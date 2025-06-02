@@ -1,12 +1,12 @@
 import torch
 from typing import Tuple
 
-from .gemm import get_best_configs
+from .gemm_int8 import get_best_configs
 from .tuner import jit_tuner
 from .utils import get_num_sms
 
 # C++ code templates
-includes = ('"deep_gemm/fp16_gemm.cuh"', )
+includes = ('"deep_gemm/int8_gemm.cuh"', )
 template = """
 using namespace deep_gemm;
 
@@ -14,9 +14,9 @@ using namespace deep_gemm;
 constexpr auto N = {N}, K = {K};
 constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
+constexpr auto BLOCK_K = {BLOCK_K};
 constexpr auto WARP_M = {WARP_M};
 constexpr auto WARP_N = {WARP_N};
-constexpr auto BLOCK_K = {BLOCK_K};
 constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 
@@ -25,15 +25,16 @@ using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups,
 
 // Launch kernel
 gemm_t::run(out, grouped_layout,
-            m, lhs, rhs,
+            m, lhs, lhs_scales, rhs, rhs_scales,
             stream, num_sms, smem_size);
 """
 
-def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
-                                              rhs: Tuple[torch.Tensor],
-                                              out: torch.Tensor, m_indices: torch.Tensor) -> None:
-    lhs = lhs
-    rhs = rhs
+
+def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Tensor],
+                                                rhs: Tuple[torch.Tensor, torch.Tensor],
+                                                out: torch.Tensor, m_indices: torch.Tensor) -> None:
+    lhs, lhs_scales = lhs
+    rhs, rhs_scales = rhs
     m, k = lhs.shape
     num_groups, n, k_ = rhs.shape
     m_, n_ = out.shape
@@ -41,12 +42,18 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
 
     # Type and shape checks
     assert m == m_ == m__ and k == k_ and n == n_
-    assert lhs.dtype == torch.bfloat16
-    assert rhs.dtype == torch.bfloat16
+    assert lhs_scales.shape == (m, 1)
+    assert rhs_scales.shape == (num_groups, n, 1)
+    assert lhs.dtype == torch.int8 and lhs_scales.dtype == torch.float32
+    assert rhs.dtype == torch.int8 and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert m_indices.dtype == torch.int32
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert out.is_contiguous() and m_indices.is_contiguous()
+
+    # LHS scales must be transposed for TMA load, but not for RHS scales
+    # lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
+    assert rhs_scales.is_contiguous()
 
     # Do nothing if `m` is zero
     if m == 0:
@@ -55,22 +62,24 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous=True)
 
-    args = (lhs, rhs, out,
+
+    args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices, m, num_groups,
             torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
-        name='m_grouped_gemm_bf16_bf16_bf16_nt',
+        name='m_grouped_gemm_int8_int8_bf16_nt',
         keys={'N': n, 'K': k,
               'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n,
+              'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'GEMM_TYPE': 'GroupedContiguous'},
         space=(),
         includes=includes,
-        arg_defs=(('lhs', torch.bfloat16),
-                  ('rhs', torch.bfloat16),
+        arg_defs=(('lhs', torch.int8), ('lhs_scales', torch.float),
+                  ('rhs', torch.int8), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('m', int), ('num_groups', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
@@ -82,9 +91,11 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
     runtime(*args)
 
 
-def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
-                                            rhs: Tuple[torch.Tensor],
-                                            out: torch.Tensor, masked_m: torch.Tensor, expected_m: int) -> None:
+def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor],
+                                          rhs: Tuple[torch.Tensor, torch.Tensor],
+                                          out: torch.Tensor, masked_m: torch.Tensor, expected_m: int) -> None:
+    lhs, lhs_scales = lhs
+    rhs, rhs_scales = rhs
     num_groups, m, k = lhs.shape
     num_groups_, n, k_ = rhs.shape
     num_groups__, m_, n_ = out.shape
@@ -94,16 +105,21 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
     assert num_groups == num_groups_ == num_groups__ == num_groups___
     assert m == m_ and n == n_ and k == k_
     assert expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0
-    assert lhs.dtype == torch.bfloat16
-    assert rhs.dtype == torch.bfloat16
+    assert lhs_scales.shape == (num_groups, m, 1)
+    assert rhs_scales.shape == (num_groups, n, 1)
+    assert lhs.dtype == torch.int8 and lhs_scales.dtype == torch.float32
+    assert rhs.dtype == torch.int8 and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert masked_m.dtype == torch.int32
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert out.is_contiguous() and masked_m.is_contiguous()
 
+    # LHS scales must be transposed for TMA load, but not for RHS scales
+    # lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
+    assert rhs_scales.is_contiguous()
+
     # Auto-tuning with compilation
     global includes, template
-
     num_sms = get_num_sms()
     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
 
@@ -111,21 +127,20 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
     if num_groups > 1 and m > block_m:
         assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
 
-    args = (lhs, rhs, out,
+    args = (lhs, lhs_scales, rhs, rhs_scales, out,
             masked_m, m,
             torch.cuda.current_stream(), num_sms, smem_config[0])
-
     runtime = jit_tuner.compile_and_tune(
-        name='m_grouped_gemm_bf16_bf16_bf16_nt',
-        keys={'N': n, 'K': k,
-              'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+        name='m_grouped_gemm_int8_int8_bf16_nt',
+        keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n,
+              'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'GEMM_TYPE': 'GroupedMasked'},
         space=(),
         includes=includes,
-        arg_defs=(('lhs', torch.bfloat16),
-                  ('rhs', torch.bfloat16),
+        arg_defs=(('lhs', torch.int8), ('lhs_scales', torch.float),
+                  ('rhs', torch.int8), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),

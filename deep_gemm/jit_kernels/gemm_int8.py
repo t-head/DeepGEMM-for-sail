@@ -7,7 +7,7 @@ from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout
 
 # C++ code templates
-includes = ('"deep_gemm/fp16_gemm.cuh"', )
+includes = ('"deep_gemm/int8_gemm.cuh"', )
 template = """
 using namespace deep_gemm;
 
@@ -26,9 +26,10 @@ using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups,
 
 // Launch kernel
 gemm_t::run(out, nullptr,
-            m, lhs, rhs,
+            m, lhs, lhs_scales, rhs, rhs_scales,
             stream, num_sms, smem_size);
 """
+
 def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128, bpp: int = 2) -> Tuple[int, int, int]:
     # Try swizzle first, as it does not waste shared memory
     swizzle_mode = 128
@@ -63,20 +64,13 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
-    #FIXME: block m can add 16, and blockM/N could be 512
+ 
     if not is_grouped_contiguous:
-        # block_ms = (32, 64, 128, 256)
         block_ms = (256, 128, 64, 32)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
 
-    # block_ns = (32, 64, 128, 256)
     block_ns = (256, 128, 64, 32)
-
-    # print(f'm:{m}, n:{n}, k:{k}, num_groups:{num_groups}\n')
-    # print(f'block_ms:{block_ms}')
-
-    # print(f'block_ns:{block_ns}')
 
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
@@ -89,6 +83,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         for block_n in filter(lambda bn: block_m <= 128 or bn <= 128, block_ns):
             success = False
             num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(best_block_m, best_block_n)
+
             if best_block_m is None or best_block_n is None:
                 success = True
             elif num_waves < best_num_waves:
@@ -98,6 +93,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                 util = get_last_wave_util(block_m, block_n)
                 best_util = get_last_wave_util(best_block_m, best_block_n)
                 success = util > best_util
+
+                # print(f'best_block_m:{best_block_m}, best_block_n:{best_block_n}, num_waves:{num_waves}, best_num_waves:{best_num_waves}, util:{util}, best_util:{best_util}\n')
                 if util == best_util:
                     # Case 1: same `block_m`, smaller `block_n` (wasted)
                     success |= block_m == best_block_m and block_n < best_block_n
@@ -105,24 +102,28 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                     success |= block_n == best_block_n and block_m < best_block_m
                     # Case 3: different for both `block_m` and `block_n`, `block_n` larger is better
                     success |= block_m != best_block_m and block_n > best_block_n
+
+                # print(f'success:{success}\n')
+    
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
 
     # best_block_m = 32
     # best_block_n = 32
-
     assert best_block_m is not None and best_block_n is not None
     
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_config, ppu_capacity = None, None, 262144
 
-    block_k = 128
-    if k <= 96:
+    # print(f'best_block_m:{best_block_m}, best_block_n:{best_block_n}')
+
+    block_k = 256
+    if k <= 96 * 2:
+        block_k = 128
+    if k <= 48 * 2:
         block_k = 64
-    if k <= 48:
-        block_k = 32
     if k >= 4096 and (best_block_m == 32 and best_block_n == 32):
-        block_k = 256
+        block_k = 512
  
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
 
@@ -133,7 +134,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # print(f'stage_candidates:{stage_candidates}')
 
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k)
+        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1)
         # print(f"num_stages:{num_stages}, best_smem_config:{best_smem_config}")
         if best_smem_config[0] < ppu_capacity:
             best_num_stages = num_stages
@@ -145,11 +146,11 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # NOTES: less L2 cache usage and less GPU frequency drop
     num_waves = get_num_waves(best_block_m, best_block_n)
     num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
-    # num_min_sms = ceil_div(num_min_sms, best_tma_multicast_config[0]) * best_tma_multicast_config[0]
     assert num_min_sms <= num_sms
 
-    # import pdb
-    # pdb.set_trace()
+    # print(f'num_waves:{num_waves}, num_sms:{num_sms}\n')
+    # print(f'm:{m}, n:{n}, best_block_m:{best_block_m}, best_block_n:{best_block_n}, num_groups:{num_groups}\n')
+    # print(f'num_min_sms:{num_min_sms}\n')
 
     warp_m = best_block_m // 2
     warp_n = best_block_n // 2
@@ -167,30 +168,30 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
         warp_n = best_block_n // 4
 
-    # best_block_m = 32
-    # best_block_n = 3
-    # warp_m = 16
-    # warp_n = 16
-    # block_k = 64
+    # best_block_m = 128
+    # best_block_n = 32
+    # warp_m = 32
+    # warp_n = 32
+    # block_k = 16
     # best_num_stages = 3
 
     return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
 
-def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
-                         rhs: Tuple[torch.Tensor],
+def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
+                         rhs: Tuple[torch.Tensor, torch.Tensor],
                          out: torch.Tensor) -> None:
+    lhs, lhs_scales = lhs
+    rhs, rhs_scales = rhs
     m, k = lhs.shape
     n, k_ = rhs.shape
     m_, n_ = out.shape
 
-    # assert n % 64 == 0 and k % 128 == 0
-
     # Type and shape checks
     assert m == m_ and n == n_ and k == k_
     assert n > 0 and k > 0
-    assert lhs.dtype == torch.bfloat16
-    assert rhs.dtype == torch.bfloat16
+    assert lhs.dtype == torch.int8 and lhs_scales.dtype == torch.float32
+    assert rhs.dtype == torch.int8 and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
 
@@ -204,17 +205,18 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
     num_sms = get_num_sms()
     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
 
-    args = (lhs, rhs, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
+    args = (lhs, lhs_scales, rhs, rhs_scales, out,
+            m, torch.cuda.current_stream(), num_sms, smem_config[0])
 
     runtime = jit_tuner.compile_and_tune(
-        name='gemm_bf16_bf16_bf16_nt',
+        name='gemm_int8_int8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'NUM_STAGES': num_stages},
         space=(),
         includes=includes,
-        arg_defs=(('lhs', torch.bfloat16),
-                  ('rhs', torch.bfloat16),
+        arg_defs=(('lhs', torch.int8), ('lhs_scales', torch.float),
+                  ('rhs', torch.int8), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16), ('m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,

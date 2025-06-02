@@ -19,7 +19,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [ ] Larger block size on N (up to 256)
 - [x] MoE scheduler with TMA multicast compatibility
 - [x] Fix TMA multicast compatibility for indivisible shapes
-- [ ] Skip useless computation on M
+- [x] Skip useless computation on M
 - [x] NVRTC as a faster compiler
 - [ ] Stolen JIT cache
 - [ ] Sanitizer for testing
@@ -123,7 +123,7 @@ The library also provides some environment variables, which may be useful:
 - Post optimization
   - `DG_JIT_DISABLE_FFMA_INTERLEAVE`: `0` or `1`, disable FFMA-interleaving optimization, `0` by default
 - Heuristic selection
-  - `DG_PRINT_AUTOTUNE`: `0` or `1`, print selected configs for each shape, `0` by default
+  - `DG_PRINT_CONFIGS`: `0` or `1`, print selected configs for each shape, `0` by default
 - Testing
   - `DG_NSYS_PROFILING`: `0` or `1`, Nsight-system compatible testing, `0` by default
 

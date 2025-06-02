@@ -1,3 +1,4 @@
 [submodule "third-party/cutlass"]
 	path = third-party/cutlass
-	url = https://github.com/NVIDIA/cutlass.git
+	url = ssh://ai-gerrit.eng.t-head.cn:29418/cutlass
+	branch = ppu_dev

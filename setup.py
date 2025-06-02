@@ -8,8 +8,9 @@ from setuptools.command.develop import develop
 current_dir = os.path.dirname(os.path.realpath(__file__))
 jit_include_dirs = ('deep_gemm/include/deep_gemm', )
 third_party_include_dirs = (
-    'third-party/cutlass/include/cute',
+    'third-party/cutlass/include/accutlass.h',
     'third-party/cutlass/include/cutlass',
+    'third-party/cutlass/include/aiu',
 )
 
 
@@ -26,9 +27,11 @@ class PostDevelopCommand(develop):
             src_dir = f'{current_dir}/{d}'
             dst_dir = f'{current_dir}/deep_gemm/include/{dirname}'
             assert os.path.exists(src_dir)
+
             if os.path.exists(dst_dir):
                 assert os.path.islink(dst_dir)
                 os.unlink(dst_dir)
+        
             os.symlink(src_dir, dst_dir, target_is_directory=True)
 
 
@@ -56,7 +59,10 @@ class CustomBuildPy(build_py):
                 shutil.rmtree(dst_dir)
 
             # Copy the directory
-            shutil.copytree(src_dir, dst_dir)
+            if os.path.isfile(src_dir):
+                shutil.copy(src_dir, dst_dir)
+            else:
+                shutil.copytree(src_dir, dst_dir)
 
 
 if __name__ == '__main__':
@@ -74,7 +80,6 @@ if __name__ == '__main__':
         package_data={
             'deep_gemm': [
                 'include/deep_gemm/*',
-                'include/cute/**/*',
                 'include/cutlass/**/*',
             ]
         },
