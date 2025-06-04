@@ -52,16 +52,19 @@ class CustomBuildPy(build_py):
         for d in third_party_include_dirs:
             dirname = d.split('/')[-1]
             src_dir = os.path.join(current_dir, d)
+
             dst_dir = os.path.join(build_include_dir, dirname)
 
             # Remove existing directory if it exists
-            if os.path.exists(dst_dir):
-                shutil.rmtree(dst_dir)
 
             # Copy the directory
             if os.path.isfile(src_dir):
+                if os.path.exists(dst_dir):
+                    os.remove(dst_dir)
                 shutil.copy(src_dir, dst_dir)
             else:
+                if os.path.exists(dst_dir):
+                    shutil.rmtree(dst_dir)
                 shutil.copytree(src_dir, dst_dir)
 
 
