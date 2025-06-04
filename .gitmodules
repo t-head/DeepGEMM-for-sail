@@ -2,3 +2,8 @@
 	path = third-party/cutlass
 	url = ssh://ai-gerrit.eng.t-head.cn:29418/cutlass
 	branch = ppu_dev
+
+[submodule "third-party/cutlass3"]
+	path = third-party/cutlass3
+	url = ssh://ai-gerrit.eng.t-head.cn:29418/AI/SW/Libraries/cutlass3
+	branch = v3.6.0_ppu_dev

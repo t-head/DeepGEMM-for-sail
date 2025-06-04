@@ -3,7 +3,7 @@ import os
 import torch
 from typing import Any, Dict
 
-from ..jit import build, cpp_format, generate, Runtime
+from ..jit import build, cpp_format, generate, Runtime, set_jit_include_dir
 
 
 class JITTuner:
@@ -11,7 +11,7 @@ class JITTuner:
         self.tuned = {}
 
     def compile_and_tune(self, name: str, keys: Dict[str, Any], space: tuple,
-                         includes: tuple, arg_defs: tuple, template: str, args: tuple) -> Runtime:
+                         includes: tuple, arg_defs: tuple, template: str, args: tuple, jit_include_dir: str = None, arch: str = None) -> Runtime:
         # NOTES: we always assume the space and template will not change
         # We also assume the GPU device will not be changed
         # NOTES: the function must have no accumulated side effects
@@ -37,7 +37,8 @@ class JITTuner:
             code = generate(includes, arg_defs, cpp_format(template, full_keys))
 
             # Illegal build must raise errors
-            kernels.append((build(name, arg_defs, code), tuned_keys))
+            set_jit_include_dir(jit_include_dir)
+            kernels.append((build(name, arg_defs, code, arch), tuned_keys))
 
         best_runtime, best_time, best_keys = None, None, None
         for runtime, tuned_keys in kernels:

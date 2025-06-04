@@ -13,21 +13,27 @@ from .template import typename_map
 
 runtime_cache = RuntimeCache()
 
+_jit_include_dir = f'{os.path.dirname(os.path.abspath(__file__))}/../include'
+
 def hash_to_hex(s: str) -> str:
     md5 = hashlib.md5()
     md5.update(s.encode('utf-8'))
     return md5.hexdigest()[0:12]
 
+@functools.lru_cache(maxsize=None)
+def set_jit_include_dir(new_jit_include_dir : str = None) -> None:
+    global _jit_include_dir
+    if new_jit_include_dir :
+        _jit_include_dir = f'{os.path.dirname(os.path.abspath(__file__))}/../include' + "/" + new_jit_include_dir
 
 @functools.lru_cache(maxsize=None)
 def get_jit_include_dir() -> str:
-    return f'{os.path.dirname(os.path.abspath(__file__))}/../include'
-
+    return _jit_include_dir
 
 @functools.lru_cache(maxsize=None)
 def get_deep_gemm_version() -> str:
     # Update include directories
-    include_dir = f'{get_jit_include_dir()}/deep_gemm'
+    include_dir = f'{os.path.dirname(os.path.abspath(__file__))}/../include/deep_gemm'
     assert os.path.exists(include_dir), f'Cannot find GEMM include directory {include_dir}'
     md5 = hashlib.md5()
     for filename in filter(lambda x: x.endswith('.cuh'), sorted(os.listdir(include_dir))):
@@ -48,7 +54,7 @@ def get_nvcc_compiler() -> Tuple[str, str]:
     paths.append(f'{CUDA_HOME}/bin/nvcc')
 
     # Try to find the first available NVCC compiler
-    least_version_required = '12.3'
+    least_version_required = '11.6'
     version_pattern = re.compile(r'release (\d+\.\d+)')
     for path in paths:
         if os.path.exists(path):
@@ -93,11 +99,12 @@ def put(path, data, is_binary=False):
     os.replace(tmp_file_path, path)
 
 
-def build(name: str, arg_defs: tuple, code: str) -> Runtime:
+def build(name: str, arg_defs: tuple, code: str, ppu_arch: str) -> Runtime:
     # Compiler flags
-    cpp_standard = int(os.getenv('DG_NVCC_OVERRIDE_CPP_STANDARD', 20))
+    cpp_standard = int(os.getenv('DG_NVCC_OVERRIDE_CPP_STANDARD', 17))
+    gen_code = '-gencode=arch=compute_89a,code=sm_89a' if ppu_arch == '1.5' else '-gencode=arch=compute_80a,code=sm_80a'
     nvcc_flags = [f'-std=c++{cpp_standard}', '-shared', '-O3', '--expt-relaxed-constexpr', '--expt-extended-lambda',
-                  '-gencode=arch=compute_80a,code=sm_80a',
+                  gen_code,
                   '--ptxas-options=--register-usage-level=10' + (',--verbose' if 'DG_PTXAS_VERBOSE' in os.environ else ''),
                   # Suppress some unnecessary warnings, such as unused variables for certain `constexpr` branch cases
                   '--diag-suppress=39,174,177,940']

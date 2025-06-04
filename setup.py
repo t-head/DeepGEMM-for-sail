@@ -11,6 +11,10 @@ third_party_include_dirs = (
     'third-party/cutlass/include/accutlass.h',
     'third-party/cutlass/include/cutlass',
     'third-party/cutlass/include/aiu',
+    'third-party/cutlass3/include/cute',
+    'third-party/cutlass3/include/cutlass',
+    'third-party/cutlass3/include/ppu',
+    'third-party/cutlass3/tools'
 )
 
 
@@ -24,14 +28,15 @@ class PostDevelopCommand(develop):
         # Make symbolic links of third-party include directories
         for d in third_party_include_dirs:
             dirname = d.split('/')[-1]
+            cutlass_dirname = d.split('/')[1]
             src_dir = f'{current_dir}/{d}'
-            dst_dir = f'{current_dir}/deep_gemm/include/{dirname}'
+            dst_dir = f'{current_dir}/deep_gemm/include/{dirname}' if cutlass_dirname == 'cutlass' else  f'{current_dir}/deep_gemm/include/cutlass3/{dirname}'
             assert os.path.exists(src_dir)
 
             if os.path.exists(dst_dir):
                 assert os.path.islink(dst_dir)
                 os.unlink(dst_dir)
-        
+
             os.symlink(src_dir, dst_dir, target_is_directory=True)
 
 
@@ -51,9 +56,12 @@ class CustomBuildPy(build_py):
         # Copy third-party includes to the build directory
         for d in third_party_include_dirs:
             dirname = d.split('/')[-1]
+            cutlass_dirname = d.split('/')[1]
             src_dir = os.path.join(current_dir, d)
-
-            dst_dir = os.path.join(build_include_dir, dirname)
+            include_dir = build_include_dir
+            if cutlass_dirname == 'cutlass3':
+                include_dir = include_dir + '/cutlass3'
+            dst_dir = os.path.join(include_dir, dirname)
 
             # Remove existing directory if it exists
 
@@ -84,6 +92,7 @@ if __name__ == '__main__':
             'deep_gemm': [
                 'include/deep_gemm/*',
                 'include/cutlass/**/*',
+                'include/cutlass3/**/*'
             ]
         },
         cmdclass={

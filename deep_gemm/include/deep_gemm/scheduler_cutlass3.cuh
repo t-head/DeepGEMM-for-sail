@@ -1,0 +1,265 @@
+#pragma once
+
+/*! \file
+    \brief Parameters structures for deepgemm schedulers
+*/
+
+#include "cutlass/coord.h"
+#include "cutlass/kernel_hardware_info.h"
+#include "cutlass/workspace.h"
+#include "cutlass/platform/platform.h"
+#include "cutlass/fast_math.h"
+#include "cutlass/gemm_coord.h"
+////////////////////////////////////////////////////////////////////////////////
+
+// namespace cutlass::gemm::kernel {
+namespace deep_gemm {
+using cutlass::KernelHardwareInfo;
+template <typename T>
+__device__ __host__ constexpr T ceil_div(T a, T b) {
+    return (a + b - 1) / b;
+}
+
+template <typename T>
+__device__ __host__ constexpr T constexpr_gcd(T a, T b) {
+    return b == 0 ? a : constexpr_gcd(b, a % b);
+}
+
+enum class GemmType {
+    Normal,
+    GroupedContiguous,
+    GroupedMasked,
+    GroupedMaskedNoBubble
+};
+
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
+template <GemmType kGemmType,
+          uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t BLOCK_M, uint32_t BLOCK_N,
+          uint32_t kNumGroups,
+          uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N),
+          uint32_t kNum1DBlocksPerGroup = 16>
+struct DeepGemmScheduler {
+    int current_iter = -1;
+    uint32_t num_aligned_m_blocks;
+    constexpr static bool kIsTMAMulticastOnA = false;
+
+    // For normal GEMM
+    // Maybe not used in the masked grouped GEMM
+    uint32_t num_blocks;
+    uint32_t num_n_blocks = kNumNBlocks;
+    uint32_t num_blocks_in_group;
+    // For grouped GEMM
+    int* grouped_layout;
+
+    // Only used for masked layout
+    uint32_t curr_group_idx, curr_cumsum, curr_group_m, curr_cumsum_m;
+
+    struct Arguments
+    {
+        int* grouped_layout;
+        uint32_t shape_m;
+
+        //
+        // Methods
+        //
+
+        /// Ctor
+        CUTLASS_HOST_DEVICE
+        Arguments()
+            : grouped_layout(nullptr)
+            , shape_m(0)
+        {
+        }
+
+        /// Ctor
+        CUTLASS_HOST_DEVICE
+        Arguments(uint32_t shape_m, int* grouped_layout_ptr = nullptr)
+            : grouped_layout(grouped_layout_ptr)
+            , shape_m(shape_m)
+        {
+        }
+
+    };
+
+    using Params = Arguments;
+    Params const& params;
+
+    CUTLASS_DEVICE explicit DeepGemmScheduler(Params const& params_) : params(params_) {
+        num_aligned_m_blocks = ceil_div(params_.shape_m, BLOCK_M);
+        if (kGemmType == GemmType::Normal) {
+            num_blocks = num_aligned_m_blocks * num_n_blocks;
+        } else if (kGemmType == GemmType::GroupedContiguous) {
+            num_blocks = num_aligned_m_blocks * num_n_blocks;
+            this->grouped_layout = params.grouped_layout;
+        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedMaskedNoBubble) {
+            curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_m = 0;
+            this->grouped_layout = params.grouped_layout;
+        }
+    }
+
+    CUTLASS_DEVICE void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx,
+                                               uint32_t& m_block_idx, uint32_t& n_block_idx) {
+        // Swizzle for better L2 usages
+        auto primary_num_blocks = kIsTMAMulticastOnA ? kNumNBlocks : num_m_blocks;
+        auto secondary_num_blocks = kIsTMAMulticastOnA ? num_m_blocks : kNumNBlocks;
+        auto num_blocks_per_group = secondary_num_blocks * kNum1DBlocksPerGroup;
+        auto group_idx = block_idx / num_blocks_per_group;
+        auto first_block_idx = group_idx * kNum1DBlocksPerGroup;
+        auto in_group_idx = block_idx % num_blocks_per_group;
+        num_blocks_in_group = min(kNum1DBlocksPerGroup, primary_num_blocks - first_block_idx);
+
+
+        // Convert to final M/N block indices
+        if constexpr (kIsTMAMulticastOnA) {
+            m_block_idx = in_group_idx / num_blocks_in_group;
+            n_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
+        } else {
+            m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
+            n_block_idx = in_group_idx / num_blocks_in_group;
+        }
+    }
+
+
+    template <bool kIgnoreGroupedForGroupedContiguous=true>
+    CUTLASS_DEVICE uint32_t get_global_idx(const uint32_t shape_dim, const uint32_t block_size,
+                                           const uint32_t& block_idx, const uint32_t& m_block_idx=0) {
+        if (kGemmType == GemmType::Normal) {
+            return block_idx * block_size;
+        } else if (kGemmType == GemmType::GroupedContiguous) {
+            auto offset = kIgnoreGroupedForGroupedContiguous ? 0 : __ldg(params.grouped_layout + m_block_idx * BLOCK_M);
+            return offset * shape_dim + block_idx * block_size;
+        } else if (kGemmType == GemmType::GroupedMasked) {
+            return curr_group_idx * shape_dim + block_idx * block_size;
+        }
+    }
+
+    CUTLASS_DEVICE bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
+        const auto next_block_idx = (++ current_iter) * gridDim.x + blockIdx.x;
+
+        if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedMaskedNoBubble) {
+            uint32_t num_m_blocks;
+            while (true) {
+                // End of the task
+                if (curr_group_idx == kNumGroups)
+                    return false;
+
+                // Within the current group
+                curr_group_m = static_cast<uint32_t>(__ldg(grouped_layout + curr_group_idx));
+                num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
+                auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
+                if (next_block_idx < current_m_block_cumsum * kNumNBlocks)
+                    break;
+
+                // Move to check the next group
+                curr_group_idx ++, curr_cumsum = current_m_block_cumsum;
+                curr_cumsum_m += curr_group_m;
+            }
+
+            get_swizzled_block_idx(num_m_blocks, next_block_idx - curr_cumsum * kNumNBlocks, m_block_idx, n_block_idx);
+        } else {
+            if (next_block_idx >= num_blocks)
+                return false;
+
+            get_swizzled_block_idx(num_aligned_m_blocks, next_block_idx, m_block_idx, n_block_idx);
+        }
+        return true;
+    }
+
+
+    template <class ProblemShapeMNKL, class TileShape, class ClusterShape>
+    static Params
+    to_underlying_arguments(
+      int* groups_layout,
+      ProblemShapeMNKL problem_shape_mnkl,
+      TileShape tile_shape,
+      ClusterShape cluster_shape,
+      [[maybe_unused]] KernelHardwareInfo const& hw_info,
+      Arguments const& arguments,
+      [[maybe_unused]] void* workspace=nullptr,
+      [[maybe_unused]] const uint32_t epilogue_subtile = 1,
+      [[maybe_unused]] uint32_t ktile_start_alignment_count = 1u) {
+
+        // cutlass3 change
+        // rtc will use this to get grid size on host
+        #ifndef ACOMPUTE_VERSION
+            // We only need the tile and cluster shape during scheduler setup, so let FTAD do the magic
+            static_assert(cute::is_static<TileShape>::value);
+            static_assert(cute::is_static<ClusterShape>::value);
+        #endif
+
+        // dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shape_mnkl, tile_shape, cluster_shape);
+        auto problem_shape = cutlass::gemm::to_gemm_coord(problem_shape_mnkl);
+
+        Params params(problem_shape.m(), groups_layout);
+        return params;
+    }
+
+    // The basic tile scheduler does not require any additional workspace
+    template <class ProblemShape, class ElementAccumulator>
+    static size_t
+    get_workspace_size(Arguments const&, ProblemShape, KernelHardwareInfo const&, uint32_t, const uint32_t = 1, uint32_t = 1) {
+        return 0;
+    }
+
+    // Returns the problem size for the current problem
+    __device__ __forceinline__ int32_t curr_problem_m(const Params& param) const
+    {
+        if constexpr (kGemmType == GemmType::Normal || kGemmType == GemmType::GroupedContiguous) {
+            return param.shape_m;
+        } else if constexpr (kGemmType == GemmType::GroupedMasked) {
+            return param.shape_m;
+        } else if constexpr (kGemmType == GemmType::GroupedMaskedNoBubble) {
+            return curr_group_m;
+        } else {
+            return 0;
+        }
+    }
+
+    // Gets the index of the problem
+    __device__ __forceinline__ int32_t problem_index() const
+    {
+        return curr_group_idx;
+    }
+
+    // Gets the pointer offset of matrix A
+    __device__ __forceinline__ int64_t curr_offset_a(const Params& param) const
+    {
+        if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {
+            return int64_t(curr_group_idx) * param.shape_m * SHAPE_K;
+        } else if constexpr (kGemmType == GemmType::GroupedMaskedNoBubble) {
+            return int64_t(curr_cumsum_m) * SHAPE_K;
+        } else {
+            return 0;
+        }
+    }
+
+    // Gets the pointer offset of matrix B
+    __device__ __forceinline__ int64_t curr_offset_b(const Params& param, const int m_block_idx = 0) const
+    {
+        if constexpr (kGemmType == GemmType::GroupedContiguous) {
+            int64_t offset = __ldg(params.grouped_layout + m_block_idx * BLOCK_M);
+            return offset * SHAPE_N * SHAPE_K;
+        } else {
+            return int64_t(curr_group_idx) * SHAPE_N * SHAPE_K;
+        }
+    }
+
+    // Gets the pointer offset of matrix C
+    __device__ __forceinline__ int64_t curr_offset_c(const Params& param) const
+    {
+        if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {
+            return int64_t(curr_group_idx) * param.shape_m * SHAPE_N;
+        } else if constexpr (kGemmType == GemmType::GroupedMaskedNoBubble) {
+            return int64_t(curr_cumsum_m) * SHAPE_N;
+        } else {
+            return 0;
+        }
+    }
+};
+
+#pragma clang diagnostic pop
+
+}
+

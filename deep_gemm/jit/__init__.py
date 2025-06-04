@@ -1,3 +1,3 @@
-from .compiler import get_nvcc_compiler, build
+from .compiler import get_nvcc_compiler, build, set_jit_include_dir
 from .template import cpp_format, generate
 from .runtime import Runtime
