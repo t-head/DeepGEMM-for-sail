@@ -206,3 +206,45 @@ This code repository is released under [the MIT License](LICENSE).
       howpublished = {\url{https://github.com/deepseek-ai/DeepGEMM}},
 }
 ```
+
+PPU Perf Data for UT:
+Dense Gemm:	H20-FP8(TFLOPS)	PPU-INT8(TFLOPS)	PPU-BF16(TFLOPS)
+m=   64, n= 7168, k=  576	73	30	27
+m=   64, n= 2112, k= 7168	134	66	40
+m=   64, n=24576, k= 1536	193	80	53
+m=   64, n=32768, k=  512	142	46	39
+m=   64, n= 7168, k=16384	229	118	69
+m=   64, n= 4096, k= 7168	183	95	53
+m=   64, n= 7168, k= 2048	157	68	45
+m=  128, n= 7168, k=  576	110	41	39
+m=  128, n= 2112, k= 7168	197	127	77
+m=  128, n=24576, k= 1536	232	120	80
+m=  128, n=32768, k=  512	185	64	59
+m=  128, n= 7168, k=16384	263	146	83
+m=  128, n= 4096, k= 7168	224	125	67
+m=  128, n= 7168, k= 2048	200	93	62
+m= 4096, n= 7168, k=  576	219	83	79
+m= 4096, n= 2112, k= 7168	163	216	118
+m= 4096, n=24576, k= 1536	215	159	110
+m= 4096, n=32768, k=  512	149	90	83
+m= 4096, n= 7168, k=16384	171	247	128
+m= 4096, n= 4096, k= 7168	187	225	123
+m= 4096, n= 7168, k= 2048	166	177	114
+			
+			
+grouped contiguous GEMM			
+num_groups= 4, expected_m_per_group=8192, n=4096, k=7168	277	232	127
+num_groups= 4, expected_m_per_group=8192, n=7168, k=2048	272	179	116
+num_groups= 8, expected_m_per_group=4096, n=4096, k=7168	236	233	127
+num_groups= 8, expected_m_per_group=4096, n=7168, k=2048	230	179	115
+num_groups=32, expected_m_per_group= 256, n=4096, k=7168	221	228	123
+num_groups=32, expected_m_per_group= 256, n=7168, k=2048	210	173	112
+			
+			
+grouped masked GEMM			
+num_groups=1, expected_m_per_group=1024, n=4096, k=7168	154	183	99
+num_groups=1, expected_m_per_group=1024, n=7168, k=2048	208	157	88
+num_groups=2, expected_m_per_group= 512, n=4096, k=7168	173	174	92
+num_groups=2, expected_m_per_group= 512, n=7168, k=2048	162	133	90
+num_groups=4, expected_m_per_group= 256, n=4096, k=7168	150	154	93
+num_groups=4, expected_m_per_group= 256, n=7168, k=2048	113	119	80

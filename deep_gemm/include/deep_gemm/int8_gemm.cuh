@@ -426,7 +426,7 @@ public:
         static uint32_t id = 0;
         return ++id;
     }
-    
+
     static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
                     uint32_t shape_m, int8_t* gmem_a, float* scales_a,
                     int8_t * gmem_b, float* scales_b,
@@ -493,7 +493,7 @@ public:
             cudaFuncAttributes attr;
             cudaFuncGetAttributes(&attr, cutlass::Kernel<GemmKernel>);
     
-            printf("[GemmGrouped-BF16:]\n");
+            printf("[GemmGrouped-INT8:]\n");
             printf("group:%d, problem:[%d, %d, %d], gemm_type:%s\n",
                 kNumGroups, shape_m, SHAPE_N, SHAPE_K, GemmTypeS[static_cast<int>(kGemmType)]);
 

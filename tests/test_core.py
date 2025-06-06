@@ -109,6 +109,7 @@ def test_m_grouped_gemm_contiguous(d: torch.dtype) -> None:
     for num_groups, expected_m_per_group, k, n in ((4, 8192, 7168, 4096), (4, 8192, 2048, 7168),
                                                    (8, 4096, 7168, 4096), (8, 4096, 2048, 7168),
                                                    (32, 256, 7168, 4096), (32, 256, 2048, 7168)):
+        # num_groups, expected_m_per_group, k, n = 4, 8192, 2048, 7168
         # NOTES: we should mask the unfilled part before calculating difference
         m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, d)
         if (d == torch.bfloat16):
@@ -168,7 +169,7 @@ def test_m_grouped_gemm_masked(d: torch.dtype) -> None:
 
     for num_groups, expected_m_per_group in ((1, 1024), (2, 512), (4, 256)):
         for k, n in ((7168, 4096), (2048, 7168), ):
-        # Test correctness
+            # Test correctness
             for i in range(10):
                 x, y, masked_m, out, ref_out = construct_grouped_masked(num_groups, 4096, expected_m_per_group, k, n, d)
 
@@ -181,21 +182,20 @@ def test_m_grouped_gemm_masked(d: torch.dtype) -> None:
                     diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
                     assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
                 
-                # noinspection PyShadowingNames
-                def test_func():
-                    if (d == torch.bfloat16):
-                        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
-                    else:
-                        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
+            # noinspection PyShadowingNames
+            def test_func():
+                if (d == torch.bfloat16):
+                    deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
+                else:
+                    deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
 
-                    # Test performance with fixed shapes
-                    # noinspection PyUnboundLocalVariable
-                    valid_m = masked_m.sum().item()
-                    t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
-                    print(f' > Perf ((masked dtype={str(d)}, {num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
-                        f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
-                        f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
-    print("Passed\n")
+            # Test performance with fixed shapes
+            # noinspection PyUnboundLocalVariable
+            valid_m = masked_m.sum().item()
+            t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+            print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+                f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
+                f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
 
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
