@@ -89,8 +89,7 @@ void print_to_file(
             outFile << std::fixed << std::setprecision(0);
         }
         for (int i = 0; i < size; ++i) {
-            float val = (float)(tmp[i]);
-            outFile << val << std::endl;
+            outFile << tmp[i] << std::endl;
         }
         delete[] tmp;
     } else {

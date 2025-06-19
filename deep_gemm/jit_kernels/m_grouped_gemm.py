@@ -25,7 +25,7 @@ using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups,
 
 // Launch kernel
 gemm_t::run(out, grouped_layout,
-            m, lhs, rhs,
+            m, expected_m, lhs, rhs,
             stream, num_sms, smem_size);
 """
 
@@ -57,8 +57,9 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
     num_sms = get_num_sms()
     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
 
+    expected_m = 0
     args = (lhs, rhs, out,
-            m_indices, m, num_groups,
+            m_indices, m, expected_m, num_groups,
             torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_bf16_bf16_bf16_nt',
@@ -72,7 +73,8 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
         arg_defs=(('lhs', torch.bfloat16),
                   ('rhs', torch.bfloat16),
                   ('out', torch.bfloat16),
-                  ('grouped_layout', torch.int32), ('m', int), ('num_groups', int),
+                  ('grouped_layout', torch.int32), ('m', int), 
+                  ('num_groups', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
         args=args
@@ -112,7 +114,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
         assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
 
     args = (lhs, rhs, out,
-            masked_m, m,
+            masked_m, m, expected_m,
             torch.cuda.current_stream(), num_sms, smem_config[0])
 
     runtime = jit_tuner.compile_and_tune(
@@ -127,7 +129,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
         arg_defs=(('lhs', torch.bfloat16),
                   ('rhs', torch.bfloat16),
                   ('out', torch.bfloat16),
-                  ('grouped_layout', torch.int32), ('m', int),
+                  ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
         args=args

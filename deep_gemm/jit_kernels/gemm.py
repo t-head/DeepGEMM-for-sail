@@ -26,7 +26,7 @@ using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups,
 
 // Launch kernel
 gemm_t::run(out, nullptr,
-            m, lhs, rhs,
+            m, 0, lhs, rhs,
             stream, num_sms, smem_size);
 """
 def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128, bpp: int = 2) -> Tuple[int, int, int]:
@@ -66,7 +66,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     #FIXME: block m can add 16, and blockM/N could be 512
     if not is_grouped_contiguous:
         # block_ms = (32, 64, 128, 256)
-        block_ms = (256, 128, 64, 32)
+        block_ms = (256, 128, 64, 32, 16)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
 
@@ -107,6 +107,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                     success |= block_m != best_block_m and block_n > best_block_n
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
 
+    #for better occ for 810e hbm bound, use smallest blockN for m16
+    if (best_block_m == 16):
+        best_block_n = 64
+    
     # best_block_m = 32
     # best_block_n = 32
 
@@ -126,9 +130,9 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
  
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
 
-    if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4):
+    if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16:
         # Unrolling both stages and `num_former_iters` will cause large code size
-        stage_candidates = (4, 3, 2)
+        stage_candidates = (3, 2)
 
     # print(f'stage_candidates:{stage_candidates}')
 
@@ -148,9 +152,6 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # num_min_sms = ceil_div(num_min_sms, best_tma_multicast_config[0]) * best_tma_multicast_config[0]
     assert num_min_sms <= num_sms
 
-    # import pdb
-    # pdb.set_trace()
-
     warp_m = best_block_m // 2
     warp_n = best_block_n // 2
 
@@ -163,16 +164,13 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     elif best_block_m == 128 or best_block_m == 256 and best_block_n >= 32:
         warp_m = best_block_m // 4
         warp_n = best_block_n // 2 if best_block_n != 32 else best_block_n
+    elif best_block_m == 16:
+        warp_m = 16
+        best_block_n = 64
+        warp_n = best_block_n // 4 if best_block_n <= 128 else best_block_n // 8
     elif best_block_n == 128 or best_block_n == 256:
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
         warp_n = best_block_n // 4
-
-    # best_block_m = 32
-    # best_block_n = 3
-    # warp_m = 16
-    # warp_n = 16
-    # block_k = 64
-    # best_num_stages = 3
 
     return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 

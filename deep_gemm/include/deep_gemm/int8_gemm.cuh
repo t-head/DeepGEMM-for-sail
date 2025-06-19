@@ -6,6 +6,12 @@
 #include "utils.cuh"
 #include "profiling_interface.hpp"
 
+#include <iostream>
+#include <fstream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/file.h>
+
 #include "accutlass.h"
 #include "cutlass/array.h"
 #include "cutlass/numeric_conversion.h"
@@ -428,7 +434,7 @@ public:
     }
 
     static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
-                    uint32_t shape_m, int8_t* gmem_a, float* scales_a,
+                    uint32_t shape_m, uint32_t expected_m, int8_t* gmem_a, float* scales_a,
                     int8_t * gmem_b, float* scales_b,
                     cudaStream_t stream, int num_sms, uint32_t smem_size) {
         using ThreadblockShape = cutlass::gemm::GemmShape<BLOCK_M, BLOCK_N, BLOCK_K>;
@@ -497,8 +503,8 @@ public:
             printf("group:%d, problem:[%d, %d, %d], gemm_type:%s\n",
                 kNumGroups, shape_m, SHAPE_N, SHAPE_K, GemmTypeS[static_cast<int>(kGemmType)]);
 
-            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
-                ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK,
+            printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], kNumStages:%d\n",
+                ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK, expected_m,
                 WarpShape::kM, WarpShape::kN, WarpShape::kK, kNumStages);
 
             printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
@@ -530,12 +536,20 @@ public:
             int id = generate_id();
             printf("id:%d\n", id);
             filename << "case" << id << "_"
+                     << "int8" << "_"
                      << "groups" << kNumGroups << "_"
                      << "m" << shape_m << "_"
                      << "n" << SHAPE_N << "_"
                      << "k" << SHAPE_K << "_"
+                     << "em" << expected_m << "_"
                      << GemmTypeS[static_cast<int>(kGemmType)] << ".dump";
-            print_to_file(grouped_layout, kGemmType == GemmType::GroupedContiguous ? shape_m : kNumGroups, filename.str().c_str(), stream);
+            std::ifstream file(filename.str().c_str());
+            int fd = open(filename.str().c_str(), O_CREAT | O_WRONLY | O_APPEND, 0666);
+            if (fd != -1 && !file) {
+                if (flock(fd, LOCK_EX | LOCK_NB) != -1)
+                    print_to_file(grouped_layout, kGemmType == GemmType::GroupedContiguous ? shape_m : kNumGroups, filename.str().c_str(), stream);
+                close(fd);
+            }
         }
 
         typename EpilogueOp::Params linearScalingParams; // TODO: right now it's unused (scaling is done in

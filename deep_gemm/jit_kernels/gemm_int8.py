@@ -26,7 +26,7 @@ using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups,
 
 // Launch kernel
 gemm_t::run(out, nullptr,
-            m, lhs, lhs_scales, rhs, rhs_scales,
+            m, 0, lhs, lhs_scales, rhs, rhs_scales,
             stream, num_sms, smem_size);
 """
 
@@ -66,7 +66,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
  
     if not is_grouped_contiguous:
-        block_ms = (256, 128, 64, 32)
+        block_ms = (256, 128, 64, 32, 16)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
 
@@ -107,8 +107,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
 
-    # best_block_m = 32
-    # best_block_n = 32
+    #for better occ for 810e hbm bound, use smallest blockN for m16
+    if (best_block_m == 16):
+        best_block_n = 64
+
     assert best_block_m is not None and best_block_n is not None
     
     # Always pick the longest one
@@ -129,7 +131,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4):
         # Unrolling both stages and `num_former_iters` will cause large code size
-        stage_candidates = (4, 3, 2)
+        stage_candidates = (3, 2)
 
     # print(f'stage_candidates:{stage_candidates}')
 
@@ -164,16 +166,13 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     elif best_block_m == 128 or best_block_m == 256 and best_block_n >= 32:
         warp_m = best_block_m // 4
         warp_n = best_block_n // 2 if best_block_n != 32 else best_block_n
+    elif best_block_m == 16:
+        warp_m = 16
+        best_block_n = 64
+        warp_n = best_block_n // 4 if best_block_n <= 128 else best_block_n // 8
     elif best_block_n == 128 or best_block_n == 256:
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
         warp_n = best_block_n // 4
-
-    # best_block_m = 128
-    # best_block_n = 32
-    # warp_m = 32
-    # warp_n = 32
-    # block_k = 16
-    # best_num_stages = 3
 
     return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
