@@ -12,7 +12,6 @@
 #include <unistd.h>
 #include <sys/file.h>
 
-
 #include "accutlass.h"
 #include "cutlass/array.h"
 #include "cutlass/numeric_conversion.h"
@@ -258,11 +257,11 @@ public:
         uint32_t m_block_idx, n_block_idx;
         while (problem_visitor.next_tile(m_block_idx, n_block_idx))
         {
-
             loop++;
 
             cutlass::gemm::GemmCoord problem_size = problem_visitor.problem_size();
             int32_t problem_idx = problem_visitor.problem_index();
+            uint32_t curr_group_m = problem_visitor.get_curr_group_m();
 
             int32_t index_m = problem_visitor.get_global_idx(gemm_m, ThreadblockShape::kM, m_block_idx);
             int32_t index_n = problem_visitor.get_global_idx<false>(gemm_n, ThreadblockShape::kN, n_block_idx, m_block_idx);
@@ -287,11 +286,15 @@ public:
             // Construct iterators to A and B operands
             typename Mma::IteratorA iterator_A(
                 params.params_A, params.ptr_A,
-                {problem_size.m() * (ProblemVisitor::kGemmType == GemmType::GroupedMasked ? params.problem_count : 1), problem_size.k()}, thread_idx, tb_offset_A);
+                // {problem_size.m() * (ProblemVisitor::kGemmType == GemmType::GroupedMasked ? params.problem_count : 1), problem_size.k()},
+                {ProblemVisitor::kGemmType == GemmType::GroupedMasked || ProblemVisitor::kGemmType == GemmType::GroupedNoPad
+                    ? index_m + curr_group_m : problem_size.m(), problem_size.k()},
+                thread_idx, tb_offset_A);
 
             typename Mma::IteratorB iterator_B(params.params_B,
                 reinterpret_cast<ElementB*>(params.ptr_B),
                 {problem_size.k(), problem_size.n() * params.problem_count}, thread_idx, tb_offset_B);
+
 
             typename Mma::FragmentC accumulators;
 
@@ -335,7 +338,9 @@ public:
             );
 
             cutlass::gemm::GemmCoord problem_size_output(
-                problem_size.m() * (ProblemVisitor::kGemmType == GemmType::GroupedMasked ? problem_idx + 1 : 1),
+                // problem_size.m() * (ProblemVisitor::kGemmType == GemmType::GroupedMasked ? problem_idx + 1 : 1),
+                ProblemVisitor::kGemmType == GemmType::GroupedMasked || ProblemVisitor::kGemmType == GemmType::GroupedNoPad
+                    ? index_m + curr_group_m : problem_size.m(),
                 problem_size.n(),
                 problem_size.k()
             );

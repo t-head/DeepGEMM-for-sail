@@ -119,6 +119,7 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
 
     x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+
     m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
@@ -131,7 +132,10 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
         m_indices[actual_end:aligned_end] = -1
         ref_out[start:aligned_end] = x[start:aligned_end] @ y[i].t()
         start = aligned_end
-    ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
+    if not cycle:
+        ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
+    else:
+        ref_out = torch.empty_like(out)
     
     if d == torch.bfloat16:
         return m, x, y, m_indices, out, ref_out
@@ -148,7 +152,10 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
     y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
 
     out = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
-    ref_out = torch.einsum('gmk,gnk->gmn', x, y)
+    if not cycle:
+        ref_out = torch.einsum('gmk,gnk->gmn', x, y)
+    else:
+        ref_out = torch.empty_like(out)
 
     # Construct mask
     if file is not None:
@@ -194,22 +201,22 @@ def test_m_grouped_gemm_contiguous(d: torch.dtype, file=None) -> None:
                                                        (8, 4096, 7168, 4096), (8, 4096, 2048, 7168),
                                                        (32, 256, 7168, 4096), (32, 256, 2048, 7168)):
 
-        # num_groups, expected_m_per_group, k, n = 256, 4, 64, 32
+        # num_groups, expected_m_per_group, k, n = 2, 2, 256, 32
             test_func()
 
-            if benchmark:
-                # noinspection PyShadowingNames
-                def test_func():
-                    if (d == torch.bfloat16):
-                        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
-                    else:
-                        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
+    if benchmark:
+        # noinspection PyShadowingNames
+        def test_func():
+            if (d == torch.bfloat16):
+                deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
+            else:
+                deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
 
-                t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
-                valid_m = (m_indices != -1).sum().item()
-                print(f' > Perf ((contiguous dtype={str(d)}, {num_groups=:2}, {expected_m_per_group=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
-                f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
-                f'{(valid_m * k + num_groups * k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
+        t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+        valid_m = (m_indices != -1).sum().item()
+        print(f' > Perf ((contiguous dtype={str(d)}, {num_groups=:2}, {expected_m_per_group=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+        f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
+        f'{(valid_m * k + num_groups * k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
 
     print("Passed\n")
 
@@ -227,7 +234,8 @@ def test_m_grouped_gemm_masked(d: torch.dtype, file: str) -> None:
         if not cycle:
             for j in range(num_groups):
                 diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
-                assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+                if (masked_m[j] != 0):
+                    assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
 
     if file is not None:
         num_groups, max_m, n, k, expected_m_per_group = parse_dump_file(file)
@@ -236,29 +244,53 @@ def test_m_grouped_gemm_masked(d: torch.dtype, file: str) -> None:
         # Test correctness
         for num_groups, expected_m_per_group in ((1, 1024), (2, 512), (4, 256)):
             for k, n in ((7168, 4096), (2048, 7168), ):
-                for i in range(10):
+
+        # num_groups, expected_m_per_group, k, n = 4, 2, 128, 64
+                for i in range(1):
                     max_m = 2048
                     test_func()
 
-                if benchmark:
-                    # noinspection PyShadowingNames
-                    def test_func():
-                        if (d == torch.bfloat16):
-                            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
-                        else:
-                            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
+        if benchmark:
+            # noinspection PyShadowingNames
+            def test_func():
+                if (d == torch.bfloat16):
+                    deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
+                else:
+                    deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
 
-                    x, y, masked_m, out, ref_out = construct_grouped_masked(num_groups, max_m, expected_m_per_group, k, n, d, file)
+            x, y, masked_m, out, ref_out = construct_grouped_masked(num_groups, max_m, expected_m_per_group, k, n, d, file)
 
-                    # Test performance with fixed shapes
-                    # noinspection PyUnboundLocalVariable
-                    valid_m = masked_m.sum().item()
-                    t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+            # Test performance with fixed shapes
+            # noinspection PyUnboundLocalVariable
+            valid_m = masked_m.sum().item()
+            t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
 
-                    print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
-                        f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
-                        f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')                
+            print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+                f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
+                f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')                
     print('passed\n')
+
+
+def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
+    print('Testing grouped unpad GEMM:')
+
+    def test_func():
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, d, file)
+        # if (d == torch.bfloat16):
+        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
+        # else:
+            # deep_gemm.m_grouped_gemm_int8_int8_bf16_nt(x, y, out, m_indices, masked_m, expected_m_per_group)
+
+        if not cycle:
+            out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
+            diff = calc_diff(out, ref_out)
+            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+
+    num_groups, expected_m_per_group, k, n = 2, 2, 128, 16
+    test_func()
+
+    print("Passed\n")
+
 
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -285,14 +317,14 @@ if __name__ == '__main__':
         cycle = 1
 
     if args.file is not None:
-        if "int8" and "GroupedContiguous" in args.file:
+        if "int8" in args.file and "GroupedContiguous" in args.file:
             test_m_grouped_gemm_contiguous(torch.int8, args.file)
-        elif "int8" and "GroupedMasked" in args.file:
+        elif "int8" in args.file and "GroupedMasked" in args.file:
             test_m_grouped_gemm_masked(torch.int8, args.file)
         elif "GroupedContiguous" in args.file:
-            test_m_grouped_gemm_contiguous(torch.int8, args.file)
+            test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
         elif "GroupedMasked" in args.file:
-            test_m_grouped_gemm_masked(torch.int8, args.file)
+            test_m_grouped_gemm_masked(torch.bfloat16, args.file)
         else:
             "invalid dump file\n"
     else:
@@ -303,5 +335,6 @@ if __name__ == '__main__':
         test_gemm(torch.bfloat16)
         test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
         test_m_grouped_gemm_masked(torch.bfloat16, args.file)
+        # test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
 
 

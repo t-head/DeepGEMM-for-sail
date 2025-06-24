@@ -107,10 +107,11 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
 
-    #for better occ for 810e hbm bound, use smallest blockN for m16
-    if (best_block_m == 16):
+    #small m hbm bound, wave is not usful, for better occ for 810e hbm bound, use smallest blockN for m16
+    if (m <=24) :
+        best_block_m = 16
         best_block_n = 64
-
+    
     assert best_block_m is not None and best_block_n is not None
     
     # Always pick the longest one
@@ -129,7 +130,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
  
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
 
-    if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4):
+    if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16:
         # Unrolling both stages and `num_former_iters` will cause large code size
         stage_candidates = (3, 2)
 

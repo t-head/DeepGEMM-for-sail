@@ -11,10 +11,11 @@ namespace deep_gemm {
 enum class GemmType {
     Normal,
     GroupedContiguous,
-    GroupedMasked
+    GroupedMasked,
+    GroupedNoPad
 };
 
-const char* GemmTypeS[] = { "Normal", "GroupedContiguous", "GroupedMasked" };
+const char* GemmTypeS[] = { "Normal", "GroupedContiguous", "GroupedMasked", "GroupedNoPad"};
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
@@ -105,6 +106,8 @@ struct Scheduler
 
     uint32_t num_n_blocks;
 
+    uint32_t last_block_m;
+
     CUTLASS_DEVICE
     Scheduler(Params const& params_, SharedStorage& shared_storage_, int32_t block_idx)
         : params(params_)
@@ -118,9 +121,13 @@ struct Scheduler
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if (kGemmType == GemmType::GroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
-        } else if (kGemmType == GemmType::GroupedMasked) {
+        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
             curr_cumsum = 0;
         }
+    }
+
+    CUTLASS_DEVICE uint32_t get_curr_group_m() {
+        return last_block_m;
     }
 
     template <bool kIgnoreGroupedForGroupedContiguous=true>
@@ -133,6 +140,9 @@ struct Scheduler
             return offset * shape_dim + block_idx * block_size;
         } else if constexpr (kGemmType == GemmType::GroupedMasked) {
             return curr_group_idx * shape_dim + block_idx * block_size;
+        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
+            int block_m = kIgnoreGroupedForGroupedContiguous ? last_block_m : shape_dim;
+            return curr_group_idx * block_m + block_idx * block_size;
         }
     }
 
@@ -162,18 +172,23 @@ struct Scheduler
     bool next_tile(uint32_t& m_block_idx, uint32_t& n_block_idx)
     {
         const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
+   
+        if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
+            uint32_t num_m = 0;
+            uint32_t num_m_blocks = 0;
 
-        if constexpr (kGemmType == GemmType::GroupedMasked) {
-            uint32_t num_m_blocks;
             while (true) {
                 // End of the task
                 if (curr_group_idx == params.problem_count)
                     return false;
 
                 // Within current group
-                num_m_blocks = cutlass::ceil_div(static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx)), ThreadblockShape::kM);
+                // num_m_blocks = cutlass::ceil_div(static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx)), ThreadblockShape::kM);
+                num_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
+                num_m_blocks = cutlass::ceil_div(num_m, ThreadblockShape::kM);
 
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
+
                 if (next_block_idx < current_m_block_cumsum * num_n_blocks)
                     break;
 
@@ -182,6 +197,10 @@ struct Scheduler
             }
 
             get_swizzled_block_idx(num_m_blocks, next_block_idx - curr_cumsum * num_n_blocks, m_block_idx, n_block_idx);
+
+            last_block_m = (num_m - (m_block_idx * ThreadblockShape::kM)) < ThreadblockShape::kM
+                     ? (num_m - (m_block_idx * ThreadblockShape::kM))
+                     : ThreadblockShape::kM;
         } else  {
             if (next_block_idx >= num_blocks)
                 return false;

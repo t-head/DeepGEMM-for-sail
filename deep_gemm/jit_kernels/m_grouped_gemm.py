@@ -137,3 +137,68 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
 
     # Run the kernel
     runtime(*args)
+
+
+def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
+                                     rhs: Tuple[torch.Tensor],
+                                     out: torch.Tensor, m_indices: torch.Tensor) -> None:
+    lhs = lhs
+    rhs = rhs
+    m, k = lhs.shape
+    num_groups, n, k_ = rhs.shape
+    m_, n_ = out.shape
+    m__ = m_indices.numel()
+
+    # Type and shape checks
+    assert m == m_ == m__ and k == k_ and n == n_
+    assert lhs.dtype == torch.bfloat16
+    assert rhs.dtype == torch.bfloat16
+    assert out.dtype == torch.bfloat16
+    assert m_indices.dtype == torch.int32
+    assert lhs.is_contiguous() and rhs.is_contiguous()
+    assert out.is_contiguous() and m_indices.is_contiguous()
+
+    expected_m = m // num_groups
+
+    # Do nothing if `m` is zero
+    if m == 0:
+        return
+
+    # Auto-tuning with compilation
+    global includes, template
+    num_sms = get_num_sms()
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
+
+    masked_m = torch.bincount(m_indices).int()
+
+    # print(f'm_indices:{m_indices}\n')
+    # print(f'masked_m:{masked_m}\n')
+
+    # Extra checks for TMA store
+    if num_groups > 1 and m > block_m:
+        assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
+
+    args = (lhs, rhs, out,
+            masked_m, m, expected_m,
+            torch.cuda.current_stream(), num_sms, smem_config[0])
+
+    runtime = jit_tuner.compile_and_tune(
+        name='m_grouped_gemm_bf16_bf16_bf16_nt',
+        keys={'N': n, 'K': k,
+              'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+              'WARP_M': warp_m, 'WARP_N': warp_n,
+              'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
+              'GEMM_TYPE': 'GroupedNoPad'},
+        space=(),
+        includes=includes,
+        arg_defs=(('lhs', torch.bfloat16),
+                  ('rhs', torch.bfloat16),
+                  ('out', torch.bfloat16),
+                  ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
+                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+        template=template,
+        args=args
+    )
+
+    # Run the kernel
+    runtime(*args)

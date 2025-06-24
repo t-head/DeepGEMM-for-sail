@@ -69,6 +69,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         block_ms = (256, 128, 64, 32, 16)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
+        # block_ms = (16, 32)
 
     # block_ns = (32, 64, 128, 256)
     block_ns = (256, 128, 64, 32)
@@ -105,15 +106,16 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                     success |= block_n == best_block_n and block_m < best_block_m
                     # Case 3: different for both `block_m` and `block_n`, `block_n` larger is better
                     success |= block_m != best_block_m and block_n > best_block_n
+
+            # print(f'm:{m}, n:{n}, block_m:{block_m}, block_n:{block_n}, num_waves:{num_waves}, best_num_waves:{best_num_waves}')
+
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
 
-    #for better occ for 810e hbm bound, use smallest blockN for m16
-    if (best_block_m == 16):
+    #small m hbm bound, wave is not usful, for better occ for 810e hbm bound, use smallest blockN for m16
+    if (m <=24) :
+        best_block_m = 16
         best_block_n = 64
     
-    # best_block_m = 32
-    # best_block_n = 32
-
     assert best_block_m is not None and best_block_n is not None
     
     # Always pick the longest one
@@ -166,7 +168,6 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         warp_n = best_block_n // 2 if best_block_n != 32 else best_block_n
     elif best_block_m == 16:
         warp_m = 16
-        best_block_n = 64
         warp_n = best_block_n // 4 if best_block_n <= 128 else best_block_n // 8
     elif best_block_n == 128 or best_block_n == 256:
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
