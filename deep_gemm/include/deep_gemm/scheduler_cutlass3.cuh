@@ -9,8 +9,10 @@
 #include "cutlass/workspace.h"
 #include "cutlass/platform/platform.h"
 #include "cutlass/fast_math.h"
-#include "cutlass/gemm_coord.h"
+#include "cutlass/gemm_coord.hpp"
 ////////////////////////////////////////////////////////////////////////////////
+
+const char* GemmTypeS[] = { "Normal", "GroupedContiguous", "GroupedMasked" };
 
 // namespace cutlass::gemm::kernel {
 namespace deep_gemm {
@@ -35,12 +37,16 @@ enum class GemmType {
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
 template <GemmType kGemmType,
-          uint32_t SHAPE_N, uint32_t SHAPE_K,
-          uint32_t BLOCK_M, uint32_t BLOCK_N,
+          uint32_t SHAPE_N_, uint32_t SHAPE_K_,
+          uint32_t BLOCK_M_, uint32_t BLOCK_N_,
           uint32_t kNumGroups,
-          uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N),
+          uint32_t kNumNBlocks = ceil_div(SHAPE_N_, BLOCK_N_),
           uint32_t kNum1DBlocksPerGroup = 16>
 struct DeepGemmScheduler {
+    constexpr static uint32_t SHAPE_N = SHAPE_N_;
+    constexpr static uint32_t SHAPE_K = SHAPE_K_;
+    constexpr static uint32_t BLOCK_M = BLOCK_M_;
+    constexpr static uint32_t BLOCK_N = BLOCK_N_;
     int current_iter = -1;
     uint32_t num_aligned_m_blocks;
     constexpr static bool kIsTMAMulticastOnA = false;
@@ -230,6 +236,18 @@ struct DeepGemmScheduler {
             return int64_t(curr_group_idx) * param.shape_m * SHAPE_K;
         } else if constexpr (kGemmType == GemmType::GroupedMaskedNoBubble) {
             return int64_t(curr_cumsum_m) * SHAPE_K;
+        } else {
+            return 0;
+        }
+    }
+
+    /// Gets the pointer offset of matrix A
+    __device__ __forceinline__ int64_t curr_offset_m(const Params& param) const
+    {
+        if constexpr (kGemmType == GemmType::GroupedMasked) {
+            return int64_t(curr_group_idx) * param.shape_m;
+        } else if constexpr (kGemmType == GemmType::GroupedMaskedNoBubble) {
+            return curr_cumsum_m;
         } else {
             return 0;
         }

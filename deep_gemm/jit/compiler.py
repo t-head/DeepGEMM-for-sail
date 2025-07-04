@@ -13,21 +13,24 @@ from .template import typename_map
 
 runtime_cache = RuntimeCache()
 
-_jit_include_dir = f'{os.path.dirname(os.path.abspath(__file__))}/../include'
+_jit_include_dir_default = f'{os.path.dirname(os.path.abspath(__file__))}/../include'
+_jit_include_dir = _jit_include_dir_default
 
 def hash_to_hex(s: str) -> str:
     md5 = hashlib.md5()
     md5.update(s.encode('utf-8'))
     return md5.hexdigest()[0:12]
 
-@functools.lru_cache(maxsize=None)
 def set_jit_include_dir(new_jit_include_dir : str = None) -> None:
     global _jit_include_dir
     if new_jit_include_dir :
         _jit_include_dir = f'{os.path.dirname(os.path.abspath(__file__))}/../include' + "/" + new_jit_include_dir
+    else:
+        _jit_include_dir = _jit_include_dir_default
+    # print("--------------------------- set_jit_include_dir = ", _jit_include_dir)
 
-@functools.lru_cache(maxsize=None)
 def get_jit_include_dir() -> str:
+    # print("--------------------------- get_jit_include_dir = ", _jit_include_dir)
     return _jit_include_dir
 
 @functools.lru_cache(maxsize=None)

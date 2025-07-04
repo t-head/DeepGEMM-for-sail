@@ -1,5 +1,6 @@
 import math
 import torch
+import os
 from functools import lru_cache
 from typing import Tuple
 
@@ -8,6 +9,7 @@ from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout
 
 # C++ code templates
 includes = ('"deep_gemm/fp16_gemm.cuh"', )
+includes_cutlass3 = ('"../deep_gemm/fp16_gemm_cutlass3.cuh"', )
 template = """
 using namespace deep_gemm;
 
@@ -208,7 +210,13 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
         warp_n = best_block_n // 4
 
-    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
+    extra_info = {}
+    use_cutlass3 = False
+    if 'DG_USE_CUTLASS3' in os.environ:
+        use_cutlass3 = int(os.getenv('DG_USE_CUTLASS3'))
+    extra_info['use_cutlass3'] = use_cutlass3
+
+    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config, extra_info
 
 
 def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
@@ -236,7 +244,7 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
     global includes, template
 
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(m, n, k, 1, num_sms)
 
     args = (lhs, rhs, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
 
@@ -246,12 +254,13 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'NUM_STAGES': num_stages},
         space=(),
-        includes=includes,
+        includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
         arg_defs=(('lhs', torch.bfloat16),
                   ('rhs', torch.bfloat16),
                   ('out', torch.bfloat16), ('m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
+        jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
 

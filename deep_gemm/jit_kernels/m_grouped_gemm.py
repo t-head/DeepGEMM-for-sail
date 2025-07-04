@@ -8,6 +8,7 @@ import os
 
 # C++ code templates
 includes = ('"deep_gemm/fp16_gemm.cuh"', )
+includes_cutlass3 = ('"../deep_gemm/fp16_gemm_cutlass3.cuh"', )
 template = """
 using namespace deep_gemm;
 
@@ -78,7 +79,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
 
     expected_m = 0
     args = (lhs, rhs, out,
@@ -92,7 +93,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'GEMM_TYPE': 'GroupedContiguous'},
         space=(),
-        includes=includes,
+        includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes ,
         arg_defs=(('lhs', torch.bfloat16),
                   ('rhs', torch.bfloat16),
                   ('out', torch.bfloat16),
@@ -100,6 +101,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
                   ('num_groups', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
+        jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
 
@@ -130,7 +132,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
     global includes, template
 
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
 
     # Extra checks for TMA store
     if num_groups > 1 and m > block_m:
@@ -148,13 +150,14 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'GEMM_TYPE': 'GroupedMasked'},
         space=(),
-        includes=includes,
+        includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
         arg_defs=(('lhs', torch.bfloat16),
                   ('rhs', torch.bfloat16),
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
+        jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
 
@@ -224,7 +227,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
             use_gemv = True
 
     if use_gemv == False:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
 
         masked_m = torch.bincount(m_indices, minlength=num_groups).int()
 
