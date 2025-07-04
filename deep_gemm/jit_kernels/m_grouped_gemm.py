@@ -3,7 +3,8 @@ from typing import Tuple
 
 from .gemm import get_best_configs
 from .tuner import jit_tuner
-from .utils import get_num_sms
+from .utils import get_num_sms, ceil_div, get_case_id
+import os
 
 # C++ code templates
 includes = ('"deep_gemm/fp16_gemm.cuh"', )
@@ -158,7 +159,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert out.is_contiguous() and m_indices.is_contiguous()
 
-    expected_m = m // num_groups
+    expected_m = ceil_div(m, num_groups)
 
     # Do nothing if `m` is zero
     if m == 0:
@@ -169,14 +170,9 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
     num_sms = get_num_sms()
     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
 
-    masked_m = torch.bincount(m_indices).int()
+    masked_m = torch.bincount(m_indices, minlength=num_groups).int()
 
-    # print(f'm_indices:{m_indices}\n')
-    # print(f'masked_m:{masked_m}\n')
-
-    # Extra checks for TMA store
-    if num_groups > 1 and m > block_m:
-        assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
+    # print(f'masked_m:{num_groups}\n')
 
     args = (lhs, rhs, out,
             masked_m, m, expected_m,
@@ -199,6 +195,18 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
         template=template,
         args=args
     )
+
+    dump_env = os.getenv('dump_group_m')
+    if dump_env:
+        filename = f"case{get_case_id()}_groups{num_groups}_m{m}_n{n}_k{k}_em{expected_m}_GroupedNoPad.dump"
+        tensor_cpu = m_indices.detach().cpu()
+        data = tensor_cpu.tolist()
+
+        print(f"[INFO] file:{filename} with size:{m_indices.size()}\n")
+
+        with open(filename, 'w', encoding='utf-8') as f:
+            for num in data:
+                f.write(f"{num}\n")
 
     # Run the kernel
     runtime(*args)

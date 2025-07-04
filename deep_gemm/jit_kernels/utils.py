@@ -57,7 +57,6 @@ def get_m_alignment_for_contiguous_layout():
         Group-level alignment requirement for grouped contiguous layout, which is always 128.
     """
     return 128
-    # return 16
 
 def get_tma_aligned_size(x: int, element_size: int) -> int:
     """
@@ -111,3 +110,10 @@ def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
     aligned_x[:, :m, :] = x
     aligned_x = aligned_x[:, :m, :]
     return aligned_x.squeeze(0) if remove_dim else aligned_x
+
+
+def get_case_id() -> int:
+    if not hasattr(get_case_id, 'case_id'):
+        get_case_id.case_id = 0
+    get_case_id.case_id += 1
+    return get_case_id.case_id

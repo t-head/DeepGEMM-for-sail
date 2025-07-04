@@ -157,7 +157,6 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
                 break
     return tuple(kernel_times) if is_tupled else kernel_times[0]
 
-
 def calc_diff(x, y):
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
@@ -173,3 +172,9 @@ def count_bytes(tensors):
         else:
             total += t.numel() * t.element_size()
     return total
+
+def get_case_id() -> int:
+    if not hasattr(get_case_id, 'case_id'):
+        get_case_id.case_id = 0
+    get_case_id.case_id += 1
+    return get_case_id.case_id

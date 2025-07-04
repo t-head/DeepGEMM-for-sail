@@ -97,7 +97,7 @@ struct Scheduler
     SharedStorage& shared_storage;
 
     // Only used for masked layout
-    uint32_t curr_group_idx, curr_cumsum;
+    uint32_t curr_group_idx, curr_cumsum, curr_m_start, curr_m;
 
     int current_iter = 0;
     uint32_t num_aligned_m_blocks;
@@ -105,8 +105,6 @@ struct Scheduler
     uint32_t num_blocks;
 
     uint32_t num_n_blocks;
-
-    uint32_t last_block_m;
 
     CUTLASS_DEVICE
     Scheduler(Params const& params_, SharedStorage& shared_storage_, int32_t block_idx)
@@ -122,12 +120,12 @@ struct Scheduler
         } else if (kGemmType == GemmType::GroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
-            curr_cumsum = 0;
+            curr_cumsum = curr_m_start = curr_m = 0;
         }
     }
 
-    CUTLASS_DEVICE uint32_t get_curr_group_m() {
-        return last_block_m;
+    CUTLASS_DEVICE uint32_t get_curr_m() {
+        return curr_m;
     }
 
     template <bool kIgnoreGroupedForGroupedContiguous=true>
@@ -141,8 +139,8 @@ struct Scheduler
         } else if constexpr (kGemmType == GemmType::GroupedMasked) {
             return curr_group_idx * shape_dim + block_idx * block_size;
         } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
-            int block_m = kIgnoreGroupedForGroupedContiguous ? last_block_m : shape_dim;
-            return curr_group_idx * block_m + block_idx * block_size;
+            return (kIgnoreGroupedForGroupedContiguous ?
+                curr_m_start : curr_group_idx * shape_dim) + block_idx * block_size;
         }
     }
 
@@ -188,17 +186,18 @@ struct Scheduler
                 num_m_blocks = cutlass::ceil_div(num_m, ThreadblockShape::kM);
 
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
-
+    
                 if (next_block_idx < current_m_block_cumsum * num_n_blocks)
                     break;
-
+        
+                curr_m_start += num_m;
                 // Move to check the next group
                 curr_group_idx ++, curr_cumsum = current_m_block_cumsum;
             }
 
             get_swizzled_block_idx(num_m_blocks, next_block_idx - curr_cumsum * num_n_blocks, m_block_idx, n_block_idx);
 
-            last_block_m = (num_m - (m_block_idx * ThreadblockShape::kM)) < ThreadblockShape::kM
+            curr_m = (num_m - (m_block_idx * ThreadblockShape::kM)) < ThreadblockShape::kM
                      ? (num_m - (m_block_idx * ThreadblockShape::kM))
                      : ThreadblockShape::kM;
         } else  {

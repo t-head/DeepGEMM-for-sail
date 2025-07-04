@@ -80,7 +80,7 @@ def read_numbers_from_file(file_path):
 
 def parse_dump_file(file):
     import re, math
-    if ("GroupedMasked" or "Contiguous" in file):
+    if ("GroupedMasked" or "Contiguous" or "GroupedNoPad" in file):
         pattern = r'groups(\d+)_m(\d+)_n(\d+)_k(\d+)_em(\d+)'
         match = re.search(pattern, file)
 
@@ -100,10 +100,8 @@ def parse_dump_file(file):
     return num_groups, m, n, k, expected_m_per_group
 
 
-def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, file: str) -> \
+def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, file: str, alignment: int) -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-
-    alignment = get_m_alignment_for_contiguous_layout()
 
     if file is not None:
         index = read_numbers_from_file(file)
@@ -182,7 +180,7 @@ def test_m_grouped_gemm_contiguous(d: torch.dtype, file=None) -> None:
     print('Testing grouped contiguous GEMM:')
 
     def test_func():
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, d, file)
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, d, file, get_m_alignment_for_contiguous_layout())
         if (d == torch.bfloat16):
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
         else:
@@ -194,7 +192,7 @@ def test_m_grouped_gemm_contiguous(d: torch.dtype, file=None) -> None:
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
     if file is not None:
-        num_groups, max_m, n, k, expected_m_per_group = parse_dump_file(file)
+        num_groups, expected_m_per_group, n, k, m = parse_dump_file(file)
         test_func()
     else:
         for num_groups, expected_m_per_group, k, n in ((4, 8192, 7168, 4096), (4, 8192, 2048, 7168),
@@ -242,11 +240,10 @@ def test_m_grouped_gemm_masked(d: torch.dtype, file: str) -> None:
         test_func()
     else:
         # Test correctness
+        # num_groups, expected_m_per_group, k, n = 4, 2, 128, 64
         for num_groups, expected_m_per_group in ((1, 1024), (2, 512), (4, 256)):
             for k, n in ((7168, 4096), (2048, 7168), ):
-
-        # num_groups, expected_m_per_group, k, n = 4, 2, 128, 64
-                for i in range(1):
+                for i in range(10):
                     max_m = 2048
                     test_func()
 
@@ -275,19 +272,22 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
     print('Testing grouped unpad GEMM:')
 
     def test_func():
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, d, file)
-        # if (d == torch.bfloat16):
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, d, file, 1)
         deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
-        # else:
-            # deep_gemm.m_grouped_gemm_int8_int8_bf16_nt(x, y, out, m_indices, masked_m, expected_m_per_group)
 
         if not cycle:
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
             diff = calc_diff(out, ref_out)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
-    num_groups, expected_m_per_group, k, n = 2, 2, 128, 16
-    test_func()
+    if file is not None:
+        num_groups, expected_m_per_group, n, k, m = parse_dump_file(file)
+        test_func()
+    else:
+        for num_groups, expected_m_per_group in ((256, 1), (256, 4), (256, 16), (256, 32), (128, 8), (128, 64), (128, 1024)):
+            for k, n in ((7168, 4096), (2048, 7168), (256, 768), (512, 128)):
+        # num_groups, expected_m_per_group, k, n = 4, 2, 128, 16
+                test_func()
 
     print("Passed\n")
 
@@ -325,6 +325,8 @@ if __name__ == '__main__':
             test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
         elif "GroupedMasked" in args.file:
             test_m_grouped_gemm_masked(torch.bfloat16, args.file)
+        elif "GroupedNoPad" in args.file:
+            test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
         else:
             "invalid dump file\n"
     else:
@@ -335,6 +337,6 @@ if __name__ == '__main__':
         test_gemm(torch.bfloat16)
         test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
         test_m_grouped_gemm_masked(torch.bfloat16, args.file)
-        # test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
+        test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
 
 

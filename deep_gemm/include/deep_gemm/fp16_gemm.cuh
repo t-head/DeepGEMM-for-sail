@@ -261,7 +261,7 @@ public:
 
             cutlass::gemm::GemmCoord problem_size = problem_visitor.problem_size();
             int32_t problem_idx = problem_visitor.problem_index();
-            uint32_t curr_group_m = problem_visitor.get_curr_group_m();
+            uint32_t curr_group_m = problem_visitor.get_curr_m();
 
             int32_t index_m = problem_visitor.get_global_idx(gemm_m, ThreadblockShape::kM, m_block_idx);
             int32_t index_n = problem_visitor.get_global_idx<false>(gemm_n, ThreadblockShape::kN, n_block_idx, m_block_idx);
@@ -294,7 +294,6 @@ public:
             typename Mma::IteratorB iterator_B(params.params_B,
                 reinterpret_cast<ElementB*>(params.ptr_B),
                 {problem_size.k(), problem_size.n() * params.problem_count}, thread_idx, tb_offset_B);
-
 
             typename Mma::FragmentC accumulators;
 
@@ -435,17 +434,16 @@ public:
         }
     
         char *pEnv_params_dump = std::getenv("dump_group_m");
-        if (pEnv_params_dump && isdigit(*pEnv_params_dump) && kGemmType != GemmType::Normal) {
+        if (pEnv_params_dump && isdigit(*pEnv_params_dump) && (kGemmType != GemmType::Normal || kGemmType != GemmType::GroupedNoPad)) {
             // check if cuda graph captured
             cudaStreamCaptureStatus captureStatus;
             cudaStreamIsCapturing(stream, &captureStatus);
             // add cuda graph mode later
             if (captureStatus != cudaStreamCaptureStatusNone) {
-                printf("[moe gemm]: dump_group_m not supported in cuda graph mode.");
+                printf("dump_group_m not supported in cuda graph mode.");
                 return;
             }
 
-            static int casedId = 0;
             std::ostringstream filename;
             int id = generate_id();
             filename << "case" << id << "_"
