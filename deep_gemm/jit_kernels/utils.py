@@ -26,8 +26,9 @@ def get_num_sms() -> int:
     global _num_sms
     if _num_sms is None:
         device_props = torch.cuda.get_device_properties(device='cuda')
-        if device_props.name == "ZW810E" or device_props.name == "ZW610E":
-            _nums_sms = 20
+        print(f'device_props.name:{device_props.name}')
+        if "ZW810E" in device_props.name or "ZW610E" in device_props.name:
+            _num_sms = 20
         else:
             _num_sms = device_props.multi_processor_count
     return _num_sms

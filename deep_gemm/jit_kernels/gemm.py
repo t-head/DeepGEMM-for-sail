@@ -60,6 +60,40 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
     return smem_size, swizzle_mode, block_n_padding
 
 @lru_cache(maxsize=None)
+def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int):
+    Alignment = 8
+    if k % (32 * 2 * Alignment) == 0:
+        ThreadPerN = 32
+        NUM_UNROLL = 2
+
+        if m >= 16 * 8:
+            NPerThread = 4
+            SWZL_SIZE_M = 4
+        elif m >= 4 * 8:
+            NPerThread = 2
+            SWZL_SIZE_M = 2
+        else:
+            NPerThread = 1
+            SWZL_SIZE_M = 1
+    elif k % (8 * Alignment) == 0:
+        ThreadPerN = 8
+        NUM_UNROLL = 1
+        SWZL_SIZE_M = 1
+
+        if m >= 8 * 8:
+            NPerThread = 4
+        else:
+            NPerThread = 1
+    else:
+        print(f"DeepGemm: gemmv not support m:{m}, n:{n}, k:{k}, groups:{num_groups}, num_sms:{num_sms}\n")
+        ThreadPerN = -1
+        NUM_UNROLL = -1
+        SWZL_SIZE_M = -1
+        NPerThread = -1
+
+    return ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread
+
+@lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
