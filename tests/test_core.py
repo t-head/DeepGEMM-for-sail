@@ -37,8 +37,25 @@ def construct(m: int, k: int, n: int, d: torch.dtype) -> \
         x_int8, y_int8 = per_token_cast_to_int8(x), per_token_cast_to_int8(y)
         return x_int8, y_int8, out, ref_out
 
-def test_gemm(d: torch.dtype) -> None:
+def test_gemm(d: torch.dtype, file = None) -> None:
     print('Testing GEMM:')
+
+    def test_func(m, n, k, d):
+        print("test_gemm->test_func: ", m, n, k, d)
+        x, y, out, ref_out = construct(m, k, n, d)
+        if d == torch.bfloat16:
+            deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
+        else:
+            deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
+        if not cycle:
+            diff = calc_diff(out, ref_out)
+            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+
+    if file is not None:
+        num_groups, expected_m_per_group, n, k, m = parse_dump_file(file)
+        test_func(m, n, k, d)
+        return
+
     for m in (64, 128, 4096):
         for k, n in [(576, 7168), (7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
             x, y, out, ref_out = construct(m, k, n, d)
@@ -80,7 +97,7 @@ def read_numbers_from_file(file_path):
 
 def parse_dump_file(file):
     import re, math
-    if ("GroupedMasked" or "Contiguous" or "GroupedNoPad" in file):
+    if ("GroupedMasked" in file or "Contiguous" in file or "GroupedNoPad" in file):
         pattern = r'groups(\d+)_m(\d+)_n(\d+)_k(\d+)_em(\d+)'
         match = re.search(pattern, file)
 
@@ -97,6 +114,23 @@ def parse_dump_file(file):
             print(f"expected_m_per_group: {expected_m_per_group}")
         else:
             print("Pattern not found.")
+    elif "DenseGemm" in file:
+        # print("DenseGemm found int file, ", file)
+        pattern = r'm(\d+)_n(\d+)_k(\d+)'
+        match = re.search(pattern, file)
+        if match:
+            num_groups = 1
+            expected_m_per_group = 1
+            m = int(match.group(1))
+            n = int(match.group(2))
+            k = int(match.group(3))
+            print(f"m: {m}")
+            print(f"n: {n}")
+            print(f"k: {k}")
+        else:
+            print("Pattern not found.")
+    else:
+        print("GemmType not supported.")
     return num_groups, m, n, k, expected_m_per_group
 
 
@@ -327,6 +361,8 @@ if __name__ == '__main__':
             test_m_grouped_gemm_masked(torch.bfloat16, args.file)
         elif "GroupedNoPad" in args.file:
             test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
+        elif "DenseGemm" in args.file:
+            test_gemm(torch.int8, args.file)
         else:
             "invalid dump file\n"
     else:

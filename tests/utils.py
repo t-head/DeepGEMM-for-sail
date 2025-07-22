@@ -35,7 +35,7 @@ def read_cycle_from_nculog(filename):
 
     with open(filename, newline='') as log_file:
         for line in log_file.read().split("\n"):
-            if re.search(kernel_pattern, line, re.IGNORECASE):
+            if re.search(kernel_pattern, line):
                 kernel_list.append(line.strip())
             if re.search(cycles_pattern, line):
                 cycles_list.append(int(line.strip().split()[-1]))

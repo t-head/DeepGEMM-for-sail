@@ -175,8 +175,53 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
         warp_n = best_block_n // 4
 
+    if num_groups == 1 and m <= 16:
+        num_min_sms = 20
+        if k >= 7168:
+            # memory bound
+            (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 64, 256, 16, 16, 4)
+        elif k <= 512:
+            # latency bound
+            (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 128, 64, 16, 32, 2)
+        else:
+            (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 128, 128, 16, 32, 4)
+
+    # print(best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages)
+
     return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
+def generate_search_space():
+    tile_list = [
+        [16, 64, 64, 3],
+        [16, 64, 128, 3],
+        [16, 64, 256, 2],
+        [16, 64, 256, 3],
+        [16, 64, 512, 2],
+        [16, 64, 512, 3],
+        [16, 64, 64, 4],
+        [16, 64, 128, 4],
+        [16, 64, 256, 4],
+        [16, 64, 512, 4],
+
+        [16, 128, 128, 3],
+        [16, 128, 256, 3],
+        [16, 128, 128, 4],
+        [16, 128, 256, 4],
+        [16, 128, 128, 5],
+        [16, 128, 256, 5],
+
+        [16, 128, 64, 2],
+        [16, 128, 64, 3],
+        [16, 256, 64, 2],
+        [16, 256, 64, 3],
+    ]
+    space = []
+    for tile in tile_list:
+        config = {'BLOCK_M': tile[0], 'BLOCK_N': tile[1], 'BLOCK_K': tile[2],
+              'WARP_M': tile[0], 'WARP_N': tile[1] // 4,
+              'NUM_STAGES': tile[3]}
+        space.append(config)
+    return space
 
 def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
                          rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -214,6 +259,7 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'NUM_STAGES': num_stages},
         space=(),
+        # space=generate_search_space(),
         includes=includes,
         arg_defs=(('lhs', torch.int8), ('lhs_scales', torch.float),
                   ('rhs', torch.int8), ('rhs_scales', torch.float),
