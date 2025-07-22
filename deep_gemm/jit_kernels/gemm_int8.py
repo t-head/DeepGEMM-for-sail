@@ -1,13 +1,16 @@
 import math
 import torch
+import os
 from functools import lru_cache
 from typing import Tuple
+import re
 
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout
 
 # C++ code templates
 includes = ('"deep_gemm/int8_gemm.cuh"', )
+includes_cutlass3 = ('"../deep_gemm/int8_gemm_cutlass3.cuh"', )
 template = """
 using namespace deep_gemm;
 
@@ -184,9 +187,20 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         else:
             (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 128, 128, 16, 32, 4)
 
+    # (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 64, 256, 16, 16, 4)
     # print(best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages)
 
-    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
+    extra_info = {}
+    use_cutlass3 = False
+    use_multistage_on_N = False
+    if 'DG_USE_CUTLASS3' in os.environ:
+        use_cutlass3 = int(os.getenv('DG_USE_CUTLASS3'))
+    extra_info['use_cutlass3'] = use_cutlass3
+    if 'DG_USE_MULTISTAGE_ON_N' in os.environ:
+        use_multistage_on_N = int(os.getenv('DG_USE_MULTISTAGE_ON_N'))
+    extra_info['use_multistage_on_N'] = use_multistage_on_N
+
+    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config, extra_info
 
 def generate_search_space():
     tile_list = [
@@ -246,10 +260,14 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     global includes, template
 
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(m, n, k, 1, num_sms)
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m, torch.cuda.current_stream(), num_sms, smem_config[0])
+
+    template_updated = template
+    if extra_info['use_multistage_on_N']:
+        template_updated = template.replace("GemmType::Normal>", "GemmType::Normal,1>")
 
     runtime = jit_tuner.compile_and_tune(
         name='gemm_int8_int8_bf16_nt',
@@ -258,12 +276,13 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
               'NUM_STAGES': num_stages},
         space=(),
         # space=generate_search_space(),
-        includes=includes,
+        includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
         arg_defs=(('lhs', torch.int8), ('lhs_scales', torch.float),
                   ('rhs', torch.int8), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16), ('m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template,
+        template=template_updated,
+        jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
 

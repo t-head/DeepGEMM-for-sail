@@ -25,6 +25,26 @@
 
 #include "ppu/ppu_include.hpp"
 
+template <typename GemmKernel>
+inline int compute_occupancy_for_kernel()
+{
+  int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
+  if (smem_size > (48 << 10)) {
+    cudaError_t result;
+    result = cudaFuncSetAttribute(cutlass::device_kernel<GemmKernel>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  smem_size);
+  }
+
+  int max_active_blocks = -1;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &max_active_blocks, cutlass::device_kernel<GemmKernel>, GemmKernel::MaxThreadsPerBlock, smem_size);
+
+  printf("compute_occupancy_for_kernel, smem_size = %d, max_active_blocks = %d\n", smem_size, max_active_blocks);
+//   max_active_blocks = 12;
+  return max_active_blocks;
+}
+
 using namespace cute;
 
 namespace cutlass::gemm {
@@ -34,7 +54,7 @@ struct KernelAiuMultistageOnN {
 };
 
 template<int Stages_, typename Schedule_ = KernelAiuMultistage>
-struct MainloopAcomputeAiuOpt {
+struct MainloopAcomputeAiuA8W8 {
   constexpr static int Stages = Stages_;
   using ArchTag = arch::Sm80;
   using Schedule = Schedule_;
@@ -55,7 +75,6 @@ template <
   class Enable = void
 >
 class DeepGemmUniversal;
-
 
 template <
   class ProblemShape_,
@@ -91,12 +110,15 @@ public:
   using MainloopArguments = typename CollectiveMainloop::Arguments;
   using MainloopParams = typename CollectiveMainloop::Params;
 
+  using ElementScale = float;
+
   // Epilogue derived types
   using CollectiveEpilogue = CollectiveEpilogue_;
   using ElementC = typename CollectiveEpilogue::ElementC;
   using StrideC  = typename CollectiveEpilogue::StrideC;
   using ElementD = typename CollectiveEpilogue::ElementD;
   using StrideD  = typename CollectiveEpilogue::StrideD;
+  using ElementCompute = typename CollectiveEpilogue::ElementCompute;
   using EpilogueArguments = typename CollectiveEpilogue::Arguments;
   using EpilogueParams = typename CollectiveEpilogue::Params;
 
@@ -110,7 +132,31 @@ public:
 
   static constexpr uint32_t N = TileScheduler::SHAPE_N;
   static constexpr uint32_t K = TileScheduler::SHAPE_K;
-  static constexpr uint32_t N_EXPAND = DispatchPolicy::Schedule::N_EXPAND;
+  static constexpr uint32_t N_EXPAND = 4;
+
+  constexpr static uint32_t CTA_M = shape<0>(TileShape{});
+  constexpr static uint32_t CTA_N = shape<1>(TileShape{});
+  constexpr static uint32_t CTA_K = shape<2>(TileShape{});
+  // ScaleA
+  using GmemTiledCopyScaleA = decltype(
+    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
+                    Layout<Shape <Int<CTA_M / 4>, _1>>{},
+                    Layout<Shape < _4,_1>>{}));
+
+  // ScaleB
+  using GmemTiledCopyScaleB = decltype(
+    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
+                    Layout<Shape <Int<CTA_N / 4>, _1>>{},
+                    Layout<Shape < _4,_1>>{}));
+
+  using SmemLayoutAtomScale = Layout<Shape<_4, _1>>;
+  using SmemLayoutScaleA = decltype(tile_to_shape(
+      SmemLayoutAtomScale{},
+      make_shape(Int<CTA_M>{}, Int<1>{}, Int<1>{})));   // assert CTA_SCALE_K = 1, gs >= cta_k
+  using SmemLayoutScaleB = decltype(tile_to_shape(
+      SmemLayoutAtomScale{},
+      make_shape(Int<CTA_N>{}, Int<1>{}, Int<1>{})));   // assert CTA_SCALE_K = 1, gs >= cta_k
+
 
   // Kernel level shared memory storage
   struct SharedStorage {
@@ -293,19 +339,21 @@ public:
       auto problem_shape_MNKL = ProblemShape{M, N, K, L};
 
       auto offset_m = deep_scheduler.curr_offset_m(params.scheduler);
-      auto expert_id = deep_scheduler.problem_index();
+    //   auto expert_id = deep_scheduler.problem_index();
       auto offset_a = deep_scheduler.curr_offset_a(params.scheduler);
-      auto offset_b = deep_scheduler.curr_offset_b(params.scheduler, m_block_idx);
+      auto offset_b = deep_scheduler.curr_offset_b(params.scheduler);
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
       auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
-                                                  M, offset_m, expert_id, ptr_A, ptr_B);
+                                                  M, offset_m, offset_b, ptr_A, ptr_B);
       // Extract out partitioned A and B.
       Tensor gA = get<0>(load_inputs);
       Tensor gB = get<1>(load_inputs);
+      Tensor gScaleA = get<2>(load_inputs);
+      Tensor gScaleB = get<3>(load_inputs);
 
       // Compute tile residues for predication
       auto m_max_coord = M - size<0>(gA) * get<0>(blk_coord_mnkl);                             // M - BLK_M * m_coord
@@ -315,7 +363,8 @@ public:
 
       // Allocate the tiled_mma and the accumulators for the (M,N) blk_shape
       TiledMma tiled_mma;
-      Tensor accumulators = partition_fragment_C(tiled_mma, take<0,2>(tile_shape)); // (MMA,MMA_M,MMA_N)
+      Tensor accumulators = make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
+
 
       using accum_type = decltype(accumulators);
       accum_type& accum = accumulators;
@@ -332,6 +381,8 @@ public:
       using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
       GmemTiledCopyA gmem_tiled_copy_A = collective_mma.gmem_tiled_copy_A;
       GmemTiledCopyB gmem_tiled_copy_B = collective_mma.gmem_tiled_copy_B;
+      GmemTiledCopyScaleA gmem_tiled_copy_scaleA = collective_mma.gmem_tiled_copy_scaleA;
+      GmemTiledCopyScaleB gmem_tiled_copy_scaleB = collective_mma.gmem_tiled_copy_scaleB;
 
       int warp_idx = canonical_warp_idx_sync();
       int lane_predicate = cute::elect_one_sync();
@@ -374,6 +425,22 @@ public:
       CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // CPY_N
       CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
 
+      Tensor sSA = make_tensor(make_smem_ptr(storage.smem_scale_a.data()), SmemLayoutScaleA{});
+      Tensor sSB = make_tensor(make_smem_ptr(storage.smem_scale_b.data()), SmemLayoutScaleB{});
+
+      auto gmem_thr_copy_scaleA = gmem_tiled_copy_scaleA.get_slice(thread_idx % (Int<CTA_M  / 4>{}));
+      auto gmem_thr_copy_scaleB = gmem_tiled_copy_scaleB.get_slice(thread_idx % (Int<CTA_N  / 4>{}));
+
+      Tensor tSgSA = gmem_thr_copy_scaleA.partition_S(gScaleA);
+      Tensor tSsSA = gmem_thr_copy_scaleA.partition_D(sSA);
+      Tensor tSgSB = gmem_thr_copy_scaleB.partition_S(gScaleB);
+      Tensor tSsSB = gmem_thr_copy_scaleB.partition_D(sSB);
+
+      if (warp_idx <= 1) {
+        copy(gmem_tiled_copy_scaleA, tSgSA(_,_,_,0), tSsSA(_,_,_,0));
+        copy(gmem_tiled_copy_scaleB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
+      }
+
       auto k_tile_iter  = 0; //cute::make_coord_iterator(shape<2>(gA));
       int  k_tile_count = size<2>(gA);
       constexpr int K_TILE_COUNT = (K + BlockK - 1) / BlockK;
@@ -393,38 +460,60 @@ public:
         --k_tile_count;
         ++k_tile_iter;
 
-        if (k_tile_iter == K_TILE_COUNT) {
-          num_n_copy_done++;
-          tBgB.data() = tBgB.data() + K * BlockN;
-          k_tile_iter = 0;
-          // if (thread0()) { printf("        update tBgB.data()\n"); }
-        }
+        // if (k_tile_iter == K_TILE_COUNT) {
+        //   num_n_copy_done++;
+        //   tBgB.data() = tBgB.data() + K * BlockN;
+        //   k_tile_iter = 0;
+        //   // if (thread0()) { printf("        update tBgB.data()\n"); }
+        // }
       }
       auto k_tile_count_reset = k_tile_count;
 
+      // scale A/B
+      using SmemCopyLayoutScaleB = decltype(tile_to_shape(Layout<Shape<_1, _4>>{},
+              make_shape(Int<1>{}, Int<CTA_N>{}, Int<DispatchPolicy::Stages>{})));
+      Tensor sSB_copy = make_tensor(make_smem_ptr(storage.smem_scale_b.data()), SmemCopyLayoutScaleB{});
+      Tensor tCrSA = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSA(_,_,Int<0>{})));
+      Tensor tCrSB = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSB_copy(_,_,Int<0>{})));
+
+      using SmemCopyAtomScale = Copy_Atom<cute::DefaultCopy, ElementScale>;
+      auto smem_tiled_copy_ScaleA   = make_tiled_copy_C(SmemCopyAtomScale{}, tiled_mma);
+      auto smem_thr_copy_ScaleA     = smem_tiled_copy_ScaleA.get_thread_slice(thread_idx);
+      Tensor tCsSA                  = smem_thr_copy_ScaleA.partition_S(sSA);
+      Tensor tCrSA_copy_view        = smem_thr_copy_ScaleA.retile_D(tCrSA);
+
+      auto smem_tiled_copy_ScaleB   = make_tiled_copy_C(SmemCopyAtomScale{}, tiled_mma);
+      auto smem_thr_copy_ScaleB     = smem_tiled_copy_ScaleB.get_thread_slice(thread_idx);
+      Tensor tCsSB                  = smem_thr_copy_ScaleB.partition_S(sSB_copy);
+      Tensor tCrSB_copy_view        = smem_thr_copy_ScaleB.retile_D(tCrSB);
+
       // Current pipe index in smem to read from
-      int smem_pipe_read = 0;
+      int smem_pipe_read  = 0;
       // Current pipe index in smem to write to
       int smem_pipe_write = 0;
 
       Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
       Tensor tCsB_p = tCsB(_,_,_,smem_pipe_read);
+      Tensor tCsSA_p = tCsSA(_,_,_,smem_pipe_read);
+      Tensor tCsSB_p = tCsSB(_,_,_,smem_pipe_read);
 
       // Size of the register pipeline
       auto K_BLOCK_MAX = size<2>(tCrA_copy_view);
       auto K_ATOM_PER_COPY = size<2>(tCrA) / size<2>(tCrA_copy_view);
 
-      clear(accumulators);
+      Tensor mma_acc = make_fragment_like<ElementAccumulator>(accum);
+      clear(mma_acc);
 
       // PREFETCH register pipeline
       if (K_BLOCK_MAX > 1) {
         // Wait until our first prefetched tile is loaded in
         cp_async_wait<DispatchPolicy::Stages-1>();
         __syncthreads();
-
         // Prefetch the first rmem from the first k-tile
         copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
         copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
+        copy(smem_tiled_copy_ScaleA, tCsSA_p(_,_,Int<0>{}), tCrSA_copy_view(_,_,Int<0>{}));
+        copy(smem_tiled_copy_ScaleB, tCsSB_p(_,Int<0>{},_), tCrSB_copy_view(_,Int<0>{},_));
       }
 
       for (int n_iter = 0; n_iter < N_EXPAND; n_iter++) {
@@ -464,11 +553,12 @@ public:
               cute::transform(tCrA(_,_,atom_idx), TransformA{});
               cute::transform(tCrB(_,_,atom_idx), TransformB{});
               // gemm for one tiled_mma atom on K
-              cute::gemm(tiled_mma, accum, tCrA(_,_,atom_idx), tCrB(_,_,atom_idx), src_accum);
+              cute::gemm(tiled_mma, mma_acc, tCrA(_,_,atom_idx), tCrB(_,_,atom_idx), mma_acc);
             }
 
             // Copy gmem to smem after computing gemm on each k-pipe
             if (k_block == K_BLOCK_MAX - 2) {
+
               // Commit the smem for smem_pipe_read
               cp_async_wait<DispatchPolicy::Stages-2>();
 
@@ -488,10 +578,16 @@ public:
                   if (num_n_copy_done < N_EXPAND) {
                     // load for next n_iter, avoid invalid page
                     tBgB.data() = tBgB.data() + K * BlockN;
+                    tSgSB.data() = tSgSB.data() + BlockN;
+
+                    if (warp_idx <= 1) {
+                      copy(gmem_tiled_copy_scaleB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
+                    }
                     // if (thread0()) { printf("        update tBgB.data()\n"); }
                   }
                   k_tile_iter = k_tile_iter_reset;
                 }
+
                 copy_aiu(
                   gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,smem_pipe_write),
                   gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,smem_pipe_write),
@@ -511,8 +607,22 @@ public:
 
         } // while k_tile_count
 
-        // if (thread0()) {
-        //   printf("accumulators[0] = %.4f\n", accumulators[0]);
+        // dequantize
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < cute::size<2>(accumulators); ++n) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int m = 0; m < cute::size<1>(accumulators); ++m) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < cute::size<0>(accumulators); ++i) {
+              accumulators(i,m,n) = mma_acc(i,m,n) * tCrSA(i,m,Int<0>{}) * tCrSB(i,Int<0>{},n);
+            // accumulators(i,m,n) = mma_acc(i,m,n);
+            }
+          }
+        }
+
+        // if(thread0()) {
+        //   printf("    mainloop with a8w8, mma_acc[0] = %.4f, tCrSA[0] = %.8f, tCrSB[0] = %.8f, accum[0] = %.8f\n",
+        //     (float)mma_acc[0], tCrSA(0,0,0), tCrSB(0,0,0), accumulators[0]);
         // }
 
         // update params.epilogue for ptrC and ptrD
@@ -535,7 +645,7 @@ public:
 
         // PREFETCH register pipeline
         if (n_iter < N_EXPAND - 1) {
-          clear(accumulators);
+          clear(mma_acc);
           k_tile_count = k_tile_count_reset;
 
           // Wait until our first prefetched tile is loaded in
@@ -545,6 +655,7 @@ public:
           // Prefetch the first rmem from the first k-tile
           copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
           copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
+          copy(smem_tiled_copy_ScaleB, tCsSB_p(_,Int<0>{},_), tCrSB_copy_view(_,Int<0>{},_));
         }
 
       } // for n_iter
@@ -566,7 +677,7 @@ namespace cutlass::gemm::collective {
 
 template <
   int Stages,
-class KernelSchedule,
+  class KernelSchedule,
   class TileShape_,
   class ElementA_,
   class StrideA_,
@@ -582,7 +693,7 @@ class KernelSchedule,
   class SmemCopyAtomB_,
   class TransformB_>
 struct CollectiveMma<
-    MainloopAcomputeAiuOpt<Stages, KernelSchedule>,
+    MainloopAcomputeAiuA8W8<Stages, KernelSchedule>,
     TileShape_,
     ElementA_,
     StrideA_,
@@ -600,7 +711,7 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopAcomputeAiuOpt<Stages, KernelSchedule>;
+  using DispatchPolicy = MainloopAcomputeAiuA8W8<Stages, KernelSchedule>;
   using TileShape = TileShape_;
   using ElementA = ElementA_;
   using StrideA = StrideA_;
@@ -618,6 +729,8 @@ struct CollectiveMma<
   using TransformB = TransformB_;
   using ArchTag = typename DispatchPolicy::ArchTag;
 
+  using ElementScale = float;
+
   static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
   static_assert((size<0>(TileShape{}) % size<0>(SmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
   static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
@@ -633,11 +746,38 @@ struct CollectiveMma<
       SmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
 
+  constexpr static uint32_t CTA_M = shape<0>(TileShape{});
+  constexpr static uint32_t CTA_N = shape<1>(TileShape{});
+  constexpr static uint32_t CTA_K = shape<2>(TileShape{});
+  // ScaleA
+  using GmemTiledCopyScaleA = decltype(
+    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
+                    Layout<Shape <Int<CTA_M / 4>, _1>>{},
+                    Layout<Shape < _4,_1>>{}));
+
+  // ScaleB
+  using GmemTiledCopyScaleB = decltype(
+    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
+                    Layout<Shape <Int<CTA_N / 4>, _1>>{},
+                    Layout<Shape < _4,_1>>{}));
+
+  using SmemLayoutAtomScale = Layout<Shape<_4, _1>>;
+  using SmemLayoutScaleA = decltype(tile_to_shape(
+      SmemLayoutAtomScale{},
+      make_shape(Int<CTA_M>{}, Int<1>{}, Int<1>{})));   // assert CTA_SCALE_K = 1, gs >= cta_k
+  using SmemLayoutScaleB = decltype(tile_to_shape(
+      SmemLayoutAtomScale{},
+      make_shape(Int<CTA_N>{}, Int<1>{}, Int<1>{})));   // assert CTA_SCALE_K = 1, gs >= cta_k
+
+  using StrideScale = cute::Stride<_1, int64_t, int64_t>;
+
   static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
 
   struct SharedStorage {
     cute::array_aligned<ElementA, cute::cosize_v<SmemLayoutA>> smem_a;
     cute::array_aligned<ElementB, cute::cosize_v<SmemLayoutB>> smem_b;
+    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutScaleA>> smem_scale_a;
+    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutScaleB>> smem_scale_b;
   };
 
   // Host side kernel arguments
@@ -646,6 +786,8 @@ struct CollectiveMma<
     StrideA dA;
     ElementB const* ptr_B;
     StrideB dB;
+    ElementScale const* ptr_scale_A;
+    ElementScale const* ptr_scale_B;
   };
 
   // Device side kernel params
@@ -656,6 +798,8 @@ struct CollectiveMma<
   GmemTiledCopyA gmem_tiled_copy_A;
   GmemTiledCopyB gmem_tiled_copy_B;
 
+  GmemTiledCopyScaleA gmem_tiled_copy_scaleA;
+  GmemTiledCopyScaleB gmem_tiled_copy_scaleB;
   //
   // Methods
   //
@@ -675,12 +819,20 @@ struct CollectiveMma<
 
     gmem_tiled_copy_A.desc_.template init<ElementA, TransA, get<0>(TilerA{}), get<1>(TilerA{})>(nullptr, M, K, params.dA);
     gmem_tiled_copy_B.desc_.template init<ElementB, TransB, get<0>(TilerB{}), get<1>(TilerB{})>(nullptr, N, K, params.dB);
+
+    gmem_tiled_copy_scaleA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
+                    Layout<Shape <Int<CTA_M / 4>, _1>>{},
+                    Layout<Shape < _4,_1>>{});
+
+    gmem_tiled_copy_scaleB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
+                    Layout<Shape <Int<CTA_N / 4>, _1>>{},
+                    Layout<Shape < _4,_1>>{});
   };
 
   template <class ProblemShape_MNKL, class BlockCoord_MNKL>
   CUTLASS_DEVICE auto
   load_init(ProblemShape_MNKL const& problem_shape_MNKL, BlockCoord_MNKL const& blk_coord_mnkl, Params const& params,
-            int M, int offset_m, int expert_id, ElementA const* ptr_A, ElementB const* ptr_B) {
+            int M, int offset_m, int64_t offset_b, ElementA const* ptr_A, ElementB const* ptr_B) {
     auto [_M,N,K,L] = problem_shape_MNKL;
     auto [m_coord, n_coord, _, l_coord] = blk_coord_mnkl;
     // load init A
@@ -693,7 +845,25 @@ struct CollectiveMma<
     Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,l_coord));                                 // (n,k)
     Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
 
-    return cute::make_tuple(gA, gB);
+    // // load init scale A/B
+    Tensor mScaleA_mkl = make_tensor(make_gmem_ptr(params.ptr_scale_A + offset_m), make_shape(M,1,1));      // (n,scale_k,l)
+    Tensor mScaleA_mk = mScaleA_mkl(_,_,l_coord);                                                           // (n,scale_k)
+    Tensor gScaleA = local_tile(mScaleA_mk, make_shape(Int<CTA_M>{}, Int<1>{}), make_coord(m_coord, _));    // (BLK_N, 1, scale_k)
+
+    Tensor mScaleB_nkl = make_tensor(make_gmem_ptr(params.ptr_scale_B + offset_b / K), make_shape(N,1,1));           // (n,scale_k,l)
+    Tensor mScaleB_nk = mScaleB_nkl(_,_,l_coord);                                                           // (n,scale_k)
+    Tensor gScaleB = local_tile(mScaleB_nk, make_shape(Int<CTA_N>{}, Int<1>{}), make_coord(n_coord, _));    // (BLK_N, 1, scale_k)
+
+    // if (thread0()) {
+    //   int expert_id = offset_b / K / N;
+    //   printf("M = %d, m_coord = %d, n_coord = %d, l_coord = %d, offset_m = %d, expert_id = %d, ptr_A = %p, ptr_B = %p, scale_a = %p, scale_b = %p\n",
+    //           M, m_coord, n_coord, l_coord, offset_m, expert_id, params.ptr_scale_A, params.ptr_scale_B, params.ptr_scale_A + offset_m, params.ptr_scale_B + expert_id * N);
+    //   printf("    m_coord = %d, n_coord = %d \n", m_coord, n_coord);
+    //   print("    gScaleA="); print(gScaleA); print('\n');
+    //   print("    gScaleB="); print(gScaleB); print('\n');
+    // }
+
+    return cute::make_tuple(gA, gB, gScaleA, gScaleB);
   }
 
   template <class ProblemShape>
@@ -741,7 +911,6 @@ struct CollectiveMma<
       "MainloopSm80CpAsync must have a pipeline mode in the smem layout.");
 
     int warp_idx = canonical_warp_idx_sync();
-    int lane_predicate = cute::elect_one_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -750,6 +919,11 @@ struct CollectiveMma<
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
+
+    // if (thread0()) {
+    //   printf("smem total size = %d, smem_a = %d, smem_b = %d, smem_scale_a = %d, smem_scale_b = %d\n",
+    //     sizeof(storage), sizeof(storage.smem_a), sizeof(storage.smem_b), sizeof(storage.smem_scale_a), sizeof(storage.smem_scale_b));
+    // }
 
     CUTE_STATIC_ASSERT_V(size<0>(gA) == size<0>(sA));                          // BLK_M
     CUTE_STATIC_ASSERT_V(size<1>(gA) == size<1>(sA));                          // BLK_K
@@ -767,6 +941,24 @@ struct CollectiveMma<
     Tensor tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
+    Tensor gScaleA = get<2>(load_inputs);
+    Tensor gScaleB = get<3>(load_inputs);
+
+    Tensor sSA = make_tensor(make_smem_ptr(storage.smem_scale_a.data()), SmemLayoutScaleA{});
+    Tensor sSB = make_tensor(make_smem_ptr(storage.smem_scale_b.data()), SmemLayoutScaleB{});
+
+    auto gmem_thr_copy_scaleA = gmem_tiled_copy_scaleA.get_slice(thread_idx % (Int<CTA_M  / 4>{}));
+    auto gmem_thr_copy_scaleB = gmem_tiled_copy_scaleB.get_slice(thread_idx % (Int<CTA_N  / 4>{}));
+
+    Tensor tSgSA = gmem_thr_copy_scaleA.partition_S(gScaleA);
+    Tensor tSsSA = gmem_thr_copy_scaleA.partition_D(sSA);
+    Tensor tSgSB = gmem_thr_copy_scaleB.partition_S(gScaleB);
+    Tensor tSsSB = gmem_thr_copy_scaleB.partition_D(sSB);
+
+    if (warp_idx <= 1) {
+      copy(gmem_tiled_copy_scaleA, tSgSA(_,_,_,0), tSsSA(_,_,_,0));
+      copy(gmem_tiled_copy_scaleB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
+    }
 
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
@@ -790,6 +982,7 @@ struct CollectiveMma<
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
     Tensor tCrA = thr_mma.partition_fragment_A(sA(_,_,0));                     // (MMA,MMA_M,MMA_K)
     Tensor tCrB = thr_mma.partition_fragment_B(sB(_,_,0));                     // (MMA,MMA_N,MMA_K)
+
 
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(src_accum));                 // MMA_M
@@ -815,20 +1008,40 @@ struct CollectiveMma<
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // CPY_N
     CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
 
+    Tensor mma_acc = make_fragment_like<ElementAccumulator>(accum);
+    clear(mma_acc);
+
+    // scale A/B
+    using SmemCopyLayoutScaleB = decltype(tile_to_shape(Layout<Shape<_1, _4>>{},
+            make_shape(Int<1>{}, Int<CTA_N>{}, Int<DispatchPolicy::Stages>{})));
+    Tensor sSB_copy = make_tensor(make_smem_ptr(storage.smem_scale_b.data()), SmemCopyLayoutScaleB{});
+    Tensor tCrSA = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSA(_,_,Int<0>{})));
+    Tensor tCrSB = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSB_copy(_,_,Int<0>{})));
+
+    using SmemCopyAtomScale = Copy_Atom<cute::DefaultCopy, ElementScale>;
+    auto smem_tiled_copy_ScaleA   = make_tiled_copy_C(SmemCopyAtomScale{}, tiled_mma);
+    auto smem_thr_copy_ScaleA     = smem_tiled_copy_ScaleA.get_thread_slice(thread_idx);
+    Tensor tCsSA                  = smem_thr_copy_ScaleA.partition_S(sSA);
+    Tensor tCrSA_copy_view        = smem_thr_copy_ScaleA.retile_D(tCrSA);
+
+    auto smem_tiled_copy_ScaleB   = make_tiled_copy_C(SmemCopyAtomScale{}, tiled_mma);
+    auto smem_thr_copy_ScaleB     = smem_tiled_copy_ScaleB.get_thread_slice(thread_idx);
+    Tensor tCsSB                  = smem_thr_copy_ScaleB.partition_S(sSB_copy);
+    Tensor tCrSB_copy_view        = smem_thr_copy_ScaleB.retile_D(tCrSB);
+
     //
     // PIPELINED MAIN LOOP
     //
-    // if (thread0()) {
-    //     print("tiled_mma = "); print(tiled_mma); print("\n");
-    // }
 
     // Current pipe index in smem to read from
-    int smem_pipe_read = 0;
+    int smem_pipe_read  = 0;
     // Current pipe index in smem to write to
     int smem_pipe_write = 0;
 
     Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
     Tensor tCsB_p = tCsB(_,_,_,smem_pipe_read);
+    Tensor tCsSA_p = tCsSA(_,_,_,smem_pipe_read);
+    Tensor tCsSB_p = tCsSB(_,_,_,smem_pipe_read);
 
     // Size of the register pipeline
     auto K_BLOCK_MAX = size<2>(tCrA_copy_view);
@@ -843,6 +1056,8 @@ struct CollectiveMma<
       // Prefetch the first rmem from the first k-tile
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
       copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
+      copy(smem_tiled_copy_ScaleA, tCsSA_p(_,_,Int<0>{}), tCrSA_copy_view(_,_,Int<0>{}));
+      copy(smem_tiled_copy_ScaleB, tCsSB_p(_,Int<0>{},_), tCrSB_copy_view(_,Int<0>{},_));
     }
 
     CUTLASS_PRAGMA_NO_UNROLL
@@ -855,6 +1070,8 @@ struct CollectiveMma<
           // Slice the smem_pipe_read smem
           tCsA_p = tCsA(_,_,_,smem_pipe_read);
           tCsB_p = tCsB(_,_,_,smem_pipe_read);
+          tCsSA_p = tCsSA(_,_,_,smem_pipe_read);
+          tCsSB_p = tCsSB(_,_,_,smem_pipe_read);
         }
 
         // Load A, B shmem->regs for k_block+1
@@ -869,13 +1086,7 @@ CUTLASS_PRAGMA_UNROLL
           cute::transform(tCrA(_,_,atom_idx), TransformA{});
           cute::transform(tCrB(_,_,atom_idx), TransformB{});
           // gemm for one tiled_mma atom on K
-          cute::gemm(tiled_mma, accum, tCrA(_,_,atom_idx), tCrB(_,_,atom_idx), src_accum);
-          // if (thread0()) {
-          //   print("tCrA(_,_,atom_idx) = "); print_tensor(tCrA(_,_,atom_idx)); print("\n");
-          //   print("tCrB(_,_,atom_idx) = "); print_tensor(tCrB(_,_,atom_idx)); print("\n");
-          //   // print("src_accum = "); print_tensor(src_accum); print("\n");
-          //   print("accum = "); print_tensor(accum); print("\n");
-          // }
+          cute::gemm(tiled_mma, mma_acc, tCrA(_,_,atom_idx), tCrB(_,_,atom_idx), mma_acc);
         }
 
         // Copy gmem to smem after computing gemm on each k-pipe
@@ -909,9 +1120,27 @@ CUTLASS_PRAGMA_UNROLL
     // TODO: original cutlass3 miss this sync
     cp_async_wait<0>();
     __syncthreads();
+
+    // dequantize
+    CUTLASS_PRAGMA_UNROLL
+    for (int n = 0; n < cute::size<2>(accum); ++n) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < cute::size<1>(accum); ++m) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < cute::size<0>(accum); ++i) {
+          accum(i,m,n) = mma_acc(i,m,n) * tCrSA(i,m,Int<0>{}) * tCrSB(i,Int<0>{},n);
+          // accum(i,m,n) += mma_acc(i,m,n);
+        }
+      }
+    }
+
+    // if(thread0()) {
+    //   printf("    mainloop with a8w8, mma_acc[0] = %.4f, tCrSA[0] = %.8f, accum[0] = %.8f\n",
+    //     (float)mma_acc[0], tCrSA(0,0,0), accum[0]);
+    // }
+
   }
 };
-
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace cutlass::gemm::collective
@@ -1139,19 +1368,20 @@ public:
       auto expert_id = deep_scheduler.problem_index();
       auto offset_a = deep_scheduler.curr_offset_a(params.scheduler);
       auto offset_b = deep_scheduler.curr_offset_b(params.scheduler, m_block_idx);
+
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
 
-      // if (thread0()) {
-      //   printf("M = %d, N = %d, K = %d, offset_m = %d, expert_id = %d, offset_a = %d, offset_b = %d, m_coord = %d, n_coord = %d, ptr_A = %p, ptr_B = %p\n",
-      //       M, N, K, offset_m, expert_id, offset_a, offset_b, m_coord, n_coord, ptr_A, ptr_B);
-      // }
+    //   if (thread0()) {
+    //     printf("M = %d, N = %d, K = %d, offset_m = %d, expert_id = %d, offset_a = %d, offset_b = %d, m_coord = %d, n_coord = %d, ptr_A = %p, ptr_B = %p\n",
+    //         M, N, K, offset_m, expert_id, offset_a, offset_b, m_coord, n_coord, ptr_A, ptr_B);
+    //   }
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
 
       auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
-                                                  M, offset_m, expert_id, ptr_A, ptr_B);
+                                                  M, offset_m, offset_b, ptr_A, ptr_B);
       // Extract out partitioned A and B.
       Tensor gA = get<0>(load_inputs);
       Tensor gB = get<1>(load_inputs);
@@ -1227,10 +1457,11 @@ public:
     }
 
     static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
-                    uint32_t shape_m, uint32_t expected_m, __nv_bfloat16* gmem_a, __nv_bfloat16* gmem_b,
+                    uint32_t shape_m, uint32_t expected_m, int8_t* gmem_a, float* scales_a,
+                    int8_t * gmem_b, float* scales_b,
                     cudaStream_t stream, int num_sms, uint32_t smem_size) {
-        using ElementA    = cutlass::bfloat16_t;
-        using ElementB    = cutlass::bfloat16_t;
+        using ElementA    = int8_t;
+        using ElementB    = int8_t;
         using ElementC    = cutlass::bfloat16_t;
         using LayoutA     = cutlass::layout::RowMajor;
         using LayoutB     = cutlass::layout::ColumnMajor;
@@ -1249,24 +1480,26 @@ public:
         static constexpr int WarpOnN = BLOCK_N / WARP_N;
 
         using TiledMma = TiledMMA<
-            MMA_Atom<Acompute10000_16x16x16_F32BF16BF16F32_TN>,
+            MMA_Atom<Acompute10000_16x16x32_S32S8S8S32_TN>,
             Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
-            Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _16>>;       // 1x1x1 value group
+            Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _32>>;       // 1x1x1 value group
 
-        constexpr int EnableMultistageOnN = EnableMultistageOnN_ && (SHAPE_N % (BLOCK_N) == 0);
+        constexpr int EnableMultistageOnN = EnableMultistageOnN_
+                                            && (SHAPE_N % (BLOCK_N) == 0)
+                                            && (SHAPE_K > (BLOCK_K * kNumStages));
         static constexpr int N_EXPAND = EnableMultistageOnN ? cutlass::gemm::KernelAiuMultistageOnN::N_EXPAND : 1;
+
         using KernelSchedule = typename cutlass::platform::conditional<
             EnableMultistageOnN,
             cutlass::gemm::KernelAiuMultistageOnN,
             cutlass::gemm::KernelAiuMultistage
         >::type;
-        using DispatchPolicy = cutlass::gemm::MainloopAcomputeAiuOpt<kNumStages, KernelSchedule>;
+        using DispatchPolicy = cutlass::gemm::MainloopAcomputeAiuA8W8<kNumStages, KernelSchedule>;
         static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
         static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
         static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
         using DefaultOperandA = cutlass::gemm::collective::detail::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
         using DefaultOperandB = cutlass::gemm::collective::detail::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
-        // using t1 = DefaultOperandB::xhzhao;
         // A
         using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
         using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
@@ -1314,7 +1547,6 @@ public:
             CollectiveEpilogue_noTsm
         >::type;
 
-
         using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, kNumGroups>;
         using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
             Shape<int,int,int,int>,
@@ -1331,7 +1563,7 @@ public:
         StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape((int)SHAPE_N, (int)SHAPE_K, 1));
         StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape((int)shape_m, (int)SHAPE_N, 1));
         auto stride_C = stride_D;
-        int max_blocks_per_cu = 2; //compute_occupancy_for_kernel<GemmKernel>();
+        int max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
 
         cutlass::KernelHardwareInfo hw_info;
         hw_info.device_id = 0;
@@ -1340,7 +1572,7 @@ public:
         typename GemmKernel::Arguments arguments{
             cutlass::gemm::GemmUniversalMode::kGemm,
             {shape_m, SHAPE_N, SHAPE_K, 1},
-            {(ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B},
+            {(ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B, scales_a, scales_b},
             {{1.0f, 0.0f}, (ElementC*)gmem_d, stride_C, (ElementD*)gmem_d, stride_D},
             hw_info, {shape_m, grouped_layout}
         };

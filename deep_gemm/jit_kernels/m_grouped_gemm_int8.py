@@ -7,6 +7,7 @@ from .utils import get_num_sms
 
 # C++ code templates
 includes = ('"deep_gemm/int8_gemm.cuh"', )
+includes_cutlass3 = ('"../deep_gemm/int8_gemm_cutlass3.cuh"', )
 template = """
 using namespace deep_gemm;
 
@@ -62,7 +63,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous=True)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous=True)
     expected_m = 0
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
@@ -122,11 +123,15 @@ def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tenso
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
 
     # Extra checks for TMA store
     if num_groups > 1 and m > block_m:
         assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
+
+    template_updated = template
+    if extra_info['use_multistage_on_N']:
+        template_updated = template.replace("GemmType::{GEMM_TYPE}>", "GemmType::{GEMM_TYPE},1>")
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             masked_m, m, expected_m,
@@ -139,13 +144,14 @@ def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tenso
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'GEMM_TYPE': 'GroupedMasked'},
         space=(),
-        includes=includes,
+        includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
         arg_defs=(('lhs', torch.int8), ('lhs_scales', torch.float),
                   ('rhs', torch.int8), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template,
+        template=template_updated,
+        jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
 

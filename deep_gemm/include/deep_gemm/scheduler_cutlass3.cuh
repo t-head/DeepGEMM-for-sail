@@ -232,7 +232,7 @@ struct DeepGemmScheduler {
     // Gets the pointer offset of matrix A
     __device__ __forceinline__ int64_t curr_offset_a(const Params& param) const
     {
-        if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {
+        if constexpr (kGemmType == GemmType::GroupedMasked) {
             return int64_t(curr_group_idx) * param.shape_m * SHAPE_K;
         } else if constexpr (kGemmType == GemmType::GroupedMaskedNoBubble) {
             return int64_t(curr_cumsum_m) * SHAPE_K;
