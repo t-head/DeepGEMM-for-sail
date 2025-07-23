@@ -24,7 +24,7 @@ def run_cmd(cmd: str, timeout=300, stdout=subprocess.PIPE, stderr=subprocess.PIP
 
 def read_cycle_from_nculog(filename):
     # kernel_pattern = r"(.*)deep_gemm(.*)"
-    kernel_pattern = r"(.*)Device(.*)"
+    kernel_pattern = r"(.*)kernel(.*)Device(.*)"
     cycles_pattern = "__cycles_active.max"
     tc_pattern = "pct_of_peak_sustained_active"
     hbm_pattern = "bytes_read"

@@ -434,7 +434,7 @@ public:
         }
     
         char *pEnv_params_dump = std::getenv("dump_group_m");
-        if (pEnv_params_dump && isdigit(*pEnv_params_dump) && (kGemmType != GemmType::Normal || kGemmType != GemmType::GroupedNoPad)) {
+        if (pEnv_params_dump && isdigit(*pEnv_params_dump) && (kGemmType == GemmType::GroupedContiguous || kGemmType == GemmType::GroupedMasked)) {
             // check if cuda graph captured
             cudaStreamCaptureStatus captureStatus;
             cudaStreamIsCapturing(stream, &captureStatus);

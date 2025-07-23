@@ -120,13 +120,11 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # print(f'best_block_m:{best_block_m}, best_block_n:{best_block_n}')
 
-    block_k = 256
-    if k <= 96 * 2:
-        block_k = 128
+    block_k = 128
     if k <= 48 * 2:
         block_k = 64
     if k >= 4096 and (best_block_m == 32 and best_block_n == 32):
-        block_k = 512
+        block_k = 256
  
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
 

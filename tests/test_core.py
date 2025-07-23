@@ -66,20 +66,21 @@ def test_gemm(d: torch.dtype, file = None) -> None:
             diff = calc_diff(out, ref_out)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
-            # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
-            x, y, out, ref_out = construct(m, k, n, d)
+            if benchmark:
+                # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
+                x, y, out, ref_out = construct(m, k, n, d)
 
-            # noinspection PyShadowingNames
-            def test_func():
-                if d == torch.bfloat16:
-                    deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
-                else:
-                    deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
+                # noinspection PyShadowingNames
+                def test_func():
+                    if d == torch.bfloat16:
+                        deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
+                    else:
+                        deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
 
-            t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
-            print(f' > Performance (dtype={str(d)}, m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
-                f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
-                f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
+                t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+                print(f' > Performance (dtype={str(d)}, m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
+                    f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
+                    f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     print("Passed\n")
 
 def read_numbers_from_file(file_path):
@@ -139,36 +140,35 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
 
     if file is not None:
         index = read_numbers_from_file(file)
-        index = [x for x in index if x != -1]
-        max_val = max(index) if index else 0
-
-        from collections import Counter
-        group_ms = [Counter(index).get(i, 0) for i in range(max_val + 1)]
+        m_indices = torch.tensor(index, device='cuda', dtype=torch.int32)
         m = expected_m_per_group
     else:
         group_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
         m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
+        m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
 
     x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
 
-    m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
 
-    start = 0
-    for i, group_m in enumerate(group_ms):
-        actual_end = start + group_m
-        aligned_end = start + ceil_div(group_m, alignment) * alignment
-        m_indices[start:actual_end] = i
-        m_indices[actual_end:aligned_end] = -1
-        ref_out[start:aligned_end] = x[start:aligned_end] @ y[i].t()
-        start = aligned_end
-    if not cycle:
-        ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
+    if file is not None:
+        for i, group in enumerate(m_indices):
+            if group != -1:
+                ref_out[i] = x[i] @ y[group].t()
     else:
-        ref_out = torch.empty_like(out)
+        start = 0
+        for i, group_m in enumerate(group_ms):
+            actual_end = start + group_m
+            aligned_end = start + ceil_div(group_m, alignment) * alignment
+            m_indices[start:actual_end] = i
+            m_indices[actual_end:aligned_end] = -1
+            ref_out[start:aligned_end] = x[start:aligned_end] @ y[i].t()
+            start = aligned_end
     
+    ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
+
     if d == torch.bfloat16:
         return m, x, y, m_indices, out, ref_out
     else:
@@ -180,8 +180,8 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
         return m, x_int8, y_int8, m_indices, out, ref_out
 
 def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, file: str):
-    x = torch.randn((num_groups, max_m, k), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+    x = torch.randn((num_groups, max_m, k), device='cpu', dtype=torch.bfloat16)
+    y = torch.randn((num_groups, n, k), device='cpu', dtype=torch.bfloat16)
 
     out = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
     if not cycle:
@@ -200,15 +200,15 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
     assert masked_m.amax().item() <= max_m
 
     if d == torch.bfloat16:
-        return x, y, masked_m, out, ref_out
+        return x.to('cuda'), y.to('cuda'), masked_m, out, ref_out.to('cuda')
     else:
-        x_int8 = (torch.empty_like(x, dtype=torch.int8), torch.empty((num_groups, max_m, 1), device='cuda', dtype=torch.float))
-        y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device='cuda', dtype=torch.float))
+        x_int8 = (torch.empty_like(x, dtype=torch.int8), torch.empty((num_groups, max_m, 1), device='cpu', dtype=torch.float))
+        y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
         for i in range(num_groups):
             x_int8[0][i], x_int8[1][i] = per_token_cast_to_int8(x[i])
             y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
 
-        return x_int8, y_int8, masked_m, out, ref_out
+        return (x_int8[0].to("cuda"), x_int8[1].to("cuda")), (y_int8[0].to("cuda"), y_int8[1].to("cuda")), masked_m, out, ref_out.to('cuda')
 
 def test_m_grouped_gemm_contiguous(d: torch.dtype, file=None) -> None:
     print('Testing grouped contiguous GEMM:')
@@ -258,6 +258,7 @@ def test_m_grouped_gemm_masked(d: torch.dtype, file: str) -> None:
 
     def test_func():
         x, y, masked_m, out, ref_out = construct_grouped_masked(num_groups, max_m, expected_m_per_group, k, n, d, file)
+
         if (d == torch.bfloat16):
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
         else:
@@ -320,7 +321,7 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
     else:
         for num_groups, expected_m_per_group in ((256, 1), (256, 4), (256, 16), (256, 32), (128, 8), (128, 64), (128, 1024)):
             for k, n in ((7168, 4096), (2048, 7168), (256, 768), (512, 128)):
-        # num_groups, expected_m_per_group, k, n = 4, 2, 128, 16
+        # num_groups, expected_m_per_group, k, n = 4, 2, 128, 8
                 test_func()
 
     print("Passed\n")

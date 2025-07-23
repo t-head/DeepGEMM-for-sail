@@ -120,6 +120,7 @@ __global__ void batched_gemvt_kernel(const GemvtArgs args) {
         int id_n = pid_n * NPerBlock + tid_n;
 
         if ( off_expert >= args.num_experts
+            || off_expert < 0
             || pid_m >= args.num_tokens
             || (id_n + (NPerThread - 1) * NLoopStep) >= args.N) {
             return;
