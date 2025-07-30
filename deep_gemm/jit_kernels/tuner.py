@@ -10,6 +10,18 @@ class JITTuner:
     def __init__(self) -> None:
         self.tuned = {}
 
+    def key_format(self, key):
+        if key:
+            return 'block{0}x{1}x{2}xwarp{3}x{4}xstage{5}'.format(
+                key['BLOCK_M'], key['BLOCK_N'], key['BLOCK_K'], key['WARP_M'], key['WARP_N'], key['NUM_STAGES'])
+        else:
+            return None
+
+    def key_compare(self, key1, key2):
+        keys = ['BLOCK_M', 'BLOCK_N', 'BLOCK_K', 'WARP_M', 'WARP_N', 'NUM_STAGES']
+        rtn = all(key1[k] == key2[k] for k in keys)
+        return rtn
+
     def compile_and_tune(self, name: str, keys: Dict[str, Any], space: tuple,
                          includes: tuple, arg_defs: tuple, template: str, args: tuple, jit_include_dir: str = None, arch: str = None) -> Runtime:
         # NOTES: we always assume the space and template will not change
@@ -41,6 +53,7 @@ class JITTuner:
             kernels.append((build(name, arg_defs, code, arch), tuned_keys))
 
         best_runtime, best_time, best_keys = None, None, None
+        default_tile_time = None
         for runtime, tuned_keys in kernels:
             if len(space) > 1:
                 # Check kernel validity
@@ -65,6 +78,9 @@ class JITTuner:
             else:
                 elapsed_time = 0
 
+            if tuned_keys and self.key_compare(keys, tuned_keys):
+                default_tile_time = elapsed_time
+
             # Compare if better
             if best_time is None or elapsed_time < best_time:
                 best_runtime, best_time, best_keys = runtime, elapsed_time, tuned_keys
@@ -74,7 +90,14 @@ class JITTuner:
 
         # Cache the best runtime and return
         if os.getenv('DG_JIT_DEBUG', None) or os.getenv('DG_PRINT_AUTOTUNE', None):
-            print(f'Best JIT kernel {name} with keys {keys} has tuned keys {best_keys} and time {best_time}')
+            print(f'Best JIT kernel {name} with keys {self.key_format(keys)} and time {default_tile_time} has tuned keys {self.key_format(best_keys)} and time {best_time}')
+            if best_keys:
+                print('Best JIT kernel CSV,{0},{1:.4f},{2},{3:.4f},{4:.4f}'.format(self.key_format(keys), default_tile_time, self.key_format(best_keys), best_time, default_tile_time/best_time))
+                print('Best JIT kernel CFG,({},{},{}):({},{},{},{},{},{})'.format(
+                    args[5], keys['N'], keys['K'],
+                    best_keys['BLOCK_M'], best_keys['BLOCK_N'], best_keys['BLOCK_K'],
+                    best_keys['WARP_M'], best_keys['WARP_N'], best_keys['NUM_STAGES']
+                ))
         self.tuned[signature] = best_runtime
         return best_runtime
 

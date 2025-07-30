@@ -7,6 +7,7 @@ import re
 
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout
+from .gemm_int8_lut import get_best_configs_from_lut
 
 # C++ code templates
 includes = ('"deep_gemm/int8_gemm.cuh"', )
@@ -63,11 +64,147 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
 
     return smem_size, swizzle_mode, block_n_padding
 
+def get_smem_occ(block_m: int, block_n: int, block_k: int, num_stages: int) -> Tuple[int]:
+    if block_m is None:
+        return 0
+
+    # use static suppose.
+    ppu_capacity = 262144
+    bpp = 1
+    smem_d = block_m * block_n
+    smem_a_per_stage = block_m * block_k
+    smem_b_per_stage = block_n * block_k
+
+    smem_size_d = smem_d * 2
+    smem_size_a = num_stages * smem_a_per_stage * bpp
+    smem_size_b = num_stages * smem_b_per_stage * bpp
+
+    smem_size = max(smem_size_d, smem_size_a + smem_size_b)
+
+    return 262144 // smem_size
+
+# rules for dense gemm
+@lru_cache(maxsize=None)
+def get_best_configs_dense(m: int, n: int, k: int, num_groups: int, num_sms: int) -> \
+    Tuple[int, int, int, int, int, int, int, int, int, dict]:
+    block_ms = (256, 128, 64, 32, 16)
+    block_ns = (256, 128, 64, 32)
+
+    fix_wave_saturate = lambda x: num_sms if x == 0 else x
+    get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
+    get_last_wave_util = lambda bm, bn: fix_wave_saturate((ceil_div(m, bm) * ceil_div(n, bn) * num_groups) % num_sms)
+    get_block_utils = lambda m, bm: (((m / bm ) / ((m + bm -1) // bm)) if m % bm != 0 else 1.0) if bm else 0
+    get_block_ai = lambda block_m, block_n: (block_m * block_n) / (block_m + block_n)
+
+
+
+    best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages = None, None, None, None, None, None
+
+    lut_result = get_best_configs_from_lut(m, n, k)
+    if lut_result:
+        best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages = lut_result
+    else:
+        # find a tile from rule
+        tile_list = generate_search_space()
+        for tile in tile_list:
+            block_m = tile['BLOCK_M']
+            block_n = tile['BLOCK_N']
+            block_k = tile['BLOCK_K']
+            warp_m = tile['WARP_M']
+            warp_n = tile['WARP_N']
+            stages = tile['NUM_STAGES']
+
+            success = False
+            num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(best_block_m, best_block_n)
+            num_utils = get_block_utils(m, block_m) * get_block_utils(n, block_n)
+            best_num_utils = get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n)
+            num_occ = get_smem_occ(block_m, block_n, block_k, stages)
+            best_num_occ = get_smem_occ(best_block_m, best_block_n, best_block_k, best_stages)
+
+            if best_block_m is None or best_block_n is None:
+                success = True
+            elif (m < 512 or n < 512):
+                # if single group block is small, balance wave, utils and occ
+                occ_wave = num_waves / num_occ
+                best_occ_wave = best_num_waves / best_num_occ
+                ai_util = get_block_ai(block_m, block_n)
+                best_ai_util = get_block_ai(best_block_m, best_block_n)
+
+                valid_occ  = (num_occ / best_num_occ) >= 1
+                valid_wave = (occ_wave / best_occ_wave) <= 1
+                valid_util = (num_utils / best_num_utils) >= 1
+                valid_ai   = (ai_util / best_ai_util) >= 1
+
+                # print(f'num_waves:{num_waves / num_occ}, best_num_waves:{best_num_waves / best_num_occ}')
+                # print(f'ai:{ai_util}, best_ai:{best_ai_util}')
+                # print(f'util_ratio:{(num_utils / best_num_utils)}, wave_ratio:{occ_wave / best_occ_wave}, occ_ratio:{(num_occ / best_num_occ)}, ai_ratio:{ai_util / best_ai_util}')
+
+                # print(f'valid_occ:{valid_occ}, valid_wave:{valid_wave}, valid_util:{valid_util}, valid_ai:{valid_ai}')
+                success = (valid_wave + valid_util + valid_occ + valid_ai) >= 3
+
+            elif num_waves < best_num_waves:
+                success = True
+            elif num_waves == best_num_waves:
+                # Check last wave utilization
+                util = get_last_wave_util(block_m, block_n)
+                best_util = get_last_wave_util(best_block_m, best_block_n)
+                success = util > best_util
+                if util == best_util:
+                    # Case 1: same `block_m`, smaller `block_n` (wasted)
+                    success |= block_m == best_block_m and block_n < best_block_n
+                    # Case 2: same `block_n`, smaller `block_m` (wasted)
+                    success |= block_n == best_block_n and block_m < best_block_m
+                    # Case 3: different for both `block_m` and `block_n`, `block_n` larger is better
+                    success |= block_m != best_block_m and block_n > best_block_n
+
+            # print(f'm:{m}, n:{n}, k:{k}, block_m:{block_m}, block_n:{block_n}, block_k:{block_k}, num_waves:{num_waves}, best_num_waves:{best_num_waves}, success:{success}\n')
+            # print(f'\n\n\n')
+            if success:
+                best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages = \
+                    (block_m, block_n, block_k, warp_m, warp_n, stages)
+
+        if m <= 16:
+            if k >= 7168:
+                # memory bound
+                (best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages) = (16, 64, 256, 16, 16, 4)
+            elif k <= 512:
+                # latency bound
+                (best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages) = (16, 128, 64, 16, 32, 2)
+            else:
+                (best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages) = (16, 128, 128, 16, 32, 4)
+
+
+    num_min_sms = 20
+    best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1)
+    extra_info = {'use_cutlass3' : False, 'use_multistage_on_N' : False}
+
+    assert best_block_m is not None
+    assert best_block_n is not None
+    assert best_block_k is not None
+    assert best_warp_m is not None
+    assert best_warp_n is not None
+    assert best_smem_config is not None
+    assert best_stages is not None
+
+    use_cutlass3 = False
+    use_multistage_on_N = False
+    if 'DG_USE_CUTLASS3' in os.environ:
+        use_cutlass3 = int(os.getenv('DG_USE_CUTLASS3'))
+    extra_info['use_cutlass3'] = use_cutlass3
+    if 'DG_USE_MULTISTAGE_ON_N' in os.environ:
+        use_multistage_on_N = int(os.getenv('DG_USE_MULTISTAGE_ON_N'))
+    extra_info['use_multistage_on_N'] = use_multistage_on_N
+
+    return num_min_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config, extra_info
+
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> \
-        Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
- 
+        Tuple[int, int, int, int, int, int, int, int, int, dict]:
+
+    if num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False:
+        return get_best_configs_dense(m, n, k, num_groups, num_sms)
+
     if not is_grouped_contiguous:
         block_ms = (256, 128, 64, 32, 16)
     else:
@@ -176,17 +313,6 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
         warp_n = best_block_n // 4
 
-    if num_groups == 1 and m <= 16:
-        num_min_sms = 20
-        if k >= 7168:
-            # memory bound
-            (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 64, 256, 16, 16, 4)
-        elif k <= 512:
-            # latency bound
-            (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 128, 64, 16, 32, 2)
-        else:
-            (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 128, 128, 16, 32, 4)
-
     # (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 64, 256, 16, 16, 4)
     # print(best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages)
 
@@ -202,37 +328,67 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config, extra_info
 
+
 def generate_search_space():
     tile_list = [
-        [16, 64, 64, 3],
+        # blockM = 16
         [16, 64, 128, 3],
         [16, 64, 256, 2],
         [16, 64, 256, 3],
-        [16, 64, 512, 2],
-        [16, 64, 512, 3],
-        [16, 64, 64, 4],
         [16, 64, 128, 4],
         [16, 64, 256, 4],
-        [16, 64, 512, 4],
-
         [16, 128, 128, 3],
         [16, 128, 256, 3],
         [16, 128, 128, 4],
         [16, 128, 256, 4],
-        [16, 128, 128, 5],
-        [16, 128, 256, 5],
 
-        [16, 128, 64, 2],
-        [16, 128, 64, 3],
-        [16, 256, 64, 2],
-        [16, 256, 64, 3],
+        # blockM = 32
+        [32, 64, 128, 3, 16, 32],
+        [32, 64, 256, 2, 16, 32],
+        [32, 64, 256, 3, 16, 32],
+        [32, 64, 128, 4, 16, 32],
+        [32, 64, 256, 4, 16, 32],
+        [32, 128, 128, 3],
+        [32, 128, 256, 3],
+        [32, 128, 128, 4],
+        [32, 128, 256, 4],
+
+        # blockM = 64
+        [64, 64, 128, 3, 32, 32],
+        [64, 64, 128, 4, 32, 32],
+        [64, 128, 128, 2, 32, 32],
+        [64, 128, 128, 3, 32, 32],
+        [64, 128, 256, 3],
+        [64, 128, 128, 4],
+        [64, 128, 256, 4],
+        [64, 256, 64, 3, 32, 64],
+        [64, 256, 128, 2, 32, 64],
+        [64, 256, 128, 3],
+        [64, 256, 128, 3, 32, 64],
+
+        # blockM = 128
+        [128, 128, 64, 2, 64, 64],
+        [128, 128, 128, 2, 64, 64],
+        [128, 128, 128, 3, 64, 64],
+        [128, 128, 128, 4, 64, 64],
+        [128, 128, 256, 3, 64, 64],
+        [128, 256, 64, 2, 64, 64],
+        [128, 256, 128, 2, 64, 64],
+        [128, 256, 128, 3, 64, 64],
     ]
     space = []
     for tile in tile_list:
-        config = {'BLOCK_M': tile[0], 'BLOCK_N': tile[1], 'BLOCK_K': tile[2],
-              'WARP_M': tile[0], 'WARP_N': tile[1] // 4,
-              'NUM_STAGES': tile[3]}
-        space.append(config)
+        assert len(tile) == 4 or len(tile) == 6
+        if len(tile) == 4:
+            config = {'BLOCK_M': tile[0], 'BLOCK_N': tile[1], 'BLOCK_K': tile[2],
+                'WARP_M': tile[0], 'WARP_N': tile[1] // 4,
+                'NUM_STAGES': tile[3]}
+            space.append(config)
+        elif len(tile) == 6:
+            config = {'BLOCK_M': tile[0], 'BLOCK_N': tile[1], 'BLOCK_K': tile[2],
+                'WARP_M': tile[4], 'WARP_N': tile[5],
+                'NUM_STAGES': tile[3]}
+            space.append(config)
     return space
 
 def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],

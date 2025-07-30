@@ -514,11 +514,12 @@ public:
 
         // export PPU_LIB_SHOW_PARAMS=1
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()){
+        if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_deep_gemm_params(
-                GemmTypeS[static_cast<int>(kGemmType)], std::string("bf16"), kNumGroups, shape_m, SHAPE_N, SHAPE_K
+                GemmTypeS[static_cast<int>(kGemmType)], std::string("int8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K
             );
         }
+        ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
         char *pEnv_params_dump = std::getenv("dump_group_m");
         if (pEnv_params_dump && isdigit(*pEnv_params_dump) && kGemmType != GemmType::Normal) {
@@ -584,6 +585,8 @@ public:
         if(run_status != cutlass::Status::kSuccess)
             printf("Failed to run cutlass variable batched gemm. Error: %s\n",
                 std::string(cutlassGetStatusString(run_status)).c_str());
+
+        ProfilingInterface::Instance().instrument(false, dg_prof_params);
     }
 };
 

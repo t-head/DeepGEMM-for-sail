@@ -49,10 +49,13 @@ def test_gemm(d: torch.dtype, file = None) -> None:
             deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
         if not cycle:
             diff = calc_diff(out, ref_out)
+            if diff >= 0.001:
+                print("ref_out:", ref_out)
+                print("out:", out)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
     if file is not None:
-        num_groups, expected_m_per_group, n, k, m = parse_dump_file(file)
+        num_groups, m, n, k, expected_m_per_group = parse_dump_file(file)
         test_func(m, n, k, d)
         return
 
