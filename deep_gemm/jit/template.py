@@ -10,6 +10,7 @@ typename_map: Dict[Any, str] = {
     **{t: t.__name__ for t in (bool, int, float)},
     torch.int: 'torch.int',
     torch.int8: 'torch.int8',
+    torch.int64: 'torch.int64',
     torch.float: 'torch.float',
     torch.bfloat16: 'torch.bfloat16',
     torch.float8_e4m3fn: 'torch.float8_e4m3fn',
@@ -19,7 +20,7 @@ typename_map: Dict[Any, str] = {
 # `ctype` map for Python casting
 ctype_map: Dict[Any, Any] = {
     **{t: getattr(ctypes, f'c_{t.__name__}') for t in (bool, int, float)},
-    **{t: ctypes.c_void_p for t in (torch.int, torch.int8, torch.float, torch.bfloat16, torch.float8_e4m3fn, torch.cuda.Stream)},
+    **{t: ctypes.c_void_p for t in (torch.int, torch.int8, torch.int64, torch.float, torch.bfloat16, torch.float8_e4m3fn, torch.cuda.Stream)},
 }
 
 
@@ -30,6 +31,7 @@ genc_map = {
     float: ('float', 'float'),
     torch.int: ('void*', 'int*'),
     torch.int8: ('void*', 'int8_t*'),
+    torch.int64: ('void*', 'int64_t*'),
     torch.float: ('void*', 'float*'),
     torch.bfloat16: ('void*', '__nv_bfloat16*'),
     torch.float8_e4m3fn: ('void*', '__nv_fp8_e4m3*'),
@@ -50,6 +52,8 @@ def map_ctype(value: Any) -> Any:
         elif value.dtype == torch.float8_e4m3fn:
             return ctypes.c_void_p(value.data_ptr())
         elif value.dtype == torch.int8:
+            return ctypes.c_void_p(value.data_ptr())
+        elif value.dtype == torch.int64:
             return ctypes.c_void_p(value.data_ptr())
         else:
             return ctypes.c_void_p(value.data_ptr())

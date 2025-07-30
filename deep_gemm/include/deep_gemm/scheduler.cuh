@@ -51,9 +51,15 @@ struct Scheduler
 
     static const GemmType kGemmType = GemmType_;
 
+    using layoutT_ = typename std::conditional<
+                    kGemmType == GemmType::GroupedNoPad,
+                    int64_t,
+                    int32_t
+                >::type;
+
     struct Params
     {
-        int32_t const* grouped_layout;
+        layoutT_ const* grouped_layout;
         int64_t gemm_n;
         int64_t gemm_k;
         int64_t gemm_m;
@@ -76,7 +82,7 @@ struct Scheduler
 
         /// Ctor
         CUTLASS_HOST_DEVICE
-        Params(int64_t gemm_m, int64_t gemm_n, int64_t gemm_k, int32_t const* groups_layout, int32_t num_groups)
+        Params(int64_t gemm_m, int64_t gemm_n, int64_t gemm_k, layoutT_ const* groups_layout, int32_t num_groups)
             : grouped_layout(groups_layout)
             , gemm_n(gemm_n)
             , gemm_k(gemm_k)
@@ -182,7 +188,13 @@ struct Scheduler
 
                 // Within current group
                 // num_m_blocks = cutlass::ceil_div(static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx)), ThreadblockShape::kM);
-                num_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
+                if constexpr (kGemmType == GemmType::GroupedNoPad) {
+                    int64_t sum_m_pre = static_cast<int64_t>(__ldg(reinterpret_cast<const int64_t*>(params.grouped_layout + curr_group_idx)));
+                    int64_t sum_m_cur = static_cast<int64_t>(__ldg(reinterpret_cast<const int64_t*>(params.grouped_layout + curr_group_idx + 1)));
+                    num_m = sum_m_cur - sum_m_pre;
+                } else {
+                    num_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
+                }
                 num_m_blocks = cutlass::ceil_div(num_m, ThreadblockShape::kM);
 
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;

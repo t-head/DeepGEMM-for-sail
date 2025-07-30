@@ -68,6 +68,8 @@ public:
     // using ProblemVisitor =  DeepGeemProblemVisitor<ThreadblockShape>;
     using ProblemVisitor = ProblemVisitor_;
 
+    using layoutT_ = ProblemVisitor::layoutT_;
+
      /// Argument structure
     struct Arguments
     {
@@ -86,7 +88,7 @@ public:
         int64_t gemm_n;
         int64_t gemm_k;
 
-        int32_t* grouped_layout;
+        layoutT_* grouped_layout;
 
         // in-order to compatility with base_group
         cutlass::gemm::GemmCoord* host_problem_sizes {nullptr};
@@ -115,7 +117,7 @@ public:
             typename Mma::IteratorA::TensorRef ref_A, typename Mma::IteratorB::TensorRef ref_B,
             typename Epilogue::OutputTileIterator::TensorRef ref_D,
             int64_t gemm_m, int64_t gemm_n, int64_t gemm_k,
-            int32_t* grouped_layout)
+            layoutT_* grouped_layout)
             : problem_count(problem_count)
             , threadblock_count(threadblock_count)
             , output_op(output_op)
@@ -215,12 +217,6 @@ public:
 
     static cutlass::Status can_implement(Arguments const& args)
     {
-        // Handle the case the input is too short
-        if (args.gemm_n < Mma::IteratorB::AccessType::kElements)
-        {
-            CUTLASS_TRACE_HOST("MoeFCGemm::can_implement() - gemm_n is smaller than the input alignment");
-            return cutlass::Status::kInvalid;
-        }
         return cutlass::Status::kSuccess;
     }
 
@@ -364,12 +360,18 @@ class Gemm {
 public:
     Gemm() = default;
 
+    using layoutT = typename std::conditional<
+                    kGemmType == GemmType::GroupedNoPad,
+                    int64_t,
+                    int32_t
+                >::type;
+
     static uint32_t generate_id() {
         static uint32_t id = 0;
         return ++id;
     }
 
-    static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
+    static void run(__nv_bfloat16* gmem_d, layoutT* grouped_layout,
                     uint32_t shape_m, uint32_t expected_m, __nv_bfloat16* gmem_a, __nv_bfloat16* gmem_b,
                     cudaStream_t stream, int num_sms, uint32_t smem_size) {
         using ThreadblockShape = cutlass::gemm::GemmShape<BLOCK_M, BLOCK_N, BLOCK_K>;

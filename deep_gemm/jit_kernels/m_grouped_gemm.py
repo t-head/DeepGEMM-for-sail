@@ -43,9 +43,11 @@ constexpr auto ThreadPerN = {ThreadPerN};
 constexpr auto NPerThread = {NPerThread};
 constexpr auto NUM_UNROLL = {NUM_UNROLL};
 constexpr auto SWZL_SIZE_M = {SWZL_SIZE_M};
+constexpr auto USE_SMALL_K = {USE_SMALL_K};
+constexpr auto BlockSize = {BlockSize};
 
 // Make a templated grouped GEMM
-using gemm_v = Gemvt<D, D, N, K, kNumGroups, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M>;
+using gemm_v = Gemvt<D, D, N, K, kNumGroups, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M, BlockSize, USE_SMALL_K>;
 
 // Launch kernel
 gemm_v::run(out, grouped_layout,
@@ -167,7 +169,8 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
 
 def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
                                      rhs: Tuple[torch.Tensor],
-                                     out: torch.Tensor, m_indices: torch.Tensor) -> None:
+                                     out: torch.Tensor, m_indices: torch.Tensor,
+                                     m_rows: torch.Tensor = None) -> None:
     lhs = lhs
     rhs = rhs
     m, k = lhs.shape
@@ -195,14 +198,14 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
     num_sms = get_num_sms()
     use_gemv = False
 
-    if (expected_m <= 2):
-    # if True:
+
+    if expected_m <= 2 and (k % 64 == 0 or (n >= 1024 and k <= 32 * 8)):
         # use gemmv if avg m small
         # ThreadPerN = 8
         # NUM_UNROLL = 1
         # SWZL_SIZE_M = 1
         # NPerThread = 1
-        ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread = get_gemv_best_configs(m, n, k, num_groups, num_sms)
+        BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, USE_SMALL_K = get_gemv_best_configs(m, n, k, num_groups, num_sms)
 
         if ThreadPerN != -1:
             args = (lhs, rhs, out,
@@ -213,7 +216,8 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
                 name='m_grouped_gemv_bf16_bf16_bf16_nt',
                 keys={'N': n, 'K': k, 'NUM_GROUPS': num_groups,
                     'ThreadPerN':ThreadPerN, 'NUM_UNROLL':NUM_UNROLL,
-                    'SWZL_SIZE_M':SWZL_SIZE_M, 'NPerThread':NPerThread},
+                    'SWZL_SIZE_M':SWZL_SIZE_M, 'NPerThread':NPerThread,
+                    'BlockSize':BlockSize, 'USE_SMALL_K':USE_SMALL_K},
                 space=(),
                 includes=includes_gemv,
                 arg_defs=(('lhs', torch.bfloat16),
@@ -229,12 +233,16 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
     if use_gemv == False:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
 
-        masked_m = torch.bincount(m_indices, minlength=num_groups).int()
-
-        # print(f'masked_m:{num_groups}\n')
+        if m_rows is None:
+            experts_for_rows = torch.zeros(num_groups + 1, dtype=torch.int32, device='cuda')
+            counts = torch.bincount(m_indices)
+            min_n = min(counts.size(0), num_groups)
+            if min_n > 0:
+                experts_for_rows[1:1+min_n] = counts[:min_n]
+            m_rows = experts_for_rows.cumsum(0)
 
         args = (lhs, rhs, out,
-                masked_m, m, expected_m,
+                m_rows, m, expected_m,
                 torch.cuda.current_stream(), num_sms, smem_config[0])
 
         runtime = jit_tuner.compile_and_tune(
@@ -249,7 +257,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
             arg_defs=(('lhs', torch.bfloat16),
                     ('rhs', torch.bfloat16),
                     ('out', torch.bfloat16),
-                    ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
+                    ('grouped_layout', torch.int64), ('m', int), ('expected_m', int),
                     ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
             template=template,
             args=args

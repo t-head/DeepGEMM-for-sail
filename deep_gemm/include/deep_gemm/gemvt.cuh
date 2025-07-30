@@ -67,6 +67,189 @@ HGGC_DEVICE_ONLY int cdiv(int a, int b) {
     return (a + b - 1) / b;
 }
 
+__device__ __forceinline__
+uint32_t SmemU32Addr(const void *smemptr) {
+    uint32_t u32addr;
+    asm (
+        "{.reg .u64 u64addr;\n"
+        " cvta.to.shared.u64 u64addr, %1;\n"
+        " cvt.u32.u64 %0, u64addr; }\n"
+        : "=r"(u32addr)
+        : "l"(smemptr)
+    );
+    return u32addr;
+}
+
+__device__ __forceinline__
+void LdgSts128(const void* smemPtr,
+               const void *gmemPtr,
+               bool guard = true) {
+    auto smemAddr = SmemU32Addr(smemPtr);
+    asm volatile (
+        "{.reg.pred p;\n"
+        " setp.ne.b32 p, %2, 0;\n"
+        " @p cp.async.cg.shared.global [%0], [%1], 16;}\n"
+        :
+        : "r"(smemAddr), "l"(gmemPtr), "r"((int)guard)
+    );
+}
+
+__device__ __forceinline__
+void LdgStsGroupCommit() {
+    asm volatile ("cp.async.commit_group;\n");
+}
+
+template <int N>
+__device__ __forceinline__
+void LdgStsGroupWait() {
+    asm volatile ("cp.async.wait_group %0;\n" : : "n"(N));
+}
+
+template <typename src_type, typename dst_type, typename acc_type,
+          typename load_atype, typename load_btype,
+          int BlockSize, int ThreadPerN = 32, int NPerThread = 1, int NUM_UNROLL=1,
+          int GROUP_SIZE_M = 1, int Stages = 2>
+__global__ void batched_gemvt_kernel_small_k(const GemvtArgs args) {
+  constexpr int WarpsPerN = ThreadPerN / WARP_SIZE;
+  constexpr int WarpCount = BlockSize / WARP_SIZE;
+  constexpr int NPerBlock = NPerThread * BlockSize / ThreadPerN;
+  constexpr int NLoopStep = BlockSize / ThreadPerN;
+
+  acc_type results[NPerThread];
+
+  int num_pid_m = args.num_tokens;
+  int num_pid_n = cdiv(args.N, NPerBlock);
+  int num_pid_in_group = GROUP_SIZE_M * num_pid_n;
+  int group_id = blockIdx.x / num_pid_in_group;
+  int first_pid_m = group_id * GROUP_SIZE_M;
+  int group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M);
+  int pid_m = first_pid_m + ((blockIdx.x % num_pid_in_group) % group_size_m);
+  int pid_n = (blockIdx.x % num_pid_in_group) / group_size_m;
+
+  constexpr int alignmentB = sizeof(load_btype) / sizeof(src_type);
+  constexpr int alignmentA = sizeof(load_atype) / sizeof(src_type);
+  constexpr int alignmentMax = alignmentB;
+  static_assert(alignmentB >= alignmentA, "only support alignmentB >= alignmentA");
+
+  // for mutlistage B
+  constexpr int TileM = ThreadPerN * alignmentB;
+  __shared__ src_type shared[Stages][NLoopStep][TileM];
+
+  int offs_token = pid_m;
+  int off_expert = *(args.expert_ids_ptr + pid_m);
+
+  int tid = threadIdx.x;
+  int warp_id = tid / WARP_SIZE;
+
+  int tid_k = tid % ThreadPerN;
+  int tid_n = tid / ThreadPerN;
+  int id_n = pid_n * NPerBlock + tid_n;
+  int id_k = tid_k * alignmentMax;
+
+  if ( off_expert >= args.num_experts
+        || pid_m >= args.num_tokens
+        || (id_n + (NPerThread - 1) * NLoopStep) >= args.N
+        || id_k >= args.K) {
+    return;
+  }
+
+  load_atype vreg_a;
+  load_btype vreg_b[NPerThread];
+  acc_type accum[NPerThread];
+
+  HGGC_PRAGMA_UNROLL
+  for (int i = 0; i < NPerThread; i++) {
+    accum[i] = 0;
+  }
+
+  dst_type * out = (dst_type*)args.c_ptr + offs_token * args.stride_cm + id_n;
+
+  const src_type *a_ptr_start = (src_type*)args.a_ptr + offs_token * args.stride_am + id_k;
+  const src_type *b_ptr_start = (src_type*)args.b_ptr + off_expert * args.stride_be + id_n * args.stride_bn + id_k;
+
+  // load A to vreg
+  import_data<src_type, load_atype, 1>(&vreg_a, a_ptr_start, alignmentA);
+
+
+  // load B to shared
+  for (int stage = 0; stage < Stages; stage++) {
+    LdgSts128(&(shared[stage][tid_n][tid_k * alignmentB]), b_ptr_start + stage * NLoopStep * args.stride_bn);
+    LdgStsGroupCommit();
+  }
+  LdgStsGroupWait<Stages - 1>();
+
+  HGGC_PRAGMA_UNROLL
+  for (int nloop = 0; nloop < NPerThread; nloop++) {
+    // load B to vreg
+    int current_stage = nloop % Stages;
+    import_data<src_type, load_btype, 1>(vreg_b + nloop,
+        &(shared[current_stage][tid_n][tid_k * alignmentB]), alignmentB);
+    // import_data<src_type, load_btype, 1>(vreg_b + nloop,
+    //   b_ptr_start + nloop * NLoopStep * args.stride_bn, alignmentB);
+
+    // auto current_b_ptr = reinterpret_cast<src_type*>(vreg_b + nloop);
+    // if (current_b_ptr[0] != shared[current_stage][tid_n][tid_k * alignmentB]) {
+    //   printf("tid = %d, nloop = %d, shared[%d][%d][%d] = %.4f, current_b[0] = %.4f\n",
+    //     tid, nloop, current_stage, tid_n, tid_k * alignmentB,
+    //     float(shared[current_stage][tid_n][tid_k * alignmentB]),
+    //     (float)current_b_ptr[0]);
+    // }
+    dot_op<src_type, acc_type, alignmentMax>((src_type *)&vreg_a,
+                                             (src_type *)(vreg_b + nloop),
+                                             accum[nloop]);
+    LdgStsGroupWait<Stages - 2>();
+
+    int load_next_n = nloop + Stages;
+    if (nloop < NPerThread - 2) {
+      // load next B to shared
+      int next_stage = load_next_n % Stages;
+      auto b_ptr_next = b_ptr_start + load_next_n * NLoopStep * args.stride_bn;
+      LdgSts128(&(shared[next_stage][tid_n][tid_k * alignmentB]), b_ptr_next, load_next_n < NPerThread);
+      LdgStsGroupCommit();
+    }
+  }
+
+  float alpha_row;
+  float alpha_col[NPerThread];
+  if (tid_k == 0) {
+    // load scale
+    if constexpr (sizeof(src_type) == 1) {
+      alpha_row = args.alphaRow[offs_token];
+      HGGC_PRAGMA_UNROLL
+      for (int nloop = 0; nloop < NPerThread; nloop++) {
+        alpha_col[nloop] = args.alphaCol[off_expert * args.N + id_n + nloop * NLoopStep];
+      }
+    }
+  }
+
+  // warp reduce
+  constexpr int SHFL_THREAD = ThreadPerN > WARP_SIZE ? WARP_SIZE : ThreadPerN;
+  HGGC_PRAGMA_UNROLL
+  for (int offset = (SHFL_THREAD >> 1); offset > 0; offset >>= 1) {
+    HGGC_PRAGMA_UNROLL
+    for (int nloop = 0; nloop < NPerThread; nloop++) {
+      acc_type temp = __shfl_down_sync(0xffffffff, accum[nloop], offset);
+      accum[nloop] += temp;
+    }
+  }
+
+  acc_type result;
+  if (tid_k == 0) {
+    // scale for int8
+    if constexpr (sizeof(src_type) == 1) {
+      HGGC_PRAGMA_UNROLL
+      for (int nloop = 0; nloop < NPerThread; nloop++) {
+        *(out + nloop * NLoopStep)  = (dst_type)(accum[nloop] * alpha_row * alpha_col[nloop]);
+      }
+
+    } else {
+      HGGC_PRAGMA_UNROLL
+      for (int nloop = 0; nloop < NPerThread; nloop++) {
+        *(out + nloop * NLoopStep)  = (dst_type)(accum[nloop]);
+      }
+    }
+  }
+}
 
 template <typename src_type, typename dst_type,
           typename load_atype, typename load_btype,
@@ -206,7 +389,7 @@ __global__ void batched_gemvt_kernel(const GemvtArgs args) {
 template <typename src_type, typename dst_type,
           uint32_t SHAPE_N, uint32_t SHAPE_K, int32_t kNumGroups,
           int ThreadPerN, int NPerThread, int NUM_UNROLL,
-          int SWZL_SIZE_M>
+          int SWZL_SIZE_M, int BlockSize = 256, bool SMALL_K = false>
 class Gemvt {
     using load_atype = int4;
     using load_btype = int4;
@@ -217,11 +400,6 @@ public:
     static void run(dst_type* gmem_d, int* grouped_layout,
                     uint32_t shape_m, src_type* gmem_a, src_type* gmem_b,
                     cudaStream_t stream) {
-
-        constexpr int BlockSize = 256;
-        size_t grid_x = shape_m;
-        constexpr uint32_t NPerBlock = NPerThread * BlockSize / ThreadPerN;
-        size_t grid_y = ceil_div(SHAPE_N, NPerBlock);
 
         GemvtArgs args;
         args.N = SHAPE_N;
@@ -243,36 +421,85 @@ public:
         args.stride_bn = SHAPE_K;
         args.stride_cm = SHAPE_N;
         args.stride_cn = 1;
-        args.total_blocks = grid_x * grid_y;
 
 
-        // check GEMM_K alignment
-        //   if(args.K % (NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type)) != 0) {
-        //     printf("K alignment mismatch, K = %d, NUM_UNROLL = %d, ThreadPerN = %d, sizeof(load_atype) = %d, sizeof(src_type) = %d",
-        //       args.K, NUM_UNROLL, ThreadPerN, sizeof(load_atype), sizeof(src_type));
-        //     return;
-        //   }
+        if (SMALL_K == false) {
+            size_t grid_x = shape_m;
+            constexpr uint32_t NPerBlock = NPerThread * BlockSize / ThreadPerN;
+            size_t grid_y = ceil_div(SHAPE_N, NPerBlock);
+            args.total_blocks = grid_x * grid_y;
+            // check GEMM_K alignment
+            //   if(args.K % (NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type)) != 0) {
+            //     printf("K alignment mismatch, K = %d, NUM_UNROLL = %d, ThreadPerN = %d, sizeof(load_atype) = %d, sizeof(src_type) = %d",
+            //       args.K, NUM_UNROLL, ThreadPerN, sizeof(load_atype), sizeof(src_type));
+            //     return;
+            //   }
 
-        auto device_func = batched_gemvt_kernel<src_type, dst_type, load_atype, load_btype,
-                            BlockSize, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M>;
-        dim3 grid = grid_x * grid_y;
+            auto device_func = batched_gemvt_kernel<src_type, dst_type, load_atype, load_btype,
+                                BlockSize, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M>;
+            dim3 grid = grid_x * grid_y;
 
-        char *pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            cudaFuncAttributes attr;
-            cudaFuncGetAttributes(&attr, device_func);
+            char *pEnv_params = std::getenv("show_log");
+            if (pEnv_params && isdigit(*pEnv_params)) {
+                cudaFuncAttributes attr;
+                cudaFuncGetAttributes(&attr, device_func);
 
-            printf("[GemV-BF16:]\n");
-            printf("group:%d, problem:[%d, %d, %d]\n",
-                kNumGroups, shape_m, SHAPE_N, SHAPE_K);
-            printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, NUM_UNROLL:%d, SWZL_SIZE_M:%d\n",
-                BlockSize, NPerThread, ThreadPerN, NPerBlock, NUM_UNROLL, SWZL_SIZE_M);
+                printf("[GemV-BF16:]\n");
+                printf("group:%d, problem:[%d, %d, %d]\n",
+                    kNumGroups, shape_m, SHAPE_N, SHAPE_K);
+                printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, NUM_UNROLL:%d, SWZL_SIZE_M:%d\n",
+                    BlockSize, NPerThread, ThreadPerN, NPerBlock, NUM_UNROLL, SWZL_SIZE_M);
+                
+                printf("threadblock_count:%d, verg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
+                
+            }
+
+            device_func<<<grid, BlockSize, 0, stream>>>(args);
+        } else {
+            // launch small_k gemm_v
+            size_t grid_x = args.num_tokens;
+            constexpr int NPerBlock = NPerThread * BlockSize / ThreadPerN;
+            size_t grid_y = args.N / NPerBlock;
+            args.total_blocks = grid_x * grid_y;
+            constexpr int MAX_K = NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type);
+            constexpr int MIN_ALIGNMENT = 16 / sizeof(src_type); // for int4 copy
+
+            if(args.K > MAX_K) {
+                printf("unsupported K, K = %d, MAX_K = %d, NUM_UNROLL = %d, ThreadPerN = %d, sizeof(load_atype) = %d, sizeof(src_type) = %d",
+                args.K, MAX_K, NUM_UNROLL, ThreadPerN, sizeof(load_atype), sizeof(src_type));
+                return;
+            }
+
+            if (args.stride_am % MIN_ALIGNMENT != 0 || args.stride_bn % MIN_ALIGNMENT !=0) {
+                printf("unsupported stride, stride_am = %d, stride_bn = %d\n", args.stride_am, args.stride_bn);
+                return;
+            }
+
+            auto device_func = batched_gemvt_kernel_small_k<src_type, dst_type, float, load_atype, load_btype,
+                                                            BlockSize, ThreadPerN, NPerThread, 1, SWZL_SIZE_M, 5>;
+            // printf("num_tokens = %d, N = %d, K = %d, top_k = %d, A = %p, B = %p, grid_x = %d, grid_y = %d",
+            //     args.num_tokens, args.N, args.K, args.top_k, args.a_ptr, args.b_ptr, grid_x, grid_y);
             
-            printf("threadblock_count:%d, verg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
-            
+            char *pEnv_params = std::getenv("show_log");
+            if (pEnv_params && isdigit(*pEnv_params)) {
+                cudaFuncAttributes attr;
+                cudaFuncGetAttributes(&attr, device_func);
+
+                printf("[GemV-Small-BF16:]\n");
+                printf("group:%d, problem:[%d, %d, %d]\n",
+                    kNumGroups, args.num_tokens, args.N, args.K);
+                printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, SWZL_SIZE_M:%d\n",
+                    BlockSize, NPerThread, ThreadPerN, NPerBlock, SWZL_SIZE_M);
+                
+                printf("threadblock_count:%d, verg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
+                
+            }
+
+            // batched_gemvt_kernel_small_k<src_type, dst_type, float, load_atype, load_btype,
+            //     BlockSize, ThreadPerN, NPerThread, 1, SWZL_SIZE_M, Stages><<<grid_x * grid_y, BlockSize, 0, stream>>>(args);
+            device_func<<<grid_x * grid_y, BlockSize, 0, stream>>>(args);
+
         }
-
-        device_func<<<grid, BlockSize, 0, stream>>>(args);
     }
 };
 
