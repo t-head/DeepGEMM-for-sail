@@ -89,8 +89,8 @@ def run_cycle_on_device(cases, output_file, dev="gpu", force_int8=False):
         metrics_string = "sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__bytes.read.sum.pct_of_peak_sustained_elapsed" if dev=="gpu" else \
                          "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format("int8" if "int8" in case or force_int8 else "bf16")
         cmd = '{} --clock-control none --metrics="{}"  \
-              --page=details python ./test_core.py --cycle --file {} \
-              2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, case, log_file)
+              --page=details python ./{} --cycle --file {} \
+              2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, case, "test_core.py" if dev == "gpu" else "test_core_gpu.py", log_file)
 
         run_cmd(cmd)
 
