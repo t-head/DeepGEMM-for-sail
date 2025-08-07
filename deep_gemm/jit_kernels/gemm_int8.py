@@ -440,7 +440,7 @@ def generate_search_space():
 
 def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
                          rhs: Tuple[torch.Tensor, torch.Tensor],
-                         out: torch.Tensor) -> None:
+                         out: torch.Tensor, configs = None) -> None:
     lhs, lhs_scales = lhs
     rhs, rhs_scales = rhs
     m, k = lhs.shape
@@ -463,8 +463,11 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     global includes, template
 
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(m, n, k, 1, num_sms)
-
+    if configs is not None:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = configs
+    else:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(m, n, k, 1, num_sms)
+        
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m, torch.cuda.current_stream(), num_sms, smem_config[0])
 
