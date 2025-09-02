@@ -33,7 +33,7 @@ gemm_t::run(out, grouped_layout,
 
 def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Tensor],
                                                 rhs: Tuple[torch.Tensor, torch.Tensor],
-                                                out: torch.Tensor, m_indices: torch.Tensor) -> None:
+                                                out: torch.Tensor, m_indices: torch.Tensor, configs = None) -> None:
     lhs, lhs_scales = lhs
     rhs, rhs_scales = rhs
     m, k = lhs.shape
@@ -63,7 +63,10 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous=True)
+    if configs:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = configs
+    else:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous=True)
     expected_m = 0
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
