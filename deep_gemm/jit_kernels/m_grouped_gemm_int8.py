@@ -3,7 +3,9 @@ from typing import Tuple
 
 from .gemm_int8 import get_best_configs
 from .tuner import jit_tuner
-from .utils import get_num_sms
+from .utils import get_num_sms, ceil_div, get_case_id
+from .gemm import get_gemv_best_configs
+import os
 
 # C++ code templates
 includes = ('"deep_gemm/int8_gemm.cuh"', )
@@ -30,6 +32,30 @@ gemm_t::run(out, grouped_layout,
             stream, num_sms, smem_size);
 """
 
+
+includes_gemv = ('"deep_gemm/gemvt.cuh"', )
+template_gemv = """
+using namespace deep_gemm;
+
+// Templated args from Python JIT call
+constexpr auto N = {N}, K = {K};
+constexpr auto kNumGroups = {NUM_GROUPS};
+constexpr auto ThreadPerN = {ThreadPerN};
+constexpr auto NPerThread = {NPerThread};
+constexpr auto NUM_UNROLL = {NUM_UNROLL};
+constexpr auto SWZL_SIZE_M = {SWZL_SIZE_M};
+constexpr auto USE_SMALL_K = {USE_SMALL_K};
+constexpr auto BlockSize = {BlockSize};
+
+// Make a templated grouped GEMM
+using gemm_v = Gemvt<int8_t, __nv_bfloat16, N, K, kNumGroups, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M, BlockSize, USE_SMALL_K>;
+
+// Launch kernel
+gemm_v::run(out, grouped_layout,
+            m, lhs, rhs,
+            stream,
+            lhs_scales, rhs_scales);
+"""
 
 def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Tensor],
                                                 rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -159,6 +185,128 @@ def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tenso
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
+
+    # Run the kernel
+    runtime(*args)
+
+
+def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
+                                     rhs: Tuple[torch.Tensor],
+                                     out: torch.Tensor, m_indices: torch.Tensor,
+                                     m_rows: torch.Tensor = None) -> None:
+    lhs, lhs_scales = lhs
+    rhs, rhs_scales = rhs
+    m, k = lhs.shape
+    num_groups, n, k_ = rhs.shape
+    m_, n_ = out.shape
+    m__ = m_indices.numel()
+
+    # Type and shape checks
+    assert m == m_ == m__ and k == k_ and n == n_
+    assert lhs_scales.shape == (m, 1)
+    assert rhs_scales.shape == (num_groups, n, 1)
+    assert lhs.dtype == torch.int8 and lhs_scales.dtype == torch.float32
+    assert rhs.dtype == torch.int8 and rhs_scales.dtype == torch.float32
+    assert out.dtype == torch.bfloat16
+    assert m_indices.dtype == torch.int32
+    assert lhs.is_contiguous() and rhs.is_contiguous()
+    assert out.is_contiguous() and m_indices.is_contiguous()
+
+    # LHS scales must be transposed for TMA load, but not for RHS scales
+    # lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
+    assert rhs_scales.is_contiguous()
+
+    # Do nothing if `m` is zero
+    if m == 0:
+        return
+
+    expected_m = ceil_div(m, num_groups)
+
+    # Auto-tuning with compilation
+    global includes, template, includes_gemv, template_gemv
+    num_sms = get_num_sms()
+    use_gemv = False
+
+    if expected_m <= 2 and (k % 64 == 0 or (n >= 1024 and k <= 32 * 8)):
+        # use gemmv if avg m small
+        # ThreadPerN = 8
+        # NUM_UNROLL = 1
+        # SWZL_SIZE_M = 1
+        # NPerThread = 1
+        BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, USE_SMALL_K = get_gemv_best_configs(m, n, k, num_groups, num_sms, torch.int8)
+
+        if ThreadPerN != -1:
+            args = (lhs, rhs, out,
+                m_indices, m,
+                torch.cuda.current_stream(),
+                lhs_scales, rhs_scales)
+
+            runtime = jit_tuner.compile_and_tune(
+                name='m_grouped_gemv_int8_int8_bf16_nt',
+                keys={'N': n, 'K': k, 'NUM_GROUPS': num_groups,
+                    'ThreadPerN':ThreadPerN, 'NUM_UNROLL':NUM_UNROLL,
+                    'SWZL_SIZE_M':SWZL_SIZE_M, 'NPerThread':NPerThread,
+                    'BlockSize':BlockSize, 'USE_SMALL_K':USE_SMALL_K},
+                space=(),
+                includes=includes_gemv,
+                arg_defs=(('lhs', torch.int8),
+                        ('rhs', torch.int8),
+                        ('out', torch.bfloat16),
+                        ('grouped_layout', torch.int32), ('m', int),
+                        ('stream', torch.cuda.Stream),
+                        ('lhs_scales', torch.float),
+                        ('rhs_scales', torch.float)),
+                template=template_gemv,
+                args=args
+            )
+            use_gemv = True
+
+    if use_gemv == False:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
+
+        if m_rows is None:
+            experts_for_rows = torch.zeros(num_groups + 1, dtype=torch.int32, device='cuda')
+            counts = torch.bincount(m_indices)
+            min_n = min(counts.size(0), num_groups)
+            if min_n > 0:
+                experts_for_rows[1:1+min_n] = counts[:min_n]
+            m_rows = experts_for_rows.cumsum(0)
+
+        args = (lhs, lhs_scales, rhs, rhs_scales, out,
+            m_rows, m, expected_m, num_groups,
+            torch.cuda.current_stream(), num_sms, smem_config[0])
+
+        runtime = jit_tuner.compile_and_tune(
+            name='m_grouped_gemm_int8_int8_bf16_nt',
+            keys={'N': n, 'K': k,
+                'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+                'WARP_M': warp_m, 'WARP_N': warp_n,
+                'BLOCK_N_PADDING': smem_config[2],
+                'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
+                'GEMM_TYPE': 'GroupedNoPad'},
+            space=(),
+            includes=includes,
+            arg_defs=(  ('lhs', torch.int8), ('lhs_scales', torch.float),
+                        ('rhs', torch.int8), ('rhs_scales', torch.float),
+                        ('out', torch.bfloat16),
+                        ('grouped_layout', torch.int64), ('m', int),
+                        ('num_groups', int), ('expected_m', int),
+                        ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+            template=template,
+            args=args
+        )
+
+    dump_env = os.getenv('dump_group_m')
+    if dump_env:
+        filename = f"case{get_case_id()}_groups{num_groups}_m{m}_n{n}_k{k}_em{expected_m}_GroupedNoPad.dump"
+        tensor_cpu = m_indices.detach().cpu()
+        data = tensor_cpu.tolist()
+
+        print(f"[INFO] file:{filename} with size:{m_indices.size()}\n")
+
+        with open(filename, 'w', encoding='utf-8') as f:
+            for num in data:
+                f.write(f"{num}\n")
 
     # Run the kernel
     runtime(*args)

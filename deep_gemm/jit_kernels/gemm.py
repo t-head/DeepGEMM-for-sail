@@ -83,8 +83,11 @@ def get_smem_occ(block_m: int, block_n: int) -> Tuple[int]:
     return 262144 // smem_size
 
 @lru_cache(maxsize=None)
-def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int):
-    Alignment = 8
+def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int, dtype: torch.dtype):
+    if dtype == torch.int8:
+        Alignment = 16
+    else:
+        Alignment = 8
     small_k_algo_limit = 32 * Alignment
     SmallK = False
 

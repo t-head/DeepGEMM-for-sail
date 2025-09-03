@@ -399,7 +399,7 @@ public:
 
     static void run(dst_type* gmem_d, int* grouped_layout,
                     uint32_t shape_m, src_type* gmem_a, src_type* gmem_b,
-                    cudaStream_t stream) {
+                    cudaStream_t stream, const float* lhs_scale = nullptr, const float* rhs_scale = nullptr) {
 
         GemvtArgs args;
         args.N = SHAPE_N;
@@ -408,9 +408,8 @@ public:
         args.b_ptr = (void *)gmem_b;
         args.c_ptr = (void *)gmem_d;
         
-        // args.topk_weights_ptr = (void *)weight_scales;
-        // args.alphaCol = prob_info->alphaCol;
-        // args.alphaRow = prob_info->alphaRow;
+        args.alphaCol = rhs_scale;
+        args.alphaRow = lhs_scale;
         args.expert_ids_ptr = grouped_layout;
         args.num_tokens = shape_m;
         args.num_experts = kNumGroups;
@@ -429,11 +428,11 @@ public:
             size_t grid_y = ceil_div(SHAPE_N, NPerBlock);
             args.total_blocks = grid_x * grid_y;
             // check GEMM_K alignment
-            //   if(args.K % (NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type)) != 0) {
-            //     printf("K alignment mismatch, K = %d, NUM_UNROLL = %d, ThreadPerN = %d, sizeof(load_atype) = %d, sizeof(src_type) = %d",
-            //       args.K, NUM_UNROLL, ThreadPerN, sizeof(load_atype), sizeof(src_type));
-            //     return;
-            //   }
+            if(args.K % (NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type)) != 0) {
+                 printf("K alignment mismatch, K = %d, NUM_UNROLL = %d, ThreadPerN = %d, sizeof(load_atype) = %d, sizeof(src_type) = %d",
+                   args.K, NUM_UNROLL, ThreadPerN, sizeof(load_atype), sizeof(src_type));
+                 return;
+            }
 
             auto device_func = batched_gemvt_kernel<src_type, dst_type, load_atype, load_btype,
                                 BlockSize, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M>;
@@ -449,7 +448,6 @@ public:
                     kNumGroups, shape_m, SHAPE_N, SHAPE_K);
                 printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, NUM_UNROLL:%d, SWZL_SIZE_M:%d\n",
                     BlockSize, NPerThread, ThreadPerN, NPerBlock, NUM_UNROLL, SWZL_SIZE_M);
-                
                 printf("threadblock_count:%d, verg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
                 
             }

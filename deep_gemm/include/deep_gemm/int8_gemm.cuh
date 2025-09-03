@@ -83,6 +83,9 @@ public:
 
     // using ProblemVisitor =  DeepGeemProblemVisitor<ThreadblockShape>;
     using ProblemVisitor = ProblemVisitor_;
+
+    using layoutT_ = ProblemVisitor::layoutT_;
+
     using EpilogueOutputOp =
         typename Epilogue::Visitor::ElementwiseFunctor; 
 
@@ -107,7 +110,7 @@ public:
         int64_t gemm_n;
         int64_t gemm_k;
 
-        int32_t* grouped_layout;
+        layoutT_* grouped_layout;
 
         // in-order to compatility with base_group
         cutlass::gemm::GemmCoord* host_problem_sizes {nullptr};
@@ -143,7 +146,7 @@ public:
         Arguments(int problem_count, int threadblock_count,
             typename Mma::IteratorA::TensorRef ref_A, typename Mma::IteratorB::TensorRef ref_B, 
             TensorRefC ref_D,
-            int64_t gemm_m, int64_t gemm_n, int64_t gemm_k, int32_t* grouped_layout,
+            int64_t gemm_m, int64_t gemm_n, int64_t gemm_k, layoutT_* grouped_layout,
             TensorRefAlphaCol ref_alpha_col_, TensorRefAlphaRow ref_alpha_row_,
             int64_t batch_stride_A_, int64_t batch_stride_B_,
             typename EpilogueVisitor::Arguments epilogue_visitor_)
@@ -328,6 +331,7 @@ public:
 
             cutlass::gemm::GemmCoord problem_size = problem_visitor.problem_size();
             int32_t problem_idx = problem_visitor.problem_index();
+            uint32_t curr_group_m = problem_visitor.get_curr_m();
 
             int32_t index_m = problem_visitor.get_global_idx(gemm_m, ThreadblockShape::kM, m_block_idx);
             int32_t index_n = problem_visitor.get_global_idx<false>(gemm_n, ThreadblockShape::kN, n_block_idx, m_block_idx);
@@ -352,7 +356,10 @@ public:
             // Construct iterators to A and B operands
             typename Mma::IteratorA iterator_A(
                 params.params_A, params.ptr_A,
-                {problem_size.m() * (ProblemVisitor::kGemmType == GemmType::GroupedMasked ? problem_idx + 1 : 1), problem_size.k()}, thread_idx, tb_offset_A);
+                // {problem_size.m() * (ProblemVisitor::kGemmType == GemmType::GroupedMasked ? params.problem_count : 1), problem_size.k()},
+                {ProblemVisitor::kGemmType == GemmType::GroupedMasked || ProblemVisitor::kGemmType == GemmType::GroupedNoPad
+                    ? index_m + curr_group_m : problem_size.m(), problem_size.k()},
+                thread_idx, tb_offset_A);
 
             typename Mma::IteratorB iterator_B(params.params_B,
                 reinterpret_cast<ElementB*>(params.ptr_B),
@@ -395,7 +402,9 @@ public:
             );
 
             cutlass::gemm::GemmCoord problem_size_output(
-                problem_size.m() * (ProblemVisitor::kGemmType == GemmType::GroupedMasked ? problem_idx + 1 : 1),
+                // problem_size.m() * (ProblemVisitor::kGemmType == GemmType::GroupedMasked ? problem_idx + 1 : 1),
+                ProblemVisitor::kGemmType == GemmType::GroupedMasked || ProblemVisitor::kGemmType == GemmType::GroupedNoPad
+                    ? index_m + curr_group_m : problem_size.m(),
                 problem_size.n(),
                 problem_size.k()
             );
@@ -428,12 +437,18 @@ class Gemm {
 public:
     Gemm() = default;
 
+    using layoutT = typename std::conditional<
+                    kGemmType == GemmType::GroupedNoPad,
+                    int64_t,
+                    int32_t
+                >::type;
+
     static uint32_t generate_id() {
         static uint32_t id = 0;
         return ++id;
     }
 
-    static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
+    static void run(__nv_bfloat16* gmem_d, layoutT* grouped_layout,
                     uint32_t shape_m, uint32_t expected_m, int8_t* gmem_a, float* scales_a,
                     int8_t * gmem_b, float* scales_b,
                     cudaStream_t stream, int num_sms, uint32_t smem_size) {

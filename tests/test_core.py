@@ -311,11 +311,15 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
 
     def test_func():
         m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, d, file, 1)
-        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
+        if (d == torch.bfloat16):
+            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
+        else:
+            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
 
         if not cycle:
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
             diff = calc_diff(out, ref_out)
+
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
     if file is not None:
@@ -324,7 +328,7 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
     else:
         for num_groups, expected_m_per_group in ((256, 1), (256, 4), (256, 16), (256, 32), (128, 8), (128, 64), (128, 1024)):
             for k, n in ((7168, 4096), (2048, 7168), (256, 768), (512, 128)):
-        # num_groups, expected_m_per_group, k, n = 4, 2, 128, 8
+        # num_groups, expected_m_per_group, k, n = 4, 1, 512, 128
                 test_func()
 
     print("Passed\n")
@@ -373,6 +377,7 @@ if __name__ == '__main__':
         test_gemm(torch.int8)
         test_m_grouped_gemm_contiguous(torch.int8, args.file)
         test_m_grouped_gemm_masked(torch.int8, args.file)
+        test_m_grouped_gemm_nopad(torch.int8, args.file)
 
         test_gemm(torch.bfloat16)
         test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)

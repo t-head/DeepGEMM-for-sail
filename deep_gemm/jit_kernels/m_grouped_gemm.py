@@ -207,7 +207,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
         # NUM_UNROLL = 1
         # SWZL_SIZE_M = 1
         # NPerThread = 1
-        BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, USE_SMALL_K = get_gemv_best_configs(m, n, k, num_groups, num_sms)
+        BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, USE_SMALL_K = get_gemv_best_configs(m, n, k, num_groups, num_sms, lhs.dtype)
 
         if ThreadPerN != -1:
             args = (lhs, rhs, out,
