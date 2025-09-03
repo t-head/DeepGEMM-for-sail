@@ -2,7 +2,7 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-#define ACOMPUTE_VERSION 10000
+// #define ACOMPUTE_VERSION 10000
 
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
@@ -1479,8 +1479,9 @@ public:
         static constexpr int WarpOnM = BLOCK_M / WARP_M;
         static constexpr int WarpOnN = BLOCK_N / WARP_N;
 
+        using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<int8_t,int8_t,int32_t>::type;
         using TiledMma = TiledMMA<
-            MMA_Atom<Acompute10000_16x16x32_S32S8S8S32_TN>,
+            MMA_Atom<MmaInst>,
             Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
             Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _32>>;       // 1x1x1 value group
 

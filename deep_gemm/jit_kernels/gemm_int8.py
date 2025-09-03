@@ -6,7 +6,7 @@ from typing import Tuple
 import re
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info
 from .gemm_int8_lut import get_best_configs_from_lut
 
 # C++ code templates
@@ -176,7 +176,6 @@ def get_best_configs_dense(m: int, n: int, k: int, num_groups: int, num_sms: int
 
     num_min_sms = 20
     best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1)
-    extra_info = {'use_cutlass3' : False, 'use_multistage_on_N' : False}
 
     assert best_block_m is not None
     assert best_block_n is not None
@@ -186,16 +185,7 @@ def get_best_configs_dense(m: int, n: int, k: int, num_groups: int, num_sms: int
     assert best_smem_config is not None
     assert best_stages is not None
 
-    use_cutlass3 = False
-    use_multistage_on_N = False
-    if 'DG_USE_CUTLASS3' in os.environ:
-        use_cutlass3 = int(os.getenv('DG_USE_CUTLASS3'))
-    extra_info['use_cutlass3'] = use_cutlass3
-    if 'DG_USE_MULTISTAGE_ON_N' in os.environ:
-        use_multistage_on_N = int(os.getenv('DG_USE_MULTISTAGE_ON_N'))
-    extra_info['use_multistage_on_N'] = use_multistage_on_N
-
-    return num_min_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config, extra_info
+    return num_min_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
 
 
 @lru_cache(maxsize=None)
@@ -352,17 +342,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 64, 256, 16, 16, 4)
     # print(best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages)
 
-    extra_info = {}
-    use_cutlass3 = False
-    use_multistage_on_N = False
-    if 'DG_USE_CUTLASS3' in os.environ:
-        use_cutlass3 = int(os.getenv('DG_USE_CUTLASS3'))
-    extra_info['use_cutlass3'] = use_cutlass3
-    if 'DG_USE_MULTISTAGE_ON_N' in os.environ:
-        use_multistage_on_N = int(os.getenv('DG_USE_MULTISTAGE_ON_N'))
-    extra_info['use_multistage_on_N'] = use_multistage_on_N
-
-    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config, extra_info
+    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
 
 def generate_search_space():
@@ -464,9 +444,11 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
 
     num_sms = get_num_sms()
     if configs is not None:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = configs
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(m, n, k, 1, num_sms)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+
+    extra_info = get_extra_info()
         
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m, torch.cuda.current_stream(), num_sms, smem_config[0])

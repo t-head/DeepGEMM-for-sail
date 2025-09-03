@@ -1,4 +1,6 @@
 import torch
+import os
+import functools
 
 _num_sms = None
 
@@ -118,3 +120,23 @@ def get_case_id() -> int:
         get_case_id.case_id = 0
     get_case_id.case_id += 1
     return get_case_id.case_id
+
+
+@functools.lru_cache(maxsize=None)
+def get_extra_info(m=0, n=0, k=0, dtype=torch.int8, api_type="dense") -> dict:
+    extra_info = {}
+    use_cutlass3 = False
+    use_multistage_on_N = False
+
+    device_prop = torch.cuda.get_device_properties()
+    if device_prop.major == 8 and device_prop.minor == 9:
+        use_cutlass3 = True
+
+    if 'DG_USE_CUTLASS3' in os.environ:
+        use_cutlass3 = int(os.getenv('DG_USE_CUTLASS3'))
+    extra_info['use_cutlass3'] = use_cutlass3
+
+    if 'DG_USE_MULTISTAGE_ON_N' in os.environ:
+        use_multistage_on_N = int(os.getenv('DG_USE_MULTISTAGE_ON_N'))
+    extra_info['use_multistage_on_N'] = use_multistage_on_N
+    return extra_info

@@ -105,7 +105,7 @@ def put(path, data, is_binary=False):
 def build(name: str, arg_defs: tuple, code: str, ppu_arch: str) -> Runtime:
     # Compiler flags
     cpp_standard = int(os.getenv('DG_NVCC_OVERRIDE_CPP_STANDARD', 17))
-    gen_code = '-gencode=arch=compute_89a,code=sm_89a' if ppu_arch == '1.5' else '-gencode=arch=compute_80a,code=sm_80a'
+    gen_code = '-gencode=arch=compute_89a,code=sm_89a' if ppu_arch == '1.5' else '-gencode=arch=compute_80,code=sm_80'
     nvcc_flags = [f'-std=c++{cpp_standard}', '-shared', '-O3', '--expt-relaxed-constexpr', '--expt-extended-lambda',
                   gen_code,
                   '--ptxas-options=--register-usage-level=10' + (',--verbose' if 'DG_PTXAS_VERBOSE' in os.environ else ''),
