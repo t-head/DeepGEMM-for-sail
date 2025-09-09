@@ -4,6 +4,7 @@ from typing import Tuple
 
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
+from utils import read_numbers_from_file, parse_dump_file
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(1) % 128 == 0
@@ -38,26 +39,39 @@ def construct(m: int, k: int, n: int) -> \
 
     return x_fp8, y_fp8, out, ref_out
 
-def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: int, n: int) -> \
+def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: int, n: int, file: str) -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-    alignment = get_m_alignment_for_contiguous_layout()
-    group_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
-    m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
+    if file is not None:
+        index = read_numbers_from_file(file)
+        m_indices = torch.tensor(index, device='cuda', dtype=torch.int32)
+        m = expected_m_per_group
+    else :
+        alignment = get_m_alignment_for_contiguous_layout()
+        group_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
+        m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
+        m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
 
     x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
-    m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
+
+
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
 
-    start = 0
-    for i, group_m in enumerate(group_ms):
-        actual_end = start + group_m
-        aligned_end = start + ceil_div(group_m, alignment) * alignment
-        m_indices[start:actual_end] = i
-        m_indices[actual_end:aligned_end] = -1
-        ref_out[start:aligned_end] = x[start:aligned_end] @ y[i].t()
-        start = aligned_end
+    if file is not None:
+        for i, group in enumerate(m_indices):
+            if group != -1:
+                ref_out[i] = x[i] @ y[group].t()
+    else:
+        start = 0
+        for i, group_m in enumerate(group_ms):
+            actual_end = start + group_m
+            aligned_end = start + ceil_div(group_m, alignment) * alignment
+            m_indices[start:actual_end] = i
+            m_indices[actual_end:aligned_end] = -1
+            ref_out[start:aligned_end] = x[start:aligned_end] @ y[i].t()
+            start = aligned_end
+
     ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
 
     assert m % 4 == 0, f'TMA alignment error: {m}'
@@ -68,14 +82,23 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
 
     return m, x_fp8, y_fp8, m_indices, out, ref_out
 
-def construct_masked_grouped(num_groups: int, m: int, k: int, n: int) -> \
+def construct_masked_grouped(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, file: str) -> \
         Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
-    x = torch.randn((num_groups, m, k), device='cuda', dtype=torch.bfloat16)
+    x = torch.randn((num_groups, max_m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
-    out = torch.zeros((num_groups, m, n), device='cuda', dtype=torch.bfloat16)
+    out = torch.zeros((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = torch.einsum('gmk,gnk->gmn', x, y)
 
-    x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, m, k // 128), device='cuda', dtype=torch.float))
+    # Construct mask
+    if file is not None:
+        list_m = read_numbers_from_file(file)
+        masked_m = torch.tensor(list_m, device='cuda', dtype=torch.int)
+    else:
+        masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
+        for j in range(num_groups):
+            masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
+
+    x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, max_m, k // 128), device='cuda', dtype=torch.float))
     y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, (n + 127) // 128, k // 128), device='cuda', dtype=torch.float))
     for i in range(num_groups):
         x_fp8[0][i], x_fp8[1][i] = per_token_cast_to_fp8(x[i])
@@ -83,11 +106,27 @@ def construct_masked_grouped(num_groups: int, m: int, k: int, n: int) -> \
 
     # Transpose earlier so that the testing will not trigger transposing kernels
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
-    return x_fp8, y_fp8, out, ref_out
+    return x_fp8, y_fp8, masked_m, out, ref_out
 
 
-def test_gemm() -> None:
+def test_gemm(file: str) -> None:
     print('Testing GEMM:')
+    def test_func(m, n, k):
+        print("test_gemm->test_func: ", m, n, k)
+        x_fp8, y_fp8, out, ref_out = construct(m, k, n)
+        deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+        if not cycle:
+            diff = calc_diff(out, ref_out)
+            if diff >= 0.001:
+                print("ref_out:", ref_out)
+                print("out:", out)
+            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+
+    if file is not None:
+        num_groups, m, n, k, expected_m_per_group = parse_dump_file(file)
+        test_func(m, n, k)
+        return
+
     for m in (64, 128, 4096):
         for k, n in [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
             x_fp8, y_fp8, out, ref_out = construct(m, k, n)
@@ -102,72 +141,95 @@ def test_gemm() -> None:
             def test_func():
                 deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 
-            t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+            t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
             print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
                 f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
                 f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     print("Passed\n")
 
-def test_m_grouped_gemm_contiguous() -> None:
+def test_m_grouped_gemm_contiguous(file: str) -> None:
     print('Testing grouped contiguous GEMM:')
-
-    for num_groups, expected_m_per_group, k, n in ((4, 8192, 7168, 4096), (4, 8192, 2048, 7168),
-                                                   (8, 4096, 7168, 4096), (8, 4096, 2048, 7168)):
-
-        # NOTES: we should mask the unfilled part before calculating difference
-        m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n)
+    def test_func():
+        m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file)
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
-        out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
-        diff = calc_diff(out, ref_out)
-        assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
-        # noinspection PyShadowingNames
-        def test_func():
+        if not cycle:
+            out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
+            diff = calc_diff(out, ref_out)
+            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+
+    if file is not None:
+        num_groups, expected_m_per_group, n, k, m = parse_dump_file(file)
+        test_func()
+    else:
+        for num_groups, expected_m_per_group, k, n in ((4, 8192, 7168, 4096), (4, 8192, 2048, 7168),
+                                                       (8, 4096, 7168, 4096), (8, 4096, 2048, 7168),
+                                                       (32, 256, 7168, 4096), (32, 256, 2048, 7168)):
+            m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file)
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
+            out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
+            diff = calc_diff(out, ref_out)
+            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
-        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
-        valid_m = (m_indices != -1).sum().item()
-        print(f' > Perf ({num_groups=:2}, {expected_m_per_group=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
-                f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
-                f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
+
+            # NOTES: we should mask the unfilled part before calculating difference
+            m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file)
+
+            # noinspection PyShadowingNames
+            def test_func():
+                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
+
+            t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+            valid_m = (m_indices != -1).sum().item()
+            print(f' > Perf ({num_groups=:2}, {expected_m_per_group=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+                  f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
+                  f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
     print("Passed\n")
 
 
-def test_m_grouped_gemm_masked() -> None:
+def test_m_grouped_gemm_masked(file: str) -> None:
     print('Testing grouped masked GEMM:')
+    def test_func():
+        x_fp8, y_fp8, masked_m, out, ref_out = construct_masked_grouped(num_groups, max_m, expected_m_per_group, k, n, file)
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m_per_group)
 
-    for num_groups, m in ((1, 1024), (2, 512), (4, 256)):
-        for k, n in ((7168, 4096), (2048, 7168), ):
-        # Test correctness
+        if not cycle:
+            for j in range(num_groups):
+                diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
+                if (masked_m[j] != 0):
+                    assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
 
-            masked_m_candidates = list(filter(lambda candidate: candidate <= m, (64, 128, 192, 256, 320, 384)))
-            for i in range(10):
-                x_fp8, y_fp8, out, ref_out = construct_masked_grouped(num_groups, m, k, n)
+    if file is not None:
+        num_groups, max_m, n, k, expected_m_per_group = parse_dump_file(file)
+        test_func()
+    else:
 
-                masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
+        for num_groups, expected_m_per_group in ((1, 1024), (2, 512), (4, 256)):
+            for k, n in ((7168, 4096), (2048, 7168), ):
+            # Test correctness
 
-                for j in range(num_groups):
-                    masked_m[j] = random.choice(masked_m_candidates)
-                expected_m = min(int(masked_m.float().mean()) + 1, m)
+                for i in range(10):
+                    x_fp8, y_fp8, masked_m, out, ref_out = construct_masked_grouped(num_groups, 4096, expected_m_per_group, k, n, file)
 
-                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m)
-                for j in range(num_groups):
-                    diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
-                    assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+                    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m_per_group)
+                    for j in range(num_groups):
+                        diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
+                        assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
 
                 # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
-                x_fp8, y_fp8, out, ref_out = construct_masked_grouped(num_groups, m, k, n)
-                masked_m = torch.ones((num_groups, ), device='cuda', dtype=torch.int) * m
+                x_fp8, y_fp8, masked_m, out, ref_out = construct_masked_grouped(num_groups, 4096, expected_m_per_group, k, n, file)
 
                 # noinspection PyShadowingNames
                 def test_func():
-                    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, m)
+                    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m_per_group)
 
+                valid_m = masked_m.sum().item()
                 # Test performance with fixed shapes
-                t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
-                print(f' > Performance ({num_groups=}, m_per_group={m:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
-                      f'throughput: {2 * num_groups * m * n * k / t / 1e12:4.0f} TFLOPS, '
-                      f'{(num_groups * (m * k + k * n + m * n * 2)) / 1e9 / t:4.0f} GB/s')
+                t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+
+                print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+                    f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
+                    f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s') 
     print("Passed\n")
 
 
@@ -180,6 +242,31 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    test_gemm()
-    test_m_grouped_gemm_contiguous()
-    test_m_grouped_gemm_masked()
+    # global benchmark
+    # benchmark = 0
+
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Process some files.")
+    parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
+    parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
+
+    args = parser.parse_args()
+    global cycle
+    cycle = 0
+    if (args.cycle):
+        cycle = 1
+
+    if args.file is not None:
+        if "GroupedContiguous" in args.file:
+            test_m_grouped_gemm_contiguous(args.file)
+        elif "GroupedMasked" in args.file:
+            test_m_grouped_gemm_masked(args.file)
+        elif "DenseGemm" in args.file:
+            test_gemm(args.file)
+        else:
+            "invalid dump file\n"
+    else:
+        test_gemm(args.file)
+        test_m_grouped_gemm_contiguous(args.file)
+        test_m_grouped_gemm_masked(args.file)

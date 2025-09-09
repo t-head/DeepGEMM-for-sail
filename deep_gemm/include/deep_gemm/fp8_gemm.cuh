@@ -5,6 +5,9 @@
 
 #include <iostream>
 #include <cuda_fp8.h>
+#include "profiling_interface.hpp"
+#include "utils.cuh"
+#include <sys/file.h>
 #include "cutlass/cutlass.h"
 
 #include "cutlass/workspace.h"
@@ -328,6 +331,7 @@ public:
 
 template <int32_t SHAPE_N, int32_t SHAPE_K,
           int32_t BLOCK_M, int32_t BLOCK_N, int32_t BLOCK_K,
+          int32_t WARP_M, int32_t WARP_N,
           int32_t BLOCK_N_PADDING,
           int32_t kSwizzleDMode,
           int32_t kNumGroups, int32_t kNumStages,
@@ -336,6 +340,11 @@ class Fp8Gemm {
 
 public:
     Fp8Gemm() = default;
+
+    static uint32_t generate_id() {
+        static uint32_t id = 0;
+        return ++id;
+    }
     static constexpr bool UseAIU = true;
     // A matrix configuration
     using         ElementA    = cutlass::float_e4m3_t;                          // Element type for A matrix operand
@@ -366,10 +375,12 @@ public:
     static constexpr int BlockM = BLOCK_M;
     static constexpr int BlockN = BLOCK_N;
     static constexpr int BlockK = BLOCK_K;
-    static constexpr int WarpM = BlockM / 2;
-    static constexpr int WarpN = BlockN / 2;
-    static constexpr int WarpK = BLOCK_K / 2;
+    static constexpr int WarpM = WARP_M;
+    static constexpr int WarpN = WARP_N;
+    static constexpr int WarpK = BLOCK_K;
     static constexpr int Stage = kNumStages;
+    using TileShape = Shape<Int<BlockM>, Int<BlockN>, Int<BlockK>>;
+    using WarpShape = Shape<Int<WarpM>, Int<WarpN>, Int<BlockK>>;
 
     using WarpOnM = Int<BlockM / WarpM>;
     using WarpOnN = Int<BlockN / WarpN>;
@@ -400,7 +411,7 @@ public:
 
     // ElemA/B and LayoutA/B is already transfered
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaBlockWise<
-      DispatchPolicy, Shape<Int<BlockM>, Int<BlockN>, Int<BlockK>>,
+      DispatchPolicy, TileShape,
       ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
       ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
       TiledMma,
@@ -409,12 +420,10 @@ public:
     >;
 
     using EpilogueDispatchPolicy = cutlass::epilogue::EpilogueSimtVectorized;
-    using TileShape_MNK = Shape<Int<BlockM>, Int<BlockN>, Int<BlockK>>;
-    using ClusterShape  = Shape<Int<WarpM>, Int<WarpN>, Int<WarpK>>;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
-      TileShape_MNK, ClusterShape,
+      TileShape, WarpShape,
       EpilogueTileType,
       ElementCompute, ElementCompute,
       ElementC, LayoutC, AlignmentC,
@@ -428,7 +437,7 @@ public:
                     float* scales_a,
                     float* scales_b,
                     int* grouped_layout,
-                    int32_t shape_m,
+                    int32_t shape_m, uint32_t expected_m,
                     cudaStream_t stream,
                     int num_sms, uint32_t smem_size) {
         using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BlockM, BlockN, kNumGroups>;
@@ -456,6 +465,9 @@ public:
         cutlass::float_e4m3_t* converted_input_b = reinterpret_cast<cutlass::float_e4m3_t*>(input_b);
         cutlass::float_e4m3_t* converted_input_a = reinterpret_cast<cutlass::float_e4m3_t*>(input_a);
         cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(gmem_d);
+        cutlass::KernelHardwareInfo hw_info;
+        hw_info.device_id = 0;
+        hw_info.sm_count = num_sms;
         typename GemmKernel::Arguments arguments{
           cutlass::gemm::GemmUniversalMode::kGemm,
           {shape_m, SHAPE_N, SHAPE_K, 1},
@@ -466,6 +478,7 @@ public:
             nullptr, stride_D,
             converted_output, stride_D
           },
+          hw_info,
         };
         // Using the arguments, query for extra workspace required for matrix multiplication computation
         size_t workspace_size = GemmKernel::get_workspace_size(arguments);
@@ -479,6 +492,71 @@ public:
         dim3 const block = GemmKernel::get_block_shape();
         dim3 const grid = GemmKernel::get_grid_shape(params);
         int sharemem_size = GemmKernel::SharedStorageSize;
+        // std::cout << "block = " << block << std::endl;
+        // std::cout << "grid = " << grid << std::endl;
+        // std::cout << "smem_size_kernel = " << sharemem_size << std::endl;
+
+        // TODO: query max_active_tb_num
+        int max_active_tb_num = 8; //GemmGrouped::maximum_active_blocks();
+
+        const int threadblock_count = num_sms < 20 ? num_sms : num_sms * max_active_tb_num;
+        char *pEnv_params = std::getenv("show_log");
+        if (pEnv_params && isdigit(*pEnv_params)) {
+            cudaFuncAttributes attr;
+            cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
+
+            printf("[GemmGrouped-FP8:]\n");
+            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s\n",
+                kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)]);
+
+            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
+                BlockM, BlockN, BlockK, WarpM, WarpN, BlockK, kNumStages);
+
+            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
+
+            printf("smem_size:%d, verg:%d, stack:%d\n", sharemem_size, int(attr.numRegs), int(attr.localSizeBytes));
+        }
+
+        // export PPU_LIB_SHOW_PARAMS=1
+        DgProfParam dg_prof_params;
+        if (ProfilingInterface::Instance().get_op_info()){
+            dg_prof_params.set_deep_gemm_params(
+                GemmTypeS[static_cast<int>(kGemmType)], std::string("fp8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K
+            );
+        }
+        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
+        char *pEnv_params_dump = std::getenv("dump_group_m");
+        if (pEnv_params_dump && isdigit(*pEnv_params_dump) && kGemmType != GemmType::Normal) {
+            // check if cuda graph captured
+            cudaStreamCaptureStatus captureStatus;
+            cudaStreamIsCapturing(stream, &captureStatus);
+            // add cuda graph mode later
+            if (captureStatus != cudaStreamCaptureStatusNone) {
+                printf("[moe gemm]: dump_group_m not supported in cuda graph mode.");
+                return;
+            }
+
+            static int casedId = 0;
+            std::ostringstream filename;
+            int id = generate_id();
+            filename << "case" << id << "_"
+                     << "fp8" << "_"
+                     << "groups" << kNumGroups << "_"
+                     << "m" << shape_m << "_"
+                     << "n" << SHAPE_N << "_"
+                     << "k" << SHAPE_K << "_"
+                     << "em" << expected_m << "_"
+                     << GemmTypeS[static_cast<int>(kGemmType)] << ".dump";
+
+            std::ifstream file(filename.str().c_str());
+            int fd = open(filename.str().c_str(), O_CREAT | O_WRONLY | O_APPEND, 0666);
+            if (fd != -1 && !file) {
+                if (flock(fd, LOCK_EX | LOCK_NB) != -1)
+                    print_to_file(grouped_layout, kGemmType == GemmType::GroupedContiguous ? shape_m : kNumGroups, filename.str().c_str(), stream);
+                close(fd);
+            }
+        }
         cutlass::device_kernel<GemmKernel><<<grid, block, sharemem_size, stream>>>(params);
 
         cudaError_t kernel_result = cudaDeviceSynchronize();
@@ -486,6 +564,8 @@ public:
             std::cerr << "Error running the CUTLASS kernel. Last CUDA error is: "
                     << cudaGetErrorString(kernel_result) << std::endl;
         }
+        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
     }
 };
 

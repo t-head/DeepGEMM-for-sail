@@ -5,6 +5,7 @@ import os
 
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_m_alignment_for_contiguous_layout
+from utils import read_numbers_from_file, parse_dump_file
 
 def per_token_cast_to_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
@@ -86,58 +87,6 @@ def test_gemm(d: torch.dtype, file = None) -> None:
                     f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
                     f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     print("Passed\n")
-
-def read_numbers_from_file(file_path):
-    numbers = []
-    with open(file_path, 'r') as file:
-        for line in file:
-            stripped_line = line.strip()
-            if stripped_line:
-                try:
-                    number = int(stripped_line)
-                    numbers.append(number)
-                except ValueError:
-                    print(f"Warning: skip invalid: {stripped_line}")
-    return numbers
-
-def parse_dump_file(file):
-    import re, math
-    if ("GroupedMasked" in file or "Contiguous" in file or "GroupedNoPad" in file):
-        pattern = r'groups(\d+)_m(\d+)_n(\d+)_k(\d+)_em(\d+)'
-        match = re.search(pattern, file)
-
-        if match:
-            num_groups = int(match.group(1))
-            m = int(match.group(2))
-            n = int(match.group(3))
-            k = int(match.group(4))
-            expected_m_per_group = int(match.group(5))
-
-            print(f"m: {m}")
-            print(f"n: {n}")
-            print(f"k: {k}")
-            print(f"expected_m_per_group: {expected_m_per_group}")
-        else:
-            print("Pattern not found.")
-    elif "DenseGemm" in file:
-        # print("DenseGemm found int file, ", file)
-        pattern = r'm(\d+)_n(\d+)_k(\d+)'
-        match = re.search(pattern, file)
-        if match:
-            num_groups = 1
-            expected_m_per_group = 1
-            m = int(match.group(1))
-            n = int(match.group(2))
-            k = int(match.group(3))
-            print(f"m: {m}")
-            print(f"n: {n}")
-            print(f"k: {k}")
-        else:
-            print("Pattern not found.")
-    else:
-        print("GemmType not supported.")
-    return num_groups, m, n, k, expected_m_per_group
-
 
 def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, file: str, alignment: int) -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:

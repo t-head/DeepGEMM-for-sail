@@ -114,3 +114,54 @@ def run_cycle_on_device(cases, output_file, dev="gpu", force_int8=False):
         for row in output_lines:
             writer.writerow(row)
         print("write result succeed")
+
+def read_numbers_from_file(file_path):
+    numbers = []
+    with open(file_path, 'r') as file:
+        for line in file:
+            stripped_line = line.strip()
+            if stripped_line:
+                try:
+                    number = int(stripped_line)
+                    numbers.append(number)
+                except ValueError:
+                    print(f"Warning: skip invalid: {stripped_line}")
+    return numbers
+
+def parse_dump_file(file):
+    import re, math
+    if ("GroupedMasked" in file or "Contiguous" in file or "GroupedNoPad" in file):
+        pattern = r'groups(\d+)_m(\d+)_n(\d+)_k(\d+)_em(\d+)'
+        match = re.search(pattern, file)
+
+        if match:
+            num_groups = int(match.group(1))
+            m = int(match.group(2))
+            n = int(match.group(3))
+            k = int(match.group(4))
+            expected_m_per_group = int(match.group(5))
+
+            print(f"m: {m}")
+            print(f"n: {n}")
+            print(f"k: {k}")
+            print(f"expected_m_per_group: {expected_m_per_group}")
+        else:
+            print("Pattern not found.")
+    elif "DenseGemm" in file:
+        # print("DenseGemm found int file, ", file)
+        pattern = r'm(\d+)_n(\d+)_k(\d+)'
+        match = re.search(pattern, file)
+        if match:
+            num_groups = 1
+            expected_m_per_group = 1
+            m = int(match.group(1))
+            n = int(match.group(2))
+            k = int(match.group(3))
+            print(f"m: {m}")
+            print(f"n: {n}")
+            print(f"k: {k}")
+        else:
+            print("Pattern not found.")
+    else:
+        print("GemmType not supported.")
+    return num_groups, m, n, k, expected_m_per_group

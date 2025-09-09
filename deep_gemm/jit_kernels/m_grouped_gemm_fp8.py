@@ -14,18 +14,21 @@ using namespace deep_gemm;
 constexpr auto N = {N}, K = {K};
 constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
-constexpr auto BLOCK_K = 128;
+// constexpr auto BLOCK_K = 128;
+constexpr auto WARP_M = {WARP_M};
+constexpr auto WARP_N = {WARP_N};
+constexpr auto BLOCK_K = {BLOCK_K};
 constexpr auto BLOCK_N_PADDING = {BLOCK_N_PADDING};
 constexpr auto kSwizzleDMode = {SWIZZLE_D_MODE};
 constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 
 // Make a templated grouped GEMM
-using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}>;
+using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}>;
 
 gemm_t::run(out, lhs, rhs,
             lhs_scales, rhs_scales, grouped_layout,
-            m, stream, num_sms, smem_size);
+            m, expected_m, stream, num_sms, smem_size);
 """
 
 
@@ -81,13 +84,15 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous=True)
+    expected_m = 0
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
-            m_indices, m, num_groups,
+            m_indices, m, expected_m, num_groups,
             torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
+              'BLOCK_K' : block_k, 'WARP_M' : warp_m, 'WARP_N' : warp_n,
               'SWIZZLE_D_MODE': smem_config[1],
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups,
@@ -97,8 +102,8 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
                   ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
-                  ('out', torch.bfloat16),
-                  ('grouped_layout', torch.int32), ('m', int), ('num_groups', int),
+                  ('out', torch.bfloat16), ('grouped_layout', torch.int32),
+                  ('m', int), ('expected_m', int), ('num_groups', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
         args=args,
@@ -160,19 +165,19 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-
-    num_sms, block_m, block_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
 
     # Extra checks for TMA store
     if num_groups > 1 and m > block_m:
         assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
-            masked_m, m,
+            masked_m, m, expected_m,
             torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
+              'BLOCK_K' : block_k,  'WARP_M' : warp_m, 'WARP_N' : warp_n,
               'SWIZZLE_D_MODE': smem_config[1],
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups,
@@ -183,7 +188,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
                   ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
-                  ('grouped_layout', torch.int32), ('m', int),
+                  ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
         args=args,

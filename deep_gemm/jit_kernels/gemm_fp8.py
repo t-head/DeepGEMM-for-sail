@@ -15,18 +15,20 @@ using namespace deep_gemm;
 constexpr auto N = {N}, K = {K};
 constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
-constexpr auto BLOCK_K = 128;
+constexpr auto WARP_M = {WARP_M};
+constexpr auto WARP_N = {WARP_N};
+constexpr auto BLOCK_K = {BLOCK_K};
 constexpr auto BLOCK_N_PADDING = {BLOCK_N_PADDING};
 constexpr auto kSwizzleDMode = {SWIZZLE_D_MODE};
 constexpr auto kNumGroups = 1;
 constexpr auto kNumStages = {NUM_STAGES};
 
 // Make a templated GEMM
-using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, GemmType::Normal>;
+using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, GemmType::Normal>;
 
 // Launch kernel
 gemm_t::run(out, lhs, rhs, lhs_scales,
-            rhs_scales, nullptr, m,
+            rhs_scales, nullptr, m, 0,
             stream, num_sms, smem_size);
 """
 
@@ -59,20 +61,19 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
     swizzle_mode = 128
     block_n_padding = 0
 
-    smem_d = block_m * (block_n + block_n_padding) * 2
+    smem_d = block_m * (block_n + block_n_padding)
     smem_a_per_stage = block_m * block_k
-    smem_scales_a_per_stage = block_m * 4
     smem_b_per_stage = block_n * block_k
-    smem_scales_b = ceil_div(k, block_k) * 4
-    # smem_barrier = num_stages * 8 * 2
 
-    smem_size = 0
-    smem_size += smem_d
-    smem_size += num_stages * smem_a_per_stage
+    smem_size_d = smem_d * 2
+    smem_size_a = num_stages * smem_a_per_stage
+    smem_size_b = num_stages * smem_b_per_stage
+    smem_scales_a_per_stage = block_m * 4
+    smem_scales_b = ceil_div(k, block_k) * 4
+
+    smem_size = max(smem_size_d, smem_size_a + smem_size_b)
     smem_size += num_stages * smem_scales_a_per_stage
-    smem_size += num_stages * smem_b_per_stage
     smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
-    # smem_size += smem_barrier
 
     # Swizzle and padding are not compatible
     assert int(swizzle_mode > 0) + int(block_n_padding > 0) <= 1
@@ -137,13 +138,12 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     #     block_k = 64
     # if k >= 4096 and (best_block_m == 32 and best_block_n == 32):
     #     block_k = 512
-    stage_candidates = (8, 7, 6, 5, 4, 3)
-    # stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
+    stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
     if 128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4:
         # Unrolling both stages and `num_former_iters` will cause large code size
         stage_candidates = (4, 3, 2)
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n)
+        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k)
         if best_smem_config[0] <= ppu_capacity:
             best_num_stages = num_stages
             break
@@ -157,22 +157,27 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
     assert num_min_sms <= num_sms
 
-    # warp_m = best_block_m // 2
-    # warp_n = best_block_n // 2
-    # if best_block_m == 32 and m == 32 and best_block_n >= 64:
-    #     warp_m = 32
-    #     warp_n = best_block_n // 4
-    # elif best_block_n == 32 and n <= 128 and best_block_m >=64:
-    #     warp_m = best_block_m // 4
-    #     warp_n = 32
-    # elif best_block_m == 128 or best_block_m == 256 and best_block_n >= 32:
-    #     warp_m = best_block_m // 4
-    #     warp_n = best_block_n // 2 if best_block_n != 32 else best_block_n
-    # elif best_block_n == 128 or best_block_n == 256:
-    #     warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
-    #     warp_n = best_block_n // 4
+    warp_m = best_block_m // 2
+    warp_n = best_block_n // 2
 
-    return num_min_sms, best_block_m, best_block_n, best_num_stages, best_smem_config
+    if best_block_m == 32 and m == 32 and best_block_n >= 64:
+        warp_m = 32
+        warp_n = best_block_n // 4
+    elif best_block_n == 32 and n <= 128 and best_block_m >=64:
+        warp_m = best_block_m // 4
+        warp_n = 32
+    elif best_block_m == 128 or best_block_m == 256 and best_block_n >= 32:
+        warp_m = best_block_m // 4
+        # warp_m = best_block_m // 2 if best_block_m == 128 else best_block_m // 4
+        # warp_n = best_block_n // 2 if best_block_n != 32 else best_block_n
+        warp_n = best_block_n // 4 if best_block_n != 32 else best_block_n
+    elif best_block_n == 128 or best_block_n == 256:
+        warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
+        warp_n = best_block_n // 4
+    # print(f'best_block_m:{best_block_m}, best_block_n:{best_block_n}\n')
+    # print(f'smem_size:{best_smem_config[0]}\n')
+
+    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
 
 def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -222,11 +227,12 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
+              'BLOCK_K' : block_k, 'WARP_M' : warp_m, 'WARP_N' : warp_n,
               'SWIZZLE_D_MODE': smem_config[1],
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_STAGES': num_stages},
