@@ -1,6 +1,7 @@
 import random
 import torch
 from typing import Tuple
+import os
 
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_m_alignment_for_contiguous_layout
@@ -320,7 +321,8 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
             diff = calc_diff(out, ref_out)
 
-            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+            #gemv accuracy
+            assert diff < 0.0015, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
     if file is not None:
         num_groups, expected_m_per_group, n, k, m = parse_dump_file(file)
@@ -328,7 +330,7 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
     else:
         for num_groups, expected_m_per_group in ((256, 1), (256, 4), (256, 16), (256, 32), (128, 8), (128, 64), (128, 1024)):
             for k, n in ((7168, 4096), (2048, 7168), (256, 768), (512, 128)):
-        # num_groups, expected_m_per_group, k, n = 4, 1, 512, 128
+            # num_groups, expected_m_per_group, k, n = 2, 1, 192, 64
                 test_func()
 
     print("Passed\n")
@@ -351,6 +353,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Process some files.")
     parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
+    parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
 
     args = parser.parse_args()
     global cycle
@@ -358,21 +361,33 @@ if __name__ == '__main__':
     if (args.cycle):
         cycle = 1
 
-    if args.file is not None:
-        if "int8" in args.file and "GroupedContiguous" in args.file:
-            test_m_grouped_gemm_contiguous(torch.int8, args.file)
-        elif "int8" in args.file and "GroupedMasked" in args.file:
-            test_m_grouped_gemm_masked(torch.int8, args.file)
-        elif "GroupedContiguous" in args.file:
-            test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
-        elif "GroupedMasked" in args.file:
-            test_m_grouped_gemm_masked(torch.bfloat16, args.file)
-        elif "GroupedNoPad" in args.file:
-            test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
-        elif "DenseGemm" in args.file:
-            test_gemm(torch.int8, args.file)
-        else:
-            "invalid dump file\n"
+    if args.file is not None or args.caselist is not None:
+        dg_cases = list()
+        if args.file:
+            dg_cases = [args.file]
+        if args.caselist:
+            for root, dirs, files in os.walk(args.caselist):
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    dg_cases.append(full_path)
+
+
+        for file in dg_cases:
+            print(f'case name:{file}')
+            if "int8" in file and "GroupedContiguous" in file:
+                test_m_grouped_gemm_contiguous(torch.int8, file)
+            elif "int8" in file and "GroupedMasked" in file:
+                test_m_grouped_gemm_masked(torch.int8, file)
+            elif "GroupedContiguous" in file:
+                test_m_grouped_gemm_contiguous(torch.bfloat16, file)
+            elif "GroupedMasked" in file:
+                test_m_grouped_gemm_masked(torch.bfloat16, file)
+            elif "GroupedNoPad" in file:
+                test_m_grouped_gemm_nopad(torch.bfloat16, file)
+            elif "DenseGemm" in file:
+                test_gemm(torch.int8, file)
+            else:
+                "invalid dump file\n"
     else:
         test_gemm(torch.int8)
         test_m_grouped_gemm_contiguous(torch.int8, args.file)

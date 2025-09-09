@@ -233,7 +233,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
     num_sms = get_num_sms()
     use_gemv = False
 
-    if expected_m <= 2 and (k % 64 == 0 or (n >= 1024 and k <= 32 * 8)):
+    if expected_m <= 2 and k % 16 == 0 and (k % 128 == 0 or (n >= 1024 and k <= 32 * 8)):
         # use gemmv if avg m small
         # ThreadPerN = 8
         # NUM_UNROLL = 1

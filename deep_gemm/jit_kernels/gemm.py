@@ -104,12 +104,13 @@ def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             NPerThread = 16
             NUM_UNROLL = 1
             SWZL_SIZE_M = 1
-        elif (k <= 24 * Alignment):
-            BlockSize = 96
-            ThreadPerN = 24
-            NPerThread = 16
-            NUM_UNROLL = 1
-            SWZL_SIZE_M = 1
+        # elif (k <= 24 * Alignment):
+        # block size 96 has accuracy issue.
+        #     BlockSize = 96
+        #     ThreadPerN = 24
+        #     NPerThread = 16
+        #     NUM_UNROLL = 1
+        #     SWZL_SIZE_M = 1
         else:
             BlockSize = 64
             ThreadPerN = 32
