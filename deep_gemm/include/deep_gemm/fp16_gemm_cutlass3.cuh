@@ -2,7 +2,7 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-#define ACOMPUTE_VERSION 10000
+// #define ACOMPUTE_VERSION 10000
 
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
@@ -24,6 +24,26 @@
 #include "scheduler_cutlass3.cuh"
 
 #include "ppu/ppu_include.hpp"
+
+template <typename GemmKernel>
+inline int compute_occupancy_for_kernel()
+{
+  int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
+  if (smem_size > (48 << 10)) {
+    cudaError_t result;
+    result = cudaFuncSetAttribute(cutlass::device_kernel<GemmKernel>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  smem_size);
+  }
+
+  int max_active_blocks = -1;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &max_active_blocks, cutlass::device_kernel<GemmKernel>, GemmKernel::MaxThreadsPerBlock, smem_size);
+
+  printf("compute_occupancy_for_kernel, smem_size = %d, max_active_blocks = %d\n", smem_size, max_active_blocks);
+//   max_active_blocks = 12;
+  return max_active_blocks;
+}
 
 using namespace cute;
 
@@ -1248,8 +1268,9 @@ public:
         static constexpr int WarpOnM = BLOCK_M / WARP_M;
         static constexpr int WarpOnN = BLOCK_N / WARP_N;
 
+        using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<cutlass::bfloat16_t, cutlass::bfloat16_t, float>::type;
         using TiledMma = TiledMMA<
-            MMA_Atom<Acompute10000_16x16x16_F32BF16BF16F32_TN>,
+            MMA_Atom<MmaInst>,
             Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
             Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _16>>;       // 1x1x1 value group
 
@@ -1331,11 +1352,11 @@ public:
         StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape((int)SHAPE_N, (int)SHAPE_K, 1));
         StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape((int)shape_m, (int)SHAPE_N, 1));
         auto stride_C = stride_D;
-        int max_blocks_per_cu = 2; //compute_occupancy_for_kernel<GemmKernel>();
+        int max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
 
         cutlass::KernelHardwareInfo hw_info;
         hw_info.device_id = 0;
-        hw_info.sm_count = 20 * max_blocks_per_cu;
+        hw_info.sm_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id) * max_blocks_per_cu;
 
         typename GemmKernel::Arguments arguments{
             cutlass::gemm::GemmUniversalMode::kGemm,

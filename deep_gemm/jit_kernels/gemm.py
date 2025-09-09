@@ -5,7 +5,7 @@ from functools import lru_cache
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info
 
 # C++ code templates
 includes = ('"deep_gemm/fp16_gemm.cuh"', )
@@ -303,13 +303,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
         warp_n = best_block_n // 4
 
-    extra_info = {}
-    use_cutlass3 = False
-    if 'DG_USE_CUTLASS3' in os.environ:
-        use_cutlass3 = int(os.getenv('DG_USE_CUTLASS3'))
-    extra_info['use_cutlass3'] = use_cutlass3
-
-    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config, extra_info
+    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
 
 def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
@@ -337,7 +331,9 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
     global includes, template
 
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(m, n, k, 1, num_sms)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+
+    extra_info = get_extra_info()
 
     args = (lhs, rhs, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
 

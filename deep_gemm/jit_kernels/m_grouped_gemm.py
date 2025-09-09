@@ -3,7 +3,7 @@ from typing import Tuple
 
 from .gemm import get_best_configs, get_gemv_best_configs
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_case_id
+from .utils import get_num_sms, ceil_div, get_case_id, get_extra_info
 import os
 
 # C++ code templates
@@ -82,10 +82,11 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
     global includes, template
     num_sms = get_num_sms()
     if configs:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = configs
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
     expected_m = 0
+    extra_info = get_extra_info()
     args = (lhs, rhs, out,
             m_indices, m, expected_m, num_groups,
             torch.cuda.current_stream(), num_sms, smem_config[0])
@@ -136,8 +137,8 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
     global includes, template
 
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
-
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
+    extra_info = get_extra_info()
     # Extra checks for TMA store
     if num_groups > 1 and m > block_m:
         assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
@@ -232,8 +233,8 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
             use_gemv = True
 
     if use_gemv == False:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config, extra_info = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
-
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
+        extra_info = get_extra_info()
         if m_rows is None:
             experts_for_rows = torch.zeros(num_groups + 1, dtype=torch.int32, device='cuda')
             counts = torch.bincount(m_indices)
