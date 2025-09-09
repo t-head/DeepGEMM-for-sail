@@ -6,7 +6,7 @@ from typing import Tuple
 import re
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, get_sm_count
 from .gemm_int8_lut import get_best_configs_from_lut
 
 # C++ code templates
@@ -187,11 +187,21 @@ def get_best_configs_dense(m: int, n: int, k: int, num_groups: int, num_sms: int
 
     return num_min_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
 
+@lru_cache(maxsize=None)
+def get_best_configs_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: int,
+                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False):
+    # todo: add more tiles for ppu1.5
+    (best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages) = (256, 256, 128, 64, 64, 4)
+    best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1)
+    num_min_sms = get_sm_count()
+    return num_min_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> \
         Tuple[int, int, int, int, int, int, int, int, int, dict]:
+    #if is_ppu1v5_device():
+    #    return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, is_grouped_contiguous, is_grouped_masked)
 
     if num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False:
         return get_best_configs_dense(m, n, k, num_groups, num_sms)
@@ -402,6 +412,9 @@ def generate_search_space():
         [128, 256, 64, 2, 64, 64],
         [128, 256, 128, 2, 64, 64],
         [128, 256, 128, 3, 64, 64],
+
+        # blockM = 256
+        [256, 256, 128, 4, 64, 64],
     ]
     space = []
     for tile in tile_list:

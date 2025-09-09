@@ -41,7 +41,7 @@ template <GemmType kGemmType,
           uint32_t BLOCK_M_, uint32_t BLOCK_N_,
           uint32_t kNumGroups,
           uint32_t kNumNBlocks = ceil_div(SHAPE_N_, BLOCK_N_),
-          uint32_t kNum1DBlocksPerGroup = 16>
+          uint32_t kNum1DBlocksPerGroup = 2>
 struct DeepGemmScheduler {
     constexpr static uint32_t SHAPE_N = SHAPE_N_;
     constexpr static uint32_t SHAPE_K = SHAPE_K_;

@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import uuid
+import torch
 from torch.utils.cpp_extension import CUDA_HOME
 from typing import Tuple
 
@@ -101,6 +102,13 @@ def put(path, data, is_binary=False):
         f.write(data)
     os.replace(tmp_file_path, path)
 
+@functools.lru_cache(maxsize=None)
+def is_ppu1v5_device():
+    device_prop = torch.cuda.get_device_properties()
+    if device_prop.major == 8 and device_prop.minor == 9:
+        return True
+    else:
+        return False
 
 def build(name: str, arg_defs: tuple, code: str, ppu_arch: str) -> Runtime:
     # Compiler flags
@@ -111,6 +119,12 @@ def build(name: str, arg_defs: tuple, code: str, ppu_arch: str) -> Runtime:
                   '--ptxas-options=--register-usage-level=10' + (',--verbose' if 'DG_PTXAS_VERBOSE' in os.environ else ''),
                   # Suppress some unnecessary warnings, such as unused variables for certain `constexpr` branch cases
                   '--diag-suppress=39,174,177,940']
+
+    if is_ppu1v5_device():
+        # append compiler options for ppu1.5
+        nvcc_flags.extend(['-ppu-simt-branch=false', '-ppu-patch-fence-ppu=false', '-wno-loop-miss-transform',
+                           '-ppu-cg-to-kp1=true', '-ppu-fix-uninit=true'])
+
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi', '-fconcepts']
     flags = [*nvcc_flags, f'--compiler-options={",".join(cxx_flags)}']
     include_dirs = [get_jit_include_dir()]

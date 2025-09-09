@@ -776,8 +776,6 @@ struct CollectiveMma<
   struct SharedStorage {
     cute::array_aligned<ElementA, cute::cosize_v<SmemLayoutA>> smem_a;
     cute::array_aligned<ElementB, cute::cosize_v<SmemLayoutB>> smem_b;
-    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutScaleA>> smem_scale_a;
-    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutScaleB>> smem_scale_b;
   };
 
   // Host side kernel arguments
@@ -944,8 +942,11 @@ struct CollectiveMma<
     Tensor gScaleA = get<2>(load_inputs);
     Tensor gScaleB = get<3>(load_inputs);
 
-    Tensor sSA = make_tensor(make_smem_ptr(storage.smem_scale_a.data()), SmemLayoutScaleA{});
-    Tensor sSB = make_tensor(make_smem_ptr(storage.smem_scale_b.data()), SmemLayoutScaleB{});
+    int last_stage = k_tile_count % DispatchPolicy::Stages;
+    ElementScale * scale_a_smem_ptr = reinterpret_cast<ElementScale*>(tAsA(_,_,_,last_stage).data().get());
+    ElementScale * scale_b_smem_ptr = reinterpret_cast<ElementScale*>(tBsB(_,_,_,last_stage).data().get());
+    Tensor sSA = make_tensor(make_smem_ptr(scale_a_smem_ptr), SmemLayoutScaleA{});
+    Tensor sSB = make_tensor(make_smem_ptr(scale_b_smem_ptr), SmemLayoutScaleB{});
 
     auto gmem_thr_copy_scaleA = gmem_tiled_copy_scaleA.get_slice(thread_idx % (Int<CTA_M  / 4>{}));
     auto gmem_thr_copy_scaleB = gmem_tiled_copy_scaleB.get_slice(thread_idx % (Int<CTA_N  / 4>{}));
@@ -954,11 +955,6 @@ struct CollectiveMma<
     Tensor tSsSA = gmem_thr_copy_scaleA.partition_D(sSA);
     Tensor tSgSB = gmem_thr_copy_scaleB.partition_S(gScaleB);
     Tensor tSsSB = gmem_thr_copy_scaleB.partition_D(sSB);
-
-    if (warp_idx <= 1) {
-      copy(gmem_tiled_copy_scaleA, tSgSA(_,_,_,0), tSsSA(_,_,_,0));
-      copy(gmem_tiled_copy_scaleB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
-    }
 
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
@@ -1014,7 +1010,7 @@ struct CollectiveMma<
     // scale A/B
     using SmemCopyLayoutScaleB = decltype(tile_to_shape(Layout<Shape<_1, _4>>{},
             make_shape(Int<1>{}, Int<CTA_N>{}, Int<DispatchPolicy::Stages>{})));
-    Tensor sSB_copy = make_tensor(make_smem_ptr(storage.smem_scale_b.data()), SmemCopyLayoutScaleB{});
+    Tensor sSB_copy = make_tensor(sSB.data(), SmemCopyLayoutScaleB{});
     Tensor tCrSA = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSA(_,_,Int<0>{})));
     Tensor tCrSB = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSB_copy(_,_,Int<0>{})));
 
@@ -1056,8 +1052,6 @@ struct CollectiveMma<
       // Prefetch the first rmem from the first k-tile
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
       copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
-      copy(smem_tiled_copy_ScaleA, tCsSA_p(_,_,Int<0>{}), tCrSA_copy_view(_,_,Int<0>{}));
-      copy(smem_tiled_copy_ScaleB, tCsSB_p(_,Int<0>{},_), tCrSB_copy_view(_,Int<0>{},_));
     }
 
     CUTLASS_PRAGMA_NO_UNROLL
@@ -1070,8 +1064,6 @@ struct CollectiveMma<
           // Slice the smem_pipe_read smem
           tCsA_p = tCsA(_,_,_,smem_pipe_read);
           tCsB_p = tCsB(_,_,_,smem_pipe_read);
-          tCsSA_p = tCsSA(_,_,_,smem_pipe_read);
-          tCsSB_p = tCsSB(_,_,_,smem_pipe_read);
         }
 
         // Load A, B shmem->regs for k_block+1
@@ -1103,6 +1095,11 @@ CUTLASS_PRAGMA_UNROLL
               gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
               warp_idx
             );
+          } else if (k_tile_count == 0) {
+            if (warp_idx <= 1) {
+              copy(gmem_tiled_copy_scaleA, tSgSA(_,_,_,0), tSsSA(_,_,_,0));
+              copy(gmem_tiled_copy_scaleB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
+            }
           }
           cp_async_fence();
 
@@ -1120,6 +1117,8 @@ CUTLASS_PRAGMA_UNROLL
     // TODO: original cutlass3 miss this sync
     cp_async_wait<0>();
     __syncthreads();
+    copy(smem_tiled_copy_ScaleA, tCsSA_p(_,_,Int<0>{}), tCrSA_copy_view(_,_,Int<0>{}));
+    copy(smem_tiled_copy_ScaleB, tCsSB_p(_,Int<0>{},_), tCrSB_copy_view(_,Int<0>{},_));
 
     // dequantize
     CUTLASS_PRAGMA_UNROLL
@@ -1499,8 +1498,8 @@ public:
         static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
         static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
         static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
-        using DefaultOperandA = cutlass::gemm::collective::detail::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
-        using DefaultOperandB = cutlass::gemm::collective::detail::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
+        using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
+        using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
         // A
         using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
         using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
@@ -1541,7 +1540,7 @@ public:
             DefaultOperation
         >::CollectiveOp;
 
-        static constexpr bool EpilogueWithTsm = false;
+        static constexpr bool EpilogueWithTsm = true;
         using CollectiveEpilogue = typename cutlass::platform::conditional<
             EpilogueWithTsm,
             CollectiveEpilogue_withTsm,
