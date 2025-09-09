@@ -2,19 +2,47 @@ import os
 import csv
 import subprocess
 import re
+import traceback
 
-def run_cmd(cmd: str, timeout=300, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
+def run_cmd(cmd: str, timeout=3600, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
     print(f"Run command: {cmd}, timeout: {timeout}")
-    ret = subprocess.run(args=cmd, timeout=timeout, shell=True, stdout=stdout, stderr=stderr, encoding="utf-8")
-    if stdout:
-        for line in ret.stdout.splitlines() + ret.stderr.splitlines():
-            print(line)
-    if ret.returncode != 0:
-        print(f"Run command failed!")
-    else:
-        print(f"Run command succeed!")
-    return ret
+    try:
+        ret = subprocess.run(args=cmd, timeout=timeout, shell=True, stdout=stdout, stderr=stderr, encoding="utf-8")
+        if stdout:
+            for line in ret.stdout.splitlines() + ret.stderr.splitlines():
+                print(line)
+        if ret.returncode != 0:
+            print(f"Run command failed!")
+        else:
+            print(f"Run command succeed!")
+        return ret
+    except Exception as e:
+        print(traceback.format_exc())
+        return None
 
+def str_to_list(s, type_func=int):
+    """Convert a comma-separated string to a list of a specified type."""
+    return [type_func(i.strip()) for i in s.split(',')]
+
+def split_list_into_groups(lst, num):
+    group_size = len(lst) // num
+    remainder = len(lst) % num
+    start = 0
+    groups = []
+    for i in range(num):
+        groups.append([])
+    for i in range(len(lst)):
+        group_idx = i % num
+        groups[group_idx].append(lst[i])
+    return groups
+
+def worker(gpu_id, cases, output, device, dtype, mode):
+    # 设置当前进程可见的 GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    print(f"Process {os.getpid()} is running on GPU {gpu_id}")
+    dtypes = str_to_list(dtype, str)
+    for _d in dtypes:
+        run_cycle_on_device(cases, output, device, _d, mode, gpu_id)
 
 # devices = {
 #     "name": ["cycle", "tensor core efficiency", "waves"],
@@ -68,34 +96,71 @@ def read_cycle_from_nculog(filename):
         return fwd_cycle_sum, fwd_tc_sum, op_cycles, fwd_hbm_sum
     else:
         print("Not valid CSV file!")
-        return 0, 0, [],[]
+        return 0, 0, [], 0
         #exit(-1)
 
+def clean_casename(name):
+    _need_replace = ['--', '=', 'format', 'Formatted', '[', ']', ":", "*", " ", ","]
+    # for item in _need_replace:
+    #     name = name.replace(item, "_")
+    name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    while "__" in name:
+        name = name.replace("__", "_")
+    return name
 
-def run_cycle_on_device(cases, output_file, dev="gpu", force_int8=False):
+def run_cycle_on_device(cases, output_file, dev="gpu", dtype="bf16", mode="metrics", gpu_id=0):
     output_lines = list()
     headers = ["casename","cycle","tc efficiency", "hbm efficiency", "cmd","detail"]
+    if not os.path.exists(f"{output_file}.csv"):
+        with open(f"{output_file}.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
     # new_row=["casename"]  metrics.get("name", [])  ["detail"] 
     # output_lines.append(new_row)
-
-    for case in cases:
-        log_file = "./gpu_cycles_single_case.log"
+    if not os.path.exists("./logs"):
+        os.makedirs("./logs")
+    total = len(cases)
+    for idx, case in enumerate(cases):
+        print(f'Profiling {idx + 1}/{total} on device{gpu_id}')
+        print(f'case name:{case}')
+        log_file = f"./logs/gpu{gpu_id}_cycles_single_case_{idx}_{dtype}.log"
         cmd = "rm -f "+ log_file
         run_cmd(cmd)
         # gpu
         # metrics = devices.get(dev, [])
         # metrics_string = ', '.join(metrics) if metrics else ""
+        if dev == "gpu":
+            script = "test_core_gpu.py"
+        elif dtype == "fp8":
+            script = "test_fp8_core.py"
+        else:
+            script = "test_core.py"
+        if mode == "full":
+            output_name = clean_casename(case)
+            cmd = '{} --set full -o {} python ./{}  --cycle --file {} --dtype {} \
+                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", output_name, script, case, dtype, log_file)
+        else: 
+            metrics_string = "sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__bytes.read.sum.pct_of_peak_sustained_elapsed" if dev=="gpu" else \
+                            "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format(dtype)
+            cmd = '{} --clock-control none --metrics="{}"  \
+                --page=details python ./{} --cycle --file {} --dtype {} \
+                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, script, case, dtype, log_file)
 
-        metrics_string = "sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__bytes.read.sum.pct_of_peak_sustained_elapsed" if dev=="gpu" else \
-                         "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format("int8" if ("int8" in os.path.basename(case) or force_int8) else "bf16")
-        cmd = '{} --clock-control none --metrics="{}"  \
-              --page=details python ./{} --file {} --cycle {}\
-              2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, "test_core.py" if dev == "ppu" else "test_core_gpu.py", case, "  --force_int8" if force_int8 else "", log_file)
+        ret = run_cmd(cmd)
 
-        run_cmd(cmd)
-
-        cycle, tc, detail, hbm = read_cycle_from_nculog(log_file)
-        output_lines.append([case.replace(",","_"), str(cycle), str(tc), str(hbm), str(cmd), str(detail)])
+        if mode != "full" and ret != None:
+            if ret.returncode == 0:
+                cycle, tc, detail, hbm = read_cycle_from_nculog(log_file)
+                row = [f"'{case.replace(",","_")}'", str(cycle), str(tc), str(hbm), str(cmd), str(detail)]
+                output_lines.append(row)
+                with open(f"{output_file}.csv", "a+") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(row)
+                    print("write result succeed")
+            else:
+                print("ERROR: failed to run cmd, please check!!")
+                if len(fa_case) == 1:
+                    exit(-1) # only one case, fail and exit
 
     output_file = output_file + '.csv'
     if len(cases) == 1:
@@ -105,16 +170,6 @@ def run_cycle_on_device(cases, output_file, dev="gpu", force_int8=False):
                 writer.writerow(row)
             print("write result to local.log succeed")
     
-    if not os.path.exists(output_file):
-        with open(output_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-    with open(output_file, "a+") as f:
-        writer = csv.writer(f)
-        for row in output_lines:
-            writer.writerow(row)
-        print("write result succeed")
-
 def read_numbers_from_file(file_path):
     numbers = []
     with open(file_path, 'r') as file:

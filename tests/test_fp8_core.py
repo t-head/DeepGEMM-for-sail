@@ -249,6 +249,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description="Process some files.")
     parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
+    parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
 
     args = parser.parse_args()
@@ -257,15 +258,36 @@ if __name__ == '__main__':
     if (args.cycle):
         cycle = 1
 
-    if args.file is not None:
-        if "GroupedContiguous" in args.file:
-            test_m_grouped_gemm_contiguous(args.file)
-        elif "GroupedMasked" in args.file:
-            test_m_grouped_gemm_masked(args.file)
-        elif "DenseGemm" in args.file:
-            test_gemm(args.file)
-        else:
-            "invalid dump file\n"
+    if args.file is not None or args.caselist is not None:
+        if args.file:
+            dg_cases = [args.file]
+        elif args.caselist:
+            if ".dump" in args.caselist:
+                dg_cases = [args.caselist]
+            elif not os.path.isdir(args.caselist):
+                print("args.caselist is a file!")
+                with open(args.caselist, "r") as f:
+                    lines = f.readlines()
+                    for line in lines:
+                        dg_cases.append(line.strip())
+            else:
+                print("args.caselist is a folder!")
+                for root, dirs, files in os.walk(args.caselist):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        dg_cases.append(full_path)
+        total = len(dg_cases)
+        for idx, file in enumerate(dg_cases):
+            print(f'Profiling {idx + 1}/{total}')
+            print(f'case name:{file}')
+            if "GroupedContiguous" in file:
+                test_m_grouped_gemm_contiguous(file)
+            elif "GroupedMasked" in file:
+                test_m_grouped_gemm_masked(file)
+            elif "DenseGemm" in file:
+                test_gemm(file)
+            else:
+                "invalid dump file\n"
     else:
         test_gemm(args.file)
         test_m_grouped_gemm_contiguous(args.file)

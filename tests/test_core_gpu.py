@@ -10,7 +10,7 @@ from typing import List, Tuple
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
 from deep_gemm.jit_kernels.utils import get_m_alignment_for_contiguous_layout
-
+from utils import read_numbers_from_file, parse_dump_file
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
@@ -213,40 +213,6 @@ def test_m_grouped_gemm_contiguous() -> None:
               f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
     print()
 
-def read_numbers_from_file(file_path):
-    numbers = []
-    with open(file_path, 'r') as file:
-        for line in file:
-            stripped_line = line.strip()
-            if stripped_line:
-                try:
-                    number = int(stripped_line)
-                    numbers.append(number)
-                except ValueError:
-                    print(f"Warning: skip invalid: {stripped_line}")
-    return numbers
-
-def parse_dump_file(file):
-    import re, math
-    if ("GroupedMasked" or "Contiguous" in file):
-        pattern = r'groups(\d+)_m(\d+)_n(\d+)_k(\d+)_em(\d+)'
-        match = re.search(pattern, file)
-
-        if match:
-            num_groups = int(match.group(1))
-            m = int(match.group(2))
-            n = int(match.group(3))
-            k = int(match.group(4))
-            expected_m_per_group = int(match.group(5))
-
-            print(f"m: {m}")
-            print(f"n: {n}")
-            print(f"k: {k}")
-            print(f"expected_m_per_group: {expected_m_per_group}")
-        else:
-            print("Pattern not found.")
-    return num_groups, m, n, k, expected_m_per_group
-
 
 def test_m_grouped_gemm_masked(file: str) -> None:
     print('Testing grouped masked GEMM:')
@@ -353,6 +319,14 @@ if __name__ == '__main__':
 
     import argparse
 
+    parser = argparse.ArgumentParser(description="Process some files.")
+    parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
+    parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
+    parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
+
+    args = parser.parse_args()
+    global cycle
+    cycle = 0
     parser = argparse.ArgumentParser(description="Process some files.")
     parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")

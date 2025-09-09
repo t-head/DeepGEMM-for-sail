@@ -31,7 +31,10 @@ def construct(m: int, k: int, n: int, d: torch.dtype) -> \
     x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
-    ref_out = x @ y.t()
+    if not cycle:
+        ref_out = x @ y.t()
+    else:
+        ref_out = torch.empty_like(out)
 
     if d == torch.bfloat16:
         return x, y, out, ref_out
@@ -307,7 +310,7 @@ if __name__ == '__main__':
     parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
-    parser.add_argument('--force_int8', action="store_true", help="force use int8 data type")
+    parser.add_argument('--dtype', default="bf16", type=str, choices=["int8","bf16", "int8,bf16"], required=False, help='data type of the cases')
 
     args = parser.parse_args()
     global cycle
@@ -316,21 +319,33 @@ if __name__ == '__main__':
         cycle = 1
 
     if args.file is not None or args.caselist is not None:
-        dg_cases = list()
         if args.file:
             dg_cases = [args.file]
-        if args.caselist:
-            for root, dirs, files in os.walk(args.caselist):
-                for file in files:
-                    full_path = os.path.join(root, file)
-                    dg_cases.append(full_path)
+        elif args.caselist:
+            if ".dump" in args.caselist:
+                dg_cases = [args.caselist]
+            elif not os.path.isdir(args.caselist):
+                print("args.caselist is a file!")
+                with open(args.caselist, "r") as f:
+                    lines = f.readlines()
+                    for line in lines:
+                        dg_cases.append(line.strip())
+            else:
+                print("args.caselist is a folder!")
+                for root, dirs, files in os.walk(args.caselist):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        dg_cases.append(full_path)
 
-        for file in dg_cases:
+        
+        total = len(dg_cases)
+        for idx, file in enumerate(dg_cases):
+            print(f'Profiling {idx + 1}/{total}')
             print(f'case name:{file}')
-            dtype = torch.int8 if "int8" in os.path.basename(file) or args.force_int8 else torch.bfloat16
+            dtype = torch.int8 if args.dtype == "int8" else torch.bfloat16
             if "GroupedContiguous" in file:
                 test_m_grouped_gemm_contiguous(dtype, file)
-            if "GroupedMasked" in file:
+            elif "GroupedMasked" in file:
                 test_m_grouped_gemm_masked(dtype, file)
             elif "GroupedNoPad" in file:
                 test_m_grouped_gemm_nopad(dtype, file)
