@@ -844,24 +844,28 @@ struct CollectiveMma<
     Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
 
     // // load init scale A/B
-    Tensor mScaleA_mkl = make_tensor(make_gmem_ptr(params.ptr_scale_A + offset_m), make_shape(M,1,1));      // (n,scale_k,l)
-    Tensor mScaleA_mk = mScaleA_mkl(_,_,l_coord);                                                           // (n,scale_k)
-    Tensor gScaleA = local_tile(mScaleA_mk, make_shape(Int<CTA_M>{}, Int<1>{}), make_coord(m_coord, _));    // (BLK_N, 1, scale_k)
+    Tensor mSFA_mk = make_tensor(make_gmem_ptr(params.ptr_scale_A + offset_m), make_shape(M,1));      // (n,scale_k,l)
+    auto sfa_shape = make_shape(Int<CTA_M>{}, Int<1>{});
+    Tensor gSFA = local_tile(mSFA_mk, sfa_shape, make_coord(m_coord, _));    // (BLK_N, 1, scale_k)
+    Tensor iSFA_mk = make_identity_tensor(sfa_shape);
+    Tensor cSFA = local_tile(iSFA_mk, sfa_shape, make_coord(m_coord, _));
 
-    Tensor mScaleB_nkl = make_tensor(make_gmem_ptr(params.ptr_scale_B + offset_b / K), make_shape(N,1,1));           // (n,scale_k,l)
-    Tensor mScaleB_nk = mScaleB_nkl(_,_,l_coord);                                                           // (n,scale_k)
-    Tensor gScaleB = local_tile(mScaleB_nk, make_shape(Int<CTA_N>{}, Int<1>{}), make_coord(n_coord, _));    // (BLK_N, 1, scale_k)
+    Tensor mSFB_nk = make_tensor(make_gmem_ptr(params.ptr_scale_B + offset_b / K), make_shape(N,1));           // (n,scale_k,l)
+    auto sfb_shape = make_shape(Int<CTA_N>{}, Int<1>{});
+    Tensor gSFB = local_tile(mSFB_nk, sfb_shape, make_coord(n_coord, _));    // (BLK_N, 1, scale_k)
+    Tensor iSFB_nk = make_identity_tensor(sfb_shape);
+    Tensor cSFB = local_tile(iSFB_nk, sfb_shape, make_coord(n_coord, _));
 
     // if (thread0()) {
     //   int expert_id = offset_b / K / N;
     //   printf("M = %d, m_coord = %d, n_coord = %d, l_coord = %d, offset_m = %d, expert_id = %d, ptr_A = %p, ptr_B = %p, scale_a = %p, scale_b = %p\n",
     //           M, m_coord, n_coord, l_coord, offset_m, expert_id, params.ptr_scale_A, params.ptr_scale_B, params.ptr_scale_A + offset_m, params.ptr_scale_B + expert_id * N);
     //   printf("    m_coord = %d, n_coord = %d \n", m_coord, n_coord);
-    //   print("    gScaleA="); print(gScaleA); print('\n');
-    //   print("    gScaleB="); print(gScaleB); print('\n');
+    //   print("    gSFA="); print(gSFA); print('\n');
+    //   print("    gSFB="); print(gSFB); print('\n');
     // }
 
-    return cute::make_tuple(gA, gB, gScaleA, gScaleB);
+    return cute::make_tuple(gA, gB, cute::make_tuple(gSFA, cSFA), cute::make_tuple(gSFB, cSFB));
   }
 
   template <class ProblemShape>
@@ -939,8 +943,11 @@ struct CollectiveMma<
     Tensor tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
-    Tensor gScaleA = get<2>(load_inputs);
-    Tensor gScaleB = get<3>(load_inputs);
+
+    Tensor gSFA = get<2, 0>(load_inputs);
+    Tensor gSFB = get<3, 0>(load_inputs);
+    Tensor cSFA = get<2, 1>(load_inputs);
+    Tensor cSFB = get<3, 1>(load_inputs);
 
     int last_stage = k_tile_count % DispatchPolicy::Stages;
     ElementScale * scale_a_smem_ptr = reinterpret_cast<ElementScale*>(tAsA(_,_,_,last_stage).data().get());
@@ -951,10 +958,22 @@ struct CollectiveMma<
     auto gmem_thr_copy_scaleA = gmem_tiled_copy_scaleA.get_slice(thread_idx % (Int<CTA_M  / 4>{}));
     auto gmem_thr_copy_scaleB = gmem_tiled_copy_scaleB.get_slice(thread_idx % (Int<CTA_N  / 4>{}));
 
-    Tensor tSgSA = gmem_thr_copy_scaleA.partition_S(gScaleA);
+    Tensor tSgSA = gmem_thr_copy_scaleA.partition_S(gSFA);
     Tensor tSsSA = gmem_thr_copy_scaleA.partition_D(sSA);
-    Tensor tSgSB = gmem_thr_copy_scaleB.partition_S(gScaleB);
+    Tensor tSFAcSFA = gmem_thr_copy_scaleA.partition_S(cSFA);
+
+    Tensor tSgSB = gmem_thr_copy_scaleB.partition_S(gSFB);
     Tensor tSsSB = gmem_thr_copy_scaleB.partition_D(sSB);
+    Tensor tSFBcSFB = gmem_thr_copy_scaleB.partition_S(cSFB);
+
+    Tensor tSpSA = make_tensor<bool>(shape(tSsSA));
+    Tensor tSpSB = make_tensor<bool>(shape(tSsSB));
+    for (int i = 0; i < size(tSpSA); ++i) {
+      tSpSA(i) = get<0>(tSFAcSFA(i)) < get<0>(residue_mnk);
+    }
+    for (int i = 0; i < size(tSpSB); ++i) {
+      tSpSB(i) = get<0>(tSFBcSFB(i)) < get<1>(residue_mnk);
+    }
 
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
@@ -1097,8 +1116,8 @@ CUTLASS_PRAGMA_UNROLL
             );
           } else if (k_tile_count == 0) {
             if (warp_idx <= 1) {
-              copy(gmem_tiled_copy_scaleA, tSgSA(_,_,_,0), tSsSA(_,_,_,0));
-              copy(gmem_tiled_copy_scaleB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
+              copy_if(gmem_tiled_copy_scaleA, tSpSA, tSgSA(_,_,_,0), tSsSA(_,_,_,0));
+              copy_if(gmem_tiled_copy_scaleB, tSpSB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
             }
           }
           cp_async_fence();

@@ -484,7 +484,8 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template_updated,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
-        args=args
+        args=args,
+        arch='1.5' if is_ppu1v5_device else '1.0'
     )
 
     # Run the kernel
