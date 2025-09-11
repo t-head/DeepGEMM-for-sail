@@ -234,13 +234,14 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
 
     # best_block_m = 32
-    # best_block_n = 64
+    # best_block_n = 128
 
     #small m hbm bound or latency bound, wave is not usful, for better occ for 810e hbm bound, use smallest blockN for m16
-    if (m < 20) :
+    if (m < 20 and n < 512) :
         best_block_m = 16
         best_block_n = 64
     
+    # best_block_n = 128
     assert best_block_m is not None and best_block_n is not None
     
     # Always pick the longest one
@@ -250,7 +251,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     block_k = 64
     if k <= 64:
         block_k = 32
-    if k >= 4096 and (best_block_m == 32 and best_block_n == 32):
+    if k >= 4096 and (best_block_m <= 32 and best_block_n <= 64):
         block_k = 128
  
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
@@ -264,15 +265,15 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         # print(f"num_stages:{num_stages}, best_smem_config:{best_smem_config}")
         if best_smem_config[0] < ppu_capacity:
             occ = ppu_capacity // best_smem_config[0]
-            if best_block_m > 32 and best_block_n >= 64 and occ >= best_occ:
-                # compute block use higer occ rather than large stage
+            if k < 512 or (best_block_m > 32 and best_block_n >= 64) and occ >= best_occ:
+                # compute block and too small-k use higer occ rather than large stage
                 best_num_stages = num_stages
                 best_occ = occ
             else:
                 best_num_stages = num_stages
                 break
 
-    # best_num_stages = 2
+    # best_num_stages = 3
     assert best_smem_config is not None
     assert best_num_stages is not None
 

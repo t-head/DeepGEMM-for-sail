@@ -279,23 +279,23 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
 
     # best_block_m = 32
-    # best_block_n = 64
+    # best_block_n = 256
 
     #small m hbm bound or latency bound, wave is not usful, for better occ for 810e hbm bound, use smallest blockN for m16
-    # if (m < 16) :
-    #     best_block_m = 16
-    #     best_block_n = 64
+    if (m < 20 and n < 512) :
+        best_block_m = 16
+        best_block_n = 64
     
     assert best_block_m is not None and best_block_n is not None
-    
+
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_config, ppu_capacity = None, None, 262144
 
     block_k = 128
-    if k <= 128:
+    if k <= 256:
         block_k = 64
-    if k >= 4096 and (best_block_m == 32 and best_block_n == 32):
+    if k >= 4096 and (best_block_m <= 32 and best_block_n <= 64):
         block_k = 256
  
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
@@ -309,7 +309,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         # print(f"num_stages:{num_stages}, best_smem_config:{best_smem_config}")
         if best_smem_config[0] < ppu_capacity:
             occ = ppu_capacity // best_smem_config[0]
-            if best_block_m > 32 and best_block_n >= 64 and occ >= best_occ:
+            if k < 512 or (best_block_m > 32 and best_block_n >= 64) and occ >= best_occ:
                 # compute block use higer occ rather than large stage
                 best_num_stages = num_stages
                 best_occ = occ
@@ -343,7 +343,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         warp_n = best_block_n // 2 if best_block_n != 32 else best_block_n
     elif best_block_m == 16:
         warp_m = 16
-        best_block_n = 64
+        best_block_n = 64 if n < 512 else best_block_n
         warp_n = best_block_n // 4 if best_block_n <= 128 else best_block_n // 8
     elif best_block_n == 128 or best_block_n == 256:
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m

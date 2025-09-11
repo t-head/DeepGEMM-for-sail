@@ -25,7 +25,7 @@ def run_cmd(cmd: str, timeout=300, stdout=subprocess.PIPE, stderr=subprocess.PIP
 def read_cycle_from_nculog(filename):
     # kernel_pattern = r"(.*)deep_gemm(.*)"
     # kernel_pattern = r"(.*)kernel(.*)Device(.*)"
-    kernel_pattern = r"(.*)Device(.*)"
+    kernel_pattern = r"(.*)Device\s+\d+"
     cycles_pattern = "__cycles_active.max"
     tc_pattern = "pct_of_peak_sustained_active"
     hbm_pattern = "bytes_read"
@@ -87,10 +87,10 @@ def run_cycle_on_device(cases, output_file, dev="gpu", force_int8=False):
         # metrics_string = ', '.join(metrics) if metrics else ""
 
         metrics_string = "sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__bytes.read.sum.pct_of_peak_sustained_elapsed" if dev=="gpu" else \
-                         "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format("int8" if "int8" in case or force_int8 else "bf16")
+                         "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format("int8" if ("int8" in os.path.basename(case) or force_int8) else "bf16")
         cmd = '{} --clock-control none --metrics="{}"  \
-              --page=details python ./{} --cycle --file {} \
-              2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, case, "test_core.py" if dev == "gpu" else "test_core_gpu.py", log_file)
+              --page=details python ./{} --file {} --cycle {}\
+              2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, "test_core.py" if dev == "ppu" else "test_core_gpu.py", case, "  --force_int8" if force_int8 else "", log_file)
 
         run_cmd(cmd)
 

@@ -152,3 +152,119 @@ def get_extra_info(m=0, n=0, k=0, dtype=torch.int8, api_type="dense") -> dict:
         use_multistage_on_N = int(os.getenv('DG_USE_MULTISTAGE_ON_N'))
     extra_info['use_multistage_on_N'] = use_multistage_on_N
     return extra_info
+
+def get_search_space(gemm_type : str) -> list:
+    """
+    Returns search space according input gemm type
+
+    Arguments:
+        gemm:type: bf16-nopad, int8-nopad, bf16-masked, int8-masked, bf16-masked, int8-masked, bf16-dense, int8-dense
+
+    Returns:
+        The tile list:{block_m, block_n, warp_m, warp_n, stage}
+    """
+    device_props = torch.cuda.get_device_properties(device='cuda')
+    if "ZW810E" in device_props.name or "ZW610E" in device_props.name:
+        if gemm_type == "bf16-nopad" or gemm_type == "int8-nopad":
+            block_k = 64 if gemm_type == "bf16-nopad" else 128
+            tile_list = [
+                # blockM = 16
+                [16, 64, 16, 16, block_k, 2],
+                [16, 64, 16, 16, block_k, 3],
+                [16, 64, 16, 16, block_k, 4],
+                [16, 64, 16, 16, block_k, 5],
+                [16, 64, 16, 16, block_k * 2, 2],
+                [16, 64, 16, 16, block_k * 2, 3],
+                [16, 64, 16, 16, block_k * 2, 4],
+                [16, 64, 16, 16, block_k * 2, 5],
+
+                [16, 128, 16, 32, block_k, 2],
+                [16, 128, 16, 32, block_k, 3],
+                [16, 128, 16, 32, block_k, 4],
+                [16, 128, 16, 32, block_k * 2, 2],
+                [16, 128, 16, 32, block_k * 2, 3],
+                [16, 128, 16, 32, block_k * 2, 4],
+                [16, 128, 16, 16, block_k, 2],
+                [16, 128, 16, 16, block_k, 3],
+                [16, 128, 16, 16, block_k, 4],
+                [16, 128, 16, 16, block_k * 2, 2],
+                [16, 128, 16, 16, block_k * 2, 3],
+                [16, 128, 16, 16, block_k * 2, 4],
+
+                [16, 256, 16, 64, block_k, 2],
+                [16, 256, 16, 64, block_k, 3],
+                [16, 256, 16, 64, block_k * 2, 2],
+                [16, 256, 16, 64, block_k * 2, 3],
+
+
+                # blockM = 32
+                [32, 64, 16, 32, block_k, 2],
+                [32, 64, 16, 32, block_k, 3],
+                [32, 64, 16, 32, block_k, 4],
+                [32, 64, 16, 32, block_k, 5],
+                [32, 64, 16, 32, block_k * 2, 2],
+                [32, 64, 16, 32, block_k * 2, 3],
+                [32, 64, 16, 32, block_k * 2, 4],
+                [32, 64, 16, 16, block_k, 2],
+                [32, 64, 16, 16, block_k, 3],
+                [32, 64, 16, 16, block_k * 2, 2],
+                [32, 64, 16, 16, block_k * 2, 3],
+
+                [32, 128, 16, 64, block_k, 2],
+                [32, 128, 16, 64, block_k, 3],
+                [32, 128, 16, 64, block_k, 4],
+                [32, 128, 16, 64, block_k * 2, 2],
+                [32, 128, 16, 64, block_k * 2, 3],
+                [32, 128, 16, 32, block_k, 2],
+                [32, 128, 16, 32, block_k, 3],
+                [32, 128, 16, 32, block_k * 2, 2],
+                [32, 128, 16, 32, block_k * 2, 3],
+
+                [32, 256, 16, 64, block_k, 2],
+                [32, 256, 16, 64, block_k, 3],
+                [32, 256, 16, 64, block_k * 2, 2],
+                [32, 256, 16, 64, block_k * 2, 3],
+
+
+                # blockM = 48
+                [48, 64, 16, 16, block_k, 2],
+                [48, 64, 16, 16, block_k * 2, 2],
+                [48, 64, 16, 16, block_k, 3],
+                [48, 64, 16, 16, block_k * 2, 3],
+                [48, 64, 16, 32, block_k, 2],
+                [48, 64, 16, 32, block_k * 2, 2],
+                [48, 64, 16, 32, block_k, 3],
+                [48, 64, 16, 32, block_k * 2, 3],
+
+                [48, 128, 48, 32, block_k, 2],
+                [48, 128, 48, 32, block_k * 2, 2],
+                [48, 128, 48, 32, block_k, 3],
+                [48, 128, 48, 32, block_k * 2, 3],
+
+
+                # blockM = 64
+                [64, 64, 32, 32, block_k, 2],
+                [64, 64, 32, 32, block_k, 3],
+                [64, 64, 32, 32, block_k, 4],
+                [64, 64, 32, 32, block_k * 2, 2],
+                [64, 64, 32, 32, block_k * 2, 3],
+                [64, 64, 32, 32, block_k * 2, 4],
+
+                [64, 128, 32, 64, block_k, 2],
+                [64, 128, 32, 64, block_k, 3],
+                [64, 128, 32, 32, block_k, 2],
+                [64, 128, 32, 32, block_k, 3],
+                [64, 128, 32, 64, block_k * 2, 2],
+                [64, 128, 32, 64, block_k * 2, 3],
+                [64, 128, 32, 32, block_k * 2, 2],
+                [64, 128, 32, 32, block_k * 2, 3],
+
+                [64, 256, 32, 64, block_k, 2],
+                [64, 256, 32, 64, block_k, 3],
+                [64, 256, 32, 64, block_k * 2, 2],
+                [64, 256, 32, 64, block_k * 2, 3]
+            ]
+        return tile_list
+
+    print("not suppose gemm type yet.\n")
+    return None

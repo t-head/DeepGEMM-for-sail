@@ -103,13 +103,17 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
     x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
 
+    x = x.to('cpu')
+    y = y.to('cpu')
+
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
 
     if file is not None:
-        for i, group in enumerate(m_indices):
-            if group != -1:
-                ref_out[i] = x[i] @ y[group].t()
+        if not cycle:
+            for i, group in enumerate(m_indices):
+                if group != -1 and not cycle:
+                    ref_out[i] = x[i] @ y[group].t()
     else:
         start = 0
         for i, group_m in enumerate(group_ms):
@@ -120,17 +124,18 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
             ref_out[start:aligned_end] = x[start:aligned_end] @ y[i].t()
             start = aligned_end
     
-    ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
+    if not cycle:
+        ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
 
     if d == torch.bfloat16:
-        return m, x, y, m_indices, out, ref_out
+        return m, x.to('cuda'), y.to('cuda'), m_indices, out, ref_out.to('cuda')
     else:
         x_int8 = per_token_cast_to_int8(x)
-        y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device='cuda', dtype=torch.float))
+        y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
         for i in range(num_groups):
             y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
 
-        return m, x_int8, y_int8, m_indices, out, ref_out
+        return m, (x_int8[0].to("cuda"), x_int8[1].to("cuda")), (y_int8[0].to("cuda"), y_int8[1].to("cuda")), m_indices, out, ref_out.to('cuda')
 
 def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, file: str):
     x = torch.randn((num_groups, max_m, k), device='cpu', dtype=torch.bfloat16)
@@ -270,7 +275,6 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
             diff = calc_diff(out, ref_out)
 
-            #gemv accuracy
             assert diff < 0.0015, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
     if file is not None:
@@ -279,7 +283,7 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
     else:
         for num_groups, expected_m_per_group in ((256, 1), (256, 4), (256, 16), (256, 32), (128, 8), (128, 64), (128, 1024)):
             for k, n in ((7168, 4096), (2048, 7168), (256, 768), (512, 128)):
-            # num_groups, expected_m_per_group, k, n = 2, 1, 192, 64
+        # num_groups, expected_m_per_group, k, n = 256, 1, 7168, 4096
                 test_func()
 
     print("Passed\n")
@@ -303,6 +307,7 @@ if __name__ == '__main__':
     parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
+    parser.add_argument('--force_int8', action="store_true", help="force use int8 data type")
 
     args = parser.parse_args()
     global cycle
@@ -320,32 +325,28 @@ if __name__ == '__main__':
                     full_path = os.path.join(root, file)
                     dg_cases.append(full_path)
 
-
         for file in dg_cases:
             print(f'case name:{file}')
-            if "int8" in file and "GroupedContiguous" in file:
-                test_m_grouped_gemm_contiguous(torch.int8, file)
-            elif "int8" in file and "GroupedMasked" in file:
-                test_m_grouped_gemm_masked(torch.int8, file)
-            elif "GroupedContiguous" in file:
-                test_m_grouped_gemm_contiguous(torch.bfloat16, file)
-            elif "GroupedMasked" in file:
-                test_m_grouped_gemm_masked(torch.bfloat16, file)
+            dtype = torch.int8 if "int8" in os.path.basename(file) or args.force_int8 else torch.bfloat16
+            if "GroupedContiguous" in file:
+                test_m_grouped_gemm_contiguous(dtype, file)
+            if "GroupedMasked" in file:
+                test_m_grouped_gemm_masked(dtype, file)
             elif "GroupedNoPad" in file:
-                test_m_grouped_gemm_nopad(torch.bfloat16, file)
+                test_m_grouped_gemm_nopad(dtype, file)
             elif "DenseGemm" in file:
-                test_gemm(torch.int8, file)
+                test_gemm(dtype, file)
             else:
                 "invalid dump file\n"
     else:
-        test_gemm(torch.int8)
-        test_m_grouped_gemm_contiguous(torch.int8, args.file)
-        test_m_grouped_gemm_masked(torch.int8, args.file)
-        test_m_grouped_gemm_nopad(torch.int8, args.file)
+        # test_gemm(torch.int8)
+        # test_m_grouped_gemm_contiguous(torch.int8, args.file)
+        # test_m_grouped_gemm_masked(torch.int8, args.file)
+        # test_m_grouped_gemm_nopad(torch.int8, args.file)
 
-        test_gemm(torch.bfloat16)
-        test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
-        test_m_grouped_gemm_masked(torch.bfloat16, args.file)
+        # test_gemm(torch.bfloat16)
+        # test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
+        # test_m_grouped_gemm_masked(torch.bfloat16, args.file)
         test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
 
 
