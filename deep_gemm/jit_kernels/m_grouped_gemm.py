@@ -173,7 +173,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
 def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
                                      rhs: Tuple[torch.Tensor],
                                      out: torch.Tensor, m_indices: torch.Tensor,
-                                     m_rows: torch.Tensor = None) -> None:
+                                     m_rows: torch.Tensor = None, configs = None) -> None:
     lhs = lhs
     rhs = rhs
     m, k = lhs.shape
@@ -233,7 +233,10 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
             use_gemv = True
 
     if use_gemv == False:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
+        if configs:
+            num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+        else:    
+            num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
         extra_info = get_extra_info()
         if m_rows is None:
             experts_for_rows = torch.zeros(num_groups + 1, dtype=torch.int32, device='cuda')
