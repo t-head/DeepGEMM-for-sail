@@ -7,8 +7,8 @@ from .utils import get_num_sms, ceil_div, get_case_id, get_extra_info, is_ppu1v5
 import os
 
 # C++ code templates
-includes = ('"deep_gemm/fp16_gemm.cuh"', )
-includes_cutlass3 = ('"../deep_gemm/fp16_gemm_cutlass3.cuh"', )
+includes = ('"deep_gemm/bf16_gemm.cuh"', )
+includes_cutlass3 = ('"../deep_gemm/bf16_gemm_cutlass3.cuh"', )
 template = """
 using namespace deep_gemm;
 
