@@ -339,14 +339,14 @@ if __name__ == '__main__':
             else:
                 "invalid dump file\n"
     else:
-        # test_gemm(torch.int8)
-        # test_m_grouped_gemm_contiguous(torch.int8, args.file)
-        # test_m_grouped_gemm_masked(torch.int8, args.file)
-        # test_m_grouped_gemm_nopad(torch.int8, args.file)
+        test_gemm(torch.int8)
+        test_m_grouped_gemm_contiguous(torch.int8, args.file)
+        test_m_grouped_gemm_masked(torch.int8, args.file)
+        test_m_grouped_gemm_nopad(torch.int8, args.file)
 
-        # test_gemm(torch.bfloat16)
-        # test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
-        # test_m_grouped_gemm_masked(torch.bfloat16, args.file)
+        test_gemm(torch.bfloat16)
+        test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
+        test_m_grouped_gemm_masked(torch.bfloat16, args.file)
         test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
 
 

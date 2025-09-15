@@ -201,7 +201,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> \
         Tuple[int, int, int, int, int, int, int, int, int, dict]:
     #if is_ppu1v5_device():
-    #    return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, is_grouped_contiguous, is_grouped_masked)
+    #   return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, is_grouped_contiguous, is_grouped_masked)
 
     if num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False:
         return get_best_configs_dense(m, n, k, num_groups, num_sms)
@@ -485,7 +485,7 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         template=template_updated,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args,
-        arch='1.5' if is_ppu1v5_device else '1.0'
+        arch='1.5' if is_ppu1v5_device() else '1.0'
     )
 
     # Run the kernel

@@ -137,19 +137,21 @@ public:
   constexpr static uint32_t CTA_M = shape<0>(TileShape{});
   constexpr static uint32_t CTA_N = shape<1>(TileShape{});
   constexpr static uint32_t CTA_K = shape<2>(TileShape{});
+  using ScaleCopyAtomWidth = cute::uint32_t;
+  constexpr static uint32_t ScaleGranularity = sizeof(ScaleCopyAtomWidth);
   // ScaleA
   using GmemTiledCopyScaleA = decltype(
-    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
-                    Layout<Shape <Int<CTA_M / 4>, _1>>{},
-                    Layout<Shape < _4,_1>>{}));
+    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<ScaleCopyAtomWidth>, ElementScale>{},
+                    Layout<Shape <Int<CTA_M / ScaleGranularity>, _1>>{},
+                    Layout<Shape <Int<ScaleGranularity>,_1>>{}));
 
   // ScaleB
   using GmemTiledCopyScaleB = decltype(
-    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
-                    Layout<Shape <Int<CTA_N / 4>, _1>>{},
-                    Layout<Shape < _4,_1>>{}));
+    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<ScaleCopyAtomWidth>, ElementScale>{},
+                    Layout<Shape <Int<CTA_N / ScaleGranularity>, _1>>{},
+                    Layout<Shape <Int<ScaleGranularity>,_1>>{}));
 
-  using SmemLayoutAtomScale = Layout<Shape<_4, _1>>;
+  using SmemLayoutAtomScale = Layout<Shape<Int<ScaleGranularity>, _1>>;
   using SmemLayoutScaleA = decltype(tile_to_shape(
       SmemLayoutAtomScale{},
       make_shape(Int<CTA_M>{}, Int<1>{}, Int<1>{})));   // assert CTA_SCALE_K = 1, gs >= cta_k
@@ -470,7 +472,7 @@ public:
       auto k_tile_count_reset = k_tile_count;
 
       // scale A/B
-      using SmemCopyLayoutScaleB = decltype(tile_to_shape(Layout<Shape<_1, _4>>{},
+      using SmemCopyLayoutScaleB = decltype(tile_to_shape(Layout<Shape<_1, Int<ScaleGranularity>>>{},
               make_shape(Int<1>{}, Int<CTA_N>{}, Int<DispatchPolicy::Stages>{})));
       Tensor sSB_copy = make_tensor(make_smem_ptr(storage.smem_scale_b.data()), SmemCopyLayoutScaleB{});
       Tensor tCrSA = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSA(_,_,Int<0>{})));
@@ -749,19 +751,29 @@ struct CollectiveMma<
   constexpr static uint32_t CTA_M = shape<0>(TileShape{});
   constexpr static uint32_t CTA_N = shape<1>(TileShape{});
   constexpr static uint32_t CTA_K = shape<2>(TileShape{});
+
+  // b32x4 is not avaliable for nopad interface, as the scale is not 16 byte alinged
+  // maybe b32x4 has better perf for the other interface
+  using ScaleCopyAtomWidth = cute::uint32_t;
+  constexpr static uint32_t ScaleGranularity = sizeof(ScaleCopyAtomWidth) / sizeof(float);
+
+  static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
+  static_assert(ScaleGranularity * MaxThreadsPerBlock  >= CTA_M, "threads not enough to copy scale for A");
+  static_assert(ScaleGranularity * MaxThreadsPerBlock  >= CTA_N, "threads not enough to copy scale for B");
+
   // ScaleA
   using GmemTiledCopyScaleA = decltype(
-    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
-                    Layout<Shape <Int<CTA_M / 4>, _1>>{},
-                    Layout<Shape < _4,_1>>{}));
+    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<ScaleCopyAtomWidth>, ElementScale>{},
+                    Layout<Shape <Int<CTA_M / ScaleGranularity>, _1>>{},
+                    Layout<Shape <Int<ScaleGranularity>,_1>>{}));
 
   // ScaleB
   using GmemTiledCopyScaleB = decltype(
-    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
-                    Layout<Shape <Int<CTA_N / 4>, _1>>{},
-                    Layout<Shape < _4,_1>>{}));
+    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<ScaleCopyAtomWidth>, ElementScale>{},
+                    Layout<Shape <Int<CTA_N / ScaleGranularity>, _1>>{},
+                    Layout<Shape <Int<ScaleGranularity>,_1>>{}));
 
-  using SmemLayoutAtomScale = Layout<Shape<_4, _1>>;
+  using SmemLayoutAtomScale = Layout<Shape<Int<ScaleGranularity>, _1>>;
   using SmemLayoutScaleA = decltype(tile_to_shape(
       SmemLayoutAtomScale{},
       make_shape(Int<CTA_M>{}, Int<1>{}, Int<1>{})));   // assert CTA_SCALE_K = 1, gs >= cta_k
@@ -818,13 +830,13 @@ struct CollectiveMma<
     gmem_tiled_copy_A.desc_.template init<ElementA, TransA, get<0>(TilerA{}), get<1>(TilerA{})>(nullptr, M, K, params.dA);
     gmem_tiled_copy_B.desc_.template init<ElementB, TransB, get<0>(TilerB{}), get<1>(TilerB{})>(nullptr, N, K, params.dB);
 
-    gmem_tiled_copy_scaleA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
-                    Layout<Shape <Int<CTA_M / 4>, _1>>{},
-                    Layout<Shape < _4,_1>>{});
+    gmem_tiled_copy_scaleA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<ScaleCopyAtomWidth>, ElementScale>{},
+                    Layout<Shape <Int<CTA_M / ScaleGranularity>, _1>>{},
+                    Layout<Shape < Int<ScaleGranularity>,_1>>{});
 
-    gmem_tiled_copy_scaleB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementScale>{},
-                    Layout<Shape <Int<CTA_N / 4>, _1>>{},
-                    Layout<Shape < _4,_1>>{});
+    gmem_tiled_copy_scaleB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<ScaleCopyAtomWidth>, ElementScale>{},
+                    Layout<Shape <Int<CTA_N / ScaleGranularity>, _1>>{},
+                    Layout<Shape < Int<ScaleGranularity>,_1>>{});
   };
 
   template <class ProblemShape_MNKL, class BlockCoord_MNKL>
@@ -955,8 +967,8 @@ struct CollectiveMma<
     Tensor sSA = make_tensor(make_smem_ptr(scale_a_smem_ptr), SmemLayoutScaleA{});
     Tensor sSB = make_tensor(make_smem_ptr(scale_b_smem_ptr), SmemLayoutScaleB{});
 
-    auto gmem_thr_copy_scaleA = gmem_tiled_copy_scaleA.get_slice(thread_idx % (Int<CTA_M  / 4>{}));
-    auto gmem_thr_copy_scaleB = gmem_tiled_copy_scaleB.get_slice(thread_idx % (Int<CTA_N  / 4>{}));
+    auto gmem_thr_copy_scaleA = gmem_tiled_copy_scaleA.get_slice(thread_idx % (Int<CTA_M  / ScaleGranularity>{}));
+    auto gmem_thr_copy_scaleB = gmem_tiled_copy_scaleB.get_slice(thread_idx % (Int<CTA_N  / ScaleGranularity>{}));
 
     Tensor tSgSA = gmem_thr_copy_scaleA.partition_S(gSFA);
     Tensor tSsSA = gmem_thr_copy_scaleA.partition_D(sSA);
@@ -974,6 +986,7 @@ struct CollectiveMma<
     for (int i = 0; i < size(tSpSB); ++i) {
       tSpSB(i) = get<0>(tSFBcSFB(i)) < get<1>(residue_mnk);
     }
+    bool scaleCopySendDone = false;
 
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
@@ -1027,7 +1040,7 @@ struct CollectiveMma<
     clear(mma_acc);
 
     // scale A/B
-    using SmemCopyLayoutScaleB = decltype(tile_to_shape(Layout<Shape<_1, _4>>{},
+    using SmemCopyLayoutScaleB = decltype(tile_to_shape(Layout<Shape<_1, Int<ScaleGranularity>>>{},
             make_shape(Int<1>{}, Int<CTA_N>{}, Int<DispatchPolicy::Stages>{})));
     Tensor sSB_copy = make_tensor(sSB.data(), SmemCopyLayoutScaleB{});
     Tensor tCrSA = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSA(_,_,Int<0>{})));
@@ -1114,11 +1127,12 @@ CUTLASS_PRAGMA_UNROLL
               gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
               warp_idx
             );
-          } else if (k_tile_count == 0) {
-            if (warp_idx <= 1) {
+          } else if (scaleCopySendDone == false) {
+            if (warp_idx <= 8) {
               copy_if(gmem_tiled_copy_scaleA, tSpSA, tSgSA(_,_,_,0), tSsSA(_,_,_,0));
               copy_if(gmem_tiled_copy_scaleB, tSpSB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
             }
+            scaleCopySendDone = true;
           }
           cp_async_fence();
 
@@ -1136,6 +1150,14 @@ CUTLASS_PRAGMA_UNROLL
     // TODO: original cutlass3 miss this sync
     cp_async_wait<0>();
     __syncthreads();
+
+    // if (thread0()) {
+    //   print("    gSFA="); print(gSFA); print('\n');
+    //   print("    tSgSA="); print(tSgSA); print('\n');
+    //   print_tensor(tSgSA);
+    //   print("    tSsSA="); print(tSsSA); print('\n');
+    //   print_tensor(tSsSA);
+    // }
     copy(smem_tiled_copy_ScaleA, tCsSA_p(_,_,Int<0>{}), tCrSA_copy_view(_,_,Int<0>{}));
     copy(smem_tiled_copy_ScaleB, tCsSB_p(_,Int<0>{},_), tCrSB_copy_view(_,Int<0>{},_));
 
@@ -1390,10 +1412,10 @@ public:
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
 
-    //   if (thread0()) {
-    //     printf("M = %d, N = %d, K = %d, offset_m = %d, expert_id = %d, offset_a = %d, offset_b = %d, m_coord = %d, n_coord = %d, ptr_A = %p, ptr_B = %p\n",
-    //         M, N, K, offset_m, expert_id, offset_a, offset_b, m_coord, n_coord, ptr_A, ptr_B);
-    //   }
+      // if (thread0()) {
+      //   printf("M = %d, N = %d, K = %d, offset_m = %d, expert_id = %d, offset_a = %d, offset_b = %d, m_coord = %d, n_coord = %d, ptr_A = %p, ptr_B = %p\n",
+      //       M, N, K, offset_m, expert_id, offset_a, offset_b, m_coord, n_coord, ptr_A, ptr_B);
+      // }
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));

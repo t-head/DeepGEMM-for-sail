@@ -119,7 +119,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
         template=template,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args,
-        arch='1.5' if is_ppu1v5_device else '1.0'
+        arch='1.5' if is_ppu1v5_device() else '1.0'
     )
 
     # Run the kernel
@@ -191,7 +191,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tenso
         template=template_updated,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args,
-        arch='1.5' if is_ppu1v5_device else '1.0'
+        arch='1.5' if is_ppu1v5_device() else '1.0'
     )
 
     # Run the kernel
@@ -275,13 +275,22 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
         else:
             num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)      
 
+        extra_info = get_extra_info()
+        grouped_layout_dtype = torch.int32 if extra_info['use_cutlass3'] else torch.int64
+
         if m_rows is None:
-            experts_for_rows = torch.zeros(num_groups + 1, dtype=torch.int32, device='cuda')
             counts = torch.bincount(m_indices)
             min_n = min(counts.size(0), num_groups)
-            if min_n > 0:
-                experts_for_rows[1:1+min_n] = counts[:min_n]
-            m_rows = experts_for_rows.cumsum(0)
+            if extra_info['use_cutlass3']:
+                experts_for_rows = torch.zeros(num_groups, dtype=torch.int32, device='cuda')
+                if min_n > 0:
+                    experts_for_rows[:min_n] = counts[:min_n]
+                m_rows = experts_for_rows
+            else:
+                experts_for_rows = torch.zeros(num_groups+1, dtype=torch.int32, device='cuda')
+                if min_n > 0:
+                    experts_for_rows[1:1+min_n] = counts[:min_n]
+                m_rows = experts_for_rows.cumsum(0)
 
         args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_rows, m, expected_m, num_groups,
@@ -296,15 +305,17 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
                 'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
                 'GEMM_TYPE': 'GroupedNoPad'},
             space=(),
-            includes=includes,
+            includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
             arg_defs=(  ('lhs', torch.int8), ('lhs_scales', torch.float),
                         ('rhs', torch.int8), ('rhs_scales', torch.float),
                         ('out', torch.bfloat16),
-                        ('grouped_layout', torch.int64), ('m', int),
+                        ('grouped_layout', grouped_layout_dtype), ('m', int),
                         ('num_groups', int), ('expected_m', int),
                         ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
             template=template,
-            args=args
+            jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
+            args=args,
+            arch='1.5' if is_ppu1v5_device() else '1.0'
         )
 
     dump_env = os.getenv('dump_group_m')

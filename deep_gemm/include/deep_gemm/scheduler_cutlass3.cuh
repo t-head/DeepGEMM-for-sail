@@ -12,7 +12,7 @@
 #include "cutlass/gemm_coord.hpp"
 ////////////////////////////////////////////////////////////////////////////////
 
-const char* GemmTypeS[] = { "Normal", "GroupedContiguous", "GroupedMasked" };
+const char* GemmTypeS[] = { "Normal", "GroupedContiguous", "GroupedMasked", "GroupedNoPad"};
 
 // namespace cutlass::gemm::kernel {
 namespace deep_gemm {
@@ -31,7 +31,7 @@ enum class GemmType {
     Normal,
     GroupedContiguous,
     GroupedMasked,
-    GroupedMaskedNoBubble
+    GroupedNoPad
 };
 
 #pragma clang diagnostic push
@@ -99,7 +99,7 @@ struct DeepGemmScheduler {
         } else if (kGemmType == GemmType::GroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
             this->grouped_layout = params.grouped_layout;
-        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedMaskedNoBubble) {
+        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
             curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_m = 0;
             this->grouped_layout = params.grouped_layout;
         }
@@ -144,7 +144,7 @@ struct DeepGemmScheduler {
     CUTLASS_DEVICE bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
         const auto next_block_idx = (++ current_iter) * gridDim.x + blockIdx.x;
 
-        if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedMaskedNoBubble) {
+        if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
             uint32_t num_m_blocks;
             while (true) {
                 // End of the task
@@ -216,7 +216,7 @@ struct DeepGemmScheduler {
             return param.shape_m;
         } else if constexpr (kGemmType == GemmType::GroupedMasked) {
             return param.shape_m;
-        } else if constexpr (kGemmType == GemmType::GroupedMaskedNoBubble) {
+        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return curr_group_m;
         } else {
             return 0;
@@ -234,7 +234,7 @@ struct DeepGemmScheduler {
     {
         if constexpr (kGemmType == GemmType::GroupedMasked) {
             return int64_t(curr_group_idx) * param.shape_m * SHAPE_K;
-        } else if constexpr (kGemmType == GemmType::GroupedMaskedNoBubble) {
+        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return int64_t(curr_cumsum_m) * SHAPE_K;
         } else {
             return 0;
@@ -246,7 +246,7 @@ struct DeepGemmScheduler {
     {
         if constexpr (kGemmType == GemmType::GroupedMasked) {
             return int64_t(curr_group_idx) * param.shape_m;
-        } else if constexpr (kGemmType == GemmType::GroupedMaskedNoBubble) {
+        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return curr_cumsum_m;
         } else {
             return 0;
@@ -269,7 +269,7 @@ struct DeepGemmScheduler {
     {
         if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {
             return int64_t(curr_group_idx) * param.shape_m * SHAPE_N;
-        } else if constexpr (kGemmType == GemmType::GroupedMaskedNoBubble) {
+        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return int64_t(curr_cumsum_m) * SHAPE_N;
         } else {
             return 0;
