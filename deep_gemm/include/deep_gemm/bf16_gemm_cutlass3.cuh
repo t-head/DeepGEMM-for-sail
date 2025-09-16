@@ -1397,7 +1397,7 @@ public:
 
             printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
 
-            printf("smem_size:%d, verg:%d, stack:%d\n", smem_size, int(attr.numRegs), int(attr.localSizeBytes));
+            printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, int(attr.numRegs), int(attr.localSizeBytes));
         }
 
 #if 0

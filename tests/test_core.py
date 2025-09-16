@@ -310,14 +310,16 @@ if __name__ == '__main__':
     parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
-    parser.add_argument('--dtype', default="bf16", type=str, choices=["int8","bf16", "int8,bf16"], required=False, help='data type of the cases')
+    parser.add_argument('--dtype', default="bf16", type=str, choices=["int8","bf16", "all"], required=False, help='data type of the cases')
+    parser.add_argument('--func', default=None, type=str, choices=["DenseGemm","GroupedContiguous", "GroupedMasked", "DenseGemm"], required=False, help='target test func')
 
     args = parser.parse_args()
     global cycle
     cycle = 0
     if (args.cycle):
         cycle = 1
-
+    if args.dtype == "all":
+        args.dtype = "int8,bf16"
     if args.file is not None or args.caselist is not None:
         if args.file:
             dg_cases = [args.file]
@@ -354,14 +356,30 @@ if __name__ == '__main__':
             else:
                 "invalid dump file\n"
     else:
-        test_gemm(torch.int8)
-        test_m_grouped_gemm_contiguous(torch.int8, args.file)
-        test_m_grouped_gemm_masked(torch.int8, args.file)
-        test_m_grouped_gemm_nopad(torch.int8, args.file)
+        if args.func is not None:
+            if "GroupedContiguous" in args.func:
+                test_m_grouped_gemm_contiguous(torch.int8, args.file)
+                test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
+            elif "GroupedMasked" in args.func:
+                test_m_grouped_gemm_masked(torch.int8, args.file)
+                test_m_grouped_gemm_masked(torch.bfloat16, args.file)
+            elif "GroupedNoPad" in args.func:
+                test_m_grouped_gemm_nopad(torch.int8, args.file)
+                test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
+            elif "DenseGemm" in args.func:
+                test_gemm(torch.int8)
+                test_gemm(torch.bfloat16)
+            else:
+                "invalid test function\n"
+        else:
+            test_gemm(torch.int8)
+            test_m_grouped_gemm_contiguous(torch.int8, args.file)
+            test_m_grouped_gemm_masked(torch.int8, args.file)
+            test_m_grouped_gemm_nopad(torch.int8, args.file)
 
-        test_gemm(torch.bfloat16)
-        test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
-        test_m_grouped_gemm_masked(torch.bfloat16, args.file)
-        test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
+            test_gemm(torch.bfloat16)
+            test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
+            test_m_grouped_gemm_masked(torch.bfloat16, args.file)
+            test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
 
 

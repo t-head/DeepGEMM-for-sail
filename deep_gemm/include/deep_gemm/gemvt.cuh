@@ -448,7 +448,7 @@ public:
                     kNumGroups, shape_m, SHAPE_N, SHAPE_K);
                 printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, NUM_UNROLL:%d, SWZL_SIZE_M:%d\n",
                     BlockSize, NPerThread, ThreadPerN, NPerBlock, NUM_UNROLL, SWZL_SIZE_M);
-                printf("threadblock_count:%d, verg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
+                printf("threadblock_count:%d, vreg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
                 
             }
 
@@ -489,7 +489,7 @@ public:
                 printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, SWZL_SIZE_M:%d\n",
                     BlockSize, NPerThread, ThreadPerN, NPerBlock, SWZL_SIZE_M);
                 
-                printf("threadblock_count:%d, verg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
+                printf("threadblock_count:%d, vreg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
                 
             }
 

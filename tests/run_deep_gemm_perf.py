@@ -20,9 +20,10 @@ if __name__ == '__main__':
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
     parser.add_argument('--file', default=None, type=str, required=False, help='the string of DG cases')
     parser.add_argument('--output', default="output", type=str, required=False, help='the output storing cycles of DG cases')
-    parser.add_argument('--dtype', default="bf16", type=str, choices=["int8","fp8","bf16","int8,fp8","int8,bf16","fp8,bf16","int8,fp8,bf16"], required=False, help='data type of the cases')
-    parser.add_argument('--mode', default="metrics", type=str, choices=["metrics","full"], required=False, help='acu mode')
+    parser.add_argument('--dtype', default="bf16", type=str, choices=["int8","fp8","bf16","all"], required=False, help='data type of the cases')
+    parser.add_argument('--mode', default="metrics", type=str, choices=["metrics","full","show_log"], required=False, help='acu mode')
     parser.add_argument('--device', default=None, type=str, required=False, help='devices index to run cases, 0 means gpu0. 0,3 means gpu0,1,2,3')
+    parser.add_argument('--acc_check', action="store_true", required=False, help='if or nor open accuracy check')
 
     args = parser.parse_args()
     dg_cases = list()
@@ -43,14 +44,19 @@ if __name__ == '__main__':
                 for file in files:
                     full_path = os.path.join(root, file)
                     dg_cases.append(full_path)
+        if len(dg_cases) == 0:
+            print("no dg_cases found")
+            exit(-1)
     else:
         print("Must give a file path or a caselist directory!")
         exit(-1)
+    if args.dtype == "all":
+        args.dtype = "int8,fp8,bf16"
     if args.device == None:
         # print(dg_cases)
         dtypes = str_to_list(args.dtype, str)
         for _d in dtypes:
-            run_cycle_on_device(dg_cases, args.output, "ppu" if USE_PPU else "gpu", _d, args.mode)
+            run_cycle_on_device(dg_cases, args.output, "ppu" if USE_PPU else "gpu", _d, args.mode, args.acc_check)
     else:
         devices = str_to_list(args.device)
         if len(devices) == 1 or len(devices) > 2:
@@ -63,6 +69,6 @@ if __name__ == '__main__':
         cases_groups = split_list_into_groups(dg_cases, len(num_gpus))
         for i in range(len(num_gpus)):
             # 创建子进程并传递 GPU ID, 在worker中循环 backend的取值
-            p = mp.Process(target=worker, args=(num_gpus[i], cases_groups[i], args.output, "ppu" if USE_PPU else "gpu", args.dtype, args.mode))
+            p = mp.Process(target=worker, args=(num_gpus[i], cases_groups[i], args.output, "ppu" if USE_PPU else "gpu", args.dtype, args.mode, args.acc_check))
             p.start()
             processes.append(p)

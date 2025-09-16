@@ -1,4 +1,15 @@
-path = "./dense_list"
+import os
+
+input_casepath = ""
+output_file = "dense_gemm.caselist"
+if input_casepath != "":
+    for root, dirs, files in os.walk(input_casepath):
+        for file in files:
+            full_path = os.path.join(root, file)
+            dg_cases.append(full_path)
+    with open(output_file, "a") as f:
+        f.writelines("\n".join(cases))
+
 m_list = [2048, 4096]
 nk_dict ={
 "dpsk-v3_tp8":
@@ -29,11 +40,14 @@ nk_dict ={
 
 }
 index = 0
+cases = list()
 for m in m_list:
     for model, nk_list in nk_dict.items():
         for (n, k) in nk_list:
             filename = f"case{index}_{model}_m{m}_n{n}_k{k}_DenseGemm.dump"
-            print(filename)
+            cases.append(filename)
             # with open(f"{path}/{filename}", "w") as f:
             #     f.writelines("")
             index += 1
+with open(output_file, "a") as f:
+    f.writelines("\n".join(cases))

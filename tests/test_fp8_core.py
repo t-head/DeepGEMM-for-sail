@@ -133,18 +133,18 @@ def test_gemm(file: str) -> None:
             deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
             diff = calc_diff(out, ref_out)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+            if benchmark:
+                # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
+                x_fp8, y_fp8, out, ref_out = construct(m, k, n)
 
-            # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
-            x_fp8, y_fp8, out, ref_out = construct(m, k, n)
+                # noinspection PyShadowingNames
+                def test_func():
+                    deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 
-            # noinspection PyShadowingNames
-            def test_func():
-                deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-
-            t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
-            print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
-                f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
-                f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
+                t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+                print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
+                    f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
+                    f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     print("Passed\n")
 
 def test_m_grouped_gemm_contiguous(file: str) -> None:
@@ -171,19 +171,19 @@ def test_m_grouped_gemm_contiguous(file: str) -> None:
             diff = calc_diff(out, ref_out)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
+            if benchmark:
+                # NOTES: we should mask the unfilled part before calculating difference
+                m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file)
 
-            # NOTES: we should mask the unfilled part before calculating difference
-            m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file)
+                # noinspection PyShadowingNames
+                def test_func():
+                    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
 
-            # noinspection PyShadowingNames
-            def test_func():
-                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
-
-            t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
-            valid_m = (m_indices != -1).sum().item()
-            print(f' > Perf ({num_groups=:2}, {expected_m_per_group=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
-                  f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
-                  f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
+                t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+                valid_m = (m_indices != -1).sum().item()
+                print(f' > Perf ({num_groups=:2}, {expected_m_per_group=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+                    f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
+                    f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
     print("Passed\n")
 
 
@@ -215,21 +215,21 @@ def test_m_grouped_gemm_masked(file: str) -> None:
                     for j in range(num_groups):
                         diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
                         assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+                if benchmark:
+                    # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
+                    x_fp8, y_fp8, masked_m, out, ref_out = construct_masked_grouped(num_groups, 4096, expected_m_per_group, k, n, file)
 
-                # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
-                x_fp8, y_fp8, masked_m, out, ref_out = construct_masked_grouped(num_groups, 4096, expected_m_per_group, k, n, file)
+                    # noinspection PyShadowingNames
+                    def test_func():
+                        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m_per_group)
 
-                # noinspection PyShadowingNames
-                def test_func():
-                    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m_per_group)
+                    valid_m = masked_m.sum().item()
+                    # Test performance with fixed shapes
+                    t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
 
-                valid_m = masked_m.sum().item()
-                # Test performance with fixed shapes
-                t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
-
-                print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
-                    f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
-                    f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s') 
+                    print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+                        f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
+                        f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s') 
     print("Passed\n")
 
 
@@ -242,8 +242,8 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    # global benchmark
-    # benchmark = 0
+    global benchmark
+    benchmark = 0
 
     import argparse
 
@@ -251,6 +251,7 @@ if __name__ == '__main__':
     parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
+    parser.add_argument("--dtype",  default="fp8", type=str, required=False, help='data type of the cases, e.g. fp8, e4m3, e5m2')
 
     args = parser.parse_args()
     global cycle
