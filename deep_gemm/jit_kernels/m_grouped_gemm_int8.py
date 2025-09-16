@@ -3,7 +3,7 @@ from typing import Tuple
 
 from .gemm_int8 import get_best_configs
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_case_id, get_extra_info, is_ppu1v5_device
+from .utils import get_num_sms, ceil_div, get_extra_info, is_ppu1v5_device
 from .gemm import get_gemv_best_configs
 import os
 
@@ -93,7 +93,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous=True)
-    expected_m = 0
+    expected_m = ceil_div(m, num_groups)
 
     extra_info = get_extra_info()
 
@@ -113,7 +113,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
         arg_defs=(('lhs', torch.int8), ('lhs_scales', torch.float),
                   ('rhs', torch.int8), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
-                  ('grouped_layout', torch.int32), ('m', int), 
+                  ('grouped_layout', torch.int32), ('m', int),
                   ('num_groups', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
@@ -271,7 +271,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
         if configs:
             num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
         else:
-            num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)      
+            num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
 
         extra_info = get_extra_info()
         grouped_layout_dtype = torch.int32 if extra_info['use_cutlass3'] else torch.int64
@@ -314,18 +314,6 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
             jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
             args=args
         )
-
-    dump_env = os.getenv('dump_group_m')
-    if dump_env:
-        filename = f"case{get_case_id()}_groups{num_groups}_m{m}_n{n}_k{k}_em{expected_m}_GroupedNoPad.dump"
-        tensor_cpu = m_indices.detach().cpu()
-        data = tensor_cpu.tolist()
-
-        print(f"[INFO] file:{filename} with size:{m_indices.size()}\n")
-
-        with open(filename, 'w', encoding='utf-8') as f:
-            for num in data:
-                f.write(f"{num}\n")
 
     # Run the kernel
     runtime(*args)

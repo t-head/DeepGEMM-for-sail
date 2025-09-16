@@ -1,6 +1,5 @@
 import math
 import torch
-import os
 from functools import lru_cache
 from typing import Tuple
 import re
@@ -285,7 +284,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     if (m < 20 and n < 512) :
         best_block_m = 16
         best_block_n = 64
-    
+
     assert best_block_m is not None and best_block_n is not None
 
     # Always pick the longest one
@@ -297,12 +296,12 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         block_k = 64
     if k >= 4096 and (best_block_m <= 32 and best_block_n <= 64):
         block_k = 256
- 
+
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
 
     if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16 or best_block_m == 32:
         stage_candidates = (3, 2)
-    
+
     best_occ = 0
     for num_stages in stage_candidates:
         best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k)
@@ -462,7 +461,7 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
 
     extra_info = get_extra_info()
-        
+
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m, torch.cuda.current_stream(), num_sms, smem_config[0])
 

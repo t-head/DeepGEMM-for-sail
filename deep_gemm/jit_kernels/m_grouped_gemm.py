@@ -3,7 +3,7 @@ from typing import Tuple
 
 from .gemm import get_best_configs, get_gemv_best_configs
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_case_id, get_extra_info, is_ppu1v5_device
+from .utils import get_num_sms, ceil_div, get_extra_info, is_ppu1v5_device
 import os
 
 # C++ code templates
@@ -85,7 +85,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
-    expected_m = 0
+    expected_m = ceil_div(m, num_groups)
     extra_info = get_extra_info()
     args = (lhs, rhs, out,
             m_indices, m, expected_m, num_groups,
@@ -102,7 +102,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
         arg_defs=(('lhs', torch.bfloat16),
                   ('rhs', torch.bfloat16),
                   ('out', torch.bfloat16),
-                  ('grouped_layout', torch.int32), ('m', int), 
+                  ('grouped_layout', torch.int32), ('m', int),
                   ('num_groups', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
@@ -235,7 +235,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
     if use_gemv == False:
         if configs:
             num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
-        else:    
+        else:
             num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
 
         extra_info = get_extra_info()
@@ -277,18 +277,6 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
             jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
             args=args
         )
-
-    dump_env = os.getenv('dump_group_m')
-    if dump_env:
-        filename = f"case{get_case_id()}_groups{num_groups}_m{m}_n{n}_k{k}_em{expected_m}_GroupedNoPad.dump"
-        tensor_cpu = m_indices.detach().cpu()
-        data = tensor_cpu.tolist()
-
-        print(f"[INFO] file:{filename} with size:{m_indices.size()}\n")
-
-        with open(filename, 'w', encoding='utf-8') as f:
-            for num in data:
-                f.write(f"{num}\n")
 
     # Run the kernel
     runtime(*args)

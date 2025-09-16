@@ -1,6 +1,5 @@
 import math
 import torch
-import os
 from functools import lru_cache
 from typing import Tuple
 
@@ -214,7 +213,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                 # print(f'valid_occ:{valid_occ}, valid_wave:{valid_wave}, valid_util:{valid_util}, valid_ai:{valid_ai}')
                 success = (valid_wave + valid_util + valid_occ + valid_ai) >= 3
 
-            elif num_waves < best_num_waves: 
+            elif num_waves < best_num_waves:
                 success = True
             elif num_waves == best_num_waves:
                 # Check last wave utilization
@@ -240,10 +239,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     if (m < 20 and n < 512) :
         best_block_m = 16
         best_block_n = 64
-    
+
     # best_block_n = 128
     assert best_block_m is not None and best_block_n is not None
-    
+
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_config, ppu_capacity = None, None, 262144
@@ -253,12 +252,12 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         block_k = 32
     if k >= 4096 and (best_block_m <= 32 and best_block_n <= 64):
         block_k = 128
- 
+
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
 
     if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16 or best_block_m == 32:
         stage_candidates = (3, 2)
-    
+
     best_occ = 0
     for num_stages in stage_candidates:
         best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k)

@@ -3,6 +3,14 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 // #define ACOMPUTE_VERSION 10000
+#include "profiling_interface.hpp"
+
+#include <iostream>
+#include <fstream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/file.h>
+#include <stdlib.h>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
@@ -1249,7 +1257,7 @@ public:
     union SharedTensorStorage {
       using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
       using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
-  
+
       MainloopSharedStorage mainloop;
       EpilogueSharedStorage epilogue;
     } tensors;
@@ -1626,8 +1634,60 @@ public:
         std::cout << "block = " << block << std::endl;
         std::cout << "grid = " << grid << std::endl;
         std::cout << "smem_size_kernel = " << smem_size_kernel << std::endl;
-        cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
 
+        // export PPU_LIB_PERF_INSTRUMENT=1
+        int id = generate_id();
+        int pid = getpid();
+        int device_id = -1;
+        cudaError_t result = cudaGetDevice(&device_id);
+        if (result != cudaSuccess) {
+            printf("get device id failed\n");
+            return;
+        }
+
+        DgProfParam dg_prof_params;
+        if (ProfilingInterface::Instance().get_op_info()){
+            dg_prof_params.set_deep_gemm_params(
+                GemmTypeS[static_cast<int>(kGemmType)], std::string("int8"), id, kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, device_id, pid
+            );
+        }
+        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+        cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
+        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+        char *pEnv_params_dump = std::getenv("PPU_LIB_SHOW_PARAMS");
+        char *pEnv_dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
+        static int target_device_id = pEnv_dump_device != nullptr ? std::stoi(pEnv_dump_device) : 0;
+
+        if (pEnv_params_dump && std::string(pEnv_params_dump) == "2" && kGemmType != GemmType::Normal && target_device_id == device_id) {
+            // check if cuda graph captured
+            cudaStreamCaptureStatus captureStatus;
+            cudaStreamIsCapturing(stream, &captureStatus);
+            // add cuda graph mode later
+            if (captureStatus != cudaStreamCaptureStatusNone) {
+                printf("dump_group_m not supported in cuda graph mode.");
+                return;
+            }
+            std::ostringstream filename;
+            filename << "case" << id << "_"
+                     << GemmTypeS[static_cast<int>(kGemmType)] << "_"
+                     << "int8" << "_"
+                     << "groups" << kNumGroups << "_"
+                     << "m" << shape_m << "_"
+                     << "n" << SHAPE_N << "_"
+                     << "k" << SHAPE_K << "_"
+                     << "em" << expected_m << "_"
+                     << "gpu" << device_id << "_"
+                     << "pid" << pid << ".dump";
+
+            std::ifstream file(filename.str().c_str());
+            int fd = open(filename.str().c_str(), O_CREAT | O_WRONLY | O_APPEND, 0666);
+            if (fd != -1 && !file) {
+                if (flock(fd, LOCK_EX | LOCK_NB) != -1)
+                    print_to_file(grouped_layout, kGemmType == GemmType::GroupedContiguous ? shape_m : kNumGroups,  filename.str().c_str(), stream);
+                close(fd);
+            }
+        }
         // TODO: query max_active_tb_num
         int max_active_tb_num = 8; //GemmGrouped::maximum_active_blocks();
 
@@ -1636,7 +1696,7 @@ public:
         if (pEnv_params && isdigit(*pEnv_params)) {
             cudaFuncAttributes attr;
             cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
-    
+
             printf("[GemmGrouped-A8W8:]\n");
             printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s\n",
                 kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)]);
@@ -1648,48 +1708,6 @@ public:
 
             printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, int(attr.numRegs), int(attr.localSizeBytes));
         }
-
-#if 0
-        // export PPU_LIB_SHOW_PARAMS=1
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()){
-            dg_prof_params.set_deep_gemm_params(
-                GemmTypeS[static_cast<int>(kGemmType)], std::string("bf16"), kNumGroups, shape_m, SHAPE_N, SHAPE_K
-            );
-        }
-    
-        char *pEnv_params_dump = std::getenv("dump_group_m");
-        if (pEnv_params_dump && isdigit(*pEnv_params_dump) && kGemmType != GemmType::Normal) {
-            // check if cuda graph captured
-            cudaStreamCaptureStatus captureStatus;
-            cudaStreamIsCapturing(stream, &captureStatus);
-            // add cuda graph mode later
-            if (captureStatus != cudaStreamCaptureStatusNone) {
-                printf("[moe gemm]: dump_group_m not supported in cuda graph mode.");
-                return;
-            }
-
-            static int casedId = 0;
-            std::ostringstream filename;
-            int id = generate_id();
-            filename << "case" << id << "_"
-                     << "groups" << kNumGroups << "_"
-                     << "m" << shape_m << "_"
-                     << "n" << SHAPE_N << "_"
-                     << "k" << SHAPE_K << "_"
-                     << "em" << expected_m << "_"
-                     << GemmTypeS[static_cast<int>(kGemmType)] << ".dump";
-            
-            std::ifstream file(filename.str().c_str());
-            int fd = open(filename.str().c_str(), O_CREAT | O_WRONLY | O_APPEND, 0666);
-            if (fd != -1 && !file) {
-                if (flock(fd, LOCK_EX | LOCK_NB) != -1)
-                    print_to_file(grouped_layout, kGemmType == GemmType::GroupedContiguous ? shape_m : kNumGroups, filename.str().c_str(), stream);
-                close(fd);
-            }
-        }
-#endif
-
     }
 };
 

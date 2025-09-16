@@ -87,7 +87,7 @@ public:
     using layoutT_ = ProblemVisitor::layoutT_;
 
     using EpilogueOutputOp =
-        typename Epilogue::Visitor::ElementwiseFunctor; 
+        typename Epilogue::Visitor::ElementwiseFunctor;
 
      /// Argument structure
     struct Arguments
@@ -137,14 +137,14 @@ public:
             , grouped_layout(nullptr)
             , batch_stride_A(0)
             , batch_stride_B(0)
-            
+
         {
         }
 
         /// Ctor
         CUTLASS_HOST_DEVICE
         Arguments(int problem_count, int threadblock_count,
-            typename Mma::IteratorA::TensorRef ref_A, typename Mma::IteratorB::TensorRef ref_B, 
+            typename Mma::IteratorA::TensorRef ref_A, typename Mma::IteratorB::TensorRef ref_B,
             TensorRefC ref_D,
             int64_t gemm_m, int64_t gemm_n, int64_t gemm_k, layoutT_* grouped_layout,
             TensorRefAlphaCol ref_alpha_col_, TensorRefAlphaRow ref_alpha_row_,
@@ -261,7 +261,7 @@ public:
         typename ProblemVisitor::SharedStorage problem_visitor;
         typename Mma::SharedStorage main_loop;
 
-        struct 
+        struct
         {
             typename Epilogue::SharedStorage epilogue;
             typename EpilogueVisitor::SharedStorage visitor;
@@ -416,7 +416,7 @@ public:
                 problem_size_output.mn(), thread_idx, warp_idx, lane_idx, params.params_alpha_col, layout_D,
                 params.params_D, params.ptr_alpha_row, ptr_ref_alpha_col, params.ptr_D,
                 params.ptr_D, threadblock_offset_output.mn(), 0);
-        
+
             epilogue_visitor.set_batch_index(threadblock_offset.k());
 
             Epilogue epilogue(shared_storage.epilogue.epilogue, thread_idx, warp_idx, lane_idx);
@@ -491,7 +491,7 @@ public:
                 DefaultGemm::Epilogue::OutputTileIterator::kElementsPerAccess, cutlass::sizeof_bits<ElementOutput>::value>,
             ElementCompute>;
 
-        // Epilogue 
+        // Epilogue
         using EpilogueVisitor = typename cutlass::epilogue::threadblock::EpilogueVisitorPerRowPerCol<ThreadblockShape,
             DefaultGemm::kThreadCount, AlphaColTileIterator, typename DefaultGemm::Epilogue::OutputTileIterator,
             ElementAccumulator, ElementCompute, EpilogueOp>;
@@ -513,7 +513,7 @@ public:
         if (pEnv_params && isdigit(*pEnv_params)) {
             cudaFuncAttributes attr;
             cudaFuncGetAttributes(&attr, cutlass::Kernel<GemmKernel>);
-    
+
             printf("[GemmGrouped-INT8:]\n");
             printf("group:%d, problem:[%d, %d, %d], gemm_type:%s\n",
                 kNumGroups, shape_m, SHAPE_N, SHAPE_K, GemmTypeS[static_cast<int>(kGemmType)]);
@@ -527,46 +527,23 @@ public:
             printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, int(attr.numRegs), int(attr.localSizeBytes));
         }
 
-        // export PPU_LIB_SHOW_PARAMS=1
+        // export PPU_LIB_PERF_INSTRUMENT=1
+        int id = generate_id();
+        int pid = getpid();
+        int device_id = -1;
+        cudaError_t result = cudaGetDevice(&device_id);
+        if (result != cudaSuccess) {
+            printf("get device id failed\n");
+            return;
+        }
+
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_deep_gemm_params(
-                GemmTypeS[static_cast<int>(kGemmType)], std::string("int8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K
+                GemmTypeS[static_cast<int>(kGemmType)], std::string("int8"), id, kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, device_id, pid
             );
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        char *pEnv_params_dump = std::getenv("dump_group_m");
-        if (pEnv_params_dump && isdigit(*pEnv_params_dump) && kGemmType != GemmType::Normal) {
-            // check if cuda graph captured
-            cudaStreamCaptureStatus captureStatus;
-            cudaStreamIsCapturing(stream, &captureStatus);
-            // add cuda graph mode later
-            if (captureStatus != cudaStreamCaptureStatusNone) {
-                printf("[moe gemm]: dump_group_m not supported in cuda graph mode.");
-                return;
-            }
-
-            static int casedId = 0;
-            std::ostringstream filename;
-            int id = generate_id();
-            printf("id:%d\n", id);
-            filename << "case" << id << "_"
-                     << "int8" << "_"
-                     << "groups" << kNumGroups << "_"
-                     << "m" << shape_m << "_"
-                     << "n" << SHAPE_N << "_"
-                     << "k" << SHAPE_K << "_"
-                     << "em" << expected_m << "_"
-                     << GemmTypeS[static_cast<int>(kGemmType)] << ".dump";
-            std::ifstream file(filename.str().c_str());
-            int fd = open(filename.str().c_str(), O_CREAT | O_WRONLY | O_APPEND, 0666);
-            if (fd != -1 && !file) {
-                if (flock(fd, LOCK_EX | LOCK_NB) != -1)
-                    print_to_file(grouped_layout, kGemmType == GemmType::GroupedContiguous ? shape_m : kNumGroups, filename.str().c_str(), stream);
-                close(fd);
-            }
-        }
 
         typename EpilogueOp::Params linearScalingParams; // TODO: right now it's unused (scaling is done in
                                                          // visitor, no activation needed)
@@ -602,6 +579,39 @@ public:
                 std::string(cutlassGetStatusString(run_status)).c_str());
 
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        char *pEnv_params_dump = std::getenv("PPU_LIB_SHOW_PARAMS");
+        char *pEnv_dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
+        static int target_device_id = pEnv_dump_device != nullptr ? std::stoi(pEnv_dump_device) : 0;
+
+        if (pEnv_params_dump && std::string(pEnv_params_dump) == "2" && kGemmType != GemmType::Normal && target_device_id == device_id) {
+            // check if cuda graph captured
+            cudaStreamCaptureStatus captureStatus;
+            cudaStreamIsCapturing(stream, &captureStatus);
+            // add cuda graph mode later
+            if (captureStatus != cudaStreamCaptureStatusNone) {
+                printf("dump_group_m not supported in cuda graph mode.");
+                return;
+            }
+            std::ostringstream filename;
+            filename << "case" << id << "_"
+                     << GemmTypeS[static_cast<int>(kGemmType)] << "_"
+                     << "int8" << "_"
+                     << "groups" << kNumGroups << "_"
+                     << "m" << shape_m << "_"
+                     << "n" << SHAPE_N << "_"
+                     << "k" << SHAPE_K << "_"
+                     << "em" << expected_m << "_"
+                     << "gpu" << device_id << "_"
+                     << "pid" << pid << ".dump";
+
+            std::ifstream file(filename.str().c_str());
+            int fd = open(filename.str().c_str(), O_CREAT | O_WRONLY | O_APPEND, 0666);
+            if (fd != -1 && !file) {
+                if (flock(fd, LOCK_EX | LOCK_NB) != -1)
+                    print_to_file(grouped_layout, kGemmType == GemmType::GroupedContiguous ? shape_m : kNumGroups,  filename.str().c_str(), stream);
+                close(fd);
+            }
+        }
     }
 };
 

@@ -413,7 +413,7 @@ public:
         if (pEnv_params && isdigit(*pEnv_params)) {
             cudaFuncAttributes attr;
             cudaFuncGetAttributes(&attr, cutlass::Kernel<GemmKernel>);
-    
+
             printf("[GemmGrouped-BF16:]\n");
             printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s\n",
                 kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)]);
@@ -427,42 +427,20 @@ public:
             printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, int(attr.numRegs), int(attr.localSizeBytes));
         }
 
-        // export PPU_LIB_SHOW_PARAMS=1
+        // export PPU_LIB_PERF_INSTRUMENT=1
+        int id = generate_id();
+        int pid = getpid();
+        int device_id = -1;
+        cudaError_t result = cudaGetDevice(&device_id);
+        if (result != cudaSuccess) {
+            printf("get device id failed\n");
+            return;
+        }
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()){
             dg_prof_params.set_deep_gemm_params(
-                GemmTypeS[static_cast<int>(kGemmType)], std::string("bf16"), kNumGroups, shape_m, SHAPE_N, SHAPE_K
+               GemmTypeS[static_cast<int>(kGemmType)], std::string("bf16"), id, kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, device_id, pid
             );
-        }
-    
-        char *pEnv_params_dump = std::getenv("dump_group_m");
-        if (pEnv_params_dump && isdigit(*pEnv_params_dump) && (kGemmType == GemmType::GroupedContiguous || kGemmType == GemmType::GroupedMasked)) {
-            // check if cuda graph captured
-            cudaStreamCaptureStatus captureStatus;
-            cudaStreamIsCapturing(stream, &captureStatus);
-            // add cuda graph mode later
-            if (captureStatus != cudaStreamCaptureStatusNone) {
-                printf("dump_group_m not supported in cuda graph mode.");
-                return;
-            }
-
-            std::ostringstream filename;
-            int id = generate_id();
-            filename << "case" << id << "_"
-                     << "groups" << kNumGroups << "_"
-                     << "m" << shape_m << "_"
-                     << "n" << SHAPE_N << "_"
-                     << "k" << SHAPE_K << "_"
-                     << "em" << expected_m << "_"
-                     << GemmTypeS[static_cast<int>(kGemmType)] << ".dump";
-            
-            std::ifstream file(filename.str().c_str());
-            int fd = open(filename.str().c_str(), O_CREAT | O_WRONLY | O_APPEND, 0666);
-            if (fd != -1 && !file) {
-                if (flock(fd, LOCK_EX | LOCK_NB) != -1)
-                    print_to_file(grouped_layout, kGemmType == GemmType::GroupedContiguous ? shape_m : kNumGroups, filename.str().c_str(), stream);
-                close(fd);
-            }
         }
 
         typename EpilogueOp::Params epilogue_op(
@@ -500,6 +478,40 @@ public:
         if(run_status != cutlass::Status::kSuccess)
             printf("Failed to run cutlass variable batched gemm. Error: %s\n",
                 std::string(cutlassGetStatusString(run_status)).c_str());
+
+        char *pEnv_params_dump = std::getenv("PPU_LIB_SHOW_PARAMS");
+        char *pEnv_dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
+        static int target_device_id = pEnv_dump_device != nullptr ? std::stoi(pEnv_dump_device) : 0;
+
+        if (pEnv_params_dump && std::string(pEnv_params_dump) == "2" && kGemmType != GemmType::Normal && target_device_id == device_id) {
+            // check if cuda graph captured
+            cudaStreamCaptureStatus captureStatus;
+            cudaStreamIsCapturing(stream, &captureStatus);
+            // add cuda graph mode later
+            if (captureStatus != cudaStreamCaptureStatusNone) {
+                printf("dump_group_m not supported in cuda graph mode.");
+                return;
+            }
+            std::ostringstream filename;
+            filename << "case" << id << "_"
+                     << GemmTypeS[static_cast<int>(kGemmType)] << "_"
+                     << "bf16" << "_"
+                     << "groups" << kNumGroups << "_"
+                     << "m" << shape_m << "_"
+                     << "n" << SHAPE_N << "_"
+                     << "k" << SHAPE_K << "_"
+                     << "em" << expected_m << "_"
+                     << "gpu" << device_id << "_"
+                     << "pid" << pid << ".dump";
+
+            std::ifstream file(filename.str().c_str());
+            int fd = open(filename.str().c_str(), O_CREAT | O_WRONLY | O_APPEND, 0666);
+            if (fd != -1 && !file) {
+                if (flock(fd, LOCK_EX | LOCK_NB) != -1)
+                    print_to_file(grouped_layout, kGemmType == GemmType::GroupedContiguous ? shape_m : kNumGroups,  filename.str().c_str(), stream);
+                close(fd);
+            }
+        }
     }
 };
 

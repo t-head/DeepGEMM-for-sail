@@ -11,12 +11,16 @@ public:
 DgProfParam() {}
 
 void initialize_args() {
+  add_argument("case");
   add_argument("gemm_type");
   add_argument("data_type");
-  add_argument("group");
+  add_argument("groups");
   add_argument("m");
   add_argument("n");
   add_argument("k");
+  add_argument("em");
+  add_argument("gpu");
+  add_argument("pid");
 }
 
 template <typename T>
@@ -30,16 +34,19 @@ void add_mha_params(const std::string& key, const T& val) {
 
 void set_deep_gemm_params(std::string gemm_type,
                           std::string data_type,
-                          int group, int m, int n, int k) {
+                          int case_id, int group, int m, int n, int k, int em, int gpu, int pid) {
 
   initialize_args();
-
+  add_mha_params("case", case_id);
   add_mha_params("gemm_type", gemm_type);
   add_mha_params("data_type", data_type);
-  add_mha_params("group", group);
+  add_mha_params("groups", group);
   add_mha_params("m", m);
   add_mha_params("n", n);
   add_mha_params("k", k);
+  add_mha_params("em", em);
+  add_mha_params("gpu", gpu);
+  add_mha_params("pid", pid);
 }
 
 std::string format() {
@@ -155,7 +162,7 @@ private:
       int value = std::stoi(std::string(pEnv_params));
       if (value == 0) {
         show_params_ = false;
-      } else if (value == 1) {
+      } else if (value == 1 || value == 2) {
         show_params_ = true;
       } else {
         printf("Invalid value for PPU_LIB_SHOW_PARAMS : %d\n", value);

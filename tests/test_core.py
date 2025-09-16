@@ -126,7 +126,7 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
             m_indices[actual_end:aligned_end] = -1
             ref_out[start:aligned_end] = x[start:aligned_end] @ y[i].t()
             start = aligned_end
-    
+
     if not cycle:
         ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
 
@@ -260,7 +260,7 @@ def test_m_grouped_gemm_masked(d: torch.dtype, file: str) -> None:
 
             print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
                 f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
-                f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')                
+                f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
     print('passed\n')
 
 
@@ -339,7 +339,7 @@ if __name__ == '__main__':
                         full_path = os.path.join(root, file)
                         dg_cases.append(full_path)
 
-        
+
         total = len(dg_cases)
         for idx, file in enumerate(dg_cases):
             print(f'Profiling {idx + 1}/{total}')

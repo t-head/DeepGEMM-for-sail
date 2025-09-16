@@ -3,7 +3,7 @@ from typing import Tuple
 
 from .gemm_fp8 import get_best_configs
 from .tuner import jit_tuner
-from .utils import get_col_major_tma_aligned_tensor, get_num_sms
+from .utils import get_col_major_tma_aligned_tensor, get_num_sms, ceil_div
 
 # C++ code templates
 includes = ('"../deep_gemm/fp8_gemm.cuh"', )
@@ -85,7 +85,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
     global includes, template
     num_sms = get_num_sms()
     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous=True)
-    expected_m = 0
+    expected_m = ceil_div(m, num_groups)
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices, m, expected_m, num_groups,
             torch.cuda.current_stream(), num_sms, smem_config[0])
