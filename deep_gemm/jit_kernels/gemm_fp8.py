@@ -139,7 +139,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # if k >= 4096 and (best_block_m == 32 and best_block_n == 32):
     #     block_k = 512
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
-    if 128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4:
+    if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4):
         # Unrolling both stages and `num_former_iters` will cause large code size
         stage_candidates = (4, 3, 2)
     for num_stages in stage_candidates:

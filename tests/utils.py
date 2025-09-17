@@ -151,7 +151,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", dtype="bf16", mode="metri
         if mode != "full" and ret != None:
             if ret.returncode == 0:
                 cycle, tc, detail, hbm = read_cycle_from_nculog(log_file)
-                row = [f"'{case.replace(",","_")}'", str(cycle), str(tc), str(hbm), str(cmd), str(detail)]
+                row = [f"'{case.replace(',','_')}'", str(cycle), str(tc), str(hbm), str(cmd), str(detail)]
                 output_lines.append(row)
                 with open(f"{output_file}.csv", "a+") as f:
                     writer = csv.writer(f)

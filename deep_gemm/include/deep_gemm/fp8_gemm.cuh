@@ -558,12 +558,6 @@ public:
             }
         }
         cutlass::device_kernel<GemmKernel><<<grid, block, sharemem_size, stream>>>(params);
-
-        cudaError_t kernel_result = cudaDeviceSynchronize();
-        if (kernel_result != cudaSuccess) {
-            std::cerr << "Error running the CUTLASS kernel. Last CUDA error is: "
-                    << cudaGetErrorString(kernel_result) << std::endl;
-        }
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
     }

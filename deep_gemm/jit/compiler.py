@@ -104,7 +104,7 @@ def put(path, data, is_binary=False):
 
 @functools.lru_cache(maxsize=None)
 def is_ppu1v5_device():
-    device_prop = torch.cuda.get_device_properties()
+    device_prop = torch.cuda.get_device_properties('cuda')
     if device_prop.major == 8 and device_prop.minor == 9:
         return True
     else:
