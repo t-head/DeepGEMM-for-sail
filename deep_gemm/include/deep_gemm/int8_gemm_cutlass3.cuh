@@ -61,10 +61,13 @@ enum class AiuSplitConfig {
 
 template <
   int BlockM,
-  int BlockN
+  int BlockN,
+  int MmaTileM,
+  int MmaTileN
 >
 CUTE_HOST_DEVICE constexpr AiuSplitConfig get_aiu_split_config() {
-  return (BlockM % 48 == 0 || (BlockM == 256 && BlockN == 256)) ? AiuSplitConfig::AiuOnWarp0 : AiuSplitConfig::AiuSplitBaseline;
+  return (((BlockM > 16 ? BlockM : 16) / 2) % MmaTileM != 0 || (BlockM == 256 && BlockN == 256)) ?
+    AiuSplitConfig::AiuOnWarp0 : AiuSplitConfig::AiuSplitBaseline;
 }
 
 
@@ -900,7 +903,9 @@ struct CollectiveMma<
   static constexpr int ScaleMsPerThread = cute::ceil_div(size<0>(TileShape{}), Int<MaxThreadsPerBlock * ScaleGranularity>{});
   static constexpr int ScaleNsPerThread = cute::ceil_div(size<1>(TileShape{}), Int<MaxThreadsPerBlock * ScaleGranularity>{});
 
-  static constexpr auto SplitAIU = get_aiu_split_config<CTA_M, CTA_N>();
+  static constexpr int MmaTileM = TiledMma().template tile_size_mnk<0>();
+  static constexpr int MmaTileN = TiledMma().template tile_size_mnk<1>();
+  static constexpr auto SplitAIU = get_aiu_split_config<CTA_M, CTA_N, MmaTileM, MmaTileN>();
 
   // ScaleA
   using GmemTiledCopyScaleA = decltype(
@@ -1681,7 +1686,9 @@ public:
         static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
         static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
 
-        static constexpr auto SplitAIU = get_aiu_split_config<BLOCK_M, BLOCK_N>();
+        static constexpr int MmaTileM = TiledMma().template tile_size_mnk<0>();
+        static constexpr int MmaTileN = TiledMma().template tile_size_mnk<1>();
+        static constexpr auto SplitAIU = get_aiu_split_config<BLOCK_M, BLOCK_N, MmaTileM, MmaTileN>();
 
         using DefaultOperandA = DefaultGemm_AIU_Operand_v2<SplitAIU, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
         using DefaultOperandB = DefaultGemm_AIU_Operand_v2<SplitAIU, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
@@ -1827,9 +1834,8 @@ public:
                 close(fd);
             }
         }
-        // TODO: query max_active_tb_num
-        int max_active_tb_num = 8; //GemmGrouped::maximum_active_blocks();
 
+        int max_active_tb_num = max_blocks_per_cu;
         const int threadblock_count = num_sms < 20 ? num_sms : num_sms * max_active_tb_num;
         char *pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
