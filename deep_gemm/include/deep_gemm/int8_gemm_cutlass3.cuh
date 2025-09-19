@@ -755,9 +755,10 @@ struct CollectiveMma<
   // b32x4 is not avaliable for nopad interface, as the scale is not 16 byte alinged
   // maybe b32x4 has better perf for the other interface
   using ScaleCopyAtomWidth = cute::uint32_t;
+  static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
   constexpr static uint32_t ScaleGranularity = sizeof(ScaleCopyAtomWidth) / sizeof(float);
-  static constexpr int ScaleMsPerThread = cute::ceil_div(size<0>(TileShape{}), Int<ScaleGranularity>{});
-  static constexpr int ScaleNsPerThread = cute::ceil_div(size<1>(TileShape{}), Int<ScaleGranularity>{});
+  static constexpr int ScaleMsPerThread = cute::ceil_div(size<0>(TileShape{}), Int<MaxThreadsPerBlock * ScaleGranularity>{});
+  static constexpr int ScaleNsPerThread = cute::ceil_div(size<1>(TileShape{}), Int<MaxThreadsPerBlock * ScaleGranularity>{});
 
   // ScaleA
   using GmemTiledCopyScaleA = decltype(
