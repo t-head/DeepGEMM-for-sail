@@ -23,7 +23,7 @@ class JITTuner:
         return rtn
 
     def compile_and_tune(self, name: str, keys: Dict[str, Any], space: tuple,
-                         includes: tuple, arg_defs: tuple, template: str, args: tuple, jit_include_dir: str = None, arch: str = None) -> Runtime:
+                         includes: tuple, arg_defs: tuple, template: str, args: tuple, jit_include_dir: str = None) -> Runtime:
         # NOTES: we always assume the space and template will not change
         # We also assume the GPU device will not be changed
         # NOTES: the function must have no accumulated side effects
@@ -50,7 +50,7 @@ class JITTuner:
 
             # Illegal build must raise errors
             set_jit_include_dir(jit_include_dir)
-            kernels.append((build(name, arg_defs, code, arch), tuned_keys))
+            kernels.append((build(name, arg_defs, code), tuned_keys))
 
         best_runtime, best_time, best_keys = None, None, None
         default_tile_time = None

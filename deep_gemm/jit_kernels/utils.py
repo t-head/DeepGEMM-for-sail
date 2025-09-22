@@ -124,7 +124,7 @@ def get_case_id() -> int:
 
 @functools.lru_cache(maxsize=None)
 def is_ppu1v5_device():
-    device_prop = torch.cuda.get_device_properties()
+    device_prop = torch.cuda.get_device_properties(device='cuda')
     if device_prop.major == 8 and device_prop.minor == 9:
         return True
     else:
@@ -132,7 +132,7 @@ def is_ppu1v5_device():
 
 @functools.lru_cache(maxsize=None)
 def get_sm_count():
-    device_prop = torch.cuda.get_device_properties()
+    device_prop = torch.cuda.get_device_properties(device='cuda')
     return device_prop.multi_processor_count
 
 @functools.lru_cache(maxsize=None)

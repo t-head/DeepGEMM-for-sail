@@ -118,8 +118,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
-        args=args,
-        arch='1.5' if is_ppu1v5_device() else '1.0'
+        args=args
     )
 
     # Run the kernel
@@ -190,8 +189,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tenso
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template_updated,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
-        args=args,
-        arch='1.5' if is_ppu1v5_device() else '1.0'
+        args=args
     )
 
     # Run the kernel
@@ -314,8 +312,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
                         ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
             template=template,
             jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
-            args=args,
-            arch='1.5' if is_ppu1v5_device() else '1.0'
+            args=args
         )
 
     dump_env = os.getenv('dump_group_m')

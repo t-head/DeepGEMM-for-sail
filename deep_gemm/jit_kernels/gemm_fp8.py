@@ -244,8 +244,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
         args=args,
-        jit_include_dir='cutlass3',
-        arch='1.5'
+        jit_include_dir='cutlass3'
     )
 
     # Run the kernel

@@ -107,8 +107,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
         args=args,
-        jit_include_dir='cutlass3',
-        arch='1.5'
+        jit_include_dir='cutlass3'
     )
 
     # Run the kernel
@@ -192,8 +191,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
         args=args,
-        jit_include_dir='cutlass3',
-        arch='1.5'
+        jit_include_dir='cutlass3'
     )
 
     # Run the kernel
