@@ -1,7 +1,7 @@
 import random
 import torch
 from typing import Tuple
-
+import os
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
 from utils import read_numbers_from_file, parse_dump_file
@@ -125,6 +125,7 @@ def test_gemm(file: str) -> None:
     if file is not None:
         num_groups, m, n, k, expected_m_per_group = parse_dump_file(file)
         test_func(m, n, k)
+        print("Passed\n")
         return
 
     for m in (64, 128, 4096):
@@ -132,6 +133,10 @@ def test_gemm(file: str) -> None:
             x_fp8, y_fp8, out, ref_out = construct(m, k, n)
             deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
             diff = calc_diff(out, ref_out)
+            if diff >= 0.001:
+                print("ref_out:", ref_out)
+                print("out:", out)
+                torch.testing.assert_close(out, ref_out, rtol=2e-1, atol=1)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
             if benchmark:
                 # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
@@ -156,6 +161,10 @@ def test_m_grouped_gemm_contiguous(file: str) -> None:
         if not cycle:
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
             diff = calc_diff(out, ref_out)
+            if diff >= 0.001:
+                print("ref_out:", ref_out)
+                print("out:", out)
+                torch.testing.assert_close(out, ref_out, rtol=2e-1, atol=1)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
     if file is not None:
@@ -169,6 +178,10 @@ def test_m_grouped_gemm_contiguous(file: str) -> None:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
             diff = calc_diff(out, ref_out)
+            if diff >= 0.001:
+                print("ref_out:", ref_out)
+                print("out:", out)
+                torch.testing.assert_close(out, ref_out, rtol=2e-1, atol=1)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
             if benchmark:
@@ -197,6 +210,11 @@ def test_m_grouped_gemm_masked(file: str) -> None:
             for j in range(num_groups):
                 diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
                 if (masked_m[j] != 0):
+                    if diff >= 0.001:
+                    # if True:
+                        print(f"ref_out[{j}]:", ref_out[j, :masked_m[j].item()])
+                        print(f"out[{j}]:", out[j, :masked_m[j].item()])
+                        torch.testing.assert_close(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()], rtol=5e-1, atol=2)
                     assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
 
     if file is not None:
@@ -214,6 +232,10 @@ def test_m_grouped_gemm_masked(file: str) -> None:
                     deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m_per_group)
                     for j in range(num_groups):
                         diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
+                        if diff >= 0.001:
+                            print(f"ref_out[{j}]:", ref_out[j, :masked_m[j].item()])
+                            print(f"out[{j}]:", out[j, :masked_m[j].item()])
+                            torch.testing.assert_close(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()], rtol=5e-1, atol=2)
                         assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
                 if benchmark:
                     # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
@@ -229,7 +251,7 @@ def test_m_grouped_gemm_masked(file: str) -> None:
 
                     print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
                         f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
-                        f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s') 
+                        f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
     print("Passed\n")
 
 
@@ -252,13 +274,14 @@ if __name__ == '__main__':
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
     parser.add_argument("--dtype",  default="fp8", type=str, required=False, help='data type of the cases, e.g. fp8, e4m3, e5m2')
+    parser.add_argument('--func', default=None, type=str, choices=["DenseGemm","GroupedContiguous", "GroupedMasked"], required=False, help='target test func')
 
     args = parser.parse_args()
     global cycle
     cycle = 0
     if (args.cycle):
         cycle = 1
-
+    dg_cases = list()
     if args.file is not None or args.caselist is not None:
         if args.file:
             dg_cases = [args.file]
@@ -270,7 +293,10 @@ if __name__ == '__main__':
                 with open(args.caselist, "r") as f:
                     lines = f.readlines()
                     for line in lines:
-                        dg_cases.append(line.strip())
+                        line = line.strip()
+                        if line == "" or line.startswith("#"):
+                            continue
+                        dg_cases.append(line)
             else:
                 print("args.caselist is a folder!")
                 for root, dirs, files in os.walk(args.caselist):
@@ -290,6 +316,16 @@ if __name__ == '__main__':
             else:
                 "invalid dump file\n"
     else:
-        test_gemm(args.file)
-        test_m_grouped_gemm_contiguous(args.file)
-        test_m_grouped_gemm_masked(args.file)
+        if args.func is not None:
+            if "GroupedContiguous" in args.func:
+                test_m_grouped_gemm_contiguous(args.file)
+            elif "GroupedMasked" in args.func:
+                test_m_grouped_gemm_masked(args.file)
+            elif "DenseGemm" in args.func:
+                test_gemm(args.file)
+            else:
+                "invalid func type\n"
+        else:
+            test_gemm(args.file)
+            test_m_grouped_gemm_contiguous(args.file)
+            test_m_grouped_gemm_masked(args.file)

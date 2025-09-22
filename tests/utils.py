@@ -45,17 +45,34 @@ def worker(gpu_id, cases, output, device, dtype, mode, acc_check):
         run_cycle_on_device(cases, output, device, _d, mode, acc_check, gpu_id)
 
 def read_detail_from_nculog(filename):
-    detail_info = {}
+    detail_info = {'m': 0, 'n': 0, 'k': 0}
     keyword_pattern = r"(GemmGrouped-BF16|GemmGrouped-FP8|GemmGrouped-INT8|GemV-BF16|GemV-Small-BF16)"
-    pattern_dict = {"group": r"group:(\d+)", "problem": r"problem:\[(\d+), (\d+), (\d+)\]", "expected_m":r"expected_m:(\d+)", 
+    pattern_dict = {"group": r"group:(\d+)", "problem": r"problem:\[(\d+), (\d+), (\d+)\]", "expected_m":r"expected_m:(\d+)", "gemm_type": r"gemm_type:(\w+)",
     "ThreadblockShape": r"ThreadblockShape\[(\d+), (\d+), (\d+)\]" , "WarpShape": r"WarpShape\[(\d+), (\d+), (\d+)\]", "kNumStages":r"kNumStages:(\d+)",
     "num_sms": r"num_sms:(\d+)", "max_active_tb_num": r"max_active_tb_num:(\d+)", "threadblock_count": r"threadblock_count:(\d+)",
-    "smem_size":r"smem_size:(\d+)", "vreg": r"vreg:(\d+)", "stack": r"stack:(\d+)"}
+    "smem_size":r"smem_size:(\d+)", "vreg": r"vreg:(\d+)", "stack": r"stack:(\d+)",
+    "BlockSize":r"BlockSize:(\d+)", "NPerThread":r"NPerThread:(\d+)", "ThreadPerN":r"ThreadPerN:(\d+)", "NPerBlock":r"NPerBlock:(\d+)", "SWZL_SIZE_M":r"SWZL_SIZE_M:(\d+)"}
     with open(filename, newline='') as log_file:
         lines = log_file.readlines()
         for idx, line in enumerate(lines):
-            print(idx)
-
+            keyword_match = re.search(keyword_pattern, line)
+            if keyword_match:
+                target_lines = "".join(lines[idx+1:idx+10])
+                for _info, _pattern in pattern_dict.items():
+                    _info_match = re.search(_pattern, target_lines)
+                    if _info_match:
+                        if len(_info_match.groups()) == 1 :
+                            detail_info[_info] = _info_match.groups()[0]
+                        else:
+                            detail_info[_info] = _info_match.groups()
+                    else:
+                        detail_info[_info] = " "
+                break
+    detail_info['m'] = detail_info['problem'][0]
+    detail_info['n'] = detail_info['problem'][1]
+    detail_info['k'] = detail_info['problem'][2]
+    # print(detail_info)
+    return detail_info
 
 
 # devices = {
@@ -70,8 +87,8 @@ def read_cycle_from_nculog(filename):
     kernel_pattern = r"(.*)Device\s+\d+"
     cycles_pattern = "__cycles_active.max"
     global tc_pattern
-    tc_pattern = "we_pipe_tensor_cycles_active"
-    #tc_pattern = "pct_of_peak_sustained_active"
+    # tc_pattern = "we_pipe_tensor_cycles_active"
+    tc_pattern = "pct_of_peak_sustained_active"
     hbm_pattern = "bytes_read"
     kernel_list = []
     cycles_list = []
@@ -130,11 +147,7 @@ def clean_casename(name):
 def run_cycle_on_device(cases, output_file, dev="gpu", dtype="bf16", mode="metrics", acc_check=False, gpu_id="0"):
     output_lines = list()
     headers = ["casename","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
-    if not os.path.exists(f"{output_file}.csv"):
-        with open(f"{output_file}.csv", "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-    # new_row=["casename"]  metrics.get("name", [])  ["detail"] 
+    # new_row=["casename"]  metrics.get("name", [])  ["detail"]
     # output_lines.append(new_row)
     if not os.path.exists("./logs"):
         os.makedirs("./logs")
@@ -164,12 +177,11 @@ def run_cycle_on_device(cases, output_file, dev="gpu", dtype="bf16", mode="metri
             if mode == "show_log":
                 os.environ["show_log"] = "1"
             metrics_string = "sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__bytes.read.sum.pct_of_peak_sustained_elapsed" if dev=="gpu" else \
-                            "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed"
-            #                 "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format(dtype)
-                           
-            
-            cmd = '{} --clock-control none --metrics="{}"  \
-                --page=details python {} --cycle --file {} --dtype {} \
+                            "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format(dtype)
+                            # "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed"
+
+            cmd = '{} --clock-control none --kernel-name "regex:Kernel|device_kernel" --metrics="{}"  \
+                --page=details python {}  --cycle --file {} --dtype {} \
                 2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, script, case, dtype, log_file)
 
         ret = run_cmd(cmd)
@@ -180,18 +192,41 @@ def run_cycle_on_device(cases, output_file, dev="gpu", dtype="bf16", mode="metri
                 cycle, tc, detail, hbm = read_cycle_from_nculog(log_file)
                 if mode == "show_log":
                     other_metrics = read_detail_from_nculog(log_file)
-        if cycle != 0:
-            result = "Pass"
+                    print(other_metrics)
+
+        if acc_check:
+            # check accuracy
+            cmd = "python {} --file {} --dtype {} ".format(script, case, dtype)
+            ret = run_cmd(cmd)
+            if ret.returncode == 0:
+                result = "Pass"
+            else:
+                result = "Fail"
+                print("ERROR: failed to pass accuracy test, please check!!")
         else:
-            print("ERROR: failed to run cmd, please check!!")
-            if len(cases) == 1:
-                exit(-1) # only one case, fail and exit
+            # only perf, check cycle found
+            if cycle != 0:
+                result = "Pass"
+            else:
+                result = "Fail"
+                print("ERROR: failed to find cycle info, please check!!")
         row =  [f"'{case.replace(',','_')}_{dtype}'", str(cycle), str(tc), str(hbm), dtype, result, str(cmd), str(detail)]
+        if mode == "show_log":
+            if "problem" not in headers:
+                headers.extend(other_metrics.keys())
+            row.extend(other_metrics.values())
         output_lines.append(row)
+        if not os.path.exists(f"{output_file}.csv"):
+            with open(f"{output_file}.csv", "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
         with open(f"{output_file}.csv", "a+") as f:
             writer = csv.writer(f)
             writer.writerow(row)
             print("write result succeed")
+
+        if len(cases) == 1 and result == "Fail":
+            exit(-1) # only one case, fail and exit
 
     output_file = output_file + '.csv'
     if len(cases) == 1:
@@ -200,7 +235,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", dtype="bf16", mode="metri
             for row in output_lines:
                 writer.writerow(row)
             print("write result to local.log succeed")
-    
+
 def read_numbers_from_file(file_path):
     numbers = []
     with open(file_path, 'r') as file:

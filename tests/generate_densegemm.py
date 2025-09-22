@@ -10,7 +10,7 @@ if input_casepath != "":
     with open(output_file, "a") as f:
         f.writelines("\n".join(cases))
 
-m_list = [2048, 4096]
+m_list = [2048, 4096, 132, 256]
 nk_dict ={
 "dpsk-v3_tp8":
 [(512,7168),
@@ -24,7 +24,7 @@ nk_dict ={
 (7168,2304)],
 
 "qwen3_tp8":
-[(1536,4096),
+[(1280,4096),
 (4096,1024),
 (4096,192),
 (384,4096)],

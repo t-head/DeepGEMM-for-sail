@@ -37,7 +37,10 @@ if __name__ == '__main__':
             with open(args.caselist, "r") as f:
                 lines = f.readlines()
                 for line in lines:
-                    dg_cases.append(line.strip())
+                    line = line.strip()
+                    if line == "" or line.startswith("#"):
+                        continue
+                    dg_cases.append(line)
         else:
             print("args.caselist is a folder!")
             for root, dirs, files in os.walk(args.caselist):

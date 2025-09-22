@@ -57,11 +57,13 @@ def test_gemm(d: torch.dtype, file = None) -> None:
             if diff >= 0.001:
                 print("ref_out:", ref_out)
                 print("out:", out)
+                torch.testing.assert_close(out, ref_out, rtol=2e-1, atol=1)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
     if file is not None:
         num_groups, m, n, k, expected_m_per_group = parse_dump_file(file)
         test_func(m, n, k, d)
+        print("Passed\n")
         return
 
     for m in (64, 128, 4096):
@@ -72,6 +74,10 @@ def test_gemm(d: torch.dtype, file = None) -> None:
             else:
                 deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
             diff = calc_diff(out, ref_out)
+            if diff >= 0.001:
+                print("ref_out:", ref_out)
+                print("out:", out)
+                torch.testing.assert_close(out, ref_out, rtol=2e-1, atol=1)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
             if benchmark:
@@ -184,6 +190,10 @@ def test_m_grouped_gemm_contiguous(d: torch.dtype, file=None) -> None:
         if not cycle:
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
             diff = calc_diff(out, ref_out)
+            if diff >= 0.001:
+                print("ref_out:", ref_out)
+                print("out:", out)
+                torch.testing.assert_close(out, ref_out, rtol=2e-1, atol=1)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
     if file is not None:
@@ -229,6 +239,11 @@ def test_m_grouped_gemm_masked(d: torch.dtype, file: str) -> None:
             for j in range(num_groups):
                 diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
                 if (masked_m[j] != 0):
+                    if diff >= 0.001:
+                    # if True:
+                        print(f"ref_out[{j}]:", ref_out[j, :masked_m[j].item()])
+                        print(f"out[{j}]:", out[j, :masked_m[j].item()])
+                        torch.testing.assert_close(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()], rtol=5e-1, atol=2)
                     assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
 
     if file is not None:
@@ -277,6 +292,10 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
         if not cycle:
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
             diff = calc_diff(out, ref_out)
+            if diff >= 0.0015:
+                print("ref_out:", ref_out)
+                print("out:", out)
+                torch.testing.assert_close(out, ref_out, rtol=5e-1, atol=2)
 
             assert diff < 0.0015, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
@@ -311,7 +330,7 @@ if __name__ == '__main__':
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
     parser.add_argument('--dtype', default="bf16", type=str, choices=["int8","bf16", "all"], required=False, help='data type of the cases')
-    parser.add_argument('--func', default=None, type=str, choices=["DenseGemm","GroupedContiguous", "GroupedMasked", "DenseGemm"], required=False, help='target test func')
+    parser.add_argument('--func', default=None, type=str, choices=["DenseGemm","GroupedContiguous", "GroupedMasked", "GroupedNoPad"], required=False, help='target test func')
 
     args = parser.parse_args()
     global cycle
@@ -320,6 +339,7 @@ if __name__ == '__main__':
         cycle = 1
     if args.dtype == "all":
         args.dtype = "int8,bf16"
+    dg_cases = list()
     if args.file is not None or args.caselist is not None:
         if args.file:
             dg_cases = [args.file]
@@ -331,7 +351,10 @@ if __name__ == '__main__':
                 with open(args.caselist, "r") as f:
                     lines = f.readlines()
                     for line in lines:
-                        dg_cases.append(line.strip())
+                        line = line.strip()
+                        if line == "" or line.startswith("#"):
+                            continue
+                        dg_cases.append(line)
             else:
                 print("args.caselist is a folder!")
                 for root, dirs, files in os.walk(args.caselist):
@@ -367,17 +390,17 @@ if __name__ == '__main__':
                 test_m_grouped_gemm_nopad(torch.int8, args.file)
                 test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
             elif "DenseGemm" in args.func:
-                test_gemm(torch.int8)
-                test_gemm(torch.bfloat16)
+                test_gemm(torch.int8, args.file)
+                test_gemm(torch.bfloat16, args.file)
             else:
                 "invalid test function\n"
         else:
-            test_gemm(torch.int8)
+            test_gemm(torch.int8, args.file)
             test_m_grouped_gemm_contiguous(torch.int8, args.file)
             test_m_grouped_gemm_masked(torch.int8, args.file)
             test_m_grouped_gemm_nopad(torch.int8, args.file)
 
-            test_gemm(torch.bfloat16)
+            test_gemm(torch.bfloat16, args.file)
             test_m_grouped_gemm_contiguous(torch.bfloat16, args.file)
             test_m_grouped_gemm_masked(torch.bfloat16, args.file)
             test_m_grouped_gemm_nopad(torch.bfloat16, args.file)
