@@ -48,7 +48,7 @@ inline int compute_occupancy_for_kernel()
   cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &max_active_blocks, cutlass::device_kernel<GemmKernel>, GemmKernel::MaxThreadsPerBlock, smem_size);
 
-  printf("compute_occupancy_for_kernel, smem_size = %d, max_active_blocks = %d\n", smem_size, max_active_blocks);
+  // printf("compute_occupancy_for_kernel, smem_size = %d, max_active_blocks = %d\n", smem_size, max_active_blocks);
 //   max_active_blocks = 12;
   return max_active_blocks;
 }
@@ -1132,11 +1132,13 @@ struct CollectiveMma<
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
-      copy_aiu_v2<SplitAIU>(
-        gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
-        gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
-        warp_idx
-      );
+      if (k_tile_count > 0) {
+        copy_aiu_v2<SplitAIU>(
+          gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
+          gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
+          warp_idx
+        );
+      }
       cp_async_fence();
       --k_tile_count;
       ++k_tile_iter;
@@ -1768,9 +1770,9 @@ public:
         dim3 const grid = GemmKernel::get_grid_shape(params);
         int smem_size_kernel = GemmKernel::SharedStorageSize;
 
-        std::cout << "block = " << block << std::endl;
-        std::cout << "grid = " << grid << std::endl;
-        std::cout << "smem_size_kernel = " << smem_size_kernel << std::endl;
+        // std::cout << "block = " << block << std::endl;
+        // std::cout << "grid = " << grid << std::endl;
+        // std::cout << "smem_size_kernel = " << smem_size_kernel << std::endl;
 
         // export PPU_LIB_PERF_INSTRUMENT=1
         int id = generate_id();
