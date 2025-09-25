@@ -114,6 +114,26 @@ def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
     aligned_x = aligned_x[:, :m, :]
     return aligned_x.squeeze(0) if remove_dim else aligned_x
 
+def get_col_major_tensor(x: torch.Tensor) -> torch.Tensor:
+    assert x.dim() in (2, 3), "Only 2-D or 3-D tensors supported"
+
+    squeeze_dim = False
+    if x.dim() == 2:
+        x = x.unsqueeze(0)
+        squeeze_dim = True
+
+    B, M, N = x.shape
+
+    col_major = torch.empty((B, N, M), dtype=x.dtype, device=x.device)
+    col_major = col_major.transpose(-2, -1)
+    
+    col_major[...] = x
+
+    if squeeze_dim:
+        col_major = col_major.squeeze(0)
+
+    return col_major
+
 
 def get_case_id() -> int:
     if not hasattr(get_case_id, 'case_id'):

@@ -10,6 +10,7 @@ from .jit_kernels import (
     ceil_div,
     set_num_sms, get_num_sms,
     get_col_major_tma_aligned_tensor,
+    get_col_major_tensor,
     get_m_alignment_for_contiguous_layout,
     m_grouped_gemm_int8_int8_bf16_nt_masked,
     m_grouped_gemm_int8_int8_bf16_nt_contiguous,

@@ -21,6 +21,7 @@ from .m_grouped_gemm_fp8 import (
 from .utils import (
     ceil_div, set_num_sms, get_num_sms, get_case_id,
     get_col_major_tma_aligned_tensor,
+    get_col_major_tensor,
     get_m_alignment_for_contiguous_layout,
     get_search_space
 )
