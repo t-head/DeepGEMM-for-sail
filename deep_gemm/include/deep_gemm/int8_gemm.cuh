@@ -83,9 +83,7 @@ public:
 
     // using ProblemVisitor =  DeepGeemProblemVisitor<ThreadblockShape>;
     using ProblemVisitor = ProblemVisitor_;
-
-    using layoutT_ = ProblemVisitor::layoutT_;
-
+    
     using EpilogueOutputOp =
         typename Epilogue::Visitor::ElementwiseFunctor;
 
@@ -110,7 +108,7 @@ public:
         int64_t gemm_n;
         int64_t gemm_k;
 
-        layoutT_* grouped_layout;
+        int* grouped_layout;
 
         // in-order to compatility with base_group
         cutlass::gemm::GemmCoord* host_problem_sizes {nullptr};
@@ -146,7 +144,7 @@ public:
         Arguments(int problem_count, int threadblock_count,
             typename Mma::IteratorA::TensorRef ref_A, typename Mma::IteratorB::TensorRef ref_B,
             TensorRefC ref_D,
-            int64_t gemm_m, int64_t gemm_n, int64_t gemm_k, layoutT_* grouped_layout,
+            int64_t gemm_m, int64_t gemm_n, int64_t gemm_k, int* grouped_layout,
             TensorRefAlphaCol ref_alpha_col_, TensorRefAlphaRow ref_alpha_row_,
             int64_t batch_stride_A_, int64_t batch_stride_B_,
             typename EpilogueVisitor::Arguments epilogue_visitor_)
@@ -437,18 +435,12 @@ class Gemm {
 public:
     Gemm() = default;
 
-    using layoutT = typename std::conditional<
-                    kGemmType == GemmType::GroupedNoPad,
-                    int64_t,
-                    int32_t
-                >::type;
-
     static uint32_t generate_id() {
         static uint32_t id = 0;
         return ++id;
     }
 
-    static void run(__nv_bfloat16* gmem_d, layoutT* grouped_layout,
+    static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
                     uint32_t shape_m, uint32_t expected_m, int8_t* gmem_a, float* scales_a,
                     int8_t * gmem_b, float* scales_b,
                     cudaStream_t stream, int num_sms, uint32_t smem_size) {
