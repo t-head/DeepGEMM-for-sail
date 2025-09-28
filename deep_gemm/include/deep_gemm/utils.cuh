@@ -13,6 +13,15 @@ __host__ __device__ __forceinline__ void host_device_printf(const char* format, 
 #define printf host_device_printf
 #endif
 
+enum class GemmType {
+    DenseGemm,
+    GroupedContiguous,
+    GroupedMasked,
+    GroupedNoPad
+};
+
+const char* GemmTypeS[] = { "DenseGemm", "GroupedContiguous", "GroupedMasked", "GroupedNoPad"};
+
 class AssertionException : public std::exception {
 private:
     std::string message{};
@@ -66,38 +75,3 @@ __device__ __host__ constexpr T constexpr_gcd(T a, T b) {
         exit(EXIT_FAILURE); \
     } \
 }
-
-template<typename T>
-void print_to_file(const T*           result,
-                   const int          size,
-                   const char*        file,
-                   cudaStream_t       stream    = 0,
-                   std::ios::openmode open_mode = std::ios::out);
-
-template<typename T>
-void print_to_file(
-    const T* result, const int size, const char* file, cudaStream_t stream, std::ios::openmode open_mode) {
-    cudaDeviceSynchronize();
-    
-    CHECK_CUDA(cudaGetLastError());
-    printf("[INFO] file: %s with size %d.\n", file, size);
-    std::ofstream outFile(file, open_mode);
-    if (outFile) {
-        T* tmp = new T[size];
-        CHECK_CUDA(cudaMemcpyAsync(tmp, result, sizeof(T) * size, cudaMemcpyDeviceToHost, stream));
-        if constexpr(std::is_integral<T>::value) {
-            outFile << std::fixed << std::setprecision(0);
-        }
-        for (int i = 0; i < size; ++i) {
-            outFile << tmp[i] << std::endl;
-        }
-        delete[] tmp;
-    } else {
-        throw std::runtime_error(std::string("[ERROR] Cannot open file: ") + file + "\n");
-    }
-    cudaDeviceSynchronize();
-    CHECK_CUDA(cudaGetLastError());
-}
-
-template void
-print_to_file(const int* result, const int size, const char* file, cudaStream_t stream, std::ios::openmode open_mode);

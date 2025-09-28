@@ -6,10 +6,6 @@
 #include "profiling_interface.hpp"
 
 #include <iostream>
-#include <fstream>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/file.h>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
@@ -1248,11 +1244,6 @@ class Gemm {
 public:
     Gemm() = default;
 
-    static uint32_t generate_id() {
-        static uint32_t id = 0;
-        return ++id;
-    }
-
     static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
                     uint32_t shape_m, uint32_t expected_m, __nv_bfloat16* gmem_a, __nv_bfloat16* gmem_b,
                     cudaStream_t stream, int num_sms, uint32_t smem_size) {
@@ -1386,59 +1377,17 @@ public:
         // std::cout << "grid = " << grid << std::endl;
         // std::cout << "smem_size_kernel = " << smem_size_kernel << std::endl;
 
-        // export PPU_LIB_PERF_INSTRUMENT=1
-        int id = generate_id();
-        int pid = getpid();
-        int device_id = -1;
-        cudaError_t result = cudaGetDevice(&device_id);
-        if (result != cudaSuccess) {
-            printf("get device id failed\n");
-            return;
-        }
-
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()){
-            dg_prof_params.set_deep_gemm_params(
-                GemmTypeS[static_cast<int>(kGemmType)], std::string("bf16"), id, kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, device_id, pid
+            dg_prof_params.set_params(
+                kGemmType, std::string("bf16"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
+                grouped_layout, stream
             );
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
         cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
-        char *pEnv_params_dump = std::getenv("PPU_LIB_SHOW_PARAMS");
-        char *pEnv_dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
-        static int target_device_id = pEnv_dump_device != nullptr ? std::stoi(pEnv_dump_device) : 0;
-
-        if (pEnv_params_dump && std::string(pEnv_params_dump) == "2" && kGemmType != GemmType::Normal && target_device_id == device_id) {
-            // check if cuda graph captured
-            cudaStreamCaptureStatus captureStatus;
-            cudaStreamIsCapturing(stream, &captureStatus);
-            // add cuda graph mode later
-            if (captureStatus != cudaStreamCaptureStatusNone) {
-                printf("dump_group_m not supported in cuda graph mode.");
-                return;
-            }
-            std::ostringstream filename;
-            filename << "case" << id << "_"
-                     << GemmTypeS[static_cast<int>(kGemmType)] << "_"
-                     << "bf16" << "_"
-                     << "groups" << kNumGroups << "_"
-                     << "m" << shape_m << "_"
-                     << "n" << SHAPE_N << "_"
-                     << "k" << SHAPE_K << "_"
-                     << "em" << expected_m << "_"
-                     << "gpu" << device_id << "_"
-                     << "pid" << pid << ".dump";
-
-            std::ifstream file(filename.str().c_str());
-            int fd = open(filename.str().c_str(), O_CREAT | O_WRONLY | O_APPEND, 0666);
-            if (fd != -1 && !file) {
-                if (flock(fd, LOCK_EX | LOCK_NB) != -1)
-                    print_to_file(grouped_layout, kGemmType == GemmType::GroupedContiguous ? shape_m : kNumGroups,  filename.str().c_str(), stream);
-                close(fd);
-            }
-        }
 
         int max_active_tb_num = max_blocks_per_cu;
         const int threadblock_count = num_sms < 20 ? num_sms : num_sms * max_active_tb_num;

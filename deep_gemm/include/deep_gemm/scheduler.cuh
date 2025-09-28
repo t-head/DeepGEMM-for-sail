@@ -8,14 +8,6 @@
 
 namespace deep_gemm {
 
-enum class GemmType {
-    Normal,
-    GroupedContiguous,
-    GroupedMasked,
-    GroupedNoPad
-};
-
-const char* GemmTypeS[] = { "Normal", "GroupedContiguous", "GroupedMasked", "GroupedNoPad"};
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
@@ -115,7 +107,7 @@ struct Scheduler
         num_n_blocks = cutlass::ceil_div(params_.gemm_n, ThreadblockShape::kN);
 
         curr_group_idx = 0;
-        if constexpr (kGemmType == GemmType::Normal) {
+        if constexpr (kGemmType == GemmType::DenseGemm) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if (kGemmType == GemmType::GroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
@@ -131,7 +123,7 @@ struct Scheduler
     template <bool kIgnoreGroupedForGroupedContiguous=true>
     CUTLASS_DEVICE uint32_t get_global_idx(const uint32_t shape_dim, const uint32_t block_size,
                                                     const uint32_t& block_idx, const uint32_t& m_block_idx=0) {
-        if constexpr (kGemmType == GemmType::Normal) {
+        if constexpr (kGemmType == GemmType::DenseGemm) {
             return block_idx * block_size;
         } else if constexpr (kGemmType == GemmType::GroupedContiguous) {
             auto offset = kIgnoreGroupedForGroupedContiguous ? 0 : __ldg(params.grouped_layout + m_block_idx * ThreadblockShape::kM);

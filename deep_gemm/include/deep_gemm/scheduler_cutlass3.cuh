@@ -4,6 +4,7 @@
     \brief Parameters structures for deepgemm schedulers
 */
 
+#include "utils.cuh"
 #include "cutlass/coord.h"
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/workspace.h"
@@ -12,27 +13,9 @@
 #include "cutlass/gemm_coord.hpp"
 ////////////////////////////////////////////////////////////////////////////////
 
-const char* GemmTypeS[] = { "Normal", "GroupedContiguous", "GroupedMasked", "GroupedNoPad"};
-
 // namespace cutlass::gemm::kernel {
 namespace deep_gemm {
 using cutlass::KernelHardwareInfo;
-template <typename T>
-__device__ __host__ constexpr T ceil_div(T a, T b) {
-    return (a + b - 1) / b;
-}
-
-template <typename T>
-__device__ __host__ constexpr T constexpr_gcd(T a, T b) {
-    return b == 0 ? a : constexpr_gcd(b, a % b);
-}
-
-enum class GemmType {
-    Normal,
-    GroupedContiguous,
-    GroupedMasked,
-    GroupedNoPad
-};
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
@@ -94,7 +77,7 @@ struct DeepGemmScheduler {
 
     CUTLASS_DEVICE explicit DeepGemmScheduler(Params const& params_) : params(params_) {
         num_aligned_m_blocks = ceil_div(params_.shape_m, BLOCK_M);
-        if (kGemmType == GemmType::Normal) {
+        if (kGemmType == GemmType::DenseGemm) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if (kGemmType == GemmType::GroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
@@ -131,7 +114,7 @@ struct DeepGemmScheduler {
     template <bool kIgnoreGroupedForGroupedContiguous=true>
     CUTLASS_DEVICE uint32_t get_global_idx(const uint32_t shape_dim, const uint32_t block_size,
                                            const uint32_t& block_idx, const uint32_t& m_block_idx=0) {
-        if (kGemmType == GemmType::Normal) {
+        if (kGemmType == GemmType::DenseGemm) {
             return block_idx * block_size;
         } else if (kGemmType == GemmType::GroupedContiguous) {
             auto offset = kIgnoreGroupedForGroupedContiguous ? 0 : __ldg(params.grouped_layout + m_block_idx * BLOCK_M);
@@ -212,7 +195,7 @@ struct DeepGemmScheduler {
     // Returns the problem size for the current problem
     __device__ __forceinline__ int32_t curr_problem_m(const Params& param) const
     {
-        if constexpr (kGemmType == GemmType::Normal || kGemmType == GemmType::GroupedContiguous) {
+        if constexpr (kGemmType == GemmType::DenseGemm || kGemmType == GemmType::GroupedContiguous) {
             return param.shape_m;
         } else if constexpr (kGemmType == GemmType::GroupedMasked) {
             return param.shape_m;

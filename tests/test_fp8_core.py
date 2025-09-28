@@ -3,9 +3,10 @@ import torch
 from typing import Tuple
 import os
 import deep_gemm
-from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tensor, get_m_alignment_for_contiguous_layout
+from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
 from utils import read_numbers_from_file, parse_dump_file
-
+from utils import judge_device_type
+use_ppu = judge_device_type()
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(1) % 128 == 0
     m, n = x.shape
@@ -35,7 +36,11 @@ def construct(m: int, k: int, n: int) -> \
     x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
 
     # Transpose earlier so that the testing will not trigger transposing kernels
-    x_fp8 = (x_fp8[0], get_col_major_tensor(x_fp8[1]))
+    if use_ppu:
+        from deep_gemm import  get_col_major_tensor
+        x_fp8 = (x_fp8[0], get_col_major_tensor(x_fp8[1]))
+    else:
+        x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
 
     return x_fp8, y_fp8, out, ref_out
 
@@ -45,7 +50,7 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
         index = read_numbers_from_file(file)
         m_indices = torch.tensor(index, device='cuda', dtype=torch.int32)
         m = expected_m_per_group
-    else :
+    else:
         alignment = get_m_alignment_for_contiguous_layout()
         group_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
         m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
@@ -79,7 +84,11 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
     y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, ceil_div(n, 128), k // 128), device='cuda', dtype=torch.float))
     for i in range(num_groups):
         y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
-    x_fp8 = (x_fp8[0], get_col_major_tensor(x_fp8[1]))
+    if use_ppu:
+        from deep_gemm import  get_col_major_tensor
+        x_fp8 = (x_fp8[0], get_col_major_tensor(x_fp8[1]))
+    else:
+        x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
 
     return m, x_fp8, y_fp8, m_indices, out, ref_out
 
@@ -106,7 +115,11 @@ def construct_masked_grouped(num_groups: int, max_m: int, expected_m_per_group: 
         y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
 
     # Transpose earlier so that the testing will not trigger transposing kernels
-    x_fp8 = (x_fp8[0], get_col_major_tensor(x_fp8[1]))
+    if use_ppu:
+        from deep_gemm import  get_col_major_tensor
+        x_fp8 = (x_fp8[0], get_col_major_tensor(x_fp8[1]))
+    else:
+        x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, masked_m, out, ref_out
 
 
@@ -325,7 +338,7 @@ if __name__ == '__main__':
             elif "DenseGemm" in args.func:
                 test_gemm(args.file)
             else:
-                "invalid func type\n"
+                print("invalid func type\n")
         else:
             test_gemm(args.file)
             test_m_grouped_gemm_contiguous(args.file)

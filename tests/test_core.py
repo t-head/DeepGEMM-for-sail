@@ -5,43 +5,9 @@ import os
 
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_m_alignment_for_contiguous_layout
-from utils import read_numbers_from_file, parse_dump_file
-
-def per_token_cast_to_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2
-    m, n = x.shape
-
-    x_view = x.view(m, -1, n)
-    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-
-    scale = 127.0 / x_amax.unsqueeze(2)
-    x_normalized = x_view * scale
-    x_int8 = x_normalized.round().clamp(-128, 127).to(torch.int8)
-    x_int8 = x_int8.view(m, -1)
-    return x_int8, (x_amax / 127.0).view(m, -1)
-
-def calc_diff(x, y):
-    x, y = x.double(), y.double()
-    denominator = (x * x + y * y).sum()
-    sim = 2 * (x * y).sum() / denominator
-    return 1 - sim
-
-def construct(m: int, k: int, n: int, d: torch.dtype) -> \
-        Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor], torch.Tensor]:
-    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
-    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
-    if not cycle:
-        ref_out = x @ y.t()
-    else:
-        ref_out = torch.empty_like(out)
-
-    if d == torch.bfloat16:
-        return x, y, out, ref_out
-    else:
-        x_int8, y_int8 = per_token_cast_to_int8(x), per_token_cast_to_int8(y)
-        return x_int8, y_int8, out, ref_out
-
+from utils import read_numbers_from_file, parse_dump_file, per_token_cast_to_int8
+from utils import calc_diff, construct, construct_contiguous_grouped, construct_grouped_masked
+from utils import set_cycle, cycle
 def test_gemm(d: torch.dtype, file = None) -> None:
     print('Testing GEMM:')
 
@@ -97,91 +63,11 @@ def test_gemm(d: torch.dtype, file = None) -> None:
                     f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     print("Passed\n")
 
-def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, file: str, alignment: int) -> \
-        Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-
-    if file is not None:
-        index = read_numbers_from_file(file)
-        m_indices = torch.tensor(index, device='cuda', dtype=torch.int32)
-        m = expected_m_per_group
-    else:
-        group_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
-        m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
-        m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
-
-    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
-
-    x = x.to('cpu')
-    y = y.to('cpu')
-
-    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
-    ref_out = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
-
-    if file is not None:
-        if not cycle:
-            for i, group in enumerate(m_indices):
-                if group != -1 and not cycle:
-                    ref_out[i] = x[i] @ y[group].t()
-    else:
-        start = 0
-        for i, group_m in enumerate(group_ms):
-            actual_end = start + group_m
-            aligned_end = start + ceil_div(group_m, alignment) * alignment
-            m_indices[start:actual_end] = i
-            m_indices[actual_end:aligned_end] = -1
-            ref_out[start:aligned_end] = x[start:aligned_end] @ y[i].t()
-            start = aligned_end
-
-    if not cycle:
-        ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
-
-    if d == torch.bfloat16:
-        return m, x.to('cuda'), y.to('cuda'), m_indices, out, ref_out.to('cuda')
-    else:
-        x_int8 = per_token_cast_to_int8(x)
-        y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
-        for i in range(num_groups):
-            y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
-
-        return m, (x_int8[0].to("cuda"), x_int8[1].to("cuda")), (y_int8[0].to("cuda"), y_int8[1].to("cuda")), m_indices, out, ref_out.to('cuda')
-
-def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, file: str):
-    x = torch.randn((num_groups, max_m, k), device='cpu', dtype=torch.bfloat16)
-    y = torch.randn((num_groups, n, k), device='cpu', dtype=torch.bfloat16)
-
-    out = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
-    if not cycle:
-        ref_out = torch.einsum('gmk,gnk->gmn', x, y)
-    else:
-        ref_out = torch.empty_like(out)
-
-    # Construct mask
-    if file is not None:
-        list_m = read_numbers_from_file(file)
-        masked_m = torch.tensor(list_m, device='cuda', dtype=torch.int)
-    else:
-        masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
-        for j in range(num_groups):
-            masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
-    assert masked_m.amax().item() <= max_m
-
-    if d == torch.bfloat16:
-        return x.to('cuda'), y.to('cuda'), masked_m, out, ref_out.to('cuda')
-    else:
-        x_int8 = (torch.empty_like(x, dtype=torch.int8), torch.empty((num_groups, max_m, 1), device='cpu', dtype=torch.float))
-        y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
-        for i in range(num_groups):
-            x_int8[0][i], x_int8[1][i] = per_token_cast_to_int8(x[i])
-            y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
-
-        return (x_int8[0].to("cuda"), x_int8[1].to("cuda")), (y_int8[0].to("cuda"), y_int8[1].to("cuda")), masked_m, out, ref_out.to('cuda')
-
 def test_m_grouped_gemm_contiguous(d: torch.dtype, file=None) -> None:
     print('Testing grouped contiguous GEMM:')
 
-    def test_func():
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, d, file, get_m_alignment_for_contiguous_layout())
+    def test_func(num_groups, m, expected_m_per_group, n, k):
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, expected_m_per_group, k, n, d, file, get_m_alignment_for_contiguous_layout())
         if (d == torch.bfloat16):
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
         else:
@@ -197,15 +83,15 @@ def test_m_grouped_gemm_contiguous(d: torch.dtype, file=None) -> None:
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
     if file is not None:
-        num_groups, expected_m_per_group, n, k, m = parse_dump_file(file)
-        test_func()
+        num_groups, m, n, k, expected_m_per_group = parse_dump_file(file)
+        test_func(num_groups, m, expected_m_per_group, n, k)
     else:
         for num_groups, expected_m_per_group, k, n in ((4, 8192, 7168, 4096), (4, 8192, 2048, 7168),
                                                        (8, 4096, 7168, 4096), (8, 4096, 2048, 7168),
                                                        (32, 256, 7168, 4096), (32, 256, 2048, 7168)):
 
         # num_groups, expected_m_per_group, k, n = 2, 2, 256, 32
-            test_func()
+            test_func(num_groups, num_groups*expected_m_per_group, expected_m_per_group, k, n)
 
     if benchmark:
         # noinspection PyShadowingNames
@@ -282,8 +168,8 @@ def test_m_grouped_gemm_masked(d: torch.dtype, file: str) -> None:
 def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
     print('Testing grouped unpad GEMM:')
 
-    def test_func():
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, d, file, 1)
+    def test_func(num_groups, m, n, k, expected_m_per_group):
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, expected_m_per_group, k, n, d, file, 1)
         if (d == torch.bfloat16):
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
         else:
@@ -300,13 +186,14 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, file: str) -> None:
             assert diff < 0.0015, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
     if file is not None:
-        num_groups, expected_m_per_group, n, k, m = parse_dump_file(file)
-        test_func()
+        num_groups, m, n, k, expected_m_per_group = parse_dump_file(file)
+        test_func(num_groups, m, n, k, expected_m_per_group)
     else:
         for num_groups, expected_m_per_group in ((256, 1), (256, 4), (256, 16), (256, 32), (128, 8), (128, 64), (128, 1024)):
             for k, n in ((7168, 4096), (2048, 7168), (256, 768), (512, 128)):
         # num_groups, expected_m_per_group, k, n = 256, 1, 7168, 4096
-                test_func()
+                
+                test_func(num_groups, num_groups*expected_m_per_group, n, k, expected_m_per_group)
 
     print("Passed\n")
 
@@ -333,10 +220,10 @@ if __name__ == '__main__':
     parser.add_argument('--func', default=None, type=str, choices=["DenseGemm","GroupedContiguous", "GroupedMasked", "GroupedNoPad"], required=False, help='target test func')
 
     args = parser.parse_args()
-    global cycle
-    cycle = 0
     if (args.cycle):
-        cycle = 1
+        set_cycle(1)
+    else:
+        set_cycle(0)
     if args.dtype == "all":
         args.dtype = "int8,bf16"
     dg_cases = list()
@@ -377,7 +264,7 @@ if __name__ == '__main__':
             elif "DenseGemm" in file:
                 test_gemm(dtype, file)
             else:
-                "invalid dump file\n"
+                print("invalid dump file\n")
     else:
         if args.func is not None:
             if "GroupedContiguous" in args.func:
@@ -393,7 +280,7 @@ if __name__ == '__main__':
                 test_gemm(torch.int8, args.file)
                 test_gemm(torch.bfloat16, args.file)
             else:
-                "invalid test function\n"
+                print("invalid test function\n")
         else:
             test_gemm(torch.int8, args.file)
             test_m_grouped_gemm_contiguous(torch.int8, args.file)

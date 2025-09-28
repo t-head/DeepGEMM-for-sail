@@ -23,7 +23,7 @@ constexpr auto kNumGroups = 1;
 constexpr auto kNumStages = {NUM_STAGES};
 
 // Make a templated grouped GEMM
-using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::Normal>;
+using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm>;
 
 // Launch kernel
 gemm_t::run(out, nullptr,

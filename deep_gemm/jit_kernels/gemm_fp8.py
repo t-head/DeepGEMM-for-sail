@@ -25,7 +25,7 @@ constexpr auto kNumGroups = 1;
 constexpr auto kNumStages = {NUM_STAGES};
 
 // Make a templated GEMM
-using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, GemmType::Normal>;
+using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, GemmType::DenseGemm>;
 
 // Launch kernel
 gemm_t::run(out, lhs, rhs, lhs_scales,
