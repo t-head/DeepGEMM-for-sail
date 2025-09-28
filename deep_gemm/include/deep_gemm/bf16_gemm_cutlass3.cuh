@@ -47,7 +47,7 @@ inline int compute_occupancy_for_kernel()
   cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &max_active_blocks, cutlass::device_kernel<GemmKernel>, GemmKernel::MaxThreadsPerBlock, smem_size);
 
-  printf("compute_occupancy_for_kernel, smem_size = %d, max_active_blocks = %d\n", smem_size, max_active_blocks);
+  // printf("compute_occupancy_for_kernel, smem_size = %d, max_active_blocks = %d\n", smem_size, max_active_blocks);
 //   max_active_blocks = 12;
   return max_active_blocks;
 }
@@ -1382,9 +1382,9 @@ public:
         dim3 const grid = GemmKernel::get_grid_shape(params);
         int smem_size_kernel = GemmKernel::SharedStorageSize;
 
-        std::cout << "block = " << block << std::endl;
-        std::cout << "grid = " << grid << std::endl;
-        std::cout << "smem_size_kernel = " << smem_size_kernel << std::endl;
+        // std::cout << "block = " << block << std::endl;
+        // std::cout << "grid = " << grid << std::endl;
+        // std::cout << "smem_size_kernel = " << smem_size_kernel << std::endl;
 
         // export PPU_LIB_PERF_INSTRUMENT=1
         int id = generate_id();
