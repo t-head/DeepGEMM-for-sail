@@ -1234,63 +1234,70 @@ struct CollectiveMma<
       copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
     }
 
+    auto process_kblock_iterations = [&](int k_block) {
+      if (k_block == K_BLOCK_MAX - 1) {
+        // Slice the smem_pipe_read smem
+        tCsA_p = tCsA(_,_,_,smem_pipe_read);
+        tCsB_p = tCsB(_,_,_,smem_pipe_read);
+      }
+
+      // Load A, B shmem->regs for k_block+1
+      auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
+      copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
+      copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
+
+CUTLASS_PRAGMA_UNROLL
+      for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
+        auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
+        // Transform before compute
+        cute::transform(tCrA(_,_,atom_idx), TransformA{});
+        cute::transform(tCrB(_,_,atom_idx), TransformB{});
+        // gemm for one tiled_mma atom on K
+        cute::gemm(tiled_mma, mma_acc, tCrA(_,_,atom_idx), tCrB(_,_,atom_idx), mma_acc);
+      }
+
+      // Copy gmem to smem after computing gemm on each k-pipe
+      if (k_block == K_BLOCK_MAX - 2) {
+
+        // Commit the smem for smem_pipe_read
+        cp_async_wait<DispatchPolicy::Stages-2>();
+
+        __syncthreads();
+
+        if (k_tile_count > 0) {
+          copy_aiu_v2<SplitAIU>(
+            gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
+            gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
+            warp_idx
+          );
+        } else if (scaleCopySendDone == false) {
+          copy_if(gmem_tiled_copy_scaleA, tSpSA, tSgSA(_,_,_,0), tSsSA(_,_,_,0));
+          copy_if(gmem_tiled_copy_scaleB, tSpSB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
+          scaleCopySendDone = true;
+        }
+        cp_async_fence();
+
+        --k_tile_count;
+        ++k_tile_iter;
+        // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
+        ++smem_pipe_read;
+        smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
+        smem_pipe_write = smem_pipe_read;
+      }
+    };
+
+    for_each(make_int_sequence<K_BLOCK_MAX >{}, [&] (auto k_block) {
+      process_kblock_iterations(k_block);
+    }); // for_each
+
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > -(DispatchPolicy::Stages)) {
       // Pipeline the outer products with a static for loop.
       //
       // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
-      for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
-        if (k_block == K_BLOCK_MAX - 1) {
-          // Slice the smem_pipe_read smem
-          tCsA_p = tCsA(_,_,_,smem_pipe_read);
-          tCsB_p = tCsB(_,_,_,smem_pipe_read);
-        }
-
-        // Load A, B shmem->regs for k_block+1
-        auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
-        copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
-        copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
-
-CUTLASS_PRAGMA_UNROLL
-        for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
-          auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
-          // Transform before compute
-          cute::transform(tCrA(_,_,atom_idx), TransformA{});
-          cute::transform(tCrB(_,_,atom_idx), TransformB{});
-          // gemm for one tiled_mma atom on K
-          cute::gemm(tiled_mma, mma_acc, tCrA(_,_,atom_idx), tCrB(_,_,atom_idx), mma_acc);
-        }
-
-        // Copy gmem to smem after computing gemm on each k-pipe
-        if (k_block == K_BLOCK_MAX - 2) {
-
-          // Commit the smem for smem_pipe_read
-          cp_async_wait<DispatchPolicy::Stages-2>();
-
-          __syncthreads();
-
-          if (k_tile_count > 0) {
-            copy_aiu_v2<SplitAIU>(
-              gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
-              gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
-              warp_idx
-            );
-          } else if (scaleCopySendDone == false) {
-            copy_if(gmem_tiled_copy_scaleA, tSpSA, tSgSA(_,_,_,0), tSsSA(_,_,_,0));
-            copy_if(gmem_tiled_copy_scaleB, tSpSB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
-            scaleCopySendDone = true;
-          }
-          cp_async_fence();
-
-          --k_tile_count;
-          ++k_tile_iter;
-          // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
-          ++smem_pipe_read;
-          smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
-          smem_pipe_write = smem_pipe_read;
-        }
+      for_each(make_int_sequence<K_BLOCK_MAX >{}, [&] (auto k_block) {
+        process_kblock_iterations(k_block);
       }); // for_each
-
     }
 
     // TODO: original cutlass3 miss this sync

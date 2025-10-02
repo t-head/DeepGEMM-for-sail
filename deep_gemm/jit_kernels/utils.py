@@ -300,7 +300,7 @@ def get_search_space(d: torch.dtype, gemm_type : str, m:int=0, n:int=0, k:int=0)
             [160, 128, 80, 64, block_k    , 4],
             [160, 128, 80, 64, block_k * 2, 3],
             [160, 256, 80, 64, block_k    , 2],
-            [160, 256, 80, 64, block_k    , 3],
+            [160, 256, 80, 64, block_k    , 4],
 
             # blockM = 192
             [192, 128, 48, 64, block_k    , 2],
@@ -308,7 +308,7 @@ def get_search_space(d: torch.dtype, gemm_type : str, m:int=0, n:int=0, k:int=0)
             [192, 128, 48, 64, block_k    , 4],
             [192, 128, 48, 64, block_k * 2, 3],
             [192, 256, 48, 64, block_k    , 2],
-            [192, 256, 48, 64, block_k    , 3],
+            [192, 256, 48, 64, block_k    , 4],
 
             # blockM = 256
             [256, 64, 32, 64, block_k,      2],
