@@ -18,5 +18,9 @@ from .jit_kernels import (
     m_grouped_gemm_bf16_bf16_bf16_nt_masked,
     m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
     m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
+    # Attention kernels
+    fp8_mqa_logits,
+    get_paged_mqa_logits_metadata,
+    fp8_paged_mqa_logits,
 )
 from .utils import bench, bench_kineto, calc_diff

@@ -25,3 +25,9 @@ from .utils import (
     get_m_alignment_for_contiguous_layout,
     get_search_space
 )
+
+from .attention import (
+    fp8_mqa_logits,
+    get_paged_mqa_logits_metadata,
+    fp8_paged_mqa_logits,
+)
