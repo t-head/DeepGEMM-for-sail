@@ -73,6 +73,9 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert out.is_contiguous() and m_indices.is_contiguous()
 
+    # LHS scales must be transposed for TMA load, but not for RHS scales
+    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
+
     assert rhs_scales.is_contiguous()
 
     # Do nothing if `m` is zero
@@ -154,6 +157,9 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     assert masked_m.dtype == torch.int32
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert out.is_contiguous() and masked_m.is_contiguous()
+
+    # LHS scales must be transposed for TMA load, but not for RHS scales
+    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
 
     assert rhs_scales.is_contiguous()
 

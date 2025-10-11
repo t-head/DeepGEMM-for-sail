@@ -122,7 +122,7 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
 
     if is_ppu1v5_device():
         # append compiler options for ppu1.5
-        nvcc_flags.extend(['-ppu-simt-branch=false', '-ppu-patch-fence-ppu=false', '-wno-loop-miss-transform',
+        nvcc_flags.extend(['-ppu-patch-fence-ppu=false', '-wno-loop-miss-transform',
                            '-ppu-cg-to-kp1=true', '-ppu-fix-uninit=true'])
 
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi', '-fconcepts']

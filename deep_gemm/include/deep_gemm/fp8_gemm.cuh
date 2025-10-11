@@ -31,11 +31,30 @@
 #include "tools/util/include/cutlass/util/host_tensor.h"
 #include "tools/util/include/cutlass/util/packed_stride.hpp"
 #include "scheduler_cutlass3.cuh"
-#include "fp8_mainloop_with_scale.hpp"
-
+#include "ppu/cutlass/gemm/collective/acompute_mma_aiu_multistage_with_scale.hpp"
 namespace deep_gemm {
 using namespace cute;
 using cutlass::KernelHardwareInfo;
+
+template <typename GemmKernel>
+inline int compute_occupancy_for_kernel()
+{
+  int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
+  if (smem_size > (48 << 10)) {
+    cudaError_t result;
+    result = cudaFuncSetAttribute(cutlass::device_kernel<GemmKernel>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  smem_size);
+  }
+
+  int max_active_blocks = -1;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &max_active_blocks, cutlass::device_kernel<GemmKernel>, GemmKernel::MaxThreadsPerBlock, smem_size);
+
+  // printf("compute_occupancy_for_kernel, smem_size = %d, max_active_blocks = %d\n", smem_size, max_active_blocks);
+  //   max_active_blocks = 12;
+  return max_active_blocks;
+}
 
 template <
   class ProblemShape_,
@@ -251,6 +270,7 @@ public:
     auto blk_shape = TileShape{}; // (BLK_M,BLK_N,BLK_K)
 
     uint32_t m_block_idx, n_block_idx;
+    #pragma clang loop licm(disable)
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
       auto m_coord = m_block_idx;
       auto n_coord = n_block_idx;
@@ -268,17 +288,15 @@ public:
       CollectiveMainloop collective_mainloop;
       // update actual global ptr offset
       MainloopParams update_params = {
-        ptr_A, params.mainloop.dA, ptr_B, params.mainloop.dB,
-        ptr_scale_A, params.mainloop.dScaleA,
-        ptr_scale_B, params.mainloop.dScaleB
+        ptr_A, params.mainloop.dA, ptr_B, params.mainloop.dB, 4,
+        ptr_scale_A, params.mainloop.layout_SFA,
+        ptr_scale_B, params.mainloop.layout_SFB
       };
       auto load_inputs = collective_mainloop.load_init(problem_shape_MNKL, blk_coord_mnkl, update_params);
       static_assert(cute::tuple_size_v<decltype(load_inputs)> >= 2, "Output of load_init must have at least two elements (A, B)");
 
       Tensor gA = get<0>(load_inputs);
       Tensor gB = get<1>(load_inputs);
-      Tensor gSA = get<2>(load_inputs);
-      Tensor gSB = get<3>(load_inputs);
       // Compute tile residues for predication
       auto m_max_coord = M - size<0>(gA) * get<0>(blk_coord_mnkl);                             // M - BLK_M * m_coord
       auto n_max_coord = N - size<0>(gB) * get<1>(blk_coord_mnkl);                             // N - BLK_N * n_coord
@@ -295,14 +313,10 @@ public:
 
       // Perform the collective scoped MMA
       collective_mainloop(
-        accumulators,
-        gA,
-        gB,
-        gSA,
-        gSB,
+        update_params,
+        load_inputs,
         accumulators,
         k_tile_iter, k_tile_count,
-        residue_mnk,
         thread_idx,
         smem_buf
       );
@@ -387,7 +401,13 @@ public:
     static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
     static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
 
-    using DispatchPolicy = cutlass::gemm::MainloopAcomputeAiuFP8<Stage, cutlass::gemm::KernelAiuMultistage>;
+    using ScaleGranularityShape = Shape<_1,_128,_128>;
+
+    using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(ScaleGranularityShape{}));
+    using LayoutSFA           = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
+    using LayoutSFB           = decltype(ScaleConfig::deduce_layoutSFB());                     // Layout type for SFB matrix operand
+
+    using DispatchPolicy = cutlass::gemm::MainloopWithScaleAcomputeAiu<Stage, cutlass::gemm::KernelAiuMultistageWithBlockWiseScale>;
 
     using GemmOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BlockM>, Int<BlockK>, false>;//operation
     using GemmOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BlockN>, Int<BlockK>, true>;
@@ -408,16 +428,40 @@ public:
     using TiledMma = cute::TiledMMA<
         cute::MMA_Atom<MmaInst>,
         cute::Layout<Shape<WarpOnM, WarpOnN, _1>>>;
+    
+    // scale
+    static constexpr int ScaleGranularityM = size<0,0>(LayoutSFA{});
+    static constexpr int ScaleGranularityN = size<0,0>(LayoutSFB{});
+    static constexpr int ScaleGranularityK = size<1,0>(LayoutSFA{});
 
-    // ElemA/B and LayoutA/B is already transfered
-    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaBlockWise<
-      DispatchPolicy, TileShape,
-      ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
-      ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
-      TiledMma,
-      typename GemmOperandA::GmemTiledCopy, typename GemmOperandA::SmemLayoutAtom, typename GemmOperandA::SmemCopyAtom, TransformA,
-      typename GemmOperandB::GmemTiledCopy, typename GemmOperandB::SmemLayoutAtom, typename GemmOperandB::SmemCopyAtom, TransformB
-    >;
+    using ElementScale = float;
+    static constexpr int MinScaleElementSize = 32 / sizeof_bits<ElementScale>::value * 8;
+    static constexpr int ScaleMsPerTile = cute::max(cute::ceil_div(Int<BlockM>{}, Int<ScaleGranularityM>{}), Int<MinScaleElementSize>{});
+    static constexpr int ScaleNsPerTile = cute::max(cute::ceil_div(Int<BlockN>{}, Int<ScaleGranularityN>{}), Int<MinScaleElementSize>{});
+    static constexpr int ScaleKsPerTile = BlockK / ScaleGranularityK;
+
+    using DefaultOperandSFA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementScale, true, Int<ScaleMsPerTile>, Int<ScaleKsPerTile>, false>;
+    using DefaultOperandSFB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementScale, true, Int<ScaleNsPerTile>, Int<ScaleKsPerTile>, true>;
+
+    // scaleA
+    using SmemLayoutAtomSFA = typename DefaultOperandSFA::SmemLayoutAtom; // M, K
+    using SmemCopyAtomSFA = typename DefaultOperandSFA::SmemCopyAtom;
+    using GmemTiledCopySFA = typename DefaultOperandSFA::GmemTiledCopy;
+
+    // scaleB
+    using SmemLayoutAtomSFB = typename DefaultOperandSFB::SmemLayoutAtom; // N, K
+    using SmemCopyAtomSFB = typename DefaultOperandSFB::SmemCopyAtom;
+    using GmemTiledCopySFB = typename DefaultOperandSFB::GmemTiledCopy;
+
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+      ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
+      ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB,
+      ElementAccumulator,
+      TileShape, WarpShape,
+      Int<Stage>,
+      cutlass::gemm::KernelAiuMultistageWithBlockWiseScale,
+    >::CollectiveOp;
 
     using EpilogueDispatchPolicy = cutlass::epilogue::EpilogueSimtVectorized;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
@@ -452,27 +496,31 @@ public:
         using StrideB = typename GemmKernel::StrideB;
         using StrideC = typename GemmKernel::StrideC;
         using StrideD = typename GemmKernel::StrideD;
-        using StrideS = typename CollectiveMainloop::StrideScale;
 
         StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(shape_m, SHAPE_K, 1));
         StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(SHAPE_N, SHAPE_K, 1));
         StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(shape_m, SHAPE_N, 1));
-        const int scale_k = (SHAPE_K + 127 - 1) / 128;
-        const int scale_n = (SHAPE_N + 127 - 1) / 128;
-        StrideS stride_scale_A = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(shape_m, scale_k, 1));
-        StrideB stride_scale_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(scale_n, scale_k, 1));
+        LayoutSFA layout_SFA;
+        LayoutSFB layout_SFB;
+        auto ScaleGranularityN = size<1>(ScaleGranularityShape{});
+        auto ScaleGranularityK = size<2>(ScaleGranularityShape{});
+        auto scale_k = (SHAPE_K + ScaleGranularityK - 1) / ScaleGranularityK;
+        auto scale_n = (SHAPE_N + ScaleGranularityN - 1) / ScaleGranularityN;
+        layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(shape_m, SHAPE_N, SHAPE_K, 1));
+        layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(shape_m, SHAPE_N, SHAPE_K, 1));
 
         cutlass::float_e4m3_t* converted_input_b = reinterpret_cast<cutlass::float_e4m3_t*>(input_b);
         cutlass::float_e4m3_t* converted_input_a = reinterpret_cast<cutlass::float_e4m3_t*>(input_a);
         cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(gmem_d);
+        int max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
         cutlass::KernelHardwareInfo hw_info;
         hw_info.device_id = 0;
-        hw_info.sm_count = num_sms;
+        hw_info.sm_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id) * max_blocks_per_cu;
         typename GemmKernel::Arguments arguments{
           cutlass::gemm::GemmUniversalMode::kGemm,
           {shape_m, SHAPE_N, SHAPE_K, 1},
-          {converted_input_a, stride_A, converted_input_b, stride_B,
-           scales_a, stride_scale_A, scales_b, stride_scale_B},
+          {converted_input_a, stride_A, converted_input_b, stride_B, 4,
+           scales_a, layout_SFA, scales_b, layout_SFB},
           {
             {1, 0},
             nullptr, stride_D,

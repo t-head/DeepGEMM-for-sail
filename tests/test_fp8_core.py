@@ -237,7 +237,7 @@ def test_m_grouped_gemm_masked(file: str) -> None:
                             print(f"ref_out[{j}]:", ref_out[j, :masked_m[j].item()])
                             print(f"out[{j}]:", out[j, :masked_m[j].item()])
                             torch.testing.assert_close(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()], rtol=5e-1, atol=2)
-                        assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+                        assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
                 if benchmark:
                     # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
                     x_fp8, y_fp8, masked_m, out, ref_out = construct_masked_grouped(num_groups, 4096, expected_m_per_group, k, n, file)
