@@ -377,7 +377,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", acc_check
     for idx, case in enumerate(cases):
         print(f'Profiling {idx + 1}/{total} on device{gpu_id}')
         print(f'case name:{case}')
-        log_file = f"./logs/gpu{gpu_id}_{case.replace(" ","").replace(",", "_").replace(":", "_").replace('/','_').replace('.','_')}.log"
+        log_file = f"./logs/gpu{gpu_id}_{case.replace(' ','').replace(',', '_').replace(':', '_').replace('/','_').replace('.','_')}.log"
         cmd = "rm -f "+ log_file
         run_cmd(cmd)
         # gpu
@@ -646,9 +646,7 @@ def test_m_grouped_gemm_nopad(args) -> None:
         elif d == torch.int8:
             deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
         elif d == torch.float8_e4m3fn:
-            print("ERROR: fp8 + grouped_nopad not supported yet, please check!")
-            exit(1)
-            # deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
+            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)

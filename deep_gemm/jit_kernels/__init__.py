@@ -16,7 +16,8 @@ from .m_grouped_gemm_int8 import (
 )
 from .m_grouped_gemm_fp8 import (
     m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-    m_grouped_gemm_fp8_fp8_bf16_nt_masked
+    m_grouped_gemm_fp8_fp8_bf16_nt_masked,
+    m_grouped_gemm_fp8_fp8_bf16_nt_nopad
 )
 from .utils import (
     ceil_div, set_num_sms, get_num_sms, get_case_id,

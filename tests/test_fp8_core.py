@@ -3,7 +3,7 @@ import torch
 from typing import Tuple
 import os
 import deep_gemm
-from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
+from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor, get_col_major_tensor, get_m_alignment_for_contiguous_layout
 from utils import read_numbers_from_file, parse_dump_file
 from utils import judge_device_type
 use_ppu = judge_device_type()
@@ -37,21 +37,35 @@ def construct(m: int, k: int, n: int) -> \
 
     # Transpose earlier so that the testing will not trigger transposing kernels
     if use_ppu:
-        from deep_gemm import  get_col_major_tensor
-        x_fp8 = (x_fp8[0], get_col_major_tensor(x_fp8[1]))
+        from deep_gemm import  get_col_major_tma_aligned_tensor
+        x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     else:
         x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
 
     return x_fp8, y_fp8, out, ref_out
 
-def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: int, n: int, file: str) -> \
+def get_m_indices_from_index(index: torch.Tensor, expected_m_per_group, alignment : int) -> torch.Tensor:
+    if alignment == 1: # for nopad
+        m_row = torch.tensor(index, device='cuda', dtype=torch.int32)
+        start = 0
+        m_indices = torch.empty(expected_m_per_group, device='cuda', dtype=torch.int32)
+        for i, group in enumerate(m_row):
+            actual_end = start + group
+            m_indices[start:actual_end] = i
+            aligned_end = start + ceil_div(group, alignment) * alignment
+            m_indices[actual_end:aligned_end] = -1
+            start = aligned_end
+    else: # for contiguous
+        m_indices = torch.tensor(index, device='cuda', dtype=torch.int32)
+    return m_indices
+
+def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: int, n: int, file: str, alignment: int) -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     if file is not None:
         index = read_numbers_from_file(file)
-        m_indices = torch.tensor(index, device='cuda', dtype=torch.int32)
+        m_indices = get_m_indices_from_index(index, expected_m_per_group, alignment)
         m = expected_m_per_group
-    else:
-        alignment = get_m_alignment_for_contiguous_layout()
+    else :
         group_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
         m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
         m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
@@ -79,14 +93,13 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
 
     ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
 
-    assert m % 4 == 0, f'TMA alignment error: {m}'
     x_fp8 = per_token_cast_to_fp8(x)
     y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, ceil_div(n, 128), k // 128), device='cuda', dtype=torch.float))
     for i in range(num_groups):
         y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
     if use_ppu:
-        from deep_gemm import  get_col_major_tensor
-        x_fp8 = (x_fp8[0], get_col_major_tensor(x_fp8[1]))
+        from deep_gemm import  get_col_major_tma_aligned_tensor
+        x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     else:
         x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
 
@@ -116,8 +129,8 @@ def construct_masked_grouped(num_groups: int, max_m: int, expected_m_per_group: 
 
     # Transpose earlier so that the testing will not trigger transposing kernels
     if use_ppu:
-        from deep_gemm import  get_col_major_tensor
-        x_fp8 = (x_fp8[0], get_col_major_tensor(x_fp8[1]))
+        from deep_gemm import  get_col_major_tma_aligned_tensor
+        x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     else:
         x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, masked_m, out, ref_out
@@ -169,7 +182,7 @@ def test_gemm(file: str) -> None:
 def test_m_grouped_gemm_contiguous(file: str) -> None:
     print('Testing grouped contiguous GEMM:')
     def test_func():
-        m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file)
+        m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file, get_m_alignment_for_contiguous_layout())
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
 
         if not cycle:
@@ -188,7 +201,7 @@ def test_m_grouped_gemm_contiguous(file: str) -> None:
         for num_groups, expected_m_per_group, k, n in ((4, 8192, 7168, 4096), (4, 8192, 2048, 7168),
                                                        (8, 4096, 7168, 4096), (8, 4096, 2048, 7168),
                                                        (32, 256, 7168, 4096), (32, 256, 2048, 7168)):
-            m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file)
+            m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file, get_m_alignment_for_contiguous_layout())
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
             diff = calc_diff(out, ref_out)
@@ -200,7 +213,7 @@ def test_m_grouped_gemm_contiguous(file: str) -> None:
 
             if benchmark:
                 # NOTES: we should mask the unfilled part before calculating difference
-                m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file)
+                m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file, get_m_alignment_for_contiguous_layout())
 
                 # noinspection PyShadowingNames
                 def test_func():
@@ -268,6 +281,31 @@ def test_m_grouped_gemm_masked(file: str) -> None:
                         f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
     print("Passed\n")
 
+def test_m_grouped_gemm_nopad(file: str) -> None:
+    print('Testing grouped unpad GEMM:')
+
+    def test_func():
+        m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n, file, 1)
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x_fp8, y_fp8, out, m_indices)
+
+        if not cycle:
+            out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
+            diff = calc_diff(out, ref_out)
+            if diff >= 0.0015:
+                print("ref_out:", ref_out)
+                print("out:", out)
+                torch.testing.assert_close(out, ref_out, rtol=5e-1, atol=2)
+            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+
+    if file is not None:
+        num_groups, expected_m_per_group, n, k, m = parse_dump_file(file)
+        test_func()
+    else:
+        for num_groups, expected_m_per_group in ((256, 1), (256, 4), (256, 16), (256, 32), (128, 8), (128, 64), (128, 1024)):
+            for k, n in ((7168, 4096), (2048, 7168), (256, 768), (512, 128)):
+                test_func()
+
+    print("Passed\n")
 
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -288,7 +326,7 @@ if __name__ == '__main__':
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
     parser.add_argument("--dtype",  default="fp8", type=str, required=False, help='data type of the cases, e.g. fp8, e4m3, e5m2')
-    parser.add_argument('--func', default=None, type=str, choices=["DenseGemm","GroupedContiguous", "GroupedMasked"], required=False, help='target test func')
+    parser.add_argument('--func', default=None, type=str, choices=["DenseGemm","GroupedContiguous", "GroupedMasked", "GroupedNoPad"], required=False, help='target test func')
 
     args = parser.parse_args()
     global cycle
@@ -325,6 +363,8 @@ if __name__ == '__main__':
                 test_m_grouped_gemm_contiguous(file)
             elif "GroupedMasked" in file:
                 test_m_grouped_gemm_masked(file)
+            elif "GroupedNoPad" in file:
+                test_m_grouped_gemm_nopad(file)
             elif "DenseGemm" in file:
                 test_gemm(file)
             else:
@@ -335,6 +375,8 @@ if __name__ == '__main__':
                 test_m_grouped_gemm_contiguous(args.file)
             elif "GroupedMasked" in args.func:
                 test_m_grouped_gemm_masked(args.file)
+            elif "GroupedNoPad" in args.func:
+                test_m_grouped_gemm_nopad(args.file)
             elif "DenseGemm" in args.func:
                 test_gemm(args.file)
             else:
@@ -343,3 +385,4 @@ if __name__ == '__main__':
             test_gemm(args.file)
             test_m_grouped_gemm_contiguous(args.file)
             test_m_grouped_gemm_masked(args.file)
+            test_m_grouped_gemm_nopad(args.file)

@@ -96,7 +96,8 @@ def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
     assert x.dim() in (2, 3)
     remove_dim = False
     m, n = x.shape[-2], x.shape[-1]
-    aligned_m = get_tma_aligned_size(m, x.element_size())
+    # aligned_m = get_tma_aligned_size(m, x.element_size())
+    aligned_m = m
     if x.dim() == 2:
         if x.stride(0) == 1 and x.stride(1) == aligned_m:
             return x

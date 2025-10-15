@@ -276,12 +276,12 @@ public:
       auto n_coord = n_block_idx;
       auto l_coord = 0;
       M = deep_scheduler.curr_problem_m(params.scheduler);
+      auto offset_scalea = deep_scheduler.curr_offset_scalea(params.scheduler);
       auto offset_a = deep_scheduler.curr_offset_a(params.scheduler);
       auto offset_b = deep_scheduler.curr_offset_b(params.scheduler, m_block_idx);
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
-      // scaleA(shape_m, shape_k / 128), offset_a is A's offset
-      const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_a / 128;
+      const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_scalea;
       const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + offset_b / 128 / 128;
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
@@ -292,6 +292,7 @@ public:
         ptr_scale_A, params.mainloop.layout_SFA,
         ptr_scale_B, params.mainloop.layout_SFB
       };
+      problem_shape_MNKL = ProblemShape{M, N, K, L};
       auto load_inputs = collective_mainloop.load_init(problem_shape_MNKL, blk_coord_mnkl, update_params);
       static_assert(cute::tuple_size_v<decltype(load_inputs)> >= 2, "Output of load_init must have at least two elements (A, B)");
 

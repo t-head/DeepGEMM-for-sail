@@ -81,6 +81,42 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
 
     return smem_size, swizzle_mode, block_n_padding
 
+def get_num_occ(block_m: int, block_n: int, block_k: int, num_stages: int) -> Tuple[int]:
+    if block_m is None:
+        return 0
+
+    # use static suppose.
+    ppu_capacity = 262144
+    bpp = 1
+    smem_d = block_m * block_n
+    smem_a_per_stage = block_m * block_k
+    smem_b_per_stage = block_n * block_k
+
+    smem_size_d = smem_d * 2
+    smem_size_a = num_stages * smem_a_per_stage * bpp
+    smem_size_b = num_stages * smem_b_per_stage * bpp
+
+    smem_size = max(smem_size_d, smem_size_a + smem_size_b)
+
+    smem_occ = int(262144 // smem_size)
+
+    vreg_occ_lut = {
+        (16, 256) : 3,
+        (32, 128) : 3,
+        (32, 256) : 2,
+        (64, 64) : 2,
+        (64, 128) : 2,
+        (64, 256) : 2,
+        (128, 128) : 2,
+    }
+    key = (block_m, block_n)
+    if key in vreg_occ_lut.keys():
+        vreg_occ = vreg_occ_lut[key]
+    else:
+        vreg_occ =1
+
+    return min(smem_occ, vreg_occ)
+
 def get_smem_occ(block_m: int, block_n: int, block_k: int, num_stages: int) -> Tuple[int]:
     if block_m is None:
         return 0
@@ -232,7 +268,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     if num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False:
         return get_best_configs_dense(m, n, k, num_groups, num_sms)
     if not is_grouped_contiguous:
-        block_ms = (256, 128, 64)
+        block_ms = (256, 192, 128, 64)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
     block_ns = (256, 128, 64)
@@ -240,6 +276,9 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None) # groups*m_block*n_block/sms = num waves
     get_last_wave_util = lambda bm, bn: fix_wave_saturate((ceil_div(m, bm) * ceil_div(n, bn) * num_groups) % num_sms)
+
+    # block size wasted
+    get_block_utils = lambda m, bm: (((m / bm ) / ((m + bm -1) // bm)) if m % bm != 0 else 1.0) if bm else 0
 
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
@@ -250,15 +289,36 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k)
         return num_min_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
     else:
-
+        best_num_occ = 1
         for block_m in block_ms:
             # NOTES: the block sizes can not be too large, so at least one dim less than 128
             for block_n in filter(lambda bn: block_m <= 128 or bn <= 128, block_ns):
                 success = False
                 num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(best_block_m, best_block_n)
+                num_utils = get_block_utils(m, block_m) * get_block_utils(n, block_n)
+                best_num_utils = get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n)
+                num_occ, best_num_occ = get_num_occ(block_m, block_n, 128, 2), get_num_occ(best_block_m, best_block_n, 128, 2)
                 # print(f'best_block_m:{best_block_m}, best_block_n:{best_block_n}, num_waves:{num_waves}, best_num_waves:{best_num_waves}\n')
                 if best_block_m is None or best_block_n is None:
                     success = True
+                elif (m < 512 or k <= 384):
+                    # if single group block is small, balance wave, utils and occ
+                    occ_wave = num_waves / num_occ
+                    best_occ_wave = best_num_waves / best_num_occ
+                    ai_util = (block_m * block_n) / (block_m + block_n)
+                    best_ai_util = (best_block_m * best_block_n) / (best_block_m + best_block_n)
+
+                    valid_occ  = (num_occ / best_num_occ) >= 1
+                    valid_wave = (occ_wave / best_occ_wave) <= 1
+                    valid_util = (num_utils / best_num_utils) >= 1
+                    valid_ai   = (ai_util / best_ai_util) >= 1
+
+                    # print(f'num_waves:{num_waves / num_occ}, best_num_waves:{best_num_waves / best_num_occ}')
+                    # print(f'ai:{ai_util}, best_ai:{best_ai_util}')
+                    # print(f'util_ratio:{(num_utils / best_num_utils)}, wave_ratio:{occ_wave / best_occ_wave}, occ_ratio:{(num_occ / best_num_occ)}, ai_ratio:{ai_util / best_ai_util}')
+
+                    # print(f'valid_occ:{valid_occ}, valid_wave:{valid_wave}, valid_util:{valid_util}, valid_ai:{valid_ai}')
+                    success = (valid_wave + valid_util + valid_occ + valid_ai) >= 3
                 elif num_waves < best_num_waves:
                     success = True
                 elif num_waves == best_num_waves:
@@ -277,6 +337,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                     # print(f'success:{success}\n')
                 best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
         assert best_block_m is not None and best_block_n is not None
+        if not is_grouped_contiguous and m >= 64 and n >= 768:
+            (best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages) = (192, 256, 128, 48, 64, 4)
 
 
 
@@ -286,19 +348,22 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         best_num_stages, best_smem_config, ppu_capacity = None, None, 262144
 
         block_k = 128
-        # if k <= 512:
-        #     block_k = 64
-        # if k >= 4096 and (best_block_m == 32 and best_block_n == 32):
-        #     block_k = 512
-        stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
+        stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3)))
         if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4):
             # Unrolling both stages and `num_former_iters` will cause large code size
-            stage_candidates = (4, 3, 2)
+            stage_candidates = (4, 3)
+        best_occ = 0
         for num_stages in stage_candidates:
             best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k)
-            if best_smem_config[0] <= ppu_capacity:
-                best_num_stages = num_stages
-                break
+            if best_smem_config[0] < ppu_capacity:
+                occ = min(ppu_capacity // best_smem_config[0], best_num_occ)
+                if k <= 384 or (best_block_m <= 64 and best_block_n >= 64) and occ >= best_occ:
+                    # compute block and too small-k use higer occ rather than large stage
+                    best_num_stages = num_stages
+                    best_occ = occ
+                else:
+                    best_num_stages = num_stages
+                    break
         assert best_smem_config is not None
         assert best_num_stages is not None
 
@@ -311,6 +376,9 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
         warp_m = best_block_m // 4
         warp_n = best_block_n // 4
+        if best_block_m == 64 and best_block_n == 256:
+            warp_m = 32
+            warp_n = 32
 
         return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 

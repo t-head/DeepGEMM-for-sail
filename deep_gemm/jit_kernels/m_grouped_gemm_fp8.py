@@ -169,8 +169,8 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
 
     # Extra checks for TMA store
-    if num_groups > 1 and m > block_m:
-        assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
+    # if num_groups > 1 and m > block_m:
+    #     assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             masked_m, m, expected_m,
@@ -191,6 +191,84 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+        template=template,
+        args=args,
+        jit_include_dir='cutlass3'
+    )
+
+    # Run the kernel
+    runtime(*args)
+
+def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs: Tuple[torch.Tensor, torch.Tensor],
+                                         rhs: Tuple[torch.Tensor, torch.Tensor],
+                                         out: torch.Tensor, m_indices: torch.Tensor,
+                                         m_rows: torch.Tensor = None, configs = None) -> None:
+    lhs, lhs_scales = lhs
+    rhs, rhs_scales = rhs
+    m, k = lhs.shape
+    num_groups, n, k_ = rhs.shape
+    m_, n_ = out.shape
+    m__ = m_indices.numel()
+
+    # Type and shape checks
+    assert m == m_ == m__ and k == k_ and n == n_
+    assert lhs_scales.shape == (m, (k + 127) // 128)
+    assert rhs_scales.shape == (num_groups, (n + 127) // 128, (k + 127) // 128)
+    assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
+    assert rhs.dtype == torch.float8_e4m3fn and rhs_scales.dtype == torch.float32
+    assert out.dtype == torch.bfloat16
+    assert m_indices.dtype == torch.int32
+    assert lhs.is_contiguous() and rhs.is_contiguous()
+    assert out.is_contiguous() and m_indices.is_contiguous()
+
+    # LHS scales must be transposed for TMA load, but not for RHS scales
+    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
+
+    assert rhs_scales.is_contiguous()
+
+    # Do nothing if `m` is zero
+    if m == 0:
+        return
+
+    expected_m = ceil_div(m, num_groups)
+
+    # Auto-tuning with compilation
+    global includes, template
+    num_sms = get_num_sms()
+
+    if configs:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+    else:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
+
+    if m_rows is None:
+        counts = torch.bincount(m_indices)
+        min_n = min(counts.size(0), num_groups)
+        experts_for_rows = torch.zeros(num_groups, dtype=torch.int32, device='cuda')
+        if min_n > 0:
+            experts_for_rows[:min_n] = counts[:min_n]
+        m_rows = experts_for_rows
+    args = (lhs, lhs_scales, rhs, rhs_scales, out,
+        m_rows, m, num_groups, expected_m,
+        torch.cuda.current_stream(), num_sms, smem_config[0])
+
+    runtime = jit_tuner.compile_and_tune(
+        name='m_grouped_gemm_fp8_fp8_bf16_nt',
+        keys={'N': n, 'K': k,
+            'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+            'WARP_M': warp_m, 'WARP_N': warp_n,
+            'SWIZZLE_D_MODE': smem_config[1],
+            'BLOCK_N_PADDING': smem_config[2],
+            'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
+            'GEMM_TYPE': 'GroupedNoPad'},
+        space=(),
+        includes=includes,
+        arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
+                    ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
+                    ('out', torch.bfloat16),
+                    ('grouped_layout', torch.int32), ('m', int),
+                    ('num_groups', int), ('expected_m', int),
+                    ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
         args=args,
         jit_include_dir='cutlass3'

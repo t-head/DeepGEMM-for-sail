@@ -224,6 +224,17 @@ struct DeepGemmScheduler {
         }
     }
 
+    __device__ __forceinline__ int64_t curr_offset_scalea(const Params& param) const
+    {
+        if constexpr (kGemmType == GemmType::GroupedMasked) {
+            return int64_t(curr_group_idx) * param.shape_m * SHAPE_K / 128;
+        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
+            return int64_t(curr_cumsum_m);
+        } else {
+            return 0;
+        }
+    }
+
     /// Gets the pointer offset of matrix A
     __device__ __forceinline__ int64_t curr_offset_m(const Params& param) const
     {
