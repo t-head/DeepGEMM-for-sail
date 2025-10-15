@@ -122,8 +122,19 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
 
     if is_ppu1v5_device():
         # append compiler options for ppu1.5
-        nvcc_flags.extend(['-ppu-patch-fence-ppu=false', '-wno-loop-miss-transform',
-                           '-ppu-cg-to-kp1=true', '-ppu-fix-uninit=true'])
+        is_fp8_kernel = 'gemm_fp8' in name.lower()
+        if not is_fp8_kernel:
+            nvcc_flags.extend(['-ppu-simt-branch=false', '-ppu-patch-fence-ppu=false', '-wno-loop-miss-transform',
+                               '-ppu-cg-to-kp1=true', '-ppu-fix-uninit=true'])
+        else:
+            nvcc_flags.extend(['-ppu-patch-fence-ppu=false', '-wno-loop-miss-transform',
+                               '-ppu-cg-to-kp1=true', '-ppu-fix-uninit=true',
+                               '-mllvm', '-ppu-blksync-nb-schedule-boundary=true',
+                               '-mllvm', '-ppu-simt-branch=false',
+                               '-mllvm', '-ppu-adjust-tsm-valu-war=13',
+                               '-mllvm', '-ppu-reassign-subregs=true',
+                               '-mllvm', '-ppu-pref-fma-reuse=true',
+                               '-mllvm', '-ppu-pref-mma-reuse=true'])
 
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi', '-fconcepts']
     flags = [*nvcc_flags, f'--compiler-options={",".join(cxx_flags)}']
