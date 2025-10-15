@@ -24,7 +24,9 @@ from .utils import (
     get_col_major_tma_aligned_tensor,
     get_col_major_tensor,
     get_m_alignment_for_contiguous_layout,
-    get_search_space
+    get_search_space,
+    set_compile_mode,
+    get_compile_mode
 )
 
 from .attention import (

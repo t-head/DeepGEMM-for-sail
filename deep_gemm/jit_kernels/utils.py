@@ -1,9 +1,24 @@
 import torch
 import os
 import functools
+from enum import Enum, auto
 
 _num_sms = None
 
+class CompuleMode(Enum):
+    COMPILE_AND_RUN = 0
+    #ONLY_COMPILE must be 1 to align with sglang deepgemm usage
+    ONLY_COMPILE = 1
+
+compile_mode = CompuleMode.COMPILE_AND_RUN
+
+def set_compile_mode(mode):
+    global compile_mode
+    compile_mode = mode
+    
+def get_compile_mode():
+    global compile_mode
+    return compile_mode
 
 def set_num_sms(num_sms: int) -> None:
     """

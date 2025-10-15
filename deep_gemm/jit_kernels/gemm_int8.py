@@ -5,7 +5,7 @@ from typing import Tuple
 import re
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, get_sm_count
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, get_sm_count, CompuleMode, compile_mode
 from .gemm_int8_lut import get_best_configs_from_lut
 
 # C++ code templates
@@ -485,6 +485,7 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
-
+    if compile_mode == CompuleMode.ONLY_COMPILE:
+        return
     # Run the kernel
     runtime(*args)

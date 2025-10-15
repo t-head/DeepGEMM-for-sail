@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, CompuleMode, compile_mode
 
 # C++ code templates
 includes = ('"deep_gemm/bf16_gemm.cuh"', )
@@ -352,6 +352,7 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
-
+    if compile_mode == CompuleMode.ONLY_COMPILE:
+        return
     # Run the kernel
     runtime(*args)
