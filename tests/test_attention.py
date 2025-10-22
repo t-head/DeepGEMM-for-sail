@@ -6,6 +6,7 @@ import deep_gemm
 from bench import *
 from numeric import *
 from math_utils import ceil_div, per_custom_dims_cast_to_fp8
+from utils import per_token_cast_to_int8
 
 # from generators import get_arch_major, generate_normal, get_ue8m0_usage, get_kernel_types, MajorTypeAB
 
@@ -117,15 +118,20 @@ def ref_fp8_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
 def test_mqa_logits():
     print('Testing FP8 MQA Logits:')
     num_heads, head_dim = 64, 128
-    test_bf16 = False
+    # qk_dtype = torch.int8 # torch.bfloat16, torch.float8_e4m3fn, torch.int8
     debug = False
     num_heads, head_dim = 64, 128
     for seq_len in (2048, 4096):
         for seq_len_kv in (4096, 8192, 16384, 32768, 65536, 131072):
-            for disable_cp in (True,):
+            #for disable_cp in (True,):
+            disable_cp = True
+            for qk_dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.int8):
                 q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
                 kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
-                weights = torch.randn(seq_len, num_heads, device='cuda', dtype=torch.float32)
+                if qk_dtype == torch.bfloat16:
+                    weights = torch.ones(seq_len, num_heads, device='cuda', dtype=torch.float32)
+                else:
+                    weights = torch.randn(seq_len, num_heads, device='cuda', dtype=torch.float32)
 
                 if disable_cp:
                     ks = torch.zeros(seq_len, dtype=torch.int, device='cuda')
@@ -133,12 +139,18 @@ def test_mqa_logits():
                 else:
                     ks, ke = generate_cp_test_data(seq_len, seq_len_kv)
 
-                q_fp8 = q.to(torch.float8_e4m3fn)
-                kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0, ), False)
-                if test_bf16:
-                    logits = deep_gemm.fp8_mqa_logits(q, (kv,kv_fp8[1]), weights, ks, ke)
-                else:
+                if qk_dtype == torch.bfloat16:
+                    logits = deep_gemm.bf16_mqa_logits(q, kv, weights, ks, ke)
+                elif qk_dtype == torch.float8_e4m3fn:
+                    q_fp8 = q.to(torch.float8_e4m3fn)
+                    kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0, ), False)
                     logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
+                elif qk_dtype == torch.int8:
+                    q_int8_2d = per_token_cast_to_int8(q.reshape(seq_len*num_heads, head_dim))
+                    q_int8 = q_int8_2d[0].reshape(seq_len, num_heads, head_dim)
+                    q_int8_scale = q_int8_2d[1].reshape(seq_len, num_heads)
+                    kv_int8 = per_token_cast_to_int8(kv)
+                    logits = deep_gemm.int8_mqa_logits((q_int8, q_int8_scale), kv_int8, weights, ks, ke)
 
                 do_check = (seq_len_kv < 32768)
                 if do_check:
@@ -181,7 +193,7 @@ def test_mqa_logits():
                 else:
                     ref_cost = ref_fp8_mqa_logits(q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, cost_only=True)
 
-                break
+                continue
                 tflops = 2 * ref_cost * num_heads * head_dim / 1e12
                 t, clean_t = bench_kineto(lambda: deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke),
                                           ('fp8_mqa_logits', 'clean_logits'))

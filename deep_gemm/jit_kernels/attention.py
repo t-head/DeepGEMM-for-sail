@@ -13,7 +13,7 @@ using namespace deep_gemm;
 
 // Templated args from Python JIT call
 using ElementQK = {ElementQK}; //cutlass::bfloat16_t or cutlass::float_e4m3_t
-using ElementAcc = float;
+using ElementAcc = {ElementAcc};
 constexpr auto kNumHeads = {kNumHeads};
 constexpr auto kHeadDim = {kHeadDim};
 constexpr auto BLOCK_QH = {BLOCK_QH};
@@ -31,40 +31,46 @@ atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, (uint3
              seq_len_q, seq_len_k, aligned_seq_len_kv, stream, num_sms);
 """
 
-
-def fp8_mqa_logits(q: torch.Tensor,
-                   kv: Tuple[torch.Tensor],
-                   weights: torch.Tensor,
-                   cu_seq_len_k_start: torch.Tensor,
-                   cu_seq_len_k_end: torch.Tensor,
-                   clean_logits: bool = True):
+def mqa_logits_common(q: torch.Tensor, q_scales: torch.Tensor,
+                      k: torch.Tensor, k_scales: torch.Tensor,
+                      weights: torch.Tensor,
+                      cu_seq_len_k_start: torch.Tensor,
+                      cu_seq_len_k_end: torch.Tensor,
+                      clean_logits: bool = True):
     seq_len_q, num_heads, head_dim = q.shape
-    seq_len_k, head_dim_ = kv[0].shape
+    seq_len_k, head_dim_ = k.shape
     seq_len_, num_heads_ = weights.shape
-    seq_len_kv_ = kv[1].shape[0]
-
-    k, k_scales = kv
 
     assert(seq_len_q == seq_len_)
     assert(num_heads == num_heads_ and head_dim == head_dim_)
-    assert(seq_len_k == seq_len_kv_)
     assert(cu_seq_len_k_start.size(0) == seq_len_q)
     assert(cu_seq_len_k_end.size(0) == seq_len_q)
 
-    assert(q.is_contiguous() and kv[0].is_contiguous())
-    assert(kv[1].is_contiguous())
+    assert(q.is_contiguous() and k.is_contiguous())
     assert(weights.is_contiguous())
     assert(cu_seq_len_k_start.is_contiguous())
     assert(cu_seq_len_k_end.is_contiguous())
 
-    assert(q.dtype == torch.float8_e4m3fn or q.dtype == torch.bfloat16)
-    assert(kv[0].dtype == torch.float8_e4m3fn or kv[0].dtype == torch.bfloat16)
-    assert(q.dtype == kv[0].dtype)
-    assert(kv[1].dtype == torch.float32)
+    assert(q.dtype == torch.float8_e4m3fn or q.dtype == torch.bfloat16 or q.dtype == torch.int8)
+    assert(k.dtype == torch.float8_e4m3fn or k.dtype == torch.bfloat16 or k.dtype == torch.int8)
+    assert(q.dtype == k.dtype)
+
     assert(weights.dtype == torch.float32)
     assert(cu_seq_len_k_start.dtype == torch.int32)
     assert(cu_seq_len_k_end.dtype == torch.int32)
 
+    if q.dtype != torch.bfloat16:
+        seq_len_kv_ = k_scales.shape[0]
+        assert(seq_len_k == seq_len_kv_)
+        assert(k_scales.is_contiguous())
+        assert(k_scales.dtype == torch.float32)
+
+    weights_update = weights * q_scales if q.dtype == torch.int8 else weights
+
+    if q.dtype == torch.int8:
+        assert(q_scales != None)
+        assert(q_scales.is_contiguous())
+        assert(q_scales.size(0) == weights.size(0))
 
     debug = False
     if debug:
@@ -109,39 +115,46 @@ def fp8_mqa_logits(q: torch.Tensor,
 
     def align(value, alignment):
         return (value + alignment - 1) // alignment * alignment
-    seq_len_alignment = 4
+
+    # defalut tile config for fp8 and int8
+    block_qh = 256
     block_kv = 256
+    warp_qh = 64
+    warp_kv = 64
+    num_q_stages = 3
+    num_kv_stages = 3
+    block_q = block_qh / num_heads
+    assert(block_qh % num_heads == 0)
+
+    seq_len_alignment = 4
+    assert(seq_len_alignment % block_q == 0)
     aligned_seq_len = align(seq_len_q, seq_len_alignment)
     aligned_seq_len_kv = align(seq_len_k + block_kv, 4)
     logits = torch.zeros(aligned_seq_len, aligned_seq_len_kv, dtype=torch.float, device=q.device)
     logits = logits[0:seq_len_q, 0:seq_len_k]
 
-    block_qh = 64
-    block_kv = 256
-    warp_qh = 64
-    warp_kv = 16
-    num_q_stages = 3
-    num_kv_stages = 3
-    block_q = block_qh / num_heads
-    assert(block_qh % num_heads == 0)
-    assert(seq_len_alignment % block_q == 0)
-
     # Auto-tuning with compilation
     global includes, template
     ElementQK = "cutlass::float_e4m3_t"
+    ElementAcc = "float"
     if q.dtype == torch.bfloat16:
         ElementQK = 'cutlass::bfloat16_t'
+        block_qh = 128
+        block_kv = 128
+        warp_kv = 32
     elif q.dtype == torch.int8:
         ElementQK = 'int8_t'
+        ElementAcc = "int32_t"
 
     num_sms = get_num_sms()
     stream = torch.cuda.current_stream()
     # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
-    args = (q, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
+    args = (q, k, k_scales, weights_update, cu_seq_len_k_start, cu_seq_len_k_end, logits,
             seq_len_q, seq_len_k, aligned_seq_len_kv, stream, num_sms)
     runtime = jit_tuner.compile_and_tune(
         name='attention_mqa_logits_fp8',
-        keys={'ElementQK': ElementQK, 'kNumHeads': num_heads, 'kHeadDim': head_dim,
+        keys={'ElementQK': ElementQK, 'ElementAcc' : ElementAcc,
+              'kNumHeads': num_heads, 'kHeadDim': head_dim,
               'BLOCK_QH': block_qh, 'BLOCK_KV': block_kv,
               'WARP_QH' : warp_qh, 'WARP_KV' : warp_kv,
               'kNumQStages': num_q_stages, 'kNumKVStages': num_kv_stages},
@@ -165,6 +178,36 @@ def fp8_mqa_logits(q: torch.Tensor,
         mask = mask_lo & mask_hi
         logits = logits.masked_fill(~mask, float('-inf'))
     return logits
+
+def bf16_mqa_logits(q: torch.Tensor,
+                    kv: torch.Tensor,
+                    weights: torch.Tensor,
+                    cu_seq_len_k_start: torch.Tensor,
+                    cu_seq_len_k_end: torch.Tensor,
+                    clean_logits: bool = True):
+    q_scales = None
+    k_scales = torch.empty(0)
+    return mqa_logits_common(q, q_scales, kv, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
+
+def fp8_mqa_logits(q: torch.Tensor,
+                   kv_s: Tuple[torch.Tensor],
+                   weights: torch.Tensor,
+                   cu_seq_len_k_start: torch.Tensor,
+                   cu_seq_len_k_end: torch.Tensor,
+                   clean_logits: bool = True):
+    k, k_scales = kv_s
+    q_scales = None
+    return mqa_logits_common(q, q_scales, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
+
+def int8_mqa_logits(q_s: Tuple[torch.Tensor],
+                   kv_s: Tuple[torch.Tensor],
+                   weights: torch.Tensor,
+                   cu_seq_len_k_start: torch.Tensor,
+                   cu_seq_len_k_end: torch.Tensor,
+                   clean_logits: bool = True):
+    q, q_scales = q_s
+    k, k_scales = kv_s
+    return mqa_logits_common(q, q_scales, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
 
 def get_paged_mqa_logits_metadata():
     return
