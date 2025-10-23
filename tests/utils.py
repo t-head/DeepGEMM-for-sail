@@ -377,7 +377,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", acc_check
     for idx, case in enumerate(cases):
         print(f'Profiling {idx + 1}/{total} on device{gpu_id}')
         print(f'case name:{case}')
-        log_file = f"./logs/gpu{gpu_id}_{case.replace(' ','').replace(',', '_').replace(':', '_').replace('/','_').replace('.','_')}.log"
+        log_file = f"./logs/gpu{gpu_id}_{case.replace(' ','').replace(',', '_').replace(':', '_').replace('/','_').replace('.','_')[:100]}.log"
         cmd = "rm -f "+ log_file
         run_cmd(cmd)
         # gpu

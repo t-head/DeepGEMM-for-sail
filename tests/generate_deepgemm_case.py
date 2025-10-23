@@ -34,13 +34,15 @@ nk_dict ={
 (384,4096)],
 
 "dpsk-v3_ep":
-[(2112,7168),
-(24576,1536),
-(36864,7168),
-(4096,7168),
-(7168,16384),
-(7168,18432),
-(7168,2048)]
+[(2112, 7168),
+(576, 7168),
+(24576, 1536),
+(32768, 512),
+(36864, 7168),
+(4096, 7168),
+(7168, 16384),
+(7168, 18432),
+(7168, 2048),]
 
 }
 index = 0
@@ -58,7 +60,8 @@ for gemm_type in supported_gemm_type:
                                 expected_m_per_group=1
                                 num_groups=1
                             case_format = f"[DeepGemm] --format={gemm_type},data_type:{data_type},groups:{num_groups},m:{m},n:{n},k:{k},em:{expected_m_per_group},distribution:{distribution}"
-                            cases.append(case_format)
+                            if case_format not in cases:
+                                cases.append(case_format)
 # cases = set(cases)
 for item in cases:
     if item not in output_cases:

@@ -48,7 +48,7 @@ if __name__ == '__main__':
 
     # Build
     print('Building ...')
-    func = jit.build('test_func', args, code, '1.5')
+    func = jit.build('test_func', args, code)
 
     # Test correctness
     print('Running ...')
