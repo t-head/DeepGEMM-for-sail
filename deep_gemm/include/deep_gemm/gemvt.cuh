@@ -251,13 +251,12 @@ __global__ void batched_gemvt_kernel_small_k(const GemvtArgs args) {
   }
 }
 
-template <typename src_type, typename dst_type,
+template <typename src_type, typename dst_type, typename acc_type,
           typename load_atype, typename load_btype,
           int BlockSize, int ThreadPerN = 32, int NPerThread = 1, int NUM_UNROLL=1,
           int GROUP_SIZE_M = 1>
 __global__ void batched_gemvt_kernel(const GemvtArgs args) {
     constexpr int BlockM = 1;
-    using acc_type = float;
     constexpr int WarpsPerN = ThreadPerN / WARP_SIZE;
     //   constexpr const int NPerThread = 1;
     constexpr int WarpCount = BlockSize / WARP_SIZE;
@@ -386,7 +385,7 @@ __global__ void batched_gemvt_kernel(const GemvtArgs args) {
     }
 }
 
-template <typename src_type, typename dst_type,
+template <typename src_type, typename dst_type, typename acc_type,
           uint32_t SHAPE_N, uint32_t SHAPE_K, int32_t kNumGroups,
           int ThreadPerN, int NPerThread, int NUM_UNROLL,
           int SWZL_SIZE_M, int BlockSize = 256, bool SMALL_K = false>
@@ -434,7 +433,7 @@ public:
                  return;
             }
 
-            auto device_func = batched_gemvt_kernel<src_type, dst_type, load_atype, load_btype,
+            auto device_func = batched_gemvt_kernel<src_type, dst_type, acc_type, load_atype, load_btype,
                                 BlockSize, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M>;
             dim3 grid = grid_x * grid_y;
 
@@ -473,7 +472,7 @@ public:
                 return;
             }
 
-            auto device_func = batched_gemvt_kernel_small_k<src_type, dst_type, float, load_atype, load_btype,
+            auto device_func = batched_gemvt_kernel_small_k<src_type, dst_type, acc_type, load_atype, load_btype,
                                                             BlockSize, ThreadPerN, NPerThread, 1, SWZL_SIZE_M, 5>;
             // printf("num_tokens = %d, N = %d, K = %d, top_k = %d, A = %p, B = %p, grid_x = %d, grid_y = %d",
             //     args.num_tokens, args.N, args.K, args.top_k, args.a_ptr, args.b_ptr, grid_x, grid_y);

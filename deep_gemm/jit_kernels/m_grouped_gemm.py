@@ -37,6 +37,7 @@ using namespace deep_gemm;
 
 // Templated args from Python JIT call
 using D = __nv_bfloat16;
+using acc_D = {acc_type};
 constexpr auto N = {N}, K = {K};
 constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto ThreadPerN = {ThreadPerN};
@@ -47,7 +48,7 @@ constexpr auto USE_SMALL_K = {USE_SMALL_K};
 constexpr auto BlockSize = {BlockSize};
 
 // Make a templated grouped GEMM
-using gemm_v = Gemvt<D, D, N, K, kNumGroups, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M, BlockSize, USE_SMALL_K>;
+using gemm_v = Gemvt<D, D, acc_D, N, K, kNumGroups, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M, BlockSize, USE_SMALL_K>;
 
 // Launch kernel
 gemm_v::run(out, grouped_layout,
@@ -219,7 +220,8 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
                 keys={'N': n, 'K': k, 'NUM_GROUPS': num_groups,
                     'ThreadPerN':ThreadPerN, 'NUM_UNROLL':NUM_UNROLL,
                     'SWZL_SIZE_M':SWZL_SIZE_M, 'NPerThread':NPerThread,
-                    'BlockSize':BlockSize, 'USE_SMALL_K':USE_SMALL_K},
+                    'BlockSize':BlockSize, 'USE_SMALL_K':USE_SMALL_K,
+                    'acc_type':'float'},
                 space=(),
                 includes=includes_gemv,
                 arg_defs=(('lhs', torch.bfloat16),
