@@ -1757,8 +1757,7 @@ public:
 
         cutlass::KernelHardwareInfo hw_info;
         hw_info.device_id = 0;
-        int sm_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
-        hw_info.sm_count = sm_count * max_blocks_per_cu;
+        hw_info.sm_count = num_sms * max_blocks_per_cu;
 
         typename GemmKernel::Arguments arguments{
             cutlass::gemm::GemmUniversalMode::kGemm,
@@ -1792,7 +1791,7 @@ public:
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
         int max_active_tb_num = max_blocks_per_cu;
-        const int threadblock_count = sm_count * max_active_tb_num;
+        const int threadblock_count = num_sms * max_active_tb_num;
         char *pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
             cudaFuncAttributes attr;
@@ -1805,7 +1804,7 @@ public:
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                 BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);
 
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", sm_count, max_active_tb_num, threadblock_count);
+            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
 
             printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, int(attr.numRegs), int(attr.localSizeBytes));
         }

@@ -95,6 +95,10 @@ public:
       >>;       // 1x1x1 value group
 #endif
 
+  static constexpr int NumThreadsPerCTA = size(TiledMma{});
+  // WarpInterleaving is enabled only when NumThreadsPerCTA is 512, which satisfy the condition that 2 warp group partitioned onto separate WEs.
+  static constexpr bool WarpInterleaving = false; //(NumThreadsPerCTA == 512);
+
   static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
   static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
   using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementQK, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
@@ -157,8 +161,8 @@ public:
       make_shape(Int<CTA_N>{}, Int<1>{}, Int<kNumQStages>{})));   // assert CTA_SCALE_K = 1, gs >= cta_k
   static constexpr int WAPR_LIMIT_SFA = CTA_M / (32 * ScaleMsPerThread);
   static constexpr int WAPR_LIMIT_SFB = CTA_N / (32 * ScaleNsPerThread);
-  static_assert(WAPR_LIMIT_SFA > 0, "WAPR_LIMIT_SFA must > 0");
-  static_assert(WAPR_LIMIT_SFB > 0, "WAPR_LIMIT_SFB must > 0");
+  static_assert(WAPR_LIMIT_SFA > 0 && WAPR_LIMIT_SFA <= (WarpOnM * WarpOnN / 2), "WAPR_LIMIT_SFA must > 0 and < half warps");
+  static_assert(WAPR_LIMIT_SFB > 0 && WAPR_LIMIT_SFB <= (WarpOnM * WarpOnN / 2), "WAPR_LIMIT_SFB must > 0 and < half warps");
 
   // Kernel level shared memory storage
   struct SharedStorage {
@@ -392,10 +396,10 @@ public:
     // Current pipe index in smem to write to
     int smem_pipe_write = 0;
 
-    Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
+    // Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
     Tensor tCsB_p = tCsB(_,_,_,smem_pipe_read);
-    Tensor tCsSFA_p = tCsSFA(_,_,_,smem_pipe_read);
-    Tensor tCsSFB_p = tCsSFB(_,_,_,smem_pipe_read);
+    // Tensor tCsSFA_p = tCsSFA(_,_,_,smem_pipe_read);
+    // Tensor tCsSFB_p = tCsSFB(_,_,_,smem_pipe_read);
 
     // Size of the register pipeline
     auto K_BLOCK_MAX = size<2>(tCrA_copy_view);
@@ -466,9 +470,9 @@ public:
     const auto& v_0_offset = lane_idx / 4 + 0;
     const auto& v_1_offset = lane_idx / 4 + 8;
     uint32_t warp_q_idx = warp_idx / WarpOnM;
+    int warp_group_id = warp_idx / 8;
 
     // printf("tid = %d, tSFBsSFB.data() = %p\n", thread_idx, tSFBsSFB.data().get());
-
     while (block_q_idx < num_q_blocks) {
         CUTE_TIE_DECL(load_schedule(1), q_stage_idx, q_phase, kv_start, kv_end, num_kv_blocks);
         tAgA.data() = tKgK.data() + kv_start;
@@ -485,6 +489,7 @@ public:
             tSFBpSFB(i) = (get<0>(tSFBcSFB(i)) + block_q_idx * kNumHeads) < N;
         }
 
+        uint32_t current_stage_kv = 0;
         if (num_kv_blocks > 0) {
             // Issue AIU Q
             copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,0), tBsB(_,_,_,0), warp_idx);
@@ -493,8 +498,7 @@ public:
             }
 
             // Issue AIU K in prologue
-            int kv_pipe = 0;
-            for (int kv_pipe = 0; kv_pipe < kNumKVStages; kv_pipe++) {
+            for (int kv_pipe = 0; kv_pipe < kNumKVStages - 1; kv_pipe++) {
                 if (kv_pipe < num_kv_blocks) {
                     for (int i = 0; i < size(tSFApSFA); ++i) {
                         tSFApSFA(i) = (get<0>(tSFAcSFA(i)) + kv_start + kv_pipe * BLOCK_KV) < kv_end;
@@ -512,31 +516,69 @@ public:
                     tAgA.data() = tAgA.data() + BLOCK_KV * kHeadDim;
                     tSFAgSFA.data() = tSFAgSFA.data() + BLOCK_KV;
                 }
+                current_stage_kv++;
                 cp_async_fence();
             }
 
             // wait AIU Q and first K
-            cp_async_wait<kNumKVStages - 1>();
+            cp_async_wait<kNumKVStages - 2>();
             __syncthreads();
 
-            // load Q and V to vreg
-            copy(smem_tiled_copy_A, tCsA_p, tCrA_copy_view);
+            // load Q to vreg
             copy(smem_tiled_copy_B, tCsB_p, tCrB_copy_view);
 
             // load scale to vreg
             // Read weights
             float * smem_weights_staged = sSFB(_,_,0).data().get() + warp_q_idx * kNumHeads;
             #pragma unroll
-            for (uint32_t j = 0; j < kNumHeads / 4; ++ j)
+            for (uint32_t j = 0; j < kNumHeads / 4; ++ j) {
+#if __HGGC_ARCH__ == 150
                 weights[j] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
+#else
+                weights[j] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) * 4 + lane_idx % 4);
+#endif
+            }
+        }
+
+        if constexpr (WarpInterleaving) {
+            if (warp_group_id == 1) {
+                __ppu_barrier_arrive(5, NumThreadsPerCTA, 0);
+            }
         }
 
         // Compute over KV blocks
         #pragma unroll
         for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++ kv_block_idx) {
+            uint32_t kv_stage_idx = kv_block_idx % kNumKVStages;
+
+            if constexpr (WarpInterleaving) {
+                __ppu_barrier_sync(5 + warp_group_id, NumThreadsPerCTA); // group 0 wait bar 5, group 1 wait bar 6
+            }
+
+            int kv_block_idx_copy = kv_block_idx + kNumKVStages - 1;
+            if (kv_block_idx_copy < num_kv_blocks) {
+                for (int i = 0; i < size(tSFApSFA); ++i) {
+                    tSFApSFA(i) = (get<0>(tSFAcSFA(i)) + kv_start + kv_block_idx_copy * BLOCK_KV) < kv_end;
+                }
+                // Issue AIU K
+                auto dim_h = kv_end - (kv_start + kv_block_idx_copy * BLOCK_KV);
+                // gmem_tiled_copy_A.desc_.dim_h = kv_end - (kv_start + kv_block_idx_copy * BLOCK_KV);
+                if (enable_print) {
+                    printf("        kv_block_idx = %d, kv_block_idx_copy = %d, dim_h = %d, current_stage_kv = %d\n", kv_block_idx, kv_block_idx_copy, dim_h, current_stage_kv);
+                }
+                copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,current_stage_kv), warp_idx);
+                if (sizeof(ElementQK) == 1 && warp_idx < WAPR_LIMIT_SFA) {
+                    copy_if(gmem_tiled_copy_scaleA, tSFApSFA(_,_,_,0), tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,current_stage_kv));
+                }
+                tAgA.data() = tAgA.data() + BLOCK_KV * kHeadDim;
+                tSFAgSFA.data() = tSFAgSFA.data() + BLOCK_KV;
+            }
+            cp_async_fence();
+            current_stage_kv = (current_stage_kv + 1) % kNumKVStages;
+
             // Compute `[BLOCK_Q * kNumHeads, kHeadDim] @ [BLOCK_KV, kHeadDim] -> [BLOCK_Q, BLOCK_KV]`
             // CUTE_TIE_DECL(get_kv_pipeline(kv_block_idx), kv_stage_idx, kv_phase);
-            uint32_t kv_stage_idx = kv_block_idx % kNumKVStages;
+
             if (enable_print) {
                 printf("    block_q_idx = %d, kv_block_idx = %d, kv_stage_idx = %d\n",
                     block_q_idx, kv_block_idx, kv_stage_idx);
@@ -544,28 +586,50 @@ public:
                     print("error error error, kv_stage_idx < 0, value =  ", kv_stage_idx);
                 }
             }
+            // load V to vreg
+            Tensor tCsA_p = tCsA(_,_,_,kv_stage_idx);
+            copy(smem_tiled_copy_A, tCsA_p, tCrA_copy_view);
 
+            // compute
             cute::gemm(tiled_mma, accum, tCrA, tCrB, accum);
 
-            // Read per-KV scales
+            // load scale from tsm to vreg before __ppu_barrier_arrive
+            static constexpr uint32_t kMmaIterM = MmaIterM{};
+            float scale_kv_array[kMmaIterM * 2];
             float * smem_kv_scales = sSFA(_,_,kv_stage_idx).data().get();
+            for (int m = 0; m < kMmaIterM; m++) {
+                uint32_t mma_offset = m * InstM;
+                scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
+                scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
+            }
+
+            if constexpr (WarpInterleaving) {
+                __ppu_barrier_arrive(6 - warp_group_id, NumThreadsPerCTA, 0);
+            }
+
+            // Read per-KV scales
+
 
             const auto& kv_offset = kv_start + kv_block_idx * BLOCK_KV + warp_offset;
 
             static constexpr uint32_t kNumAccumPerMma = 8;
-            static constexpr uint32_t kMmaIterM = MmaIterM{};
+
             static constexpr uint32_t kAccumStrideN16 = kNumAccumPerMma * kMmaIterM;
             CUTE_STATIC_ASSERT(kNumHeads % 8 == 0);
             CUTE_STATIC_ASSERT(WARP_Q == 1);
             for (int m = 0; m < kMmaIterM; m++) {
                 uint32_t mma_offset = m * InstM;
-                float scale_kv_0 = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
-                float scale_kv_1 = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
+                float scale_kv_0 = scale_kv_array[m * 2];
+                float scale_kv_1 = scale_kv_array[m * 2 + 1];
 
                 // Reduce over the head dim and store
                 auto shifted_accum = accum.data() + m * kNumAccumPerMma;
                 const auto& transform = [&](const uint32_t& j, const uint32_t& n = 0) {
+#if __HGGC_ARCH__ == 150
                     return fmaxf(shifted_accum[n * kAccumStrideN16 + j], 0) * weights[n * 4 + (j / 4) * 2 + (j & 1)];
+#else
+                    return fmaxf(shifted_accum[n * kAccumStrideN16 + j], 0) * weights[n * 4 + j % 4];
+#endif
                 };
 
                 // Intra-thread reduction
@@ -577,8 +641,13 @@ public:
                     for (uint32_t k = 0; k < kNumAccumPerMma; k ++)
                         sum[k] += transform(k, n);
                 }
+#if __HGGC_ARCH__ == 150
                 float v_0 = (sum[0] + sum[1] + sum[4] + sum[5]) * scale_kv_0;
                 float v_1 = (sum[2] + sum[3] + sum[6] + sum[7]) * scale_kv_1;
+#else
+                float v_0 = (sum[0] + sum[1] + sum[2] + sum[3]) * scale_kv_0;
+                float v_1 = (sum[4] + sum[5] + sum[6] + sum[7]) * scale_kv_1;
+#endif
 
                 // Inter-thread reduction
                 #pragma unroll
@@ -602,36 +671,22 @@ public:
                 }
             }
 
-            if ((kv_block_idx + 1) < num_kv_blocks) {
-                // wait for next K, load next K to vreg
-                cp_async_wait<kNumKVStages - 2>();
+            // wait for next K, load next K to vreg
+            cp_async_wait<kNumKVStages - 2>();
+
+            if constexpr (WarpInterleaving) {
+                __ppu_barrier_sync(3 + warp_group_id, NumThreadsPerCTA / 2);   // warp group sync
+            } else {
                 __syncthreads();
-
-                int kv_block_idx_copy = kv_block_idx + kNumKVStages;
-                if (kv_block_idx_copy < num_kv_blocks) {
-                    for (int i = 0; i < size(tSFApSFA); ++i) {
-                        tSFApSFA(i) = (get<0>(tSFAcSFA(i)) + kv_start + kv_block_idx_copy * BLOCK_KV) < kv_end;
-                    }
-                    // Issue AIU K
-                    auto dim_h = kv_end - (kv_start + kv_block_idx_copy * BLOCK_KV);
-                    // gmem_tiled_copy_A.desc_.dim_h = kv_end - (kv_start + kv_block_idx_copy * BLOCK_KV);
-                    if (enable_print) {
-                        printf("        kv_block_idx = %d, kv_block_idx_copy = %d, dim_h = %d\n", kv_block_idx, kv_block_idx_copy, dim_h);
-                    }
-                    copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,kv_stage_idx), warp_idx);
-                    if (sizeof(ElementQK) == 1 && warp_idx < WAPR_LIMIT_SFA) {
-                        copy_if(gmem_tiled_copy_scaleA, tSFApSFA(_,_,_,0), tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,kv_stage_idx));
-                    }
-                    tAgA.data() = tAgA.data() + BLOCK_KV * kHeadDim;
-                    tSFAgSFA.data() = tSFAgSFA.data() + BLOCK_KV;
-                }
-                cp_async_fence();
-
-                int kv_stage_idx_next = (kv_stage_idx + 1) % kNumKVStages;
-                copy(smem_tiled_copy_A, tCsA(_,_,_,kv_stage_idx_next), tCrA_copy_view);
             }
 
             clear(accum);
+        }
+
+        if constexpr (WarpInterleaving) {
+            if (warp_group_id == 0) {
+                __ppu_barrier_sync(5, NumThreadsPerCTA);
+            }
         }
 
         cp_async_wait<0>();
@@ -691,8 +746,7 @@ public:
 
         cutlass::KernelHardwareInfo hw_info;
         hw_info.device_id = 0;
-        int sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
-        hw_info.sm_count = sm_count * max_blocks_per_cu;
+        hw_info.sm_count = num_sms * max_blocks_per_cu;
 
         typename AttnKernel::Arguments arguments{ptr_q, ptr_k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
                                                  seq_len_q, seq_len_k, stride_k, stride_A, stride_B, hw_info};
@@ -704,7 +758,7 @@ public:
         cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);
 
         int max_active_tb_num = max_blocks_per_cu;
-        const int threadblock_count = sm_count * max_active_tb_num;
+        const int threadblock_count = num_sms * max_active_tb_num;
         char *pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
             cudaFuncAttributes attr;
@@ -717,7 +771,7 @@ public:
             printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n",
                 BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages);
 
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", sm_count, max_active_tb_num, threadblock_count);
+            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
             printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
             std::cout << "block = " << block << std::endl;
             std::cout << "grid = " << grid << std::endl;

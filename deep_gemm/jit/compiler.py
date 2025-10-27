@@ -122,8 +122,8 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
 
     if is_ppu1v5_device():
         # append compiler options for ppu1.5
-        is_fp8_kernel = 'gemm_fp8' in name.lower()
-        if not is_fp8_kernel:
+        use_warp_interleaving = ('gemm_fp8' in name.lower()) or ('mqa_logits' in name.lower())
+        if not use_warp_interleaving:
             nvcc_flags.extend(['-ppu-simt-branch=false', '-ppu-patch-fence-ppu=false', '-wno-loop-miss-transform',
                                '-ppu-cg-to-kp1=true', '-ppu-fix-uninit=true'])
         else:

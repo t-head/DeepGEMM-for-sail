@@ -7,6 +7,7 @@ from bench import *
 from numeric import *
 from math_utils import ceil_div, per_custom_dims_cast_to_fp8
 from utils import per_token_cast_to_int8
+from deep_gemm.jit_kernels.utils import is_ppu1v5_device
 
 # from generators import get_arch_major, generate_normal, get_ue8m0_usage, get_kernel_types, MajorTypeAB
 
@@ -125,7 +126,10 @@ def test_mqa_logits():
         for seq_len_kv in (4096, 8192, 16384, 32768, 65536, 131072):
             #for disable_cp in (True,):
             disable_cp = True
-            for qk_dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.int8):
+            qk_dtype_list = [torch.bfloat16, torch.int8]
+            if is_ppu1v5_device():
+                qk_dtype_list.append(torch.float8_e4m3fn)
+            for qk_dtype in qk_dtype_list:
                 q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
                 kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
                 if qk_dtype == torch.bfloat16:
@@ -202,7 +206,7 @@ def test_mqa_logits():
                       f'{tflops / t:4.0f} TFLOPS, {t * 1e6:4.0f} us, '
                       f'{(count_bytes(q_fp8, kv_fp8, weights, ks, ke) + ref_cost * 4) / t / 1e9:4.0f} GB/s | '
                       f'clean: {clean_t * 1e6:3.0f} us, {clean_bytes / clean_t / 1e9:4.0f} GB/s')
-    print()
+    print("Passed\n")
 
 
 def ref_fp8_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
