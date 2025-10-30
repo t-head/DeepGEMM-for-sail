@@ -152,7 +152,7 @@ def get_best_configs_dense(m: int, n: int, k: int, num_groups: int, num_sms: int
 
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
-    lut_result = get_best_configs_from_lut(m, n, k, False, False)
+    lut_result = get_best_configs_from_lut(m, n, k, 1, False, False)
     if lut_result:
         best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages = lut_result
         num_min_sms = 40
@@ -282,7 +282,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
-    lut_result = get_best_configs_from_lut(m, n, k, is_grouped_contiguous, is_grouped_masked)
+    lut_result = get_best_configs_from_lut(m, n, k, num_groups, is_grouped_contiguous, is_grouped_masked)
     if lut_result:
         best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages = lut_result
         num_min_sms = 40
