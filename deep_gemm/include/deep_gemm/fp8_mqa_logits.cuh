@@ -2,27 +2,10 @@
 #include "tools/util/include/cutlass/util/packed_stride.hpp"
 #include "ppu/ppu_include.hpp"
 #include "cute_tie.cuh"
+#include "utils.cuh"
+#include "utils_cutlass3.h"
 
 #define ENABLE_WARP_CONTIG_LAYOUT 1
-
-template <typename GemmKernel>
-inline int compute_occupancy_for_kernel()
-{
-  int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
-  if (smem_size > (48 << 10)) {
-    cudaError_t result;
-    result = cudaFuncSetAttribute(cutlass::device_kernel<GemmKernel>,
-                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  smem_size);
-  }
-
-  int max_active_blocks = -1;
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &max_active_blocks, cutlass::device_kernel<GemmKernel>, GemmKernel::MaxThreadsPerBlock, smem_size);
-
-  // printf("compute_occupancy_for_kernel, smem_size = %d, max_active_blocks = %d\n", smem_size, max_active_blocks);
-  return max_active_blocks;
-}
 
 __forceinline__ __device__ uint32_t get_lane_idx() {
     uint32_t lane_id;
@@ -97,7 +80,7 @@ public:
 
   static constexpr int NumThreadsPerCTA = size(TiledMma{});
   // WarpInterleaving is enabled only when NumThreadsPerCTA is 512, which satisfy the condition that 2 warp group partitioned onto separate WEs.
-  static constexpr bool WarpInterleaving = false; //(NumThreadsPerCTA == 512);
+  static constexpr bool WarpInterleaving = (NumThreadsPerCTA == 512);
 
   static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
   static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;

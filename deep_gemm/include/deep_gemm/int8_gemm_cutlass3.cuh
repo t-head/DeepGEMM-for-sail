@@ -28,161 +28,7 @@
 #include "scheduler_cutlass3.cuh"
 
 #include "ppu/ppu_include.hpp"
-
-template <typename GemmKernel>
-inline int compute_occupancy_for_kernel()
-{
-  int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
-  if (smem_size > (48 << 10)) {
-    cudaError_t result;
-    result = cudaFuncSetAttribute(cutlass::device_kernel<GemmKernel>,
-                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  smem_size);
-  }
-
-  int max_active_blocks = -1;
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &max_active_blocks, cutlass::device_kernel<GemmKernel>, GemmKernel::MaxThreadsPerBlock, smem_size);
-
-  // printf("compute_occupancy_for_kernel, smem_size = %d, max_active_blocks = %d\n", smem_size, max_active_blocks);
-//   max_active_blocks = 12;
-  return max_active_blocks;
-}
-
-enum class AiuSplitConfig {
-  AiuSplitBaseline,
-  AiuOnWarp0A1B,
-  AiuOnWarp0,
-};
-
-template <
-  int BlockM,
-  int BlockN,
-  int MmaTileM,
-  int MmaTileN
->
-CUTE_HOST_DEVICE constexpr AiuSplitConfig get_aiu_split_config() {
-  return (((BlockM > 16 ? BlockM : 16) / 2) % MmaTileM != 0 || (BlockM == 256 && BlockN == 256)) ?
-    AiuSplitConfig::AiuOnWarp0 : AiuSplitConfig::AiuSplitBaseline;
-}
-
-
-using namespace cute;
-template <
-  AiuSplitConfig SplitConfig,
-  class CopyPolicyA,
-  class SrcEngineA, class SrcLayoutA,
-  class DstEngineA, class DstLayoutA,
-  class CopyPolicyB,
-  class SrcEngineB, class SrcLayoutB,
-  class DstEngineB, class DstLayoutB
->
-CUTE_HOST_DEVICE
-void
-copy_aiu_v2(
-  CopyPolicyA                  const& copy_policy_a,
-  Tensor<SrcEngineA, SrcLayoutA> const& src_a,
-  Tensor<DstEngineA, DstLayoutA>     && dst_a,
-  CopyPolicyB                  const& copy_policy_b,
-  Tensor<SrcEngineB, SrcLayoutB> const& src_b,
-  Tensor<DstEngineB, DstLayoutB>     && dst_b,
-  int &warp_idx
-) {
-  if constexpr (SplitConfig == AiuSplitConfig::AiuOnWarp0A1B) {
-    if (warp_idx == 0) {
-      copy(copy_policy_a, src_a, dst_a);
-    } else if (warp_idx == 1) {
-      copy(copy_policy_b, src_b, dst_b);
-    }
-  } else if constexpr (SplitConfig == AiuSplitConfig::AiuOnWarp0) {
-    if (warp_idx == 0) {
-      copy(copy_policy_a, src_a, dst_a);
-      copy(copy_policy_b, src_b, dst_b);
-    }
-  } else if constexpr (SplitConfig == AiuSplitConfig::AiuSplitBaseline) {
-    if (warp_idx == 0) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size<1>(src_a) / 2; ++i) {
-        copy(copy_policy_a, src_a(_,i,_), dst_a(_,i,_));
-      }
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size<1>(src_b) / 2; ++i) {
-        copy(copy_policy_b, src_b(_,i,_), dst_b(_,i,_));
-      }
-    }
-    else if (warp_idx == 1) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = size<1>(src_a) / 2; i < size<1>(src_a); ++i) {
-        copy(copy_policy_a, src_a(_,i,_), dst_a(_,i,_));
-      }
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = size<1>(src_b) / 2; i < size<1>(src_b); ++i) {
-        copy(copy_policy_b, src_b(_,i,_), dst_b(_,i,_));
-      }
-    }
-  }
-
-}
-
-template <
-  AiuSplitConfig SplitConfig,
-  typename Element,
-  bool Trans,
-  typename Block_MN,
-  typename Block_K,
-  bool Swap,
-  int StageStride = 1
-> struct DefaultGemm_AIU_Operand_v2;
-
-template <
-  AiuSplitConfig SplitConfig,
-  typename Element,
-  typename Block_MN,
-  typename Block_K,
-  bool Swap,
-  int StageStride
-> struct DefaultGemm_AIU_Operand_v2<
-  SplitConfig,
-  Element,
-  false,
-  Block_MN,
-  Block_K,
-  Swap,
-  StageStride
-> {
-
-  static_assert(Block_K{} * sizeof_bits<Element>::value * 8 % 32 == 0, "aiu_no_trans: block_k must be multiple of 32B");
-  static constexpr int BlockContSize = Block_K{} * sizeof_bits<Element>::value / 8;
-  static_assert(BlockContSize > 128 ? (BlockContSize % 128 == 0) : (BlockContSize % 32 == 0), "aiu_trans: block contiguous size should be multiple of 128B or 32B");
-  static constexpr int AiuContByteSize = BlockContSize > 128 ? 128 : BlockContSize;
-  static constexpr int AiuContElemSize = AiuContByteSize / sizeof_bits<Element>::value * 8;
-  static constexpr bool split_on_k = AiuContElemSize < Block_K{};
-  // each aiu_load should at least cover one mma
-  static constexpr bool split_on_mn = SplitConfig == AiuSplitConfig::AiuSplitBaseline;
-  static constexpr int inst_num = split_on_k ? (Block_K{} / AiuContElemSize) : (split_on_mn ? 2 : 1);
-
-  // will only split on one dimension
-  static constexpr int CUBE_H = split_on_k ? Block_MN{} : (Block_MN{} / inst_num);
-  static constexpr int CUBE_W = AiuContElemSize;
-  static constexpr int bits_per_aiu = CUBE_H * CUBE_W * sizeof_bits<Element>::value;
-  using CopyInst = Acompute10500_AIU_LOAD<cute::C<bits_per_aiu>, Element, false, CUBE_H, CUBE_W>;
-  using SmemCopyOp = Acompute10500_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, false, inst_num * StageStride>;
-
-  using GmemTiledCopy = decltype(
-    make_tiled_copy(Copy_Atom<CopyInst, Element>{},
-                    Layout<Shape <_1,_1>,
-                           Stride<_1,_1>>{},
-                    Layout<Shape <Int<CUBE_H>, Int<CUBE_W>>>{}));
-
-  using SmemCopyAtom = Copy_Atom<SmemCopyOp, Element>;
-  // to make smem_layout[0] or smem_layout[1] to be two dimensional, SmemLayoutAtom.stride is not used in aiu gemm
-  using SmemAtomStride = typename cutlass::platform::conditional<
-    split_on_k,
-    Stride<Int<CUBE_W>, _1>,
-    Stride<_1, Int<CUBE_H>>
-  >::type;
-  using SmemLayoutAtom = Layout<Shape<Int<CUBE_H>, Int<CUBE_W>>, SmemAtomStride>;
-};
+#include "utils_cutlass3.h"
 
 using namespace cute;
 
@@ -901,7 +747,6 @@ struct CollectiveMma<
 
   static constexpr int MmaTileM = TiledMma().template tile_size_mnk<0>();
   static constexpr int MmaTileN = TiledMma().template tile_size_mnk<1>();
-  static constexpr auto SplitAIU = get_aiu_split_config<CTA_M, CTA_N, MmaTileM, MmaTileN>();
 
   // ScaleA
   using GmemTiledCopyScaleA = decltype(
@@ -1134,7 +979,7 @@ struct CollectiveMma<
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
       if (k_tile_count > 0) {
-        copy_aiu_v2<SplitAIU>(
+        copy_aiu(
           gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
           gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
           warp_idx
@@ -1261,7 +1106,7 @@ CUTLASS_PRAGMA_UNROLL
         __syncthreads();
 
         if (k_tile_count > 0) {
-          copy_aiu_v2<SplitAIU>(
+          copy_aiu(
             gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
             gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
             warp_idx
@@ -1684,12 +1529,8 @@ public:
         static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
         static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
 
-        static constexpr int MmaTileM = TiledMma().template tile_size_mnk<0>();
-        static constexpr int MmaTileN = TiledMma().template tile_size_mnk<1>();
-        static constexpr auto SplitAIU = get_aiu_split_config<BLOCK_M, BLOCK_N, MmaTileM, MmaTileN>();
-
-        using DefaultOperandA = DefaultGemm_AIU_Operand_v2<SplitAIU, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
-        using DefaultOperandB = DefaultGemm_AIU_Operand_v2<SplitAIU, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
+        using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
+        using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
         // A
         using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
         using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;

@@ -25,28 +25,9 @@
 #include "ppu/cutlass/gemm/dispatch_policy.hpp"
 #include "tools/util/include/cutlass/util/packed_stride.hpp"
 #include "scheduler_cutlass3.cuh"
+#include "utils_cutlass3.h"
 
 #include "ppu/ppu_include.hpp"
-
-template <typename GemmKernel>
-inline int compute_occupancy_for_kernel()
-{
-  int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
-  if (smem_size > (48 << 10)) {
-    cudaError_t result;
-    result = cudaFuncSetAttribute(cutlass::device_kernel<GemmKernel>,
-                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  smem_size);
-  }
-
-  int max_active_blocks = -1;
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &max_active_blocks, cutlass::device_kernel<GemmKernel>, GemmKernel::MaxThreadsPerBlock, smem_size);
-
-  // printf("compute_occupancy_for_kernel, smem_size = %d, max_active_blocks = %d\n", smem_size, max_active_blocks);
-//   max_active_blocks = 12;
-  return max_active_blocks;
-}
 
 using namespace cute;
 
