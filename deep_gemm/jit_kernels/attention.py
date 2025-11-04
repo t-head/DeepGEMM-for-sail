@@ -6,8 +6,11 @@ from typing import Tuple
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info
 
+def align(value, alignment):
+    return (value + alignment - 1) // alignment * alignment
+
 # C++ code templates
-includes = ('"../deep_gemm/fp8_mqa_logits.cuh"', )
+includes = ('"../deep_gemm/ppu_mqa_logits.cuh"', )
 template = """
 using namespace deep_gemm;
 
@@ -113,8 +116,7 @@ def mqa_logits_common(q: torch.Tensor, q_scales: torch.Tensor,
         print("score_mul_weight_reduce64_mul_kscale = ", score_mul_weight_reduce64_mul_kscale)
         # import pdb;pdb.set_trace()
 
-    def align(value, alignment):
-        return (value + alignment - 1) // alignment * alignment
+
 
     # defalut tile config for fp8 and int8
     block_qh = 256
@@ -130,7 +132,7 @@ def mqa_logits_common(q: torch.Tensor, q_scales: torch.Tensor,
     assert(seq_len_alignment % block_q == 0)
     aligned_seq_len = align(seq_len_q, seq_len_alignment)
     aligned_seq_len_kv = align(seq_len_k + block_kv, 4)
-    logits = torch.zeros(aligned_seq_len, aligned_seq_len_kv, dtype=torch.float, device=q.device)
+    logits = torch.empty(aligned_seq_len, aligned_seq_len_kv, dtype=torch.float, device=q.device)
     logits = logits[0:seq_len_q, 0:seq_len_k]
 
     # Auto-tuning with compilation
@@ -152,7 +154,7 @@ def mqa_logits_common(q: torch.Tensor, q_scales: torch.Tensor,
     args = (q, k, k_scales, weights_update, cu_seq_len_k_start, cu_seq_len_k_end, logits,
             seq_len_q, seq_len_k, aligned_seq_len_kv, stream, num_sms)
     runtime = jit_tuner.compile_and_tune(
-        name='attention_mqa_logits_fp8',
+        name='attention_mqa_logits_' + ElementQK,
         keys={'ElementQK': ElementQK, 'ElementAcc' : ElementAcc,
               'kNumHeads': num_heads, 'kHeadDim': head_dim,
               'BLOCK_QH': block_qh, 'BLOCK_KV': block_kv,
@@ -209,8 +211,189 @@ def int8_mqa_logits(q_s: Tuple[torch.Tensor],
     k, k_scales = kv_s
     return mqa_logits_common(q, q_scales, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
 
-def get_paged_mqa_logits_metadata():
-    return
 
-def fp8_paged_mqa_logits():
-    return
+includes_paged = ('"../deep_gemm/ppu_paged_mqa_logits.cuh"', )
+template_paged_metadata = """
+using namespace deep_gemm;
+constexpr uint32_t kAlignedBatchSize = {kAlignedBatchSize};
+constexpr uint32_t SPLIT_KV = {SPLIT_KV};
+constexpr uint32_t kNumSMs = {kNumSMs};
+launch_paged_mqa_logits_metadata<kAlignedBatchSize, SPLIT_KV, kNumSMs>(
+    batch_size, (uint32_t*)context_lens, (uint32_t*)schedule_metadata, stream);
+"""
+
+template_paged = """
+using namespace deep_gemm;
+// Templated args from Python JIT call
+using ElementQK = {ElementQK}; //cutlass::bfloat16_t or cutlass::float_e4m3_t
+using ElementAcc = {ElementAcc};
+constexpr uint32_t kNextN = {kNextN};
+constexpr uint32_t kNumHeads = {kNumHeads};
+constexpr uint32_t kHeadDim = {kHeadDim};
+constexpr uint32_t BLOCK_KV = {BLOCK_KV};
+constexpr uint32_t kNumQStages = {kNumQStages};
+constexpr uint32_t kNumKVStages = {kNumKVStages};
+constexpr uint32_t SPLIT_KV = {SPLIT_KV};
+
+// Make a templated GEMM
+using atten_t = PagedAttention<ElementQK, ElementAcc, kNextN, kNumHeads, kHeadDim, BLOCK_KV, kNumQStages, kNumKVStages, SPLIT_KV>;
+
+// Launch kernel
+atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, batch_size, logits_stride, block_table_stride,
+             (uint32_t*)context_lens, logits, (uint32_t*)block_table, (uint32_t*)schedule_meta, stream, num_sms);
+"""
+
+
+def get_paged_mqa_logits_metadata(context_lens: torch.Tensor,
+                                  block_kv: int,
+                                  num_sms: int):
+    batch_size = context_lens.shape[0]
+    assert(context_lens.dtype == torch.int32)
+    assert(context_lens.is_contiguous())
+
+    num_math_warpgroups = 4
+    aligned_batch_size = align(batch_size, 32)
+    split_kv = block_kv * num_math_warpgroups
+
+    schedule_metadata = torch.empty((num_sms + 1, 2), dtype=context_lens.dtype, device=context_lens.device)
+
+    num_sms = get_num_sms()
+    stream = torch.cuda.current_stream()
+    args = (batch_size, context_lens, schedule_metadata, stream)
+    runtime = jit_tuner.compile_and_tune(
+        name='attention_paged_mqa_logits_metadata',
+        keys={'kAlignedBatchSize': aligned_batch_size,
+              'SPLIT_KV': split_kv,
+              'kNumSMs': num_sms},
+        space=(),
+        includes=includes_paged,
+        arg_defs=(('batch_size', int),
+                  ('context_lens', torch.int32),
+                  ('schedule_metadata', torch.int32),
+                  ('stream', torch.cuda.Stream)),
+        template=template_paged_metadata,
+        args=args,
+        jit_include_dir='cutlass3'
+    )
+
+    runtime(*args)
+
+    return schedule_metadata
+
+def fp8_paged_mqa_logits(q: torch.Tensor,
+                         fused_kv_cache: torch.Tensor,
+                         weights: torch.Tensor,
+                         context_lens: torch.Tensor,
+                         block_table: torch.Tensor,
+                         schedule_meta: torch.Tensor,
+                         max_context_len: int,
+                         clean_logits: bool = True):
+
+    batch_size, next_n, num_heads, head_dim = q.shape
+    num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf = fused_kv_cache.shape
+    batch_size_ = context_lens.shape[0]
+    batch_size_next_n, num_heads_ = weights.shape
+    batch_size__, max_block_len = block_table.shape
+    schedule_meta_size, meta_info_size = schedule_meta.shape
+    kv_cache_stride_bytes = fused_kv_cache.stride(0)
+    block_table_stride = block_table.stride(0)
+
+    size_of_float = 4
+    num_sms = get_num_sms()
+    assert(batch_size == batch_size_ and batch_size == batch_size__)
+    assert(batch_size_next_n == batch_size * next_n)
+    assert(num_heads == num_heads_ and num_heads_kv == 1)
+    # assert(head_dim_with_sf == head_dim + size_of_float)
+    assert(schedule_meta_size == num_sms + 1 and meta_info_size == 2)
+
+    assert(next_n == 1 or next_n == 2)
+    assert(block_kv == 64)
+
+    assert(q.is_contiguous())
+    assert(kv_cache_stride_bytes % size_of_float == 0)
+    # assert(fused_kv_cache.stride(1) == head_dim_with_sf)
+    # assert(fused_kv_cache.stride(2) == head_dim_with_sf)
+    assert(fused_kv_cache.stride(3) == 1)
+    assert(weights.is_contiguous())
+    assert(context_lens.is_contiguous())
+    assert(block_table.stride(1) == 1)
+    assert(schedule_meta.is_contiguous())
+
+    # assert(q.dtype == torch.float8_e4m3fn)
+    # assert(fused_kv_cache.dtype == torch.uint8)
+    assert(weights.dtype == torch.float)
+    assert(context_lens.dtype == torch.int32)
+    assert(block_table.dtype == torch.int32)
+    assert(schedule_meta.dtype == torch.int32)
+
+
+    # Derive FP8 values and SF tensor from KV cache
+    k = torch.as_strided(
+        input=fused_kv_cache,
+        size=(num_kv_blocks, block_kv, head_dim),
+        stride=(kv_cache_stride_bytes, head_dim, 1),
+    )
+
+    # import pdb;pdb.set_trace()
+    k_scales = torch.as_strided(
+        input=fused_kv_cache,
+        size=(num_kv_blocks, block_kv),
+        stride=(int(kv_cache_stride_bytes / size_of_float), 1),
+        storage_offset = block_kv * head_dim,
+    ).to(torch.float)
+
+    debug = False
+    if debug:
+        print("kv size = ", k.size(), " stride = ", k.stride())
+        print("context_lens[0] = ", context_lens[0] )
+        # sum0 = q[0,0,0,:] * k[]
+        # print(q[])
+        # import pdb;pdb.set_trace()
+
+    num_math_warp_groups = 1
+    aligned_max_context_len = align(max_context_len, num_math_warp_groups * block_kv)
+    logits = torch.zeros((batch_size * next_n, aligned_max_context_len), dtype=torch.float, device=q.device)
+    logits = logits[..., :max_context_len]
+
+    num_q_stages = 3
+    num_kv_stages = 3
+    split_kv = num_math_warp_groups * block_kv
+    logits_stride = aligned_max_context_len
+
+    # Construct TMAs
+    assert(head_dim == 32 or head_dim == 64 or head_dim == 128)
+
+    global includes_paged, template_paged
+    ElementQK = "cutlass::float_e4m3_t"
+    ElementAcc = "float"
+    if q.dtype == torch.bfloat16:
+        ElementQK = 'cutlass::bfloat16_t'
+    elif q.dtype == torch.int8:
+        ElementQK = 'int8_t'
+        ElementAcc = "int32_t"
+
+    num_sms = get_num_sms()
+    stream = torch.cuda.current_stream()
+    args = (q, k, k_scales, weights, batch_size, logits_stride, block_table_stride, context_lens, logits,
+            block_table, schedule_meta, stream, num_sms)
+    runtime = jit_tuner.compile_and_tune(
+        name='attention_mqa_logits_' + ElementQK,
+        keys={'ElementQK': ElementQK, 'ElementAcc' : ElementAcc,
+              'kNextN' : next_n, 'kNumHeads': num_heads,
+              'kHeadDim': head_dim, 'BLOCK_KV': block_kv,
+              'kNumQStages': num_q_stages, 'kNumKVStages': num_kv_stages,
+              'SPLIT_KV': split_kv},
+        space=(),
+        includes=includes_paged,
+        arg_defs=(('q', q.dtype), ('k', k.dtype), ('k_scales', torch.float), ('weights', torch.float),
+                  ('batch_size', int), ('logits_stride', int), ('block_table_stride', int), ('context_lens', torch.int32),
+                  ('logits', torch.float), ('block_table', torch.int32), ('schedule_meta', torch.int32),
+                  ('stream', torch.cuda.Stream), ('num_sms', int)),
+        template=template_paged,
+        args=args,
+        jit_include_dir='cutlass3'
+    )
+
+    runtime(*args)
+
+    return logits
