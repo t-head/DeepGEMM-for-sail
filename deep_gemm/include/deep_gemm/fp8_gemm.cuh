@@ -100,6 +100,9 @@ public:
   using TileSchedulerArguments = typename TileScheduler::Arguments;
   using TileSchedulerParams = typename TileScheduler::Params;
   using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
+  using ScaleGranularityShape = Shape<_1,_128,_128>;
+  using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, true, true>(ScaleGranularityShape{}));
+  using LayoutSFA           = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
 
   static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
 
@@ -283,13 +286,14 @@ public:
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
       const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_scalea;
       const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + offset_b / 128 / 128;
+      LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(M, N, K, 1));
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       CollectiveMainloop collective_mainloop;
       // update actual global ptr offset
       MainloopParams update_params = {
         ptr_A, params.mainloop.dA, ptr_B, params.mainloop.dB, 4,
-        ptr_scale_A, params.mainloop.layout_SFA,
+        ptr_scale_A, layout_SFA,
         ptr_scale_B, params.mainloop.layout_SFB
       };
       problem_shape_MNKL = ProblemShape{M, N, K, L};
@@ -400,7 +404,7 @@ public:
 
     using ScaleGranularityShape = Shape<_1,_128,_128>;
 
-    using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(ScaleGranularityShape{}));
+    using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, true, true>(ScaleGranularityShape{}));
     using LayoutSFA           = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
     using LayoutSFB           = decltype(ScaleConfig::deduce_layoutSFB());                     // Layout type for SFB matrix operand
 

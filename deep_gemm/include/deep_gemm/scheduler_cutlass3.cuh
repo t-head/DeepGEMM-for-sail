@@ -229,7 +229,7 @@ struct DeepGemmScheduler {
         if constexpr (kGemmType == GemmType::GroupedMasked) {
             return int64_t(curr_group_idx) * param.shape_m * SHAPE_K / 128;
         } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
-            return int64_t(curr_cumsum_m);
+            return int64_t(curr_cumsum_m) * SHAPE_K / 128;
         } else {
             return 0;
         }

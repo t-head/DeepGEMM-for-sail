@@ -222,7 +222,7 @@ def get_best_configs_dense(m: int, n: int, k: int, num_groups: int, num_sms: int
         best_num_stages, best_smem_config, ppu_capacity = None, None, 262144
         # barrier impl only support 128
         block_k = 128
-        stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
+        stage_candidates = tuple(filter(lambda s: s <= k // block_k, (4, 3, 2)))
         # if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16 or best_block_m == 32:
         if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4):
             stage_candidates = (4, 3, 2)
