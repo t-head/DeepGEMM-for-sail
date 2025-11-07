@@ -10,7 +10,6 @@ from .gemm_int8_lut import get_best_configs_from_lut
 
 # C++ code templates
 includes = ('"deep_gemm/int8_gemm.cuh"', )
-includes_cutlass3 = ('"../deep_gemm/int8_gemm_cutlass3.cuh"', )
 template = """
 using namespace deep_gemm;
 
@@ -30,6 +29,31 @@ using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups,
 // Launch kernel
 gemm_t::run(out, nullptr,
             m, 0, lhs, lhs_scales, rhs, rhs_scales,
+            stream, num_sms, smem_size);
+"""
+
+includes_cutlass3 = ('"../deep_gemm/int8_gemm_cutlass3.cuh"', )
+template_cutlass3 = """
+using namespace deep_gemm;
+
+// Templated args from Python JIT call
+using ElementAB = {ElementAB};
+using ElementAcc = {ElementAcc};
+constexpr auto N = {N}, K = {K};
+constexpr auto BLOCK_M = {BLOCK_M};
+constexpr auto BLOCK_N = {BLOCK_N};
+constexpr auto WARP_M = {WARP_M};
+constexpr auto WARP_N = {WARP_N};
+constexpr auto BLOCK_K = {BLOCK_K};
+constexpr auto kNumGroups = 1;
+constexpr auto kNumStages = {NUM_STAGES};
+
+// Make a templated grouped GEMM
+using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm>;
+
+// Launch kernel
+gemm_t::run(out, nullptr,
+            m, 0, (ElementAB*)lhs, lhs_scales, (ElementAB*)rhs, rhs_scales,
             stream, num_sms, smem_size);
 """
 
@@ -173,7 +197,7 @@ def get_best_configs_dense(m: int, n: int, k: int, num_groups: int, num_sms: int
                 (best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages) = (16, 128, 128, 16, 32, 4)
 
 
-    num_min_sms = 20
+    num_min_sms = num_sms
     best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1)
 
     assert best_block_m is not None
@@ -430,9 +454,10 @@ def generate_search_space():
             space.append(config)
     return space
 
-def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
-                         rhs: Tuple[torch.Tensor, torch.Tensor],
-                         out: torch.Tensor, configs = None) -> None:
+# support both int8 and fp8 with per-tensor per-channel scales
+def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
+                             rhs: Tuple[torch.Tensor, torch.Tensor],
+                             out: torch.Tensor, configs = None) -> None:
     lhs, lhs_scales = lhs
     rhs, rhs_scales = rhs
     m, k = lhs.shape
@@ -442,8 +467,11 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Type and shape checks
     assert m == m_ and n == n_ and k == k_
     assert n > 0 and k > 0
-    assert lhs.dtype == torch.int8 and lhs_scales.dtype == torch.float32
-    assert rhs.dtype == torch.int8 and rhs_scales.dtype == torch.float32
+    assert lhs.dtype == torch.int8 or lhs.dtype == torch.float8_e4m3fn
+    assert rhs.dtype == torch.int8 or rhs.dtype == torch.float8_e4m3fn
+    assert lhs.dtype == rhs.dtype
+    assert lhs_scales.shape[0] == m and lhs_scales.dtype == torch.float32
+    assert rhs_scales.shape[0] == n and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
 
@@ -452,7 +480,7 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         return
 
     # Auto-tuning with compilation
-    global includes, template
+    global includes, template, includes_cutlass3, template_cutlass3
 
     num_sms = get_num_sms()
     if configs is not None:
@@ -465,23 +493,23 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m, torch.cuda.current_stream(), num_sms, smem_config[0])
 
-    template_updated = template
-    if extra_info['use_multistage_on_N']:
-        template_updated = template.replace("GemmType::DenseGemm>", "GemmType::DenseGemm,1>")
+    ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
+    ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
 
     runtime = jit_tuner.compile_and_tune(
-        name='gemm_int8_int8_bf16_nt',
-        keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+        name='gemm_' + ElementAB + '_bf16_nt',
+        keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
+              'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'NUM_STAGES': num_stages},
         space=(),
         # space=generate_search_space(),
         includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
-        arg_defs=(('lhs', torch.int8), ('lhs_scales', torch.float),
-                  ('rhs', torch.int8), ('rhs_scales', torch.float),
+        arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
+                  ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16), ('m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template_updated,
+        template=template_cutlass3 if extra_info['use_cutlass3'] else template,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
@@ -489,3 +517,8 @@ def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         return
     # Run the kernel
     runtime(*args)
+
+def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
+                         rhs: Tuple[torch.Tensor, torch.Tensor],
+                         out: torch.Tensor, configs = None) -> None:
+    gemm_a8w8_per_channel_nt(lhs, rhs, out, configs)

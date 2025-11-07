@@ -6,6 +6,7 @@ from typing import Tuple
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, CompuleMode, compile_mode
 from .gemm_fp8_lut import get_best_configs_from_lut
+from .gemm_int8 import gemm_a8w8_per_channel_nt
 
 # C++ code templates
 includes = ('"../deep_gemm/fp8_gemm.cuh"', )
@@ -383,8 +384,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
 
-def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
-                         rhs: Tuple[torch.Tensor, torch.Tensor],
+def gemm_fp8_fp8_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
+                         rhs_: Tuple[torch.Tensor, torch.Tensor],
                          out: torch.Tensor, configs = None) -> None:
     """
     Do a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
@@ -401,11 +402,14 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         out: the BF16 output tensor of shape `[m, n]`, representing the result.
         configs: The best configs from the framework auto tuning.
     """
-    lhs, lhs_scales = lhs
-    rhs, rhs_scales = rhs
+    lhs, lhs_scales = lhs_
+    rhs, rhs_scales = rhs_
     m, k = lhs.shape
     n, k_ = rhs.shape
     m_, n_ = out.shape
+
+    if lhs_scales.dim() == 1 and lhs_scales.shape[0] == m and rhs_scales.dim() == 1 and rhs_scales.shape[0] == n:
+        return gemm_a8w8_per_channel_nt(lhs_, rhs_, out, configs)
 
     assert n % 64 == 0 and k % 128 == 0
 

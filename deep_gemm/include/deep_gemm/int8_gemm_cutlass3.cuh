@@ -733,6 +733,11 @@ struct CollectiveMma<
       SmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
 
+  // tile256x256 && !NT trans, use sigle warp to issue AIU LOAD
+  static constexpr bool SplitAIU = size<0>(TileShape{}) != 256 || size<1>(TileShape{}) != 256
+              || (is_same_v<StrideA, cutlass::detail::TagToStrideA_t<layout::ColumnMajor>>
+                  && is_same_v<StrideB, cutlass::detail::TagToStrideB_t<layout::RowMajor>>);
+
   constexpr static uint32_t CTA_M = shape<0>(TileShape{});
   constexpr static uint32_t CTA_N = shape<1>(TileShape{});
   constexpr static uint32_t CTA_K = shape<2>(TileShape{});
@@ -979,7 +984,7 @@ struct CollectiveMma<
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
       if (k_tile_count > 0) {
-        copy_aiu(
+        copy_aiu<SplitAIU>(
           gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
           gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
           warp_idx
@@ -1106,7 +1111,7 @@ CUTLASS_PRAGMA_UNROLL
         __syncthreads();
 
         if (k_tile_count > 0) {
-          copy_aiu(
+          copy_aiu<SplitAIU>(
             gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
             gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
             warp_idx
@@ -1474,7 +1479,8 @@ public:
 
 namespace deep_gemm {
 
-template <uint32_t SHAPE_N, uint32_t SHAPE_K,
+template <typename ElementAB, typename ElementAcc,
+          uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t WARP_M, uint32_t WARP_N,
           uint32_t kNumGroups, uint32_t kNumStages,
@@ -1486,11 +1492,11 @@ public:
     Gemm() = default;
 
     static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
-                    uint32_t shape_m, uint32_t expected_m, int8_t* gmem_a, float* scales_a,
-                    int8_t * gmem_b, float* scales_b,
+                    uint32_t shape_m, uint32_t expected_m, ElementAB* gmem_a, float* scales_a,
+                    ElementAB * gmem_b, float* scales_b,
                     cudaStream_t stream, int num_sms, uint32_t smem_size) {
-        using ElementA    = int8_t;
-        using ElementB    = int8_t;
+        using ElementA    = ElementAB;
+        using ElementB    = ElementAB;
         using ElementC    = cutlass::bfloat16_t;
         using LayoutA     = cutlass::layout::RowMajor;
         using LayoutB     = cutlass::layout::ColumnMajor;
@@ -1508,7 +1514,7 @@ public:
         static constexpr int WarpOnM = BLOCK_M / WARP_M;
         static constexpr int WarpOnN = BLOCK_N / WARP_N;
 
-        using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<int8_t,int8_t,int32_t>::type;
+        using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ElementAB,ElementAB,ElementAcc>::type;
         using TiledMma = TiledMMA<
             MMA_Atom<MmaInst>,
             Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group

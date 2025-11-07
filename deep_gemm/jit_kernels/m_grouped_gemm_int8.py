@@ -9,7 +9,6 @@ import os
 
 # C++ code templates
 includes = ('"deep_gemm/int8_gemm.cuh"', )
-includes_cutlass3 = ('"../deep_gemm/int8_gemm_cutlass3.cuh"', )
 template = """
 using namespace deep_gemm;
 
@@ -32,6 +31,30 @@ gemm_t::run(out, grouped_layout,
             stream, num_sms, smem_size);
 """
 
+includes_cutlass3 = ('"../deep_gemm/int8_gemm_cutlass3.cuh"', )
+template_cutlass3 = """
+using namespace deep_gemm;
+
+// Templated args from Python JIT call
+using ElementAB = {ElementAB};
+using ElementAcc = {ElementAcc};
+constexpr auto N = {N}, K = {K};
+constexpr auto BLOCK_M = {BLOCK_M};
+constexpr auto BLOCK_N = {BLOCK_N};
+constexpr auto BLOCK_K = {BLOCK_K};
+constexpr auto WARP_M = {WARP_M};
+constexpr auto WARP_N = {WARP_N};
+constexpr auto kNumGroups = {NUM_GROUPS};
+constexpr auto kNumStages = {NUM_STAGES};
+
+// Make a templated grouped GEMM
+using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}>;
+
+// Launch kernel
+gemm_t::run(out, grouped_layout,
+            m, expected_m, (ElementAB*)lhs, lhs_scales, (ElementAB*)rhs, rhs_scales,
+            stream, num_sms, smem_size);
+"""
 
 includes_gemv = ('"deep_gemm/gemvt.cuh"', )
 template_gemv = """
@@ -57,9 +80,9 @@ gemm_v::run(out, grouped_layout,
             lhs_scales, rhs_scales);
 """
 
-def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Tensor],
-                                                rhs: Tuple[torch.Tensor, torch.Tensor],
-                                                out: torch.Tensor, m_indices: torch.Tensor, configs = None) -> None:
+def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Tensor],
+                                                  rhs: Tuple[torch.Tensor, torch.Tensor],
+                                                  out: torch.Tensor, m_indices: torch.Tensor, configs = None) -> None:
     lhs, lhs_scales = lhs
     rhs, rhs_scales = rhs
     m, k = lhs.shape
@@ -71,8 +94,11 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
     assert m == m_ == m__ and k == k_ and n == n_
     assert lhs_scales.shape == (m, 1)
     assert rhs_scales.shape == (num_groups, n, 1)
-    assert lhs.dtype == torch.int8 and lhs_scales.dtype == torch.float32
-    assert rhs.dtype == torch.int8 and rhs_scales.dtype == torch.float32
+    assert lhs.dtype == torch.int8 or lhs.dtype == torch.float8_e4m3fn
+    assert rhs.dtype == torch.int8 or rhs.dtype == torch.float8_e4m3fn
+    assert lhs.dtype == rhs.dtype
+    assert lhs_scales.dtype == torch.float32
+    assert rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert m_indices.dtype == torch.int32
     assert lhs.is_contiguous() and rhs.is_contiguous()
@@ -87,7 +113,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
         return
 
     # Auto-tuning with compilation
-    global includes, template
+    global includes, template, includes_cutlass3, template_cutlass3
     num_sms = get_num_sms()
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
@@ -97,12 +123,16 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
 
     extra_info = get_extra_info()
 
+    ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
+    ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
+
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices, m, expected_m, num_groups,
             torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_int8_int8_bf16_nt',
-        keys={'N': n, 'K': k,
+        keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
+              'N': n, 'K': k,
               'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'BLOCK_N_PADDING': smem_config[2],
@@ -110,13 +140,13 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
               'GEMM_TYPE': 'GroupedContiguous'},
         space=(),
         includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
-        arg_defs=(('lhs', torch.int8), ('lhs_scales', torch.float),
-                  ('rhs', torch.int8), ('rhs_scales', torch.float),
+        arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
+                  ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('m', int),
                   ('num_groups', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template,
+        template=template_cutlass3 if extra_info['use_cutlass3'] else template,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
@@ -125,10 +155,14 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
     # Run the kernel
     runtime(*args)
 
+def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Tensor],
+                                                rhs: Tuple[torch.Tensor, torch.Tensor],
+                                                out: torch.Tensor, m_indices: torch.Tensor, configs = None) -> None:
+    m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs, rhs, out, m_indices, configs)
 
-def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor],
-                                          rhs: Tuple[torch.Tensor, torch.Tensor],
-                                          out: torch.Tensor, masked_m: torch.Tensor, expected_m: int, configs = None) -> None:
+def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor],
+                                              rhs: Tuple[torch.Tensor, torch.Tensor],
+                                              out: torch.Tensor, masked_m: torch.Tensor, expected_m: int, configs = None) -> None:
     lhs, lhs_scales = lhs
     rhs, rhs_scales = rhs
     num_groups, m, k = lhs.shape
@@ -142,8 +176,11 @@ def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tenso
     assert expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0
     assert lhs_scales.shape == (num_groups, m, 1)
     assert rhs_scales.shape == (num_groups, n, 1)
-    assert lhs.dtype == torch.int8 and lhs_scales.dtype == torch.float32
-    assert rhs.dtype == torch.int8 and rhs_scales.dtype == torch.float32
+    assert lhs.dtype == torch.int8 or lhs.dtype == torch.float8_e4m3fn
+    assert rhs.dtype == torch.int8 or rhs.dtype == torch.float8_e4m3fn
+    assert lhs.dtype == rhs.dtype
+    assert lhs_scales.dtype == torch.float32
+    assert rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert masked_m.dtype == torch.int32
     assert lhs.is_contiguous() and rhs.is_contiguous()
@@ -154,7 +191,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tenso
     assert rhs_scales.is_contiguous()
 
     # Auto-tuning with compilation
-    global includes, template
+    global includes, template, includes_cutlass3, template_cutlass3
     num_sms = get_num_sms()
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
@@ -167,28 +204,28 @@ def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tenso
     if num_groups > 1 and m > block_m:
         assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
 
-    template_updated = template
-    if extra_info['use_multistage_on_N']:
-        template_updated = template.replace("GemmType::{GEMM_TYPE}>", "GemmType::{GEMM_TYPE},1>")
+    ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
+    ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             masked_m, m, expected_m,
             torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
-        name='m_grouped_gemm_int8_int8_bf16_nt',
-        keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+        name='m_grouped_gemm_' + ElementAB + '_nt',
+        keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
+              'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'GEMM_TYPE': 'GroupedMasked'},
         space=(),
         includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
-        arg_defs=(('lhs', torch.int8), ('lhs_scales', torch.float),
-                  ('rhs', torch.int8), ('rhs_scales', torch.float),
+        arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
+                  ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template_updated,
+        template=template_cutlass3 if extra_info['use_cutlass3'] else template,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
@@ -197,11 +234,15 @@ def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tenso
     # Run the kernel
     runtime(*args)
 
+def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor],
+                                            rhs: Tuple[torch.Tensor, torch.Tensor],
+                                            out: torch.Tensor, masked_m: torch.Tensor, expected_m: int, configs = None) -> None:
+    m_grouped_gemm_a8w8_per_channel_nt_masked(lhs, rhs, out, masked_m, expected_m, configs)
 
-def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
-                                     rhs: Tuple[torch.Tensor],
-                                     out: torch.Tensor, m_indices: torch.Tensor,
-                                     m_rows: torch.Tensor = None, configs = None) -> None:
+def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
+                                             rhs: Tuple[torch.Tensor],
+                                             out: torch.Tensor, m_indices: torch.Tensor,
+                                             m_rows: torch.Tensor = None, configs = None) -> None:
     lhs, lhs_scales = lhs
     rhs, rhs_scales = rhs
     m, k = lhs.shape
@@ -213,8 +254,11 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
     assert m == m_ == m__ and k == k_ and n == n_
     assert lhs_scales.shape == (m, 1)
     assert rhs_scales.shape == (num_groups, n, 1)
-    assert lhs.dtype == torch.int8 and lhs_scales.dtype == torch.float32
-    assert rhs.dtype == torch.int8 and rhs_scales.dtype == torch.float32
+    assert lhs.dtype == torch.int8 or lhs.dtype == torch.float8_e4m3fn
+    assert rhs.dtype == torch.int8 or rhs.dtype == torch.float8_e4m3fn
+    assert lhs.dtype == rhs.dtype
+    assert lhs_scales.dtype == torch.float32
+    assert rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert m_indices.dtype == torch.int32
     assert lhs.is_contiguous() and rhs.is_contiguous()
@@ -231,7 +275,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
     expected_m = ceil_div(m, num_groups)
 
     # Auto-tuning with compilation
-    global includes, template, includes_gemv, template_gemv
+    global includes, template, includes_gemv, template_gemv, includes_cutlass3, template_cutlass3
     num_sms = get_num_sms()
     use_gemv = False
 
@@ -243,7 +287,7 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
         # NPerThread = 1
         BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, USE_SMALL_K = get_gemv_best_configs(m, n, k, num_groups, num_sms, torch.int8)
 
-        if ThreadPerN != -1:
+        if ThreadPerN != -1 and lhs.dtype != torch.float8_e4m3fn:
             args = (lhs, rhs, out,
                 m_indices, m,
                 torch.cuda.current_stream(),
@@ -278,6 +322,9 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
 
         extra_info = get_extra_info()
 
+        ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
+        ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
+
         if m_rows is None:
             counts = torch.bincount(m_indices)
             min_n = min(counts.size(0), num_groups)
@@ -290,22 +337,23 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
             torch.cuda.current_stream(), num_sms, smem_config[0])
 
         runtime = jit_tuner.compile_and_tune(
-            name='m_grouped_gemm_int8_int8_bf16_nt',
-            keys={'N': n, 'K': k,
-                'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
-                'WARP_M': warp_m, 'WARP_N': warp_n,
-                'BLOCK_N_PADDING': smem_config[2],
-                'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
-                'GEMM_TYPE': 'GroupedNoPad'},
+            name='m_grouped_gemm_' + ElementAB + '_nt',
+            keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
+                  'N': n, 'K': k,
+                  'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+                  'WARP_M': warp_m, 'WARP_N': warp_n,
+                  'BLOCK_N_PADDING': smem_config[2],
+                  'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
+                  'GEMM_TYPE': 'GroupedNoPad'},
             space=(),
             includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
-            arg_defs=(  ('lhs', torch.int8), ('lhs_scales', torch.float),
-                        ('rhs', torch.int8), ('rhs_scales', torch.float),
+            arg_defs=(  ('lhs', lhs.dtype), ('lhs_scales', torch.float),
+                        ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                         ('out', torch.bfloat16),
                         ('grouped_layout', torch.int32), ('m', int),
                         ('num_groups', int), ('expected_m', int),
                         ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-            template=template,
+            template=template_cutlass3 if extra_info['use_cutlass3'] else template,
             jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
             args=args
         )
@@ -313,3 +361,9 @@ def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
         return
     # Run the kernel
     runtime(*args)
+
+def m_grouped_gemm_int8_int8_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
+                                     rhs: Tuple[torch.Tensor],
+                                     out: torch.Tensor, m_indices: torch.Tensor,
+                                     m_rows: torch.Tensor = None, configs = None) -> None:
+    m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs, rhs, out, m_indices, m_rows, configs)
