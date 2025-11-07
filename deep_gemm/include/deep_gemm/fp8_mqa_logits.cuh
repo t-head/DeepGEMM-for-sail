@@ -476,7 +476,7 @@ public:
         if (num_kv_blocks > 0) {
             // Issue AIU Q
             copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,0), tBsB(_,_,_,0), warp_idx);
-            if (sizeof(ElementQK) == 1 && warp_idx < WAPR_LIMIT_SFB) {
+            if (warp_idx < WAPR_LIMIT_SFB) {
                 copy_if(gmem_tiled_copy_scaleB, tSFBpSFB(_,_,_,0), tSFBgSFB(_,_,_,0), tSFBsSFB(_,_,_,0));
             }
 
@@ -516,9 +516,9 @@ public:
             #pragma unroll
             for (uint32_t j = 0; j < kNumHeads / 4; ++ j) {
 #if __HGGC_ARCH__ == 150
-                weights[j] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
+                weights[j] = ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
 #else
-                weights[j] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) * 4 + lane_idx % 4);
+                weights[j] = ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) * 4 + lane_idx % 4);
 #endif
             }
         }

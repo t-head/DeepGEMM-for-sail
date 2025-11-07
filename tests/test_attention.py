@@ -132,10 +132,7 @@ def test_mqa_logits():
             for qk_dtype in qk_dtype_list:
                 q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
                 kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
-                if qk_dtype == torch.bfloat16:
-                    weights = torch.ones(seq_len, num_heads, device='cuda', dtype=torch.float32)
-                else:
-                    weights = torch.randn(seq_len, num_heads, device='cuda', dtype=torch.float32)
+                weights = torch.randn(seq_len, num_heads, device='cuda', dtype=torch.float32)
 
                 if disable_cp:
                     ks = torch.zeros(seq_len, dtype=torch.int, device='cuda')
