@@ -1,9 +1,25 @@
 import torch
 import os
 import functools
+from enum import Enum
+import copy
 
 _num_sms = None
 
+class CompuleMode(Enum):
+    COMPILE_AND_RUN = 0
+    #ONLY_COMPILE must be 1 to align with sglang deepgemm usage
+    ONLY_COMPILE = 1
+
+compile_mode = CompuleMode.COMPILE_AND_RUN
+
+def set_compile_mode(mode):
+    global compile_mode
+    compile_mode = mode
+
+def get_compile_mode():
+    global compile_mode
+    return compile_mode
 
 def set_num_sms(num_sms: int) -> None:
     """
@@ -55,7 +71,7 @@ def get_m_alignment_for_contiguous_layout():
     When we do a grouped GEMM in contiguous format, LHS are grouped into several batches along the M axis.
     Since we deal with exactly one sub-matrix of RHS for each GEMM block, batch sizes above should align well
         with GEMM block shape.
-    
+
     Returns:
         Group-level alignment requirement for grouped contiguous layout, which is always 128.
     """
@@ -127,7 +143,7 @@ def get_col_major_tensor(x: torch.Tensor) -> torch.Tensor:
 
     col_major = torch.empty((B, N, M), dtype=x.dtype, device=x.device)
     col_major = col_major.transpose(-2, -1)
-    
+
     col_major[...] = x
 
     if squeeze_dim:
@@ -334,18 +350,23 @@ def get_search_space(d: torch.dtype, gemm_type : str, m:int=0, n:int=0, k:int=0)
             [256, 128, 64, 64, int(block_k / 2), 2],
         ])
 
-    # add block_k / 2 tile for k <256
     tile_list_rtn = []
+    if d == torch.float8_e4m3fn:
+        for tile in tile_list:
+            if tile[4] == block_k and tile[0] != 48:
+                tile_list_rtn.append(tile)
+        return tile_list_rtn
+
+    # add block_k / 2 tile for k <256
     if k != 0 and k <= 512:
         for tile in tile_list:
+            tile_list_rtn.append(tile)
             if tile[4] == block_k:
-                tile_copy = tile
+                tile_copy = copy.deepcopy(tile)
                 tile_copy[4] = int(block_k / 2)
                 tile_list_rtn.append(tile_copy)
-            elif tile[4] < k:
-                tile_list_rtn.append(tile)
     else:
         tile_list_rtn = tile_list
 
-    return tile_list
+    return tile_list_rtn
 
