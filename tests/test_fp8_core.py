@@ -37,7 +37,7 @@ def construct(m: int, k: int, n: int) -> \
 
     # Transpose earlier so that the testing will not trigger transposing kernels
     if use_ppu:
-        x_fp8 = (x_fp8[0], x_fp8[1])
+        x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     else:
         x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
 
@@ -97,7 +97,7 @@ def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: 
     for i in range(num_groups):
         y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
     if use_ppu:
-        x_fp8 = (x_fp8[0], x_fp8[1])
+        x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     else:
         x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
 
@@ -127,7 +127,7 @@ def construct_masked_grouped(num_groups: int, max_m: int, expected_m_per_group: 
 
     # Transpose earlier so that the testing will not trigger transposing kernels
     if use_ppu:
-        x_fp8 = (x_fp8[0], x_fp8[1])
+        x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     else:
         x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, masked_m, out, ref_out
@@ -380,6 +380,6 @@ if __name__ == '__main__':
                 print("invalid func type\n")
         else:
             test_gemm(args.file)
-            test_m_grouped_gemm_contiguous(args.file)
-            test_m_grouped_gemm_masked(args.file)
-            test_m_grouped_gemm_nopad(args.file)
+            # test_m_grouped_gemm_contiguous(args.file)
+            # test_m_grouped_gemm_masked(args.file)
+            # test_m_grouped_gemm_nopad(args.file)

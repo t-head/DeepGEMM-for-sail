@@ -89,7 +89,7 @@ def construct(m: int, k: int, n: int, d: torch.dtype) -> \
         x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
         # Transpose earlier so that the testing will not trigger transposing kernels
         if use_ppu:
-            x_fp8 = (x_fp8[0], x_fp8[1])
+            x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         return x_fp8, y_fp8, out, ref_out
@@ -175,7 +175,7 @@ def construct_contiguous_grouped(num_groups: int, m: int, expected_m_per_group: 
         for i in range(num_groups):
             y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
         if use_ppu:
-            x_fp8 = (x_fp8[0], x_fp8[1])
+            x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         return m, (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), m_indices, out, ref_out.to('cuda')
@@ -216,7 +216,7 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
 
         # Transpose earlier so that the testing will not trigger transposing kernels
         if use_ppu:
-            x_fp8 = (x_fp8[0], x_fp8[1])
+            x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m, out, ref_out.to('cuda')

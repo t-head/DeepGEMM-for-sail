@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, CompuleMode, compile_mode
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, CompuleMode, compile_mode,get_col_major_tma_aligned_tensor
 from .gemm_fp8_lut import get_best_configs_from_lut
 from .gemm_int8 import gemm_a8w8_per_channel_nt
 
@@ -424,6 +424,8 @@ def gemm_fp8_fp8_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
 
     # NOTES: `get_tma_aligned_lhs_scales` may launch a kernel if not processed by previous kernels
+    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
+
     assert rhs_scales.is_contiguous()
 
     # Do nothing if `m` is zero
