@@ -9,7 +9,7 @@ import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_m_alignment_for_contiguous_layout, get_col_major_tensor
 from deep_gemm.jit_kernels.gemm_int8 import get_smem_config
 from deep_gemm.jit_kernels.utils import get_search_space, get_num_sms
-from utils import read_numbers_from_file, parse_dump_file, parse_deepgemm_string_re, judge_device_type,set_cycle
+from utils import read_numbers_from_file, parse_dump_file, parse_deepgemm_string_re, judge_device_type
 from utils import construct_contiguous_grouped, construct_grouped_masked, split_list_into_groups
 from deepgemm_tools import get_supported_configs, get_best_configs
 
@@ -58,7 +58,7 @@ def test_gemm(d: torch.dtype, args = None) -> None:
         print('use default testcase')
 
     x, y, out, ref_out = construct(m, k, n, d)
-    tile_list = get_tile_list(d, m, n, k, num_groups, 'dense', True)
+    tile_list = get_tile_list(d, m, n, k, num_group, 'dense', True)
 
     enable_multithread = not bool(cycle)
     if enable_multithread:
@@ -108,7 +108,7 @@ def test_m_grouped_gemm_contiguous(d: torch.dtype, args=None) -> None:
         num_groups, expected_m_per_group, m, n, k, distribution = args['groups'], args['em'], args['m'], args['n'], args['k'], args['distribution']
     else:
         print('use default testcase')
-    m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, expected_m_per_group, k, n, d, distribution, get_m_alignment_for_contiguous_layout())
+    m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, get_m_alignment_for_contiguous_layout())
     tile_list = get_tile_list(d, m, n, k, num_groups, 'contiguous', True)
 
     enable_multithread = not bool(cycle)
@@ -166,7 +166,7 @@ def test_m_grouped_gemm_masked(d: torch.dtype, args) -> None:
     else:
         distribute = torch.tensor(distribution, dtype=torch.int32, device='cuda')
 
-    x, y, masked_m, out, ref_out = construct_grouped_masked(num_groups, max_m, expected_m_per_group, k, n, d, distribution)
+    x, y, masked_m, out, ref_out = construct_grouped_masked(num_groups, max_m, k, n, d, distribution, expected_m_per_group)
 
     tile_list = get_tile_list(d, max_m, n, k, num_groups, 'masked', True)
 
@@ -230,7 +230,7 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, args = None) -> None:
     else:
         distribute = torch.tensor(distribution, dtype=torch.int32, device='cuda')
 
-    m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, expected_m_per_group, k, n, d, distribution, 1)
+    m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1)
     tile_list = get_tile_list(d, m, n, k, num_groups, 'nopad', True)
     '''
     block_m, block_n, block_k, warp_m, warp_n, num_stages = 64, 256, 128, 32, 32, 3
@@ -302,7 +302,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    set_cycle(0)
     global cycle
     cycle = 0
     if (args.cycle):

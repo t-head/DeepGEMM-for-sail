@@ -65,7 +65,8 @@ if __name__ == "__main__":
             print("[Warning] caselist shoulde be a file. {} is not exist.", args.caselist)
         with open(args.caselist, "r") as f:
             for line in f:
-                dg_cases.append(line.strip())
+                case = line.strip()[line.find("--format=") + len("--format="):]
+                dg_cases.append(case)
     total = len(dg_cases)
     if len(dg_cases) == 0:
         print("[Warning] Please provide problem cases for tile scan, use --format or --caselist.")
@@ -92,7 +93,8 @@ if __name__ == "__main__":
         os.environ["show_log"] = "1"
         metrics_string = "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,ppu__dram_throughput.avg.pct_of_peak_sustained_elapsed"
         cmd = '{} --clock-control none {} --metrics="{}"  --page=details python {} {} --cycle \
-                2>&1 | tee {}'.format("acu", '--kernel-name "regex:Kernel|device_kernel"', metrics_string, script, case[10:], log_file)
+                2>&1 | tee {}'.format("acu", '--kernel-name "regex:Kernel|device_kernel"', metrics_string, script, "--format=" + case, log_file)
+        print(cmd)
         ret = run_cmd(cmd)
         if ret != None and ret.returncode == 0:
             best_config = parse(log_file, "./logs/{}".format(fname))
