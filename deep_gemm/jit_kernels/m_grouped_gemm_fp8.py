@@ -4,6 +4,9 @@ from typing import Tuple
 from .gemm_fp8 import get_best_configs
 from .tuner import jit_tuner
 from .utils import get_col_major_tma_aligned_tensor, get_num_sms, ceil_div
+from .m_grouped_gemm_int8 import m_grouped_gemm_a8w8_per_channel_nt_contiguous
+from .m_grouped_gemm_int8 import m_grouped_gemm_a8w8_per_channel_nt_masked
+from .m_grouped_gemm_int8 import m_grouped_gemm_a8w8_per_channel_nt_nopad
 
 # C++ code templates
 includes = ('"../deep_gemm/fp8_gemm.cuh"', )
@@ -32,8 +35,8 @@ gemm_t::run(out, lhs, rhs,
 """
 
 
-def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Tensor],
-                                              rhs: Tuple[torch.Tensor, torch.Tensor],
+def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs_: Tuple[torch.Tensor, torch.Tensor],
+                                              rhs_: Tuple[torch.Tensor, torch.Tensor],
                                               out: torch.Tensor, m_indices: torch.Tensor) -> None:
     """
     Do a grouped GEMM (contiguous format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
@@ -55,12 +58,15 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
             which means that the i-th row of the LHS matrix will be multiplied with `rhs[m_indices[i]]`.
             Values of `m_indices` in every-m-alignment-block must also be the same.
     """
-    lhs, lhs_scales = lhs
-    rhs, rhs_scales = rhs
+    lhs, lhs_scales = lhs_
+    rhs, rhs_scales = rhs_
     m, k = lhs.shape
     num_groups, n, k_ = rhs.shape
     m_, n_ = out.shape
     m__ = m_indices.numel()
+
+    if lhs_scales.shape == (m, 1) and rhs_scales.shape == (num_groups, n, 1):
+        return m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs_, rhs_, out, m_indices)
 
     # Type and shape checks
     assert m == m_ == m__ and k == k_ and n == n_
@@ -114,8 +120,8 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
     runtime(*args)
 
 
-def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor],
-                                          rhs: Tuple[torch.Tensor, torch.Tensor],
+def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor],
+                                          rhs_: Tuple[torch.Tensor, torch.Tensor],
                                           out: torch.Tensor, masked_m: torch.Tensor, expected_m: int) -> None:
     """
     Do a grouped GEMM (masked format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
@@ -137,12 +143,15 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
         expected_m: a value hint (which is a value on CPU) for the M expectation of each batch,
             correctly setting this value may lead to better performance.
     """
-    lhs, lhs_scales = lhs
-    rhs, rhs_scales = rhs
+    lhs, lhs_scales = lhs_
+    rhs, rhs_scales = rhs_
     num_groups, m, k = lhs.shape
     num_groups_, n, k_ = rhs.shape
     num_groups__, m_, n_ = out.shape
     num_groups___ = masked_m.numel()
+
+    if lhs_scales.shape == (num_groups, m, 1) and rhs_scales.shape == (num_groups, n, 1):
+        return m_grouped_gemm_a8w8_per_channel_nt_masked(lhs_, rhs_, out, masked_m, expected_m)
 
     # Type and shape checks
     assert num_groups == num_groups_ == num_groups__ == num_groups___
@@ -197,16 +206,19 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     # Run the kernel
     runtime(*args)
 
-def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs: Tuple[torch.Tensor, torch.Tensor],
-                                         rhs: Tuple[torch.Tensor, torch.Tensor],
+def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor],
+                                         rhs_: Tuple[torch.Tensor, torch.Tensor],
                                          out: torch.Tensor, m_indices: torch.Tensor,
                                          m_rows: torch.Tensor = None, configs = None) -> None:
-    lhs, lhs_scales = lhs
-    rhs, rhs_scales = rhs
+    lhs, lhs_scales = lhs_
+    rhs, rhs_scales = rhs_
     m, k = lhs.shape
     num_groups, n, k_ = rhs.shape
     m_, n_ = out.shape
     m__ = m_indices.numel()
+
+    if lhs_scales.shape == (m, 1) and rhs_scales.shape == (num_groups, n, 1):
+        return m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs_, rhs_, out, m_indices, m_rows, configs)
 
     # Type and shape checks
     assert m == m_ == m__ and k == k_ and n == n_

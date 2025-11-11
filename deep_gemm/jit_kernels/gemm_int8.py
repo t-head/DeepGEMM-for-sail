@@ -470,8 +470,8 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     assert lhs.dtype == torch.int8 or lhs.dtype == torch.float8_e4m3fn
     assert rhs.dtype == torch.int8 or rhs.dtype == torch.float8_e4m3fn
     assert lhs.dtype == rhs.dtype
-    assert lhs_scales.shape[0] == m and lhs_scales.dtype == torch.float32
-    assert rhs_scales.shape[0] == n and rhs_scales.dtype == torch.float32
+    assert lhs_scales.squeeze().shape == (m,) and lhs_scales.dtype == torch.float32
+    assert rhs_scales.squeeze().shape == (n,) and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
 
