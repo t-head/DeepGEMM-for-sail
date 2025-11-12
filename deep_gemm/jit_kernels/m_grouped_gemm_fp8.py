@@ -3,7 +3,7 @@ from typing import Tuple
 
 from .gemm_fp8 import get_best_configs
 from .tuner import jit_tuner
-from .utils import get_col_major_tma_aligned_tensor, get_num_sms, ceil_div, CompuleMode, compile_mode
+from .utils import get_col_major_tma_aligned_tensor, get_num_sms, ceil_div
 
 # C++ code templates
 includes = ('"../deep_gemm/fp8_gemm.cuh"', )
@@ -110,9 +110,6 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
         args=args,
         jit_include_dir='cutlass3'
     )
-    global compile_mode
-    if compile_mode == CompuleMode.ONLY_COMPILE:
-        return
     # Run the kernel
     runtime(*args)
 
@@ -197,8 +194,6 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
         args=args,
         jit_include_dir='cutlass3'
     )
-    if compile_mode == CompuleMode.ONLY_COMPILE:
-        return
     # Run the kernel
     runtime(*args)
 
@@ -276,8 +271,5 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs: Tuple[torch.Tensor, torch.Tensor],
         args=args,
         jit_include_dir='cutlass3'
     )
-    global compile_mode
-    if compile_mode == CompuleMode.ONLY_COMPILE:
-        return 
     # Run the kernel
     runtime(*args)

@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, CompuleMode, compile_mode,get_col_major_tma_aligned_tensor
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout,get_col_major_tma_aligned_tensor
 from .gemm_fp8_lut import get_best_configs_from_lut
 from .gemm_int8 import gemm_a8w8_per_channel_nt
 
@@ -457,7 +457,5 @@ def gemm_fp8_fp8_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
         args=args,
         jit_include_dir='cutlass3'
     )
-    if compile_mode == CompuleMode.ONLY_COMPILE:
-        return
     # Run the kernel
     runtime(*args)

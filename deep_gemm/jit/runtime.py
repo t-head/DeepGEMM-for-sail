@@ -4,7 +4,21 @@ import torch
 from typing import Optional
 
 from .template import map_ctype
+from enum import Enum, auto
+class CompileMode(Enum):
+    COMPILE_AND_RUN = 0
+    #ONLY_COMPILE must be 1 to align with sglang deepgemm usage
+    ONLY_COMPILE = 1
 
+compile_mode = CompileMode.COMPILE_AND_RUN
+
+def set_compile_mode(mode):
+    global compile_mode
+    compile_mode = mode
+    
+def get_compile_mode():
+    global compile_mode
+    return compile_mode
 
 class Runtime:
     def __init__(self, path: str) -> None:
@@ -25,6 +39,8 @@ class Runtime:
         return all(os.path.exists(os.path.join(path, file)) for file in files)
 
     def __call__(self, *args) -> int:
+        if compile_mode == CompileMode.ONLY_COMPILE.value:
+            return 
         # Load SO file
         if self.lib is None or self.args is None:
             self.lib = ctypes.CDLL(os.path.join(self.path, 'kernel.so'))

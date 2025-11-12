@@ -3,7 +3,7 @@ from typing import Tuple
 
 from .gemm_int8 import get_best_configs
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_extra_info, is_ppu1v5_device, CompuleMode, compile_mode
+from .utils import get_num_sms, ceil_div, get_extra_info, is_ppu1v5_device
 from .gemm import get_gemv_best_configs
 import os
 
@@ -150,8 +150,6 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
-    if compile_mode == CompuleMode.ONLY_COMPILE:
-        return
     # Run the kernel
     runtime(*args)
 
@@ -229,8 +227,6 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
-    if compile_mode == CompuleMode.ONLY_COMPILE:
-        return
     # Run the kernel
     runtime(*args)
 
@@ -357,8 +353,6 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
             jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
             args=args
         )
-    if compile_mode == CompuleMode.ONLY_COMPILE:
-        return
     # Run the kernel
     runtime(*args)
 

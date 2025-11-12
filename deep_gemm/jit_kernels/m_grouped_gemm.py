@@ -3,7 +3,7 @@ from typing import Tuple
 
 from .gemm import get_best_configs, get_gemv_best_configs
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_extra_info, is_ppu1v5_device, CompuleMode, compile_mode
+from .utils import get_num_sms, ceil_div, get_extra_info, is_ppu1v5_device
 import os
 
 # C++ code templates
@@ -110,10 +110,6 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
-    
-    global compile_mode
-    if compile_mode == CompuleMode.ONLY_COMPILE:
-        return 
 
     # Run the kernel
     runtime(*args)
@@ -170,9 +166,6 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
-    global compile_mode
-    if compile_mode == CompuleMode.ONLY_COMPILE:
-        return 
     # Run the kernel
     runtime(*args)
 
@@ -278,8 +271,5 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
             jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
             args=args
         )
-    global compile_mode
-    if compile_mode == CompuleMode.ONLY_COMPILE:
-        return 
     # Run the kernel
     runtime(*args)
