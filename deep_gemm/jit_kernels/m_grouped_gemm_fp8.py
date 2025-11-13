@@ -37,7 +37,7 @@ gemm_t::run(out, lhs, rhs,
 
 def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs_: Tuple[torch.Tensor, torch.Tensor],
                                               rhs_: Tuple[torch.Tensor, torch.Tensor],
-                                              out: torch.Tensor, m_indices: torch.Tensor) -> None:
+                                              out: torch.Tensor, m_indices: torch.Tensor, configs = None) -> None:
     """
     Do a grouped GEMM (contiguous format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
@@ -66,7 +66,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs_: Tuple[torch.Tensor, torch.Te
     m__ = m_indices.numel()
 
     if lhs_scales.shape == (m, 1) and rhs_scales.shape == (num_groups, n, 1):
-        return m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs_, rhs_, out, m_indices)
+        return m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs_, rhs_, out, m_indices, configs)
 
     # Type and shape checks
     assert m == m_ == m__ and k == k_ and n == n_
@@ -91,7 +91,10 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs_: Tuple[torch.Tensor, torch.Te
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous=True)
+    if configs:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+    else:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous=True)
     expected_m = ceil_div(m, num_groups)
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices, m, expected_m, num_groups,
@@ -122,7 +125,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs_: Tuple[torch.Tensor, torch.Te
 
 def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor],
                                           rhs_: Tuple[torch.Tensor, torch.Tensor],
-                                          out: torch.Tensor, masked_m: torch.Tensor, expected_m: int) -> None:
+                                          out: torch.Tensor, masked_m: torch.Tensor, expected_m: int, configs = None) -> None:
     """
     Do a grouped GEMM (masked format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
@@ -151,7 +154,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     num_groups___ = masked_m.numel()
 
     if lhs_scales.shape == (num_groups, m, 1) and rhs_scales.shape == (num_groups, n, 1):
-        return m_grouped_gemm_a8w8_per_channel_nt_masked(lhs_, rhs_, out, masked_m, expected_m)
+        return m_grouped_gemm_a8w8_per_channel_nt_masked(lhs_, rhs_, out, masked_m, expected_m, configs)
 
     # Type and shape checks
     assert num_groups == num_groups_ == num_groups__ == num_groups___
@@ -174,7 +177,10 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
+    if configs:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+    else:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
 
     # Extra checks for TMA store
     # if num_groups > 1 and m > block_m:

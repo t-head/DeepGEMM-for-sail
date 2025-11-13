@@ -328,7 +328,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     best_occ = 0
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k)
+        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1)
         # print(f"num_stages:{num_stages}, best_smem_config:{best_smem_config}")
         if best_smem_config[0] < ppu_capacity:
             occ = ppu_capacity // best_smem_config[0]
