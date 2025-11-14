@@ -5,6 +5,7 @@ from typing import Tuple
 
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info
+from .gemm_search_space import MatmulHeuristicsTile
 
 # C++ code templates
 includes = ('"deep_gemm/bf16_gemm.cuh"', )
@@ -153,7 +154,7 @@ def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> \
+                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False, dtype: torch.dtype = torch.bfloat16) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     #FIXME: block m can add 16, and blockM/N could be 512
     if not is_grouped_contiguous:
@@ -162,6 +163,13 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
         # block_ms = (16, 32)
+
+    shape = [m, n, k]
+    device_props = torch.cuda.get_device_properties(device='cuda')
+    if all(a >= 4096 and a % 64 == 0 for a in shape)\
+        and (dtype == torch.bfloat16 or dtype == torch.float16)\
+        and ("ZW810E" in device_props.name or "ZW810" in device_props.name):
+       return get_gemm_best_configs_v2(shape, 2, num_sms)
 
     # block_ns = (32, 64, 128, 256)
     block_ns = (256, 128, 64, 32)
@@ -305,6 +313,36 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
+#pre-configured optimal tiling greater than or equal to 4096
+CONFIG_TILE_GREATER_4096 = [
+    [128, 128, 64, 64, 32, 64, 2],\
+    [256, 128, 64, 64, 64, 64, 2],\
+    [512, 128, 64, 64, 64, 64, 3],\
+    [128, 256, 64, 32, 128, 64, 2]\
+    ]
+def generate_search_space_v2(lhs: Tuple[torch.Tensor],
+                             rhs: Tuple[torch.Tensor],
+                             out: torch.Tensor, num_candidate:int):
+    m, k = lhs.shape
+    n, _ = rhs.shape
+    shape = [m, n, k]
+    device_props = torch.cuda.get_device_properties(device='cuda')
+    if not (all(a >= 4096 and a % 64 == 0 for a in shape)\
+            and (lhs.dtype == torch.bfloat16 or lhs.dtype == torch.float16)\
+            and ("ZW810E" in device_props.name or "ZW810" in device_props.name)):
+       return []
+    candidate_tile = MatmulHeuristicsTile(shape, 2, CONFIG_TILE_GREATER_4096)
+    tile_list = candidate_tile.get_candidate_tile(num_candidate)
+    return [tile[3:11] for tile in tile_list]
+
+def get_gemm_best_configs_v2(shape, dtype, num_sms):
+    candidate_tile = MatmulHeuristicsTile(shape, dtype, CONFIG_TILE_GREATER_4096)
+    tile_list = candidate_tile.get_candidate_tile(1)
+    _,_,k = shape
+    tile_item = tile_list[0]
+    [bm, bn, bk, wm, wn, _, stages, num_min_sms] = tile_item[3:11]
+    best_smem_config = get_smem_config(stages, k, bm, bn, bk)
+    return num_min_sms, bm, bn, bk, wm, wn, stages, best_smem_config
 
 def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
                          rhs: Tuple[torch.Tensor],
@@ -331,7 +369,7 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
     global includes, template
 
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, lhs.dtype)
 
     extra_info = get_extra_info()
 
