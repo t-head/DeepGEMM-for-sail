@@ -10,15 +10,15 @@ public:
 
 DgProfParam() {}
 
-void initialize_args(GemmType gemm_type, int m, int group, int* grouped_layout, int device_id, cudaStream_t stream = 0) {
+void initialize_args(GemmType gemm_type, bool is_gemv, int m, int group, int* grouped_layout, int device_id, cudaStream_t stream = 0) {
     op_name_ = GemmTypeS[static_cast<int>(gemm_type)];
     m_ = m;
     group_ = group;
     grouped_layout_ = grouped_layout;
     stream_ = stream;
-    need_bincount_ = (gemm_type == GemmType::GroupedContiguous);
-    is_normal_gemm_ = (gemm_type == GemmType::DenseGemm);
     device_id_ = device_id;
+    gemm_type_ = gemm_type;
+    is_gemv_ = is_gemv;
     add_argument("data_type");
     add_argument("groups");
     add_argument("m");
@@ -36,7 +36,7 @@ void add_params(const std::string& key, const T& val) {
     insertionOrder.push_back(key);
 }
 
-void set_params(GemmType gemm_type,
+void set_params(GemmType gemm_type, bool is_gemv,
                           std::string data_type,
                           int group, int m, int n, int k, int em,
                           int* grouped_layout, cudaStream_t stream = 0) {
@@ -46,7 +46,7 @@ void set_params(GemmType gemm_type,
         printf("get device id failed\n");
         return;
     }
-    initialize_args(gemm_type, m, group, grouped_layout, gpu, stream);
+    initialize_args(gemm_type, is_gemv, m, group, grouped_layout, gpu, stream);
     add_params("data_type", data_type);
     add_params("groups", group);
     add_params("m", m);
@@ -76,10 +76,11 @@ std::string distribution() {
     CHECK_CUDA(cudaGetLastError());
     std::ostringstream outDist;
     outDist << ",distribution:[" ;
-    int size = need_bincount_ ? m_ : group_;
+    bool need_bincount = (gemm_type_ == GemmType::GroupedContiguous || is_gemv_ );
+    int size = need_bincount ? m_ : group_;
     int* tmp = new int[size];
     CHECK_CUDA(cudaMemcpyAsync(tmp, grouped_layout_, sizeof(int) * size, cudaMemcpyDeviceToHost, stream_));
-    if (need_bincount_) {
+    if (need_bincount) {
         int* counts = new int[group_];
         for (int i = 0; i < group_; ++i) {
             counts[i] = 0;
@@ -113,7 +114,7 @@ bool check_support_dump(){
     if (target_device_id != device_id_) {
         return false;
     }
-    if (is_normal_gemm_) {
+    if (gemm_type_ == GemmType::DenseGemm) {
         printf("\ndump_group_m not supported for normal gemm.\n");
         return false;
     }
@@ -165,9 +166,9 @@ protected:
     int m_;
     int group_;
     int* grouped_layout_;
-    bool need_bincount_;
-    bool is_normal_gemm_;
     int device_id_;
+    GemmType gemm_type_;
+    bool is_gemv_;
     cudaStream_t stream_;
 };
 
@@ -188,7 +189,7 @@ public:
 
     void instrument(bool start, DgProfParam &params) {
         if (!get_op_info()){
-        return;
+            return;
         }
 
         if (start) {
@@ -196,8 +197,8 @@ public:
         if (show_params_) {
             std::cout << op_name;
             if (params.check_support_dump()) {
-            std::string distribution = params.distribution();
-            std::cout << distribution << std::endl;
+                std::string distribution = params.distribution();
+                std::cout << distribution << std::endl;
             }
             std::cout << std::endl;
         }

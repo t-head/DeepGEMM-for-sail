@@ -513,7 +513,7 @@ public:
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(
-                kGemmType, std::string("int8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
+                kGemmType, false, std::string("int8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
                 grouped_layout, stream
             );
         }

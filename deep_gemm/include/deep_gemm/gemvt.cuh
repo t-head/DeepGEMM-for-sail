@@ -10,6 +10,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include "utils.cuh"
+#include "profiling_interface.hpp"
 
 namespace deep_gemm {
 
@@ -406,7 +407,7 @@ public:
         args.a_ptr = (void *)gmem_a;
         args.b_ptr = (void *)gmem_b;
         args.c_ptr = (void *)gmem_d;
-        
+
         args.alphaCol = rhs_scale;
         args.alphaRow = lhs_scale;
         args.expert_ids_ptr = grouped_layout;
@@ -420,6 +421,24 @@ public:
         args.stride_cm = SHAPE_N;
         args.stride_cn = 1;
 
+        DgProfParam dg_prof_params;
+        // check src type
+        std::string data_type = "";
+        if constexpr (std::is_same_v<src_type, int8_t>) {
+            data_type = "int8";
+        }
+        else if constexpr (std::is_same_v<src_type, __nv_bfloat16>) {
+            data_type = "bf16";
+        }
+        else {
+            data_type = "unsupported";
+        }
+        if (ProfilingInterface::Instance().get_op_info()){
+            dg_prof_params.set_params(
+                GemmType::GroupedNoPad, true, data_type, kNumGroups, shape_m, SHAPE_N, SHAPE_K, 1,
+                grouped_layout, stream
+            );
+        }
 
         if (SMALL_K == false) {
             size_t grid_x = shape_m;
@@ -448,10 +467,11 @@ public:
                 printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, NUM_UNROLL:%d, SWZL_SIZE_M:%d\n",
                     BlockSize, NPerThread, ThreadPerN, NPerBlock, NUM_UNROLL, SWZL_SIZE_M);
                 printf("threadblock_count:%d, vreg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
-                
-            }
 
+            }
+            ProfilingInterface::Instance().instrument(true, dg_prof_params);
             device_func<<<grid, BlockSize, 0, stream>>>(args);
+            ProfilingInterface::Instance().instrument(false, dg_prof_params);
         } else {
             // launch small_k gemm_v
             size_t grid_x = args.num_tokens;
@@ -476,7 +496,7 @@ public:
                                                             BlockSize, ThreadPerN, NPerThread, 1, SWZL_SIZE_M, 5>;
             // printf("num_tokens = %d, N = %d, K = %d, top_k = %d, A = %p, B = %p, grid_x = %d, grid_y = %d",
             //     args.num_tokens, args.N, args.K, args.top_k, args.a_ptr, args.b_ptr, grid_x, grid_y);
-            
+
             char *pEnv_params = std::getenv("show_log");
             if (pEnv_params && isdigit(*pEnv_params)) {
                 cudaFuncAttributes attr;
@@ -487,14 +507,16 @@ public:
                     kNumGroups, args.num_tokens, args.N, args.K);
                 printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, SWZL_SIZE_M:%d\n",
                     BlockSize, NPerThread, ThreadPerN, NPerBlock, SWZL_SIZE_M);
-                
+
                 printf("threadblock_count:%d, vreg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
-                
+
             }
 
+            ProfilingInterface::Instance().instrument(true, dg_prof_params);
             // batched_gemvt_kernel_small_k<src_type, dst_type, float, load_atype, load_btype,
             //     BlockSize, ThreadPerN, NPerThread, 1, SWZL_SIZE_M, Stages><<<grid_x * grid_y, BlockSize, 0, stream>>>(args);
             device_func<<<grid_x * grid_y, BlockSize, 0, stream>>>(args);
+            ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
         }
     }
