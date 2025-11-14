@@ -328,8 +328,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
             if min_n > 0:
                 experts_for_rows[:min_n] = counts[:min_n]
             m_rows = experts_for_rows
-        args = (lhs, lhs_scales, rhs, rhs_scales, out,
-            m_rows, m, expected_m, num_groups,
+        args = (lhs, lhs_scales, rhs, rhs_scales, out, m_rows, m, expected_m,
             torch.cuda.current_stream(), num_sms, smem_config[0])
 
         runtime = jit_tuner.compile_and_tune(
@@ -346,8 +345,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
             arg_defs=(  ('lhs', lhs.dtype), ('lhs_scales', torch.float),
                         ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                         ('out', torch.bfloat16),
-                        ('grouped_layout', torch.int32), ('m', int),
-                        ('num_groups', int), ('expected_m', int),
+                        ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
                         ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
             template=template_cutlass3 if extra_info['use_cutlass3'] else template,
             jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,

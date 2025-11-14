@@ -57,7 +57,7 @@ gemm_t::run(out, nullptr,
             stream, num_sms, smem_size);
 """
 
-def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128, bpp: int = 2) -> Tuple[int, int, int]:
+def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128, bpp: int = 1) -> Tuple[int, int, int]:
     # Try swizzle first, as it does not waste shared memory
     swizzle_mode = 128
     # block_n_padding = get_block_n_padding_for_smem_d(block_n) if swizzle_mode == 0 else 0
@@ -247,8 +247,14 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
     for block_m in block_ms:
-        # NOTES: the block sizes can not be too large, so at least one dim less than 128
-        for block_n in filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32)), block_ns):
+        # NOTES:
+        # for PPU1.0: the block sizes can not be too large, so at least one dim less than 128
+        # for PPU1.5: the tile 256x256 is good for many compute bound case
+        if is_ppu1v5_device() and ((m >= 128 and k > 2048) or m >= 256):
+            block_ns_after_filter = filter(lambda bn: (bn != n and n >= 32), block_ns)
+        else:
+            block_ns_after_filter = filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32)), block_ns)
+        for block_n in block_ns_after_filter:
             success = False
             num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(best_block_m, best_block_n)
             num_utils = get_block_utils(m, block_m) * get_block_utils(n, block_n)
@@ -325,12 +331,14 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16 or best_block_m == 32:
         stage_candidates = (3, 2)
+    if best_block_m == 256 and best_block_n == 256:
+        stage_candidates = (4,)
 
     best_occ = 0
     for num_stages in stage_candidates:
         best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1)
         # print(f"num_stages:{num_stages}, best_smem_config:{best_smem_config}")
-        if best_smem_config[0] < ppu_capacity:
+        if best_smem_config[0] <= ppu_capacity:
             occ = ppu_capacity // best_smem_config[0]
             if k < 512 or (best_block_m > 32 and best_block_n >= 64) and occ >= best_occ:
                 # compute block use higer occ rather than large stage
@@ -355,7 +363,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     warp_m = best_block_m // 2
     warp_n = best_block_n // 2
 
-    if best_block_m == 32 and best_block_n >= 64:
+    if best_block_m == 256 and best_block_n == 256:
+        warp_m = best_block_m // 4
+        warp_n = best_block_n // 4
+    elif best_block_m == 32 and best_block_n >= 64:
         warp_m = 32
         warp_n = best_block_n // 4
     elif best_block_n == 32 and n <= 128 and best_block_m >=64:
