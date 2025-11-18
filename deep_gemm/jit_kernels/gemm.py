@@ -370,7 +370,7 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
     global includes, template
 
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, lhs.dtype)
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, dtype=lhs.dtype)
 
     extra_info = get_extra_info()
 
