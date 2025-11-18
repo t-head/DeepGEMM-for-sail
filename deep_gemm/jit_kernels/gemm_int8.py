@@ -316,6 +316,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # best_block_m = 32
     # best_block_n = 256
 
+    if is_ppu1v5_device() and (m >= 96 and m < 128 and n > 2048 and k > 2048 and num_groups >= 8):
+        best_block_m = 192
+        best_block_n = 256
+
     #small m hbm bound or latency bound, wave is not usful, for better occ for 810e hbm bound, use smallest blockN for m16
     if (m < 20 and n < 512) :
         best_block_m = 16
@@ -337,7 +341,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16 or best_block_m == 32:
         stage_candidates = (3, 2)
-    if best_block_m == 256 and best_block_n == 256:
+    if best_block_m > 128 and best_block_n == 256:
         stage_candidates = (4,)
 
     best_occ = 0
@@ -362,14 +366,17 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # NOTES: less L2 cache usage and less GPU frequency drop
     num_waves = get_num_waves(best_block_m, best_block_n)
 
-    num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
+    if is_ppu1v5_device():
+        num_min_sms = num_sms
+    else:
+        num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
 
     assert num_min_sms <= num_sms
 
     warp_m = best_block_m // 2
     warp_n = best_block_n // 2
 
-    if best_block_m == 256 and best_block_n == 256:
+    if best_block_m > 128 and best_block_n == 256:
         warp_m = best_block_m // 4
         warp_n = best_block_n // 4
     elif best_block_m == 32 and best_block_n >= 64:
