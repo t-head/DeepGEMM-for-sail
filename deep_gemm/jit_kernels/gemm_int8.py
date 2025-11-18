@@ -226,7 +226,12 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     #if is_ppu1v5_device():
     #   return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, is_grouped_contiguous, is_grouped_masked)
 
-    if num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False:
+    lut_result = get_best_configs_from_lut(m, n, k)
+    if num_groups == 1 and lut_result:
+        best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages = lut_result
+        best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1)
+        return num_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
+    elif num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False and is_ppu1v5_device():
         return get_best_configs_dense(m, n, k, num_groups, num_sms)
 
     #FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
@@ -253,7 +258,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         if is_ppu1v5_device() and ((m >= 128 and k > 2048) or m >= 256):
             block_ns_after_filter = filter(lambda bn: (bn != n and n >= 32), block_ns)
         else:
-            block_ns_after_filter = filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32)), block_ns)
+            block_ns_after_filter = \
+                filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32) and not (block_m == 16 and bn == 32)), block_ns)
         for block_n in block_ns_after_filter:
             success = False
             num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(best_block_m, best_block_n)
@@ -386,7 +392,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 64, 256, 16, 16, 4)
     # print(best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages)
 
-    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
+    return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
 
 def generate_search_space():

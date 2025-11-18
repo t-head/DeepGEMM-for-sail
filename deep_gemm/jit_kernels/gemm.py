@@ -288,9 +288,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # NOTES: less L2 cache usage and less GPU frequency drop
     num_waves = get_num_waves(best_block_m, best_block_n)
 
-    num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
+    # num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
+    num_min_sms = ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups
 
-    assert num_min_sms <= num_sms
+    # assert num_min_sms <= num_sms
 
     warp_m = best_block_m // 2
     warp_n = best_block_n // 2
@@ -311,7 +312,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
         warp_n = best_block_n // 4
 
-    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
+    return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
 #pre-configured optimal tiling greater than or equal to 4096
 CONFIG_TILE_GREATER_4096 = [
