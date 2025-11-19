@@ -3,16 +3,16 @@ import csv
 import subprocess
 import re
 import traceback
-from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
-
+from deep_gemm import get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
 import deep_gemm
 import random
 import torch
 from typing import Tuple
 from enum import Enum
 import ast
-global cycle
-cycle = 1
+
+global _acc_check
+_acc_check = True
 global use_ppu
 
 class DGStatus(Enum):
@@ -28,15 +28,21 @@ def judge_device_type():
     use_ppu = use_ppu_
     return use_ppu_
 
-def set_cycle(value):
-    global cycle
-    cycle = value
+def set_acc_check(value):
+    global _acc_check
+    _acc_check = value
+
+def get_acc_check():
+    return _acc_check
 
 def calc_diff(x, y):
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+def ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(1) % 128 == 0
@@ -75,7 +81,7 @@ def construct(m: int, k: int, n: int, d: torch.dtype) -> \
     y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
 
-    if not cycle:
+    if _acc_check:
         ref_out = x @ y.t()
     else:
         ref_out = torch.empty_like(out)
@@ -103,8 +109,42 @@ def unbincount(counts):
 def bincount(counts, min_lenth):
     return torch.bincount(torch.tensor(counts), weights=None, minlength=min_lenth)
 
-def construct_group_m_list(distribution, num_groups, expected_m_per_group):
+def round_m_list_sum_to_m(m_list, m_sum):
+    current_sum = sum(m_list)
+    step = int(abs(current_sum - m_sum) / len(m_list))
+    _res = abs(current_sum - m_sum) % len(m_list)
+    if current_sum > m_sum:
+        m_list[:] = [x - step if x > step else x for x in m_list]
+        idx, idy = 0, 0
+        _res = abs(sum(m_list) - m_sum)
+        while idx < _res:
+            if m_list[idy] >= 1:
+                m_list[idy] -= 1
+                idx += 1
+            idy = (idy+1) % len(m_list)
+    elif current_sum < m_sum:
+        m_list[:] = [x + step for x in m_list]
+        m_list[:_res] = [x + 1 for x in m_list[:_res]]
+    return m_list
+
+def find_next_power_of_2(m_list):
+    if isinstance(m_list, torch.Tensor):
+        max_val = m_list.amax().item()
+    elif isinstance(m_list, list):
+        max_val = max(m_list)
+    else:
+        raise ValueError("Invalid m_list")
+    if max_val <= 0:
+        return 1
+    bit = (max_val - 1).bit_length()
+    return 1 << bit
+
+def construct_group_m_list(distribution, num_groups, m, is_mask=False, seed=0, em=0):
     group_m_list = list()
+    if is_mask and em != 0:
+        expected_m_per_group = em
+    else:
+        expected_m_per_group = ceil_div(m, num_groups)
     if distribution == None: # default value
         distribution = "uniform"
     if type(distribution) is list:
@@ -116,26 +156,35 @@ def construct_group_m_list(distribution, num_groups, expected_m_per_group):
             for i in range(len(group_m_list), num_groups):
                 group_m_list.append(0)
     elif distribution == "uniform":
+        random.seed(seed)
         group_m_list = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
     elif distribution == "normal" or distribution == "gaussian":
+        random.seed(seed)
         # avg is expected_m_per_group, sigma is expected_m_per_group * 0.5
         group_m_list = [max(0, int(random.gauss(expected_m_per_group, expected_m_per_group * 0.5))) for _ in range(num_groups)]
     elif distribution == "zipf":
         import numpy as np
-        np.random.seed(0)
+        np.random.seed(seed)
+        random.seed(seed)
         # 为zip分布加入扰动，避免大量相同的值
-        dist = np.random.zipf(2.0, num_groups) +  [random.gauss(0, 1) for _ in range(num_groups)]
+        dist = np.random.zipf(2.0, num_groups)
+        noise = [random.gauss(0, 1) for _ in range(num_groups)]
+        dist = dist + noise
         scale = expected_m_per_group * num_groups / dist.sum()
-        group_m_list = np.round(dist * scale).astype(int)
+        group_m_list = [max(0, x) for x in np.round(dist * scale).astype(int)]
     else:
         print("ERROR: Unsupported distribution type, please check!")
         exit(1)
+    group_m_list = round_m_list_sum_to_m(group_m_list, m)
+    if is_mask:
+        group_m_list = [int(random.uniform(0, 1) * x) for x in group_m_list]
+    assert sum(group_m_list) <= m, f"sum(m_list)={sum(group_m_list)} must <= m_sum={m}"
     return group_m_list
 
 
-def construct_contiguous_grouped(num_groups: int, m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, distribution: str, alignment: int) -> \
+def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: torch.dtype, distribution: str, alignment: int) -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-    group_ms = construct_group_m_list(distribution, num_groups, expected_m_per_group)
+    group_ms = construct_group_m_list(distribution, num_groups, m)
     m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
     m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
     x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
@@ -153,11 +202,11 @@ def construct_contiguous_grouped(num_groups: int, m: int, expected_m_per_group: 
         aligned_end = start + ceil_div(group_m, alignment) * alignment
         m_indices[start:actual_end] = i
         m_indices[actual_end:aligned_end] = -1
-        if not cycle:
+        if _acc_check:
             ref_out[start:aligned_end] = x[start:aligned_end] @ y[i].t()
         start = aligned_end
 
-    if not cycle:
+    if _acc_check:
         ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
 
     if d == torch.bfloat16:
@@ -183,20 +232,22 @@ def construct_contiguous_grouped(num_groups: int, m: int, expected_m_per_group: 
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
 
-def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, distribution: str):
+def construct_grouped_masked(num_groups: int, m: int, k: int, n: int, d: torch.dtype, distribution: str, expected_m_per_group: int):
+    # Construct mask
+    list_m =  construct_group_m_list(distribution, num_groups, m, is_mask=True, em=expected_m_per_group)
+    max_m = find_next_power_of_2(list_m)
+    masked_m = torch.tensor(list_m, device='cuda', dtype=torch.int)
+    assert masked_m.amax().item() <= max_m
+
     x = torch.randn((num_groups, max_m, k), device='cpu', dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device='cpu', dtype=torch.bfloat16)
     out = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
 
-    if not cycle:
+    if _acc_check:
         ref_out = torch.einsum('gmk,gnk->gmn', x, y)
     else:
         ref_out = torch.empty_like(out)
 
-    # Construct mask
-    list_m =  construct_group_m_list(distribution, num_groups, expected_m_per_group)
-    masked_m = torch.tensor(list_m, device='cuda', dtype=torch.int)
-    assert masked_m.amax().item() <= max_m
 
     if d == torch.bfloat16:
         return x.to('cuda'), y.to('cuda'), masked_m, out, ref_out.to('cuda')
@@ -256,11 +307,11 @@ def split_list_into_groups(lst, num):
         groups[group_idx].append(lst[i])
     return groups
 
-def worker(gpu_id, cases, output, device, mode, acc_check):
+def worker(gpu_id, cases, output, device, mode):
     # 设置当前进程可见的 GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     print(f"Process {os.getpid()} is running on GPU {gpu_id}")
-    run_cycle_on_device(cases, output, device, mode, acc_check, gpu_id)
+    run_cycle_on_device(cases, output, device, mode, gpu_id)
 
 def read_detail_from_nculog(filename):
     detail_info = {'m': 0, 'n': 0, 'k': 0}
@@ -295,7 +346,7 @@ def read_detail_from_nculog(filename):
 
 # devices = {
 #     "name": ["cycle", "tensor core efficiency", "waves"],
-#      hopper ppu tc: sm__pipe_tensor_type_hmma_hgmma_qgmma_imma_igmma_bmma_bgmma_cycles_active.avg.pct_of_peak_sustained_elapsed
+#      hopper tc: sm__pipe_tensor_type_hmma_hgmma_qgmma_imma_igmma_bmma_bgmma_cycles_active.avg.pct_of_peak_sustained_elapsed
 #     "gpu":  ["sm__cycles_active.max", "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active", "launch__waves_per_multiprocessor"],
 #     "ppu":  ["ce__cycles_active.max", "cu__inst_executed_pipe_tensor_fp16.avg.pct_of_peak_sustained_active", "launch__waves_per_cu"],
 # }
@@ -343,8 +394,8 @@ def read_cycle_from_nculog(filename):
         op_cycles[op] = cycle
         if "deep_gemm" in op.lower():
             fwd_cycle_sum += cycle
-            fwd_tc_sum += tc_list[i]
-            fwd_hbm_sum += hbm_list[i]
+            fwd_tc_sum = tc_list[i]
+            fwd_hbm_sum = hbm_list[i]
     # calculate statistics data
     if fwd_cycle_sum != 0:
         # fwd unit case
@@ -363,7 +414,7 @@ def clean_casename(name):
         name = name.replace("__", "_")
     return name
 
-def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", acc_check=False, gpu_id="0"):
+def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0"):
     output_lines = list()
     headers = ["casename","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"]
@@ -388,6 +439,8 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", acc_check
             output_name = clean_casename(case)
             cmd = '{} --set full -o {} python {} --format {} \
                 2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", output_name, script, case, log_file)
+            ret = run_cmd(cmd)
+            continue
         else:
             if mode == "show_log":
                 os.environ["show_log"] = "1"
@@ -395,10 +448,10 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", acc_check
             metrics_string = "sm__cycles_active.max,sm__pipe_tensor_type_hmma_hgmma_qgmma_imma_igmma_bmma_bgmma_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed" if dev=="gpu" else \
                             "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format(dtype)
                             # "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed"
-
+            _acc = "" if _acc_check else "--disable_acc"
             cmd = '{} --clock-control none {} --metrics="{}"  \
-                --page=details python {} --format {} \
-                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", "" if dev == "gpu" else '--kernel-name "regex:Kernel|device_kernel"', metrics_string, script, case, log_file)
+                --page=details python {} --format "{}" {} \
+                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", "" if dev == "gpu" else '--kernel-name "regex:Kernel|device_kernel|batched_gemvt*"', metrics_string, script, case, _acc, log_file)
 
         ret = run_cmd(cmd)
         result = "Fail"
@@ -410,9 +463,9 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", acc_check
                     other_metrics = read_detail_from_nculog(log_file)
                     print(other_metrics)
 
-        if acc_check:
+        if _acc_check:
             # check accuracy
-            cmd = "python {} --format {} --acc_check".format(script, case)
+            cmd = "python {} --format {}".format(script, case)
             ret = run_cmd(cmd)
             if ret.returncode == 0:
                 result = "Pass"
@@ -468,7 +521,7 @@ def read_numbers_from_file(file_path):
 def parse_deepgemm_string_re(s):
     # give default value
     result = {"distribution": "uniform"}
-    supported_keys = ["data_type", "groups", "m", "n", "k", "em", "distribution"]
+    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em"]
     supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedMasked", "Normal", "DenseGemm"]
     import re
     dg_params = r"(?:\[DeepGemm\] --format=|\[DeepGemm with Distribution\] --format=)?(GroupedContiguous|GroupedNoPad|GroupedMasked|DenseGemm|Normal),(.+)"
@@ -553,113 +606,117 @@ def convert_data_type_to_dtype(data_type):
 
 def test_gemm(args) -> None:
     print('Testing GEMM:')
-    def test_func(m, n, k, d):
-        print("test_gemm->test_func: ", m, n, k, d)
-        x, y, out, ref_out = construct(m, k, n, d)
-        if d == torch.bfloat16:
-            deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
-        elif d == torch.int8:
-            deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
-        elif d == torch.float8_e4m3fn:
-            deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out)
-        else:
-            print("ERROR: Unsupported dtype, please check!")
-            exit(1)
-        if not cycle:
-            diff = calc_diff(out, ref_out)
-            if diff >= 0.001:
-                print("ref_out:", ref_out)
-                print("out:", out)
-            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
-
-    test_func(args['m'], args['n'], args['k'], args["data_type"])
-    print("Passed\n")
+    m, n, k, d = args['m'], args['n'], args['k'], args["data_type"]
+    print(f"test_gemm->test_func: m:{m},n:{n},k:{k},data_type:{d}")
+    x, y, out, ref_out = construct(m, k, n, d)
+    if d == torch.bfloat16:
+        deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
+    elif d == torch.int8:
+        deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
+    elif d == torch.float8_e4m3fn:
+        deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out)
+    else:
+        print("ERROR: Unsupported dtype, please check!")
+        exit(1)
+    if _acc_check:
+        diff = calc_diff(out, ref_out)
+        if diff >= 0.001:
+            print("ref_out:", ref_out)
+            print("out:", out)
+        assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+        print("Passed with acc_check\n")
+    else:
+        print("Passed without acc_check\n")
     return
 
 def test_m_grouped_gemm_contiguous(args) -> None:
     print('Testing grouped contiguous GEMM:')
+    num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
+    m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, get_m_alignment_for_contiguous_layout())
+    print(f"test_m_grouped_gemm_contiguous->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d}")
+    if d == torch.bfloat16:
+        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
+    elif d == torch.int8:
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
+    else:
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices)
 
-    def test_func(num_groups, m, n, k, expected_m_per_group, d, distribution):
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, expected_m_per_group, k, n, d, distribution, get_m_alignment_for_contiguous_layout())
-        print("test_m_grouped_gemm_contiguous->test_func: ", num_groups, m, n, k, expected_m_per_group, d)
-        if d == torch.bfloat16:
-            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
-        elif d == torch.int8:
-            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
-        else:
-            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices)
-
-        if not cycle:
-            out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
-            diff = calc_diff(out, ref_out)
-            if diff >= 0.001:
-                print("ref_out:", ref_out)
-                print("out:", out)
-                torch.testing.assert_close(out, ref_out, rtol=2e-1, atol=1)
-            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
-
-    test_func(args['groups'], args['m'], args['n'], args['k'], args['em'], args['data_type'], args['distribution'])
-    print("Passed\n")
+    if _acc_check:
+        out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
+        diff = calc_diff(out, ref_out)
+        if diff >= 0.001:
+            print("ref_out:", ref_out)
+            print("out:", out)
+            torch.testing.assert_close(out, ref_out, rtol=2e-1, atol=1)
+        assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+        print("Passed with acc_check\n")
+    else:
+        print("Passed without acc_check\n")
     return
 
 def test_m_grouped_gemm_masked(args) -> None:
     print('Testing grouped masked GEMM:')
 
-    def test_func(num_groups, max_m, n, k, expected_m_per_group, d, distribution):
-        print("test_m_grouped_gemm_masked->test_func: ", num_groups, max_m, n, k, expected_m_per_group, d)
-        x, y, masked_m, out, ref_out = construct_grouped_masked(num_groups, max_m, expected_m_per_group, k, n, d, distribution)
+    num_groups, m, n, k, d, distribution = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
+    
+    expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
+    x, y, masked_m, out, ref_out = construct_grouped_masked(num_groups, m, k, n, d, distribution, expected_m_per_group)
+    # post compute max_m and em to help kernel choose tile
+    max_m = find_next_power_of_2(masked_m) if "max_m" not in args.keys() else args["max_m"]
+    expected_m_per_group = ceil_div(sum(masked_m).item(), num_groups) if "em" not in args.keys() else args["em"]
+    print(f"test_m_grouped_gemm_masked->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},em:{expected_m_per_group},max_m:{max_m},distribution:{masked_m}")
 
-        if d == torch.bfloat16:
-            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
-        elif d == torch.int8:
-            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
-        elif d == torch.float8_e4m3fn:
-            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
-        else:
-            print("ERROR: Unsupported dtype, please check!")
-            exit(1)
-        if not cycle:
-            for j in range(num_groups):
-                diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
-                if (masked_m[j] != 0):
-                    if diff >= 0.001:
-                        print(f"ref_out[{j}]:", ref_out[j, :masked_m[j].item()])
-                        print(f"out[{j}]:", out[j, :masked_m[j].item()])
-                        # torch.testing.assert_close(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()], rtol=5e-1, atol=2)
-                    assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
-
-    test_func(args["groups"], args['m'], args['n'], args['k'], args['em'], args['data_type'], args['distribution'])
-    print("Passed\n")
+    if d == torch.bfloat16:
+        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
+    elif d == torch.int8:
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
+    elif d == torch.float8_e4m3fn:
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
+    else:
+        print("ERROR: Unsupported dtype, please check!")
+        exit(1)
+    if _acc_check:
+        for j in range(num_groups):
+            diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
+            if (masked_m[j] != 0):
+                if diff >= 0.001:
+                    print(f"ref_out[{j}]:", ref_out[j, :masked_m[j].item()])
+                    print(f"out[{j}]:", out[j, :masked_m[j].item()])
+                    # torch.testing.assert_close(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()], rtol=5e-1, atol=2)
+                assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+        print("Passed with acc_check\n")
+    else:
+        print("Passed without acc_check\n")
     return
 
 def test_m_grouped_gemm_nopad(args) -> None:
     print('Testing grouped unpad GEMM:')
+    num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
 
-    def test_func(num_groups, m, n, k, expected_m_per_group, d, distribution):
-        print("test_m_grouped_gemm_nopad->test_func: ", num_groups, m, n, k, expected_m_per_group, d, distribution)
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, expected_m_per_group, k, n, d, distribution, 1)
-        if d == torch.bfloat16:
-            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
-        elif d == torch.int8:
-            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
-        elif d == torch.float8_e4m3fn:
-            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
-        else:
-            print("ERROR: Unsupported dtype, please check!")
-            exit(1)
+    print(f"test_m_grouped_gemm_nopad->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d}")
+    m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1)
+    if d == torch.bfloat16:
+        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
+    elif d == torch.int8:
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
+    elif d == torch.float8_e4m3fn:
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
+    else:
+        print("ERROR: Unsupported dtype, please check!")
+        exit(1)
 
-        if not cycle:
-            # out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
-            diff = calc_diff(out, ref_out)
-            if diff >= 0.0015:
-                print("ref_out:", ref_out)
-                print("out:", out)
-                torch.testing.assert_close(out, ref_out, rtol=5e-1, atol=2)
+    if _acc_check:
+        # out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
+        diff = calc_diff(out, ref_out)
+        if diff >= 0.0015:
+            print("ref_out:", ref_out)
+            print("out:", out)
+            torch.testing.assert_close(out, ref_out, rtol=5e-1, atol=2)
 
-            assert diff < 0.0015, f'{m=}, {k=}, {n=}, {diff:.5f}'
-
-    test_func(args['groups'], args['m'], args['n'], args['k'], args['em'], args['data_type'], args['distribution'])
-    print("Passed\n")
+        assert diff < 0.0015, f'{m=}, {k=}, {n=}, {diff:.5f}'
+        print("Passed with acc_check\n")
+    else:
+        print("Passed without acc_check\n")
     return
 
 

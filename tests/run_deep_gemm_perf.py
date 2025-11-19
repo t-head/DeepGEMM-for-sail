@@ -2,6 +2,7 @@ import argparse
 import os
 import torch
 from utils import run_cycle_on_device, str_to_list, worker, split_list_into_groups
+from utils import set_acc_check, _acc_check
 import multiprocessing as mp
 
 device_name = torch.cuda.get_device_name()
@@ -33,13 +34,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Performance Testing for DeepGemm with format or list.')
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
+    parser.add_argument('--case_idx', default=None, type=int, required=False, help='the line index of case in caselist file')
     parser.add_argument('--format',  type=str, default=None, help="Case cmd to describe problem size.")
     parser.add_argument('--output', default="output", type=str, required=False, help='the output storing cycles of DG cases')
     parser.add_argument('--mode', default="metrics", type=str, choices=["metrics","full","show_log","umd_perf"], required=False, help='run perf mode')
     parser.add_argument('--device', default=None, type=str, required=False, help='devices index to run cases, 0 means gpu0. 0,3 means gpu0,1,2,3')
-    parser.add_argument('--acc_check', action="store_true", required=False, help='if or nor open accuracy check')
+    parser.add_argument('--disable_acc', action="store_true", required=False, help='if or not open accuracy check')
 
     args = parser.parse_args()
+
     dg_cases = list()
     if args.format:
         dg_cases = [args.format]
@@ -48,12 +51,17 @@ if __name__ == '__main__':
         if len(dg_cases) == 0:
             print("no dg_cases found")
             exit(-1)
+        if args.case_idx:
+            dg_cases = [dg_cases[args.case_idx]]
     else:
         print("Must give must give --caselist or --format")
         exit(-1)
 
+    if args.disable_acc:
+        set_acc_check(0)
+
     if args.device == None:
-        run_cycle_on_device(dg_cases, args.output, "ppu" if USE_PPU else "gpu", args.mode, args.acc_check)
+        run_cycle_on_device(dg_cases, args.output, "ppu" if USE_PPU else "gpu", args.mode)
     else:
         devices = str_to_list(args.device)
         if len(devices) == 1 or len(devices) > 2:
@@ -66,6 +74,6 @@ if __name__ == '__main__':
         cases_groups = split_list_into_groups(dg_cases, len(num_gpus))
         for i in range(len(num_gpus)):
             # 创建子进程并传递 GPU ID, 在worker中循环 backend的取值
-            p = mp.Process(target=worker, args=(num_gpus[i], cases_groups[i], args.output, "ppu" if USE_PPU else "gpu", args.mode, args.acc_check))
+            p = mp.Process(target=worker, args=(num_gpus[i], cases_groups[i], args.output, "ppu" if USE_PPU else "gpu", args.mode))
             p.start()
             processes.append(p)

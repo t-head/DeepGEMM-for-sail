@@ -20,11 +20,15 @@ void initialize_args(GemmType gemm_type, bool is_gemv, int m, int group, int* gr
     gemm_type_ = gemm_type;
     is_gemv_ = is_gemv;
     add_argument("data_type");
-    add_argument("groups");
+    if (gemm_type_ != GemmType::DenseGemm){
+        add_argument("groups");
+    }
     add_argument("m");
     add_argument("n");
     add_argument("k");
-    add_argument("em");
+    if (gemm_type_ == GemmType::GroupedMasked){
+        add_argument("em");
+    }
 }
 
 template <typename T>
@@ -48,11 +52,15 @@ void set_params(GemmType gemm_type, bool is_gemv,
     }
     initialize_args(gemm_type, is_gemv, m, group, grouped_layout, gpu, stream);
     add_params("data_type", data_type);
-    add_params("groups", group);
+    if (gemm_type_ != GemmType::DenseGemm){
+        add_params("groups", group);
+    }
     add_params("m", m);
     add_params("n", n);
     add_params("k", k);
-    add_params("em", em);
+    if (gemm_type_ == GemmType::GroupedMasked){
+        add_params("em", em);
+    }
     add_params("gpu", gpu);
 }
 

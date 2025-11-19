@@ -166,10 +166,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     shape = [m, n, k]
     device_props = torch.cuda.get_device_properties(device='cuda')
-    if all(a >= 4096 and a % 64 == 0 for a in shape)\
-        and (dtype == torch.bfloat16 or dtype == torch.float16)\
-        and ("ZW810E" in device_props.name or "ZW810" in device_props.name):
-       return get_gemm_best_configs_v2(shape, 2, num_sms)
+    # if all(a >= 4096 and a % 64 == 0 for a in shape)\
+    #     and (dtype == torch.bfloat16 or dtype == torch.float16)\
+    #     and ("ZW810E" in device_props.name or "ZW810" in device_props.name):
+    #    return get_gemm_best_configs_v2(shape, 2, num_sms)
 
     # block_ns = (32, 64, 128, 256)
     block_ns = (256, 128, 64, 32)
