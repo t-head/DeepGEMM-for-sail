@@ -154,7 +154,7 @@ def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False, dtype: torch.dtype = torch.bfloat16) -> \
+                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     #FIXME: block m can add 16, and blockM/N could be 512
     if not is_grouped_contiguous:
@@ -163,13 +163,6 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
         # block_ms = (16, 32)
-
-    shape = [m, n, k]
-    device_props = torch.cuda.get_device_properties(device='cuda')
-    # if all(a >= 4096 and a % 64 == 0 for a in shape)\
-    #     and (dtype == torch.bfloat16 or dtype == torch.float16)\
-    #     and ("ZW810E" in device_props.name or "ZW810" in device_props.name):
-    #    return get_gemm_best_configs_v2(shape, 2, num_sms)
 
     # block_ns = (32, 64, 128, 256)
     block_ns = (256, 128, 64, 32)
@@ -368,9 +361,14 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
 
     # Auto-tuning with compilation
     global includes, template
-
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, dtype=lhs.dtype)
+    shape = [m, n, k]
+    device_props = torch.cuda.get_device_properties(device='cuda')
+    if all(a >= 4096 and a % 64 == 0 for a in shape)\
+       and ("ZW810E" in device_props.name or "ZW810" in device_props.name):
+       num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_gemm_best_configs_v2(shape, 2, num_sms)
+    else:
+       num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
 
     extra_info = get_extra_info()
 
