@@ -231,8 +231,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages = lut_result
         best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1)
         return num_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
-    elif num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False and is_ppu1v5_device():
-        return get_best_configs_dense(m, n, k, num_groups, num_sms)
+    #elif num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False and is_ppu1v5_device():
+    #    return get_best_configs_dense(m, n, k, num_groups, num_sms)
 
     #FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
     if not is_grouped_contiguous:
