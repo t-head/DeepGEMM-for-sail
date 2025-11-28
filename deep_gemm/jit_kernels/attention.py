@@ -280,14 +280,14 @@ def get_paged_mqa_logits_metadata(context_lens: torch.Tensor,
 
     return schedule_metadata
 
-def fp8_paged_mqa_logits(q: torch.Tensor,
-                         fused_kv_cache: torch.Tensor,
-                         weights: torch.Tensor,
-                         context_lens: torch.Tensor,
-                         block_table: torch.Tensor,
-                         schedule_meta: torch.Tensor,
-                         max_context_len: int,
-                         clean_logits: bool = True):
+def paged_mqa_logits_common(q: torch.Tensor,
+                            fused_kv_cache: torch.Tensor,
+                            weights: torch.Tensor,
+                            context_lens: torch.Tensor,
+                            block_table: torch.Tensor,
+                            schedule_meta: torch.Tensor,
+                            max_context_len: int,
+                            clean_logits: bool = True):
 
     batch_size, next_n, num_heads, head_dim = q.shape
     num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf = fused_kv_cache.shape
@@ -397,3 +397,27 @@ def fp8_paged_mqa_logits(q: torch.Tensor,
     runtime(*args)
 
     return logits
+
+def bf16_paged_mqa_logits(q: torch.Tensor,
+                          fused_kv_cache: torch.Tensor,
+                          weights: torch.Tensor,
+                          context_lens: torch.Tensor,
+                          block_table: torch.Tensor,
+                          schedule_meta: torch.Tensor,
+                          max_context_len: int,
+                          clean_logits: bool = True):
+    # q_scales = None
+    # k_scales = torch.empty(0)
+    return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)
+
+def fp8_paged_mqa_logits(q: torch.Tensor,
+                         fused_kv_cache: torch.Tensor,
+                         weights: torch.Tensor,
+                         context_lens: torch.Tensor,
+                         block_table: torch.Tensor,
+                         schedule_meta: torch.Tensor,
+                         max_context_len: int,
+                         clean_logits: bool = True):
+    # q_scales = None
+    # k_scales = torch.empty(0)
+    return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)

@@ -23,6 +23,7 @@ from .jit_kernels import (
     fp8_mqa_logits,
     get_paged_mqa_logits_metadata,
     fp8_paged_mqa_logits,
+    bf16_paged_mqa_logits,
     bf16_mqa_logits,
     int8_mqa_logits,
 )
