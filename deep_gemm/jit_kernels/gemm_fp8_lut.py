@@ -34,30 +34,19 @@ class MNKDict:
 
     def query(self, m_query: int, n: int, k: int):
         """
-        查询 (n,k) 下 m <= m_query 的最大 m 对应的 tile
+        查询 (n,k) 下 m >= m_query 的最大 m 对应的 tile
         """
         key = (n, k)
         if key not in self.index:
             return None
 
         m_list = self.index[key]
-        # 二分查找最后一个 <= m_query 的位置
-        pos = bisect.bisect_right(m_list, m_query) - 1
-
-        if pos < 0:
+        pos = bisect.bisect_left(m_list, m_query)
+        if pos >= len(m_list):
             return None
 
         best_m = m_list[pos]
         return self.tiles[key][best_m]
-
-    def __contains__(self, key):
-        """支持 `in` 操作: (m, n, k) 是否存在"""
-        m, n, k = key
-        return (n, k) in self.tiles and m in self.values[(n, k)]
-
-    def get(self, m: int, n: int, k: int, default=None):
-        """获取精确 (m,n,k) 的值"""
-        return self.tiles.get((n, k), {}).get(m, default)
 
 @lru_cache(maxsize=None)
 def get_best_configs_from_lut(m: int, n: int, k: int, groups: int, is_grouped_contiguous: bool, is_grouped_masked: bool) -> \
@@ -78,21 +67,21 @@ def get_best_configs_from_lut(m: int, n: int, k: int, groups: int, is_grouped_co
 
     fp8_nopad_list = MNKDict([
         (  4,  768, 4096, ( 32,  64, 128, 16, 32, 3)),
-        (  8,  768, 4096, ( 16, 128, 128, 16, 32, 2)),
+        ( 16,  768, 4096, ( 16, 128, 128, 16, 32, 2)),
         ( 32,  768, 4096, ( 32,  64, 128, 16, 32, 4)),
-        (  4, 4096,  384, ( 16, 128, 128, 16, 32, 2)),
+        ( 16, 4096,  384, ( 16, 128, 128, 16, 32, 2)),
         ( 32, 4096,  384, ( 32,  64, 128, 16, 32, 2)),
-        (224, 4096,  384, ( 64, 128, 128, 32, 32, 2)),
-        (288, 4096,  384, ( 64,  64, 128, 32, 32, 2)),
+        (272, 4096,  384, ( 64, 128, 128, 32, 32, 2)),
+        (336, 4096,  384, ( 64,  64, 128, 32, 32, 2)),
         (512, 4096,  384, ( 64, 128, 128, 32, 32, 2)),
         (   1,  2048,   128, ( 16, 256, 128, 16, 64, 2)),
-        (   2,  2048,   128, ( 16, 128, 128, 16, 32, 2)),
-        (  13,  2048,   128, ( 32, 128, 128, 16, 64, 2)),
+        (  12,  2048,   128, ( 16, 128, 128, 16, 32, 2)),
+        (  32,  2048,   128, ( 32, 128, 128, 16, 64, 2)),
         (   1,   256,  2048, ( 16, 128, 128, 16, 32, 4)),
-        (   2,   256,  2048, ( 16,  64, 128, 16, 16, 3)),
-        (   4,   256,  2048, ( 16,  64, 128, 16, 16, 4)),
-        (  14,   256,  2048, ( 32, 128, 128, 16, 64, 3)),
-        (  30,   256,  2048, ( 64, 256, 128, 32, 64, 3)),
+        (   3,   256,  2048, ( 16,  64, 128, 16, 16, 3)),
+        (  13,   256,  2048, ( 16,  64, 128, 16, 16, 4)),
+        (  29,   256,  2048, ( 32, 128, 128, 16, 64, 3)),
+        (  32,   256,  2048, ( 64, 256, 128, 32, 64, 3)),
     ])
 
     if is_grouped_contiguous == False and is_grouped_masked == False and groups > 1:
