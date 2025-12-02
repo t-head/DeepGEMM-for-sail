@@ -487,7 +487,7 @@ public:
                         tSFApSFA(i) = (get<0>(tSFAcSFA(i)) + kv_start + kv_pipe * BLOCK_KV) < kv_end;
                     }
 
-                    // gmem_tiled_copy_A.desc_.dim_h = kv_end - (kv_start + kv_pipe * BLOCK_KV);
+                    gmem_tiled_copy_A.desc_.dim_h = kv_end - (kv_start + kv_pipe * BLOCK_KV);
                     if (enable_print) {
                         printf("    kv_pipe = %d, dim_h = %d\n", kv_pipe, kv_end - (kv_start + kv_pipe * BLOCK_KV));
                         print("        tAsA(_,_,_,kv_pipe): "); print(tAsA(_,_,_,kv_pipe)); print("\n");
@@ -545,7 +545,7 @@ public:
                 }
                 // Issue AIU K
                 auto dim_h = kv_end - (kv_start + kv_block_idx_copy * BLOCK_KV);
-                // gmem_tiled_copy_A.desc_.dim_h = kv_end - (kv_start + kv_block_idx_copy * BLOCK_KV);
+                gmem_tiled_copy_A.desc_.dim_h = kv_end - (kv_start + kv_block_idx_copy * BLOCK_KV);
                 if (enable_print) {
                     printf("        kv_block_idx = %d, kv_block_idx_copy = %d, dim_h = %d, current_stage_kv = %d\n", kv_block_idx, kv_block_idx_copy, dim_h, current_stage_kv);
                 }

@@ -140,10 +140,8 @@ __global__ void batched_gemvt_kernel_small_k(const GemvtArgs args) {
   int off_expert = *(args.expert_ids_ptr + pid_m);
 
   int tid = threadIdx.x;
-  int warp_id = tid / WARP_SIZE;
-
   int tid_k = tid % ThreadPerN;
-  int tid_n = tid / ThreadPerN;
+  int tid_n = (ThreadPerN == 32) ? __ppu_read_firstlane(tid / ThreadPerN) : tid / ThreadPerN;
   int id_n = pid_n * NPerBlock + tid_n;
   int id_k = tid_k * alignmentMax;
 
@@ -277,8 +275,6 @@ __global__ void batched_gemvt_kernel(const GemvtArgs args) {
     constexpr int ksize_ept = ThreadPerN * alignmentMax;
 
     int tid = threadIdx.x;
-    int warp_id = tid / WARP_SIZE;
-
     int tid_k = tid % ThreadPerN;
     int tid_n = tid / ThreadPerN;
 
