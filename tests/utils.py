@@ -8,17 +8,19 @@ try:
     from deep_gemm import get_col_major_tma_aligned_tensor
 except:
     from deep_gemm import get_mn_major_tma_aligned_tensor
+from deep_gemm import bench_kineto
 import deep_gemm
 import random
 import torch
 from typing import Tuple
 from enum import Enum
 import ast
+from math_utils import *
 
-
-global _acc_check
-_acc_check = True
-global use_ppu
+global _acc_check, _benchmark
+_acc_check, _benchmark = True, False
+global use_ppu, show_log
+show_log = False if "show_log" not in os.environ.keys() else True
 
 class KernelType(Enum):
     Kernel1D1D = 0
@@ -150,12 +152,14 @@ class DGStatus(Enum):
     Skip = 2
 def judge_device_type():
     device_name = torch.cuda.get_device_name()
-    use_ppu_ = (device_name.lower().find("ppu") != -1) or (device_name.lower().find("zw") != -1)
-    if not any(k in device_name.lower() for k in ['ppu', 'zw','nvidia']):
+    # cmodel device name return empty
+    use_ppu_ = (device_name.lower().find("ppu") != -1) or (device_name.lower().find("zw") != -1) or device_name == ""
+    if not any(k in device_name.lower() for k in ['ppu', 'zw','nvidia','']):
         raise ValueError("Unrecognized device name: {}!".format(device_name))
     global use_ppu
     use_ppu = use_ppu_
     return use_ppu_
+use_ppu = judge_device_type()
 
 def set_acc_check(value):
     global _acc_check
@@ -163,6 +167,13 @@ def set_acc_check(value):
 
 def get_acc_check():
     return _acc_check
+
+def set_benchmark(value):
+    global _benchmark
+    _benchmark = value
+
+def get_benchmark():
+    return _benchmark
 
 def check_signal(num_local_expert, max_m, block_m, threshold, signal, masked_m):
     ceil_div = lambda a, b: (a + b - 1) // b
@@ -179,47 +190,7 @@ def check_signal(num_local_expert, max_m, block_m, threshold, signal, masked_m):
             else:
                 assert signal[i] == 0, f'{i=}, {signal[i]=}'
 
-def calc_diff(x, y):
-    x, y = x.double(), y.double()
-    denominator = (x * x + y * y).sum()
-    sim = 2 * (x * y).sum() / denominator
-    return 1 - sim
-
-def ceil_div(x: int, y: int) -> int:
-    return (x + y - 1) // y
-
-def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2 and x.size(1) % 128 == 0
-    m, n = x.shape
-    x_view = x.view(m, -1, 128)
-    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), (x_amax / 448.0).view(m, -1)
-
-def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2
-    m, n = x.shape
-    x_padded = torch.zeros((ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device)
-    x_padded[:m, :n] = x
-    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
-    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
-    x_scaled = (x_view * (448.0 / x_amax)).to(torch.float8_e4m3fn)
-    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), (x_amax / 448.0).view(x_view.size(0), x_view.size(2))
-
-
-def per_token_cast_to_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2
-    m, n = x.shape
-
-    x_view = x.view(m, -1, n)
-    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-
-    scale = 127.0 / x_amax.unsqueeze(2)
-    x_normalized = x_view * scale
-    x_int8 = x_normalized.round().clamp(-128, 127).to(torch.int8)
-    x_int8 = x_int8.view(m, -1)
-    return x_int8, (x_amax / 127.0).view(m, -1)
-
-def construct(m: int, k: int, n: int, d: torch.dtype) -> \
+def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block") -> \
         Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor], torch.Tensor]:
     x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
@@ -236,7 +207,12 @@ def construct(m: int, k: int, n: int, d: torch.dtype) -> \
         x_int8, y_int8 = per_token_cast_to_int8(x), per_token_cast_to_int8(y)
         return x_int8, y_int8, out, ref_out
     elif d == torch.float8_e4m3fn:
-        x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
+        if quant_type == "channel":
+            x_fp8, y_fp8 = per_custom_dims_cast_to_fp8(x, (0, ), False, True), per_custom_dims_cast_to_fp8(y, (0, ), False, True)
+        else:
+            x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
+        if show_log:
+            print(y_fp8[1].shape)
         # Transpose earlier so that the testing will not trigger transposing kernels
         if use_ppu:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
@@ -319,14 +295,15 @@ def construct_group_m_list(distribution, num_groups, m, is_mask=False, seed=0, e
     else:
         print("ERROR: Unsupported distribution type, please check!")
         exit(1)
-    group_m_list = round_m_list_sum_to_m(group_m_list, m)
-    if is_mask:
-        group_m_list = [int(random.uniform(0, 1) * x) for x in group_m_list]
-    assert sum(group_m_list) <= m, f"sum(m_list)={sum(group_m_list)} must <= m_sum={m}"
+    if not is_mask:
+        group_m_list = round_m_list_sum_to_m(group_m_list, m)
+        assert sum(group_m_list) <= m, f"sum(m_list)={sum(group_m_list)} must <= m_sum={m}"
+    if show_log:
+        print(f"distribution:{group_m_list}")
     return group_m_list
 
 
-def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: torch.dtype, distribution: str, alignment: int) -> \
+def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: torch.dtype, distribution: str, alignment: int, quant_type: str = "block") -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     group_ms = construct_group_m_list(distribution, num_groups, m)
     m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
@@ -363,10 +340,20 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: tor
         return m, (x_int8[0].to("cuda"), x_int8[1].to("cuda")), (y_int8[0].to("cuda"), y_int8[1].to("cuda")), m_indices, out, ref_out.to('cuda')
     elif d == torch.float8_e4m3fn:
         # assert m % 4 == 0, f'TMA alignment error: {m}'
-        x_fp8 = per_token_cast_to_fp8(x)
-        y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, ceil_div(n, 128), k // 128), device='cpu', dtype=torch.float))
-        for i in range(num_groups):
-            y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
+        if quant_type == "channel":
+            x_fp8 = per_custom_dims_cast_to_fp8(x, (0, ), False, True)
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
+            for i in range(num_groups):
+                y_fp8[0][i], y_fp8[1][i] = per_custom_dims_cast_to_fp8(y[i], (0, ), False, True)
+                if show_log:
+                    print(y_fp8[1][i].shape)
+        else: # block wise
+            x_fp8 = per_token_cast_to_fp8(x)
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, ceil_div(n, 128), k // 128), device='cpu', dtype=torch.float))
+            for i in range(num_groups):
+                y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
+                if show_log:
+                    print(y_fp8[1][i].shape)
         if use_ppu:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
@@ -376,13 +363,13 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: tor
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
 
-def construct_grouped_masked(num_groups: int, m: int, k: int, n: int, d: torch.dtype, distribution: str, expected_m_per_group: int,
-                             enable_sbo_overlap: bool = False):
+def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, distribution: str,
+                             enable_sbo_overlap: bool = False, quant_type: str = "block"):
     # Construct mask
-    list_m =  construct_group_m_list(distribution, num_groups, m, is_mask=True, em=expected_m_per_group)
-    max_m = find_next_power_of_2(list_m)
+    list_m =  construct_group_m_list(distribution, num_groups, max_m, is_mask=True, em=expected_m_per_group)
     masked_m = torch.tensor(list_m, device='cuda', dtype=torch.int)
-    assert masked_m.amax().item() <= max_m
+    max_m = find_next_power_of_2(list_m)
+    assert masked_m.amax().item() <= max_m, f"max masked_m={masked_m.amax().item()}, allowed max_m={max_m}"
 
     x = torch.randn((num_groups, max_m, k), device='cpu', dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device='cpu', dtype=torch.bfloat16)
@@ -398,27 +385,37 @@ def construct_grouped_masked(num_groups: int, m: int, k: int, n: int, d: torch.d
     signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda') if enable_sbo_overlap else torch.empty(0).int()
 
     if d == torch.bfloat16:
-        return x.to('cuda'), y.to('cuda'), masked_m, out, ref_out.to('cuda'), signal
+        return x.to('cuda'), y.to('cuda'), masked_m, out, ref_out.to('cuda'), signal, max_m
     elif d == torch.int8:
         x_int8 = (torch.empty_like(x, dtype=torch.int8), torch.empty((num_groups, max_m, 1), device='cpu', dtype=torch.float))
         y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
         for i in range(num_groups):
             x_int8[0][i], x_int8[1][i] = per_token_cast_to_int8(x[i])
             y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
-        return (x_int8[0].to("cuda"), x_int8[1].to("cuda")), (y_int8[0].to("cuda"), y_int8[1].to("cuda")), masked_m, out, ref_out.to('cuda'), signal
+        return (x_int8[0].to("cuda"), x_int8[1].to("cuda")), (y_int8[0].to("cuda"), y_int8[1].to("cuda")), masked_m, out, ref_out.to('cuda'), signal, max_m
     elif d == torch.float8_e4m3fn:
-        x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, max_m, k // 128), device='cpu', dtype=torch.float))
-        y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, (n + 127) // 128, k // 128), device='cpu', dtype=torch.float))
-        for i in range(num_groups):
-            x_fp8[0][i], x_fp8[1][i] = per_token_cast_to_fp8(x[i])
-            y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
-
+        if quant_type == "channel":
+            x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, max_m, 1), device='cpu', dtype=torch.float))
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
+            for i in range(num_groups):
+                x_fp8[0][i], x_fp8[1][i] = per_custom_dims_cast_to_fp8(x[i], (0, ), False, True)
+                y_fp8[0][i], y_fp8[1][i] = per_custom_dims_cast_to_fp8(y[i], (0, ), False, True)
+                if show_log:
+                    print(y_fp8[1][i].shape)
+        else: # block wise
+            x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, max_m, k // 128), device='cpu', dtype=torch.float))
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, (n + 127) // 128, k // 128), device='cpu', dtype=torch.float))
+            for i in range(num_groups):
+                x_fp8[0][i], x_fp8[1][i] = per_token_cast_to_fp8(x[i])
+                y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
+                if show_log:
+                    print(y_fp8[1][i].shape)
         # Transpose earlier so that the testing will not trigger transposing kernels
         if use_ppu:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
-        return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m, out, ref_out.to('cuda'), signal
+        return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m, out, ref_out.to('cuda'), signal, max_m
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
@@ -495,7 +492,7 @@ def read_detail_from_nculog(filename):
 # devices = {
 #     "name": ["cycle", "tensor core efficiency", "waves"],
 #      hopper tc: sm__pipe_tensor_type_hmma_hgmma_qgmma_imma_igmma_bmma_bgmma_cycles_active.avg.pct_of_peak_sustained_elapsed
-#     "gpu":  ["sm__cycles_active.max", "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active", "launch__waves_per_multiprocessor"],
+#     "gpu":  ["gpu__time_duration.sum", "sm__cycles_active.max", "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active", "launch__waves_per_multiprocessor"],
 #     "ppu":  ["ce__cycles_active.max", "cu__inst_executed_pipe_tensor_fp16.avg.pct_of_peak_sustained_active", "launch__waves_per_cu"],
 # }
 
@@ -504,6 +501,7 @@ def read_cycle_from_nculog(filename):
     # kernel_pattern = r"(.*)kernel(.*)Device(.*)"
     kernel_pattern = r"(.*)Device\s+\d+"
     cycles_pattern = r"__cycles_active.max"
+    time_pattern = r"time_duration"
     global tc_pattern
     # tc_pattern = "we_pipe_tensor_cycles_active"
     tc_pattern = "_tensor_(.*)avg.pct_of_peak_sustained"
@@ -512,6 +510,7 @@ def read_cycle_from_nculog(filename):
     cycles_list = []
     tc_list = []
     hbm_list = []
+    time_list = []
 
     with open(filename, newline='') as log_file:
         for line in log_file.read().split("\n"):
@@ -523,10 +522,12 @@ def read_cycle_from_nculog(filename):
                 tc_list.append(float(line.strip().split()[-1]))
             if re.search(hbm_pattern, line):
                 hbm_list.append(float(line.strip().split()[-1]))
+            if re.search(time_pattern, line):
+                time_list.append(float(line.strip().split()[-1]))
 
     if (len(kernel_list) != len(cycles_list)) or (len(kernel_list) != len(tc_list)) or (len(kernel_list) != len(hbm_list)):
         print(f"assert len(kernel_list){len(kernel_list)} == len(cycles_list){len(cycles_list)} == len(tc_list){len(tc_list)} == len(hbm_list){len(hbm_list)} failed!!")
-        return 0, 0, [], 0
+        return 0, 0, [], 0, 0
     # assert(len(kernel_list) == len(cycles_list))
     # assert(len(kernel_list) == len(tc_list))
     # assert(len(kernel_list) == len(hbm_list))
@@ -535,6 +536,7 @@ def read_cycle_from_nculog(filename):
     fwd_cycle_sum = 0
     fwd_tc_sum = 0
     fwd_hbm_sum = 0
+    fwd_time = 0
 
     for i in range(len(kernel_list)):
         op = kernel_list[i]
@@ -544,13 +546,14 @@ def read_cycle_from_nculog(filename):
             fwd_cycle_sum += cycle
             fwd_tc_sum = tc_list[i]
             fwd_hbm_sum = hbm_list[i]
+            fwd_time = time_list[i]
     # calculate statistics data
     if fwd_cycle_sum != 0:
         # fwd unit case
-        return fwd_cycle_sum, fwd_tc_sum, op_cycles, fwd_hbm_sum
+        return fwd_cycle_sum, fwd_tc_sum, op_cycles, fwd_hbm_sum, fwd_time
     else:
         print("Not valid CSV file!")
-        return 0, 0, [], 0
+        return 0, 0, [], 0, 0
         #exit(-1)
 
 def clean_casename(name):
@@ -564,7 +567,7 @@ def clean_casename(name):
 
 def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0"):
     output_lines = list()
-    headers = ["casename","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
+    headers = ["casename","time","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"]
     # output_lines.append(new_row)
     if not os.path.exists("./logs"):
@@ -604,17 +607,17 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
                 # "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed"
                 metrics_string = "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format(dtype)
 
-            _acc = "" if _acc_check else "--disable_acc"
+            _acc = "--disable_acc"
             cmd = '{} --clock-control none {} --metrics="{}"  \
                 --page=details python {} --format "{}" {} \
                 2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", "" if dev == "gpu" else '--kernel-name "regex:Kernel|device_kernel|batched_gemvt*"', metrics_string, script, case, _acc, log_file)
 
         ret = run_cmd(cmd)
         result = "Fail"
-        cycle, tc, detail, hbm = 0, 0, "", 0
+        cycle, tc, detail, hbm, time = 0, 0, "", 0, 0
         if mode != "full" and ret != None:
             if ret.returncode == 0:
-                cycle, tc, detail, hbm = read_cycle_from_nculog(log_file)
+                cycle, tc, detail, hbm, time = read_cycle_from_nculog(log_file)
                 if mode == "show_log":
                     other_metrics = read_detail_from_nculog(log_file)
                     print(other_metrics)
@@ -635,7 +638,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
             else:
                 result = "Fail"
                 print("ERROR: failed to find cycle info, please check!!")
-        row =  [f"'{case.replace(',','_')}_{dtype}'", str(cycle), str(tc), str(hbm), dtype, result, str(cmd), str(detail)]
+        row =  [f"'{case.replace(',','_')}_{dtype}'", str(time), str(cycle), str(tc), str(hbm), dtype, result, str(cmd), str(detail)]
         if mode == "show_log":
             if "problem" not in headers:
                 headers.extend(other_metrics.keys())
@@ -675,14 +678,15 @@ def read_numbers_from_file(file_path):
     return numbers
 
 def parse_deepgemm_string_re(s):
-    # give default value
-    result = {"distribution": "uniform"}
-    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em"]
+    # give default value, for fp8 we have block and channel
+    result = {"distribution": "uniform", "enable_sbo_overlap": False, "quant_type": "block"}
+    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap"]
     supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedMasked", "Normal", "DenseGemm"]
+    supported_quant_type = ["block", "channel"]
     import re
-    dg_params = r"(?:\[DeepGemm\] --format=|\[DeepGemm with Distribution\] --format=)?(GroupedContiguous|GroupedNoPad|GroupedMasked|DenseGemm|Normal),(.+)"
+    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedMasked|DenseGemm|Normal),(.+)"
     pattern = re.compile(dg_params)
-    m = pattern.match(s.strip("."))
+    m = pattern.search(s.strip("."))
     if not m:
         print("Invalid input format string did not match deepgemm params:", dg_params)
         exit(1)
@@ -699,6 +703,11 @@ def parse_deepgemm_string_re(s):
             result[key] = ast.literal_eval(value)
         elif key == "data_type":
             result[key] = convert_data_type_to_dtype(value)
+        elif key == "quant_type":
+            if value not in supported_quant_type:
+                print("Invalid input quant_type")
+                exit(1)
+            result[key] = value
         else:
             # 尝试转换为整数、浮点数等
             try:
@@ -750,11 +759,13 @@ def parse_dump_file(file):
     return num_groups, m, n, k, expected_m_per_group
 
 def convert_data_type_to_dtype(data_type):
-    if data_type == "bf16":
+    if data_type in [torch.bfloat16, torch.int8, torch.float8_e4m3fn]:
+        return data_type
+    elif data_type in ["bf16", "torch.bfloat16"]:
         return torch.bfloat16
-    elif data_type == "int8":
+    elif data_type in ["int8", "torch.int8"]:
         return torch.int8
-    elif data_type == "fp8":
+    elif data_type in ["fp8", "torch.float8_e4m3fn"]:
         return torch.float8_e4m3fn
     else:
         print("ERROR: Unsupported dtype, please check!")
@@ -763,9 +774,10 @@ def convert_data_type_to_dtype(data_type):
 def test_gemm(args) -> None:
     print('Testing GEMM:')
     m, n, k, d = args['m'], args['n'], args['k'], args["data_type"]
-    print(f"test_gemm->test_func: m:{m},n:{n},k:{k},data_type:{d}")
+    quant_type = args['quant_type'] if 'quant_type' in args else 'block'
+    print(f"test_gemm->test_func: DenseGemm,m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")
     if use_ppu:
-        x, y, out, ref_out = construct(m, k, n, d)
+        x, y, out, ref_out = construct(m, k, n, d, quant_type=quant_type)
         if d == torch.bfloat16:
             deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
         elif d == torch.int8:
@@ -800,15 +812,33 @@ def test_gemm(args) -> None:
         print("Passed with acc_check\n")
     else:
         print("Passed without acc_check\n")
+    
+    if get_benchmark():
+        # noinspection PyShadowingNames
+        def test_func():
+            if d == torch.bfloat16:
+                deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
+            elif d == torch.int8:
+                deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
+            elif d == torch.float8_e4m3fn:
+                deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out)
+            else:
+                print("ERROR: Unsupported dtype, please check!")
+                exit(1)
+        t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+        print(f' > Performance (dtype={str(d)}, m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
+            f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
+            f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     return
 
 def test_m_grouped_gemm_contiguous(args) -> None:
     print('Testing grouped contiguous GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
+    quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     if use_ppu:
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, get_m_alignment_for_contiguous_layout())
-        print(f"test_m_grouped_gemm_contiguous->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d}")
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, get_m_alignment_for_contiguous_layout(),quant_type=quant_type)
+        print(f"test_m_grouped_gemm_contiguous->test_func: GroupedContiguous,groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")
         if d == torch.bfloat16:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
         elif d == torch.int8:
@@ -840,20 +870,47 @@ def test_m_grouped_gemm_contiguous(args) -> None:
         print("Passed with acc_check\n")
     else:
         print("Passed without acc_check\n")
+    
+    if get_benchmark():
+        # noinspection PyShadowingNames
+        def test_func():
+            if d == torch.bfloat16:
+                deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
+            elif d == torch.int8:
+                deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
+            elif d == torch.float8_e4m3fn:
+                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices)
+            else:
+                print("ERROR: Unsupported dtype, please check!")
+                exit(1)
+        t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+        valid_m = (m_indices != -1).sum().item()
+        print(f' > Perf ((contiguous dtype={str(d)}, {num_groups=:2}, {ceil_div(m, num_groups)=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+        f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
+        f'{(valid_m * k + num_groups * k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     return
+
+def estimate_expected_m(max_m, group_size, m_indices):
+    assert group_size != 0
+    estimate = round_up(int(max_m // group_size), 16)
+    max_m = round_up(min(max(m_indices.tolist()), max_m), 16)
+    # clamp estimate
+    estimate = max(estimate, 16)
+    estimate = min(max_m, estimate)
+    return estimate
 
 def test_m_grouped_gemm_masked(args) -> None:
     print('Testing grouped masked GEMM:')
 
     num_groups, m, n, k, d, distribution = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
+    quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     if use_ppu:
-        expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
-        x, y, masked_m, out, ref_out, signal = construct_grouped_masked(num_groups, m, k, n, d, distribution, expected_m_per_group, enable_sbo_overlap=enable_sbo_overlap)
-        # post compute max_m and em to help kernel choose tile
-        max_m = find_next_power_of_2(masked_m)
-        expected_m_per_group = ceil_div(sum(masked_m).item(), num_groups) if "em" not in args.keys() else args["em"]
-        print(f"test_m_grouped_gemm_masked->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},em:{expected_m_per_group},max_m:{max_m},distribution:{masked_m},sbo_overlap:{enable_sbo_overlap}")
+        expected_m_per_group = ceil_div(m, num_groups)
+        x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type)
+
+        expected_m_per_group = estimate_expected_m(m, num_groups, masked_m) if "em" not in args.keys() else args["em"]
+        print(f"test_m_grouped_gemm_masked->test_func: GroupedMasked,groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},em:{expected_m_per_group},max_m:{max_m},distribution:{masked_m},sbo_overlap:{enable_sbo_overlap}")
 
         if d == torch.bfloat16:
             result = deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
@@ -864,6 +921,9 @@ def test_m_grouped_gemm_masked(args) -> None:
         elif d == torch.float8_e4m3fn:
             result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+        else:
+            print("ERROR: Unsupported dtype, please check!")
+            exit(1)
     else:
         expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
         if d == torch.bfloat16:
@@ -894,14 +954,37 @@ def test_m_grouped_gemm_masked(args) -> None:
         print("Passed with acc_check\n")
     else:
         print("Passed without acc_check\n")
+    if get_benchmark():
+        # noinspection PyShadowingNames
+        def test_func():
+            if d == torch.bfloat16:
+                result = deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
+                                                                        enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+            elif d == torch.int8:
+                result = deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
+                                                                        enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+            elif d == torch.float8_e4m3fn:
+                result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
+                                                                        enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+            else:
+                print("ERROR: Unsupported dtype, please check!")
+                exit(1)
+        # Test performance with fixed shapes
+        # noinspection PyUnboundLocalVariable
+        valid_m = masked_m.sum().item()
+        t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+        print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+            f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
+            f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
     return
 
 def test_m_grouped_gemm_nopad(args) -> None:
-    print('Testing grouped unpad GEMM:')
+    print('Testing grouped nopad GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
-    print(f"test_m_grouped_gemm_nopad->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d}")
+    quant_type = args['quant_type'] if 'quant_type' in args else 'block'
+    print(f"test_m_grouped_gemm_nopad->test_func: GroupedNoPad,data_type:{d},groups:{num_groups},m:{m},n:{n},k:{k},quant_type:{quant_type}")
     if use_ppu:
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1)
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1, quant_type=quant_type)
         if d == torch.bfloat16:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
         elif d == torch.int8:
@@ -927,6 +1010,24 @@ def test_m_grouped_gemm_nopad(args) -> None:
         print("Passed with acc_check\n")
     else:
         print("Passed without acc_check\n")
+    if get_benchmark():
+        # noinspection PyShadowingNames
+        def test_func():
+            if d == torch.bfloat16:
+                deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
+            elif d == torch.int8:
+                deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
+            elif d == torch.float8_e4m3fn:
+                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
+            else:
+                print("ERROR: Unsupported dtype, please check!")
+                exit(1)
+        t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+        valid_m = (m_indices != -1).sum().item()
+        print(f' > Perf ((contiguous dtype={str(d)}, {num_groups=:2}, {ceil_div(m, num_groups)=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+        f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
+        f'{(valid_m * k + num_groups * k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
+    
     return
 
 

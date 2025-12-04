@@ -166,7 +166,7 @@ def test_m_grouped_gemm_masked(d: torch.dtype, args) -> None:
     else:
         distribute = torch.tensor(distribution, dtype=torch.int32, device='cuda')
 
-    x, y, masked_m, out, ref_out = construct_grouped_masked(num_groups, max_m, k, n, d, distribution, expected_m_per_group)
+    x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, max_m, k, n, d, distribution, expected_m_per_group)
 
     tile_list = get_tile_list(d, max_m, n, k, num_groups, 'masked', True)
 
@@ -298,7 +298,6 @@ if __name__ == '__main__':
     parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
-    parser.add_argument('--dtype', default="bf16", type=str, choices=["int8","bf16", "int8,bf16", 'fp8'], required=False, help='data type of the cases')
 
     args = parser.parse_args()
 

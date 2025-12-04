@@ -34,7 +34,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Performance Testing for DeepGemm with format or list.')
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
-    parser.add_argument('--case_idx', default=None, type=int, required=False, help='the line index of case in caselist file')
+    parser.add_argument('--case_idx', default=None, type=int, required=False, help='the line index(1~line) of case in caselist file')
     parser.add_argument('--format',  type=str, default=None, help="Case cmd to describe problem size.")
     parser.add_argument('--output', default="output", type=str, required=False, help='the output storing cycles of DG cases')
     parser.add_argument('--mode', default="metrics", type=str, choices=["metrics","full","show_log","umd_perf"], required=False, help='run perf mode')
@@ -52,7 +52,7 @@ if __name__ == '__main__':
             print("no dg_cases found")
             exit(-1)
         if args.case_idx:
-            dg_cases = [dg_cases[args.case_idx]]
+            dg_cases = [dg_cases[args.case_idx-1]]
     else:
         print("Must give must give --caselist or --format")
         exit(-1)

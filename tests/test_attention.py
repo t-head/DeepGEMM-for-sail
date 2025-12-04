@@ -4,8 +4,7 @@ from typing import Tuple
 
 import deep_gemm
 from bench import *
-from numeric import *
-from math_utils import ceil_div, per_custom_dims_cast_to_fp8
+from math_utils import *
 from utils import per_token_cast_to_int8
 from deep_gemm.jit_kernels.utils import is_ppu1v5_device
 
