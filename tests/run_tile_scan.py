@@ -80,7 +80,8 @@ if __name__ == "__main__":
         print(f'Profiling {idx + 1}/{total}. case:', case)
         one_case = parse_deepgemm_string_re(case)
         m, n, k = int(one_case['m']), int(one_case['n']), int(one_case['k'])
-        fname = "m{}_n{}_k{}_group{}".format(m, n, k, one_case['groups'])
+        group = one_case['groups'] if 'groups' in one_case else 1
+        fname = "m{}_n{}_k{}_group{}".format(m, n, k, group)
         print(f'case name:{one_case}')
         log_file = "./logs/tile_scan.log.{}".format(fname)
         cmd = "rm -f " + log_file

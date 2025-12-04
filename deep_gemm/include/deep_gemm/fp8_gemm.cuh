@@ -428,7 +428,7 @@ public:
     using TiledMma = cute::TiledMMA<
         cute::MMA_Atom<MmaInst>,
         cute::Layout<Shape<WarpOnM, WarpOnN, _1>>>;
-    
+
     // scale
     static constexpr int ScaleGranularityM = size<0,0>(LayoutSFA{});
     static constexpr int ScaleGranularityN = size<0,0>(LayoutSFB{});
@@ -438,7 +438,10 @@ public:
     static constexpr int MinScaleElementSize = 32 / sizeof_bits<ElementScale>::value * 8;
     static constexpr int ScaleMsPerTile = cute::max(cute::ceil_div(Int<BlockM>{}, Int<ScaleGranularityM>{}), Int<MinScaleElementSize>{});
     static constexpr int ScaleNsPerTile = cute::max(cute::ceil_div(Int<BlockN>{}, Int<ScaleGranularityN>{}), Int<MinScaleElementSize>{});
-    static constexpr int ScaleKsPerTile = BlockK / ScaleGranularityK;
+
+    static constexpr int ScaleKsPerTile = cute::ceil_div(Int<BlockK>{}, Int<ScaleGranularityK>{});
+    static_assert(BlockK > ScaleGranularityK ? (BlockK % ScaleGranularityK) == 0 : (ScaleGranularityK % BlockK) == 0,
+              "Block scaling granularity must evenly divide tile shape along K.");
 
     using DefaultOperandSFA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementScale, true, Int<ScaleMsPerTile>, Int<ScaleKsPerTile>, false>;
     using DefaultOperandSFB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementScale, true, Int<ScaleNsPerTile>, Int<ScaleKsPerTile>, true>;

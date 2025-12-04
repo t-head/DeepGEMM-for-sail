@@ -10,7 +10,7 @@ from deep_gemm import bench_kineto, calc_diff, ceil_div, get_m_alignment_for_con
 from deep_gemm.jit_kernels.gemm_int8 import get_smem_config
 from deep_gemm.jit_kernels.utils import get_search_space, get_num_sms
 from utils import read_numbers_from_file, parse_dump_file, parse_deepgemm_string_re, judge_device_type
-from utils import construct_contiguous_grouped, construct_grouped_masked, split_list_into_groups
+from utils import construct, construct_contiguous_grouped, construct_grouped_masked, split_list_into_groups
 from deepgemm_tools import get_supported_configs, get_best_configs
 
 def call_test_func(gemm_type, func_args):
@@ -53,7 +53,7 @@ def test_gemm(d: torch.dtype, args = None) -> None:
     print('Testing GEMM:')
     m, n, k, num_group = 64, 2304, 4096, 1
     if args:
-        m, n, k, num_group = args['m'], args['n'], args['k'], args['groups']
+        m, n, k = args['m'], args['n'], args['k']
     else:
         print('use default testcase')
 
@@ -219,9 +219,9 @@ def test_func_nopad(cycle, tid, m, n, k, d, tile_list, x, y, out, m_indices, dis
 
 def test_m_grouped_gemm_nopad(d: torch.dtype, args = None) -> None:
     print('Testing grouped unpad GEMM:')
-    num_groups, expected_m_per_group, m, n, k, distribution = 128, 4, 512, 4096, 384, "uniform"
+    num_groups, m, n, k, distribution = 128, 512, 4096, 384, "uniform"
     if args:
-        num_groups, expected_m_per_group, m, n, k, distribution = args['groups'], args['em'], args['m'], args['n'], args['k'], args['distribution']
+        num_groups, m, n, k, distribution = args['groups'], args['m'], args['n'], args['k'], args['distribution']
     else:
         print('use default testcase')
 

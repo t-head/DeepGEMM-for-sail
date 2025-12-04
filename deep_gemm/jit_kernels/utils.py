@@ -353,8 +353,12 @@ def get_search_space(d: torch.dtype, gemm_type : str, m:int=0, n:int=0, k:int=0)
     tile_list_rtn = []
     if d == torch.float8_e4m3fn:
         for tile in tile_list:
-            if tile[4] == block_k and tile[0] != 48:
+            if tile[0] != 48 and tile[0] != 160 and tile[0] < 256 and not (tile[1] == 256 and tile[4] == 256):
                 tile_list_rtn.append(tile)
+                if tile[4] == block_k and tile[0] != 192:
+                    tile_copy = copy.deepcopy(tile)
+                    tile_copy[4] = int(block_k / 2)
+                    tile_list_rtn.append(tile_copy)
         return tile_list_rtn
 
     # add block_k / 2 tile for k <256
