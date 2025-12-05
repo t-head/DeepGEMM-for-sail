@@ -21,14 +21,15 @@ constexpr auto WARP_M = {WARP_M};
 constexpr auto WARP_N = {WARP_N};
 constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
+constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
 
 // Make a templated grouped GEMM
-using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}>;
+using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap>;
 
 // Launch kernel
 gemm_t::run(out, grouped_layout,
             m, expected_m, lhs, lhs_scales, rhs, rhs_scales,
-            stream, num_sms, smem_size);
+            stream, num_sms, smem_size, signal);
 """
 
 includes_cutlass3 = ('"../deep_gemm/int8_gemm_cutlass3.cuh"', )
@@ -46,14 +47,15 @@ constexpr auto WARP_M = {WARP_M};
 constexpr auto WARP_N = {WARP_N};
 constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
+constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
 
 // Make a templated grouped GEMM
-using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}>;
+using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap>;
 
 // Launch kernel
 gemm_t::run(out, grouped_layout,
             m, expected_m, (ElementAB*)lhs, lhs_scales, (ElementAB*)rhs, rhs_scales,
-            stream, num_sms, smem_size);
+            stream, num_sms, smem_size, signal);
 """
 
 includes_gemv = ('"deep_gemm/gemvt.cuh"', )
@@ -128,7 +130,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices, m, expected_m, num_groups,
-            torch.cuda.current_stream(), num_sms, smem_config[0])
+            torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_int8_int8_bf16_nt',
         keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
@@ -137,6 +139,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
+              'ENABLE_SBO_OVERLAP': False,
               'GEMM_TYPE': 'GroupedContiguous'},
         space=(),
         includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
@@ -145,7 +148,8 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('m', int),
                   ('num_groups', int), ('expected_m', int),
-                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
+                  ('signal', torch.int32)),
         template=template_cutlass3 if extra_info['use_cutlass3'] else template,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
@@ -160,7 +164,9 @@ def m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.T
 
 def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor],
                                               rhs: Tuple[torch.Tensor, torch.Tensor],
-                                              out: torch.Tensor, masked_m: torch.Tensor, expected_m: int, configs = None) -> None:
+                                              out: torch.Tensor, masked_m: torch.Tensor, expected_m: int, configs = None,
+                                              max_block_n: int = 256, enable_sbo_overlap: bool = False,
+                                              signal: torch.Tensor = torch.empty(0).int()) -> None:
     lhs, lhs_scales = lhs
     rhs, rhs_scales = rhs
     num_groups, m, k = lhs.shape
@@ -188,13 +194,18 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
     # lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
     assert rhs_scales.is_contiguous()
 
+    if enable_sbo_overlap:
+        assert signal is not None
+        assert signal.is_contiguous()
+        assert signal.dtype == torch.int32
+
     # Auto-tuning with compilation
     global includes, template, includes_cutlass3, template_cutlass3
     num_sms = get_num_sms()
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True, max_block_n=max_block_n)
 
     extra_info = get_extra_info()
 
@@ -203,7 +214,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             masked_m, m, expected_m,
-            torch.cuda.current_stream(), num_sms, smem_config[0])
+            torch.cuda.current_stream(), num_sms, smem_config[0], signal)
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_' + ElementAB + '_nt',
         keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
@@ -211,6 +222,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
+              'ENABLE_SBO_OVERLAP': enable_sbo_overlap,
               'GEMM_TYPE': 'GroupedMasked'},
         space=(),
         includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
@@ -218,7 +230,8 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
                   ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
-                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
+                  ('signal', torch.int32)),
         template=template_cutlass3 if extra_info['use_cutlass3'] else template,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
@@ -226,10 +239,14 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
     # Run the kernel
     runtime(*args)
 
+    return (block_m, ceil_div(n, block_n))
+
 def m_grouped_gemm_int8_int8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor],
                                             rhs: Tuple[torch.Tensor, torch.Tensor],
-                                            out: torch.Tensor, masked_m: torch.Tensor, expected_m: int, configs = None) -> None:
-    m_grouped_gemm_a8w8_per_channel_nt_masked(lhs, rhs, out, masked_m, expected_m, configs)
+                                            out: torch.Tensor, masked_m: torch.Tensor, expected_m: int, configs = None,
+                                            max_block_n: int = 256, enable_sbo_overlap: bool = False,
+                                            signal: torch.Tensor = torch.empty(0).int()) -> None:
+    return m_grouped_gemm_a8w8_per_channel_nt_masked(lhs, rhs, out, masked_m, expected_m, configs, max_block_n, enable_sbo_overlap, signal)
 
 def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
                                              rhs: Tuple[torch.Tensor],
@@ -326,7 +343,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
                 experts_for_rows[:min_n] = counts[:min_n]
             m_rows = experts_for_rows
         args = (lhs, lhs_scales, rhs, rhs_scales, out, m_rows, m, expected_m,
-            torch.cuda.current_stream(), num_sms, smem_config[0])
+            torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
 
         runtime = jit_tuner.compile_and_tune(
             name='m_grouped_gemm_' + ElementAB + '_nt',
@@ -336,6 +353,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
                   'WARP_M': warp_m, 'WARP_N': warp_n,
                   'BLOCK_N_PADDING': smem_config[2],
                   'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
+                  'ENABLE_SBO_OVERLAP': False,
                   'GEMM_TYPE': 'GroupedNoPad'},
             space=(),
             includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
@@ -343,7 +361,8 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
                         ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                         ('out', torch.bfloat16),
                         ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
-                        ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+                        ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
+                        ('signal', torch.int32)),
             template=template_cutlass3 if extra_info['use_cutlass3'] else template,
             jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
             args=args

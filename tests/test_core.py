@@ -7,7 +7,7 @@ import deep_gemm
 from deep_gemm import bench_kineto, get_m_alignment_for_contiguous_layout
 from utils import calc_diff, construct, construct_contiguous_grouped, construct_grouped_masked
 from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad
-from utils import set_acc_check, get_acc_check
+from utils import set_acc_check, get_acc_check, check_signal
 def test_gemm_loop(d: torch.dtype) -> None:
     for m in (64, 128, 4096):
         for k, n in [(576, 7168), (7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
@@ -55,14 +55,16 @@ def test_m_grouped_gemm_contiguous_loop(d: torch.dtype) -> None:
     print("Passed\n")
 
 
-def test_m_grouped_gemm_masked_loop(d: torch.dtype) -> None:    
+def test_m_grouped_gemm_masked_loop(d: torch.dtype) -> None:
     # Test correctness
     # num_groups, expected_m_per_group, k, n = 4, 2, 128, 64
     for num_groups, expected_m_per_group in ((1, 1024), (2, 512), (4, 256)):
         for k, n in ((7168, 4096), (2048, 7168), ):
-            for i in range(10):
-                args = {"groups":num_groups,"m":num_groups*expected_m_per_group, "n":n, "k":k, "data_type":d, "distribution": "uniform", "max_m": 2048}
-                test_m_grouped_gemm_masked(args)
+            for enable_sbo_overlap in (False, True):
+                for i in range(10):
+                    args = {"groups":num_groups,"m":num_groups*expected_m_per_group, "n":n, "k":k, "data_type":d, "distribution": "uniform", "max_m": 2048,
+                            "enable_sbo_overlap":enable_sbo_overlap}
+                    test_m_grouped_gemm_masked(args)
 
     if benchmark:
         # noinspection PyShadowingNames

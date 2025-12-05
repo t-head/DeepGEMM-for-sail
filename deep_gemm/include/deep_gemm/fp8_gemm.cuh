@@ -41,7 +41,8 @@ template <
   class ProblemShape_,
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
-  class TileScheduler_
+  class TileScheduler_,
+  bool kEnableSboOverlap
 >
 class DeepGemmUniversal
 {
@@ -109,6 +110,7 @@ public:
     EpilogueArguments epilogue{};
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
+    int32_t* signal{nullptr};
   };
 
   // Kernel entry point API
@@ -120,6 +122,7 @@ public:
     KernelHardwareInfo hw_info{};
     TileSchedulerParams scheduler{};
     void* workspace{nullptr};
+    int32_t* signal{nullptr};
   };
 
   //
@@ -180,7 +183,8 @@ public:
       CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, epilogue_workspace),
       hw_info,
       scheduler,
-      workspace
+      workspace,
+      args.signal
     };
   }
 
@@ -328,6 +332,15 @@ public:
         (char*)&shared_storage.tensors.epilogue
       );
 
+      if constexpr(kEnableSboOverlap) {
+        cp_async_wait<0>();
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+          atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
+                  * ceil_div(M, TileScheduler::BLOCK_M) + m_block_idx, 1);
+        }
+      }
     } // Scheduler work fetch loop
   }
 
@@ -339,7 +352,8 @@ template <int32_t SHAPE_N, int32_t SHAPE_K,
           int32_t BLOCK_N_PADDING,
           int32_t kSwizzleDMode,
           int32_t kNumGroups, int32_t kNumStages,
-          GemmType kGemmType>
+          GemmType kGemmType,
+          bool kEnableSboOverlap = false>
 class Fp8Gemm {
 
 public:
@@ -469,13 +483,14 @@ public:
                     int* grouped_layout,
                     int32_t shape_m, uint32_t expected_m,
                     cudaStream_t stream,
-                    int num_sms, uint32_t smem_size) {
+                    int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
         using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BlockM, BlockN, kNumGroups>;
         using GemmKernel = typename deep_gemm::DeepGemmUniversal<
           Shape<int,int,int,int>,
           CollectiveMainloop,
           CollectiveEpilogue,
-          TileScheduler
+          TileScheduler,
+          kEnableSboOverlap
         >;
 
         using StrideA = typename GemmKernel::StrideA;
@@ -512,7 +527,7 @@ public:
             nullptr, stride_D,
             converted_output, stride_D
           },
-          hw_info,
+          hw_info, {}, signal
         };
         // Using the arguments, query for extra workspace required for matrix multiplication computation
         size_t workspace_size = GemmKernel::get_workspace_size(arguments);

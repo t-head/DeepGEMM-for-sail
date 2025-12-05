@@ -24,7 +24,8 @@ namespace deep_gemm {
 
 template <typename Mma_,          ///! Threadblock-scoped matrix multiply-accumulate
     typename Epilogue_,           ///! Epilogue
-    typename ProblemVisitor_
+    typename ProblemVisitor_,
+    bool kEnableSboOverlap
     >
 struct GemmKernel {
 public:
@@ -90,6 +91,8 @@ public:
         int problem_count {0};
         int threadblock_count {0};
 
+        int32_t* signal;
+
         //
         // Methods
         //
@@ -103,6 +106,7 @@ public:
             , gemm_n(0)
             , gemm_k(0)
             , grouped_layout(nullptr)
+            , signal(nullptr)
         {
         }
 
@@ -112,7 +116,7 @@ public:
             typename Mma::IteratorA::TensorRef ref_A, typename Mma::IteratorB::TensorRef ref_B,
             typename Epilogue::OutputTileIterator::TensorRef ref_D,
             int64_t gemm_m, int64_t gemm_n, int64_t gemm_k,
-            int* grouped_layout)
+            int* grouped_layout, int32_t* signal)
             : problem_count(problem_count)
             , threadblock_count(threadblock_count)
             , output_op(output_op)
@@ -123,6 +127,7 @@ public:
             , gemm_n(gemm_n)
             , gemm_k(gemm_k)
             , grouped_layout(grouped_layout)
+            , signal(signal)
         {
         }
     };
@@ -147,6 +152,8 @@ public:
         ElementC* ptr_D;
         typename Epilogue::OutputTileIterator::Params params_D;
 
+        int32_t* signal;
+
         //
         // Methods
         //
@@ -156,6 +163,7 @@ public:
             : ptr_A(nullptr)
             , ptr_B(nullptr)
             , ptr_D(nullptr)
+            , signal(nullptr)
         {
         }
 
@@ -171,6 +179,7 @@ public:
             , params_B(args.ref_B.layout())
             , ptr_D(args.ref_D.data())
             , params_D(args.ref_D.layout())
+            , signal(args.signal)
         {
         }
 
@@ -185,6 +194,7 @@ public:
             ptr_A = args.ptr_A;
             ptr_B = args.ptr_B;
             ptr_D = args.ptr_D;
+            signal = args.signal;
         }
     };
 
@@ -341,6 +351,16 @@ public:
             Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
 
             epilogue(output_op, iterator_D, accumulators, iterator_D);
+
+            if constexpr(kEnableSboOverlap) {
+                cutlass::arch::cp_async_wait<0>();
+                __syncthreads();
+
+                if (threadIdx.x == 0) {
+                    atomic_add_release_global(params.signal + problem_visitor.curr_group_idx
+                            * ceil_div(static_cast<int>(gemm_m), ThreadblockShape::kM) + m_block_idx, 1);
+                }
+            }
         }
     }
 };
@@ -349,7 +369,7 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t WARP_M, uint32_t WARP_N,
           uint32_t kNumGroups, uint32_t kNumStages,
-          GemmType kGemmType>
+          GemmType kGemmType, bool kEnableSboOverlap = false>
 class Gemm {
 
 public:
@@ -357,7 +377,7 @@ public:
 
     static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
                     uint32_t shape_m, uint32_t expected_m, __nv_bfloat16* gmem_a, __nv_bfloat16* gmem_b,
-                    cudaStream_t stream, int num_sms, uint32_t smem_size) {
+                    cudaStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
         using ThreadblockShape = cutlass::gemm::GemmShape<BLOCK_M, BLOCK_N, BLOCK_K>;
         using WarpShape = cutlass::gemm::GemmShape<WARP_M, WARP_N, BLOCK_K>;
         using ElementType = cutlass::bfloat16_t;
@@ -385,7 +405,7 @@ public:
 
         using ProblemVisitor = Scheduler<kGemmType, SHAPE_N, ThreadblockShape>;
 
-        using GemmKernel = GemmKernel<typename DefaultGemm::Mma, typename DefaultGemm::Epilogue, ProblemVisitor>;
+        using GemmKernel = GemmKernel<typename DefaultGemm::Mma, typename DefaultGemm::Epilogue, ProblemVisitor, kEnableSboOverlap>;
 
         using GemmGrouped = aiu::gemm::device::GemmGrouped<GemmKernel>;
 
@@ -430,7 +450,7 @@ public:
             // {gmem_d, SHAPE_N},
             {reinterpret_cast<ElementType*>(gmem_d), SHAPE_N},
             shape_m, SHAPE_N, SHAPE_K,
-            grouped_layout
+            grouped_layout, signal
         );
 
         GemmGrouped gemm;

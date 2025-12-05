@@ -154,7 +154,7 @@ def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> \
+                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False, max_block_n: int = 256) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     #FIXME: block m can add 16, and blockM/N could be 512
     if not is_grouped_contiguous:
@@ -164,8 +164,9 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         block_ms = (get_m_alignment_for_contiguous_layout(), )
         # block_ms = (16, 32)
 
-    # block_ns = (32, 64, 128, 256)
-    block_ns = (256, 128, 64, 32)
+    # block_ns = (256, 128, 64, 32)
+    assert max_block_n > 0 and (max_block_n & (max_block_n - 1)) == 0
+    block_ns = tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 1, 4, -1)))
 
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)

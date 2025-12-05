@@ -56,6 +56,7 @@ template <
   class CollectiveMainloopOrEpilogue_,
   class CollectiveEpilogueOrThreadblockSwizzle_,
   class TileScheduler_ = void,
+  bool kEnableSboOverlap = false,
   class Enable = void
 >
 class DeepGemmUniversal;
@@ -65,13 +66,15 @@ template <
   class ProblemShape_,
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
-  class TileScheduler_
+  class TileScheduler_,
+  bool kEnableSboOverlap
 >
 class DeepGemmUniversal<
   ProblemShape_,
   CollectiveMainloop_,
   CollectiveEpilogue_,
   TileScheduler_,
+  kEnableSboOverlap,
   cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistageOnN, typename CollectiveMainloop_::DispatchPolicy::Schedule>>> {
 public:
   //
@@ -137,6 +140,7 @@ public:
     EpilogueArguments epilogue{};
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
+    int32_t* signal{nullptr};
   };
 
   // Kernel entry point API
@@ -148,6 +152,7 @@ public:
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
     void* workspace{nullptr};
+    int32_t* signal{nullptr};
   };
 
   //
@@ -201,7 +206,8 @@ public:
       CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, epilogue_workspace),
       hw_info,
       args.scheduler,
-      workspace
+      workspace,
+      args.signal
     };
   }
 
@@ -553,6 +559,15 @@ public:
 
       } // for n_iter
 
+      if constexpr(kEnableSboOverlap) {
+        cp_async_wait<0>();
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+          atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
+                  * ceil_div(M, TileScheduler::BLOCK_M) + m_block_idx, 1);
+        }
+      }
     } // Scheduler work fetch loop
   }
 
@@ -929,13 +944,15 @@ template <
   class ProblemShape_,
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
-  class TileScheduler_
+  class TileScheduler_,
+  bool kEnableSboOverlap
 >
 class DeepGemmUniversal<
   ProblemShape_,
   CollectiveMainloop_,
   CollectiveEpilogue_,
   TileScheduler_,
+  kEnableSboOverlap,
   cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistage, typename CollectiveMainloop_::DispatchPolicy::Schedule>>> {
 public:
 public:
@@ -1002,6 +1019,7 @@ public:
     EpilogueArguments epilogue{};
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
+    int32_t* signal{nullptr};
   };
 
   // Kernel entry point API
@@ -1013,6 +1031,7 @@ public:
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
     void* workspace{nullptr};
+    int32_t* signal{nullptr};
   };
 
   //
@@ -1066,7 +1085,8 @@ public:
       CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, epilogue_workspace),
       hw_info,
       args.scheduler,
-      workspace
+      workspace,
+      args.signal
     };
   }
 
@@ -1205,6 +1225,16 @@ public:
       // if (thread0()) {
       //   printf("accumulators[0] = %.4f\n", accumulators[0]);
       // }
+
+      if constexpr(kEnableSboOverlap) {
+        cp_async_wait<0>();
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+          atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
+                  * ceil_div(M, TileScheduler::BLOCK_M) + m_block_idx, 1);
+        }
+      }
     } // Scheduler work fetch loop
   }
 
@@ -1218,7 +1248,7 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t WARP_M, uint32_t WARP_N,
           uint32_t kNumGroups, uint32_t kNumStages,
-          GemmType kGemmType,
+          GemmType kGemmType, bool kEnableSboOverlap = false,
           bool EnableMultistageOnN_ = false>
 class Gemm {
 
@@ -1227,7 +1257,7 @@ public:
 
     static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
                     uint32_t shape_m, uint32_t expected_m, __nv_bfloat16* gmem_a, __nv_bfloat16* gmem_b,
-                    cudaStream_t stream, int num_sms, uint32_t smem_size) {
+                    cudaStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
         using ElementA    = cutlass::bfloat16_t;
         using ElementB    = cutlass::bfloat16_t;
         using ElementC    = cutlass::bfloat16_t;
@@ -1320,7 +1350,8 @@ public:
             Shape<int,int,int,int>,
             CollectiveMainloop,
             CollectiveEpilogue,
-            TileScheduler>;
+            TileScheduler,
+            kEnableSboOverlap>;
 
         using StrideA = typename GemmKernel::StrideA;
         using StrideB = typename GemmKernel::StrideB;
@@ -1343,7 +1374,7 @@ public:
             {shape_m, SHAPE_N, SHAPE_K, 1},
             {(ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B},
             {{1.0f, 0.0f}, (ElementC*)gmem_d, stride_C, (ElementD*)gmem_d, stride_D},
-            hw_info, {shape_m, grouped_layout}
+            hw_info, {shape_m, grouped_layout}, signal
         };
 
         arguments.epilogue.thread.alpha = 1;

@@ -35,6 +35,21 @@ def set_acc_check(value):
 def get_acc_check():
     return _acc_check
 
+def check_signal(num_local_expert, max_m, block_m, threshold, signal, masked_m):
+    ceil_div = lambda a, b: (a + b - 1) // b
+
+    expert_len = max_m // block_m
+    for expert in range(num_local_expert):
+        mask = masked_m[expert]
+        start = expert * expert_len
+        end = expert * expert_len + expert_len
+        valid_len = ceil_div(mask, block_m)
+        for i in range(start, end):
+            if i < start + valid_len:
+                assert signal[i] == threshold, f'{i=}, {signal[i]=}, {threshold=}'
+            else:
+                assert signal[i] == 0, f'{i=}, {signal[i]=}'
+
 def calc_diff(x, y):
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
@@ -232,7 +247,8 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: tor
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
 
-def construct_grouped_masked(num_groups: int, m: int, k: int, n: int, d: torch.dtype, distribution: str, expected_m_per_group: int):
+def construct_grouped_masked(num_groups: int, m: int, k: int, n: int, d: torch.dtype, distribution: str, expected_m_per_group: int,
+                             enable_sbo_overlap: bool = False):
     # Construct mask
     list_m =  construct_group_m_list(distribution, num_groups, m, is_mask=True, em=expected_m_per_group)
     max_m = find_next_power_of_2(list_m)
@@ -249,15 +265,18 @@ def construct_grouped_masked(num_groups: int, m: int, k: int, n: int, d: torch.d
         ref_out = torch.empty_like(out)
 
 
+    max_signal_size = num_groups * ceil_div(max_m, 64)
+    signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda') if enable_sbo_overlap else torch.empty(0).int()
+
     if d == torch.bfloat16:
-        return x.to('cuda'), y.to('cuda'), masked_m, out, ref_out.to('cuda')
+        return x.to('cuda'), y.to('cuda'), masked_m, out, ref_out.to('cuda'), signal
     elif d == torch.int8:
         x_int8 = (torch.empty_like(x, dtype=torch.int8), torch.empty((num_groups, max_m, 1), device='cpu', dtype=torch.float))
         y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
         for i in range(num_groups):
             x_int8[0][i], x_int8[1][i] = per_token_cast_to_int8(x[i])
             y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
-        return (x_int8[0].to("cuda"), x_int8[1].to("cuda")), (y_int8[0].to("cuda"), y_int8[1].to("cuda")), masked_m, out, ref_out.to('cuda')
+        return (x_int8[0].to("cuda"), x_int8[1].to("cuda")), (y_int8[0].to("cuda"), y_int8[1].to("cuda")), masked_m, out, ref_out.to('cuda'), signal
     elif d == torch.float8_e4m3fn:
         x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, max_m, k // 128), device='cpu', dtype=torch.float))
         y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, (n + 127) // 128, k // 128), device='cpu', dtype=torch.float))
@@ -270,7 +289,7 @@ def construct_grouped_masked(num_groups: int, m: int, k: int, n: int, d: torch.d
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
-        return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m, out, ref_out.to('cuda')
+        return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m, out, ref_out.to('cuda'), signal
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
@@ -657,25 +676,32 @@ def test_m_grouped_gemm_contiguous(args) -> None:
 def test_m_grouped_gemm_masked(args) -> None:
     print('Testing grouped masked GEMM:')
 
-    num_groups, m, n, k, d, distribution = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
-    
+    num_groups, m, n, k, d, distribution, enable_sbo_overlap = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution'], args['enable_sbo_overlap']
+
     expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
-    x, y, masked_m, out, ref_out = construct_grouped_masked(num_groups, m, k, n, d, distribution, expected_m_per_group)
+    x, y, masked_m, out, ref_out, signal = construct_grouped_masked(num_groups, m, k, n, d, distribution, expected_m_per_group, enable_sbo_overlap=enable_sbo_overlap)
     # post compute max_m and em to help kernel choose tile
-    max_m = find_next_power_of_2(masked_m) if "max_m" not in args.keys() else args["max_m"]
+    max_m = find_next_power_of_2(masked_m)
     expected_m_per_group = ceil_div(sum(masked_m).item(), num_groups) if "em" not in args.keys() else args["em"]
-    print(f"test_m_grouped_gemm_masked->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},em:{expected_m_per_group},max_m:{max_m},distribution:{masked_m}")
+    print(f"test_m_grouped_gemm_masked->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},em:{expected_m_per_group},max_m:{max_m},distribution:{masked_m},sbo_overlap:{enable_sbo_overlap}")
 
     if d == torch.bfloat16:
-        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
+        result = deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
+                                                                   enable_sbo_overlap=enable_sbo_overlap, signal=signal)
     elif d == torch.int8:
-        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
+        result = deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
+                                                                   enable_sbo_overlap=enable_sbo_overlap, signal=signal)
     elif d == torch.float8_e4m3fn:
-        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
+        result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
+                                                                 enable_sbo_overlap=enable_sbo_overlap, signal=signal)
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
     if _acc_check:
+        if enable_sbo_overlap:
+            block_m, threshold = result
+            check_signal(num_groups, max_m, block_m, threshold, signal, masked_m)
+
         for j in range(num_groups):
             diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
             if (masked_m[j] != 0):

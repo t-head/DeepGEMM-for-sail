@@ -13,6 +13,12 @@ __host__ __device__ __forceinline__ void host_device_printf(const char* format, 
 #define printf host_device_printf
 #endif
 
+__device__ __forceinline__ int atomic_add_release_global(int* addr, int value) {
+    int ret;
+    asm volatile ("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(addr), "r"(value));
+    return ret;
+}
+
 enum class GemmType {
     DenseGemm,
     GroupedContiguous,
