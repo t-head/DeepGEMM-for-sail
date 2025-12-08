@@ -144,7 +144,7 @@ def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             else:
                 NPerThread = 1
         else:
-            print(f"DeepGemm: gemmv not support m:{m}, n:{n}, k:{k}, groups:{num_groups}, num_sms:{num_sms}\n")
+            print(f"DeepGemm: gemv not support m:{m}, n:{n}, k:{k}, groups:{num_groups}, num_sms:{num_sms}\n")
             ThreadPerN = -1
             NUM_UNROLL = -1
             SWZL_SIZE_M = -1

@@ -7,6 +7,7 @@ from .utils import get_col_major_tma_aligned_tensor, get_num_sms, ceil_div
 from .m_grouped_gemm_int8 import m_grouped_gemm_a8w8_per_channel_nt_contiguous
 from .m_grouped_gemm_int8 import m_grouped_gemm_a8w8_per_channel_nt_masked
 from .m_grouped_gemm_int8 import m_grouped_gemm_a8w8_per_channel_nt_nopad
+from .gemm import get_gemv_best_configs
 
 # C++ code templates
 includes = ('"../deep_gemm/fp8_gemm.cuh"', )
@@ -33,6 +34,30 @@ using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_N_
 gemm_t::run(out, lhs, rhs,
             lhs_scales, rhs_scales, grouped_layout,
             m, expected_m, stream, num_sms, smem_size, signal);
+"""
+
+includes_gemv = ('"deep_gemm/blockwise_gemvt.cuh"', )
+template_gemv = """
+using namespace deep_gemm;
+
+// Templated args from Python JIT call
+constexpr auto N = {N}, K = {K};
+constexpr auto kNumGroups = {NUM_GROUPS};
+constexpr auto ThreadPerN = {ThreadPerN};
+constexpr auto NPerThread = {NPerThread};
+constexpr auto NUM_UNROLL = {NUM_UNROLL};
+constexpr auto SWZL_SIZE_M = {SWZL_SIZE_M};
+constexpr auto USE_SMALL_K = {USE_SMALL_K};
+constexpr auto BlockSize = {BlockSize};
+
+// Make a templated grouped GEMM
+using gemm_v = BlockWiseGemvt<__nv_fp8_e4m3, __nv_bfloat16, {acc_type}, N, K, kNumGroups, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M, BlockSize, USE_SMALL_K>;
+
+// Launch kernel
+gemm_v::run(out, grouped_layout,
+            m, lhs, rhs,
+            stream,
+            lhs_scales, rhs_scales);
 """
 
 
@@ -263,8 +288,36 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     expected_m = ceil_div(m, num_groups)
 
     # Auto-tuning with compilation
-    global includes, template
+    global includes, template, includes_gemv, template_gemv
     num_sms = get_num_sms()
+
+    # use gemv for small k
+    if k <= 256 and m <= num_groups:
+        BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, USE_SMALL_K = get_gemv_best_configs(m, n, k, num_groups, num_sms, torch.int8)
+        if ThreadPerN != -1:
+            args = (lhs, rhs, out, m_indices, m, torch.cuda.current_stream(), lhs_scales, rhs_scales)
+
+            runtime = jit_tuner.compile_and_tune(
+                name='m_grouped_gemv_fp8_fp8_bf16_nt',
+                keys={'N': n, 'K': k, 'NUM_GROUPS': num_groups,
+                    'ThreadPerN':ThreadPerN, 'NUM_UNROLL':NUM_UNROLL,
+                    'SWZL_SIZE_M':SWZL_SIZE_M, 'NPerThread':NPerThread,
+                    'BlockSize':BlockSize, 'USE_SMALL_K':USE_SMALL_K,
+                    'acc_type':'float'},
+                space=(),
+                includes=includes_gemv,
+                arg_defs=(('lhs', torch.float8_e4m3fn),
+                        ('rhs', torch.float8_e4m3fn),
+                        ('out', torch.bfloat16),
+                        ('grouped_layout', torch.int32), ('m', int),
+                        ('stream', torch.cuda.Stream),
+                        ('lhs_scales', torch.float),
+                        ('rhs_scales', torch.float)),
+                template=template_gemv,
+                args=args
+            )
+            runtime(*args)
+            return
 
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
