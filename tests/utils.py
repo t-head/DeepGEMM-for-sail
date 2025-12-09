@@ -3,7 +3,11 @@ import csv
 import subprocess
 import re
 import traceback
-from deep_gemm import get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
+from deep_gemm import get_m_alignment_for_contiguous_layout
+try:
+    from deep_gemm import get_col_major_tma_aligned_tensor
+except:
+    from deep_gemm import get_mn_major_tma_aligned_tensor
 import deep_gemm
 import random
 import torch
@@ -11,9 +15,134 @@ from typing import Tuple
 from enum import Enum
 import ast
 
+
 global _acc_check
 _acc_check = True
 global use_ppu
+
+class KernelType(Enum):
+    Kernel1D1D = 0
+    Kernel1D2D = 1
+    KernelNoSF = 2
+
+    def is_1d1d(self):
+        return self.value == 0
+
+    def is_1d2d(self):
+        return self.value == 1
+
+    def is_nosf(self):
+        return self.value == 2
+
+class MajorTypeAB(Enum):
+    KMajor = 0
+    MNMajor = 1
+
+    def is_k_major(self):
+        return self.value == 0
+
+    def is_mn_major(self):
+        return self.value == 1
+
+def get_arch_major() -> int:
+    major, minor = torch.cuda.get_device_capability()
+    return major
+
+def get_kernel_types(dtype: torch.dtype) -> KernelType:
+    if dtype == torch.bfloat16:
+        return KernelType.KernelNoSF
+
+    return KernelType.Kernel1D2D if get_arch_major() == 9 else KernelType.Kernel1D1D
+
+def get_ue8m0_usage(kernel_type: KernelType) -> bool:
+    if get_arch_major() == 9:
+        return False
+    return kernel_type.is_1d1d()
+
+def generate_normal(m: int, n: int, k: int,
+                    major_a: MajorTypeAB, major_b: MajorTypeAB,
+                    accumulate: bool, out_dtype: torch.dtype,
+                    kernel_type: KernelType,
+                    use_ue8m0: bool = False, use_bf16: bool = False):
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
+    d = torch.randn((m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else \
+        torch.empty((m, n), device='cuda', dtype=out_dtype)
+    c = d if accumulate else None
+    ref_d = (a.float() @ b.float().t() + (c if accumulate else 0)).to(out_dtype)
+
+    if use_bf16:
+        a = a if major_a.is_k_major() else a.T.contiguous().T
+        b = b if major_b.is_k_major() else b.T.contiguous().T
+        return a, b, c, d, ref_d
+
+    a_fp8 = deep_gemm.per_token_cast_to_fp8(a, use_ue8m0=use_ue8m0)
+    b_fp8 = deep_gemm.per_token_cast_to_fp8(b, use_ue8m0=use_ue8m0) if kernel_type.is_1d1d() and accumulate \
+            else deep_gemm.per_block_cast_to_fp8(b, use_ue8m0=use_ue8m0)
+    a_fp8 = a_fp8 if major_a.is_k_major() else (a_fp8[0].T.contiguous().T, a_fp8[1])
+    b_fp8 = b_fp8 if major_b.is_k_major() else (b_fp8[0].T.contiguous().T, b_fp8[1])
+    return a_fp8, b_fp8, c, d, ref_d
+
+def generate_m_grouped_contiguous(num_groups: int, m: int, n: int, k: int, distribution: str, alignment: int,
+                                  major_a: MajorTypeAB, major_b: MajorTypeAB,
+                                  use_ue8m0: bool = False, use_bf16: bool = False):
+    group_ms = construct_group_m_list(distribution, num_groups, m)
+    m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
+    m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
+
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+    d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    ref_d = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
+
+    start = 0
+    for i, group_m in enumerate(group_ms):
+        actual_end = start + group_m
+        aligned_end = start + ceil_div(group_m, alignment) * alignment
+        m_indices[start:actual_end] = i
+        m_indices[actual_end:aligned_end] = -1
+        if _acc_check:
+            ref_d[start:aligned_end] = a[start:aligned_end] @ b[i].t()
+        start = aligned_end
+
+    if _acc_check:
+        ref_d= torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_d), ref_d)
+
+    if use_bf16:
+        b = b if major_b.is_k_major() else b.mT.contiguous().mT
+        return m, a, b, m_indices, d, ref_d
+
+    assert major_a.is_k_major()
+    a_fp8 = deep_gemm.per_token_cast_to_fp8(a, use_ue8m0=use_ue8m0)
+    b_fp8 = (torch.empty_like(b, dtype=torch.float8_e4m3fn),
+             torch.empty((num_groups, ceil_div(n, 128), ceil_div(k, 128)), device='cuda', dtype=torch.float))
+    for i in range(num_groups):
+        b_fp8[0][i], b_fp8[1][i] = deep_gemm.per_block_cast_to_fp8(b[i], use_ue8m0=use_ue8m0)
+    b_fp8 = b_fp8 if major_b.is_k_major() else (b_fp8[0].mT.contiguous().mT, b_fp8[1])
+    return m, a_fp8, b_fp8, m_indices, d, ref_d
+
+def generate_m_grouped_masked(num_groups: int, m: int, n: int, k: int, distribution: str, expected_m_per_group: int,
+                              use_ue8m0: bool = False, use_bf16: bool = False):
+    list_m =  construct_group_m_list(distribution, num_groups, m, is_mask=True, em=expected_m_per_group)
+    max_m = find_next_power_of_2(list_m)
+    masked_m = torch.tensor(list_m, device='cuda', dtype=torch.int)
+    assert masked_m.amax().item() <= max_m
+
+    a = torch.randn((num_groups, max_m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+    d = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
+    ref_d = torch.einsum('gmk,gnk->gmn', a, b)
+
+    if use_bf16:
+        return a, b, masked_m, d, ref_d
+
+    a_fp8 = (torch.empty_like(a, dtype=torch.float8_e4m3fn), torch.empty((num_groups, max_m, ceil_div(k, 128)), device='cuda', dtype=torch.float))
+    b_fp8 = (torch.empty_like(b, dtype=torch.float8_e4m3fn), torch.empty((num_groups, ceil_div(n, 128), ceil_div(k, 128)), device='cuda', dtype=torch.float))
+    for i in range(num_groups):
+        a_fp8[0][i], a_fp8[1][i] = deep_gemm.per_token_cast_to_fp8(a[i], use_ue8m0=use_ue8m0)
+        b_fp8[0][i], b_fp8[1][i] = deep_gemm.per_block_cast_to_fp8(b[i], use_ue8m0=use_ue8m0)
+
+    return a_fp8, b_fp8, masked_m, d, ref_d
 
 class DGStatus(Enum):
     Pass = 0
@@ -112,7 +241,7 @@ def construct(m: int, k: int, n: int, d: torch.dtype) -> \
         if use_ppu:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
-            x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
+            x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return x_fp8, y_fp8, out, ref_out
     else:
         print("ERROR: Unsupported dtype, please check!")
@@ -241,7 +370,7 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: tor
         if use_ppu:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
-            x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
+            x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return m, (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), m_indices, out, ref_out.to('cuda')
     else:
         print("ERROR: Unsupported dtype, please check!")
@@ -288,7 +417,7 @@ def construct_grouped_masked(num_groups: int, m: int, k: int, n: int, d: torch.d
         if use_ppu:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
-            x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
+            x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m, out, ref_out.to('cuda'), signal
     else:
         print("ERROR: Unsupported dtype, please check!")
@@ -463,10 +592,18 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         else:
             if mode == "show_log":
                 os.environ["show_log"] = "1"
-            # Ampere:"sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed"
-            metrics_string = "sm__cycles_active.max,sm__pipe_tensor_type_hmma_hgmma_qgmma_imma_igmma_bmma_bgmma_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed" if dev=="gpu" else \
-                            "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format(dtype)
-                            # "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed"
+            if dev == "gpu":
+                arch = get_arch_major()
+                if arch == 8:
+                    metrics_string = "sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
+                elif arch == 9:
+                    metrics_string = "sm__cycles_active.max,sm__pipe_tensor_type_hmma_hgmma_qgmma_imma_igmma_bmma_bgmma_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
+                else:
+                    metrics_string = "sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
+            else:
+                # "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed"
+                metrics_string = "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format(dtype)
+
             _acc = "" if _acc_check else "--disable_acc"
             cmd = '{} --clock-control none {} --metrics="{}"  \
                 --page=details python {} --format "{}" {} \
@@ -627,16 +764,33 @@ def test_gemm(args) -> None:
     print('Testing GEMM:')
     m, n, k, d = args['m'], args['n'], args['k'], args["data_type"]
     print(f"test_gemm->test_func: m:{m},n:{n},k:{k},data_type:{d}")
-    x, y, out, ref_out = construct(m, k, n, d)
-    if d == torch.bfloat16:
-        deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
-    elif d == torch.int8:
-        deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
-    elif d == torch.float8_e4m3fn:
-        deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out)
+    if use_ppu:
+        x, y, out, ref_out = construct(m, k, n, d)
+        if d == torch.bfloat16:
+            deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
+        elif d == torch.int8:
+            deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
+        elif d == torch.float8_e4m3fn:
+            deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out)
+        else:
+            print("ERROR: Unsupported dtype, please check!")
+            exit(1)
     else:
-        print("ERROR: Unsupported dtype, please check!")
-        exit(1)
+        kernel_type = get_kernel_types(d)
+        out_type = torch.bfloat16
+        accumulate = False
+        if d == torch.bfloat16:
+            x, y, c, out, ref_out = generate_normal(m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, accumulate, out_type, kernel_type, False, use_bf16=True)
+            deep_gemm.bf16_gemm_nt(x, y, out, c=c)
+        elif d == torch.float8_e4m3fn:
+            use_ue8m0 = get_ue8m0_usage(kernel_type)
+            disable_ue8m0_cast = not use_ue8m0
+            recipe = (1, 1, 128) if kernel_type.is_1d1d() and accumulate else None
+            x, y, c, out, ref_out = generate_normal(m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, accumulate, out_type, kernel_type, use_ue8m0=use_ue8m0)
+            deep_gemm.fp8_gemm_nt(x, y, out, c=c, disable_ue8m0_cast=disable_ue8m0_cast, recipe=recipe)
+        else:
+            print("ERROR: Unsupported dtype, please check!")
+            exit(1)
     if _acc_check:
         diff = calc_diff(out, ref_out)
         if diff >= 0.001:
@@ -651,14 +805,29 @@ def test_gemm(args) -> None:
 def test_m_grouped_gemm_contiguous(args) -> None:
     print('Testing grouped contiguous GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
-    m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, get_m_alignment_for_contiguous_layout())
-    print(f"test_m_grouped_gemm_contiguous->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d}")
-    if d == torch.bfloat16:
-        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
-    elif d == torch.int8:
-        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
+    expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
+    if use_ppu:
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, get_m_alignment_for_contiguous_layout())
+        print(f"test_m_grouped_gemm_contiguous->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d}")
+        if d == torch.bfloat16:
+            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
+        elif d == torch.int8:
+            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
+        else:
+            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices)
     else:
-        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices)
+        if d == torch.bfloat16:
+            m, x, y, m_indices, out, ref_out = generate_m_grouped_contiguous(num_groups, m, n, k, distribution, get_m_alignment_for_contiguous_layout(), MajorTypeAB.KMajor, MajorTypeAB.KMajor, use_bf16=True)
+            deep_gemm.m_grouped_bf16_gemm_nt_contiguous(x, y, out, m_indices)
+        elif d == torch.float8_e4m3fn:
+            kernel_type = get_kernel_types(d)
+            use_ue8m0 = get_ue8m0_usage(kernel_type)
+            disable_ue8m0_cast = not use_ue8m0
+            m, x, y, m_indices, out, ref_out = generate_m_grouped_contiguous(num_groups, m, n, k, distribution, get_m_alignment_for_contiguous_layout(), MajorTypeAB.KMajor, MajorTypeAB.KMajor, use_ue8m0=use_ue8m0)
+            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(x, y, out, m_indices, disable_ue8m0_cast=disable_ue8m0_cast)
+        else:
+          print("ERROR: Unsupported dtype, please check!")
+          exit(1)
 
     if _acc_check:
         out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
@@ -678,26 +847,37 @@ def test_m_grouped_gemm_masked(args) -> None:
 
     num_groups, m, n, k, d, distribution = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
+    if use_ppu:
+        expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
+        x, y, masked_m, out, ref_out, signal = construct_grouped_masked(num_groups, m, k, n, d, distribution, expected_m_per_group, enable_sbo_overlap=enable_sbo_overlap)
+        # post compute max_m and em to help kernel choose tile
+        max_m = find_next_power_of_2(masked_m)
+        expected_m_per_group = ceil_div(sum(masked_m).item(), num_groups) if "em" not in args.keys() else args["em"]
+        print(f"test_m_grouped_gemm_masked->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},em:{expected_m_per_group},max_m:{max_m},distribution:{masked_m},sbo_overlap:{enable_sbo_overlap}")
 
-    expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
-    x, y, masked_m, out, ref_out, signal = construct_grouped_masked(num_groups, m, k, n, d, distribution, expected_m_per_group, enable_sbo_overlap=enable_sbo_overlap)
-    # post compute max_m and em to help kernel choose tile
-    max_m = find_next_power_of_2(masked_m)
-    expected_m_per_group = ceil_div(sum(masked_m).item(), num_groups) if "em" not in args.keys() else args["em"]
-    print(f"test_m_grouped_gemm_masked->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},em:{expected_m_per_group},max_m:{max_m},distribution:{masked_m},sbo_overlap:{enable_sbo_overlap}")
-
-    if d == torch.bfloat16:
-        result = deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
-                                                                   enable_sbo_overlap=enable_sbo_overlap, signal=signal)
-    elif d == torch.int8:
-        result = deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
-                                                                   enable_sbo_overlap=enable_sbo_overlap, signal=signal)
-    elif d == torch.float8_e4m3fn:
-        result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
-                                                                 enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+        if d == torch.bfloat16:
+            result = deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
+                                                                      enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+        elif d == torch.int8:
+            result = deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
+                                                                      enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+        elif d == torch.float8_e4m3fn:
+            result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
+                                                                    enable_sbo_overlap=enable_sbo_overlap, signal=signal)
     else:
-        print("ERROR: Unsupported dtype, please check!")
-        exit(1)
+        expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
+        if d == torch.bfloat16:
+            x, y, masked_m, out, ref_out = generate_m_grouped_masked(num_groups, m, n, k, distribution, expected_m_per_group, use_bf16=True)
+            deep_gemm.m_grouped_bf16_gemm_nt_masked(x, y, out, masked_m, expected_m_per_group)
+        elif d == torch.float8_e4m3fn:
+            kernel_type = get_kernel_types(d)
+            use_ue8m0 = get_ue8m0_usage(kernel_type)
+            disable_ue8m0_cast = not use_ue8m0
+            x, y, masked_m, out, ref_out = generate_m_grouped_masked(num_groups, m, n, k, distribution, expected_m_per_group, use_ue8m0=use_ue8m0)
+            deep_gemm.m_grouped_fp8_gemm_nt_masked(x, y, out, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+        else:
+            print("ERROR: Unsupported dtype, please check!")
+            exit(1)
     if _acc_check:
         if enable_sbo_overlap:
             block_m, threshold = result
@@ -719,17 +899,20 @@ def test_m_grouped_gemm_masked(args) -> None:
 def test_m_grouped_gemm_nopad(args) -> None:
     print('Testing grouped unpad GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
-
     print(f"test_m_grouped_gemm_nopad->test_func: num_groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d}")
-    m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1)
-    if d == torch.bfloat16:
-        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
-    elif d == torch.int8:
-        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
-    elif d == torch.float8_e4m3fn:
-        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
+    if use_ppu:
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1)
+        if d == torch.bfloat16:
+            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
+        elif d == torch.int8:
+            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
+        elif d == torch.float8_e4m3fn:
+            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
+        else:
+            print("ERROR: Unsupported dtype, please check!")
+            exit(1)
     else:
-        print("ERROR: Unsupported dtype, please check!")
+        print("ERROR: unsupport m_grouped_gemm_nopad!")
         exit(1)
 
     if _acc_check:

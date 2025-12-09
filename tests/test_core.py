@@ -8,6 +8,8 @@ from deep_gemm import bench_kineto, get_m_alignment_for_contiguous_layout
 from utils import calc_diff, construct, construct_contiguous_grouped, construct_grouped_masked
 from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad
 from utils import set_acc_check, get_acc_check, check_signal
+from utils import judge_device_type
+use_ppu = judge_device_type()
 def test_gemm_loop(d: torch.dtype) -> None:
     for m in (64, 128, 4096):
         for k, n in [(576, 7168), (7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
