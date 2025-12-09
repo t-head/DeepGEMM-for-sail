@@ -677,6 +677,7 @@ def test_m_grouped_gemm_masked(args) -> None:
     print('Testing grouped masked GEMM:')
 
     num_groups, m, n, k, d, distribution, enable_sbo_overlap = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution'], args['enable_sbo_overlap']
+    enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
 
     expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
     x, y, masked_m, out, ref_out, signal = construct_grouped_masked(num_groups, m, k, n, d, distribution, expected_m_per_group, enable_sbo_overlap=enable_sbo_overlap)
