@@ -137,6 +137,7 @@ public:
 
   static constexpr uint32_t N = TileScheduler::SHAPE_N;
   static constexpr uint32_t K = TileScheduler::SHAPE_K;
+  static constexpr uint32_t N_PREFETCH_CACHELINE = cute::ceil_div(TileScheduler::kNumGroups, 32); // numGroups * sizeof(int) / 128 Byte = cacheline
   static constexpr uint32_t N_EXPAND = DispatchPolicy::Schedule::N_EXPAND;
 
   // Kernel level shared memory storage
@@ -274,6 +275,17 @@ public:
     // Preconditions
     CUTE_STATIC_ASSERT(is_static<TileShape>::value);
 
+    int warp_idx = canonical_warp_idx_sync();
+    if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+      // group is small 8|16, just prefetch one cacheline
+      __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
+    } else if (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+      // each warp prefetch one cacheline
+      if (warp_idx < N_PREFETCH_CACHELINE) {
+        __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx<<5)));
+      }
+    }
+
     // if (thread0()) {
     //   printf("EpilogueSharedStorage size = %d\n", sizeof(CollectiveEpilogue::SharedStorage));
     // }
@@ -363,8 +375,6 @@ public:
       GmemTiledCopyA gmem_tiled_copy_A = collective_mma.gmem_tiled_copy_A;
       GmemTiledCopyB gmem_tiled_copy_B = collective_mma.gmem_tiled_copy_B;
 
-      int warp_idx = canonical_warp_idx_sync();
-      int lane_predicate = cute::elect_one_sync();
       // Construct shared memory tiles
       MainloopSharedStorage& storage = *reinterpret_cast<MainloopSharedStorage*>(smem_buf);
       Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
@@ -1018,6 +1028,7 @@ public:
 
   static constexpr uint32_t N = TileScheduler::SHAPE_N;
   static constexpr uint32_t K = TileScheduler::SHAPE_K;
+  static constexpr uint32_t N_PREFETCH_CACHELINE = cute::ceil_div(TileScheduler::kNumGroups, 32); // numGroups * sizeof(int) / 128 Byte = cacheline
 
   // Kernel level shared memory storage
   struct SharedStorage {
@@ -1152,6 +1163,17 @@ public:
 
     // Preconditions
     CUTE_STATIC_ASSERT(is_static<TileShape>::value);
+
+    int warp_idx = canonical_warp_idx_sync();
+    if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+      // group is small 8|16, just prefetch one cacheline
+      __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
+    } else if (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+      // each warp prefetch one cacheline
+      if (warp_idx < N_PREFETCH_CACHELINE) {
+        __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx<<5)));
+      }
+    }
 
     // Kernel level shared memory storage
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -1737,6 +1759,7 @@ public:
 
   static constexpr uint32_t N = TileScheduler::SHAPE_N;
   static constexpr uint32_t K = TileScheduler::SHAPE_K;
+  static constexpr uint32_t N_PREFETCH_CACHELINE = cute::ceil_div(TileScheduler::kNumGroups, 32); // numGroups * sizeof(int) / 128 Byte = cacheline
 
   // Kernel level shared memory storage
   struct SharedStorage {
@@ -1872,8 +1895,14 @@ public:
     // Preconditions
     CUTE_STATIC_ASSERT(is_static<TileShape>::value);
     int warp_idx = canonical_warp_idx_sync();
-    if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked || TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
-      __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx<<5)));
+    if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+      // group is small 8|16, just prefetch one cacheline
+      __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
+    } else if (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+      // each warp prefetch one cacheline
+      if (warp_idx < N_PREFETCH_CACHELINE) {
+        __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx<<5)));
+      }
     }
 
     // Kernel level shared memory storage
@@ -2501,6 +2530,7 @@ public:
 
   static constexpr uint32_t N = TileScheduler::SHAPE_N;
   static constexpr uint32_t K = TileScheduler::SHAPE_K;
+  static constexpr uint32_t N_PREFETCH_CACHELINE = cute::ceil_div(TileScheduler::kNumGroups, 32); // numGroups * sizeof(int) / 128 Byte = cacheline
 
   // Kernel level shared memory storage
   struct SharedStorage {
@@ -2635,8 +2665,14 @@ public:
     CUTE_STATIC_ASSERT(is_static<TileShape>::value);
 
     int warp_idx = canonical_warp_idx_sync();
-    if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked || TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
-      __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx<<5)));
+    if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+      // group is small 8|16, just prefetch one cacheline
+      __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
+    } else if (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+      // each warp prefetch one cacheline
+      if (warp_idx < N_PREFETCH_CACHELINE) {
+        __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx<<5)));
+      }
     }
 
     // Kernel level shared memory storage

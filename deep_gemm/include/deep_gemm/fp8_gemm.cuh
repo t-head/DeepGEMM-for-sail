@@ -88,6 +88,7 @@ public:
 
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
   static constexpr uint32_t NumMmaWarpGroups = 1;
+  static constexpr uint32_t N_PREFETCH_CACHELINE = cute::ceil_div(TileScheduler::kNumGroups, 32); // numGroups * sizeof(int) / 128 Byte = cacheline
 
   // Kernel level shared memory storage
   struct SharedStorage {
@@ -227,6 +228,17 @@ public:
   operator()(Params const& params, char* smem_buf) {
     using namespace cute;
     using X = Underscore;
+
+    int warp_idx = cutlass::canonical_warp_idx_sync();
+    if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+      // group is small 8|16, just prefetch one cacheline
+      __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
+    } else if (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+      // each warp prefetch one cacheline
+      if (warp_idx < N_PREFETCH_CACHELINE) {
+        __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx<<5)));
+      }
+    }
 
     TileScheduler deep_scheduler{params.scheduler};
 

@@ -22,7 +22,7 @@ using cutlass::KernelHardwareInfo;
 template <GemmType kGemmType,
           uint32_t SHAPE_N_, uint32_t SHAPE_K_,
           uint32_t BLOCK_M_, uint32_t BLOCK_N_,
-          uint32_t kNumGroups,
+          uint32_t kNumGroups_,
           uint32_t kNumNBlocks = ceil_div(SHAPE_N_, BLOCK_N_),
           uint32_t kNum1DBlocksPerGroup = 2>
 struct DeepGemmScheduler {
@@ -30,6 +30,7 @@ struct DeepGemmScheduler {
     constexpr static uint32_t SHAPE_K = SHAPE_K_;
     constexpr static uint32_t BLOCK_M = BLOCK_M_;
     constexpr static uint32_t BLOCK_N = BLOCK_N_;
+    constexpr static uint32_t kNumGroups = kNumGroups_;
     int current_iter = 0;
     uint32_t num_aligned_m_blocks;
     constexpr static GemmType GEMM_TYPE = kGemmType;
