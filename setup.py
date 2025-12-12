@@ -75,6 +75,11 @@ class CustomBuildPy(build_py):
                     shutil.rmtree(dst_dir)
                 shutil.copytree(src_dir, dst_dir)
 
+def custom_local_scheme(version):
+    return 'dev%03d.%s' % (version.distance, version.short_node)
+
+def custom_version_scheme(version):
+    return '1.0.0'
 
 if __name__ == '__main__':
     # noinspection PyBroadException
@@ -86,7 +91,11 @@ if __name__ == '__main__':
 
     setuptools.setup(
         name='deep_gemm',
-        version='1.0.0' + revision,
+        use_scm_version={
+            "local_scheme": custom_local_scheme,
+            "version_scheme": custom_version_scheme,
+        },
+        setup_requires=["setuptools_scm"],
         packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels'],
         package_data={
             'deep_gemm': [
