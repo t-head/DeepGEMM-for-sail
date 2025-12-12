@@ -676,7 +676,7 @@ def test_m_grouped_gemm_contiguous(args) -> None:
 def test_m_grouped_gemm_masked(args) -> None:
     print('Testing grouped masked GEMM:')
 
-    num_groups, m, n, k, d, distribution, enable_sbo_overlap = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution'], args['enable_sbo_overlap']
+    num_groups, m, n, k, d, distribution = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
 
     expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
