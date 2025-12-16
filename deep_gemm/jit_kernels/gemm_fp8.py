@@ -30,7 +30,7 @@ using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_N_
 
 // Launch kernel
 gemm_t::run(out, lhs, rhs, lhs_scales,
-            rhs_scales, nullptr, m, 0,
+            rhs_scales, nullptr, nullptr, m, 0,
             stream, num_sms, smem_size);
 """
 
@@ -463,6 +463,7 @@ def gemm_fp8_fp8_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',

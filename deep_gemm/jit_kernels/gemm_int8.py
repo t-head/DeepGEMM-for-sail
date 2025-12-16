@@ -52,7 +52,7 @@ constexpr auto kNumStages = {NUM_STAGES};
 using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm>;
 
 // Launch kernel
-gemm_t::run(out, nullptr,
+gemm_t::run(out, nullptr, nullptr,
             m, 0, (ElementAB*)lhs, lhs_scales, (ElementAB*)rhs, rhs_scales,
             stream, num_sms, smem_size);
 """

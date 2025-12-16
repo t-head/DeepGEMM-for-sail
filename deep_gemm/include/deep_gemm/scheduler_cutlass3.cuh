@@ -13,6 +13,8 @@
 #include "cutlass/gemm_coord.hpp"
 ////////////////////////////////////////////////////////////////////////////////
 
+#define EnableGroupNoPadOpt
+
 // namespace cutlass::gemm::kernel {
 namespace deep_gemm {
 using cutlass::KernelHardwareInfo;
@@ -35,6 +37,11 @@ struct DeepGemmScheduler {
     uint32_t num_aligned_m_blocks;
     constexpr static GemmType GEMM_TYPE = kGemmType;
     constexpr static bool kIsTMAMulticastOnA = false;
+#ifdef EnableGroupNoPadOpt
+    constexpr static bool kIsNoPadPreprocessLayout = kGemmType == GemmType::GroupedNoPad && kNumGroups >= 128;
+#else
+    constexpr static bool kIsNoPadPreprocessLayout = false;
+#endif
 
     // For normal GEMM
     // Maybe not used in the masked grouped GEMM
@@ -80,8 +87,16 @@ struct DeepGemmScheduler {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if (kGemmType == GemmType::GroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
-        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
+        } else if (kGemmType == GemmType::GroupedMasked) {
             curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_m = 0;
+        } else if (kGemmType == GemmType::GroupedNoPad) {
+            if (kIsNoPadPreprocessLayout) {
+                num_aligned_m_blocks = params_.grouped_layout[0]; // total blocks in m, block_m_sum
+                curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_m = 0;
+                num_blocks = num_aligned_m_blocks * num_n_blocks;
+            } else {
+                curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_m = 0;
+            }
         }
     }
 
@@ -122,31 +137,46 @@ struct DeepGemmScheduler {
 
     CUTLASS_DEVICE bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
         const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
-
-        if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
+        if (kIsNoPadPreprocessLayout) {
+            if (next_block_idx >= num_blocks) {
+                m_block_idx = num_aligned_m_blocks;
+                n_block_idx = kNumNBlocks;
+                return false;
+            }
+            int block_m_idx = next_block_idx / kNumNBlocks;
+            uint4 data = (((const uint4*)params.grouped_layout) + 1)[block_m_idx];
+            curr_group_idx = data.x;
+            curr_group_m = data.y;
+            uint32_t block_idx_in_m = data.z * kNumNBlocks + next_block_idx % kNumNBlocks;
+            uint32_t num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
+            curr_cumsum_m = data.w;
+            get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);
+        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
             uint32_t num_m_blocks;
             while (true) {
                 // End of the task
-                if (curr_group_idx == kNumGroups)
+                if (curr_group_idx == kNumGroups) {
+                    m_block_idx = num_m_blocks;
+                    n_block_idx = kNumNBlocks;
                     return false;
-
+                }
                 // Within the current group
                 curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
                 num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
                 if (next_block_idx < current_m_block_cumsum * kNumNBlocks)
                     break;
-
                 // Move to check the next group
                 curr_group_idx ++, curr_cumsum = current_m_block_cumsum;
                 curr_cumsum_m += curr_group_m;
             }
-
             get_swizzled_block_idx(num_m_blocks, next_block_idx - curr_cumsum * kNumNBlocks, m_block_idx, n_block_idx);
         } else {
-            if (next_block_idx >= num_blocks)
+            if (next_block_idx >= num_blocks) {
+                m_block_idx = num_aligned_m_blocks;
+                n_block_idx = kNumNBlocks;
                 return false;
-
+            }
             get_swizzled_block_idx(num_aligned_m_blocks, next_block_idx, m_block_idx, n_block_idx);
         }
         return true;

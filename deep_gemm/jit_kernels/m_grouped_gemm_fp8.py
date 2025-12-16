@@ -32,7 +32,7 @@ constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
 using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap>;
 
 gemm_t::run(out, lhs, rhs,
-            lhs_scales, rhs_scales, grouped_layout,
+            lhs_scales, rhs_scales, grouped_layout, block_m_info,
             m, expected_m, stream, num_sms, smem_size, signal);
 """
 
@@ -123,7 +123,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs_: Tuple[torch.Tensor, torch.Te
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous=True)
     expected_m = ceil_div(m, num_groups)
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
-            m_indices, m, expected_m, num_groups,
+            m_indices, m_indices, m, expected_m,
             torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp8_fp8_bf16_nt',
@@ -139,8 +139,8 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs_: Tuple[torch.Tensor, torch.Te
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
                   ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
-                  ('out', torch.bfloat16), ('grouped_layout', torch.int32),
-                  ('m', int), ('expected_m', int), ('num_groups', int),
+                  ('out', torch.bfloat16), ('grouped_layout', torch.int32), ('block_m_info', torch.int32),
+                  ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                   ('signal', torch.int32)),
         template=template,
@@ -222,7 +222,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     #     assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
-            masked_m, m, expected_m,
+            masked_m, masked_m, m, expected_m,
             torch.cuda.current_stream(), num_sms, smem_config[0], signal)
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp8_fp8_bf16_nt',
@@ -239,7 +239,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
                   ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
-                  ('grouped_layout', torch.int32), ('m', int), ('expected_m', int),
+                  ('grouped_layout', torch.int32), ('block_m_info', torch.int32), ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                   ('signal', torch.int32)),
         template=template,
@@ -331,8 +331,14 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         if min_n > 0:
             experts_for_rows[:min_n] = counts[:min_n]
         m_rows = experts_for_rows
+
+    ## the largest blockM_num is, num_groups - 1 only has 1 token, the last group has (m-1) tokens, blockM_num = num_group -1  + ceil_div(m + 1 - num_group, block_m)
+    ## total line num: blockM_num + 1, line0 is used to store the real blockM_num
+    ## total_size = (blockM_num + 1) * 4 * sizeof(int) Byte
+    block_m_info = torch.empty((num_groups + ceil_div(m + 1 - num_groups, block_m)) * 4, dtype=torch.int32, device=m_rows.device)
+
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
-        m_rows, m, num_groups, expected_m,
+        m_rows, block_m_info, m, expected_m,
         torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
 
     runtime = jit_tuner.compile_and_tune(
@@ -350,8 +356,8 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
                     ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
                     ('out', torch.bfloat16),
-                    ('grouped_layout', torch.int32), ('m', int),
-                    ('num_groups', int), ('expected_m', int),
+                    ('grouped_layout', torch.int32), ('block_m_info', torch.int32),
+                    ('m', int), ('expected_m', int),
                     ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                     ('signal', torch.int32)),
         template=template,

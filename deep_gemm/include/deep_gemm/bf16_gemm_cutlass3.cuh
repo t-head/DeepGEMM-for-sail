@@ -2832,7 +2832,7 @@ class Gemm {
 public:
     Gemm() = default;
 
-    static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
+    static void run(__nv_bfloat16* gmem_d, int* grouped_layout, int* block_m_info,
                     uint32_t shape_m, uint32_t expected_m, __nv_bfloat16* gmem_a, __nv_bfloat16* gmem_b,
                     cudaStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
         using ElementA    = cutlass::bfloat16_t;
@@ -2952,6 +2952,15 @@ public:
         StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)shape_m, (int)SHAPE_K, 1));
         StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape((int)SHAPE_N, (int)SHAPE_K, 1));
         StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape((int)shape_m, (int)SHAPE_N, 1));
+
+        int* layout_info = grouped_layout;
+        // compute block_m_info
+        if (TileScheduler::kIsNoPadPreprocessLayout) {
+            uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+            computeBlockInfoKernel<BLOCK_M><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
+            layout_info = block_m_info;
+        }
+
         auto stride_C = stride_D;
 
         int max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
@@ -2965,7 +2974,7 @@ public:
             {shape_m, SHAPE_N, SHAPE_K, 1},
             {(ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B},
             {{1.0f, 0.0f}, (ElementC*)gmem_d, stride_C, (ElementD*)gmem_d, stride_D},
-            hw_info, {shape_m, grouped_layout}, signal
+            hw_info, {shape_m, layout_info}, signal
         };
 
         arguments.epilogue.thread.alpha = 1;
@@ -3001,8 +3010,8 @@ public:
             cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
 
             printf("[GemmGrouped-BF16:]\n");
-            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kernel_type:%s\n",
-                kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)], KernelTypeS[static_cast<int>(kKernelType)]);
+            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kernel_type:%s, kIsNoPadPreprocessLayout: %d\n",
+                kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)], KernelTypeS[static_cast<int>(kKernelType)], TileScheduler::kIsNoPadPreprocessLayout);
 
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                 BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);

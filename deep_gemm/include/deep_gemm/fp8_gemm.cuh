@@ -495,7 +495,7 @@ public:
                     __nv_fp8_e4m3* input_b,
                     float* scales_a,
                     float* scales_b,
-                    int* grouped_layout,
+                    int* grouped_layout, int* block_m_info,
                     int32_t shape_m, uint32_t expected_m,
                     cudaStream_t stream,
                     int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
@@ -525,6 +525,14 @@ public:
         layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(shape_m, SHAPE_N, SHAPE_K, 1));
         layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(shape_m, SHAPE_N, SHAPE_K, 1));
 
+        int* layout_info = grouped_layout;
+        // compute block_m_info
+        if (TileScheduler::kIsNoPadPreprocessLayout) {
+            uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+            computeBlockInfoKernel<BLOCK_M><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
+            layout_info = block_m_info;
+        }
+
         cutlass::float_e4m3_t* converted_input_b = reinterpret_cast<cutlass::float_e4m3_t*>(input_b);
         cutlass::float_e4m3_t* converted_input_a = reinterpret_cast<cutlass::float_e4m3_t*>(input_a);
         cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(gmem_d);
@@ -551,7 +559,7 @@ public:
         cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
 
         // evt realization must construct evt params on device, can't use GemmUniversalAdapter
-        typename GemmKernel::Params params = GemmKernel::to_underlying_arguments(arguments, workspace.get(), grouped_layout);
+        typename GemmKernel::Params params = GemmKernel::to_underlying_arguments(arguments, workspace.get(), layout_info);
 
         dim3 const block = GemmKernel::get_block_shape();
         dim3 const grid = GemmKernel::get_grid_shape(params);
@@ -569,8 +577,8 @@ public:
             cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
 
             printf("[GemmGrouped-FP8:]\n");
-            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s\n",
-                kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)]);
+            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d\n",
+                kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)], TileScheduler::kIsNoPadPreprocessLayout);
 
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                 BlockM, BlockN, BlockK, WarpM, WarpN, BlockK, kNumStages);

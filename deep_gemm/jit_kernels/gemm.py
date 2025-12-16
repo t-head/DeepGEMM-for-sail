@@ -9,7 +9,6 @@ from .gemm_search_space import MatmulHeuristicsTile
 
 # C++ code templates
 includes = ('"deep_gemm/bf16_gemm.cuh"', )
-includes_cutlass3 = ('"../deep_gemm/bf16_gemm_cutlass3.cuh"', )
 template = """
 using namespace deep_gemm;
 
@@ -28,6 +27,28 @@ using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups,
 
 // Launch kernel
 gemm_t::run(out, nullptr,
+            m, 0, lhs, rhs,
+            stream, num_sms, smem_size);
+"""
+includes_cutlass3 = ('"../deep_gemm/bf16_gemm_cutlass3.cuh"', )
+template_cutlass3 = """
+using namespace deep_gemm;
+
+// Templated args from Python JIT call
+constexpr auto N = {N}, K = {K};
+constexpr auto BLOCK_M = {BLOCK_M};
+constexpr auto BLOCK_N = {BLOCK_N};
+constexpr auto WARP_M = {WARP_M};
+constexpr auto WARP_N = {WARP_N};
+constexpr auto BLOCK_K = {BLOCK_K};
+constexpr auto kNumGroups = 1;
+constexpr auto kNumStages = {NUM_STAGES};
+
+// Make a templated grouped GEMM
+using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm>;
+
+// Launch kernel
+gemm_t::run(out, nullptr, nullptr,
             m, 0, lhs, rhs,
             stream, num_sms, smem_size);
 """
@@ -387,7 +408,7 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
 
     extra_info = get_extra_info()
-
+ 
     args = (lhs, rhs, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
 
     runtime = jit_tuner.compile_and_tune(
@@ -401,7 +422,7 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
                   ('rhs', torch.bfloat16),
                   ('out', torch.bfloat16), ('m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template,
+        template=template_cutlass3 if extra_info['use_cutlass3'] else template,
         jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
         args=args
     )
