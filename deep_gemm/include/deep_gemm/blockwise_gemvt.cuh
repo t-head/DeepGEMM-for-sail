@@ -27,7 +27,7 @@ struct BlockWiseGemvtArgs {
     int64_t stride_cn;
 };
 
-template <typename src_type, typename acc_type, int ept, typename CvtType = __nv_bfloat16>
+template <typename src_type, typename acc_type, int ept, typename CvtType = float>
 HGGC_DEVICE_ONLY void cvt_dot_op(src_type *src_a, src_type *src_x, acc_type &val) {
     HGGC_PRAGMA_UNROLL
     for (int i = 0; i < ept; i++) {
@@ -46,7 +46,7 @@ __global__ void batched_blockwise_gemvt_kernel_small_k(const BlockWiseGemvtArgs 
   constexpr int NLoopStep = BlockSize / ThreadPerN;
 
   int num_pid_m = args.num_tokens;
-  int num_pid_n = cdiv(args.N, NPerBlock);
+  int num_pid_n = ceil_div(args.N, NPerBlock);
   int num_pid_in_group = GROUP_SIZE_M * num_pid_n;
   int group_id = blockIdx.x / num_pid_in_group;
   int first_pid_m = group_id * GROUP_SIZE_M;

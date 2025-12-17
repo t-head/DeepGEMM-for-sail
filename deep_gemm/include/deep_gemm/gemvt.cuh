@@ -64,10 +64,6 @@ HGGC_DEVICE_ONLY void dot_op(src_type *src_a, src_type *src_x, acc_type &val) {
     return;
 }
 
-HGGC_DEVICE_ONLY int cdiv(int a, int b) {
-    return (a + b - 1) / b;
-}
-
 __device__ __forceinline__
 uint32_t SmemU32Addr(const void *smemptr) {
     uint32_t u32addr;
@@ -119,7 +115,7 @@ __global__ void batched_gemvt_kernel_small_k(const GemvtArgs args) {
   acc_type results[NPerThread];
 
   int num_pid_m = args.num_tokens;
-  int num_pid_n = cdiv(args.N, NPerBlock);
+  int num_pid_n = ceil_div(args.N, NPerBlock);
   int num_pid_in_group = GROUP_SIZE_M * num_pid_n;
   int group_id = blockIdx.x / num_pid_in_group;
   int first_pid_m = group_id * GROUP_SIZE_M;
@@ -283,7 +279,7 @@ __global__ void batched_gemvt_kernel(const GemvtArgs args) {
     acc_type accum[NUM_UNROLL * BlockM * NPerThread];
 
     int num_pid_m = args.num_tokens;
-    int num_pid_n = cdiv(args.N, NPerBlock);
+    int num_pid_n = ceil_div(args.N, NPerBlock);
     int num_pid_in_group = GROUP_SIZE_M * num_pid_n;
 
     int block_id = blockIdx.x;

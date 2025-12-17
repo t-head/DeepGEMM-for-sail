@@ -292,7 +292,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     num_sms = get_num_sms()
 
     # use gemv for small k
-    if k <= 256 and m <= num_groups:
+    if k == 128 and m <= num_groups:
         BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, USE_SMALL_K = get_gemv_best_configs(m, n, k, num_groups, num_sms, torch.int8)
         if ThreadPerN != -1:
             args = (lhs, rhs, out, m_indices, m, torch.cuda.current_stream(), lhs_scales, rhs_scales)
