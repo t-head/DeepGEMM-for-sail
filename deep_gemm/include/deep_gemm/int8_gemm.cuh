@@ -428,7 +428,7 @@ public:
             // Execute the epilogue operator to update the destination tensor.
             epilogue(epilogue_visitor, accumulators);
 
-            if constexpr(kEnableSboOverlap) {
+            if constexpr(kEnableSboOverlap && ProblemVisitor::kGemmType == GemmType::GroupedMasked) {
                 cutlass::arch::cp_async_wait<0>();
                 __syncthreads();
 

@@ -32,15 +32,13 @@ struct DeepGemmScheduler {
     constexpr static uint32_t BLOCK_N = BLOCK_N_;
     int current_iter = -1;
     uint32_t num_aligned_m_blocks;
+    constexpr static GemmType GEMM_TYPE = kGemmType;
     constexpr static bool kIsTMAMulticastOnA = false;
 
     // For normal GEMM
     // Maybe not used in the masked grouped GEMM
     uint32_t num_blocks;
     uint32_t num_n_blocks = kNumNBlocks;
-    uint32_t num_blocks_in_group;
-    // For grouped GEMM
-    int* grouped_layout;
 
     // Only used for masked layout
     uint32_t curr_group_idx, curr_cumsum, curr_group_m, curr_cumsum_m;
@@ -81,10 +79,8 @@ struct DeepGemmScheduler {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if (kGemmType == GemmType::GroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
-            this->grouped_layout = params.grouped_layout;
         } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
             curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_m = 0;
-            this->grouped_layout = params.grouped_layout;
         }
     }
 
@@ -97,8 +93,7 @@ struct DeepGemmScheduler {
         auto group_idx = block_idx / num_blocks_per_group;
         auto first_block_idx = group_idx * kNum1DBlocksPerGroup;
         auto in_group_idx = block_idx % num_blocks_per_group;
-        num_blocks_in_group = min(kNum1DBlocksPerGroup, primary_num_blocks - first_block_idx);
-
+        uint32_t num_blocks_in_group = min(kNum1DBlocksPerGroup, primary_num_blocks - first_block_idx);
 
         // Convert to final M/N block indices
         if constexpr (kIsTMAMulticastOnA) {
@@ -135,7 +130,7 @@ struct DeepGemmScheduler {
                     return false;
 
                 // Within the current group
-                curr_group_m = static_cast<uint32_t>(__ldg(grouped_layout + curr_group_idx));
+                curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
                 num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
                 if (next_block_idx < current_m_block_cumsum * kNumNBlocks)
@@ -193,12 +188,12 @@ struct DeepGemmScheduler {
     }
 
     // Returns the problem size for the current problem
-    __device__ __forceinline__ int32_t curr_problem_m(const Params& param) const
+    __device__ __forceinline__ int32_t curr_problem_m() const
     {
         if constexpr (kGemmType == GemmType::DenseGemm || kGemmType == GemmType::GroupedContiguous) {
-            return param.shape_m;
+            return params.shape_m;
         } else if constexpr (kGemmType == GemmType::GroupedMasked) {
-            return param.shape_m;
+            return params.shape_m;
         } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return curr_group_m;
         } else {
@@ -213,10 +208,10 @@ struct DeepGemmScheduler {
     }
 
     // Gets the pointer offset of matrix A
-    __device__ __forceinline__ int64_t curr_offset_a(const Params& param) const
+    __device__ __forceinline__ int64_t curr_offset_a() const
     {
         if constexpr (kGemmType == GemmType::GroupedMasked) {
-            return int64_t(curr_group_idx) * param.shape_m * SHAPE_K;
+            return int64_t(curr_group_idx) * params.shape_m * SHAPE_K;
         } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return int64_t(curr_cumsum_m) * SHAPE_K;
         } else {
@@ -224,10 +219,10 @@ struct DeepGemmScheduler {
         }
     }
 
-    __device__ __forceinline__ int64_t curr_offset_scalea(const Params& param) const
+    __device__ __forceinline__ int64_t curr_offset_scalea() const
     {
         if constexpr (kGemmType == GemmType::GroupedMasked) {
-            return int64_t(curr_group_idx) * param.shape_m * SHAPE_K / 128;
+            return int64_t(curr_group_idx) * params.shape_m * SHAPE_K / 128;
         } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return int64_t(curr_cumsum_m);
         } else {
@@ -236,10 +231,10 @@ struct DeepGemmScheduler {
     }
 
     /// Gets the pointer offset of matrix A
-    __device__ __forceinline__ int64_t curr_offset_m(const Params& param) const
+    __device__ __forceinline__ int64_t curr_offset_m() const
     {
         if constexpr (kGemmType == GemmType::GroupedMasked) {
-            return int64_t(curr_group_idx) * param.shape_m;
+            return int64_t(curr_group_idx) * params.shape_m;
         } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return curr_cumsum_m;
         } else {
@@ -248,7 +243,7 @@ struct DeepGemmScheduler {
     }
 
     // Gets the pointer offset of matrix B
-    __device__ __forceinline__ int64_t curr_offset_b(const Params& param, const int m_block_idx = 0) const
+    __device__ __forceinline__ int64_t curr_offset_b(const int m_block_idx = 0) const
     {
         if constexpr (kGemmType == GemmType::GroupedContiguous) {
             int64_t offset = __ldg(params.grouped_layout + m_block_idx * BLOCK_M);
@@ -259,10 +254,10 @@ struct DeepGemmScheduler {
     }
 
     // Gets the pointer offset of matrix C
-    __device__ __forceinline__ int64_t curr_offset_c(const Params& param) const
+    __device__ __forceinline__ int64_t curr_offset_c() const
     {
         if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {
-            return int64_t(curr_group_idx) * param.shape_m * SHAPE_N;
+            return int64_t(curr_group_idx) * params.shape_m * SHAPE_N;
         } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return int64_t(curr_cumsum_m) * SHAPE_N;
         } else {

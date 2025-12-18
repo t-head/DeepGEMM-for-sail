@@ -287,6 +287,7 @@ public:
     //   printf("EpilogueSharedStorage size = %d\n", sizeof(CollectiveEpilogue::SharedStorage));
     // }
 
+    int warp_idx = cutlass::canonical_warp_idx_sync();
     // Kernel level shared memory storage
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
@@ -327,14 +328,14 @@ public:
       auto n_coord = n_block_idx * N_EXPAND;
       auto l_coord = 0;
 
-      uint32_t M = deep_scheduler.curr_problem_m(params.scheduler);
+      uint32_t M = deep_scheduler.curr_problem_m();
 
       auto problem_shape_MNKL = ProblemShape{M, N, K, L};
 
-      auto offset_m = deep_scheduler.curr_offset_m(params.scheduler);
+      auto offset_m = deep_scheduler.curr_offset_m();
     //   auto expert_id = deep_scheduler.problem_index();
-      auto offset_a = deep_scheduler.curr_offset_a(params.scheduler);
-      auto offset_b = deep_scheduler.curr_offset_b(params.scheduler);
+      auto offset_a = deep_scheduler.curr_offset_a();
+      auto offset_b = deep_scheduler.curr_offset_b();
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
 
@@ -377,8 +378,6 @@ public:
       GmemTiledCopyScaleA gmem_tiled_copy_scaleA = collective_mma.gmem_tiled_copy_scaleA;
       GmemTiledCopyScaleB gmem_tiled_copy_scaleB = collective_mma.gmem_tiled_copy_scaleB;
 
-      int warp_idx = canonical_warp_idx_sync();
-      int lane_predicate = cute::elect_one_sync();
       // Construct shared memory tiles
       MainloopSharedStorage& storage = *reinterpret_cast<MainloopSharedStorage*>(smem_buf);
       Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
@@ -620,8 +619,8 @@ public:
 
         // update params.epilogue for ptrC and ptrD
         auto params_epilogue_local = params.epilogue;
-        params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c(params.scheduler);
-        params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(params.scheduler);
+        params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
+        params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
 
         // Epilogue and write to gD
         CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
@@ -653,13 +652,13 @@ public:
 
       } // for n_iter
 
-      if constexpr(kEnableSboOverlap) {
+      if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
         cp_async_wait<0>();
         __syncthreads();
 
         if (threadIdx.x == 0) {
           atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
-                  * ceil_div(M, TileScheduler::BLOCK_M) + m_block_idx, 1);
+                  * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
         }
       }
     } // Scheduler work fetch loop
@@ -1419,14 +1418,14 @@ public:
       auto n_coord = n_block_idx;
       auto l_coord = 0;
 
-      uint32_t M = deep_scheduler.curr_problem_m(params.scheduler);
+      uint32_t M = deep_scheduler.curr_problem_m();
 
       auto problem_shape_MNKL = ProblemShape{M, N, K, L};
 
-      auto offset_m = deep_scheduler.curr_offset_m(params.scheduler);
+      auto offset_m = deep_scheduler.curr_offset_m();
       auto expert_id = deep_scheduler.problem_index();
-      auto offset_a = deep_scheduler.curr_offset_a(params.scheduler);
-      auto offset_b = deep_scheduler.curr_offset_b(params.scheduler, m_block_idx);
+      auto offset_a = deep_scheduler.curr_offset_a();
+      auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
 
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
@@ -1472,8 +1471,8 @@ public:
 
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
-      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c(params.scheduler);
-      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(params.scheduler);
+      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
+      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
 
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
@@ -1491,13 +1490,13 @@ public:
       //   printf("accumulators[0] = %.4f\n", accumulators[0]);
       // }
 
-      if constexpr(kEnableSboOverlap) {
+      if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
         cp_async_wait<0>();
         __syncthreads();
 
         if (threadIdx.x == 0) {
           atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
-                  * ceil_div(M, TileScheduler::BLOCK_M) + m_block_idx, 1);
+                  * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
         }
       }
     } // Scheduler work fetch loop

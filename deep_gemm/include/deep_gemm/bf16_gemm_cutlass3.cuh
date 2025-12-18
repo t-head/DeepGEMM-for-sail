@@ -298,21 +298,21 @@ public:
       auto n_coord = n_block_idx * N_EXPAND;
       auto l_coord = 0;
 
-      uint32_t M = deep_scheduler.curr_problem_m(params.scheduler);
+      uint32_t M = deep_scheduler.curr_problem_m();
 
       auto problem_shape_MNKL = ProblemShape{M, N, K, L};
 
-      auto offset_m = deep_scheduler.curr_offset_m(params.scheduler);
+      auto offset_m = deep_scheduler.curr_offset_m();
       auto expert_id = deep_scheduler.problem_index();
-      auto offset_a = deep_scheduler.curr_offset_a(params.scheduler);
-      auto offset_b = deep_scheduler.curr_offset_b(params.scheduler, m_block_idx);
+      auto offset_a = deep_scheduler.curr_offset_a();
+      auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
       auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
-                                                  M, offset_m, expert_id, ptr_A, ptr_B);
+                                                  offset_m, expert_id, ptr_A, ptr_B);
       // Extract out partitioned A and B.
       Tensor gA = get<0>(load_inputs);
       Tensor gB = get<1>(load_inputs);
@@ -527,8 +527,8 @@ public:
 
         // update params.epilogue for ptrC and ptrD
         auto params_epilogue_local = params.epilogue;
-        params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c(params.scheduler);
-        params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(params.scheduler);
+        params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
+        params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
 
         // Epilogue and write to gD
         CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
@@ -559,13 +559,13 @@ public:
 
       } // for n_iter
 
-      if constexpr(kEnableSboOverlap) {
+      if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
         cp_async_wait<0>();
         __syncthreads();
 
         if (threadIdx.x == 0) {
           atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
-                  * ceil_div(M, TileScheduler::BLOCK_M) + m_block_idx, 1);
+                  * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
         }
       }
     } // Scheduler work fetch loop
@@ -699,8 +699,8 @@ struct CollectiveMma<
   template <class ProblemShape_MNKL, class BlockCoord_MNKL>
   CUTLASS_DEVICE auto
   load_init(ProblemShape_MNKL const& problem_shape_MNKL, BlockCoord_MNKL const& blk_coord_mnkl, Params const& params,
-            int M, int offset_m, int expert_id, ElementA const* ptr_A, ElementB const* ptr_B) {
-    auto [_M,N,K,L] = problem_shape_MNKL;
+            int offset_m, int expert_id, ElementA const* ptr_A, ElementB const* ptr_B) {
+    auto [M,N,K,L] = problem_shape_MNKL;
     auto [m_coord, n_coord, _, l_coord] = blk_coord_mnkl;
     // load init A
     Tensor mA_mkl = make_tensor(make_gmem_ptr(ptr_A), make_shape(M,K,L), params.dA);   // (m,k,l)
@@ -733,6 +733,7 @@ struct CollectiveMma<
   initialize_workspace(ProblemShape const& problem_shape, Arguments const& args, void* workspace, cudaStream_t stream, CudaHostAdapter* cuda_adapter = nullptr) {
     return cutlass::Status::kSuccess;
   }
+
   /// Perform a collective-scoped matrix multiply-accumulate
   template <
     class... Ts,
@@ -881,7 +882,7 @@ struct CollectiveMma<
         copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
         copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
 
-CUTLASS_PRAGMA_UNROLL
+        CUTLASS_PRAGMA_UNROLL
         for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
           auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
           // Transform before compute
@@ -1147,22 +1148,20 @@ public:
 
     TileScheduler deep_scheduler(params.scheduler);
 
-    uint32_t m_block_idx, n_block_idx;
+    uint32_t m_coord, n_coord;
+    uint32_t l_coord = 0;
     constexpr uint32_t L = 1;
-    while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
 
-      auto m_coord = m_block_idx;
-      auto n_coord = n_block_idx;
-      auto l_coord = 0;
+    while (deep_scheduler.fetch_next_work(m_coord, n_coord)) {
 
-      uint32_t M = deep_scheduler.curr_problem_m(params.scheduler);
+      uint32_t M = deep_scheduler.curr_problem_m();
 
       auto problem_shape_MNKL = ProblemShape{M, N, K, L};
 
-      auto offset_m = deep_scheduler.curr_offset_m(params.scheduler);
+      auto offset_m = deep_scheduler.curr_offset_m();
       auto expert_id = deep_scheduler.problem_index();
-      auto offset_a = deep_scheduler.curr_offset_a(params.scheduler);
-      auto offset_b = deep_scheduler.curr_offset_b(params.scheduler, m_block_idx);
+      auto offset_a = deep_scheduler.curr_offset_a();
+      auto offset_b = deep_scheduler.curr_offset_b(m_coord);
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
 
@@ -1175,7 +1174,7 @@ public:
       CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
 
       auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
-                                                  M, offset_m, expert_id, ptr_A, ptr_B);
+                                                  offset_m, expert_id, ptr_A, ptr_B);
       // Extract out partitioned A and B.
       Tensor gA = get<0>(load_inputs);
       Tensor gB = get<1>(load_inputs);
@@ -1207,8 +1206,8 @@ public:
 
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
-      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c(params.scheduler);
-      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(params.scheduler);
+      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
+      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
 
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
@@ -1226,13 +1225,13 @@ public:
       //   printf("accumulators[0] = %.4f\n", accumulators[0]);
       // }
 
-      if constexpr(kEnableSboOverlap) {
+      if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
         cp_async_wait<0>();
         __syncthreads();
 
         if (threadIdx.x == 0) {
           atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
-                  * ceil_div(M, TileScheduler::BLOCK_M) + m_block_idx, 1);
+                  * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_coord, 1);
         }
       }
     } // Scheduler work fetch loop
@@ -1417,7 +1416,7 @@ public:
 
             printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
 
-            printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, int(attr.numRegs), int(attr.localSizeBytes));
+            printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
         }
     }
 };

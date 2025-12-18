@@ -352,7 +352,7 @@ public:
 
             epilogue(output_op, iterator_D, accumulators, iterator_D);
 
-            if constexpr(kEnableSboOverlap) {
+            if constexpr(kEnableSboOverlap && ProblemVisitor::kGemmType == GemmType::GroupedMasked) {
                 cutlass::arch::cp_async_wait<0>();
                 __syncthreads();
 
