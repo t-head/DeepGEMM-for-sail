@@ -28,6 +28,15 @@ enum class GemmType {
 
 const char* GemmTypeS[] = { "DenseGemm", "GroupedContiguous", "GroupedMasked", "GroupedNoPad"};
 
+enum class KernelType {
+    Default,
+    MultistageOnN,
+    OverlapPrologue,
+    OverlapMainloop
+};
+
+const char* KernelTypeS[] = { "Default", "MultistageOnN", "OverlapPrologue", "OverlapMainloop"};
+
 class AssertionException : public std::exception {
 private:
     std::string message{};

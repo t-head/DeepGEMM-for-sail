@@ -30,7 +30,7 @@ struct DeepGemmScheduler {
     constexpr static uint32_t SHAPE_K = SHAPE_K_;
     constexpr static uint32_t BLOCK_M = BLOCK_M_;
     constexpr static uint32_t BLOCK_N = BLOCK_N_;
-    int current_iter = -1;
+    int current_iter = 0;
     uint32_t num_aligned_m_blocks;
     constexpr static GemmType GEMM_TYPE = kGemmType;
     constexpr static bool kIsTMAMulticastOnA = false;
@@ -73,7 +73,7 @@ struct DeepGemmScheduler {
     using Params = Arguments;
     Params const& params;
 
-    CUTLASS_DEVICE explicit DeepGemmScheduler(Params const& params_) : params(params_) {
+    CUTLASS_DEVICE explicit DeepGemmScheduler(Params const& params_, const int warp_group_id = 0) : params(params_), current_iter(warp_group_id) {
         num_aligned_m_blocks = ceil_div(params_.shape_m, BLOCK_M);
         if (kGemmType == GemmType::DenseGemm) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
@@ -120,7 +120,7 @@ struct DeepGemmScheduler {
     }
 
     CUTLASS_DEVICE bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        const auto next_block_idx = (++ current_iter) * gridDim.x + blockIdx.x;
+        const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
 
         if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
             uint32_t num_m_blocks;
