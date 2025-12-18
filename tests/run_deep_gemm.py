@@ -4,8 +4,8 @@ import random
 import deep_gemm
 from utils import parse_deepgemm_string_re, read_cmds_from_file
 from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad
-from utils import set_acc_check, get_acc_check, set_benchmark, get_benchmark
-from utils import judge_device_type
+from utils import set_acc_check, set_benchmark
+from utils import judge_device_type, set_ref_backend
 def call_test_func(gemm_type, func_args):
     supported_call_funcs = {
         "GroupedContiguous": test_m_grouped_gemm_contiguous,
@@ -39,9 +39,11 @@ if __name__ == '__main__':
     parser.add_argument('--case_idx', default=None, type=int, required=False, help='the line index(1~line) of case in caselist file')
     parser.add_argument("--disable_acc", action="store_true", help="if or not open accuracy check")
     parser.add_argument('--benchmark', default=False, action="store_true", required=False, help='specify if run benchmark')
+    parser.add_argument('--ref_backend', default="device", type=str, required=False, choices=["host", "device"], help='specify the backend used to compute ref output')
 
     args = parser.parse_args()
     set_benchmark(args.benchmark)
+    set_ref_backend(args.ref_backend)
     if args.disable_acc:
         set_acc_check(0)
     dg_cases = list()

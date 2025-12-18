@@ -2,7 +2,7 @@ import argparse
 import os
 import torch
 from utils import run_cycle_on_device, str_to_list, worker, split_list_into_groups
-from utils import set_acc_check, _acc_check
+from utils import set_acc_check, set_ref_backend
 import multiprocessing as mp
 
 device_name = torch.cuda.get_device_name()
@@ -40,8 +40,10 @@ if __name__ == '__main__':
     parser.add_argument('--mode', default="metrics", type=str, choices=["metrics","full","show_log","umd_perf"], required=False, help='run perf mode')
     parser.add_argument('--device', default=None, type=str, required=False, help='devices index to run cases, 0 means gpu0. 0,3 means gpu0,1,2,3')
     parser.add_argument('--disable_acc', action="store_true", required=False, help='if or not open accuracy check')
+    parser.add_argument('--ref_backend', default="device", type=str, required=False, choices=["host", "device"], help='specify the backend used to compute ref output')
 
     args = parser.parse_args()
+    set_ref_backend(args.ref_backend)
 
     dg_cases = list()
     if args.format:

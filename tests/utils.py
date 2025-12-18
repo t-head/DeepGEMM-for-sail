@@ -6,9 +6,11 @@ import traceback
 from deep_gemm import get_m_alignment_for_contiguous_layout
 try:
     from deep_gemm import get_col_major_tma_aligned_tensor
+    from deep_gemm import bench_kineto
 except:
     from deep_gemm import get_mn_major_tma_aligned_tensor
-from deep_gemm import bench_kineto
+    from deep_gemm.testing import bench_kineto
+
 import deep_gemm
 import random
 import torch
@@ -17,10 +19,11 @@ from enum import Enum
 import ast
 from math_utils import *
 
-global _acc_check, _benchmark
-_acc_check, _benchmark = True, False
+global _acc_check, _benchmark, _ref_backend
 global use_ppu, show_log
+_acc_check, _benchmark, use_ppu = True, False, True
 show_log = False if "show_log" not in os.environ.keys() else True
+_ref_backend = "device"
 
 class KernelType(Enum):
     Kernel1D1D = 0
@@ -175,6 +178,13 @@ def set_benchmark(value):
 def get_benchmark():
     return _benchmark
 
+def set_ref_backend(value):
+    global _ref_backend
+    _ref_backend = value
+
+def get_ref_backend():
+    return _ref_backend
+
 def check_signal(num_local_expert, max_m, block_m, threshold, signal, masked_m):
     ceil_div = lambda a, b: (a + b - 1) // b
 
@@ -192,9 +202,10 @@ def check_signal(num_local_expert, max_m, block_m, threshold, signal, masked_m):
 
 def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block") -> \
         Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor], torch.Tensor]:
-    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
-    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    tensor_device = 'cuda' if get_ref_backend() == "device" else 'host'
+    x = torch.randn((m, k), device=tensor_device, dtype=torch.bfloat16)
+    y = torch.randn((n, k), device=tensor_device, dtype=torch.bfloat16)
+    out = torch.empty((m, n), device=tensor_device, dtype=torch.bfloat16)
 
     if _acc_check:
         ref_out = x @ y.t()
@@ -202,23 +213,21 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
         ref_out = torch.empty_like(out)
 
     if d == torch.bfloat16:
-        return x, y, out, ref_out
+        return x.to('cuda'), y.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.int8:
         x_int8, y_int8 = per_token_cast_to_int8(x), per_token_cast_to_int8(y)
-        return x_int8, y_int8, out, ref_out
+        return  (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.float8_e4m3fn:
         if quant_type == "channel":
             x_fp8, y_fp8 = per_custom_dims_cast_to_fp8(x, (0, ), False, True), per_custom_dims_cast_to_fp8(y, (0, ), False, True)
         else:
             x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
-        if show_log:
-            print(y_fp8[1].shape)
         # Transpose earlier so that the testing will not trigger transposing kernels
         if use_ppu:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
-        return x_fp8, y_fp8, out, ref_out
+        return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), out.to('cuda'), ref_out.to('cuda')
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
@@ -256,7 +265,7 @@ def find_next_power_of_2(m_list):
         raise ValueError("Invalid m_list")
     if max_val <= 0:
         return 1
-    bit = (max_val - 1).bit_length()
+    bit = (int(max_val) - 1).bit_length()
     return 1 << bit
 
 def construct_group_m_list(distribution, num_groups, m, is_mask=False, seed=0, em=0):
@@ -305,17 +314,15 @@ def construct_group_m_list(distribution, num_groups, m, is_mask=False, seed=0, e
 
 def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: torch.dtype, distribution: str, alignment: int, quant_type: str = "block") -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    tensor_device = 'cuda' if get_ref_backend() == "device" else 'host'
     group_ms = construct_group_m_list(distribution, num_groups, m)
     m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
-    m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
-    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+    m_indices = torch.empty(m, device=tensor_device, dtype=torch.int32)
+    x = torch.randn((m, k), device=tensor_device, dtype=torch.bfloat16)
+    y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
 
-    x = x.to('cpu')
-    y = y.to('cpu')
-
-    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
-    ref_out = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
+    out = torch.empty((m, n), device=tensor_device, dtype=torch.bfloat16)
+    ref_out = torch.randn((m, n), device=tensor_device, dtype=torch.bfloat16)
 
     start = 0
     for i, group_m in enumerate(group_ms):
@@ -331,49 +338,46 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: tor
         ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
 
     if d == torch.bfloat16:
-        return m, x.to('cuda'), y.to('cuda'), m_indices, out, ref_out.to('cuda')
+        return m, x.to('cuda'), y.to('cuda'), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.int8:
         x_int8 = per_token_cast_to_int8(x)
-        y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
+        y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device=tensor_device, dtype=torch.float))
         for i in range(num_groups):
             y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
-        return m, (x_int8[0].to("cuda"), x_int8[1].to("cuda")), (y_int8[0].to("cuda"), y_int8[1].to("cuda")), m_indices, out, ref_out.to('cuda')
+        return m, (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.float8_e4m3fn:
         # assert m % 4 == 0, f'TMA alignment error: {m}'
         if quant_type == "channel":
             x_fp8 = per_custom_dims_cast_to_fp8(x, (0, ), False, True)
-            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, n, 1), device=tensor_device, dtype=torch.float))
             for i in range(num_groups):
                 y_fp8[0][i], y_fp8[1][i] = per_custom_dims_cast_to_fp8(y[i], (0, ), False, True)
-                if show_log:
-                    print(y_fp8[1][i].shape)
         else: # block wise
             x_fp8 = per_token_cast_to_fp8(x)
-            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, ceil_div(n, 128), k // 128), device='cpu', dtype=torch.float))
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, ceil_div(n, 128), k // 128), device=tensor_device, dtype=torch.float))
             for i in range(num_groups):
                 y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
-                if show_log:
-                    print(y_fp8[1][i].shape)
         if use_ppu:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
-        return m, (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), m_indices, out, ref_out.to('cuda')
+        return m, (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
 
 def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, distribution: str,
                              enable_sbo_overlap: bool = False, quant_type: str = "block"):
+    tensor_device = 'cuda' if get_ref_backend() == "device" else 'host'
     # Construct mask
     list_m =  construct_group_m_list(distribution, num_groups, max_m, is_mask=True, em=expected_m_per_group)
-    masked_m = torch.tensor(list_m, device='cuda', dtype=torch.int)
+    masked_m = torch.tensor(list_m, device=tensor_device, dtype=torch.int)
     max_m = find_next_power_of_2(list_m)
     assert masked_m.amax().item() <= max_m, f"max masked_m={masked_m.amax().item()}, allowed max_m={max_m}"
 
-    x = torch.randn((num_groups, max_m, k), device='cpu', dtype=torch.bfloat16)
-    y = torch.randn((num_groups, n, k), device='cpu', dtype=torch.bfloat16)
-    out = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
+    x = torch.randn((num_groups, max_m, k), device=tensor_device, dtype=torch.bfloat16)
+    y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
+    out = torch.empty((num_groups, max_m, n), device=tensor_device, dtype=torch.bfloat16)
 
     if _acc_check:
         ref_out = torch.einsum('gmk,gnk->gmn', x, y)
@@ -382,40 +386,36 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
 
 
     max_signal_size = num_groups * ceil_div(max_m, 64)
-    signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda') if enable_sbo_overlap else torch.empty(0).int()
+    signal = torch.zeros(max_signal_size, dtype=torch.int32, device=tensor_device) if enable_sbo_overlap else torch.empty(0).int()
 
     if d == torch.bfloat16:
-        return x.to('cuda'), y.to('cuda'), masked_m, out, ref_out.to('cuda'), signal, max_m
+        return x.to('cuda'), y.to('cuda'), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     elif d == torch.int8:
-        x_int8 = (torch.empty_like(x, dtype=torch.int8), torch.empty((num_groups, max_m, 1), device='cpu', dtype=torch.float))
-        y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
+        x_int8 = (torch.empty_like(x, dtype=torch.int8), torch.empty((num_groups, max_m, 1), device=tensor_device, dtype=torch.float))
+        y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device=tensor_device, dtype=torch.float))
         for i in range(num_groups):
             x_int8[0][i], x_int8[1][i] = per_token_cast_to_int8(x[i])
             y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
-        return (x_int8[0].to("cuda"), x_int8[1].to("cuda")), (y_int8[0].to("cuda"), y_int8[1].to("cuda")), masked_m, out, ref_out.to('cuda'), signal, max_m
+        return (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     elif d == torch.float8_e4m3fn:
         if quant_type == "channel":
-            x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, max_m, 1), device='cpu', dtype=torch.float))
-            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, n, 1), device='cpu', dtype=torch.float))
+            x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, max_m, 1), device=tensor_device, dtype=torch.float))
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, n, 1), device=tensor_device, dtype=torch.float))
             for i in range(num_groups):
                 x_fp8[0][i], x_fp8[1][i] = per_custom_dims_cast_to_fp8(x[i], (0, ), False, True)
                 y_fp8[0][i], y_fp8[1][i] = per_custom_dims_cast_to_fp8(y[i], (0, ), False, True)
-                if show_log:
-                    print(y_fp8[1][i].shape)
         else: # block wise
-            x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, max_m, k // 128), device='cpu', dtype=torch.float))
-            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, (n + 127) // 128, k // 128), device='cpu', dtype=torch.float))
+            x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, max_m, k // 128), device=tensor_device, dtype=torch.float))
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, (n + 127) // 128, k // 128), device=tensor_device, dtype=torch.float))
             for i in range(num_groups):
                 x_fp8[0][i], x_fp8[1][i] = per_token_cast_to_fp8(x[i])
                 y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
-                if show_log:
-                    print(y_fp8[1][i].shape)
         # Transpose earlier so that the testing will not trigger transposing kernels
         if use_ppu:
             x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
         else:
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
-        return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m, out, ref_out.to('cuda'), signal, max_m
+        return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
@@ -493,7 +493,7 @@ def read_detail_from_nculog(filename):
 #     "name": ["cycle", "tensor core efficiency", "waves"],
 #      hopper tc: sm__pipe_tensor_type_hmma_hgmma_qgmma_imma_igmma_bmma_bgmma_cycles_active.avg.pct_of_peak_sustained_elapsed
 #     "gpu":  ["gpu__time_duration.sum", "sm__cycles_active.max", "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active", "launch__waves_per_multiprocessor"],
-#     "ppu":  ["ce__cycles_active.max", "cu__inst_executed_pipe_tensor_fp16.avg.pct_of_peak_sustained_active", "launch__waves_per_cu"],
+#     "ppu":  ["ppu__time_duration.sum","ce__cycles_active.max", "cu__inst_executed_pipe_tensor_fp16.avg.pct_of_peak_sustained_active", "launch__waves_per_cu"],
 # }
 
 def read_cycle_from_nculog(filename):
@@ -523,7 +523,10 @@ def read_cycle_from_nculog(filename):
             if re.search(hbm_pattern, line):
                 hbm_list.append(float(line.strip().split()[-1]))
             if re.search(time_pattern, line):
-                time_list.append(float(line.strip().split()[-1]))
+                fwd_time = float(line.strip().split()[-1])
+                if "ns" in line: # ppu return ns, gpu return ms
+                    fwd_time = fwd_time/1000/1000
+                time_list.append(fwd_time)
 
     if (len(kernel_list) != len(cycles_list)) or (len(kernel_list) != len(tc_list)) or (len(kernel_list) != len(hbm_list)):
         print(f"assert len(kernel_list){len(kernel_list)} == len(cycles_list){len(cycles_list)} == len(tc_list){len(tc_list)} == len(hbm_list){len(hbm_list)} failed!!")
@@ -567,7 +570,7 @@ def clean_casename(name):
 
 def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0"):
     output_lines = list()
-    headers = ["casename","time","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
+    headers = ["casename","time(ms)","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"]
     # output_lines.append(new_row)
     if not os.path.exists("./logs"):
@@ -588,8 +591,8 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         script = f"{os.path.dirname(current_file_path)}/run_deep_gemm.py"
         if mode == "full":
             output_name = clean_casename(case)
-            cmd = '{} --set full -o {} python {} --format {} \
-                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", output_name, script, case, log_file)
+            cmd = "{} --set full --kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*' -o {} python {} --format {} \
+                2>&1 | tee {}".format("ncu" if dev == "gpu" else "acu", output_name, script, case, log_file)
             ret = run_cmd(cmd)
             continue
         else:
@@ -598,19 +601,19 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
             if dev == "gpu":
                 arch = get_arch_major()
                 if arch == 8:
-                    metrics_string = "sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
+                    metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
                 elif arch == 9:
-                    metrics_string = "sm__cycles_active.max,sm__pipe_tensor_type_hmma_hgmma_qgmma_imma_igmma_bmma_bgmma_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
+                    metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
                 else:
-                    metrics_string = "sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
+                    metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
             else:
                 # "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed"
-                metrics_string = "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format(dtype)
+                metrics_string = "ppu__time_duration.sum,ce__cycles_elapsed.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format(dtype)
 
             _acc = "--disable_acc"
             cmd = '{} --clock-control none {} --metrics="{}"  \
                 --page=details python {} --format "{}" {} \
-                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", "" if dev == "gpu" else '--kernel-name "regex:Kernel|device_kernel|batched_gemvt*"', metrics_string, script, case, _acc, log_file)
+                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", '--kernel-name regex:gemm*' if dev == "gpu" else "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*'", metrics_string, script, case, _acc, log_file)
 
         ret = run_cmd(cmd)
         result = "Fail"
