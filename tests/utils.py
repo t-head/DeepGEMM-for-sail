@@ -202,7 +202,7 @@ def check_signal(num_local_expert, max_m, block_m, threshold, signal, masked_m):
 
 def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block") -> \
         Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor], torch.Tensor]:
-    tensor_device = 'cuda' if get_ref_backend() == "device" else 'host'
+    tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
     x = torch.randn((m, k), device=tensor_device, dtype=torch.bfloat16)
     y = torch.randn((n, k), device=tensor_device, dtype=torch.bfloat16)
     out = torch.empty((m, n), device=tensor_device, dtype=torch.bfloat16)
@@ -314,7 +314,7 @@ def construct_group_m_list(distribution, num_groups, m, is_mask=False, seed=0, e
 
 def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: torch.dtype, distribution: str, alignment: int, quant_type: str = "block") -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-    tensor_device = 'cuda' if get_ref_backend() == "device" else 'host'
+    tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
     group_ms = construct_group_m_list(distribution, num_groups, m)
     m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
     m_indices = torch.empty(m, device=tensor_device, dtype=torch.int32)
@@ -368,11 +368,11 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: tor
 
 def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, distribution: str,
                              enable_sbo_overlap: bool = False, quant_type: str = "block"):
-    tensor_device = 'cuda' if get_ref_backend() == "device" else 'host'
+    tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
     # Construct mask
     list_m =  construct_group_m_list(distribution, num_groups, max_m, is_mask=True, em=expected_m_per_group)
     masked_m = torch.tensor(list_m, device=tensor_device, dtype=torch.int)
-    max_m = find_next_power_of_2(list_m)
+    max_m = max(128, find_next_power_of_2(list_m))
     assert masked_m.amax().item() <= max_m, f"max masked_m={masked_m.amax().item()}, allowed max_m={max_m}"
 
     x = torch.randn((num_groups, max_m, k), device=tensor_device, dtype=torch.bfloat16)
@@ -500,7 +500,7 @@ def read_cycle_from_nculog(filename):
     # kernel_pattern = r"(.*)deep_gemm(.*)"
     # kernel_pattern = r"(.*)kernel(.*)Device(.*)"
     kernel_pattern = r"(.*)Device\s+\d+"
-    cycles_pattern = r"__cycles_active.max"
+    cycles_pattern = r"__cycles_elapsed.max"
     time_pattern = r"time_duration"
     global tc_pattern
     # tc_pattern = "we_pipe_tensor_cycles_active"
@@ -524,9 +524,9 @@ def read_cycle_from_nculog(filename):
                 hbm_list.append(float(line.strip().split()[-1]))
             if re.search(time_pattern, line):
                 fwd_time = float(line.strip().split()[-1])
-                if "ns" in line: # ppu return ns, gpu return ms
-                    fwd_time = fwd_time/1000/1000
-                time_list.append(fwd_time)
+                if "ns" in line: # ppu return ns, gpu return us
+                    fwd_time = fwd_time/1000
+                time_list.append(round(fwd_time,4))
 
     if (len(kernel_list) != len(cycles_list)) or (len(kernel_list) != len(tc_list)) or (len(kernel_list) != len(hbm_list)):
         print(f"assert len(kernel_list){len(kernel_list)} == len(cycles_list){len(cycles_list)} == len(tc_list){len(tc_list)} == len(hbm_list){len(hbm_list)} failed!!")
@@ -570,7 +570,7 @@ def clean_casename(name):
 
 def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0"):
     output_lines = list()
-    headers = ["casename","time(ms)","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
+    headers = ["casename","time(us)","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"]
     # output_lines.append(new_row)
     if not os.path.exists("./logs"):
@@ -601,14 +601,14 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
             if dev == "gpu":
                 arch = get_arch_major()
                 if arch == 8:
-                    metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
+                    metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed"
                 elif arch == 9:
-                    metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
+                    metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed"
                 else:
-                    metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed".format(dtype)
+                    metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed"
             else:
                 # "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed"
-                metrics_string = "ppu__time_duration.sum,ce__cycles_elapsed.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed".format(dtype)
+                metrics_string = "ppu__time_duration.sum,ce__cycles_elapsed.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed"
 
             _acc = "--disable_acc"
             cmd = '{} --clock-control none {} --metrics="{}"  \
