@@ -332,6 +332,17 @@ struct DeepGemmScheduler {
         }
     }
 
+    // Gets the pointer offset of matrix A_scale for MXFP4, scale is padded to uint64_t but load as uint32_t.
+    __device__ __forceinline__ int64_t curr_offset_mxfp4_scalea() const
+    {
+        int64_t shape_k_scale = SHAPE_K / 16;
+        if constexpr (kGemmType == GemmType::GroupedNoPad) {
+            return int64_t(curr_cumsum_m) * ((shape_k_scale + 7) / 8 * 2);
+        } else {
+            return 0;
+        }
+    }
+
     /// Gets the pointer offset of matrix A
     __device__ __forceinline__ int64_t curr_offset_m() const
     {
@@ -355,7 +366,23 @@ struct DeepGemmScheduler {
         }
     }
 
+    // Gets the pointer offset of matrix B_scale for MXFP4, scale is padded to uint64_t but load as uint32_t.
+    __device__ __forceinline__ int64_t curr_offset_mxfp4_scaleb(const int m_block_idx = 0) const
+    {
+        int64_t shape_k_scale = SHAPE_K / 16;
+        return int64_t(curr_group_idx) * SHAPE_N * ((shape_k_scale + 7) / 8 * 2);
+    }
+
     // Gets the pointer offset of matrix C
+    __device__ __forceinline__ int64_t curr_offset_mxfp4_c() const
+    {
+        if constexpr (kGemmType == GemmType::GroupedNoPad) {
+            return int64_t(curr_group_idx) * SHAPE_N;
+        } else {
+            return 0;
+        }
+    }
+
     __device__ __forceinline__ int64_t curr_offset_c() const
     {
         if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {

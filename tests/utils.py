@@ -218,6 +218,21 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
     elif d == torch.int8:
         x_int8, y_int8 = per_token_cast_to_int8(x), per_token_cast_to_int8(y)
         return  (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), out.to('cuda'), ref_out.to('cuda')
+    elif d == torch.uint8:
+        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, uint8_padding
+        A = torch.randn(m, k, dtype=torch.bfloat16, device='cuda').contiguous()
+        B = torch.randn(n, k, dtype=torch.bfloat16, device='cuda').contiguous()
+        a, a_scale = quantize_fp4_torch(A.to(torch.bfloat16))
+        b, b_scale = quantize_fp4_torch(B.to(torch.bfloat16))
+        a_dequant = dequantize_fp4_torch(a, a_scale).cuda()
+        b_dequant = dequantize_fp4_torch(b, b_scale).cuda()
+        bias = torch.zeros(m, n, dtype=torch.float32, device='cuda')
+        out = torch.zeros(m, n, dtype=torch.float32, device='cuda')
+        a_scale = uint8_padding(a_scale)
+        b_scale = uint8_padding(b_scale)
+        ref_out = torch.mm(a_dequant, b_dequant.T)
+        ref_out = ref_out + bias
+        return (a, a_scale), (b, b_scale), out, ref_out
     elif d == torch.float8_e4m3fn:
         if quant_type == "channel":
             x_fp8, y_fp8 = per_custom_dims_cast_to_fp8(x, (0, ), False, True), per_custom_dims_cast_to_fp8(y, (0, ), False, True)
@@ -793,6 +808,8 @@ def convert_data_type_to_dtype(data_type):
         return torch.bfloat16
     elif data_type in ["int8", "torch.int8"]:
         return torch.int8
+    elif data_type in ["fp4"]:
+        return torch.uint8
     elif data_type in ["fp8", "torch.float8_e4m3fn"]:
         return torch.float8_e4m3fn
     else:

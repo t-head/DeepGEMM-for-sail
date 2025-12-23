@@ -1,4 +1,5 @@
 from .gemm import gemm_bf16_bf16_bf16_nt
+from .gemm_fp4 import gemm_fp4_fp4_fp32_nt
 from .gemm_int8 import gemm_int8_int8_bf16_nt
 from .gemm_fp8 import gemm_fp8_fp8_bf16_nt
 from .m_grouped_gemm import (
@@ -18,6 +19,9 @@ from .m_grouped_gemm_fp8 import (
     m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
     m_grouped_gemm_fp8_fp8_bf16_nt_masked,
     m_grouped_gemm_fp8_fp8_bf16_nt_nopad
+)
+from .m_grouped_gemm_fp4 import (
+    m_grouped_gemm_fp4_fp4_fp32_nt_nopad,
 )
 from .utils import (
     ceil_div, set_num_sms, get_num_sms, get_case_id,

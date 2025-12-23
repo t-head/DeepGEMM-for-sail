@@ -1,0 +1,1085 @@
+#pragma once
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-attributes"
+#define ACOMPUTE_VERSION 10500
+
+#include "cutlass/cutlass.h"
+#include "utils.cuh"
+#include <iostream>
+#include "profiling_interface.hpp"
+
+#include "ppu/cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/numeric_types.h"
+#include "cutlass/workspace.h"
+#include "cutlass/fast_math.h"
+#include "cutlass/epilogue/collective/detail.hpp"
+#include "cutlass/epilogue/collective/sm70_epilogue_vectorized.hpp"
+#include "cute/algorithm/functional.hpp"
+#include "cute/atom/mma_atom.hpp"
+#include "cute/algorithm/gemm.hpp"
+#include "cute/tensor_predicate.hpp"
+#include "cute/numeric/integral_constant.hpp"
+#include "cute/numeric/arithmetic_tuple.hpp"
+#include "cute/tensor.hpp"
+#include "ppu/cute/util.hpp"
+#include "cutlass/pipeline/pipeline.hpp"
+#include "cutlass/kernel_hardware_info.hpp"
+#include "cutlass/gemm/gemm.h"
+#include "ppu/ppu_include.hpp"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/trace.h"
+#include "ppu/gemm/config/gemm_configs.hpp"
+#include "ppu/gemm/config/gemm_operands.hpp"
+#include "cutlass/numeric_conversion.h"
+#include "tools/util/include/cutlass/util/host_tensor.h"
+#include "tools/util/include/cutlass/util/packed_stride.hpp"
+#include "scheduler_cutlass3.cuh"
+#include "utils_cutlass3.h"
+
+#include <math.h>
+
+using namespace cute;
+
+namespace deep_gemm {
+using cutlass::KernelHardwareInfo;
+
+template <
+  class ProblemShape_,
+  class CollectiveMainloop_,
+  class CollectiveEpilogue_,
+  class TileScheduler_
+>
+class DeepGemmUniversal
+{
+public:
+  //
+  // Type Aliases
+  //
+  using ProblemShape = ProblemShape_;
+
+  static_assert(rank(ProblemShape{}) == 3 or rank(ProblemShape{}) == 4,
+    "ProblemShape{} should be <M,N,K> or <M,N,K,L>");
+
+  // Mainloop derived types
+  using CollectiveMainloop = CollectiveMainloop_;
+  using TileShape = typename CollectiveMainloop::TileShape;
+  using TiledMma  = typename CollectiveMainloop::TiledMma;
+  using ArchTag   = typename CollectiveMainloop::ArchTag;
+  using ElementA  = typename CollectiveMainloop::ElementA;
+  using StrideA   = typename CollectiveMainloop::StrideA;
+  using ElementB  = typename CollectiveMainloop::ElementB;
+  using StrideB   = typename CollectiveMainloop::StrideB;
+  using ElementScale  = typename CollectiveMainloop::ElementScale;
+  using DispatchPolicy = typename CollectiveMainloop::DispatchPolicy;
+  using ElementAccumulator = typename CollectiveMainloop::ElementAccumulator;
+  using MainloopArguments = typename CollectiveMainloop::Arguments;
+  using ClusterShape = typename DispatchPolicy::ClusterShape;
+  using MainloopParams = typename CollectiveMainloop::Params;
+
+  // FLUX would deliver in own private PersistentScheduler for gemm+communication kernel
+  // static_assert(cute::is_void_v<TileScheduler_> or cute::is_same_v<TileScheduler_, PersistentScheduler>,
+  //   "SM70 kernel does not support specializing the tile scheduler.");
+  // using TileSchedulerTag = TileScheduler_;
+  // using TileScheduler = typename detail::TileSchedulerSelector<
+  //   TileScheduler_, ArchTag, TileShape,
+  //   cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>::Scheduler;
+  using TileScheduler = TileScheduler_;
+  using TileSchedulerArguments = typename TileScheduler::Arguments;
+  using TileSchedulerParams = typename TileScheduler::Params;
+  using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
+  using KernelHardwareInfo = cutlass::KernelHardwareInfo;
+
+  // Epilogue derived types
+  using CollectiveEpilogue = CollectiveEpilogue_;
+  using ElementC = typename CollectiveEpilogue::ElementC;
+  using StrideC  = typename CollectiveEpilogue::StrideC;
+  using ElementD = typename CollectiveEpilogue::ElementD;
+  using StrideD  = typename CollectiveEpilogue::StrideD;
+  using EpilogueArguments = typename CollectiveEpilogue::Arguments;
+  using EpilogueParams = typename CollectiveEpilogue::Params;
+  static_assert(cute::is_same_v<ElementAccumulator, typename CollectiveEpilogue::ElementAccumulator>,
+    "Mainloop and epilogue do not agree on accumulator value type.");
+
+  static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
+  static constexpr uint32_t NumMmaWarpGroups = 1;
+
+  // Kernel level shared memory storage
+  struct SharedStorage {
+    // Mainloop and epilogue don't use smem concurrently since kernel is non-persistent, so we can use a union
+    union SharedTensorStorage {
+      using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
+      using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
+      MainloopSharedStorage mainloop;
+      EpilogueSharedStorage epilogue;
+    } tensors;
+  };
+
+  // MSVC requires the cast to fix a warning-as-error.
+  static constexpr int SharedStorageSize = sizeof(SharedStorage);
+
+  static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
+
+#if SAIL_SYNC_IN_CE
+  // only 256/256 tile enable sync tb in CE
+  static constexpr bool EnableSyncCE = (size<0>(TileShape{}) == 256) && (size<1>(TileShape{}) == 256) && (!cute::is_same_v<cutlass::float4_t, ElementA>) && (!cute::is_same_v<cutlass::float4_t, ElementB>);
+#endif
+
+  // Device side arguments
+  struct Arguments {
+    GemmUniversalMode mode{};
+    ProblemShape problem_shape{};
+    MainloopArguments mainloop{};
+    EpilogueArguments epilogue{};
+    KernelHardwareInfo hw_info{};
+    TileSchedulerArguments scheduler{};
+#if SAIL_SYNC_IN_CE
+    int *ptr_sync_ce = nullptr;
+#endif
+
+#if SAIL_SYNC_IN_CE
+    Arguments(
+      GemmUniversalMode mode_ = GemmUniversalMode{},
+      ProblemShape problem_shape_ = ProblemShape{},
+      MainloopArguments mainloop_ = MainloopArguments{},
+      EpilogueArguments epilogue_ = EpilogueArguments{},
+      KernelHardwareInfo hw_info_ = KernelHardwareInfo{},
+      TileSchedulerArguments scheduler_ = TileSchedulerArguments{})
+    : mode(mode_), problem_shape(problem_shape_), mainloop(mainloop_),
+      epilogue(epilogue_), hw_info(hw_info_), scheduler(scheduler_) {}
+#endif
+  };
+
+  // Kernel entry point API
+  struct Params {
+    GemmUniversalMode mode{};
+    ProblemShape problem_shape{};
+    MainloopParams mainloop{};
+    EpilogueParams epilogue{};
+    KernelHardwareInfo hw_info{};
+    TileSchedulerParams scheduler{};
+    void* workspace{nullptr};
+#if SAIL_SYNC_IN_CE
+    int *ptr_sync_ce = nullptr;
+#endif
+  };
+
+  //
+  // Methods
+  //
+
+  // Convert to underlying arguments. In this case, a simple copy for the aliased type.
+  static
+  Params
+  to_underlying_arguments(Arguments const& args, void* workspace, int* grouped_layout) {
+    (void) workspace;
+    auto problem_shape = args.problem_shape;
+    if constexpr (cutlass::gemm::kernel::detail::Has_SwapAB_v<CollectiveMainloop>) {
+      // swap M/N
+      cute::get<0>(problem_shape) = cute::get<1>(args.problem_shape);
+      cute::get<1>(problem_shape) = cute::get<0>(args.problem_shape);
+    }
+    auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
+
+    // Get SM count if needed, otherwise use user supplied SM count
+    int sm_count = args.hw_info.sm_count;
+    if (sm_count <= 0) {
+      CUTLASS_TRACE_HOST("  WARNING: Arguments do not include a valid SM count.\n"
+          "  For optimal performance, populate the arguments KernelHardwareInfo struct with the SM count.");
+      sm_count = KernelHardwareInfo::query_device_multiprocessor_count(args.hw_info.device_id);
+    }
+
+    CUTLASS_TRACE_HOST("to_underlying_arguments(): Setting persistent grid SM count to " << sm_count);
+    KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
+
+    constexpr uint32_t NumEpilogueSubTiles = 1;
+    uint8_t* workspace_ptr = reinterpret_cast<uint8_t*>(workspace);
+    void* scheduler_workspace = workspace_ptr;
+
+    TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(grouped_layout,
+      problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
+    return {
+      args.mode,
+      args.problem_shape,
+      CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, workspace),
+      CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, workspace),
+      hw_info,
+      scheduler
+    };
+  }
+
+  static bool
+  can_implement(Arguments const& args) {
+    return args.mode == GemmUniversalMode::kGemm or
+          (args.mode == GemmUniversalMode::kBatched && rank(ProblemShape{}) == 4);
+  }
+
+  static int
+  get_workspace_size(Arguments const& args) {
+    size_t workspace_size = 0;
+
+    workspace_size += CollectiveEpilogue::get_workspace_size(args.problem_shape, args.epilogue);
+    workspace_size = cutlass::round_nearest(workspace_size,  cutlass::MinWorkspaceAlignment);
+
+    return workspace_size;
+  }
+
+  static
+  cutlass::Status
+  initialize_workspace(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr,
+                       cutlass::CudaHostAdapter* cuda_adapter = nullptr) {
+    cutlass::Status status = cutlass::Status::kSuccess;
+    uint8_t* workspace_ptr = reinterpret_cast<uint8_t*>(workspace);
+    size_t workspace_offset = 0;
+
+    status = CollectiveEpilogue::initialize_workspace(args.problem_shape, args.epilogue, workspace_ptr + workspace_offset, stream, cuda_adapter);
+    workspace_offset += CollectiveEpilogue::get_workspace_size(args.problem_shape, args.epilogue);
+    workspace_offset = cutlass::round_nearest(workspace_offset,  cutlass::MinWorkspaceAlignment);
+    if (status != cutlass::Status::kSuccess) {
+      return status;
+    }
+
+    return status;
+  }
+
+  static dim3
+  get_grid_shape(Params const& params) {
+    return dim3(params.hw_info.sm_count, 1, 1);
+  }
+
+  static dim3
+  get_block_shape() {
+    return dim3(MaxThreadsPerBlock, 1, 1);
+  }
+
+  CUTLASS_DEVICE
+  void
+  operator()(Params const& params, char* smem_buf) {
+    using namespace cute;
+    using X = Underscore;
+
+    TileScheduler deep_scheduler{params.scheduler};
+
+    // Preconditions
+    CUTE_STATIC_ASSERT(is_static<TileShape>::value);
+
+    // Kernel level shared memory storage
+    SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+
+    // Separate out problem shape for convenience
+    // Optionally append 1s until problem shape is rank-4 in case its is only rank-3 (MNK)
+    auto problem_shape_MNKL = append<4>(params.problem_shape, Int<1>{});
+    auto M = get<0>(problem_shape_MNKL);
+    auto N = get<1>(problem_shape_MNKL);
+    auto K = get<2>(problem_shape_MNKL);
+    auto L = get<3>(problem_shape_MNKL);
+
+    // Preconditions
+    static_assert(rank(StrideA{}) == 3, "StrideA must be rank-3: [M, K, L]. If batch mode is not needed, set L stride to Int<0>.");
+    static_assert(rank(StrideB{}) == 3, "StrideB must be rank-3: [N, K, L]. If batch mode is not needed, set L stride to Int<0>.");
+    static_assert(rank(StrideC{}) == 3, "StrideC must be rank-3: [M, N, L]. If batch mode is not needed, set L stride to Int<0>.");
+    static_assert(rank(StrideD{}) == 3, "StrideD must be rank-3: [M, N, L]. If batch mode is not needed, set L stride to Int<0>.");
+
+    // Get the appropriate blocks for this thread block -- potential for thread block locality
+    int thread_idx = int(threadIdx.x);
+    auto blk_shape = TileShape{};                                                                // (BLK_M,BLK_N,BLK_K)
+
+    uint32_t m_block_idx, n_block_idx;
+    #pragma clang loop licm(disable)
+    while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
+      auto m_coord = m_block_idx;
+      auto n_coord = n_block_idx;
+      auto l_coord = 0;
+
+      uint32_t M = deep_scheduler.curr_problem_m();
+
+      auto problem_shape_MNKL = ProblemShape{M, N, K, L};
+
+      auto offset_a = deep_scheduler.curr_offset_a();
+      auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
+      auto offset_scalea = deep_scheduler.curr_offset_mxfp4_scalea();
+      auto offset_scaleb = deep_scheduler.curr_offset_mxfp4_scaleb(m_block_idx);
+      const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
+      const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
+      const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_scalea;
+      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + offset_scaleb;
+
+      auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
+      // update actual global ptr offset
+      MainloopParams update_params = {
+        {M, N, K}, ptr_A, params.mainloop.dA, ptr_B, params.mainloop.dB,
+        ptr_scale_A, params.mainloop.dSFA, ptr_scale_B, params.mainloop.dSFB
+      };
+      CollectiveMainloop collective_mma(update_params, problem_shape_MNKL);
+      auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, update_params);
+
+      // Extract out partitioned A and B.
+      Tensor gA = get<0>(load_inputs);
+      Tensor gB = get<1>(load_inputs);
+
+      // Compute tile residues for predication
+      auto m_max_coord = M - size<0>(gA) * get<0>(blk_coord_mnkl);                             // M - BLK_M * m_coord
+      auto n_max_coord = N - size<0>(gB) * get<1>(blk_coord_mnkl);                             // N - BLK_N * n_coord
+      auto k_residue   = K - size<1>(gA) * size<2>(gA);                                        // K - BLK_K * k_coord_max
+      auto residue_mnk = make_tuple(m_max_coord, n_max_coord, k_residue);
+
+      // Allocate the tiled_mma and the accumulators for the (M,N) blk_shape
+      TiledMma tiled_mma;
+      Tensor accumulators = partition_fragment_C(tiled_mma, take<0,2>(blk_shape)); // (MMA,MMA_M,MMA_N)
+      clear(accumulators);
+
+      auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
+      int  k_tile_count = size<2>(gA);
+
+      // Perform the collective scoped MMA
+      collective_mma(
+        accumulators,
+        load_inputs,
+        accumulators,
+        k_tile_iter, k_tile_count,
+        residue_mnk,
+        thread_idx,
+        smem_buf
+      );
+
+      // Update the pointer to C and D of MXFP4 in the epilogue parameters
+      auto params_epilogue_local = params.epilogue;
+      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
+      params_epilogue_local.ptr_Bias += deep_scheduler.curr_offset_mxfp4_c();
+
+      // Epilogue and write to gD
+      CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
+      epilogue(
+        problem_shape_MNKL,
+        blk_shape,
+        blk_coord_mnkl,
+        accumulators,
+        tiled_mma,
+        residue_mnk,
+        thread_idx,
+        (char*)&shared_storage.tensors.epilogue
+      );
+    }
+  }
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+} // namespace cutlass::gemm::kernel
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace cutlass::gemm::collective {
+using namespace cute;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <
+  class DispatchPolicy_,
+  class TileShape_,
+  class ElementA_,
+  class StrideA_,
+  class ElementB_,
+  class StrideB_,
+  class TiledMma_,
+  class GmemTiledCopyA_,
+  class SmemLayoutAtomA_,
+  class SmemCopyAtomA_,
+  class TransformA_,
+  class GmemTiledCopyB_,
+  class SmemLayoutAtomB_,
+  class SmemCopyAtomB_,
+  class TransformB_,
+  class GmemTiledCopySFA_,
+  class GmemTiledCopySFB_,
+  class SmemTiledCopySFA_,
+  class SmemTiledCopySFB_,
+  class ElementScale_>
+struct CollectiveMmaScaleFp4
+{
+  //
+  // Type Aliases
+  //
+  using DispatchPolicy = DispatchPolicy_;
+  using TileShape = TileShape_;
+  using ElementA = ElementA_;
+  using StrideA = StrideA_;
+  using ElementB = ElementB_;
+  using StrideB = StrideB_;
+  using TiledMma = TiledMma_;
+  using ElementAccumulator = typename TiledMma::ValTypeC;
+  using GmemTiledCopyA = GmemTiledCopyA_;
+  using GmemTiledCopyB = GmemTiledCopyB_;
+  using SmemLayoutAtomA = SmemLayoutAtomA_;
+  using SmemLayoutAtomB = SmemLayoutAtomB_;
+  using SmemCopyAtomA = SmemCopyAtomA_;
+  using SmemCopyAtomB = SmemCopyAtomB_;
+  using TransformA = TransformA_;
+  using TransformB = TransformB_;
+  using GmemTiledCopySFA = GmemTiledCopySFA_;
+  using GmemTiledCopySFB = GmemTiledCopySFB_;
+  using ArchTag = typename DispatchPolicy::ArchTag;
+  using ElementScale = ElementScale_;
+  using ThrLayoutVMNK = TiledMma::ThrLayoutVMNK;
+  static constexpr int warp_on_m = size<1>(ThrLayoutVMNK{});
+  static constexpr int warp_on_n = size<2>(ThrLayoutVMNK{});
+  static constexpr int group_size = 64;   // mma scale is reorgnized with 64 rows in a single row;
+  static constexpr int ElementScaleNumIn16bit = sizeof(ElementScale{}) / 2;    // The number of ElementScale in 16 bit.
+
+  static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
+  static_assert((size<0>(TileShape{}) % size<0>(SmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
+  static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
+
+  static_assert(rank(SmemLayoutAtomB{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
+  static_assert((size<1>(TileShape{}) % size<0>(SmemLayoutAtomB{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
+  static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomB{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
+  static_assert((size<0>(TileShape{}) % group_size) == 0, "TileShape must evenly divide group_size 64.");
+  static_assert((size<1>(TileShape{}) % group_size) == 0, "TileShape must evenly divide group_size 64.");
+
+  using SmemLayoutA = decltype(tile_to_shape(
+      SmemLayoutAtomA{},
+      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+  using SmemLayoutB = decltype(tile_to_shape(
+      SmemLayoutAtomB{},
+      make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+
+  static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
+
+  // declare the BlockScaleShape and SmemLayoutScale in original form.
+  static constexpr int tile_scale_M = size<0>(TileShape{});
+  static constexpr int tile_scale_N = size<1>(TileShape{});
+  static constexpr int tile_scale_K = size<2>(TileShape{}) / 16 / sizeof(ElementScale);
+  using BlockScaleShape = Shape<Int<tile_scale_M>, Int<tile_scale_N>, Int<tile_scale_K>>;
+  using SmemLayoutSFA = decltype(make_layout(make_shape(size<0>(BlockScaleShape{}), size<2>(BlockScaleShape{}), Int<DispatchPolicy::Stages>{}), make_stride(size<2>(BlockScaleShape{}), Int<1>{}, size<0>(BlockScaleShape{}) * size<2>(BlockScaleShape{}))));
+  using SmemLayoutSFB = decltype(make_layout(make_shape(size<1>(BlockScaleShape{}), size<2>(BlockScaleShape{}), Int<DispatchPolicy::Stages>{}), make_stride(size<2>(BlockScaleShape{}), Int<1>{}, size<1>(BlockScaleShape{}) * size<2>(BlockScaleShape{}))));
+
+  // declare scale smem Layout to copy scale from smem to reg.
+  // Layout transform for SmemAScale & SmemBScale
+  static constexpr int group_num_m = size<0>(TileShape{}) / group_size / warp_on_m;
+  static constexpr int group_num_n = size<1>(TileShape{}) / group_size / warp_on_n;
+  static constexpr int K_scale_tile = cute::ceil_div(size<2>(TileShape{}), 16 * 2);
+
+  // all strides are made of row_num * column_len
+  static constexpr int stride0_0 = 16 * K_scale_tile;                       // stride across a warp/mma.
+  static constexpr int stride0_1_m = warp_on_m * group_size * K_scale_tile;   // stride across all mma.
+  static constexpr int stride0_1_n = warp_on_n * group_size * K_scale_tile;   // stride across all mma.
+  static constexpr int stride1_0 = 8 * K_scale_tile;                        // stride across inner mma(8 rows).
+  static constexpr int stride1_1_m = warp_on_m * 16 * K_scale_tile;           // stride across inter mma(warp_on_m * 16 rows)
+  static constexpr int stride1_1_n = warp_on_n * 16 * K_scale_tile;           // stride across inter mma(warp_on_n * 16 rows)
+  static constexpr int stride1_2 = K_scale_tile;                            // stride across 1 row in a mma.
+  // last stride_1_3 is _1 means traverse the K Scale.
+  static constexpr int stride_stage_m = size<0>(BlockScaleShape{}) * size<2>(BlockScaleShape{}) * ElementScaleNumIn16bit;
+  static constexpr int stride_stage_n = size<1>(BlockScaleShape{}) * size<2>(BlockScaleShape{}) * ElementScaleNumIn16bit;
+
+  using sSFATransShape = decltype(make_shape(make_shape(Int<warp_on_m>{}, Int<group_num_m>{}), make_shape(Int<2>{}, Int<4>{}, Int<8>{}, Int<K_scale_tile>{}), Int<DispatchPolicy::Stages>{}));
+  using sSFATransStride = decltype(make_stride(make_stride(Int<stride0_0>{}, Int<stride0_1_m>{}), make_stride(Int<stride1_0>{}, Int<stride1_1_m>{}, Int<stride1_2>{}, Int<1>{}), Int<stride_stage_m>{}));
+  using sSFATransLayout = decltype(make_layout(sSFATransShape{}, sSFATransStride{}));
+
+  using sSFBTransShape = decltype(make_shape(make_shape(Int<warp_on_n>{}, Int<group_num_n>{}), make_shape(Int<2>{}, Int<4>{}, Int<8>{}, Int<K_scale_tile>{}), Int<DispatchPolicy::Stages>{}));
+  using sSFBTransStride = decltype(make_stride(make_stride(Int<stride0_0>{}, Int<stride0_1_n>{}), make_stride(Int<stride1_0>{}, Int<stride1_1_n>{}, Int<stride1_2>{}, Int<1>{}), Int<stride_stage_n>{}));
+  using sSFBTransLayout = decltype(make_layout(sSFBTransShape{}, sSFBTransStride{}));
+
+  using SmemTiledCopySFA = SmemTiledCopySFA_;
+  using SmemTiledCopySFB = SmemTiledCopySFB_;
+
+  struct SharedStorage
+  {
+    cute::array_aligned<ElementA, cute::cosize_v<SmemLayoutA>> smem_a;
+    cute::array_aligned<ElementB, cute::cosize_v<SmemLayoutB>> smem_b;
+    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFA>> smem_SFA;
+    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFB>> smem_SFB;
+  };
+
+  // Host side kernel arguments
+  struct Arguments {
+    Shape<int,int,int> problem_shape;
+    ElementA const* ptr_A;
+    StrideA dA;
+    ElementB const* ptr_B;
+    StrideB dB;
+    ElementScale const* ptr_scale_A;
+    StrideA dSFA;
+    ElementScale const* ptr_scale_B;
+    StrideB dSFB;
+  };
+
+  // Device side kernel params
+  using Params = Arguments;
+  // store params to const scale tensor in mainloop
+  // avoid modify kernel file for fp4
+  Params params_;
+
+  // sm90 realization put TMA_A into params directly
+  // put gmem_tiled_copy here and copy desc in kernel to simplify rtc usage
+  GmemTiledCopyA gmem_tiled_copy_A;
+  GmemTiledCopyB gmem_tiled_copy_B;
+  GmemTiledCopySFA gmem_tiled_copy_SFA;
+  GmemTiledCopySFB gmem_tiled_copy_SFB;
+
+  //
+  // Methods
+  //
+
+  template <class ProblemShape>
+  CUTLASS_DEVICE
+  CollectiveMmaScaleFp4(Params params, ProblemShape problem_shape_MNK, int batch_idx = 0) {
+    params_ = params;
+
+    auto M = get<0>(problem_shape_MNK);
+    auto N = get<1>(problem_shape_MNK);
+    auto K = get<2>(problem_shape_MNK);
+
+    using TilerA = typename GmemTiledCopyA::Tiler_MN;
+    using TilerB = typename GmemTiledCopyB::Tiler_MN;
+
+    gmem_tiled_copy_A.desc_.init<ElementA, false, get<0>(TilerA{}), get<1>(TilerA{})>(nullptr, M, K, params.dA);
+    gmem_tiled_copy_B.desc_.init<ElementB, false, get<0>(TilerB{}), get<1>(TilerB{})>(nullptr, N, K, params.dB);
+
+    // update desc.ptr to current batch, use y_offset as batch will cause smaller bit wide
+    gmem_tiled_copy_A.desc_.gmem_ptr += batch_idx * get<2>(params.dA) * sizeof(ElementA);
+    gmem_tiled_copy_B.desc_.gmem_ptr += batch_idx * get<2>(params.dB) * sizeof(ElementB);
+  };
+
+  template <class ProblemShape_MNKL, class BlockCoord_MNKL>
+  CUTLASS_DEVICE auto
+  load_init(ProblemShape_MNKL const& problem_shape_MNKL, BlockCoord_MNKL const& blk_coord_mnkl, Params const& params) {
+    using X = Underscore;
+
+    auto [M,N,K,L] = problem_shape_MNKL;
+    auto [m_coord, n_coord, _, l_coord] = blk_coord_mnkl;
+
+    // problem.k has divided 2 since regard input as int8, scale.k is K/16 but not K/32
+    // /4 because regard meta as uint32
+    // Scales are K-Major, so enlarge M/N shape means padding 0;
+    int rectify_M = (M + size<0>(TileShape{}) - 1) / size<0>(TileShape{}) * size<0>(TileShape{});
+    int rectify_N = (N + size<1>(TileShape{}) - 1) / size<1>(TileShape{}) * size<1>(TileShape{});
+
+    // Reconstruct meta_a/b (scale) with the layout.
+    // K is regarded as int8. becaus fp mma is 16x16x64, two b-bit scales are combined together(16bit).
+    int K_scale = ceil_div(ceil_div(cute::ceil_div(K, 16 * 2), ElementScaleNumIn16bit), 2) * 2;
+
+    // load init A
+    Tensor mA_mkl = make_tensor(make_gmem_ptr(params.ptr_A), make_shape(M,K,L), params.dA);   // (m,k,l)
+    Tensor mA_mk = make_mix_tensor_like(mA_mkl(_,_,l_coord));                                 // (m,k)
+    Tensor gA = local_tile(mA_mk, TileShape{}, take<0,3>(blk_coord_mnkl), Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
+
+    // load init B
+    Tensor mB_nkl = make_tensor(make_gmem_ptr(params.ptr_B), make_shape(N,K,L), params.dB);   //(n,k,l)
+    Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,l_coord));                                 // (n,k)
+    Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
+
+    // load init scale A/B
+    Tensor mSFA_mk = make_tensor(make_gmem_ptr(params.ptr_scale_A), make_shape(rectify_M, K_scale), make_stride(K_scale, 1));
+    Tensor gSFA = local_tile(mSFA_mk, select<0, 2>(BlockScaleShape{}), make_coord(m_coord, _)); // (BLK_M,BLK_K,k)
+    Tensor iSFA_mk = make_identity_tensor(make_shape(rectify_M, K_scale));
+    Tensor cSFA = local_tile(iSFA_mk, select<0, 2>(BlockScaleShape{}), make_coord(m_coord, _));
+
+    Tensor mSFB_nk = make_tensor(make_gmem_ptr(params.ptr_scale_B), make_shape(rectify_N, K_scale), make_stride(K_scale, 1));
+    Tensor gSFB = local_tile(mSFB_nk, select<1, 2>(BlockScaleShape{}), make_coord(n_coord, _)); // (BLK_N,BLK_K,k)
+    Tensor iSFB_nk = make_identity_tensor(make_shape(rectify_N, K_scale));
+    Tensor cSFB = local_tile(iSFB_nk, select<1, 2>(BlockScaleShape{}), make_coord(n_coord, _));
+
+    return cute::make_tuple(gA, gB, cute::make_tuple(gSFA, cSFA), cute::make_tuple(gSFB, cSFB));
+  }
+
+  template <class ProblemShape>
+  static constexpr Params
+  to_underlying_arguments(ProblemShape const& _, Arguments const& args, void* workspace) {
+    (void) workspace;
+    return args;
+  }
+
+  /// Perform a collective-scoped matrix multiply-accumulate
+  template <
+    class... Ts,
+    class FrgTensorD,
+    class FrgTensorC,
+    class KTileIterator,
+    class ResidueMNK
+  >
+  CUTLASS_DEVICE void
+  operator() (
+      FrgTensorD &accum,
+      cute::tuple<Ts...> const& load_inputs,
+      FrgTensorC const &src_accum,
+      KTileIterator k_tile_iter, int k_tile_count,
+      ResidueMNK residue_mnk,
+      int thread_idx,
+      char *smem_buf)
+  {
+    using namespace cute;
+
+    static_assert(is_rmem<FrgTensorD>::value, "D tensor must be rmem resident.");
+    static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
+    static_assert(rank(SmemLayoutA{}) == 3,
+      "MainloopSm80CpAsync must have a pipeline mode in the smem layout.");
+    static_assert(rank(SmemLayoutB{}) == 3,
+      "MainloopSm80CpAsync must have a pipeline mode in the smem layout.");
+
+    int warp_idx = canonical_warp_idx_sync();
+    int lane_idx = threadIdx.x % 32;
+    int lane_predicate = cute::elect_one_sync();
+
+    int warp_m_idx = warp_idx % warp_on_m;
+    int warp_n_idx = warp_idx / warp_on_m;
+
+    auto M = get<0>(params_.problem_shape);
+    auto N = get<1>(params_.problem_shape);
+
+    Tensor gA = get<0>(load_inputs);
+    Tensor gB = get<1>(load_inputs);
+
+    // Construct shared memory tiles
+    SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+    Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
+    Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
+
+    CUTE_STATIC_ASSERT_V(size<0>(gA) == size<0>(sA));                          // BLK_M
+    CUTE_STATIC_ASSERT_V(size<1>(gA) == size<1>(sA));                          // BLK_K
+    CUTE_STATIC_ASSERT_V(size<0>(gB) == size<0>(sB));                          // BLK_N
+    CUTE_STATIC_ASSERT_V(size<1>(gB) == size<1>(sB));                          // BLK_K
+    CUTE_STATIC_ASSERT_V(size<1>(sA) == size<1>(sB));                          // BLK_K
+    CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sA));        // PIPE
+    CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sB));        // PIPE
+
+    // Partition the copying of A and B tiles across the threads
+    auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx);
+    auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
+
+    Tensor tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
+    Tensor tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
+    Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
+    Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
+
+    Tensor gSFA = get<2, 0>(load_inputs);
+    Tensor gSFB = get<3, 0>(load_inputs);
+    Tensor cSFA = get<2, 1>(load_inputs);
+    Tensor cSFB = get<3, 1>(load_inputs);
+
+    Tensor sSFA = make_tensor(make_smem_ptr(storage.smem_SFA.data()), SmemLayoutSFA{});
+    Tensor sSFB = make_tensor(make_smem_ptr(storage.smem_SFB.data()), SmemLayoutSFB{});
+
+    auto gmem_thr_copy_SFA = gmem_tiled_copy_SFA.get_thread_slice(thread_idx);
+    auto gmem_thr_copy_SFB = gmem_tiled_copy_SFB.get_thread_slice(thread_idx);
+
+    Tensor tSFAgSFA = gmem_thr_copy_SFA.partition_S(gSFA);
+    Tensor tSFAsSFA = gmem_thr_copy_SFA.partition_D(sSFA);
+    Tensor tSFAcSFA = gmem_thr_copy_SFA.partition_S(cSFA);
+
+    Tensor tSFBgSFB = gmem_thr_copy_SFB.partition_S(gSFB);
+    Tensor tSFBsSFB = gmem_thr_copy_SFB.partition_D(sSFB);
+    Tensor tSFBcSFB = gmem_thr_copy_SFB.partition_S(cSFB);
+
+    Tensor tSFApSFA = make_tensor<bool>(shape(tSFAsSFA));
+    Tensor tSFBpSFB = make_tensor<bool>(shape(tSFBsSFB));
+    for (int i = 0; i < size(tSFApSFA); ++i) {
+      tSFApSFA(i) = get<0>(tSFAcSFA(i)) < M;
+    }
+    for (int i = 0; i < size(tSFBpSFB); ++i) {
+      tSFBpSFB(i) = get<0>(tSFBcSFB(i)) < N;
+    }
+
+    // copy scale from smem to reg with the converted scale.
+    Tensor sSFAUint16 = recast<uint16_t>(sSFA);
+    Tensor sSFBUint16 = recast<uint16_t>(sSFB);
+
+    Tensor sSFATrans = make_tensor(sSFAUint16.data(), sSFATransLayout{});
+    Tensor sSFBTrans = make_tensor(sSFBUint16.data(), sSFBTransLayout{});
+
+    // smem layout for scale A/B
+    SmemTiledCopySFA smem_tiled_copy_SFA;
+    auto smem_thr_copy_SFA = smem_tiled_copy_SFA.get_slice(warp_m_idx * 32 + lane_idx);
+    Tensor tCsSFA = smem_thr_copy_SFA.partition_S(sSFATrans);
+    // Scale vreg for one stage
+    Tensor tCrSFA_stage = smem_thr_copy_SFA.partition_D(sSFATrans(_, _, Int<0>{}));
+    using SFARegType = decltype(make_fragment_like(tCrSFA_stage));
+    SFARegType tCrSFA;
+
+    SmemTiledCopySFB smem_tiled_copy_SFB;
+    auto smem_thr_copy_SFB = smem_tiled_copy_SFB.get_slice(warp_n_idx * 32 + lane_idx);
+    Tensor tCsSFB = smem_thr_copy_SFB.partition_S(sSFBTrans);
+    // Scale vreg for one stage
+    Tensor tCrSFB_stage = smem_thr_copy_SFB.partition_D(sSFBTrans(_, _, Int<0>{}));
+    using SFBRegType = decltype(make_fragment_like(tCrSFB_stage));
+    SFBRegType tCrSFB;
+
+    Tensor tCrSFAUint32 = recast<uint32_t>(tCrSFA);
+    Tensor tCrSFBUint32 = recast<uint32_t>(tCrSFB);
+
+    // Start async loads for all pipes but the last
+    CUTLASS_PRAGMA_UNROLL
+    for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages-1; ++k_pipe) {
+      if (k_tile_count > 0){
+        copy_aiu(
+          gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
+          gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
+          warp_idx
+        );
+        copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,*k_tile_iter), tSFAsSFA(_,_,_,k_pipe));
+        copy_if(gmem_tiled_copy_SFB, tSFBpSFB, tSFBgSFB(_,_,_,*k_tile_iter), tSFBsSFB(_,_,_,k_pipe));
+      }
+      cp_async_fence();
+      --k_tile_count;
+      if (k_tile_count > 0) { ++k_tile_iter; }
+    }
+
+    //
+    // MMA Atom partitioning
+    //
+
+    // Tile MMA compute thread partitions and allocate accumulators
+    TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
+    Tensor tCrA = thr_mma.partition_fragment_A(sA(_,_,0));                     // (MMA,MMA_M,MMA_K)
+    Tensor tCrB = thr_mma.partition_fragment_B(sB(_,_,0));                     // (MMA,MMA_N,MMA_K)
+
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(src_accum));                 // MMA_M
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(accum));                     // MMA_N
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(src_accum));                 // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                      // MMA_K
+
+    //
+    // Copy Atom retiling
+    //
+
+    // tsm ld swzl needn't distinguish params inner warp
+    // use original smem_tiled_copy to avoid use specific tailed_layout_tv like below, use warp_idx*32 to get scaler layout of current warp
+    auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+    smem_tiled_copy_A.smem_base_ = storage.smem_a.data();
+    auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(warp_idx * 32);
+    Tensor tCsA            = smem_thr_copy_A.partition_S(make_tsm_ld_tensor<SmemLayoutA>());                 // (CPY,CPY_M,CPY_K,PIPE)
+    Tensor tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);                   // (CPY,CPY_M,CPY_K)
+    CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // CPY_M
+    CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCrA_copy_view));            // CPY_K
+
+    auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+    smem_tiled_copy_B.smem_base_ = storage.smem_b.data();
+    auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(warp_idx * 32);
+    Tensor tCsB            = smem_thr_copy_B.partition_S(make_tsm_ld_tensor<SmemLayoutB>());                  // (CPY,CPY_N,CPY_K,PIPE)
+    Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(tCrB);                   // (CPY,CPY_N,CPY_K)
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // CPY_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
+
+    //
+    // PIPELINED MAIN LOOP
+    //
+
+    // Current pipe index in smem to read from
+    int smem_pipe_read  = 0;
+    // Current pipe index in smem to write to
+    int smem_pipe_write = DispatchPolicy::Stages-1;
+
+    Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
+    Tensor tCsB_p = tCsB(_,_,_,smem_pipe_read);
+    Tensor tCsSFA_p = tCsSFA(_,_,_,smem_pipe_read);
+    Tensor tCsSFB_p = tCsSFB(_,_,_,smem_pipe_read);
+
+    // Size of the register pipeline
+    auto K_BLOCK_MAX = size<2>(tCrA);
+
+    // PREFETCH register pipeline
+    if (K_BLOCK_MAX > 1) {
+      // Wait until our first prefetched tile is loaded in
+      cp_async_wait<DispatchPolicy::Stages-2>();
+      __syncthreads();
+
+      // Prefetch the first rmem from the first k-tile
+      copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
+      copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
+      copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,Int<0>{}), tCrSFA(_,_,Int<0>{}));
+      copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,Int<0>{}), tCrSFB(_,_,Int<0>{}));
+    }
+
+    int mainloop_idx = 0;
+    CUTLASS_PRAGMA_NO_UNROLL
+    for ( ; k_tile_count > -(DispatchPolicy::Stages-1); --k_tile_count)
+    {
+      int meta_stage_idx = mainloop_idx % 4;
+      // Pipeline the outer products with a static for loop.
+      //
+      // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
+      for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block)
+      {
+        if (k_block == K_BLOCK_MAX - 1)
+        {
+          // Slice the smem_pipe_read smem
+          tCsA_p = tCsA(_,_,_,smem_pipe_read);
+          tCsB_p = tCsB(_,_,_,smem_pipe_read);
+          tCsSFA_p = tCsSFA(_,_,_,smem_pipe_read);
+          tCsSFB_p = tCsSFB(_,_,_,smem_pipe_read);
+
+          // Commit the smem for smem_pipe_read
+          cp_async_wait<DispatchPolicy::Stages-2>();
+          __syncthreads();
+        }
+
+        // Load A, B shmem->regs for k_block+1
+        auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
+        copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
+        copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
+        copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,k_block_next), tCrSFA(_,_,k_block_next));
+        copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,k_block_next), tCrSFB(_,_,k_block_next));
+
+        // Copy gmem to smem before computing gemm on each k-pipe
+        if constexpr (k_block == 0)
+        {
+          if (k_tile_count > 0){
+            copy_aiu(
+              gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
+              gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
+              warp_idx
+            );
+            copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,*k_tile_iter), tSFAsSFA(_,_,_,smem_pipe_write));
+            copy_if(gmem_tiled_copy_SFB, tSFBpSFB, tSFBgSFB(_,_,_,*k_tile_iter), tSFBsSFB(_,_,_,smem_pipe_write));
+          }
+          cp_async_fence();
+          if (k_tile_count > 0) { ++k_tile_iter; }
+
+          // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
+          smem_pipe_write = smem_pipe_read;
+          ++smem_pipe_read;
+          smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
+        }
+
+        // Transform before compute
+        cute::transform(tCrA(_,_,k_block), TransformA{});
+        cute::transform(tCrB(_,_,k_block), TransformB{});
+
+        // Thread-level register gemm for k_block
+        cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrSFAUint32(_,_,k_block), tCrB(_,_,k_block), tCrSFBUint32(_,_,k_block), src_accum);
+      });
+
+      ++mainloop_idx;
+    }
+
+    // TODO: original cutlass3 miss this sync
+    cp_async_wait<0>();
+    __syncthreads();
+  }
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+} // namespace cutlass::gemm::collective
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace deep_gemm {
+
+template <int32_t ShapeN, int32_t ShapeK,
+          int32_t BlockM, int32_t BlockN, int32_t BlockK,
+          int32_t WarpM, int32_t WarpN,
+          int32_t kNumGroups, int32_t kNumStages, GemmType kGemmType>
+class Fp4Gemm {
+
+public:
+    Fp4Gemm() = default;
+
+    static void run(uint8_t *a_ptr, uint8_t *scale_a, uint8_t *b_ptr, uint8_t *scale_b,
+                    float *c_ptr, float *d_ptr, int shape_m, int *grouped_layout, uint32_t expected_m,
+                    cudaStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
+
+        // A matrix configuration
+        using         ElementA    = cutlass::float4_t;                          // Element type for A matrix operand
+        using         LayoutA     = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
+        constexpr int AlignmentA  = 1;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
+
+        // B matrix configuration
+        using         ElementB    = cutlass::float4_t;                          // Element type for B matrix operand
+        using         LayoutB     = cutlass::layout::ColumnMajor;                   // Layout type for B matrix operand
+        constexpr int AlignmentB  = 1;    // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
+
+        // C matrix configuration
+        using         ElementC    = float;                          // Element type for C and D matrix operands
+        using         LayoutC     = cutlass::layout::RowMajor;                   // Layout type for C and D matrix operands
+        constexpr int AlignmentC  = 1;
+
+        // D matrix configuration
+        using         ElementD    = ElementC;
+        using         LayoutD     = LayoutC;
+        constexpr int AlignmentD  = AlignmentC;
+
+        // Auxiliary matrix configuration
+        using         ElementAux   = ElementC;
+        using         LayoutAux    = LayoutC;
+
+        // Core kernel configurations
+        using ElementAccumulator  = float;                                          // Element type for internal accumulation
+        using ElementCompute      = float;                                          // Element type for epilogue computation
+        using ElementBias         = float;                                          // Element type for bias addition
+        using ElementScalar    = ElementCompute;
+
+        using EpilogueOutputOp = cutlass::epilogue::thread::LinearCombinationBiasElementwise<ElementD, ElementAccumulator, ElementCompute, ElementBias, ElementBias, AlignmentD, cutlass::epilogue::thread::Identity<float>>;
+
+        using WarpOnM = Int<BlockM / WarpM>;
+        using WarpOnN = Int<BlockN / WarpN>;
+        static constexpr int ThreadNum = WarpOnM() * WarpOnN() * 32;
+        static constexpr bool TransA = false;
+        static constexpr bool TransB = false;
+
+        using DispatchPolicy = cutlass::gemm::MainloopWithScaleAcompute10500Aiu<kNumStages>;
+        using GemmOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BlockM>, Int<BlockK>, false>;
+        using GemmOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BlockN>, Int<BlockK>, true>;
+
+        using TransformA = cute::identity;
+        using TransformB = cute::identity;
+
+        using ScaleCopyElement = cute::uint32_t;
+        using ScaleCopyInst = SM80_CP_ASYNC_CACHEGLOBAL<ScaleCopyElement>;
+        // T0/4/8/12 is successive, T1 is next mma for current warp, below other warps
+        using ThrLayoutSFA = decltype(make_layout(make_shape(Int<BlockM>(), Int<ThreadNum / BlockM>()), make_stride(Int<ThreadNum / BlockM>(), _1{})));
+        // each thread read 4 int8 in one atom, use int32 layout to fit with copyOp's register
+        using ValLayoutSFA = decltype(make_layout(make_shape(_1{}, Int<BlockK / 16 / sizeof(ScaleCopyElement) / (ThreadNum / BlockM)>())));
+        using GmemTiledCopySFA = decltype(
+            make_tiled_copy(Copy_Atom<ScaleCopyInst, ScaleCopyElement>{},
+                            ThrLayoutSFA{},
+                            ValLayoutSFA{}));
+
+        using ThrLayoutSFB = decltype(make_layout(make_shape(Int<BlockN>(), Int<ThreadNum / BlockN>()), make_stride(Int<ThreadNum / BlockN>(), _1{})));
+        // each thread read 4 int8 in one atom, use int32 layout to fit with copyOp's register
+        using ValLayoutSFB = decltype(make_layout(make_shape(_1{}, Int<BlockK / 16 / sizeof(ScaleCopyElement) / (ThreadNum / BlockN)>())));
+        using GmemTiledCopySFB = decltype(
+            make_tiled_copy(Copy_Atom<ScaleCopyInst, ScaleCopyElement>{},
+                            ThrLayoutSFB{},
+                            ValLayoutSFB{}));
+
+        // TiledCopy for Scale Smem to Reg
+        using ScaleCopyInstSmem = UniversalCopy<uint16_t>;
+        // T0/4/8/12 is successive, T1 is next mma for current warp, below other warps
+        using ThrLayoutSFASmem = decltype(make_layout(make_shape(WarpOnM(), _32{}), make_stride(_32{}, _1{})));
+        // each thread read 4 int8 in one atom, use int32 layout to fit with copyOp's register
+        using ValLayoutSFASmem = decltype(make_layout(make_shape(_1{}, _2{})));
+        using SmemTiledCopySFA = decltype(
+            make_tiled_copy(Copy_Atom<ScaleCopyInstSmem, uint16_t>{},
+                            ThrLayoutSFASmem{},
+                            ValLayoutSFASmem{}));
+        using ThrLayoutSFBSmem = decltype(make_layout(make_shape(WarpOnN(), _32{}), make_stride(_32{}, _1{})));
+        // each thread read 4 int8 in one atom, use int32 layout to fit with copyOp's register
+        using ValLayoutSFBSmem = decltype(make_layout(make_shape(_1{}, _2{})));
+        using SmemTiledCopySFB = decltype(
+            make_tiled_copy(Copy_Atom<ScaleCopyInstSmem, uint16_t>{},
+                            ThrLayoutSFBSmem{},
+                            ValLayoutSFBSmem{}));
+
+        using MmaInst = Acompute10500_16x16x64_F32F4F4F32_TN;
+
+        using TiledMma = cute::TiledMMA<
+        cute::MMA_Atom<MmaInst>,
+        cute::Layout<Shape<WarpOnM, WarpOnN, _1>>>;
+
+        using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaScaleFp4<
+          DispatchPolicy, Shape<Int<BlockM>, Int<BlockN>, Int<BlockK>>,
+          ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
+          ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
+          TiledMma,
+          typename GemmOperandA::GmemTiledCopy, typename GemmOperandA::SmemLayoutAtom, typename GemmOperandA::SmemCopyAtom, TransformA,
+          typename GemmOperandB::GmemTiledCopy, typename GemmOperandB::SmemLayoutAtom, typename GemmOperandB::SmemCopyAtom, TransformB,
+          GmemTiledCopySFA, GmemTiledCopySFB,
+          SmemTiledCopySFA, SmemTiledCopySFB,
+          ScaleCopyElement
+        >;
+
+        using EpilogueCopyInst = AutoVectorizingCopyWithAssumedAlignment<AlignmentC * sizeof(ElementC) * 8>;
+        using GemmEpilogueConfiguration = cutlass::gemm::config::DefaultGemm_Epilogue_Configuration<EpilogueCopyInst, float, AlignmentC, Int<BlockM>, Int<BlockN>, WarpOnM, ThreadNum>;
+
+        using CollectiveEpilogue = typename cutlass::epilogue::collective::Epilogue<
+          cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
+          cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
+          EpilogueOutputOp,
+          typename GemmEpilogueConfiguration::SmemLayoutO,
+          Copy_Atom<EpilogueCopyInst,float>,
+          typename GemmEpilogueConfiguration::GmemTiledCopyO,
+          Copy_Atom<EpilogueCopyInst,ElementC>
+        >;
+        using TileScheduler = DeepGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN, kNumGroups>;
+        using GemmKernel = typename deep_gemm::DeepGemmUniversal<
+            Shape<int,int,int,int>,
+            CollectiveMainloop,
+            CollectiveEpilogue,
+            TileScheduler,
+        >;
+
+        using StrideA = typename GemmKernel::StrideA;
+        using StrideB = typename GemmKernel::StrideB;
+        using StrideC = typename GemmKernel::StrideC;
+        using StrideD = typename GemmKernel::StrideD;
+        using StrideBias  = Stride<_0,_1,int64_t>;
+
+        StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(shape_m, ShapeK, 1));
+        StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(ShapeN, ShapeK, 1));
+        StrideA stride_meta_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(shape_m, cute::ceil_div(ShapeK, 16), 1));
+        StrideB stride_meta_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(ShapeN, cute::ceil_div(ShapeK, 16), 1));
+        StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(shape_m, 0, 1));
+        StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(shape_m, ShapeN, 1));
+        StrideBias stride_Bias = {};
+
+        int max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
+        cutlass::KernelHardwareInfo hw_info;
+        hw_info.device_id = 0;
+        hw_info.sm_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id) * max_blocks_per_cu;
+
+        typename GemmKernel::Arguments arguments{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {shape_m, ShapeN, ShapeK, 1},
+            {
+              {shape_m, ShapeN, ShapeK},
+              reinterpret_cast<ElementA const*>(a_ptr), stride_A,
+              reinterpret_cast<ElementB const*>(b_ptr), stride_B,
+              reinterpret_cast<uint32_t*>(scale_a), stride_meta_A,
+              reinterpret_cast<uint32_t*>(scale_b), stride_meta_B
+            },
+            {
+              {
+                1.0, 0.0,
+                nullptr, nullptr,
+                c_ptr, stride_Bias,
+              }, // epilogue.thread
+              nullptr, stride_C,
+              d_ptr, stride_D,
+            },
+            hw_info,
+        };
+
+        size_t workspace_size = GemmKernel::get_workspace_size(arguments);
+        cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+        typename GemmKernel::Params params = GemmKernel::to_underlying_arguments(arguments, workspace.get(), grouped_layout);
+        dim3 const block = GemmKernel::get_block_shape();
+        dim3 const grid = GemmKernel::get_grid_shape(params);
+        int sharemem_size = GemmKernel::SharedStorageSize;
+
+        int max_active_tb_num = 8;
+        const int threadblock_count = num_sms < 20 ? num_sms : num_sms * max_active_tb_num;
+        char *pEnv_params = std::getenv("show_log");
+        if (pEnv_params && isdigit(*pEnv_params)) {
+            cudaFuncAttributes attr;
+            cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
+
+            printf("[GemmGrouped-FP4:]\n");
+            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s\n",
+                kNumGroups, shape_m, ShapeN, ShapeK, expected_m, GemmTypeS[static_cast<int>(kGemmType)]);
+
+            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
+                BlockM, BlockN, BlockK, WarpM, WarpN, BlockK, kNumStages);
+
+            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
+
+            printf("smem_size:%d, vreg:%d, stack:%d\n", sharemem_size, int(attr.numRegs), int(attr.localSizeBytes));
+        }
+
+        DgProfParam dg_prof_params;
+        if (ProfilingInterface::Instance().get_op_info()){
+            dg_prof_params.set_params(
+                kGemmType, false, std::string("fp4"), kNumGroups, shape_m, ShapeN, ShapeK, expected_m,
+                grouped_layout, stream
+            );
+        }
+
+        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+        cutlass::device_kernel<GemmKernel><<<grid, block, sharemem_size, stream>>>(params);
+        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    }
+  };
+
+};  // namespace deep_gemm
