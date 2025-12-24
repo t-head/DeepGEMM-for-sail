@@ -297,7 +297,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         best_num_occ = 1
         for block_m in block_ms:
             # NOTES: the block sizes can not be too large, so at least one dim less than 128
-            for block_n in filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32)), block_ns):
+            for block_n in filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32) and not (block_m == 16 and bn <= 32)), block_ns):
                 success = False
                 num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(best_block_m, best_block_n)
                 num_utils = get_block_utils(m, block_m) * get_block_utils(n, block_n)

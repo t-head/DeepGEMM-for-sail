@@ -312,10 +312,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         # for PPU1.0: the block sizes can not be too large, so at least one dim less than 128
         # for PPU1.5: the tile 256x256 is good for many compute bound case
         if is_ppu1v5_device() and ((m >= 128 and k > 2048) or m >= 256):
-            block_ns_after_filter = filter(lambda bn: (bn != n and n >= 32), block_ns)
+            block_ns_after_filter = filter(lambda bn: (bn != n and n >= 32) and not (block_m == 16 and bn <= 32), block_ns)
         else:
             block_ns_after_filter = \
-                filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32) and not (block_m == 16 and bn == 32)), block_ns)
+                filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32) and not (block_m == 16 and bn <= 32)), block_ns)
         for block_n in block_ns_after_filter:
             success = False
             num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(best_block_m, best_block_n)
