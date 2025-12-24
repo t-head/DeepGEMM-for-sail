@@ -353,7 +353,8 @@ def get_gemm_best_configs_v2(shape, dtype, num_sms):
 
 def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
                          rhs: Tuple[torch.Tensor],
-                         out: torch.Tensor) -> None:
+                         out: torch.Tensor,
+                         configs = None) -> None:
     m, k = lhs.shape
     n, k_ = rhs.shape
     m_, n_ = out.shape
@@ -377,7 +378,9 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
     num_sms = get_num_sms()
     shape = [m, n, k]
     device_props = torch.cuda.get_device_properties(device='cuda')
-    if all(a >= 4096 and a % 64 == 0 for a in shape)\
+    if configs is  not None:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+    elif all(a >= 4096 and a % 64 == 0 for a in shape)\
        and ("ZW810E" in device_props.name or "ZW810" in device_props.name):
        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_gemm_best_configs_v2(shape, 2, num_sms)
     else:

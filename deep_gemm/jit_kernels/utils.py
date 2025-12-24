@@ -200,7 +200,7 @@ def get_search_space(d: torch.dtype, gemm_type : str, m:int=0, n:int=0, k:int=0)
     Returns:
         The tile list:{block_m, block_n, warp_m, warp_n, stage}
     """
-    assert gemm_type in ('nopad', 'masked', 'dense')
+    assert gemm_type in ('nopad', 'masked', 'dense','contiguous')
 
     block_k = 64 if d == torch.bfloat16 else 128
     tile_list = [

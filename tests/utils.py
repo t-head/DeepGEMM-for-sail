@@ -268,7 +268,7 @@ def find_next_power_of_2(m_list):
     bit = (int(max_val) - 1).bit_length()
     return 1 << bit
 
-def construct_group_m_list(distribution, num_groups, m, is_mask=False, seed=0, em=0):
+def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=False, seed=0, em=0):
     group_m_list = list()
     if is_mask and em != 0:
         expected_m_per_group = em
@@ -815,7 +815,7 @@ def test_gemm(args) -> None:
         print("Passed with acc_check\n")
     else:
         print("Passed without acc_check\n")
-    
+
     if get_benchmark():
         # noinspection PyShadowingNames
         def test_func():
@@ -873,7 +873,7 @@ def test_m_grouped_gemm_contiguous(args) -> None:
         print("Passed with acc_check\n")
     else:
         print("Passed without acc_check\n")
-    
+
     if get_benchmark():
         # noinspection PyShadowingNames
         def test_func():
@@ -1030,7 +1030,7 @@ def test_m_grouped_gemm_nopad(args) -> None:
         print(f' > Perf ((contiguous dtype={str(d)}, {num_groups=:2}, {ceil_div(m, num_groups)=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
         f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
         f'{(valid_m * k + num_groups * k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
-    
+
     return
 
 

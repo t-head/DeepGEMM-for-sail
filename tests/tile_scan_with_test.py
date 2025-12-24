@@ -40,7 +40,7 @@ def test_func_dense(cycle, tid, m, n, k, d, tile_list, x, y, out, ref_out):
             deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out, tile_config)
         else:
             deep_gemm.gemm_int8_int8_bf16_nt(x, y, out, tile_config)
-        if not cycle:
+        if not cycle and not os.environ.get('HGGC_WARM_UP', False):
             diff = calc_diff(out, ref_out)
             if diff >= 0.001:
                 print("ref_out:", ref_out)
@@ -80,7 +80,7 @@ def test_gemm(d: torch.dtype, args = None) -> None:
     else:
         test_func_dense(cycle, 0, m, n, k, d, tile_list, x, y, out, ref_out)
 
-def test_func_contiguous(cycle, tid, m, n, k, d, tile_list, x, y, out, ref_out):
+def test_func_contiguous(cycle, tid, m, n, k, d, tile_list, x, y, out, m_indices, distribute, ref_out):
     print("tid = ", tid, ' tile_list = ', tile_list)
     for tile_config in tile_list:
         print("scan_tile = ", tile_config)
@@ -92,7 +92,7 @@ def test_func_contiguous(cycle, tid, m, n, k, d, tile_list, x, y, out, ref_out):
         else:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices, tile_config)
 
-        if not cycle:
+        if not cycle and not os.environ.get('HGGC_WARM_UP', False):
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
             diff = calc_diff(out, ref_out)
             if diff >= 0.001:
@@ -121,7 +121,7 @@ def test_m_grouped_gemm_contiguous(d: torch.dtype, args=None) -> None:
         print("tile_group = ", tile_group)
         mp.set_start_method('spawn', force=True)
         for tid in range(thread_count):
-            p = mp.Process(target=test_func_contiguous, args=(cycle, tid, m, n, k, d, [tile_list[x] for x in tile_group[tid]], x, y, out, m_indices, distribute, ref_out))
+            p = mp.Process(target=test_func_contiguous, args=(cycle, tid, m, n, k, d, [tile_list[x] for x in tile_group[tid]], x, y, out, m_indices, distribution, ref_out))
             p.start()
             processes.append(p)
 
@@ -129,7 +129,7 @@ def test_m_grouped_gemm_contiguous(d: torch.dtype, args=None) -> None:
         for p in processes:
             p.join()
     else:
-        test_func_contiguous(cycle, 0, m, n, k, d, tile_list, x, y, out, m_indices, distribute, ref_out)
+        test_func_contiguous(cycle, 0, m, n, k, d, tile_list, x, y, out, m_indices, distribution, ref_out)
     return
 
     print("Passed\n")
@@ -147,7 +147,7 @@ def test_func_masked(cycle, tid, m, n, k, d, tile_list, x, y, out, masked_m, em,
         else:
             deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, em, tile_config)
 
-        if not cycle:
+        if not cycle and not os.environ.get('HGGC_WARM_UP', False):
             for j in range(num_groups):
                 diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
                 if (masked_m[j] != 0):
@@ -166,7 +166,7 @@ def test_m_grouped_gemm_masked(d: torch.dtype, args) -> None:
     else:
         distribute = torch.tensor(distribution, dtype=torch.int32, device='cuda')
 
-    x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, max_m, k, n, d, distribution, expected_m_per_group)
+    x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, max_m, expected_m_per_group, k, n, d, distribution)
 
     tile_list = get_tile_list(d, max_m, n, k, num_groups, 'masked', True)
 
@@ -189,7 +189,7 @@ def test_m_grouped_gemm_masked(d: torch.dtype, args) -> None:
         for p in processes:
             p.join()
     else:
-        test_func_masked(cycle, 0, max_m, n, k, d, tile_list, x, y, out, masked_m, expected_m_per_group, num_groups, distribute, ref_out)
+        test_func_masked(cycle, 0, max_m, n, k, d, tile_list, x, y, out, masked_m, expected_m_per_group, num_groups, distribution, ref_out)
     print('Passed\n')
 
 
@@ -206,7 +206,7 @@ def test_func_nopad(cycle, tid, m, n, k, d, tile_list, x, y, out, m_indices, dis
         else:
             deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices, distribute, tile_config)
 
-        if not cycle:
+        if not cycle and not os.environ.get('HGGC_WARM_UP', False):
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
             diff = calc_diff(out, ref_out)
 
@@ -306,6 +306,8 @@ if __name__ == '__main__':
     if (args.cycle):
         cycle = 1
     print("cycle:", cycle)
+    if os.environ.get('HGGC_WARM_UP', False):
+        print(f'WARM UP FOR COMPILING ...')
 
     judge_device_type()
     dg_cases = []

@@ -15,7 +15,7 @@ compile_mode = CompileMode.COMPILE_AND_RUN
 def set_compile_mode(mode):
     global compile_mode
     compile_mode = mode
-    
+
 def get_compile_mode():
     global compile_mode
     return compile_mode
@@ -39,8 +39,8 @@ class Runtime:
         return all(os.path.exists(os.path.join(path, file)) for file in files)
 
     def __call__(self, *args) -> int:
-        if compile_mode == CompileMode.ONLY_COMPILE.value:
-            return 
+        if compile_mode == CompileMode.ONLY_COMPILE.value or os.environ.get('HGGC_WARM_UP', False):
+            return
         # Load SO file
         if self.lib is None or self.args is None:
             self.lib = ctypes.CDLL(os.path.join(self.path, 'kernel.so'))
