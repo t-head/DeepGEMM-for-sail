@@ -2958,7 +2958,7 @@ public:
 
         cutlass::KernelHardwareInfo hw_info;
         hw_info.device_id = 0;
-        hw_info.sm_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id) * max_blocks_per_cu;
+        hw_info.sm_count = num_sms * max_blocks_per_cu;
 
         typename GemmKernel::Arguments arguments{
             cutlass::gemm::GemmUniversalMode::kGemm,
