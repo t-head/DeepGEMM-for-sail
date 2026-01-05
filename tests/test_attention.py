@@ -232,7 +232,7 @@ def test_paged_mqa_logits():
     print('Testing FP8 Paged MQA Logits:')
     max_model_len = 111 * 1000
     debug = False
-    for batch_size, next_n in [(64, 1), (64, 2), (128, 1)]:
+    for batch_size, next_n in [(1, 1), (64, 1), (64, 2), (128, 1)]:
         for heads, index_dim in [(64, 128)]:
             for avg_kv in (8192, 32768):
                 num_blocks, blocksize = max_model_len * 3, 64

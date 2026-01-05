@@ -538,7 +538,11 @@ public:
             // Issue next AIU Q if exit
             uint32_t prev_q_idx = copy_kv_stage_idx == 0 ? params.batch_size : q_idx_array[copy_kv_stage_idx - 1];
             uint32_t curr_q_idx = q_idx_array[copy_kv_stage_idx];
-            bool prefetch_q = (prev_q_idx != curr_q_idx and scheduler.exist_q_idx(curr_q_idx + 1));
+            bool prefetch_q = (prev_q_idx != curr_q_idx and scheduler.exist_q_idx(curr_q_idx));
+            if (enable_print) {
+                printf("Prologue: prefetch_q = %d, prev_q_idx = %d, curr_q_idx = %d, exist_q_idx = %d\n",
+                    prefetch_q, prev_q_idx, curr_q_idx, scheduler.exist_q_idx(curr_q_idx));
+            }
             if (prefetch_q) {
                 auto q_offset = curr_q_idx * BLOCK_N;
                 tBgB.data() = tQgQ.data() + q_offset * kHeadDim;
@@ -591,8 +595,8 @@ public:
             // Current Q changes
             bool prefetch_q = (prev_q_idx != curr_q_idx and scheduler.exist_q_idx(curr_q_idx));
             if (enable_print && prev_q_idx != curr_q_idx) {
-                printf("Mainloop: new q to load, prev_q_idx = %d, curr_q_idx = %d, exist_q_q = %d\n",
-                    prev_q_idx, curr_q_idx, scheduler.exist_q_idx(curr_q_idx + 1));
+                printf("Mainloop: new q to load, prev_q_idx = %d, curr_q_idx = %d, exist_q_idx = %d\n",
+                    prev_q_idx, curr_q_idx, scheduler.exist_q_idx(curr_q_idx));
             }
             if (prefetch_q) {
                 // Issue next AIU Q
