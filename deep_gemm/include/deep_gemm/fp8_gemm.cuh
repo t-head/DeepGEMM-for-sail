@@ -560,10 +560,9 @@ public:
         // std::cout << "grid = " << grid << std::endl;
         // std::cout << "smem_size_kernel = " << sharemem_size << std::endl;
 
-        // TODO: query max_active_tb_num
-        int max_active_tb_num = 8; //GemmGrouped::maximum_active_blocks();
+        int max_active_tb_num = max_blocks_per_cu;
+        const int threadblock_count = num_sms * max_active_tb_num;
 
-        const int threadblock_count = num_sms < 20 ? num_sms : num_sms * max_active_tb_num;
         char *pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
             cudaFuncAttributes attr;
