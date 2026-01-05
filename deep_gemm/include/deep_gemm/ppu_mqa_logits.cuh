@@ -475,6 +475,7 @@ public:
         uint32_t current_stage_kv = 0;
         if (num_kv_blocks > 0) {
             // Issue AIU Q
+            gmem_tiled_copy_B.desc_.dim_h = (params.seq_len_q - block_q_idx * BLOCK_Q) * kNumHeads;
             copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,0), tBsB(_,_,_,0), warp_idx);
             if (warp_idx < WAPR_LIMIT_SFB) {
                 copy_if(gmem_tiled_copy_scaleB, tSFBpSFB(_,_,_,0), tSFBgSFB(_,_,_,0), tSFBsSFB(_,_,_,0));
