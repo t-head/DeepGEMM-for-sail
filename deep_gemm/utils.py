@@ -178,3 +178,22 @@ def get_case_id() -> int:
         get_case_id.case_id = 0
     get_case_id.case_id += 1
     return get_case_id.case_id
+
+def transform_sf_into_required_layout(
+    sf: torch.Tensor,
+    mn: int,
+    k: int,
+    recipe: tuple[int, int, int],
+    num_groups: int | None = None,
+    is_sfa: bool = False,
+    disable_ue8m0_cast: bool = False,
+) -> torch.Tensor:
+    """
+    https://github.com/deepseek-ai/DeepGEMM/blob/c9f8b34dcdacc20aa746b786f983492c51072870/csrc/apis/layout.hpp
+
+    Fake implementation intended to emulate upstream SM90 (FP32, 128, 128) path:
+    no transform, just return `sf` (optionally validating basic expectations).
+    All parameters are accepted to match the original signature.
+    PPU DeepGemm get col-major input and row-major weights.
+    """
+    return sf.contiguous()

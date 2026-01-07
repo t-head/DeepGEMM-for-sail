@@ -27,5 +27,10 @@ from .jit_kernels import (
     bf16_mqa_logits,
     int8_mqa_logits,
 )
-from .utils import bench, bench_kineto, calc_diff
+from .utils import (
+    bench,
+    bench_kineto,
+    calc_diff,
+    transform_sf_into_required_layout,
+)
 from .jit import set_compile_mode, get_compile_mode
