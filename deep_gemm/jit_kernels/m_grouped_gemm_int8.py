@@ -48,11 +48,9 @@ constexpr auto WARP_N = {WARP_N};
 constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
-constexpr auto kEnableMoeDynamitTile = {ENABLE_MOE_DYNAMIC_TILE};
 
 // Make a templated grouped GEMM
-using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE},
-                    kEnableSboOverlap, kEnableMoeDynamitTile>;
+using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelType::{KERNEL_TYPE}>;
 
 // Launch kernel
 gemm_t::run(out, grouped_layout, block_m_info,
@@ -133,6 +131,9 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices, m_indices, m, expected_m,
             torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
+
+    ## Default, MultistageOnN, OverlapPrologue, OverlapMainloop
+    kernel_type = 'Default'
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_int8_int8_bf16_nt',
         keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
@@ -141,8 +142,8 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'ENABLE_SBO_OVERLAP': False,
-              'ENABLE_MOE_DYNAMIC_TILE': enable_moe_dynamic_tile,
-              'GEMM_TYPE': 'GroupedContiguous'},
+              'GEMM_TYPE': 'GroupedContiguous',
+              'KERNEL_TYPE': kernel_type},
         space=(),
         includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
         arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
@@ -212,6 +213,9 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
 
     extra_info = get_extra_info()
 
+    ## Default, MultistageOnN, MoeDynamicTile, OverlapPrologue, OverlapMainloop
+    kernel_type = 'Default'
+
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
     enable_moe_dynamic_tile = extra_info['use_moe_dynamic_tile']
@@ -228,11 +232,13 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
     if enable_moe_dynamic_tile:
         # fix the block config to avoid unecessary jit compile
         block_m, block_n, block_k, warp_m, warp_n, num_stages = (128, 128, 128, 64, 64, 3)
+        kernel_type = 'MoeDynamicTile'
 
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             masked_m, masked_m, m, expected_m,
             torch.cuda.current_stream(), num_sms, smem_config[0], signal)
+
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_' + ElementAB + '_nt',
         keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
@@ -240,8 +246,8 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'ENABLE_SBO_OVERLAP': enable_sbo_overlap,
-              'ENABLE_MOE_DYNAMIC_TILE': enable_moe_dynamic_tile,
-              'GEMM_TYPE': 'GroupedMasked'},
+              'GEMM_TYPE': 'GroupedMasked',
+              'KERNEL_TYPE': kernel_type},
         space=(),
         includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
         arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
@@ -348,12 +354,16 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
 
         extra_info = get_extra_info()
 
+        ## Default, MultistageOnN, MoeDynamicTile, OverlapPrologue, OverlapMainloop
+        kernel_type = 'Default'
+
         ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
         ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
         enable_moe_dynamic_tile = extra_info['use_moe_dynamic_tile']
         if enable_moe_dynamic_tile:
             # fix the block config to avoid unecessary jit compile
             block_m, block_n, block_k, warp_m, warp_n, num_stages = (128, 128, 128, 64, 64, 3)
+            kernel_type = 'MoeDynamicTile'
 
         if m_rows is None:
             counts = torch.bincount(m_indices)
@@ -379,8 +389,9 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
                   'WARP_M': warp_m, 'WARP_N': warp_n,
                   'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
                   'ENABLE_SBO_OVERLAP': False,
-                  'ENABLE_MOE_DYNAMIC_TILE': enable_moe_dynamic_tile,
-                  'GEMM_TYPE': 'GroupedNoPad'},
+                  'GEMM_TYPE': 'GroupedNoPad',
+                  'KERNEL_TYPE': kernel_type
+                  },
             space=(),
             includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
             arg_defs=(  ('lhs', lhs.dtype), ('lhs_scales', torch.float),

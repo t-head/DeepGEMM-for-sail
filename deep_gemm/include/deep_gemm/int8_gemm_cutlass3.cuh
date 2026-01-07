@@ -38,8 +38,18 @@ struct KernelAiuMultistageOnN {
   constexpr static int N_EXPAND = 4;
 };
 
+struct KernelAiuMultistageOverlapPrologue {};
+
 template<int Stages_, typename Schedule_ = KernelAiuMultistage>
 struct MainloopAcomputeAiuA8W8 {
+  constexpr static int Stages = Stages_;
+  using ArchTag = arch::Sm80;
+  using Schedule = Schedule_;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapPrologue>
+struct MainloopAcomputeAiuA8W8OverlapPrologue {
   constexpr static int Stages = Stages_;
   using ArchTag = arch::Sm80;
   using Schedule = Schedule_;
@@ -1526,6 +1536,8 @@ public:
 
 } // namespace cutlass::gemm::kernel
 
+#include "int8_gemm_cutlass3_overlap_prologue.cuh"
+
 namespace deep_gemm {
 
 template <typename ElementAB, typename ElementAcc,
@@ -1535,8 +1547,7 @@ template <typename ElementAB, typename ElementAcc,
           uint32_t kNumGroups, uint32_t kNumStages,
           GemmType kGemmType,
           bool kEnableSboOverlap = false,
-          bool kEnableMoeDynamicTile = false,
-          bool EnableMultistageOnN_ = false>
+          KernelType kKernelType = KernelType::Default>
 class Gemm {
 
 public:
@@ -1566,7 +1577,7 @@ public:
         cudaFuncAttributes attr;
         int DynamicTildId = 0;
 
-        if constexpr (kEnableMoeDynamicTile) {
+        if constexpr (kKernelType == KernelType::MoeDynamicTile) {
           auto launch_dynamic_tile_kernel = [&](auto gemm_kernel_) {
             using GemmKernel = decltype(gemm_kernel_);
             using TileScheduler = typename GemmKernel::TileScheduler;
@@ -1645,23 +1656,34 @@ public:
               Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
               Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _32>>;       // 1x1x1 value group
 
-          constexpr int EnableMultistageOnN = EnableMultistageOnN_
+          constexpr int EnableMultistageOnN = kKernelType == KernelType::MultistageOnN
                                               && (SHAPE_N % (BLOCK_N) == 0)
                                               && (SHAPE_K > (BLOCK_K * kNumStages));
           static constexpr int N_EXPAND = EnableMultistageOnN ? cutlass::gemm::KernelAiuMultistageOnN::N_EXPAND : 1;
+          constexpr int EnableOverlapPrologue = kKernelType == KernelType::OverlapPrologue;
+                                          // && (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(int8_t) >= WarpOnM * 16 * BLOCK_N * sizeof(int32_t); // to impl
 
-          using KernelSchedule = typename cutlass::platform::conditional<
-              EnableMultistageOnN,
-              cutlass::gemm::KernelAiuMultistageOnN,
-              cutlass::gemm::KernelAiuMultistage
-          >::type;
-          using DispatchPolicy = cutlass::gemm::MainloopAcomputeAiuA8W8<kNumStages, KernelSchedule>;
+          using KernelSchedule = cute::conditional_t<
+              EnableOverlapPrologue,
+              cutlass::gemm::KernelAiuMultistageOverlapPrologue,
+              cute::conditional_t<
+                EnableMultistageOnN,
+                cutlass::gemm::KernelAiuMultistageOnN,
+                cutlass::gemm::KernelAiuMultistage>>;
+
+          using DispatchPolicy = cute::conditional_t<
+              EnableOverlapPrologue,
+              cutlass::gemm::MainloopAcomputeAiuA8W8OverlapPrologue<kNumStages, KernelSchedule>,
+              cutlass::gemm::MainloopAcomputeAiuA8W8<kNumStages, KernelSchedule>>;
+
           static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
           static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
           static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
 
-          using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
-          using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
+          static constexpr int SmemLayoutStageStrideA = EnableOverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
+          static constexpr int SmemLayoutStageStrideB = EnableOverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
+          using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
+          using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
           // A
           using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
           using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
@@ -1778,10 +1800,11 @@ public:
         const int threadblock_count = num_sms * max_blocks_per_cu;
         char *pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
+          static const bool kEnableMoeDynamicTile = kKernelType == KernelType::MoeDynamicTile;
           printf("[GemmGrouped-A8W8:]\n");
-          printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d, kEnableMoeDynamicTile:%d\n",
+          printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d, kernel_type:%s\n",
               kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)],
-              kIsNoPadPreprocessLayout, kEnableMoeDynamicTile);
+              kIsNoPadPreprocessLayout, KernelTypeS[static_cast<int>(kKernelType)]);
           if constexpr (!kEnableMoeDynamicTile) {
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                 BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);

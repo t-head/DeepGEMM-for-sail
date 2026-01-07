@@ -13,11 +13,12 @@ const char* GemmTypeS[] = { "DenseGemm", "GroupedContiguous", "GroupedMasked", "
 enum class KernelType {
     Default,
     MultistageOnN,
+    MoeDynamicTile,
     OverlapPrologue,
     OverlapMainloop
 };
 
-const char* KernelTypeS[] = { "Default", "MultistageOnN", "OverlapPrologue", "OverlapMainloop"};
+const char* KernelTypeS[] = { "Default", "MultistageOnN", "MoeDynamicTile", "OverlapPrologue", "OverlapMainloop"};
 
 template <typename T>
 __device__ __host__ constexpr inline T ceil_div(T a, T b) {
