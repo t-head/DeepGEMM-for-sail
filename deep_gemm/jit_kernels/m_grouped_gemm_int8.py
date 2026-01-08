@@ -48,9 +48,11 @@ constexpr auto WARP_N = {WARP_N};
 constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
+constexpr auto kEnableMoeDynamitTile = {ENABLE_MOE_DYNAMIC_TILE};
 
 // Make a templated grouped GEMM
-using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap>;
+using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE},
+                    kEnableSboOverlap, kEnableMoeDynamitTile>;
 
 // Launch kernel
 gemm_t::run(out, grouped_layout, block_m_info,
@@ -126,6 +128,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
 
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
+    enable_moe_dynamic_tile = False
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices, m_indices, m, expected_m,
@@ -139,6 +142,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'ENABLE_SBO_OVERLAP': False,
+              'ENABLE_MOE_DYNAMIC_TILE': enable_moe_dynamic_tile,
               'GEMM_TYPE': 'GroupedContiguous'},
         space=(),
         includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
@@ -198,6 +202,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
         assert signal.is_contiguous()
         assert signal.dtype == torch.int32
 
+
     # Auto-tuning with compilation
     global includes, template, includes_cutlass3, template_cutlass3
     num_sms = get_num_sms()
@@ -210,6 +215,8 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
 
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
+    enable_moe_dynamic_tile = extra_info['use_moe_dynamic_tile']
+
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             masked_m, masked_m, m, expected_m,
@@ -222,6 +229,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'ENABLE_SBO_OVERLAP': enable_sbo_overlap,
+              'ENABLE_MOE_DYNAMIC_TILE': enable_moe_dynamic_tile,
               'GEMM_TYPE': 'GroupedMasked'},
         space=(),
         includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
@@ -332,6 +340,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
 
         ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
         ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
+        enable_moe_dynamic_tile = extra_info['use_moe_dynamic_tile']
 
         if m_rows is None:
             counts = torch.bincount(m_indices)
@@ -358,6 +367,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
                   'BLOCK_N_PADDING': smem_config[2],
                   'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
                   'ENABLE_SBO_OVERLAP': False,
+                  'ENABLE_MOE_DYNAMIC_TILE': enable_moe_dynamic_tile,
                   'GEMM_TYPE': 'GroupedNoPad'},
             space=(),
             includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,

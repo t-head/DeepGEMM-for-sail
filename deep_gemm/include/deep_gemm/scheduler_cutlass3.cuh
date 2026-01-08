@@ -49,7 +49,7 @@ struct DeepGemmScheduler {
     uint32_t num_n_blocks = kNumNBlocks;
 
     // Only used for masked layout
-    uint32_t curr_group_idx, curr_cumsum, curr_group_m, curr_cumsum_m;
+    uint32_t curr_group_idx, curr_cumsum, curr_cumsum_blocks, curr_group_m, curr_cumsum_m;
 
     struct Arguments
     {
@@ -88,23 +88,23 @@ struct DeepGemmScheduler {
         } else if (kGemmType == GemmType::GroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if (kGemmType == GemmType::GroupedMasked) {
-            curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_m = 0;
+            curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_blocks = curr_cumsum_m = 0;
         } else if (kGemmType == GemmType::GroupedNoPad) {
             if (kIsNoPadPreprocessLayout) {
                 num_aligned_m_blocks = params_.grouped_layout[0]; // total blocks in m, block_m_sum
-                curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_m = 0;
+                curr_group_idx = curr_cumsum = curr_cumsum_blocks = curr_group_m = curr_cumsum_m = 0;
                 num_blocks = num_aligned_m_blocks * num_n_blocks;
             } else {
-                curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_m = 0;
+                curr_group_idx = curr_cumsum = curr_cumsum_blocks = curr_group_m = curr_cumsum_m = 0;
             }
         }
     }
 
     CUTLASS_DEVICE void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx,
-                                               uint32_t& m_block_idx, uint32_t& n_block_idx) {
+                                               uint32_t& m_block_idx, uint32_t& n_block_idx, int n_expand=1) {
         // Swizzle for better L2 usages
         auto primary_num_blocks = kIsTMAMulticastOnA ? kNumNBlocks : num_m_blocks;
-        auto secondary_num_blocks = kIsTMAMulticastOnA ? num_m_blocks : kNumNBlocks;
+        auto secondary_num_blocks = kIsTMAMulticastOnA ? num_m_blocks : (kNumNBlocks / n_expand);
         auto num_blocks_per_group = secondary_num_blocks * kNum1DBlocksPerGroup;
         auto group_idx = block_idx / num_blocks_per_group;
         auto first_block_idx = group_idx * kNum1DBlocksPerGroup;
@@ -182,6 +182,72 @@ struct DeepGemmScheduler {
         return true;
     }
 
+    CUTLASS_DEVICE int get_n_expand(int curr_group_m) {
+        int n_expand = 1;
+        if ((SHAPE_K > 2048 && curr_group_m > 32 && curr_group_m <= 64)
+            || (SHAPE_K <= 2048 && curr_group_m <= 64)) {
+            n_expand = 2;
+        }
+        return n_expand;
+    }
+
+    CUTLASS_DEVICE bool fetch_next_work_dynamic_tile(uint32_t& m_block_idx, uint32_t& n_block_idx) {
+        const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
+        if (kIsNoPadPreprocessLayout) {
+            if (next_block_idx >= num_blocks) {
+                m_block_idx = num_aligned_m_blocks;
+                n_block_idx = kNumNBlocks;
+                return false;
+            }
+            int block_m_idx = next_block_idx / kNumNBlocks;
+            uint4 data = (((const uint4*)params.grouped_layout) + 1)[block_m_idx];
+            curr_group_idx = data.x;
+            curr_group_m = data.y;
+            int n_expand = get_n_expand(curr_group_m);
+            uint32_t block_idx_in_m = data.z * kNumNBlocks / n_expand + next_block_idx % kNumNBlocks / n_expand;
+            uint32_t num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
+            curr_cumsum_m = data.w;
+            get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx, n_expand);
+        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
+            uint32_t num_m_blocks;
+            int n_expand = 1;
+            int curr_cumsum_blocks_prev;
+
+            while (true) {
+                // End of the task
+                if (curr_group_idx == kNumGroups)
+                    return false;
+
+                // Within the current group
+                curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
+                n_expand = get_n_expand(curr_group_m);
+                num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
+                auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
+                curr_cumsum_blocks_prev = curr_cumsum_blocks;
+                int curr_cumsum_blocks_next = curr_cumsum_blocks + num_m_blocks * kNumNBlocks / n_expand;
+
+                // if (cute::thread0()) {
+                //     printf("curr_group_idx = %d, curr_cumsum_blocks = %d, num_m_blocks = %d, next_block_idx = %d, curr_cumsum_blocks_prev = %d, curr_cumsum_blocks_next = %d, n_expand = %d\n",
+                //         curr_group_idx, curr_cumsum_blocks, num_m_blocks, next_block_idx, curr_cumsum_blocks_prev, curr_cumsum_blocks_next, n_expand);
+                // }
+                if (next_block_idx < curr_cumsum_blocks_next)
+                    break;
+
+                // Move to check the next group
+                curr_cumsum_blocks = curr_cumsum_blocks_next;
+                curr_group_idx ++, curr_cumsum = current_m_block_cumsum;
+                curr_cumsum_m += curr_group_m;
+            }
+
+            get_swizzled_block_idx(num_m_blocks, next_block_idx - curr_cumsum_blocks_prev, m_block_idx, n_block_idx, n_expand);
+        } else {
+            if (next_block_idx >= num_blocks)
+                return false;
+
+            get_swizzled_block_idx(num_aligned_m_blocks, next_block_idx, m_block_idx, n_block_idx);
+        }
+        return true;
+    }
 
     template <class ProblemShapeMNKL, class TileShape, class ClusterShape>
     static Params
@@ -224,7 +290,7 @@ struct DeepGemmScheduler {
         if constexpr (kGemmType == GemmType::DenseGemm || kGemmType == GemmType::GroupedContiguous) {
             return params.shape_m;
         } else if constexpr (kGemmType == GemmType::GroupedMasked) {
-            return params.shape_m;
+            return curr_group_m;
         } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return curr_group_m;
         } else {

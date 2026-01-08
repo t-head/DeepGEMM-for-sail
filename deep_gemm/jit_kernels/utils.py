@@ -177,6 +177,7 @@ def get_extra_info(m=0, n=0, k=0, dtype=torch.int8, api_type="dense") -> dict:
     extra_info = {}
     use_cutlass3 = False
     use_multistage_on_N = False
+    use_moe_dynamic_tile = False
 
     if is_ppu1v5_device():
         use_cutlass3 = True
@@ -188,6 +189,10 @@ def get_extra_info(m=0, n=0, k=0, dtype=torch.int8, api_type="dense") -> dict:
     if 'DG_USE_MULTISTAGE_ON_N' in os.environ:
         use_multistage_on_N = int(os.getenv('DG_USE_MULTISTAGE_ON_N'))
     extra_info['use_multistage_on_N'] = use_multistage_on_N
+
+    if 'DG_USE_MOE_DYNAMIC_TILE' in os.environ:
+        use_moe_dynamic_tile = int(os.getenv('DG_USE_MOE_DYNAMIC_TILE'))
+    extra_info['use_moe_dynamic_tile'] = use_moe_dynamic_tile
     return extra_info
 
 def get_search_space(d: torch.dtype, gemm_type : str, m:int=0, n:int=0, k:int=0) -> list:
