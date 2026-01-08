@@ -291,6 +291,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     global includes, template, includes_gemv, template_gemv
     num_sms = get_num_sms()
 
+#if 0
     # use gemv for small k
     if k == 128 and m <= num_groups:
         BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, USE_SMALL_K = get_gemv_best_configs(m, n, k, num_groups, num_sms, torch.int8)
@@ -318,6 +319,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
             )
             runtime(*args)
             return
+#endif
 
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
