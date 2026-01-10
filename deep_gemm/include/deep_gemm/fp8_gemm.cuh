@@ -34,6 +34,7 @@
 #include "scheduler_cutlass3.cuh"
 #include "utils_cutlass3.h"
 #include "ppu/cutlass/gemm/collective/acompute_mma_aiu_multistage_with_scale.hpp"
+
 namespace deep_gemm {
 using namespace cute;
 using cutlass::KernelHardwareInfo;
@@ -147,7 +148,7 @@ public:
   // Convert to underlying arguments. In this case, a simple copy for the aliased type.
   static
   Params
-  to_underlying_arguments(Arguments const& args, void* workspace, int* grouped_layout) {
+  to_underlying_arguments(Arguments const& args, void* workspace) {
     CUTLASS_TRACE_HOST("to_underlying_arguments():");
     auto problem_shape = args.problem_shape;
     if constexpr (cutlass::gemm::kernel::detail::Has_SwapAB_v<CollectiveMainloop>) {
@@ -179,19 +180,13 @@ public:
     workspace_offset += CollectiveEpilogue::get_workspace_size(args.problem_shape, args.epilogue);
     workspace_offset = cutlass::round_nearest(workspace_offset,  cutlass::MinWorkspaceAlignment);
     void* mainloop_workspace = nullptr;
-    // Precompute the sub tiles numbers in epilogue, pass into tile scheduler.  Therefore it will be used
-    // in separate reduction scheme for streamk case, NumEpilogueSubTiles default value is 1, which means
-    // subtile will not be used, therefore separate reduction will not be enabled.
-    constexpr uint32_t NumEpilogueSubTiles = 1; //CollectiveEpilogue::get_store_pipe_increment(TileShape{});
-    TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(grouped_layout,
-      problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
     return {
       args.mode,
       problem_shape,
       CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, mainloop_workspace),
       CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, epilogue_workspace),
       hw_info,
-      scheduler,
+      args.scheduler,
       workspace,
       args.signal
     };
@@ -475,7 +470,7 @@ public:
   // Convert to underlying arguments. In this case, a simple copy for the aliased type.
   static
   Params
-  to_underlying_arguments(Arguments const& args, void* workspace, int* grouped_layout) {
+  to_underlying_arguments(Arguments const& args, void* workspace) {
     CUTLASS_TRACE_HOST("to_underlying_arguments():");
 
     auto problem_shape = args.problem_shape;
@@ -512,12 +507,6 @@ public:
     workspace_offset = cutlass::round_nearest(workspace_offset,  cutlass::MinWorkspaceAlignment);
 
     void* mainloop_workspace = nullptr;
-    // Precompute the sub tiles numbers in epilogue, pass into tile scheduler.  Therefore it will be used
-    // in separate reduction scheme for streamk case, NumEpilogueSubTiles default value is 1, which means
-    // subtile will not be used, therefore separate reduction will not be enabled.
-    constexpr uint32_t NumEpilogueSubTiles = 1; //CollectiveEpilogue::get_store_pipe_increment(TileShape{});
-    TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(grouped_layout,
-      problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
 
     return {
       args.mode,
@@ -525,7 +514,7 @@ public:
       CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, mainloop_workspace),
       CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, epilogue_workspace),
       hw_info,
-      scheduler,
+      args.scheduler,
       workspace,
       args.signal
     };
@@ -1105,6 +1094,7 @@ public:
                     cudaStream_t stream,
                     int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
         constexpr int N_EXPAND = kUseNStageKernel ? KernelAiuMultistageOnN::N_EXPAND : 1;
+
         using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, kNumGroups>;
         
         using GemmKernel = typename deep_gemm::DeepGemmUniversal<
@@ -1140,7 +1130,6 @@ public:
             computeBlockInfoKernel<BLOCK_M><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
             layout_info = block_m_info;
         }
-
         cutlass::float_e4m3_t* converted_input_b = reinterpret_cast<cutlass::float_e4m3_t*>(input_b);
         cutlass::float_e4m3_t* converted_input_a = reinterpret_cast<cutlass::float_e4m3_t*>(input_a);
         cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(gmem_d);
@@ -1158,7 +1147,7 @@ public:
             nullptr, stride_D,
             converted_output, stride_D
           },
-          hw_info, {}, signal
+          hw_info, {shape_m, max_blocks_per_cu, num_sms, layout_info}, signal
         };
         // Using the arguments, query for extra workspace required for matrix multiplication computation
         size_t workspace_size = GemmKernel::get_workspace_size(arguments);
@@ -1168,7 +1157,7 @@ public:
         // cutlass::DeviceAllocation<uint8_t> workspace(workspace_size);
 
         // evt realization must construct evt params on device, can't use GemmUniversalAdapter
-        typename GemmKernel::Params params = GemmKernel::to_underlying_arguments(arguments, nullptr, layout_info);
+        typename GemmKernel::Params params = GemmKernel::to_underlying_arguments(arguments, nullptr);
 
         dim3 const block = GemmKernel::get_block_shape();
         dim3 const grid = GemmKernel::get_grid_shape(params);
@@ -1192,9 +1181,10 @@ public:
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                 BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);
 
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
+            printf("num_sms:%d, max_active_tb_num: %d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
 
             printf("smem_size:%d, vreg:%d, stack:%d\n", sharemem_size, int(attr.numRegs), int(attr.localSizeBytes));
+            printf("enable_hw_dispatch: %d\n", TileScheduler::EnableHWDispatchStrategy);
         }
 
         DgProfParam dg_prof_params;
@@ -1205,8 +1195,7 @@ public:
             );
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        cutlass::device_kernel<GemmKernel><<<grid, block, sharemem_size, stream>>>(params);
+        launch_kernel<GemmKernel>(params, stream, max_blocks_per_cu);
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
   }

@@ -17,6 +17,7 @@
 #include "../heuristics/common_int8.hpp"
 #include "../heuristics/predicated_tile_iterator_params.hpp"
 #include "cutlass/kernel_hardware_info.hpp"
+#include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "ppu/cutlass/detail/blockwise_scale_layout.hpp"
@@ -86,11 +87,6 @@ public:
       std::string kernel_name;
     };
 
-    struct TileSchedulerArguments {
-      int* grouped_layout;
-      uint32_t shape_m;
-    };
-
     struct GemmArguments {
       GemmUniversalMode mode;
       GemmProblemSize problem_shape;
@@ -99,11 +95,6 @@ public:
       cutlass::KernelHardwareInfo hw_info;
       TileSchedulerArguments scheduler{};
       int32_t* signal{nullptr};
-    };
-
-    struct TileSchedulerParams {
-      int* grouped_layout;
-      uint32_t shape_m;
     };
 
     using CollectiveMainloopParams = MainLoopArguments;
@@ -115,20 +106,19 @@ public:
       CollectiveMainloopParams collective_mainloop_params;
       CollectiveEpilogueParams collective_epilogue_params;
       cutlass::KernelHardwareInfo hw_info;
-      TileSchedulerParams tile_scheduler_params;
+      TileSchedulerArguments scheduler;
       void* workspace{nullptr};//workspace,
       int32_t* signal{nullptr};
     };
 
     struct Args {
-      GemmArguments gemm_args;
       LaunchInfo launch_info;
       LaunchArgs launch_args;
       GemmKernelParams kernel_params;
       std::string type_info;
     };
 
-    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace, int* grouped_layout) {
+    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace) {
       auto problem_shape = args.problem_shape;
       auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
       // Get SM count if needed, otherwise use user supplied SM count
@@ -144,7 +134,6 @@ public:
       cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
 
       uint32_t problem_shape_m = cute::get<0>(problem_shape_MNKL);
-      TileSchedulerParams scheduler = {grouped_layout, problem_shape_m};
 
       return {
         args.mode,
@@ -152,7 +141,7 @@ public:
         args.mainloopargs,
         args.epilogueargs,
         hw_info,
-        scheduler,
+        args.scheduler,
         workspace,
         args.signal
       };
@@ -321,7 +310,7 @@ __global__ void {}(
 }}
 }}
 )",
-        cute::get<1>(args.gemm_args.problem_shape), cute::get<2>(args.gemm_args.problem_shape),
+        cute::get<1>(args.kernel_params.problem_shape), cute::get<2>(args.kernel_params.problem_shape),
         args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k,
         args.launch_info.num_groups, 
         args.launch_info.warp_m, args.launch_info.warp_n,
@@ -577,16 +566,15 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
             converted_output, stride_D,
           },
           .hw_info = hw_info,
-          .scheduler = {},
+          .scheduler = {m, 1, num_sms_new, layout_info}, // update right tb_per_cu after gen code
           .signal = nullptr
         };
 
-        PPU10500INT8GemmRuntime::GemmKernelParams params = PPU10500INT8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr, grouped_layout);
+        PPU10500INT8GemmRuntime::GemmKernelParams params = PPU10500INT8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
         // if(get_int8_tample_params_size() != sizeof(PPU10500INT8GemmRuntime::GemmKernelParams)) {
         //   std::cout << "\n the params size is not right, please check." << std::endl;
         // }
         auto args = PPU10500INT8GemmRuntime::Args{
-          .gemm_args = gemm_args,
           .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "int8_deep_gemm"},
           .launch_args = {grid, block, SMSIZE},
           .kernel_params = params,
@@ -603,6 +591,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
           SMSIZE
           );
         args.launch_args.grid_dim.x *= blocks_per_cu;
+        args.kernel_params.scheduler.tb_per_cu = blocks_per_cu;
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()){
             dg_prof_params.set_params(
@@ -690,16 +679,15 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
           converted_output, stride_D,
         },
         .hw_info = hw_info,
-        .scheduler = {},
+        .scheduler = {m, 1, num_sms_new, layout_info}, // update right tb_per_cu after gen code
         .signal = nullptr
       };
 
-      PPU10500INT8GemmRuntime::GemmKernelParams params = PPU10500INT8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr, grouped_layout);
+      PPU10500INT8GemmRuntime::GemmKernelParams params = PPU10500INT8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
       // if(get_int8_tample_params_size() != sizeof(PPU10500INT8GemmRuntime::GemmKernelParams)) {
       //   std::cout << "\n the params size is not right, please check." << std::endl;
       // }
       auto args = PPU10500INT8GemmRuntime::Args{
-        .gemm_args = gemm_args,
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "fp8_deep_gemm"},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = params,
@@ -716,6 +704,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
         SMSIZE
         );
       args.launch_args.grid_dim.x *= blocks_per_cu;
+      args.kernel_params.scheduler.tb_per_cu = blocks_per_cu;
 
       DgProfParam dg_prof_params;
       if (ProfilingInterface::Instance().get_op_info()){

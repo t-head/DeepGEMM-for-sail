@@ -214,7 +214,7 @@ class DeepGemmUniversal <
   // Convert to underlying arguments. In this case, a simple copy for the aliased type.
   static
   Params
-  to_underlying_arguments(Arguments const& args, void* workspace, int* grouped_layout) {
+  to_underlying_arguments(Arguments const& args, void* workspace) {
     (void) workspace;
     auto problem_shape = args.problem_shape;
     if constexpr (cutlass::gemm::kernel::detail::Has_SwapAB_v<CollectiveMainloop>) {
@@ -239,15 +239,13 @@ class DeepGemmUniversal <
     uint8_t* workspace_ptr = reinterpret_cast<uint8_t*>(workspace);
     void* scheduler_workspace = workspace_ptr;
 
-    TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(grouped_layout,
-      problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
     return {
       args.mode,
       args.problem_shape,
       CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, workspace),
       CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, workspace),
       hw_info,
-      scheduler,
+      args.scheduler,
       workspace,
       args.signal
     };
@@ -790,7 +788,7 @@ public:
   // Convert to underlying arguments. In this case, a simple copy for the aliased type.
   static
   Params
-  to_underlying_arguments(Arguments const& args, void* workspace, int* grouped_layout) {
+  to_underlying_arguments(Arguments const& args, void* workspace) {
     (void) workspace;
     auto problem_shape = args.problem_shape;
     if constexpr (cutlass::gemm::kernel::detail::Has_SwapAB_v<CollectiveMainloop>) {
@@ -815,16 +813,13 @@ public:
     uint8_t* workspace_ptr = reinterpret_cast<uint8_t*>(workspace);
     void* scheduler_workspace = workspace_ptr;
 
-    TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(grouped_layout,
-      problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
-
     return {
       args.mode,
       args.problem_shape,
       CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, workspace),
       CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, workspace),
       hw_info,
-      scheduler,
+      args.scheduler,
       workspace,
       args.signal
     };
@@ -1755,12 +1750,12 @@ public:
               reinterpret_cast<ElementSFB*>(scale_b), stride_meta_B
             },
             epilogue_arguments,
-            hw_info, {}, signal
+            hw_info, {shape_m, max_blocks_per_cu, num_sms, layout_info}, signal
         };
 
         size_t workspace_size = GemmKernel::get_workspace_size(arguments);
         cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-        typename GemmKernel::Params params = GemmKernel::to_underlying_arguments(arguments, workspace.get(), layout_info);
+        typename GemmKernel::Params params = GemmKernel::to_underlying_arguments(arguments, workspace.get());
         dim3 const block = GemmKernel::get_block_shape();
         dim3 const grid = GemmKernel::get_grid_shape(params);
         int sharemem_size = GemmKernel::SharedStorageSize;
@@ -1782,6 +1777,8 @@ public:
             printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
 
             printf("smem_size:%d, vreg:%d, stack:%d\n", sharemem_size, int(attr.numRegs), int(attr.localSizeBytes));
+            printf("enable_hw_dispatch: %d\n", TileScheduler::EnableHWDispatchStrategy);
+
         }
 
         DgProfParam dg_prof_params;
@@ -1793,7 +1790,7 @@ public:
         }
 
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
-        cutlass::device_kernel<GemmKernel><<<grid, block, sharemem_size, stream>>>(params);
+        launch_kernel<GemmKernel>(params, stream, max_blocks_per_cu);
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
     }
   };

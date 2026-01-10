@@ -16,7 +16,7 @@
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_bf16.hpp"
 // #include "../heuristics/gemm_search_space.hpp"
-#include "cutlass/kernel_hardware_info.hpp"
+#include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "ppu/cutlass/detail/blockwise_scale_layout.hpp"
@@ -80,12 +80,6 @@ public:
       std::string kernel_name;
     };
 
-    struct TileSchedulerArguments {
-      int* grouped_layout;
-      uint32_t shape_m;
-    };
-
-
     struct GemmArguments {
       GemmUniversalMode mode;
       GemmProblemSize problem_shape;
@@ -97,7 +91,6 @@ public:
     };
 
     using CollectiveEpilogueParams = EpilogueArgs;
-    using TileSchedulerParams = TileSchedulerArguments;
     using CollectiveMainloopParams = MainLoopArguments;
 
     struct GemmKernelParams {
@@ -112,14 +105,13 @@ public:
     };
 
     struct Args {
-      GemmArguments gemm_args;
       LaunchInfo launch_info;
       LaunchArgs launch_args;
       GemmKernelParams kernel_params;
     };
 
 
-    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace, int* grouped_layout) {
+    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace) {
       auto problem_shape = args.problem_shape;
       auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
       // Get SM count if needed, otherwise use user supplied SM count
@@ -291,7 +283,7 @@ __global__ void {}(
 }}
 }}
 )",
-        cute::get<1>(args.gemm_args.problem_shape), cute::get<2>(args.gemm_args.problem_shape),
+        cute::get<1>(args.kernel_params.problem_shape), cute::get<2>(args.kernel_params.problem_shape),
         args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k,
         args.launch_info.num_groups, 
         args.launch_info.warp_m, args.launch_info.warp_n,
@@ -317,11 +309,6 @@ public:
     struct LaunchInfo {
       int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages, shape_n, shape_k;
       std::string kernel_name;
-    };
-
-    struct TileSchedulerArguments {
-      int* grouped_layout;
-      uint32_t shape_m;
     };
 
     struct ProblemVisitorParams {
@@ -511,16 +498,15 @@ static void bf16_gemm(const torch::Tensor& lhs,
           output, stride_D,
         },
         .hw_info = hw_info,
-        .scheduler = {layout_info, (uint32_t)m},
+        .scheduler = {m, 1, num_sms_new, layout_info}, // update right tb_per_cu after gen code
         .signal = nullptr
       };
 
-      BF16GemmCutlass3Runtime::GemmKernelParams params = BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr, grouped_layout);
+      BF16GemmCutlass3Runtime::GemmKernelParams params = BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
       // if(get_bf16_tample_params_size() != sizeof(BF16GemmCutlass3Runtime::GemmKernelParams)) {
       //   std::cout << "\n the params size is not right, please check." << std::endl;
       // }
       auto args = BF16GemmCutlass3Runtime::Args{
-        .gemm_args = gemm_args,
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "bf16_deep_gemm"},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = params
@@ -536,9 +522,8 @@ static void bf16_gemm(const torch::Tensor& lhs,
         SMSIZE
         );
       args.launch_args.grid_dim.x *= blocks_per_cu;
-
+      args.kernel_params.scheduler.tb_per_cu = blocks_per_cu;
       BF16GemmCutlass3Runtime::launch(runtime, args);
-      
     } else {
       int64_t stride, increment_row, increment_group, increment_cluster;
       int64_t advance_row, advance_group, advance_cluster, advance_tile;    

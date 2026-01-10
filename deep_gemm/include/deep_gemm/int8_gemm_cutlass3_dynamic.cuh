@@ -313,10 +313,18 @@ struct DeepGemmDynamicTile {
     typename CollectiveEpilogue::Params epi_params;
     // arguments for scheduler
     uint32_t shape_m;
+    int tb_per_cu;
+    int cu_count;
     int* grouped_layout;
   };
 
   using Params = Arguments;
+
+  static
+  Params
+  to_underlying_arguments(Arguments const& args, void* workspace) {
+    return args;
+  }
 
   struct SharedStorage {
     // Mainloop and epilogue don't use smem concurrently since kernel is non-persistent, so we can use a union
@@ -335,11 +343,36 @@ struct DeepGemmDynamicTile {
     return dim3(MaxThreadsPerBlock, 1, 1);
   }
 
+  // // Computes the kernel launch grid shape based on runtime parameters
+  static dim3
+  get_grid_shape(Params const& params) {
+    return dim3(params.cu_count * params.tb_per_cu, 1, 1);
+  }
+
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
     int thread_idx = int(threadIdx.x);
-    TileScheduler deep_scheduler({params.shape_m, params.grouped_layout});
+
+    // compute total blocks
+    int total_blocks = 0;
+    if constexpr (TileScheduler::EnableHWDispatchStrategy) {
+      for (int i = 0; i < TileScheduler::kNumGroups; i++) {
+        int M = __ld_smem(params.grouped_layout + i);
+        if (M <= Builder0::BLOCK_M) {
+          total_blocks += Builder0::TileScheduler::kNumNBlocks;
+        } else if (M <= Builder1::BLOCK_M) {
+          total_blocks += Builder1::TileScheduler::kNumNBlocks;
+        } else if (M <= Builder2::BLOCK_M) {
+          total_blocks += Builder2::TileScheduler::kNumNBlocks;
+        } else if (M <= Builder3::BLOCK_M) {
+          total_blocks += Builder3::TileScheduler::kNumNBlocks;
+        } else {
+          total_blocks += (cute::ceil_div(M, Builder4::BLOCK_M) * Builder4::TileScheduler::kNumNBlocks);
+        }
+      }
+    }
+    TileScheduler deep_scheduler({params.shape_m, params.tb_per_cu, params.cu_count, params.grouped_layout}, total_blocks);
 
     uint32_t m_block_idx, n_block_idx;
     while (deep_scheduler.template fetch_next_work_dynamic_tile<kEnableNExpand>(m_block_idx, n_block_idx)) {

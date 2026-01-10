@@ -2678,7 +2678,7 @@ public:
     int thread_idx = int(threadIdx.x) - warp_group_id * MaxThreadsPerBlock;
     auto blk_shape = TileShape{}; // (BLK_M,BLK_N,BLK_K)
 
-    TileScheduler deep_scheduler(params.scheduler, warp_group_id);
+    TileScheduler deep_scheduler(params.scheduler, 0, warp_group_id);
 
     constexpr uint32_t L = 1;
     uint32_t l_coord = 0;
@@ -2923,7 +2923,6 @@ public:
             CollectiveEpilogue_noTsm
         >::type;
 
-
         using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, kNumGroups>;
         using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
             Shape<int,int,int,int>,
@@ -2962,7 +2961,7 @@ public:
             {shape_m, SHAPE_N, SHAPE_K, 1},
             {(ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B},
             {{1.0f, 0.0f}, (ElementC*)gmem_d, stride_C, (ElementD*)gmem_d, stride_D},
-            hw_info, {shape_m, layout_info}, signal
+            hw_info, {shape_m, max_blocks_per_cu, num_sms, layout_info}, signal
         };
 
         arguments.epilogue.thread.alpha = 1;
@@ -2986,9 +2985,8 @@ public:
             );
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
-        cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
+        launch_kernel<GemmKernel>(params, stream, max_blocks_per_cu);
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
 
         int max_active_tb_num = max_blocks_per_cu;
         const int threadblock_count = num_sms < 20 ? num_sms : num_sms * max_active_tb_num;
@@ -3007,6 +3005,8 @@ public:
             printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
 
             printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
+            printf("enable_hw_dispatch: %d\n", TileScheduler::EnableHWDispatchStrategy);
+
         }
     }
 };
