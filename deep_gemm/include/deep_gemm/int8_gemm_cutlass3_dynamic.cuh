@@ -25,7 +25,7 @@ struct KernelAiuDynamicTileSmallK {
   constexpr static int TileLength = 5; // 16, 32, 64, 128
   constexpr static int ElementsPerTile = 6; // blockM, blockN, warpM, warpN, blockK, stages
   constexpr static int TileConfigList[TileLength][ElementsPerTile] = {
-    {16, 256, 16, 16, 128, 3},
+    {16, 256, 16, 32, 128, 3},
     {32, 256, 32, 32, 128, 3},
     {64, 256, 32, 64, 128, 3},
     {128, 128, 32, 64, 128, 3},

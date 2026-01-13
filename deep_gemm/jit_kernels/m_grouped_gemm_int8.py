@@ -139,7 +139,6 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
               'N': n, 'K': k,
               'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n,
-              'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'ENABLE_SBO_OVERLAP': False,
               'ENABLE_MOE_DYNAMIC_TILE': enable_moe_dynamic_tile,
@@ -216,6 +215,12 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
     enable_moe_dynamic_tile = extra_info['use_moe_dynamic_tile']
+    if enable_sbo_overlap:
+        # disable dynamic tile if enable_sbo_overlap, as the kNumNBlocks is not static
+        enable_moe_dynamic_tile = False
+    if enable_moe_dynamic_tile:
+        # fix the block config to avoid unecessary jit compile
+        block_m, block_n, block_k, warp_m, warp_n, num_stages = (128, 128, 128, 64, 64, 3)
 
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
@@ -226,7 +231,6 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
         keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
               'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n,
-              'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'ENABLE_SBO_OVERLAP': enable_sbo_overlap,
               'ENABLE_MOE_DYNAMIC_TILE': enable_moe_dynamic_tile,
@@ -364,7 +368,6 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
                   'N': n, 'K': k,
                   'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                   'WARP_M': warp_m, 'WARP_N': warp_n,
-                  'BLOCK_N_PADDING': smem_config[2],
                   'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
                   'ENABLE_SBO_OVERLAP': False,
                   'ENABLE_MOE_DYNAMIC_TILE': enable_moe_dynamic_tile,
