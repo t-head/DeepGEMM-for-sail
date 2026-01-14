@@ -203,11 +203,10 @@ struct DeepGemmScheduler {
             uint4 data = (((const uint4*)params.grouped_layout) + 1)[block_m_idx];
             curr_group_idx = data.x;
             curr_group_m = data.y;
-            int n_expand = get_n_expand(curr_group_m);
-            uint32_t block_idx_in_m = data.z * kNumNBlocks / n_expand + next_block_idx % kNumNBlocks / n_expand;
+            uint32_t block_idx_in_m = data.z * kNumNBlocks + next_block_idx % kNumNBlocks;
             uint32_t num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
             curr_cumsum_m = data.w;
-            get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx, n_expand);
+            get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);
         } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
             uint32_t num_m_blocks;
             int n_expand = 1;

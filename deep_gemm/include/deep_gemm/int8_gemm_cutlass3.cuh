@@ -1562,15 +1562,17 @@ public:
         int smem_size_kernel = 0;
         bool kIsNoPadPreprocessLayout = false;
         cudaFuncAttributes attr;
+        int DynamicTildId = 0;
 
         if constexpr (kEnableMoeDynamicTile) {
-          using KernelSchedule = cutlass::gemm::KernelAiuDynamicTileLargeK;
-          using DispatchPolicy = cutlass::gemm::MainloopAcomputeAiuA8W8<kNumStages, KernelSchedule>;
           using GemmKernel = cutlass::gemm::kernel::DeepGemmDynamicTile<
                   kGemmType, ElementA, ElementB, ElementD, int32_t, ElementCompute,
                   SHAPE_N, SHAPE_K, kNumGroups>;
 
-          kIsNoPadPreprocessLayout = GemmKernel::TileScheduler::kIsNoPadPreprocessLayout;
+          using TileScheduler = typename GemmKernel::TileScheduler;
+          kIsNoPadPreprocessLayout = TileScheduler::kIsNoPadPreprocessLayout;
+          DynamicTildId = GemmKernel::KernelAiuDynamicTile::DynamicTildId;
+
           using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
           using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
           using StrideD = cutlass::detail::TagToStrideC_t<LayoutD>;
@@ -1585,17 +1587,26 @@ public:
           typename Epilogue::Arguments arg_epilogue = {{1.0f, 0.0f}, (ElementD*)gmem_d, stride_D, (ElementD*)gmem_d, stride_D};
           auto params_epilogue = Epilogue::to_underlying_arguments(problem_shape_MNKL, arg_epilogue, nullptr);
 
+          int* layout_info = grouped_layout;
+          // compute block_m_info
+          if (TileScheduler::kIsNoPadPreprocessLayout) {
+              uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+              computeBlockInfoKernel<TileScheduler::BLOCK_M><<<1, block_size, 0, stream>>>(
+                reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
+              layout_info = block_m_info;
+          }
+
           typename GemmKernel::Arguments arguments {
               (ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B, scales_a, scales_b,
-              params_epilogue, shape_m, grouped_layout
+              params_epilogue, shape_m, layout_info
           };
 
+          max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
           dim3 const block = GemmKernel::get_block_shape();
-          dim3 const grid(num_sms * 2, 1, 1);
+          dim3 const grid(num_sms * max_blocks_per_cu, 1, 1);
           smem_size_kernel = GemmKernel::SharedStorageSize;
           cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(arguments);
 
-          max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
           cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
         } else {
 
@@ -1747,6 +1758,8 @@ public:
           if constexpr (!kEnableMoeDynamicTile) {
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                 BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);
+          } else {
+            printf("DynamicTildId:%d\n", DynamicTildId);
           }
           printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_blocks_per_cu, threadblock_count);
           printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));

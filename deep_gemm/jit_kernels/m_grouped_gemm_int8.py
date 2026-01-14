@@ -345,6 +345,9 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
         ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
         ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
         enable_moe_dynamic_tile = extra_info['use_moe_dynamic_tile']
+        if enable_moe_dynamic_tile:
+            # fix the block config to avoid unecessary jit compile
+            block_m, block_n, block_k, warp_m, warp_n, num_stages = (128, 128, 128, 64, 64, 3)
 
         if m_rows is None:
             counts = torch.bincount(m_indices)

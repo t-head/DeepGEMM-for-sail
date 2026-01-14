@@ -8,10 +8,11 @@
 
 namespace cutlass::gemm {
 
+constexpr static int TileLength = 5;
+constexpr static int ElementsPerTile = 6; // blockM, blockN, warpM, warpN, blockK, stages
 
 struct KernelAiuDynamicTileLargeK {
-  constexpr static int TileLength = 5; // 16, 32, 64, 128
-  constexpr static int ElementsPerTile = 6; // blockM, blockN, warpM, warpN, blockK, stages
+  constexpr static int DynamicTildId = 0;
   constexpr static int TileConfigList[TileLength][ElementsPerTile] = {
     {16, 128, 16, 16, 256, 3},
     {32, 128, 16, 32, 256, 3},
@@ -22,14 +23,35 @@ struct KernelAiuDynamicTileLargeK {
 };
 
 struct KernelAiuDynamicTileSmallK {
-  constexpr static int TileLength = 5; // 16, 32, 64, 128
-  constexpr static int ElementsPerTile = 6; // blockM, blockN, warpM, warpN, blockK, stages
+  constexpr static int DynamicTildId = 1;
   constexpr static int TileConfigList[TileLength][ElementsPerTile] = {
     {16, 256, 16, 32, 128, 3},
     {32, 256, 32, 32, 128, 3},
     {64, 256, 32, 64, 128, 3},
     {128, 128, 32, 64, 128, 3},
     {192, 128, 48, 64, 128, 3}
+  };
+};
+
+struct KernelAiuDynamicTileTPLargeK {
+  constexpr static int DynamicTildId = 2;
+  constexpr static int TileConfigList[TileLength][ElementsPerTile] = {
+    {16, 256, 16, 32, 128, 3},
+    {32, 256, 32, 32, 128, 3},
+    {64, 256, 32, 64, 128, 3},
+    {96, 256, 48, 64, 128, 2},
+    {128, 256, 64, 64, 128, 2}
+  };
+};
+
+struct KernelAiuDynamicTileTPSmallK {
+  constexpr static int DynamicTildId = 3;
+  constexpr static int TileConfigList[TileLength][ElementsPerTile] = {
+    {16, 128, 16, 32, 128, 3},
+    {32, 128, 32, 32, 128, 3},
+    {64, 128, 32, 64, 128, 2},
+    {96, 128, 48, 64, 128, 2},
+    {128, 128, 64, 64, 128, 2}
   };
 };
 
@@ -48,6 +70,7 @@ template <
   int SHAPE_N,
   int SHAPE_K,
   int kNumGroups,
+  typename KernelAiuDynamicTile,
   int TileId
 >
 struct PPUTypeBuilder {
@@ -61,11 +84,6 @@ struct PPUTypeBuilder {
   static constexpr bool TransB = false;
 
   using ProblemShape = Shape<int,int,int,int>;
-
-  using KernelAiuDynamicTile = typename cutlass::platform::conditional<
-          (SHAPE_K > 2048),
-          KernelAiuDynamicTileLargeK,
-          KernelAiuDynamicTileSmallK>::type;
 
   static constexpr int BLOCK_M = KernelAiuDynamicTile::TileConfigList[TileId][0];
   static constexpr int BLOCK_N = KernelAiuDynamicTile::TileConfigList[TileId][1];
@@ -84,6 +102,8 @@ struct PPUTypeBuilder {
       MMA_Atom<MmaInst>,
       Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
       Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _32>>;       // 1x1x1 value group
+
+  static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
 
   using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
   using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
@@ -231,22 +251,37 @@ struct DeepGemmDynamicTile {
   using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
   using StrideD = cutlass::detail::TagToStrideC_t<LayoutD>;
 
-  static constexpr uint32_t MaxThreadsPerBlock = 256; // use 8 warp in default
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
   static constexpr uint32_t NumMmaWarpGroups = 1;
   using ElementScale = float;
   using ProblemShape = Shape<int,int,int,int>;
 
-  using Builder0 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD,
-                                  ElementAcc, ElementCompute, SHAPE_N, SHAPE_K, kNumGroups, 0>;
-  using Builder1 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD,
-                                  ElementAcc, ElementCompute, SHAPE_N, SHAPE_K, kNumGroups, 1>;
-  using Builder2 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD,
-                                  ElementAcc, ElementCompute, SHAPE_N, SHAPE_K, kNumGroups, 2>;
-  using Builder3 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD,
-                                  ElementAcc, ElementCompute, SHAPE_N, SHAPE_K, kNumGroups, 3>;
-  using Builder4 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD,
-                                  ElementAcc, ElementCompute, SHAPE_N, SHAPE_K, kNumGroups, 4>;
+  static constexpr bool IsEP = (kGemmType == GemmType::GroupedMasked);
+
+  using KernelAiuDynamicTile = typename cutlass::platform::conditional<
+          IsEP,
+          typename cutlass::platform::conditional<
+            (SHAPE_K > 2048),
+            KernelAiuDynamicTileLargeK,
+            KernelAiuDynamicTileSmallK>::type,
+          typename cutlass::platform::conditional<
+            (SHAPE_K > 384),
+            KernelAiuDynamicTileTPLargeK,
+            KernelAiuDynamicTileTPSmallK>::type,
+          >::type;
+
+  using Builder0 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD, ElementAcc, ElementCompute,
+                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuDynamicTile, 0>;
+  using Builder1 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD, ElementAcc, ElementCompute,
+                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuDynamicTile, 1>;
+  using Builder2 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD, ElementAcc, ElementCompute,
+                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuDynamicTile, 2>;
+  using Builder3 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD, ElementAcc, ElementCompute,
+                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuDynamicTile, 3>;
+  using Builder4 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD, ElementAcc, ElementCompute,
+                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuDynamicTile, 4>;
+
+  static constexpr uint32_t MaxThreadsPerBlock = Builder4::MaxThreadsPerBlock;
 
   using CollectiveEpilogue = typename Builder4::CollectiveEpilogue;
   using TileScheduler = typename Builder4::TileScheduler;
