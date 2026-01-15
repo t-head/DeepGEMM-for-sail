@@ -388,7 +388,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     best_num_stages, best_smem_config, ppu_capacity = None, None, 262144
 
     block_k = 128
-    if k <= 256:
+    if (m > 32 and k == 256) or k == 128:
         block_k = 64
     if k >= 4096 and (best_block_m <= 32 and best_block_n <= 64):
         block_k = 256

@@ -134,7 +134,8 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
                                '-mllvm', '-ppu-adjust-tsm-valu-war=13',
                                '-mllvm', '-ppu-reassign-subregs=true',
                                '-mllvm', '-ppu-pref-fma-reuse=true',
-                               '-mllvm', '-ppu-pref-mma-reuse=true'])
+                               '-mllvm', '-ppu-pref-mma-reuse=true',
+                               '-mllvm', '-regalloc=pbqp'])
 
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi', '-fconcepts']
     flags = [*nvcc_flags, f'--compiler-options={",".join(cxx_flags)}']
