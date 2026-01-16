@@ -1029,12 +1029,22 @@ public:
         ElementD, LayoutD, AlignmentD,
         EpilogueDispatchPolicy
       >::CollectiveOp;
-    using CollectiveEpilogueNoTsm = cutlass::epilogue::collective::DefaultEpilogue<
+
+    // Epilogue
+    static constexpr bool IsAligedN = SHAPE_N % BLOCK_N == 0 ? true : false;
+    using CollectiveEpilogueNoTsm = typename cutlass::epilogue::collective::DefaultEpilogueNoTsm<
         cutlass::detail::TagToStrideA_t<LayoutC>,
         cutlass::detail::TagToStrideA_t<LayoutC>,
-        cutlass::epilogue::thread::LinearCombination<ElementC, 8, float, float>,
-        cutlass::gemm::EpilogueDefault>;
-    using CollectiveEpilogue = cute::conditional_t< (N_EXPAND == 1), CollectiveEpilogueWithTsm, CollectiveEpilogueNoTsm>;
+        cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float>,
+        cutlass::gemm::EpilogueDefault,
+        IsAligedN>;
+    // using CollectiveEpilogue = cute::conditional_t< (N_EXPAND == 1), CollectiveEpilogueWithTsm, CollectiveEpilogueNoTsm>;
+    static constexpr bool EpilogueWithTsm = false;
+    using CollectiveEpilogue = typename cutlass::platform::conditional<
+        EpilogueWithTsm,
+        CollectiveEpilogueWithTsm,
+        CollectiveEpilogueNoTsm
+    >::type;
 
     static void run(__nv_bfloat16* gmem_d,
                     __nv_fp8_e4m3* input_a,
