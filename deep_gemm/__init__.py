@@ -29,6 +29,12 @@ from .jit_kernels import (
     bf16_paged_mqa_logits,
     int8_paged_mqa_logits,
 )
+
+# Some alias for APIs
+fp8_m_grouped_gemm_nt_masked = m_grouped_gemm_fp8_fp8_bf16_nt_masked
+m_grouped_fp8_gemm_nt_contiguous = m_grouped_gemm_fp8_fp8_bf16_nt_contiguous
+get_mn_major_tma_aligned_tensor = get_col_major_tma_aligned_tensor
+
 from .utils import (
     bench,
     bench_kineto,
