@@ -96,7 +96,7 @@ if __name__ == '__main__':
             "version_scheme": custom_version_scheme,
         },
         setup_requires=["setuptools_scm"],
-        packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels'],
+        packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels', 'deep_gemm/deep_gemm_tuner'],
         package_data={
             'deep_gemm': [
                 'include/deep_gemm/*',

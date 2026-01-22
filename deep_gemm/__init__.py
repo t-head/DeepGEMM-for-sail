@@ -1,6 +1,7 @@
 import torch
 
 from . import jit
+from . import deep_gemm_tuner
 from .jit_kernels import (
     gemm_bf16_bf16_bf16_nt,
     gemm_int8_int8_bf16_nt,
