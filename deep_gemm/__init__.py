@@ -1,4 +1,27 @@
+import os
+import subprocess
 import torch
+from torch.version import cuda as cuda_version
+from packaging import version
+from torch.utils.cpp_extension import CUDA_HOME
+
+from . import deep_gemm_cpp
+# from .deep_gemm_cpp import (
+#     set_num_sms,
+#     get_num_sms,
+#     set_tc_util,
+#     get_tc_util,
+# )
+
+# DeepGEMM Kernels
+# from .deep_gemm_cpp import (
+#     # FP8 GEMMs
+#     gemm_fp8_fp8_bf16_nt, 
+#     # fp8_gemm_nn,
+#     # fp8_gemm_tn, fp8_gemm_tt,
+#     # gemm_bf16_bf16_bf16_nt
+#     # fp8_gemm_nt_skip_head_mid,
+# )
 
 from . import jit
 from . import deep_gemm_tuner
@@ -43,4 +66,10 @@ from .utils import (
     calc_diff,
     transform_sf_into_required_layout,
 )
+
 from .jit import set_compile_mode, get_compile_mode
+# Import functions from the CPP module
+deep_gemm_cpp.init(
+    os.path.dirname(os.path.abspath(__file__)), # Library root directory path
+    CUDA_HOME         # CUDA home
+)

@@ -4,13 +4,14 @@
     \brief Parameters structures for deepgemm schedulers
 */
 
-#include "utils.cuh"
+#include "utils_rtc.cuh"
 #include "cutlass/coord.h"
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/workspace.h"
 #include "cutlass/platform/platform.h"
 #include "cutlass/fast_math.h"
 #include "cutlass/gemm_coord.hpp"
+#include "cutlass/cutlass.h"
 ////////////////////////////////////////////////////////////////////////////////
 
 #define EnableGroupNoPadOpt
@@ -277,7 +278,6 @@ struct DeepGemmScheduler {
 
         // dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shape_mnkl, tile_shape, cluster_shape);
         auto problem_shape = cutlass::gemm::to_gemm_coord(problem_shape_mnkl);
-
         Params params(problem_shape.m(), groups_layout);
         return params;
     }

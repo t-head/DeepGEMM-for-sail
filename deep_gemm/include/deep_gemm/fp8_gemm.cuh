@@ -3,10 +3,13 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #define ACOMPUTE_VERSION 10500
 
-#include <iostream>
+// #include <iostream>
 #include <cuda_fp8.h>
-#include "profiling_interface.hpp"
-#include "utils.cuh"
+#ifndef FP8_NVRTC
+    #include "profiling_interface.hpp"
+    #include "tools/util/include/cutlass/util/host_tensor.h"
+#endif
+// #include "utils.cuh"
 
 #include "cutlass/cutlass.h"
 
@@ -28,7 +31,6 @@
 #include "cutlass/numeric_conversion.h"
 #include "ppu/gemm/config/gemm_configs.hpp"
 #include "ppu/cutlass/epilogue/fusion/ppu_callbacks.hpp"
-#include "tools/util/include/cutlass/util/host_tensor.h"
 #include "tools/util/include/cutlass/util/packed_stride.hpp"
 #include "scheduler_cutlass3.cuh"
 #include "utils_cutlass3.h"
@@ -146,16 +148,12 @@ public:
     int32_t* signal{nullptr};
   };
 
-  //
-  // Methods
-  //
 
   // Convert to underlying arguments. In this case, a simple copy for the aliased type.
   static
   Params
   to_underlying_arguments(Arguments const& args, void* workspace, int* grouped_layout) {
     CUTLASS_TRACE_HOST("to_underlying_arguments():");
-
     auto problem_shape = args.problem_shape;
     if constexpr (cutlass::gemm::kernel::detail::Has_SwapAB_v<CollectiveMainloop>) {
       // swap M/N
@@ -163,7 +161,6 @@ public:
       cute::get<1>(problem_shape) = cute::get<0>(args.problem_shape);
     }
     auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
-
     // Get SM count if needed, otherwise use user supplied SM count
     int sm_count = args.hw_info.sm_count;
     if (sm_count <= 0) {
@@ -179,16 +176,13 @@ public:
     // Calculate workspace pointers
     uint8_t* workspace_ptr = reinterpret_cast<uint8_t*>(workspace);
     size_t workspace_offset = 0;
-
     void* scheduler_workspace = workspace_ptr;
     workspace_offset += TileScheduler::template get_workspace_size<ProblemShape, ElementAccumulator>(
       args.scheduler, args.problem_shape, args.hw_info, NumMmaWarpGroups);
     workspace_offset = cutlass::round_nearest(workspace_offset,  cutlass::MinWorkspaceAlignment);
-
     void* epilogue_workspace = workspace_ptr + workspace_offset;
     workspace_offset += CollectiveEpilogue::get_workspace_size(args.problem_shape, args.epilogue);
     workspace_offset = cutlass::round_nearest(workspace_offset,  cutlass::MinWorkspaceAlignment);
-
     void* mainloop_workspace = nullptr;
     // Precompute the sub tiles numbers in epilogue, pass into tile scheduler.  Therefore it will be used
     // in separate reduction scheme for streamk case, NumEpilogueSubTiles default value is 1, which means
@@ -196,7 +190,6 @@ public:
     constexpr uint32_t NumEpilogueSubTiles = 1; //CollectiveEpilogue::get_store_pipe_increment(TileShape{});
     TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(grouped_layout,
       problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
-
     return {
       args.mode,
       problem_shape,
@@ -248,7 +241,6 @@ public:
   operator()(Params const& params, char* smem_buf) {
     using namespace cute;
     using X = Underscore;
-
     int warp_idx = cutlass::canonical_warp_idx_sync();
     if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
       // group is small 8|16, just prefetch one cacheline
@@ -287,7 +279,6 @@ public:
     int thread_idx = int(threadIdx.x);
     auto blk_shape = TileShape{}; // (BLK_M,BLK_N,BLK_K)
     auto strides = make_stride(make_stride(_0{}, _1{}), make_stride(_0{}, M));
-
     uint32_t m_block_idx, n_block_idx;
     #pragma clang loop licm(disable)
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
@@ -300,6 +291,7 @@ public:
       auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
+
       const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_scalea;
       const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + offset_b / 128 / 128;
       auto mk_layout = make_layout(
@@ -328,7 +320,6 @@ public:
       auto n_max_coord = N - size<0>(gB) * get<1>(blk_coord_mnkl);                             // N - BLK_N * n_coord
       auto k_residue   = K - size<1>(gA) * size<2>(gA);                                        // K - BLK_K * k_coord_max
       auto residue_mnk = make_tuple(m_max_coord, n_max_coord, k_residue);
-
       // Allocate the tiled_mma and the accumulators for the (M,N) blk_shape
       TiledMma tiled_mma;
       Tensor accumulators = partition_fragment_C(tiled_mma, take<0,2>(blk_shape)); // (MMA,MMA_M,MMA_N)
@@ -346,11 +337,9 @@ public:
         thread_idx,
         smem_buf
       );
-
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
       params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
-
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
       epilogue(
@@ -363,7 +352,6 @@ public:
         thread_idx,
         (char*)&shared_storage.tensors.epilogue
       );
-
       if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
         cp_async_wait<0>();
         __syncthreads();
@@ -553,7 +541,7 @@ public:
     bool implementable = (args.mode == GemmUniversalMode::kGemm) or
         (args.mode == GemmUniversalMode::kBatched && cute::rank(ProblemShape{}) == 4);
     if (!implementable) {
-      CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Arguments or Problem Shape don't meet the requirements.\n");
+      CUTLASS_TRACE_HOST("CAN IMPLEMENT: Arguments or Problem Shape don't meet the requirements.\n");
       return implementable;
     }
     implementable &= TileScheduler::can_implement(args.scheduler);
@@ -986,7 +974,6 @@ public:
         auto params_epilogue_local = params.epilogue;
         params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
         params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
-
         // Epilogue and write to gD
         CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
         epilogue(
@@ -1080,7 +1067,7 @@ public:
       ElementAccumulator,
       TileShape, WarpShape,
       Int<Stage>,
-      cutlass::gemm::KernelAiuMultistageWithBlockWiseScale,
+      cutlass::gemm::KernelAiuMultistageWithBlockWiseScale
     >::CollectiveOp;
 
     using EpilogueDispatchPolicy = cutlass::epilogue::EpilogueSimtVectorized;
@@ -1122,6 +1109,7 @@ public:
                     int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
         constexpr int N_EXPAND = kUseNStageKernel ? 4 : 1;
         using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, kNumGroups>;
+        
         using GemmKernel = typename deep_gemm::DeepGemmUniversal<
           Shape<int,int,int,int>,
           CollectiveMainloop,

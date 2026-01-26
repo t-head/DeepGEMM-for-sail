@@ -73,4 +73,8 @@ if __name__ == '__main__':
     for idx, one_case in enumerate(dg_cases):
         print(f'Profiling {idx + 1}/{total}')
         print(f'case info:{one_case}')
-        call_test_func(one_case['gemm_type'], one_case)
+        try:
+            call_test_func(one_case['gemm_type'], one_case)
+        except Exception as e:
+            print(f"❌ Test {idx} failed with error: {e}")
+            continue

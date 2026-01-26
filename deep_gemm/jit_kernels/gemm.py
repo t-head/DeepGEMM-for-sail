@@ -320,7 +320,6 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     warp_m = best_block_m // 2
     warp_n = best_block_n // 2
-
     if best_block_m == 256 and best_block_n == 256:
         warp_m = best_block_m // 4
         warp_n = best_block_n // 4

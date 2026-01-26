@@ -3,10 +3,11 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 // #define ACOMPUTE_VERSION 10000
-#include "profiling_interface.hpp"
-
-#include <iostream>
-#include <stdlib.h>
+#ifndef FP8_NVRTC
+    #include "profiling_interface.hpp"
+#endif
+// #include <iostream>
+// #include <stdlib.h>
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/mma.h"
@@ -1495,7 +1496,7 @@ public:
       auto params_epilogue_local = params.epilogue;
       params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
       params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
-
+      
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
       epilogue(

@@ -653,7 +653,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
             _acc = "--disable_acc"
             cmd = '{} --clock-control none {} --metrics="{}"  \
                 --page=details python {} --format "{}" {} \
-                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", '--kernel-name regex:gemm*' if dev == "gpu" else "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*'", metrics_string, script, case, _acc, log_file)
+                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", '--kernel-name regex:gemm*' if dev == "gpu" else "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*'", metrics_string, script, case, _acc, log_file)
 
         ret = run_cmd(cmd)
         result = "Fail"

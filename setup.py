@@ -4,10 +4,26 @@ import shutil
 import subprocess
 from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
+from setuptools import find_packages
+from torch.utils.cpp_extension import CppExtension, CUDA_HOME
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
-jit_include_dirs = ('deep_gemm/include/deep_gemm', )
-third_party_include_dirs = (
+cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-g']
+sources = ['csrc/python_api.cpp']
+build_include_dirs = [
+    f'{CUDA_HOME}/include',
+    'deep_gemm/include',
+    'third-party/cutlass3/include',
+    'third-party/cutlass3/tools',
+    'third-party/fmt/include',
+]
+build_libraries = ['cuda', 'cudart', 'nvrtc']
+build_library_dirs = [
+    f'{CUDA_HOME}/lib64',
+    f'{CUDA_HOME}/lib64/stub'
+]
+
+third_party_include_dirs = [
     'third-party/cutlass/include/accutlass.h',
     'third-party/cutlass/include/cutlass',
     'third-party/cutlass/include/aiu',
@@ -15,7 +31,8 @@ third_party_include_dirs = (
     'third-party/cutlass3/include/cutlass',
     'third-party/cutlass3/include/ppu',
     'third-party/cutlass3/tools'
-)
+]
+
 
 
 class PostDevelopCommand(develop):
@@ -45,8 +62,22 @@ class CustomBuildPy(build_py):
         # First, prepare the include directories
         self.prepare_includes()
 
-        # Then run the regular build
+        # Second, make clusters' cache setting default into `envs.py`
+        self.generate_default_envs()
+
+        # Finally, run the regular build
         build_py.run(self)
+
+
+    def generate_default_envs(self):
+        code = '# Pre-installed environment variables\n'
+        code += 'persistent_envs = dict()\n'
+        for name in ('DG_JIT_CACHE_DIR', 'DG_JIT_PRINT_COMPILER_COMMAND', 'DG_JIT_DISABLE_SHORTCUT_CACHE'):
+            code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
+
+        with open(os.path.join(self.build_lib, 'deep_gemm', 'envs.py'), 'w') as f:
+            f.write(code)
+
 
     def prepare_includes(self):
         # Create temporary build directory instead of modifying package directory
@@ -77,7 +108,7 @@ class CustomBuildPy(build_py):
 
 def custom_local_scheme(version):
     return 'dev%03d.%s' % (version.distance, version.short_node)
-
+    
 def custom_version_scheme(version):
     return '1.0.0'
 
@@ -96,14 +127,24 @@ if __name__ == '__main__':
             "version_scheme": custom_version_scheme,
         },
         setup_requires=["setuptools_scm"],
-        packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels', 'deep_gemm/deep_gemm_tuner'],
+        # version='2.0.0' + revision,
+        packages=find_packages('.'), # old version: packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels', 'deep_gemm/deep_gemm_tuner'],, 
         package_data={
             'deep_gemm': [
-                'include/deep_gemm/*',
+                'include/deep_gemm/**/*',
                 'include/cutlass/**/*',
                 'include/cutlass3/**/*'
             ]
         },
+        ext_modules=[
+            CppExtension(name='deep_gemm.deep_gemm_cpp',
+                         sources=sources,
+                         include_dirs=build_include_dirs,
+                         libraries=build_libraries,
+                         library_dirs=build_library_dirs,
+                         extra_compile_args=cxx_flags)
+        ],
+        zip_safe=False,
         cmdclass={
             'develop': PostDevelopCommand,
             'build_py': CustomBuildPy,

@@ -7,6 +7,7 @@
 #include <vector>
 #include <functional>
 #include <iomanip>
+#include "utils_rtc.cuh"
 
 #ifdef __CLION_IDE__
 __host__ __device__ __forceinline__ void host_device_printf(const char* format, ...) { asm volatile("trap;"); }
@@ -19,23 +20,6 @@ __device__ __forceinline__ int atomic_add_release_global(int* addr, int value) {
     return ret;
 }
 
-enum class GemmType {
-    DenseGemm,
-    GroupedContiguous,
-    GroupedMasked,
-    GroupedNoPad
-};
-
-const char* GemmTypeS[] = { "DenseGemm", "GroupedContiguous", "GroupedMasked", "GroupedNoPad"};
-
-enum class KernelType {
-    Default,
-    MultistageOnN,
-    OverlapPrologue,
-    OverlapMainloop
-};
-
-const char* KernelTypeS[] = { "Default", "MultistageOnN", "OverlapPrologue", "OverlapMainloop"};
 
 class AssertionException : public std::exception {
 private:
@@ -71,16 +55,6 @@ do {                                                                            
 #ifndef DG_STATIC_ASSERT
 #define DG_STATIC_ASSERT(cond, reason) static_assert(cond, reason)
 #endif
-
-template <typename T>
-__device__ __host__ constexpr T ceil_div(T a, T b) {
-    return (a + b - 1) / b;
-}
-
-template <typename T>
-__device__ __host__ constexpr T constexpr_gcd(T a, T b) {
-    return b == 0 ? a : constexpr_gcd(b, a % b);
-}
 
 #define CHECK_CUDA(call) \
 { \

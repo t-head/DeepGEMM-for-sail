@@ -7,3 +7,7 @@
 	path = third-party/cutlass3
 	url = ssh://ai-gerrit.eng.t-head.cn:29418/AI/SW/Libraries/cutlass3
 	branch = v3.6.0_ppu_dev
+[submodule "third-party/fmt"]
+	path = third-party/fmt
+	url = https://github.com/fmtlib/fmt.git
+	branch = master

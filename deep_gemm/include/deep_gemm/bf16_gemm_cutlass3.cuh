@@ -3,9 +3,11 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 // #define ACOMPUTE_VERSION 10000
-#include "profiling_interface.hpp"
 
-#include <iostream>
+#ifndef BF16_NVRTC
+    #include "profiling_interface.hpp"
+#endif
+// #include <iostream>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
@@ -1187,7 +1189,6 @@ public:
     // Get the appropriate blocks for this thread block -- potential for thread block locality
     int thread_idx = int(threadIdx.x);
     auto blk_shape = TileShape{}; // (BLK_M,BLK_N,BLK_K)
-
     TileScheduler deep_scheduler(params.scheduler);
 
     uint32_t m_coord, n_coord;
@@ -1250,7 +1251,6 @@ public:
       auto params_epilogue_local = params.epilogue;
       params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
       params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
-
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
       epilogue(
