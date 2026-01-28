@@ -182,15 +182,21 @@ struct DeepGemmScheduler {
         return true;
     }
 
+    template<bool kEnableNExpand>
     CUTLASS_DEVICE int get_n_expand(int curr_group_m) {
         int n_expand = 1;
-        if ((SHAPE_K > 2048 && curr_group_m > 32 && curr_group_m <= 64)
-            || (SHAPE_K <= 2048 && curr_group_m <= 64)) {
-            n_expand = 2;
+        if constexpr (kEnableNExpand) {
+            if ((SHAPE_K > 2048 && curr_group_m > 32 && curr_group_m <= 64)
+                || (SHAPE_K <= 2048 && curr_group_m <= 64)) {
+                n_expand = 2;
+            }
+            return n_expand;
+        } else {
+            return 1;
         }
-        return n_expand;
     }
 
+    template<bool kEnableNExpand = true>
     CUTLASS_DEVICE bool fetch_next_work_dynamic_tile(uint32_t& m_block_idx, uint32_t& n_block_idx) {
         const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
         if (kIsNoPadPreprocessLayout) {
@@ -219,7 +225,7 @@ struct DeepGemmScheduler {
 
                 // Within the current group
                 curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
-                n_expand = get_n_expand(curr_group_m);
+                n_expand = get_n_expand<kEnableNExpand>(curr_group_m);
                 num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
                 curr_cumsum_blocks_prev = curr_cumsum_blocks;

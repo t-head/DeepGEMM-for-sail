@@ -33,8 +33,19 @@ struct KernelAiuDynamicTileSmallK {
   };
 };
 
-struct KernelAiuDynamicTileTPLargeK {
+struct KernelAiuDynamicTileLargeEM {
   constexpr static int DynamicTildId = 2;
+  constexpr static int TileConfigList[TileLength][ElementsPerTile] = {
+    {128, 256, 32, 64, 128, 5},
+    {192, 256, 48, 64, 128, 4},
+    {256, 256, 64, 64, 128, 4},
+    {256, 256, 64, 64, 128, 4},
+    {256, 256, 64, 64, 128, 4}
+  };
+};
+
+struct KernelAiuDynamicTileTPLargeK {
+  constexpr static int DynamicTildId = 10;
   constexpr static int TileConfigList[TileLength][ElementsPerTile] = {
     {16, 256, 16, 32, 128, 3},
     {32, 256, 32, 32, 128, 3},
@@ -45,7 +56,7 @@ struct KernelAiuDynamicTileTPLargeK {
 };
 
 struct KernelAiuDynamicTileTPSmallK {
-  constexpr static int DynamicTildId = 3;
+  constexpr static int DynamicTildId = 11;
   constexpr static int TileConfigList[TileLength][ElementsPerTile] = {
     {16, 128, 16, 32, 128, 3},
     {32, 128, 32, 32, 128, 3},
@@ -128,19 +139,15 @@ struct PPUTypeBuilder {
       GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity   // B
   >;
 
-  static constexpr int AlignmentC = 16 / sizeof(ElementC);
-  using DefaultOperation = cutlass::epilogue::fusion::LinearCombination<ElementD, ElementCompute>;
-  using EpilogueSchedule = typename cutlass::epilogue::EpilogueSimtVectorized;
-  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
-      TileShape, WarpShape,
-      cutlass::epilogue::collective::EpilogueTileAuto,
-      float, float,
-      ElementC, LayoutC, AlignmentC,
-      ElementC, LayoutC, AlignmentC,
-      EpilogueSchedule,
-      DefaultOperation
-  >::CollectiveOp;
+  // Epilogue
+  static constexpr bool IsAligedN = SHAPE_N % BLOCK_N == 0 ? true : false;
+  // reduce vreg to use ScaleType::Nothing for alpha=1 & beta=0
+  using CollectiveEpilogue = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
+      cutlass::detail::TagToStrideA_t<LayoutC>,
+      cutlass::detail::TagToStrideA_t<LayoutC>,
+      cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
+      cutlass::gemm::EpilogueDefault,
+      IsAligedN>;
 
   using TileScheduler = ::deep_gemm::DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, kNumGroups>;
 
@@ -236,7 +243,8 @@ template <
   typename ElementCompute,
   int SHAPE_N,
   int SHAPE_K,
-  int kNumGroups
+  int kNumGroups,
+  bool kLargeEM
 >
 struct DeepGemmDynamicTile {
 
@@ -261,13 +269,17 @@ struct DeepGemmDynamicTile {
   using KernelAiuDynamicTile = typename cutlass::platform::conditional<
           IsEP,
           typename cutlass::platform::conditional<
-            (SHAPE_K > 2048),
-            KernelAiuDynamicTileLargeK,
-            KernelAiuDynamicTileSmallK>::type,
+            kLargeEM,
+            KernelAiuDynamicTileLargeEM,
+            typename cutlass::platform::conditional<
+              (SHAPE_K > 2048),
+              KernelAiuDynamicTileLargeK,
+              KernelAiuDynamicTileTPSmallK>::type
+            >::type,
           typename cutlass::platform::conditional<
             (SHAPE_K > 384),
             KernelAiuDynamicTileTPLargeK,
-            KernelAiuDynamicTileTPSmallK>::type,
+            KernelAiuDynamicTileTPSmallK>::type
           >::type;
 
   using Builder0 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD, ElementAcc, ElementCompute,
@@ -280,7 +292,10 @@ struct DeepGemmDynamicTile {
                                   SHAPE_N, SHAPE_K, kNumGroups, KernelAiuDynamicTile, 3>;
   using Builder4 = PPUTypeBuilder<kGemmType, ElementA, ElementB, ElementD, ElementAcc, ElementCompute,
                                   SHAPE_N, SHAPE_K, kNumGroups, KernelAiuDynamicTile, 4>;
-
+  static constexpr bool kEnableNExpand = !(Builder4::BLOCK_N == Builder0::BLOCK_N
+                                           && Builder4::BLOCK_N == Builder1::BLOCK_N
+                                           && Builder4::BLOCK_N == Builder2::BLOCK_N
+                                           && Builder4::BLOCK_N == Builder3::BLOCK_N);
   static constexpr uint32_t MaxThreadsPerBlock = Builder4::MaxThreadsPerBlock;
 
   using CollectiveEpilogue = typename Builder4::CollectiveEpilogue;
@@ -327,7 +342,7 @@ struct DeepGemmDynamicTile {
     TileScheduler deep_scheduler({params.shape_m, params.grouped_layout});
 
     uint32_t m_block_idx, n_block_idx;
-    while (deep_scheduler.fetch_next_work_dynamic_tile(m_block_idx, n_block_idx)) {
+    while (deep_scheduler.template fetch_next_work_dynamic_tile<kEnableNExpand>(m_block_idx, n_block_idx)) {
       auto m_coord = m_block_idx;
       auto n_coord = n_block_idx;
 

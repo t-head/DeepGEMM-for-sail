@@ -1566,49 +1566,61 @@ public:
         int DynamicTildId = 0;
 
         if constexpr (kEnableMoeDynamicTile) {
-          using GemmKernel = cutlass::gemm::kernel::DeepGemmDynamicTile<
-                  kGemmType, ElementA, ElementB, ElementD, int32_t, ElementCompute,
-                  SHAPE_N, SHAPE_K, kNumGroups>;
+          auto launch_dynamic_tile_kernel = [&](auto gemm_kernel_) {
+            using GemmKernel = decltype(gemm_kernel_);
+            using TileScheduler = typename GemmKernel::TileScheduler;
+            kIsNoPadPreprocessLayout = TileScheduler::kIsNoPadPreprocessLayout;
+            DynamicTildId = GemmKernel::KernelAiuDynamicTile::DynamicTildId;
 
-          using TileScheduler = typename GemmKernel::TileScheduler;
-          kIsNoPadPreprocessLayout = TileScheduler::kIsNoPadPreprocessLayout;
-          DynamicTildId = GemmKernel::KernelAiuDynamicTile::DynamicTildId;
+            using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
+            using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
+            using StrideD = cutlass::detail::TagToStrideC_t<LayoutD>;
 
-          using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
-          using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
-          using StrideD = cutlass::detail::TagToStrideC_t<LayoutD>;
+            StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)shape_m, (int)SHAPE_K, 1));
+            StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape((int)SHAPE_N, (int)SHAPE_K, 1));
+            StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape((int)shape_m, (int)SHAPE_N, 1));
 
-          StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)shape_m, (int)SHAPE_K, 1));
-          StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape((int)SHAPE_N, (int)SHAPE_K, 1));
-          StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape((int)shape_m, (int)SHAPE_N, 1));
+            using Epilogue = typename GemmKernel::CollectiveEpilogue;
+            using ProblemShape = Shape<int,int,int,int>;
+            auto problem_shape_MNKL = ProblemShape{32, SHAPE_N, SHAPE_K, 1};
+            typename Epilogue::Arguments arg_epilogue = {{1.0f, 0.0f}, (ElementD*)gmem_d, stride_D, (ElementD*)gmem_d, stride_D};
+            auto params_epilogue = Epilogue::to_underlying_arguments(problem_shape_MNKL, arg_epilogue, nullptr);
 
-          using Epilogue = typename GemmKernel::CollectiveEpilogue;
-          using ProblemShape = Shape<int,int,int,int>;
-          auto problem_shape_MNKL = ProblemShape{32, SHAPE_N, SHAPE_K, 1};
-          typename Epilogue::Arguments arg_epilogue = {{1.0f, 0.0f}, (ElementD*)gmem_d, stride_D, (ElementD*)gmem_d, stride_D};
-          auto params_epilogue = Epilogue::to_underlying_arguments(problem_shape_MNKL, arg_epilogue, nullptr);
+            int* layout_info = grouped_layout;
+            // compute block_m_info
+            if (TileScheduler::kIsNoPadPreprocessLayout) {
+                uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+                computeBlockInfoKernel<TileScheduler::BLOCK_M><<<1, block_size, 0, stream>>>(
+                  reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
+                layout_info = block_m_info;
+            }
 
-          int* layout_info = grouped_layout;
-          // compute block_m_info
-          if (TileScheduler::kIsNoPadPreprocessLayout) {
-              uint32_t block_size = max(32, next_power_of_two(kNumGroups));
-              computeBlockInfoKernel<TileScheduler::BLOCK_M><<<1, block_size, 0, stream>>>(
-                reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
-              layout_info = block_m_info;
-          }
+            typename GemmKernel::Arguments arguments {
+                (ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B, scales_a, scales_b,
+                params_epilogue, shape_m, layout_info
+            };
 
-          typename GemmKernel::Arguments arguments {
-              (ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B, scales_a, scales_b,
-              params_epilogue, shape_m, layout_info
+            max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
+            dim3 const block = GemmKernel::get_block_shape();
+            dim3 const grid(num_sms * max_blocks_per_cu, 1, 1);
+            smem_size_kernel = GemmKernel::SharedStorageSize;
+            cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(arguments);
+
+            cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
           };
-
-          max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
-          dim3 const block = GemmKernel::get_block_shape();
-          dim3 const grid(num_sms * max_blocks_per_cu, 1, 1);
-          smem_size_kernel = GemmKernel::SharedStorageSize;
-          cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(arguments);
-
-          cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
+          if (expected_m > 73) {
+            constexpr bool kLargeEM = true;
+            using GemmKernel = cutlass::gemm::kernel::DeepGemmDynamicTile<
+                kGemmType, ElementA, ElementB, ElementD, int32_t, ElementCompute,
+                SHAPE_N, SHAPE_K, kNumGroups, kLargeEM>;
+            launch_dynamic_tile_kernel(GemmKernel{});
+          } else {
+            constexpr bool kLargeEM = false;
+            using GemmKernel = cutlass::gemm::kernel::DeepGemmDynamicTile<
+                kGemmType, ElementA, ElementB, ElementD, int32_t, ElementCompute,
+                SHAPE_N, SHAPE_K, kNumGroups, kLargeEM>;
+            launch_dynamic_tile_kernel(GemmKernel{});
+          }
         } else {
 
           using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
