@@ -18,6 +18,7 @@ from typing import Tuple
 from enum import Enum
 import ast
 from math_utils import *
+import numpy as np
 
 global _acc_check, _benchmark, _ref_backend
 global use_ppu, show_log
@@ -268,6 +269,28 @@ def find_next_power_of_2(m_list):
     bit = (int(max_val) - 1).bit_length()
     return 1 << bit
 
+def truncated_zipf(num_experts, tokens, a=1.1, random_seed=None):
+    """
+    return list[int]: length=num_experts, means selected time of each expert
+    """
+    if random_seed is not None:
+        torch.manual_seed(random_seed)
+
+    # 1. custom zifp: P(i) ∝ 1/i^a, allow a < 1
+    v = torch.arange(1, num_experts + 1, dtype=torch.float32)
+    p = 1.0 / (v ** a)
+    p = p / p.sum()  # normalize
+
+    # 2. add noise
+    noise = torch.randn(tokens, num_experts) * 0.1
+    logits = p.log().unsqueeze(0) + noise
+    pertoken_p = torch.softmax(logits, dim=-1)  # [tokens, num_experts]
+
+    # 3. sampling
+    selected_experts = torch.multinomial(pertoken_p, num_samples=1).squeeze(-1)  # [tokens]
+    count = np.bincount(selected_experts, minlength=num_experts)
+    return count
+
 def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=False, seed=0, em=0):
     group_m_list = list()
     if is_mask and em != 0:
@@ -291,14 +314,15 @@ def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=Fals
         random.seed(seed)
         # avg is expected_m_per_group, sigma is expected_m_per_group * 0.5
         group_m_list = [max(0, int(random.gauss(expected_m_per_group, expected_m_per_group * 0.5))) for _ in range(num_groups)]
-    elif distribution == "zipf":
-        import numpy as np
+    elif "zipf" in distribution:
         np.random.seed(seed)
         random.seed(seed)
+        zipf_a = 1.1 if "." not in distribution else float(distribution.replace("zipf",""))
+        dist = truncated_zipf(num_groups, m, a=zipf_a) # 参考moe bench中的逻辑
+        # dist = np.random.zipf(zipf_a, num_groups)
         # 为zip分布加入扰动，避免大量相同的值
-        dist = np.random.zipf(2.0, num_groups)
-        noise = [random.gauss(0, 1) for _ in range(num_groups)]
-        dist = dist + noise
+        # noise = [random.gauss(0, 1) for _ in range(num_groups)]
+        # dist = dist + noise
         scale = expected_m_per_group * num_groups / dist.sum()
         group_m_list = [max(0, x) for x in np.round(dist * scale).astype(int)]
     else:
@@ -307,6 +331,7 @@ def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=Fals
     if not is_mask:
         group_m_list = round_m_list_sum_to_m(group_m_list, m)
         assert sum(group_m_list) <= m, f"sum(m_list)={sum(group_m_list)} must <= m_sum={m}"
+    group_m_list = sorted(group_m_list, reverse=True)
     if show_log:
         print(f"distribution:{group_m_list}")
     return group_m_list

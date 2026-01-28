@@ -63,7 +63,6 @@ def test_gemm(d: torch.dtype, args = None) -> None:
     enable_multithread = not bool(cycle)
     if enable_multithread:
         tile_idx = [i for i in range(len(tile_list))]
-        thread_count = 16
         tile_group = split_list_into_groups(tile_idx, thread_count)
         processes = []
 
@@ -114,7 +113,6 @@ def test_m_grouped_gemm_contiguous(d: torch.dtype, args=None) -> None:
     enable_multithread = not bool(cycle)
     if enable_multithread:
         tile_idx = [i for i in range(len(tile_list))]
-        thread_count = 32
         tile_group = split_list_into_groups(tile_idx, thread_count)
         processes = []
 
@@ -173,7 +171,6 @@ def test_m_grouped_gemm_masked(d: torch.dtype, args) -> None:
     enable_multithread = not bool(cycle)
     if enable_multithread:
         tile_idx = [i for i in range(len(tile_list))]
-        thread_count = 32
         tile_group = split_list_into_groups(tile_idx, thread_count)
         processes = []
 
@@ -242,7 +239,6 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, args = None) -> None:
     enable_multithread = not bool(cycle)
     if enable_multithread:
         tile_idx = [i for i in range(len(tile_list))]
-        thread_count = 32
         tile_group = split_list_into_groups(tile_idx, thread_count)
         processes = []
 
@@ -298,14 +294,16 @@ if __name__ == '__main__':
     parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
+    parser.add_argument('--thread_count', default=32, type=int, required=False, help='the thread_count when run multi thread prebuild')
 
     args = parser.parse_args()
 
-    global cycle
+    global cycle, thread_count
     cycle = 0
     if (args.cycle):
         cycle = 1
-    print("cycle:", cycle)
+    thread_count = args.thread_count
+    print(f"cycle: {cycle}, thread_count: {thread_count}")
     if os.environ.get('HGGC_WARM_UP', False):
         print(f'WARM UP FOR COMPILING ...')
 

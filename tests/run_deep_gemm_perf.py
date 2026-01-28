@@ -4,7 +4,12 @@ import torch
 from utils import run_cycle_on_device, str_to_list, worker, split_list_into_groups
 from utils import set_acc_check, set_ref_backend
 import multiprocessing as mp
-
+import atexit
+def cuda_sync_at_exit():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        print("CUDA synchronized on exit.")
+atexit.register(cuda_sync_at_exit)
 device_name = torch.cuda.get_device_name()
 USE_PPU = (device_name.lower().find("ppu") != -1) or (device_name.lower().find("zw") != -1)
 if not any(k in device_name.lower() for k in ['ppu','zw','nvidia']):

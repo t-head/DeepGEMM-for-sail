@@ -6,6 +6,12 @@ from utils import parse_deepgemm_string_re, read_cmds_from_file
 from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad
 from utils import set_acc_check, set_benchmark
 from utils import judge_device_type, set_ref_backend
+import atexit
+def cuda_sync_at_exit():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        print("CUDA synchronized on exit.")
+atexit.register(cuda_sync_at_exit)
 def call_test_func(gemm_type, func_args):
     supported_call_funcs = {
         "GroupedContiguous": test_m_grouped_gemm_contiguous,
