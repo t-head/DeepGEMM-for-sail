@@ -388,7 +388,7 @@ public:
     auto K_BLOCK_MAX = size<2>(tCrA_copy_view);
     auto K_ATOM_PER_COPY = size<2>(tCrA) / size<2>(tCrA_copy_view);
 
-    auto enable_print = 0; //cute::thread(0,1);
+    constexpr bool enable_print = false;
 
     if (enable_print) {
         params.print();

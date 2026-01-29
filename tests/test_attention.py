@@ -68,6 +68,17 @@ def kv_cache_cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
     x_fp8[ :, block_size * head_dim :] = sf.view(num_blocks, block_size).view(dtype=torch.uint8)
     return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4)
 
+def kv_cache_cast_to_int8(x: torch.Tensor) -> torch.Tensor:
+    num_blocks, block_size, num_heads, head_dim = x.shape
+    assert num_heads == 1
+    x_amax = x.abs().float().amax(dim=3, keepdim=True).clamp(1e-4)
+    sf = x_amax / 127.0
+    x_scaled = (x * (1.0 / sf)).to(torch.int8)
+    x_int8 = torch.empty((num_blocks, block_size * (head_dim + 4)), device=x.device, dtype=torch.uint8)
+    x_int8[:, : block_size * head_dim] = x_scaled.view(num_blocks, block_size * head_dim).view(dtype=torch.uint8)
+    x_int8[:, block_size * head_dim:] = sf.view(num_blocks, block_size).view(dtype=torch.uint8)
+    return x_int8.view(num_blocks, block_size, num_heads, head_dim + 4)
+
 
 def generate_cp_test_data(seq_len, seq_len_kv):
     assert seq_len_kv % seq_len == 0 and seq_len % 2 == 0
@@ -146,11 +157,12 @@ def test_mqa_logits():
                     kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0, ), False)
                     logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
                 elif qk_dtype == torch.int8:
-                    q_int8_2d = per_token_cast_to_int8(q.reshape(seq_len*num_heads, head_dim))
-                    q_int8 = q_int8_2d[0].reshape(seq_len, num_heads, head_dim)
-                    q_int8_scale = q_int8_2d[1].reshape(seq_len, num_heads)
+                    q_int8, q_int8_scale = per_token_cast_to_int8(q.reshape(seq_len*num_heads, head_dim))
+                    q_int8 = q_int8.reshape(seq_len, num_heads, head_dim)
+                    q_int8_scale = q_int8_scale.reshape(seq_len, num_heads)
+                    weights_int8 = weights * q_int8_scale
                     kv_int8 = per_token_cast_to_int8(kv)
-                    logits = deep_gemm.int8_mqa_logits((q_int8, q_int8_scale), kv_int8, weights, ks, ke)
+                    logits = deep_gemm.int8_mqa_logits(q_int8, kv_int8, weights_int8, ks, ke)
 
                 do_check = (seq_len_kv < 32768)
                 if do_check:
@@ -254,65 +266,80 @@ def test_paged_mqa_logits():
                         block_tables[i][j] = block_idx_pool[counter]
                         counter += 1
 
-                q_fp8 = q.to(torch.float8_e4m3fn)
-                kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
-
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms())
-                logits = deep_gemm.fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
-
                 ref_logits = ref_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len)
                 positions = torch.arange(max_model_len, device='cuda').unsqueeze(0).expand(batch_size * next_n, -1)
                 row_indices = torch.arange(batch_size * next_n, device='cuda') // next_n
                 next_n_offset = torch.arange(batch_size * next_n, device='cuda') % next_n
                 ref_neginf_mask = ~(positions <= (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(1))
 
-                neginf_mask = (logits == float('-inf'))
-                # assert torch.equal(neginf_mask, ref_neginf_mask)
+                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms())
 
-                logits = logits.masked_fill(ref_neginf_mask, 0)
-                ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
-                diff = calc_diff(logits, ref_logits)
+                qk_dtype_list = [torch.bfloat16, torch.int8]
+                if is_ppu1v5_device():
+                    qk_dtype_list.append(torch.float8_e4m3fn)
+                for qk_dtype in qk_dtype_list:
+                    if qk_dtype == torch.float8_e4m3fn:
+                        q_fp8 = q.to(torch.float8_e4m3fn)
+                        kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
+                        logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
+                    elif qk_dtype == torch.bfloat16:
+                        logits = deep_gemm.bf16_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
+                    elif qk_dtype == torch.int8:
+                        q_int8, q_int8_scale = per_token_cast_to_int8(q.reshape(batch_size * next_n * heads, index_dim))
+                        q_int8 = q_int8.reshape(batch_size, next_n, heads, index_dim)
+                        q_int8_scale = q_int8_scale.reshape(batch_size * next_n, heads)
+                        weights_int8 = weights * q_int8_scale
+                        kv_cache_int8 = kv_cache_cast_to_int8(kv_cache)
+                        logits = deep_gemm.int8_paged_mqa_logits(q_int8, kv_cache_int8, weights_int8, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
+                
 
-                if debug:
-                    def check_col(col=0, rtol=0.1):
-                        for row in range(logits.size(0)):
-                            if abs((logits[row,col] - ref_logits[row,col]) / ref_logits[row,col]) > rtol:
-                                print('fail, (row,col) = (', row, col, "), value = ", logits[row,col], 'ref = ', ref_logits[row,col])
-                                break
-                            else:
-                                print('pass, (row,col) = (', row, col, "), value = ", logits[row,col], 'ref = ', ref_logits[row,col])
-                    def check_row(row=0, rtol=0.1):
-                        for col in range(logits.size(1)):
-                            if abs((logits[row,col] - ref_logits[row,col]) / ref_logits[row,col]) > rtol:
-                                print('fail, (row,col) = (', row, col, "), value = ", logits[row,col], 'ref = ', ref_logits[row,col])
-                                break
-                            else:
-                                print('pass, (row,col) = (', row, col, "), value = ", logits[row,col], 'ref = ', ref_logits[row,col])
+                    neginf_mask = (logits == float('-inf'))
+                    # assert torch.equal(neginf_mask, ref_neginf_mask)
 
-                    # torch.set_printoptions(precision=2)
-                    print("ref_logits = ", ref_logits)
-                    # print("ref_logits[:,0] = ", ref_logits[:,0])
-                    print("logits = ", logits)
-                    # print("logits[:,0] = ", logits[:,0])
-                    print("logits size = ", ref_logits.size())
-                    print("context_lens[0] = ", context_lens[0])
-                    print("diff = ", diff)
-                    if diff >= 1e-3:
-                        import pdb;pdb.set_trace()
+                    logits = logits.masked_fill(ref_neginf_mask, 0)
+                    ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
+                    diff = calc_diff(logits, ref_logits)
 
-                assert diff < 1e-3, f"{diff=}"
+                    if debug:
+                        def check_col(col=0, rtol=0.1):
+                            for row in range(logits.size(0)):
+                                if abs((logits[row,col] - ref_logits[row,col]) / ref_logits[row,col]) > rtol:
+                                    print('fail, (row,col) = (', row, col, "), value = ", logits[row,col], 'ref = ', ref_logits[row,col])
+                                    break
+                                else:
+                                    print('pass, (row,col) = (', row, col, "), value = ", logits[row,col], 'ref = ', ref_logits[row,col])
+                        def check_row(row=0, rtol=0.1):
+                            for col in range(logits.size(1)):
+                                if abs((logits[row,col] - ref_logits[row,col]) / ref_logits[row,col]) > rtol:
+                                    print('fail, (row,col) = (', row, col, "), value = ", logits[row,col], 'ref = ', ref_logits[row,col])
+                                    break
+                                else:
+                                    print('pass, (row,col) = (', row, col, "), value = ", logits[row,col], 'ref = ', ref_logits[row,col])
 
-                # sum_lens = sum(context_lens.to(torch.int64))
-                # tflops = 2 * sum_lens * next_n * heads * index_dim / 1e12
-                # input_bytes = count_bytes(q_fp8, weights, context_lens) + sum_lens * (index_dim + 4) + (sum_lens / blocksize) * 4
-                # output_bytes = sum_lens * next_n * 4
-                # t, clean_t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True),
-                #                           ('fp8_paged_mqa_logits', 'clean_logits'))
-                # clean_bytes = (batch_size * next_n * max_model_len - neginf_mask.sum().item()) * 4 + count_bytes(context_lens)
-                # print(f' > BSZ={batch_size:3}, NextN={next_n:1}, H={heads:2}, D={index_dim:2}, L={avg_kv:6}: '
-                #       f'{tflops / t:4.0f} TFLOPS, {t * 1e6:3.0f} us, '
-                #       f'{(input_bytes + output_bytes) / t / 1e9:4.0f} GB/s | '
-                #       f'clean: {clean_t * 1e6:3.0f} us, {clean_bytes / clean_t / 1e9:4.0f} GB/s')
+                        # torch.set_printoptions(precision=2)
+                        print("ref_logits = ", ref_logits)
+                        # print("ref_logits[:,0] = ", ref_logits[:,0])
+                        print("logits = ", logits)
+                        # print("logits[:,0] = ", logits[:,0])
+                        print("logits size = ", ref_logits.size())
+                        print("context_lens[0] = ", context_lens[0])
+                        print("diff = ", diff)
+                        if diff >= 1e-3:
+                            import pdb;pdb.set_trace()
+
+                    assert diff < 1e-3, f"{diff=}"
+
+                    # sum_lens = sum(context_lens.to(torch.int64))
+                    # tflops = 2 * sum_lens * next_n * heads * index_dim / 1e12
+                    # input_bytes = count_bytes(q_fp8, weights, context_lens) + sum_lens * (index_dim + 4) + (sum_lens / blocksize) * 4
+                    # output_bytes = sum_lens * next_n * 4
+                    # t, clean_t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True),
+                    #                           ('fp8_paged_mqa_logits', 'clean_logits'))
+                    # clean_bytes = (batch_size * next_n * max_model_len - neginf_mask.sum().item()) * 4 + count_bytes(context_lens)
+                    # print(f' > BSZ={batch_size:3}, NextN={next_n:1}, H={heads:2}, D={index_dim:2}, L={avg_kv:6}: '
+                    #       f'{tflops / t:4.0f} TFLOPS, {t * 1e6:3.0f} us, '
+                    #       f'{(input_bytes + output_bytes) / t / 1e9:4.0f} GB/s | '
+                    #       f'clean: {clean_t * 1e6:3.0f} us, {clean_bytes / clean_t / 1e9:4.0f} GB/s')
     print("Passed\n")
 
 

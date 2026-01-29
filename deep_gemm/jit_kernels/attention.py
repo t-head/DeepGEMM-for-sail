@@ -34,7 +34,7 @@ atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, (uint3
              seq_len_q, seq_len_k, aligned_seq_len_kv, stream, num_sms);
 """
 
-def mqa_logits_common(q: torch.Tensor, q_scales: torch.Tensor,
+def mqa_logits_common(q: torch.Tensor,
                       k: torch.Tensor, k_scales: torch.Tensor,
                       weights: torch.Tensor,
                       cu_seq_len_k_start: torch.Tensor,
@@ -67,13 +67,6 @@ def mqa_logits_common(q: torch.Tensor, q_scales: torch.Tensor,
         assert(seq_len_k == seq_len_kv_)
         assert(k_scales.is_contiguous())
         assert(k_scales.dtype == torch.float32)
-
-    weights_update = weights * q_scales if q.dtype == torch.int8 else weights
-
-    if q.dtype == torch.int8:
-        assert(q_scales != None)
-        assert(q_scales.is_contiguous())
-        assert(q_scales.size(0) == weights.size(0))
 
     debug = False
     if debug:
@@ -151,7 +144,7 @@ def mqa_logits_common(q: torch.Tensor, q_scales: torch.Tensor,
     num_sms = get_num_sms()
     stream = torch.cuda.current_stream()
     # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
-    args = (q, k, k_scales, weights_update, cu_seq_len_k_start, cu_seq_len_k_end, logits,
+    args = (q, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
             seq_len_q, seq_len_k, aligned_seq_len_kv, stream, num_sms)
     runtime = jit_tuner.compile_and_tune(
         name='attention_mqa_logits_' + ElementQK,
@@ -187,9 +180,8 @@ def bf16_mqa_logits(q: torch.Tensor,
                     cu_seq_len_k_start: torch.Tensor,
                     cu_seq_len_k_end: torch.Tensor,
                     clean_logits: bool = True):
-    q_scales = None
     k_scales = torch.empty(0)
-    return mqa_logits_common(q, q_scales, kv, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
+    return mqa_logits_common(q, kv, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
 
 def fp8_mqa_logits(q: torch.Tensor,
                    kv_s: Tuple[torch.Tensor],
@@ -198,18 +190,16 @@ def fp8_mqa_logits(q: torch.Tensor,
                    cu_seq_len_k_end: torch.Tensor,
                    clean_logits: bool = True):
     k, k_scales = kv_s
-    q_scales = None
-    return mqa_logits_common(q, q_scales, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
+    return mqa_logits_common(q, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
 
-def int8_mqa_logits(q_s: Tuple[torch.Tensor],
+def int8_mqa_logits(q: torch.Tensor,
                    kv_s: Tuple[torch.Tensor],
                    weights: torch.Tensor,
                    cu_seq_len_k_start: torch.Tensor,
                    cu_seq_len_k_end: torch.Tensor,
                    clean_logits: bool = True):
-    q, q_scales = q_s
     k, k_scales = kv_s
-    return mqa_logits_common(q, q_scales, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
+    return mqa_logits_common(q, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
 
 
 includes_paged = ('"../deep_gemm/ppu_paged_mqa_logits.cuh"', )
@@ -298,29 +288,30 @@ def paged_mqa_logits_common(q: torch.Tensor,
     kv_cache_stride_bytes = fused_kv_cache.stride(0)
     block_table_stride = block_table.stride(0)
 
-    size_of_float = 4
+    size_of_scale_float = 0 if q.dtype == torch.bfloat16 else 4
     num_sms = get_num_sms()
     assert(batch_size == batch_size_ and batch_size == batch_size__)
     assert(batch_size_next_n == batch_size * next_n)
     assert(num_heads == num_heads_ and num_heads_kv == 1)
-    # assert(head_dim_with_sf == head_dim + size_of_float)
+    assert(head_dim_with_sf == head_dim + size_of_scale_float)
     assert(schedule_meta_size == num_sms + 1 and meta_info_size == 2)
 
     assert(next_n == 1 or next_n == 2)
     assert(block_kv == 64)
 
     assert(q.is_contiguous())
-    assert(kv_cache_stride_bytes % size_of_float == 0)
-    # assert(fused_kv_cache.stride(1) == head_dim_with_sf)
-    # assert(fused_kv_cache.stride(2) == head_dim_with_sf)
+    if q.dtype != torch.bfloat16: 
+        assert(kv_cache_stride_bytes % size_of_scale_float == 0)
+    assert(fused_kv_cache.stride(1) == head_dim_with_sf)
+    assert(fused_kv_cache.stride(2) == head_dim_with_sf)
     assert(fused_kv_cache.stride(3) == 1)
     assert(weights.is_contiguous())
     assert(context_lens.is_contiguous())
     assert(block_table.stride(1) == 1)
     assert(schedule_meta.is_contiguous())
 
-    # assert(q.dtype == torch.float8_e4m3fn)
-    # assert(fused_kv_cache.dtype == torch.uint8)
+    if q.dtype != torch.bfloat16: 
+        assert(fused_kv_cache.dtype == torch.uint8)
     assert(weights.dtype == torch.float)
     assert(context_lens.dtype == torch.int32)
     assert(block_table.dtype == torch.int32)
@@ -332,15 +323,18 @@ def paged_mqa_logits_common(q: torch.Tensor,
         input=fused_kv_cache,
         size=(num_kv_blocks, block_kv, head_dim),
         stride=(kv_cache_stride_bytes, head_dim, 1),
-    )
+    ).view(dtype=q.dtype)
 
     # import pdb;pdb.set_trace()
-    k_scales = torch.as_strided(
-        input=fused_kv_cache,
-        size=(num_kv_blocks, block_kv),
-        stride=(int(kv_cache_stride_bytes / size_of_float), 1),
-        storage_offset = block_kv * head_dim,
-    ).to(torch.float)
+    if q.dtype == torch.bfloat16:
+        k_scales = torch.empty(0)
+    else:
+        k_scales = torch.as_strided(
+            input=fused_kv_cache,
+            size=(num_kv_blocks, block_kv * 4),
+            stride=(kv_cache_stride_bytes, 1),
+            storage_offset = block_kv * head_dim,
+        ).view(dtype=torch.float)
 
     debug = False
     if debug:
@@ -377,7 +371,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
     args = (q, k, k_scales, weights, batch_size, logits_stride, block_table_stride, context_lens, logits,
             block_table, schedule_meta, stream, num_sms)
     runtime = jit_tuner.compile_and_tune(
-        name='attention_mqa_logits_' + ElementQK,
+        name='attention_paged_mqa_logits_' + ElementQK,
         keys={'ElementQK': ElementQK, 'ElementAcc' : ElementAcc,
               'kNextN' : next_n, 'kNumHeads': num_heads,
               'kHeadDim': head_dim, 'BLOCK_KV': block_kv,
@@ -406,8 +400,6 @@ def bf16_paged_mqa_logits(q: torch.Tensor,
                           schedule_meta: torch.Tensor,
                           max_context_len: int,
                           clean_logits: bool = True):
-    # q_scales = None
-    # k_scales = torch.empty(0)
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)
 
 def fp8_paged_mqa_logits(q: torch.Tensor,
@@ -418,6 +410,14 @@ def fp8_paged_mqa_logits(q: torch.Tensor,
                          schedule_meta: torch.Tensor,
                          max_context_len: int,
                          clean_logits: bool = True):
-    # q_scales = None
-    # k_scales = torch.empty(0)
+    return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)
+
+def int8_paged_mqa_logits(q: torch.Tensor,
+                         fused_kv_cache: torch.Tensor,
+                         weights: torch.Tensor,
+                         context_lens: torch.Tensor,
+                         block_table: torch.Tensor,
+                         schedule_meta: torch.Tensor,
+                         max_context_len: int,
+                         clean_logits: bool = True):
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)

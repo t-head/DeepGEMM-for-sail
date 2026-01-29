@@ -482,7 +482,7 @@ public:
     Tensor tCsSFB                 = smem_thr_copy_ScaleB.partition_S(sSB_copy);
     Tensor tCrSFB_copy_view       = smem_thr_copy_ScaleB.retile_D(tCrSB);
 
-    auto enable_print = 0; //cute::thread(0,0);
+    constexpr bool enable_print = false;
 
     if (enable_print) {
         params.print();
@@ -516,6 +516,7 @@ public:
     auto tQgQ = tBgB;
     auto tSFQgSFQ = tSFBgSFB;
 
+    constexpr uint64_t kv_cache_stride_bytes = BLOCK_KV * (kHeadDim + (2 - sizeof(ElementQK)) * 4);
     const auto& lane_idx = get_lane_idx();
     const auto& warp_offset = (warp_idx % WarpOnM) * WARP_M;
     const auto& v_0_offset = lane_idx / 4 + 0;
@@ -524,127 +525,86 @@ public:
     int warp_group_id = warp_idx / 8;
 
     // Initialize `prev_q_idx` outside `[0, batch_size)` to indicate it was none
-    uint32_t prev_q_idx = params.batch_size, q_idx, kv_idx, num_kv;
-    uint32_t q_iter_idx = 0, kv_iter_idx = 0;
-
     uint32_t q_idx_array[kNumKVStages];
     uint32_t kv_idx_array[kNumKVStages];
-    uint32_t num_kv_array[kNumKVStages];
+    uint32_t num_kv; // num_kv is not used
+    uint32_t prev_q_idx_g2s = params.batch_size;
+    uint32_t prev_q_idx_s2r = params.batch_size;
+    uint32_t smem_pipe_read_q = 0, smem_pipe_read_kv = 0;
+    uint32_t smem_pipe_write_q = 0, smem_pipe_write_kv = 0;
 
-    uint32_t copy_q_stage_idx = 0;
-    uint32_t copy_kv_stage_idx = 0;
-    for (; copy_kv_stage_idx < kNumKVStages - 1; copy_kv_stage_idx++) {
-        if (scheduler.fetch_next_task(q_idx_array[copy_kv_stage_idx], kv_idx_array[copy_kv_stage_idx], num_kv_array[copy_kv_stage_idx])) {
+
+    auto load_next_qk_g2s = [&]() {
+        uint32_t& q_idx = q_idx_array[smem_pipe_write_kv];
+        uint32_t& kv_idx = kv_idx_array[smem_pipe_write_kv];
+        uint32_t& prev_q_idx = prev_q_idx_g2s;
+        if (scheduler.fetch_next_task(q_idx, kv_idx, num_kv)) {
             // Issue next AIU Q if exit
-            uint32_t prev_q_idx = copy_kv_stage_idx == 0 ? params.batch_size : q_idx_array[copy_kv_stage_idx - 1];
-            uint32_t curr_q_idx = q_idx_array[copy_kv_stage_idx];
-            bool prefetch_q = (prev_q_idx != curr_q_idx and scheduler.exist_q_idx(curr_q_idx));
-            if (enable_print) {
-                printf("Prologue: prefetch_q = %d, prev_q_idx = %d, curr_q_idx = %d, exist_q_idx = %d\n",
-                    prefetch_q, prev_q_idx, curr_q_idx, scheduler.exist_q_idx(curr_q_idx));
+            bool prefetch_q = (prev_q_idx != q_idx);
+            if (enable_print && prefetch_q) {
+                printf("load q = %d, prev_q_idx = %d, q_idx = %d\n", prefetch_q, prev_q_idx, q_idx);
             }
             if (prefetch_q) {
-                auto q_offset = curr_q_idx * BLOCK_N;
+                auto q_offset = q_idx * BLOCK_N;
                 tBgB.data() = tQgQ.data() + q_offset * kHeadDim;
                 tSFBgSFB.data() = tSFQgSFQ.data() + q_offset;
-                copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,0), tBsB(_,_,_,copy_q_stage_idx), warp_idx);
+                copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,0), tBsB(_,_,_,smem_pipe_write_q), warp_idx);
                 if (warp_idx < WAPR_LIMIT_SFB) {
-                    copy(gmem_tiled_copy_scaleB, tSFBgSFB(_,_,_,0), tSFBsSFB(_,_,_,copy_q_stage_idx));
+                    copy(gmem_tiled_copy_scaleB, tSFBgSFB(_,_,_,0), tSFBsSFB(_,_,_,smem_pipe_write_q));
                 }
                 if (enable_print) {
-                    printf("Prologue: copy q_offset = %d, stage = %d\n", q_offset, copy_q_stage_idx);
+                    printf("copy q_offset = %d, stage = %d\n", q_offset, smem_pipe_write_q);
                 }
-                copy_q_stage_idx++;
+                smem_pipe_write_q = (smem_pipe_write_q + 1) % kNumQStages;
             }
 
             // Issue AIU KV
-            uint32_t curr_kv_idx = kv_idx_array[copy_kv_stage_idx];
-            auto kv_offset = __ldg(params.block_table + curr_q_idx * params.block_table_stride + curr_kv_idx);
-            tAgA.data() = tKgK.data() + (uint64_t)kv_offset * BLOCK_KV * kHeadDim;;
-            tSFAgSFA.data() = tSFKgSFK.data() + kv_offset;
-            copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,copy_kv_stage_idx), warp_idx);
+            auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
+            tAgA.data() = tKgK.data() + kv_offset * kv_cache_stride_bytes;
+            tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * kv_cache_stride_bytes / 4;
+            copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), warp_idx);
+            if (sizeof(ElementQK) == 1 && warp_idx < WAPR_LIMIT_SFA) {
+                copy(gmem_tiled_copy_scaleA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv));
+            }
             if (enable_print) {
-                printf("Prologue: copy kv_offset = %d, stage = %d\n", kv_offset, copy_kv_stage_idx);
+                printf("copy kv_offset = %d, stage = %d\n", kv_offset, smem_pipe_write_kv);
             }
         }
+        prev_q_idx = q_idx;
+        smem_pipe_write_kv = (smem_pipe_write_kv + 1) % kNumKVStages;
         cp_async_fence();
+    };
+    while (smem_pipe_write_kv < kNumKVStages - 1) {
+        load_next_qk_g2s();
     }
-
     // wait AIU Q and first K
     cp_async_wait<kNumKVStages - 2>();
     __syncthreads();
 
-    uint32_t& copy_id = copy_kv_stage_idx;
-    uint32_t prev_copy_id = copy_kv_stage_idx - 1;
-
     while (true) {
-        uint32_t kv_stage_idx = kv_iter_idx % kNumKVStages;
-
         // Get current Q and KV index
-        q_idx = q_idx_array[kv_stage_idx];
-        kv_idx = kv_idx_array[kv_stage_idx];
-        num_kv = num_kv_array[kv_stage_idx];
-        bool is_last_task = scheduler.is_last_task(q_idx, kv_idx);
+        const uint32_t& q_idx = q_idx_array[smem_pipe_read_kv];
+        const uint32_t& kv_idx = kv_idx_array[smem_pipe_read_kv];
+        uint32_t& prev_q_idx = prev_q_idx_s2r;
 
-        if (is_last_task) { break; }
+        if (scheduler.is_last_task(q_idx, kv_idx)) break;
 
-        if (scheduler.fetch_next_task(q_idx_array[copy_id], kv_idx_array[copy_id], num_kv_array[copy_id])) {
-            uint32_t prev_q_idx = q_idx_array[prev_copy_id];
-            uint32_t curr_q_idx = q_idx_array[copy_id];
-            uint32_t curr_kv_idx = kv_idx_array[copy_id];
-            // Current Q changes
-            bool prefetch_q = (prev_q_idx != curr_q_idx and scheduler.exist_q_idx(curr_q_idx));
-            if (enable_print && prev_q_idx != curr_q_idx) {
-                printf("Mainloop: new q to load, prev_q_idx = %d, curr_q_idx = %d, exist_q_idx = %d\n",
-                    prev_q_idx, curr_q_idx, scheduler.exist_q_idx(curr_q_idx));
-            }
-            if (prefetch_q) {
-                // Issue next AIU Q
-                auto q_offset = curr_q_idx * BLOCK_N;
-                tBgB.data() = tQgQ.data() + q_offset * kHeadDim;
-                tSFBgSFB.data() = tSFQgSFQ.data() + q_offset;
-                copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,0), tBsB(_,_,_,copy_q_stage_idx), warp_idx);
-                if (warp_idx < WAPR_LIMIT_SFB) {
-                    copy(gmem_tiled_copy_scaleB, tSFBgSFB(_,_,_,0), tSFBsSFB(_,_,_,copy_q_stage_idx));
-                }
-                if (enable_print) {
-                    printf("Mainloop: copy q_offset = %d, stage = %d\n", q_offset, copy_q_stage_idx);
-                }
-
-                // update for next q load
-                copy_q_stage_idx = (copy_q_stage_idx + 1) % kNumQStages;
-            }
-
-            // Issue AIU KV copy
-            auto kv_offset = __ldg(params.block_table + curr_q_idx * params.block_table_stride + curr_kv_idx);
-            tAgA.data() = tKgK.data() + (uint64_t)kv_offset * BLOCK_KV * kHeadDim;
-            tSFAgSFA.data() = tSFKgSFK.data() + kv_offset;
-            copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,copy_id), warp_idx);
-            if (enable_print) {
-                printf("Mainloop: copy kv_offset = %d, stage = %d\n", kv_offset, copy_id);
-            }
-
-            prev_copy_id = copy_id;
-            copy_id = (copy_id + 1) % kNumKVStages;
-        }
-        cp_async_fence();
+        load_next_qk_g2s();
 
         if (enable_print) {
-            printf("prev_q_idx = %d, q_idx = %d, kv_idx = %d, num_kv=%d, is_last_task = %d\n",
-                prev_q_idx, q_idx, kv_idx, num_kv, is_last_task);
+            printf("prev_q_idx = %d, q_idx = %d, kv_idx = %d\n", prev_q_idx, q_idx, kv_idx);
         }
 
         // Read weights if current Q changes
         if (prev_q_idx != q_idx) {
-            uint32_t q_stage_idx = q_iter_idx % kNumQStages;
             // load Q to vreg
-            copy(smem_tiled_copy_B, tCsB(_,_,_,q_stage_idx), tCrB_copy_view);
+            copy(smem_tiled_copy_B, tCsB(_,_,_,smem_pipe_read_q), tCrB_copy_view);
             if (enable_print) {
-                printf("    copy q to vreg, q_stage_idx = %d,\n", q_stage_idx);
+                printf("    copy q to vreg, q_stage_idx = %d,\n", smem_pipe_read_q);
             }
 
             // Read weights
-            float * smem_weights_staged = sSFB(_,_,q_stage_idx).data().get() + warp_q_idx * kNumHeads;
+            float * smem_weights_staged = sSFB(_,_,smem_pipe_read_q).data().get() + warp_q_idx * kNumHeads;
             #pragma unroll
             for (uint32_t j = 0; j < kNumHeads / 4; ++ j) {
 #if __HGGC_ARCH__ == 150
@@ -653,18 +613,16 @@ public:
                 weights[j] = ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) * 4 + lane_idx % 4);
 #endif
             }
-            q_iter_idx++;
+            smem_pipe_read_q = (smem_pipe_read_q + 1) % kNumQStages;
         }
         prev_q_idx = q_idx;
 
         // load V to VREG
-        Tensor tCsA_p = tCsA(_,_,_,kv_stage_idx);
+        Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read_kv);
         copy(smem_tiled_copy_A, tCsA_p, tCrA_copy_view);
         if (enable_print) {
-            printf("    copy kv to vreg, kv_stage_idx = %d,\n", kv_stage_idx);
+            printf("    copy kv to vreg, stage = %d,\n", smem_pipe_read_kv);
         }
-        kv_iter_idx++;
-
 
         // compute
         cute::gemm(tiled_mma, accum, tCrA, tCrB, accum);
@@ -672,7 +630,7 @@ public:
         // load scale from tsm to vreg before __ppu_barrier_arrive
         static constexpr uint32_t kMmaIterM = MmaIterM{};
         float scale_kv_array[kMmaIterM * 2];
-        float * smem_kv_scales = sSFA(_,_,kv_stage_idx).data().get();
+        float * smem_kv_scales = sSFA(_,_,smem_pipe_read_kv).data().get();
         for (int m = 0; m < kMmaIterM; m++) {
             uint32_t mma_offset = m * InstM;
             scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
@@ -737,6 +695,7 @@ public:
                     v_0, q_idx, warp_q_idx, kMmaIterM, kAccumStrideN16);
             }
         }
+        smem_pipe_read_kv = (smem_pipe_read_kv + 1) % kNumKVStages;
 
         // wait for next K, load next K to vreg
         cp_async_wait<kNumKVStages - 2>();
@@ -821,7 +780,7 @@ public:
             cudaFuncGetAttributes(&attr, cutlass::device_kernel<AttnKernel>);
 
             printf("[paged_mqa_logits:]\n");
-            printf("kNumHeads:%d, kHeadDim:%d, kNextN:%d, BLOCK_KV:%d, SPLIT_KV:%ld\n",
+            printf("kNumHeads:%d, kHeadDim:%d, kNextN:%d, BLOCK_KV:%d, SPLIT_KV:%d\n",
                 kNumHeads, kHeadDim, kNextN, BLOCK_KV, SPLIT_KV);
 
             printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n",

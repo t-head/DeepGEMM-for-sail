@@ -21,12 +21,13 @@ from .jit_kernels import (
     m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
     m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
     # Attention kernels
-    fp8_mqa_logits,
     get_paged_mqa_logits_metadata,
-    fp8_paged_mqa_logits,
-    bf16_paged_mqa_logits,
+    fp8_mqa_logits,
     bf16_mqa_logits,
     int8_mqa_logits,
+    fp8_paged_mqa_logits,
+    bf16_paged_mqa_logits,
+    int8_paged_mqa_logits,
 )
 from .utils import (
     bench,
