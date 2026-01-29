@@ -1659,10 +1659,11 @@ public:
 
           // Epilogue
           static constexpr bool IsAligedN = SHAPE_N % BLOCK_N == 0 ? true : false;
+          // reduce vreg to use ScaleType::Nothing for alpha=1 & beta=0
           using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
               cutlass::detail::TagToStrideA_t<LayoutC>,
               cutlass::detail::TagToStrideA_t<LayoutC>,
-              cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float>,
+              cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
               cutlass::gemm::EpilogueDefault,
               IsAligedN>;
 
