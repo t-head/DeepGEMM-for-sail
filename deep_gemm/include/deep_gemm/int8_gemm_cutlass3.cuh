@@ -1196,6 +1196,7 @@ CUTLASS_PRAGMA_UNROLL
       }
     }
 
+    __syncthreads();
     // if(thread0()) {
     //   printf("    mainloop with a8w8, mma_acc[0] = %.4f, tCrSA[0] = %.8f, accum[0] = %.8f\n",
     //     (float)mma_acc[0], tCrSA(0,0,0), accum[0]);
