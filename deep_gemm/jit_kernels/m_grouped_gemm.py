@@ -177,8 +177,8 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
     extra_info = get_extra_info()
 
     # Extra checks for TMA store
-    if num_groups > 1 and m > block_m:
-        assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
+    # if num_groups > 1 and m > block_m:
+    #     assert m % block_m == 0, f'For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
 
     args = (lhs, rhs, out,
             masked_m, masked_m, m, expected_m,

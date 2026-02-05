@@ -318,13 +318,13 @@ def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=Fals
         np.random.seed(seed)
         random.seed(seed)
         zipf_a = 1.1 if "." not in distribution else float(distribution.replace("zipf",""))
-        dist = truncated_zipf(num_groups, m, a=zipf_a) # 参考moe bench中的逻辑
+        group_m_list = truncated_zipf(num_groups, m, a=zipf_a) # 参考moe bench中的逻辑
         # dist = np.random.zipf(zipf_a, num_groups)
         # 为zip分布加入扰动，避免大量相同的值
         # noise = [random.gauss(0, 1) for _ in range(num_groups)]
         # dist = dist + noise
-        scale = expected_m_per_group * num_groups / dist.sum()
-        group_m_list = [max(0, x) for x in np.round(dist * scale).astype(int)]
+        # scale = expected_m_per_group * num_groups / dist.sum()
+        # group_m_list = [max(0, x) for x in np.round(dist * scale).astype(int)]
     else:
         print("ERROR: Unsupported distribution type, please check!")
         exit(1)
@@ -632,8 +632,8 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
                 else:
                     metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed"
             else:
-                # "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed"
-                metrics_string = "ppu__time_duration.sum,ce__cycles_elapsed.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__llc_bytes_read.sum.pct_of_peak_sustained_elapsed"
+                # "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum.pct_of_peak_sustained_elapsed"
+                metrics_string = "ppu__time_duration.sum,ce__cycles_elapsed.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum.pct_of_peak_sustained_elapsed"
 
             _acc = "--disable_acc"
             cmd = '{} --clock-control none {} --metrics="{}"  \
