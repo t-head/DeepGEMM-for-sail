@@ -268,13 +268,13 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     elif num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False:
         return get_best_configs_dense(m, n, k, num_groups, num_sms)
     if not is_grouped_contiguous:
-        block_ms = (256, 192, 128, 64, 32, 16)
+        block_ms = (256, 192, 128, 64, 32, 16) if k > 384 else (64, 32, 16)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
 
     # block_ns = (256, 128, 64, 32)
     assert max_block_n > 0 and (max_block_n & (max_block_n - 1)) == 0
-    block_ns = tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 1, 4, -1)))
+    block_ns = tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 1, 4, -1))) if k > 384  else tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 2, 4, -1)))
 
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None) # groups*m_block*n_block/sms = num waves
@@ -344,6 +344,12 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             best_block_m = 64
             best_block_n = 128
 
+        if (best_block_m - 10 <= m <= best_block_m) and best_block_m == 16:
+            best_block_m = best_block_m * 2
+
+        if (best_block_m - 10 <= m <= best_block_m) and (best_block_m == 32) and k > 384:
+            best_block_m = best_block_m * 2
+
     # print(f'best_block_m:{best_block_m}, best_block_n:{best_block_n}')
 
 
@@ -355,14 +361,18 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (7, 6, 5, 4, 3, 2)))
     if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16 or best_block_m == 32:
         # Unrolling both stages and `num_former_iters` will cause large code size
-        stage_candidates = (4, 3, 2)
+        stage_candidates = (3, 2)
+    if best_block_m >= 128 and best_block_n >= 128:
+        stage_candidates = (4,)
+    if (best_block_m == 128 or best_block_m == 64) and best_block_n == 128 and k > 384:
+        stage_candidates = (3,)
     best_occ = 0
     for num_stages in stage_candidates:
         best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k)
         if best_smem_config[0] < ppu_capacity:
             occ = ppu_capacity // best_smem_config[0]
             # print(f'occ:{occ}, best_occ:{best_occ}, stages:{num_stages}\n')
-            if k < 512 or (best_block_m <= 64 and best_block_n >= 64) and occ >= best_occ:
+            if k < 512 or (best_block_m > 64 and best_block_n >= 64) and occ >= best_occ:
                 # compute block and too small-k use higer occ rather than large stage
                 best_num_stages = num_stages
                 best_occ = occ
@@ -383,19 +393,18 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     warp_n = best_block_n // 2
     if best_block_m == 32 and best_block_n >= 64:
         warp_m = best_block_m // 2
-        best_block_n = 64 if best_block_n == 128 else best_block_n
+        # best_block_n = 64 if best_block_n == 128 else best_block_n
         warp_n = best_block_n // 2 if best_block_n <= 128 else best_block_n // 4
     elif best_block_n == 32 and n <= 128 and best_block_m >=64:
         warp_m = best_block_m // 4
         warp_n = 32
     elif best_block_m == 192 and best_block_n == 128:
-        best_block_m = 64
-        warp_m = 32
-        warp_n = best_block_n // 4
+        best_block_n = 256
+        warp_m = 48
+        warp_n = 64
     elif best_block_m == 128 or best_block_m == 192 or best_block_m == 256 and best_block_n >= 32:
         warp_m = best_block_m // 4
-        warp_n = best_block_n // 2 if best_block_n < 128 else best_block_n // 4
-        # warp_n = best_block_n // 2 if best_block_n != 32 else best_block_n
+        warp_n = best_block_n // 2 if best_block_n <= 128 else best_block_n // 4
     elif best_block_m == 16:
         warp_m = 16
         best_block_n = 64 if n < 512 else best_block_n
@@ -403,6 +412,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     elif best_block_n == 128 or best_block_n == 256:
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
         warp_n = best_block_n // 4
+    # print(f'best_block_m:{best_block_m}, best_block_n:{best_block_n}')
 
 
     return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
