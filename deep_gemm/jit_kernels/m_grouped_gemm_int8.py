@@ -215,7 +215,12 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
     enable_moe_dynamic_tile = extra_info['use_moe_dynamic_tile']
-    if k >= 2048 and n >= 2048:
+
+    supported_N_K_list = [
+        (4096, 7168), (7168, 2048), # dpsk
+        (4096, 8192), (8192, 2048), # qwen3.5
+    ]
+    if is_ppu1v5_device() and (n, k) in supported_N_K_list:
         enable_moe_dynamic_tile = True
     if enable_sbo_overlap:
         # disable dynamic tile if enable_sbo_overlap, as the kNumNBlocks is not static
