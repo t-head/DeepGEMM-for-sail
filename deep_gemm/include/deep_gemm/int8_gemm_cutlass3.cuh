@@ -1611,13 +1611,13 @@ public:
           if (expected_m > 73) {
             constexpr bool kLargeEM = true;
             using GemmKernel = cutlass::gemm::kernel::DeepGemmDynamicTile<
-                kGemmType, ElementA, ElementB, ElementD, int32_t, ElementCompute,
+                kGemmType, ElementA, ElementB, ElementD, ElementAcc, ElementCompute,
                 SHAPE_N, SHAPE_K, kNumGroups, kLargeEM>;
             launch_dynamic_tile_kernel(GemmKernel{});
           } else {
             constexpr bool kLargeEM = false;
             using GemmKernel = cutlass::gemm::kernel::DeepGemmDynamicTile<
-                kGemmType, ElementA, ElementB, ElementD, int32_t, ElementCompute,
+                kGemmType, ElementA, ElementB, ElementD, ElementAcc, ElementCompute,
                 SHAPE_N, SHAPE_K, kNumGroups, kLargeEM>;
             launch_dynamic_tile_kernel(GemmKernel{});
           }
