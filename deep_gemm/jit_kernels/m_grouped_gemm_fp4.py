@@ -24,7 +24,7 @@ constexpr auto kNumStages = {NUM_STAGES};
 using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}>;
 
 gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
-            bias, out, m, grouped_layout, expected_m,
+            bias, out, m, grouped_layout, block_m_info, expected_m,
             stream, num_sms, smem_size, signal);
 """
 
@@ -61,18 +61,12 @@ def m_grouped_gemm_fp4_fp4_fp32_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     num_sms = get_num_sms()
 
     # TODO: enable fp4 get_best_configs
-    # if configs:
-    #     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
-    # else:
-    #     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
-
-    block_m = 256
-    block_n = 256
-    block_k = 128
-    warp_m = 64
-    warp_n = 64
-    num_stages = 3
-    smem_config = get_smem_config(num_stages, k, block_m, block_n, block_k)
+    if configs:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+    else:
+        # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
+        smem_config = get_smem_config(num_stages, k, block_m, block_n, block_k)
 
     if m_rows is None:
         counts = torch.bincount(m_indices)
@@ -81,7 +75,13 @@ def m_grouped_gemm_fp4_fp4_fp32_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         if min_n > 0:
             experts_for_rows[:min_n] = counts[:min_n]
         m_rows = experts_for_rows
-    args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, m_rows, expected_m, torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
+
+    ## the largest blockM_num is, num_groups - 1 only has 1 token, the last group has (m-1) tokens, blockM_num = num_group -1  + ceil_div(m + 1 - num_group, block_m)
+    ## total line num: blockM_num + 1, line0 is used to store the real blockM_num
+    ## total_size = (blockM_num + 1) * 4 * sizeof(int) Byte
+    block_m_info = torch.empty((num_groups + ceil_div(m + 1 - num_groups, block_m)) * 4, dtype=torch.int32, device=m_rows.device)
+
+    args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, m_rows, block_m_info, expected_m, torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp4_fp4_fp32_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
@@ -92,7 +92,7 @@ def m_grouped_gemm_fp4_fp4_fp32_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint8),
                   ('rhs', torch.uint8), ('rhs_scales', torch.uint8),
                   ('bias', torch.float32), ('out', torch.float32),
-                  ('m', int), ('grouped_layout', torch.int32), ('expected_m', int),
+                  ('m', int), ('grouped_layout', torch.int32), ('block_m_info', torch.int32), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                   ('signal', torch.int32)),
         template=template,

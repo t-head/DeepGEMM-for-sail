@@ -90,10 +90,10 @@ def uint8_padding(scale_uint8: torch.Tensor) -> torch.Tensor:
         scale_uint8 = scale_uint8.to(torch.uint8)
 
     orig_width = scale_uint8.shape[1]
-    remainder = orig_width % 8
+    remainder = orig_width % 4
 
     if remainder != 0:
-        pad_size = 8 - remainder
+        pad_size = 4 - remainder
         scale_uint8 = torch.nn.functional.pad(
             scale_uint8,
             (0, pad_size),
@@ -102,18 +102,87 @@ def uint8_padding(scale_uint8: torch.Tensor) -> torch.Tensor:
         )
     return scale_uint8
 
+def ppu_cutlass_mxfp4_scales_swizzle(scale: torch.Tensor, m_indices: torch.Tensor = None, num_groups: int = None) -> torch.Tensor:
+    """
+        transform the scale layout for ppu mxfp4
+
+        Args:
+            scale: e8m0 scales, whose shape should be [M/N, K] or [E, N, K]
+            m_indices: reordered token distribution in moe
+            num_groups: the number of experts
+
+        Returns:
+            out: transformed scales, which are aligned to (16, 2)
+    """
+    assert scale.dtype == torch.uint8, "ppu_swizzle_mx_scale_cutlass only accept torch.uint8 now."
+    assert len(scale.shape) in [2, 3]
+
+    m_rows = None
+    if m_indices is not None:
+        assert num_groups is not None and num_groups > 0, "num_groups should be large than 0 for grouped gemm"
+        counts = torch.bincount(m_indices)
+        min_n = min(counts.size(0), num_groups)
+        experts_for_rows = torch.zeros(num_groups, dtype=torch.int32, device='cuda')
+        if min_n > 0:
+            experts_for_rows[:min_n] = counts[:min_n]
+        m_rows = experts_for_rows
+        assert int(m_rows.sum().item()) == scale.shape[0]
+
+    ### scales are aligned with (16, 2) sub blocks, which is refered to a mma.
+    SWIZZLE_ALIGN_MN = 16
+    SWIZZEL_ALIGN_K = 2
+
+    outs = []
+
+    def swizzle_scale(scale_: torch.Tensor, outs_: list):
+        *leading_shape, MN, K = scale_.shape
+        pad_k = (SWIZZEL_ALIGN_K - (K % SWIZZEL_ALIGN_K)) % SWIZZEL_ALIGN_K
+        pad_mn = (SWIZZLE_ALIGN_MN - (MN % SWIZZLE_ALIGN_MN)) % SWIZZLE_ALIGN_MN
+        scale_pad = scale_
+        if pad_k or pad_mn > 0:
+            scale_pad = torch.nn.functional.pad(scale_, (0, pad_k, 0, pad_mn))
+        padded_shape = scale_pad.shape
+        assert padded_shape[-2] % 16 == 0 and padded_shape[-1] % 2 == 0, "padding shape must be aligned to MN, K -> (16, 2)"
+
+        scale_pad_flatten = scale_pad.reshape(-1, padded_shape[-2], padded_shape[-1])
+        scale_pad_flatten_b16 = scale_pad_flatten.contiguous().view(torch.uint16)
+        L, MNp, Kp = scale_pad_flatten_b16.shape
+
+        scale_pad_flatten_b16 = scale_pad_flatten_b16.reshape(L, MNp // 16, 16, Kp)
+        scale_pad_flatten_b16 = scale_pad_flatten_b16.reshape(L, MNp // 16, 2, 8, Kp).permute(0, 1, 3, 2, 4)
+        scale_pad_flatten_b16 = scale_pad_flatten_b16.reshape(L, MNp // 16, 16, Kp)
+
+        scale_swizzled = scale_pad_flatten_b16.permute(0, 1, 3, 2).contiguous().reshape(L, MNp // 16, Kp * 16)
+        scale_swizzled = scale_swizzled.view(torch.uint8).reshape(*leading_shape, MNp // 16, Kp * 2 * 16)
+
+        outs_.append(scale_swizzled)
+
+    if m_indices is not None:
+        prev = 0
+        for rows in m_rows:
+            if (rows.item() == 0): continue
+            cur_scale = scale[prev:prev+rows.item()]
+            swizzle_scale(scale_=cur_scale, outs_=outs)
+            prev += rows.item()
+    else:
+        swizzle_scale(scale_=scale, outs_=outs)
+
+    out = torch.concat(outs, dim=0)
+    return out
+
 def test_gemm(args):
     m, n, k = args['m'], args['n'], args['k']
     A = torch.randn(m, k, dtype=torch.bfloat16, device='cuda').contiguous()
     B = torch.randn(n, k, dtype=torch.bfloat16, device='cuda').contiguous()
-    x = quantize_fp4_torch(A.to(torch.bfloat16))
-    y = quantize_fp4_torch(B.to(torch.bfloat16))
+    x = quantize_fp4_torch(A)
+    y = quantize_fp4_torch(B)
     a_dequant = dequantize_fp4_torch(x[0], x[1]).cuda()
     b_dequant = dequantize_fp4_torch(y[0], y[1]).cuda()
     bias = torch.randn(1, n, dtype=torch.float32, device='cuda')
     out = torch.zeros(m, n, dtype=torch.float32, device='cuda')
+    # x_scale = ppu_cutlass_mxfp4_scales_swizzle(scale=x[1])
     x_scale = uint8_padding(x[1])
-    y_scale = uint8_padding(y[1])
+    y_scale = ppu_cutlass_mxfp4_scales_swizzle(scale=y[1])
     x = x[0], x_scale
     y = y[0], y_scale
 
@@ -172,11 +241,13 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str
 
     x_fp4 = quantize_fp4_torch(x.to(torch.bfloat16).to('cuda'))
     x_fp4_scale = uint8_padding(x_fp4[1])
+    # x_fp4_scale = ppu_cutlass_mxfp4_scales_swizzle(scale=x_fp4[1], m_indices=m_indices, num_groups=num_groups)
     y_fp4 = (torch.empty((num_groups, n, int(k / 2)), device='cuda', dtype=torch.uint8), torch.empty((num_groups, n, int(k / 32)), device='cuda', dtype=torch.uint8))
     y_scale = []
     for i in range(num_groups):
         y_fp4[0][i], y_fp4[1][i] = quantize_fp4_torch(y[i].to(torch.bfloat16))
-        y_scale.append(uint8_padding(y_fp4[1][i]))
+        # y_scale.append(uint8_padding(y_fp4[1][i]))
+        y_scale.append(ppu_cutlass_mxfp4_scales_swizzle(scale=y_fp4[1][i]))
     y_fp4_scale = torch.stack(y_scale, dim=0)
     return (x_fp4[0].to("cuda"), x_fp4_scale.to("cuda")), (y_fp4[0].to("cuda"), y_fp4_scale.to("cuda")), m_indices, bias, out, ref_out.to('cuda').to(torch.float)
 

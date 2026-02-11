@@ -25,7 +25,7 @@ constexpr auto kNumStages = {NUM_STAGES};
 using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}>;
 
 gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
-            bias, out, m, nullptr, 0,
+            bias, out, m, nullptr, nullptr, 0,
             stream, num_sms, smem_size);
 """
 
@@ -416,18 +416,12 @@ def gemm_fp4_fp4_fp32_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
     num_sms = get_num_sms()
 
     # TODO: enable fp4 get_best_configs
-    # if configs is not None:
-    #     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
-    # else:
-    #     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
-
-    block_m = 256
-    block_n = 256
-    block_k = 128
-    warp_m = 64
-    warp_n = 64
-    num_stages = 3
-    smem_config = get_smem_config(num_stages, k, block_m, block_n, block_k)
+    if configs is not None:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+    else:
+        # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
+        smem_config = get_smem_config(num_stages, k, block_m, block_n, block_k)
 
     args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(

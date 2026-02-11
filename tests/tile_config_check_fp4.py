@@ -3,7 +3,8 @@ import json
 from typing import List, Dict, Tuple
 import deep_gemm
 import argparse
-from test_fp4_core import quantize_fp4_torch, uint8_padding, dequantize_fp4_torch
+import copy
+from test_fp4_core import quantize_fp4_torch, uint8_padding, dequantize_fp4_torch, ppu_cutlass_mxfp4_scales_swizzle, construct_grouped
 from deep_gemm.jit_kernels.utils import get_num_sms
 from utils import construct_group_m_list
 from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config
@@ -16,15 +17,17 @@ def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[
         try:
             A = torch.randn(m, k, dtype=torch.bfloat16, device='cuda').contiguous()
             B = torch.randn(n, k, dtype=torch.bfloat16, device='cuda').contiguous()
-            x = quantize_fp4_torch(A.to(torch.bfloat16))
-            y = quantize_fp4_torch(B.to(torch.bfloat16))
-            a_dequant = dequantize_fp4_torch(x[0], x[1]).cuda()
-            b_dequant = dequantize_fp4_torch(y[0], y[1]).cuda()
+            x = quantize_fp4_torch(A)
+            y = quantize_fp4_torch(B)
+            a_dequant = dequantize_fp4_torch(x[0], x[1]).cuda().float()
+            b_dequant = dequantize_fp4_torch(y[0], y[1]).cuda().float()
             bias = torch.randn(1, n, dtype=torch.float32, device='cuda')
             out = torch.zeros(m, n, dtype=torch.float32, device='cuda')
             ref_out = torch.mm(a_dequant, b_dequant.T)
+            ref_out = ref_out + bias
+            # x_scale = ppu_cutlass_mxfp4_scales_swizzle(scale=x[1])
             x_scale = uint8_padding(x[1])
-            y_scale = uint8_padding(y[1])
+            y_scale = ppu_cutlass_mxfp4_scales_swizzle(scale=y[1])
             x = x[0], x_scale
             y = y[0], y_scale
 
@@ -59,41 +62,6 @@ def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[
         except Exception as e:
             error_msg = f"{type(e).__name__}: {str(e)}"
             return False, error_msg
-
-def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str, alignment: int):
-    group_ms = construct_group_m_list(distribution, num_groups, m)
-    m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
-    m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
-    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
-    bias = torch.zeros((num_groups, n), device='cuda', dtype=torch.float)
-
-    out = torch.empty((m, n), device='cuda', dtype=torch.float)
-    ref_out = torch.empty((m, n), device='cuda', dtype=torch.float)
-
-    start = 0
-    for i, group_m in enumerate(group_ms):
-        actual_end = start + group_m
-        aligned_end = start + ceil_div(group_m, alignment) * alignment
-        m_indices[start:actual_end] = i
-        m_indices[actual_end:aligned_end] = -1
-        a, a_scale = quantize_fp4_torch(x[start:aligned_end].to(torch.bfloat16).cuda())
-        b, b_scale = quantize_fp4_torch(y[i].to(torch.bfloat16).cuda())
-        a_dequant = dequantize_fp4_torch(a, a_scale).to(torch.float)
-        b_dequant = dequantize_fp4_torch(b, b_scale).to(torch.float)
-        ref_out[start:aligned_end] = a_dequant @ b_dequant.t()
-        ref_out[start:aligned_end] = ref_out[start:aligned_end] + bias[i]
-        start = aligned_end
-
-    x_fp4 = quantize_fp4_torch(x.to(torch.bfloat16).to('cuda'))
-    x_fp4_scale = uint8_padding(x_fp4[1])
-    y_fp4 = (torch.empty((num_groups, n, int(k / 2)), device='cuda', dtype=torch.uint8), torch.empty((num_groups, n, int(k / 32)), device='cuda', dtype=torch.uint8))
-    y_scale = []
-    for i in range(num_groups):
-        y_fp4[0][i], y_fp4[1][i] = quantize_fp4_torch(y[i].to(torch.bfloat16))
-        y_scale.append(uint8_padding(y_fp4[1][i]))
-    y_fp4_scale = torch.stack(y_scale, dim=0)
-    return (x_fp4[0].to("cuda"), x_fp4_scale.to("cuda")), (y_fp4[0].to("cuda"), y_fp4_scale.to("cuda")), m_indices, bias, out, ref_out.to('cuda').to(torch.float)
 
 def test_all_configs(config_list: List[Tuple],
                      gemm_type: str,
@@ -203,6 +171,62 @@ def get_search_space_doublecheck(d: torch.dtype, gemm_type : str, m:int=0, n:int
 
     block_k = 64 if d == torch.bfloat16 else 128
     tile_list = [
+        # blockM = 16
+        [16, 64, 16, 16, block_k, 2],
+        [16, 64, 16, 16, block_k, 3],
+        [16, 64, 16, 16, block_k, 4],
+        [16, 64, 16, 16, block_k, 5],
+        [16, 64, 16, 16, block_k * 2, 2],
+        [16, 64, 16, 16, block_k * 2, 3],
+        [16, 64, 16, 16, block_k * 2, 4],
+        [16, 64, 16, 16, block_k * 2, 5],
+
+        [16, 128, 16, 32, block_k, 2],
+        [16, 128, 16, 32, block_k, 3],
+        [16, 128, 16, 32, block_k, 4],
+        [16, 128, 16, 32, block_k * 2, 2],
+        [16, 128, 16, 32, block_k * 2, 3],
+        [16, 128, 16, 32, block_k * 2, 4],
+        [16, 128, 16, 16, block_k, 2],
+        [16, 128, 16, 16, block_k, 3],
+        [16, 128, 16, 16, block_k, 4],
+        [16, 128, 16, 16, block_k * 2, 2],
+        [16, 128, 16, 16, block_k * 2, 3],
+        [16, 128, 16, 16, block_k * 2, 4],
+
+        [16, 256, 16, 64, block_k, 2],
+        [16, 256, 16, 64, block_k, 3],
+        [16, 256, 16, 64, block_k * 2, 2],
+        [16, 256, 16, 64, block_k * 2, 3],
+
+        # blockM = 32
+        [32, 64, 16, 32, block_k, 2],
+        [32, 64, 16, 32, block_k, 3],
+        [32, 64, 16, 32, block_k, 4],
+        [32, 64, 16, 32, block_k, 5],
+        [32, 64, 16, 32, block_k * 2, 2],
+        [32, 64, 16, 32, block_k * 2, 3],
+        [32, 64, 16, 32, block_k * 2, 4],
+        [32, 64, 16, 16, block_k, 2],
+        [32, 64, 16, 16, block_k, 3],
+        [32, 64, 16, 16, block_k * 2, 2],
+        [32, 64, 16, 16, block_k * 2, 3],
+
+        [32, 128, 16, 64, block_k, 2],
+        [32, 128, 16, 64, block_k, 3],
+        [32, 128, 16, 64, block_k, 4],
+        [32, 128, 16, 64, block_k * 2, 2],
+        [32, 128, 16, 64, block_k * 2, 3],
+        [32, 128, 16, 32, block_k, 2],
+        [32, 128, 16, 32, block_k, 3],
+        [32, 128, 16, 32, block_k * 2, 2],
+        [32, 128, 16, 32, block_k * 2, 3],
+
+        [32, 256, 16, 64, block_k, 2],
+        [32, 256, 16, 64, block_k, 3],
+        [32, 256, 16, 64, block_k * 2, 2],
+        [32, 256, 16, 64, block_k * 2, 3],
+
         # blockM = 64
         [64, 64, 16, 16, block_k, 2],
         [64, 64, 16, 16, block_k, 3],
@@ -265,15 +289,15 @@ def get_search_space_doublecheck(d: torch.dtype, gemm_type : str, m:int=0, n:int
         [128, 256, 64, 64, int(block_k / 2), 2],
         [128, 256, 64, 64, int(block_k / 2), 3],
         [128, 256, 64, 64, int(block_k / 2), 4],
-        [128, 320, 64, 80, block_k    , 2],
-        [128, 320, 64, 80, block_k    , 3],
-        [128, 320, 64, 80, block_k    , 4],
-        [128, 320, 64, 80, block_k * 2, 2],
-        [128, 320, 64, 80, block_k * 2, 3],
-        [128, 320, 64, 80, block_k * 2, 4],
-        [128, 320, 64, 80, int(block_k / 2), 2],
-        [128, 320, 64, 80, int(block_k / 2), 3],
-        [128, 320, 64, 80, int(block_k / 2), 4],
+        # [128, 320, 64, 80, block_k    , 2],
+        # [128, 320, 64, 80, block_k    , 3],
+        # [128, 320, 64, 80, block_k    , 4],
+        # [128, 320, 64, 80, block_k * 2, 2],
+        # [128, 320, 64, 80, block_k * 2, 3],
+        # [128, 320, 64, 80, block_k * 2, 4],
+        # [128, 320, 64, 80, int(block_k / 2), 2],
+        # [128, 320, 64, 80, int(block_k / 2), 3],
+        # [128, 320, 64, 80, int(block_k / 2), 4],
 
         # blockM = 256
         [256, 64, 32, 64, block_k,      2],
@@ -298,49 +322,74 @@ def get_search_space_doublecheck(d: torch.dtype, gemm_type : str, m:int=0, n:int
         [256, 256, 64, 64, int(block_k / 2), 2],
         [256, 256, 64, 64, int(block_k / 2), 3],
         [256, 256, 64, 64, int(block_k / 2), 4],
-        [256, 320, 64, 80, block_k,     2],
-        [256, 320, 64, 80, block_k,     3],
-        [256, 320, 64, 80, block_k,     4],
-        [256, 320, 64, 80, block_k * 2, 2],
-        [256, 320, 64, 80, block_k * 2, 3],
-        [256, 320, 64, 80, block_k * 2, 4],
-        [256, 320, 64, 80, int(block_k / 2), 2],
-        [256, 320, 64, 80, int(block_k / 2), 3],
-        [256, 320, 64, 80, int(block_k / 2), 4],
+        # [256, 320, 64, 80, block_k,     2],
+        # [256, 320, 64, 80, block_k,     3],
+        # [256, 320, 64, 80, block_k,     4],
+        # [256, 320, 64, 80, block_k * 2, 2],
+        # [256, 320, 64, 80, block_k * 2, 3],
+        # [256, 320, 64, 80, block_k * 2, 4],
+        # [256, 320, 64, 80, int(block_k / 2), 2],
+        # [256, 320, 64, 80, int(block_k / 2), 3],
+        # [256, 320, 64, 80, int(block_k / 2), 4],
 
         # blockM = 320
-        [320, 256, 80, 64, block_k    , 2],
-        [320, 256, 80, 64, block_k    , 3],
-        [320, 256, 80, 64, block_k    , 4],
-        [320, 256, 80, 64, block_k * 2, 2],
-        [320, 256, 80, 64, block_k * 2, 3],
-        [320, 256, 80, 64, block_k * 2, 4],
-        [320, 256, 80, 64, int(block_k / 2), 2],
-        [320, 256, 80, 64, int(block_k / 2), 3],
-        [320, 256, 80, 64, int(block_k / 2), 4],
+        # [320, 256, 80, 64, block_k    , 2],
+        # [320, 256, 80, 64, block_k    , 3],
+        # [320, 256, 80, 64, block_k    , 4],
+        # [320, 256, 80, 64, block_k * 2, 2],
+        # [320, 256, 80, 64, block_k * 2, 3],
+        # [320, 256, 80, 64, block_k * 2, 4],
+        # [320, 256, 80, 64, int(block_k / 2), 2],
+        # [320, 256, 80, 64, int(block_k / 2), 3],
+        # [320, 256, 80, 64, int(block_k / 2), 4],
         ]
 
-    tile_list_rtn = []
+    if 'dense' in gemm_type:
+        tile_list.extend([
+            # blockM = 128
+            [128, 128, 64, 64, block_k    , 2],
+            [128, 128, 64, 64, block_k    , 3],
+            [128, 128, 64, 64, block_k    , 4],
+            [128, 128, 64, 64, block_k * 2, 3],
+            [128, 256, 64, 64, block_k    , 2],
+            [128, 256, 64, 64, block_k    , 3],
+
+            # blockM = 256
+            [256, 64, 32, 64, block_k,      2],
+            [256, 64, 32, 64, block_k,      3],
+            [256, 64, 32, 64, block_k * 2,  2],
+            [256, 64, 32, 64, block_k * 2,  3],
+            [256, 128, 64, 64, block_k    , 2],
+            [256, 128, 64, 64, block_k    , 3],
+            [256, 128, 64, 64, block_k    , 4],
+            [256, 256, 64, 64, block_k,     4],
+
+            # blockK = 64B
+            [128, 128, 64, 64, int(block_k / 2), 2],
+            [128, 256, 64, 64, int(block_k / 2), 2],
+            [256, 128, 64, 64, int(block_k / 2), 2],
+        ])
+
+    tile_list_rtn = set()
     if d == torch.float8_e4m3fn:
         for tile in tile_list:
             if tile[0] != 48 and tile[0] != 160 and tile[0] < 256 and not (tile[1] == 256 and tile[4] == 256):
-                tile_list_rtn.append(tile)
+                tile_list_rtn.add(tuple(tile))
                 if tile[4] == block_k and tile[0] != 192:
                     tile_copy = copy.deepcopy(tile)
                     tile_copy[4] = int(block_k / 2)
-                    tile_list_rtn.append(tile_copy)
+                    tile_list_rtn.add(tuple(tile_copy))
         return tile_list_rtn
 
-    # add block_k / 2 tile for k <256
-    if k != 0 and k <= 512:
+    if d == torch.uint8:
         for tile in tile_list:
-            tile_list_rtn.append(tile)
-            if tile[4] == block_k:
-                tile_copy = copy.deepcopy(tile)
-                tile_copy[4] = int(block_k / 2)
-                tile_list_rtn.append(tile_copy)
-    else:
-        tile_list_rtn = tile_list
+            if tile[2] % 16 == 0 and tile[3] % 16 == 0 and tile[0] % 16 == 0 and tile[1] % 16 == 0 and tile[4] % 32 == 0:
+                tile_list_rtn.add(tuple(tile))
+                if tile[4] == block_k:
+                    tile_copy = copy.deepcopy(tile)
+                    tile_copy[4] = int(block_k / 2)
+                    if tile[4] != 0 and tile_copy[4] % 32 == 0:
+                        tile_list_rtn.add(tuple(tile_copy))
 
     return tile_list_rtn
 
@@ -359,11 +408,11 @@ if __name__ == "__main__":
     m, n, k = args.m, args.n, args.k
     gemm_type = args.type
 
-    out = torch.zeros(m, n, dtype=torch.float32, device='cuda')
+    d = torch.uint8 ### dtype for mxfp4
     if gemm_type in ['dense']:
-        search_space = get_search_space_doublecheck(out, 'dense', m, n, k)
+        search_space = get_search_space_doublecheck(d, 'dense', m, n, k)
     elif gemm_type in ['grouped']:
-        search_space = get_search_space_doublecheck(out, 'dense', m, n, k)
+        search_space = get_search_space_doublecheck(d, 'dense', m, n, k)
 
     config_list = []
     for tile in search_space:
