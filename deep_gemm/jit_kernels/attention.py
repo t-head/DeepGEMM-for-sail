@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, get_paged_mqa_logits_tb_per_sm
 
 def align(value, alignment):
     return (value + alignment - 1) // alignment * alignment
@@ -231,25 +231,30 @@ atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, batch_
 
 def get_paged_mqa_logits_metadata(context_lens: torch.Tensor,
                                   block_kv: int,
-                                  num_sms: int):
+                                  num_sms: int,
+                                  q: torch.Tensor = None):
     batch_size = context_lens.shape[0]
     assert(context_lens.dtype == torch.int32)
     assert(context_lens.is_contiguous())
 
-    num_math_warpgroups = 4
+    num_math_warpgroups = 1 # sm80, no warpgroup
     aligned_batch_size = align(batch_size, 32)
     split_kv = block_kv * num_math_warpgroups
 
-    schedule_metadata = torch.empty((num_sms + 1, 2), dtype=context_lens.dtype, device=context_lens.device)
+    tb_per_cu = 1
+    if q is not None:
+        batch_size, next_n, num_heads, head_dim = q.shape
+        tb_per_cu = get_paged_mqa_logits_tb_per_sm(next_n, split_kv, num_heads, head_dim, q.element_size())
+    num_blocks = num_sms * tb_per_cu
+    schedule_metadata = torch.empty((num_blocks + 1, 2), dtype=context_lens.dtype, device=context_lens.device)
 
-    num_sms = get_num_sms()
     stream = torch.cuda.current_stream()
     args = (batch_size, context_lens, schedule_metadata, stream)
     runtime = jit_tuner.compile_and_tune(
         name='attention_paged_mqa_logits_metadata',
         keys={'kAlignedBatchSize': aligned_batch_size,
               'SPLIT_KV': split_kv,
-              'kNumSMs': num_sms},
+              'kNumSMs': num_blocks},
         space=(),
         includes=includes_paged,
         arg_defs=(('batch_size', int),
@@ -289,7 +294,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
     assert(batch_size_next_n == batch_size * next_n)
     assert(num_heads == num_heads_ and num_heads_kv == 1)
     assert(head_dim_with_sf == head_dim + size_of_scale_float)
-    assert(schedule_meta_size == num_sms + 1 and meta_info_size == 2)
+    assert((schedule_meta_size - 1) % num_sms == 0 and meta_info_size == 2)
 
     assert(next_n == 1 or next_n == 2)
     assert(block_kv == 64)
@@ -361,10 +366,9 @@ def paged_mqa_logits_common(q: torch.Tensor,
         ElementQK = 'int8_t'
         ElementAcc = "int32_t"
 
-    num_sms = get_num_sms()
     stream = torch.cuda.current_stream()
     args = (q, k, k_scales, weights, batch_size, logits_stride, block_table_stride, context_lens, logits,
-            block_table, schedule_meta, stream, num_sms)
+            block_table, schedule_meta, stream, schedule_meta_size - 1)
     runtime = jit_tuner.compile_and_tune(
         name='attention_paged_mqa_logits_' + ElementQK,
         keys={'ElementQK': ElementQK, 'ElementAcc' : ElementAcc,

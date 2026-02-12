@@ -522,6 +522,7 @@ public:
     auto tSFQgSFQ = tSFBgSFB;
 
     constexpr uint64_t kv_cache_stride_bytes = BLOCK_KV * (kHeadDim + (2 - sizeof(ElementQK)) * 4);
+    constexpr bool load_kv_scale = sizeof(ElementQK) == 1;
     const auto& lane_idx = get_lane_idx();
     const auto& warp_offset = (warp_idx % WarpOnM) * WARP_M;
     const auto& v_0_offset = lane_idx / 4 + 0;
@@ -566,10 +567,12 @@ public:
             // Issue AIU KV
             auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
             tAgA.data() = tKgK.data() + kv_offset * kv_cache_stride_bytes;
-            tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * kv_cache_stride_bytes / 4;
             copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), warp_idx);
-            if (sizeof(ElementQK) == 1 && warp_idx < WAPR_LIMIT_SFA) {
-                copy(gmem_tiled_copy_scaleA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv));
+            if constexpr(load_kv_scale) {
+                tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * kv_cache_stride_bytes / 4;
+                if (sizeof(ElementQK) == 1 && warp_idx < WAPR_LIMIT_SFA) {
+                    copy(gmem_tiled_copy_scaleA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv));
+                }
             }
             if (enable_print) {
                 printf("copy kv_offset = %d, stage = %d\n", kv_offset, smem_pipe_write_kv);

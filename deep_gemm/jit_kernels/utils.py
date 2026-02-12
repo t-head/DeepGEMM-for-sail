@@ -379,3 +379,16 @@ def get_search_space(d: torch.dtype, gemm_type : str, m:int=0, n:int=0, k:int=0)
 
     return tile_list_rtn
 
+def get_paged_mqa_logits_tb_per_sm(next_n, split_kv, num_heads, head_dim, datasize):
+    block_m = split_kv
+    block_n = next_n * num_heads
+    block_k = head_dim
+    stage_q = 3
+    stage_k = 3
+    smem_q = block_n * block_k * stage_q * datasize
+    smem_k = block_m * block_k * stage_k * datasize
+    smem_k_scale = block_m * stage_k * 4
+    smem_weight = block_n * stage_q * 4
+    smem = smem_q + smem_k + smem_k_scale + smem_weight
+    tb_per_sm = 262144 // smem
+    return tb_per_sm

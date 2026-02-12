@@ -6,7 +6,7 @@ import deep_gemm
 from bench import *
 from math_utils import *
 from utils import per_token_cast_to_int8
-from deep_gemm.jit_kernels.utils import is_ppu1v5_device
+from deep_gemm.jit_kernels.utils import is_ppu1v5_device, get_paged_mqa_logits_tb_per_sm
 
 # from generators import get_arch_major, generate_normal, get_ue8m0_usage, get_kernel_types, MajorTypeAB
 
@@ -239,6 +239,33 @@ def ref_fp8_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
             logits[i * next_n:(i + 1) * next_n, block_rk * block_size: (block_rk + 1) * block_size] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float('-inf'))
     return logits
 
+def ref_get_metadata(context_lens: torch.Tensor, block_kv: int, num_sms: int, q: torch.Tensor = None):
+    num_math_warpgroups = 1
+    split_kv = block_kv * num_math_warpgroups
+    tb_per_cu = 1
+    if q is not None:
+        batch_size, next_n, num_heads, head_dim = q.shape
+        tb_per_cu = get_paged_mqa_logits_tb_per_sm(next_n, split_kv, num_heads, head_dim, q.element_size())
+    num_splits = num_sms * tb_per_cu
+
+    batch_size = context_lens.size(0)
+    blocksize = split_kv
+    block_len = (context_lens + blocksize - 1) // blocksize
+    block_start = torch.cumsum(block_len, dim=0)
+    total_blocks = block_start[-1].item()
+    block_count = total_blocks // num_splits
+    extra_blocks = total_blocks - block_count * num_splits
+
+    schedule_meta_data = torch.zeros((num_splits + 1, 2), dtype=torch.int32, device=context_lens.device)
+    for i in range(num_splits + 1):
+        seg_starts = i * block_count + min(i, extra_blocks)
+        q_idx = 0
+        while q_idx < batch_size and block_start[q_idx] <= seg_starts:
+            q_idx += 1
+        kv_idx = seg_starts if q_idx == 0 else seg_starts - block_start[q_idx - 1]
+        schedule_meta_data[i, 0] = q_idx
+        schedule_meta_data[i, 1] = kv_idx
+    return schedule_meta_data
 
 def test_paged_mqa_logits():
     print('Testing FP8 Paged MQA Logits:')
@@ -272,8 +299,6 @@ def test_paged_mqa_logits():
                 next_n_offset = torch.arange(batch_size * next_n, device='cuda') % next_n
                 ref_neginf_mask = ~(positions <= (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(1))
 
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms())
-
                 qk_dtype_list = [torch.bfloat16, torch.int8]
                 if is_ppu1v5_device():
                     qk_dtype_list.append(torch.float8_e4m3fn)
@@ -281,8 +306,10 @@ def test_paged_mqa_logits():
                     if qk_dtype == torch.float8_e4m3fn:
                         q_fp8 = q.to(torch.float8_e4m3fn)
                         kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
+                        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), q_fp8)
                         logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
                     elif qk_dtype == torch.bfloat16:
+                        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), q)
                         logits = deep_gemm.bf16_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
                     elif qk_dtype == torch.int8:
                         q_int8, q_int8_scale = per_token_cast_to_int8(q.reshape(batch_size * next_n * heads, index_dim))
@@ -290,6 +317,7 @@ def test_paged_mqa_logits():
                         q_int8_scale = q_int8_scale.reshape(batch_size * next_n, heads)
                         weights_int8 = weights * q_int8_scale
                         kv_cache_int8 = kv_cache_cast_to_int8(kv_cache)
+                        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), q_int8)
                         logits = deep_gemm.int8_paged_mqa_logits(q_int8, kv_cache_int8, weights_int8, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
                 
 
