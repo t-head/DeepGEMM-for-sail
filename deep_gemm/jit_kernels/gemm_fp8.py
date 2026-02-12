@@ -155,7 +155,7 @@ def get_best_configs_dense(m: int, n: int, k: int, num_groups: int, num_sms: int
     best_block_m, best_block_n = None, None
     for block_m in block_ms:
         # NOTES: the block sizes can not be too large, so at least one dim less than 128
-        for block_n in filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32) and not (block_m == 128 and bn == 128)), block_ns):
+        for block_n in filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 1) and not (block_m == 128 and bn == 128)), block_ns):
             success = False
             num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(best_block_m, best_block_n)
             num_utils = get_block_utils(m, block_m) * get_block_utils(n, block_n)
@@ -445,7 +445,7 @@ def gemm_fp8_fp8_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
     if lhs_scales.shape == (m, 1) and rhs_scales.shape == (n, 1):
         return gemm_a8w8_per_channel_nt(lhs_, rhs_, out, configs)
 
-    assert n % 64 == 0 and k % 128 == 0
+    assert k % 128 == 0
 
     # Type and shape checks
     assert m == m_ and n == n_ and k == k_
