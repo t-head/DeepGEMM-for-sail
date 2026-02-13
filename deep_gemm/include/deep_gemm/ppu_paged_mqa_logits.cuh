@@ -111,10 +111,15 @@ struct PagedMQALogitsScheduler {
             return false;
 
         current_kv_idx += kNumMathWarpGroups;
-        if (current_kv_idx >= current_num_kv) {
+        while (current_kv_idx >= current_num_kv) {
             ++ current_q_idx;
             current_kv_idx = 0;
-            current_num_kv = current_q_idx < batch_size ? ceil_div(__ldg(this->context_lens + current_q_idx), BLOCK_KV) : 0;
+            if (current_q_idx < batch_size) {
+                current_num_kv = ceil_div(__ldg(this->context_lens + current_q_idx), BLOCK_KV);
+            } else {
+                current_num_kv = 0;
+                break;
+            }
         }
 
         return true;
