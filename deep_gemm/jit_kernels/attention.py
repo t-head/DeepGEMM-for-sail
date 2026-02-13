@@ -112,12 +112,7 @@ def mqa_logits_common(q: torch.Tensor,
 
 
     # defalut tile config for fp8 and int8
-    block_qh = 256
-    block_kv = 256
-    warp_qh = 64
-    warp_kv = 64
-    num_q_stages = 3
-    num_kv_stages = 3
+    block_qh, block_kv, warp_qh, warp_kv, num_q_stages, num_kv_stages = [256, 256, 64, 64, 3, 3] if num_heads == 64 else [128, 256, 32, 64, 3, 3]
     block_q = block_qh / num_heads
     assert(block_qh % num_heads == 0)
 
