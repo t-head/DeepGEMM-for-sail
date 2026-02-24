@@ -4,6 +4,7 @@
 #include "cute_tie.cuh"
 #include "utils.cuh"
 #include "utils_cutlass3.h"
+#include "profiling_interface.hpp"
 
 #define ENABLE_WARP_CONTIG_LAYOUT 1
 
@@ -406,7 +407,7 @@ public:
         print("sSFA: "); print(sSFA); print("\n");
         print("sSFB: "); print(sSFB); print("\n");
 
-        print("tSFAsSFA: "); print(tSFAsSFA); print("\n");        
+        print("tSFAsSFA: "); print(tSFAsSFA); print("\n");
         print("tSFBsSFB: "); print(tSFBsSFB); print("\n");
     }
 
@@ -739,7 +740,22 @@ public:
         dim3 const grid = AttnKernel::get_grid_shape(params);
         int smem_size_kernel = AttnKernel::SharedStorageSize;
 
+        DgProfParam dg_prof_params;
+        if (ProfilingInterface::Instance().get_op_info()){
+            std::string data_type_str = "unknown";
+            if (std::is_same_v<ElementQK, cutlass::bfloat16_t>) {
+                data_type_str = "bf16";
+            } else if (std::is_same_v<ElementQK, cutlass::float_e4m3_t>) {
+                data_type_str = "fp8";
+            } else if (std::is_same_v<ElementQK, int8_t>) {
+                data_type_str = "int8";
+            }
+
+            dg_prof_params.set_mqa_logits_params(data_type_str, seq_len_q, seq_len_k, kNumHeads, kHeadDim);
+        }
+        ProfilingInterface::Instance().instrument(true, dg_prof_params);
         cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);
+        ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
         int max_active_tb_num = max_blocks_per_cu;
         const int threadblock_count = num_sms * max_active_tb_num;

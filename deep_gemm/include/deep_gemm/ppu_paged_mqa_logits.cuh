@@ -4,6 +4,7 @@
 #include "cute_tie.cuh"
 #include "utils.cuh"
 #include "utils_cutlass3.h"
+#include "profiling_interface.hpp"
 
 #define ENABLE_WARP_CONTIG_LAYOUT 1
 
@@ -135,7 +136,7 @@ struct PagedMQALogitsScheduler {
 };
 
 template <typename ElementQK, typename ElementAcc,
-          uint32_t kNextN, uint32_t kNumHeads, 
+          uint32_t kNextN, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t BLOCK_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV>
@@ -725,7 +726,7 @@ public:
 namespace deep_gemm {
 
 template <typename ElementQK, typename ElementAcc,
-          uint32_t kNextN, uint32_t kNumHeads, 
+          uint32_t kNextN, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t BLOCK_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV>
@@ -778,7 +779,22 @@ public:
         dim3 const grid = AttnKernel::get_grid_shape(params);
         int smem_size_kernel = AttnKernel::SharedStorageSize;
 
+        DgProfParam dg_prof_params;
+        if (ProfilingInterface::Instance().get_op_info()){
+            std::string data_type_str = "unknown";
+            if (std::is_same_v<ElementQK, cutlass::bfloat16_t>) {
+                data_type_str = "bf16";
+            } else if (std::is_same_v<ElementQK, cutlass::float_e4m3_t>) {
+                data_type_str = "fp8";
+            } else if (std::is_same_v<ElementQK, int8_t>) {
+                data_type_str = "int8";
+            }
+
+            dg_prof_params.set_paged_mqa_logits_params(data_type_str, batch_size, kNextN, kNumHeads, kHeadDim, reinterpret_cast<int*>(const_cast<uint32_t*>(context_lens)));
+        }
+        ProfilingInterface::Instance().instrument(true, dg_prof_params);
         cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);
+        ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
         int max_active_tb_num = max_blocks_per_cu;
         const int threadblock_count = num_sms;

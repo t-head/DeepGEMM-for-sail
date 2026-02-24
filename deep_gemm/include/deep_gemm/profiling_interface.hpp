@@ -31,6 +31,57 @@ void initialize_args(GemmType gemm_type, bool is_gemv, int m, int group, int* gr
     }
 }
 
+void set_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv, int num_heads, int head_dim) {
+    op_name_ = "MqaLogits";
+    add_argument("data_type");
+    add_argument("seq_len_q");
+    add_argument("seq_len_kv");
+    add_argument("num_heads");
+    add_argument("head_dim");
+
+    add_params("data_type", data_type);
+    add_params("seq_len_q", seq_len_q);
+    add_params("seq_len_kv", seq_len_kv);
+    add_params("num_heads", num_heads);
+    add_params("head_dim", head_dim);
+
+    // Set default values (unused)
+    m_ = seq_len_q;
+    group_ = 1;
+    grouped_layout_ = nullptr;
+    gemm_type_ = GemmType::DenseGemm;
+    is_gemv_ = false;
+}
+
+void set_paged_mqa_logits_params(std::string data_type, int batch_size, int next_n, int num_heads, int head_dim, int* context_lens) {
+    op_name_ = "PagedMqaLogits";
+    add_argument("data_type");
+    add_argument("batch_size");
+    add_argument("next_n");
+    add_argument("num_heads");
+    add_argument("head_dim");
+
+    add_params("data_type", data_type);
+    add_params("batch_size", batch_size);
+    add_params("next_n", next_n);
+    add_params("num_heads", num_heads);
+    add_params("head_dim", head_dim);
+
+    // Set values for distribution
+    m_ = batch_size;
+    group_ = batch_size;
+    grouped_layout_ = context_lens;
+    gemm_type_ = GemmType::GroupedNoPad;
+    is_gemv_ = false;
+    int gpu = -1;
+    cudaError_t result = cudaGetDevice(&gpu);
+    if (result != cudaSuccess) {
+        printf("get device id failed\n");
+        return;
+    }
+    device_id_ = gpu;
+}
+
 template <typename T>
 void add_params(const std::string& key, const T& val) {
     if (args_.find(key) == args_.end()) {
@@ -84,33 +135,51 @@ std::string distribution() {
     CHECK_CUDA(cudaGetLastError());
     std::ostringstream outDist;
     outDist << ",distribution:[" ;
-    bool need_bincount = (gemm_type_ == GemmType::GroupedContiguous || is_gemv_ );
-    int size = need_bincount ? m_ : group_;
-    int* tmp = new int[size];
-    CHECK_CUDA(cudaMemcpyAsync(tmp, grouped_layout_, sizeof(int) * size, cudaMemcpyDeviceToHost, stream_));
-    if (need_bincount) {
-        int* counts = new int[group_];
-        for (int i = 0; i < group_; ++i) {
-            counts[i] = 0;
-        }
-        for (int i = 0; i < size; ++i) {
-            if (tmp[i] < 0 || tmp[i] >= group_) {
-                continue;
-            }
-            counts[tmp[i]]++;
-        }
-        for (int i = 0; i < group_ - 1; ++i) {
-            outDist << counts[i] << ",";
-        }
-        outDist << counts[group_ - 1] << "].";
-        delete[] counts;
-    } else {
-        for (int i = 0; i < size - 1; ++i) {
+
+    // Check if this is for paged_mqa_logits (using batch_size and context_lens)
+    if (op_name_ == "PagedMqaLogits") {
+        // For paged_mqa_logits, batch_size is stored in group_ and context_lens in grouped_layout_
+        int batch_size = group_;
+        int* context_lens = grouped_layout_;
+        int* tmp = new int[batch_size];
+        CHECK_CUDA(cudaMemcpyAsync(tmp, context_lens, sizeof(int) * batch_size, cudaMemcpyDeviceToHost, stream_));
+
+        for (int i = 0; i < batch_size - 1; ++i) {
             outDist << tmp[i] << ",";
         }
-        outDist << tmp[size - 1] << "].";
+        outDist << tmp[batch_size - 1] << "].";
+        delete[] tmp;
+    } else {
+        // Original gemm distribution logic
+        bool need_bincount = (gemm_type_ == GemmType::GroupedContiguous || is_gemv_ );
+        int size = need_bincount ? m_ : group_;
+        int* tmp = new int[size];
+        CHECK_CUDA(cudaMemcpyAsync(tmp, grouped_layout_, sizeof(int) * size, cudaMemcpyDeviceToHost, stream_));
+        if (need_bincount) {
+            int* counts = new int[group_];
+            for (int i = 0; i < group_; ++i) {
+                counts[i] = 0;
+            }
+            for (int i = 0; i < size; ++i) {
+                if (tmp[i] < 0 || tmp[i] >= group_) {
+                    continue;
+                }
+                counts[tmp[i]]++;
+            }
+            for (int i = 0; i < group_ - 1; ++i) {
+                outDist << counts[i] << ",";
+            }
+            outDist << counts[group_ - 1] << "].";
+            delete[] counts;
+        } else {
+            for (int i = 0; i < size - 1; ++i) {
+                outDist << tmp[i] << ",";
+            }
+            outDist << tmp[size - 1] << "].";
+        }
+        delete[] tmp;
     }
-    delete[] tmp;
+
     cudaDeviceSynchronize();
     CHECK_CUDA(cudaGetLastError());
     return outDist.str().c_str();
