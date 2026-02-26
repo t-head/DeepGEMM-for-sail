@@ -532,8 +532,8 @@ def read_detail_from_nculog(filename):
 # devices = {
 #     "name": ["cycle", "tensor core efficiency", "waves"],
 #      hopper tc: sm__pipe_tensor_type_hmma_hgmma_qgmma_imma_igmma_bmma_bgmma_cycles_active.avg.pct_of_peak_sustained_elapsed
-#     "gpu":  ["gpu__time_duration.sum", "sm__cycles_active.max", "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active", "launch__waves_per_multiprocessor"],
-#     "ppu":  ["ppu__time_duration.sum","ce__cycles_active.max", "cu__inst_executed_pipe_tensor_fp16.avg.pct_of_peak_sustained_active", "launch__waves_per_cu"],
+#     "gpu":  ["gpu__time_duration.sum", "sm__cycles_elapsed.max", "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active", "launch__waves_per_multiprocessor"],
+#     "ppu":  ["ppu__time_duration.sum","ce__cycles_elapsed.max", "cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed", "launch__waves_per_cu"],
 # }
 
 def read_cycle_from_nculog(filename):
@@ -630,7 +630,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         dtype = re.search(pattern, case).groups()[0]
         script = f"{os.path.dirname(current_file_path)}/run_deep_gemm.py"
         if mode == "full":
-            output_name = clean_casename(case)
+            output_name = clean_casename(case)[:50]
             cmd = "{} --set full --kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*' -o {} python {} --format {} \
                 2>&1 | tee {}".format("ncu" if dev == "gpu" else "acu", output_name, script, case, log_file)
             ret = run_cmd(cmd)
@@ -647,7 +647,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
                 else:
                     metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed"
             else:
-                # "ce__cycles_active.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum.pct_of_peak_sustained_elapsed"
+                # "ce__cycles_elapsed.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum.pct_of_peak_sustained_elapsed"
                 metrics_string = "ppu__time_duration.sum,ce__cycles_elapsed.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum.pct_of_peak_sustained_elapsed"
 
             _acc = "--disable_acc"

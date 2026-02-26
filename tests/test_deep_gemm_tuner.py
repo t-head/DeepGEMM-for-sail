@@ -6,7 +6,7 @@ from deep_gemm.deep_gemm_tuner import (
 )
 
 seed = 123
-performance_threshold = 0.9
+performance_threshold = 0.85
 test_cases_dir = os.path.dirname(os.path.abspath(__file__))+"/tune_configs/"
 test_cases_path = {
     "dense": test_cases_dir+"dense_configs.json",

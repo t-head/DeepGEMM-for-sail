@@ -1,4 +1,5 @@
 import torch
+import multiprocessing as mp
 import json
 from typing import List, Dict, Tuple
 import deep_gemm
@@ -6,15 +7,15 @@ import argparse
 import copy
 from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, construct_grouped
 from deep_gemm.jit_kernels.utils import get_num_sms
-from deep_gemm import uint8_padding, preprocess_mxfp4_scales
-from utils import construct_group_m_list
+from deep_gemm import uint8_padding, preprocess_mxfp4_scales, calc_diff
+from utils import construct_group_m_list, split_list_into_groups
 from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
 from deep_gemm import ceil_div
 from deep_gemm.jit_kernels.utils import get_search_space
 
 # This tile config check file only support MXFP4
 def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[bool, str]:
-    if 'dense' in gemm_type:
+    if 'dense' in gemm_type.lower():
         try:
             A = torch.randn(m, k, dtype=torch.bfloat16, device='cuda').contiguous()
             B = torch.randn(n, k, dtype=torch.bfloat16, device='cuda').contiguous()
@@ -35,9 +36,13 @@ def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[
             deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, bias, out, configs)
             torch.cuda.synchronize()
 
-            if torch.allclose(out, ref_out.to('cuda').to(torch.bfloat16), rtol=1e-2, atol=1e-3):
+            diff = calc_diff(out, ref_out.to('cuda').to(torch.bfloat16))
+            if diff < 0.001:
                 return True, "Success"
             else:
+                print("ref_out:", ref_out)
+                print("out:", out)
+                torch.allclose(out, ref_out, rtol=1e-3, atol=1e-4)
                 return False, "Gemm compute result is wrong!!!"
 
         except RuntimeError as e:
@@ -46,15 +51,19 @@ def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[
         except Exception as e:
             error_msg = f"{type(e).__name__}: {str(e)}"
             return False, error_msg
-    elif 'grouped' in gemm_type:
+    elif 'nopad' in gemm_type.lower():
         try:
             x, y, m_indices, bias, out, ref_out = construct_grouped(num_groups, m, k, n, 'uniform', 1)
 
             deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices, configs=configs)
             torch.cuda.synchronize()
-            if torch.allclose(out, ref_out, rtol=1e-2, atol=1e-3):
+            diff = calc_diff(out, ref_out.to('cuda').to(torch.bfloat16))
+            if diff < 0.001:
                 return True, "Success"
             else:
+                print("ref_out:", ref_out)
+                print("out:", out)
+                torch.allclose(out, ref_out, rtol=1e-3, atol=1e-4)
                 return False, "Gemm compute result is wrong!!!"
 
         except RuntimeError as e:
@@ -71,40 +80,76 @@ def test_all_configs(config_list: List[Tuple],
                      m: int = 1024,
                      n: int = 1024,
                      k: int = 1024,
-                     num_groups: int = 1) -> Dict:
+                     num_groups: int = 1,
+                     success_rate_threshold = 0.95) -> Dict:
     valid_configs = []
     invalid_configs = []
+    all_results_and_configs = {}
 
     print(f"Start testing {len(config_list)} configs...")
     print(f"Test matrix dimensions: M={m}, N={n}, K={k}\n")
+    
+    enable_multithread = not bool(cycle)
+    if enable_multithread:
+        mp.set_start_method('spawn', force=True)
+        global thread_count
+        thread_count = min(thread_count, len(config_list))
+        with mp.Pool(processes=thread_count) as pool:
+            tasks = []
+            for idx in range(len(config_list)):
+                num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = config_list[idx]
+                task_args = (config_list[idx], m, n, k, num_groups, gemm_type)
+                tasks.append(task_args)
+                config_dict = {
+                    'num_sms': num_sms,
+                    'block_m': block_m,
+                    'block_n': block_n,
+                    'block_k': block_k,
+                    'warp_m': warp_m,
+                    'warp_n': warp_n,
+                    'num_stages': num_stages,
+                    'error': None,
+                    'result': None
+                }
+                all_results_and_configs[idx] = config_dict
 
-    for i, configs in enumerate(config_list):
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+            # 并行执行并获取结果列表
+            results = pool.starmap(test_kernel_config, tasks)
+        # print(results)
+        for idx in range(len(results)):
+            is_valid, error_msg = results[idx]
+            all_results_and_configs[idx]['error'] = error_msg
+            all_results_and_configs[idx]['result'] = is_valid
 
-        print(f"[{i+1}/{len(config_list)}] test config:")
-        print(f"  num_sms={num_sms}, block_m={block_m}, block_n={block_n}, block_k={block_k}")
-        print(f"  warp_m={warp_m}, warp_n={warp_n}, num_stages={num_stages}")
-        if 'dense' in gemm_type:
+    else:
+        for i, configs in enumerate(config_list):
+            num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+
+            print(f"[{i+1}/{len(config_list)}] test config:")
+            print(f"  num_sms={num_sms}, block_m={block_m}, block_n={block_n}, block_k={block_k}")
+            print(f"  warp_m={warp_m}, warp_n={warp_n}, num_stages={num_stages}")
             is_valid, error_msg = test_kernel_config(configs, m, n, k, num_groups, gemm_type)
-        elif 'grouped' in gemm_type:
-            is_valid, error_msg = test_kernel_config(configs, m, n, k, num_groups, gemm_type)
 
-        config_dict = {
-            'num_sms': num_sms,
-            'block_m': block_m,
-            'block_n': block_n,
-            'block_k': block_k,
-            'warp_m': warp_m,
-            'warp_n': warp_n,
-            'num_stages': num_stages,
-            'error': error_msg
-        }
+            config_dict = {
+                'num_sms': num_sms,
+                'block_m': block_m,
+                'block_n': block_n,
+                'block_k': block_k,
+                'warp_m': warp_m,
+                'warp_n': warp_n,
+                'num_stages': num_stages,
+                'error': error_msg,
+                'result': is_valid
+            }
+            all_results_and_configs[i] = config_dict
 
+    for i, config in all_results_and_configs.items():
+        is_valid, error_msg = config["result"], config["error"]
         if is_valid:
-            print(f"Test success!\n")
+            print(f"[{i+1}/{len(all_results_and_configs)}] Test success!{config}\n")
             valid_configs.append(config_dict)
         else:
-            print(f"Test failure: {error_msg}\n")
+            print(f"[{i+1}/{len(all_results_and_configs)}] Test failure: {config}, {error_msg}\n")
             invalid_configs.append(config_dict)
 
     results = {
@@ -115,7 +160,8 @@ def test_all_configs(config_list: List[Tuple],
         'valid_configs': valid_configs,
         'invalid_configs': invalid_configs
     }
-
+    success_rate = round(results['valid']/results['total'], 4)
+    assert success_rate >= success_rate_threshold, f'expect {success_rate_threshold=}, actual {success_rate=}'
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write("=" * 100 + "\n")
         f.write(f"{gemm_type} Kernel Configuration Test Results\n")
@@ -125,7 +171,7 @@ def test_all_configs(config_list: List[Tuple],
         f.write(f"Total Configs: {results['total']}\n")
         f.write(f"Valid Configs: {results['valid']}\n")
         f.write(f"Invalid Configs: {results['invalid']}\n")
-        f.write(f"Success Rate: {results['valid']/results['total']*100:.2f}%\n\n")
+        f.write(f"Success Rate: {success_rate*100:.2f}%\n\n")
 
         f.write("=" * 100 + "\n")
         f.write("VALID CONFIGURATIONS\n")
@@ -396,28 +442,45 @@ def get_search_space_doublecheck(d: torch.dtype, gemm_type : str, m:int=0, n:int
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run GEMM tile check')
-    parser.add_argument('--type', type=str,
-                       choices=['grouped', 'dense'],
+    parser.add_argument('--type', type=str, required=True, # now use grouped as nopad
+                       choices=['grouped','contiguous', 'dense', 'nopad', 'masked'],
                        help='Choose the gemm configure')
-    parser.add_argument('--groups', default=1, type=int, help='Number of groups for Grouped GEMM')
+    parser.add_argument('--groups', default=8, type=int, help='Number of groups for Grouped GEMM')
+    parser.add_argument('--target_stage', default=3, type=int, choices=[-1,2,3,4,5], help='specify which num_stages config to run, -1 means all')
     parser.add_argument('--m', default=8192, type=int, help='M dimension')
     parser.add_argument('--n', default=8192, type=int, help='N dimension')
     parser.add_argument('--k', default=8192, type=int, help='K dimension')
+    parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
+    parser.add_argument('--thread_count', default=12, type=int, required=False, help='the thread_count when run multi thread prebuild')
     args = parser.parse_args()
 
     num_groups = args.groups
     m, n, k = args.m, args.n, args.k
     gemm_type = args.type
+    global cycle, thread_count
+    cycle = 0
+    if (args.cycle):
+        cycle = 1
+    thread_count = args.thread_count
+    print(f"cycle: {cycle}, thread_count: {thread_count}")
 
     d = torch.uint8 ### dtype for mxfp4
+    search_space = []
     if gemm_type in ['dense']:
         search_space = get_search_space_doublecheck(d, 'dense', m, n, k)
-    elif gemm_type in ['grouped']:
-        search_space = get_search_space_doublecheck(d, 'dense', m, n, k)
+    elif gemm_type in ['grouped', 'contiguous', 'nopad', 'masked',"GroupedContiguous", "GroupedNoPad", "GroupedMasked"]:
+        # actually get_search_space_doublecheck only add special config for 'dense'
+        search_space = get_search_space_doublecheck(d, gemm_type, m, n, k)
+    else:
+        print("Must give a gemm type configure ")
 
     config_list = []
+    print(f"only run config_list that satisfy num_stages=={args.target_stage}")
     for tile in search_space:
         block_m, block_n, warp_m, warp_n, block_k, num_stages = tile
+        if args.target_stage > 0 and num_stages != args.target_stage:
+            # only run num_stage == target_stage, because run all configs take too much time (>7200s)
+            continue
         sm = get_num_sms()
         smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
         config_list.append((sm, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config))

@@ -15,7 +15,8 @@ from datetime import datetime
 from functools import lru_cache
 from typing import Tuple, Dict, Any, Optional, List
 from tqdm import tqdm
-
+import logging
+logger = logging.getLogger(__name__)
 
 try:
     from transformers import AutoConfig
@@ -491,13 +492,13 @@ def tune_gemm_config(
     # Check if already tuned
     config_key = (m, k, n, num_groups, nopad)
     if config_key in tuned_configs:
-        print(f"Configuration for M={m}, K={k}, N={n}, num_groups={num_groups}, nopad={nopad} already tuned. Skipping...")
+        logger.info(f"Configuration for M={m}, K={k}, N={n}, num_groups={num_groups}, nopad={nopad} already tuned. Skipping...")
         return tuned_configs[config_key]
  
-    print(f"Tuning configuration for M={m}, K={k}, N={n}, num_groups={num_groups}, nopad={nopad}...")
+    logger.info(f"Tuning configuration for M={m}, K={k}, N={n}, num_groups={num_groups}, nopad={nopad}...")
     baseline_time = dispatch_tune_method(num_groups, nopad, dtype)(m, k, n, num_groups=num_groups)
     if baseline_time is None:
-        print(f"Failed to get baseline time for M={m}, K={k}, N={n}, num_groups={num_groups}")
+        logger.info(f"Failed to get baseline time for M={m}, K={k}, N={n}, num_groups={num_groups}")
         return None
     
     if dtype == "fp8":
@@ -538,14 +539,14 @@ def tune_gemm_config(
             }
             acc = (1 - (time / baseline_time))
             best_config["acc"] = acc
-            print(f"mnk: {m}x{n}x{k}, config: {config}, (groups:{num_groups}, nopad{nopad}) - Time: {time:.3f}us - Acc: {acc:.2f}")
+            logger.info(f"mnk: {m}x{n}x{k}, config: {config}, (groups:{num_groups}, nopad{nopad}) - Time: {time:.3f}us - Acc: {acc:.2f}")
     
-    print(f"{m}x{n}x{k} (groups:{num_groups}, nopad{nopad}), config: {config}, - best_time: {best_time:.3f}us - baseline_time: {baseline_time:.2f}")
+    logger.info(f"{m}x{n}x{k} (groups:{num_groups}, nopad{nopad}), config: {config}, - best_time: {best_time:.3f}us - baseline_time: {baseline_time:.2f}")
 
     return best_config
 
 import ray
-import logging
+
 
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
@@ -560,7 +561,7 @@ class BenchmarkWorker:
     ) -> Dict[str, int]:
         best_config = tune_gemm_config(m, k, n, num_groups, nopad, dtype, tuned_configs)
         if best_config is None:
-            print(
+            logger.info(
                 f"Warning: No valid configuration found for M={m}, K={k}, N={n}, num_groups={num_groups}, nopad={nopad}"
             )
         return best_config
@@ -757,10 +758,11 @@ def tuning_deepgemm_config_entrypoint(test_cases, tp, seed=0, model="anonymous",
         for case in [tuple(test_case) + (tuned_configs,) for test_case in test_cases ]:
             best_config = tune_gemm_config(*case)
             if best_config is None:
-                print(
+                logger.info(
                     f"Warning: No valid configuration found for {case}"
                 )
             else:
+                logger.info(best_config)
                 best_configs.append(best_config)
     else:
         ray.init()

@@ -307,7 +307,7 @@ if __name__ == '__main__':
     parser.add_argument('--file',  type=str, default=None, help="File path to be processed (optional).")
     parser.add_argument("--cycle", action="store_true", help="measure cycles instead of duration")
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
-    parser.add_argument('--thread_count', default=32, type=int, required=False, help='the thread_count when run multi thread prebuild')
+    parser.add_argument('--thread_count', default=16, type=int, required=False, help='the thread_count when run multi thread prebuild')
 
     args = parser.parse_args()
 
