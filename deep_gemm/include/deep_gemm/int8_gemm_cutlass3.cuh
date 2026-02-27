@@ -1604,7 +1604,17 @@ public:
             dim3 const block = GemmKernel::get_block_shape();
             dim3 const grid(num_sms * max_blocks_per_cu, 1, 1);
             smem_size_kernel = GemmKernel::SharedStorageSize;
+
+            DgProfParam dg_prof_params;
+            if (ProfilingInterface::Instance().get_op_info()){
+                dg_prof_params.set_params(
+                    kGemmType, false, std::string("int8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
+                    grouped_layout, stream
+                );
+            }
+            ProfilingInterface::Instance().instrument(true, dg_prof_params);
             cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(arguments);
+            ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
             cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
           };
