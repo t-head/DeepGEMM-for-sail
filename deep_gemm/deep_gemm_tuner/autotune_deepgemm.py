@@ -11,138 +11,121 @@ import os
 import argparse
 import triton
 import math
-import numpy as np
 from datetime import datetime
 from functools import lru_cache
 from typing import Tuple, Dict, Any, Optional, List
 from tqdm import tqdm
+
 
 try:
     from transformers import AutoConfig
 except ImportError:
     AutoConfig = None
 
-from deep_gemm.deep_gemm_tuner.deepgemm_tools import get_supported_configs, get_pre_assert_configs
+from deep_gemm.deep_gemm_tuner.deepgemm_tools import get_supported_configs, get_pre_assert_configs, exec_tuning_iter
+from deep_gemm.deep_gemm_tuner.deepgemm_tools import count_expert_num_tokens, fused_topk_torch_native, grouped_masked_m_sample, deepgemm_moe_permute
+from deep_gemm.deep_gemm_tuner.deepgemm_tools import per_token_quant_int8, gemm_nt_i8i8bf16, grouped_gemm_nt_i8i8bf16_masked, grouped_gemm_nt_i8i8bf16_nopad
 from deep_gemm.deep_gemm_tuner.utils import CANDIDATE_Ms, get_deep_gemm_luts, get_device_name
 
 # Try to import deep_gemm functions
-try:
-    # breakpoint()
-    from deep_gemm.utils import calc_diff
-    from deep_gemm.jit_kernels import m_grouped_gemm_int8_int8_bf16_nt_masked, gemm_int8_int8_bf16_nt, get_num_sms
-    from deep_gemm.jit_kernels.gemm_int8 import get_smem_config
-    DEEP_GEMM_AVAILABLE = True
-except ImportError:
-    DEEP_GEMM_AVAILABLE = False
-    print("Warning: deep_gemm not available, some functions will be mocked")
+from deep_gemm import calc_diff
+from deep_gemm.jit_kernels import m_grouped_gemm_int8_int8_bf16_nt_masked, gemm_int8_int8_bf16_nt, get_num_sms
+from deep_gemm.jit_kernels.gemm_int8 import get_smem_config
+DEEP_GEMM_AVAILABLE = True
 
-gamma_params =[
-    {7: (1.45, 4.271)},
-    {10: (1.284, 6.957)},
-    {13: (1.711, 6.695)},
-    {16: (1.283, 10.943)},
-    {19: (1.853, 9.013)},
-    {22: (1.595, 12.031)},
-    {25: (1.788, 12.266)},
-    {28: (1.542, 15.892)},
-    {31: (1.404, 19.307)}
-]
 
-def gamma_sample(shape, scale, num_groups, num_samples):
-    rate = 1.0 / scale  # rate 参数 = 1 / scale
-    # 定义 Gamma 分布（PyTorch 使用 concentration 和 rate）
-    concentration = torch.tensor([shape])  # 形状参数
-    rate_tensor = torch.tensor([rate])     # 速率参数
+def run_grouped_gemm_nopad_test(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
+    """
+    运行分组GEMM测试
 
-    # 创建分布并采样
-    dist = torch.distributions.Gamma(concentration=concentration, rate=rate_tensor)
-    samples = dist.sample((num_samples, num_groups)).to('cuda').int().squeeze()  # 采样 1000 个样本
-    return samples
+    参数:
+    M, K, N: 矩阵维度
+    config: 配置参数
+    num_groups: 分组数量
 
-def grouped_masked_m_sample(expect_m, num_groups, num_samples=100):
-    keys = []
-    shapes = []
-    scales = []
+    返回:
+    执行时间（毫秒）
+    """
+    assert(DEEP_GEMM_AVAILABLE)
+    DEBUG_MODE = int(os.getenv("DEEPGEMM_TUNER_DEBUG_MODE", 0))
 
-    for d in gamma_params:
-        k = list(d.keys())[0]
-        shape, scale = d[k]
-        keys.append(k)
-        shapes.append(shape)
-        scales.append(scale)
+    # Create input tensors for grouped gemm, similar to normal gemm but with groups dimensionn
+    # hard code
+    if num_groups == 512:
+        topk = 10 # qwen3.5
+    else:
+        topk = 8
+    actual_M = M // topk
+    x = torch.randn((actual_M, K), dtype=torch.float16, device="cuda") * 0.1
 
-    def interpolate_gamma_params(target_key: float) -> Optional[Tuple[float, float]]:
-        """
-        根据 target_key 插值得到 (shape, scale)
+    # Create weight tensors for grouped gemm with shape [num_groups, N, K]
+    weight_fp32 = (torch.randn((num_groups, N, K), dtype=torch.float32, device="cuda") - 0.5) * 2
+    weight = (weight_fp32 * 127).clamp(min=-128, max=127).to(torch.int8)
 
-        参数:
-            target_key (float): 输入的 key（如 15, 20 等）
+    # Quantize input
+    x_q, x_scale = per_token_quant_int8(x)
+    block_k = K
+    block_align = 1 # for int8
 
-        返回:
-            tuple: (interpolated_shape, interpolated_scale)
-        """
-        if target_key < min(keys) or target_key > max(keys):
-            print(f"警告: {target_key} 超出插值范围 [{min(keys)}, {max(keys)}]，结果可能不准确。")
+    # Create weight scale with shape [num_groups, N, 1]
+    weight_scale = torch.rand((num_groups, N, 1), device="cuda", dtype=torch.float32) * 1e-2
 
-        # 线性插值
-        shape_interp = np.interp(target_key, keys, shapes)
-        scale_interp = np.interp(target_key, keys, scales)
+    # Create output tensor
 
-        return (shape_interp, scale_interp)
+    output_baseline = torch.empty([M, N], device="cuda", dtype=torch.bfloat16)
+    output_test = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
 
-    shape, scale = interpolate_gamma_params(expect_m)
-    return gamma_sample(shape, scale, num_groups, num_samples)
-
-# sample from real dataset
-def parse_and_figure(file_path, expect_m, total_cases):
-    """Extract all values from 'masked_m' lists in the log file."""
-    all_values = []
-    flag=True
-    flag_pattern = f"expected_m {expect_m}"
-    pattern = r'masked_m\s*\[(.*?)\]'
-    import re
-    iter = 0
-    with open(file_path, 'r') as file:
-        for line in file:
-            # Match the masked_m list pattern
-            flag_match = re.search(flag_pattern, line)
-            match = re.search(pattern, line)
-            if match and flag_match:
-                iter+=1
-                if iter > 5000:
-                    # Extract and convert values
-                    values_str = match.group(1)
-                    values = list(map(int, values_str.split(', ')))
-                    all_values.append(values)
-
-            if len(all_values) > total_cases:
-                break
-    return torch.tensor(all_values, dtype=torch.int32, device='cuda')
-
-def per_token_quant_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-token quantization function for int8"""
-    x = x.to(torch.float32)
-    scale = x.amax(dim=-1, keepdim=True).clamp(min=1e-5) / 127
-    x_q = (x.div(scale)).round().clamp(-128, 127).to(torch.int8)
-    return x_q, scale
-
-# int8 implementation
-def gemm_nt_i8i8bf16(
-    lhs: Tuple[torch.Tensor, torch.Tensor],
-    rhs: Tuple[torch.Tensor, torch.Tensor],
-    out: torch.Tensor,
-    configs: Tuple = None,
-):
-    m, k = lhs[0].shape
-    n, _ = rhs[0].shape
-    num_groups = 1
-    best_config = (
-        configs
-        if configs is not None
-        else get_deep_gemm_luts(m, n, k, num_groups=num_groups)
+    # Create expert_ids tensor and fill with [0...num_group] value
+    input_gating = torch.randn(actual_M, num_groups, dtype=torch.float32, device="cuda")
+    _, topk_ids = fused_topk_torch_native(x, input_gating, topk=topk, renormalize=True)
+    a, a_scale, expert_ids, inv_perm, num_recv_tokens_per_expert = deepgemm_moe_permute(
+        aq=x_q,
+        aq_scale=x_scale,
+        topk_ids=topk_ids,
+        local_num_experts=num_groups,
+        block_align=block_align,
+        block_k=block_k
     )
+    
+    def grouped_gemm_nopad():
+        with torch.inference_mode():
+            f1 = lambda: grouped_gemm_nt_i8i8bf16_nopad(
+                (a, a_scale),
+                (weight, weight_scale),
+                output_baseline,
+                expert_ids
+            )
 
-    get_deep_gemm_luts(lhs, rhs, out, best_config)
+            f2 = lambda: grouped_gemm_nt_i8i8bf16_nopad(
+                (a, a_scale),
+                (weight, weight_scale),
+                output_test,
+                expert_ids,
+                num_recv_tokens_per_expert,
+                config
+            )
+
+            # Warmup runs
+            for _ in range(10):
+                f1()
+                f2()
+            ref_out = output_baseline
+            output = output_test
+
+            # Check that results match within tolerance
+            diff = torch.mean(torch.abs(output.to(torch.float32) - ref_out.to(torch.float32)))
+            rel_diff = diff / torch.mean(torch.abs(ref_out.to(torch.float32)))
+            if rel_diff >= 0.05:
+                print(f"Relative difference too large: {rel_diff}. "
+                    f"Shapes: x_q={x_q.shape}, weight={weight.shape}, "
+                    f"x_scale={x_scale.shape}, weight_scale={weight_scale.shape}")
+                return None
+
+            use_time_deep_gemm = triton.testing.do_bench(f2)
+
+            return 1000 * use_time_deep_gemm
+
+    return exec_tuning_iter(grouped_gemm_nopad, "run_grouped_gemm_nopad_test", DEBUG_MODE)
 
 
 def run_normal_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
@@ -158,6 +141,7 @@ def run_normal_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None,
     执行时间（毫秒）
     """
     assert(DEEP_GEMM_AVAILABLE)
+    DEBUG_MODE = int(os.getenv("DEEPGEMM_TUNER_DEBUG_MODE", 0))
 
     # Create input tensors
     x = torch.randn((M, K), dtype=torch.float16, device="cuda") * 0.1
@@ -175,7 +159,8 @@ def run_normal_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None,
 
     # No bias in these test cases
     bias = None
-    try:
+    
+    def dense_gemm_normal():
         with torch.inference_mode():
             ref_out = torch.empty([M, N], device=x.device, dtype=torch.bfloat16)
             # Compute reference result using acext kernel
@@ -220,51 +205,9 @@ def run_normal_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None,
             use_time_deep_gemm = triton.testing.do_bench(f2)
 
             return 1000 * use_time_deep_gemm
+        
+    return exec_tuning_iter(dense_gemm_normal, "run_normal_gemm_test", DEBUG_MODE)
 
-    except Exception as e:
-        print(f"Error in run_normal_gemm_test: {e}")
-        return None
-
-
-
-def grouped_gemm_nt_i8i8bf16_masked(
-    lhs: Tuple[torch.Tensor, torch.Tensor],
-    rhs: Tuple[torch.Tensor, torch.Tensor],
-    out: torch.Tensor,
-    masked_m: torch.Tensor,
-    expected_m: int,
-    configs=None,
-    overlap_args: Optional[Any] = None,
-    max_block_n: int = 256,
-):
-    num_groups, _, k = lhs[0].shape
-    _, n, _ = rhs[0].shape
-    best_config = (
-        configs
-        if configs is not None
-        else tuner.get_deep_gemm_luts(expected_m, n, k, num_groups=num_groups)
-    )
-
-    with configure_deep_gemm_num_sms(
-        overlap_args.num_sms if overlap_args is not None else None
-    ):
-        return m_grouped_gemm_int8_int8_bf16_nt_masked(
-            lhs,
-            rhs,
-            out,
-            masked_m,
-            expected_m,
-            best_config,
-            **(
-                dict(
-                    enable_sbo_overlap=True,
-                    max_block_n=max_block_n,
-                    signal=overlap_args.signal,
-                )
-                if overlap_args is not None
-                else {}
-            ),
-        )
 
 def run_grouped_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
     """
@@ -279,6 +222,9 @@ def run_grouped_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None
     执行时间（毫秒）
     """
     assert(DEEP_GEMM_AVAILABLE)
+    DEBUG_MODE = int(os.getenv("DEEPGEMM_TUNER_DEBUG_MODE", 0))
+    # hard code
+    topk=8
 
     # Create input tensors for grouped gemm, similar to normal gemm but with groups dimensionn
     x = torch.randn((num_groups, 4096, K), dtype=torch.float16, device="cuda") * 0.1
@@ -304,18 +250,12 @@ def run_grouped_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None
     # sample from random input gate
     def gen_expert_num_tokens(total_cases=100):
         ret = []
-        from sglang.srt.layers.moe.topk import select_experts, TopKConfig
-        from sglang.srt.layers.moe.fused_moe_triton.deepgemm_moe import count_expert_num_tokens
         num_tokens = (M-1)*256//(8)
-        topk_config = TopKConfig(
-            top_k=8,
-            renormalize=True,
-        )
 
         for _ in range(total_cases):
             x_dummy =  torch.randn((num_tokens, K), dtype=torch.float16, device="cuda")
             input_gating = torch.randn(num_tokens, 256, device='cuda', dtype=torch.float32)
-            _, topk_ids, _ = select_experts(x_dummy, input_gating, topk_config)
+            _, topk_ids = fused_topk_torch_native(x_dummy, input_gating, topk=topk, renormalize=True)
             expert_num_tokens = count_expert_num_tokens(topk_ids, 16, 1)
             ret.append(expert_num_tokens)
         return ret
@@ -328,7 +268,7 @@ def run_grouped_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None
         # standard distribution sample
         masked_m_all = gen_expert_num_tokens(total_cases)
 
-    try:
+    def group_gemm_masked():
         with torch.inference_mode():
             def run_with_masked_m(output, config=None):
                 for i in range(total_cases):
@@ -365,10 +305,7 @@ def run_grouped_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None
             use_time_deep_gemm = triton.testing.do_bench(f2) / total_cases
 
             return 1000 * use_time_deep_gemm
-
-    except Exception as e:
-        print(f"Error in run_grouped_gemm_test: {e}")
-        return None
+    return exec_tuning_iter(group_gemm_masked, "run_grouped_gemm_test", DEBUG_MODE)
 
 
 def load_tuned_configs(filename: str = "best_gemm_configs.json") -> Dict[Tuple[int, int, int, int], Dict[str, Any]]:
@@ -439,6 +376,7 @@ def tune_gemm_config(
     k: int,
     n: int,
     num_groups: int,
+    nopad: bool,
     tuned_configs: Optional[Dict[Tuple[int, int, int, int], Dict[str, Any]]]
     ) -> Optional[Dict[str, Any]]:
     """
@@ -453,15 +391,18 @@ def tune_gemm_config(
     最佳配置或None（如果已存在或调优失败）
     """
     # Check if already tuned
-    config_key = (m, k, n, num_groups)
+    config_key = (m, k, n, num_groups, nopad)
     if config_key in tuned_configs:
-        print(f"Configuration for M={m}, K={k}, N={n}, num_groups={num_groups} already tuned. Skipping...")
+        print(f"Configuration for M={m}, K={k}, N={n}, num_groups={num_groups}, nopad={nopad} already tuned. Skipping...")
         return tuned_configs[config_key]
-
-    print(f"Tuning configuration for M={m}, K={k}, N={n}, num_groups={num_groups}...")
+ 
+    print(f"Tuning configuration for M={m}, K={k}, N={n}, num_groups={num_groups}, nopad={nopad}...")
     if num_groups == 1:
         baseline_time = run_normal_gemm_test(m, k, n)
         gemm_type = "dense"
+    elif nopad:
+        baseline_time = run_grouped_gemm_nopad_test(m, k, n, num_groups=num_groups)
+        gemm_type = "nopad"
     else:
         baseline_time = run_grouped_gemm_test(m, k, n, num_groups=num_groups)
         gemm_type = "masked"
@@ -477,6 +418,8 @@ def tune_gemm_config(
         num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config = config
         if num_groups == 1:
             time = run_normal_gemm_test(m, k, n, config)
+        elif nopad:
+            time = run_grouped_gemm_nopad_test(m, k, n, config=config, num_groups=num_groups)
         else:
             time = run_grouped_gemm_test(m, k, n, config, num_groups)
         if time is not None and time < best_time and (1 - (time / baseline_time)) > 0.01:
@@ -486,6 +429,7 @@ def tune_gemm_config(
                 "K": k,
                 "N": n,
                 "num_groups": num_groups,
+                "nopad": nopad,
                 "config": {
                     "num_min_sms": num_min_sms,
                     "best_block_m": best_block_m,
@@ -501,9 +445,9 @@ def tune_gemm_config(
             }
             acc = (1 - (time / baseline_time))
             best_config["acc"] = acc
-            print(f"mnk: {m}x{n}x{k}, config: {config}, (groups:{num_groups}) - Time: {time:.3f}us - Acc: {acc:.2f}")
-
-    print(f"{m}x{n}x{k} (groups:{num_groups}), config: {config}, - best_time: {best_time:.3f}us - baseline_time: {baseline_time:.2f}")
+            print(f"mnk: {m}x{n}x{k}, config: {config}, (groups:{num_groups}, nopad{nopad}) - Time: {time:.3f}us - Acc: {acc:.2f}")
+    
+    print(f"{m}x{n}x{k} (groups:{num_groups}, nopad{nopad}), config: {config}, - best_time: {best_time:.3f}us - baseline_time: {baseline_time:.2f}")
 
     return best_config
 
@@ -519,16 +463,13 @@ class BenchmarkWorker:
         self.seed = seed
 
     def tune(
-        self,
-        m: int,
-        k: int,
-        n: int,
-        num_groups: int,
-        tuned_configs
+        self, m: int, k: int, n: int, num_groups: int, nopad: bool, tuned_configs
     ) -> Dict[str, int]:
-        best_config = tune_gemm_config(m, k, n, num_groups, tuned_configs)
+        best_config = tune_gemm_config(m, k, n, num_groups, nopad, tuned_configs)
         if best_config is None:
-            print(f"Warning: No valid configuration found for M={m}, K={k}, N={n}, num_groups={num_groups}")
+            print(
+                f"Warning: No valid configuration found for M={m}, K={k}, N={n}, num_groups={num_groups}, nopad={nopad}"
+            )
         return best_config
 
 
@@ -704,6 +645,7 @@ def get_test_cases(args):
 
 def tuning_deepgemm_config_entrypoint(test_cases, tp, seed=0, model="anonymous", tuned_config=None, out_of_box=False):
     print(f"tuning cases are {test_cases}")
+    DEBUG_MODE = int(os.getenv("DEEPGEMM_TUNER_DEBUG_MODE", 0))
 
     # Load previously tuned configurations
     tuned_configs = load_tuned_configs(tuned_config)
@@ -713,56 +655,68 @@ def tuning_deepgemm_config_entrypoint(test_cases, tp, seed=0, model="anonymous",
     best_configs = sorted(best_configs, key = lambda x : str(x))
 
     # init cluster
-    ray.init()
 
     logger = logging.getLogger(__name__)
     logging.basicConfig(filename='ray_output.log', level=logging.INFO)
 
-    num_gpus = int(ray.available_resources()["GPU"])
-    workers = [BenchmarkWorker.remote(seed) for _ in range(num_gpus)]
-    def _distribute(method: str, inputs: List[Any]) -> List[Any]:
-        outputs = []
-        worker_idx = 0
-        for input_args in inputs:
-            worker = workers[worker_idx]
-            worker_method = getattr(worker, method)
-            output = worker_method.remote(*input_args)
-            outputs.append(output)
-            worker_idx = (worker_idx + 1) % num_gpus
-        return ray.get(outputs)
+    if DEBUG_MODE:
+        best_configs = []
+        for case in [tuple(test_case) + (tuned_configs,) for test_case in test_cases ]:
+            best_config = tune_gemm_config(*case)
+            if best_config is None:
+                print(
+                    f"Warning: No valid configuration found for {case}"
+                )
+            else:
+                best_configs.append(best_config)
+    else:
+        ray.init()
+        num_gpus = int(ray.available_resources()["GPU"])
+        workers = [BenchmarkWorker.remote(seed) for _ in range(num_gpus)]
+        def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+            outputs = []
+            worker_idx = 0
+            for input_args in inputs:
+                worker = workers[worker_idx]
+                worker_method = getattr(worker, method)
+                output = worker_method.remote(*input_args)
+                outputs.append(output)
+                worker_idx = (worker_idx + 1) % num_gpus
+            return ray.get(outputs)
 
-    best_configs = _distribute(
-        "tune",
-        [tuple(test_case) + (tuned_configs,) for test_case in test_cases ]
-    )
+        best_configs = _distribute(
+            "tune",
+            [tuple(test_case) + (tuned_configs,) for test_case in test_cases ]
+        )
 
     # Save all configurations
     if best_configs:
         device_name = get_device_name().replace(" ", "_")
         save_path = ""
+        def get_timestamp():
+            from datetime import datetime
+            # 获取当前时间
+            current_time = datetime.now()
+            # 格式化时间为 "YY/MM/DD/HH/MM"
+            formatted_time = current_time.strftime("%y-%m-%d-%H-%M")
+            return formatted_time
         if out_of_box:
             save_dir = os.path.join(
                 os.path.dirname(os.path.realpath(__file__)),
                 "configs",
             )
             assert os.path.exists(save_dir), "Deepgemm int8 configs dir "+save_dir+" do not exist, please upgrade to the latest version."
-            def get_timestamp():
-                from datetime import datetime
-                # 获取当前时间
-                current_time = datetime.now()
-                # 格式化时间为 "YY/MM/DD/HH/MM"
-                formatted_time = current_time.strftime("%y-%m-%d-%H-%M")
-                return formatted_time
 
             save_path = os.path.join(save_dir, get_timestamp())
 
         else:
-            save_path = (model.split("/")[-1] if len(model.split("/")[-1])>0 else args.model.split("/")[-2])
-
-        save_tuned_configs(best_configs,  save_path + "-tp" + str(tp) +",device_name="+device_name+"-deepgemm_configs.json")
+            save_path = get_timestamp()
+        save_path = save_path + "-tp" + str(tp) +",device_name="+device_name+"-deepgemm_configs.json"
+        save_tuned_configs(best_configs,  save_path)
         print(f"Tuning completed. Found {len(best_configs)} best configurations.")
     else:
         print("No configurations were tuned.")
+    return save_path
 
 
 def tuning_deepgemm_model_config(args):

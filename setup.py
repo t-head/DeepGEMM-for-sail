@@ -133,7 +133,8 @@ if __name__ == '__main__':
             'deep_gemm': [
                 'include/deep_gemm/**/*',
                 'include/cutlass/**/*',
-                'include/cutlass3/**/*'
+                'include/cutlass3/**/*',
+                'deep_gemm_tuner/configs/*',
             ]
         },
         ext_modules=[

@@ -5,15 +5,31 @@ from prettytable import PrettyTable
 from sglang.srt.utils import logger
 from collections import defaultdict
 from deep_gemm import deep_gemm_tuner as tuner
-from .autotune_deepgemm import run_normal_gemm_test, run_grouped_gemm_test
-from .utils import get_deep_gemm_luts, search_for_suitable_config
-from termcolor import colored
+from .autotune_deepgemm import run_normal_gemm_test, run_grouped_gemm_test, run_grouped_gemm_nopad_test
+from .utils import get_deep_gemm_best_configs, search_for_suitable_config
 
-def colorize_score_termcolor(value):
-    if value >= 1.0:
-        return colored(f"{value:.2f}", "green")
-    else:
-        return colored(f"{value:.2f}", "red")
+try:
+    from prettytable import PrettyTable
+except ImportError as e:
+    logger.warning(
+        f"{e}, please run 'pip install prettytable'."
+    )
+    from .deepgemm_tools import PrettyTable
+
+try:
+    from termcolor import colored
+    def colorize_score_termcolor(value):
+        if value >= 1.0:
+            return colored(f"{value:.2f}", "green")
+        else:
+            return colored(f"{value:.2f}", "red")
+except ImportError as e:
+    logger.warning(
+        f"{e}, please run 'pip install prettytable'."
+    )
+    def colorize_score_termcolor(value):
+        return f"{value:.2f}"
+
 colorize_score = colorize_score_termcolor
 
 
@@ -23,7 +39,7 @@ def get_tuned_configs(config_file_path: str):
     try:
         with open(config_file_path,'r') as f:
             config_dict = json.load(f)
-        config_dict = dict([((x['M'],x['N'],x['K'],x['num_groups']),x) for x in config_dict])
+        config_dict = dict([((x["M"], x["N"], x["K"], x["num_groups"], x['nopad'] if 'nopad' in x else False), x) for x in config_dict])
     except :
         logger.warning(
             f"Empty config found in {config_file_path}."
@@ -32,12 +48,12 @@ def get_tuned_configs(config_file_path: str):
     def gen_NKG_M_map(best_config):
         nkg_m_map = defaultdict(list)
         for key in best_config:
-            m, n, k, g = key
-            nkg_m_map[(n, k, g)].append(m)
+            m, n, k, g, nopad = key
+            nkg_m_map[(n, k, g, nopad)].append(m)
         return nkg_m_map
     return config_dict, gen_NKG_M_map(config_dict)
 
-def benckmark_normal_atom(M, N, K, num_groups, config, baseline_config=None):
+def benckmark_normal_atom(M, N, K, num_groups, nopad, config, baseline_config=None):
     num_sms = config["num_min_sms"]
     block_m = config["best_block_m"]
     block_n = config["best_block_n"]
@@ -46,7 +62,10 @@ def benckmark_normal_atom(M, N, K, num_groups, config, baseline_config=None):
     warp_n = config["warp_n"]
     num_stages = config["best_num_stages"]
     smem_config = config["best_smem_config"]
-    benchmark_func = run_grouped_gemm_test if num_groups > 1 else run_normal_gemm_test
+    if nopad:
+        benchmark_func = run_grouped_gemm_nopad_test
+    else:
+        benchmark_func = run_grouped_gemm_test if num_groups > 1 else run_normal_gemm_test
     if baseline_config:
         b_num_sms = baseline_config["num_min_sms"]
         b_block_m = baseline_config["best_block_m"]
@@ -70,13 +89,13 @@ def benchmark_tuned_configs(config_file_path=None):
     if config_file_path:
         best_configs, _ = get_tuned_configs(config_file_path)
     else:
-        best_configs, _ = get_deep_gemm_luts()
+        best_configs, _ = get_deep_gemm_best_configs()
     for k, config in best_configs.items():
-        M, N, K , num_group = k
+        M, N, K, num_group, nopad = k
         if config_file_path is None and num_group > 1:
             continue
-        baseline_time, config_time = benckmark_normal_atom(M, N, K, config=eval(config['config']), num_groups=num_group)
-        table.add_row([f"({M}, {N}, {K}, {num_group})", f"{baseline_time:.2f}", f"{config_time:.2f}", colorize_score(baseline_time/config_time)])
+        baseline_time, config_time = benckmark_normal_atom(M, N, K, config=eval(config['config']), num_groups=num_group, nopad=nopad)
+        table.add_row([f"({M}, {N}, {K}, {num_group}, {nopad})", f"{baseline_time:.2f}", f"{config_time:.2f}", colorize_score(baseline_time/config_time)])
 
     print(table)
 
@@ -84,7 +103,7 @@ def benchmark_attach_case(config_file_path=None, concurrency_list=[1], MTP=1, to
     if config_file_path:
         best_configs, nkg_m_map = get_tuned_configs(config_file_path)
     else:
-        best_configs, nkg_m_map = get_deep_gemm_luts()
+        best_configs, nkg_m_map = get_deep_gemm_best_configs()
     table = PrettyTable()
     table.float_format = "0.2f"
     table.field_names = ["(M(expect M), N, K, num_groups)", "M attached", "default time", "optimized time", "speedup"]
@@ -92,7 +111,7 @@ def benchmark_attach_case(config_file_path=None, concurrency_list=[1], MTP=1, to
     for nkg in nkg_m_map:
         for concurrency in concurrency_list:
             concurrency=int(concurrency)
-            N, K, num_groups = nkg
+            N, K, num_groups, nopad = nkg
             if num_groups > 1:
                 ## masked expect_m estimate
                 M = concurrency*MTP*topk//experts_num+1
@@ -103,46 +122,49 @@ def benchmark_attach_case(config_file_path=None, concurrency_list=[1], MTP=1, to
             M_candidate = M
             if best_configs is not None:
                 # find neariest config
-                config, M_candidate = search_for_suitable_config(M, N, K, num_groups, best_configs, nkg_m_map)
+                config, M_candidate = search_for_suitable_config(M, N, K, num_groups, nopad, best_configs, nkg_m_map)
 
             if config:
-                baseline_time, config_time = benckmark_normal_atom(M, N, K, config=config, num_groups=num_groups)
-                table.add_row([f"({M}, {N}, {K}, {num_groups})", M_candidate, f"{baseline_time:.2f}", f"{config_time:.2f}", colorize_score(baseline_time/config_time)])
+                baseline_time, config_time = benckmark_normal_atom(M, N, K, config=config, num_groups=num_groups, nopad=nopad)
+                table.add_row([f"({M}, {N}, {K}, {num_groups}, {nopad})", M_candidate, f"{baseline_time:.2f}", f"{config_time:.2f}", colorize_score(baseline_time/config_time)])
             else:
-                table.add_row([f"({M}, {N}, {K}, {num_groups})", M_candidate, -1, -1, 1])
+                table.add_row([f"({M}, {N}, {K}, {num_groups}, {nopad})", M_candidate, -1, -1, 1])
 
     print(table)
 
 def benchmark_increment(config_file_path):
     best_configs, nkg_m_map = get_tuned_configs(config_file_path)
-    baseline_configs, base_nkg_m_map = get_deep_gemm_luts()
+    baseline_configs, base_nkg_m_map = get_deep_gemm_best_configs()
 
     table = PrettyTable()
     table.float_format = "0.2f"
     table.field_names = ["(M(expect M), N, K, num_groups)", "M baseline attached", "baseline time", "M attached", "optimized time", "speedup"]
 
+    benchmark_result = []
     for nkg in nkg_m_map:
-        N, K, num_groups = nkg
+        N, K, num_groups, nopad = nkg
         for M in nkg_m_map[nkg]:
             config = None
             M_candidate = M
             if best_configs is not None:
                 # find neariest config
-                config, M_candidate = search_for_suitable_config(M, N, K, num_groups, best_configs, nkg_m_map)
+                config, M_candidate = search_for_suitable_config(M, N, K,  num_groups, nopad, best_configs, nkg_m_map)
 
             baseline_config = None
             M_baseline_candidate = M
             if baseline_configs is not None:
                 # find neariest config
-                baseline_config, M_baseline_candidate = search_for_suitable_config(M, N, K, num_groups, baseline_configs, base_nkg_m_map)
+                baseline_config, M_baseline_candidate = search_for_suitable_config(M, N, K, num_groups, nopad, baseline_configs, base_nkg_m_map)
 
             if config:
-                baseline_time, config_time = benckmark_normal_atom(M, N, K, config=config, num_groups=num_groups, baseline_config=baseline_config)
-                table.add_row([f"({M}, {N}, {K}, {num_groups})", M_baseline_candidate, f"{baseline_time:.2f}", M_candidate, f"{config_time:.2f}", colorize_score(baseline_time/config_time)])
+                baseline_time, config_time = benckmark_normal_atom(M, N, K, config=config, num_groups=num_groups, baseline_config=baseline_config, nopad=nopad)
+                table.add_row([f"({M}, {N}, {K}, {num_groups}, {nopad})", M_baseline_candidate, f"{baseline_time:.2f}", M_candidate, f"{config_time:.2f}", colorize_score(baseline_time/config_time)])
+                benchmark_result.append((M, N, K, num_groups, baseline_time/config_time))
             else:
-                table.add_row([f"({M}, {N}, {K}, {num_groups})", M_baseline_candidate, -1,  M_candidate, -1, 1])
+                table.add_row([f"({M}, {N}, {K}, {num_groups}, {nopad})", M_baseline_candidate, -1,  M_candidate, -1, 1])
 
     print(table)
+    return benchmark_result
 
 
 if __name__ == "__main__":
@@ -188,5 +210,5 @@ if __name__ == "__main__":
     elif args.command == 'benchmark':
         benchmark_tuned_configs(args.tuned_config)
     elif args.command == 'all':
-        logger.info(colored("Full test on dense gemm", 'red'))
+        logger.info("Full test on dense gemm")
         benchmark_tuned_configs()
