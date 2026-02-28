@@ -64,9 +64,9 @@ def m_grouped_gemm_fp4_fp4_fp32_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
-        smem_config = get_smem_config(num_stages, k, block_m, block_n, block_k)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms)
+        # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
+        # smem_config = get_smem_config(num_stages, k, block_m, block_n, block_k)
 
     if m_rows is None:
         counts = torch.bincount(m_indices)
