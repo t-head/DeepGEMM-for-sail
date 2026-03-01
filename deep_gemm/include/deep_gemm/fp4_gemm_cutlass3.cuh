@@ -451,13 +451,13 @@ struct CollectiveMmaScaleFp4
   static constexpr int tile_scale_M = size<0>(TileShape{}) / 16;
   static constexpr int tile_scale_N = size<1>(TileShape{}) / 16;
   static constexpr int tile_scale_K = size<2>(TileShape{}) / 32 * 8;
-  // calculate the scale smem padding
+  // calculate the scale smem padding for sfb
   static constexpr int SwizzlePadding = []() constexpr {
     constexpr int targets[] = {8, 24, 4, 12, 20, 28, 16, 0};
     for (int t : targets) {
       for (int pad = 0; pad < 32; ++pad) {
         int L = tile_scale_K + pad;
-        if (((warp_on_m * L) & 31) == t) return pad;
+        if (((warp_on_n * L) & 31) == t) return pad;
       }
     }
     return 0;
@@ -472,11 +472,11 @@ struct CollectiveMmaScaleFp4
   using SmemLayoutSFA = decltype(make_layout(make_shape(size<0>(BlockScaleShapeSFA{}), size<2>(BlockScaleShapeSFA{}), Int<DispatchPolicy::Stages>{}), make_stride(size<2>(BlockScaleShapeSFA{}), Int<1>{}, size<0>(BlockScaleShapeSFA{}) * size<2>(BlockScaleShapeSFA{}))));
   using SmemLayoutSFB = decltype(make_layout(make_shape(size<1>(BlockScaleShape{}), size<2>(BlockScaleShape{}), Int<DispatchPolicy::Stages>{}), make_stride((size<2>(BlockScaleShape{}) + Int<SwizzlePadding>{}), Int<1>{}, size<1>(BlockScaleShape{}) * (size<2>(BlockScaleShape{}) + Int<SwizzlePadding>{}))));
 
-  // align smem M/N by 64 for those tiles that are not divideable by 64, where SmemTiledcopy will cause OOB load.
-  static constexpr int tile_scale_M_aligned = cute::ceil_div(tile_scale_M, 64) * 64;
-  static constexpr int tile_scale_N_aligned = cute::ceil_div(tile_scale_N, 64) * 64;
+  // align smem M/N by 64 for those tiles that are not divideable by 4 * warp_on_mn, where SmemTiledcopy will cause OOB load.
+  static constexpr int tile_scale_M_aligned = cute::ceil_div(tile_scale_M, 4 * warp_on_m) * 4 * warp_on_m;
+  static constexpr int tile_scale_N_aligned = cute::ceil_div(tile_scale_N, 4 * warp_on_n) * 4 * warp_on_n;
   using BlockScaleShapeAligned = Shape<Int<tile_scale_M_aligned>, Int<tile_scale_N_aligned>, Int<tile_scale_K>>;
-  using SmemLayoutSFAAligned = decltype(make_layout(make_shape(size<0>(BlockScaleShapeAligned{}), size<2>(BlockScaleShapeAligned{}), Int<DispatchPolicy::Stages>{}), make_stride((size<2>(BlockScaleShapeAligned{}) + Int<SwizzlePadding>{}), Int<1>{}, size<0>(BlockScaleShapeAligned{}) * (size<2>(BlockScaleShapeAligned{}) + Int<SwizzlePadding>{}))));
+  using SmemLayoutSFAAligned = decltype(make_layout(make_shape(size<0>(BlockScaleShapeAligned{}), size<2>(BlockScaleShapeAligned{}), Int<DispatchPolicy::Stages>{}), make_stride((size<2>(BlockScaleShapeAligned{})), Int<1>{}, size<0>(BlockScaleShapeAligned{}) * (size<2>(BlockScaleShapeAligned{})))));
   using SmemLayoutSFBAligned = decltype(make_layout(make_shape(size<1>(BlockScaleShapeAligned{}), size<2>(BlockScaleShapeAligned{}), Int<DispatchPolicy::Stages>{}), make_stride((size<2>(BlockScaleShapeAligned{}) + Int<SwizzlePadding>{}), Int<1>{}, size<1>(BlockScaleShapeAligned{}) * (size<2>(BlockScaleShapeAligned{}) + Int<SwizzlePadding>{}))));
 
   // temporally load SFB in original layout
@@ -1143,7 +1143,7 @@ public:
     Fp4Gemm() = default;
 
     static void run(uint8_t *a_ptr, uint8_t *scale_a, uint8_t *b_ptr, uint8_t *scale_b,
-                    float *c_ptr, float *d_ptr, int shape_m, int *grouped_layout, int *block_m_info, uint32_t expected_m,
+                    float *c_ptr, __nv_bfloat16 *d_ptr, int shape_m, int *grouped_layout, int *block_m_info, uint32_t expected_m,
                     cudaStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
 
         // A matrix configuration
@@ -1162,13 +1162,13 @@ public:
         constexpr int AlignmentC  = 1;
 
         // D matrix configuration
-        using         ElementD    = ElementC;
+        using         ElementD    = cutlass::bfloat16_t;
         using         LayoutD     = LayoutC;
         constexpr int AlignmentD  = AlignmentC;
 
-        // Auxiliary matrix configuration
-        using         ElementAux   = ElementC;
-        using         LayoutAux    = LayoutC;
+        // // Auxiliary matrix configuration
+        // using         ElementAux   = ElementC;
+        // using         LayoutAux    = LayoutC;
 
         // Core kernel configurations
         using ElementAccumulator  = float;                                          // Element type for internal accumulation
@@ -1176,7 +1176,7 @@ public:
         using ElementBias         = float;                                          // Element type for bias addition
         using ElementScalar    = ElementCompute;
 
-        using EpilogueOutputOp = cutlass::epilogue::thread::LinearCombinationBiasElementwise<ElementD, ElementAccumulator, ElementCompute, ElementBias, ElementBias, AlignmentD, cutlass::epilogue::thread::Identity<float>>;
+        using EpilogueOutputOp = cutlass::epilogue::thread::LinearCombinationBiasElementwise<ElementD, ElementAccumulator, ElementCompute, ElementD, ElementD, AlignmentD, cutlass::epilogue::thread::Identity<float>, cutlass::plus<ElementCompute>, true, ElementBias>;
 
         using WarpOnM = Int<BlockM / WarpM>;
         using WarpOnN = Int<BlockN / WarpN>;
@@ -1297,7 +1297,7 @@ public:
         cutlass::KernelHardwareInfo hw_info;
         hw_info.device_id = 0;
         hw_info.sm_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id) * max_blocks_per_cu;
-
+        cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(d_ptr);
         typename GemmKernel::Arguments arguments{
             cutlass::gemm::GemmUniversalMode::kGemm,
             {shape_m, ShapeN, ShapeK, 1},
@@ -1315,7 +1315,7 @@ public:
                 c_ptr, stride_Bias,
               }, // epilogue.thread
               nullptr, stride_C,
-              d_ptr, stride_D,
+              converted_output, stride_D,
             },
             hw_info,
         };

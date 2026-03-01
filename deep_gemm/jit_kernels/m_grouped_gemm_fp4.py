@@ -1,7 +1,7 @@
 import torch
 from typing import Tuple
 
-from .gemm_fp4 import get_best_configs, get_smem_config
+from .gemm_fp4 import get_best_configs, get_smem_config_fp4
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div
 
@@ -28,7 +28,7 @@ gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
             stream, num_sms, smem_size, signal);
 """
 
-def m_grouped_gemm_fp4_fp4_fp32_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor],
+def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor],
                                          rhs_: Tuple[torch.Tensor, torch.Tensor],
                                          bias: torch.Tensor, out: torch.Tensor,
                                          m_indices: torch.Tensor, m_rows: torch.Tensor = None,
@@ -46,7 +46,7 @@ def m_grouped_gemm_fp4_fp4_fp32_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     assert lhs.dtype == torch.uint8 and rhs.dtype == torch.uint8
     assert lhs_scales.dtype == torch.uint8 and rhs_scales.dtype == torch.uint8
     assert bias.dtype == torch.float32
-    assert out.dtype == torch.float32
+    assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
     assert rhs_scales.is_contiguous() and lhs_scales.is_contiguous() and m_indices.is_contiguous()
 
@@ -64,9 +64,10 @@ def m_grouped_gemm_fp4_fp4_fp32_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
+        # import ipdb; ipdb.set_trace()
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
-        # smem_config = get_smem_config(num_stages, k, block_m, block_n, block_k)
+        # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
 
     if m_rows is None:
         counts = torch.bincount(m_indices)
@@ -83,7 +84,7 @@ def m_grouped_gemm_fp4_fp4_fp32_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
 
     args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, m_rows, block_m_info, expected_m, torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
     runtime = jit_tuner.compile_and_tune(
-        name='m_grouped_gemm_fp4_fp4_fp32_nt',
+        name='m_grouped_gemm_fp4_fp4_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages,'GEMM_TYPE': 'GroupedNoPad'},
@@ -91,7 +92,7 @@ def m_grouped_gemm_fp4_fp4_fp32_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint8),
                   ('rhs', torch.uint8), ('rhs_scales', torch.uint8),
-                  ('bias', torch.float32), ('out', torch.float32),
+                  ('bias', torch.float32), ('out', torch.bfloat16),
                   ('m', int), ('grouped_layout', torch.int32), ('block_m_info', torch.int32), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                   ('signal', torch.int32)),

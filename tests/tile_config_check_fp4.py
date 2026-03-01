@@ -7,7 +7,7 @@ import copy
 from test_fp4_core import quantize_fp4_torch, uint8_padding, dequantize_fp4_torch, ppu_cutlass_mxfp4_scales_swizzle, construct_grouped
 from deep_gemm.jit_kernels.utils import get_num_sms
 from utils import construct_group_m_list
-from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config
+from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
 from deep_gemm import ceil_div
 from deep_gemm.jit_kernels.utils import get_search_space
 
@@ -22,7 +22,7 @@ def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[
             a_dequant = dequantize_fp4_torch(x[0], x[1]).cuda().float()
             b_dequant = dequantize_fp4_torch(y[0], y[1]).cuda().float()
             bias = torch.randn(1, n, dtype=torch.float32, device='cuda')
-            out = torch.zeros(m, n, dtype=torch.float32, device='cuda')
+            out = torch.zeros(m, n, dtype=torch.bfloat16, device='cuda')
             ref_out = torch.mm(a_dequant, b_dequant.T)
             ref_out = ref_out + bias
             # x_scale = ppu_cutlass_mxfp4_scales_swizzle(scale=x[1])
@@ -31,10 +31,10 @@ def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[
             x = x[0], x_scale
             y = y[0], y_scale
 
-            deep_gemm.gemm_fp4_fp4_fp32_nt(x, y, bias, out, configs)
+            deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, bias, out, configs)
             torch.cuda.synchronize()
 
-            if torch.allclose(out, ref_out.to('cuda').to(torch.float), rtol=1e-2, atol=1e-3):
+            if torch.allclose(out, ref_out.to('cuda').to(torch.bfloat16), rtol=1e-2, atol=1e-3):
                 return True, "Success"
             else:
                 return False, "Gemm compute result is wrong!!!"
@@ -49,7 +49,7 @@ def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[
         try:
             x, y, m_indices, bias, out, ref_out = construct_grouped(num_groups, m, k, n, 'uniform', 1)
 
-            deep_gemm.m_grouped_gemm_fp4_fp4_fp32_nt_nopad(x, y, bias, out, m_indices, configs=configs)
+            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices, configs=configs)
             torch.cuda.synchronize()
             if torch.allclose(out, ref_out, rtol=1e-2, atol=1e-3):
                 return True, "Success"
@@ -418,7 +418,7 @@ if __name__ == "__main__":
     for tile in search_space:
         block_m, block_n, warp_m, warp_n, block_k, num_stages = tile
         sm = get_num_sms()
-        smem_config = get_smem_config(num_stages, k, block_m, block_n, block_k)
+        smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
         config_list.append((sm, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config))
 
     results = test_all_configs(config_list, gemm_type, f'{gemm_type}_kernel_config_results_{m}{n}{k}_double.txt', f'{gemm_type}_kernel_config_results_{m}{n}{k}_double.json', m, n, k, num_groups)

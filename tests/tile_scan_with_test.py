@@ -42,7 +42,7 @@ def test_func_dense(cycle, tid, m, n, k, d, tile_list, x, y, out, ref_out):
         elif d == torch.uint8:
             m, n = out.shape
             bias = torch.zeros((m, n), device='cuda', dtype=torch.float)
-            deep_gemm.gemm_fp4_fp4_fp32_nt(x, y, bias, out, tile_config)
+            deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, bias, out, tile_config)
         else:
             deep_gemm.gemm_int8_int8_bf16_nt(x, y, out, tile_config)
         if not cycle and not os.environ.get('HGGC_WARM_UP', False):
@@ -209,7 +209,7 @@ def test_func_nopad(cycle, tid, m, n, k, d, tile_list, x, y, out, m_indices, dis
             y_value, _ = y
             num_groups, n, k = y_value.shape
             bias = torch.zeros((num_groups, n), device='cuda', dtype=torch.float)
-            deep_gemm.m_grouped_gemm_fp4_fp4_fp32_nt_nopad(x, y, bias, out, m_indices, distribute, tile_config)
+            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices, distribute, tile_config)
         else:
             deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices, distribute, tile_config)
 

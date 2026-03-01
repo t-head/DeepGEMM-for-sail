@@ -179,18 +179,18 @@ def test_gemm(args):
     a_dequant = dequantize_fp4_torch(x[0], x[1]).cuda()
     b_dequant = dequantize_fp4_torch(y[0], y[1]).cuda()
     bias = torch.randn(1, n, dtype=torch.float32, device='cuda')
-    out = torch.zeros(m, n, dtype=torch.float32, device='cuda')
+    out = torch.zeros(m, n, dtype=torch.bfloat16, device='cuda')
     # x_scale = ppu_cutlass_mxfp4_scales_swizzle(scale=x[1])
     x_scale = uint8_padding(x[1])
     y_scale = ppu_cutlass_mxfp4_scales_swizzle(scale=y[1])
     x = x[0], x_scale
     y = y[0], y_scale
 
-    deep_gemm.gemm_fp4_fp4_fp32_nt(x, y, bias, out)
+    deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, bias, out)
 
     ref_out = torch.mm(a_dequant, b_dequant.T)
-    ref_out = ref_out + bias
-
+    ref_out = (ref_out + bias).to(torch.bfloat16)
+    # import ipdb; ipdb.set_trace()
     diff = calc_diff(out, ref_out)
     if diff >= 0.001:
         print("ref_out:", ref_out)
@@ -203,7 +203,7 @@ def test_m_grouped_gemm_nopad(args) -> None:
     num_groups, m, n, k, distribution = args['groups'], args['m'], args['n'], args['k'], args['distribution']
     x, y, m_indices, bias, out, ref_out = construct_grouped(num_groups, m, k, n, distribution, 1)
 
-    deep_gemm.m_grouped_gemm_fp4_fp4_fp32_nt_nopad(x, y, bias, out, m_indices)
+    deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices)
 
     diff = calc_diff(out, ref_out)
     if diff >= 0.001:
@@ -222,7 +222,7 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str
     y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
     bias = torch.randn((num_groups, n), device='cuda', dtype=torch.float)
 
-    out = torch.empty((m, n), device='cuda', dtype=torch.float)
+    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = torch.empty((m, n), device='cuda', dtype=torch.float)
 
     start = 0
@@ -249,7 +249,7 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str
         # y_scale.append(uint8_padding(y_fp4[1][i]))
         y_scale.append(ppu_cutlass_mxfp4_scales_swizzle(scale=y_fp4[1][i]))
     y_fp4_scale = torch.stack(y_scale, dim=0)
-    return (x_fp4[0].to("cuda"), x_fp4_scale.to("cuda")), (y_fp4[0].to("cuda"), y_fp4_scale.to("cuda")), m_indices, bias, out, ref_out.to('cuda').to(torch.float)
+    return (x_fp4[0].to("cuda"), x_fp4_scale.to("cuda")), (y_fp4[0].to("cuda"), y_fp4_scale.to("cuda")), m_indices, bias, out, ref_out.to('cuda').to(torch.bfloat16)
 
 
 def test_m_grouped_gemm_nopad_loop(num_groups: int = None, m: int = None, n: int = None, k: int = None) -> None:

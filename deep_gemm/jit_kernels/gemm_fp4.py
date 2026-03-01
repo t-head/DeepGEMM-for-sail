@@ -29,7 +29,33 @@ gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
             stream, num_sms, smem_size);
 """
 
-def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128, bpp: int = 1) -> Tuple[int, int, int]:
+def get_sf_padding_size_b32(block_mn: int, warp_mn: int, block_k: int) -> int:
+    assert block_k % 32 == 0, f"block_k must be divideable by 32, but got {block_k}"
+    tile_scale_K = block_k / 32 * 8
+    warp_on_mn = block_mn // warp_mn
+
+    targets = [8, 24, 4, 12, 20, 28, 16, 0]
+    for t in targets:
+        for pad in range(0, 32):
+            L = tile_scale_K + pad
+            if ((int(warp_on_mn * L) & 31) == t): return pad
+
+    return 0
+
+def get_sf_per_stage_size(block_mn: int, block_k: int, warp_mn: int, w_padding: bool = False) -> int:
+    ### Assume warp_mn = block_mn to calculate occ
+
+    warp_num_mn = block_mn // warp_mn
+
+    smem_sf_mn_aligned = ceil_div(block_mn // 16, warp_num_mn * 4) * (warp_num_mn * 4)
+
+    sf_padding = get_sf_padding_size_b32(block_mn, warp_mn, block_k) if w_padding else 0
+    smem_sf_k = block_k + sf_padding * 4 ## uint8 block_k * 16 / 16
+
+    return smem_sf_mn_aligned * smem_sf_k
+
+@lru_cache(maxsize=None)
+def get_smem_config_fp4(num_stages: int, block_m: int, block_n: int, warp_m: int, warp_n: int, block_k: int = 128, bpp: int = 1) -> Tuple[int, int, int]:
     # Try swizzle first, as it does not waste shared memory
     swizzle_mode = 128
     # block_n_padding = get_block_n_padding_for_smem_d(block_n) if swizzle_mode == 0 else 0
@@ -39,12 +65,12 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
     smem_a_per_stage = block_m * block_k
     smem_b_per_stage = block_n * block_k
     # smem_barrier = num_stages * 8 * 2
-    ### NOTE(yfu): do not consider padding swizzle currently
-    smem_sfa_per_stage = ceil_div(block_m, 64) * 64 * block_k // 16 ### uint8
-    smem_sfb_per_stage = ceil_div(block_n, 64) * 64 * block_k // 16 ### uint8
+    ### NOTE(yfu): we only consider sfb_padding when select num_stages
+    smem_sfa_per_stage = get_sf_per_stage_size(block_m, block_k, warp_m, False)
+    smem_sfb_per_stage = get_sf_per_stage_size(block_n, block_k, warp_n, True)
 
-    ### output dtype of fp4 is float32 currently
-    smem_size_d = smem_d * 4
+    ### output dtype of fp4 is bf16 currently
+    smem_size_d = smem_d * 2
     smem_size_a = num_stages * smem_a_per_stage * bpp
     smem_size_b = num_stages * smem_b_per_stage * bpp
     smem_size_sfa = num_stages * smem_sfa_per_stage * bpp
@@ -57,28 +83,13 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
 
     return smem_size, swizzle_mode, block_n_padding
 
-def get_smem_occ(block_m: int, block_n: int, block_k: int, num_stages: int) -> Tuple[int]:
+def get_smem_occ(block_m: int, block_n: int, block_k: int, num_stages: int, warp_m: int, warp_n: int) -> Tuple[int]:
     if block_m is None:
         return 0
 
     # use static suppose.
     ppu_capacity = 262144
-    bpp = 1
-    smem_d = block_m * block_n
-    smem_a_per_stage = block_m * block_k
-    smem_b_per_stage = block_n * block_k
-    ### NOTE(yfu): do not consider padding swizzle currently
-    smem_sfa_per_stage = ceil_div(block_m, 64) * 64 * block_k // 16 ### uint8
-    smem_sfb_per_stage = ceil_div(block_n, 64) * 64 * block_k // 16 ### uint8
-
-    ### output dtype of fp4 is float32 currently
-    smem_size_d = smem_d * 4
-    smem_size_a = num_stages * smem_a_per_stage * bpp
-    smem_size_b = num_stages * smem_b_per_stage * bpp
-    smem_size_sfa = num_stages * smem_sfa_per_stage * bpp
-    smem_size_sfb = num_stages * smem_sfb_per_stage * bpp
-
-    smem_size = max(smem_size_d, smem_size_a + smem_size_b + smem_size_sfa + smem_size_sfb)
+    smem_size = get_smem_config_fp4(num_stages=num_stages, block_m=block_m, block_n=block_n, block_k=block_k, warp_m=warp_m, warp_n=warp_n)[0]
 
     return ppu_capacity // smem_size
 
@@ -96,6 +107,36 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
     get_block_utils = lambda m, bm: (((m / bm ) / ((m + bm -1) // bm)) if m % bm != 0 else 1.0) if bm else 0
     get_block_ai = lambda block_m, block_n: (block_m * block_n) / (block_m + block_n)
 
+    @lru_cache(maxsize=None)
+    def get_warp_mn_dense(m: int, n: int, k: int, block_m_: int, block_n_: int) -> Tuple[int, int, int, int]:
+        if block_m_ is None or block_n_ is None:
+            return (None, None, None, None)
+
+        warp_m_ = block_m_ // 2
+        warp_n_ = block_n_ // 2
+
+        if block_m_ >= 128 and block_n_ == 256:
+            warp_m_ = block_m_ // 4
+            warp_n_ = block_n_ // 4
+        elif block_m_ == 32 and block_n_ >= 64:
+            warp_m_ = 32
+            warp_n_ = block_n_ // 4
+        elif block_n_ == 32 and n <= 128 and block_m_ >= 64:
+            warp_m_ = block_m_ // 4
+            warp_n_ = 32
+        elif block_m_ == 128 or block_m_ == 256 or block_m_ == 192 and block_n_ >= 32:
+            warp_m_ = block_m_ // 4
+            warp_n_ = block_n_ // 2 if block_n_ != 32 else block_n_
+        elif block_m_ == 16:
+            warp_m_ = 16
+            block_n_ = 64 if n < 512 else block_n_
+            warp_n_ = block_n_ // 4 if block_n_ <= 128 else block_n_ // 8
+        elif block_n_ == 128 or block_n_ == 256:
+            warp_m_ = block_m_ // 2 if block_m_ != 32 else block_m_
+            warp_n_ = block_n_ // 4
+
+        return (block_m_, block_n_, warp_m_, warp_n_)
+
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
     for block_m in block_ms:
@@ -112,7 +153,10 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
             num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(best_block_m, best_block_n)
             num_utils = get_block_utils(m, block_m) * get_block_utils(n, block_n)
             best_num_utils = get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n)
-            num_occ, best_num_occ = get_smem_occ(block_m, block_n, 128, 2), get_smem_occ(best_block_m, best_block_n, 128, 2)
+
+            tmp_block_m, tmp_block_n, tmp_warp_m, tmp_warp_n = get_warp_mn_dense(m, n, k, block_m, block_n)
+            tmp_best_block_m, tmp_best_block_n, tmp_best_warp_m, tmp_best_warp_n = get_warp_mn_dense(m, n, k, best_block_m, best_block_n)
+            num_occ, best_num_occ = get_smem_occ(tmp_block_m, tmp_block_n, 128, 2, warp_m=tmp_warp_m, warp_n=tmp_warp_n), get_smem_occ(tmp_best_block_m, tmp_best_block_n, 128, 2, warp_m=tmp_best_warp_m, warp_n=tmp_best_warp_n)
 
             # print(f"block_m:{block_m}, block_n:{block_n}, best_block_m:{best_block_m}, best_block_n:{best_block_n}")
             # print(f'num_occ:{num_occ}, best_num_occ:{best_num_occ}')
@@ -177,7 +221,19 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
     if k >= 4096 and ((best_block_m <= 32 and best_block_n <= 64) or (best_block_m == 64 and best_block_n == 128)):
         block_k = 256
 
-    stage_candidates = tuple(filter(lambda s: s <= k // block_k, (5, 4, 3, 2)))
+    # Recompute the minimal number of SMs required
+    # NOTES: less L2 cache usage and less GPU frequency drop
+    num_waves = get_num_waves(best_block_m, best_block_n)
+
+    num_min_sms = num_sms
+
+    assert num_min_sms <= num_sms
+
+    best_block_m, best_block_n, warp_m, warp_n = get_warp_mn_dense(m, n, k, best_block_m, best_block_n)
+
+    stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
+    ### for those cases with super small k.
+    if not stage_candidates: stage_candidates = (2, )
 
     # if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4):
     #     stage_candidates = (3, 2)
@@ -186,10 +242,10 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
 
     best_occ = 0
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1)
+        best_smem_config = get_smem_config_fp4(num_stages, best_block_m, best_block_n, warp_m, warp_n, block_k, 1)
         # print(f"num_stages:{num_stages}, best_smem_config:{best_smem_config}")
         if best_smem_config[0] <= ppu_capacity:
-            occ = ppu_capacity // best_smem_config[0]
+            # occ = ppu_capacity // best_smem_config[0]
             # if k < 512 or (best_block_m > 64 and best_block_n >= 64) and occ >= best_occ:
             #     # compute block use higer occ rather than large stage
             #     best_num_stages = num_stages
@@ -203,37 +259,6 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
     # best_num_stages = 2
     assert best_smem_config is not None
     assert best_num_stages is not None
-
-    # Recompute the minimal number of SMs required
-    # NOTES: less L2 cache usage and less GPU frequency drop
-    num_waves = get_num_waves(best_block_m, best_block_n)
-
-    num_min_sms = num_sms
-
-    assert num_min_sms <= num_sms
-
-    warp_m = best_block_m // 2
-    warp_n = best_block_n // 2
-
-    if best_block_m >= 128 and best_block_n == 256:
-        warp_m = best_block_m // 4
-        warp_n = best_block_n // 4
-    elif best_block_m == 32 and best_block_n >= 64:
-        warp_m = 32
-        warp_n = best_block_n // 4
-    elif best_block_n == 32 and n <= 128 and best_block_m >= 64:
-        warp_m = best_block_m // 4
-        warp_n = 32
-    elif best_block_m == 128 or best_block_m == 256 or best_block_m == 192 and best_block_n >= 32:
-        warp_m = best_block_m // 4
-        warp_n = best_block_n // 2 if best_block_n != 32 else best_block_n
-    elif best_block_m == 16:
-        warp_m = 16
-        best_block_n = 64 if n < 512 else best_block_n
-        warp_n = best_block_n // 4 if best_block_n <= 128 else best_block_n // 8
-    elif best_block_n == 128 or best_block_n == 256:
-        warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
-        warp_n = best_block_n // 4
 
     return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
@@ -261,6 +286,39 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     get_block_utils = lambda m, bm: (((m / bm ) / ((m + bm -1) // bm)) if m % bm != 0 else 1.0) if bm else 0
     get_block_ai = lambda block_m, block_n: (block_m * block_n) / (block_m + block_n)
 
+    @lru_cache(maxsize=None)
+    def get_warp_mn_grouped(m: int, n: int, k: int, block_m_: int, block_n_: int) -> Tuple[int, int, int, int]:
+        if block_m_ is None or block_n_ is None:
+            return (None, None, None, None)
+
+        warp_m_ = block_m_ // 2
+        warp_n_ = block_n_ // 2
+
+        if block_m_ > 128 and block_n_ == 256:
+            warp_m_ = block_m_ // 4
+            warp_n_ = block_n_ // 4
+        elif block_m_ == 64 and block_n_ >= 128:
+            warp_m_ = 64 if k < 256 else 32
+            warp_n_ = 64
+        elif block_m_ == 32 and block_n_ >= 64:
+            warp_m_ = 32
+            warp_n_ = block_n_ // 2 if block_n_ <= 128 else block_n_ // 4
+        elif block_n_ == 32 and n <= 128 and block_m_ >=64:
+            warp_m_ = block_m_ // 4
+            warp_n_ = 32
+        elif block_m_ == 128 or block_m_ == 256 and block_n_ >= 32:
+            warp_m_ = 64
+            warp_n_ = block_n_ // 2 if block_n_ <= 128 else block_n_ // 4
+        elif block_m_ == 16:
+            warp_m_ = 16
+            block_n_ = 64 if n < 512 else block_n_
+            warp_n_ = block_n_ // 2 if block_n_ < 128 else block_n_ // 4
+        elif block_n_ == 128 or block_n_ == 256:
+            warp_m_ = block_m_ // 2 if block_m_ != 32 else block_m_
+            warp_n_ = 64
+
+        return (block_m_, block_n_, warp_m_, warp_n_)
+
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
     for block_m in block_ms:
@@ -277,7 +335,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(best_block_m, best_block_n)
             num_utils = get_block_utils(m, block_m) * get_block_utils(n, block_n)
             best_num_utils = get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n)
-            num_occ, best_num_occ = get_smem_occ(block_m, block_n, 128, 2), get_smem_occ(best_block_m, best_block_n, 128, 2)
+
+            tmp_block_m, tmp_block_n, tmp_warp_m, tmp_warp_n = get_warp_mn_grouped(m, n, k, block_m, block_n)
+            tmp_best_block_m, tmp_best_block_n, tmp_best_warp_m, tmp_best_warp_n = get_warp_mn_grouped(m, n, k, best_block_m, best_block_n)
+            num_occ, best_num_occ = get_smem_occ(tmp_block_m, tmp_block_n, 128, 2, warp_m=tmp_warp_m, warp_n=tmp_warp_n), get_smem_occ(tmp_best_block_m, tmp_best_block_n, 128, 2, warp_m=tmp_best_warp_m, warp_n=tmp_best_warp_n)
 
             # print(f"block_m:{block_m}, block_n:{block_n}, best_block_m:{best_block_m}, best_block_n:{best_block_n}")
             # print(f'num_occ:{num_occ}, best_num_occ:{best_num_occ}')
@@ -353,7 +414,19 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     if k >= 4096 and (best_block_m <= 32 and best_block_n <= 64):
         block_k = 256
 
+    # Recompute the minimal number of SMs required
+    # NOTES: less L2 cache usage and less GPU frequency drop
+    num_waves = get_num_waves(best_block_m, best_block_n)
+
+    num_min_sms = num_sms
+
+    assert num_min_sms <= num_sms
+
+    best_block_m, best_block_n, warp_m, warp_n = get_warp_mn_grouped(m, n, k, best_block_m, best_block_n)
+
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
+    ### for those cases with super small k.
+    if not stage_candidates: stage_candidates = (2, )
 
     # if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16 or best_block_m == 32:
     #     stage_candidates = (3, 2)
@@ -362,7 +435,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     best_occ = 0
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1)
+        best_smem_config = get_smem_config_fp4(num_stages, best_block_m, best_block_n, warp_m, warp_n, block_k, 1)
         # print(f"num_stages:{num_stages}, best_smem_config:{best_smem_config}")
         if best_smem_config[0] <= ppu_capacity:
             occ = ppu_capacity // best_smem_config[0]
@@ -379,46 +452,12 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     assert best_smem_config is not None
     assert best_num_stages is not None
 
-    # Recompute the minimal number of SMs required
-    # NOTES: less L2 cache usage and less GPU frequency drop
-    num_waves = get_num_waves(best_block_m, best_block_n)
-
-    num_min_sms = num_sms
-
-    assert num_min_sms <= num_sms
-
-    warp_m = best_block_m // 2
-    warp_n = best_block_n // 2
-
-    if best_block_m > 128 and best_block_n == 256:
-        warp_m = best_block_m // 4
-        warp_n = best_block_n // 4
-    elif best_block_m == 64 and best_block_n >= 128:
-        warp_m = 64 if k < 256 else 32
-        warp_n = 64
-    elif best_block_m == 32 and best_block_n >= 64:
-        warp_m = 32
-        warp_n = best_block_n // 2 if best_block_n <= 128 else best_block_n // 4
-    elif best_block_n == 32 and n <= 128 and best_block_m >=64:
-        warp_m = best_block_m // 4
-        warp_n = 32
-    elif best_block_m == 128 or best_block_m == 256 and best_block_n >= 32:
-        warp_m = 64
-        warp_n = best_block_n // 2 if best_block_n <= 128 else best_block_n // 4
-    elif best_block_m == 16:
-        warp_m = 16
-        best_block_n = 64 if n < 512 else best_block_n
-        warp_n = best_block_n // 2 if best_block_n < 128 else best_block_n // 4
-    elif best_block_n == 128 or best_block_n == 256:
-        warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
-        warp_n = 64
-
     # (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 64, 256, 16, 16, 4)
     # print(best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages)
 
     return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
-def gemm_fp4_fp4_fp32_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
+def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
                          rhs_: Tuple[torch.Tensor, torch.Tensor],
                          bias: torch.Tensor, out: torch.Tensor, configs = None) -> None:
     lhs, lhs_scales = lhs_
@@ -433,7 +472,7 @@ def gemm_fp4_fp4_fp32_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
     assert lhs.dtype == torch.uint8 and lhs_scales.dtype == torch.uint8
     assert rhs.dtype == torch.uint8 and rhs_scales.dtype == torch.uint8
     assert bias.dtype == torch.float32
-    assert out.dtype == torch.float32
+    assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
     assert rhs_scales.is_contiguous() and lhs_scales.is_contiguous()
 
@@ -452,11 +491,11 @@ def gemm_fp4_fp4_fp32_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
         # import ipdb; ipdb.set_trace()
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
-        # smem_config = get_smem_config(num_stages, k, block_m, block_n, block_k)
+        # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
 
     args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
-        name='gemm_fp4_fp4_fp32_nt',
+        name='gemm_fp4_fp4_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': 1,
               'NUM_STAGES': num_stages,'GEMM_TYPE': 'DenseGemm'},
@@ -464,7 +503,7 @@ def gemm_fp4_fp4_fp32_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint8),
                   ('rhs', torch.uint8), ('rhs_scales', torch.uint8),
-                  ('bias', torch.float32), ('out', torch.float32),
+                  ('bias', torch.float32), ('out', torch.bfloat16),
                   ('m', int), ('stream', torch.cuda.Stream),
                   ('num_sms', int), ('smem_size', int)),
         template=template,
