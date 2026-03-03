@@ -4,6 +4,7 @@ from typing import Tuple
 from .gemm_fp4 import get_best_configs, get_smem_config_fp4
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div
+from ..deep_gemm_tuner.autotune_fp4 import lookup_best_config
 
 # C++ code templates
 includes = ('"../deep_gemm/fp4_gemm_cutlass3.cuh"', )
@@ -71,9 +72,14 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
         # import ipdb; ipdb.set_trace()
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms)
-        # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
-        # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
+        configs = lookup_best_config(m, n, k, num_groups)
+        if configs is not None:
+            block_m, block_n, block_k, warp_m, warp_n, num_stages = configs
+            smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
+        else:
+            num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms)
+            # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
+            # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
 
     if m_rows is None:
         counts = torch.bincount(m_indices)
