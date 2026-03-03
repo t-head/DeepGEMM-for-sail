@@ -22,11 +22,16 @@ constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 
 // Make a templated grouped GEMM
-using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}>;
+auto bias_dispatcher = [&](auto HasBias) {
+    using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, decltype(HasBias)::value>;
+    gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
+                bias, out, m, nullptr, nullptr, 0,
+                stream, num_sms, smem_size); 
+};
 
-gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
-            bias, out, m, nullptr, nullptr, 0,
-            stream, num_sms, smem_size);
+// NOTE: The data_ptr might not be nullptr in torch.empty(0)
+if (bias == nullptr) bias_dispatcher(std::bool_constant<false>{});
+else                 bias_dispatcher(std::bool_constant<true>{});
 """
 
 def get_sf_padding_size_b32(block_mn: int, warp_mn: int, block_k: int) -> int:
@@ -130,10 +135,12 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
         elif block_m_ == 16:
             warp_m_ = 16
             block_n_ = 64 if n < 512 else block_n_
-            warp_n_ = block_n_ // 4 if block_n_ <= 128 else block_n_ // 8
+            warp_n_ = 16
         elif block_n_ == 128 or block_n_ == 256:
             warp_m_ = block_m_ // 2 if block_m_ != 32 else block_m_
             warp_n_ = block_n_ // 4
+        elif block_n_ == 16:
+            warp_n_ = 16
 
         return (block_m_, block_n_, warp_m_, warp_n_)
 
@@ -312,10 +319,12 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         elif block_m_ == 16:
             warp_m_ = 16
             block_n_ = 64 if n < 512 else block_n_
-            warp_n_ = block_n_ // 2 if block_n_ < 128 else block_n_ // 4
+            warp_n_ = 16
         elif block_n_ == 128 or block_n_ == 256:
             warp_m_ = block_m_ // 2 if block_m_ != 32 else block_m_
             warp_n_ = 64
+        elif block_n_ == 16:
+            warp_n_ = 16
 
         return (block_m_, block_n_, warp_m_, warp_n_)
 
@@ -471,10 +480,11 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
     assert n > 0 and k > 0
     assert lhs.dtype == torch.uint8 and lhs_scales.dtype == torch.uint8
     assert rhs.dtype == torch.uint8 and rhs_scales.dtype == torch.uint8
-    assert bias.dtype == torch.float32
+    assert (bias is None) or (bias.dtype == torch.float32)
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
     assert rhs_scales.is_contiguous() and lhs_scales.is_contiguous()
+    if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device)
 
     # Do nothing if `m` is zero
     if m == 0:

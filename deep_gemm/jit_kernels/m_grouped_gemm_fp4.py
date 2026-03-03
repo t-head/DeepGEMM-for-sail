@@ -21,11 +21,16 @@ constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 
 // Make a templated grouped GEMM
-using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}>;
+auto bias_dispatcher = [&](auto HasBias) {
+    using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, decltype(HasBias)::value>;
+    gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
+                bias, out, m, grouped_layout, block_m_info, expected_m,
+                stream, num_sms, smem_size, signal); 
+};
 
-gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
-            bias, out, m, grouped_layout, block_m_info, expected_m,
-            stream, num_sms, smem_size, signal);
+// NOTE: The data_ptr might not be nullptr in torch.empty(0)
+if (bias == nullptr) bias_dispatcher(std::bool_constant<false>{});
+else                 bias_dispatcher(std::bool_constant<true>{});
 """
 
 def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor],
@@ -45,10 +50,11 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     assert n > 0 and k > 0
     assert lhs.dtype == torch.uint8 and rhs.dtype == torch.uint8
     assert lhs_scales.dtype == torch.uint8 and rhs_scales.dtype == torch.uint8
-    assert bias.dtype == torch.float32
+    assert bias is None or bias.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
     assert rhs_scales.is_contiguous() and lhs_scales.is_contiguous() and m_indices.is_contiguous()
+    if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device)
 
     # Do nothing if `m` is zero
     if m == 0:

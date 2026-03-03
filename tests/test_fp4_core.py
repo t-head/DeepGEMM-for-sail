@@ -178,7 +178,7 @@ def test_gemm(args):
     y = quantize_fp4_torch(B)
     a_dequant = dequantize_fp4_torch(x[0], x[1]).cuda()
     b_dequant = dequantize_fp4_torch(y[0], y[1]).cuda()
-    bias = torch.randn(1, n, dtype=torch.float32, device='cuda')
+    bias = torch.randn(1, n, dtype=torch.float32, device='cuda') if args.get("with_bias", True) else None
     out = torch.zeros(m, n, dtype=torch.bfloat16, device='cuda')
     # x_scale = ppu_cutlass_mxfp4_scales_swizzle(scale=x[1])
     x_scale = uint8_padding(x[1])
@@ -189,7 +189,7 @@ def test_gemm(args):
     deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, bias, out)
 
     ref_out = torch.mm(a_dequant, b_dequant.T)
-    ref_out = (ref_out + bias).to(torch.bfloat16)
+    ref_out = (ref_out + bias).to(torch.bfloat16) if bias is not None else ref_out.to(torch.bfloat16)
     # import ipdb; ipdb.set_trace()
     diff = calc_diff(out, ref_out)
     if diff >= 0.001:
@@ -201,7 +201,8 @@ def test_gemm(args):
 
 def test_m_grouped_gemm_nopad(args) -> None:
     num_groups, m, n, k, distribution = args['groups'], args['m'], args['n'], args['k'], args['distribution']
-    x, y, m_indices, bias, out, ref_out = construct_grouped(num_groups, m, k, n, distribution, 1)
+    with_bias = args.get("with_bias", True)
+    x, y, m_indices, bias, out, ref_out = construct_grouped(num_groups, m, k, n, distribution, 1, with_bias)
 
     deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices)
 
@@ -214,13 +215,13 @@ def test_m_grouped_gemm_nopad(args) -> None:
     print("Passed with acc_check\n")
     return
 
-def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str, alignment: int):
+def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str, alignment: int, with_bias: bool = True):
     group_ms = construct_group_m_list(distribution, num_groups, m)
     m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
     m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
     x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
-    bias = torch.randn((num_groups, n), device='cuda', dtype=torch.float)
+    bias = torch.randn((num_groups, n), device='cuda', dtype=torch.float) if with_bias else None
 
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = torch.empty((m, n), device='cuda', dtype=torch.float)
@@ -236,7 +237,7 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str
         a_dequant = dequantize_fp4_torch(a, a_scale).to(torch.float)
         b_dequant = dequantize_fp4_torch(b, b_scale).to(torch.float)
         ref_out[start:aligned_end] = a_dequant @ b_dequant.t()
-        ref_out[start:aligned_end] = ref_out[start:aligned_end] + bias[i]
+        ref_out[start:aligned_end] = ref_out[start:aligned_end] + bias[i] if bias is not None else ref_out[start:aligned_end]
         start = aligned_end
 
     x_fp4 = quantize_fp4_torch(x.to(torch.bfloat16).to('cuda'))
@@ -260,11 +261,12 @@ def test_m_grouped_gemm_nopad_loop(num_groups: int = None, m: int = None, n: int
         test_m_grouped_gemm_nopad(args)
     else:
         print("Running default test suite...")
-        for num_groups, expected_m_per_group in ((256, 1), (256, 4), (256, 16), (256, 32), (128, 8), (128, 64), (128, 1024)):
-            for k, n in ((256, 768), (512, 128), (2048, 7168), (7168, 4096)):
-                print(f"Testing with num_groups={num_groups}, m={num_groups * expected_m_per_group}, n={n}, k={k}")
-                args = {"groups": num_groups, "m": num_groups * expected_m_per_group, "n": n, "k": k, "distribution": "uniform"}
-                test_m_grouped_gemm_nopad(args)
+        for with_bias in [True, False]:
+            for num_groups, expected_m_per_group in ((256, 1), (256, 4), (256, 16), (256, 32), (128, 8), (128, 64), (128, 1024)):
+                for k, n in ((256, 768), (512, 128), (2048, 7168), (7168, 4096)):
+                    print(f"Testing with num_groups={num_groups}, m={num_groups * expected_m_per_group}, n={n}, k={k}")
+                    args = {"groups": num_groups, "m": num_groups * expected_m_per_group, "n": n, "k": k, "distribution": "uniform", "with_bias": with_bias}
+                    test_m_grouped_gemm_nopad(args)
     print("Passed\n")
 
 def test_gemm_loop(m: int = None, n: int = None, k: int = None) -> None:
@@ -275,11 +277,12 @@ def test_gemm_loop(m: int = None, n: int = None, k: int = None) -> None:
         test_gemm(args)
     else:
         print("Running default test suite...")
-        for m in (64, 128, 4096):
-            for k, n in [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
-                print(f"Testing with m={m}, n={n}, k={k}")
-                args = {"m": m, "n": n, "k": k}
-                test_gemm(args)
+        for with_bias in [True, False]:
+            for m in (64, 128, 4096):
+                for k, n in [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
+                    print(f"Testing with m={m}, n={n}, k={k}")
+                    args = {"m": m, "n": n, "k": k, "with_bias": with_bias}
+                    test_gemm(args)
     print("Passed\n")
 
 if __name__ == '__main__':

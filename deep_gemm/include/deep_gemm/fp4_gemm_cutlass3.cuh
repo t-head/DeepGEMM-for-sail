@@ -1136,8 +1136,12 @@ namespace deep_gemm {
 template <int32_t ShapeN, int32_t ShapeK,
           int32_t BlockM, int32_t BlockN, int32_t BlockK,
           int32_t WarpM, int32_t WarpN,
-          int32_t kNumGroups, int32_t kNumStages, GemmType kGemmType>
+          int32_t kNumGroups, int32_t kNumStages, GemmType kGemmType, bool HasBias = false>
 class Fp4Gemm {
+  static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
+  static_assert((BlockN == 16) || (BlockN == 32) || (BlockN == 64) || (BlockN == 128) || (BlockN == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
+  static_assert((WarpM % 16 == 0), "WarpM must be divideable by 16.");
+  static_assert((WarpN % 16 == 0), "WarpN must be divideable by 16.");
 
 public:
     Fp4Gemm() = default;
@@ -1176,7 +1180,11 @@ public:
         using ElementBias         = float;                                          // Element type for bias addition
         using ElementScalar    = ElementCompute;
 
-        using EpilogueOutputOp = cutlass::epilogue::thread::LinearCombinationBiasElementwise<ElementD, ElementAccumulator, ElementCompute, ElementD, ElementD, AlignmentD, cutlass::epilogue::thread::Identity<float>, cutlass::plus<ElementCompute>, true, ElementBias>;
+        using EpilogueOutputOp = typename cutlass::platform::conditional<
+          HasBias,
+          cutlass::epilogue::thread::LinearCombinationBiasElementwise<ElementD, ElementAccumulator, ElementCompute, ElementD, ElementD, AlignmentD, cutlass::epilogue::thread::Identity<float>, cutlass::plus<ElementCompute>, false, ElementBias>,
+          cutlass::epilogue::thread::LinearCombination<ElementD, AlignmentD, ElementAccumulator, ElementCompute, cutlass::epilogue::thread::ScaleType::Nothing>
+        >::type;
 
         using WarpOnM = Int<BlockM / WarpM>;
         using WarpOnN = Int<BlockN / WarpN>;
