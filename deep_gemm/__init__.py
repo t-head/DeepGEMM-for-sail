@@ -5,24 +5,6 @@ from torch.version import cuda as cuda_version
 from packaging import version
 from torch.utils.cpp_extension import CUDA_HOME
 
-from . import deep_gemm_cpp
-# from .deep_gemm_cpp import (
-#     set_num_sms,
-#     get_num_sms,
-#     set_tc_util,
-#     get_tc_util,
-# )
-
-# DeepGEMM Kernels
-# from .deep_gemm_cpp import (
-#     # FP8 GEMMs
-#     gemm_fp8_fp8_bf16_nt, 
-#     # fp8_gemm_nn,
-#     # fp8_gemm_tn, fp8_gemm_tt,
-#     # gemm_bf16_bf16_bf16_nt
-#     # fp8_gemm_nt_skip_head_mid,
-# )
-
 from . import jit
 from . import deep_gemm_tuner
 from .jit_kernels import (
@@ -69,7 +51,29 @@ from .utils import (
 
 from .jit import set_compile_mode, get_compile_mode
 # Import functions from the CPP module
-deep_gemm_cpp.init(
-    os.path.dirname(os.path.abspath(__file__)), # Library root directory path
-    CUDA_HOME         # CUDA home
-)
+
+
+use_cpp_jit = os.environ.get('USE_CPP_JIT', '').lower()
+should_init_deep_gemm_cpp = use_cpp_jit in ('1', 'true', 'yes', 'on')
+if should_init_deep_gemm_cpp:
+    from . import deep_gemm_cpp
+    # from .deep_gemm_cpp import (
+    #     set_num_sms,
+    #     get_num_sms,
+    #     set_tc_util,
+    #     get_tc_util,
+    # )
+
+    # DeepGEMM Kernels
+    # from .deep_gemm_cpp import (
+    #     # FP8 GEMMs
+    #     gemm_fp8_fp8_bf16_nt, 
+    #     # fp8_gemm_nn,
+    #     # fp8_gemm_tn, fp8_gemm_tt,
+    #     # gemm_bf16_bf16_bf16_nt
+    #     # fp8_gemm_nt_skip_head_mid,
+    # )
+    deep_gemm_cpp.init(
+        os.path.dirname(os.path.abspath(__file__)), # Library root directory path
+        CUDA_HOME         # CUDA home
+    )

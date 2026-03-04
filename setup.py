@@ -119,7 +119,18 @@ if __name__ == '__main__':
         revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
     except:
         revision = ''
-
+    use_cpp_jit = os.environ.get('USE_CPP_JIT', '').lower()
+    should_build_ext = use_cpp_jit in ('1', 'true', 'yes', 'on')
+    ext_modules = []
+    if should_build_ext:
+        ext_modules = [
+            CppExtension(name='deep_gemm.deep_gemm_cpp',
+                         sources=sources,
+                         include_dirs=build_include_dirs,
+                         libraries=build_libraries,
+                         library_dirs=build_library_dirs,
+                         extra_compile_args=cxx_flags)
+        ]
     setuptools.setup(
         name='deep_gemm',
         use_scm_version={
@@ -137,14 +148,7 @@ if __name__ == '__main__':
                 'deep_gemm_tuner/configs/*',
             ]
         },
-        ext_modules=[
-            CppExtension(name='deep_gemm.deep_gemm_cpp',
-                         sources=sources,
-                         include_dirs=build_include_dirs,
-                         libraries=build_libraries,
-                         library_dirs=build_library_dirs,
-                         extra_compile_args=cxx_flags)
-        ],
+        ext_modules=ext_modules,
         zip_safe=False,
         cmdclass={
             'develop': PostDevelopCommand,
