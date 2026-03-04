@@ -5,7 +5,7 @@ from typing import Tuple
 import deep_gemm
 from deep_gemm import calc_diff, ceil_div, get_col_major_tma_aligned_tensor, get_col_major_tensor, get_m_alignment_for_contiguous_layout
 from utils import judge_device_type
-from utils import construct_group_m_list
+from utils import construct_group_m_list, get_ref_backend, find_next_power_of_2, check_signal
 import argparse
 
 # torch.cuda.manual_seed(42)
@@ -215,6 +215,28 @@ def test_m_grouped_gemm_nopad(args) -> None:
     print("Passed with acc_check\n")
     return
 
+def test_m_grouped_gemm_masked(args) -> None:
+    num_groups, m, n, k, distribution = args['groups'], args['m'], args['n'], args['k'], args['distribution']
+    enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
+    with_bias = args.get("with_bias", True)
+    expected_m_per_group = ceil_div(m, num_groups)
+    x, y, bias, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, distribution, enable_sbo_overlap, with_bias=with_bias)
+    result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, bias, out, masked_m, expected_m_per_group, enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+
+    if enable_sbo_overlap:
+        block_m, threshold = result
+        check_signal(num_groups, max_m, block_m, threshold, signal, masked_m)
+
+    for j in range(num_groups):
+        diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
+        if (masked_m[j] != 0):
+            if diff >= 0.001:
+                print(f"ref_out[{j}]:", ref_out[j, :masked_m[j].item()])
+                print(f"out[{j}]:", out[j, :masked_m[j].item()])
+            assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+    print("Passed with acc_check\n")
+    return
+
 def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str, alignment: int, with_bias: bool = True):
     group_ms = construct_group_m_list(distribution, num_groups, m)
     m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
@@ -253,8 +275,55 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str
     return (x_fp4[0].to("cuda"), x_fp4_scale.to("cuda")), (y_fp4[0].to("cuda"), y_fp4_scale.to("cuda")), m_indices, bias, out, ref_out.to('cuda').to(torch.bfloat16)
 
 
+def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, distribution: str,
+                             enable_sbo_overlap: bool = False, with_bias: bool = True):
+    tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
+    # Construct mask
+    list_m =  construct_group_m_list(distribution, num_groups, max_m, is_mask=True, em=expected_m_per_group)
+    masked_m = torch.tensor(list_m, device=tensor_device, dtype=torch.int)
+    max_m = max(128, find_next_power_of_2(list_m))
+    assert masked_m.amax().item() <= max_m, f"max masked_m={masked_m.amax().item()}, allowed max_m={max_m}"
+    
+    x = torch.randn((num_groups, max_m, k), device=tensor_device, dtype=torch.bfloat16)
+    y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
+    out = torch.empty((num_groups, max_m, n), device=tensor_device, dtype=torch.bfloat16)
+    bias = torch.randn((num_groups, n), device='cuda', dtype=torch.float) if with_bias else None
+
+    x_fp4 = []
+    x_fp4_scale = []
+    y_fp4 = []
+    y_fp4_scale = []
+    x_ref = []
+    y_ref = []
+    for i in range(num_groups):
+        a, a_scale = quantize_fp4_torch(x[i].cuda())
+        b, b_scale = quantize_fp4_torch(y[i].cuda())
+        a_dequant = dequantize_fp4_torch(a, a_scale).to(torch.float)
+        b_dequant = dequantize_fp4_torch(b, b_scale).to(torch.float)
+        x_fp4.append(a)
+        x_fp4_scale.append(uint8_padding(a_scale))
+        y_fp4.append(b)
+        y_fp4_scale.append(ppu_cutlass_mxfp4_scales_swizzle(b_scale))
+        x_ref.append(a_dequant)
+        y_ref.append(b_dequant)
+    
+    x_fp4 = torch.stack(x_fp4, dim=0)
+    x_fp4_scale = torch.stack(x_fp4_scale, dim=0)
+    y_fp4 = torch.stack(y_fp4, dim=0)
+    y_fp4_scale = torch.stack(y_fp4_scale, dim=0)
+    x_ref = torch.stack(x_ref, dim=0)
+    y_ref = torch.stack(y_ref, dim=0)
+
+    ref_out = torch.einsum('gmk,gnk->gmn', x_ref, y_ref)
+    ref_out = ref_out + bias.unsqueeze(1) if bias is not None else ref_out
+
+    max_signal_size = num_groups * ceil_div(max_m, 64)
+    signal = torch.zeros(max_signal_size, dtype=torch.int32, device=tensor_device) if enable_sbo_overlap else torch.empty(0).int()
+
+    return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), bias, masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda').to(torch.bfloat16), signal.to('cuda'), max_m
+
 def test_m_grouped_gemm_nopad_loop(num_groups: int = None, m: int = None, n: int = None, k: int = None) -> None:
-    print("Running Grouped GEMM test...")
+    print("Running GroupedNoPad GEMM test...")
     if num_groups is not None and m is not None and n is not None and k is not None:
         print(f"Testing with num_groups={num_groups}, m={m * num_groups}, n={n}, k={k}")
         args = {"groups": num_groups, "m": m * num_groups, "n": n, "k": k, "distribution": "uniform"}
@@ -267,6 +336,22 @@ def test_m_grouped_gemm_nopad_loop(num_groups: int = None, m: int = None, n: int
                     print(f"Testing with num_groups={num_groups}, m={num_groups * expected_m_per_group}, n={n}, k={k}")
                     args = {"groups": num_groups, "m": num_groups * expected_m_per_group, "n": n, "k": k, "distribution": "uniform", "with_bias": with_bias}
                     test_m_grouped_gemm_nopad(args)
+    print("Passed\n")
+
+def test_m_grouped_gemm_masked_loop(num_groups: int = None, m: int = None, n: int = None, k: int = None) -> None:
+    print("Running GroupedMasked GEMM test...")
+    if num_groups is not None and m is not None and n is not None and k is not None:
+        print(f"Testing with num_groups={num_groups}, m={m * num_groups}, n={n}, k={k}")
+        args = {"groups": num_groups, "m": m * num_groups, "n": n, "k": k, "distribution": "uniform"}
+        test_m_grouped_gemm_masked(args)
+    else:
+        print("Running default test suite...")
+        for with_bias in [True, False]:
+            for num_groups, expected_m_per_group in ((256, 1), (256, 4), (256, 16), (256, 32), (128, 8), (128, 64), (128, 1024)):
+                for k, n in ((256, 768), (512, 128), (2048, 7168), (7168, 4096)):
+                    print(f"Testing with num_groups={num_groups}, m={num_groups * expected_m_per_group}, n={n}, k={k}")
+                    args = {"groups": num_groups, "m": num_groups * expected_m_per_group, "n": n, "k": k, "distribution": "uniform", "with_bias": with_bias}
+                    test_m_grouped_gemm_masked(args)
     print("Passed\n")
 
 def test_gemm_loop(m: int = None, n: int = None, k: int = None) -> None:
@@ -287,7 +372,7 @@ def test_gemm_loop(m: int = None, n: int = None, k: int = None) -> None:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Process target function api test.")
-    parser.add_argument('--func', default=None, choices=["DenseGemm", "GroupedNoPad"], required=False, help='target test func')
+    parser.add_argument('--func', default=None, choices=["DenseGemm", "GroupedNoPad", "GroupedMasked"], required=False, help='target test func')
     parser.add_argument('--num_groups', type=int, help='Number of groups for Grouped GEMM')
     parser.add_argument('--m', type=int, help='M dimension')
     parser.add_argument('--n', type=int, help='N dimension')
@@ -301,8 +386,12 @@ if __name__ == '__main__':
         if args.func in ['GroupedNoPad']:
             test_m_grouped_gemm_nopad_loop(num_groups, m, n, k)
 
+        if args.func in ['GroupedMasked']:
+            test_m_grouped_gemm_masked_loop(num_groups, m, n, k)
+
         if args.func in ['DenseGemm']:
             test_gemm_loop(m, n, k)
     else:
         test_m_grouped_gemm_nopad_loop(num_groups, m, n, k)
+        test_m_grouped_gemm_masked_loop(num_groups, m, n, k)
         test_gemm_loop(m, n, k)

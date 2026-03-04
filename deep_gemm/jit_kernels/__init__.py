@@ -21,6 +21,7 @@ from .m_grouped_gemm_fp8 import (
     m_grouped_gemm_fp8_fp8_bf16_nt_nopad
 )
 from .m_grouped_gemm_fp4 import (
+    m_grouped_gemm_fp4_fp4_bf16_nt_masked,
     m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
 )
 from .utils import (

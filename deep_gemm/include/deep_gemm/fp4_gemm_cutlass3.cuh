@@ -49,7 +49,8 @@ template <
   class ProblemShape_,
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
-  class TileScheduler_
+  class TileScheduler_,
+  bool kEnableSboOverlap
 >
 class DeepGemmUniversal
 {
@@ -134,6 +135,7 @@ public:
     EpilogueArguments epilogue{};
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
+    int32_t* signal{nullptr};
 #if SAIL_SYNC_IN_CE
     int *ptr_sync_ce = nullptr;
 #endif
@@ -145,9 +147,10 @@ public:
       MainloopArguments mainloop_ = MainloopArguments{},
       EpilogueArguments epilogue_ = EpilogueArguments{},
       KernelHardwareInfo hw_info_ = KernelHardwareInfo{},
-      TileSchedulerArguments scheduler_ = TileSchedulerArguments{})
+      TileSchedulerArguments scheduler_ = TileSchedulerArguments{},
+      int32_t* signal_ = nullptr)
     : mode(mode_), problem_shape(problem_shape_), mainloop(mainloop_),
-      epilogue(epilogue_), hw_info(hw_info_), scheduler(scheduler_) {}
+      epilogue(epilogue_), hw_info(hw_info_), scheduler(scheduler_), signal(signal_){}
 #endif
   };
 
@@ -160,6 +163,7 @@ public:
     KernelHardwareInfo hw_info{};
     TileSchedulerParams scheduler{};
     void* workspace{nullptr};
+    int32_t* signal{nullptr};
 #if SAIL_SYNC_IN_CE
     int *ptr_sync_ce = nullptr;
 #endif
@@ -199,13 +203,16 @@ public:
 
     TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(grouped_layout,
       problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
+
     return {
       args.mode,
       args.problem_shape,
       CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, workspace),
       CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, workspace),
       hw_info,
-      scheduler
+      scheduler,
+      workspace,
+      args.signal
     };
   }
 
@@ -360,6 +367,16 @@ public:
         thread_idx,
         (char*)&shared_storage.tensors.epilogue
       );
+
+      if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+        cp_async_wait<0>();
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+          atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
+                  * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
+        }
+      }
     }
   }
 };
@@ -1136,7 +1153,8 @@ namespace deep_gemm {
 template <int32_t ShapeN, int32_t ShapeK,
           int32_t BlockM, int32_t BlockN, int32_t BlockK,
           int32_t WarpM, int32_t WarpN,
-          int32_t kNumGroups, int32_t kNumStages, GemmType kGemmType, bool HasBias = false>
+          int32_t kNumGroups, int32_t kNumStages, GemmType kGemmType,
+          bool kEnableSboOverlap = false, bool HasBias = false>
 class Fp4Gemm {
   static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
   static_assert((BlockN == 16) || (BlockN == 32) || (BlockN == 64) || (BlockN == 128) || (BlockN == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
@@ -1277,6 +1295,7 @@ public:
             CollectiveMainloop,
             CollectiveEpilogue,
             TileScheduler,
+            kEnableSboOverlap
         >;
 
         using StrideA = typename GemmKernel::StrideA;
@@ -1284,7 +1303,7 @@ public:
         using StrideC = typename GemmKernel::StrideC;
         using StrideD = typename GemmKernel::StrideD;
         using StrideBias  = Stride<_0,_1,int64_t>;
-      
+
         int* layout_info = grouped_layout;
         // compute block_m_info
         if (TileScheduler::kIsNoPadPreprocessLayout) {
@@ -1325,7 +1344,7 @@ public:
               nullptr, stride_C,
               converted_output, stride_D,
             },
-            hw_info,
+            hw_info, {}, signal
         };
 
         size_t workspace_size = GemmKernel::get_workspace_size(arguments);
@@ -1355,7 +1374,7 @@ public:
         }
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()){
+        if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(
                 kGemmType, false, std::string("fp4"), kNumGroups, shape_m, ShapeN, ShapeK, expected_m,
                 grouped_layout, stream

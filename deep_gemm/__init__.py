@@ -12,6 +12,7 @@ from .jit_kernels import (
     gemm_int8_int8_bf16_nt,
     # gemm_fp8_fp8_bf16_nt,
     gemm_fp4_fp4_bf16_nt,
+    m_grouped_gemm_fp4_fp4_bf16_nt_masked,
     m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
     m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
     m_grouped_gemm_fp8_fp8_bf16_nt_masked,

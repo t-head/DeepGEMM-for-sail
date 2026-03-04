@@ -339,6 +339,8 @@ struct DeepGemmScheduler {
         if constexpr (kGemmType == GemmType::GroupedNoPad) {
             // /4 means uint8_t to uint32_t;
             return int64_t(curr_cumsum_m) * ((shape_k_scale + 3) / 4);
+        } else if constexpr (kGemmType == GemmType::GroupedMasked) {
+            return int64_t(curr_group_idx) * params.shape_m * ((shape_k_scale + 3) / 4);
         } else {
             return 0;
         }
@@ -383,7 +385,7 @@ struct DeepGemmScheduler {
     // Gets the pointer offset of matrix C
     __device__ __forceinline__ int64_t curr_offset_mxfp4_c() const
     {
-        if constexpr (kGemmType == GemmType::GroupedNoPad) {
+        if constexpr (kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedMasked) {
             return int64_t(curr_group_idx) * SHAPE_N;
         } else {
             return 0;

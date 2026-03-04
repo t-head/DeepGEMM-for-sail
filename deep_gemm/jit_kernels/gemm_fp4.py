@@ -6,6 +6,7 @@ from functools import lru_cache
 
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, is_ppu1v5_device
+from ..deep_gemm_tuner.autotune_fp4 import lookup_best_config
 # C++ code templates
 includes = ('"../deep_gemm/fp4_gemm_cutlass3.cuh"', )
 template = """
@@ -271,13 +272,17 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False,
+                     is_grouped_nopad: bool = False, is_grouped_masked: bool = False,
                      max_block_n: int = 256) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     assert is_ppu1v5_device(), "mxfp4 is noly supported on PPU-ZW890"
-    assert not(is_grouped_contiguous or is_grouped_masked), "mxfp4 grouped gemm only supports GroupedNoPad Now"
 
-    if num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False:
+    configs = lookup_best_config(m, n, k * 2, num_groups)
+    if configs is not None:
+        block_m, block_n, block_k, warp_m, warp_n, num_stages = configs
+        smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
+        return num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config
+    if num_groups == 1 and is_grouped_nopad == False and is_grouped_masked == False:
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms)
 
     block_ms = (256, 128, 64, 32, 16) if k >= 384 else (128, 64, 32, 16)
