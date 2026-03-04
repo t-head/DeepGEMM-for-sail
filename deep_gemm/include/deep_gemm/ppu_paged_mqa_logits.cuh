@@ -23,55 +23,99 @@ __device__  __forceinline__ float ld_shared(const float* ptr) {
 
 namespace deep_gemm {
 
-template <uint32_t kAlignedBatchSize, uint32_t SPLIT_KV, uint32_t kNumSMs>
-__global__ __launch_bounds__(32, 1)
+template <uint32_t SPLIT_KV, uint32_t kNumSMs>
+__global__
 void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t* context_lens, uint32_t* schedule_metadata) {
-    DG_STATIC_ASSERT(kAlignedBatchSize % 32 == 0, "Invalid aligned batch size");
-    const uint32_t lane_idx = get_lane_idx();
+    extern __shared__ uint32_t prefix_sum[];
+    const uint32_t tid = threadIdx.x;
 
-    uint32_t num_segs[kAlignedBatchSize / 32];
-    #pragma unroll
-    for (uint32_t k = 0; k < kAlignedBatchSize / 32; ++ k) {
-        const uint32_t& context_len = (k * 32 + lane_idx < batch_size ? __ldg(context_lens + k * 32 + lane_idx) : 0);
-        num_segs[k] = ceil_div(context_len, SPLIT_KV);
+    // load context lens
+    for (uint32_t k = tid; k < batch_size; k += blockDim.x) {
+        prefix_sum[k] = ceil_div(__ldg(context_lens + k), SPLIT_KV);
     }
+    __syncthreads();
 
-    __shared__ uint32_t prefix_sum[kAlignedBatchSize];
+    // calculate prefix sum
     uint32_t sum = 0;
-    #pragma unroll
-    for (uint32_t k = 0; k < kAlignedBatchSize / 32; ++ k) {
-        uint32_t x = num_segs[k];
+    uint32_t* temp_prefix_sum = prefix_sum;
+    uint32_t loop_num = batch_size / blockDim.x;
+    for (uint32_t k = 0; k < loop_num; k++) {
+        uint32_t val = temp_prefix_sum[tid];
         #pragma unroll
-        for (uint32_t offset = 1; offset < 32; offset <<= 1) {
-            const uint32_t& y = __shfl_up_sync(0xffffffff, x, offset);
-            x += (lane_idx >= offset ? y : 0);
+        for (uint32_t offset = 1; offset < blockDim.x; offset <<= 1) {
+            uint32_t temp = 0;
+            if (tid >= offset) {
+                temp = temp_prefix_sum[tid - offset];
+            }
+            __syncthreads();
+            val += temp;
+            __syncthreads();
+            temp_prefix_sum[tid] = val;
         }
-        x += sum;
-        prefix_sum[k * 32 + lane_idx] = x;
-        sum = __shfl_sync(0xffffffff, x, 31);
+        temp_prefix_sum[tid] += sum;
+        __syncthreads();
+        sum = temp_prefix_sum[blockDim.x - 1];
+        temp_prefix_sum += blockDim.x;
     }
+    // blockDim.x < 1024: only last loop
+    uint32_t last = batch_size - loop_num * blockDim.x;
+    if (tid < last) {
+        uint32_t val = temp_prefix_sum[tid];
+        #pragma unroll
+        for (uint32_t offset = 1; offset < last; offset <<= 1) {
+            uint32_t temp = 0;
+            if (tid >= offset) {
+                temp = temp_prefix_sum[tid - offset];
+            }
+            __syncthreads();
+            val += temp;
+            __syncthreads();
+            temp_prefix_sum[tid] = val;
+        }
+        temp_prefix_sum[tid] += sum;
+    } else {
+        for (uint32_t offset = 1; offset < last; offset <<= 1) {
+            __syncthreads();
+            __syncthreads();
+        }
+    }
+    __syncthreads();
+    sum = prefix_sum[batch_size - 1];
 
+    // binary search
     const uint32_t& q = sum / kNumSMs, r = sum % kNumSMs;
-    for (uint32_t sm_idx = lane_idx; sm_idx <= kNumSMs; sm_idx += 32) {
+    for (uint32_t sm_idx = tid; sm_idx < kNumSMs + 1; sm_idx += blockDim.x) {
         uint32_t seg_starts = sm_idx * q + min(sm_idx, r);
-        uint32_t q_idx = 0;
-        while (q_idx < batch_size and prefix_sum[q_idx] <= seg_starts)
-            ++ q_idx;
-        const uint32_t& kv_split_idx = (q_idx == 0 ? seg_starts : seg_starts - prefix_sum[q_idx - 1]);
-        __syncwarp();
+
+        int left = 0;
+        int right = batch_size - 1;
+        int found_idx = batch_size;
+        while (left <= right) {
+            int mid = (left + right) / 2;
+            if (prefix_sum[mid] > seg_starts) {
+                found_idx = mid;
+                right = mid - 1;
+            } else {
+                left = mid + 1;
+            }
+        }
+
+        uint32_t q_idx = found_idx;
+        uint32_t prev_sum = (q_idx == 0) ? 0 : prefix_sum[q_idx - 1];
+        uint32_t kv_split_idx = seg_starts - prev_sum;
 
         schedule_metadata[sm_idx * 2] = q_idx;
         schedule_metadata[sm_idx * 2 + 1] = kv_split_idx;
     }
 }
 
-template <uint32_t kAlignedBatchSize, uint32_t SPLIT_KV, uint32_t kNumSMs>
+template <uint32_t SPLIT_KV, uint32_t kNumSMs>
 void launch_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t* context_lens, uint32_t* schedule_metadata,
                                       cudaStream_t stream) {
     int grid = 1;
-    int block = 32;
-    int smem_size = 0;
-    smxx_paged_mqa_logits_metadata<kAlignedBatchSize, SPLIT_KV, kNumSMs><<<grid, block, smem_size, stream>>>(
+    int block = min(batch_size, 1024);
+    int smem_size = batch_size * 4;
+    smxx_paged_mqa_logits_metadata<SPLIT_KV, kNumSMs><<<grid, block, smem_size, stream>>>(
         batch_size, context_lens, schedule_metadata);
 
 };

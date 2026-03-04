@@ -200,10 +200,9 @@ def int8_mqa_logits(q: torch.Tensor,
 includes_paged = ('"../deep_gemm/ppu_paged_mqa_logits.cuh"', )
 template_paged_metadata = """
 using namespace deep_gemm;
-constexpr uint32_t kAlignedBatchSize = {kAlignedBatchSize};
 constexpr uint32_t SPLIT_KV = {SPLIT_KV};
 constexpr uint32_t kNumSMs = {kNumSMs};
-launch_paged_mqa_logits_metadata<kAlignedBatchSize, SPLIT_KV, kNumSMs>(
+launch_paged_mqa_logits_metadata<SPLIT_KV, kNumSMs>(
     batch_size, (uint32_t*)context_lens, (uint32_t*)schedule_metadata, stream);
 """
 
@@ -236,9 +235,10 @@ def get_paged_mqa_logits_metadata(context_lens: torch.Tensor,
     batch_size = context_lens.shape[0]
     assert(context_lens.dtype == torch.int32)
     assert(context_lens.is_contiguous())
+    # shared memory limit
+    assert(batch_size <= 65536)
 
     num_math_warpgroups = 1 # sm80, no warpgroup
-    aligned_batch_size = align(batch_size, 32)
     split_kv = block_kv * num_math_warpgroups
 
     tb_per_cu = 1
@@ -252,8 +252,7 @@ def get_paged_mqa_logits_metadata(context_lens: torch.Tensor,
     args = (batch_size, context_lens, schedule_metadata, stream)
     runtime = jit_tuner.compile_and_tune(
         name='attention_paged_mqa_logits_metadata',
-        keys={'kAlignedBatchSize': aligned_batch_size,
-              'SPLIT_KV': split_kv,
+        keys={'SPLIT_KV': split_kv,
               'kNumSMs': num_blocks},
         space=(),
         includes=includes_paged,
@@ -300,7 +299,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
     assert(block_kv == 64)
 
     assert(q.is_contiguous())
-    if q.dtype != torch.bfloat16: 
+    if q.dtype != torch.bfloat16:
         assert(kv_cache_stride_bytes % size_of_scale_float == 0)
     assert(fused_kv_cache.stride(1) == head_dim_with_sf)
     assert(fused_kv_cache.stride(2) == head_dim_with_sf)
@@ -310,7 +309,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
     assert(block_table.stride(1) == 1)
     assert(schedule_meta.is_contiguous())
 
-    if q.dtype != torch.bfloat16: 
+    if q.dtype != torch.bfloat16:
         assert(fused_kv_cache.dtype == torch.uint8)
     assert(weights.dtype == torch.float)
     assert(context_lens.dtype == torch.int32)
