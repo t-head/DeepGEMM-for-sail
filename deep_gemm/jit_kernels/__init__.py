@@ -1,7 +1,11 @@
 from .gemm import gemm_bf16_bf16_bf16_nt
-from .gemm_fp4 import gemm_fp4_fp4_bf16_nt
 from .gemm_int8 import gemm_int8_int8_bf16_nt
 from .gemm_fp8 import gemm_fp8_fp8_bf16_nt
+from .gemm_fp4 import (
+    gemm_fp4_fp4_bf16_nt,
+    preprocess_mxfp4_scales,
+    uint8_padding,
+)
 from .m_grouped_gemm import (
     # m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
     # m_grouped_gemm_fp8_fp8_bf16_nt_masked,

@@ -24,7 +24,7 @@ constexpr auto kNumStages = {NUM_STAGES};
 
 // Make a templated grouped GEMM
 auto bias_dispatcher = [&](auto HasBias) {
-    using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, decltype(HasBias)::value>;
+    using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, false, decltype(HasBias)::value>;
     gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
                 bias, out, m, nullptr, nullptr, 0,
                 stream, num_sms, smem_size); 
@@ -271,17 +271,17 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
     return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
 @lru_cache(maxsize=None)
-def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
+def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_sms: int,
                      is_grouped_nopad: bool = False, is_grouped_masked: bool = False,
                      max_block_n: int = 256) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     assert is_ppu1v5_device(), "mxfp4 is noly supported on PPU-ZW890"
-
-    configs = lookup_best_config(m, n, k * 2, num_groups)
+    if is_grouped_masked:
+        configs = lookup_best_config(m, n, k * 2, num_groups, is_grouped_masked)
+    else:
+        configs = lookup_best_config(total_m, n, k * 2, num_groups, False)
     if configs is not None:
-        block_m, block_n, block_k, warp_m, warp_n, num_stages = configs
-        smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
-        return num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config
+        return configs
     if num_groups == 1 and is_grouped_nopad == False and is_grouped_masked == False:
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms)
 
@@ -471,6 +471,68 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
+def uint8_padding(scale_uint8: torch.Tensor) -> torch.Tensor:
+    """
+        zero-pad uint8 tensor to align its width to a multiple of 4 for ppu mxfp4
+
+        Args:
+            scale_uint8: uint8 tensor, expected shape [M, K]
+
+        Returns:
+            out: padded tensor with width aligned to 4, shape [M, K_pad] where K_pad = ceil(K/4)*4
+    """
+    remainder = scale_uint8.shape[1] & 3
+    if remainder == 0:
+        return scale_uint8 if scale_uint8.dtype == torch.uint8 else scale_uint8.to(torch.uint8)
+    pad_size = 4 - remainder
+    if scale_uint8.dtype != torch.uint8:
+        scale_uint8 = scale_uint8.to(torch.uint8)
+    return torch.nn.functional.pad(scale_uint8, (0, pad_size))
+
+def preprocess_mxfp4_scales(scale: torch.Tensor) -> torch.Tensor:
+    """
+        transform the scale layout for ppu mxfp4
+
+        Args:
+            scale: e8m0 scales, whose shape should be [M/N, K] or [E, N, K]
+
+        Returns:
+            out: transformed scales, which are aligned to (16, 2)
+    """
+    assert scale.dtype == torch.uint8, "ppu_swizzle_mx_scale_cutlass only accept torch.uint8 now."
+    assert len(scale.shape) in [2, 3]
+
+    ### scales are aligned with (16, 2) sub blocks, which is refered to a mma.
+    SWIZZLE_ALIGN_MN = 16
+    SWIZZEL_ALIGN_K = 2
+
+    outs = []
+
+    *leading_shape, MN, K = scale.shape
+    pad_k = (SWIZZEL_ALIGN_K - (K % SWIZZEL_ALIGN_K)) % SWIZZEL_ALIGN_K
+    pad_mn = (SWIZZLE_ALIGN_MN - (MN % SWIZZLE_ALIGN_MN)) % SWIZZLE_ALIGN_MN
+    scale_pad = scale
+    if pad_k or pad_mn > 0:
+        scale_pad = torch.nn.functional.pad(scale, (0, pad_k, 0, pad_mn))
+    padded_shape = scale_pad.shape
+    assert padded_shape[-2] % 16 == 0 and padded_shape[-1] % 2 == 0, "padding shape must be aligned to MN, K -> (16, 2)"
+
+    scale_pad_flatten = scale_pad.reshape(-1, padded_shape[-2], padded_shape[-1])
+    scale_pad_flatten_b16 = scale_pad_flatten.contiguous().view(torch.uint16)
+    L, MNp, Kp = scale_pad_flatten_b16.shape
+
+    scale_pad_flatten_b16 = scale_pad_flatten_b16.reshape(L, MNp // 16, 16, Kp)
+    scale_pad_flatten_b16 = scale_pad_flatten_b16.reshape(L, MNp // 16, 2, 8, Kp).permute(0, 1, 3, 2, 4)
+    scale_pad_flatten_b16 = scale_pad_flatten_b16.reshape(L, MNp // 16, 16, Kp)
+
+    scale_swizzled = scale_pad_flatten_b16.permute(0, 1, 3, 2).contiguous().reshape(L, MNp // 16, Kp * 16)
+    scale_swizzled = scale_swizzled.view(torch.uint8).reshape(*leading_shape, MNp // 16, Kp * 2 * 16)
+
+    outs.append(scale_swizzled)
+
+    out = torch.concat(outs, dim=0)
+    return out
+
 def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
                          rhs_: Tuple[torch.Tensor, torch.Tensor],
                          bias: torch.Tensor, out: torch.Tensor, configs = None) -> None:
@@ -504,7 +566,7 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
         # import ipdb; ipdb.set_trace()
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, m, n, k, 1, num_sms)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
         # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
 

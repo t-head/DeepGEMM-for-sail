@@ -12,16 +12,12 @@ from functools import lru_cache
 from typing import List, Dict, Optional, Tuple, Any
 import copy
 
+import torch.nn.functional as F
 import numpy as np
 import torch
 import deep_gemm
 import traceback
-from deep_gemm import uint8_padding, ppu_cutlass_mxfp4_scales_swizzle, get_num_sms
-from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
 import concurrent.futures
-
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, upcast_from_mxfp
-
 
 CANDIDATE_Ms = sorted(set(
     list(range(1, 16))
@@ -73,19 +69,92 @@ def construct_fp4_dense(
     N: int,
     K: int,
 ):
+    from deep_gemm.jit_kernels.gemm_fp4 import uint8_padding, preprocess_mxfp4_scales
     A = torch.randn(M, K, dtype=torch.bfloat16, device='cuda').contiguous()
     B = torch.randn(N, K, dtype=torch.bfloat16, device='cuda').contiguous()
-    x = downcast_to_mxfp(A, torch.uint8, axis=1)
-    y = downcast_to_mxfp(B, torch.uint8, axis=1)
+    x = quantize_fp4_torch(A).cuda()
+    y = quantize_fp4_torch(B).cuda()
     bias = torch.randn(1, N, dtype=torch.float32, device='cuda')
     out = torch.zeros(M, N, dtype=torch.bfloat16, device='cuda')
     ref_out = torch.zeros(M, N, dtype=torch.bfloat16, device='cuda')
     x_scale = uint8_padding(x[1])
-    y_scale = ppu_cutlass_mxfp4_scales_swizzle(scale=y[1])
+    y_scale = preprocess_mxfp4_scales(scale=y[1])
     x = x[0], x_scale
     y = y[0], y_scale
     return x, y, bias, out, ref_out
 
+def right_shift_unsigned(x, shift):
+    return (x >> shift) & ((1 << (32 - shift)) - 1)
+
+def quantize_fp4_torch(src_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    assert src_tensor.dtype in {torch.float32, torch.bfloat16, torch.float16}
+    device = src_tensor.device
+    *batch_dims, N, K = src_tensor.shape
+    assert K % 2 == 0
+
+    src = src_tensor.to(torch.float32)
+    padded_K = ((K + 31) // 32) * 32
+    pad_amount = padded_K - K
+    padded_src = F.pad(src, (0, pad_amount))
+    valid_mask = F.pad(torch.ones_like(src, dtype=torch.bool), (0, pad_amount))
+
+    abs_src = torch.abs(padded_src)
+    abs_src = torch.where(valid_mask, abs_src, torch.tensor(-1.0, device=device))
+    abs_groups = abs_src.view(*batch_dims, N, padded_K // 32, 32)
+    max_val, _ = abs_groups.max(dim=-1, keepdim=True)
+
+    dequant_scale = max_val / 6.0
+    ds_int = dequant_scale.view(torch.int32)
+    ds_int_rounded = (ds_int + 0x007FFFFF) & 0x7F800000
+    dequant_scale_rounded = ds_int_rounded.view(torch.float32)
+    quant_scale = torch.where(dequant_scale_rounded == 0, torch.tensor(0.0, device=device), 1.0 / dequant_scale_rounded)
+
+    padded_src_groups = padded_src.view(*batch_dims, N, padded_K // 32, 32)
+    quant_tensor = padded_src_groups * quant_scale
+    quant_tensor = quant_tensor.view(*batch_dims, N, padded_K)[..., :K]
+
+    q_int = quant_tensor.contiguous().view(torch.int32)
+    signs = q_int & 0x80000000
+    exponents = right_shift_unsigned(q_int, 23) & 0xFF
+    mantissas = q_int & 0x7FFFFF
+
+    E8_BIAS, E2_BIAS = 127, 1
+    mantissas = torch.where(exponents < E8_BIAS, (0x400000 | right_shift_unsigned(mantissas, 1)) >> (E8_BIAS - exponents - 1), mantissas)
+    exponents = torch.maximum(exponents, torch.tensor(E8_BIAS - E2_BIAS, device=device)) - (E8_BIAS - E2_BIAS)
+
+    e2m1_tmp = right_shift_unsigned(((exponents << 2) | right_shift_unsigned(mantissas, 21)) + 1, 1)
+    e2m1_tmp = torch.minimum(e2m1_tmp, torch.tensor(0x7, device=device))
+    e2m1_value = (right_shift_unsigned(signs, 28) | e2m1_tmp).to(torch.uint8)
+
+    e2m1_value = e2m1_value.view(*batch_dims, N, K // 2, 2)
+    packed_tensor = e2m1_value[..., 0] | (e2m1_value[..., 1] << 4)
+    scale_uint8 = (ds_int_rounded.squeeze(-1) >> 23).to(torch.uint8)
+
+    return packed_tensor, scale_uint8
+
+def dequantize_fp4_torch(quant_tensor: torch.Tensor, scale: torch.Tensor, target_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    assert quant_tensor.dtype == torch.uint8 and scale.dtype == torch.uint8
+    assert target_dtype in {torch.float32, torch.bfloat16, torch.float16}
+
+    device = quant_tensor.device
+    *batch_dims, N, packed_K = quant_tensor.shape
+    K = packed_K * 2
+
+    quant_int = quant_tensor.to(torch.int32)
+    evens = quant_int & 0xF
+    odds = (quant_int >> 4) & 0xF
+
+    vals = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    lookup_table = torch.tensor(vals + [-v for v in vals], dtype=torch.float32, device=device)
+    fp32_tensor = torch.stack([lookup_table[evens], lookup_table[odds]], dim=-1).view(*batch_dims, N, K)
+
+    dq_scale = (scale.to(torch.int32) << 23).view(torch.float32)
+    padded_K = dq_scale.shape[-1] * 32
+    padded_tensor = F.pad(fp32_tensor, (0, padded_K - K))
+    padded_tensor = padded_tensor.view(*batch_dims, N, dq_scale.shape[-1], 32)
+    out_padded = (padded_tensor * dq_scale.unsqueeze(-1)).view(*batch_dims, N, padded_K)
+
+    return out_padded[..., :K].to(target_dtype)
 
 def construct_fp4_nopad(
     N: int,
@@ -94,6 +163,7 @@ def construct_fp4_nopad(
     num_experts: int,
     device: str = "cuda",
 ):
+    from deep_gemm.jit_kernels.gemm_fp4 import uint8_padding, preprocess_mxfp4_scales
     total_tokens = int(m_rows.sum().item())
     dtype = torch.bfloat16
     x = torch.randn(total_tokens, K, dtype=dtype, device=device)
@@ -102,7 +172,7 @@ def construct_fp4_nopad(
     out = torch.empty(total_tokens, N, dtype=dtype, device=device)
     ref_out = torch.empty(total_tokens, N, dtype=dtype, device=device)
 
-    x_fp4 = downcast_to_mxfp(x.cuda(), torch.uint8, axis=1)
+    x_fp4 = quantize_fp4_torch(x.cuda())
     x_fp4_scale = uint8_padding(x_fp4[1])
     y_fp4 = (torch.empty((num_experts, N, int(K / 2)), device='cuda', dtype=torch.uint8),
              torch.empty((num_experts, N, int(K / 32)),
@@ -110,15 +180,17 @@ def construct_fp4_nopad(
              )
     y_scale = []
     for i in range(num_experts):
-        y_fp4[0][i], y_fp4[1][i] = downcast_to_mxfp(
-            y[i].cuda(), torch.uint8, axis=1)
-        y_scale.append(ppu_cutlass_mxfp4_scales_swizzle(scale=y_fp4[1][i]))
+        y_fp4[0][i], y_fp4[1][i] = quantize_fp4_torch(y[i].cuda())
+        y_scale.append(preprocess_mxfp4_scales(scale=y_fp4[1][i]))
+
+    m_indices = torch.empty(total_tokens, device='cuda', dtype=torch.int32)
     y_fp4_scale = torch.stack(y_scale, dim=0)
 
-    return (x_fp4[0], x_fp4_scale), (y_fp4[0], y_fp4_scale), bias, out, ref_out
+    return (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4[0].to('cuda'), y_fp4_scale.to('cuda')), bias.to('cuda'), out.to('cuda'), ref_out.to('cuda'), m_indices.to('cuda')
 
 def construct_fp4_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, distribution: str,
                              enable_sbo_overlap: bool = False, with_bias: bool = True):
+    from deep_gemm.jit_kernels.gemm_fp4 import uint8_padding, preprocess_mxfp4_scales
     tensor_device = 'cuda'
     def find_next_power_of_2(m_list):
         if isinstance(m_list, torch.Tensor):
@@ -150,14 +222,14 @@ def construct_fp4_masked(num_groups: int, max_m: int, expected_m_per_group: int,
     x_ref = []
     y_ref = []
     for i in range(num_groups):
-        a, a_scale = downcast_to_mxfp(x[i].cuda(), torch.uint8, axis=1)
-        b, b_scale = downcast_to_mxfp(y[i].cuda(), torch.uint8, axis=1)
-        a_dequant = upcast_from_mxfp(a, a_scale, torch.bfloat16, axis=-1)
-        b_dequant = upcast_from_mxfp(b, b_scale, torch.bfloat16, axis=-1)
+        a, a_scale = quantize_fp4_torch(x[i].cuda())
+        b, b_scale = quantize_fp4_torch(y[i].cuda())
+        a_dequant = dequantize_fp4_torch(a, a_scale)
+        b_dequant = dequantize_fp4_torch(b, b_scale)
         x_fp4.append(a)
         x_fp4_scale.append(uint8_padding(a_scale))
         y_fp4.append(b)
-        y_fp4_scale.append(ppu_cutlass_mxfp4_scales_swizzle(b_scale))
+        y_fp4_scale.append(preprocess_mxfp4_scales(b_scale))
         x_ref.append(a_dequant)
         y_ref.append(b_dequant)
 
@@ -375,7 +447,7 @@ def get_search_space(d: torch.dtype, gemm_type: str) -> list:
     return tile_list_rtn
 
 def get_full_search_space(k) -> list:
-
+    from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
     block_ms = [256, 128, 64, 32, 16]
     block_ns = [256, 128, 64, 32, 16]
     block_ks = [256, 128, 64]
@@ -428,6 +500,7 @@ def precompile_kernels(search_space, M, N, K, num_experts, topk_experts, gemm_ty
         return 1 - sim
 
     def compile_and_validate(config, gemm_type):
+        from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4, get_num_sms
         num_sms = get_num_sms()
         smem_config = get_smem_config_fp4(2, 256, 256, 64, 64, 128)
         ref_config = (num_sms, 256, 256, 128, 64, 64, 2, smem_config)
@@ -435,18 +508,18 @@ def precompile_kernels(search_space, M, N, K, num_experts, topk_experts, gemm_ty
         smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
         config = (num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config)
         if gemm_type == "GroupedNoPad":
-            m_rows = construct_uniform_m_list("uniform", num_experts, M*topk_experts)
-            m_rows = torch.tensor(m_rows).to('cuda').to(torch.int32)
+            group_ms = construct_uniform_m_list("uniform", num_experts, M*topk_experts)
+            m_rows = torch.tensor(group_ms).to('cuda').to(torch.int32)
 
             cuda_m_rows = m_rows.to('cuda')
-            x_fp4, y_fp4, bias, out, ref_out = construct_fp4_nopad(
+            x_fp4, y_fp4, bias, out, ref_out, m_indices = construct_fp4_nopad(
                 N, K, cuda_m_rows, num_experts)
 
             try:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
-                    x_fp4, y_fp4, bias, out, m_rows=cuda_m_rows, configs=config)
+                    x_fp4, y_fp4, bias, out, m_indices, m_rows=cuda_m_rows, configs=config)
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
-                    x_fp4, y_fp4, bias, ref_out, m_rows=cuda_m_rows, configs=ref_config)
+                    x_fp4, y_fp4, bias, ref_out, m_indices, m_rows=cuda_m_rows, configs=ref_config)
                 torch.cuda.synchronize()
 
                 diff = calc_diff(out, ref_out)
@@ -542,12 +615,12 @@ def benchmark_kernel(
 
     if gemm_type == "GroupedNoPad":
         total_tokens = int(m_rows.sum().item())
-        x_fp4, y_fp4, bias, out, _ = construct_fp4_nopad(N, K, m_rows, num_experts)
+        x_fp4, y_fp4, bias, out, _, m_indices = construct_fp4_nopad(N, K, m_rows, num_experts)
         m_rows = m_rows.to('cuda')
 
         def run():
             deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
-                x_fp4, y_fp4, bias, out, m_rows=m_rows, configs=config)
+                x_fp4, y_fp4, bias, out, m_indices, m_rows=m_rows, configs=config)
 
         try:
             for i in range(warmup):
@@ -918,7 +991,8 @@ def autotune_all(
         K = case_list[0]["K"]
         topk_experts = case_list[0]["topk_experts"]
 
-        search_space = get_search_space(torch.uint8, gemm_type=gemm_type)
+        # search_space = get_search_space(torch.uint8, gemm_type=gemm_type)
+        search_space = get_full_search_space(K)
         config_list = []
         for tile in search_space:
             block_m, block_n, warp_m, warp_n, block_k, num_stages = tile
@@ -1056,7 +1130,6 @@ def lookup_best_config(
     else:
         group_key = f"N{N}_K{K}_E{num_experts}"
     if group_key not in lut:
-        print(f"[AutoTune] No entry for {group_key} in LUT folder")
         return None
 
     configs = lut[group_key].get("configs", {})

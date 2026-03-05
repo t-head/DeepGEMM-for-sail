@@ -14,6 +14,8 @@ from .jit_kernels import (
     gemm_fp4_fp4_bf16_nt,
     m_grouped_gemm_fp4_fp4_bf16_nt_masked,
     m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
+    preprocess_mxfp4_scales,
+    uint8_padding,
     m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
     m_grouped_gemm_fp8_fp8_bf16_nt_masked,
     m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
