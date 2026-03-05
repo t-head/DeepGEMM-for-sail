@@ -23,6 +23,7 @@
 
 #include "cutlass/epilogue/threadblock/epilogue_with_visitor.h"
 #include "cutlass/epilogue/threadblock/epilogue_per_row_per_col_scale.h"
+#include "utils.cuh"
 
 namespace deep_gemm {
 
@@ -451,7 +452,7 @@ class Gemm {
 public:
     Gemm() = default;
 
-    static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
+    static void run(__nv_bfloat16* gmem_d, int* grouped_layout, int* block_m_info,
                     uint32_t shape_m, uint32_t expected_m, int8_t* gmem_a, float* scales_a,
                     int8_t * gmem_b, float* scales_b,
                     cudaStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
@@ -484,7 +485,7 @@ public:
                                                                             cutlass::gemm::kernel::GroupScheduleMode::kDeepGemm,
                                                                             cutlass::arch::OpMultiplyAdd>::GemmKernel;
 
-        using ProblemVisitor = Scheduler<kGemmType, SHAPE_N, ThreadblockShape>;
+        using ProblemVisitor = Scheduler<kGemmType, SHAPE_N, ThreadblockShape, kNumGroups>;
 
         using AlphaColTileIterator = cutlass::epilogue::threadblock::PredicatedTileIterator<
             cutlass::epilogue::threadblock::OutputTileOptimalThreadMap<
@@ -507,6 +508,13 @@ public:
         using GemmKernel = GemmKernel<typename DefaultGemm::Mma, Epilogue, ProblemVisitor, kEnableSboOverlap>;
 
         using GemmGrouped = aiu::gemm::device::GemmGrouped<GemmKernel>;
+        int* layout_info = grouped_layout;
+        // compute block_m_info
+        if (ProblemVisitor::kIsNoPadPreprocessLayout) {
+            uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+            computeBlockInfoKernel<BLOCK_M><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
+            layout_info = block_m_info;
+        }
 
         int max_active_tb_num = GemmGrouped::maximum_active_blocks();
 
@@ -518,8 +526,8 @@ public:
             cudaFuncGetAttributes(&attr, cutlass::Kernel<GemmKernel>);
 
             printf("[GemmGrouped-INT8:]\n");
-            printf("group:%d, problem:[%d, %d, %d], gemm_type:%s\n",
-                kNumGroups, shape_m, SHAPE_N, SHAPE_K, GemmTypeS[static_cast<int>(kGemmType)]);
+            printf("group:%d, problem:[%d, %d, %d], gemm_type:%s, kIsNoPadPreprocessLayout:%d\n",
+                kNumGroups, shape_m, SHAPE_N, SHAPE_K, GemmTypeS[static_cast<int>(kGemmType)], ProblemVisitor::kIsNoPadPreprocessLayout);
 
             printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], kNumStages:%d\n",
                 ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK, expected_m,
@@ -545,7 +553,7 @@ public:
             {reinterpret_cast<ElementType*>(gmem_a), SHAPE_K},
             {reinterpret_cast<ElementType*>(gmem_b), SHAPE_K},
             {reinterpret_cast<ElementOutput*>(gmem_d), SHAPE_N},
-            shape_m, SHAPE_N, SHAPE_K, grouped_layout,
+            shape_m, SHAPE_N, SHAPE_K, layout_info,
             {reinterpret_cast<ElementCompute*>(scales_b), 0},
             {reinterpret_cast<ElementCompute*>(scales_a), 0},
             0, 0,

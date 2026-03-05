@@ -26,7 +26,7 @@ constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
 using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap>;
 
 // Launch kernel
-gemm_t::run(out, grouped_layout,
+gemm_t::run(out, grouped_layout, block_m_info,
             m, expected_m, lhs, rhs,
             stream, num_sms, smem_size, signal);
 """

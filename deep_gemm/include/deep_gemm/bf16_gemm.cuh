@@ -18,6 +18,7 @@
 #include "aiu/gemm/kernel/default_gemm_grouped.h"
 #include "aiu/gemm/kernel/default_gemm.h"
 #include "aiu/gemm/threadblock/default_mma.h"
+#include "utils.cuh"
 
 
 namespace deep_gemm {
@@ -375,7 +376,7 @@ class Gemm {
 public:
     Gemm() = default;
 
-    static void run(__nv_bfloat16* gmem_d, int* grouped_layout,
+    static void run(__nv_bfloat16* gmem_d, int* grouped_layout, int* block_m_info,
                     uint32_t shape_m, uint32_t expected_m, __nv_bfloat16* gmem_a, __nv_bfloat16* gmem_b,
                     cudaStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
         using ThreadblockShape = cutlass::gemm::GemmShape<BLOCK_M, BLOCK_N, BLOCK_K>;
@@ -403,11 +404,18 @@ public:
                                                                             cutlass::gemm::kernel::GroupScheduleMode::kDeepGemm,
                                                                             cutlass::arch::OpMultiplyAdd>::GemmKernel;
 
-        using ProblemVisitor = Scheduler<kGemmType, SHAPE_N, ThreadblockShape>;
+        using ProblemVisitor = Scheduler<kGemmType, SHAPE_N, ThreadblockShape, kNumGroups>;
 
         using GemmKernel = GemmKernel<typename DefaultGemm::Mma, typename DefaultGemm::Epilogue, ProblemVisitor, kEnableSboOverlap>;
 
         using GemmGrouped = aiu::gemm::device::GemmGrouped<GemmKernel>;
+        int* layout_info = grouped_layout;
+        // compute block_m_info
+        if (ProblemVisitor::kIsNoPadPreprocessLayout) {
+            uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+            computeBlockInfoKernel<BLOCK_M><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
+            layout_info = block_m_info;
+        }
 
         int max_active_tb_num = GemmGrouped::maximum_active_blocks();
 
@@ -419,8 +427,8 @@ public:
             cudaFuncGetAttributes(&attr, cutlass::Kernel<GemmKernel>);
 
             printf("[GemmGrouped-BF16:]\n");
-            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s\n",
-                kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)]);
+            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d\n",
+                kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)], ProblemVisitor::kIsNoPadPreprocessLayout);
 
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                 ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK,
@@ -450,7 +458,7 @@ public:
             // {gmem_d, SHAPE_N},
             {reinterpret_cast<ElementType*>(gmem_d), SHAPE_N},
             shape_m, SHAPE_N, SHAPE_K,
-            grouped_layout, signal
+            layout_info, signal
         );
 
         GemmGrouped gemm;

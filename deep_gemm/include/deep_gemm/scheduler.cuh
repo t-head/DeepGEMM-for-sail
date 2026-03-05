@@ -5,7 +5,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/matrix_coord.h"
 #include "cutlass/fast_math.h"
-
+#define EnableGroupNoPadOpt
 namespace deep_gemm {
 
 
@@ -14,7 +14,7 @@ namespace deep_gemm {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // ProblemVisitor that same as deepgemm
 //
-template <GemmType GemmType_, uint32_t SHAPE_N, typename ThreadblockShape_, uint32_t kNum1DBlocksPerGroup = 16>
+template <GemmType GemmType_, uint32_t SHAPE_N, typename ThreadblockShape_, uint32_t kNumGroups_, uint32_t kNum1DBlocksPerGroup = 16>
 struct Scheduler
 {
     /// use for base_group compatiblity
@@ -42,6 +42,11 @@ struct Scheduler
     using ThreadblockShape = ThreadblockShape_;
 
     static const GemmType kGemmType = GemmType_;
+#ifdef EnableGroupNoPadOpt
+    constexpr static bool kIsNoPadPreprocessLayout = kGemmType == GemmType::GroupedNoPad and kNumGroups_ >= 128;
+#else
+    constexpr static bool kIsNoPadPreprocessLayout = false;
+#endif
 
     struct Params
     {
@@ -90,6 +95,7 @@ struct Scheduler
 
     // Only used for masked layout
     uint32_t curr_group_idx, curr_cumsum, curr_m_start, curr_m;
+    int curr_group_m;
 
     int current_iter = 0;
     uint32_t num_aligned_m_blocks;
@@ -111,8 +117,16 @@ struct Scheduler
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if (kGemmType == GemmType::GroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
-        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
+        } else if (kGemmType == GemmType::GroupedMasked) {
             curr_cumsum = curr_m_start = curr_m = 0;
+        } else if (kGemmType == GemmType::GroupedNoPad) {
+            if (kIsNoPadPreprocessLayout) {
+                num_aligned_m_blocks = params_.grouped_layout[0]; // total blocks in m, block_m_sum
+                curr_cumsum = curr_group_m = curr_m = 0;
+                num_blocks = num_aligned_m_blocks * num_n_blocks;
+            } else {
+                curr_cumsum = curr_m_start = curr_m = curr_group_m = 0;
+            }
         }
     }
 
@@ -163,33 +177,47 @@ struct Scheduler
     {
         const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
 
-        if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
-            uint32_t num_m = 0;
-            uint32_t num_m_blocks = 0;
-
+        if (kIsNoPadPreprocessLayout) {
+            if (next_block_idx >= num_blocks) {
+                m_block_idx = num_aligned_m_blocks;
+                n_block_idx = num_n_blocks;
+                return false;
+            }
+            int block_m_idx = next_block_idx / num_n_blocks;
+            uint4 data = (((const uint4*)params.grouped_layout) + 1)[block_m_idx];
+            curr_group_idx = data.x;
+            curr_group_m = data.y;
+            uint32_t block_idx_in_m = data.z * num_n_blocks + next_block_idx % num_n_blocks;
+            uint32_t num_m_blocks = ceil_div(curr_group_m, ThreadblockShape::kM);
+            curr_m_start = data.w;
+            get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);
+            curr_m = (curr_group_m - (m_block_idx * ThreadblockShape::kM)) < ThreadblockShape::kM
+                     ? (curr_group_m - (m_block_idx * ThreadblockShape::kM))
+                     : ThreadblockShape::kM;
+        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
+            uint32_t num_m_blocks;
             while (true) {
                 // End of the task
-                if (curr_group_idx == params.problem_count)
+                if (curr_group_idx == params.problem_count) {
+                    m_block_idx = num_m_blocks;
+                    n_block_idx = num_n_blocks;
                     return false;
-
-                // Within current group
-                num_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
-                num_m_blocks = cutlass::ceil_div(num_m, ThreadblockShape::kM);
+                }
+                // Within the current group
+                curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
+                num_m_blocks = ceil_div(curr_group_m, ThreadblockShape::kM);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
                 if (next_block_idx < current_m_block_cumsum * num_n_blocks)
                     break;
-
-                curr_m_start += num_m;
                 // Move to check the next group
                 curr_group_idx ++, curr_cumsum = current_m_block_cumsum;
+                curr_m_start += curr_group_m;
             }
-
             get_swizzled_block_idx(num_m_blocks, next_block_idx - curr_cumsum * num_n_blocks, m_block_idx, n_block_idx);
-
-            curr_m = (num_m - (m_block_idx * ThreadblockShape::kM)) < ThreadblockShape::kM
-                     ? (num_m - (m_block_idx * ThreadblockShape::kM))
+            curr_m = (curr_group_m - (m_block_idx * ThreadblockShape::kM)) < ThreadblockShape::kM
+                     ? (curr_group_m - (m_block_idx * ThreadblockShape::kM))
                      : ThreadblockShape::kM;
-        } else  {
+        } else {
             if (next_block_idx >= num_blocks)
                 return false;
 

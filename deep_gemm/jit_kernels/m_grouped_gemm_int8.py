@@ -27,7 +27,7 @@ constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
 using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap>;
 
 // Launch kernel
-gemm_t::run(out, grouped_layout,
+gemm_t::run(out, grouped_layout, block_m_info,
             m, expected_m, lhs, lhs_scales, rhs, rhs_scales,
             stream, num_sms, smem_size, signal);
 """
@@ -305,8 +305,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
     global includes, template, includes_gemv, template_gemv, includes_cutlass3, template_cutlass3
     num_sms = get_num_sms()
     use_gemv = False
-
-    if (expected_m <= 2 and k % 16 == 0 and (k % 128 == 0 or (n >= 1024 and k <= 32 * 8)) and not is_ppu1v5_device()):
+    if k % 16 == 0 and ((m <= 2 * num_groups * 0.75 and k <= 32 * 8) or (m < 0.65 * num_groups and k > 256)) and not is_ppu1v5_device():
         # use gemmv if avg m small
         # ThreadPerN = 8
         # NUM_UNROLL = 1
