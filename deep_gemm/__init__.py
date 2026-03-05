@@ -10,7 +10,7 @@ from . import deep_gemm_tuner
 from .jit_kernels import (
     gemm_bf16_bf16_bf16_nt,
     gemm_int8_int8_bf16_nt,
-    gemm_fp8_fp8_bf16_nt,
+    # gemm_fp8_fp8_bf16_nt,
     gemm_fp4_fp4_fp32_nt,
     m_grouped_gemm_fp4_fp4_fp32_nt_nopad,
     m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
@@ -53,8 +53,8 @@ from .jit import set_compile_mode, get_compile_mode
 # Import functions from the CPP module
 
 
-use_cpp_jit = os.environ.get('USE_CPP_JIT', '').lower()
-should_init_deep_gemm_cpp = use_cpp_jit in ('1', 'true', 'yes', 'on')
+use_cpp_jit_for_python = os.environ.get('USE_CPP_JIT_FOR_PYTHON', '').lower()
+should_init_deep_gemm_cpp = use_cpp_jit_for_python in ('1', 'true', 'yes', 'on')
 if should_init_deep_gemm_cpp:
     from . import deep_gemm_cpp
     # from .deep_gemm_cpp import (
@@ -65,15 +65,17 @@ if should_init_deep_gemm_cpp:
     # )
 
     # DeepGEMM Kernels
-    # from .deep_gemm_cpp import (
-    #     # FP8 GEMMs
-    #     gemm_fp8_fp8_bf16_nt, 
-    #     # fp8_gemm_nn,
-    #     # fp8_gemm_tn, fp8_gemm_tt,
-    #     # gemm_bf16_bf16_bf16_nt
-    #     # fp8_gemm_nt_skip_head_mid,
-    # )
+    from .deep_gemm_cpp import (
+        # FP8 GEMMs
+        gemm_fp8_fp8_bf16_nt, 
+        # fp8_gemm_nn,
+        # fp8_gemm_tn, fp8_gemm_tt,
+        # gemm_bf16_bf16_bf16_nt
+        # fp8_gemm_nt_skip_head_mid,
+    )
     deep_gemm_cpp.init(
         os.path.dirname(os.path.abspath(__file__)), # Library root directory path
         CUDA_HOME         # CUDA home
     )
+else:
+    from .jit_kernels import gemm_fp8_fp8_bf16_nt

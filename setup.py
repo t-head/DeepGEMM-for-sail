@@ -2,20 +2,24 @@ import os
 import setuptools
 import shutil
 import subprocess
+import torch
 from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
 from setuptools import find_packages
-from torch.utils.cpp_extension import CppExtension, CUDA_HOME
+from torch.utils.cpp_extension import CppExtension, CUDA_HOME, CUDAExtension, BuildExtension
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
-cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-g']
-sources = ['csrc/python_api.cpp']
+# cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-g']
+
+sources = ['csrc/python_api.cu']
 build_include_dirs = [
     f'{CUDA_HOME}/include',
-    'deep_gemm/include',
-    'third-party/cutlass3/include',
-    'third-party/cutlass3/tools',
-    'third-party/fmt/include',
+    current_dir + '/deep_gemm/include',
+    current_dir + '/third-party/cutlass3/',
+    current_dir + '/third-party/cutlass3/include',
+    current_dir + '/third-party/cutlass3/tools',
+    current_dir + '/third-party/fmt/include',
+    current_dir + '/third-party/cutlass3/include/cute',
 ]
 build_libraries = ['cuda', 'cudart', 'nvrtc']
 build_library_dirs = [
@@ -119,18 +123,40 @@ if __name__ == '__main__':
         revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
     except:
         revision = ''
-    use_cpp_jit = os.environ.get('USE_CPP_JIT', '').lower()
-    should_build_ext = use_cpp_jit in ('1', 'true', 'yes', 'on')
+
+    cuda_version = torch.version.cuda
+
+    def parse_cuda_version(version_str):
+        if version_str is None:
+            return (0, 0)
+        major, minor = map(int, version_str.split('.')[:2])
+        return (major, minor)
+
+    cuda_ver = parse_cuda_version(torch.version.cuda)
+    should_build_ext = False
+    if cuda_ver <= (12, 6):
+        should_build_ext = True
+    
     ext_modules = []
     if should_build_ext:
-        ext_modules = [
-            CppExtension(name='deep_gemm.deep_gemm_cpp',
+        ext_modules.append(
+            CUDAExtension(name='deep_gemm.deep_gemm_cpp',
                          sources=sources,
                          include_dirs=build_include_dirs,
                          libraries=build_libraries,
                          library_dirs=build_library_dirs,
-                         extra_compile_args=cxx_flags)
-        ]
+                         extra_compile_args={
+                "cxx": ["-O3", "-std=c++20"],
+                "nvcc": [
+                    "-O3",
+                    "-std=c++20",
+                    "--use_fast_math",
+                    # 可选：指定 nvcc 使用的主机编译器（如 clang）
+                    # "-ccbin", "/usr/bin/clang++-14",
+                    # 指定架构（关键！）
+                    "-gencode=arch=compute_80,code=sm_80",
+                ],   # cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-g']
+            }))
     setuptools.setup(
         name='deep_gemm',
         use_scm_version={
@@ -138,7 +164,6 @@ if __name__ == '__main__':
             "version_scheme": custom_version_scheme,
         },
         setup_requires=["setuptools_scm"],
-        # version='2.0.0' + revision,
         packages=find_packages('.'), # old version: packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels', 'deep_gemm/deep_gemm_tuner'],, 
         package_data={
             'deep_gemm': [
@@ -153,5 +178,6 @@ if __name__ == '__main__':
         cmdclass={
             'develop': PostDevelopCommand,
             'build_py': CustomBuildPy,
+            'build_ext': BuildExtension,
         },
     )

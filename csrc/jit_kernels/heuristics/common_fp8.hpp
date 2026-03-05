@@ -229,7 +229,9 @@ ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num
             break;
         }
     }
-    assert(best_smem_config.index() != 0 || std::get<0>(best_smem_config) != 0); // Check that best_smem_config is not null
+  
+    // assert best_num_stages is not None
+    assert(std::get<0>(best_smem_config) != 0); // Check that best_smem_config is not null
     assert(best_num_stages != 0);
     int num_waves_final = get_num_waves(best_block_m, best_block_n);
     int num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves_final);

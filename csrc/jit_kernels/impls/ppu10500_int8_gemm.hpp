@@ -21,7 +21,7 @@
 #include "ppu/cutlass/detail/blockwise_scale_layout.hpp"
 #include "../../../deep_gemm/include/deep_gemm/utils_rtc.cuh"
 #include "epilogue.hpp"
-#include "runtime_utils.hpp"
+// #include "runtime_utils.hpp"
 #include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
 
 using namespace deep_gemm_int8;
@@ -507,7 +507,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
     auto args = PPU10500INT8GemmRuntime::Args{
       .gemm_args = gemm_args,
       .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "sm100_int8_deep_gemm_1d1d"},
-      .launch_args = LaunchArgs(grid, block, SMSIZE),
+      .launch_args = {grid, block, SMSIZE},
       .kernel_params = params
     };
     const auto& code = PPU10500INT8GemmRuntime::generate(args);
@@ -527,7 +527,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
-    PPU10500INT8GemmRuntime::launch(runtime, args, stream);
+    PPU10500INT8GemmRuntime::launch(runtime, args);
 
     ProfilingInterface::Instance().instrument(false, dg_prof_params);
 }

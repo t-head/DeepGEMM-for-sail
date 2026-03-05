@@ -23,7 +23,7 @@
 
 
 #include "epilogue.hpp"
-#include "runtime_utils.hpp"
+// #include "runtime_utils.hpp"
 using namespace deep_gemm_bf16;
 namespace deep_gemm {
 
@@ -681,7 +681,7 @@ static void bf16_gemm(const torch::Tensor& lhs,
       auto args = BF16GemmCutlass3Runtime::Args{
         .gemm_args = gemm_args,
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "ppu10500_bf16_gemm"},
-        .launch_args = LaunchArgs(grid, block, SMSIZE),
+        .launch_args = {grid, block, SMSIZE},
         .kernel_params = params
       };
       const auto& code = BF16GemmCutlass3Runtime::generate(args);
@@ -692,7 +692,7 @@ static void bf16_gemm(const torch::Tensor& lhs,
       grid = get_grid_shape(hw_info.sm_count);
       args.launch_args.grid_dim = grid;
 
-      BF16GemmCutlass3Runtime::launch(runtime, args, stream);
+      BF16GemmCutlass3Runtime::launch(runtime, args);
       
     } else {
 
@@ -732,7 +732,7 @@ static void bf16_gemm(const torch::Tensor& lhs,
       auto args = BF16GemmRuntime::Args{
         // .gemm_args = gemm_args,
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "ppu10000_bf16_gemm"},
-        .launch_args = LaunchArgs(grid, block, SMSIZE),
+        .launch_args = {grid, block, SMSIZE},
         .kernel_params = params
       };
 
@@ -745,7 +745,7 @@ static void bf16_gemm(const torch::Tensor& lhs,
       grid = get_grid_shape(hw_info.sm_count);
       args.launch_args.grid_dim = grid;
 
-      BF16GemmRuntime::launch(runtime, args, stream);
+      BF16GemmRuntime::launch(runtime, args);
     }
 }
 } // namespace deep_gemm

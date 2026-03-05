@@ -24,6 +24,7 @@
 #include "runtime_utils.hpp"
 #include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
 #include "ppu10500_int8_gemm.hpp"
+#include "fake_fp8_gemm.hpp"
 
 using namespace deep_gemm_fp8;
 namespace deep_gemm {
@@ -452,6 +453,7 @@ using GemmKernel = DeepGemmUniversal<
 
 // Kernel 函数定义
 extern "C" 
+__launch_bounds__(512)
 __global__ void {}(
   typename GemmKernel::Params params
 ) {{
@@ -515,15 +517,7 @@ static void ppu10500_fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs
     }
     
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
-    // std::cout << "\n num_sms_new is " << num_sms_new << std::endl;
-    // std::cout << "\n block_m is " << block_m << std::endl;
-    // std::cout << "\n block_n is " << block_n << std::endl;
-    // std::cout << "\n block_k is " << block_k << std::endl;
-    // std::cout << "\n warp_m is " << warp_m << std::endl;
-    // std::cout << "\n warp_n is " << warp_n << std::endl;
-    // std::cout << "\n num_stages is " << num_stages << std::endl;
     auto SMSIZE = std::get<0>(smem_config);
-    // std::cout << "\n SMSIZE is " << SMSIZE << std::endl;
 
     uint32_t kNumGroups = 1;
     
@@ -552,11 +546,11 @@ static void ppu10500_fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs
       uint32_t block_size = std::max(32, next_power_of_two(kNumGroups));
       auto compute_block_info_args = ComputeBlockInfoKernelRuntime::Args{
         .launch_attr_args = {reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info)},
-        .launch_args = LaunchArgs(1, block_size, 0),
+        .launch_args = {1, block_size, 0},
       };
       const auto& code_blockinfo = ComputeBlockInfoKernelRuntime::generate(block_m);
       const auto& runtime_blockinfo = compiler->build("computeBlockInfoKernel", code_blockinfo);
-      ComputeBlockInfoKernelRuntime::launch(runtime_blockinfo, compute_block_info_args, stream);
+      ComputeBlockInfoKernelRuntime::launch(runtime_blockinfo, compute_block_info_args);
     }
 
     cutlass::float_e4m3_t* converted_input_b = reinterpret_cast<cutlass::float_e4m3_t*>(rhs.data_ptr<at::Float8_e4m3fn>());
@@ -586,10 +580,14 @@ static void ppu10500_fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs
     };
 
     PPU10500FP8GemmRuntime::GemmKernelParams params = PPU10500FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr, grouped_layout);
+    if(get_tample_params_size() != sizeof(PPU10500FP8GemmRuntime::GemmKernelParams)) {
+      std::cout << "\n the size is not right!!!" << std::endl;
+    }
+    // checkParams(params);
     auto args = PPU10500FP8GemmRuntime::Args{
       .gemm_args = gemm_args,
       .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "sm100_fp8_deep_gemm_1d1d"},
-      .launch_args = LaunchArgs(grid, block, SMSIZE),
+      .launch_args = {grid, block, SMSIZE},
       .kernel_params = params
     };
     const auto& code = PPU10500FP8GemmRuntime::generate(args);
@@ -609,7 +607,7 @@ static void ppu10500_fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
-    PPU10500FP8GemmRuntime::launch(runtime, args, stream);
+    PPU10500FP8GemmRuntime::launch(runtime, args);
 
     ProfilingInterface::Instance().instrument(false, dg_prof_params);
 }

@@ -172,24 +172,23 @@ public:
         // The override the compiler flags
         // Only NVCC >= 12.9 supports arch-specific family suffix
         const auto& arch = 89;//device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
-        std::cout << "library_include_path.c_str()=========" << library_include_path.c_str() << std::endl;
         flags = fmt::format("{} -I{}/cutlass3 -I{}/deep_gemm -gencode=arch=compute_89,code=sm_{} "
-                            "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
-                            "-cubin -shared -O3 --expt-relaxed-constexpr --expt-extended-lambda",
+                            ",-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
+                            "-cubin --expt-relaxed-constexpr --expt-extended-lambda",
                             flags, library_include_path.c_str(), library_include_path.c_str(), arch);
         bool is_ppu1v5_device = true;
         std::string nvcc_flags;
         if (is_ppu1v5_device) {
-            nvcc_flags = "-ppu-patch-fence-ppu=false -wno-loop-miss-transform -ppu-cg-to-kp1=true "
+            nvcc_flags = " -ppu-patch-fence-ppu=false -wno-loop-miss-transform -ppu-cg-to-kp1=true "
             "-ppu-fix-uninit=true -mllvm -ppu-blksync-nb-schedule-boundary=true -mllvm -ppu-simt-branch=false "
             "-mllvm -ppu-adjust-tsm-valu-war=13 -mllvm -ppu-reassign-subregs=true -mllvm -ppu-pref-fma-reuse=true "
-            "-mllvm -ppu-pref-mma-reuse=true";
+            "-mllvm -ppu-pref-mma-reuse=true  -mllvm -regalloc=pbqp --ptxas-options=--register-usage-level=10";
         }
         flags += nvcc_flags;
 
 
         
-    }//LiTODO '--ptxas-options=--register-usage-level=10' + (',--verbose' if 'DG_PTXAS_VERBOSE' in os.environ else ''),
+    }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path, const std::string& name, int32_t thread_num, int32_t smem_size) const override {
         // Write the code into the cache directory
@@ -248,7 +247,7 @@ public:
                 opts.emplace_back("--include-path=" + path);
             }
             };
-        #ifndef __HGGCCC__
+        // #ifndef __HGGCCC__
         // #if defined(ACOMPUTE_VERSION) && ACOMPUTE_VERSION == 10700
         //     opts_insert({"--gpu-architecture=compute_90a"});
         // #elif defined(ACOMPUTE_VERSION) && ACOMPUTE_VERSION == 20000
@@ -294,6 +293,8 @@ public:
                     "--ppu-tuning-options=-ppu-reassign-subregs=true",
                     "--ppu-tuning-options=-ppu-pref-fma-reuse=true",
                     "--ppu-tuning-options=-ppu-force-defer-sync=true",
+                    "--ppu-tuning-options=-ppu-pref-mma-reuse=true",
+                    "--ppu-tuning-options=-regalloc=pbqp",
                 });
             } else if (arch == AC_PPU0017) {
                 opts_insert({
@@ -316,7 +317,7 @@ public:
                     // "--ppu-tuning-options=-ppu-force-defer-sync=true",
                 });
             }
-        #endif
+        // #endif
 
         #ifdef USE_HEADER_FILES
             if (getenv("PPU_HOME") == nullptr) {

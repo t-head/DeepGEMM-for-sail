@@ -12,7 +12,6 @@
 // #include "utils.cuh"
 
 #include "cutlass/cutlass.h"
-
 #include "cutlass/workspace.h"
 #include "cutlass/fast_math.h"
 #include "cutlass/kernel_hardware_info.hpp"
@@ -1167,10 +1166,11 @@ public:
         size_t workspace_size = GemmKernel::get_workspace_size(arguments);
 
         // Allocate workspace memory
-        cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+        // // cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+        // cutlass::DeviceAllocation<uint8_t> workspace(workspace_size);
 
         // evt realization must construct evt params on device, can't use GemmUniversalAdapter
-        typename GemmKernel::Params params = GemmKernel::to_underlying_arguments(arguments, workspace.get(), layout_info);
+        typename GemmKernel::Params params = GemmKernel::to_underlying_arguments(arguments, nullptr, layout_info);
 
         dim3 const block = GemmKernel::get_block_shape();
         dim3 const grid = GemmKernel::get_grid_shape(params);
