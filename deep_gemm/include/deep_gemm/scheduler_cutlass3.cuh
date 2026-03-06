@@ -39,7 +39,7 @@ struct DeepGemmScheduler {
     constexpr static GemmType GEMM_TYPE = kGemmType;
     constexpr static bool kIsTMAMulticastOnA = false;
 #ifdef EnableGroupNoPadOpt
-    constexpr static bool kIsNoPadPreprocessLayout = kGemmType == GemmType::GroupedNoPad && kNumGroups >= 128;
+    constexpr static bool kIsNoPadPreprocessLayout = (kGemmType == GemmType::GroupedNoPad||kGemmType == GemmType::GroupedFused) && kNumGroups >= 128;
 #else
     constexpr static bool kIsNoPadPreprocessLayout = false;
 #endif
@@ -84,14 +84,14 @@ struct DeepGemmScheduler {
 
     CUTLASS_DEVICE explicit DeepGemmScheduler(Params const& params_, const int warp_group_id = 0) : params(params_), current_iter(warp_group_id) {
         num_aligned_m_blocks = ceil_div(params_.shape_m, BLOCK_M);
-        if (kGemmType == GemmType::DenseGemm) {
+        if constexpr(kGemmType == GemmType::DenseGemm) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
-        } else if (kGemmType == GemmType::GroupedContiguous) {
+        } else if constexpr(kGemmType == GemmType::GroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
-        } else if (kGemmType == GemmType::GroupedMasked) {
+        } else if constexpr(kGemmType == GemmType::GroupedMasked) {
             curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_blocks = curr_cumsum_m = 0;
-        } else if (kGemmType == GemmType::GroupedNoPad) {
-            if (kIsNoPadPreprocessLayout) {
+        } else if constexpr(kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused) {
+            if constexpr(kIsNoPadPreprocessLayout) {
                 num_aligned_m_blocks = params_.grouped_layout[0]; // total blocks in m, block_m_sum
                 curr_group_idx = curr_cumsum = curr_cumsum_blocks = curr_group_m = curr_cumsum_m = 0;
                 num_blocks = num_aligned_m_blocks * num_n_blocks;
@@ -138,7 +138,7 @@ struct DeepGemmScheduler {
 
     CUTLASS_DEVICE bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
         const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
-        if (kIsNoPadPreprocessLayout) {
+        if constexpr(kIsNoPadPreprocessLayout) {
             if (next_block_idx >= num_blocks) {
                 m_block_idx = num_aligned_m_blocks;
                 n_block_idx = kNumNBlocks;
@@ -148,11 +148,15 @@ struct DeepGemmScheduler {
             uint4 data = (((const uint4*)params.grouped_layout) + 1)[block_m_idx];
             curr_group_idx = data.x;
             curr_group_m = data.y;
-            uint32_t block_idx_in_m = data.z * kNumNBlocks + next_block_idx % kNumNBlocks;
+            uint32_t block_idx_in_m = next_block_idx - data.z * kNumNBlocks;
             uint32_t num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
-            curr_cumsum_m = data.w;
             get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);
-        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
+            if constexpr(kGemmType == GemmType::GroupedFused) {
+                m_block_idx += data.z;
+            } else {
+                curr_cumsum_m = data.w;
+            }
+        } else if constexpr(kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused) {
             uint32_t num_m_blocks;
             while (true) {
                 // End of the task
@@ -172,6 +176,9 @@ struct DeepGemmScheduler {
                 curr_cumsum_m += curr_group_m;
             }
             get_swizzled_block_idx(num_m_blocks, next_block_idx - curr_cumsum * kNumNBlocks, m_block_idx, n_block_idx);
+            if constexpr(kGemmType == GemmType::GroupedFused) {
+                m_block_idx += curr_cumsum;
+            }
         } else {
             if (next_block_idx >= num_blocks) {
                 m_block_idx = num_aligned_m_blocks;

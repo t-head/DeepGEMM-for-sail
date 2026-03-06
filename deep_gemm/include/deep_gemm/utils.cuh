@@ -140,7 +140,7 @@ __global__ void computeBlockInfoKernel(
         uint32_t block_idx = base_offset + i * 4;
         output_info[block_idx]     = tid;          // group_idx
         output_info[block_idx + 1] = group_val;    // group_num
-        output_info[block_idx + 2] = i;            // block_in_group
+        output_info[block_idx + 2] = global_block_prefix; // prefix_block_m_idx
         output_info[block_idx + 3] = global_group_prefix; // prefix_group_sum
     }
 }

@@ -352,6 +352,75 @@ def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=Fals
     return group_m_list
 
 
+
+def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: int, topk:int, d: torch.dtype, quant_type: str = "block") -> \
+        Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
+
+    """构造 topk_ids"""
+    topk_ids = torch.empty((num_token, topk), device=tensor_device, dtype=torch.int32)
+    for i in range(num_token):
+        # 每个 token 随机选择 topk 个不同的专家
+        topk_ids[i] = torch.randperm(num_groups)[:topk]
+
+    x = torch.randn((num_token, k), device=tensor_device, dtype=torch.bfloat16)
+    y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
+
+    out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
+    ref_out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
+
+    if _acc_check:
+        # ========== Step 1: 按 Token 顺序计算 GEMM ==========
+        output_token_order = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
+        for token_idx in range(num_token):
+            for topk_idx in range(topk):
+                expert_id = topk_ids[token_idx, topk_idx].item()
+                flat_idx = token_idx * topk + topk_idx
+                output_token_order[flat_idx] = x[token_idx] @ y[expert_id].T
+        # ========== Step 2: Permute - 按 expert id 重新排序 ==========
+        # 收集所有 (expert_id, src_idx) 二元组
+        entries = []
+        for token_idx in range(num_token):
+            for topk_idx in range(topk):
+                expert_id = topk_ids[token_idx, topk_idx].item()
+                src_idx = token_idx * topk + topk_idx
+                entries.append((expert_id, src_idx))
+
+        # 按 expert_id 排序
+        entries.sort(key=lambda e: e[0])
+        for dst_idx, (expert_id, src_idx) in enumerate(entries):
+            ref_out[dst_idx] = output_token_order[src_idx]
+
+
+    if d == torch.bfloat16:
+        return x.to('cuda'), y.to('cuda'), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    elif d == torch.int8:
+        x_int8 = per_token_cast_to_int8(x)
+        y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device=tensor_device, dtype=torch.float))
+        for i in range(num_groups):
+            y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
+        return (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    elif d == torch.float8_e4m3fn:
+        # assert m % 4 == 0, f'TMA alignment error: {m}'
+        if quant_type == "channel":
+            x_fp8 = per_custom_dims_cast_to_fp8(x, (0, ), False, True)
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, n, 1), device=tensor_device, dtype=torch.float))
+            for i in range(num_groups):
+                y_fp8[0][i], y_fp8[1][i] = per_custom_dims_cast_to_fp8(y[i], (0, ), False, True)
+        else: # block wise
+            x_fp8 = per_token_cast_to_fp8(x)
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, ceil_div(n, 128), k // 128), device=tensor_device, dtype=torch.float))
+            for i in range(num_groups):
+                y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
+        if use_ppu:
+            x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
+        else:
+            x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
+        return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    else:
+        print("ERROR: Unsupported dtype, please check!")
+        exit(1)
+
 def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: torch.dtype, distribution: str, alignment: int, quant_type: str = "block") -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
@@ -723,11 +792,11 @@ def read_numbers_from_file(file_path):
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False, "quant_type": "block"}
-    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap"]
-    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits"]
+    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk"]
+    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits"]
     supported_quant_type = ["block", "channel"]
     import re
-    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedMasked|DenseGemm|Normal|MqaLogits|PagedMqaLogits),(.+)"
+    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|Normal|MqaLogits|PagedMqaLogits),(.+)"
     pattern = re.compile(dg_params)
     m = pattern.search(s.strip("."))
     if not m:
@@ -1022,6 +1091,33 @@ def test_m_grouped_gemm_masked(args) -> None:
             f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
             f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
     return
+
+def test_m_grouped_gemm_fused(args) -> None:
+    print('Testing grouped fuse permute GEMM:')
+    num_groups, n, k, d = args['groups'], args['n'], args['k'], args['data_type']
+    num_token, topk = args['num_token'], args['topk']
+    quant_type = args['quant_type'] if 'quant_type' in args else 'block'
+    if use_ppu:
+        x, y, m_indices, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type)
+        if d == torch.bfloat16:
+            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_indices)
+        else:
+            print("ERROR: Unsupported dtype, please check!")
+            exit(1)
+    else:
+        print("ERROR: unsupport m_grouped_gemm_fused!")
+        exit(1)
+    if _acc_check:
+        diff = calc_diff(out, ref_out)
+        if diff >= 0.0015 or torch.isnan(diff) or torch.isinf(diff):
+            # torch.set_printoptions(threshold=10000000, linewidth=10000, precision=2, sci_mode=False)
+            print("ref_out:", ref_out)
+            print("out:", out)
+            torch.testing.assert_close(out, ref_out, rtol=5e-1, atol=2)
+        assert diff < 0.0015, f'{num_token=}, {k=}, {n=}, {diff:.5f}'
+        print("Passed with acc_check\n")
+    else:
+        print("Passed without acc_check\n")
 
 def test_m_grouped_gemm_nopad(args) -> None:
     print('Testing grouped nopad GEMM:')

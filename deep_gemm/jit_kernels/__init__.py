@@ -12,7 +12,8 @@ from .m_grouped_gemm import (
     # m_grouped_gemm_int8_int8_bf16_nt_masked,
     m_grouped_gemm_bf16_bf16_bf16_nt_masked,
     m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
-    m_grouped_gemm_bf16_bf16_bf16_nt_nopad
+    m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
+    m_grouped_gemm_bf16_bf16_bf16_nt_fused
 )
 from .m_grouped_gemm_int8 import (
     m_grouped_gemm_int8_int8_bf16_nt_contiguous,

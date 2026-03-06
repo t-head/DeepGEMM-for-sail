@@ -187,7 +187,7 @@ struct Scheduler
             uint4 data = (((const uint4*)params.grouped_layout) + 1)[block_m_idx];
             curr_group_idx = data.x;
             curr_group_m = data.y;
-            uint32_t block_idx_in_m = data.z * num_n_blocks + next_block_idx % num_n_blocks;
+            uint32_t block_idx_in_m = next_block_idx - data.z * num_n_blocks;
             uint32_t num_m_blocks = ceil_div(curr_group_m, ThreadblockShape::kM);
             curr_m_start = data.w;
             get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);

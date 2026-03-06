@@ -30,6 +30,7 @@ from .jit_kernels import (
     m_grouped_gemm_bf16_bf16_bf16_nt_masked,
     m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
     m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
+    m_grouped_gemm_bf16_bf16_bf16_nt_fused,
     # Attention kernels
     get_paged_mqa_logits_metadata,
     fp8_mqa_logits,
@@ -65,7 +66,7 @@ if should_init_deep_gemm_cpp:
     # DeepGEMM Kernels
     from .deep_gemm_cpp import (
         # FP8 GEMMs
-        gemm_fp8_fp8_bf16_nt, 
+        gemm_fp8_fp8_bf16_nt,
         # fp8_gemm_nn,
         # fp8_gemm_tn, fp8_gemm_tt,
         # gemm_bf16_bf16_bf16_nt

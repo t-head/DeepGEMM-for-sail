@@ -3,7 +3,7 @@ import torch
 import random
 import deep_gemm
 from utils import parse_deepgemm_string_re, read_cmds_from_file
-from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad
+from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad, test_m_grouped_gemm_fused
 from utils import test_mqa_logits, test_paged_mqa_logits
 from utils import set_acc_check, set_benchmark
 from utils import judge_device_type, set_ref_backend
@@ -17,6 +17,7 @@ def call_test_func(gemm_type, func_args):
     supported_call_funcs = {
         "GroupedContiguous": test_m_grouped_gemm_contiguous,
         "GroupedNoPad": test_m_grouped_gemm_nopad,
+        "GroupedFused" : test_m_grouped_gemm_fused,
         "GroupedMasked": test_m_grouped_gemm_masked,
         "DenseGemm": test_gemm,
         "Normal": test_gemm,
