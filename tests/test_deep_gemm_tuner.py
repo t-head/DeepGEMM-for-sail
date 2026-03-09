@@ -12,6 +12,8 @@ test_cases_path = {
     "dense": test_cases_dir+"dense_configs.json",
     "masked": test_cases_dir+"masked_configs.json",
     "nopad": test_cases_dir+"nopad_configs.json",
+    "nopad_bf16": test_cases_dir+"nopad_bf16_configs.json",
+    "masked_bf16": test_cases_dir+"masked_bf16_configs.json",
 }
 
 def gen_test_case(mnk_configs: str):
@@ -20,11 +22,11 @@ def gen_test_case(mnk_configs: str):
         test_cases = json.load(f)
         return test_cases
 
-@pytest.mark.parametrize("gemm_type", ["dense", "masked", "nopad"])
-def test_deepgemm_tuning(gemm_type):
+@pytest.mark.parametrize("test_configs", ["dense", "masked", "nopad", "nopad_bf16"])
+def test_deepgemm_tuning(test_configs):
     os.environ["DEEPGEMM_TUNER_DEBUG_MODE"] = "1"
     save_path = autotune_deepgemm.tuning_deepgemm_config_entrypoint(
-        gen_test_case(test_cases_path[gemm_type]),
+        gen_test_case(test_cases_path[test_configs]),
         1,
         seed,
         None,
@@ -36,7 +38,7 @@ def test_deepgemm_tuning(gemm_type):
     benchmark_result = benchmark_deepgemm.benchmark_increment(save_path)
     for result in benchmark_result:
         assert result[-1] > performance_threshold, f"{result[:-1]} gets poorer perfomance than baseline ({result[-1]}<={performance_threshold})"
-    os.remove(save_path)
+    # os.remove(save_path)
  
 
 if __name__ == '__main__':

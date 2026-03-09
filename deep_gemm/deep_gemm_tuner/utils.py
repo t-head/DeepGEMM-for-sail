@@ -44,14 +44,14 @@ def get_deep_gemm_best_configs():
     device_name = get_device_name().replace(" ", "_")
     device_name_signature = f",device_name={device_name}-"
 
-    print(f"deepgemm start loading config......")
+    logger.info(f"deepgemm start loading config......")
 
     for config in configs:
 
         if device_name_signature not in config:
-            print(f"skipping device_name_signature {config}")
+            logger.info(f"skipping device_name_signature {config}")
             continue
-        print(f"loading device_name_signature {config}")
+        logger.info(f"loading device_name_signature {config}")
 
         config_file_path = os.path.join(
             os.path.dirname(os.path.realpath(__file__)),
@@ -64,7 +64,9 @@ def get_deep_gemm_best_configs():
             with open(config_file_path,'r') as f:
                 config_dict = json.load(f)
             config_dict = dict(
-                [((x["M"], x["N"], x["K"], x["num_groups"], x['nopad'] if 'nopad' in x else False), x) for x in config_dict]
+                [((x["M"], x["N"], x["K"], x["num_groups"],
+                   x['nopad'] if 'nopad' in x else False,
+                   x['dtype'] if 'dtype' in x else "int8"), x) for x in config_dict]
             )
         except :
             logger.warning(
@@ -77,8 +79,8 @@ def get_deep_gemm_best_configs():
     def gen_NKG_M_map(best_config):
         nkg_m_map = defaultdict(list)
         for key in best_config:
-            m, n, k, g, nopad = key
-            nkg_m_map[(n, k, g, nopad)].append(m)
+            m, n, k, g, nopad, dtype = key
+            nkg_m_map[(n, k, g, nopad, dtype)].append(m)
         return nkg_m_map
 
     return config_dict_in_all, gen_NKG_M_map(config_dict_in_all)
@@ -102,46 +104,46 @@ def check_appropriate_of_candidate_M(M_candidate, M):
 
     return should_use_default
 
-def search_for_suitable_config(M, N, K, num_groups, nopad, best_configs, nkg_m_map):
+def search_for_suitable_config(M, N, K, num_groups, nopad, dtype, best_configs, nkg_m_map):
     config = None
     M_candidate = M
     # find neariest config
-    if (M, N, K, num_groups, nopad) in best_configs:
-        config = eval(best_configs[(M, N, K, num_groups, nopad)]["config"])
+    if (M, N, K, num_groups, nopad, dtype) in best_configs:
+        config = eval(best_configs[(M, N, K, num_groups, nopad, dtype)]["config"])
     else:
         # There are tuned configs found under (N, K, num_groups)
-        if len(nkg_m_map[(N, K, num_groups, nopad)]) > 0:
-            existed_Ms = nkg_m_map[(N, K, num_groups, nopad)]
+        if len(nkg_m_map[(N, K, num_groups, nopad, dtype)]) > 0:
+            existed_Ms = nkg_m_map[(N, K, num_groups, nopad, dtype)]
             M_candidate = find_closest(existed_Ms, M)
             if SAIL_DEEPGEMM_TUNER_VERBOSE:
                 logger.info(
-                    f"DeepGemm Tuner: found configs for {(M, N, K, num_groups, nopad)}, attached to M_candidate {M_candidate}"
+                    f"DeepGemm Tuner: found configs for {(M, N, K, num_groups, nopad, dtype)}, attached to M_candidate {M_candidate}"
                 )
-            if (M_candidate, N, K, num_groups, nopad) in best_configs:
-                config = eval(best_configs[(M_candidate, N, K, num_groups, nopad)]["config"])
+            if (M_candidate, N, K, num_groups, nopad, dtype) in best_configs:
+                config = eval(best_configs[(M_candidate, N, K, num_groups, nopad, dtype)]["config"])
                 # if check appropriate  failed, we only record this (M,N,K,NUM_GROUP)
                 should_use_default = check_appropriate_of_candidate_M(
                     M_candidate, M
                 )
                 if should_use_default:
                     if SAIL_DEEPGEMM_TUNER_VERBOSE:
-                        logger.info(f"DeepGemm Tuner: check appropriate  failed: {(M, N, K, num_groups, nopad)}")
+                        logger.info(f"DeepGemm Tuner: check appropriate  failed: {(M, N, K, num_groups, nopad, dtype)}")
                         logger.info(f"DeepGemm Tuner: abort attaching {M} to M_candidate{M_candidate}")
                     config = None
     return config, M_candidate
 
 @lru_cache(maxsize=None)
-def get_deep_gemm_luts(M,N,K,num_groups, nopad=False, force_heruistic=False):
+def get_deep_gemm_luts(M,N,K,num_groups, nopad=False, dtype='int8', force_heruistic=False):
     if force_heruistic:
         return None
     best_configs, nkg_m_map = get_deep_gemm_best_configs()
     if len(best_configs)>0:
         # find neariest config
-        config, _ = search_for_suitable_config(M, N, K, num_groups, nopad, best_configs, nkg_m_map)
+        config, _ = search_for_suitable_config(M, N, K, num_groups, nopad, dtype, best_configs, nkg_m_map)
 
         if config is None:
             if SAIL_DEEPGEMM_TUNER_VERBOSE:
-                logger.info(f"DeepGemm Tuner: no config found, target configs are {(M, N, K, num_groups, nopad)}")
+                logger.info(f"DeepGemm Tuner: no config found, target configs are {(M, N, K, num_groups, nopad, dtype)}")
             return None
 
         num_sms = config["num_min_sms"]
@@ -153,7 +155,7 @@ def get_deep_gemm_luts(M,N,K,num_groups, nopad=False, force_heruistic=False):
         num_stages = config["best_num_stages"]
         smem_config = config["best_smem_config"]
         if SAIL_DEEPGEMM_TUNER_VERBOSE:
-            logger.info(f"DeepGemm Tuner: found configs for {(M, N, K, num_groups, nopad)},")
+            logger.info(f"DeepGemm Tuner: found configs for {(M, N, K, num_groups, nopad, dtype)},")
         return (num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config)
     else:
         if SAIL_DEEPGEMM_TUNER_VERBOSE:

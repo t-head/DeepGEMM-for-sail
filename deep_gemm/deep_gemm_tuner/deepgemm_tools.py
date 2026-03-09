@@ -13,7 +13,7 @@ from functools import lru_cache
 from typing import Tuple, List, Optional, Any
 
 from deep_gemm import calc_diff
-from deep_gemm.jit_kernels import m_grouped_gemm_int8_int8_bf16_nt_masked, m_grouped_gemm_int8_int8_bf16_nt_nopad, gemm_int8_int8_bf16_nt, get_num_sms
+from deep_gemm.jit_kernels import m_grouped_gemm_int8_int8_bf16_nt_masked, m_grouped_gemm_int8_int8_bf16_nt_nopad, gemm_int8_int8_bf16_nt, m_grouped_gemm_bf16_bf16_bf16_nt_nopad, get_num_sms
 from deep_gemm.jit_kernels.gemm_int8 import get_smem_config
 from .utils import get_deep_gemm_luts
 DEEP_GEMM_AVAILABLE = True
@@ -168,7 +168,7 @@ def get_supported_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
 from deep_gemm.jit_kernels.utils import get_search_space
 def get_pre_assert_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                          is_grouped_contiguous: bool = False, is_grouped_masked: bool = False, gemm_type: str = "dense") -> List[Tuple]:
+                          is_grouped_contiguous: bool = False, is_grouped_masked: bool = False, gemm_type: str = "dense", dtype=torch.int8) -> List[Tuple]:
     """
     获取支持的配置列表
 
@@ -182,7 +182,8 @@ def get_pre_assert_configs(m: int, n: int, k: int, num_groups: int, num_sms: int
     返回:
     配置列表
     """
-    assert_config = get_search_space(torch.int8, gemm_type)
+    assert dtype in (torch.int8, torch.float8_e4m3fn, torch.bfloat16)
+    assert_config = get_search_space(dtype, gemm_type)
     rst = []
     for config in assert_config:
         best_block_m, best_block_n, warp_m, warp_n,  block_k, best_num_stages = config
@@ -458,11 +459,67 @@ def grouped_gemm_nt_i8i8bf16_nopad(
     best_config = (
         configs
         if configs is not None
-        else get_deep_gemm_luts(m, n, k, num_groups=num_groups)
+        else get_deep_gemm_luts(m, n, k, num_groups=num_groups, nopad=True)
     )
 
     m_grouped_gemm_int8_int8_bf16_nt_nopad(
         lhs, rhs, out, m_indices, m_rows, best_config
+    )
+
+def grouped_gemm_nt_bf16bf16bf16_nopad(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: torch.Tensor = None,
+    configs=None,
+):
+    m, k = lhs.shape
+    num_groups, n, _ = rhs.shape
+    best_config = (
+        configs
+        if configs is not None
+        else get_deep_gemm_luts(m, n, k, num_groups=num_groups, nopad=True)
+    )
+
+    m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
+        lhs, rhs, out, m_indices, m_rows, best_config
+    )
+
+
+def grouped_gemm_nt_bf16bf16bf16_masked(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    configs=None,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
+):
+    num_groups, _, k = lhs.shape
+    _, n, _ = rhs.shape
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(expected_m, n, k, num_groups=num_groups)
+    )
+
+    m_grouped_gemm_bf16_bf16_bf16_nt_masked(
+        lhs,
+        rhs,
+        out,
+        masked_m,
+        expected_m,
+        **(
+            dict(
+                enable_sbo_overlap=True,
+                max_block_n=max_block_n,
+                signal=overlap_args.signal,
+            )
+            if overlap_args is not None
+            else {}
+        ),
     )
 
 def exec_tuning_iter(func, func_name, debug_mode=False):

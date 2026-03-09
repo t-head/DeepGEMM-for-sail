@@ -25,6 +25,7 @@ except ImportError:
 from deep_gemm.deep_gemm_tuner.deepgemm_tools import get_supported_configs, get_pre_assert_configs, exec_tuning_iter
 from deep_gemm.deep_gemm_tuner.deepgemm_tools import count_expert_num_tokens, fused_topk_torch_native, grouped_masked_m_sample, deepgemm_moe_permute
 from deep_gemm.deep_gemm_tuner.deepgemm_tools import per_token_quant_int8, gemm_nt_i8i8bf16, grouped_gemm_nt_i8i8bf16_masked, grouped_gemm_nt_i8i8bf16_nopad
+from deep_gemm.deep_gemm_tuner.deepgemm_tools import grouped_gemm_nt_bf16bf16bf16_nopad
 from deep_gemm.deep_gemm_tuner.utils import CANDIDATE_Ms, get_deep_gemm_luts, get_device_name
 
 # Try to import deep_gemm functions
@@ -33,8 +34,89 @@ from deep_gemm.jit_kernels import m_grouped_gemm_int8_int8_bf16_nt_masked, gemm_
 from deep_gemm.jit_kernels.gemm_int8 import get_smem_config
 DEEP_GEMM_AVAILABLE = True
 
+ENABLE_GAMMA_SAMPLE = os.environ.get("ENABLE_GAMMA_SAMPLE", None)
 
-def run_grouped_gemm_nopad_test(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
+def run_grouped_gemm_nopad_test_bf16(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
+    """
+    运行分组GEMM测试
+
+    参数:
+    M, K, N: 矩阵维度
+    config: 配置参数
+    num_groups: 分组数量
+
+    返回:
+    执行时间（毫秒）
+    """
+    assert(DEEP_GEMM_AVAILABLE)
+    DEBUG_MODE = int(os.getenv("DEEPGEMM_TUNER_DEBUG_MODE", 0))
+
+    # Create input tensors for grouped gemm, similar to normal gemm but with groups dimensionn
+    topk = 8 # hard code
+    actual_M = M // topk
+    x = torch.randn((actual_M, K), dtype=torch.bfloat16, device="cuda") * 0.1
+
+    # Create weight tensors for grouped gemm with shape [num_groups, N, K]
+    weight_bf16 = (torch.randn((num_groups, N, K), dtype=torch.bfloat16, device="cuda") - 0.5) * 2
+
+    output_baseline = torch.empty([M, N], device="cuda", dtype=torch.bfloat16)
+    output_test = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+
+    # Create expert_ids tensor and fill with [0...num_group] value
+    input_gating = torch.randn(actual_M, num_groups, dtype=torch.float32, device="cuda")
+    _, topk_ids = fused_topk_torch_native(x, input_gating, topk=topk, renormalize=True)
+    a, a_scale, expert_ids, inv_perm, num_recv_tokens_per_expert = deepgemm_moe_permute(
+        aq=x,
+        aq_scale=None,
+        topk_ids=topk_ids,
+        local_num_experts=num_groups,
+        block_align=1,
+        block_k=K
+    )
+
+    def grouped_gemm_nopad_bf16():
+        with torch.inference_mode():
+            f1 = lambda: grouped_gemm_nt_bf16bf16bf16_nopad(
+                a, 
+                weight_bf16, 
+                output_baseline, 
+                expert_ids
+            )
+
+            f2 = lambda: grouped_gemm_nt_bf16bf16bf16_nopad(
+                a, 
+                weight_bf16,
+                output_test, 
+                expert_ids,
+                num_recv_tokens_per_expert, 
+                config
+            )
+
+            # Warmup runs
+            for _ in range(10):
+                f1()
+                f2()
+            ref_out = output_baseline
+            output = output_test
+
+            # Check that results match within tolerance
+            diff = torch.mean(torch.abs(output.to(torch.float32) - ref_out.to(torch.float32)))
+            rel_diff = diff / torch.mean(torch.abs(ref_out.to(torch.float32)))
+            if rel_diff >= 0.05:
+                # breakpoint()
+                print(f"Relative difference too large: {rel_diff}. "
+                    f"Shapes: x_q={x_q.shape}, weight={weight.shape}, "
+                    f"x_scale={x_scale.shape}, weight_scale={weight_scale.shape}")
+                return None
+
+            use_time_deep_gemm = triton.testing.do_bench(f2)
+
+            return 1000 * use_time_deep_gemm
+
+    return exec_tuning_iter(grouped_gemm_nopad_bf16, "run_grouped_gemm_nopad_bf16_test", DEBUG_MODE)
+
+
+def run_grouped_gemm_nopad_test_int8(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
     """
     运行分组GEMM测试
 
@@ -83,8 +165,8 @@ def run_grouped_gemm_nopad_test(M: int, K: int, N: int, config: Optional[Tuple] 
         aq_scale=x_scale,
         topk_ids=topk_ids,
         local_num_experts=num_groups,
-        block_align=block_align,
-        block_k=block_k
+        block_align=1,
+        block_k=K
     )
     
     def grouped_gemm_nopad():
@@ -125,10 +207,10 @@ def run_grouped_gemm_nopad_test(M: int, K: int, N: int, config: Optional[Tuple] 
 
             return 1000 * use_time_deep_gemm
 
-    return exec_tuning_iter(grouped_gemm_nopad, "run_grouped_gemm_nopad_test", DEBUG_MODE)
+    return exec_tuning_iter(grouped_gemm_nopad, "run_grouped_gemm_nopad_test_int8", DEBUG_MODE)
 
 
-def run_normal_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
+def run_normal_gemm_test_int8(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
     """
     运行普通的GEMM测试
 
@@ -206,10 +288,10 @@ def run_normal_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None,
 
             return 1000 * use_time_deep_gemm
         
-    return exec_tuning_iter(dense_gemm_normal, "run_normal_gemm_test", DEBUG_MODE)
+    return exec_tuning_iter(dense_gemm_normal, "run_normal_gemm_test_int8", DEBUG_MODE)
 
 
-def run_grouped_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
+def run_grouped_gemm_test_masked_int8(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
     """
     运行分组GEMM测试
 
@@ -261,7 +343,7 @@ def run_grouped_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None
         return ret
 
     # Create masked_m tensor and fill with M value
-    if 7168 in (K, N): # deepseek-R1
+    if ENABLE_GAMMA_SAMPLE: # deepseek-R1
         # gamma sample
         masked_m_all = grouped_masked_m_sample(expect_m=M, num_groups=num_groups, num_samples=total_cases)
     else:
@@ -305,7 +387,7 @@ def run_grouped_gemm_test(M: int, K: int, N: int, config: Optional[Tuple] = None
             use_time_deep_gemm = triton.testing.do_bench(f2) / total_cases
 
             return 1000 * use_time_deep_gemm
-    return exec_tuning_iter(group_gemm_masked, "run_grouped_gemm_test", DEBUG_MODE)
+    return exec_tuning_iter(group_gemm_masked, "run_grouped_gemm_test_masked_int8", DEBUG_MODE)
 
 
 def load_tuned_configs(filename: str = "best_gemm_configs.json") -> Dict[Tuple[int, int, int, int], Dict[str, Any]]:
@@ -370,6 +452,21 @@ def save_tuned_configs(configs: List[Dict[str, Any]], filename: str = "best_gemm
 
     print(f"Best configs also saved to {filename}")
 
+def dispatch_tune_method(num_groups:int, nopad: bool, dtype: str):
+    if dtype == "int8":
+        if num_groups == 1:
+            return run_normal_gemm_test_int8
+        elif nopad:
+            return run_grouped_gemm_nopad_test_int8
+        else:
+             return run_grouped_gemm_test_masked_int8
+    elif dtype == "bf16":
+        if nopad:
+             return run_grouped_gemm_nopad_test_bf16
+        else:
+            assert False, f"unsupport dtype bf16 with nopad=False"
+    else:
+        assert False, f"unsupport dtype {dtype}"
 
 def tune_gemm_config(
     m: int,
@@ -377,6 +474,7 @@ def tune_gemm_config(
     n: int,
     num_groups: int,
     nopad: bool,
+    dtype: str,
     tuned_configs: Optional[Dict[Tuple[int, int, int, int], Dict[str, Any]]]
     ) -> Optional[Dict[str, Any]]:
     """
@@ -397,31 +495,25 @@ def tune_gemm_config(
         return tuned_configs[config_key]
  
     print(f"Tuning configuration for M={m}, K={k}, N={n}, num_groups={num_groups}, nopad={nopad}...")
-    if num_groups == 1:
-        baseline_time = run_normal_gemm_test(m, k, n)
-        gemm_type = "dense"
-    elif nopad:
-        baseline_time = run_grouped_gemm_nopad_test(m, k, n, num_groups=num_groups)
-        gemm_type = "nopad"
-    else:
-        baseline_time = run_grouped_gemm_test(m, k, n, num_groups=num_groups)
-        gemm_type = "masked"
+    baseline_time = dispatch_tune_method(num_groups, nopad, dtype)(m, k, n, num_groups=num_groups)
     if baseline_time is None:
         print(f"Failed to get baseline time for M={m}, K={k}, N={n}, num_groups={num_groups}")
         return None
     
-    configs = get_pre_assert_configs(m, n, k, num_groups, get_num_sms(), gemm_type)
+    if dtype == "fp8":
+        torch_dtype=torch.float8_e4m3fn
+    elif dtype == "bf16":
+        torch_dtype=torch.bfloat16
+    else:
+        torch_dtype=torch.int8
+
+    configs = get_pre_assert_configs(m, n, k, num_groups, get_num_sms(), torch_dtype)
     best_time = baseline_time
     best_config = None
 
     for config in tqdm(configs):
         num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config = config
-        if num_groups == 1:
-            time = run_normal_gemm_test(m, k, n, config)
-        elif nopad:
-            time = run_grouped_gemm_nopad_test(m, k, n, config=config, num_groups=num_groups)
-        else:
-            time = run_grouped_gemm_test(m, k, n, config, num_groups)
+        time = dispatch_tune_method(num_groups, nopad, dtype)(m, k, n, config=config, num_groups=num_groups)
         if time is not None and time < best_time and (1 - (time / baseline_time)) > 0.01:
             best_time = time
             best_config = {
@@ -430,6 +522,7 @@ def tune_gemm_config(
                 "N": n,
                 "num_groups": num_groups,
                 "nopad": nopad,
+                "dtype": dtype,
                 "config": {
                     "num_min_sms": num_min_sms,
                     "best_block_m": best_block_m,
@@ -463,9 +556,9 @@ class BenchmarkWorker:
         self.seed = seed
 
     def tune(
-        self, m: int, k: int, n: int, num_groups: int, nopad: bool, tuned_configs
+        self, m: int, k: int, n: int, num_groups: int, nopad: bool, dtype: str, tuned_configs
     ) -> Dict[str, int]:
-        best_config = tune_gemm_config(m, k, n, num_groups, nopad, tuned_configs)
+        best_config = tune_gemm_config(m, k, n, num_groups, nopad, dtype, tuned_configs)
         if best_config is None:
             print(
                 f"Warning: No valid configuration found for M={m}, K={k}, N={n}, num_groups={num_groups}, nopad={nopad}"
