@@ -834,7 +834,7 @@ public:
                 data_type_str = "int8";
             }
 
-            dg_prof_params.set_paged_mqa_logits_params(data_type_str, batch_size, kNextN, kNumHeads, kHeadDim, reinterpret_cast<int*>(const_cast<uint32_t*>(context_lens)));
+            dg_prof_params.set_paged_mqa_logits_params(data_type_str, batch_size, kNextN, kNumHeads, kHeadDim, reinterpret_cast<int*>(const_cast<uint32_t*>(context_lens)), stream);
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
         cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);

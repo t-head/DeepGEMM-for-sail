@@ -31,7 +31,7 @@ void initialize_args(GemmType gemm_type, bool is_gemv, int m, int group, int* gr
     }
 }
 
-void set_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv, int num_heads, int head_dim) {
+void set_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv, int num_heads, int head_dim, cudaStream_t stream = 0) {
     op_name_ = "MqaLogits";
     add_argument("data_type");
     add_argument("seq_len_q");
@@ -45,6 +45,7 @@ void set_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv,
     add_params("num_heads", num_heads);
     add_params("head_dim", head_dim);
 
+    stream_ = stream;
     // Set default values (unused)
     m_ = seq_len_q;
     group_ = 1;
@@ -53,7 +54,7 @@ void set_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv,
     is_gemv_ = false;
 }
 
-void set_paged_mqa_logits_params(std::string data_type, int batch_size, int next_n, int num_heads, int head_dim, int* context_lens) {
+void set_paged_mqa_logits_params(std::string data_type, int batch_size, int next_n, int num_heads, int head_dim, int* context_lens, cudaStream_t stream = 0) {
     op_name_ = "PagedMqaLogits";
     add_argument("data_type");
     add_argument("batch_size");
@@ -67,6 +68,7 @@ void set_paged_mqa_logits_params(std::string data_type, int batch_size, int next
     add_params("num_heads", num_heads);
     add_params("head_dim", head_dim);
 
+    stream_ = stream;
     // Set values for distribution
     m_ = batch_size;
     group_ = batch_size;
@@ -129,32 +131,47 @@ std::string format() {
     return ss.str();
 }
 
-std::string distribution() {
+bool is_paged_mqa_logits() {
+    return op_name_ == "PagedMqaLogits";
+}
+
+void distribution() {
     cudaDeviceSynchronize();
 
     CHECK_CUDA(cudaGetLastError());
     std::ostringstream outDist;
-    outDist << ",distribution:[" ;
+    outDist << "[" ;
 
     // Check if this is for paged_mqa_logits (using batch_size and context_lens)
-    if (op_name_ == "PagedMqaLogits") {
+    if (is_paged_mqa_logits()) {
         // For paged_mqa_logits, batch_size is stored in group_ and context_lens in grouped_layout_
         int batch_size = group_;
+        int sum_context_len = 0;
         int* context_lens = grouped_layout_;
         int* tmp = new int[batch_size];
         CHECK_CUDA(cudaMemcpyAsync(tmp, context_lens, sizeof(int) * batch_size, cudaMemcpyDeviceToHost, stream_));
+        cudaStreamSynchronize(stream_);
 
         for (int i = 0; i < batch_size - 1; ++i) {
             outDist << tmp[i] << ",";
+            sum_context_len += tmp[i];
         }
+        sum_context_len += tmp[batch_size - 1];
         outDist << tmp[batch_size - 1] << "].";
         delete[] tmp;
+        // Dump average instead of distribution when batch size is large
+        if (batch_size > 64) {
+            add_params("avg_context_len", sum_context_len / batch_size);
+            return;
+        }
     } else {
         // Original gemm distribution logic
         bool need_bincount = (gemm_type_ == GemmType::GroupedContiguous || is_gemv_ );
         int size = need_bincount ? m_ : group_;
         int* tmp = new int[size];
         CHECK_CUDA(cudaMemcpyAsync(tmp, grouped_layout_, sizeof(int) * size, cudaMemcpyDeviceToHost, stream_));
+        cudaStreamSynchronize(stream_);
+
         if (need_bincount) {
             int* counts = new int[group_];
             for (int i = 0; i < group_; ++i) {
@@ -182,13 +199,14 @@ std::string distribution() {
 
     cudaDeviceSynchronize();
     CHECK_CUDA(cudaGetLastError());
-    return outDist.str().c_str();
+    add_params("distribution", outDist.str());
 }
 
 bool check_support_dump(){
     char *pEnv_dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
     static int target_device_id = pEnv_dump_device != nullptr ? std::stoi(pEnv_dump_device) : 0;
-    if (target_device_id != device_id_) {
+    // export PPU_LIB_DUMP_DEVICE=-1 to dump all devices
+    if (target_device_id != -1 && target_device_id != device_id_) {
         return false;
     }
     if (gemm_type_ == GemmType::DenseGemm) {
@@ -270,26 +288,25 @@ public:
         }
 
         if (start) {
-        std::string op_name = params.format();
-        if (show_params_) {
-            std::cout << op_name;
-            if (params.check_support_dump()) {
-                std::string distribution = params.distribution();
-                std::cout << distribution << std::endl;
+            if ((show_params_ || (params.is_paged_mqa_logits() && use_nvtx_)) && params.check_support_dump()) {
+                params.distribution();
             }
-            std::cout << std::endl;
-        }
-        if (use_nvtx_) {
-            nvtxEventAttributes_t eventAttrib = {0};
-            eventAttrib.version = NVTX_VERSION;
-            eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
-            eventAttrib.message.ascii = op_name.c_str();
-            nvtxDomainRangePushEx(domain_, &eventAttrib);
-        }
+            std::string op_name = params.format();
+            if (show_params_) {
+                std::cout << op_name << std::endl;
+            }
+            if (use_nvtx_) {
+                nvtxEventAttributes_t eventAttrib = {0};
+                eventAttrib.version = NVTX_VERSION;
+                eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+                eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
+                eventAttrib.message.ascii = op_name.c_str();
+                nvtxDomainRangePushEx(domain_, &eventAttrib);
+            }
         } else {
-        if (use_nvtx_) {
-            nvtxDomainRangePop(domain_);
-        }
+            if (use_nvtx_) {
+                nvtxDomainRangePop(domain_);
+            }
         } // if start
 
   }

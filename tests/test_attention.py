@@ -120,6 +120,30 @@ def test_paged_mqa_logits_loop():
     print("Passed\n")
 
 
+def test_nvtx():
+    print('Testing mvtx dump:')
+    import torch.cuda.nvtx as nvtx
+    nvtx.range_push("paged_mqa_logits")
+    qk_dtype_list = [torch.int8]
+    for qk_dtype in qk_dtype_list:
+        for batch_size, next_n in [(1, 1), (64, 1)]:
+            for num_heads, head_dim in [(32, 128), (64, 128)]:
+                if next_n == 2 and num_heads == 32: continue
+                for avg_kv in [8192]:
+                    # Call test_paged_mqa_logits with the parameters
+                    args = {
+                        'data_type': qk_dtype,
+                        'batch_size': batch_size,
+                        'next_n': next_n,
+                        'avg_context_len': avg_kv,
+                        'num_heads': num_heads,
+                        'head_dim': head_dim
+                    }
+                    set_acc_check(False)
+                    test_paged_mqa_logits(args)
+    nvtx.range_pop()
+    print("Passed\n")
+
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -127,6 +151,7 @@ if __name__ == '__main__':
     random.seed(0)
 
     # test_gemm_skip_head_mid()
+    # test_nvtx()
 
     test_mqa_logits_loop()
     test_paged_mqa_logits_loop()
