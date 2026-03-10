@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, get_paged_mqa_logits_tb_per_sm
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, get_paged_mqa_logits_tile
 
 def align(value, alignment):
     return (value + alignment - 1) // alignment * alignment
@@ -224,7 +224,7 @@ using atten_t = PagedAttention<ElementQK, ElementAcc, kNextN, kNumHeads, kHeadDi
 
 // Launch kernel
 atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, batch_size, logits_stride, block_table_stride,
-             (uint32_t*)context_lens, logits, (uint32_t*)block_table, (uint32_t*)schedule_meta, stream, num_sms);
+             (uint32_t*)context_lens, logits, (uint32_t*)block_table, (uint32_t*)schedule_meta, stream, num_sms, num_blocks);
 """
 
 
@@ -244,7 +244,7 @@ def get_paged_mqa_logits_metadata(context_lens: torch.Tensor,
     tb_per_cu = 1
     if metadata_extra is not None:
         next_n, num_heads, head_dim, element_size = metadata_extra
-        tb_per_cu = get_paged_mqa_logits_tb_per_sm(next_n, split_kv, num_heads, head_dim, element_size)
+        _, _, tb_per_cu = get_paged_mqa_logits_tile(next_n, split_kv, num_heads, head_dim, element_size)
     num_blocks = num_sms * tb_per_cu
     schedule_metadata = torch.empty((num_blocks + 1, 2), dtype=context_lens.dtype, device=context_lens.device)
 
@@ -348,9 +348,8 @@ def paged_mqa_logits_common(q: torch.Tensor,
     logits = torch.zeros((batch_size * next_n, aligned_max_context_len), dtype=torch.float, device=q.device)
     logits = logits[..., :max_context_len]
 
-    num_q_stages = 3
-    num_kv_stages = 3
     split_kv = num_math_warp_groups * block_kv
+    num_q_stages, num_kv_stages, _ = get_paged_mqa_logits_tile(next_n, split_kv, num_heads, head_dim, q.element_size())
     logits_stride = aligned_max_context_len
 
     # Construct TMAs
@@ -367,7 +366,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
 
     stream = torch.cuda.current_stream()
     args = (q, k, k_scales, weights, batch_size, logits_stride, block_table_stride, context_lens, logits,
-            block_table, schedule_meta, stream, schedule_meta_size - 1)
+            block_table, schedule_meta, stream, num_sms, schedule_meta_size - 1)
     runtime = jit_tuner.compile_and_tune(
         name='attention_paged_mqa_logits_' + ElementQK,
         keys={'ElementQK': ElementQK, 'ElementAcc' : ElementAcc,
@@ -380,7 +379,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
         arg_defs=(('q', q.dtype), ('k', k.dtype), ('k_scales', torch.float), ('weights', torch.float),
                   ('batch_size', int), ('logits_stride', int), ('block_table_stride', int), ('context_lens', torch.int32),
                   ('logits', torch.float), ('block_table', torch.int32), ('schedule_meta', torch.int32),
-                  ('stream', torch.cuda.Stream), ('num_sms', int)),
+                  ('stream', torch.cuda.Stream), ('num_sms', int), ('num_blocks', int)),
         template=template_paged,
         args=args,
         jit_include_dir='cutlass3'

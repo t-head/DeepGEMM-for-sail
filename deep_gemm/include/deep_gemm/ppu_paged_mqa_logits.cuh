@@ -302,6 +302,7 @@ public:
   using SmemLayoutScaleB = decltype(tile_to_shape(
       SmemLayoutAtomScale{},
       make_shape(Int<CTA_N>{}, Int<1>{}, Int<kNumQStages>{})));   // assert CTA_SCALE_K = 1, gs >= cta_k
+  static_assert(kNumQStages <= 2 && kNumKVStages >= 3, "q_stage <= 2 and kv_stage >= 3");
   static constexpr int WAPR_LIMIT_SFA = CTA_M / (32 * ScaleMsPerThread);
   static constexpr int WAPR_LIMIT_SFB = CTA_N / (32 * ScaleNsPerThread);
   static_assert(WAPR_LIMIT_SFA > 0 && WAPR_LIMIT_SFA <= (WarpOnM * WarpOnN / 2), "WAPR_LIMIT_SFA must > 0 and < half warps");
@@ -533,8 +534,9 @@ public:
     Tensor tCrSFB_copy_view       = smem_thr_copy_ScaleB.retile_D(tCrSB);
 
     constexpr bool enable_print = false;
+    bool thread_print = enable_print && cute::thread(0, 0);
 
-    if (enable_print) {
+    if (false) {
         params.print();
         print("gA: "); print(gA); print("\n");
         print("gB: "); print(gB); print("\n");
@@ -575,60 +577,75 @@ public:
     uint32_t warp_q_idx = warp_idx / WarpOnM;
     int warp_group_id = warp_idx / 8;
 
-    // Initialize `prev_q_idx` outside `[0, batch_size)` to indicate it was none
-    uint32_t q_idx_array[kNumKVStages];
+    uint32_t q_idx = scheduler.current_q_idx;
     uint32_t kv_idx_array[kNumKVStages];
+    kv_idx_array[kNumKVStages - 1] = UINT32_MAX;
     uint32_t num_kv; // num_kv is not used
-    uint32_t prev_q_idx_g2s = params.batch_size;
-    uint32_t prev_q_idx_s2r = params.batch_size;
     uint32_t smem_pipe_read_q = 0, smem_pipe_read_kv = 0;
     uint32_t smem_pipe_write_q = 0, smem_pipe_write_kv = 0;
 
+    auto load_q_g2s = [&](uint32_t q_idx) {
+        auto q_offset = q_idx * BLOCK_N;
+        tBgB.data() = tQgQ.data() + q_offset * kHeadDim;
+        tSFBgSFB.data() = tSFQgSFQ.data() + q_offset;
+        copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,0), tBsB(_,_,_,smem_pipe_write_q), warp_idx);
+        if (warp_idx < WAPR_LIMIT_SFB) {
+            copy(gmem_tiled_copy_scaleB, tSFBgSFB(_,_,_,0), tSFBsSFB(_,_,_,smem_pipe_write_q));
+        }
+        if (thread_print) {
+            printf("  copy_q q_idx = %d, q_offset = %d, stage = %d\n", q_idx, q_offset, smem_pipe_write_q);
+        }
+        smem_pipe_write_q = (smem_pipe_write_q + 1) % kNumQStages;
+    };
 
-    auto load_next_qk_g2s = [&]() {
-        uint32_t& q_idx = q_idx_array[smem_pipe_write_kv];
-        uint32_t& kv_idx = kv_idx_array[smem_pipe_write_kv];
-        uint32_t& prev_q_idx = prev_q_idx_g2s;
-        if (scheduler.fetch_next_task(q_idx, kv_idx, num_kv)) {
-            // Issue next AIU Q if exit
-            bool prefetch_q = (prev_q_idx != q_idx);
-            if (enable_print && prefetch_q) {
-                printf("load q = %d, prev_q_idx = %d, q_idx = %d\n", prefetch_q, prev_q_idx, q_idx);
-            }
-            if (prefetch_q) {
-                auto q_offset = q_idx * BLOCK_N;
-                tBgB.data() = tQgQ.data() + q_offset * kHeadDim;
-                tSFBgSFB.data() = tSFQgSFQ.data() + q_offset;
-                copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,0), tBsB(_,_,_,smem_pipe_write_q), warp_idx);
-                if (warp_idx < WAPR_LIMIT_SFB) {
-                    copy(gmem_tiled_copy_scaleB, tSFBgSFB(_,_,_,0), tSFBsSFB(_,_,_,smem_pipe_write_q));
-                }
-                if (enable_print) {
-                    printf("copy q_offset = %d, stage = %d\n", q_offset, smem_pipe_write_q);
-                }
-                smem_pipe_write_q = (smem_pipe_write_q + 1) % kNumQStages;
-            }
-
-            // Issue AIU KV
-            auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
-            tAgA.data() = tKgK.data() + kv_offset * kv_cache_stride_bytes;
-            copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), warp_idx);
-            if constexpr(load_kv_scale) {
-                tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * kv_cache_stride_bytes / 4;
-                if (sizeof(ElementQK) == 1 && warp_idx < WAPR_LIMIT_SFA) {
-                    copy(gmem_tiled_copy_scaleA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv));
-                }
-            }
-            if (enable_print) {
-                printf("copy kv_offset = %d, stage = %d\n", kv_offset, smem_pipe_write_kv);
+    auto load_kv_g2s = [&](uint32_t q_idx, uint32_t kv_idx) {
+        auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
+        tAgA.data() = tKgK.data() + kv_offset * kv_cache_stride_bytes;
+        copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), warp_idx);
+        if constexpr(load_kv_scale) {
+            tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * kv_cache_stride_bytes / 4;
+            if (sizeof(ElementQK) == 1 && warp_idx < WAPR_LIMIT_SFA) {
+                copy(gmem_tiled_copy_scaleA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv));
             }
         }
-        prev_q_idx = q_idx;
+        if (thread_print) {
+            printf("  copy_k q_idx = %d, kv_idx = %d, kv_offset = %d, stage = %d\n", q_idx, kv_idx, kv_offset, smem_pipe_write_kv);
+        }
+    };
+
+    auto load_q_s2r = [&]() {
+        copy(smem_tiled_copy_B, tCsB(_,_,_,smem_pipe_read_q), tCrB_copy_view);
+        if (thread_print) {
+            printf("    copy q to vreg, q_stage_idx = %d,\n", smem_pipe_read_q);
+        }
+
+        // Read weights
+        float * smem_weights_staged = sSFB(_,_,smem_pipe_read_q).data().get() + warp_q_idx * kNumHeads;
+        #pragma unroll
+        for (uint32_t j = 0; j < kNumHeads / 4; ++ j) {
+            #if __HGGC_ARCH__ == 150
+                weights[j] = ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
+            #else
+                weights[j] = ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) * 4 + lane_idx % 4);
+            #endif
+        }
+        smem_pipe_read_q = (smem_pipe_read_q + 1) % kNumQStages;
+    };
+
+    auto load_next_qk_g2s = [&](bool load_q) {
+        uint32_t q_idx;
+        uint32_t& kv_idx = kv_idx_array[smem_pipe_write_kv];
+        if (scheduler.fetch_next_task(q_idx, kv_idx, num_kv)) {
+            if (load_q) load_q_g2s(q_idx);
+            load_kv_g2s(q_idx, kv_idx);
+        }
         smem_pipe_write_kv = (smem_pipe_write_kv + 1) % kNumKVStages;
+        if (thread_print) printf("cp_async commit\n");
         cp_async_fence();
     };
-    while (smem_pipe_write_kv < kNumKVStages - 1) {
-        load_next_qk_g2s();
+    // load qk
+    for (int i = 0; i < kNumKVStages - 1; i++) {
+        load_next_qk_g2s(i == 0);
     }
     // wait AIU Q and first K
     cp_async_wait<kNumKVStages - 2>();
@@ -636,50 +653,38 @@ public:
 
     while (true) {
         // Get current Q and KV index
-        const uint32_t& q_idx = q_idx_array[smem_pipe_read_kv];
         const uint32_t& kv_idx = kv_idx_array[smem_pipe_read_kv];
-        uint32_t& prev_q_idx = prev_q_idx_s2r;
 
         if (scheduler.is_last_task(q_idx, kv_idx)) break;
-
-        load_next_qk_g2s();
-
-        if (enable_print) {
-            printf("prev_q_idx = %d, q_idx = %d, kv_idx = %d\n", prev_q_idx, q_idx, kv_idx);
+        if (thread_print) {
+            printf("q_idx = %d, kv_idx = %d\n", q_idx, kv_idx);
         }
 
         // Read weights if current Q changes
-        if (prev_q_idx != q_idx) {
-            // load Q to vreg
-            copy(smem_tiled_copy_B, tCsB(_,_,_,smem_pipe_read_q), tCrB_copy_view);
-            if (enable_print) {
-                printf("    copy q to vreg, q_stage_idx = %d,\n", smem_pipe_read_q);
+        if (kv_idx == 0 || kv_idx_array[kNumKVStages - 1] == UINT32_MAX) {
+            if constexpr(kNumQStages > 1) {
+                if (scheduler.exist_q_idx(q_idx + 1)) {
+                    load_q_g2s(q_idx + 1);
+                }
+                cp_async_fence();
             }
-
-            // Read weights
-            float * smem_weights_staged = sSFB(_,_,smem_pipe_read_q).data().get() + warp_q_idx * kNumHeads;
-            #pragma unroll
-            for (uint32_t j = 0; j < kNumHeads / 4; ++ j) {
-#if __HGGC_ARCH__ == 150
-                weights[j] = ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
-#else
-                weights[j] = ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) * 4 + lane_idx % 4);
-#endif
+            load_q_s2r();
+            if constexpr(kNumQStages == 1) {
+                __syncthreads();
+                if (scheduler.exist_q_idx(q_idx + 1)) {
+                    load_q_g2s(q_idx + 1);
+                }
+                cp_async_fence();
             }
-            smem_pipe_read_q = (smem_pipe_read_q + 1) % kNumQStages;
         }
-        prev_q_idx = q_idx;
+        load_next_qk_g2s(false);
 
         // load V to VREG
         Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read_kv);
         copy(smem_tiled_copy_A, tCsA_p, tCrA_copy_view);
-        if (enable_print) {
+        if (thread_print) {
             printf("    copy kv to vreg, stage = %d,\n", smem_pipe_read_kv);
         }
-
-        // compute
-        cute::gemm(tiled_mma, accum, tCrA, tCrB, accum);
-
         // load scale from tsm to vreg before __ppu_barrier_arrive
         static constexpr uint32_t kMmaIterM = MmaIterM{};
         float scale_kv_array[kMmaIterM * 2];
@@ -689,6 +694,9 @@ public:
             scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
             scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
         }
+
+        // compute
+        cute::gemm(tiled_mma, accum, tCrA, tCrB, accum);
 
         static constexpr uint32_t kNumAccumPerMma = 8;
         static constexpr uint32_t kAccumStrideN16 = kNumAccumPerMma * kMmaIterM;
@@ -719,11 +727,11 @@ public:
                     sum[k] += transform(k, n);
             }
 #if __HGGC_ARCH__ == 150
-            float v_0 = (sum[0] + sum[1] + sum[4] + sum[5]) * scale_kv_0;
-            float v_1 = (sum[2] + sum[3] + sum[6] + sum[7]) * scale_kv_1;
+            float v_0 = sum[0] + sum[1] + sum[4] + sum[5];
+            float v_1 = sum[2] + sum[3] + sum[6] + sum[7];
 #else
-            float v_0 = (sum[0] + sum[1] + sum[2] + sum[3]) * scale_kv_0;
-            float v_1 = (sum[4] + sum[5] + sum[6] + sum[7]) * scale_kv_1;
+            float v_0 = sum[0] + sum[1] + sum[2] + sum[3];
+            float v_1 = sum[4] + sum[5] + sum[6] + sum[7];
 #endif
 
             // Inter-thread reduction
@@ -736,12 +744,11 @@ public:
 
             // Store into the global memory
             // NOTES: we have redundant writes here, consider more carefully
-
             auto kv_offset = (q_idx * kNextN + warp_q_idx) * params.logits_stride + kv_idx * BLOCK_KV;
-            params.logits[kv_offset + warp_offset + mma_offset + v_0_offset] = v_0;
-            params.logits[kv_offset + warp_offset + mma_offset + v_1_offset] = v_1;
+            params.logits[kv_offset + warp_offset + mma_offset + v_0_offset] = v_0 * scale_kv_0;
+            params.logits[kv_offset + warp_offset + mma_offset + v_1_offset] = v_1 * scale_kv_1;
 
-            if (enable_print) {
+            if (thread_print) {
                 printf("        sum[0] = %.4f, sum[1] = %f, sum[2] = %f, sum[3] = %f, sum[4] = %.4f, sum[5] = %f, sum[6] = %f, sum[7] = %f\n",
                     sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6], sum[7]);
                 printf("        v_0 = %.4f, q_idx = %d, warp_q_idx = %d, kMmaIterM = %d, kAccumStrideN16 = %d\n",
@@ -749,8 +756,8 @@ public:
             }
         }
         smem_pipe_read_kv = (smem_pipe_read_kv + 1) % kNumKVStages;
+        if (kv_idx_array[smem_pipe_read_kv] == 0) q_idx++;
 
-        // wait for next K, load next K to vreg
         cp_async_wait<kNumKVStages - 2>();
         __syncthreads();
 
@@ -792,7 +799,7 @@ public:
                     const uint64_t logits_stride, const uint64_t block_table_stride,
                     const uint32_t* context_lens, float* logits,
                     const uint32_t* block_table, const uint32_t* schedule_meta,
-                    cudaStream_t stream, int num_sms) {
+                    cudaStream_t stream, int num_sms, int num_blocks) {
 
         using AttnKernel = cutlass::gemm::kernel::Sm80PagedMqaLogits<ElementQK, ElementAcc, kNextN, kNumHeads, kHeadDim, BLOCK_KV, kNumQStages, kNumKVStages, SPLIT_KV>;
 
@@ -811,10 +818,13 @@ public:
         StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)SHAPE_M, (int)SHAPE_K, 1));
         StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape((int)SHAPE_N, (int)SHAPE_K, 1));
         int max_blocks_per_cu = compute_occupancy_for_kernel<AttnKernel>();
+        if (num_sms * max_blocks_per_cu  != num_blocks) {
+            printf("Warning: num_blocks(%d) should equal to num_sms(%d) * max_blocks_per_cu(%d) = %d\n", num_blocks, num_sms, max_blocks_per_cu, num_sms * max_blocks_per_cu);
+        }
 
         cutlass::KernelHardwareInfo hw_info;
         hw_info.device_id = 0;
-        hw_info.sm_count = num_sms;
+        hw_info.sm_count = num_blocks;
 
         typename AttnKernel::Arguments arguments{ptr_q, ptr_k, k_scales, weights, batch_size, logits_stride, block_table_stride,
                                                  context_lens, logits, block_table, schedule_meta, stride_A, stride_B, hw_info};
@@ -840,8 +850,6 @@ public:
         cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
-        int max_active_tb_num = max_blocks_per_cu;
-        const int threadblock_count = num_sms;
         char *pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
             cudaFuncAttributes attr;
@@ -854,7 +862,7 @@ public:
             printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n",
                 BLOCK_M, BLOCK_N, WARP_M, WARP_N, kNumQStages, kNumKVStages);
 
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
+            printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d\n", num_sms, max_blocks_per_cu, num_blocks);
             printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
             std::cout << "block = " << block << std::endl;
             std::cout << "grid = " << grid << std::endl;

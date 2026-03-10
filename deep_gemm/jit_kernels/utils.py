@@ -379,16 +379,41 @@ def get_search_space(d: torch.dtype, gemm_type : str, m:int=0, n:int=0, k:int=0)
 
     return tile_list_rtn
 
-def get_paged_mqa_logits_tb_per_sm(next_n, split_kv, num_heads, head_dim, datasize):
-    block_m = split_kv
-    block_n = next_n * num_heads
-    block_k = head_dim
-    stage_q = 3
-    stage_k = 3
-    smem_q = block_n * block_k * stage_q * datasize
-    smem_k = block_m * block_k * stage_k * datasize
-    smem_k_scale = block_m * stage_k * 4
-    smem_weight = block_n * stage_q * 4
-    smem = smem_q + smem_k + smem_k_scale + smem_weight
-    tb_per_sm = 262144 // smem
-    return tb_per_sm
+@functools.lru_cache(maxsize=4096)
+def get_paged_mqa_logits_tile(next_n, split_kv, num_heads, head_dim, datasize):
+    def get_smem_tb_per_sm(stage_q, stage_k):
+        block_m = split_kv
+        block_n = next_n * num_heads
+        block_k = head_dim
+        smem_q = block_n * block_k * stage_q * datasize
+        smem_k = block_m * block_k * stage_k * datasize
+        smem_k_scale = block_m * stage_k * 4
+        smem_weight = block_n * stage_q * 4
+        smem = smem_q + smem_k + smem_k_scale + smem_weight
+        smem_tb_per_sm = 262144 // smem
+        return smem_tb_per_sm
+
+    def get_vreg_tb_per_sm():
+        assert next_n == 1 and split_kv == 64 and head_dim == 128 and (num_heads == 32 or num_heads == 64)
+        vreg_base = 24
+        if num_heads == 32 and datasize == 1:
+            vreg_weights, vreg_acc, vreg_A, vreg_B = 8, 16, 16, 32
+        elif num_heads == 64 and datasize == 1:
+            vreg_weights, vreg_acc, vreg_A, vreg_B = 16, 32, 16, 64
+        elif num_heads == 32 and datasize == 2:
+            vreg_weights, vreg_acc, vreg_A, vreg_B = 8, 16, 32, 64
+        elif num_heads == 64 and datasize == 2:
+            vreg_weights, vreg_acc, vreg_A, vreg_B = 16, 32, 32, 128
+        vreg = vreg_base + vreg_weights + vreg_acc + vreg_A + vreg_B
+        num_threads = 128
+        warps_per_we = 512 // vreg
+        num_warps = 8 * warps_per_we
+        vreg_tb_per_sm = num_warps // (num_threads // 32)
+        return vreg_tb_per_sm
+
+    tile_list = [(2, 3, get_smem_tb_per_sm(2, 3))]
+    if next_n == 1 and split_kv == 64 and head_dim == 128 and (num_heads == 32 or num_heads == 64):
+        tile_list.append((1, 3, min(get_smem_tb_per_sm(1, 3), get_vreg_tb_per_sm())))
+    tile = max(tile_list, key=lambda x: (x[2], x[0]))
+    # print(tile_list, tile)
+    return tile
