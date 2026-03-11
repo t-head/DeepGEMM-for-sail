@@ -435,7 +435,7 @@ public:
   static constexpr uint32_t NumMmaWarpGroups = 1;
   static constexpr uint32_t N_PREFETCH_CACHELINE = cute::ceil_div(TileScheduler::kNumGroups, 32); // numGroups * sizeof(int) / 128 Byte = cacheline
   static constexpr int N_EXPAND = KernelAiuMultistageOnN::N_EXPAND;
-  static constexpr int Stages = TileScheduler::SHAPE_K == 128 ? 1 :DispatchPolicy::Stages;
+  static constexpr int Stages = TileScheduler::SHAPE_K < BlockK * DispatchPolicy::Stages ? TileScheduler::SHAPE_K / BlockK : DispatchPolicy::Stages;
 
   // Kernel level shared memory storage
   struct SharedStorage {
@@ -917,8 +917,7 @@ public:
             copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
             copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
 
-            // CUTLASS_PRAGMA_UNROLL
-            CUTLASS_PRAGMA_NO_UNROLL
+            CUTLASS_PRAGMA_UNROLL
             for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
               auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
               // Transform before compute
@@ -932,8 +931,10 @@ public:
               // Commit the smem for smem_pipe_read
               if constexpr (Stages > 1) {
                 cp_async_wait<Stages-2>();
-                __syncthreads();
+              } else {
+                cp_async_wait<Stages-1>();
               }
+              __syncthreads();
               if (k_tile_count > 0 || n_iter < N_EXPAND - 1) {
                 if (k_tile_iter >= K_TILE_COUNT) {
                   if (n_iter < N_EXPAND - 1) {
@@ -1057,7 +1058,8 @@ public:
     using LayoutSFA           = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
     using LayoutSFB           = decltype(ScaleConfig::deduce_layoutSFB());                     // Layout type for SFB matrix operand
 
-    static constexpr bool kUseNStageKernel = SHAPE_K <= 512 && (SHAPE_N % (BLOCK_N * KernelAiuMultistageOnN::N_EXPAND) == 0) && (BLOCK_K == 128) && kNumStages == 2;
+    static constexpr bool kUseNStageKernel = SHAPE_K <= 512 && (SHAPE_N % (BLOCK_N * KernelAiuMultistageOnN::N_EXPAND) == 0)
+                                              && (BLOCK_K == 128) && (SHAPE_K % BLOCK_K == 0) && kNumStages == 2;
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
@@ -1106,7 +1108,7 @@ public:
                     int32_t shape_m, uint32_t expected_m,
                     cudaStream_t stream,
                     int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
-        constexpr int N_EXPAND = kUseNStageKernel ? 4 : 1;
+        constexpr int N_EXPAND = kUseNStageKernel ? KernelAiuMultistageOnN::N_EXPAND : 1;
         using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, kNumGroups>;
         
         using GemmKernel = typename deep_gemm::DeepGemmUniversal<
