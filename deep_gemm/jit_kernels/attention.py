@@ -231,7 +231,7 @@ atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, batch_
 def get_paged_mqa_logits_metadata(context_lens: torch.Tensor,
                                   block_kv: int,
                                   num_sms: int,
-                                  q: torch.Tensor = None):
+                                  metadata_extra: tuple = None):
     batch_size = context_lens.shape[0]
     assert(context_lens.dtype == torch.int32)
     assert(context_lens.is_contiguous())
@@ -242,9 +242,9 @@ def get_paged_mqa_logits_metadata(context_lens: torch.Tensor,
     split_kv = block_kv * num_math_warpgroups
 
     tb_per_cu = 1
-    if q is not None:
-        batch_size, next_n, num_heads, head_dim = q.shape
-        tb_per_cu = get_paged_mqa_logits_tb_per_sm(next_n, split_kv, num_heads, head_dim, q.element_size())
+    if metadata_extra is not None:
+        next_n, num_heads, head_dim, element_size = metadata_extra
+        tb_per_cu = get_paged_mqa_logits_tb_per_sm(next_n, split_kv, num_heads, head_dim, element_size)
     num_blocks = num_sms * tb_per_cu
     schedule_metadata = torch.empty((num_blocks + 1, 2), dtype=context_lens.dtype, device=context_lens.device)
 

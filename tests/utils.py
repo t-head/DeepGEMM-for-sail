@@ -1110,14 +1110,14 @@ def generate_cp_test_data(seq_len, seq_len_kv):
         ke[i + chunk_size] = (cp_size * 2 - 1 - cp_id) * chunk_size + i
     return ks, ke
 
-def ref_get_metadata(context_lens: torch.Tensor, block_kv: int, num_sms: int, q: torch.Tensor = None):
+def ref_get_metadata(context_lens: torch.Tensor, block_kv: int, num_sms: int, metadata_extra: tuple = None):
     num_math_warpgroups = 1
     split_kv = block_kv * num_math_warpgroups
     tb_per_cu = 1
-    if q is not None:
+    if metadata_extra is not None:
         from deep_gemm.jit_kernels.utils import get_paged_mqa_logits_tb_per_sm
-        batch_size, next_n, num_heads, head_dim = q.shape
-        tb_per_cu = get_paged_mqa_logits_tb_per_sm(next_n, split_kv, num_heads, head_dim, q.element_size())
+        next_n, num_heads, head_dim, element_size = metadata_extra
+        tb_per_cu = get_paged_mqa_logits_tb_per_sm(next_n, split_kv, num_heads, head_dim, element_size)
     num_splits = num_sms * tb_per_cu
 
     batch_size = context_lens.size(0)
@@ -1295,12 +1295,14 @@ def test_paged_mqa_logits(args) -> None:
         ref_logits = ref_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len)
 
     if data_type == torch.bfloat16:
-        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), q)
+        metadata_extra = (next_n, num_heads, head_dim, q.element_size())
+        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra)
         logits = deep_gemm.bf16_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
     elif data_type == torch.float8_e4m3fn:
         q_fp8 = q.to(torch.float8_e4m3fn)
         kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
-        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), q_fp8)
+        metadata_extra = (next_n, num_heads, head_dim, q_fp8.element_size())
+        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra)
         logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
     elif data_type == torch.int8:
         q_int8, q_int8_scale = per_token_cast_to_int8(q.reshape(batch_size * next_n * num_heads, head_dim))
@@ -1308,7 +1310,8 @@ def test_paged_mqa_logits(args) -> None:
         q_int8_scale = q_int8_scale.reshape(batch_size * next_n, num_heads)
         weights_int8 = weights * q_int8_scale
         kv_cache_int8 = kv_cache_cast_to_int8(kv_cache)
-        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), q_int8)
+        metadata_extra = (next_n, num_heads, head_dim, q_int8.element_size())
+        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra)
         logits = deep_gemm.int8_paged_mqa_logits(q_int8, kv_cache_int8, weights_int8, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
     else:
         print("ERROR: Unsupported dtype for Paged MQA Logits, please check!")
