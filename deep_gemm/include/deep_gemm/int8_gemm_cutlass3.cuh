@@ -481,7 +481,7 @@ public:
       Tensor tCrSA = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSA(_,_,Int<0>{})));
       Tensor tCrSB = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSB_copy(_,_,Int<0>{})));
 
-      using SmemCopyAtomScale = Copy_Atom<cute::DefaultCopy, ElementScale>;
+      using SmemCopyAtomScale = Copy_Atom<cute::AutoVectorizingCopyWithAssumedAlignment<cutlass::sizeof_bits<ElementScale>::value>, ElementScale>;
       auto smem_tiled_copy_ScaleA   = make_tiled_copy_C(SmemCopyAtomScale{}, tiled_mma);
       auto smem_thr_copy_ScaleA     = smem_tiled_copy_ScaleA.get_thread_slice(thread_idx);
       Tensor tCsSA                  = smem_thr_copy_ScaleA.partition_S(sSA);
@@ -1064,7 +1064,7 @@ struct CollectiveMma<
     Tensor tCrSA = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSA(_,_,Int<0>{})));
     Tensor tCrSB = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSB_copy(_,_,Int<0>{})));
 
-    using SmemCopyAtomScale = Copy_Atom<cute::DefaultCopy, ElementScale>;
+    using SmemCopyAtomScale = Copy_Atom<cute::AutoVectorizingCopyWithAssumedAlignment<cutlass::sizeof_bits<ElementScale>::value>, ElementScale>;
     auto smem_tiled_copy_ScaleA   = make_tiled_copy_C(SmemCopyAtomScale{}, tiled_mma);
     auto smem_thr_copy_ScaleA     = smem_tiled_copy_ScaleA.get_thread_slice(thread_idx);
     Tensor tCsSA                  = smem_thr_copy_ScaleA.partition_S(sSA);
