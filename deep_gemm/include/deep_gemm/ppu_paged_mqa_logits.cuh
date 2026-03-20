@@ -818,9 +818,6 @@ public:
         StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)SHAPE_M, (int)SHAPE_K, 1));
         StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape((int)SHAPE_N, (int)SHAPE_K, 1));
         int max_blocks_per_cu = compute_occupancy_for_kernel<AttnKernel>();
-        if (num_sms * max_blocks_per_cu  != num_blocks) {
-            printf("Warning: num_blocks(%d) should equal to num_sms(%d) * max_blocks_per_cu(%d) = %d\n", num_blocks, num_sms, max_blocks_per_cu, num_sms * max_blocks_per_cu);
-        }
 
         cutlass::KernelHardwareInfo hw_info;
         hw_info.device_id = 0;
@@ -866,6 +863,9 @@ public:
             printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
             std::cout << "block = " << block << std::endl;
             std::cout << "grid = " << grid << std::endl;
+            if (num_sms * max_blocks_per_cu  != num_blocks) {
+                printf("Warning: num_blocks(%d) should equal to num_sms(%d) * max_blocks_per_cu(%d) = %d\n", num_blocks, num_sms, max_blocks_per_cu, num_sms * max_blocks_per_cu);
+            }
         }
     }
 };

@@ -470,7 +470,7 @@ public:
         }
 
         for (int i = 0; i < size(tSFBpSFB); ++i) {
-            tSFBpSFB(i) = (get<0>(tSFBcSFB(i)) + block_q_idx * kNumHeads) < N;
+            tSFBpSFB(i) = (get<0>(tSFBcSFB(i)) + block_q_idx * BLOCK_Q * kNumHeads) < N;
         }
 
         uint32_t current_stage_kv = 0;
