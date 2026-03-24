@@ -136,6 +136,8 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
                                '-mllvm', '-ppu-pref-fma-reuse=true',
                                '-mllvm', '-ppu-pref-mma-reuse=true',
                                '-mllvm', '-regalloc=pbqp'])
+        if 'w4a16' in name.lower():
+            nvcc_flags.extend(['-mllvm', '-sort-copy-before-coalesce'])
 
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi', '-fconcepts']
     flags = [*nvcc_flags, f'--compiler-options={",".join(cxx_flags)}']

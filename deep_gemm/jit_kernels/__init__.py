@@ -29,6 +29,11 @@ from .m_grouped_gemm_fp4 import (
     m_grouped_gemm_fp4_fp4_bf16_nt_masked,
     m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
 )
+from .m_grouped_gemm_w4a16 import (
+    m_grouped_gemm_w4a16_masked,
+    m_grouped_gemm_w4a16_nopad,
+    m_grouped_gemm_w4a16_fused,
+)
 from .utils import (
     ceil_div, set_num_sms, get_num_sms, get_case_id,
     get_col_major_tma_aligned_tensor,

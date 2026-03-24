@@ -352,7 +352,7 @@ def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=Fals
 
 
 
-def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: int, topk:int, d: torch.dtype, quant_type: str = "block") -> \
+def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: int, topk:int, d: torch.dtype, quant_type: str = "block", group_size = 32) -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
 
@@ -364,6 +364,10 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
 
     x = torch.randn((num_token, k), device=tensor_device, dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
+    if d == 'w4a16':
+        assert quant_type == 'group'
+        # use y_dequant instead of origin y
+        y, y_quant, y_scale = quant_w4a16(y, group_size)
 
     out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
     ref_out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
@@ -416,11 +420,13 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
         else:
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    elif d == 'w4a16':
+        return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
 
-def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: torch.dtype, distribution: str, alignment: int, quant_type: str = "block") -> \
+def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, distribution: str, alignment: int, quant_type: str = "block", group_size = 32) -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
     group_ms = construct_group_m_list(distribution, num_groups, m)
@@ -428,6 +434,10 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: tor
     m_indices = torch.empty(m, device=tensor_device, dtype=torch.int32)
     x = torch.randn((m, k), device=tensor_device, dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
+    if d == 'w4a16':
+        assert quant_type == 'group'
+        # use y_dequant instead of origin y
+        y, y_quant, y_scale = quant_w4a16(y, group_size)
 
     out = torch.empty((m, n), device=tensor_device, dtype=torch.bfloat16)
     ref_out = torch.randn((m, n), device=tensor_device, dtype=torch.bfloat16)
@@ -469,6 +479,8 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: tor
         else:
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return m, (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    elif d == 'w4a16':
+        return m, x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
@@ -790,9 +802,9 @@ def read_numbers_from_file(file_path):
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False, "quant_type": "block"}
-    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk"]
+    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size"]
     supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits"]
-    supported_quant_type = ["block", "channel"]
+    supported_quant_type = ["block", "channel", "group"]
     import re
     dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|Normal|MqaLogits|PagedMqaLogits),(.+)"
     pattern = re.compile(dg_params)
@@ -879,6 +891,8 @@ def convert_data_type_to_dtype(data_type):
         return torch.uint8
     elif data_type in ["fp8", "torch.float8_e4m3fn"]:
         return torch.float8_e4m3fn
+    elif data_type in ["w4a16"]:
+        return "w4a16"
     else:
         print(f"ERROR: Unsupported dtype: {data_type}, please check!")
         exit(1)
@@ -1094,11 +1108,14 @@ def test_m_grouped_gemm_fused(args) -> None:
     print('Testing grouped fuse permute GEMM:')
     num_groups, n, k, d = args['groups'], args['n'], args['k'], args['data_type']
     num_token, topk = args['num_token'], args['topk']
-    quant_type = args['quant_type'] if 'quant_type' in args else 'block'
+    quant_type = args.get('quant_type', 'block')
+    group_size = args.get('group_size', 32)
     if use_ppu:
-        x, y, m_indices, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type)
+        x, y, m_indices, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type, group_size)
         if d == torch.bfloat16:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_indices)
+        elif d == 'w4a16':
+            deep_gemm.m_grouped_gemm_w4a16_fused(x, y, out, m_indices)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
@@ -1120,16 +1137,22 @@ def test_m_grouped_gemm_fused(args) -> None:
 def test_m_grouped_gemm_nopad(args) -> None:
     print('Testing grouped nopad GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
-    quant_type = args['quant_type'] if 'quant_type' in args else 'block'
-    print(f"test_m_grouped_gemm_nopad->test_func: GroupedNoPad,data_type:{d},groups:{num_groups},m:{m},n:{n},k:{k},quant_type:{quant_type}")
+    UT = f"test_m_grouped_gemm_nopad->test_func: GroupedNoPad,data_type:{d},groups:{num_groups},m:{m},n:{n},k:{k}"
+    quant_type = args.get('quant_type', 'block')
+    group_size = args.get('group_size', 32)
+    if quant_type in args: UT += f",quant_type:{quant_type}"
+    if group_size in args: UT += f",group_size:{group_size}"
+    print(UT)
     if use_ppu:
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1, quant_type=quant_type)
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1, quant_type=quant_type, group_size=group_size)
         if d == torch.bfloat16:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
         elif d == torch.int8:
             deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
         elif d == torch.float8_e4m3fn:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
+        elif d == 'w4a16':
+            deep_gemm.m_grouped_gemm_w4a16_nopad(x, y, out, m_indices)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)

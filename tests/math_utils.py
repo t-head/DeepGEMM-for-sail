@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from typing import Tuple, Iterable
 
 
@@ -97,3 +98,92 @@ def per_token_cast_to_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
     x_int8 = x_normalized.round().clamp(-128, 127).to(torch.int8)
     x_int8 = x_int8.view(m, -1)
     return x_int8, (x_amax / 127.0).view(m, -1)
+
+
+def _get_perms():
+    perm = []
+    for i in range(32):
+        perm1 = []
+        col = i // 4
+        for block in [0, 1]:
+            for row in [
+                2 * (i % 4),
+                2 * (i % 4) + 1,
+                2 * (i % 4 + 4),
+                2 * (i % 4 + 4) + 1
+            ]:
+                perm1.append(16 * row + col + 8 * block)
+        for j in range(4):
+            perm.extend([p + 256 * j for p in perm1])
+
+    perm = np.array(perm)
+    interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
+    perm = perm.reshape((-1, 8))[:, interleave].ravel()
+    perm = torch.from_numpy(perm)
+    scale_perm = []
+    for i in range(8):
+        scale_perm.extend([i + 8 * j for j in range(8)])
+    scale_perm_single = []
+    for i in range(4):
+        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
+    return perm, scale_perm, scale_perm_single
+
+_perm, _scale_perm, _scale_perm_single = _get_perms()
+
+
+def quant_w4a16(y, groupsize):
+    e, n, k = y.shape
+    tile = 16
+    maxq = 2 ** 4 - 1
+    assert k % groupsize == 0
+    assert k % tile == 0 and n % tile == 0
+    assert y.dtype in [torch.half, torch.bfloat16]
+
+    all_refs, all_qs, all_scales = [], [], []
+
+    for i in range(e):
+        w = y[i].T.contiguous()
+        wk, wn = w.shape
+
+        w = w.reshape((-1, groupsize, wn))
+        w = w.permute(1, 0, 2)
+        w = w.reshape((groupsize, -1))
+
+        s = torch.max(torch.abs(w), 0, keepdim=True)[0]
+        s *= 2 / maxq
+        w = torch.round(w / s).int()
+        w += (maxq + 1) // 2
+        w = torch.clamp(w, 0, maxq)
+        ref = (w - (maxq + 1) // 2) * s
+
+        def reshape(t):
+            t = t.reshape((groupsize, -1, wn))
+            t = t.permute(1, 0, 2)
+            t = t.reshape((wk, wn)).contiguous()
+            return t
+
+        ref = reshape(ref)
+        w = reshape(w)
+        s = s.reshape((-1, wn)).contiguous()
+
+        s = s.reshape((-1, len(_scale_perm)))[:, _scale_perm]
+        s = s.reshape((-1, wn)).contiguous()
+
+        w = w.reshape((wk // tile, tile, wn // tile, tile))
+        w = w.permute((0, 2, 1, 3))
+        w = w.reshape((wk // tile, wn * tile))
+        w = w.reshape((-1, _perm.numel()))[:, _perm].reshape(w.shape)
+
+        w = w.to(torch.int32)
+        q = torch.zeros((w.shape[0], w.shape[1] // 8), dtype=torch.int32, device=w.device)
+        for j in range(8):
+            q |= w[:, j::8] << (4 * j)
+
+        all_refs.append(ref.T)
+        all_qs.append(q)
+        all_scales.append(s)
+
+    refs = torch.stack(all_refs)
+    qs = torch.stack(all_qs)
+    scales = torch.stack(all_scales)
+    return refs, qs, scales
