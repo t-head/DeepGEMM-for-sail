@@ -54,6 +54,7 @@ template <
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
   class TileScheduler_,
+  bool hasBias = false,
   bool kUseNStageKernel = false,
   bool kEnableSboOverlap = false
 >
@@ -63,13 +64,15 @@ template <
   class ProblemShape_,
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
-  class TileScheduler_
+  class TileScheduler_,
+  bool hasBias_
 >
 class DeepGemmUniversal <
   ProblemShape_,
   CollectiveMainloop_,
   CollectiveEpilogue_,
   TileScheduler_,
+  hasBias_,
   true,
   false
 > {
@@ -308,10 +311,11 @@ class DeepGemmUniversal <
     int warp_m_idx = warp_idx % warp_on_m;
     int warp_n_idx = warp_idx / warp_on_m;
 
-    if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
       // group is small 8|16, just prefetch one cacheline
       __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
-    } else if (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+    }
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
       // each warp prefetch one cacheline
       if (warp_idx < N_PREFETCH_CACHELINE) {
         __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx << 5)));
@@ -674,7 +678,9 @@ class DeepGemmUniversal <
         }
         auto params_epilogue_local = params.epilogue;
         params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
-        params_epilogue_local.ptr_C += deep_scheduler.curr_offset_mxfp4_c();
+        if constexpr (hasBias_) {
+          params_epilogue_local.ptr_Bias += deep_scheduler.curr_offset_mxfp4_c();
+        }
         // Epilogue and write to gD
         CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
         epilogue(
@@ -696,13 +702,15 @@ template <
   class ProblemShape_,
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
-  class TileScheduler_
+  class TileScheduler_,
+  bool hasBias_
 >
 class DeepGemmUniversal <
   ProblemShape_,
   CollectiveMainloop_,
   CollectiveEpilogue_,
   TileScheduler_,
+  hasBias_,
   false,
   false
 > {
@@ -773,6 +781,7 @@ public:
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
+  static constexpr uint32_t N_PREFETCH_CACHELINE = cute::ceil_div(TileScheduler::kNumGroups, 32);   // numGroups * sizeof(int) / 128 Byte = cacheline
 
 #if SAIL_SYNC_IN_CE
   // only 256/256 tile enable sync tb in CE
@@ -944,6 +953,18 @@ public:
     int thread_idx = int(threadIdx.x);
     auto blk_shape = TileShape{};                                                                // (BLK_M,BLK_N,BLK_K)
 
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+      // group is small 8|16, just prefetch one cacheline
+      __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
+    }
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+      // each warp prefetch one cacheline
+      int warp_idx = cutlass::canonical_warp_idx_sync();
+      if (warp_idx < N_PREFETCH_CACHELINE) {
+        __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx << 5)));
+      }
+    }
+
     uint32_t m_block_idx, n_block_idx;
     #pragma clang loop licm(disable)
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
@@ -1005,7 +1026,9 @@ public:
       // Update the pointer to C and D of MXFP4 in the epilogue parameters
       auto params_epilogue_local = params.epilogue;
       params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
-      params_epilogue_local.ptr_Bias += deep_scheduler.curr_offset_mxfp4_c();
+      if constexpr (hasBias_) {
+        params_epilogue_local.ptr_Bias += deep_scheduler.curr_offset_mxfp4_c();
+      }
 
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
@@ -1019,16 +1042,6 @@ public:
         thread_idx,
         (char*)&shared_storage.tensors.epilogue
       );
-
-      // if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
-      //   cp_async_wait<0>();
-      //   __syncthreads();
-
-      //   if (threadIdx.x == 0) {
-      //     atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
-      //             * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
-      //   }
-      // }
     }
   }
 };
@@ -1392,105 +1405,64 @@ struct CollectiveMmaScaleFp4
 
     Tensor tCrSFAUint32 = recast<uint32_t>(tCrSFA);
 
-    #if 0
-    if ((blockIdx.x == 0) && threadIdx.x == 0) {
-      printf("gSFA: \n");
-      print(gSFA);
-      print("\n");
-
-      printf("sSFA: \n");
-      print(sSFA);
-      print("\n");
-
-      printf("tSFAgSFA: \n");
-      print(tSFAgSFA);
-      print("\n");
-
-      printf("tSFAsSFA: \n");
-      print(tSFAsSFA);
-      print("\n");
-
-      printf("sSFAUint16: \n");
-      print(sSFAUint16);
-      print("\n");
-
-      printf("sSFATrans: \n");
-      print(sSFATrans);
-      print("\n");
-
-      printf("tCsSFA: \n");
-      print(tCsSFA);
-      print("\n");
-
-      printf("tCrSFA_stage: \n");
-      print(tCrSFA_stage);
-      print("\n");
-
-      printf("tCrSFA: \n");
-      print(tCrSFA);
-      print("\n");
-
-      printf("tCrSFAUint32: \n");
-      print(tCrSFAUint32);
-      print("\n");
-    }
-    __threadfence();
-    #endif
-
     bool notBoundaryBlocks = get<0>(residue_mnk) >= size<0>(TileShape{}) && get<1>(residue_mnk) >= size<1>(TileShape{});
+    auto copy_to_tsm = [&](int k_pipe_write, int k_idx, int warp_idx) {
+      copy_aiu<SplitAIU>(
+        gmem_tiled_copy_A, tAgA(_,_,_,k_idx), tAsA(_,_,_,k_pipe_write),
+        gmem_tiled_copy_B, tBgB(_,_,_,k_idx), tBsB(_,_,_,k_pipe_write),
+        warp_idx
+      );
+      if (__builtin_expect(k_tile_count > 1 && notBoundaryBlocks, 1)) {
+        if constexpr (ThreadNum == GmemTiledCopySFAThrNum) {
+          copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
+        } else {
+          if (threadIdx.x < GmemTiledCopySFAThrNum) {
+            copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
+          }
+        }
+        if constexpr (ThreadNum == GmemTiledCopySFBThrNum) {
+          copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,k_idx), tSFBsSFB(_,_,_,k_pipe_write));
+        } else {
+          if (threadIdx.x < GmemTiledCopySFBThrNum) {
+            copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,k_idx), tSFBsSFB(_,_,_,k_pipe_write));
+          }
+        }
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(tSFApSFA); ++i) {
+          tSFApSFA(i) = get<0>(tSFAcSFA(_, _, _, k_idx)(i)) < M && get<1>(tSFAcSFA(_, _, _, k_idx)(i)) < SFA_K && threadIdx.x < GmemTiledCopySFAThrNum;
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(tSFBpSFB); ++i) {
+          tSFBpSFB(i) = get<0>(tSFBcSFB(_, _, _, k_idx)(i)) < SFN && get<1>(tSFBcSFB(_, _, _, k_idx)(i)) < SFK && threadIdx.x < GmemTiledCopySFBThrNum;
+        }
+        // NOTE: Make sure the number of threads that send cp insts be the same with the number of threads in TiledCopy!
+        if constexpr (ThreadNum == GmemTiledCopySFAThrNum) {
+          copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
+        } else {
+          if (threadIdx.x < GmemTiledCopySFAThrNum) {
+            copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
+          }
+        }
+        if constexpr (ThreadNum == GmemTiledCopySFBThrNum) {
+          copy_if(gmem_tiled_copy_SFB, tSFBpSFB, tSFBgSFB(_,_,_,k_idx), tSFBsSFB(_,_,_,k_pipe_write));
+        } else {
+          if (threadIdx.x < GmemTiledCopySFBThrNum) {
+            copy_if(gmem_tiled_copy_SFB, tSFBpSFB, tSFBgSFB(_,_,_,k_idx), tSFBsSFB(_,_,_,k_pipe_write));
+          }
+        }
+      }
+    };
+
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages-1; ++k_pipe) {
       if (k_tile_count > 0){
-        copy_aiu<SplitAIU>(
-          gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
-          gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
-          warp_idx
-        );
-        if (__builtin_expect(k_tile_count > 1 && notBoundaryBlocks, 1)) {
-          if constexpr (ThreadNum == GmemTiledCopySFAThrNum) {
-            copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,*k_tile_iter), tSFAsSFA(_,_,_,k_pipe));
-          } else {
-            if (threadIdx.x < GmemTiledCopySFAThrNum) {
-              copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,*k_tile_iter), tSFAsSFA(_,_,_,k_pipe));
-            }
-          }
-          if constexpr (ThreadNum == GmemTiledCopySFBThrNum) {
-            copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,*k_tile_iter), tSFBsSFB(_,_,_,k_pipe));
-          } else {
-            if (threadIdx.x < GmemTiledCopySFBThrNum) {
-              copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,*k_tile_iter), tSFBsSFB(_,_,_,k_pipe));
-            }
-          }
-        } else {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(tSFApSFA); ++i) {
-            tSFApSFA(i) = get<0>(tSFAcSFA(_, _, _, *k_tile_iter)(i)) < M && get<1>(tSFAcSFA(_, _, _, *k_tile_iter)(i)) < SFA_K && threadIdx.x < GmemTiledCopySFAThrNum;
-          }
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(tSFBpSFB); ++i) {
-            tSFBpSFB(i) = get<0>(tSFBcSFB(_, _, _, *k_tile_iter)(i)) < SFN && get<1>(tSFBcSFB(_, _, _, *k_tile_iter)(i)) < SFK && threadIdx.x < GmemTiledCopySFBThrNum;
-          }
-          // NOTE: Make sure the number of threads that send cp insts be the same with the number of threads in TiledCopy!
-          if constexpr (ThreadNum == GmemTiledCopySFAThrNum) {
-            copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,*k_tile_iter), tSFAsSFA(_,_,_,k_pipe));
-          } else {
-            if (threadIdx.x < GmemTiledCopySFAThrNum) {
-              copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,*k_tile_iter), tSFAsSFA(_,_,_,k_pipe));
-            }
-          }
-          if constexpr (ThreadNum == GmemTiledCopySFBThrNum) {
-            copy_if(gmem_tiled_copy_SFB, tSFBpSFB, tSFBgSFB(_,_,_,*k_tile_iter), tSFBsSFB(_,_,_,k_pipe));
-          } else {
-            if (threadIdx.x < GmemTiledCopySFBThrNum) {
-              copy_if(gmem_tiled_copy_SFB, tSFBpSFB, tSFBgSFB(_,_,_,*k_tile_iter), tSFBsSFB(_,_,_,k_pipe));
-            }
-          }
-        }
+        copy_to_tsm(k_pipe, *k_tile_iter, warp_idx);
+        ++k_tile_iter;
       }
       cp_async_fence();
       --k_tile_count;
-      if (k_tile_count > 0) { ++k_tile_iter; }
     }
 
     //
@@ -1561,236 +1533,51 @@ struct CollectiveMmaScaleFp4
       copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,Int<0>{}), tCrSFB(_,_,Int<0>{}));
     }
 
-    #if 0
-    if (thread0()) {
-      printf("\n======= DEBUG in CollectiveMmaScale =======\n");
-      printf("gA:\n");
-      print(gA);
-      printf("\n");
-      printf("gB:\n");
-      print(gB);
-      printf("\n");
-      printf("sA:\n");
-      print(sA);
-      printf("\n");
-      printf("sB:\n");
-      print(sB);
-      printf("\n");
-      printf("tCsA:\n");
-      print(tCsA);
-      printf("\n");
-      printf("tCrA:\n");
-      print(tCrA);
-      printf("\n");
-      printf("tCrA_copy_view:\n");
-      print(tCrA_copy_view);
-      printf("\n");
-    }
-    #endif
-    #if 0
-    if ((blockIdx.x == 0) && threadIdx.x == 0) {
-      printf("blockIdx.x: %d, sSFA:\n", blockIdx.x);
-      for (int s = 0; s < DispatchPolicy::Stages; s++) {
-        printf("stage: %d\n", s);
-        // uint32_t *start_ptr = (uint32_t*)sSFA(_, _, s).data();
-        auto smem_p = sSFA(_, _, s).data();
-        auto start_ptr = cute::raw_pointer_cast(smem_p);  // 得到原生指针（仍指向 shared）
-        for (int i = 0; i < tile_SFA_M; i++) {
-          for (int j = 0; j < tile_SFA_K; j++) {
-            uint32_t val = start_ptr[i*tile_SFA_K+j];
-            printf("%u, %u, %u, %u, ", (unsigned)val & 0xff, (unsigned)(val >> 8) & 0xff, (unsigned)(val >> 16) & 0xff, (unsigned)(val >> 24) & 0xff);
-          }
-          printf("\n");
-        }
-      }
-    }
-    if ((blockIdx.x == 0) && threadIdx.x == 0) {
-      printf("blockIdx.x: %d, sSFB:\n", blockIdx.x);
-      for (int s = 0; s < DispatchPolicy::Stages; s++) {
-        printf("stage: %d, SwizzlePadding: %d\n", s, SwizzlePadding);
-        // uint32_t *start_ptr = (uint32_t*)sSFA(_, _, s).data();
-        auto smem_p = sSFB(_, _, s).data();
-        auto start_ptr = cute::raw_pointer_cast(smem_p);  // 得到原生指针（仍指向 shared）
-        for (int i = 0; i < tile_scale_M; i++) {
-          for (int j = 0; j < tile_scale_K; j++) {
-            uint32_t val = start_ptr[i*(tile_scale_K+SwizzlePadding)+j];
-            printf("%u, %u, %u, %u, ", (unsigned)val & 0xff, (unsigned)(val >> 8) & 0xff, (unsigned)(val >> 16) & 0xff, (unsigned)(val >> 24) & 0xff);
-          }
-          printf("\n");
-        }
-      }
-    }
-    #endif
-
-    int mainloop_idx = 0;
     CUTLASS_PRAGMA_NO_UNROLL
     for ( ; k_tile_count > -(DispatchPolicy::Stages-1); --k_tile_count)
     {
-      int meta_stage_idx = mainloop_idx % 4;
       // Pipeline the outer products with a static for loop.
-      //
       // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
       for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block)
       {
         if constexpr (k_block == K_BLOCK_MAX - 1)
         {
+          // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
+          ++smem_pipe_read;
+          smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
+          // Commit the smem for smem_pipe_read
+          cp_async_wait<DispatchPolicy::Stages-2>();
+          __syncthreads();
           // Slice the smem_pipe_read smem
           tCsA_p = tCsA(_,_,_,smem_pipe_read);
           tCsB_p = tCsB(_,_,_,smem_pipe_read);
           tCsSFA_p = tCsSFA(_,_,_,smem_pipe_read);
           tCsSFB_p = tCsSFB(_,_,_,smem_pipe_read);
-
-          // Commit the smem for smem_pipe_read
-          cp_async_wait<DispatchPolicy::Stages-2>();
-          __syncthreads();
-
-          #if 0
-          if ((blockIdx.x == 0) && threadIdx.x == 0) {
-            printf("blockIdx.x: %d, sSFA:\n", blockIdx.x);
-            for (int s = 0; s < 1; s++) {
-              printf("stage: %d\n", smem_pipe_read);
-              // uint32_t *start_ptr = (uint32_t*)sSFA(_, _, s).data();
-              auto smem_p = sSFA(_, _, smem_pipe_read).data();
-              auto start_ptr = cute::raw_pointer_cast(smem_p);  // 得到原生指针（仍指向 shared）
-              for (int i = 0; i < tile_SFA_M; i++) {
-                for (int j = 0; j < tile_SFA_K; j++) {
-                  uint32_t val = start_ptr[i*tile_SFA_K+j];
-                  printf("%u, %u, %u, %u, ", (unsigned)val & 0xff, (unsigned)(val >> 8) & 0xff, (unsigned)(val >> 16) & 0xff, (unsigned)(val >> 24) & 0xff);
-                }
-                printf("\n");
-              }
-            }
-          }
-          if ((blockIdx.x == 0) && threadIdx.x == 0) {
-            printf("blockIdx.x: %d, sSFB:\n", blockIdx.x);
-            for (int s = 0; s < 1; s++) {
-              printf("stage: %d, SwizzlePadding: %d\n", smem_pipe_read, SwizzlePadding);
-              // uint32_t *start_ptr = (uint32_t*)sSFA(_, _, s).data();
-              auto smem_p = sSFB(_, _, smem_pipe_read).data();
-              auto start_ptr = cute::raw_pointer_cast(smem_p);  // 得到原生指针（仍指向 shared）
-              for (int i = 0; i < tile_scale_N; i++) {
-                for (int j = 0; j < tile_scale_K; j++) {
-                  uint32_t val = start_ptr[i*(tile_scale_K+SwizzlePadding)+j];
-                  printf("%u, %u, %u, %u, ", (unsigned)val & 0xff, (unsigned)(val >> 8) & 0xff, (unsigned)(val >> 16) & 0xff, (unsigned)(val >> 24) & 0xff);
-                }
-                printf("\n");
-              }
-            }
-          }
-          __threadfence();
-          #endif
+          copy(smem_tiled_copy_A, tCsA_p(_,_,_0{}), tCrA_copy_view(_,_,_0{}));
+          copy(smem_tiled_copy_B, tCsB_p(_,_,_0{}), tCrB_copy_view(_,_,_0{}));
+          copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,_0{}), tCrSFA(_,_,_0{}));
+          copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,_0{}), tCrSFB(_,_,_0{}));
+        } else {
+          auto k_block_next = k_block + Int<1>{};  // static
+          copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
+          copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
+          copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,k_block_next), tCrSFA(_,_,k_block_next));
+          copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,k_block_next), tCrSFB(_,_,k_block_next));
         }
-
-        // Load A, B shmem->regs for k_block+1
-        auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
-        copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
-        copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
-        copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,k_block_next), tCrSFA(_,_,k_block_next));
-        copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,k_block_next), tCrSFB(_,_,k_block_next));
-
-        // Copy gmem to smem before computing gemm on each k-pipe
-        if constexpr (k_block == 0)
-        {
-          if (k_tile_count > 0){
-            copy_aiu<SplitAIU>(
-              gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
-              gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
-              warp_idx
-            );
-            if (__builtin_expect(k_tile_count > 1 && notBoundaryBlocks, 1)) {
-              if constexpr (ThreadNum == GmemTiledCopySFAThrNum) {
-                copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,*k_tile_iter), tSFAsSFA(_,_,_,smem_pipe_write));
-              } else {
-                if (threadIdx.x < GmemTiledCopySFAThrNum) {
-                  copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,*k_tile_iter), tSFAsSFA(_,_,_,smem_pipe_write));
-                }
-              }
-              if constexpr (ThreadNum == GmemTiledCopySFBThrNum) {
-                copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,*k_tile_iter), tSFBsSFB(_,_,_,smem_pipe_write));
-              } else {
-                if (threadIdx.x < GmemTiledCopySFBThrNum) {
-                  copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,*k_tile_iter), tSFBsSFB(_,_,_,smem_pipe_write));
-                }
-              }
-            } else {
-              CUTLASS_PRAGMA_UNROLL
-              for (int i = 0; i < size(tSFApSFA); ++i) {
-                tSFApSFA(i) = get<0>(tSFAcSFA(_, _, _, *k_tile_iter)(i)) < M && get<1>(tSFAcSFA(_, _, _, *k_tile_iter)(i)) < SFA_K;
-              }
-              CUTLASS_PRAGMA_UNROLL
-              for (int i = 0; i < size(tSFBpSFB); ++i) {
-                tSFBpSFB(i) = get<0>(tSFBcSFB(_, _, _, *k_tile_iter)(i)) < SFN && get<1>(tSFBcSFB(_, _, _, *k_tile_iter)(i)) < SFK;
-              }
-              // NOTE: Make sure the number of threads that send cp insts be the same with the number of threads in TiledCopy!
-              if constexpr (ThreadNum == GmemTiledCopySFAThrNum) {
-                copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,*k_tile_iter), tSFAsSFA(_,_,_,smem_pipe_write));
-              } else {
-                if (threadIdx.x < GmemTiledCopySFAThrNum) {
-                  copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,*k_tile_iter), tSFAsSFA(_,_,_,smem_pipe_write));
-                }
-              }
-              if constexpr (ThreadNum == GmemTiledCopySFBThrNum) {
-                copy_if(gmem_tiled_copy_SFB, tSFBpSFB, tSFBgSFB(_,_,_,*k_tile_iter), tSFBsSFB(_,_,_,smem_pipe_write));
-              } else {
-                if (threadIdx.x < GmemTiledCopySFBThrNum) {
-                  copy_if(gmem_tiled_copy_SFB, tSFBpSFB, tSFBgSFB(_,_,_,*k_tile_iter), tSFBsSFB(_,_,_,smem_pipe_write));
-                }
-              }
-            }
-          }
-          cp_async_fence();
-          if (k_tile_count > 0) { ++k_tile_iter; }
-
-          // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
-          smem_pipe_write = smem_pipe_read;
-          ++smem_pipe_read;
-          smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
-        }
-
         // Transform before compute
         cute::transform(tCrA(_,_,k_block), TransformA{});
         cute::transform(tCrB(_,_,k_block), TransformB{});
-
-        // Thread-level register gemm for k_block
-        #if 0
-        if (blockIdx.x == 0 && threadIdx.x == 0) {
-          printf("stage: %d, k_block: %d, accum: \n", int(k_tile_count), int(k_block));
-          for (int i = 0; i < size(accum); i++) {
-            printf("%f ", (float_t)accum(i));
-          }
-          printf("\n");
-          printf("tCrSFAUint32: \n");
-          for (int i = 0; i < size(tCrSFAUint32(_,_,k_block)); i++) {
-            uint32_t val = (unsigned)tCrSFAUint32(_,_,k_block)(i);
-            printf("%u, %u, %u, %u, ", (unsigned)val & 0xff, (unsigned)(val >> 8) & 0xff, (unsigned)(val >> 16) & 0xff, (unsigned)(val >> 24) & 0xff);
-          }
-          printf("\n");
-          printf("tCrSFB: \n");
-          for (int i = 0; i < size(tCrSFB(_,_,k_block)); i++) {
-            uint32_t val = (unsigned)tCrSFB(_,_,k_block)(i);
-            printf("%u, %u, %u, %u, ", (unsigned)val & 0xff, (unsigned)(val >> 8) & 0xff, (unsigned)(val >> 16) & 0xff, (unsigned)(val >> 24) & 0xff);
-          }
-          printf("\n");
-        }
-        #endif
         cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrSFAUint32(_,_,k_block), tCrB(_,_,k_block), tCrSFB(_,_,k_block), src_accum);
-        #if 0
-        if (blockIdx.x == 0 && threadIdx.x == 0) {
-          printf("stage: %d, k_block: %d, accum_after: \n", int(k_tile_count), int(k_block));
-          for (int i = 0; i < size(accum); i++) {
-            printf("%f ", (float_t)accum(i));
+        if constexpr (k_block == 0) {
+          if (k_tile_count > 0){
+            copy_to_tsm(smem_pipe_write, *k_tile_iter, warp_idx);
+            ++k_tile_iter;
           }
-          printf("\n==================================\n");
+          cp_async_fence();
+          smem_pipe_write = smem_pipe_read;
         }
-        #endif
       });
-
-      ++mainloop_idx;
     }
-
-    // TODO: original cutlass3 miss this sync
-    cp_async_wait<0>();
-    __syncthreads();
   }
 };
 
@@ -1806,7 +1593,7 @@ template <int32_t ShapeN, int32_t ShapeK,
           int32_t BlockM, int32_t BlockN, int32_t BlockK,
           int32_t WarpM, int32_t WarpN,
           int32_t kNumGroups, int32_t kNumStages, GemmType kGemmType,
-          bool kEnableSboOverlap = false, bool HasBias = false>
+          bool kEnableSboOverlap = false, bool hasBias = false>
 class Fp4Gemm {
   static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
   static_assert((BlockN == 16) || (BlockN == 32) || (BlockN == 64) || (BlockN == 128) || (BlockN == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
@@ -1814,7 +1601,7 @@ class Fp4Gemm {
   static_assert((WarpN % 16 == 0), "WarpN must be divideable by 16.");
 
   // might need to be revised.
-  static constexpr bool kUseNStageKernel = ShapeK <= 512 && (ShapeN % (BlockN * KernelAiuMultistageOnN::N_EXPAND) == 0) && !HasBias;
+  static constexpr bool kUseNStageKernel = ShapeK <= 512 && (ShapeN % (BlockN * KernelAiuMultistageOnN::N_EXPAND) == 0) && !hasBias;
 public:
     Fp4Gemm() = default;
 
@@ -1927,18 +1714,10 @@ public:
         >;
 
         using EpilogueOutputOp = typename cutlass::platform::conditional<
-          !kUseNStageKernel,
-          typename cutlass::platform::conditional<
-            HasBias,
+            hasBias,
             cutlass::epilogue::thread::LinearCombinationBiasElementwise<ElementD, ElementAccumulator, ElementCompute, ElementD, ElementD, AlignmentD, cutlass::epilogue::thread::Identity<float>, cutlass::plus<ElementCompute>, false, ElementBias>,
-            cutlass::epilogue::thread::LinearCombination<ElementD, AlignmentD, ElementAccumulator, ElementCompute, cutlass::epilogue::thread::ScaleType::Nothing>
-          >::type,
-          typename cutlass::platform::conditional<
-            HasBias,
-            cutlass::epilogue::thread::LinearCombination<ElementD, 2, ElementAccumulator, ElementCompute, cutlass::epilogue::thread::ScaleType::NoBetaScaling, cutlass::FloatRoundStyle::round_to_nearest, ElementC>,
             cutlass::epilogue::thread::LinearCombination<ElementD, 2, ElementAccumulator, ElementCompute, cutlass::epilogue::thread::ScaleType::Nothing, cutlass::FloatRoundStyle::round_to_nearest, ElementC>,
-          >::type
-        >::type;
+          >::type;
 
         using EpilogueCopyInst = AutoVectorizingCopyWithAssumedAlignment<AlignmentC * sizeof(ElementC) * 8>;
         using GemmEpilogueConfiguration = cutlass::gemm::config::DefaultGemm_Epilogue_Configuration<EpilogueCopyInst, float, AlignmentC, Int<BlockM>, Int<BlockN>, WarpOnM, ThreadNum>;
@@ -1963,7 +1742,7 @@ public:
         >;
 
         using CollectiveEpilogue = typename cutlass::platform::conditional<
-          !kUseNStageKernel,
+          hasBias,
           CollectiveEpilogueWithTsm,
           CollectiveEpilogueNoTsm
         >::type;
@@ -1974,6 +1753,7 @@ public:
             CollectiveMainloop,
             CollectiveEpilogue,
             TileScheduler,
+            hasBias,
             kUseNStageKernel,
             kEnableSboOverlap,
         >;
@@ -2007,7 +1787,7 @@ public:
         cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(d_ptr);
 
         typename CollectiveEpilogue::Arguments epilogue_arguments = [&]() -> auto {
-            if constexpr (!kUseNStageKernel) {
+            if constexpr (hasBias) {
               return typename CollectiveEpilogueWithTsm::Arguments{{1.0, 0.0, nullptr, nullptr, c_ptr, stride_Bias}, nullptr, stride_C, converted_output, stride_D};
             } else {
               return typename CollectiveEpilogueNoTsm::Arguments{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D};
