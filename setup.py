@@ -163,7 +163,7 @@ if __name__ == '__main__':
             "local_scheme": custom_local_scheme,
             "version_scheme": custom_version_scheme,
         },
-        setup_requires=["setuptools_scm"],
+        setup_requires=["setuptools-scm==9.2.2"],
         packages=find_packages('.'), # old version: packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels', 'deep_gemm/deep_gemm_tuner'],, 
         package_data={
             'deep_gemm': [
