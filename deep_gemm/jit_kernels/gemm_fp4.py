@@ -48,7 +48,19 @@ def get_sf_padding_size_b32(block_mn: int, warp_mn: int, block_k: int) -> int:
 
     return 0
 
-def get_sf_per_stage_size(block_mn: int, block_k: int, warp_mn: int, w_padding: bool = False) -> int:
+def get_sfa_per_stage_size(block_mn: int, block_k: int, warp_mn: int, w_padding: bool = False) -> int:
+    smem_sf_k = ceil_div(block_k, 32) # uint16
+    base_smem_sfa_size = block_mn * smem_sf_k * 2   # 2 means sizeof(uint16)
+
+    if block_mn <= 64:
+        return base_smem_sfa_size
+    else:
+        aiu_num_on_m = ceil_div(block_mn, 64)
+        sfa_padding_size = 16 * aiu_num_on_m * 2    # 16 means padding 16 rows for bankconflicts
+
+        return base_smem_sfa_size + sfa_padding_size
+
+def get_sfb_per_stage_size(block_mn: int, block_k: int, warp_mn: int, w_padding: bool = False) -> int:
     ### Assume warp_mn = block_mn to calculate occ
 
     warp_num_mn = block_mn // warp_mn
@@ -72,8 +84,8 @@ def get_smem_config_fp4(num_stages: int, block_m: int, block_n: int, warp_m: int
     smem_b_per_stage = block_n * block_k
     # smem_barrier = num_stages * 8 * 2
     ### NOTE(yfu): we only consider sfb_padding when select num_stages
-    smem_sfa_per_stage = get_sf_per_stage_size(block_m, block_k, warp_m, False)
-    smem_sfb_per_stage = get_sf_per_stage_size(block_n, block_k, warp_n, True)
+    smem_sfa_per_stage = get_sfa_per_stage_size(block_m, block_k, warp_m, False)
+    smem_sfb_per_stage = get_sfb_per_stage_size(block_n, block_k, warp_n, True)
 
     ### output dtype of fp4 is bf16 currently
     smem_size_d = smem_d * 2
@@ -471,23 +483,15 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
 
     return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
-def uint8_padding(scale_uint8: torch.Tensor) -> torch.Tensor:
-    """
-        zero-pad uint8 tensor to align its width to a multiple of 4 for ppu mxfp4
+def preprocess_mxfp4_sfa(scale: torch.Tensor) -> torch.Tensor:
+    assert scale.dtype == torch.uint8, f"The dtype of scale should be torch.uint8 but got {scale.dtype}."
+    assert scale.is_contiguous(), f"Scales should be contiguous."
+    assert len(scale.shape) == 2 or len(scale.shape) == 3, f"The rank of scale should be 2(dense/groupedNoPad) or 3(groupedMasked)."
 
-        Args:
-            scale_uint8: uint8 tensor, expected shape [M, K]
-
-        Returns:
-            out: padded tensor with width aligned to 4, shape [M, K_pad] where K_pad = ceil(K/4)*4
-    """
-    remainder = scale_uint8.shape[1] & 3
-    if remainder == 0:
-        return scale_uint8 if scale_uint8.dtype == torch.uint8 else scale_uint8.to(torch.uint8)
-    pad_size = 4 - remainder
-    if scale_uint8.dtype != torch.uint8:
-        scale_uint8 = scale_uint8.to(torch.uint8)
-    return torch.nn.functional.pad(scale_uint8, (0, pad_size))
+    if len(scale.shape) == 2:
+        return scale.view(torch.uint16).t().contiguous().t()
+    else:
+        return scale.view(torch.uint16).permute(0, 2, 1).contiguous().permute(0, 2, 1)
 
 def preprocess_mxfp4_scales(scale: torch.Tensor) -> torch.Tensor:
     """
@@ -545,12 +549,12 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
     # Type and shape checks
     assert m == m_ and n == n_ and k == k_
     assert n > 0 and k > 0
-    assert lhs.dtype == torch.uint8 and lhs_scales.dtype == torch.uint8
+    assert lhs.dtype == torch.uint8 and lhs_scales.dtype == torch.uint16
     assert rhs.dtype == torch.uint8 and rhs_scales.dtype == torch.uint8
     assert (bias is None) or (bias.dtype == torch.float32)
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
-    assert rhs_scales.is_contiguous() and lhs_scales.is_contiguous()
+    assert lhs_scales.stride(0) == 1 and rhs_scales.is_contiguous()
     if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device)
 
     # Do nothing if `m` is zero
@@ -578,7 +582,7 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
               'NUM_STAGES': num_stages,'GEMM_TYPE': 'DenseGemm'},
         space=(),
         includes=includes,
-        arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint8),
+        arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),
                   ('rhs', torch.uint8), ('rhs_scales', torch.uint8),
                   ('bias', torch.float32), ('out', torch.bfloat16),
                   ('m', int), ('stream', torch.cuda.Stream),

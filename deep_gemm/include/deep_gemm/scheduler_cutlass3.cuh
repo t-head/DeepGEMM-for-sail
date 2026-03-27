@@ -345,9 +345,9 @@ struct DeepGemmScheduler {
         uint32_t shape_k_scale = SHAPE_K / 16;
         if constexpr (kGemmType == GemmType::GroupedNoPad) {
             // /4 means uint8_t to uint32_t;
-            return int64_t(curr_cumsum_m) * ((shape_k_scale + 3) / 4);
+            return int64_t(curr_cumsum_m);
         } else if constexpr (kGemmType == GemmType::GroupedMasked) {
-            return int64_t(curr_group_idx) * params.shape_m * ((shape_k_scale + 3) / 4);
+            return int64_t(curr_group_idx) * params.shape_m * ((shape_k_scale + 1) / 2);
         } else {
             return 0;
         }

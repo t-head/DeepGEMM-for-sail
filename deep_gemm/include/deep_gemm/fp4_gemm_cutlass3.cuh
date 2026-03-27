@@ -90,7 +90,10 @@ class DeepGemmUniversal <
   using StrideA   = typename CollectiveMainloop::StrideA;
   using ElementB  = typename CollectiveMainloop::ElementB;
   using StrideB   = typename CollectiveMainloop::StrideB;
-  using ElementScale  = typename CollectiveMainloop::ElementScale;
+  using ElementSFA  = typename CollectiveMainloop::ElementSFA;
+  using StrideSFA = typename CollectiveMainloop::StrideSFA;
+  using ElementSFB  = typename CollectiveMainloop::ElementSFB;
+  using StrideSFB = typename CollectiveMainloop::StrideSFB;
   using DispatchPolicy = typename CollectiveMainloop::DispatchPolicy;
   using ElementAccumulator = typename CollectiveMainloop::ElementAccumulator;
   using MainloopArguments = typename CollectiveMainloop::Arguments;
@@ -103,12 +106,11 @@ class DeepGemmUniversal <
   static constexpr int warp_on_m = size<1>(ThrLayoutVMNK{});
   static constexpr int warp_on_n = size<2>(ThrLayoutVMNK{});
   static constexpr int ThreadNum = warp_on_m * warp_on_n * 32;
-  static constexpr int GmemTiledCopySFAThrNum = GmemTiledCopySFA::TiledNumThr::value;
   static constexpr int GmemTiledCopySFBThrNum = GmemTiledCopySFB::TiledNumThr::value;
-  static constexpr int ElementScaleNumIn16bit = sizeof(ElementScale{}) / 2;
 
   // warp_num == 1, use sigle warp to issue AIU LOAD
   static constexpr bool SplitAIU = (warp_on_m * warp_on_n) > 1;
+  static constexpr int AIU_SFA_WARP = (SplitAIU && (warp_on_m * warp_on_n) > 2) ? 2 : 0;
 
   // FLUX would deliver in own private PersistentScheduler for gemm+communication kernel
   // static_assert(cute::is_void_v<TileScheduler_> or cute::is_same_v<TileScheduler_, PersistentScheduler>,
@@ -359,8 +361,8 @@ class DeepGemmUniversal <
       auto offset_scaleb = deep_scheduler.curr_offset_mxfp4_scaleb(m_block_idx);
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
-      const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_scalea;
-      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + offset_scaleb;
+      const ElementSFA* ptr_scale_A = reinterpret_cast<const ElementSFA*>(params.mainloop.ptr_scale_A) + offset_scalea;
+      const ElementSFB* ptr_scale_B = reinterpret_cast<const ElementSFB*>(params.mainloop.ptr_scale_B) + offset_scaleb;
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       // update actual global ptr offset
@@ -427,37 +429,28 @@ class DeepGemmUniversal <
       // ========= fp4 scale gmem tiledCopy =========
       using SmemLayoutSFA = typename CollectiveMainloop::SmemLayoutSFA;
       using SmemLayoutSFB = typename CollectiveMainloop::SmemLayoutSFB;
-      using SmemTiledCopySFA = typename CollectiveMainloop::SmemTiledCopySFA;
       using SmemTiledCopySFB = typename CollectiveMainloop::SmemTiledCopySFB;
-      using sSFATransLayout = typename CollectiveMainloop::sSFATransLayout;
-      static constexpr int tile_scale_N = CollectiveMainloop::tile_scale_N;
-      static constexpr int tile_scale_K = CollectiveMainloop::tile_scale_K;
-      static constexpr int SwizzlePadding = CollectiveMainloop::SwizzlePadding;
 
       GmemTiledCopySFA& gmem_tiled_copy_SFA = collective_mma.gmem_tiled_copy_SFA;
       GmemTiledCopySFB& gmem_tiled_copy_SFB = collective_mma.gmem_tiled_copy_SFB;
 
-      Tensor gSFA = get<2, 0>(load_inputs);
+      Tensor gSFA = get<2>(load_inputs);
       Tensor gSFB = get<3, 0>(load_inputs);
-      Tensor cSFA = get<2, 1>(load_inputs);
       Tensor cSFB = get<3, 1>(load_inputs);
 
-
-      Tensor sSFA = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_SFA.data()), SmemLayoutSFA{});
-      Tensor sSFB = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_SFB.data()), SmemLayoutSFB{});
+      Tensor sSFA = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_sfa.data()), SmemLayoutSFA{});
+      Tensor sSFB = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_sfb.data()), SmemLayoutSFB{});
 
       auto gmem_thr_copy_SFA = gmem_tiled_copy_SFA.get_thread_slice(thread_idx);
       auto gmem_thr_copy_SFB = gmem_tiled_copy_SFB.get_thread_slice(thread_idx);
 
       Tensor tSFAgSFA = gmem_thr_copy_SFA.partition_S(gSFA);
       Tensor tSFAsSFA = gmem_thr_copy_SFA.partition_D(sSFA);
-      Tensor tSFAcSFA = gmem_thr_copy_SFA.partition_S(cSFA);
 
       Tensor tSFBgSFB = gmem_thr_copy_SFB.partition_S(gSFB);
       Tensor tSFBsSFB = gmem_thr_copy_SFB.partition_D(sSFB);
       Tensor tSFBcSFB = gmem_thr_copy_SFB.partition_S(cSFB);
 
-      Tensor tSFApSFA = make_tensor<bool>(shape(tSFAsSFA(_, _, _, Int<0>{})));
       Tensor tSFBpSFB = make_tensor<bool>(shape(tSFBsSFB(_, _, _, Int<0>{})));
 
       // Tile MMA compute thread partitions and allocate accumulators
@@ -492,22 +485,22 @@ class DeepGemmUniversal <
       CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
 
       // ========= fp4 scale smem tiledCopy =========
+      // create rSFA refer to tCsA/tCrA
+      constexpr auto warp_iter_num = size<1>(tCsA);
+      constexpr auto block_iter_num = size<2>(tCsA);
+      constexpr auto warp_iter_stride = [&]() constexpr {
+        if constexpr (cute::is_scaled_basis<decltype(stride<1>(tCsA))>::value) {
+          return stride<1>(tCsA).value();
+        } else {
+          return stride<1>(tCsA);
+        }
+      }();
+      constexpr int ldmat_iter_num = cute::ceil_div(warp_iter_num, Int<4>{});
+      Tensor tCrSFA = make_tensor<uint32_t>(Shape<Int<1>, Int<ldmat_iter_num>, Int<block_iter_num>>{});
+      static_assert(warp_iter_num <= 4, "warp_iter_num > 4 is not valid now.");
+
       auto SFK = cute::ceil_div(K, 16 * 2) * 8;
-      auto SFA_K = ceil_div(cute::ceil_div(K, 16 * 2), ElementScaleNumIn16bit);
       auto SFN = cute::ceil_div(N, 16);
-
-      // copy scale from smem to reg with the converted scale.
-      Tensor sSFAUint16 = recast<uint16_t>(sSFA);
-      Tensor sSFATrans = make_tensor(sSFAUint16.data(), sSFATransLayout{});
-
-      // smem layout for scale A/B
-      SmemTiledCopySFA smem_tiled_copy_SFA;
-      auto smem_thr_copy_SFA = smem_tiled_copy_SFA.get_slice(warp_m_idx * 32 + lane_idx);
-      Tensor tCsSFA = smem_thr_copy_SFA.partition_S(sSFATrans);
-      // Scale vreg for one stage
-      Tensor tCrSFA_stage = smem_thr_copy_SFA.partition_D(sSFATrans(_, _, Int<0>{}));
-      using SFARegType = decltype(make_fragment_like(tCrSFA_stage));
-      SFARegType tCrSFA;
 
       SmemTiledCopySFB smem_tiled_copy_SFB;
       auto smem_thr_copy_SFB = smem_tiled_copy_SFB.get_slice(warp_n_idx * 32 + lane_idx);
@@ -517,8 +510,6 @@ class DeepGemmUniversal <
       using SFBRegType = decltype(make_fragment_like(tCrSFB_stage));
       SFBRegType tCrSFB;
 
-      Tensor tCrSFAUint32 = recast<uint32_t>(tCrSFA);
-
       bool notBoundaryBlocks = get<0>(residue_mnk) >= size<0>(TileShape{}) && get<1>(residue_mnk) >= size<1>(TileShape{});
       auto copy_to_tsm = [&](int k_pipe_write, int k_idx, int warp_idx) {
         copy_aiu<SplitAIU>(
@@ -526,14 +517,10 @@ class DeepGemmUniversal <
           gmem_tiled_copy_B, tBgB(_,_,_,k_idx), tBsB(_,_,_,k_pipe_write),
           warp_idx
         );
+        if (warp_idx == AIU_SFA_WARP) {
+          copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
+        }
         if (__builtin_expect(k_tile_count > 1 && notBoundaryBlocks, 1)) {
-          if constexpr (ThreadNum == GmemTiledCopySFAThrNum) {
-            copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
-          } else {
-            if (threadIdx.x < GmemTiledCopySFAThrNum) {
-              copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
-            }
-          }
           if constexpr (ThreadNum == GmemTiledCopySFBThrNum) {
             copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,k_idx), tSFBsSFB(_,_,_,k_pipe_write));
           } else {
@@ -543,21 +530,10 @@ class DeepGemmUniversal <
           }
         } else {
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(tSFApSFA); ++i) {
-            tSFApSFA(i) = get<0>(tSFAcSFA(_, _, _, k_idx)(i)) < M && get<1>(tSFAcSFA(_, _, _, k_idx)(i)) < SFA_K && threadIdx.x < GmemTiledCopySFAThrNum;
-          }
-          CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < size(tSFBpSFB); ++i) {
             tSFBpSFB(i) = get<0>(tSFBcSFB(_, _, _, k_idx)(i)) < SFN && get<1>(tSFBcSFB(_, _, _, k_idx)(i)) < SFK && threadIdx.x < GmemTiledCopySFBThrNum;
           }
           // NOTE: Make sure the number of threads that send cp insts be the same with the number of threads in TiledCopy!
-          if constexpr (ThreadNum == GmemTiledCopySFAThrNum) {
-            copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
-          } else {
-            if (threadIdx.x < GmemTiledCopySFAThrNum) {
-              copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
-            }
-          }
           if constexpr (ThreadNum == GmemTiledCopySFBThrNum) {
             copy_if(gmem_tiled_copy_SFB, tSFBpSFB, tSFBgSFB(_,_,_,k_idx), tSFBsSFB(_,_,_,k_pipe_write));
           } else {
@@ -596,18 +572,19 @@ class DeepGemmUniversal <
 
       Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
       Tensor tCsB_p = tCsB(_,_,_,smem_pipe_read);
-      Tensor tCsSFA_p = tCsSFA(_,_,_,smem_pipe_read);
       Tensor tCsSFB_p = tCsSFB(_,_,_,smem_pipe_read);
 
       // Size of the register pipeline
       auto K_BLOCK_MAX = size<2>(tCrA_copy_view);
 
       // tsm->vreg prefetch
+      int base_offset = 0;
+      CollectiveMainloop::cal_ldmat_offset(base_offset, sSFA, lane_idx, warp_m_idx, Int<warp_iter_num>{}, Int<warp_iter_stride>{});
       cp_async_wait<Stages - 1>();
       __syncthreads();
       copy(smem_tiled_copy_A, tCsA_p(_,_,_0{}), tCrA_copy_view(_,_,_0{}));
       copy(smem_tiled_copy_B, tCsB_p(_,_,_0{}), tCrB_copy_view(_,_,_0{}));
-      copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,Int<0>{}), tCrSFA(_,_,Int<0>{}));
+      CollectiveMainloop::sf_s2r(sSFA, tCrSFA, base_offset, lane_idx, Int<0>{}, 0);
       copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,Int<0>{}), tCrSFB(_,_,Int<0>{}));
 
       CUTLASS_PRAGMA_NO_UNROLL
@@ -640,14 +617,13 @@ class DeepGemmUniversal <
               smem_pipe_read = (smem_pipe_read == Stages) ? 0 : smem_pipe_read;
               tCsA_p = tCsA(_,_,_,smem_pipe_read);
               tCsB_p = tCsB(_,_,_,smem_pipe_read);
-              tCsSFA_p = tCsSFA(_,_,_,smem_pipe_read);
               tCsSFB_p = tCsSFB(_,_,_,smem_pipe_read);
               if constexpr (K_BLOCK_MAX > 1) {
                 cp_async_wait<Stages - 1>();
                 __syncthreads();
                 copy(smem_tiled_copy_A, tCsA_p(_,_,_0{}), tCrA_copy_view(_,_,_0{}));
                 copy(smem_tiled_copy_B, tCsB_p(_,_,_0{}), tCrB_copy_view(_,_,_0{}));
-                copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,Int<0>{}), tCrSFA(_,_,Int<0>{}));
+                CollectiveMainloop::sf_s2r(sSFA, tCrSFA, base_offset, lane_idx, Int<0>{}, smem_pipe_read);
                 copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,Int<0>{}), tCrSFB(_,_,Int<0>{}));
               }
               smem_pipe_write = smem_pipe_read;
@@ -655,20 +631,20 @@ class DeepGemmUniversal <
               auto k_block_next = k_block + Int<1>{};
               copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
               copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
-              copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,k_block_next), tCrSFA(_,_,k_block_next));
+              CollectiveMainloop::sf_s2r(sSFA, tCrSFA, base_offset, lane_idx, k_block_next, smem_pipe_read);
               copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,k_block_next), tCrSFB(_,_,k_block_next));
             }
             // Transform before compute
             cute::transform(tCrA(_,_,k_block), TransformA{});
             cute::transform(tCrB(_,_,k_block), TransformB{});
             // gemm for one tiled_mma atom on K
-            cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrSFAUint32(_,_,k_block), tCrB(_,_,k_block), tCrSFB(_,_,k_block), accum);
+            cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrSFA(_,_,k_block), tCrB(_,_,k_block), tCrSFB(_,_,k_block), accum);
             if constexpr (K_BLOCK_MAX == 1) {
               cp_async_wait<Stages - 1>();
               __syncthreads();
               copy(smem_tiled_copy_A, tCsA_p(_,_,_0{}), tCrA_copy_view(_,_,_0{}));
               copy(smem_tiled_copy_B, tCsB_p(_,_,_0{}), tCrB_copy_view(_,_,_0{}));
-              copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,Int<0>{}), tCrSFA(_,_,Int<0>{}));
+              CollectiveMainloop::sf_s2r(sSFA, tCrSFA, base_offset, lane_idx, Int<0>{}, smem_pipe_read);
               copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,Int<0>{}), tCrSFB(_,_,Int<0>{}));
             }
           });
@@ -729,7 +705,10 @@ public:
   using StrideA   = typename CollectiveMainloop::StrideA;
   using ElementB  = typename CollectiveMainloop::ElementB;
   using StrideB   = typename CollectiveMainloop::StrideB;
-  using ElementScale  = typename CollectiveMainloop::ElementScale;
+  using ElementSFA  = typename CollectiveMainloop::ElementSFA;
+  using StrideSFA = typename CollectiveMainloop::StrideSFA;
+  using ElementSFB  = typename CollectiveMainloop::ElementSFB;
+  using StrideSFB = typename CollectiveMainloop::StrideSFB;
   using DispatchPolicy = typename CollectiveMainloop::DispatchPolicy;
   using ElementAccumulator = typename CollectiveMainloop::ElementAccumulator;
   using MainloopArguments = typename CollectiveMainloop::Arguments;
@@ -979,8 +958,8 @@ public:
       auto offset_scaleb = deep_scheduler.curr_offset_mxfp4_scaleb(m_block_idx);
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
-      const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_scalea;
-      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + offset_scaleb;
+      const ElementSFA* ptr_scale_A = reinterpret_cast<const ElementSFA*>(params.mainloop.ptr_scale_A) + offset_scalea;
+      const ElementSFB* ptr_scale_B = reinterpret_cast<const ElementSFB*>(params.mainloop.ptr_scale_B) + offset_scaleb;
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       // update actual global ptr offset
@@ -1070,11 +1049,14 @@ template <
   class SmemLayoutAtomB_,
   class SmemCopyAtomB_,
   class TransformB_,
+  class ElementSFA_,
+  class StrideSFA_,
   class GmemTiledCopySFA_,
+  class SmemLayoutAtomSFA_,
+  class ElementSFB_,
+  class StrideSFB_,
   class GmemTiledCopySFB_,
-  class SmemTiledCopySFA_,
-  class SmemTiledCopySFB_,
-  class ElementScale_>
+  class SmemTiledCopySFB_>
 struct CollectiveMmaScaleFp4
 {
   //
@@ -1097,17 +1079,20 @@ struct CollectiveMmaScaleFp4
   using TransformA = TransformA_;
   using TransformB = TransformB_;
   using GmemTiledCopySFA = GmemTiledCopySFA_;
+  using SmemLayoutAtomSFA = SmemLayoutAtomSFA_;
   using GmemTiledCopySFB = GmemTiledCopySFB_;
   using ArchTag = typename DispatchPolicy::ArchTag;
-  using ElementScale = ElementScale_;
+  using ElementSFA = ElementSFA_;
+  using StrideSFA = StrideSFA_;
+  using ElementSFB = ElementSFB_;
+  using StrideSFB = StrideSFB_;
   using ThrLayoutVMNK = TiledMma::ThrLayoutVMNK;
   static constexpr int warp_on_m = size<1>(ThrLayoutVMNK{});
   static constexpr int warp_on_n = size<2>(ThrLayoutVMNK{});
   static constexpr int ThreadNum = warp_on_m * warp_on_n * 32;
-  static constexpr int GmemTiledCopySFAThrNum = GmemTiledCopySFA::TiledNumThr::value;
   static constexpr int GmemTiledCopySFBThrNum = GmemTiledCopySFB::TiledNumThr::value;
 
-  static_assert(GmemTiledCopySFAThrNum <= ThreadNum && GmemTiledCopySFBThrNum <= ThreadNum, "GmemTiledCopySDThrNum must be less than ThreadNum");
+  static_assert(GmemTiledCopySFBThrNum <= ThreadNum, "GmemTiledCopySDThrNum must be less than ThreadNum");
   static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
   static_assert((size<0>(TileShape{}) % size<0>(SmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
   static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
@@ -1122,6 +1107,48 @@ struct CollectiveMmaScaleFp4
   using SmemLayoutB = decltype(tile_to_shape(
       SmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+  static constexpr int BlockKSFA = size<2>(TileShape{}) / 32;
+  static constexpr int SwizzlePaddingSFA = []() {
+    // element type is uint16_t, when BlockM > 64, need to pad 16 rows in case of bankconflict.
+    if constexpr (shape<0>(TileShape{}) > 64) return 16;
+    else return 0;
+  }();
+  using SmemLayoutSFA_ = decltype(tile_to_shape(
+      SmemLayoutAtomSFA{},
+      make_shape(shape<0>(TileShape{}), Int<BlockKSFA>{}, Int<DispatchPolicy::Stages>{})));
+  using SmemLayoutSFAShape = decltype(shape(SmemLayoutSFA_{}));
+  using SmemLayoutSFAStride_ = decltype(stride(SmemLayoutSFA_{}));
+  static constexpr auto smem_layout_sfa = []() constexpr {
+    if constexpr (rank<0>(SmemLayoutSFA_{}) == 1) {
+      constexpr auto shape_m = get<0>(SmemLayoutSFAShape{});
+      constexpr auto shape_k = get<1>(SmemLayoutSFAShape{});
+      constexpr auto shape_stage = get<2>(SmemLayoutSFAShape{});
+      constexpr auto stride_m = get<0>(SmemLayoutSFAStride_{});
+      constexpr auto stride_k = get<1>(SmemLayoutSFAStride_{});
+      constexpr auto stride_stage = get<2>(SmemLayoutSFAStride_{});
+
+      // if the BlockM is 16, 32, 64, swizzle padding is no need;
+      constexpr auto sfa_shape = make_shape(make_shape(shape_m, Int<1>{}), shape_k, shape_stage);
+      constexpr auto sfa_stride = make_stride(make_stride(stride_m, Int<0>{}), stride_k, stride_stage);
+
+      return Layout<decltype(sfa_shape), decltype(sfa_stride)>{};
+    } else {
+      constexpr auto shape_atom_k = get<0, 1>(SmemLayoutSFAShape{}); // must be <0,1 > rather than <1>
+      constexpr auto stride_atom_m = get<0, 0>(SmemLayoutSFAStride_{});
+      constexpr auto stride_k_block = get<0, 1>(SmemLayoutSFAStride_{}) + Int<SwizzlePaddingSFA>{};
+      constexpr auto stride_outer_m = get<1>(SmemLayoutSFAStride_{});
+      constexpr auto stride_stage = get<2>(SmemLayoutSFAStride_{}) + Int<SwizzlePaddingSFA>{} * Int<shape_atom_k>{};
+
+      constexpr auto sfa_stride = make_stride(make_stride(stride_atom_m, stride_k_block), stride_outer_m, stride_stage);
+
+      return Layout<SmemLayoutSFAShape, decltype(sfa_stride)>{};
+    }
+  }();
+  using SmemLayoutSFA = decltype(smem_layout_sfa);
+  static constexpr int inner_shape = size<0, 0>(SmemLayoutSFA{}.shape());
+  static constexpr int inner_stride = size<0, 1>(SmemLayoutSFA{}.stride());
+  static constexpr int k_block_stride = size<1>(SmemLayoutSFA{}.stride());
+  static constexpr int stage_stride = size<2>(SmemLayoutSFA{}.stride());
 
   static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
 
@@ -1143,46 +1170,26 @@ struct CollectiveMmaScaleFp4
   }();
 
   using BlockScaleShape = Shape<Int<tile_scale_M>, Int<tile_scale_N>, Int<tile_scale_K>>;
-  // The layout of SFA is tranformed during smem to vreg, so it is original tile shape.
-  static constexpr int tile_SFA_M = size<0>(TileShape{});
-  static constexpr int tile_SFA_N = size<1>(TileShape{});
-  static constexpr int tile_SFA_K = size<2>(TileShape{}) / 16 / sizeof(ElementScale);
-  using BlockScaleShapeSFA = Shape<Int<tile_SFA_M>, Int<tile_SFA_N>, Int<tile_SFA_K>>;
-  using SmemLayoutSFA = decltype(make_layout(make_shape(size<0>(BlockScaleShapeSFA{}), size<2>(BlockScaleShapeSFA{}), Int<DispatchPolicy::Stages>{}), make_stride(size<2>(BlockScaleShapeSFA{}), Int<1>{}, size<0>(BlockScaleShapeSFA{}) * size<2>(BlockScaleShapeSFA{}))));
   using SmemLayoutSFB = decltype(make_layout(make_shape(size<1>(BlockScaleShape{}), size<2>(BlockScaleShape{}), Int<DispatchPolicy::Stages>{}), make_stride((size<2>(BlockScaleShape{}) + Int<SwizzlePadding>{}), Int<1>{}, size<1>(BlockScaleShape{}) * (size<2>(BlockScaleShape{}) + Int<SwizzlePadding>{}))));
 
   // align smem M/N by 64 for those tiles that are not divideable by 4 * warp_on_mn, where SmemTiledcopy will cause OOB load.
   static constexpr int tile_scale_M_aligned = cute::ceil_div(tile_scale_M, 4 * warp_on_m) * 4 * warp_on_m;
   static constexpr int tile_scale_N_aligned = cute::ceil_div(tile_scale_N, 4 * warp_on_n) * 4 * warp_on_n;
   using BlockScaleShapeAligned = Shape<Int<tile_scale_M_aligned>, Int<tile_scale_N_aligned>, Int<tile_scale_K>>;
-  using SmemLayoutSFAAligned = decltype(make_layout(make_shape(size<0>(BlockScaleShapeAligned{}), size<2>(BlockScaleShapeAligned{}), Int<DispatchPolicy::Stages>{}), make_stride((size<2>(BlockScaleShapeAligned{})), Int<1>{}, size<0>(BlockScaleShapeAligned{}) * (size<2>(BlockScaleShapeAligned{})))));
   using SmemLayoutSFBAligned = decltype(make_layout(make_shape(size<1>(BlockScaleShapeAligned{}), size<2>(BlockScaleShapeAligned{}), Int<DispatchPolicy::Stages>{}), make_stride((size<2>(BlockScaleShapeAligned{}) + Int<SwizzlePadding>{}), Int<1>{}, size<1>(BlockScaleShapeAligned{}) * (size<2>(BlockScaleShapeAligned{}) + Int<SwizzlePadding>{}))));
-
-  // temporally load SFB in original layout
-  static constexpr int group_size = 64;   // mma scale is reorgnized with 64 rows in a single row;
-  static constexpr int ElementScaleNumIn16bit = sizeof(ElementScale{}) / 2;    // The number of ElementScale in 16 bit.
-
-  static constexpr int K_scale_tile = size<2>(TileShape{}) / (16 * 2);  // uint16
-  static constexpr int stride_m = 16 * K_scale_tile;
-  static constexpr int stride_k0 = 8 * K_scale_tile;
-  static constexpr int stride_k1 = K_scale_tile;
-  static constexpr int stride_stage_m = size<0>(BlockScaleShapeSFA{}) * size<2>(BlockScaleShapeSFA{}) * ElementScaleNumIn16bit;
-  using sSFATransShape = decltype(make_shape(Int<size<0>(TileShape{}) / 16>{}, make_shape(Int<2>{}, Int<8>{}, Int<K_scale_tile>{}), Int<DispatchPolicy::Stages>{}));
-  using sSFATransStride = decltype(make_stride(Int<stride_m>{}, make_stride(Int<stride_k0>{}, Int<stride_k1>{}, Int<1>{}), Int<stride_stage_m>{}));
-  using sSFATransLayout = decltype(make_layout(sSFATransShape{}, sSFATransStride{}));
 
   // warp_num == 1, use sigle warp to issue AIU LOAD
   static constexpr bool SplitAIU = (warp_on_m * warp_on_n) > 1;
+  static constexpr int AIU_SFA_WARP = (SplitAIU && (warp_on_m * warp_on_n) > 2) ? 2 : 0;
 
-  using SmemTiledCopySFA = SmemTiledCopySFA_;
   using SmemTiledCopySFB = SmemTiledCopySFB_;
 
   struct SharedStorage
   {
     cute::array_aligned<ElementA, cute::cosize_v<SmemLayoutA>> smem_a;
     cute::array_aligned<ElementB, cute::cosize_v<SmemLayoutB>> smem_b;
-    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFAAligned>> smem_SFA;
-    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFBAligned>> smem_SFB;
+    cute::array_aligned<ElementSFA, cute::cosize_v<SmemLayoutSFA>> smem_sfa;
+    cute::array_aligned<ElementSFB, cute::cosize_v<SmemLayoutSFBAligned>> smem_sfb;
   };
 
   // Host side kernel arguments
@@ -1192,10 +1199,10 @@ struct CollectiveMmaScaleFp4
     StrideA dA;
     ElementB const* ptr_B;
     StrideB dB;
-    ElementScale const* ptr_scale_A;
-    StrideA dSFA;
-    ElementScale const* ptr_scale_B;
-    StrideB dSFB;
+    ElementSFA const* ptr_scale_A;
+    StrideSFA dSFA;
+    ElementSFB const* ptr_scale_B;
+    StrideSFB dSFB;
   };
 
   // Device side kernel params
@@ -1233,6 +1240,10 @@ struct CollectiveMmaScaleFp4
     // update desc.ptr to current batch, use y_offset as batch will cause smaller bit wide
     gmem_tiled_copy_A.desc_.gmem_ptr += batch_idx * get<2>(params.dA) * sizeof(ElementA);
     gmem_tiled_copy_B.desc_.gmem_ptr += batch_idx * get<2>(params.dB) * sizeof(ElementB);
+
+    using TilerSFA = typename GmemTiledCopySFA::Tiler_MN;
+    constexpr bool TransSFA = true;
+    gmem_tiled_copy_SFA.desc_.init<ElementSFA, TransSFA, get<0>(TilerSFA{}), get<1>(TilerSFA{})>(nullptr, M, cute::ceil_div(K, 32), params.dSFA);
   };
 
   template <class ProblemShape_MNKL, class BlockCoord_MNKL>
@@ -1267,20 +1278,17 @@ struct CollectiveMmaScaleFp4
     Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
 
     // load init scale A/B
-    int K_scale_SFA = ceil_div(cute::ceil_div(K, 16 * 2), ElementScaleNumIn16bit);
-    auto mSFA_layout = make_layout(make_shape(M, K_scale_SFA), LayoutRight{}); // uint32_t
-    auto mSFB_layout = make_layout(make_shape(rectify_SFN, K_scale), LayoutRight{}); // uint32_t
+    auto mSFA_layout = make_layout(make_shape(M, cute::ceil_div(K, 16 * 2)), LayoutLeft{}); // uint16_t
     Tensor mSFA_mk = make_tensor(make_gmem_ptr(params_.ptr_scale_A), mSFA_layout);
-    Tensor gSFA = local_tile(mSFA_mk, select<0, 2>(BlockScaleShapeSFA{}), make_coord(m_coord, _)); // (BLK_M,BLK_K,k)
-    Tensor iSFA_mk = make_identity_tensor(make_shape(M, K_scale_SFA));
-    Tensor cSFA = local_tile(iSFA_mk, select<0, 2>(BlockScaleShapeSFA{}), make_coord(m_coord, _));
+    Tensor gSFA = local_tile(make_mix_tensor_like(mSFA_mk), make_shape(shape<0>(TileShape{}), shape<2>(TileShape{})/32), make_coord(m_coord, _)); // (BLK_M,BLK_K,k)
 
+    auto mSFB_layout = make_layout(make_shape(rectify_SFN, K_scale), LayoutRight{}); // uint32_t
     Tensor mSFB_nk = make_tensor(make_gmem_ptr(params_.ptr_scale_B), mSFB_layout);
     Tensor gSFB = local_tile(mSFB_nk, select<1, 2>(BlockScaleShape{}), make_coord(n_coord, _)); // (BLK_N,BLK_K,k)
     Tensor iSFB_nk = make_identity_tensor(make_shape(rectify_SFN, K_scale));
     Tensor cSFB = local_tile(iSFB_nk, select<1, 2>(BlockScaleShape{}), make_coord(n_coord, _));
 
-    return cute::make_tuple(gA, gB, cute::make_tuple(gSFA, cSFA), cute::make_tuple(gSFB, cSFB));
+    return cute::make_tuple(gA, gB, gSFA, cute::make_tuple(gSFB, cSFB));
   }
 
   template <class ProblemShape>
@@ -1288,6 +1296,39 @@ struct CollectiveMmaScaleFp4
   to_underlying_arguments(ProblemShape const& _, Arguments const& args, void* workspace) {
     (void) workspace;
     return args;
+  }
+
+  static CUTLASS_DEVICE void ld_mat_m8n8_x1_b16(uint128_t const& smem_src, uint32_t& dst0) {
+    uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_src);
+    asm volatile ("ldmatrix.sync.aligned.x1.trans.m8n8.shared.b16 {%0}, [%1];\n"
+      : "=r"(dst0)
+      : "r"(smem_int_ptr));
+  }
+
+  template <typename TensorSFA, int warp_iter_num, int warp_iter_stride>
+  static CUTLASS_DEVICE void cal_ldmat_offset(int& base_offset, TensorSFA& sSFA, const int lane_idx, const int warp_mn_idx, cute::Int<warp_iter_num>, cute::Int<warp_iter_stride>) {
+    constexpr int valid_lane_id = warp_iter_num * 2;
+    if (lane_idx < valid_lane_id) {
+      // each 2 lane consist a group.
+      int group_idx = lane_idx / 2;
+      int is_down = lane_idx % 2;
+      int warp_offset = warp_mn_idx * 16;
+      int group_offset = group_idx * warp_iter_stride;
+      int down_offset = is_down * 8;
+      int offset_ = warp_offset + group_offset + down_offset;
+      base_offset = (offset_ % inner_shape) + (offset_ / inner_shape) * inner_stride;
+    }
+  }
+
+  template <typename TensorSFA, typename TensortCrSFA, int k_block>
+  static CUTLASS_DEVICE void sf_s2r(TensorSFA& sSFA, TensortCrSFA& tCrSFA, const int base_offset, const int lane_idx, cute::Int<k_block>, const int stage) {
+    // for SFA
+    auto& vreg = tCrSFA(Int<0>{}, Int<0>{}, k_block);
+    auto smem_start_ptr_sfa = cute::raw_pointer_cast(sSFA.data());
+
+    constexpr int k_block_offset = k_block * k_block_stride;
+    auto smem_ptr_lane_sfa = smem_start_ptr_sfa + base_offset + k_block_offset + stage * stage_stride;
+    ld_mat_m8n8_x1_b16(*reinterpret_cast<uint128_t const*>(smem_ptr_lane_sfa), vreg);
   }
 
   /// Perform a collective-scoped matrix multiply-accumulate
@@ -1327,10 +1368,8 @@ struct CollectiveMmaScaleFp4
     auto M = get<0>(params_.problem_shape);
     auto N = get<1>(params_.problem_shape);
     auto K = get<2>(params_.problem_shape);
-    auto SFM = cute::ceil_div(M, 16);
     auto SFN = cute::ceil_div(N, 16);
     auto SFK = cute::ceil_div(K, 16 * 2) * 8;
-    auto SFA_K = ceil_div(cute::ceil_div(K, 16 * 2), ElementScaleNumIn16bit);
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -1357,40 +1396,24 @@ struct CollectiveMmaScaleFp4
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
-    Tensor gSFA = get<2, 0>(load_inputs);
+    Tensor gSFA = get<2>(load_inputs);
     Tensor gSFB = get<3, 0>(load_inputs);
-    Tensor cSFA = get<2, 1>(load_inputs);
     Tensor cSFB = get<3, 1>(load_inputs);
 
-    Tensor sSFA = make_tensor(make_smem_ptr(storage.smem_SFA.data()), SmemLayoutSFA{});
-    Tensor sSFB = make_tensor(make_smem_ptr(storage.smem_SFB.data()), SmemLayoutSFB{});
+    Tensor sSFA = make_tensor(make_smem_ptr(storage.smem_sfa.data()), SmemLayoutSFA{});
+    Tensor sSFB = make_tensor(make_smem_ptr(storage.smem_sfb.data()), SmemLayoutSFB{});
 
     auto gmem_thr_copy_SFA = gmem_tiled_copy_SFA.get_thread_slice(thread_idx);
     auto gmem_thr_copy_SFB = gmem_tiled_copy_SFB.get_thread_slice(thread_idx);
 
     Tensor tSFAgSFA = gmem_thr_copy_SFA.partition_S(gSFA);
     Tensor tSFAsSFA = gmem_thr_copy_SFA.partition_D(sSFA);
-    Tensor tSFAcSFA = gmem_thr_copy_SFA.partition_S(cSFA);
 
     Tensor tSFBgSFB = gmem_thr_copy_SFB.partition_S(gSFB);
     Tensor tSFBsSFB = gmem_thr_copy_SFB.partition_D(sSFB);
     Tensor tSFBcSFB = gmem_thr_copy_SFB.partition_S(cSFB);
 
-    Tensor tSFApSFA = make_tensor<bool>(shape(tSFAsSFA(_, _, _, Int<0>{})));
     Tensor tSFBpSFB = make_tensor<bool>(shape(tSFBsSFB(_, _, _, Int<0>{})));
-
-    // copy scale from smem to reg with the converted scale.
-    Tensor sSFAUint16 = recast<uint16_t>(sSFA);
-    Tensor sSFATrans = make_tensor(sSFAUint16.data(), sSFATransLayout{});
-
-    // smem layout for scale A/B
-    SmemTiledCopySFA smem_tiled_copy_SFA;
-    auto smem_thr_copy_SFA = smem_tiled_copy_SFA.get_slice(warp_m_idx * 32 + lane_idx);
-    Tensor tCsSFA = smem_thr_copy_SFA.partition_S(sSFATrans);
-    // Scale vreg for one stage
-    Tensor tCrSFA_stage = smem_thr_copy_SFA.partition_D(sSFATrans(_, _, Int<0>{}));
-    using SFARegType = decltype(make_fragment_like(tCrSFA_stage));
-    SFARegType tCrSFA;
 
     SmemTiledCopySFB smem_tiled_copy_SFB;
     auto smem_thr_copy_SFB = smem_tiled_copy_SFB.get_slice(warp_n_idx * 32 + lane_idx);
@@ -1400,8 +1423,6 @@ struct CollectiveMmaScaleFp4
     using SFBRegType = decltype(make_fragment_like(tCrSFB_stage));
     SFBRegType tCrSFB;
 
-    Tensor tCrSFAUint32 = recast<uint32_t>(tCrSFA);
-
     bool notBoundaryBlocks = get<0>(residue_mnk) >= size<0>(TileShape{}) && get<1>(residue_mnk) >= size<1>(TileShape{});
     auto copy_to_tsm = [&](int k_pipe_write, int k_idx, int warp_idx) {
       copy_aiu<SplitAIU>(
@@ -1409,14 +1430,10 @@ struct CollectiveMmaScaleFp4
         gmem_tiled_copy_B, tBgB(_,_,_,k_idx), tBsB(_,_,_,k_pipe_write),
         warp_idx
       );
+      if (warp_idx == AIU_SFA_WARP) {
+        copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
+      }
       if (__builtin_expect(k_tile_count > 1 && notBoundaryBlocks, 1)) {
-        if constexpr (ThreadNum == GmemTiledCopySFAThrNum) {
-          copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
-        } else {
-          if (threadIdx.x < GmemTiledCopySFAThrNum) {
-            copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
-          }
-        }
         if constexpr (ThreadNum == GmemTiledCopySFBThrNum) {
           copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,k_idx), tSFBsSFB(_,_,_,k_pipe_write));
         } else {
@@ -1426,20 +1443,8 @@ struct CollectiveMmaScaleFp4
         }
       } else {
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tSFApSFA); ++i) {
-          tSFApSFA(i) = get<0>(tSFAcSFA(_, _, _, k_idx)(i)) < M && get<1>(tSFAcSFA(_, _, _, k_idx)(i)) < SFA_K && threadIdx.x < GmemTiledCopySFAThrNum;
-        }
-        CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tSFBpSFB); ++i) {
           tSFBpSFB(i) = get<0>(tSFBcSFB(_, _, _, k_idx)(i)) < SFN && get<1>(tSFBcSFB(_, _, _, k_idx)(i)) < SFK && threadIdx.x < GmemTiledCopySFBThrNum;
-        }
-        // NOTE: Make sure the number of threads that send cp insts be the same with the number of threads in TiledCopy!
-        if constexpr (ThreadNum == GmemTiledCopySFAThrNum) {
-          copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
-        } else {
-          if (threadIdx.x < GmemTiledCopySFAThrNum) {
-            copy_if(gmem_tiled_copy_SFA, tSFApSFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
-          }
         }
         if constexpr (ThreadNum == GmemTiledCopySFBThrNum) {
           copy_if(gmem_tiled_copy_SFB, tSFBpSFB, tSFBgSFB(_,_,_,k_idx), tSFBsSFB(_,_,_,k_pipe_write));
@@ -1500,6 +1505,20 @@ struct CollectiveMmaScaleFp4
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // CPY_N
     CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
 
+    // create rSFA refer to tCsA/tCrA
+    constexpr auto warp_iter_num = size<1>(tCsA);
+    constexpr auto block_iter_num = size<2>(tCsA);
+    constexpr auto warp_iter_stride = [&]() constexpr {
+      if constexpr (cute::is_scaled_basis<decltype(stride<1>(tCsA))>::value) {
+        return stride<1>(tCsA).value();
+      } else {
+        return stride<1>(tCsA);
+      }
+    }();
+    constexpr int ldmat_iter_num = cute::ceil_div(warp_iter_num, Int<4>{});
+    Tensor tCrSFA = make_tensor<uint32_t>(Shape<Int<1>, Int<ldmat_iter_num>, Int<block_iter_num>>{});
+    static_assert(warp_iter_num <= 4, "warp_iter_num > 4 is not valid now.");
+
     //
     // PIPELINED MAIN LOOP
     //
@@ -1511,12 +1530,13 @@ struct CollectiveMmaScaleFp4
 
     Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
     Tensor tCsB_p = tCsB(_,_,_,smem_pipe_read);
-    Tensor tCsSFA_p = tCsSFA(_,_,_,smem_pipe_read);
     Tensor tCsSFB_p = tCsSFB(_,_,_,smem_pipe_read);
 
     // Size of the register pipeline
     auto K_BLOCK_MAX = size<2>(tCrA);
 
+    int base_offset = 0;
+    cal_ldmat_offset(base_offset, sSFA, lane_idx, warp_m_idx, Int<warp_iter_num>{}, Int<warp_iter_stride>{});
     // PREFETCH register pipeline
     if (K_BLOCK_MAX > 1) {
       // Wait until our first prefetched tile is loaded in
@@ -1526,7 +1546,7 @@ struct CollectiveMmaScaleFp4
       // Prefetch the first rmem from the first k-tile
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
       copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
-      copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,Int<0>{}), tCrSFA(_,_,Int<0>{}));
+      sf_s2r(sSFA, tCrSFA, base_offset, lane_idx, Int<0>{}, 0);
       copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,Int<0>{}), tCrSFB(_,_,Int<0>{}));
     }
 
@@ -1548,23 +1568,22 @@ struct CollectiveMmaScaleFp4
           // Slice the smem_pipe_read smem
           tCsA_p = tCsA(_,_,_,smem_pipe_read);
           tCsB_p = tCsB(_,_,_,smem_pipe_read);
-          tCsSFA_p = tCsSFA(_,_,_,smem_pipe_read);
           tCsSFB_p = tCsSFB(_,_,_,smem_pipe_read);
           copy(smem_tiled_copy_A, tCsA_p(_,_,_0{}), tCrA_copy_view(_,_,_0{}));
           copy(smem_tiled_copy_B, tCsB_p(_,_,_0{}), tCrB_copy_view(_,_,_0{}));
-          copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,_0{}), tCrSFA(_,_,_0{}));
+          sf_s2r(sSFA, tCrSFA, base_offset, lane_idx, Int<0>{}, smem_pipe_read);
           copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,_0{}), tCrSFB(_,_,_0{}));
         } else {
           auto k_block_next = k_block + Int<1>{};  // static
           copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
           copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
-          copy(smem_tiled_copy_SFA, tCsSFA_p(_,_,k_block_next), tCrSFA(_,_,k_block_next));
+          sf_s2r(sSFA, tCrSFA, base_offset, lane_idx, k_block_next, smem_pipe_read);
           copy(smem_tiled_copy_SFB, tCsSFB_p(_,_,k_block_next), tCrSFB(_,_,k_block_next));
         }
         // Transform before compute
         cute::transform(tCrA(_,_,k_block), TransformA{});
         cute::transform(tCrB(_,_,k_block), TransformB{});
-        cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrSFAUint32(_,_,k_block), tCrB(_,_,k_block), tCrSFB(_,_,k_block), src_accum);
+        cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrSFA(_,_,k_block), tCrB(_,_,k_block), tCrSFB(_,_,k_block), src_accum);
         if constexpr (k_block == 0) {
           if (k_tile_count > 0){
             copy_to_tsm(smem_pipe_write, *k_tile_iter, warp_idx);
@@ -1594,7 +1613,8 @@ template <int32_t ShapeN, int32_t ShapeK,
 class Fp4Gemm {
   static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
   static_assert((BlockN == 16) || (BlockN == 32) || (BlockN == 64) || (BlockN == 128) || (BlockN == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
-  static_assert((WarpM % 16 == 0), "WarpM must be divideable by 16.");
+  static_assert((BlockK % 32 == 0), "BlockK must be divideable by 32.");
+  static_assert((WarpM <= 64) && (WarpM % 16 == 0), "WarpM must be divideable by 16.");
   static_assert((WarpN % 16 == 0), "WarpN must be divideable by 16.");
 
   // might need to be revised.
@@ -1602,7 +1622,7 @@ class Fp4Gemm {
 public:
     Fp4Gemm() = default;
 
-    static void run(uint8_t *a_ptr, uint8_t *scale_a, uint8_t *b_ptr, uint8_t *scale_b,
+    static void run(uint8_t *a_ptr, uint16_t *scale_a, uint8_t *b_ptr, uint8_t *scale_b,
                     float *c_ptr, __nv_bfloat16 *d_ptr, int shape_m, int *grouped_layout, int *block_m_info, uint32_t expected_m,
                     cudaStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
         constexpr int N_EXPAND = kUseNStageKernel ? KernelAiuMultistageOnN::N_EXPAND : 1;
@@ -1650,40 +1670,42 @@ public:
         using TransformA = cute::identity;
         using TransformB = cute::identity;
 
-        using ScaleCopyElement = cute::uint32_t;
-        using ScaleCopyInst = SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<ScaleCopyElement>;
+        // Use Aiu for SFA
+        using ElementSFA = uint16_t;
+        using LayoutSFA = cutlass::layout::ColumnMajor;
+        constexpr bool TransSFA = true;
+        constexpr int MinAiuContElemSize = 32 / (sizeof_bits<ElementSFA>::value / 8);      // 16
+
+        constexpr int ScaleGranularityK = 32;
+        constexpr int ScaleMsPerTile = BlockM;
+        constexpr int ScaleKsPerTile = BlockK / ScaleGranularityK; // BlockK must divideable by 32
+
+        constexpr int SFATileM = TransSFA ? cute::max(ScaleMsPerTile, MinAiuContElemSize) : ScaleMsPerTile;
+        constexpr int SFATileK = TransSFA ? ScaleKsPerTile : cute::max(ScaleKsPerTile, MinAiuContElemSize);
+
+        constexpr bool swap = true;
+        constexpr int StageStride = 0;
+        constexpr bool swzl = false;
+        using GemmOperandSFA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementSFA, TransSFA, Int<SFATileM>, Int<SFATileK>, swap, StageStride, swzl>;
+
+        // Use Cp.async for SFB
+        using ElementSFB = cute::uint32_t;
+        using LayoutSFB = cutlass::layout::ColumnMajor;
+        using ScaleCopyInst = SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<ElementSFB>;
         // T0/4/8/12 is successive, T1 is next mma for current warp, below other warps
         static constexpr int SFNumOnK_b32 = BlockK / 32 * 8;
         static constexpr int SFCopyThreadsOnBlockN = cute::min(BlockN / 16, ThreadNum / SFNumOnK_b32);
-        // The layout of SFA is tranformed during smem to vreg
-        static constexpr int SFANumOnK_b32 = BlockK / 32 / 2; // 2 means uint32_t
-        static constexpr int SFACopyThreadsOnBlockM = cute::min(BlockM, ThreadNum / SFANumOnK_b32);
-        using ThrLayoutSFA = decltype(make_layout(make_shape(Int<SFACopyThreadsOnBlockM>(), Int<SFANumOnK_b32>()), LayoutRight{}));
-        // each thread read 4 int8 in one atom, use int32 layout to fit with copyOp's register
-        using ValLayoutSFA = decltype(make_layout(make_shape(Int<1>{}, Int<1>{})));
-        using GmemTiledCopySFA = decltype(
-            make_tiled_copy(Copy_Atom<ScaleCopyInst, ScaleCopyElement>{},
-                            ThrLayoutSFA{},
-                            ValLayoutSFA{}));
-
         using ThrLayoutSFB = decltype(make_layout(make_shape(Int<SFCopyThreadsOnBlockN>{}, Int<SFNumOnK_b32>{}), LayoutRight{}));
         // each thread read 4 int8 in one atom, use int32 layout to fit with copyOp's register
         using ValLayoutSFB = decltype(make_layout(make_shape(Int<1>{}, Int<1>{})));
         using GmemTiledCopySFB = decltype(
-            make_tiled_copy(Copy_Atom<ScaleCopyInst, ScaleCopyElement>{},
+            make_tiled_copy(Copy_Atom<ScaleCopyInst, ElementSFB>{},
                             ThrLayoutSFB{},
                             ValLayoutSFB{}));
 
         // TiledCopy for Scale Smem to Reg
         using ScaleCopyInstSmem = UniversalCopy<uint32_t>;
         // T0/4/8/12 is successive, T1 is next mma for current warp, below other warps
-        using ThrLayoutSFASmem = decltype(make_layout(make_shape(make_shape(WarpOnM{}, Int<4>{}), _8{}), make_stride(make_stride(Int<32>{}, _1{}), Int<4>{})));
-        // each thread read 4 int8 in one atom, use int32 layout to fit with copyOp's register
-        using ValLayoutSFASmem = decltype(make_layout(make_shape(_1{}, _2{})));
-        using SmemTiledCopySFA = decltype(
-            make_tiled_copy(Copy_Atom<UniversalCopy<uint16_t>, uint16_t>{},
-                            ThrLayoutSFASmem{},
-                            ValLayoutSFASmem{}));
         using ThrLayoutSFBSmem = decltype(make_layout(make_shape(make_shape(WarpOnN{}, Int<4>{}), _8{}), make_stride(make_stride(Int<32>{}, _1{}), Int<4>{})));
         // each thread read 4 int8 in one atom, use int32 layout to fit with copyOp's register
         using ValLayoutSFBSmem = decltype(make_layout(make_shape(_1{}, _1{})));
@@ -1705,10 +1727,8 @@ public:
           TiledMma,
           typename GemmOperandA::GmemTiledCopy, typename GemmOperandA::SmemLayoutAtom, typename GemmOperandA::SmemCopyAtom, TransformA,
           typename GemmOperandB::GmemTiledCopy, typename GemmOperandB::SmemLayoutAtom, typename GemmOperandB::SmemCopyAtom, TransformB,
-          GmemTiledCopySFA, GmemTiledCopySFB,
-          SmemTiledCopySFA, SmemTiledCopySFB,
-          ScaleCopyElement
-        >;
+          ElementSFA, cutlass::detail::TagToStrideA_t<LayoutSFA>, typename GemmOperandSFA::GmemTiledCopy, typename GemmOperandSFA::SmemLayoutAtom,
+          ElementSFB, cutlass::detail::TagToStrideB_t<LayoutSFB>, GmemTiledCopySFB, SmemTiledCopySFB>;
 
         using EpilogueOutputOp = typename cutlass::platform::conditional<
             hasBias,
@@ -1760,6 +1780,8 @@ public:
         using StrideC = typename GemmKernel::StrideC;
         using StrideD = typename GemmKernel::StrideD;
         using StrideBias  = Stride<_0,_1,int64_t>;
+        using StrideSFA = typename GemmKernel::StrideSFA;
+        using StrideSFB = typename GemmKernel::StrideSFB;
 
         int* layout_info = grouped_layout;
         // compute block_m_info
@@ -1771,8 +1793,9 @@ public:
 
         StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(shape_m, ShapeK, 1));
         StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(ShapeN, ShapeK, 1));
-        StrideA stride_meta_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(shape_m, cute::ceil_div(ShapeK, 16), 1));
-        StrideB stride_meta_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(ShapeN, cute::ceil_div(ShapeK, 16), 1));
+        // SFA is M-Major in uint16_t
+        StrideSFA stride_meta_A = cutlass::make_cute_packed_stride(StrideSFA{}, cute::make_shape(shape_m, cute::ceil_div(ShapeK, 32), 1));
+        StrideSFB stride_meta_B = cutlass::make_cute_packed_stride(StrideSFB{}, cute::make_shape(ShapeN, cute::ceil_div(ShapeK, 16), 1));
         StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(shape_m, 0, 1));
         StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(shape_m, ShapeN, 1));
         StrideBias stride_Bias = {};
@@ -1798,8 +1821,8 @@ public:
               {shape_m, ShapeN, ShapeK},
               reinterpret_cast<ElementA const*>(a_ptr), stride_A,
               reinterpret_cast<ElementB const*>(b_ptr), stride_B,
-              reinterpret_cast<uint32_t*>(scale_a), stride_meta_A,
-              reinterpret_cast<uint32_t*>(scale_b), stride_meta_B
+              reinterpret_cast<ElementSFA*>(scale_a), stride_meta_A,
+              reinterpret_cast<ElementSFB*>(scale_b), stride_meta_B
             },
             epilogue_arguments,
             hw_info, {}, signal

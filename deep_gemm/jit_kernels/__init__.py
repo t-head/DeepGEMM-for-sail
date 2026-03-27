@@ -4,7 +4,7 @@ from .gemm_fp8 import gemm_fp8_fp8_bf16_nt
 from .gemm_fp4 import (
     gemm_fp4_fp4_bf16_nt,
     preprocess_mxfp4_scales,
-    uint8_padding,
+    preprocess_mxfp4_sfa
 )
 from .m_grouped_gemm import (
     # m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
