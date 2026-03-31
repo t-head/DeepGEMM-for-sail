@@ -133,30 +133,23 @@ if __name__ == '__main__':
         return (major, minor)
 
     cuda_ver = parse_cuda_version(torch.version.cuda)
-    should_build_ext = False
-    if cuda_ver <= (12, 6):
-        should_build_ext = True
     
     ext_modules = []
-    if should_build_ext:
-        ext_modules.append(
-            CUDAExtension(name='deep_gemm.deep_gemm_cpp',
-                         sources=sources,
-                         include_dirs=build_include_dirs,
-                         libraries=build_libraries,
-                         library_dirs=build_library_dirs,
-                         extra_compile_args={
-                "cxx": ["-O3", "-std=c++20"],
-                "nvcc": [
-                    "-O3",
-                    "-std=c++20",
-                    "--use_fast_math",
-                    # 可选：指定 nvcc 使用的主机编译器（如 clang）
-                    # "-ccbin", "/usr/bin/clang++-14",
-                    # 指定架构（关键！）
-                    "-gencode=arch=compute_80,code=sm_80",
-                ],   # cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-g']
-            }))
+    ext_modules.append(
+        CUDAExtension(name='deep_gemm.deep_gemm_cpp',
+                        sources=sources,
+                        include_dirs=build_include_dirs,
+                        libraries=build_libraries,
+                        library_dirs=build_library_dirs,
+                        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "--use_fast_math",
+                "-gencode=arch=compute_80,code=sm_80",
+            ],
+        }))
     setuptools.setup(
         name='deep_gemm',
         use_scm_version={

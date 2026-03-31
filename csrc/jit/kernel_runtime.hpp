@@ -39,7 +39,7 @@ public:
             printf("symbols: %s\n", symbols.c_str());
         std::string expected_name = dir_path.filename().string();
         // 去掉前缀 "kernel." 和后缀哈希（根据你的命名规则调整）
-        if (expected_name.starts_with("kernel.")) {
+        if (expected_name.rfind("kernel.", 0) == 0) {
             expected_name = expected_name.substr(7); // remove "kernel."
         }
         size_t dot_pos = expected_name.find('.');
