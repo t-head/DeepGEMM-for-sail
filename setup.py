@@ -9,7 +9,6 @@ from setuptools import find_packages
 from torch.utils.cpp_extension import CppExtension, CUDA_HOME, CUDAExtension, BuildExtension
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
-# cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-g']
 
 sources = ['csrc/python_api.cu']
 build_include_dirs = [
@@ -36,8 +35,6 @@ third_party_include_dirs = [
     'third-party/cutlass3/include/ppu',
     'third-party/cutlass3/tools'
 ]
-
-
 
 class PostDevelopCommand(develop):
     def run(self):
@@ -123,17 +120,6 @@ if __name__ == '__main__':
         revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
     except:
         revision = ''
-
-    cuda_version = torch.version.cuda
-
-    def parse_cuda_version(version_str):
-        if version_str is None:
-            return (0, 0)
-        major, minor = map(int, version_str.split('.')[:2])
-        return (major, minor)
-
-    cuda_ver = parse_cuda_version(torch.version.cuda)
-    
     ext_modules = []
     ext_modules.append(
         CUDAExtension(name='deep_gemm.deep_gemm_cpp',
@@ -147,7 +133,6 @@ if __name__ == '__main__':
                 "-O3",
                 "-std=c++17",
                 "--use_fast_math",
-                "-gencode=arch=compute_80,code=sm_80",
             ],
         }))
     setuptools.setup(

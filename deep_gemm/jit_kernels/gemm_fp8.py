@@ -245,7 +245,7 @@ def get_best_configs_dense(m: int, n: int, k: int, num_groups: int, num_sms: int
     num_waves = get_num_waves(best_block_m, best_block_n)
     num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
     assert num_min_sms <= num_sms
-
+    
     warp_m = best_block_m // 4
     warp_n = best_block_n // 4
 

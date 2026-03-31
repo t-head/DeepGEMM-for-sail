@@ -676,7 +676,6 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
-
     extra_info = get_extra_info()
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,

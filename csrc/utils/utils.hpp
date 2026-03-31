@@ -3,6 +3,7 @@
 #include <string>
 #include <torch/version.h>
 #include <ATen/cuda/CUDAContext.h>
+#include "math.hpp"
 
 namespace deep_gemm {
 
@@ -15,16 +16,14 @@ torch::Tensor get_col_major_tma_aligned_tensor(const torch::Tensor& x) {
     auto dtype = x.dtype();
     auto device = x.device();
 
-    // 获取元素大小以计算对齐
     int64_t element_size = x.element_size();
     int64_t aligned_m = get_tma_aligned_size(m, element_size);
 
     torch::Tensor x_view = x;
 
-    // 如果是二维张量，扩展成三维以便统一处理
     if (x.dim() == 2) {
         if (x.stride(0) == 1 && x.stride(1) == aligned_m) {
-            return x;  // 已经是对齐的列主序
+            return x;
         }
         x_view = x.unsqueeze(0);
         remove_dim = true;
@@ -32,27 +31,20 @@ torch::Tensor get_col_major_tma_aligned_tensor(const torch::Tensor& x) {
 
     int64_t b = x_view.size(0);
 
-    // 检查是否已经符合 TMA 要求的内存布局：
-    // stride(0) = aligned_m * n （batch 维度跳跃）
-    // stride(1) = 1             （行方向连续）
-    // stride(2) = aligned_m     （列方向跳跃）
     if (x_view.stride(0) == aligned_m * n &&
         x_view.stride(1) == 1 &&
         x_view.stride(2) == aligned_m) {
         return remove_dim ? x_view.squeeze(0) : x_view;
     }
 
-    // 不符合条件时需要重新分配和复制数据
     auto options = torch::TensorOptions().dtype(dtype).device(device);
     torch::Tensor aligned_x = torch::transpose(
         torch::empty({b, n, aligned_m}, options),
         1, 2
     );
 
-    // 复制有效区域
     aligned_x.slice(1, 0, m).copy_(x_view);
 
-    // 截断多余部分
     aligned_x = aligned_x.slice(1, 0, m);
 
     return remove_dim ? aligned_x.squeeze(0) : aligned_x;

@@ -45,10 +45,6 @@ using namespace cute;
 namespace deep_gemm {
 using cutlass::KernelHardwareInfo;
 
-struct KernelAiuMultistageOnN {
-  constexpr static int N_EXPAND = 4;
-};
-
 template <
   class ProblemShape_,
   class CollectiveMainloop_,

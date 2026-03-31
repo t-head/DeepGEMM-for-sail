@@ -2,77 +2,11 @@
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
-#include "../../utils/python2cpp.hpp"
+#include "../../utils/utils.hpp"
 #include "gemm_search_space.hpp"
 
 using namespace deep_gemm;
-namespace deep_gemm_bf16 {
-// struct MulticastConfig {
-//     int num_multicast;
-//     bool is_multicast_on_a;
-
-//     MulticastConfig(const int& num_multicast, const bool& is_multicast_on_a):
-//         num_multicast(num_multicast), is_multicast_on_a(is_multicast_on_a) {
-//         DG_HOST_ASSERT(1 <= num_multicast and num_multicast <= 2);
-//     }
-// };
-
-// struct SharedMemoryConfig {
-//     int smem_size;
-//     int swizzle_a_mode;
-//     int swizzle_b_mode;
-//     int swizzle_cd_mode;
-// };
-
-// struct ThreadConfig {
-//     int num_threads;
-
-//     // SM90
-//     int num_tma_threads;
-//     int num_math_threads;
-
-//     // SM100
-//     int num_non_epilogue_threads;
-//     int num_epilogue_threads;
-
-//     static ThreadConfig sm90(const int& num_tma_threads,
-//                              const int& num_math_threads) {
-//         auto config = ThreadConfig();
-//         config.num_threads = num_tma_threads + num_math_threads;
-//         config.num_tma_threads = num_tma_threads;
-//         config.num_math_threads = num_math_threads;
-//         return config;
-//     }
-
-//     static ThreadConfig sm100(const int& num_non_epilogue_threads,
-//                               const int& num_epilogue_threads) {
-//         auto config = ThreadConfig();
-//         config.num_threads = num_non_epilogue_threads + num_epilogue_threads;
-//         config.num_non_epilogue_threads = num_non_epilogue_threads;
-//         config.num_epilogue_threads = num_epilogue_threads;
-//         return config;
-//     }
-// };
-
-// static bool is_multicast_legal(const int& shape_dim, const int& block_dim,
-//                                const int& num_multicast, const int& num_sms,
-//                                const bool& require_divisible) {
-//     const bool& divisible = ceil_div(shape_dim, block_dim) % num_multicast == 0 or not require_divisible;
-//     return divisible and num_sms % num_multicast == 0;
-// }
-
-// template <typename size_type_t>
-// static int get_swizzle_mode(const int& block_size, const size_type_t& elem_size) {
-//     // `> 0` means interleaving
-//     // 16B actually means non-swizzling (but interleaving)
-//     for (const int& mode: {128, 64, 32, 16}) {
-//         if ((block_size * static_cast<int>(elem_size)) % mode == 0)
-//             return mode;
-//     }
-//     DG_HOST_UNREACHABLE("Unreachable");
-// }
-
-
+namespace deep_gemm_bf16_common {
 std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, int block_n, int block_k = 128, int bpp = 2) {
     // Try swizzle first, as it does not waste shared memory
     int swizzle_mode = 128;
@@ -262,7 +196,6 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         // Filter block_ns
         std::vector<int> block_ns_after_filter;
         for (int block_n : block_ns) {
-            std::cout << "liyefeng block_m n is " << block_m << std::endl;
             bool condition;
             if (is_ppu1v5_device() && ((m >= 128 && k > 2048) || m >= 256)) {
                 condition = (block_n != n && n >= 32) && !(block_m == 16 && block_n <= 32);
@@ -390,7 +323,6 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     
     int warp_m = best_block_m / 2;
     int warp_n = best_block_n / 2;
-    std::cout << "best_block_n is " << best_block_n << std::endl;
     
     if (best_block_m == 256 && best_block_n == 256) {
         warp_m = best_block_m / 4;

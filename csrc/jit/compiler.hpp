@@ -13,6 +13,7 @@
 #include "../utils/hash.hpp"
 #include "../utils/lazy_init.hpp"
 #include "../utils/system.hpp"
+#include "../utils/utils.hpp"
 #include "cache.hpp"
 #include "device_runtime.hpp"
 #include "acarch.h"
@@ -86,6 +87,7 @@ public:
     }
 
     int32_t get_max_block_per_cu() {
+        
         return Compiler::blocks_per_cu;
     }
 
@@ -102,7 +104,6 @@ public:
     }
 
     std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code, int32_t thread_num = 0, int32_t smem_size = 0) const {
-        // auto start = std::chrono::high_resolution_clock::now();
         const auto kernel_signature = fmt::format("{}$${}$${}$${}$${}", name, library_version, signature, flags, code);
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
@@ -124,9 +125,6 @@ public:
         // Put into the runtime cache
         const auto& runtime = kernel_runtime_cache->get(dir_path);
         DG_HOST_ASSERT(runtime != nullptr);
-        // auto end = std::chrono::high_resolution_clock::now();
-        // auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        // std::cout << "[C++/NVRTC] 编译耗时: " << duration.count() << "ms" << std::endl;
         return runtime;
     }
 
@@ -169,16 +167,24 @@ public:
         const auto& [nvcc_major, nvcc_minor] = get_nvcc_version();
         signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);
 
-        // The override the compiler flags
-        // Only NVCC >= 12.9 supports arch-specific family suffix
         const auto& arch = 89;//device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
-        flags = fmt::format("{} -I{}/cutlass3 -I{}/deep_gemm -gencode=arch=compute_89,code=sm_{} "
+        
+        auto arch_flag = "";
+        if (is_ppu1v5_device()) {
+            arch_flag = "-gencode=arch=compute_89,code=sm_89";
+            flags = fmt::format("{} -I{}/cutlass3 -I{}/deep_gemm {} "
                             ",-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
-                            "-cubin --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), library_include_path.c_str(), arch);
-        bool is_ppu1v5_device = true;
+                            "-cubin --expt-relaxed-constexpr --expt-extended-lambda ",
+                            flags, library_include_path.c_str(), library_include_path.c_str(), arch_flag);
+        } else {
+            arch_flag = "-gencode=arch=compute_80a,code=sm_80a";
+            flags = fmt::format("{} -I{} -I{}/cutlass -I{}/deep_gemm {} "
+                            ",-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
+                            "-cubin --expt-relaxed-constexpr --expt-extended-lambda ",
+                            flags, library_include_path.c_str(), library_include_path.c_str(), library_include_path.c_str(), arch_flag);
+        }
         std::string nvcc_flags;
-        if (is_ppu1v5_device) {
+        if (is_ppu1v5_device()) {
             nvcc_flags = " -ppu-patch-fence-ppu=false -wno-loop-miss-transform -ppu-cg-to-kp1=true "
             "-ppu-fix-uninit=true -mllvm -ppu-blksync-nb-schedule-boundary=true -mllvm -ppu-simt-branch=false "
             "-mllvm -ppu-adjust-tsm-valu-war=13 -mllvm -ppu-reassign-subregs=true -mllvm -ppu-pref-fma-reuse=true "
@@ -274,15 +280,13 @@ public:
             opts_insert({"-DNDEBUG", "-DUSE_CLANG", "-no-cache"});
             if (arch == AC_PPU0010) {
                 opts_insert({
-                    "--gpu-architecture=compute_80",
                     "-DACOMPUTE_VERSION=10000",
                     "--ppu-arch=ppu001",
                 });
             } else if (arch == AC_PPU0015) {
                 opts_insert({
-                    "--gpu-architecture=compute_89",
-                    "-DACOMPUTE_VERSION=10500",
                     "--ppu-arch=ppu0015",
+                    "-DACOMPUTE_VERSION=10500",
                     "--ppu-tuning-options=-ppu-patch-fence-ppu=false",
                     "--ppu-tuning-options=-wno-loop-miss-transform",
                     "--ppu-tuning-options=-ppu-simt-branch=false",
@@ -344,18 +348,17 @@ public:
             });
         #endif
 
-            std::string standard = (arch == AC_PPU0010) ? "--std=c++11" : "--std=c++17";
-            // cuda should use c++17 to avoid compile error on numeric_limits in platform.h
-        #if (!defined __HGGCCC__ && ! defined USE_HGGC)
-            standard = "--std=c++17";
-        #endif
+            std::string standard = "--std=c++17";
             opts.emplace_back(standard);
-            // for (size_t i = 0; i < opts.size(); ++i) {
-            //   printf("\nopts[%zu] = %s\n", i, opts[i].c_str());
-            // }
-
             opts_char.resize(opts.size());
             std::transform(opts.begin(), opts.end(), opts_char.begin(), [](const std::string& s) { return s.c_str(); });
+
+            // std::cout << "--- NVRTC Options Debug ---" << std::endl;
+            // for (size_t i = 0; i < opts.size(); ++i) {
+            //     std::cout << "  [" << i << "] '" << opts[i] << "'" << std::endl;
+            // }
+            // std::cout << "---------------------------" << std::endl;
+
         }
 
         size_t size() {
@@ -376,30 +379,6 @@ public:
         DG_NVRTC_CHECK(nvrtcVersion(&major, &minor));
         signature = fmt::format("NVRTC{}.{}", major, minor);
         DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVRTC version should be >= 12.3");
-
-        // Build include directories list
-        // std::cout << "\n library_include_path.string() is " << library_include_path.string() << std::endl;
-        // std::string include_dirs;
-        // include_dirs += fmt::format("-I{}/cutlass3 -I{}/deep_gemm ", library_include_path.string(), library_include_path.string());
-        // include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
-
-        // Add PCH support for version 12.8 and above
-        // NOTES: PCH is vital for compilation speed
-        // LiTODO
-        // std::string pch_flags;
-        // if (major > 12 or minor >= 8) {
-        //     pch_flags = "--pch ";
-        //     if (get_env<int>("DG_JIT_DEBUG", 0))
-        //         pch_flags += "--pch-verbose=true ";
-        // }
-        // Override the compiler flags
-        // Only NVRTC >= 12.9 supports arch-specific family suffix
-        // RtcOptions opts(arch, use_cutlass3);
-
-
-        // const auto& arch = 89;// LiTODO device_runtime->get_arch(false, major > 12 or minor >= 9);
-        // flags = fmt::format("{} {}--gpu-architecture=sm_{} -default-device {} -DNDEBUG -DUSE_CLANG -no-cache",
-        //                     flags, include_dirs, arch, pch_flags);
         
     }
 
@@ -408,30 +387,13 @@ public:
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);
         // const auto& arch = 89;
-        bool use_cutlass3 = true;
-        acArch_t arch = AC_PPU0015;
+        acArch_t arch = AC_PPU0010;
+        bool use_cutlass3 = false;
+        if (is_ppu1v5_device()) {
+            arch = AC_PPU0015;
+            use_cutlass3 = true;
+        }
         RtcOptions opts(arch, use_cutlass3);
-
-        // // Parse compilation options
-        // std::istringstream iss(flags);
-        // std::vector<std::string> options;
-        // std::string option;
-        // while (iss >> option)
-        //     options.push_back(option);
-
-        // // Convert to C-style string array for NVRTC
-        // std::vector<const char*> option_cstrs;
-        // for (const auto& opt: options)
-        //     option_cstrs.push_back(opt.c_str());
-
-        // Print compiler command if requested
-        // if (get_env<int>("DG_JIT_DEBUG", 0) or get_env<int>("DG_JIT_PRINT_COMPILER_COMMAND", 0)) {
-        //     printf("Compiling JIT runtime with NVRTC options: ");
-        //     for (const auto& opt: options)
-        //         printf("%s ", opt.c_str());
-        //     printf("\n");
-        // }
-
         // Create NVRTC program and compile
         nvrtcProgram program;
         DG_NVRTC_CHECK(nvrtcCreateProgram(&program, code.c_str(), "kernel.cu", 0, nullptr, nullptr));
@@ -457,13 +419,12 @@ public:
 
         // Write into the file system
         put(cubin_path, cubin_data);
-        std::cout << "cubin_path is " << cubin_path << std::endl;
         // Cleanup
         DG_NVRTC_CHECK(nvrtcDestroyProgram(&program));
         
 
         CUmodule module;
-        cuModuleLoadData(&module, cubin_data.data()); 
+        cuModuleLoadData(&module, cubin_data.data());
 
         CUfunction kernel_func;
         cuModuleGetFunction(&kernel_func, module, name.c_str());
@@ -478,9 +439,6 @@ public:
         if (result != CUDA_SUCCESS) {
             printf("Get Max active blocks per SM failed!\n");
         }
-
-        // printf("Max active blocks per SM: %d\n", maxBlocksPerSM);
-
     }
 };
 

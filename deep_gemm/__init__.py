@@ -8,10 +8,10 @@ from torch.utils.cpp_extension import CUDA_HOME
 from . import jit
 from . import deep_gemm_tuner
 from .jit_kernels import (
+    gemm_fp4_fp4_bf16_nt,
     gemm_bf16_bf16_bf16_nt,
     gemm_int8_int8_bf16_nt,
-    # gemm_fp8_fp8_bf16_nt,
-    gemm_fp4_fp4_bf16_nt,
+    gemm_fp8_fp8_bf16_nt,
     m_grouped_gemm_fp4_fp4_bf16_nt_masked,
     m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
     preprocess_mxfp4_scales,
@@ -69,18 +69,21 @@ if should_init_deep_gemm_cpp:
         gemm_fp8_fp8_bf16_nt,
         # fp8_gemm_nn,
         # fp8_gemm_tn, fp8_gemm_tt,
-        # gemm_bf16_bf16_bf16_nt
+        gemm_bf16_bf16_bf16_nt,
+        gemm_int8_int8_bf16_nt,
         # fp8_gemm_nt_skip_head_mid,
     )
+    
+
     deep_gemm_cpp.init(
         os.path.dirname(os.path.abspath(__file__)), # Library root directory path
         CUDA_HOME         # CUDA home
     )
-else:
-    from .jit_kernels import gemm_fp8_fp8_bf16_nt
+
 
 # Some alias for APIs
 fp8_gemm_nt = gemm_fp8_fp8_bf16_nt
 fp8_m_grouped_gemm_nt_masked = m_grouped_gemm_fp8_fp8_bf16_nt_masked
 m_grouped_fp8_gemm_nt_contiguous = m_grouped_gemm_fp8_fp8_bf16_nt_contiguous
 get_mn_major_tma_aligned_tensor = get_col_major_tma_aligned_tensor
+

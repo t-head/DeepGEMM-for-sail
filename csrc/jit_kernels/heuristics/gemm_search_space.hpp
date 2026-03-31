@@ -8,7 +8,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
-#include "../../utils/python2cpp.hpp"
+#include "../../utils/utils.hpp"
 
 inline int align(int x, int y) {
     return ceil_div(x, y) * y;
@@ -46,7 +46,7 @@ public:
         int tc_inst_fp16_k;
         double max_reg_utils;
         
-        HWMetric() : cu_count(get_num_sms()) {
+        HWMetric() : cu_count(::deep_gemm::get_num_sms()) {
             mmad_cal_bpp = 4;
             share_mem_size = 256 * 1024;
             max_warps_per_cu = 64;

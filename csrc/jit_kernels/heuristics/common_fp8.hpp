@@ -2,9 +2,9 @@
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
-#include "../../utils/python2cpp.hpp"
+#include "../../utils/utils.hpp"
 using namespace deep_gemm;
-namespace deep_gemm_fp8 {
+namespace deep_gemm_fp8_common {
 
 struct MulticastConfig {
     int num_multicast;
@@ -52,27 +52,6 @@ struct ThreadConfig {
         return config;
     }
 };
-
-// struct GemmConfig {
-//     // Templated configs
-//     GemmType gemm_type;
-//     // KernelType kernel_type;
-//     // at::ScalarType ab_dtype, cd_dtype;
-//     cute::UMMA::Major major_a;
-//     cute::UMMA::Major major_b;
-//     // bool with_accumulation;
-//     int block_m, block_n, block_k;
-//     int num_stages, num_last_stages;
-
-//     // Templated device configs
-//     int num_sms;
-//     int tc_util;
-
-//     // Structured configs
-//     MulticastConfig multicast_config;
-//     SharedMemoryConfig smem_config;
-//     ThreadConfig thread_config;
-// };
 
 static bool is_multicast_legal(const int& shape_dim, const int& block_dim,
                                const int& num_multicast, const int& num_sms,
@@ -236,7 +215,6 @@ ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num
     int num_waves_final = get_num_waves(best_block_m, best_block_n);
     int num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves_final);
     assert(num_min_sms <= num_sms);
-    
     int warp_m = best_block_m / 4;
     int warp_n = best_block_n / 4;
     

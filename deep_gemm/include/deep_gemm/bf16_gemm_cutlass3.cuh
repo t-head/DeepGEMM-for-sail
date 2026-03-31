@@ -34,15 +34,6 @@
 using namespace cute;
 
 namespace cutlass::gemm {
-
-struct KernelAiuMultistageOnN {
-  constexpr static int N_EXPAND = 4;
-};
-
-
-struct KernelAiuMultistageOverlapPrologue {};
-struct KernelAiuMultistageOverlapMainloop {};
-
 template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapPrologue>
 struct MainloopAcomputeOverlapPrologue {
   constexpr static int Stages = Stages_;
@@ -66,12 +57,10 @@ struct MainloopAcomputeAiuOpt {
   using Schedule = Schedule_;
   using ClusterShape = Shape<_1,_1,_1>;
 };
-
 } // namespace cutlass::gemm
 
 
 namespace cutlass::gemm::kernel {
-
 ///////////////////////////////////////////////////////////////////////////////
 template <
   class ProblemShapeOrThreadblockMma_, // (m, n, k) or (m, n, k, l)
@@ -606,7 +595,6 @@ public:
 };
 
 ///////////////////////////////////////////////////////////////////////////////
-
 } // namespace cutlass::gemm::kernel
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2860,16 +2848,16 @@ public:
             Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
             Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _16>>;       // 1x1x1 value group
 
-        static constexpr int N_EXPAND = kKernelType == KernelType::MultistageOnN && (SHAPE_N % (BLOCK_N) == 0) ? cutlass::gemm::KernelAiuMultistageOnN::N_EXPAND : 1;
+        static constexpr int N_EXPAND = kKernelType == KernelType::MultistageOnN && (SHAPE_N % (BLOCK_N) == 0) ? KernelAiuMultistageOnN::N_EXPAND : 1;
         using KernelSchedule = cute::conditional_t<
             kKernelType == KernelType::OverlapMainloop,
-            cutlass::gemm::KernelAiuMultistageOverlapMainloop,
+            KernelAiuMultistageOverlapMainloop,
             cute::conditional_t<
               kKernelType == KernelType::OverlapPrologue,
-              cutlass::gemm::KernelAiuMultistageOverlapPrologue,
+              KernelAiuMultistageOverlapPrologue,
               cute::conditional_t<
                 kKernelType == KernelType::MultistageOnN,
-                cutlass::gemm::KernelAiuMultistageOnN,
+                KernelAiuMultistageOnN,
                 cutlass::gemm::KernelAiuMultistage>>>;
         using DispatchPolicy = cute::conditional_t<
             kKernelType == KernelType::OverlapMainloop,

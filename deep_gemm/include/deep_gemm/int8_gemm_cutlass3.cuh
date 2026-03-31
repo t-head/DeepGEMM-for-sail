@@ -3,11 +3,9 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 // #define ACOMPUTE_VERSION 10000
-#ifndef FP8_NVRTC
+#ifndef INT8_NVRTC
     #include "profiling_interface.hpp"
 #endif
-// #include <iostream>
-// #include <stdlib.h>
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/mma.h"
@@ -33,12 +31,6 @@
 using namespace cute;
 
 namespace cutlass::gemm {
-
-struct KernelAiuMultistageOnN {
-  constexpr static int N_EXPAND = 4;
-};
-
-struct KernelAiuMultistageOverlapPrologue {};
 
 template<int Stages_, typename Schedule_ = KernelAiuMultistage>
 struct MainloopAcomputeAiuA8W8 {
@@ -1644,7 +1636,6 @@ public:
             launch_dynamic_tile_kernel(GemmKernel{});
           }
         } else {
-
           using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
           using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>;
           static constexpr int WarpOnM = BLOCK_M / WARP_M;
@@ -1659,16 +1650,16 @@ public:
           constexpr int EnableMultistageOnN = kKernelType == KernelType::MultistageOnN
                                               && (SHAPE_N % (BLOCK_N) == 0)
                                               && (SHAPE_K > (BLOCK_K * kNumStages));
-          static constexpr int N_EXPAND = EnableMultistageOnN ? cutlass::gemm::KernelAiuMultistageOnN::N_EXPAND : 1;
+          static constexpr int N_EXPAND = EnableMultistageOnN ? KernelAiuMultistageOnN::N_EXPAND : 1;
           constexpr int EnableOverlapPrologue = kKernelType == KernelType::OverlapPrologue;
                                           // && (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(int8_t) >= WarpOnM * 16 * BLOCK_N * sizeof(int32_t); // to impl
 
           using KernelSchedule = cute::conditional_t<
               EnableOverlapPrologue,
-              cutlass::gemm::KernelAiuMultistageOverlapPrologue,
+              KernelAiuMultistageOverlapPrologue,
               cute::conditional_t<
                 EnableMultistageOnN,
-                cutlass::gemm::KernelAiuMultistageOnN,
+                KernelAiuMultistageOnN,
                 cutlass::gemm::KernelAiuMultistage>>;
 
           using DispatchPolicy = cute::conditional_t<
@@ -1817,7 +1808,6 @@ public:
 
     }
 };
-
 };  // namespace deep_gemm
 
 #pragma clang diagnostic pop

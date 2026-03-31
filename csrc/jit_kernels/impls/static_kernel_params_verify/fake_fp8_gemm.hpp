@@ -3,7 +3,7 @@
 namespace deep_gemm {
 using namespace cute;
 using cutlass::KernelHardwareInfo;
-static size_t get_tample_params_size() {
+static size_t get_fp8_tample_params_size() {
   constexpr int SHAPE_N = 256;
   constexpr int SHAPE_K = 256;
   constexpr int BLOCK_M = 64;
@@ -18,7 +18,7 @@ static size_t get_tample_params_size() {
   using LayoutSFA           = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
   using LayoutSFB           = decltype(ScaleConfig::deduce_layoutSFB());
   static constexpr bool kEnableMultistageOnN = false;
-  static constexpr bool kUseNStageKernel = SHAPE_K <= 512 && (SHAPE_N % (BLOCK_N * KernelAiuMultistageOnN::N_EXPAND) == 0) && (BLOCK_K == 128);
+  static constexpr bool kUseNStageKernel = SHAPE_K <= 512 && (SHAPE_N % (BLOCK_N * KernelAiuMultistageOnN::N_EXPAND) == 0) && (BLOCK_K == 128) && STAGES == 2;
 
   constexpr int N_EXPAND = kUseNStageKernel ? 4 : 1;
 

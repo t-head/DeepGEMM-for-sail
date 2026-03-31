@@ -19,7 +19,6 @@ from enum import Enum
 import ast
 from math_utils import *
 import numpy as np
-
 global _acc_check, _benchmark, _ref_backend
 global use_ppu, show_log
 _acc_check, _benchmark, use_ppu = True, False, True
@@ -442,7 +441,6 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d: tor
         if _acc_check:
             ref_out[start:aligned_end] = x[start:aligned_end] @ y[i].t()
         start = aligned_end
-
     if _acc_check:
         ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
 
@@ -654,7 +652,7 @@ def read_cycle_from_nculog(filename):
         op = kernel_list[i]
         cycle = cycles_list[i]
         op_cycles[op] = cycle
-        if "deep_gemm" in op.lower():
+        if "gemm" in op.lower():
             fwd_cycle_sum += cycle
             fwd_tc_sum = tc_list[i]
             fwd_hbm_sum = hbm_list[i]

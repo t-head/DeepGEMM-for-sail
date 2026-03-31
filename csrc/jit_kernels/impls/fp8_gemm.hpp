@@ -11,7 +11,7 @@
 #include "../../utils/exception.hpp"
 #include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
-#include "../../utils/python2cpp.hpp"
+#include "../../utils/utils.hpp"
 #include "../../utils/layout_type_name.hpp"
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_fp8.hpp"
@@ -20,22 +20,20 @@
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "ppu/cutlass/detail/blockwise_scale_layout.hpp"
 #include "../../../deep_gemm/include/deep_gemm/utils_rtc.cuh"
-#include "epilogue.hpp"
-#include "runtime_utils.hpp"
 #include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
-#include "ppu10500_int8_gemm.hpp"
-#include "fake_fp8_gemm.hpp"
+#include "int8_gemm.hpp"
+// #include "static_kernel_params_verify/fake_fp8_gemm.hpp"
 
-using namespace deep_gemm_fp8;
+using namespace deep_gemm_fp8_common;
 namespace deep_gemm {
 
 class ComputeBlockInfoKernelRuntime final: public LaunchRuntime<ComputeBlockInfoKernelRuntime> {
 public:
 
     struct ComputeBlockInfoArguments {
-      const uint32_t* grouped_layout;  // 分组布局指针
-      uint32_t num_groups;              // 分组数量
-      uint32_t* block_m_info;          // Block信息输出指针
+      const uint32_t* grouped_layout;
+      uint32_t num_groups;
+      uint32_t* block_m_info;
     };
 
     struct Args {
@@ -122,7 +120,6 @@ __global__ void computeBlockInfoKernel(
 }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        // TODO: optimize `args` copy
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.launch_attr_args));
     }
 };
@@ -141,8 +138,6 @@ public:
     using LayoutD             = cutlass::layout::RowMajor;
     using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
 
-    // 问题尺寸
-
     using GemmProblemSize = cute::tuple<int32_t,int32_t,int32_t,int32_t>;
 
     struct MainLoopArguments {
@@ -157,18 +152,6 @@ public:
       LayoutSFB layout_SFB;
     };
 
-    // struct CallBack {
-    //   float alpha = float(1);
-    //   float beta = float(0);
-    //   float const* alpha_ptr = nullptr;
-    //   float const* beta_ptr = nullptr;
-
-    //   using StrideAlpha = cute::Stride<cute::Int<0>,cute::Int<0>,int64_t>;
-    //   using StrideBeta  = cute::Stride<cute::Int<0>,cute::Int<0>,int64_t>;
-    //   StrideAlpha dAlpha = {cute::Int<0>{}, cute::Int<0>{}, 0};
-    //   StrideBeta  dBeta  = {cute::Int<0>{}, cute::Int<0>{}, 0};
-    // };
-
     struct LinearCombinationArgs {
       float alpha = 1.0f;                         ///< scales accumulators
       float beta = 0.0f;                         ///< scales source tensor
@@ -177,14 +160,14 @@ public:
       float const* const* alpha_ptr_array = nullptr; ///< array of pointers to accumulator scalar per group/batch
       float const* const* beta_ptr_array = nullptr;  ///< array of pointers to source scalar per group/batch
 // #if SUPPORT_FP8_SCALING
-      // float scale_a = float(1);
-      // float scale_b = float(1);
-      // float scale_c = float(1);
-      // float scale_d = float(1);
-      // float const* scale_a_ptr = nullptr;
-      // float const* scale_b_ptr = nullptr;
-      // float const* scale_c_ptr = nullptr;
-      // float const* scale_d_ptr = nullptr;
+//       float scale_a = float(1);
+//       float scale_b = float(1);
+//       float scale_c = float(1);
+//       float scale_d = float(1);
+//       float const* scale_a_ptr = nullptr;
+//       float const* scale_b_ptr = nullptr;
+//       float const* scale_c_ptr = nullptr;
+//       float const* scale_d_ptr = nullptr;
 // #endif
     };
 
@@ -219,35 +202,6 @@ public:
       int32_t* signal{nullptr};
     };
 
-    // struct EmptyArgs {};
-
-    // struct ScalarBroadcastArgs {
-    //   float        value;  // 标量值 (beta/alpha)
-    //   float const* ptr;    // 可选设备指针 (nullptr 表示使用 value)
-    //   cute::Stride<cute::Int<0>,cute::Int<0>,int64_t> stride; // 广播步长 (标量场景下通常为 0，但需占位)
-    // };
-
-    // struct InnerMultiplyArgs {
-    //   ScalarBroadcastArgs alpha_args; // {{alpha}, {alpha_ptr}, {dAlpha}}
-    //   EmptyArgs           acc_args;   // {} (Sm90AccFetch 无参数)
-    //   EmptyArgs           op_args;    // {} (multiplies 操作无运行时参数)
-    // };
-
-    // struct LinearCombinationArgs {
-    //   ScalarBroadcastArgs beta_args;   // {{beta}, {beta_ptr}, {dBeta}}
-    //   EmptyArgs           c_args;      // {} (Sm90SrcFetch 参数由外层 epilogue 框架注入)
-    //   InnerMultiplyArgs   inner_args;  // { {{alpha},...}, {}, {} }
-    //   EmptyArgs           op_args;     // {} (homogeneous_multiply_add 无运行时参数)
-    // };
-
-    // struct CollectiveEpilogueParams {
-    //   LinearCombinationArgs thread;
-    //   cutlass::bfloat16_t * ptr_C = nullptr;
-    //   cute::Stride<int64_t, cute::Int<1>, int64_t> dC{};
-    //   cutlass::bfloat16_t * ptr_D = nullptr;
-    //   cute::Stride<int64_t, cute::Int<1>, int64_t> dD{};
-    // };
-
     struct TileSchedulerParams {
       int* grouped_layout;
       uint32_t shape_m;
@@ -274,36 +228,6 @@ public:
       GemmKernelParams kernel_params;
     };
 
-    // static CollectiveEpilogueParams to_underlying_arguments_epilogue(EpilogueArgs args) {
-    //   CollectiveEpilogueParams params;
-    //   params.ptr_C = args.ptr_C;
-    //   params.dC = args.stride_C;
-    //   params.ptr_D = args.ptr_D;
-    //   params.dD = args.stride_D;
-
-    //   float alpha = args.callback.alpha;
-    //   float beta = args.callback.beta;
-    //   float const* alpha_ptr = nullptr;
-    //   float const* beta_ptr = nullptr;
-
-    //   using StrideAlpha = cute::Stride<cute::Int<0>,cute::Int<0>,int64_t>;
-    //   using StrideBeta  = cute::Stride<cute::Int<0>,cute::Int<0>,int64_t>;
-    //   StrideAlpha dAlpha = {cute::Int<0>{}, cute::Int<0>{}, 0};
-    //   StrideBeta  dBeta  = {cute::Int<0>{}, cute::Int<0>{}, 0};
-    //   params.thread = 
-    //       {    // ternary op : beta * C + (alpha * acc)
-    //         {{beta}, {beta_ptr}, {dBeta}}, // leaf args : beta
-    //         {},                   // leaf args : C
-    //         {                     // binary op : alpha * acc
-    //           {{alpha}, {alpha_ptr}, {dAlpha}}, // leaf args : alpha
-    //           {},                     // leaf args : acc
-    //           {}                  // binary args : multiplies
-    //         },                    // end binary op
-    //         {} // ternary args : multiply_add
-    //       };   // end ternary op
-    //   return params;
-    // }
-
     static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace, int* grouped_layout) {
       auto problem_shape = args.problem_shape;
       auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
@@ -325,8 +249,8 @@ public:
       return {
         args.mode,
         problem_shape,
-        args.mainloopargs, // CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, mainloop_workspace),
-        args.epilogueargs, //to_underlying_arguments_epilogue(args.epilogueargs),
+        args.mainloopargs,
+        args.epilogueargs,
         hw_info,
         scheduler,
         workspace,
@@ -357,9 +281,9 @@ using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scal
 using LayoutSFA           = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
 using LayoutSFB           = decltype(ScaleConfig::deduce_layoutSFB());
 static constexpr bool kEnableMultistageOnN = false;
-static constexpr bool kUseNStageKernel = SHAPE_K <= 512 && (SHAPE_N % (BLOCK_N * KernelAiuMultistageOnN::N_EXPAND) == 0) && (BLOCK_K == 128);
-
-constexpr int N_EXPAND = kUseNStageKernel ? 4 : 1;
+static constexpr bool kUseNStageKernel = SHAPE_K <= 512 && (SHAPE_N % (BLOCK_N * KernelAiuMultistageOnN::N_EXPAND) == 0)
+                                          && (BLOCK_K == 128) && (SHAPE_K % BLOCK_K == 0) && STAGES == 2;
+constexpr int N_EXPAND = kUseNStageKernel ? KernelAiuMultistageOnN::N_EXPAND : 1;
 
 // 根据模板参数定义具体类型
 using TileScheduler = DeepGemmScheduler<
@@ -453,14 +377,12 @@ using GemmKernel = DeepGemmUniversal<
 
 // Kernel 函数定义
 extern "C" 
-__launch_bounds__(512)
+__launch_bounds__(512, 1)
 __global__ void {}(
   typename GemmKernel::Params params
 ) {{
   extern __shared__ char smem[];
   int* grouped_layout = nullptr;
-  // evt realization must construct evt params on device, can't use GemmUniversalAdapter
-  // typename GemmKernel::Params params = GemmKernel::to_underlying_arguments(arguments, nullptr, grouped_layout);
   GemmKernel op;
   op(params, smem);
 }}
@@ -476,13 +398,12 @@ __global__ void {}(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        // TODO: optimize `args` copy
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
 
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
-static void ppu10500_fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
+static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                               const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                               const torch::Tensor& out,
                               const int& m, const int& n, const int& k, std::optional<ConfigTuple> config = std::nullopt, at::cuda::CUDAStream stream = at::cuda::getDefaultCUDAStream()) {
@@ -495,13 +416,11 @@ static void ppu10500_fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs
                            rhs_scales.size(0) == n && 
                            rhs_scales.size(1) == 1);
     
-    if (lhs_shape_valid && rhs_shape_valid) { //lhs_shape_valid && rhs_shape_valid
-        // 调用 gemm_a8w8_per_channel_nt 函数
-        gemm_a8w8_per_channel_nt(lhs, lhs_scales, rhs, rhs_scales, out, m, n, k, config, stream);
+    if (lhs_shape_valid && rhs_shape_valid) {
+        gemm_a8w8_per_channel_nt(lhs, lhs_scales, rhs, rhs_scales, out, m, n, k, config);
         return;
     }
 
-    // # NOTES: `get_tma_aligned_lhs_scales` may launch a kernel if not processed by previous kernels
     auto lhs_scales_aligned = get_col_major_tma_aligned_tensor(lhs_scales);
     TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
     if (m == 0) {
@@ -513,12 +432,13 @@ static void ppu10500_fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs
     if (config.has_value()) {
       selected_config = *config;
     } else {
-      selected_config = deep_gemm_fp8::get_best_configs(m, n, k, 1, num_sms);
+      selected_config = deep_gemm_fp8_common::get_best_configs(m, n, k, 1, num_sms);
     }
     
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
     auto SMSIZE = std::get<0>(smem_config);
-
+    // std::cout << "num_sms_new is " << num_sms_new << " block_m is " << block_m << " block_n is " << block_n << " block_k is " << block_k << std::endl;
+    // std::cout << " warp_m is " << warp_m << " warp_n is " << warp_n << " num_stages is " << num_stages << " SMSIZE is " << SMSIZE << std::endl;
     uint32_t kNumGroups = 1;
     
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
@@ -558,7 +478,6 @@ static void ppu10500_fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs
     cutlass::bfloat16_t * converted_output = reinterpret_cast<cutlass::bfloat16_t *>(out.data_ptr<at::BFloat16>());
     float* scales_a_ptr = lhs_scales_aligned.data_ptr<float>();
     float* scales_b_ptr = rhs_scales.data_ptr<float>();
-    // TODO get hw info from real env
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count = num_sms_new;
@@ -580,24 +499,28 @@ static void ppu10500_fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs
     };
 
     PPU10500FP8GemmRuntime::GemmKernelParams params = PPU10500FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr, grouped_layout);
-    if(get_tample_params_size() != sizeof(PPU10500FP8GemmRuntime::GemmKernelParams)) {
-      std::cout << "\n the size is not right!!!" << std::endl;
-    }
-    // checkParams(params);
+    // if(get_fp8_tample_params_size() != sizeof(PPU10500FP8GemmRuntime::GemmKernelParams)) {
+    //   std::cout << "\n the params size is not right, please check.\n" << std::endl;
+    //   std::cout << get_fp8_tample_params_size() << std::endl;
+    //   std::cout << "\n sizeof(PPU10500FP8GemmRuntime::GemmKernelParams)" << sizeof(PPU10500FP8GemmRuntime::GemmKernelParams) <<  std::endl;
+    // }
     auto args = PPU10500FP8GemmRuntime::Args{
       .gemm_args = gemm_args,
-      .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "sm100_fp8_deep_gemm_1d1d"},
+      .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "fp8_deep_gemm"},
       .launch_args = {grid, block, SMSIZE},
       .kernel_params = params
     };
     const auto& code = PPU10500FP8GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("sm100_fp8_deep_gemm_1d1d", code, block.x, SMSIZE);
-    const auto& max_block_per_cu = compiler->get_max_block_per_cu();
-
-    hw_info.sm_count = hw_info.sm_count * max_block_per_cu;
-    grid = get_grid_shape(hw_info.sm_count);
-    args.launch_args.grid_dim = grid;
-
+    const auto& runtime = compiler->build("fp8_deep_gemm", code, block.x, SMSIZE);
+    const auto& kernel = runtime->kernel;
+    int blocks_per_cu = 0;
+    CUresult result = cuOccupancyMaxActiveBlocksPerMultiprocessor(
+      &blocks_per_cu,
+      kernel,
+      block.x,
+      SMSIZE
+      );
+    args.launch_args.grid_dim.x *= blocks_per_cu;
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()){
         dg_prof_params.set_params(

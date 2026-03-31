@@ -35,6 +35,7 @@ from .utils import (
     get_col_major_tensor,
     get_m_alignment_for_contiguous_layout,
     get_search_space,
+    is_ppu1v5_device,
 )
 
 from .attention import (

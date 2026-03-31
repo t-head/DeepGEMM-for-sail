@@ -8,7 +8,6 @@
 
 #include <iostream>
 
-
 #include "accutlass.h"
 #include "cutlass/array.h"
 #include "cutlass/numeric_conversion.h"

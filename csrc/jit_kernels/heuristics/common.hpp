@@ -5,7 +5,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
-#include "../../utils/python2cpp.hpp"
+#include "../../utils/utils.hpp"
 
 namespace deep_gemm {
 

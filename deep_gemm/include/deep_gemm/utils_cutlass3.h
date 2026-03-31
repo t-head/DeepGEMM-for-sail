@@ -1,5 +1,15 @@
+#ifndef DEEP_GEMM_UTILS_CUTLASS3_H
+#define DEEP_GEMM_UTILS_CUTLASS3_H
+
 #include "cutlass/cutlass.h"
 #include "cutlass/device_kernel.h"
+
+struct KernelAiuMultistageOnN {
+  constexpr static int N_EXPAND = 4;
+};
+
+struct KernelAiuMultistageOverlapPrologue {};
+struct KernelAiuMultistageOverlapMainloop {};
 
 template <typename GemmKernel>
 inline int compute_occupancy_for_kernel() {
@@ -37,3 +47,4 @@ public:
                                                     cutlass::float_e4m3_t, Element_if_fp16>::type;
   using type = Element_if_fp8_e4m3;
 };
+#endif // DEEP_GEMM_UTILS_CUTLASS3_H

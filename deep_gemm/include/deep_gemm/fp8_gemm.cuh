@@ -38,10 +38,6 @@ namespace deep_gemm {
 using namespace cute;
 using cutlass::KernelHardwareInfo;
 
-struct KernelAiuMultistageOnN {
-  constexpr static int N_EXPAND = 4;
-};
-
 template <
   class ProblemShape_,
   class CollectiveMainloop_,
@@ -1217,5 +1213,4 @@ public:
 };
 
 };  // namespace deep_gemm
-
 #pragma clang diagnostic pop
