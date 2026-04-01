@@ -145,7 +145,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
 
 def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
                                             rhs: Tuple[torch.Tensor],
-                                            out: torch.Tensor, masked_m: torch.Tensor, expected_m: int,
+                                            out: torch.Tensor, masked_m: torch.Tensor, expected_m: int, configs = None,
                                             max_block_n: int = 256, enable_sbo_overlap: bool = False,
                                             signal: torch.Tensor = torch.empty(0).int()) -> None:
     num_groups, m, k = lhs.shape
@@ -173,7 +173,10 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
     global includes, template
 
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True, max_block_n=max_block_n)
+    if configs:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+    else:
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True, max_block_n=max_block_n)
     extra_info = get_extra_info()
 
     # Extra checks for TMA store
