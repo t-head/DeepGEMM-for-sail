@@ -626,15 +626,16 @@ class DeepGemmUniversal <
           // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
           for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
             if constexpr (k_block == K_BLOCK_MAX - 1) {
-              if (n_tile_iter < N_EXPAND) {
-                if (k_tile_iter >= K_TILE_COUNT) {
-                  if (n_tile_iter < N_EXPAND - 1) {
-                    tBgB.data() = tBgB.data() + K * BlockN;
-                    tSFBgSFB.data() = tSFBgSFB.data() + SFK * (BlockN / 16);
-                    ++n_tile_iter;
-                  }
-                  k_tile_iter = 0;
+              if (k_tile_iter >= K_TILE_COUNT) {
+                if (n_tile_iter < N_EXPAND - 1) {
+                  tBgB.data() = tBgB.data() + K * BlockN;
+                  tSFBgSFB.data() = tSFBgSFB.data() + SFK * (BlockN / 16);
                 }
+                ++n_tile_iter;
+                k_tile_iter = 0;
+              }
+              if (n_tile_iter < N_EXPAND) {
+                __syncthreads();
                 copy_to_tsm(smem_pipe_write, k_tile_iter, warp_idx);
               }
               cp_async_fence();
