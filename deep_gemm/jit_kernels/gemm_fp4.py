@@ -27,7 +27,7 @@ auto bias_dispatcher = [&](auto HasBias) {
     using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, false, decltype(HasBias)::value>;
     gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
                 bias, out, m, nullptr, nullptr, 0,
-                stream, num_sms, smem_size); 
+                stream, num_sms, smem_size);
 };
 
 // NOTE: The data_ptr might not be nullptr in torch.empty(0)
@@ -35,42 +35,20 @@ if (bias == nullptr) bias_dispatcher(std::bool_constant<false>{});
 else                 bias_dispatcher(std::bool_constant<true>{});
 """
 
-def get_sf_padding_size_b32(block_mn: int, warp_mn: int, block_k: int) -> int:
-    assert block_k % 32 == 0, f"block_k must be divideable by 32, but got {block_k}"
-    tile_scale_K = block_k / 32 * 8
-    warp_on_mn = block_mn // warp_mn
-
-    targets = [8, 24, 4, 12, 20, 28, 16, 0]
-    for t in targets:
-        for pad in range(0, 32):
-            L = tile_scale_K + pad
-            if ((int(warp_on_mn * L) & 31) == t): return pad
-
-    return 0
-
-def get_sfa_per_stage_size(block_mn: int, block_k: int, warp_mn: int, w_padding: bool = False) -> int:
+def get_sf_per_stage_size(block_mn: int, block_k: int) -> Tuple[int, int]:
+    bpp = 2                           # bpp=2 means sizeof(uint16)
     smem_sf_k = ceil_div(block_k, 32) # uint16
-    base_smem_sfa_size = block_mn * smem_sf_k * 2   # 2 means sizeof(uint16)
+    base_smem_sf_size = block_mn * smem_sf_k * bpp   
 
     if block_mn <= 64:
-        return base_smem_sfa_size
+        invalid_sf_element_size = 0
+        return (base_smem_sf_size, invalid_sf_element_size)
     else:
         aiu_num_on_m = ceil_div(block_mn, 64)
-        sfa_padding_size = 16 * aiu_num_on_m * 2    # 16 means padding 16 rows for bankconflicts
+        sf_padding_size = 16 * aiu_num_on_m * bpp    # 16 means padding 16 rows for bankconflicts
+        invalid_sf_element_size = 16 * bpp           # -16 means cute::cosize will only reserve spaces until the last valid elemnt
 
-        return base_smem_sfa_size + sfa_padding_size
-
-def get_sfb_per_stage_size(block_mn: int, block_k: int, warp_mn: int, w_padding: bool = False) -> int:
-    ### Assume warp_mn = block_mn to calculate occ
-
-    warp_num_mn = block_mn // warp_mn
-
-    smem_sf_mn_aligned = ceil_div(block_mn // 16, warp_num_mn * 4) * (warp_num_mn * 4)
-
-    sf_padding = get_sf_padding_size_b32(block_mn, warp_mn, block_k) if w_padding else 0
-    smem_sf_k = block_k + sf_padding * 4 ## uint8 block_k * 16 / 16
-
-    return smem_sf_mn_aligned * smem_sf_k
+        return (base_smem_sf_size + sf_padding_size, invalid_sf_element_size)
 
 @lru_cache(maxsize=None)
 def get_smem_config_fp4(num_stages: int, block_m: int, block_n: int, warp_m: int, warp_n: int, block_k: int = 128, bpp: int = 1) -> Tuple[int, int, int]:
@@ -83,16 +61,15 @@ def get_smem_config_fp4(num_stages: int, block_m: int, block_n: int, warp_m: int
     smem_a_per_stage = block_m * block_k
     smem_b_per_stage = block_n * block_k
     # smem_barrier = num_stages * 8 * 2
-    ### NOTE(yfu): we only consider sfb_padding when select num_stages
-    smem_sfa_per_stage = get_sfa_per_stage_size(block_m, block_k, warp_m, False)
-    smem_sfb_per_stage = get_sfb_per_stage_size(block_n, block_k, warp_n, True)
+    smem_sfa_per_stage, invalid_sfa_element_size = get_sf_per_stage_size(block_m, block_k)
+    smem_sfb_per_stage, invalid_sfb_element_size = get_sf_per_stage_size(block_n, block_k)
 
     ### output dtype of fp4 is bf16 currently
     smem_size_d = smem_d * 2
     smem_size_a = num_stages * smem_a_per_stage * bpp
     smem_size_b = num_stages * smem_b_per_stage * bpp
-    smem_size_sfa = num_stages * smem_sfa_per_stage * bpp
-    smem_size_sfb = num_stages * smem_sfb_per_stage * bpp
+    smem_size_sfa = num_stages * smem_sfa_per_stage * bpp - invalid_sfa_element_size
+    smem_size_sfb = num_stages * smem_sfb_per_stage * bpp - invalid_sfb_element_size
 
     smem_size = max(smem_size_d, smem_size_a + smem_size_b + smem_size_sfa + smem_size_sfb)
 
@@ -483,59 +460,24 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
 
     return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
-def preprocess_mxfp4_sfa(scale: torch.Tensor) -> torch.Tensor:
+def uint8_padding(scale: torch.Tensor) -> torch.Tensor:
+    import warnings
+    warnings.warn("uint8_padding is deprecated and will be remove in DeepGemm later!!! Please use preprocess_mxfp4_scales to preprocess SFA instead.", DeprecationWarning, stacklevel=2)
+
+    return preprocess_mxfp4_scales(scale=scale)
+
+def preprocess_mxfp4_scales(scale: torch.Tensor) -> torch.Tensor:
     assert scale.dtype == torch.uint8, f"The dtype of scale should be torch.uint8 but got {scale.dtype}."
     assert scale.is_contiguous(), f"Scales should be contiguous."
     assert len(scale.shape) == 2 or len(scale.shape) == 3, f"The rank of scale should be 2(dense/groupedNoPad) or 3(groupedMasked)."
+    if (scale.shape[-1] % 2):
+        scale = torch.nn.functional.pad(scale, (0, 1))
+    assert scale.shape[-1] % 2 == 0, f'The dim of contiguous must be even number for being viewed as b16.'
 
     if len(scale.shape) == 2:
         return scale.view(torch.uint16).t().contiguous().t()
     else:
         return scale.view(torch.uint16).permute(0, 2, 1).contiguous().permute(0, 2, 1)
-
-def preprocess_mxfp4_scales(scale: torch.Tensor) -> torch.Tensor:
-    """
-        transform the scale layout for ppu mxfp4
-
-        Args:
-            scale: e8m0 scales, whose shape should be [M/N, K] or [E, N, K]
-
-        Returns:
-            out: transformed scales, which are aligned to (16, 2)
-    """
-    assert scale.dtype == torch.uint8, "ppu_swizzle_mx_scale_cutlass only accept torch.uint8 now."
-    assert len(scale.shape) in [2, 3]
-
-    ### scales are aligned with (16, 2) sub blocks, which is refered to a mma.
-    SWIZZLE_ALIGN_MN = 16
-    SWIZZEL_ALIGN_K = 2
-
-    outs = []
-
-    *leading_shape, MN, K = scale.shape
-    pad_k = (SWIZZEL_ALIGN_K - (K % SWIZZEL_ALIGN_K)) % SWIZZEL_ALIGN_K
-    pad_mn = (SWIZZLE_ALIGN_MN - (MN % SWIZZLE_ALIGN_MN)) % SWIZZLE_ALIGN_MN
-    scale_pad = scale
-    if pad_k or pad_mn > 0:
-        scale_pad = torch.nn.functional.pad(scale, (0, pad_k, 0, pad_mn))
-    padded_shape = scale_pad.shape
-    assert padded_shape[-2] % 16 == 0 and padded_shape[-1] % 2 == 0, "padding shape must be aligned to MN, K -> (16, 2)"
-
-    scale_pad_flatten = scale_pad.reshape(-1, padded_shape[-2], padded_shape[-1])
-    scale_pad_flatten_b16 = scale_pad_flatten.contiguous().view(torch.uint16)
-    L, MNp, Kp = scale_pad_flatten_b16.shape
-
-    scale_pad_flatten_b16 = scale_pad_flatten_b16.reshape(L, MNp // 16, 16, Kp)
-    scale_pad_flatten_b16 = scale_pad_flatten_b16.reshape(L, MNp // 16, 2, 8, Kp).permute(0, 1, 3, 2, 4)
-    scale_pad_flatten_b16 = scale_pad_flatten_b16.reshape(L, MNp // 16, 16, Kp)
-
-    scale_swizzled = scale_pad_flatten_b16.permute(0, 1, 3, 2).contiguous().reshape(L, MNp // 16, Kp * 16)
-    scale_swizzled = scale_swizzled.view(torch.uint8).reshape(*leading_shape, MNp // 16, Kp * 2 * 16)
-
-    outs.append(scale_swizzled)
-
-    out = torch.concat(outs, dim=0)
-    return out
 
 def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
                          rhs_: Tuple[torch.Tensor, torch.Tensor],
@@ -550,11 +492,11 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
     assert m == m_ and n == n_ and k == k_
     assert n > 0 and k > 0
     assert lhs.dtype == torch.uint8 and lhs_scales.dtype == torch.uint16
-    assert rhs.dtype == torch.uint8 and rhs_scales.dtype == torch.uint8
+    assert rhs.dtype == torch.uint8 and rhs_scales.dtype == torch.uint16
     assert (bias is None) or (bias.dtype == torch.float32)
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
-    assert lhs_scales.stride(0) == 1 and rhs_scales.is_contiguous()
+    assert (lhs_scales.stride(0) == 1 or lhs_scales.shape[0] == 1) and (rhs_scales.stride(0) == 1 or rhs_scales.shape[0] == 1)
     if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device)
 
     # Do nothing if `m` is zero
@@ -583,7 +525,7 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),
-                  ('rhs', torch.uint8), ('rhs_scales', torch.uint8),
+                  ('rhs', torch.uint8), ('rhs_scales', torch.uint16),
                   ('bias', torch.float32), ('out', torch.bfloat16),
                   ('m', int), ('stream', torch.cuda.Stream),
                   ('num_sms', int), ('smem_size', int)),

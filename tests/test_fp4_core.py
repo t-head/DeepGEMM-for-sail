@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import time
 from typing import Tuple
 import deep_gemm
-from deep_gemm import calc_diff, ceil_div, preprocess_mxfp4_scales, preprocess_mxfp4_sfa
+from deep_gemm import calc_diff, ceil_div, preprocess_mxfp4_scales
 from utils import construct_group_m_list, get_ref_backend, find_next_power_of_2, check_signal
 import argparse
 
@@ -92,8 +92,7 @@ def test_gemm(args):
     b_dequant = dequantize_fp4_torch(y[0], y[1]).cuda()
     bias = torch.randn(1, n, dtype=torch.float32, device='cuda') if args.get("with_bias", True) else None
     out = torch.zeros(m, n, dtype=torch.bfloat16, device='cuda')
-    # x_scale = preprocess_mxfp4_scales(scale=x[1])
-    x_scale = preprocess_mxfp4_sfa(scale=x[1])
+    x_scale = preprocess_mxfp4_scales(scale=x[1])
     y_scale = preprocess_mxfp4_scales(scale=y[1])
     x = x[0], x_scale
     y = y[0], y_scale
@@ -109,7 +108,7 @@ def test_gemm(args):
         print("out:", out)
         torch.testing.assert_close(out, ref_out, rtol=1e-3, atol=1e-4)
     assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
-    print(f"Passed with acc_check\n")
+    print(f"Passed with acc_check. diff: {diff}\n")
 
 def test_m_grouped_gemm_nopad(args) -> None:
     num_groups, m, n, k, distribution = args['groups'], args['m'], args['n'], args['k'], args['distribution']
@@ -124,7 +123,7 @@ def test_m_grouped_gemm_nopad(args) -> None:
         print("out:", out)
         torch.testing.assert_close(out, ref_out, rtol=1e-3, atol=1e-4)
     assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
-    print("Passed with acc_check\n")
+    print(f"Passed with acc_check. diff: {diff}\n")
     return
 
 def test_m_grouped_gemm_masked(args) -> None:
@@ -146,7 +145,7 @@ def test_m_grouped_gemm_masked(args) -> None:
                 print(f"ref_out[{j}]:", ref_out[j, :masked_m[j].item()])
                 print(f"out[{j}]:", out[j, :masked_m[j].item()])
             assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
-    print("Passed with acc_check\n")
+    print(f"Passed with acc_check. diff: {diff}\n")
     return
 
 def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str, alignment: int, with_bias: bool = True):
@@ -175,15 +174,15 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str
         start = aligned_end
 
     x_fp4 = quantize_fp4_torch(x.to(torch.bfloat16).to('cuda'))
-    x_fp4_scale = preprocess_mxfp4_sfa(scale=x_fp4[1])
-    # x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4[1], m_indices=m_indices, num_groups=num_groups)
+    x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4[1])
     y_fp4 = (torch.empty((num_groups, n, int(k / 2)), device='cuda', dtype=torch.uint8), torch.empty((num_groups, n, int(k / 32)), device='cuda', dtype=torch.uint8))
     y_scale = []
     for i in range(num_groups):
         y_fp4[0][i], y_fp4[1][i] = quantize_fp4_torch(y[i].to(torch.bfloat16))
         # y_scale.append(uint8_padding(y_fp4[1][i]))
-        y_scale.append(preprocess_mxfp4_scales(scale=y_fp4[1][i]))
+        y_scale.append(y_fp4[1][i])
     y_fp4_scale = torch.stack(y_scale, dim=0)
+    y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
     return (x_fp4[0].to("cuda"), x_fp4_scale.to("cuda")), (y_fp4[0].to("cuda"), y_fp4_scale.to("cuda")), m_indices, bias, out, ref_out.to('cuda').to(torch.bfloat16)
 
 
@@ -215,15 +214,16 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
         x_fp4.append(a)
         x_fp4_scale.append(a_scale)
         y_fp4.append(b)
-        y_fp4_scale.append(preprocess_mxfp4_scales(b_scale))
+        y_fp4_scale.append(b_scale)
         x_ref.append(a_dequant)
         y_ref.append(b_dequant)
-    
+
     x_fp4 = torch.stack(x_fp4, dim=0)
     x_fp4_scale = torch.stack(x_fp4_scale, dim=0)
-    x_fp4_scale = preprocess_mxfp4_sfa(scale=x_fp4_scale)
+    x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4_scale)
     y_fp4 = torch.stack(y_fp4, dim=0)
     y_fp4_scale = torch.stack(y_fp4_scale, dim=0)
+    y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
     x_ref = torch.stack(x_ref, dim=0)
     y_ref = torch.stack(y_ref, dim=0)
 

@@ -342,12 +342,13 @@ struct DeepGemmScheduler {
     // Gets the pointer offset of matrix A_scale for MXFP4, scale is padded to uint64_t but load as uint32_t.
     __device__ __forceinline__ int64_t curr_offset_mxfp4_scalea() const
     {
-        uint32_t shape_k_scale = SHAPE_K / 16;
+        // scales are organized in uint16_t
+        uint32_t shape_k_scale = ceil_div(SHAPE_K, (uint32_t)32);
         if constexpr (kGemmType == GemmType::GroupedNoPad) {
             // /4 means uint8_t to uint32_t;
             return int64_t(curr_cumsum_m);
         } else if constexpr (kGemmType == GemmType::GroupedMasked) {
-            return int64_t(curr_group_idx) * params.shape_m * ((shape_k_scale + 1) / 2);
+            return int64_t(curr_group_idx) * params.shape_m * shape_k_scale;
         } else {
             return 0;
         }
@@ -379,14 +380,10 @@ struct DeepGemmScheduler {
     // Gets the pointer offset of matrix B_scale for MXFP4, scale is padded to uint64_t but load as uint32_t.
     __device__ __forceinline__ int64_t curr_offset_mxfp4_scaleb(const int m_block_idx = 0) const
     {
-        uint32_t shape_k_scale = SHAPE_K / 16;
+        // scale are organized in uint16_t
+        uint32_t shape_k_scale = ceil_div(SHAPE_K, (uint32_t)32);
 
-        // B is swizzled, so its shape is (ceil_div(N, 16), (ceil_div(ceil_div(K, 16), 2) * 2) * 16 / 4);
-        // ceil_div(N, 16) means tranpose scale by N direction;
-        // ceil_div(K, 16) means deduce the number of scale in uint8_t;
-        // ceil_div(xxx, 2) * 2 means MMA inst is 16x16x64 which has 2 uint8 scale by K direction;
-        // * 16 comes for N direction, /4 means uint32_t
-        return int64_t(curr_group_idx) * ceil_div(SHAPE_N, uint32_t(16)) * ((ceil_div(shape_k_scale, uint32_t(2))) * 8);
+        return int64_t(curr_group_idx) * SHAPE_N * shape_k_scale;
     }
 
     // Gets the pointer offset of matrix C

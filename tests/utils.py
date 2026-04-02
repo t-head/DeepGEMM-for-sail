@@ -218,7 +218,7 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
         x_int8, y_int8 = per_token_cast_to_int8(x), per_token_cast_to_int8(y)
         return  (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.uint8:
-        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, preprocess_mxfp4_scales, preprocess_mxfp4_sfa
+        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, preprocess_mxfp4_scales
         A = torch.randn(m, k, dtype=torch.bfloat16, device='cuda').contiguous()
         B = torch.randn(n, k, dtype=torch.bfloat16, device='cuda').contiguous()
         a, a_scale = quantize_fp4_torch(A.to(torch.bfloat16))
@@ -227,7 +227,7 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
         b_dequant = dequantize_fp4_torch(b, b_scale).cuda()
         bias = torch.zeros(m, n, dtype=torch.float32, device='cuda')
         out = torch.zeros(m, n, dtype=torch.float32, device='cuda')
-        a_scale = preprocess_mxfp4_sfa(scale=a_scale)
+        a_scale = preprocess_mxfp4_scales(scale=a_scale)
         b_scale = preprocess_mxfp4_scales(scale=b_scale)
         ref_out = torch.mm(a_dequant, b_dequant.T)
         ref_out = ref_out + bias

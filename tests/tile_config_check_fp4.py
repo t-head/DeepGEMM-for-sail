@@ -7,7 +7,7 @@ import argparse
 import copy
 from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, construct_grouped
 from deep_gemm.jit_kernels.utils import get_num_sms
-from deep_gemm import preprocess_mxfp4_scales, calc_diff, preprocess_mxfp4_sfa
+from deep_gemm import preprocess_mxfp4_scales, calc_diff
 from utils import construct_group_m_list, split_list_into_groups
 from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
 from deep_gemm import ceil_div
@@ -27,8 +27,7 @@ def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[
             out = torch.zeros(m, n, dtype=torch.bfloat16, device='cuda')
             ref_out = torch.mm(a_dequant, b_dequant.T)
             ref_out = ref_out + bias
-            # x_scale = preprocess_mxfp4_scales(scale=x[1])
-            x_scale = preprocess_mxfp4_sfa(scale=x[1])
+            x_scale = preprocess_mxfp4_scales(scale=x[1])
             y_scale = preprocess_mxfp4_scales(scale=y[1])
             x = x[0], x_scale
             y = y[0], y_scale

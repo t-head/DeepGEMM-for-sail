@@ -69,7 +69,7 @@ def construct_fp4_dense(
     N: int,
     K: int,
 ):
-    from deep_gemm.jit_kernels.gemm_fp4 import preprocess_mxfp4_scales, preprocess_mxfp4_sfa
+    from deep_gemm.jit_kernels.gemm_fp4 import preprocess_mxfp4_scales
     A = torch.randn(M, K, dtype=torch.bfloat16, device='cuda').contiguous()
     B = torch.randn(N, K, dtype=torch.bfloat16, device='cuda').contiguous()
     x = quantize_fp4_torch(A).cuda()
@@ -77,7 +77,7 @@ def construct_fp4_dense(
     bias = torch.randn(1, N, dtype=torch.float32, device='cuda')
     out = torch.zeros(M, N, dtype=torch.bfloat16, device='cuda')
     ref_out = torch.zeros(M, N, dtype=torch.bfloat16, device='cuda')
-    x_scale = preprocess_mxfp4_sfa(scale=x[1])
+    x_scale = preprocess_mxfp4_scales(scale=x[1])
     y_scale = preprocess_mxfp4_scales(scale=y[1])
     x = x[0], x_scale
     y = y[0], y_scale
@@ -163,7 +163,7 @@ def construct_fp4_nopad(
     num_experts: int,
     device: str = "cuda",
 ):
-    from deep_gemm.jit_kernels.gemm_fp4 import preprocess_mxfp4_scales, preprocess_mxfp4_sfa
+    from deep_gemm.jit_kernels.gemm_fp4 import preprocess_mxfp4_scales
     total_tokens = int(m_rows.sum().item())
     dtype = torch.bfloat16
     x = torch.randn(total_tokens, K, dtype=dtype, device=device)
@@ -173,7 +173,7 @@ def construct_fp4_nopad(
     ref_out = torch.empty(total_tokens, N, dtype=dtype, device=device)
 
     x_fp4 = quantize_fp4_torch(x.cuda())
-    x_fp4_scale = preprocess_mxfp4_sfa(scale=x_fp4[1])
+    x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4[1])
     y_fp4 = (torch.empty((num_experts, N, int(K / 2)), device='cuda', dtype=torch.uint8),
              torch.empty((num_experts, N, int(K / 32)),
                          device='cuda', dtype=torch.uint8),
@@ -181,16 +181,17 @@ def construct_fp4_nopad(
     y_scale = []
     for i in range(num_experts):
         y_fp4[0][i], y_fp4[1][i] = quantize_fp4_torch(y[i].cuda())
-        y_scale.append(preprocess_mxfp4_scales(scale=y_fp4[1][i]))
+        y_scale.append(y_fp4[1][i])
 
     m_indices = torch.empty(total_tokens, device='cuda', dtype=torch.int32)
     y_fp4_scale = torch.stack(y_scale, dim=0)
+    y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
 
     return (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4[0].to('cuda'), y_fp4_scale.to('cuda')), bias.to('cuda'), out.to('cuda'), ref_out.to('cuda'), m_indices.to('cuda')
 
 def construct_fp4_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, distribution: str,
                              enable_sbo_overlap: bool = False, with_bias: bool = True):
-    from deep_gemm.jit_kernels.gemm_fp4 import preprocess_mxfp4_scales, preprocess_mxfp4_sfa
+    from deep_gemm.jit_kernels.gemm_fp4 import preprocess_mxfp4_scales
     tensor_device = 'cuda'
     def find_next_power_of_2(m_list):
         if isinstance(m_list, torch.Tensor):
@@ -229,15 +230,16 @@ def construct_fp4_masked(num_groups: int, max_m: int, expected_m_per_group: int,
         x_fp4.append(a)
         x_fp4_scale.append(a_scale)
         y_fp4.append(b)
-        y_fp4_scale.append(preprocess_mxfp4_scales(b_scale))
+        y_fp4_scale.append(b_scale)
         x_ref.append(a_dequant)
         y_ref.append(b_dequant)
 
     x_fp4 = torch.stack(x_fp4, dim=0)
     x_fp4_scale = torch.stack(x_fp4_scale, dim=0)
-    x_fp4_scale = preprocess_mxfp4_sfa(scale=x_fp4_scale)
+    x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4_scale)
     y_fp4 = torch.stack(y_fp4, dim=0)
     y_fp4_scale = torch.stack(y_fp4_scale, dim=0)
+    y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
     x_ref = torch.stack(x_ref, dim=0)
     y_ref = torch.stack(y_ref, dim=0)
 

@@ -50,11 +50,11 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     assert m == m_ == m__ and n == n_ and k == k_
     assert n > 0 and k > 0
     assert lhs.dtype == torch.uint8 and rhs.dtype == torch.uint8
-    assert lhs_scales.dtype == torch.uint16 and rhs_scales.dtype == torch.uint8
+    assert lhs_scales.dtype == torch.uint16 and rhs_scales.dtype == torch.uint16
     assert bias is None or bias.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
-    assert lhs_scales.stride(0) == 1 and rhs_scales.is_contiguous() and m_indices.is_contiguous()
+    assert (lhs_scales.stride(0) == 1 or lhs_scales.shape[0] == 1) and (rhs_scales.stride(1) == 1 or rhs_scales.shape[1] == 1) and m_indices.is_contiguous()
     if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device)
 
     # Do nothing if `m` is zero
@@ -97,7 +97,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),
-                  ('rhs', torch.uint8), ('rhs_scales', torch.uint8),
+                  ('rhs', torch.uint8), ('rhs_scales', torch.uint16),
                   ('bias', torch.float32), ('out', torch.bfloat16),
                   ('m', int), ('grouped_layout', torch.int32), ('block_m_info', torch.int32), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
@@ -129,12 +129,12 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     assert m == m_ and n == n_ and k == k_
     assert expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0
     assert lhs.dtype == torch.uint8 and rhs.dtype == torch.uint8
-    assert lhs_scales.dtype == torch.uint16 and rhs_scales.dtype == torch.uint8
+    assert lhs_scales.dtype == torch.uint16 and rhs_scales.dtype == torch.uint16
     assert bias is None or bias.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert masked_m.dtype == torch.int32
     assert lhs.is_contiguous() and rhs.is_contiguous()
-    assert lhs_scales.stride(1) == 1 and rhs_scales.is_contiguous()
+    assert (lhs_scales.stride(1) == 1 or lhs_scales.shape[1] == 1) and (rhs_scales.stride(1) == 1 or rhs_scales.shape[1] == 1)
     assert out.is_contiguous() and masked_m.is_contiguous()
     if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device)
 
@@ -171,9 +171,9 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),
-                  ('rhs', torch.uint8), ('rhs_scales', torch.uint8),
+                  ('rhs', torch.uint8), ('rhs_scales', torch.uint16),
                   ('bias', torch.float32), ('out', torch.bfloat16),
-                  ('m', int), ('grouped_layout', torch.int32), 
+                  ('m', int), ('grouped_layout', torch.int32),
                   ('block_m_info', torch.int32), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                   ('signal', torch.int32)),
