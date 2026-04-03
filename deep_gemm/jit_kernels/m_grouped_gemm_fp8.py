@@ -60,7 +60,6 @@ gemm_v::run(out, grouped_layout,
             lhs_scales, rhs_scales);
 """
 
-
 def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs_: Tuple[torch.Tensor, torch.Tensor],
                                               rhs_: Tuple[torch.Tensor, torch.Tensor],
                                               out: torch.Tensor, m_indices: torch.Tensor, configs = None) -> None:
@@ -290,7 +289,6 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     # Auto-tuning with compilation
     global includes, template, includes_gemv, template_gemv
     num_sms = get_num_sms()
-
     '''
     # use gemv for small k
     if k == 128 and m <= num_groups:

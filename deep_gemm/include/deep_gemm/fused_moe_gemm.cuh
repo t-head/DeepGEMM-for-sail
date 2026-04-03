@@ -15,24 +15,12 @@
 #include "ppu/cute/algorithm/copy.hpp"
 
 #include "fused_scheduler.cuh"
+#include "fused_gemm_util.cuh"
 #include "utils_cutlass3.h"
 
 using namespace cute;
 
 namespace deep_gemm {
-
-struct GemmArgs {
-  const void *__restrict__ a_ptr;
-  const void *__restrict__ b_ptr;
-  void *__restrict__ c_ptr;
-
-  const int *__restrict__ m_rows;
-  const int *__restrict__ expert_ids_and_cumsum;
-  const int *__restrict__ sorted_token_ids;
-  const int *__restrict__ aligned_num_m_blocks;
-  uint32_t num_valid_tokens;
-  int topk;
-};
 
 template <class _SrcT, GemmType kGemmType,
           uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
@@ -40,7 +28,7 @@ template <class _SrcT, GemmType kGemmType,
           uint32_t WARP_M, uint32_t WARP_N,
           uint32_t BLOCK_SIZE, int kNumStages>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void
-bf16_fused_moe_gemm_impl(const GemmArgs args) {
+bf16_gemm_fused_moe_kernel(const GemmArgs args) {
     constexpr uint32_t STRIDE_AM = SHAPE_K;
     constexpr uint32_t STRIDE_BE = SHAPE_N * SHAPE_K;
     constexpr uint32_t STRIDE_CM = SHAPE_N;
@@ -58,19 +46,17 @@ bf16_fused_moe_gemm_impl(const GemmArgs args) {
 
     using TileScheduler = FusedGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, kNumGroups>;
 
-    // ppu1.5 tsm.ld.swzl need 128B aligned
-    constexpr uint32_t SMEM_A_SIZE = cute::round_up(kNumStages * BLOCK_M * BLOCK_K * sizeof(SrcT), 128);
-
     // Shared memory
+    using TsmCfg = GemmSmemConfig<SrcT, kNumStages, BLOCK_M, BLOCK_N, BLOCK_K>;
     extern __shared__ __align__(128) uint8_t smem_buffer[];
     SrcT* smem_a = reinterpret_cast<SrcT*>(smem_buffer);
-    SrcT* smem_b = reinterpret_cast<SrcT*>(smem_buffer + SMEM_A_SIZE);
+    SrcT* smem_b = reinterpret_cast<SrcT*>(smem_buffer + TsmCfg::kSmemASize);
 
     uint32_t thread_idx = threadIdx.x;
     int warp_idx = cutlass::canonical_warp_idx_sync();
 
     int topk = args.topk;
-    uint32_t num_valid_tokens = args.num_valid_tokens;
+    uint32_t num_valid_tokens = args.shape_m * topk;
 
     // load A from hbm to tsm: use async copy.
     constexpr int Alignment = 128 / cutlass::sizeof_bits<SrcT>::value;
@@ -152,41 +138,18 @@ bf16_fused_moe_gemm_impl(const GemmArgs args) {
       // gmem_b in block
       SrcT* gmem_b = (SrcT*)args.b_ptr + deep_scheduler.curr_group_idx * STRIDE_BE;
       Tensor mB_nk = cute::make_tensor(cute::make_gmem_ptr(gmem_b), shape_B, stride_B);
-      Tensor mB_nk_mix = cute::make_mix_tensor_like(mB_nk);
-      Tensor gB = cute::local_tile(mB_nk_mix, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});           // (BLK_N,BLK_K,k)
+      Tensor gB = cute::local_tile(cute::make_mix_tensor_like(mB_nk), TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});           // (BLK_N,BLK_K,k)
       Tensor tBgB = gmem_thr_copy_B.partition_S(gB);
 
       int k_tile_iter  = 0;
       int k_tile_count = size<2>(gB);
 
-      auto copy_A_to_tsm = [&](int pipe_write, uint32_t stage_offset) {
-        static constexpr uint32_t KPerThread = 128 / cutlass::sizeof_bits<SrcT>::value;
-        static constexpr uint32_t NumThreads_CPY_K = get<1>(TilerA{}) / KPerThread; // max cont is 128B
-        static constexpr uint32_t M_ITER = ceil_div(BLOCK_M, get<0>(TilerA{}));
-        static constexpr uint32_t K_ITER = BLOCK_K / get<1>(TilerA{});
-
-        uint32_t tid_k = thread_idx % NumThreads_CPY_K;
-        uint32_t tid_m = thread_idx / NumThreads_CPY_K;
-        if (tid_m < BLOCK_M) {
-          CUTLASS_PRAGMA_UNROLL
-          for(uint32_t m_iter = 0; m_iter < M_ITER; ++m_iter) {
-            CUTLASS_PRAGMA_UNROLL
-            for(uint32_t k_iter = 0; k_iter < K_ITER; ++k_iter) {
-              uint32_t token_offset = __ldg(blk_token_base + (m_iter * get<0>(TilerA{})) + tid_m);
-              bool token_mask = token_offset < num_valid_tokens;
-              cutlass::uint128_t* src_ptr = reinterpret_cast<cutlass::uint128_t*>((SrcT*)args.a_ptr
-                    + token_offset / topk * STRIDE_AM + (k_iter * get<1>(TilerA{})) + tid_k * KPerThread + stage_offset);
-              cutlass::uint128_t* dst_ptr = reinterpret_cast<cutlass::uint128_t*>(raw_pointer_cast(tAsA(_,m_iter,k_iter,pipe_write).data()));
-              ACopyInst::copy(*src_ptr, *dst_ptr, token_mask);
-            }
-          }
-        }
-      };
-
       CUTLASS_PRAGMA_UNROLL
       for (int k_pipe = 0; k_pipe < kNumStages; ++k_pipe) {
         if (k_tile_count > 0) {
-          copy_A_to_tsm(k_pipe, BLOCK_K * k_tile_iter);
+          copy_A_to_tsm<SrcT, ACopyInst, TilerA, BLOCK_M, BLOCK_K, STRIDE_AM>(
+              tAsA(_,_,_,k_pipe), args.a_ptr,
+              blk_token_base, BLOCK_K * k_tile_iter, num_valid_tokens, topk, thread_idx);
           copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,k_pipe), warp_idx);
           ++k_tile_iter;
         }
@@ -230,7 +193,9 @@ bf16_fused_moe_gemm_impl(const GemmArgs args) {
           cp_async_wait<kNumStages-2>();
           __syncthreads();
           if (k_tile_count > 0) {
-            copy_A_to_tsm(smem_pipe_write, BLOCK_K * k_tile_iter);
+            copy_A_to_tsm<SrcT, ACopyInst, TilerA, BLOCK_M, BLOCK_K, STRIDE_AM>(
+              tAsA(_,_,_,smem_pipe_write), args.a_ptr,
+              blk_token_base, BLOCK_K * k_tile_iter, num_valid_tokens, topk, thread_idx);
             copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,smem_pipe_write), warp_idx);
             ++k_tile_iter;
           }
@@ -283,40 +248,6 @@ bf16_fused_moe_gemm_impl(const GemmArgs args) {
       Tensor tCcC = thr_mma.partition_C(cC);
       CUTE_STATIC_ASSERT_V(size(tCcC) == size(accum),
           "Accumulator count must have the same destination element count.");
-
-      auto epilogue_no_tsm = [&]() {
-#if __HGGC_ARCH__ == 150
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tCcC); i += 2) {
-          size_t token_offset = __ldg(blk_token_base + get<0>(tCcC(i)));
-          bool cond = token_offset < num_valid_tokens;
-          if constexpr (SHAPE_N % BLOCK_N) {
-            cond = cond && get<1>(tCcC(i)) < (SHAPE_N - blk_n_offset);
-          }
-          if (cond) {
-            AccT* acc_ptr = raw_pointer_cast(accum.data()) + accum.layout()(i);
-            uint32_t* dst_ptr = (uint32_t*)((DstT*)args.c_ptr + token_offset * STRIDE_CM + blk_n_offset + get<1>(tCcC(i)));
-            uint32_t d;
-            asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(d) : "f"(acc_ptr[1]), "f"(acc_ptr[0]));
-            *dst_ptr = d;
-          }
-        }
-#else
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tCcC); ++i) {
-          size_t token_offset = __ldg(blk_token_base + get<0>(tCcC(i)));
-          bool cond = token_offset < num_valid_tokens;
-          if constexpr (SHAPE_N % BLOCK_N) {
-            cond = cond && get<1>(tCcC(i)) < (SHAPE_N - blk_n_offset);
-          }
-          if (cond) {
-            AccT* acc_ptr = raw_pointer_cast(accum.data()) + accum.layout()(i);
-            DstT* dst_ptr = (DstT*)args.c_ptr + token_offset * STRIDE_CM + blk_n_offset + get<1>(tCcC(i));
-            *dst_ptr = DstT(*acc_ptr);
-          }
-        }
-#endif
-      };
 
       auto epilogue_with_tsm = [&]() {
         using EpilogueCopyInst = AutoVectorizingCopyWithAssumedAlignment<128>;
@@ -398,7 +329,8 @@ bf16_fused_moe_gemm_impl(const GemmArgs args) {
           }
         }
       };
-      epilogue_no_tsm();
+      epilogue_no_tsm<AccT, DstT, SHAPE_N, BLOCK_N, STRIDE_CM>(accum, tCcC, args.c_ptr,
+          blk_token_base, num_valid_tokens, blk_n_offset);
       // epilogue_with_tsm();
     }
 }
@@ -415,8 +347,8 @@ class FusedMoeGemm {
 public:
     FusedMoeGemm() = default;
 
-    static void run(DstT* gmem_d, SrcT* gmem_a, SrcT* gmem_b, int* m_rows,
-                    int* expert_ids_and_cumsum, int* sorted_token_ids,
+    static void run(DstT* gmem_d, SrcT* gmem_a, SrcT* gmem_b,
+                    int* m_rows, int* expert_ids_and_cumsum, int* sorted_token_ids,
                     int* aligned_num_m_blocks, uint32_t shape_m, uint32_t topk,
                     cudaStream_t stream, int num_sms) {
 
@@ -430,7 +362,7 @@ public:
         args.expert_ids_and_cumsum = expert_ids_and_cumsum;
         args.sorted_token_ids = sorted_token_ids;
         args.aligned_num_m_blocks = aligned_num_m_blocks;
-        args.num_valid_tokens = shape_m * topk;
+        args.shape_m = shape_m;
         args.topk = topk;
 
         DgProfParam dg_prof_params;
@@ -445,11 +377,8 @@ public:
         // dispatch and launch kernel
         constexpr int BlockSize = BLOCK_M / WARP_M * BLOCK_N / WARP_N * 32;
 
-        auto device_func = bf16_fused_moe_gemm_impl<SrcT, kGemmType, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BlockSize, kNumStages>;
-        // ppu1.5 tsm.ld.swzl need 128B aligned
-        constexpr uint32_t SMEM_A_SIZE = cute::round_up(kNumStages * BLOCK_M * BLOCK_K * sizeof(SrcT), 128);
-        constexpr uint32_t SMEM_B_SIZE = cute::round_up(kNumStages * BLOCK_N * BLOCK_K * sizeof(SrcT), 128);
-        constexpr uint32_t smem_size =  SMEM_A_SIZE + SMEM_B_SIZE;
+        auto device_func = bf16_gemm_fused_moe_kernel<SrcT, kGemmType, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BlockSize, kNumStages>;
+        constexpr uint32_t smem_size = GemmSmemConfig<SrcT, kNumStages, BLOCK_M, BLOCK_N, BLOCK_K>::kTotalSize;
         CHECK_CUDA(cudaFuncSetAttribute(device_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         int max_blocks_per_cu = -1;
         CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_cu, device_func, BlockSize, smem_size));

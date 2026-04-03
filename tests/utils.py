@@ -19,7 +19,8 @@ from enum import Enum
 import ast
 from math_utils import *
 import numpy as np
-from deep_gemm.jit_kernels.gemm import get_best_configs
+from deep_gemm.jit_kernels.gemm import get_best_configs as bf16_get_best_configs
+from deep_gemm.jit_kernels.gemm_fp8 import get_best_configs as fp8_get_best_configs
 
 global _acc_check, _benchmark, _ref_backend
 global use_ppu, show_log
@@ -1125,14 +1126,17 @@ def test_m_grouped_gemm_fused(args) -> None:
     if use_ppu:
         x, y, m_indices, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type, group_size)
         expected_m = (num_token * topk + num_groups - 1) / num_groups
-        if d == 'w4a16':
-            configs = deep_gemm.jit_kernels.m_grouped_gemm_w4a16.get_w4a16_config("GroupedFused", expected_m, n, k, group_size)
-        else:
-            configs = get_best_configs(expected_m, n, k, num_groups, deep_gemm.get_num_sms(), is_grouped_contiguous=False)
-        m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks = deep_gemm.moe_align_block_size(m_indices, num_groups, configs[1])
         if d == torch.bfloat16:
+            configs = bf16_get_best_configs(expected_m, n, k, num_groups, deep_gemm.get_num_sms(), is_grouped_contiguous=False)
+            m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks = deep_gemm.moe_align_block_size(m_indices, num_groups, configs[1])
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+        elif d == torch.float8_e4m3fn:
+            configs = fp8_get_best_configs(expected_m, n, k, num_groups, deep_gemm.get_num_sms(), is_grouped_contiguous=False)
+            m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks = deep_gemm.moe_align_block_size(m_indices, num_groups, configs[1])
+            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d == 'w4a16':
+            configs = deep_gemm.jit_kernels.m_grouped_gemm_w4a16.get_w4a16_config("GroupedFused", expected_m, n, k, group_size)
+            m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks = deep_gemm.moe_align_block_size(m_indices, num_groups, configs[1])
             deep_gemm.m_grouped_gemm_w4a16_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         else:
             print("ERROR: Unsupported dtype, please check!")
