@@ -1,250 +1,160 @@
 # DeepGEMM
 
-DeepGEMM is a library designed for clean and efficient FP8 General Matrix Multiplications (GEMMs) with fine-grained scaling, as proposed in [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3). It supports both normal and Mix-of-Experts (MoE) grouped GEMMs. Written in CUDA, the library has no compilation need during installation, by compiling all kernels at runtime using a lightweight Just-In-Time (JIT) module.
+DeepGEMM for PPU 是基于 [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) 适配 PPU 硬件特性的版本，支持 DeepGEMM 在 PPU 上的计算执行。
 
-Currently, DeepGEMM exclusively supports NVIDIA Hopper tensor cores. To address the imprecise FP8 tensor core accumulation, it employs CUDA-core two-level accumulation (promotion). While it leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute), it avoids heavy reliance on their templates or algebras. Instead, the library is designed for simplicity, with only one core kernel function. This makes it a clean and accessible resource for learning Hopper FP8 matrix multiplication and optimization techniques.
 
-Despite its lightweight design, DeepGEMM's performance matches or exceeds expert-tuned libraries across various matrix shapes.
+## 快速开始
 
-## News
+### 环境要求
 
-- 2025.05.14: DeepGEMM now offers weight gradient kernels for dense and MoE backward! See [#95](https://github.com/deepseek-ai/DeepGEMM/pull/95) for details.
-- 2025.05.07: DeepGEMM now supports NVRTC with up to 10x compilation speedup! See [#94](https://github.com/deepseek-ai/DeepGEMM/pull/94) for details. Please use `DG_JIT_USE_NVRTC=1` to enable it (may have performance loss with some cases).
-- 2025.04.18: DeepGEMM now achieves up to **1550 TFLOPS** on H800! See [#74](https://github.com/deepseek-ai/DeepGEMM/pull/74), [#78](https://github.com/deepseek-ai/DeepGEMM/pull/78), [#81](https://github.com/deepseek-ai/DeepGEMM/pull/81), [#86](https://github.com/deepseek-ai/DeepGEMM/pull/86) and [340d988](https://github.com/deepseek-ai/DeepGEMM/commit/340d9880f4a418d943d34260d20a79f41f4c0526) for details.
+- ZW 610 / 610E / 810 / 810E / 890P
+- Python 3.8 或更高版本
+- PPU SDK 12.3 或更高版本
+- PyTorch 2.1 或更高版本
+- CUTLASS3 for PPU: v3.6.0_release
 
-## Roadmap
-
-- [x] More correctness tests for grouped-contiguous layout
-- [x] Shared memory swizzling for output
-- [ ] Larger block size on N (up to 256)
-- [x] MoE scheduler with TMA multicast compatibility
-- [x] Fix TMA multicast compatibility for indivisible shapes
-- [x] Skip useless computation on M
-- [x] NVRTC as a faster compiler
-- [ ] Stolen JIT cache
-- [ ] Sanitizer for testing
-- [x] Weight gradient kernels for dense models
-- [x] Weight gradient kernels for MoE models
-- [ ] Better `get_best_configs` modeling
-- [ ] Utility kernels for MoE models (maybe with [tile-lang](https://github.com/tile-ai/tilelang))
-- [ ] CUDA PDL support
-- [ ] More scaling granularity support via templates
-- [ ] Larger TMA multicast size for some shapes
-- [x] MMA template refactor with CUTLASS
-- [ ] Optimizations for power efficiency
-- [x] Remove shape limitations on N and K
-- [ ] BF16 kernels
-- [ ] Split/stream-k optimizations
-
-## Quick start
-
-### Requirements
-
-- Hopper architecture GPUs, `sm_90a` must be supported
-- Python 3.8 or above
-- CUDA 12.3 or above
-  - **But we highly recommend 12.8 or above for the best performance**
-- PyTorch 2.1 or above
-- CUTLASS 3.6 or above (could be cloned by Git submodule)
-
-### Development
+### 开发流程
 
 ```bash
-# Submodule must be cloned
-git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
+# 必须递归克隆子模块
+git clone --recursive git@gitlab.alibaba-inc.com:ppu_open_source/DeepGemm.git
 
-# Make symbolic links for third-party (CUTLASS and CuTe) include directories
+# 为第三方头文件目录（CUTLASS 和 CuTe）创建符号链接
 python setup.py develop
 
-# Test JIT compilation
+# 测试 JIT 编译
 python tests/test_jit.py
 
-# Test all GEMM implements (normal, contiguous-grouped and masked-grouped)
+# 测试所有 GEMM 实现（普通、连续分组、掩码分组）
 python tests/test_core.py
 ```
 
-### Installation
+### 安装方式
 
 ```bash
 python setup.py install
 ```
 
-Then, import `deep_gemm` in your Python project, and enjoy!
+安装完成后，在您的 Python 项目中导入 `deep_gemm` 即可使用！
 
-## Interfaces
+## 接口说明
 
-#### Notices
+#### 注意事项
 
-This library exclusively contains GEMM kernels. It requires the LHS scaling factor to be TMA-aligned and transposed, and it only supports the NT format (non-transposed LHS and transposed RHS). For transposition or other FP8 casting operations, please implement or fuse them into prior kernels independently. While the library provides some simple PyTorch utility functions, these may result in slower performance, but our primary focus is on optimizing the GEMM kernels themselves.
+本库仅包含 GEMM 内核。它要求左侧矩阵（LHS）的缩放因子满足 AIU 对齐并进行转置，且仅支持 NT 格式（左侧非转置，右侧转置）。如需执行转置或其他 FP8 类型转换操作，请自行实现或将这些操作融合到前置内核中。虽然本库提供了一些简单的 PyTorch 工具函数，但这些函数可能性能较低；我们的主要优化目标始终是 GEMM 内核本身。
 
-#### Normal dense GEMMs (non-grouped)
+#### 数据精度
 
-To perform a basic non-grouped FP8 GEMM, call the `deep_gemm.gemm_fp8_fp8_bf16_nt` function. For more details, please refer to the function documentation.
+| 算法 | INT8 | FP4 | FP8 | BF16 |
+| :--- | :---: | :---: | :---: | :---: |
+| **Non-grouped** | ✅ | ✅ | ✅ | ✅ |
+| **Contiguous** | ✅ | ✅ | ✅ | ✅ |
+| **No-pad** | ✅ | ✅ | ✅ | ✅ |
+| **Masked** | ✅ | ✅ | ✅ | ✅ |
 
-#### Grouped GEMMs (contiguous layout)
+#### 常规稠密 GEMM（非 Grouped）
 
-Unlike traditional grouped GEMMs in CUTLASS, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape.
+执行基本的非 Group FP8 GEMM，请调用 `deep_gemm.gemm_fp8_fp8_bf16_nt` 函数。详细信息请参考该函数的文档。
 
-For training forward passes or inference prefilling, where each expert may process a varying number of tokens, we concatenate these tokens into a single tensor, referred to as the "contiguous" layout. Note that each expert segment must be aligned to the GEMM M block size (`get_m_alignment_for_contiguous_layout()`).
+#### Grouped GEMM（contiguous layout）
 
-For more information, please refer to the `m_grouped_gemm_fp8_fp8_bf16_nt_contiguous` function documentation.
+与 CUTLASS 中的传统 Grouped GEMM 不同，DeepGEMM 仅对 M 轴进行分组，而 N 和 K 维度必须保持固定。这种设计特别适用于 MoE 模型中各专家具有相同形状的场景。
 
-#### Grouped GEMMs (masked layout)
+在训练前向传播或推理 prefill 阶段，当每个专家处理的 token 数量不同时，我们将这些 token 拼接成一个单一张量，称为“contiguous layout”。请注意，每个专家的数据段必须对齐到 GEMM 的 M 块大小（可通过 `get_m_alignment_for_contiguous_layout()` 获取）。
 
-During the inference decoding phase, when CUDA graph is enabled and the CPU is unaware of the number of tokens each expert receives, we support masked grouped GEMMs. By providing a mask tensor, the kernel computes only the valid portions.
+更多信息请参阅 `m_grouped_gemm_fp8_fp8_bf16_nt_contiguous` 函数的文档。
 
-Use `m_grouped_gemm_fp8_fp8_bf16_nt_masked` for this purpose and consult the relevant documentation. An example usage is to use the output of low-latency kernels from [DeepEP](https://github.com/deepseek-ai/DeepEP) as input.
+#### Grouped GEMM（nopad layout）
+我们提供了一种新的 Grouped GEMM 模式，即nopad layout。当每个专家处理的 token 数量不同时，通过提供索引张量存储不同专家处理的token数量，无需对齐到 GEMM 的 M 块大小，减少无效的数据搬运.
 
-#### Utilities
+更多信息请参阅 `m_grouped_gemm_fp8_fp8_bf16_nt_nopad` 函数的文档。
 
-The library provides some utility functions besides the above kernels:
+#### Grouped GEMM（masked layout）
 
-- `deep_gemm.set_num_sms`: set the maximum SM count to use
-- `deep_gemm.get_num_sms`: get the current SM maximum count
-- `deep_gemm.get_m_alignment_for_contiguous_layout`: get the group-level alignment requirement for grouped contiguous layout
-- `deep_gemm.get_tma_aligned_size`: get the required TMA alignment size
-- `deep_gemm.get_col_major_tma_aligned_tensor`: get a column-major TMA-aligned tensor
+在推理解码阶段，若启用了 HGGC Graph 且 CPU 无法预知每个专家接收到的 token 数量，我们支持带掩码的 Grouped GEMM。通过提供一个掩码张量，内核将仅计算有效部分。
 
-The library also provides some environment variables, which may be useful:
+请使用 `m_grouped_gemm_fp8_fp8_bf16_nt_masked` 函数，并查阅相关文档。一个典型用例是将其输入设为来自 [DeepEP](https://github.com/deepseek-ai/DeepEP) 的低延迟内核输出。
 
-- General
-  - `DG_JIT_DEBUG`: `0` or `1`, print more JIT debugging information, `0` by default
-- JIT cache related
-  - `DG_JIT_CACHE_DIR`: string, the cache directory to store compiled kernels, `$HOME/.deep_gemm` by default
-  - `DG_JIT_DISABLE_CACHE`: `0` or `1`, disable the use of cache directory, `0` by default
-- NVCC/NVRTC selections
-  - `DG_JIT_USE_NVRTC`: `0` or `1`, use NVRTC instead of NVCC, faster compilation but maybe have lower performance for some cases, `0` by default
-  - `DG_JIT_NVCC_COMPILER`: string, specified NVCC compiler path; will find in `torch.utils.cpp_extension.CUDA_HOME` by default
-- Compiler options
-  - `DG_JIT_OVERRIDE_CPP_STANDARD`: integer (e.g., `20`), support for some old version GCC compiler, `20` by default
-  - `DG_JIT_PTXAS_VERBOSE`: `0` or `1`, show detailed PTXAS compiler output, `0` by default
-  - `DG_JIT_PRINT_REG_REUSE`: `0` or `1`, print FFMA-interleaving details, `0` by default
-  - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print NVCC compilation command, `0` by default
-- Post optimization
-  - `DG_JIT_DISABLE_FFMA_INTERLEAVE`: `0` or `1`, disable FFMA-interleaving optimization, `0` by default
-- Heuristic selection
-  - `DG_PRINT_CONFIGS`: `0` or `1`, print selected configs for each shape, `0` by default
-- Testing
-  - `DG_NSYS_PROFILING`: `0` or `1`, Nsight-system compatible testing, `0` by default
+#### 实用工具函数
 
-For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
+除了上述内核外，本库还提供以下实用函数：
 
-## Optimizations
+- `deep_gemm.set_num_sms`：设置最大可用的 SM 数量
+- `deep_gemm.get_num_sms`：获取当前设定的最大 SM 数量
+- `deep_gemm.get_m_alignment_for_contiguous_layout`：获取连续布局下分组级别的 M 对齐要求
+- `deep_gemm.get_tma_aligned_size`：获取所需的 AIU 对齐尺寸
+- `deep_gemm.get_col_major_tma_aligned_tensor`：获取列主序且 AIU 对齐的张量
 
-We indicate the techniques excluded from CUTLASS with 🐳.
+本库还支持以下环境变量，可能对调试和调优有帮助：
 
-#### Persistent warp-specialization
+- **通用设置**
+  - `DG_JIT_DEBUG`: `0` 或 `1`，是否打印更多 JIT 调试信息，默认为 `0`
+- **JIT 缓存相关**
+  - `DG_JIT_CACHE_DIR`: 字符串，指定编译内核的缓存目录，默认为 `$HOME/.deep_gemm`
+  - `DG_JIT_DISABLE_CACHE`: `0` 或 `1`，是否禁用缓存目录，默认为 `0`
+- **HGCC/HGRTC 选择**
+  - `DG_JIT_USE_NVRTC`: `0` 或 `1`，是否使用 HGRTC 替代 HGCC，可加快编译速度但某些情况可能影响性能，默认为 `0`
+  - `DG_JIT_NVCC_COMPILER`: 字符串，指定编译器路径，默认从 `torch.utils.cpp_extension.CUDA_HOME` 中查找
+- **编译器选项**
+  - `DG_JIT_PTXAS_VERBOSE`: `0` 或 `1`，是否显示详细的 PTXAS 编译输出，默认为 `0`
+  - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` 或 `1`，是否打印 HGCC 编译命令，默认为 `0`
+- **测试相关**
+  - `DG_NSYS_PROFILING`: `0` 或 `1`，是否启用兼容 Asight Systems 的测试模式，默认为 `0`
 
-Following the CUTLASS design, the kernels in DeepGEMM are warp-specialized, enabling overlapping data movement, tensor-core MMA instructions, and CUDA-core promotion. A simplified figure illustrating this process is shown below:
+更多示例和细节请参考 [测试代码](tests/test_core.py) 或查看相应的 Python 文档。
 
-![design](figures/design.png)
+## 优化技术
 
-#### Hopper TMA features
+我们用 🐳 标记那些未直接沿用自 CUTLASS 的创新技术。
 
-The [Tensor Memory Accelerator](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#tensor-memory-accelerator) (TMA) is a new hardware feature introduced by the Hopper architecture, designed for faster and asynchronous data movement. Specifically, we utilize TMA for:
+#### 持久化 Warp 特化（Persistent Warp Interleave）
 
-- TMA load for LHS, LHS scaling factors, and RHS matrices
-- TMA store for the output matrix
-- TMA multicast (automatically decide LHS or RHS to broadcast)
-- TMA descriptor prefetching
+遵循 CUTLASS 的设计理念，DeepGEMM for PPU的内核采用 Warp Interleave设计，使得数据搬运、MMA 指令和 promotion操作能够重叠执行。
 
-#### Common detail optimizations
+#### 常见细节优化
 
-- Utilization of the [`stmatrix`](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-store-instruction-stmatrix) PTX instruction
-- [Register count control](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#miscellaneous-instructions-setmaxnreg) tailored for different warpgroups
-- Less bank conflicts via 3D TMA or swizzling
-- Larger block sizes (up to 256x128 🐳)
-- Overlapping as much as possible, e.g., overlapping TMA store and non-TMA RHS scaling factor load 🐳
+- 更大的块尺寸（最高达 256x256 🐳）
 
-#### A unified and optimized block scheduler
+#### 统一且优化的块调度器
 
-- [One scheduler](deep_gemm/include/deep_gemm/scheduler.cuh) for all non-grouped and grouped kernels
-- [Rasterization](https://github.com/NVIDIA/cutlass/blob/eefa171318b79cbe2e78514d4cce5cd0fe919d0c/media/docs/efficient_gemm.md#threadblock-rasterization) to enhance L2 cache reuse
+- 所有非分组和分组内核共用 [同一个调度器](deep_gemm/include/deep_gemm/scheduler.cuh)
+- 采用 [光栅化（Rasterization）](https://github.com/NVIDIA/cutlass/blob/eefa171318b79cbe2e78514d4cce5cd0fe919d0c/media/docs/efficient_gemm.md#threadblock-rasterization) 策略以提升 L2 缓存复用率
 
-#### Fully JIT design 🐳
+#### 完全 JIT 化设计 🐳
 
-DeepGEMM employs a fully [Just-In-Time](deep_gemm/jit) (JIT) design, with no compilation required at installation. All kernels are compiled at runtime using a lightweight JIT implementation. This approach offers several advantages:
+DeepGEMM 采用完全的 [即时编译（JIT）](deep_gemm/jit) 设计，安装时无需编译。所有内核均在运行时通过轻量级 JIT 实现动态编译。这种方法带来诸多优势：
 
-- GEMM shapes, block sizes, and the number of pipeline stages are treated as compile-time constants
-  - Saving registers
-  - Compilers may do more optimizations
-- Automatic selection of block sizes, number of warpgroups, optimal pipeline stages, and TMA cluster size
-  - But without auto-tuning, the optimal one is deterministically selected
-- Full unrolling of the MMA pipelines, providing compilers with more optimization opportunities
-  - Very important for small shapes 
-  - Refer to `launch_k_iterations` in [the kernel file](deep_gemm/include/deep_gemm/fp8_gemm.cuh) for details
+- 将 GEMM 形状、块大小和流水线级数作为编译时常量处理
+  - 节省寄存器资源
+  - 使编译器能进行更深层次优化
+- 自动选择最优的块大小、warpgroup 数量、流水线级数
+  - 无需自动调优，最优配置由确定性算法选出
+- 完全展开 MMA 流水线，为编译器提供更多优化机会
+  - 对小形状尤其重要
+  - 详见 [内核文件](deep_gemm/include/deep_gemm/fp8_gemm.cuh) 中的 `launch_k_iterations` 函数
 
-Overall, JIT significantly improves performance for small shapes, similar to the approach of the [Triton](https://github.com/triton-lang/triton/) compiler.
+总体而言，JIT 显著提升了小形状矩阵的性能表现，其思路类似于 [Triton](https://github.com/triton-lang/triton/) 编译器。
 
-#### Unaligned block sizes 🐳
+#### 非对齐块大小 🐳
 
-For certain shapes, block sizes aligned to powers of 2 can lead to underutilized SMs. For instance, with `M=256, N=7168`, a typical block size assignment of `BLOCK_M=128, BLOCK_N=128` results in only `(256 / 128) * (7168 / 128) = 112` out of 132 SMs being utilized. To address this, we support unaligned block sizes like 112, enabling `(256 / 128) * (7168 / 112) = 128` SMs to work in such scenarios. Implementing this technique alongside fine-grained scaling requires careful optimization but ultimately delivers performance gains.
+对于某些特定形状，若块大小强制对齐到 2 的幂次，可能导致 SM 利用率不足。例如，当 `M=256, N=7168` 时，若采用典型的 `BLOCK_M=128, BLOCK_N=128`，则仅有 `(256 / 128) * (7168 / 128) = 112` 个 SM 被利用（总共 132 个）。为此，我们支持非对齐块大小（如 112），使得 `(256 / 128) * (7168 / 112) = 128` 个 SM 可参与计算。将此技术与细粒度缩放结合需要精细优化，但最终能带来显著性能增益。
 
-#### FFMA SASS interleaving 🐳
+## 致谢
 
-We observe a performance improvement in [the CUTLASS FP8 kernel](https://github.com/NVIDIA/cutlass/tree/main/examples/54_hopper_fp8_warp_specialized_gemm) between NVCC 12.2 and 12.3. By comparing the compiled SASS, we discover that one bit in [a series of `FADD` instructions](https://github.com/NVIDIA/cutlass/blob/eefa171318b79cbe2e78514d4cce5cd0fe919d0c/include/cutlass/gemm/collective/fp8_accumulation.hpp#L73) is flipped in an interleaving pattern.
-After referencing some open-source [CUDA assembler](https://github.com/cloudcores/CuAssembler/blob/96a9f72baf00f40b9b299653fcef8d3e2b4a3d49/CuAsm/CuControlCode.py#L46) implementations, we identified that this bit controls `yield`, which may enhance warp-level parallelism (just a guess, yielding the current warp and let other warps work).
+DeepGEMM 的设计灵感来源于 [CUTLASS](https://github.com/nvidia/cutlass) 项目。在此向所有开发者致以感谢与敬意！
 
-To leverage this, we develop [a similar script](deep_gemm/jit/interleave_ffma.py) to modify the `FFMA` instructions in the compiled binary. Besides simply modifying the `yield` bit, we also flip the `reuse` bit (registers cannot be reused if the warp is yielded). This adjustment improves performance (10%+ in some cases) for fine-grained scaling FP8 GEMMs by creating more opportunities to overlap MMA instructions with promotion `FFMA` instructions.
+## 许可证
 
-## Acknowledgement
+本代码仓库依据 [MIT 许可证](LICENSE) 发布。
 
-DeepGEMM is inspired by the [CUTLASS](https://github.com/nvidia/cutlass) project. Thanks and respect to the developers!
-
-## License
-
-This code repository is released under [the MIT License](LICENSE).
-
-## Citation
+## 引用格式
 
 ```bibtex
 @misc{deepgemm2025,
-      title={DeepGEMM: clean and efficient FP8 GEMM kernels with fine-grained scaling}, 
+      title={DeepGEMM: clean and efficient FP8 GEMM kernels with fine-grained scaling},
       author={Chenggang Zhao and Liang Zhao and Jiashi Li and Zhean Xu},
       year={2025},
       publisher = {GitHub},
       howpublished = {\url{https://github.com/deepseek-ai/DeepGEMM}},
 }
 ```
-
-PPU Perf Data for UT:
-Dense Gemm:	H20-FP8(TFLOPS)	PPU-INT8(TFLOPS)	PPU-BF16(TFLOPS)
-m=   64, n= 7168, k=  576	73	30	27
-m=   64, n= 2112, k= 7168	134	66	40
-m=   64, n=24576, k= 1536	193	80	53
-m=   64, n=32768, k=  512	142	46	39
-m=   64, n= 7168, k=16384	229	118	69
-m=   64, n= 4096, k= 7168	183	95	53
-m=   64, n= 7168, k= 2048	157	68	45
-m=  128, n= 7168, k=  576	110	41	39
-m=  128, n= 2112, k= 7168	197	127	77
-m=  128, n=24576, k= 1536	232	120	80
-m=  128, n=32768, k=  512	185	64	59
-m=  128, n= 7168, k=16384	263	146	83
-m=  128, n= 4096, k= 7168	224	125	67
-m=  128, n= 7168, k= 2048	200	93	62
-m= 4096, n= 7168, k=  576	219	83	79
-m= 4096, n= 2112, k= 7168	163	216	118
-m= 4096, n=24576, k= 1536	215	159	110
-m= 4096, n=32768, k=  512	149	90	83
-m= 4096, n= 7168, k=16384	171	247	128
-m= 4096, n= 4096, k= 7168	187	225	123
-m= 4096, n= 7168, k= 2048	166	177	114
-			
-			
-grouped contiguous GEMM			
-num_groups= 4, expected_m_per_group=8192, n=4096, k=7168	277	232	127
-num_groups= 4, expected_m_per_group=8192, n=7168, k=2048	272	179	116
-num_groups= 8, expected_m_per_group=4096, n=4096, k=7168	236	233	127
-num_groups= 8, expected_m_per_group=4096, n=7168, k=2048	230	179	115
-num_groups=32, expected_m_per_group= 256, n=4096, k=7168	221	228	123
-num_groups=32, expected_m_per_group= 256, n=7168, k=2048	210	173	112
-			
-			
-grouped masked GEMM			
-num_groups=1, expected_m_per_group=1024, n=4096, k=7168	154	183	99
-num_groups=1, expected_m_per_group=1024, n=7168, k=2048	208	157	88
-num_groups=2, expected_m_per_group= 512, n=4096, k=7168	173	174	92
-num_groups=2, expected_m_per_group= 512, n=7168, k=2048	162	133	90
-num_groups=4, expected_m_per_group= 256, n=4096, k=7168	150	154	93
-num_groups=4, expected_m_per_group= 256, n=7168, k=2048	113	119	80
