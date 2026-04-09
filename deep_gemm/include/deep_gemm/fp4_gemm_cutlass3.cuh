@@ -465,7 +465,7 @@ class DeepGemmUniversal <
       auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
       smem_tiled_copy_A.smem_base_ = shared_storage.tensors.mainloop.smem_a.data();
       auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(aiu_warp_group_thread_idx);
-      Tensor tCsA            = smem_thr_copy_A.partition_S(make_tsm_ld_tensor<SmemLayoutA>());                 // (CPY,CPY_M,CPY_K,PIPE)
+      Tensor tCsA            = smem_thr_copy_A.partition_S(make_mix_tensor_like(sA));                 // (CPY,CPY_M,CPY_K,PIPE)
       Tensor tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);                   // (CPY,CPY_M,CPY_K)
       CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // CPY_M
       CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCrA_copy_view));            // CPY_K
@@ -473,7 +473,7 @@ class DeepGemmUniversal <
       auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
       smem_tiled_copy_B.smem_base_ = shared_storage.tensors.mainloop.smem_b.data();
       auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(aiu_warp_group_thread_idx);
-      Tensor tCsB            = smem_thr_copy_B.partition_S(make_tsm_ld_tensor<SmemLayoutB>());                  // (CPY,CPY_N,CPY_K,PIPE)
+      Tensor tCsB            = smem_thr_copy_B.partition_S(make_mix_tensor_like(sB));                  // (CPY,CPY_N,CPY_K,PIPE)
       Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(tCrB);                   // (CPY,CPY_N,CPY_K)
       CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // CPY_N
       CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
@@ -1379,7 +1379,7 @@ struct CollectiveMmaScaleFp4
 
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
-    for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages-1; ++k_pipe) {
+    for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
       if (k_tile_count > 0){
         copy_to_tsm(k_pipe, *k_tile_iter, warp_idx);
         ++k_tile_iter;
@@ -1413,7 +1413,7 @@ struct CollectiveMmaScaleFp4
     auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
     smem_tiled_copy_A.smem_base_ = storage.smem_a.data();
     auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(aiu_warp_group_thread_idx);
-    Tensor tCsA            = smem_thr_copy_A.partition_S(make_tsm_ld_tensor<SmemLayoutA>());                 // (CPY,CPY_M,CPY_K,PIPE)
+    Tensor tCsA            = smem_thr_copy_A.partition_S(make_mix_tensor_like(sA));                 // (CPY,CPY_M,CPY_K,PIPE)
     Tensor tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);                   // (CPY,CPY_M,CPY_K)
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // CPY_M
     CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCrA_copy_view));            // CPY_K
@@ -1421,7 +1421,7 @@ struct CollectiveMmaScaleFp4
     auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
     smem_tiled_copy_B.smem_base_ = storage.smem_b.data();
     auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(aiu_warp_group_thread_idx);
-    Tensor tCsB            = smem_thr_copy_B.partition_S(make_tsm_ld_tensor<SmemLayoutB>());                  // (CPY,CPY_N,CPY_K,PIPE)
+    Tensor tCsB            = smem_thr_copy_B.partition_S(make_mix_tensor_like(sB));                  // (CPY,CPY_N,CPY_K,PIPE)
     Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(tCrB);                   // (CPY,CPY_N,CPY_K)
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // CPY_N
     CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
@@ -1460,13 +1460,14 @@ struct CollectiveMmaScaleFp4
     // Current pipe index in smem to read from
     int smem_pipe_read  = 0;
     // Current pipe index in smem to write to
-    int smem_pipe_write = DispatchPolicy::Stages-1;
+    int smem_pipe_write = 0;
 
     Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
     Tensor tCsB_p = tCsB(_,_,_,smem_pipe_read);
 
     // Size of the register pipeline
     auto K_BLOCK_MAX = size<2>(tCrA);
+    static_assert(K_BLOCK_MAX > 1, "K_BLOCK_MAX should be large than 1.");
 
     int base_offset_sfa = 0;
     int base_offset_sfb = 0;
@@ -1475,7 +1476,7 @@ struct CollectiveMmaScaleFp4
     // PREFETCH register pipeline
     if (K_BLOCK_MAX > 1) {
       // Wait until our first prefetched tile is loaded in
-      cp_async_wait<DispatchPolicy::Stages-2>();
+      cp_async_wait<DispatchPolicy::Stages-1>();
       __syncthreads();
 
       // Prefetch the first rmem from the first k-tile
@@ -1486,7 +1487,7 @@ struct CollectiveMmaScaleFp4
     }
 
     CUTLASS_PRAGMA_NO_UNROLL
-    for ( ; k_tile_count > -(DispatchPolicy::Stages-1); --k_tile_count)
+    for ( ; k_tile_count > -(DispatchPolicy::Stages); --k_tile_count)
     {
       // Pipeline the outer products with a static for loop.
       // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
@@ -1494,12 +1495,6 @@ struct CollectiveMmaScaleFp4
       {
         if constexpr (k_block == K_BLOCK_MAX - 1)
         {
-          // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
-          ++smem_pipe_read;
-          smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
-          // Commit the smem for smem_pipe_read
-          cp_async_wait<DispatchPolicy::Stages-2>();
-          __syncthreads();
           // Slice the smem_pipe_read smem
           tCsA_p = tCsA(_,_,_,smem_pipe_read);
           tCsB_p = tCsB(_,_,_,smem_pipe_read);
@@ -1518,16 +1513,29 @@ struct CollectiveMmaScaleFp4
         cute::transform(tCrA(_,_,k_block), TransformA{});
         cute::transform(tCrB(_,_,k_block), TransformB{});
         cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrSFA(_,_,k_block), tCrB(_,_,k_block), tCrSFB(_,_,k_block), src_accum);
-        if constexpr (k_block == 0) {
+        if constexpr (k_block == K_BLOCK_MAX - 2) {
+          // Commit the smem for smem_pipe_read
+          cp_async_wait<DispatchPolicy::Stages-2>();
+          __syncthreads();
+
           if (k_tile_count > 0){
             copy_to_tsm(smem_pipe_write, *k_tile_iter, warp_idx);
             ++k_tile_iter;
           }
           cp_async_fence();
+
+          // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
+          ++smem_pipe_read;
+          smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
+
           smem_pipe_write = smem_pipe_read;
         }
       });
     }
+
+    // TODO: original cutlass3 miss this sync
+    cp_async_wait<0>();
+    __syncthreads();
   }
 };
 
