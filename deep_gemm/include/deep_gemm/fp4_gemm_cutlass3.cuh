@@ -51,7 +51,7 @@ template <
   class CollectiveEpilogue_,
   class TileScheduler_,
   bool hasBias = false,
-  bool kUseNStageKernel = false,
+  int nExpand = 1,
   bool kEnableSboOverlap = false
 >
 class DeepGemmUniversal;
@@ -61,7 +61,8 @@ template <
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
   class TileScheduler_,
-  bool hasBias_
+  bool hasBias_,
+  int nExpand
 >
 class DeepGemmUniversal <
   ProblemShape_,
@@ -69,7 +70,7 @@ class DeepGemmUniversal <
   CollectiveEpilogue_,
   TileScheduler_,
   hasBias_,
-  true,
+  nExpand,
   false
 > {
   public:
@@ -140,7 +141,7 @@ class DeepGemmUniversal <
   static constexpr int BlockK = size<2>(TileShape{});
   static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
   static constexpr uint32_t NumMmaWarpGroups = 1;
-  static constexpr int N_EXPAND = KernelAiuMultistageOnN::N_EXPAND;
+  static constexpr int N_EXPAND = nExpand;
   static constexpr uint32_t N_PREFETCH_CACHELINE = cute::ceil_div(TileScheduler::kNumGroups, 32);   // numGroups * sizeof(int) / 128 Byte = cacheline
   static constexpr int Stages = DispatchPolicy::Stages;
 
@@ -660,7 +661,7 @@ class DeepGemmUniversal <
   CollectiveEpilogue_,
   TileScheduler_,
   hasBias_,
-  false,
+  1,
   false
 > {
 public:
@@ -1551,7 +1552,7 @@ template <int32_t ShapeN, int32_t ShapeK,
           int32_t BlockM, int32_t BlockN, int32_t BlockK,
           int32_t WarpM, int32_t WarpN,
           int32_t kNumGroups, int32_t kNumStages, GemmType kGemmType,
-          bool kEnableSboOverlap = false, bool hasBias = false>
+          bool kEnableSboOverlap = false, bool hasBias = false, int NExpand = 1>
 class Fp4Gemm {
   static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
   static_assert((BlockN == 16) || (BlockN == 32) || (BlockN == 64) || (BlockN == 128) || (BlockN == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
@@ -1559,15 +1560,13 @@ class Fp4Gemm {
   static_assert((WarpM <= 64) && (WarpM % 16 == 0), "WarpM must be divideable by 16.");
   static_assert((WarpN % 16 == 0), "WarpN must be divideable by 16.");
 
-  // might need to be revised.
-  static constexpr bool kUseNStageKernel = ShapeK <= 512 && (ShapeN % (BlockN * KernelAiuMultistageOnN::N_EXPAND) == 0) && !hasBias;
 public:
     Fp4Gemm() = default;
 
     static void run(uint8_t *a_ptr, uint16_t *scale_a, uint8_t *b_ptr, uint16_t *scale_b,
                     float *c_ptr, __nv_bfloat16 *d_ptr, int shape_m, int *grouped_layout, int *block_m_info, uint32_t expected_m,
                     cudaStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
-        constexpr int N_EXPAND = kUseNStageKernel ? KernelAiuMultistageOnN::N_EXPAND : 1;
+        constexpr int N_EXPAND = NExpand;
 
         // A matrix configuration
         using         ElementA    = cutlass::float4_t;                          // Element type for A matrix operand
@@ -1702,7 +1701,7 @@ public:
             CollectiveEpilogue,
             TileScheduler,
             hasBias,
-            kUseNStageKernel,
+            N_EXPAND,
             kEnableSboOverlap,
         >;
 

@@ -20,10 +20,10 @@ constexpr auto BLOCK_K = {BLOCK_K};
 constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
-
+constexpr auto nExpand = {N_EXPAND};
 // Make a templated grouped GEMM
 auto bias_dispatcher = [&](auto HasBias) {
-    using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap, decltype(HasBias)::value>;
+    using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap, decltype(HasBias)::value, nExpand>;
     gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
                 bias, out, m, grouped_layout, block_m_info, expected_m,
                 stream, num_sms, smem_size, signal);
@@ -55,7 +55,9 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
     assert (lhs_scales.stride(0) == 1 or lhs_scales.shape[0] == 1) and (rhs_scales.stride(1) == 1 or rhs_scales.shape[1] == 1) and m_indices.is_contiguous()
-    if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device)
+
+    has_bias = True
+    if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device); has_bias = False
 
     # Do nothing if `m` is zero
     if m == 0:
@@ -87,13 +89,16 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     ## total line num: blockM_num + 1, line0 is used to store the real blockM_num
     ## total_size = (blockM_num + 1) * 4 * sizeof(int) Byte
     block_m_info = torch.empty((num_groups + ceil_div(m + 1 - num_groups, block_m)) * 4, dtype=torch.int32, device=m_rows.device)
+    n_expand = 1
 
+    if k <= 512 and n % (block_n * 4) == 0 and not has_bias:
+        n_expand = 4
     args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, m_rows, block_m_info, expected_m, torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp4_fp4_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': num_groups,
-              'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': False, 'GEMM_TYPE': 'GroupedNoPad'},
+              'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': False, 'GEMM_TYPE': 'GroupedNoPad', 'N_EXPAND' : n_expand},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),
@@ -136,7 +141,9 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert (lhs_scales.stride(1) == 1 or lhs_scales.shape[1] == 1) and (rhs_scales.stride(1) == 1 or rhs_scales.shape[1] == 1)
     assert out.is_contiguous() and masked_m.is_contiguous()
-    if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device)
+
+    has_bias = True
+    if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device); has_bias = False
 
     if enable_sbo_overlap:
         assert signal is not None
@@ -160,6 +167,9 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     block_m_info = torch.empty(
         (num_groups + ceil_div(m + 1 - num_groups, block_m)) * 4, dtype=torch.int32, device=masked_m.device)
 
+    n_expand = 1
+    if k <= 512 and expected_m > 2 and n % (block_n * 4) == 0 and not has_bias:
+        n_expand = 4
     args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, masked_m, block_m_info, expected_m,
             torch.cuda.current_stream(), num_sms, smem_config[0], signal)
     runtime = jit_tuner.compile_and_tune(
@@ -167,7 +177,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': enable_sbo_overlap,
-              'GEMM_TYPE': 'GroupedMasked'},
+              'GEMM_TYPE': 'GroupedMasked', 'N_EXPAND' : n_expand},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),
