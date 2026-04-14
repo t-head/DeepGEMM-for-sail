@@ -180,14 +180,14 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     #FIXME: block m can add 16, and blockM/N could be 512
     if not is_grouped_contiguous:
         # block_ms = (32, 64, 128, 256)
-        block_ms = (256, 128, 64, 32, 16)
+        block_ms = (256, 128, 64, 32, 16) if k >= 384 else (64, 32, 16)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
         # block_ms = (16, 32)
 
     # block_ns = (256, 128, 64, 32)
     assert max_block_n > 0 and (max_block_n & (max_block_n - 1)) == 0
-    block_ns = tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 1, 4, -1)))
+    block_ns = tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 1, 4, -1))) if k >= 384 else tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 2, 4, -1)))
 
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
@@ -264,6 +264,9 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # best_block_m = 32
     # best_block_n = 128
+    if not is_ppu1v5_device() and (m > 64 and n == 128 and k == 4096):
+        best_block_m = 128
+        best_block_n = 128
 
     #small m hbm bound or latency bound, wave is not usful, for better occ for 810e hbm bound, use smallest blockN for m16
     if (m < 20 and n < 512) :
@@ -323,6 +326,9 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     if best_block_m == 256 and best_block_n == 256:
         warp_m = best_block_m // 4
         warp_n = best_block_n // 4
+    elif best_block_m == 64 and best_block_n >= 128:
+        warp_m = 32
+        warp_n = best_block_n // 2 if best_block_n < 128 else best_block_n // 4
     elif best_block_m == 32 and best_block_n >= 64:
         warp_m = 32
         warp_n = best_block_n // 4
@@ -330,8 +336,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         warp_m = best_block_m // 4
         warp_n = 32
     elif best_block_m == 128 or best_block_m == 256 and best_block_n >= 32:
-        warp_m = best_block_m // 4
-        warp_n = best_block_n // 2 if best_block_n != 32 else best_block_n
+        warp_m = 64
+        warp_n = best_block_n // 2 if best_block_n <= 128 else best_block_n // 4
     elif best_block_m == 16:
         warp_m = 16
         warp_n = best_block_n // 4 if best_block_n <= 128 else best_block_n // 8

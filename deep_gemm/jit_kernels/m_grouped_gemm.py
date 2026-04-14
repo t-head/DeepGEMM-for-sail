@@ -543,7 +543,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
     num_sms = get_num_sms()
     use_gemv = False
 
-    if ((expected_m <= 2 and k % 8 == 0 and (k % 64 == 0 or (n >= 1024 and k <= 32 * 8)) and not is_ppu1v5_device())
+    if ((k % 16 == 0 and ((m <= 2 * num_groups * 0.75 and k <= 32 * 8) or (m < 0.65 * num_groups and k > 256)) and not is_ppu1v5_device())
         or (m < 0.8 * num_groups and is_ppu1v5_device())):
         # use gemmv if avg m small
         # ThreadPerN = 8
