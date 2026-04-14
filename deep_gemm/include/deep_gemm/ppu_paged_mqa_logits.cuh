@@ -325,6 +325,7 @@ public:
     const float * weights;
     const uint32_t batch_size;
     const uint64_t logits_stride;
+    const uint64_t kv_cache_stride_bytes;
     const uint64_t block_table_stride;
     const uint32_t* context_lens;
     float* logits;
@@ -340,8 +341,8 @@ public:
                 kNumHeads, kHeadDim, BLOCK_M, BLOCK_N, WARP_M, WARP_N, kNumQStages, kNumKVStages, kNextN);
         printf("arguments, ptr_q=%p, ptr_k=%p, k_scales=%p, weights=%p, context_lens=%p, logits=%p, block_table=%p, schedule_meta=%p\n",
                 ptr_q, ptr_k, k_scales, weights, context_lens, logits, block_table, schedule_meta);
-        printf("arguments, batch_size=%d, logits_stride=%ld, block_table_stride=%ld\n",
-                batch_size, logits_stride, block_table_stride);
+        printf("arguments, batch_size=%d, logits_stride=%ld, kv_cache_stride_bytes=%ld, block_table_stride=%ld\n",
+                batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride);
     }
   };
 
@@ -568,7 +569,6 @@ public:
     auto tQgQ = tBgB;
     auto tSFQgSFQ = tSFBgSFB;
 
-    constexpr uint64_t kv_cache_stride_bytes = BLOCK_KV * (kHeadDim + (2 - sizeof(ElementQK)) * 4);
     constexpr bool load_kv_scale = sizeof(ElementQK) == 1;
     const auto& lane_idx = get_lane_idx();
     const auto& warp_offset = (warp_idx % WarpOnM) * WARP_M;
@@ -600,10 +600,10 @@ public:
 
     auto load_kv_g2s = [&](uint32_t q_idx, uint32_t kv_idx) {
         auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
-        tAgA.data() = tKgK.data() + kv_offset * kv_cache_stride_bytes;
+        tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes;
         copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), warp_idx);
         if constexpr(load_kv_scale) {
-            tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * kv_cache_stride_bytes / 4;
+            tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / 4;
             if (sizeof(ElementQK) == 1 && warp_idx < WAPR_LIMIT_SFA) {
                 copy(gmem_tiled_copy_scaleA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv));
             }
@@ -796,7 +796,7 @@ public:
                     const float * k_scales,
                     const float * weights,
                     const uint32_t batch_size,
-                    const uint64_t logits_stride, const uint64_t block_table_stride,
+                    const uint64_t logits_stride, const uint64_t kv_cache_stride_bytes, const uint64_t block_table_stride,
                     const uint32_t* context_lens, float* logits,
                     const uint32_t* block_table, const uint32_t* schedule_meta,
                     cudaStream_t stream, int num_sms, int num_blocks) {
@@ -823,7 +823,7 @@ public:
         hw_info.device_id = 0;
         hw_info.sm_count = num_blocks;
 
-        typename AttnKernel::Arguments arguments{ptr_q, ptr_k, k_scales, weights, batch_size, logits_stride, block_table_stride,
+        typename AttnKernel::Arguments arguments{ptr_q, ptr_k, k_scales, weights, batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride,
                                                  context_lens, logits, block_table, schedule_meta, stride_A, stride_B, hw_info};
         auto params = arguments;
         dim3 const block = AttnKernel::get_block_shape();

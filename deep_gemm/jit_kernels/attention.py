@@ -223,7 +223,7 @@ constexpr uint32_t SPLIT_KV = {SPLIT_KV};
 using atten_t = PagedAttention<ElementQK, ElementAcc, kNextN, kNumHeads, kHeadDim, BLOCK_KV, kNumQStages, kNumKVStages, SPLIT_KV>;
 
 // Launch kernel
-atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, batch_size, logits_stride, block_table_stride,
+atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride,
              (uint32_t*)context_lens, logits, (uint32_t*)block_table, (uint32_t*)schedule_meta, stream, num_sms, num_blocks);
 """
 
@@ -365,7 +365,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
         ElementAcc = "int32_t"
 
     stream = torch.cuda.current_stream()
-    args = (q, k, k_scales, weights, batch_size, logits_stride, block_table_stride, context_lens, logits,
+    args = (q, k, k_scales, weights, batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride, context_lens, logits,
             block_table, schedule_meta, stream, num_sms, schedule_meta_size - 1)
     runtime = jit_tuner.compile_and_tune(
         name='attention_paged_mqa_logits_' + ElementQK,
@@ -377,7 +377,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
         space=(),
         includes=includes_paged,
         arg_defs=(('q', q.dtype), ('k', k.dtype), ('k_scales', torch.float), ('weights', torch.float),
-                  ('batch_size', int), ('logits_stride', int), ('block_table_stride', int), ('context_lens', torch.int32),
+                  ('batch_size', int), ('logits_stride', int), ('kv_cache_stride_bytes', int), ('block_table_stride', int), ('context_lens', torch.int32),
                   ('logits', torch.float), ('block_table', torch.int32), ('schedule_meta', torch.int32),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('num_blocks', int)),
         template=template_paged,
