@@ -10,7 +10,9 @@
 
 namespace deep_gemm::gemm {
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
-static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+extern "C"
+{
+void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                         const std::pair<torch::Tensor, torch::Tensor>& b,
                         const torch::Tensor& d, std::optional<ConfigTuple> config = std::nullopt) {
     // Shape must be `[M, K] @ [N, K].T`
@@ -30,7 +32,7 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     fp8_gemm(a.first, a.second, b.first, b.second, d, m, n, k, config);
 }
 
-static void gemm_bf16_bf16_bf16_nt(const torch::Tensor& a,
+void gemm_bf16_bf16_bf16_nt(const torch::Tensor& a,
                         const torch::Tensor& b, const torch::Tensor& d,
                         std::optional<ConfigTuple> config = std::nullopt) {
     const auto& [m , k ] = get_shape<2>(a);
@@ -50,7 +52,7 @@ static void gemm_bf16_bf16_bf16_nt(const torch::Tensor& a,
     bf16_gemm(a, b, d, m, n, k, config);
 }
 
-static void gemm_int8_int8_bf16_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+void gemm_int8_int8_bf16_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                         const std::pair<torch::Tensor, torch::Tensor>& b,
                         const torch::Tensor& d, std::optional<ConfigTuple> config = std::nullopt) {
     const auto& [m , k ] = get_shape<2>(a.first);
@@ -69,7 +71,7 @@ static void gemm_int8_int8_bf16_nt(const std::pair<torch::Tensor, torch::Tensor>
     }
     int8_gemm(a.first, a.second, b.first, b.second, d, m, n, k, config);
 }
-
+}
 static void register_apis(pybind11::module_& m) {
     m.def("gemm_bf16_bf16_bf16_nt", &gemm_bf16_bf16_bf16_nt,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("config") = std::nullopt);

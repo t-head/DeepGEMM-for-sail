@@ -25,4 +25,17 @@ static void register_apis(pybind11::module_& m) {
     });
 }
 
+extern "C"
+{
+    void deep_gemm_runtime_init(void* library_root_path_ptr, void * cuda_home_path_by_python_ptr)
+    {
+        using namespace deep_gemm::runtime;
+        DG_HOST_ASSERT(library_root_path_ptr);
+        DG_HOST_ASSERT(cuda_home_path_by_python_ptr);
+        auto library_root_path = *reinterpret_cast<std::string*>(library_root_path_ptr);
+        auto cuda_home_path_by_python = *reinterpret_cast<std::string*>(cuda_home_path_by_python_ptr);
+        Compiler::prepare_init(library_root_path, cuda_home_path_by_python);
+        KernelRuntime::prepare_init(cuda_home_path_by_python);
+    }
+}
 } // namespace deep_gemm::runtime
