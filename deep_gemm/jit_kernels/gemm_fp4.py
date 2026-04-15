@@ -1,5 +1,6 @@
 import math
 import torch
+import os
 from typing import Tuple
 import random
 from functools import lru_cache
@@ -34,11 +35,20 @@ auto bias_dispatcher = [&](auto HasBias) {
 if (bias == nullptr) bias_dispatcher(std::bool_constant<false>{});
 else                 bias_dispatcher(std::bool_constant<true>{});
 """
+tile_config = {
+    #(block_m, block_n, block_k):(warp_m, warp_n, stages)
+    (16,  64,  128) : (16, 32, 3),
+    (32,  128, 128) : (32, 64, 2),
+    (32,  64,  128) : (32, 32, 2),
+    (64,  128, 128) : (32, 32, 3),
+    (128, 128, 128) : (32, 64, 2),
+    (128, 256, 64)  : (64, 64, 3)
+}
 
 def get_sf_per_stage_size(block_mn: int, block_k: int) -> Tuple[int, int]:
     bpp = 2                           # bpp=2 means sizeof(uint16)
     smem_sf_k = ceil_div(block_k, 32) # uint16
-    base_smem_sf_size = block_mn * smem_sf_k * bpp   
+    base_smem_sf_size = block_mn * smem_sf_k * bpp
 
     if block_mn <= 64:
         invalid_sf_element_size = 0
@@ -265,17 +275,20 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
                      max_block_n: int = 256) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     assert is_ppu1v5_device(), "mxfp4 is noly supported on PPU-ZW890"
-    if is_grouped_masked:
-        configs = lookup_best_config(m, n, k * 2, num_groups, is_grouped_masked)
-    else:
-        configs = lookup_best_config(total_m, n, k * 2, num_groups, False)
-    if configs is not None:
-        return configs
+
+    # todo: add lut logic
+    # use_heuristic = os.environ.get('USE_HEUR', 'False').lower() == 'true'
+    # if not use_heuristic:
+    #   if is_grouped_masked:
+    #       configs = lookup_best_config(m, n, k * 2, num_groups, is_grouped_masked)
+    #   else:
+    #       configs = lookup_best_config(total_m, n, k * 2, num_groups, False)
+    #   if configs is not None:
+    #       return configs
     if num_groups == 1 and is_grouped_nopad == False and is_grouped_masked == False:
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms)
 
-    block_ms = (256, 128, 64, 32, 16) if k >= 384 else (128, 64, 32, 16)
-
+    block_ms = (256, 128, 64, 32, 16) if k > 768 else (128, 64, 32, 16)
     # block_ns = (256, 128, 64, 32)
     assert max_block_n > 0 and (max_block_n & (max_block_n - 1)) == 0
     block_ns = tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 1, 4, -1))) if k >= 384 else tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 2, 4, -1)))
@@ -328,7 +341,7 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
         # NOTES:
         # for PPU1.0: the block sizes can not be too large, so at least one dim less than 128
         # for PPU1.5: the tile 256x256 is good for many compute bound case
-        if (m >= 128 and k > 2048) or (m >= 256 and k >= 512):
+        if (m >= 96 and k > 1024) or (m >= 256 and k >= 512):
             block_ns_after_filter = filter(lambda bn: (bn != n and n >= 32) and not (block_m == 16 and bn <= 32), block_ns)
         else:
             block_ns_after_filter = \
@@ -353,8 +366,8 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
                 success = True
             elif (m < 512 or n < 512):
                 # if single group block is small, balance wave, utils and occ
-                occ_wave = num_waves / num_occ
-                best_occ_wave = best_num_waves / best_num_occ
+                occ_wave = num_waves
+                best_occ_wave = best_num_waves
                 ai_util = get_block_ai(block_m, block_n)
                 best_ai_util = get_block_ai(best_block_m, best_block_n)
 
@@ -368,8 +381,8 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
                 # print(f'util_ratio:{(num_utils / best_num_utils)}, wave_ratio:{occ_wave / best_occ_wave}, occ_ratio:{(num_occ / best_num_occ)}, ai_ratio:{ai_util / best_ai_util}')
 
                 # print(f'valid_occ:{valid_occ}, valid_wave:{valid_wave}, valid_util:{valid_util}, valid_ai:{valid_ai}')
-                success = (valid_wave + valid_util + valid_occ + valid_ai) >= 3
-
+                # success = (valid_wave + valid_util + valid_occ + valid_ai) >= 3
+                success = (valid_wave + valid_util + valid_ai) >= 2
             elif num_waves < best_num_waves:
                 success = True
             elif num_waves == best_num_waves:
@@ -389,10 +402,6 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
             # print(f'\n\n\n')
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
 
-    # if m >= 96 and m < 128 and n > 2048 and k > 2048 and num_groups >= 8:
-    #     best_block_m = 192
-    #     best_block_n = 256
-
     if (best_block_m - 10 <= m <= best_block_m) and best_block_m == 16:
         best_block_m = best_block_m * 2
 
@@ -400,25 +409,41 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
     if (best_block_m - 10 <= m <= best_block_m) and (best_block_m == 32 or best_block_m == 64) and k > 256:
         best_block_m = best_block_m * 2
 
-    #small m hbm bound or latency bound, wave is not usful, for better occ for 810e hbm bound, use smallest blockN for m16
-    if (m < 10 and n < 512) :
-        best_block_m = 16
-        best_block_n = 64
-
     assert best_block_m is not None and best_block_n is not None
 
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_config, ppu_capacity = None, None, 262144
 
-    block_k = 128
-    if k == 128:
-        block_k = 64
-    if k >= 4096 and (best_block_m <= 32 and best_block_n <= 64):
-        block_k = 256
+    block_k = 64
+    if (best_block_m <= 32 and best_block_n <= 128):
+        if (best_block_n <= 64 or k <= 128):
+            block_k = 128
+    if (best_block_m == 256 and best_block_n == 256):
+        block_k = 128
+    if k <= 128:
+        block_k = 128
 
-    # Recompute the minimal number of SMs required
-    # NOTES: less L2 cache usage and less GPU frequency drop
+    if(m < 6 and n >= 512):
+        if m < 2:
+            best_block_m = 16
+        else:
+            best_block_m = 32
+        best_block_n = 64
+        block_k = 128
+
+    warp_stage = tile_config.get((best_block_m, best_block_n, block_k))
+    if warp_stage:
+        warp_m, warp_n, num_stages = warp_stage
+        best_smem_config = get_smem_config_fp4(num_stages, best_block_m, best_block_n, warp_m, warp_n, block_k, 1)
+        return num_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, num_stages, best_smem_config
+
+    #todo: opt this logic
+    if (m >= 520 and k <= 768):
+        if best_block_m == 128 and best_block_n == 256:
+            best_block_m, best_block_n = best_block_n, best_block_m
+            stage_candidates = (3, )
+
     num_waves = get_num_waves(best_block_m, best_block_n)
 
     num_min_sms = num_sms
@@ -428,9 +453,17 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
     best_block_m, best_block_n, warp_m, warp_n = get_warp_mn_grouped(m, n, k, best_block_m, best_block_n)
 
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
+
     ### for those cases with super small k.
     if not stage_candidates: stage_candidates = (2, )
-
+    if best_block_m <= 32: stage_candidates = (3, 2)
+    if best_block_m > 32: stage_candidates = (3,)
+    if best_block_m >= 128 and best_block_n >= 128: stage_candidates = (3, 4)
+    if best_block_m == 128 and best_block_n == 256:
+        if k >= 768:
+            stage_candidates = (4,)
+        else:
+            stage_candidates = (3,)
     # if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16 or best_block_m == 32:
     #     stage_candidates = (3, 2)
     # if best_block_m > 128 and best_block_n == 256:
