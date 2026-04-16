@@ -19,6 +19,8 @@ from enum import Enum
 import ast
 from math_utils import *
 import numpy as np
+from deep_gemm.jit_kernels.gemm import get_best_configs
+
 global _acc_check, _benchmark, _ref_backend
 global use_ppu, show_log
 _acc_check, _benchmark, use_ppu = True, False, True
@@ -379,20 +381,21 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
             for topk_idx in range(topk):
                 expert_id = topk_ids[token_idx, topk_idx].item()
                 flat_idx = token_idx * topk + topk_idx
-                output_token_order[flat_idx] = x[token_idx] @ y[expert_id].T
-        # ========== Step 2: Permute - 按 expert id 重新排序 ==========
-        # 收集所有 (expert_id, src_idx) 二元组
-        entries = []
-        for token_idx in range(num_token):
-            for topk_idx in range(topk):
-                expert_id = topk_ids[token_idx, topk_idx].item()
-                src_idx = token_idx * topk + topk_idx
-                entries.append((expert_id, src_idx))
+                # output_token_order[flat_idx] = x[token_idx] @ y[expert_id].T
+                ref_out[flat_idx] = x[token_idx] @ y[expert_id].T
+        # # ========== Step 2: Permute - 按 expert id 重新排序 ==========
+        # # 收集所有 (expert_id, src_idx) 二元组
+        # entries = []
+        # for token_idx in range(num_token):
+        #     for topk_idx in range(topk):
+        #         expert_id = topk_ids[token_idx, topk_idx].item()
+        #         src_idx = token_idx * topk + topk_idx
+        #         entries.append((expert_id, src_idx))
 
-        # 按 expert_id 排序
-        entries.sort(key=lambda e: e[0])
-        for dst_idx, (expert_id, src_idx) in enumerate(entries):
-            ref_out[dst_idx] = output_token_order[src_idx]
+        # # 按 expert_id 排序
+        # entries.sort(key=lambda e: e[0])
+        # for dst_idx, (expert_id, src_idx) in enumerate(entries):
+        #     ref_out[dst_idx] = output_token_order[src_idx]
 
 
     if d == torch.bfloat16:
@@ -1112,8 +1115,11 @@ def test_m_grouped_gemm_fused(args) -> None:
     group_size = args.get('group_size', 32)
     if use_ppu:
         x, y, m_indices, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type, group_size)
+        expected_m = (num_token * topk + num_groups - 1) / num_groups
+        configs = get_best_configs(expected_m, n, k, num_groups, deep_gemm.get_num_sms(), is_grouped_contiguous=False)
+        m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks = deep_gemm.moe_align_block_size(m_indices, num_groups, configs[1])
         if d == torch.bfloat16:
-            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_indices)
+            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d == 'w4a16':
             deep_gemm.m_grouped_gemm_w4a16_fused(x, y, out, m_indices)
         else:

@@ -33,6 +33,7 @@ from .jit_kernels import (
     m_grouped_gemm_bf16_bf16_bf16_nt_masked,
     m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
     m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
+    moe_align_block_size,
     m_grouped_gemm_bf16_bf16_bf16_nt_fused,
     # Attention kernels
     get_paged_mqa_logits_metadata,
