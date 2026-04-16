@@ -87,7 +87,6 @@ public:
     }
 
     int32_t get_max_block_per_cu() {
-        
         return Compiler::blocks_per_cu;
     }
 
@@ -191,9 +190,6 @@ public:
             "-mllvm -ppu-pref-mma-reuse=true  -mllvm -regalloc=pbqp --ptxas-options=--register-usage-level=10";
         }
         flags += nvcc_flags;
-
-
-        
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path, const std::string& name, int32_t thread_num, int32_t smem_size) const override {
@@ -273,15 +269,16 @@ public:
             includes_insert({cuda_home, cuda_home + "/cuda/std", cuda_home + "/../targets/x86_64-linux/include/thrust/system/cuda"});
         #endif
             std::string library_include_path_str = fmt::format("{}", library_include_path.c_str());
-            includes_insert({library_include_path_str+ "/cutlass3", library_include_path_str + "/deep_gemm"});
-
-
+            if (arch == AC_PPU0010) {
+                includes_insert({library_include_path_str+ "/cutlass", library_include_path_str + "/deep_gemm", library_include_path_str});
+            } else {
+                includes_insert({library_include_path_str+ "/cutlass3", library_include_path_str + "/deep_gemm"});
+            }
         // #else
             opts_insert({"-DNDEBUG", "-DUSE_CLANG", "-no-cache"});
             if (arch == AC_PPU0010) {
                 opts_insert({
                     "-DACOMPUTE_VERSION=10000",
-                    "--ppu-arch=ppu001",
                 });
             } else if (arch == AC_PPU0015) {
                 opts_insert({
@@ -323,33 +320,9 @@ public:
             }
         // #endif
 
-        #ifdef USE_HEADER_FILES
-            if (getenv("PPU_HOME") == nullptr) {
-              printf("No PPU_HOME exist\n");
-            }
-            std::string ppu_home = getenv("PPU_HOME");
-            std::string acompute_home = ppu_home + "/acompute";
-            std::string cutlass_home = ppu_home + (use_cutlass3 ? "/cutlass3" : "/cutlass");
-            if (arch == AC_PPU0010) {
-              includes_insert({
-                  acompute_home + "/blas/cuda/aiu/include", // aiu files
-            });
-            }
-            includes_insert({
-            acompute_home, // rtc/include/kernel_params/*
-            acompute_home + "/include", // acrtc_utils.h
-            // support gemv
-            acompute_home + "/utils", // cutlass_type_convert.h
-            acompute_home + "/blas/cuda", // gemv_common.h
-            acompute_home + "/base/include", // ac_fusion.h
-            acompute_home + "/include/head_wrapper", // acwrapper_mma.h
-            cutlass_home + "/include",
-            cutlass_home + "/test/unit/nvrtc/stdlib", // assert.h
-            });
-        #endif
-
             std::string standard = "--std=c++17";
             opts.emplace_back(standard);
+
             opts_char.resize(opts.size());
             std::transform(opts.begin(), opts.end(), opts_char.begin(), [](const std::string& s) { return s.c_str(); });
 
@@ -386,7 +359,6 @@ public:
         // Write the code into the cache directory
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);
-        // const auto& arch = 89;
         acArch_t arch = AC_PPU0010;
         bool use_cutlass3 = false;
         if (is_ppu1v5_device()) {
@@ -398,6 +370,7 @@ public:
         nvrtcProgram program;
         DG_NVRTC_CHECK(nvrtcCreateProgram(&program, code.c_str(), "kernel.cu", 0, nullptr, nullptr));
         const auto& compile_result = nvrtcCompileProgram(program, opts.size(), opts.data());
+
         // Get and print compiler log
         size_t log_size;
         DG_NVRTC_CHECK(nvrtcGetProgramLogSize(program, &log_size));
@@ -421,7 +394,6 @@ public:
         put(cubin_path, cubin_data);
         // Cleanup
         DG_NVRTC_CHECK(nvrtcDestroyProgram(&program));
-        
 
         CUmodule module;
         cuModuleLoadData(&module, cubin_data.data());

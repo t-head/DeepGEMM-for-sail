@@ -126,7 +126,7 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
     get_last_wave_util = lambda bm, bn: fix_wave_saturate((ceil_div(m, bm) * ceil_div(n, bn) * num_groups) % num_sms)
-    get_block_utils = lambda m, bm: (((m / bm ) / ((m + bm -1) // bm)) if m % bm != 0 else 1.0) if bm else 0
+    get_block_utils = lambda m, bm: (((m / bm) / ((m + bm -1) // bm)) if m % bm != 0 else 1.0) if bm else 0
     get_block_ai = lambda block_m, block_n: (block_m * block_n) / (block_m + block_n)
 
     # Decide block sizes by waves
@@ -269,7 +269,6 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
         warp_m = best_block_m // 2 if best_block_m != 32 else best_block_m
         warp_n = best_block_n // 4
 
-
     return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
 @lru_cache(maxsize=None)
@@ -294,7 +293,7 @@ def get_best_configs_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: in
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
     get_last_wave_util = lambda bm, bn: fix_wave_saturate((ceil_div(m, bm) * ceil_div(n, bn) * num_groups) % num_sms)
 
-    get_block_utils = lambda m, bm: (((m / bm ) / ((m + bm -1) // bm)) if m % bm != 0 else 1.0) if bm else 0
+    get_block_utils = lambda m, bm: (((m / bm) / ((m + bm -1) // bm)) if m % bm != 0 else 1.0) if bm else 0
     get_block_ai = lambda block_m, block_n: (block_m * block_n) / (block_m + block_n)
 
     # Decide block sizes by waves
@@ -371,7 +370,6 @@ def get_best_configs_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: in
     # qwen3-next & deepseek gemm2 need to fix some issues
     if (best_block_m - 10 <= m <= best_block_m) and (best_block_m == 32 or best_block_m == 64) and k > 256:
         best_block_m = best_block_m * 2
-
 
     #small m hbm bound or latency bound, wave is not usful, for better occ for 810e hbm bound, use smallest blockN for m16
     if (m < 10 and n < 512) :
@@ -468,7 +466,6 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         return num_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
     if is_ppu1v5_device():
         return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, is_grouped_contiguous, is_grouped_masked, max_block_n)
-
     #FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
     if not is_grouped_contiguous:
         block_ms = (256, 128, 64, 32, 16) if k > 384 else (64, 32, 16)
@@ -483,7 +480,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
     get_last_wave_util = lambda bm, bn: fix_wave_saturate((ceil_div(m, bm) * ceil_div(n, bn) * num_groups) % num_sms)
 
-    get_block_utils = lambda m, bm: (((m / bm ) / ((m + bm -1) // bm)) if m % bm != 0 else 1.0) if bm else 0
+    get_block_utils = lambda m, bm: (((m / bm) / ((m + bm -1) // bm)) if m % bm != 0 else 1.0) if bm else 0
     get_block_ai = lambda block_m, block_n: (block_m * block_n) / (block_m + block_n)
 
     # Decide block sizes by waves
@@ -620,7 +617,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         warp_m = best_block_m // 4
         warp_n = best_block_n // 4
     elif best_block_m == 32 and best_block_n >= 64:
-        warp_m = best_block_m // 2 if k > 256 else 32 
+        warp_m = best_block_m // 2 if k > 256 else 32
         warp_n = best_block_n // 4 if best_block_n <= 128 else best_block_n // 8
     elif best_block_n == 32 and n <= 128 and best_block_m >=64:
         warp_m = best_block_m // 4

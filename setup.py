@@ -19,6 +19,9 @@ build_include_dirs = [
     current_dir + '/third-party/cutlass3/tools',
     current_dir + '/third-party/fmt/include',
     current_dir + '/third-party/cutlass3/include/cute',
+    current_dir + '/third-party/cutlass/include/accutlass.h',
+    current_dir + '/third-party/cutlass/include/cutlass',
+    current_dir + '/third-party/cutlass/include/',
 ]
 build_libraries = ['cuda', 'cudart', 'nvrtc']
 build_library_dirs = [

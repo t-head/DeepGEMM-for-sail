@@ -3,10 +3,8 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 #include "scheduler.cuh"
-#include "utils.cuh"
 #include "profiling_interface.hpp"
-
-#include <iostream>
+#include "utils.cuh"
 
 #include "accutlass.h"
 #include "cutlass/array.h"
@@ -17,7 +15,6 @@
 #include "aiu/gemm/kernel/default_gemm_grouped.h"
 #include "aiu/gemm/kernel/default_gemm.h"
 #include "aiu/gemm/threadblock/default_mma.h"
-#include "utils.cuh"
 
 
 namespace deep_gemm {
