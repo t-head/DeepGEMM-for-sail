@@ -106,17 +106,28 @@ def test_paged_mqa_logits_loop():
                     set_acc_check(do_check)
                     test_paged_mqa_logits(args)
 
-    # context_len = 0
-    args = {
-        'data_type': torch.int8,
-        'batch_size': 4,
-        'next_n': 1,
-        'num_heads': 64,
-        'head_dim': 128,
-        'distribution': [20, 10, 0, 0]
-    }
-    set_acc_check(True)
-    test_paged_mqa_logits(args)
+    for args in [
+        # context_len = 0
+        {
+            'data_type': torch.int8,
+            'batch_size': 4,
+            'next_n': 1,
+            'num_heads': 64,
+            'head_dim': 128,
+            'distribution': [20, 10, 0, 0]
+        },
+        # batch_size > 1024
+        {
+            'data_type': torch.bfloat16,
+            'batch_size': 1119,
+            'next_n': 1,
+            'num_heads': 64,
+            'head_dim': 128,
+            'avg_context_len': 1087
+        },
+    ]:
+        set_acc_check(True)
+        test_paged_mqa_logits(args)
     print("Passed\n")
 
 

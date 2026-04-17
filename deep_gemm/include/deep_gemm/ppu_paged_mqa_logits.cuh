@@ -59,25 +59,19 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t* c
     }
     // blockDim.x < 1024: only last loop
     uint32_t last = batch_size - loop_num * blockDim.x;
-    if (tid < last) {
-        uint32_t val = temp_prefix_sum[tid];
-        #pragma unroll
-        for (uint32_t offset = 1; offset < last; offset <<= 1) {
-            uint32_t temp = 0;
-            if (tid >= offset) {
-                temp = temp_prefix_sum[tid - offset];
-            }
-            __syncthreads();
-            val += temp;
-            __syncthreads();
+    uint32_t val = (tid < last) ? temp_prefix_sum[tid] : 0;
+    #pragma unroll
+    for (uint32_t offset = 1; offset < last; offset <<= 1) {
+        uint32_t temp = (tid >= offset && tid < last) ? temp_prefix_sum[tid - offset] : 0;
+        __syncthreads();
+        val += temp;
+        __syncthreads();
+        if (tid < last) {
             temp_prefix_sum[tid] = val;
         }
+    }
+    if (tid < last) {
         temp_prefix_sum[tid] += sum;
-    } else {
-        for (uint32_t offset = 1; offset < last; offset <<= 1) {
-            __syncthreads();
-            __syncthreads();
-        }
     }
     __syncthreads();
     sum = prefix_sum[batch_size - 1];
