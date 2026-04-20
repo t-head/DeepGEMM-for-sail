@@ -165,7 +165,27 @@ def test_m_grouped_gemm_nopad_loop():
             test_m_grouped_gemm_nopad(args)
     print("Passed\n")
 
-# still have problems
+
+def test_m_grouped_gemm_masked_loop():
+    print("Testing GroupedMasked GEMM (W4A16)...")
+    for num_groups, expected_m_per_group in ((64, 1), (16, 16), (128, 48)):
+        for k, n in ((256, 768), (2048, 7168)):
+            group_size = 32
+            print(f"Testing with num_groups={num_groups}, m={num_groups * expected_m_per_group}, n={n}, k={k}, group_size={group_size}")
+            args = {
+                "data_type": "w4a16",
+                "groups": num_groups,
+                "m": num_groups * expected_m_per_group,
+                "n": n,
+                "k": k,
+                "distribution": "zipf",
+                "quant_type": "group",
+                "group_size": group_size
+            }
+            test_m_grouped_gemm_masked(args)
+    print("Passed\n")
+
+
 def test_m_grouped_gemm_fused_loop():
     print("Testing GroupedFused GEMM (W4A16)...")
     for num_groups, num_token, topk in ((256, 1, 8), (256, 16, 8), (384, 32, 16)):
@@ -198,5 +218,6 @@ if __name__ == '__main__':
 
     debug_test()
     # test_m_grouped_gemm_fused_loop()
+    # test_m_grouped_gemm_masked_loop()
     # test_m_grouped_gemm_nopad_loop()
     # test_tile_loop()

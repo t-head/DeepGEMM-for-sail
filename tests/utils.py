@@ -489,7 +489,7 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
         exit(1)
 
 def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, distribution: str,
-                             enable_sbo_overlap: bool = False, quant_type: str = "block"):
+                             enable_sbo_overlap: bool = False, quant_type: str = "block", group_size: int = 32):
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
     # Construct mask
     list_m =  construct_group_m_list(distribution, num_groups, max_m, is_mask=True, em=expected_m_per_group)
@@ -500,6 +500,10 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
     x = torch.randn((num_groups, max_m, k), device=tensor_device, dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
     out = torch.empty((num_groups, max_m, n), device=tensor_device, dtype=torch.bfloat16)
+    if d == 'w4a16':
+        assert quant_type == 'group'
+        # use y_dequant instead of origin y
+        y, y_quant, y_scale = quant_w4a16(y, group_size)
 
     if _acc_check:
         ref_out = torch.einsum('gmk,gnk->gmn', x, y)
@@ -538,6 +542,8 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
         else:
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
+    elif d == 'w4a16':
+        return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
@@ -1034,9 +1040,10 @@ def test_m_grouped_gemm_masked(args) -> None:
     num_groups, m, n, k, d, distribution = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
+    group_size = args.get('group_size', 32)
     if use_ppu:
         expected_m_per_group = ceil_div(m, num_groups)
-        x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type)
+        x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type, group_size=group_size)
 
         expected_m_per_group = estimate_expected_m(m, num_groups, masked_m) if "em" not in args.keys() else args["em"]
         print(f"test_m_grouped_gemm_masked->test_func: GroupedMasked,groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},em:{expected_m_per_group},max_m:{max_m},distribution:{masked_m},sbo_overlap:{enable_sbo_overlap}")
@@ -1050,6 +1057,8 @@ def test_m_grouped_gemm_masked(args) -> None:
         elif d == torch.float8_e4m3fn:
             result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+        elif d == 'w4a16':
+            deep_gemm.m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
@@ -1116,12 +1125,15 @@ def test_m_grouped_gemm_fused(args) -> None:
     if use_ppu:
         x, y, m_indices, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type, group_size)
         expected_m = (num_token * topk + num_groups - 1) / num_groups
-        configs = get_best_configs(expected_m, n, k, num_groups, deep_gemm.get_num_sms(), is_grouped_contiguous=False)
+        if d == 'w4a16':
+            configs = deep_gemm.jit_kernels.m_grouped_gemm_w4a16.get_w4a16_config("GroupedFused", expected_m, n, k, group_size)
+        else:
+            configs = get_best_configs(expected_m, n, k, num_groups, deep_gemm.get_num_sms(), is_grouped_contiguous=False)
         m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks = deep_gemm.moe_align_block_size(m_indices, num_groups, configs[1])
         if d == torch.bfloat16:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d == 'w4a16':
-            deep_gemm.m_grouped_gemm_w4a16_fused(x, y, out, m_indices)
+            deep_gemm.m_grouped_gemm_w4a16_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)

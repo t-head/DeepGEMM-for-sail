@@ -10,6 +10,15 @@ template <GemmType kGemmType,
     uint32_t kNum1DBlocksPerGroup = 2>
 struct FusedGemmScheduler {
 public:
+  struct Params {
+    const int32_t* aligned_num_m_blocks;
+    const int32_t* m_rows;
+    const int32_t* expert_ids_and_cumsum;
+  };
+
+  __device__ __forceinline__ explicit FusedGemmScheduler(Params params)
+  : FusedGemmScheduler(params.aligned_num_m_blocks, params.m_rows, params.expert_ids_and_cumsum) {};
+
   __device__ __forceinline__ explicit FusedGemmScheduler(const int32_t* aligned_num_m_blocks,
                                                          const int32_t* m_rows,
                                                          const int32_t* expert_ids_and_cumsum)
