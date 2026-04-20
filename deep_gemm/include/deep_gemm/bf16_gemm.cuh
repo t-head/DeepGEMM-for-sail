@@ -418,7 +418,7 @@ public:
 
         int max_active_tb_num = GemmGrouped::maximum_active_blocks();
 
-        const int threadblock_count = num_sms < 20 ? num_sms : num_sms * max_active_tb_num;
+        const int threadblock_count = num_sms * max_active_tb_num;
 
         char *pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {

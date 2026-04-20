@@ -608,10 +608,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # NOTES: less L2 cache usage and less GPU frequency drop
     num_waves = get_num_waves(best_block_m, best_block_n)
 
-    if is_ppu1v5_device():
-        num_min_sms = num_sms
-    else:
-        num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
+    num_min_sms = num_sms
+    # num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
 
     assert num_min_sms <= num_sms
 
