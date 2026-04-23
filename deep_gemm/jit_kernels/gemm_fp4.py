@@ -3,6 +3,7 @@ import torch
 import os
 from typing import Tuple
 import random
+import warnings
 from functools import lru_cache
 
 from .tuner import jit_tuner
@@ -493,21 +494,45 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
 
     return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
+def check_mxfp4_scales_layout(scale: torch.Tensor, is_sfa: bool) -> bool:
+    """
+        check whether the layout of the MXFP4 scale is satisfied with the requirement.
+    """
+    is_mn_major = (((scale.dim() == 2) and (scale.stride(0) == 1 or scale.shape[0] == 1)) or ((scale.dim() == 3) and (scale.stride(1) == 1 or scale.shape[1] == 1)))
+    if scale.dtype == torch.uint16 and is_mn_major:
+        return True
+
+    return False
+
 def uint8_padding(scale: torch.Tensor) -> torch.Tensor:
-    import warnings
-    warnings.warn("uint8_padding is deprecated and will be remove in DeepGemm later!!! Please use preprocess_mxfp4_scales to preprocess SFA instead.", DeprecationWarning, stacklevel=2)
+    """
+        forward compatible interface for release_2v1. might be removed later.
+    """
+    if not torch.compiler.is_compiling():
+        warnings.warn("uint8_padding is deprecated and will be remove in DeepGemm later!!! Please use preprocess_mxfp4_scales to preprocess SFA instead.", DeprecationWarning, stacklevel=2)
 
     return preprocess_mxfp4_scales(scale=scale)
 
+def _post_preprocess_mxfp4_scales(scale: torch.Tensor) -> torch.Tensor:
+    """
+        Internal interface for forward compatibility interface for release_2v1. might be removed later.
+    """
+    if scale.dtype == torch.uint16 and scale.is_contiguous() and scale.dim() == 3:
+        if not torch.compiler.is_compiling():
+            warnings.warn("called preprocess_mxfp4_scales for a grouped tensor(dim=3) before torch.stack(), which might lower the preprocess performance. Please use preprocess_mxfp4_scales on the tensor after torch.stack() directly!", UserWarning, stacklevel=3)
+        return scale.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+
+    return scale
+
 def preprocess_mxfp4_scales(scale: torch.Tensor) -> torch.Tensor:
-    assert scale.dtype == torch.uint8, f"The dtype of scale should be torch.uint8 but got {scale.dtype}."
-    assert scale.is_contiguous(), f"Scales should be contiguous."
-    assert len(scale.shape) == 2 or len(scale.shape) == 3, f"The rank of scale should be 2(dense/groupedNoPad) or 3(groupedMasked)."
+    assert scale.dtype == torch.uint8, f"The dtype of scale to be preprocessed in MXFP4 should be torch.uint8 but got {scale.dtype}."
+    assert scale.is_contiguous(), f"Scales to be preprocessed in MXFP4 should be contiguous."
+    assert scale.dim() == 2 or scale.dim() == 3, f"The rank of scale to be preprocessed in MXFP4 should be 2(dense/groupedNoPad) or 3(groupedMasked)."
     if (scale.shape[-1] % 2):
         scale = torch.nn.functional.pad(scale, (0, 1))
     assert scale.shape[-1] % 2 == 0, f'The dim of contiguous must be even number for being viewed as b16.'
 
-    if len(scale.shape) == 2:
+    if scale.dim() == 2:
         return scale.view(torch.uint16).t().contiguous().t()
     else:
         return scale.view(torch.uint16).permute(0, 2, 1).contiguous().permute(0, 2, 1)
@@ -520,6 +545,18 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
     m, k = lhs.shape
     n, k_ = rhs.shape
     m_, n_ = out.shape
+
+    if (not check_mxfp4_scales_layout(scale=lhs_scales, is_sfa=True)):
+        if not torch.compiler.is_compiling():
+            warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFA inner DenseGemm interface.", UserWarning, stacklevel=3)
+        lhs_scales = preprocess_mxfp4_scales(scale=lhs_scales)
+    if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+        if not torch.compiler.is_compiling():
+            warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFB inner DenseGemm interface. preprocess the weight scale might degrade the performance!", UserWarning, stacklevel=3)
+        ### forward compatibility for release_2v1
+        rhs_scales = _post_preprocess_mxfp4_scales(scale=rhs_scales)
+        if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+            rhs_scales = preprocess_mxfp4_scales(scale=rhs_scales)
 
     # Type and shape checks
     assert m == m_ and n == n_ and k == k_

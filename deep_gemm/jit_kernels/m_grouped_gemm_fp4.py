@@ -1,7 +1,8 @@
 import torch
+import warnings
 from typing import Tuple
 
-from .gemm_fp4 import get_best_configs, get_smem_config_fp4
+from .gemm_fp4 import get_best_configs, get_smem_config_fp4, check_mxfp4_scales_layout, preprocess_mxfp4_scales, _post_preprocess_mxfp4_scales
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div
 
@@ -45,6 +46,18 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     num_groups, n, k_ = rhs.shape
     m_, n_ = out.shape
     m__ = m_indices.numel()
+
+    if (not check_mxfp4_scales_layout(scale=lhs_scales, is_sfa=True)):
+        if not torch.compiler.is_compiling():
+            warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFA inner GroupedNoPad interface.", UserWarning, stacklevel=3)
+        lhs_scales = preprocess_mxfp4_scales(scale=lhs_scales)
+    if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+        if not torch.compiler.is_compiling():
+            warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFB inner GroupedNoPad interface. preprocess the weight scale might degrade the performance!", UserWarning, stacklevel=3)
+        ### forward compatibility for release_2v1
+        rhs_scales = _post_preprocess_mxfp4_scales(scale=rhs_scales)
+        if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+            rhs_scales = preprocess_mxfp4_scales(scale=rhs_scales)
 
     # Type and shape checks
     assert m == m_ == m__ and n == n_ and k == k_
@@ -128,6 +141,18 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     num_groups_, n, k_ = rhs.shape
     num_groups__, m_, n_ = out.shape
     num_groups___ = masked_m.numel()
+
+    if (not check_mxfp4_scales_layout(scale=lhs_scales, is_sfa=True)):
+        if not torch.compiler.is_compiling():
+            warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFA inner GroupedMasked interface.", UserWarning, stacklevel=3)
+        lhs_scales = preprocess_mxfp4_scales(scale=lhs_scales)
+    if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+        if not torch.compiler.is_compiling():
+            warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFB inner GroupedMasked interface. preprocess the weight scale might degrade the performance!", UserWarning, stacklevel=3)
+        ### forward compatibility for release_2v1
+        rhs_scales = _post_preprocess_mxfp4_scales(scale=rhs_scales)
+        if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+            rhs_scales = preprocess_mxfp4_scales(scale=rhs_scales)
 
     # Type and shape checks
     assert num_groups == num_groups_ == num_groups__ == num_groups___
