@@ -1463,6 +1463,231 @@ def test_paged_mqa_logits(args) -> None:
     return
 
 
+def kv_cache_cast_to_fp4(x: torch.Tensor) -> torch.Tensor:
+    """Pack a bf16 KV cache block into fused FP4+scale layout for ppu.
+
+    Input : x  [num_blocks, block_size, 1, head_dim]  bfloat16
+    Output:    [num_blocks, block_size, 1, head_dim//2 + scale_bytes]
+               where the first head_dim//2 bytes are packed FP4 (uint8)
+               and the last scale_bytes bytes are e8m0 uint8 scales
+               (one scale per 32 elements, i.e. head_dim//32 scales per row,
+               stored as uint8 and padded to 4-byte alignment).
+    """
+    from test_fp4_core import quantize_fp4_torch
+    num_blocks, block_size, num_heads, head_dim = x.shape
+    assert num_heads == 1
+    # quantize_fp4_torch expects [..., N, K]; work on [num_blocks*block_size, head_dim]
+    x_flat = x.view(num_blocks * block_size, head_dim).to(torch.bfloat16)
+    packed, scale_u8 = quantize_fp4_torch(x_flat)   # packed: uint8 [rows, head_dim//2]
+                                                     # scale_u8: uint8 [rows, head_dim//32]
+    # pad scale to 4-byte width alignment (for the kernel's int32 load)
+    scale_bytes_per_row = scale_u8.shape[1]          # head_dim // 32
+    scale_pad = 4 - (scale_bytes_per_row % 4) if scale_bytes_per_row % 4 != 0 else 0
+    if scale_pad:
+        import torch.nn.functional as F
+        scale_u8 = F.pad(scale_u8, (0, scale_pad))  # [rows, scale_bytes_per_row + pad]
+    scale_bytes = scale_u8.shape[1]
+
+    # fuse: [rows, head_dim//2 + scale_bytes]
+    fused_row_bytes = head_dim // 2 + scale_bytes
+    fused = torch.empty((num_blocks * block_size, fused_row_bytes), dtype=torch.uint8, device=x.device)
+    fused[:, :head_dim // 2] = packed
+    fused[:, head_dim // 2:] = scale_u8
+    return fused.view(num_blocks, block_size, num_heads, fused_row_bytes)
+
+
+def quantize_fp4_for_mqa(x: torch.Tensor, gran_k: int = 32):
+    """Quantize a tensor to ppu FP4 format for MQA logits.
+
+    Args:
+        x       : bfloat16 tensor, shape [seq_len, num_heads, head_dim] (Q)
+                  or                      [seq_len, head_dim]           (KV)
+        gran_k  : scale granularity (elements per scale), default 32
+
+    Returns:
+        packed  : uint8 tensor  [..., head_dim//2]   packed FP4
+        scale   : uint8 tensor  [..., head_dim//gran_k] e8m0 scale
+    """
+    from test_fp4_core import quantize_fp4_torch
+    orig_shape = x.shape
+    head_dim = orig_shape[-1]
+    x_2d = x.reshape(-1, head_dim).to(torch.bfloat16)
+    packed, scale_u8 = quantize_fp4_torch(x_2d)  # packed uint8 [rows, head_dim//2]
+                                                  # scale_u8 uint8 [rows, head_dim//32]
+    packed = packed.reshape(*orig_shape[:-1], head_dim // 2)
+    scale_u8 = scale_u8.reshape(*orig_shape[:-1], head_dim // gran_k)
+    return packed, scale_u8
+
+
+def dequantize_fp4_for_mqa(packed: torch.Tensor, scale_u8: torch.Tensor, gran_k: int = 32):
+    """Dequantize ppu FP4 back to bfloat16 for reference computation."""
+    from test_fp4_core import dequantize_fp4_torch
+    orig_shape = packed.shape[:-1]
+    head_dim = packed.shape[-1] * 2
+    packed_2d = packed.reshape(-1, head_dim // 2)
+    scale_2d = scale_u8.reshape(packed_2d.shape[0], -1)
+    dq = dequantize_fp4_torch(packed_2d, scale_2d)  # [rows, head_dim] bfloat16
+    return dq.reshape(*orig_shape, head_dim)
+
+
+def test_fp8_fp4_mqa_logits(args) -> None:
+    data_type = args['data_type']       # torch.float8_e4m3fn or 'fp4' (torch.uint8)
+    seq_len_q = args['seq_len_q']
+    seq_len_kv = args['seq_len_kv']
+    num_heads = args.get('num_heads', 64)
+    head_dim = args.get('head_dim', 128)
+    logits_dtype = args.get('logits_dtype', torch.float32)
+
+    print("test_fp8_fp4_mqa_logits: data_type={},seq_len_q={},seq_len_kv={},"
+          "num_heads={},head_dim={},logits_dtype={}".format(
+          data_type, seq_len_q, seq_len_kv, num_heads, head_dim, logits_dtype))
+
+    q_bf16 = torch.randn(seq_len_q, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
+    kv_bf16 = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
+    weights = torch.randn(seq_len_q, num_heads, device='cuda', dtype=torch.float32)
+    ks = torch.zeros(seq_len_q, dtype=torch.int32, device='cuda')
+    ke = torch.arange(seq_len_q, dtype=torch.int32, device='cuda') + (seq_len_kv - seq_len_q)
+
+    # Reference (bf16 path)
+    ref_logits = None
+    if get_acc_check():
+        assert get_ref_backend() == "device"
+        ref_logits, _ = ref_fp8_mqa_logits(q=q_bf16, kv=kv_bf16, weights=weights,
+                                           cu_seqlen_ks=ks, cu_seqlen_ke=ke)
+
+    if data_type == torch.float8_e4m3fn:
+        q_in = q_bf16.to(torch.float8_e4m3fn), None
+        kv_fp8, kv_sf = per_custom_dims_cast_to_fp8(kv_bf16, (0,), False)
+        kv_in = kv_fp8, kv_sf
+    elif data_type == torch.uint8:  # FP4
+        # TODO: FP4 MQA logits kernel not yet implemented; this branch exercises
+        # the quantization helpers and interface signature only.
+        q_packed, q_sf = quantize_fp4_for_mqa(q_bf16)
+        kv_packed, kv_sf_fp4 = quantize_fp4_for_mqa(kv_bf16)
+        q_in = q_packed, q_sf
+        kv_in = kv_packed, kv_sf_fp4
+        print(' > FP4 path: kernel not yet implemented, skipping kernel call.')
+        return
+    else:
+        print("ERROR: Unsupported dtype for fp8_fp4_mqa_logits, please check!")
+        exit(1)
+
+    logits = deep_gemm.fp8_fp4_mqa_logits(
+        q=q_in, kv=kv_in, weights=weights,
+        cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
+        clean_logits=True, logits_dtype=logits_dtype,
+    )
+
+    if get_acc_check() and ref_logits is not None:
+        neginf_mask = (logits.float() == float('-inf'))
+        ref_neginf_mask = (ref_logits == float('-inf'))
+        if not torch.equal(neginf_mask, ref_neginf_mask):
+            print("ERROR: -inf mask mismatch!")
+            exit(1)
+        from math_utils import calc_diff
+        diff = calc_diff(
+            logits.float().masked_fill(neginf_mask, 0),
+            ref_logits.masked_fill(ref_neginf_mask, 0),
+        )
+        if diff >= 1e-3:
+            print(f"ERROR: Accuracy check failed, diff={diff}")
+            exit(1)
+        print("Accuracy check passed\n")
+    return
+
+
+def test_fp8_fp4_paged_mqa_logits(args) -> None:
+    data_type = args['data_type']
+    batch_size = args['batch_size']
+    next_n = args['next_n']
+    avg_context_len = args.get('avg_context_len', 8192)
+    distribution = args.get('distribution', [])
+    num_heads = args.get('num_heads', 64)
+    head_dim = args.get('head_dim', 128)
+    logits_dtype = args.get('logits_dtype', torch.float32)
+
+    print("test_fp8_fp4_paged_mqa_logits: data_type={},batch_size={},next_n={},"
+          "avg_context_len={},num_heads={},head_dim={},logits_dtype={}".format(
+          data_type, batch_size, next_n, avg_context_len, num_heads, head_dim, logits_dtype))
+
+    max_model_len = 111 * 1000
+    blocksize = 64
+
+    q_bf16 = torch.randn((batch_size, next_n, num_heads, head_dim),
+                         device='cuda', dtype=torch.bfloat16)
+    num_blocks = max_model_len * 3
+    kv_cache_bf16 = torch.randn((num_blocks, blocksize, 1, head_dim),
+                                device='cuda', dtype=torch.bfloat16)
+    weights = torch.randn((batch_size * next_n, num_heads),
+                          device='cuda', dtype=torch.float32)
+
+    if distribution and isinstance(distribution, list):
+        assert len(distribution) == batch_size
+        context_lens = torch.tensor(distribution[:batch_size], device='cuda', dtype=torch.int32)
+    else:
+        context_lens = torch.randint(
+            int(0.7 * avg_context_len), int(1.3 * avg_context_len),
+            (batch_size,), device='cuda', dtype=torch.int32)
+
+    max_block_len = (context_lens.max().item() + blocksize - 1) // blocksize
+    block_tables = torch.full((batch_size, max_block_len), fill_value=-1,
+                              device='cuda', dtype=torch.int32)
+    block_idx_pool = list(range(num_blocks))
+    import random as _random
+    _random.shuffle(block_idx_pool)
+    counter = 0
+    for i in range(batch_size):
+        ctx_len = context_lens[i].item()
+        for j in range((ctx_len + blocksize - 1) // blocksize):
+            block_tables[i][j] = block_idx_pool[counter]
+            counter += 1
+
+    # Reference (bf16)
+    ref_logits = None
+    if get_acc_check():
+        assert get_ref_backend() == "device"
+        ref_logits = ref_fp8_paged_mqa_logits(
+            q_bf16, kv_cache_bf16, weights, context_lens, block_tables, max_model_len)
+
+    if data_type == torch.float8_e4m3fn:
+        q_fp8 = q_bf16.to(torch.float8_e4m3fn)
+        kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache_bf16)
+        metadata_extra = (next_n, num_heads, head_dim, q_fp8.element_size())
+        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra)
+        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+            q=(q_fp8, None), fused_kv_cache=kv_cache_fp8, weights=weights,
+            context_lens=context_lens, block_table=block_tables,
+            schedule_meta=schedule_metadata, max_context_len=max_model_len,
+            clean_logits=True, logits_dtype=logits_dtype,
+        )
+    elif data_type == torch.uint8:  # FP4
+        # TODO: FP4 paged MQA logits kernel not yet implemented.
+        print(' > FP4 paged path: kernel not yet implemented, skipping kernel call.')
+        return
+    else:
+        print("ERROR: Unsupported dtype for fp8_fp4_paged_mqa_logits, please check!")
+        exit(1)
+
+    if get_acc_check() and ref_logits is not None:
+        positions = torch.arange(max_model_len, device='cuda').unsqueeze(0).expand(
+            batch_size * next_n, -1)
+        row_indices = torch.arange(batch_size * next_n, device='cuda') // next_n
+        next_n_offset = torch.arange(batch_size * next_n, device='cuda') % next_n
+        ref_neginf_mask = ~(
+            positions <= (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(1))
+
+        from math_utils import calc_diff
+        diff = calc_diff(
+            logits.float().masked_fill(ref_neginf_mask, 0),
+            ref_logits.masked_fill(ref_neginf_mask, 0),
+        )
+        if diff >= 1e-3:
+            print(f"ERROR: Accuracy check failed, diff={diff}")
+            exit(1)
+        print("Accuracy check passed\n")
+    return
+
 def read_cmds_from_file(casefile):
     dg_cases = list()
     with open(casefile, "r") as f:

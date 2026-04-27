@@ -55,4 +55,6 @@ from .attention import (
     fp8_paged_mqa_logits,
     bf16_paged_mqa_logits,
     int8_paged_mqa_logits,
+    fp8_fp4_mqa_logits,
+    fp8_fp4_paged_mqa_logits,
 )

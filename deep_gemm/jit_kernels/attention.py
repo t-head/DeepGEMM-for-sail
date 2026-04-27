@@ -418,3 +418,79 @@ def int8_paged_mqa_logits(q: torch.Tensor,
                          max_context_len: int,
                          clean_logits: bool = True):
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)
+
+
+# New unified FP8/FP4 APIs
+# q  : tuple(q_fp, Optional[q_sf])
+#        FP8 mode : q_fp is float8_e4m3fn, q_sf is None
+#        FP4 mode : q_fp is packed FP4 (uint8), q_sf is UE8M0 scale factor (int32)
+# kv : tuple(kv_fp, kv_sf)
+#        FP8 mode : kv_fp is float8_e4m3fn, kv_sf is per-token float32 scale
+#        FP4 mode : kv_fp is packed FP4 (uint8), kv_sf is UE8M0 scale factor (int32)
+# logits_dtype : output dtype, torch.float32 or torch.bfloat16
+
+def fp8_fp4_mqa_logits(q: Tuple,
+                      kv: Tuple,
+                      weights: torch.Tensor,
+                      cu_seq_len_k_start: torch.Tensor,
+                      cu_seq_len_k_end: torch.Tensor,
+                      clean_logits: bool = True,
+                      max_seqlen_k: int = 0,
+                      logits_dtype: torch.dtype = torch.float32):
+    q_fp, q_sf = q
+    kv_fp, kv_sf = kv
+    is_fp4 = q_sf is not None
+
+    if is_fp4:
+        # TODO: implement FP4 MQA logits kernel for PPU
+        # FP4 format: q_fp is packed FP4 (uint8, shape [seq_len, num_heads, head_dim//2]),
+        #             q_sf is UE8M0 scale (int32, shape [seq_len, num_heads]),
+        #             kv_fp is packed FP4 (uint8, shape [seq_len_kv, head_dim//2]),
+        #             kv_sf is UE8M0 scale (int32, shape [seq_len_kv])
+        raise NotImplementedError(
+            "FP4 MQA logits kernel is not yet implemented for PPU. "
+            "Please use fp8_mqa_logits for FP8 inputs."
+        )
+    else:
+        # FP8 path: delegate to existing fp8_mqa_logits logic
+        # max_seqlen_k (compressed logits) is not supported in the current PPU
+        # implementation; ignore it and return full [seq_len_q, seq_len_kv] logits.
+        if max_seqlen_k != 0:
+            raise NotImplementedError(
+                "compressed_logits (max_seqlen_k != 0) is not yet supported in PPU fp8_fp4_mqa_logits."
+            )
+        logits = mqa_logits_common(q_fp, kv_fp, kv_sf, weights,
+                                   cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
+        if logits_dtype != torch.float32:
+            logits = logits.to(logits_dtype)
+        return logits
+
+
+def fp8_fp4_paged_mqa_logits(q: Tuple,
+                             fused_kv_cache: torch.Tensor,
+                             weights: torch.Tensor,
+                             context_lens: torch.Tensor,
+                             block_table: torch.Tensor,
+                             schedule_meta: torch.Tensor,
+                             max_context_len: int,
+                             clean_logits: bool = False,
+                             logits_dtype: torch.dtype = torch.float32):
+    q_fp, q_sf = q
+    is_fp4 = q_sf is not None
+
+    if is_fp4:
+        # TODO: implement FP4 paged MQA logits kernel for PPU
+        # FP4 format: q_fp is packed FP4 (uint8, shape [batch, next_n, num_heads, head_dim//2]),
+        #             q_sf is UE8M0 scale (int32, shape [batch, next_n, num_heads]),
+        #             fused_kv_cache layout: [num_blocks, block_kv, 1, head_dim//2 + sizeof(int)]
+        raise NotImplementedError(
+            "FP4 paged MQA logits kernel is not yet implemented for PPU. "
+            "Please use fp8_paged_mqa_logits for FP8 inputs."
+        )
+    else:
+        # FP8 path: delegate to existing paged_mqa_logits_common logic
+        logits = paged_mqa_logits_common(q_fp, fused_kv_cache, weights, context_lens,
+                                        block_table, schedule_meta, max_context_len, clean_logits)
+        if logits_dtype != torch.float32:
+            logits = logits.to(logits_dtype)
+        return logits

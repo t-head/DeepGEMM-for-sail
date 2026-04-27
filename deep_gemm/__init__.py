@@ -43,6 +43,8 @@ from .jit_kernels import (
     fp8_paged_mqa_logits,
     bf16_paged_mqa_logits,
     int8_paged_mqa_logits,
+    fp8_fp4_mqa_logits,
+    fp8_fp4_paged_mqa_logits,
 )
 
 from .utils import (
@@ -77,7 +79,7 @@ if should_init_deep_gemm_cpp:
         gemm_int8_int8_bf16_nt,
         # fp8_gemm_nt_skip_head_mid,
     )
-    
+
 
     deep_gemm_cpp.init(
         os.path.dirname(os.path.abspath(__file__)), # Library root directory path
