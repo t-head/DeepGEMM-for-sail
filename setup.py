@@ -13,7 +13,6 @@ current_dir = os.path.dirname(os.path.realpath(__file__))
 sources = ['csrc/python_api.cu']
 build_include_dirs = [
     f'{CUDA_HOME}/include',
-    current_dir + '/deep_gemm/include',
     current_dir + '/third-party/cutlass3/',
     current_dir + '/third-party/cutlass3/include',
     current_dir + '/third-party/cutlass3/tools',
@@ -112,7 +111,7 @@ class CustomBuildPy(build_py):
 
 def custom_local_scheme(version):
     return 'dev%03d.%s' % (version.distance, version.short_node)
-    
+
 def custom_version_scheme(version):
     return '1.0.0'
 
@@ -145,7 +144,7 @@ if __name__ == '__main__':
             "version_scheme": custom_version_scheme,
         },
         setup_requires=["setuptools-scm==9.2.2"],
-        packages=find_packages('.'), # old version: packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels', 'deep_gemm/deep_gemm_tuner'],, 
+        packages=find_packages('.'), # old version: packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels', 'deep_gemm/deep_gemm_tuner'],,
         package_data={
             'deep_gemm': [
                 'include/deep_gemm/**/*',

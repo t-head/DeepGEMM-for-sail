@@ -1,6 +1,7 @@
 from .gemm import gemm_bf16_bf16_bf16_nt
 from .gemm_int8 import gemm_int8_int8_bf16_nt
 from .gemm_fp8 import gemm_fp8_fp8_bf16_nt
+from .tf32_hc_prenorm_gemm import tf32_hc_prenorm_gemm
 from .gemm_fp4 import (
     gemm_fp4_fp4_bf16_nt,
     preprocess_mxfp4_scales,

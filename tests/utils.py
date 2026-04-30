@@ -218,6 +218,19 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
 
     if d == torch.bfloat16:
         return x.to('cuda'), y.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    elif d == torch.float32:
+        y = y.to(torch.float32)
+        out = torch.empty((m, n), device=tensor_device, dtype=torch.float32)
+        out_s = torch.ones((m, ), device=tensor_device, dtype=torch.float32)
+
+        if _acc_check:
+            ref_out = x.float() @ y.t()
+            ref_s = x.float().square().sum(-1)
+        else:
+            ref_out = torch.empty_like(out)
+            ref_s = torch.empty_like(out_s)
+
+        return x.to('cuda'), y.to('cuda'), out.to('cuda'), out_s.to('cuda'), ref_out.to('cuda'), ref_s.to('cuda')
     elif d == torch.int8:
         x_int8, y_int8 = per_token_cast_to_int8(x), per_token_cast_to_int8(y)
         return  (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), out.to('cuda'), ref_out.to('cuda')
@@ -738,7 +751,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         # metrics = devices.get(dev, [])
         # metrics_string = ', '.join(metrics) if metrics else ""
         current_file_path = os.path.abspath(__file__)
-        pattern = r"data_type:(bf16|int8|fp8)"
+        pattern = r"data_type:(bf16|int8|fp8|tf32)"
         dtype = re.search(pattern, case).groups()[0]
         script = f"{os.path.dirname(current_file_path)}/run_deep_gemm.py"
         if mode == "full":
@@ -926,6 +939,8 @@ def convert_data_type_to_dtype(data_type):
         return data_type
     elif data_type in ["bf16", "torch.bfloat16"]:
         return torch.bfloat16
+    elif data_type in ["tf32", "torch.float32"]:
+        return torch.float32
     elif data_type in ["int8", "torch.int8"]:
         return torch.int8
     elif data_type in ["fp4"]:
@@ -944,9 +959,14 @@ def test_gemm(args) -> None:
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     print(f"test_gemm->test_func: DenseGemm,m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")
     if use_ppu:
-        x, y, out, ref_out = construct(m, k, n, d, quant_type=quant_type)
+        if d == torch.float32:
+            x, y, out, out_s, ref_out, ref_s = construct(m, k, n, d, quant_type=quant_type)
+        else:
+            x, y, out, ref_out = construct(m, k, n, d, quant_type=quant_type)
         if d == torch.bfloat16:
             deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
+        elif d == torch.float32:
+            deep_gemm.tf32_hc_prenorm_gemm(x, y, out, out_s, num_splits=None)
         elif d == torch.int8:
             deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
         elif d == torch.float8_e4m3fn:
@@ -971,6 +991,12 @@ def test_gemm(args) -> None:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
     if _acc_check:
+        if d == torch.float32:
+            diff_s = calc_diff(out_s, ref_s)
+            if diff_s >= 0.001:
+                print("ref_out_s:", ref_s)
+                print("out_s:", out_s)
+            assert diff_s < 0.001, f'{m=}, {k=}, {n=}, {diff_s:.5f}'
         diff = calc_diff(out, ref_out)
         if diff >= 0.001:
             print("ref_out:", ref_out)
