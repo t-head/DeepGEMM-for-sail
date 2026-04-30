@@ -168,6 +168,17 @@ struct PagedMQALogitsScheduler {
         return q_idx < end_q_idx or q_idx == end_q_idx and 0 < end_kv_idx;
     }
 
+    // return 0 means no valid next q
+    __device__ __forceinline__ uint32_t next_valid_q_idx(const uint32_t& q_idx) const {
+        int next_q_idx = q_idx + 1;
+        while (true) {
+            if (!exist_q_idx(next_q_idx)) return 0;
+            if (__ldg(this->context_lens + next_q_idx) != 0) return next_q_idx;
+            next_q_idx++;
+        }
+        return 0;
+    }
+
     __device__ __forceinline__ bool is_last_task(const uint32_t& q_idx, const uint32_t& kv_idx) const {
         return q_idx == end_q_idx and kv_idx == end_kv_idx;
     }
@@ -571,7 +582,7 @@ public:
     uint32_t warp_q_idx = warp_idx / WarpOnM;
     int warp_group_id = warp_idx / 8;
 
-    uint32_t q_idx = scheduler.current_q_idx;
+    uint32_t q_idx_array[kNumKVStages];
     uint32_t kv_idx_array[kNumKVStages];
     kv_idx_array[kNumKVStages - 1] = UINT32_MAX;
     uint32_t num_kv; // num_kv is not used
@@ -627,7 +638,7 @@ public:
     };
 
     auto load_next_qk_g2s = [&](bool load_q) {
-        uint32_t q_idx;
+        uint32_t& q_idx = q_idx_array[smem_pipe_write_kv];
         uint32_t& kv_idx = kv_idx_array[smem_pipe_write_kv];
         if (scheduler.fetch_next_task(q_idx, kv_idx, num_kv)) {
             if (load_q) load_q_g2s(q_idx);
@@ -647,6 +658,7 @@ public:
 
     while (true) {
         // Get current Q and KV index
+        const uint32_t& q_idx = q_idx_array[smem_pipe_read_kv];
         const uint32_t& kv_idx = kv_idx_array[smem_pipe_read_kv];
 
         if (scheduler.is_last_task(q_idx, kv_idx)) break;
@@ -657,16 +669,18 @@ public:
         // Read weights if current Q changes
         if (kv_idx == 0 || kv_idx_array[kNumKVStages - 1] == UINT32_MAX) {
             if constexpr(kNumQStages > 1) {
-                if (scheduler.exist_q_idx(q_idx + 1)) {
-                    load_q_g2s(q_idx + 1);
+                uint32_t next_q_idx = scheduler.next_valid_q_idx(q_idx);
+                if (next_q_idx != 0) {
+                    load_q_g2s(next_q_idx);
                 }
                 cp_async_fence();
             }
             load_q_s2r();
             if constexpr(kNumQStages == 1) {
                 __syncthreads();
-                if (scheduler.exist_q_idx(q_idx + 1)) {
-                    load_q_g2s(q_idx + 1);
+                uint32_t next_q_idx = scheduler.next_valid_q_idx(q_idx);
+                if (next_q_idx != 0) {
+                    load_q_g2s(next_q_idx);
                 }
                 cp_async_fence();
             }
@@ -750,7 +764,6 @@ public:
             }
         }
         smem_pipe_read_kv = (smem_pipe_read_kv + 1) % kNumKVStages;
-        if (kv_idx_array[smem_pipe_read_kv] == 0) q_idx++;
 
         cp_async_wait<kNumKVStages - 2>();
         __syncthreads();
@@ -837,9 +850,6 @@ public:
 
             dg_prof_params.set_paged_mqa_logits_params(data_type_str, batch_size, kNextN, kNumHeads, kHeadDim, reinterpret_cast<int*>(const_cast<uint32_t*>(context_lens)), stream);
         }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-        cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
         char *pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
@@ -861,6 +871,10 @@ public:
                 printf("Warning: num_blocks(%d) should equal to num_sms(%d) * max_blocks_per_cu(%d) = %d\n", num_blocks, num_sms, max_blocks_per_cu, num_sms * max_blocks_per_cu);
             }
         }
+
+        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+        cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);
+        ProfilingInterface::Instance().instrument(false, dg_prof_params);
     }
 };
 

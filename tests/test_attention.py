@@ -117,6 +117,15 @@ def test_paged_mqa_logits_loop():
             'head_dim': 128,
             'distribution': [20, 10, 0, 0]
         },
+        # mtp: context_len = 0 in middle
+        {
+            'data_type': torch.int8,
+            'batch_size': 16,
+            'next_n': 1,
+            'num_heads': 32,
+            'head_dim': 128,
+            'distribution': [4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1]
+        },
         # batch_size > 1024
         {
             'data_type': torch.bfloat16,

@@ -1238,7 +1238,7 @@ def ref_get_metadata(context_lens: torch.Tensor, block_kv: int, num_sms: int, me
     split_kv = block_kv * num_math_warpgroups
     tb_per_cu = 1
     if metadata_extra is not None:
-        from deep_gemm.jit_kernels.utils import get_paged_mqa_logits_tb_per_sm
+        from deep_gemm.jit_kernels.utils import get_paged_mqa_logits_tile
         next_n, num_heads, head_dim, element_size = metadata_extra
         _, _, tb_per_cu = get_paged_mqa_logits_tile(next_n, split_kv, num_heads, head_dim, element_size)
     num_splits = num_sms * tb_per_cu
