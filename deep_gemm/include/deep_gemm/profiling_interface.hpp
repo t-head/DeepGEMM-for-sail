@@ -209,7 +209,7 @@ bool check_support_dump(){
     if (target_device_id != -1 && target_device_id != device_id_ && !is_paged_mqa_logits()) {
         return false;
     }
-    if (gemm_type_ == GemmType::DenseGemm) {
+    if (gemm_type_ == GemmType::DenseGemm || gemm_type_ == GemmType::BatchGemm) {
         printf("\ndump_group_m not supported for normal gemm.\n");
         return false;
     }

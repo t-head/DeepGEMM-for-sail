@@ -1123,7 +1123,17 @@ public:
 
         StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(shape_m, SHAPE_K, 1));
         StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(SHAPE_N, SHAPE_K, 1));
-        StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(shape_m, SHAPE_N, 1));
+        StrideD stride_D;
+        if constexpr (kGemmType == GemmType::BatchGemm) {
+          // BHD output: D[b,h,d] has offset b*H*D + h*D + d
+          // In the kernel's (batch=h, M=b, N=d) model:
+          //   row stride = H*D = kNumGroups * SHAPE_N
+          //   col stride = 1
+          //   batch stride = D = SHAPE_N
+          stride_D = StrideD{int64_t(kNumGroups) * SHAPE_N, cute::Int<1>{}, int64_t(SHAPE_N)};
+        } else {
+          stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(shape_m, SHAPE_N, 1));
+        }
         LayoutSFA layout_SFA;
         LayoutSFB layout_SFB;
         auto ScaleGranularityN = size<1>(ScaleGranularityShape{});

@@ -849,11 +849,11 @@ def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
     supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size", "logits_dtype"]
-    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits"]
+    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits", "BatchGemm"]
     supported_logits_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
-    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|Normal|MqaLogits|PagedMqaLogits),(.+)"
+    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|Normal|MqaLogits|PagedMqaLogits|BatchGemm),(.+)"
     pattern = re.compile(dg_params)
     m = pattern.search(s.strip("."))
     if not m:
@@ -1586,6 +1586,49 @@ def test_paged_mqa_logits(args) -> None:
         else:
             print("Accuracy check passed\n")
     return
+
+def test_fp8_einsum(args) -> None:
+    print('Testing FP8 einsum:')
+    b, h, r, d, data_type, expr = args['b'], args['h'], args['r'], args['d'], args["data_type"], args["expr"]
+    quant_type = args['quant_type'] if 'quant_type' in args else 'block'
+    if expr == 'bhr,hdr->bhd':
+        tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
+        x = torch.randn((b, h, r), device=tensor_device, dtype=torch.bfloat16)
+        y = torch.randn((h, d, r), device=tensor_device, dtype=torch.bfloat16)
+        out = torch.empty((b, h, d), device='cuda', dtype=torch.bfloat16)
+        if _acc_check:
+            ref_out = torch.einsum('bhr,hdr->bhd', x, y)
+        else:
+            ref_out = torch.empty_like(out)
+        x_fp8 = per_token_cast_to_fp8(x.view(-1, r), use_ue8m0=False)
+        x_fp8 = x_fp8[0].view(b, h, r), x_fp8[1].view(b, h, ceil_div(r, 128))
+        y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn),
+                    torch.empty((h, ceil_div(d, 128), ceil_div(r, 128)), device='cuda', dtype=torch.float))
+        for i in range(h):
+            y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i], use_ue8m0=False)
+        deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, out)
+    else:
+        raise ValueError(f"unsupported expr expression: {expr}!")
+
+    if _acc_check:
+        diff = calc_diff(out, ref_out)
+        if diff >= 0.001:
+            print("ref_out:", ref_out)
+            print("out:", out)
+        assert diff < 0.001, f'{h=}, {b=}, {d=}, {r=}, {diff:.5f}'
+        print("Passed with acc_check\n")
+    else:
+        print("Passed without acc_check\n")
+
+    if get_benchmark():
+        t = bench_kineto(lambda: deep_gemm.fp8_einsum(expr, x_fp8, y_fp8, out), 'gemm', suppress_kineto_output=True)
+        # t_cublaslt = bench_kineto(lambda: deep_gemm.einsum(expr, x, y, z, use_cublaslt=True), 'nvjet', suppress_kineto_output=True)
+        print(f' > Perf ({b=:4.0f}, {h=}, {r=}, {d=}): ',
+                f'{t * 1e6:4.0f} us | '
+                f'{2 * b * h * r * d / t / 1e12:4.0f} TFLOPS | '
+                f'{count_bytes((x_fp8, y_fp8, out)) / t / 1e9:4.0f} GB/s | ')
+                # f'{t_cublaslt / t:4.2f} x')
+
 
 def read_cmds_from_file(casefile):
     dg_cases = list()

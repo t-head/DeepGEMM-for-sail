@@ -49,6 +49,7 @@ from .jit_kernels import (
     int8_paged_mqa_logits,
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
+    fp8_einsum,
 )
 
 from .utils import (
