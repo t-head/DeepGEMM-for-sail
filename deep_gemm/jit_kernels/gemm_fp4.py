@@ -36,14 +36,22 @@ auto bias_dispatcher = [&](auto HasBias) {
 if (bias == nullptr) bias_dispatcher(std::bool_constant<false>{});
 else                 bias_dispatcher(std::bool_constant<true>{});
 """
-tile_config = {
+tile_config_normal = {
     #(block_m, block_n, block_k):(warp_m, warp_n, stages)
     (16,  64,  128) : (16, 32, 3),
+    (16,  64,  256) : (16, 16, 4),
     (32,  128, 128) : (32, 64, 2),
     (32,  64,  128) : (32, 32, 2),
-    (64,  128, 128) : (32, 32, 3),
+    (64,  128, 128) : (32, 64, 2),
     (128, 128, 128) : (32, 64, 2),
     (128, 256, 64)  : (64, 64, 3)
+}
+tile_config_smallK = {
+    (16,  64,  128) : (16, 16, 2),
+    (32,  64,  128) : (16, 32, 2),
+    (32, 128,  128) : (16, 64, 2),
+    (64, 128,  128) : (32, 64, 2),
+    (64, 256,  128) : (32, 64, 2)
 }
 
 def get_sf_per_stage_size(block_mn: int, block_k: int) -> Tuple[int, int]:
@@ -407,7 +415,7 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
         best_block_m = best_block_m * 2
 
     # qwen3-next & deepseek gemm2 need to fix some issues
-    if (best_block_m - 10 <= m <= best_block_m) and (best_block_m == 32 or best_block_m == 64) and k > 256:
+    if (best_block_m - 10 <= m <= best_block_m) and (best_block_m == 32 or best_block_m == 64) and k >= 192:
         best_block_m = best_block_m * 2
 
     assert best_block_m is not None and best_block_n is not None
@@ -422,8 +430,11 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
             block_k = 128
     if (best_block_m == 256 and best_block_n == 256):
         block_k = 128
-    if k <= 128:
+    if k <= 256:
         block_k = 128
+        # for deepseek-pro tp8 gemm2
+        if k == 192 and best_block_m == 128 and best_block_n == 128:
+            block_k = 64
 
     if(m < 6 and n >= 512):
         if m < 2:
@@ -432,6 +443,15 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
             best_block_m = 32
         best_block_n = 64
         block_k = 128
+    # for deepseek-v4 pro tp16 gemm1 smallN
+    if(m < 2 and n < 512):
+        best_block_m = 16
+        best_block_n = 64
+        block_k = 256
+
+    tile_config = tile_config_normal
+    if (k < 128) and not (best_block_n >= 128 and best_block_m >= 128):
+        tile_config = tile_config_smallK
 
     warp_stage = tile_config.get((best_block_m, best_block_n, block_k))
     if warp_stage:
