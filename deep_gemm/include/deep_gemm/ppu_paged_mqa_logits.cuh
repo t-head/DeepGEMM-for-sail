@@ -146,7 +146,7 @@ struct PagedMQALogitsScheduler {
         kv_idx = current_kv_idx;
         num_kv = current_num_kv;
 
-        if (q_idx == end_q_idx and kv_idx == end_kv_idx)
+        if (is_last_task(q_idx, kv_idx))
             return false;
 
         current_kv_idx += kNumMathWarpGroups;
@@ -180,7 +180,7 @@ struct PagedMQALogitsScheduler {
     }
 
     __device__ __forceinline__ bool is_last_task(const uint32_t& q_idx, const uint32_t& kv_idx) const {
-        return q_idx == end_q_idx and kv_idx == end_kv_idx;
+        return q_idx > end_q_idx or (q_idx == end_q_idx and kv_idx == end_kv_idx);
     }
 };
 
