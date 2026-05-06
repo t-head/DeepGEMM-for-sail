@@ -249,89 +249,19 @@ bf16_gemm_fused_moe_kernel(const GemmArgs args) {
       CUTE_STATIC_ASSERT_V(size(tCcC) == size(accum),
           "Accumulator count must have the same destination element count.");
 
-      auto epilogue_with_tsm = [&]() {
-        using EpilogueCopyInst = AutoVectorizingCopyWithAssumedAlignment<128>;
-        static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<DstT>::value;
-        using EpilogueConfig = cutlass::gemm::config::DefaultGemm_Epilogue_Configuration<
-                EpilogueCopyInst, DstT, AlignmentD, Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_M / WARP_M>, BLOCK_SIZE>;
-        using SmemLayoutO = typename EpilogueConfig::SmemLayoutO;
-        using CopyAtomR2S = Copy_Atom<EpilogueCopyInst, DstT>;
-        using TiledCopyS2R = typename EpilogueConfig::GmemTiledCopyO;
-
-        Tensor sAcc = make_tensor(make_smem_ptr(reinterpret_cast<DstT*>(smem_buffer)), SmemLayoutO{});
-
-        // Partition sAcc to match the accumulator partitioning
-        auto tiled_r2s = make_tiled_copy_C(CopyAtomR2S{}, tiled_mma);
-        auto thread_r2s     = tiled_r2s.get_thread_slice(thread_idx);
-        Tensor tRS_rAcc = thread_r2s.retile_S(accum);                        // ((Atom,AtomNum), MMA_M, MMA_N)
-        Tensor tRS_sAcc = thread_r2s.partition_D(sAcc);                      // ((Atom,AtomNum),PIPE_M,PIPE_N)
-
-        // Tile gC by the shape of SmemLayout first
-        auto tile  = make_shape(size<0>(sAcc), size<1>(sAcc));
-
-        // Partition sAcc, gC for the output
-        auto tiled_s2r = TiledCopyS2R{};
-        auto thread_s2r     = tiled_s2r.get_thread_slice(thread_idx);
-        Tensor tSR_sAcc = thread_s2r.partition_S(sAcc);                      //               ((Atom,AtomNum),ATOM_M,ATOM_N)
-
-        // Repeat the D-partitioning for coordinates and predication
-        Tensor cCt  = flat_divide(cC, tile);                                 //                (SMEM_M,SMEM_N,TILE_M,TILE_N)
-        Tensor tSR_cC = thread_s2r.partition_D(cCt);                         // ((Atom,AtomNum),ATOM_M,ATOM_N,TILE_M,TILE_N)
-
-        // Allocate intermediate registers on the dst tensors
-        Tensor tSR_rAcc = make_tensor<DstT>(take<0,3>(shape(tSR_cC)));       // ((Atom,AtomNum),ATOM_M,ATOM_N)
-
-        CUTE_STATIC_ASSERT(size<1>(tRS_rAcc) % size<3>(tSR_cC) == 0);  // TILE_M divides MMA_M
-        CUTE_STATIC_ASSERT(size<2>(tRS_rAcc) % size<4>(tSR_cC) == 0);  // TILE_N divides MMA_N
-
-        CUTLASS_PRAGMA_UNROLL
-        for (int step_m = 0; step_m < size<2>(cCt); ++step_m) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int step_n = 0; step_n < size<3>(cCt); ++step_n) {
-            // Step 1. Copy to SMEM
-            CUTLASS_PRAGMA_UNROLL
-            for (int pipe_m = 0; pipe_m < size<1>(tRS_sAcc); ++pipe_m) {
-              CUTLASS_PRAGMA_UNROLL
-              for (int pipe_n = 0; pipe_n < size<2>(tRS_sAcc); ++pipe_n) {
-                int mma_m = step_m * size<1>(tRS_sAcc) + pipe_m;
-                int mma_n = step_n * size<2>(tRS_sAcc) + pipe_n;
-                copy(tiled_r2s, tRS_rAcc(_,mma_m,mma_n), tRS_sAcc(_,pipe_m,pipe_n));
-              }
-            }
-            // Step 2. Wait for SMEM writes to complete
-            __syncthreads();
-
-            // Step 3. Copy from SMEM into a fragment
-            copy(tiled_s2r, tSR_sAcc, tSR_rAcc);
-
-            // Step 4. Wait for SMEM reads to complete
-            __syncthreads();
-
-            Tensor tSR_cDmn = tSR_cC(_,_,_,step_m,step_n);
-            CUTLASS_PRAGMA_UNROLL
-            for (int m = 0; m < size<1>(tSR_cDmn); ++m) {
-              CUTLASS_PRAGMA_UNROLL
-              for (int n = 0; n < size<2>(tSR_cDmn); ++n) {
-                size_t token_offset = __ldg(blk_token_base + get<0>(tSR_cDmn(0,m,n)));
-                size_t n_offset = blk_n_offset + get<1>(tSR_cDmn(0,m,n));
-                // Predication
-                bool cond = token_offset < num_valid_tokens;
-                if constexpr (SHAPE_N % BLOCK_N) {
-                  cond = cond &&  n_offset < SHAPE_N;
-                }
-                if (cond) {
-                  uint128_t* dst_ptr = (uint128_t*)((DstT*)args.c_ptr + token_offset * STRIDE_CM + n_offset);
-                  uint128_t* acc_ptr = (uint128_t*)(raw_pointer_cast(tSR_rAcc(_,m,n).data()));
-                  *dst_ptr = *acc_ptr;
-                }
-              }
-            }
-          }
-        }
-      };
+#if __HGGC_ARCH__ == 150
       epilogue_no_tsm<AccT, DstT, SHAPE_N, BLOCK_N, STRIDE_CM>(accum, tCcC, args.c_ptr,
           blk_token_base, num_valid_tokens, blk_n_offset);
-      // epilogue_with_tsm();
+#else
+      using EpilogueCopyInst = AutoVectorizingCopyWithAssumedAlignment<128>;
+      static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<DstT>::value;
+      using EpilogueConfig = cutlass::gemm::config::DefaultGemm_Epilogue_Configuration<
+              EpilogueCopyInst, DstT, AlignmentD, Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_M / WARP_M>, BLOCK_SIZE>;
+      using CopyAtomR2S = Copy_Atom<EpilogueCopyInst, DstT>;
+      epilogue_with_tsm<AccT, DstT, SHAPE_N, BLOCK_N, STRIDE_CM, EpilogueConfig, CopyAtomR2S>(
+        accum, tCcC, cC, tiled_mma, args.c_ptr, smem_buffer, blk_token_base, thread_idx,
+        num_valid_tokens, blk_n_offset);
+#endif
     }
 }
 
@@ -386,8 +316,8 @@ public:
         int sm_count = num_sms * max_blocks_per_cu;
         dim3 grid(sm_count, 1, 1);
 
-        char *pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
+        const char* pEnv_params = std::getenv("show_log");
+        if (pEnv_params && std::atoi(pEnv_params) == 1) {
             cudaFuncAttributes attr;
             cudaFuncGetAttributes(&attr, device_func);
 

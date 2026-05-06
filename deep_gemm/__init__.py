@@ -37,6 +37,7 @@ from .jit_kernels import (
     moe_align_block_size,
     m_grouped_gemm_bf16_bf16_bf16_nt_fused,
     m_grouped_gemm_fp8_fp8_bf16_nt_fused,
+    m_grouped_gemm_int8_int8_bf16_nt_fused,
     # Attention kernels
     get_paged_mqa_logits_metadata,
     fp8_mqa_logits,

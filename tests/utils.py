@@ -20,7 +20,8 @@ import ast
 from math_utils import *
 import numpy as np
 from deep_gemm.jit_kernels.gemm import get_best_configs as bf16_get_best_configs
-from deep_gemm.jit_kernels.gemm_fp8 import get_best_configs as fp8_get_best_configs
+from deep_gemm.jit_kernels.gemm_fp8 import get_best_configs as fp8_blkwise_get_best_configs
+from deep_gemm.jit_kernels.gemm_int8 import get_best_configs as perchannel_get_best_configs
 
 global _acc_check, _benchmark, _ref_backend
 global use_ppu, show_log
@@ -355,7 +356,7 @@ def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=Fals
 
 
 
-def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: int, topk:int, d: torch.dtype, quant_type: str = "block", group_size = 32) -> \
+def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: int, topk:int, d: torch.dtype, quant_type: str, group_size = 32) -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
 
@@ -382,33 +383,55 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
             for topk_idx in range(topk):
                 expert_id = topk_ids[token_idx, topk_idx].item()
                 flat_idx = token_idx * topk + topk_idx
-                # output_token_order[flat_idx] = x[token_idx] @ y[expert_id].T
                 ref_out[flat_idx] = x[token_idx] @ y[expert_id].T
-        # # ========== Step 2: Permute - 按 expert id 重新排序 ==========
-        # # 收集所有 (expert_id, src_idx) 二元组
-        # entries = []
-        # for token_idx in range(num_token):
-        #     for topk_idx in range(topk):
-        #         expert_id = topk_ids[token_idx, topk_idx].item()
-        #         src_idx = token_idx * topk + topk_idx
-        #         entries.append((expert_id, src_idx))
 
-        # # 按 expert_id 排序
-        # entries.sort(key=lambda e: e[0])
-        # for dst_idx, (expert_id, src_idx) in enumerate(entries):
-        #     ref_out[dst_idx] = output_token_order[src_idx]
+    '''
+    #  check for nopad interface
+    if _acc_check:
+        # ========== Step 1: 按 Token 顺序计算 GEMM ==========
+        output_token_order = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
+        x_permuted = torch.randn((num_token * topk, k), device=tensor_device, dtype=torch.bfloat16)
+        for token_idx in range(num_token):
+            for topk_idx in range(topk):
+                expert_id = topk_ids[token_idx, topk_idx].item()
+                flat_idx = token_idx * topk + topk_idx
+                output_token_order[flat_idx] = x[token_idx] @ y[expert_id].T
+        # ========== Step 2: Permute - 按 expert id 重新排序 ==========
+        # 收集所有 (expert_id, src_idx) 二元组
+        entries = []
+        for token_idx in range(num_token):
+            for topk_idx in range(topk):
+                expert_id = topk_ids[token_idx, topk_idx].item()
+                src_idx = token_idx * topk + topk_idx
+                entries.append((expert_id, src_idx))
 
+        # 按 expert_id 排序
+        entries.sort(key=lambda e: e[0])
+        for dst_idx, (expert_id, src_idx) in enumerate(entries):
+            ref_out[dst_idx] = output_token_order[src_idx]
+            x_permuted[dst_idx] = x[src_idx // topk]
+
+        topk_ids_permuted = torch.tensor(
+            [e[0] for e in entries],
+            device=tensor_device,
+            dtype=topk_ids.dtype
+        )
+        topk_ids = topk_ids_permuted
+        x = x_permuted
+    '''
 
     if d == torch.bfloat16:
+        assert quant_type == 'non_quantized', "BF16 only supports non-quantized inputs, got '{}'".format(quant_type)
         return x.to('cuda'), y.to('cuda'), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.int8:
+        assert quant_type == 'channel', "Expected perchannel quantization for int8, got '{}'".format(quant_type)
         x_int8 = per_token_cast_to_int8(x)
         y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device=tensor_device, dtype=torch.float))
         for i in range(num_groups):
             y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
         return (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.float8_e4m3fn:
-        # assert m % 4 == 0, f'TMA alignment error: {m}'
+        assert quant_type == 'channel' or quant_type == 'block', "Expected perchannel/blockwise quantization for fp8, got '{}'".format(quant_type)
         if quant_type == "channel":
             x_fp8 = per_custom_dims_cast_to_fp8(x, (0, ), False, True)
             y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, n, 1), device=tensor_device, dtype=torch.float))
@@ -811,10 +834,10 @@ def read_numbers_from_file(file_path):
 
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
-    result = {"distribution": "uniform", "enable_sbo_overlap": False, "quant_type": "block"}
+    result = {"distribution": "uniform", "enable_sbo_overlap": False}
     supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size"]
     supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits"]
-    supported_quant_type = ["block", "channel", "group"]
+    supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
     dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|Normal|MqaLogits|PagedMqaLogits),(.+)"
     pattern = re.compile(dg_params)
@@ -850,6 +873,14 @@ def parse_deepgemm_string_re(s):
                 except ValueError:
                     result[key] = value
                     pass
+    if "quant_type" not in result:
+        quant_type_defaults = {
+            torch.bfloat16: 'non_quantized',
+            torch.int8 : 'channel',
+            torch.float8_e4m3fn: 'block',
+            'w4a16': 'group'
+        }
+        result["quant_type"] = quant_type_defaults.get(result["data_type"], 'block')
     return result
 
 def parse_dump_file(file):
@@ -1121,17 +1152,21 @@ def test_m_grouped_gemm_fused(args) -> None:
     print('Testing grouped fuse permute GEMM:')
     num_groups, n, k, d = args['groups'], args['n'], args['k'], args['data_type']
     num_token, topk = args['num_token'], args['topk']
-    quant_type = args.get('quant_type', 'block')
+    quant_type = args.get('quant_type')
     group_size = args.get('group_size', 32)
     if use_ppu:
         x, y, m_indices, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type, group_size)
-        expected_m = (num_token * topk + num_groups - 1) / num_groups
+        expected_m = ceil_div(num_token * topk, num_groups)
         if d == torch.bfloat16:
             configs = bf16_get_best_configs(expected_m, n, k, num_groups, deep_gemm.get_num_sms(), is_grouped_contiguous=False)
             m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks = deep_gemm.moe_align_block_size(m_indices, num_groups, configs[1])
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+        elif d == torch.int8:
+            configs = perchannel_get_best_configs(expected_m, n, k, num_groups, deep_gemm.get_num_sms(), is_grouped_contiguous=False)
+            m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks = deep_gemm.moe_align_block_size(m_indices, num_groups, configs[1])
+            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d == torch.float8_e4m3fn:
-            configs = fp8_get_best_configs(expected_m, n, k, num_groups, deep_gemm.get_num_sms(), is_grouped_contiguous=False)
+            configs = fp8_blkwise_get_best_configs(expected_m, n, k, num_groups, deep_gemm.get_num_sms(), is_grouped_contiguous=False)
             m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks = deep_gemm.moe_align_block_size(m_indices, num_groups, configs[1])
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d == 'w4a16':

@@ -14,9 +14,6 @@
 #include "ppu/cute/atom/copy_traits_acompute10500_aiu.hpp"
 #include "ppu/cute/algorithm/copy.hpp"
 
-#include "ppu/cutlass/detail/blockwise_scale_layout.hpp"
-#include "ppu/cutlass/gemm/collective/ppu_promotion_with_scale_accumulation.hpp"
-
 #include "fused_scheduler.cuh"
 #include "fused_gemm_util.cuh"
 #include "utils_cutlass3.h"
@@ -31,22 +28,15 @@ template <class _SrcT, GemmType kGemmType,
           uint32_t WARP_M, uint32_t WARP_N,
           uint32_t BLOCK_SIZE, int kNumStages>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void
-fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
-    static constexpr uint32_t GROUP_M = 1;
-    static constexpr uint32_t GROUP_N = 128;
-    static constexpr uint32_t GROUP_K = 128;
-    static constexpr uint32_t ScaleMsPerTile = cute::ceil_div(Int<BLOCK_M>{}, Int<1>{});
-    static constexpr uint32_t ScaleNsPerTile = cute::ceil_div(Int<BLOCK_N>{}, Int<GROUP_N>{});
-    static constexpr uint32_t ScaleKsPerTile = cute::ceil_div(Int<BLOCK_K>{}, Int<GROUP_K>{});
-
+a8w8_perchannel_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
     constexpr uint32_t STRIDE_AM = SHAPE_K;
     constexpr uint32_t STRIDE_BE = SHAPE_N * SHAPE_K;
     constexpr uint32_t STRIDE_CM = SHAPE_N;
-    constexpr uint32_t STRIDE_BSE = SHAPE_N / GROUP_N * SHAPE_K / GROUP_K;
+    constexpr uint32_t STRIDE_BSE = SHAPE_N;
 
     using SrcT = typename ToCutlassType<_SrcT>::type;
     using DstT = cutlass::bfloat16_t;
-    using AccT = float;
+    using AccT = cute::conditional_t<cute::is_same_v<SrcT, int8_t>, int32_t, float>;
     using ElementScale = float;
     using TileShape = cute::Shape<cute::Int<BLOCK_M>, cute::Int<BLOCK_N>, cute::Int<BLOCK_K>>;
     using WarpShape = cute::Shape<cute::Int<WARP_M>, cute::Int<WARP_N>, cute::Int<BLOCK_K>>;
@@ -59,12 +49,10 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
     using TileScheduler = FusedGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, kNumGroups>;
 
     // Shared memory
-    using TsmCfg = BlkwiseQuantGemmSmemConfig<SrcT, kNumStages, BLOCK_M, BLOCK_N, BLOCK_K>;
+    using TsmCfg = GemmSmemConfig<SrcT, kNumStages, BLOCK_M, BLOCK_N, BLOCK_K>;
     extern __shared__ __align__(128) uint8_t smem_buffer[];
     SrcT* smem_a = reinterpret_cast<SrcT*>(smem_buffer);
     SrcT* smem_b = reinterpret_cast<SrcT*>(smem_buffer + TsmCfg::kSmemASize);
-    ElementScale* smem_scale_a = reinterpret_cast<ElementScale*>(smem_buffer + (TsmCfg::kSmemASize + TsmCfg::kSmemBSize));
-    ElementScale* smem_scale_b = reinterpret_cast<ElementScale*>(smem_buffer + (TsmCfg::kTotalSize - TsmCfg::kSmemScaleBSize));
 
     uint32_t thread_idx = threadIdx.x;
     int warp_idx = cutlass::canonical_warp_idx_sync();
@@ -106,45 +94,37 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);
 
     // --------------------------------------- scale operand -------------------------------------//
-    using ScaleACopyInst = cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<ElementScale>;
-    auto copy_scaleA_to_tsm = [&](int pipe_write, uint32_t k_idx, const int* blk_token_base) {
-      static constexpr uint32_t NumThreads_Needed = ScaleMsPerTile * ScaleKsPerTile;
+    // Per-channel quant scale TSM usage: BLOCK_M + BLOCK_N.
+    // Assumes BLOCK_K >= sizeof(ElementScale) so the TSM can be reused.
+
+    constexpr int LastStage = (SHAPE_K / BLOCK_K) % kNumStages;
+    ElementScale* smem_scale_a = reinterpret_cast<ElementScale*>(sA(_,_,Int<LastStage>{}).data().get());
+    ElementScale* smem_scale_b = reinterpret_cast<ElementScale*>(sB(_,_,Int<LastStage>{}).data().get());
+
+    // Copy strategy: each thread copies one scale value.
+    //   - ScaleA: BLOCK_M threads load BLOCK_M scale values
+    //   - ScaleB: BLOCK_N threads load BLOCK_N scale values
+    using ScaleCopyInst = cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<ElementScale>;
+    auto copy_scaleA_to_tsm = [&](const int* blk_token_base) {
       CUTLASS_PRAGMA_UNROLL
-      for(uint32_t tid = thread_idx; tid < NumThreads_Needed; tid += BLOCK_SIZE) {
-        uint32_t tid_k = tid / ScaleMsPerTile;
-        uint32_t tid_m = tid % ScaleMsPerTile;
-        uint32_t token_offset = __ldg(blk_token_base + tid_m);
+      for(uint32_t tid = thread_idx; tid < BLOCK_M; tid += BLOCK_SIZE) {
+        uint32_t token_offset = __ldg(blk_token_base + tid);
         bool token_mask = token_offset < num_valid_tokens;
-        // scale a is m-major, stride asm = 1, stride_ask = shape_m;
-        ElementScale* src_ptr = (ElementScale*)args.scale_a_ptr + (tid_k + k_idx) * shape_m + token_offset / topk;
-        ElementScale* dst_ptr = (ElementScale*)smem_scale_a + (tid_k + pipe_write) * BLOCK_M + tid_m;
-        ScaleACopyInst::copy(*src_ptr, *dst_ptr, token_mask);
+        ElementScale* src_ptr = (ElementScale*)args.scale_a_ptr + token_offset / topk;
+        ElementScale* dst_ptr = smem_scale_a + tid;
+        ScaleCopyInst::copy(*src_ptr, *dst_ptr, token_mask);
       }
     };
 
-    // load scaleB from hbm to tsm: use aiu load.
-    constexpr uint32_t MaxAiuContElemSize = 128 / (sizeof_bits<ElementScale>::value / 8);     // 32
-    constexpr uint32_t MinAiuContElemSize = 32 / (sizeof_bits<ElementScale>::value / 8);      // 8
-    constexpr bool TransSFB = false;  // k-major is false
-    static constexpr uint32_t SFBTileN = TransSFB ? cute::max(ScaleNsPerTile, MinAiuContElemSize) : ScaleNsPerTile;
-    static constexpr uint32_t SFBTileK = TransSFB ? ScaleKsPerTile : cute::max(ScaleKsPerTile, MinAiuContElemSize);
-    using GemmOperandSFB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementScale, TransSFB, Int<SFBTileN>, Int<SFBTileK>, true, 1, false>;
-    using RealSmemLayoutAtomSFB = Layout<Shape<Int<SFBTileN>, Int<SFBTileK>>, Stride<Int<SFBTileK>, _1>>;
-    using RealSmemLayoutSFB = decltype(tile_to_shape(RealSmemLayoutAtomSFB{},
-            Shape<cute::Int<SFBTileN>, cute::Int<SFBTileK>, cute::Int<kNumStages>>{}));
-
-    // init aiu desc
-    typename GemmOperandSFB::GmemTiledCopy gmem_tiled_copy_SFB;
-    using TilerSFB = typename GemmOperandSFB::GmemTiledCopy::Tiler_MN;
-    constexpr uint32_t SCALE_N = cute::ceil_div(Int<SHAPE_N>{}, Int<GROUP_N>{});
-    constexpr uint32_t SCALE_K = cute::ceil_div(Int<SHAPE_K>{}, Int<GROUP_K>{});
-    auto shape_SFB = cute::make_shape(Int<SCALE_N>{}, Int<SCALE_K>{});
-    auto stride_SFB = cute::make_shape((int)SCALE_K, _1{});
-    gmem_tiled_copy_SFB.desc_.template init<ElementScale, TransSFB, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(nullptr, SCALE_N, SCALE_K, stride_SFB);
-    auto gmem_thr_copy_SFB = gmem_tiled_copy_SFB.get_slice(thread_idx);
-    Tensor sSFB = cute::make_tensor(cute::make_smem_ptr(smem_scale_b), RealSmemLayoutSFB{});
-    Tensor tSFBsSFB = gmem_thr_copy_SFB.partition_D(sSFB);
-
+    auto copy_scaleB_to_tsm = [&](const ElementScale* gmem_scale_b, int blk_n_offset) {
+      CUTLASS_PRAGMA_UNROLL
+      for(uint32_t tid = thread_idx; tid < BLOCK_N; tid += BLOCK_SIZE) {
+        bool mask = blk_n_offset + tid < SHAPE_N;
+        const ElementScale* src_ptr = gmem_scale_b + tid;
+        ElementScale* dst_ptr = smem_scale_b + tid;
+        ScaleCopyInst::copy(*src_ptr, *dst_ptr, mask);
+      }
+    };
     //
     // MMA Atom partitioning
     //
@@ -181,69 +161,30 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // CPY_N
     CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
 
-    // ---------------- scale ------------------- //
-    using ScaleConfig = ::cutlass::detail::PPUBlockwiseScaleConfig<GROUP_M, GROUP_N, GROUP_K>;
-    using SmemLayoutAtomSFA = decltype(ScaleConfig::smem_atom_layoutSFA(TileShape{}));
-    using SmemLayoutAtomSFB = decltype(ScaleConfig::smem_atom_layoutSFB(TileShape{}));
-
-    using SmemLayoutSFA = decltype(make_layout(
-      append(shape(SmemLayoutAtomSFA{}), Int<kNumStages>{}),
-      append(stride(SmemLayoutAtomSFA{}), size(filter_zeros(SmemLayoutAtomSFA{})))
-    ));
-
-    using SmemLayoutSFB = decltype(make_layout(
-      append(shape(SmemLayoutAtomSFB{}), Int<kNumStages>{}),
-      append(stride(SmemLayoutAtomSFB{}), size(filter_zeros(SmemLayoutAtomSFB{})))
-    ));
-
+    // ------------------ scale A/B ------------------ //
+    static constexpr int ScaleMsPerThread = cute::ceil_div(BLOCK_M , BLOCK_SIZE);
+    static constexpr int ScaleNsPerThread = cute::ceil_div(BLOCK_N , BLOCK_SIZE);
     auto layout_sSFA_copy = make_layout(
-      make_shape(
-        shape<0>(SmemLayoutSFA{}),
-        get<1>(TileShape{}),
-        make_shape(
-          shape<1>(SmemLayoutSFA{}),
-          shape<2>(SmemLayoutSFA{}))
-      ),
-      make_stride(
-        stride<0>(SmemLayoutSFA{}),
-        _0{},
-        make_stride(
-          stride<1>(SmemLayoutSFA{}),
-          stride<2>(SmemLayoutSFA{}))
-      )
+      make_shape(Int<BLOCK_M>{}, _1{}),
+      make_stride(_1{}, _0{})
     );
 
     auto layout_sSFB_copy = make_layout(
-      make_shape(
-        get<0>(TileShape{}),
-        get<0>(shape(SmemLayoutSFB{})),       // n-broadcast
-        make_shape(
-          get<1>(shape(SmemLayoutSFB{})),     // k-broadcast
-          get<2>(shape(SmemLayoutSFB{})))
-      ),
-      make_stride(
-        _0{},
-        make_stride(_0{}, get<0>(stride(RealSmemLayoutSFB{}))),
-        make_stride(
-          get<1>(stride(SmemLayoutSFB{})),
-          get<2>(stride(RealSmemLayoutSFB{})))
-      )
+      make_shape(_1{}, Int<BLOCK_N>{}),
+      make_stride(_0{}, _1{})
     );
 
-    Tensor sSFA_copy = make_tensor(cute::make_smem_ptr(smem_scale_a), layout_sSFA_copy);
-    Tensor sSFB_copy = make_tensor(cute::make_smem_ptr(smem_scale_b), layout_sSFB_copy);
+    Tensor sSFA = make_tensor(make_smem_ptr(smem_scale_a), layout_sSFA_copy);
+    Tensor sSFB = make_tensor(make_smem_ptr(smem_scale_b), layout_sSFB_copy);
 
-    Tensor tCsSFA = tiled_mma.get_slice(thread_idx).partition_C(sSFA_copy);
-    Tensor tCsSFB = tiled_mma.get_slice(thread_idx).partition_C(sSFB_copy);
-    Tensor tCrSFA = make_fragment_like<ElementScale>(tCsSFA(_, _, _, _0{}));
-    Tensor tCrSFB = make_fragment_like<ElementScale>(tCsSFB(_, _, _, _0{}));
-
-    static constexpr int ScalePromotionInterval = GROUP_K / size<2>(typename TiledMma::AtomShape_MNK{});
-    using FrgTensorC = decltype(accum);
-    using EngineAccum = typename FrgTensorC::engine_type;
-    using LayoutAccum = typename FrgTensorC::layout_type;
-    cutlass::gemm::collective::MixAccumulation<EngineAccum, LayoutAccum, AccT> accumulation(
-      accum, ScalePromotionInterval, size<2>(tCrA));
+    Tensor tCsSFA = tiled_mma.get_slice(thread_idx).partition_C(sSFA);
+    Tensor tCsSFB = tiled_mma.get_slice(thread_idx).partition_C(sSFB);
+    Tensor tCrSFA = make_fragment_like<ElementScale>(tCsSFA);
+    Tensor tCrSFB = make_fragment_like<ElementScale>(tCsSFB);
+    
+    using SmemCopyAtomScale = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<sizeof_bits_v<ElementScale>>, ElementScale>;
+    auto smem_tiled_copy_ScaleA   = make_tiled_copy_C(SmemCopyAtomScale{}, tiled_mma);
+    auto smem_tiled_copy_ScaleB   = make_tiled_copy_C(SmemCopyAtomScale{}, tiled_mma);
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
@@ -260,13 +201,9 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
       Tensor gB = cute::local_tile(cute::make_mix_tensor_like(mB_nk), TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});           // (BLK_N,BLK_K,k)
       Tensor tBgB = gmem_thr_copy_B.partition_S(gB);
 
-      // gmem_scale b in block
-      ElementScale* gmem_scale_b = (ElementScale*)args.scale_b_ptr + deep_scheduler.curr_group_idx * STRIDE_BSE;
-      static constexpr int n_factor = cute::ceil_div(Int<GROUP_N>{}, Int<BLOCK_N>{});
-      Tensor mSFB_nk = cute::make_tensor(cute::make_gmem_ptr(gmem_scale_b), shape_SFB, stride_SFB);
-      Tensor gSFB = cute::local_tile(cute::make_mix_tensor_like(mSFB_nk), make_tile(Int<ScaleNsPerTile>{}, Int<ScaleKsPerTile>{}),
-                                     make_coord(n_block_idx / n_factor,_));
-      Tensor tSFBgSFB = gmem_thr_copy_SFB.partition_S(gSFB);
+      // gmem_scale_b in block
+      ElementScale* gmem_scale_b = (ElementScale*)args.scale_b_ptr + deep_scheduler.curr_group_idx * STRIDE_BSE + blk_n_offset;
+      bool scaleCopySendDone = false;
 
       int k_tile_iter  = 0;
       int k_tile_count = size<2>(gB);
@@ -274,16 +211,10 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
       CUTLASS_PRAGMA_UNROLL
       for (int k_pipe = 0; k_pipe < kNumStages; ++k_pipe) {
         if (k_tile_count > 0) {
-          // copy_A_to_tsm(k_pipe, BLOCK_K * k_tile_iter, m_block_idx);
           copy_A_to_tsm<SrcT, ACopyInst, TilerA, BLOCK_M, BLOCK_K, STRIDE_AM>(
               tAsA(_,_,_,k_pipe), args.a_ptr,
               blk_token_base, BLOCK_K * k_tile_iter, num_valid_tokens, topk, thread_idx);
-          copy_scaleA_to_tsm(k_pipe, k_tile_iter, blk_token_base);
-          if (warp_idx == 0) {
-            copy(gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,k_pipe));
-          } else if (warp_idx == 1) {
-            copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,k_tile_iter), tSFBsSFB(_,_,_,k_pipe));
-          }
+          copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,k_pipe), warp_idx);
           ++k_tile_iter;
         }
         cp_async_fence();
@@ -291,7 +222,6 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
       }
 
       clear(accum);
-
       //
       // PIPELINED MAIN LOOP
       //
@@ -317,119 +247,133 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
         // Prefetch the first rmem from the first k-tile
         copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
         copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
-        copy(tCsSFA(_,_,_,make_coord(_0{}, _0{})), tCrSFA);
-        copy(tCsSFB(_,_,_,make_coord(_0{}, _0{})), tCrSFB);
       }
+      Tensor out_acc = make_fragment_like<float>(accum);
+      auto process_kblock_iterations = [&](int k_block) {
+        // Load A, B shmem->regs for k_block+1
+        // Copy gmem to smem before computing gemm on each k-pipe
+        if (k_block == K_BLOCK_MAX - 1) {
+          // Commit the smem for smem_pipe_read
+          cp_async_wait<kNumStages-2>();
+          __syncthreads();
+          if (k_tile_count > 0) {
+            copy_A_to_tsm<SrcT, ACopyInst, TilerA, BLOCK_M, BLOCK_K, STRIDE_AM>(
+              tAsA(_,_,_,smem_pipe_write), args.a_ptr,
+              blk_token_base, BLOCK_K * k_tile_iter, num_valid_tokens, topk, thread_idx);
+            copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,smem_pipe_write), warp_idx);
+            ++k_tile_iter;
+          } else if (scaleCopySendDone == false) {
+            copy_scaleA_to_tsm(blk_token_base);
+            copy_scaleB_to_tsm(gmem_scale_b, blk_n_offset);
+            scaleCopySendDone = true;
+          }
+          cp_async_fence();
+          // Advance the tile
+          --k_tile_count;
 
+          // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
+          ++smem_pipe_read;
+          smem_pipe_read = (smem_pipe_read == kNumStages) ? 0 : smem_pipe_read;
+          smem_pipe_write = smem_pipe_read;
+
+          // Slice the smem_pipe_read smem
+          tCsA_p = tCsA(_,_,_,smem_pipe_read);
+          tCsB_p = tCsB(_,_,_,smem_pipe_read);
+        }
+        // Load A, B shmem->regs for k_block+1
+        auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
+        copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
+        copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
+          auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
+          // gemm for one tiled_mma atom on K
+          cute::gemm(tiled_mma, accum, tCrA(_,_,atom_idx), tCrB(_,_,atom_idx), accum);
+        }
+      };
+      // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
+      //
+      // Split out the first loop iteration to facilitate the use of mm instructions
+      for_each(make_int_sequence<K_BLOCK_MAX >{}, [&] (auto k_block) {
+        process_kblock_iterations(k_block);
+      }); // for_each
 
       CUTLASS_PRAGMA_NO_UNROLL
       while (k_tile_count > -(kNumStages)) {
-        clear(accumulation());
-        if constexpr (ScaleMsPerTile == 1 && ScaleNsPerTile == 1) {
-          tCrSFA(_0{}) = tCrSFA(_0{}) * tCrSFB(_0{});
-        }
-        if constexpr (ScaleMsPerTile  > 1 && ScaleNsPerTile == 1) {
-          ElementScale scale_b = tCrSFB(_0{});
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(filter_zeros(tCrSFA)); i++) {
-            filter_zeros(tCrSFA)(i) = filter_zeros(tCrSFA)(i) * scale_b;
-          }
-        }
-        if constexpr (ScaleMsPerTile == 1 && ScaleNsPerTile  > 1) {
-          ElementScale scale_a = tCrSFA(_0{});
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(filter_zeros(tCrSFB)); i++) {
-            filter_zeros(tCrSFB)(i) = filter_zeros(tCrSFB)(i) * scale_a;
-          }
-        }
         // Pipeline the outer products with a static for loop.
         //
         // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
         for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
-          // Load A, B shmem->regs for k_block+1
-          // Copy gmem to smem before computing gemm on each k-pipe
-          if (k_block == K_BLOCK_MAX - 1) {
-            // Commit the smem for smem_pipe_read
-            cp_async_wait<kNumStages-2>();
-            __syncthreads();
-            if (k_tile_count > 0) {
-              // copy_A_to_tsm(smem_pipe_write, BLOCK_K * k_tile_iter, m_block_idx);
-              copy_A_to_tsm<SrcT, ACopyInst, TilerA, BLOCK_M, BLOCK_K, STRIDE_AM>(
-                  tAsA(_,_,_,smem_pipe_write), args.a_ptr,
-                  blk_token_base, BLOCK_K * k_tile_iter, num_valid_tokens, topk, thread_idx);
-              copy_scaleA_to_tsm(smem_pipe_write, k_tile_iter, blk_token_base);
-              if (warp_idx == 0) {
-                copy(gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,smem_pipe_write));
-              } else if (warp_idx == 1) {
-                copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,k_tile_iter), tSFBsSFB(_,_,_,smem_pipe_write));
-              }
-              ++k_tile_iter;
-            }
-            cp_async_fence();
-            // Advance the tile
-            --k_tile_count;
-
-            // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
-            ++smem_pipe_read;
-            smem_pipe_read = (smem_pipe_read == kNumStages) ? 0 : smem_pipe_read;
-            smem_pipe_write = smem_pipe_read;
-
-            // Slice the smem_pipe_read smem
-            tCsA_p = tCsA(_,_,_,smem_pipe_read);
-            tCsB_p = tCsB(_,_,_,smem_pipe_read);
-          }
-          // Load A, B shmem->regs for k_block+1
-          auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
-          copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
-          copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
-
-          CUTLASS_PRAGMA_UNROLL
-          for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
-            auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
-            // gemm for one tiled_mma atom on K
-            cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB(_,_,atom_idx), accumulation());
-          }
+          process_kblock_iterations(k_block);
         }); // for_each
-        // Block scale the accumulators with reg tensor `tCrSFA` and `tCrSFB`
-        if constexpr (ScaleMsPerTile == 1 && ScaleNsPerTile == 1) {
-          ElementScale scale_ab = tCrSFA(_0{});
-          accumulation.scale(scale_ab);
-        }
-        if constexpr (ScaleMsPerTile  > 1 && ScaleNsPerTile == 1) {
-          accumulation.scale(tCrSFA);
-        }
-        if constexpr (ScaleMsPerTile == 1 && ScaleNsPerTile  > 1) {
-          accumulation.scale(tCrSFB);
-        }
-        if constexpr (ScaleMsPerTile  > 1 && ScaleNsPerTile  > 1) {
-          accumulation.scale(tCrSFA, tCrSFB);
-        }
-        copy(tCsSFA(_,_,_,make_coord(_0{}, smem_pipe_read)), tCrSFA);
-        copy(tCsSFB(_,_,_,make_coord(_0{}, smem_pipe_read)), tCrSFB);
       }
+      cp_async_wait<0>();
+      __syncthreads();
 
+      copy(smem_tiled_copy_ScaleA, tCsSFA(_,_,_0{}), tCrSFA(_,_,_0{}));
+      copy(smem_tiled_copy_ScaleB, tCsSFB(_,_0{},_), tCrSFB(_,_0{},_));
+
+      // dequantize
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < cute::size<2>(accum); ++n) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int m = 0; m < cute::size<1>(accum); ++m) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < cute::size<0>(accum); ++i) {
+            out_acc(i,m,n) = accum(i,m,n) * tCrSFA(i,m,_0{}) * tCrSFB(i,_0{},n);
+          }
+        }
+      }
       // acc write back
       auto blk_mn_shape = Shape<Int<BLOCK_M>, Int<BLOCK_N>>{};
       Tensor cC = make_identity_tensor(blk_mn_shape);
       Tensor tCcC = thr_mma.partition_C(cC);
-      CUTE_STATIC_ASSERT_V(size(tCcC) == size(accum),
+      CUTE_STATIC_ASSERT_V(size(tCcC) == size(out_acc),
           "Accumulator count must have the same destination element count.");
-      epilogue_no_tsm<AccT, DstT, SHAPE_N, BLOCK_N, STRIDE_CM>(accum, tCcC, args.c_ptr,
+
+#if __HGGC_ARCH__ == 150
+      epilogue_no_tsm<float, DstT, SHAPE_N, BLOCK_N, STRIDE_CM>(out_acc, tCcC, args.c_ptr,
           blk_token_base, num_valid_tokens, blk_n_offset);
+#else
+      using EpilogueCopyInst = AutoVectorizingCopyWithAssumedAlignment<128>;
+      static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<DstT>::value;
+      using EpilogueConfig = cutlass::gemm::config::DefaultGemm_Epilogue_Configuration<
+              EpilogueCopyInst, DstT, AlignmentD, Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_M / WARP_M>, BLOCK_SIZE>;
+      using CopyAtomR2S = Copy_Atom<EpilogueCopyInst, DstT>;
+      epilogue_with_tsm<float, DstT, SHAPE_N, BLOCK_N, STRIDE_CM, EpilogueConfig, CopyAtomR2S>(
+          out_acc, tCcC, cC, tiled_mma, args.c_ptr, smem_buffer, blk_token_base, thread_idx,
+          num_valid_tokens, blk_n_offset);
+#endif
     }
 }
 
-template <uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
+template <typename SrcT>
+struct TypeToString {
+    static constexpr const char* value = "unsupported";
+};
+
+template <>
+struct TypeToString<int8_t> {
+    static constexpr const char* value = "int8";
+};
+
+template <>
+struct TypeToString<__nv_fp8_e4m3> {
+    static constexpr const char* value = "fp8";
+};
+
+template <class SrcT, uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t WARP_M, uint32_t WARP_N, int32_t kNumStages,
           GemmType kGemmType, bool kEnableSboOverlap = false,
           KernelType kKernelType = KernelType::Default>
-class FusedMoeGemmWithBlkwiseQuant {
-    using SrcT = __nv_fp8_e4m3;
+class FusedMoeGemmWithPerChannelQuant {
     using DstT = __nv_bfloat16;
+    static_assert(sizeof_bits_v<SrcT> == 8, "SrcT must be an 8-bit type");
 
 public:
-    FusedMoeGemmWithBlkwiseQuant() = default;
+    FusedMoeGemmWithPerChannelQuant() = default;
 
     static void run(DstT* gmem_d, SrcT* gmem_a, SrcT* gmem_b, float* gmem_sa, float* gmem_sb,
                     int* m_rows, int* expert_ids_and_cumsum, int* sorted_token_ids,
@@ -454,7 +398,7 @@ public:
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()){
             // check src type
-            std::string data_type = "fp8";
+            std::string data_type = TypeToString<SrcT>::value;
             dg_prof_params.set_params(
                 GemmType::GroupedFused, false, data_type, kNumGroups, shape_m, SHAPE_N, SHAPE_K, 1,
                 m_rows, stream
@@ -464,8 +408,9 @@ public:
         // dispatch and launch kernel
         constexpr int BlockSize = BLOCK_M / WARP_M * BLOCK_N / WARP_N * 32;
 
-        auto device_func = fp8_blockwise_quant_gemm_fused_moe_kernel<SrcT, kGemmType, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BlockSize, kNumStages>;
-        constexpr int smem_size = BlkwiseQuantGemmSmemConfig<SrcT, kNumStages, BLOCK_M, BLOCK_N, BLOCK_K>::kTotalSize;
+        auto device_func = a8w8_perchannel_quant_gemm_fused_moe_kernel<
+                              SrcT, kGemmType, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BlockSize, kNumStages>;
+        constexpr int smem_size = GemmSmemConfig<SrcT, kNumStages, BLOCK_M, BLOCK_N, BLOCK_K>::kTotalSize;
         CHECK_CUDA(cudaFuncSetAttribute(device_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         int max_blocks_per_cu = -1;
         CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_cu, device_func, BlockSize, smem_size));
@@ -477,8 +422,9 @@ public:
         if (pEnv_params && std::atoi(pEnv_params) == 1) {
             cudaFuncAttributes attr;
             cudaFuncGetAttributes(&attr, device_func);
-
-            printf("[FusedMoeGemmWithBlkwiseQuant-FP8:]\n");
+            std::string data_type = TypeToString<SrcT>::value;
+            std::transform(data_type.begin(), data_type.end(), data_type.begin(), ::toupper);
+            printf("[FusedMoeGemmWithPerchannelQuant-%s:]\n", data_type.c_str());
             printf("group:%d, problem:[%d, %d, %d], gemm_type:%s, kernel_type:%s\n",
                 kNumGroups, shape_m, SHAPE_N, SHAPE_K, GemmTypeS[static_cast<int>(kGemmType)], KernelTypeS[static_cast<int>(kKernelType)]);
 

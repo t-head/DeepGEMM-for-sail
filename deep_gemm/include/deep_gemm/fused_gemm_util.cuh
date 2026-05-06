@@ -81,8 +81,7 @@ template <typename AccT, typename DstT,
          class TAcc, class TCcC, class... Ts>
 __forceinline__ __device__ void epilogue_no_tsm(TAcc& accum, TCcC& tCcC, void* c_ptr, const int* blk_token_base,
                                                 uint32_t num_valid_tokens, uint32_t blk_n_offset) {
-// #if __HGGC_ARCH__ == 150
-#if 1
+#if __HGGC_ARCH__ == 150
   CUTLASS_PRAGMA_UNROLL
   for (int i = 0; i < size(tCcC); i += 2) {
     size_t token_offset = __ldg(blk_token_base + cute::get<0>(tCcC(i)));
@@ -114,6 +113,89 @@ __forceinline__ __device__ void epilogue_no_tsm(TAcc& accum, TCcC& tCcC, void* c
     }
   }
 #endif
+};
+
+template <typename AccT, typename DstT,
+          uint32_t SHAPE_N, uint32_t BLOCK_N, uint32_t STRIDE_CM,
+          typename EpilogueConfig, typename CopyAtomR2S,
+          class TAcc, class TCcC, class TCC, class TileMMA, class... Ts>
+__forceinline__ __device__ void epilogue_with_tsm(TAcc& accum, TCcC& tCcC, TCC& cC, TileMMA& tiled_mma,
+            void* c_ptr, void* smem_buffer, const int* blk_token_base, uint32_t thread_idx,
+            uint32_t num_valid_tokens, uint32_t blk_n_offset) {
+  using SmemLayoutO = typename EpilogueConfig::SmemLayoutO;
+  using TiledCopyS2R = typename EpilogueConfig::GmemTiledCopyO;
+  using namespace cute;
+
+  Tensor sAcc = make_tensor(make_smem_ptr(reinterpret_cast<DstT*>(smem_buffer)), SmemLayoutO{});
+
+  // Partition sAcc to match the accumulator partitioning
+  auto tiled_r2s  = make_tiled_copy_C(CopyAtomR2S{}, tiled_mma);
+  auto thread_r2s = tiled_r2s.get_thread_slice(thread_idx);
+  Tensor tRS_rAcc = thread_r2s.retile_S(accum);                        // ((Atom,AtomNum), MMA_M, MMA_N)
+  Tensor tRS_sAcc = thread_r2s.partition_D(sAcc);                      // ((Atom,AtomNum),PIPE_M,PIPE_N)
+
+  // Tile gC by the shape of SmemLayout first
+  auto tile  = make_shape(size<0>(sAcc), size<1>(sAcc));
+
+  // Partition sAcc, gC for the output
+  auto tiled_s2r  = TiledCopyS2R{};
+  auto thread_s2r = tiled_s2r.get_thread_slice(thread_idx);
+  Tensor tSR_sAcc = thread_s2r.partition_S(sAcc);                      //               ((Atom,AtomNum),ATOM_M,ATOM_N)
+
+  // Repeat the D-partitioning for coordinates and predication
+  Tensor cCt  = flat_divide(cC, tile);                                 //                (SMEM_M,SMEM_N,TILE_M,TILE_N)
+  Tensor tSR_cC = thread_s2r.partition_D(cCt);                         // ((Atom,AtomNum),ATOM_M,ATOM_N,TILE_M,TILE_N)
+
+  // Allocate intermediate registers on the dst tensors
+  Tensor tSR_rAcc = make_tensor<DstT>(take<0,3>(shape(tSR_cC)));       // ((Atom,AtomNum),ATOM_M,ATOM_N)
+
+  CUTE_STATIC_ASSERT(size<1>(tRS_rAcc) % size<3>(tSR_cC) == 0);  // TILE_M divides MMA_M
+  CUTE_STATIC_ASSERT(size<2>(tRS_rAcc) % size<4>(tSR_cC) == 0);  // TILE_N divides MMA_N
+
+  CUTLASS_PRAGMA_UNROLL
+  for (int step_m = 0; step_m < size<2>(cCt); ++step_m) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int step_n = 0; step_n < size<3>(cCt); ++step_n) {
+      // Step 1. Copy to SMEM
+      CUTLASS_PRAGMA_UNROLL
+      for (int pipe_m = 0; pipe_m < size<1>(tRS_sAcc); ++pipe_m) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int pipe_n = 0; pipe_n < size<2>(tRS_sAcc); ++pipe_n) {
+          int mma_m = step_m * size<1>(tRS_sAcc) + pipe_m;
+          int mma_n = step_n * size<2>(tRS_sAcc) + pipe_n;
+          copy(tiled_r2s, tRS_rAcc(_,mma_m,mma_n), tRS_sAcc(_,pipe_m,pipe_n));
+        }
+      }
+      // Step 2. Wait for SMEM writes to complete
+      __syncthreads();
+
+      // Step 3. Copy from SMEM into a fragment
+      copy(tiled_s2r, tSR_sAcc, tSR_rAcc);
+
+      // Step 4. Wait for SMEM reads to complete
+      __syncthreads();
+
+      Tensor tSR_cDmn = tSR_cC(_,_,_,step_m,step_n);
+      CUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < size<1>(tSR_cDmn); ++m) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < size<2>(tSR_cDmn); ++n) {
+          size_t token_offset = __ldg(blk_token_base + get<0>(tSR_cDmn(0,m,n)));
+          size_t n_offset = blk_n_offset + get<1>(tSR_cDmn(0,m,n));
+          // Predication
+          bool cond = token_offset < num_valid_tokens;
+          if constexpr (SHAPE_N % BLOCK_N) {
+            cond = cond &&  n_offset < SHAPE_N;
+          }
+          if (cond) {
+            uint128_t* dst_ptr = (uint128_t*)((DstT*)c_ptr + token_offset * STRIDE_CM + n_offset);
+            uint128_t* acc_ptr = (uint128_t*)(raw_pointer_cast(tSR_rAcc(_,m,n).data()));
+            *dst_ptr = *acc_ptr;
+          }
+        }
+      }
+    }
+  }
 };
 
 template <typename T>
