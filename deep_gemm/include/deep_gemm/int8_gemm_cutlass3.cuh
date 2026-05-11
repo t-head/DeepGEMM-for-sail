@@ -1568,8 +1568,6 @@ public:
         bool kIsNoPadPreprocessLayout = false;
         cudaFuncAttributes attr;
         int DynamicTildId = 0;
-        int warp_num = 1;
-        bool enable_hw_dispatch = false;  // only used for print, use EnableHWDispatchStrategy to control;
 
         if constexpr (kKernelType == KernelType::MoeDynamicTile) {
           auto launch_dynamic_tile_kernel = [&](auto gemm_kernel_) {
@@ -1577,7 +1575,6 @@ public:
             using TileScheduler = typename GemmKernel::TileScheduler;
             kIsNoPadPreprocessLayout = TileScheduler::kIsNoPadPreprocessLayout;
             DynamicTildId = GemmKernel::KernelAiuDynamicTile::DynamicTildId;
-            enable_hw_dispatch = TileScheduler::EnableHWDispatchStrategy;
 
             using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
             using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
@@ -1602,17 +1599,15 @@ public:
                 layout_info = block_m_info;
             }
 
+            typename GemmKernel::Arguments arguments {
+                (ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B, scales_a, scales_b,
+                params_epilogue, shape_m, layout_info
+            };
+
             max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
             dim3 const block = GemmKernel::get_block_shape();
             dim3 const grid(num_sms * max_blocks_per_cu, 1, 1);
             smem_size_kernel = GemmKernel::SharedStorageSize;
-            warp_num = block.x / 32; // used for print
-
-            typename GemmKernel::Arguments arguments {
-                (ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B, scales_a, scales_b,
-                params_epilogue, shape_m, max_blocks_per_cu, num_sms, layout_info
-            };
-            auto params = GemmKernel::to_underlying_arguments(arguments, nullptr);
 
             DgProfParam dg_prof_params;
             if (ProfilingInterface::Instance().get_op_info()){
@@ -1622,7 +1617,7 @@ public:
                 );
             }
             ProfilingInterface::Instance().instrument(true, dg_prof_params);
-            launch_kernel<GemmKernel>(params, stream, max_blocks_per_cu);
+            cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(arguments);
             ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
             cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
@@ -1743,7 +1738,6 @@ public:
           using StrideC = typename GemmKernel::StrideC;
           using StrideD = typename GemmKernel::StrideD;
 
-          enable_hw_dispatch = TileScheduler::EnableHWDispatchStrategy; // used for print
           kIsNoPadPreprocessLayout = TileScheduler::kIsNoPadPreprocessLayout;
 
           int* layout_info = grouped_layout;
@@ -1769,8 +1763,9 @@ public:
               {shape_m, SHAPE_N, SHAPE_K, 1},
               {(ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B, scales_a, scales_b},
               {{1.0f, 0.0f}, (ElementC*)gmem_d, stride_C, (ElementD*)gmem_d, stride_D},
-              hw_info, {shape_m, max_blocks_per_cu, num_sms, layout_info}, signal
+              hw_info, {shape_m, layout_info}, signal
           };
+
           arguments.epilogue.thread.alpha = 1;
           arguments.epilogue.thread.beta = 0;
           auto params = GemmKernel::to_underlying_arguments(arguments, nullptr);
@@ -1778,7 +1773,6 @@ public:
           dim3 const block = GemmKernel::get_block_shape();
           dim3 const grid = GemmKernel::get_grid_shape(params);
           smem_size_kernel = GemmKernel::SharedStorageSize;
-          warp_num = block.x / 32; // used to print occ
 
           DgProfParam dg_prof_params;
           if (ProfilingInterface::Instance().get_op_info()){
@@ -1788,7 +1782,7 @@ public:
               );
           }
           ProfilingInterface::Instance().instrument(true, dg_prof_params);
-          launch_kernel<GemmKernel>(params, stream, max_blocks_per_cu);
+          cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
           ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
           cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
@@ -1810,10 +1804,6 @@ public:
           }
           printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_blocks_per_cu, threadblock_count);
           printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
-          float occ_limit_by_smem = 256 * 1024 / float(smem_size_kernel);
-          float occ_limit_by_vreg = int(512/attr.numRegs) * 8 / float(warp_num);
-          printf("warp_num: %d, occ_limit_by_smem: %f, occ_limit_by_vreg: %f\n", warp_num, occ_limit_by_smem, occ_limit_by_vreg);
-          printf("enable_hw_dispatch: %d\n", enable_hw_dispatch);
         }
 
     }

@@ -13,6 +13,7 @@ current_dir = os.path.dirname(os.path.realpath(__file__))
 sources = ['csrc/python_api.cu']
 build_include_dirs = [
     f'{CUDA_HOME}/include',
+    current_dir + '/deep_gemm/include',
     current_dir + '/third-party/cutlass3/',
     current_dir + '/third-party/cutlass3/include',
     current_dir + '/third-party/cutlass3/tools',

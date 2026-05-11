@@ -14,37 +14,11 @@
 #include "cutlass/cutlass.h"
 ////////////////////////////////////////////////////////////////////////////////
 
+#define EnableGroupNoPadOpt
+
 // namespace cutlass::gemm::kernel {
 namespace deep_gemm {
 using cutlass::KernelHardwareInfo;
-
-struct TileSchedulerArguments
-{
-    uint32_t shape_m;
-    int tb_per_cu;
-    int cu_count;
-    int* grouped_layout;
-
-    //
-    // Methods
-    //
-
-    /// Ctor
-    CUTLASS_HOST_DEVICE
-    TileSchedulerArguments()
-        : shape_m(0), tb_per_cu(0), cu_count(0), grouped_layout(nullptr)
-    {
-    }
-
-    /// Ctor
-    CUTLASS_HOST_DEVICE
-    TileSchedulerArguments(uint32_t shape_m, int tb_per_cu, int cu_count, int* grouped_layout_ptr = nullptr)
-        : shape_m(shape_m), tb_per_cu(tb_per_cu), cu_count(cu_count), grouped_layout(grouped_layout_ptr)
-    {
-    }
-
-};
-using TileSchedulerParams = TileSchedulerArguments;
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
@@ -52,91 +26,78 @@ template <GemmType kGemmType,
           uint32_t SHAPE_N_, uint32_t SHAPE_K_,
           uint32_t BLOCK_M_, uint32_t BLOCK_N_,
           uint32_t kNumGroups_,
-          uint32_t kNumNBlocks_ = ceil_div(SHAPE_N_, BLOCK_N_),
-          uint32_t kNum1DBlocksPerGroup = 2
-          >
+          uint32_t kNumNBlocks = ceil_div(SHAPE_N_, BLOCK_N_),
+          uint32_t kNum1DBlocksPerGroup = 2>
 struct DeepGemmScheduler {
     constexpr static uint32_t SHAPE_N = SHAPE_N_;
     constexpr static uint32_t SHAPE_K = SHAPE_K_;
     constexpr static uint32_t BLOCK_M = BLOCK_M_;
     constexpr static uint32_t BLOCK_N = BLOCK_N_;
     constexpr static uint32_t kNumGroups = kNumGroups_;
-    constexpr static uint32_t kNumNBlocks = kNumNBlocks_;
     int current_iter = 0;
     uint32_t num_aligned_m_blocks;
     constexpr static GemmType GEMM_TYPE = kGemmType;
     constexpr static bool kIsTMAMulticastOnA = false;
-    // disable tileM=16 or Occpuancy = 1
-    static constexpr bool EnableHWDispatchStrategy = BLOCK_M >= 32 && BLOCK_M <= 128 || (BLOCK_M == 192 && BLOCK_N == 128);
-    constexpr static bool kIsNoPadPreprocessLayout = kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused;
+#ifdef EnableGroupNoPadOpt
+    constexpr static bool kIsNoPadPreprocessLayout = (kGemmType == GemmType::GroupedNoPad||kGemmType == GemmType::GroupedFused) && kNumGroups >= 128;
+#else
+    constexpr static bool kIsNoPadPreprocessLayout = false;
+#endif
 
     // For normal GEMM
     // Maybe not used in the masked grouped GEMM
     uint32_t num_blocks;
+    uint32_t num_n_blocks = kNumNBlocks;
 
     // Only used for masked layout
     uint32_t curr_group_idx, curr_cumsum, curr_cumsum_blocks, curr_group_m, curr_cumsum_m;
 
-    // last round
-    int last_round_wave;
-    int last_round_idx;
+    struct Arguments
+    {
+        int* grouped_layout;
+        uint32_t shape_m;
 
-    using Arguments = TileSchedulerArguments;
-    using Params = TileSchedulerArguments;
+        //
+        // Methods
+        //
+
+        /// Ctor
+        CUTLASS_HOST_DEVICE
+        Arguments()
+            : grouped_layout(nullptr)
+            , shape_m(0)
+        {
+        }
+
+        /// Ctor
+        CUTLASS_HOST_DEVICE
+        Arguments(uint32_t shape_m, int* grouped_layout_ptr = nullptr)
+            : grouped_layout(grouped_layout_ptr)
+            , shape_m(shape_m)
+        {
+        }
+
+    };
+
+    using Params = Arguments;
     Params const& params;
 
-    CUTLASS_DEVICE explicit DeepGemmScheduler(Params const& params_, const int total_blocks = 0, const int warp_group_id = 0) : params(params_), current_iter(warp_group_id) {
+    CUTLASS_DEVICE explicit DeepGemmScheduler(Params const& params_, const int warp_group_id = 0) : params(params_), current_iter(warp_group_id) {
         num_aligned_m_blocks = ceil_div(params_.shape_m, BLOCK_M);
-        if (kGemmType == GemmType::DenseGemm) {
-            num_blocks = num_aligned_m_blocks * kNumNBlocks;
-        } else if (kGemmType == GemmType::GroupedContiguous) {
-            num_blocks = num_aligned_m_blocks * kNumNBlocks;
-        } else if (kIsNoPadPreprocessLayout) {
-            num_aligned_m_blocks = __ld_smem(params_.grouped_layout); // total blocks in m, block_m_sum
-            curr_group_idx = curr_cumsum = curr_cumsum_blocks = curr_group_m = curr_cumsum_m = 0;
-            num_blocks = num_aligned_m_blocks * kNumNBlocks;
-        } else if (kGemmType == GemmType::GroupedMasked) {
-            if constexpr (EnableHWDispatchStrategy) {
-                if (total_blocks == 0) {
-                    int m_blocks_sum = 0;
-                    for (int i = 0; i < kNumGroups; i++) {
-                        int curr_group_m = __ld_smem(params.grouped_layout + i);
-                        m_blocks_sum += cute::ceil_div(curr_group_m, BLOCK_M);
-                    }
-                    num_aligned_m_blocks = m_blocks_sum; // total blocks in m, block_m_sum
-                    num_blocks = num_aligned_m_blocks * kNumNBlocks;
-                } else {
-                    // dynamic tile, compute total blocks in kernel
-                    num_blocks = total_blocks;
-                }
-            }
+        if constexpr(kGemmType == GemmType::DenseGemm) {
+            num_blocks = num_aligned_m_blocks * num_n_blocks;
+        } else if constexpr(kGemmType == GemmType::GroupedContiguous) {
+            num_blocks = num_aligned_m_blocks * num_n_blocks;
+        } else if constexpr(kGemmType == GemmType::GroupedMasked) {
             curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_blocks = curr_cumsum_m = 0;
-        } else if (kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused) {
-            curr_group_idx = curr_cumsum = curr_cumsum_blocks = curr_group_m = curr_cumsum_m = 0;
-            num_blocks = 0;
-        }
-        // compute last round idx, to keep work balance in last round
-        if constexpr (EnableHWDispatchStrategy) {
-            if (params_.cu_count == 39) {
-                last_round_wave = num_blocks / gridDim.x;
-                int ce_idx = blockIdx.x / (params_.tb_per_cu * 4);
-                int tb_idx_in_ce = blockIdx.x % (params_.tb_per_cu * 4);
-                int cu_idx = ce_idx < 9 ? tb_idx_in_ce % 4 : tb_idx_in_ce % 3;
-                int tb_idx_in_cu = ce_idx < 9 ? tb_idx_in_ce / 4 : tb_idx_in_ce / 3;
-                last_round_idx = ce_idx * 4 + cu_idx + tb_idx_in_cu * params_.cu_count;
-            } else if (params_.cu_count % 4 == 0) {
-                last_round_wave = num_blocks / gridDim.x;
-                int ce_idx = blockIdx.x / (params_.tb_per_cu * 4);
-                int tb_idx_in_ce = blockIdx.x % (params_.tb_per_cu * 4);
-                int cu_idx = tb_idx_in_ce % 4;
-                int tb_idx_in_cu = tb_idx_in_ce / 4;
-                last_round_idx = ce_idx * 4 + cu_idx + tb_idx_in_cu * params_.cu_count;
+        } else if constexpr(kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused) {
+            if constexpr(kIsNoPadPreprocessLayout) {
+                num_aligned_m_blocks = params_.grouped_layout[0]; // total blocks in m, block_m_sum
+                curr_group_idx = curr_cumsum = curr_cumsum_blocks = curr_group_m = curr_cumsum_m = 0;
+                num_blocks = num_aligned_m_blocks * num_n_blocks;
             } else {
-                last_round_idx = blockIdx.x;
+                curr_group_idx = curr_cumsum = curr_cumsum_blocks = curr_group_m = curr_cumsum_m = 0;
             }
-        } else {
-            last_round_wave = 0; // not used
-            last_round_idx = blockIdx.x; // not used
         }
     }
 
@@ -155,10 +116,6 @@ struct DeepGemmScheduler {
         if constexpr (kIsTMAMulticastOnA) {
             m_block_idx = in_group_idx / num_blocks_in_group;
             n_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
-        } else if constexpr (kNum1DBlocksPerGroup == 2) {
-            auto sel = (num_blocks_in_group >> 1) & 1;
-            m_block_idx = first_block_idx + (((in_group_idx ^ (in_group_idx >> 2)) & 1) & sel);
-            n_block_idx = in_group_idx >> sel;
         } else {
             m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
             n_block_idx = in_group_idx / num_blocks_in_group;
@@ -180,19 +137,15 @@ struct DeepGemmScheduler {
     }
 
     CUTLASS_DEVICE bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        int tb_idx = blockIdx.x;
-        if constexpr (EnableHWDispatchStrategy) {
-            tb_idx = current_iter < last_round_wave ? blockIdx.x : last_round_idx;
-        }
-        const auto next_block_idx = current_iter++ * gridDim.x + tb_idx;
-        if (kIsNoPadPreprocessLayout) {
+        const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
+        if constexpr(kIsNoPadPreprocessLayout) {
             if (next_block_idx >= num_blocks) {
                 m_block_idx = num_aligned_m_blocks;
                 n_block_idx = kNumNBlocks;
                 return false;
             }
             int block_m_idx = next_block_idx / kNumNBlocks;
-            const uint4 data = __ld_smem((const uint4*)params.grouped_layout + 1 + block_m_idx);
+            uint4 data = (((const uint4*)params.grouped_layout) + 1)[block_m_idx];
             curr_group_idx = data.x;
             curr_group_m = data.y;
             uint32_t block_idx_in_m = next_block_idx - data.z * kNumNBlocks;
@@ -213,7 +166,7 @@ struct DeepGemmScheduler {
                     return false;
                 }
                 // Within the current group
-                curr_group_m = static_cast<uint32_t>(__ld_smem(params.grouped_layout + curr_group_idx));
+                curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
                 num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
                 if (next_block_idx < current_m_block_cumsum * kNumNBlocks)
@@ -253,11 +206,7 @@ struct DeepGemmScheduler {
 
     template<bool kEnableNExpand = true>
     CUTLASS_DEVICE bool fetch_next_work_dynamic_tile(uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        int tb_idx = blockIdx.x;
-        if constexpr (EnableHWDispatchStrategy) {
-            tb_idx = current_iter < last_round_wave ? blockIdx.x : last_round_idx;
-        }
-        const auto next_block_idx = current_iter++ * gridDim.x + tb_idx;
+        const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
         if (kIsNoPadPreprocessLayout) {
             if (next_block_idx >= num_blocks) {
                 m_block_idx = num_aligned_m_blocks;
@@ -265,10 +214,10 @@ struct DeepGemmScheduler {
                 return false;
             }
             int block_m_idx = next_block_idx / kNumNBlocks;
-            const uint4 data = __ld_smem((const uint4*)params.grouped_layout + 1 + block_m_idx);
+            uint4 data = (((const uint4*)params.grouped_layout) + 1)[block_m_idx];
             curr_group_idx = data.x;
             curr_group_m = data.y;
-            uint32_t block_idx_in_m = next_block_idx - data.z * kNumNBlocks;
+            uint32_t block_idx_in_m = data.z * kNumNBlocks + next_block_idx % kNumNBlocks;
             uint32_t num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
             curr_cumsum_m = data.w;
             get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);
@@ -283,7 +232,7 @@ struct DeepGemmScheduler {
                     return false;
 
                 // Within the current group
-                curr_group_m = static_cast<uint32_t>(__ld_smem(params.grouped_layout + curr_group_idx));
+                curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
                 n_expand = get_n_expand<kEnableNExpand>(curr_group_m);
                 num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
@@ -311,6 +260,33 @@ struct DeepGemmScheduler {
             get_swizzled_block_idx(num_aligned_m_blocks, next_block_idx, m_block_idx, n_block_idx);
         }
         return true;
+    }
+
+    template <class ProblemShapeMNKL, class TileShape, class ClusterShape>
+    static Params
+    to_underlying_arguments(
+      int* groups_layout,
+      ProblemShapeMNKL problem_shape_mnkl,
+      TileShape tile_shape,
+      ClusterShape cluster_shape,
+      [[maybe_unused]] KernelHardwareInfo const& hw_info,
+      Arguments const& arguments,
+      [[maybe_unused]] void* workspace=nullptr,
+      [[maybe_unused]] const uint32_t epilogue_subtile = 1,
+      [[maybe_unused]] uint32_t ktile_start_alignment_count = 1u) {
+
+        // cutlass3 change
+        // rtc will use this to get grid size on host
+        #ifndef ACOMPUTE_VERSION
+            // We only need the tile and cluster shape during scheduler setup, so let FTAD do the magic
+            static_assert(cute::is_static<TileShape>::value);
+            static_assert(cute::is_static<ClusterShape>::value);
+        #endif
+
+        // dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shape_mnkl, tile_shape, cluster_shape);
+        auto problem_shape = cutlass::gemm::to_gemm_coord(problem_shape_mnkl);
+        Params params(problem_shape.m(), groups_layout);
+        return params;
     }
 
     // The basic tile scheduler does not require any additional workspace

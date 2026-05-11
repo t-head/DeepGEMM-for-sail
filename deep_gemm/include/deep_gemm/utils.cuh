@@ -65,20 +65,6 @@ do {                                                                            
     } \
 }
 
-#define CHECK_DRIVER_API(call) \
-    do { \
-        CUresult result = call; \
-        if (result != CUDA_SUCCESS) { \
-            const char* name; \
-            cuGetErrorName(result, &name); \
-            const char* msg; \
-            cuGetErrorString(result, &msg); \
-            std::cerr << "CUDA Driver API error at " << __FILE__ << ":" << __LINE__ \
-                      << " - " << name << ": " << msg << std::endl; \
-            exit(static_cast<int>(result)); \
-        } \
-    } while(0)
-
 uint32_t next_power_of_two(uint32_t n) {
   if (n == 0) return 1;
   n--;
