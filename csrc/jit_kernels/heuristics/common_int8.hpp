@@ -10,7 +10,8 @@
 using namespace deep_gemm;
 namespace deep_gemm_int8 {
 
-std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, int block_n, int block_k = 128, int bpp = 1) {
+std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, int block_n, int block_k = 128,
+                                          int bpp = 1) {
     // 首先尝试使用 swizzle，因为它不浪费共享内存
     int swizzle_mode = 128;
     // int block_n_padding = (swizzle_mode == 0) ? get_block_n_padding_for_smem_d(block_n) : 0;
@@ -50,14 +51,8 @@ std::tuple<int> get_num_occ(int block_m, int block_n, int block_k, int num_stage
 
     // 创建查找表，使用字符串作为键的简单方法
     std::unordered_map<long long, int> vreg_occ_lut = {
-        {16LL * 100000 + 256, 3},
-        {32LL * 100000 + 128, 3},
-        {32LL * 100000 + 256, 2},
-        {64LL * 100000 + 64, 2},
-        {64LL * 100000 + 128, 2},
-        {64LL * 100000 + 256, 2},
-        {128LL * 100000 + 128, 2}
-    };
+        {16LL * 100000 + 256, 3}, {32LL * 100000 + 128, 3}, {32LL * 100000 + 256, 2}, {64LL * 100000 + 64, 2},
+        {64LL * 100000 + 128, 2}, {64LL * 100000 + 256, 2}, {128LL * 100000 + 128, 2}};
 
     long long key = static_cast<long long>(block_m) * 100000 + block_n;
     int vreg_occ = 1; // 默认值
@@ -94,9 +89,8 @@ int get_smem_occ(int block_m, int block_n, int block_k, int num_stages) {
 }
 
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
-get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
-                        bool is_grouped_contiguous = false, bool is_grouped_masked = false) {
-
+get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms, bool is_grouped_contiguous = false,
+                        bool is_grouped_masked = false) {
     // todo: add more tiles for ppu1.5
     int best_block_m = 256;
     int best_block_n = 256;
@@ -108,15 +102,12 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
     auto best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1);
     int num_min_sms = get_sm_count();
 
-    return std::make_tuple(num_min_sms, best_block_m, best_block_n, best_block_k,
-                          best_warp_m, best_warp_n, best_stages, best_smem_config);
-
+    return std::make_tuple(num_min_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages,
+                           best_smem_config);
 }
-
 
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) {
-
     // FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
     std::vector<int> block_ms = {256, 192, 128, 64, 32, 16};
     std::vector<int> block_ns = {256, 128, 64, 32};
@@ -127,7 +118,8 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
     };
 
     auto get_num_waves = [m, n, num_groups, num_sms](int bm, int bn) -> int {
-        if (bm == 0) return 0;
+        if (bm == 0)
+            return 0;
         return ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms);
     };
 
@@ -137,7 +129,8 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
     };
 
     auto get_block_utils = [](int dim, int block_dim) -> double {
-        if (block_dim == 0) return 0.0;
+        if (block_dim == 0)
+            return 0.0;
         if (dim % block_dim != 0) {
             int num_blocks = (dim + block_dim - 1) / block_dim;
             return (static_cast<double>(dim) / block_dim) / num_blocks;
@@ -166,7 +159,8 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
                 }
             }
         } else {
-            // block_ns_after_filter = filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 1) and not (block_m == 16 and bn == 32)), block_ns)
+            // block_ns_after_filter = filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 1) and not
+            // (block_m == 16 and bn == 32)), block_ns)
             for (int bn : block_ns) {
                 if ((block_m <= 128 || bn <= 128) && (bn != n && n >= 1) && !(block_m == 16 && bn == 32)) {
                     block_ns_after_filter.push_back(bn);
@@ -180,8 +174,8 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
             int best_num_waves = (best_block_m == 0) ? 0 : get_num_waves(best_block_m, best_block_n);
 
             double num_utils = get_block_utils(m, block_m) * get_block_utils(n, block_n);
-            double best_num_utils = (best_block_m == 0) ? 0.0 :
-                                  get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n);
+            double best_num_utils =
+                (best_block_m == 0) ? 0.0 : get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n);
 
             int num_occ = get_smem_occ(block_m, block_n, 128, 2);
             int best_num_occ = (best_block_m == 0) ? 0 : get_smem_occ(best_block_m, best_block_n, 128, 2);
@@ -200,8 +194,8 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
                 bool valid_util = (num_utils / best_num_utils) >= 1;
                 bool valid_ai = (ai_util / best_ai_util) >= 1;
 
-                int valid_count = (valid_wave ? 1 : 0) + (valid_util ? 1 : 0) +
-                                (valid_occ ? 1 : 0) + (valid_ai ? 1 : 0);
+                int valid_count =
+                    (valid_wave ? 1 : 0) + (valid_util ? 1 : 0) + (valid_occ ? 1 : 0) + (valid_ai ? 1 : 0);
                 success = valid_count >= 3;
             } else if (num_waves < best_num_waves) {
                 success = true;
@@ -228,7 +222,8 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
         }
     }
 
-    // small m hbm bound or latency bound, wave is not useful, for better occ for 810e hbm bound, use smallest blockN for m16
+    // small m hbm bound or latency bound, wave is not useful, for better occ for 810e hbm bound, use smallest blockN
+    // for m16
     if (m < 20 && n < 512) {
         best_block_m = 16;
         best_block_n = 64;
@@ -252,10 +247,14 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
 
     std::vector<int> stage_candidates;
     int max_stages = k / block_k;
-    if (5 <= max_stages) stage_candidates.push_back(5);
-    if (4 <= max_stages) stage_candidates.push_back(4);
-    if (3 <= max_stages) stage_candidates.push_back(3);
-    if (2 <= max_stages) stage_candidates.push_back(2);
+    if (5 <= max_stages)
+        stage_candidates.push_back(5);
+    if (4 <= max_stages)
+        stage_candidates.push_back(4);
+    if (3 <= max_stages)
+        stage_candidates.push_back(3);
+    if (2 <= max_stages)
+        stage_candidates.push_back(2);
 
     // if not stage_candidates or (128 % best_block_n != 0 and 128 // gcd(128, best_block_n) <= 4):
     if (stage_candidates.empty() || (128 % best_block_n != 0 && 128 / gcd(128, best_block_n) <= 4)) {
@@ -321,16 +320,13 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
         warp_n = best_block_n / 4;
     }
 
-    return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k,
-                          warp_m, warp_n, best_num_stages, best_smem_config);
+    return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n,
+                           best_num_stages, best_smem_config);
 }
 
-
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
-get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
-                        bool is_grouped_contiguous = false, bool is_grouped_masked = false,
-                        int max_block_n = 256) {
-
+get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms, bool is_grouped_contiguous = false,
+                        bool is_grouped_masked = false, int max_block_n = 256) {
     if (num_groups == 1 && is_grouped_contiguous == false && is_grouped_masked == false) {
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms);
     }
@@ -369,7 +365,8 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
     };
 
     auto get_num_waves = [m, n, num_groups, num_sms](int bm, int bn) -> int {
-        if (bm == 0) return 0;
+        if (bm == 0)
+            return 0;
         return ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms);
     };
 
@@ -379,7 +376,8 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
     };
 
     auto get_block_utils = [](int dim, int block_dim) -> double {
-        if (block_dim == 0) return 0.0;
+        if (block_dim == 0)
+            return 0.0;
         if (dim % block_dim != 0) {
             int num_blocks = (dim + block_dim - 1) / block_dim;
             return (static_cast<double>(dim) / block_dim) / num_blocks;
@@ -401,14 +399,16 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
 
         std::vector<int> block_ns_after_filter;
         if (is_ppu1v5_device() && ((m >= 128 && k > 2048) || (m >= 256 && k >= 512))) {
-            // block_ns_after_filter = filter(lambda bn: (bn != n and n >= 32) and not (block_m == 16 and bn <= 32), block_ns)
+            // block_ns_after_filter = filter(lambda bn: (bn != n and n >= 32) and not (block_m == 16 and bn <= 32),
+            // block_ns)
             for (int bn : block_ns) {
                 if ((bn != n && n >= 32) && !(block_m == 16 && bn <= 32)) {
                     block_ns_after_filter.push_back(bn);
                 }
             }
         } else {
-            // block_ns_after_filter = filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32) and not (block_m == 16 and bn <= 32)), block_ns)
+            // block_ns_after_filter = filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32) and
+            // not (block_m == 16 and bn <= 32)), block_ns)
             for (int bn : block_ns) {
                 if ((block_m <= 128 || bn <= 128) && (bn != n && n >= 32) && !(block_m == 16 && bn <= 32)) {
                     block_ns_after_filter.push_back(bn);
@@ -422,8 +422,8 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
             int best_num_waves = (best_block_m == 0) ? 0 : get_num_waves(best_block_m, best_block_n);
 
             double num_utils = get_block_utils(m, block_m) * get_block_utils(n, block_n);
-            double best_num_utils = (best_block_m == 0) ? 0.0 :
-                                  get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n);
+            double best_num_utils =
+                (best_block_m == 0) ? 0.0 : get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n);
 
             int num_occ = get_smem_occ(block_m, block_n, 128, 2);
             int best_num_occ = (best_block_m == 0) ? 0 : get_smem_occ(best_block_m, best_block_n, 128, 2);
@@ -442,8 +442,8 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
                 bool valid_util = (num_utils / best_num_utils) >= 1;
                 bool valid_ai = (ai_util / best_ai_util) >= 1;
 
-                int valid_count = (valid_wave ? 1 : 0) + (valid_util ? 1 : 0) +
-                                (valid_occ ? 1 : 0) + (valid_ai ? 1 : 0);
+                int valid_count =
+                    (valid_wave ? 1 : 0) + (valid_util ? 1 : 0) + (valid_occ ? 1 : 0) + (valid_ai ? 1 : 0);
                 success = valid_count >= 3;
             } else if (num_waves < best_num_waves) {
                 success = true;
@@ -484,7 +484,8 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
         best_block_m = best_block_m * 2;
     }
 
-    // small m hbm bound or latency bound, wave is not useful, for better occ for 810e hbm bound, use smallest blockN for m16
+    // small m hbm bound or latency bound, wave is not useful, for better occ for 810e hbm bound, use smallest blockN
+    // for m16
     if (m < 10 && n < 512) {
         best_block_m = 16;
         best_block_n = 64;
@@ -508,15 +509,23 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
 
     std::vector<int> stage_candidates;
     int max_stages = k / block_k;
-    if (8 <= max_stages) stage_candidates.push_back(8);
-    if (7 <= max_stages) stage_candidates.push_back(7);
-    if (6 <= max_stages) stage_candidates.push_back(6);
-    if (5 <= max_stages) stage_candidates.push_back(5);
-    if (4 <= max_stages) stage_candidates.push_back(4);
-    if (3 <= max_stages) stage_candidates.push_back(3);
-    if (2 <= max_stages) stage_candidates.push_back(2);
+    if (8 <= max_stages)
+        stage_candidates.push_back(8);
+    if (7 <= max_stages)
+        stage_candidates.push_back(7);
+    if (6 <= max_stages)
+        stage_candidates.push_back(6);
+    if (5 <= max_stages)
+        stage_candidates.push_back(5);
+    if (4 <= max_stages)
+        stage_candidates.push_back(4);
+    if (3 <= max_stages)
+        stage_candidates.push_back(3);
+    if (2 <= max_stages)
+        stage_candidates.push_back(2);
 
-    // if not stage_candidates or (128 % best_block_n != 0 and 128 // gcd(128, best_block_n) <= 4) or best_block_m == 16 or best_block_m == 32:
+    // if not stage_candidates or (128 % best_block_n != 0 and 128 // gcd(128, best_block_n) <= 4) or best_block_m == 16
+    // or best_block_m == 32:
     if (stage_candidates.empty() || (128 % best_block_n != 0 && 128 / gcd(128, best_block_n) <= 4) ||
         best_block_m == 16 || best_block_m == 32) {
         stage_candidates = {3, 2};
@@ -584,18 +593,16 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
         warp_n = 64;
     }
 
-    return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k,
-                          warp_m, warp_n, best_num_stages, best_smem_config);
+    return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n,
+                           best_num_stages, best_smem_config);
 }
 
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
-get_best_configs(int m, int n, int k, int num_groups, int num_sms,
-                bool is_grouped_contiguous = false, bool is_grouped_masked = false,
-                int max_block_n = 256) {
-
+get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_grouped_contiguous = false,
+                 bool is_grouped_masked = false, int max_block_n = 256) {
     if (is_ppu1v5_device()) {
-        return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms,
-                                      is_grouped_contiguous, is_grouped_masked, max_block_n);
+        return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, is_grouped_contiguous, is_grouped_masked,
+                                       max_block_n);
     }
     // FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
     std::vector<int> block_ms;
@@ -631,7 +638,8 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     };
 
     auto get_num_waves = [m, n, num_groups, num_sms](int bm, int bn) -> int {
-        if (bm == 0) return 0;
+        if (bm == 0)
+            return 0;
         return ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms);
     };
 
@@ -641,7 +649,8 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     };
 
     auto get_block_utils = [](int dim, int block_dim) -> double {
-        if (block_dim == 0) return 0.0;
+        if (block_dim == 0)
+            return 0.0;
         if (dim % block_dim != 0) {
             int num_blocks = (dim + block_dim - 1) / block_dim;
             return (static_cast<double>(dim) / block_dim) / num_blocks;
@@ -664,16 +673,19 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
 
         std::vector<int> block_ns_after_filter;
         if (is_ppu1v5_device() && ((m >= 128 && k > 2048) || m >= 256)) {
-            // block_ns_after_filter = filter(lambda bn: (bn != n and n >= min_n_threshold) and not (block_m == 16 and bn <= 32), block_ns)
+            // block_ns_after_filter = filter(lambda bn: (bn != n and n >= min_n_threshold) and not (block_m == 16 and
+            // bn <= 32), block_ns)
             for (int bn : block_ns) {
                 if ((bn != n && n >= min_n_threshold) && !(block_m == 16 && bn <= 32)) {
                     block_ns_after_filter.push_back(bn);
                 }
             }
         } else {
-            // block_ns_after_filter = filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= min_n_threshold) and not (block_m == 16 and bn <= 32)), block_ns)
+            // block_ns_after_filter = filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >=
+            // min_n_threshold) and not (block_m == 16 and bn <= 32)), block_ns)
             for (int bn : block_ns) {
-                if ((block_m <= 128 || bn <= 128) && (bn != n && n >= min_n_threshold) && !(block_m == 16 && bn <= 32)) {
+                if ((block_m <= 128 || bn <= 128) && (bn != n && n >= min_n_threshold) &&
+                    !(block_m == 16 && bn <= 32)) {
                     block_ns_after_filter.push_back(bn);
                 }
             }
@@ -685,8 +697,8 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
             int best_num_waves = (best_block_m == 0) ? 0 : get_num_waves(best_block_m, best_block_n);
 
             double num_utils = get_block_utils(m, block_m) * get_block_utils(n, block_n);
-            double best_num_utils = (best_block_m == 0) ? 0.0 :
-                                  get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n);
+            double best_num_utils =
+                (best_block_m == 0) ? 0.0 : get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n);
 
             int num_occ = get_smem_occ(block_m, block_n, 128, 2);
             int best_num_occ = (best_block_m == 0) ? 0 : get_smem_occ(best_block_m, best_block_n, 128, 2);
@@ -705,8 +717,8 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
                 bool valid_util = (num_utils / best_num_utils) >= 1;
                 bool valid_ai = (ai_util / best_ai_util) >= 1;
 
-                int valid_count = (valid_wave ? 1 : 0) + (valid_util ? 1 : 0) +
-                                (valid_occ ? 1 : 0) + (valid_ai ? 1 : 0);
+                int valid_count =
+                    (valid_wave ? 1 : 0) + (valid_util ? 1 : 0) + (valid_occ ? 1 : 0) + (valid_ai ? 1 : 0);
                 success = valid_count >= 3;
             } else if (num_waves < best_num_waves) {
                 success = true;
@@ -738,15 +750,14 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         best_block_n = 256;
     }
 
-    // small m hbm bound or latency bound, wave is not useful, for better occ for 810e hbm bound, use smallest blockN for m16
+    // small m hbm bound or latency bound, wave is not useful, for better occ for 810e hbm bound, use smallest blockN
+    // for m16
     if (m < 6 && n < 512) {
         best_block_m = 16;
         best_block_n = 64;
     }
 
-    if ((best_block_m - 10 <= m && m <= best_block_m) &&
-        best_block_m == 16 &&
-        k > 384) {
+    if ((best_block_m - 10 <= m && m <= best_block_m) && best_block_m == 16 && k > 384) {
         best_block_m = best_block_m * 2;
     }
 
@@ -758,6 +769,10 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     std::tuple<int, int, int> best_smem_config;
     const int ppu_capacity = 262144;
 
+    if (!is_ppu1v5_device() && 64 < m && m < 128) {
+        best_block_m = 64;
+    }
+
     int block_k = 128;
     if (k <= 256) {
         block_k = 64;
@@ -768,16 +783,22 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
 
     std::vector<int> stage_candidates;
     int max_stages = k / block_k;
-    if (8 <= max_stages) stage_candidates.push_back(8);
-    if (7 <= max_stages) stage_candidates.push_back(7);
-    if (6 <= max_stages) stage_candidates.push_back(6);
-    if (5 <= max_stages) stage_candidates.push_back(5);
-    if (4 <= max_stages) stage_candidates.push_back(4);
-    if (3 <= max_stages) stage_candidates.push_back(3);
-    if (2 <= max_stages) stage_candidates.push_back(2);
+    if (8 <= max_stages)
+        stage_candidates.push_back(8);
+    if (7 <= max_stages)
+        stage_candidates.push_back(7);
+    if (6 <= max_stages)
+        stage_candidates.push_back(6);
+    if (5 <= max_stages)
+        stage_candidates.push_back(5);
+    if (4 <= max_stages)
+        stage_candidates.push_back(4);
+    if (3 <= max_stages)
+        stage_candidates.push_back(3);
+    if (2 <= max_stages)
+        stage_candidates.push_back(2);
 
-    if (stage_candidates.empty() ||
-        (128 % best_block_n != 0 && 128 / gcd(128, best_block_n) <= 4) ||
+    if (stage_candidates.empty() || (128 % best_block_n != 0 && 128 / gcd(128, best_block_n) <= 4) ||
         best_block_m == 16 || best_block_m == 32) {
         stage_candidates = {3, 2};
     }
@@ -811,11 +832,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     // NOTES: less L2 cache usage and less GPU frequency drop
     int num_waves = get_num_waves(best_block_m, best_block_n);
     int num_min_sms;
-    if (is_ppu1v5_device()) {
-        num_min_sms = num_sms;
-    } else {
-        num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves);
-    }
+    num_min_sms = num_sms;
 
     assert(num_min_sms <= num_sms);
 
@@ -843,8 +860,8 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         warp_n = best_block_n / 4;
     }
 
-    return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k,
-                          warp_m, warp_n, best_num_stages, best_smem_config);
+    return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n,
+                           best_num_stages, best_smem_config);
 }
 
-} // namespace deep_gemm
+} // namespace deep_gemm_int8

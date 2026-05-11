@@ -31,36 +31,27 @@ namespace deep_gemm {
 ///   out_advance_cluster: bytes to add to move to the next 'cluster' position
 ///   out_advance_tile:    bytes to add to move to the next 'tile'
 CUTLASS_HOST_DEVICE
-void compute_predicated_tile_iterator_params(
-    int block_m, int block_n, int block_k,
-    int warp_m, int warp_n, int warp_k,
-    int elements_per_access,
-    int element_size_bits,
-    int shape_n,
-    int64_t* out_stride,
-    int64_t* out_increment_row,
-    int64_t* out_increment_group,
-    int64_t* out_increment_cluster,
-    int64_t* out_advance_row,
-    int64_t* out_advance_group,
-    int64_t* out_advance_cluster,
-    int64_t* out_advance_tile) {
+void compute_predicated_tile_iterator_params(int block_m, int block_n, int block_k, int warp_m, int warp_n, int warp_k,
+                                             int elements_per_access, int element_size_bits, int shape_n,
+                                             int64_t* out_stride, int64_t* out_increment_row,
+                                             int64_t* out_increment_group, int64_t* out_increment_cluster,
+                                             int64_t* out_advance_row, int64_t* out_advance_group,
+                                             int64_t* out_advance_cluster, int64_t* out_advance_tile) {
     const int WARP_SIZE = 32;
-    const int K_TENSOR_OP_ROWS = 8;  // 固定值
+    const int K_TENSOR_OP_ROWS = 8; // 固定值
 
     int warp_count_m = block_m / warp_m;
     int warp_count_n = block_n / warp_n;
     int total_warps = warp_count_m * warp_count_n;
 
-    int shape_column = block_n;           // BLOCK_N
-    int shape_row = K_TENSOR_OP_ROWS;     // 固定值 8
-    int shape_group = warp_count_m;       // BLOCK_M / WARP_M
+    int shape_column = block_n;       // BLOCK_N
+    int shape_row = K_TENSOR_OP_ROWS; // 固定值 8
+    int shape_group = warp_count_m;   // BLOCK_M / WARP_M
     int shape_cluster = 1;
     int shape_tile = 1;
-
     // Count
     int count_column = 1;
-    int count_row = warp_m / K_TENSOR_OP_ROWS;  // WARP_M / 8
+    int count_row = warp_m / K_TENSOR_OP_ROWS; // WARP_M / 8
     int count_group = 1;
     int count_cluster = 1;
     int count_tile = warp_m / K_TENSOR_OP_ROWS;
@@ -71,7 +62,6 @@ void compute_predicated_tile_iterator_params(
     } else {
         warps_remaining_for_groups = total_warps / shape_cluster;
     }
-
     int warps_remaining_for_rows;
     if (shape_group > warps_remaining_for_groups) {
         warps_remaining_for_rows = 1;
@@ -98,7 +88,6 @@ void compute_predicated_tile_iterator_params(
     } else {
         access_width = std::min(WARP_SIZE, 128 / (elements_per_access * element_size_bits / 8));
     }
-
     // kAccessRows
     int access_rows;
     if (target_access_rows > detail_shape_row) {
@@ -122,7 +111,6 @@ void compute_predicated_tile_iterator_params(
         iterations_group = 1;
         delta_group = 1;
     }
-
     int iterations_cluster;
     int delta_cluster;
     if (shape_cluster > total_warps) {
@@ -142,30 +130,23 @@ void compute_predicated_tile_iterator_params(
     *out_increment_row = *out_stride * delta_row;
 
     // 3. increment_group
-    *out_increment_group = *out_stride * delta_group
-                         - *out_stride * delta_row * (iterations_row - 1);
+    *out_increment_group = *out_stride * delta_group - *out_stride * delta_row * (iterations_row - 1);
 
     // 4. increment_cluster
-    *out_increment_cluster = *out_stride * delta_cluster
-                           - *out_stride * delta_group * (iterations_group - 1)
-                           - *out_stride * delta_row * (iterations_row - 1);
+    *out_increment_cluster = *out_stride * delta_cluster - *out_stride * delta_group * (iterations_group - 1) -
+                             *out_stride * delta_row * (iterations_row - 1);
 
     // 5. advance_row
     *out_advance_row = *out_stride * shape_row;
 
     // 6. advance_group
-    *out_advance_group = *out_stride *
-        (shape_group - 1) * shape_row * count_row;
+    *out_advance_group = *out_stride * (shape_group - 1) * shape_row * count_row;
 
     // 7. advance_cluster
-    *out_advance_cluster = *out_stride *
-        count_group * shape_group *
-        count_row * shape_row;
+    *out_advance_cluster = *out_stride * count_group * shape_group * count_row * shape_row;
 
     // 8. advance_tile
-    *out_advance_tile = *out_stride *
-        shape_group * shape_row *
-        shape_cluster * shape_tile;
+    *out_advance_tile = *out_stride * shape_group * shape_row * shape_cluster * shape_tile;
 }
 
 } // namespace deep_gemm

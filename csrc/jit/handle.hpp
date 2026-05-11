@@ -21,17 +21,17 @@ static void* get_driver_handle() {
 }
 
 // Macro to define wrapper functions named `lazy_cu{API name}`
-#define DECL_LAZY_CUDA_DRIVER_FUNCTION(name) \
-template <typename... Args> \
-static auto lazy_##name(Args&&... args) -> decltype(name(args...)) { \
-    using FuncType = decltype(&name); \
-    static FuncType func = nullptr; \
-    if (func == nullptr) { \
-        func = reinterpret_cast<FuncType>(dlsym(get_driver_handle(), #name)); \
-        DG_HOST_ASSERT(func != nullptr and "Failed to load CUDA driver API"); \
-    } \
-    return func(std::forward<decltype(args)>(args)...); \
-}
+#define DECL_LAZY_CUDA_DRIVER_FUNCTION(name)                                                                           \
+    template <typename... Args>                                                                                        \
+    static auto lazy_##name(Args&&... args)->decltype(name(args...)) {                                                 \
+        using FuncType = decltype(&name);                                                                              \
+        static FuncType func = nullptr;                                                                                \
+        if (func == nullptr) {                                                                                         \
+            func = reinterpret_cast<FuncType>(dlsym(get_driver_handle(), #name));                                      \
+            DG_HOST_ASSERT(func != nullptr and "Failed to load CUDA driver API");                                      \
+        }                                                                                                              \
+        return func(std::forward<decltype(args)>(args)...);                                                            \
+    }
 
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorName);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorString);
@@ -56,10 +56,11 @@ using LaunchAttrHandle = cudaLaunchAttribute;
 #define DG_CUDA_UNIFIED_CHECK DG_CUDA_RUNTIME_CHECK
 
 static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const std::string& func_name,
-                                LibraryHandle *library_opt = nullptr) {
+                                LibraryHandle* library_opt = nullptr) {
     LibraryHandle library;
     KernelHandle kernel{};
-    DG_CUDA_RUNTIME_CHECK(cudaLibraryLoadFromFile(&library, cubin_path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+    DG_CUDA_RUNTIME_CHECK(
+        cudaLibraryLoadFromFile(&library, cubin_path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
     DG_CUDA_RUNTIME_CHECK(cudaLibraryGetKernel(&kernel, library, func_name.c_str()));
 
     if (library_opt != nullptr)
@@ -72,9 +73,8 @@ static void unload_library(const LibraryHandle& library) {
     DG_HOST_ASSERT(error == cudaSuccess or error == cudaErrorCudartUnloading);
 }
 
-static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
-                                                  const cudaStream_t& stream, const int& smem_size,
-                                                  const dim3& grid_dim, const dim3& block_dim) {
+static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel, const cudaStream_t& stream,
+                                                  const int& smem_size, const dim3& grid_dim, const dim3& block_dim) {
     if (smem_size > 0)
         DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     LaunchConfigHandle config;
@@ -87,9 +87,9 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     return config;
 }
 
-template<typename... ActTypes>
+template <typename... ActTypes>
 static auto launch_kernel(const KernelHandle& kernel, const LaunchConfigHandle& config, ActTypes&&... args) {
-    void *ptr_args[] = { &args... };
+    void* ptr_args[] = {&args...};
     return cudaLaunchKernelExC(&config, kernel, ptr_args);
 }
 
@@ -104,7 +104,7 @@ using LaunchAttrHandle = CUlaunchAttribute;
 #define DG_CUDA_UNIFIED_CHECK DG_CUDA_DRIVER_CHECK
 
 static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const std::string& func_name,
-                               LibraryHandle *library_opt = nullptr) {
+                                LibraryHandle* library_opt = nullptr) {
     LibraryHandle library;
     KernelHandle kernel;
     DG_CUDA_DRIVER_CHECK(lazy_cuModuleLoad(&library, cubin_path.c_str()));
@@ -120,11 +120,11 @@ static void unload_library(const LibraryHandle& library) {
     DG_HOST_ASSERT(error == CUDA_SUCCESS or error == CUDA_ERROR_DEINITIALIZED);
 }
 
-static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
-                                                 const cudaStream_t& stream, const int& smem_size,
-                                                 const dim3& grid_dim, const dim3& block_dim) {
+static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel, const cudaStream_t& stream,
+                                                  const int& smem_size, const dim3& grid_dim, const dim3& block_dim) {
     if (smem_size > 0)
-        DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
+        DG_CUDA_DRIVER_CHECK(
+            lazy_cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
     LaunchConfigHandle config;
     config.gridDimX = grid_dim.x;
     config.gridDimY = grid_dim.y;
@@ -140,9 +140,10 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     return config;
 }
 
-template<typename... ActTypes>
+template <typename... ActTypes>
 static auto launch_kernel(const KernelHandle& kernel, const LaunchConfigHandle& config, ActTypes&&... args) {
-    void *ptr_args[] = { &args... };
+    // void *ptr_args[] = { &args... };
+    void* ptr_args[] = {(void*)(&args)...};
     return lazy_cuLaunchKernelEx(&config, kernel, ptr_args, nullptr);
 }
 

@@ -21,6 +21,7 @@ enum class KernelType {
 
 const char* KernelTypeS[] = { "Default", "MultistageOnN", "MoeDynamicTile", "OverlapPrologue", "OverlapMainloop"};
 
+
 template <typename T>
 __device__ __host__ constexpr inline T ceil_div(T a, T b) {
     return (a + b - 1) / b;

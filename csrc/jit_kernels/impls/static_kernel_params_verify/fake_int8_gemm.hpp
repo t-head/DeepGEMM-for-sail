@@ -1,3 +1,4 @@
+namespace deep_gemm_int8 {
 #define FP8_NVRTC
 #include <../../../deep_gemm/include/deep_gemm/int8_gemm_cutlass3.cuh>
 namespace deep_gemm {
@@ -134,4 +135,5 @@ static size_t get_int8_tample_params_size() {
     return sizeof(GemmKernel::Params);
     
   }
+}
 }

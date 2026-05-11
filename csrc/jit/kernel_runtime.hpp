@@ -33,8 +33,10 @@ public:
 
         // Find the only symbol
         // TODO: use kernel enumeration for newer drivers
-        const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
-        const auto& [exit_code, symbols] = call_external_command(fmt::format("{} --dump-elf-symbols=0 {}", cuobjdump_path.c_str(), cubin_path.c_str()));
+        const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal",
+                                                        "__assertfail"};
+        const auto& [exit_code, symbols] = call_external_command(
+            fmt::format("{} --dump-elf-symbols=0 {}", cuobjdump_path.c_str(), cubin_path.c_str()));
         if (get_env<int>("DG_JIT_DEBUG"))
             printf("symbols: %s\n", symbols.c_str());
         std::string expected_name = dir_path.filename().string();
@@ -55,12 +57,11 @@ public:
     }
 
     static bool check_validity(const std::filesystem::path& dir_path) {
-        return std::filesystem::exists(dir_path / "kernel.cu") and
-               std::filesystem::exists(dir_path / "kernel.cubin");
+        return std::filesystem::exists(dir_path / "kernel.cu") and std::filesystem::exists(dir_path / "kernel.cubin");
     }
 
-        ~KernelRuntime() noexcept(false) {
-            unload_library(library);
+    ~KernelRuntime() noexcept(false) {
+        unload_library(library);
     }
 };
 
@@ -82,10 +83,12 @@ public:
         const auto& kernel = kernel_runtime->kernel;
         const auto& stream = at::cuda::getCurrentCUDAStream();
         const LaunchArgs& launch_args = args.launch_args;
-        auto config = construct_launch_config(kernel, stream, launch_args.smem_size,
-                                              launch_args.grid_dim, launch_args.block_dim);
-        // std::cout << " launch_args.grid_dim" << launch_args.grid_dim.x << launch_args.grid_dim.y << launch_args.grid_dim.z <<  std::endl;
-        //  std::cout << " launch_args.block_dim" << launch_args.block_dim.x << launch_args.block_dim.y << launch_args.block_dim.z <<  std::endl;
+        auto config =
+            construct_launch_config(kernel, stream, launch_args.smem_size, launch_args.grid_dim, launch_args.block_dim);
+        // std::cout << " launch_args.grid_dim" << launch_args.grid_dim.x << launch_args.grid_dim.y <<
+        // launch_args.grid_dim.z <<  std::endl;
+        //  std::cout << " launch_args.block_dim" << launch_args.block_dim.x << launch_args.block_dim.y <<
+        //  launch_args.block_dim.z <<  std::endl;
 
         // Launch in the derived class
         if (get_env<int>("DG_JIT_DEBUG")) {

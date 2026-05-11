@@ -167,29 +167,27 @@ public:
         signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);
 
         const auto& arch = 89;//device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
-        
+
         auto arch_flag = "";
         if (is_ppu1v5_device()) {
             arch_flag = "-gencode=arch=compute_89,code=sm_89";
             flags = fmt::format("{} -I{}/cutlass3 -I{}/deep_gemm {} "
-                            ",-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
+                            " -O3 -fconcepts  -Wno-deprecated-declarations  -Wno-abi "
                             "-cubin --expt-relaxed-constexpr --expt-extended-lambda ",
                             flags, library_include_path.c_str(), library_include_path.c_str(), arch_flag);
         } else {
             arch_flag = "-gencode=arch=compute_80a,code=sm_80a";
             flags = fmt::format("{} -I{} -I{}/cutlass -I{}/deep_gemm {} "
-                            ",-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
+                            " -O3  -fconcepts  -Wno-deprecated-declarations  -Wno-abi "
                             "-cubin --expt-relaxed-constexpr --expt-extended-lambda ",
                             flags, library_include_path.c_str(), library_include_path.c_str(), library_include_path.c_str(), arch_flag);
         }
         std::string nvcc_flags;
         if (is_ppu1v5_device()) {
-            nvcc_flags = " -ppu-patch-fence-ppu=false -wno-loop-miss-transform -ppu-cg-to-kp1=true "
-            "-ppu-fix-uninit=true -mllvm -ppu-blksync-nb-schedule-boundary=true -mllvm -ppu-simt-branch=false "
-            "-mllvm -ppu-adjust-tsm-valu-war=13 -mllvm -ppu-reassign-subregs=true -mllvm -ppu-pref-fma-reuse=true "
-            "-mllvm -ppu-pref-mma-reuse=true  -mllvm -regalloc=pbqp --ptxas-options=--register-usage-level=10";
+            flags += " -ppu-patch-fence-ppu=false -wno-loop-miss-transform"
+                     " -ppu-cg-to-kp1=true -ppu-fix-uninit=true"
+                     " --ptxas-options=--register-usage-level=10";
         }
-        flags += nvcc_flags;
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path, const std::string& name, int32_t thread_num, int32_t smem_size) const override {
@@ -197,8 +195,27 @@ public:
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);
 
+        // Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use -mllvm flags,
+        // others only need -ppu-simt-branch=false (aligned with compiler.py logic)
+        std::string per_kernel_flags;
+        if (is_ppu1v5_device()) {
+            const bool use_warp_interleaving = (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
+                                               (name.find("fp8_deep_gemm") != std::string::npos) ||
+                                               (name.find("mqa_logits") != std::string::npos);
+            if (!use_warp_interleaving) {
+                per_kernel_flags = " -ppu-simt-branch=false";
+            } else {
+                per_kernel_flags = " -mllvm -ppu-blksync-nb-schedule-boundary=true"
+                                   " -mllvm -ppu-simt-branch=false"
+                                   " -mllvm -ppu-adjust-tsm-valu-war=13"
+                                   " -mllvm -ppu-reassign-subregs=true"
+                                   " -mllvm -ppu-pref-fma-reuse=true"
+                                   " -mllvm -ppu-pref-mma-reuse=true"
+                                   " -mllvm -regalloc=pbqp";
+            }
+        }
         // Compile
-        const auto& command = fmt::format("{} {} -o {} {}", nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
+        const auto& command = fmt::format("{} {} -o {} {}{}", nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags, per_kernel_flags);
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running NVCC command: %s\n", command.c_str());
         const auto& [return_code, output] = call_external_command(command);
@@ -352,7 +369,7 @@ public:
         DG_NVRTC_CHECK(nvrtcVersion(&major, &minor));
         signature = fmt::format("NVRTC{}.{}", major, minor);
         DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVRTC version should be >= 12.3");
-        
+
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path, const std::string& name, int32_t thread_num, int32_t smem_size) const override {
@@ -415,7 +432,7 @@ public:
 };
 
 static auto compiler = LazyInit<Compiler>([]() -> std::shared_ptr<Compiler> {
-    if (get_env<int>("DG_JIT_USE_NVRTC", 1)) {
+    if (get_env<int>("DG_JIT_USE_NVRTC", 0)) {
         return std::make_shared<NVRTCCompiler>();
     } else {
         return std::make_shared<NVCCCompiler>();

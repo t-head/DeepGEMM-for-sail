@@ -90,7 +90,6 @@ __global__ void computeBlockInfoKernel(
     uint32_t block_val = (group_val + BlockM - 1) / BlockM;
     uint32_t warp_group_scan = group_val;
     uint32_t warp_block_scan = block_val;
-
     for (uint32_t offset = 1; offset < 32; offset *= 2) {
         uint32_t tmp_group = __shfl_up_sync(0xFFFFFFFF, warp_group_scan, offset);
         uint32_t tmp_block = __shfl_up_sync(0xFFFFFFFF, warp_block_scan, offset);

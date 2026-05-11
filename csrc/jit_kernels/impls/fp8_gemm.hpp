@@ -1,7 +1,7 @@
 #pragma once
 
 #include <torch/python.h>
-#include <cstdint> 
+#include <cstdint>
 #include <cuda_fp8.h>
 #include "cute/tensor.hpp"
 #include "cute/arch/cluster_sm90.hpp"
@@ -15,37 +15,34 @@
 #include "../../utils/layout_type_name.hpp"
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_fp8.hpp"
-#include "cutlass/kernel_hardware_info.hpp"
+#include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "ppu/cutlass/detail/blockwise_scale_layout.hpp"
 #include "../../../deep_gemm/include/deep_gemm/utils_rtc.cuh"
 #include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
 #include "int8_gemm.hpp"
-// #include "static_kernel_params_verify/fake_fp8_gemm.hpp"
 
 using namespace deep_gemm_fp8_common;
 namespace deep_gemm {
 
-class ComputeBlockInfoKernelRuntime final: public LaunchRuntime<ComputeBlockInfoKernelRuntime> {
+class ComputeBlockInfoKernelRuntime final : public LaunchRuntime<ComputeBlockInfoKernelRuntime> {
 public:
-
     struct ComputeBlockInfoArguments {
-      const uint32_t* grouped_layout;
-      uint32_t num_groups;
-      uint32_t* block_m_info;
+        const uint32_t* grouped_layout;
+        const uint32_t num_groups;
+        uint32_t* block_m_info;
     };
 
     struct Args {
-      ComputeBlockInfoArguments launch_attr_args;
-      LaunchArgs launch_args;
+        ComputeBlockInfoArguments launch_attr_args;
+        LaunchArgs launch_args;
     };
 
     static std::string generate_impl(const int BlockM) {
-        return fmt::format(R"(
-#include "cutlass/cutlass.h"
-#include "cutlass/device_kernel.h"
-extern "C" 
+        return fmt::format(
+            R"(
+extern "C"
 __global__ void computeBlockInfoKernel(
     const uint32_t* __restrict__ group_num_list,
     const uint32_t group_num,
@@ -53,8 +50,8 @@ __global__ void computeBlockInfoKernel(
 {{
     constexpr int32_t BlockM = {};
     const uint32_t tid = threadIdx.x;
-    const uint32_t lane = cutlass::canonical_lane_idx();
-    const uint32_t warp_id = cutlass::canonical_warp_idx_sync();
+    const uint32_t lane = threadIdx.x % 32;
+    const uint32_t warp_id = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const uint32_t num_warps = blockDim.x / 32;
     uint32_t group_val = tid < group_num ? group_num_list[tid] : 0;
     uint32_t block_val = (group_val + BlockM - 1) / BlockM;
@@ -77,7 +74,6 @@ __global__ void computeBlockInfoKernel(
         warp_group_totals[warp_id] = warp_group_scan;
         warp_block_totals[warp_id] = warp_block_scan;
     }}
-
     __syncthreads();
 
     __shared__ uint32_t warp_group_prefix[32];
@@ -111,156 +107,133 @@ __global__ void computeBlockInfoKernel(
         uint32_t block_idx = base_offset + i * 4;
         output_info[block_idx]     = tid;          // group_idx
         output_info[block_idx + 1] = group_val;    // group_num
-        output_info[block_idx + 2] = i;            // block_in_group
+        output_info[block_idx + 2] = global_block_prefix; // block_in_group
         output_info[block_idx + 3] = global_group_prefix; // prefix_group_sum
     }}
 }}
 )",
-        BlockM);
-}
+            BlockM);
+    }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.launch_attr_args));
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.launch_attr_args.grouped_layout,
+                                            args.launch_attr_args.num_groups, args.launch_attr_args.block_m_info));
     }
 };
 
-class PPU10500FP8GemmRuntime final: public LaunchRuntime<PPU10500FP8GemmRuntime> {
+class FP8GemmRuntime final : public LaunchRuntime<FP8GemmRuntime> {
 public:
-    using ScaleGranularityShape = cute::Shape<cute::_1,cute::_128,cute::_128>;
-    using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(ScaleGranularityShape{}));
-    using LayoutSFA           = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
-    using LayoutSFB           = decltype(ScaleConfig::deduce_layoutSFB());
-    using ElementA            = cutlass::float_e4m3_t;                          // Element type for A matrix operand
-    using LayoutA             = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
-    using ElementB            = cutlass::float_e4m3_t;                          // Element type for B matrix operand
-    using LayoutB             = cutlass::layout::ColumnMajor;                   // Layout type for B matrix operand
-    using ElementD            = cutlass::bfloat16_t;
-    using LayoutD             = cutlass::layout::RowMajor;
+    using ScaleGranularityShape = cute::Shape<cute::_1, cute::_128, cute::_128>;
+    using ScaleConfig =
+        decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(
+            ScaleGranularityShape{}));
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA()); // Layout type for SFA matrix operand
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
     using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
 
-    using GemmProblemSize = cute::tuple<int32_t,int32_t,int32_t,int32_t>;
+    using GemmProblemSize = cute::tuple<int32_t, int32_t, int32_t, int32_t>;
 
     struct MainLoopArguments {
-      cutlass::float_e4m3_t* ptr_A;
-      cute::Stride<int64_t, cute::Int<1>, int64_t> stride_A;
-      cutlass::float_e4m3_t* ptr_B;
-      cute::Stride<int64_t, cute::Int<1>, int64_t> stride_B;
-      uint32_t mma_promotion_interval = 4;
-      float * ptr_scale_A;
-      LayoutSFA layout_SFA;
-      float * ptr_scale_B;
-      LayoutSFB layout_SFB;
+        cutlass::float_e4m3_t* ptr_A;
+        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_A;
+        cutlass::float_e4m3_t* ptr_B;
+        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_B;
+        uint32_t mma_promotion_interval = 4;
+        float* ptr_scale_A;
+        LayoutSFA layout_SFA;
+        float* ptr_scale_B;
+        LayoutSFB layout_SFB;
     };
 
     struct LinearCombinationArgs {
-      float alpha = 1.0f;                         ///< scales accumulators
-      float beta = 0.0f;                         ///< scales source tensor
-      float const *alpha_ptr = nullptr;              ///< pointer to accumulator scalar - if not null, loads it from memory
-      float const *beta_ptr = nullptr;               ///< pointer to source scalar - if not null, loads it from memory
-      float const* const* alpha_ptr_array = nullptr; ///< array of pointers to accumulator scalar per group/batch
-      float const* const* beta_ptr_array = nullptr;  ///< array of pointers to source scalar per group/batch
-// #if SUPPORT_FP8_SCALING
-//       float scale_a = float(1);
-//       float scale_b = float(1);
-//       float scale_c = float(1);
-//       float scale_d = float(1);
-//       float const* scale_a_ptr = nullptr;
-//       float const* scale_b_ptr = nullptr;
-//       float const* scale_c_ptr = nullptr;
-//       float const* scale_d_ptr = nullptr;
-// #endif
+        float alpha = 1.0f;               ///< scales accumulators
+        float beta = 0.0f;                ///< scales source tensor
+        float const* alpha_ptr = nullptr; ///< pointer to accumulator scalar - if not null, loads it from memory
+        float const* beta_ptr = nullptr;  ///< pointer to source scalar - if not null, loads it from memory
+        float const* const* alpha_ptr_array = nullptr; ///< array of pointers to accumulator scalar per group/batch
+        float const* const* beta_ptr_array = nullptr;  ///< array of pointers to source scalar per group/batch
+                                                       // float scale_a = float(1);
+                                                       // float scale_b = float(1);
+                                                       // float scale_c = float(1);
+                                                       // float scale_d = float(1);
+                                                       // float const* scale_a_ptr = nullptr;
+                                                       // float const* scale_b_ptr = nullptr;
+                                                       // float const* scale_c_ptr = nullptr;
+                                                       // float const* scale_d_ptr = nullptr;
     };
 
     // Epilogue
     struct EpilogueArgs {
-      LinearCombinationArgs callback;
-      cutlass::bfloat16_t * ptr_C;        // 通常为 nullptr（in-place D）
-      cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C;   // 通常等于 stride_D
+        LinearCombinationArgs callback;
+        cutlass::bfloat16_t* ptr_C;                            // 通常为 nullptr（in-place D）
+        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C; // 通常等于 stride_D
 
-      cutlass::bfloat16_t * ptr_D;
-      cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D;
+        cutlass::bfloat16_t* ptr_D;
+        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D;
     };
 
     struct LaunchInfo {
-      int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
-      std::string kernel_name;
-    };
-
-    struct TileSchedulerArguments {
-      int* grouped_layout;
-      uint32_t shape_m;
+        int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
+        std::string gemm_type, kKernelType, kernel_name;
+        bool kEnableSboOverlap;
     };
 
     // 主 Arguments 结构体
     struct GemmArguments {
-      GemmUniversalMode mode;
-      GemmProblemSize problem_shape;
-      MainLoopArguments mainloopargs;
-      EpilogueArgs epilogueargs;
-      cutlass::KernelHardwareInfo hw_info;
-      TileSchedulerArguments scheduler{};
-      int32_t* signal{nullptr};
-    };
-
-    struct TileSchedulerParams {
-      int* grouped_layout;
-      uint32_t shape_m;
+        GemmUniversalMode mode;
+        GemmProblemSize problem_shape;
+        MainLoopArguments mainloopargs;
+        EpilogueArgs epilogueargs;
+        cutlass::KernelHardwareInfo hw_info;
+        TileSchedulerArguments scheduler{};
+        int32_t* signal{nullptr};
     };
 
     using CollectiveMainloopParams = MainLoopArguments;
     using CollectiveEpilogueParams = EpilogueArgs;
 
     struct GemmKernelParams {
-      GemmUniversalMode mode;
-      GemmProblemSize problem_shape;
-      CollectiveMainloopParams collective_mainloop_params;
-      CollectiveEpilogueParams collective_epilogue_params;
-      cutlass::KernelHardwareInfo hw_info;
-      TileSchedulerParams tile_scheduler_params;
-      void* workspace{nullptr};//workspace,
-      int32_t* signal{nullptr};
+        GemmUniversalMode mode;
+        GemmProblemSize problem_shape;
+        CollectiveMainloopParams collective_mainloop_params;
+        CollectiveEpilogueParams collective_epilogue_params;
+        cutlass::KernelHardwareInfo hw_info;
+        TileSchedulerArguments scheduler;
+        void* workspace{nullptr}; // workspace,
+        int32_t* signal{nullptr};
     };
 
     struct Args {
-      GemmArguments gemm_args;
-      LaunchInfo launch_info;
-      LaunchArgs launch_args;
-      GemmKernelParams kernel_params;
+        LaunchInfo launch_info;
+        LaunchArgs launch_args;
+        GemmKernelParams kernel_params;
     };
 
-    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace, int* grouped_layout) {
-      auto problem_shape = args.problem_shape;
-      auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
-      // Get SM count if needed, otherwise use user supplied SM count
-      int sm_count = args.hw_info.sm_count;
-      if (sm_count <= 0) {
-        CUTLASS_TRACE_HOST("  WARNING: Arguments do not include a valid SM count.\n"
-            "  For optimal performance, populate the arguments KernelHardwareInfo struct with the SM count.");
-        sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(args.hw_info.device_id);
-      }
+    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace) {
+        auto problem_shape = args.problem_shape;
+        auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
+        // Get SM count if needed, otherwise use user supplied SM count
+        int sm_count = args.hw_info.sm_count;
+        if (sm_count <= 0) {
+            CUTLASS_TRACE_HOST(
+                "  WARNING: Arguments do not include a valid SM count.\n"
+                "  For optimal performance, populate the arguments KernelHardwareInfo struct with the SM count.");
+            sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(args.hw_info.device_id);
+        }
 
-      CUTLASS_TRACE_HOST("to_underlying_arguments(): Setting persistent grid SM count to " << sm_count);
+        CUTLASS_TRACE_HOST("to_underlying_arguments(): Setting persistent grid SM count to " << sm_count);
 
-      cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
+        cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
 
-      uint32_t problem_shape_m = cute::get<0>(problem_shape_MNKL);
-      TileSchedulerParams scheduler = {grouped_layout, problem_shape_m};
+        uint32_t problem_shape_m = cute::get<0>(problem_shape_MNKL);
 
-      return {
-        args.mode,
-        problem_shape,
-        args.mainloopargs,
-        args.epilogueargs,
-        hw_info,
-        scheduler,
-        workspace,
-        args.signal
-      };
-
+        return {args.mode, problem_shape,  args.mainloopargs, args.epilogueargs,
+                hw_info,   args.scheduler, workspace,         args.signal};
     }
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        return fmt::format(
+            R"(
 #define FP8_NVRTC
 #include <fp8_gemm.cuh>
 namespace deep_gemm {{
@@ -276,22 +249,26 @@ constexpr int NUM_GROUPS = {};
 constexpr int WARP_M = {};
 constexpr int WARP_N = {};
 constexpr int STAGES = {};
+
+static constexpr GemmType kGemmType = GemmType::{};
+static constexpr KernelType kKernelType = KernelType::{}; //Default;
+static constexpr bool kEnableSboOverlap = {};
+
 using ScaleGranularityShape = cute::Shape<cute::_1,cute::_128,cute::_128>;
 using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(ScaleGranularityShape{{}}));
 using LayoutSFA           = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
 using LayoutSFB           = decltype(ScaleConfig::deduce_layoutSFB());
-static constexpr bool kEnableMultistageOnN = false;
 static constexpr bool kUseNStageKernel = SHAPE_K <= 512 && (SHAPE_N % (BLOCK_N * KernelAiuMultistageOnN::N_EXPAND) == 0)
                                           && (BLOCK_K == 128) && (SHAPE_K % BLOCK_K == 0) && STAGES == 2;
 constexpr int N_EXPAND = kUseNStageKernel ? KernelAiuMultistageOnN::N_EXPAND : 1;
 
 // 根据模板参数定义具体类型
 using TileScheduler = DeepGemmScheduler<
-  GemmType::DenseGemm, 
-  SHAPE_N, 
-  SHAPE_K, 
-  BLOCK_M, 
-  BLOCK_N * N_EXPAND, 
+  kGemmType,
+  SHAPE_N,
+  SHAPE_K,
+  BLOCK_M,
+  BLOCK_N * N_EXPAND,
   NUM_GROUPS
 >;
 
@@ -316,9 +293,6 @@ using         ElementC    = ElementD;
 using         LayoutC     = LayoutD;
 static constexpr int AlignmentC  = AlignmentD;
 
-struct Debug_CollectiveMainloop; 
-
-
 // Core kernel configurations
 using ElementAccumulator  = float;                                          // Element type for internal accumulation
 using ElementCompute      = float;                                          // Element type for epilogue computation
@@ -338,7 +312,7 @@ using EpilogueDispatchPolicy = cutlass::epilogue::EpilogueSimtVectorized;
 using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 using CollectiveEpilogueWithTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
-    Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>, 
+    Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>,
     Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>,
     EpilogueTileType,
     ElementCompute, ElementCompute,
@@ -348,7 +322,6 @@ using CollectiveEpilogueWithTsm = typename cutlass::epilogue::collective::Collec
   >::CollectiveOp;
 
 // Epilogue
-static constexpr bool kEnableSboOverlap = false;
 static constexpr bool IsAligedN = SHAPE_N % BLOCK_N == 0 ? true : false;
 // reduce vreg to use ScaleType::Nothing for alpha=1 & beta=0
 using CollectiveEpilogueNoTsm = typename cutlass::epilogue::collective::DefaultEpilogueNoTsm<
@@ -373,28 +346,22 @@ using GemmKernel = DeepGemmUniversal<
   kUseNStageKernel
 >;
 
-
-
 // Kernel 函数定义
-extern "C" 
-__launch_bounds__(512, 1)
+extern "C"
+__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
 __global__ void {}(
   typename GemmKernel::Params params
 ) {{
   extern __shared__ char smem[];
-  int* grouped_layout = nullptr;
   GemmKernel op;
   op(params, smem);
 }}
 }}
 )",
-        cute::get<1>(args.gemm_args.problem_shape), cute::get<2>(args.gemm_args.problem_shape),
-        args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k,
-        args.launch_info.num_groups, 
-        args.launch_info.warp_m, args.launch_info.warp_n,
-        args.launch_info.num_stages,
-        args.launch_info.kernel_name
-        );
+            cute::get<1>(args.kernel_params.problem_shape), cute::get<2>(args.kernel_params.problem_shape),
+            args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
+            args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
+            args.launch_info.kKernelType, args.launch_info.kEnableSboOverlap, args.launch_info.kernel_name);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -403,19 +370,13 @@ __global__ void {}(
 };
 
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
-static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
-                              const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
-                              const torch::Tensor& out,
-                              const int& m, const int& n, const int& k, std::optional<ConfigTuple> config = std::nullopt, at::cuda::CUDAStream stream = at::cuda::getDefaultCUDAStream()) {
+static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
+                     const torch::Tensor& rhs_scales, const torch::Tensor& out, const int& m, const int& n,
+                     const int& k, std::optional<ConfigTuple> config = std::nullopt) {
+    bool lhs_shape_valid = (lhs_scales.dim() == 2 && lhs_scales.size(0) == m && lhs_scales.size(1) == 1);
 
-    bool lhs_shape_valid = (lhs_scales.dim() == 2 && 
-                           lhs_scales.size(0) == m && 
-                           lhs_scales.size(1) == 1);
-    
-    bool rhs_shape_valid = (rhs_scales.dim() == 2 && 
-                           rhs_scales.size(0) == n && 
-                           rhs_scales.size(1) == 1);
-    
+    bool rhs_shape_valid = (rhs_scales.dim() == 2 && rhs_scales.size(0) == n && rhs_scales.size(1) == 1);
+
     if (lhs_shape_valid && rhs_shape_valid) {
         gemm_a8w8_per_channel_nt(lhs, lhs_scales, rhs, rhs_scales, out, m, n, k, config);
         return;
@@ -427,26 +388,26 @@ static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
         return;
     }
     int num_sms = get_num_sms();
-    
+
     ConfigTuple selected_config;
     if (config.has_value()) {
-      selected_config = *config;
+        selected_config = *config;
     } else {
-      selected_config = deep_gemm_fp8_common::get_best_configs(m, n, k, 1, num_sms);
+        selected_config = deep_gemm_fp8_common::get_best_configs(m, n, k, 1, num_sms);
     }
-    
+
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
     auto SMSIZE = std::get<0>(smem_config);
-    // std::cout << "num_sms_new is " << num_sms_new << " block_m is " << block_m << " block_n is " << block_n << " block_k is " << block_k << std::endl;
-    // std::cout << " warp_m is " << warp_m << " warp_n is " << warp_n << " num_stages is " << num_stages << " SMSIZE is " << SMSIZE << std::endl;
     uint32_t kNumGroups = 1;
-    
+
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     using StrideB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
-    using ScaleGranularityShape = cute::Shape<cute::_1,cute::_128,cute::_128>;
-    using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(ScaleGranularityShape{}));
-    using LayoutSFA           = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
-    using LayoutSFB           = decltype(ScaleConfig::deduce_layoutSFB());
+    using ScaleGranularityShape = cute::Shape<cute::_1, cute::_128, cute::_128>;
+    using ScaleConfig =
+        decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(
+            ScaleGranularityShape{}));
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA()); // Layout type for SFA matrix operand
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
     static constexpr bool kEnableMultistageOnN = false;
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
@@ -463,19 +424,22 @@ static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
     static constexpr GemmType kGemmType = GemmType::DenseGemm;
     constexpr static bool kIsNoPadPreprocessLayout = kGemmType == GemmType::GroupedNoPad && kNumGroups >= 128;
     if (kIsNoPadPreprocessLayout) {
-      uint32_t block_size = std::max(32, next_power_of_two(kNumGroups));
-      auto compute_block_info_args = ComputeBlockInfoKernelRuntime::Args{
-        .launch_attr_args = {reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info)},
-        .launch_args = {1, block_size, 0},
-      };
-      const auto& code_blockinfo = ComputeBlockInfoKernelRuntime::generate(block_m);
-      const auto& runtime_blockinfo = compiler->build("computeBlockInfoKernel", code_blockinfo);
-      ComputeBlockInfoKernelRuntime::launch(runtime_blockinfo, compute_block_info_args);
+        uint32_t block_size = std::max(32, next_power_of_two(kNumGroups));
+        auto compute_block_info_args = ComputeBlockInfoKernelRuntime::Args{
+            .launch_attr_args = {reinterpret_cast<const uint32_t*>(grouped_layout), 256,
+                                 reinterpret_cast<uint32_t*>(block_m_info)},
+            .launch_args = {1, block_size, 0},
+        };
+        const auto& code_blockinfo = ComputeBlockInfoKernelRuntime::generate(block_m);
+        const auto& runtime_blockinfo = compiler->build("computeBlockInfoKernel", code_blockinfo);
+        ComputeBlockInfoKernelRuntime::launch(runtime_blockinfo, compute_block_info_args);
     }
 
-    cutlass::float_e4m3_t* converted_input_b = reinterpret_cast<cutlass::float_e4m3_t*>(rhs.data_ptr<at::Float8_e4m3fn>());
-    cutlass::float_e4m3_t* converted_input_a = reinterpret_cast<cutlass::float_e4m3_t*>(lhs.data_ptr<at::Float8_e4m3fn>());
-    cutlass::bfloat16_t * converted_output = reinterpret_cast<cutlass::bfloat16_t *>(out.data_ptr<at::BFloat16>());
+    cutlass::float_e4m3_t* converted_input_b =
+        reinterpret_cast<cutlass::float_e4m3_t*>(rhs.data_ptr<at::Float8_e4m3fn>());
+    cutlass::float_e4m3_t* converted_input_a =
+        reinterpret_cast<cutlass::float_e4m3_t*>(lhs.data_ptr<at::Float8_e4m3fn>());
+    cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
     float* scales_a_ptr = lhs_scales_aligned.data_ptr<float>();
     float* scales_b_ptr = rhs_scales.data_ptr<float>();
     cutlass::KernelHardwareInfo hw_info;
@@ -483,55 +447,60 @@ static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
     hw_info.sm_count = num_sms_new;
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.sm_count);
-    const auto gemm_args = PPU10500FP8GemmRuntime::GemmArguments{
-      .mode = cutlass::gemm::GemmUniversalMode::kGemm,
-      .problem_shape = {m, n, k, 1},
-      .mainloopargs = {converted_input_a, stride_A, converted_input_b, stride_B, 4,
-        scales_a_ptr, layout_SFA, scales_b_ptr, layout_SFB},
-      .epilogueargs = {
-        {1, 0},
-        nullptr, stride_D,
-        converted_output, stride_D,
-      },
-      .hw_info = hw_info,
-      .scheduler = {},
-      .signal = nullptr
-    };
+    const auto gemm_args = FP8GemmRuntime::GemmArguments{
+        .mode = cutlass::gemm::GemmUniversalMode::kGemm,
+        .problem_shape = {m, n, k, 1},
+        .mainloopargs = {converted_input_a, stride_A, converted_input_b, stride_B, 4,
+                        scales_a_ptr, layout_SFA, scales_b_ptr, layout_SFB},
+        .epilogueargs =
+            {
+                {1, 0},
+                nullptr,
+                stride_D,
+                converted_output,
+                stride_D,
+            },
+        .hw_info = hw_info,
+        .scheduler = {(uint32_t)m, grouped_layout},
+        .signal = nullptr};
 
-    PPU10500FP8GemmRuntime::GemmKernelParams params = PPU10500FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr, grouped_layout);
-    // if(get_fp8_tample_params_size() != sizeof(PPU10500FP8GemmRuntime::GemmKernelParams)) {
-    //   std::cout << "\n the params size is not right, please check.\n" << std::endl;
-    //   std::cout << get_fp8_tample_params_size() << std::endl;
-    //   std::cout << "\n sizeof(PPU10500FP8GemmRuntime::GemmKernelParams)" << sizeof(PPU10500FP8GemmRuntime::GemmKernelParams) <<  std::endl;
-    // }
-    auto args = PPU10500FP8GemmRuntime::Args{
-      .gemm_args = gemm_args,
-      .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "fp8_deep_gemm"},
-      .launch_args = {grid, block, SMSIZE},
-      .kernel_params = params
-    };
-    const auto& code = PPU10500FP8GemmRuntime::generate(args);
+    FP8GemmRuntime::GemmKernelParams params = FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
+
+    auto args = FP8GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
+                                                     "DenseGemm", "Default", "fp8_deep_gemm", false},
+                                     .launch_args = {grid, block, SMSIZE},
+                                     .kernel_params = params};
+
+    const auto& code = FP8GemmRuntime::generate(args);
     const auto& runtime = compiler->build("fp8_deep_gemm", code, block.x, SMSIZE);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
-    CUresult result = cuOccupancyMaxActiveBlocksPerMultiprocessor(
-      &blocks_per_cu,
-      kernel,
-      block.x,
-      SMSIZE
-      );
+    CUresult result = cuOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
     args.launch_args.grid_dim.x *= blocks_per_cu;
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()){
-        dg_prof_params.set_params(
-            kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, 0,
-            grouped_layout, stream
-        );
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, 0, grouped_layout,
+                                  at::cuda::getCurrentCUDAStream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
-    PPU10500FP8GemmRuntime::launch(runtime, args);
+    FP8GemmRuntime::launch(runtime, args);
 
     ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+    char* pEnv_params = std::getenv("show_log");
+    if (pEnv_params && isdigit(*pEnv_params)) {
+        int numRegs = 0, localSize = 0;
+        cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+        cuFuncGetAttribute(&localSize, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+
+        printf("[DenseGemm_FP8:]\n");
+        printf("group:%d, problem:[%d, %d, %d]\n", kNumGroups, m, n, k);
+        printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
+               args.launch_args.grid_dim.x);
+        printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n, block_k,
+               warp_m, warp_n, block_k, num_stages);
+        printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
+    }
 }
 } // namespace deep_gemm

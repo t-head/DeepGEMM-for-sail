@@ -19,6 +19,33 @@
 // namespace cutlass::gemm::kernel {
 namespace deep_gemm {
 using cutlass::KernelHardwareInfo;
+struct TileSchedulerArguments
+{
+    int* grouped_layout;
+    uint32_t shape_m;
+
+    //
+    // Methods
+    //
+
+    /// Ctor
+    CUTLASS_HOST_DEVICE
+    TileSchedulerArguments()
+        : grouped_layout(nullptr)
+        , shape_m(0)
+    {
+    }
+
+    /// Ctor
+    CUTLASS_HOST_DEVICE
+    TileSchedulerArguments(uint32_t shape_m, int* grouped_layout_ptr = nullptr)
+        : grouped_layout(grouped_layout_ptr)
+        , shape_m(shape_m)
+    {
+    }
+
+};
+using TileSchedulerParams = TileSchedulerArguments;
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
@@ -51,35 +78,8 @@ struct DeepGemmScheduler {
 
     // Only used for masked layout
     uint32_t curr_group_idx, curr_cumsum, curr_cumsum_blocks, curr_group_m, curr_cumsum_m;
-
-    struct Arguments
-    {
-        int* grouped_layout;
-        uint32_t shape_m;
-
-        //
-        // Methods
-        //
-
-        /// Ctor
-        CUTLASS_HOST_DEVICE
-        Arguments()
-            : grouped_layout(nullptr)
-            , shape_m(0)
-        {
-        }
-
-        /// Ctor
-        CUTLASS_HOST_DEVICE
-        Arguments(uint32_t shape_m, int* grouped_layout_ptr = nullptr)
-            : grouped_layout(grouped_layout_ptr)
-            , shape_m(shape_m)
-        {
-        }
-
-    };
-
-    using Params = Arguments;
+    using Arguments = TileSchedulerArguments;
+    using Params = TileSchedulerParams;
     Params const& params;
 
     CUTLASS_DEVICE explicit DeepGemmScheduler(Params const& params_, const int warp_group_id = 0) : params(params_), current_iter(warp_group_id) {

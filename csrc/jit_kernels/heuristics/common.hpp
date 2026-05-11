@@ -9,15 +9,24 @@
 
 namespace deep_gemm {
 
-int ceil_div(int a, int b) { return (a + b - 1) / b; }
-int gcd(int a, int b) { while (b != 0) { int temp = b; b = a % b; a = temp; } return a; }
+int ceil_div(int a, int b) {
+    return (a + b - 1) / b;
+}
+int gcd(int a, int b) {
+    while (b != 0) {
+        int temp = b;
+        b = a % b;
+        a = temp;
+    }
+    return a;
+}
 
 struct MulticastConfig {
     int num_multicast;
     bool is_multicast_on_a;
 
-    MulticastConfig(const int& num_multicast, const bool& is_multicast_on_a):
-        num_multicast(num_multicast), is_multicast_on_a(is_multicast_on_a) {
+    MulticastConfig(const int& num_multicast, const bool& is_multicast_on_a)
+        : num_multicast(num_multicast), is_multicast_on_a(is_multicast_on_a) {
         DG_HOST_ASSERT(1 <= num_multicast and num_multicast <= 2);
     }
 };
@@ -40,8 +49,7 @@ struct ThreadConfig {
     int num_non_epilogue_threads;
     int num_epilogue_threads;
 
-    static ThreadConfig sm90(const int& num_tma_threads,
-                             const int& num_math_threads) {
+    static ThreadConfig sm90(const int& num_tma_threads, const int& num_math_threads) {
         auto config = ThreadConfig();
         config.num_threads = num_tma_threads + num_math_threads;
         config.num_tma_threads = num_tma_threads;
@@ -49,8 +57,7 @@ struct ThreadConfig {
         return config;
     }
 
-    static ThreadConfig sm100(const int& num_non_epilogue_threads,
-                              const int& num_epilogue_threads) {
+    static ThreadConfig sm100(const int& num_non_epilogue_threads, const int& num_epilogue_threads) {
         auto config = ThreadConfig();
         config.num_threads = num_non_epilogue_threads + num_epilogue_threads;
         config.num_non_epilogue_threads = num_non_epilogue_threads;
@@ -80,8 +87,7 @@ struct ThreadConfig {
 //     ThreadConfig thread_config;
 // };
 
-static bool is_multicast_legal(const int& shape_dim, const int& block_dim,
-                               const int& num_multicast, const int& num_sms,
+static bool is_multicast_legal(const int& shape_dim, const int& block_dim, const int& num_multicast, const int& num_sms,
                                const bool& require_divisible) {
     const bool& divisible = ceil_div(shape_dim, block_dim) % num_multicast == 0 or not require_divisible;
     return divisible and num_sms % num_multicast == 0;
@@ -91,13 +97,12 @@ template <typename size_type_t>
 static int get_swizzle_mode(const int& block_size, const size_type_t& elem_size) {
     // `> 0` means interleaving
     // 16B actually means non-swizzling (but interleaving)
-    for (const int& mode: {128, 64, 32, 16}) {
+    for (const int& mode : {128, 64, 32, 16}) {
         if ((block_size * static_cast<int>(elem_size)) % mode == 0)
             return mode;
     }
     DG_HOST_UNREACHABLE("Unreachable");
 }
-
 
 std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, int block_n, int block_k = 128) {
     // Try swizzle first, as it does not waste shared memory
@@ -120,24 +125,24 @@ std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, in
 }
 
 int get_smem_occ(int block_m, int block_n, int block_k, int num_stages) {
-    if (block_m == 0) {  // Assuming 0 represents None in this context
+    if (block_m == 0) { // Assuming 0 represents None in this context
         return 0;
     }
-    
+
     // use static suppose.
     const int ppu_capacity = 262144;
     const int bpp = 1;
-    
+
     int smem_d = block_m * block_n;
     int smem_a_per_stage = block_m * block_k;
     int smem_b_per_stage = block_n * block_k;
-    
+
     int smem_size_d = smem_d * 2;
     int smem_size_a = num_stages * smem_a_per_stage * bpp;
     int smem_size_b = num_stages * smem_b_per_stage * bpp;
-    
+
     int smem_size = std::max(smem_size_d, smem_size_a + smem_size_b);
-    
+
     return ppu_capacity / smem_size;
 }
 
@@ -145,20 +150,24 @@ using ConfigResult = std::tuple<int, int, int, int, int, int, int, std::tuple<in
 ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num_sms) {
     std::vector<int> block_ms = {256, 192, 128, 64};
     std::vector<int> block_ns = {256, 128, 64};
-    
-    auto fix_wave_saturate = [num_sms](int x) -> int { return x == 0 ? num_sms : x; };
-    
+
+    auto fix_wave_saturate = [num_sms](int x) -> int {
+        return x == 0 ? num_sms : x;
+    };
+
     auto get_num_waves = [m, n, num_groups, num_sms](int bm, int bn) -> int {
-        if (bm == 0) return 0;
+        if (bm == 0)
+            return 0;
         return ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms);
     };
-    
+
     auto get_last_wave_util = [m, n, num_groups, num_sms, fix_wave_saturate](int bm, int bn) -> int {
         return fix_wave_saturate((ceil_div(m, bm) * ceil_div(n, bn) * num_groups) % num_sms);
     };
-    
+
     auto get_block_utils = [](int dim, int bm) -> double {
-        if (bm == 0) return 0.0;
+        if (bm == 0)
+            return 0.0;
         if (dim % bm != 0) {
             return ((dim / double(bm)) / ((dim + bm - 1) / bm));
         } else {
@@ -166,14 +175,16 @@ ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num
         }
     };
 
-    int best_block_m = 0, best_block_n = 0;    
+    int best_block_m = 0, best_block_n = 0;
     for (int block_m : block_ms) {
         for (int block_n : block_ns) {
-            // Filter condition: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32) and not (block_m == 128 and bn == 128))
-            if (!((block_m <= 128 || block_n <= 128) && (block_n != n && n >= 32) && !(block_m == 128 && block_n == 128))) {
+            // Filter condition: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32) and not (block_m == 128 and bn
+            // == 128))
+            if (!((block_m <= 128 || block_n <= 128) && (block_n != n && n >= 32) &&
+                  !(block_m == 128 && block_n == 128))) {
                 continue;
             }
-            
+
             bool success = false;
             int num_waves = get_num_waves(block_m, block_n);
             int best_num_waves = get_num_waves(best_block_m, best_block_n);
@@ -181,7 +192,7 @@ ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num
             double best_num_utils = get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n);
             int num_occ = get_smem_occ(block_m, block_n, 128, 2);
             int best_num_occ = get_smem_occ(best_block_m, best_block_n, 128, 2);
-            
+
             if (best_block_m == 0 || best_block_n == 0) {
                 success = true;
             } else if (num_waves < best_num_waves) {
@@ -196,7 +207,7 @@ ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num
                     success |= (block_m != best_block_m && block_n > best_block_n);
                 }
             }
-            
+
             if (success) {
                 best_block_m = block_m;
                 best_block_n = block_n;
@@ -207,23 +218,23 @@ ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num
         best_block_m = 192;
         best_block_n = 256;
     }
-    
+
     int best_num_stages = 0;
     std::tuple<int, int, int> best_smem_config;
     int ppu_capacity = 262144;
     int block_k = 128;
-    
+
     std::vector<int> stage_candidates;
     for (int s : {4, 3, 2}) {
         if (s <= k / block_k) {
             stage_candidates.push_back(s);
         }
     }
-    
+
     if (stage_candidates.empty() || (128 % best_block_n != 0 && 128 / gcd(128, best_block_n) <= 4)) {
         stage_candidates = {4, 3, 2};
     }
-    
+
     int best_occ = 0;
     for (int num_stages : stage_candidates) {
         best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k);
@@ -233,29 +244,29 @@ ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num
             break;
         }
     }
-    assert(best_smem_config.index() != 0 || std::get<0>(best_smem_config) != 0); // Check that best_smem_config is not null
+    assert(best_smem_config.index() != 0 ||
+           std::get<0>(best_smem_config) != 0); // Check that best_smem_config is not null
     assert(best_num_stages != 0);
     int num_waves_final = get_num_waves(best_block_m, best_block_n);
     int num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves_final);
     assert(num_min_sms <= num_sms);
-    
+
     int warp_m = best_block_m / 4;
     int warp_n = best_block_n / 4;
-    
+
     if (best_block_m == 64 && best_block_n == 256) {
         warp_m = 32;
         warp_n = 32;
     }
-    
-    ConfigResult result = std::make_tuple(num_min_sms, best_block_m, best_block_n, block_k, 
-                                         warp_m, warp_n, best_num_stages, best_smem_config);
+
+    ConfigResult result = std::make_tuple(num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n,
+                                          best_num_stages, best_smem_config);
     return result;
 }
 
-
-
 static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
-                             bool is_grouped_contiguous = false, bool is_grouped_masked = false, int max_block_n = 256) {
+                                     bool is_grouped_contiguous = false, bool is_grouped_masked = false,
+                                     int max_block_n = 256) {
     if (num_groups == 1 && is_grouped_contiguous == false && is_grouped_masked == false) {
         auto result = get_best_configs_dense(m, n, k, num_groups, num_sms);
         return result;
@@ -275,12 +286,15 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
     bit_length = 32 - __builtin_clz(static_cast<unsigned>(max_block_n));
     std::vector<int> block_ns;
     for (int exp = bit_length - 1; exp > 4; --exp) {
-        block_ns.push_back(1 << exp);  // 2^exp
+        block_ns.push_back(1 << exp); // 2^exp
     }
-    auto fix_wave_saturate = [num_sms](int x) -> int { return x == 0 ? num_sms : x; };
+    auto fix_wave_saturate = [num_sms](int x) -> int {
+        return x == 0 ? num_sms : x;
+    };
 
     auto get_num_waves = [m, n, num_groups, num_sms](int bm, int bn) -> int {
-        if (bm == 0) return 0;
+        if (bm == 0)
+            return 0;
         return ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms);
     };
 
@@ -289,7 +303,8 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
     };
 
     auto get_block_utils = [](int m, int bm) -> double {
-        if (bm == 0) return 0.0;
+        if (bm == 0)
+            return 0.0;
         if (m % bm != 0) {
             return ((m / double(bm)) / ((m + bm - 1) / bm));
         } else {
@@ -303,10 +318,11 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
     for (int block_m : block_ms) {
         for (int block_n : block_ns) {
             // Filter condition: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32))
-            if (!((block_m <= 128 || block_n <= 128) && (block_n != n && n >= 32)) || (block_m == 16 and block_n <= 32)) {
+            if (!((block_m <= 128 || block_n <= 128) && (block_n != n && n >= 32)) ||
+                (block_m == 16 and block_n <= 32)) {
                 continue;
             }
-            
+
             bool success = false;
             int num_waves = get_num_waves(block_m, block_n);
             int best_num_waves = get_num_waves(best_block_m, best_block_n);
@@ -314,7 +330,7 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
             double best_num_utils = get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n);
             int num_occ = get_smem_occ(block_m, block_n, 128, 2);
             int best_num_occ_current = get_smem_occ(best_block_m, best_block_n, 128, 2);
-            
+
             if (best_block_m == 0 || best_block_n == 0) {
                 success = true;
             } else if (m < 64 || n < 512) {
@@ -340,7 +356,7 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
                     success |= (block_m != best_block_m && block_n > best_block_n);
                 }
             }
-            
+
             if (success) {
                 best_block_m = block_m;
                 best_block_n = block_n;
@@ -358,12 +374,12 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
             best_block_n = 128;
         }
     }
-    
+
     int best_num_stages = 0;
     std::tuple<int, int, int> best_smem_config;
     int ppu_capacity = 262144;
     int block_k = 128;
-    
+
     std::vector<int> stage_candidates;
     for (int s : {7, 6, 5, 4, 3, 2}) {
         if (s <= k / block_k) {
@@ -371,10 +387,11 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
         }
     }
 
-    if (stage_candidates.empty() || (128 % best_block_n != 0 && 128 / gcd(128, best_block_n) <= 4) || best_block_m == 16 || best_block_m == 32) {
-            stage_candidates = {4, 3, 2};
-        }
-    
+    if (stage_candidates.empty() || (128 % best_block_n != 0 && 128 / gcd(128, best_block_n) <= 4) ||
+        best_block_m == 16 || best_block_m == 32) {
+        stage_candidates = {4, 3, 2};
+    }
+
     int best_occ = 0;
     for (int num_stages : stage_candidates) {
         best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k);
@@ -393,10 +410,10 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
 
     int num_waves_final = get_num_waves(best_block_m, best_block_n);
     int num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves_final);
-    
+
     int warp_m = best_block_m / 2;
     int warp_n = best_block_n / 2;
-    
+
     if (best_block_m == 32 && best_block_n >= 64) {
         warp_m = best_block_m / 2;
         best_block_n = best_block_n == 128 ? 64 : best_block_n;
@@ -419,9 +436,9 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
         warp_m = best_block_m != 32 ? best_block_m / 2 : best_block_m;
         warp_n = best_block_n / 4;
     }
-    
-    ConfigResult result = std::make_tuple(num_min_sms, best_block_m, best_block_n, block_k, 
-                                         warp_m, warp_n, best_num_stages, best_smem_config);
+
+    ConfigResult result = std::make_tuple(num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n,
+                                          best_num_stages, best_smem_config);
     return result;
 }
 

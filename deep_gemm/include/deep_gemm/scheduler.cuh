@@ -1,6 +1,6 @@
 #pragma once
 
-#include "utils.cuh"
+#include "utils_rtc.cuh"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/matrix_coord.h"

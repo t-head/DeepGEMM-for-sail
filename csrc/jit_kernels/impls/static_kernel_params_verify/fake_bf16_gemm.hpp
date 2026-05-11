@@ -1,3 +1,4 @@
+namespace deep_gemm_bf16_common {
 #define FP8_NVRTC
 #include <../../../deep_gemm/include/deep_gemm/bf16_gemm_cutlass3.cuh>
 namespace deep_gemm {
@@ -127,4 +128,5 @@ static size_t get_bf16_tample_params_size() {
   return sizeof(GemmKernel::Params);
   
   }
+}
 }

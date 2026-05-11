@@ -382,7 +382,6 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
 
         args = (lhs, lhs_scales, rhs, rhs_scales, out, m_rows, block_m_info, m, expected_m,
             torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
-
         runtime = jit_tuner.compile_and_tune(
             name='m_grouped_gemm_' + ElementAB + '_nt',
             keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,

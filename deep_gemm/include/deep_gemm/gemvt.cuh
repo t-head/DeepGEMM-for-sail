@@ -106,7 +106,7 @@ template <typename src_type, typename dst_type, typename acc_type,
           typename load_atype, typename load_btype,
           int BlockSize, int ThreadPerN = 32, int NPerThread = 1, int NUM_UNROLL=1,
           int GROUP_SIZE_M = 1, int Stages = 2>
-__global__ void batched_gemvt_kernel_small_k(const GemvtArgs args) {
+__device__ void batched_gemvt_kernel_small_k_impl(const GemvtArgs args) {
   constexpr int WarpsPerN = ThreadPerN / WARP_SIZE;
   constexpr int WarpCount = BlockSize / WARP_SIZE;
   constexpr int NPerBlock = NPerThread * BlockSize / ThreadPerN;
@@ -249,8 +249,17 @@ __global__ void batched_gemvt_kernel_small_k(const GemvtArgs args) {
 template <typename src_type, typename dst_type, typename acc_type,
           typename load_atype, typename load_btype,
           int BlockSize, int ThreadPerN = 32, int NPerThread = 1, int NUM_UNROLL=1,
+          int GROUP_SIZE_M = 1, int Stages = 2>
+__global__ void batched_gemvt_kernel_small_k(const GemvtArgs args) {
+    batched_gemvt_kernel_small_k_impl<src_type, dst_type, acc_type, load_atype, load_btype,
+        BlockSize, ThreadPerN, NPerThread, NUM_UNROLL, GROUP_SIZE_M, Stages>(args);
+}
+
+template <typename src_type, typename dst_type, typename acc_type,
+          typename load_atype, typename load_btype,
+          int BlockSize, int ThreadPerN = 32, int NPerThread = 1, int NUM_UNROLL=1,
           int GROUP_SIZE_M = 1>
-__global__ void batched_gemvt_kernel(const GemvtArgs args) {
+__device__ void batched_gemvt_kernel_impl(const GemvtArgs args) {
     constexpr int BlockM = 1;
     constexpr int WarpsPerN = ThreadPerN / WARP_SIZE;
     //   constexpr const int NPerThread = 1;
@@ -376,6 +385,15 @@ __global__ void batched_gemvt_kernel(const GemvtArgs args) {
             }
         }
     }
+}
+
+template <typename src_type, typename dst_type, typename acc_type,
+          typename load_atype, typename load_btype,
+          int BlockSize, int ThreadPerN = 32, int NPerThread = 1, int NUM_UNROLL=1,
+          int GROUP_SIZE_M = 1>
+__global__ void batched_gemvt_kernel(const GemvtArgs args) {
+    batched_gemvt_kernel_impl<src_type, dst_type, acc_type, load_atype, load_btype,
+        BlockSize, ThreadPerN, NPerThread, NUM_UNROLL, GROUP_SIZE_M>(args);
 }
 
 template <typename src_type, typename dst_type, typename acc_type,
