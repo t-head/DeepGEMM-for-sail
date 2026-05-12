@@ -4,10 +4,7 @@ from typing import Tuple
 
 import deep_gemm
 from bench import *
-from utils import (
-    test_mqa_logits, test_paged_mqa_logits, set_acc_check,
-    test_fp8_fp4_mqa_logits, test_fp8_fp4_paged_mqa_logits,
-)
+from utils import test_mqa_logits, test_paged_mqa_logits, set_acc_check
 from deep_gemm.jit_kernels.utils import is_ppu1v5_device
 
 
@@ -61,12 +58,13 @@ def test_mqa_logits_loop():
     print('Testing MQA Logits:')
     qk_dtype_list = [torch.bfloat16, torch.int8]
     if is_ppu1v5_device():
-        qk_dtype_list.append(torch.float8_e4m3fn)
+        qk_dtype_list.extend([torch.float8_e4m3fn, torch.uint8]) # fp8, fp4
     num_heads, head_dim = 64, 128
     for qk_dtype in qk_dtype_list:
         for seq_len in (2048, 4096):
-            # deepseek v3.2 (64, 128), glm5 (32, 128)
+            # deepseek (64, 128), glm5 (32, 128)
             for num_heads, head_dim in [(32, 128), (64, 128)]:
+                if qk_dtype == torch.uint8 and (num_heads != 64 or head_dim != 128): continue
                 for seq_len_kv in (4096, 8192, 16384, 32768, 65536, 131072):
                     do_check = (seq_len_kv < 32768)
                     # Call test_mqa_logits with the parameters
@@ -79,6 +77,9 @@ def test_mqa_logits_loop():
                     }
                     set_acc_check(do_check)
                     test_mqa_logits(args)
+                    if qk_dtype == torch.uint8: # fp4 bf16 output
+                        args['logits_dtype'] = torch.bfloat16
+                        test_mqa_logits(args)
 
     print("Passed\n")
 
@@ -87,12 +88,13 @@ def test_paged_mqa_logits_loop():
     print('Testing Paged MQA Logits:')
     qk_dtype_list = [torch.bfloat16, torch.int8]
     if is_ppu1v5_device():
-        qk_dtype_list.append(torch.float8_e4m3fn)
+        qk_dtype_list.extend([torch.float8_e4m3fn, torch.uint8]) # fp8, fp4
     for qk_dtype in qk_dtype_list:
         for batch_size, next_n in [(1, 1), (64, 1), (64, 2), (128, 1)]:
-            # deepseek v3.2 (64, 128), glm5 (32, 128)
+            # deepseek (64, 128), glm5 (32, 128)
             for num_heads, head_dim in [(32, 128), (64, 128)]:
                 if next_n == 2 and num_heads == 32: continue
+                if qk_dtype == torch.uint8 and (num_heads != 64 or head_dim != 128): continue
                 for avg_kv in (8192, 32768):
                     do_check = (avg_kv < 32768)
                     # Call test_paged_mqa_logits with the parameters
@@ -106,6 +108,9 @@ def test_paged_mqa_logits_loop():
                     }
                     set_acc_check(do_check)
                     test_paged_mqa_logits(args)
+                    if qk_dtype == torch.uint8:  # fp4 bf16 output
+                        args['logits_dtype'] = torch.bfloat16
+                        test_paged_mqa_logits(args)
 
     for args in [
         # context_len = 0
@@ -166,78 +171,6 @@ def test_nvtx():
     print("Passed\n")
 
 
-def test_fp8_fp4_mqa_logits_loop():
-    print('Testing fp8_fp4_mqa_logits:')
-    if not is_ppu1v5_device():
-        print(' > Skipped: fp8_fp4_mqa_logits is only supported on PPU 1.5 devices.')
-        return
-    # FP8 path: one case, just for testing api
-    for logits_dtype in [torch.float32, torch.bfloat16]:
-        for seq_len in [4096]:
-            for seq_len_kv in [8192]:
-                for num_heads, head_dim in [(64, 128)]:
-                    args = {
-                        'data_type': torch.float8_e4m3fn,
-                        'seq_len_q': seq_len,
-                        'seq_len_kv': seq_len_kv,
-                        'num_heads': num_heads,
-                        'head_dim': head_dim,
-                        'logits_dtype': logits_dtype,
-                    }
-                    set_acc_check(True)
-                    test_fp8_fp4_mqa_logits(args)
-    # FP4 path (kernel TODO, will skip inside test_fp8_fp4_mqa_logits)
-    for num_heads, head_dim in [(32, 128), (64, 128)]:
-        args = {
-            'data_type': torch.uint8,
-            'seq_len_q': 2048,
-            'seq_len_kv': 4096,
-            'num_heads': num_heads,
-            'head_dim': head_dim,
-        }
-        set_acc_check(False)
-        test_fp8_fp4_mqa_logits(args)
-    print('Passed\n')
-
-
-def test_fp8_fp4_paged_mqa_logits_loop():
-    print('Testing fp8_fp4_paged_mqa_logits:')
-    if not is_ppu1v5_device():
-        print(' > Skipped: fp8_fp4_paged_mqa_logits is only supported on PPU 1.5 devices.')
-        return
-    # FP8 path: one case, just for testing api
-    for logits_dtype in [torch.float32, torch.bfloat16]:
-        for batch_size, next_n in [(64, 1)]:
-            for num_heads, head_dim in [(64, 128)]:
-                for avg_kv in (8192,):
-                    args = {
-                        'data_type': torch.float8_e4m3fn,
-                        'batch_size': batch_size,
-                        'next_n': next_n,
-                        'avg_context_len': avg_kv,
-                        'num_heads': num_heads,
-                        'head_dim': head_dim,
-                        'logits_dtype': logits_dtype,
-                    }
-                    set_acc_check(True)
-                    test_fp8_fp4_paged_mqa_logits(args)
-    # FP4 path (kernel TODO, will skip inside test_fp8_fp4_paged_mqa_logits)
-    for num_heads, head_dim in [(32, 128), (64, 128)]:
-        args = {
-            'data_type': torch.uint8,
-            'batch_size': 1,
-            'next_n': 1,
-            'avg_context_len': 8192,
-            'num_heads': num_heads,
-            'head_dim': head_dim,
-        }
-        set_acc_check(False)
-        test_fp8_fp4_paged_mqa_logits(args)
-    print('Passed\n')
-
-
-
-
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -249,5 +182,3 @@ if __name__ == '__main__':
 
     test_mqa_logits_loop()
     test_paged_mqa_logits_loop()
-    test_fp8_fp4_mqa_logits_loop()
-    test_fp8_fp4_paged_mqa_logits_loop()

@@ -11,6 +11,7 @@ def align(value, alignment):
 
 # C++ code templates
 includes = ('"../deep_gemm/ppu_mqa_logits.cuh"', )
+includes_fp4_mqa = ('"../deep_gemm/fp4_mqa_logits.cuh"', )
 template = """
 using namespace deep_gemm;
 
@@ -31,6 +32,30 @@ using atten_t = Attention<ElementQK, ElementAcc, kNumHeads, kHeadDim, BLOCK_QH, 
 
 // Launch kernel
 atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, (uint32_t*)cu_seq_len_k_start, (uint32_t*)cu_seq_len_k_end, logits,
+             seq_len_q, seq_len_k, aligned_seq_len_kv, stream, num_sms);
+"""
+
+template_fp4_mqa = """
+using namespace deep_gemm;
+// Templated args from Python JIT call
+using ElementQK = {ElementQK};          // uint8_t (packed FP4)
+using ElementAcc = {ElementAcc};
+using ElementLogits = {ElementLogits};  // float or __nv_bfloat16
+constexpr int kNumHeads = {kNumHeads};
+constexpr int kHeadDim = {kHeadDim};       // packed head_dim (64)
+constexpr int BLOCK_QH = {BLOCK_QH};
+constexpr int BLOCK_KV = {BLOCK_KV};
+constexpr int WARP_QH = {WARP_QH};
+constexpr int WARP_KV = {WARP_KV};
+constexpr int kNumQStages = {kNumQStages};
+constexpr int kNumKVStages = {kNumKVStages};
+
+// Make a templated GEMM
+using atten_t = AttentionFP4<ElementQK, ElementAcc, ElementLogits, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages>;
+
+// Launch kernel
+atten_t::run((const ElementQK*)q, (const uint32_t*)q_sf, (const ElementQK*)k, (const uint32_t*)k_sf, weights,
+             cu_seq_len_k_start, cu_seq_len_k_end, logits,
              seq_len_q, seq_len_k, aligned_seq_len_kv, stream, num_sms);
 """
 
@@ -197,7 +222,116 @@ def int8_mqa_logits(q: torch.Tensor,
     return mqa_logits_common(q, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
 
 
+def fp4_mqa_logits(q: torch.Tensor,
+                   q_sf: torch.Tensor,
+                   k: torch.Tensor,
+                   k_sf: torch.Tensor,
+                   weights: torch.Tensor,
+                   cu_seq_len_k_start: torch.Tensor,
+                   cu_seq_len_k_end: torch.Tensor,
+                   clean_logits: bool = True,
+                   logits_dtype: torch.dtype = torch.float32):
+    """FP4 MQA logits (non-paged).
+
+    Args:
+        q:     packed FP4 Q, int8 [seq_len_q, num_heads, head_dim_packed]
+               where head_dim_packed = original_head_dim // 2 = 64
+        q_sf:  UE8M0 scale for Q, int32 [seq_len_q, num_heads]
+               Packed from uint8 e8m0 (4\u00d7uint8 per int32)
+        k:     packed FP4 K, uint8 [seq_len_k, head_dim_packed]
+        k_sf:  UE8M0 scale for K, int32 [seq_len_k]
+        weights:      float32 [seq_len_q, num_heads]
+        cu_seq_len_k_start: int32 [seq_len_q]
+        cu_seq_len_k_end:   int32 [seq_len_q]
+        clean_logits: whether to mask out-of-range logits with -inf
+        logits_dtype: output logits dtype, torch.float32 or torch.bfloat16
+    """
+    assert(logits_dtype in (torch.float32, torch.bfloat16))
+    seq_len_q, num_heads, head_dim_packed = q.shape
+    seq_len_k, head_dim_packed_ = k.shape
+    seq_len_k_ = k_sf.shape[0]
+    seq_len_q__, num_heads_ = weights.shape
+
+    assert(head_dim_packed == head_dim_packed_ and head_dim_packed == 64)
+    assert(num_heads == num_heads_)
+    assert(seq_len_q == seq_len_q__)
+    assert(seq_len_k == seq_len_k_)
+    assert(cu_seq_len_k_start.size(0) == seq_len_q)
+    assert(cu_seq_len_k_end.size(0) == seq_len_q)
+
+    assert(q.is_contiguous() and k.is_contiguous())
+    assert(q_sf.is_contiguous() and k_sf.is_contiguous())
+    assert(weights.is_contiguous())
+    assert(cu_seq_len_k_start.is_contiguous() and cu_seq_len_k_end.is_contiguous())
+
+    assert(q.dtype == torch.int8)
+    assert(k.dtype == torch.int8)
+    assert(q_sf.dtype == torch.int32)
+    assert(k_sf.dtype == torch.int32)
+    assert(weights.dtype == torch.float32)
+    assert(cu_seq_len_k_start.dtype == torch.int32)
+    assert(cu_seq_len_k_end.dtype == torch.int32)
+
+    # Default tile config for FP4 non-paged MQA logits
+    block_qh = num_heads * 4
+    block_kv = 256
+    warp_qh = num_heads       # 1 Q row per warp in head dimension
+    warp_kv = 64
+    num_q_stages, num_kv_stages = 1, 3
+    block_q = block_qh // num_heads
+    assert(block_qh % num_heads == 0)
+
+    seq_len_alignment = 4
+    assert(seq_len_alignment % block_q == 0)
+    aligned_seq_len = align(seq_len_q, seq_len_alignment)
+    aligned_seq_len_kv = align(seq_len_k + block_kv, 4)
+    logits = torch.empty(aligned_seq_len, aligned_seq_len_kv, dtype=logits_dtype, device=q.device)
+    logits = logits[0:seq_len_q, 0:seq_len_k]
+
+    num_sms = get_num_sms()
+    stream = torch.cuda.current_stream()
+
+    global includes_fp4_mqa, template_fp4_mqa
+    ElementQK = "uint8_t"
+    ElementAcc = "float"
+    ElementLogits = "float" if logits_dtype == torch.float32 else "__nv_bfloat16"
+
+    args = (q.view(torch.uint8), q_sf, k.view(torch.uint8), k_sf, weights,
+            cu_seq_len_k_start, cu_seq_len_k_end, logits,
+            seq_len_q, seq_len_k, aligned_seq_len_kv,
+            stream, num_sms)
+    runtime = jit_tuner.compile_and_tune(
+        name='attention_mqa_logits_fp4',
+        keys={'ElementQK': ElementQK, 'ElementAcc': ElementAcc,
+              'ElementLogits': ElementLogits,
+              'kNumHeads': num_heads, 'kHeadDim': head_dim_packed,
+              'BLOCK_QH': block_qh, 'BLOCK_KV': block_kv,
+              'WARP_QH': warp_qh, 'WARP_KV': warp_kv,
+              'kNumQStages': num_q_stages, 'kNumKVStages': num_kv_stages},
+        space=(),
+        includes=includes_fp4_mqa,
+        arg_defs=(('q', torch.uint8), ('q_sf', torch.int32), ('k', torch.uint8), ('k_sf', torch.int32), ('weights', torch.float),
+                  ('cu_seq_len_k_start', torch.int32), ('cu_seq_len_k_end', torch.int32),
+                  ('logits', logits_dtype),
+                  ('seq_len_q', int), ('seq_len_k', int), ('aligned_seq_len_kv', int),
+                  ('stream', torch.cuda.Stream), ('num_sms', int)),
+        template=template_fp4_mqa,
+        args=args,
+        jit_include_dir='cutlass3'
+    )
+
+    runtime(*args)
+
+    if clean_logits:
+        mask_lo = torch.arange(0, seq_len_k, device='cuda')[None, :] >= cu_seq_len_k_start[:, None]
+        mask_hi = torch.arange(0, seq_len_k, device='cuda')[None, :] < cu_seq_len_k_end[:, None]
+        mask = mask_lo & mask_hi
+        logits = logits.masked_fill(~mask, float('-inf'))
+    return logits
+
+
 includes_paged = ('"../deep_gemm/ppu_paged_mqa_logits.cuh"', )
+includes_paged_fp4 = ('"../deep_gemm/fp4_paged_mqa_logits.cuh"', )
 template_paged_metadata = """
 using namespace deep_gemm;
 constexpr uint32_t SPLIT_KV = {SPLIT_KV};
@@ -224,6 +358,28 @@ using atten_t = PagedAttention<ElementQK, ElementAcc, kNextN, kNumHeads, kHeadDi
 
 // Launch kernel
 atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride,
+             (uint32_t*)context_lens, logits, (uint32_t*)block_table, (uint32_t*)schedule_meta, stream, num_sms, num_blocks);
+"""
+
+template_paged_fp4 = """
+using namespace deep_gemm;
+// Templated args from Python JIT call
+using ElementQK = {ElementQK};     // uint8_t (packed FP4)
+using ElementAcc = {ElementAcc};
+using ElementLogits = {ElementLogits}; // float or cutlass::bfloat16_t
+constexpr uint32_t kNextN = {kNextN};
+constexpr uint32_t kNumHeads = {kNumHeads};
+constexpr uint32_t kHeadDim = {kHeadDim};   // packed head_dim (64)
+constexpr uint32_t BLOCK_KV = {BLOCK_KV};
+constexpr uint32_t kNumQStages = {kNumQStages};
+constexpr uint32_t kNumKVStages = {kNumKVStages};
+constexpr uint32_t SPLIT_KV = {SPLIT_KV};
+
+// Make a templated GEMM
+using atten_t = PagedAttentionFP4<ElementQK, ElementAcc, ElementLogits, kNextN, kNumHeads, kHeadDim, BLOCK_KV, kNumQStages, kNumKVStages, SPLIT_KV>;
+
+// Launch kernel
+atten_t::run((const ElementQK*)q, (const uint32_t*)q_sf, (const ElementQK*)k, (const uint32_t*)k_scales, weights, batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride,
              (uint32_t*)context_lens, logits, (uint32_t*)block_table, (uint32_t*)schedule_meta, stream, num_sms, num_blocks);
 """
 
@@ -426,13 +582,147 @@ def int8_paged_mqa_logits(q: torch.Tensor,
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)
 
 
+def fp4_paged_mqa_logits(q: torch.Tensor,
+                         q_sf: torch.Tensor,
+                         fused_kv_cache: torch.Tensor,
+                         weights: torch.Tensor,
+                         context_lens: torch.Tensor,
+                         block_table: torch.Tensor,
+                         schedule_meta: torch.Tensor,
+                         max_context_len: int,
+                         clean_logits: bool = True,
+                         logits_dtype: torch.dtype = torch.float32):
+    """FP4 paged MQA logits with dedicated indexer for FP4 fused KV cache layout.
+
+    Args:
+        q:  packed FP4 Q, int8 [batch, next_n, num_heads, head_dim_packed]
+               where head_dim_packed = original_head_dim // 2
+        q_sf:  UE8M0 scale for Q, int32 [batch, next_n, num_heads]
+               Packed from uint8 e8m0 (4×uint8 per int32)
+        fused_kv_cache: fused FP4 KV cache, uint8
+               [num_kv_blocks, block_kv, 1, head_dim_packed + scale_bytes]
+               Per-row layout: [fp4_packed (head_dim_packed bytes), scale (scale_bytes bytes)]
+        weights:       float32 [batch * next_n, num_heads]
+        context_lens:  int32   [batch]
+        block_table:   int32   [batch, max_block_len]
+        schedule_meta: int32   [num_blocks+1, 2]
+        max_context_len: maximum context length
+        clean_logits:  whether to mask out-of-range logits with -inf
+        logits_dtype:  output logits dtype, torch.float32 or torch.bfloat16.
+                       The kernel produces logits in this dtype directly,
+                       no separate conversion kernel is needed.
+    """
+    assert(logits_dtype in (torch.float32, torch.bfloat16))
+    batch_size, next_n, num_heads, head_dim_packed = q.shape
+    num_kv_blocks, block_kv, num_heads_kv, fused_row_bytes = fused_kv_cache.shape
+    batch_size_ = context_lens.shape[0]
+    batch_size_next_n, num_heads_ = weights.shape
+    batch_size__, max_block_len = block_table.shape
+    schedule_meta_size, meta_info_size = schedule_meta.shape
+    kv_cache_stride_bytes = fused_kv_cache.stride(0)
+    block_table_stride = block_table.stride(0)
+
+    # FP4 packed Q: original head_dim=128, packed head_dim=64, scale_bytes=4
+    assert(head_dim_packed == 64)
+    scale_bytes = fused_row_bytes - head_dim_packed
+    assert(scale_bytes == 4)
+    num_sms = get_num_sms()
+    assert(batch_size == batch_size_ and batch_size == batch_size__)
+    assert(batch_size_next_n == batch_size * next_n)
+    assert(num_heads == num_heads_ and num_heads_kv == 1)
+    assert(fused_row_bytes == head_dim_packed + scale_bytes)
+    assert((schedule_meta_size - 1) % num_sms == 0 and meta_info_size == 2)
+
+    assert(next_n == 1 or next_n == 2)
+    assert(block_kv == 64)
+
+    assert(q.is_contiguous())
+    assert(q.dtype == torch.int8)
+    assert(q_sf.is_contiguous())
+    assert(q_sf.dtype == torch.int32)
+    assert(q_sf.shape == (batch_size, next_n, num_heads))
+    assert(fused_kv_cache.dtype == torch.uint8)
+    assert(kv_cache_stride_bytes % scale_bytes == 0)
+    assert(fused_kv_cache.stride(1) == fused_row_bytes)
+    assert(fused_kv_cache.stride(2) == fused_row_bytes)
+    assert(fused_kv_cache.stride(3) == 1)
+    assert(weights.is_contiguous())
+    assert(weights.dtype == torch.float)
+    assert(context_lens.is_contiguous())
+    assert(context_lens.dtype == torch.int32)
+    assert(block_table.stride(1) == 1)
+    assert(block_table.dtype == torch.int32)
+    assert(schedule_meta.is_contiguous())
+    assert(schedule_meta.dtype == torch.int32)
+
+    k = torch.as_strided(
+        input=fused_kv_cache,
+        size=(num_kv_blocks, block_kv, head_dim_packed),
+        stride=(kv_cache_stride_bytes, head_dim_packed, 1),
+    )
+    # k_scales: view the scale region as int32 (4×uint8 per row packed into one uint32)
+    k_scales = torch.as_strided(
+        input=fused_kv_cache,
+        size=(num_kv_blocks, block_kv * 4),
+        stride=(kv_cache_stride_bytes, 1),
+        storage_offset=block_kv*head_dim_packed,
+    ).view(torch.int32)
+
+    num_math_warp_groups = 1
+    aligned_max_context_len = align(max_context_len, num_math_warp_groups * block_kv)
+    logits = torch.empty((batch_size * next_n, aligned_max_context_len), dtype=logits_dtype, device=q.device)
+    logits = logits[..., :max_context_len]
+
+    split_kv = num_math_warp_groups * block_kv
+    num_q_stages, num_kv_stages, _ = get_paged_mqa_logits_tile(
+        next_n, split_kv, num_heads, head_dim_packed, q.element_size())
+    logits_stride = aligned_max_context_len
+
+    global includes_paged_fp4, template_paged_fp4
+    ElementQK = "uint8_t"
+    ElementAcc = "float"
+    ElementLogits = "float" if logits_dtype == torch.float32 else "__nv_bfloat16"
+
+    stream = torch.cuda.current_stream()
+    args = (q.view(torch.uint8), q_sf, k, k_scales, weights, batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride, context_lens, logits,
+            block_table, schedule_meta, stream, num_sms, schedule_meta_size - 1)
+    runtime = jit_tuner.compile_and_tune(
+        name='attention_paged_mqa_logits_fp4',
+        keys={'ElementQK': ElementQK, 'ElementAcc': ElementAcc,
+              'ElementLogits': ElementLogits,
+              'kNextN': next_n, 'kNumHeads': num_heads,
+              'kHeadDim': head_dim_packed, 'BLOCK_KV': block_kv,
+              'kNumQStages': num_q_stages, 'kNumKVStages': num_kv_stages,
+              'SPLIT_KV': split_kv},
+        space=(),
+        includes=includes_paged_fp4,
+        arg_defs=(('q', torch.uint8), ('q_sf', torch.int32), ('k', torch.uint8), ('k_scales', torch.int32), ('weights', torch.float),
+                  ('batch_size', int), ('logits_stride', int), ('kv_cache_stride_bytes', int), ('block_table_stride', int), ('context_lens', torch.int32),
+                  ('logits', logits_dtype), ('block_table', torch.int32), ('schedule_meta', torch.int32),
+                  ('stream', torch.cuda.Stream), ('num_sms', int), ('num_blocks', int)),
+        template=template_paged_fp4,
+        args=args,
+        jit_include_dir='cutlass3'
+    )
+
+    runtime(*args)
+
+    if clean_logits:
+        offsets = torch.arange(next_n, device=context_lens.device)
+        context_lens_expanded = (context_lens[:, None] - next_n + offsets[None, :]).reshape(-1)
+        positions = torch.arange(max_context_len, device=logits.device)  # [max_context_len]
+        mask = positions[None, :] <= context_lens_expanded[:, None]  # [batch_size * next_n, max_context_len]
+        logits = logits.masked_fill(~mask, float('-inf'))
+    return logits
+
+
 # New unified FP8/FP4 APIs
 # q  : tuple(q_fp, Optional[q_sf])
 #        FP8 mode : q_fp is float8_e4m3fn, q_sf is None
-#        FP4 mode : q_fp is packed FP4 (uint8), q_sf is UE8M0 scale factor (int32)
+#        FP4 mode : q_fp is packed FP4 (int8), q_sf is UE8M0 scale factor (int32)
 # kv : tuple(kv_fp, kv_sf)
 #        FP8 mode : kv_fp is float8_e4m3fn, kv_sf is per-token float32 scale
-#        FP4 mode : kv_fp is packed FP4 (uint8), kv_sf is UE8M0 scale factor (int32)
+#        FP4 mode : kv_fp is packed FP4 (int8), kv_sf is UE8M0 scale factor (int32)
 # logits_dtype : output dtype, torch.float32 or torch.bfloat16
 
 def fp8_fp4_mqa_logits(q: Tuple,
@@ -446,25 +736,18 @@ def fp8_fp4_mqa_logits(q: Tuple,
     q_fp, q_sf = q
     kv_fp, kv_sf = kv
     is_fp4 = q_sf is not None
+    # max_seqlen_k (compressed logits) is not supported in the current PPU
+    if max_seqlen_k != 0:
+        raise NotImplementedError(
+            "compressed_logits (max_seqlen_k != 0) is not yet supported in PPU fp8_fp4_mqa_logits."
+        )
 
     if is_fp4:
-        # TODO: implement FP4 MQA logits kernel for PPU
-        # FP4 format: q_fp is packed FP4 (uint8, shape [seq_len, num_heads, head_dim//2]),
-        #             q_sf is UE8M0 scale (int32, shape [seq_len, num_heads]),
-        #             kv_fp is packed FP4 (uint8, shape [seq_len_kv, head_dim//2]),
-        #             kv_sf is UE8M0 scale (int32, shape [seq_len_kv])
-        raise NotImplementedError(
-            "FP4 MQA logits kernel is not yet implemented for PPU. "
-            "Please use fp8_mqa_logits for FP8 inputs."
-        )
+        logits = fp4_mqa_logits(q_fp, q_sf, kv_fp, kv_sf, weights,
+                                cu_seq_len_k_start, cu_seq_len_k_end, clean_logits,
+                                logits_dtype=logits_dtype)
+        return logits
     else:
-        # FP8 path: delegate to existing fp8_mqa_logits logic
-        # max_seqlen_k (compressed logits) is not supported in the current PPU
-        # implementation; ignore it and return full [seq_len_q, seq_len_kv] logits.
-        if max_seqlen_k != 0:
-            raise NotImplementedError(
-                "compressed_logits (max_seqlen_k != 0) is not yet supported in PPU fp8_fp4_mqa_logits."
-            )
         logits = mqa_logits_common(q_fp, kv_fp, kv_sf, weights,
                                    cu_seq_len_k_start, cu_seq_len_k_end, clean_logits)
         if logits_dtype != torch.float32:
@@ -485,16 +768,12 @@ def fp8_fp4_paged_mqa_logits(q: Tuple,
     is_fp4 = q_sf is not None
 
     if is_fp4:
-        # TODO: implement FP4 paged MQA logits kernel for PPU
-        # FP4 format: q_fp is packed FP4 (uint8, shape [batch, next_n, num_heads, head_dim//2]),
-        #             q_sf is UE8M0 scale (int32, shape [batch, next_n, num_heads]),
-        #             fused_kv_cache layout: [num_blocks, block_kv, 1, head_dim//2 + sizeof(int)]
-        raise NotImplementedError(
-            "FP4 paged MQA logits kernel is not yet implemented for PPU. "
-            "Please use fp8_paged_mqa_logits for FP8 inputs."
-        )
+        logits = fp4_paged_mqa_logits(q_fp, q_sf, fused_kv_cache, weights,
+                                     context_lens, block_table, schedule_meta,
+                                     max_context_len, clean_logits,
+                                     logits_dtype=logits_dtype)
+        return logits
     else:
-        # FP8 path: delegate to existing paged_mqa_logits_common logic
         logits = paged_mqa_logits_common(q_fp, fused_kv_cache, weights, context_lens,
                                         block_table, schedule_meta, max_context_len, clean_logits)
         if logits_dtype != torch.float32:

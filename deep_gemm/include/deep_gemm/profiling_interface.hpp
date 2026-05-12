@@ -206,7 +206,7 @@ bool check_support_dump(){
     char *pEnv_dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
     static int target_device_id = pEnv_dump_device != nullptr ? std::stoi(pEnv_dump_device) : 0;
     // export PPU_LIB_DUMP_DEVICE=-1 to dump all devices
-    if (target_device_id != -1 && target_device_id != device_id_) {
+    if (target_device_id != -1 && target_device_id != device_id_ && !is_paged_mqa_logits()) {
         return false;
     }
     if (gemm_type_ == GemmType::DenseGemm) {

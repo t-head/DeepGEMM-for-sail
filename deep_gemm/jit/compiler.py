@@ -122,7 +122,8 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
 
     if is_ppu1v5_device():
         # append compiler options for ppu1.5
-        use_warp_interleaving = ('gemm_fp8' in name.lower()) or ('mqa_logits' in name.lower())
+        lower_name = name.lower()
+        use_warp_interleaving = ('gemm_fp8' in lower_name) or ('mqa_logits' in lower_name and 'paged' not in lower_name)
         if not use_warp_interleaving:
             nvcc_flags.extend(['-ppu-simt-branch=false', '-ppu-patch-fence-ppu=false', '-wno-loop-miss-transform',
                                '-ppu-cg-to-kp1=true', '-ppu-fix-uninit=true'])
@@ -136,7 +137,7 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
                                '-mllvm', '-ppu-pref-fma-reuse=true',
                                '-mllvm', '-ppu-pref-mma-reuse=true',
                                '-mllvm', '-regalloc=pbqp'])
-        if 'w4a16' in name.lower():
+        if 'w4a16' in lower_name:
             nvcc_flags.extend(['-mllvm', '-sort-copy-before-coalesce'])
 
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi', '-fconcepts']
