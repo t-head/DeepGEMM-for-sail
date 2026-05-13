@@ -39,17 +39,6 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(const torch::Tensor& 
                                                            const torch::Tensor& out, const torch::Tensor& m_indices,
                                                            const int& m, const int& n, const int& k,
                                                            const int& num_groups, std::optional<ConfigTuple> config) {
-    bool lhs_shape_valid = (lhs_scales.dim() == 2 && lhs_scales.size(0) == m && lhs_scales.size(1) == 1);
-
-    bool rhs_shape_valid = (rhs_scales.dim() == 3 && rhs_scales.size(0) == num_groups && rhs_scales.size(1) == n &&
-                            rhs_scales.size(2) == 1);
-
-    if (lhs_shape_valid && rhs_shape_valid) {
-        m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(lhs, lhs_scales, rhs, rhs_scales, out, m_indices, m, n, k,
-                                                           num_groups, config);
-        return;
-    }
-
     auto lhs_scales_aligned = get_col_major_tma_aligned_tensor(lhs_scales);
     TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
 
@@ -170,18 +159,6 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(const torch::Tensor& lhs,
                                                        const int& expected_m, std::optional<ConfigTuple> config,
                                                        int max_block_n, bool enable_sbo_overlap,
                                                        const torch::Tensor& signal) {
-    bool lhs_shape_valid = (lhs_scales.dim() == 2 && lhs_scales.size(0) == m && lhs_scales.size(1) == 1);
-
-    bool rhs_shape_valid = (rhs_scales.dim() == 3 && rhs_scales.size(0) == num_groups && rhs_scales.size(1) == n &&
-                            rhs_scales.size(2) == 1);
-
-    if (lhs_shape_valid && rhs_shape_valid) {
-        m_grouped_gemm_a8w8_per_channel_nt_masked_impl(lhs, lhs_scales, rhs, rhs_scales, out, masked_m, m, n, k,
-                                                       num_groups, expected_m, config, max_block_n, enable_sbo_overlap,
-                                                       signal);
-        return;
-    }
-
     auto lhs_scales_aligned = get_col_major_tma_aligned_tensor(lhs_scales);
     TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
 
@@ -303,16 +280,6 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, 
                                                       const int& m, const int& n, const int& k, const int& num_groups,
                                                       std::optional<const torch::Tensor> m_rows,
                                                       std::optional<ConfigTuple> config) {
-    bool lhs_shape_valid = (lhs_scales.dim() == 2 && lhs_scales.size(0) == m && lhs_scales.size(1) == 1);
-
-    bool rhs_shape_valid = (rhs_scales.dim() == 3 && rhs_scales.size(0) == num_groups && rhs_scales.size(1) == n &&
-                            rhs_scales.size(2) == 1);
-
-    if (lhs_shape_valid && rhs_shape_valid) {
-        m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(lhs, lhs_scales, rhs, rhs_scales, out, m_indices, m, n, k,
-                                                      num_groups, m_rows, config);
-        return;
-    }
     int num_sms = get_num_sms();
     int expected_m = ceil_div(m, num_groups);
 

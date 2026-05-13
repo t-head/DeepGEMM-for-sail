@@ -14,25 +14,6 @@
 namespace deep_gemm::gemm {
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 extern "C" {
-void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
-                 const torch::Tensor& d, std::optional<ConfigTuple> config = std::nullopt) {
-    // Shape must be `[M, K] @ [N, K].T`
-
-    // C/D must be N-major
-    check_major_type_cd(d);
-    // Type and shape checks
-    const auto& [m, k] = get_shape<2>(a.first);
-    const auto& [n, k_] = get_shape<2>(b.first);
-    const auto& [m_, n_] = get_shape<2>(d);
-
-    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
-    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
-
-    fp8_gemm(a.first, a.second, b.first, b.second, d, m, n, k, config);
-}
-
 void gemm_bf16_bf16_bf16_nt(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
                             std::optional<ConfigTuple> config = std::nullopt) {
     const auto& [m, k] = get_shape<2>(a);
@@ -60,9 +41,13 @@ void gemm_int8_int8_bf16_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     const auto& [m_, n_] = get_shape<2>(d);
 
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
-    DG_HOST_ASSERT(a.first.scalar_type() == torch::kInt8);
-    DG_HOST_ASSERT(b.first.scalar_type() == torch::kInt8);
+    DG_HOST_ASSERT(n > 0 and k > 0);
+    DG_HOST_ASSERT((a.first.scalar_type() == torch::kInt8) || (a.first.scalar_type() == torch::kFloat8_e4m3fn));
+    DG_HOST_ASSERT((b.first.scalar_type() == torch::kInt8) || (b.first.scalar_type() == torch::kFloat8_e4m3fn));
+    DG_HOST_ASSERT(a.first.scalar_type() == b.first.scalar_type());
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT((a.second.size(0) == m) && (a.second.scalar_type() == torch::kFloat32));
+    DG_HOST_ASSERT((b.second.size(0) == n) && (b.second.scalar_type() == torch::kFloat32));
     TORCH_CHECK(a.first.is_contiguous(), "lhs must be contiguous");
     TORCH_CHECK(b.first.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
@@ -72,154 +57,30 @@ void gemm_int8_int8_bf16_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     int8_gemm(a.first, a.second, b.first, b.second, d, m, n, k, config);
 }
 
-static void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
-                                                      const std::pair<torch::Tensor, torch::Tensor>& b,
-                                                      const torch::Tensor& d, const torch::Tensor& m_indices,
-                                                      std::optional<ConfigTuple> config = std::nullopt) {
-    const auto& lhs = a.first;
+void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
+                 const torch::Tensor& d, std::optional<ConfigTuple> config = std::nullopt) {
     const auto& lhs_scales = a.second;
-    const auto& rhs = b.first;
     const auto& rhs_scales = b.second;
-
-    const auto& [m, k] = get_shape<2>(lhs);
-    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
+    // Type and shape checks
+    const auto& [m, k] = get_shape<2>(a.first);
+    const auto& [n, k_] = get_shape<2>(b.first);
     const auto& [m_, n_] = get_shape<2>(d);
-    int m__ = m_indices.numel();
 
-    // Type and shape checks (matching Python implementation)
-    DG_HOST_ASSERT(m == m_ && m_ == m__ && k == k_ && n == n_);
+    if ((lhs_scales.sizes() == std::vector<int64_t>{m, 1}) && (rhs_scales.sizes() == std::vector<int64_t>{n, 1})) {
+        return gemm_int8_int8_bf16_nt(a, b, d, config);
+    }
+    DG_HOST_ASSERT(k % 128 == 0);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(n > 0 and k > 0);
     DG_HOST_ASSERT((lhs_scales.sizes() == std::vector<int64_t>{m, (k + 127) / 128}));
-    DG_HOST_ASSERT((rhs_scales.sizes() == std::vector<int64_t>{num_groups, (n + 127) / 128, (k + 127) / 128}));
-
-    DG_HOST_ASSERT(lhs.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(lhs_scales.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT(rhs.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT((rhs_scales.sizes() == std::vector<int64_t>{(n + 127) / 128, (k + 127) / 128}));
+    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(m_indices.scalar_type() == torch::kInt32);
-
-    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
-    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    TORCH_CHECK(a.first.is_contiguous(), "lhs must be contiguous");
+    TORCH_CHECK(b.first.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
-    TORCH_CHECK(m_indices.is_contiguous(), "m_indices must be contiguous");
-    TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
-
-    if (m == 0) {
-        return;
-    }
-
-    // TODO: lhs_scales needs TMA-aligned transposing (like Python's
-    // get_col_major_tma_aligned_tensor)
-
-    m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(lhs, lhs_scales, rhs, rhs_scales, d, m_indices, m, n, k, num_groups,
-                                                   config);
-}
-
-static void m_grouped_gemm_fp8_fp8_bf16_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
-                                                  const std::pair<torch::Tensor, torch::Tensor>& b,
-                                                  const torch::Tensor& d, const torch::Tensor& masked_m, int expected_m,
-                                                  std::optional<ConfigTuple> config = std::nullopt,
-                                                  std::optional<int> max_block_n = 256,
-                                                  std::optional<bool> enable_sbo_overlap = false,
-                                                  std::optional<const torch::Tensor> signal = std::nullopt) {
-    const auto& lhs = a.first;
-    const auto& lhs_scales = a.second;
-    const auto& rhs = b.first;
-    const auto& rhs_scales = b.second;
-
-    at::Tensor signal_tensor;
-    if (signal.has_value() && signal->defined()) {
-        signal_tensor = *signal;
-    } else {
-        signal_tensor = at::empty({0}, at::TensorOptions().dtype(at::kInt).device(d.device()));
-    }
-
-    const auto& [num_groups, m, k] = get_shape<3>(lhs);
-    const auto& [num_groups_, n, k_] = get_shape<3>(rhs);
-    const auto& [num_groups__, m_, n_] = get_shape<3>(d);
-    int num_groups___ = masked_m.numel();
-
-    // Check if per-channel mode
-    if (lhs_scales.sizes() == std::vector<int64_t>{num_groups, m, 1} &&
-        rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1}) {
-        // TODO: Call per-channel implementation
-        TORCH_CHECK(false, "Per-channel mode not yet implemented for FP8 grouped GEMM");
-    }
-
-    // Type and shape checks (matching Python implementation)
-    DG_HOST_ASSERT(num_groups == num_groups_ && num_groups_ == num_groups__ && num_groups__ == num_groups___);
-    DG_HOST_ASSERT(m == m_ && n == n_ && k == k_);
-    DG_HOST_ASSERT(expected_m > 0 && m > 0 && n > 0 && k > 0 && num_groups > 0);
-    DG_HOST_ASSERT((lhs_scales.sizes() == std::vector<int64_t>{num_groups, m, (k + 127) / 128}));
-    DG_HOST_ASSERT((rhs_scales.sizes() == std::vector<int64_t>{num_groups, (n + 127) / 128, (k + 127) / 128}));
-
-    DG_HOST_ASSERT(lhs.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(lhs_scales.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT(rhs.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt32);
-
-    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
-    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
-    TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
-    TORCH_CHECK(masked_m.is_contiguous(), "masked_m must be contiguous");
-    TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
-
-    if (enable_sbo_overlap.value_or(false)) {
-        TORCH_CHECK(signal_tensor.defined(), "signal must be defined when enable_sbo_overlap is true");
-        TORCH_CHECK(signal_tensor.is_contiguous(), "signal must be contiguous");
-        TORCH_CHECK(signal_tensor.scalar_type() == torch::kInt32, "signal must be int32");
-    }
-
-    // TODO: lhs_scales needs TMA-aligned transposing
-
-    m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(lhs, lhs_scales, rhs, rhs_scales, d, masked_m, m, n, k, num_groups,
-                                               expected_m, config, max_block_n.value_or(256),
-                                               enable_sbo_overlap.value_or(false), signal_tensor);
-}
-
-static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& a,
-                                                 const std::pair<torch::Tensor, torch::Tensor>& b,
-                                                 const torch::Tensor& d, const torch::Tensor& m_indices,
-                                                 std::optional<const torch::Tensor> m_rows = std::nullopt,
-                                                 std::optional<ConfigTuple> config = std::nullopt) {
-    const auto& lhs = a.first;
-    const auto& lhs_scales = a.second;
-    const auto& rhs = b.first;
-    const auto& rhs_scales = b.second;
-
-    const auto& [m, k] = get_shape<2>(lhs);
-    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
-    const auto& [m_, n_] = get_shape<2>(d);
-    int m__ = m_indices.numel();
-
-    // Type and shape checks (matching Python implementation)
-    DG_HOST_ASSERT(m == m_ && m_ == m__ && k == k_ && n == n_);
-    DG_HOST_ASSERT((lhs_scales.sizes() == std::vector<int64_t>{m, (k + 127) / 128}));
-    DG_HOST_ASSERT((rhs_scales.sizes() == std::vector<int64_t>{num_groups, (n + 127) / 128, (k + 127) / 128}));
-
-    DG_HOST_ASSERT(lhs.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(lhs_scales.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT(rhs.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(m_indices.scalar_type() == torch::kInt32);
-
-    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
-    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
-    TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
-    TORCH_CHECK(m_indices.is_contiguous(), "m_indices must be contiguous");
-    TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
-
-    if (m == 0) {
-        return;
-    }
-
-    // TODO: lhs_scales needs TMA-aligned transposing
-
-    m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(lhs, lhs_scales, rhs, rhs_scales, d, m_indices, m, n, k, num_groups,
-                                              m_rows, config);
+    fp8_gemm(a.first, a.second, b.first, b.second, d, m, n, k, config);
 }
 
 static void m_grouped_gemm_int8_int8_bf16_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -358,6 +219,158 @@ static void m_grouped_gemm_int8_int8_bf16_nt_nopad(const std::pair<torch::Tensor
 
     m_grouped_gemm_int8_int8_bf16_nt_nopad_impl(lhs, lhs_scales, rhs, rhs_scales, d, m_indices, m, n, k, num_groups,
                                                 m_rows, config);
+}
+
+static void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                      const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                      const torch::Tensor& d, const torch::Tensor& m_indices,
+                                                      std::optional<ConfigTuple> config = std::nullopt) {
+    const auto& lhs = a.first;
+    const auto& lhs_scales = a.second;
+    const auto& rhs = b.first;
+    const auto& rhs_scales = b.second;
+
+    const auto& [m, k] = get_shape<2>(lhs);
+    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
+    const auto& [m_, n_] = get_shape<2>(d);
+    int m__ = m_indices.numel();
+
+    if ((lhs_scales.sizes() == std::vector<int64_t>{m, 1}) &&
+        (rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1})) {
+        return m_grouped_gemm_int8_int8_bf16_nt_contiguous(a, b, d, m_indices, config);
+    }
+
+    // Type and shape checks (matching Python implementation)
+    DG_HOST_ASSERT(m == m_ && m_ == m__ && k == k_ && n == n_);
+    DG_HOST_ASSERT((lhs_scales.sizes() == std::vector<int64_t>{m, (k + 127) / 128}));
+    DG_HOST_ASSERT((rhs_scales.sizes() == std::vector<int64_t>{num_groups, (n + 127) / 128, (k + 127) / 128}));
+
+    DG_HOST_ASSERT(lhs.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(lhs_scales.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(rhs.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(m_indices.scalar_type() == torch::kInt32);
+
+    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
+    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+    TORCH_CHECK(m_indices.is_contiguous(), "m_indices must be contiguous");
+    TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
+
+    if (m == 0) {
+        return;
+    }
+
+    m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(lhs, lhs_scales, rhs, rhs_scales, d, m_indices, m, n, k, num_groups,
+                                                   config);
+}
+
+static void m_grouped_gemm_fp8_fp8_bf16_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                  const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                  const torch::Tensor& d, const torch::Tensor& masked_m, int expected_m,
+                                                  std::optional<ConfigTuple> config = std::nullopt,
+                                                  std::optional<int> max_block_n = 256,
+                                                  std::optional<bool> enable_sbo_overlap = false,
+                                                  std::optional<const torch::Tensor> signal = std::nullopt) {
+    const auto& lhs = a.first;
+    const auto& lhs_scales = a.second;
+    const auto& rhs = b.first;
+    const auto& rhs_scales = b.second;
+
+    at::Tensor signal_tensor;
+    if (signal.has_value() && signal->defined()) {
+        signal_tensor = *signal;
+    } else {
+        signal_tensor = at::empty({0}, at::TensorOptions().dtype(at::kInt).device(d.device()));
+    }
+
+    const auto& [num_groups, m, k] = get_shape<3>(lhs);
+    const auto& [num_groups_, n, k_] = get_shape<3>(rhs);
+    const auto& [num_groups__, m_, n_] = get_shape<3>(d);
+    int num_groups___ = masked_m.numel();
+
+    if ((lhs_scales.sizes() == std::vector<int64_t>{num_groups, m, 1}) &&
+        (rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1})) {
+        return m_grouped_gemm_int8_int8_bf16_nt_masked(a, b, d, masked_m, expected_m, config, max_block_n,
+                                                       enable_sbo_overlap, signal);
+    }
+
+    // Type and shape checks (matching Python implementation)
+    DG_HOST_ASSERT(num_groups == num_groups_ && num_groups_ == num_groups__ && num_groups__ == num_groups___);
+    DG_HOST_ASSERT(m == m_ && n == n_ && k == k_);
+    DG_HOST_ASSERT(expected_m > 0 && m > 0 && n > 0 && k > 0 && num_groups > 0);
+    DG_HOST_ASSERT((lhs_scales.sizes() == std::vector<int64_t>{num_groups, m, (k + 127) / 128}));
+    DG_HOST_ASSERT((rhs_scales.sizes() == std::vector<int64_t>{num_groups, (n + 127) / 128, (k + 127) / 128}));
+
+    DG_HOST_ASSERT(lhs.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(lhs_scales.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(rhs.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt32);
+
+    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
+    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+    TORCH_CHECK(masked_m.is_contiguous(), "masked_m must be contiguous");
+    TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
+
+    if (enable_sbo_overlap.value_or(false)) {
+        TORCH_CHECK(signal_tensor.defined(), "signal must be defined when enable_sbo_overlap is true");
+        TORCH_CHECK(signal_tensor.is_contiguous(), "signal must be contiguous");
+        TORCH_CHECK(signal_tensor.scalar_type() == torch::kInt32, "signal must be int32");
+    }
+
+    m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(lhs, lhs_scales, rhs, rhs_scales, d, masked_m, m, n, k, num_groups,
+                                               expected_m, config, max_block_n.value_or(256),
+                                               enable_sbo_overlap.value_or(false), signal_tensor);
+}
+
+static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                 const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                 const torch::Tensor& d, const torch::Tensor& m_indices,
+                                                 std::optional<const torch::Tensor> m_rows = std::nullopt,
+                                                 std::optional<ConfigTuple> config = std::nullopt) {
+    const auto& lhs = a.first;
+    const auto& lhs_scales = a.second;
+    const auto& rhs = b.first;
+    const auto& rhs_scales = b.second;
+
+    const auto& [m, k] = get_shape<2>(lhs);
+    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
+    const auto& [m_, n_] = get_shape<2>(d);
+    int m__ = m_indices.numel();
+
+    if ((lhs_scales.sizes() == std::vector<int64_t>{m, 1}) &&
+        (rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1})) {
+        return m_grouped_gemm_int8_int8_bf16_nt_nopad(a, b, d, m_indices, m_rows, config);
+    }
+
+    // Type and shape checks (matching Python implementation)
+    DG_HOST_ASSERT(m == m_ && m_ == m__ && k == k_ && n == n_);
+    DG_HOST_ASSERT((lhs_scales.sizes() == std::vector<int64_t>{m, (k + 127) / 128}));
+    DG_HOST_ASSERT((rhs_scales.sizes() == std::vector<int64_t>{num_groups, (n + 127) / 128, (k + 127) / 128}));
+
+    DG_HOST_ASSERT(lhs.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(lhs_scales.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(rhs.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(m_indices.scalar_type() == torch::kInt32);
+
+    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
+    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+    TORCH_CHECK(m_indices.is_contiguous(), "m_indices must be contiguous");
+    TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
+
+    if (m == 0) {
+        return;
+    }
+
+    m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(lhs, lhs_scales, rhs, rhs_scales, d, m_indices, m, n, k, num_groups,
+                                              m_rows, config);
 }
 
 void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(const torch::Tensor& lhs, const torch::Tensor& rhs,

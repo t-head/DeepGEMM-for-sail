@@ -373,20 +373,7 @@ using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int
 static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
                      const torch::Tensor& rhs_scales, const torch::Tensor& out, const int& m, const int& n,
                      const int& k, std::optional<ConfigTuple> config = std::nullopt) {
-    bool lhs_shape_valid = (lhs_scales.dim() == 2 && lhs_scales.size(0) == m && lhs_scales.size(1) == 1);
-
-    bool rhs_shape_valid = (rhs_scales.dim() == 2 && rhs_scales.size(0) == n && rhs_scales.size(1) == 1);
-
-    if (lhs_shape_valid && rhs_shape_valid) {
-        gemm_a8w8_per_channel_nt(lhs, lhs_scales, rhs, rhs_scales, out, m, n, k, config);
-        return;
-    }
-
     auto lhs_scales_aligned = get_col_major_tma_aligned_tensor(lhs_scales);
-    TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
-    if (m == 0) {
-        return;
-    }
     int num_sms = get_num_sms();
 
     ConfigTuple selected_config;

@@ -607,11 +607,10 @@ static void m_grouped_gemm_a8w8_per_channel_nt_masked_impl(const torch::Tensor& 
         smem_config = deep_gemm_int8::get_smem_config(num_stages, k, block_m, block_n, block_k, 1);
         SMSIZE = std::get<0>(smem_config);
         auto args = DynamicTileRuntime::Args{
-            // .gemm_args = gemm_args,
-            .launch_info = {kNumGroups, num_stages, n, k, "GroupedMasked", "Default", kernel_name, kLargeEM},
+            .launch_info = {kNumGroups, num_stages, n, k, "GroupedMasked", "MoeDynamicTile", kernel_name, kLargeEM},
             .launch_args = {grid, block_new, SMSIZE},
             .kernel_params = gemm_args,
-            .type_info = "int8_t"};
+            .type_info = type_info};
         const auto& code = DynamicTileRuntime::generate(args);
         const auto& runtime = compiler->build(kernel_name, code, block_new.x, SMSIZE);
         const auto& kernel = runtime->kernel;
@@ -621,7 +620,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_masked_impl(const torch::Tensor& 
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("int8"), kNumGroups, m, n, k, 0, grouped_layout,
+            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout,
                                       at::cuda::getCurrentCUDAStream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
