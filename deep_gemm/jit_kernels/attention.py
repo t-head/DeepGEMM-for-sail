@@ -345,7 +345,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
 
     num_math_warp_groups = 1
     aligned_max_context_len = align(max_context_len, num_math_warp_groups * block_kv)
-    logits = torch.zeros((batch_size * next_n, aligned_max_context_len), dtype=torch.float, device=q.device)
+    logits = torch.empty((batch_size * next_n, aligned_max_context_len), dtype=torch.float, device=q.device)
     logits = logits[..., :max_context_len]
 
     split_kv = num_math_warp_groups * block_kv
@@ -387,6 +387,12 @@ def paged_mqa_logits_common(q: torch.Tensor,
 
     runtime(*args)
 
+    if clean_logits:
+        offsets = torch.arange(next_n, device=context_lens.device)
+        context_lens_expanded = (context_lens[:, None] - next_n + offsets[None, :]).reshape(-1)
+        positions = torch.arange(max_context_len, device=logits.device)  # [max_context_len]
+        mask = positions[None, :] <= context_lens_expanded[:, None]  # [batch_size * next_n, max_context_len]
+        logits = logits.masked_fill(~mask, float('-inf'))
     return logits
 
 def bf16_paged_mqa_logits(q: torch.Tensor,
