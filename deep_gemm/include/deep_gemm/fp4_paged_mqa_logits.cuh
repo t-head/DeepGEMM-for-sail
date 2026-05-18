@@ -378,13 +378,6 @@ public:
         auto tSFQgSFQ = tSFBgSFB;
         auto tWgW_base = tWgW;
 
-        if (thread0() && false) {
-            printv(tSFAgSFA);
-            printv(tSFAsSFA);
-            printv(tSFBgSFB);
-            printv(tSFBsSFB);
-        }
-
         const auto& warp_offset = warp_m_idx * WARP_M;
         const auto& v_0_offset = lane_idx / 4 + 0;
         const auto& v_1_offset = lane_idx / 4 + 8;
