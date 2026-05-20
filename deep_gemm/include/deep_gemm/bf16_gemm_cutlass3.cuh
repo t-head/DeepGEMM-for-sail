@@ -2,8 +2,6 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-// #define ACOMPUTE_VERSION 10000
-
 #ifndef BF16_NVRTC
     #include "profiling_interface.hpp"
 #endif
@@ -12,7 +10,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/mma.h"
-#include "ppu/cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/dispatch_policy.hpp"
 
 #include "cute/algorithm/functional.hpp"
 #include "cute/atom/mma_atom.hpp"
@@ -23,19 +21,18 @@
 #include "cutlass/gemm/collective/collective_mma.hpp"
 #include "cutlass/detail/layout.hpp"
 
-#include "ppu/cute/util.hpp"
-#include "ppu/cutlass/gemm/dispatch_policy.hpp"
+#include "cute/ppu_util.hpp"
 #include "tools/util/include/cutlass/util/packed_stride.hpp"
 #include "scheduler_cutlass3.cuh"
 #include "utils_cutlass3.h"
 
-#include "ppu/ppu_include.hpp"
+#include "ppu_include.hpp"
 
 using namespace cute;
 
 namespace cutlass::gemm {
 template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapPrologue>
-struct MainloopAcomputeOverlapPrologue {
+struct MainloopPPUOverlapPrologue {
   constexpr static int Stages = Stages_;
   using ArchTag = arch::Sm80;
   using Schedule = Schedule_;
@@ -43,7 +40,7 @@ struct MainloopAcomputeOverlapPrologue {
 };
 
 template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapMainloop>
-struct MainloopAcomputeOverlapMainloop {
+struct MainloopPPUOverlapMainloop {
   constexpr static int Stages = Stages_;
   using ArchTag = arch::Sm80;
   using Schedule = Schedule_;
@@ -51,7 +48,7 @@ struct MainloopAcomputeOverlapMainloop {
 };
 
 template<int Stages_, typename Schedule_ = KernelAiuMultistage>
-struct MainloopAcomputeAiuOpt {
+struct MainloopPPUAiuOpt {
   constexpr static int Stages = Stages_;
   using ArchTag = arch::Sm80;
   using Schedule = Schedule_;
@@ -259,7 +256,7 @@ public:
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
-    // printf("run acompute aiu deepgemm persistent!!!");
+    // printf("run ppu aiu deepgemm persistent!!!");
     using namespace cute;
     using X = Underscore;
 
@@ -604,8 +601,9 @@ namespace cutlass::gemm::collective {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <
+  typename Arch_,
   int Stages,
-class KernelSchedule,
+  class KernelSchedule,
   class TileShape_,
   class ElementA_,
   class StrideA_,
@@ -621,7 +619,8 @@ class KernelSchedule,
   class SmemCopyAtomB_,
   class TransformB_>
 struct CollectiveMma<
-    MainloopAcomputeAiuOpt<Stages, KernelSchedule>,
+    Arch_,
+    MainloopPPUAiuOpt<Stages, KernelSchedule>,
     TileShape_,
     ElementA_,
     StrideA_,
@@ -639,7 +638,7 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopAcomputeAiuOpt<Stages, KernelSchedule>;
+  using DispatchPolicy = MainloopPPUAiuOpt<Stages, KernelSchedule>;
   using TileShape = TileShape_;
   using ElementA = ElementA_;
   using StrideA = StrideA_;
@@ -781,7 +780,6 @@ struct CollectiveMma<
       "MainloopSm80CpAsync must have a pipeline mode in the smem layout.");
 
     int warp_idx = canonical_warp_idx_sync();
-    int lane_predicate = cute::elect_one_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -1148,7 +1146,7 @@ public:
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
-    // printf("run acompute aiu deepgemm persistent!!!");
+    // printf("run ppu aiu deepgemm persistent!!!");
     using X = Underscore;
 
     // Preconditions
@@ -1276,6 +1274,7 @@ namespace cutlass::gemm::collective {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <
+  typename Arch_,
   int Stages,
   class KernelSchedule,
   class TileShape_,
@@ -1293,7 +1292,8 @@ template <
   class SmemCopyAtomB_,
   class TransformB_>
 struct CollectiveMma<
-    MainloopAcomputeOverlapPrologue<Stages, KernelSchedule>,
+    Arch_,
+    MainloopPPUOverlapPrologue<Stages, KernelSchedule>,
     TileShape_,
     ElementA_,
     StrideA_,
@@ -1311,7 +1311,7 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopAcomputeOverlapPrologue<Stages, KernelSchedule>;
+  using DispatchPolicy = MainloopPPUOverlapPrologue<Stages, KernelSchedule>;
   using TileShape = TileShape_;
   using ElementA = ElementA_;
   using StrideA = StrideA_;
@@ -1446,7 +1446,6 @@ struct CollectiveMma<
       "MainloopSm80CpAsync must have a pipeline mode in the smem layout.");
 
     int warp_idx = canonical_warp_idx_sync();
-    int lane_predicate = cute::elect_one_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -1508,7 +1507,6 @@ struct CollectiveMma<
       "MainloopSm80CpAsync must have a pipeline mode in the smem layout.");
 
     int warp_idx = canonical_warp_idx_sync();
-    int lane_predicate = cute::elect_one_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -1877,7 +1875,7 @@ public:
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
-    // printf("run acompute aiu deepgemm persistent!!!");
+    // printf("run ppu aiu deepgemm persistent!!!");
     using X = Underscore;
 
     // Preconditions
@@ -2018,6 +2016,7 @@ public:
 namespace cutlass::gemm::collective {
 
 template <
+  typename Arch_,
   int Stages,
   class KernelSchedule,
   class TileShape_,
@@ -2035,7 +2034,8 @@ template <
   class SmemCopyAtomB_,
   class TransformB_>
 struct CollectiveMma<
-    MainloopAcomputeOverlapMainloop<Stages, KernelSchedule>,
+    Arch_,
+    MainloopPPUOverlapMainloop<Stages, KernelSchedule>,
     TileShape_,
     ElementA_,
     StrideA_,
@@ -2053,7 +2053,7 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopAcomputeOverlapMainloop<Stages, KernelSchedule>;
+  using DispatchPolicy = MainloopPPUOverlapMainloop<Stages, KernelSchedule>;
   using TileShape = TileShape_;
   using ElementA = ElementA_;
   using StrideA = StrideA_;
@@ -2195,7 +2195,6 @@ struct CollectiveMma<
       "MainloopSm80CpAsync must have a pipeline mode in the smem layout.");
 
     int warp_idx = canonical_warp_idx_sync();
-    int lane_predicate = cute::elect_one_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -2260,7 +2259,6 @@ struct CollectiveMma<
       "MainloopSm80CpAsync must have a pipeline mode in the smem layout.");
 
     //int warp_idx = canonical_warp_idx_sync();
-    int lane_predicate = cute::elect_one_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -2646,7 +2644,7 @@ public:
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
-    // printf("run acompute aiu deepgemm persistent!!!");
+    // printf("run ppu aiu deepgemm persistent!!!");
     using X = Underscore;
 
     // Preconditions
@@ -2835,14 +2833,14 @@ public:
         using ElementScalar       = ElementCompute;
         using LinearCombOutType   = ElementD;
         using OperatorClass = cutlass::arch::OpClassTensorOp;
-        using ArchTag = cutlass::arch::Sm80;
+        using ArchTag = cutlass::arch::PPU0015;
 
         using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
         using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>;
         static constexpr int WarpOnM = BLOCK_M / WARP_M;
         static constexpr int WarpOnN = BLOCK_N / WARP_N;
 
-        using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<cutlass::bfloat16_t, cutlass::bfloat16_t, float>::type;
+        using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, cutlass::bfloat16_t, cutlass::bfloat16_t, float>::type;
         using TiledMma = TiledMMA<
             MMA_Atom<MmaInst>,
             Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
@@ -2861,11 +2859,11 @@ public:
                 cutlass::gemm::KernelAiuMultistage>>>;
         using DispatchPolicy = cute::conditional_t<
             kKernelType == KernelType::OverlapMainloop,
-            cutlass::gemm::MainloopAcomputeOverlapMainloop<kNumStages, KernelSchedule>,
+            cutlass::gemm::MainloopPPUOverlapMainloop<kNumStages, KernelSchedule>,
             cute::conditional_t<
               kKernelType == KernelType::OverlapPrologue,
-              cutlass::gemm::MainloopAcomputeOverlapPrologue<kNumStages, KernelSchedule>,
-              cutlass::gemm::MainloopAcomputeAiuOpt<kNumStages, KernelSchedule>>>;
+              cutlass::gemm::MainloopPPUOverlapPrologue<kNumStages, KernelSchedule>,
+              cutlass::gemm::MainloopPPUAiuOpt<kNumStages, KernelSchedule>>>;
 
         static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
         static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
@@ -2873,8 +2871,8 @@ public:
 
         static constexpr int SmemLayoutStageStrideA = kKernelType == KernelType::OverlapMainloop || kKernelType == KernelType::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
         static constexpr int SmemLayoutStageStrideB = kKernelType == KernelType::OverlapMainloop || kKernelType == KernelType::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
-        using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
-        using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
+        using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
+        using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
         // using t1 = DefaultOperandB::xhzhao;
         // A
         using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
@@ -2887,6 +2885,7 @@ public:
 
         // Mainloop
         using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+            ArchTag,
             DispatchPolicy, TileShape,
             ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
             ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
@@ -2906,7 +2905,7 @@ public:
         using DefaultOperation = cutlass::epilogue::fusion::LinearCombination<ElementD, ElementCompute>;
         using EpilogueSchedule = typename cutlass::epilogue::EpilogueSimtVectorized;
         using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
-            cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+            ArchTag, cutlass::arch::OpClassTensorOp,
             TileShape, WarpShape,
             cutlass::epilogue::collective::EpilogueTileAuto,
             float, float,

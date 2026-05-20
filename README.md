@@ -7,7 +7,7 @@ DeepGEMM for PPU 是基于 [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) �
 
 ### 环境要求
 
-- ZW 610 / 610E / 810 / 810E / 890P
+- ZW 610 / 610E / 810 / 810E / M530 / M890 / 890L / 890P
 - Python 3.8 或更高版本
 - PPU SDK 12.3 或更高版本
 - PyTorch 2.1 或更高版本

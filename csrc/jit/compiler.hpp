@@ -241,16 +241,6 @@ public:
         public:
         RtcOptions() = delete;
         RtcOptions(acArch_t arch, bool use_cutlass3) {
-        #if defined(ACOMPUTE_VERSION) && ACOMPUTE_VERSION >= 10700
-            std::string fp8_promotion = "-DUSELESS_MACRO";
-            if (getenv("CLOSE_FP8_PROMOTION") != nullptr) {
-            fp8_promotion = "-DCLOSE_FP8_PROMOTION";
-            }
-            std::string use_mma_k48 = "-DUSELESS_MACRO";
-            if (getenv("USE_MMA_K48") != nullptr) {
-            use_mma_k48 = "-DUSE_MMA_K48";
-            }
-        #endif
             opts = {
             "--device-as-default-execution-space",
             "-DHGGC_COMPILER_WRAPPER_MODE",
@@ -266,14 +256,6 @@ public:
                 opts.emplace_back("--include-path=" + path);
             }
             };
-        // #ifndef __HGGCCC__
-        // #if defined(ACOMPUTE_VERSION) && ACOMPUTE_VERSION == 10700
-        //     opts_insert({"--gpu-architecture=compute_90a"});
-        // #elif defined(ACOMPUTE_VERSION) && ACOMPUTE_VERSION == 20000
-        //     opts_insert({"--gpu-architecture=compute_100a"});
-        // #else
-        //     opts_insert({"--gpu-architecture=compute_80"});
-        // #endif
             if (getenv("CUDA_HOME") == nullptr) {
               printf("No CUDA_HOME exist\n");
             }
@@ -295,12 +277,11 @@ public:
             opts_insert({"-DNDEBUG", "-DUSE_CLANG", "-no-cache"});
             if (arch == AC_PPU0010) {
                 opts_insert({
-                    "-DACOMPUTE_VERSION=10000",
+                    "--ppu-arch=ppu001",
                 });
             } else if (arch == AC_PPU0015) {
                 opts_insert({
                     "--ppu-arch=ppu0015",
-                    "-DACOMPUTE_VERSION=10500",
                     "--ppu-tuning-options=-ppu-patch-fence-ppu=false",
                     "--ppu-tuning-options=-wno-loop-miss-transform",
                     "--ppu-tuning-options=-ppu-simt-branch=false",
@@ -314,28 +295,7 @@ public:
                     "--ppu-tuning-options=-ppu-pref-mma-reuse=true",
                     "--ppu-tuning-options=-regalloc=pbqp",
                 });
-            } else if (arch == AC_PPU0017) {
-                opts_insert({
-                    #ifdef ClusterGroupSync
-                    "-DClusterGroupSync",
-                    #endif
-                    #if defined(ACOMPUTE_VERSION) && ACOMPUTE_VERSION == 10700
-                    fp8_promotion.c_str(),
-                    use_mma_k48.c_str(),
-                    #endif
-                    "--gpu-architecture=compute_90a",
-                    "-DACOMPUTE_VERSION=10700",
-                    "--ppu-arch=ppu0017",
-                    "--ppu-tuning-options=-ppu-patch-fence-ppu=false",
-                    "--ppu-tuning-options=-wno-loop-miss-transform",
-                    "--ppu-tuning-options=-ppu-simt-branch=false",
-                    "--ppu-tuning-options=-ppu-cg-to-kp1=true",
-                    "--ppu-tuning-options=-ppu-fix-uninit=true",
-                    "-DHGGC_COMPILER_WRAPPER_MODE",
-                    // "--ppu-tuning-options=-ppu-force-defer-sync=true",
-                });
             }
-        // #endif
 
             std::string standard = "--std=c++17";
             opts.emplace_back(standard);

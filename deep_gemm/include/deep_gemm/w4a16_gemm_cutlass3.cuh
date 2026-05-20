@@ -4,14 +4,14 @@
 #pragma clang diagnostic ignored "-Wcuda-compat"
 #pragma clang diagnostic ignored "-Wswitch"
 
-#include "ppu/cute/tensor_mix.hpp"
-#include "ppu/gemm/config/gemm_operands.hpp"
-#include "ppu/cute/atom/mma_traits_acompute10000.hpp"
-#include "ppu/cute/atom/mma_traits_acompute10500.hpp"
-#include "ppu/cute/atom/copy_traits_acompute10000_aiu.hpp"
-#include "ppu/cute/atom/copy_traits_acompute10500_aiu.hpp"
-#include "ppu/cute/algorithm/copy.hpp"
-#include "ppu/cutlass/fast_numeric_conversion_for_mix_gemm.h"
+#include "cute/ppu_tensor_mix.hpp"
+#include "cutlass/gemm/config/gemm_operands.hpp"
+#include "cute/atom/mma_traits_ppu0010.hpp"
+#include "cute/atom/mma_traits_ppu0015.hpp"
+#include "cute/atom/copy_traits_ppu0010_aiu.hpp"
+#include "cute/atom/copy_traits_ppu0015_aiu.hpp"
+#include "cute/algorithm/ppu_copy.hpp"
+#include "cutlass/fast_numeric_conversion_for_mix_gemm.h"
 #include "profiling_interface.hpp"
 #include "scheduler_cutlass3.cuh"
 #include "fused_scheduler.cuh"
@@ -53,9 +53,14 @@ public:
     deep_gemm::FusedGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND, kNumGroups, N_Blocks, scheduler_swizzle>,
     deep_gemm::DeepGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND, kNumGroups, N_Blocks, scheduler_swizzle>
   >;
+#if __HGGC_ARCH__ == 100
+    using ArchTag = cutlass::arch::PPU0010;
+#else
+    using ArchTag = cutlass::arch::PPU0015;
+#endif
 
   // mma
-  using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ElementA, ElementA, ElementAcc>::type;
+  using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementA, ElementA, ElementAcc>::type;
   static constexpr int WarpsOnM = BlockM / WarpM;
   static constexpr int WarpsOnN = BlockN / 64; // WarpN = 64
   static constexpr int WarpsOnK = BlockK / WarpK;
@@ -75,7 +80,7 @@ public:
   using DefaultOperandA = cute::conditional_t<
     Fused,
     cutlass::gemm::config::DefaultGemm_TensorOpSm80_Operand<ElementA, false, AlignA, Int<BlockK>, MaxThreadsPerBlock, ACopyInst>,
-    cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, false, Int<BlockM>, Int<BlockK>, false, 0, true>
+    cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, false, Int<BlockM>, Int<BlockK>, false, 0, true>
   >;
   using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom;
   using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
@@ -85,7 +90,7 @@ public:
 
   // sB
   using TileB = Shape<Int<BlockK / 16>, Int<BlockN * 2>>;
-  using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<int, false, decltype(get<0>(TileB{})), decltype(get<1>(TileB{})), false, 0, false>;
+  using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, int, false, decltype(get<0>(TileB{})), decltype(get<1>(TileB{})), false, 0, false>;
   using SmemLayoutAtomB = typename DefaultOperandB::SmemLayoutAtom;
   using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
   using SmemLayoutB = decltype(tile_to_shape(SmemLayoutAtomB{}, make_shape(get<0>(TileB{}), get<1>(TileB{}), Int<kNumStages>{})));
@@ -102,7 +107,7 @@ public:
 
   // sScale
   using TileScale = Shape<Int<GroupsPerBlock>, Int<BlockN>>;
-  using DefaultOperandScale = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementScale, false, Int<GroupsPerBlock>, Int<BlockN>, false, 0, false>;
+  using DefaultOperandScale = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementScale, false, Int<GroupsPerBlock>, Int<BlockN>, false, 0, false>;
   using SmemLayoutAtomScale = typename DefaultOperandScale::SmemLayoutAtom;
   using GmemTiledCopyScale = typename DefaultOperandScale::GmemTiledCopy;
   using SmemLayoutScale = decltype(tile_to_shape(SmemLayoutAtomScale{}, make_shape(Int<GroupsPerBlock>{}, Int<BlockN>{}, Int<kNumStages>{})));

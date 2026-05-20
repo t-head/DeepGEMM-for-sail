@@ -1,7 +1,6 @@
 #pragma once
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
-#define ACOMPUTE_VERSION 10500
 
 // #include <iostream>
 #include <cuda_fp8.h>
@@ -15,25 +14,22 @@
 #include "cutlass/workspace.h"
 #include "cutlass/fast_math.h"
 #include "cutlass/kernel_hardware_info.hpp"
-#include "cute/arch/cluster_sm90.hpp"
-#include "cutlass/arch/reg_reconfig.h"
-#include "cutlass/arch/mma_sm90.h"
 #include "cutlass/epilogue/collective/detail.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/trace.h"
-#include "ppu/cute/util.hpp"
-#include "ppu/cutlass/gemm/dispatch_policy.hpp"
+#include "cute/ppu_util.hpp"
+#include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/numeric_types.h"
 #include "cute/tensor.hpp"
 #include "cutlass/numeric_conversion.h"
-#include "ppu/gemm/config/gemm_configs.hpp"
-#include "ppu/cutlass/epilogue/fusion/ppu_callbacks.hpp"
+#include "cutlass/gemm/config/gemm_configs.hpp"
+#include "cutlass/epilogue/fusion/ppu_callbacks.hpp"
 #include "tools/util/include/cutlass/util/packed_stride.hpp"
 #include "scheduler_cutlass3.cuh"
 #include "utils_cutlass3.h"
-#include "ppu/cutlass/gemm/collective/acompute_mma_aiu_multistage_with_scale.hpp"
+#include "cutlass/gemm/collective/ppu_mma_aiu_multistage_with_scale.hpp"
 namespace deep_gemm {
 using namespace cute;
 using cutlass::KernelHardwareInfo;
@@ -1039,6 +1035,7 @@ public:
     using         LayoutC     = LayoutD;
     static constexpr int AlignmentC  = AlignmentD;
 
+    using ArchTag = cutlass::arch::PPU0015;
 
     // Core kernel configurations
     using ElementAccumulator  = float;                                          // Element type for internal accumulation
@@ -1058,7 +1055,7 @@ public:
                                               && (BLOCK_K == 128) && (SHAPE_K % BLOCK_K == 0) && kNumStages == 2;
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+      ArchTag, cutlass::arch::OpClassTensorOp,
       ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
       ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB,
       ElementAccumulator,
@@ -1070,7 +1067,7 @@ public:
     using EpilogueDispatchPolicy = cutlass::epilogue::EpilogueSimtVectorized;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
     using CollectiveEpilogueWithTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
-        cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+        ArchTag, cutlass::arch::OpClassTensorOp,
         TileShape, WarpShape,
         EpilogueTileType,
         ElementCompute, ElementCompute,

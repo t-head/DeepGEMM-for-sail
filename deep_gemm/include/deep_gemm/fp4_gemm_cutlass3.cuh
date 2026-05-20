@@ -1,19 +1,16 @@
 #pragma once
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
-#define ACOMPUTE_VERSION 10500
-
 #include "cutlass/cutlass.h"
 #include "utils.cuh"
 #include <iostream>
 #include "profiling_interface.hpp"
 
-#include "ppu/cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/numeric_types.h"
 #include "cutlass/workspace.h"
 #include "cutlass/fast_math.h"
 #include "cutlass/epilogue/collective/detail.hpp"
-#include "cutlass/epilogue/collective/sm70_epilogue_vectorized.hpp"
 #include "cute/algorithm/functional.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/algorithm/gemm.hpp"
@@ -21,17 +18,17 @@
 #include "cute/numeric/integral_constant.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
 #include "cute/tensor.hpp"
-#include "ppu/cute/util.hpp"
+#include "cute/ppu_util.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/gemm/gemm.h"
-#include "ppu/ppu_include.hpp"
+#include "ppu_include.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/trace.h"
-#include "ppu/gemm/config/gemm_configs.hpp"
-#include "ppu/gemm/config/gemm_operands.hpp"
+#include "cutlass/gemm/config/gemm_configs.hpp"
+#include "cutlass/gemm/config/gemm_operands.hpp"
 #include "cutlass/numeric_conversion.h"
 #include "tools/util/include/cutlass/util/host_tensor.h"
 #include "tools/util/include/cutlass/util/packed_stride.hpp"
@@ -86,7 +83,6 @@ class DeepGemmUniversal <
   using CollectiveMainloop = CollectiveMainloop_;
   using TileShape = typename CollectiveMainloop::TileShape;
   using TiledMma  = typename CollectiveMainloop::TiledMma;
-  using ArchTag   = typename CollectiveMainloop::ArchTag;
   using ElementA  = typename CollectiveMainloop::ElementA;
   using StrideA   = typename CollectiveMainloop::StrideA;
   using ElementB  = typename CollectiveMainloop::ElementB;
@@ -677,7 +673,6 @@ public:
   using CollectiveMainloop = CollectiveMainloop_;
   using TileShape = typename CollectiveMainloop::TileShape;
   using TiledMma  = typename CollectiveMainloop::TiledMma;
-  using ArchTag   = typename CollectiveMainloop::ArchTag;
   using ElementA  = typename CollectiveMainloop::ElementA;
   using StrideA   = typename CollectiveMainloop::StrideA;
   using ElementB  = typename CollectiveMainloop::ElementB;
@@ -1059,7 +1054,8 @@ struct CollectiveMmaScaleFp4
   using SmemLayoutAtomSFA = SmemLayoutAtomSFA_;
   using GmemTiledCopySFB = GmemTiledCopySFB_;
   using SmemLayoutAtomSFB = SmemLayoutAtomSFB_;
-  using ArchTag = typename DispatchPolicy::ArchTag;
+  // PPU cutlass3.6 will not bring arch tag in dispatch policy, bring in template of collective mma directly if needed
+  // using ArchTag = typename DispatchPolicy::ArchTag;
   using ElementSFA = ElementSFA_;
   using StrideSFA = StrideSFA_;
   using ElementSFB = ElementSFB_;
@@ -1604,9 +1600,9 @@ public:
         static constexpr bool TransA = false;
         static constexpr bool TransB = false;
 
-        using DispatchPolicy = cutlass::gemm::MainloopWithScaleAcompute10500Aiu<kNumStages>;
-        using GemmOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BlockM>, Int<BlockK>, false>;
-        using GemmOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BlockN>, Int<BlockK>, true>;
+        using DispatchPolicy = cutlass::gemm::MainloopWithScalePPU0015Aiu<kNumStages>;
+        using GemmOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, ElementA, TransA, Int<BlockM>, Int<BlockK>, false>;
+        using GemmOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, ElementB, TransB, Int<BlockN>, Int<BlockK>, true>;
 
         using TransformA = cute::identity;
         using TransformB = cute::identity;
@@ -1627,7 +1623,7 @@ public:
         constexpr bool swap = true;
         constexpr int StageStride = 0;
         constexpr bool swzl = false;
-        using GemmOperandSFA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementSFA, TransSFA, Int<SFATileM>, Int<SFATileK>, swap, StageStride, swzl>;
+        using GemmOperandSFA = cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, ElementSFA, TransSFA, Int<SFATileM>, Int<SFATileK>, swap, StageStride, swzl>;
 
         // Use Aiu for SFB
         using ElementSFB = uint16_t;
@@ -1641,9 +1637,9 @@ public:
         constexpr int SFBTileN = TransSFB ? cute::max(ScaleNsPerTile, MinAiuContElemSizeSFB) : ScaleNsPerTile;
         constexpr int SFBTileK = TransSFB ? ScaleKsPerTileSFB : cute::max(ScaleKsPerTileSFB, MinAiuContElemSizeSFB);
 
-        using GemmOperandSFB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementSFB, TransSFB, Int<SFBTileN>, Int<SFBTileK>, swap, StageStride, swzl>;
+        using GemmOperandSFB = cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, ElementSFB, TransSFB, Int<SFBTileN>, Int<SFBTileK>, swap, StageStride, swzl>;
 
-        using MmaInst = Acompute10500_16x16x64_F32F4F4F32_TN;
+        using MmaInst = PPU0015_16x16x64_F32F4F4F32_TN;
 
         using TiledMma = cute::TiledMMA<
         cute::MMA_Atom<MmaInst>,

@@ -1,6 +1,6 @@
 #pragma once
 #include "tools/util/include/cutlass/util/packed_stride.hpp"
-#include "ppu/ppu_include.hpp"
+#include "ppu_include.hpp"
 #include "cute_tie.cuh"
 #include "utils.cuh"
 #include "utils_cutlass3.h"
@@ -38,7 +38,6 @@ public:
   using ElementCompute      = float;
   using ElementScale        = float;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
-  using ArchTag = cutlass::arch::Sm80;
   static constexpr int BLOCK_M = BLOCK_KV;
   static constexpr int BLOCK_N = BLOCK_QH;
   static constexpr int BLOCK_K = kHeadDim;
@@ -55,7 +54,13 @@ public:
   using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>;
   static constexpr int WarpOnM = BLOCK_M / WARP_M;
   static constexpr int WarpOnN = BLOCK_N / WARP_N;
-  using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ElementQK,ElementQK,ElementAcc>::type;
+#if __HGGC_ARCH__ == 100
+    using ArchTag = cutlass::arch::PPU0010;
+#else
+    using ArchTag = cutlass::arch::PPU0015;
+#endif
+
+  using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementQK,ElementQK,ElementAcc>::type;
   using MmaK_type = typename cutlass::platform::conditional<sizeof(ElementQK) == 2, _16, _32 >::type;
 
 #if ENABLE_WARP_CONTIG_LAYOUT
@@ -85,8 +90,8 @@ public:
 
   static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
   static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
-  using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementQK, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
-  using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementQK, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
+  using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementQK, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
+  using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementQK, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
   // A
   using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
   using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
@@ -265,7 +270,7 @@ public:
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
-    // printf("run acompute aiu deepgemm persistent!!!");
+    // printf("run ppu aiu deepgemm persistent!!!");
     using namespace cute;
     using X = Underscore;
 

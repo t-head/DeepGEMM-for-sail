@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <cuda_fp8.h>
 #include "cute/tensor.hpp"
-#include "cute/arch/cluster_sm90.hpp"
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
 #include "../../jit/kernel_runtime.hpp"
@@ -18,7 +17,7 @@
 #include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
-#include "ppu/cutlass/detail/blockwise_scale_layout.hpp"
+#include "cutlass/detail/blockwise_scale_layout.hpp"
 #include "../../../deep_gemm/include/deep_gemm/utils_rtc.cuh"
 #include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
 #include "int8_gemm.hpp"
@@ -293,12 +292,14 @@ using         ElementC    = ElementD;
 using         LayoutC     = LayoutD;
 static constexpr int AlignmentC  = AlignmentD;
 
+using ArchTag = cutlass::arch::PPU0015;
+
 // Core kernel configurations
 using ElementAccumulator  = float;                                          // Element type for internal accumulation
 using ElementCompute      = float;                                          // Element type for epilogue computation
 using ElementScalar    = ElementCompute;
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-  cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+  ArchTag, cutlass::arch::OpClassTensorOp,
   ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
   ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB,
   ElementAccumulator,  // ElementAccumulator
@@ -311,8 +312,8 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
 using EpilogueDispatchPolicy = cutlass::epilogue::EpilogueSimtVectorized;
 using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 using CollectiveEpilogueWithTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
-    Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>,
+    ArchTag, cutlass::arch::OpClassTensorOp,
+    Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>, 
     Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>,
     EpilogueTileType,
     ElementCompute, ElementCompute,

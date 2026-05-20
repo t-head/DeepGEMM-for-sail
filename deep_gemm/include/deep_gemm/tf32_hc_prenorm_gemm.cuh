@@ -27,14 +27,14 @@
 #include "cutlass/gemm/collective/collective_mma.hpp"
 #include "cutlass/detail/layout.hpp"
 
-#include "ppu/cute/util.hpp"
-#include "ppu/cutlass/gemm/dispatch_policy.hpp"
+#include "cute/ppu_util.hpp"
+#include "cutlass/gemm/dispatch_policy.hpp"
 #include "tools/util/include/cutlass/util/packed_stride.hpp"
 #include "scheduler_cutlass3.cuh"
 #include "utils_cutlass3.h"
 #include "utils.cuh"
 
-#include "ppu/ppu_include.hpp"
+#include "ppu_include.hpp"
 
 using namespace cute;
 
@@ -207,7 +207,7 @@ sm80_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
     const uint32_t num_total_stages = kNumKBlocksPerSplit + (k_split_idx < kRemainKBlocks);
 
     using MmaAtom = MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>;
-    // using MmaAtom = MMA_Atom<Acompute10500_16x16x8_F32TF32TF32F32_TN>;
+    // using MmaAtom = MMA_Atom<PPU0015_16x16x8_F32TF32TF32F32_TN>;
     using TiledMma = cute::TiledMMA<MmaAtom, Layout<Shape<Int<BLOCK_M / 16>, _1, _1>>>;
     TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tid);

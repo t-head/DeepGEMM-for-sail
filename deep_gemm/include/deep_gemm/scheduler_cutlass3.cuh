@@ -285,11 +285,9 @@ struct DeepGemmScheduler {
 
         // cutlass3 change
         // rtc will use this to get grid size on host
-        #ifndef ACOMPUTE_VERSION
-            // We only need the tile and cluster shape during scheduler setup, so let FTAD do the magic
-            static_assert(cute::is_static<TileShape>::value);
-            static_assert(cute::is_static<ClusterShape>::value);
-        #endif
+        // We only need the tile and cluster shape during scheduler setup, so let FTAD do the magic
+        static_assert(cute::is_static<TileShape>::value);
+        static_assert(cute::is_static<ClusterShape>::value);
 
         // dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shape_mnkl, tile_shape, cluster_shape);
         auto problem_shape = cutlass::gemm::to_gemm_coord(problem_shape_mnkl);

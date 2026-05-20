@@ -34,7 +34,8 @@ third_party_include_dirs = [
     'third-party/cutlass/include/aiu',
     'third-party/cutlass3/include/cute',
     'third-party/cutlass3/include/cutlass',
-    'third-party/cutlass3/include/ppu',
+    'third-party/cutlass3/include/ppu_include.hpp',
+    'third-party/cutlass3/include/accutlass.hpp',
     'third-party/cutlass3/tools'
 ]
 

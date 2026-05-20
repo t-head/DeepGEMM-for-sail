@@ -1,5 +1,5 @@
 #pragma once
-#include "ppu/ppu_include.hpp"
+#include "ppu_include.hpp"
 #include "cute_tie.cuh"
 #include "utils.cuh"
 #include "utils_cutlass3.h"
@@ -23,7 +23,7 @@ namespace cutlass::gemm::kernel {
 //   - k_sf is uint32_t (packed e8m0), not float32 per-token scale
 //   - Q/K/SFA/SFB/weights all use AIU load
 //   - Output dtype controlled by ElementLogits (float or bfloat16)
-//   - MMA atom: Acompute10500_16x16x64_F32F4F4F32_TN (6-operand)
+//   - MMA atom: PPU10500_16x16x64_F32F4F4F32_TN (6-operand)
 //   - Non-paged scheduling using cu_seq_len_k_start / cu_seq_len_k_end
 // ============================================================================
 
@@ -43,7 +43,6 @@ public:
     using ElementCompute = float;
     using ElementScale = uint8_t;
     using OperatorClass = cutlass::arch::OpClassTensorOp;
-    using ArchTag = cutlass::arch::Sm80;
 
     static constexpr int BLOCK_M = BLOCK_KV;
     static constexpr int BLOCK_N = BLOCK_QH;
@@ -62,7 +61,7 @@ public:
     static constexpr int WarpOnN = BLOCK_N / WARP_N;
 
     // ── MMA: F32F4F4F32 (16×16×64) ────────────────────────────────────
-    using MmaInst = Acompute10500_16x16x64_F32F4F4F32_TN;
+    using MmaInst = PPU0015_16x16x64_F32F4F4F32_TN;
     using MmaK_type = _32;
 
     static constexpr int InstM = 16;
@@ -81,9 +80,9 @@ public:
 
     // ── AIU operands for Q/K ────────────────────────────────────────────
     using DefaultOperandA =
-        cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementQK, false, Int<BLOCK_M>, Int<BLOCK_K>, false>;
+        cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, ElementQK, false, Int<BLOCK_M>, Int<BLOCK_K>, false>;
     using DefaultOperandB =
-        cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementQK, false, Int<BLOCK_N>, Int<BLOCK_K>, true>;
+        cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015,ElementQK, false, Int<BLOCK_N>, Int<BLOCK_K>, true>;
     // A (K)
     using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom;
     using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
@@ -113,7 +112,7 @@ public:
     // ── SFA / SFB / Weight AIU operands ────────────────────────────────
     // SFA (k_sf): one uint32_t per KV row
     using DefaultOperandSFA =
-        cutlass::gemm::config::DefaultGemm_AIU_Operand<uint32_t, false, _1, Int<BLOCK_M>, false, 0, false>;
+        cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, uint32_t, false, _1, Int<BLOCK_M>, false, 0, false>;
     using SmemLayoutAtomSFA = typename DefaultOperandSFA::SmemLayoutAtom;
     using GmemTiledCopySFA = typename DefaultOperandSFA::GmemTiledCopy;
     using SmemLayoutSFA =
@@ -121,14 +120,14 @@ public:
 
     // SFB (q_sf / weights): one uint32_t/float32 per Q head
     using DefaultOperandSFB =
-        cutlass::gemm::config::DefaultGemm_AIU_Operand<uint32_t, false, _1, Int<BLOCK_N>, false, 0, false>;
+        cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, uint32_t, false, _1, Int<BLOCK_N>, false, 0, false>;
     using SmemLayoutAtomSFB = typename DefaultOperandSFB::SmemLayoutAtom;
     using GmemTiledCopySFB = typename DefaultOperandSFB::GmemTiledCopy;
     using SmemLayoutSFB =
         decltype(tile_to_shape(SmemLayoutAtomSFB{}, make_shape(_1{}, Int<BLOCK_N>{}, Int<kNumQStages>{})));
 
     using DefaultOperandWeight =
-        cutlass::gemm::config::DefaultGemm_AIU_Operand<float, false, _1, Int<BLOCK_N>, false, 0, false>;
+        cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, float, false, _1, Int<BLOCK_N>, false, 0, false>;
     using SmemLayoutAtomWeight = typename DefaultOperandWeight::SmemLayoutAtom;
     using GmemTiledCopyWeight = typename DefaultOperandWeight::GmemTiledCopy;
     using SmemLayoutWeight =

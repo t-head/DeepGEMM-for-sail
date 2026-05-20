@@ -9,6 +9,7 @@ namespace cutlass::gemm::collective {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <
+  typename Arch_,
   int Stages,
   class KernelSchedule,
   class TileShape_,
@@ -26,7 +27,8 @@ template <
   class SmemCopyAtomB_,
   class TransformB_>
 struct CollectiveMma<
-    MainloopAcomputeAiuA8W8OverlapPrologue<Stages, KernelSchedule>,
+    Arch_,
+    MainloopPPUAiuA8W8OverlapPrologue<Stages, KernelSchedule>,
     TileShape_,
     ElementA_,
     StrideA_,
@@ -44,7 +46,7 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopAcomputeAiuA8W8OverlapPrologue<Stages, KernelSchedule>;
+  using DispatchPolicy = MainloopPPUAiuA8W8OverlapPrologue<Stages, KernelSchedule>;
   using TileShape = TileShape_;
   using ElementA = ElementA_;
   using StrideA = StrideA_;
@@ -823,7 +825,7 @@ public:
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
-    // printf("run acompute aiu deepgemm persistent!!!");
+    // printf("run ppu aiu deepgemm persistent!!!");
     using X = Underscore;
 
     // Preconditions

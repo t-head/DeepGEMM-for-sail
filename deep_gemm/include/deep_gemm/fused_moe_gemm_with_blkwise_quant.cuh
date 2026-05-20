@@ -5,17 +5,17 @@
 #include "utils.cuh"
 #include "profiling_interface.hpp"
 
-#include "ppu/cute/tensor_mix.hpp"
-#include "ppu/gemm/config/gemm_operands.hpp"
+#include "cute/ppu_tensor_mix.hpp"
+#include "cutlass/gemm/config/gemm_operands.hpp"
 
-#include "ppu/cute/atom/mma_traits_acompute10000.hpp"
-#include "ppu/cute/atom/mma_traits_acompute10500.hpp"
-#include "ppu/cute/atom/copy_traits_acompute10000_aiu.hpp"
-#include "ppu/cute/atom/copy_traits_acompute10500_aiu.hpp"
-#include "ppu/cute/algorithm/copy.hpp"
+#include "cute/atom/mma_traits_ppu0010.hpp"
+#include "cute/atom/mma_traits_ppu0015.hpp"
+#include "cute/atom/copy_traits_ppu0010_aiu.hpp"
+#include "cute/atom/copy_traits_ppu0015_aiu.hpp"
+#include "cute/algorithm/copy.hpp"
 
-#include "ppu/cutlass/detail/blockwise_scale_layout.hpp"
-#include "ppu/cutlass/gemm/collective/ppu_promotion_with_scale_accumulation.hpp"
+#include "cutlass/detail/blockwise_scale_layout.hpp"
+#include "cutlass/gemm/collective/ppu_promotion_with_scale_accumulation.hpp"
 
 #include "fused_scheduler.cuh"
 #include "fused_gemm_util.cuh"
@@ -50,8 +50,13 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
     using ElementScale = float;
     using TileShape = cute::Shape<cute::Int<BLOCK_M>, cute::Int<BLOCK_N>, cute::Int<BLOCK_K>>;
     using WarpShape = cute::Shape<cute::Int<WARP_M>, cute::Int<WARP_N>, cute::Int<BLOCK_K>>;
+#if __HGGC_ARCH__ == 100
+    using ArchTag = cutlass::arch::PPU0010;
+#else
+    using ArchTag = cutlass::arch::PPU0015;
+#endif
 
-    using MmaInst = typename cutlass::gemm::config::GetMmaInst<SrcT, SrcT, AccT>::type;
+    using MmaInst = typename cutlass::gemm::config::GetMmaInst<ArchTag, SrcT, SrcT, AccT>::type;
     using TiledMma = cute::TiledMMA<
       cute::MMA_Atom<MmaInst>,
       cute::Layout<Shape< Int<BLOCK_M / WARP_M>, Int<BLOCK_N / WARP_N>, _1>>>;
@@ -91,7 +96,7 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
 
     // load B from hbm to tsm: use aiu load.
     using GemmOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<
-            SrcT, false, cute::Int<BLOCK_N>, cute::Int<BLOCK_K>, true>;
+            ArchTag, SrcT, false, cute::Int<BLOCK_N>, cute::Int<BLOCK_K>, true>;
     using SmemLayoutB = decltype(tile_to_shape(typename GemmOperandB::SmemLayoutAtom{},
             Shape<cute::Int<BLOCK_N>, cute::Int<BLOCK_K>, cute::Int<kNumStages>>{}));
 
@@ -128,7 +133,7 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
     constexpr bool TransSFB = false;  // k-major is false
     static constexpr uint32_t SFBTileN = TransSFB ? cute::max(ScaleNsPerTile, MinAiuContElemSize) : ScaleNsPerTile;
     static constexpr uint32_t SFBTileK = TransSFB ? ScaleKsPerTile : cute::max(ScaleKsPerTile, MinAiuContElemSize);
-    using GemmOperandSFB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementScale, TransSFB, Int<SFBTileN>, Int<SFBTileK>, true, 1, false>;
+    using GemmOperandSFB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementScale, TransSFB, Int<SFBTileN>, Int<SFBTileK>, true, 1, false>;
     using RealSmemLayoutAtomSFB = Layout<Shape<Int<SFBTileN>, Int<SFBTileK>>, Stride<Int<SFBTileK>, _1>>;
     using RealSmemLayoutSFB = decltype(tile_to_shape(RealSmemLayoutAtomSFB{},
             Shape<cute::Int<SFBTileN>, cute::Int<SFBTileK>, cute::Int<kNumStages>>{}));

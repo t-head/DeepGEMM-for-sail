@@ -1,11 +1,11 @@
 #pragma once
 #include <cub/cub.cuh>
 
-#include "ppu/cute/tensor_mix.hpp"
-#include "ppu/gemm/config/gemm_operands.hpp"
-#include "ppu/cute/atom/copy_traits_acompute10000_aiu.hpp"
-#include "ppu/cute/atom/copy_traits_acompute10500_aiu.hpp"
-#include "ppu/cute/algorithm/copy.hpp"
+#include "cute/ppu_tensor_mix.hpp"
+#include "cutlass/gemm/config/gemm_operands.hpp"
+#include "cute/atom/copy_traits_ppu0010_aiu.hpp"
+#include "cute/atom/copy_traits_ppu0015_aiu.hpp"
+#include "cute/algorithm/ppu_copy.hpp"
 
 namespace deep_gemm {
 using cute::_;

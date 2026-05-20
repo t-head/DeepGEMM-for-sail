@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <cuda_fp8.h>
 #include "cute/tensor.hpp"
-#include "cute/arch/cluster_sm90.hpp"
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
 #include "../../jit/kernel_runtime.hpp"
@@ -19,7 +18,7 @@
 #include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
-#include "ppu/cutlass/detail/blockwise_scale_layout.hpp"
+#include "cutlass/detail/blockwise_scale_layout.hpp"
 #include "../../../deep_gemm/include/deep_gemm/utils_rtc.cuh"
 #include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
 
@@ -148,7 +147,7 @@ constexpr int WARP_M = {};
 constexpr int WARP_N = {};
 constexpr int STAGES = {};
 
-using ArchTag = cutlass::arch::Sm80;
+using ArchTag = cutlass::arch::PPU0015;
 
 using         ElementA    = {};
 using         LayoutA     = cutlass::layout::RowMajor;
@@ -178,7 +177,7 @@ static constexpr int WarpOnN = BLOCK_N / WARP_N;
 constexpr bool kEnableSboOverlap = {};
 constexpr KernelType kKernelType = KernelType::{};
 
-using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ElementA,ElementA,ElementAccumulator>::type;
+using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementA,ElementB,ElementAccumulator>::type;
 using TiledMma = TiledMMA<
     MMA_Atom<MmaInst>,
     Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
@@ -199,15 +198,16 @@ using KernelSchedule = cute::conditional_t<
       cutlass::gemm::KernelAiuMultistage>>;
 using DispatchPolicy = cute::conditional_t<
     EnableOverlapPrologue,
-    cutlass::gemm::MainloopAcomputeAiuA8W8OverlapPrologue<STAGES, KernelSchedule>,
-    cutlass::gemm::MainloopAcomputeAiuA8W8<STAGES, KernelSchedule>>;
+    cutlass::gemm::MainloopPPUAiuA8W8OverlapPrologue<STAGES, KernelSchedule>,
+    cutlass::gemm::MainloopPPUAiuA8W8<STAGES, KernelSchedule>>;
 static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
 static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
 static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
 static constexpr int SmemLayoutStageStrideA = EnableOverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
 static constexpr int SmemLayoutStageStrideB = EnableOverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
-using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
-using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
+using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
+using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
+
 // A
 using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
 using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
@@ -219,6 +219,7 @@ using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
 
 // Mainloop
 using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+    ArchTag,
     DispatchPolicy, TileShape,
     ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
     ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
@@ -239,7 +240,7 @@ static constexpr int AlignmentC = 16 / sizeof(ElementC);
 using DefaultOperation = cutlass::epilogue::fusion::LinearCombination<ElementD, ElementCompute>;
 using EpilogueSchedule = typename cutlass::epilogue::EpilogueSimtVectorized;
 using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+    ArchTag, cutlass::arch::OpClassTensorOp,
     TileShape, WarpShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
     float, float,

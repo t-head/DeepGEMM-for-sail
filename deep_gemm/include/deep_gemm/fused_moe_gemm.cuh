@@ -5,14 +5,14 @@
 #include "utils.cuh"
 #include "profiling_interface.hpp"
 
-#include "ppu/cute/tensor_mix.hpp"
-#include "ppu/gemm/config/gemm_operands.hpp"
+#include "cute/ppu_tensor_mix.hpp"
+#include "cutlass/gemm/config/gemm_operands.hpp"
 
-#include "ppu/cute/atom/mma_traits_acompute10000.hpp"
-#include "ppu/cute/atom/mma_traits_acompute10500.hpp"
-#include "ppu/cute/atom/copy_traits_acompute10000_aiu.hpp"
-#include "ppu/cute/atom/copy_traits_acompute10500_aiu.hpp"
-#include "ppu/cute/algorithm/copy.hpp"
+#include "cute/atom/mma_traits_ppu0010.hpp"
+#include "cute/atom/mma_traits_ppu0015.hpp"
+#include "cute/atom/copy_traits_ppu0010_aiu.hpp"
+#include "cute/atom/copy_traits_ppu0015_aiu.hpp"
+#include "cute/algorithm/ppu_copy.hpp"
 
 #include "fused_scheduler.cuh"
 #include "fused_gemm_util.cuh"
@@ -38,8 +38,13 @@ bf16_gemm_fused_moe_kernel(const GemmArgs args) {
     using AccT = float;
     using TileShape = cute::Shape<cute::Int<BLOCK_M>, cute::Int<BLOCK_N>, cute::Int<BLOCK_K>>;
     using WarpShape = cute::Shape<cute::Int<WARP_M>, cute::Int<WARP_N>, cute::Int<BLOCK_K>>;
+#if __HGGC_ARCH__ == 100
+    using ArchTag = cutlass::arch::PPU0010;
+#else
+    using ArchTag = cutlass::arch::PPU0015;
+#endif
 
-    using MmaInst = typename cutlass::gemm::config::GetMmaInst<SrcT, SrcT, AccT>::type;
+    using MmaInst = typename cutlass::gemm::config::GetMmaInst<ArchTag, SrcT, SrcT, AccT>::type;
     using TiledMma = cute::TiledMMA<
       cute::MMA_Atom<MmaInst>,
       cute::Layout<Shape< Int<BLOCK_M / WARP_M>, Int<BLOCK_N / WARP_N>, _1>>>;
@@ -76,7 +81,7 @@ bf16_gemm_fused_moe_kernel(const GemmArgs args) {
 
     // load B from hbm to tsm: use aiu load.
     using GemmOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<
-            SrcT, false, cute::Int<BLOCK_N>, cute::Int<BLOCK_K>, true>;
+            ArchTag, SrcT, false, cute::Int<BLOCK_N>, cute::Int<BLOCK_K>, true>;
     using SmemLayoutB = decltype(tile_to_shape(typename GemmOperandB::SmemLayoutAtom{},
             Shape<cute::Int<BLOCK_N>, cute::Int<BLOCK_K>, cute::Int<kNumStages>>{}));
 

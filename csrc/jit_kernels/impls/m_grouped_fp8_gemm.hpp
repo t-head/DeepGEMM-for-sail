@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <cuda_fp8.h>
 #include "cute/tensor.hpp"
-#include "cute/arch/cluster_sm90.hpp"
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
 #include "../../jit/kernel_runtime.hpp"
@@ -18,7 +17,7 @@
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
-#include "ppu/cutlass/detail/blockwise_scale_layout.hpp"
+#include "cutlass/detail/blockwise_scale_layout.hpp"
 #include "../../../deep_gemm/include/deep_gemm/utils_rtc.cuh"
 #include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
 #include "int8_gemm.hpp"

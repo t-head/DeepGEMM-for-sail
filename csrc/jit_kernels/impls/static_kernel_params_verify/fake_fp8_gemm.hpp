@@ -54,14 +54,14 @@ static size_t get_fp8_tample_params_size() {
   static constexpr int AlignmentC  = AlignmentD;
 
   struct Debug_CollectiveMainloop; 
-
+  using ArchTag = cutlass::arch::PPU0015;
 
   // Core kernel configurations
   using ElementAccumulator  = float;                                          // Element type for internal accumulation
   using ElementCompute      = float;                                          // Element type for epilogue computation
   using ElementScalar    = ElementCompute;
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+    ArchTag, cutlass::arch::OpClassTensorOp,
     ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
     ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB,
     ElementAccumulator,  // ElementAccumulator
@@ -74,7 +74,7 @@ static size_t get_fp8_tample_params_size() {
   using EpilogueDispatchPolicy = cutlass::epilogue::EpilogueSimtVectorized;
   using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
   using CollectiveEpilogueWithTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
-      cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+      ArchTag, cutlass::arch::OpClassTensorOp,
       Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>, 
       Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>,
       EpilogueTileType,

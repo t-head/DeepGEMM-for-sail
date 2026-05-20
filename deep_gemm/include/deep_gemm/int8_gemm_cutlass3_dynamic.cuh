@@ -1,9 +1,9 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/mma.h"
-#include "ppu/cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/dispatch_policy.hpp"
 
-#include "ppu/ppu_include.hpp"
+#include "ppu_include.hpp"
 
 
 namespace cutlass::gemm {
@@ -90,9 +90,9 @@ struct PPUTypeBuilder {
   using LayoutB     = cutlass::layout::ColumnMajor;
   using LayoutC     = cutlass::layout::RowMajor;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
-  using ArchTag = cutlass::arch::Sm80;
   static constexpr bool TransA = false;
   static constexpr bool TransB = false;
+  using ArchTag = cutlass::arch::PPU0015;
 
   using ProblemShape = Shape<int,int,int,int>;
 
@@ -108,7 +108,7 @@ struct PPUTypeBuilder {
   static constexpr int WarpOnM = BLOCK_M / WARP_M;
   static constexpr int WarpOnN = BLOCK_N / WARP_N;
 
-  using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ElementA,ElementB,ElementAcc>::type;
+  using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementA,ElementB,ElementAcc>::type;
   using TiledMma = TiledMMA<
       MMA_Atom<MmaInst>,
       Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
@@ -116,8 +116,8 @@ struct PPUTypeBuilder {
 
   static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
 
-  using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
-  using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
+  using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
+  using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
   // A
   using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
   using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
@@ -128,9 +128,10 @@ struct PPUTypeBuilder {
   using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
 
   using KernelSchedule = cutlass::gemm::KernelAiuMultistage;
-  using DispatchPolicy = cutlass::gemm::MainloopAcomputeAiuA8W8<kNumStages, KernelSchedule>;
+  using DispatchPolicy = cutlass::gemm::MainloopPPUAiuA8W8<kNumStages, KernelSchedule>;
 
   using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+      ArchTag,
       DispatchPolicy, TileShape,
       ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
       ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
@@ -253,7 +254,6 @@ struct DeepGemmDynamicTile {
   using LayoutC = cutlass::layout::RowMajor;
   using LayoutD = LayoutC;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
-  using ArchTag = cutlass::arch::Sm80;
 
   using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
   using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
