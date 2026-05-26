@@ -206,7 +206,11 @@ sm80_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                                (k_split_idx < kRemainKBlocks ? k_split_idx : kRemainKBlocks)) * BLOCK_K;
     const uint32_t num_total_stages = kNumKBlocksPerSplit + (k_split_idx < kRemainKBlocks);
 
-    using MmaAtom = MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>;
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
+    using MmaAtom = MMA_Atom<PPU0015_16x8x8_F32TF32TF32F32_TN>;
+#else
+    using MmaAtom = MMA_Atom<PPU0010_16x16x8_F32TF32TF32F32_TN>;
+#endif
     // using MmaAtom = MMA_Atom<PPU0015_16x16x8_F32TF32TF32F32_TN>;
     using TiledMma = cute::TiledMMA<MmaAtom, Layout<Shape<Int<BLOCK_M / 16>, _1, _1>>>;
     TiledMma tiled_mma;
