@@ -1600,12 +1600,21 @@ def test_fp8_einsum(args) -> None:
             ref_out = torch.einsum('bhr,hdr->bhd', x, y)
         else:
             ref_out = torch.empty_like(out)
-        x_fp8 = per_token_cast_to_fp8(x.view(-1, r), use_ue8m0=False)
-        x_fp8 = x_fp8[0].view(b, h, r), x_fp8[1].view(b, h, ceil_div(r, 128))
-        y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn),
-                    torch.empty((h, ceil_div(d, 128), ceil_div(r, 128)), device='cuda', dtype=torch.float))
-        for i in range(h):
-            y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i], use_ue8m0=False)
+        if quant_type == 'block':
+            x_fp8 = per_token_cast_to_fp8(x.view(-1, r), use_ue8m0=False)
+            x_fp8 = x_fp8[0].view(b, h, r), x_fp8[1].view(b, h, ceil_div(r, 128))
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn),
+                        torch.empty((h, ceil_div(d, 128), ceil_div(r, 128)), device='cuda', dtype=torch.float))
+            for i in range(h):
+                y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i], use_ue8m0=False)
+        elif quant_type == 'channel':
+            x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((b, h, 1), device=tensor_device, dtype=torch.float))
+            y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((h, d, 1), device=tensor_device, dtype=torch.float))
+            for i in range(b):
+                x_fp8[0][i], x_fp8[1][i] = per_custom_dims_cast_to_fp8(x[i], (0, ), False, True)
+            for i in range(h):
+                y_fp8[0][i], y_fp8[1][i] = per_custom_dims_cast_to_fp8(y[i], (0, ), False, True)
+
         deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, out)
     else:
         raise ValueError(f"unsupported expr expression: {expr}!")

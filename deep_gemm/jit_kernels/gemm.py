@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, GemmType
 from .gemm_search_space import MatmulHeuristicsTile
 
 # C++ code templates
@@ -175,10 +175,10 @@ def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False, max_block_n: int = 256) -> \
+                     gemm_type: GemmType=GemmType.DenseGemm, max_block_n: int = 256) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     #FIXME: block m can add 16, and blockM/N could be 512
-    if not is_grouped_contiguous:
+    if gemm_type != GemmType.GroupedContiguous:
         # block_ms = (32, 64, 128, 256)
         block_ms = (256, 128, 64, 32, 16) if k >= 384 else (64, 32, 16)
     else:
@@ -200,7 +200,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
-    min_n_threshold = 1 if (num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False) else 32
+    min_n_threshold = 1 if gemm_type == GemmType.DenseGemm else 32
     for block_m in block_ms:
         if is_ppu1v5_device() and ((m >= 128 and k > 2048) or m >= 256):
             block_ns_after_filter = filter(lambda bn: (bn != n and n >= min_n_threshold) and not (block_m == 16 and bn <= 32), block_ns)

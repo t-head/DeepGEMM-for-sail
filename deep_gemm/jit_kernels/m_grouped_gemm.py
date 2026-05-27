@@ -3,7 +3,7 @@ from typing import Tuple
 
 from .gemm import get_best_configs, get_gemv_best_configs
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_extra_info, is_ppu1v5_device
+from .utils import get_num_sms, ceil_div, get_extra_info, is_ppu1v5_device, GemmType
 import os
 
 # C++ code templates
@@ -109,7 +109,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(lhs: Tuple[torch.Tensor],
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms, gemm_type=GemmType.GroupedContiguous)
     expected_m = ceil_div(m, num_groups)
     extra_info = get_extra_info()
     args = (lhs, rhs, out,
@@ -176,7 +176,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_masked(lhs: Tuple[torch.Tensor],
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True, max_block_n=max_block_n)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedMasked, max_block_n=max_block_n)
     extra_info = get_extra_info()
 
     # Extra checks for TMA store
@@ -282,7 +282,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
         if configs:
             num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
         else:
-            num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_contiguous=False)
+            num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedNoPad)
         extra_info = get_extra_info()
 
         if m_rows is None:

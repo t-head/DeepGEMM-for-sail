@@ -6,6 +6,15 @@ import copy
 
 _num_sms = None
 
+class GemmType(Enum):
+    """Matches C++ enum GemmType in utils_rtc.cuh"""
+    DenseGemm = 0
+    GroupedContiguous = 1
+    GroupedMasked = 2
+    GroupedNoPad = 3
+    GroupedFused = 4
+    BatchGemm = 5
+
 class CompuleMode(Enum):
     COMPILE_AND_RUN = 0
     #ONLY_COMPILE must be 1 to align with sglang deepgemm usage

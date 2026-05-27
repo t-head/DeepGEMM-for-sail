@@ -147,6 +147,7 @@ def get_best_configs_from_lut(m: int, n: int, k: int) -> \
         (256, 4096,  1024): (128, 128,  64, 32,  64, 8),
         (256, 4096,  1536): (128, 128,  64, 32,  64, 8),
         (256, 4096, 12288): (256, 128, 128, 64,  64, 5),
+        (256, 32768, 1024): (256, 128,  64, 64,  64, 4)
     }
     gemm_dense_lut = gemm_dense_a8w8_lut_1v5 if is_ppu1v5_device() else gemm_dense_a8w8_lut
 

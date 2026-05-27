@@ -7,7 +7,7 @@ import warnings
 from functools import lru_cache
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, is_ppu1v5_device
+from .utils import get_num_sms, ceil_div, is_ppu1v5_device, GemmType
 from ..deep_gemm_tuner.autotune_fp4 import lookup_best_config
 # C++ code templates
 includes = ('"../deep_gemm/fp4_gemm_cutlass3.cuh"', )
@@ -280,7 +280,7 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
 
 @lru_cache(maxsize=None)
 def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_nopad: bool = False, is_grouped_masked: bool = False,
+                     gemm_type: GemmType=GemmType.DenseGemm,
                      max_block_n: int = 256) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     assert is_ppu1v5_device(), "mxfp4 is noly supported on PPU-ZW890"
@@ -294,7 +294,7 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
     #       configs = lookup_best_config(total_m, n, k * 2, num_groups, False)
     #   if configs is not None:
     #       return configs
-    if num_groups == 1 and is_grouped_nopad == False and is_grouped_masked == False:
+    if gemm_type == GemmType.DenseGemm:
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms)
 
     block_ms = (256, 128, 64, 32, 16) if k > 768 else (128, 64, 32, 16)

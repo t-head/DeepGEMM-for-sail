@@ -22,5 +22,5 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_fp8_bhr_hdr_bhd()
-    # test_fp8_bhr_hdr_bhd("channel")
+    test_fp8_bhr_hdr_bhd("channel")
 

@@ -4,7 +4,7 @@ from typing import Tuple
 
 from .gemm_fp4 import get_best_configs, get_smem_config_fp4, check_mxfp4_scales_layout, preprocess_mxfp4_scales, _post_preprocess_mxfp4_scales
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div
+from .utils import get_num_sms, ceil_div, GemmType
 
 # C++ code templates
 includes = ('"../deep_gemm/fp4_gemm_cutlass3.cuh"', )
@@ -86,7 +86,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, is_grouped_nopad=True)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedNoPad)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
         # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
 
@@ -182,7 +182,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedMasked)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
         # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
 

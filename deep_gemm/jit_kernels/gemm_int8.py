@@ -5,7 +5,7 @@ from typing import Tuple
 import re
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, get_sm_count
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, get_sm_count, GemmType
 from .gemm_int8_lut import get_best_configs_from_lut
 
 # C++ code templates
@@ -49,7 +49,7 @@ constexpr auto kNumGroups = 1;
 constexpr auto kNumStages = {NUM_STAGES};
 
 // Make a templated grouped GEMM
-using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm>;
+using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm, false, KernelType::{KERNEL_TYPE}>;
 
 // Launch kernel
 gemm_t::run(out, nullptr, nullptr,
@@ -273,14 +273,13 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
 
 @lru_cache(maxsize=None)
 def get_best_configs_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False,
-                     max_block_n: int = 256) -> \
+                     gemm_type: GemmType = GemmType.DenseGemm, max_block_n: int = 256) -> \
         Tuple[int, int, int, int, int, int, int, int, int, dict]:
-    if num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False:
+    if gemm_type == GemmType.DenseGemm or gemm_type == GemmType.BatchGemm:
        return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms)
 
     #FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
-    if not is_grouped_contiguous:
+    if gemm_type != GemmType.GroupedContiguous:
         block_ms = (256, 128, 64, 32, 16) if k >= 384 else (128, 64, 32, 16)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
@@ -456,7 +455,7 @@ def get_best_configs_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: in
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False,
+                     gemm_type: GemmType = GemmType.DenseGemm,
                      max_block_n: int = 256) -> \
         Tuple[int, int, int, int, int, int, int, int, int, dict]:
     lut_result = get_best_configs_from_lut(m, n, k)
@@ -465,9 +464,9 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1)
         return num_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
     if is_ppu1v5_device():
-        return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, is_grouped_contiguous, is_grouped_masked, max_block_n)
+        return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, gemm_type, max_block_n)
     #FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
-    if not is_grouped_contiguous:
+    if gemm_type != GemmType.GroupedContiguous:
         block_ms = (256, 128, 64, 32, 16) if k > 384 else (64, 32, 16)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
@@ -485,7 +484,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
-    min_n_threshold = 1 if (num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False) else 32
+    min_n_threshold = 1 if gemm_type == GemmType.DenseGemm else 32
     for block_m in block_ms:
         # NOTES:
         # for PPU1.0: the block sizes can not be too large, so at least one dim less than 128
@@ -662,6 +661,9 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Do nothing if `m` is zero
     if m == 0:
         return
+    kernel_type = 'Default'
+    if k < 4096:
+        kernel_type = 'OverlapPrologue'
 
     # Auto-tuning with compilation
     global includes, template, includes_cutlass3, template_cutlass3
@@ -684,7 +686,8 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
               'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n,
-              'NUM_STAGES': num_stages},
+              'NUM_STAGES': num_stages,
+              'KERNEL_TYPE': kernel_type},
         space=(),
         # space=generate_search_space(),
         includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,

@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout,get_col_major_tma_aligned_tensor
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout,get_col_major_tma_aligned_tensor, GemmType
 from .gemm_fp8_lut import get_best_configs_from_lut
 from .gemm_int8 import gemm_a8w8_per_channel_nt
 
@@ -257,17 +257,17 @@ def get_best_configs_dense(m: int, n: int, k: int, num_groups: int, num_sms: int
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False,
+                     gemm_type: GemmType = GemmType.DenseGemm,
                      max_block_n: int = 256) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
-    lut_result = get_best_configs_from_lut(m, n, k, num_groups, is_grouped_contiguous, is_grouped_masked)
+    lut_result = get_best_configs_from_lut(m, n, k, num_groups, gemm_type)
     if lut_result:
         best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages = lut_result
         best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k)
         return num_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
-    elif num_groups == 1 and is_grouped_contiguous == False and is_grouped_masked == False:
+    elif gemm_type == GemmType.DenseGemm or gemm_type == GemmType.BatchGemm:
         return get_best_configs_dense(m, n, k, num_groups, num_sms)
-    if not is_grouped_contiguous:
+    if gemm_type != GemmType.GroupedContiguous:
         block_ms = (256, 192, 128, 64, 32, 16) if k > 384 else (64, 32, 16)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
@@ -334,7 +334,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
     assert best_block_m is not None and best_block_n is not None
 
-    if is_grouped_contiguous == False:
+    if gemm_type != GemmType.GroupedContiguous:
         if m > 256 and n >= 256:
             # compute bound, force to best tile
             best_block_m = 192
