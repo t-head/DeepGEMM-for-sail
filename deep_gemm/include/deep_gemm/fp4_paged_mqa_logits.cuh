@@ -185,7 +185,7 @@ public:
         const uint32_t batch_size;
         const uint64_t logits_stride;
         const uint64_t kv_cache_stride_bytes;
-        const uint64_t block_table_stride;
+        const uint32_t block_table_stride;
         const uint32_t* context_lens;
         ElementLogits* logits;
         const uint32_t* block_table;
@@ -614,7 +614,7 @@ class PagedAttentionFP4 {
 public:
     static void run(const ElementQK* ptr_q, const uint32_t* q_sf, const ElementQK* ptr_k, const uint32_t* k_sf,
                     const float* weights, const uint32_t batch_size, const uint64_t logits_stride,
-                    const uint64_t kv_cache_stride_bytes, const uint64_t block_table_stride,
+                    const uint64_t kv_cache_stride_bytes, const uint32_t block_table_stride,
                     const uint32_t* context_lens, ElementLogits* logits, const uint32_t* block_table,
                     const uint32_t* schedule_meta, cudaStream_t stream, int num_sms, int num_blocks) {
         using AttnKernel =

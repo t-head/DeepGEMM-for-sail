@@ -28,11 +28,14 @@ namespace cutlass::gemm::kernel {
 // ============================================================================
 
 template <typename ElementQK, typename ElementAcc, typename ElementLogits, int kNumHeads, int kHeadDim, int BLOCK_QH,
-          int BLOCK_KV, int WARP_QH, int WARP_KV, int kNumQStages, int kNumKVStages>
+          int BLOCK_KV, int WARP_QH, int WARP_KV, int kNumQStages, int kNumKVStages,
+          typename StrideKType = uint32_t>
 class Sm80MqaLogitsFP4 {
 public:
     static_assert(std::is_same_v<ElementQK, uint8_t>, "FP4 MQA logits requires uint8_t ElementQK");
     static_assert(kHeadDim == 64, "FP4 packed head_dim must be 64 (original 128 / 2)");
+    static_assert(std::is_same_v<StrideKType, uint32_t> || std::is_same_v<StrideKType, uint64_t>,
+                  "StrideKType must be uint32_t or uint64_t");
 
     // ── Core types ──────────────────────────────────────────────────────
     using ElementC = float;
@@ -176,7 +179,7 @@ public:
         ElementLogits* logits;
         const int seq_len_q;
         const int seq_len_k;
-        const uint64_t stride_k;
+        const StrideKType stride_k;
     };
 
     using Params = Arguments;
@@ -436,6 +439,7 @@ public:
             static constexpr int kNumAccumPerMma = size<0>(accum);
             CUTE_STATIC_ASSERT(kNumHeads % 8 == 0);
             const auto& kv_offset = kv_start + kv_block_idx * BLOCK_KV + warp_offset;
+            #pragma unroll
             for (int m = 0; m < size<1>(accum); m++) {
                 int mma_offset = m * InstM;
                 auto logits_q_offset = (block_q_idx * BLOCK_Q + warp_q_idx) * params.stride_k;
@@ -536,8 +540,7 @@ public:
                 }
             }
 
-// ── Inner loop: KV blocks ──────────────────────────────────────
-#pragma unroll
+            // ── Inner loop: KV blocks ──────────────────────────────────────
             for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
                 int kv_stage_idx = kv_block_idx % kNumKVStages;
 
@@ -553,7 +556,6 @@ public:
                 cp_async_fence();
                 current_stage_kv = (current_stage_kv + 1) % kNumKVStages;
 
-                // TODO: overlap load_kv_s2r and cute::gemm (need change warp-interleave mainloop)
                 constexpr int K_BLOCK_MAX = size<2>(tCrA);
                 for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
                     load_kv_s2r(k_block, kv_stage_idx);
@@ -600,16 +602,17 @@ public:
 namespace deep_gemm {
 
 template <typename ElementQK, typename ElementAcc, typename ElementLogits, int kNumHeads, int kHeadDim, int BLOCK_QH,
-          int BLOCK_KV, int WARP_QH, int WARP_KV, int kNumQStages, int kNumKVStages>
+          int BLOCK_KV, int WARP_QH, int WARP_KV, int kNumQStages, int kNumKVStages,
+          typename StrideKType = uint32_t>
 class AttentionFP4 {
 public:
     static void run(const ElementQK* ptr_q, const uint32_t* q_sf, const ElementQK* ptr_k, const uint32_t* k_sf,
                     const float* weights, int* cu_seq_len_k_start, int* cu_seq_len_k_end, ElementLogits* logits,
-                    const int seq_len_q, const int seq_len_k, const uint64_t stride_k, cudaStream_t stream,
+                    const int seq_len_q, const int seq_len_k, const StrideKType stride_k, cudaStream_t stream,
                     int num_sms) {
         using AttnKernel =
             cutlass::gemm::kernel::Sm80MqaLogitsFP4<ElementQK, ElementAcc, ElementLogits, kNumHeads, kHeadDim, BLOCK_QH,
-                                                    BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages>;
+                                                    BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType>;
 
         static constexpr int BLOCK_M = AttnKernel::BLOCK_M;
         static constexpr int BLOCK_N = AttnKernel::BLOCK_N;

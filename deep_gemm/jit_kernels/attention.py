@@ -26,13 +26,14 @@ constexpr auto WARP_QH = {WARP_QH};
 constexpr auto WARP_KV = {WARP_KV};
 constexpr auto kNumQStages = {kNumQStages};
 constexpr auto kNumKVStages = {kNumKVStages};
+using StrideKType = {StrideKType};
 
 // Make a templated GEMM
-using atten_t = Attention<ElementQK, ElementAcc, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages>;
+using atten_t = Attention<ElementQK, ElementAcc, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType>;
 
 // Launch kernel
 atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, (uint32_t*)cu_seq_len_k_start, (uint32_t*)cu_seq_len_k_end, logits,
-             seq_len_q, seq_len_k, aligned_seq_len_kv, stream, num_sms);
+             seq_len_q, seq_len_k, static_cast<StrideKType>(aligned_seq_len_kv), stream, num_sms);
 """
 
 template_fp4_mqa = """
@@ -49,15 +50,30 @@ constexpr int WARP_QH = {WARP_QH};
 constexpr int WARP_KV = {WARP_KV};
 constexpr int kNumQStages = {kNumQStages};
 constexpr int kNumKVStages = {kNumKVStages};
+using StrideKType = {StrideKType};
 
 // Make a templated GEMM
-using atten_t = AttentionFP4<ElementQK, ElementAcc, ElementLogits, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages>;
+using atten_t = AttentionFP4<ElementQK, ElementAcc, ElementLogits, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType>;
 
 // Launch kernel
 atten_t::run((const ElementQK*)q, (const uint32_t*)q_sf, (const ElementQK*)k, (const uint32_t*)k_sf, weights,
              cu_seq_len_k_start, cu_seq_len_k_end, logits,
-             seq_len_q, seq_len_k, aligned_seq_len_kv, stream, num_sms);
+             seq_len_q, seq_len_k, static_cast<StrideKType>(aligned_seq_len_kv), stream, num_sms);
 """
+
+
+def _select_stride_k_type(aligned_seq_len: int, aligned_seq_len_kv: int) -> str:
+    """Pick StrideKType for kernel: uint32_t when q_idx*stride_k fits in 32-bit,
+    otherwise fall back to uint64_t to avoid overflow."""
+    # aligned_seq_len_kv is passed via JIT as ctypes.c_int (signed 32-bit),
+    # so it itself must fit in int32 positive range.
+    assert aligned_seq_len_kv < (1 << 31), \
+        f"aligned_seq_len_kv({aligned_seq_len_kv}) exceeds int32 positive range; " \
+        f"JIT passes it via ctypes.c_int."
+    if aligned_seq_len * aligned_seq_len_kv < (1 << 32):
+        return "uint32_t"
+    return "uint64_t"
+
 
 def mqa_logits_common(q: torch.Tensor,
                       k: torch.Tensor, k_scales: torch.Tensor,
@@ -145,9 +161,11 @@ def mqa_logits_common(q: torch.Tensor,
     assert(seq_len_alignment % block_q == 0)
     aligned_seq_len = align(seq_len_q, seq_len_alignment)
     aligned_seq_len_kv = align(seq_len_k + block_kv, 4)
+    # stride_k may be uint32_t or uint64_t depending on whether q_idx * stride_k
+    # overflows 32-bit. Decided dynamically here and forwarded as a JIT template key.
+    stride_k_type = _select_stride_k_type(aligned_seq_len, aligned_seq_len_kv)
     logits = torch.empty(aligned_seq_len, aligned_seq_len_kv, dtype=torch.float, device=q.device)
     logits = logits[0:seq_len_q, 0:seq_len_k]
-
     # Auto-tuning with compilation
     global includes, template
     ElementQK = "cutlass::float_e4m3_t"
@@ -172,7 +190,8 @@ def mqa_logits_common(q: torch.Tensor,
               'kNumHeads': num_heads, 'kHeadDim': head_dim,
               'BLOCK_QH': block_qh, 'BLOCK_KV': block_kv,
               'WARP_QH' : warp_qh, 'WARP_KV' : warp_kv,
-              'kNumQStages': num_q_stages, 'kNumKVStages': num_kv_stages},
+              'kNumQStages': num_q_stages, 'kNumKVStages': num_kv_stages,
+              'StrideKType': stride_k_type},
         space=(),
         includes=includes,
         arg_defs=(('q', q.dtype), ('k', k.dtype), ('k_scales', torch.float), ('weights', torch.float),
@@ -253,6 +272,7 @@ def fp4_mqa_logits(q: torch.Tensor,
     seq_len_q__, num_heads_ = weights.shape
 
     assert(head_dim_packed == head_dim_packed_ and head_dim_packed == 64)
+    assert(num_heads == 32 or num_heads == 64)
     assert(num_heads == num_heads_)
     assert(seq_len_q == seq_len_q__)
     assert(seq_len_k == seq_len_k_)
@@ -273,23 +293,24 @@ def fp4_mqa_logits(q: torch.Tensor,
     assert(cu_seq_len_k_end.dtype == torch.int32)
 
     # Default tile config for FP4 non-paged MQA logits
-    block_qh = num_heads * 4
-    block_kv = 256
-    warp_qh = num_heads       # 1 Q row per warp in head dimension
-    warp_kv = 64
+    num_sms = get_num_sms()
+    stream = torch.cuda.current_stream()
+    if num_heads == 64 and logits_dtype == torch.bfloat16:
+        block_q, warp_qh, block_kv, warp_kv = 4, num_heads, 64, 16
+    else:
+        block_q, warp_qh, block_kv, warp_kv = 4, num_heads, 256, 64
     num_q_stages, num_kv_stages = 1, 3
-    block_q = block_qh // num_heads
-    assert(block_qh % num_heads == 0)
+    block_qh = num_heads * block_q
 
     seq_len_alignment = 4
     assert(seq_len_alignment % block_q == 0)
     aligned_seq_len = align(seq_len_q, seq_len_alignment)
     aligned_seq_len_kv = align(seq_len_k + block_kv, 4)
+    # stride_k may be uint32_t or uint64_t depending on whether q_idx * stride_k
+    # overflows 32-bit. Decided dynamically here and forwarded as a JIT template key.
+    stride_k_type = _select_stride_k_type(aligned_seq_len, aligned_seq_len_kv)
     logits = torch.empty(aligned_seq_len, aligned_seq_len_kv, dtype=logits_dtype, device=q.device)
     logits = logits[0:seq_len_q, 0:seq_len_k]
-
-    num_sms = get_num_sms()
-    stream = torch.cuda.current_stream()
 
     global includes_fp4_mqa, template_fp4_mqa
     ElementQK = "uint8_t"
@@ -307,7 +328,8 @@ def fp4_mqa_logits(q: torch.Tensor,
               'kNumHeads': num_heads, 'kHeadDim': head_dim_packed,
               'BLOCK_QH': block_qh, 'BLOCK_KV': block_kv,
               'WARP_QH': warp_qh, 'WARP_KV': warp_kv,
-              'kNumQStages': num_q_stages, 'kNumKVStages': num_kv_stages},
+              'kNumQStages': num_q_stages, 'kNumKVStages': num_kv_stages,
+              'StrideKType': stride_k_type},
         space=(),
         includes=includes_fp4_mqa,
         arg_defs=(('q', torch.uint8), ('q_sf', torch.int32), ('k', torch.uint8), ('k_sf', torch.int32), ('weights', torch.float),

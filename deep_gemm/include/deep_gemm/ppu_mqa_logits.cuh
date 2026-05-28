@@ -26,8 +26,11 @@ template <typename ElementQK, typename ElementAcc,
           uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t BLOCK_QH, uint32_t BLOCK_KV,
           uint32_t WARP_QH, uint32_t WARP_KV,
-          uint32_t kNumQStages, uint32_t kNumKVStages>
+          uint32_t kNumQStages, uint32_t kNumKVStages,
+          typename StrideKType = uint32_t>
 class Sm80MqaLogits {
+  static_assert(std::is_same_v<StrideKType, uint32_t> || std::is_same_v<StrideKType, uint64_t>,
+                "StrideKType must be uint32_t or uint64_t");
 public:
   using ElementC            = float;
   using LayoutA             = cutlass::layout::RowMajor;
@@ -173,7 +176,7 @@ public:
     float* logits;
     const uint32_t seq_len_q;
     const uint32_t seq_len_k;
-    const uint64_t stride_k;
+    const StrideKType stride_k;
     StrideA dA;
     StrideB dB;
     KernelHardwareInfo hw_info{};
@@ -184,8 +187,8 @@ public:
                 kNumHeads, kHeadDim, BLOCK_KV, BLOCK_QH, WARP_KV, WARP_QH, kNumQStages, kNumKVStages, BLOCK_Q);
         printf("arguments, ptr_q=%p, ptr_k=%p, k_scales=%p, weights=%p, cu_seq_len_k_start=%p, cu_seq_len_k_end=%p, logits=%p\n",
                 ptr_q, ptr_k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits);
-        printf("arguments, seq_len_q=%d, seq_len_k=%d, stride_k=%ld\n",
-                seq_len_q, seq_len_k, stride_k);
+        printf("arguments, seq_len_q=%u, seq_len_k=%u, stride_k=%llu\n",
+                seq_len_q, seq_len_k, static_cast<unsigned long long>(stride_k));
     }
   };
 
@@ -537,7 +540,6 @@ public:
         }
 
         // Compute over KV blocks
-        #pragma unroll
         for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++ kv_block_idx) {
             uint32_t kv_stage_idx = kv_block_idx % kNumKVStages;
 
@@ -701,7 +703,8 @@ template <typename ElementQK, typename ElementAcc,
           uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t BLOCK_QH, uint32_t BLOCK_KV,
           uint32_t WARP_QH, uint32_t WARP_KV,
-          uint32_t kNumQStages, uint32_t kNumKVStages>
+          uint32_t kNumQStages, uint32_t kNumKVStages,
+          typename StrideKType = uint32_t>
 class Attention {
 
 public:
@@ -719,10 +722,10 @@ public:
                     uint32_t* cu_seq_len_k_start,
                     uint32_t* cu_seq_len_k_end,
                     float* logits,
-                    const uint32_t seq_len_q, const uint32_t seq_len_k, const uint64_t stride_k,
+                    const uint32_t seq_len_q, const uint32_t seq_len_k, const StrideKType stride_k,
                     cudaStream_t stream, int num_sms) {
 
-        using AttnKernel = cutlass::gemm::kernel::Sm80MqaLogits<ElementQK, ElementAcc, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages>;
+        using AttnKernel = cutlass::gemm::kernel::Sm80MqaLogits<ElementQK, ElementAcc, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType>;
 
         using StrideA = typename AttnKernel::StrideA;
         using StrideB = typename AttnKernel::StrideB;
@@ -770,8 +773,8 @@ public:
             cudaFuncGetAttributes(&attr, cutlass::device_kernel<AttnKernel>);
 
             printf("[mqa_logits:]\n");
-            printf("kNumHeads:%d, kHeadDim:%d, seq_len_q:%d, seq_len_k:%d, stride_k:%ld\n",
-                kNumHeads, kHeadDim, seq_len_q, seq_len_k, stride_k);
+            printf("kNumHeads:%u, kHeadDim:%u, seq_len_q:%u, seq_len_k:%u, stride_k:%llu\n",
+                kNumHeads, kHeadDim, seq_len_q, seq_len_k, static_cast<unsigned long long>(stride_k));
 
             printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n",
                 BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages);

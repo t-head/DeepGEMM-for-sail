@@ -329,7 +329,7 @@ public:
     const uint32_t batch_size;
     const uint64_t logits_stride;
     const uint64_t kv_cache_stride_bytes;
-    const uint64_t block_table_stride;
+    const uint32_t block_table_stride;
     const uint32_t* context_lens;
     float* logits;
     const uint32_t* block_table;
@@ -344,7 +344,7 @@ public:
                 kNumHeads, kHeadDim, BLOCK_M, BLOCK_N, WARP_M, WARP_N, kNumQStages, kNumKVStages, kNextN);
         printf("arguments, ptr_q=%p, ptr_k=%p, k_scales=%p, weights=%p, context_lens=%p, logits=%p, block_table=%p, schedule_meta=%p\n",
                 ptr_q, ptr_k, k_scales, weights, context_lens, logits, block_table, schedule_meta);
-        printf("arguments, batch_size=%d, logits_stride=%ld, kv_cache_stride_bytes=%ld, block_table_stride=%ld\n",
+        printf("arguments, batch_size=%d, logits_stride=%ld, kv_cache_stride_bytes=%ld, block_table_stride=%u\n",
                 batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride);
     }
   };
@@ -752,7 +752,7 @@ public:
                     const float * k_scales,
                     const float * weights,
                     const uint32_t batch_size,
-                    const uint64_t logits_stride, const uint64_t kv_cache_stride_bytes, const uint64_t block_table_stride,
+                    const uint64_t logits_stride, const uint64_t kv_cache_stride_bytes, const uint32_t block_table_stride,
                     const uint32_t* context_lens, float* logits,
                     const uint32_t* block_table, const uint32_t* schedule_meta,
                     cudaStream_t stream, int num_sms, int num_blocks) {
