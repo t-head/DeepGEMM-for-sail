@@ -662,8 +662,8 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     if m == 0:
         return
     kernel_type = 'Default'
-    if k < 4096:
-        kernel_type = 'OverlapPrologue'
+    # if k < 4096:
+    #     kernel_type = 'OverlapPrologue'
 
     # Auto-tuning with compilation
     global includes, template, includes_cutlass3, template_cutlass3
