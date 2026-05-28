@@ -3,7 +3,7 @@ import torch
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_num_sms
+from .utils import get_num_sms, is_ppu1v5_device
 
 includes_cutlass3 = ('"../deep_gemm/tf32_hc_prenorm_gemm.cuh"', )
 
@@ -69,8 +69,11 @@ def tf32_hc_prenorm_gemm(a: torch.Tensor,
             assert sqr_sum.shape == (1, m)
         assert sqr_sum.is_contiguous()
 
-    block_n = min(_align(n, 8), 32)
-    # block_n = min(_align(n, 16), 32)
+    if is_ppu1v5_device():
+        block_n = min(_align(n, 8), 32)
+    else:
+        block_n = min(_align(n, 16), 32)
+
     assert n <= block_n
     assert n <= 32 and n % 8 == 0
 
