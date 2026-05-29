@@ -250,7 +250,6 @@ using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
     TileScheduler,
     kEnableSboOverlap>;
 
-// Kernel 函数定义
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
 __global__ void {}(
@@ -382,7 +381,6 @@ using DefaultGemm = typename aiu::gemm::kernel::DefaultGemmGrouped<ElementType, 
 using ProblemVisitor = Scheduler<kGemmType, SHAPE_N, ThreadblockShape, NUM_GROUPS>;
 using Gemm_Kernel = GemmKernel<typename DefaultGemm::Mma, typename DefaultGemm::Epilogue, ProblemVisitor, kEnableSboOverlap>;
 
-// Kernel 函数定义
 extern "C"
 __launch_bounds__(DefaultGemm::kThreadCount)
 __global__ void {}(

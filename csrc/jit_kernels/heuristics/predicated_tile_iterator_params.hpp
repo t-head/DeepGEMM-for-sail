@@ -38,14 +38,14 @@ void compute_predicated_tile_iterator_params(int block_m, int block_n, int block
                                              int64_t* out_advance_row, int64_t* out_advance_group,
                                              int64_t* out_advance_cluster, int64_t* out_advance_tile) {
     const int WARP_SIZE = 32;
-    const int K_TENSOR_OP_ROWS = 8; // 固定值
+    const int K_TENSOR_OP_ROWS = 8;
 
     int warp_count_m = block_m / warp_m;
     int warp_count_n = block_n / warp_n;
     int total_warps = warp_count_m * warp_count_n;
 
     int shape_column = block_n;       // BLOCK_N
-    int shape_row = K_TENSOR_OP_ROWS; // 固定值 8
+    int shape_row = K_TENSOR_OP_ROWS;
     int shape_group = warp_count_m;   // BLOCK_M / WARP_M
     int shape_cluster = 1;
     int shape_tile = 1;

@@ -349,9 +349,9 @@ def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=Fals
         np.random.seed(seed)
         random.seed(seed)
         zipf_a = 1.1 if "." not in distribution else float(distribution.replace("zipf",""))
-        group_m_list = truncated_zipf(num_groups, m, a=zipf_a) # 参考moe bench中的逻辑
+        group_m_list = truncated_zipf(num_groups, m, a=zipf_a)
         # dist = np.random.zipf(zipf_a, num_groups)
-        # 为zip分布加入扰动，避免大量相同的值
+        # Add noise to zipf distribution to avoid many identical values
         # noise = [random.gauss(0, 1) for _ in range(num_groups)]
         # dist = dist + noise
         # scale = expected_m_per_group * num_groups / dist.sum()
@@ -373,10 +373,8 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
 
-    """构造 topk_ids"""
     topk_ids = torch.empty((num_token, topk), device=tensor_device, dtype=torch.int32)
     for i in range(num_token):
-        # 每个 token 随机选择 topk 个不同的专家
         topk_ids[i] = torch.randperm(num_groups)[:topk]
 
     x = torch.randn((num_token, k), device=tensor_device, dtype=torch.bfloat16)
@@ -390,7 +388,7 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
     ref_out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
 
     if _acc_check:
-        # ========== Step 1: 按 Token 顺序计算 GEMM ==========
+        # Step 1 Compute GEMM in Token order
         output_token_order = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
         for token_idx in range(num_token):
             for topk_idx in range(topk):
@@ -401,7 +399,7 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
     '''
     #  check for nopad interface
     if _acc_check:
-        # ========== Step 1: 按 Token 顺序计算 GEMM ==========
+        # Step 1 Compute GEMM in Token order
         output_token_order = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
         x_permuted = torch.randn((num_token * topk, k), device=tensor_device, dtype=torch.bfloat16)
         for token_idx in range(num_token):
@@ -409,8 +407,7 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
                 expert_id = topk_ids[token_idx, topk_idx].item()
                 flat_idx = token_idx * topk + topk_idx
                 output_token_order[flat_idx] = x[token_idx] @ y[expert_id].T
-        # ========== Step 2: Permute - 按 expert id 重新排序 ==========
-        # 收集所有 (expert_id, src_idx) 二元组
+        # Step 2: Permute
         entries = []
         for token_idx in range(num_token):
             for topk_idx in range(topk):
@@ -418,7 +415,6 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
                 src_idx = token_idx * topk + topk_idx
                 entries.append((expert_id, src_idx))
 
-        # 按 expert_id 排序
         entries.sort(key=lambda e: e[0])
         for dst_idx, (expert_id, src_idx) in enumerate(entries):
             ref_out[dst_idx] = output_token_order[src_idx]
@@ -618,7 +614,6 @@ def split_list_into_groups(lst, num):
     return groups
 
 def worker(gpu_id, cases, output, device, mode):
-    # 设置当前进程可见的 GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     print(f"Process {os.getpid()} is running on GPU {gpu_id}")
     run_cycle_on_device(cases, output, device, mode, gpu_id)
@@ -868,7 +863,6 @@ def parse_deepgemm_string_re(s):
         print("ERROR: wrong deepgemm format input, please check!!")
     for key, value in match_string:
         if value.startswith('[') and value.endswith(']'):
-            # 解析为列表
             result[key] = ast.literal_eval(value)
         elif key == "data_type":
             result[key] = convert_data_type_to_dtype(value)
@@ -883,7 +877,6 @@ def parse_deepgemm_string_re(s):
                 exit(1)
             result[key] = convert_data_type_to_dtype(value)
         else:
-            # 尝试转换为整数、浮点数等
             try:
                 result[key] = int(value)
             except ValueError:

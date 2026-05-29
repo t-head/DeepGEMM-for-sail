@@ -955,7 +955,7 @@ def autotune_all(
     hidden_size: Optional[int] = None,
     moe_intermediate_size: Optional[int] = None,
     topk_experts: int = 1,
-    num_experts: int = 1,  # 🔑 默认为 1，DenseGemm 固定用 1
+    num_experts: int = 1,  # DenseGemm always uses 1
     tp_size: Optional[int] = None,
     ep_size: Optional[int] = None,
     save_path: str = "",

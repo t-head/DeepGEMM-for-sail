@@ -226,7 +226,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) moe_align_block_size_kernel(
   }
   __syncthreads();
 
-  // 统计每个专家的 token 数量, m_rows
+  // Count tokens per expert
   for (uint32_t i = tid; i < numel; i += blockDim.x) {
     int eid = topk_ids[i];
     atomicAdd(&shared_counts[eid], 1);

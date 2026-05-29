@@ -40,11 +40,10 @@ std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, in
 }
 
 int get_smem_occ(int block_m, int block_n) {
-    if (block_m <= 0) { // C++中没有None，用<=0来判断无效值
+    if (block_m <= 0) {
         return 0;
     }
 
-    // 使用静态假设
     const int ppu_capacity = 262144;
     const int block_k = 64;
     const int bpp = 2;
@@ -58,7 +57,7 @@ int get_smem_occ(int block_m, int block_n) {
     int smem_size_b = num_stages * smem_b_per_stage * bpp;
     int smem_size = std::max(smem_size_d, smem_size_a + smem_size_b);
 
-    return ppu_capacity / smem_size; // 整数除法
+    return ppu_capacity / smem_size;
 }
 
 std::tuple<int, int, int, int, int, bool> get_gemv_best_configs(int m, int n, int k, int num_groups, int num_sms,
@@ -365,53 +364,49 @@ const std::vector<std::vector<int>> CONFIG_TILE_GREATER_4096 = {{128, 128, 64, 6
 // std::vector<std::vector<int>> generate_search_space_v2(
 //     int64_t m,          // lhs[0].shape[0]
 //     int64_t n,          // rhs[0].shape[0]
-//     int64_t k,          // lhs[0].shape[1] (隐含 rhs[0].shape[1] == k)
+//     int64_t k,          // lhs[0].shape[1] (implicitly rhs[0].shape[1] == k)
 //     DataType dtype,     // lhs[0].dtype
-//     const std::string& device_name, // CUDA 设备名称（如 "ZW810E-100"）
-//     int num_candidate   // 候选 tile 数量
+//     const std::string& device_name, // CUDA device name (e.g. "ZW810E-100")
+//     int num_candidate   // Number of candidate tiles
 // ) {
-//     // TODO 修改了入参，还有内部调用device_props =
-//     torch.cuda.get_device_properties(device='cuda')的语句，需要想办法解决
-//     // 条件1: 所有维度 >=4096 且 64 对齐
+//     // TODO: Modified input params, and internal call to device_props =
+//     torch.cuda.get_device_properties(device='cuda') statement, need to find a solution
+//     // Condition 1: All dimensions >=4096 and 64 aligned
 //     if (!(m >= 4096 && m % 64 == 0 &&
 //           n >= 4096 && n % 64 == 0 &&
 //           k >= 4096 && k % 64 == 0)) {
 //         return {};
 //     }
 
-//     // 条件2: 数据类型必须为 BFLOAT16 或 FLOAT16
+//     // Condition 2: Data type must be BFLOAT16 or FLOAT16
 //     if (dtype != DataType::BFLOAT16 && dtype != DataType::FLOAT16) {
 //         return {};
 //     }
 
-//     // 条件3: 设备名称必须包含 "ZW810E" 或 "ZW810"（大小写敏感）
+//     // Condition 3: Device name must contain "ZW810E" or "ZW810" (case sensitive)
 //     if (device_name.find("ZW810E") == std::string::npos &&
 //         device_name.find("ZW810") == std::string::npos) {
 //         return {};
 //     }
 
-//     // 构造 shape 向量 [m, n, k]（与 Python 逻辑一致）
 //     std::vector<int> shape = {
 //         static_cast<int>(m),
 //         static_cast<int>(n),
 //         static_cast<int>(k)
 //     };
 
-//     // 创建启发式 tile 生成器（严格按 Python 参数传递）
 //     MatmulHeuristicsTile candidate_tile(shape, 2, CONFIG_TILE_GREATER_4096);
 
-//     // 获取候选 tile 列表（假设返回 vector<vector<int>>）
 //     auto tile_list = candidate_tile.get_candidate_tile(num_candidate);
 
-//     // 提取每个 tile 的 [3:11] 切片（索引 3～10，共 8 个元素）
 //     std::vector<std::vector<int>> result;
 //     result.reserve(tile_list.size());
 //     for (const auto& tile : tile_list) {
-//         // 安全切片：仅当 tile 长度 >=11 时提取（防御性编程，原 Python 未显式检查）
+//         // Safe slice: only extract when tile length >=11 (defensive programming, original Python didn't explicitly check)
 //         if (tile.size() >= 11) {
 //             result.emplace_back(tile.begin() + 3, tile.begin() + 11);
 //         }
-//         // 注：若 tile 长度不足，按原 Python 逻辑应崩溃；此处保守跳过（实际需根据 MatmulHeuristicsTile 保证）
+//         // Note: If tile length is insufficient, original Python logic should crash; here we conservatively skip (actual need to be guaranteed by MatmulHeuristicsTile)
 //     }
 //     return result;
 // }

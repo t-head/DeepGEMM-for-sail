@@ -1,5 +1,5 @@
-# UT 功能测试
-    建议使用 `run_deep_gemm.py` 文件，--format指定输入参数。
+# UT Functional Test
+Use `run_deep_gemm.py` with --format to specify input parameters.
 ## Usage
 run_deep_gemm.py [-h] [--format FORMAT] [--caselist CASELIST] [--case_idx CASE_IDX] [--disable_acc] [--benchmark] [--ref_backend {host,device}]
 
@@ -13,19 +13,19 @@ options: \
   --ref_backend {host,device}
                         specify the backend used to compute ref output \
 ## Example
-### 精度测试，deepgemm的实现和pytorch cpu实现的结果对比
-[cmodel环境建议使用] \
+### Accuracy test: compare deepgemm with pytorch cpu implementation
+[recommended for cmodel environment] \
 python ./run_deep_gemm.py --format=GroupedMasked,data_type:int8,groups:16,m:4096,n:4096,k:7168,em:12 --ref_backend=host
 
-### 精度测试，deepgemm的实现和pytorch device kernel实现的结果对比
+### Accuracy test: compare deepgemm with pytorch device kernel implementation
 python ./run_deep_gemm.py --format=GroupedMasked,data_type:int8,groups:16,m:4096,n:4096,k:7168,em:12
 
-### 只跑deepgemm的kernel 不检查正确性
+### Run deepgemm kernel only without correctness check
 python ./run_deep_gemm.py --format=GroupedMasked,data_type:int8,groups:16,m:4096,n:4096,k:7168,em:12 --disable_acc
 
 
-# UT 性能测试
-建议使用 `run_deep_gemm_perf.py` 文件，--format指定输入参数, --mode指定模式。
+# UT Performance Test
+Use `run_deep_gemm_perf.py` with --format to specify input parameters and --mode to specify mode.
 ## Usage
 run_deep_gemm_perf.py [-h] [--caselist CASELIST] [--case_idx CASE_IDX] [--format FORMAT] [--output OUTPUT] [--mode {metrics,full,show_log,umd_perf}]
                              [--device DEVICE] [--disable_acc] [--ref_backend {host,device}]
@@ -44,17 +44,17 @@ options: \
                         specify the backend used to compute ref output \
 
 ## Example
-### 跑一个case,参数信息由format指定
+### Run a single case with parameters specified by format
 python ./run_deep_gemm_perf.py --format=GroupedMasked,data_type:int8,groups:16,m:4096,n:4096,k:7168,em:12,distribution:[45,200,30,18,13,21,31,3,5,17,17,16,18,15,18,13]
 
-### 跑一批case，默认是精度+性能
+### Run a batch of cases (accuracy + performance by default)
 python ./run_deep_gemm_perf.py --caselist=./deepgemm.caselist
 
-# Checkin 测试
-## 测试fp8
+# Checkin Test
+## Test fp8
 python ./test_fp8_core.py
 
-## 测试int8和bf16
+## Test int8 and bf16
 python ./test_core.py
 
 test_core.py options:

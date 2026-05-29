@@ -23,18 +23,18 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      block_ms_lists: Tuple[int], block_ns_lists: Tuple[int],
                      block_k: int) -> Tuple[int, int, int, int, int, int, int, Tuple]:
     """
-    根据给定的矩阵维度和硬件参数，计算最优的GEMM配置
+    Calculate optimal GEMM configuration given matrix dimensions and hardware parameters
 
-    参数:
-    m, n, k: 矩阵乘法的维度 (M x K) * (K x N)
-    num_groups: 分组数量
-    num_sms: GPU上的SM数量
-    block_ms_lists: 可选的block_m值列表
-    block_ns_lists: 可选的block_n值列表
-    block_k: block_k值
+    Args:
+    m, n, k: Matrix multiplication dimensions (M x K) * (K x N)
+    num_groups: Number of groups
+    num_sms: Number of SMs on GPU
+    block_ms_lists: Optional block_m value list
+    block_ns_lists: Optional block_n value list
+    block_k: block_k value
 
-    返回:
-    包含最优配置的元组: (num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config)
+    Returns:
+    Tuple containing optimal configuration: (num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config)
     """
 
     block_ms = block_ms_lists
@@ -127,17 +127,17 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 def get_supported_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                           is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> List[Tuple]:
     """
-    获取支持的配置列表
+    Get list of supported configurations
 
-    参数:
-    m, n, k: 矩阵维度
-    num_groups: 分组数量
-    num_sms: SM数量
-    is_grouped_contiguous: 是否为连续分组
-    is_grouped_masked: 是否为掩码分组
+    Args:
+    m, n, k: Matrix dimensions
+    num_groups: Number of groups
+    num_sms: Number of SMs
+    is_grouped_contiguous: Whether it's grouped contiguous
+    is_grouped_masked: Whether it's masked grouped
 
-    返回:
-    配置列表
+    Returns:
+    List of configurations
     """
     if not is_grouped_contiguous:
         block_ms = (256, 128, 64, 32, 16)
@@ -170,17 +170,17 @@ from deep_gemm.jit_kernels.utils import get_search_space
 def get_pre_assert_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                           is_grouped_contiguous: bool = False, is_grouped_masked: bool = False, gemm_type: str = "dense", dtype=torch.int8) -> List[Tuple]:
     """
-    获取支持的配置列表
+    Get list of supported configurations
 
-    参数:
-    m, n, k: 矩阵维度
-    num_groups: 分组数量
-    num_sms: SM数量
-    is_grouped_contiguous: 是否为连续分组
-    is_grouped_masked: 是否为掩码分组
+    Args:
+    m, n, k: Matrix dimensions
+    num_groups: Number of groups
+    num_sms: Number of SMs
+    is_grouped_contiguous: Whether it's grouped contiguous
+    is_grouped_masked: Whether it's masked grouped
 
-    返回:
-    配置列表
+    Returns:
+    List of configurations
     """
     assert dtype in (torch.int8, torch.float8_e4m3fn, torch.bfloat16)
     assert_config = get_search_space(dtype, gemm_type)
@@ -313,14 +313,12 @@ gamma_params =[
 ]
 
 def gamma_sample(shape, scale, num_groups, num_samples):
-    rate = 1.0 / scale  # rate 参数 = 1 / scale
-    # 定义 Gamma 分布（PyTorch 使用 concentration 和 rate）
-    concentration = torch.tensor([shape])  # 形状参数
-    rate_tensor = torch.tensor([rate])     # 速率参数
+    rate = 1.0 / scale
+    concentration = torch.tensor([shape])
+    rate_tensor = torch.tensor([rate])
 
-    # 创建分布并采样
     dist = torch.distributions.Gamma(concentration=concentration, rate=rate_tensor)
-    samples = dist.sample((num_samples, num_groups)).to('cuda').int().squeeze()  # 采样 1000 个样本
+    samples = dist.sample((num_samples, num_groups)).to('cuda').int().squeeze()
     return samples
 
 def grouped_masked_m_sample(expect_m, num_groups, num_samples=100):
@@ -337,18 +335,18 @@ def grouped_masked_m_sample(expect_m, num_groups, num_samples=100):
 
     def interpolate_gamma_params(target_key: float) -> Optional[Tuple[float, float]]:
         """
-        根据 target_key 插值得到 (shape, scale)
+        Interpolate to get (shape, scale) based on target_key
 
-        参数:
-            target_key (float): 输入的 key（如 15, 20 等）
+        Args:
+            target_key (float): Input key (e.g. 15, 20, etc.)
 
-        返回:
+        Returns:
             tuple: (interpolated_shape, interpolated_scale)
         """
         if target_key < min(keys) or target_key > max(keys):
-            print(f"警告: {target_key} 超出插值范围 [{min(keys)}, {max(keys)}]，结果可能不准确。")
+            print(f"Warning: {target_key} is out of interpolation range [{min(keys)}, {max(keys)}], results may be inaccurate.")
 
-        # 线性插值
+        # Linear interpolation
         shape_interp = np.interp(target_key, keys, shapes)
         scale_interp = np.interp(target_key, keys, scales)
 

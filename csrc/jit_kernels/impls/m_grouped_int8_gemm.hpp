@@ -454,7 +454,6 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
     }
 }
 
-// 实际实现：m_grouped_gemm_a8w8_per_channel_nt_masked_impl
 static void m_grouped_gemm_a8w8_per_channel_nt_masked_impl(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                                                            const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                                                            const torch::Tensor& out, const torch::Tensor& masked_m,
@@ -770,7 +769,6 @@ static void m_grouped_gemm_a8w8_per_channel_nt_masked_impl(const torch::Tensor& 
     }
 }
 
-// 实际实现：m_grouped_gemm_a8w8_per_channel_nt_nopad_impl
 static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                                                           const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                                                           const torch::Tensor& out, const torch::Tensor& m_indices,
@@ -1138,7 +1136,6 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         }
     }
 }
-// 路由层：m_grouped_gemm_int8_int8_bf16_nt_xxx_impl -> m_grouped_gemm_a8w8_per_channel_nt_xxx
 static void m_grouped_gemm_int8_int8_bf16_nt_contiguous_impl(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                                                              const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                                                              const torch::Tensor& out, const torch::Tensor& m_indices,
@@ -1149,7 +1146,6 @@ static void m_grouped_gemm_int8_int8_bf16_nt_contiguous_impl(const torch::Tensor
                                                        num_groups, config);
 }
 
-// 路由层：m_grouped_gemm_int8_int8_bf16_nt_xxx_impl -> m_grouped_gemm_a8w8_per_channel_nt_xxx
 static void m_grouped_gemm_int8_int8_bf16_nt_masked_impl(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                                                          const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                                                          const torch::Tensor& out, const torch::Tensor& masked_m,
@@ -1162,7 +1158,6 @@ static void m_grouped_gemm_int8_int8_bf16_nt_masked_impl(const torch::Tensor& lh
                                                    expected_m, config, max_block_n, enable_sbo_overlap, signal);
 }
 
-// 路由层：m_grouped_gemm_int8_int8_bf16_nt_xxx_impl -> m_grouped_gemm_a8w8_per_channel_nt_xxx
 static void m_grouped_gemm_int8_int8_bf16_nt_nopad_impl(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                                                         const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                                                         const torch::Tensor& out, const torch::Tensor& m_indices,

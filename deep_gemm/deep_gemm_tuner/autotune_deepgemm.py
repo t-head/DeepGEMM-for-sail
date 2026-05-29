@@ -39,15 +39,15 @@ ENABLE_GAMMA_SAMPLE = os.environ.get("ENABLE_GAMMA_SAMPLE", None)
 
 def run_grouped_gemm_nopad_test_bf16(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
     """
-    运行分组GEMM测试
+    Run grouped GEMM test
 
-    参数:
-    M, K, N: 矩阵维度
-    config: 配置参数
-    num_groups: 分组数量
+    Args:
+    M, K, N: Matrix dimensions
+    config: Configuration parameters
+    num_groups: Number of groups
 
-    返回:
-    执行时间（毫秒）
+    Returns:
+    Execution time (milliseconds)
     """
     assert(DEEP_GEMM_AVAILABLE)
     DEBUG_MODE = int(os.getenv("DEEPGEMM_TUNER_DEBUG_MODE", 0))
@@ -119,15 +119,15 @@ def run_grouped_gemm_nopad_test_bf16(M: int, K: int, N: int, config: Optional[Tu
 
 def run_grouped_gemm_nopad_test_int8(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
     """
-    运行分组GEMM测试
+    Run grouped GEMM test
 
-    参数:
-    M, K, N: 矩阵维度
-    config: 配置参数
-    num_groups: 分组数量
+    Args:
+    M, K, N: Matrix dimensions
+    config: Configuration parameters
+    num_groups: Number of groups
 
-    返回:
-    执行时间（毫秒）
+    Returns:
+    Execution time (milliseconds)
     """
     assert(DEEP_GEMM_AVAILABLE)
     DEBUG_MODE = int(os.getenv("DEEPGEMM_TUNER_DEBUG_MODE", 0))
@@ -213,15 +213,15 @@ def run_grouped_gemm_nopad_test_int8(M: int, K: int, N: int, config: Optional[Tu
 
 def run_normal_gemm_test_int8(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
     """
-    运行普通的GEMM测试
+    Run normal GEMM test
 
-    参数:
-    M, K, N: 矩阵维度
-    config: 配置参数
-    num_groups: 分组数量
+    Args:
+    M, K, N: Matrix dimensions
+    config: Configuration parameters
+    num_groups: Number of groups
 
-    返回:
-    执行时间（毫秒）
+    Returns:
+    Execution time (milliseconds)
     """
     assert(DEEP_GEMM_AVAILABLE)
     DEBUG_MODE = int(os.getenv("DEEPGEMM_TUNER_DEBUG_MODE", 0))
@@ -294,15 +294,15 @@ def run_normal_gemm_test_int8(M: int, K: int, N: int, config: Optional[Tuple] = 
 
 def run_grouped_gemm_test_masked_int8(M: int, K: int, N: int, config: Optional[Tuple] = None, num_groups: int = 1) -> Optional[float]:
     """
-    运行分组GEMM测试
+    Run grouped GEMM test
 
-    参数:
-    M, K, N: 矩阵维度
-    config: 配置参数
-    num_groups: 分组数量
+    Args:
+    M, K, N: Matrix dimensions
+    config: Configuration parameters
+    num_groups: Number of groups
 
-    返回:
-    执行时间（毫秒）
+    Returns:
+    Execution time (milliseconds)
     """
     assert(DEEP_GEMM_AVAILABLE)
     DEBUG_MODE = int(os.getenv("DEEPGEMM_TUNER_DEBUG_MODE", 0))
@@ -393,13 +393,13 @@ def run_grouped_gemm_test_masked_int8(M: int, K: int, N: int, config: Optional[T
 
 def load_tuned_configs(filename: str = "best_gemm_configs.json") -> Dict[Tuple[int, int, int, int], Dict[str, Any]]:
     """
-    从文件中加载已调优的配置，避免重复调优
+    Load pre-tuned configurations from file to avoid re-tuning
 
-    参数:
-    filename: 配置文件名
+    Args:
+    filename: Configuration file name
 
-    返回:
-    以(M,K,N,num_groups)为键的配置字典
+    Returns:
+    Configuration dictionary with (M,K,N,num_groups) as key
     """
     try:
         with open(filename, 'r') as f:
@@ -426,11 +426,11 @@ def load_tuned_configs(filename: str = "best_gemm_configs.json") -> Dict[Tuple[i
 
 def save_tuned_configs(configs: List[Dict[str, Any]], filename: str = "best_gemm_configs.json") -> None:
     """
-    将调优后的配置保存到文件
+    Save tuned configurations to file
 
-    参数:
-    configs: 配置列表
-    filename: 保存的文件名
+    Args:
+    configs: List of configurations
+    filename: File name to save to
     """
     # Ensure config data is serializable
     serializable_configs = []
@@ -479,15 +479,15 @@ def tune_gemm_config(
     tuned_configs: Optional[Dict[Tuple[int, int, int, int], Dict[str, Any]]]
     ) -> Optional[Dict[str, Any]]:
     """
-    为特定尺寸的GEMM操作调优配置
+    Tune configuration for GEMM operation with specific dimensions
 
-    参数:
-    m, k, n: 矩阵维度
-    num_groups: 分组数量
-    tuned_configs: 已调优的配置字典
+    Args:
+    m, k, n: Matrix dimensions
+    num_groups: Number of groups
+    tuned_configs: Pre-tuned configuration dictionary
 
-    返回:
-    最佳配置或None（如果已存在或调优失败）
+    Returns:
+    Best configuration or None (if already exists or tuning failed)
     """
     # Check if already tuned
     config_key = (m, k, n, num_groups, nopad)
@@ -790,9 +790,8 @@ def tuning_deepgemm_config_entrypoint(test_cases, tp, seed=0, model="anonymous",
         save_path = ""
         def get_timestamp():
             from datetime import datetime
-            # 获取当前时间
             current_time = datetime.now()
-            # 格式化时间为 "YY/MM/DD/HH/MM"
+            # "YY/MM/DD/HH/MM"
             formatted_time = current_time.strftime("%y-%m-%d-%H-%M")
             return formatted_time
         if out_of_box:

@@ -112,7 +112,6 @@ def test_all_configs(config_list: List[Tuple],
                 }
                 all_results_and_configs[idx] = config_dict
 
-            # 并行执行并获取结果列表
             results = pool.starmap(test_kernel_config, tasks)
         # print(results)
         for idx in range(len(results)):

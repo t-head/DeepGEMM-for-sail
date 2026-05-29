@@ -14,18 +14,12 @@ class MNKDict:
             self._build_from_data(data)
 
     def _build_from_data(self, data):
-        """
-        批量构建内部结构
-        """
-        # 临时存储：按 (n, k) 分组
         groups = defaultdict(list)
 
         for m, n, k, tile in data:
             groups[(n, k)].append((m, tile))
 
-        # 对每组按 m 排序，并分离出 m_list 和 tile_map
         for (n, k), items in groups.items():
-            # 按 m 升序排序
             sorted_items = sorted(items, key=lambda x: x[0])
             m_list = [item[0] for item in sorted_items]
             tile_dict = {item[0]: item[1] for item in sorted_items}
@@ -35,7 +29,7 @@ class MNKDict:
 
     def query(self, m_query: int, n: int, k: int):
         """
-        查询 (n,k) 下 m >= m_query 的最大 m 对应的 tile
+        Query tile corresponding to maximum m where m >= m_query under (n,k)
         """
         key = (n, k)
         if key not in self.index:

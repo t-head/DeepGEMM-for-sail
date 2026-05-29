@@ -12,7 +12,7 @@ namespace deep_gemm_int8 {
 
 std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, int block_n, int block_k = 128,
                                           int bpp = 1) {
-    // 首先尝试使用 swizzle，因为它不浪费共享内存
+    // Try swizzle first
     int swizzle_mode = 128;
     // int block_n_padding = (swizzle_mode == 0) ? get_block_n_padding_for_smem_d(block_n) : 0;
     int block_n_padding = 0;
@@ -27,14 +27,13 @@ std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, in
 
     int smem_size = std::max(smem_size_d, smem_size_a + smem_size_b);
 
-    // 确保 swizzle 和 padding 不同时启用
+    // Swizzle and padding are mutually exclusive
     assert((swizzle_mode > 0) + (block_n_padding > 0) <= 1);
 
     return std::make_tuple(smem_size, swizzle_mode, block_n_padding);
 }
 
 std::tuple<int> get_num_occ(int block_m, int block_n, int block_k, int num_stages) {
-    // 使用静态假设
     const int ppu_capacity = 262144;
     const int bpp = 1;
 
@@ -49,15 +48,15 @@ std::tuple<int> get_num_occ(int block_m, int block_n, int block_k, int num_stage
     int smem_size = std::max(smem_size_d, smem_size_a + smem_size_b);
     int smem_occ = ppu_capacity / smem_size;
 
-    // 创建查找表，使用字符串作为键的简单方法
+    // Create lookup table
     std::unordered_map<long long, int> vreg_occ_lut = {
         {16LL * 100000 + 256, 3}, {32LL * 100000 + 128, 3}, {32LL * 100000 + 256, 2}, {64LL * 100000 + 64, 2},
         {64LL * 100000 + 128, 2}, {64LL * 100000 + 256, 2}, {128LL * 100000 + 128, 2}};
 
     long long key = static_cast<long long>(block_m) * 100000 + block_n;
-    int vreg_occ = 1; // 默认值
+    int vreg_occ = 1;
 
-    // 查找键值
+    // Lookup
     auto it = vreg_occ_lut.find(key);
     if (it != vreg_occ_lut.end()) {
         vreg_occ = it->second;
@@ -112,7 +111,6 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
     std::vector<int> block_ms = {256, 192, 128, 64, 32, 16};
     std::vector<int> block_ns = {256, 128, 64, 32};
 
-    // Lambda 函数定义
     auto fix_wave_saturate = [num_sms](int x) -> int {
         return (x == 0) ? num_sms : x;
     };
@@ -359,7 +357,6 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms, bool i
         block_ns.push_back(1 << x);
     }
 
-    // Lambda 函数定义
     auto fix_wave_saturate = [num_sms](int x) -> int {
         return (x == 0) ? num_sms : x;
     };
@@ -632,7 +629,6 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_group
         block_ns.push_back(1 << x);
     }
 
-    // Lambda 函数定义
     auto fix_wave_saturate = [num_sms](int x) -> int {
         return (x == 0) ? num_sms : x;
     };

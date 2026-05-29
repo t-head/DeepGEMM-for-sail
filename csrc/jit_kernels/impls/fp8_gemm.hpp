@@ -164,8 +164,8 @@ public:
     // Epilogue
     struct EpilogueArgs {
         LinearCombinationArgs callback;
-        cutlass::bfloat16_t* ptr_C;                            // 通常为 nullptr（in-place D）
-        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C; // 通常等于 stride_D
+        cutlass::bfloat16_t* ptr_C;
+        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C;
 
         cutlass::bfloat16_t* ptr_D;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D;
@@ -177,7 +177,7 @@ public:
         bool kEnableSboOverlap;
     };
 
-    // 主 Arguments 结构体
+    // Main Arguments
     struct GemmArguments {
         GemmUniversalMode mode;
         GemmProblemSize problem_shape;
@@ -261,7 +261,6 @@ static constexpr bool kUseNStageKernel = SHAPE_K <= 512 && (SHAPE_N % (BLOCK_N *
                                           && (BLOCK_K == 128) && (SHAPE_K % BLOCK_K == 0) && STAGES == 2;
 constexpr int N_EXPAND = kUseNStageKernel ? KernelAiuMultistageOnN::N_EXPAND : 1;
 
-// 根据模板参数定义具体类型
 using TileScheduler = DeepGemmScheduler<
   kGemmType,
   SHAPE_N,
@@ -347,7 +346,6 @@ using GemmKernel = DeepGemmUniversal<
   kUseNStageKernel
 >;
 
-// Kernel 函数定义
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
 __global__ void {}(

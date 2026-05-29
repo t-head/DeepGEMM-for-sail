@@ -26,18 +26,18 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      block_ms_lists: Tuple[int], block_ns_lists: Tuple[int],
                      block_k: int) -> Tuple[int, int, int, int, int, int, int, Tuple]:
     """
-    根据给定的矩阵维度和硬件参数，计算最优的GEMM配置
-    
-    参数:
-    m, n, k: 矩阵乘法的维度 (M x K) * (K x N)
-    num_groups: 分组数量
-    num_sms: GPU上的SM数量
-    block_ms_lists: 可选的block_m值列表
-    block_ns_lists: 可选的block_n值列表
-    block_k: block_k值
-    
-    返回:
-    包含最优配置的元组: (num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config)
+    Calculate optimal GEMM configuration given matrix dimensions and hardware parameters
+
+    Args:
+    m, n, k: Matrix multiplication dimensions (M x K) * (K x N)
+    num_groups: Number of groups
+    num_sms: Number of SMs on GPU
+    block_ms_lists: Optional block_m value list
+    block_ns_lists: Optional block_n value list
+    block_k: block_k value
+
+    Returns:
+    Tuple containing optimal configuration: (num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config)
     """
  
     block_ms = block_ms_lists
@@ -130,17 +130,17 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 def get_supported_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                           is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> List[Tuple]:
     """
-    获取支持的配置列表
-    
-    参数:
-    m, n, k: 矩阵维度
-    num_groups: 分组数量
-    num_sms: SM数量
-    is_grouped_contiguous: 是否为连续分组
-    is_grouped_masked: 是否为掩码分组
-    
-    返回:
-    配置列表
+    Get list of supported configurations
+
+    Args:
+    m, n, k: Matrix dimensions
+    num_groups: Number of groups
+    num_sms: Number of SMs
+    is_grouped_contiguous: Whether it's grouped contiguous
+    is_grouped_masked: Whether it's masked grouped
+
+    Returns:
+    List of configurations
     """
     if not is_grouped_contiguous:
         block_ms = (256, 128, 64, 32, 16)

@@ -431,7 +431,6 @@ using Epilogue = typename cutlass::epilogue::threadblock::EpilogueWithVisitorFro
 // GEMM
 using Gemm_Kernel = GemmKernel<typename DefaultGemm::Mma, Epilogue, ProblemVisitor, kEnableSboOverlap>;
 
-// Kernel 函数定义
 extern "C"
 __launch_bounds__(DefaultGemm::kThreadCount)
 __global__ void {}(
