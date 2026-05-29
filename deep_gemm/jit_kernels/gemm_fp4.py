@@ -42,6 +42,7 @@ tile_config_normal = {
     (16,  64,  256) : (16, 16, 4),
     (32,  128, 128) : (32, 64, 2),
     (32,  64,  128) : (32, 32, 2),
+    (64,  64,  128) : (32, 64, 3),
     (64,  128, 128) : (32, 64, 2),
     (128, 128, 128) : (32, 64, 2),
     (128, 256, 64)  : (64, 64, 3)
@@ -448,7 +449,15 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
         best_block_m = 16
         best_block_n = 64
         block_k = 256
-
+    # for DeepSeek-V4 Pro EP
+    if (n == 6144 and k == 3584) or (n == 7168 and k == 1536):
+        if (m < 6):
+            if (best_block_m == 32 and best_block_n == 64):
+                best_block_m, best_block_n, block_k = 64, 64, 128
+                if (k == 1536):
+                    best_block_n = 128
+        elif (m >= 6) and (best_block_m in [32, 64] and best_block_n == 256):
+            best_block_m, best_block_n, block_k = 128, 256, 64
     tile_config = tile_config_normal
     if (k < 128) and not (best_block_n >= 128 and best_block_m >= 128):
         tile_config = tile_config_smallK
