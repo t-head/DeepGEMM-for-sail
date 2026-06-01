@@ -126,6 +126,7 @@ CUTLASS_DEVICE void gemm_explicit(ThrMma const& thr_mma,
 
         if constexpr (kFastBF16ToTF32) {
             auto tCrAi_k = tCrAi(_, _, k_block);
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
             CUTE_UNROLL
             for (int i = 0; i < size(tCrAi_k); i += 2) {
                 const float value_lo = __bfloat162float(tCrAi_k(i));
@@ -133,10 +134,24 @@ CUTLASS_DEVICE void gemm_explicit(ThrMma const& thr_mma,
                 sqr_sum_acc_lo = fmaf(value_lo, value_lo, sqr_sum_acc_lo);
                 sqr_sum_acc_hi = fmaf(value_hi, value_hi, sqr_sum_acc_hi);
             }
+#else
+            constexpr int kHalf = decltype(size(tCrAi_k))::value / 2;
+            CUTE_UNROLL
+            for (int i = 0; i < kHalf; ++i) {
+                const float value = __bfloat162float(tCrAi_k(i));
+                sqr_sum_acc_lo = fmaf(value, value, sqr_sum_acc_lo);
+            }
+            CUTE_UNROLL
+            for (int i = kHalf; i < size(tCrAi_k); ++i) {
+                const float value = __bfloat162float(tCrAi_k(i));
+                sqr_sum_acc_hi = fmaf(value, value, sqr_sum_acc_hi);
+            }
+#endif
             cute::transform(tCrAi(_, _, k_block), tCrA(_, _, k_block), ToTF32<true>{});
         } else {
             auto tCrAi_k = tCrAi(_, _, k_block);
             auto tCrA_k = tCrA(_, _, k_block);
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
             CUTE_UNROLL
             for (int i = 0; i < size(tCrAi_k); i += 2) {
                 const float value_lo = __bfloat162float(tCrAi_k(i));
@@ -146,6 +161,21 @@ CUTLASS_DEVICE void gemm_explicit(ThrMma const& thr_mma,
                 tCrA_k(i) = cutlass::tfloat32_t(value_lo);
                 tCrA_k(i + 1) = cutlass::tfloat32_t(value_hi);
             }
+#else
+            constexpr int kHalf = decltype(size(tCrAi_k))::value / 2;
+            CUTE_UNROLL
+            for (int i = 0; i < kHalf; ++i) {
+                const float value = __bfloat162float(tCrAi_k(i));
+                sqr_sum_acc_lo = fmaf(value, value, sqr_sum_acc_lo);
+                tCrA_k(i) = cutlass::tfloat32_t(value);
+            }
+            CUTE_UNROLL
+            for (int i = kHalf; i < size(tCrAi_k); ++i) {
+                const float value = __bfloat162float(tCrAi_k(i));
+                sqr_sum_acc_hi = fmaf(value, value, sqr_sum_acc_hi);
+                tCrA_k(i) = cutlass::tfloat32_t(value);
+            }
+#endif
         }
 
         cute::transform(tCrBi(_, _, k_block), tCrB(_, _, k_block), ToTF32<kFastBF16ToTF32>{});
@@ -211,7 +241,6 @@ sm80_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
 #else
     using MmaAtom = MMA_Atom<PPU0010_16x16x8_F32TF32TF32F32_TN>;
 #endif
-    // using MmaAtom = MMA_Atom<PPU0015_16x16x8_F32TF32TF32F32_TN>;
     using TiledMma = cute::TiledMMA<MmaAtom, Layout<Shape<Int<BLOCK_M / 16>, _1, _1>>>;
     TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tid);
