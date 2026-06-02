@@ -569,3 +569,5 @@ self_design,[DeepGemm] --format=PagedMqaLogits,data_type:bf16,batch_size:8,next_
 self_design,[DeepGemm] --format=PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,avg_context_len:2048
 self_design,[DeepGemm] --format=PagedMqaLogits,data_type:fp8,batch_size:64,next_n:1,avg_context_len:2048
 self_design,[DeepGemm] --format=PagedMqaLogits,data_type:fp4,batch_size:64,next_n:1,avg_context_len:8192,logits_dtype:bf16
+kimi,[DeepGemm] --format=GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
+kimi,[DeepGemm] --format=GroupedMasked,data_type:w4a16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32

@@ -30,7 +30,7 @@ template <int ShapeN, int ShapeK,
 class W4A16GEMM {
 public:
   using ElementA = cutlass::bfloat16_t;
-  using ElementB = cutlass::int4_t;
+  using ElementB = int4_t;
   using ElementScale = ElementA;
   using ElementD = ElementA;
   using ElementAcc = float;
