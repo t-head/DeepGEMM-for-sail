@@ -386,18 +386,42 @@ public:
         int warp_q_idx = warp_idx / WarpOnM;
         int warp_group_id = warp_idx / 8;
 
-        int smem_pipe_read = 0;
-        int smem_pipe_write = 0;
-        int num_total_kv_blocks = 0;
+        auto warp_interleave_start = [&]() {
+            if constexpr (WarpInterleaving) {
+                if (warp_group_id == 1) {
+                    __ppu_barrier_arrive(5, NumThreadsPerCTA, 0);
+                }
+            }
+        };
 
-        auto load_q_g2s = [&](int block_q_idx) {
+        auto warp_interleave_sync = [&]() {
+            if constexpr (WarpInterleaving) {
+                __ppu_barrier_sync(5 + warp_group_id, NumThreadsPerCTA);
+            }
+        };
+
+        auto warp_interleave_defer = [&]() {
+            if constexpr (WarpInterleaving) {
+                __ppu_barrier_arrive(6 - warp_group_id, NumThreadsPerCTA, 0);
+            }
+        };
+
+        auto warp_interleave_end = [&]() {
+            if constexpr (WarpInterleaving) {
+                if (warp_group_id == 0) {
+                    __ppu_barrier_sync(5, NumThreadsPerCTA);
+                }
+            }
+        };
+
+        auto load_q_g2s = [&](int block_q_idx, int q_stage_idx) {
             int residual_n = (params.seq_len_q - block_q_idx * BLOCK_Q) * kNumHeads;
             gmem_tiled_copy_B.desc_.dim_h = residual_n;
             gmem_tiled_copy_SFB.desc_.dim_w = residual_n;
             gmem_tiled_copy_weight.desc_.dim_w = residual_n;
-            copy_aiu(gmem_tiled_copy_B, tBgB(_, _, _, 0), tBsB(_, _, _, 0), warp_idx);
-            copy_aiu<true>(gmem_tiled_copy_SFB, tSFBgSFB(_, _, _, 0), tSFBsSFB(_, _, _, 0), gmem_tiled_copy_weight,
-                           tWgW(_, _, _, 0), tWsW(_, _, _, 0), warp_idx);
+            copy_aiu(gmem_tiled_copy_B, tBgB(_, _, _, 0), tBsB(_, _, _, q_stage_idx), warp_idx);
+            copy_aiu<true>(gmem_tiled_copy_SFB, tSFBgSFB(_, _, _, 0), tSFBsSFB(_, _, _, q_stage_idx), gmem_tiled_copy_weight,
+                           tWgW(_, _, _, 0), tWsW(_, _, _, q_stage_idx), warp_idx);
         };
 
         auto load_kv_g2s = [&](int kv_start, int kv_end, int kv_block_idx, int smem_stage) {
@@ -410,10 +434,10 @@ public:
             tSFAgSFA.data() = tSFAgSFA.data() + BLOCK_KV;
         };
 
-        auto load_q_s2r = [&]() {
-            copy(smem_tiled_copy_B, tCsB(_, _, _, 0), tCrB_copy_view);
-            copy(smem_tiled_copy_SFB, tCsSFB(_, _, _, 0), tCrSFB_copy_view);
-            copy(smem_tiled_copy_weights, tCsW(_, _, _, 0), tCrW_copy_view);
+        auto load_q_s2r = [&](int q_stage_idx) {
+            copy(smem_tiled_copy_B, tCsB(_, _, _, q_stage_idx), tCrB_copy_view);
+            copy(smem_tiled_copy_SFB, tCsSFB(_, _, _, q_stage_idx), tCrSFB_copy_view);
+            copy(smem_tiled_copy_weights, tCsW(_, _, _, q_stage_idx), tCrW_copy_view);
             if constexpr (cute::is_same_v<ElementLogits, float>) {
                 for (int j = 0; j < elem_weights; j++) {
                     weights[j] = tCrW_copy_view(j);
@@ -434,13 +458,18 @@ public:
             copy(smem_tiled_copy_SFA, tCsSFA(_, _, k_block, kv_stage_idx), tCrSFA_copy_view(_, _, k_block));
         };
 
-        auto epilogue = [&](int kv_start, int kv_block_idx) {
+        auto load_kv_s2r_mblock = [&](int k_block, int kv_stage_idx, int m_block) {
+            copy(smem_tiled_copy_A, tCsA(_, m_block, k_block, kv_stage_idx), tCrA_copy_view(_, m_block, k_block));
+            copy(smem_tiled_copy_SFA, tCsSFA(_, m_block, k_block, kv_stage_idx), tCrSFA_copy_view(_, m_block, k_block));
+        };
+
+        auto epilogue_mblock = [&](int kv_start, int kv_block_idx, int m_block) {
             // Reduce over heads and store logits
             static constexpr int kNumAccumPerMma = size<0>(accum);
             CUTE_STATIC_ASSERT(kNumHeads % 8 == 0);
             const auto& kv_offset = kv_start + kv_block_idx * BLOCK_KV + warp_offset;
-            #pragma unroll
-            for (int m = 0; m < size<1>(accum); m++) {
+            {
+                int m = m_block;
                 int mma_offset = m * InstM;
                 auto logits_q_offset = (block_q_idx * BLOCK_Q + warp_q_idx) * params.stride_k;
                 auto logits_kv_offset = kv_offset + mma_offset;
@@ -503,7 +532,7 @@ public:
 
         // ── Outer loop: Q blocks ──────────────────────────────────────────
         while (block_q_idx < num_q_blocks) {
-            CUTE_TIE_DECL(load_schedule(1), q_stage_idx, q_phase, kv_start, kv_end, num_kv_blocks);
+            CUTE_TIE_DECL(load_schedule(0), q_stage_idx, q_phase, kv_start, kv_end, num_kv_blocks);
 
             // ── Offset Q / K / scale data pointers ──────────────────────────
             tAgA.data() = tKgK.data() + kv_start * BLOCK_K;
@@ -515,7 +544,7 @@ public:
             int current_stage_kv = 0;
             if (num_kv_blocks > 0) {
                 // ── Load Q + q_sf + weights (AIU) ──────────────────────────
-                load_q_g2s(block_q_idx);
+                load_q_g2s(block_q_idx, q_stage_idx);
 
                 // ── Prologue: load first (kNumKVStages - 1) K blocks (AIU) ──
                 for (int kv_pipe = 0; kv_pipe < kNumKVStages - 1; kv_pipe++) {
@@ -531,22 +560,16 @@ public:
                 __syncthreads();
 
                 // ── Load Q + q_sf + weights from smem to vreg ──────────────
-                load_q_s2r();
+                load_q_s2r(q_stage_idx);
             }
 
-            if constexpr (WarpInterleaving) {
-                if (warp_group_id == 1) {
-                    __ppu_barrier_arrive(5, NumThreadsPerCTA, 0);
-                }
-            }
+            warp_interleave_start();
 
             // ── Inner loop: KV blocks ──────────────────────────────────────
             for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
                 int kv_stage_idx = kv_block_idx % kNumKVStages;
 
-                if constexpr (WarpInterleaving) {
-                    __ppu_barrier_sync(5 + warp_group_id, NumThreadsPerCTA);
-                }
+                warp_interleave_sync();
 
                 // Issue next K block
                 int next_kv_block_idx = kv_block_idx + kNumKVStages - 1;
@@ -556,40 +579,58 @@ public:
                 cp_async_fence();
                 current_stage_kv = (current_stage_kv + 1) % kNumKVStages;
 
-                constexpr int K_BLOCK_MAX = size<2>(tCrA);
-                for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
-                    load_kv_s2r(k_block, kv_stage_idx);
-                    cute::gemm(tiled_mma, accum, tCrA(_, _, k_block), tCrSFA(_, _, k_block), tCrB(_, _, k_block),
-                               tCrSFB(_, _, k_block), accum);
-                });
-
-                if constexpr (WarpInterleaving) {
-                    __ppu_barrier_arrive(6 - warp_group_id, NumThreadsPerCTA, 0);
+                constexpr int M_BLOCK = size<1>(accum);
+                constexpr int N_BLOCK = size<2>(accum);
+                constexpr int K_BLOCK = size<2>(tCrA);
+                if constexpr (std::is_same_v<ElementLogits, float>) {
+                    for_each(make_int_sequence<K_BLOCK>{}, [&](auto k_block) {
+                        load_kv_s2r(k_block, kv_stage_idx);
+                        cute::gemm(tiled_mma, accum, tCrA(_, _, k_block), tCrSFA(_, _, k_block), tCrB(_, _, k_block),
+                                    tCrSFB(_, _, k_block), accum);
+                    });
+                    warp_interleave_defer();
+                    #pragma unroll
+                    for (int m_block = 0; m_block < size<1>(accum); m_block++) {
+                        epilogue_mblock(kv_start, kv_block_idx, m_block);
+                    }
+                } else { // Interleaved mma and epilogue
+                    constexpr int m_group = M_BLOCK / size<1>(tCrSFA);
+                    constexpr int n_group = N_BLOCK / size<1>(tCrSFB);
+                    for_each(make_int_sequence<M_BLOCK>{}, [&](auto m_block) {
+                        if constexpr(m_block > 0) warp_interleave_sync();
+                        for_each(make_int_sequence<K_BLOCK>{}, [&](auto k_block) {
+                            load_kv_s2r_mblock(k_block, kv_stage_idx, m_block);
+                            for_each(make_int_sequence<N_BLOCK>{}, [&](auto n_block) {
+                                Tensor s = make_tensor<uint32_t>(Int<4>{});
+                                MMA_Atom<MmaInst> mma_atom;
+                                Tensor d = accum(_, m_block, n_block);
+                                Tensor a = tCrA(_, m_block, k_block);
+                                Tensor b = tCrB(_, n_block, k_block);
+                                Tensor c = accum(_, m_block, n_block);
+                                s[0] = tCrSFA(_, _, k_block)[m_block / m_group];
+                                s[1] = tCrSFB(_, _, k_block)[n_block / n_group];
+                                s[2] = m_block % m_group;
+                                s[3] = n_block % n_group;
+                                cute::mma_unpack(mma_atom, d, a, b, c, s);
+                            });
+                        });
+                        warp_interleave_defer();
+                        epilogue_mblock(kv_start, kv_block_idx, m_block);
+                    });
                 }
 
-                // ── Epilogue: reduce over heads, apply weights, store ──────
-                epilogue(kv_start, kv_block_idx);
-
-                // ── Wait for next K ─────────────────────────────────────────
+                // Wait for next K
                 cp_async_wait<kNumKVStages - 2>();
-                if constexpr (WarpInterleaving) {
-                    __ppu_barrier_sync(3 + warp_group_id, NumThreadsPerCTA / 2);
-                } else {
+                if constexpr (!WarpInterleaving) {
                     __syncthreads();
                 }
                 clear(accum);
             } // end KV loop
 
-            if constexpr (WarpInterleaving) {
-                if (warp_group_id == 0) {
-                    __ppu_barrier_sync(5, NumThreadsPerCTA);
-                }
-            }
+            warp_interleave_end();
 
             cp_async_wait<0>();
             __syncthreads();
-
-            num_total_kv_blocks += num_kv_blocks;
 
             // Jump to next Q block
             CUTE_TIE(get_next_block_q_idx(), block_q_idx, q_iter_idx);

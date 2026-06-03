@@ -109,49 +109,6 @@ def mqa_logits_common(q: torch.Tensor,
         assert(k_scales.is_contiguous())
         assert(k_scales.dtype == torch.float32)
 
-    debug = False
-    if debug:
-        print("cu_seq_len_k_start = ", cu_seq_len_k_start)
-        print("cu_seq_len_k_end = ", cu_seq_len_k_end)
-        print("k_scales = ", k_scales)
-        q_fp32 = q.to(torch.float32)
-        k_fp32 = k.to(torch.float32)
-        torch.set_printoptions(linewidth=200)
-        score_with_fp32 = torch.einsum('mhd,nd->hmn', q_fp32, k_fp32)
-        # print("score_with_fp32 = ", score_with_fp32[0, :, 0])
-        print("score_with_fp32 size stride = ", score_with_fp32.size(), score_with_fp32.stride())
-        print("score_with_fp32[0, 1, 0] = ", score_with_fp32[0, 1, 0])
-        print("score_with_fp32[:, 1, 0] = ", score_with_fp32[:, 1, 0])
-        temp = score_with_fp32[:, 1, 0]
-        for row in range(8):
-            print(temp[(row*8):(row*8 +8)])
-        print("score_with_fp32[:, 1, 0].relu() = ", score_with_fp32[:, 1, 0].relu())
-        temp = score_with_fp32[:, 1, 0].relu()
-        for row in range(8):
-            print(temp[(row*8):(row*8 +7)])
-        print("q_fp32 size = ", q_fp32.size(), q_fp32.stride())
-        print("q_fp32[1, 0, 0] = ", q_fp32[1, 0, 0])
-
-        print("k_fp32 size = ", k_fp32.size(), k_fp32.stride())
-        print("k_fp32[0, 0] = ", k_fp32[0, 0])
-        q_mul_k_0 = sum(q_fp32[1, 0, :] * k_fp32[0, :])
-        q_mul_k_1 = sum(q_fp32[1, 1, :] * k_fp32[0, :])
-        # print("q vector = ", q_fp32[1, 0, :])
-        # print("k vector = ", k_fp32[0, :])
-        print("q_mul_k_0 = ", q_mul_k_0)
-        print("q_mul_k_1 = ", q_mul_k_1)
-        print("weights[1,0] = ", weights[1,0])
-        print("k_scales[0] = ", k_scales[0])
-
-        score_mul_weight_reduce64 = sum(score_with_fp32[:, 1, 0].relu() * weights[1, :])
-        print("score_mul_weight_reduce64 = ", score_mul_weight_reduce64)
-
-        score_mul_weight_reduce64_mul_kscale = score_mul_weight_reduce64 * k_scales[0]
-        print("score_mul_weight_reduce64_mul_kscale = ", score_mul_weight_reduce64_mul_kscale)
-        # import pdb;pdb.set_trace()
-
-
-
     # defalut tile config for fp8 and int8
     block_qh, block_kv, warp_qh, warp_kv, num_q_stages, num_kv_stages = [256, 256, 64, 64, 3, 3] if num_heads == 64 else [128, 256, 32, 64, 3, 3]
     block_q = block_qh / num_heads
@@ -296,10 +253,12 @@ def fp4_mqa_logits(q: torch.Tensor,
     num_sms = get_num_sms()
     stream = torch.cuda.current_stream()
     if num_heads == 64 and logits_dtype == torch.bfloat16:
-        block_q, warp_qh, block_kv, warp_kv = 4, num_heads, 64, 16
+        if seq_len_k >= 8192:
+            block_q, warp_qh, block_kv, warp_kv, num_q_stages, num_kv_stages = 4, num_heads, 256, 64, 1, 4
+        else:
+            block_q, warp_qh, block_kv, warp_kv, num_q_stages, num_kv_stages = 4, num_heads, 64, 16, 1, 4
     else:
-        block_q, warp_qh, block_kv, warp_kv = 4, num_heads, 256, 64
-    num_q_stages, num_kv_stages = 1, 3
+        block_q, warp_qh, block_kv, warp_kv, num_q_stages, num_kv_stages = 4, num_heads, 256, 64, 1, 3
     block_qh = num_heads * block_q
 
     seq_len_alignment = 4
@@ -416,12 +375,15 @@ def get_paged_mqa_logits_metadata(context_lens: torch.Tensor,
     # shared memory limit
     assert(batch_size <= 65536)
 
-    num_math_warpgroups = 1 # sm80, no warpgroup
+    num_math_warpgroups = 1
     split_kv = block_kv * num_math_warpgroups
 
     tb_per_cu = 1
     if metadata_extra is not None:
         next_n, num_heads, head_dim, element_size = metadata_extra
+        # if element_size == 1 and head_dim == 64: # fp4 warp-interleave
+        #     num_math_warpgroups = 4
+        #     split_kv = block_kv * num_math_warpgroups
         _, _, tb_per_cu = get_paged_mqa_logits_tile(next_n, split_kv, num_heads, head_dim, element_size)
     num_blocks = num_sms * tb_per_cu
     schedule_metadata = torch.empty((num_blocks + 1, 2), dtype=context_lens.dtype, device=context_lens.device)
@@ -502,7 +464,6 @@ def paged_mqa_logits_common(q: torch.Tensor,
         stride=(kv_cache_stride_bytes, head_dim, 1),
     ).view(dtype=q.dtype)
 
-    # import pdb;pdb.set_trace()
     if q.dtype == torch.bfloat16:
         k_scales = torch.empty(0)
     else:
@@ -512,14 +473,6 @@ def paged_mqa_logits_common(q: torch.Tensor,
             stride=(kv_cache_stride_bytes, 1),
             storage_offset = block_kv * head_dim,
         ).view(dtype=torch.float)
-
-    debug = False
-    if debug:
-        print("kv size = ", k.size(), " stride = ", k.stride())
-        print("context_lens[0] = ", context_lens[0] )
-        # sum0 = q[0,0,0,:] * k[]
-        # print(q[])
-        # import pdb;pdb.set_trace()
 
     num_math_warp_groups = 1
     aligned_max_context_len = align(max_context_len, num_math_warp_groups * block_kv)
@@ -691,6 +644,7 @@ def fp4_paged_mqa_logits(q: torch.Tensor,
     ).view(torch.int32)
 
     num_math_warp_groups = 1
+    # num_math_warp_groups = 4 # 4 warpgroups, each warpgroup 4 warps, 16 warps for warp-interleave
     aligned_max_context_len = align(max_context_len, num_math_warp_groups * block_kv)
     logits = torch.empty((batch_size * next_n, aligned_max_context_len), dtype=logits_dtype, device=q.device)
     logits = logits[..., :max_context_len]

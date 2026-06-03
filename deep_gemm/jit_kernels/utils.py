@@ -421,7 +421,12 @@ def get_paged_mqa_logits_tile(next_n, split_kv, num_heads, head_dim, datasize):
         return vreg_tb_per_sm
 
     if datasize == 1 and head_dim == 64: # fp4 packed head_dim = 64
-        return (2, 3, 8)
+        if split_kv == 64:
+            return (2, 3, 8)
+        elif split_kv == 256: # warp-interleave
+            return (2, 3, 2)
+        else:
+            raise ValueError
     tile_list = [(2, 3, get_smem_tb_per_sm(2, 3))]
     if next_n == 1 and split_kv == 64 and head_dim == 128 and (num_heads == 32 or num_heads == 64):
         tile_list.append((1, 3, min(get_smem_tb_per_sm(1, 3), get_vreg_tb_per_sm())))

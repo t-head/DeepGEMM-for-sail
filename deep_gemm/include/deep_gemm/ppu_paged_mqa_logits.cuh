@@ -41,7 +41,6 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t* c
     uint32_t loop_num = batch_size / blockDim.x;
     for (uint32_t k = 0; k < loop_num; k++) {
         uint32_t val = temp_prefix_sum[tid];
-        #pragma unroll
         for (uint32_t offset = 1; offset < blockDim.x; offset <<= 1) {
             uint32_t temp = 0;
             if (tid >= offset) {
@@ -60,7 +59,6 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t* c
     // blockDim.x < 1024: only last loop
     uint32_t last = batch_size - loop_num * blockDim.x;
     uint32_t val = (tid < last) ? temp_prefix_sum[tid] : 0;
-    #pragma unroll
     for (uint32_t offset = 1; offset < last; offset <<= 1) {
         uint32_t temp = (tid >= offset && tid < last) ? temp_prefix_sum[tid - offset] : 0;
         __syncthreads();
@@ -150,15 +148,10 @@ struct PagedMQALogitsScheduler {
             return false;
 
         current_kv_idx += kNumMathWarpGroups;
-        while (current_kv_idx >= current_num_kv) {
+        if (current_kv_idx >= current_num_kv) {
             ++ current_q_idx;
             current_kv_idx = 0;
-            if (current_q_idx < batch_size) {
-                current_num_kv = ceil_div(__ldg(this->context_lens + current_q_idx), BLOCK_KV);
-            } else {
-                current_num_kv = 0;
-                break;
-            }
+            current_num_kv = current_q_idx < batch_size ? ceil_div(__ldg(this->context_lens + current_q_idx), BLOCK_KV) : 0;
         }
 
         return true;
@@ -168,19 +161,8 @@ struct PagedMQALogitsScheduler {
         return q_idx < end_q_idx or q_idx == end_q_idx and 0 < end_kv_idx;
     }
 
-    // return 0 means no valid next q
-    __device__ __forceinline__ uint32_t next_valid_q_idx(const uint32_t& q_idx) const {
-        int next_q_idx = q_idx + 1;
-        while (true) {
-            if (!exist_q_idx(next_q_idx)) return 0;
-            if (__ldg(this->context_lens + next_q_idx) != 0) return next_q_idx;
-            next_q_idx++;
-        }
-        return 0;
-    }
-
     __device__ __forceinline__ bool is_last_task(const uint32_t& q_idx, const uint32_t& kv_idx) const {
-        return q_idx > end_q_idx or (q_idx == end_q_idx and kv_idx == end_kv_idx);
+        return q_idx == end_q_idx and kv_idx == end_kv_idx;
     }
 };
 
@@ -200,7 +182,7 @@ public:
   using ElementCompute      = float;
   using ElementScale        = float;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
-  static constexpr int BLOCK_M = SPLIT_KV;
+  static constexpr int BLOCK_M = BLOCK_KV;
   static constexpr int BLOCK_N = kNextN * kNumHeads;
   static constexpr int BLOCK_K = kHeadDim;
   static constexpr int WARP_M = 16;
@@ -208,7 +190,7 @@ public:
 
   static constexpr int BLOCK_Q = kNextN;
   static constexpr int WARP_Q = 1;
-  static constexpr int kNumMathWarpGroups = 1;
+  static constexpr int kNumMathWarpGroups = SPLIT_KV / BLOCK_KV;
 
   using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
   using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
@@ -248,9 +230,11 @@ public:
       >>;       // 1x1x1 value group
 #endif
 
-  static constexpr int NumThreadsPerCTA = size(TiledMma{});
-  // WarpInterleaving is enabled only when NumThreadsPerCTA is 512, which satisfy the condition that 2 warp group partitioned onto separate WEs.
-  static constexpr bool WarpInterleaving = (NumThreadsPerCTA == 512);
+  static constexpr int MaxThreadsPerBlock = kNumMathWarpGroups * size(TiledMma{});
+  static constexpr int WarpOnGroup = size(TiledMma{}) / 32;
+  static constexpr int MinBlocksPerMultiprocessor = 1;
+  static constexpr bool WarpInterleaving = (MaxThreadsPerBlock == 512);
+  static_assert(!(WarpInterleaving && kNumQStages == 1), "warp-interleave does not support stage_q = 1");
 
   static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
   static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
@@ -276,7 +260,7 @@ public:
 
   using SmemLayoutA = decltype(tile_to_shape(
       SmemLayoutAtomA{},
-      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<kNumKVStages>{})));
+      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<kNumKVStages>{}, Int<kNumMathWarpGroups>{})));
   using SmemLayoutB = decltype(tile_to_shape(
       SmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<kNumQStages>{})));
@@ -285,9 +269,6 @@ public:
   constexpr static uint32_t CTA_N = shape<1>(TileShape{});
   constexpr static uint32_t CTA_K = shape<2>(TileShape{});
 
-  static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
-  static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
-
   // ScaleA (k_scales, float per KV row) -- AIU load, no pre-rearrangement
   using DefaultOperandSFA =
       cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, float, false, _1, Int<CTA_M>, false, 0, false>;
@@ -295,7 +276,7 @@ public:
   using GmemTiledCopySFA = typename DefaultOperandSFA::GmemTiledCopy;
   using SmemLayoutSFA = decltype(tile_to_shape(
       SmemLayoutAtomSFA{},
-      make_shape(_1{}, Int<CTA_M>{}, Int<kNumKVStages>{})));
+      make_shape(_1{}, Int<CTA_M>{}, Int<kNumKVStages>{}, Int<kNumMathWarpGroups>{})));
 
   // ScaleB (weights, float per Q head) -- AIU load, no pre-rearrangement
   using DefaultOperandSFB =
@@ -337,16 +318,6 @@ public:
     StrideA dA;
     StrideB dB;
     KernelHardwareInfo hw_info{};
-
-    CUTLASS_DEVICE void
-    print() const {
-        printf("templates, kNumHeads=%d, kHeadDim=%d, tile=(%d, %d, %d, %d, %d, %d), kNextN=%d\n",
-                kNumHeads, kHeadDim, BLOCK_M, BLOCK_N, WARP_M, WARP_N, kNumQStages, kNumKVStages, kNextN);
-        printf("arguments, ptr_q=%p, ptr_k=%p, k_scales=%p, weights=%p, context_lens=%p, logits=%p, block_table=%p, schedule_meta=%p\n",
-                ptr_q, ptr_k, k_scales, weights, context_lens, logits, block_table, schedule_meta);
-        printf("arguments, batch_size=%d, logits_stride=%ld, kv_cache_stride_bytes=%ld, block_table_stride=%u\n",
-                batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride);
-    }
   };
 
   // Kernel entry point API
@@ -416,19 +387,18 @@ public:
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
-    // printf("run ppu aiu deepgemm persistent!!!");
-    using namespace cute;
-    using X = Underscore;
-
-    // Preconditions
-    CUTE_STATIC_ASSERT(is_static<TileShape>::value);
-
     int warp_idx = canonical_warp_idx_sync();
     int thread_idx = int(threadIdx.x);
-
-    // if (thread0()) {
-    //   printf("EpilogueSharedStorage size = %d\n", sizeof(CollectiveEpilogue::SharedStorage));
-    // }
+    auto [warp_group_idx, local_warp_idx, local_thread_idx] = [&]() {
+        if constexpr (kNumMathWarpGroups == 1) {
+            return cute::make_tuple(0, warp_idx, thread_idx);
+        } else {
+            int warp_group_idx = warp_idx / WarpOnGroup;
+            int local_warp_idx = warp_idx % WarpOnGroup;
+            int local_thread_idx = thread_idx % (32 * WarpOnGroup);
+            return cute::make_tuple(warp_group_idx, local_warp_idx, local_thread_idx);
+        }
+    }();
 
     // Kernel level shared memory storage
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -450,21 +420,26 @@ public:
     Tensor gSFA = get<2>(load_inputs);
     Tensor gSFB = get<3>(load_inputs);
 
-    Tensor sA = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
+    // 4D KV smem: (BLOCK_M, BLOCK_K, kNumKVStages, kNumMathWarpGroups)
+    // Slice by warp_group_idx to get this warp_group's 3D region
+    Tensor sA_full = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutA{}); // 4D
+    Tensor sA = sA_full(_, _, _, warp_group_idx); // 3D slice for this warp_group
     Tensor sB = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
-    // Partition the copying of A and B tiles across the threads
-    auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx);
-    auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
+    // Partition the copying of A and B tiles across the threads (use local_thread_idx)
+    auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(local_thread_idx);
+    auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(local_thread_idx);
     Tensor tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
     Tensor tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
-    Tensor sSFA = make_tensor(make_smem_ptr(shared_storage.smem_k_scales.data()), SmemLayoutSFA{});
+    // 4D SFA smem: (_1, BLOCK_M, kNumKVStages, kNumMathWarpGroups)
+    Tensor sSFA_full = make_tensor(make_smem_ptr(shared_storage.smem_k_scales.data()), SmemLayoutSFA{}); // 4D
+    Tensor sSFA = sSFA_full(_, _, _, warp_group_idx); // 3D slice for this warp_group
     Tensor sSFB = make_tensor(make_smem_ptr(shared_storage.smem_weight.data()), SmemLayoutSFB{});
 
-    auto gmem_thr_copy_SFA = gmem_tiled_copy_SFA.get_thread_slice(thread_idx);
-    auto gmem_thr_copy_SFB = gmem_tiled_copy_SFB.get_thread_slice(thread_idx);
+    auto gmem_thr_copy_SFA = gmem_tiled_copy_SFA.get_thread_slice(local_thread_idx);
+    auto gmem_thr_copy_SFB = gmem_tiled_copy_SFB.get_thread_slice(local_thread_idx);
 
     Tensor tSFAgSFA = gmem_thr_copy_SFA.partition_S(gSFA);
     Tensor tSFAsSFA = gmem_thr_copy_SFA.partition_D(sSFA);
@@ -474,7 +449,7 @@ public:
 
     TiledMma tiled_mma;
     Tensor accum = partition_fragment_C(tiled_mma, take<0,2>(TileShape{}));
-    auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
+    auto thr_mma = tiled_mma.get_thread_slice(local_thread_idx);
     Tensor tCrA = thr_mma.partition_fragment_A(sA(_,_,0));                     // (MMA,MMA_M,MMA_K)
     Tensor tCrB = thr_mma.partition_fragment_B(sB(_,_,0));                     // (MMA,MMA_N,MMA_K)
 
@@ -485,14 +460,14 @@ public:
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                  // MMA_K
 
     auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
-    auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(warp_idx * 32);
+    auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(local_warp_idx * 32);
     Tensor tCsA            = smem_thr_copy_A.partition_S(make_mix_tensor_like(sA));                  // (CPY,CPY_M,CPY_K,PIPE)
     Tensor tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);                   // (CPY,CPY_M,CPY_K)
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // CPY_M
     CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCrA_copy_view));            // CPY_K
 
     auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
-    auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(warp_idx * 32);
+    auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(local_warp_idx * 32);
     Tensor tCsB            = smem_thr_copy_B.partition_S(make_mix_tensor_like(sB));                  // (CPY,CPY_N,CPY_K,PIPE)
     Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(tCrB);                   // (CPY,CPY_N,CPY_K)
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // CPY_N
@@ -515,16 +490,17 @@ public:
 
     constexpr bool load_kv_scale = sizeof(ElementQK) == 1;
     const auto& lane_idx = get_lane_idx();
-    const auto& warp_offset = (warp_idx % WarpOnM) * WARP_M;
+    int warp_m_idx = local_warp_idx % WarpOnM;
+    int warp_n_idx = local_warp_idx / WarpOnM;
+    const auto& warp_offset = warp_m_idx * WARP_M;
     const auto& v_0_offset = lane_idx / 4 + 0;
     const auto& v_1_offset = lane_idx / 4 + 8;
-    uint32_t warp_q_idx = warp_idx / WarpOnM;
+    uint32_t warp_q_idx = warp_n_idx;
     int warp_group_id = warp_idx / 8;
 
-    uint32_t q_idx_array[kNumKVStages];
+    uint32_t q_idx = scheduler.current_q_idx;
+    uint32_t kv_idx_base;
     uint32_t kv_idx_array[kNumKVStages];
-    kv_idx_array[kNumKVStages - 1] = UINT32_MAX;
-    uint32_t num_kv; // num_kv is not used
     uint32_t smem_pipe_read_q = 0, smem_pipe_read_kv = 0;
     uint32_t smem_pipe_write_q = 0, smem_pipe_write_kv = 0;
 
@@ -546,12 +522,12 @@ public:
         if constexpr(load_kv_scale) {
             tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / 4;
             copy_aiu<true>(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv),
-                           gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv), warp_idx);
+                           gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv), local_warp_idx);
         } else {
-            copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), warp_idx);
+            copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), local_warp_idx);
         }
         if (thread_print) {
-            printf("  copy_k q_idx = %d, kv_idx = %d, kv_offset = %d, stage = %d\n", q_idx, kv_idx, kv_offset, smem_pipe_write_kv);
+            printf("  copy_k q_idx = %d, kv_idx = %d, kv_offset = %d, wg = %d, stage = %d\n", q_idx, kv_idx, kv_offset, warp_group_idx, smem_pipe_write_kv);
         }
     };
 
@@ -575,14 +551,16 @@ public:
     };
 
     auto load_next_qk_g2s = [&](bool load_q) {
-        uint32_t& q_idx = q_idx_array[smem_pipe_write_kv];
-        uint32_t& kv_idx = kv_idx_array[smem_pipe_write_kv];
-        if (scheduler.fetch_next_task(q_idx, kv_idx, num_kv)) {
+        uint32_t q_idx, kv_idx_base, num_kv;
+        if (scheduler.fetch_next_task(q_idx, kv_idx_base, num_kv)) {
             if (load_q) load_q_g2s(q_idx);
-            load_kv_g2s(q_idx, kv_idx);
+            uint32_t actual_kv = kv_idx_base + warp_group_idx;
+            if (actual_kv < num_kv)
+                load_kv_g2s(q_idx, actual_kv);
         }
+        kv_idx_array[smem_pipe_write_kv] = kv_idx_base;
         smem_pipe_write_kv = (smem_pipe_write_kv + 1) % kNumKVStages;
-        if (thread_print) printf("cp_async commit\n");
+        if (thread_print) printf("cp_async commit, write_stage = %d\n", smem_pipe_write_kv);
         cp_async_fence();
     };
 
@@ -662,63 +640,99 @@ public:
     for (int i = 0; i < kNumKVStages - 1; i++) {
         load_next_qk_g2s(i == 0);
     }
+    kv_idx_base = kv_idx_array[0];
     // wait AIU Q and first K
     cp_async_wait<kNumKVStages - 2>();
     __syncthreads();
-    copy(smem_tiled_copy_A, tCsA(_,_,0,0), tCrA_copy_view(_,_,0));
 
-    while (true) {
-        // Get current Q and KV index
-        const uint32_t& q_idx = q_idx_array[smem_pipe_read_kv];
-        const uint32_t& kv_idx = kv_idx_array[smem_pipe_read_kv];
+    if constexpr (WarpInterleaving) {
+        if (warp_group_id == 1) {
+            __ppu_barrier_arrive(5, MaxThreadsPerBlock, 0);
+        }
+    }
 
-        if (scheduler.is_last_task(q_idx, kv_idx)) break;
+    auto handle_q_change = [&]() {
+        if constexpr(kNumQStages > 1) {
+            if (scheduler.exist_q_idx(q_idx + 1)) {
+                load_q_g2s(q_idx + 1);
+            }
+            cp_async_fence();
+        }
+        load_q_s2r();
+        if constexpr(kNumQStages == 1) { // not supported with warp interleaving
+            __syncthreads();
+            if (scheduler.exist_q_idx(q_idx + 1)) {
+                load_q_g2s(q_idx + 1);
+            }
+            cp_async_fence();
+        }
+    };
+
+    // Make `first` a compile-time constant via cute::true_type / cute::false_type
+    // so the compiler can fold the first-iteration branch and avoid the runtime
+    // check on the first iteration.
+    auto mainloop = [&](auto first_ic) {
+        constexpr bool first = decltype(first_ic)::value;
         if (thread_print) {
-            printf("q_idx = %d, kv_idx = %d\n", q_idx, kv_idx);
+            printf("q_idx = %d, kv_idx_base = %d, wg = %d, read_stage = %d\n", q_idx, kv_idx_base, warp_group_idx, smem_pipe_read_kv);
         }
 
-        // Read weights if current Q changes
-        if (kv_idx == 0 || kv_idx_array[kNumKVStages - 1] == UINT32_MAX) {
-            if constexpr(kNumQStages > 1) {
-                uint32_t next_q_idx = scheduler.next_valid_q_idx(q_idx);
-                if (next_q_idx != 0) {
-                    load_q_g2s(next_q_idx);
-                }
-                cp_async_fence();
-            }
-            load_q_s2r();
-            if constexpr(kNumQStages == 1) {
-                __syncthreads();
-                uint32_t next_q_idx = scheduler.next_valid_q_idx(q_idx);
-                if (next_q_idx != 0) {
-                    load_q_g2s(next_q_idx);
-                }
-                cp_async_fence();
+        if constexpr (WarpInterleaving) {
+            __ppu_barrier_sync(5 + warp_group_id, MaxThreadsPerBlock);
+        }
+
+        // Read weights if current Q changes. On the first iteration always load Q;
+        // afterwards only when kv_idx_base == 0 (first group of new q).
+        if constexpr (first) {
+            handle_q_change();
+        } else {
+            if (kv_idx_base == 0) {
+                handle_q_change();
             }
         }
+
+        // Issue next KV load (overlap with current compute)
         load_next_qk_g2s(false);
 
-        load_kv_scale_s2r();
-
+        // s2r KV + compute GEMM from current read stage
         constexpr int K_BLOCK_MAX = size<2>(tCrA);
+        uint32_t actual_kv = kv_idx_base + warp_group_idx;
         for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
-            auto k_block_next = (k_block + 1) % K_BLOCK_MAX;
-            if (k_block_next == 0) {
-                cp_async_wait<kNumKVStages - 2>();
-                __syncthreads();
-                smem_pipe_read_kv = (smem_pipe_read_kv + 1) % kNumKVStages;
-                if (thread_print) {
-                    printf("    copy kv to vreg, stage = %d,\n", smem_pipe_read_kv);
-                }
-            }
-            copy(smem_tiled_copy_A, tCsA(_,_,k_block_next,smem_pipe_read_kv), tCrA_copy_view(_,_,k_block_next));
+            copy(smem_tiled_copy_A, tCsA(_,_,k_block,smem_pipe_read_kv), tCrA_copy_view(_,_,k_block));
             cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrB(_,_,k_block), accum);
         });
 
-        epilogue(q_idx, kv_idx);
+        if constexpr (WarpInterleaving) {
+            __ppu_barrier_arrive(6 - warp_group_id, MaxThreadsPerBlock, 0);
+        }
+
+        load_kv_scale_s2r();
+        epilogue(q_idx, actual_kv);
+
+        cp_async_wait<kNumKVStages - 2>();
+        if constexpr (!WarpInterleaving) {
+            __syncthreads();
+        }
+        // move to next kv_block
+        smem_pipe_read_kv = (smem_pipe_read_kv + 1) % kNumKVStages;
+        kv_idx_base = kv_idx_array[smem_pipe_read_kv];
+        if (kv_idx_base == 0) q_idx++;
 
         clear(accum);
-    } // end of while loop
+    };
+
+    if (!scheduler.is_last_task(q_idx, kv_idx_base)) {
+        mainloop(cute::true_type{});
+    }
+    while (!scheduler.is_last_task(q_idx, kv_idx_base)) {
+        mainloop(cute::false_type{});
+    }
+
+    if constexpr (WarpInterleaving) {
+        if (warp_group_id == 0) {
+            __ppu_barrier_sync(5, MaxThreadsPerBlock);
+        }
+    }
 
     cp_async_wait<0>();
     __syncthreads();

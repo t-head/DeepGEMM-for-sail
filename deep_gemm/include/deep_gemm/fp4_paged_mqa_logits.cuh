@@ -38,13 +38,13 @@ public:
     // FP4 scale: uint8_t e8m0, packed as uint32_t for async copy
     using ElementScale = uint8_t;
     using OperatorClass = cutlass::arch::OpClassTensorOp;
-    static constexpr int BLOCK_M = SPLIT_KV;
+    static constexpr int BLOCK_M = BLOCK_KV;
     static constexpr int BLOCK_N = kNextN * kNumHeads;
     static constexpr int BLOCK_K = 64; // kHeadDim = 64
     static constexpr int WARP_M = 16;
     static constexpr int WARP_N = kNumHeads;
 
-    static constexpr int kNumMathWarpGroups = 1;
+    static constexpr int kNumMathWarpGroups = SPLIT_KV / BLOCK_KV;
 
     using ProblemShape_MNKL = Shape<int, int, int, int>;
 
@@ -67,9 +67,11 @@ public:
              Layout<Shape<Int<InstN>, Int<WarpOnN>, Int<MmaIterN>>, Stride<_1, Int<WARP_N>, Int<InstN>>>, MmaK_type>;
     using TiledMma = TiledMMA<MMA_Atom<MmaInst>, Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>, PermutationMNK>;
 
-    static constexpr int NumThreadsPerCTA = size(TiledMma{});
+    static constexpr int MaxThreadsPerBlock = kNumMathWarpGroups * size(TiledMma{});
+    static constexpr int WarpOnGroup = size(TiledMma{}) / 32;
     static constexpr int MinBlocksPerMultiprocessor = 1;
-    static constexpr bool WarpInterleaving = (NumThreadsPerCTA == 512);
+    static constexpr bool WarpInterleaving = (MaxThreadsPerBlock == 512);
+    static_assert(!(WarpInterleaving && kNumQStages == 1), "warp-interleave does not support stage_q = 1");
 
     using DefaultOperandA =
         cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, ElementQK, false, Int<BLOCK_M>, Int<BLOCK_K>, false>;
@@ -96,8 +98,8 @@ public:
     static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomB{})) == 0,
                   "SmemLayoutAtom must evenly divide tile shape.");
 
-    using SmemLayoutA =
-        decltype(tile_to_shape(SmemLayoutAtomA{}, Shape<Int<BLOCK_M>, Int<BLOCK_K>, Int<kNumKVStages>>{}));
+    using SmemLayoutA = decltype(tile_to_shape(
+        SmemLayoutAtomA{}, Shape<Int<BLOCK_M>, Int<BLOCK_K>, Int<kNumKVStages>, Int<kNumMathWarpGroups>>{}));
     using SmemLayoutB =
         decltype(tile_to_shape(SmemLayoutAtomB{}, Shape<Int<BLOCK_N>, Int<BLOCK_K>, Int<kNumQStages>>{}));
 
@@ -114,15 +116,14 @@ public:
     // SFA: k_sf — async copy of uint32_t (4 bytes per KV row)
     // Layout: BLOCK_M rows × 1 column of uint32_t
     using SFCopyAtomWidth = cute::uint32_t;
-    static constexpr int MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
 
     // SFA (k_sf): one uint32_t per KV row
     using DefaultOperandSFA =
         cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, uint32_t, false, _1, Int<BLOCK_M>, false, 0, false>;
     using SmemLayoutAtomSFA = typename DefaultOperandSFA::SmemLayoutAtom;
     using GmemTiledCopySFA = typename DefaultOperandSFA::GmemTiledCopy;
-    using SmemLayoutSFA =
-        decltype(tile_to_shape(SmemLayoutAtomSFA{}, make_shape(_1{}, Int<BLOCK_M>{}, Int<kNumKVStages>{})));
+    using SmemLayoutSFA = decltype(tile_to_shape(
+        SmemLayoutAtomSFA{}, make_shape(_1{}, Int<BLOCK_M>{}, Int<kNumKVStages>{}, Int<kNumMathWarpGroups>{})));
 
     // SFB (q_sf/weights): one uint32_t/float32 per Q head
     using DefaultOperandSFB =
@@ -141,7 +142,7 @@ public:
 
     // SFA smem->vreg: recast smem as uint16_t, then transpose layout for MMA consumption
     // sSFATrans shape: ((MmaIterM, WarpOnM), (2, 8, 2), kNumKVStages), stride: ((WarpOnM * 32, 32), (16, 2, 1),
-    // BLOCK_M*2)
+    // BLOCK_M*2) Note: operates on per-warp_group 3D slice after slicing the warp_group dimension
     using sSFATransLayout = Layout<Shape<Shape<Int<WarpOnM>, Int<MmaIterM>>, Shape<_2, _8, _2>, Int<kNumKVStages>>,
                                    Stride<Stride<Int<MmaIterM * 32>, _32>, Stride<_16, _2, _1>, Int<BLOCK_M * 2>>>;
     // SFA s2r tiled copy: uint16_t copy atom
@@ -158,7 +159,7 @@ public:
         Layout<Shape<Shape<Int<WarpOnN>, _4>, _8>, Stride<Stride<_32, _1>, _4>>{}, Layout<Shape<_1, _2>>{}));
 
     using sWCopyLayout = Layout<
-        Shape<Shape<_2, _4, Int<WarpOnN>, _2, Int<MmaIterN>>, _1, Int<kNumKVStages>>, Stride<Stride<_1, _2, Int<WARP_N>, _8, _16>, _1, Int<BLOCK_N>>, >;
+        Shape<Shape<_2, _4, Int<WarpOnN>, _2, Int<MmaIterN>>, _1, Int<kNumQStages>>, Stride<Stride<_1, _2, Int<WARP_N>, _8, _16>, _1, Int<BLOCK_N>>, >;
     using SmemTiledCopyWeights = decltype(make_tiled_copy(
         Copy_Atom<UniversalCopy<uint64_t>, float>{},
         Layout<Shape<Shape<_4, Int<WarpOnN>>, _1>, Stride<Stride<_1, _4>, _1>>{}, Layout<Shape<_2, _1>>{}));
@@ -261,9 +262,20 @@ public:
 #endif
         int warp_idx = canonical_warp_idx_sync();
         int thread_idx = int(threadIdx.x);
-        int warp_m_idx = warp_idx % WarpOnM;
-        int warp_n_idx = warp_idx / WarpOnM;
+        auto [warp_group_idx, local_warp_idx, local_thread_idx] = [&]() {
+            if constexpr (kNumMathWarpGroups == 1) {
+                return cute::make_tuple(0, warp_idx, thread_idx);
+            } else {
+                int warp_group_idx = warp_idx / WarpOnGroup;
+                int local_warp_idx = warp_idx % WarpOnGroup;
+                int local_thread_idx = thread_idx % (32 * WarpOnGroup);
+                return cute::make_tuple(warp_group_idx, local_warp_idx, local_thread_idx);
+            }
+        }();
+        int warp_m_idx = local_warp_idx % WarpOnM;
+        int warp_n_idx = local_warp_idx / WarpOnM;
         int lane_idx = get_lane_idx();
+        int warp_group_id = warp_idx / 8;
 
         // Kernel level shared memory storage
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -274,24 +286,29 @@ public:
         // init input tensors
         auto [gA, gB, gSFA, gSFB, gW] = load_init(params); // gSFA=k_sf, gSFB=q_sf, gW=weights
 
-        Tensor sA = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
+        // 4D KV smem: (BLOCK_M, BLOCK_K, kNumKVStages, kNumMathWarpGroups)
+        // Slice by warp_group_idx to get this warp_group's 3D region: (BLOCK_M, BLOCK_K, kNumKVStages)
+        Tensor sA_full = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutA{}); // 4D
+        Tensor sA = sA_full(_, _, _, warp_group_idx); // 3D slice for this warp_group
         Tensor sB = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
-        // Partition the copying of A and B tiles across the threads
-        auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx);
-        auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
+        // Partition the copying of A and B tiles across the threads (use local_thread_idx for 128-thread group)
+        auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(local_thread_idx);
+        auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(local_thread_idx);
         Tensor tAgA = gmem_thr_copy_A.partition_S(gA);
         Tensor tAsA = gmem_thr_copy_A.partition_D(sA);
         Tensor tBgB = gmem_thr_copy_B.partition_S(gB);
         Tensor tBsB = gmem_thr_copy_B.partition_D(sB);
 
-        // FP4 scale tensors (k_sf, q_sf) — async copy
-        Tensor sSFA = make_tensor(make_smem_ptr(shared_storage.smem_k_sf.data()), SmemLayoutSFA{});
+        // 4D SFA smem: (_1, BLOCK_M, kNumKVStages, kNumMathWarpGroups)
+        // Slice by warp_group_idx to get this warp_group's 3D region
+        Tensor sSFA_full = make_tensor(make_smem_ptr(shared_storage.smem_k_sf.data()), SmemLayoutSFA{}); // 4D
+        Tensor sSFA = sSFA_full(_, _, _, warp_group_idx); // 3D slice for this warp_group
         Tensor sSFB = make_tensor(make_smem_ptr(shared_storage.smem_q_sf.data()), SmemLayoutSFB{});
         Tensor sW = make_tensor(make_smem_ptr(shared_storage.smem_weight.data()), SmemLayoutWeight{});
 
-        auto gmem_thr_copy_SFA = gmem_tiled_copy_SFA.get_thread_slice(thread_idx);
-        auto gmem_thr_copy_SFB = gmem_tiled_copy_SFB.get_thread_slice(thread_idx);
-        auto gmem_thr_copy_weight = gmem_tiled_copy_weight.get_thread_slice(thread_idx);
+        auto gmem_thr_copy_SFA = gmem_tiled_copy_SFA.get_thread_slice(local_thread_idx);
+        auto gmem_thr_copy_SFB = gmem_tiled_copy_SFB.get_thread_slice(local_thread_idx);
+        auto gmem_thr_copy_weight = gmem_tiled_copy_weight.get_thread_slice(local_thread_idx);
 
         Tensor tSFAgSFA = gmem_thr_copy_SFA.partition_S(gSFA);
         Tensor tSFAsSFA = gmem_thr_copy_SFA.partition_D(sSFA);
@@ -304,7 +321,7 @@ public:
 
         TiledMma tiled_mma;
         Tensor accum = partition_fragment_C(tiled_mma, take<0, 2>(TileShape{}));
-        auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
+        auto thr_mma = tiled_mma.get_thread_slice(local_thread_idx);
         Tensor tCrA = thr_mma.partition_fragment_A(sA(_, _, 0));
         Tensor tCrB = thr_mma.partition_fragment_B(sB(_, _, 0));
 
@@ -313,14 +330,14 @@ public:
         CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));
 
         auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
-        auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(warp_idx * 32);
+        auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(local_warp_idx * 32);
         Tensor tCsA = smem_thr_copy_A.partition_S(make_mix_tensor_like(sA));
         Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
         CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));
         CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCrA_copy_view));
 
         auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
-        auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(warp_idx * 32);
+        auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(local_warp_idx * 32);
         Tensor tCsB = smem_thr_copy_B.partition_S(make_mix_tensor_like(sB));
         Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
         CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));
@@ -381,10 +398,9 @@ public:
         const auto& v_0_offset = lane_idx / 4 + 0;
         const auto& v_1_offset = lane_idx / 4 + 8;
 
-        uint32_t q_idx_array[kNumKVStages];
+        uint32_t q_idx = scheduler.current_q_idx;
+        uint32_t kv_idx_base;
         uint32_t kv_idx_array[kNumKVStages];
-        kv_idx_array[kNumKVStages - 1] = UINT32_MAX;
-        uint32_t num_kv;
         uint32_t smem_pipe_read_q = 0, smem_pipe_read_kv = 0;
         uint32_t smem_pipe_write_q = 0, smem_pipe_write_kv = 0;
 
@@ -405,16 +421,17 @@ public:
         };
 
         // Load K (packed FP4) + k_sf (e8m0) from gmem to smem
+        // Each warp_group loads into its own 3D smem slice, at stage = smem_pipe_write_kv
         auto load_kv_g2s = [&](uint32_t q_idx, uint32_t kv_idx) {
             auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
             tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes;
             tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / sizeof(uint32_t);
             copy_aiu<true>(gmem_tiled_copy_A, tAgA(_, _, _, 0), tAsA(_, _, _, smem_pipe_write_kv), gmem_tiled_copy_SFA,
-                           tSFAgSFA(_, _, _, 0), tSFAsSFA(_, _, _, smem_pipe_write_kv), warp_idx);
+                           tSFAgSFA(_, _, _, 0), tSFAsSFA(_, _, _, smem_pipe_write_kv), local_warp_idx);
 
             if (thread_print) {
-                printf("  copy_k q_idx = %d, kv_idx = %d, kv_offset = %d, stage = %d\n", q_idx, kv_idx, kv_offset,
-                       smem_pipe_write_kv);
+                printf("  copy_k q_idx = %d, kv_idx = %d, kv_offset = %d, wg = %d, stage = %d\n", q_idx, kv_idx,
+                       kv_offset, warp_group_idx, smem_pipe_write_kv);
             }
         };
 
@@ -444,16 +461,17 @@ public:
         };
 
         auto load_next_qk_g2s = [&](bool load_q) {
-            uint32_t& q_idx = q_idx_array[smem_pipe_write_kv];
-            uint32_t& kv_idx = kv_idx_array[smem_pipe_write_kv];
-            if (scheduler.fetch_next_task(q_idx, kv_idx, num_kv)) {
-                if (load_q)
-                    load_q_g2s(q_idx);
-                load_kv_g2s(q_idx, kv_idx);
+            uint32_t q_idx, kv_idx_base, num_kv;
+            if (scheduler.fetch_next_task(q_idx, kv_idx_base, num_kv)) {
+                if (load_q) load_q_g2s(q_idx);
+                uint32_t actual_kv = kv_idx_base + warp_group_idx;
+                if (actual_kv < num_kv)
+                    load_kv_g2s(q_idx, actual_kv);
             }
+            kv_idx_array[smem_pipe_write_kv] = kv_idx_base;
             smem_pipe_write_kv = (smem_pipe_write_kv + 1) % kNumKVStages;
             if (thread_print)
-                printf("cp_async commit\n");
+                printf("cp_async commit, write_stage = %d\n", smem_pipe_write_kv);
             cp_async_fence();
         };
 
@@ -537,67 +555,102 @@ public:
         for (int i = 0; i < kNumKVStages - 1; i++) {
             load_next_qk_g2s(i == 0);
         }
+        kv_idx_base = kv_idx_array[0];
         // wait AIU Q and first K
         cp_async_wait<kNumKVStages - 2>();
         __syncthreads();
-        copy(smem_tiled_copy_A, tCsA(_, _, 0, 0), tCrA_copy_view(_, _, 0));
-        copy(smem_tiled_copy_SFA, tCsSFA(_, _, 0, 0), tCrSFA_copy_view(_, _, 0));
 
-        while (true) {
-            // Get current Q and KV index
-            const uint32_t& q_idx = q_idx_array[smem_pipe_read_kv];
-            const uint32_t& kv_idx = kv_idx_array[smem_pipe_read_kv];
+        if constexpr (WarpInterleaving) {
+            if (warp_group_id == 1) {
+                __ppu_barrier_arrive(5, MaxThreadsPerBlock, 0);
+            }
+        }
 
-            if (scheduler.is_last_task(q_idx, kv_idx))
-                break;
+        auto handle_q_change = [&]() {
+            if constexpr (kNumQStages > 1) {
+                if (scheduler.exist_q_idx(q_idx + 1)) {
+                    load_q_g2s(q_idx + 1);
+                }
+                cp_async_fence();
+            }
+            load_q_s2r();
+            if constexpr (kNumQStages == 1) { // not support warp interleaving
+                __syncthreads();
+                if (scheduler.exist_q_idx(q_idx + 1)) {
+                    load_q_g2s(q_idx + 1);
+                }
+                cp_async_fence();
+            }
+        };
+
+        // Make `first` a compile-time constant via std::integral_constant<bool, ...>
+        // so the compiler can fold the `first || kv_idx_base == 0` branch and avoid
+        // the runtime check on the first iteration.
+        auto mainloop = [&](auto first_ic) {
+            constexpr bool first = decltype(first_ic)::value;
             if (thread_print) {
-                printf("q_idx = %d, kv_idx = %d\n", q_idx, kv_idx);
+                printf("q_idx = %d, kv_idx_base = %d, wg = %d, read_stage = %d\n", q_idx, kv_idx_base, warp_group_idx, smem_pipe_read_kv);
             }
 
-            // Read weights + q_sf if current Q changes
-            if (kv_idx == 0 || kv_idx_array[kNumKVStages - 1] == UINT32_MAX) {
-                if constexpr (kNumQStages > 1) {
-                    uint32_t next_q_idx = scheduler.next_valid_q_idx(q_idx);
-                    if (next_q_idx != 0) {
-                        load_q_g2s(next_q_idx);
-                    }
-                    cp_async_fence();
-                }
-                load_q_s2r();
-                if constexpr (kNumQStages == 1) {
-                    __syncthreads();
-                    uint32_t next_q_idx = scheduler.next_valid_q_idx(q_idx);
-                    if (next_q_idx != 0) {
-                        load_q_g2s(next_q_idx);
-                    }
-                    cp_async_fence();
+            if constexpr (WarpInterleaving) {
+                __ppu_barrier_sync(5 + warp_group_id, MaxThreadsPerBlock);
+            }
+
+            // Handle Q change: on the first iteration always load the next Q;
+            // afterwards only when kv_idx_base == 0 (first group of new q).
+            if constexpr (first) {
+                handle_q_change();
+            } else {
+                if (kv_idx_base == 0) {
+                    handle_q_change();
                 }
             }
+
+            // Issue next KV load (overlap with current compute)
             load_next_qk_g2s(false);
 
+            // s2r KV + compute GEMM from current read stage
             constexpr int K_BLOCK_MAX = size<2>(tCrA);
+            uint32_t actual_kv = kv_idx_base + warp_group_idx;
             for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
-                auto k_block_next = (k_block + 1) % K_BLOCK_MAX;
-                if (k_block_next == 0) {
-                    cp_async_wait<kNumKVStages - 2>();
-                    __syncthreads();
-                    smem_pipe_read_kv = (smem_pipe_read_kv + 1) % kNumKVStages;
-                    if (thread_print) {
-                        printf("    copy kv to vreg, stage = %d,\n", smem_pipe_read_kv);
-                    }
-                }
-                copy(smem_tiled_copy_A, tCsA(_, _, k_block_next, smem_pipe_read_kv),
-                     tCrA_copy_view(_, _, k_block_next));
-                copy(smem_tiled_copy_SFA, tCsSFA(_, _, k_block_next, smem_pipe_read_kv),
-                     tCrSFA_copy_view(_, _, k_block_next));
+                copy(smem_tiled_copy_A, tCsA(_, _, k_block, smem_pipe_read_kv),
+                     tCrA_copy_view(_, _, k_block));
+                copy(smem_tiled_copy_SFA, tCsSFA(_, _, k_block, smem_pipe_read_kv),
+                     tCrSFA_copy_view(_, _, k_block));
                 cute::gemm(tiled_mma, accum, tCrA(_, _, k_block), tCrSFA(_, _, k_block), tCrB(_, _, k_block),
                            tCrSFB(_, _, k_block), accum);
             });
 
-            epilogue(q_idx, kv_idx);
+            if constexpr (WarpInterleaving) {
+                __ppu_barrier_arrive(6 - warp_group_id, MaxThreadsPerBlock, 0);
+            }
+
+            epilogue(q_idx, actual_kv);
+
+            cp_async_wait<kNumKVStages - 2>();
+            if (!WarpInterleaving) {
+                __syncthreads();
+            }
+            // move to next kv_block
+            smem_pipe_read_kv = (smem_pipe_read_kv + 1) % kNumKVStages;
+            kv_idx_base = kv_idx_array[smem_pipe_read_kv];
+            if (kv_idx_base == 0) q_idx++;
 
             clear(accum);
-        } // end of while loop
+        };
+
+        if (!scheduler.is_last_task(q_idx, kv_idx_base)) {
+            mainloop(cute::true_type{});
+        }
+        while (!scheduler.is_last_task(q_idx, kv_idx_base)) {
+            mainloop(cute::false_type{});
+        }
+
+        if constexpr (WarpInterleaving) {
+            if (warp_group_id == 0) {
+                __ppu_barrier_sync(5, MaxThreadsPerBlock);
+            }
+        }
 
         cp_async_wait<0>();
         __syncthreads();
