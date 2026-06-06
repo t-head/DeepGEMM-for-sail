@@ -114,8 +114,8 @@ __global__ void computeBlockInfoKernel(
             BlockM);
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.launch_attr_args.grouped_layout,
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, configs, args.launch_attr_args.grouped_layout,
                                             args.launch_attr_args.num_groups, args.launch_attr_args.block_m_info));
     }
 };
@@ -363,21 +363,21 @@ __global__ void {}(
             args.launch_info.kKernelType, args.launch_info.kEnableSboOverlap, args.launch_info.kernel_name);
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, configs, args.kernel_params));
     }
 };
 
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
                      const torch::Tensor& rhs_scales, const torch::Tensor& out, const int& m, const int& n,
-                     const int& k, std::optional<ConfigTuple> config = std::nullopt) {
+                     const int& k, std::optional<ConfigTuple> configs = std::nullopt) {
     auto lhs_scales_aligned = get_col_major_tma_aligned_tensor(lhs_scales);
     int num_sms = get_num_sms();
 
     ConfigTuple selected_config;
-    if (config.has_value()) {
-        selected_config = *config;
+    if (configs.has_value()) {
+        selected_config = *configs;
     } else {
         selected_config = deep_gemm_fp8_common::get_best_configs(m, n, k, 1, num_sms);
     }

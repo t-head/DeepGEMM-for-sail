@@ -1006,6 +1006,7 @@ using namespace cute;
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <
+  typename Arch_,
   class DispatchPolicy_,
   class TileShape_,
   class ElementA_,
@@ -1054,7 +1055,7 @@ struct CollectiveMmaScaleFp4
   using SmemLayoutAtomSFA = SmemLayoutAtomSFA_;
   using GmemTiledCopySFB = GmemTiledCopySFB_;
   using SmemLayoutAtomSFB = SmemLayoutAtomSFB_;
-  // PPU cutlass3.6 will not bring arch tag in dispatch policy, bring in template of collective mma directly if needed
+  // PPU will not bring arch tag in dispatch policy, bring in template of collective mma directly if needed
   // using ArchTag = typename DispatchPolicy::ArchTag;
   using ElementSFA = ElementSFA_;
   using StrideSFA = StrideSFA_;
@@ -1646,7 +1647,7 @@ public:
         cute::Layout<Shape<WarpOnM, WarpOnN, _1>>>;
 
         using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaScaleFp4<
-          DispatchPolicy, Shape<Int<BlockM>, Int<BlockN>, Int<BlockK>>,
+          cutlass::arch::PPU0015, DispatchPolicy, Shape<Int<BlockM>, Int<BlockN>, Int<BlockK>>,
           ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
           ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
           TiledMma,
@@ -1761,8 +1762,6 @@ public:
         dim3 const grid = GemmKernel::get_grid_shape(params);
         int sharemem_size = GemmKernel::SharedStorageSize;
 
-        int max_active_tb_num = 8;
-        const int threadblock_count = num_sms < 20 ? num_sms : num_sms * max_active_tb_num;
         char *pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
             cudaFuncAttributes attr;
@@ -1775,7 +1774,7 @@ public:
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                 BlockM, BlockN, BlockK, WarpM, WarpN, BlockK, kNumStages);
 
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
+            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_blocks_per_cu, grid.x);
 
             printf("smem_size:%d, vreg:%d, stack:%d\n", sharemem_size, int(attr.numRegs), int(attr.localSizeBytes));
         }

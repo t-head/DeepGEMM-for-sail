@@ -9,18 +9,6 @@
 #include <iomanip>
 #include "utils_rtc.cuh"
 
-#ifdef __CLION_IDE__
-__host__ __device__ __forceinline__ void host_device_printf(const char* format, ...) { asm volatile("trap;"); }
-#define printf host_device_printf
-#endif
-
-__device__ __forceinline__ int atomic_add_release_global(int* addr, int value) {
-    int ret;
-    asm volatile ("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(addr), "r"(value));
-    return ret;
-}
-
-
 class AssertionException : public std::exception {
 private:
     std::string message{};

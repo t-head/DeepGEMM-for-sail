@@ -28,11 +28,11 @@ using Config = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int
 static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor& lhs, const torch::Tensor& rhs,
                                                              const torch::Tensor& out, const torch::Tensor& m_indices,
                                                              const int& m, const int& n, const int& k,
-                                                             const int& num_groups, std::optional<ConfigTuple> config) {
+                                                             const int& num_groups, std::optional<ConfigTuple> configs) {
     int num_sms = get_num_sms();
     Config cfg;
-    if (config.has_value()) {
-        cfg = *config;
+    if (configs.has_value()) {
+        cfg = *configs;
     } else {
         cfg = deep_gemm_bf16_common::get_best_configs(m, n, k, 1, num_sms, true);
     }
@@ -116,7 +116,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
                    args.launch_args.grid_dim.x);
             printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
                    block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
         }
     } else {
         int64_t stride, increment_row, increment_group, increment_cluster;
@@ -191,22 +191,22 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
                    args.launch_args.grid_dim.x);
             printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
                    block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
         }
     }
 }
 
-static void m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const torch::Tensor& lhs, const torch::Tensor& rhs,
+static std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const torch::Tensor& lhs, const torch::Tensor& rhs,
                                                          const torch::Tensor& out, const torch::Tensor& masked_m,
                                                          const int& m, const int& n, const int& k,
                                                          const int& num_groups, const int& expected_m,
-                                                         std::optional<ConfigTuple> config, int max_block_n,
+                                                         std::optional<ConfigTuple> configs, int max_block_n,
                                                          bool enable_sbo_overlap, const torch::Tensor& signal) {
     int num_sms = get_num_sms();
 
     Config cfg;
-    if (config.has_value()) {
-        cfg = *config;
+    if (configs.has_value()) {
+        cfg = *configs;
     } else {
         cfg = deep_gemm_bf16_common::get_best_configs(expected_m, n, k, num_groups, num_sms, false, true, max_block_n);
     }
@@ -227,6 +227,8 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const torch::Tensor& lh
     auto stride_D = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, n, 1));
 
     int32_t* grouped_layout = reinterpret_cast<int32_t*>(masked_m.data_ptr<int32_t>());
+    int32_t* signal_ptr = reinterpret_cast<int32_t*>(signal.data_ptr<int32_t>());
+
     cutlass::bfloat16_t* input_b = reinterpret_cast<cutlass::bfloat16_t*>(rhs.data_ptr<at::BFloat16>());
     cutlass::bfloat16_t* input_a = reinterpret_cast<cutlass::bfloat16_t*>(lhs.data_ptr<at::BFloat16>());
     cutlass::bfloat16_t* output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
@@ -236,7 +238,6 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const torch::Tensor& lh
     hw_info.sm_count = num_sms_new;
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.sm_count);
-    bool kEnableSboOverlap = false;
     if (extra_info["use_cutlass3"]) {
         const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{
             .mode = cutlass::gemm::GemmUniversalMode::kGemm,
@@ -252,7 +253,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const torch::Tensor& lh
                 },
             .hw_info = hw_info,
             .scheduler = {(uint32_t)m, grouped_layout},
-            .signal = nullptr};
+            .signal = signal_ptr};
 
         BF16GemmCutlass3Runtime::GemmKernelParams params =
             BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
@@ -292,7 +293,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const torch::Tensor& lh
                    args.launch_args.grid_dim.x);
             printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
                    block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
         }
     } else {
         int64_t stride, increment_row, increment_group, increment_cluster;
@@ -329,16 +330,16 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const torch::Tensor& lh
             .ptr_D = output,
             .params_D = {stride, increment_row, increment_group, increment_cluster, advance_row, advance_group,
                          advance_cluster, advance_tile}, // cutlass::layout::RowMajor(n),
-            .signal = nullptr};
+            .signal = signal_ptr};
 
         auto args = BF16GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
                                                           num_stages, n, k, "GroupedMasked",
-                                                          "bf16_grouped_deep_gemm_contiguous_mask", kEnableSboOverlap},
+                                                          "bf16_grouped_deep_gemm_masked", enable_sbo_overlap},
                                           .launch_args = {grid, block, SMSIZE},
                                           .kernel_params = params};
 
         const auto& code = BF16GemmRuntime::generate(args);
-        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_contiguous_mask", code, block.x, SMSIZE);
+        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_masked", code, block.x, SMSIZE);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         CUresult result = cuOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -367,16 +368,17 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const torch::Tensor& lh
                    args.launch_args.grid_dim.x);
             printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
                    block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
         }
     }
+    return std::make_pair(block_m, ceil_div(n, block_n));
 }
 
 static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs, const torch::Tensor& rhs,
                                                         const torch::Tensor& out, const torch::Tensor& m_indices,
                                                         const int& m, const int& n, const int& k, const int& num_groups,
                                                         std::optional<const torch::Tensor> m_rows,
-                                                        std::optional<ConfigTuple> config) {
+                                                        std::optional<ConfigTuple> configs) {
     int BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread;
     bool SMALL_K;
     int num_sms = get_num_sms();
@@ -500,8 +502,8 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
         }
     }
     Config cfg;
-    if (config.has_value()) {
-        cfg = *config;
+    if (configs.has_value()) {
+        cfg = *configs;
     } else {
         cfg = deep_gemm_bf16_common::get_best_configs(expected_m, n, k, num_groups, num_sms);
     }
@@ -628,7 +630,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
                    args.launch_args.grid_dim.x);
             printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
                    block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
         }
 
     } else {
@@ -704,7 +706,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
                    args.launch_args.grid_dim.x);
             printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
                    block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
         }
     }
 }

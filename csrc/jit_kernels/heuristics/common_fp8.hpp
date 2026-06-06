@@ -3,6 +3,8 @@
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
+#include "gemm_fp8_lut.hpp"
+
 using namespace deep_gemm;
 namespace deep_gemm_fp8_common {
 
@@ -235,6 +237,17 @@ ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num
 static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
                                      bool is_grouped_contiguous = false, bool is_grouped_masked = false,
                                      int max_block_n = 256) {
+    auto lut_result = deep_gemm_fp8_lut::get_best_configs_from_lut(
+        m, n, k, num_groups, is_grouped_contiguous, is_grouped_masked);
+    if (lut_result.has_value()) {
+        int best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages;
+        std::tie(best_block_m, best_block_n, best_block_k,
+                 best_warp_m, best_warp_n, best_stages) = lut_result.value();
+        auto best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k);
+        return std::make_tuple(num_sms, best_block_m, best_block_n, best_block_k,
+                               best_warp_m, best_warp_n, best_stages, best_smem_config);
+    }
+
     if (num_groups == 1 && is_grouped_contiguous == false && is_grouped_masked == false) {
         auto result = get_best_configs_dense(m, n, k, num_groups, num_sms);
         return result;

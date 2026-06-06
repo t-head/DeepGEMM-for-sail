@@ -42,7 +42,7 @@ struct BlkwiseQuantGemmSmemConfig : public GemmSmemConfig<SrcT, kNumStages, BLOC
   static constexpr uint32_t kSmemScaleASize = cute::round_up(
       kNumStages * BLOCK_M * BLOCK_K / 128 * sizeof(float), 128);
   static constexpr uint32_t kSmemScaleBSize = cute::round_up(
-      kNumStages * BLOCK_N / 128 * BLOCK_K / 128 * sizeof(float), 256);
+      kNumStages * cute::ceil_div(BLOCK_N, 128) * BLOCK_K / 128 * sizeof(float), 256);
   static constexpr uint32_t kTotalSize = Base::kTotalSize + kSmemScaleASize + kSmemScaleBSize;
 };
 
@@ -79,23 +79,38 @@ __forceinline__ __device__ void copy_A_to_tsm(TAsA&& tAsA, const void* src_ptr, 
 template <typename AccT, typename DstT,
          uint32_t SHAPE_N, uint32_t BLOCK_N, uint32_t STRIDE_CM,
          class TAcc, class TCcC, class... Ts>
-__forceinline__ __device__ void epilogue_no_tsm(TAcc& accum, TCcC& tCcC, void* c_ptr, const int* blk_token_base,
+__forceinline__ __device__ void epilogue_no_tsm(TAcc& accum, const TCcC& tCcC, void* c_ptr, const int* blk_token_base,
                                                 uint32_t num_valid_tokens, uint32_t blk_n_offset) {
+  using namespace cute;
 #if __HGGC_ARCH__ == 150
   CUTLASS_PRAGMA_UNROLL
-  for (int i = 0; i < size(tCcC); i += 2) {
-    size_t token_offset = __ldg(blk_token_base + cute::get<0>(tCcC(i)));
-    bool cond = token_offset < num_valid_tokens;
-    if constexpr (SHAPE_N % BLOCK_N) {
-      cond = cond && cute::get<1>(tCcC(i)) < (SHAPE_N - blk_n_offset);
-    }
-    if (cond) {
-      AccT* acc_ptr = cute::raw_pointer_cast(accum.data()) + accum.layout()(i);
-      uint32_t* dst_ptr = reinterpret_cast<uint32_t*>(reinterpret_cast<DstT*>(c_ptr)
-                          + token_offset * STRIDE_CM + blk_n_offset + cute::get<1>(tCcC(i)));
-      uint32_t d;
-      asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(d) : "f"(acc_ptr[1]), "f"(acc_ptr[0]));
-      *dst_ptr = d;
+  for (int warp_m = 0; warp_m < size<1>(tCcC); ++warp_m) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int mma_m = 0; mma_m < size<0,1>(tCcC); ++mma_m) {
+      uint32_t token_offset = __ldg(blk_token_base + get<0>(tCcC(make_coord(_0{}, mma_m, _0{}), warp_m, _0{})));
+      bool cond = token_offset < num_valid_tokens;
+      if (cond) {
+        DstT* cur_c_ptr = reinterpret_cast<DstT*>(c_ptr) + token_offset * STRIDE_CM + blk_n_offset;
+        CUTLASS_PRAGMA_UNROLL
+        for (int warp_n = 0; warp_n < size<2>(tCcC); ++warp_n) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int mma_n = 0; mma_n < size<0,2>(tCcC); ++mma_n) {
+            AccT* acc_ptr = cute::raw_pointer_cast(accum(make_coord(_, mma_m, mma_n), warp_m, warp_n).data());
+            uint32_t d;
+            asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(d) : "f"(acc_ptr[1]), "f"(acc_ptr[0]));
+
+            size_t n_idx = get<1>(tCcC(make_coord(_0{}, mma_m, mma_n), warp_m, warp_n));
+            uint32_t* dst_ptr = reinterpret_cast<uint32_t*>(cur_c_ptr + n_idx);
+            if constexpr (SHAPE_N % BLOCK_N) {
+              if (cond && n_idx < (SHAPE_N - blk_n_offset)) {
+                *dst_ptr = d;
+              }
+            } else {
+              *dst_ptr = d;
+            }
+          }
+        }
+      }
     }
   }
 #else

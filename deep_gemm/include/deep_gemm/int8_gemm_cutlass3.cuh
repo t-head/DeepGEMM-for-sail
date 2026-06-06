@@ -25,6 +25,7 @@
 
 #include "ppu_include.hpp"
 #include "utils_cutlass3.h"
+#include "utils_rtc.cuh"
 
 using namespace cute;
 

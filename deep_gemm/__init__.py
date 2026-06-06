@@ -7,12 +7,11 @@ from torch.utils.cpp_extension import CUDA_HOME
 
 from . import jit
 from . import deep_gemm_tuner
+from . import deep_gemm_cpp
 from .jit_kernels import (
     gemm_fp4_fp4_bf16_nt,
-    gemm_bf16_bf16_bf16_nt,
-    gemm_int8_int8_bf16_nt,
     tf32_hc_prenorm_gemm,
-    gemm_fp8_fp8_bf16_nt,
+    # gemm_fp8_fp8_bf16_nt,
     m_grouped_gemm_fp4_fp4_bf16_nt_masked,
     m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
     m_grouped_gemm_w4a16_masked,
@@ -20,20 +19,14 @@ from .jit_kernels import (
     m_grouped_gemm_w4a16_fused,
     preprocess_mxfp4_scales,
     uint8_padding,
-    m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-    m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-    m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
+    # m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
+    # m_grouped_gemm_fp8_fp8_bf16_nt_masked,
+    # m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
     ceil_div,
     set_num_sms, get_num_sms,
     get_col_major_tma_aligned_tensor,
     get_col_major_tensor,
     get_m_alignment_for_contiguous_layout,
-    m_grouped_gemm_int8_int8_bf16_nt_masked,
-    m_grouped_gemm_int8_int8_bf16_nt_contiguous,
-    m_grouped_gemm_int8_int8_bf16_nt_nopad,
-    m_grouped_gemm_bf16_bf16_bf16_nt_masked,
-    m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
-    m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
     #fused kernel
     moe_align_block_size,
     m_grouped_gemm_bf16_bf16_bf16_nt_fused,
@@ -62,46 +55,49 @@ from .utils import (
 from .jit import set_compile_mode, get_compile_mode
 # Import functions from the CPP module
 
+from .deep_gemm_cpp import (
+    gemm_bf16_bf16_bf16_nt,
+    gemm_fp8_fp8_bf16_nt,
+    gemm_int8_int8_bf16_nt,
+    m_grouped_gemm_bf16_bf16_bf16_nt_masked,
+    m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
+    m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
+    m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
+    m_grouped_gemm_fp8_fp8_bf16_nt_masked,
+    m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
+    m_grouped_gemm_int8_int8_bf16_nt_masked,
+    m_grouped_gemm_int8_int8_bf16_nt_contiguous,
+    m_grouped_gemm_int8_int8_bf16_nt_nopad,
+)
 
 use_cpp_jit_for_python = os.environ.get('USE_CPP_JIT_FOR_PYTHON', '').lower()
 should_init_deep_gemm_cpp = use_cpp_jit_for_python in ('1', 'true', 'yes', 'on')
 if should_init_deep_gemm_cpp:
-    from . import deep_gemm_cpp
     # from .deep_gemm_cpp import (
     #     set_num_sms,
     #     get_num_sms,
     #     set_tc_util,
     #     get_tc_util,
     # )
-
     # DeepGEMM Kernels
     from .deep_gemm_cpp import (
         # FP8 GEMMs
-        gemm_fp8_fp8_bf16_nt,
+        # gemm_fp8_fp8_bf16_nt,
         # fp8_gemm_nn,
         # fp8_gemm_tn, fp8_gemm_tt,
-        gemm_bf16_bf16_bf16_nt,
-        gemm_int8_int8_bf16_nt,
-        m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
-        m_grouped_gemm_bf16_bf16_bf16_nt_masked,
-        m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-        m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
-        m_grouped_gemm_int8_int8_bf16_nt_masked,
-        m_grouped_gemm_int8_int8_bf16_nt_contiguous,
-        m_grouped_gemm_int8_int8_bf16_nt_nopad,
-    # fp8_gemm_nt_skip_head_mid,
+        # m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
+        # m_grouped_gemm_fp8_fp8_bf16_nt_masked,
+        # m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
+        # fp8_gemm_nt_skip_head_mid,
+        m_grouped_gemm_fp4_fp4_bf16_nt_masked,
+        m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
+        gemm_fp4_fp4_bf16_nt,
     )
 
-
-    deep_gemm_cpp.init(
-        os.path.dirname(os.path.abspath(__file__)), # Library root directory path
-        CUDA_HOME         # CUDA home
-    )
-else:
-    from .jit_kernels import( gemm_fp8_fp8_bf16_nt, gemm_bf16_bf16_bf16_nt, gemm_int8_int8_bf16_nt, m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
-    m_grouped_gemm_bf16_bf16_bf16_nt_masked)
+deep_gemm_cpp.init(
+    os.path.dirname(os.path.abspath(__file__)), # Library root directory path
+    CUDA_HOME         # CUDA home
+)
 
 # Some alias for APIs
 fp8_gemm_nt = gemm_fp8_fp8_bf16_nt

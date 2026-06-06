@@ -6,8 +6,6 @@ using namespace cute;
 
 namespace cutlass::gemm::collective {
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
 template <
   typename Arch_,
   int Stages,
@@ -28,7 +26,7 @@ template <
   class TransformB_>
 struct CollectiveMma<
     Arch_,
-    MainloopPPUAiuA8W8OverlapPrologue<Stages, KernelSchedule>,
+    MainloopPPUOverlapMainloop<Stages, KernelSchedule>,
     TileShape_,
     ElementA_,
     StrideA_,
@@ -46,7 +44,7 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopPPUAiuA8W8OverlapPrologue<Stages, KernelSchedule>;
+  using DispatchPolicy = MainloopPPUOverlapMainloop<Stages, KernelSchedule>;
   using TileShape = TileShape_;
   using ElementA = ElementA_;
   using StrideA = StrideA_;
@@ -63,8 +61,6 @@ struct CollectiveMma<
   using TransformA = TransformA_;
   using TransformB = TransformB_;
   using ArchTag = typename DispatchPolicy::ArchTag;
-
-  using ElementScale = float;
 
   static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
   static_assert((size<0>(TileShape{}) % size<0>(SmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
@@ -85,47 +81,6 @@ struct CollectiveMma<
   using SmemLayoutAInterleave = decltype(make_layout(shape(SmemLayoutA{}), make_stride(stride<0>(SmemLayoutA{}), stride<1>(SmemLayoutA{}), stride<2>(SmemLayoutA{}) + stride<2>(SmemLayoutB{}))));
   using SmemLayoutBInterleave  = decltype(make_layout(shape(SmemLayoutB{}), make_stride(stride<0>(SmemLayoutB{}), stride<1>(SmemLayoutB{}), stride<2>(SmemLayoutA{}) + stride<2>(SmemLayoutB{}))));
 
-  // tile256x256 && !NT trans, use sigle warp to issue AIU LOAD
-  static constexpr bool SplitAIU = size<0>(TileShape{}) != 256 || size<1>(TileShape{}) != 256
-              || (is_same_v<StrideA, cutlass::detail::TagToStrideA_t<layout::ColumnMajor>>
-                  && is_same_v<StrideB, cutlass::detail::TagToStrideB_t<layout::RowMajor>>);
-
-  constexpr static uint32_t CTA_M = shape<0>(TileShape{});
-  constexpr static uint32_t CTA_N = shape<1>(TileShape{});
-  constexpr static uint32_t CTA_K = shape<2>(TileShape{});
-
-  // b32x4 is not avaliable for nopad interface, as the scale is not 16 byte alinged
-  // maybe b32x4 has better perf for the other interface
-  using ScaleCopyAtomWidth = cute::uint32_t;
-  static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
-  constexpr static uint32_t ScaleGranularity = sizeof(ScaleCopyAtomWidth) / sizeof(float);
-  static constexpr int ScaleMsPerThread = cute::ceil_div(size<0>(TileShape{}), Int<MaxThreadsPerBlock * ScaleGranularity>{});
-  static constexpr int ScaleNsPerThread = cute::ceil_div(size<1>(TileShape{}), Int<MaxThreadsPerBlock * ScaleGranularity>{});
-
-  static constexpr int MmaTileM = TiledMma().template tile_size_mnk<0>();
-  static constexpr int MmaTileN = TiledMma().template tile_size_mnk<1>();
-
-  // ScaleA
-  using GmemTiledCopyScaleA = decltype(
-    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<ScaleCopyAtomWidth>, ElementScale>{},
-                    Layout<Shape <Int<CTA_M / ScaleMsPerThread>, _1>>{},
-                    Layout<Shape <Int<ScaleMsPerThread>,_1>>{}));
-
-  // ScaleB
-  using GmemTiledCopyScaleB = decltype(
-    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<ScaleCopyAtomWidth>, ElementScale>{},
-                    Layout<Shape <Int<CTA_N / ScaleNsPerThread>, _1>>{},
-                    Layout<Shape <Int<ScaleNsPerThread>,_1>>{}));
-
-  using SmemLayoutAtomScale = Layout<Shape<Int<ScaleGranularity>, _1>>;
-  using SmemLayoutScaleA = decltype(tile_to_shape(
-      SmemLayoutAtomScale{},
-      make_shape(Int<CTA_M>{}, Int<1>{}, Int<1>{})));   // assert CTA_SCALE_K = 1, gs >= cta_k
-  using SmemLayoutScaleB = decltype(tile_to_shape(
-      SmemLayoutAtomScale{},
-      make_shape(Int<CTA_N>{}, Int<1>{}, Int<1>{})));   // assert CTA_SCALE_K = 1, gs >= cta_k
-
-  using StrideScale = cute::Stride<_1, int64_t, int64_t>;
 
   static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
 
@@ -134,14 +89,15 @@ struct CollectiveMma<
     cute::array_aligned<ElementB, cute::cosize_v<SmemLayoutB>> smem_b;
   };
 
+  static constexpr int NumThreadsPerCTA = size(TiledMma{});
+  static constexpr uint32_t MaxThreadsPerBlockTotal = NumThreadsPerCTA * 2;
+
   // Host side kernel arguments
   struct Arguments {
     ElementA const* ptr_A;
     StrideA dA;
     ElementB const* ptr_B;
     StrideB dB;
-    ElementScale const* ptr_scale_A;
-    ElementScale const* ptr_scale_B;
   };
 
   // Device side kernel params
@@ -151,16 +107,15 @@ struct CollectiveMma<
   // put gmem_tiled_copy here and copy desc in kernel to simplify rtc usage
   GmemTiledCopyA gmem_tiled_copy_A;
   GmemTiledCopyB gmem_tiled_copy_B;
+  GmemTiledCopyA gmem_tiled_copy_A_next;
 
-  GmemTiledCopyScaleA gmem_tiled_copy_scaleA;
-  GmemTiledCopyScaleB gmem_tiled_copy_scaleB;
   //
   // Methods
   //
 
   template <class ProblemShape>
   CUTLASS_DEVICE
-  CollectiveMma(Params params, ProblemShape problem_shape_MNK) {
+  CollectiveMma(Params params, ProblemShape problem_shape_MNK, int M_next=0) {
     static constexpr bool TransA = is_static<decltype(get<1>(params.dA))>::value ? false : true;
     static constexpr bool TransB = is_static<decltype(get<1>(params.dB))>::value ? false : true;
 
@@ -173,20 +128,13 @@ struct CollectiveMma<
 
     gmem_tiled_copy_A.desc_.template init<ElementA, TransA, get<0>(TilerA{}), get<1>(TilerA{})>(nullptr, M, K, params.dA);
     gmem_tiled_copy_B.desc_.template init<ElementB, TransB, get<0>(TilerB{}), get<1>(TilerB{})>(nullptr, N, K, params.dB);
-
-    gmem_tiled_copy_scaleA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<ScaleCopyAtomWidth>, ElementScale>{},
-                    Layout<Shape <Int<CTA_M / ScaleMsPerThread>, _1>>{},
-                    Layout<Shape < Int<ScaleMsPerThread>,_1>>{});
-
-    gmem_tiled_copy_scaleB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<ScaleCopyAtomWidth>, ElementScale>{},
-                    Layout<Shape <Int<CTA_N / ScaleNsPerThread>, _1>>{},
-                    Layout<Shape < Int<ScaleNsPerThread>,_1>>{});
+    gmem_tiled_copy_A_next.desc_.template init<ElementA, TransA, get<0>(TilerA{}), get<1>(TilerA{})>(nullptr, M_next, K, params.dA);
   };
 
   template <class ProblemShape_MNKL, class BlockCoord_MNKL>
   CUTLASS_DEVICE auto
   load_init(ProblemShape_MNKL const& problem_shape_MNKL, BlockCoord_MNKL const& blk_coord_mnkl, Params const& params,
-            int offset_m, int64_t offset_b, ElementA const* ptr_A, ElementB const* ptr_B) {
+            int offset_m, int expert_id, ElementA const* ptr_A, ElementB const* ptr_B) {
     auto [M,N,K,L] = problem_shape_MNKL;
     auto [m_coord, n_coord, _, l_coord] = blk_coord_mnkl;
     // load init A
@@ -199,29 +147,7 @@ struct CollectiveMma<
     Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,l_coord));                                 // (n,k)
     Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
 
-    // // load init scale A/B
-    Tensor mSFA_mk = make_tensor(make_gmem_ptr(params.ptr_scale_A + offset_m), make_shape(M,1));      // (n,scale_k,l)
-    auto sfa_shape = make_shape(Int<CTA_M>{}, Int<1>{});
-    Tensor gSFA = local_tile(mSFA_mk, sfa_shape, make_coord(m_coord, _));    // (BLK_N, 1, scale_k)
-    Tensor iSFA_mk = make_identity_tensor(sfa_shape);
-    Tensor cSFA = local_tile(iSFA_mk, sfa_shape, make_coord(m_coord, _));
-
-    Tensor mSFB_nk = make_tensor(make_gmem_ptr(params.ptr_scale_B + offset_b / K), make_shape(N,1));           // (n,scale_k,l)
-    auto sfb_shape = make_shape(Int<CTA_N>{}, Int<1>{});
-    Tensor gSFB = local_tile(mSFB_nk, sfb_shape, make_coord(n_coord, _));    // (BLK_N, 1, scale_k)
-    Tensor iSFB_nk = make_identity_tensor(sfb_shape);
-    Tensor cSFB = local_tile(iSFB_nk, sfb_shape, make_coord(n_coord, _));
-
-    // if (thread0()) {
-    //   int expert_id = offset_b / K / N;
-    //   printf("M = %d, m_coord = %d, n_coord = %d, l_coord = %d, offset_m = %d, expert_id = %d, ptr_A = %p, ptr_B = %p, scale_a = %p, scale_b = %p\n",
-    //           M, m_coord, n_coord, l_coord, offset_m, expert_id, params.ptr_scale_A, params.ptr_scale_B, params.ptr_scale_A + offset_m, params.ptr_scale_B + expert_id * N);
-    //   printf("    m_coord = %d, n_coord = %d \n", m_coord, n_coord);
-    //   print("    gSFA="); print(gSFA); print('\n');
-    //   print("    gSFB="); print(gSFB); print('\n');
-    // }
-
-    return cute::make_tuple(gA, gB, cute::make_tuple(gSFA, cSFA), cute::make_tuple(gSFB, cSFB));
+    return cute::make_tuple(gA, gB);
   }
 
   template <class ProblemShape>
@@ -243,16 +169,14 @@ struct CollectiveMma<
     return cutlass::Status::kSuccess;
   }
 
+  /// Perform a collective-scoped matrix multiply-accumulate
   template <
     class... Ts
   >
   CUTLASS_DEVICE void
   prologue(
       cute::tuple<Ts...> const& load_inputs,
-      int& k_tile_iter, int& k_tile_count,
       int thread_idx,
-      int smem_pipe_write,
-      bool tile_valid,
       char *smem_buf) {
     using namespace cute;
 
@@ -262,6 +186,7 @@ struct CollectiveMma<
       "MainloopSm80CpAsync must have a pipeline mode in the smem layout.");
 
     int warp_idx = canonical_warp_idx_sync();
+    int lane_predicate = cute::elect_one_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -288,108 +213,18 @@ struct CollectiveMma<
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
-    //// Start async loads for all pipes but the last
-    CUTLASS_PRAGMA_UNROLL
-    for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages-1; ++k_pipe) {
-      if (tile_valid && k_tile_count > 0) {
-        copy_aiu<SplitAIU>(
-          gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,smem_pipe_write),
-          gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,smem_pipe_write),
-          warp_idx
-        );
-      }
-      cp_async_fence();
-      --k_tile_count;
-      ++k_tile_iter;
-      ++smem_pipe_write;
-      smem_pipe_write = (smem_pipe_write == DispatchPolicy::Stages) ? 0 : smem_pipe_write;
-    }
-
-    //copy_aiu<SplitAIU>(
-    //  gmem_tiled_copy_A, tAgA(_,_,_,Int<0>{}), tAsA(_,_,_,Int<0>{}),
-    //  gmem_tiled_copy_B, tBgB(_,_,_,Int<0>{}), tBsB(_,_,_,Int<0>{}),
-    //  warp_idx
-    //);
-    //cp_async_fence();
-  }
-
-  /// Perform a collective-scoped matrix multiply-accumulate
-  template <
-    class FrgTensorMma,
-    class FrgTensorMmaDequqnt
-  >
-  CUTLASS_DEVICE void
-  dequant(
-      FrgTensorMma &mma_acc,
-      FrgTensorMmaDequqnt &accum,
-      int thread_idx,
-      int smem_pipe_scale,
-      char *smem_buf) {
-    int warp_idx = canonical_warp_idx_sync();
-
-    // Construct shared memory tiles
-    SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-    Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutAInterleave{}); // (BLK_M,BLK_K,PIPE)
-    Tensor sB = make_tensor(make_smem_ptr(storage.smem_a.data() + size<0>(TileShape{}) * size<2>(TileShape{})), SmemLayoutBInterleave{}); // (BLK_N,BLK_K,PIPE)
-    // Partition the copying of A and B tiles across the threads
-    auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx);
-    auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
-    Tensor tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
-    Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
-
-    // use last stage for scale in overlap prologue
-    ElementScale * scale_a_smem_ptr = reinterpret_cast<ElementScale*>(tAsA(_,_,_,smem_pipe_scale).data().get());
-    ElementScale * scale_b_smem_ptr = reinterpret_cast<ElementScale*>(tBsB(_,_,_,smem_pipe_scale).data().get());
-    Tensor sSA = make_tensor(make_smem_ptr(scale_a_smem_ptr), SmemLayoutScaleA{});
-    Tensor sSB = make_tensor(make_smem_ptr(scale_b_smem_ptr), SmemLayoutScaleB{});
-    // Tile MMA compute thread partitions and allocate accumulators
-    TiledMma tiled_mma;
-    auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
-
-    // scale A/B
-    using SmemCopyLayoutScaleB = decltype(tile_to_shape(Layout<Shape<_1, Int<ScaleNsPerThread>>>{},
-            make_shape(Int<1>{}, Int<CTA_N>{}, Int<1>{})));
-    Tensor sSB_copy = make_tensor(sSB.data(), SmemCopyLayoutScaleB{});
-    Tensor tCrSA = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSA(_,_,Int<0>{})));
-    Tensor tCrSB = make_fragment_like<ElementScale>(thr_mma.partition_fragment_C(sSB_copy(_,_,Int<0>{})));
-
-    using SmemCopyAtomScale = Copy_Atom<cute::AutoVectorizingCopyWithAssumedAlignment<cutlass::sizeof_bits<ElementScale>::value>, ElementScale>;
-    auto smem_tiled_copy_ScaleA   = make_tiled_copy_C(SmemCopyAtomScale{}, tiled_mma);
-    auto smem_thr_copy_ScaleA     = smem_tiled_copy_ScaleA.get_thread_slice(thread_idx);
-    Tensor tCsSA                  = smem_thr_copy_ScaleA.partition_S(sSA);
-    Tensor tCrSA_copy_view        = smem_thr_copy_ScaleA.retile_D(tCrSA);
-
-    auto smem_tiled_copy_ScaleB   = make_tiled_copy_C(SmemCopyAtomScale{}, tiled_mma);
-    auto smem_thr_copy_ScaleB     = smem_tiled_copy_ScaleB.get_thread_slice(thread_idx);
-    Tensor tCsSB                  = smem_thr_copy_ScaleB.partition_S(sSB_copy);
-    Tensor tCrSB_copy_view        = smem_thr_copy_ScaleB.retile_D(tCrSB);
-
-    Tensor tCsSA_p = tCsSA(_,_,_,Int<0>{});
-    Tensor tCsSB_p = tCsSB(_,_,_,Int<0>{});
-
-    cp_async_wait<DispatchPolicy::Stages-1>();
-    __syncthreads();
-
-    copy(smem_tiled_copy_ScaleA, tCsSA_p(_,_,Int<0>{}), tCrSA_copy_view(_,_,Int<0>{}));
-    copy(smem_tiled_copy_ScaleB, tCsSB_p(_,Int<0>{},_), tCrSB_copy_view(_,Int<0>{},_));
-
-    // dequantize
-    CUTLASS_PRAGMA_UNROLL
-    for (int n = 0; n < cute::size<2>(accum); ++n) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int m = 0; m < cute::size<1>(accum); ++m) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < cute::size<0>(accum); ++i) {
-          accum(i,m,n) = mma_acc(i,m,n) * tCrSA(i,m,Int<0>{}) * tCrSB(i,Int<0>{},n);
-        }
-      }
-    }
-
+    copy_aiu(
+      gmem_tiled_copy_A, tAgA(_,_,_,Int<0>{}), tAsA(_,_,_,Int<0>{}),
+      gmem_tiled_copy_B, tBgB(_,_,_,Int<0>{}), tBsB(_,_,_,Int<0>{}),
+      warp_idx
+    );
+    cp_async_fence();
   }
 
   /// Perform a collective-scoped matrix multiply-accumulate
   template <
     class... Ts,
+    class... Ts1,
     class FrgTensorD,
     class FrgTensorC,
     class ResidueMNK
@@ -398,12 +233,13 @@ struct CollectiveMma<
   operator() (
       FrgTensorD &accum,
       cute::tuple<Ts...> const& load_inputs,
+      cute::tuple<Ts1...> const& load_inputs_next,
       FrgTensorC const &src_accum,
-      int k_tile_iter, int k_tile_count,
       ResidueMNK residue_mnk,
       int thread_idx,
-      int smem_pipe_write,
-      int smem_pipe_scale,
+      int warp_idx,
+      int warp_group_id,
+      int smem_pipe_read,
       char *smem_buf) {
     using namespace cute;
 
@@ -414,7 +250,8 @@ struct CollectiveMma<
     static_assert(rank(SmemLayoutB{}) == 3,
       "MainloopSm80CpAsync must have a pipeline mode in the smem layout.");
 
-    int warp_idx = canonical_warp_idx_sync();
+    //int warp_idx = canonical_warp_idx_sync();
+    int lane_predicate = cute::elect_one_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -423,11 +260,6 @@ struct CollectiveMma<
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutAInterleave{}); // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(storage.smem_a.data() + size<0>(TileShape{}) * size<2>(TileShape{})), SmemLayoutBInterleave{}); // (BLK_N,BLK_K,PIPE)
-
-    // if (thread0()) {
-    //   printf("smem total size = %d, smem_a = %d, smem_b = %d, smem_scale_a = %d, smem_scale_b = %d\n",
-    //     sizeof(storage), sizeof(storage.smem_a), sizeof(storage.smem_b), sizeof(storage.smem_scale_a), sizeof(storage.smem_scale_b));
-    // }
 
     CUTE_STATIC_ASSERT_V(size<0>(gA) == size<0>(sA));                          // BLK_M
     CUTE_STATIC_ASSERT_V(size<1>(gA) == size<1>(sA));                          // BLK_K
@@ -440,61 +272,49 @@ struct CollectiveMma<
     // Partition the copying of A and B tiles across the threads
     auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx);
     auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
+    auto gmem_thr_copy_A_next = gmem_tiled_copy_A_next.get_slice(thread_idx);
 
     Tensor tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
     Tensor tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
-    Tensor gSFA = get<2, 0>(load_inputs);
-    Tensor gSFB = get<3, 0>(load_inputs);
-    Tensor cSFA = get<2, 1>(load_inputs);
-    Tensor cSFB = get<3, 1>(load_inputs);
+    Tensor tAsA_next = gmem_thr_copy_A_next.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
+    Tensor gA_next = get<0>(load_inputs_next);
+    Tensor gB_next = get<1>(load_inputs_next);
+    Tensor tAgA_next = gmem_thr_copy_A_next.partition_S(gA_next);                             // (ACPY,ACPY_M,ACPY_K,k)
+    Tensor tBgB_next = gmem_thr_copy_B.partition_S(gB_next);                             // (BCPY,BCPY_N,BCPY_K,k)
 
-    // use last stage for scale in overlap prologue
-    // int smem_pipe_scale = (smem_pipe_write + k_tile_count) % DispatchPolicy::Stages;
-    ElementScale * scale_a_smem_ptr = reinterpret_cast<ElementScale*>(tAsA(_,_,_,smem_pipe_scale).data().get());
-    ElementScale * scale_b_smem_ptr = reinterpret_cast<ElementScale*>(tBsB(_,_,_,smem_pipe_scale).data().get());
-    Tensor sSA = make_tensor(make_smem_ptr(scale_a_smem_ptr), SmemLayoutScaleA{});
-    Tensor sSB = make_tensor(make_smem_ptr(scale_b_smem_ptr), SmemLayoutScaleB{});
-
-    auto gmem_thr_copy_scaleA = gmem_tiled_copy_scaleA.get_slice(thread_idx);
-    auto gmem_thr_copy_scaleB = gmem_tiled_copy_scaleB.get_slice(thread_idx);
-
-    Tensor tSgSA = gmem_thr_copy_scaleA.partition_S(gSFA);
-    Tensor tSsSA = gmem_thr_copy_scaleA.partition_D(sSA);
-    Tensor tSFAcSFA = gmem_thr_copy_scaleA.partition_S(cSFA);
-
-    Tensor tSgSB = gmem_thr_copy_scaleB.partition_S(gSFB);
-    Tensor tSsSB = gmem_thr_copy_scaleB.partition_D(sSB);
-    Tensor tSFBcSFB = gmem_thr_copy_scaleB.partition_S(cSFB);
-
-    Tensor tSpSA = make_tensor<bool>(shape(tSsSA));
-    Tensor tSpSB = make_tensor<bool>(shape(tSsSB));
-    for (int i = 0; i < size(tSpSA); ++i) {
-      tSpSA(i) = get<0>(tSFAcSFA(i)) < get<0>(residue_mnk);
-    }
-    for (int i = 0; i < size(tSpSB); ++i) {
-      tSpSB(i) = get<0>(tSFBcSFB(i)) < get<1>(residue_mnk);
-    }
-    bool scaleCopySendDone = false;
-
-
-    if (k_tile_count > 0) {
-      copy_aiu<SplitAIU>(
-        gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,smem_pipe_write),
-        gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,smem_pipe_write),
-        warp_idx
-      );
-    }
-    cp_async_fence();
-    --k_tile_count;
-    ++k_tile_iter;
-    ++smem_pipe_write;
+    int k_tile_iter = 1;
+    int k_tile_count = size<2>(gA) - 1;
+    int smem_pipe_write = smem_pipe_read + 1;
     smem_pipe_write = (smem_pipe_write == DispatchPolicy::Stages) ? 0 : smem_pipe_write;
+    // Start async loads for all pipes but the last
+    CUTLASS_PRAGMA_UNROLL
+    for (int k_pipe = 1; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
+      __ppu_barrier_sync(5 + k_pipe * 2 + warp_group_id, MaxThreadsPerBlockTotal);
+      if (k_tile_count > 0) {
+        copy_aiu(
+          gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,smem_pipe_write),
+          gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,smem_pipe_write),
+          warp_idx
+        );
+        ++k_tile_iter;
+      } else if (k_tile_count == 0) {
+        copy_aiu(
+          gmem_tiled_copy_A_next, tAgA_next(_,_,_,Int<0>{}), tAsA_next(_,_,_,smem_pipe_write),
+          gmem_tiled_copy_B, tBgB_next(_,_,_,Int<0>{}), tBsB(_,_,_,smem_pipe_write),
+          warp_idx
+        );
+      } else {
+        __ppu_barrier_arrive(6 - k_tile_count * 2 - warp_group_id, MaxThreadsPerBlockTotal, 0);
+      }
+      cp_async_fence();
+      ++smem_pipe_write;
+      smem_pipe_write = (smem_pipe_write == DispatchPolicy::Stages) ? 0 : smem_pipe_write;
+      --k_tile_count;
+    }
 
-    // Current pipe index in smem to read from
-    int smem_pipe_read  = smem_pipe_write;
     //
     // MMA Atom partitioning
     //
@@ -504,7 +324,6 @@ struct CollectiveMma<
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
     Tensor tCrA = thr_mma.partition_fragment_A(sA(_,_,0));                     // (MMA,MMA_M,MMA_K)
     Tensor tCrB = thr_mma.partition_fragment_B(sB(_,_,0));                     // (MMA,MMA_N,MMA_K)
-
 
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(src_accum));                 // MMA_M
@@ -530,9 +349,11 @@ struct CollectiveMma<
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // CPY_N
     CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
 
-    //
-    // PIPELINED MAIN LOOP
-    //
+
+    //// Current pipe index in smem to read from
+    //int smem_pipe_read = 0;
+    //// Current pipe index in smem to write to
+    //int smem_pipe_write = 0;
 
     Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
     Tensor tCsB_p = tCsB(_,_,_,smem_pipe_read);
@@ -541,95 +362,89 @@ struct CollectiveMma<
     auto K_BLOCK_MAX = size<2>(tCrA_copy_view);
     auto K_ATOM_PER_COPY = size<2>(tCrA) / size<2>(tCrA_copy_view);
 
+    __ppu_barrier_sync(5 + warp_group_id, MaxThreadsPerBlockTotal);
+
     // PREFETCH register pipeline
     if (K_BLOCK_MAX > 1) {
       // Wait until our first prefetched tile is loaded in
       cp_async_wait<DispatchPolicy::Stages-1>();
-      __syncthreads();
+      __ppu_barrier_sync(3 + warp_group_id, NumThreadsPerCTA);
 
       // Prefetch the first rmem from the first k-tile
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
       copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
     }
 
-    auto process_kblock_iterations = [&](int k_block) {
-      if (k_block == K_BLOCK_MAX - 1) {
-        // Slice the smem_pipe_read smem
-        tCsA_p = tCsA(_,_,_,smem_pipe_read);
-        tCsB_p = tCsB(_,_,_,smem_pipe_read);
-      }
-
-      // Load A, B shmem->regs for k_block+1
-      auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
-      copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
-      copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
-
-CUTLASS_PRAGMA_UNROLL
-      for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
-        auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
-        // Transform before compute
-        cute::transform(tCrA(_,_,atom_idx), TransformA{});
-        cute::transform(tCrB(_,_,atom_idx), TransformB{});
-        // gemm for one tiled_mma atom on K
-        cute::gemm(tiled_mma, accum, tCrA(_,_,atom_idx), tCrB(_,_,atom_idx), accum);
-      }
-
-      // Copy gmem to smem after computing gemm on each k-pipe
-      if (k_block == K_BLOCK_MAX - 2) {
-        // avoid to move aiu load before smem copy
-        cp_async_wait<DispatchPolicy::Stages-2>();
-        __syncthreads();
-
-        // __ppu_sched_bound();
-        // __syncthreads();
-        if (k_tile_count > 0) {
-          copy_aiu<SplitAIU>(
-            gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,smem_pipe_write),
-            gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,smem_pipe_write),
-            warp_idx
-          );
-        } else if (scaleCopySendDone == false) {
-          copy_if(gmem_tiled_copy_scaleA, tSpSA, tSgSA(_,_,_,0), tSsSA(_,_,_,0));
-          copy_if(gmem_tiled_copy_scaleB, tSpSB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
-          scaleCopySendDone = true;
-        }
-        cp_async_fence();
-
-        --k_tile_count;
-        ++k_tile_iter;
-        // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
-        ++smem_pipe_read;
-        smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
-        smem_pipe_write = smem_pipe_read;
-
-        // // Commit the smem for smem_pipe_read
-        // cp_async_wait<DispatchPolicy::Stages-1>();
-        // __syncthreads();
-      }
-    };
-
-    for_each(make_int_sequence<K_BLOCK_MAX >{}, [&] (auto k_block) {
-      process_kblock_iterations(k_block);
-    }); // for_each
-
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > -(DispatchPolicy::Stages)) {
       // Pipeline the outer products with a static for loop.
       //
       // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
-      for_each(make_int_sequence<K_BLOCK_MAX >{}, [&] (auto k_block) {
-        process_kblock_iterations(k_block);
+      for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
+        if (k_block == K_BLOCK_MAX - 1) {
+          // Slice the smem_pipe_read smem
+          tCsA_p = tCsA(_,_,_,smem_pipe_read);
+          tCsB_p = tCsB(_,_,_,smem_pipe_read);
+        }
+
+        // Load A, B shmem->regs for k_block+1
+        auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
+        copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
+        copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
+
+CUTLASS_PRAGMA_UNROLL
+        for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
+          auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
+          // Transform before compute
+          cute::transform(tCrA(_,_,atom_idx), TransformA{});
+          cute::transform(tCrB(_,_,atom_idx), TransformB{});
+          // gemm for one tiled_mma atom on K
+          cute::gemm(tiled_mma, accum, tCrA(_,_,atom_idx), tCrB(_,_,atom_idx), src_accum);
+        }
+
+        // Copy gmem to smem after computing gemm on each k-pipe
+        if (k_block == K_BLOCK_MAX - 2) {
+
+          // Commit the smem for smem_pipe_read
+          cp_async_wait<DispatchPolicy::Stages-2>();
+
+          __ppu_barrier_sync(3 + warp_group_id, NumThreadsPerCTA);
+
+          if (k_tile_count > 0) {
+            copy_aiu(
+              gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,smem_pipe_write),
+              gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,smem_pipe_write),
+              warp_idx
+            );
+            ++k_tile_iter;
+          } else if (k_tile_count == 0) {
+            copy_aiu(
+              gmem_tiled_copy_A_next, tAgA_next(_,_,_,Int<0>{}), tAsA_next(_,_,_,smem_pipe_write),
+              gmem_tiled_copy_B, tBgB_next(_,_,_,Int<0>{}), tBsB(_,_,_,smem_pipe_write),
+              warp_idx
+            );
+          } else {
+            __ppu_barrier_arrive(6 - k_tile_count * 2 - warp_group_id, MaxThreadsPerBlockTotal, 0);
+          }
+          cp_async_fence();
+          --k_tile_count;
+
+          // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
+          ++smem_pipe_read;
+          smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
+          smem_pipe_write = smem_pipe_read;
+        }
       }); // for_each
+
     }
 
+    // // TODO: original cutlass3 miss this sync
+    // cp_async_wait<0>();
+    // __ppu_barrier_sync(3 + warp_group_id, NumThreadsPerCTA);
+    __ppu_barrier_arrive(6 - warp_group_id, MaxThreadsPerBlockTotal, 0);
   }
 };
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
 } // namespace cutlass::gemm::collective
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
 
 namespace cutlass::gemm::kernel {
 
@@ -646,7 +461,7 @@ class DeepGemmUniversal<
   CollectiveEpilogue_,
   TileScheduler_,
   kEnableSboOverlap,
-  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistageOverlapPrologue, typename CollectiveMainloop_::DispatchPolicy::Schedule>>> {
+  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistageOverlapMainloop, typename CollectiveMainloop_::DispatchPolicy::Schedule>>> {
 public:
 public:
   //
@@ -681,8 +496,12 @@ public:
   using EpilogueParams = typename CollectiveEpilogue::Params;
 
   static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
+  static constexpr uint32_t WarpNum = MaxThreadsPerBlock >> 5;
+  static constexpr uint32_t MaxThreadsPerBlockTotal = MaxThreadsPerBlock * 2;
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
   static constexpr uint32_t NumMmaWarpGroups = 1;
+  static_assert(DispatchPolicy::Stages <= 5, "Stags must <= 5, limited by bar num for overlap mainloop kernel");
+  static constexpr uint32_t EpilogueSmemStride = sizeof(typename CollectiveEpilogue::SharedStorage);
 
   using TileScheduler = TileScheduler_;
   using TileSchedulerArguments = typename TileScheduler::Arguments;
@@ -695,18 +514,13 @@ public:
   // Kernel level shared memory storage
   struct SharedStorage {
     // Mainloop and epilogue don't use smem concurrently since kernel is non-persistent, so we can use a union
-    union SharedTensorStorage {
-      using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
-      using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
-
-      MainloopSharedStorage mainloop;
-      EpilogueSharedStorage epilogue;
-    } tensors;
+    using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
+    using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
+    MainloopSharedStorage mainloop;
+    EpilogueSharedStorage epilogue;
+    EpilogueSharedStorage epilogue1;
   };
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
-  static constexpr uint32_t EpilogueSmemStride = (size<0>(TileShape{}) + size<1>(TileShape{}))* size<2>(TileShape{}) * (CollectiveMainloop_::DispatchPolicy::Stages-1) * sizeof(ElementA); //use last stage shm;
-  static constexpr bool EnableOverlapPrologue = (size<0>(TileShape{}) + size<1>(TileShape{})) * size<2>(TileShape{}) * sizeof(ElementA) >= sizeof(decltype(CollectiveEpilogue::SharedStorage::smem_epilogue));
-  // static_assert(EnableOverlapPrologue, "Mainloop one stage smem of A+B must be larger than epilogue smem to do overlap !");
 
   // Device side arguments
   struct Arguments {
@@ -817,13 +631,12 @@ public:
 
   static dim3
   get_block_shape() {
-    return dim3(MaxThreadsPerBlock, 1, 1);
+    return dim3(MaxThreadsPerBlockTotal, 1, 1);
   }
 
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
-    // printf("run ppu aiu deepgemm persistent!!!");
     using X = Underscore;
 
     // Preconditions
@@ -842,6 +655,8 @@ public:
 
     // Kernel level shared memory storage
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+    int warp_group_id = warp_idx / WarpNum;
+    warp_idx = warp_idx - warp_group_id * WarpNum;
 
     // Preconditions
     static_assert(cute::rank(StrideA{}) == 3, "StrideA must be rank-3: [M, K, L]. If batch mode is not needed, set L stride to Int<0>.");
@@ -850,16 +665,16 @@ public:
     static_assert(cute::rank(StrideD{}) == 3, "StrideD must be rank-3: [M, N, L]. If batch mode is not needed, set L stride to Int<0>.");
 
     // Get the appropriate blocks for this thread block -- potential for thread block locality
-    int thread_idx = int(threadIdx.x);
+    int thread_idx = int(threadIdx.x) - warp_group_id * MaxThreadsPerBlock;
     auto blk_shape = TileShape{}; // (BLK_M,BLK_N,BLK_K)
 
-    TileScheduler deep_scheduler(params.scheduler);
+    TileScheduler deep_scheduler(params.scheduler, warp_group_id);
 
-    uint32_t m_coord, n_coord;
     constexpr uint32_t L = 1;
-
+    uint32_t l_coord = 0;
+    uint32_t m_coord, n_coord;
     bool tile_valid = deep_scheduler.fetch_next_work(m_coord, n_coord);
-    auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, 0);
+    auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
     uint32_t M = deep_scheduler.curr_problem_m();
     auto problem_shape_MNKL = ProblemShape{M, N, K, L};
     CollectiveMainloop collective_mma_prologue(params.mainloop, take<0, 3>(problem_shape_MNKL));
@@ -870,15 +685,26 @@ public:
     const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
     const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
     auto load_inputs = collective_mma_prologue.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
-                                                  offset_m, offset_b, ptr_A, ptr_B);
-    int k_tile_count = size<2>(get<0>(load_inputs));
-    int k_tile_iter = 0;
-    int smem_pipe_write = 0;
-    collective_mma_prologue.prologue(load_inputs, k_tile_iter, k_tile_count, thread_idx, smem_pipe_write, tile_valid, smem_buf);
+                                                  offset_m, expert_id, ptr_A, ptr_B);
+    // update params.epilogue for ptrC and ptrD
+    auto params_epilogue_local = params.epilogue;
+    params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
+    params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
 
-    //#pragma clang loop licm(disable)
+    int smem_pipe_read = (warp_group_id * size<2>(get<0>(load_inputs))) % DispatchPolicy::Stages;
+
+    if (warp_group_id == 0) {
+      collective_mma_prologue.prologue(load_inputs, thread_idx, smem_buf);
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int k_pipe = 1; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
+        __ppu_barrier_arrive(6 + k_pipe * 2 - warp_group_id, MaxThreadsPerBlockTotal, 0);
+      }
+      __ppu_barrier_arrive(6 - warp_group_id, MaxThreadsPerBlockTotal, 0);
+    }
+
+    #pragma clang loop licm(disable)
     while (tile_valid) {
-      CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
       // Extract out partitioned A and B.
       Tensor gA = get<0>(load_inputs);
       Tensor gB = get<1>(load_inputs);
@@ -888,59 +714,46 @@ public:
       auto n_max_coord = N - size<0>(gB) * get<1>(blk_coord_mnkl);                             // N - BLK_N * n_coord
       auto k_residue   = K - size<1>(gA) * size<2>(gA);                                        // K - BLK_K * k_coord_max
       auto residue_mnk = make_tuple(m_max_coord, n_max_coord, k_residue);
-
-      // update params.epilogue for ptrC and ptrD
-      auto params_epilogue_local = params.epilogue;
-      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
-      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
       auto curr_group_idx = deep_scheduler.curr_group_idx;
       auto curr_m_coord = m_coord;
 
-      tile_valid = deep_scheduler.fetch_next_work(m_coord, n_coord);
-      M = deep_scheduler.curr_problem_m();
-      auto blk_coord_mnkl_next = make_coord(m_coord, n_coord, _, 0);
-      auto problem_shape_MNKL_next = ProblemShape{M, N, K, L};
-      CollectiveMainloop collective_mma_next(params.mainloop, take<0, 3>(problem_shape_MNKL_next));
+      // get next work tile
+      uint32_t m_coord_next, n_coord_next;
+      bool tile_valid_next = deep_scheduler.fetch_next_work(m_coord_next, n_coord_next);
+      auto blk_coord_mnkl_next = make_coord(m_coord_next, n_coord_next, _, l_coord);
+      uint32_t M_next = deep_scheduler.curr_problem_m();
+      auto problem_shape_MNKL_next = ProblemShape{M_next, N, K, L};
       auto offset_m_next = deep_scheduler.curr_offset_m();
       auto expert_id_next = deep_scheduler.problem_index();
       auto offset_a_next = deep_scheduler.curr_offset_a();
-      auto offset_b_next = deep_scheduler.curr_offset_b(m_coord);
+      auto offset_b_next = deep_scheduler.curr_offset_b(m_coord_next);
       const ElementA* ptr_A_next = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a_next;
       const ElementB* ptr_B_next = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b_next;
 
+      CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL), M_next);
+      auto load_inputs_next = collective_mma.load_init(problem_shape_MNKL_next, blk_coord_mnkl_next, params.mainloop,
+                                                  offset_m_next, expert_id_next, ptr_A_next, ptr_B_next);
+
       // Allocate the tiled_mma and the accumulators for the (M,N) blk_shape
       TiledMma tiled_mma;
-      Tensor mma_acc = make_fragment_like<ElementAccumulator>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape))); // (MMA,MMA_M,MMA_N)
-      clear(mma_acc);
+      Tensor accumulators = make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape))); // (MMA,MMA_M,MMA_N)
+      clear(accumulators);
 
-      int smem_pipe_scale = (smem_pipe_write + size<2>(get<0>(load_inputs))) % CollectiveMainloop_::DispatchPolicy::Stages;
-      smem_pipe_write = (smem_pipe_write == 0) ? (CollectiveMainloop_::DispatchPolicy::Stages - 1) : (smem_pipe_write - 1); // prologue + stage - 1
       // Perform the collective scoped MMA
       collective_mma(
-        mma_acc,
+        accumulators,
         load_inputs,
-        mma_acc,
-        k_tile_iter, k_tile_count,
+        load_inputs_next,
+        accumulators,
         residue_mnk,
         thread_idx,
-        smem_pipe_write,
-        smem_pipe_scale,
+        warp_idx,
+        warp_group_id,
+        smem_pipe_read,
         smem_buf
       );
 
-      load_inputs = collective_mma_next.load_init(problem_shape_MNKL_next, blk_coord_mnkl_next, params.mainloop,
-                                                      offset_m_next, offset_b_next, ptr_A_next, ptr_B_next);
-      k_tile_count = size<2>(get<0>(load_inputs));
-      k_tile_iter = 0;
-      smem_pipe_write = smem_pipe_scale + 1;
-      smem_pipe_write = (smem_pipe_write == CollectiveMainloop_::DispatchPolicy::Stages) ? 0 : smem_pipe_write;
-      collective_mma_next.prologue(load_inputs, k_tile_iter, k_tile_count, thread_idx, smem_pipe_write, tile_valid, smem_buf);
-
-      Tensor accumulators = make_fragment_like<ElementCompute>(mma_acc);
-      collective_mma.dequant(mma_acc, accumulators, thread_idx, smem_pipe_scale, smem_buf);
-
-      // Epilogue and write to gD
-      CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
+      CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.epilogue};
       epilogue(
         problem_shape_MNKL,
         blk_shape,
@@ -949,25 +762,37 @@ public:
         tiled_mma,
         residue_mnk,
         thread_idx,
-        (char*)&shared_storage.tensors.epilogue
+        (char*)&shared_storage.epilogue + warp_group_id * EpilogueSmemStride
       );
-      __syncthreads();
-
-      blk_coord_mnkl = blk_coord_mnkl_next;
-      problem_shape_MNKL = problem_shape_MNKL_next;
 
       if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
         cp_async_wait<0>();
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
+        __ppu_barrier_sync(3 + warp_group_id, MaxThreadsPerBlock);
+        if (thread_idx == 0) {
           atomic_add_release_global(params.signal + curr_group_idx
                   * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + curr_m_coord, 1);
         }
       }
+
+      // get next work tile
+      tile_valid = deep_scheduler.fetch_next_work(m_coord, n_coord);
+      blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
+      M = deep_scheduler.curr_problem_m();
+      problem_shape_MNKL = ProblemShape{M, N, K, L};
+      auto offset_m_temp = deep_scheduler.curr_offset_m();
+      auto expert_id_temp = deep_scheduler.problem_index();
+      auto offset_a_temp = deep_scheduler.curr_offset_a();
+      auto offset_b_temp = deep_scheduler.curr_offset_b(m_coord);
+      const ElementA* ptr_A_temp = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a_temp;
+      const ElementB* ptr_B_temp = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b_temp;
+      load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
+                                            offset_m_temp, expert_id_temp, ptr_A_temp, ptr_B_temp);
+      params_epilogue_local = params.epilogue;
+      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
+      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
+      smem_pipe_read = (smem_pipe_read + 2 * size<2>(gA)) % DispatchPolicy::Stages;
     } // Scheduler work fetch loop
   }
-
 };
 
 } // namespace cutlass::gemm::kernel

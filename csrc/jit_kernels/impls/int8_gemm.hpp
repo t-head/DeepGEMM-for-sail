@@ -27,14 +27,7 @@ namespace deep_gemm {
 
 class INT8GemmCutlass3Runtime final : public LaunchRuntime<INT8GemmCutlass3Runtime> {
 public:
-    using ScaleGranularityShape = cute::Shape<cute::_1, cute::_128, cute::_128>;
-    using ScaleConfig =
-        decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(
-            ScaleGranularityShape{}));
-    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
-    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
     using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
-
     using GemmProblemSize = cute::tuple<int32_t, int32_t, int32_t, int32_t>;
 
     struct MainLoopArguments {
@@ -285,12 +278,12 @@ __global__ void {}(
                            args.launch_info.gemm_type, args.launch_info.kernel_name);
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, configs, args.kernel_params));
     }
 };
 
-class INT8GroupedGemmRuntime final : public LaunchRuntime<INT8GroupedGemmRuntime> {
+class INT8GemmRuntime final : public LaunchRuntime<INT8GemmRuntime> {
 public:
     struct LinearCombinationArgs {
         float alpha = 1.0;                ///< scales accumulators
@@ -451,8 +444,8 @@ __global__ void {}(
                            args.launch_info.kernel_name);
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, configs, args.kernel_params));
     }
 };
 
@@ -460,7 +453,7 @@ using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int
 static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                                      const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                                      const torch::Tensor& out, const int& m, const int& n, const int& k,
-                                     std::optional<ConfigTuple> config = std::nullopt,
+                                     std::optional<ConfigTuple> configs = std::nullopt,
                                      at::cuda::CUDAStream stream = at::cuda::getDefaultCUDAStream()) {
     TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
     if (m == 0) {
@@ -469,8 +462,8 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
     int num_sms = get_num_sms();
 
     ConfigTuple selected_config;
-    if (config.has_value()) {
-        selected_config = *config;
+    if (configs.has_value()) {
+        selected_config = *configs;
     } else {
         selected_config = deep_gemm_int8::get_best_configs(m, n, k, 1, num_sms);
     }
@@ -583,7 +576,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
                    args.launch_args.grid_dim.x);
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n, block_k,
                    warp_m, warp_n, block_k, num_stages);
-            printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
         }
 
     } else {
@@ -607,9 +600,9 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
         // %ld, advance_cluster is %ld, advance_tile is %ld", stride, increment_row, increment_group, increment_cluster,
         // advance_row, advance_group, advance_cluster, advance_tile);
 
-        INT8GroupedGemmRuntime::EpilogueVisitorParams temp;
+        INT8GemmRuntime::EpilogueVisitorParams temp;
         const int threadblock_count = num_sms;
-        INT8GroupedGemmRuntime::GemmKernelParams params = INT8GroupedGemmRuntime::GemmKernelParams{
+        INT8GemmRuntime::GemmKernelParams params = INT8GemmRuntime::GemmKernelParams{
             .problem_visitor = {layout_info, n, k, m, kNumGroups},
             .threadblock_count = threadblock_count,
             .problem_count = kNumGroups,
@@ -630,11 +623,11 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
             .signal = nullptr,
         };
         auto args =
-            INT8GroupedGemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
+            INT8GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
                                                          num_stages, n, k, "DenseGemm", "int8_deep_gemm", false},
                                          .launch_args = {grid, block, SMSIZE},
                                          .kernel_params = params};
-        const auto& code = INT8GroupedGemmRuntime::generate(args);
+        const auto& code = INT8GemmRuntime::generate(args);
         const auto& runtime = compiler->build("int8_deep_gemm", code, block.x, SMSIZE);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
@@ -648,7 +641,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
-        INT8GroupedGemmRuntime::launch(runtime, args);
+        INT8GemmRuntime::launch(runtime, args);
 
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
@@ -664,14 +657,14 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
                    args.launch_args.grid_dim.x);
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n, block_k,
                    warp_m, warp_n, block_k, num_stages);
-            printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
         }
     }
 }
 
 static void int8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
                       const torch::Tensor& rhs_scales, const torch::Tensor& out, const int& m, const int& n,
-                      const int& k, std::optional<ConfigTuple> config = std::nullopt) {
-    gemm_a8w8_per_channel_nt(lhs, lhs_scales, rhs, rhs_scales, out, m, n, k, config);
+                      const int& k, std::optional<ConfigTuple> configs = std::nullopt) {
+    gemm_a8w8_per_channel_nt(lhs, lhs_scales, rhs, rhs_scales, out, m, n, k, configs);
 }
 } // namespace deep_gemm

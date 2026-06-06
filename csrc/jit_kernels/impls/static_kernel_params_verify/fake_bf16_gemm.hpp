@@ -90,11 +90,13 @@ static size_t get_bf16_tample_params_size() {
   >;
 
   // Epilogue
-  using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogue<
+  static constexpr bool IsAligedN = SHAPE_N % BLOCK_N == 0 ? true : false;
+  using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
       cutlass::detail::TagToStrideA_t<LayoutC>,
       cutlass::detail::TagToStrideA_t<LayoutC>,
-      cutlass::epilogue::thread::LinearCombination<ElementC, 8, float, float>,
-      cutlass::gemm::EpilogueDefault>;
+      cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
+      cutlass::gemm::EpilogueDefault,
+      IsAligedN>;
 
   static constexpr int AlignmentC = 16 / sizeof(ElementC);
   using DefaultOperation = cutlass::epilogue::fusion::LinearCombination<ElementD, ElementCompute>;

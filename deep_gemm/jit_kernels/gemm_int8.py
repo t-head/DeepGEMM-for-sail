@@ -575,31 +575,6 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
 
-    if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16 or best_block_m == 32:
-        stage_candidates = (3, 2)
-    if best_block_m == 64 and best_block_n == 128:
-        stage_candidates = (3, 2)
-    if best_block_m > 128 and best_block_n == 256:
-        stage_candidates = (4,)
-
-    best_occ = 0
-    for num_stages in stage_candidates:
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1)
-        # print(f"num_stages:{num_stages}, best_smem_config:{best_smem_config}")
-        if best_smem_config[0] <= ppu_capacity:
-            occ = ppu_capacity // best_smem_config[0]
-            if k < 512 or (best_block_m > 64 and best_block_n >= 64) and occ >= best_occ:
-                # compute block use higer occ rather than large stage
-                best_num_stages = num_stages
-                best_occ = occ
-            else:
-                best_num_stages = num_stages
-                break
-
-    # best_num_stages = 2
-    assert best_smem_config is not None
-    assert best_num_stages is not None
-
     # Recompute the minimal number of SMs required
     # NOTES: less L2 cache usage and less GPU frequency drop
     num_waves = get_num_waves(best_block_m, best_block_n)
@@ -634,6 +609,31 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 64, 256, 16, 16, 4)
     # print(best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages)
+
+    if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16 or best_block_m == 32:
+        stage_candidates = (3, 2)
+    if best_block_m == 64 and best_block_n == 128:
+        stage_candidates = (3, 2)
+    if best_block_m > 128 and best_block_n == 256:
+        stage_candidates = (4,)
+
+    best_occ = 0
+    for num_stages in stage_candidates:
+        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1)
+        # print(f"num_stages:{num_stages}, best_smem_config:{best_smem_config}")
+        if best_smem_config[0] <= ppu_capacity:
+            occ = ppu_capacity // best_smem_config[0]
+            if k < 512 or (best_block_m > 64 and best_block_n >= 64) and occ >= best_occ:
+                # compute block use higer occ rather than large stage
+                best_num_stages = num_stages
+                best_occ = occ
+            else:
+                best_num_stages = num_stages
+                break
+
+    # best_num_stages = 2
+    assert best_smem_config is not None
+    assert best_num_stages is not None
 
     return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 

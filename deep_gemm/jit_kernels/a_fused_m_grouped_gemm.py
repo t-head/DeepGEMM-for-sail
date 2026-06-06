@@ -217,6 +217,11 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_fused(lhs: Tuple[torch.Tensor],
         "so that 8 bfloat16 elements can be loaded with 128b aligned vectorized memory access."
     )
 
+    assert k % 8 == 0, (
+        "K must be a multiple of 8, "
+        "so that 8 bfloat16 elements can be loaded with 128b aligned vectorized memory access."
+    )
+
     topk = int(m_sum / num_token)
 
     # Do nothing if `m_sum` is zero
@@ -238,7 +243,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_fused(lhs: Tuple[torch.Tensor],
 
     kernel_type = 'Default'
     runtime = jit_tuner.compile_and_tune(
-        name='fusedMoeGemm_bf16_bf16_bf16_nt',
+        name='fusedmoe_gemm_bf16_bf16_bf16_nt',
         keys={'N': n, 'K': k, 'NUM_GROUPS': num_groups,
                 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                 'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages,
@@ -322,7 +327,7 @@ def m_grouped_gemm_perchannel_nt_fused(lhs_: Tuple[torch.Tensor],
     SrcT = "__nv_fp8_e4m3" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     kernel_type = 'Default'
     runtime = jit_tuner.compile_and_tune(
-        name='fusedMoeGemm_a8w8_nt_' + SrcT,
+        name='fusedmoe_gemm_a8w8_nt_' + SrcT,
         keys={'SrcT' : SrcT, 'N': n, 'K': k, 'NUM_GROUPS': num_groups,
                 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                 'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages,
@@ -389,6 +394,10 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
      # Auto-tuning with compilation
     global includes_fusedmoe_gemm_with_blkwise_quant, template_fusedmoe_gemm_with_blkwise_quant
     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+    # block_m, block_n, block_k, warp_m, warp_n, num_stages = 64, 128, 128, 32, 32, 2
+    assert n % 128 == 0, f"n ({n}) must be divisible by 128)"
+    assert k % 128 == 0, f"k ({k}) must be divisible by 128)"
+    assert block_k == 128, "currently only support block_k = 128."
 
     # print("m_rows:", m_rows.shape, m_rows)
     # print(expert_ids_and_cumsum.shape, expert_ids_and_cumsum)
@@ -408,7 +417,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
 
     kernel_type = 'Default'
     runtime = jit_tuner.compile_and_tune(
-        name='fusedMoeGemm_fp8_fp8_bf16_nt',
+        name='fusedmoe_gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'NUM_GROUPS': num_groups,
                 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                 'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages,

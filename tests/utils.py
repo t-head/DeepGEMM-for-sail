@@ -1096,6 +1096,10 @@ def test_m_grouped_gemm_masked(args) -> None:
 
     num_groups, m, n, k, d, distribution = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
+
+    if isinstance(enable_sbo_overlap, str):
+        enable_sbo_overlap = enable_sbo_overlap.lower() == 'true'
+
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     group_size = args.get('group_size', 32)
     if use_ppu:

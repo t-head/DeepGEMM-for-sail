@@ -37,15 +37,15 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(const torch::Tensor& 
                                                            const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                                                            const torch::Tensor& out, const torch::Tensor& m_indices,
                                                            const int& m, const int& n, const int& k,
-                                                           const int& num_groups, std::optional<ConfigTuple> config) {
+                                                           const int& num_groups, std::optional<ConfigTuple> configs) {
     auto lhs_scales_aligned = get_col_major_tma_aligned_tensor(lhs_scales);
     TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
 
     int num_sms = get_num_sms();
 
     ConfigTuple selected_config;
-    if (config.has_value()) {
-        selected_config = *config;
+    if (configs.has_value()) {
+        selected_config = *configs;
     } else {
         selected_config = deep_gemm_fp8_common::get_best_configs(m, n, k, num_groups, num_sms, true);
     }
@@ -147,25 +147,23 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(const torch::Tensor& 
                args.launch_args.grid_dim.x);
         printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n,
                block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-        printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+        printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
     }
 }
 
-static void m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
-                                                       const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
-                                                       const torch::Tensor& out, const torch::Tensor& masked_m,
-                                                       const int& m, const int& n, const int& k, const int& num_groups,
-                                                       const int& expected_m, std::optional<ConfigTuple> config,
-                                                       int max_block_n, bool enable_sbo_overlap,
-                                                       const torch::Tensor& signal) {
+static std::pair<int, int> m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(
+    const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
+    const torch::Tensor& rhs_scales, const torch::Tensor& out, const torch::Tensor& masked_m, const int& m,
+    const int& n, const int& k, const int& num_groups, const int& expected_m, std::optional<ConfigTuple> configs,
+    int max_block_n, bool enable_sbo_overlap, const torch::Tensor& signal) {
     auto lhs_scales_aligned = get_col_major_tma_aligned_tensor(lhs_scales);
     TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
 
     int num_sms = get_num_sms();
 
     ConfigTuple selected_config;
-    if (config.has_value()) {
-        selected_config = *config;
+    if (configs.has_value()) {
+        selected_config = *configs;
     } else {
         selected_config =
             deep_gemm_fp8_common::get_best_configs(expected_m, n, k, num_groups, num_sms, false, true, max_block_n);
@@ -200,6 +198,8 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(const torch::Tensor& lhs,
     static constexpr GemmType kGemmType = GemmType::GroupedMasked;
 
     int32_t* grouped_layout = reinterpret_cast<int32_t*>(masked_m.data_ptr<int32_t>());
+    int32_t* signal_ptr = reinterpret_cast<int32_t*>(signal.data_ptr<int32_t>());
+
     cutlass::float_e4m3_t* converted_input_b =
         reinterpret_cast<cutlass::float_e4m3_t*>(rhs.data_ptr<at::Float8_e4m3fn>());
     cutlass::float_e4m3_t* converted_input_a =
@@ -227,7 +227,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(const torch::Tensor& lhs,
             },
         .hw_info = hw_info,
         .scheduler = {(uint32_t)m, grouped_layout},
-        .signal = nullptr};
+        .signal = signal_ptr};
 
     FP8GemmRuntime::GemmKernelParams params = FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
@@ -269,8 +269,9 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(const torch::Tensor& lhs,
                args.launch_args.grid_dim.x);
         printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n,
                block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-        printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+        printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
     }
+    return std::make_pair(block_m, ceil_div(n, block_n));
 }
 
 static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
@@ -278,13 +279,13 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, 
                                                       const torch::Tensor& out, const torch::Tensor& m_indices,
                                                       const int& m, const int& n, const int& k, const int& num_groups,
                                                       std::optional<const torch::Tensor> m_rows,
-                                                      std::optional<ConfigTuple> config) {
+                                                      std::optional<ConfigTuple> configs) {
     int num_sms = get_num_sms();
     int expected_m = ceil_div(m, num_groups);
 
     ConfigTuple cfg;
-    if (config.has_value()) {
-        cfg = *config;
+    if (configs.has_value()) {
+        cfg = *configs;
     } else {
         cfg = deep_gemm_fp8_common::get_best_configs(expected_m, n, k, num_groups, num_sms);
     }
@@ -414,7 +415,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, 
                args.launch_args.grid_dim.x);
         printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n,
                block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-        printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+        printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
     }
 }
 

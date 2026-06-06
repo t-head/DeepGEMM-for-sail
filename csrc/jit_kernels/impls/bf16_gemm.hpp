@@ -215,11 +215,13 @@ using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
 >;
 
 // Epilogue
-using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogue<
+static constexpr bool IsAligedN = SHAPE_N % BLOCK_N == 0 ? true : false;
+using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
     cutlass::detail::TagToStrideA_t<LayoutC>,
     cutlass::detail::TagToStrideA_t<LayoutC>,
-    cutlass::epilogue::thread::LinearCombination<ElementC, 8, float, float>,
-    cutlass::gemm::EpilogueDefault>;
+    cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
+    cutlass::gemm::EpilogueDefault,
+    IsAligedN>;
 
 static constexpr int AlignmentC = 16 / sizeof(ElementC);
 using DefaultOperation = cutlass::epilogue::fusion::LinearCombination<ElementD, ElementCompute>;
@@ -267,8 +269,8 @@ __global__ void {}(
             args.launch_info.kKernelType, args.launch_info.kEnableSboOverlap, args.launch_info.kernel_name);
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, configs, args.kernel_params));
     }
 };
 
@@ -400,37 +402,41 @@ __global__ void {}(
             args.launch_info.kernel_name);
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, configs, args.kernel_params));
     }
 };
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out, const int& m,
-                      const int& n, const int& k, std::optional<ConfigTuple> config = std::nullopt) {
+                      const int& n, const int& k, std::optional<ConfigTuple> configs = std::nullopt) {
     int num_sms = get_num_sms();
     cudaDeviceProp device_props;
     cudaGetDeviceProperties(&device_props, 0);
     std::vector<int> shape = {m, n, k};
     static constexpr GemmType kGemmType = GemmType::DenseGemm;
 
-    bool all_ok = true;
-    for (int64_t a : shape) {
-        if (!(a >= 4096 && (a % 64 == 0))) {
-            all_ok = false;
-            break;
-        }
-    }
-
-    std::string dev_name(device_props.name);
-    bool zw_ok = (dev_name.find("ZW810E") != std::string::npos) || (dev_name.find("ZW810") != std::string::npos);
-
     using Config = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 
     Config cfg;
-    if (all_ok && zw_ok) {
-        cfg = get_gemm_best_configs_v2(shape, 2, num_sms);
+    if (configs.has_value()) {
+        cfg = *configs;
     } else {
-        cfg = deep_gemm_bf16_common::get_best_configs(m, n, k, 1, num_sms);
+        bool shape_large_aligned = true;
+        for (int64_t a : shape) {
+            if (!(a >= 4096 && (a % 64 == 0))) {
+                shape_large_aligned = false;
+                break;
+            }
+        }
+
+        std::string dev_name(device_props.name);
+        bool is_ppu0010_device = (dev_name.find("ZW810E") != std::string::npos) || (dev_name.find("ZW810") != std::string::npos);
+
+        if (shape_large_aligned && is_ppu0010_device) {
+            cfg = get_gemm_best_configs_v2(shape, 2, num_sms);
+        } else {
+            cfg = deep_gemm_bf16_common::get_best_configs(m, n, k, 1, num_sms);
+        }
     }
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
     auto extra_info = get_extra_info();
@@ -515,7 +521,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
                    args.launch_args.grid_dim.x);
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n, block_k,
                    warp_m, warp_n, block_k, num_stages);
-            printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
         }
     } else {
         int64_t stride, increment_row, increment_group, increment_cluster;
@@ -592,7 +598,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
                    args.launch_args.grid_dim.x);
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n, block_k,
                    warp_m, warp_n, block_k, num_stages);
-            printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
         }
     }
 }

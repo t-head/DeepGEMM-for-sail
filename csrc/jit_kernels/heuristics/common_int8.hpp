@@ -7,6 +7,7 @@
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
+#include "gemm_int8_lut.hpp"
 using namespace deep_gemm;
 namespace deep_gemm_int8 {
 
@@ -597,6 +598,17 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms, bool i
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_grouped_contiguous = false,
                  bool is_grouped_masked = false, int max_block_n = 256) {
+    auto lut_result = deep_gemm_int8_lut::get_best_configs_from_lut(m, n, k);
+    if (num_groups == 1 && lut_result.has_value()) {
+        int best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages;
+        std::tie(best_block_m, best_block_n, best_block_k,
+                 best_warp_m, best_warp_n, best_stages) = lut_result.value();
+        auto best_smem_config = get_smem_config(best_stages, k,
+                                                best_block_m, best_block_n,
+                                                best_block_k, 1);
+        return std::make_tuple(num_sms, best_block_m, best_block_n, best_block_k,
+                               best_warp_m, best_warp_n, best_stages, best_smem_config);
+    }
     if (is_ppu1v5_device()) {
         return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, is_grouped_contiguous, is_grouped_masked,
                                        max_block_n);
@@ -794,36 +806,6 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_group
     if (2 <= max_stages)
         stage_candidates.push_back(2);
 
-    if (stage_candidates.empty() || (128 % best_block_n != 0 && 128 / gcd(128, best_block_n) <= 4) ||
-        best_block_m == 16 || best_block_m == 32) {
-        stage_candidates = {3, 2};
-    }
-
-    if (best_block_m == 64 && best_block_n == 128) {
-        stage_candidates = {3, 2};
-    }
-
-    if (best_block_m > 128 && best_block_n == 256) {
-        stage_candidates = {4};
-    }
-
-    int best_occ = 0;
-    for (int num_stages : stage_candidates) {
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1);
-        if (std::get<0>(best_smem_config) <= ppu_capacity) {
-            int occ = ppu_capacity / std::get<0>(best_smem_config);
-            if (k < 512 || ((best_block_m > 64 && best_block_n >= 64) && occ >= best_occ)) {
-                best_num_stages = num_stages;
-                best_occ = occ;
-            } else {
-                best_num_stages = num_stages;
-                break;
-            }
-        }
-    }
-
-    assert(best_num_stages != 0);
-
     // Recompute the minimal number of SMs required
     // NOTES: less L2 cache usage and less GPU frequency drop
     int num_waves = get_num_waves(best_block_m, best_block_n);
@@ -856,6 +838,35 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_group
         warp_n = best_block_n / 4;
     }
 
+    if (stage_candidates.empty() || (128 % best_block_n != 0 && 128 / gcd(128, best_block_n) <= 4) ||
+        best_block_m == 16 || best_block_m == 32) {
+        stage_candidates = {3, 2};
+    }
+
+    if (best_block_m == 64 && best_block_n == 128) {
+        stage_candidates = {3, 2};
+    }
+
+    if (best_block_m > 128 && best_block_n == 256) {
+        stage_candidates = {4};
+    }
+
+    int best_occ = 0;
+    for (int num_stages : stage_candidates) {
+        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1);
+        if (std::get<0>(best_smem_config) <= ppu_capacity) {
+            int occ = ppu_capacity / std::get<0>(best_smem_config);
+            if (k < 512 || ((best_block_m > 64 && best_block_n >= 64) && occ >= best_occ)) {
+                best_num_stages = num_stages;
+                best_occ = occ;
+            } else {
+                best_num_stages = num_stages;
+                break;
+            }
+        }
+    }
+
+    assert(best_num_stages != 0);
     return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n,
                            best_num_stages, best_smem_config);
 }
