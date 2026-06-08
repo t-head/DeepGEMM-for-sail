@@ -1,0 +1,97 @@
+
+strategy:
+  fast-fail: '${{git.branch != "ppu_dev"}}'
+
+name: "deepgemm coverity_scan"
+params:
+    <<: !include version_matrix.yaml
+
+jobs:
+  build_and_test_job:
+    image: "reg.docker.alibaba-inc.com/ai-tmp/pytorch:ubuntu24.04-py312.06"
+    timeout: 12h
+    continue-on-error: false
+    matrix:
+      params:
+        - name: cuda_version
+          value: ${{params.cuda_versions}}
+        - name: torch_version
+          value: ${{params.torch_versions}}
+        - name: sdk_version
+          value: ${{params.sdk_versions}}
+    envs:
+      os_version: 'ubuntu2404'
+      python_version: 'py312'
+      cuda_version: ${{matrix.cuda_version}}
+      pytorch_version: ${{matrix.torch_version}}
+      cuda_sdk: 'PPU_SDK_cuda-${{matrix.cuda_version}}-ubuntu2404.tar.gz'
+      torch_sdk: 'ppu_sdk_cuda${{matrix.cuda_version}}-pytorch${{matrix.torch_version}}-ubuntu2404-py312.tar.gz'
+      pkg_name: 'deepgemm_cuda${{matrix.cuda_version}}-pytorch${{matrix.torch_version}}-ubuntu2404-py312.tar.gz'
+    steps:
+      - run: echo "11.162.25.191 art-pub.eng.t-head.cn" >> /etc/hosts
+      - uses: setup-github-proxy
+      - run: |
+          git clone https://github.com/fmtlib/fmt.git
+      - uses: checkout
+        inputs:
+          enable-cache: true
+          submodules: false
+          submodule-fetch-depth: 0
+          path: '/aoneci/runner/work/source/DeepGemm'
+      - uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:PPU-Libraries/cutlass3.git'
+          ref: 'v3.6.0_ppu_dev'
+          path: '/aoneci/runner/work/source/cutlass3'
+          ssh-key: ${{secrets.private_ssh_key}}
+      - uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:PPU-Libraries/cutlass.git'
+          ref: 'ppu_dev'
+          path: '/aoneci/runner/work/source/cutlass'
+          ssh-key: ${{secrets.private_ssh_key}}
+      - uses: ptg-sdk-setup  # 会下载并解压到$AONE_CI_WORKSPACE/opt/PPU_SDK
+        inputs:
+          cuda_version: ${{matrix.cuda_version}}
+          sdk_version: ${{matrix.sdk_version}}
+          type: ${{params.sdk_type}}
+          sdk_daily_version: ${{params.sdk_daily_version}}
+          os: "ubuntu2404"
+      - uses: ptg-torch-setup 
+        inputs:
+          version: ${{matrix.torch_version}}
+          cuda_version: ${{matrix.cuda_version}}
+          sdk_version: ${{matrix.sdk_version}}
+          type: ${{params.sdk_type}}
+          torch_daily_version: ${{params.torch_daily_versions}}
+          os: "ubuntu2404"
+          python: "cp312"
+      - id: build
+        name: "Build with coverity"
+        timeout: 5h
+        run: |
+          eecho "Setup coverity---------------------"
+          cp /aoneci/runner/work/source/DeepGemm/.aoneci/stc_scan/coverity_scan.sh /opt/coverity_scan.sh
+          wget --no-check-certificate -q -O /opt/coverity-linux64-2024.06.zip https://art-pub.eng.t-head.cn:443/artifactory/example-repo-local/coverity-linux64-2024.06.zip
+          unzip -q -o /opt/coverity-linux64-2024.06.zip -d /opt/
+          apt update && apt install -y --no-install-recommends uuid-runtime
+          echo "Starting build with coverity---------------------"
+          export source_home=$AONE_CI_SOURCE
+          export build_output=$AONE_CI_SOURCE/output
+          mkdir -p $build_output
+          source /opt/coverity_scan.sh /opt/coverity-linux64-2024.06 $AONE_CI_SOURCE/DeepGemm /aoneci/runner/work/source/DeepGemm/.aoneci/scripts/aoneci_build.sh
+      - uses: upload-oss
+        name: "Upload coverity report"
+        inputs:
+          path: idir.tar.gz
+      - uses: stc-scan@0.0.1
+        inputs:
+          app_key: ${{secrets.top_app_key}}
+          app_token: ${{secrets.top_app_token}}
+          git_branch: ${{git.commitId}}
+          git_repo: git@gitlab.alibaba-inc.com:ppu_open_source/DeepGemm.git
+          mode: compile
+          report_url: https://aone-ci-reports.alibaba-inc.com/public/${{pipeline.inst.id}}/idir.tar.gz
+      - uses: upload-oss
+        inputs:
+          path: stc_report.json

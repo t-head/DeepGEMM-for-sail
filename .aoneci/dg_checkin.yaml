@@ -1,0 +1,105 @@
+triggers:
+  merge_request:
+    target-branches:
+      - 'ppu_dev'
+    types:
+      - 'opened'
+
+strategy:
+  fast-fail: '${{git.branch != "ppu_dev"}}'
+  concurrency:
+    group: ci-${{git.merge_request.id}}
+    cancel-in-progress: true
+
+name: "repo: deepgemm,master; test: dg cases"
+params:
+    <<: !include version_matrix.yaml
+
+jobs:
+  build_and_test_job:
+    image: "reg.docker.alibaba-inc.com/ai-tmp/pytorch:ubuntu24.04-py312.06"
+    timeout: 12h
+    continue-on-error: false
+    matrix:
+      params:
+        - name: cuda_version
+          value: ${{params.cuda_versions}}
+        - name: torch_version
+          value: ${{params.torch_versions}}
+        - name: sdk_version
+          value: ${{params.sdk_versions}}
+    envs:
+      os_version: 'ubuntu2404'
+      python_version: 'py312'
+      cuda_version: ${{matrix.cuda_version}}
+      pytorch_version: ${{matrix.torch_version}}
+      cuda_sdk: 'PPU_SDK_cuda-${{matrix.cuda_version}}-ubuntu2404.tar.gz'
+      torch_sdk: 'ppu_sdk_cuda${{matrix.cuda_version}}-pytorch${{matrix.torch_version}}-ubuntu2404-py312.tar.gz'
+      pkg_name: 'deepgemm_cuda${{matrix.cuda_version}}-pytorch${{matrix.torch_version}}-ubuntu2404-py312.tar.gz'
+    steps:
+      - run: echo "11.162.25.191 art-pub.eng.t-head.cn" >> /etc/hosts
+      - uses: setup-github-proxy
+      - run: |
+          rm -rf fmt && git clone https://github.com/fmtlib/fmt.git && cd fmt && git checkout	7ad8004d575a7eb5aed7b5911c1ae298f7258052 && cd ..
+      - uses: checkout
+        inputs:
+          enable-cache: false
+          submodules: false
+          submodule-fetch-depth: 0
+          path: '/aoneci/runner/work/source/DeepGemm'
+      - uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:PPU-Libraries/cutlass3.git'
+          ref: 'v3.6.0_opensource_2v1_dev'
+          path: '/aoneci/runner/work/source/cutlass3'
+          ssh-key: ${{secrets.private_ssh_key}}
+      - uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:PPU-Libraries/cutlass.git'
+          ref: 'ppu_dev'
+          path: '/aoneci/runner/work/source/cutlass'
+          ssh-key: ${{secrets.private_ssh_key}}
+      - uses: ptg-sdk-setup  # 会下载并解压到$AONE_CI_WORKSPACE/opt/PPU_SDK
+        inputs:
+          cuda_version: ${{matrix.cuda_version}}
+          sdk_version: ${{matrix.sdk_version}}
+          type: ${{params.sdk_type}}
+          product: ${{params.product}}
+          sdk_daily_version: ${{params.sdk_daily_version}}
+          os: "ubuntu2404"
+      - uses: ptg-torch-setup 
+        inputs:
+          version: ${{matrix.torch_version}}
+          cuda_version: ${{matrix.cuda_version}}
+          sdk_version: ${{matrix.sdk_version}}
+          product: ${{params.product}}
+          type: ${{params.sdk_type}}
+          torch_daily_version: ${{params.torch_daily_versions}}
+          sdk_daily_version: ${{params.sdk_daily_version}}
+          os: "ubuntu2404"
+          python: "cp312"
+      - id: build
+        name: deepgemm_build
+        run: source /aoneci/runner/work/source/DeepGemm/.aoneci/scripts/aoneci_build.sh
+      - id: package
+        run: |
+          echo 'Start package deepgemm'
+          echo $(pwd)
+          tar -zcf output.tar.gz -C output .
+          mv output.tar.gz deepgemm_${{matrix.cuda_version}}.tar.gz
+      - uses: upload-oss
+        inputs:
+          path: deepgemm_${{matrix.cuda_version}}.tar.gz
+          retention-days: 7
+      - id: artifact
+        run: |
+          echo ${{steps.upload-oss.outputs.result}}
+          echo ${{ #array(steps.upload-oss.outputs.result)[0].remote }} > ${{outputs.oss_url.path}}
+      - uses: ptg-ai-test
+        inputs: 
+          ppu: 1
+          run_image: "reg.docker.alibaba-inc.com/ai-tmp/pytorch:ubuntu24.04-py312.06"
+          labels: OAM-810E
+          image_url: ${{steps.artifact.outputs.oss_url}}
+          timeout: 7200
+          cmd: source ./ci_run.sh

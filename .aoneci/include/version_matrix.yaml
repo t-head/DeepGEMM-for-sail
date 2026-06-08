@@ -1,0 +1,55 @@
+# deepgemm CI 多版本组合矩阵参数
+# 抽象出 CUDA * Torch * SDK 多版本组合的可调参数
+# 由 checkin_test.yaml 通过 !include 引用,实现多流水线共享同一矩阵定义
+
+product:
+  description: '产品, 默认ppu'
+  required: false
+  type: string
+  default: 'ppu'
+sdk_type:
+  description: 'sdk类型, 默认release'
+  required: false
+  type: string
+  options: ['release', 'daily']
+  default: 'daily'
+cuda_versions:
+  description: '多个cuda版本(仅作为可选项展示,实际矩阵以 version_combos 为准）'
+  required: false
+  type: array
+  options: ['12.6.0', '12.8.0', '12.9.0', '13.0.0']
+  default: ['13.0.0']
+torch_versions:
+  description: '多个torch版本(仅作为可选项展示,实际矩阵以 version_combos 为准）'
+  required: false
+  type: array
+  options: ['2.6.0', '2.8.0', '2.9.0', '2.10.0']
+  default: ['2.9.0']
+sdk_versions:
+  description: '多个sdk版本(仅作为可选项展示,实际矩阵以 version_combos 为准）'
+  required: false
+  type: array
+  options: ["1.6.0", "1.6.1", "1.6.1_hotfix", "1.6.1_hotfix2", "1.7.0", "1.7.0_hotfix1", "1.7.0_hotfix2", "2.0.0_preview", "2.0.0", "2.1.0_preview", "2.1.0"]
+  default: ['2.1.0']
+version_combos:
+  description: 'CUDA * Torch * SDK 固定组合矩阵;每条对应一次完整编译测试。aone-ci 渲染为对象字符串,acbv_ci.yaml parse_combo 步骤负责解析'
+  required: false
+  type: array
+  default:
+    - cuda_version: '12.8.0'
+      torch_version: '2.8.0'
+      sdk_version: '2.1.0'
+    - cuda_version: '13.0.0'
+      torch_version: '2.9.0'
+      sdk_version: '2.1.0'
+sdk_daily_version:
+  description: 'sdk版本, 默认latest'
+  required: false
+  type: string
+  default: 'latest'
+torch_daily_versions:
+  description: 'torch daily版本号'
+  required: false
+  type: string
+  default: 'latest'
+
