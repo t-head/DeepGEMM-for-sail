@@ -1,12 +1,12 @@
 [submodule "third-party/cutlass"]
 	path = third-party/cutlass
-	url = ssh://ai-gerrit.eng.t-head.cn:29418/cutlass
-	branch = ppu_dev
+	url = git@gitlab.alibaba-inc.com:PPU-Libraries/cutlass.git
+	branch = gpgpu_2v1_opensource
 
 [submodule "third-party/cutlass3"]
 	path = third-party/cutlass3
-	url = ssh://ai-gerrit.eng.t-head.cn:29418/AI/SW/Libraries/cutlass3
-	branch = v3.6.0_ppu_dev
+	url = git@gitlab.alibaba-inc.com:PPU-Libraries/cutlass3.git
+	branch = v3.6.0_opensource_2v1_dev
 [submodule "third-party/fmt"]
 	path = third-party/fmt
 	url = https://github.com/fmtlib/fmt.git
