@@ -35,7 +35,6 @@ static dtype_t get_env(const std::string& name, const dtype_t& default_value = d
 static std::tuple<int, std::string> call_external_command(std::string command) {
     command = command + " 2>&1";
     const auto& deleter = [](FILE* f) { if (f) pclose(f); };
-    printf("command: %s\n", command.c_str());
     std::unique_ptr<FILE, decltype(deleter)> pipe(popen(command.c_str(), "r"), deleter);
     DG_HOST_ASSERT(pipe != nullptr);
 
