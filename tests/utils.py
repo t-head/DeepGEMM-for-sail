@@ -746,7 +746,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         # metrics = devices.get(dev, [])
         # metrics_string = ', '.join(metrics) if metrics else ""
         current_file_path = os.path.abspath(__file__)
-        pattern = r"data_type:(bf16|int8|fp8|tf32)"
+        pattern = r"data_type:(bf16|int8|fp8|tf32|fp4)"
         dtype = re.search(pattern, case).groups()[0]
         script = f"{os.path.dirname(current_file_path)}/run_deep_gemm.py"
         if mode == "full":
