@@ -11,7 +11,8 @@ from . import deep_gemm_cpp
 from .jit_kernels import (
     gemm_fp4_fp4_bf16_nt,
     tf32_hc_prenorm_gemm,
-    gemm_fp8_fp8_bf16_nt,
+    # gemm_fp8_fp8_bf16_nt,
+    gemm_int8_int8_bf16_nt,
     m_grouped_gemm_fp4_fp4_bf16_nt_masked,
     m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
     m_grouped_gemm_w4a16_masked,
@@ -57,8 +58,8 @@ from .jit import set_compile_mode, get_compile_mode
 
 from .deep_gemm_cpp import (
     gemm_bf16_bf16_bf16_nt,
-    # gemm_fp8_fp8_bf16_nt,
-    gemm_int8_int8_bf16_nt,
+    gemm_fp8_fp8_bf16_nt,
+    # gemm_int8_int8_bf16_nt,
     m_grouped_gemm_bf16_bf16_bf16_nt_masked,
     m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
     m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
@@ -89,7 +90,7 @@ if should_init_deep_gemm_cpp:
         # m_grouped_gemm_fp8_fp8_bf16_nt_masked,
         # m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
         # fp8_gemm_nt_skip_head_mid,
-        gemm_fp8_fp8_bf16_nt,
+        gemm_int8_int8_bf16_nt,
         m_grouped_gemm_fp4_fp4_bf16_nt_masked,
         m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
         gemm_fp4_fp4_bf16_nt,
