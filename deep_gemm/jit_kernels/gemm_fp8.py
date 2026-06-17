@@ -445,7 +445,7 @@ def gemm_fp8_fp8_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
     if lhs_scales.shape == (m, 1) and rhs_scales.shape == (n, 1):
         return gemm_a8w8_per_channel_nt(lhs_, rhs_, out, configs)
 
-    assert k % 128 == 0
+    # assert k % 128 == 0
 
     # Type and shape checks
     assert m == m_ and n == n_ and k == k_

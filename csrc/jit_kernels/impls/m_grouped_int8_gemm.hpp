@@ -348,7 +348,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout,
+            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, expected_m, grouped_layout,
                                       at::cuda::getCurrentCUDAStream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
@@ -617,7 +617,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout,
+            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, expected_m, grouped_layout,
                                       at::cuda::getCurrentCUDAStream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
@@ -664,7 +664,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout,
+            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, expected_m, grouped_layout,
                                       at::cuda::getCurrentCUDAStream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
@@ -795,8 +795,8 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         DgProfParam dg_prof_params;
         at::cuda::CUDAStream stream = at::cuda::getDefaultCUDAStream();
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(GemmType::GroupedNoPad, true, std::string("int8"), num_groups, m, n, k, 1,
-                                      layout_info, stream);
+            dg_prof_params.set_params(GemmType::GroupedNoPad, true, std::string("int8"), num_groups, m, n, k, expected_m,
+                                      m_rows->data_ptr<int32_t>(), stream);
         }
         cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
         auto gemmv_args = GemvRuntime::GemvtArgs{
@@ -1038,7 +1038,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, layout_info,
+            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, expected_m, m_rows_tensor.data_ptr<int32_t>(),
                                       at::cuda::getCurrentCUDAStream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
@@ -1118,7 +1118,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("int8"), kNumGroups, m, n, k, expected_m,
-                                      layout_info, at::cuda::getCurrentCUDAStream());
+                                      m_rows_tensor.data_ptr<int32_t>(), at::cuda::getCurrentCUDAStream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 

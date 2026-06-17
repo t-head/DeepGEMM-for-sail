@@ -213,7 +213,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m, layout_info,
+        dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m, m_rows_tensor.data_ptr<int32_t>(),
                                   at::cuda::getCurrentCUDAStream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);

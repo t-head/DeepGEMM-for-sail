@@ -17,8 +17,7 @@ DeepGEMM for PPU is a version based on [DeepGEMM](https://github.com/deepseek-ai
 
 ```bash
 # Submodule must be cloned recursively
-git clone --recursive git@gitlab.alibaba-inc.com:ppu_open_source/DeepGemm.git
-
+git clone --recursive git@gitlab.alibaba-inc.com:PPU-Libraries/DeepGemm.git
 # Make symbolic links for third-party (CUTLASS and CuTe) include directories
 python setup.py develop
 

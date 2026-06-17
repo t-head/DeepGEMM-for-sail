@@ -128,7 +128,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(const torch::Tensor& 
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, 0, grouped_layout, stream);
+        dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, expected_m, grouped_layout, stream);
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -248,7 +248,7 @@ static std::pair<int, int> m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, 0, grouped_layout, stream);
+        dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, expected_m, grouped_layout, stream);
     }
 
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
@@ -280,6 +280,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, 
                                                       const int& m, const int& n, const int& k, const int& num_groups,
                                                       std::optional<const torch::Tensor> m_rows,
                                                       std::optional<ConfigTuple> configs) {
+    auto lhs_scales_aligned = get_col_major_tma_aligned_tensor(lhs_scales);
     int num_sms = get_num_sms();
     int expected_m = ceil_div(m, num_groups);
 
@@ -319,7 +320,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, 
     cutlass::float_e4m3_t* input_b = reinterpret_cast<cutlass::float_e4m3_t*>(rhs.data_ptr<at::Float8_e4m3fn>());
     cutlass::float_e4m3_t* input_a = reinterpret_cast<cutlass::float_e4m3_t*>(lhs.data_ptr<at::Float8_e4m3fn>());
     cutlass::bfloat16_t* output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
-    float* scales_a_ptr = lhs_scales.data_ptr<float>();
+    float* scales_a_ptr = lhs_scales_aligned.data_ptr<float>();
     float* scales_b_ptr = rhs_scales.data_ptr<float>();
 
     cutlass::KernelHardwareInfo hw_info;
@@ -394,7 +395,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, 
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, expected_m, layout_info,
+        dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, expected_m, m_rows_tensor.data_ptr<int32_t>(),
                                   at::cuda::getCurrentCUDAStream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);

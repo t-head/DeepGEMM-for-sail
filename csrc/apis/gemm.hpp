@@ -71,7 +71,7 @@ void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pa
     if ((lhs_scales.sizes() == std::vector<int64_t>{m, 1}) && (rhs_scales.sizes() == std::vector<int64_t>{n, 1})) {
         return gemm_int8_int8_bf16_nt(a, b, d, configs);
     }
-    DG_HOST_ASSERT(k % 128 == 0);
+    // DG_HOST_ASSERT(k % 128 == 0);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0);
     DG_HOST_ASSERT((lhs_scales.sizes() == std::vector<int64_t>{m, (k + 127) / 128}));
@@ -82,6 +82,7 @@ void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pa
     TORCH_CHECK(a.first.is_contiguous(), "lhs must be contiguous");
     TORCH_CHECK(b.first.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+    TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
     fp8_gemm(a.first, a.second, b.first, b.second, d, m, n, k, configs);
 }
 
