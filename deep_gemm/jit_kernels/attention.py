@@ -257,8 +257,12 @@ def fp4_mqa_logits(q: torch.Tensor,
             block_q, warp_qh, block_kv, warp_kv, num_q_stages, num_kv_stages = 4, num_heads, 256, 64, 1, 4
         else:
             block_q, warp_qh, block_kv, warp_kv, num_q_stages, num_kv_stages = 4, num_heads, 64, 16, 1, 4
-    else:
+    elif num_heads == 64 and logits_dtype == torch.float32:
         block_q, warp_qh, block_kv, warp_kv, num_q_stages, num_kv_stages = 4, num_heads, 256, 64, 1, 3
+    elif num_heads == 32 and logits_dtype == torch.bfloat16:
+        block_q, warp_qh, block_kv, warp_kv, num_q_stages, num_kv_stages = 4, num_heads, 64, 16, 1, 3
+    elif num_heads == 32 and logits_dtype == torch.float32:
+        block_q, warp_qh, block_kv, warp_kv, num_q_stages, num_kv_stages = 4, num_heads, 64, 16, 1, 4
     block_qh = num_heads * block_q
 
     seq_len_alignment = 4

@@ -843,7 +843,7 @@ def read_numbers_from_file(file_path):
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
-    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size", "logits_dtype"]
+    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size", "logits_dtype","c4_compressed"]
     supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits", "BatchGemm"]
     supported_logits_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
@@ -1411,15 +1411,19 @@ def test_mqa_logits(args) -> None:
     num_heads = args.get('num_heads', 64)
     head_dim = args.get('head_dim', 128)
     logits_dtype = args.get('logits_dtype', torch.float32)
+    c4_compressed = bool(args.get('c4_compressed', 0))
 
-    print("test_mqa_logits->test_func: MqaLogits,data_type:{},seq_len_q:{},seq_len_kv:{},num_heads:{},head_dim:{}".format(data_type, seq_len_q, seq_len_kv, num_heads, head_dim))
+    print("test_mqa_logits->test_func: MqaLogits,data_type:{},seq_len_q:{},seq_len_kv:{},num_heads:{},head_dim:{},c4_compressed:{}".format(data_type, seq_len_q, seq_len_kv, num_heads, head_dim, c4_compressed))
 
     q = torch.randn(seq_len_q, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
     kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
     weights = torch.randn(seq_len_q, num_heads, device='cuda', dtype=torch.float32)
 
     ks = torch.zeros(seq_len_q, dtype=torch.int, device='cuda')
-    ke = torch.arange(seq_len_q, dtype=torch.int, device='cuda') + (seq_len_kv - seq_len_q)
+    if c4_compressed: # c4_compressed for deepseek v4
+        ke = torch.arange(seq_len_q, dtype=torch.int, device='cuda') // 4 + (seq_len_kv - seq_len_q // 4)
+    else:
+        ke = torch.arange(seq_len_q, dtype=torch.int, device='cuda') + (seq_len_kv - seq_len_q)
     # ks, ke = generate_cp_test_data(seq_len, seq_len_kv)
 
     if data_type == torch.bfloat16:

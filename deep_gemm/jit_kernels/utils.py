@@ -421,9 +421,13 @@ def get_paged_mqa_logits_tile(next_n, split_kv, num_heads, head_dim, datasize):
         return vreg_tb_per_sm
 
     if datasize == 1 and head_dim == 64: # fp4 packed head_dim = 64
-        if split_kv == 64:
+        if num_heads == 32 and split_kv == 64:
+            return (2, 3, 14)
+        elif num_heads == 32 and split_kv == 256: # warp-interleave
+            return (2, 3, 3)
+        elif num_heads == 64 and split_kv == 64:
             return (2, 3, 8)
-        elif split_kv == 256: # warp-interleave
+        elif num_heads == 64 and split_kv == 256: # warp-interleave
             return (2, 3, 2)
         else:
             raise ValueError
