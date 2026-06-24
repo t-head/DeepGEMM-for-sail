@@ -20,6 +20,7 @@ from .jit_kernels import (
     m_grouped_gemm_w4a16_fused,
     preprocess_mxfp4_scales,
     uint8_padding,
+    preprocess_mxfp4_weight_for_act_and_quant_fusing,
     # m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
     # m_grouped_gemm_fp8_fp8_bf16_nt_masked,
     # m_grouped_gemm_fp8_fp8_bf16_nt_nopad,

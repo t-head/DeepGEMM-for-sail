@@ -187,7 +187,7 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str
 
 
 def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, distribution: str,
-                             enable_sbo_overlap: bool = False, with_bias: bool = True):
+                             enable_sbo_overlap: bool = False, with_bias: bool = True, enable_silu_and_mul_quant_fusing: bool = False):
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
     # Construct mask
     list_m =  construct_group_m_list(distribution, num_groups, max_m, is_mask=True, em=expected_m_per_group)
@@ -197,7 +197,11 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
     
     x = torch.randn((num_groups, max_m, k), device=tensor_device, dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
-    out = torch.empty((num_groups, max_m, n), device=tensor_device, dtype=torch.bfloat16)
+    if enable_silu_and_mul_quant_fusing:
+        out = torch.empty((num_groups, max_m, (n // 4)), dtype=torch.uint8, device='cuda')
+        out_scale = torch.empty((num_groups, max_m, ceil_div((n // 4), 32)), dtype=torch.uint16, device='cuda')
+    else:
+        out = torch.empty((num_groups, max_m, n), device=tensor_device, dtype=torch.bfloat16)
     bias = torch.randn((num_groups, n), device='cuda', dtype=torch.float) if with_bias else None
 
     x_fp4 = []
@@ -233,7 +237,10 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
     max_signal_size = num_groups * ceil_div(max_m, 64)
     signal = torch.zeros(max_signal_size, dtype=torch.int32, device=tensor_device) if enable_sbo_overlap else torch.empty(0).int()
 
-    return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), bias, masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda').to(torch.bfloat16), signal.to('cuda'), max_m
+    if enable_silu_and_mul_quant_fusing:
+        return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), bias, masked_m.to('cuda'), out, out_scale, ref_out.to('cuda'), signal.to('cuda'), max_m
+    else:
+        return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), bias, masked_m.to('cuda'), out, ref_out.to('cuda'), signal.to('cuda'), max_m
 
 def test_m_grouped_gemm_nopad_loop(num_groups: int = None, m: int = None, n: int = None, k: int = None) -> None:
     print("Running GroupedNoPad GEMM test...")
@@ -283,6 +290,58 @@ def test_gemm_loop(m: int = None, n: int = None, k: int = None) -> None:
                     test_gemm(args)
     print("Passed\n")
 
+def test_m_grouped_gemm_masked_silu_and_mul_post_quant(args) -> None:
+    num_groups, m, n, k, distribution, swiglu_limit = args['groups'], args['m'], args['n'], args['k'], args['distribution'], args['swiglu_limit']
+    enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
+
+    expected_m_per_group = ceil_div(m, num_groups)
+    x, y, bias, masked_m, out, out_scale, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, distribution, enable_sbo_overlap, with_bias=False, enable_silu_and_mul_quant_fusing=True)
+
+    from deep_gemm import preprocess_mxfp4_weight_for_act_and_quant_fusing
+    weight_scale = y[1].contiguous().view(torch.uint8)
+    y_interleave = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y[0], weight_scale=weight_scale)
+    result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y_interleave, bias, out, masked_m, expected_m_per_group, enable_sbo_overlap=enable_sbo_overlap, signal=signal, out_scale=out_scale, swiglu_limit=swiglu_limit)
+
+    ### Reference
+    if swiglu_limit > 0.0:
+        gate_clamped = torch.clamp(ref_out[:, :, :(ref_out.shape[-1]//2)], max=swiglu_limit)
+        up_clamped = torch.clamp(ref_out[:, :, (ref_out.shape[-1]//2):], min=-swiglu_limit, max=swiglu_limit)
+        silu = gate_clamped * torch.sigmoid(gate_clamped) * up_clamped
+    else:
+        silu = ref_out[:, :, :(ref_out.shape[-1]//2)] * torch.sigmoid(ref_out[:, :, :(ref_out.shape[-1]//2)]) * ref_out[:, :, (ref_out.shape[-1]//2):]
+    ref_quant_torch, ref_quant_scale_torch_ = quantize_fp4_torch(src_tensor=silu)
+    ref_quant_scale_torch = preprocess_mxfp4_scales(scale=ref_quant_scale_torch_)
+
+    ### Check
+    max_diff, max_diff_scale = 0, 0
+    for j in range(num_groups):
+        diff = calc_diff(out[j, :masked_m[j].item()], ref_quant_torch[j, :masked_m[j].item()])
+        if (masked_m[j] != 0):
+            if diff >= 0.0001:
+                print(f"ref_out[{j}]:", ref_quant_torch[j, :masked_m[j].item()])
+                print(f"out[{j}]:", out[j, :masked_m[j].item()])
+            assert diff < 0.0001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+        diff_scale = calc_diff(out_scale[j, :masked_m[j].item()], ref_quant_scale_torch[j, :masked_m[j].item()])
+        if (masked_m[j] != 0):
+            if diff_scale >= 0.0001:
+                print(f"ref_scale_out[{j}]:", ref_quant_scale_torch[j, :masked_m[j].item()])
+                print(f"out_scale[{j}]:", out_scale[j, :masked_m[j].item()])
+            assert diff_scale < 0.0001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+        max_diff = max(diff, max_diff)
+        max_diff_scale = max(diff_scale, max_diff_scale)
+    print(f"Passed with acc_check. max_diff: {max_diff}, max_diff_scale: {max_diff_scale}\n")
+
+def test_m_grouped_gemm_masked_silu_and_mul_post_quant_loop(num_groups: int = None, m: int = None, n: int = None, k: int = None) -> None:
+    print("Running GroupedMasked GEMM with enable_silu_and_mul_quant_fusing test...")
+    print("Running default test suite...")
+    for num_groups, expected_m_per_group in ((8, 256), (8, 16)):
+        for k, n in ((4096, 4096), (4096, 4032)):
+            for swiglu_limit in (0.0, 10.0):
+                print(f"Testing with num_groups={num_groups}, m={num_groups * expected_m_per_group}, n={n}, k={k}")
+                args = {"groups": num_groups, "m": num_groups * expected_m_per_group, "n": n, "k": k, "distribution": "uniform", "swiglu_limit": swiglu_limit}
+                test_m_grouped_gemm_masked_silu_and_mul_post_quant(args)
+    print("Passed\n")
+        
 def construct_grouped_fused(num_groups: int, m: int, k: int, n: int, topk: int, distribution: str, alignment: int):
     ### 0. prepare input
     score = torch.randn((m, num_groups), device='cuda', dtype=torch.float32)
@@ -367,7 +426,7 @@ def test_m_grouped_gemm_fused_loop(num_groups: int = None, m: int = None, n: int
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Process target function api test.")
-    parser.add_argument('--func', default=None, choices=["DenseGemm", "GroupedNoPad", "GroupedMasked", "GroupedFused"], required=False, help='target test func')
+    parser.add_argument('--func', default=None, choices=["DenseGemm", "GroupedNoPad", "GroupedMasked", "GroupedFused", "GroupedMaskedSiluAndMulPostQuant"], required=False, help='target test func')
     parser.add_argument('--num_groups', type=int, help='Number of groups for Grouped GEMM')
     parser.add_argument('--m', type=int, help='M dimension')
     parser.add_argument('--n', type=int, help='N dimension')
@@ -389,6 +448,9 @@ if __name__ == '__main__':
 
         if args.func in ['GroupedFused']:
             test_m_grouped_gemm_fused_loop(m, n, k)
+
+        if args.func in ['GroupedMaskedSiluAndMulPostQuant']:
+            test_m_grouped_gemm_masked_silu_and_mul_post_quant_loop(num_groups, m, n, k)
     else:
         test_m_grouped_gemm_nopad_loop(num_groups, m, n, k)
         test_m_grouped_gemm_masked_loop(num_groups, m, n, k)

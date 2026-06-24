@@ -1,6 +1,6 @@
 import torch
 import warnings
-from typing import Tuple
+from typing import Tuple, Optional
 
 from .gemm_fp4 import get_best_configs, get_smem_config_fp4, check_mxfp4_scales_layout, preprocess_mxfp4_scales, _post_preprocess_mxfp4_scales
 from .tuner import jit_tuner
@@ -22,18 +22,15 @@ constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
 constexpr auto nExpand = {N_EXPAND};
+constexpr auto hasBias = {HAS_BIAS};
 constexpr auto kDynamicTileId = FP4DynamicTileId::{DynamicTileId};
-// Make a templated grouped GEMM
-auto bias_dispatcher = [&](auto HasBias) {
-    using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap, decltype(HasBias)::value, nExpand, kDynamicTileId>;
-    gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
-                bias, out, m, grouped_layout, block_m_info, expected_m,
-                stream, num_sms, smem_size, signal);
-};
+constexpr auto kApplySwigluLimit = {kApplySwigluLimit};
 
-// NOTE: The data_ptr might not be nullptr in torch.empty(0)
-if (bias == nullptr) bias_dispatcher(std::bool_constant<false>{});
-else                 bias_dispatcher(std::bool_constant<true>{});
+// Make a templated grouped GEMM
+using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap, hasBias, nExpand, kDynamicTileId, EpilogueType::{EPILOGUE_TYPE}, kApplySwigluLimit>;
+gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
+            bias, out, m, grouped_layout, block_m_info, expected_m,
+            stream, num_sms, smem_size, signal, out_scale, swiglu_limit);
 """
 
 def select_moe_dynamic_tile(n: int, k: int, expected_m: int, has_bias: bool) -> Tuple[bool, str]:
@@ -149,12 +146,12 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         n_expand = 4
     if k <= 128 and n % (block_n * 8) == 0 and not has_bias:
         n_expand = 8
-    args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, m_rows, block_m_info, expected_m, torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
+    args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, m_rows, block_m_info, expected_m, torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int(), torch.empty(0, dtype=torch.uint16, device=out.device), 0.0)
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp4_fp4_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': num_groups,
-              'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': False, 'GEMM_TYPE': 'GroupedNoPad', 'N_EXPAND' : n_expand, 'DynamicTileId': 'Disabled'},
+              'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': False, 'GEMM_TYPE': 'GroupedNoPad', 'N_EXPAND' : n_expand, 'HAS_BIAS': has_bias, 'DynamicTileId': 'Disabled', 'EPILOGUE_TYPE': 'Default', 'kApplySwigluLimit': False},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),
@@ -162,7 +159,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
                   ('bias', torch.float32), ('out', torch.bfloat16),
                   ('m', int), ('grouped_layout', torch.int32), ('block_m_info', torch.int32), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
-                  ('signal', torch.int32)),
+                  ('signal', torch.int32), ('out_scale', torch.uint16), ('swiglu_limit', float)),
         template=template,
         args=args,
         jit_include_dir='actlize_v1.0.0'
@@ -177,12 +174,40 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
                                           rhs_: Tuple[torch.Tensor, torch.Tensor],
                                           bias: torch.Tensor, out: torch.Tensor,
                                           masked_m: torch.Tensor, expected_m: int, configs=None,
-                                          enable_sbo_overlap: bool = False, signal: torch.Tensor = torch.empty(0).int()) -> None:
+                                          enable_sbo_overlap: bool = False, signal: torch.Tensor = torch.empty(0).int(),
+                                          out_scale: Optional[torch.Tensor] = None,
+                                          swiglu_limit: Optional[float] = 0.0) -> None:
+    """MoE GroupedMasked FP4 GEMM.
+
+    When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
+    `out` must be uint8 of shape (num_groups, m, n // 4) and `out_scale` uint16 of shape
+    (num_groups, m, ceil_div(n // 4, 32)).
+
+    NOTE: when `out_scale` is not None, `out_scale` is re-strided **in place** to the N-major layout
+    (sfm * sfn, 1, sfm) expected by the Gemm2 SFA reader.
+    """
+
     lhs, lhs_scales = lhs_
     rhs, rhs_scales = rhs_
     num_groups, m, k = lhs.shape
     num_groups_, n, k_ = rhs.shape
     num_groups__, m_, n_ = out.shape
+
+    enable_silu_and_mul_quant_fusing = out_scale is not None
+    if enable_silu_and_mul_quant_fusing:
+        shape_n_out = n // 4 ### /2: silu_and_mul; /2: quant mxfp4
+        sfm, sfn = m, ceil_div(shape_n_out, 32)
+        assert n_ == shape_n_out, f'{n_=}, expected {shape_n_out}'
+        assert out_scale.shape == (num_groups, sfm, sfn), \
+            f'out_scale shape {out_scale.shape}, expected {(num_groups, sfm, sfn)}'
+        assert out.dtype == torch.uint8 and out_scale.dtype == torch.uint16
+        assert bias is None, "bias not None is not supported in SiluAndMulPostQuant Epilogue."
+        epilogue_type, output_type = 'SiluAndMulPostQuantFp4', torch.uint8
+    else:
+        assert n_ == n, f'{n_=}, expected {n}'
+        out_scale = torch.empty(0, dtype=torch.uint16, device=out.device)
+        assert out.dtype == torch.bfloat16
+        epilogue_type, output_type = 'Default', torch.bfloat16
     num_groups___ = masked_m.numel()
 
     if (not check_mxfp4_scales_layout(scale=lhs_scales, is_sfa=True)):
@@ -199,12 +224,11 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
 
     # Type and shape checks
     assert num_groups == num_groups_ == num_groups__ == num_groups___
-    assert m == m_ and n == n_ and k == k_
+    assert m == m_ and k == k_
     assert expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0
     assert lhs.dtype == torch.uint8 and rhs.dtype == torch.uint8
     assert lhs_scales.dtype == torch.uint16 and rhs_scales.dtype == torch.uint16
     assert bias is None or bias.dtype == torch.float32
-    assert out.dtype == torch.bfloat16
     assert masked_m.dtype == torch.int32
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert (lhs_scales.stride(1) == 1 or lhs_scales.shape[1] == 1) and (rhs_scales.stride(1) == 1 or rhs_scales.shape[1] == 1)
@@ -228,7 +252,8 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedMasked)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
         # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
-
+        if (enable_silu_and_mul_quant_fusing and block_n < 64):
+            block_n = 64
     ## the largest blockM_num is, num_groups - 1 only has 1 token, the last group has (m-1) tokens, blockM_num = num_group -1  + ceil_div(m + 1 - num_group, block_m)
     ## total line num: blockM_num + 1, line0 is used to store the real blockM_num
     ## total_size = (blockM_num + 1) * 4 * sizeof(int) Byte
@@ -236,7 +261,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
         (num_groups + ceil_div(m + 1 - num_groups, block_m)) * 4, dtype=torch.int32, device=masked_m.device)
 
     n_expand = 1
-    if k <= 512 and expected_m > 2 and n % (block_n * 4) == 0 and not has_bias:
+    if k <= 512 and expected_m > 2 and n % (block_n * 4) == 0 and not has_bias and not enable_silu_and_mul_quant_fusing:
         n_expand = 4
 
     EnableMoeDynamicTile, DynamicTileId = select_moe_dynamic_tile(
@@ -244,24 +269,28 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     if EnableMoeDynamicTile:
         # fix the block config to avoid unecessary jit compile
         block_m, block_n, block_k, warp_m, warp_n, num_stages = (128, 128, 64, 64, 64, 3)
+
+    swiglu_limit_ = 0.0 if (swiglu_limit is None) else swiglu_limit
+    kApplySwigluLimit = swiglu_limit_ > 0
+
     args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, masked_m, block_m_info, expected_m,
-            torch.cuda.current_stream(), num_sms, smem_config[0], signal)
+            torch.cuda.current_stream(), num_sms, smem_config[0], signal, out_scale, swiglu_limit_)
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp4_fp4_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': enable_sbo_overlap,
-              'GEMM_TYPE': 'GroupedMasked', 'N_EXPAND' : n_expand,
-              'DynamicTileId': DynamicTileId},
+              'GEMM_TYPE': 'GroupedMasked', 'N_EXPAND' : n_expand, 'HAS_BIAS': has_bias,
+              'DynamicTileId': DynamicTileId, 'EPILOGUE_TYPE': epilogue_type, 'kApplySwigluLimit': kApplySwigluLimit},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),
                   ('rhs', torch.uint8), ('rhs_scales', torch.uint16),
-                  ('bias', torch.float32), ('out', torch.bfloat16),
+                  ('bias', torch.float32), ('out', output_type),
                   ('m', int), ('grouped_layout', torch.int32),
                   ('block_m_info', torch.int32), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
-                  ('signal', torch.int32)),
+                  ('signal', torch.int32), ('out_scale', torch.uint16), ('swiglu_limit', float)),
         template=template,
         args=args,
         jit_include_dir='actlize_v1.0.0'
@@ -269,5 +298,8 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
 
     # Run the kernel
     runtime(*args)
+
+    if enable_silu_and_mul_quant_fusing:
+        out_scale.as_strided_(size=(num_groups, sfm, sfn), stride=(sfm * sfn, 1, sfm))
 
     return (block_m, ceil_div(n, block_n))

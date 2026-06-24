@@ -23,18 +23,13 @@ constexpr auto WARP_N = {WARP_N};
 constexpr auto BLOCK_K = {BLOCK_K};
 constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
+constexpr auto hasBias = {HAS_BIAS};
 
 // Make a templated grouped GEMM
-auto bias_dispatcher = [&](auto HasBias) {
-    using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, false, decltype(HasBias)::value>;
-    gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
-                bias, out, m, nullptr, nullptr, 0,
-                stream, num_sms, smem_size);
-};
-
-// NOTE: The data_ptr might not be nullptr in torch.empty(0)
-if (bias == nullptr) bias_dispatcher(std::bool_constant<false>{});
-else                 bias_dispatcher(std::bool_constant<true>{});
+using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, false, hasBias>;
+gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
+            bias, out, m, nullptr, nullptr, 0,
+            stream, num_sms, smem_size);
 """
 tile_config_normal = {
     #(block_m, block_n, block_k):(warp_m, warp_n, stages)
@@ -566,6 +561,27 @@ def preprocess_mxfp4_scales(scale: torch.Tensor) -> torch.Tensor:
     else:
         return scale.view(torch.uint16).permute(0, 2, 1).contiguous().permute(0, 2, 1)
 
+def preprocess_mxfp4_weight_for_act_and_quant_fusing(weight: torch.Tensor, weight_scale: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert weight.dim() == weight_scale.dim() == 3, "The dimensions of weight and weight_scale must be 3."
+    assert weight.dtype == torch.uint8 and weight_scale.dtype == torch.uint8, "The dtype of weight and weight_scale must be uint8, preprocess_mxfp4_weight_for_act_and_quant_fusing should be called before preprocess_mxfp4_scales."
+    assert weight.is_contiguous() and weight_scale.is_contiguous(), "weight and weight_scale must be contiguous. preprocess_mxfp4_weight_for_act_and_quant_fusing should be called before preprocess_mxfp4_scales."
+
+    ### do interleaving to make up and gate be adjecent.
+    num_groups, n, k = weight.shape
+    assert n % 2 == 0, "N must be divideable by 2 for silu_and_mul."
+    half_n = n // 2
+    gate = weight[:, :half_n, :]
+    up = weight[:, half_n:, :]
+    weight_out = torch.stack([gate, up], dim=2).view(num_groups, n, k)
+
+    num_groups_, sfn, sfk = weight_scale.shape
+    assert num_groups == num_groups_ and n == sfn and sfk == ceil_div(k, 16) # weight is uint8
+    gate_scale = weight_scale[:, :half_n, :]
+    up_scale = weight_scale[:, half_n:, :]
+    weight_scale_out = torch.stack([gate_scale, up_scale], dim=2).view(num_groups_, sfn, sfk)
+    weight_scale_out = preprocess_mxfp4_scales(scale=weight_scale_out)
+    return (weight_out, weight_scale_out)
+
 def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
                          rhs_: Tuple[torch.Tensor, torch.Tensor],
                          bias: torch.Tensor, out: torch.Tensor, configs = None) -> None:
@@ -596,7 +612,8 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
     assert (lhs_scales.stride(0) == 1 or lhs_scales.shape[0] == 1) and (rhs_scales.stride(0) == 1 or rhs_scales.shape[0] == 1)
-    if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device)
+    has_bias = True
+    if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device); has_bias = False
 
     # Do nothing if `m` is zero
     if m == 0:
@@ -620,7 +637,7 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
         name='gemm_fp4_fp4_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': 1,
-              'NUM_STAGES': num_stages,'GEMM_TYPE': 'DenseGemm'},
+              'NUM_STAGES': num_stages,'GEMM_TYPE': 'DenseGemm', 'HAS_BIAS': has_bias},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),

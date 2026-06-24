@@ -36,6 +36,8 @@
 #include "utils_cutlass3.h"
 #include "fp4_gemm_cutlass3_dynamic.cuh"
 #include "fp4_mma.cuh"
+#include "fp4_epilogue_silu_and_mul_post_quant.hpp"
+
 #include <math.h>
 
 using namespace cute;
@@ -50,7 +52,8 @@ template <
   class TileScheduler_,
   bool hasBias = false,
   int nExpand = 1,
-  bool kEnableSboOverlap = false
+  bool kEnableSboOverlap = false,
+  EpilogueType kEpilogueType = EpilogueType::Default
 >
 class DeepGemmUniversal;
 
@@ -60,7 +63,8 @@ template <
   class CollectiveEpilogue_,
   class TileScheduler_,
   bool hasBias_,
-  int nExpand
+  int nExpand,
+  EpilogueType kEpilogueType
 >
 class DeepGemmUniversal <
   ProblemShape_,
@@ -69,7 +73,8 @@ class DeepGemmUniversal <
   TileScheduler_,
   hasBias_,
   nExpand,
-  false
+  false,
+  kEpilogueType
 > {
   public:
   //
@@ -79,6 +84,7 @@ class DeepGemmUniversal <
 
   static_assert(rank(ProblemShape{}) == 3 or rank(ProblemShape{}) == 4,
     "ProblemShape{} should be <M,N,K> or <M,N,K,L>");
+  static_assert(kEpilogueType == EpilogueType::Default, "NExpand mode only supports EpilogueType::Default because TSM overlap in the Epilogue");
 
   // Mainloop derived types
   using CollectiveMainloop = CollectiveMainloop_;
@@ -301,11 +307,6 @@ class DeepGemmUniversal <
     using X = Underscore;
 
     int warp_idx = cutlass::canonical_warp_idx_sync();
-    int lane_idx = threadIdx.x % 32;
-    int aiu_warp_group_thread_idx = warp_idx * 32;
-    int warp_m_idx = warp_idx % warp_on_m;
-    int warp_n_idx = warp_idx / warp_on_m;
-
     if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
       // group is small 8|16, just prefetch one cacheline
       __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
@@ -316,6 +317,11 @@ class DeepGemmUniversal <
         __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx << 5)));
       }
     }
+
+    int lane_idx = threadIdx.x % 32;
+    int aiu_warp_group_thread_idx = warp_idx * 32;
+    int warp_m_idx = warp_idx % warp_on_m;
+    int warp_n_idx = warp_idx / warp_on_m;
 
     TileScheduler deep_scheduler{params.scheduler};
 
@@ -650,7 +656,8 @@ template <
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
   class TileScheduler_,
-  bool hasBias_
+  bool hasBias_,
+  EpilogueType kEpilogueType
 >
 class DeepGemmUniversal <
   ProblemShape_,
@@ -659,7 +666,8 @@ class DeepGemmUniversal <
   TileScheduler_,
   hasBias_,
   1,
-  false
+  false,
+  kEpilogueType
 > {
 public:
   //
@@ -876,10 +884,20 @@ public:
     using namespace cute;
     using X = Underscore;
 
-    TileScheduler deep_scheduler{params.scheduler};
-
     // Preconditions
     CUTE_STATIC_ASSERT(is_static<TileShape>::value);
+
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+      // group is small 8|16, just prefetch one cacheline
+      __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
+    }
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+      // each warp prefetch one cacheline
+      int warp_idx = cutlass::canonical_warp_idx_sync();
+      if (warp_idx < N_PREFETCH_CACHELINE) {
+        __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx << 5)));
+      }
+    }
 
     // Kernel level shared memory storage
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -898,21 +916,11 @@ public:
     static_assert(rank(StrideC{}) == 3, "StrideC must be rank-3: [M, N, L]. If batch mode is not needed, set L stride to Int<0>.");
     static_assert(rank(StrideD{}) == 3, "StrideD must be rank-3: [M, N, L]. If batch mode is not needed, set L stride to Int<0>.");
 
+    TileScheduler deep_scheduler{params.scheduler};
+
     // Get the appropriate blocks for this thread block -- potential for thread block locality
     int thread_idx = int(threadIdx.x);
     auto blk_shape = TileShape{};                                                                // (BLK_M,BLK_N,BLK_K)
-
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
-      // group is small 8|16, just prefetch one cacheline
-      __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
-    }
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
-      // each warp prefetch one cacheline
-      int warp_idx = cutlass::canonical_warp_idx_sync();
-      if (warp_idx < N_PREFETCH_CACHELINE) {
-        __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx << 5)));
-      }
-    }
 
     uint32_t m_block_idx, n_block_idx;
     #pragma clang loop licm(disable)
@@ -978,7 +986,9 @@ public:
       if constexpr (hasBias_) {
         params_epilogue_local.ptr_Bias += deep_scheduler.curr_offset_mxfp4_c();
       }
-
+      if constexpr (EpilogueTraits<kEpilogueType>::needs_sfd_offset) {
+        params_epilogue_local.ptr_SFD += deep_scheduler.curr_offset_c_scales();
+      }
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
       epilogue(
@@ -1008,7 +1018,7 @@ template <int32_t ShapeN, int32_t ShapeK,
           int32_t WarpM, int32_t WarpN,
           int32_t kNumGroups, int32_t kNumStages, GemmType kGemmType,
           bool kEnableSboOverlap = false, bool hasBias = false, int NExpand = 1,
-          FP4DynamicTileId kDynamicTileId = FP4DynamicTileId::Disabled>
+          FP4DynamicTileId kDynamicTileId = FP4DynamicTileId::Disabled, EpilogueType kEpilogueType = EpilogueType::Default, bool kApplySwigluLimit = false>
 class Fp4Gemm {
   static constexpr bool kEnableMoeDynamicTile = (kDynamicTileId != FP4DynamicTileId::Disabled);
   static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
@@ -1016,13 +1026,17 @@ class Fp4Gemm {
   static_assert((BlockK % 32 == 0), "BlockK must be divideable by 32.");
   static_assert((WarpM <= 64) && (WarpM % 16 == 0), "WarpM must be divideable by 16 and less than 64.");
   static_assert((WarpN <= 64) && (WarpN % 16 == 0), "WarpN must be divideable by 16 and less than 64.");
+  static_assert(EpilogueTraits<kEpilogueType>::is_valid_config(ShapeN, BlockN, NExpand, hasBias), 
+    "SiluAndMulPostQuantFp4 Epilogue only support BlockN >= 64, ShapeN % 64 == 0, Nexpand = 1 and hasBias = false. ShapeN % 64 means ShapeN // 4(act_func&quant) / 16(scale_group).");
 
 public:
     Fp4Gemm() = default;
+    using ElementD = typename EpilogueTraits<kEpilogueType>::ElementD;
+    using ElementDPtr = typename EpilogueTraits<kEpilogueType>::ElementDPtr;
 
     static void run(uint8_t *a_ptr, uint16_t *scale_a, uint8_t *b_ptr, uint16_t *scale_b,
-                    float *c_ptr, __ppu_bfloat16 *d_ptr, int shape_m, int *grouped_layout, int *block_m_info, uint32_t expected_m,
-                    hggcStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
+                    float *c_ptr, ElementDPtr *d_ptr, int shape_m, int *grouped_layout, int *block_m_info, uint32_t expected_m,
+                    hggcStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr, uint16_t* sfd_ptr = nullptr, float swiglu_limit = 0.0) {
         constexpr int N_EXPAND = NExpand;
 
         // A matrix configuration
@@ -1041,7 +1055,6 @@ public:
         constexpr int AlignmentC  = 1;
         constexpr int AlignmentD  = 1;
         // D matrix configuration
-        using         ElementD    = cutlass::bfloat16_t;
         using         LayoutD     = LayoutC;
         using ElementAccumulator = float;
         using ElementCompute = float;
@@ -1054,6 +1067,8 @@ public:
 
         hggcFuncAttributes attr;
         if constexpr (kEnableMoeDynamicTile) {
+            static_assert(kEpilogueType == EpilogueType::Default,
+                            "MoE dynamic tile does not support EpilogueType::SiluAndMulPostQuantFp4");
             auto launch_dynamic_tile_kernel = [&](auto gemm_kernel_) {
                 using GemmKernel = decltype(gemm_kernel_);
                 using TileScheduler = typename GemmKernel::TileScheduler;
@@ -1213,14 +1228,14 @@ public:
             ElementSFB, cutlass::detail::TagToStrideB_t<LayoutSFB>, typename GemmOperandSFB::GmemTiledCopy, typename GemmOperandSFB::SmemLayoutAtom>;
 
           using EpilogueOutputOp = typename cutlass::platform::conditional<
-              hasBias,
+              hasBias || (ShapeN % 2 != 0),
               cutlass::epilogue::thread::LinearCombinationBiasElementwise<ElementD, ElementAccumulator, ElementCompute, ElementD, ElementD, AlignmentD, cutlass::epilogue::thread::Identity<float>, cutlass::plus<ElementCompute>, false, ElementBias>,
               cutlass::epilogue::thread::LinearCombination<ElementD, 2, ElementAccumulator, ElementCompute, cutlass::epilogue::thread::ScaleType::Nothing, cutlass::FloatRoundStyle::round_to_nearest, ElementC>,
             >::type;
 
           using EpilogueCopyInst = AutoVectorizingCopyWithAssumedAlignment<AlignmentC * sizeof(ElementC) * 8>;
           using GemmEpilogueConfiguration = cutlass::gemm::config::DefaultGemm_Epilogue_Configuration<EpilogueCopyInst, float, AlignmentC, Int<BlockM>, Int<BlockN>, WarpOnM, ThreadNum>;
-          static constexpr bool IsAligedN = ShapeN % BlockN == 0 ? true : false;
+          static constexpr bool IsAlignedN = ShapeN % BlockN == 0 ? true : false;
 
           using CollectiveEpilogueWithTsm = typename cutlass::epilogue::collective::Epilogue<
             cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
@@ -1237,17 +1252,30 @@ public:
             cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
             EpilogueOutputOp,
             cutlass::gemm::EpilogueDefault,
-            IsAligedN
+            IsAlignedN
+          >;
+
+          using CollectiveEpilogueNoTsmSiluAndMulQuant = typename cutlass::epilogue::collective::EpilogueNoTsmSiluAndMulQuant<
+            cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
+            cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
+            EpilogueOutputOp,
+            cutlass::gemm::EpilogueDefault,
+            IsAlignedN,
+            kApplySwigluLimit
           >;
 
           // CollectiveEpilogueNoTsm requires that N is divideable by 2
           using CollectiveEpilogue = typename cutlass::platform::conditional<
             hasBias || (ShapeN % 2 != 0),
             CollectiveEpilogueWithTsm,
-            CollectiveEpilogueNoTsm
+            typename cutlass::platform::conditional<
+              kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4,
+              CollectiveEpilogueNoTsmSiluAndMulQuant,
+              CollectiveEpilogueNoTsm
+            >::type
           >::type;
 
-          using TileScheduler = DeepGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND, kNumGroups>;
+          using TileScheduler = DeepGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND, kNumGroups, ceil_div(ShapeN, BlockN * N_EXPAND), 2, kEpilogueType>;
           using GemmKernel = typename deep_gemm::DeepGemmUniversal<
               Shape<int,int,int,int>,
               CollectiveMainloop,
@@ -1256,7 +1284,16 @@ public:
               hasBias,
               N_EXPAND,
               kEnableSboOverlap,
+              kEpilogueType
           >;
+
+          if constexpr (kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4) {
+            // Epilogue reuse the shared storage comes from mainloop.
+            // Make sure that the size of epilogue SharedStorage is less than Mainloop.
+            static_assert( CollectiveEpilogueNoTsmSiluAndMulQuant::get_shared_storage_size(BlockM, BlockN)
+                          <= GemmKernel::SharedStorageSize,
+                          "fused epilogue act tile exceeds the kernel shared storage");
+          }
 
           using StrideA = typename GemmKernel::StrideA;
           using StrideB = typename GemmKernel::StrideB;
@@ -1287,11 +1324,13 @@ public:
           cutlass::KernelHardwareInfo hw_info;
           hw_info.device_id = 0;
           hw_info.cu_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id) * max_blocks_per_cu;
-          cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(d_ptr);
+          ElementD* converted_output = reinterpret_cast<ElementD*>(d_ptr);
 
           typename CollectiveEpilogue::Arguments epilogue_arguments = [&]() -> auto {
-              if constexpr (hasBias) {
+              if constexpr (hasBias || (ShapeN % 2 != 0)) {
                 return typename CollectiveEpilogueWithTsm::Arguments{{1.0, 0.0, nullptr, nullptr, c_ptr, stride_Bias}, nullptr, stride_C, converted_output, stride_D};
+              } else if constexpr (kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4) {
+                return typename CollectiveEpilogueNoTsmSiluAndMulQuant::Arguments{{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D}, sfd_ptr, shape_m, swiglu_limit};
               } else {
                 return typename CollectiveEpilogueNoTsm::Arguments{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D};
               }
@@ -1323,9 +1362,9 @@ public:
               hggcFuncAttributes attr;
               hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
 
-              printf("[GemmGrouped-FP4:]\n");
-              printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d\n",
-                  kNumGroups, shape_m, ShapeN, ShapeK, expected_m, GemmTypeS[static_cast<int>(kGemmType)], TileScheduler::kIsNoPadPreprocessLayout);
+            printf("[GemmGrouped-FP4:]\n");
+            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d, kEpilogueType:%s\n",
+                kNumGroups, shape_m, ShapeN, ShapeK, expected_m, GemmTypeS[static_cast<int>(kGemmType)], TileScheduler::kIsNoPadPreprocessLayout, EpilogueTypeS[static_cast<int>(kEpilogueType)]);
 
               printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                   BlockM, BlockN, BlockK, WarpM, WarpN, BlockK, kNumStages);

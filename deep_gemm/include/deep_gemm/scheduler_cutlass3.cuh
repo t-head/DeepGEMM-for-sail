@@ -54,13 +54,15 @@ template <GemmType kGemmType,
           uint32_t BLOCK_M_, uint32_t BLOCK_N_,
           uint32_t kNumGroups_,
           uint32_t kNumNBlocks = ceil_div(SHAPE_N_, BLOCK_N_),
-          uint32_t kNum1DBlocksPerGroup = 2>
+          uint32_t kNum1DBlocksPerGroup = 2,
+          EpilogueType kEpilogueType = EpilogueType::Default>
 struct DeepGemmScheduler {
     constexpr static uint32_t SHAPE_N = SHAPE_N_;
     constexpr static uint32_t SHAPE_K = SHAPE_K_;
     constexpr static uint32_t BLOCK_M = BLOCK_M_;
     constexpr static uint32_t BLOCK_N = BLOCK_N_;
     constexpr static uint32_t kNumGroups = kNumGroups_;
+    constexpr static uint32_t SHAPE_N_OUT = EpilogueTraits<kEpilogueType>::get_shape_n_out(SHAPE_N);
     int current_iter = 0;
     uint32_t num_aligned_m_blocks;
     constexpr static GemmType GEMM_TYPE = kGemmType;
@@ -414,11 +416,28 @@ struct DeepGemmScheduler {
     __device__ __forceinline__ int64_t curr_offset_c() const
     {
         if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {
-            return int64_t(curr_group_idx) * params.shape_m * SHAPE_N;
+            return int64_t(curr_group_idx) * params.shape_m * SHAPE_N_OUT;
         } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
-            return int64_t(curr_cumsum_m) * SHAPE_N;
+            return int64_t(curr_cumsum_m) * SHAPE_N_OUT;
         } else if constexpr(kGemmType == GemmType::BatchGemm) {
-            return int64_t(curr_group_idx) * SHAPE_N;
+            return int64_t(curr_group_idx) * SHAPE_N_OUT;
+        } else {
+            return 0;
+        }
+    }
+
+    // curr_offset_c_scales is only for epilogue fusing(gemm1 + silu_and_mul + downcast_to_mxfp4)
+    __device__ __forceinline__ int64_t curr_offset_c_scales() const
+    {
+        // scale is M/N-Major(uint16)
+        constexpr uint32_t SFC_SHAPE_N = EpilogueTraits<kEpilogueType>::get_shape_sfn_out(SHAPE_N);
+
+        if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {
+            return int64_t(curr_group_idx) * params.shape_m * SFC_SHAPE_N;
+        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
+            return int64_t(curr_cumsum_m) * SFC_SHAPE_N;
+        } else if constexpr(kGemmType == GemmType::BatchGemm) {
+            return int64_t(curr_group_idx) * SFC_SHAPE_N;
         } else {
             return 0;
         }
