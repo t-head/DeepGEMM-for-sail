@@ -16,3 +16,8 @@ deep_gemm/include/accutlass.h
 deep_gemm/include/aiu
 .eggs/
 tmp/
+
+# AKO4ALL
+__pycache__/
+_bench_output.txt
+trajectory/

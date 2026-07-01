@@ -44,6 +44,15 @@ from .jit_kernels import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
     fp8_einsum,
+    # Block-copy fused dispatch
+    get_sym_buffer_size,
+    mxfp4_quantize_to_sym_buffer,
+    dispatch_preprocess,
+    create_preprocess_workspace,
+    dispatch_expert_preprocess,
+    create_expert_preprocess_workspace,
+    create_block_copy_buffers,
+    fused_dispatch_block_copy_gemm1_fp4,
 )
 
 from .utils import (
