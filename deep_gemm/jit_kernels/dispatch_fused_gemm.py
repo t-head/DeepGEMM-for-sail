@@ -82,7 +82,7 @@ constexpr auto kNumStages = {NUM_STAGES};
 
 using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N,
                         kNumGroups, kNumStages, GemmType::FusedDispatch>;
-gemm_t::template run_fused_dispatch<{NUM_RANKS}, {NUM_COPY_BLOCKS}>(
+gemm_t::template run_fused_dispatch<{NUM_RANKS}, {NUM_COPY_BLOCKS}, {K_TILES_PER_FLAG}>(
     rhs, rhs_scales, bias, out, shape_m,
     grouped_layout,
     max_tokens_per_expert,
@@ -93,7 +93,9 @@ gemm_t::template run_fused_dispatch<{NUM_RANKS}, {NUM_COPY_BLOCKS}>(
     reinterpret_cast<const uint32_t*>(rank_counts),
     reinterpret_cast<const uint64_t*>(merged_sfa_addrs),
     reinterpret_cast<uint8_t*>(local_fp4_buf),
-    reinterpret_cast<volatile uint32_t*>(copy_ready_flags));
+    reinterpret_cast<volatile uint32_t*>(copy_ready_flags),
+    reinterpret_cast<uint64_t*>(kstripe_profile_buf),
+    kstripe_profile_max_mb);
 """
 
 # ==============================================================
@@ -381,15 +383,14 @@ def dispatch_expert_preprocess(
 
 
 def create_block_copy_buffers(num_local_experts, num_ranks, max_tokens_per_expert, hidden_dim, block_m, device):
-    """Allocate buffers for block-copy mode: local FP4 + per-M-block completion flags.
-    Last element of copy_ready_flags is reserved as atomic tile counter for work-stealing."""
+    """Allocate buffers for block-copy mode: local FP4 + per-M-block completion flags."""
     k_half = hidden_dim // 2
     local_fp4 = torch.zeros(num_local_experts * max_tokens_per_expert * k_half,
                             dtype=torch.uint8, device=device)
     max_expert_tokens = num_ranks * max_tokens_per_expert
     max_m_blocks_per_expert = ceil_div(max_expert_tokens, block_m)
     max_total_m_blocks = num_local_experts * max_m_blocks_per_expert
-    copy_ready_flags = torch.zeros(max_total_m_blocks + 1, dtype=torch.int32, device=device)
+    copy_ready_flags = torch.zeros(max_total_m_blocks, dtype=torch.int32, device=device)
     return local_fp4, copy_ready_flags
 
 
@@ -407,8 +408,10 @@ def fused_dispatch_block_copy_gemm1_fp4(
     local_fp4_buf: torch.Tensor,
     copy_ready_flags: torch.Tensor,
     num_copy_blocks: int = 1,
+    k_tiles_per_flag: int = 0,
     configs=None,
     merged_sfa_addrs: torch.Tensor = None,
+    kstripe_profile_buf: torch.Tensor = None,
 ) -> None:
     """Block-copy fused dispatch GEMM1: dedicated copy blocks + GEMM from local HBM."""
     rhs, rhs_scales = rhs_
@@ -422,6 +425,12 @@ def fused_dispatch_block_copy_gemm1_fp4(
     if shape_m == 0:
         return
 
+    # NOTE: block_m here MUST match the block_m used to build grouped_layout /
+    # rank_split_m in dispatch_expert_preprocess. The copy kernel places each
+    # M-block at m_block_in_expert * BLOCK_M rows; a mismatch writes 2nd+ blocks
+    # to the wrong expert region (silently zeroing their output). The preprocess
+    # side (get_gemm_block_m) uses plain expected_m with no <=128 bump, so we
+    # must not bump here either.
     expected_m = ceil_div(shape_m, num_groups)
 
     global includes_gemm, template_gemm_block_copy
@@ -440,13 +449,22 @@ def fused_dispatch_block_copy_gemm1_fp4(
 
     copy_ready_flags.zero_()
 
+    if kstripe_profile_buf is None:
+        kstripe_profile_buf = torch.empty(0, dtype=torch.int64, device=rhs.device)
+        kstripe_profile_max_mb = 0
+    else:
+        num_k_tiles = k // block_k
+        num_stripes = (num_k_tiles // k_tiles_per_flag) if k_tiles_per_flag > 0 else 1
+        kstripe_profile_max_mb = kstripe_profile_buf.numel() // (2 * num_stripes + 1)
+
     args = (rhs, rhs_scales, bias, out, shape_m,
             grouped_layout,
             max_tokens_per_expert,
             torch.cuda.current_stream(), num_sms, smem_config[0],
             rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts,
             merged_sfa_addrs,
-            local_fp4_buf, copy_ready_flags)
+            local_fp4_buf, copy_ready_flags,
+            kstripe_profile_buf, kstripe_profile_max_mb)
 
     runtime = jit_tuner.compile_and_tune(
         name='fused_dispatch_block_copy_gemm1_fp4',
@@ -458,6 +476,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
             'NUM_STAGES': num_stages,
             'NUM_RANKS': num_ranks,
             'NUM_COPY_BLOCKS': num_copy_blocks,
+            'K_TILES_PER_FLAG': k_tiles_per_flag,
         },
         space=(),
         includes=includes_gemm,
@@ -479,6 +498,8 @@ def fused_dispatch_block_copy_gemm1_fp4(
             ('merged_sfa_addrs', torch.int64),
             ('local_fp4_buf', torch.uint8),
             ('copy_ready_flags', torch.int32),
+            ('kstripe_profile_buf', torch.int64),
+            ('kstripe_profile_max_mb', int),
         ),
         template=template_gemm_block_copy,
         args=args,

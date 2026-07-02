@@ -55,11 +55,16 @@ Status values: improved / no-change / regression / failed.
 | 14 | 双流quant+preprocess重叠 | — | 0.357 / 1.07x | 无变化（已回退）|
 | 15 | block_m=128（移除expected_m clamp）| — | 0.310 / 1.24x | **改进（-44µs, +0.16x）** |
 | 16 | 配置空间探索：4-stage / NCB扫描 / block_m=64 | — | 0.310 / 1.24x | 无改进（确认平台期）|
+| 17 | 基准修正：消除scale预处理开销（COL_MAJOR_SCALE）| — | 0.290 / 1.02x | **基线更新** |
 
 > **注意:** Iter 1–3使用随机token路由（每次运行shape_m不同）。
 > 从iter 4开始，路由固定为**均匀分布**（round-robin），
 > 产生确定性的M维度（2卡: M=1538, 4/8卡: M=1560）。
 > 绝对时间在不同路由模式间不可比较；vs-NF比率可比较。
+>
+> **环境变更:** Iter 1–16 在 deepgemm.lxh 容器中测试，NF 基线含 scale round-trip 开销
+> （~90µs）。Iter 17+ 在 sglang.lxh 容器中测试（`COL_MAJOR_SCALE=1`），NF 基线公平。
+> Iter 17 的 vs-NF 比率与 iter 1-16 **不可直接比较**。
 
 ## Iterations
 
@@ -666,3 +671,64 @@ stages=3, ncb=8/13）已达到当前kernel架构的优化平台期。
 - 剩余开销：quant 0.025ms + preprocess 0.028ms + launch ~0.007ms = 0.060ms
 - 进一步优化需要：将quant/preprocess融合到GEMM kernel（cooperative launch方案，
   预计可节省~20µs，但实现复杂度较高）
+
+---
+
+### Iter 17 — 基准修正：消除scale预处理开销（COL_MAJOR_SCALE）
+
+- **背景:** Iter 1-16 的 non-fused 基线中包含了不必要的 scale 预处理开销。DeepEP
+  `low_latency_dispatch` 默认返回 row-major (int32) scale，测试代码需要做
+  `.contiguous().view(uint8)` + `preprocess_mxfp4_scales()` 转换为 DeepGemm 要求的
+  uint16 列主序。但这在生产环境中完全可以避免：传 `mxfp4_scale_row_major=False` 即可
+  让 DeepEP 直接返回 uint16 列主序 scale（stride(1)==1），直接满足 GEMM 的
+  `check_mxfp4_scales_layout` 要求，零额外开销。
+
+- **消除的开销:**
+  - `.contiguous()` → 76µs elementwise_kernel（Grid 5824, 将非连续 uint16 tensor 转为连续）
+  - `.view(uint8)` + `preprocess_mxfp4_scales()` → 额外 kernel（转回 uint16 列主序）
+  - 总计约 **~90µs** 无意义 round-trip
+
+- **修改:**
+  - `test_block_copy_gemm1_multi_gpu.py`:
+    1. 新增 `COL_MAJOR_SCALE` 环境变量（默认 1）
+    2. 新增 `nonfused_dispatch()` helper：`COL_MAJOR_SCALE=1` 时传
+       `mxfp4_scale_row_major=False` 并直接使用返回的 scale；否则走原来的预处理路径
+    3. 替换全部 5 处 non-fused dispatch 调用为统一 helper
+
+- **环境:** sglang.lxh 容器（DeepEP 支持 `mxfp4_scale_row_major` 参数）
+
+- **Bench (4-GPU, M=1560, N=6144, K=7168, ncb=13, SKIP_ISOLATION=1):**
+
+  | 指标 | COL_MAJOR_SCALE=1 | Iter 15-16 (旧基线) | 差异 |
+  |------|-------------------|---------------------|------|
+  | BC pipeline | 0.290 ms | 0.310 ms | -20µs (环境差异) |
+  | NF pipeline | 0.294 ms | 0.383 ms | **-89µs (消除scale开销)** |
+  | NF GEMM-only | 0.228 ms | 0.248 ms | -20µs (环境差异) |
+  | vs NF | 1.02x | 1.24x | — |
+  | BC overhead | 0.074 ms | 0.060 ms | — |
+
+  NF overhead: 0.294 - 0.228 = 0.066 ms (纯 DeepEP dispatch 延迟)
+  BC overhead: quant 0.048ms + preprocess 0.026ms = 0.074 ms
+
+- **分析:**
+
+  1. **Non-fused 基线大幅变快:** 消除 scale round-trip 后，NF pipeline 从 0.383ms
+     降至 0.294ms（-23%）。这说明此前 1.24x 的优势中约 0.5x 来自 NF 的人为开销。
+
+  2. **"真实"对比:** 公平条件下（both paths 无冗余开销），block-copy 与 non-fused
+     在 4-GPU 场景下基本持平 (1.02x)。Block-copy 的优势被其自身的
+     overhead（quant + preprocess = 0.074ms）抵消。
+
+  3. **BC 绝对时间略快 (0.290 vs 0.310):** 可能因 sglang.lxh 容器环境差异
+    （不同 PyTorch 版本、JIT cache 差异）。NF GEMM-only 同样更快
+     (0.228 vs 0.248ms)，说明这是全局环境因素。
+
+  4. **核心结论:** Block-copy 的真实价值在于**将 P2P 传输与 GEMM 计算重叠**。
+     当两者独立开销接近时（如 4-GPU 场景），重叠收益被 quant/preprocess 开销抵消。
+     在 **8-GPU** 场景下（P2P 延迟更高、NF dispatch 更慢），block-copy 预期仍有优势。
+
+- **新基线:** 后续所有比较应使用 `COL_MAJOR_SCALE=1`（sglang.lxh 容器），
+  以获得公平的 non-fused 基线。4-GPU 新基线：
+  - BC pipeline: **0.290 ms**
+  - NF pipeline: **0.294 ms**
+  - vs NF: **1.02x**

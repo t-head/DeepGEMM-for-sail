@@ -52,7 +52,7 @@ class TestConfig:
             self.topk = 1
             self.max_tokens = 8
         elif name == 'prod':
-            self.num_local_experts = 13
+            self.num_local_experts = 12
             self.hidden = 7168
             self.N = 6144
             self.num_tokens = 256
@@ -77,6 +77,8 @@ class TestConfig:
 CONFIG = TestConfig(os.getenv('TEST_CONFIG', 'prod'))
 FULL_CORRECTNESS = int(os.getenv('FULL_CORRECTNESS', '0'))
 SKIP_CORRECTNESS = int(os.getenv('SKIP_CORRECTNESS', '0'))
+SKIP_ISOLATION = int(os.getenv('SKIP_ISOLATION', '0'))
+COL_MAJOR_SCALE = int(os.getenv('COL_MAJOR_SCALE', '1'))
 PAD_ALIGN = 1  # no padding; matches dispatch_preprocess.cuh (removed 8-alignment)
 
 
@@ -133,13 +135,25 @@ def quantize_grouped_fp4(tensor_3d):
     return fp4, scale_raw, scale_u16
 
 
-def get_gemm_block_m(shape_m, num_groups, n, k, num_ranks=0):
+def get_gemm_configs(shape_m, num_groups, n, k):
+    """Full GEMM config used by BOTH preprocess (block_m) and the fused kernel.
+
+    Returning the whole tuple and passing it to fused_dispatch guarantees the
+    preprocess block_m == kernel block_m (a mismatch silently zeroes 2nd+ blocks).
+    FORCE_EXPECTED_M lets you steer block_m for testing (e.g. 129 -> block_m=256).
+    """
     expected_m = ceil_div(shape_m, num_groups)
+    force = int(os.getenv('FORCE_EXPECTED_M', '0'))
+    if force > 0:
+        expected_m = force
     num_sms = get_num_sms()
-    _, block_m, *_ = get_best_configs_fp4(
+    return get_best_configs_fp4(
         shape_m, expected_m, n, k, num_groups, num_sms,
         gemm_type=GemmType.GroupedNoPad)
-    return block_m
+
+
+def get_gemm_block_m(shape_m, num_groups, n, k, num_ranks=0):
+    return get_gemm_configs(shape_m, num_groups, n, k)[1]
 
 
 def init_dist():
@@ -168,6 +182,20 @@ def create_ep_buffer(group, num_local_experts, num_tokens, hidden, world_size, n
 
 def _align_up(x, align):
     return (x + align - 1) & ~(align - 1) if align > 1 else x
+
+
+def nonfused_dispatch(ep_buffer, x, topk_ids_i64, num_tokens, num_total_experts):
+    """Run DeepEP low_latency_dispatch with optional column-major scale."""
+    kwargs = dict(use_mxfp4=True, quant_size=32)
+    if COL_MAJOR_SCALE:
+        kwargs['mxfp4_scale_row_major'] = False
+    (pf, ps), pc, eh, ee, ehk = ep_buffer.low_latency_dispatch(
+        x, topk_ids_i64, num_tokens, num_total_experts, **kwargs)
+    if COL_MAJOR_SCALE:
+        lhs_sc = ps
+    else:
+        lhs_sc = preprocess_mxfp4_scales(ps.contiguous().view(torch.uint8))
+    return pf, lhs_sc, pc, eh, ee, ehk
 
 
 def get_expert_token_counts(all_sym_bufs, ge, world_size):
@@ -290,7 +318,8 @@ def test_correctness(rank, world_size, group, device):
         num_local_experts, num_total_experts, max_tokens, hidden,
         local_expert_start, block_m=64)
 
-    block_m = get_gemm_block_m(shape_m_probe, num_local_experts, N, hidden // 2, num_ranks=world_size)
+    bc_configs = get_gemm_configs(shape_m_probe, num_local_experts, N, hidden // 2)
+    block_m = bc_configs[1]
 
     ws_expert = create_expert_preprocess_workspace(
         num_local_experts, world_size, max_tokens, block_m, device)
@@ -298,17 +327,20 @@ def test_correctness(rank, world_size, group, device):
         sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
         max_tokens, hidden, local_expert_start, block_m, _workspace=ws_expert)
 
-    # Recompute block_m from actual shape_m; re-run preprocess if it changed
-    block_m2 = get_gemm_block_m(shape_m, num_local_experts, N, hidden // 2, num_ranks=world_size)
-    if block_m2 != block_m:
+    # Recompute configs from actual shape_m; re-run preprocess if block_m changed
+    bc_configs2 = get_gemm_configs(shape_m, num_local_experts, N, hidden // 2)
+    if bc_configs2[1] != block_m:
         if rank == 0:
-            print(f"  block_m changed: {block_m} -> {block_m2} (shape_m_probe={shape_m_probe}, shape_m={shape_m})")
-        block_m = block_m2
+            print(f"  block_m changed: {block_m} -> {bc_configs2[1]} (shape_m_probe={shape_m_probe}, shape_m={shape_m})")
+        bc_configs = bc_configs2
+        block_m = bc_configs[1]
         ws_expert = create_expert_preprocess_workspace(
             num_local_experts, world_size, max_tokens, block_m, device)
         gl, ra, rs, sm, rc, blocks, shape_m = dispatch_expert_preprocess(
             sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
             max_tokens, hidden, local_expert_start, block_m, _workspace=ws_expert)
+    else:
+        bc_configs = bc_configs2
     if rank == 0:
         print(f"  block_m={block_m}, shape_m={shape_m}, blocks={blocks}")
 
@@ -333,34 +365,43 @@ def test_correctness(rank, world_size, group, device):
     # ---- Run block-copy GEMM ----
     k_half = hidden // 2
     NUM_COPY_BLOCKS = int(os.getenv('NCB', '8'))
+    K_TILES_PER_FLAG = int(os.getenv('K_TILES_PER_FLAG', '0'))
     bc_fp4, bc_flags = create_block_copy_buffers(
         num_local_experts, world_size, max_tokens, hidden, block_m, device)
     out_bc = torch.zeros(shape_m, N, dtype=torch.bfloat16, device=device)
 
     if rank == 0:
-        print(f"\n  Running block-copy GEMM (num_copy_blocks={NUM_COPY_BLOCKS})")
+        print(f"\n  Running block-copy GEMM (num_copy_blocks={NUM_COPY_BLOCKS}, k_tiles_per_flag={K_TILES_PER_FLAG})")
     fused_dispatch_block_copy_gemm1_fp4(
         (W_fp4, W_scale_u16), out_bc, gl, ra, rs, sm, rc,
         shape_m, max_tokens, world_size,
         local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
-        num_copy_blocks=NUM_COPY_BLOCKS, merged_sfa_addrs=merged_sfa_addrs)
+        num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,
+        configs=bc_configs,
+        merged_sfa_addrs=merged_sfa_addrs)
     torch.cuda.synchronize()
 
     # ---- Non-fused baseline (DeepEP + standard GEMM) ----
     topk_ids_i64 = topk_ids.to(torch.int64)
     ep_buffer = create_ep_buffer(group, num_local_experts, num_tokens, hidden,
                                  world_size, num_total_experts)
-    (pf, ps), pc, eh, ee, ehk = ep_buffer.low_latency_dispatch(
-        x, topk_ids_i64, num_tokens, num_total_experts,
-        use_mxfp4=True, quant_size=32)
+    pf, lhs_sc, pc, eh, ee, ehk = nonfused_dispatch(
+        ep_buffer, x, topk_ids_i64, num_tokens, num_total_experts)
     mm = max(int(pc.max().item()), 1)
-    lhs_sc = preprocess_mxfp4_scales(ps.contiguous().view(torch.uint8))
+    nf_block_m = int(os.getenv('NF_BLOCK_M', '128'))
+    if nf_block_m > 0:
+        nf_configs = get_best_configs_fp4(
+            mm * num_local_experts, mm, N, hidden // 2,
+            num_local_experts, get_num_sms(), gemm_type=GemmType.GroupedNoPad)
+    else:
+        nf_configs = None
     nf_out = torch.empty(num_local_experts, pf.shape[1], N,
                          dtype=torch.bfloat16, device=device)
     deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
         (pf.contiguous(), lhs_sc),
         (W_fp4, W_scale_u16),
-        None, nf_out, pc.to(torch.int32), mm)
+        None, nf_out, pc.to(torch.int32), mm,
+        configs=nf_configs)
     torch.cuda.synchronize()
 
     # ---- Compare block-copy vs non-fused + CPU reference ----
@@ -518,6 +559,7 @@ def test_performance(rank, world_size, group, device):
     num_warmup = 3
     num_iters = 20
     verbose = os.environ.get('PERF_VERBOSE', '0') != '0'
+    K_TILES_PER_FLAG = int(os.getenv('K_TILES_PER_FLAG', '0'))
 
     if rank == 0:
         print(f"\n{'='*60}")
@@ -616,11 +658,9 @@ def test_performance(rank, world_size, group, device):
             max_tokens, hidden, local_expert_start, block_m, _workspace=ws_expert)
 
         # Non-fused warmup
-        (pf, ps), pc, _, _, _ = ep_buffer.low_latency_dispatch(
-            x, topk_ids_i64, num_tokens, num_total_experts,
-            use_mxfp4=True, quant_size=32)
+        pf, lhs_sc, pc, _, _, _ = nonfused_dispatch(
+            ep_buffer, x, topk_ids_i64, num_tokens, num_total_experts)
         mm = max(int(pc.max().item()), 1)
-        lhs_sc = preprocess_mxfp4_scales(ps.contiguous().view(torch.uint8))
         nf_out = torch.empty(num_local_experts, pf.shape[1], N,
                              dtype=torch.bfloat16, device=device)
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
@@ -651,58 +691,62 @@ def test_performance(rank, world_size, group, device):
         num_total_experts, max_tokens, hidden, world_size, device)
 
     # ---- Benchmark non-fused (pipeline throughput) ----
-    # Print non-fused GEMM config for reference
+    fixed_expected_m = max(int(pc.max().item()), 1)
+    nf_block_m = int(os.getenv('NF_BLOCK_M', '128'))
+    if nf_block_m > 0:
+        nf_configs = get_best_configs_fp4(
+            fixed_expected_m * num_local_experts, fixed_expected_m, N, hidden // 2,
+            num_local_experts, get_num_sms(), gemm_type=GemmType.GroupedNoPad)
+    else:
+        nf_configs = None
     if rank == 0:
-        nf_num_sms = get_num_sms()
-        nf_k_half = hidden // 2
-        nf_sms, nf_bm, nf_bn, nf_bk, nf_wm, nf_wn, nf_stages, nf_smem = get_best_configs_fp4(
-            max_tokens * num_local_experts, max_tokens, N, nf_k_half, num_local_experts, nf_num_sms,
-            gemm_type=GemmType.GroupedMasked)
-        print(f"\n  Non-fused config: block_m={nf_bm}, block_n={nf_bn}, block_k={nf_bk}, "
+        if nf_configs:
+            nf_sms, nf_bm, nf_bn, nf_bk, nf_wm, nf_wn, nf_stages, nf_smem = nf_configs
+        else:
+            nf_sms, nf_bm, nf_bn, nf_bk, nf_wm, nf_wn, nf_stages, nf_smem = get_best_configs_fp4(
+                fixed_expected_m * num_local_experts, fixed_expected_m, N, hidden // 2,
+                num_local_experts, get_num_sms(), gemm_type=GemmType.GroupedMasked)
+        print(f"\n  Non-fused config (expected_m={fixed_expected_m}): block_m={nf_bm}, block_n={nf_bn}, block_k={nf_bk}, "
               f"warp_m={nf_wm}, warp_n={nf_wn}, stages={nf_stages}, num_sms={nf_sms}, smem={nf_smem}")
-    fixed_expected_m = max_tokens
     nf_pipe_out = torch.empty(num_local_experts, pf.shape[1], N,
                               dtype=torch.bfloat16, device=device)
     for _ in range(num_warmup):
-        (pf2, ps2), pc2, _, _, _ = ep_buffer.low_latency_dispatch(
-            x, topk_ids_i64, num_tokens, num_total_experts,
-            use_mxfp4=True, quant_size=32)
-        lhs2 = preprocess_mxfp4_scales(ps2.contiguous().view(torch.uint8))
+        pf2, lhs2, pc2, _, _, _ = nonfused_dispatch(
+            ep_buffer, x, topk_ids_i64, num_tokens, num_total_experts)
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
             (pf2.contiguous(), lhs2),
             (W_fp4, W_scale_u16),
-            None, nf_pipe_out, pc2.to(torch.int32), fixed_expected_m)
+            None, nf_pipe_out, pc2.to(torch.int32), fixed_expected_m,
+            configs=nf_configs)
     torch.cuda.synchronize()
 
     ev_nfp = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
     pipe_iters = num_iters * 2
     ev_nfp[0].record()
     for _ in range(pipe_iters):
-        (pf2, ps2), pc2, _, _, _ = ep_buffer.low_latency_dispatch(
-            x, topk_ids_i64, num_tokens, num_total_experts,
-            use_mxfp4=True, quant_size=32)
-        lhs2 = preprocess_mxfp4_scales(ps2.contiguous().view(torch.uint8))
+        pf2, lhs2, pc2, _, _, _ = nonfused_dispatch(
+            ep_buffer, x, topk_ids_i64, num_tokens, num_total_experts)
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
             (pf2.contiguous(), lhs2),
             (W_fp4, W_scale_u16),
-            None, nf_pipe_out, pc2.to(torch.int32), fixed_expected_m)
+            None, nf_pipe_out, pc2.to(torch.int32), fixed_expected_m,
+            configs=nf_configs)
     ev_nfp[1].record()
     torch.cuda.synchronize()
     nf_pipeline_ms = ev_nfp[0].elapsed_time(ev_nfp[1]) / pipe_iters
 
     # ---- Non-fused GEMM-only (for reference) ----
     dist.barrier()
-    (pf_go, ps_go), pc_go, _, _, _ = ep_buffer.low_latency_dispatch(
-        x, topk_ids_i64, num_tokens, num_total_experts,
-        use_mxfp4=True, quant_size=32)
-    lhs_go = preprocess_mxfp4_scales(ps_go.contiguous().view(torch.uint8))
+    pf_go, lhs_go, pc_go, _, _, _ = nonfused_dispatch(
+        ep_buffer, x, topk_ids_i64, num_tokens, num_total_experts)
     nf_go_out = torch.empty(num_local_experts, pf_go.shape[1], N,
                             dtype=torch.bfloat16, device=device)
     for _ in range(num_warmup):
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
             (pf_go.contiguous(), lhs_go),
             (W_fp4, W_scale_u16),
-            None, nf_go_out, pc_go.to(torch.int32), fixed_expected_m)
+            None, nf_go_out, pc_go.to(torch.int32), fixed_expected_m,
+            configs=nf_configs)
     torch.cuda.synchronize()
     ev_nfgo = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
     ev_nfgo[0].record()
@@ -710,7 +754,8 @@ def test_performance(rank, world_size, group, device):
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
             (pf_go.contiguous(), lhs_go),
             (W_fp4, W_scale_u16),
-            None, nf_go_out, pc_go.to(torch.int32), fixed_expected_m)
+            None, nf_go_out, pc_go.to(torch.int32), fixed_expected_m,
+            configs=nf_configs)
     ev_nfgo[1].record()
     torch.cuda.synchronize()
     nf_gemm_only_ms = ev_nfgo[0].elapsed_time(ev_nfgo[1]) / pipe_iters
@@ -724,14 +769,15 @@ def test_performance(rank, world_size, group, device):
     stream = torch.cuda.current_stream()
     bc_results = {}
 
-    for ncb in [4, 8, 13, 20]:
+    ncb_list = [int(x) for x in os.getenv('NCB_SWEEP', '4,8,12').split(',')]
+    for ncb in ncb_list:
         # Warmup
         for _ in range(num_warmup):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
                 local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=ncb,
+                num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
                 merged_sfa_addrs=merged_sfa_addrs)
         torch.cuda.synchronize()
 
@@ -754,7 +800,7 @@ def test_performance(rank, world_size, group, device):
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
                 local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=ncb,
+                num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
                 merged_sfa_addrs=merged_sfa_addrs)
             bc_end_events[i].record(stream)
         torch.cuda.synchronize()
@@ -800,122 +846,122 @@ def test_performance(rank, world_size, group, device):
     # ---- Pipeline without preprocess (upper bound of preprocess fusion savings) ----
     # Skip dispatch_expert_preprocess, use metadata from warmup/breakdown.
     # Routing is uniform → metadata unchanged between iterations.
-    dist.barrier()
-    gen_np = 60000
-    for _ in range(num_warmup):
-        g = gen_np
-        sym_buf[:metadata_size].zero_()
-        mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
-            num_local_experts=num_total_experts, num_total_experts=num_total_experts,
-            max_tokens_per_expert=max_tokens, generation=g)
-        dispatch_expert_preprocess(
-            sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
-            max_tokens, hidden, local_expert_start, block_m,
-            generation=g, sync=False, _workspace=ws_expert)
-        fused_dispatch_block_copy_gemm1_fp4(
-            (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
-            expert_shape_m, max_tokens, world_size,
-            local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-            num_copy_blocks=best_ncb,
-            merged_sfa_addrs=merged_sfa_addrs)
-    torch.cuda.synchronize()
+    no_preproc_pipeline_ms = 0.0
+    preproc_savings_ms = 0.0
+    bc_kernel_only_ms = 0.0
+    bc_kernel_std = 0.0
+    local_kernel_ms = 0.0
+    local_kernel_std = 0.0
+    if not SKIP_ISOLATION:
+        dist.barrier()
+        gen_np = 60000
+        for _ in range(num_warmup):
+            g = gen_np
+            sym_buf[:metadata_size].zero_()
+            mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
+                num_local_experts=num_total_experts, num_total_experts=num_total_experts,
+                max_tokens_per_expert=max_tokens, generation=g)
+            dispatch_expert_preprocess(
+                sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
+                max_tokens, hidden, local_expert_start, block_m,
+                generation=g, sync=False, _workspace=ws_expert)
+            fused_dispatch_block_copy_gemm1_fp4(
+                (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
+                expert_shape_m, max_tokens, world_size,
+                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
+        torch.cuda.synchronize()
 
-    np_start = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-    np_end = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-    for i in range(num_iters):
-        g = gen_np + i + 1
-        np_start[i].record(stream)
-        sym_buf[:metadata_size].zero_()
-        mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
-            num_local_experts=num_total_experts, num_total_experts=num_total_experts,
-            max_tokens_per_expert=max_tokens, generation=g)
-        fused_dispatch_block_copy_gemm1_fp4(
-            (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
-            expert_shape_m, max_tokens, world_size,
-            local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-            num_copy_blocks=best_ncb,
-            merged_sfa_addrs=merged_sfa_addrs)
-        np_end[i].record(stream)
-    torch.cuda.synchronize()
-    np_times = sorted([np_start[i].elapsed_time(np_end[i]) for i in range(num_iters)])
-    no_preproc_pipeline_ms = np_times[len(np_times) // 2]
-    preproc_savings_ms = bc_pipeline_ms - no_preproc_pipeline_ms
+        np_start = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+        np_end = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+        for i in range(num_iters):
+            g = gen_np + i + 1
+            np_start[i].record(stream)
+            sym_buf[:metadata_size].zero_()
+            mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
+                num_local_experts=num_total_experts, num_total_experts=num_total_experts,
+                max_tokens_per_expert=max_tokens, generation=g)
+            fused_dispatch_block_copy_gemm1_fp4(
+                (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
+                expert_shape_m, max_tokens, world_size,
+                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
+            np_end[i].record(stream)
+        torch.cuda.synchronize()
+        np_times = sorted([np_start[i].elapsed_time(np_end[i]) for i in range(num_iters)])
+        no_preproc_pipeline_ms = np_times[len(np_times) // 2]
+        preproc_savings_ms = bc_pipeline_ms - no_preproc_pipeline_ms
 
-    # ---- Block-Copy kernel-only: copy+GEMM without quant/preprocess ----
-    # Note: this includes P2P copy time because copy_ready_flags is zeroed inside the kernel.
-    # "Kernel-only" = fused copy+GEMM kernel, excluding quant and preprocess stages.
-    dist.barrier()
-    for _ in range(num_warmup):
-        fused_dispatch_block_copy_gemm1_fp4(
-            (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
-            expert_shape_m, max_tokens, world_size,
-            local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-            num_copy_blocks=best_ncb,
-            merged_sfa_addrs=merged_sfa_addrs)
-    torch.cuda.synchronize()
-    bc_kernel_times = []
-    for _ in range(pipe_iters):
-        ev_s = torch.cuda.Event(enable_timing=True)
-        ev_e = torch.cuda.Event(enable_timing=True)
-        ev_s.record()
-        fused_dispatch_block_copy_gemm1_fp4(
-            (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
-            expert_shape_m, max_tokens, world_size,
-            local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-            num_copy_blocks=best_ncb,
-            merged_sfa_addrs=merged_sfa_addrs)
-        ev_e.record()
-        bc_kernel_times.append((ev_s, ev_e))
-    torch.cuda.synchronize()
-    bc_kernel_ms_list = sorted([s.elapsed_time(e) for s, e in bc_kernel_times])
-    bc_kernel_only_ms = bc_kernel_ms_list[len(bc_kernel_ms_list) // 2]
-    bc_kernel_std = (sum((t - bc_kernel_only_ms)**2 for t in bc_kernel_ms_list) / len(bc_kernel_ms_list)) ** 0.5
+        # ---- Block-Copy kernel-only: copy+GEMM without quant/preprocess ----
+        dist.barrier()
+        for _ in range(num_warmup):
+            fused_dispatch_block_copy_gemm1_fp4(
+                (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
+                expert_shape_m, max_tokens, world_size,
+                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
+        torch.cuda.synchronize()
+        bc_kernel_times = []
+        for _ in range(pipe_iters):
+            ev_s = torch.cuda.Event(enable_timing=True)
+            ev_e = torch.cuda.Event(enable_timing=True)
+            ev_s.record()
+            fused_dispatch_block_copy_gemm1_fp4(
+                (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
+                expert_shape_m, max_tokens, world_size,
+                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
+            ev_e.record()
+            bc_kernel_times.append((ev_s, ev_e))
+        torch.cuda.synchronize()
+        bc_kernel_ms_list = sorted([s.elapsed_time(e) for s, e in bc_kernel_times])
+        bc_kernel_only_ms = bc_kernel_ms_list[len(bc_kernel_ms_list) // 2]
+        bc_kernel_std = (sum((t - bc_kernel_only_ms)**2 for t in bc_kernel_ms_list) / len(bc_kernel_ms_list)) ** 0.5
 
-    # ---- Local-to-local P2P isolation experiment ----
-    # Pre-copy remote FP4 data to local memory (via all_sym_bufs, already gathered).
-    # Redirect rank_addr_a to local copies so copy blocks do local HBM→HBM instead of NVLink.
-    # Comparison:
-    #   local ≈ normal  → MC contention is the bottleneck (P2P link not the issue)
-    #   local << normal → NVLink bandwidth is the bottleneck
-    dist.barrier()
-    ra_local = ra_e.clone()
-    sym_addrs_list = sym_buf_addrs.cpu().tolist()
-    ra_list = ra_e.cpu().tolist()
-    num_ra_entries = blocks_e * world_size
-    for idx in range(num_ra_entries):
-        addr = ra_list[idx]
-        if addr == 0:
-            continue
-        r = idx % world_size
-        offset = addr - sym_addrs_list[r]
-        ra_local[idx] = all_sym_bufs[r].data_ptr() + offset
+        # ---- Local-to-local P2P isolation experiment ----
+        dist.barrier()
+        ra_local = ra_e.clone()
+        sym_addrs_list = sym_buf_addrs.cpu().tolist()
+        ra_list = ra_e.cpu().tolist()
+        num_ra_entries = blocks_e * world_size
+        for idx in range(num_ra_entries):
+            addr = ra_list[idx]
+            if addr == 0:
+                continue
+            r = idx % world_size
+            offset = addr - sym_addrs_list[r]
+            ra_local[idx] = all_sym_bufs[r].data_ptr() + offset
 
-    for _ in range(num_warmup):
-        fused_dispatch_block_copy_gemm1_fp4(
-            (W_fp4, W_scale_u16), out_bc, gl_e, ra_local, rs_e, sm_e, rc_e,
-            expert_shape_m, max_tokens, world_size,
-            local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-            num_copy_blocks=best_ncb,
-            merged_sfa_addrs=merged_sfa_addrs)
-    torch.cuda.synchronize()
+        for _ in range(num_warmup):
+            fused_dispatch_block_copy_gemm1_fp4(
+                (W_fp4, W_scale_u16), out_bc, gl_e, ra_local, rs_e, sm_e, rc_e,
+                expert_shape_m, max_tokens, world_size,
+                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
+        torch.cuda.synchronize()
 
-    local_kernel_times = []
-    for _ in range(pipe_iters):
-        ev_s = torch.cuda.Event(enable_timing=True)
-        ev_e = torch.cuda.Event(enable_timing=True)
-        ev_s.record()
-        fused_dispatch_block_copy_gemm1_fp4(
-            (W_fp4, W_scale_u16), out_bc, gl_e, ra_local, rs_e, sm_e, rc_e,
-            expert_shape_m, max_tokens, world_size,
-            local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-            num_copy_blocks=best_ncb,
-            merged_sfa_addrs=merged_sfa_addrs)
-        ev_e.record()
-        local_kernel_times.append((ev_s, ev_e))
-    torch.cuda.synchronize()
-    local_ms_list = sorted([s.elapsed_time(e) for s, e in local_kernel_times])
-    local_kernel_ms = local_ms_list[len(local_ms_list) // 2]
-    local_kernel_std = (sum((t - local_kernel_ms)**2 for t in local_ms_list) / len(local_ms_list)) ** 0.5
+        local_kernel_times = []
+        for _ in range(pipe_iters):
+            ev_s = torch.cuda.Event(enable_timing=True)
+            ev_e = torch.cuda.Event(enable_timing=True)
+            ev_s.record()
+            fused_dispatch_block_copy_gemm1_fp4(
+                (W_fp4, W_scale_u16), out_bc, gl_e, ra_local, rs_e, sm_e, rc_e,
+                expert_shape_m, max_tokens, world_size,
+                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
+            ev_e.record()
+            local_kernel_times.append((ev_s, ev_e))
+        torch.cuda.synchronize()
+        local_ms_list = sorted([s.elapsed_time(e) for s, e in local_kernel_times])
+        local_kernel_ms = local_ms_list[len(local_ms_list) // 2]
+        local_kernel_std = (sum((t - local_kernel_ms)**2 for t in local_ms_list) / len(local_ms_list)) ** 0.5
 
     # ---- Print results ----
     if rank == 0:
@@ -989,6 +1035,167 @@ def test_performance(rank, world_size, group, device):
 
 
 # ============================================================
+# Test 3: K-stripe clock64 profiling
+# ============================================================
+
+def test_kstripe_profile(rank, world_size, group, device):
+    cfg = CONFIG
+    num_total_experts = cfg.num_total_experts(world_size)
+    num_local_experts = cfg.num_local_experts
+    local_expert_start = cfg.local_expert_start(rank)
+    hidden = cfg.hidden
+    N = cfg.N
+    num_tokens = cfg.num_tokens
+    topk = cfg.topk
+    max_tokens = cfg.max_tokens
+    K_TILES_PER_FLAG = int(os.getenv('K_TILES_PER_FLAG', '4'))
+    NUM_COPY_BLOCKS = int(os.getenv('NCB', '8'))
+
+    if rank == 0:
+        print(f"\n{'='*60}")
+        print(f"Test 3: K-stripe clock64 profiling")
+        print(f"  K_TILES_PER_FLAG={K_TILES_PER_FLAG}, NCB={NUM_COPY_BLOCKS}")
+        print(f"{'='*60}\n")
+
+    torch.manual_seed(99 + rank)
+    x = generate_test_input(num_tokens, hidden, device)
+    token_idx = torch.arange(num_tokens, device=device, dtype=torch.int32)
+    topk_ids = torch.stack(
+        [(token_idx * topk + j) % num_total_experts for j in range(topk)], dim=1)
+
+    torch.manual_seed(200)
+    W = torch.randn(num_local_experts, N, hidden, dtype=torch.bfloat16, device=device) * 0.01
+    W_fp4, W_scale_raw, W_scale_u16 = quantize_grouped_fp4(W)
+
+    buf_size = get_sym_buffer_size(num_local_experts, num_total_experts, max_tokens, hidden)
+    sym_buf, sym_buf_addrs, sym_handle = alloc_sym_buffer(buf_size, device, group)
+
+    block_m = get_gemm_block_m(num_tokens * topk, num_local_experts, N, hidden // 2, num_ranks=world_size)
+
+    metadata_size = ((num_total_experts * 4 + 15) // 16) * 16
+
+    sym_buf[:metadata_size].zero_()
+    mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
+        num_local_experts=num_total_experts, num_total_experts=num_total_experts,
+        max_tokens_per_expert=max_tokens)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    ws_expert = create_expert_preprocess_workspace(
+        num_local_experts, world_size, max_tokens, block_m, device)
+    gl_e, ra_e, rs_e, sm_e, rc_e, total_mb, shape_m = dispatch_expert_preprocess(
+        sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
+        max_tokens, hidden, local_expert_start, block_m,
+        sync=True, _workspace=ws_expert)
+
+    all_sym_bufs = [torch.empty_like(sym_buf) for _ in range(world_size)]
+    dist.all_gather(all_sym_bufs, sym_buf)
+    merged_sfa, merged_sfa_addrs = build_merged_sfa(
+        all_sym_bufs, num_local_experts, local_expert_start,
+        num_total_experts, max_tokens, hidden, world_size, device)
+
+    bc_fp4, bc_flags = create_block_copy_buffers(
+        num_local_experts, world_size, max_tokens, hidden, block_m, device)
+    out_bc = torch.zeros(shape_m, N, dtype=torch.bfloat16, device=device)
+
+    max_mb = total_mb
+    # Compute num_stripes for buffer layout
+    block_k = 128  # from tuner config
+    num_k_tiles = (hidden // 2) // block_k
+    num_stripes = (num_k_tiles // K_TILES_PER_FLAG) if K_TILES_PER_FLAG > 0 else 1
+    profile_buf_size = max_mb * (2 * num_stripes + 1)
+    profile_buf = torch.zeros(profile_buf_size, dtype=torch.int64, device=device)
+
+    if rank == 0:
+        print(f"  num_k_tiles={num_k_tiles}, num_stripes={num_stripes}, max_mb={max_mb}")
+
+    for _ in range(5):
+        fused_dispatch_block_copy_gemm1_fp4(
+            (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
+            shape_m, max_tokens, world_size,
+            local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
+            num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,
+            merged_sfa_addrs=merged_sfa_addrs)
+    torch.cuda.synchronize()
+
+    NUM_ITERS = 20
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    start_evt.record()
+    for _ in range(NUM_ITERS):
+        fused_dispatch_block_copy_gemm1_fp4(
+            (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
+            shape_m, max_tokens, world_size,
+            local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
+            num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,
+            merged_sfa_addrs=merged_sfa_addrs)
+    end_evt.record()
+    torch.cuda.synchronize()
+    kernel_ms = start_evt.elapsed_time(end_evt) / NUM_ITERS
+
+    profile_buf.zero_()
+    fused_dispatch_block_copy_gemm1_fp4(
+        (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
+        shape_m, max_tokens, world_size,
+        local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
+        num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,
+        merged_sfa_addrs=merged_sfa_addrs,
+        kstripe_profile_buf=profile_buf)
+    torch.cuda.synchronize()
+
+    prof = profile_buf.cpu().numpy()
+    # New layout: [copy: max_mb * num_stripes] [gemm_wait: max_mb * num_stripes] [gemm_mma: max_mb]
+    copy_section = prof[:max_mb * num_stripes].reshape(max_mb, num_stripes)
+    wait_section = prof[max_mb * num_stripes : max_mb * num_stripes * 2].reshape(max_mb, num_stripes)
+    mma_section = prof[max_mb * num_stripes * 2 : max_mb * num_stripes * 2 + max_mb]
+
+    if rank == 0:
+        mode = f"kstripe(KTPF={K_TILES_PER_FLAG})" if K_TILES_PER_FLAG > 0 else "mblock"
+        print(f"\n  Mode: {mode}, total_m_blocks={max_mb}, num_stripes={num_stripes}")
+        print(f"  Kernel time: {kernel_ms:.3f} ms (avg over {NUM_ITERS} iters)")
+
+        # Per-stripe copy stats
+        print(f"\n  Copy block (per stripe, clock cycles):")
+        for s in range(num_stripes):
+            stripe_data = copy_section[:, s]
+            active = stripe_data[stripe_data > 0]
+            if len(active) > 0:
+                med = int(sorted(active)[len(active)//2])
+                print(f"    stripe {s}: median={med:>7}, mean={active.mean():.0f}, "
+                      f"min={active.min():.0f}, max={active.max():.0f} (n={len(active)})")
+
+        # Per-stripe GEMM wait stats
+        print(f"\n  GEMM wait (per stripe, clock cycles):")
+        for s in range(num_stripes):
+            stripe_data = wait_section[:, s]
+            active = stripe_data[stripe_data > 0]
+            if len(active) > 0:
+                med = int(sorted(active)[len(active)//2])
+                print(f"    stripe {s}: median={med:>7}, mean={active.mean():.0f}, "
+                      f"min={active.min():.0f}, max={active.max():.0f} (n={len(active)})")
+            else:
+                print(f"    stripe {s}: (no wait, flag already ready)")
+
+        # MMA total stats
+        active_mma = mma_section[mma_section > 0]
+        if len(active_mma) > 0:
+            med = int(sorted(active_mma)[len(active_mma)//2])
+            print(f"\n  GEMM MMA total (per M-block, clock cycles):")
+            print(f"    median={med}, mean={active_mma.mean():.0f}, "
+                  f"min={active_mma.min():.0f}, max={active_mma.max():.0f} (n={len(active_mma)})")
+
+        # Summary: total copy per M-block (sum across stripes)
+        copy_total_per_mb = copy_section.sum(axis=1)
+        active_total = copy_total_per_mb[copy_total_per_mb > 0]
+        if len(active_total) > 0:
+            med = int(sorted(active_total)[len(active_total)//2])
+            print(f"\n  Copy total per M-block (sum of stripes):")
+            print(f"    median={med}, mean={active_total.mean():.0f}")
+
+    return True
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -1028,6 +1235,20 @@ if __name__ == '__main__':
             print(f"Test 2 error: {e}")
             import traceback; traceback.print_exc()
         results['test2_performance'] = False
+
+    dist.barrier()
+
+    if os.getenv('KSTRIPE_PROFILE', '0') == '1':
+        try:
+            results['test3_profile'] = test_kstripe_profile(rank, world_size, group, device)
+        except Exception as e:
+            if rank == 0:
+                print(f"Test 3 error: {e}")
+                import traceback; traceback.print_exc()
+            results['test3_profile'] = False
+        dist.barrier()
+    elif rank == 0:
+        print("Skipping Test 3 (profiling) — set KSTRIPE_PROFILE=1 to enable")
 
     dist.barrier()
     dist.destroy_process_group()

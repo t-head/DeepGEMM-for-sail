@@ -205,6 +205,196 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
     }
 }
 
+template <uint32_t BLOCK_M, uint32_t NumRanks, uint32_t BLOCK_K, uint32_t K_TILES_PER_FLAG>
+__device__ void run_copy_block_kstripe(
+    const TileSchedulerArguments& sched, uint32_t total_m_blocks)
+{
+    constexpr uint32_t stripe_int4s = K_TILES_PER_FLAG * BLOCK_K / 16;
+
+    const uint32_t num_copy = sched.num_copy_blocks;
+    const uint32_t k_half = sched.local_buf_k_half;
+    const uint32_t k_half_int4s = k_half / 16;
+    const uint32_t max_tok = sched.local_buf_max_tokens;
+    const uint32_t num_stripes = k_half_int4s / stripe_int4s;
+    constexpr uint32_t nr = NumRanks;
+    const uint32_t stride = blockDim.x;
+
+    for (uint32_t mb = blockIdx.x; mb < total_m_blocks; mb += num_copy) {
+        uint4 gl = (reinterpret_cast<const uint4*>(sched.grouped_layout) + 1)[mb];
+        uint32_t expert_local = gl.x;
+        uint32_t m_block_in_expert = mb - gl.z;
+
+        uint8_t* local_a_base = sched.local_fp4_buf +
+            (uint64_t)expert_local * max_tok * k_half +
+            (uint64_t)m_block_in_expert * BLOCK_M * k_half;
+
+        for (uint32_t ks = 0; ks < num_stripes; ++ks) {
+            const uint32_t stripe_col_start = ks * stripe_int4s;
+
+            uint32_t r = 0;
+            #pragma unroll
+            for (; r + 8 <= nr; r += 8) {
+                uint32_t idx = mb * nr + r;
+                const int4* __restrict__ s0 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx));
+                const int4* __restrict__ s1 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx + 1));
+                const int4* __restrict__ s2 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx + 2));
+                const int4* __restrict__ s3 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx + 3));
+                const int4* __restrict__ s4 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx + 4));
+                const int4* __restrict__ s5 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx + 5));
+                const int4* __restrict__ s6 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx + 6));
+                const int4* __restrict__ s7 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx + 7));
+
+                int4* __restrict__ d0 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx) * k_half);
+                int4* __restrict__ d1 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 1) * k_half);
+                int4* __restrict__ d2 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 2) * k_half);
+                int4* __restrict__ d3 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 3) * k_half);
+                int4* __restrict__ d4 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 4) * k_half);
+                int4* __restrict__ d5 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 5) * k_half);
+                int4* __restrict__ d6 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 6) * k_half);
+                int4* __restrict__ d7 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 7) * k_half);
+
+                uint32_t n0 = __ldg(sched.rank_counts + idx) * stripe_int4s;
+                uint32_t n1 = __ldg(sched.rank_counts + idx + 1) * stripe_int4s;
+                uint32_t n2 = __ldg(sched.rank_counts + idx + 2) * stripe_int4s;
+                uint32_t n3 = __ldg(sched.rank_counts + idx + 3) * stripe_int4s;
+                uint32_t n4 = __ldg(sched.rank_counts + idx + 4) * stripe_int4s;
+                uint32_t n5 = __ldg(sched.rank_counts + idx + 5) * stripe_int4s;
+                uint32_t n6 = __ldg(sched.rank_counts + idx + 6) * stripe_int4s;
+                uint32_t n7 = __ldg(sched.rank_counts + idx + 7) * stripe_int4s;
+
+                uint32_t min_n = min(min(min(n0, n1), min(n2, n3)), min(min(n4, n5), min(n6, n7)));
+                uint32_t max_n = max(max(max(n0, n1), max(n2, n3)), max(max(n4, n5), max(n6, n7)));
+                uint32_t i = threadIdx.x;
+                for (; i < min_n; i += stride) {
+                    uint32_t row = i / stripe_int4s;
+                    uint32_t col = i % stripe_int4s;
+                    uint32_t addr = row * k_half_int4s + stripe_col_start + col;
+                    int4 v0 = ld_nc_global(s0 + addr);
+                    int4 v1 = ld_nc_global(s1 + addr);
+                    int4 v2 = ld_nc_global(s2 + addr);
+                    int4 v3 = ld_nc_global(s3 + addr);
+                    int4 v4 = ld_nc_global(s4 + addr);
+                    int4 v5 = ld_nc_global(s5 + addr);
+                    int4 v6 = ld_nc_global(s6 + addr);
+                    int4 v7 = ld_nc_global(s7 + addr);
+                    d0[addr] = v0; d1[addr] = v1; d2[addr] = v2; d3[addr] = v3;
+                    d4[addr] = v4; d5[addr] = v5; d6[addr] = v6; d7[addr] = v7;
+                }
+                for (; i < max_n; i += stride) {
+                    uint32_t row = i / stripe_int4s;
+                    uint32_t col = i % stripe_int4s;
+                    uint32_t addr = row * k_half_int4s + stripe_col_start + col;
+                    int4 v0, v1, v2, v3, v4, v5, v6, v7;
+                    if (i < n0) v0 = ld_nc_global(s0 + addr);
+                    if (i < n1) v1 = ld_nc_global(s1 + addr);
+                    if (i < n2) v2 = ld_nc_global(s2 + addr);
+                    if (i < n3) v3 = ld_nc_global(s3 + addr);
+                    if (i < n4) v4 = ld_nc_global(s4 + addr);
+                    if (i < n5) v5 = ld_nc_global(s5 + addr);
+                    if (i < n6) v6 = ld_nc_global(s6 + addr);
+                    if (i < n7) v7 = ld_nc_global(s7 + addr);
+                    if (i < n0) d0[addr] = v0; if (i < n1) d1[addr] = v1;
+                    if (i < n2) d2[addr] = v2; if (i < n3) d3[addr] = v3;
+                    if (i < n4) d4[addr] = v4; if (i < n5) d5[addr] = v5;
+                    if (i < n6) d6[addr] = v6; if (i < n7) d7[addr] = v7;
+                }
+            }
+
+            #pragma unroll
+            for (; r + 4 <= nr; r += 4) {
+                uint32_t idx = mb * nr + r;
+                const int4* __restrict__ s0 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx));
+                const int4* __restrict__ s1 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx + 1));
+                const int4* __restrict__ s2 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx + 2));
+                const int4* __restrict__ s3 = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx + 3));
+
+                int4* __restrict__ d0 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx) * k_half);
+                int4* __restrict__ d1 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 1) * k_half);
+                int4* __restrict__ d2 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 2) * k_half);
+                int4* __restrict__ d3 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 3) * k_half);
+
+                uint32_t n0 = __ldg(sched.rank_counts + idx) * stripe_int4s;
+                uint32_t n1 = __ldg(sched.rank_counts + idx + 1) * stripe_int4s;
+                uint32_t n2 = __ldg(sched.rank_counts + idx + 2) * stripe_int4s;
+                uint32_t n3 = __ldg(sched.rank_counts + idx + 3) * stripe_int4s;
+
+                uint32_t min_n = min(min(n0, n1), min(n2, n3));
+                uint32_t max_n = max(max(n0, n1), max(n2, n3));
+                uint32_t i = threadIdx.x;
+                for (; i < min_n; i += stride) {
+                    uint32_t row = i / stripe_int4s;
+                    uint32_t col = i % stripe_int4s;
+                    uint32_t addr = row * k_half_int4s + stripe_col_start + col;
+                    int4 v0 = ld_nc_global(s0 + addr);
+                    int4 v1 = ld_nc_global(s1 + addr);
+                    int4 v2 = ld_nc_global(s2 + addr);
+                    int4 v3 = ld_nc_global(s3 + addr);
+                    d0[addr] = v0;
+                    d1[addr] = v1;
+                    d2[addr] = v2;
+                    d3[addr] = v3;
+                }
+                for (; i < max_n; i += stride) {
+                    uint32_t row = i / stripe_int4s;
+                    uint32_t col = i % stripe_int4s;
+                    uint32_t addr = row * k_half_int4s + stripe_col_start + col;
+                    int4 v0, v1, v2, v3;
+                    if (i < n0) v0 = ld_nc_global(s0 + addr);
+                    if (i < n1) v1 = ld_nc_global(s1 + addr);
+                    if (i < n2) v2 = ld_nc_global(s2 + addr);
+                    if (i < n3) v3 = ld_nc_global(s3 + addr);
+                    if (i < n0) d0[addr] = v0;
+                    if (i < n1) d1[addr] = v1;
+                    if (i < n2) d2[addr] = v2;
+                    if (i < n3) d3[addr] = v3;
+                }
+            }
+
+            #pragma unroll
+            for (; r < nr; ++r) {
+                uint32_t idx = mb * nr + r;
+                const int4* __restrict__ src = reinterpret_cast<const int4*>(
+                    __ldg(sched.rank_addr_a + idx));
+                int4* __restrict__ dst = reinterpret_cast<int4*>(
+                    local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx) * k_half);
+                uint32_t total_int4s = __ldg(sched.rank_counts + idx) * stripe_int4s;
+
+                uint32_t i = threadIdx.x;
+                for (; i + 3 * stride < total_int4s; i += 4 * stride) {
+                    uint32_t r0 = i / stripe_int4s, c0 = i % stripe_int4s;
+                    uint32_t r1 = (i + stride) / stripe_int4s, c1 = (i + stride) % stripe_int4s;
+                    uint32_t r2 = (i + 2*stride) / stripe_int4s, c2 = (i + 2*stride) % stripe_int4s;
+                    uint32_t r3 = (i + 3*stride) / stripe_int4s, c3 = (i + 3*stride) % stripe_int4s;
+                    uint32_t a0 = r0 * k_half_int4s + stripe_col_start + c0;
+                    uint32_t a1 = r1 * k_half_int4s + stripe_col_start + c1;
+                    uint32_t a2 = r2 * k_half_int4s + stripe_col_start + c2;
+                    uint32_t a3 = r3 * k_half_int4s + stripe_col_start + c3;
+                    int4 v0 = ld_nc_global(src + a0);
+                    int4 v1 = ld_nc_global(src + a1);
+                    int4 v2 = ld_nc_global(src + a2);
+                    int4 v3 = ld_nc_global(src + a3);
+                    dst[a0] = v0;
+                    dst[a1] = v1;
+                    dst[a2] = v2;
+                    dst[a3] = v3;
+                }
+                for (; i < total_int4s; i += stride) {
+                    uint32_t row = i / stripe_int4s;
+                    uint32_t col = i % stripe_int4s;
+                    uint32_t addr = row * k_half_int4s + stripe_col_start + col;
+                    dst[addr] = ld_nc_global(src + addr);
+                }
+            }
+
+            __syncthreads();
+            __threadfence();
+            if (threadIdx.x == 0) {
+                sched.copy_ready_flags[mb] = ks + 1;
+            }
+        }
+    }
+}
+
 template <
   class ProblemShape_,
   class CollectiveMainloop_,
@@ -469,7 +659,13 @@ class DeepGemmUniversal <
     if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch && TileScheduler::kNumCopyBlocks > 0) {
       if (blockIdx.x < TileScheduler::kNumCopyBlocks) {
         uint32_t total_m_blocks = params.scheduler.grouped_layout[0];
-        run_copy_block<BlockM, TileScheduler::kNumRanks>(params.scheduler, total_m_blocks);
+        if constexpr (TileScheduler::kKTilesPerFlag > 0) {
+          run_copy_block_kstripe<BlockM, TileScheduler::kNumRanks,
+              cute::size<2>(TileShape{}), TileScheduler::kKTilesPerFlag>(
+              params.scheduler, total_m_blocks);
+        } else {
+          run_copy_block<BlockM, TileScheduler::kNumRanks>(params.scheduler, total_m_blocks);
+        }
         return;
       }
     }
@@ -536,7 +732,7 @@ class DeepGemmUniversal <
 
       if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch) {
         uint32_t global_m_blk = deep_scheduler.curr_global_block_m_idx;
-        if constexpr (TileScheduler::kNumCopyBlocks > 0) {
+        if constexpr (TileScheduler::kNumCopyBlocks > 0 && TileScheduler::kKTilesPerFlag == 0) {
             while (fd2_copy_flags[global_m_blk] == 0) { }
             asm volatile("" ::: "memory");
         }
@@ -1059,7 +1255,13 @@ public:
     if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch && TileScheduler::kNumCopyBlocks > 0) {
       if (blockIdx.x < TileScheduler::kNumCopyBlocks) {
         uint32_t total_m_blocks = params.scheduler.grouped_layout[0];
-        run_copy_block<BlockM, TileScheduler::kNumRanks>(params.scheduler, total_m_blocks);
+        if constexpr (TileScheduler::kKTilesPerFlag > 0) {
+          run_copy_block_kstripe<BlockM, TileScheduler::kNumRanks,
+              cute::size<2>(TileShape{}), TileScheduler::kKTilesPerFlag>(
+              params.scheduler, total_m_blocks);
+        } else {
+          run_copy_block<BlockM, TileScheduler::kNumRanks>(params.scheduler, total_m_blocks);
+        }
         return;
       }
     }
@@ -1130,7 +1332,7 @@ public:
       const ElementSFA* ptr_scale_A;
       if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch) {
           uint32_t global_m_blk = deep_scheduler.curr_global_block_m_idx;
-          if constexpr (TileScheduler::kNumCopyBlocks > 0) {
+          if constexpr (TileScheduler::kNumCopyBlocks > 0 && TileScheduler::kKTilesPerFlag == 0) {
               while (fd_copy_flags[global_m_blk] == 0) { }
               asm volatile("" ::: "memory");
           }
@@ -1162,7 +1364,13 @@ public:
       }
       MainloopParams update_params = {
         {M, N, K}, ptr_A, params.mainloop.dA, ptr_B, params.mainloop.dB,
-        ptr_scale_A, dSFA_local, ptr_scale_B, params.mainloop.dSFB
+        ptr_scale_A, dSFA_local, ptr_scale_B, params.mainloop.dSFB,
+        // k-stripe overlap: only active for FusedDispatch with copy blocks and KTilesPerFlag>0
+        (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch
+          && TileScheduler::kNumCopyBlocks > 0 && TileScheduler::kKTilesPerFlag > 0)
+            ? fd_copy_flags : nullptr,
+        deep_scheduler.curr_global_block_m_idx,
+        TileScheduler::kKTilesPerFlag
       };
       CollectiveMainloop collective_mma(update_params, problem_shape_MNKL);
       auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, update_params);
@@ -1384,6 +1592,11 @@ struct CollectiveMmaScaleFp4
     StrideSFA dSFA;
     ElementSFB const* ptr_scale_B;
     StrideSFB dSFB;
+    // k-stripe copy/compute overlap (FusedDispatch + KTilesPerFlag>0 only).
+    // nullptr => disabled, all stripe waits are skipped (non-fused paths).
+    volatile uint32_t* copy_ready_flags = nullptr;
+    uint32_t copy_flag_m_blk = 0;
+    uint32_t copy_k_tiles_per_flag = 0;
   };
 
   // Device side kernel params
@@ -1600,12 +1813,34 @@ struct CollectiveMmaScaleFp4
       }
     };
 
+    // k-stripe copy/compute overlap: before issuing the async load of k-tile t,
+    // ensure the copy block has published stripe (t / ktpf) into local HBM.
+    // The copy block sets copy_ready_flags[mb] = stripe_idx+1 after each stripe;
+    // a device __threadfence() there makes stripe data visible before the flag.
+    // Disabled (nullptr) for non-fused paths and KTilesPerFlag==0.
+    volatile uint32_t* ks_flags = params_.copy_ready_flags;
+    const uint32_t ks_mblk = params_.copy_flag_m_blk;
+    const int ks_ktpf = (int)params_.copy_k_tiles_per_flag;
+    int ks_loaded_k = 0;      // number of k-tiles whose load has been issued
+    int ks_next_bnd = 0;      // k-tile index of the next stripe boundary
+    uint32_t ks_cur_stripe = 0;
+    auto wait_stripe = [&]() {
+      if (ks_flags != nullptr && ks_loaded_k >= ks_next_bnd) {
+        while (ks_flags[ks_mblk] < ks_cur_stripe + 1) { }
+        asm volatile("" ::: "memory");
+        ++ks_cur_stripe;
+        ks_next_bnd += ks_ktpf;
+      }
+    };
+
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
       if (k_tile_count > 0){
+        wait_stripe();
         copy_to_tsm(k_pipe, *k_tile_iter, warp_idx);
         ++k_tile_iter;
+        ++ks_loaded_k;
       }
       cp_async_fence();
       --k_tile_count;
@@ -1742,8 +1977,10 @@ struct CollectiveMmaScaleFp4
           __syncthreads();
 
           if (k_tile_count > 0){
+            wait_stripe();
             copy_to_tsm(smem_pipe_write, *k_tile_iter, warp_idx);
             ++k_tile_iter;
+            ++ks_loaded_k;
           }
           cp_async_fence();
 
@@ -2017,7 +2254,7 @@ public:
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
     }
 
-    template <uint32_t NumRanks, uint32_t NumCopyBlocks = 0>
+    template <uint32_t NumRanks, uint32_t NumCopyBlocks = 0, uint32_t KTilesPerFlag = 0>
     static void run_fused_dispatch(
         uint8_t *b_ptr, uint16_t *scale_b,
         float *c_ptr, __nv_bfloat16 *d_ptr,
@@ -2032,10 +2269,14 @@ public:
         const uint64_t *remote_addr_sfa,
         uint8_t* local_fp4_buf,
         volatile uint32_t* copy_ready_flags,
+        uint64_t* kstripe_profile_buf = nullptr,
+        uint32_t kstripe_profile_max_mb = 0,
         profiling::GemmProfileRecord* profile_records = nullptr) {
 
         static_assert(kGemmType == GemmType::FusedDispatch,
                       "run_fused_dispatch requires GemmType::FusedDispatch");
+        static_assert(KTilesPerFlag == 0 || (ShapeK / BlockK) % KTilesPerFlag == 0,
+                      "KTilesPerFlag must evenly divide num_k_tiles");
         constexpr int N_EXPAND = NExpand;
 
         using ElementA    = cutlass::float4_t;
@@ -2134,7 +2375,7 @@ public:
             IsAligedN>;
 
         using TileScheduler = DeepGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND, kNumGroups,
-                                                ceil_div((uint32_t)ShapeN, (uint32_t)(BlockN * N_EXPAND)), 2, NumRanks, NumCopyBlocks>;
+                                                ceil_div((uint32_t)ShapeN, (uint32_t)(BlockN * N_EXPAND)), 2, NumRanks, NumCopyBlocks, KTilesPerFlag>;
         using GemmKernel = typename deep_gemm::DeepGemmUniversal<
             Shape<int,int,int,int>,
             CollectiveMainloop,
@@ -2179,6 +2420,8 @@ public:
             remote_addr_sfa,
             local_fp4_buf, k_half, max_tokens_per_expert,
             copy_ready_flags, NumCopyBlocks);
+        (void)kstripe_profile_buf;
+        (void)kstripe_profile_max_mb;
 
         // ptr_A/ptr_SFA are resolved per-block in operator(); use local_fp4_buf as placeholder
         typename GemmKernel::Arguments arguments{

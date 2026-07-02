@@ -2,8 +2,9 @@
 # AKO4ALL Bench Script — Block-copy fused dispatch GEMM1
 # Usage: bash scripts/bench.sh [label]
 #
-# Copies solution/ files into the JIT include path, then runs the
-# multi-GPU benchmark inside docker container deepgemm.lxh.
+# Kernel sources live directly under deep_gemm/ (single source of truth).
+# Runs the multi-GPU benchmark inside docker container deepgemm.lxh and
+# archives the kernel sources + output to trajectory/ for AKO iteration history.
 set -eo pipefail
 cd "$(dirname "$0")/.."
 
@@ -20,18 +21,15 @@ NCB="${NCB:-8}"
 
 echo "=== AKO Bench: ${NPROC}-GPU (${GPUS}), ncb=${NCB}, label=${LABEL:-baseline} ==="
 
-# --- Copy solution files to JIT include path ---
+# --- Kernel source files (edited in place; deep_gemm/ is the single source) ---
 INCLUDE_DIR="deep_gemm/include/deep_gemm"
 JIT_KERNELS_DIR="deep_gemm/jit_kernels"
-
-for f in solution/*.cuh; do
-    [ -f "$f" ] && cp "$f" "$INCLUDE_DIR/"
-done
-if [ -f solution/dispatch_fused_gemm.py ]; then
-    cp solution/dispatch_fused_gemm.py "$JIT_KERNELS_DIR/"
-fi
-
-echo "Solution files copied to JIT paths."
+KERNEL_SRCS=(
+    "${INCLUDE_DIR}/fp4_gemm_cutlass3.cuh"
+    "${INCLUDE_DIR}/scheduler_cutlass3.cuh"
+    "${INCLUDE_DIR}/dispatch_preprocess.cuh"
+    "${JIT_KERNELS_DIR}/dispatch_fused_gemm.py"
+)
 
 # --- Container paths ---
 CONTAINER="deepgemm.lxh"
@@ -59,7 +57,9 @@ else
     TRAJ_DIR="trajectory/${TIMESTAMP}"
 fi
 mkdir -p "$TRAJ_DIR"
-cp -r solution/* "$TRAJ_DIR/"
+for f in "${KERNEL_SRCS[@]}"; do
+    [ -f "$f" ] && cp "$f" "$TRAJ_DIR/"
+done
 [ -f _bench_output.txt ] && mv _bench_output.txt "$TRAJ_DIR/output.txt"
 echo "Trajectory saved to: $TRAJ_DIR"
 

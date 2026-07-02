@@ -594,3 +594,67 @@ P2P 隔离实验（将 rank_addr_a 全部重定向到本地数据副本）表明
 
 **P2P link 是最大单一瓶颈**，NVLink 带宽限制了 copy block 吞吐量。
 4-GPU 开销更大因为 75% 数据需远程读取（vs 2-GPU 的 50%）。
+
+---
+
+## 8. 测试与运行
+
+### 测试脚本
+
+`tests/test_block_copy_gemm1_multi_gpu.py` — 多 GPU 正确性 + 性能测试。
+
+### 环境变量
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `TEST_CONFIG` | 配置选择: `small`(2 experts), `prod`(13 experts), `prod12`(12 experts) | `prod` |
+| `SKIP_CORRECTNESS` | 设为 `1` 跳过正确性测试，只跑性能 | `0` |
+| `FULL_CORRECTNESS` | 设为 `1` 开启逐 expert Python reference 对比 | `0` |
+| `PERF_VERBOSE` | 设为 `1` 输出详细性能分解（P2P isolation 等） | `0` |
+
+### 执行命令
+
+需在 Docker 容器 (`deepgemm.lxh`) 内执行，项目根目录为 `/DeepGemm_workspace/codebase/DeepGemm-block-copy`。
+
+```bash
+# 8-GPU 性能测试（prod 配置，13 experts/rank）
+SKIP_CORRECTNESS=1 PERF_VERBOSE=1 TEST_CONFIG=prod \
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  torchrun --nproc_per_node=8 --master_port=29530 \
+  tests/test_block_copy_gemm1_multi_gpu.py --verbose
+
+# 8-GPU 性能测试（12 experts/rank）
+SKIP_CORRECTNESS=1 PERF_VERBOSE=1 TEST_CONFIG=prod12 \
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  torchrun --nproc_per_node=8 --master_port=29530 \
+  tests/test_block_copy_gemm1_multi_gpu.py --verbose
+
+# 2-GPU 正确性 + 性能
+FULL_CORRECTNESS=1 PERF_VERBOSE=1 \
+  CUDA_VISIBLE_DEVICES=2,3 \
+  torchrun --nproc_per_node=2 --master_port=29530 \
+  tests/test_block_copy_gemm1_multi_gpu.py --verbose
+
+# 4-GPU 正确性 + 性能
+FULL_CORRECTNESS=1 PERF_VERBOSE=1 \
+  CUDA_VISIBLE_DEVICES=2,3,4,5 \
+  torchrun --nproc_per_node=4 --master_port=29531 \
+  tests/test_block_copy_gemm1_multi_gpu.py --verbose
+```
+
+### 宿主机调用方式
+
+```bash
+sudo docker exec 98d3ee763c25 bash -c "cd /DeepGemm_workspace/codebase/DeepGemm-block-copy && \
+  SKIP_CORRECTNESS=1 PERF_VERBOSE=1 TEST_CONFIG=prod \
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  torchrun --nproc_per_node=8 --master_port=29530 \
+  tests/test_block_copy_gemm1_multi_gpu.py --verbose"
+```
+
+### 注意事项
+
+- 运行前用 `ppu-smi` 确认目标 GPU 空闲（避免抢占导致性能数据不准）
+- `--master_port` 需避免端口冲突，多组测试并行时使用不同端口
+- JIT 首次编译耗时约 1-2 分钟，后续命中缓存（`~/.deep_gemm/cache/`）
+- 性能数据取 median of 20 iterations，建议连跑 3 次确认稳定性

@@ -155,10 +155,8 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
 
     disable_cache = os.environ.get("DG_JIT_DISABLE_CACHE")
     if (runtime_cache[path] is not None) and (disable_cache is None or disable_cache == '0'):
-        print(f'Using cached JIT runtime {path} {name} during build')
-
         if os.getenv('DG_JIT_DEBUG', None):
-            print(f'Using cached JIT runtime {name} during build')
+            print(f'Using cached JIT runtime {path} {name} during build')
         return runtime_cache[path]
 
     # Write the code
