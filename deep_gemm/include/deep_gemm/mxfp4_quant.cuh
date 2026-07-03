@@ -184,9 +184,22 @@ __global__ void mxfp4_quantize_kernel(
     }
 }
 
-__global__ void set_ready_flag_kernel(volatile uint32_t* flag, uint32_t generation) {
-    __threadfence_system();
-    *flag = generation;
+// Atomic-arrival producer: push this rank's generation into every consumer's local
+// slot[rank_idx]. Consumers poll their own local slot (no remote flag spinning).
+// __threadfence_system() before the writes gives release semantics: a consumer that
+// observes the slot is guaranteed to see this rank's quantized counts/data.
+__global__ void arrival_push_kernel(
+    const int64_t* __restrict__ sym_buf_addrs,
+    uint32_t rank_idx, uint32_t num_ranks,
+    uint64_t arrival_offset, uint32_t generation) {
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        for (uint32_t c = 0; c < num_ranks; ++c) {
+            uint32_t* slot = reinterpret_cast<uint32_t*>(
+                sym_buf_addrs[c] + static_cast<int64_t>(arrival_offset)) + rank_idx;
+            *slot = generation;
+        }
+    }
 }
 
 // Host-side launcher
@@ -201,32 +214,39 @@ void launch_mxfp4_quantize(
     uint32_t num_total_experts,
     uint32_t max_tokens_per_expert,
     uint32_t generation,
+    const int64_t* sym_buf_addrs,
+    uint32_t rank_idx,
+    uint32_t num_ranks,
     cudaStream_t stream,
     int64_t* profile_clocks = nullptr) {
 
     DispatchBufferLayout layout(num_total_experts, num_total_experts,
                                 max_tokens_per_expert, HIDDEN);
-    cudaMemsetAsync(sym_buf_base, 0, layout.metadata_bytes(), stream);
+    // Double-buffering: write this generation into buf[generation & 1] so we never clobber
+    // the buffer a 1-iteration-slower consumer is still reading. Arrival slots (below) are
+    // NOT double-buffered — they live at the fixed ready_flag_offset from the true base.
+    void* data_base = layout.parity_base(sym_buf_base, generation & 1u);
+    cudaMemsetAsync(data_base, 0, layout.metadata_bytes(), stream);
 
     constexpr int THREADS = 256;
     int blocks = num_tokens;
 
     if (topk <= 4) {
         mxfp4_quantize_kernel<HIDDEN, 4><<<blocks, THREADS, 0, stream>>>(
-            input, topk_ids, sym_buf_base,
+            input, topk_ids, data_base,
             num_tokens, topk, num_local_experts, num_total_experts,
             max_tokens_per_expert, HIDDEN, profile_clocks);
     } else {
         mxfp4_quantize_kernel<HIDDEN, 8><<<blocks, THREADS, 0, stream>>>(
-            input, topk_ids, sym_buf_base,
+            input, topk_ids, data_base,
             num_tokens, topk, num_local_experts, num_total_experts,
             max_tokens_per_expert, HIDDEN, profile_clocks);
     }
 
     if (generation > 0) {
-        volatile uint32_t* flag_ptr = reinterpret_cast<volatile uint32_t*>(
-            static_cast<uint8_t*>(sym_buf_base) + layout.ready_flag_offset());
-        set_ready_flag_kernel<<<1, 1, 0, stream>>>(flag_ptr, generation);
+        arrival_push_kernel<<<1, 1, 0, stream>>>(
+            sym_buf_addrs, rank_idx, num_ranks,
+            layout.ready_flag_offset(), generation);
     }
 }
 

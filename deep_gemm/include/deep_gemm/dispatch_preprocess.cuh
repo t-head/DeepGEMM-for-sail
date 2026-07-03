@@ -49,15 +49,19 @@ __device__ void dispatch_preprocess_device(
     DispatchBufferLayout buf_layout(num_total_experts, num_total_experts,
                                      max_tokens_per_expert, hidden_dim);
 
+    // Double-buffering: this generation's data lives in buf[generation & 1].
+    void* data_base = buf_layout.parity_base(sym_buffer.get_base_ptr<void*>(), generation & 1u);
+
     if (threadIdx.x == 0 && profile_clocks) _t1 = clock64();
 
     if (generation > 0 && threadIdx.x < num_ranks) {
-        uint32_t* local_flag = reinterpret_cast<uint32_t*>(
+        // Atomic-arrival barrier: each producer p pushes its generation into THIS rank's
+        // local slot[p] (see arrival_push_kernel). We poll the LOCAL slot instead of
+        // spinning on a remote NVLink flag read — far less P2P polling traffic + jitter.
+        volatile uint32_t* arrival_slots = reinterpret_cast<volatile uint32_t*>(
             static_cast<uint8_t*>(sym_buffer.get_base_ptr<void*>()) +
             buf_layout.ready_flag_offset());
-        volatile uint32_t* remote_flag =
-            (volatile uint32_t*)sym_buffer.map(local_flag, threadIdx.x);
-        while (*remote_flag < generation) { }
+        while (arrival_slots[threadIdx.x] < generation) { }
     }
     if (generation > 0) __syncthreads();
 
@@ -75,8 +79,7 @@ __device__ void dispatch_preprocess_device(
         uint32_t local_expert = tid % num_local_experts;
         uint32_t global_expert = local_expert_start + local_expert;
 
-        uint32_t* local_counts_ptr = buf_layout.expert_token_counts_ptr(
-            sym_buffer.get_base_ptr<void*>());
+        uint32_t* local_counts_ptr = buf_layout.expert_token_counts_ptr(data_base);
         uint32_t* remote_counts_ptr = sym_buffer.map(local_counts_ptr, src_rank);
 
         uint32_t count = __ldg(remote_counts_ptr + global_expert);
@@ -187,12 +190,10 @@ __device__ void dispatch_preprocess_device(
         uint32_t base_block = pair_cumsum_blocks[tid];
         uint32_t base_m = pair_cumsum_m[tid];
 
-        uint8_t* local_fp4_base = buf_layout.fp4_data_ptr(
-            sym_buffer.get_base_ptr<void*>(), global_expert);
+        uint8_t* local_fp4_base = buf_layout.fp4_data_ptr(data_base, global_expert);
         uint8_t* remote_fp4_base = sym_buffer.map(local_fp4_base, src_rank);
 
-        uint16_t* local_scale_base = buf_layout.scale_ptr(
-            sym_buffer.get_base_ptr<void*>(), global_expert);
+        uint16_t* local_scale_base = buf_layout.scale_ptr(data_base, global_expert);
         uint16_t* remote_scale_base = sym_buffer.map(local_scale_base, src_rank);
 
         for (uint32_t mb = 0; mb < num_mblocks; ++mb) {
@@ -338,14 +339,18 @@ __device__ void dispatch_expert_preprocess_device(
     DispatchBufferLayout buf_layout(num_total_experts, num_total_experts,
                                      max_tokens_per_expert, hidden_dim);
 
+    // Double-buffering: this generation's data lives in buf[generation & 1].
+    void* data_base = buf_layout.parity_base(sym_buffer.get_base_ptr<void*>(), generation & 1u);
+
     // Phase 2: Flag polling (same as original)
     if (generation > 0 && threadIdx.x < num_ranks) {
-        uint32_t* local_flag = reinterpret_cast<uint32_t*>(
+        // Atomic-arrival barrier: each producer p pushes its generation into THIS rank's
+        // local slot[p] (see arrival_push_kernel). We poll the LOCAL slot instead of
+        // spinning on a remote NVLink flag read — far less P2P polling traffic + jitter.
+        volatile uint32_t* arrival_slots = reinterpret_cast<volatile uint32_t*>(
             static_cast<uint8_t*>(sym_buffer.get_base_ptr<void*>()) +
             buf_layout.ready_flag_offset());
-        volatile uint32_t* remote_flag =
-            (volatile uint32_t*)sym_buffer.map(local_flag, threadIdx.x);
-        while (*remote_flag < generation) { }
+        while (arrival_slots[threadIdx.x] < generation) { }
     }
     if (generation > 0) __syncthreads();
 
@@ -364,8 +369,7 @@ __device__ void dispatch_expert_preprocess_device(
         uint32_t local_expert = tid % num_local_experts;
         uint32_t global_expert = local_expert_start + local_expert;
 
-        uint32_t* local_counts_ptr = buf_layout.expert_token_counts_ptr(
-            sym_buffer.get_base_ptr<void*>());
+        uint32_t* local_counts_ptr = buf_layout.expert_token_counts_ptr(data_base);
         uint32_t* remote_counts_ptr = sym_buffer.map(local_counts_ptr, src_rank);
 
         uint32_t count = __ldg(remote_counts_ptr + global_expert);
@@ -473,11 +477,9 @@ __device__ void dispatch_expert_preprocess_device(
                 uint32_t available = BLOCK_M - smem_row;
                 uint32_t take = min(remaining[r], available);
 
-                uint8_t* local_fp4 = buf_layout.fp4_data_ptr(
-                    sym_buffer.get_base_ptr<void*>(), global_expert);
+                uint8_t* local_fp4 = buf_layout.fp4_data_ptr(data_base, global_expert);
                 uint8_t* remote_fp4 = sym_buffer.map(local_fp4, r);
-                uint16_t* local_scale = buf_layout.scale_ptr(
-                    sym_buffer.get_base_ptr<void*>(), global_expert);
+                uint16_t* local_scale = buf_layout.scale_ptr(data_base, global_expert);
                 uint16_t* remote_scale = sym_buffer.map(local_scale, r);
 
                 // Offset by tokens already placed from this rank

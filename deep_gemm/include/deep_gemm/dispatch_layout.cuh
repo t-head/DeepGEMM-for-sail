@@ -109,14 +109,31 @@ struct DispatchBufferLayout {
         return metadata_bytes() + fp4_data_bytes() + scale_bytes();
     }
 
+    // Double-buffering: the data region (metadata+fp4+scale) is duplicated so a producer
+    // writing generation g+1 into buf[(g+1)&1] cannot clobber buf[g&1] that a 1-iteration-
+    // slower consumer is still reading. The per-iteration all-to-all arrival barrier bounds
+    // rank skew to 1 iteration, so 2 buffers are sufficient. Parity = generation & 1.
+    __host__ __device__
+    uint64_t parity_offset(uint32_t parity) const {
+        return static_cast<uint64_t>(parity & 1u) * total_bytes();
+    }
+
+    // Base pointer of the parity buffer's data region.
+    __host__ __device__
+    void* parity_base(void* base, uint32_t parity) const {
+        return static_cast<uint8_t*>(base) + parity_offset(parity);
+    }
+
     __host__ __device__
     uint64_t ready_flag_offset() const {
-        return (total_bytes() + 15) & ~uint64_t(15);
+        // Arrival slots live AFTER both data buffers (they are monotonic, not double-buffered).
+        return (2 * total_bytes() + 15) & ~uint64_t(15);
     }
 
     __host__ __device__
     uint64_t total_bytes_with_flags() const {
-        return ready_flag_offset() + 16;
+        // Arrival slots: one uint32 per rank (atomic-arrival barrier). 128B = up to 32 ranks.
+        return ready_flag_offset() + 128;
     }
 
     // Offset getters

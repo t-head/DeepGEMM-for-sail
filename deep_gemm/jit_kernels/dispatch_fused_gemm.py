@@ -23,6 +23,7 @@ launch_mxfp4_quantize<{HIDDEN}>(
     num_tokens, topk,
     {NUM_LOCAL_EXPERTS}, {NUM_TOTAL_EXPERTS}, {MAX_TOKENS_PER_EXPERT},
     generation,
+    sym_buf_addrs, rank_idx, num_ranks,
     stream);
 """
 
@@ -114,9 +115,13 @@ def get_sym_buffer_size(
     k_blocks = (hidden_dim + 31) // 32
     k_scale_blocks = (k_blocks + 1) // 2
     scales = num_total_experts * k_scale_blocks * max_tokens_per_expert * 2
-    base = metadata + fp4_data + scales
-    flag_offset = ((base + 15) // 16) * 16
-    return flag_offset + 16
+    data_region = metadata + fp4_data + scales
+    # Double-buffered data region (parity = generation & 1) so a 1-iteration-ahead producer
+    # cannot overwrite the buffer a slower consumer is still reading. Must match
+    # DispatchBufferLayout::ready_flag_offset() (== align16(2 * total_bytes())).
+    flag_offset = ((2 * data_region + 15) // 16) * 16
+    # Arrival slots: one uint32 per rank (atomic-arrival barrier). 128B = up to 32 ranks.
+    return flag_offset + 128
 
 
 def create_preprocess_workspace(
@@ -145,8 +150,17 @@ def mxfp4_quantize_to_sym_buffer(
     num_total_experts: int,
     max_tokens_per_expert: int,
     generation: int = 0,
+    sym_buf_addrs: torch.Tensor = None,
+    rank_idx: int = 0,
+    num_ranks: int = 1,
 ) -> None:
-    """Quantize BF16 activations to MXFP4 and write into symmetric buffer."""
+    """Quantize BF16 activations to MXFP4 and write into symmetric buffer.
+
+    When generation > 0, an atomic-arrival kernel pushes `generation` into every
+    consumer's local slot[rank_idx]; sym_buf_addrs (peer base ptrs, int64) is required
+    in that case. Consumers (dispatch_preprocess) poll their local slot instead of
+    spinning on a remote NVLink flag.
+    """
     num_tokens, hidden_dim = input_bf16.shape
     topk = topk_ids.shape[1]
 
@@ -154,6 +168,11 @@ def mxfp4_quantize_to_sym_buffer(
     assert topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
     assert topk_ids.shape[0] == num_tokens
     assert hidden_dim % 32 == 0
+    if sym_buf_addrs is None:
+        # No peers to signal (generation must be 0 in this case); dummy keeps arg_defs stable.
+        assert generation == 0, "sym_buf_addrs required when generation > 0"
+        sym_buf_addrs = torch.zeros(1, dtype=torch.int64, device=input_bf16.device)
+    assert sym_buf_addrs.dtype == torch.int64
 
     if num_tokens == 0:
         return
@@ -163,6 +182,7 @@ def mxfp4_quantize_to_sym_buffer(
     args = (input_bf16, topk_ids, sym_buf,
             num_tokens, topk,
             generation,
+            sym_buf_addrs, rank_idx, num_ranks,
             torch.cuda.current_stream())
     arg_defs = (
         ('input', torch.bfloat16),
@@ -171,6 +191,9 @@ def mxfp4_quantize_to_sym_buffer(
         ('num_tokens', int),
         ('topk', int),
         ('generation', int),
+        ('sym_buf_addrs', torch.int64),
+        ('rank_idx', int),
+        ('num_ranks', int),
         ('stream', torch.cuda.Stream),
     )
 

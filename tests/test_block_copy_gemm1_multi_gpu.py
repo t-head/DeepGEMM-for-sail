@@ -586,10 +586,13 @@ def test_performance(rank, world_size, group, device):
     # ---- Fused path setup ----
     buf_size = get_sym_buffer_size(num_local_experts, num_total_experts, max_tokens, hidden)
     sym_buf, sym_buf_addrs, sym_handle = alloc_sym_buffer(buf_size, device, group)
+    # One-time zero of the atomic-arrival slot region (last 128B); symm_mem.empty() is
+    # uninitialized and warmup uses generation=0 (no push), so slots must start < any g.
+    sym_buf[buf_size - 128:].zero_()
+    dist.barrier(); torch.cuda.synchronize()
     metadata_size = ((num_total_experts * 4 + 15) // 16) * 16
 
     # Probe block_m
-    sym_buf[:metadata_size].zero_()
     mxfp4_quantize_to_sym_buffer(
         x, topk_ids, sym_buf,
         num_local_experts=num_total_experts,
@@ -645,7 +648,6 @@ def test_performance(rank, world_size, group, device):
 
     # ---- Warmup ----
     for _ in range(num_warmup):
-        sym_buf[:metadata_size].zero_()
         mxfp4_quantize_to_sym_buffer(
             x, topk_ids, sym_buf,
             num_local_experts=num_total_experts,
@@ -788,10 +790,10 @@ def test_performance(rank, world_size, group, device):
         for i in range(num_iters):
             g = gen_bc + i + 1
             bc_start_events[i].record(stream)
-            sym_buf[:metadata_size].zero_()
             mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
                 num_local_experts=num_total_experts, num_total_experts=num_total_experts,
-                max_tokens_per_expert=max_tokens, generation=g)
+                max_tokens_per_expert=max_tokens, generation=g,
+                sym_buf_addrs=sym_buf_addrs, rank_idx=rank, num_ranks=world_size)
             dispatch_expert_preprocess(
                 sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
                 max_tokens, hidden, local_expert_start, block_m,
@@ -821,10 +823,10 @@ def test_performance(rank, world_size, group, device):
     for i in range(n_breakdown):
         g = gen_bd + i + 1
         ev_q_s[i].record(stream)
-        sym_buf[:metadata_size].zero_()
         mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
             num_local_experts=num_total_experts, num_total_experts=num_total_experts,
-            max_tokens_per_expert=max_tokens, generation=g)
+            max_tokens_per_expert=max_tokens, generation=g,
+            sym_buf_addrs=sym_buf_addrs, rank_idx=rank, num_ranks=world_size)
         ev_q_e[i].record(stream)
         ev_p_s[i].record(stream)
         dispatch_expert_preprocess(
@@ -857,10 +859,10 @@ def test_performance(rank, world_size, group, device):
         gen_np = 60000
         for _ in range(num_warmup):
             g = gen_np
-            sym_buf[:metadata_size].zero_()
             mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
                 num_local_experts=num_total_experts, num_total_experts=num_total_experts,
-                max_tokens_per_expert=max_tokens, generation=g)
+                max_tokens_per_expert=max_tokens, generation=g,
+                sym_buf_addrs=sym_buf_addrs, rank_idx=rank, num_ranks=world_size)
             dispatch_expert_preprocess(
                 sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
                 max_tokens, hidden, local_expert_start, block_m,
@@ -878,10 +880,10 @@ def test_performance(rank, world_size, group, device):
         for i in range(num_iters):
             g = gen_np + i + 1
             np_start[i].record(stream)
-            sym_buf[:metadata_size].zero_()
             mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
                 num_local_experts=num_total_experts, num_total_experts=num_total_experts,
-                max_tokens_per_expert=max_tokens, generation=g)
+                max_tokens_per_expert=max_tokens, generation=g,
+                sym_buf_addrs=sym_buf_addrs, rank_idx=rank, num_ranks=world_size)
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
