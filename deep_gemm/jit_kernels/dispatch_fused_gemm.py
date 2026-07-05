@@ -61,8 +61,10 @@ launch_dispatch_expert_preprocess<{BLOCK_M}>(
     reinterpret_cast<uint64_t*>(rank_addr_sfa),
     reinterpret_cast<uint32_t*>(rank_split_m),
     reinterpret_cast<uint32_t*>(rank_counts),
+    reinterpret_cast<uint32_t*>(masked_m),
     reinterpret_cast<uint32_t*>(out_total_m_blocks),
     reinterpret_cast<uint32_t*>(out_shape_m),
+    reinterpret_cast<uint64_t*>(dbg_cyc),
     stream);
 """
 
@@ -82,10 +84,10 @@ constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 
 using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N,
-                        kNumGroups, kNumStages, GemmType::FusedDispatch>;
+                        kNumGroups, kNumStages, GemmType::{GEMM_TYPE}>;
 gemm_t::template run_fused_dispatch<{NUM_RANKS}, {NUM_COPY_BLOCKS}, {K_TILES_PER_FLAG}>(
     rhs, rhs_scales, bias, out, shape_m,
-    grouped_layout,
+    grouped_layout, masked_m,
     max_tokens_per_expert,
     stream, num_sms, smem_size,
     reinterpret_cast<const uint64_t*>(rank_addr_a),
@@ -96,7 +98,9 @@ gemm_t::template run_fused_dispatch<{NUM_RANKS}, {NUM_COPY_BLOCKS}, {K_TILES_PER
     reinterpret_cast<uint8_t*>(local_fp4_buf),
     reinterpret_cast<volatile uint32_t*>(copy_ready_flags),
     reinterpret_cast<uint64_t*>(kstripe_profile_buf),
-    kstripe_profile_max_mb);
+    kstripe_profile_max_mb,
+    (bool)copy_only,
+    (uint32_t)copy_mode);
 """
 
 # ==============================================================
@@ -312,12 +316,23 @@ def create_expert_preprocess_workspace(
     max_m_blocks_per_expert = ceil_div(max_expert_tokens, block_m)
     max_total_m_blocks = num_local_experts * max_m_blocks_per_expert
     max_rank_entries = max_total_m_blocks * num_ranks
+    # Keep masked metadata in the tail of the same allocation so the fused
+    # dispatch API can recover it from grouped_layout without changing every
+    # legacy call site.
+    grouped_layout = torch.zeros(
+        (1 + max_total_m_blocks) * 4 + 2 * num_local_experts,
+        dtype=torch.int32, device=device)
+    masked_m = grouped_layout[-2 * num_local_experts:]
     return (
-        torch.zeros((1 + max_total_m_blocks) * 4, dtype=torch.int32, device=device),
+        grouped_layout,
         torch.zeros(max_rank_entries, dtype=torch.int64, device=device),
         torch.zeros(max_rank_entries, dtype=torch.int64, device=device),
         torch.zeros(max_rank_entries, dtype=torch.int32, device=device),
         torch.zeros(max_rank_entries, dtype=torch.int32, device=device),
+        # [expert token counts, expert base M-block offsets]. The first half is
+        # the production GroupedMasked scheduler input; the second maps its
+        # expert-local tiles to the compact copy-ready flag array.
+        masked_m,
         torch.zeros(1, dtype=torch.int32, device=device),
         torch.zeros(1, dtype=torch.int32, device=device),
     )
@@ -335,25 +350,34 @@ def dispatch_expert_preprocess(
     block_m: int,
     generation: int = 0,
     sync: bool = True,
+    return_masked_m: bool = False,
+    dbg_cyc: torch.Tensor = None,
     _workspace=None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Expert-level preprocess: groups by expert, producing per-rank split metadata."""
+) -> Tuple:
+    """Expert-level preprocess: groups by expert, producing per-rank split metadata.
+
+    dbg_cyc: optional int64[>=3] buffer. If given, kernel writes per-phase cycle
+    counts [setup+barrier, remote-count-reads, compute(Phase4+5)] (thread 0).
+    """
     assert sym_buf_addrs.dtype == torch.int64
     device = sym_buf_addrs.device
+    if dbg_cyc is None:
+        dbg_cyc = torch.zeros(4, dtype=torch.int64, device=device)  # >=3: kernel writes [0..2]
+    assert dbg_cyc.dtype == torch.int64 and dbg_cyc.numel() >= 3
 
     if _workspace is not None:
-        grouped_layout, rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts, \
+        grouped_layout, rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts, masked_m, \
             out_total_m_blocks, out_shape_m = _workspace
     else:
-        grouped_layout, rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts, \
+        grouped_layout, rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts, masked_m, \
             out_total_m_blocks, out_shape_m = create_expert_preprocess_workspace(
                 num_local_experts, num_ranks, max_tokens_per_expert, block_m, device)
 
     global includes_preprocess, template_expert_preprocess
 
     args = (sym_buf_addrs, grouped_layout, rank_addr_a, rank_addr_sfa,
-            rank_split_m, rank_counts,
-            out_total_m_blocks, out_shape_m,
+            rank_split_m, rank_counts, masked_m,
+            out_total_m_blocks, out_shape_m, dbg_cyc,
             generation,
             torch.cuda.current_stream())
 
@@ -380,8 +404,10 @@ def dispatch_expert_preprocess(
             ('rank_addr_sfa', torch.int64),
             ('rank_split_m', torch.int32),
             ('rank_counts', torch.int32),
+            ('masked_m', torch.int32),
             ('out_total_m_blocks', torch.int32),
             ('out_shape_m', torch.int32),
+            ('dbg_cyc', torch.int64),
             ('generation', int),
             ('stream', torch.cuda.Stream),
         ),
@@ -401,8 +427,9 @@ def dispatch_expert_preprocess(
         total_m_blocks = num_local_experts * max_m_blocks_per_expert
         shape_m = num_local_experts * num_ranks * max_tokens_per_expert
 
-    return grouped_layout, rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts, \
-           total_m_blocks, shape_m
+    result = (grouped_layout, rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts,
+              total_m_blocks, shape_m)
+    return result + (masked_m,) if return_masked_m else result
 
 
 def create_block_copy_buffers(num_local_experts, num_ranks, max_tokens_per_expert, hidden_dim, block_m, device):
@@ -413,7 +440,10 @@ def create_block_copy_buffers(num_local_experts, num_ranks, max_tokens_per_exper
     max_expert_tokens = num_ranks * max_tokens_per_expert
     max_m_blocks_per_expert = ceil_div(max_expert_tokens, block_m)
     max_total_m_blocks = num_local_experts * max_m_blocks_per_expert
-    copy_ready_flags = torch.zeros(max_total_m_blocks, dtype=torch.int32, device=device)
+    # 2x size: [0..total-1] = per-M-block ready flags (read by GEMM),
+    # [total..2*total-1] = per-M-block done-counters for cooperative copy
+    # (copy_mode=1); the last of ncb blocks to finish an M-block sets its flag.
+    copy_ready_flags = torch.zeros(2 * max_total_m_blocks, dtype=torch.int32, device=device)
     return local_fp4, copy_ready_flags
 
 
@@ -435,8 +465,17 @@ def fused_dispatch_block_copy_gemm1_fp4(
     configs=None,
     merged_sfa_addrs: torch.Tensor = None,
     kstripe_profile_buf: torch.Tensor = None,
+    copy_only: bool = False,
+    copy_mode: int = 0,
+    masked_m: torch.Tensor = None,
 ) -> None:
-    """Block-copy fused dispatch GEMM1: dedicated copy blocks + GEMM from local HBM."""
+    """Block-copy fused GEMM1 with selectable NoPad or Masked scheduling.
+
+    Set FUSED_GEMM_GROUPING=nopad|masked (default: nopad). Masked mode expects
+    ``out`` shaped [num_groups, padded_m, n]. The standard expert preprocess
+    workspace stores ``masked_m`` in the grouped-layout tail automatically.
+    NoPad retains the existing compact [shape_m, n] output contract.
+    """
     rhs, rhs_scales = rhs_
     num_groups, n, k = rhs.shape
 
@@ -448,13 +487,48 @@ def fused_dispatch_block_copy_gemm1_fp4(
     if shape_m == 0:
         return
 
+    grouping = os.getenv('FUSED_GEMM_GROUPING', 'nopad').strip().lower()
+    if grouping not in ('nopad', 'masked'):
+        raise ValueError(f"FUSED_GEMM_GROUPING must be 'nopad' or 'masked', got {grouping!r}")
+    use_masked = grouping == 'masked'
+
+    if use_masked:
+        if masked_m is None:
+            masked_m = grouped_layout[-2 * num_groups:]
+        assert masked_m.dtype == torch.int32
+        assert masked_m.is_contiguous() and masked_m.numel() >= 2 * num_groups
+        assert out.dim() == 3 and out.shape[0] == num_groups and out.shape[2] == n
+        gemm_shape_m = out.shape[1]
+        # Keep the padded storage/output stride independent from the tuning
+        # workload. The production masked path tunes on active rows, otherwise
+        # a capacity of 256 incorrectly selects block_m=256 for ~128-row experts.
+        expected_m = ceil_div(shape_m, num_groups)
+        tuning_m = shape_m
+        config_gemm_type = GemmType.GroupedMasked
+        jit_gemm_type = 'FusedDispatchMasked'
+    else:
+        assert out.dim() == 2 and out.shape == (shape_m, n)
+        # The masked pointer is compile-time dead on the NoPad path. Reuse an
+        # existing int32 tensor to keep the legacy call contract allocation-free.
+        if masked_m is None:
+            masked_m = grouped_layout
+        gemm_shape_m = shape_m
+        expected_m = ceil_div(shape_m, num_groups)
+        tuning_m = shape_m
+        config_gemm_type = GemmType.GroupedNoPad
+        jit_gemm_type = 'FusedDispatch'
+
     # NOTE: block_m here MUST match the block_m used to build grouped_layout /
     # rank_split_m in dispatch_expert_preprocess. The copy kernel places each
     # M-block at m_block_in_expert * BLOCK_M rows; a mismatch writes 2nd+ blocks
     # to the wrong expert region (silently zeroing their output). The preprocess
     # side (get_gemm_block_m) uses plain expected_m with no <=128 bump, so we
     # must not bump here either.
-    expected_m = ceil_div(shape_m, num_groups)
+    if not use_masked and expected_m <= 128:  # legacy NoPad tuning clamp
+        expected_m = 129
+    _force = int(os.getenv('FORCE_EXPECTED_M', '0'))  # A/B: 强制 block_m(须与 test 侧 get_gemm_block_m 一致)
+    if _force > 0:
+        expected_m = _force
 
     global includes_gemm, template_gemm_block_copy
     num_sms = get_num_sms()
@@ -463,8 +537,8 @@ def fused_dispatch_block_copy_gemm1_fp4(
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = \
-            get_best_configs(shape_m, expected_m, n, k, num_groups, num_sms,
-                             gemm_type=GemmType.GroupedNoPad)
+            get_best_configs(tuning_m, expected_m, n, k, num_groups, num_sms,
+                             gemm_type=config_gemm_type)
 
     bias = torch.empty(0, dtype=torch.float32, device=rhs.device)
     if merged_sfa_addrs is None:
@@ -472,22 +546,27 @@ def fused_dispatch_block_copy_gemm1_fp4(
 
     copy_ready_flags.zero_()
 
+    # Per-tile k-stripe wait profiling. Pass a zeroed int64 tensor of length
+    # 4 * (>= num tiles = num_m_blocks * num_n_blocks). Record per tile_idx:
+    #   [tile*4+0] = P2P stripe-wait cycles      [tile*4+1] = mainloop cycles
+    #   [tile*4+2] = wave number (current_iter)  [tile*4+3] = GEMM CTA id
+    # Group rows (compute>0) by wave to see first-wave vs later-wave P2P exposure.
     if kstripe_profile_buf is None:
         kstripe_profile_buf = torch.empty(0, dtype=torch.int64, device=rhs.device)
         kstripe_profile_max_mb = 0
     else:
-        num_k_tiles = k // block_k
-        num_stripes = (num_k_tiles // k_tiles_per_flag) if k_tiles_per_flag > 0 else 1
-        kstripe_profile_max_mb = kstripe_profile_buf.numel() // (2 * num_stripes + 1)
+        kstripe_profile_buf.zero_()
+        kstripe_profile_max_mb = kstripe_profile_buf.numel() // 4  # capacity in tiles
 
-    args = (rhs, rhs_scales, bias, out, shape_m,
-            grouped_layout,
+    args = (rhs, rhs_scales, bias, out, gemm_shape_m,
+            grouped_layout, masked_m,
             max_tokens_per_expert,
             torch.cuda.current_stream(), num_sms, smem_config[0],
             rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts,
             merged_sfa_addrs,
             local_fp4_buf, copy_ready_flags,
-            kstripe_profile_buf, kstripe_profile_max_mb)
+            kstripe_profile_buf, kstripe_profile_max_mb,
+            int(copy_only), int(copy_mode))
 
     runtime = jit_tuner.compile_and_tune(
         name='fused_dispatch_block_copy_gemm1_fp4',
@@ -500,6 +579,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
             'NUM_RANKS': num_ranks,
             'NUM_COPY_BLOCKS': num_copy_blocks,
             'K_TILES_PER_FLAG': k_tiles_per_flag,
+            'GEMM_TYPE': jit_gemm_type,
         },
         space=(),
         includes=includes_gemm,
@@ -510,6 +590,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
             ('out', torch.bfloat16),
             ('shape_m', int),
             ('grouped_layout', torch.int32),
+            ('masked_m', torch.int32),
             ('max_tokens_per_expert', int),
             ('stream', torch.cuda.Stream),
             ('num_sms', int),
@@ -523,6 +604,8 @@ def fused_dispatch_block_copy_gemm1_fp4(
             ('copy_ready_flags', torch.int32),
             ('kstripe_profile_buf', torch.int64),
             ('kstripe_profile_max_mb', int),
+            ('copy_only', int),
+            ('copy_mode', int),
         ),
         template=template_gemm_block_copy,
         args=args,

@@ -58,7 +58,7 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
     const uint32_t stride = blockDim.x;
 
     for (uint32_t mb = blockIdx.x; mb < total_m_blocks; mb += num_copy) {
-        uint4 gl = (reinterpret_cast<const uint4*>(sched.grouped_layout) + 1)[mb];
+        uint4 gl = (reinterpret_cast<const uint4*>(sched.copy_grouped_layout) + 1)[mb];
         uint32_t expert_local = gl.x;
         uint32_t m_block_in_expert = mb - gl.z;
 
@@ -205,6 +205,65 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
     }
 }
 
+// Cooperative copy (copy_mode=1): all ncb copy blocks walk the M-blocks in the
+// SAME order (0,1,2,...), each doing a 1/ncb slice of the current M-block. Because
+// GEMM consumes M-major (needs m0 first), giving each low-index M-block the full
+// aggregate copy bandwidth makes it ready earliest -> shrinks the first-wave stall.
+// Per-M-block done-counter (copy_ready_flags[total_m_blocks + mb]); the last of the
+// ncb blocks to finish an M-block publishes its ready flag. KTPF=0 semantics only.
+template <uint32_t BLOCK_M, uint32_t NumRanks, bool SingleThreadFence = false>
+__device__ void run_copy_block_cooperative(const TileSchedulerArguments& sched, uint32_t total_m_blocks)
+{
+    const uint32_t ncb = sched.num_copy_blocks;
+    const uint32_t k_half = sched.local_buf_k_half;
+    const uint32_t max_tok = sched.local_buf_max_tokens;
+    constexpr uint32_t nr = NumRanks;
+    const uint32_t gstride = ncb * blockDim.x;                 // cooperative stride across all blocks
+    const uint32_t gstart  = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t* __restrict__ done_ctr = (uint32_t*)(sched.copy_ready_flags) + total_m_blocks;
+
+    for (uint32_t mb = 0; mb < total_m_blocks; ++mb) {
+        uint4 gl = (reinterpret_cast<const uint4*>(sched.copy_grouped_layout) + 1)[mb];
+        uint32_t expert_local = gl.x;
+        uint32_t m_block_in_expert = mb - gl.z;
+        uint8_t* local_a_base = sched.local_fp4_buf +
+            (uint64_t)expert_local * max_tok * k_half +
+            (uint64_t)m_block_in_expert * BLOCK_M * k_half;
+
+        #pragma unroll 1
+        for (uint32_t r = 0; r < nr; ++r) {
+            uint32_t idx = mb * nr + r;
+            const int4* __restrict__ src = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx));
+            int4* __restrict__ dst = reinterpret_cast<int4*>(
+                local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx) * k_half);
+            uint32_t n_int4 = __ldg(sched.rank_counts + idx) * k_half / 16;
+            for (uint32_t i = gstart; i < n_int4; i += gstride)
+                dst[i] = ld_nc_global(src + i);
+        }
+
+        __syncthreads();
+        if constexpr (SingleThreadFence) {
+            // wbinv is an address-less full-SM-cache write-back+invalidate, so one
+            // thread flushes the whole block's writes (syncthreads above ensures
+            // they're all in-cache). Avoids the redundant per-warp wbinv issues.
+            if (threadIdx.x == 0) {
+                __threadfence();  // flush this block's SM cache once
+                if (atomicAdd(&done_ctr[mb], 1u) == ncb - 1) {
+                    sched.copy_ready_flags[mb] = 1;  // data already flushed above
+                }
+            }
+        } else {
+            __threadfence();  // publish this block's writes device-wide before signalling
+            if (threadIdx.x == 0) {
+                if (atomicAdd(&done_ctr[mb], 1u) == ncb - 1) {
+                    __threadfence();
+                    sched.copy_ready_flags[mb] = 1;
+                }
+            }
+        }
+    }
+}
+
 template <uint32_t BLOCK_M, uint32_t NumRanks, uint32_t BLOCK_K, uint32_t K_TILES_PER_FLAG>
 __device__ void run_copy_block_kstripe(
     const TileSchedulerArguments& sched, uint32_t total_m_blocks)
@@ -220,7 +279,7 @@ __device__ void run_copy_block_kstripe(
     const uint32_t stride = blockDim.x;
 
     for (uint32_t mb = blockIdx.x; mb < total_m_blocks; mb += num_copy) {
-        uint4 gl = (reinterpret_cast<const uint4*>(sched.grouped_layout) + 1)[mb];
+        uint4 gl = (reinterpret_cast<const uint4*>(sched.copy_grouped_layout) + 1)[mb];
         uint32_t expert_local = gl.x;
         uint32_t m_block_in_expert = mb - gl.z;
 
@@ -656,13 +715,17 @@ class DeepGemmUniversal <
     using X = Underscore;
 
     // FusedDispatch: copy blocks do P2P copy then exit
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch && TileScheduler::kNumCopyBlocks > 0) {
+    if constexpr (TileScheduler::kIsFusedDispatch && TileScheduler::kNumCopyBlocks > 0) {
       if (blockIdx.x < TileScheduler::kNumCopyBlocks) {
-        uint32_t total_m_blocks = params.scheduler.grouped_layout[0];
+        uint32_t total_m_blocks = params.scheduler.copy_grouped_layout[0];
         if constexpr (TileScheduler::kKTilesPerFlag > 0) {
           run_copy_block_kstripe<BlockM, TileScheduler::kNumRanks,
               cute::size<2>(TileShape{}), TileScheduler::kKTilesPerFlag>(
               params.scheduler, total_m_blocks);
+        } else if (params.scheduler.copy_mode == 1) {
+          run_copy_block_cooperative<BlockM, TileScheduler::kNumRanks, false>(params.scheduler, total_m_blocks);
+        } else if (params.scheduler.copy_mode == 2) {
+          run_copy_block_cooperative<BlockM, TileScheduler::kNumRanks, true>(params.scheduler, total_m_blocks);
         } else {
           run_copy_block<BlockM, TileScheduler::kNumRanks>(params.scheduler, total_m_blocks);
         }
@@ -676,7 +739,7 @@ class DeepGemmUniversal <
     int warp_m_idx = warp_idx % warp_on_m;
     int warp_n_idx = warp_idx / warp_on_m;
 
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+    if constexpr (TileScheduler::kIsMaskedLayout) {
       __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
     }
     if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
@@ -708,7 +771,7 @@ class DeepGemmUniversal <
     uint8_t* fd2_fp4_buf;
     const uint64_t* fd2_sfa_addrs;
     volatile uint32_t* fd2_copy_flags;
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch) {
+    if constexpr (TileScheduler::kIsFusedDispatch) {
         fd2_k_half = params.scheduler.local_buf_k_half;
         fd2_max_tok = params.scheduler.local_buf_max_tokens;
         fd2_fp4_buf = params.scheduler.local_fp4_buf;
@@ -730,7 +793,7 @@ class DeepGemmUniversal <
       const ElementA* ptr_A;
       const ElementSFA* ptr_scale_A;
 
-      if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch) {
+      if constexpr (TileScheduler::kIsFusedDispatch) {
         uint32_t global_m_blk = deep_scheduler.curr_global_block_m_idx;
         if constexpr (TileScheduler::kNumCopyBlocks > 0 && TileScheduler::kKTilesPerFlag == 0) {
             while (fd2_copy_flags[global_m_blk] == 0) { }
@@ -757,7 +820,7 @@ class DeepGemmUniversal <
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       auto dSFA_local = params.mainloop.dSFA;
-      if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch) {
+      if constexpr (TileScheduler::kIsFusedDispatch) {
           get<1>(dSFA_local) = static_cast<int64_t>(M);
       }
       MainloopParams update_params = {
@@ -1252,13 +1315,17 @@ public:
     using X = Underscore;
 
     // FusedDispatch: copy blocks do P2P copy then exit
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch && TileScheduler::kNumCopyBlocks > 0) {
+    if constexpr (TileScheduler::kIsFusedDispatch && TileScheduler::kNumCopyBlocks > 0) {
       if (blockIdx.x < TileScheduler::kNumCopyBlocks) {
-        uint32_t total_m_blocks = params.scheduler.grouped_layout[0];
+        uint32_t total_m_blocks = params.scheduler.copy_grouped_layout[0];
         if constexpr (TileScheduler::kKTilesPerFlag > 0) {
           run_copy_block_kstripe<BlockM, TileScheduler::kNumRanks,
               cute::size<2>(TileShape{}), TileScheduler::kKTilesPerFlag>(
               params.scheduler, total_m_blocks);
+        } else if (params.scheduler.copy_mode == 1) {
+          run_copy_block_cooperative<BlockM, TileScheduler::kNumRanks, false>(params.scheduler, total_m_blocks);
+        } else if (params.scheduler.copy_mode == 2) {
+          run_copy_block_cooperative<BlockM, TileScheduler::kNumRanks, true>(params.scheduler, total_m_blocks);
         } else {
           run_copy_block<BlockM, TileScheduler::kNumRanks>(params.scheduler, total_m_blocks);
         }
@@ -1292,7 +1359,7 @@ public:
     int thread_idx = int(threadIdx.x);
     auto blk_shape = TileShape{};                                                                // (BLK_M,BLK_N,BLK_K)
 
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+    if constexpr (TileScheduler::kIsMaskedLayout) {
       // group is small 8|16, just prefetch one cacheline
       __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
     }
@@ -1309,7 +1376,7 @@ public:
     uint8_t* fd_fp4_buf;
     const uint64_t* fd_sfa_addrs;
     volatile uint32_t* fd_copy_flags;
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch) {
+    if constexpr (TileScheduler::kIsFusedDispatch) {
         fd_k_half = params.scheduler.local_buf_k_half;
         fd_max_tok = params.scheduler.local_buf_max_tokens;
         fd_fp4_buf = params.scheduler.local_fp4_buf;
@@ -1330,10 +1397,31 @@ public:
 
       const ElementA* ptr_A;
       const ElementSFA* ptr_scale_A;
-      if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch) {
+      // Per-tile profiling record base (nullptr => off / out of capacity). Layout
+      // per tile: [0]=wait cycles, [1]=mainloop cycles, [2]=wave, [3]=gemm CTA id.
+      // Indexed by tile_idx => each tile is a unique slot (no atomics needed).
+      uint64_t* ks_rec = nullptr;
+      if constexpr (TileScheduler::kIsFusedDispatch) {
+        uint64_t* ks_base = params.scheduler.kstripe_profile_buf;
+        if (ks_base != nullptr &&
+            deep_scheduler.curr_tile_idx < params.scheduler.kstripe_profile_max_tiles) {
+          ks_rec = ks_base + (uint64_t)deep_scheduler.curr_tile_idx * 4;
+          if (threadIdx.x == 0) {
+            ks_rec[2] = deep_scheduler.curr_wave;
+            ks_rec[3] = deep_scheduler.curr_cta_id;
+          }
+        }
+      }
+      if constexpr (TileScheduler::kIsFusedDispatch) {
           uint32_t global_m_blk = deep_scheduler.curr_global_block_m_idx;
           if constexpr (TileScheduler::kNumCopyBlocks > 0 && TileScheduler::kKTilesPerFlag == 0) {
+              // KTPF=0: GEMM waits once at tile entry for the whole M-block to be
+              // copied (mainloop stripe wait is disabled in this mode). Record this
+              // tile's entry wait into its own slot; thread 0 only.
+              const bool _op_prof_on = (ks_rec != nullptr && threadIdx.x == 0);
+              const uint64_t _op_w0 = _op_prof_on ? clock64() : 0;
               while (fd_copy_flags[global_m_blk] == 0) { }
+              if (_op_prof_on) ks_rec[0] = clock64() - _op_w0;
               asm volatile("" ::: "memory");
           }
 
@@ -1357,7 +1445,7 @@ public:
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       // update actual global ptr offset
       auto dSFA_local = params.mainloop.dSFA;
-      if constexpr (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch) {
+      if constexpr (TileScheduler::kIsFusedDispatch) {
           // SFA is packed column-major per expert with stride = padded_total (M),
           // not max_tokens_per_expert. Override K-dim stride to match.
           get<1>(dSFA_local) = static_cast<int64_t>(M);
@@ -1366,11 +1454,12 @@ public:
         {M, N, K}, ptr_A, params.mainloop.dA, ptr_B, params.mainloop.dB,
         ptr_scale_A, dSFA_local, ptr_scale_B, params.mainloop.dSFB,
         // k-stripe overlap: only active for FusedDispatch with copy blocks and KTilesPerFlag>0
-        (TileScheduler::GEMM_TYPE == GemmType::FusedDispatch
+        (TileScheduler::kIsFusedDispatch
           && TileScheduler::kNumCopyBlocks > 0 && TileScheduler::kKTilesPerFlag > 0)
             ? fd_copy_flags : nullptr,
         deep_scheduler.curr_global_block_m_idx,
-        TileScheduler::kKTilesPerFlag
+        TileScheduler::kKTilesPerFlag,
+        ks_rec
       };
       CollectiveMainloop collective_mma(update_params, problem_shape_MNKL);
       auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, update_params);
@@ -1597,6 +1686,8 @@ struct CollectiveMmaScaleFp4
     volatile uint32_t* copy_ready_flags = nullptr;
     uint32_t copy_flag_m_blk = 0;
     uint32_t copy_k_tiles_per_flag = 0;
+    // Aggregate k-stripe wait profiling buffer (nullptr => off). See scheduler.
+    uint64_t* kstripe_profile_buf = nullptr;
   };
 
   // Device side kernel params
@@ -1824,9 +1915,17 @@ struct CollectiveMmaScaleFp4
     int ks_loaded_k = 0;      // number of k-tiles whose load has been issued
     int ks_next_bnd = 0;      // k-tile index of the next stripe boundary
     uint32_t ks_cur_stripe = 0;
+    // Per-tile k-stripe wait profiling: thread 0 times each stripe spin in
+    // registers and writes this tile's record once at mainloop end (no atomics).
+    uint64_t* const ks_prof = params_.kstripe_profile_buf;
+    const bool ks_prof_on = (ks_prof != nullptr && thread_idx == 0);
+    uint64_t ks_wait_accum = 0;
+    const uint64_t ks_t_begin = ks_prof_on ? clock64() : 0;
     auto wait_stripe = [&]() {
       if (ks_flags != nullptr && ks_loaded_k >= ks_next_bnd) {
+        const uint64_t _w0 = ks_prof_on ? clock64() : 0;
         while (ks_flags[ks_mblk] < ks_cur_stripe + 1) { }
+        if (ks_prof_on) ks_wait_accum += clock64() - _w0;
         asm volatile("" ::: "memory");
         ++ks_cur_stripe;
         ks_next_bnd += ks_ktpf;
@@ -1996,6 +2095,14 @@ struct CollectiveMmaScaleFp4
     // TODO: original cutlass3 miss this sync
     cp_async_wait<0>();
     __syncthreads();
+
+    // Flush per-tile k-stripe wait profiling. ks_prof points at this tile's
+    // record base (unique slot => plain stores, no atomics). [2]/[3] (wave/CTA)
+    // are written by the kernel operator() before the mainloop runs.
+    if (ks_prof_on) {
+      ks_prof[0] += ks_wait_accum;  // += so KTPF=0 entry wait (set in operator) survives
+      ks_prof[1] = clock64() - ks_t_begin;
+    }
   }
 };
 
@@ -2260,6 +2367,7 @@ public:
         float *c_ptr, __nv_bfloat16 *d_ptr,
         int shape_m,
         int *grouped_layout,
+        int *masked_m,
         uint32_t max_tokens_per_expert,
         cudaStream_t stream, int num_sms, uint32_t smem_size,
         const uint64_t *rank_addr_a,
@@ -2271,10 +2379,13 @@ public:
         volatile uint32_t* copy_ready_flags,
         uint64_t* kstripe_profile_buf = nullptr,
         uint32_t kstripe_profile_max_mb = 0,
+        bool copy_only = false,
+        uint32_t copy_mode = 0,
         profiling::GemmProfileRecord* profile_records = nullptr) {
 
-        static_assert(kGemmType == GemmType::FusedDispatch,
-                      "run_fused_dispatch requires GemmType::FusedDispatch");
+        static_assert(kGemmType == GemmType::FusedDispatch ||
+                      kGemmType == GemmType::FusedDispatchMasked,
+                      "run_fused_dispatch requires a fused dispatch GemmType");
         static_assert(KTilesPerFlag == 0 || (ShapeK / BlockK) % KTilesPerFlag == 0,
                       "KTilesPerFlag must evenly divide num_k_tiles");
         constexpr int N_EXPAND = NExpand;
@@ -2393,7 +2504,7 @@ public:
         using StrideSFA = typename GemmKernel::StrideSFA;
         using StrideSFB = typename GemmKernel::StrideSFB;
 
-        int* layout_info = grouped_layout;
+        int* layout_info = kGemmType == GemmType::FusedDispatchMasked ? masked_m : grouped_layout;
 
         StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)max_tokens_per_expert, ShapeK, 1));
         StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(ShapeN, ShapeK, 1));
@@ -2416,12 +2527,13 @@ public:
 
         TileSchedulerArguments sched_args(
             (uint32_t)shape_m, layout_info,
+            grouped_layout,
             rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts, NumRanks,
             remote_addr_sfa,
             local_fp4_buf, k_half, max_tokens_per_expert,
-            copy_ready_flags, NumCopyBlocks);
-        (void)kstripe_profile_buf;
-        (void)kstripe_profile_max_mb;
+            copy_ready_flags, NumCopyBlocks,
+            kstripe_profile_buf, kstripe_profile_max_mb,  // max_mb repurposed as max_tiles (numel/4)
+            copy_mode);
 
         // ptr_A/ptr_SFA are resolved per-block in operator(); use local_fp4_buf as placeholder
         typename GemmKernel::Arguments arguments{
@@ -2447,8 +2559,22 @@ public:
         params.profile_records = profile_records;
 #endif
         dim3 const block = GemmKernel::get_block_shape();
-        dim3 grid = GemmKernel::get_grid_shape(params);
-        grid.x += NumCopyBlocks;
+        dim3 grid;
+        if (copy_only) {
+            // Copy-only bandwidth probe: launch just the NumCopyBlocks copy blocks
+            // (no GEMM CTAs). Every block has blockIdx.x < NumCopyBlocks => takes the
+            // copy path and returns; GEMM is never entered. Host-time for copy BW.
+            grid = dim3(NumCopyBlocks, 1, 1);
+        } else {
+            grid = GemmKernel::get_grid_shape(params);
+            // FUSED_EXACT_GRID=1: keep total grid == sm_count (GEMM gets
+            // sm_count-ncb CTAs, exact fit, no oversubscription). Default:
+            // oversubscribe (39 GEMM + ncb copy) so freed SMs refill after copy.
+            const char* exact_env = std::getenv("FUSED_EXACT_GRID");
+            if (!(exact_env && exact_env[0] == '1')) {
+                grid.x += NumCopyBlocks;
+            }
+        }
         int sharemem_size = GemmKernel::SharedStorageSize;
 
         cudaFuncSetAttribute(cutlass::device_kernel<GemmKernel>,

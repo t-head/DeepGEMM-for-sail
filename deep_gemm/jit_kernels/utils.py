@@ -15,6 +15,7 @@ class GemmType(Enum):
     GroupedFused = 4
     BatchGemm = 5
     FusedDispatch = 6
+    FusedDispatchMasked = 7
 
 class CompuleMode(Enum):
     COMPILE_AND_RUN = 0

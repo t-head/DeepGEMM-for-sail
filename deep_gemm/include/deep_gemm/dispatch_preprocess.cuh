@@ -316,11 +316,14 @@ __device__ void dispatch_expert_preprocess_device(
     uint64_t* __restrict__ rank_addr_sfa,
     uint32_t* __restrict__ rank_split_m,
     uint32_t* __restrict__ rank_counts,
+    uint32_t* __restrict__ masked_m,
     uint32_t* __restrict__ out_total_m_blocks,
     uint32_t* __restrict__ out_shape_m,
+    uint64_t* __restrict__ dbg_cyc,
     uint32_t* smem_workspace,
     uint32_t num_threads) {
 
+    long long _dbg_t0 = clock64();
     // Phase 1: SymBuffer init (same as original)
     __shared__ SymBuffer smem_sym;
     if (threadIdx.x == 0) {
@@ -353,6 +356,7 @@ __device__ void dispatch_expert_preprocess_device(
         while (arrival_slots[threadIdx.x] < generation) { }
     }
     if (generation > 0) __syncthreads();
+    long long _dbg_tA = clock64();  // after Phase 1+2 (setup + arrival barrier)
 
     // Phase 3: Read pair token counts (same as original)
     const uint32_t total_pairs = num_local_experts * num_ranks;
@@ -376,6 +380,7 @@ __device__ void dispatch_expert_preprocess_device(
         pair_token_counts[tid] = count;
     }
     __syncthreads();
+    long long _dbg_tB = clock64();  // after Phase 3 (remote count reads)
 
     // Phase 4: Expert-level aggregation + prefix sum
     // Greedy packing: fill each M-block to capacity, splitting rank data across blocks.
@@ -419,6 +424,11 @@ __device__ void dispatch_expert_preprocess_device(
         uint32_t global_expert = local_expert_start + e;
         uint32_t k_half = hidden_dim / 2;
 
+        // Masked scheduler metadata. The second half maps an expert-local
+        // M-block back to the compact copy-ready flag index.
+        masked_m[e] = total_count;
+        masked_m[num_local_experts + e] = base_block;
+
         // Per-rank remaining tokens and offset tracking
         uint32_t remaining[kNumMaxRanks];
         uint32_t rank_offset[kNumMaxRanks];  // tokens already placed
@@ -427,29 +437,12 @@ __device__ void dispatch_expert_preprocess_device(
             rank_offset[r] = 0;
         }
 
-        uint32_t tokens_placed_total = 0;  // for grouped_layout base_m tracking
-
         for (uint32_t mb = 0; mb < num_mblocks; ++mb) {
             uint32_t block_idx = base_block + mb;
 
-            // Count actual tokens in this M-block (for grouped_layout entry.y)
-            uint32_t tokens_in_block = 0;
-            uint32_t smem_row = 0;
-
-            // First pass: compute how many tokens fit in this block
-            uint32_t temp_remaining[kNumMaxRanks];
-            for (uint32_t r = 0; r < num_ranks; ++r)
-                temp_remaining[r] = remaining[r];
-
-            for (uint32_t r = 0; r < num_ranks; ++r) {
-                if (temp_remaining[r] == 0) continue;
-                uint32_t available = BLOCK_M - smem_row;
-                if (available == 0) break;
-                uint32_t take = min(temp_remaining[r], available);
-                tokens_in_block += take;
-                smem_row += take;
-                temp_remaining[r] -= take;
-            }
+            // [opt#1] Removed dead first pass: it computed tokens_in_block /
+            // temp_remaining that were never used (entry.y uses total_count, and
+            // tokens_placed_total was discarded). Saves ~num_ranks iters/block.
 
             // Write grouped_layout entry
             // entry.y = total tokens across ALL M-blocks for this expert (not per-block),
@@ -462,7 +455,7 @@ __device__ void dispatch_expert_preprocess_device(
             reinterpret_cast<uint4*>(grouped_layout + 4)[block_idx] = entry;
 
             // Second pass: write per-rank split info and update state
-            smem_row = 0;
+            uint32_t smem_row = 0;
             for (uint32_t r = 0; r < num_ranks; ++r) {
                 uint32_t idx = block_idx * num_ranks + r;
 
@@ -494,9 +487,15 @@ __device__ void dispatch_expert_preprocess_device(
                 remaining[r] -= take;
                 rank_offset[r] += take;
             }
-
-            tokens_placed_total += tokens_in_block;
         }
+    }
+
+    // Debug timing: [setup+barrier, remote-count-reads, compute(Phase4+5)] cycles
+    if (dbg_cyc != nullptr && threadIdx.x == 0) {
+        long long _dbg_t2 = clock64();
+        dbg_cyc[0] = (uint64_t)(_dbg_tA - _dbg_t0);
+        dbg_cyc[1] = (uint64_t)(_dbg_tB - _dbg_tA);
+        dbg_cyc[2] = (uint64_t)(_dbg_t2 - _dbg_tB);
     }
 }
 
@@ -517,8 +516,10 @@ __global__ void dispatch_expert_preprocess_kernel(
     uint64_t* __restrict__ rank_addr_sfa,
     uint32_t* __restrict__ rank_split_m,
     uint32_t* __restrict__ rank_counts,
+    uint32_t* __restrict__ masked_m,
     uint32_t* __restrict__ out_total_m_blocks,
-    uint32_t* __restrict__ out_shape_m) {
+    uint32_t* __restrict__ out_shape_m,
+    uint64_t* __restrict__ dbg_cyc) {
 
     extern __shared__ uint32_t smem[];
     dispatch_expert_preprocess_device<BLOCK_M>(
@@ -526,9 +527,9 @@ __global__ void dispatch_expert_preprocess_kernel(
         num_local_experts, num_total_experts, max_tokens_per_expert, hidden_dim,
         local_expert_start, generation,
         grouped_layout, rank_addr_a, rank_addr_sfa,
-        rank_split_m, rank_counts,
+        rank_split_m, rank_counts, masked_m,
         out_total_m_blocks, out_shape_m,
-        smem, blockDim.x);
+        dbg_cyc, smem, blockDim.x);
 }
 
 // Host launcher for expert-level preprocess
@@ -548,8 +549,10 @@ void launch_dispatch_expert_preprocess(
     uint64_t* rank_addr_sfa,
     uint32_t* rank_split_m,
     uint32_t* rank_counts,
+    uint32_t* masked_m,
     uint32_t* out_total_m_blocks,
     uint32_t* out_shape_m,
+    uint64_t* dbg_cyc,
     cudaStream_t stream) {
 
     uint32_t total_pairs = num_local_experts * num_ranks;
@@ -563,8 +566,8 @@ void launch_dispatch_expert_preprocess(
         num_local_experts, num_total_experts, max_tokens_per_expert, hidden_dim,
         local_expert_start, generation,
         grouped_layout, rank_addr_a, rank_addr_sfa,
-        rank_split_m, rank_counts,
-        out_total_m_blocks, out_shape_m);
+        rank_split_m, rank_counts, masked_m,
+        out_total_m_blocks, out_shape_m, dbg_cyc);
 }
 
 }  // namespace deep_gemm

@@ -12,6 +12,9 @@ deep_gemm/include/cutlass
 deep_gemm/include/cutlass3/cutlass
 deep_gemm/include/cutlass3/ppu
 deep_gemm/include/cutlass3/tools
+deep_gemm/include/cutlass3/accutlass.hpp
+deep_gemm/include/cutlass3/ppu_include.hpp
+sweep_logs/
 deep_gemm/include/accutlass.h
 deep_gemm/include/aiu
 .eggs/

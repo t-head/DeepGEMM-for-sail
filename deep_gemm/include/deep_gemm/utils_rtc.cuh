@@ -19,9 +19,10 @@ enum class GemmType {
     GroupedFused,
     BatchGemm,
     FusedDispatch,
+    FusedDispatchMasked,
 };
 
-const char* GemmTypeS[] = { "DenseGemm", "GroupedContiguous", "GroupedMasked", "GroupedNoPad", "GroupedFused", "BatchGemm", "FusedDispatch"};
+const char* GemmTypeS[] = { "DenseGemm", "GroupedContiguous", "GroupedMasked", "GroupedNoPad", "GroupedFused", "BatchGemm", "FusedDispatch", "FusedDispatchMasked"};
 
 enum class KernelType {
     Default,
