@@ -94,9 +94,8 @@ gl, ra, rs, sm, rc, blocks, shape_m = dispatch_expert_preprocess(
 print(f"  preprocess OK: shape_m={shape_m}, block_m={block_m}, blocks={blocks}")
 
 # Buffers
-bc_fp4, bc_flags = create_block_copy_buffers(num_local_experts, 1, max_tokens, hidden, block_m, device)
+bc_fp4, bc_sfa, bc_flags = create_block_copy_buffers(num_local_experts, 1, max_tokens, hidden, block_m, device)
 out = torch.zeros(shape_m, N, dtype=torch.bfloat16, device=device)
-merged_sfa = torch.zeros(num_local_experts, dtype=torch.int64, device=device)
 
 # ============ Test A: WITHOUT profiler ============
 print("\n  [Test A] Running kernel WITHOUT kstripe_profile_buf...")
@@ -104,9 +103,9 @@ try:
     fused_dispatch_block_copy_gemm1_fp4(
         (W_fp4, W_scale_u16), out, gl, ra, rs, sm, rc,
         shape_m, max_tokens, 1,
-        local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
+        local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
         num_copy_blocks=NCB, k_tiles_per_flag=K_TILES_PER_FLAG,
-        configs=bc_configs, merged_sfa_addrs=merged_sfa)
+        configs=bc_configs)
     torch.cuda.synchronize()
     print("  [Test A] OK - kernel runs without profiler")
 except Exception as e:
@@ -119,9 +118,9 @@ try:
     fused_dispatch_block_copy_gemm1_fp4(
         (W_fp4, W_scale_u16), out, gl, ra, rs, sm, rc,
         shape_m, max_tokens, 1,
-        local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
+        local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
         num_copy_blocks=NCB, k_tiles_per_flag=K_TILES_PER_FLAG,
-        configs=bc_configs, merged_sfa_addrs=merged_sfa,
+        configs=bc_configs,
         kstripe_profile_buf=prof)
     torch.cuda.synchronize()
     print("  [Test B] OK - kernel runs with profiler")

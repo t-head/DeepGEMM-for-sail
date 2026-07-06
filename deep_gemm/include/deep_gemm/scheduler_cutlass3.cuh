@@ -39,6 +39,12 @@ struct TileSchedulerArguments
     uint8_t* local_fp4_buf;
     uint32_t local_buf_k_half;
     uint32_t local_buf_max_tokens;
+    // Local HBM staging buffer for GPU-side SFA (scale) copy/repack. The copy
+    // blocks repack each rank's column-major scales into per-expert layout
+    // [k_scale_blocks, max_tokens] (K-stride = local_buf_max_tokens) so the GEMM
+    // reads this rank's SFA directly, without a host-built merged_sfa.
+    uint16_t* local_sfa_buf;
+    uint32_t local_buf_k_scale_blocks;
 
     // Dedicated copy blocks
     volatile uint32_t* copy_ready_flags;
@@ -74,6 +80,8 @@ struct TileSchedulerArguments
         , local_fp4_buf(nullptr)
         , local_buf_k_half(0)
         , local_buf_max_tokens(0)
+        , local_sfa_buf(nullptr)
+        , local_buf_k_scale_blocks(0)
         , copy_ready_flags(nullptr)
         , num_copy_blocks(0)
         , kstripe_profile_buf(nullptr)
@@ -97,6 +105,8 @@ struct TileSchedulerArguments
         , local_fp4_buf(nullptr)
         , local_buf_k_half(0)
         , local_buf_max_tokens(0)
+        , local_sfa_buf(nullptr)
+        , local_buf_k_scale_blocks(0)
         , copy_ready_flags(nullptr)
         , num_copy_blocks(0)
         , kstripe_profile_buf(nullptr)
@@ -116,6 +126,8 @@ struct TileSchedulerArguments
                            uint8_t* local_fp4_buf_,
                            uint32_t local_buf_k_half_,
                            uint32_t local_buf_max_tokens_,
+                           uint16_t* local_sfa_buf_,
+                           uint32_t local_buf_k_scale_blocks_,
                            volatile uint32_t* copy_ready_flags_,
                            uint32_t num_copy_blocks_,
                            uint64_t* kstripe_profile_buf_ = nullptr,
@@ -133,6 +145,8 @@ struct TileSchedulerArguments
         , local_fp4_buf(local_fp4_buf_)
         , local_buf_k_half(local_buf_k_half_)
         , local_buf_max_tokens(local_buf_max_tokens_)
+        , local_sfa_buf(local_sfa_buf_)
+        , local_buf_k_scale_blocks(local_buf_k_scale_blocks_)
         , copy_ready_flags(copy_ready_flags_)
         , num_copy_blocks(num_copy_blocks_)
         , kstripe_profile_buf(kstripe_profile_buf_)

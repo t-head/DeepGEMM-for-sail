@@ -229,65 +229,6 @@ def get_expert_token_counts(all_sym_bufs, ge, world_size):
             for r in range(world_size)]
 
 
-def build_merged_sfa(all_sym_bufs, num_local_experts, local_expert_start,
-                     num_total_experts, max_tokens, hidden, world_size, device,
-                     pad_align=None):
-    """Build merged SFA buffer from all-gathered symmetric buffers.
-
-    The CuTe mainloop creates SFA tensors with LayoutLeft (column-major):
-    shape (M, K_scale), stride (1, M) where M = padded_total per expert.
-    So the SFA data must be packed column-major with stride = padded_total.
-
-    Returns (merged_sfa, merged_sfa_addrs) tensors.
-    """
-    if pad_align is None:
-        pad_align = PAD_ALIGN
-    k_blocks = (hidden + 31) // 32
-    k_scale_blocks = (k_blocks + 1) // 2
-    scale_elems_per_expert_max = k_scale_blocks * max_tokens
-    metadata_bytes = ((num_total_experts * 4 + 15) // 16) * 16
-    fp4_per_expert = max_tokens * (hidden // 2)
-    fp4_region_size = num_total_experts * fp4_per_expert
-
-    expert_padded_totals = []
-    for le in range(num_local_experts):
-        ge = local_expert_start + le
-        counts = get_expert_token_counts(all_sym_bufs, ge, world_size)
-        padded = sum(_align_up(c, pad_align) for c in counts)
-        expert_padded_totals.append(padded)
-
-    total_sfa_elems = sum(pt * k_scale_blocks for pt in expert_padded_totals)
-    merged_sfa = torch.zeros(total_sfa_elems, dtype=torch.uint16, device=device)
-    merged_sfa_addrs = torch.zeros(num_local_experts, dtype=torch.int64, device=device)
-
-    offset = 0
-    for le in range(num_local_experts):
-        ge = local_expert_start + le
-        pt = expert_padded_totals[le]
-        merged_sfa_addrs[le] = merged_sfa.data_ptr() + offset * 2
-
-        if pt == 0:
-            offset += pt * k_scale_blocks
-            continue
-
-        expert_sfa = merged_sfa[offset:offset + pt * k_scale_blocks].view(k_scale_blocks, pt)
-
-        merged_token_pos = 0
-        for r in range(world_size):
-            count_r = all_sym_bufs[r][ge * 4: ge * 4 + 4].view(torch.int32).item()
-            if count_r == 0:
-                continue
-            scale_off_r = metadata_bytes + fp4_region_size + ge * scale_elems_per_expert_max * 2
-            src_scale = all_sym_bufs[r][scale_off_r:scale_off_r + scale_elems_per_expert_max * 2] \
-                .view(torch.uint16).view(k_scale_blocks, max_tokens)
-            expert_sfa[:, merged_token_pos:merged_token_pos + count_r] = src_scale[:, :count_r]
-            merged_token_pos += _align_up(count_r, pad_align)
-
-        offset += pt * k_scale_blocks
-
-    return merged_sfa, merged_sfa_addrs
-
-
 def print_routing_table(topk_ids, num_local_experts, rank, world_size, num_tokens, topk):
     """Print where each rank's tokens are routed: (target_rank, local_expert)."""
     ids = topk_ids.cpu().tolist()  # [num_tokens, topk]
@@ -432,17 +373,16 @@ def test_correctness(rank, world_size, group, device):
             print(f"    Expert {ge}: counts={counts} total={sum(counts)} padded={padded_total} mblocks={mblocks}")
     dist.barrier()
 
-    # Build merged SFA
-    merged_sfa, merged_sfa_addrs = build_merged_sfa(
-        all_sym_bufs, num_local_experts, local_expert_start,
-        num_total_experts, max_tokens, hidden, world_size, device)
+    # SFA is now copied/repacked on-device by the block-copy kernel (P0), so
+    # there is no host build_merged_sfa; all_sym_bufs above is only used for the
+    # CPU reference and token-count checks below.
 
     # ---- Run block-copy GEMM ----
     k_half = hidden // 2
     NUM_COPY_BLOCKS = int(os.getenv('NCB', '8'))
     K_TILES_PER_FLAG = int(os.getenv('K_TILES_PER_FLAG', '0'))
     COPY_MODE = int(os.getenv('COPY_MODE', '0'))  # 0=round-robin, 1=cooperative
-    bc_fp4, bc_flags = create_block_copy_buffers(
+    bc_fp4, bc_sfa, bc_flags = create_block_copy_buffers(
         num_local_experts, world_size, max_tokens, hidden, block_m, device)
     out_bc = create_fused_output(
         shape_m, num_local_experts, max_tokens, N, device)
@@ -452,10 +392,10 @@ def test_correctness(rank, world_size, group, device):
     fused_dispatch_block_copy_gemm1_fp4(
         (W_fp4, W_scale_u16), out_bc, gl, ra, rs, sm, rc,
         shape_m, max_tokens, world_size,
-        local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
+        local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
         num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,
         configs=bc_configs,
-        merged_sfa_addrs=merged_sfa_addrs, copy_mode=COPY_MODE)
+        copy_mode=COPY_MODE)
     torch.cuda.synchronize()
 
     # ---- Non-fused baseline (DeepEP + standard GEMM) ----
@@ -768,14 +708,11 @@ def test_performance(rank, world_size, group, device):
         print(f"  Block-copy config: block_m={bc_bm}, block_n={bc_bn}, block_k={bc_bk}, "
               f"warp_m={bc_wm}, warp_n={bc_wn}, stages={bc_stages}, num_sms={bc_sms}, smem={bc_smem}")
 
-    # ---- Build merged SFA for block-copy ----
+    # All-gather sym bufs (used by the local-to-local P2P isolation experiment
+    # below). SFA is produced on-device by the kernel — no host build_merged_sfa.
     all_sym_bufs = [torch.zeros_like(sym_buf) for _ in range(world_size)]
     dist.all_gather(all_sym_bufs, sym_buf)
     dist.barrier()
-
-    merged_sfa, merged_sfa_addrs = build_merged_sfa(
-        all_sym_bufs, num_local_experts, local_expert_start,
-        num_total_experts, max_tokens, hidden, world_size, device)
 
     # ---- Benchmark non-fused (pipeline throughput) ----
     fixed_expected_m = max(int(pc.max().item()), 1)
@@ -895,7 +832,7 @@ def test_performance(rank, world_size, group, device):
 
     # ---- Block-Copy NCB sweep ----
     dist.barrier()
-    bc_fp4_perf, bc_flags_perf = create_block_copy_buffers(
+    bc_fp4_perf, bc_sfa_perf, bc_flags_perf = create_block_copy_buffers(
         num_local_experts, world_size, max_tokens, hidden, block_m, device)
     out_bc = create_fused_output(
         expert_shape_m, num_local_experts, max_tokens, N, device)
@@ -910,9 +847,9 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
-                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs, copy_mode=COPY_MODE)
+                copy_mode=COPY_MODE)
         torch.cuda.synchronize()
 
         # Benchmark: full pipeline (quant + preprocess + block-copy GEMM)
@@ -933,9 +870,9 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
-                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs, copy_mode=COPY_MODE)
+                copy_mode=COPY_MODE)
             bc_end_events[i].record(stream)
         torch.cuda.synchronize()
         bc_t = sorted([s.elapsed_time(e) for s, e in zip(bc_start_events, bc_end_events)])
@@ -1063,9 +1000,8 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
-                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
         torch.cuda.synchronize()
 
         np_start = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
@@ -1080,9 +1016,8 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
-                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
             np_end[i].record(stream)
         torch.cuda.synchronize()
         np_times = sorted([np_start[i].elapsed_time(np_end[i]) for i in range(num_iters)])
@@ -1095,9 +1030,8 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
-                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
         torch.cuda.synchronize()
         bc_kernel_times = []
         for _ in range(pipe_iters):
@@ -1107,9 +1041,8 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
-                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
             ev_e.record()
             bc_kernel_times.append((ev_s, ev_e))
         torch.cuda.synchronize()
@@ -1137,9 +1070,9 @@ def test_performance(rank, world_size, group, device):
                 fused_dispatch_block_copy_gemm1_fp4(
                     (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                     expert_shape_m, max_tokens, world_size,
-                    local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                    local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                     num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                    merged_sfa_addrs=merged_sfa_addrs, copy_mode=ks_copy_mode)
+                    copy_mode=ks_copy_mode)
             torch.cuda.synchronize()
             ks_ev0 = torch.cuda.Event(enable_timing=True)
             ks_ev1 = torch.cuda.Event(enable_timing=True)
@@ -1147,9 +1080,9 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
-                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs, copy_mode=ks_copy_mode,
+                copy_mode=ks_copy_mode,
                 kstripe_profile_buf=ks_prof_buf)
             ks_ev1.record()
             torch.cuda.synchronize()
@@ -1219,9 +1152,9 @@ def test_performance(rank, world_size, group, device):
                     fused_dispatch_block_copy_gemm1_fp4(
                         (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                         expert_shape_m, max_tokens, world_size,
-                        local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                        local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                         num_copy_blocks=ncb, k_tiles_per_flag=0,
-                        merged_sfa_addrs=merged_sfa_addrs, copy_only=True)
+                        copy_only=True)
                 torch.cuda.synchronize()
                 evs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
                        for _ in range(bw_iters)]
@@ -1230,9 +1163,9 @@ def test_performance(rank, world_size, group, device):
                     fused_dispatch_block_copy_gemm1_fp4(
                         (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                         expert_shape_m, max_tokens, world_size,
-                        local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                        local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                         num_copy_blocks=ncb, k_tiles_per_flag=0,
-                        merged_sfa_addrs=merged_sfa_addrs, copy_only=True)
+                        copy_only=True)
                     e.record(stream)
                 torch.cuda.synchronize()
                 ts = sorted([s.elapsed_time(e) for s, e in evs])
@@ -1263,9 +1196,9 @@ def test_performance(rank, world_size, group, device):
                 fused_dispatch_block_copy_gemm1_fp4(
                     (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                     expert_shape_m, max_tokens, world_size,
-                    local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                    local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                     num_copy_blocks=8, k_tiles_per_flag=0,
-                    merged_sfa_addrs=merged_sfa_addrs, copy_mode=0)
+                    copy_mode=0)
             torch.cuda.synchronize()
             ab_modes = [int(x) for x in os.getenv('AB_MODES', '0,1,2').split(',')]
             for mode in ab_modes:
@@ -1274,9 +1207,9 @@ def test_performance(rank, world_size, group, device):
                         fused_dispatch_block_copy_gemm1_fp4(
                             (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                             expert_shape_m, max_tokens, world_size,
-                            local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                            local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                             num_copy_blocks=ncb, k_tiles_per_flag=0,
-                            merged_sfa_addrs=merged_sfa_addrs, copy_mode=mode)
+                            copy_mode=mode)
                     torch.cuda.synchronize()
                     evs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
                            for _ in range(ab_iters)]
@@ -1285,9 +1218,9 @@ def test_performance(rank, world_size, group, device):
                         fused_dispatch_block_copy_gemm1_fp4(
                             (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                             expert_shape_m, max_tokens, world_size,
-                            local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
+                            local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                             num_copy_blocks=ncb, k_tiles_per_flag=0,
-                            merged_sfa_addrs=merged_sfa_addrs, copy_mode=mode)
+                            copy_mode=mode)
                         e.record(stream)
                     torch.cuda.synchronize()
                     kt = sorted([s.elapsed_time(e) for s, e in evs])
@@ -1322,9 +1255,8 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_local, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
-                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
         torch.cuda.synchronize()
 
         local_kernel_times = []
@@ -1335,9 +1267,8 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_local, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
-                local_fp4_buf=bc_fp4_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
             ev_e.record()
             local_kernel_times.append((ev_s, ev_e))
         torch.cuda.synchronize()
@@ -1472,13 +1403,8 @@ def test_kstripe_profile(rank, world_size, group, device):
         max_tokens, hidden, local_expert_start, block_m,
         sync=True, _workspace=ws_expert)
 
-    all_sym_bufs = [torch.empty_like(sym_buf) for _ in range(world_size)]
-    dist.all_gather(all_sym_bufs, sym_buf)
-    merged_sfa, merged_sfa_addrs = build_merged_sfa(
-        all_sym_bufs, num_local_experts, local_expert_start,
-        num_total_experts, max_tokens, hidden, world_size, device)
-
-    bc_fp4, bc_flags = create_block_copy_buffers(
+    # SFA produced on-device by the kernel (P0) — no host merged SFA needed.
+    bc_fp4, bc_sfa, bc_flags = create_block_copy_buffers(
         num_local_experts, world_size, max_tokens, hidden, block_m, device)
     out_bc = create_fused_output(
         shape_m, num_local_experts, max_tokens, N, device)
@@ -1498,9 +1424,8 @@ def test_kstripe_profile(rank, world_size, group, device):
         fused_dispatch_block_copy_gemm1_fp4(
             (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
             shape_m, max_tokens, world_size,
-            local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
-            num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,
-            merged_sfa_addrs=merged_sfa_addrs)
+            local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
+            num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,)
     torch.cuda.synchronize()
 
     NUM_ITERS = 20
@@ -1511,9 +1436,8 @@ def test_kstripe_profile(rank, world_size, group, device):
         fused_dispatch_block_copy_gemm1_fp4(
             (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
             shape_m, max_tokens, world_size,
-            local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
-            num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,
-            merged_sfa_addrs=merged_sfa_addrs)
+            local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
+            num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,)
     end_evt.record()
     torch.cuda.synchronize()
     kernel_ms = start_evt.elapsed_time(end_evt) / NUM_ITERS
@@ -1522,9 +1446,8 @@ def test_kstripe_profile(rank, world_size, group, device):
     fused_dispatch_block_copy_gemm1_fp4(
         (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
         shape_m, max_tokens, world_size,
-        local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
+        local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
         num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,
-        merged_sfa_addrs=merged_sfa_addrs,
         kstripe_profile_buf=profile_buf)
     torch.cuda.synchronize()
 

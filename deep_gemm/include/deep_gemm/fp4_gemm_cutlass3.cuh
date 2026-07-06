@@ -48,6 +48,81 @@ __device__ __forceinline__ int4 ld_nc_global(const int4* ptr) {
     return __ldg(ptr);
 }
 
+// GPU-side SFA (scale) copy/repack for one M-block, all ranks.
+// Source: each rank's column-major scales in its symmetric buffer,
+//   [k_scale_blocks, max_tokens] with K-stride = local_buf_max_tokens; the
+//   preprocess-provided rank_addr_sfa[mb*nr+r] already points at (kb=0, this
+//   rank's token offset). Dest: this rank's local per-expert SFA buffer with the
+//   SAME K-stride, rows placed at m_block_in_expert*BLOCK_M + rank_split_m — i.e.
+//   the exact row layout the FP4 copy uses, so the GEMM reads matching A + SFA.
+// (start, stride) let cooperative copy (copy_mode 1/2) split the work across all
+// ncb blocks; single-owner paths pass (threadIdx.x, blockDim.x).
+template <uint32_t BLOCK_M, uint32_t NumRanks>
+__device__ __forceinline__ void copy_mblock_sfa(
+    const TileSchedulerArguments& sched, uint32_t mb,
+    uint32_t expert_local, uint32_t m_block_in_expert,
+    uint32_t start, uint32_t stride)
+{
+    const uint32_t ksb = sched.local_buf_k_scale_blocks;
+    const uint32_t max_tok = sched.local_buf_max_tokens;
+    uint16_t* __restrict__ dst_expert = sched.local_sfa_buf +
+        (uint64_t)expert_local * ksb * max_tok;
+    const uint32_t mrow_base = m_block_in_expert * BLOCK_M;
+
+    #pragma unroll 1
+    for (uint32_t r = 0; r < NumRanks; ++r) {
+        uint32_t idx = mb * NumRanks + r;
+        uint32_t cnt = __ldg(sched.rank_counts + idx);
+        if (cnt == 0) continue;
+        const uint16_t* __restrict__ src =
+            reinterpret_cast<const uint16_t*>(__ldg(sched.rank_addr_sfa + idx));
+        uint16_t* __restrict__ dst = dst_expert + (mrow_base + __ldg(sched.rank_split_m + idx));
+        // Flatten K-scale rows across the whole CTA. The old kb-outer loop used
+        // only `cnt` threads (64 in the production case), leaving 3/4 of a
+        // 256-thread copy CTA idle while every active thread serialized 112
+        // 16-bit loads. Flattening exposes ksb*cnt independent elements.
+        //
+        // When both row starts are 16-byte aligned, move eight uint16 scales per
+        // int4 transaction. Rank boundaries may be unaligned for arbitrary
+        // routing, so retain a scalar fallback and a scalar tail.
+        const bool aligned16 =
+            ((reinterpret_cast<uint64_t>(src) | reinterpret_cast<uint64_t>(dst)) & 15u) == 0;
+        if (aligned16 && cnt >= 8) {
+            const uint32_t vecs_per_row = cnt / 8;
+            const uint32_t total_vecs = ksb * vecs_per_row;
+            for (uint32_t linear = start; linear < total_vecs; linear += stride) {
+                uint32_t kb = linear / vecs_per_row;
+                uint32_t v = linear - kb * vecs_per_row;
+                const int4* __restrict__ s = reinterpret_cast<const int4*>(
+                    src + (uint64_t)kb * max_tok) + v;
+                int4* __restrict__ d = reinterpret_cast<int4*>(
+                    dst + (uint64_t)kb * max_tok) + v;
+                *d = ld_nc_global(s);
+            }
+
+            const uint32_t tail_begin = vecs_per_row * 8;
+            const uint32_t tail_count = cnt - tail_begin;
+            if (tail_count != 0) {
+                const uint32_t total_tail = ksb * tail_count;
+                for (uint32_t linear = start; linear < total_tail; linear += stride) {
+                    uint32_t kb = linear / tail_count;
+                    uint32_t t = linear - kb * tail_count + tail_begin;
+                    dst[(uint64_t)kb * max_tok + t] =
+                        __ldg(src + (uint64_t)kb * max_tok + t);
+                }
+            }
+        } else {
+            const uint32_t total_elems = ksb * cnt;
+            for (uint32_t linear = start; linear < total_elems; linear += stride) {
+                uint32_t kb = linear / cnt;
+                uint32_t t = linear - kb * cnt;
+                dst[(uint64_t)kb * max_tok + t] =
+                    __ldg(src + (uint64_t)kb * max_tok + t);
+            }
+        }
+    }
+}
+
 template <uint32_t BLOCK_M, uint32_t NumRanks>
 __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t total_m_blocks)
 {
@@ -197,6 +272,10 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
                 dst[i] = ld_nc_global(src + i);
         }
 
+        // GPU-side SFA copy for this M-block (published together with FP4 below).
+        copy_mblock_sfa<BLOCK_M, NumRanks>(
+            sched, mb, expert_local, m_block_in_expert, threadIdx.x, blockDim.x);
+
         __syncthreads();
         __threadfence();
         if (threadIdx.x == 0) {
@@ -240,6 +319,10 @@ __device__ void run_copy_block_cooperative(const TileSchedulerArguments& sched, 
             for (uint32_t i = gstart; i < n_int4; i += gstride)
                 dst[i] = ld_nc_global(src + i);
         }
+
+        // GPU-side SFA copy for this M-block, split across all ncb blocks.
+        copy_mblock_sfa<BLOCK_M, NumRanks>(
+            sched, mb, expert_local, m_block_in_expert, gstart, gstride);
 
         __syncthreads();
         if constexpr (SingleThreadFence) {
@@ -286,6 +369,11 @@ __device__ void run_copy_block_kstripe(
         uint8_t* local_a_base = sched.local_fp4_buf +
             (uint64_t)expert_local * max_tok * k_half +
             (uint64_t)m_block_in_expert * BLOCK_M * k_half;
+
+        // SFA is small and not K-striped; copy it all up-front so it is published
+        // by the first stripe's fence+flag (GEMM only reads SFA once ready).
+        copy_mblock_sfa<BLOCK_M, NumRanks>(
+            sched, mb, expert_local, m_block_in_expert, threadIdx.x, blockDim.x);
 
         for (uint32_t ks = 0; ks < num_stripes; ++ks) {
             const uint32_t stripe_col_start = ks * stripe_int4s;
@@ -767,15 +855,16 @@ class DeepGemmUniversal <
     auto blk_shape = TileShape{};
 
     // Hoist loop-invariant FusedDispatch values (nExpand>1 path)
-    uint32_t fd2_k_half, fd2_max_tok;
+    uint32_t fd2_k_half, fd2_max_tok, fd2_sfa_ksb;
     uint8_t* fd2_fp4_buf;
-    const uint64_t* fd2_sfa_addrs;
+    uint16_t* fd2_sfa_buf;
     volatile uint32_t* fd2_copy_flags;
     if constexpr (TileScheduler::kIsFusedDispatch) {
         fd2_k_half = params.scheduler.local_buf_k_half;
         fd2_max_tok = params.scheduler.local_buf_max_tokens;
         fd2_fp4_buf = params.scheduler.local_fp4_buf;
-        fd2_sfa_addrs = params.scheduler.remote_addr_sfa;
+        fd2_sfa_buf = params.scheduler.local_sfa_buf;
+        fd2_sfa_ksb = params.scheduler.local_buf_k_scale_blocks;
         fd2_copy_flags = params.scheduler.copy_ready_flags;
     }
 
@@ -804,8 +893,11 @@ class DeepGemmUniversal <
         ptr_A = reinterpret_cast<const ElementA*>(
             fd2_fp4_buf +
             (uint64_t)expert_local * fd2_max_tok * fd2_k_half);
+        // GPU-side SFA: per-expert local buffer, column-major [k_scale_blocks,
+        // max_tokens] with K-stride = max_tokens (see dSFA override below).
         ptr_scale_A = reinterpret_cast<const ElementSFA*>(
-            fd2_sfa_addrs[expert_local]);
+            fd2_sfa_buf +
+            (uint64_t)expert_local * fd2_sfa_ksb * fd2_max_tok);
       } else {
         auto offset_a = deep_scheduler.curr_offset_a();
         auto offset_scalea = deep_scheduler.curr_offset_mxfp4_scalea();
@@ -821,7 +913,9 @@ class DeepGemmUniversal <
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       auto dSFA_local = params.mainloop.dSFA;
       if constexpr (TileScheduler::kIsFusedDispatch) {
-          get<1>(dSFA_local) = static_cast<int64_t>(M);
+          // GPU-side SFA local buffer is packed per-expert with a fixed K-stride
+          // = max_tokens (NOT the dynamic padded M), matching the copy layout.
+          get<1>(dSFA_local) = static_cast<int64_t>(fd2_max_tok);
       }
       MainloopParams update_params = {
         {M, N, K}, ptr_A, params.mainloop.dA, ptr_B, params.mainloop.dB,
@@ -1372,15 +1466,16 @@ public:
     }
 
     // Hoist loop-invariant FusedDispatch values before LICM-disabled loop
-    uint32_t fd_k_half, fd_max_tok;
+    uint32_t fd_k_half, fd_max_tok, fd_sfa_ksb;
     uint8_t* fd_fp4_buf;
-    const uint64_t* fd_sfa_addrs;
+    uint16_t* fd_sfa_buf;
     volatile uint32_t* fd_copy_flags;
     if constexpr (TileScheduler::kIsFusedDispatch) {
         fd_k_half = params.scheduler.local_buf_k_half;
         fd_max_tok = params.scheduler.local_buf_max_tokens;
         fd_fp4_buf = params.scheduler.local_fp4_buf;
-        fd_sfa_addrs = params.scheduler.remote_addr_sfa;
+        fd_sfa_buf = params.scheduler.local_sfa_buf;
+        fd_sfa_ksb = params.scheduler.local_buf_k_scale_blocks;
         fd_copy_flags = params.scheduler.copy_ready_flags;
     }
 
@@ -1429,8 +1524,11 @@ public:
           ptr_A = reinterpret_cast<const ElementA*>(
               fd_fp4_buf +
               (uint64_t)expert_local * fd_max_tok * fd_k_half);
+          // GPU-side SFA: per-expert local buffer, column-major [k_scale_blocks,
+          // max_tokens] with K-stride = max_tokens (see dSFA override below).
           ptr_scale_A = reinterpret_cast<const ElementSFA*>(
-              fd_sfa_addrs[expert_local]);
+              fd_sfa_buf +
+              (uint64_t)expert_local * fd_sfa_ksb * fd_max_tok);
       } else {
           auto offset_a = deep_scheduler.curr_offset_a();
           auto offset_scalea = deep_scheduler.curr_offset_mxfp4_scalea();
@@ -1446,9 +1544,9 @@ public:
       // update actual global ptr offset
       auto dSFA_local = params.mainloop.dSFA;
       if constexpr (TileScheduler::kIsFusedDispatch) {
-          // SFA is packed column-major per expert with stride = padded_total (M),
-          // not max_tokens_per_expert. Override K-dim stride to match.
-          get<1>(dSFA_local) = static_cast<int64_t>(M);
+          // GPU-side SFA local buffer is packed per-expert with a fixed K-stride
+          // = max_tokens (NOT the dynamic padded M), matching the copy layout.
+          get<1>(dSFA_local) = static_cast<int64_t>(fd_max_tok);
       }
       MainloopParams update_params = {
         {M, N, K}, ptr_A, params.mainloop.dA, ptr_B, params.mainloop.dB,
@@ -2376,6 +2474,7 @@ public:
         const uint32_t *rank_counts,
         const uint64_t *remote_addr_sfa,
         uint8_t* local_fp4_buf,
+        uint16_t* local_sfa_buf,
         volatile uint32_t* copy_ready_flags,
         uint64_t* kstripe_profile_buf = nullptr,
         uint32_t kstripe_profile_max_mb = 0,
@@ -2524,6 +2623,9 @@ public:
         };
 
         uint32_t k_half = ShapeK;
+        // SFA (scale) K-blocks = ceil(K/32); matches the GEMM's SFK and the
+        // per-expert local SFA buffer stride used by the copy blocks.
+        uint32_t k_scale_blocks = (ShapeK + 31u) / 32u;
 
         TileSchedulerArguments sched_args(
             (uint32_t)shape_m, layout_info,
@@ -2531,6 +2633,7 @@ public:
             rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts, NumRanks,
             remote_addr_sfa,
             local_fp4_buf, k_half, max_tokens_per_expert,
+            local_sfa_buf, k_scale_blocks,
             copy_ready_flags, NumCopyBlocks,
             kstripe_profile_buf, kstripe_profile_max_mb,  // max_mb repurposed as max_tiles (numel/4)
             copy_mode);

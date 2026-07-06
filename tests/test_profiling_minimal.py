@@ -161,10 +161,9 @@ def main():
         print(f"  Step 3 OK: shape_m={shape_m}, block_m={block_m}, blocks={blocks}")
 
     # Build merged SFA (simple: use zeros placeholder for this minimal test)
-    merged_sfa_addrs = torch.zeros(num_local_experts, dtype=torch.int64, device=device)
 
     # Create block-copy buffers
-    bc_fp4, bc_flags = create_block_copy_buffers(
+    bc_fp4, bc_sfa, bc_flags = create_block_copy_buffers(
         num_local_experts, world_size, max_tokens, hidden, block_m, device)
     out_bc = torch.zeros(shape_m, N, dtype=torch.bfloat16, device=device)
 
@@ -176,10 +175,9 @@ def main():
         fused_dispatch_block_copy_gemm1_fp4(
             (W_fp4, W_scale_u16), out_bc, gl, ra, rs, sm, rc,
             shape_m, max_tokens, world_size,
-            local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
+            local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
             num_copy_blocks=NCB, k_tiles_per_flag=K_TILES_PER_FLAG,
-            configs=bc_configs,
-            merged_sfa_addrs=merged_sfa_addrs)
+            configs=bc_configs,)
     torch.cuda.synchronize()
 
     if rank == 0:
@@ -196,10 +194,9 @@ def main():
         fused_dispatch_block_copy_gemm1_fp4(
             (W_fp4, W_scale_u16), out_bc, gl, ra, rs, sm, rc,
             shape_m, max_tokens, world_size,
-            local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
+            local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
             num_copy_blocks=NCB, k_tiles_per_flag=K_TILES_PER_FLAG,
-            configs=bc_configs,
-            merged_sfa_addrs=merged_sfa_addrs)
+            configs=bc_configs,)
     ev_e.record()
     torch.cuda.synchronize()
     kernel_ms = ev_s.elapsed_time(ev_e) / NUM_ITERS
@@ -215,10 +212,9 @@ def main():
     fused_dispatch_block_copy_gemm1_fp4(
         (W_fp4, W_scale_u16), out_bc, gl, ra, rs, sm, rc,
         shape_m, max_tokens, world_size,
-        local_fp4_buf=bc_fp4, copy_ready_flags=bc_flags,
+        local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
         num_copy_blocks=NCB, k_tiles_per_flag=K_TILES_PER_FLAG,
         configs=bc_configs,
-        merged_sfa_addrs=merged_sfa_addrs,
         kstripe_profile_buf=ks_prof_buf)
     torch.cuda.synchronize()
 
