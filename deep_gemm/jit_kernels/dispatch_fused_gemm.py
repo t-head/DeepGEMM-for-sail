@@ -1,5 +1,6 @@
 import os
 import torch
+from dataclasses import dataclass
 from typing import Tuple
 
 from .gemm_fp4 import (
@@ -27,35 +28,35 @@ launch_mxfp4_quantize<{HIDDEN}>(
     stream);
 """
 
-# --- Dispatch Preprocess: read routing info → generate M-block metadata ---
-includes_preprocess = ('"../deep_gemm/dispatch_preprocess.cuh"', )
-template_preprocess = """
+# --- Expert preprocess: read routing info → generate M-block metadata ---
+includes_preprocess = ('"../deep_gemm/expert_preprocess.cuh"', )
+template_expert_prepare = """
 using namespace deep_gemm;
 
-launch_dispatch_preprocess<{BLOCK_M}>(
+launch_dispatch_expert_prepare(
     sym_buf_addrs,
     {RANK_IDX}, {NUM_RANKS},
     {NUM_LOCAL_EXPERTS}, {NUM_TOTAL_EXPERTS}, {MAX_TOKENS_PER_EXPERT}, {HIDDEN},
     {LOCAL_EXPERT_START},
     generation,
-    grouped_layout,
-    reinterpret_cast<uint64_t*>(remote_addr_a),
-    reinterpret_cast<uint64_t*>(remote_addr_sfa),
-    reinterpret_cast<uint32_t*>(out_total_m_blocks),
+    reinterpret_cast<uint32_t*>(pair_counts),
+    reinterpret_cast<uint32_t*>(masked_m),
     reinterpret_cast<uint32_t*>(out_shape_m),
+    reinterpret_cast<uint32_t*>(out_expected_m),
+    reinterpret_cast<uint64_t*>(dbg_cyc),
     stream);
 """
 
-# --- Expert-level Preprocess: merge expert-rank pairs into expert groups ---
-template_expert_preprocess = """
+template_expert_finalize = """
 using namespace deep_gemm;
 
-launch_dispatch_expert_preprocess<{BLOCK_M}>(
+launch_dispatch_expert_finalize<{BLOCK_M}>(
     sym_buf_addrs,
     {RANK_IDX}, {NUM_RANKS},
     {NUM_LOCAL_EXPERTS}, {NUM_TOTAL_EXPERTS}, {MAX_TOKENS_PER_EXPERT}, {HIDDEN},
     {LOCAL_EXPERT_START},
     generation,
+    reinterpret_cast<const uint32_t*>(pair_counts),
     grouped_layout,
     reinterpret_cast<uint64_t*>(rank_addr_a),
     reinterpret_cast<uint64_t*>(rank_addr_sfa),
@@ -64,6 +65,30 @@ launch_dispatch_expert_preprocess<{BLOCK_M}>(
     reinterpret_cast<uint32_t*>(masked_m),
     reinterpret_cast<uint32_t*>(out_total_m_blocks),
     reinterpret_cast<uint32_t*>(out_shape_m),
+    reinterpret_cast<uint64_t*>(dbg_cyc),
+    stream);
+"""
+
+
+template_expert_preprocess_merged = """
+using namespace deep_gemm;
+
+launch_dispatch_expert_preprocess_merged<{BLOCK_M}>(
+    sym_buf_addrs,
+    {RANK_IDX}, {NUM_RANKS},
+    {NUM_LOCAL_EXPERTS}, {NUM_TOTAL_EXPERTS}, {MAX_TOKENS_PER_EXPERT}, {HIDDEN},
+    {LOCAL_EXPERT_START},
+    generation,
+    reinterpret_cast<uint32_t*>(pair_counts),
+    grouped_layout,
+    reinterpret_cast<uint64_t*>(rank_addr_a),
+    reinterpret_cast<uint64_t*>(rank_addr_sfa),
+    reinterpret_cast<uint32_t*>(rank_split_m),
+    reinterpret_cast<uint32_t*>(rank_counts),
+    reinterpret_cast<uint32_t*>(masked_m),
+    reinterpret_cast<uint32_t*>(out_total_m_blocks),
+    reinterpret_cast<uint32_t*>(out_shape_m),
+    reinterpret_cast<uint32_t*>(out_expected_m),
     reinterpret_cast<uint64_t*>(dbg_cyc),
     stream);
 """
@@ -129,25 +154,7 @@ def get_sym_buffer_size(
     return flag_offset + 128
 
 
-def create_preprocess_workspace(
-    num_local_experts: int,
-    num_ranks: int,
-    max_tokens_per_expert: int,
-    block_m: int,
-    device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    max_m_blocks_per_pair = ceil_div(max_tokens_per_expert, block_m)
-    max_total_m_blocks = num_local_experts * num_ranks * max_m_blocks_per_pair
-    return (
-        torch.zeros((1 + max_total_m_blocks) * 4, dtype=torch.int32, device=device),
-        torch.zeros(max_total_m_blocks, dtype=torch.int64, device=device),
-        torch.zeros(max_total_m_blocks, dtype=torch.int64, device=device),
-        torch.zeros(1, dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int32, device=device),
-    )
-
-
-def mxfp4_quantize_to_sym_buffer(
+def _mxfp4_quantize_to_sym_buffer(
     input_bf16: torch.Tensor,
     topk_ids: torch.Tensor,
     sym_buf: torch.Tensor,
@@ -163,7 +170,7 @@ def mxfp4_quantize_to_sym_buffer(
 
     When generation > 0, an atomic-arrival kernel pushes `generation` into every
     consumer's local slot[rank_idx]; sym_buf_addrs (peer base ptrs, int64) is required
-    in that case. Consumers (dispatch_preprocess) poll their local slot instead of
+    in that case. Consumers (expert prepare) poll their local slot instead of
     spinning on a remote NVLink flag.
     """
     num_tokens, hidden_dim = input_bf16.shape
@@ -203,7 +210,7 @@ def mxfp4_quantize_to_sym_buffer(
     )
 
     runtime = jit_tuner.compile_and_tune(
-        name='mxfp4_quantize_to_sym_buffer',
+        name='_mxfp4_quantize_to_sym_buffer',
         keys={
             'HIDDEN': hidden_dim,
             'NUM_LOCAL_EXPERTS': num_local_experts,
@@ -222,100 +229,34 @@ def mxfp4_quantize_to_sym_buffer(
     runtime(*args)
 
 
-def dispatch_preprocess(
-    sym_buf_addrs: torch.Tensor,
-    rank_idx: int,
-    num_ranks: int,
-    num_local_experts: int,
-    num_total_experts: int,
-    max_tokens_per_expert: int,
-    hidden_dim: int,
-    local_expert_start: int,
-    block_m: int,
-    generation: int = 0,
-    sync: bool = True,
-    _workspace=None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Read routing metadata and generate M-block scheduling for fused GEMM."""
-    assert sym_buf_addrs.dtype == torch.int64
-    assert sym_buf_addrs.numel() >= num_ranks
-
-    device = sym_buf_addrs.device
-
-    max_m_blocks_per_pair = ceil_div(max_tokens_per_expert, block_m)
-    max_total_m_blocks = num_local_experts * num_ranks * max_m_blocks_per_pair
-
-    if _workspace is not None:
-        grouped_layout, remote_addr_a, remote_addr_sfa, out_total_m_blocks, out_shape_m = _workspace
-    else:
-        grouped_layout = torch.zeros((1 + max_total_m_blocks) * 4, dtype=torch.int32, device=device)
-        remote_addr_a = torch.zeros(max_total_m_blocks, dtype=torch.int64, device=device)
-        remote_addr_sfa = torch.zeros(max_total_m_blocks, dtype=torch.int64, device=device)
-        out_total_m_blocks = torch.zeros(1, dtype=torch.int32, device=device)
-        out_shape_m = torch.zeros(1, dtype=torch.int32, device=device)
-
-    global includes_preprocess, template_preprocess
-
-    args = (sym_buf_addrs, grouped_layout, remote_addr_a, remote_addr_sfa,
-            out_total_m_blocks, out_shape_m,
-            generation,
-            torch.cuda.current_stream())
-
-    runtime = jit_tuner.compile_and_tune(
-        name='dispatch_preprocess',
-        keys={
-            'RANK_IDX': rank_idx,
-            'NUM_RANKS': num_ranks,
-            'NUM_LOCAL_EXPERTS': num_local_experts,
-            'NUM_TOTAL_EXPERTS': num_total_experts,
-            'MAX_TOKENS_PER_EXPERT': max_tokens_per_expert,
-            'HIDDEN': hidden_dim,
-            'LOCAL_EXPERT_START': local_expert_start,
-            'BLOCK_M': block_m,
-            'BLOCK_N': 1, 'BLOCK_K': 1,
-            'WARP_M': 1, 'WARP_N': 1, 'NUM_STAGES': 1,
-        },
-        space=(),
-        includes=includes_preprocess,
-        arg_defs=(
-            ('sym_buf_addrs', torch.int64),
-            ('grouped_layout', torch.int32),
-            ('remote_addr_a', torch.int64),
-            ('remote_addr_sfa', torch.int64),
-            ('out_total_m_blocks', torch.int32),
-            ('out_shape_m', torch.int32),
-            ('generation', int),
-            ('stream', torch.cuda.Stream),
-        ),
-        template=template_preprocess,
-        args=args,
-        jit_include_dir='cutlass3',
-    )
-    runtime(*args)
-
-    if sync:
-        torch.cuda.current_stream().synchronize()
-        total_m_blocks = out_total_m_blocks.item()
-        shape_m = out_shape_m.item()
-    else:
-        max_m_blocks_per_pair = ceil_div(max_tokens_per_expert, block_m)
-        total_m_blocks = num_local_experts * num_ranks * max_m_blocks_per_pair
-        shape_m = num_local_experts * num_ranks * max_tokens_per_expert
-
-    return grouped_layout, remote_addr_a, remote_addr_sfa, total_m_blocks, shape_m
+@dataclass(frozen=True)
+class ExpertPreprocessWorkspace:
+    grouped_layout: torch.Tensor
+    rank_addr_a: torch.Tensor
+    rank_addr_sfa: torch.Tensor
+    rank_split_m: torch.Tensor
+    rank_counts: torch.Tensor
+    masked_m: torch.Tensor
+    pair_counts: torch.Tensor
+    out_total_m_blocks: torch.Tensor
+    out_shape_m: torch.Tensor
+    out_expected_m: torch.Tensor
 
 
 def create_expert_preprocess_workspace(
     num_local_experts: int,
     num_ranks: int,
     max_tokens_per_expert: int,
-    block_m: int,
     device,
-):
-    """Allocate workspace for expert-level preprocess."""
-    max_expert_tokens = num_ranks * max_tokens_per_expert
-    max_m_blocks_per_expert = ceil_div(max_expert_tokens, block_m)
-    max_total_m_blocks = num_local_experts * max_m_blocks_per_expert
+) -> ExpertPreprocessWorkspace:
+    """Allocate BLOCK_M-independent storage for expert prepare + finalize.
+
+    The destination staging contract caps each aggregated owner expert at
+    ``max_tokens_per_expert``. Reserving one metadata entry per possible token
+    is therefore sufficient for every positive BLOCK_M without guessing the
+    configuration that prepare will select.
+    """
+    max_total_m_blocks = num_local_experts * max_tokens_per_expert
     max_rank_entries = max_total_m_blocks * num_ranks
     # Keep masked metadata in the tail of the same allocation so the fused
     # dispatch API can recover it from grouped_layout without changing every
@@ -324,22 +265,108 @@ def create_expert_preprocess_workspace(
         (1 + max_total_m_blocks) * 4 + 2 * num_local_experts,
         dtype=torch.int32, device=device)
     masked_m = grouped_layout[-2 * num_local_experts:]
-    return (
-        grouped_layout,
-        torch.zeros(max_rank_entries, dtype=torch.int64, device=device),
-        torch.zeros(max_rank_entries, dtype=torch.int64, device=device),
-        torch.zeros(max_rank_entries, dtype=torch.int32, device=device),
-        torch.zeros(max_rank_entries, dtype=torch.int32, device=device),
+    return ExpertPreprocessWorkspace(
+        grouped_layout=grouped_layout,
+        rank_addr_a=torch.zeros(max_rank_entries, dtype=torch.int64, device=device),
+        rank_addr_sfa=torch.zeros(max_rank_entries, dtype=torch.int64, device=device),
+        rank_split_m=torch.zeros(max_rank_entries, dtype=torch.int32, device=device),
+        rank_counts=torch.zeros(max_rank_entries, dtype=torch.int32, device=device),
         # [expert token counts, expert base M-block offsets]. The first half is
         # the production GroupedMasked scheduler input; the second maps its
         # expert-local tiles to the compact copy-ready flag array.
-        masked_m,
-        torch.zeros(1, dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int32, device=device),
+        masked_m=masked_m,
+        # BLOCK_M-independent count cache, rank-major [rank, local_expert].
+        pair_counts=torch.zeros(num_ranks * num_local_experts, dtype=torch.int32, device=device),
+        out_total_m_blocks=torch.zeros(1, dtype=torch.int32, device=device),
+        out_shape_m=torch.zeros(1, dtype=torch.int32, device=device),
+        out_expected_m=torch.zeros(1, dtype=torch.int32, device=device),
     )
 
 
-def dispatch_expert_preprocess(
+def dispatch_expert_prepare(
+    sym_buf_addrs: torch.Tensor,
+    rank_idx: int,
+    num_ranks: int,
+    num_local_experts: int,
+    num_total_experts: int,
+    max_tokens_per_expert: int,
+    hidden_dim: int,
+    local_expert_start: int,
+    generation: int = 0,
+    sync: bool = True,
+    dbg_cyc: torch.Tensor = None,
+    _workspace=None,
+) -> Tuple:
+    """BLOCK_M-independent expert count phase.
+
+    Waits for the generation, caches per-(rank, expert) counts, writes the first
+    half of masked_m, and returns total M plus max expert M.
+    """
+    assert sym_buf_addrs.dtype == torch.int64
+    device = sym_buf_addrs.device
+    if dbg_cyc is None:
+        dbg_cyc = torch.zeros(4, dtype=torch.int64, device=device)  # >=3: kernel writes [0..2]
+    assert dbg_cyc.dtype == torch.int64 and dbg_cyc.numel() >= 3
+
+    if _workspace is None:
+        _workspace = create_expert_preprocess_workspace(
+            num_local_experts, num_ranks, max_tokens_per_expert, device)
+    masked_m = _workspace.masked_m
+    pair_counts = _workspace.pair_counts
+    out_shape_m = _workspace.out_shape_m
+    out_expected_m = _workspace.out_expected_m
+
+    args = (sym_buf_addrs, pair_counts, masked_m, out_shape_m, out_expected_m,
+            dbg_cyc, generation, torch.cuda.current_stream())
+
+    runtime = jit_tuner.compile_and_tune(
+        name='dispatch_expert_prepare',
+        keys={
+            'RANK_IDX': rank_idx,
+            'NUM_RANKS': num_ranks,
+            'NUM_LOCAL_EXPERTS': num_local_experts,
+            'NUM_TOTAL_EXPERTS': num_total_experts,
+            'MAX_TOKENS_PER_EXPERT': max_tokens_per_expert,
+            'HIDDEN': hidden_dim,
+            'LOCAL_EXPERT_START': local_expert_start,
+            'BLOCK_M': 1,
+            'BLOCK_N': 1, 'BLOCK_K': 1,
+            'WARP_M': 1, 'WARP_N': 1, 'NUM_STAGES': 1,
+        },
+        space=(),
+        includes=includes_preprocess,
+        arg_defs=(
+            ('sym_buf_addrs', torch.int64),
+            ('pair_counts', torch.int32),
+            ('masked_m', torch.int32),
+            ('out_shape_m', torch.int32),
+            ('out_expected_m', torch.int32),
+            ('dbg_cyc', torch.int64),
+            ('generation', int),
+            ('stream', torch.cuda.Stream),
+        ),
+        template=template_expert_prepare,
+        args=args,
+        jit_include_dir='cutlass3',
+    )
+    runtime(*args)
+
+    if sync:
+        torch.cuda.current_stream().synchronize()
+        shape_m = out_shape_m.item()
+        expected_m = out_expected_m.item()
+        if expected_m > max_tokens_per_expert:
+            raise RuntimeError(
+                f"expert token count {expected_m} exceeds staging capacity "
+                f"{max_tokens_per_expert}")
+    else:
+        shape_m = None
+        expected_m = None
+
+    return shape_m, expected_m, masked_m
+
+
+def dispatch_expert_finalize(
     sym_buf_addrs: torch.Tensor,
     rank_idx: int,
     num_ranks: int,
@@ -355,35 +382,31 @@ def dispatch_expert_preprocess(
     dbg_cyc: torch.Tensor = None,
     _workspace=None,
 ) -> Tuple:
-    """Expert-level preprocess: groups by expert, producing per-rank split metadata.
-
-    dbg_cyc: optional int64[>=3] buffer. If given, kernel writes per-phase cycle
-    counts [setup+barrier, remote-count-reads, compute(Phase4+5)] (thread 0).
-    """
+    """BLOCK_M-dependent expert layout phase using cached pair counts."""
     assert sym_buf_addrs.dtype == torch.int64
     device = sym_buf_addrs.device
     if dbg_cyc is None:
-        dbg_cyc = torch.zeros(4, dtype=torch.int64, device=device)  # >=3: kernel writes [0..2]
+        dbg_cyc = torch.zeros(4, dtype=torch.int64, device=device)
     assert dbg_cyc.dtype == torch.int64 and dbg_cyc.numel() >= 3
 
-    if _workspace is not None:
-        grouped_layout, rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts, masked_m, \
-            out_total_m_blocks, out_shape_m = _workspace
-    else:
-        grouped_layout, rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts, masked_m, \
-            out_total_m_blocks, out_shape_m = create_expert_preprocess_workspace(
-                num_local_experts, num_ranks, max_tokens_per_expert, block_m, device)
+    if _workspace is None:
+        raise ValueError("dispatch_expert_prepare workspace is required")
+    grouped_layout = _workspace.grouped_layout
+    rank_addr_a = _workspace.rank_addr_a
+    rank_addr_sfa = _workspace.rank_addr_sfa
+    rank_split_m = _workspace.rank_split_m
+    rank_counts = _workspace.rank_counts
+    masked_m = _workspace.masked_m
+    pair_counts = _workspace.pair_counts
+    out_total_m_blocks = _workspace.out_total_m_blocks
+    out_shape_m = _workspace.out_shape_m
 
-    global includes_preprocess, template_expert_preprocess
-
-    args = (sym_buf_addrs, grouped_layout, rank_addr_a, rank_addr_sfa,
-            rank_split_m, rank_counts, masked_m,
-            out_total_m_blocks, out_shape_m, dbg_cyc,
-            generation,
-            torch.cuda.current_stream())
+    args = (sym_buf_addrs, pair_counts, grouped_layout, rank_addr_a, rank_addr_sfa,
+            rank_split_m, rank_counts, masked_m, out_total_m_blocks, out_shape_m,
+            dbg_cyc, generation, torch.cuda.current_stream())
 
     runtime = jit_tuner.compile_and_tune(
-        name='dispatch_expert_preprocess',
+        name='dispatch_expert_finalize',
         keys={
             'RANK_IDX': rank_idx,
             'NUM_RANKS': num_ranks,
@@ -400,6 +423,7 @@ def dispatch_expert_preprocess(
         includes=includes_preprocess,
         arg_defs=(
             ('sym_buf_addrs', torch.int64),
+            ('pair_counts', torch.int32),
             ('grouped_layout', torch.int32),
             ('rank_addr_a', torch.int64),
             ('rank_addr_sfa', torch.int64),
@@ -412,7 +436,7 @@ def dispatch_expert_preprocess(
             ('generation', int),
             ('stream', torch.cuda.Stream),
         ),
-        template=template_expert_preprocess,
+        template=template_expert_finalize,
         args=args,
         jit_include_dir='cutlass3',
     )
@@ -423,10 +447,107 @@ def dispatch_expert_preprocess(
         total_m_blocks = out_total_m_blocks.item()
         shape_m = out_shape_m.item()
     else:
-        max_expert_tokens = num_ranks * max_tokens_per_expert
-        max_m_blocks_per_expert = ceil_div(max_expert_tokens, block_m)
+        max_m_blocks_per_expert = ceil_div(max_tokens_per_expert, block_m)
         total_m_blocks = num_local_experts * max_m_blocks_per_expert
-        shape_m = num_local_experts * num_ranks * max_tokens_per_expert
+        shape_m = num_local_experts * max_tokens_per_expert
+
+    result = (grouped_layout, rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts,
+              total_m_blocks, shape_m)
+    return result + (masked_m,) if return_masked_m else result
+
+
+def dispatch_expert_preprocess_merged(
+    sym_buf_addrs: torch.Tensor,
+    rank_idx: int,
+    num_ranks: int,
+    num_local_experts: int,
+    num_total_experts: int,
+    max_tokens_per_expert: int,
+    hidden_dim: int,
+    local_expert_start: int,
+    block_m: int,
+    generation: int = 0,
+    sync: bool = False,
+    return_masked_m: bool = False,
+    dbg_cyc: torch.Tensor = None,
+    _workspace=None,
+) -> Tuple:
+    """Single-launch prepare+finalize for the fixed-BLOCK_M (masked) path.
+
+    Equivalent to dispatch_expert_prepare() followed by dispatch_expert_finalize()
+    but in one kernel launch (saves the finalize launch + kernel-boundary gap).
+    Requires block_m known on host; does not support the sync=True host-readback
+    contract of the split prepare (there is no intermediate stage to read back).
+    """
+    assert sym_buf_addrs.dtype == torch.int64
+    device = sym_buf_addrs.device
+    if dbg_cyc is None:
+        dbg_cyc = torch.zeros(4, dtype=torch.int64, device=device)
+    assert dbg_cyc.dtype == torch.int64 and dbg_cyc.numel() >= 3
+
+    if _workspace is None:
+        raise ValueError("dispatch_expert_preprocess_merged workspace is required")
+    grouped_layout = _workspace.grouped_layout
+    rank_addr_a = _workspace.rank_addr_a
+    rank_addr_sfa = _workspace.rank_addr_sfa
+    rank_split_m = _workspace.rank_split_m
+    rank_counts = _workspace.rank_counts
+    masked_m = _workspace.masked_m
+    pair_counts = _workspace.pair_counts
+    out_total_m_blocks = _workspace.out_total_m_blocks
+    out_shape_m = _workspace.out_shape_m
+    out_expected_m = _workspace.out_expected_m
+
+    args = (sym_buf_addrs, pair_counts, grouped_layout, rank_addr_a, rank_addr_sfa,
+            rank_split_m, rank_counts, masked_m, out_total_m_blocks, out_shape_m,
+            out_expected_m, dbg_cyc, generation, torch.cuda.current_stream())
+
+    runtime = jit_tuner.compile_and_tune(
+        name='dispatch_expert_preprocess_merged',
+        keys={
+            'RANK_IDX': rank_idx,
+            'NUM_RANKS': num_ranks,
+            'NUM_LOCAL_EXPERTS': num_local_experts,
+            'NUM_TOTAL_EXPERTS': num_total_experts,
+            'MAX_TOKENS_PER_EXPERT': max_tokens_per_expert,
+            'HIDDEN': hidden_dim,
+            'LOCAL_EXPERT_START': local_expert_start,
+            'BLOCK_M': block_m,
+            'BLOCK_N': 1, 'BLOCK_K': 1,
+            'WARP_M': 1, 'WARP_N': 1, 'NUM_STAGES': 1,
+        },
+        space=(),
+        includes=includes_preprocess,
+        arg_defs=(
+            ('sym_buf_addrs', torch.int64),
+            ('pair_counts', torch.int32),
+            ('grouped_layout', torch.int32),
+            ('rank_addr_a', torch.int64),
+            ('rank_addr_sfa', torch.int64),
+            ('rank_split_m', torch.int32),
+            ('rank_counts', torch.int32),
+            ('masked_m', torch.int32),
+            ('out_total_m_blocks', torch.int32),
+            ('out_shape_m', torch.int32),
+            ('out_expected_m', torch.int32),
+            ('dbg_cyc', torch.int64),
+            ('generation', int),
+            ('stream', torch.cuda.Stream),
+        ),
+        template=template_expert_preprocess_merged,
+        args=args,
+        jit_include_dir='cutlass3',
+    )
+    runtime(*args)
+
+    if sync:
+        torch.cuda.current_stream().synchronize()
+        total_m_blocks = out_total_m_blocks.item()
+        shape_m = out_shape_m.item()
+    else:
+        max_m_blocks_per_expert = ceil_div(max_tokens_per_expert, block_m)
+        total_m_blocks = num_local_experts * max_m_blocks_per_expert
+        shape_m = num_local_experts * max_tokens_per_expert
 
     result = (grouped_layout, rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts,
               total_m_blocks, shape_m)
@@ -444,8 +565,7 @@ def create_block_copy_buffers(num_local_experts, num_ranks, max_tokens_per_exper
     k_scale_blocks = ceil_div(k_half, 32)
     local_sfa = torch.zeros(num_local_experts * k_scale_blocks * max_tokens_per_expert,
                             dtype=torch.uint16, device=device)
-    max_expert_tokens = num_ranks * max_tokens_per_expert
-    max_m_blocks_per_expert = ceil_div(max_expert_tokens, block_m)
+    max_m_blocks_per_expert = ceil_div(max_tokens_per_expert, block_m)
     max_total_m_blocks = num_local_experts * max_m_blocks_per_expert
     # 2x size: [0..total-1] = per-M-block ready flags (read by GEMM),
     # [total..2*total-1] = per-M-block done-counters for cooperative copy
@@ -468,6 +588,8 @@ def fused_dispatch_block_copy_gemm1_fp4(
     local_fp4_buf: torch.Tensor,
     local_sfa_buf: torch.Tensor,
     copy_ready_flags: torch.Tensor,
+    *,
+    expected_m: int,
     num_copy_blocks: int = 1,
     k_tiles_per_flag: int = 0,
     configs=None,
@@ -477,12 +599,11 @@ def fused_dispatch_block_copy_gemm1_fp4(
     copy_mode: int = 0,
     masked_m: torch.Tensor = None,
 ) -> None:
-    """Block-copy fused GEMM1 with selectable NoPad or Masked scheduling.
+    """Block-copy fused GEMM1 with masked grouped scheduling.
 
-    Set FUSED_GEMM_GROUPING=nopad|masked (default: nopad). Masked mode expects
-    ``out`` shaped [num_groups, padded_m, n]. The standard expert preprocess
-    workspace stores ``masked_m`` in the grouped-layout tail automatically.
-    NoPad retains the existing compact [shape_m, n] output contract.
+    ``out`` is shaped [num_groups, padded_m, n]. The standard expert preprocess
+    workspace stores ``masked_m`` (per-expert counts + base M-block) in the
+    grouped-layout tail automatically.
     """
     rhs, rhs_scales = rhs_
     num_groups, n, k = rhs.shape
@@ -494,49 +615,32 @@ def fused_dispatch_block_copy_gemm1_fp4(
 
     if shape_m == 0:
         return
+    if expected_m <= 0 or expected_m > max_tokens_per_expert:
+        raise ValueError(
+            f"expected_m must be in [1, {max_tokens_per_expert}], got {expected_m}")
 
-    grouping = os.getenv('FUSED_GEMM_GROUPING', 'nopad').strip().lower()
-    if grouping not in ('nopad', 'masked'):
-        raise ValueError(f"FUSED_GEMM_GROUPING must be 'nopad' or 'masked', got {grouping!r}")
-    use_masked = grouping == 'masked'
-
-    if use_masked:
-        if masked_m is None:
-            masked_m = grouped_layout[-2 * num_groups:]
-        assert masked_m.dtype == torch.int32
-        assert masked_m.is_contiguous() and masked_m.numel() >= 2 * num_groups
-        assert out.dim() == 3 and out.shape[0] == num_groups and out.shape[2] == n
-        gemm_shape_m = out.shape[1]
-        # Keep the padded storage/output stride independent from the tuning
-        # workload. The production masked path tunes on active rows, otherwise
-        # a capacity of 256 incorrectly selects block_m=256 for ~128-row experts.
-        expected_m = ceil_div(shape_m, num_groups)
-        tuning_m = shape_m
-        config_gemm_type = GemmType.GroupedMasked
-        jit_gemm_type = 'FusedDispatchMasked'
-    else:
-        assert out.dim() == 2 and out.shape == (shape_m, n)
-        # The masked pointer is compile-time dead on the NoPad path. Reuse an
-        # existing int32 tensor to keep the legacy call contract allocation-free.
-        if masked_m is None:
-            masked_m = grouped_layout
-        gemm_shape_m = shape_m
-        expected_m = ceil_div(shape_m, num_groups)
-        tuning_m = shape_m
-        config_gemm_type = GemmType.GroupedNoPad
-        jit_gemm_type = 'FusedDispatch'
+    # Masked is the only fused scheduling path. ``out`` is [num_groups, padded_m, n];
+    # masked_m (per-expert counts + base M-block) lives in the grouped-layout tail.
+    if masked_m is None:
+        masked_m = grouped_layout[-2 * num_groups:]
+    assert masked_m.dtype == torch.int32
+    assert masked_m.is_contiguous() and masked_m.numel() >= 2 * num_groups
+    assert out.dim() == 3 and out.shape[0] == num_groups and out.shape[2] == n
+    gemm_shape_m = out.shape[1]
+    # Tune on active rows, not padded capacity: a capacity of e.g. 256 would
+    # incorrectly select block_m=256 for ~128-row experts (the old NoPad clamp bug).
+    tuning_m = shape_m
+    config_gemm_type = GemmType.GroupedMasked
+    jit_gemm_type = 'FusedDispatchMasked'
 
     # NOTE: block_m here MUST match the block_m used to build grouped_layout /
-    # rank_split_m in dispatch_expert_preprocess. The copy kernel places each
+    # rank_split_m in dispatch_expert_finalize. The copy kernel places each
     # M-block at m_block_in_expert * BLOCK_M rows; a mismatch writes 2nd+ blocks
-    # to the wrong expert region (silently zeroing their output). The preprocess
-    # side (get_gemm_block_m) uses plain expected_m with no <=128 bump, so we
-    # must not bump here either.
-    if not use_masked and expected_m <= 128:  # legacy NoPad tuning clamp
-        expected_m = 129
-    _force = int(os.getenv('FORCE_EXPECTED_M', '0'))  # A/B: 强制 block_m(须与 test 侧 get_gemm_block_m 一致)
+    # to the wrong expert region (silently zeroing their output).
+    tuning_expected_m = expected_m
+    _force = int(os.getenv('FORCE_EXPECTED_M', '0'))  # diagnostic: force block_m
     if _force > 0:
-        expected_m = _force
+        tuning_expected_m = _force
 
     global includes_gemm, template_gemm_block_copy
     num_sms = get_num_sms()
@@ -545,7 +649,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = \
-            get_best_configs(tuning_m, expected_m, n, k, num_groups, num_sms,
+            get_best_configs(tuning_m, tuning_expected_m, n, k, num_groups, num_sms,
                              gemm_type=config_gemm_type)
 
     bias = torch.empty(0, dtype=torch.float32, device=rhs.device)
@@ -621,3 +725,157 @@ def fused_dispatch_block_copy_gemm1_fp4(
         jit_include_dir='cutlass3',
     )
     runtime(*args)
+
+
+@dataclass(frozen=True)
+class BlockCopyRoundResult:
+    """Output plus read-only diagnostics for one context-managed round."""
+    out: torch.Tensor
+    shape_m: int
+    expected_m: int
+    block_m: int
+    generation: int
+    parity: int
+
+
+class BlockCopyDispatchContext:
+    """Own a block-copy buffer set and its monotonic generation sequence.
+
+    Production callers submit complete rounds through :meth:`run`; generation
+    and parity are derived internally and cannot be supplied by the caller.
+    The context is stream-affine so quantize, prepare, finalize, and GEMM remain
+    ordered on the same double-buffer lifetime.
+    """
+
+    def __init__(
+        self,
+        sym_buf: torch.Tensor,
+        sym_buf_addrs: torch.Tensor,
+        rank_idx: int,
+        num_ranks: int,
+        num_local_experts: int,
+        num_total_experts: int,
+        max_tokens_per_expert: int,
+        local_expert_start: int,
+        group=None,
+    ):
+        if sym_buf.dtype != torch.uint8 or not sym_buf.is_contiguous():
+            raise ValueError("sym_buf must be a contiguous uint8 tensor")
+        if sym_buf_addrs.dtype != torch.int64 or sym_buf_addrs.numel() < num_ranks:
+            raise ValueError("sym_buf_addrs must contain every rank base address")
+        self._sym_buf = sym_buf
+        self._sym_buf_addrs = sym_buf_addrs
+        self._rank_idx = rank_idx
+        self._num_ranks = num_ranks
+        self._num_local_experts = num_local_experts
+        self._num_total_experts = num_total_experts
+        self._max_tokens = max_tokens_per_expert
+        self._local_expert_start = local_expert_start
+        self._workspace = create_expert_preprocess_workspace(
+            num_local_experts, num_ranks, max_tokens_per_expert, sym_buf.device)
+        self._buffer_cache = {}
+        self._generation = 0
+        self._stream = torch.cuda.current_stream(sym_buf.device)
+
+        # Symmetric memory is uninitialized. Zero local arrival slots before any
+        # peer can publish generation 1, then collectively finish initialization.
+        self._sym_buf[-128:].zero_()
+        self._stream.synchronize()
+        if group is not None:
+            import torch.distributed as dist
+            dist.barrier(group=group)
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    @property
+    def parity(self) -> int:
+        return self._generation & 1
+
+    def _check_stream(self):
+        current = torch.cuda.current_stream(self._sym_buf.device)
+        if current.cuda_stream != self._stream.cuda_stream:
+            raise RuntimeError(
+                "BlockCopyDispatchContext is stream-affine; use a separate "
+                "context/buffer set for another stream")
+
+    def _select_configs(self, shape_m, expected_m, n, k):
+        # Masked-only fused path: tune on active rows, no NoPad clamp.
+        tuning_expected_m = expected_m
+        forced = int(os.getenv('FORCE_EXPECTED_M', '0'))
+        if forced > 0:
+            tuning_expected_m = forced
+        return get_best_configs(
+            shape_m, tuning_expected_m, n, k, self._num_local_experts,
+            get_num_sms(), gemm_type=GemmType.GroupedMasked)
+
+    def run(
+        self,
+        input_bf16: torch.Tensor,
+        topk_ids: torch.Tensor,
+        rhs_: Tuple[torch.Tensor, torch.Tensor],
+        out: torch.Tensor = None,
+        num_copy_blocks: int = 1,
+        k_tiles_per_flag: int = 0,
+        copy_mode: int = 0,
+    ) -> BlockCopyRoundResult:
+        self._check_stream()
+        rhs, _ = rhs_
+        num_groups, n, k = rhs.shape
+        if num_groups != self._num_local_experts:
+            raise ValueError(
+                f"rhs groups {num_groups} != local experts {self._num_local_experts}")
+        if input_bf16.shape[1] != k * 2:
+            raise ValueError(
+                f"input hidden {input_bf16.shape[1]} != packed rhs K {k} * 2")
+
+        # Allocate before launch. Advancing immediately prevents a failed round
+        # from ever reusing a generation that may already have been published.
+        self._generation += 1
+        generation = self._generation
+        _mxfp4_quantize_to_sym_buffer(
+            input_bf16, topk_ids, self._sym_buf,
+            num_local_experts=self._num_total_experts,
+            num_total_experts=self._num_total_experts,
+            max_tokens_per_expert=self._max_tokens,
+            generation=generation,
+            sym_buf_addrs=self._sym_buf_addrs,
+            rank_idx=self._rank_idx,
+            num_ranks=self._num_ranks)
+        shape_m, expected_m, masked_m = dispatch_expert_prepare(
+            self._sym_buf_addrs, self._rank_idx, self._num_ranks,
+            self._num_local_experts, self._num_total_experts,
+            self._max_tokens, input_bf16.shape[1], self._local_expert_start,
+            generation=generation, _workspace=self._workspace)
+        configs = self._select_configs(shape_m, expected_m, n, k)
+        block_m = configs[1]
+        grouped_layout, rank_addr_a, rank_addr_sfa, rank_split_m, rank_counts, \
+            _, finalized_shape_m = dispatch_expert_finalize(
+                self._sym_buf_addrs, self._rank_idx, self._num_ranks,
+                self._num_local_experts, self._num_total_experts,
+                self._max_tokens, input_bf16.shape[1], self._local_expert_start,
+                block_m, generation=generation, _workspace=self._workspace)
+        if finalized_shape_m != shape_m:
+            raise RuntimeError(
+                f"prepare/finalize shape mismatch: {shape_m} != {finalized_shape_m}")
+
+        if out is None:
+            out = torch.empty((num_groups, self._max_tokens, n),
+                              dtype=torch.bfloat16, device=rhs.device)
+        cache_key = (block_m, input_bf16.shape[1])
+        if cache_key not in self._buffer_cache:
+            self._buffer_cache[cache_key] = create_block_copy_buffers(
+                self._num_local_experts, self._num_ranks, self._max_tokens,
+                input_bf16.shape[1], block_m, rhs.device)
+        local_fp4, local_sfa, copy_ready_flags = self._buffer_cache[cache_key]
+        fused_dispatch_block_copy_gemm1_fp4(
+            rhs_, out, grouped_layout, rank_addr_a, rank_addr_sfa,
+            rank_split_m, rank_counts, shape_m, self._max_tokens,
+            self._num_ranks, local_fp4, local_sfa, copy_ready_flags,
+            expected_m=expected_m, num_copy_blocks=num_copy_blocks,
+            k_tiles_per_flag=k_tiles_per_flag, configs=configs,
+            copy_mode=copy_mode, masked_m=masked_m)
+        return BlockCopyRoundResult(
+            out=out, shape_m=shape_m, expected_m=expected_m,
+            block_m=block_m, generation=generation, parity=generation & 1)

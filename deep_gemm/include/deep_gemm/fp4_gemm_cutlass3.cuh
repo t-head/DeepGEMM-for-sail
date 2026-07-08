@@ -2482,9 +2482,8 @@ public:
         uint32_t copy_mode = 0,
         profiling::GemmProfileRecord* profile_records = nullptr) {
 
-        static_assert(kGemmType == GemmType::FusedDispatch ||
-                      kGemmType == GemmType::FusedDispatchMasked,
-                      "run_fused_dispatch requires a fused dispatch GemmType");
+        static_assert(kGemmType == GemmType::FusedDispatchMasked,
+                      "run_fused_dispatch requires GemmType::FusedDispatchMasked");
         static_assert(KTilesPerFlag == 0 || (ShapeK / BlockK) % KTilesPerFlag == 0,
                       "KTilesPerFlag must evenly divide num_k_tiles");
         constexpr int N_EXPAND = NExpand;
@@ -2603,7 +2602,7 @@ public:
         using StrideSFA = typename GemmKernel::StrideSFA;
         using StrideSFB = typename GemmKernel::StrideSFB;
 
-        int* layout_info = kGemmType == GemmType::FusedDispatchMasked ? masked_m : grouped_layout;
+        int* layout_info = masked_m;  // fused path is masked-only
 
         StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)max_tokens_per_expert, ShapeK, 1));
         StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(ShapeN, ShapeK, 1));

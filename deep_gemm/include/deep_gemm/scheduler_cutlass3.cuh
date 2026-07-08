@@ -183,12 +183,12 @@ struct DeepGemmScheduler {
     uint32_t num_aligned_m_blocks;
     constexpr static GemmType GEMM_TYPE = kGemmType;
     constexpr static bool kIsFusedDispatch =
-        kGemmType == GemmType::FusedDispatch || kGemmType == GemmType::FusedDispatchMasked;
+        kGemmType == GemmType::FusedDispatchMasked;
     constexpr static bool kIsMaskedLayout =
         kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::FusedDispatchMasked;
     constexpr static bool kIsTMAMulticastOnA = false;
 #ifdef EnableGroupNoPadOpt
-    constexpr static bool kIsNoPadPreprocessLayout = ((kGemmType == GemmType::GroupedNoPad||kGemmType == GemmType::GroupedFused) && kNumGroups >= 128) || kGemmType == GemmType::FusedDispatch;
+    constexpr static bool kIsNoPadPreprocessLayout = ((kGemmType == GemmType::GroupedNoPad||kGemmType == GemmType::GroupedFused) && kNumGroups >= 128);
 #else
     constexpr static bool kIsNoPadPreprocessLayout = false;
 #endif
@@ -219,7 +219,7 @@ struct DeepGemmScheduler {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if constexpr(kIsMaskedLayout) {
             curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_blocks = curr_cumsum_m = 0;
-        } else if constexpr(kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused || kGemmType == GemmType::FusedDispatch) {
+        } else if constexpr(kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused) {
             if constexpr(kIsNoPadPreprocessLayout) {
                 num_aligned_m_blocks = params_.grouped_layout[0]; // total blocks in m, block_m_sum
                 curr_group_idx = curr_cumsum = curr_cumsum_blocks = curr_group_m = curr_cumsum_m = 0;
@@ -286,18 +286,6 @@ struct DeepGemmScheduler {
                 n_block_idx = kNumNBlocks;
                 return false;
             }
-            if constexpr(kGemmType == GemmType::FusedDispatch) {
-                // M-major without swizzle: matches copy block order (M-block 0 copied first)
-                // Swizzle disabled: prevents cross-M-block mapping that causes copy_ready_flags race
-                int block_m_idx = next_block_idx / kNumNBlocks;
-                n_block_idx = next_block_idx % kNumNBlocks;
-                curr_global_block_m_idx = block_m_idx;
-                uint4 data = (((const uint4*)params.grouped_layout) + 1)[block_m_idx];
-                curr_group_idx = data.x;
-                curr_group_m = data.y;
-                curr_cumsum_m = data.w;
-                m_block_idx = block_m_idx - data.z;
-            } else {
             int block_m_idx = next_block_idx / kNumNBlocks;
             curr_global_block_m_idx = block_m_idx;
             uint4 data = (((const uint4*)params.grouped_layout) + 1)[block_m_idx];
@@ -311,8 +299,7 @@ struct DeepGemmScheduler {
             } else {
                 curr_cumsum_m = data.w;
             }
-            }
-        } else if constexpr(kIsMaskedLayout || kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused || kGemmType == GemmType::FusedDispatch) {
+        } else if constexpr(kIsMaskedLayout || kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused) {
             uint32_t num_m_blocks;
             while (true) {
                 // End of the task
@@ -478,7 +465,7 @@ struct DeepGemmScheduler {
             return params.shape_m;
         } else if constexpr (kIsMaskedLayout) {
             return curr_group_m;
-        } else if constexpr (kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::FusedDispatch) {
+        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return curr_group_m;
         } else {
             return 0;
@@ -564,7 +551,7 @@ struct DeepGemmScheduler {
     // Gets the pointer offset of matrix C
     __device__ __forceinline__ int64_t curr_offset_mxfp4_c() const
     {
-        if constexpr (kGemmType == GemmType::GroupedNoPad || kIsMaskedLayout || kGemmType == GemmType::FusedDispatch) {
+        if constexpr (kGemmType == GemmType::GroupedNoPad || kIsMaskedLayout) {
             return int64_t(curr_group_idx) * SHAPE_N;
         } else {
             return 0;
@@ -575,7 +562,7 @@ struct DeepGemmScheduler {
     {
         if constexpr (kIsMaskedLayout || kGemmType == GemmType::GroupedContiguous) {
             return int64_t(curr_group_idx) * params.shape_m * SHAPE_N;
-        } else if constexpr (kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::FusedDispatch) {
+        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return int64_t(curr_cumsum_m) * SHAPE_N;
         } else if constexpr(kGemmType == GemmType::BatchGemm) {
             return int64_t(curr_group_idx) * SHAPE_N;

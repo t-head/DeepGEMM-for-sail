@@ -23,11 +23,13 @@ Environment variables:
     FULL_CORRECTNESS=1      Enable per-expert Python reference check (default: 0)
     PERF_VERBOSE=1          Print detailed performance breakdown
     SKIP_CORRECTNESS=1      Skip Test 1, run only performance
-    FUSED_GEMM_GROUPING=    nopad|masked (default: nopad)
+    (Fused dispatch GEMM1 is masked-only; the NoPad fused path was removed.)
 """
 
 import os
 import sys
+import time
+import inspect
 
 # Ensure we import deep_gemm from THIS repo, not the pip-installed original
 _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -78,18 +80,14 @@ class TestConfig:
 CONFIG = TestConfig(os.getenv('TEST_CONFIG', 'prod'))
 FULL_CORRECTNESS = int(os.getenv('FULL_CORRECTNESS', '0'))
 SKIP_CORRECTNESS = int(os.getenv('SKIP_CORRECTNESS', '0'))
+SKIP_PERFORMANCE = int(os.getenv('SKIP_PERFORMANCE', '0'))
+RUN_RANK_SKEW = int(os.getenv('RUN_RANK_SKEW', '0'))
 SKIP_ISOLATION = int(os.getenv('SKIP_ISOLATION', '0'))
 COL_MAJOR_SCALE = int(os.getenv('COL_MAJOR_SCALE', '1'))
-PAD_ALIGN = 1  # no padding; matches dispatch_preprocess.cuh (removed 8-alignment)
-FUSED_GEMM_GROUPING = os.getenv('FUSED_GEMM_GROUPING', 'nopad').strip().lower()
-if FUSED_GEMM_GROUPING not in ('nopad', 'masked'):
-    raise ValueError("FUSED_GEMM_GROUPING must be 'nopad' or 'masked'")
-USE_MASKED_FUSED_GEMM = FUSED_GEMM_GROUPING == 'masked'
-# BC_GEN: generation used throughout Test1 (correctness). Default 0 = legacy path
-# (skips the atomic-arrival barrier, always parity 0). Set BC_GEN=2 to validate the
-# gen>0 arrival-barrier path with parity 0 (matches build_merged_sfa's parity-0 read;
-# odd values put data in parity 1 which the reference/merged_sfa path does not track).
-BC_GEN = int(os.getenv('BC_GEN', '0'))
+PAD_ALIGN = 1  # expert packing has no artificial token alignment
+# Fused dispatch GEMM1 is masked-only; the NoPad fused path has been removed.
+FUSED_GEMM_GROUPING = 'masked'
+USE_MASKED_FUSED_GEMM = True
 
 
 # ============================================================
@@ -100,13 +98,14 @@ import deep_gemm
 import deep_ep
 from deep_gemm import (
     calc_diff, preprocess_mxfp4_scales,
-    mxfp4_quantize_to_sym_buffer,
-    dispatch_preprocess,
     get_sym_buffer_size,
 )
 from deep_gemm.jit_kernels.dispatch_fused_gemm import (
-    create_preprocess_workspace,
-    dispatch_expert_preprocess, create_expert_preprocess_workspace,
+    _mxfp4_quantize_to_sym_buffer,
+    BlockCopyDispatchContext,
+    dispatch_expert_prepare, dispatch_expert_finalize,
+    dispatch_expert_preprocess_merged,
+    create_expert_preprocess_workspace,
     fused_dispatch_block_copy_gemm1_fp4,
     create_block_copy_buffers,
 )
@@ -145,40 +144,56 @@ def quantize_grouped_fp4(tensor_3d):
     return fp4, scale_raw, scale_u16
 
 
-def get_gemm_configs(shape_m, num_groups, n, k, padded_m=None):
+def get_gemm_configs(shape_m, expected_m, num_groups, n, k, padded_m=None):
     """Full GEMM config used by BOTH preprocess (block_m) and the fused kernel.
 
     Returning the whole tuple and passing it to fused_dispatch guarantees the
     preprocess block_m == kernel block_m (a mismatch silently zeroes 2nd+ blocks).
     FORCE_EXPECTED_M lets you steer block_m for testing (e.g. 129 -> block_m=256).
     """
-    if USE_MASKED_FUSED_GEMM:
-        assert padded_m is not None
-        tuning_m = shape_m
-        expected_m = ceil_div(shape_m, num_groups)
-        gemm_type = GemmType.GroupedMasked
-    else:
-        tuning_m = shape_m
-        expected_m = ceil_div(shape_m, num_groups)
-        if expected_m <= 128:  # legacy NoPad tuning clamp
-            expected_m = 129
-        gemm_type = GemmType.GroupedNoPad
+    assert padded_m is not None
+    tuning_m = shape_m
+    tuning_expected_m = expected_m
+    gemm_type = GemmType.GroupedMasked
     force = int(os.getenv('FORCE_EXPECTED_M', '0'))
     if force > 0:
-        expected_m = force
+        tuning_expected_m = force
     num_sms = get_num_sms()
     return get_best_configs_fp4(
-        tuning_m, expected_m, n, k, num_groups, num_sms,
+        tuning_m, tuning_expected_m, n, k, num_groups, num_sms,
         gemm_type=gemm_type)
 
 
-def get_gemm_block_m(shape_m, num_groups, n, k, num_ranks=0, padded_m=None):
-    return get_gemm_configs(shape_m, num_groups, n, k, padded_m=padded_m)[1]
+def get_gemm_block_m(shape_m, expected_m, num_groups, n, k, padded_m=None):
+    return get_gemm_configs(
+        shape_m, expected_m, num_groups, n, k, padded_m=padded_m)[1]
+
+
+def refresh_expert_preprocess(
+    sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
+    max_tokens, hidden, local_expert_start, block_m, _workspace, generation=0,
+    sync=False, dbg_cyc=None,
+):
+    """Refresh fixed-config metadata without a host count readback.
+
+    MERGED_PREPROCESS=1 runs prepare+finalize as a single kernel launch."""
+    if os.getenv("MERGED_PREPROCESS", "0") == "1":
+        return dispatch_expert_preprocess_merged(
+            sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
+            max_tokens, hidden, local_expert_start, block_m, generation=generation,
+            sync=sync, dbg_cyc=dbg_cyc, _workspace=_workspace)
+    dispatch_expert_prepare(
+        sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
+        max_tokens, hidden, local_expert_start, generation=generation,
+        sync=False, dbg_cyc=dbg_cyc, _workspace=_workspace)
+    return dispatch_expert_finalize(
+        sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
+        max_tokens, hidden, local_expert_start, block_m, generation=generation,
+        sync=sync, dbg_cyc=dbg_cyc, _workspace=_workspace)
 
 
 def create_fused_output(shape_m, num_groups, padded_m, n, device):
-    shape = (num_groups, padded_m, n) if USE_MASKED_FUSED_GEMM else (shape_m, n)
-    return torch.zeros(shape, dtype=torch.bfloat16, device=device)
+    return torch.zeros((num_groups, padded_m, n), dtype=torch.bfloat16, device=device)
 
 
 def init_dist():
@@ -223,9 +238,17 @@ def nonfused_dispatch(ep_buffer, x, topk_ids_i64, num_tokens, num_total_experts)
     return pf, lhs_sc, pc, eh, ee, ehk
 
 
-def get_expert_token_counts(all_sym_bufs, ge, world_size):
+def data_region_size(num_total_experts, max_tokens, hidden):
+    metadata_bytes = ((num_total_experts * 4 + 15) // 16) * 16
+    fp4_region = num_total_experts * max_tokens * (hidden // 2)
+    k_scale_blocks = (((hidden + 31) // 32) + 1) // 2
+    scale_region = num_total_experts * k_scale_blocks * max_tokens * 2
+    return metadata_bytes + fp4_region + scale_region
+
+
+def get_expert_token_counts(all_sym_bufs, ge, world_size, data_base=0):
     """Return list of per-rank token counts for global expert ge."""
-    return [all_sym_bufs[r][ge * 4: ge * 4 + 4].view(torch.int32).item()
+    return [all_sym_bufs[r][data_base + ge * 4:data_base + ge * 4 + 4].view(torch.int32).item()
             for r in range(world_size)]
 
 
@@ -272,6 +295,27 @@ def print_routing_table(topk_ids, num_local_experts, rank, world_size, num_token
 # Test 1: Correctness (Random Routing)
 # ============================================================
 
+
+def test_public_api_contract():
+    """Production API must not let callers select generation or parity."""
+    run_params = inspect.signature(deep_gemm.BlockCopyDispatchContext.run).parameters
+    forbidden_round_args = {'generation', 'parity'}
+    leaked_round_args = forbidden_round_args.intersection(run_params)
+    assert not leaked_round_args, f"public run() leaks {sorted(leaked_round_args)}"
+
+    forbidden_exports = {
+        'mxfp4_quantize_to_sym_buffer',
+        'dispatch_preprocess',
+        'dispatch_expert_preprocess',
+        'create_preprocess_workspace',
+    }
+    leaked_exports = sorted(name for name in forbidden_exports if hasattr(deep_gemm, name))
+    assert not leaked_exports, f"deprecated low-level exports remain: {leaked_exports}"
+    assert deep_gemm.BlockCopyDispatchContext.generation.fset is None
+    assert deep_gemm.BlockCopyDispatchContext.parity.fset is None
+    return True
+
+
 def test_correctness(rank, world_size, group, device):
     cfg = CONFIG
     num_total_experts = cfg.num_total_experts(world_size)
@@ -282,281 +326,222 @@ def test_correctness(rank, world_size, group, device):
     num_tokens = cfg.num_tokens
     topk = cfg.topk
     max_tokens = cfg.max_tokens
+    num_rounds = int(os.getenv('TEST_ROUNDS', '3'))
+    if RUN_RANK_SKEW and num_rounds < 3:
+        raise ValueError("RUN_RANK_SKEW requires TEST_ROUNDS >= 3")
+    num_copy_blocks = int(os.getenv('NCB', '8'))
+    k_tiles_per_flag = int(os.getenv('K_TILES_PER_FLAG', '0'))
+    copy_mode = int(os.getenv('COPY_MODE', '0'))
 
     if rank == 0:
         print(f"\n{'='*60}")
-        print(f"Test 1: Correctness (Block-Copy, Random Routing)")
+        print("Test 1: Context-managed multi-round correctness")
         print(f"  Config: {cfg}")
-        print(f"  world_size={world_size}")
+        print(f"  world_size={world_size}, rounds={num_rounds}")
         print(f"{'='*60}\n")
 
-    # Random routing
-    torch.manual_seed(77 + rank)
-    x = generate_test_input(num_tokens, hidden, device)
-    scores = torch.randn(num_tokens, num_total_experts, dtype=torch.float32, device=device)
-    topk_ids = torch.topk(scores, topk, dim=-1, largest=True, sorted=False)[1].to(torch.int32)
-
-    # Print routing information
-    print_routing_table(topk_ids, num_local_experts, rank, world_size, num_tokens, topk)
-    dist.barrier()
-
-    # Weights
     torch.manual_seed(200)
-    W = torch.randn(num_local_experts, N, hidden, dtype=torch.bfloat16, device=device) * 0.01
+    W = torch.randn(
+        num_local_experts, N, hidden, dtype=torch.bfloat16, device=device) * 0.01
     W_fp4, W_scale_raw, W_scale_u16 = quantize_grouped_fp4(W)
 
-    # ---- Fused path: symmetric memory ----
-    buf_size = get_sym_buffer_size(num_local_experts, num_total_experts, max_tokens, hidden)
+    buf_size = get_sym_buffer_size(
+        num_local_experts, num_total_experts, max_tokens, hidden)
     sym_buf, sym_buf_addrs, sym_handle = alloc_sym_buffer(buf_size, device, group)
-
-    sym_buf.zero_()
-    torch.cuda.synchronize()
-    dist.barrier()
-
-    mxfp4_quantize_to_sym_buffer(
-        x, topk_ids, sym_buf,
-        num_local_experts=num_total_experts,
+    context = BlockCopyDispatchContext(
+        sym_buf=sym_buf,
+        sym_buf_addrs=sym_buf_addrs,
+        rank_idx=rank,
+        num_ranks=world_size,
+        num_local_experts=num_local_experts,
         num_total_experts=num_total_experts,
         max_tokens_per_expert=max_tokens,
-        generation=BC_GEN,
-        sym_buf_addrs=(sym_buf_addrs if BC_GEN > 0 else None),
-        rank_idx=rank, num_ranks=world_size)
-    torch.cuda.synchronize()
-    dist.barrier()
+        local_expert_start=local_expert_start,
+        group=group,
+    )
+    ep_buffer = create_ep_buffer(
+        group, num_local_experts, num_tokens, hidden, world_size,
+        num_total_experts)
 
-    # Two-pass block_m selection: probe → expert preprocess → recompute if needed
-    _, _, _, _, shape_m_probe = dispatch_preprocess(
-        sym_buf_addrs, rank, world_size,
-        num_local_experts, num_total_experts, max_tokens, hidden,
-        local_expert_start, block_m=64)
-
-    bc_configs = get_gemm_configs(
-        shape_m_probe, num_local_experts, N, hidden // 2, padded_m=max_tokens)
-    block_m = bc_configs[1]
-
-    ws_expert = create_expert_preprocess_workspace(
-        num_local_experts, world_size, max_tokens, block_m, device)
-    gl, ra, rs, sm, rc, blocks, shape_m = dispatch_expert_preprocess(
-        sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
-        max_tokens, hidden, local_expert_start, block_m,
-        generation=BC_GEN, _workspace=ws_expert)
-
-    # Recompute configs from actual shape_m; re-run preprocess if block_m changed
-    bc_configs2 = get_gemm_configs(
-        shape_m, num_local_experts, N, hidden // 2, padded_m=max_tokens)
-    if bc_configs2[1] != block_m:
-        if rank == 0:
-            print(f"  block_m changed: {block_m} -> {bc_configs2[1]} (shape_m_probe={shape_m_probe}, shape_m={shape_m})")
-        bc_configs = bc_configs2
-        block_m = bc_configs[1]
-        ws_expert = create_expert_preprocess_workspace(
-            num_local_experts, world_size, max_tokens, block_m, device)
-        gl, ra, rs, sm, rc, blocks, shape_m = dispatch_expert_preprocess(
-            sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
-            max_tokens, hidden, local_expert_start, block_m,
-            generation=BC_GEN, _workspace=ws_expert)
-    else:
-        bc_configs = bc_configs2
-    if rank == 0:
-        print(f"  block_m={block_m}, shape_m={shape_m}, blocks={blocks}")
-
-    # All-gather sym bufs for reference + merged SFA construction
-    all_sym_bufs = [torch.zeros_like(sym_buf) for _ in range(world_size)]
-    dist.all_gather(all_sym_bufs, sym_buf)
-
-    if rank == 0:
-        for le in range(num_local_experts):
-            ge = local_expert_start + le
-            counts = get_expert_token_counts(all_sym_bufs, ge, world_size)
-            padded_total = sum(_align_up(c, PAD_ALIGN) for c in counts)
-            mblocks = (padded_total + block_m - 1) // block_m
-            print(f"    Expert {ge}: counts={counts} total={sum(counts)} padded={padded_total} mblocks={mblocks}")
-    dist.barrier()
-
-    # SFA is now copied/repacked on-device by the block-copy kernel (P0), so
-    # there is no host build_merged_sfa; all_sym_bufs above is only used for the
-    # CPU reference and token-count checks below.
-
-    # ---- Run block-copy GEMM ----
-    k_half = hidden // 2
-    NUM_COPY_BLOCKS = int(os.getenv('NCB', '8'))
-    K_TILES_PER_FLAG = int(os.getenv('K_TILES_PER_FLAG', '0'))
-    COPY_MODE = int(os.getenv('COPY_MODE', '0'))  # 0=round-robin, 1=cooperative
-    bc_fp4, bc_sfa, bc_flags = create_block_copy_buffers(
-        num_local_experts, world_size, max_tokens, hidden, block_m, device)
-    out_bc = create_fused_output(
-        shape_m, num_local_experts, max_tokens, N, device)
-
-    if rank == 0:
-        print(f"\n  Running block-copy GEMM (num_copy_blocks={NUM_COPY_BLOCKS}, k_tiles_per_flag={K_TILES_PER_FLAG}, copy_mode={COPY_MODE})")
-    fused_dispatch_block_copy_gemm1_fp4(
-        (W_fp4, W_scale_u16), out_bc, gl, ra, rs, sm, rc,
-        shape_m, max_tokens, world_size,
-        local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
-        num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,
-        configs=bc_configs,
-        copy_mode=COPY_MODE)
-    torch.cuda.synchronize()
-
-    # ---- Non-fused baseline (DeepEP + standard GEMM) ----
-    topk_ids_i64 = topk_ids.to(torch.int64)
-    ep_buffer = create_ep_buffer(group, num_local_experts, num_tokens, hidden,
-                                 world_size, num_total_experts)
-    pf, lhs_sc, pc, eh, ee, ehk = nonfused_dispatch(
-        ep_buffer, x, topk_ids_i64, num_tokens, num_total_experts)
-    mm = max(int(pc.max().item()), 1)
-    nf_block_m = int(os.getenv('NF_BLOCK_M', '128'))
-    if nf_block_m > 0:
-        nf_configs = get_best_configs_fp4(
-            mm * num_local_experts, mm, N, hidden // 2,
-            num_local_experts, get_num_sms(), gemm_type=GemmType.GroupedNoPad)
-    else:
-        nf_configs = None
-    nf_out = torch.empty(num_local_experts, pf.shape[1], N,
-                         dtype=torch.bfloat16, device=device)
-    deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
-        (pf.contiguous(), lhs_sc),
-        (W_fp4, W_scale_u16),
-        None, nf_out, pc.to(torch.int32), mm,
-        configs=nf_configs)
-    torch.cuda.synchronize()
-
-    # ---- Compare block-copy vs non-fused + CPU reference ----
     metadata_bytes = ((num_total_experts * 4 + 15) // 16) * 16
     fp4_per_expert = max_tokens * (hidden // 2)
     fp4_region_size = num_total_experts * fp4_per_expert
     k_blocks = (hidden + 31) // 32
     k_scale_blocks = (k_blocks + 1) // 2
     scale_elems_per_expert = k_scale_blocks * max_tokens
-
-    # Parse expert layout from grouped_layout
-    gl_cpu = gl.cpu()
-    expert_seg = {}
-    for b in range(blocks):
-        e = gl_cpu[4 + b * 4 + 0].item()
-        cnt = gl_cpu[4 + b * 4 + 1].item()
-        bm_off = gl_cpu[4 + b * 4 + 3].item()
-        if e not in expert_seg:
-            expert_seg[e] = (bm_off, cnt)
-
+    region_size = data_region_size(num_total_experts, max_tokens, hidden)
     all_passed = True
+    previous_x = None
+    previous_topk_ids = None
 
-    if rank == 0:
-        print(f"\n  {'Expert':<10s} {'M':>5s} {'BC vs NF':>10s} {'BC vs CPU':>12s} {'(elem)':>8s} {'Status':>8s}")
+    for round_idx in range(num_rounds):
+        seed = 77 + round_idx * 1000 + rank
+        torch.manual_seed(seed)
+        x = generate_test_input(num_tokens, hidden, device)
+        scores = torch.randn(
+            num_tokens, num_total_experts, dtype=torch.float32, device=device)
+        topk_ids = torch.topk(
+            scores, topk, dim=-1, largest=True, sorted=False)[1].to(torch.int32)
+        if previous_x is not None:
+            if torch.equal(x, previous_x):
+                raise AssertionError(f"round {round_idx + 1} reused the previous input")
+            if torch.equal(topk_ids, previous_topk_ids):
+                raise AssertionError(f"round {round_idx + 1} reused the previous routing")
+        previous_x = x.clone()
+        previous_topk_ids = topk_ids.clone()
 
-    for le in range(num_local_experts):
-        ge = local_expert_start + le
-        m_nf = int(pc[le].item())
-
-        # Count fused tokens from sym buf metadata
-        counts_per_rank = get_expert_token_counts(all_sym_bufs, ge, world_size)
-        m_fused = sum(counts_per_rank)
-
-        if m_fused == 0:
+        if RUN_RANK_SKEW and round_idx == 2:
+            # Align before injecting skew, then delay exactly one producer. The
+            # other ranks must block inside expert prepare on full generation 3
+            # (parity 1), not accept generation 1 data or a stale parity flag.
+            dist.barrier()
+            skew_seconds = float(os.getenv('RANK_SKEW_SECONDS', '1.0'))
             if rank == 0:
-                print(f"  Expert {ge:<4d}  {0:>5d}  {'—':>10s} {'—':>12s} {'—':>8s} {'SKIP':>8s}")
-            continue
-
-        # Token count consistency check
-        if m_fused != m_nf:
+                time.sleep(skew_seconds)
+        round_start = time.monotonic()
+        round_result = context.run(
+            x, topk_ids, (W_fp4, W_scale_u16),
+            num_copy_blocks=num_copy_blocks,
+            k_tiles_per_flag=k_tiles_per_flag,
+            copy_mode=copy_mode)
+        round_elapsed = time.monotonic() - round_start
+        torch.cuda.synchronize()
+        if RUN_RANK_SKEW and round_idx == 2:
+            min_wait = float(os.getenv('RANK_SKEW_SECONDS', '1.0')) * 0.7
+            elapsed_tensor = torch.tensor([round_elapsed], dtype=torch.float64, device=device)
+            elapsed_by_rank = [torch.zeros_like(elapsed_tensor) for _ in range(world_size)]
+            dist.all_gather(elapsed_by_rank, elapsed_tensor)
+            elapsed_values = [value.item() for value in elapsed_by_rank]
+            skew_ok = all(value >= min_wait for value in elapsed_values[1:])
+            all_passed = all_passed and skew_ok
             if rank == 0:
-                print(f"  Expert {ge}: token count mismatch: fused={m_fused}, non-fused={m_nf}")
-            all_passed = False
-            continue
+                waits = ', '.join(
+                    f"rank{r}={value:.3f}s" for r, value in enumerate(elapsed_values))
+                print(f"  Rank-skew generation 3 waits: {waits} "
+                      f"({'PASSED' if skew_ok else 'FAILED'})")
 
-        # Non-fused output for this expert
-        nf_e = nf_out[le, :m_nf].cpu()
+        expected_generation = round_idx + 1
+        if (round_result.generation != expected_generation or
+                round_result.parity != (expected_generation & 1)):
+            raise AssertionError(
+                f"internal round sequence mismatch: got "
+                f"gen={round_result.generation}/parity={round_result.parity}, "
+                f"expected {expected_generation}/{expected_generation & 1}")
+        data_base = round_result.parity * region_size
 
-        # Block-copy output for this expert
-        if le in expert_seg:
-            ebm, ecnt = expert_seg[le]
-            bc_e = (out_bc[le, :ecnt] if USE_MASKED_FUSED_GEMM
-                    else out_bc[ebm:ebm + ecnt]).cpu()
-        else:
-            all_passed = False
+        # This collective is deliberately after prepare + GEMM. It exists only
+        # to build the CPU reference and cannot satisfy the arrival barrier.
+        all_sym_bufs = [torch.zeros_like(sym_buf) for _ in range(world_size)]
+        dist.all_gather(all_sym_bufs, sym_buf)
+
+        pf, lhs_sc, pc, _, _, _ = nonfused_dispatch(
+            ep_buffer, x, topk_ids.to(torch.int64), num_tokens,
+            num_total_experts)
+        nonfused_expected_m = max(int(pc.max().item()), 1)
+        nf_configs = get_best_configs_fp4(
+            nonfused_expected_m * num_local_experts, nonfused_expected_m,
+            N, hidden // 2, num_local_experts, get_num_sms(),
+            gemm_type=GemmType.GroupedNoPad)
+        nf_out = torch.empty(
+            num_local_experts, pf.shape[1], N,
+            dtype=torch.bfloat16, device=device)
+        deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
+            (pf.contiguous(), lhs_sc), (W_fp4, W_scale_u16), None,
+            nf_out, pc.to(torch.int32), nonfused_expected_m,
+            configs=nf_configs)
+        torch.cuda.synchronize()
+
+        if round_result.expected_m != nonfused_expected_m:
             if rank == 0:
-                print(f"  Expert {ge:<4d}  {m_fused:>5d}  {'—':>10s} {'—':>12s} {'—':>8s} {'NOSEG':>8s}")
-            continue
-
-        # Extract non-padding rows from block-copy output for sorted-norm comparison
-        bc_real_rows = []
-        pos = 0
-        for r in range(world_size):
-            cr = counts_per_rank[r]
-            if cr > 0:
-                bc_real_rows.append(bc_e[pos:pos + cr])
-            pos += _align_up(cr, PAD_ALIGN)
-        bc_real = torch.cat(bc_real_rows, dim=0) if bc_real_rows else torch.zeros(0, N)
-
-        # Sorted-norm comparison (BC vs NF) — secondary check (token orders differ)
-        bc_norms = bc_real.float().norm(dim=-1).sort().values
-        nf_norms = nf_e.float().norm(dim=-1).sort().values
-        min_len = min(len(bc_norms), len(nf_norms))
-        diff_bc_nf = calc_diff(bc_norms[:min_len], nf_norms[:min_len]) if min_len > 0 else 0.0
-
-        # CPU reference with same padding layout — primary element-wise check
-        diff_bc_cpu_norm = float('nan')
-        diff_bc_cpu_elem = float('nan')
-        if FULL_CORRECTNESS and le in expert_seg:
-            # Build A matrix with same padding layout as block-copy
-            A_rows = []
-            for r in range(world_size):
-                count_r = counts_per_rank[r]
-                if count_r == 0:
-                    pad_rows = _align_up(0, PAD_ALIGN)
-                    if pad_rows > 0:
-                        A_rows.append(torch.zeros(pad_rows, hidden, dtype=torch.bfloat16))
-                    continue
-                fp4_off_r = metadata_bytes + ge * fp4_per_expert
-                fp4_r = all_sym_bufs[r][fp4_off_r:fp4_off_r + count_r * (hidden // 2)].cpu()
-                fp4_r = fp4_r.view(count_r, hidden // 2)
-                scale_off_r = metadata_bytes + fp4_region_size + ge * scale_elems_per_expert * 2
-                src_scale_raw = all_sym_bufs[r][scale_off_r:scale_off_r + scale_elems_per_expert * 2]
-                src_scale = src_scale_raw.cpu().view(torch.uint16).view(k_scale_blocks, max_tokens)
-                scale_per_token = src_scale[:, :count_r].T.contiguous()
-                scale_u8 = scale_per_token.view(torch.uint8).view(count_r, k_blocks)
-                A_rank = dequantize_fp4_torch(fp4_r, scale_u8)
-                A_rows.append(A_rank)
-                # Add padding rows
-                pad_count = _align_up(count_r, PAD_ALIGN) - count_r
-                if pad_count > 0:
-                    A_rows.append(torch.zeros(pad_count, hidden, dtype=torch.bfloat16))
-
-            A_padded = torch.cat(A_rows, dim=0)
-            W_bf16 = dequantize_fp4_torch(W_fp4[le].cpu(), W_scale_raw[le].cpu())
-            ref_out = (A_padded.float() @ W_bf16.float().T).bfloat16()
-
-            # Element-wise comparison (with padding layout matched)
-            cmp_len = min(len(ref_out), len(bc_e))
-            diff_bc_cpu_elem = calc_diff(bc_e[:cmp_len].float(), ref_out[:cmp_len].float())
-
-            # Sorted-norm comparison as secondary metric
-            ref_norms = ref_out.float().norm(dim=-1).sort().values
-            bc_norms_all = bc_e.float().norm(dim=-1).sort().values
-            cmp_n = min(len(bc_norms_all), len(ref_norms))
-            diff_bc_cpu_norm = calc_diff(bc_norms_all[:cmp_n], ref_norms[:cmp_n]) if cmp_n > 0 else 0.0
-
-        ok = diff_bc_nf < 0.01
-        if FULL_CORRECTNESS and diff_bc_cpu_elem == diff_bc_cpu_elem:
-            ok = ok and diff_bc_cpu_elem < 0.002
-        if not ok:
+                print(
+                    f"  Round {round_idx + 1}: expected_m mismatch: "
+                    f"fused={round_result.expected_m}, "
+                    f"non-fused={nonfused_expected_m}")
             all_passed = False
 
         if rank == 0:
-            status = 'PASSED' if ok else 'FAILED'
-            cpu_n_str = f"{diff_bc_cpu_norm:.6f}" if diff_bc_cpu_norm == diff_bc_cpu_norm else "—"
-            cpu_e_str = f"{diff_bc_cpu_elem:.6f}" if diff_bc_cpu_elem == diff_bc_cpu_elem else "—"
-            print(f"  Expert {ge:<4d}  {m_fused:>5d}  {diff_bc_nf:>10.6f} {cpu_n_str:>12s} {cpu_e_str:>8s} {status:>8s}")
+            print(
+                f"\n  Round {round_idx + 1}: internal "
+                f"gen={round_result.generation}, parity={round_result.parity}, "
+                f"shape_m={round_result.shape_m}, "
+                f"expected_m={round_result.expected_m}, "
+                f"block_m={round_result.block_m}")
+            print(
+                f"  {'Expert':<10s} {'M':>5s} {'BC vs NF':>10s} "
+                f"{'BC vs CPU':>12s} {'Status':>8s}")
+
+        expert_base_m = 0
+        for le in range(num_local_experts):
+            ge = local_expert_start + le
+            counts_per_rank = get_expert_token_counts(
+                all_sym_bufs, ge, world_size, data_base=data_base)
+            m_fused = sum(counts_per_rank)
+            m_nf = int(pc[le].item())
+
+            if m_fused != m_nf:
+                if rank == 0:
+                    print(
+                        f"  Expert {ge}: token count mismatch: "
+                        f"fused={m_fused}, non-fused={m_nf}")
+                all_passed = False
+                expert_base_m += m_fused
+                continue
+            if m_fused == 0:
+                expert_base_m += m_fused
+                continue
+
+            bc_e = round_result.out[le, :m_fused]
+            nf_e = nf_out[le, :m_nf]
+            bc_norms = bc_e.float().norm(dim=-1).sort().values
+            nf_norms = nf_e.float().norm(dim=-1).sort().values
+            diff_bc_nf = calc_diff(bc_norms, nf_norms)
+
+            A_rows = []
+            for src_rank, count_r in enumerate(counts_per_rank):
+                if count_r == 0:
+                    continue
+                fp4_off = (
+                    data_base + metadata_bytes + ge * fp4_per_expert)
+                fp4_r = all_sym_bufs[src_rank][
+                    fp4_off:fp4_off + count_r * (hidden // 2)
+                ].cpu().view(count_r, hidden // 2)
+                scale_off = (
+                    data_base + metadata_bytes + fp4_region_size +
+                    ge * scale_elems_per_expert * 2)
+                src_scale = all_sym_bufs[src_rank][
+                    scale_off:scale_off + scale_elems_per_expert * 2
+                ].cpu().view(torch.uint16).view(
+                    k_scale_blocks, max_tokens)
+                scale_u8 = src_scale[:, :count_r].T.contiguous().view(
+                    torch.uint8).view(count_r, k_blocks)
+                A_rows.append(dequantize_fp4_torch(fp4_r, scale_u8))
+            A = torch.cat(A_rows, dim=0)
+            W_bf16 = dequantize_fp4_torch(
+                W_fp4[le].cpu(), W_scale_raw[le].cpu())
+            ref_out = (A.float() @ W_bf16.float().T).bfloat16()
+            diff_bc_cpu = calc_diff(
+                bc_e.cpu().float(), ref_out.float())
+
+            ok = diff_bc_nf < 0.01
+            if FULL_CORRECTNESS:
+                ok = ok and diff_bc_cpu < 0.002
+            all_passed = all_passed and ok
+            if rank == 0:
+                print(
+                    f"  Expert {ge:<4d}  {m_fused:>5d}  "
+                    f"{diff_bc_nf:>10.6f} {diff_bc_cpu:>12.6f} "
+                    f"{'PASSED' if ok else 'FAILED':>8s}")
+            expert_base_m += m_fused
 
     ep_buffer.destroy()
-
-    # Multi-rank correctness aggregation
-    pass_tensor = torch.tensor([1 if all_passed else 0], dtype=torch.int32, device=device)
+    pass_tensor = torch.tensor(
+        [1 if all_passed else 0], dtype=torch.int32, device=device)
     dist.all_reduce(pass_tensor, op=dist.ReduceOp.MIN)
     all_passed = pass_tensor.item() == 1
-
     if rank == 0:
-        print(f"\n  Test 1: {'PASSED' if all_passed else 'FAILED'} (all ranks)")
+        print(
+            f"\n  Test 1: {'PASSED' if all_passed else 'FAILED'} "
+            f"({num_rounds} rounds, all ranks)")
     return all_passed
 
 
@@ -584,9 +569,10 @@ def test_performance(rank, world_size, group, device):
 
     if rank == 0:
         print(f"\n{'='*60}")
-        print(f"Test 2: Performance Benchmarking (Block-Copy)")
+        print(f"Test 2: Fixed-routing kernel microbenchmark (Block-Copy)")
         print(f"  Config: {cfg}")
         print(f"  world_size={world_size}")
+        print("  Includes GPU-side SFA copy; dynamic-routing E2E is not measured here")
         print(f"{'='*60}\n")
 
     torch.manual_seed(99 + rank)
@@ -618,48 +604,66 @@ def test_performance(rank, world_size, group, device):
     dist.barrier(); torch.cuda.synchronize()
     metadata_size = ((num_total_experts * 4 + 15) // 16) * 16
 
-    # Probe block_m
-    mxfp4_quantize_to_sym_buffer(
+    # Count/shape prepare is independent of BLOCK_M and directly provides the
+    # actual maximum expert M used by both fused and non-fused tuning.
+    _mxfp4_quantize_to_sym_buffer(
         x, topk_ids, sym_buf,
         num_local_experts=num_total_experts,
         num_total_experts=num_total_experts,
         max_tokens_per_expert=max_tokens)
     torch.cuda.synchronize()
     dist.barrier()
-    _, _, _, _, shape_m_probe = dispatch_preprocess(
-        sym_buf_addrs, rank, world_size,
-        num_local_experts, num_total_experts, max_tokens, hidden,
-        local_expert_start, block_m=64)
-
-    block_m = get_gemm_block_m(
-        shape_m_probe, num_local_experts, N, hidden // 2,
-        num_ranks=world_size, padded_m=max_tokens)
-    if rank == 0:
-        print(f"  block_m={block_m}, shape_m_probe={shape_m_probe}")
-
-    # Two-pass block_m: run expert preprocess to get actual shape_m, recompute if needed
     ws_expert = create_expert_preprocess_workspace(
-        num_local_experts, world_size, max_tokens, block_m, device)
-    gl_e, ra_e, rs_e, sm_e, rc_e, blocks_e, expert_shape_m = dispatch_expert_preprocess(
+        num_local_experts, world_size, max_tokens, device)
+    expert_shape_m, expert_expected_m, _ = dispatch_expert_prepare(
+        sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
+        max_tokens, hidden, local_expert_start, _workspace=ws_expert)
+    block_m = get_gemm_block_m(
+        expert_shape_m, expert_expected_m, num_local_experts, N, hidden // 2,
+        padded_m=max_tokens)
+    gl_e, ra_e, rs_e, sm_e, rc_e, blocks_e, finalized_shape_m = dispatch_expert_finalize(
         sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
         max_tokens, hidden, local_expert_start, block_m, _workspace=ws_expert)
-    block_m2 = get_gemm_block_m(
-        expert_shape_m, num_local_experts, N, hidden // 2,
-        num_ranks=world_size, padded_m=max_tokens)
-    if block_m2 != block_m:
-        if rank == 0:
-            print(f"  block_m changed: {block_m} -> {block_m2} (shape_m_probe={shape_m_probe}, shape_m={expert_shape_m})")
-        block_m = block_m2
-        ws_expert = create_expert_preprocess_workspace(
-            num_local_experts, world_size, max_tokens, block_m, device)
-        gl_e, ra_e, rs_e, sm_e, rc_e, blocks_e, expert_shape_m = dispatch_expert_preprocess(
+    assert finalized_shape_m == expert_shape_m
+
+    # --- Validate merged preprocess kernel vs split (bit-identical metadata) ---
+    if os.getenv("VALIDATE_MERGED", "0") == "1":
+        ws2 = create_expert_preprocess_workspace(
+            num_local_experts, world_size, max_tokens, device)
+        gl2, ra2, rs2, sm2, rc2, blk2, sh2 = dispatch_expert_preprocess_merged(
             sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
-            max_tokens, hidden, local_expert_start, block_m, _workspace=ws_expert)
+            max_tokens, hidden, local_expert_start, block_m, generation=0,
+            sync=True, _workspace=ws2)
+        torch.cuda.synchronize()
+        checks = {
+            "grouped_layout": (gl_e, gl2),
+            "rank_addr_a": (ra_e, ra2),
+            "rank_addr_sfa": (rs_e, rs2),
+            "rank_split_m": (sm_e, sm2),
+            "rank_counts": (rc_e, rc2),
+            "masked_m": (ws_expert.masked_m, ws2.masked_m),
+        }
+        allok = True
+        for name, (a, b) in checks.items():
+            eq = bool(torch.equal(a, b))
+            allok = allok and eq
+            if rank == 0:
+                print(f"    [VALIDATE_MERGED] {name}: {(chr(0x2713) if eq else chr(0x2717))} "
+                      f"(split_shape={tuple(a.shape)})")
+        ok_scalar = (blk2 == blocks_e) and (sh2 == finalized_shape_m)
+        if rank == 0:
+            print(f"    [VALIDATE_MERGED] total_m_blocks={blk2}=={blocks_e}, shape_m={sh2}=={finalized_shape_m}: "
+                  f"{(chr(0x2713) if ok_scalar else chr(0x2717))}")
+            result = "ALL MATCH" if (allok and ok_scalar) else "MISMATCH!"
+            print(f"    [VALIDATE_MERGED] RESULT: {result}")
+    if rank == 0:
+        print(f"  block_m={block_m}, shape_m={expert_shape_m}, expected_m={expert_expected_m}")
 
     if rank == 0:
         k_half = hidden // 2
         bc_sms, bc_bm, bc_bn, bc_bk, bc_wm, bc_wn, bc_stages, bc_smem = get_gemm_configs(
-            expert_shape_m, num_local_experts, N, k_half, padded_m=max_tokens)
+            expert_shape_m, expert_expected_m, num_local_experts, N, k_half,
+            padded_m=max_tokens)
         print(f"  Block-copy fused config ({FUSED_GEMM_GROUPING}): block_m={bc_bm}, block_n={bc_bn}, block_k={bc_bk}, "
               f"warp_m={bc_wm}, warp_n={bc_wn}, stages={bc_stages}, num_sms={bc_sms}, smem={bc_smem}")
         # Non-fused config (GroupedMasked)
@@ -675,16 +679,16 @@ def test_performance(rank, world_size, group, device):
 
     # ---- Warmup ----
     for _ in range(num_warmup):
-        mxfp4_quantize_to_sym_buffer(
+        _mxfp4_quantize_to_sym_buffer(
             x, topk_ids, sym_buf,
             num_local_experts=num_total_experts,
             num_total_experts=num_total_experts,
             max_tokens_per_expert=max_tokens)
         torch.cuda.synchronize()
         dist.barrier()
-        dispatch_expert_preprocess(
+        refresh_expert_preprocess(
             sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
-            max_tokens, hidden, local_expert_start, block_m, _workspace=ws_expert)
+            max_tokens, hidden, local_expert_start, block_m, ws_expert, sync=True)
 
         # Non-fused warmup
         pf, lhs_sc, pc, _, _, _ = nonfused_dispatch(
@@ -703,7 +707,8 @@ def test_performance(rank, world_size, group, device):
         # Print fused dispatch (block-copy) GEMM config
         bc_k_half = hidden // 2
         bc_sms, bc_bm, bc_bn, bc_bk, bc_wm, bc_wn, bc_stages, bc_smem = get_gemm_configs(
-            expert_shape_m, num_local_experts, N, bc_k_half, padded_m=max_tokens)
+            expert_shape_m, expert_expected_m, num_local_experts, N, bc_k_half,
+            padded_m=max_tokens)
         print(f"  expert_shape_m={expert_shape_m}, blocks={blocks_e}, block_m={block_m}")
         print(f"  Block-copy config: block_m={bc_bm}, block_n={bc_bn}, block_k={bc_bk}, "
               f"warp_m={bc_wm}, warp_n={bc_wn}, stages={bc_stages}, num_sms={bc_sms}, smem={bc_smem}")
@@ -737,9 +742,10 @@ def test_performance(rank, world_size, group, device):
         # /num_groups/num_sms 选 tile（gemm_type 非 Dense 时不影响选择）。这里把两
         # 边实际解析出的 (block_m,n,k / warp / stages / num_sms) 与 expected_m 并排
         # 打出来，逐次核对是否一致；不一致就说明 M 分布让 expected_m 分叉了。
-        fused_expected_m = ceil_div(expert_shape_m, num_local_experts)
+        fused_expected_m = expert_expected_m
         fu_sms, fu_bm, fu_bn, fu_bk, fu_wm, fu_wn, fu_stages, fu_smem = get_gemm_configs(
-            expert_shape_m, num_local_experts, N, hidden // 2, padded_m=max_tokens)
+            expert_shape_m, expert_expected_m, num_local_experts, N, hidden // 2,
+            padded_m=max_tokens)
         pc_list = pc.tolist()
         fused_tile = (fu_bm, fu_bn, fu_bk, fu_wm, fu_wn, fu_stages, fu_sms)
         nf_tile = (nf_bm, nf_bn, nf_bk, nf_wm, nf_wn, nf_stages, nf_sms)
@@ -847,6 +853,7 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
+                expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
                 copy_mode=COPY_MODE)
@@ -859,17 +866,18 @@ def test_performance(rank, world_size, group, device):
         for i in range(num_iters):
             g = gen_bc + i + 1
             bc_start_events[i].record(stream)
-            mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
+            _mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
                 num_local_experts=num_total_experts, num_total_experts=num_total_experts,
                 max_tokens_per_expert=max_tokens, generation=g,
                 sym_buf_addrs=sym_buf_addrs, rank_idx=rank, num_ranks=world_size)
-            dispatch_expert_preprocess(
+            refresh_expert_preprocess(
                 sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
                 max_tokens, hidden, local_expert_start, block_m,
                 generation=g, sync=False, _workspace=ws_expert)
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
+                expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
                 copy_mode=COPY_MODE)
@@ -892,13 +900,13 @@ def test_performance(rank, world_size, group, device):
     for i in range(n_breakdown):
         g = gen_bd + i + 1
         ev_q_s[i].record(stream)
-        mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
+        _mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
             num_local_experts=num_total_experts, num_total_experts=num_total_experts,
             max_tokens_per_expert=max_tokens, generation=g,
             sym_buf_addrs=sym_buf_addrs, rank_idx=rank, num_ranks=world_size)
         ev_q_e[i].record(stream)
         ev_p_s[i].record(stream)
-        dispatch_expert_preprocess(
+        refresh_expert_preprocess(
             sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
             max_tokens, hidden, local_expert_start, block_m,
             generation=g, sync=False, _workspace=ws_expert)
@@ -917,7 +925,7 @@ def test_performance(rank, world_size, group, device):
     ev_p0_e = [torch.cuda.Event(enable_timing=True) for _ in range(n_breakdown)]
     for i in range(n_breakdown):
         ev_p0_s[i].record(stream)
-        dispatch_expert_preprocess(
+        refresh_expert_preprocess(
             sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
             max_tokens, hidden, local_expert_start, block_m,
             generation=0, sync=False, _workspace=ws_expert)
@@ -946,11 +954,11 @@ def test_performance(rank, world_size, group, device):
         g = 70000 + i
         # MUST run quant first: it pushes the arrival flag the preprocess
         # barrier (gen>0) waits on — else preprocess deadlocks.
-        mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
+        _mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
             num_local_experts=num_total_experts, num_total_experts=num_total_experts,
             max_tokens_per_expert=max_tokens, generation=g,
             sym_buf_addrs=sym_buf_addrs, rank_idx=rank, num_ranks=world_size)
-        dispatch_expert_preprocess(
+        refresh_expert_preprocess(
             sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
             max_tokens, hidden, local_expert_start, block_m,
             generation=g, sync=False, _workspace=ws_expert, dbg_cyc=dbg_cyc)
@@ -976,7 +984,7 @@ def test_performance(rank, world_size, group, device):
               f"[{'MET' if (quant_ms+preproc_ms) <= deepep_ms/2 else 'NOT MET'}]")
 
     # ---- Pipeline without preprocess (upper bound of preprocess fusion savings) ----
-    # Skip dispatch_expert_preprocess, use metadata from warmup/breakdown.
+    # Skip expert prepare/finalize, use metadata from warmup/breakdown.
     # Routing is uniform → metadata unchanged between iterations.
     no_preproc_pipeline_ms = 0.0
     preproc_savings_ms = 0.0
@@ -989,17 +997,18 @@ def test_performance(rank, world_size, group, device):
         gen_np = 60000
         for _ in range(num_warmup):
             g = gen_np
-            mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
+            _mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
                 num_local_experts=num_total_experts, num_total_experts=num_total_experts,
                 max_tokens_per_expert=max_tokens, generation=g,
                 sym_buf_addrs=sym_buf_addrs, rank_idx=rank, num_ranks=world_size)
-            dispatch_expert_preprocess(
+            refresh_expert_preprocess(
                 sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
                 max_tokens, hidden, local_expert_start, block_m,
                 generation=g, sync=False, _workspace=ws_expert)
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
+                expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
         torch.cuda.synchronize()
@@ -1009,13 +1018,14 @@ def test_performance(rank, world_size, group, device):
         for i in range(num_iters):
             g = gen_np + i + 1
             np_start[i].record(stream)
-            mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
+            _mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
                 num_local_experts=num_total_experts, num_total_experts=num_total_experts,
                 max_tokens_per_expert=max_tokens, generation=g,
                 sym_buf_addrs=sym_buf_addrs, rank_idx=rank, num_ranks=world_size)
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
+                expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
             np_end[i].record(stream)
@@ -1030,6 +1040,7 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
+                expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
         torch.cuda.synchronize()
@@ -1041,6 +1052,7 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
+                expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
             ev_e.record()
@@ -1059,7 +1071,7 @@ def test_performance(rank, world_size, group, device):
             # block-copy config here so bc_bn is always in scope.
             bc_k_half_p = hidden // 2
             _, _bm_p, bc_bn_p, *_ = get_gemm_configs(
-                expert_shape_m, num_local_experts, N, bc_k_half_p,
+                expert_shape_m, expert_expected_m, num_local_experts, N, bc_k_half_p,
                 padded_m=max_tokens)
             num_n_blocks_p = ceil_div(N, bc_bn_p)
             num_tiles_cap = (blocks_e + 4) * num_n_blocks_p  # +margin for m-block alignment
@@ -1070,6 +1082,7 @@ def test_performance(rank, world_size, group, device):
                 fused_dispatch_block_copy_gemm1_fp4(
                     (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                     expert_shape_m, max_tokens, world_size,
+                    expected_m=expert_expected_m,
                     local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                     num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
                     copy_mode=ks_copy_mode)
@@ -1080,6 +1093,7 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
+                expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
                 copy_mode=ks_copy_mode,
@@ -1152,6 +1166,7 @@ def test_performance(rank, world_size, group, device):
                     fused_dispatch_block_copy_gemm1_fp4(
                         (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                         expert_shape_m, max_tokens, world_size,
+                        expected_m=expert_expected_m,
                         local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                         num_copy_blocks=ncb, k_tiles_per_flag=0,
                         copy_only=True)
@@ -1163,6 +1178,7 @@ def test_performance(rank, world_size, group, device):
                     fused_dispatch_block_copy_gemm1_fp4(
                         (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                         expert_shape_m, max_tokens, world_size,
+                        expected_m=expert_expected_m,
                         local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                         num_copy_blocks=ncb, k_tiles_per_flag=0,
                         copy_only=True)
@@ -1196,6 +1212,7 @@ def test_performance(rank, world_size, group, device):
                 fused_dispatch_block_copy_gemm1_fp4(
                     (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                     expert_shape_m, max_tokens, world_size,
+                    expected_m=expert_expected_m,
                     local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                     num_copy_blocks=8, k_tiles_per_flag=0,
                     copy_mode=0)
@@ -1207,6 +1224,7 @@ def test_performance(rank, world_size, group, device):
                         fused_dispatch_block_copy_gemm1_fp4(
                             (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                             expert_shape_m, max_tokens, world_size,
+                            expected_m=expert_expected_m,
                             local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                             num_copy_blocks=ncb, k_tiles_per_flag=0,
                             copy_mode=mode)
@@ -1218,6 +1236,7 @@ def test_performance(rank, world_size, group, device):
                         fused_dispatch_block_copy_gemm1_fp4(
                             (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
                             expert_shape_m, max_tokens, world_size,
+                            expected_m=expert_expected_m,
                             local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                             num_copy_blocks=ncb, k_tiles_per_flag=0,
                             copy_mode=mode)
@@ -1255,6 +1274,7 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_local, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
+                expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
         torch.cuda.synchronize()
@@ -1267,6 +1287,7 @@ def test_performance(rank, world_size, group, device):
             fused_dispatch_block_copy_gemm1_fp4(
                 (W_fp4, W_scale_u16), out_bc, gl_e, ra_local, rs_e, sm_e, rc_e,
                 expert_shape_m, max_tokens, world_size,
+                expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
             ev_e.record()
@@ -1383,25 +1404,28 @@ def test_kstripe_profile(rank, world_size, group, device):
     buf_size = get_sym_buffer_size(num_local_experts, num_total_experts, max_tokens, hidden)
     sym_buf, sym_buf_addrs, sym_handle = alloc_sym_buffer(buf_size, device, group)
 
-    block_m = get_gemm_block_m(
-        num_tokens * topk, num_local_experts, N, hidden // 2,
-        num_ranks=world_size, padded_m=max_tokens)
-
     metadata_size = ((num_total_experts * 4 + 15) // 16) * 16
 
     sym_buf[:metadata_size].zero_()
-    mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
+    _mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
         num_local_experts=num_total_experts, num_total_experts=num_total_experts,
         max_tokens_per_expert=max_tokens)
     torch.cuda.synchronize()
     dist.barrier()
 
     ws_expert = create_expert_preprocess_workspace(
-        num_local_experts, world_size, max_tokens, block_m, device)
-    gl_e, ra_e, rs_e, sm_e, rc_e, total_mb, shape_m = dispatch_expert_preprocess(
+        num_local_experts, world_size, max_tokens, device)
+    shape_m, expert_expected_m, _ = dispatch_expert_prepare(
+        sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
+        max_tokens, hidden, local_expert_start, _workspace=ws_expert)
+    block_m = get_gemm_block_m(
+        shape_m, expert_expected_m, num_local_experts, N, hidden // 2,
+        padded_m=max_tokens)
+    gl_e, ra_e, rs_e, sm_e, rc_e, total_mb, finalized_shape_m = dispatch_expert_finalize(
         sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
         max_tokens, hidden, local_expert_start, block_m,
         sync=True, _workspace=ws_expert)
+    assert finalized_shape_m == shape_m
 
     # SFA produced on-device by the kernel (P0) — no host merged SFA needed.
     bc_fp4, bc_sfa, bc_flags = create_block_copy_buffers(
@@ -1424,6 +1448,7 @@ def test_kstripe_profile(rank, world_size, group, device):
         fused_dispatch_block_copy_gemm1_fp4(
             (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
             shape_m, max_tokens, world_size,
+            expected_m=expert_expected_m,
             local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
             num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,)
     torch.cuda.synchronize()
@@ -1436,6 +1461,7 @@ def test_kstripe_profile(rank, world_size, group, device):
         fused_dispatch_block_copy_gemm1_fp4(
             (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
             shape_m, max_tokens, world_size,
+            expected_m=expert_expected_m,
             local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
             num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,)
     end_evt.record()
@@ -1446,6 +1472,7 @@ def test_kstripe_profile(rank, world_size, group, device):
     fused_dispatch_block_copy_gemm1_fp4(
         (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
         shape_m, max_tokens, world_size,
+        expected_m=expert_expected_m,
         local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
         num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,
         kstripe_profile_buf=profile_buf)
@@ -1524,6 +1551,15 @@ if __name__ == '__main__':
     symm_mem.enable_symm_mem_for_group(dist.group.WORLD.group_name)
 
     results = {}
+    try:
+        results['test0_api_contract'] = test_public_api_contract()
+    except Exception as e:
+        if rank == 0:
+            print(f"Test 0 API contract error: {e}")
+            import traceback; traceback.print_exc()
+        results['test0_api_contract'] = False
+    if rank == 0 and results['test0_api_contract']:
+        print("Test 0: public API generation/parity contract PASSED")
 
     if not SKIP_CORRECTNESS:
         try:
@@ -1537,13 +1573,16 @@ if __name__ == '__main__':
     elif rank == 0:
         print("Skipping Test 1 (correctness) — SKIP_CORRECTNESS=1")
 
-    try:
-        results['test2_performance'] = test_performance(rank, world_size, group, device)
-    except Exception as e:
-        if rank == 0:
-            print(f"Test 2 error: {e}")
-            import traceback; traceback.print_exc()
-        results['test2_performance'] = False
+    if not SKIP_PERFORMANCE:
+        try:
+            results['test2_performance'] = test_performance(rank, world_size, group, device)
+        except Exception as e:
+            if rank == 0:
+                print(f"Test 2 error: {e}")
+                import traceback; traceback.print_exc()
+            results['test2_performance'] = False
+    elif rank == 0:
+        print("Skipping Test 2 (performance) — SKIP_PERFORMANCE=1")
 
     dist.barrier()
 

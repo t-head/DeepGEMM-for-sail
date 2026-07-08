@@ -440,7 +440,7 @@ bash sweep_blockcopy.sh 8 0,1,2,3,4,5,6,7  29700   # 8 卡
 （quant+preprocess+copy+gemm）机制不同，非严格同口径；纯 GEMM（gemm-only 0.194–0.196）稳定。
 
 诊断开关：`FUSED_GEMM_GROUPING=nopad|masked`；`FORCE_EXPECTED_M=128` 强制 block_m；MNK check 每次
-打印在 `--- MNK partition check ---` 段。多卡对照脚本 `tests/sweep_masked_vs_nopad.sh`。
+打印在 `--- MNK partition check ---` 段。
 
 ### 8.8 masked 配置扫描（8 卡，3 轮 min，2026-07-06）
 
