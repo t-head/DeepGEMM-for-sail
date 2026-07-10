@@ -5,6 +5,48 @@
 namespace deep_gemm {
 
 static constexpr uint32_t kNumMaxRanks = 72;
+static constexpr uint32_t kTaggedMinGenerationBits = 20;
+static constexpr uint32_t kTaggedMaxCountBits = 32 - kTaggedMinGenerationBits;
+static constexpr uint32_t kTaggedMaxCountMask = (1u << kTaggedMaxCountBits) - 1u;
+
+__host__ __device__ __forceinline__ uint32_t tagged_count_bits(uint32_t max_tokens_per_expert) {
+    uint32_t bits = 1;
+    uint32_t mask = 1u;
+    while (mask < max_tokens_per_expert && bits < kTaggedMaxCountBits) {
+        ++bits;
+        mask = (1u << bits) - 1u;
+    }
+    return bits;
+}
+
+__host__ __device__ __forceinline__ uint32_t tagged_count_mask(uint32_t max_tokens_per_expert) {
+    return (1u << tagged_count_bits(max_tokens_per_expert)) - 1u;
+}
+
+__host__ __device__ __forceinline__ uint32_t tagged_generation_mask(uint32_t max_tokens_per_expert) {
+    return (1u << (32 - tagged_count_bits(max_tokens_per_expert))) - 1u;
+}
+
+__host__ __device__ __forceinline__ bool use_tagged_generation_counts(
+    uint32_t generation, uint32_t max_tokens_per_expert) {
+    return generation > 0 &&
+           max_tokens_per_expert <= kTaggedMaxCountMask &&
+           generation <= tagged_generation_mask(max_tokens_per_expert);
+}
+
+__host__ __device__ __forceinline__ uint32_t pack_count_generation(
+    uint32_t generation, uint32_t max_tokens_per_expert) {
+    return generation << tagged_count_bits(max_tokens_per_expert);
+}
+
+__host__ __device__ __forceinline__ uint32_t unpack_generation_count(
+    uint32_t packed_count, uint32_t generation, uint32_t max_tokens_per_expert) {
+    if (!use_tagged_generation_counts(generation, max_tokens_per_expert))
+        return packed_count;
+    const uint32_t count_mask = tagged_count_mask(max_tokens_per_expert);
+    const uint32_t tag = pack_count_generation(generation, max_tokens_per_expert);
+    return ((packed_count & ~count_mask) == tag) ? (packed_count & count_mask) : 0u;
+}
 
 // Symmetric buffer address mapping for NVLink peer-to-peer access.
 // Translates local pointers to remote rank addresses via pre-computed offsets.

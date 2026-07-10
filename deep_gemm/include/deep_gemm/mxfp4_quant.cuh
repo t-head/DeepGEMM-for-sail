@@ -1,10 +1,39 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include "dispatch_layout.cuh"
 
 namespace deep_gemm {
+
+// Grid-completion counter for the folded arrival push (see mxfp4_quantize_kernel
+// tail). Self-resetting: atomicInc with wrap value gridDim.x-1 returns it to 0
+// after the last block retires, so it needs no external zero-init even though the
+// symmetric buffer is uninitialized. __device__ statics are zero-initialized at
+// module load, so the very first (generation>0) launch also starts clean. Quant
+// launches are serialized on a single stream, so one counter is race-free across
+// generations.
+__device__ uint32_t g_quant_arrival_retire = 0;
+
+__device__ __forceinline__ uint32_t atomic_add_generation_count(
+    uint32_t* counter, uint32_t generation, uint32_t max_tokens_per_expert) {
+    if (!use_tagged_generation_counts(generation, max_tokens_per_expert))
+        return atomicAdd(counter, 1u);
+
+    const uint32_t count_mask = tagged_count_mask(max_tokens_per_expert);
+    const uint32_t tag = pack_count_generation(generation, max_tokens_per_expert);
+    uint32_t old = *counter;
+    while ((old & ~count_mask) != tag) {
+        uint32_t prev = atomicCAS(counter, old, tag);
+        if (prev == old) {
+            old = tag;
+            break;
+        }
+        old = prev;
+    }
+    return atomicAdd(counter, 1u) & count_mask;
+}
 
 // Convert two FP32 values to packed E2M1x2 (two FP4 values in 1 byte)
 __device__ __forceinline__ uint8_t cvt_f32x2_to_fp4x2(float hi, float lo) {
@@ -60,7 +89,16 @@ __global__ void mxfp4_quantize_kernel(
     uint32_t num_total_experts,
     uint32_t max_tokens_per_expert,
     uint32_t hidden_dim,
-    int64_t* __restrict__ profile_clocks = nullptr) {
+    uint32_t generation,
+    int64_t* __restrict__ profile_clocks = nullptr,
+    // Folded arrival push (do_arrival != 0): the last block to retire signals every
+    // consumer that this rank's generation is complete, replacing the standalone
+    // arrival_push_kernel launch.
+    const int64_t* __restrict__ sym_buf_addrs = nullptr,
+    uint32_t rank_idx = 0,
+    uint32_t num_ranks = 0,
+    uint64_t arrival_offset = 0,
+    uint32_t do_arrival = 0) {
 
     constexpr int ELEMS_PER_THREAD = 8;  // 8 BF16 values = 1 int4 load
     constexpr int SCALE_GROUP_SIZE = 32;
@@ -91,8 +129,26 @@ __global__ void mxfp4_quantize_kernel(
     if (profile_clocks && blockIdx.x == 0 && threadIdx.x == 0) _prof_t0 = clock64();
 
     // ---- Phase 1: Quantize token data ONCE into shared memory ----
-    for (int i = threadIdx.x; i < FP4_INTS; i += blockDim.x) {
-        int4 int4_val = reinterpret_cast<const int4*>(token_data)[i];
+    // Compile-time stride (launch is always THREADS=256) so the compiler can unroll
+    // the fixed iteration count. Loads are HOISTED into a register array first so the
+    // P1_ITERS independent int4 fetches issue back-to-back and overlap (MLP): the
+    // per-iteration `load; compute` schedule made the compiler emit `s.wait vldcnt(0)`
+    // after every load (serializing the memory latency, acu No-Eligible ~48%);
+    // separating loads from compute lets it wait with staggered vldcnt instead.
+    constexpr int THREADS = 256;
+    constexpr int P1_ITERS = (FP4_INTS + THREADS - 1) / THREADS;
+    const int4* token_v = reinterpret_cast<const int4*>(token_data);
+    int4 raw[P1_ITERS];
+    #pragma unroll
+    for (int it = 0; it < P1_ITERS; ++it) {
+        const int i = it * THREADS + threadIdx.x;
+        if (i < FP4_INTS) raw[it] = token_v[i];
+    }
+    #pragma unroll
+    for (int it = 0; it < P1_ITERS; ++it) {
+        const int i = it * THREADS + threadIdx.x;
+        if (i >= FP4_INTS) continue;
+        int4 int4_val = raw[it];
         __nv_bfloat162 local_v2[ELEMS_PER_THREAD / 2];
 
         __nv_bfloat162 amax2 = __float2bfloat162_rn(0.0f);
@@ -105,13 +161,17 @@ __global__ void mxfp4_quantize_kernel(
         amax = __hmax(amax, __shfl_xor_sync(0xffffffff, amax, 2, 4));
         amax = __hmax(amax, __shfl_xor_sync(0xffffffff, amax, 1, 4));
 
+        // PROBE(dedup scale calc): all 4 lanes of a scale-group share `amax` after
+        // the shfl reduction, so compute scale/scale_inv only on the group leader
+        // (lane 0) and broadcast `scale` to the other 3. scale_inv is only stored by
+        // the leader, so lanes 1-3 never needed it.
         __nv_bfloat16 scale;
-        uint8_t scale_inv;
-        calculate_mxfp4_scales_bf16(amax, scale, scale_inv);
-
         if ((lane_id & (LANES_PER_GROUP - 1)) == 0) {
+            uint8_t scale_inv;
+            calculate_mxfp4_scales_bf16(amax, scale, scale_inv);
             s_scale_inv[i / LANES_PER_GROUP] = scale_inv;
         }
+        scale = __shfl_sync(0xffffffff, scale, (lane_id & ~(LANES_PER_GROUP - 1)) & 31, 32);
 
         __nv_bfloat162 scale2 = __halves2bfloat162(scale, scale);
         int int_value;
@@ -144,7 +204,8 @@ __global__ void mxfp4_quantize_kernel(
             int expert_idx = topk_ids[token_idx * topk + t];
             s_expert[t] = expert_idx;
             if (expert_idx >= 0) {
-                s_slot[t] = atomicAdd(&counts[expert_idx], 1);
+                s_slot[t] = atomic_add_generation_count(
+                    &counts[expert_idx], generation, max_tokens_per_expert);
             } else {
                 s_slot[t] = max_tokens_per_expert;
             }
@@ -181,6 +242,34 @@ __global__ void mxfp4_quantize_kernel(
         profile_clocks[0] = _prof_t1 - _prof_t0;  // Phase 1: quantize to SMEM
         profile_clocks[1] = _prof_t2 - _prof_t1;  // Phase 2: scatter to global
         profile_clocks[2] = _prof_t2 - _prof_t0;  // Total
+    }
+
+    // ---- Phase 3 (optional): folded arrival push ----
+    // Detect grid completion via a self-resetting atomic counter and have the last
+    // block signal every consumer, saving the separate arrival_push_kernel launch.
+    // Each block release-fences at DEVICE scope before its increment: this both
+    // orders the block's scatter writes ahead of the counter bump and makes them
+    // globally visible in this rank's HBM (which is what a consumer's NVLink read
+    // observes — the same visibility the old kernel boundary provided). When the
+    // last block sees the full count, every block's data is therefore consumer-
+    // readable; it then release-fences SYSTEM-wide (matching the old arrival_push)
+    // and publishes `generation` into each consumer's local slot[rank_idx].
+    if (do_arrival) {
+        __threadfence();
+        __shared__ bool s_is_last_block;
+        if (threadIdx.x == 0) {
+            uint32_t ticket = atomicInc(&g_quant_arrival_retire, gridDim.x - 1);
+            s_is_last_block = (ticket == gridDim.x - 1);
+        }
+        __syncthreads();
+        if (s_is_last_block && threadIdx.x == 0) {
+            __threadfence_system();
+            for (uint32_t c = 0; c < num_ranks; ++c) {
+                uint32_t* slot = reinterpret_cast<uint32_t*>(
+                    sym_buf_addrs[c] + static_cast<int64_t>(arrival_offset)) + rank_idx;
+                *slot = generation;
+            }
+        }
     }
 }
 
@@ -226,27 +315,44 @@ void launch_mxfp4_quantize(
     // the buffer a 1-iteration-slower consumer is still reading. Arrival slots (below) are
     // NOT double-buffered — they live at the fixed ready_flag_offset from the true base.
     void* data_base = layout.parity_base(sym_buf_base, generation & 1u);
-    cudaMemsetAsync(data_base, 0, layout.metadata_bytes(), stream);
+    if (!use_tagged_generation_counts(generation, max_tokens_per_expert)) {
+        cudaMemsetAsync(data_base, 0, layout.metadata_bytes(), stream);
+    }
 
     constexpr int THREADS = 256;
     int blocks = num_tokens;
+
+    // FUSED_ARRIVAL_IN_QUANT=1 folds the arrival push into the quant kernel's last
+    // block (saves one launch + lets consumers observe arrival ~1 launch earlier).
+    // Default keeps the standalone arrival_push_kernel below as the A/B baseline.
+    // Read once (env is process-static); generation is still a runtime arg.
+    static const bool fold_arrival_env = []() {
+        const char* e = std::getenv("FUSED_ARRIVAL_IN_QUANT");
+        return e != nullptr && e[0] == '1';
+    }();
+    const bool arrival_needed = (generation > 0);
+    const bool fold_arrival = arrival_needed && fold_arrival_env;
+    const uint32_t do_arrival = fold_arrival ? 1u : 0u;
+    const uint64_t arrival_offset = layout.ready_flag_offset();
 
     if (topk <= 4) {
         mxfp4_quantize_kernel<HIDDEN, 4><<<blocks, THREADS, 0, stream>>>(
             input, topk_ids, data_base,
             num_tokens, topk, num_local_experts, num_total_experts,
-            max_tokens_per_expert, HIDDEN, profile_clocks);
+            max_tokens_per_expert, HIDDEN, generation, profile_clocks,
+            sym_buf_addrs, rank_idx, num_ranks, arrival_offset, do_arrival);
     } else {
         mxfp4_quantize_kernel<HIDDEN, 8><<<blocks, THREADS, 0, stream>>>(
             input, topk_ids, data_base,
             num_tokens, topk, num_local_experts, num_total_experts,
-            max_tokens_per_expert, HIDDEN, profile_clocks);
+            max_tokens_per_expert, HIDDEN, generation, profile_clocks,
+            sym_buf_addrs, rank_idx, num_ranks, arrival_offset, do_arrival);
     }
 
-    if (generation > 0) {
+    if (arrival_needed && !fold_arrival) {
         arrival_push_kernel<<<1, 1, 0, stream>>>(
             sym_buf_addrs, rank_idx, num_ranks,
-            layout.ready_flag_offset(), generation);
+            arrival_offset, generation);
     }
 }
 

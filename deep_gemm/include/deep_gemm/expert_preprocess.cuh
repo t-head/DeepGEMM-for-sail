@@ -67,7 +67,8 @@ __device__ void dispatch_expert_prepare_device(
         uint32_t global_expert = local_expert_start + local_expert;
         uint32_t* local_counts = buf_layout.expert_token_counts_ptr(data_base);
         uint32_t* remote_counts = sym_buffer.map(local_counts, src_rank);
-        pair_counts[tid] = __ldg(remote_counts + global_expert);
+        pair_counts[tid] = unpack_generation_count(
+            __ldg(remote_counts + global_expert), generation, max_tokens_per_expert);
     }
     __syncthreads();
     long long dbg_t_counts = clock64();

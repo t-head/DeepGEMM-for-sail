@@ -176,8 +176,11 @@ def refresh_expert_preprocess(
 ):
     """Refresh fixed-config metadata without a host count readback.
 
-    MERGED_PREPROCESS=1 runs prepare+finalize as a single kernel launch."""
-    if os.getenv("MERGED_PREPROCESS", "0") == "1":
+    Merged prepare+finalize (single launch) is the DEFAULT for this fixed-block_m
+    path: it saves one launch + the kernel-boundary gap, worth ~7us clean-min on
+    the 2-GPU pipeline (bit-exact vs split, VALIDATE_MERGED=1). Set
+    MERGED_PREPROCESS=0 to force the split prepare();finalize() sequence."""
+    if os.getenv("MERGED_PREPROCESS", "1") == "1":
         return dispatch_expert_preprocess_merged(
             sym_buf_addrs, rank, world_size, num_local_experts, num_total_experts,
             max_tokens, hidden, local_expert_start, block_m, generation=generation,
@@ -246,10 +249,36 @@ def data_region_size(num_total_experts, max_tokens, hidden):
     return metadata_bytes + fp4_region + scale_region
 
 
-def get_expert_token_counts(all_sym_bufs, ge, world_size, data_base=0):
+def tagged_count_bits(max_tokens):
+    bits = 1
+    mask = 1
+    while mask < max_tokens and bits < 12:
+        bits += 1
+        mask = (1 << bits) - 1
+    return bits
+
+
+def unpack_generation_count(value, generation, max_tokens):
+    if generation == 0 or max_tokens > 0xFFF:
+        return value
+    bits = tagged_count_bits(max_tokens)
+    gen_mask = (1 << (32 - bits)) - 1
+    if generation > gen_mask:
+        return value
+    count_mask = (1 << bits) - 1
+    value &= 0xFFFFFFFF
+    tag = generation << bits
+    return (value & count_mask) if (value & ~count_mask) == tag else 0
+
+
+def get_expert_token_counts(all_sym_bufs, ge, world_size, data_base=0, generation=0, max_tokens=0):
     """Return list of per-rank token counts for global expert ge."""
-    return [all_sym_bufs[r][data_base + ge * 4:data_base + ge * 4 + 4].view(torch.int32).item()
-            for r in range(world_size)]
+    return [
+        unpack_generation_count(
+            all_sym_bufs[r][data_base + ge * 4:data_base + ge * 4 + 4].view(torch.int32).item(),
+            generation, max_tokens)
+        for r in range(world_size)
+    ]
 
 
 def print_routing_table(topk_ids, num_local_experts, rank, world_size, num_tokens, topk):
@@ -474,7 +503,8 @@ def test_correctness(rank, world_size, group, device):
         for le in range(num_local_experts):
             ge = local_expert_start + le
             counts_per_rank = get_expert_token_counts(
-                all_sym_bufs, ge, world_size, data_base=data_base)
+                all_sym_bufs, ge, world_size, data_base=data_base,
+                generation=round_result.generation, max_tokens=max_tokens)
             m_fused = sum(counts_per_rank)
             m_nf = int(pc[le].item())
 
@@ -920,6 +950,14 @@ def test_performance(rank, world_size, group, device):
     #      (Phase 2 is gated on generation>0). So preproc(gen>0) - preproc(gen=0)
     #      isolates the barrier wait; preproc(gen=0) = remote count reads + compute
     #      + launch. Same runtime kernel (generation is a runtime arg, no recompile).
+    # Generation-tagged count metadata is only unpacked on gen>0. Rebuild parity-0
+    # metadata in the raw-count format before timing this no-barrier diagnostic path.
+    _mxfp4_quantize_to_sym_buffer(
+        x, topk_ids, sym_buf,
+        num_local_experts=num_total_experts,
+        num_total_experts=num_total_experts,
+        max_tokens_per_expert=max_tokens)
+    torch.cuda.synchronize()
     dist.barrier()
     ev_p0_s = [torch.cuda.Event(enable_timing=True) for _ in range(n_breakdown)]
     ev_p0_e = [torch.cuda.Event(enable_timing=True) for _ in range(n_breakdown)]
@@ -994,9 +1032,9 @@ def test_performance(rank, world_size, group, device):
     local_kernel_std = 0.0
     if not SKIP_ISOLATION:
         dist.barrier()
-        gen_np = 60000
-        for _ in range(num_warmup):
-            g = gen_np
+        gen_np = 80000
+        for i in range(num_warmup):
+            g = gen_np + i + 1
             _mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
                 num_local_experts=num_total_experts, num_total_experts=num_total_experts,
                 max_tokens_per_expert=max_tokens, generation=g,
@@ -1016,7 +1054,7 @@ def test_performance(rank, world_size, group, device):
         np_start = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
         np_end = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
         for i in range(num_iters):
-            g = gen_np + i + 1
+            g = gen_np + num_warmup + i + 1
             np_start[i].record(stream)
             _mxfp4_quantize_to_sym_buffer(x, topk_ids, sym_buf,
                 num_local_experts=num_total_experts, num_total_experts=num_total_experts,

@@ -732,3 +732,146 @@ stages=3, ncb=8/13）已达到当前kernel架构的优化平台期。
   - BC pipeline: **0.290 ms**
   - NF pipeline: **0.294 ms**
   - vs NF: **1.02x**
+
+---
+
+## 2026-07-09: arrival_push 折进 quant 尾（grid-completion）——已测,perf 零和,默认关
+
+**动机:** 前次结论(2026-07-08)指出 preprocess 15µs 大头是 arrival barrier 等生产者 quant。
+唯一想缩的是这个"等待"。思路:把 `arrival_push_kernel`(quant 后单独 `<<<1,1>>>`)用 grid-completion
+折进 quant kernel 尾部——让 peer 的 arrival flag 早 ~1 launch 到达,缩短 consumer 的 barrier 等待。
+预期 -5~10µs。
+
+**实现** (`deep_gemm/include/deep_gemm/mxfp4_quant.cuh`,env `FUSED_ARRIVAL_IN_QUANT=1`,默认关):
+- quant kernel 尾新增 grid-completion:自复位 atomic counter
+  `atomicInc(&g_quant_arrival_retire, gridDim.x-1)`(wrap 回 0,免外部清零;`__device__` global 模块加载零初始化;
+  `blocks==num_tokens` → 全 block 都到尾,计数干净)。
+- 每 block 增量前 `__threadfence()`(device):既排序本 block scatter 写在计数之前,又使其在本 rank HBM
+  全局可见(= consumer NVLink 读所需的可见性,等价旧 kernel 边界)。last-block 检测到满 → `__threadfence_system()`
+  + 推 generation 到各 peer 的 slot[rank_idx](与旧 arrival_push 逐字相同)。
+- launcher `static getenv` 一次读 env;折进时不再 launch 独立 arrival kernel。标准路径保留为 A/B 基线。
+
+**正确性:PASS。** `FUSED_ARRIVAL_IN_QUANT=1 FULL_CORRECTNESS=1`(2卡 GPU1,2)gen1/2/3 vs CPU **逐位 0.000000**;
+`RUN_RANK_SKEW=1` rank1 正确等 1.002s(慢生产者的折进 arrival 仍正确阻塞 consumer,barrier 语义保住)。
+
+**性能:中性偏负(2卡同 GPU 对 1,2,clean-min ×3):**
+
+| 指标 | 基线(标准 <<<1,1>>>) | 折进 | Δ |
+|---|---|---|---|
+| quant_ms | 0.056 | 0.069 | **+13µs** |
+| preproc_ms | 0.049 | 0.038 | **−11µs** |
+| pipeline_full (min) | **0.305** | 0.308 | +3µs(噪声内) |
+
+三轮高度一致。**机制有效但零和:** arrival 早到确实省了 consumer barrier 等待(preproc −12µs),
+但代价是把「让全 grid 的写对 peer 可见」从**免费的 kernel teardown 边界**换成 **256 个 per-block
+`__threadfence()`** + tail 上的 system fence,压回 quant kernel 关键路径(+13µs)。
+
+**根因/结论:** 标准 `<<<1,1>>>` arrival kernel 从 quant 的 kernel 边界**白嫖 device-wide 写可见性**,
+自身只做 1 次 system fence——已近最优。折进后必须手动重建该 barrier(per-block fence),成本 > 省下的
+~3-5µs launch。再次印证 **launch 不是瓶颈**。代码 default-off gated 保留作基础设施(未 commit)。
+future 若想赢:须让"全 block 写对 peer 可见"比 per-block fence 更便宜(cooperative `grid.sync()` 太重;
+release-atomic 边际)。
+
+---
+
+## [iter 1] 2026-07-09: merged prepare+finalize 设为默认(fixed-block_m 路径)——真赢 ~7µs
+
+**AKO loop (pre-GEMM overhead).** 上次(07-08)把 merged 判为 "perf 中性",归因于 GPU 对混淆。
+用固定 GPU 对(1,2)+ clean-min 重测,结论翻转:**merged 真赢 ~7µs**。
+
+**Profiling 定位(acu + 微基准 scripts/quant_microbench.py):**
+- quant kernel(单 rank, gen=0)= **35µs GPU**;Phase2 scatter(topk× 写放大 + scale 写)完全跳过后
+  仍 **35µs** → scatter 对 256-block 网格**免费**(latency 被并行掩盖),印证 "quant 冗余写别动"。
+- scale 写改 coalesced row-major:**无提升**(35µs),因 scatter 本就免费。已回滚。
+- quant 由 Phase1(读 3.67MB + 量化 compute)+ launch 主导;acu:Mem Busy 80% 但仅 26% 峰值带宽,
+  Issue Slots 15.6% → latency-bound,非 BW。Phase1 较固有,难缩。
+- preprocess:单 CTA,in-kernel compute 小,主要是 **launch + kernel-boundary**;这正是 merged 的靶。
+
+**改动:** `refresh_expert_preprocess` 默认 `MERGED_PREPROCESS` 0→1(fixed-block_m 路径默认走单 launch);
+`scripts/bench.sh` 相应默认 =1,并加 VALIDATE_MERGED 门。
+
+**Signal(clean-min ×3,GPU 1,2,SKIP_CORRECTNESS):**
+| | split(baseline) | merged | 
+|---|---|---|
+| pipeline runs | 0.309/0.304/0.305 | 0.301/0.297/0.298 |
+| clean-min | **0.304** | **0.297** (−7µs) |
+
+三对全部 merged < split。event-isolated preproc 0.05→0.022(−28µs)但 pipeline 仅 −7µs:差额是
+CPU-dispatch 空隙,在 pipeline 里被相邻迭代的 GEMM/quant 重叠掩盖;真正省下的是 ~7µs launch+boundary。
+
+**Verdict:** 正确性 PASSED(3 轮);VALIDATE_MERGED **ALL MATCH**(6 张 metadata + 标量逐位一致);
+单跑 pipeline 0.302(FULL_CORRECTNESS 负载下更噪)。vs non-fused 0.89→~0.91x。
+
+**适用范围:** 仅当 block_m 已知/固定(推理已知 shape)。生产 `run()` 动态路由仍需 prepare 的
+expected_m host readback 来选 block_m,无法直接合并(这是 run() 用 split 的根因)。
+
+**下一步候选:** quant Phase1(30µs 大头,但 compute/latency-bound 难);或 run() 的 sync readback
+消除(固定 block_m 策略)以让生产路径也吃到 merged。
+
+---
+
+## [iter 2] 2026-07-09: quant Phase1 编译期 stride + #pragma unroll(ILP)——kernel -2µs,pipeline 中性
+
+**动机(acu on quant kernel, single rank):** Duration 22.9µs,latency-bound:No-Eligible **48.6%**,
+Issue Slots Busy 14.8%,Warp Cycles/Issued 9.31。Phase1 循环用 `i += blockDim.x`(runtime stride)
+→ 编译器无法 unroll/pipeline 独立迭代。launch 恒为 THREADS=256,把 stride 设为编译期常量 →
+固定 4 次迭代可 unroll,独立 int4 load 提前发射(ILP)掩盖 LLC/延迟停顿。
+
+**改动:** Phase1 循环 `constexpr THREADS=256; P1_ITERS=ceil(FP4_INTS/256)=4; #pragma unroll`,
+`if (i>=FP4_INTS) continue;`。仅 Phase1(热点),其余循环不动。
+
+**结果:**
+- **kernel:** acu Duration 22.9→**20.9µs**(−2µs,−8.5%);Issue Slots 14.8→16.5%。真降,但小。
+- **pipeline(clean-min ×3,GPU 1,2):** 0.297(iter1)→**0.296**,噪声内(<3%)。
+- **Verdict:** 正确性 PASSED(3 轮 vs CPU 0.000000,循环重构 bit-exact);pipeline 0.299(单跑)。
+
+**为何 pipeline 不动:** 微基准与 benchmark 都**复用同一个 x**(每迭代同输入)→ iter0 后 x 常驻 LLC
+(acu DRAM 仅 5.73%),掩盖了 quant 的真实 DRAM 读成本。ILP 主要掩盖读延迟,在 cached 场景收益小。
+**生产**(每 token 输入不同 → DRAM 读)收益应大于此处所见,故**保留**(低风险,仅设 blockDim==256,
+launcher 恒满足)。
+
+**结论:** quant Phase1 已近本算法地板(cvt/compute + 少量 per-thread 迭代);pre-GEMM 的干净大头
+(merged, iter1)已吃到。进一步 pipeline 收益需转向 kernel 内 copy+GEMM 或 run() 的 sync-readback 消除。
+
+---
+
+## [iter 3] 2026-07-09: quant Phase1 去重 scale 计算(4-lane 只算一次+shfl 广播)——kernel -2.7µs
+
+**动机:** 每个 scale-group(32 元素=4 lane)shfl 归约后 4 个 lane 拿到相同 amax,却各自重复算
+`calculate_mxfp4_scales_bf16`(log2+2×pow2+hmul+cast)。scale_inv 只 lane0 存 → lanes 1-3 白算。
+
+**改动:** 只在 group leader(lane&3==0)算 scale/scale_inv+存 scale_inv;`__shfl_sync(...,lane&~3,32)`
+把 scale 广播给另外 3 个 lane。
+
+**结果:** acu Duration 20.9→**18.2µs**(−2.7µs);Issue Slots 16.5→12.6%(冗余指令减少)。
+combined iter2+3:quant kernel **22.9→18.2µs(−20%)**。pipeline ~0.297(clean-min,cached 输入掩盖,中性)。
+Verdict:正确性 PASSED,vs CPU **0.000000**(scale 值与各 lane 自算完全相同 → bit-exact)。
+
+**ISA 发现(用户指出,hgobjdump --dump-isa):** Phase1 的 4 个 unrolled `vmem.ld.b32x4` 每个后面跟
+`s.wait vldcnt(0)`(等所有 vmem load 归零)→ **4 个 load 被串行化**,内存延迟全暴露(印证 No-Eligible 48%)。
+对比 smem setup 是 8 load 连发 + sldcnt(7..0) 交错等(正确 MLP)。iter2 的 unroll 没拿到 MLP 就是因为
+compiler 每迭代 load 紧跟 compute+vldcnt(0)。→ iter4 攻这个(hoist loads)。
+
+---
+
+## [iter 4] 2026-07-09: quant Phase1 load hoist(修 s.wait vldcnt(0) 串行)——ISA 验证 MLP,累计 pipeline -5µs
+
+**动机(ISA,iter3 发现):** Phase1 的 4 个 unrolled `vmem.ld.b32x4` 每个后跟 `s.wait vldcnt(0)`
+(等所有 vmem load 归零)→ 4 个 load 串行,DRAM/LLC 延迟全暴露。
+
+**改动:** 把 4 次 int4 load 提到独立 loop 先全部发射到寄存器数组 `raw[P1_ITERS]`,再统一 compute。
+分离 load/compute 让 compiler 连发 4 个 load 再 wait。
+
+**ISA 验证(hgobjdump --dump-isa):** 4 个 `vmem.ld.b32x4` 现在**连续发射**(offset 228/258/288/2b8)
+再到第一个 `s.wait vldcnt(0)` → **MLP 达成**(4 load 并行,1× 延迟 vs 之前 4×)。
+
+**结果:**
+- acu Duration 18.2→**17.8µs**(cached 微基准仅 −0.4µs:x 常驻 LLC + 48 warp TLP 已掩盖低 LLC 延迟;
+  MLP 在**生产 uncached DRAM** 收益才大)。寄存器 40→48/thread,占用 73.5→70.9%(轻微)。
+- **累计 quant kernel:22.9→17.8µs(−22%,iter2 ILP + iter3 dedup + iter4 hoist)。**
+- **pipeline clean-min(全 4 opt):0.297→0.292(−5µs);baseline 0.304 → 现 0.292(−12µs,merged -7 + quant -5)。
+  vs non-fused 0.89→0.925x。** 单个 quant opt 落噪声内,三个叠加后 −5µs 可测。
+- Verdict:正确性 PASSED,vs CPU 0.000000(纯调度/MLP 改动,bit-exact)。
+
+**教训:** iter2 单独判"pipeline 中性"过早——kernel 小改需**累计**到超噪声(~5µs)才看得出 pipeline 收益;
+且 quant 确实在关键路径上(Pipeline-no-preproc 0.288→0.285)。ISA 级验证(而非只看 wall-clock)是对的。
