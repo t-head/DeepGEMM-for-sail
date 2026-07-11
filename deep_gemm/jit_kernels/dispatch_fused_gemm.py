@@ -125,7 +125,8 @@ gemm_t::template run_fused_dispatch<{NUM_RANKS}, {NUM_COPY_BLOCKS}, {K_TILES_PER
     reinterpret_cast<volatile uint32_t*>(copy_ready_flags),
     reinterpret_cast<uint64_t*>(kstripe_profile_buf),
     kstripe_profile_max_mb,
-    (bool)copy_only);
+    (bool)copy_only,
+    (bool)skip_sfa_copy);
 """
 
 # ==============================================================
@@ -594,6 +595,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
     merged_sfa_addrs: torch.Tensor = None,
     kstripe_profile_buf: torch.Tensor = None,
     copy_only: bool = False,
+    skip_sfa_copy: bool = None,
     masked_m: torch.Tensor = None,
 ) -> None:
     """Block-copy fused GEMM1 with masked grouped scheduling.
@@ -667,6 +669,12 @@ def fused_dispatch_block_copy_gemm1_fp4(
         kstripe_profile_buf.zero_()
         kstripe_profile_max_mb = kstripe_profile_buf.numel() // 4  # capacity in tiles
 
+    # Diagnostic A/B: skip the GPU-side SFA copy in the copy blocks to measure its
+    # exposed cost behind the FP4 copy. Output is INCORRECT when set — timing only.
+    # Explicit arg wins; otherwise fall back to env SKIP_SFA_COPY (default off).
+    if skip_sfa_copy is None:
+        skip_sfa_copy = int(os.getenv('SKIP_SFA_COPY', '0')) != 0
+
     args = (rhs, rhs_scales, bias, out, gemm_shape_m,
             grouped_layout, masked_m,
             max_tokens_per_expert,
@@ -675,7 +683,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
             merged_sfa_addrs,
             local_fp4_buf, local_sfa_buf, copy_ready_flags,
             kstripe_profile_buf, kstripe_profile_max_mb,
-            int(copy_only))
+            int(copy_only), int(skip_sfa_copy))
 
     runtime = jit_tuner.compile_and_tune(
         name='fused_dispatch_block_copy_gemm1_fp4',
@@ -715,6 +723,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
             ('kstripe_profile_buf', torch.int64),
             ('kstripe_profile_max_mb', int),
             ('copy_only', int),
+            ('skip_sfa_copy', int),
         ),
         template=template_gemm_block_copy,
         args=args,

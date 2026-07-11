@@ -50,6 +50,11 @@ struct TileSchedulerArguments
     volatile uint32_t* copy_ready_flags;
     uint32_t num_copy_blocks;
 
+    // Diagnostic A/B: when true, copy blocks skip the GPU-side SFA copy/repack
+    // (copy_mblock_sfa). Used to measure SFA copy's exposed cost vs the FP4 copy
+    // it rides behind. Output is INCORRECT with this set — timing probe only.
+    bool skip_sfa_copy;
+
     // Optional per-tile k-stripe wait profiling buffer (nullptr => off).
     // Indexed by tile_idx (= next_block_idx); 4 int64 per tile:
     // [0]=stripe-wait cycles, [1]=mainloop cycles, [2]=wave, [3]=gemm CTA id.
@@ -80,6 +85,7 @@ struct TileSchedulerArguments
         , local_buf_k_scale_blocks(0)
         , copy_ready_flags(nullptr)
         , num_copy_blocks(0)
+        , skip_sfa_copy(false)
         , kstripe_profile_buf(nullptr)
         , kstripe_profile_max_tiles(0)
     {
@@ -104,6 +110,7 @@ struct TileSchedulerArguments
         , local_buf_k_scale_blocks(0)
         , copy_ready_flags(nullptr)
         , num_copy_blocks(0)
+        , skip_sfa_copy(false)
         , kstripe_profile_buf(nullptr)
         , kstripe_profile_max_tiles(0)
     {
@@ -125,7 +132,8 @@ struct TileSchedulerArguments
                            volatile uint32_t* copy_ready_flags_,
                            uint32_t num_copy_blocks_,
                            uint64_t* kstripe_profile_buf_ = nullptr,
-                           uint32_t kstripe_profile_max_tiles_ = 0)
+                           uint32_t kstripe_profile_max_tiles_ = 0,
+                           bool skip_sfa_copy_ = false)
         : grouped_layout(grouped_layout_ptr)
         , copy_grouped_layout(copy_grouped_layout_ptr)
         , shape_m(shape_m)
@@ -142,6 +150,7 @@ struct TileSchedulerArguments
         , local_buf_k_scale_blocks(local_buf_k_scale_blocks_)
         , copy_ready_flags(copy_ready_flags_)
         , num_copy_blocks(num_copy_blocks_)
+        , skip_sfa_copy(skip_sfa_copy_)
         , kstripe_profile_buf(kstripe_profile_buf_)
         , kstripe_profile_max_tiles(kstripe_profile_max_tiles_)
     {

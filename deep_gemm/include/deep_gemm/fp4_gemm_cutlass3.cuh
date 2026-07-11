@@ -57,7 +57,12 @@ __device__ __forceinline__ int4 ld_nc_global(const int4* ptr) {
 //   the exact row layout the FP4 copy uses, so the GEMM reads matching A + SFA.
 // (start, stride) let the caller split the work across threads; the single-owner
 // copy paths pass (threadIdx.x, blockDim.x).
-template <uint32_t BLOCK_M, uint32_t NumRanks>
+// SkipVectorizedMain=true does only the residual work: the scalar tail of
+// aligned ranks (cnt%8 tokens) and the full scalar copy of unaligned/cnt<8
+// ranks. The aligned-vectorized main body is then expected to have been
+// co-issued into the FP4 copy loop (see run_copy_block, NumRanks==4). This keeps
+// one source of truth for the SFA layout/addressing across both paths.
+template <uint32_t BLOCK_M, uint32_t NumRanks, bool SkipVectorizedMain = false>
 __device__ __forceinline__ void copy_mblock_sfa(
     const TileSchedulerArguments& sched, uint32_t mb,
     uint32_t expert_local, uint32_t m_block_in_expert,
@@ -90,14 +95,16 @@ __device__ __forceinline__ void copy_mblock_sfa(
         if (aligned16 && cnt >= 8) {
             const uint32_t vecs_per_row = cnt / 8;
             const uint32_t total_vecs = ksb * vecs_per_row;
-            for (uint32_t linear = start; linear < total_vecs; linear += stride) {
-                uint32_t kb = linear / vecs_per_row;
-                uint32_t v = linear - kb * vecs_per_row;
-                const int4* __restrict__ s = reinterpret_cast<const int4*>(
-                    src + (uint64_t)kb * max_tok) + v;
-                int4* __restrict__ d = reinterpret_cast<int4*>(
-                    dst + (uint64_t)kb * max_tok) + v;
-                *d = ld_nc_global(s);
+            if constexpr (!SkipVectorizedMain) {
+                for (uint32_t linear = start; linear < total_vecs; linear += stride) {
+                    uint32_t kb = linear / vecs_per_row;
+                    uint32_t v = linear - kb * vecs_per_row;
+                    const int4* __restrict__ s = reinterpret_cast<const int4*>(
+                        src + (uint64_t)kb * max_tok) + v;
+                    int4* __restrict__ d = reinterpret_cast<int4*>(
+                        dst + (uint64_t)kb * max_tok) + v;
+                    *d = ld_nc_global(s);
+                }
             }
 
             const uint32_t tail_begin = vecs_per_row * 8;
@@ -129,6 +136,7 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
     const uint32_t num_copy = sched.num_copy_blocks;
     const uint32_t k_half = sched.local_buf_k_half;
     const uint32_t max_tok = sched.local_buf_max_tokens;
+    const uint32_t sfa_ksb = sched.local_buf_k_scale_blocks;  // for SFA co-issue
     constexpr uint32_t nr = NumRanks;
     const uint32_t stride = blockDim.x;
 
@@ -217,10 +225,46 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
             int4* __restrict__ d2 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 2) * k_half);
             int4* __restrict__ d3 = reinterpret_cast<int4*>(local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx + 3) * k_half);
 
-            uint32_t n0 = __ldg(sched.rank_counts + idx) * k_half / 16;
-            uint32_t n1 = __ldg(sched.rank_counts + idx + 1) * k_half / 16;
-            uint32_t n2 = __ldg(sched.rank_counts + idx + 2) * k_half / 16;
-            uint32_t n3 = __ldg(sched.rank_counts + idx + 3) * k_half / 16;
+            uint32_t c0 = __ldg(sched.rank_counts + idx);
+            uint32_t c1 = __ldg(sched.rank_counts + idx + 1);
+            uint32_t c2 = __ldg(sched.rank_counts + idx + 2);
+            uint32_t c3 = __ldg(sched.rank_counts + idx + 3);
+            uint32_t n0 = c0 * k_half / 16;
+            uint32_t n1 = c1 * k_half / 16;
+            uint32_t n2 = c2 * k_half / 16;
+            uint32_t n3 = c3 * k_half / 16;
+
+            // SFA co-issue setup (NumRanks==4 only): ride the aligned-vectorized
+            // SFA int4 loads alongside FP4 so the SFA copy is no longer a serial
+            // tail. Per rank tv = ksb*(cnt/8) = n/16 <= max_n, so guarding each
+            // SFA vec by i<tv inside the FP4 loops covers every vec exactly once
+            // (bit-exact). Scalar tails and unaligned/cnt<8 ranks fall to the
+            // residual copy_mblock_sfa<...,SkipVectorizedMain=true> after FP4.
+            const uint16_t* ss0 = nullptr; uint16_t* sd0 = nullptr; uint32_t vpr0 = 0, tv0 = 0;
+            const uint16_t* ss1 = nullptr; uint16_t* sd1 = nullptr; uint32_t vpr1 = 0, tv1 = 0;
+            const uint16_t* ss2 = nullptr; uint16_t* sd2 = nullptr; uint32_t vpr2 = 0, tv2 = 0;
+            const uint16_t* ss3 = nullptr; uint16_t* sd3 = nullptr; uint32_t vpr3 = 0, tv3 = 0;
+            if constexpr (nr == 4) if (!sched.skip_sfa_copy) {  // skip => tv stays 0 => no co-issue (A/B probe)
+                uint16_t* sfa_dst_expert = sched.local_sfa_buf +
+                    (uint64_t)expert_local * sfa_ksb * max_tok;
+                uint32_t sfa_mrow = m_block_in_expert * BLOCK_M;
+                ss0 = reinterpret_cast<const uint16_t*>(__ldg(sched.rank_addr_sfa + idx));
+                ss1 = reinterpret_cast<const uint16_t*>(__ldg(sched.rank_addr_sfa + idx + 1));
+                ss2 = reinterpret_cast<const uint16_t*>(__ldg(sched.rank_addr_sfa + idx + 2));
+                ss3 = reinterpret_cast<const uint16_t*>(__ldg(sched.rank_addr_sfa + idx + 3));
+                sd0 = sfa_dst_expert + sfa_mrow + __ldg(sched.rank_split_m + idx);
+                sd1 = sfa_dst_expert + sfa_mrow + __ldg(sched.rank_split_m + idx + 1);
+                sd2 = sfa_dst_expert + sfa_mrow + __ldg(sched.rank_split_m + idx + 2);
+                sd3 = sfa_dst_expert + sfa_mrow + __ldg(sched.rank_split_m + idx + 3);
+                bool a0 = ((reinterpret_cast<uint64_t>(ss0) | reinterpret_cast<uint64_t>(sd0)) & 15u) == 0 && c0 >= 8;
+                bool a1 = ((reinterpret_cast<uint64_t>(ss1) | reinterpret_cast<uint64_t>(sd1)) & 15u) == 0 && c1 >= 8;
+                bool a2 = ((reinterpret_cast<uint64_t>(ss2) | reinterpret_cast<uint64_t>(sd2)) & 15u) == 0 && c2 >= 8;
+                bool a3 = ((reinterpret_cast<uint64_t>(ss3) | reinterpret_cast<uint64_t>(sd3)) & 15u) == 0 && c3 >= 8;
+                vpr0 = a0 ? c0 / 8 : 0; tv0 = sfa_ksb * vpr0;
+                vpr1 = a1 ? c1 / 8 : 0; tv1 = sfa_ksb * vpr1;
+                vpr2 = a2 ? c2 / 8 : 0; tv2 = sfa_ksb * vpr2;
+                vpr3 = a3 ? c3 / 8 : 0; tv3 = sfa_ksb * vpr3;
+            }
 
             uint32_t min_n = min(min(n0, n1), min(n2, n3));
             uint32_t max_n = max(max(n0, n1), max(n2, n3));
@@ -230,10 +274,26 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
                 int4 v1 = ld_nc_global(s1 + i);
                 int4 v2 = ld_nc_global(s2 + i);
                 int4 v3 = ld_nc_global(s3 + i);
+                int4 g0, g1, g2, g3;
+                uint32_t kb0 = 0, vx0 = 0, kb1 = 0, vx1 = 0, kb2 = 0, vx2 = 0, kb3 = 0, vx3 = 0;
+                bool q0 = false, q1 = false, q2 = false, q3 = false;
+                if constexpr (nr == 4) {
+                    q0 = i < tv0; q1 = i < tv1; q2 = i < tv2; q3 = i < tv3;
+                    if (q0) { kb0 = i / vpr0; vx0 = i - kb0 * vpr0; g0 = ld_nc_global(reinterpret_cast<const int4*>(ss0 + (uint64_t)kb0 * max_tok) + vx0); }
+                    if (q1) { kb1 = i / vpr1; vx1 = i - kb1 * vpr1; g1 = ld_nc_global(reinterpret_cast<const int4*>(ss1 + (uint64_t)kb1 * max_tok) + vx1); }
+                    if (q2) { kb2 = i / vpr2; vx2 = i - kb2 * vpr2; g2 = ld_nc_global(reinterpret_cast<const int4*>(ss2 + (uint64_t)kb2 * max_tok) + vx2); }
+                    if (q3) { kb3 = i / vpr3; vx3 = i - kb3 * vpr3; g3 = ld_nc_global(reinterpret_cast<const int4*>(ss3 + (uint64_t)kb3 * max_tok) + vx3); }
+                }
                 d0[i] = v0;
                 d1[i] = v1;
                 d2[i] = v2;
                 d3[i] = v3;
+                if constexpr (nr == 4) {
+                    if (q0) *(reinterpret_cast<int4*>(sd0 + (uint64_t)kb0 * max_tok) + vx0) = g0;
+                    if (q1) *(reinterpret_cast<int4*>(sd1 + (uint64_t)kb1 * max_tok) + vx1) = g1;
+                    if (q2) *(reinterpret_cast<int4*>(sd2 + (uint64_t)kb2 * max_tok) + vx2) = g2;
+                    if (q3) *(reinterpret_cast<int4*>(sd3 + (uint64_t)kb3 * max_tok) + vx3) = g3;
+                }
             }
             for (; i < max_n; i += stride) {
                 int4 v0, v1, v2, v3;
@@ -241,10 +301,26 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
                 if (i < n1) v1 = ld_nc_global(s1 + i);
                 if (i < n2) v2 = ld_nc_global(s2 + i);
                 if (i < n3) v3 = ld_nc_global(s3 + i);
+                int4 g0, g1, g2, g3;
+                uint32_t kb0 = 0, vx0 = 0, kb1 = 0, vx1 = 0, kb2 = 0, vx2 = 0, kb3 = 0, vx3 = 0;
+                bool q0 = false, q1 = false, q2 = false, q3 = false;
+                if constexpr (nr == 4) {
+                    q0 = i < tv0; q1 = i < tv1; q2 = i < tv2; q3 = i < tv3;
+                    if (q0) { kb0 = i / vpr0; vx0 = i - kb0 * vpr0; g0 = ld_nc_global(reinterpret_cast<const int4*>(ss0 + (uint64_t)kb0 * max_tok) + vx0); }
+                    if (q1) { kb1 = i / vpr1; vx1 = i - kb1 * vpr1; g1 = ld_nc_global(reinterpret_cast<const int4*>(ss1 + (uint64_t)kb1 * max_tok) + vx1); }
+                    if (q2) { kb2 = i / vpr2; vx2 = i - kb2 * vpr2; g2 = ld_nc_global(reinterpret_cast<const int4*>(ss2 + (uint64_t)kb2 * max_tok) + vx2); }
+                    if (q3) { kb3 = i / vpr3; vx3 = i - kb3 * vpr3; g3 = ld_nc_global(reinterpret_cast<const int4*>(ss3 + (uint64_t)kb3 * max_tok) + vx3); }
+                }
                 if (i < n0) d0[i] = v0;
                 if (i < n1) d1[i] = v1;
                 if (i < n2) d2[i] = v2;
                 if (i < n3) d3[i] = v3;
+                if constexpr (nr == 4) {
+                    if (q0) *(reinterpret_cast<int4*>(sd0 + (uint64_t)kb0 * max_tok) + vx0) = g0;
+                    if (q1) *(reinterpret_cast<int4*>(sd1 + (uint64_t)kb1 * max_tok) + vx1) = g1;
+                    if (q2) *(reinterpret_cast<int4*>(sd2 + (uint64_t)kb2 * max_tok) + vx2) = g2;
+                    if (q3) *(reinterpret_cast<int4*>(sd3 + (uint64_t)kb3 * max_tok) + vx3) = g3;
+                }
             }
         }
 
@@ -273,8 +349,17 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
         }
 
         // GPU-side SFA copy for this M-block (published together with FP4 below).
-        copy_mblock_sfa<BLOCK_M, NumRanks>(
-            sched, mb, expert_local, m_block_in_expert, threadIdx.x, blockDim.x);
+        // For NumRanks==4 the aligned-vectorized SFA main body was already
+        // co-issued into the FP4 nr4 loop above; only the residual (scalar tails
+        // + unaligned/cnt<8 ranks) remains. Other rank counts do the full copy.
+        if (!sched.skip_sfa_copy) {  // diagnostic A/B: SKIP_SFA_COPY skips it (timing probe; output invalid)
+            if constexpr (NumRanks == 4)
+                copy_mblock_sfa<BLOCK_M, NumRanks, /*SkipVectorizedMain=*/true>(
+                    sched, mb, expert_local, m_block_in_expert, threadIdx.x, blockDim.x);
+            else
+                copy_mblock_sfa<BLOCK_M, NumRanks>(
+                    sched, mb, expert_local, m_block_in_expert, threadIdx.x, blockDim.x);
+        }
 
         __syncthreads();
         __threadfence();
@@ -309,8 +394,9 @@ __device__ void run_copy_block_kstripe(
 
         // SFA is small and not K-striped; copy it all up-front so it is published
         // by the first stripe's fence+flag (GEMM only reads SFA once ready).
-        copy_mblock_sfa<BLOCK_M, NumRanks>(
-            sched, mb, expert_local, m_block_in_expert, threadIdx.x, blockDim.x);
+        if (!sched.skip_sfa_copy)  // diagnostic A/B: SKIP_SFA_COPY skips it (timing probe; output invalid)
+            copy_mblock_sfa<BLOCK_M, NumRanks>(
+                sched, mb, expert_local, m_block_in_expert, threadIdx.x, blockDim.x);
 
         for (uint32_t ks = 0; ks < num_stripes; ++ks) {
             const uint32_t stripe_col_start = ks * stripe_int4s;
@@ -2408,6 +2494,7 @@ public:
         uint64_t* kstripe_profile_buf = nullptr,
         uint32_t kstripe_profile_max_mb = 0,
         bool copy_only = false,
+        bool skip_sfa_copy = false,
         profiling::GemmProfileRecord* profile_records = nullptr) {
 
         static_assert(kGemmType == GemmType::FusedDispatchMasked,
@@ -2562,7 +2649,8 @@ public:
             local_fp4_buf, k_half, max_tokens_per_expert,
             local_sfa_buf, k_scale_blocks,
             copy_ready_flags, NumCopyBlocks,
-            kstripe_profile_buf, kstripe_profile_max_mb);  // max_mb repurposed as max_tiles (numel/4)
+            kstripe_profile_buf, kstripe_profile_max_mb,  // max_mb repurposed as max_tiles (numel/4)
+            skip_sfa_copy);
 
         // ptr_A/ptr_SFA are resolved per-block in operator(); use local_fp4_buf as placeholder
         typename GemmKernel::Arguments arguments{
