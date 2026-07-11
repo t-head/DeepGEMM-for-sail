@@ -55,6 +55,13 @@ struct TileSchedulerArguments
     // it rides behind. Output is INCORRECT with this set — timing probe only.
     bool skip_sfa_copy;
 
+    // Diagnostic A/B: when true, the GEMM reads ptr_scale_A from the host-built
+    // merged_sfa (remote_addr_sfa[expert], K-stride = M) — the pre-0f40bad read
+    // path — instead of the GPU-side local_sfa_buf (K-stride = max_tokens). Lets
+    // us isolate whether the high-latency-machine regression is in the GEMM SFA
+    // read side. Requires remote_addr_sfa to point at valid host-built merged_sfa.
+    bool sfa_source_host;
+
     // Optional per-tile k-stripe wait profiling buffer (nullptr => off).
     // Indexed by tile_idx (= next_block_idx); 4 int64 per tile:
     // [0]=stripe-wait cycles, [1]=mainloop cycles, [2]=wave, [3]=gemm CTA id.
@@ -86,6 +93,7 @@ struct TileSchedulerArguments
         , copy_ready_flags(nullptr)
         , num_copy_blocks(0)
         , skip_sfa_copy(false)
+        , sfa_source_host(false)
         , kstripe_profile_buf(nullptr)
         , kstripe_profile_max_tiles(0)
     {
@@ -111,6 +119,7 @@ struct TileSchedulerArguments
         , copy_ready_flags(nullptr)
         , num_copy_blocks(0)
         , skip_sfa_copy(false)
+        , sfa_source_host(false)
         , kstripe_profile_buf(nullptr)
         , kstripe_profile_max_tiles(0)
     {
@@ -133,7 +142,8 @@ struct TileSchedulerArguments
                            uint32_t num_copy_blocks_,
                            uint64_t* kstripe_profile_buf_ = nullptr,
                            uint32_t kstripe_profile_max_tiles_ = 0,
-                           bool skip_sfa_copy_ = false)
+                           bool skip_sfa_copy_ = false,
+                           bool sfa_source_host_ = false)
         : grouped_layout(grouped_layout_ptr)
         , copy_grouped_layout(copy_grouped_layout_ptr)
         , shape_m(shape_m)
@@ -151,6 +161,7 @@ struct TileSchedulerArguments
         , copy_ready_flags(copy_ready_flags_)
         , num_copy_blocks(num_copy_blocks_)
         , skip_sfa_copy(skip_sfa_copy_)
+        , sfa_source_host(sfa_source_host_)
         , kstripe_profile_buf(kstripe_profile_buf_)
         , kstripe_profile_max_tiles(kstripe_profile_max_tiles_)
     {

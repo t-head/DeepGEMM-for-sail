@@ -281,6 +281,69 @@ def get_expert_token_counts(all_sym_bufs, ge, world_size, data_base=0, generatio
     ]
 
 
+def build_merged_sfa(all_sym_bufs, num_local_experts, local_expert_start,
+                     num_total_experts, max_tokens, hidden, world_size, device,
+                     data_base=0, generation=0, pad_align=None):
+    """Build the pre-0f40bad host merged SFA buffer from all-gathered sym bufs.
+
+    Diagnostic helper for DG_SFA_SOURCE=host: reassembles each local expert's A
+    scales into a tightly-packed column-major [k_scale_blocks, padded_total]
+    region (K-stride = padded_total), the exact layout the GEMM's host read path
+    expects (ptr_scale_A = base, dSFA K-stride = M). Rank r's rows are placed at
+    the cumulative (pad_align-aligned) token offset, matching rank_split_m under
+    PAD_ALIGN=1 for the single-m-block-per-expert production config.
+
+    Returns (merged_sfa, merged_sfa_addrs) — keep merged_sfa alive until the GEMM
+    has run (merged_sfa_addrs holds raw data pointers into it).
+    """
+    if pad_align is None:
+        pad_align = PAD_ALIGN
+    k_blocks = (hidden + 31) // 32
+    k_scale_blocks = (k_blocks + 1) // 2
+    scale_elems_per_expert_max = k_scale_blocks * max_tokens
+    metadata_bytes = ((num_total_experts * 4 + 15) // 16) * 16
+    fp4_per_expert = max_tokens * (hidden // 2)
+    fp4_region_size = num_total_experts * fp4_per_expert
+
+    expert_padded_totals = []
+    for le in range(num_local_experts):
+        ge = local_expert_start + le
+        counts = get_expert_token_counts(
+            all_sym_bufs, ge, world_size, data_base=data_base,
+            generation=generation, max_tokens=max_tokens)
+        expert_padded_totals.append(sum(_align_up(c, pad_align) for c in counts))
+
+    total_sfa_elems = max(sum(pt * k_scale_blocks for pt in expert_padded_totals), 1)
+    merged_sfa = torch.zeros(total_sfa_elems, dtype=torch.uint16, device=device)
+    merged_sfa_addrs = torch.zeros(num_local_experts, dtype=torch.int64, device=device)
+
+    offset = 0
+    for le in range(num_local_experts):
+        ge = local_expert_start + le
+        pt = expert_padded_totals[le]
+        merged_sfa_addrs[le] = merged_sfa.data_ptr() + offset * 2
+        if pt == 0:
+            continue
+        expert_sfa = merged_sfa[offset:offset + pt * k_scale_blocks].view(k_scale_blocks, pt)
+        counts = get_expert_token_counts(
+            all_sym_bufs, ge, world_size, data_base=data_base,
+            generation=generation, max_tokens=max_tokens)
+        merged_token_pos = 0
+        for r in range(world_size):
+            count_r = counts[r]
+            if count_r == 0:
+                continue
+            scale_off_r = (data_base + metadata_bytes + fp4_region_size +
+                           ge * scale_elems_per_expert_max * 2)
+            src_scale = all_sym_bufs[r][scale_off_r:scale_off_r + scale_elems_per_expert_max * 2] \
+                .view(torch.uint16).view(k_scale_blocks, max_tokens)
+            expert_sfa[:, merged_token_pos:merged_token_pos + count_r] = src_scale[:, :count_r]
+            merged_token_pos += _align_up(count_r, pad_align)
+        offset += pt * k_scale_blocks
+
+    return merged_sfa, merged_sfa_addrs
+
+
 def print_routing_table(topk_ids, num_local_experts, rank, world_size, num_tokens, topk):
     """Print where each rank's tokens are routed: (target_rank, local_expert)."""
     ids = topk_ids.cpu().tolist()  # [num_tokens, topk]
@@ -610,8 +673,9 @@ def test_performance(rank, world_size, group, device):
     topk_ids = torch.stack(
         [(token_idx * topk + j) % num_total_experts for j in range(topk)], dim=1)
 
-    # Print routing information
-    print_routing_table(topk_ids, num_local_experts, rank, world_size, num_tokens, topk)
+    # Print routing information (默认关闭;set PRINT_ROUTING=1 打开)
+    if int(os.getenv('PRINT_ROUTING', '0')):
+        print_routing_table(topk_ids, num_local_experts, rank, world_size, num_tokens, topk)
     dist.barrier()
 
     topk_ids_i64 = topk_ids.to(torch.int64)
@@ -744,6 +808,25 @@ def test_performance(rank, world_size, group, device):
     dist.all_gather(all_sym_bufs, sym_buf)
     dist.barrier()
 
+    # ---- DG_SFA_SOURCE=host diagnostic: build the pre-0f40bad host merged_sfa ----
+    # The GEMM read side is the suspected high-latency-machine regression (see
+    # SFA_COPY_OPT_HANDOFF.md). With DG_SFA_SOURCE=host we rebuild the tightly-
+    # packed host merged_sfa here (from the parity-0 warmup snapshot; x/topk are
+    # fixed so the scale values are generation-independent) and feed it to the
+    # block-copy GEMM, which then reads ptr_scale_A from it (K-stride = M) instead
+    # of the GPU-side local_sfa_buf. gpu mode leaves merged_sfa_addrs=None so the
+    # kernel path is byte-for-byte the current default.
+    sfa_source = os.getenv('DG_SFA_SOURCE', 'gpu').lower()
+    merged_sfa_addrs = None
+    _merged_sfa_keep = None  # keep the backing tensor alive across kernel launches
+    if sfa_source == 'host':
+        _merged_sfa_keep, merged_sfa_addrs = build_merged_sfa(
+            all_sym_bufs, num_local_experts, local_expert_start,
+            num_total_experts, max_tokens, hidden, world_size, device)
+        if rank == 0:
+            print("  DG_SFA_SOURCE=host: block-copy GEMM reads host-built "
+                  "merged_sfa (K-stride=M); NCB sweep + kernel-only reflect this.")
+
     # ---- Benchmark non-fused (pipeline throughput) ----
     fixed_expected_m = max(int(pc.max().item()), 1)
     nf_block_m = int(os.getenv('NF_BLOCK_M', '128'))
@@ -871,6 +954,39 @@ def test_performance(rank, world_size, group, device):
     stream = torch.cuda.current_stream()
     bc_results = {}
 
+    # ---- DG_SFA_SOURCE correctness self-check ----
+    # The host read path must be bit-exact with the (independently CPU-verified in
+    # Test 1) gpu read path on active rows. Metadata (gl_e/ra_e/...) and sym_buf
+    # are still at the parity-0 warmup generation here — the same snapshot
+    # merged_sfa was built from — so gpu and host read identical scales.
+    if sfa_source == 'host':
+        chk_counts = [
+            sum(get_expert_token_counts(
+                all_sym_bufs, local_expert_start + le, world_size,
+                data_base=0, generation=0, max_tokens=max_tokens))
+            for le in range(num_local_experts)]
+        out_gpu = create_fused_output(expert_shape_m, num_local_experts, max_tokens, N, device)
+        out_host = create_fused_output(expert_shape_m, num_local_experts, max_tokens, N, device)
+        for out_t, host_flag in ((out_gpu, False), (out_host, True)):
+            fused_dispatch_block_copy_gemm1_fp4(
+                (W_fp4, W_scale_u16), out_t, gl_e, ra_e, rs_e, sm_e, rc_e,
+                expert_shape_m, max_tokens, world_size,
+                expected_m=expert_expected_m,
+                local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
+                num_copy_blocks=3, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=(merged_sfa_addrs if host_flag else None),
+                sfa_source_host=host_flag)
+        torch.cuda.synchronize()
+        chk_ok = all(
+            torch.equal(out_gpu[le, :c], out_host[le, :c])
+            for le, c in enumerate(chk_counts) if c > 0)
+        chk_t = torch.tensor([1 if chk_ok else 0], dtype=torch.int32, device=device)
+        dist.all_reduce(chk_t, op=dist.ReduceOp.MIN)
+        chk_ok = chk_t.item() == 1
+        if rank == 0:
+            print(f"  DG_SFA_SOURCE host-vs-gpu bit-exact self-check: "
+                  f"{'PASSED' if chk_ok else 'FAILED'}")
+
     ncb_list = [int(x) for x in os.getenv('NCB_SWEEP', '4,8,12').split(',')]
     for ncb in ncb_list:
         # Warmup
@@ -880,7 +996,8 @@ def test_performance(rank, world_size, group, device):
                 expert_shape_m, max_tokens, world_size,
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG)
+                num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
         torch.cuda.synchronize()
 
         # Benchmark: full pipeline (quant + preprocess + block-copy GEMM)
@@ -903,7 +1020,8 @@ def test_performance(rank, world_size, group, device):
                 expert_shape_m, max_tokens, world_size,
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG)
+                num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
             bc_end_events[i].record(stream)
         torch.cuda.synchronize()
         bc_t = sorted([s.elapsed_time(e) for s, e in zip(bc_start_events, bc_end_events)])
@@ -1041,7 +1159,8 @@ def test_performance(rank, world_size, group, device):
                 expert_shape_m, max_tokens, world_size,
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
         torch.cuda.synchronize()
 
         np_start = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
@@ -1058,7 +1177,8 @@ def test_performance(rank, world_size, group, device):
                 expert_shape_m, max_tokens, world_size,
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
             np_end[i].record(stream)
         torch.cuda.synchronize()
         np_times = sorted([np_start[i].elapsed_time(np_end[i]) for i in range(num_iters)])
@@ -1073,7 +1193,8 @@ def test_performance(rank, world_size, group, device):
                 expert_shape_m, max_tokens, world_size,
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
         torch.cuda.synchronize()
         bc_kernel_times = []
         for _ in range(pipe_iters):
@@ -1085,7 +1206,8 @@ def test_performance(rank, world_size, group, device):
                 expert_shape_m, max_tokens, world_size,
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
+                merged_sfa_addrs=merged_sfa_addrs)
             ev_e.record()
             bc_kernel_times.append((ev_s, ev_e))
         torch.cuda.synchronize()
@@ -1152,7 +1274,14 @@ def test_performance(rank, world_size, group, device):
                         ww = int(wr[:, 0].sum()); wm = int(wr[:, 1].sum())
                         exp = ww / wm if wm > 0 else 0.0
                         avg_w = ww / len(wr)
-                        avg_c = (wm - ww) / len(wr)
+                        # KTPF=0: wait 在 mainloop 之前的 tile 入口计时,与 mainloop
+                        # 区间不重叠 → compute 即 mainloop 本身(不能再减 wait,否则高
+                        # P2P 延迟机器上 wait>compute 会穿负)。KTPF>0: wait 的 spin 嵌
+                        # 套在 mainloop 计时窗口内 → compute = mainloop - wait。
+                        if K_TILES_PER_FLAG == 0:
+                            avg_c = wm / len(wr)
+                        else:
+                            avg_c = (wm - ww) / len(wr)
                         print(f"    {w:>4} {len(wr):>6} {exp:>9.4f} "
                               f"{avg_w:>12,.0f} {avg_c:>12,.0f}")
                     if K_TILES_PER_FLAG == 0:

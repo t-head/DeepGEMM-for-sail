@@ -126,7 +126,8 @@ gemm_t::template run_fused_dispatch<{NUM_RANKS}, {NUM_COPY_BLOCKS}, {K_TILES_PER
     reinterpret_cast<uint64_t*>(kstripe_profile_buf),
     kstripe_profile_max_mb,
     (bool)copy_only,
-    (bool)skip_sfa_copy);
+    (bool)skip_sfa_copy,
+    (bool)sfa_source_host);
 """
 
 # ==============================================================
@@ -596,6 +597,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
     kstripe_profile_buf: torch.Tensor = None,
     copy_only: bool = False,
     skip_sfa_copy: bool = None,
+    sfa_source_host: bool = None,
     masked_m: torch.Tensor = None,
 ) -> None:
     """Block-copy fused GEMM1 with masked grouped scheduling.
@@ -652,6 +654,21 @@ def fused_dispatch_block_copy_gemm1_fp4(
                              gemm_type=config_gemm_type)
 
     bias = torch.empty(0, dtype=torch.float32, device=rhs.device)
+
+    # Diagnostic A/B: DG_SFA_SOURCE=host makes the GEMM read ptr_scale_A from the
+    # host-built merged_sfa (pre-0f40bad read path, K-stride = M) instead of the
+    # GPU-side local_sfa_buf (K-stride = max_tokens). Explicit arg wins; otherwise
+    # env — but env only flips host mode ON where the caller actually supplied
+    # merged_sfa_addrs, so uninstrumented call sites stay on the GPU path (no crash
+    # reading the zeroed placeholder) when the whole run is launched with the env.
+    if sfa_source_host is None:
+        sfa_source_host = (os.getenv('DG_SFA_SOURCE', 'gpu').lower() == 'host'
+                           and merged_sfa_addrs is not None)
+    if sfa_source_host and merged_sfa_addrs is None:
+        raise ValueError(
+            "sfa_source_host=True requires merged_sfa_addrs (host-built merged_sfa "
+            "per-expert base pointers). Build it (e.g. tests' build_merged_sfa) and "
+            "pass merged_sfa_addrs=.")
     if merged_sfa_addrs is None:
         merged_sfa_addrs = torch.zeros(num_groups, dtype=torch.int64, device=rhs.device)
 
@@ -683,7 +700,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
             merged_sfa_addrs,
             local_fp4_buf, local_sfa_buf, copy_ready_flags,
             kstripe_profile_buf, kstripe_profile_max_mb,
-            int(copy_only), int(skip_sfa_copy))
+            int(copy_only), int(skip_sfa_copy), int(sfa_source_host))
 
     runtime = jit_tuner.compile_and_tune(
         name='fused_dispatch_block_copy_gemm1_fp4',
@@ -724,6 +741,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
             ('kstripe_profile_max_mb', int),
             ('copy_only', int),
             ('skip_sfa_copy', int),
+            ('sfa_source_host', int),
         ),
         template=template_gemm_block_copy,
         args=args,

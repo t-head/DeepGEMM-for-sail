@@ -878,6 +878,8 @@ class DeepGemmUniversal <
     uint8_t* fd2_fp4_buf;
     uint16_t* fd2_sfa_buf;
     volatile uint32_t* fd2_copy_flags;
+    bool fd2_sfa_source_host;
+    const uint64_t* fd2_remote_sfa;
     if constexpr (TileScheduler::kIsFusedDispatch) {
         fd2_k_half = params.scheduler.local_buf_k_half;
         fd2_max_tok = params.scheduler.local_buf_max_tokens;
@@ -885,6 +887,8 @@ class DeepGemmUniversal <
         fd2_sfa_buf = params.scheduler.local_sfa_buf;
         fd2_sfa_ksb = params.scheduler.local_buf_k_scale_blocks;
         fd2_copy_flags = params.scheduler.copy_ready_flags;
+        fd2_sfa_source_host = params.scheduler.sfa_source_host;
+        fd2_remote_sfa = params.scheduler.remote_addr_sfa;
     }
 
     uint32_t m_block_idx, n_block_idx;
@@ -912,11 +916,18 @@ class DeepGemmUniversal <
         ptr_A = reinterpret_cast<const ElementA*>(
             fd2_fp4_buf +
             (uint64_t)expert_local * fd2_max_tok * fd2_k_half);
-        // GPU-side SFA: per-expert local buffer, column-major [k_scale_blocks,
-        // max_tokens] with K-stride = max_tokens (see dSFA override below).
-        ptr_scale_A = reinterpret_cast<const ElementSFA*>(
-            fd2_sfa_buf +
-            (uint64_t)expert_local * fd2_sfa_ksb * fd2_max_tok);
+        if (fd2_sfa_source_host) {
+            // Diagnostic (DG_SFA_SOURCE=host): pre-0f40bad read path — host-built
+            // merged_sfa per-expert base, tightly packed column-major, K-stride = M
+            // (set in the dSFA override below).
+            ptr_scale_A = reinterpret_cast<const ElementSFA*>(fd2_remote_sfa[expert_local]);
+        } else {
+            // GPU-side SFA: per-expert local buffer, column-major [k_scale_blocks,
+            // max_tokens] with K-stride = max_tokens (see dSFA override below).
+            ptr_scale_A = reinterpret_cast<const ElementSFA*>(
+                fd2_sfa_buf +
+                (uint64_t)expert_local * fd2_sfa_ksb * fd2_max_tok);
+        }
       } else {
         auto offset_a = deep_scheduler.curr_offset_a();
         auto offset_scalea = deep_scheduler.curr_offset_mxfp4_scalea();
@@ -934,7 +945,9 @@ class DeepGemmUniversal <
       if constexpr (TileScheduler::kIsFusedDispatch) {
           // GPU-side SFA local buffer is packed per-expert with a fixed K-stride
           // = max_tokens (NOT the dynamic padded M), matching the copy layout.
-          get<1>(dSFA_local) = static_cast<int64_t>(fd2_max_tok);
+          // Host merged_sfa is tightly packed with K-stride = M (pre-0f40bad).
+          get<1>(dSFA_local) = fd2_sfa_source_host
+              ? static_cast<int64_t>(M) : static_cast<int64_t>(fd2_max_tok);
       }
       MainloopParams update_params = {
         {M, N, K}, ptr_A, params.mainloop.dA, ptr_B, params.mainloop.dB,
@@ -1485,6 +1498,8 @@ public:
     uint8_t* fd_fp4_buf;
     uint16_t* fd_sfa_buf;
     volatile uint32_t* fd_copy_flags;
+    bool fd_sfa_source_host;
+    const uint64_t* fd_remote_sfa;
     if constexpr (TileScheduler::kIsFusedDispatch) {
         fd_k_half = params.scheduler.local_buf_k_half;
         fd_max_tok = params.scheduler.local_buf_max_tokens;
@@ -1492,6 +1507,8 @@ public:
         fd_sfa_buf = params.scheduler.local_sfa_buf;
         fd_sfa_ksb = params.scheduler.local_buf_k_scale_blocks;
         fd_copy_flags = params.scheduler.copy_ready_flags;
+        fd_sfa_source_host = params.scheduler.sfa_source_host;
+        fd_remote_sfa = params.scheduler.remote_addr_sfa;
     }
 
     uint32_t m_block_idx, n_block_idx;
@@ -1539,11 +1556,18 @@ public:
           ptr_A = reinterpret_cast<const ElementA*>(
               fd_fp4_buf +
               (uint64_t)expert_local * fd_max_tok * fd_k_half);
-          // GPU-side SFA: per-expert local buffer, column-major [k_scale_blocks,
-          // max_tokens] with K-stride = max_tokens (see dSFA override below).
-          ptr_scale_A = reinterpret_cast<const ElementSFA*>(
-              fd_sfa_buf +
-              (uint64_t)expert_local * fd_sfa_ksb * fd_max_tok);
+          if (fd_sfa_source_host) {
+              // Diagnostic (DG_SFA_SOURCE=host): pre-0f40bad read path — host-built
+              // merged_sfa per-expert base, tightly packed column-major, K-stride = M
+              // (set in the dSFA override below).
+              ptr_scale_A = reinterpret_cast<const ElementSFA*>(fd_remote_sfa[expert_local]);
+          } else {
+              // GPU-side SFA: per-expert local buffer, column-major [k_scale_blocks,
+              // max_tokens] with K-stride = max_tokens (see dSFA override below).
+              ptr_scale_A = reinterpret_cast<const ElementSFA*>(
+                  fd_sfa_buf +
+                  (uint64_t)expert_local * fd_sfa_ksb * fd_max_tok);
+          }
       } else {
           auto offset_a = deep_scheduler.curr_offset_a();
           auto offset_scalea = deep_scheduler.curr_offset_mxfp4_scalea();
@@ -1561,7 +1585,9 @@ public:
       if constexpr (TileScheduler::kIsFusedDispatch) {
           // GPU-side SFA local buffer is packed per-expert with a fixed K-stride
           // = max_tokens (NOT the dynamic padded M), matching the copy layout.
-          get<1>(dSFA_local) = static_cast<int64_t>(fd_max_tok);
+          // Host merged_sfa is tightly packed with K-stride = M (pre-0f40bad).
+          get<1>(dSFA_local) = fd_sfa_source_host
+              ? static_cast<int64_t>(M) : static_cast<int64_t>(fd_max_tok);
       }
       MainloopParams update_params = {
         {M, N, K}, ptr_A, params.mainloop.dA, ptr_B, params.mainloop.dB,
@@ -2495,6 +2521,7 @@ public:
         uint32_t kstripe_profile_max_mb = 0,
         bool copy_only = false,
         bool skip_sfa_copy = false,
+        bool sfa_source_host = false,
         profiling::GemmProfileRecord* profile_records = nullptr) {
 
         static_assert(kGemmType == GemmType::FusedDispatchMasked,
@@ -2650,7 +2677,7 @@ public:
             local_sfa_buf, k_scale_blocks,
             copy_ready_flags, NumCopyBlocks,
             kstripe_profile_buf, kstripe_profile_max_mb,  // max_mb repurposed as max_tiles (numel/4)
-            skip_sfa_copy);
+            skip_sfa_copy, sfa_source_host);
 
         // ptr_A/ptr_SFA are resolved per-block in operator(); use local_fp4_buf as placeholder
         typename GemmKernel::Arguments arguments{
