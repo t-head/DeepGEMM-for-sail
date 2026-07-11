@@ -360,7 +360,6 @@ def test_correctness(rank, world_size, group, device):
         raise ValueError("RUN_RANK_SKEW requires TEST_ROUNDS >= 3")
     num_copy_blocks = int(os.getenv('NCB', '8'))
     k_tiles_per_flag = int(os.getenv('K_TILES_PER_FLAG', '0'))
-    copy_mode = int(os.getenv('COPY_MODE', '0'))
 
     if rank == 0:
         print(f"\n{'='*60}")
@@ -431,8 +430,7 @@ def test_correctness(rank, world_size, group, device):
         round_result = context.run(
             x, topk_ids, (W_fp4, W_scale_u16),
             num_copy_blocks=num_copy_blocks,
-            k_tiles_per_flag=k_tiles_per_flag,
-            copy_mode=copy_mode)
+            k_tiles_per_flag=k_tiles_per_flag)
         round_elapsed = time.monotonic() - round_start
         torch.cuda.synchronize()
         if RUN_RANK_SKEW and round_idx == 2:
@@ -593,9 +591,6 @@ def test_performance(rank, world_size, group, device):
     num_iters = 20
     verbose = os.environ.get('PERF_VERBOSE', '0') != '0'
     K_TILES_PER_FLAG = int(os.getenv('K_TILES_PER_FLAG', '0'))
-    # copy_mode only matters when ktpf==0 (ktpf>0 always uses the kstripe copy
-    # path). Let the main NCB-sweep honor it so perf reflects the swept config.
-    COPY_MODE = int(os.getenv('COPY_MODE', '0'))
 
     if rank == 0:
         print(f"\n{'='*60}")
@@ -885,8 +880,7 @@ def test_performance(rank, world_size, group, device):
                 expert_shape_m, max_tokens, world_size,
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                copy_mode=COPY_MODE)
+                num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG)
         torch.cuda.synchronize()
 
         # Benchmark: full pipeline (quant + preprocess + block-copy GEMM)
@@ -909,8 +903,7 @@ def test_performance(rank, world_size, group, device):
                 expert_shape_m, max_tokens, world_size,
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                copy_mode=COPY_MODE)
+                num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG)
             bc_end_events[i].record(stream)
         torch.cuda.synchronize()
         bc_t = sorted([s.elapsed_time(e) for s, e in zip(bc_start_events, bc_end_events)])
@@ -1114,7 +1107,6 @@ def test_performance(rank, world_size, group, device):
             num_n_blocks_p = ceil_div(N, bc_bn_p)
             num_tiles_cap = (blocks_e + 4) * num_n_blocks_p  # +margin for m-block alignment
             ks_prof_buf = torch.zeros(num_tiles_cap * 4, dtype=torch.int64, device=device)
-            ks_copy_mode = int(os.getenv('COPY_MODE', '0'))
             # warm the exact call so the profiled iteration isn't cold
             for _ in range(5):
                 fused_dispatch_block_copy_gemm1_fp4(
@@ -1122,8 +1114,7 @@ def test_performance(rank, world_size, group, device):
                     expert_shape_m, max_tokens, world_size,
                     expected_m=expert_expected_m,
                     local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                    num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                    copy_mode=ks_copy_mode)
+                    num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG)
             torch.cuda.synchronize()
             ks_ev0 = torch.cuda.Event(enable_timing=True)
             ks_ev1 = torch.cuda.Event(enable_timing=True)
@@ -1134,14 +1125,12 @@ def test_performance(rank, world_size, group, device):
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                copy_mode=ks_copy_mode,
                 kstripe_profile_buf=ks_prof_buf)
             ks_ev1.record()
             torch.cuda.synchronize()
             ks_wall_us = ks_ev0.elapsed_time(ks_ev1) * 1000.0
 
             if rank == 0:
-                print(f"  [copy_mode={ks_copy_mode}]", end="")
                 rec = ks_prof_buf.cpu().numpy().reshape(-1, 4)
                 rec = rec[rec[:, 1] > 0]  # keep tiles that actually ran (mainloop>0)
                 if len(rec) > 0:
@@ -1235,64 +1224,6 @@ def test_performance(rank, world_size, group, device):
                     speedup = f"{prev/ms:.2f}x" if prev else "—"
                     print(f"    {ncb:>4} {ms*1e3:>9.1f} {gbps:>8.1f} {speedup:>8}")
                     prev = ms
-
-        # ---- Copy strategy A/B: mode 0 (round-robin) vs 1 (cooperative), sweep ncb ----
-        # Set COPY_MODE_AB=1. Kernel-only (copy+GEMM), same binary -> fair compare.
-        # AB_NCB_LIST controls the sweep (default 2,4,8,12,16); each cell = median of
-        # AB_ITERS. Finds the best ncb for EACH mode (cooperative's optimum may differ:
-        # more blocks = more per-M-block bandwidth but more fences + worse straggler).
-        if int(os.getenv('COPY_MODE_AB', '0')):
-            ab_ncb_list = [int(x) for x in os.getenv('AB_NCB_LIST', '2,4,8,12,16').split(',')]
-            ab_iters = int(os.getenv('AB_ITERS', '30'))
-            ab_res = {}
-            # Global prewarm so the very first measured cell isn't cold.
-            for _ in range(10):
-                fused_dispatch_block_copy_gemm1_fp4(
-                    (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
-                    expert_shape_m, max_tokens, world_size,
-                    expected_m=expert_expected_m,
-                    local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                    num_copy_blocks=8, k_tiles_per_flag=0,
-                    copy_mode=0)
-            torch.cuda.synchronize()
-            ab_modes = [int(x) for x in os.getenv('AB_MODES', '0,1,2').split(',')]
-            for mode in ab_modes:
-                for ncb in ab_ncb_list:
-                    for _ in range(num_warmup):
-                        fused_dispatch_block_copy_gemm1_fp4(
-                            (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
-                            expert_shape_m, max_tokens, world_size,
-                            expected_m=expert_expected_m,
-                            local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                            num_copy_blocks=ncb, k_tiles_per_flag=0,
-                            copy_mode=mode)
-                    torch.cuda.synchronize()
-                    evs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-                           for _ in range(ab_iters)]
-                    for s, e in evs:
-                        s.record(stream)
-                        fused_dispatch_block_copy_gemm1_fp4(
-                            (W_fp4, W_scale_u16), out_bc, gl_e, ra_e, rs_e, sm_e, rc_e,
-                            expert_shape_m, max_tokens, world_size,
-                            expected_m=expert_expected_m,
-                            local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                            num_copy_blocks=ncb, k_tiles_per_flag=0,
-                            copy_mode=mode)
-                        e.record(stream)
-                    torch.cuda.synchronize()
-                    kt = sorted([s.elapsed_time(e) for s, e in evs])
-                    ab_res[(mode, ncb)] = kt[len(kt) // 2]
-            if rank == 0:
-                mode_name = {0: 'round-robin', 1: 'coop', 2: 'coop-1thF'}
-                hdr = ' '.join(f"{mode_name.get(m,'m'+str(m)):>11}" for m in ab_modes)
-                print(f"\n  Copy Strategy A/B kernel-only ncb sweep (ms, KTPF=0, median of {ab_iters}):")
-                print(f"    {'ncb':>4} {hdr}")
-                for ncb in ab_ncb_list:
-                    row = ' '.join(f"{ab_res[(m,ncb)]:>11.3f}" for m in ab_modes)
-                    print(f"    {ncb:>4} {row}")
-                for m in ab_modes:
-                    bm = min(ab_ncb_list, key=lambda n: ab_res[(m, n)])
-                    print(f"    best {mode_name.get(m,'m'+str(m))}: ncb={bm} ({ab_res[(m,bm)]:.3f} ms)")
 
         # ---- Local-to-local P2P isolation experiment ----
         dist.barrier()

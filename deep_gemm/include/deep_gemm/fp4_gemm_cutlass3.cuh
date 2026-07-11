@@ -55,8 +55,8 @@ __device__ __forceinline__ int4 ld_nc_global(const int4* ptr) {
 //   rank's token offset). Dest: this rank's local per-expert SFA buffer with the
 //   SAME K-stride, rows placed at m_block_in_expert*BLOCK_M + rank_split_m — i.e.
 //   the exact row layout the FP4 copy uses, so the GEMM reads matching A + SFA.
-// (start, stride) let cooperative copy (copy_mode 1/2) split the work across all
-// ncb blocks; single-owner paths pass (threadIdx.x, blockDim.x).
+// (start, stride) let the caller split the work across threads; the single-owner
+// copy paths pass (threadIdx.x, blockDim.x).
 template <uint32_t BLOCK_M, uint32_t NumRanks>
 __device__ __forceinline__ void copy_mblock_sfa(
     const TileSchedulerArguments& sched, uint32_t mb,
@@ -280,69 +280,6 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
         __threadfence();
         if (threadIdx.x == 0) {
             sched.copy_ready_flags[mb] = 1;
-        }
-    }
-}
-
-// Cooperative copy (copy_mode=1): all ncb copy blocks walk the M-blocks in the
-// SAME order (0,1,2,...), each doing a 1/ncb slice of the current M-block. Because
-// GEMM consumes M-major (needs m0 first), giving each low-index M-block the full
-// aggregate copy bandwidth makes it ready earliest -> shrinks the first-wave stall.
-// Per-M-block done-counter (copy_ready_flags[total_m_blocks + mb]); the last of the
-// ncb blocks to finish an M-block publishes its ready flag. KTPF=0 semantics only.
-template <uint32_t BLOCK_M, uint32_t NumRanks, bool SingleThreadFence = false>
-__device__ void run_copy_block_cooperative(const TileSchedulerArguments& sched, uint32_t total_m_blocks)
-{
-    const uint32_t ncb = sched.num_copy_blocks;
-    const uint32_t k_half = sched.local_buf_k_half;
-    const uint32_t max_tok = sched.local_buf_max_tokens;
-    constexpr uint32_t nr = NumRanks;
-    const uint32_t gstride = ncb * blockDim.x;                 // cooperative stride across all blocks
-    const uint32_t gstart  = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t* __restrict__ done_ctr = (uint32_t*)(sched.copy_ready_flags) + total_m_blocks;
-
-    for (uint32_t mb = 0; mb < total_m_blocks; ++mb) {
-        uint4 gl = (reinterpret_cast<const uint4*>(sched.copy_grouped_layout) + 1)[mb];
-        uint32_t expert_local = gl.x;
-        uint32_t m_block_in_expert = mb - gl.z;
-        uint8_t* local_a_base = sched.local_fp4_buf +
-            (uint64_t)expert_local * max_tok * k_half +
-            (uint64_t)m_block_in_expert * BLOCK_M * k_half;
-
-        #pragma unroll 1
-        for (uint32_t r = 0; r < nr; ++r) {
-            uint32_t idx = mb * nr + r;
-            const int4* __restrict__ src = reinterpret_cast<const int4*>(__ldg(sched.rank_addr_a + idx));
-            int4* __restrict__ dst = reinterpret_cast<int4*>(
-                local_a_base + (uint64_t)__ldg(sched.rank_split_m + idx) * k_half);
-            uint32_t n_int4 = __ldg(sched.rank_counts + idx) * k_half / 16;
-            for (uint32_t i = gstart; i < n_int4; i += gstride)
-                dst[i] = ld_nc_global(src + i);
-        }
-
-        // GPU-side SFA copy for this M-block, split across all ncb blocks.
-        copy_mblock_sfa<BLOCK_M, NumRanks>(
-            sched, mb, expert_local, m_block_in_expert, gstart, gstride);
-
-        __syncthreads();
-        if constexpr (SingleThreadFence) {
-            // wbinv is an address-less full-SM-cache write-back+invalidate, so one
-            // thread flushes the whole block's writes (syncthreads above ensures
-            // they're all in-cache). Avoids the redundant per-warp wbinv issues.
-            if (threadIdx.x == 0) {
-                __threadfence();  // flush this block's SM cache once
-                if (atomicAdd(&done_ctr[mb], 1u) == ncb - 1) {
-                    sched.copy_ready_flags[mb] = 1;  // data already flushed above
-                }
-            }
-        } else {
-            __threadfence();  // publish this block's writes device-wide before signalling
-            if (threadIdx.x == 0) {
-                if (atomicAdd(&done_ctr[mb], 1u) == ncb - 1) {
-                    __threadfence();
-                    sched.copy_ready_flags[mb] = 1;
-                }
-            }
         }
     }
 }
@@ -810,10 +747,6 @@ class DeepGemmUniversal <
           run_copy_block_kstripe<BlockM, TileScheduler::kNumRanks,
               cute::size<2>(TileShape{}), TileScheduler::kKTilesPerFlag>(
               params.scheduler, total_m_blocks);
-        } else if (params.scheduler.copy_mode == 1) {
-          run_copy_block_cooperative<BlockM, TileScheduler::kNumRanks, false>(params.scheduler, total_m_blocks);
-        } else if (params.scheduler.copy_mode == 2) {
-          run_copy_block_cooperative<BlockM, TileScheduler::kNumRanks, true>(params.scheduler, total_m_blocks);
         } else {
           run_copy_block<BlockM, TileScheduler::kNumRanks>(params.scheduler, total_m_blocks);
         }
@@ -1416,10 +1349,6 @@ public:
           run_copy_block_kstripe<BlockM, TileScheduler::kNumRanks,
               cute::size<2>(TileShape{}), TileScheduler::kKTilesPerFlag>(
               params.scheduler, total_m_blocks);
-        } else if (params.scheduler.copy_mode == 1) {
-          run_copy_block_cooperative<BlockM, TileScheduler::kNumRanks, false>(params.scheduler, total_m_blocks);
-        } else if (params.scheduler.copy_mode == 2) {
-          run_copy_block_cooperative<BlockM, TileScheduler::kNumRanks, true>(params.scheduler, total_m_blocks);
         } else {
           run_copy_block<BlockM, TileScheduler::kNumRanks>(params.scheduler, total_m_blocks);
         }
@@ -2479,7 +2408,6 @@ public:
         uint64_t* kstripe_profile_buf = nullptr,
         uint32_t kstripe_profile_max_mb = 0,
         bool copy_only = false,
-        uint32_t copy_mode = 0,
         profiling::GemmProfileRecord* profile_records = nullptr) {
 
         static_assert(kGemmType == GemmType::FusedDispatchMasked,
@@ -2634,8 +2562,7 @@ public:
             local_fp4_buf, k_half, max_tokens_per_expert,
             local_sfa_buf, k_scale_blocks,
             copy_ready_flags, NumCopyBlocks,
-            kstripe_profile_buf, kstripe_profile_max_mb,  // max_mb repurposed as max_tiles (numel/4)
-            copy_mode);
+            kstripe_profile_buf, kstripe_profile_max_mb);  // max_mb repurposed as max_tiles (numel/4)
 
         // ptr_A/ptr_SFA are resolved per-block in operator(); use local_fp4_buf as placeholder
         typename GemmKernel::Arguments arguments{

@@ -125,8 +125,7 @@ gemm_t::template run_fused_dispatch<{NUM_RANKS}, {NUM_COPY_BLOCKS}, {K_TILES_PER
     reinterpret_cast<volatile uint32_t*>(copy_ready_flags),
     reinterpret_cast<uint64_t*>(kstripe_profile_buf),
     kstripe_profile_max_mb,
-    (bool)copy_only,
-    (uint32_t)copy_mode);
+    (bool)copy_only);
 """
 
 # ==============================================================
@@ -567,10 +566,9 @@ def create_block_copy_buffers(num_local_experts, num_ranks, max_tokens_per_exper
                             dtype=torch.uint16, device=device)
     max_m_blocks_per_expert = ceil_div(max_tokens_per_expert, block_m)
     max_total_m_blocks = num_local_experts * max_m_blocks_per_expert
-    # 2x size: [0..total-1] = per-M-block ready flags (read by GEMM),
-    # [total..2*total-1] = per-M-block done-counters for cooperative copy
-    # (copy_mode=1); the last of ncb blocks to finish an M-block sets its flag.
-    copy_ready_flags = torch.zeros(2 * max_total_m_blocks, dtype=torch.int32, device=device)
+    # [0..total-1] = per-M-block ready flags (read by GEMM); a copy block sets
+    # copy_ready_flags[mb]=1 once it has published M-block mb's data.
+    copy_ready_flags = torch.zeros(max_total_m_blocks, dtype=torch.int32, device=device)
     return local_fp4, local_sfa, copy_ready_flags
 
 
@@ -596,7 +594,6 @@ def fused_dispatch_block_copy_gemm1_fp4(
     merged_sfa_addrs: torch.Tensor = None,
     kstripe_profile_buf: torch.Tensor = None,
     copy_only: bool = False,
-    copy_mode: int = 0,
     masked_m: torch.Tensor = None,
 ) -> None:
     """Block-copy fused GEMM1 with masked grouped scheduling.
@@ -678,7 +675,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
             merged_sfa_addrs,
             local_fp4_buf, local_sfa_buf, copy_ready_flags,
             kstripe_profile_buf, kstripe_profile_max_mb,
-            int(copy_only), int(copy_mode))
+            int(copy_only))
 
     runtime = jit_tuner.compile_and_tune(
         name='fused_dispatch_block_copy_gemm1_fp4',
@@ -718,7 +715,6 @@ def fused_dispatch_block_copy_gemm1_fp4(
             ('kstripe_profile_buf', torch.int64),
             ('kstripe_profile_max_mb', int),
             ('copy_only', int),
-            ('copy_mode', int),
         ),
         template=template_gemm_block_copy,
         args=args,
@@ -818,7 +814,6 @@ class BlockCopyDispatchContext:
         out: torch.Tensor = None,
         num_copy_blocks: int = 1,
         k_tiles_per_flag: int = 0,
-        copy_mode: int = 0,
     ) -> BlockCopyRoundResult:
         self._check_stream()
         rhs, _ = rhs_
@@ -875,7 +870,7 @@ class BlockCopyDispatchContext:
             self._num_ranks, local_fp4, local_sfa, copy_ready_flags,
             expected_m=expected_m, num_copy_blocks=num_copy_blocks,
             k_tiles_per_flag=k_tiles_per_flag, configs=configs,
-            copy_mode=copy_mode, masked_m=masked_m)
+            masked_m=masked_m)
         return BlockCopyRoundResult(
             out=out, shape_m=shape_m, expected_m=expected_m,
             block_m=block_m, generation=generation, parity=generation & 1)

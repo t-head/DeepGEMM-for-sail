@@ -875,3 +875,33 @@ compiler 每迭代 load 紧跟 compute+vldcnt(0)。→ iter4 攻这个(hoist loa
 
 **教训:** iter2 单独判"pipeline 中性"过早——kernel 小改需**累计**到超噪声(~5µs)才看得出 pipeline 收益;
 且 quant 确实在关键路径上(Pipeline-no-preproc 0.288→0.285)。ISA 级验证(而非只看 wall-clock)是对的。
+
+---
+
+## 删除 cooperative copy 逻辑 (2026-07-11)
+
+**动机:** copy block 三条搬运策略里 cooperative(copy_mode 1/2)已被多轮实验证伪
+(8卡合搬 +82~180µs,fence/straggler 劣化;wave0 掩盖使其无 wall-clock 收益),生产用 round-robin ncb8。
+彻底删掉这条死路径。
+
+**改动(全链路清 copy_mode):**
+- `fp4_gemm_cutlass3.cuh`:删 `run_copy_block_cooperative` 函数 + 两处 dispatch 的 copy_mode==1/2 分支
+  + `run_fused_dispatch` 的 copy_mode 形参/实参。dispatch 简化为 `if constexpr(KTPF>0)`→kstripe / `else`→basic。
+- `scheduler_cutlass3.cuh`:删 `copy_mode` 字段 + 三个构造器的初始化。
+- `dispatch_fused_gemm.py`:删 copy_mode 整条传参链(模板 arg/arg_defs/两个 API 形参);
+  flag buffer `2*max_total_m_blocks`→`max_total_m_blocks`(done_ctr 上半区只被 cooperative 用,已死)。
+- 测试/脚本:删 COPY_MODE 读取/透传、COPY_MODE_AB A/B benchmark 块、sweep_block_copy.sh 的 copy_mode 轴。
+
+**验证(GPU 3,4,5,6 固定,避开 GPU0 忙/GPU2 E.Process 坑):**
+- 正确性:2卡 + 4卡 × basic(KTPF=0)/kstripe(KTPF=7) 全 `test1_correctness PASSED`,
+  所有 expert vs_cpu/vs_nf = 0.000000(bit-exact)。
+- 性能(4卡,median of 3,对比删除前基线):
+
+  | path | BC kernel-only 基线→后 | best-pipeline 基线→后 |
+  |---|---|---|
+  | basic (KTPF=0) | 0.275→0.274 | 0.317→0.314 |
+  | kstripe (KTPF=7) | 0.264→0.267 | 0.308→0.308 |
+
+  全部 ±3µs(std≈10µs)内 → **无回退**。两条保留 path 功能+性能均正常。
+
+**Verdict:** 纯清理,bit-exact,无性能回退。分支 opt/kernel-copy-gemm-overlap,未 commit。

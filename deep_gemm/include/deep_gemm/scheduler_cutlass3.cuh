@@ -57,10 +57,6 @@ struct TileSchedulerArguments
     uint64_t* kstripe_profile_buf;
     uint32_t kstripe_profile_max_tiles;
 
-    // Copy strategy: 0 = static round-robin (each block owns whole M-blocks),
-    // 1 = cooperative (all blocks co-copy each M-block in order). KTPF=0 only.
-    uint32_t copy_mode;
-
     //
     // Methods
     //
@@ -86,7 +82,6 @@ struct TileSchedulerArguments
         , num_copy_blocks(0)
         , kstripe_profile_buf(nullptr)
         , kstripe_profile_max_tiles(0)
-        , copy_mode(0)
     {
     }
 
@@ -111,7 +106,6 @@ struct TileSchedulerArguments
         , num_copy_blocks(0)
         , kstripe_profile_buf(nullptr)
         , kstripe_profile_max_tiles(0)
-        , copy_mode(0)
     {
     }
 
@@ -131,8 +125,7 @@ struct TileSchedulerArguments
                            volatile uint32_t* copy_ready_flags_,
                            uint32_t num_copy_blocks_,
                            uint64_t* kstripe_profile_buf_ = nullptr,
-                           uint32_t kstripe_profile_max_tiles_ = 0,
-                           uint32_t copy_mode_ = 0)
+                           uint32_t kstripe_profile_max_tiles_ = 0)
         : grouped_layout(grouped_layout_ptr)
         , copy_grouped_layout(copy_grouped_layout_ptr)
         , shape_m(shape_m)
@@ -151,7 +144,6 @@ struct TileSchedulerArguments
         , num_copy_blocks(num_copy_blocks_)
         , kstripe_profile_buf(kstripe_profile_buf_)
         , kstripe_profile_max_tiles(kstripe_profile_max_tiles_)
-        , copy_mode(copy_mode_)
     {
     }
 
