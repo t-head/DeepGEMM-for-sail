@@ -41,8 +41,8 @@ KERNEL_SRCS=(
     "${JIT_KERNELS_DIR}/dispatch_fused_gemm.py"
 )
 
-CONTAINER="sglang.lxh"
-CONTAINER_WS="/DeepGemm_workspace/codebase/DeepGemm-block-copy"
+CONTAINER="sglang0512.lxh"
+CONTAINER_WS="/DeepGemm_workspace/codebase/DeepGemm-block-copy-fusedopt"
 
 set +e
 sudo docker exec -i \

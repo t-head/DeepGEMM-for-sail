@@ -9,11 +9,14 @@
 #     bash sweep_blockcopy.sh 4 0,1,2,3           29600
 #     bash sweep_blockcopy.sh 8 0,1,2,3,4,5,6,7   29700
 #
-# ★ SFA 归因(三个 mode,可用 MODES 覆盖):
-#     base    = DG_SFA_SOURCE=gpu  SKIP_SFA_COPY=0   (当前默认)
+# ★ SFA 归因 + copy 路径(mode,可用 MODES 覆盖):
+#     base    = DG_SFA_SOURCE=gpu  SKIP_SFA_COPY=0                      (当前默认拷贝路径)
 #     skipsfa = DG_SFA_SOURCE=gpu  SKIP_SFA_COPY=1   (copy 侧 SFA 搬运 A/B,输出无效只计时)
 #     host    = DG_SFA_SOURCE=host SKIP_SFA_COPY=0   (GEMM 读侧 SFA A/B,读 host merged_sfa,K-stride=M)
-#   → base vs host 的 mainloop cycle 差 = 读侧代价;base vs skipsfa 的 wait cycle 差 = 搬运暴露。
+#     remote  = DG_BULK_REMOTE=1   SKIP_ISOLATION=1  (P2P A-copy 走专用 remote bulk-DMA,bit-exact,8/4卡 ~-2%)
+#   → base vs host 的 mainloop cycle 差 = 读侧代价;base vs skipsfa 的 wait cycle 差 = 搬运暴露;
+#     base vs remote 的 pipeline 差 = remote bulk-DMA 收益。remote 必须 SKIP_ISOLATION=1(all-local
+#     副本与 remote 指令不兼容,否则 illegal crash)。
 #
 # 采集的 cycle(PASS2 KSTRIPE_PROFILE=1):
 #   - GEMM per-tile:wait / mainloop(→ Overall exposure、每 wave avg_wait/avg_compute、
@@ -42,7 +45,7 @@ NPROC=${1:?need nproc};  DEVS=${2:?need devices csv};  PORT=${3:-29700}
 cd "$(dirname "$0")"
 
 # --- 可用 env 覆盖的矩阵(默认 = 全量;快速验证时收窄)---
-MODES=${MODES:-"base skipsfa host"}    # base|skipsfa|host 的子集
+MODES=${MODES:-"base skipsfa host remote"}    # base|skipsfa|host|remote 的子集
 ROUNDS=${ROUNDS:-3}
 NCB_E0=${NCB_E0-""}              # exact-grid=0 的 ncb 列表(设为空串 NCB_E0='' 可跳过)
 NCB_E1=${NCB_E1-"2 3 4"}             # exact-grid=1 的 ncb 列表(设为空串可跳过)
@@ -66,12 +69,13 @@ preflight() {   # 等目标机器所有卡空闲
 
 run() {   # args: mode exact ncb ktpf profile(0|1)
   local mode=$1 exact=$2 ncb=$3 ktpf=$4 prof=$5
-  local dg skip
+  local dg skip bulk_remote=0 skip_iso=0
   case "$mode" in
     base)    dg=gpu;  skip=0 ;;
     skipsfa) dg=gpu;  skip=1 ;;
     host)    dg=host; skip=0 ;;
-    *) echo "[run] 未知 mode=$mode(用 base|skipsfa|host)"; return 1 ;;
+    remote)  dg=gpu;  skip=0; bulk_remote=1; skip_iso=1 ;;   # 专用 remote bulk-DMA A-copy
+    *) echo "[run] 未知 mode=$mode(用 base|skipsfa|host|remote)"; return 1 ;;
   esac
   local ks_grep
   if [ "$prof" = "1" ]; then
@@ -79,8 +83,9 @@ run() {   # args: mode exact ncb ktpf profile(0|1)
   else
     ks_grep="block_m=.*best ncb|Pipeline \(full\)|Pipeline \(no preprocess\)|Kernel-only \(copy|Pipeline overhead|vs non-fused|Local-only timing|$COMMON_GREP"
   fi
-  echo "@@@ nproc=$NPROC mode=$mode(dg=$dg skip=$skip) exact=$exact ncb=$ncb ktpf=$ktpf profile=$prof port=$PORT TS=$(date '+%H:%M:%S')"
+  echo "@@@ nproc=$NPROC mode=$mode(dg=$dg skip=$skip bulk_remote=$bulk_remote) exact=$exact ncb=$ncb ktpf=$ktpf profile=$prof port=$PORT TS=$(date '+%H:%M:%S')"
   SKIP_CORRECTNESS=1 DG_SFA_SOURCE=$dg SKIP_SFA_COPY=$skip KSTRIPE_PROFILE=$prof \
+    DG_BULK_REMOTE=$bulk_remote SKIP_ISOLATION=$skip_iso \
     K_TILES_PER_FLAG=$ktpf NCB_SWEEP=$ncb FUSED_EXACT_GRID=$exact PERF_VERBOSE=1 \
     CUDA_VISIBLE_DEVICES=$DEVS \
     torchrun --nproc_per_node=$NPROC --master_port=$PORT \

@@ -33,6 +33,11 @@ struct TileSchedulerArguments
     const uint32_t* rank_split_m;
     const uint32_t* rank_counts;
     uint32_t num_ranks;
+    // This GPU's own rank index. rank r's source (rank_addr_a[mb*nr+r]) is LOCAL
+    // iff r == rank_idx (SymBuffer::map offset is 0 for self); all other r are
+    // remote peers. Used by the DG_BULK_REMOTE copy path to pick plain vs remote
+    // load per rank (remote intrinsics are illegal on local addresses).
+    uint32_t rank_idx = 0;
     const uint64_t* remote_addr_sfa;
 
     // Local HBM staging buffer for block-copy

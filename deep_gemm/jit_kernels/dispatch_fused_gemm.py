@@ -93,6 +93,25 @@ launch_dispatch_expert_preprocess_merged<{BLOCK_M}>(
     stream);
 """
 
+# --- Standalone SFA (A-scale) gather/repack preprocess (DG_SFA_PREPROCESS) ---
+# Does the SAME per-M-block SFA gather+repack as the fused copy blocks' inline
+# copy_mblock_sfa, but for ALL M-blocks up front in a dedicated pre-GEMM launch,
+# so the fused GEMM can run skip_sfa_copy=True (copy blocks no longer touch SFA).
+# Lives in fp4_gemm_cutlass3.cuh (single source of truth for the SFA layout).
+template_sfa_preprocess = """
+using namespace deep_gemm;
+
+launch_dispatch_sfa_preprocess<{BLOCK_M}, {NUM_RANKS}>(
+    grouped_layout,
+    reinterpret_cast<const uint64_t*>(rank_addr_sfa),
+    reinterpret_cast<const uint32_t*>(rank_split_m),
+    reinterpret_cast<const uint32_t*>(rank_counts),
+    reinterpret_cast<uint16_t*>(local_sfa_buf),
+    k_scale_blocks, max_tokens_per_expert,
+    num_sms, num_threads,
+    stream);
+"""
+
 # --- Fused Dispatch GEMM1 (block-copy mode) ---
 includes_gemm = ('"../deep_gemm/fp4_gemm_cutlass3.cuh"', )
 
@@ -127,7 +146,8 @@ gemm_t::template run_fused_dispatch<{NUM_RANKS}, {NUM_COPY_BLOCKS}, {K_TILES_PER
     kstripe_profile_max_mb,
     (bool)copy_only,
     (bool)skip_sfa_copy,
-    (bool)sfa_source_host);
+    (bool)sfa_source_host,
+    {RANK_IDX});
 """
 
 # ==============================================================
@@ -555,6 +575,68 @@ def dispatch_expert_preprocess_merged(
     return result + (masked_m,) if return_masked_m else result
 
 
+def dispatch_sfa_preprocess(
+    grouped_layout: torch.Tensor,
+    rank_addr_sfa: torch.Tensor,
+    rank_split_m: torch.Tensor,
+    rank_counts: torch.Tensor,
+    local_sfa_buf: torch.Tensor,
+    num_ranks: int,
+    block_m: int,
+    k_scale_blocks: int,
+    max_tokens_per_expert: int,
+    num_sms: int,
+    num_threads: int = 256,
+) -> None:
+    """Standalone SFA (A-scale) gather/repack for ALL M-blocks (DG_SFA_PREPROCESS).
+
+    Fills ``local_sfa_buf`` exactly as the fused copy blocks' inline
+    ``copy_mblock_sfa`` would (same layout / addressing — one source of truth in
+    fp4_gemm_cutlass3.cuh), but in a single pre-GEMM launch. Lets the fused GEMM
+    run with ``skip_sfa_copy=True`` so its copy blocks no longer do SFA while the
+    GEMM still reads the already-published ``local_sfa_buf`` (default gpu source).
+
+    MUST run on the same stream as — and before — the fused GEMM: kernel-boundary
+    completion makes the ``local_sfa_buf`` writes visible to the GEMM's SFA TMA
+    (L2 domain) with no explicit fence. ``block_m`` MUST equal the fused GEMM's
+    BLOCK_M (rows are placed at m_block_in_expert*BLOCK_M).
+    """
+    assert grouped_layout.dtype == torch.int32
+    assert local_sfa_buf.dtype == torch.uint16
+    global includes_gemm, template_sfa_preprocess
+    args = (grouped_layout, rank_addr_sfa, rank_split_m, rank_counts, local_sfa_buf,
+            int(k_scale_blocks), int(max_tokens_per_expert),
+            int(num_sms), int(num_threads), torch.cuda.current_stream())
+
+    runtime = jit_tuner.compile_and_tune(
+        name='dispatch_sfa_preprocess',
+        keys={
+            'BLOCK_M': block_m,
+            'NUM_RANKS': num_ranks,
+            'BLOCK_N': 1, 'BLOCK_K': 1,
+            'WARP_M': 1, 'WARP_N': 1, 'NUM_STAGES': 1,
+        },
+        space=(),
+        includes=includes_gemm,
+        arg_defs=(
+            ('grouped_layout', torch.int32),
+            ('rank_addr_sfa', torch.int64),
+            ('rank_split_m', torch.int32),
+            ('rank_counts', torch.int32),
+            ('local_sfa_buf', torch.uint16),
+            ('k_scale_blocks', int),
+            ('max_tokens_per_expert', int),
+            ('num_sms', int),
+            ('num_threads', int),
+            ('stream', torch.cuda.Stream),
+        ),
+        template=template_sfa_preprocess,
+        args=args,
+        jit_include_dir='cutlass3',
+    )
+    runtime(*args)
+
+
 def create_block_copy_buffers(num_local_experts, num_ranks, max_tokens_per_expert, hidden_dim, block_m, device):
     """Allocate buffers for block-copy mode: local FP4 + local SFA + per-M-block flags."""
     k_half = hidden_dim // 2
@@ -599,6 +681,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
     skip_sfa_copy: bool = None,
     sfa_source_host: bool = None,
     masked_m: torch.Tensor = None,
+    rank_idx: int = 0,
 ) -> None:
     """Block-copy fused GEMM1 with masked grouped scheduling.
 
@@ -653,6 +736,35 @@ def fused_dispatch_block_copy_gemm1_fp4(
             get_best_configs(tuning_m, tuning_expected_m, n, k, num_groups, num_sms,
                              gemm_type=config_gemm_type)
 
+    # --- Optional config override (opt-in via env; defaults unchanged) ---
+    # block_n 256->512 halves N_blocks -> halves wave count (288->144 tiles /
+    # 36 SM = 8->4 waves; compute unchanged, bit-exact). Enable with
+    # FUSED_BLOCK_N=512. Only valid at block_m==128 + warp_n=64: smem = 262016 <
+    # ppu cap 262144, and warp_iter_num_sfb <= 4 (fp4_gemm_cutlass3.cuh:2124).
+    # Measured 8-GPU prod (ncb=3): pipeline 0.292->0.264ms (-9.6%, 3-run stable).
+    # Set FUSED_BLOCK_N=512 FUSED_WARP_N=64 together; copy path (A only) is untouched.
+    _bn_ovr = int(os.getenv('FUSED_BLOCK_N', '0'))
+    _bm_ovr = int(os.getenv('FUSED_BLOCK_M', '0'))
+    _st_ovr = int(os.getenv('FUSED_STAGES', '0'))
+    _wn_ovr = int(os.getenv('FUSED_WARP_N', '0'))
+    if _bn_ovr > 0 or _bm_ovr > 0 or _st_ovr > 0 or _wn_ovr > 0:
+        if _bn_ovr > 0:
+            block_n = _bn_ovr
+        if _bm_ovr > 0:
+            block_m = _bm_ovr
+        if _st_ovr > 0:
+            num_stages = _st_ovr
+        if _wn_ovr > 0:
+            warp_n = _wn_ovr
+        from .gemm_fp4 import get_smem_config_fp4
+        smem_config = get_smem_config_fp4(num_stages=num_stages, block_m=block_m,
+                                          block_n=block_n, warp_m=warp_m, warp_n=warp_n,
+                                          block_k=block_k)
+        if int(os.getenv('FUSED_CFG_VERBOSE', '0')):
+            print(f"[FUSED_CFG_OVERRIDE] block_m={block_m} block_n={block_n} "
+                  f"block_k={block_k} warp_m={warp_m} warp_n={warp_n} "
+                  f"stages={num_stages} smem={smem_config[0]}", flush=True)
+
     bias = torch.empty(0, dtype=torch.float32, device=rhs.device)
 
     # Diagnostic A/B: DG_SFA_SOURCE=host makes the GEMM read ptr_scale_A from the
@@ -692,6 +804,25 @@ def fused_dispatch_block_copy_gemm1_fp4(
     if skip_sfa_copy is None:
         skip_sfa_copy = int(os.getenv('SKIP_SFA_COPY', '0')) != 0
 
+    # DG_SFA_PREPROCESS: hoist the GPU-side SFA gather/repack out of the fused
+    # copy blocks into a dedicated pre-GEMM kernel. Fill local_sfa_buf for all
+    # M-blocks up front (same stream -> visible to the GEMM's SFA TMA), then run
+    # the fused GEMM with skip_sfa_copy=True so its copy blocks no longer touch
+    # SFA. The GEMM still reads local_sfa_buf (default gpu source), so output
+    # stays valid. Motivation: on high-latency machines SFA's short strided
+    # remote reads are exposed on the fused critical path as a serial tail after
+    # the FP4 copy; a separate kernel lets them complete/overlap before the GEMM.
+    # Orthogonal, host-side only (no GEMM recompile). Mutually exclusive with the
+    # host SFA source (which reads remote_addr_sfa, not local_sfa_buf).
+    if os.getenv('DG_SFA_PREPROCESS', '0') != '0' and not sfa_source_host:
+        dispatch_sfa_preprocess(
+            grouped_layout, rank_addr_sfa, rank_split_m, rank_counts, local_sfa_buf,
+            num_ranks=num_ranks, block_m=block_m,
+            k_scale_blocks=ceil_div(k, 32),
+            max_tokens_per_expert=max_tokens_per_expert,
+            num_sms=num_sms)
+        skip_sfa_copy = True
+
     args = (rhs, rhs_scales, bias, out, gemm_shape_m,
             grouped_layout, masked_m,
             max_tokens_per_expert,
@@ -711,6 +842,7 @@ def fused_dispatch_block_copy_gemm1_fp4(
             'NUM_GROUPS': num_groups,
             'NUM_STAGES': num_stages,
             'NUM_RANKS': num_ranks,
+            'RANK_IDX': rank_idx,
             'NUM_COPY_BLOCKS': num_copy_blocks,
             'K_TILES_PER_FLAG': k_tiles_per_flag,
             'GEMM_TYPE': jit_gemm_type,
@@ -897,7 +1029,7 @@ class BlockCopyDispatchContext:
             self._num_ranks, local_fp4, local_sfa, copy_ready_flags,
             expected_m=expected_m, num_copy_blocks=num_copy_blocks,
             k_tiles_per_flag=k_tiles_per_flag, configs=configs,
-            masked_m=masked_m)
+            masked_m=masked_m, rank_idx=self._rank_idx)
         return BlockCopyRoundResult(
             out=out, shape_m=shape_m, expected_m=expected_m,
             block_m=block_m, generation=generation, parity=generation & 1)

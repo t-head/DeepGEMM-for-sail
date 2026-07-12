@@ -140,6 +140,35 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
         if 'w4a16' in lower_name:
             nvcc_flags.extend(['-mllvm', '-sort-copy-before-coalesce'])
 
+    # Opt-in: use PPU bulk-DMA (swizzled) 128-bit read/write for the warp-aligned
+    # body of the P2P FP4 A-copy. Off by default; changes the JIT signature so A/B
+    # builds don't collide in the cache.
+    if os.getenv('DG_BULK_COPY', '0') != '0':
+        nvcc_flags.append('-DDG_BULK_COPY')
+        # Store cache level for the bulk copy: default .cg (L2); DG_BULK_STWB=1
+        # switches to write-back (stwb), the highest level.
+        if os.getenv('DG_BULK_STWB', '0') != '0':
+            nvcc_flags.append('-DDG_BULK_STWB')
+
+    # Opt-in (independent of DG_BULK_COPY): use PPU dedicated remote bulk-load
+    # (__ppu_remote_load_bulk_*) for the P2P copy's REMOTE-rank reads only; the
+    # local rank (r==rank_idx) keeps plain __ldg (remote intrinsics are illegal on
+    # local addresses). Store stays plain. Targets the still-exposed remote-read
+    # cost that the generic bulk swizzle did not reduce.
+    if os.getenv('DG_BULK_REMOTE', '0') != '0':
+        nvcc_flags.append('-DDG_BULK_REMOTE')
+
+    # Opt-in: store SFA (A-scale) in the symmetric buffer ROW-MAJOR [max_tokens, ksb]
+    # (each token's ksb scales contiguous) instead of column-major [ksb, max_tokens].
+    # The block-copy remote SFA read then becomes one contiguous burst per rank
+    # (was ksb=112 strided segments — the "carved + strided" latency cost that hurts
+    # high-latency machines); the strided repack lands on the cheap local store, and
+    # the GEMM's column-major local_sfa_buf read is unchanged. Layout is a writer/
+    # reader/addresser contract, so this macro must apply to ALL kernels that touch
+    # the sym-buffer scale (quant, expert_preprocess, fp4_gemm copy) together.
+    if os.getenv('DG_SFA_ROWMAJOR_SRC', '0') != '0':
+        nvcc_flags.append('-DDG_SFA_ROWMAJOR_SRC')
+
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi', '-fconcepts']
     flags = [*nvcc_flags, f'--compiler-options={",".join(cxx_flags)}']
     include_dirs = [get_jit_include_dir()]

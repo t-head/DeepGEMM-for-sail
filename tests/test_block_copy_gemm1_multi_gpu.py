@@ -83,6 +83,16 @@ SKIP_CORRECTNESS = int(os.getenv('SKIP_CORRECTNESS', '0'))
 SKIP_PERFORMANCE = int(os.getenv('SKIP_PERFORMANCE', '0'))
 RUN_RANK_SKEW = int(os.getenv('RUN_RANK_SKEW', '0'))
 SKIP_ISOLATION = int(os.getenv('SKIP_ISOLATION', '0'))
+# The all-local P2P isolation experiment replaces every rank_addr_a with a LOCAL
+# copy. That is fundamentally incompatible with DG_BULK_REMOTE, whose copy loop
+# issues remote-only intrinsics for peer ranks (r != rank_idx) — running them on a
+# local address is illegal (illegal memory access → crash). So when the kernel is
+# built with DG_BULK_REMOTE, force-skip isolation regardless of the env value.
+if int(os.getenv('DG_BULK_REMOTE', '0')) != 0 and not SKIP_ISOLATION:
+    SKIP_ISOLATION = 1
+    print("[test] DG_BULK_REMOTE set -> forcing SKIP_ISOLATION=1 "
+          "(remote intrinsics can't run on the all-local isolation buffers)",
+          flush=True)
 COL_MAJOR_SCALE = int(os.getenv('COL_MAJOR_SCALE', '1'))
 PAD_ALIGN = 1  # expert packing has no artificial token alignment
 # Fused dispatch GEMM1 is masked-only; the NoPad fused path has been removed.
@@ -469,10 +479,20 @@ def test_correctness(rank, world_size, group, device):
         seed = 77 + round_idx * 1000 + rank
         torch.manual_seed(seed)
         x = generate_test_input(num_tokens, hidden, device)
-        scores = torch.randn(
-            num_tokens, num_total_experts, dtype=torch.float32, device=device)
-        topk_ids = torch.topk(
-            scores, topk, dim=-1, largest=True, sorted=False)[1].to(torch.int32)
+        if int(os.getenv('UNIFORM_ROUTING', '0')):
+            # Uniform round-robin routing (each expert ~128 tokens => block_m=128),
+            # matching the perf section. round_idx offset keeps each round's routing
+            # distinct (satisfies the no-reuse guard) while staying uniform. Lets us
+            # validate configs whose smem only fits at block_m=128 (e.g. block_n=512).
+            token_idx = torch.arange(num_tokens, device=device, dtype=torch.int32)
+            topk_ids = torch.stack(
+                [(token_idx * topk + j + round_idx) % num_total_experts
+                 for j in range(topk)], dim=1).to(torch.int32)
+        else:
+            scores = torch.randn(
+                num_tokens, num_total_experts, dtype=torch.float32, device=device)
+            topk_ids = torch.topk(
+                scores, topk, dim=-1, largest=True, sorted=False)[1].to(torch.int32)
         if previous_x is not None:
             if torch.equal(x, previous_x):
                 raise AssertionError(f"round {round_idx + 1} reused the previous input")
@@ -599,11 +619,19 @@ def test_correctness(rank, world_size, group, device):
                 scale_off = (
                     data_base + metadata_bytes + fp4_region_size +
                     ge * scale_elems_per_expert * 2)
-                src_scale = all_sym_bufs[src_rank][
+                src_scale_flat = all_sym_bufs[src_rank][
                     scale_off:scale_off + scale_elems_per_expert * 2
-                ].cpu().view(torch.uint16).view(
-                    k_scale_blocks, max_tokens)
-                scale_u8 = src_scale[:, :count_r].T.contiguous().view(
+                ].cpu().view(torch.uint16)
+                if os.getenv('DG_SFA_ROWMAJOR_SRC', '0') != '0':
+                    # Row-major source [max_tokens, k_scale_blocks]: each token's
+                    # ksb scales contiguous -> first count_r rows are this expert's.
+                    scale_pairs = src_scale_flat.view(
+                        max_tokens, k_scale_blocks)[:count_r, :]  # [count_r, ksb]
+                else:
+                    # Column-major source [k_scale_blocks, max_tokens].
+                    scale_pairs = src_scale_flat.view(
+                        k_scale_blocks, max_tokens)[:, :count_r].T  # [count_r, ksb]
+                scale_u8 = scale_pairs.contiguous().view(
                     torch.uint8).view(count_r, k_blocks)
                 A_rows.append(dequantize_fp4_torch(fp4_r, scale_u8))
             A = torch.cat(A_rows, dim=0)
@@ -829,11 +857,29 @@ def test_performance(rank, world_size, group, device):
 
     # ---- Benchmark non-fused (pipeline throughput) ----
     fixed_expected_m = max(int(pc.max().item()), 1)
+    # FORCE_EXPECTED_M must steer the non-fused path too. It already forces the
+    # FUSED block_m (get_gemm_configs), so if the non-fused kept its own real
+    # expected_m the "vs non-fused" ratio would compare fused@block_m=256 against
+    # non-fused@block_m=128 — an unfair cross-block_m comparison. Apply it
+    # symmetrically so both sides tune to the same expected_m -> same block_m.
+    # (configs are passed explicitly and pc2 carries the real per-expert counts,
+    # so steering expected_m only changes tile selection, not the work done.)
+    _force_em = int(os.getenv('FORCE_EXPECTED_M', '0'))
+    if _force_em > 0:
+        fixed_expected_m = _force_em
     nf_block_m = int(os.getenv('NF_BLOCK_M', '128'))
+    nf_block_n = int(os.getenv('NF_BLOCK_N', '0'))  # apple-to-apple: force NF block_n (e.g. 512)
     if nf_block_m > 0:
         nf_configs = get_best_configs_fp4(
             fixed_expected_m * num_local_experts, fixed_expected_m, N, hidden // 2,
             num_local_experts, get_num_sms(), gemm_type=GemmType.GroupedNoPad)
+        if nf_block_n > 0:
+            # Give NF the same block_n lever as fused (warp_n=64 keeps sfb iter<=4).
+            from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
+            _s, _bm, _bn, _bk, _wm, _wn, _st, _sm = nf_configs
+            _sm = get_smem_config_fp4(num_stages=_st, block_m=_bm, block_n=nf_block_n,
+                                      warp_m=_wm, warp_n=64, block_k=_bk)
+            nf_configs = (_s, _bm, nf_block_n, _bk, _wm, 64, _st, _sm)
     else:
         nf_configs = None
     if rank == 0:
@@ -997,7 +1043,7 @@ def test_performance(rank, world_size, group, device):
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                merged_sfa_addrs=merged_sfa_addrs, rank_idx=rank)
         torch.cuda.synchronize()
 
         # Benchmark: full pipeline (quant + preprocess + block-copy GEMM)
@@ -1021,7 +1067,7 @@ def test_performance(rank, world_size, group, device):
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                merged_sfa_addrs=merged_sfa_addrs, rank_idx=rank)
             bc_end_events[i].record(stream)
         torch.cuda.synchronize()
         bc_t = sorted([s.elapsed_time(e) for s, e in zip(bc_start_events, bc_end_events)])
@@ -1160,7 +1206,7 @@ def test_performance(rank, world_size, group, device):
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                merged_sfa_addrs=merged_sfa_addrs, rank_idx=rank)
         torch.cuda.synchronize()
 
         np_start = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
@@ -1178,7 +1224,7 @@ def test_performance(rank, world_size, group, device):
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                merged_sfa_addrs=merged_sfa_addrs, rank_idx=rank)
             np_end[i].record(stream)
         torch.cuda.synchronize()
         np_times = sorted([np_start[i].elapsed_time(np_end[i]) for i in range(num_iters)])
@@ -1194,7 +1240,7 @@ def test_performance(rank, world_size, group, device):
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                merged_sfa_addrs=merged_sfa_addrs, rank_idx=rank)
         torch.cuda.synchronize()
         bc_kernel_times = []
         for _ in range(pipe_iters):
@@ -1207,7 +1253,7 @@ def test_performance(rank, world_size, group, device):
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                merged_sfa_addrs=merged_sfa_addrs)
+                merged_sfa_addrs=merged_sfa_addrs, rank_idx=rank)
             ev_e.record()
             bc_kernel_times.append((ev_s, ev_e))
         torch.cuda.synchronize()
@@ -1236,7 +1282,7 @@ def test_performance(rank, world_size, group, device):
                     expert_shape_m, max_tokens, world_size,
                     expected_m=expert_expected_m,
                     local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                    num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG)
+                    num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG, rank_idx=rank)
             torch.cuda.synchronize()
             ks_ev0 = torch.cuda.Event(enable_timing=True)
             ks_ev1 = torch.cuda.Event(enable_timing=True)
@@ -1247,7 +1293,7 @@ def test_performance(rank, world_size, group, device):
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                 num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,
-                kstripe_profile_buf=ks_prof_buf)
+                kstripe_profile_buf=ks_prof_buf, rank_idx=rank)
             ks_ev1.record()
             torch.cuda.synchronize()
             ks_wall_us = ks_ev0.elapsed_time(ks_ev1) * 1000.0
@@ -1325,7 +1371,7 @@ def test_performance(rank, world_size, group, device):
                         expected_m=expert_expected_m,
                         local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                         num_copy_blocks=ncb, k_tiles_per_flag=0,
-                        copy_only=True)
+                        copy_only=True, rank_idx=rank)
                 torch.cuda.synchronize()
                 evs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
                        for _ in range(bw_iters)]
@@ -1337,7 +1383,7 @@ def test_performance(rank, world_size, group, device):
                         expected_m=expert_expected_m,
                         local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
                         num_copy_blocks=ncb, k_tiles_per_flag=0,
-                        copy_only=True)
+                        copy_only=True, rank_idx=rank)
                     e.record(stream)
                 torch.cuda.synchronize()
                 ts = sorted([s.elapsed_time(e) for s, e in evs])
@@ -1374,7 +1420,7 @@ def test_performance(rank, world_size, group, device):
                 expert_shape_m, max_tokens, world_size,
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG, rank_idx=rank,)
         torch.cuda.synchronize()
 
         local_kernel_times = []
@@ -1387,7 +1433,7 @@ def test_performance(rank, world_size, group, device):
                 expert_shape_m, max_tokens, world_size,
                 expected_m=expert_expected_m,
                 local_fp4_buf=bc_fp4_perf, local_sfa_buf=bc_sfa_perf, copy_ready_flags=bc_flags_perf,
-                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG,)
+                num_copy_blocks=best_ncb, k_tiles_per_flag=K_TILES_PER_FLAG, rank_idx=rank,)
             ev_e.record()
             local_kernel_times.append((ev_s, ev_e))
         torch.cuda.synchronize()
@@ -1548,7 +1594,7 @@ def test_kstripe_profile(rank, world_size, group, device):
             shape_m, max_tokens, world_size,
             expected_m=expert_expected_m,
             local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
-            num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,)
+            num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG, rank_idx=rank,)
     torch.cuda.synchronize()
 
     NUM_ITERS = 20
@@ -1561,7 +1607,7 @@ def test_kstripe_profile(rank, world_size, group, device):
             shape_m, max_tokens, world_size,
             expected_m=expert_expected_m,
             local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
-            num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,)
+            num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG, rank_idx=rank,)
     end_evt.record()
     torch.cuda.synchronize()
     kernel_ms = start_evt.elapsed_time(end_evt) / NUM_ITERS
@@ -1573,7 +1619,7 @@ def test_kstripe_profile(rank, world_size, group, device):
         expected_m=expert_expected_m,
         local_fp4_buf=bc_fp4, local_sfa_buf=bc_sfa, copy_ready_flags=bc_flags,
         num_copy_blocks=NUM_COPY_BLOCKS, k_tiles_per_flag=K_TILES_PER_FLAG,
-        kstripe_profile_buf=profile_buf)
+        kstripe_profile_buf=profile_buf, rank_idx=rank)
     torch.cuda.synchronize()
 
     prof = profile_buf.cpu().numpy()

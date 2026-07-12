@@ -231,7 +231,15 @@ __global__ void mxfp4_quantize_kernel(
 
             uint16_t* scale_out = layout.scale_ptr(sym_buf_base, expert_idx);
             for (int j = threadIdx.x; j < K_SCALE_BLOCKS; j += blockDim.x) {
+#ifdef DG_SFA_ROWMAJOR_SRC
+                // Row-major [max_tokens, ksb]: this token's ksb scales are stored
+                // contiguously, so the block-copy remote read is one contiguous
+                // burst per rank instead of ksb strided segments. (This write is
+                // also contiguous per token, vs the strided column-major write.)
+                scale_out[static_cast<int64_t>(slot) * K_SCALE_BLOCKS + j] = s_packed_scale[j];
+#else
                 scale_out[static_cast<int64_t>(j) * max_tokens_per_expert + slot] = s_packed_scale[j];
+#endif
             }
         }
         // No __syncthreads() needed: s_fp4_v, s_packed_scale, s_expert, s_slot are all read-only here

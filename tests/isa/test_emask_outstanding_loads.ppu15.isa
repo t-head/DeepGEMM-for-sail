@@ -1,0 +1,167 @@
+test_emask_outstanding_loads:	file format elf64-x86-64
+
+ELF FILE 1:
+
+
+Disassembly of section .text:
+
+0000000000000000 <.text>:
+       0: 00 00 00 00 00 00 00 08      	s.nop
+       8: 00 00 00 00 00 00 00 08      	s.nop
+      10: 00 00 00 00 00 00 00 08      	s.nop
+      18: 00 00 00 00 00 00 00 08      	s.nop
+      20: 00 00 00 00 00 00 00 08      	s.nop
+      28: 00 00 00 00 00 00 00 08      	s.nop
+      30: 00 00 00 00 00 00 00 08      	s.nop
+      38: 00 00 00 00 00 00 00 08      	s.nop
+      40: 00 00 00 00 00 00 00 08      	s.nop
+      48: 00 00 00 00 00 00 00 08      	s.nop
+      50: 00 00 00 00 00 00 00 08      	s.nop
+      58: 00 00 00 00 00 00 00 08      	s.nop
+      60: 00 00 00 00 00 00 00 08      	s.nop
+      68: 00 00 00 00 00 00 00 08      	s.nop
+      70: 00 00 00 00 00 00 00 08      	s.nop
+      78: 00 00 00 00 00 00 00 08      	s.nop
+
+Disassembly of section .text.kernel._Z21predicated_load_storePK5uint4PS_jjjjjjjj:
+
+0000000000000000 <_Z21predicated_load_storePK5uint4PS_jjjjjjjj>:
+; _Z21predicated_load_storePK5uint4PS_jjjjjjjj():
+; /tmp/test_emask_outstanding_loads.cu:27
+       0: 00 00 00 00 20 40 80 56      	v.mov.alllane.b32	vreg1, 0x0
+       8: 00 00 00 00 20 80 80 56      	v.mov.alllane.b32	vreg2, 0x0
+; /tmp/test_emask_outstanding_loads.cu:28
+      10: 00 00 00 00 00 c9 c0 57      	v.tid.init	vreg3, sreg[36:37]
+      18: ff 0f 00 00 e0 c0 00 9a      	v.and.b32	vreg3, vreg3, 0xfff
+; /tmp/test_emask_outstanding_loads.cu:47
+      20: 00 80 80 01 82 02 d2 bf      	v.cmp.gt.u32	sreg2, sreg10, vreg3.reuse
+      28: 00 80 82 01 82 03 d2 bf      	v.cmp.gt.u32	sreg10, sreg14, vreg3.reuse
+      30: 00 c0 80 01 c2 02 d2 bf      	v.cmp.gt.u32	sreg3, sreg11, vreg3.reuse
+      38: 00 00 81 01 02 03 d2 bf      	v.cmp.gt.u32	sreg4, sreg12, vreg3.reuse
+      40: 00 40 81 01 40 03 d2 bf      	v.cmp.gt.u32	sreg5, sreg13, vreg3
+      48: 00 20 00 00 80 80 03 1c      	s.lop.emsk	sreg14, sreg2 # 0x8
+      50: c9 00 04 00 e0 00 01 c9      	vmem.ld.b32x4.kp1	vreg[4:7], [0x0 + vreg3 * 0x10] @sreg[6:7]
+      58: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+      60: 00 c0 82 01 c2 03 d2 bf      	v.cmp.gt.u32	sreg11, sreg15, vreg3.reuse
+      68: 00 00 83 01 00 04 d2 bf      	v.cmp.gt.u32	sreg12, sreg16, vreg3
+      70: 00 20 00 00 c0 80 03 1c      	s.lop.emsk	sreg14, sreg3 # 0x8
+      78: c9 00 04 20 e0 00 02 c9      	vmem.ld.b32x4.kp1	vreg[8:11], [0x200 + vreg3 * 0x10] @sreg[6:7]
+      80: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+      88: 00 40 83 01 40 04 d2 bf      	v.cmp.gt.u32	sreg13, sreg17, vreg3
+      90: 00 20 00 00 00 81 03 1c      	s.lop.emsk	sreg14, sreg4 # 0x8
+      98: c9 00 04 40 e0 00 03 c9      	vmem.ld.b32x4.kp1	vreg[12:15], [0x400 + vreg3 * 0x10] @sreg[6:7]
+      a0: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+      a8: 00 20 00 00 40 81 03 1c      	s.lop.emsk	sreg14, sreg5 # 0x8
+      b0: c9 00 04 60 e0 00 04 c9      	vmem.ld.b32x4.kp1	vreg[16:19], [0x600 + vreg3 * 0x10] @sreg[6:7]
+      b8: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+      c0: 00 20 00 00 80 82 03 1c      	s.lop.emsk	sreg14, sreg10 # 0x8
+      c8: c9 00 04 81 e0 00 05 c9      	vmem.ld.b32x4.kp1	vreg[20:23], [0x810 + vreg3 * 0x10] @sreg[6:7]
+      d0: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+      d8: 00 20 00 00 c0 82 03 1c      	s.lop.emsk	sreg14, sreg11 # 0x8
+      e0: c9 00 44 81 e0 00 06 c9      	vmem.ld.b32x4.kp1	vreg[24:27], [0x814 + vreg3 * 0x10] @sreg[6:7]
+      e8: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+      f0: 00 20 00 00 00 83 03 1c      	s.lop.emsk	sreg14, sreg12 # 0x8
+      f8: c9 00 84 81 e0 00 07 c9      	vmem.ld.b32x4.kp1	vreg[28:31], [0x818 + vreg3 * 0x10] @sreg[6:7]
+     100: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+     108: 00 20 00 00 40 83 03 1c      	s.lop.emsk	sreg14, sreg13 # 0x8
+     110: c9 00 c4 81 e0 00 08 c9      	vmem.ld.b32x4.kp1	vreg[32:35], [0x81c + vreg3 * 0x10] @sreg[6:7]
+     118: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+     120: 00 20 00 00 80 80 03 1c      	s.lop.emsk	sreg14, sreg2 # 0x8
+     128: 00 00 c0 01 00 00 c4 08      	s.wait	vldcnt(7)
+     130: 08 01 04 00 e0 00 01 cd      	vmem.st.b32x4	vreg[4:7], [0x0 + vreg3 * 0x10] @sreg[8:9]
+     138: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+     140: 00 20 00 00 c0 80 03 1c      	s.lop.emsk	sreg14, sreg3 # 0x8
+     148: 00 00 80 01 00 00 c4 08      	s.wait	vldcnt(6)
+     150: 08 01 04 20 e0 00 02 cd      	vmem.st.b32x4	vreg[8:11], [0x200 + vreg3 * 0x10] @sreg[8:9]
+     158: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+     160: 00 20 00 00 00 81 03 1c      	s.lop.emsk	sreg14, sreg4 # 0x8
+     168: 00 00 40 01 00 00 c4 08      	s.wait	vldcnt(5)
+     170: 08 01 04 40 e0 00 03 cd      	vmem.st.b32x4	vreg[12:15], [0x400 + vreg3 * 0x10] @sreg[8:9]
+     178: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+     180: 00 20 00 00 40 81 03 1c      	s.lop.emsk	sreg14, sreg5 # 0x8
+     188: 00 00 00 01 00 00 c4 08      	s.wait	vldcnt(4)
+     190: 08 01 04 60 e0 00 04 cd      	vmem.st.b32x4	vreg[16:19], [0x600 + vreg3 * 0x10] @sreg[8:9]
+     198: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+     1a0: 00 20 00 00 80 82 03 1c      	s.lop.emsk	sreg14, sreg10 # 0x8
+     1a8: 00 00 c0 00 00 00 c4 08      	s.wait	vldcnt(3)
+     1b0: 08 01 04 81 e0 00 05 cd      	vmem.st.b32x4	vreg[20:23], [0x810 + vreg3 * 0x10] @sreg[8:9]
+     1b8: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+     1c0: 00 20 00 00 c0 82 03 1c      	s.lop.emsk	sreg14, sreg11 # 0x8
+     1c8: 00 00 80 00 00 00 c4 08      	s.wait	vldcnt(2)
+     1d0: 08 01 44 81 e0 00 06 cd      	vmem.st.b32x4	vreg[24:27], [0x814 + vreg3 * 0x10] @sreg[8:9]
+     1d8: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+     1e0: 00 20 00 00 00 83 03 1c      	s.lop.emsk	sreg14, sreg12 # 0x8
+     1e8: 00 00 40 00 00 00 c4 08      	s.wait	vldcnt(1)
+     1f0: 08 01 84 81 e0 00 07 cd      	vmem.st.b32x4	vreg[28:31], [0x818 + vreg3 * 0x10] @sreg[8:9]
+     1f8: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+     200: 00 20 00 00 40 83 03 1c      	s.lop.emsk	sreg14, sreg13 # 0x8
+     208: 00 00 00 00 00 00 c4 08      	s.wait	vldcnt(0)
+     210: 08 01 c4 81 e0 00 08 cd      	vmem.st.b32x4	vreg[32:35], [0x81c + vreg3 * 0x10] @sreg[8:9]
+     218: 00 00 00 07 00 3c 7c 26      	s.or.b32	emsk, emsk, sreg14
+; /tmp/test_emask_outstanding_loads.cu:86
+     220: 00 00 00 00 00 00 80 7f      	simt.exit
+
+0000000000000228 <BB0_1>:
+; BB0_1():
+     228: 00 00 00 00 00 00 00 08      	s.nop
+     230: fe ff 0f 30 20 00 00 09      	s.cbr	0xffffe <BB0_1>
+     238: 00 00 00 00 00 00 00 08      	s.nop
+     240: 00 00 00 00 00 00 00 08      	s.nop
+     248: 00 00 00 00 00 00 00 08      	s.nop
+     250: 00 00 00 00 00 00 00 08      	s.nop
+     258: 00 00 00 00 00 00 00 08      	s.nop
+     260: 00 00 00 00 00 00 00 08      	s.nop
+     268: 00 00 00 00 00 00 00 08      	s.nop
+     270: 00 00 00 00 00 00 00 08      	s.nop
+     278: 00 00 00 00 00 00 00 08      	s.nop
+     280: 00 00 00 00 00 00 00 08      	s.nop
+     288: 00 00 00 00 00 00 00 08      	s.nop
+     290: 00 00 00 00 00 00 00 08      	s.nop
+     298: 00 00 00 00 00 00 00 08      	s.nop
+     2a0: 00 00 00 00 00 00 00 08      	s.nop
+     2a8: 00 00 00 00 00 00 00 08      	s.nop
+     2b0: 00 00 00 00 00 00 00 08      	s.nop
+     2b8: 00 00 00 00 00 00 00 08      	s.nop
+     2c0: 00 00 00 00 00 00 00 08      	s.nop
+     2c8: 00 00 00 00 00 00 00 08      	s.nop
+
+.debug_line contents:
+debug_line[0x00000000]
+Line table prologue:
+    total_length: 0x00000066
+          format: DWARF32
+         version: 4
+ prologue_length: 0x00000037
+ min_inst_length: 4
+max_ops_per_inst: 1
+ default_is_stmt: 1
+       line_base: -5
+      line_range: 14
+     opcode_base: 13
+standard_opcode_lengths[DW_LNS_copy] = 0
+standard_opcode_lengths[DW_LNS_advance_pc] = 1
+standard_opcode_lengths[DW_LNS_advance_line] = 1
+standard_opcode_lengths[DW_LNS_set_file] = 1
+standard_opcode_lengths[DW_LNS_set_column] = 1
+standard_opcode_lengths[DW_LNS_negate_stmt] = 0
+standard_opcode_lengths[DW_LNS_set_basic_block] = 0
+standard_opcode_lengths[DW_LNS_const_add_pc] = 0
+standard_opcode_lengths[DW_LNS_fixed_advance_pc] = 1
+standard_opcode_lengths[DW_LNS_set_prologue_end] = 0
+standard_opcode_lengths[DW_LNS_set_epilogue_begin] = 0
+standard_opcode_lengths[DW_LNS_set_isa] = 1
+file_names[  1]:
+           name: "test_emask_outstanding_loads.cu"
+      dir_index: 0
+       mod_time: 0x00000000
+         length: 0x00000000
+
+Address            Line   Column File   ISA Discriminator Flags
+------------------ ------ ------ ------ --- ------------- -------------
+0x0000000000000000     27      0      1   0             0  is_stmt
+0x0000000000000010     28     31      1   0             0  is_stmt prologue_end
+0x0000000000000020     47      5      1   0             0  is_stmt
+0x0000000000000220     86      1      1   0             0  is_stmt
+0x0000000000000228      0      1      1   0             0 
+0x00000000000002d0      0      1      1   0             0  end_sequence
+

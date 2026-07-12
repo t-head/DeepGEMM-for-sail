@@ -24,3 +24,13 @@ tmp/
 __pycache__/
 _bench_output.txt
 trajectory/
+
+# compiled extension / build artifacts (do not commit)
+*.so
+
+# test/bench output logs and stray artifacts (do not commit)
+*.log
+fusedopt_logs/
+sfa_8card_logs/
+logs/
+*.patch

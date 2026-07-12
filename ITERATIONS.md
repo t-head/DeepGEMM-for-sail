@@ -905,3 +905,299 @@ compiler 每迭代 load 紧跟 compute+vldcnt(0)。→ iter4 攻这个(hoist loa
   全部 ±3µs(std≈10µs)内 → **无回退**。两条保留 path 功能+性能均正常。
 
 **Verdict:** 纯清理,bit-exact,无性能回退。分支 opt/kernel-copy-gemm-overlap,未 commit。
+
+---
+
+# 新仓库 DeepGemm-block-copy-fusedopt (2026-07-11, 分支 opt/fused-copy-block-gemm)
+
+基线 (8卡 prod, d3e85f0): pipeline **0.291ms/0.87x** (ncb=3); kernel-only BC=0.249 / all-local=0.231 / NF=0.194ms; P2P +0.018ms; pre-GEMM(quant+preproc)=0.043ms 暴露。
+
+## Iter A — block_n 256→512 减半 wave (不支持, 失败)
+
+- **假设:** GEMM tile 数 = (M/bm)×(N/bn) = (1536/128)×(6144/256) = 12×24 = 288 tiles;
+  36 GEMM SM (39-ncb3) → 288/36 = 8 整 wave。NF 用 bm=256 只 4 wave。
+  增大 block_n 256→512 → 12×12=144 tiles/36 = 4 wave, 计算量不变但 wave 减半。
+- **改动:** dispatch_fused_gemm.py 加 FUSED_BLOCK_N/FUSED_STAGES/FUSED_WARP_N env 覆盖 + 重算 smem (保留为实验基础设施, 不改默认)。
+- **结果:** **编译失败**。fp4_gemm_cutlass3.cuh:2237 static_assert 硬限制 `BlockN ∈ {16,32,64,128,256}` (CUTE tile 层)。512 不支持; smem 也 314432 过大。
+- **附带发现:** 2卡时 get_best_configs 给 block_m=256 (随 M 变); 8卡 prod expected_m=128 → block_m=128。
+- **结论:** block_n 上限 256, 此路不通。
+
+## 关键瓶颈定性 (代码+算术, 非盲目)
+
+- 8卡 fused GEMM 的 **288 tiles / 8 wave 是结构性下界**: m_blocks=12 (=expert数×ceil(128/128), 硬定)、
+  n_blocks=24 (block_n≤256 锁死)、SM=39 固定。
+- **回收 idle copy SM 无效** (印证 iter1/iter10 失败): ceil(288/39)=8 wave 仍=8, SM 36→39 不减 wave。
+- NF 快在 block_m=256 (GroupedContiguous 打包无 padding) → 只 4 wave。fused masked 不能用 bm=256 (per-expert M=128 会 2x padding)。
+- **根治需 GroupedContiguous 大改** (消 per-expert padding 才能 bm=256 减 wave), 超出单次 config 调优。
+- 剩余 kernel 内可探索: wave 内 MMA/smem 利用率 (需 profile); pre-GEMM launch overhead (memory 显示已榨, 见 project_preprocess_fusion)。
+
+## Iter B — block_n 256→512 (放宽 assert, warp_n=64, 4 wave) ★重大正面★
+
+- **假设:** GEMM 288 tiles/8 wave 结构性慢。block_n 256→512 → n_blocks 24→12 → 144 tiles/36 SM = **4 wave** (计算量不变)。
+- **突破口:** block_n>256 只被 `static_assert(BlockN≤256)` (fp4_gemm_cutlass3.cuh:2237) 挡; smem 上限 ppu_capacity=262144, 而 bm128/bn512/st3 = **262016 < 262144 (刚好放得下)**。
+- **改动:**
+  - fp4_gemm_cutlass3.cuh:2237 static_assert 白名单加 512。
+  - dispatch_fused_gemm.py 加 FUSED_BLOCK_N/BLOCK_M/STAGES/WARP_N env 覆盖 + 重算 smem (实验基础设施)。
+  - test 加 UNIFORM_ROUTING env (correctness 段用均匀 round-robin → block_m=128, 才能在 bn512 的 smem 约束内验证)。
+- **关键约束 (踩坑记录):**
+  - warp_n **必须=64** (每 warp 64 列, 与 bn256 相同的 sfb 迭代 ≤4)。warp_n=128 → `warp_iter_num_sfb>4` static_assert (2124) 失败。
+  - block_m **必须=128** (均匀路由)。随机路由 correctness 段 expected_m>128 → block_m=256 → bn512 smem=314432 超限 (`too many resources / invalid argument`)。
+- **正确性 (8卡, UNIFORM_ROUTING=1, FULL_CORRECTNESS):** 所有 expert **vs_cpu=0.000000, vs_nf=0.000000 → bit-exact**, All PASSED。
+  (数学上 block_n 只分块 N 维、不改 K 累加顺序, 应 bit-exact; 实测确认。)
+- **性能 (8卡 prod, perf 段均匀, ncb sweep 2,3,4, 单次):**
+
+  | 指标 | 基线 bn256 | **bn512** | 改进 |
+  |---|---|---|---|
+  | pipeline (best ncb=3) | 0.291ms / 0.87x | **0.264ms / 0.96x** | **-9.3%** |
+  | kernel-only (copy+GEMM) | 0.249ms | **0.221ms** | **-11%** |
+  | all-local | 0.231ms | 0.209ms | -9.5% |
+  | vs NF (pipeline) | 0.87x | **0.96x** | +0.09x |
+
+- **结论:** wave 8→4 假设成立, 大幅逼近 NF。**待办: 3次稳定性复测 + 默认化 (仅 block_m==128 时启用, bn512 需 bm128 保 smem) + verdict。**
+
+## Iter B 收尾 — 3次稳定性 + 默认化 + apple-to-apple + verdict
+
+**3次稳定性 (8卡, perf-only, NCB=3, 空闲):**
+| run | fused pipeline bn512 | fused pipeline bn256(base) |
+|---|---|---|
+| r1/r2/r3 | 0.264 / 0.264 / 0.265 | 0.292 / 0.292 / 0.292 |
+→ 中位 **0.264 vs 0.292 = -9.6%**, fused 绝对时间 std<1µs 极稳。
+
+**默认化:** dispatch_fused_gemm.py 在 env override 的 else 分支加自动启用: 当
+`block_m==128 && block_n==256 && warp_n==64 && block_k==128` 时升 block_n=512 (重算 smem)。
+逃生开关 `FUSED_DISABLE_BN512=1`。随机路由 (expected_m>128 → block_m=256) 条件 false → 自动回退 bn256 (bn512+bm256=314432 超 cap)。
+
+**Verdict (8卡, 默认配置, FULL_CORRECTNESS, 随机路由):** 所有 expert (token 106~147, 含>128) **vs_cpu=vs_nf=0.000000 PASSED**;
+correctness 段无 BN512_DEFAULT 打印 (回退 bn256), perf 段触发 BN512_DEFAULT (bn512)。条件回退逻辑验证正确。
+(注: verdict 的 perf 段 GPU0 被他人占用, 数值不可信; perf 以上面 3次空闲数据为准。)
+
+**apple-to-apple (用户要求, 3次, NF 也用 bn512):**
+| GEMM 纯算 (8卡) | bn256 (8 wave) | bn512 (4 wave) | bn512 收益 |
+|---|---|---|---|
+| NF gemm-only | 0.194/0.193/0.193 | 0.177/0.177/0.177 | **-8.8%** |
+| fused kernel-only | 0.249 | 0.220/0.221/0.220 | -11.6% |
+| fused pipeline | 0.292 | 0.264 | -9.6% |
+
+- **诚实结论: bn512 是通用 GEMM tile 优化 (wave 8→4), NF 也受益 -8.8%。** 不是 fused 独占。
+- fused kernel(0.220, 36SM+P2P) 相对 NF gemm-only(0.177, 39SM) 仍有 fused 固有开销 (P2P copy + 3个SM做copy), 属预期。
+- vs-NF 比率 (0.90~1.20 抖动) 不可靠, 因 NF pipeline 含 DeepEP dispatch 噪声大; 用 gemm-only 稳定对比。
+- **对本任务 (优化 fused): fused 绝对 pipeline -9.6%, bit-exact, 已默认化。达成。**
+- 后续可选: 把 bn512 也用于生产 NF/GroupedNoPad GEMM (需评估对全局 fp4 GEMM 的影响, 超出本任务范围)。
+
+## bn512 下最优配置 — ncb 重扫 (3次, 空闲)
+
+bn512 只有 144 tiles (bn256 是 288), 对 GEMM SM 数极敏感 (144/36=4 整除):
+| ncb | GEMM SM | wave | r1 | r2 | r3 |
+|---|---|---|---|---|---|
+| 1 | 38 | 4 | 0.505 | — | — (copy 太慢, 严重暴露) |
+| 2 | 37 | 4 | 0.318 | 0.319 | 0.318 (copy 不够快) |
+| **3** | **36** | **4** | **0.264** | **0.264** | **0.264 ← 最优** |
+| 4 | 35 | **5** | 0.301 | 0.301 | 0.300 (掉 wave +14%) |
+| 5 | 34 | 5 | 0.301 | 0.301 | 0.302 |
+| 6 | 33 | 5 | 0.306 | — | — |
+| 7 | 32 | 5 | 0.310 | — | — |
+
+**ncb=3 是 bn512 的双重甜点**: (1) GEMM 侧 144/36=4 wave 整除, ncb≥4 → 35 SM → ceil(144/35)=5 wave (+14%); (2) copy 侧 3 block 刚好及时完成 P2P, ncb≤2 copy 暴露。与 bn256 最优 ncb=3 数值巧合但机理不同 (bn256 的 288 tiles 对 SM 不敏感)。
+
+**bn512 完整最优配置**: block_m=128, block_n=512, block_k=128, warp_m=64, warp_n=64, stages=3, ncb=3, K_TILES_PER_FLAG=0, num_sms=39 (36 GEMM + 3 copy), smem=262016。stages 无法增到 4 (smem 已近 262144 上限)。
+
+## 改为 env 选项 (用户要求, 不默认化)
+
+按用户要求, bn512 **不默认启用**, 改为纯 env opt-in:
+- 启用: `FUSED_BLOCK_N=512 FUSED_WARP_N=64` (两者同设; ncb=3 最优)。
+- 默认 (不设 env): 走 get_best_configs 的 bn256 (基线行为, ~0.292ms)。
+- 删除了 dispatch_fused_gemm.py 中 else 分支的自动默认化 (FUSED_BN512_DEFAULT / FUSED_DISABLE_BN512 逻辑移除)。
+- 其余 env: FUSED_BLOCK_M / FUSED_STAGES 仍可覆盖; FUSED_CFG_VERBOSE=1 打印实际 config。
+
+## 2026-07-11 copy loop 换 PPU bulk-DMA (swizzled ldg/stcg) — 结论: neutral/marginal-negative, 不默认化
+
+**任务**: 把 fused copy block 的 P2P copy loop 数据读写从 `__ldg`/普通 store 换成 PPU bulk 版
+(`__ppu_global_ldg_bulk_b32x4` / `__ppu_global_stwb_bulk_b32x4`), 优先最高缓存级, 测 block_m=256/bn256/bk128。
+
+**关键机理发现 (踩坑记录)**:
+1. bulk API 是 128-bit (uint4) 同步 load/store, 形态上 1:1 (非 DMA 描述符)。
+2. **bulk load/store 是 warp-collective swizzle 对**: load 做 shuffle, store 做反 shuffle,
+   **必须配对 + 整 warp-wave 满员 (所有 lane 参与、地址连续) 才互相抵消**。SDK 有显式
+   `__ppu_swizzle_bulk_b32x4(val, mask)` "swizzle data for bulk" 佐证。
+   - 单独换 load 或单独换 store → shuffle 不抵消 → 大错 (无意义, 用户提示证实)。
+   - 配对但不满 wave: 每 rank 拷贝元素数 = cnt*k_half/16, 非 blockDim(256) 整数倍 →
+     最后一个残 wave (~0.5% 元素) lane 不满 → swizzle 失配 → **小残差 (vs_cpu 0.02~0.14, 复现稳定)**。
+     误差量级 ≈ 残 wave 占比 0.5%, 与观测吻合。**这是"配对后仍失败"的根因, 不是 store 写回可见性。**
+3. **正确写法 = 满 wave 用 bulk + ragged 尾部/max_n 预测段用 plain**: 只在连续、全 lane 的
+   min_n 满 wave body (`full=(min_n/stride)*stride`) 用 bulk; 尾部/预测段回退 `__ldg`/普通 store。
+   nr8/nr4 的 FP4 A-copy min_n 都加了 `#ifdef DG_BULK_COPY` 的 bulk 前置循环, 原 plain 循环变残余循环。
+   nr4 的 SFA co-issue 是 per-lane predicated → 保持 plain (写不同 buffer, 不扰 FP4 swizzle 寄存器)。
+   → **4卡 nr4 bit-exact (3 轮全 0.000000)**。
+4. store 缓存级: `stwb` (写回, 最高级) 在**未 split 时**因尾部 swizzle 而失败, 曾误判为写回不可见;
+   split 后 `stwb` 也 bit-exact → 证实之前是尾部问题不是可见性。但 `stwb` perf 不如 `.cg`(stcg)
+   (写回多一次 __threadfence flush, TMA 立即读 L2 无收益)。**默认用 stcg (.cg/L2)**。
+
+**perf A/B (block_m=256/bn256/bk128, 4卡 nr4, GPU 4-7 固定, 各 3 次, FORCE_EXPECTED_M=129):**
+| 指标 | baseline | bulk stcg | bulk stwb |
+|---|---|---|---|
+| Pipeline / ncb=8 best | 0.340 ×3 | 0.332~0.333 | 0.334~0.336 |
+| Kernel-only (copy+GEMM) | 0.285 ×3 | 0.288~0.291 | 0.290~0.292 |
+| Kernel all-local (无 P2P) | 0.264 | 0.268~0.270 | 0.269~0.270 |
+| **P2P link overhead** | **+0.020** | **+0.020~0.021** | **+0.020~0.022** |
+
+**诚实结论**:
+- **P2P exposure 完全不变 (+0.020 三者一致)** → bulk 没有减少实际 copy 暴露。
+- kernel-only / all-local 反而 +0.005 (两种 store 级一致) → bulk swizzle 指令本身比 baseline
+  已最优的 coalesced 8-wide MLP 路径略慢; 开销不在 split 尾部(≤1 迭代)也不在 store 缓存级。
+- pipeline/ncb-best 的 -0.007 稳定但被 kernel-only 反向抵消, 不作为真实 copy 收益。
+- **印证 project_blockcopy_isa_audit: copy 访存已近最优 + P2P 已 91% pipeline-masked, bulk DMA
+  无可回收空间。** bulk 对这个 copy 是 neutral/marginal-negative。
+- 未测: 8卡 nr8 (remote 87.5%>75%, copy 占比更高), nr8 已 bulk-ified 且待 bit-exact, 需 8 卡空闲。
+
+**落地**: 保留 opt-in, **默认关**。env: `DG_BULK_COPY=1` 启用 (满 wave bulk, stcg 存);
+`DG_BULK_STWB=1` 额外切写回存 (bit-exact 但更慢)。diff 纯 additive (macro-gated, 关时 baseline codegen 不变)。
+工作分支 `opt/fused-copy-block-gemm`, 未 commit (负结果, 待用户定是否保留开关)。
+
+### 补测 8卡 nr8 (2026-07-11, 用户要求)
+
+8卡 nr8 **bit-exact** (block_m=256, 3 轮全 0.000000)。perf A/B (8卡, FORCE_EXPECTED_M=129, 各3次;
+注: NF pipeline 有几次被外部干扰污染, 但 BC kernel 数值稳定, 以 BC 为准):
+| 指标 (8卡 nr8) | baseline | bulk stcg |
+|---|---|---|
+| Kernel-only (copy+GEMM) | 0.294, 0.298 | 0.292, 0.295, 0.298 (~parity) |
+| **Kernel all-local (无P2P)** | 0.277, 0.277 | **0.274, 0.274, 0.275 (−0.003, ~−1%)** |
+| Pipeline / ncb=8 best | 0.361, 0.346 | 0.344, 0.344, 0.353 |
+| P2P link overhead | +0.017, +0.021 | +0.017, +0.021, +0.024 (重叠, 无明显差) |
+| remote 占比 | 88% (7/8 ranks) | — |
+
+- **相比 4卡, nr8 picture 翻转: bulk 从"略负"变"parity~略正"** (all-local −0.003/−1%, 稳定;
+  nr8 是 8-wide load + 数据更多, bulk 略占优)。但仍是 marginal, 不是明显 win。
+- **P2P exposure 仍未明显降低** (两边 0.017~0.024 重叠) → 通用 `ldg_bulk` 没专门加速 remote 读。
+
+**下一步杠杆 (用户提示 2026-07-11)**: 试 **专用 remote 指令** `__ppu_remote_load_bulk_volatile_*` /
+`__ppu_remote_store_bulk_volatile_*` (SDK hggc_extend_device_functions.h ~line 290-305)。这是针对
+remote 访存的指令 (通用 bulk 没碰到的、仍暴露的 +0.020 P2P 部分)。**注意: 只能用于 remote 访存,
+不能用于本地地址 → 需对每个 rank 指针做 local/remote 判断** (rank==本 rank 或地址落在本地 sym_buf 时
+走普通/plain, 否则走 remote 指令)。这可能真正压 P2P exposure。
+
+## 2026-07-12 remote 专用指令版 (DG_BULK_REMOTE) — ★ 首个稳定 win (~-2% pipeline, bit-exact)
+
+**实现**:
+- **local/remote 判定**: rank r 的 source 是 local iff `r == rank_idx` (SymBuffer::map offset[rank_idx]=0)。
+  把 `rank_idx` 从 .py 模板 (`{RANK_IDX}` + keys) 经 run_fused_dispatch 新增 param → `sched_args.rank_idx`
+  (scheduler struct 新增字段) 传到 copy loop。test 的 15 处直接调用都补了 `rank_idx=rank`。
+- **remote load 也是 swizzle 版**: 单独 remote_load + plain store 失败 (vs_cpu~0.02/vs_nf~0.7, 与通用 bulk
+  同理)。正确写法 = **warp-aligned body 里, remote rank 用 `__ppu_remote_load_bulk_b32x4`, local rank 用
+  通用 `ld_bulk_global`, 两者都由通用 `st_bulk_global`(.cg) un-swizzle** (remote_load 与通用 bulk load
+  共享同一 swizzle, 实测 st_bulk_global 能反 shuffle 两者)。tail/max_n 仍 plain `__ldg` (remote 上 __ldg 合法)。
+  → LD_BODY 宏 (body, 按 rank 选 remote/generic bulk) + LD_A 宏 (tail, 恒 plain)。rtmd=0 (peer VA 已编码目标 GPU)。
+- SFA 读保持 plain __ldg (remote 上合法, 未加速; 聚焦 A 数据)。
+
+**★ 坑: all-local isolation 与 remote 不兼容** — Test2 的 P2P isolation 把所有 rank_addr_a 换成 local 副本,
+但 remote 代码对 r!=rank_idx 仍发 remote 指令 → **remote 指令打 local 地址 = illegal memory access, 整跑 crash**。
+必须 `SKIP_ISOLATION=1` (isolation 对 remote 本就无意义)。Test1 correctness 无 isolation 故先前通过。
+
+**perf A/B (8卡 nr8, block_m=256, SKIP_ISOLATION=1, FORCE_EXPECTED_M=129, 多次交替, 剔除 2 次外部污染窗口)**:
+| ncb=8 pipeline (ms) | baseline | remote |
+|---|---|---|
+| 各次 | 0.343,0.345,0.344,0.346,0.347,0.356 | 0.337,0.337,0.339,0.339,0.339,0.341 |
+| **中位** | **~0.345 (抖0.343-0.356)** | **~0.339 (紧, 0.337-0.341)** |
+
+- **remote ~0.339 vs baseline ~0.345 → -0.006ms (~-2%), 稳定且分布几乎不重叠。首个稳定 beat baseline 的变体。**
+  也略优于通用 bulk (8卡 ~0.344-0.347)。机理: 专用 remote 指令加速 88% remote 读 (通用 bulk 没碰到的暴露部分)。
+- 8卡 nr8 **bit-exact** (Test1 context 路径, rank_idx 正确)。SKIP_ISOLATION 下无 kernel-only (=0.000), 用 pipeline 作端到端指标 (preprocess/quant 两边同, pipeline delta = kernel delta)。
+- 4卡 nr4 (75% remote) 预计收益更小, 未细测。
+
+**落地**: opt-in `DG_BULK_REMOTE=1` (宏, 默认关, 独立于 DG_BULK_COPY)。**测试已自动保护**: 检测到 env
+`DG_BULK_REMOTE!=0` 时强制 `SKIP_ISOLATION=1` (test line ~85), 用户无需手动设, 避免 all-local crash。
+未 commit, 待用户定是否默认化/保留。
+
+**SFA 走 remote/bulk 不可行 (2026-07-12 分析)**: SFA aligned 主体虽是 int4/128-bit, 但每行只有
+vecs_per_row=cnt/8≈16 int4 (256B), **比一个 warp(32 lane=512B) 还短** → warp 必跨行边界, 地址在
+`kb*max_tok` 处大跳 → 非连续, bulk swizzle 需要 warp 连续 512B 块, 不满足 (对照 A-copy min_n 是连续才 work)。
+且 SFA 体量仅 A 的 ~1/28 (ksb*cnt/8 vs cnt*k_half/16), 即使能做收益也可忽略。→ SFA 保持 plain __ldg (remote 上合法)。
+
+**remote store 在本 copy 不适用**: copy 永远 gather remote→**local** (dst=local_fp4/sfa_buf), 没有写 remote 的方向;
+remote store 只对 scatter (local→peer) 的 kernel 有意义 (本 fused GEMM copy 不涉及)。
+
+## 2026-07-12 SFA copy/repack 拎进独立 preprocess kernel (DG_SFA_PREPROCESS) — bit-exact, 低延迟中性, 待高延迟机 A/B
+
+**动机**: 现状 SFA (A 的 scale) gather+repack 在 fused GEMM 的 copy block 里做 —— 是每 copy block FP4 拷贝
+之后的**串行尾巴** (0f40bad 引入的 `copy_mblock_sfa`)。SFA 画像: 碎+跨步远端读 (prod 8卡仅 336KB 但
+~10,752 次 32B 跨步读, 延迟型)。高延迟机 (2 级 shm) 上这笔暴露大, 0f40bad 后一直回退。思路: 把 SFA 从
+copy block 里**拎出来做成独立 pre-GEMM kernel**, 提前把**所有 expert/所有 M-block** 的 SFA 一次性 gather+repack
+到 local_sfa_buf, 让 fused GEMM 的 copy block 不再做 SFA、GEMM 直接读已备好的 buffer。
+
+**改动 (纯 additive, opt-in host-side 开关, 默认关, 与 DG_BULK_* / DG_SFA_SOURCE 正交)**:
+- `fp4_gemm_cutlass3.cuh`: 新增 `dispatch_sfa_preprocess_kernel<BLOCK_M,NumRanks>` (grid-stride over
+  total_m_blocks=`copy_grouped_layout[0]`, 每 CTA 一个 M-block) + `launch_dispatch_sfa_preprocess` host wrapper。
+  **复用 `copy_mblock_sfa` 本体** (单一真源 → layout/addressing 与 inline 路径逐位一致); 只填 sched 里
+  copy_mblock_sfa 读的 6 个字段 (rank_addr_sfa/rank_split_m/rank_counts/local_sfa_buf/ksb/max_tok)。
+  grouped_layout 解析 (gl.x=expert_local, gl.z=base_block, m_block_in_expert=mb−gl.z) 与 run_copy_block L265-267 一致。
+  remote 读用 plain `__ldg` (SFA 碎/短, bulk/remote 不适合, 见 project_blockcopy_bulk_dma)。
+- `dispatch_fused_gemm.py`: `template_sfa_preprocess` + `dispatch_sfa_preprocess()` (照 dispatch_expert_preprocess_merged
+  的 JIT 模式; BLOCK_M/NUM_RANKS 编译期 key, ksb/max_tok/num_sms/num_threads 运行期 arg)。
+  `fused_dispatch_block_copy_gemm1_fp4` 里: `os.getenv('DG_SFA_PREPROCESS')!=0 and not sfa_source_host` 时
+  在 GEMM launch **前** (同 stream → kernel-boundary 使 local_sfa_buf 对 GEMM 的 SFA TMA/L2 域可见, 无需 fence)
+  发 sfa-preprocess kernel, 并强制 `skip_sfa_copy=True` (copy block 不做 SFA, GEMM 仍读 local_sfa_buf → 输出有效)。
+  与 host SFA source 互斥 (host 读 remote_addr_sfa 不读 local_sfa_buf)。
+- **无编译宏 / 无新 JIT key on GEMM**: 独立 kernel 自成 JIT 模块, skip_sfa_copy 已是运行期 flag → env 翻转不重编 GEMM
+  (同 DG_SFA_SOURCE 的路子)。block_m 传 GEMM 的 resolved block_m (=copy block 的 BLOCK_M, 与 finalize 建的
+  grouped_layout/rank_split_m 必须一致, 这是既有不变量 L639)。
+
+**正确性 (硬 gate, PASSED)**:
+- 4卡 (GPU4-7): Test1 所有 12 expert × 3 轮 `vs_cpu=vs_nf=0.000000` bit-exact; test1_correctness+test2_performance ALL PASSED。
+- 8卡 (GPU0-7): Test1 3 轮 PASSED, All PASSED。→ 与 inline copy_mblock_sfa 逐位一致 (预期, 同一函数体)。
+
+**性能 A/B (8卡, block_m=256 via FORCE_EXPECTED_M=129, ncb=8, median of 20 iters, GPU0-7)**:
+| 模式 | Pipeline(full) | Kernel-only(copy+GEMM) | Local-only |
+|---|---|---|---|
+| baseline (SFA 在 copy block) | 0.346 | 0.296 | 0.277 |
+| DG_SFA_PREPROCESS=1 | **0.348** | 0.292 | 0.278 |
+| SKIP_SFA_COPY=1 (floor, 无 SFA) | 0.330 | 0.277 | 0.260 |
+
+**Verdict — 低延迟机中性 (符合预期)**: SFA 总暴露 = baseline−floor = ~16µs (pipeline) / ~19µs (kernel-only)。
+DG_SFA_PREPROCESS pipeline 0.348 ≈ baseline 0.346 (+2µs, 噪声内 ~3-5µs), **没往 floor 回收**。机理: 低延迟机上
+SFA remote 读本就便宜且在 baseline 里已被 FP4 copy 大量掩盖 (KTPF=0 ~91% hidden); 拎成独立 kernel 只是把这笔
+成本从 copy-block 尾巴挪到一个**串行前置 kernel** (它依赖 finalize 产的 metadata, 只能排在 preprocess 后、GEMM 前,
+无重叠余地) → net wash。**收益主要在高延迟机** (SFA 碎跨步远端读被成倍放大时, 一个高占用/跨全 SM 的批量 gather
+可能比 copy-block 尾巴的少数 block 串行读更能藏延迟) —— 本机无法复现其延迟, 同 DG_SFA_SOURCE 的处境。
+
+**下一步**: 交用户在**高延迟机**上跑 `DG_SFA_PREPROCESS=1` vs `=0` 同命令 A/B (block_m=256)。若明显快 → 坐实
+拎独立 kernel 对高延迟 SFA 有效; 否则回退在 GEMM 读侧 (见 DG_SFA_SOURCE=host 的定位路线, 二者可组合排查)。
+diff 纯 additive、默认关。log: logs/perf_{baseline,sfaprep,floor}.log, logs/sfa_prep_{4,8}card_correctness.log。
+
+## 2026-07-12 SFA 对称 buffer 行主序 source (DG_SFA_ROWMAJOR_SRC) — 连续 remote load + 列主序 local store,bit-exact,待高延迟机测
+
+**动机(用户提出)**:现状 quant 写 SFA 到对称 buffer 是列主序 `[ksb, max_tok]`,copy 的 remote 读 =
+每 rank ksb=112 个跨步段(段内 cnt token 连续、段间跨 max_tok)→ 高延迟机上 112 次跨步远端访问延迟放大
+(SFA 慢真因是"碎+跨步",量仅 336KB)。改法:source 改**行主序** `[max_tok, ksb]`(每 token 的 ksb 个
+scale 连续)→ copy 的 remote 读变成**一整块连续 burst**(一个 rank 的 cnt token × ksb 连续 ~29KB),
+strided 落到便宜的**本地 store**,GEMM 读的 dst(local_sfa_buf)仍列主序不变。⚠️与 memory 里被否的
+"行主序根治"不同(那个改 dst 害 GEMM 读;这个只改 source)。
+
+**改动(纯 additive,编译宏 DG_SFA_ROWMAJOR_SRC 门控默认关,5 处;布局是 writer/reader/addresser 契约必须一起翻)**:
+1. `mxfp4_quant.cuh` scatter:`scale_out[slot*K_SCALE_BLOCKS + j]`(行主序)vs 列主序 `j*max_tok+slot`。
+   顺带 quant 自己的写也从列主序跨步变连续。
+2. `expert_preprocess.cuh` rank_addr_sfa 偏移:`rank_offset[r]*ksb`(ksb=ceil(hidden/64),由 hidden_dim 推)vs `rank_offset[r]`。
+3. `fp4_gemm_cutlass3.cuh` `copy_mblock_sfa`:宏下走行主序全量拷贝分支——**连续读** `src[linear]`
+   (linear=t*ksb+kb,consecutive lane→coalesced burst)+ **列主序写** `dst[kb*max_tok+t]`;忽略 SkipVectorizedMain。
+4. 同文件 nr4 SFA co-issue interleave(列主序专用)宏下 `#ifndef` 编译掉(tv 保持 0→inline 块 no-op),
+   nr4 也走 trailing 的行主序全量 copy_mblock_sfa。
+5. `compiler.py`:`DG_SFA_ROWMAJOR_SRC=1` → `-DDG_SFA_ROWMAJOR_SRC`(mirror DG_BULK_*,进 JIT 签名,env 翻转不重编串)。
+   test CPU 参考(build A 反量化)也做布局感知读(env 判断行/列主序),否则 CPU-ref 读错报假 FAIL。
+
+**正确性(硬 gate,PASSED)**:DG_SFA_ROWMAJOR_SRC=1,4 卡 + 8 卡 Test1 所有 expert × 3 轮
+**BC vs NF = 0.000000 且 BC vs CPU = 0.000000**(bit-exact)。⚠️首测 test CPU 参考按列主序硬读 → 假 FAIL
+(BC vs NF 已 0 说明 kernel 对),修 test 参考后全过。与 DG_SFA_PREPROCESS 组合也自动生效(共用 copy_mblock_sfa)。
+
+**性能**:待测(本机被第三方 DeepSeek 服务间歇占 + host 高 load,pipeline 计时不可信;kernel-only 可信)。
+低延迟本机预计中性偏微正(远端事务数 112 段→1 burst,但 SFA 已被 FP4 copy 大量掩盖);**收益主要在高延迟机**
+——交用户 A/B `DG_SFA_ROWMAJOR_SRC` 0 vs 1(bm128/bm256 同命令)。设计/交接见 HANDOFF_sfa_rowmajor_src.md。
+⚠️ DG_SFA_SOURCE=host 的 merged builder 假设列主序,与本宏组合需同步更新(单用不冲突)。
+
+### 补:行主序 copy 必须向量化(naive 标量版 2x 回退 → 向量化后持平/微正)
+**踩坑**:首版 `copy_mblock_sfa` 行主序分支写成 naive 标量循环(每元素 `linear/ksb` 除法 + 标量 uint16
+读写)→ **kernel-only 稳定 2x 回退**(bm128 local-only 0.230→0.458,3 轮全 0.518-0.519 非噪声)。
+根因:丢了原列主序的 int4 向量化,且每元素 ÷ksb=112。**local-only 也 2x** 坐实是 copy compute/访存本身,非 remote。
+**修法**:行主序下 kb 是连续轴 → 读向量化为 int4(8 个连续 kb of one token,ksb%8==0 且 src 16B 对齐时,
+t*ksb 是 8 的倍数→对齐),再散射 8 个标量 strided store 到列主序 dst;÷vpt=14 每 int4(非每元素)。
+**结果(bm128,8卡,kernel-only bc/local)**:OFF 0.258/0.230 vs **ON 向量化 0.247-0.252/0.229-0.230**
+→ 持平,**bc(含 remote)侧稳定略好 ~6-10µs**(连续 burst 在低延迟 NVLink 也有小正收益),local 相同。
+bit-exact 保持(4卡 BC-vs-NF=BC-vs-CPU=0)。**教训**:行主序的价值(remote 连续读)只有在读**仍向量化**时才成立;
+标量实现会被 compute 拖垮。strided store 是列主序 dst 的不可约成本(8x store 指令 vs 列主序),但本地便宜。

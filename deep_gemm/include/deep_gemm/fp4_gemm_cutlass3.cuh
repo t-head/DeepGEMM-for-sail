@@ -48,6 +48,60 @@ __device__ __forceinline__ int4 ld_nc_global(const int4* ptr) {
     return __ldg(ptr);
 }
 
+// PPU bulk-DMA (swizzled) 128-bit copy primitives, opt-in via -DDG_BULK_COPY
+// (plumbed from env DG_BULK_COPY in jit/compiler.py). The bulk load applies a
+// warp-collective swizzle and the bulk store applies the inverse un-swizzle, so
+// they are CORRECT ONLY WHEN PAIRED and every lane of the warp participates on
+// CONTIGUOUS addresses (a full warp-wave). uint4/int4 are layout-compatible
+// (4x b32), so the paired copy is value-identical (bit-exact) on such a wave.
+// Store is .cg (L2) to stay coherent with the GEMM's TMA read after
+// __threadfence (write-back stwb would not be visible at copy_ready_flag time;
+// same L2/L3 cross-domain class as the copy_ready_flag L3 race). Used ONLY on the
+// warp-aligned uniform body of the FP4 A-copy min_n loops; ragged tails and the
+// per-lane-predicated max_n segment keep plain __ldg / store, else the swizzle
+// mis-cancels and corrupts the partial wave.
+#if defined(DG_BULK_COPY) || defined(DG_BULK_REMOTE)
+#include <hggc_runtime.h>
+// Generic global bulk load/store — a warp-collective swizzle pair (load shuffles,
+// store un-shuffles), correct only paired on a full warp-wave. ld_bulk_global is
+// used for the local rank; st_bulk_global (.cg = L2, TMA-coherent after
+// __threadfence) un-swizzles BOTH the local and the remote bulk load below.
+__device__ __forceinline__ int4 ld_bulk_global(const int4* ptr) {
+    uint4 v = __ppu_global_ldg_bulk_b32x4(ptr);
+    return *reinterpret_cast<const int4*>(&v);
+}
+__device__ __forceinline__ void st_bulk_global(int4* ptr, const int4& v) {
+#ifdef DG_BULK_STWB
+    // Highest cache level (write-back). Relies on __threadfence flushing the
+    // write-back data to L2 before copy_ready_flags is set (TMA reads L2).
+    __ppu_global_stwb_bulk_b32x4(ptr, *reinterpret_cast<const uint4*>(&v));
+#else
+    __ppu_global_stcg_bulk_b32x4(ptr, *reinterpret_cast<const uint4*>(&v));
+#endif
+}
+#endif
+
+#ifdef DG_BULK_REMOTE
+// Dedicated remote bulk load (peer address ONLY — illegal on local). Like the
+// generic bulk load it is a swizzled warp-collective op, so it must be PAIRED
+// with the bulk (un-swizzle) store on a full warp-wave, not a plain store. rtmd=0
+// (the peer VA already encodes the target GPU via the SymBuffer offset).
+__device__ __forceinline__ int4 ld_remote_bulk_global(const int4* ptr) {
+    uint4 v = __ppu_remote_load_bulk_b32x4(ptr);
+    return *reinterpret_cast<const int4*>(&v);
+}
+// Warp-aligned body load: remote ranks use the dedicated remote bulk load, the
+// local rank (is_rem=false) uses the generic bulk load; both un-swizzle via
+// st_bulk_global.
+#define LD_BODY(ptr, is_rem) ((is_rem) ? ld_remote_bulk_global(ptr) : ld_bulk_global(ptr))
+#elif defined(DG_BULK_COPY)
+#define LD_BODY(ptr, is_rem) ld_bulk_global(ptr)
+#endif
+
+// Ragged tail / per-lane-predicated (max_n) loads are always plain (no swizzle):
+// plain __ldg is legal on both local and remote addresses.
+#define LD_A(ptr, is_rem) ld_nc_global(ptr)
+
 // GPU-side SFA (scale) copy/repack for one M-block, all ranks.
 // Source: each rank's column-major scales in its symmetric buffer,
 //   [k_scale_blocks, max_tokens] with K-stride = local_buf_max_tokens; the
@@ -73,6 +127,59 @@ __device__ __forceinline__ void copy_mblock_sfa(
     uint16_t* __restrict__ dst_expert = sched.local_sfa_buf +
         (uint64_t)expert_local * ksb * max_tok;
     const uint32_t mrow_base = m_block_in_expert * BLOCK_M;
+
+#ifdef DG_SFA_ROWMAJOR_SRC
+    // Row-major source [max_tokens, ksb]: quant writes each token's ksb scales
+    // contiguously and preprocess offsets rank_addr_sfa by rank_offset*ksb, so a
+    // rank's cnt tokens form one contiguous [cnt, ksb] block. Read it fully
+    // contiguous (consecutive lanes -> consecutive addrs -> coalesced, i.e. one
+    // remote burst instead of ksb=112 strided segments), and scatter to the
+    // column-major dst [ksb, max_tokens] (local HBM, cheap strided writes). The
+    // GEMM read layout (column-major local_sfa_buf) is unchanged. SkipVectorizedMain
+    // is ignored here (always full copy); the nr4 co-issue interleave is compiled
+    // out under this macro so this is the single writer.
+    // Vectorize the contiguous read as int4 (8 kb of one token) and scatter 8
+    // strided uint16 stores to the column-major dst. Row-major puts kb on the
+    // contiguous axis, so ksb%8==0 (=ceil(hidden/64), 112 for hidden=7168) and an
+    // int4-aligned src make each token's read a run of ksb/8 aligned int4 (t*ksb
+    // is a multiple of 8). This keeps the remote read a wide coalesced burst and
+    // divides by vpt (=14) per int4 instead of per element; the strided repack is
+    // the irreducible cost of the column-major dst (local HBM, cheap). Fall back
+    // to a scalar loop for the ksb%8 tail and any unaligned/indivisible rank.
+    #pragma unroll 1
+    for (uint32_t r = 0; r < NumRanks; ++r) {
+        uint32_t idx = mb * NumRanks + r;
+        uint32_t cnt = __ldg(sched.rank_counts + idx);
+        if (cnt == 0) continue;
+        const uint16_t* __restrict__ src =
+            reinterpret_cast<const uint16_t*>(__ldg(sched.rank_addr_sfa + idx));
+        uint16_t* __restrict__ dst = dst_expert + (mrow_base + __ldg(sched.rank_split_m + idx));
+        const uint32_t vpt = ksb >> 3;            // int4 vecs per token (kb axis)
+        const bool aligned = (vpt != 0) && ((ksb & 7u) == 0) &&
+            ((reinterpret_cast<uint64_t>(src) & 15u) == 0);
+        if (aligned) {
+            const uint32_t total_v = cnt * vpt;
+            for (uint32_t linv = start; linv < total_v; linv += stride) {
+                uint32_t t = linv / vpt;
+                uint32_t vk = linv - t * vpt;
+                int4 v = ld_nc_global(reinterpret_cast<const int4*>(src + (uint64_t)t * ksb) + vk);
+                const uint16_t* ev = reinterpret_cast<const uint16_t*>(&v);
+                uint32_t kb0 = vk << 3;
+                #pragma unroll
+                for (uint32_t e = 0; e < 8; ++e)
+                    dst[(uint64_t)(kb0 + e) * max_tok + t] = ev[e];
+            }
+        } else {
+            const uint32_t total = ksb * cnt;
+            for (uint32_t linear = start; linear < total; linear += stride) {
+                uint32_t t = linear / ksb;
+                uint32_t kb = linear - t * ksb;
+                dst[(uint64_t)kb * max_tok + t] = __ldg(src + linear);
+            }
+        }
+    }
+    return;
+#endif
 
     #pragma unroll 1
     for (uint32_t r = 0; r < NumRanks; ++r) {
@@ -130,6 +237,73 @@ __device__ __forceinline__ void copy_mblock_sfa(
     }
 }
 
+// ===========================================================================
+// Standalone SFA (A-scale) gather/repack preprocess kernel (DG_SFA_PREPROCESS).
+//
+// Does the SAME per-M-block SFA gather+repack as the fused copy blocks' inline
+// copy_mblock_sfa, but for ALL M-blocks up front in a dedicated pre-GEMM launch.
+// When enabled (host env DG_SFA_PREPROCESS=1) the fused GEMM runs with
+// skip_sfa_copy=true — its copy blocks no longer do SFA, and the GEMM reads the
+// already-published local_sfa_buf. Motivation: on high-latency machines the SFA
+// remote reads are exposed on the fused critical path; hoisting them into a
+// separate kernel removes them from the copy block's serial SFA tail and lets
+// them complete (or overlap other preprocess) before the GEMM starts.
+//
+// Grid-strides over total_m_blocks (= copy_grouped_layout[0]); each CTA repacks
+// one M-block's all-rank SFA via the single-source-of-truth copy_mblock_sfa (so
+// the layout/addressing is bit-identical to the inline path). Remote reads use
+// plain __ldg — SFA rows are short/non-contiguous, so bulk/remote intrinsics do
+// not fit (see project_blockcopy_bulk_dma). Kernel-boundary completion makes the
+// local_sfa_buf writes visible to the GEMM's SFA TMA (L2 domain) with no fence.
+template <uint32_t BLOCK_M, uint32_t NumRanks>
+__global__ void dispatch_sfa_preprocess_kernel(
+    const int* __restrict__ copy_grouped_layout,
+    const uint64_t* __restrict__ rank_addr_sfa,
+    const uint32_t* __restrict__ rank_split_m,
+    const uint32_t* __restrict__ rank_counts,
+    uint16_t* __restrict__ local_sfa_buf,
+    uint32_t local_buf_k_scale_blocks,
+    uint32_t local_buf_max_tokens)
+{
+    // copy_mblock_sfa only reads these fields of sched; fill just those.
+    TileSchedulerArguments sched;
+    sched.rank_addr_sfa = rank_addr_sfa;
+    sched.rank_split_m = rank_split_m;
+    sched.rank_counts = rank_counts;
+    sched.local_sfa_buf = local_sfa_buf;
+    sched.local_buf_k_scale_blocks = local_buf_k_scale_blocks;
+    sched.local_buf_max_tokens = local_buf_max_tokens;
+
+    const uint32_t total_m_blocks =
+        static_cast<uint32_t>(copy_grouped_layout[0]);
+    for (uint32_t mb = blockIdx.x; mb < total_m_blocks; mb += gridDim.x) {
+        uint4 gl = (reinterpret_cast<const uint4*>(copy_grouped_layout) + 1)[mb];
+        uint32_t expert_local = gl.x;
+        uint32_t m_block_in_expert = mb - gl.z;
+        copy_mblock_sfa<BLOCK_M, NumRanks>(
+            sched, mb, expert_local, m_block_in_expert, threadIdx.x, blockDim.x);
+    }
+}
+
+template <uint32_t BLOCK_M, uint32_t NumRanks>
+void launch_dispatch_sfa_preprocess(
+    const int* copy_grouped_layout,
+    const uint64_t* rank_addr_sfa,
+    const uint32_t* rank_split_m,
+    const uint32_t* rank_counts,
+    uint16_t* local_sfa_buf,
+    uint32_t local_buf_k_scale_blocks,
+    uint32_t local_buf_max_tokens,
+    uint32_t num_sms,
+    uint32_t num_threads,
+    cudaStream_t stream)
+{
+    dispatch_sfa_preprocess_kernel<BLOCK_M, NumRanks>
+        <<<num_sms, num_threads, 0, stream>>>(
+            copy_grouped_layout, rank_addr_sfa, rank_split_m, rank_counts,
+            local_sfa_buf, local_buf_k_scale_blocks, local_buf_max_tokens);
+}
+
 template <uint32_t BLOCK_M, uint32_t NumRanks>
 __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t total_m_blocks)
 {
@@ -183,28 +357,57 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
             uint32_t min_n = min(min(min(n0, n1), min(n2, n3)), min(min(n4, n5), min(n6, n7)));
             uint32_t max_n = max(max(max(n0, n1), max(n2, n3)), max(max(n4, n5), max(n6, n7)));
             uint32_t i = threadIdx.x;
+#ifdef DG_BULK_REMOTE
+            // Per-rank local/remote: rank (r+k) is local iff == rank_idx. LD_A
+            // uses the dedicated remote bulk load for remote ranks, plain __ldg
+            // for the local one (remote intrinsics are illegal on local addrs).
+            const uint32_t ri = sched.rank_idx;
+            const bool rm0=(r+0)!=ri, rm1=(r+1)!=ri, rm2=(r+2)!=ri, rm3=(r+3)!=ri,
+                       rm4=(r+4)!=ri, rm5=(r+5)!=ri, rm6=(r+6)!=ri, rm7=(r+7)!=ri;
+#endif
+#if defined(DG_BULK_COPY) || defined(DG_BULK_REMOTE)
+            // Warp-aligned body: process only full warp-waves (min_n floored to
+            // stride) so every lane participates on contiguous addresses and the
+            // paired bulk swizzle/un-swizzle cancels exactly. LD_BODY picks the
+            // remote bulk load for peer ranks (DG_BULK_REMOTE) or the generic bulk
+            // load otherwise; st_bulk_global un-swizzles either. The plain loop
+            // below finishes the ragged remainder.
+            uint32_t full = (min_n / stride) * stride;
+            for (; i < full; i += stride) {
+                int4 v0 = LD_BODY(s0 + i, rm0);
+                int4 v1 = LD_BODY(s1 + i, rm1);
+                int4 v2 = LD_BODY(s2 + i, rm2);
+                int4 v3 = LD_BODY(s3 + i, rm3);
+                int4 v4 = LD_BODY(s4 + i, rm4);
+                int4 v5 = LD_BODY(s5 + i, rm5);
+                int4 v6 = LD_BODY(s6 + i, rm6);
+                int4 v7 = LD_BODY(s7 + i, rm7);
+                st_bulk_global(d0 + i, v0); st_bulk_global(d1 + i, v1); st_bulk_global(d2 + i, v2); st_bulk_global(d3 + i, v3);
+                st_bulk_global(d4 + i, v4); st_bulk_global(d5 + i, v5); st_bulk_global(d6 + i, v6); st_bulk_global(d7 + i, v7);
+            }
+#endif
             for (; i < min_n; i += stride) {
-                int4 v0 = ld_nc_global(s0 + i);
-                int4 v1 = ld_nc_global(s1 + i);
-                int4 v2 = ld_nc_global(s2 + i);
-                int4 v3 = ld_nc_global(s3 + i);
-                int4 v4 = ld_nc_global(s4 + i);
-                int4 v5 = ld_nc_global(s5 + i);
-                int4 v6 = ld_nc_global(s6 + i);
-                int4 v7 = ld_nc_global(s7 + i);
+                int4 v0 = LD_A(s0 + i, rm0);
+                int4 v1 = LD_A(s1 + i, rm1);
+                int4 v2 = LD_A(s2 + i, rm2);
+                int4 v3 = LD_A(s3 + i, rm3);
+                int4 v4 = LD_A(s4 + i, rm4);
+                int4 v5 = LD_A(s5 + i, rm5);
+                int4 v6 = LD_A(s6 + i, rm6);
+                int4 v7 = LD_A(s7 + i, rm7);
                 d0[i] = v0; d1[i] = v1; d2[i] = v2; d3[i] = v3;
                 d4[i] = v4; d5[i] = v5; d6[i] = v6; d7[i] = v7;
             }
             for (; i < max_n; i += stride) {
                 int4 v0, v1, v2, v3, v4, v5, v6, v7;
-                if (i < n0) v0 = ld_nc_global(s0 + i);
-                if (i < n1) v1 = ld_nc_global(s1 + i);
-                if (i < n2) v2 = ld_nc_global(s2 + i);
-                if (i < n3) v3 = ld_nc_global(s3 + i);
-                if (i < n4) v4 = ld_nc_global(s4 + i);
-                if (i < n5) v5 = ld_nc_global(s5 + i);
-                if (i < n6) v6 = ld_nc_global(s6 + i);
-                if (i < n7) v7 = ld_nc_global(s7 + i);
+                if (i < n0) v0 = LD_A(s0 + i, rm0);
+                if (i < n1) v1 = LD_A(s1 + i, rm1);
+                if (i < n2) v2 = LD_A(s2 + i, rm2);
+                if (i < n3) v3 = LD_A(s3 + i, rm3);
+                if (i < n4) v4 = LD_A(s4 + i, rm4);
+                if (i < n5) v5 = LD_A(s5 + i, rm5);
+                if (i < n6) v6 = LD_A(s6 + i, rm6);
+                if (i < n7) v7 = LD_A(s7 + i, rm7);
                 if (i < n0) d0[i] = v0; if (i < n1) d1[i] = v1;
                 if (i < n2) d2[i] = v2; if (i < n3) d3[i] = v3;
                 if (i < n4) d4[i] = v4; if (i < n5) d5[i] = v5;
@@ -244,6 +447,9 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
             const uint16_t* ss1 = nullptr; uint16_t* sd1 = nullptr; uint32_t vpr1 = 0, tv1 = 0;
             const uint16_t* ss2 = nullptr; uint16_t* sd2 = nullptr; uint32_t vpr2 = 0, tv2 = 0;
             const uint16_t* ss3 = nullptr; uint16_t* sd3 = nullptr; uint32_t vpr3 = 0, tv3 = 0;
+            // DG_SFA_ROWMAJOR_SRC: leave tv=0 so the column-major co-issue is a
+            // no-op; the trailing full copy_mblock_sfa does the row-major SFA copy.
+#ifndef DG_SFA_ROWMAJOR_SRC
             if constexpr (nr == 4) if (!sched.skip_sfa_copy) {  // skip => tv stays 0 => no co-issue (A/B probe)
                 uint16_t* sfa_dst_expert = sched.local_sfa_buf +
                     (uint64_t)expert_local * sfa_ksb * max_tok;
@@ -265,15 +471,47 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
                 vpr2 = a2 ? c2 / 8 : 0; tv2 = sfa_ksb * vpr2;
                 vpr3 = a3 ? c3 / 8 : 0; tv3 = sfa_ksb * vpr3;
             }
+#endif
 
             uint32_t min_n = min(min(n0, n1), min(n2, n3));
             uint32_t max_n = max(max(n0, n1), max(n2, n3));
             uint32_t i = threadIdx.x;
+#ifdef DG_BULK_REMOTE
+            // Per-rank local/remote for the FP4 A loads (SFA stays plain).
+            const uint32_t ri = sched.rank_idx;
+            const bool rm0=(r+0)!=ri, rm1=(r+1)!=ri, rm2=(r+2)!=ri, rm3=(r+3)!=ri;
+#endif
+#if defined(DG_BULK_COPY) || defined(DG_BULK_REMOTE)
+            // Warp-aligned body (full warp-waves only): FP4 v0..v3 use the paired
+            // bulk swizzle (all lanes, contiguous -> exact cancel); LD_BODY picks
+            // the remote bulk load for peer ranks (DG_BULK_REMOTE). The SFA
+            // co-issue is per-lane predicated, so it stays plain __ldg / store; it
+            // writes a disjoint buffer and does not disturb the FP4 swizzle
+            // registers. FP4 store is done right after the FP4 load (no divergence
+            // in between) to keep the load/store pairing tight.
+            uint32_t full = (min_n / stride) * stride;
+            for (; i < full; i += stride) {
+                int4 v0 = LD_BODY(s0 + i, rm0);
+                int4 v1 = LD_BODY(s1 + i, rm1);
+                int4 v2 = LD_BODY(s2 + i, rm2);
+                int4 v3 = LD_BODY(s3 + i, rm3);
+                st_bulk_global(d0 + i, v0);
+                st_bulk_global(d1 + i, v1);
+                st_bulk_global(d2 + i, v2);
+                st_bulk_global(d3 + i, v3);
+                if constexpr (nr == 4) {
+                    if (i < tv0) { uint32_t kb = i / vpr0, vx = i - kb * vpr0; *(reinterpret_cast<int4*>(sd0 + (uint64_t)kb * max_tok) + vx) = ld_nc_global(reinterpret_cast<const int4*>(ss0 + (uint64_t)kb * max_tok) + vx); }
+                    if (i < tv1) { uint32_t kb = i / vpr1, vx = i - kb * vpr1; *(reinterpret_cast<int4*>(sd1 + (uint64_t)kb * max_tok) + vx) = ld_nc_global(reinterpret_cast<const int4*>(ss1 + (uint64_t)kb * max_tok) + vx); }
+                    if (i < tv2) { uint32_t kb = i / vpr2, vx = i - kb * vpr2; *(reinterpret_cast<int4*>(sd2 + (uint64_t)kb * max_tok) + vx) = ld_nc_global(reinterpret_cast<const int4*>(ss2 + (uint64_t)kb * max_tok) + vx); }
+                    if (i < tv3) { uint32_t kb = i / vpr3, vx = i - kb * vpr3; *(reinterpret_cast<int4*>(sd3 + (uint64_t)kb * max_tok) + vx) = ld_nc_global(reinterpret_cast<const int4*>(ss3 + (uint64_t)kb * max_tok) + vx); }
+                }
+            }
+#endif
             for (; i < min_n; i += stride) {
-                int4 v0 = ld_nc_global(s0 + i);
-                int4 v1 = ld_nc_global(s1 + i);
-                int4 v2 = ld_nc_global(s2 + i);
-                int4 v3 = ld_nc_global(s3 + i);
+                int4 v0 = LD_A(s0 + i, rm0);
+                int4 v1 = LD_A(s1 + i, rm1);
+                int4 v2 = LD_A(s2 + i, rm2);
+                int4 v3 = LD_A(s3 + i, rm3);
                 int4 g0, g1, g2, g3;
                 uint32_t kb0 = 0, vx0 = 0, kb1 = 0, vx1 = 0, kb2 = 0, vx2 = 0, kb3 = 0, vx3 = 0;
                 bool q0 = false, q1 = false, q2 = false, q3 = false;
@@ -297,10 +535,10 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
             }
             for (; i < max_n; i += stride) {
                 int4 v0, v1, v2, v3;
-                if (i < n0) v0 = ld_nc_global(s0 + i);
-                if (i < n1) v1 = ld_nc_global(s1 + i);
-                if (i < n2) v2 = ld_nc_global(s2 + i);
-                if (i < n3) v3 = ld_nc_global(s3 + i);
+                if (i < n0) v0 = LD_A(s0 + i, rm0);
+                if (i < n1) v1 = LD_A(s1 + i, rm1);
+                if (i < n2) v2 = LD_A(s2 + i, rm2);
+                if (i < n3) v3 = LD_A(s3 + i, rm3);
                 int4 g0, g1, g2, g3;
                 uint32_t kb0 = 0, vx0 = 0, kb1 = 0, vx1 = 0, kb2 = 0, vx2 = 0, kb3 = 0, vx3 = 0;
                 bool q0 = false, q1 = false, q2 = false, q3 = false;
@@ -2260,7 +2498,7 @@ template <int32_t ShapeN, int32_t ShapeK,
           bool kEnableSboOverlap = false, bool hasBias = false, int NExpand = 1>
 class Fp4Gemm {
   static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
-  static_assert((BlockN == 16) || (BlockN == 32) || (BlockN == 64) || (BlockN == 128) || (BlockN == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
+  static_assert((BlockN == 16) || (BlockN == 32) || (BlockN == 64) || (BlockN == 128) || (BlockN == 256) || (BlockN == 512), "BlockN should only be in [16, 32, 64, 128, 256, 512].");
   static_assert((BlockK % 32 == 0), "BlockK must be divideable by 32.");
   static_assert((WarpM <= 64) && (WarpM % 16 == 0), "WarpM must be divideable by 16.");
   static_assert((WarpN % 16 == 0), "WarpN must be divideable by 16.");
@@ -2522,6 +2760,7 @@ public:
         bool copy_only = false,
         bool skip_sfa_copy = false,
         bool sfa_source_host = false,
+        uint32_t rank_idx = 0,
         profiling::GemmProfileRecord* profile_records = nullptr) {
 
         static_assert(kGemmType == GemmType::FusedDispatchMasked,
@@ -2678,6 +2917,7 @@ public:
             copy_ready_flags, NumCopyBlocks,
             kstripe_profile_buf, kstripe_profile_max_mb,  // max_mb repurposed as max_tiles (numel/4)
             skip_sfa_copy, sfa_source_host);
+        sched_args.rank_idx = rank_idx;  // for DG_BULK_REMOTE local/remote pick
 
         // ptr_A/ptr_SFA are resolved per-block in operator(); use local_fp4_buf as placeholder
         typename GemmKernel::Arguments arguments{

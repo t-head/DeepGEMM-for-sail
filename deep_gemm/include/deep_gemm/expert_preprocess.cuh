@@ -282,8 +282,19 @@ __device__ void dispatch_expert_finalize_device(
                 // Offset by tokens already placed from this rank
                 rank_addr_a[idx] = reinterpret_cast<uint64_t>(
                     remote_fp4 + (uint64_t)rank_offset[r] * k_half);
+#ifdef DG_SFA_ROWMAJOR_SRC
+                // Row-major source [max_tokens, ksb]: token offset strides by ksb
+                // (each token's ksb scales are contiguous). ksb = ceil(hidden/64)
+                // = K_SCALE_BLOCKS, matching mxfp4_quant / the GEMM's SFK.
+                {
+                    uint32_t ksb = ((hidden_dim / 2) + 31u) / 32u;
+                    rank_addr_sfa[idx] = reinterpret_cast<uint64_t>(
+                        remote_scale + (uint64_t)rank_offset[r] * ksb);
+                }
+#else
                 rank_addr_sfa[idx] = reinterpret_cast<uint64_t>(
                     remote_scale + rank_offset[r]);
+#endif
                 rank_split_m[idx] = smem_row;
                 rank_counts[idx] = take;
 
