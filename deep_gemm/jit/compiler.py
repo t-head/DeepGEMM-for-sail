@@ -169,6 +169,27 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
     if os.getenv('DG_SFA_ROWMAJOR_SRC', '0') != '0':
         nvcc_flags.append('-DDG_SFA_ROWMAJOR_SRC')
 
+    # A/B probe: force-disable the nr==4 in-FP4-loop SFA co-issue. The co-issue
+    # setup is compiled out so tv stays a compile-time 0 (the in-loop co-issue is
+    # dead-code eliminated -> clean FP4 loop, fewer live registers) and SFA falls
+    # to the serial trailing copy_mblock_sfa. Lets us measure whether the co-issue
+    # itself (register/ALU pressure) is slowing the FP4 copy.
+    if os.getenv('DG_SFA_NO_COISSUE', '0') != '0':
+        nvcc_flags.append('-DDG_SFA_NO_COISSUE')
+
+    # Opt-in: SFA (A-scale) PUSH path. Instead of the fused GEMM PULLing remote SFA
+    # (round-trip latency bound), the quant kernel pushes each token's ksb scales
+    # directly into the owner rank's symmetric staging buffer (fire-and-forget P2P
+    # write, overlapped with quant compute), and a local reshape (v1: standalone
+    # full-grid kernel; v2: GEMM-CTA prologue) repacks staging -> local_sfa_buf. Must
+    # be consistent across quant / reshape. See snoopy-mixing-scroll plan.
+    if os.getenv('DG_SFA_PUSH', '0') != '0':
+        nvcc_flags.append('-DDG_SFA_PUSH')
+    # Diagnostic: keep the push addressing/buffer/compile but SKIP the peer-VA store,
+    # to test whether the bulk peer writes themselves poison subsequent P2P reads.
+    if os.getenv('DG_SFA_PUSH_NOWRITE', '0') != '0':
+        nvcc_flags.append('-DDG_SFA_PUSH_NOWRITE')
+
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi', '-fconcepts']
     flags = [*nvcc_flags, f'--compiler-options={",".join(cxx_flags)}']
     include_dirs = [get_jit_include_dir()]

@@ -170,7 +170,8 @@ __device__ void dispatch_expert_finalize_device(
     uint32_t* __restrict__ out_shape_m,
     uint64_t* __restrict__ dbg_cyc,
     uint32_t* smem_workspace,
-    uint32_t num_threads) {
+    uint32_t num_threads,
+    const int64_t* __restrict__ staging_addrs = nullptr) {  // DG_SFA_PUSH: separate staging buffer peer bases
 
     long long dbg_t0 = clock64();
     __shared__ SymBuffer smem_sym;
@@ -282,7 +283,24 @@ __device__ void dispatch_expert_finalize_device(
                 // Offset by tokens already placed from this rank
                 rank_addr_a[idx] = reinterpret_cast<uint64_t>(
                     remote_fp4 + (uint64_t)rank_offset[r] * k_half);
-#ifdef DG_SFA_ROWMAJOR_SRC
+#if defined(DG_SFA_PUSH)
+                // PUSH: SFA is not pulled from the source. Quant pushed each token's
+                // ksb scales (row-major) into THIS rank's SEPARATE staging buffer band
+                // [local_expert e][src_rank r][slot][ksb]. rank_addr_sfa points at the
+                // LOCAL staging slice start for (e, r, rank_offset[r]); the reshape
+                // reads it row-major (see copy_mblock_sfa DG_SFA_PUSH path).
+                {
+                    uint32_t ksb = ((hidden_dim / 2) + 31u) / 32u;
+                    uint64_t staging_local_base =
+                        (staging_addrs != nullptr) ? (uint64_t)staging_addrs[rank_idx] : 0ull;
+                    uint16_t* staging = reinterpret_cast<uint16_t*>(
+                        staging_local_base
+                        + (uint64_t)(generation & 1u) * buf_layout.staging_parity_bytes());
+                    uint64_t sidx = ((uint64_t)(e * num_ranks + r) * max_tokens_per_expert
+                                     + rank_offset[r]) * ksb;
+                    rank_addr_sfa[idx] = reinterpret_cast<uint64_t>(staging + sidx);
+                }
+#elif defined(DG_SFA_ROWMAJOR_SRC)
                 // Row-major source [max_tokens, ksb]: token offset strides by ksb
                 // (each token's ksb scales are contiguous). ksb = ceil(hidden/64)
                 // = K_SCALE_BLOCKS, matching mxfp4_quant / the GEMM's SFK.
@@ -330,7 +348,8 @@ __global__ void dispatch_expert_finalize_kernel(
     uint32_t* __restrict__ masked_m,
     uint32_t* __restrict__ out_total_m_blocks,
     uint32_t* __restrict__ out_shape_m,
-    uint64_t* __restrict__ dbg_cyc) {
+    uint64_t* __restrict__ dbg_cyc,
+    const int64_t* __restrict__ staging_addrs = nullptr) {
 
     extern __shared__ uint32_t smem[];
     dispatch_expert_finalize_device<BLOCK_M>(
@@ -340,7 +359,7 @@ __global__ void dispatch_expert_finalize_kernel(
         pair_counts, grouped_layout, rank_addr_a, rank_addr_sfa,
         rank_split_m, rank_counts, masked_m,
         out_total_m_blocks, out_shape_m,
-        dbg_cyc, smem, blockDim.x);
+        dbg_cyc, smem, blockDim.x, staging_addrs);
 }
 
 template <uint32_t BLOCK_M>
@@ -364,7 +383,8 @@ void launch_dispatch_expert_finalize(
     uint32_t* out_total_m_blocks,
     uint32_t* out_shape_m,
     uint64_t* dbg_cyc,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const int64_t* __restrict__ staging_addrs = nullptr) {
 
     uint32_t num_scan_warps = (num_local_experts + 31) / 32;
     uint32_t min_threads = max(num_scan_warps * 32, min(num_local_experts, 256u));
@@ -376,7 +396,7 @@ void launch_dispatch_expert_finalize(
         local_expert_start, generation,
         pair_counts, grouped_layout, rank_addr_a, rank_addr_sfa,
         rank_split_m, rank_counts, masked_m,
-        out_total_m_blocks, out_shape_m, dbg_cyc);
+        out_total_m_blocks, out_shape_m, dbg_cyc, staging_addrs);
 }
 
 
@@ -410,7 +430,8 @@ __global__ void dispatch_expert_preprocess_merged_kernel(
     uint32_t* __restrict__ out_total_m_blocks,
     uint32_t* __restrict__ out_shape_m,
     uint32_t* __restrict__ out_expected_m,
-    uint64_t* __restrict__ dbg_cyc) {
+    uint64_t* __restrict__ dbg_cyc,
+    const int64_t* __restrict__ staging_addrs = nullptr) {
 
     extern __shared__ uint32_t smem[];
 
@@ -430,7 +451,7 @@ __global__ void dispatch_expert_preprocess_merged_kernel(
         pair_counts, grouped_layout, rank_addr_a, rank_addr_sfa,
         rank_split_m, rank_counts, masked_m,
         out_total_m_blocks, out_shape_m,
-        dbg_cyc, smem, blockDim.x);
+        dbg_cyc, smem, blockDim.x, staging_addrs);
 }
 
 template <uint32_t BLOCK_M>
@@ -455,7 +476,8 @@ void launch_dispatch_expert_preprocess_merged(
     uint32_t* out_shape_m,
     uint32_t* out_expected_m,
     uint64_t* dbg_cyc,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const int64_t* __restrict__ staging_addrs = nullptr) {
 
     uint32_t total_pairs = num_local_experts * num_ranks;
     uint32_t prep_threads = max(32u, min(max(total_pairs, num_local_experts), 256u));
@@ -470,7 +492,7 @@ void launch_dispatch_expert_preprocess_merged(
         local_expert_start, generation,
         pair_counts, grouped_layout, rank_addr_a, rank_addr_sfa,
         rank_split_m, rank_counts, masked_m,
-        out_total_m_blocks, out_shape_m, out_expected_m, dbg_cyc);
+        out_total_m_blocks, out_shape_m, out_expected_m, dbg_cyc, staging_addrs);
 }
 
 }  // namespace deep_gemm

@@ -178,6 +178,27 @@ struct DispatchBufferLayout {
         return ready_flag_offset() + 128;
     }
 
+    // DG_SFA_PUSH staging region (after the arrival flags). The quant kernel PUSHES
+    // each token's ksb scales into the OWNER rank's staging (row-major, fixed
+    // per-source-rank band), and the reshape reads it locally. Layout on one rank:
+    //   [num_local_real][num_ranks][max_tokens_per_expert][ksb] uint16, x2 for parity.
+    // With num_local(=num_total here) built layout, num_local_real*num_ranks == num_total,
+    // so one parity of staging == scale_bytes() (num_total * ksb * max_tok * 2).
+    __host__ __device__
+    uint64_t staging_offset() const {
+        // 16-aligned start after both data buffers + arrival flags.
+        return (total_bytes_with_flags() + 15) & ~uint64_t(15);
+    }
+    __host__ __device__
+    uint64_t staging_parity_bytes() const {
+        // One parity of staging = num_total_experts * ksb * max_tokens * sizeof(uint16).
+        return uint64_t(num_total_experts) * k_scale_blocks() * max_tokens_per_expert * sizeof(uint16_t);
+    }
+    __host__ __device__
+    uint64_t total_bytes_with_staging() const {
+        return staging_offset() + 2 * staging_parity_bytes();
+    }
+
     // Offset getters
     __host__ __device__
     uint32_t* expert_token_counts_ptr(void* base) const {

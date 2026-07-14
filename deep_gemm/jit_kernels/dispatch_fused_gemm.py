@@ -25,7 +25,7 @@ launch_mxfp4_quantize<{HIDDEN}>(
     {NUM_LOCAL_EXPERTS}, {NUM_TOTAL_EXPERTS}, {MAX_TOKENS_PER_EXPERT},
     generation,
     sym_buf_addrs, rank_idx, num_ranks,
-    stream);
+    stream, nullptr, staging_addrs);
 """
 
 # --- Expert preprocess: read routing info → generate M-block metadata ---
@@ -66,7 +66,7 @@ launch_dispatch_expert_finalize<{BLOCK_M}>(
     reinterpret_cast<uint32_t*>(out_total_m_blocks),
     reinterpret_cast<uint32_t*>(out_shape_m),
     reinterpret_cast<uint64_t*>(dbg_cyc),
-    stream);
+    stream, reinterpret_cast<const int64_t*>(staging_addrs));
 """
 
 
@@ -90,7 +90,7 @@ launch_dispatch_expert_preprocess_merged<{BLOCK_M}>(
     reinterpret_cast<uint32_t*>(out_shape_m),
     reinterpret_cast<uint32_t*>(out_expected_m),
     reinterpret_cast<uint64_t*>(dbg_cyc),
-    stream);
+    stream, reinterpret_cast<const int64_t*>(staging_addrs));
 """
 
 # --- Standalone SFA (A-scale) gather/repack preprocess (DG_SFA_PREPROCESS) ---
@@ -172,7 +172,39 @@ def get_sym_buffer_size(
     # DispatchBufferLayout::ready_flag_offset() (== align16(2 * total_bytes())).
     flag_offset = ((2 * data_region + 15) // 16) * 16
     # Arrival slots: one uint32 per rank (atomic-arrival barrier). 128B = up to 32 ranks.
+    # NOTE: DG_SFA_PUSH staging is a SEPARATE symmetric buffer (get_sfa_staging_size),
+    # NOT appended here — growing THIS buffer slows its remote FP4 P2P reads ~3x on this
+    # platform (per-buffer size threshold), while a separate allocation does not.
     return flag_offset + 128
+
+
+def get_sfa_staging_size(
+    num_local_experts: int,
+    num_total_experts: int,
+    max_tokens_per_expert: int,
+    hidden_dim: int,
+) -> int:
+    """DG_SFA_PUSH staging: a SEPARATE symmetric buffer, row-major per-source-rank band
+    [num_local_real][num_ranks][max_tokens][ksb] uint16, x2 for parity. On one rank
+    num_local_real*num_ranks == num_total_experts, so one parity = num_total * ksb *
+    max_tokens * 2 bytes."""
+    k_blocks = (hidden_dim + 31) // 32
+    k_scale_blocks = (k_blocks + 1) // 2
+    staging_parity = num_total_experts * k_scale_blocks * max_tokens_per_expert * 2
+    return 2 * staging_parity
+
+
+# DG_SFA_PUSH staging peer addresses, set once by the caller (test) via
+# set_sfa_staging_addrs so the ~10 quant / expert_preprocess call sites need not thread
+# a new tensor. The host wrappers read these and pass to their kernels.
+_sfa_staging_addrs = None      # torch.int64 [num_ranks] peer base ptrs of the staging buffer
+_sfa_staging_local_base = 0    # this rank's staging buffer base (int)
+
+
+def set_sfa_staging_addrs(addrs, local_base):
+    global _sfa_staging_addrs, _sfa_staging_local_base
+    _sfa_staging_addrs = addrs
+    _sfa_staging_local_base = int(local_base)
 
 
 def _mxfp4_quantize_to_sym_buffer(
@@ -212,10 +244,20 @@ def _mxfp4_quantize_to_sym_buffer(
 
     global includes_quant, template_quant
 
+    # DG_SFA_PUSH staging peer addrs (separate symmetric buffer), set once by the caller.
+    # A dummy zeros(1) (base ptr 0) tells the kernel to skip the push. Also require real
+    # peer addrs (num_ranks matches) so the count-prepare quant (num_ranks=1) never pushes.
+    staging_addrs = _sfa_staging_addrs
+    if (staging_addrs is None or num_ranks <= 1
+            or sym_buf_addrs.numel() < num_ranks):
+        staging_addrs = torch.zeros(1, dtype=torch.int64, device=input_bf16.device)
+    assert staging_addrs.dtype == torch.int64
+
     args = (input_bf16, topk_ids, sym_buf,
             num_tokens, topk,
             generation,
             sym_buf_addrs, rank_idx, num_ranks,
+            staging_addrs,
             torch.cuda.current_stream())
     arg_defs = (
         ('input', torch.bfloat16),
@@ -227,6 +269,7 @@ def _mxfp4_quantize_to_sym_buffer(
         ('sym_buf_addrs', torch.int64),
         ('rank_idx', int),
         ('num_ranks', int),
+        ('staging_addrs', torch.int64),
         ('stream', torch.cuda.Stream),
     )
 
@@ -422,9 +465,12 @@ def dispatch_expert_finalize(
     out_total_m_blocks = _workspace.out_total_m_blocks
     out_shape_m = _workspace.out_shape_m
 
+    staging_arg = _sfa_staging_addrs
+    if staging_arg is None or staging_arg.numel() < num_ranks:
+        staging_arg = torch.zeros(max(num_ranks, 1), dtype=torch.int64, device=device)
     args = (sym_buf_addrs, pair_counts, grouped_layout, rank_addr_a, rank_addr_sfa,
             rank_split_m, rank_counts, masked_m, out_total_m_blocks, out_shape_m,
-            dbg_cyc, generation, torch.cuda.current_stream())
+            dbg_cyc, generation, staging_arg, torch.cuda.current_stream())
 
     runtime = jit_tuner.compile_and_tune(
         name='dispatch_expert_finalize',
@@ -455,6 +501,7 @@ def dispatch_expert_finalize(
             ('out_shape_m', torch.int32),
             ('dbg_cyc', torch.int64),
             ('generation', int),
+            ('staging_addrs', torch.int64),
             ('stream', torch.cuda.Stream),
         ),
         template=template_expert_finalize,
@@ -519,9 +566,13 @@ def dispatch_expert_preprocess_merged(
     out_shape_m = _workspace.out_shape_m
     out_expected_m = _workspace.out_expected_m
 
+    staging_arg = _sfa_staging_addrs
+    if staging_arg is None or staging_arg.numel() < num_ranks:
+        staging_arg = torch.zeros(max(num_ranks, 1), dtype=torch.int64, device=device)
     args = (sym_buf_addrs, pair_counts, grouped_layout, rank_addr_a, rank_addr_sfa,
             rank_split_m, rank_counts, masked_m, out_total_m_blocks, out_shape_m,
-            out_expected_m, dbg_cyc, generation, torch.cuda.current_stream())
+            out_expected_m, dbg_cyc, generation, staging_arg,
+            torch.cuda.current_stream())
 
     runtime = jit_tuner.compile_and_tune(
         name='dispatch_expert_preprocess_merged',
@@ -553,6 +604,7 @@ def dispatch_expert_preprocess_merged(
             ('out_expected_m', torch.int32),
             ('dbg_cyc', torch.int64),
             ('generation', int),
+            ('staging_addrs', torch.int64),
             ('stream', torch.cuda.Stream),
         ),
         template=template_expert_preprocess_merged,
@@ -814,13 +866,19 @@ def fused_dispatch_block_copy_gemm1_fp4(
     # the FP4 copy; a separate kernel lets them complete/overlap before the GEMM.
     # Orthogonal, host-side only (no GEMM recompile). Mutually exclusive with the
     # host SFA source (which reads remote_addr_sfa, not local_sfa_buf).
-    if os.getenv('DG_SFA_PREPROCESS', '0') != '0' and not sfa_source_host:
-        dispatch_sfa_preprocess(
-            grouped_layout, rank_addr_sfa, rank_split_m, rank_counts, local_sfa_buf,
-            num_ranks=num_ranks, block_m=block_m,
-            k_scale_blocks=ceil_div(k, 32),
-            max_tokens_per_expert=max_tokens_per_expert,
-            num_sms=num_sms)
+    # DG_SFA_PUSH reuses the same reshape kernel: quant already PUSHED SFA into the
+    # local staging region and expert_preprocess set rank_addr_sfa to LOCAL staging
+    # slice pointers, so dispatch_sfa_preprocess now does a purely LOCAL row-major->
+    # col-major repack (no remote read). Same skip_sfa_copy handoff to the GEMM.
+    if (os.getenv('DG_SFA_PREPROCESS', '0') != '0'
+            or os.getenv('DG_SFA_PUSH', '0') != '0') and not sfa_source_host:
+        if os.getenv('DG_SFA_PUSH_SKIP_RESHAPE', '0') == '0':  # diagnostic: skip reshape to isolate its cost
+            dispatch_sfa_preprocess(
+                grouped_layout, rank_addr_sfa, rank_split_m, rank_counts, local_sfa_buf,
+                num_ranks=num_ranks, block_m=block_m,
+                k_scale_blocks=ceil_div(k, 32),
+                max_tokens_per_expert=max_tokens_per_expert,
+                num_sms=num_sms)
         skip_sfa_copy = True
 
     args = (rhs, rhs_scales, bias, out, gemm_shape_m,

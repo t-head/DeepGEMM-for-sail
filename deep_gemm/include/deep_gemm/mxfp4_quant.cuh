@@ -98,7 +98,10 @@ __global__ void mxfp4_quantize_kernel(
     uint32_t rank_idx = 0,
     uint32_t num_ranks = 0,
     uint64_t arrival_offset = 0,
-    uint32_t do_arrival = 0) {
+    uint32_t do_arrival = 0,
+    // DG_SFA_PUSH: peer base ptrs of the SEPARATE staging symmetric buffer (row-major
+    // [num_local_real][num_ranks][max_tokens][ksb] uint16, x2 parity). nullptr => no push.
+    const int64_t* __restrict__ staging_addrs = nullptr) {
 
     constexpr int ELEMS_PER_THREAD = 8;  // 8 BF16 values = 1 int4 load
     constexpr int SCALE_GROUP_SIZE = 32;
@@ -120,7 +123,7 @@ __global__ void mxfp4_quantize_kernel(
     // Shared memory: quantized FP4 data + packed scales (quantize once, scatter many)
     __shared__ int s_fp4_data[FP4_INTS];
     __shared__ uint8_t s_scale_inv[K_BLOCKS];
-    __shared__ uint16_t s_packed_scale[K_SCALE_BLOCKS];
+    __shared__ __align__(16) uint16_t s_packed_scale[K_SCALE_BLOCKS];  // 16B-aligned for int4 push
     __shared__ uint32_t s_slot[MAX_TOPK];
     __shared__ int s_expert[MAX_TOPK];
 
@@ -245,6 +248,52 @@ __global__ void mxfp4_quantize_kernel(
         // No __syncthreads() needed: s_fp4_v, s_packed_scale, s_expert, s_slot are all read-only here
     }
 
+#ifdef DG_SFA_PUSH
+    // ---- SFA PUSH ----
+    // Push this token's ksb scales into the OWNER rank's symmetric staging (row-major,
+    // fixed per-source-rank band [local_expert][src_rank=rank_idx][slot][ksb]). `slot`
+    // is the SAME local atomic slot claimed above, so it aligns with the source-side
+    // ordering (rank_offset) that expert_preprocess uses to locate this rank's slice.
+    // No per-token remote atomic; the only remote op is this fire-and-forget scale write.
+    // Visibility: each block __threadfence_system() below (folded-arrival path) makes
+    // these peer-HBM writes system-visible before the arrival flag is published; push
+    // therefore requires FUSED_ARRIVAL_IN_QUANT=1.
+    // staging_addrs[0]==0 marks the dummy (no real staging buffer / count-prepare quant):
+    // skip the push. A real staging buffer base is a valid non-zero device pointer.
+    if (staging_addrs != nullptr && num_ranks > 0 && staging_addrs[0] != 0) {
+        const uint32_t nlr = num_total_experts / num_ranks;   // real local experts per owner rank
+        const uint64_t parity_stride = layout.staging_parity_bytes();
+        for (int t = 0; t < topk; ++t) {
+            int e = s_expert[t];
+            uint32_t slot = s_slot[t];
+            if (e < 0 || slot >= max_tokens_per_expert) continue;
+            uint32_t d  = static_cast<uint32_t>(e) / nlr;     // owner rank
+            uint32_t le = static_cast<uint32_t>(e) - d * nlr; // local expert on owner
+            // Separate staging buffer: peer base at offset 0 (+ parity), no staging_offset.
+            uint8_t* peer_base = reinterpret_cast<uint8_t*>(staging_addrs[d]);
+            uint16_t* staging = reinterpret_cast<uint16_t*>(
+                peer_base + static_cast<uint64_t>(generation & 1u) * parity_stride);
+            uint64_t sidx = (static_cast<uint64_t>(le * num_ranks + rank_idx) * max_tokens_per_expert
+                             + slot) * K_SCALE_BLOCKS;
+            uint16_t* dst = staging + sidx;
+#ifndef DG_SFA_PUSH_NOWRITE
+            // int4-vectorized push (8 uint16 = 16B per store): ksb multiple of 8, and
+            // both src (16B-aligned smem) and dst (sidx multiple of 8) are 16B-aligned.
+            // Falls back to scalar for any ksb%8 tail (none for hidden=7168 -> ksb=112).
+            constexpr int KSB_I4 = K_SCALE_BLOCKS / 8;
+            const int4* s4 = reinterpret_cast<const int4*>(s_packed_scale);
+            int4* d4 = reinterpret_cast<int4*>(dst);
+            for (int v = threadIdx.x; v < KSB_I4; v += blockDim.x)
+                d4[v] = s4[v];   // peer-VA int4 write (push)
+            for (int j = KSB_I4 * 8 + threadIdx.x; j < K_SCALE_BLOCKS; j += blockDim.x)
+                dst[j] = s_packed_scale[j];
+#else
+            (void)dst;
+#endif
+        }
+    }
+#endif
+
     if (profile_clocks && blockIdx.x == 0 && threadIdx.x == 0) {
         _prof_t2 = clock64();
         profile_clocks[0] = _prof_t1 - _prof_t0;  // Phase 1: quantize to SMEM
@@ -263,7 +312,14 @@ __global__ void mxfp4_quantize_kernel(
     // readable; it then release-fences SYSTEM-wide (matching the old arrival_push)
     // and publishes `generation` into each consumer's local slot[rank_idx].
     if (do_arrival) {
+#ifdef DG_SFA_PUSH
+        // Push writes targeted PEER HBM: device-scope fence only guarantees local-HBM
+        // visibility (enough for the pull model). System scope is required so every
+        // block's remote pushes are globally visible before the arrival flag.
+        __threadfence_system();
+#else
         __threadfence();
+#endif
         __shared__ bool s_is_last_block;
         if (threadIdx.x == 0) {
             uint32_t ticket = atomicInc(&g_quant_arrival_retire, gridDim.x - 1);
@@ -315,7 +371,8 @@ void launch_mxfp4_quantize(
     uint32_t rank_idx,
     uint32_t num_ranks,
     cudaStream_t stream,
-    int64_t* profile_clocks = nullptr) {
+    int64_t* profile_clocks = nullptr,
+    const int64_t* staging_addrs = nullptr) {
 
     DispatchBufferLayout layout(num_total_experts, num_total_experts,
                                 max_tokens_per_expert, HIDDEN);
@@ -348,13 +405,13 @@ void launch_mxfp4_quantize(
             input, topk_ids, data_base,
             num_tokens, topk, num_local_experts, num_total_experts,
             max_tokens_per_expert, HIDDEN, generation, profile_clocks,
-            sym_buf_addrs, rank_idx, num_ranks, arrival_offset, do_arrival);
+            sym_buf_addrs, rank_idx, num_ranks, arrival_offset, do_arrival, staging_addrs);
     } else {
         mxfp4_quantize_kernel<HIDDEN, 8><<<blocks, THREADS, 0, stream>>>(
             input, topk_ids, data_base,
             num_tokens, topk, num_local_experts, num_total_experts,
             max_tokens_per_expert, HIDDEN, generation, profile_clocks,
-            sym_buf_addrs, rank_idx, num_ranks, arrival_offset, do_arrival);
+            sym_buf_addrs, rank_idx, num_ranks, arrival_offset, do_arrival, staging_addrs);
     }
 
     if (arrival_needed && !fold_arrival) {

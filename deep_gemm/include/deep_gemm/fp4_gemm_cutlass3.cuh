@@ -128,7 +128,11 @@ __device__ __forceinline__ void copy_mblock_sfa(
         (uint64_t)expert_local * ksb * max_tok;
     const uint32_t mrow_base = m_block_in_expert * BLOCK_M;
 
-#ifdef DG_SFA_ROWMAJOR_SRC
+    // DG_SFA_PUSH reuses the row-major read path: rank_addr_sfa points at a LOCAL
+    // staging slice [count, ksb] (row-major), read here and scattered to the
+    // column-major local_sfa_buf — identical to the row-major-source repack, just
+    // a local source instead of a remote peer buffer.
+#if defined(DG_SFA_ROWMAJOR_SRC) || defined(DG_SFA_PUSH)
     // Row-major source [max_tokens, ksb]: quant writes each token's ksb scales
     // contiguously and preprocess offsets rank_addr_sfa by rank_offset*ksb, so a
     // rank's cnt tokens form one contiguous [cnt, ksb] block. Read it fully
@@ -276,12 +280,27 @@ __global__ void dispatch_sfa_preprocess_kernel(
 
     const uint32_t total_m_blocks =
         static_cast<uint32_t>(copy_grouped_layout[0]);
-    for (uint32_t mb = blockIdx.x; mb < total_m_blocks; mb += gridDim.x) {
+
+    // total_m_blocks is small (~= num_local_experts, e.g. 12), so a plain
+    // mb=blockIdx.x grid-stride leaves most SMs idle (only ~12 CTAs active) and
+    // the SFA gather stays remote-latency-bound. Instead split EACH M-block's
+    // flattened work across `sub` CTAs via copy_mblock_sfa's (start, stride):
+    // CTA (mb, s) covers linear indices s*blockDim.x + threadIdx.x, stepping
+    // sub*blockDim.x. Every element is still hit exactly once (disjoint per s),
+    // dst writes stay disjoint, and no flag/sync is needed (kernel-boundary
+    // publishes). This lifts the active-CTA count from ~12 to ~num_sms, giving
+    // the many concurrent remote reads the MLP to hide their round-trip latency.
+    const uint32_t sub = total_m_blocks ? max(1u, gridDim.x / total_m_blocks) : 1u;
+    const uint32_t total_work = total_m_blocks * sub;
+    for (uint32_t w = blockIdx.x; w < total_work; w += gridDim.x) {
+        uint32_t mb = w / sub;
+        uint32_t s  = w - mb * sub;
         uint4 gl = (reinterpret_cast<const uint4*>(copy_grouped_layout) + 1)[mb];
         uint32_t expert_local = gl.x;
         uint32_t m_block_in_expert = mb - gl.z;
         copy_mblock_sfa<BLOCK_M, NumRanks>(
-            sched, mb, expert_local, m_block_in_expert, threadIdx.x, blockDim.x);
+            sched, mb, expert_local, m_block_in_expert,
+            s * blockDim.x + threadIdx.x, sub * blockDim.x);
     }
 }
 
@@ -449,7 +468,10 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
             const uint16_t* ss3 = nullptr; uint16_t* sd3 = nullptr; uint32_t vpr3 = 0, tv3 = 0;
             // DG_SFA_ROWMAJOR_SRC: leave tv=0 so the column-major co-issue is a
             // no-op; the trailing full copy_mblock_sfa does the row-major SFA copy.
-#ifndef DG_SFA_ROWMAJOR_SRC
+            // DG_SFA_NO_COISSUE (A/B probe): also leave tv=0 so all SFA vecs stay 0
+            // compile-time constants -> the in-loop co-issue is dead-code eliminated
+            // (clean FP4 loop) and the trailing full copy_mblock_sfa is the writer.
+#if !defined(DG_SFA_ROWMAJOR_SRC) && !defined(DG_SFA_NO_COISSUE) && !defined(DG_SFA_PUSH)
             if constexpr (nr == 4) if (!sched.skip_sfa_copy) {  // skip => tv stays 0 => no co-issue (A/B probe)
                 uint16_t* sfa_dst_expert = sched.local_sfa_buf +
                     (uint64_t)expert_local * sfa_ksb * max_tok;
@@ -591,10 +613,12 @@ __device__ void run_copy_block(const TileSchedulerArguments& sched, uint32_t tot
         // co-issued into the FP4 nr4 loop above; only the residual (scalar tails
         // + unaligned/cnt<8 ranks) remains. Other rank counts do the full copy.
         if (!sched.skip_sfa_copy) {  // diagnostic A/B: SKIP_SFA_COPY skips it (timing probe; output invalid)
+#ifndef DG_SFA_NO_COISSUE
             if constexpr (NumRanks == 4)
                 copy_mblock_sfa<BLOCK_M, NumRanks, /*SkipVectorizedMain=*/true>(
                     sched, mb, expert_local, m_block_in_expert, threadIdx.x, blockDim.x);
             else
+#endif
                 copy_mblock_sfa<BLOCK_M, NumRanks>(
                     sched, mb, expert_local, m_block_in_expert, threadIdx.x, blockDim.x);
         }

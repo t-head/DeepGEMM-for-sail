@@ -118,6 +118,7 @@ from deep_gemm.jit_kernels.dispatch_fused_gemm import (
     create_expert_preprocess_workspace,
     fused_dispatch_block_copy_gemm1_fp4,
     create_block_copy_buffers,
+    get_sfa_staging_size, set_sfa_staging_addrs,
 )
 from deep_gemm.jit_kernels.gemm_fp4 import get_best_configs as get_best_configs_fp4
 from deep_gemm.jit_kernels.utils import get_num_sms, ceil_div, GemmType
@@ -449,6 +450,12 @@ def test_correctness(rank, world_size, group, device):
     buf_size = get_sym_buffer_size(
         num_local_experts, num_total_experts, max_tokens, hidden)
     sym_buf, sym_buf_addrs, sym_handle = alloc_sym_buffer(buf_size, device, group)
+    # DG_SFA_PUSH: separate symmetric staging buffer (see the perf-path setup for why it
+    # must NOT be appended to sym_buf). Register once for this context test.
+    if os.getenv('DG_SFA_PUSH', '0') != '0':
+        staging_size = get_sfa_staging_size(num_local_experts, num_total_experts, max_tokens, hidden)
+        sfa_staging_buf, sfa_staging_addrs, sfa_staging_handle = alloc_sym_buffer(staging_size, device, group)
+        set_sfa_staging_addrs(sfa_staging_addrs, sfa_staging_buf.data_ptr())
     context = BlockCopyDispatchContext(
         sym_buf=sym_buf,
         sym_buf_addrs=sym_buf_addrs,
@@ -715,6 +722,15 @@ def test_performance(rank, world_size, group, device):
     # ---- Fused path setup ----
     buf_size = get_sym_buffer_size(num_local_experts, num_total_experts, max_tokens, hidden)
     sym_buf, sym_buf_addrs, sym_handle = alloc_sym_buffer(buf_size, device, group)
+    # DG_SFA_PUSH: separate symmetric staging buffer (NOT appended to sym_buf — growing
+    # sym_buf slows its remote FP4 P2P ~3x on this platform). quant pushes SFA into peers'
+    # staging; expert_preprocess points rank_addr_sfa at this rank's local staging; the
+    # reshape repacks it locally. Register once so the ~10 quant/preprocess call sites are
+    # unchanged.
+    if os.getenv('DG_SFA_PUSH', '0') != '0':
+        staging_size = get_sfa_staging_size(num_local_experts, num_total_experts, max_tokens, hidden)
+        sfa_staging_buf, sfa_staging_addrs, sfa_staging_handle = alloc_sym_buffer(staging_size, device, group)
+        set_sfa_staging_addrs(sfa_staging_addrs, sfa_staging_buf.data_ptr())
     # One-time zero of the atomic-arrival slot region (last 128B); symm_mem.empty() is
     # uninitialized and warmup uses generation=0 (no push), so slots must start < any g.
     sym_buf[buf_size - 128:].zero_()
