@@ -102,6 +102,20 @@ struct BlkwiseQuantGemmSmemConfig : public GemmSmemConfig<SrcT, kNumStages, BLOC
   static constexpr uint32_t kTotalSize = Base::kTotalSize + kSmemScaleASize + kSmemScaleBSize;
 };
 
+template <int kNumStages, int BLOCK_M, int BLOCK_N, int BLOCK_K, typename MainloopFp4>
+struct GemmSmemConfigFp4 {
+  // A is copied with cp.sync
+  // the size of storage of cutlass::float4_t is uint8;
+  static constexpr uint32_t kSmemASize = cute::round_up(kNumStages * BLOCK_M * BLOCK_K * sizeof(cutlass::float4_t), 128);
+  // B is copied with aiu
+  static constexpr uint32_t kSmemBSize = kNumStages * BLOCK_N * BLOCK_K * sizeof(cutlass::float4_t);
+
+  static constexpr auto kSmemSFASize = cute::cosize_v<typename MainloopFp4::SmemLayoutSFA> * sizeof(typename MainloopFp4::ElementSFA);
+  static constexpr auto kSmemSFBSize = cute::cosize_v<typename MainloopFp4::SmemLayoutSFB> * sizeof(typename MainloopFp4::ElementSFB);
+
+  static constexpr uint32_t kTotalSize = kSmemASize + kSmemBSize + kSmemSFASize + kSmemSFBSize;
+};
+
 template <typename SrcT, typename ACopyInst, typename TilerA,
          uint32_t BLOCK_M, uint32_t BLOCK_K, uint32_t STRIDE_AM,
          class TAsA, class... Ts>

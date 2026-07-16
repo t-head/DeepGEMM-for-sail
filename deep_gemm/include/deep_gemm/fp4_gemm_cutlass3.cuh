@@ -1014,8 +1014,8 @@ class Fp4Gemm {
   static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
   static_assert((BlockN == 16) || (BlockN == 32) || (BlockN == 64) || (BlockN == 128) || (BlockN == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
   static_assert((BlockK % 32 == 0), "BlockK must be divideable by 32.");
-  static_assert((WarpM <= 64) && (WarpM % 16 == 0), "WarpM must be divideable by 16.");
-  static_assert((WarpN % 16 == 0), "WarpN must be divideable by 16.");
+  static_assert((WarpM <= 64) && (WarpM % 16 == 0), "WarpM must be divideable by 16 and less than 64.");
+  static_assert((WarpN <= 64) && (WarpN % 16 == 0), "WarpN must be divideable by 16 and less than 64.");
 
 public:
     Fp4Gemm() = default;
