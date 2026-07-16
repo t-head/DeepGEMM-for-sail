@@ -4,7 +4,9 @@ import time
 from typing import Tuple
 import deep_gemm
 from deep_gemm import calc_diff, ceil_div, preprocess_mxfp4_scales, moe_align_block_size
-from utils import construct_group_m_list, get_ref_backend, find_next_power_of_2, check_signal
+from utils import construct, check_signal, construct_group_m_list, get_ref_backend, find_next_power_of_2
+from utils import construct_contiguous_grouped as construct_nopad_base
+from utils import construct_grouped_masked as construct_masked_base
 import argparse
 
 # torch.cuda.manual_seed(42)
@@ -84,23 +86,12 @@ def dequantize_fp4_torch(quant_tensor: torch.Tensor, scale: torch.Tensor, target
 
 def test_gemm(args):
     m, n, k = args['m'], args['n'], args['k']
-    A = torch.randn(m, k, dtype=torch.bfloat16, device='cuda').contiguous()
-    B = torch.randn(n, k, dtype=torch.bfloat16, device='cuda').contiguous()
-    x = quantize_fp4_torch(A)
-    y = quantize_fp4_torch(B)
-    a_dequant = dequantize_fp4_torch(x[0], x[1]).cuda()
-    b_dequant = dequantize_fp4_torch(y[0], y[1]).cuda()
+    x, y, out, ref_out = construct(m, k, n, torch.uint8)
     bias = torch.randn(1, n, dtype=torch.float32, device='cuda') if args.get("with_bias", True) else None
-    out = torch.zeros(m, n, dtype=torch.bfloat16, device='cuda')
-    x_scale = preprocess_mxfp4_scales(scale=x[1])
-    y_scale = preprocess_mxfp4_scales(scale=y[1])
-    x = x[0], x_scale
-    y = y[0], y_scale
 
     deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, bias, out)
 
-    ref_out = torch.mm(a_dequant, b_dequant.T)
-    ref_out = (ref_out + bias).to(torch.bfloat16) if bias is not None else ref_out.to(torch.bfloat16)
+    ref_out = (ref_out.float() + bias).to(torch.bfloat16) if bias is not None else ref_out
     # import ipdb; ipdb.set_trace()
     diff = calc_diff(out, ref_out)
     if diff >= 0.001:
@@ -113,7 +104,10 @@ def test_gemm(args):
 def test_m_grouped_gemm_nopad(args) -> None:
     num_groups, m, n, k, distribution = args['groups'], args['m'], args['n'], args['k'], args['distribution']
     with_bias = args.get("with_bias", True)
-    x, y, m_indices, bias, out, ref_out = construct_grouped(num_groups, m, k, n, distribution, 1, with_bias)
+    m, x, y, m_indices, out, ref_out = construct_nopad_base(num_groups, m, k, n, torch.uint8, distribution, 1)
+    bias = torch.randn((num_groups, n), device='cuda', dtype=torch.float) if with_bias else None
+    if bias is not None:
+        ref_out = (ref_out.float() + torch.where((m_indices != -1).unsqueeze(1), bias[m_indices.clamp(min=0)], torch.zeros_like(bias[0]))).to(torch.bfloat16)
 
     deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices)
 
@@ -131,7 +125,10 @@ def test_m_grouped_gemm_masked(args) -> None:
     enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
     with_bias = args.get("with_bias", True)
     expected_m_per_group = ceil_div(m, num_groups)
-    x, y, bias, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, distribution, enable_sbo_overlap, with_bias=with_bias)
+    x, y, masked_m, out, ref_out, signal, max_m = construct_masked_base(num_groups, m, expected_m_per_group, k, n, torch.uint8, distribution, enable_sbo_overlap)
+    bias = torch.randn((num_groups, n), device='cuda', dtype=torch.float) if with_bias else None
+    if bias is not None:
+        ref_out = (ref_out.float() + bias.unsqueeze(1)).to(torch.bfloat16)
     result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, bias, out, masked_m, expected_m_per_group, enable_sbo_overlap=enable_sbo_overlap, signal=signal)
 
     if enable_sbo_overlap:
@@ -147,43 +144,6 @@ def test_m_grouped_gemm_masked(args) -> None:
             assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
     print(f"Passed with acc_check. diff: {diff}\n")
     return
-
-def construct_grouped(num_groups: int, m: int, k: int, n: int, distribution: str, alignment: int, with_bias: bool = True):
-    group_ms = construct_group_m_list(distribution, num_groups, m)
-    m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
-    m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
-    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
-    bias = torch.randn((num_groups, n), device='cuda', dtype=torch.float) if with_bias else None
-
-    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
-    ref_out = torch.empty((m, n), device='cuda', dtype=torch.float)
-
-    start = 0
-    for i, group_m in enumerate(group_ms):
-        actual_end = start + group_m
-        aligned_end = start + ceil_div(group_m, alignment) * alignment
-        m_indices[start:actual_end] = i
-        m_indices[actual_end:aligned_end] = -1
-        a, a_scale = quantize_fp4_torch(x[start:aligned_end].to(torch.bfloat16).cuda())
-        b, b_scale = quantize_fp4_torch(y[i].to(torch.bfloat16).cuda())
-        a_dequant = dequantize_fp4_torch(a, a_scale).to(torch.float)
-        b_dequant = dequantize_fp4_torch(b, b_scale).to(torch.float)
-        ref_out[start:aligned_end] = a_dequant @ b_dequant.t()
-        ref_out[start:aligned_end] = ref_out[start:aligned_end] + bias[i] if bias is not None else ref_out[start:aligned_end]
-        start = aligned_end
-
-    x_fp4 = quantize_fp4_torch(x.to(torch.bfloat16).to('cuda'))
-    x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4[1])
-    y_fp4 = (torch.empty((num_groups, n, int(k / 2)), device='cuda', dtype=torch.uint8), torch.empty((num_groups, n, int(k / 32)), device='cuda', dtype=torch.uint8))
-    y_scale = []
-    for i in range(num_groups):
-        y_fp4[0][i], y_fp4[1][i] = quantize_fp4_torch(y[i].to(torch.bfloat16))
-        # y_scale.append(uint8_padding(y_fp4[1][i]))
-        y_scale.append(y_fp4[1][i])
-    y_fp4_scale = torch.stack(y_scale, dim=0)
-    y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
-    return (x_fp4[0].to("cuda"), x_fp4_scale.to("cuda")), (y_fp4[0].to("cuda"), y_fp4_scale.to("cuda")), m_indices, bias, out, ref_out.to('cuda').to(torch.bfloat16)
 
 
 def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, distribution: str,

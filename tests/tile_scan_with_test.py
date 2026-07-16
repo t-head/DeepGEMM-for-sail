@@ -206,10 +206,7 @@ def test_func_nopad(cycle, tid, m, n, k, d, tile_list, x, y, out, m_indices, dis
         elif d == torch.float8_e4m3fn:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices, distribute, tile_config)
         elif d == torch.uint8:
-            y_value, _ = y
-            num_groups, n, k = y_value.shape
-            bias = torch.zeros((num_groups, n), device='cuda', dtype=torch.float)
-            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices, distribute, tile_config)
+            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices, distribute, tile_config)
         else:
             deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices, distribute, tile_config)
 
@@ -237,12 +234,7 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, args = None) -> None:
     else:
         distribute = torch.tensor(distribution, dtype=torch.int32, device='cuda')
 
-    if d == torch.uint8:
-        from test_fp4_core import construct_grouped
-        x, y, m_indices, bias, out, ref_out = construct_grouped(num_groups, m, k, n, distribution, 1)
-        ref_out = ref_out - bias
-    else:
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1)
+    m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1)
     tile_list = get_tile_list(d, m, n, k, num_groups, 'nopad', True)
     '''
     block_m, block_n, block_k, warp_m, warp_n, num_stages = 64, 256, 128, 32, 32, 3

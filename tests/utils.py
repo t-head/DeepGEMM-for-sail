@@ -252,16 +252,15 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
         from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, preprocess_mxfp4_scales
         A = torch.randn(m, k, dtype=torch.bfloat16, device='cuda').contiguous()
         B = torch.randn(n, k, dtype=torch.bfloat16, device='cuda').contiguous()
-        a, a_scale = quantize_fp4_torch(A.to(torch.bfloat16))
-        b, b_scale = quantize_fp4_torch(B.to(torch.bfloat16))
-        a_dequant = dequantize_fp4_torch(a, a_scale).cuda()
-        b_dequant = dequantize_fp4_torch(b, b_scale).cuda()
-        bias = torch.zeros(m, n, dtype=torch.float32, device='cuda')
-        out = torch.zeros(m, n, dtype=torch.float32, device='cuda')
+        a, a_scale = quantize_fp4_torch(A)
+        b, b_scale = quantize_fp4_torch(B)
+        a_dequant = dequantize_fp4_torch(a, a_scale)
+        b_dequant = dequantize_fp4_torch(b, b_scale)
+        out = torch.zeros(m, n, dtype=torch.bfloat16, device='cuda')
         a_scale = preprocess_mxfp4_scales(scale=a_scale)
         b_scale = preprocess_mxfp4_scales(scale=b_scale)
         ref_out = torch.mm(a_dequant, b_dequant.T)
-        ref_out = ref_out + bias
+        ref_out = ref_out.to(torch.bfloat16)
         return (a, a_scale), (b, b_scale), out, ref_out
     elif d == torch.float8_e4m3fn:
         if quant_type == "channel":
@@ -543,6 +542,32 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
         else:
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return m, (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    elif d == torch.uint8:
+        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, preprocess_mxfp4_scales
+        # Recompute ref_out from fp4-dequantized values for accurate comparison
+        if _acc_check:
+            start = 0
+            for i, group_m in enumerate(group_ms):
+                aligned_end = start + ceil_div(group_m, alignment) * alignment
+                a_q, a_s = quantize_fp4_torch(x[start:aligned_end].to(torch.bfloat16).to('cuda'))
+                b_q, b_s = quantize_fp4_torch(y[i].to(torch.bfloat16).to('cuda'))
+                a_dq = dequantize_fp4_torch(a_q, a_s).to(torch.float)
+                b_dq = dequantize_fp4_torch(b_q, b_s).to(torch.float)
+                ref_out[start:aligned_end] = a_dq @ b_dq.t()
+                start = aligned_end
+            ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
+        # Quantize x (whole tensor) and y (per group) to fp4
+        x_fp4 = quantize_fp4_torch(x.to(torch.bfloat16).to('cuda'))
+        x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4[1])
+        y_fp4_packed = torch.empty((num_groups, n, int(k / 2)), device='cuda', dtype=torch.uint8)
+        y_fp4_scale_list = []
+        for i in range(num_groups):
+            b_packed, b_s = quantize_fp4_torch(y[i].to(torch.bfloat16).to('cuda'))
+            y_fp4_packed[i] = b_packed
+            y_fp4_scale_list.append(b_s)
+        y_fp4_scale = torch.stack(y_fp4_scale_list, dim=0)
+        y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
+        return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4_packed.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d in ('w4a16', 'w4fa16', 'w4fa16_s16'):
         return m, x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     else:
@@ -604,6 +629,30 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
         else:
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
+    elif d == torch.uint8:
+        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, preprocess_mxfp4_scales
+        # Quantize x and y per group to fp4 and compute ref from dequantized values
+        x_fp4_list, x_fp4_scale_list = [], []
+        y_fp4_list, y_fp4_scale_list = [], []
+        x_ref_list, y_ref_list = [], []
+        for i in range(num_groups):
+            a_q, a_s = quantize_fp4_torch(x[i].to('cuda'))
+            b_q, b_s = quantize_fp4_torch(y[i].to('cuda'))
+            x_fp4_list.append(a_q)
+            x_fp4_scale_list.append(a_s)
+            y_fp4_list.append(b_q)
+            y_fp4_scale_list.append(b_s)
+            x_ref_list.append(dequantize_fp4_torch(a_q, a_s).to(torch.float))
+            y_ref_list.append(dequantize_fp4_torch(b_q, b_s).to(torch.float))
+        x_fp4 = torch.stack(x_fp4_list, dim=0)
+        x_fp4_scale = preprocess_mxfp4_scales(scale=torch.stack(x_fp4_scale_list, dim=0))
+        y_fp4 = torch.stack(y_fp4_list, dim=0)
+        y_fp4_scale = preprocess_mxfp4_scales(scale=torch.stack(y_fp4_scale_list, dim=0))
+        if _acc_check:
+            x_ref = torch.stack(x_ref_list, dim=0)
+            y_ref = torch.stack(y_ref_list, dim=0)
+            ref_out = torch.einsum('gmk,gnk->gmn', x_ref, y_ref)
+        return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda').to(torch.bfloat16), signal.to('cuda'), max_m
     elif d in ('w4a16', 'w4fa16', 'w4fa16_s16'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     else:
@@ -1001,6 +1050,8 @@ def test_gemm(args) -> None:
             deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
         elif d == torch.float8_e4m3fn:
             deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out)
+        elif d == torch.uint8:
+            deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, None, out)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
@@ -1046,6 +1097,8 @@ def test_gemm(args) -> None:
                 deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
             elif d == torch.float8_e4m3fn:
                 deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out)
+            elif d == torch.uint8:
+                deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, None, out)
             else:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)
@@ -1060,6 +1113,9 @@ def test_m_grouped_gemm_contiguous(args) -> None:
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
+    if d == torch.uint8:
+        print("ERROR: fp4 does not support GroupedContiguous, please use GroupedNoPad or GroupedMasked instead!")
+        exit(1)
     if use_ppu:
         m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, get_m_alignment_for_contiguous_layout(),quant_type=quant_type)
         print(f"test_m_grouped_gemm_contiguous->test_func: GroupedContiguous,groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")
@@ -1150,6 +1206,9 @@ def test_m_grouped_gemm_masked(args) -> None:
         elif d == torch.float8_e4m3fn:
             result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+        elif d == torch.uint8:
+            result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
+                                                                    enable_sbo_overlap=enable_sbo_overlap, signal=signal)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_s16'):
             deep_gemm.m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group, fp4_use_bf16_scale=(d == 'w4fa16_s16'))
         else:
@@ -1196,6 +1255,9 @@ def test_m_grouped_gemm_masked(args) -> None:
                                                                         enable_sbo_overlap=enable_sbo_overlap, signal=signal)
             elif d == torch.float8_e4m3fn:
                 result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
+                                                                        enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+            elif d == torch.uint8:
+                result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
                                                                         enable_sbo_overlap=enable_sbo_overlap, signal=signal)
             else:
                 print("ERROR: Unsupported dtype, please check!")
@@ -1271,6 +1333,8 @@ def test_m_grouped_gemm_nopad(args) -> None:
             deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
         elif d == torch.float8_e4m3fn:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
+        elif d == torch.uint8:
+            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_s16'):
             deep_gemm.m_grouped_gemm_w4a16_nopad(x, y, out, m_indices, fp4_use_bf16_scale=(d == 'w4fa16_s16'))
         else:
@@ -1301,6 +1365,8 @@ def test_m_grouped_gemm_nopad(args) -> None:
                 deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
             elif d == torch.float8_e4m3fn:
                 deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
+            elif d == torch.uint8:
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
             else:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)

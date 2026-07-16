@@ -5,10 +5,9 @@ from typing import List, Dict, Tuple
 import deep_gemm
 import argparse
 import copy
-from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, construct_grouped
 from deep_gemm.jit_kernels.utils import get_num_sms
-from deep_gemm import preprocess_mxfp4_scales, calc_diff
-from utils import construct_group_m_list, split_list_into_groups
+from deep_gemm import calc_diff
+from utils import construct, construct_contiguous_grouped, construct_group_m_list, split_list_into_groups
 from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
 from deep_gemm import ceil_div
 from deep_gemm.jit_kernels.utils import get_search_space
@@ -17,22 +16,9 @@ from deep_gemm.jit_kernels.utils import get_search_space
 def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[bool, str]:
     if 'dense' in gemm_type.lower():
         try:
-            A = torch.randn(m, k, dtype=torch.bfloat16, device='cuda').contiguous()
-            B = torch.randn(n, k, dtype=torch.bfloat16, device='cuda').contiguous()
-            x = quantize_fp4_torch(A)
-            y = quantize_fp4_torch(B)
-            a_dequant = dequantize_fp4_torch(x[0], x[1]).cuda().float()
-            b_dequant = dequantize_fp4_torch(y[0], y[1]).cuda().float()
-            bias = torch.randn(1, n, dtype=torch.float32, device='cuda')
-            out = torch.zeros(m, n, dtype=torch.bfloat16, device='cuda')
-            ref_out = torch.mm(a_dequant, b_dequant.T)
-            ref_out = ref_out + bias
-            x_scale = preprocess_mxfp4_scales(scale=x[1])
-            y_scale = preprocess_mxfp4_scales(scale=y[1])
-            x = x[0], x_scale
-            y = y[0], y_scale
+            x, y, out, ref_out = construct(m, k, n, torch.uint8)
 
-            deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, bias, out, configs)
+            deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, None, out, configs)
             torch.cuda.synchronize()
 
             diff = calc_diff(out, ref_out.to('cuda').to(torch.bfloat16))
@@ -52,9 +38,9 @@ def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[
             return False, error_msg
     elif 'nopad' in gemm_type.lower():
         try:
-            x, y, m_indices, bias, out, ref_out = construct_grouped(num_groups, m, k, n, 'uniform', 1)
+            m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, torch.uint8, 'uniform', 1)
 
-            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices, configs=configs)
+            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices, configs=configs)
             torch.cuda.synchronize()
             diff = calc_diff(out, ref_out.to('cuda').to(torch.bfloat16))
             if diff < 0.001:
