@@ -3,9 +3,11 @@ import torch.nn.functional as F
 import time
 from typing import Tuple
 import deep_gemm
-from deep_gemm import calc_diff, ceil_div, preprocess_mxfp4_scales
+from deep_gemm import calc_diff, ceil_div, preprocess_mxfp4_scales, moe_align_block_size
 from utils import construct_group_m_list, get_ref_backend, find_next_power_of_2, check_signal
 import argparse
+
+# torch.cuda.manual_seed(42)
 
 def right_shift_unsigned(x, shift):
     return (x >> shift) & ((1 << (32 - shift)) - 1)
@@ -281,9 +283,91 @@ def test_gemm_loop(m: int = None, n: int = None, k: int = None) -> None:
                     test_gemm(args)
     print("Passed\n")
 
+def construct_grouped_fused(num_groups: int, m: int, k: int, n: int, topk: int, distribution: str, alignment: int):
+    ### 0. prepare input
+    score = torch.randn((m, num_groups), device='cuda', dtype=torch.float32)
+    score = torch.softmax(score, dim=-1, dtype=torch.float32)
+    topk_weight, topk_ids = torch.topk(score, topk)
+    topk_ids = topk_ids.to(torch.int32)
+
+    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+
+    ### the shape of fusedMoe is same with fusedNoPad
+    out = torch.empty((m * topk, n), device='cuda', dtype=torch.bfloat16)
+    ref_out = []
+
+    ### 1. do quantization
+    x_fp4_tupple = quantize_fp4_torch(x)
+    x_fp4 = x_fp4_tupple[0]
+    ### no preprocess_mxfp4_scales, padding to even
+    x_scale_fp4 = x_fp4_tupple[1]
+    if (x_scale_fp4.shape[-1] % 2):
+        x_scale_fp4 = torch.nn.functional.pad(x_scale_fp4, (0, 1))
+    x_scale_fp4 = x_scale_fp4.view(torch.uint16) 
+
+    y_fp4_tuple = (torch.empty((num_groups, n, x_fp4.shape[-1]), device='cuda', dtype=torch.uint8), torch.empty((num_groups, n, x_fp4_tupple[1].shape[-1]), device='cuda', dtype=torch.uint8))
+    y_scale = []
+    for i in range(num_groups):
+        y_fp4_tuple[0][i], y_fp4_tuple[1][i] = quantize_fp4_torch(y[i])
+        y_scale.append(y_fp4_tuple[1][i])
+    y_fp4 = y_fp4_tuple[0]
+    y_scale_fp4_ = torch.stack(y_scale, dim=0)
+    y_scale_fp4 = preprocess_mxfp4_scales(scale=y_scale_fp4_)
+
+    ### 2. calculate reference output
+    k_ = x_fp4.shape[-1]
+    sfk_ = x_fp4_tupple[1].shape[-1]
+    x_fp4_ = x_fp4.view(m, -1, k_).repeat(1, topk, 1).reshape(-1, k_)
+    x_scale_fp4_ = x_fp4_tupple[1].view(m, -1, sfk_).repeat(1, topk, 1).reshape(-1, sfk_)
+    topk_ids_ = topk_ids.view(-1)
+    for i in range(y_fp4.shape[0]):
+        mask = (topk_ids_ == i)
+        if mask.sum():
+            ref_out_group = dequantize_fp4_torch(x_fp4_[mask], x_scale_fp4_[mask]) @ dequantize_fp4_torch(y_fp4[i], y_scale_fp4_[i]).transpose(0, 1)
+            ref_out.append(ref_out_group)
+    ref_out = torch.concat(ref_out, dim=0)
+
+    ### 3. return
+    return (x_fp4, x_scale_fp4), (y_fp4, y_scale_fp4), topk_ids, out, ref_out
+
+def test_m_grouped_gemm_fused(args) -> None:
+    num_groups, m, n, k, topk, distribution = args['groups'], args['m'], args['n'], args['k'], args['topk'], args['distribution']
+    x, y, topk_ids, out, ref_out = construct_grouped_fused(num_groups, m, k, n, topk, distribution, 1)
+
+    config, m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, inv_perm, expert_ids = (
+        moe_align_block_size(x[0], y[0], topk_ids, False)
+    )
+    deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, config)
+
+    diff = calc_diff(out, ref_out)
+    if diff >= 0.001:
+        print("ref_out:", ref_out)
+        print("out:", out)
+        torch.testing.assert_close(out, ref_out, rtol=1e-3, atol=1e-4)
+    assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+    print(f"Passed with acc_check. diff: {diff}\n")
+    return
+
+def test_m_grouped_gemm_fused_loop(num_groups: int = None, m: int = None, n: int = None, k: int = None, topk: int = None) -> None:
+    print("Running GroupedFused GEMM test...")
+    if num_groups is not None and m is not None and n is not None and k is not None and topk is not None:
+        print(f"Testing with num_groups={num_groups}, m={m}, n={n}, k={k}, topk={topk}")
+        args = {"groups": num_groups, "m": m, "n": n, "k": k, "topk": topk, "distribution": "uniform"}
+        test_m_grouped_gemm_fused(args)
+    else:
+        print("Running default test suite...")
+        ### derived from glm5 tp16
+        for num_groups, topk, m in ((256, 8, 16), (256, 1, 16 * 8), (256, 8, 64), (256, 1, 64 * 8), (256, 8, 256), (256, 1, 256 * 8), (256, 8, 2048), (256, 1, 2048 * 8), ):
+            for k, n in ((6144, 256), ):
+                print(f"Testing with num_groups={num_groups}, m={m}, n={n}, k={k}, topk={topk}")
+                args = {"groups": num_groups, "m": m, "n": n, "k": k, "topk": topk, "distribution": "uniform"}
+                test_m_grouped_gemm_fused(args)
+    print("Passed\n")
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Process target function api test.")
-    parser.add_argument('--func', default=None, choices=["DenseGemm", "GroupedNoPad", "GroupedMasked"], required=False, help='target test func')
+    parser.add_argument('--func', default=None, choices=["DenseGemm", "GroupedNoPad", "GroupedMasked", "GroupedFused"], required=False, help='target test func')
     parser.add_argument('--num_groups', type=int, help='Number of groups for Grouped GEMM')
     parser.add_argument('--m', type=int, help='M dimension')
     parser.add_argument('--n', type=int, help='N dimension')
@@ -302,7 +386,11 @@ if __name__ == '__main__':
 
         if args.func in ['DenseGemm']:
             test_gemm_loop(m, n, k)
+
+        if args.func in ['GroupedFused']:
+            test_m_grouped_gemm_fused_loop(m, n, k)
     else:
         test_m_grouped_gemm_nopad_loop(num_groups, m, n, k)
         test_m_grouped_gemm_masked_loop(num_groups, m, n, k)
         test_gemm_loop(m, n, k)
+        test_m_grouped_gemm_fused_loop(m, n, k)

@@ -1,7 +1,6 @@
 #pragma once
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
-#define ACOMPUTE_VERSION 10500
 
 #include "cutlass/cutlass.h"
 #include "utils.cuh"
@@ -526,41 +525,41 @@ struct CollectiveMmaScaleFp4
       sf_s2r(sSFB, tCrSFB, base_offset_sfb, lane_idx, Int<0>{}, 0);
     }
 
-      auto process_kblock_iterations = [&](auto k_block) {
-        if constexpr (k_block == K_BLOCK_MAX - 1)
-        {
-          // Slice the smem_pipe_read smem
-          tCsA_p = tCsA(_,_,_,smem_pipe_read);
-          tCsB_p = tCsB(_,_,_,smem_pipe_read);
-          copy(smem_tiled_copy_A, tCsA_p(_,_,_0{}), tCrA_copy_view(_,_,_0{}));
-          copy(smem_tiled_copy_B, tCsB_p(_,_,_0{}), tCrB_copy_view(_,_,_0{}));
-          sf_s2r(sSFA, tCrSFA, base_offset_sfa, lane_idx, Int<0>{}, smem_pipe_read);
-          sf_s2r(sSFB, tCrSFB, base_offset_sfb, lane_idx, Int<0>{}, smem_pipe_read);
-        } else {
-          auto k_block_next = k_block + Int<1>{};  // static
-          copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
-          copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
-          sf_s2r(sSFA, tCrSFA, base_offset_sfa, lane_idx, k_block_next, smem_pipe_read);
-          sf_s2r(sSFB, tCrSFB, base_offset_sfb, lane_idx, k_block_next, smem_pipe_read);
+    auto process_kblock_iterations = [&](auto k_block) {
+      if constexpr (k_block == K_BLOCK_MAX - 1)
+      {
+        // Slice the smem_pipe_read smem
+        tCsA_p = tCsA(_,_,_,smem_pipe_read);
+        tCsB_p = tCsB(_,_,_,smem_pipe_read);
+        copy(smem_tiled_copy_A, tCsA_p(_,_,_0{}), tCrA_copy_view(_,_,_0{}));
+        copy(smem_tiled_copy_B, tCsB_p(_,_,_0{}), tCrB_copy_view(_,_,_0{}));
+        sf_s2r(sSFA, tCrSFA, base_offset_sfa, lane_idx, Int<0>{}, smem_pipe_read);
+        sf_s2r(sSFB, tCrSFB, base_offset_sfb, lane_idx, Int<0>{}, smem_pipe_read);
+      } else {
+        auto k_block_next = k_block + Int<1>{};  // static
+        copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
+        copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
+        sf_s2r(sSFA, tCrSFA, base_offset_sfa, lane_idx, k_block_next, smem_pipe_read);
+        sf_s2r(sSFB, tCrSFB, base_offset_sfb, lane_idx, k_block_next, smem_pipe_read);
+      }
+      // Transform before compute
+      cute::transform(tCrA(_,_,k_block), TransformA{});
+      cute::transform(tCrB(_,_,k_block), TransformB{});
+      cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrSFA(_,_,k_block), tCrB(_,_,k_block), tCrSFB(_,_,k_block), src_accum);
+      if constexpr (k_block == K_BLOCK_MAX - 2) {
+        // Commit the smem for smem_pipe_read
+        cp_async_wait<DispatchPolicy::Stages-2>();
+        __syncthreads();
+
+        if (k_tile_count > 0){
+          copy_to_tsm(smem_pipe_write, *k_tile_iter, warp_idx);
+          ++k_tile_iter;
         }
-        // Transform before compute
-        cute::transform(tCrA(_,_,k_block), TransformA{});
-        cute::transform(tCrB(_,_,k_block), TransformB{});
-        cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrSFA(_,_,k_block), tCrB(_,_,k_block), tCrSFB(_,_,k_block), src_accum);
-        if constexpr (k_block == K_BLOCK_MAX - 2) {
-          // Commit the smem for smem_pipe_read
-          cp_async_wait<DispatchPolicy::Stages-2>();
-          __syncthreads();
+        cp_async_fence();
 
-          if (k_tile_count > 0){
-            copy_to_tsm(smem_pipe_write, *k_tile_iter, warp_idx);
-            ++k_tile_iter;
-          }
-          cp_async_fence();
-
-          // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
-          ++smem_pipe_read;
-          smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
+        // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
+        ++smem_pipe_read;
+        smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
 
           smem_pipe_write = smem_pipe_read;
         }

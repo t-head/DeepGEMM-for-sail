@@ -5,6 +5,7 @@ from .tuner import jit_tuner
 from .gemm import get_best_configs as bf16_get_best_configs
 from .gemm_int8 import get_best_configs as perchannel_get_best_configs
 from .gemm_fp8 import get_best_configs as fp8_blkwise_get_best_configs
+from .gemm_fp4 import get_best_configs as fp4_get_best_configs
 from .utils import get_num_sms, ceil_div, GemmType, get_col_major_tma_aligned_tensor
 import os
 
@@ -107,6 +108,31 @@ moe_align_block_size_kernel_launcher<BLOCK_M, kNumGroups, kTopK>(m_rows,
             intermediate_buffer, stream);
 """
 
+includes_fp4_fusedmoe_gemm = ('"../deep_gemm/fused_moe_fp4_gemm.cuh"', )
+template_fp4_fusedmoe_gemm = """
+using namespace deep_gemm;
+// Templated args from Python JIT call
+constexpr auto N = {N}, K = {K};
+constexpr auto kNumGroups = {NUM_GROUPS};
+constexpr auto BLOCK_M = {BLOCK_M};
+constexpr auto BLOCK_N = {BLOCK_N};
+constexpr auto WARP_M = {WARP_M};
+constexpr auto WARP_N = {WARP_N};
+constexpr auto BLOCK_K = {BLOCK_K};
+constexpr auto kNumStages = {NUM_STAGES};
+constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
+
+// Make a templated grouped GEMM
+using fused_moe_gemm_fp4 = Fp4FusedMoeGemm<N, K, kNumGroups,
+            BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumStages,
+            GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelType::{KERNEL_TYPE}>;
+
+// Launch kernel
+fused_moe_gemm_fp4::run(out, lhs, rhs, lhs_scales, rhs_scales,
+            m_rows, expert_ids_and_cumsum, sorted_token_ids,
+            aligned_num_m_blocks, m, topk, stream, num_sms);
+"""
+
 def moe_align_block_size(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -160,6 +186,8 @@ def moe_align_block_size(
             config = perchannel_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
         elif dtype == torch.float8_e4m3fn:
             config = fp8_blkwise_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
+        elif dtype == torch.uint8:
+            config = fp4_get_best_configs(numel, expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
     block_m = config[1]
@@ -505,3 +533,74 @@ def m_grouped_gemm_int8_int8_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
                                      configs) -> None:
     m_grouped_gemm_perchannel_nt_fused(lhs_, rhs_, out,
         m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, configs)
+
+def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
+                                     rhs_: Tuple[torch.Tensor],
+                                     out: torch.Tensor,
+                                     m_rows: torch.Tensor,
+                                     expert_ids_and_cumsum: torch.Tensor,
+                                     sorted_token_ids: torch.Tensor,
+                                     aligned_num_m_blocks: torch.Tensor,
+                                     configs) -> None:
+    from .gemm_fp4 import check_mxfp4_scales_layout
+
+    lhs, lhs_scales = lhs_
+    rhs, rhs_scales = rhs_
+    num_token, k = lhs.shape
+    num_groups, n, k_ = rhs.shape
+    m_sum, n_ = out.shape
+
+    # Type and shape checks
+    assert k == k_ and n == n_
+    assert lhs.dtype == torch.uint8 and rhs.dtype == torch.uint8
+    assert lhs_scales.dtype == torch.uint16 and rhs_scales.dtype == torch.uint16
+    assert out.dtype == torch.bfloat16
+    assert lhs.is_contiguous() and rhs.is_contiguous()
+    assert out.is_contiguous()
+    ### lhs_scales is k major for fp4 fused moe, which has better sfa acp efficiency.
+    assert lhs_scales.is_contiguous() and check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)
+    assert k % 16 == 0, (
+        "K must be a multiple of 16, "
+        "so that 16 8-bit elements can be loaded with 128b aligned vectorized memory access."
+    )
+    assert n % 2 == 0, f"n ({n}) must be divisible by 2)"
+
+    topk = int(m_sum / num_token)
+    # Do nothing if `m_sum` is zero
+    if m_sum == 0:
+        return
+    
+    ### parse tile config
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = configs
+
+    global includes_fp4_fusedmoe_gemm, template_fp4_fusedmoe_gemm
+    args = (lhs, lhs_scales, rhs, rhs_scales, out, m_rows,
+            expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks,
+            num_token, topk, torch.cuda.current_stream(), int(num_sms))
+    kernel_type = 'Default'
+    runtime = jit_tuner.compile_and_tune(
+        name='fusedmoe_gemm_fp4_fp4_bf16_nt',
+        keys={'N': n, 'K': k, 'NUM_GROUPS': num_groups,
+                'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+                'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages,
+                'ENABLE_SBO_OVERLAP': False,
+                'GEMM_TYPE': 'GroupedFused',
+                'KERNEL_TYPE': kernel_type},
+        space=(),
+        includes=includes_fp4_fusedmoe_gemm,
+        arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.uint16),
+                ('rhs', lhs.dtype), ('rhs_scales', torch.uint16),
+                ('out', torch.bfloat16),
+                ('m_rows', torch.int32),
+                ('expert_ids_and_cumsum', torch.int32),
+                ('sorted_token_ids', torch.int32),
+                ('aligned_num_m_blocks', torch.int32),
+                ('m', int),
+                ('topk', int),
+                ('stream', torch.cuda.Stream),
+                ('num_sms', int)),
+        template=template_fp4_fusedmoe_gemm,
+        jit_include_dir='actlize_v1.0.0',
+        args=args
+    )
+    runtime(*args)
