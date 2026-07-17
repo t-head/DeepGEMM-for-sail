@@ -3,11 +3,11 @@ import mmap
 import os
 import re
 import subprocess
-from torch.utils.cpp_extension import CUDA_HOME
+PPU_HOME = os.environ.get('PPU_SDK') or os.environ.get('PPU_HOME') or '/usr/local/PPU_SDK'
 
 
-def run_cuobjdump(file_path):
-    command = [f'{CUDA_HOME}/bin/cuobjdump', '-sass', file_path]
+def run_hgobjdump(file_path):
+    command = [f'{PPU_HOME}/bin/hgobjdump', '-sass', file_path]
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     assert result.returncode == 0
     return result.stdout
@@ -37,7 +37,7 @@ def extract_ffma(sass):
                 collected.append((f'{arch_name}::{func_name}', current))
             current = []
 
-    if int(os.getenv('DG_JIT_PRINT_REG_REUSE', 0)):
+    if os.getenv('DG_PRINT_REG_REUSE', None):
         print(f'Found {len(collected)} FFMA segments')
     return collected
 
@@ -100,7 +100,7 @@ def modify_segment(m, name, ffma_lines):
         dst_reg_set.add(dst_reg)
         new_le_bytes.append(low_hex.to_bytes(8, 'little') + high_hex.to_bytes(8, 'little'))
         last_reused, last_dst_reg = reused, dst_reg
-    if int(os.getenv('DG_JIT_PRINT_REG_REUSE', 0)):
+    if os.getenv('DG_PRINT_REG_REUSE', None):
         print(f' > segment `{name}` new reused list ({num_changed} changed): {reused_list}')
 
     # Find the offset
@@ -118,9 +118,9 @@ def modify_segment(m, name, ffma_lines):
 
 
 def process(path):
-    if int(os.getenv('DG_JIT_PRINT_REG_REUSE', 0)):
+    if os.getenv('DG_PRINT_REG_REUSE', None):
         print(f'Processing {path}')
-    output = run_cuobjdump(path)
+    output = run_hgobjdump(path)
     segments = extract_ffma(output)
     with open(path, 'r+b') as f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_WRITE)

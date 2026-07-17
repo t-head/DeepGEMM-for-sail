@@ -78,13 +78,27 @@ class suppress_stdout_stderr:
 
 
 def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: bool = False,
-                 trace_path: str = None, barrier_comm_profiling: bool = False, flush_l2: bool = True,
-                 with_multiple_kernels: bool = False):
+                 trace_path: str = None, barrier_comm_profiling: bool = False, flush_l2: bool = True):
     # Conflict with Nsight Systems
-    using_nsys = int(os.environ.get('DG_NSYS_PROFILING', 0))
+    using_nsys = os.environ.get('DG_NSYS_PROFILING', False)
 
     # By default, flush L2 with an excessive 8GB memset to give the GPU some (literal) chill time without full idle
+    # this avoid thermal throttling while keeping DVFS at max clocks (slight gain vs sleep / more consistent on GH200)
+    sleep_between_tests = 0.0
     flush_l2_size = int(8e9 // 4)
+    if os.environ.get('DG_BENCH_DISABLE_L2_FLUSH', False):
+        flush_l2 = False
+    if os.environ.get('DG_BENCH_POWER_LIMITED', False):
+        # if we want to be thermally limited, we need to run many iterations non-stop for a fairly long time
+        # and spend as little time as possible doing memset and other setup work (80MiB should be enough to flush L2)
+        num_tests = 2000
+        flush_l2_size = int(80e6 // 4)
+    sleep_val = os.environ.get('DG_BENCH_SLEEP_BETWEEN_TESTS', False)
+    if sleep_val:
+        try:
+            sleep_between_tests = float(sleep_val)
+        except ValueError:
+            pass  # Keep default
 
     # For some auto-tuning kernels with prints
     fn()
@@ -103,6 +117,8 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
                     lhs @ rhs
                     dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
                 for _ in range(num_tests):
+                    if sleep_between_tests > 0.0:
+                        time.sleep(sleep_between_tests)
                     if flush_l2:
                         torch.empty(flush_l2_size, dtype=torch.int, device='cuda').zero_()
                     fn()
@@ -120,9 +136,8 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
     prof_lines = profiler.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
     kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
-    if not with_multiple_kernels:
-        for name in kernel_names:
-            assert sum([name in line for line in prof_lines]) == 1, f'Errors of the kernel {name} in the profiling table'
+    for name in kernel_names:
+        assert sum([name in line for line in prof_lines]) == 1, f'Errors of the kernel {name} in the profiling table'
 
     # Save chrome traces
     if trace_path is not None:
@@ -132,21 +147,15 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
     units = {'ms': 1e3, 'us': 1e6}
     kernel_times = []
     for name in kernel_names:
-        total_time = 0
-        total_num = 0
         for line in prof_lines:
             if name in line:
                 time_str = line.split()[-2]
-                num_str = line.split()[-1]
                 for unit, scale in units.items():
                     if unit in time_str:
-                        total_time += float(time_str.replace(unit, '')) / scale * int(num_str)
-                        total_num += int(num_str)
+                        kernel_times.append(float(time_str.replace(unit, '')) / scale)
                         break
-        kernel_times.append(total_time / total_num)
-
+                break
     return tuple(kernel_times) if is_tupled else kernel_times[0]
-
 
 def calc_diff(x, y):
     x, y = x.double(), y.double()
@@ -163,3 +172,28 @@ def count_bytes(tensors):
         else:
             total += t.numel() * t.element_size()
     return total
+
+def get_case_id() -> int:
+    if not hasattr(get_case_id, 'case_id'):
+        get_case_id.case_id = 0
+    get_case_id.case_id += 1
+    return get_case_id.case_id
+
+def transform_sf_into_required_layout(
+    sf: torch.Tensor,
+    mn: int,
+    k: int,
+    recipe: tuple[int, int, int],
+    num_groups: int | None = None,
+    is_sfa: bool = False,
+    disable_ue8m0_cast: bool = False,
+) -> torch.Tensor:
+    """
+    https://github.com/deepseek-ai/DeepGEMM/blob/c9f8b34dcdacc20aa746b786f983492c51072870/csrc/apis/layout.hpp
+
+    Fake implementation intended to emulate upstream PPU0010 (FP32, 128, 128) path:
+    no transform, just return `sf` (optionally validating basic expectations).
+    All parameters are accepted to match the original signature.
+    PPU DeepGemm get col-major input and row-major weights.
+    """
+    return sf.contiguous()

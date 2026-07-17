@@ -7,5 +7,15 @@ dist
 *.pyc
 
 # Third-party links created by `setup.py develop`
-deep_gemm/include/cute
+deep_gemm/include/actlize_v1.0.0/cute
+deep_gemm/include/actlize_v0.5.0
+deep_gemm/include/actlize_v1.0.0/cutlass
+deep_gemm/include/actlize_v1.0.0/ppu
+deep_gemm/include/actlize_v1.0.0/tools
+deep_gemm/include/accutlass.h
+deep_gemm/include/aiu
 deep_gemm/include/cutlass
+deep_gemm/include/actlize_v1.0.0/ppu_include.hpp
+deep_gemm/include/actlize_v1.0.0/accutlass.hpp
+.eggs/
+tmp/

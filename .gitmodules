@@ -1,3 +1,12 @@
-[submodule "third-party/cutlass"]
-	path = third-party/cutlass
-	url = https://github.com/NVIDIA/cutlass.git
+[submodule "third-party/actlize_v0.5.0"]
+	path = third-party/actlize_v0.5.0
+	url = https://github.com/t-head/actlize.git
+
+[submodule "third-party/actlize_v1.0.0"]
+	path = third-party/actlize_v1.0.0
+	url = https://github.com/t-head/actlize.git
+
+[submodule "third-party/fmt"]
+	path = third-party/fmt
+	url = https://github.com/fmtlib/fmt.git
+	branch = master
