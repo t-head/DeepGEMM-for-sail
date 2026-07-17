@@ -44,6 +44,11 @@ from .jit_kernels import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
     fp8_einsum,
+    # Block-copy fused dispatch
+    get_sym_buffer_size,
+    get_sfa_staging_size,
+    BlockCopyDispatchContext,
+    BlockCopyRoundResult,
 )
 
 from .utils import (

@@ -140,6 +140,72 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
         if 'w4a16' in lower_name:
             nvcc_flags.extend(['-mllvm', '-sort-copy-before-coalesce'])
 
+    # Opt-in: use PPU bulk-DMA (swizzled) 128-bit read/write for the warp-aligned
+    # body of the P2P FP4 A-copy. Off by default; changes the JIT signature so A/B
+    # builds don't collide in the cache.
+    if os.getenv('DG_BULK_COPY', '0') != '0':
+        nvcc_flags.append('-DDG_BULK_COPY')
+        # Store cache level for the bulk copy: default .cg (L2); DG_BULK_STWB=1
+        # switches to write-back (stwb), the highest level.
+        if os.getenv('DG_BULK_STWB', '0') != '0':
+            nvcc_flags.append('-DDG_BULK_STWB')
+
+    # Opt-in (independent of DG_BULK_COPY): use PPU dedicated remote bulk-load
+    # (__ppu_remote_load_bulk_*) for the P2P copy's REMOTE-rank reads only; the
+    # local rank (r==rank_idx) keeps plain __ldg (remote intrinsics are illegal on
+    # local addresses). Store stays plain. Targets the still-exposed remote-read
+    # cost that the generic bulk swizzle did not reduce.
+    if os.getenv('DG_BULK_REMOTE', '0') != '0':
+        nvcc_flags.append('-DDG_BULK_REMOTE')
+
+    # Opt-in: store SFA (A-scale) in the symmetric buffer ROW-MAJOR [max_tokens, ksb]
+    # (each token's ksb scales contiguous) instead of column-major [ksb, max_tokens].
+    # The block-copy remote SFA read then becomes one contiguous burst per rank
+    # (was ksb=112 strided segments — the "carved + strided" latency cost that hurts
+    # high-latency machines); the strided repack lands on the cheap local store, and
+    # the GEMM's column-major local_sfa_buf read is unchanged. Layout is a writer/
+    # reader/addresser contract, so this macro must apply to ALL kernels that touch
+    # the sym-buffer scale (quant, expert_preprocess, fp4_gemm copy) together.
+    if os.getenv('DG_SFA_ROWMAJOR_SRC', '0') != '0':
+        nvcc_flags.append('-DDG_SFA_ROWMAJOR_SRC')
+
+    # A/B probe: force-disable the nr==4 in-FP4-loop SFA co-issue. The co-issue
+    # setup is compiled out so tv stays a compile-time 0 (the in-loop co-issue is
+    # dead-code eliminated -> clean FP4 loop, fewer live registers) and SFA falls
+    # to the serial trailing copy_mblock_sfa. Lets us measure whether the co-issue
+    # itself (register/ALU pressure) is slowing the FP4 copy.
+    if os.getenv('DG_SFA_NO_COISSUE', '0') != '0':
+        nvcc_flags.append('-DDG_SFA_NO_COISSUE')
+
+    # Opt-in: SFA (A-scale) PUSH path. Instead of the fused GEMM PULLing remote SFA
+    # (round-trip latency bound), the quant kernel pushes each token's ksb scales
+    # directly into the owner rank's symmetric staging buffer (fire-and-forget P2P
+    # write, overlapped with quant compute), and a local reshape (v1: standalone
+    # full-grid kernel; v2: GEMM-CTA prologue) repacks staging -> local_sfa_buf. Must
+    # be consistent across quant / reshape. See snoopy-mixing-scroll plan.
+    if os.getenv('DG_SFA_PUSH', '0') != '0':
+        nvcc_flags.append('-DDG_SFA_PUSH')
+        # The push path's fused consumer reads owner-local staging, so the duplicate
+        # sym-buffer scale copy is omitted by default. Retain it for the host-source
+        # diagnostic or an explicit compatibility/debug request.
+        if (os.getenv('DG_SFA_KEEP_LOCAL_SCALE', '0') != '0'
+                or os.getenv('DG_SFA_SOURCE', 'gpu') == 'host'):
+            nvcc_flags.append('-DDG_SFA_KEEP_LOCAL_SCALE')
+    # Also push the per-(src_rank,expert) token counts into the owner's staging buffer so
+    # expert_preprocess reads them LOCALLY instead of a remote NVLink read. Only meaningful
+    # with DG_SFA_PUSH (reuses its staging buffer + addrs). Quant/prepare must agree.
+    if os.getenv('DG_SFA_PUSH_COUNTS', '0') != '0':
+        nvcc_flags.append('-DDG_SFA_PUSH_COUNTS')
+    # Diagnostic: keep the push addressing/buffer/compile but SKIP the peer-VA store,
+    # to test whether the bulk peer writes themselves poison subsequent P2P reads.
+    if os.getenv('DG_SFA_PUSH_NOWRITE', '0') != '0':
+        nvcc_flags.append('-DDG_SFA_PUSH_NOWRITE')
+
+    # Diagnostic-only Phase-1 clock split. Compiled out of the default production
+    # kernel; when enabled, profile_clocks must provide four extra int64 slots.
+    if os.getenv('DG_QUANT_PROFILE_P1SPLIT', '0') != '0':
+        nvcc_flags.append('-DDG_QUANT_PROFILE_P1SPLIT')
+
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi', '-fconcepts']
     flags = [*nvcc_flags, f'--compiler-options={",".join(cxx_flags)}']
     include_dirs = [get_jit_include_dir()]
@@ -155,10 +221,8 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
 
     disable_cache = os.environ.get("DG_JIT_DISABLE_CACHE")
     if (runtime_cache[path] is not None) and (disable_cache is None or disable_cache == '0'):
-        print(f'Using cached JIT runtime {path} {name} during build')
-
         if os.getenv('DG_JIT_DEBUG', None):
-            print(f'Using cached JIT runtime {name} during build')
+            print(f'Using cached JIT runtime {path} {name} during build')
         return runtime_cache[path]
 
     # Write the code

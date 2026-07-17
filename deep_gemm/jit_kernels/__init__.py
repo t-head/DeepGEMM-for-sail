@@ -65,3 +65,10 @@ from .attention import (
 from .einsum import (
     fp8_einsum,
 )
+
+from .dispatch_fused_gemm import (
+    get_sym_buffer_size,
+    get_sfa_staging_size,
+    BlockCopyDispatchContext,
+    BlockCopyRoundResult,
+)

@@ -45,7 +45,8 @@ tile_config_normal = {
     (64,  64,  128) : (32, 64, 3),
     (64,  128, 128) : (32, 64, 2),
     (128, 128, 128) : (32, 64, 2),
-    (128, 256, 64)  : (64, 64, 3)
+    (128, 256, 64)  : (64, 64, 3),
+    (128, 256, 128) : (64, 64, 3)
 }
 tile_config_smallK = {
     (16,  64,  128) : (16, 16, 2),
@@ -430,6 +431,8 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
         if (best_block_n <= 64 or k <= 128):
             block_k = 128
     if (best_block_m == 256 and best_block_n == 256):
+        block_k = 128
+    if (best_block_m == 128 and best_block_n == 256):
         block_k = 128
     if k <= 256:
         block_k = 128

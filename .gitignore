@@ -12,7 +12,25 @@ deep_gemm/include/cutlass
 deep_gemm/include/cutlass3/cutlass
 deep_gemm/include/cutlass3/ppu
 deep_gemm/include/cutlass3/tools
+deep_gemm/include/cutlass3/accutlass.hpp
+deep_gemm/include/cutlass3/ppu_include.hpp
+sweep_logs/
 deep_gemm/include/accutlass.h
 deep_gemm/include/aiu
 .eggs/
 tmp/
+
+# AKO4ALL
+__pycache__/
+_bench_output.txt
+trajectory/
+
+# compiled extension / build artifacts (do not commit)
+*.so
+
+# test/bench output logs and stray artifacts (do not commit)
+*.log
+fusedopt_logs/
+sfa_8card_logs/
+logs/
+*.patch
