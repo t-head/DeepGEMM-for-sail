@@ -292,7 +292,7 @@ constexpr int next_pow2() {
 // 1 block x 1024 threads, 4 phases, 3 syncs, zero grid.sync()
 // =============================================================================
 
-template <int BLOCK_M, int kNumGroups, int BLOCK_SIZE = 1024>
+template <int BLOCK_M, int kNumGroups, int kTopK, int BLOCK_SIZE = 1024>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void
 moe_align_warp_ordered_kernel(
     const int32_t* __restrict__ topk_ids,
@@ -303,8 +303,7 @@ moe_align_warp_ordered_kernel(
     int32_t* __restrict__ inv_perm,
     int32_t* __restrict__ m_indices,
     int numel,
-    int s_total_ub,
-    int topk)
+    int s_total_ub)
 {
     constexpr int WARP_SIZE = 32;
     constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -328,8 +327,9 @@ moe_align_warp_ordered_kernel(
     // Phase 1: Fill PAD + Warp Count + peer_rank[]
     // =======================================================================
     {
-        // Fill PAD via int4 stride-write (PAD value = shape_m = numel / topk)
-        int shape_m = numel / topk;
+        // Fill PAD via int4 stride-write (PAD value = shape_m = numel / kTopK)
+        constexpr int shape_m_div = kTopK;  // divisor is compile-time constant
+        int shape_m = numel / shape_m_div;
         int4 fill_val = make_int4(shape_m, shape_m, shape_m, shape_m);
         int4* out_vec = (int4*)sorted_token_ids;
         for (int i = threadIdx.x; i < s_total_ub / 4; i += BLOCK_SIZE) {
@@ -435,7 +435,7 @@ moe_align_warp_ordered_kernel(
             int offset = warp_prefix[warp_id * kNumGroups + eid] + peer_rank[c];
             int rank = shared_cumsum[eid] + offset;
             int compact_rank = shared_nopad[eid] + offset;
-            sorted_token_ids[rank] = idx / topk;
+            sorted_token_ids[rank] = idx / kTopK;
             inv_perm[idx] = compact_rank;
             m_indices[compact_rank] = eid;
         }
@@ -456,15 +456,14 @@ moe_align_warp_ordered_kernel(
 //
 // Grid: NUM_BLOCKS blocks.  SMEM: kNumGroups * sizeof(int32_t).
 // ----------------------------------------------------------------------------
-template <int BLOCK_SIZE, int kNumGroups>
+template <int BLOCK_SIZE, int kNumGroups, int kTopK>
 __global__ void __launch_bounds__(BLOCK_SIZE, 1)
 block_count_with_fill(
     const int32_t* __restrict__ topk_ids,        // [numel] flattened topk_ids
     int32_t* __restrict__ sorted_token_ids,      // [s_total_ub] output, stride-filled with PAD_ID
     int32_t* __restrict__ block_counts,          // [NUM_BLOCKS * kNumGroups] output
     int numel,                                   // total elements = M * topk
-    int s_total_ub,                              // upper bound of s_total (= max_num_m_blocks * BLOCK_M)
-    int topk)                                    // topk = topk_ids.shape[1]
+    int s_total_ub)                              // upper bound of s_total (= max_num_m_blocks * BLOCK_M)
 {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
@@ -472,7 +471,7 @@ block_count_with_fill(
     size_t idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
 
     // -- Fill PAD: stride-write shape_m to all of sorted_token_ids --
-    int shape_m = numel / topk;
+    int shape_m = numel / kTopK;
     {
         int4 fill_val = make_int4(shape_m, shape_m, shape_m, shape_m);
         int4* out_vec = (int4*)sorted_token_ids;
@@ -639,7 +638,7 @@ cumsum_expert_ids(
 // Grid: num_blocks blocks.  BLOCK_SIZE = next_pow2(kNumGroups).
 // Output: sorted_token_ids (filled with token_idx = idx / topk).
 // ----------------------------------------------------------------------------
-template <int BLOCK_SIZE, int BLOCK_M>
+template <int BLOCK_SIZE, int BLOCK_M, int kTopK>
 __global__ void __launch_bounds__(BLOCK_SIZE, 1)
 deterministic_scatter(
     const int32_t* __restrict__ topk_ids,            // [numel] flattened topk_ids
@@ -649,8 +648,7 @@ deterministic_scatter(
     const int32_t* __restrict__ cumsum,                // [kNumGroups] element-level padded cumsum from K3
     const int32_t* __restrict__ local_offsets,         // [num_blocks * kNumGroups]
     int numel,                                         // = M * topk
-    int kNumGroups,                                    // runtime
-    int topk)                                          // topk = topk_ids.shape[1]
+    int kNumGroups)                                    // runtime
 {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
@@ -673,29 +671,21 @@ deterministic_scatter(
         for (int j = 0; j < BLOCK_SIZE / 4; j++) {
             int4 v = tile4[j];
             int ib = block_base + j * 4;
-            if (v.x == eid) {
-                sorted_token_ids[off + cnt] = ib / topk;
-                inv_perm[ib] = compact_off + cnt;
-                m_indices[compact_off + cnt] = eid;
-                cnt++;
-            }
-            if (v.y == eid) {
-                sorted_token_ids[off + cnt] = (ib + 1) / topk;
-                inv_perm[ib + 1] = compact_off + cnt;
-                m_indices[compact_off + cnt] = eid;
-                cnt++;
-            }
-            if (v.z == eid) {
-                sorted_token_ids[off + cnt] = (ib + 2) / topk;
-                inv_perm[ib + 2] = compact_off + cnt;
-                m_indices[compact_off + cnt] = eid;
-                cnt++;
-            }
-            if (v.w == eid) {
-                sorted_token_ids[off + cnt] = (ib + 3) / topk;
-                inv_perm[ib + 3] = compact_off + cnt;
-                m_indices[compact_off + cnt] = eid;
-                cnt++;
+            // Compute match mask: 4 independent comparisons → 4-bit mask
+            int mask = ((v.x == eid) << 0) | ((v.y == eid) << 1) |
+                       ((v.z == eid) << 2) | ((v.w == eid) << 3);
+            int n = __popc(mask);
+            if (n > 0) {
+                int idxs[4] = {ib, ib + 1, ib + 2, ib + 3};
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    if (mask & (1 << k)) {
+                        sorted_token_ids[off + cnt] = idxs[k] / kTopK;
+                        inv_perm[idxs[k]] = compact_off + cnt;
+                        m_indices[compact_off + cnt] = eid;
+                        cnt++;
+                    }
+                }
             }
         }
     }
@@ -705,7 +695,7 @@ deterministic_scatter(
 // Receives pre-allocated intermediate buffers from Python (torch tensors).
 // Launches K1->K2->K3->K4 sequentially on the given stream.
 // ---------------------------------------------------------------------------
-template<int BLOCK_M, int kNumGroups>
+template<int BLOCK_M, int kNumGroups, int kTopK>
 void moe_align_block_size_kernel_launcher(
       int* m_rows,
       int* expert_ids_and_cumsum,
@@ -713,7 +703,6 @@ void moe_align_block_size_kernel_launcher(
       int* inv_perm, int* m_indices,
       const int* topk_ids, int numel, int max_num_m_blocks,
       int* intermediate_buffer,
-      int topk,
       hggcStream_t stream) {
 
     int s_total_ub = max_num_m_blocks * BLOCK_M;
@@ -728,13 +717,13 @@ void moe_align_block_size_kernel_launcher(
     if (numel <= MOE_ALIGN_WARP_ORDERED_MAX_NUMEL) {
         constexpr int BLOCK_SIZE = 1024;
         constexpr int smem = (kNumGroups * (BLOCK_SIZE / 32) + 2 * (kNumGroups + 1)) * sizeof(int32_t);
-        auto device_func = moe_align_warp_ordered_kernel<BLOCK_M, kNumGroups, BLOCK_SIZE>;
+        auto device_func = moe_align_warp_ordered_kernel<BLOCK_M, kNumGroups, kTopK, BLOCK_SIZE>;
 
         device_func<<<1, BLOCK_SIZE, smem, stream>>>(
                 topk_ids, sorted_token_ids, m_rows,
                 expert_ids_and_cumsum, aligned_num_m_blocks,
                 inv_perm, m_indices,
-                numel, s_total_ub, topk);
+                numel, s_total_ub);
         return;
     }
 
@@ -755,10 +744,10 @@ void moe_align_block_size_kernel_launcher(
     // -- K1: fill PAD + per-block count --
     {
         constexpr int smem = kNumGroups * sizeof(int32_t);
-        block_count_with_fill<BLOCK_SIZE, kNumGroups>
+        block_count_with_fill<BLOCK_SIZE, kNumGroups, kTopK>
             <<<num_blocks_pad, BLOCK_SIZE, smem, stream>>>(
                 topk_ids, sorted_token_ids, block_counts,
-                numel, s_total_ub, topk);
+                numel, s_total_ub);
     }
 
     // -- K2: 2-level parallel scan -> expert_counts + local_offsets --
@@ -782,10 +771,10 @@ void moe_align_block_size_kernel_launcher(
     // -- K4: deterministic scatter --
     {
         constexpr int smem = BLOCK_SIZE * sizeof(int32_t);
-        deterministic_scatter<BLOCK_SIZE, BLOCK_M>
+        deterministic_scatter<BLOCK_SIZE, BLOCK_M, kTopK>
             <<<num_blocks, BLOCK_SIZE, smem, stream>>>(
                 topk_ids, sorted_token_ids, inv_perm, m_indices, cumsum_gpu, local_offsets,
-                numel, kNumGroups, topk);
+                numel, kNumGroups);
     }
 }
 

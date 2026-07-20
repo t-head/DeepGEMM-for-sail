@@ -98,12 +98,13 @@ using namespace deep_gemm;
 // Templated args from Python JIT call
 constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto BLOCK_M = {BLOCK_M};
+constexpr auto kTopK = {TOPK};
 
 // Launch kernel
-moe_align_block_size_kernel_launcher<BLOCK_M, kNumGroups>(m_rows,
+moe_align_block_size_kernel_launcher<BLOCK_M, kNumGroups, kTopK>(m_rows,
             expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks,
             inv_perm, m_indices, topk_ids, numel, max_num_m_blocks,
-            intermediate_buffer, topk, stream);
+            intermediate_buffer, stream);
 """
 
 def moe_align_block_size(
@@ -193,13 +194,14 @@ def moe_align_block_size(
 
     args = (m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks,
             inv_perm, m_indices, topk_ids, numel, max_num_m_blocks, intermediate_buffer,
-            topk, torch.cuda.current_stream())
+            torch.cuda.current_stream())
 
     runtime = jit_tuner.compile_and_tune(
         name='moe_align_block_size',
         keys={'NUM_GROUPS': num_groups,
                 'BLOCK_M': block_m, 'BLOCK_N': 1, 'BLOCK_K': 1,
                 'WARP_M': 1, 'WARP_N': 1, 'NUM_STAGES': 1,
+                'TOPK': topk,
             },
         space=(),
         includes=includes_fusedgemm_util_kernel,
@@ -213,14 +215,14 @@ def moe_align_block_size(
                 ('numel', int),
                 ('max_num_m_blocks', int),
                 ('intermediate_buffer', torch.int32),
-                ('topk', int),
                 ('stream', torch.cuda.Stream)),
         template=template_fusedgemm_util_kernel,
         jit_include_dir='actlize_v1.0.0',
         args=args
     )
     runtime(*args)
-    return config, m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, inv_perm, m_indices
+    # Drop smem_config (last item): only the first 7 tuning params are needed
+    return config[:7], m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, inv_perm, m_indices
 
 def m_grouped_gemm_bf16_bf16_bf16_nt_fused(lhs: torch.Tensor,
                                      rhs: torch.Tensor,
@@ -283,7 +285,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_fused(lhs: torch.Tensor,
         return
      # Auto-tuning with compilation
     global includes_fusedmoe_gemm, template_fusedmoe_gemm
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, _ = configs
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = configs
     # torch.set_printoptions(threshold=10000000, linewidth=10000, precision=2, sci_mode=False)
     # print(expert_ids_and_cumsum.shape, expert_ids_and_cumsum)
     # print(sorted_token_ids, sorted_token_ids.shape)
@@ -357,7 +359,7 @@ def m_grouped_gemm_perchannel_nt_fused(lhs_: Tuple[torch.Tensor],
      # Auto-tuning with compilation
     global includes_fusedmoe_gemm_with_perchannel_quant, template_fusedmoe_gemm_with_perchannel_quant
 
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, _ = configs
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = configs
 
     # print(expert_ids_and_cumsum.shape, expert_ids_and_cumsum)
     # print(sorted_token_ids, sorted_token_ids.shape)
@@ -444,7 +446,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
     lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
      # Auto-tuning with compilation
     global includes_fusedmoe_gemm_with_blkwise_quant, template_fusedmoe_gemm_with_blkwise_quant
-    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, _ = configs
+    num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = configs
     # block_m, block_n, block_k, warp_m, warp_n, num_stages = 64, 128, 128, 32, 32, 2
     assert n % 128 == 0, f"n ({n}) must be divisible by 128)"
     assert k % 128 == 0, f"k ({k}) must be divisible by 128)"
