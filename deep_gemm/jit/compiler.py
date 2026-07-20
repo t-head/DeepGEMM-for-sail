@@ -120,7 +120,7 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
                   # Suppress some unnecessary warnings, such as unused variables for certain `constexpr` branch cases
                   '--diag-suppress=39,174,177,940']
 
-    if is_ppu1v5_device():
+    if is_ppu1v5_device() and os.getenv('DG_PPU_LEGACY_FLAGS', '1') != '0':
         # append compiler options for ppu1.5
         lower_name = name.lower()
         use_warp_interleaving = ('gemm_fp8' in lower_name) or ('mqa_logits' in lower_name and 'paged' not in lower_name)
@@ -149,6 +149,13 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
         # switches to write-back (stwb), the highest level.
         if os.getenv('DG_BULK_STWB', '0') != '0':
             nvcc_flags.append('-DDG_BULK_STWB')
+        # Pair two full-warp chunks so sixteen independent rank loads can be
+        # issued before the dependent store/un-swizzle sequence.
+        if os.getenv('DG_BULK_PIPE2', '0') != '0':
+            nvcc_flags.append('-DDG_BULK_PIPE2')
+        # Refill the next sixteen-load pair while draining the current pair.
+        if os.getenv('DG_BULK_ROLL2', '0') != '0':
+            nvcc_flags.append('-DDG_BULK_ROLL2')
 
     # Opt-in (independent of DG_BULK_COPY): use PPU dedicated remote bulk-load
     # (__ppu_remote_load_bulk_*) for the P2P copy's REMOTE-rank reads only; the
@@ -157,6 +164,11 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
     # cost that the generic bulk swizzle did not reduce.
     if os.getenv('DG_BULK_REMOTE', '0') != '0':
         nvcc_flags.append('-DDG_BULK_REMOTE')
+
+    # Default-on two-iteration load pipeline for wave0-critical mb0/mb1.
+    # DG_COPY_PIPE2=0 preserves the original schedule as an escape hatch.
+    if os.getenv('DG_COPY_PIPE2', '1') != '0':
+        nvcc_flags.append('-DDG_COPY_PIPE2')
 
     # Opt-in: store SFA (A-scale) in the symmetric buffer ROW-MAJOR [max_tokens, ksb]
     # (each token's ksb scales contiguous) instead of column-major [ksb, max_tokens].

@@ -22,7 +22,7 @@ IFS=',' read -ra GPU_ARRAY <<< "$GPUS"
 NPROC=${#GPU_ARRAY[@]}
 NCB="${NCB:-3}"
 PORT="${PORT:-$((29500 + RANDOM % 400))}"
-RUNS="${RUNS:-1}"
+RUNS="${RUNS:-3}"
 
 # --- Correctness gate: full only in VERDICT mode; signal runs perf-only ---
 if [ "${VERDICT:-0}" = "1" ]; then
@@ -42,29 +42,42 @@ KERNEL_SRCS=(
     "${JIT_KERNELS_DIR}/dispatch_fused_gemm.py"
 )
 
-CONTAINER="sglang.lxh"
-CONTAINER_WS="/mnt/ssd/home/lixianghan.lxh/DeepGemm"
+CONTAINER="${CONTAINER:-sglang.lxh}"
+CONTAINER_WS="${CONTAINER_WS:-$(pwd)}"
 
 : > _bench_output.txt
 BENCH_EXIT=0
 for RUN_INDEX in $(seq 1 "$RUNS"); do
     echo "=== independent run ${RUN_INDEX}/${RUNS} ===" | tee -a _bench_output.txt
-    ppu-smi | tee -a _bench_output.txt
+    SMI_OUTPUT="$(ppu-smi)"
+    printf '%s\n' "$SMI_OUTPUT" | tee -a _bench_output.txt
+    if ! grep -Fq "No running processes found" <<< "$SMI_OUTPUT"; then
+        echo "ABORT: PPU machine is not idle before run ${RUN_INDEX}." | tee -a _bench_output.txt
+        BENCH_EXIT=75
+        break
+    fi
+    ppu-smi -q -d CLOCK | tee -a _bench_output.txt
     set +e
     docker exec -i \
     -e CUDA_VISIBLE_DEVICES="${GPUS}" \
     -e TEST_CONFIG="${TEST_CONFIG:-prod}" \
     -e FORCE_EXPECTED_M="${FORCE_EXPECTED_M:-128}" \
     -e DG_SFA_PUSH="${DG_SFA_PUSH:-1}" \
+    -e DG_PPU_LEGACY_FLAGS="${DG_PPU_LEGACY_FLAGS:-0}" \
+    -e DG_NVCC_OVERRIDE_CPP_STANDARD="${DG_NVCC_OVERRIDE_CPP_STANDARD:-20}" \
     -e DG_SFA_PUSH_COUNTS="${DG_SFA_PUSH_COUNTS:-0}" \
     -e DG_SFA_PUSH_INLINE="${DG_SFA_PUSH_INLINE:-0}" \
-    -e DG_SFA_OVERLAP="${DG_SFA_OVERLAP:-0}" \
+    -e DG_SFA_OVERLAP="${DG_SFA_OVERLAP:-1}" \
     -e ASYS_FULL_ONLY="${ASYS_FULL_ONLY:-0}" \
     -e ASYS_FULL_ITERS="${ASYS_FULL_ITERS:-10}" \
     -e DG_SFA_NUM_SMS="${DG_SFA_NUM_SMS:-39}" \
     -e DG_SFA_NUM_THREADS="${DG_SFA_NUM_THREADS:-256}" \
     -e NCB="${NCB}" \
     -e NCB_SWEEP="${NCB_SWEEP:-${NCB}}" \
+    -e DG_BULK_COPY="${DG_BULK_COPY:-0}" \
+    -e DG_BULK_PIPE2="${DG_BULK_PIPE2:-0}" \
+    -e DG_BULK_ROLL2="${DG_BULK_ROLL2:-0}" \
+    -e DG_COPY_PIPE2="${DG_COPY_PIPE2:-1}" \
     -e K_TILES_PER_FLAG="${K_TILES_PER_FLAG:-14}" \
     -e FUSED_EXACT_GRID="${FUSED_EXACT_GRID:-0}" \
     -e FUSED_ARRIVAL_IN_QUANT="${FUSED_ARRIVAL_IN_QUANT:-1}" \
