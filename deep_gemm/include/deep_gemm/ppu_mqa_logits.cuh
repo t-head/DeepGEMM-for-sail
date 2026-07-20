@@ -601,7 +601,7 @@ public:
 
     while (block_q_idx < num_q_blocks) {
         CUTE_TIE_DECL(load_schedule(1), q_stage_idx, q_phase, kv_start, kv_end, num_kv_blocks);
-        tAgA.data() = tKgK.data() + kv_start;
+        tAgA.data() = tKgK.data() + kv_start * kHeadDim;
         tSFAgSFA.data() = tSFKgSFK.data() + kv_start;
         tBgB.data() = tQgQ.data() + block_q_idx * BLOCK_Q * kNumHeads * kHeadDim;
         tSFBgSFB.data() = tSFQgSFQ.data() + block_q_idx * BLOCK_Q * kNumHeads;

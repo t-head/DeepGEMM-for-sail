@@ -54,6 +54,32 @@ def test_gemm_skip_head_mid() -> None:
     print()
 
 
+def test_ks_ke():
+    # Single INT8 case: seq_len_q=1 with ks != 0, manually constructed (not via test_mqa_logits).
+    # Verifies the kernel correctly offsets into KV when the valid window does not start at 0.
+    # Only q[0, 0, 0]=1 and k[4, 0]=5 are non-zero, so logits[0, 4] = relu(1*5) * 1 * 1 = 5.
+    print('Testing INT8 MQA Logits (seq_len_q=1, ks!=0):')
+    sq, nh, hd = 1, 32, 128
+    skv = 6
+    q = torch.zeros((sq, nh, hd), device='cuda', dtype=torch.int8)
+    k = torch.zeros((skv, hd), device='cuda', dtype=torch.int8)
+    k_scale = torch.ones(skv, device='cuda', dtype=torch.float32)
+    weights = torch.ones((sq, nh), device='cuda', dtype=torch.float32)
+    q[0, 0, 0] = 1
+    k[4, 0] = 5
+    # ks != 0: only KV token 4 is within [ks, ke)
+    ks = torch.tensor([4], device='cuda', dtype=torch.int32)
+    ke = torch.tensor([5], device='cuda', dtype=torch.int32)
+    # Reference: logits = (relu(q·k) * weights).sum(heads) * k_scale
+    scores = torch.matmul(q.float(), k.float().T)            # [1, 32, 6]
+    ref = (scores.relu() * weights[:, :, None]).sum(dim=1)  # [1, 6]
+    ref = ref * k_scale[None, :]
+    actual = deep_gemm.int8_mqa_logits(q, (k, k_scale), weights, ks, ke, clean_logits=False)
+    torch.testing.assert_close(actual[0, 4].float(), ref[0, 4].float(), rtol=1e-3, atol=1e-3)
+    print(f'  INT8 ks!=0 case: expected[0,4]={ref[0, 4].item():.4f}, actual[0,4]={actual[0, 4].item():.4f}')
+    print("Passed\n")
+
+
 def test_mqa_logits_loop():
     print('Testing MQA Logits:')
     qk_dtype_list = [torch.int8]
@@ -191,5 +217,6 @@ if __name__ == '__main__':
     # test_gemm_skip_head_mid()
     # test_nvtx()
 
+    test_ks_ke()
     test_mqa_logits_loop()
     test_paged_mqa_logits_loop()
