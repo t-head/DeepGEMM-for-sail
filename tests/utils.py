@@ -872,9 +872,9 @@ def read_numbers_from_file(file_path):
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
-    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size", "logits_dtype","c4_compressed"]
+    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size", "logits_dtype", "weights_dtype", "c4_compressed"]
     supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits", "BatchGemm"]
-    supported_logits_type = ["fp32", "bf16"]
+    supported_indexer_epilogue_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
     dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|Normal|MqaLogits|PagedMqaLogits|BatchGemm),(.+)"
@@ -900,9 +900,9 @@ def parse_deepgemm_string_re(s):
                 print("Invalid input quant_type")
                 exit(1)
             result[key] = value
-        elif key == "logits_dtype":
-            if value not in supported_logits_type:
-                print("Invalid input logits_type")
+        elif key == "logits_dtype" or key == "weights_dtype":
+            if value not in supported_indexer_epilogue_type:
+                print(f"Invalid input indexer epilogue type")
                 exit(1)
             result[key] = convert_data_type_to_dtype(value)
         else:
@@ -1351,25 +1351,22 @@ def generate_cp_test_data(seq_len, seq_len_kv):
     # Select an arbitrary CP rank
     cp_id = cp_size // 3
     ks = torch.zeros(seq_len, dtype=torch.int, device='cuda')
-    ke = torch.zeros(seq_len, dtype=torch.int,  device='cuda')
+    ke = torch.zeros(seq_len, dtype=torch.int, device='cuda')
     for i in range(chunk_size):
         ke[i] = cp_id * chunk_size + i
         ke[i + chunk_size] = (cp_size * 2 - 1 - cp_id) * chunk_size + i
     return ks, ke
 
 def ref_get_metadata(context_lens: torch.Tensor, block_kv: int, num_sms: int, metadata_extra: tuple = None):
-    num_math_warpgroups = 1
-    split_kv = block_kv * num_math_warpgroups
+    split_kv = block_kv * 4  # fallback: assume max num_math_warpgroups=4 to avoid crash
     tb_per_cu = 1
     if metadata_extra is not None:
         from deep_gemm.jit_kernels.utils import get_paged_mqa_logits_tile
         next_n, num_heads, head_dim, element_size = metadata_extra
-        # if element_size == 1 and head_dim == 64: # fp4 warp-interleave
-        #     num_math_warpgroups = 4
-        #     split_kv = block_kv * num_math_warpgroups
-        _, _, tb_per_cu = get_paged_mqa_logits_tile(next_n, split_kv, num_heads, head_dim, element_size)
+        _, _, split_kv, _, _, tb_per_cu = get_paged_mqa_logits_tile(next_n, block_kv, num_heads, head_dim, element_size)
     num_splits = num_sms * tb_per_cu
 
+    context_lens = context_lens[:, -1] # convert to 1D context lens, use last token's context_len
     batch_size = context_lens.size(0)
     blocksize = split_kv
     block_len = (context_lens + blocksize - 1) // blocksize
@@ -1420,10 +1417,13 @@ def ref_fp8_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
     batch_size, next_n, heads, dim = q.size()
     num_block, block_size, _, dim = kv_cache.size()
     logits = torch.full([batch_size * next_n, max_model_len], float('-inf'), device=q.device, dtype=torch.float32)
-    context_lens = context_lens.tolist()
+    # 2D context_lens: use last token's context_len (maximum) as KV range, matching kernel behavior
+    context_lens_max = context_lens[:, -1].tolist()
     for i in range(batch_size):
-        context_len = context_lens[i]
-        q_offsets = torch.arange(context_len - next_n, context_len, device='cuda')
+        context_len = context_lens_max[i]
+        # All tokens see the same KV range (up to max context_len)
+        # Per-token masking is done externally
+        q_offsets = torch.full((next_n, ), context_len, device='cuda')
         weight_slice = weights[i * next_n:(i + 1) * next_n, :].transpose(0, 1).contiguous()
         for block_rk in range(ceil_div(context_len, block_size)):
             block_idx = block_tables[i][block_rk]
@@ -1444,34 +1444,44 @@ def test_mqa_logits(args) -> None:
     num_heads = args.get('num_heads', 64)
     head_dim = args.get('head_dim', 128)
     logits_dtype = args.get('logits_dtype', torch.float32)
+    weights_dtype = args.get('weights_dtype', torch.float32)
     c4_compressed = bool(args.get('c4_compressed', 0))
+    compressed_logits = bool(args.get('compressed_logits', 0))
 
-    print("test_mqa_logits->test_func: MqaLogits,data_type:{},seq_len_q:{},seq_len_kv:{},num_heads:{},head_dim:{},c4_compressed:{},logits_dtype:{}".format(data_type, seq_len_q, seq_len_kv, num_heads, head_dim, c4_compressed, logits_dtype))
+    print("test_mqa_logits->test_func: MqaLogits,data_type:{},seq_len_q:{},seq_len_kv:{},num_heads:{},head_dim:{},c4_compressed:{},compressed_logits:{},weights_dtype:{},logits_dtype:{}".format(data_type, seq_len_q, seq_len_kv, num_heads, head_dim, c4_compressed, compressed_logits, weights_dtype, logits_dtype))
 
     q = torch.randn(seq_len_q, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
     kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
-    weights = torch.randn(seq_len_q, num_heads, device='cuda', dtype=torch.float32)
+    weights = torch.randn(seq_len_q, num_heads, device='cuda', dtype=weights_dtype)
 
     ks = torch.zeros(seq_len_q, dtype=torch.int, device='cuda')
     if c4_compressed: # c4_compressed for deepseek v4
         ke = torch.arange(seq_len_q, dtype=torch.int, device='cuda') // 4 + (seq_len_kv - seq_len_q // 4)
     else:
         ke = torch.arange(seq_len_q, dtype=torch.int, device='cuda') + (seq_len_kv - seq_len_q)
-    # ks, ke = generate_cp_test_data(seq_len, seq_len_kv)
+
+    max_seqlen_k = (ke - ks).max().item() if compressed_logits else 0
+    clean_logits_arg = not compressed_logits
 
     if data_type == torch.bfloat16:
-        logits = deep_gemm.bf16_mqa_logits(q, kv, weights, ks, ke, logits_dtype=logits_dtype)
+        logits = deep_gemm.bf16_mqa_logits(q, kv, weights, ks, ke,
+                                           clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k,
+                                           logits_dtype=logits_dtype)
     elif data_type == torch.float8_e4m3fn:
         q_fp8 = q.to(torch.float8_e4m3fn)
         kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0, ), False)
-        logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke, logits_dtype=logits_dtype)
+        logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke,
+                                          clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k,
+                                          logits_dtype=logits_dtype)
     elif data_type == torch.int8:
         q_int8, q_int8_scale = per_token_cast_to_int8(q.reshape(seq_len_q*num_heads, head_dim))
         q_int8 = q_int8.reshape(seq_len_q, num_heads, head_dim)
         q_int8_scale = q_int8_scale.reshape(seq_len_q, num_heads)
-        weights_int8 = weights * q_int8_scale
+        weights_int8 = weights * q_int8_scale.to(weights.dtype)
         kv_int8 = per_token_cast_to_int8(kv)
-        logits = deep_gemm.int8_mqa_logits(q_int8, kv_int8, weights_int8, ks, ke, logits_dtype=logits_dtype)
+        logits = deep_gemm.int8_mqa_logits(q_int8, kv_int8, weights_int8, ks, ke,
+                                            clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k,
+                                            logits_dtype=logits_dtype)
     elif data_type == torch.uint8:  # FP4
         q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
         q_in = (q_fp4[0].view(seq_len_q, num_heads, head_dim // 2), q_fp4[1].view(seq_len_q, num_heads))
@@ -1483,7 +1493,8 @@ def test_mqa_logits(args) -> None:
         logits = deep_gemm.fp8_fp4_mqa_logits(
             q=q_in, kv=kv_in, weights=weights,
             cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
-            clean_logits=True, logits_dtype=logits_dtype,
+            clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k,
+            logits_dtype=logits_dtype,
         )
     else:
         print("ERROR: Unsupported dtype for MQA Logits, please check!")
@@ -1493,10 +1504,19 @@ def test_mqa_logits(args) -> None:
     ref_logits = None
     if get_acc_check():
         assert get_ref_backend() == "device", "ref_backend only supports 'device' for MQA Logits"
-        ref_logits, _ = ref_fp8_mqa_logits(q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke)
+        ref_logits, _ = ref_fp8_mqa_logits(q=q, kv=kv, weights=weights.float(), cu_seqlen_ks=ks, cu_seqlen_ke=ke)
 
     # Accuracy check
     if get_acc_check() and ref_logits is not None:
+        # Unpack compressed logits to full [seq_len_q, seq_len_kv] for comparison
+        if compressed_logits:
+            full_logits = torch.full((seq_len_q, seq_len_kv), float('-inf'), device='cuda', dtype=logits.dtype)
+            for i in range(seq_len_q):
+                valid_len = (ke[i] - ks[i]).item()
+                if valid_len > 0:
+                    full_logits[i, ks[i]:ke[i]] = logits[i, :valid_len]
+            logits = full_logits
+
         neginf_mask = (logits == float('-inf'))
         ref_neginf_mask = (ref_logits == float('-inf'))
 
@@ -1523,60 +1543,87 @@ def test_paged_mqa_logits(args) -> None:
     next_n = args['next_n']
     avg_context_len = args.get('avg_context_len', 8192)
     distribution = args.get('distribution', [])
+    pre_distribution = args.get('pre_distribution', [])
     num_heads = args.get('num_heads', 64)
     head_dim = args.get('head_dim', 128)
     logits_dtype = args.get('logits_dtype', torch.float32)
+    weights_dtype = args.get('weights_dtype', torch.float32)
+    flatten_mtp = args.get('flatten_mtp', False)
 
-    print("test_paged_mqa_logits->test_func: PagedMqaLogits,data_type:{},batch_size:{},next_n:{},avg_context_len:{},num_heads:{},head_dim:{},logits_dtype:{}".format(data_type, batch_size, next_n, avg_context_len, num_heads, head_dim, logits_dtype))
+    print("test_paged_mqa_logits->test_func: PagedMqaLogits,data_type:{},batch_size:{},next_n:{},avg_context_len:{},num_heads:{},head_dim:{},logits_dtype:{},weights_dtype:{}".format(data_type, batch_size, next_n, avg_context_len, num_heads, head_dim, logits_dtype, weights_dtype))
 
-    max_model_len = 111 * 1000
+    max_model_len = 262144
     blocksize = 64
 
     q = torch.randn((batch_size, next_n, num_heads, head_dim), device='cuda', dtype=torch.bfloat16)
-    num_blocks = max_model_len * 3
-    kv_cache = torch.randn((num_blocks, blocksize, 1, head_dim), device='cuda', dtype=torch.bfloat16)
-    weights = torch.randn((batch_size * next_n, num_heads), device='cuda', dtype=torch.float32)
+    weights = torch.randn((batch_size * next_n, num_heads), device='cuda', dtype=weights_dtype)
 
-    # Generate context_lens
+    # Generate context_lens (2D [batch_size, next_n] for DeepGEMM 2D context_lens support)
     if distribution and isinstance(distribution, list):
         assert(len(distribution) == batch_size)
         context_lens = torch.tensor(distribution[:batch_size], device='cuda', dtype=torch.int32)
     else:
         context_lens = torch.randint(int(0.7 * avg_context_len), int(1.3 * avg_context_len), (batch_size, )).cuda().to(torch.int32)
 
-    max_block_len = (context_lens.max().item() + blocksize - 1) // blocksize * blocksize
-    block_tables = torch.full((batch_size, max_block_len), fill_value=-1, device='cuda', dtype=torch.int32)
+    max_block_len = (context_lens.max().item() + blocksize - 1) // blocksize
+    num_blocks = int(((context_lens + blocksize - 1) // blocksize).sum().item() * 1.3)  # 30% slack
+    kv_cache = torch.randn((num_blocks, blocksize, 1, head_dim), device='cuda', dtype=torch.bfloat16)
 
+    block_tables = torch.full((batch_size, max_block_len), fill_value=0, device='cuda', dtype=torch.int32)
+    block_idx_pool = torch.randperm(num_blocks, device='cuda', dtype=torch.int32)
     counter = 0
-    block_idx_pool = list(range(num_blocks))
-    import random
-    random.shuffle(block_idx_pool)
     for i in range(batch_size):
-        ctx_len = context_lens[i].item()
-        for j in range(ceil_div(ctx_len, blocksize)):
-            block_tables[i][j] = block_idx_pool[counter]
-            counter += 1
+        nblk = ceil_div(context_lens[i].item(), blocksize)
+        block_tables[i, :nblk] = block_idx_pool[counter:counter+nblk]
+        counter += nblk
 
+    # Generate 2D context_lens for main kernel
+    if next_n == 1:
+        context_lens = context_lens.unsqueeze(-1)  # [batch_size] -> [batch_size, 1]
+    else:
+        # Generate per-token context_lens: last column = actual context_len, others decrease by 1
+        # e.g. context_lens=[4,5], next_n=3 -> [[2,3,4],[3,4,5]]
+        offsets = torch.arange(next_n, device='cuda', dtype=torch.int32)
+        context_lens_2d = (context_lens.unsqueeze(1) - (next_n - 1) + offsets).clamp(min=0).to(torch.int32)
+        context_lens = context_lens_2d
+
+    if flatten_mtp:
+        # Flatten next_n into batch dimension, call subsequent APIs with next_n=1
+        q = q.reshape(batch_size * next_n, 1, num_heads, head_dim)
+        context_lens = context_lens.flatten().unsqueeze(-1)  # [batch_size * next_n, 1]
+        block_tables = torch.repeat_interleave(block_tables, repeats=next_n, dim=0)
+        batch_size = batch_size * next_n
+        next_n = 1
+
+    # Generate pre_context_lens for get_paged_mqa_logits_metadata (may differ from main kernel context_lens in MTP + CUDA graph)
+    if pre_distribution and isinstance(pre_distribution, list):
+        assert(next_n == 1 and not flatten_mtp)
+        pre_context_lens = torch.tensor(pre_distribution, device='cuda', dtype=torch.int32).unsqueeze(-1)
+    else:
+        pre_context_lens = context_lens
+
+    get_metadata_kernel = deep_gemm.get_paged_mqa_logits_metadata
+    # get_metadata_kernel = ref_get_metadata
 
     if data_type == torch.bfloat16:
         metadata_extra = (next_n, num_heads, head_dim, q.element_size())
-        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra)
-        logits = deep_gemm.bf16_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True, logits_dtype=logits_dtype)
+        schedule_metadata = get_metadata_kernel(pre_context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
+        logits = deep_gemm.bf16_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False, logits_dtype=logits_dtype)
     elif data_type == torch.float8_e4m3fn:
         q_fp8 = q.to(torch.float8_e4m3fn)
         kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
         metadata_extra = (next_n, num_heads, head_dim, q_fp8.element_size())
-        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra)
-        logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True, logits_dtype=logits_dtype)
+        schedule_metadata = get_metadata_kernel(pre_context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
+        logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False, logits_dtype=logits_dtype)
     elif data_type == torch.int8:
         q_int8, q_int8_scale = per_token_cast_to_int8(q.reshape(batch_size * next_n * num_heads, head_dim))
         q_int8 = q_int8.reshape(batch_size, next_n, num_heads, head_dim)
         q_int8_scale = q_int8_scale.reshape(batch_size * next_n, num_heads)
-        weights_int8 = weights * q_int8_scale
+        weights_int8 = weights * q_int8_scale.to(weights.dtype)
         kv_cache_int8 = kv_cache_cast_to_int8(kv_cache)
         metadata_extra = (next_n, num_heads, head_dim, q_int8.element_size())
-        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra)
-        logits = deep_gemm.int8_paged_mqa_logits(q_int8, kv_cache_int8, weights_int8, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True, logits_dtype=logits_dtype)
+        schedule_metadata = get_metadata_kernel(pre_context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
+        logits = deep_gemm.int8_paged_mqa_logits(q_int8, kv_cache_int8, weights_int8, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False, logits_dtype=logits_dtype)
     elif data_type == torch.uint8:  # FP4
         q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
         q_in = (q_fp4[0].view(batch_size, next_n, num_heads, head_dim // 2), q_fp4[1].view(batch_size, next_n, num_heads))
@@ -1584,13 +1631,12 @@ def test_paged_mqa_logits(args) -> None:
         kv_cache_fp4, kv_cache_dequant = kv_cache_cast_to_fp4(kv_cache)
         q, kv_cache = q_dequant, kv_cache_dequant
         metadata_extra = (next_n, num_heads, head_dim // 2, q_fp4[0].element_size())
-        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-            context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra)
+        schedule_metadata = get_metadata_kernel(pre_context_lens, blocksize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
         logits = deep_gemm.fp8_fp4_paged_mqa_logits(
             q=q_in, fused_kv_cache=kv_cache_fp4, weights=weights,
             context_lens=context_lens, block_table=block_tables,
             schedule_meta=schedule_metadata, max_context_len=max_model_len,
-            clean_logits=True, logits_dtype=logits_dtype,
+            clean_logits=False, logits_dtype=logits_dtype,
         )
     else:
         print("ERROR: Unsupported dtype for Paged MQA Logits, please check!")
@@ -1605,9 +1651,8 @@ def test_paged_mqa_logits(args) -> None:
     # Accuracy check
     if get_acc_check() and ref_logits is not None:
         positions = torch.arange(max_model_len, device='cuda').unsqueeze(0).expand(batch_size * next_n, -1)
-        row_indices = torch.arange(batch_size * next_n, device='cuda') // next_n
-        next_n_offset = torch.arange(batch_size * next_n, device='cuda') % next_n
-        ref_neginf_mask = ~(positions <= (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(1))
+        # 2D context_lens: each token has its own context_len for per-token masking
+        ref_neginf_mask = ~(positions < context_lens.view(-1, 1))
 
         neginf_mask = (logits == float('-inf'))
         # assert torch.equal(neginf_mask, ref_neginf_mask)

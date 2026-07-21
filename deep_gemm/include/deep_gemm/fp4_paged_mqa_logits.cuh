@@ -1,11 +1,6 @@
 #pragma once
-#include "ppu_include.hpp"
-#include "cute_tie.cuh"
-#include "utils.cuh"
-#include "utils_cutlass3.h"
-#include "profiling_interface.hpp"
-// Reuse PagedMQALogitsScheduler, metadata kernel, and device helpers from FP8 paged MQA logits
-#include "ppu_paged_mqa_logits.cuh"
+#include "mqa_logits_utils.cuh"
+#include "paged_mqa_logits_scheduler.cuh"
 
 namespace cutlass::gemm::kernel {
 
@@ -22,34 +17,22 @@ namespace cutlass::gemm::kernel {
 //   - MMA atom: F32F4F4F32 (16x16x64)
 // ============================================================================
 
-template <typename ElementQK, typename ElementAcc, typename ElementLogits, uint32_t kNextN, uint32_t kNumHeads,
-          uint32_t kHeadDim, uint32_t BLOCK_KV, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t SPLIT_KV>
+template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights, uint32_t kNextN, uint32_t kNumHeads,
+          uint32_t kHeadDim, uint32_t BLOCK_KV, uint32_t WARP_KV, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t SPLIT_KV, bool SPLIT_MBLOCK>
 class PPUPagedMqaLogitsFP4 {
 public:
-    static_assert(std::is_same_v<ElementQK, uint8_t>, "FP4 paged MQA logits requires uint8_t ElementQK");
+    static_assert(cute::is_same_v<ElementQK, uint8_t>, "FP4 paged MQA logits requires uint8_t ElementQK");
     static_assert(kHeadDim == 64, "FP4 packed head_dim must be 64 (original 128 / 2)");
 
-    using ElementC = float;
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::ColumnMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-    using LayoutD = cutlass::layout::RowMajor;
-    using ElementCompute = float;
-    // FP4 scale: uint8_t e8m0, packed as uint32_t for async copy
-    using ElementScale = uint8_t;
-    using OperatorClass = cutlass::arch::OpClassTensorOp;
     static constexpr int BLOCK_M = BLOCK_KV;
     static constexpr int BLOCK_N = kNextN * kNumHeads;
     static constexpr int BLOCK_K = 64; // kHeadDim = 64
-    static constexpr int WARP_M = 16;
+    static constexpr int WARP_M = WARP_KV;
     static constexpr int WARP_N = kNumHeads;
 
     static constexpr int kNumMathWarpGroups = SPLIT_KV / BLOCK_KV;
 
-    using ProblemShape_MNKL = Shape<int, int, int, int>;
-
     using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
-    using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>;
     static constexpr int WarpOnM = BLOCK_M / WARP_M;
     static constexpr int WarpOnN = BLOCK_N / WARP_N;
 
@@ -134,34 +117,19 @@ public:
         decltype(tile_to_shape(SmemLayoutAtomSFB{}, make_shape(_1{}, Int<BLOCK_N>{}, Int<kNumQStages>{})));
 
     using DefaultOperandWeight =
-        cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, float, false, _1, Int<BLOCK_N>, false, 0, false>;
+        cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, ElementWeights, false, _1, Int<BLOCK_N>, false, 0, false>;
     using SmemLayoutAtomWeight = typename DefaultOperandWeight::SmemLayoutAtom;
     using GmemTiledCopyWeight = typename DefaultOperandWeight::GmemTiledCopy;
     using SmemLayoutWeight =
         decltype(tile_to_shape(SmemLayoutAtomWeight{}, make_shape(_1{}, Int<BLOCK_N>{}, Int<kNumQStages>{})));
 
-    // SFA smem->vreg: recast smem as uint16_t, then transpose layout for MMA consumption
-    // sSFATrans shape: ((MmaIterM, WarpOnM), (2, 8, 2), kNumKVStages), stride: ((WarpOnM * 32, 32), (16, 2, 1),
-    // BLOCK_M*2) Note: operates on per-warp_group 3D slice after slicing the warp_group dimension
-    using sSFATransLayout = Layout<Shape<Shape<Int<WarpOnM>, Int<MmaIterM>>, Shape<_2, _8, _2>, Int<kNumKVStages>>,
-                                   Stride<Stride<Int<MmaIterM * 32>, _32>, Stride<_16, _2, _1>, Int<BLOCK_M * 2>>>;
-    // SFA s2r tiled copy: uint16_t copy atom
-    // thr_layout: ((WarpOnM, 4), 8) stride: ((32, 1), 4), val_layout: (1, 2)
-    using SmemTiledCopySFA = decltype(make_tiled_copy(
-        Copy_Atom<UniversalCopy<uint16_t>, uint16_t>{},
-        Layout<Shape<Shape<Int<WarpOnM>, _4>, _8>, Stride<Stride<_32, _1>, _4>>{}, Layout<Shape<_1, _2>>{}));
-
-    // SFB s2r tiled copy: same as SFA s2r tiled copy
-    using sSFBTransLayout = Layout<Shape<Shape<Int<WarpOnN>, Int<MmaIterN>>, Shape<_2, _8, _2>, Int<kNumQStages>>,
-                                   Stride<Stride<Int<MmaIterN * 32>, _32>, Stride<_16, _2, _1>, Int<BLOCK_N * 2>>>;
-    using SmemTiledCopySFB = decltype(make_tiled_copy(
-        Copy_Atom<UniversalCopy<uint16_t>, uint16_t>{},
-        Layout<Shape<Shape<Int<WarpOnN>, _4>, _8>, Stride<Stride<_32, _1>, _4>>{}, Layout<Shape<_1, _2>>{}));
-
-    using sWCopyLayout = Layout<
-        Shape<Shape<_2, _4, Int<WarpOnN>, _2, Int<MmaIterN>>, _1, Int<kNumQStages>>, Stride<Stride<_1, _2, Int<WARP_N>, _8, _16>, _1, Int<BLOCK_N>>, >;
+    // SFA/SFB/Weight s2r layouts
+    MQA_DEFINE_FP4_S2R_LAYOUTS(WarpOnM, MmaIterM, kNumKVStages, BLOCK_M,
+                               WarpOnN, MmaIterN, kNumQStages, BLOCK_N)
+    // SmemTiledCopyWeights: use conditional copy atom type (same as fp4_mqa_logits.cuh)
+    using WeightCopyAtomType = cute::conditional_t<cute::is_same_v<ElementWeights, __ppu_bfloat16>, uint32_t, uint64_t>;
     using SmemTiledCopyWeights = decltype(make_tiled_copy(
-        Copy_Atom<UniversalCopy<uint64_t>, float>{},
+        Copy_Atom<UniversalCopy<WeightCopyAtomType>, ElementWeights>{},
         Layout<Shape<Shape<_4, Int<WarpOnN>>, _1>, Stride<Stride<_1, _4>, _1>>{}, Layout<Shape<_2, _1>>{}));
 
     static_assert(kNumQStages <= 2 && kNumKVStages >= 3, "q_stage <= 2 and kv_stage >= 3");
@@ -172,7 +140,7 @@ public:
         cute::array_aligned<ElementQK, cute::cosize_v<SmemLayoutB>> smem_q;       // Q packed FP4
         cute::array_aligned<uint32_t, cute::cosize_v<SmemLayoutSFA>> smem_k_sf;   // KV e8m0 scales (uint32_t)
         cute::array_aligned<uint32_t, cute::cosize_v<SmemLayoutSFB>> smem_q_sf;   // Q e8m0 scales (uint32_t)
-        cute::array_aligned<float, cute::cosize_v<SmemLayoutWeight>> smem_weight; // weights (float32)
+        cute::array_aligned<ElementWeights, cute::cosize_v<SmemLayoutWeight>> smem_weight;
     };
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
@@ -182,7 +150,7 @@ public:
         const uint32_t* q_sf; // Q scale factor (packed e8m0, 4×uint8 per int32)
         const ElementQK* ptr_k;
         const uint32_t* k_sf; // K scale factor (packed e8m0, uint32_t)
-        const float* weights;
+        const ElementWeights* weights;
         const uint32_t batch_size;
         const uint64_t logits_stride;
         const uint64_t kv_cache_stride_bytes;
@@ -212,6 +180,8 @@ public:
         using TilerSFA = typename GmemTiledCopySFA::Tiler_MN;
         using TilerSFB = typename GmemTiledCopySFB::Tiler_MN;
 
+        using TilerWeight = typename GmemTiledCopyWeight::Tiler_MN;
+
         gmem_tiled_copy_A.desc_.template init<ElementQK, false, get<0>(TilerA{}), get<1>(TilerA{})>(
             nullptr, BLOCK_M, BLOCK_K, StrideAB{});
         gmem_tiled_copy_B.desc_.template init<ElementQK, false, get<0>(TilerB{}), get<1>(TilerB{})>(
@@ -220,7 +190,7 @@ public:
             nullptr, 1, BLOCK_M, StrideSFA{});
         gmem_tiled_copy_SFB.desc_.template init<uint32_t, false, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(
             nullptr, 1, BLOCK_N, StrideSFB{});
-        gmem_tiled_copy_weight.desc_.template init<float, false, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(
+        gmem_tiled_copy_weight.desc_.template init<ElementWeights, false, get<0>(TilerWeight{}), get<1>(TilerWeight{})>(
             nullptr, 1, BLOCK_N, StrideSFB{});
     };
 
@@ -373,7 +343,7 @@ public:
         bool thread_print = enable_print && cute::thread(0, 0);
 
         // Scheduler
-        auto scheduler = PagedMQALogitsScheduler<BLOCK_KV, kNumMathWarpGroups>(
+        auto scheduler = deep_gemm::PagedMQALogitsScheduler<BLOCK_KV, kNumMathWarpGroups, kNextN>(
             params.batch_size, blockIdx.x, params.context_lens, params.schedule_meta);
         DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
 
@@ -426,7 +396,8 @@ public:
             auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
             tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes;
             tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / sizeof(uint32_t);
-            copy_aiu<true>(gmem_tiled_copy_A, tAgA(_, _, _, 0), tAsA(_, _, _, smem_pipe_write_kv), gmem_tiled_copy_SFA,
+            constexpr bool SPLIT_AIU = (BLOCK_KV > WARP_KV);
+            copy_aiu<SPLIT_AIU>(gmem_tiled_copy_A, tAgA(_, _, _, 0), tAsA(_, _, _, smem_pipe_write_kv), gmem_tiled_copy_SFA,
                            tSFAgSFA(_, _, _, 0), tSFAsSFA(_, _, _, smem_pipe_write_kv), local_warp_idx);
 
             if (thread_print) {
@@ -440,19 +411,8 @@ public:
             copy(smem_tiled_copy_B, tCsB(_, _, _, smem_pipe_read_q), tCrB_copy_view);
             copy(smem_tiled_copy_SFB, tCsSFB(_, _, _, smem_pipe_read_q), tCrSFB_copy_view);
             copy(smem_tiled_copy_weights, tCsW(_, _, _, smem_pipe_read_q), tCrW_copy_view);
-            if constexpr (cute::is_same_v<ElementLogits, float>) {
-                for (int j = 0; j < elem_weights; j++) {
-                    weights[j] = tCrW_copy_view(j);
-                }
-            } else {
-                for (int j = 0; j < elem_weights; j += 2) {
-                    uint32_t d;
-                    asm volatile("ppu.cvt.rtte.bf16x2.f32 %0, %1, %2;\n"
-                                 : "=r"(d)
-                                 : "f"(tCrW_copy_view(j + 1)), "f"(tCrW_copy_view(j)));
-                    *reinterpret_cast<uint32_t*>(&weights[j]) = d;
-                }
-            }
+            deep_gemm::load_weights_from_copy_view<ElementWeights, ElementLogits>(
+                tCrW_copy_view, weights, elem_weights);
 
             if (thread_print) {
                 printf("    copy q to vreg, q_stage_idx = %d,\n", smem_pipe_read_q);
@@ -475,41 +435,35 @@ public:
             cp_async_fence();
         };
 
-        auto epilogue = [&](int q_idx, int kv_idx) {
+        // Load KV (A + SFA) from smem to vreg — all M blocks for one k_block (float path)
+        auto load_kv_s2r = [&](int k_block) {
+            copy(smem_tiled_copy_A, tCsA(_, _, k_block, smem_pipe_read_kv), tCrA_copy_view(_, _, k_block));
+            copy(smem_tiled_copy_SFA, tCsSFA(_, _, k_block, smem_pipe_read_kv), tCrSFA_copy_view(_, _, k_block));
+        };
+
+        // Load KV (A + SFA) from smem to vreg — single m_block for one k_block (bf16 path)
+        auto load_kv_s2r_mblock = [&](int k_block, int m_block) {
+            copy(smem_tiled_copy_A, tCsA(_, m_block, k_block, smem_pipe_read_kv), tCrA_copy_view(_, m_block, k_block));
+            copy(smem_tiled_copy_SFA, tCsSFA(_, m_block, k_block, smem_pipe_read_kv), tCrSFA_copy_view(_, m_block, k_block));
+        };
+
+        auto epilogue_mblock = [&](int q_idx, int kv_idx, int m_block) {
             // Reduce over heads and store logits
             static constexpr int kNumAccumPerMma = size<0>(accum);
             CUTE_STATIC_ASSERT(kNumHeads % 8 == 0);
 
-            for (int m = 0; m < size<1>(accum); m++) {
+            int m = m_block;
+            {
                 int mma_offset = m * InstM;
                 auto logits_q_offset = (q_idx * kNextN + warp_n_idx) * params.logits_stride;
                 auto logits_kv_offset = kv_idx * BLOCK_KV + warp_offset + mma_offset;
 
                 if constexpr (cute::is_same_v<ElementLogits, float>) {
-                    auto transform = [&](int j, int n) {
-                        return fmaxf(accum(j, m, n), 0) * tCrW(j, n);
-                    };
-
-                    float v_0 = 0, v_1 = 0;
-                    #pragma unroll
-                    for (int n = 0; n < size<2>(accum); n++) {
-                        v_0 += transform(0, n);
-                        v_0 += transform(1, n);
-                        v_1 += transform(2, n);
-                        v_1 += transform(3, n);
-                        v_0 += transform(4, n);
-                        v_0 += transform(5, n);
-                        v_1 += transform(6, n);
-                        v_1 += transform(7, n);
-                    }
+                    float v_0, v_1;
+                    deep_gemm::float_epilogue_reduce_tCrW(accum, m, tCrW, v_0, v_1);
 
                     // Inter-thread reduction
-                    #pragma unroll
-                    for (int j = 0; j < 2; ++j) {
-                        const auto& offset = static_cast<int>(1u << j);
-                        v_0 += __shfl_xor_sync(0xffffffffu, v_0, offset);
-                        v_1 += __shfl_xor_sync(0xffffffffu, v_1, offset);
-                    }
+                    deep_gemm::shfl_xor_reduce_2(v_0, v_1);
                     params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = v_0;
                     params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = v_1;
                 } else {
@@ -520,44 +474,16 @@ public:
                     uint32_t cvt_buf[kTotalTransforms];
 
                     // cvt phase: issue all ppu.cvt.rtte.bf16x2.f32.relu
-                    #pragma unroll
-                    for (int idx = 0; idx < kTotalTransforms; idx++) {
-                        int n = idx / 4;
-                        int sub = idx % 4;
-                        int j = sub * 2;
-                        asm volatile("ppu.cvt.rtte.bf16x2.f32.relu %0, %1, %2;\n"
-                                     : "=r"(cvt_buf[idx])
-                                     : "f"(accum(j + 1, m, n)), "f"(accum(j, m, n)));
-                    }
+                    deep_gemm::cvt_accum_to_bf16x2_buf<kTotalTransforms>(accum, m, cvt_buf);
                     __ppu_sched_bound();
                     // fma2 phase: issue all __hfma2
-                    #pragma unroll
-                    for (int idx = 0; idx < kTotalTransforms; idx++) {
-                        int n = idx / 4;
-                        int sub = idx % 4;
-                        int j = sub * 2;
-                        __ppu_bfloat162 a = reinterpret_cast<__ppu_bfloat162&>(cvt_buf[idx]);
-                        __ppu_bfloat162 b = {tCrW(j, n), tCrW(j + 1, n)};
-                        if (sub % 2 == 0) {
-                            sum_0 = __hfma2(a, b, sum_0);
-                        } else {
-                            sum_1 = __hfma2(a, b, sum_1);
-                        }
-                    }
-                    __ppu_sched_bound();
+                    deep_gemm::fma2_phase_tCrW<kTotalTransforms>(cvt_buf, tCrW, sum_0, sum_1);
                     // Intra-thread reduction in bfloat16
                     __ppu_bfloat16 v_0_bf = __hadd(__low2bfloat16(sum_0), __high2bfloat16(sum_0));
                     __ppu_bfloat16 v_1_bf = __hadd(__low2bfloat16(sum_1), __high2bfloat16(sum_1));
 
                     // Cross-lane reduction: pack v_0/v_1 into bfloat162 for single 32-bit shuffle
-                    __ppu_bfloat162 packed = {v_0_bf, v_1_bf};
-                    #pragma unroll
-                    for (int j = 0; j < 2; ++j) {
-                        uint32_t bits = reinterpret_cast<uint32_t&>(packed);
-                        uint32_t received_bits = __shfl_xor_sync(0xffffffffu, bits, 1u << j);
-                        __ppu_bfloat162 received = reinterpret_cast<__ppu_bfloat162&>(received_bits);
-                        packed = __hadd2(packed, received);
-                    }
+                    __ppu_bfloat162 packed = deep_gemm::shfl_xor_reduce_bf16x2({v_0_bf, v_1_bf});
                     params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = __low2bfloat16(packed);
                     params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = __high2bfloat16(packed);
                 }
@@ -573,11 +499,7 @@ public:
         cp_async_wait<kNumKVStages - 2>();
         __syncthreads();
 
-        if constexpr (WarpInterleaving) {
-            if (warp_group_id == 1) {
-                __ppu_barrier_arrive(5, MaxThreadsPerBlock, 0);
-            }
-        }
+        deep_gemm::warp_interleave_start<WarpInterleaving>(warp_group_id, MaxThreadsPerBlock);
 
         auto handle_q_change = [&]() {
             if constexpr (kNumQStages > 1) {
@@ -605,9 +527,7 @@ public:
                 printf("q_idx = %d, kv_idx_base = %d, wg = %d, read_stage = %d\n", q_idx, kv_idx_base, warp_group_idx, smem_pipe_read_kv);
             }
 
-            if constexpr (WarpInterleaving) {
-                __ppu_barrier_sync(5 + warp_group_id, MaxThreadsPerBlock);
-            }
+            deep_gemm::warp_interleave_sync<WarpInterleaving>(warp_group_id, MaxThreadsPerBlock);
 
             // Handle Q change: on the first iteration always load the next Q;
             // afterwards only when kv_idx_base == 0 (first group of new q).
@@ -624,21 +544,45 @@ public:
 
             // s2r KV + compute GEMM from current read stage
             constexpr int K_BLOCK_MAX = size<2>(tCrA);
+            constexpr int M_BLOCK = size<1>(accum);
+            constexpr int N_BLOCK = size<2>(accum);
             uint32_t actual_kv = kv_idx_base + warp_group_idx;
-            for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
-                copy(smem_tiled_copy_A, tCsA(_, _, k_block, smem_pipe_read_kv),
-                     tCrA_copy_view(_, _, k_block));
-                copy(smem_tiled_copy_SFA, tCsSFA(_, _, k_block, smem_pipe_read_kv),
-                     tCrSFA_copy_view(_, _, k_block));
-                cute::gemm(tiled_mma, accum, tCrA(_, _, k_block), tCrSFA(_, _, k_block), tCrB(_, _, k_block),
-                           tCrSFB(_, _, k_block), accum);
-            });
-
-            if constexpr (WarpInterleaving) {
-                __ppu_barrier_arrive(6 - warp_group_id, MaxThreadsPerBlock, 0);
+            if constexpr (not SPLIT_MBLOCK) {
+                for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+                    load_kv_s2r(k_block);
+                    cute::gemm(tiled_mma, accum, tCrA(_, _, k_block), tCrSFA(_, _, k_block), tCrB(_, _, k_block),
+                               tCrSFB(_, _, k_block), accum);
+                });
+                deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, MaxThreadsPerBlock);
+                #pragma unroll
+                for (int m_block = 0; m_block < size<1>(accum); m_block++) {
+                    epilogue_mblock(q_idx, actual_kv, m_block);
+                }
+            } else { // Interleaved mma and epilogue
+                constexpr int m_group = M_BLOCK / size<1>(tCrSFA);
+                constexpr int n_group = N_BLOCK / size<1>(tCrSFB);
+                for_each(make_int_sequence<M_BLOCK>{}, [&](auto m_block) {
+                    if constexpr(m_block > 0) deep_gemm::warp_interleave_sync<WarpInterleaving>(warp_group_id, MaxThreadsPerBlock);
+                    for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+                        load_kv_s2r_mblock(k_block, m_block);
+                        for_each(make_int_sequence<N_BLOCK>{}, [&](auto n_block) {
+                            Tensor s = make_tensor<uint32_t>(Int<4>{});
+                            MMA_Atom<MmaInst> mma_atom;
+                            Tensor d = accum(_, m_block, n_block);
+                            Tensor a = tCrA(_, m_block, k_block);
+                            Tensor b = tCrB(_, n_block, k_block);
+                            Tensor c = accum(_, m_block, n_block);
+                            s[0] = tCrSFA(_, _, k_block)[m_block / m_group];
+                            s[1] = tCrSFB(_, _, k_block)[n_block / n_group];
+                            s[2] = m_block % m_group;
+                            s[3] = n_block % n_group;
+                            cute::mma_unpack(mma_atom, d, a, b, c, s);
+                        });
+                    });
+                    deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, MaxThreadsPerBlock);
+                    epilogue_mblock(q_idx, actual_kv, m_block);
+                });
             }
-
-            epilogue(q_idx, actual_kv);
 
             cp_async_wait<kNumKVStages - 2>();
             if (!WarpInterleaving) {
@@ -659,11 +603,7 @@ public:
             mainloop(cute::false_type{});
         }
 
-        if constexpr (WarpInterleaving) {
-            if (warp_group_id == 0) {
-                __ppu_barrier_sync(5, MaxThreadsPerBlock);
-            }
-        }
+        deep_gemm::warp_interleave_end<WarpInterleaving>(warp_group_id, MaxThreadsPerBlock);
 
         cp_async_wait<0>();
         __syncthreads();
@@ -674,18 +614,18 @@ public:
 
 namespace deep_gemm {
 
-template <typename ElementQK, typename ElementAcc, typename ElementLogits, uint32_t kNextN, uint32_t kNumHeads,
-          uint32_t kHeadDim, uint32_t BLOCK_KV, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t SPLIT_KV>
+template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights, uint32_t kNextN, uint32_t kNumHeads,
+          uint32_t kHeadDim, uint32_t BLOCK_KV, uint32_t WARP_KV, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t SPLIT_KV, bool SPLIT_MBLOCK>
 class PagedAttentionFP4 {
 public:
     static void run(const ElementQK* ptr_q, const uint32_t* q_sf, const ElementQK* ptr_k, const uint32_t* k_sf,
-                    const float* weights, const uint32_t batch_size, const uint64_t logits_stride,
+                    const ElementWeights* weights, const uint32_t batch_size, const uint64_t logits_stride,
                     const uint64_t kv_cache_stride_bytes, const uint32_t block_table_stride,
                     const uint32_t* context_lens, ElementLogits* logits, const uint32_t* block_table,
                     const uint32_t* schedule_meta, hggcStream_t stream, int num_sms, int num_blocks) {
         using AttnKernel =
-            cutlass::gemm::kernel::PPUPagedMqaLogitsFP4<ElementQK, ElementAcc, ElementLogits, kNextN, kNumHeads,
-                                                         kHeadDim, BLOCK_KV, kNumQStages, kNumKVStages, SPLIT_KV>;
+            cutlass::gemm::kernel::PPUPagedMqaLogitsFP4<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNextN, kNumHeads,
+                                                         kHeadDim, BLOCK_KV, WARP_KV, kNumQStages, kNumKVStages, SPLIT_KV, SPLIT_MBLOCK>;
 
         static constexpr int BLOCK_M = AttnKernel::BLOCK_M;
         static constexpr int BLOCK_N = AttnKernel::BLOCK_N;
@@ -719,8 +659,11 @@ public:
             dg_prof_params.set_paged_mqa_logits_params("fp4", batch_size, kNextN, kNumHeads, kHeadDim * 2,
                                                        reinterpret_cast<int*>(const_cast<uint32_t*>(context_lens)),
                                                        stream);
-            if constexpr (std::is_same_v<ElementLogits, __ppu_bfloat16>) {
+            if constexpr (cute::is_same_v<ElementLogits, __ppu_bfloat16>) {
                 dg_prof_params.add_params("logits_dtype", std::string("bf16"));
+            }
+            if constexpr (cute::is_same_v<ElementWeights, __ppu_bfloat16>) {
+                dg_prof_params.add_params("weights_dtype", std::string("bf16"));
             }
         }
 
@@ -736,10 +679,9 @@ public:
             printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", BLOCK_M, BLOCK_N,
                    WARP_M, WARP_N, kNumQStages, kNumKVStages);
 
-            printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d\n", num_sms, max_blocks_per_cu, num_blocks);
+            printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d, num_threads: %d\n", num_sms, max_blocks_per_cu, num_blocks, MaxThreadsPerBlock);
             printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
-            std::cout << "block = " << block << std::endl;
-            std::cout << "grid = " << grid << std::endl;
+            printf("weights_bf16:%s\n", cute::is_same_v<ElementWeights, __ppu_bfloat16> ? "true" : "false");
             if (num_sms * max_blocks_per_cu != num_blocks) {
                 printf("Warning: num_blocks(%d) should equal to num_sms(%d) * max_blocks_per_cu(%d) = %d\n", num_blocks,
                        num_sms, max_blocks_per_cu, num_sms * max_blocks_per_cu);
