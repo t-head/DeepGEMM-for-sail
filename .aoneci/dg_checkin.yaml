@@ -63,6 +63,13 @@ jobs:
           ref: 'master'
           path: '/aoneci/runner/work/source/cudafy-for-sail'
           ssh-key: ${{secrets.private_ssh_key}}
+      - uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:ppu_test_org/ACTest.git'
+          ref: 'master'
+          path: '/aoneci/runner/work/source/ACTest'
+          ssh-key: ${{secrets.private_ssh_key}}
+          enable-cache: false
       - uses: ptg-sdk-setup
         inputs:
           hggc_version: ${{matrix.hggc_version}}
@@ -113,4 +120,4 @@ jobs:
           labels: OAM-810E
           image_url: ${{steps.artifact.outputs.oss_url}}
           timeout: 7200
-          cmd: source ./ci_run.sh
+          cmd: source ./run_ci_xtest.sh

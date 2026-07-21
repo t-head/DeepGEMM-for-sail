@@ -44,3 +44,12 @@ cp -r ${source_home}/DeepGemm/.git* ${source_home}/output
 cp -rf /usr/local/PPU_SDK ${source_home}/output
 cp -rf $AONE_CI_WORKSPACE/opt/torch/ ${source_home}/output/
 echo "BUILD INFO: COPY deepgemm succeed!"
+
+# 复制 acompute_v2_test 测试项目到产物中（从 ACTest 仓库 checkout）
+export ACTEST_HOME=${source_home}/ACTest
+if [ -d "${ACTEST_HOME}/acompute_v2_test" ]; then
+    cp -rf ${ACTEST_HOME}/acompute_v2_test ${source_home}/output/acompute_v2_test
+    echo "========= acompute_v2_test copied from ACTest repo ========="
+else
+    echo "WARNING: ACTest/acompute_v2_test not found at ${ACTEST_HOME}/acompute_v2_test"
+fi
