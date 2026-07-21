@@ -1,0 +1,118 @@
+triggers:
+  merge_request:
+    target-branches:
+      - 'main'
+    types:
+      - 'opened'
+strategy:
+  fast-fail: false
+
+name: "DG main Coverity Scan"
+params:
+    <<: !include version_matrix.yaml
+jobs:
+  coverity_scan:
+    name: "pypi-coverity-ubuntu24-py312"
+    image: "reg.docker.alibaba-inc.com/ai-tmp/pytorch:ubuntu24.04-py312.06"
+    timeout: 12h
+    continue-on-error: false
+    matrix:
+      params:
+        - name: hggc_version
+          value: ${{params.hggc_versions}}
+        - name: torch_version
+          value: ${{params.torch_versions}}
+        - name: sdk_version
+          value: ${{params.sdk_versions}}
+    envs:
+      os_version: 'ubuntu2404'
+      python_version: 'py312'
+      hggc_version: ${{matrix.hggc_version}}
+      pytorch_version: ${{matrix.torch_version}}
+      pkg_name: 'deepgemm_hggc${{matrix.hggc_version}}-pytorch${{matrix.torch_version}}-ubuntu2404-py312.tar.gz'
+    steps:
+      - run: echo "11.162.25.191 art-pub.eng.t-head.cn" >> /etc/hosts
+      - uses: setup-github-proxy
+      - run: |
+          rm -rf fmt && git clone https://github.com/fmtlib/fmt.git && cd fmt && git checkout	7ad8004d575a7eb5aed7b5911c1ae298f7258052 && cd ..
+      - uses: ptg-sdk-setup
+        inputs:
+          hggc_version: ${{matrix.hggc_version}}
+          sdk_version: ${{matrix.sdk_version}}
+          type: ${{params.sdk_type}}
+          sdk_daily_version: ${{params.sdk_daily_version}}
+          os: "ubuntu2404"
+          product: ${{params.product}}
+      - uses: ptg-torch-setup 
+        inputs:
+          version: ${{matrix.torch_version}}
+          hggc_version: ${{matrix.hggc_version}}
+          sdk_version: ${{matrix.sdk_version}}
+          type: ${{params.sdk_type}}
+          torch_daily_version: ${{params.torch_daily_versions}}
+          sdk_daily_version: ${{params.sdk_daily_version}}
+          os: "ubuntu2404"
+          python: "cp312"
+          product: ${{params.product}}
+      - uses: checkout
+        inputs:
+          enable-cache: false
+          submodules: false
+          submodule-fetch-depth: 0
+          path: '/aoneci/runner/work/source/DeepGemm'
+      - uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:PPU-Libraries/actlize.git'
+          ref: 'v1.0.0'
+          path: '/aoneci/runner/work/source/actlize_v1.0.0'
+          ssh-key: ${{secrets.private_ssh_key}}
+      - uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:PPU-Libraries/actlize.git'
+          ref: 'v0.5.0'
+          path: '/aoneci/runner/work/source/actlize_v0.5.0'
+          ssh-key: ${{secrets.private_ssh_key}}
+      - uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:PPU-Libraries/cudafy-for-sail.git'
+          ref: 'master'
+          path: '/aoneci/runner/work/source/cudafy-for-sail'
+          ssh-key: ${{secrets.private_ssh_key}}
+      - envs:
+          os_version: 'ubuntu2404'
+          python_version: 'py312'
+          hggc_version: '12.9.0'
+        name: "Build with coverity"
+        timeout: 5h
+        run: |
+          eecho "Setup coverity---------------------"
+          cp /aoneci/runner/work/source/DeepGemm/.aoneci/stc_scan/coverity_scan.sh /opt/coverity_scan.sh
+          wget --no-check-certificate -q -O /opt/coverity-linux64-2024.06.zip https://art-pub.eng.t-head.cn:443/artifactory/example-repo-local/coverity-linux64-2024.06.zip
+          unzip -q -o /opt/coverity-linux64-2024.06.zip -d /opt/
+          apt update && apt install -y --no-install-recommends uuid-runtime
+          echo "Starting build with coverity---------------------"
+          export source_home=$AONE_CI_SOURCE
+          export build_output=$AONE_CI_SOURCE/output
+          mkdir -p $build_output
+          source /opt/coverity_scan.sh /opt/coverity-linux64-2024.06 $AONE_CI_SOURCE /aoneci/runner/work/source/DeepGemm/.aoneci/scripts/aoneci_build.sh
+      - uses: upload-oss
+        name: "Upload coverity report"
+        inputs:
+          path: idir.tar.gz
+  stc_scan:
+    steps:
+      - uses: checkout
+        inputs:
+          enable-cache: true
+          submodules: false
+          submodule-fetch-depth: 0
+      - uses: stc-scan@0.0.1
+        inputs:
+          app_key: ${{secrets.top_app_key}}
+          app_token: ${{secrets.top_app_token}}
+          git_branch: ${{git.commitId}}
+          git_repo: git@gitlab.alibaba-inc.com:PPU-Libraries/DeepGemm.git
+          mode: source
+      - uses: upload-oss
+        inputs:
+          path: stc_report.json

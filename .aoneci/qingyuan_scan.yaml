@@ -1,0 +1,17 @@
+
+strategy:
+  fast-fail: false 
+
+name: "清源main"
+jobs:
+  qy_scan:
+    name: "清源扫描"
+    steps:
+      - uses: qy-scan
+        inputs:
+          token: ${{secrets.qysca_token}}
+          ref: ${{git.commitId}}
+          repo: http://gitlab.alibaba-inc.com/ppu_open_source/DeepGemm.git
+      - uses: upload-oss
+        inputs:
+          path: qyscan_report.json

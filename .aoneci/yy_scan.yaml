@@ -1,0 +1,33 @@
+
+strategy:
+  fast-fail: false 
+
+name: "yy扫描main"
+jobs:
+  yy_scan:
+    name: "敏感信息扫描"
+    timeout: 5h
+    steps:
+      - uses: ci-security-scan
+        id: security-scan
+        inputs:
+          # 是否仅扫描增量代码
+          incremental_scan: 'N'
+          # 参考 YUNYI 规则列表设置合适的扫描规则： https://alidocs.dingtalk.com/i/nodes/oP0MALyR8kzGnoOwFZdGL7nyJ3bzYmDO
+          yy_rule_id: "133"
+          # 下面选项可保持字面量不变
+          project_id: ${{git.projectId}}
+          git_url: ${{git.url}}
+          branch: ${{git.branch}}
+          target_branch: ${{git.branch}}
+          pipeline_instance_id: ${{pipeline.inst.id}}
+      - id: check
+        timeout: 3h
+        run: |-
+          if [ '${{steps.security-scan.outputs.yy_bugs_cnt}}' -eq 0 ]; then
+            echo "YY check PASS"
+            exit 0
+          else
+            echo "YY check failed, refer to the scan log for more information."
+            exit 1
+          fi
