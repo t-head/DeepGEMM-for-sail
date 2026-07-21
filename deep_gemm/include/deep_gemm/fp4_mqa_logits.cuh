@@ -1,15 +1,5 @@
 #pragma once
-#include "ppu_include.hpp"
-#include "cute_tie.cuh"
-#include "utils.cuh"
-#include "utils_cutlass3.h"
-#include "profiling_interface.hpp"
-
-__forceinline__ __device__ int get_lane_idx() {
-    int lane_id;
-    asm("mov.u32 %0, %laneid;" : "=r"(lane_id));
-    return lane_id;
-}
+#include "mqa_logits_utils.cuh"
 
 namespace cutlass::gemm::kernel {
 
@@ -27,25 +17,17 @@ namespace cutlass::gemm::kernel {
 //   - Non-paged scheduling using cu_seq_len_k_start / cu_seq_len_k_end
 // ============================================================================
 
-template <typename ElementQK, typename ElementAcc, typename ElementLogits, int kNumHeads, int kHeadDim, int BLOCK_QH,
+template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights,
+          int kNumHeads, int kHeadDim, int BLOCK_QH,
           int BLOCK_KV, int WARP_QH, int WARP_KV, int kNumQStages, int kNumKVStages,
-          typename StrideKType = uint32_t>
+          typename StrideKType = uint32_t,
+          bool kIsCompressedLogits = false>
 class PPUMqaLogitsFP4 {
 public:
-    static_assert(std::is_same_v<ElementQK, uint8_t>, "FP4 MQA logits requires uint8_t ElementQK");
+    static_assert(cute::is_same_v<ElementQK, uint8_t>, "FP4 MQA logits requires uint8_t ElementQK");
     static_assert(kHeadDim == 64, "FP4 packed head_dim must be 64 (original 128 / 2)");
-    static_assert(std::is_same_v<StrideKType, uint32_t> || std::is_same_v<StrideKType, uint64_t>,
+    static_assert(cute::is_same_v<StrideKType, uint32_t> || cute::is_same_v<StrideKType, uint64_t>,
                   "StrideKType must be uint32_t or uint64_t");
-
-    // ── Core types ──────────────────────────────────────────────────────
-    using ElementC = float;
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::ColumnMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-    using LayoutD = cutlass::layout::RowMajor;
-    using ElementCompute = float;
-    using ElementScale = uint8_t;
-    using OperatorClass = cutlass::arch::OpClassTensorOp;
 
     static constexpr int BLOCK_M = BLOCK_KV;
     static constexpr int BLOCK_N = BLOCK_QH;
@@ -55,11 +37,7 @@ public:
     static constexpr int BLOCK_Q = BLOCK_QH / kNumHeads;
     static constexpr int WARP_Q = WARP_QH / kNumHeads;
 
-    static constexpr int kNumMathWarpGroups = 1;
-
-    // ── Tile / Warp shapes ──────────────────────────────────────────────
     using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
-    using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>;
     static constexpr int WarpOnM = BLOCK_M / WARP_M;
     static constexpr int WarpOnN = BLOCK_N / WARP_N;
 
@@ -130,31 +108,19 @@ public:
         decltype(tile_to_shape(SmemLayoutAtomSFB{}, make_shape(_1{}, Int<BLOCK_N>{}, Int<kNumQStages>{})));
 
     using DefaultOperandWeight =
-        cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, float, false, _1, Int<BLOCK_N>, false, 0, false>;
+        cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, ElementWeights, false, _1, Int<BLOCK_N>, false, 0, false>;
     using SmemLayoutAtomWeight = typename DefaultOperandWeight::SmemLayoutAtom;
     using GmemTiledCopyWeight = typename DefaultOperandWeight::GmemTiledCopy;
     using SmemLayoutWeight =
         decltype(tile_to_shape(SmemLayoutAtomWeight{}, make_shape(_1{}, Int<BLOCK_N>{}, Int<kNumQStages>{})));
 
-    // ── SFA s2r: recast smem as uint16_t, then transposed layout for MMA ──
-    using sSFATransLayout = Layout<Shape<Shape<Int<WarpOnM>, Int<MmaIterM>>, Shape<_2, _8, _2>, Int<kNumKVStages>>,
-                                   Stride<Stride<Int<MmaIterM * 32>, _32>, Stride<_16, _2, _1>, Int<BLOCK_M * 2>>>;
-    using SmemTiledCopySFA = decltype(make_tiled_copy(
-        Copy_Atom<UniversalCopy<uint16_t>, uint16_t>{},
-        Layout<Shape<Shape<Int<WarpOnM>, _4>, _8>, Stride<Stride<_32, _1>, _4>>{}, Layout<Shape<_1, _2>>{}));
-
-    // ── SFB s2r: recast smem as uint16_t, then transposed layout for MMA ──
-    using sSFBTransLayout = Layout<Shape<Shape<Int<WarpOnN>, Int<MmaIterN>>, Shape<_2, _8, _2>, Int<kNumQStages>>,
-                                   Stride<Stride<Int<MmaIterN * 32>, _32>, Stride<_16, _2, _1>, Int<BLOCK_N * 2>>>;
-    using SmemTiledCopySFB = decltype(make_tiled_copy(
-        Copy_Atom<UniversalCopy<uint16_t>, uint16_t>{},
-        Layout<Shape<Shape<Int<WarpOnN>, _4>, _8>, Stride<Stride<_32, _1>, _4>>{}, Layout<Shape<_1, _2>>{}));
-
-    // ── Weights s2r copy ────────────────────────────────────────────────
-    using sWCopyLayout = Layout<
-        Shape<Shape<_2, _4, Int<WarpOnN>, _2, Int<MmaIterN>>, _1, Int<kNumKVStages>>, Stride<Stride<_1, _2, Int<WARP_N>, _8, _16>, _1, Int<BLOCK_N>>, >;
+    // SFA/SFB/Weight s2r layouts
+    MQA_DEFINE_FP4_S2R_LAYOUTS(WarpOnM, MmaIterM, kNumKVStages, BLOCK_M,
+                               WarpOnN, MmaIterN, kNumQStages, BLOCK_N)
+    // WeightCopyAtomType and SmemTiledCopyWeights are kernel-specific (depend on ElementWeights)
+    using WeightCopyAtomType = cute::conditional_t<cute::is_same_v<ElementWeights, __ppu_bfloat16>, uint16_t, uint64_t>;
     using SmemTiledCopyWeights = decltype(make_tiled_copy(
-        Copy_Atom<UniversalCopy<uint64_t>, float>{},
+        Copy_Atom<UniversalCopy<WeightCopyAtomType>, ElementWeights>{},
         Layout<Shape<Shape<_4, Int<WarpOnN>>, _1>, Stride<Stride<_1, _4>, _1>>{}, Layout<Shape<_2, _1>>{}));
 
     // ── Shared memory ──────────────────────────────────────────────────
@@ -163,7 +129,7 @@ public:
         cute::array_aligned<ElementQK, cute::cosize_v<SmemLayoutB>> smem_q;       // Q packed FP4
         cute::array_aligned<uint32_t, cute::cosize_v<SmemLayoutSFA>> smem_k_sf;   // K e8m0 scales (uint32_t)
         cute::array_aligned<uint32_t, cute::cosize_v<SmemLayoutSFB>> smem_q_sf;   // Q e8m0 scales (uint32_t)
-        cute::array_aligned<float, cute::cosize_v<SmemLayoutWeight>> smem_weight; // weights (float32)
+        cute::array_aligned<ElementWeights, cute::cosize_v<SmemLayoutWeight>> smem_weight; // weights
     };
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
@@ -173,7 +139,7 @@ public:
         const uint32_t* q_sf; // Q scale factor (packed e8m0, uint32_t)
         const ElementQK* ptr_k;
         const uint32_t* k_sf; // K scale factor (packed e8m0, uint32_t)
-        const float* weights;
+        const ElementWeights* weights;
         int* cu_seq_len_k_start;
         int* cu_seq_len_k_end;
         ElementLogits* logits;
@@ -200,6 +166,7 @@ public:
         using TilerB = typename GmemTiledCopyB::Tiler_MN;
         using TilerSFA = typename GmemTiledCopySFA::Tiler_MN;
         using TilerSFB = typename GmemTiledCopySFB::Tiler_MN;
+        using TilerWeight = typename GmemTiledCopyWeight::Tiler_MN;
 
         gmem_tiled_copy_A.desc_.template init<ElementQK, false, get<0>(TilerA{}), get<1>(TilerA{})>(
             nullptr, BLOCK_M, BLOCK_K, StrideAB{});
@@ -209,7 +176,7 @@ public:
             nullptr, 1, BLOCK_M, StrideSFA{});
         gmem_tiled_copy_SFB.desc_.template init<uint32_t, false, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(
             nullptr, 1, BLOCK_N, StrideSFB{});
-        gmem_tiled_copy_weight.desc_.template init<float, false, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(
+        gmem_tiled_copy_weight.desc_.template init<ElementWeights, false, get<0>(TilerWeight{}), get<1>(TilerWeight{})>(
             nullptr, 1, BLOCK_N, StrideSFB{});
     };
 
@@ -341,36 +308,22 @@ public:
 
         // ── Weights s2r setup ─────────────────────────────────────────────
         constexpr int elem_weights = kNumHeads / 4;
-        ElementLogits weights[elem_weights];
         Tensor sW_copy = make_tensor(sW.data(), sWCopyLayout{});
         SmemTiledCopyWeights smem_tiled_copy_weights;
         auto smem_thr_copy_weights = smem_tiled_copy_weights.get_slice(warp_n_idx * 4 + lane_idx % 4);
         Tensor tCsW = smem_thr_copy_weights.partition_S(sW_copy);
         Tensor tCrW_copy_view = make_tensor_like(tCsW(_, _, _, 0));
         using WeightRegLayout = Layout<Shape<Shape<_2, _2, _2>, Int<MmaIterN>>, Stride<Stride<_1, _0, _2>, _4>>;
+        // For bf16 weights: tCrW points directly to tCrW_copy_view's data (no separate weights array)
+        // For float weights: tCrW points to weights array (populated by cvt in load_q_s2r)
+        ElementLogits weights[elem_weights];
         Tensor tCrW = make_tensor(static_cast<ElementLogits*>(weights), WeightRegLayout{});
 
         // ── Block scheduler (non-paged) ───────────────────────────────────
         const auto& num_q_blocks = ceil_div(params.seq_len_q, BLOCK_Q);
-        int block_q_idx = blockIdx.x, q_iter_idx = 0;
-
-        const auto& get_next_block_q_idx = [&]() -> cute::tuple<int, int> {
-            return {block_q_idx + gridDim.x, q_iter_idx + 1};
-        };
-
-        const auto& load_schedule = [&](const int& q_iter_offset = 0) -> cute::tuple<int, int, int, int, int> {
-            int start = cute::numeric_limits<int>::max();
-            int end = cute::numeric_limits<int>::min();
-            #pragma unroll
-            for (int i = 0; i < BLOCK_Q; ++i) {
-                const auto& q_idx = min(block_q_idx * BLOCK_Q + i, params.seq_len_q - 1);
-                start = min(start, min(__ldg(params.cu_seq_len_k_start + q_idx), params.seq_len_k));
-                end = max(end, min(__ldg(params.cu_seq_len_k_end + q_idx), params.seq_len_k));
-            }
-            start = start / 4 * 4;
-            return {(q_iter_idx + q_iter_offset) % kNumQStages, ((q_iter_idx + q_iter_offset) / kNumQStages) & 1, start,
-                    end, ceil_div(end - start, BLOCK_KV)};
-        };
+        uint32_t block_q_idx = blockIdx.x, q_iter_idx = 0;
+        // Per-token KV range arrays for compressed logits mode (dead code when kIsCompressedLogits=false)
+        uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
 
         // ── Variables ─────────────────────────────────────────────────────
         clear(accum);
@@ -383,38 +336,10 @@ public:
         const auto& warp_offset = warp_m_idx * WARP_M;
         const auto& v_0_offset = lane_idx / 4 + 0;
         const auto& v_1_offset = lane_idx / 4 + 8;
-        int warp_q_idx = warp_idx / WarpOnM;
+        uint32_t warp_q_idx = warp_idx / WarpOnM;
         int warp_group_id = warp_idx / 8;
 
-        auto warp_interleave_start = [&]() {
-            if constexpr (WarpInterleaving) {
-                if (warp_group_id == 1) {
-                    __ppu_barrier_arrive(5, NumThreadsPerCTA, 0);
-                }
-            }
-        };
-
-        auto warp_interleave_sync = [&]() {
-            if constexpr (WarpInterleaving) {
-                __ppu_barrier_sync(5 + warp_group_id, NumThreadsPerCTA);
-            }
-        };
-
-        auto warp_interleave_defer = [&]() {
-            if constexpr (WarpInterleaving) {
-                __ppu_barrier_arrive(6 - warp_group_id, NumThreadsPerCTA, 0);
-            }
-        };
-
-        auto warp_interleave_end = [&]() {
-            if constexpr (WarpInterleaving) {
-                if (warp_group_id == 0) {
-                    __ppu_barrier_sync(5, NumThreadsPerCTA);
-                }
-            }
-        };
-
-        auto load_q_g2s = [&](int block_q_idx, int q_stage_idx) {
+        auto load_q_g2s = [&](uint32_t block_q_idx, uint32_t q_stage_idx) {
             int residual_n = (params.seq_len_q - block_q_idx * BLOCK_Q) * kNumHeads;
             gmem_tiled_copy_B.desc_.dim_h = residual_n;
             gmem_tiled_copy_SFB.desc_.dim_w = residual_n;
@@ -424,7 +349,7 @@ public:
                            tWgW(_, _, _, 0), tWsW(_, _, _, q_stage_idx), warp_idx);
         };
 
-        auto load_kv_g2s = [&](int kv_start, int kv_end, int kv_block_idx, int smem_stage) {
+        auto load_kv_g2s = [&](uint32_t kv_start, uint32_t kv_end, uint32_t kv_block_idx, uint32_t smem_stage) {
             int residual_m = kv_end - (kv_start + kv_block_idx * BLOCK_KV);
             gmem_tiled_copy_A.desc_.dim_h = residual_m;
             gmem_tiled_copy_SFA.desc_.dim_w = residual_m;
@@ -434,36 +359,25 @@ public:
             tSFAgSFA.data() = tSFAgSFA.data() + BLOCK_KV;
         };
 
-        auto load_q_s2r = [&](int q_stage_idx) {
+        auto load_q_s2r = [&](uint32_t q_stage_idx) {
             copy(smem_tiled_copy_B, tCsB(_, _, _, q_stage_idx), tCrB_copy_view);
             copy(smem_tiled_copy_SFB, tCsSFB(_, _, _, q_stage_idx), tCrSFB_copy_view);
             copy(smem_tiled_copy_weights, tCsW(_, _, _, q_stage_idx), tCrW_copy_view);
-            if constexpr (cute::is_same_v<ElementLogits, float>) {
-                for (int j = 0; j < elem_weights; j++) {
-                    weights[j] = tCrW_copy_view(j);
-                }
-            } else {
-                for (int j = 0; j < elem_weights; j += 2) {
-                    uint32_t d;
-                    asm volatile("ppu.cvt.rtte.bf16x2.f32 %0, %1, %2;\n"
-                                 : "=r"(d)
-                                 : "f"(tCrW_copy_view(j + 1)), "f"(tCrW_copy_view(j)));
-                    *reinterpret_cast<uint32_t*>(&weights[j]) = d;
-                }
-            }
+            deep_gemm::load_weights_from_copy_view<ElementWeights, ElementLogits>(
+                tCrW_copy_view, weights, elem_weights);
         };
 
-        auto load_kv_s2r = [&](int k_block, int kv_stage_idx) {
+        auto load_kv_s2r = [&](int k_block, uint32_t kv_stage_idx) {
             copy(smem_tiled_copy_A, tCsA(_, _, k_block, kv_stage_idx), tCrA_copy_view(_, _, k_block));
             copy(smem_tiled_copy_SFA, tCsSFA(_, _, k_block, kv_stage_idx), tCrSFA_copy_view(_, _, k_block));
         };
 
-        auto load_kv_s2r_mblock = [&](int k_block, int kv_stage_idx, int m_block) {
+        auto load_kv_s2r_mblock = [&](int k_block, uint32_t kv_stage_idx, int m_block) {
             copy(smem_tiled_copy_A, tCsA(_, m_block, k_block, kv_stage_idx), tCrA_copy_view(_, m_block, k_block));
             copy(smem_tiled_copy_SFA, tCsSFA(_, m_block, k_block, kv_stage_idx), tCrSFA_copy_view(_, m_block, k_block));
         };
 
-        auto epilogue_mblock = [&](int kv_start, int kv_block_idx, int m_block) {
+        auto epilogue_mblock = [&](uint32_t kv_start, uint32_t kv_block_idx, int m_block) {
             // Reduce over heads and store logits
             static constexpr int kNumAccumPerMma = size<0>(accum);
             CUTE_STATIC_ASSERT(kNumHeads % 8 == 0);
@@ -474,30 +388,21 @@ public:
                 auto logits_q_offset = (block_q_idx * BLOCK_Q + warp_q_idx) * params.stride_k;
                 auto logits_kv_offset = kv_offset + mma_offset;
 
-                if constexpr (std::is_same_v<ElementLogits, float>) {
-                    auto transform = [&](int j, int n) {
-                        return fmaxf(accum(j, m, n), 0) * tCrW(j, n);
-                    };
-                    float v_0 = 0, v_1 = 0;
-                    #pragma unroll
-                    for (int n = 0; n < size<2>(accum); n++) {
-                        v_0 += transform(0, n);
-                        v_0 += transform(1, n);
-                        v_1 += transform(2, n);
-                        v_1 += transform(3, n);
-                        v_0 += transform(4, n);
-                        v_0 += transform(5, n);
-                        v_1 += transform(6, n);
-                        v_1 += transform(7, n);
+                if constexpr (cute::is_same_v<ElementLogits, float>) {
+                    float v_0, v_1;
+                    deep_gemm::float_epilogue_reduce_tCrW(accum, m, tCrW, v_0, v_1);
+                    deep_gemm::shfl_xor_reduce_2(v_0, v_1);
+                    if constexpr (kIsCompressedLogits) {
+                        const uint32_t rel_kv = static_cast<uint32_t>(logits_kv_offset) - seq_k_start[warp_q_idx];
+                        const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
+                        if (rel_kv + v_0_offset < len)
+                            params.logits[logits_q_offset + rel_kv + v_0_offset] = v_0;
+                        if (rel_kv + v_1_offset < len)
+                            params.logits[logits_q_offset + rel_kv + v_1_offset] = v_1;
+                    } else {
+                        params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = v_0;
+                        params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = v_1;
                     }
-                    #pragma unroll
-                    for (int j = 0; j < 2; ++j) {
-                        const auto& offset = static_cast<int>(1u << j);
-                        v_0 += __shfl_xor_sync(0xffffffffu, v_0, offset);
-                        v_1 += __shfl_xor_sync(0xffffffffu, v_1, offset);
-                    }
-                    params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = v_0;
-                    params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = v_1;
                 } else {
                     // bf16 output: separate cvt and fma2 phases with __ppu_sched_bound()
                     constexpr int kTotalTransforms = 4 * size<2>(accum);
@@ -506,49 +411,36 @@ public:
                     uint32_t cvt_buf[kTotalTransforms];
 
                     // cvt phase: issue all ppu.cvt.rtte.bf16x2.f32.relu
-                    #pragma unroll
-                    for (int idx = 0; idx < kTotalTransforms; idx++) {
-                        int n = idx / 4;
-                        int sub = idx % 4;
-                        int j = sub * 2;
-                        asm volatile("ppu.cvt.rtte.bf16x2.f32.relu %0, %1, %2;\n"
-                                     : "=r"(cvt_buf[idx])
-                                     : "f"(accum(j + 1, m, n)), "f"(accum(j, m, n)));
-                    }
+                    deep_gemm::cvt_accum_to_bf16x2_buf<kTotalTransforms>(accum, m, cvt_buf);
                     __ppu_sched_bound();
                     // fma2 phase: issue all __hfma2
-                    #pragma unroll
-                    for (int idx = 0; idx < kTotalTransforms; idx++) {
-                        int n = idx / 4;
-                        int sub = idx % 4;
-                        int j = sub * 2;
-                        __ppu_bfloat162 a = reinterpret_cast<__ppu_bfloat162&>(cvt_buf[idx]);
-                        __ppu_bfloat162 b = {tCrW(j, n), tCrW(j + 1, n)};
-                        if (sub % 2 == 0) {
-                            sum_0 = __hfma2(a, b, sum_0);
-                        } else {
-                            sum_1 = __hfma2(a, b, sum_1);
-                        }
-                    }
+                    deep_gemm::fma2_phase_tCrW<kTotalTransforms>(cvt_buf, tCrW, sum_0, sum_1);
                     __ppu_bfloat16 v_0_bf = __hadd(__low2bfloat16(sum_0), __high2bfloat16(sum_0));
                     __ppu_bfloat16 v_1_bf = __hadd(__low2bfloat16(sum_1), __high2bfloat16(sum_1));
-                    __ppu_bfloat162 packed = {v_0_bf, v_1_bf};
-                    #pragma unroll
-                    for (int j = 0; j < 2; ++j) {
-                        uint32_t bits = reinterpret_cast<uint32_t&>(packed);
-                        uint32_t received_bits = __shfl_xor_sync(0xffffffffu, bits, 1u << j);
-                        __ppu_bfloat162 received = reinterpret_cast<__ppu_bfloat162&>(received_bits);
-                        packed = __hadd2(packed, received);
+                    __ppu_bfloat162 packed = deep_gemm::shfl_xor_reduce_bf16x2({v_0_bf, v_1_bf});
+                    if constexpr (kIsCompressedLogits) {
+                        const uint32_t rel_kv = static_cast<uint32_t>(logits_kv_offset) - seq_k_start[warp_q_idx];
+                        const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
+                        if (rel_kv + v_0_offset < len)
+                            params.logits[logits_q_offset + rel_kv + v_0_offset] = __low2bfloat16(packed);
+                        if (rel_kv + v_1_offset < len)
+                            params.logits[logits_q_offset + rel_kv + v_1_offset] = __high2bfloat16(packed);
+                    } else {
+                        params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = __low2bfloat16(packed);
+                        params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = __high2bfloat16(packed);
                     }
-                    params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = __low2bfloat16(packed);
-                    params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = __high2bfloat16(packed);
                 }
             }
         };
 
         // ── Outer loop: Q blocks ──────────────────────────────────────────
         while (block_q_idx < num_q_blocks) {
-            CUTE_TIE_DECL(load_schedule(0), q_stage_idx, q_phase, kv_start, kv_end, num_kv_blocks);
+            CUTE_TIE_DECL(
+                (deep_gemm::load_schedule<BLOCK_Q, kNumQStages, BLOCK_KV, kIsCompressedLogits>(
+                    block_q_idx, q_iter_idx, 0, params.seq_len_q, params.seq_len_k,
+                    params.cu_seq_len_k_start, params.cu_seq_len_k_end,
+                    seq_k_start, seq_k_end)),
+                q_stage_idx, q_phase, kv_start, kv_end, num_kv_blocks);
 
             // ── Offset Q / K / scale data pointers ──────────────────────────
             tAgA.data() = tKgK.data() + kv_start * BLOCK_K;
@@ -557,13 +449,13 @@ public:
             tSFBgSFB.data() = tSFQgSFQ.data() + block_q_idx * BLOCK_Q * kNumHeads;
             tWgW.data() = tWgW_base.data() + block_q_idx * BLOCK_Q * kNumHeads;
 
-            int current_stage_kv = 0;
+            uint32_t current_stage_kv = 0;
             if (num_kv_blocks > 0) {
                 // ── Load Q + q_sf + weights (AIU) ──────────────────────────
                 load_q_g2s(block_q_idx, q_stage_idx);
 
                 // ── Prologue: load first (kNumKVStages - 1) K blocks (AIU) ──
-                for (int kv_pipe = 0; kv_pipe < kNumKVStages - 1; kv_pipe++) {
+                for (uint32_t kv_pipe = 0; kv_pipe < kNumKVStages - 1; kv_pipe++) {
                     if (kv_pipe < num_kv_blocks) {
                         load_kv_g2s(kv_start, kv_end, kv_pipe, kv_pipe);
                     }
@@ -579,16 +471,16 @@ public:
                 load_q_s2r(q_stage_idx);
             }
 
-            warp_interleave_start();
+            deep_gemm::warp_interleave_start<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
 
             // ── Inner loop: KV blocks ──────────────────────────────────────
-            for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
-                int kv_stage_idx = kv_block_idx % kNumKVStages;
+            for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++ kv_block_idx) {
+                uint32_t kv_stage_idx = kv_block_idx % kNumKVStages;
 
-                warp_interleave_sync();
+                deep_gemm::warp_interleave_sync<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
 
                 // Issue next K block
-                int next_kv_block_idx = kv_block_idx + kNumKVStages - 1;
+                uint32_t next_kv_block_idx = kv_block_idx + kNumKVStages - 1;
                 if (next_kv_block_idx < num_kv_blocks) {
                     load_kv_g2s(kv_start, kv_end, next_kv_block_idx, current_stage_kv);
                 }
@@ -598,13 +490,13 @@ public:
                 constexpr int M_BLOCK = size<1>(accum);
                 constexpr int N_BLOCK = size<2>(accum);
                 constexpr int K_BLOCK = size<2>(tCrA);
-                if constexpr (std::is_same_v<ElementLogits, float>) {
+                if constexpr (cute::is_same_v<ElementLogits, float>) {
                     for_each(make_int_sequence<K_BLOCK>{}, [&](auto k_block) {
                         load_kv_s2r(k_block, kv_stage_idx);
                         cute::gemm(tiled_mma, accum, tCrA(_, _, k_block), tCrSFA(_, _, k_block), tCrB(_, _, k_block),
                                     tCrSFB(_, _, k_block), accum);
                     });
-                    warp_interleave_defer();
+                    deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
                     #pragma unroll
                     for (int m_block = 0; m_block < size<1>(accum); m_block++) {
                         epilogue_mblock(kv_start, kv_block_idx, m_block);
@@ -613,7 +505,7 @@ public:
                     constexpr int m_group = M_BLOCK / size<1>(tCrSFA);
                     constexpr int n_group = N_BLOCK / size<1>(tCrSFB);
                     for_each(make_int_sequence<M_BLOCK>{}, [&](auto m_block) {
-                        if constexpr(m_block > 0) warp_interleave_sync();
+                        if constexpr(m_block > 0) deep_gemm::warp_interleave_sync<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
                         for_each(make_int_sequence<K_BLOCK>{}, [&](auto k_block) {
                             load_kv_s2r_mblock(k_block, kv_stage_idx, m_block);
                             for_each(make_int_sequence<N_BLOCK>{}, [&](auto n_block) {
@@ -630,7 +522,7 @@ public:
                                 cute::mma_unpack(mma_atom, d, a, b, c, s);
                             });
                         });
-                        warp_interleave_defer();
+                        deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
                         epilogue_mblock(kv_start, kv_block_idx, m_block);
                     });
                 }
@@ -643,13 +535,13 @@ public:
                 clear(accum);
             } // end KV loop
 
-            warp_interleave_end();
+            deep_gemm::warp_interleave_end<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
 
             cp_async_wait<0>();
             __syncthreads();
 
             // Jump to next Q block
-            CUTE_TIE(get_next_block_q_idx(), block_q_idx, q_iter_idx);
+            CUTE_TIE(deep_gemm::get_next_block_q_idx(block_q_idx, q_iter_idx), block_q_idx, q_iter_idx);
         } // end Q loop
     }
 };
@@ -658,18 +550,20 @@ public:
 
 namespace deep_gemm {
 
-template <typename ElementQK, typename ElementAcc, typename ElementLogits, int kNumHeads, int kHeadDim, int BLOCK_QH,
+template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights,
+          int kNumHeads, int kHeadDim, int BLOCK_QH,
           int BLOCK_KV, int WARP_QH, int WARP_KV, int kNumQStages, int kNumKVStages,
-          typename StrideKType = uint32_t>
+          typename StrideKType = uint32_t,
+          bool kIsCompressedLogits = false>
 class AttentionFP4 {
 public:
     static void run(const ElementQK* ptr_q, const uint32_t* q_sf, const ElementQK* ptr_k, const uint32_t* k_sf,
-                    const float* weights, int* cu_seq_len_k_start, int* cu_seq_len_k_end, ElementLogits* logits,
+                    const ElementWeights* weights, int* cu_seq_len_k_start, int* cu_seq_len_k_end, ElementLogits* logits,
                     const int seq_len_q, const int seq_len_k, const StrideKType stride_k, hggcStream_t stream,
                     int num_sms) {
         using AttnKernel =
-            cutlass::gemm::kernel::PPUMqaLogitsFP4<ElementQK, ElementAcc, ElementLogits, kNumHeads, kHeadDim, BLOCK_QH,
-                                                    BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType>;
+            cutlass::gemm::kernel::PPUMqaLogitsFP4<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNumHeads, kHeadDim, BLOCK_QH,
+                                                    BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits>;
 
         static constexpr int BLOCK_M = AttnKernel::BLOCK_M;
         static constexpr int BLOCK_N = AttnKernel::BLOCK_N;
@@ -692,8 +586,11 @@ public:
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_mqa_logits_params("fp4", seq_len_q, seq_len_k, kNumHeads, kHeadDim * 2, stream);
-            if constexpr (std::is_same_v<ElementLogits, __ppu_bfloat16>) {
+            if constexpr (cute::is_same_v<ElementLogits, __ppu_bfloat16>) {
                 dg_prof_params.add_params("logits_dtype", std::string("bf16"));
+            }
+            if constexpr (cute::is_same_v<ElementWeights, __ppu_bfloat16>) {
+                dg_prof_params.add_params("weights_dtype", std::string("bf16"));
             }
         }
 
@@ -706,9 +603,11 @@ public:
                    BLOCK_KV);
             printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", BLOCK_M, BLOCK_N,
                    WARP_M, WARP_N, kNumQStages, kNumKVStages);
-            printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d\n", num_sms, max_blocks_per_cu,
-                   threadblock_count);
+            printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d, num_threads:%d\n", num_sms, max_blocks_per_cu,
+                   threadblock_count, MaxThreadsPerBlock);
             printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
+            printf("compressed_logits:%s, ", kIsCompressedLogits ? "true" : "false");
+            printf("weights_bf16:%s\n", cute::is_same_v<ElementWeights, __ppu_bfloat16> ? "true" : "false");
         }
 
         ProfilingInterface::Instance().instrument(true, dg_prof_params);

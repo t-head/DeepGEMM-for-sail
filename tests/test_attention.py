@@ -110,10 +110,29 @@ def test_mqa_logits_loop():
         # bf16 test
         {
             'data_type': torch.bfloat16,
-            'seq_len_q': 4096,
+            'seq_len_q': 8191,
             'seq_len_kv': 8191,
             'num_heads': 64,
             'head_dim': 128,
+        },
+        # compressed logits
+        {
+            'data_type': torch.int8,
+            'seq_len_q': 4096,
+            'seq_len_kv': 8192,
+            'num_heads': 64,
+            'head_dim': 128,
+            "compressed_logits": True,
+        },
+        # BF16 weights + BF16 logits
+        {
+            'data_type': torch.int8,
+            'seq_len_q': 1024,
+            'seq_len_kv': 4096,
+            'num_heads': 32,
+            'head_dim': 128,
+            'logits_dtype': torch.bfloat16,
+            'weights_dtype': torch.bfloat16,
         },
     ]:
         set_acc_check(True)
@@ -149,7 +168,7 @@ def test_paged_mqa_logits_loop():
                         args['logits_dtype'] = torch.bfloat16
                         test_paged_mqa_logits(args)
 
-    for args in [
+    test_configs = [
         # context_len = 0
         {
             'data_type': torch.int8,
@@ -177,8 +196,55 @@ def test_paged_mqa_logits_loop():
             'head_dim': 128,
             'avg_context_len': 1087
         },
-    ]:
+        # BF16 weights + BF16 logits
+        {
+            'data_type': torch.int8,
+            'batch_size': 64,
+            'next_n': 1,
+            'num_heads': 64,
+            'head_dim': 128,
+            'avg_context_len': 8192,
+            'logits_dtype': torch.bfloat16,
+            'weights_dtype': torch.bfloat16,
+        },
+        # int8, next_n = 4
+        {
+            'data_type': torch.int8,
+            'batch_size': 64,
+            'next_n': 4,
+            'num_heads': 64,
+            'head_dim': 128,
+            'avg_context_len': 8192,
+        },
+    ]
+    if is_ppu1v5_device():
+        # fp4, next_n = 6
+        test_configs.append({
+            'data_type': torch.uint8,
+            'batch_size': 64,
+            'next_n': 6,
+            'num_heads': 64,
+            'head_dim': 128,
+            'avg_context_len': 8192,
+            'logits_dtype': torch.bfloat16,
+        })
+    no_check_test_configs = [
+        # mtp with cuda graph: context_lens change
+        {
+            'data_type': torch.int8,
+            'batch_size': 8,
+            'next_n': 1,
+            'num_heads': 32,
+            'head_dim': 128,
+            'pre_distribution': [4090,0,1,0,1],
+            'distribution': [4090,0,1,0,1,100,200,300],
+        },
+    ]
+    for args in test_configs:
         set_acc_check(True)
+        test_paged_mqa_logits(args)
+    for args in no_check_test_configs:
+        set_acc_check(False)
         test_paged_mqa_logits(args)
     print("Passed\n")
 

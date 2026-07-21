@@ -55,6 +55,7 @@ void set_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv,
     grouped_layout_ = nullptr;
     gemm_type_ = GemmType::DenseGemm;
     is_gemv_ = false;
+    device_id_ = -1; // avoid check_support_dump print
 }
 
 void set_paged_mqa_logits_params(std::string data_type, int batch_size, int next_n, int num_heads, int head_dim, int* context_lens, hggcStream_t stream = 0) {
@@ -76,6 +77,7 @@ void set_paged_mqa_logits_params(std::string data_type, int batch_size, int next
     m_ = batch_size;
     group_ = batch_size;
     grouped_layout_ = context_lens;
+    next_n_ = next_n;
     gemm_type_ = GemmType::GroupedNoPad;
     is_gemv_ = false;
     int gpu = -1;
@@ -151,16 +153,20 @@ void distribution() {
         int batch_size = group_;
         int sum_context_len = 0;
         int* context_lens = grouped_layout_;
-        int* tmp = new int[batch_size];
-        CHECK_HGGC(hggcMemcpyAsync(tmp, context_lens, sizeof(int) * batch_size, hggcMemcpyDeviceToHost, stream_));
+        int total_elements = batch_size * next_n_;
+        int* tmp = new int[total_elements];
+        CHECK_HGGC(hggcMemcpyAsync(tmp, context_lens, sizeof(int) * total_elements, hggcMemcpyDeviceToHost, stream_));
         hggcStreamSynchronize(stream_);
 
+        // Output the last context_len for each batch (i.e., tmp[i * next_n_ + next_n_ - 1])
         for (int i = 0; i < batch_size - 1; ++i) {
-            outDist << tmp[i] << ",";
-            sum_context_len += tmp[i];
+            int val = tmp[i * next_n_ + next_n_ - 1];
+            outDist << val << ",";
+            sum_context_len += val;
         }
-        sum_context_len += tmp[batch_size - 1];
-        outDist << tmp[batch_size - 1] << "].";
+        int last_val = tmp[(batch_size - 1) * next_n_ + next_n_ - 1];
+        sum_context_len += last_val;
+        outDist << last_val << "].";
         delete[] tmp;
         // Dump average instead of distribution when batch size is large
         if (batch_size > 64) {
@@ -264,6 +270,7 @@ protected:
     int m_;
     int group_;
     int* grouped_layout_;
+    int next_n_ = 1;
     int device_id_;
     GemmType gemm_type_;
     bool is_gemv_;
