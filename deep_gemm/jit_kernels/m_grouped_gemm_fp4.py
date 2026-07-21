@@ -107,6 +107,8 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
 
     if k <= 512 and n % (block_n * 4) == 0 and not has_bias:
         n_expand = 4
+    if k <= 128 and n % (block_n * 8) == 0 and not has_bias:
+        n_expand = 8
     args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, m_rows, block_m_info, expected_m, torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp4_fp4_bf16_nt',
