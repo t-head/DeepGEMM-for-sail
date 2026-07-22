@@ -547,7 +547,7 @@ public:
                     int j = sub * 2;
                     asm volatile("ppu.cvt.rtte.bf16x2.f32.relu %0, %1, %2;\n"
                                  : "=r"(cvt_buf[idx])
-                                 : "f"(accum(j + 1, m, n)), "f"(accum(j, m, n)));
+                                 : "f"((float)accum(j + 1, m, n)), "f"((float)accum(j, m, n)));
                 }
                 __ppu_sched_bound();
                 // fma2 phase: issue all __hfma2
