@@ -1509,7 +1509,7 @@ def test_mqa_logits(args) -> None:
 
         from math_utils import calc_diff
         diff = calc_diff(logits_masked, ref_logits_masked)
-        if diff >= 1e-3:
+        if torch.isnan(torch.tensor(diff)) or diff >= 1e-3:
             print(f"ERROR: Accuracy check failed, diff={diff}")
             exit(1)
         else:
@@ -1618,7 +1618,7 @@ def test_paged_mqa_logits(args) -> None:
         from math_utils import calc_diff
         diff = calc_diff(logits_masked, ref_logits_masked)
         threshold = 1.5e-3 if logits_dtype == torch.bfloat16 else 1e-3
-        if diff >= threshold:
+        if torch.isnan(torch.tensor(diff)) or diff >= 1e-3:
             print(f"ERROR: Accuracy check failed, diff={diff}")
             exit(1)
         else:
