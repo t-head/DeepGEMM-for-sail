@@ -22,10 +22,10 @@ constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
 constexpr auto nExpand = {N_EXPAND};
-constexpr auto kEnableMoeDynamicTile = {EnableMoeDynamicTile};
+constexpr auto kDynamicTileId = FP4DynamicTileId::{DynamicTileId};
 // Make a templated grouped GEMM
 auto bias_dispatcher = [&](auto HasBias) {
-    using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap, decltype(HasBias)::value, nExpand, kEnableMoeDynamicTile>;
+    using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap, decltype(HasBias)::value, nExpand, kDynamicTileId>;
     gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
                 bias, out, m, grouped_layout, block_m_info, expected_m,
                 stream, num_sms, smem_size, signal);
@@ -35,6 +35,46 @@ auto bias_dispatcher = [&](auto HasBias) {
 if (bias == nullptr) bias_dispatcher(std::bool_constant<false>{});
 else                 bias_dispatcher(std::bool_constant<true>{});
 """
+
+def select_moe_dynamic_tile(n: int, k: int, expected_m: int, has_bias: bool) -> Tuple[bool, str]:
+    """Decide whether to enable MoE dynamic-tile and which variant to use.
+
+    Returns (enable_moe_dynamic_tile, dynamic_tile_id). dynamic_tile_id is a
+    FP4DynamicTileId enum name string: 'LargeEM', 'LargeK', 'LargeK_G2', 'SmallEM';
+    'Disabled' when not enabled.
+    """
+    extra_info = get_extra_info()
+    env_use_moe_dynamic_tile = extra_info.get('use_moe_dynamic_tile', False)
+    if has_bias or not env_use_moe_dynamic_tile:
+        return False, 'Disabled'
+
+    model_gemm1_shape_list = [
+        (4096, 8192), # qwen3.8
+    ]
+    model_gemm2_shape_list = [
+        (8192, 2048), # qwen3.8
+    ]
+    # gemm1
+    if (n, k * 2) in model_gemm1_shape_list:
+        #todo 修复大EM场景的stack问题
+        if(expected_m < 6 or expected_m > 76):
+            return False, 'Disabled'
+    # gemm2
+    elif (n, k * 2) in model_gemm2_shape_list:
+        if(expected_m < 6 or expected_m > 51):
+            return False, 'Disabled'
+    else:
+        if(expected_m < 23):
+            return False, 'Disabled'
+    # select dynamic-tile variant: LargeEM, LargeK, LargeK_G2, SmallEM
+    if k > 2048:
+        dynamic_tile_id = 'LargeEM' if expected_m > 32 else 'LargeK'
+    else:
+        if expected_m > 117:
+            dynamic_tile_id = 'LargeEM'
+        else:
+            dynamic_tile_id = 'SmallEM' if k <= 1024 else 'LargeK_G2'
+    return True, dynamic_tile_id
 
 def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor],
                                          rhs_: Tuple[torch.Tensor, torch.Tensor],
@@ -114,7 +154,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         name='m_grouped_gemm_fp4_fp4_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': num_groups,
-              'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': False, 'GEMM_TYPE': 'GroupedNoPad', 'N_EXPAND' : n_expand, 'EnableMoeDynamicTile': False},
+              'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': False, 'GEMM_TYPE': 'GroupedNoPad', 'N_EXPAND' : n_expand, 'DynamicTileId': 'Disabled'},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),
@@ -198,11 +238,12 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     n_expand = 1
     if k <= 512 and expected_m > 2 and n % (block_n * 4) == 0 and not has_bias:
         n_expand = 4
-    extra_info = get_extra_info()
-    EnableMoeDynamicTile = False
-    env_use_moe_dynamic_tile = extra_info.get('use_moe_dynamic_tile', False)
-    if expected_m > 23 and not has_bias and env_use_moe_dynamic_tile:
-        EnableMoeDynamicTile = True
+
+    EnableMoeDynamicTile, DynamicTileId = select_moe_dynamic_tile(
+        n, k, expected_m, has_bias)
+    if EnableMoeDynamicTile:
+        # fix the block config to avoid unecessary jit compile
+        block_m, block_n, block_k, warp_m, warp_n, num_stages = (128, 128, 64, 64, 64, 3)
     args = (lhs, lhs_scales, rhs, rhs_scales, bias, out, m, masked_m, block_m_info, expected_m,
             torch.cuda.current_stream(), num_sms, smem_config[0], signal)
     runtime = jit_tuner.compile_and_tune(
@@ -210,7 +251,8 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': enable_sbo_overlap,
-              'GEMM_TYPE': 'GroupedMasked', 'N_EXPAND' : n_expand, 'EnableMoeDynamicTile' : EnableMoeDynamicTile},
+              'GEMM_TYPE': 'GroupedMasked', 'N_EXPAND' : n_expand,
+              'DynamicTileId': DynamicTileId},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),
