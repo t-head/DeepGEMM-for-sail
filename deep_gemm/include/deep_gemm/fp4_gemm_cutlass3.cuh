@@ -1007,8 +1007,10 @@ template <int32_t ShapeN, int32_t ShapeK,
           int32_t BlockM, int32_t BlockN, int32_t BlockK,
           int32_t WarpM, int32_t WarpN,
           int32_t kNumGroups, int32_t kNumStages, GemmType kGemmType,
-          bool kEnableSboOverlap = false, bool hasBias = false, int NExpand = 1, const bool kEnableMoeDynamicTile = false>
+          bool kEnableSboOverlap = false, bool hasBias = false, int NExpand = 1,
+          FP4DynamicTileId kDynamicTileId = FP4DynamicTileId::Disabled>
 class Fp4Gemm {
+  static constexpr bool kEnableMoeDynamicTile = (kDynamicTileId != FP4DynamicTileId::Disabled);
   static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
   static_assert((BlockN == 16) || (BlockN == 32) || (BlockN == 64) || (BlockN == 128) || (BlockN == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
   static_assert((BlockK % 32 == 0), "BlockK must be divideable by 32.");
@@ -1047,7 +1049,7 @@ public:
         int max_blocks_per_cu = 0;
         int smem_size_kernel = 0;
         bool kIsNoPadPreprocessLayout = false;
-        int DynamicTildId = 0;
+        int DynamicTildId = 0; // for printf, cast from FP4DynamicTileId enum
         int warp_num = 1;
 
         hggcFuncAttributes attr;
@@ -1056,7 +1058,7 @@ public:
                 using GemmKernel = decltype(gemm_kernel_);
                 using TileScheduler = typename GemmKernel::TileScheduler;
                 kIsNoPadPreprocessLayout = TileScheduler::kIsNoPadPreprocessLayout;
-                DynamicTildId = GemmKernel::KernelAiuFp4DynamicTile::DynamicTildId;
+                DynamicTildId = static_cast<int>(GemmKernel::KernelAiuFp4DynamicTile::DynamicTildId);
 
                 using StrideA   = typename GemmKernel::StrideA;
                 using StrideB   = typename GemmKernel::StrideB;
@@ -1099,6 +1101,23 @@ public:
                 smem_size_kernel = GemmKernel::SharedStorageSize;
                 warp_num = block.x / 32; // used for print
 
+                char *pEnv_params = std::getenv("show_log");
+                if (pEnv_params && isdigit(*pEnv_params)) {
+                    hggcFuncAttributes attr;
+                    hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
+
+                    printf("[GemmGrouped-FP4-DynamicTile:]\n");
+                    printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d, dynamic_tile_id:%d\n",
+                        kNumGroups, shape_m, ShapeN, ShapeK, expected_m, GemmTypeS[static_cast<int>(kGemmType)], TileScheduler::kIsNoPadPreprocessLayout, DynamicTildId);
+
+                    printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
+                        BlockM, BlockN, BlockK, WarpM, WarpN, BlockK, kNumStages);
+
+                    printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d, warp_num:%d\n", num_sms, max_blocks_per_cu, grid.x, warp_num);
+
+                    printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
+                }
+
                 typename GemmKernel::Arguments arguments {
                     reinterpret_cast<ElementA const*>(a_ptr), stride_A,
                     reinterpret_cast<ElementB const*>(b_ptr), stride_B,
@@ -1121,35 +1140,10 @@ public:
                 ProfilingInterface::Instance().instrument(false, dg_prof_params);
             };
 
-            if (ShapeK > 2048) {
-                if (expected_m > 32) {
-                  constexpr bool kLargeEM = true;
-                  using GemmKernelDynamic = cutlass::gemm::kernel::Fp4DeepGemmDynamicTile<
-                    kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAccumulator, ElementCompute,
-                    ShapeN, ShapeK, kNumGroups, kLargeEM>;
-                  launch_dynamic_tile_kernel(GemmKernelDynamic{});
-                } else {
-                  constexpr bool kLargeEM = false;
-                  using GemmKernelDynamic = cutlass::gemm::kernel::Fp4DeepGemmDynamicTile<
-                      kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAccumulator, ElementCompute,
-                      ShapeN, ShapeK, kNumGroups, kLargeEM>;
-                  launch_dynamic_tile_kernel(GemmKernelDynamic{});
-                }
-            } else {
-                if (expected_m > 117) {
-                  constexpr bool kLargeEM = true;
-                  using GemmKernelDynamic = cutlass::gemm::kernel::Fp4DeepGemmDynamicTile<
-                    kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAccumulator, ElementCompute,
-                    ShapeN, ShapeK, kNumGroups, kLargeEM>;
-                  launch_dynamic_tile_kernel(GemmKernelDynamic{});
-                } else {
-                  constexpr bool kLargeEM = false;
-                  using GemmKernelDynamic = cutlass::gemm::kernel::Fp4DeepGemmDynamicTile<
-                      kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAccumulator, ElementCompute,
-                      ShapeN, ShapeK, kNumGroups, kLargeEM>;
-                  launch_dynamic_tile_kernel(GemmKernelDynamic{});
-                }
-            }
+            using GemmKernelDynamic = cutlass::gemm::kernel::Fp4DeepGemmDynamicTile<
+                kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAccumulator, ElementCompute,
+                ShapeN, ShapeK, kNumGroups, kDynamicTileId>;
+            launch_dynamic_tile_kernel(GemmKernelDynamic{});
         } else {
           // Core kernel configurations
           using ElementAccumulator  = float;                                          // Element type for internal accumulation

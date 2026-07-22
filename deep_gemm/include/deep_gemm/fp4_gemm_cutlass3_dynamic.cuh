@@ -17,7 +17,7 @@ constexpr static int Fp4TileLength = 5;
 constexpr static int Fp4ElementsPerTile = 6; // BLOCK_M, BLOCK_N, warpM, warpN, blockK, stages
 
 struct KernelAiuFp4DynamicTileLargeEM {
-  constexpr static int DynamicTildId = 0;
+  constexpr static FP4DynamicTileId DynamicTildId = FP4DynamicTileId::LargeEM;
   constexpr static int TileConfigList[Fp4TileLength][Fp4ElementsPerTile] = {
     {64,  256, 32, 32, 128, 4},
     {64,  256, 32, 32, 128, 4},
@@ -28,7 +28,7 @@ struct KernelAiuFp4DynamicTileLargeEM {
 }; // max
 
 struct KernelAiuFp4DynamicTileLargeK {
-  constexpr static int DynamicTildId = 1;
+  constexpr static FP4DynamicTileId DynamicTildId = FP4DynamicTileId::LargeK;
   constexpr static int TileConfigList[Fp4TileLength][Fp4ElementsPerTile] = {
     {32, 256, 32, 32, 128, 3},
     {64, 256, 32, 64, 128, 3},
@@ -39,7 +39,7 @@ struct KernelAiuFp4DynamicTileLargeK {
 };
 
 struct KernelAiuFp4DynamicTileLargeK_G2 {
-  constexpr static int DynamicTildId = 2;
+  constexpr static FP4DynamicTileId DynamicTildId = FP4DynamicTileId::LargeK_G2;
   constexpr static int TileConfigList[Fp4TileLength][Fp4ElementsPerTile] = {
     { 32, 256, 32, 32, 128, 3},
     { 64, 256, 32, 64, 128, 3},
@@ -47,7 +47,25 @@ struct KernelAiuFp4DynamicTileLargeK_G2 {
     {128, 256, 64, 64,  64, 3},
     {128, 256, 64, 64,  64, 3}
   };
-}; // max
+};
+
+struct KernelAiuFp4DynamicTileSmallEM {
+  constexpr static FP4DynamicTileId DynamicTildId = FP4DynamicTileId::SmallEM;
+  constexpr static int TileConfigList[Fp4TileLength][Fp4ElementsPerTile] = {
+    {16, 128, 16, 32, 128, 3},
+    {32, 128, 32, 32, 128, 4},
+    {64, 128, 32, 64, 128, 3},
+    {64, 128, 32, 64, 128, 3},
+    {128, 128, 64, 64, 64, 3}
+  };
+};
+
+// Select FP4 dynamic-tile variant by FP4DynamicTileId
+template <FP4DynamicTileId kDynamicTileId> struct Fp4DynamicTileSelector;
+template <> struct Fp4DynamicTileSelector<FP4DynamicTileId::LargeEM>   { using type = KernelAiuFp4DynamicTileLargeEM; };
+template <> struct Fp4DynamicTileSelector<FP4DynamicTileId::LargeK>    { using type = KernelAiuFp4DynamicTileLargeK; };
+template <> struct Fp4DynamicTileSelector<FP4DynamicTileId::LargeK_G2> { using type = KernelAiuFp4DynamicTileLargeK_G2; };
+template <> struct Fp4DynamicTileSelector<FP4DynamicTileId::SmallEM>   { using type = KernelAiuFp4DynamicTileSmallEM; };
 
 }
 
@@ -292,7 +310,7 @@ template <
   int SHAPE_N,
   int SHAPE_K,
   int kNumGroups,
-  bool kLargeEM
+  FP4DynamicTileId kDynamicTileId
 >
 struct Fp4DeepGemmDynamicTile {
 
@@ -302,14 +320,7 @@ struct Fp4DeepGemmDynamicTile {
 
   static constexpr bool IsEP = (kGemmType == GemmType::GroupedMasked);
 
-  using KernelAiuFp4DynamicTile = typename cutlass::platform::conditional<
-            kLargeEM,
-            KernelAiuFp4DynamicTileLargeEM,
-            typename cutlass::platform::conditional<
-              (SHAPE_K > 2048),
-              KernelAiuFp4DynamicTileLargeK,
-              KernelAiuFp4DynamicTileLargeK_G2>::type
-            >::type;
+  using KernelAiuFp4DynamicTile = typename Fp4DynamicTileSelector<kDynamicTileId>::type;
   using Builder0 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
                                   SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 0>;
   using Builder1 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
