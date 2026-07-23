@@ -153,7 +153,11 @@ using ElementCompute      = float;
 using ElementScalar       = ElementCompute;
 using LinearCombOutType   = ElementD;
 using OperatorClass = cutlass::arch::OpClassTensorOp;
+#if __HGGC_ARCH__ == 100
+using ArchTag = cutlass::arch::PPU0010;
+#else
 using ArchTag = cutlass::arch::PPU0015;
+#endif
 
 using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
 using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>;
@@ -697,7 +701,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
     bool kEnableSboOverlap = false;
-    if (extra_info["use_cutlass3"]) {
+    if (is_ppu1v5_device()) {
         const auto gemm_args = DenseBF16GemmCutlass3Runtime::GemmArguments{
             .mode = cutlass::gemm::GemmUniversalMode::kGemm,
             .problem_shape = {m, n, k, 1},
@@ -757,6 +761,63 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n",
                    block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages);
             printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
+        }
+    } else if (extra_info.at("use_actlize_v100")) {
+        const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{
+            .mode = cutlass::gemm::GemmUniversalMode::kGemm,
+            .problem_shape = {m, n, k, 1},
+            .mainloopargs = {input_a, stride_A, input_b, stride_B},
+            .epilogueargs =
+                {
+                    {1, 0},
+                    output,
+                    stride_D,
+                    output,
+                    stride_D,
+                },
+            .hw_info = hw_info,
+            .scheduler = {(uint32_t)m, layout_info},
+            .signal = nullptr};
+
+        BF16GemmCutlass3Runtime::GemmKernelParams params =
+            BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+
+        auto args = BF16GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
+                                                                  num_stages, "DenseGemm", "Default", "bf16_deep_gemm",
+                                                                  kEnableSboOverlap},
+                                                  .launch_args = {grid, block, SMSIZE},
+                                                  .kernel_params = params};
+
+        const auto& code = BF16GemmCutlass3Runtime::generate(args);
+        const auto& runtime = compiler->build("bf16_deep_gemm", code, block.x, SMSIZE);
+        const auto& kernel = runtime->kernel;
+        int blocks_per_cu = 0;
+        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
+        args.launch_args.grid_dim.x *= blocks_per_cu;
+        DgProfParam dg_prof_params;
+        if (ProfilingInterface::Instance().get_op_info()) {
+            dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, grouped_layout,
+                                      (hggcStream_t)0);
+        }
+        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
+        BF16GemmCutlass3Runtime::launch(runtime, args);
+
+        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+        char* pEnv_params = std::getenv("show_log");
+        if (pEnv_params && isdigit(*pEnv_params)) {
+            int numRegs = 0, localSize = 0;
+            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+
+            printf("[DenseGemm_BF16:]\n");
+            printf("group:%d, problem:[%d, %d, %d]\n", kNumGroups, m, n, k);
+            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
+                   args.launch_args.grid_dim.x);
+            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n, block_k,
+                   warp_m, warp_n, block_k, num_stages);
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
         }
     } else {
         int64_t stride, increment_row, increment_group, increment_cluster;

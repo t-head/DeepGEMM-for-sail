@@ -703,7 +703,7 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
 
-    if extra_info['use_cutlass3']:
+    if extra_info['use_actlize_v100']:
         # Standalone DenseGemm path: N and K are runtime args, not compile keys
         args = (lhs, lhs_scales, rhs, rhs_scales, out,
                 m, n, k, torch.cuda.current_stream(), num_sms, smem_config[0])

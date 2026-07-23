@@ -4,6 +4,7 @@
 #include <torch/version.h>
 #include <hggc_runtime_api.h>
 #include "math.hpp"
+#include "system.hpp"
 
 namespace deep_gemm {
 
@@ -62,11 +63,6 @@ int get_num_sms() {
     return *_num_sms;
 }
 
-std::string get_env_var(const std::string& name) {
-    const char* value = std::getenv(name.c_str());
-    return value ? std::string(value) : "";
-}
-
 bool is_ppu1v5_device() {
     hggcDeviceProp device_prop;
     hggcGetDeviceProperties(&device_prop, 0);
@@ -86,31 +82,9 @@ int get_sm_count() {
 std::unordered_map<std::string, int> get_extra_info(int m = 0, int n = 0, int k = 0, int dtype = 1,
                                                     const std::string& api_type = "dense") {
     std::unordered_map<std::string, int> extra_info;
-    bool use_cutlass3 = false;
-    bool use_multistage_on_N = false;
-    bool use_moe_dynamic_tile = false;
-
-    if (is_ppu1v5_device()) {
-        use_cutlass3 = true;
-    }
-
-    // if (!get_env_var("DG_USE_CUTLASS3").empty()) {
-    //     use_cutlass3 = std::stoi(get_env_var("DG_USE_CUTLASS3"));
-    // }
-
-    extra_info["use_cutlass3"] = use_cutlass3;
-
-    if (!get_env_var("DG_USE_MULTISTAGE_ON_N").empty()) {
-        use_multistage_on_N = std::stoi(get_env_var("DG_USE_MULTISTAGE_ON_N"));
-    }
-
-    extra_info["use_multistage_on_N"] = use_multistage_on_N;
-
-    if (!get_env_var("DG_USE_MOE_DYNAMIC_TILE").empty()) {
-        use_moe_dynamic_tile = std::stoi(get_env_var("DG_USE_MOE_DYNAMIC_TILE"));
-    }
-
-    extra_info["use_moe_dynamic_tile"] = use_moe_dynamic_tile;
+    extra_info["use_actlize_v100"] = is_ppu1v5_device() || get_env<int>("DG_USE_ACTLIZE_V100", 0);
+    extra_info["use_multistage_on_N"] = get_env<int>("DG_USE_MULTISTAGE_ON_N", 0);
+    extra_info["use_moe_dynamic_tile"] = get_env<int>("DG_USE_MOE_DYNAMIC_TILE", 0);
 
     return extra_info;
 }

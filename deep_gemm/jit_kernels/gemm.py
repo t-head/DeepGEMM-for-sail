@@ -443,7 +443,7 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
     extra_info = get_extra_info()
     kernel_type = 'Default'
 
-    if extra_info['use_cutlass3']:
+    if extra_info['use_actlize_v100']:
         # Standalone BF16 DenseGemm path: N and K are runtime args, not compile keys
         args = (lhs, rhs, out, m, n, k, torch.cuda.current_stream(), num_sms, smem_config[0])
 

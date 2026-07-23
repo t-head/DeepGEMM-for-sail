@@ -184,7 +184,8 @@ public:
         }
 
         // --- Include paths (derived from library_include_path) ---
-        if (is_ppu1v5_device()) {
+        const bool use_actlize_v100 = is_ppu1v5_device() || get_env<int>("DG_USE_ACTLIZE_V100", 0);
+        if (use_actlize_v100) {
             flags += fmt::format("-I{}/actlize_v1.0.0 -I{}/deep_gemm ", inc, inc);
         } else {
             flags += fmt::format("-I{} -I{}/actlize_v0.5.0 -I{}/deep_gemm ", inc, inc, inc);
@@ -199,7 +200,7 @@ public:
 
         // NOTE: --ptxas-options=--register-usage-level=10 is intentionally not passed here
         std::string hgcc_extra_flags;
-        if (is_ppu1v5_device()) {
+        if (use_actlize_v100) {
             flags += " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
                      " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
         }
@@ -219,7 +220,7 @@ public:
         // Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use -Xllvm flags,
         // others only need -ppu-simt-branch=false (aligned with compiler.py logic)
         std::string per_kernel_flags;
-        if (is_ppu1v5_device()) {
+        if (is_ppu1v5_device() || get_env<int>("DG_USE_ACTLIZE_V100", 0)) {
             const bool use_warp_interleaving = (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
                                                (name.find("fp8_deep_gemm") != std::string::npos) ||
                                                (name.find("mqa_logits") != std::string::npos &&
@@ -290,7 +291,8 @@ public:
             includes_insert({sdk_include});
         #endif
             std::string library_include_path_str = fmt::format("{}", library_include_path.c_str());
-            if (arch == AC_PPU0010) {
+            const bool force_actlize_v100 = get_env<int>("DG_USE_ACTLIZE_V100", 0);
+            if (arch == AC_PPU0010 && !force_actlize_v100) {
                 includes_insert({library_include_path_str+ "/actlize_v0.5.0", library_include_path_str + "/deep_gemm", library_include_path_str});
             } else {
                 includes_insert({library_include_path_str+ "/actlize_v1.0.0", library_include_path_str + "/deep_gemm"});
@@ -317,6 +319,10 @@ public:
             } else if (arch == AC_PPU0015) {
                 opts_insert({
                     "--ppu-arch=ppu0015",
+                });
+            }
+            if (arch == AC_PPU0015 || force_actlize_v100) {
+                opts_insert({
                     "--ppu-tuning-options=-ppu-patch-fence-ppu=false",
                     "--ppu-tuning-options=-wno-loop-miss-transform",
                     "--ppu-tuning-options=-ppu-cg-to-kp1=true",

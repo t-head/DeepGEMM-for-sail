@@ -365,7 +365,11 @@ constexpr int WARP_M = {};
 constexpr int WARP_N = {};
 constexpr int STAGES = {};
 
+#if __HGGC_ARCH__ == 100
+using ArchTag = cutlass::arch::PPU0010;
+#else
 using ArchTag = cutlass::arch::PPU0015;
+#endif
 
 using         ElementA    = {};
 using         LayoutA     = cutlass::layout::RowMajor;
@@ -760,7 +764,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
         profile_type = "fp8";
     }
 
-    if (extra_info["use_cutlass3"]) {
+    if (is_ppu1v5_device()) {
         // Dense-specific JIT cache key (distinct from MoE grouped kernels) to avoid cache collision.
         std::string dense_kernel_name = (dtype == torch::kInt8) ? "int8_dense_gemm" : "fp8_dense_gemm";
         const auto gemm_args = DenseINT8GemmCutlass3Runtime::GemmArguments{
@@ -803,6 +807,65 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
         DenseINT8GemmCutlass3Runtime::launch(runtime, args);
+
+        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+        char* pEnv_params = std::getenv("show_log");
+        if (pEnv_params && isdigit(*pEnv_params)) {
+            int numRegs = 0, localSize = 0;
+            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+
+            printf("[DenseGemm_INT8:]\n");
+            printf("group:%d, problem:[%d, %d, %d]\n", kNumGroups, m, n, k);
+            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
+                   args.launch_args.grid_dim.x);
+            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n, block_k,
+                   warp_m, warp_n, block_k, num_stages);
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
+        }
+
+    } else if (extra_info.at("use_actlize_v100")) {
+        const auto gemm_args = INT8GemmCutlass3Runtime::GemmArguments{
+            .mode = cutlass::gemm::GemmUniversalMode::kGemm,
+            .problem_shape = {m, n, k, 1},
+            .mainloopargs = {converted_input_a, stride_A, converted_input_b, stride_B, scales_a_ptr, scales_b_ptr},
+            .epilogueargs =
+                {
+                    {1, 0},
+                    nullptr,
+                    stride_D,
+                    converted_output,
+                    stride_D,
+                },
+            .hw_info = hw_info,
+            .scheduler = {(uint32_t)m, grouped_layout},
+            .signal = nullptr};
+
+        INT8GemmCutlass3Runtime::GemmKernelParams params =
+            INT8GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+
+        auto args = INT8GemmCutlass3Runtime::Args{
+            .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "DenseGemm", "Default",
+                            kernel_name, false},
+            .launch_args = {grid, block, SMSIZE},
+            .kernel_params = params,
+            .type_info = type_info,
+        };
+        const auto& code = INT8GemmCutlass3Runtime::generate(args);
+        const auto& runtime = compiler->build(kernel_name, code, block.x, SMSIZE);
+        const auto& kernel = runtime->kernel;
+        int blocks_per_cu = 0;
+        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
+        args.launch_args.grid_dim.x *= blocks_per_cu;
+
+        DgProfParam dg_prof_params;
+        if (ProfilingInterface::Instance().get_op_info()) {
+            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout, stream);
+        }
+        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
+        INT8GemmCutlass3Runtime::launch(runtime, args);
 
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
