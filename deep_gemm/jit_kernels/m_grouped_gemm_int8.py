@@ -145,7 +145,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
               'GEMM_TYPE': 'GroupedContiguous',
               'KERNEL_TYPE': kernel_type},
         space=(),
-        includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
+        includes=includes_cutlass3 if extra_info['use_actlize_v100'] else includes,
         arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
                   ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
@@ -153,8 +153,8 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
                   ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                   ('signal', torch.int32)),
-        template=template_cutlass3 if extra_info['use_cutlass3'] else template,
-        jit_include_dir='actlize_v1.0.0' if extra_info['use_cutlass3'] else None,
+        template=template_cutlass3 if extra_info['use_actlize_v100'] else template,
+        jit_include_dir='actlize_v1.0.0' if extra_info['use_actlize_v100'] else None,
         args=args
     )
     # Run the kernel
@@ -249,15 +249,15 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
               'GEMM_TYPE': 'GroupedMasked',
               'KERNEL_TYPE': kernel_type},
         space=(),
-        includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
+        includes=includes_cutlass3 if extra_info['use_actlize_v100'] else includes,
         arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
                   ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('block_m_info', torch.int32), ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                   ('signal', torch.int32)),
-        template=template_cutlass3 if extra_info['use_cutlass3'] else template,
-        jit_include_dir='actlize_v1.0.0' if extra_info['use_cutlass3'] else None,
+        template=template_cutlass3 if extra_info['use_actlize_v100'] else template,
+        jit_include_dir='actlize_v1.0.0' if extra_info['use_actlize_v100'] else None,
         args=args
     )
     # Run the kernel
@@ -394,15 +394,15 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
                   'KERNEL_TYPE': kernel_type
                   },
             space=(),
-            includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
+            includes=includes_cutlass3 if extra_info['use_actlize_v100'] else includes,
             arg_defs=(  ('lhs', lhs.dtype), ('lhs_scales', torch.float),
                         ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                         ('out', torch.bfloat16),
                         ('grouped_layout', torch.int32), ('block_m_info', torch.int32), ('m', int), ('expected_m', int),
                         ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                         ('signal', torch.int32)),
-            template=template_cutlass3 if extra_info['use_cutlass3'] else template,
-            jit_include_dir='actlize_v1.0.0' if extra_info['use_cutlass3'] else None,
+            template=template_cutlass3 if extra_info['use_actlize_v100'] else template,
+            jit_include_dir='actlize_v1.0.0' if extra_info['use_actlize_v100'] else None,
             args=args
         )
     # Run the kernel

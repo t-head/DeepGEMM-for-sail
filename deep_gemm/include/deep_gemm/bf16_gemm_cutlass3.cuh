@@ -37,7 +37,11 @@ namespace cutlass::gemm {
 template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapPrologue>
 struct MainloopPPUOverlapPrologue {
   constexpr static int Stages = Stages_;
+#if __HGGC_ARCH__ == 100
+  using ArchTag = arch::PPU0010;
+#else
   using ArchTag = arch::PPU0015;
+#endif
   using Schedule = Schedule_;
   using ClusterShape = Shape<_1,_1,_1>;
 };
@@ -45,7 +49,11 @@ struct MainloopPPUOverlapPrologue {
 template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapMainloop>
 struct MainloopPPUOverlapMainloop {
   constexpr static int Stages = Stages_;
+#if __HGGC_ARCH__ == 100
+  using ArchTag = arch::PPU0010;
+#else
   using ArchTag = arch::PPU0015;
+#endif
   using Schedule = Schedule_;
   using ClusterShape = Shape<_1,_1,_1>;
 };
@@ -53,7 +61,11 @@ struct MainloopPPUOverlapMainloop {
 template<int Stages_, typename Schedule_ = KernelAiuMultistage>
 struct MainloopPPUAiuOpt {
   constexpr static int Stages = Stages_;
+#if __HGGC_ARCH__ == 100
+  using ArchTag = arch::PPU0010;
+#else
   using ArchTag = arch::PPU0015;
+#endif
   using Schedule = Schedule_;
   using ClusterShape = Shape<_1,_1,_1>;
 };
@@ -1304,7 +1316,11 @@ public:
         using ElementScalar       = ElementCompute;
         using LinearCombOutType   = ElementD;
         using OperatorClass = cutlass::arch::OpClassTensorOp;
+#if __HGGC_ARCH__ == 100
+        using ArchTag = cutlass::arch::PPU0010;
+#else
         using ArchTag = cutlass::arch::PPU0015;
+#endif
 
         using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
         using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>;
@@ -1468,7 +1484,7 @@ public:
             hggcFuncAttributes attr;
             hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
 
-            printf("[GemmGrouped-BF16:]\n");
+            printf("[GemmGrouped-BF16: bf16_gemm_cutlass3.cuh]\n");
             printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kernel_type:%s, kIsNoPadPreprocessLayout: %d\n",
                 kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)], KernelTypeS[static_cast<int>(kKernelType)], TileScheduler::kIsNoPadPreprocessLayout);
 

@@ -34,7 +34,11 @@ namespace cutlass::gemm {
 template<int Stages_, typename Schedule_ = KernelAiuMultistage>
 struct MainloopPPUAiuA8W8 {
   constexpr static int Stages = Stages_;
+#if __HGGC_ARCH__ == 100
+  using ArchTag = arch::PPU0010;
+#else
   using ArchTag = arch::PPU0015;
+#endif
   using Schedule = Schedule_;
   using ClusterShape = Shape<_1,_1,_1>;
 };
@@ -42,7 +46,11 @@ struct MainloopPPUAiuA8W8 {
 template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapPrologue>
 struct MainloopPPUAiuA8W8OverlapPrologue {
   constexpr static int Stages = Stages_;
+#if __HGGC_ARCH__ == 100
+  using ArchTag = arch::PPU0010;
+#else
   using ArchTag = arch::PPU0015;
+#endif
   using Schedule = Schedule_;
   using ClusterShape = Shape<_1,_1,_1>;
 };
@@ -1562,7 +1570,11 @@ public:
         using ElementScalar       = ElementCompute;
         using LinearCombOutType   = ElementD;
         using OperatorClass = cutlass::arch::OpClassTensorOp;
+#if __HGGC_ARCH__ == 100
+        using ArchTag = cutlass::arch::PPU0010;
+#else
         using ArchTag = cutlass::arch::PPU0015;
+#endif
 
         int max_blocks_per_cu = 0;
         int smem_size_kernel = 0;

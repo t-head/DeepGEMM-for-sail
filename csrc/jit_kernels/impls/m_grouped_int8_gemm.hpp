@@ -314,7 +314,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
         profile_type = "fp8";
     }
 
-    if (extra_info["use_cutlass3"]) {
+    if (extra_info["use_actlize_v100"]) {
         const auto gemm_args = INT8GemmCutlass3Runtime::GemmArguments{
             .mode = cutlass::gemm::GemmUniversalMode::kGemm,
             .problem_shape = {m, n, k, 1},
@@ -632,7 +632,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
         return std::make_pair(block_m, ceil_div(n, block_n));
     }
 
-    if (extra_info["use_cutlass3"]) {
+    if (extra_info["use_actlize_v100"]) {
         const auto gemm_args = INT8GemmCutlass3Runtime::GemmArguments{
             .mode = cutlass::gemm::GemmUniversalMode::kGemm,
             .problem_shape = {m, n, k, 1},
@@ -1003,7 +1003,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         layout_info = block_m_info.data_ptr<int32_t>();
     }
 
-    if (extra_info["use_cutlass3"]) {
+    if (extra_info["use_actlize_v100"]) {
         const auto gemm_args = INT8GemmCutlass3Runtime::GemmArguments{
             .mode = cutlass::gemm::GemmUniversalMode::kGemm,
             .problem_shape = {m, n, k, 1},
