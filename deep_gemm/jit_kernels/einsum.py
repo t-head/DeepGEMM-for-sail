@@ -387,7 +387,7 @@ def int8_bmm(a: torch.Tensor, sfa: torch.Tensor,
                   ('d', torch.bfloat16), ('m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template_cutlass3 if extra_info['use_cutlass3'] else template_cutlass2_int8,
-        jit_include_dir='cutlass3' if extra_info['use_cutlass3'] else None,
+        jit_include_dir='actlize_v1.0.0' if extra_info['use_cutlass3'] else None,
         args=args,
     )
     # Run the kernel
