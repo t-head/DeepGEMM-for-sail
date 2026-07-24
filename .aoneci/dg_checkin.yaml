@@ -91,9 +91,16 @@ jobs:
           echo $(pwd)
           tar -zcf output.tar.gz -C output .
           mv output.tar.gz deepgemm_${{matrix.hggc_version}}.tar.gz
+      - id: package_whl
+        run: |
+          find . -name "deep_gemm*.whl" -exec tar -zcf deepgemm_whl_${{matrix.hggc_version}}.tar.gz {} +
       - uses: upload-oss
         inputs:
           path: deepgemm_${{matrix.hggc_version}}.tar.gz
+          retention-days: 7
+      - uses: upload-oss
+        inputs:
+          path: deepgemm_whl_${{matrix.hggc_version}}.tar.gz
           retention-days: 7
       - id: artifact
         run: |
