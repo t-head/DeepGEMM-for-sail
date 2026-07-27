@@ -4,6 +4,7 @@
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
 #include "gemm_search_space.hpp"
+#include "adaptive_tile_selector.hpp"
 
 using namespace deep_gemm;
 namespace deep_gemm_bf16_common {
@@ -132,9 +133,30 @@ std::tuple<int, int, int, int, int, bool> get_gemv_best_configs(int m, int n, in
     return std::make_tuple(BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, SmallK);
 }
 
+// Returns 8-element tuple: (num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config)
+// NOTE: baseline 8-element contract. Adaptive warp_k/dense_s2_opt injection is done in the dense impl
+// (bf16_gemm.hpp), so MoE grouped callers unpack this tuple directly without narrowing.
 using ConfigResult = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
+
+// Adaptive tile selection for DenseGemm (BF16). warp_k/dense_s2_opt are injected in the dense
+// impl; here we only apply the adaptive tile choice and return the 8-tuple.
+ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms) {
+    auto [sms, bm, bn, bk, wm, wn, wk, stages] =
+        deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms);
+    (void)wk;
+    auto smem = get_smem_config(stages, k, bm, bn, bk);
+    return std::make_tuple(sms, bm, bn, bk, wm, wn, stages, smem);
+}
+
 ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_grouped_contiguous = false,
                               bool is_grouped_masked = false, int max_block_n = 256) {
+    // Adaptive tile selection for DenseGemm (BF16). warp_k/dense_s2_opt are injected in the dense
+    // impl; here we only apply the adaptive tile choice and return the 8-tuple.
+    if (num_groups == 1 && !is_grouped_contiguous && !is_grouped_masked && is_ppu1v5_device() &&
+        (deep_gemm_adaptive::is_bf16_adaptive_shape(m, n, k) ||
+         deep_gemm_adaptive::bf16_adaptive_enabled())) {
+        return get_adaptive_configs_bf16(m, n, k, num_sms);
+    }
     // Generate block_ms
     std::vector<int> block_ms;
     if (!is_grouped_contiguous) {
@@ -361,7 +383,7 @@ const std::vector<std::vector<int>> CONFIG_TILE_GREATER_4096 = {{128, 128, 64, 6
                                                                 {256, 128, 64, 64, 64, 64, 2},
                                                                 {512, 128, 64, 64, 64, 64, 3},
                                                                 {128, 256, 64, 32, 128, 64, 2}};
-std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
+std::tuple<int, int, int, int, int, int, int, int, bool, std::tuple<int, int, int>>
 get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms) {
     MatmulHeuristicsTile candidate_tile(shape, dtype, CONFIG_TILE_GREATER_4096);
 
@@ -383,6 +405,6 @@ get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms) 
     int k = shape[2];
     std::tuple<int, int, int> best_smem_config = get_smem_config(stages, k, bm, bn, bk);
 
-    return {num_min_sms, bm, bn, bk, wm, wn, stages, best_smem_config};
+    return {num_min_sms, bm, bn, bk, wm, wn, bk, stages, false, best_smem_config};
 }
 } // namespace deep_gemm_bf16_common

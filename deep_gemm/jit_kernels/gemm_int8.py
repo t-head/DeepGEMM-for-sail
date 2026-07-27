@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 from functools import lru_cache
 from typing import Tuple
@@ -7,6 +8,10 @@ import re
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, get_sm_count, GemmType
 from .gemm_int8_lut import get_best_configs_from_lut
+from .densegemm_adaptive_select_strategy import get_adaptive_configs, is_int8_adaptive_shape
+
+# int8 adaptive tile selector gate using shared DenseGemm strategy
+_INT8_ADAPTIVE = os.environ.get('DG_INT8_ADAPTIVE', '0') != '0'
 
 # C++ code templates
 includes = ('"deep_gemm/int8_gemm.cuh"', )
@@ -32,28 +37,29 @@ gemm_t::run(out, nullptr, nullptr,
             stream, num_sms, smem_size);
 """
 
-includes_cutlass3 = ('"../deep_gemm/int8_gemm_cutlass3.cuh"', )
-template_cutlass3 = """
+# DenseGemm-only cutlass3 path: standalone kernel that reads N/K at runtime.
+# Do NOT reuse includes_densegemm/template_densegemm for grouped or MoE paths.
+includes_densegemm = ('"../deep_gemm/int8_densegemm_cutlass3.cuh"', )
+template_densegemm = """
 using namespace deep_gemm;
 
 // Templated args from Python JIT call
 using ElementAB = {ElementAB};
 using ElementAcc = {ElementAcc};
-constexpr auto N = {N}, K = {K};
 constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
 constexpr auto WARP_M = {WARP_M};
 constexpr auto WARP_N = {WARP_N};
 constexpr auto BLOCK_K = {BLOCK_K};
-constexpr auto kNumGroups = 1;
+constexpr auto WARP_K = {WARP_K};
 constexpr auto kNumStages = {NUM_STAGES};
+constexpr bool kIsAlignedN = {IS_ALIGNED_N};
 
-// Make a templated grouped GEMM
-using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm, false, KernelType::{KERNEL_TYPE}>;
+// Make a templated DenseGemm (no SHAPE_N/K in template - uses runtime args)
+using gemm_t = DenseGemm<ElementAB, ElementAcc, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumStages, {DENSE_S2_OPT}, KernelType::{KERNEL_TYPE}, kIsAlignedN>;
 
 // Launch kernel
-gemm_t::run(out, nullptr, nullptr,
-            m, 0, (ElementAB*)lhs, lhs_scales, (ElementAB*)rhs, rhs_scales,
+gemm_t::run(out, m, n, k, (ElementAB*)lhs, lhs_scales, (ElementAB*)rhs, rhs_scales,
             stream, num_sms, smem_size);
 """
 
@@ -451,7 +457,21 @@ def get_best_configs_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: in
     # (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 64, 256, 16, 16, 4)
     # print(best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages)
 
-    return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
+# ---- adaptive tile selector for int8 DenseGemm ----
+@lru_cache(maxsize=None)
+def get_adaptive_configs_int8(m: int, n: int, k: int, num_sms: int):
+    """int8 adaptive selector using the shared DenseGemm tile strategy.
+
+    Calls the bf16 strategy (densegemm_adaptive_select_strategy) and doubles
+    block_k and warp_k — int8 has bpp=1 while bf16 has bpp=2, so doubled BK
+    fits the same SMEM budget. SMEM config is recomputed with int8's formula.
+    """
+    ns, bm, bn, bk, wm, wn, wk, s = get_adaptive_configs(m, n, k, num_sms)
+    # int8: double BK and WK (bpp=1 halves per-stage SMEM vs bf16 bpp=2)
+    bk, wk = bk * 2, wk * 2
+    smem_config = get_smem_config(s, k, bm, bn, bk, bpp=1)
+    return ns, bm, bn, bk, wm, wn, s, smem_config
+
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
@@ -463,6 +483,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages = lut_result
         best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1)
         return num_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
+    # Adaptive tile selector for int8 DenseGemm on PPU1.5
+    # Enable when shape falls within the qwen38 decode range, or DG_INT8_ADAPTIVE is set
+    if (is_int8_adaptive_shape(m, n, k) or _INT8_ADAPTIVE) and is_ppu1v5_device() and gemm_type == GemmType.DenseGemm:
+        return get_adaptive_configs_int8(m, n, k, num_sms)
     if is_ppu1v5_device():
         return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, gemm_type, max_block_n)
     #FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
@@ -666,39 +690,69 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     #     kernel_type = 'OverlapPrologue'
 
     # Auto-tuning with compilation
-    global includes, template, includes_cutlass3, template_cutlass3
+    global includes, template, includes_cutlass3, template_cutlass3, includes_densegemm, template_densegemm
 
     num_sms = get_num_sms()
     if configs is not None:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+        warp_k = block_k  # default: no K-split for explicit configs
+        dense_s2_opt = False  # External configs: no adaptive re-evaluation
     else:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+        warp_k = block_k  # WarpOnK=1; TODO: enable adaptive warp_k when supported
+        # Heuristic path: inject adaptive dense_s2_opt (mirrors C++ int8_gemm.hpp:698-701)
+        dense_s2_opt = is_ppu1v5_device() and (is_int8_adaptive_shape(m, n, k) or _INT8_ADAPTIVE)
     extra_info = get_extra_info()
-
-    args = (lhs, lhs_scales, rhs, rhs_scales, out,
-            m, torch.cuda.current_stream(), num_sms, smem_config[0])
 
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
 
-    runtime = jit_tuner.compile_and_tune(
-        name='gemm_' + ElementAB + '_bf16_nt',
-        keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
-              'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
-              'WARP_M': warp_m, 'WARP_N': warp_n,
-              'NUM_STAGES': num_stages,
-              'KERNEL_TYPE': kernel_type},
-        space=(),
-        # space=generate_search_space(),
-        includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
-        arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
-                  ('rhs', rhs.dtype), ('rhs_scales', torch.float),
-                  ('out', torch.bfloat16), ('m', int),
-                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template_cutlass3 if extra_info['use_cutlass3'] else template,
-        jit_include_dir='actlize_v1.0.0' if extra_info['use_cutlass3'] else None,
-        args=args
-    )
+    if extra_info['use_cutlass3']:
+        # Standalone DenseGemm path: N and K are runtime args, not compile keys
+        args = (lhs, lhs_scales, rhs, rhs_scales, out,
+                m, n, k, torch.cuda.current_stream(), num_sms, smem_config[0])
+
+        runtime = jit_tuner.compile_and_tune(
+            name='gemm_' + ElementAB + '_bf16_nt',
+            keys={'ElementAB': ElementAB, 'ElementAcc': ElementAcc,
+                  'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+                  'WARP_M': warp_m, 'WARP_N': warp_n, 'WARP_K': warp_k,
+                  'NUM_STAGES': num_stages,
+                  'KERNEL_TYPE': kernel_type,
+                  'DENSE_S2_OPT': 'true' if dense_s2_opt else 'false',
+                  'IS_ALIGNED_N': 'true' if n % block_n == 0 else 'false'},
+            space=(),
+            includes=includes_densegemm,
+            arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
+                      ('rhs', rhs.dtype), ('rhs_scales', torch.float),
+                      ('out', torch.bfloat16), ('m', int), ('n', int), ('k', int),
+                      ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+            template=template_densegemm,
+            jit_include_dir='actlize_v1.0.0',
+            args=args
+        )
+    else:
+        # Legacy non-cutlass3 path
+        args = (lhs, lhs_scales, rhs, rhs_scales, out,
+                m, torch.cuda.current_stream(), num_sms, smem_config[0])
+
+        runtime = jit_tuner.compile_and_tune(
+            name='gemm_' + ElementAB + '_bf16_nt',
+            keys={'ElementAB': ElementAB, 'ElementAcc': ElementAcc,
+                  'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+                  'WARP_M': warp_m, 'WARP_N': warp_n,
+                  'NUM_STAGES': num_stages,
+                  'KERNEL_TYPE': kernel_type},
+            space=(),
+            includes=includes,
+            arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
+                      ('rhs', rhs.dtype), ('rhs_scales', torch.float),
+                      ('out', torch.bfloat16), ('m', int),
+                      ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+            template=template,
+            jit_include_dir=None,
+            args=args
+        )
     # Run the kernel
     runtime(*args)
 
