@@ -8,6 +8,7 @@
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
 #include "gemm_int8_lut.hpp"
+#include "adaptive_tile_selector.hpp"
 using namespace deep_gemm;
 namespace deep_gemm_int8 {
 
@@ -102,8 +103,8 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms, bool i
     auto best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1);
     int num_min_sms = get_sm_count();
 
-    return std::make_tuple(num_min_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages,
-                           best_smem_config);
+    return std::make_tuple(num_min_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n,
+                           best_stages, best_smem_config);
 }
 
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
@@ -595,6 +596,22 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms, bool i
                            best_num_stages, best_smem_config);
 }
 
+// Returns 8-element tuple: (num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config)
+// NOTE: baseline 8-element contract. Adaptive warp_k/dense_s2_opt injection is done in the dense impl
+// (int8_gemm.hpp), so MoE grouped callers unpack this tuple directly without narrowing.
+// Adaptive tile selection for DenseGemm (INT8). warp_k/dense_s2_opt are injected in the dense
+// impl; here we only apply the adaptive tile choice (incl. bk *= 2) and return the 8-tuple.
+std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
+get_adaptive_configs_int8(int m, int n, int k, int num_sms) {
+    auto [sms, bm, bn, bk, wm, wn, wk, stages] =
+        deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms);
+    // INT8: double BK (bpp=1 vs bf16 bpp=2); WarpOnK=1, TODO: enable adaptive warp_k
+    (void)wk;
+    bk *= 2;
+    auto smem = get_smem_config(stages, k, bm, bn, bk, 1);
+    return std::make_tuple(sms, bm, bn, bk, wm, wn, stages, smem);
+}
+
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_grouped_contiguous = false,
                  bool is_grouped_masked = false, int max_block_n = 256) {
@@ -608,6 +625,13 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_group
                                                 best_block_k, 1);
         return std::make_tuple(num_sms, best_block_m, best_block_n, best_block_k,
                                best_warp_m, best_warp_n, best_stages, best_smem_config);
+    }
+    // Adaptive tile selection for DenseGemm (INT8). warp_k/dense_s2_opt are injected in the dense
+    // impl; here we only apply the adaptive tile choice (incl. bk *= 2) and return the 8-tuple.
+    if (num_groups == 1 && !is_grouped_contiguous && !is_grouped_masked && is_ppu1v5_device() &&
+        (deep_gemm_adaptive::is_int8_adaptive_shape(m, n, k) ||
+         deep_gemm_adaptive::int8_adaptive_enabled())) {
+        return get_adaptive_configs_int8(m, n, k, num_sms);
     }
     if (is_ppu1v5_device()) {
         return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, is_grouped_contiguous, is_grouped_masked,

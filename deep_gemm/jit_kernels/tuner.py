@@ -93,11 +93,12 @@ class JITTuner:
             print(f'Best JIT kernel {name} with keys {self.key_format(keys)} and time {default_tile_time} has tuned keys {self.key_format(best_keys)} and time {best_time}')
             if best_keys:
                 print('Best JIT kernel CSV,{0},{1:.4f},{2},{3:.4f},{4:.4f}'.format(self.key_format(keys), default_tile_time, self.key_format(best_keys), best_time, default_tile_time/best_time))
-                print('Best JIT kernel CFG,({},{},{}):({},{},{},{},{},{})'.format(
-                    args[5], keys['N'], keys['K'],
-                    best_keys['BLOCK_M'], best_keys['BLOCK_N'], best_keys['BLOCK_K'],
-                    best_keys['WARP_M'], best_keys['WARP_N'], best_keys['NUM_STAGES']
-                ))
+                if 'N' in keys and 'K' in keys:
+                    print('Best JIT kernel CFG,({},{},{}):({},{},{},{},{},{})'.format(
+                        args[5], keys['N'], keys['K'],
+                        best_keys['BLOCK_M'], best_keys['BLOCK_N'], best_keys['BLOCK_K'],
+                        best_keys['WARP_M'], best_keys['WARP_N'], best_keys['NUM_STAGES']
+                    ))
         self.tuned[signature] = best_runtime
         return best_runtime
 

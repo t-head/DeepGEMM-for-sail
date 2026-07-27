@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 from functools import lru_cache
 from typing import Tuple
@@ -6,6 +7,10 @@ from typing import Tuple
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, GemmType
 from .gemm_search_space import MatmulHeuristicsTile
+from .densegemm_adaptive_select_strategy import get_adaptive_configs, is_bf16_adaptive_shape, get_warp_k
+
+# bf16 adaptive tile selector gate using shared DenseGemm strategy
+_BF16_ADAPTIVE = os.environ.get('DG_BF16_ADAPTIVE', '0') != '0'
 
 # C++ code templates
 includes = ('"deep_gemm/bf16_gemm.cuh"', )
@@ -22,7 +27,6 @@ constexpr auto BLOCK_K = {BLOCK_K};
 constexpr auto kNumGroups = 1;
 constexpr auto kNumStages = {NUM_STAGES};
 
-// Make a templated grouped GEMM
 using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm>;
 
 // Launch kernel
@@ -30,54 +34,46 @@ gemm_t::run(out, nullptr, nullptr,
             m, 0, lhs, rhs,
             stream, num_sms, smem_size);
 """
-includes_cutlass3 = ('"../deep_gemm/bf16_gemm_cutlass3.cuh"', )
-template_cutlass3 = """
+
+# BF16 DenseGemm-only cutlass3 path: standalone kernel that reads N/K at runtime.
+# Do NOT reuse includes_bf16_densegemm/template_bf16_densegemm for grouped or MoE paths.
+includes_bf16_densegemm = ('"../deep_gemm/bf16_densegemm_cutlass3.cuh"', )
+template_bf16_densegemm = """
 using namespace deep_gemm;
 
 // Templated args from Python JIT call
-constexpr auto N = {N}, K = {K};
+using ElementAB = cutlass::bfloat16_t;
+using ElementAcc = float;
 constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
 constexpr auto WARP_M = {WARP_M};
 constexpr auto WARP_N = {WARP_N};
 constexpr auto BLOCK_K = {BLOCK_K};
-constexpr auto kNumGroups = 1;
+constexpr auto WARP_K = {WARP_K};
 constexpr auto kNumStages = {NUM_STAGES};
+constexpr bool kIsAlignedN = {IS_ALIGNED_N};
 
-// Make a templated grouped GEMM
-using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm>;
+// Make a templated BF16 DenseGemm (no SHAPE_N/K in template - uses runtime args)
+using gemm_t = BF16DenseGemm<ElementAB, ElementAcc, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumStages, {DENSE_S2_OPT}, KernelType::{KERNEL_TYPE}, kIsAlignedN>;
 
 // Launch kernel
-gemm_t::run(out, nullptr, nullptr,
-            m, 0, lhs, rhs,
+gemm_t::run(out, m, n, k, lhs, rhs,
             stream, num_sms, smem_size);
 """
-def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128, bpp: int = 2) -> Tuple[int, int, int, int]:
-    # Try swizzle first, as it does not waste shared memory
+def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128, bpp: int = 2) -> Tuple[int, int, int]:
     swizzle_mode = 128
-    # block_n_padding = get_block_n_padding_for_smem_d(block_n) if swizzle_mode == 0 else 0
     block_n_padding = 0
 
     smem_d = block_m * (block_n + block_n_padding)
     smem_a_per_stage = block_m * block_k
-    # smem_scales_a_per_stage = block_m * 4
     smem_b_per_stage = block_n * block_k
-    # smem_scales_b = ceil_div(k, block_k) * 4
-    # smem_barrier = num_stages * 8 * 2
 
-    # smem_size = 0
     smem_size_d = smem_d * 2
     smem_size_a = num_stages * smem_a_per_stage * bpp
     smem_size_b = num_stages * smem_b_per_stage * bpp
 
     smem_size = max(smem_size_d, smem_size_a + smem_size_b)
-    # smem_size += num_stages * smem_a_per_stage
-    # smem_size += num_stages * smem_scales_a_per_stage
-    # smem_size += num_stages * smem_b_per_stage
-    # smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
-    # smem_size += smem_barrier
 
-    # Swizzle and padding are not compatible
     assert int(swizzle_mode > 0) + int(block_n_padding > 0) <= 1
 
     return smem_size, swizzle_mode, block_n_padding
@@ -102,6 +98,11 @@ def get_smem_occ(block_m: int, block_n: int) -> Tuple[int]:
     smem_size = max(smem_size_d, smem_size_a + smem_size_b)
 
     return 262144 // smem_size
+
+# Adaptive tile selection for 890P DenseGemm (shared with int8 DenseGemm)
+# lives in densegemm_adaptive_select_strategy.py. Adaptive detection is done
+# per-shape via is_bf16_adaptive_shape() in the heuristic path below.
+
 
 @lru_cache(maxsize=None)
 def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int, dtype: torch.dtype):
@@ -174,9 +175,26 @@ def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     return BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, SmallK
 
 @lru_cache(maxsize=None)
+def get_adaptive_configs_bf16(m: int, n: int, k: int, num_sms: int):
+    """bf16 adaptive selector using the shared DenseGemm tile strategy.
+    Wraps get_adaptive_configs(), drops warp_k, and computes bf16 smem_config
+    (bpp=2). Returns 8-tuple matching the get_best_configs contract:
+      (num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config)
+    """
+    ns, bm, bn, bk, wm, wn, wk, s = get_adaptive_configs(m, n, k, num_sms)
+    smem_config = get_smem_config(s, k, bm, bn, bk, bpp=2)
+    return ns, bm, bn, bk, wm, wn, s, smem_config
+
+@lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      gemm_type: GemmType=GemmType.DenseGemm, max_block_n: int = 256) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
+
+    # Adaptive tile selector for int8 DenseGemm on PPU1.5
+    # Enable when shape falls within the qwen38 decode range, or DG_INT8_ADAPTIVE is set
+    if (is_bf16_adaptive_shape(m, n, k) or _BF16_ADAPTIVE) and is_ppu1v5_device() and gemm_type == GemmType.DenseGemm:
+        return get_adaptive_configs_bf16(m, n, k, num_sms)
+
     #FIXME: block m can add 16, and blockM/N could be 512
     if gemm_type != GemmType.GroupedContiguous:
         # block_ms = (32, 64, 128, 256)
@@ -405,32 +423,68 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
     num_sms = get_num_sms()
     shape = [m, n, k]
     device_props = torch.cuda.get_device_properties(device='cuda')
-    if configs is  not None:
+    if configs is not None:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
+        warp_k = block_k  # default: no K-split for explicit configs
+        dense_s2_opt = False  # External configs: no adaptive re-evaluation
     elif all(a >= 4096 and a % 64 == 0 for a in shape)\
        and ("ZW810E" in device_props.name or "ZW810" in device_props.name):
-       num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_gemm_best_configs_v2(shape, 2, num_sms)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_gemm_best_configs_v2(shape, 2, num_sms)
+        warp_k = block_k
+        dense_s2_opt = False
     else:
-       num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
+        warp_k = block_k  # default WarpOnK=1
+        # Heuristic path: inject adaptive warp_k/dense_s2_opt (mirrors C++ bf16_gemm.hpp:664-668)
+        if is_ppu1v5_device() and (is_bf16_adaptive_shape(m, n, k) or _BF16_ADAPTIVE):
+            dense_s2_opt = True
+            # tile 已是 adaptive tile（get_best_configs 命中 adaptive 分支），
+            # 直接用 get_warp_k 在该 tile 上求 warp_k，等价于 get_adaptive_configs(...)[6]
+            warp_k = get_warp_k(block_m, block_n, block_k, warp_m, warp_n, num_stages)
+        else:
+            dense_s2_opt = False
 
     extra_info = get_extra_info()
- 
-    args = (lhs, rhs, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
+    kernel_type = 'Default'
 
-    runtime = jit_tuner.compile_and_tune(
-        name='gemm_bf16_bf16_bf16_nt',
-        keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
-              'WARP_M': warp_m, 'WARP_N': warp_n,
-              'NUM_STAGES': num_stages},
-        space=(),
-        includes=includes_cutlass3 if extra_info['use_cutlass3'] else includes,
-        arg_defs=(('lhs', torch.bfloat16),
-                  ('rhs', torch.bfloat16),
-                  ('out', torch.bfloat16), ('m', int),
-                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template_cutlass3 if extra_info['use_cutlass3'] else template,
-        jit_include_dir='actlize_v1.0.0' if extra_info['use_cutlass3'] else None,
-        args=args
-    )
-    # Run the kernel
+    if extra_info['use_cutlass3']:
+        # Standalone BF16 DenseGemm path: N and K are runtime args, not compile keys
+        args = (lhs, rhs, out, m, n, k, torch.cuda.current_stream(), num_sms, smem_config[0])
+
+        runtime = jit_tuner.compile_and_tune(
+            name='gemm_bf16_bf16_bf16_nt',
+            keys={'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+                  'WARP_M': warp_m, 'WARP_N': warp_n, 'WARP_K': warp_k,
+                  'NUM_STAGES': num_stages,
+                  'KERNEL_TYPE': kernel_type,
+                  'DENSE_S2_OPT': 'true' if dense_s2_opt else 'false',
+                  'IS_ALIGNED_N': 'true' if n % block_n == 0 else 'false'},
+            space=(),
+            includes=includes_bf16_densegemm,
+            arg_defs=(('lhs', torch.bfloat16),
+                      ('rhs', torch.bfloat16),
+                      ('out', torch.bfloat16), ('m', int), ('n', int), ('k', int),
+                      ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+            template=template_bf16_densegemm,
+            jit_include_dir='actlize_v1.0.0',
+            args=args
+        )
+    else:
+        args = (lhs, rhs, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
+
+        runtime = jit_tuner.compile_and_tune(
+            name='gemm_bf16_bf16_bf16_nt',
+            keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+                  'WARP_M': warp_m, 'WARP_N': warp_n,
+                  'NUM_STAGES': num_stages},
+            space=(),
+            includes=includes,
+            arg_defs=(('lhs', torch.bfloat16),
+                      ('rhs', torch.bfloat16),
+                      ('out', torch.bfloat16), ('m', int),
+                      ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+            template=template,
+            jit_include_dir=None,
+            args=args
+        )
     runtime(*args)

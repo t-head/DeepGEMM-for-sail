@@ -186,7 +186,6 @@ struct CollectiveMma<
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
 
     int warp_idx = canonical_warp_idx_sync();
-    int lane_predicate = cute::elect_one_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -251,7 +250,6 @@ struct CollectiveMma<
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
 
     //int warp_idx = canonical_warp_idx_sync();
-    int lane_predicate = cute::elect_one_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
