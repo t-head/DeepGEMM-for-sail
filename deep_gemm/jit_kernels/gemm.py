@@ -7,10 +7,7 @@ from typing import Tuple
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, GemmType
 from .gemm_search_space import MatmulHeuristicsTile
-from .densegemm_adaptive_select_strategy import get_adaptive_configs, is_bf16_adaptive_shape, get_warp_k
-
-# bf16 adaptive tile selector gate using shared DenseGemm strategy
-_BF16_ADAPTIVE = os.environ.get('DG_BF16_ADAPTIVE', '0') != '0'
+from .densegemm_adaptive_select_strategy import get_adaptive_configs, is_bf16_adaptive_enabled, get_warp_k
 
 # C++ code templates
 includes = ('"deep_gemm/bf16_gemm.cuh"', )
@@ -190,9 +187,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      gemm_type: GemmType=GemmType.DenseGemm, max_block_n: int = 256) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
 
-    # Adaptive tile selector for int8 DenseGemm on PPU1.5
-    # Enable when shape falls within the qwen38 decode range, or DG_INT8_ADAPTIVE is set
-    if (is_bf16_adaptive_shape(m, n, k) or _BF16_ADAPTIVE) and is_ppu1v5_device() and gemm_type == GemmType.DenseGemm:
+    # Adaptive tile selector for bf16 DenseGemm on PPU1.5
+    if is_bf16_adaptive_enabled(m, n, k) and is_ppu1v5_device() and gemm_type == GemmType.DenseGemm:
         return get_adaptive_configs_bf16(m, n, k, num_sms)
 
     #FIXME: block m can add 16, and blockM/N could be 512
@@ -436,7 +432,7 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
         warp_k = block_k  # default WarpOnK=1
         # Heuristic path: inject adaptive warp_k/dense_s2_opt (mirrors C++ bf16_gemm.hpp:664-668)
-        if is_ppu1v5_device() and (is_bf16_adaptive_shape(m, n, k) or _BF16_ADAPTIVE):
+        if is_ppu1v5_device() and is_bf16_adaptive_enabled(m, n, k):
             dense_s2_opt = True
             # tile 已是 adaptive tile（get_best_configs 命中 adaptive 分支），
             # 直接用 get_warp_k 在该 tile 上求 warp_k，等价于 get_adaptive_configs(...)[6]

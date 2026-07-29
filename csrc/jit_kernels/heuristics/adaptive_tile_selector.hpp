@@ -20,15 +20,33 @@ using ::ceil_div;
 
 inline bool is_int8_adaptive_shape(int m, int n, int k) {
     return (m <= 160 && (
-        (n == 36864 && k == 8192) ||
-        (n == 8192 && k == 16384) ||
-        (n == 34816 && k == 8192)
+        (n >= 10240 && k >= 1024) ||
+        (n == 8192 && k == 16384)
     ));
 }
 
 inline bool is_bf16_adaptive_shape(int m, int n, int k) {
-    // return n >= 2048 && k >= 1024;
-    return false;
+    return (m <= 160 && n >= 5120 && k >= 1024);
+}
+
+inline bool bf16_adaptive_enabled(int m, int n, int k) {
+    // 0: force disable, 1: force enable, other values: use default
+    const char* e = std::getenv("DG_BF16_ADAPTIVE");
+    if (e != nullptr) {
+        if (std::string(e) == "0") return false;
+        if (std::string(e) == "1") return true;
+    }
+    return is_bf16_adaptive_shape(m, n, k);
+}
+
+inline bool int8_adaptive_enabled(int m, int n, int k) {
+    // 0: force disable, 1: force enable, other values: use default
+    const char* e = std::getenv("DG_INT8_ADAPTIVE");
+    if (e != nullptr) {
+        if (std::string(e) == "0") return false;
+        if (std::string(e) == "1") return true;
+    }
+    return is_int8_adaptive_shape(m, n, k);
 }
 
 // ============================================================
@@ -71,22 +89,6 @@ inline bool compute_tile_enabled() {
     static const bool val = []() {
         const char* e = std::getenv("DG_COMPUTE_TILE");
         return e == nullptr || std::string(e) != "0";
-    }();
-    return val;
-}
-
-inline bool bf16_adaptive_enabled() {
-    static const bool val = []() {
-        const char* e = std::getenv("DG_BF16_ADAPTIVE");
-        return e != nullptr && std::string(e) != "0";
-    }();
-    return val;
-}
-
-inline bool int8_adaptive_enabled() {
-    static const bool val = []() {
-        const char* e = std::getenv("DG_INT8_ADAPTIVE");
-        return e != nullptr && std::string(e) != "0";
     }();
     return val;
 }
@@ -339,9 +341,9 @@ inline MemBoundResult select_tile_memory_bound(int cutlass_n, int cutlass_m, int
         return get_max_warp_on_n(block_m, warp_m, wn) * wn;
     };
 
-    // For BM>=80, WN=16 over-shrinks the warp tile. Drop WN=16.
+    // For BM>=128, WN=16 over-shrinks the warp tile. Drop WN=16.
     std::vector<int> wn_candidates;
-    if (block_m >= 80) {
+    if (block_m >= 128) {
         for (int wn : WN_CANDIDATES_SMALLBM) {
             if (wn >= 32) wn_candidates.push_back(wn);
         }
@@ -380,24 +382,21 @@ inline MemBoundResult select_tile_memory_bound(int cutlass_n, int cutlass_m, int
     // Step 5: block_n = ceil-align bn_wave_even to warp_n
     int block_n = ceil_div(bn_wave_even, warp_n_result) * warp_n_result;
 
-    // Step 6: BK, stages, warp_k
+    // Step 6: BK, stages, warp_k — memory-bound policy.
+    // Start BK=64, double BK while stages > 3, up to BK=512.
+    // Memory-bound keeps stages in {2, 3}.
     int block_k = BASE_BLOCK_K;
     int max_stages = 0;
-    bool loop_completed = true;
-    while (block_k < MAX_BLOCK_K) {
+    while (true) {
         max_stages = SMEM_SIZE / ((block_m + block_n) * block_k * 2);
-        if (max_stages <= 4) {
-            loop_completed = false;
+        if (max_stages <= 3 || block_k >= MAX_BLOCK_K) {
             break;
         }
         block_k *= 2;
     }
-    if (loop_completed) {
-        // Python "else" clause of while
-        max_stages = SMEM_SIZE / ((block_m + block_n) * block_k * 2);
-    }
 
-    int num_stages = std::min({max_stages, 4, ceil_div(cutlass_k, block_k)});
+    // Cap stages at 3; also bounded by K-iterations.
+    int num_stages = std::min({max_stages, 3, ceil_div(cutlass_k, block_k)});
     num_stages = std::max(num_stages, 2);
     int warp_k = get_warp_k(block_m, block_n, block_k, warp_m, warp_n_result, num_stages);
 
@@ -709,12 +708,14 @@ inline int get_warp_k(int block_m, int block_n, int block_k, int warp_m, int war
     int warp_on_m = std::max(1, block_m / warp_m);
     int warp_on_n = std::max(1, block_n / warp_n);
     int base_warps = warp_on_m * warp_on_n;
-    if (block_k <= 128) return block_k;
-    if (2 * base_warps > 32) return block_k;
-    int mainloop_smem = (block_m + block_n) * block_k * 2 * (num_stages - 1);
-    int reduce_per_slot = block_m * block_n * 4;
-    if (mainloop_smem < reduce_per_slot) return block_k;
-    return block_k / 2;
+    int warp_on_k_max = std::max(1, 32 / base_warps);
+    int warp_on_k = block_k / 128;
+
+    if ((block_k == 256 || block_k == 512) && warp_on_k <= warp_on_k_max) {
+        return 128;
+    } else {
+        return block_k;
+    }
 }
 
 // ============================================================

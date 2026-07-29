@@ -8,10 +8,7 @@ import re
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, get_sm_count, GemmType
 from .gemm_int8_lut import get_best_configs_from_lut
-from .densegemm_adaptive_select_strategy import get_adaptive_configs, is_int8_adaptive_shape
-
-# int8 adaptive tile selector gate using shared DenseGemm strategy
-_INT8_ADAPTIVE = os.environ.get('DG_INT8_ADAPTIVE', '0') != '0'
+from .densegemm_adaptive_select_strategy import get_adaptive_configs, is_int8_adaptive_enabled, get_warp_k
 
 # C++ code templates
 includes = ('"deep_gemm/int8_gemm.cuh"', )
@@ -484,8 +481,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1)
         return num_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
     # Adaptive tile selector for int8 DenseGemm on PPU1.5
-    # Enable when shape falls within the qwen38 decode range, or DG_INT8_ADAPTIVE is set
-    if (is_int8_adaptive_shape(m, n, k) or _INT8_ADAPTIVE) and is_ppu1v5_device() and gemm_type == GemmType.DenseGemm:
+    if is_int8_adaptive_enabled(m, n, k) and is_ppu1v5_device() and gemm_type == GemmType.DenseGemm:
         return get_adaptive_configs_int8(m, n, k, num_sms)
     if is_ppu1v5_device():
         return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, gemm_type, max_block_n)
@@ -699,9 +695,16 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         dense_s2_opt = False  # External configs: no adaptive re-evaluation
     else:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, 1, num_sms)
-        warp_k = block_k  # WarpOnK=1; TODO: enable adaptive warp_k when supported
-        # Heuristic path: inject adaptive dense_s2_opt (mirrors C++ int8_gemm.hpp:698-701)
-        dense_s2_opt = is_ppu1v5_device() and (is_int8_adaptive_shape(m, n, k) or _INT8_ADAPTIVE)
+        warp_k = block_k
+        # Heuristic path: inject adaptive warp_k/dense_s2_opt (mirrors C++ int8_gemm)
+        if is_ppu1v5_device() and is_int8_adaptive_enabled(m, n, k):
+            dense_s2_opt = True
+            # The tile is already an adaptive tile (get_best_configs hit the adaptive branch).
+            # get_warp_k is calibrated for BF16-scale block_k; INT8 doubles block_k (bpp=1),
+            # so pass the original scale (block_k // 2) and double the result.
+            warp_k = get_warp_k(block_m, block_n, block_k // 2, warp_m, warp_n, num_stages) * 2
+        else:
+            dense_s2_opt = False
     extra_info = get_extra_info()
 
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
