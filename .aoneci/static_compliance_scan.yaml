@@ -1,0 +1,45 @@
+triggers:
+  merge_request:
+    target-branches:
+      - 'main'
+    types:
+      - 'opened'
+strategy:
+  fast-fail: false
+  concurrency:
+    group: static-compliance-${{git.merge_request.id}}
+    cancel-in-progress: true
+name: "DeepGemm main, incremental static compliance scan"
+jobs:
+  incremental_static_compliance_scan:
+    name: "Incremental static compliance scan"
+    timeout: 30m
+    steps:
+      - uses: checkout
+        inputs:
+          enable-cache: false
+          submodules: false
+          submodule-fetch-depth: 0
+          path: '/aoneci/runner/work/source/DeepGemm'
+      # The scanner is shared by the PPU libraries and kept in one repository, so
+      # a rule fix reaches every pipeline without a commit in each. It is checked
+      # out beside the source rather than into it, to stay out of what it scans.
+      - uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:PPU-Libraries/compliance-scan.git'
+          ref: 'master'
+          path: '/aoneci/runner/work/source/compliance-scan'
+          ssh-key: ${{secrets.private_ssh_key}}
+          enable-cache: false
+      - id: static_compliance_scan
+        run: |-
+          set -e
+          cd /aoneci/runner/work/source/DeepGemm
+          git fetch origin main --depth=200 || true
+          # --ignore .aoneci leaves out this pipeline's own directory, which spells
+          # out the rules it runs and would otherwise report the scan itself.
+          # exit code: 0 = clean, 1 = compliance findings, 2 = scanner error
+          python3 /aoneci/runner/work/source/compliance-scan/static_compliance_scan.py \
+            --base origin/main \
+            --mode normal \
+            --ignore .aoneci
