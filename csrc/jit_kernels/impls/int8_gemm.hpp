@@ -702,7 +702,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
         auto [ns, bm, bn, bk, wm, wn, nst, sc] = deep_gemm_int8::get_best_configs(m, n, k, 1, num_sms);
         int warp_k = bk;  // default: WarpOnK=1
         bool dense_s2_opt = false;
-        if (is_ppu1v5_device() && (deep_gemm_adaptive::is_int8_adaptive_shape(m, n, k) || deep_gemm_adaptive::int8_adaptive_enabled())) {
+        if (is_ppu1v5_device() && deep_gemm_adaptive::int8_adaptive_enabled(m, n, k)) {
             dense_s2_opt = true;
             // warp_k remains = block_k (WarpOnK=1 for INT8; adaptive warp_k TODO)
         }

@@ -153,8 +153,7 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms, 
     // Adaptive tile selection for DenseGemm (BF16). warp_k/dense_s2_opt are injected in the dense
     // impl; here we only apply the adaptive tile choice and return the 8-tuple.
     if (num_groups == 1 && !is_grouped_contiguous && !is_grouped_masked && is_ppu1v5_device() &&
-        (deep_gemm_adaptive::is_bf16_adaptive_shape(m, n, k) ||
-         deep_gemm_adaptive::bf16_adaptive_enabled())) {
+        deep_gemm_adaptive::bf16_adaptive_enabled(m, n, k)) {
         return get_adaptive_configs_bf16(m, n, k, num_sms);
     }
     // Generate block_ms

@@ -661,7 +661,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             auto [ns, bm, bn, bk, wm, wn, nst, sc] = deep_gemm_bf16_common::get_best_configs(m, n, k, 1, num_sms);
             int warp_k = bk;  // default: WarpOnK=1 (non-adaptive)
             bool dense_s2_opt = false;
-            if (is_ppu1v5_device() && (deep_gemm_adaptive::is_bf16_adaptive_shape(m, n, k) || deep_gemm_adaptive::bf16_adaptive_enabled())) {
+            if (is_ppu1v5_device() && deep_gemm_adaptive::bf16_adaptive_enabled(m, n, k)) {
                 dense_s2_opt = true;
                 // BF16 adaptive: warp_k comes from the adaptive selector (Python gemm.py parity).
                 auto adaptive_cfg = deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms);

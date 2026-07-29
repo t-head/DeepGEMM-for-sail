@@ -629,8 +629,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_group
     // Adaptive tile selection for DenseGemm (INT8). warp_k/dense_s2_opt are injected in the dense
     // impl; here we only apply the adaptive tile choice (incl. bk *= 2) and return the 8-tuple.
     if (num_groups == 1 && !is_grouped_contiguous && !is_grouped_masked && is_ppu1v5_device() &&
-        (deep_gemm_adaptive::is_int8_adaptive_shape(m, n, k) ||
-         deep_gemm_adaptive::int8_adaptive_enabled())) {
+        deep_gemm_adaptive::int8_adaptive_enabled(m, n, k)) {
         return get_adaptive_configs_int8(m, n, k, num_sms);
     }
     if (is_ppu1v5_device()) {

@@ -28,6 +28,21 @@ from .utils import ceil_div
 _USE_REG_MODEL_ONLY = os.environ.get('DG_TILE_REG_MODEL', '1') == '1'
 _COMPUTE_TILE_ENABLED = os.environ.get('DG_COMPUTE_TILE', '1') != '0'
 
+# int8 adaptive tile selector gate using shared DenseGemm strategy
+#   DG_INT8_ADAPTIVE=0: force disable adaptive tile
+#   DG_INT8_ADAPTIVE=1: force enable adaptive tile
+#   unset: use is_int8_adaptive_shape() default logic
+_INT8_ADAPTIVE_ENV = os.environ.get('DG_INT8_ADAPTIVE', None)
+
+
+def is_int8_adaptive_enabled(m, n, k):
+    # 0: force disable, 1: force enable, other values: use default
+    if _INT8_ADAPTIVE_ENV == '0':
+        return False
+    if _INT8_ADAPTIVE_ENV == '1':
+        return True
+    return is_int8_adaptive_shape(m, n, k)
+
 
 def is_int8_adaptive_shape(m: int, n: int, k: int) -> bool:
     """Whether (m, n, k) falls within the validated INT8 adaptive tile shape range.
@@ -36,24 +51,23 @@ def is_int8_adaptive_shape(m: int, n: int, k: int) -> bool:
     INT8 adaptive tile-selector path. Add newly validated shapes here.
     """
     return (m <= 160 and (
-        (n == 36864 and k == 8192) or
-        (n == 8192 and k == 16384) or
-        (n == 34816 and k == 8192)
-        # NOTE: (n==4096,k==8192) and (n==8192,k==2048) are NOT optimized because
-        # scale multiplication is done before warpK reduce in the current kernel.
-        # The fix is to do warpK reduce first, then scale multiplication.
-        # (n == 4096 and k == 8192) or
-        # (n == 8192 and k == 2048)
+        (n >= 10240 and k >= 1024) or
+        (n == 8192 and k == 16384)
     ))
-
 
 def is_bf16_adaptive_shape(m: int, n: int, k: int) -> bool:
     """Whether (m, n, k) falls within the BF16 adaptive tile shape range.
-
-    BF16 adaptive tile selection: no M restriction, N >= 5120, K >= 1024.
     """
-    # return n >= 2048 and k >= 1024
-    return False
+    return (m <= 160 and n >= 5120 and k >= 1024)
+
+def is_bf16_adaptive_enabled(m, n, k):
+    # 0: force disable, 1: force enable, other values: use default
+    env_val = os.environ.get('DG_BF16_ADAPTIVE')
+    if env_val == '0':
+        return False
+    if env_val == '1':
+        return True
+    return is_bf16_adaptive_shape(m, n, k)
 
 _SMEM_SIZE = 256 * 1024
 _BASE_BLOCK_K = 64
@@ -490,7 +504,7 @@ def _select_tile_memory_bound(cutlass_n, cutlass_m, cutlass_k, num_sms, block_m,
     # K=1024/5120 fullgen, mostly REGR). Drop WN=16 from the candidate set;
     # BM<=64 keeps WN=16 as the small-N escape hatch.
     wn_candidates = (tuple(wn for wn in _WN_CANDIDATES_SMALLBM if wn >= 32)
-                     if block_m >= 80 else _WN_CANDIDATES_SMALLBM)
+                     if block_m >= 128 else _WN_CANDIDATES_SMALLBM)
 
     # Step 1: plan_max_bn = max achievable BN (SMEM + regs + warps bounded).
     plan_max_bn = max(achievable_bn(wn) for wn in wn_candidates)
@@ -520,19 +534,17 @@ def _select_tile_memory_bound(cutlass_n, cutlass_m, cutlass_k, num_sms, block_m,
     block_n = math.ceil(bn_wave_even / warp_n) * warp_n
 
     # Step 6: BK, stages, warp_k — memory-bound policy.
-    # Start BK=64, double BK while stages > 4, up to BK=512.
-    # Memory-bound keeps stages in {2, 3, 4}.
+    # Start BK=64, double BK while stages > 3, up to BK=512.
+    # Memory-bound keeps stages in {2, 3}.
     block_k = _BASE_BLOCK_K
-    while block_k < _MAX_BLOCK_K:
+    while True:
         max_stages = _SMEM_SIZE // ((block_m + block_n) * block_k * 2)
-        if max_stages <= 4:
+        if max_stages <= 3 or block_k >= _MAX_BLOCK_K:
             break
         block_k *= 2
-    else:
-        max_stages = _SMEM_SIZE // ((block_m + block_n) * block_k * 2)
 
-    # Cap stages at 4; also bounded by K-iterations.
-    num_stages = min(max_stages, 4, math.ceil(cutlass_k / block_k))
+    # Cap stages at 3; also bounded by K-iterations.
+    num_stages = min(max_stages, 3, math.ceil(cutlass_k / block_k))
     num_stages = max(num_stages, 2)
     warp_k = get_warp_k(block_m, block_n, block_k, warp_m, warp_n, num_stages)
     return block_n, warp_n, block_k, num_stages, warp_k
@@ -683,16 +695,13 @@ def get_warp_k(block_m, block_n, block_k, warp_m, warp_n, num_stages):
     warp_on_m = max(1, block_m // warp_m)
     warp_on_n = max(1, block_n // warp_n)
     base_warps = warp_on_m * warp_on_n
-    if block_k <= 128:
-        return block_k
-    if 2 * base_warps > 32:
-        return block_k
-    mainloop_smem = (block_m + block_n) * block_k * 2 * (num_stages - 1)
-    reduce_per_slot = block_m * block_n * 4
-    if mainloop_smem < reduce_per_slot:
-        return block_k
-    return block_k // 2
+    warp_on_k_max = max(1, 32 // base_warps)
+    warp_on_k = block_k // 128
 
+    if block_k in (256, 512) and warp_on_k <= warp_on_k_max:
+        return 128
+    else:
+        return block_k
 
 @lru_cache(maxsize=None)
 def get_adaptive_configs(m: int, n: int, k: int, num_sms: int):
