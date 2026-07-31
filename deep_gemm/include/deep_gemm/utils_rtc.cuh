@@ -1,29 +1,5 @@
 #pragma once
 
-#ifndef USE_HGGC
-__device__ __forceinline__ int atomic_add_release_global(int* addr, int value) {
-    int ret;
-    asm volatile ("ppu.atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(addr), "r"(value));
-    return ret;
-}
-#endif
-// When not compiling with hgcc (e.g. gcc host compilation via CppExtension),
-// device function qualifiers are unknown and must be defined as empty macros.
-#ifndef USE_HGGC
-#ifndef __device__
-#define __device__
-#endif
-#ifndef __host__
-#define __host__
-#endif
-#ifndef __forceinline__
-#define __forceinline__ inline
-#endif
-#ifndef __launch_bounds__
-#define __launch_bounds__(...)
-#endif
-#endif  // !USE_HGGC
-
 
 enum class GemmType {
     DenseGemm,

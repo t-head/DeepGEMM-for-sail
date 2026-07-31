@@ -47,10 +47,8 @@ struct TileSchedulerArguments
 };
 using TileSchedulerParams = TileSchedulerArguments;
 
-#ifdef __clang__
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
-#endif
 template <GemmType kGemmType,
           uint32_t SHAPE_N_, uint32_t SHAPE_K_,
           uint32_t BLOCK_M_, uint32_t BLOCK_N_,
@@ -429,8 +427,6 @@ struct DeepGemmScheduler {
 
 };
 
-#ifdef USE_HGGC
-
 // ==================== Dynamic Tile Builder Config & Scheduler ====================
 
 /// Configuration for dynamic tile builder selection.
@@ -549,11 +545,7 @@ struct DynamicTileScheduler
 #endif  // defined(__HGGC__)
 };
 
-#endif  // USE_HGGC (DynamicTile section)
-
-#ifdef __clang__
 #pragma clang diagnostic pop
-#endif
 
 }
 

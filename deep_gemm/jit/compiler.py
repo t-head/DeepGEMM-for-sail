@@ -116,14 +116,14 @@ def is_ppu1v5_device():
 
 def build(name: str, arg_defs: tuple, code: str) -> Runtime:
     """
-    JIT compile a kernel using hgcc, producing a shared library (.so).
-    Flags are aligned with compiler.hpp's HGCCCompiler for consistency.
+    JIT compile a kernel into a shared library (.so).
+    Flags are kept aligned with the C++ JIT compiler for consistency.
     """
     # --- Language standard & defines ---
     cpp_standard = int(os.getenv('DG_HGCC_OVERRIDE_CPP_STANDARD', 17))
     hgcc_flags = [
         f'-std=c++{cpp_standard}',
-        '-shared',                  # produce .so (unlike -hgbin in compiler.hpp which produces raw binary)
+        '-shared',                  # produce a .so rather than a raw binary
         '-DUSE_HGGC', '-DUSE_CLANG', '-DUSE_ACWRAPPER',
     ]
 
@@ -138,22 +138,7 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
 
 
     # --- Host compiler flags (via -Xcompiler) ---
-    hgcc_flags.extend([
-        '-Xcompiler', '-fPIC',
-        '-Xcompiler', '-Wno-deprecated-declarations',
-        '-Xcompiler', '-Wno-abi',
-    ])
-
-    # --- Optional: host compiler path (DG_CCBIN) ---
-    ccbin = os.getenv('DG_CCBIN')
-    if ccbin:
-        hgcc_flags.extend(['-ccbin', ccbin])
-
-    # --- Optional: delayed-template-parsing control ---
-    # Set DG_DELAYED_TEMPLATE_PARSING=false to debug hgcc segfaults.
-    # Default: delayed parsing ON (avoids crash in clang::Stmt::getBeginLoc).
-    if os.getenv('DG_DELAYED_TEMPLATE_PARSING') == 'false':
-        hgcc_flags.append('-fno-delayed-template-parsing')
+    hgcc_flags.extend(['-Xcompiler', '-fPIC', '-Xcompiler', '-Wno-deprecated-declarations', '-Xcompiler', '-Wno-abi'])
 
     # --- PPU LLVM backend tuning ---
     if is_ppu1v5_device():
@@ -176,25 +161,21 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
                                '-Xllvm', '-ppu-adjust-tsm-valu-war=13',
                                '-Xllvm', '-ppu-reassign-subregs=true',
                                '-Xllvm', '-ppu-pref-fma-reuse=true',
-                               '-Xllvm', '-ppu-pref-mma-reuse=true',
-                               '-Xllvm', '-regalloc=pbqp'])
+                               '-Xllvm', '-ppu-pref-mma-reuse=true'])
         if 'w4a16' in lower_name:
             hgcc_flags.extend(['-Xllvm', '-sort-copy-before-coalesce'])
 
     # --- Source language ---
-    hgcc_flags.append('-x')
-    hgcc_flags.append('hg')
+    hgcc_flags.extend(['-x', 'hg'])
 
     # --- Include paths ---
     include_dirs = [get_jit_include_dir()]
-    # Always include deep_gemm headers (aligned with compiler.hpp)
+    # Always include the deep_gemm headers (aligned with the C++ JIT compiler)
     deep_gemm_inc = f'{_jit_include_dir_default}/deep_gemm'
     if deep_gemm_inc not in include_dirs:
         include_dirs.append(deep_gemm_inc)
-    # NOTE: Do NOT add PPU_SDK/include explicitly here.
-    # hgcc finds its own SDK headers via built-in paths.
-    # Adding it explicitly causes GCC 13 <cmath> conflicts.
-    # (compiler.hpp HGCCCompiler also does NOT add PPU_HOME path)
+    # NOTE: do not add the SDK include dir explicitly -- the compiler finds its own
+    # headers via built-in paths, and adding it causes GCC 13 <cmath> conflicts.
 
     # --- Build signature ---
     enable_sass_opt = 0
