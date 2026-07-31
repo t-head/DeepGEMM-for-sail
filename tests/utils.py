@@ -1219,12 +1219,9 @@ def test_m_grouped_gemm_fused(args) -> None:
         x_tensor = x[0] if isinstance(x, (tuple, list)) else x
         y_tensor = y[0] if isinstance(y, (tuple, list)) else y
         is_perchannel = quant_type == 'channel'
+        configs, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, _, _ = deep_gemm.moe_align_block_size(x_tensor, y_tensor, topk_ids, is_perchannel)
         if d == 'w4a16':
-            expected_m = ceil_div(num_token * topk, num_groups)
-            configs = deep_gemm.jit_kernels.m_grouped_gemm_w4a16.get_w4a16_config("GroupedFused", expected_m, n, k, group_size)
-            configs, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, _, _ = deep_gemm.moe_align_block_size(x_tensor, y_tensor, topk_ids, is_perchannel, config=configs)
-        else:
-            configs, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, _, _ = deep_gemm.moe_align_block_size(x_tensor, y_tensor, topk_ids, is_perchannel)
+            assert len(configs) == 8, f"W4A16 fused config must keep 8 items, got {configs}"
 
         if d == torch.bfloat16:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
@@ -1232,6 +1229,8 @@ def test_m_grouped_gemm_fused(args) -> None:
             deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d == torch.float8_e4m3fn:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+        elif d == 'w4a16':
+            deep_gemm.m_grouped_gemm_w4a16_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)

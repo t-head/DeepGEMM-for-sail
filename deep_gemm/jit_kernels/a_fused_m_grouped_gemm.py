@@ -6,6 +6,7 @@ from .gemm import get_best_configs as bf16_get_best_configs
 from .gemm_int8 import get_best_configs as perchannel_get_best_configs
 from .gemm_fp8 import get_best_configs as fp8_blkwise_get_best_configs
 from .gemm_fp4 import get_best_configs as fp4_get_best_configs
+from .m_grouped_gemm_w4a16 import w4a16_get_best_configs
 from .utils import get_num_sms, ceil_div, GemmType, get_col_major_tma_aligned_tensor
 import os
 
@@ -173,6 +174,7 @@ def moe_align_block_size(
     num_token, k = lhs.shape
     num_groups, n, k_ = rhs.shape
     dtype = lhs.dtype
+    is_w4a16 = rhs.dtype == torch.int32
     numel = topk_ids.numel()
     topk = topk_ids.shape[1]
 
@@ -180,7 +182,9 @@ def moe_align_block_size(
     if config is None:
         expected_m = ceil_div(numel, num_groups)
         num_sms = get_num_sms()
-        if dtype == torch.bfloat16:
+        if is_w4a16:
+            config = w4a16_get_best_configs(GemmType.GroupedFused, expected_m, n, k, num_groups, num_sms)
+        elif dtype == torch.bfloat16:
             config = bf16_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
         elif perchannel_quant:
             config = perchannel_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
@@ -249,8 +253,9 @@ def moe_align_block_size(
         args=args
     )
     runtime(*args)
-    # Drop smem_config (last item): only the first 7 tuning params are needed
-    return config[:7], m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, inv_perm, m_indices
+    return_config = config if is_w4a16 else config[:7]
+    # Drop smem_config (last item): only the first 7 tuning params are needed for non-W4A16 fused kernels
+    return return_config, m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, inv_perm, m_indices
 
 def m_grouped_gemm_bf16_bf16_bf16_nt_fused(lhs: torch.Tensor,
                                      rhs: torch.Tensor,
@@ -569,7 +574,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
     # Do nothing if `m_sum` is zero
     if m_sum == 0:
         return
-    
+
     ### parse tile config
     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = configs
 

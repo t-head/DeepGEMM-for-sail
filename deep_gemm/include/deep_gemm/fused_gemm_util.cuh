@@ -146,6 +146,90 @@ __forceinline__ __device__ void copy_A_to_tsm(TAsA&& tAsA, const void* src_ptr, 
   }
 };
 
+// Support prefetch token offsets and rebalance threads for A copy
+template <typename SrcT, typename TilerA,
+          uint32_t BLOCK_M, uint32_t BLOCK_K, int THREAD_NUM>
+struct CopyAToTsmConfig {
+  static constexpr uint32_t TILER_M = cute::get<0>(TilerA{});
+  static constexpr uint32_t TILER_N = cute::get<1>(TilerA{});
+  static constexpr uint32_t KPerThread = 128 / cutlass::sizeof_bits<SrcT>::value;
+  static constexpr uint32_t NumThreads_CPY_K = TILER_N / KPerThread;
+  static constexpr uint32_t ActiveM = cute::min(BLOCK_M, TILER_M);
+  static constexpr uint32_t ThreadsPerKIter = ActiveM * NumThreads_CPY_K;
+  static constexpr uint32_t M_ITER = cute::ceil_div(BLOCK_M, TILER_M);
+  static constexpr uint32_t K_ITER = BLOCK_K / TILER_N;
+  static_assert(THREAD_NUM != 0, "THREAD_NUM must be non-zero for CopyAToTsmConfig");
+  static constexpr uint32_t MaxKCohorts = uint32_t(THREAD_NUM) / ThreadsPerKIter;
+  static constexpr bool Rebalance = BLOCK_M < TILER_M && K_ITER > 1 &&
+      ThreadsPerKIter % 32 == 0 && MaxKCohorts > 1;
+  static constexpr uint32_t KCohorts = Rebalance ? cute::min(K_ITER, MaxKCohorts) : 1;
+
+  __forceinline__ __device__ static uint32_t logical_thread_idx(uint32_t thread_idx) {
+    return Rebalance ? thread_idx % ThreadsPerKIter : thread_idx;
+  }
+};
+
+template <typename SrcT, typename TilerA,
+          uint32_t BLOCK_M, uint32_t BLOCK_K, int THREAD_NUM,
+          uint32_t M_ITER>
+__forceinline__ __device__ void prefetch_A_token_offsets(
+    uint32_t (&token_offsets)[M_ITER], const int* blk_token_base,
+    uint32_t shape_m, uint32_t thread_idx) {
+  using Config = CopyAToTsmConfig<SrcT, TilerA, BLOCK_M, BLOCK_K, THREAD_NUM>;
+  static_assert(M_ITER == Config::M_ITER, "token offset buffer size must match A copy M iterations");
+  uint32_t logical_thread_idx = Config::logical_thread_idx(thread_idx);
+  uint32_t k_cohort = Config::Rebalance ? thread_idx / Config::ThreadsPerKIter : 0;
+  uint32_t tid_m = logical_thread_idx / Config::NumThreads_CPY_K;
+  bool active_copy_thread = k_cohort < Config::KCohorts && tid_m < BLOCK_M;
+  CUTLASS_PRAGMA_UNROLL
+  for (uint32_t m_iter = 0; m_iter < Config::M_ITER; ++m_iter) {
+    token_offsets[m_iter] = active_copy_thread
+        ? __ldg(blk_token_base + m_iter * Config::TILER_M + tid_m) : shape_m;
+  }
+}
+
+template <typename SrcT, typename ACopyInst, typename TilerA,
+          uint32_t BLOCK_M, uint32_t BLOCK_K, uint32_t STRIDE_AM,
+          int THREAD_NUM, class TAsA>
+__forceinline__ __device__ void copy_A_to_tsm_impl(
+    TAsA&& tAsA, const void* src_ptr, const uint32_t* token_offsets,
+    uint32_t stage_offset, uint32_t shape_m, uint32_t thread_idx) {
+  using Config = CopyAToTsmConfig<SrcT, TilerA, BLOCK_M, BLOCK_K, THREAD_NUM>;
+  uint32_t logical_thread_idx = Config::logical_thread_idx(thread_idx);
+  uint32_t k_cohort = Config::Rebalance ? thread_idx / Config::ThreadsPerKIter : 0;
+  uint32_t tid_k = logical_thread_idx % Config::NumThreads_CPY_K;
+  uint32_t tid_m = logical_thread_idx / Config::NumThreads_CPY_K;
+  if (k_cohort < Config::KCohorts && tid_m < BLOCK_M) {
+    CUTLASS_PRAGMA_UNROLL
+    for (uint32_t m_iter = 0; m_iter < Config::M_ITER; ++m_iter) {
+      uint32_t token_offset = token_offsets[m_iter];
+      bool token_mask = token_offset < shape_m;
+      CUTLASS_PRAGMA_UNROLL
+      for (uint32_t k_iter = k_cohort; k_iter < Config::K_ITER; k_iter += Config::KCohorts) {
+        const cutlass::uint128_t* src_ptr128 = reinterpret_cast<const cutlass::uint128_t*>(
+            reinterpret_cast<const SrcT*>(src_ptr) + token_offset * STRIDE_AM +
+            k_iter * Config::TILER_N + tid_k * Config::KPerThread + stage_offset);
+        cutlass::uint128_t* dst_ptr128 = reinterpret_cast<cutlass::uint128_t*>(
+            cute::raw_pointer_cast(tAsA(_,m_iter,k_iter).data()));
+        ACopyInst::copy(*src_ptr128, *dst_ptr128, token_mask);
+      }
+    }
+  }
+}
+
+template <typename SrcT, typename ACopyInst, typename TilerA,
+          uint32_t BLOCK_M, uint32_t BLOCK_K, uint32_t STRIDE_AM,
+          int THREAD_NUM, class TAsA>
+__forceinline__ __device__ void copy_A_to_tsm(
+    TAsA&& tAsA, const void* src_ptr, const uint32_t* token_offsets,
+    uint32_t stage_offset, uint32_t shape_m, uint32_t thread_idx,
+    cute::Int<THREAD_NUM>) {
+  copy_A_to_tsm_impl<SrcT, ACopyInst, TilerA, BLOCK_M, BLOCK_K, STRIDE_AM, THREAD_NUM>(
+      static_cast<TAsA&&>(tAsA), src_ptr, token_offsets,
+      stage_offset, shape_m, thread_idx);
+}
+
+
 template <typename AccT, typename DstT,
          uint32_t SHAPE_N, uint32_t BLOCK_N, uint32_t STRIDE_CM,
          class TAcc, class TCcC, class... Ts>
