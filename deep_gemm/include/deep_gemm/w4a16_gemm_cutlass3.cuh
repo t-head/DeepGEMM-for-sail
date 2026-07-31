@@ -14,6 +14,7 @@
 #include "profiling_interface.hpp"
 #include "scheduler_cutlass3.cuh"
 #include "fused_scheduler.cuh"
+#include "fused_gemm_util.cuh"
 #include "utils.cuh"
 #include "utils_cutlass3.h"
 
@@ -76,15 +77,24 @@ public:
   // sA
   static constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;
   using ACopyInst = cute::PPU_CP_ASYNC_CACHEALWAYS_ZFILL<cutlass::uint128_t>;
+#if __HGGC_ARCH__ >= 150
+  using FusedOperandA = cutlass::gemm::config::Gemm_Hybrid_Operand<
+    ArchTag, ElementA, false, AlignA, Int<BlockK>, MaxThreadsPerBlock,
+    ACopyInst, Int<BlockM>>;
+#else
+  using FusedOperandA = cutlass::gemm::config::DefaultGemm_TensorOpPPU_Operand<
+    ElementA, false, AlignA, Int<BlockK>, MaxThreadsPerBlock, ACopyInst>;
+#endif
   using DefaultOperandA = cute::conditional_t<
     Fused,
-    cutlass::gemm::config::DefaultGemm_TensorOpPPU_Operand<ElementA, false, AlignA, Int<BlockK>, MaxThreadsPerBlock, ACopyInst>,
+    FusedOperandA,
     cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, false, Int<BlockM>, Int<BlockK>, false, 0, true>
   >;
   using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom;
   using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
   using GmemTiledCopyA = typename DefaultOperandA::GmemTiledCopy;
   using TilerA = typename GmemTiledCopyA::Tiler_MN;
+  using CopyAConfig = deep_gemm::CopyAToTsmConfig<ElementA, TilerA, BlockM, BlockK, MaxThreadsPerBlock>;
   using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtomA{}, make_shape(Int<BlockM>{}, Int<BlockK>{}, Int<kNumStages>{})));
 
   // sB
@@ -149,7 +159,6 @@ public:
     int* block_m_info;
   };
   struct FusedArguments {
-    int topk;
     const int* expert_ids_and_cumsum;
     const int* sorted_token_ids;
     const int* aligned_num_m_blocks;
@@ -162,7 +171,6 @@ public:
     const ElementScale* ptr_scale;
     ElementD* ptr_d;
     int num_token;
-    int topk;
     const int* sorted_token_ids;
     typename TileScheduler::Params scheduler;
 
@@ -231,7 +239,8 @@ public:
     GmemTiledCopyScale gmem_tiled_copy_scale;
     gmem_tiled_copy_B.desc_.template init<int, false, get<0>(TileB{}), get<1>(TileB{})>(nullptr, K / 16, N * 2, strideB);
     gmem_tiled_copy_scale.desc_.template init<ElementScale, false, GroupsPerBlock, BlockN>(nullptr, K / kGroupSize, N, strideScale);
-    auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx);
+    uint32_t thread_idx_A = Fused ? CopyAConfig::logical_thread_idx(thread_idx) : thread_idx;
+    auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx_A);
     auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
     auto gmem_thr_copy_scale = gmem_tiled_copy_scale.get_slice(thread_idx);
     Tensor tAsA = gmem_thr_copy_A.partition_D(sA);
@@ -248,8 +257,14 @@ public:
     auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
     auto [smem_thr_copy_A, tCsA] = [&]() {
       if constexpr(Fused) {
+#if __HGGC_ARCH__ >= 150
+        auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(warp_idx * 32);
+        auto mix_sA = make_mix_tensor_like(sA);
+        auto sA_r2s = reshape_warpk<1>(mix_sA);
+#else
         auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(thread_idx);
         auto sA_r2s = reshape_warpk<1>(sA);
+#endif
         auto tCsA = smem_thr_copy_A.partition_S(sA_r2s);
         return cute::make_tuple(smem_thr_copy_A, tCsA);
       } else {
@@ -301,7 +316,8 @@ public:
       Tensor tSgS = gmem_thr_copy_scale.partition_S(gScale);
 
       Tensor cD = make_identity_tensor(make_shape(Int<BlockM>{}, Int<BlockN>{}));
-      auto [blk_token_base, tAgA, residual_m, gD] = [&]() {
+      uint32_t token_offsets[CopyAConfig::M_ITER];
+      auto [tAgA, residual_m, gD] = [&]() {
         if constexpr(!Fused) {
           int M = deep_scheduler.curr_group_m;
           gmem_tiled_copy_A.desc_.template init<ElementA, false, BlockM, BlockK>(nullptr, M, K, strideA);
@@ -314,11 +330,15 @@ public:
           Tensor gD = local_tile(mD_mn, TileShape{}, make_coord(m_block_idx, n_block_idx, _), Step<_1, _1, X>{}); // (BLK_M,BLK_N)
           int residual_m = M - BlockM * m_block_idx;
 
-          return cute::make_tuple(nullptr, tAgA, residual_m, gD);
+          return cute::make_tuple(tAgA, residual_m, gD);
         } else {
           const int* blk_token_base = params.sorted_token_ids + deep_scheduler.cumsum_m_block_idx * BlockM;
-          int num_valid_tokens = params.num_token * params.topk;
-          return cute::make_tuple(blk_token_base, NoTensor{}, 0, NoTensor{});
+          deep_gemm::prefetch_A_token_offsets<ElementA, TilerA, BlockM, BlockK, MaxThreadsPerBlock>(
+              token_offsets, blk_token_base, params.num_token, thread_idx);
+          Tensor mD_mn = make_tensor(make_gmem_ptr(params.ptr_d + deep_scheduler.curr_block_m_offset * N), make_shape(Int<BlockM>{}, Int<N>{}), strideD); // (m,n)
+          Tensor gD = local_tile(mD_mn, TileShape{}, make_coord(_0{}, n_block_idx, _), Step<_1, _1, X>{}); // (BLK_M,BLK_N)
+          int residual_m = deep_scheduler.valid_m_in_block;
+          return cute::make_tuple(NoTensor{}, residual_m, gD);
         }
       }();
 
@@ -337,28 +357,10 @@ public:
             copy(gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,k_pipe));
           }
         } else { // async copy
-          constexpr int tiler_m = get<0>(TilerA{});
-          constexpr int tiler_k = get<1>(TilerA{});
-          constexpr int NumThreads_CPY_K = tiler_k / AlignA;
-          constexpr int M_ITER = ceil_div(BlockM, tiler_m);
-          constexpr int K_ITER = BlockK / tiler_k;
-          static_assert(BlockK % tiler_k == 0);
-
-          int tid_k = thread_idx % NumThreads_CPY_K;
-          int tid_m = thread_idx / NumThreads_CPY_K;
-          if (tid_m < BlockM) {
-            CUTLASS_PRAGMA_UNROLL
-            for(int m_iter = 0; m_iter < M_ITER; ++m_iter) {
-              CUTLASS_PRAGMA_UNROLL
-              for(int k_iter = 0; k_iter < K_ITER; ++k_iter) {
-                int m_offset = __ldg(blk_token_base + (m_iter * tiler_m) + tid_m) / params.topk;
-                int k_offset = k_iter * tiler_k + tid_k * AlignA + k_tile_iter * BlockK;
-                const cutlass::uint128_t& src = *reinterpret_cast<const cutlass::uint128_t*>(params.ptr_a + m_offset * K + k_offset);
-                cutlass::uint128_t& dst = *reinterpret_cast<cutlass::uint128_t*>(raw_pointer_cast(tAsA(_,m_iter,k_iter,k_pipe).data()));
-                ACopyInst::copy(src, dst, m_offset < params.num_token);
-              }
-            }
-          }
+          deep_gemm::copy_A_to_tsm<ElementA, ACopyInst, TilerA, BlockM, BlockK, K>(
+              tAsA(_,_,_,k_pipe), params.ptr_a, token_offsets,
+              BlockK * k_tile_iter, params.num_token, thread_idx,
+              Int<MaxThreadsPerBlock>{});
         }
       };
 
@@ -479,25 +481,11 @@ public:
           constexpr int align_elems = 1;
         #endif
         Tensor tDcD = thr_mma.partition_C(cD);
-        auto tDgD = [&]() {
-          if constexpr(!Fused) {
-            return thr_mma.partition_C(gD);
-          } else {
-            return NoTensor{};
-          }
-        }();
+        auto tDgD = thr_mma.partition_C(gD);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tDcD); i += align_elems) {
-          ElementD* dst_ptr;
-          bool cond;
-          if constexpr(Fused) {
-            int m_offset = __ldg(blk_token_base + get<0>(tDcD(i)));
-            cond = m_offset < params.num_token * params.topk;
-            dst_ptr = params.ptr_d + m_offset * N + n_block_idx * BlockN + get<1>(tDcD(i));
-          } else {
-            cond = get<0>(tDcD(i)) < residual_m;
-            dst_ptr = &tDgD(i);
-          }
+          bool cond = get<0>(tDcD(i)) < residual_m;
+          ElementD* dst_ptr = &tDgD(i);
           if constexpr(N % BlockN) {
             cond = cond && get<1>(tDcD(i)) < (N - n_block_idx * BlockN);
           }
@@ -530,15 +518,8 @@ public:
         Tensor tDcD = smem_thr_copy_s2r.partition_D(cDt);
         Tensor tDrD = make_tensor<ElementD>(take<0,3>(shape(tDcD)));
 
-        auto tDgD = [&]() {
-          if constexpr(!Fused) {
-            Tensor gDt = flat_divide(gD, sC_tile);
-            Tensor tDgD = smem_thr_copy_s2r.partition_D(gDt);
-            return tDgD;
-          } else {
-            return NoTensor{};
-          }
-        }();
+        Tensor gDt = flat_divide(gD, sC_tile);
+        Tensor tDgD = smem_thr_copy_s2r.partition_D(gDt);
 
         auto convert_b16 = [&](int mma_m, int mma_n) {
           constexpr int mma_elems = decltype(size<0>(accum))::value;
@@ -583,27 +564,13 @@ public:
           for (int m = 0; m < size<1>(tDcDmn); ++m) {
             CUTLASS_PRAGMA_UNROLL
             for (int n = 0; n < size<2>(tDcDmn); ++n) {
-              if constexpr(Fused) {
-                int m_offset = __ldg(blk_token_base + get<0>(tDcDmn(0,m,n)));
-                int n_offset = n_block_idx * BlockN + get<1>(tDcDmn(0,m,n));
-                bool cond = m_offset < params.num_token * params.topk;
-                if constexpr(N % BlockN) {
-                  cond = cond && n_offset < N;
-                }
-                if (cond) {
-                  uint128_t* dst_ptr = (uint128_t*)(params.ptr_d + m_offset * N + n_offset);
-                  uint128_t* acc_ptr = (uint128_t*)(raw_pointer_cast(tDrD(_,m,n).data()));
-                  *dst_ptr = *acc_ptr;
-                }
-              } else {
-                Tensor tDgDmn = tDgD(_,_,_,step_m,0);
-                bool cond = get<0>(tDcDmn(0,m,n)) < residual_m;
-                if constexpr(N % BlockN) {
-                  cond = cond && get<1>(tDcDmn(0,m,n)) < (N - n_block_idx * BlockN);
-                }
-                if (cond) {
-                  copy(CopyAtomR2G{}, tDrD(_,m,n), tDgDmn(_,m,n));
-                }
+              Tensor tDgDmn = tDgD(_,_,_,step_m,0);
+              bool cond = get<0>(tDcDmn(0,m,n)) < residual_m;
+              if constexpr(N % BlockN) {
+                cond = cond && get<1>(tDcDmn(0,m,n)) < (N - n_block_idx * BlockN);
+              }
+              if (cond) {
+                copy(CopyAtomR2G{}, tDrD(_,m,n), tDgDmn(_,m,n));
               }
             }
           }
@@ -683,9 +650,7 @@ public:
           // epilogue
           if (n_iter > 0) {
             n_block_idx++;
-            if constexpr(!Fused) {
-              gD.data() = gD.data() + BlockN;
-            }
+            gD.data() = gD.data() + BlockN;
           }
           epilogue_no_tsm();
 
@@ -807,9 +772,8 @@ public:
       bool NoPadPreprocessLayout = false;
       if constexpr(kGemmType == GemmType::GroupedFused) {
         params.num_token = shape_m;
-        params.topk = args.topk;
         params.sorted_token_ids = args.sorted_token_ids;
-        params.scheduler = {args.aligned_num_m_blocks, m_rows, args.expert_ids_and_cumsum};
+        params.scheduler = {args.aligned_num_m_blocks, args.expert_ids_and_cumsum};
       } else {
         int* layout_info = m_rows;
         if constexpr(Kernel::TileScheduler::kIsNoPadPreprocessLayout) {
