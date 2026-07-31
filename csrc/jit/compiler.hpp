@@ -66,13 +66,14 @@ public:
         if (const auto& env_cache_dir_path = get_env<std::string>("DG_JIT_CACHE_DIR"); not env_cache_dir_path.empty())
             cache_dir_path = env_cache_dir_path;
 
-        // The compiler flags applied to all derived compilers
+        // The compiler flags applied to all derived compilers.
+        // NOTE: keep only options this compiler actually accepts here -- it rejects both
+        // --diag-suppress=... and --ptxas-options=..., so neither is seeded. Everything
+        // seeded below is inherited by the derived compilers.
         signature = "unknown-compiler";
-        flags = fmt::format("-std=c++{} --diag-suppress=39,174,177,940 ",
+        flags = fmt::format("-std=c++{} ",
                             //"--ptxas-options=--register-usage-level=10",
                             get_env<int>("DG_CPP_STANDARD", 17));
-        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0) or get_env("DG_JIT_PTXAS_CHECK", 0))
-            flags += " --ptxas-options=--verbose,--warn-on-local-memory-usage";
         if (get_env("DG_JIT_WITH_LINEINFO", 0))
             flags += " -Xcompiler -rdynamic -lineinfo";
     }
@@ -139,6 +140,8 @@ DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_version);
 class HGCCCompiler final: public Compiler {
     std::filesystem::path hgcc_path;
 
+    // >>> PORTING LANDMARK: get_hgcc_version() — the offline compat script rewrites this whole
+    //     method (matched by its signature below, NOT by this note). Interior edits are safe.
     // Query the hgcc driver version (best-effort; never fatal on format mismatch)
     std::string get_hgcc_version() const {
         DG_HOST_ASSERT(std::filesystem::exists(hgcc_path) and "hgcc compiler not found");
@@ -153,36 +156,25 @@ class HGCCCompiler final: public Compiler {
             return match[1].str();
         return "unknown";
     }
+    // <<< PORTING LANDMARK: end of get_hgcc_version().
 
 public:
     HGCCCompiler() {
-        // Locate the hgcc offline compiler shipped with the PPU SDK
-        hgcc_path = "/usr/local/PPU_SDK/bin/hgcc";
+        // Locate the offline compiler binary
+        hgcc_path = sdk_home / "bin" / "hgcc";
         if (const auto& env_hgcc_path = get_env<std::string>("DG_JIT_HGCC_COMPILER"); not env_hgcc_path.empty())
             hgcc_path = env_hgcc_path;
         signature = fmt::format("HGCC{}", get_hgcc_version());
 
-        // Build hgcc flags incrementally for clarity and maintainability.
+        // Flags are APPENDED to the ones seeded by the base Compiler ctor (-std=c++NN plus
+        // the opt-in -lineinfo addition), so those are preserved here too.
         // All configurable paths come from environment variables or SDK detection.
-        //
-        // Environment variables:
-        //   DG_CPP_STANDARD               - C++ standard version (default: 17)
-        //   DG_CCBIN                       - host compiler path (e.g. /usr/bin/g++-13)
-        //   DG_DELAYED_TEMPLATE_PARSING    - set to "false" to debug hgcc segfaults
-        //
-        // NOTE on `-fdelayed-template-parsing=false`:
-        //   hgcc/hgrtc (clang 13 fork) crashes with NPE inside
-        //   clang::Stmt::getBeginLoc() -> clang::InitializationSequence::Diagnose(...)
-        //   under default delayed-template-parsing when a template instantiation fails.
-        //   Setting DG_DELAYED_TEMPLATE_PARSING=false forces immediate parsing, avoiding
-        //   the crash and yielding precise diagnostics. Trade-off: all non-dependent names
-        //   must be visible at the template definition point.
-
-        const int cpp_standard = get_env<int>("DG_CPP_STANDARD", 17);
         const std::string inc = library_include_path.string();
 
         // --- Language & defines ---
-        flags = fmt::format("-std=c++{} -DUSE_HGGC -DUSE_CLANG -DUSE_ACWRAPPER ", cpp_standard);
+        // NOTE: leading space is required -- the base flags do not always end with one
+        // (the optional debug/lineinfo appends have no trailing space).
+        flags += " -DUSE_HGGC -DUSE_CLANG -DUSE_ACWRAPPER ";
 
         // --- Architecture ---
         if (is_ppu1v5_device()) {
@@ -205,24 +197,18 @@ public:
         flags += "-Xcompiler -fPIC ";
         flags += "-Xcompiler -Wno-deprecated-declarations -Xcompiler -Wno-abi ";
 
-        // --- Optional: host compiler path (DG_CCBIN) ---
-        if (const char* ccbin = std::getenv("DG_CCBIN"); ccbin && ccbin[0] != '\0') {
-            flags += fmt::format("-ccbin {} ", ccbin);
-        }
-
-        // --- Optional: delayed-template-parsing control ---
-        if (const auto& dtp = get_env<std::string>("DG_DELAYED_TEMPLATE_PARSING"); dtp == "false") {
-            flags += "-fno-delayed-template-parsing ";
-        }
-        // NOTE: --ptxas-options=--register-usage-level=10 is not supported by hgcc
+        // NOTE: --ptxas-options=--register-usage-level=10 is intentionally not passed here
         std::string hgcc_extra_flags;
         if (is_ppu1v5_device()) {
             flags += " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
                      " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
         }
 
+        // >>> PORTING LANDMARK: source-language flag — dropped by the offline compat script
+        //     (matched by the code below, NOT by this note); unused by the ported build.
         // --- Source language ---
         flags += " -x hg ";
+        // <<< PORTING LANDMARK: end of dropped source-language flag.
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, int32_t thread_num, int32_t smem_size) const override {
@@ -230,8 +216,8 @@ public:
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);
 
-        // Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use the full
-        // -Xllvm tuning set; others only need -ppu-simt-branch=false (aligned with compiler.py logic)
+        // Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use -Xllvm flags,
+        // others only need -ppu-simt-branch=false (aligned with compiler.py logic)
         std::string per_kernel_flags;
         if (is_ppu1v5_device()) {
             const bool use_warp_interleaving = (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
@@ -262,7 +248,11 @@ public:
             DG_HOST_ASSERT(false and "HGCC compilation failed");
         }
 
-        // Print compiler log
+        // Check local memory usage
+        if (get_env("DG_JIT_PTXAS_CHECK", 0))
+            DG_HOST_ASSERT(not std::regex_search(output, std::regex(R"(Local memory used)")));
+
+        // Print PTXAS log
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))
             printf("%s", output.c_str());
     }
@@ -367,15 +357,6 @@ public:
             }
             std::string standard = "--std=c++17";
             opts.emplace_back(standard);
-            const char* rtc_ccbin_env = std::getenv("DG_CCBIN");
-            if (rtc_ccbin_env && rtc_ccbin_env[0] != '\0') {
-                opts.emplace_back("-ccbin");
-                opts.emplace_back(rtc_ccbin_env);
-            }
-            // Optional: delayed-template-parsing control (DG_DELAYED_TEMPLATE_PARSING=false)
-            if (const auto& dtp = get_env<std::string>("DG_DELAYED_TEMPLATE_PARSING"); dtp == "false") {
-                opts.emplace_back("-fno-delayed-template-parsing");
-            }
 
             opts_char.resize(opts.size());
             std::transform(opts.begin(), opts.end(), opts_char.begin(), [](const std::string& s) { return s.c_str(); });

@@ -1,7 +1,5 @@
 #pragma once
-#ifdef DG_USE_HGTX
 #include <hgtx3/hgToolsExt.h>
-#endif
 #include <hggc_runtime.h>
 #include <string>
 #include <iostream>
@@ -305,7 +303,6 @@ public:
             if (show_params_) {
                 std::cout << op_name << std::endl;
             }
-#ifdef DG_USE_HGTX
             if (use_hgtx_) {
                 hgtxEventAttributes_t eventAttrib = {0};
                 eventAttrib.version = HGTX_VERSION;
@@ -314,13 +311,10 @@ public:
                 eventAttrib.message.ascii = op_name.c_str();
                 hgtxDomainRangePushEx(domain_, &eventAttrib);
             }
-#endif
         } else {
-#ifdef DG_USE_HGTX
             if (use_hgtx_) {
                 hgtxDomainRangePop(domain_);
             }
-#endif
         } // if start
 
   }
@@ -328,11 +322,7 @@ public:
 private:
     ProfilingInterface() {
         // TODO: add print log
-#ifdef DG_USE_HGTX
         domain_ = hgtxDomainCreateA("deepgemm");
-#else
-        domain_ = nullptr;
-#endif
         use_hgtx_ = false;
         show_params_ = false;
 
@@ -363,17 +353,11 @@ private:
 
 
     ~ProfilingInterface() {
-#ifdef DG_USE_HGTX
         hgtxDomainDestroy(domain_);
-#endif
     }
 
     bool use_hgtx_;
     bool show_params_;
-#ifdef DG_USE_HGTX
     hgtxDomainHandle_t domain_;
-#else
-    void* domain_;
-#endif
 
 };

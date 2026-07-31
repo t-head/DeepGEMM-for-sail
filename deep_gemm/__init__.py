@@ -2,15 +2,8 @@ import os
 import subprocess
 import torch
 
-# PPU SDK path: env PPU_SDK > env PPU_HOME > default
-def _get_ppu_home():
-    for env_key in ('PPU_SDK', 'PPU_HOME'):
-        val = os.environ.get(env_key)
-        if val:
-            return val
-    return '/usr/local/PPU_SDK'
-
-PPU_HOME = _get_ppu_home()
+# SDK root: env PPU_SDK > env PPU_HOME > default
+PPU_HOME = os.environ.get('PPU_SDK') or os.environ.get('PPU_HOME') or '/usr/local/PPU_SDK'
 
 from . import jit
 from . import deep_gemm_tuner
@@ -80,11 +73,6 @@ from .deep_gemm_cpp import (
     m_grouped_gemm_int8_int8_bf16_nt_nopad,
 )
 
-deep_gemm_cpp.init(
-    os.path.dirname(os.path.abspath(__file__)), # Library root directory path
-    PPU_HOME         # PPU SDK home
-)
-
 use_cpp_jit_for_python = os.environ.get('USE_CPP_JIT_FOR_PYTHON', '').lower()
 should_init_deep_gemm_cpp = use_cpp_jit_for_python in ('1', 'true', 'yes', 'on')
 if should_init_deep_gemm_cpp:
@@ -110,6 +98,11 @@ if should_init_deep_gemm_cpp:
         m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
         gemm_fp4_fp4_bf16_nt,
     )
+
+deep_gemm_cpp.init(
+    os.path.dirname(os.path.abspath(__file__)), # Library root directory path
+    PPU_HOME         # SDK root
+)
 
 # Some alias for APIs
 fp8_gemm_nt = gemm_fp8_fp8_bf16_nt
