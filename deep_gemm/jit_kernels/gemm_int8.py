@@ -110,15 +110,6 @@ def get_smem_occ(block_m: int, block_n: int, block_k: int, num_stages: int) -> T
     return 262144 // smem_size
 
 @lru_cache(maxsize=None)
-def get_best_configs_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False):
-    # todo: add more tiles for ppu1.5
-    (best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages) = (256, 256, 128, 64, 64, 4)
-    best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1)
-    num_min_sms = get_sm_count()
-    return num_min_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
-
-@lru_cache(maxsize=None)
 def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: int) -> \
         Tuple[int, int, int, int, int, int, int, int, int, dict]:
 
@@ -453,6 +444,8 @@ def get_best_configs_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: in
 
     # (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 64, 256, 16, 16, 4)
     # print(best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages)
+
+    return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
 # ---- adaptive tile selector for int8 DenseGemm ----
 @lru_cache(maxsize=None)
