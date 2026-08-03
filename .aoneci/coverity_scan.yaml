@@ -75,7 +75,7 @@ jobs:
       - uses: checkout
         inputs:
           repository-url: 'git@gitlab.alibaba-inc.com:PPU-Libraries/cudafy-for-sail.git'
-          ref: 'master'
+          ref: 'main'
           path: '/aoneci/runner/work/source/cudafy-for-sail'
           ssh-key: ${{secrets.private_ssh_key}}
       - envs:
