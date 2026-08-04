@@ -9,6 +9,8 @@ includes = ('"../deep_gemm/w4a16_gemm_cutlass3.cuh"', )
 w4a16_nopad_template = """
 using namespace deep_gemm;
 using ElementA = cutlass::bfloat16_t;
+using ElementB = {ELEMENT_B};
+using ElementScale = {ELEMENT_SCALE};
 
 // Templated args from Python JIT call
 constexpr auto N = {N}, K = {K};
@@ -23,9 +25,8 @@ constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kGroupSize = {GROUP_SIZE};
 constexpr auto N_EXPAND = {N_EXPAND};
 
-// Make a templated grouped GEMM
-using gemm_t = W4A16Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kGroupSize, N_EXPAND>;
-gemm_t::run((const ElementA*) lhs, rhs, (const ElementA*) rhs_scales, (ElementA*) out,
+using gemm_t = W4A16Gemm<ElementB, ElementScale, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kGroupSize, N_EXPAND>;
+gemm_t::run((const ElementA*) lhs, rhs, (const ElementScale*) rhs_scales, (ElementA*) out,
             m, expected_m, stream, num_sms,
             m_rows, {block_m_info});
 """
@@ -33,6 +34,8 @@ gemm_t::run((const ElementA*) lhs, rhs, (const ElementA*) rhs_scales, (ElementA*
 w4a16_masked_template = """
 using namespace deep_gemm;
 using ElementA = cutlass::bfloat16_t;
+using ElementB = {ELEMENT_B};
+using ElementScale = {ELEMENT_SCALE};
 
 // Templated args from Python JIT call
 constexpr auto N = {N}, K = {K};
@@ -47,9 +50,8 @@ constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kGroupSize = {GROUP_SIZE};
 constexpr auto N_EXPAND = {N_EXPAND};
 
-// Make a templated grouped GEMM
-using gemm_t = W4A16Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kGroupSize, N_EXPAND>;
-gemm_t::run((const ElementA*) lhs, rhs, (const ElementA*) rhs_scales, (ElementA*) out,
+using gemm_t = W4A16Gemm<ElementB, ElementScale, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kGroupSize, N_EXPAND>;
+gemm_t::run((const ElementA*) lhs, rhs, (const ElementScale*) rhs_scales, (ElementA*) out,
             m, expected_m, stream, num_sms,
             m_rows, {nullptr});
 """
@@ -57,6 +59,8 @@ gemm_t::run((const ElementA*) lhs, rhs, (const ElementA*) rhs_scales, (ElementA*
 w4a16_fused_template = """
 using namespace deep_gemm;
 using ElementA = cutlass::bfloat16_t;
+using ElementB = {ELEMENT_B};
+using ElementScale = {ELEMENT_SCALE};
 
 // Templated args from Python JIT call
 constexpr auto N = {N}, K = {K};
@@ -71,9 +75,8 @@ constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kGroupSize = {GROUP_SIZE};
 constexpr auto N_EXPAND = {N_EXPAND};
 
-// Make a templated grouped GEMM
-using gemm_t = W4A16Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kGroupSize, N_EXPAND>;
-gemm_t::run((const ElementA*) lhs, rhs, (const ElementA*) rhs_scales, (ElementA*) out,
+using gemm_t = W4A16Gemm<ElementB, ElementScale, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kGroupSize, N_EXPAND>;
+gemm_t::run((const ElementA*) lhs, rhs, (const ElementScale*) rhs_scales, (ElementA*) out,
             m, expected_m, stream, num_sms,
             m_rows, {expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks});
 """
@@ -100,7 +103,7 @@ def w4a16_get_best_configs(gemm_type, expected_m, n, k, num_groups, num_sms, gro
     return configs
 
 
-def m_grouped_gemm_w4a16_common(gemm_type: GemmType, expected_m: int,
+def m_grouped_gemm_w4a16_common(is_fp4: bool, gemm_type: GemmType, expected_m: int,
                                 lhs: torch.Tensor,
                                 rhs_: Tuple[torch.Tensor, torch.Tensor],
                                 out: torch.Tensor,
@@ -108,13 +111,15 @@ def m_grouped_gemm_w4a16_common(gemm_type: GemmType, expected_m: int,
                                 m_rows: torch.Tensor,
                                 scheduler_extra):
     """
-    W4A16 grouped GEMM without padding.
+    W4A16 / W4FA16 grouped GEMM.
 
     Args:
+        is_fp4: True for W4FA16 (FP4 weights), False for W4A16 (INT4 weights)
         lhs: Activation tensor in BF16, shape nopad: (m, k), masked: (num_groups, m, k), fused: (num_token, k)
         rhs_: Tuple of (weight, scale)
             - weight: 4-bit weight stored in int32, shape (num_groups, k // 16, n * 2)
-            - scale: Per-channel scale in BF16, shape (num_groups, k // group_size), n)
+            - scale: BF16 numerical scale, or uint8 raw E8M0 exponent bytes
+              (W4FA16 only), shape (num_groups, k // group_size, n)
         out: Output tensor in BF16, shape nopad/fused: (m, n), masked: (num_groups, m, n)
         m_rows: Number of rows per group, shape (num_groups,)
         group_size: Group size for quantization (default 32)
@@ -139,10 +144,20 @@ def m_grouped_gemm_w4a16_common(gemm_type: GemmType, expected_m: int,
     assert n > 0 and k > 0 and n % 64 == 0 and k % 16 == 0
     assert lhs.dtype == torch.bfloat16
     assert rhs.dtype == torch.int32
-    assert rhs_scales.dtype == torch.bfloat16
+    if is_fp4:
+        # W4FA16 supports BF16 numerical scale or uint8 raw E8M0 exponent bytes.
+        assert rhs_scales.dtype in (torch.bfloat16, torch.uint8), \
+            f"W4FA16 scale dtype must be bfloat16 or uint8 (E8M0), got {rhs_scales.dtype}"
+    else:
+        assert rhs_scales.dtype == torch.bfloat16, \
+            f"W4A16 (INT4) scale dtype must be bfloat16, got {rhs_scales.dtype}"
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
     assert rhs_scales.is_contiguous()
+    use_e8m0 = is_fp4 and rhs_scales.dtype == torch.uint8
+    scale_dtype = rhs_scales.dtype
+    element_b = 'cutlass::float4_t' if is_fp4 else 'int4_t'
+    element_scale = 'uint8_t' if use_e8m0 else 'bfloat16_t'
 
     num_sms, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages = configs
     assert warp_n == 64
@@ -157,10 +172,11 @@ def m_grouped_gemm_w4a16_common(gemm_type: GemmType, expected_m: int,
             name='m_grouped_gemm_w4a16',
             keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                 'WARP_M': warp_m, 'WARP_N': warp_n, 'WARP_K': warp_k, 'NUM_GROUPS': num_groups,
-                'NUM_STAGES': num_stages, 'GROUP_SIZE': group_size, 'GEMM_TYPE': gemm_type_name, 'N_EXPAND': n_expand},
+                'NUM_STAGES': num_stages, 'GROUP_SIZE': group_size, 'GEMM_TYPE': gemm_type_name, 'N_EXPAND': n_expand,
+                'ELEMENT_B': element_b, 'ELEMENT_SCALE': element_scale},
             space=(),
             includes=includes,
-            arg_defs=(('lhs', torch.bfloat16), ('rhs', torch.int32), ('rhs_scales', torch.bfloat16), ('out', torch.bfloat16),
+            arg_defs=(('lhs', torch.bfloat16), ('rhs', torch.int32), ('rhs_scales', scale_dtype), ('out', torch.bfloat16),
                     ('m', int), ('expected_m', int), ('stream', torch.cuda.Stream), ('num_sms', int),
                     ('m_rows', torch.int32), ('block_m_info', torch.int32)),
             template=w4a16_nopad_template,
@@ -173,10 +189,11 @@ def m_grouped_gemm_w4a16_common(gemm_type: GemmType, expected_m: int,
             name='m_grouped_gemm_w4a16',
             keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                 'WARP_M': warp_m, 'WARP_N': warp_n, 'WARP_K': warp_k, 'NUM_GROUPS': num_groups,
-                'NUM_STAGES': num_stages, 'GROUP_SIZE': group_size, 'GEMM_TYPE': gemm_type_name, 'N_EXPAND': n_expand},
+                'NUM_STAGES': num_stages, 'GROUP_SIZE': group_size, 'GEMM_TYPE': gemm_type_name, 'N_EXPAND': n_expand,
+                'ELEMENT_B': element_b, 'ELEMENT_SCALE': element_scale},
             space=(),
             includes=includes,
-            arg_defs=(('lhs', torch.bfloat16), ('rhs', torch.int32), ('rhs_scales', torch.bfloat16), ('out', torch.bfloat16),
+            arg_defs=(('lhs', torch.bfloat16), ('rhs', torch.int32), ('rhs_scales', scale_dtype), ('out', torch.bfloat16),
                     ('m', int), ('expected_m', int), ('stream', torch.cuda.Stream), ('num_sms', int),
                     ('m_rows', torch.int32)),
             template=w4a16_masked_template,
@@ -191,10 +208,11 @@ def m_grouped_gemm_w4a16_common(gemm_type: GemmType, expected_m: int,
             name='m_grouped_gemm_w4a16',
             keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                 'WARP_M': warp_m, 'WARP_N': warp_n, 'WARP_K': warp_k, 'NUM_GROUPS': num_groups,
-                'NUM_STAGES': num_stages, 'GROUP_SIZE': group_size, 'GEMM_TYPE': gemm_type_name, 'N_EXPAND': n_expand},
+                'NUM_STAGES': num_stages, 'GROUP_SIZE': group_size, 'GEMM_TYPE': gemm_type_name, 'N_EXPAND': n_expand,
+                'ELEMENT_B': element_b, 'ELEMENT_SCALE': element_scale},
             space=(),
             includes=includes,
-            arg_defs=(('lhs', torch.bfloat16), ('rhs', torch.int32), ('rhs_scales', torch.bfloat16), ('out', torch.bfloat16),
+            arg_defs=(('lhs', torch.bfloat16), ('rhs', torch.int32), ('rhs_scales', scale_dtype), ('out', torch.bfloat16),
                     ('m', int), ('expected_m', int), ('stream', torch.cuda.Stream), ('num_sms', int),
                     ('m_rows', torch.int32),
                     ('expert_ids_and_cumsum', torch.int32), ('sorted_token_ids', torch.int32), ('aligned_num_m_blocks', torch.int32)),
@@ -214,7 +232,8 @@ def m_grouped_gemm_w4a16_fused(lhs: torch.Tensor,
                                 expert_ids_and_cumsum: torch.Tensor,
                                 sorted_token_ids: torch.Tensor,
                                 aligned_num_m_blocks: torch.Tensor,
-                                configs):
+                                configs,
+                                fp4_use_bf16_scale: bool = False):
     num_token = lhs.shape[0]
     num_groups = rhs_[0].shape[0]
     m_sum = out.shape[0]
@@ -225,26 +244,30 @@ def m_grouped_gemm_w4a16_fused(lhs: torch.Tensor,
     n = rhs_[1].shape[2]
     k = lhs.shape[1]
     group_size = lhs.shape[1] // rhs_[1].shape[1]
-    m_grouped_gemm_w4a16_common(GemmType.GroupedFused, expected_m, lhs, rhs_, out, group_size, configs, m_rows, (expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks))
+    is_fp4 = True if fp4_use_bf16_scale else rhs_[1].dtype == torch.uint8
+    m_grouped_gemm_w4a16_common(is_fp4, GemmType.GroupedFused, expected_m, lhs, rhs_, out, group_size, configs, m_rows, (expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks))
 
 
 def m_grouped_gemm_w4a16_masked(lhs: torch.Tensor,
                                 rhs_: Tuple[torch.Tensor, torch.Tensor],
                                 out: torch.Tensor,
-                                masked_m: torch.Tensor, expected_m: int, configs=None):
+                                masked_m: torch.Tensor, expected_m: int, configs=None,
+                                fp4_use_bf16_scale: bool = False):
     num_groups, m_padded, k = lhs.shape
     n = rhs_[1].shape[2]
     group_size = k // rhs_[1].shape[1]
     if configs is None:
         configs = w4a16_get_best_configs(GemmType.GroupedMasked, expected_m, n, k, num_groups, get_num_sms(), group_size)
-    m_grouped_gemm_w4a16_common(GemmType.GroupedMasked, expected_m, lhs, rhs_, out, group_size, configs, masked_m, None)
+    is_fp4 = True if fp4_use_bf16_scale else rhs_[1].dtype == torch.uint8
+    m_grouped_gemm_w4a16_common(is_fp4, GemmType.GroupedMasked, expected_m, lhs, rhs_, out, group_size, configs, masked_m, None)
 
 
 def m_grouped_gemm_w4a16_nopad(lhs: torch.Tensor,
                                 rhs_: Tuple[torch.Tensor, torch.Tensor],
                                 out: torch.Tensor,
                                 m_indices: torch.Tensor, m_rows: torch.Tensor = None,
-                                configs = None):
+                                configs = None,
+                                fp4_use_bf16_scale: bool = False):
     num_groups = rhs_[0].shape[0]
     m = lhs.shape[0]
     group_size = lhs.shape[1] // rhs_[1].shape[1]
@@ -262,4 +285,5 @@ def m_grouped_gemm_w4a16_nopad(lhs: torch.Tensor,
             experts_for_rows[:min_n] = counts[:min_n]
         m_rows = experts_for_rows
     block_m_info = torch.empty((num_groups + ceil_div(m + 1 - num_groups, block_m)) * 4, dtype=torch.int32, device=m_rows.device)
-    m_grouped_gemm_w4a16_common(GemmType.GroupedNoPad, expected_m, lhs, rhs_, out, group_size, configs, m_rows, block_m_info)
+    is_fp4 = True if fp4_use_bf16_scale else rhs_[1].dtype == torch.uint8
+    m_grouped_gemm_w4a16_common(is_fp4, GemmType.GroupedNoPad, expected_m, lhs, rhs_, out, group_size, configs, m_rows, block_m_info)

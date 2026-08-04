@@ -203,15 +203,41 @@ def _get_perms():
     scale_perm = []
     for i in range(8):
         scale_perm.extend([i + 8 * j for j in range(8)])
-    scale_perm_single = []
+    scale_perm_e8m0 = []
+    for i in range(16):  # 64 / 4
+        for sw in (0, 2, 1, 3):
+            scale_perm_e8m0.append(scale_perm[4 * i + sw])
+    scale_perm_chennel = []
     for i in range(4):
-        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
-    return perm, scale_perm, scale_perm_single
+        scale_perm_chennel.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
+    return perm, scale_perm, scale_perm_chennel, scale_perm_e8m0
 
-_perm, _scale_perm, _scale_perm_single = _get_perms()
+_perm, _scale_perm, _scale_perm_chennel, _scale_perm_e8m0 = _get_perms()
 
 
-def quant_w4a16(y, groupsize):
+def quant_w4a16(y, groupsize=32, d='w4a16'):
+    """
+    Weight quantization for W4A16 (INT4), W4FA16 (FP4 with E8M0 scale) or
+    W4FA16_S16 (FP4 with BF16 scale).
+
+    Args:
+        y: weight tensor, shape (e, n, k), dtype=torch.bfloat16
+        groupsize: quantization group size, default 32
+        d: 'w4a16' (default, INT4), 'w4fa16' (FP4 + E8M0 scale) or
+           'w4fa16_s16' (FP4 + BF16 scale)
+
+    Returns:
+        refs: (e, k, n), dequantized reference for verification
+        qs: (e, k // 16, n * 2), int32, packed weights (8 nibbles per int32)
+        scales: (e, k // groupsize, n), per-group scale:
+            bfloat16 numerical scale for 'w4a16'/'w4fa16_s16', or raw E8M0
+            exponent bytes as uint8 for 'w4fa16' (same layout as SGLang's
+            MXFP4 Marlin path)
+    """
+    assert d in ('w4a16', 'w4fa16', 'w4fa16_s16'), \
+        f"d must be 'w4a16'/'w4fa16'/'w4fa16_s16', got {d}"
+    quant_format = 'int4' if d == 'w4a16' else 'fp4'
+    use_e8m0 = (d == 'w4fa16')
     e, n, k = y.shape
     tile = 16
     maxq = 2 ** 4 - 1
@@ -229,12 +255,21 @@ def quant_w4a16(y, groupsize):
         w = w.permute(1, 0, 2)
         w = w.reshape((groupsize, -1))
 
-        s = torch.max(torch.abs(w), 0, keepdim=True)[0]
-        s *= 2 / maxq
-        w = torch.round(w / s).int()
-        w += (maxq + 1) // 2
-        w = torch.clamp(w, 0, maxq)
-        ref = (w - (maxq + 1) // 2) * s
+        if quant_format == 'int4':
+            s = torch.max(torch.abs(w), 0, keepdim=True)[0]
+            s *= 2 / maxq
+            w_q = torch.round(w / s).int()
+            w_q += (maxq + 1) // 2
+            w_q = torch.clamp(w_q, 0, maxq)
+            ref = (w_q - (maxq + 1) // 2) * s
+        else:  # 'fp4'
+            s = torch.max(torch.abs(w), 0, keepdim=True)[0]
+            s = s / 6.0
+            s = s.clamp_min(1e-4)
+            if use_e8m0:
+                s = ceil_to_ue8m0(s)
+            w_q = _quantize_to_fp4_e2m1(w / s)
+            ref = _dequantize_from_fp4_e2m1(w_q) * s
 
         def reshape(t):
             t = t.reshape((groupsize, -1, wn))
@@ -243,11 +278,18 @@ def quant_w4a16(y, groupsize):
             return t
 
         ref = reshape(ref)
-        w = reshape(w)
+        w = reshape(w_q)
         s = s.reshape((-1, wn)).contiguous()
 
-        s = s.reshape((-1, len(_scale_perm)))[:, _scale_perm]
-        s = s.reshape((-1, wn)).contiguous()
+        if use_e8m0:
+            # E8M0 perm includes the extra [0, 2, 1, 3] swap
+            s = s.reshape((-1, len(_scale_perm_e8m0)))[:, _scale_perm_e8m0]
+            s = s.reshape((-1, wn)).contiguous()
+            # ceil_to_ue8m0 keeps the input dtype (bf16), so widen to fp32 before extracting the exponent bits.
+            s = ((s.to(torch.float32).view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+        else:
+            s = s.reshape((-1, len(_scale_perm)))[:, _scale_perm]
+            s = s.reshape((-1, wn)).contiguous()
 
         w = w.reshape((wk // tile, tile, wn // tile, tile))
         w = w.permute((0, 2, 1, 3))
@@ -264,6 +306,8 @@ def quant_w4a16(y, groupsize):
         all_scales.append(s)
 
     refs = torch.stack(all_refs)
+    if quant_format == 'fp4':
+        refs = refs.to(torch.bfloat16)
     qs = torch.stack(all_qs)
     scales = torch.stack(all_scales)
     return refs, qs, scales

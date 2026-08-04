@@ -10,7 +10,7 @@
 #include "cute/atom/copy_traits_ppu0010_aiu.hpp"
 #include "cute/atom/copy_traits_ppu0015_aiu.hpp"
 #include "cute/algorithm/ppu_copy.hpp"
-#include "cutlass/fast_numeric_conversion_for_mix_gemm.h"
+#include "dequant_w4a16.cuh"
 #include "profiling_interface.hpp"
 #include "scheduler_cutlass3.cuh"
 #include "fused_scheduler.cuh"
@@ -22,7 +22,8 @@ using namespace cute;
 
 namespace cutlass::gemm::kernel {
 
-template <int ShapeN, int ShapeK,
+template <typename ElementB, typename ElementScale,
+          int ShapeN, int ShapeK,
           int BlockM, int BlockN, int BlockK,
           int WarpM, int WarpN, int WarpK,
           int kNumGroups, int kNumStages, GemmType kGemmType,
@@ -30,13 +31,12 @@ template <int ShapeN, int ShapeK,
 class W4A16GEMM {
 public:
   using ElementA = cutlass::bfloat16_t;
-  using ElementB = int4_t;
-  using ElementScale = ElementA;
   using ElementD = ElementA;
   using ElementAcc = float;
 
   // basic
   static constexpr bool Fused = (kGemmType == GemmType::GroupedFused);
+  static constexpr bool E8M0_scale = cute::is_same_v<ElementScale, uint8_t>;
   static constexpr int N = ShapeN;
   static constexpr int K = ShapeK;
   static constexpr int L = kNumGroups;
@@ -121,7 +121,9 @@ public:
   using GmemTiledCopyScale = typename DefaultOperandScale::GmemTiledCopy;
   using SmemLayoutScale = decltype(tile_to_shape(SmemLayoutAtomScale{}, make_shape(Int<GroupsPerBlock>{}, Int<BlockN>{}, Int<kNumStages>{})));
   // custom s2r copy scale
-  using SmemCopyAtomScale = Copy_Atom<CopyTraits, ElementScale>;
+  using ScaleCopyOp = cute::conditional_t<E8M0_scale, UniversalCopy<cute::uint64_t>, UniversalCopy<cute::uint128_t>>;
+  using ScaleCopyTraits = Copy_Traits<ScaleCopyOp>;
+  using SmemCopyAtomScale = Copy_Atom<ScaleCopyTraits, ElementScale>;
   using SmemThrLayoutScale = Layout<
     Shape<Int<WarpsOnK>, Shape<_8, Int<WarpsOnN>>>,
     Stride<Int<8 * WarpsOnN>, Stride<_1, _8>>
@@ -296,7 +298,20 @@ public:
     Tensor tCrS_copy_view = make_tensor_like(tCsS(_,_,_,0)); // (8,CPY_K,CPY_N)
     Tensor tCrS = composition(tCrS_copy_view, select<0, 2, 1>(tCrS_copy_view.layout())); // (8,CPY_N,CPY_K)
     static_assert(size<2>(tCrS) == GroupsPerWarp);
-    Tensor tCrS_dequant_view = make_tensor(tCrS.data(), Layout<Shape<_4, _2, _4, Int<GroupsPerWarp>>, Stride<_0, _1, _2, _8>>{});
+    cutlass::bfloat16_t tCrS_bf16_data[8 * GroupsPerWarp];
+    Tensor tCrS_bf16 = make_tensor(static_cast<cutlass::bfloat16_t*>(tCrS_bf16_data), make_shape(_8{}, _1{}, Int<GroupsPerWarp>{})); // (8,CPY_N,CPY_K) bf16
+    auto dequant_scale_e8m0 = [&](int group_idx) {
+      deep_gemm::DequantE8M0<8>::convert(
+          reinterpret_cast<const uint8_t*>(tCrS(_, 0, group_idx).data()),
+          reinterpret_cast<cutlass::bfloat16_t*>(tCrS_bf16(_, 0, group_idx).data()));
+    };
+    Tensor tCrS_dequant_view = [&]() {
+      if constexpr (E8M0_scale) {
+        return make_tensor(tCrS_bf16.data(), Layout<Shape<_4, _2, _4, Int<GroupsPerWarp>>, Stride<_0, _1, _2, _8>>{});
+      } else {
+        return make_tensor(tCrS.data(), Layout<Shape<_4, _2, _4, Int<GroupsPerWarp>>, Stride<_0, _1, _2, _8>>{});
+      }
+    }();
 
     uint32_t m_block_idx, n_block_idx;
     #pragma clang loop licm(disable)
@@ -382,6 +397,7 @@ public:
         copy(smem_tiled_copy_B, tCsB_p(_,0,_), tCrB_copy_view(_,0,_));
         if constexpr(GroupsPerWarp > 1) {
           copy(smem_tiled_copy_scale, tCsS_p(_,0,_), tCrS_copy_view(_,0,_));
+          if constexpr (E8M0_scale) dequant_scale_e8m0(0);
         }
       };
 
@@ -397,19 +413,18 @@ public:
         copy(smem_tiled_copy_B, tCsB_p(_,k_block_next,_), tCrB_copy_view(_,k_block_next,_));
         if ((GroupsPerWarp > 1 && k_block_next % MmaPerGroup == 0) || (GroupsPerWarp == 1 && k_block == 0)) {
           copy(smem_tiled_copy_scale, tCsS_p(_,k_block_next/MmaPerGroup,_), tCrS_copy_view(_,k_block_next/MmaPerGroup,_));
+          if constexpr (E8M0_scale) dequant_scale_e8m0(k_block_next/MmaPerGroup);
         }
       };
 
       auto mix_gemm = [&](int k_block) {
         auto dequant = [&](int n_idx, int k_block) {
           constexpr int InterleavedElems = 8;
-          using Converter = MixGemmNumericArrayConverter<ElementA, ElementB, InterleavedElems>;
-          using SrcArray = cutlass::Array<ElementB, InterleavedElems>;
-          using DstArray = cutlass::Array<ElementA, InterleavedElems>;
+          using Dequant = deep_gemm::DequantW4A16<ElementA, ElementB, InterleavedElems>;
 
-          const SrcArray& src = *reinterpret_cast<const SrcArray*>(tCrB_i32(n_idx,_,k_block).data());
-          DstArray& dst = *reinterpret_cast<DstArray*>(tCrB(_,n_idx,k_block).data());
-          dst = Converter::convert(src);
+          const int* src = tCrB_i32(n_idx,_,k_block).data();
+          cutlass::bfloat16_t* dst = reinterpret_cast<cutlass::bfloat16_t*>(tCrB(_,n_idx,k_block).data());
+          Dequant::convert(src, dst);
           cute::transform(
             tCrB_dequant_view(_,_,n_idx,k_block),
             tCrS_dequant_view(_,_,n_idx,k_block/MmaPerGroup),
@@ -740,7 +755,8 @@ public:
 namespace deep_gemm {
 using cutlass::KernelHardwareInfo;
 
-template <int ShapeN, int ShapeK,
+template <typename ElementB, typename ElementScale,
+          int ShapeN, int ShapeK,
           int BlockM, int BlockN, int BlockK,
           int WarpM, int WarpN, int WarpK,
           int kNumGroups, int kNumStages, GemmType kGemmType,
@@ -753,11 +769,11 @@ class W4A16Gemm {
   static_assert((BlockK >= kGroupSize && BlockK % kGroupSize == 0), "BlockK must be multiple of group_size.");
   static_assert((kGroupSize >= 16 && kGroupSize % 16 == 0), "Group_size must be multiple of 16 (mma_k).");
 
-  using Kernel = cutlass::gemm::kernel::W4A16GEMM<ShapeN, ShapeK, BlockM, BlockN, BlockK, WarpM, WarpN, WarpK, kNumGroups, kNumStages, kGemmType, kGroupSize, N_EXPAND>;
+  using Kernel = cutlass::gemm::kernel::W4A16GEMM<ElementB, ElementScale, ShapeN, ShapeK, BlockM, BlockN, BlockK, WarpM, WarpN, WarpK, kNumGroups, kNumStages, kGemmType, kGroupSize, N_EXPAND>;
 public:
     W4A16Gemm() = default;
 
-    static void run(const cutlass::bfloat16_t *a_ptr, const int *b_ptr, const cutlass::bfloat16_t *scale_b_ptr, cutlass::bfloat16_t *d_ptr,
+    static void run(const cutlass::bfloat16_t *a_ptr, const int *b_ptr, const ElementScale *scale_b_ptr, cutlass::bfloat16_t *d_ptr,
                     int shape_m, int expected_m, hggcStream_t stream, int num_sms,
                     int *m_rows, typename Kernel::Arguments args) {
       int num_threads = Kernel::MaxThreadsPerBlock;
@@ -787,8 +803,12 @@ public:
 
       DgProfParam dg_prof_params;
       if (ProfilingInterface::Instance().get_op_info()) {
+        std::string dtype_name = cute::is_same_v<ElementB, cutlass::int4b_t> ? std::string("w4a16") :
+            (Kernel::E8M0_scale ? std::string("w4fa16") : std::string("w4fa16_s16"));
         dg_prof_params.set_params(
-            kGemmType, false, std::string("w4a16"), kNumGroups, shape_m, ShapeN, ShapeK, expected_m,
+            kGemmType, false,
+            dtype_name,
+            kNumGroups, shape_m, ShapeN, ShapeK, expected_m,
             m_rows, stream
         );
         dg_prof_params.add_params(std::string("quant_type"), std::string("group"));
@@ -800,7 +820,8 @@ public:
         hggcFuncAttributes attr;
         hggcFuncGetAttributes(&attr, cutlass::device_kernel<Kernel>);
 
-        printf("[GemmGrouped-W4A16:]\n");
+        printf("[GemmGrouped-W4A16:] quant_type:%s, scale_type:%s\n",
+            cute::is_same_v<ElementB, cutlass::int4b_t> ? "int4" : "fp4", Kernel::E8M0_scale ? "e8m0" : "bf16");
         printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, NoPadPreprocessLayout: %d, N_EXPAND: %d\n",
             kNumGroups, shape_m, ShapeN, ShapeK, expected_m, GemmTypeS[static_cast<int>(kGemmType)], NoPadPreprocessLayout, N_EXPAND);
 

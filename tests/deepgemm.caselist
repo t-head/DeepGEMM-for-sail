@@ -578,3 +578,6 @@ self_design,[DeepGemm] --format=GroupedFused,data_type:bf16,groups:256,num_token
 kimi,[DeepGemm] --format=GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
 kimi,[DeepGemm] --format=GroupedMasked,data_type:w4a16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
 kimi,[DeepGemm] --format=GroupedFused,data_type:w4a16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_type:group,group_size:32
+kimi,[DeepGemm] --format=GroupedNoPad,data_type:w4fa16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
+kimi,[DeepGemm] --format=GroupedMasked,data_type:w4fa16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
+kimi,[DeepGemm] --format=GroupedFused,data_type:w4fa16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_type:group,group_size:32
