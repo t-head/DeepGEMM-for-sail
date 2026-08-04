@@ -12,7 +12,7 @@
 
 __forceinline__ __device__ uint32_t get_lane_idx() {
     uint32_t lane_id;
-    asm("mov.u32 %0, %laneid;" : "=r"(lane_id));
+    asm("ppu.mov.u32 %0, %laneid;" : "=r"(lane_id));
     return lane_id;
 }
 

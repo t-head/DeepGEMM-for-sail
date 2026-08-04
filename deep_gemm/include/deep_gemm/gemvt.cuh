@@ -69,8 +69,8 @@ uint32_t SmemU32Addr(const void *smemptr) {
     uint32_t u32addr;
     asm (
         "{.reg .u64 u64addr;\n"
-        " cvta.to.shared.u64 u64addr, %1;\n"
-        " cvt.u32.u64 %0, u64addr; }\n"
+        " ppu.cvta.to.shared.u64 u64addr, %1;\n"
+        " ppu.cvt.u32.u64 %0, u64addr; }\n"
         : "=r"(u32addr)
         : "l"(smemptr)
     );
