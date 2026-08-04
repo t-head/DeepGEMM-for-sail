@@ -23,6 +23,8 @@ test_files_cmds = [
     ["python", os.path.join(test_dir, "run_deep_gemm.py"), "--format=GroupedFused,data_type:bf16,groups:256,num_token:64,topk:8,n:256,k:6144"],
     ["python", os.path.join(test_dir, "run_deep_gemm.py"), "--format=GroupedFused,data_type:bf16,groups:256,num_token:256,topk:8,n:6144,k:128"],
     ["python", os.path.join(test_dir, "run_deep_gemm.py"), "--format=GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32"],
+    ["python", os.path.join(test_dir, "run_deep_gemm.py"), "--format=GroupedMasked,data_type:w4a16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32"],
+    ["python", os.path.join(test_dir, "run_deep_gemm.py"), "--format=GroupedFused,data_type:w4a16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_type:group,group_size:32"],
     #["pytest", os.path.join(test_dir, "test_deep_gemm_tuner.py"), "::test_deepgemm_tuning[dense] -v"],
 ]
 temp_xml_files = []
