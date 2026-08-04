@@ -35,7 +35,7 @@ do {                                                                \
 do {                                                                                    \
     if (not (cond)) {                                                                   \
         printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond);  \
-        asm("trap;");                                                                   \
+        asm("ppu.trap;");                                                                   \
     }                                                                                   \
 } while (0)
 #endif
