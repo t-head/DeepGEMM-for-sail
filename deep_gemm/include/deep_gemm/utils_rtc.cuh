@@ -51,7 +51,7 @@ __device__ __forceinline__ int atomic_add_release_global(int* addr, int value) {
 }
 #endif  // __HGGC__
 
-uint32_t next_power_of_two(uint32_t n) {
+__device__ __host__ constexpr uint32_t next_power_of_two(uint32_t n) {
   if (n == 0) return 1;
   n--;
   n |= n >> 1;

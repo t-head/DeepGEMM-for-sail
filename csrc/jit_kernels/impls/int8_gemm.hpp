@@ -17,6 +17,7 @@
 #include "../heuristics/predicated_tile_iterator_params.hpp"
 #include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
 #include "../../../deep_gemm/include/deep_gemm/densegemm_scheduler_cutlass3.cuh"
+#include "../../../deep_gemm/include/deep_gemm/gemm_occ_model.cuh"
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
@@ -128,6 +129,8 @@ public:
     }
 
     static std::string generate_impl(const Args& args) {
+        // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
+        const PpuHwParams& hw = PpuHwParams::instance();
         // IsAlignedN is derived from the runtime problem N and block_n (n % block_n == 0),
         // aligned with DenseBF16GemmCutlass3Runtime::generate_impl. The int8 dense epilogue
         // (DefaultEpilogueNoTsm, ElementD = bfloat16_t) predicates the N boundary on block_n,
@@ -137,24 +140,31 @@ public:
         return fmt::format(R"(
 #define INT8_HGRTC
 #include <int8_densegemm_cutlass3.cuh>
+#include <gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
 
-using ElementAB = {};
+// Injected device hardware constants (host-side hggcDeviceGetAttribute query).
+constexpr int kHwTsmPerCu         = {11};
+constexpr int kHwMaxThreadsPerCta = {12};
+constexpr int kHwMaxWarpsPerCu    = {13};
+constexpr int kHwTotalVregPerCu   = {14};
+
+using ElementAB = {0};
 using ElementAccumulator = cute::conditional_t<
     cute::is_same_v<ElementAB, int8_t>,
     int32_t,
     float
 >;
-constexpr int BLOCK_M = {};
-constexpr int BLOCK_N = {};
-constexpr int BLOCK_K = {};
-constexpr int WARP_M = {};
-constexpr int WARP_N = {};
-constexpr int WARP_K = {};
-constexpr int STAGES = {};
-constexpr bool kDenseS2Opt = {};
+constexpr int BLOCK_M = {1};
+constexpr int BLOCK_N = {2};
+constexpr int BLOCK_K = {3};
+constexpr int WARP_M = {4};
+constexpr int WARP_N = {5};
+constexpr int WARP_K = {6};
+constexpr int STAGES = {7};
+constexpr bool kDenseS2Opt = {8};
 
 using ArchTag = cutlass::arch::PPU0015;
 using ElementA = ElementAB;
@@ -204,7 +214,7 @@ using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
     GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,
     GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity>;
 
-static constexpr bool IsAlignedN = {};
+static constexpr bool IsAlignedN = {9};
 using CollectiveEpilogue = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
     cutlass::detail::TagToStrideA_t<LayoutC>,
     cutlass::detail::TagToStrideA_t<LayoutC>,
@@ -219,9 +229,14 @@ using GemmKernel = cutlass::gemm::kernel::DenseGemmKernel<
     CollectiveEpilogue,
     TileScheduler>;
 
+using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, STAGES,
+                            cute::sizeof_bits_v<ElementA>, cute::sizeof_bits_v<ElementB>,
+                            cute::sizeof_bits_v<ElementCompute>,
+                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu>;
+
 extern "C"
-__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
-__global__ void {}(
+__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
+__global__ void {10}(
   typename GemmKernel::Params params
 ) {{
   extern __shared__ char smem[];
@@ -240,7 +255,8 @@ __global__ void {}(
                        args.launch_info.num_stages,
                        args.launch_info.kDenseS2Opt,
                        is_aligned_n ? "true" : "false",
-                       args.launch_info.kernel_name);
+                       args.launch_info.kernel_name,
+                       hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
@@ -348,22 +364,31 @@ public:
     }
 
     static std::string generate_impl(const Args& args) {
+        // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
+        const PpuHwParams& hw = PpuHwParams::instance();
         return fmt::format(R"(
 #define INT8_HGRTC
 #include <int8_gemm_cutlass3.cuh>
+#include <gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
 
-constexpr int SHAPE_N = {};
-constexpr int SHAPE_K = {};
-constexpr int BLOCK_M = {};
-constexpr int BLOCK_N = {};
-constexpr int BLOCK_K = {};
-constexpr int NUM_GROUPS = {};
-constexpr int WARP_M = {};
-constexpr int WARP_N = {};
-constexpr int STAGES = {};
+// Injected device hardware constants (host-side hggcDeviceGetAttribute query).
+constexpr int kHwTsmPerCu         = {14};
+constexpr int kHwMaxThreadsPerCta = {15};
+constexpr int kHwMaxWarpsPerCu    = {16};
+constexpr int kHwTotalVregPerCu   = {17};
+
+constexpr int SHAPE_N = {0};
+constexpr int SHAPE_K = {1};
+constexpr int BLOCK_M = {2};
+constexpr int BLOCK_N = {3};
+constexpr int BLOCK_K = {4};
+constexpr int NUM_GROUPS = {5};
+constexpr int WARP_M = {6};
+constexpr int WARP_N = {7};
+constexpr int STAGES = {8};
 
 #if __HGGC_ARCH__ == 100
 using ArchTag = cutlass::arch::PPU0010;
@@ -371,7 +396,7 @@ using ArchTag = cutlass::arch::PPU0010;
 using ArchTag = cutlass::arch::PPU0015;
 #endif
 
-using         ElementA    = {};
+using         ElementA    = {9};
 using         LayoutA     = cutlass::layout::RowMajor;
 
 using         ElementB    = ElementA;
@@ -396,8 +421,8 @@ using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>;
 static constexpr int WarpOnM = BLOCK_M / WARP_M;
 static constexpr int WarpOnN = BLOCK_N / WARP_N;
 
-constexpr bool kEnableSboOverlap = {};
-constexpr KernelType kKernelType = KernelType::{};
+constexpr bool kEnableSboOverlap = {10};
+constexpr KernelType kKernelType = KernelType::{11};
 
 using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementA,ElementB,ElementAccumulator>::type;
 using TiledMma = TiledMMA<
@@ -478,7 +503,7 @@ using CollectiveEpilogue = typename cutlass::platform::conditional<
     CollectiveEpilogue_noTsm
 >::type;
 
-static constexpr GemmType kGemmType = GemmType::{};
+static constexpr GemmType kGemmType = GemmType::{12};
 
 using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS>;
 using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
@@ -488,9 +513,14 @@ using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
     TileScheduler,
     kEnableSboOverlap>;
 
+using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, STAGES,
+                            cute::sizeof_bits_v<ElementA>, cute::sizeof_bits_v<ElementB>,
+                            cute::sizeof_bits_v<ElementCompute>,
+                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu>;
+
 extern "C"
-__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
-__global__ void {}(
+__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
+__global__ void {13}(
   typename GemmKernel::Params params
 ) {{
   extern __shared__ char smem[];
@@ -504,7 +534,8 @@ __global__ void {}(
                            args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
                            args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages,
                            args.type_info, args.launch_info.kEnableSboOverlap, args.launch_info.kKernelType,
-                           args.launch_info.gemm_type, args.launch_info.kernel_name);
+                           args.launch_info.gemm_type, args.launch_info.kernel_name,
+                           hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {

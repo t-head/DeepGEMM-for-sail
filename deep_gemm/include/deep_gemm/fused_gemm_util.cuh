@@ -1,5 +1,6 @@
 #pragma once
 #include <cub/cub.cuh>
+#include "utils_rtc.cuh"
 
 #include "cute/ppu_tensor_mix.hpp"
 #include "cutlass/gemm/config/gemm_operands.hpp"
@@ -347,17 +348,6 @@ __forceinline__ __device__ void epilogue_with_tsm(TAcc& accum, TCcC& tCcC, TCC& 
     }
   }
 };
-
-template <int N>
-constexpr int next_pow2() {
-    int v = N - 1;
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    return v + 1;
-}
 
 // =============================================================================
 // Single-kernel WarpOrdered deterministic moe_align (replaces 4-kernel for numel <= 16384)
@@ -766,7 +756,7 @@ cumsum_expert_ids(
 // Thread<->expert 1:1 binding.  SMEM tile cooperative load + scan.
 // ZERO atomicAdd in scatter phase -- fully deterministic.
 //
-// Grid: num_blocks blocks.  BLOCK_SIZE = next_pow2(kNumGroups).
+// Grid: num_blocks blocks.  BLOCK_SIZE = next_power_of_two(kNumGroups).
 // Output: sorted_token_ids (filled with token_idx = idx / topk).
 // ----------------------------------------------------------------------------
 template <int BLOCK_SIZE, int BLOCK_M, int kTopK>
@@ -878,8 +868,8 @@ void moe_align_block_size_kernel_launcher(
 
     // -- 4-kernel fallback --
     // -- Runtime parameters --
-    constexpr int BLOCK_SIZE = next_pow2<kNumGroups>();      // K1, K4
-    constexpr int K3_BLOCK  = next_pow2<kNumGroups + 1>();  // K3 only
+    constexpr int BLOCK_SIZE = next_power_of_two(kNumGroups);      // K1, K4
+    constexpr int K3_BLOCK  = next_power_of_two(kNumGroups + 1);  // K3 only
     constexpr int K2_BLOCK  = 256;                          // K2 scan
 
     int num_blocks_pad = cute::ceil_div(s_total_ub, BLOCK_SIZE);

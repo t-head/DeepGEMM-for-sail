@@ -15,6 +15,7 @@
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_fp8.hpp"
 #include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
+#include "../../../deep_gemm/include/deep_gemm/gemm_occ_model.cuh"
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
@@ -231,27 +232,36 @@ public:
     }
 
     static std::string generate_impl(const Args& args) {
+        // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
+        const PpuHwParams& hw = PpuHwParams::instance();
         return fmt::format(
             R"(
 #define FP8_HGRTC
 #include <fp8_gemm.cuh>
+#include <gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
 
-constexpr int SHAPE_N = {};
-constexpr int SHAPE_K = {};
-constexpr int BLOCK_M = {};
-constexpr int BLOCK_N = {};
-constexpr int BLOCK_K = {};
-constexpr int NUM_GROUPS = {};
-constexpr int WARP_M = {};
-constexpr int WARP_N = {};
-constexpr int STAGES = {};
+// Injected device hardware constants (host-side hggcDeviceGetAttribute query).
+constexpr int kHwTsmPerCu         = {13};
+constexpr int kHwMaxThreadsPerCta = {14};
+constexpr int kHwMaxWarpsPerCu    = {15};
+constexpr int kHwTotalVregPerCu   = {16};
 
-static constexpr GemmType kGemmType = GemmType::{};
-static constexpr KernelType kKernelType = KernelType::{}; //Default;
-static constexpr bool kEnableSboOverlap = {};
+constexpr int SHAPE_N = {0};
+constexpr int SHAPE_K = {1};
+constexpr int BLOCK_M = {2};
+constexpr int BLOCK_N = {3};
+constexpr int BLOCK_K = {4};
+constexpr int NUM_GROUPS = {5};
+constexpr int WARP_M = {6};
+constexpr int WARP_N = {7};
+constexpr int STAGES = {8};
+
+static constexpr GemmType kGemmType = GemmType::{9};
+static constexpr KernelType kKernelType = KernelType::{10}; //Default;
+static constexpr bool kEnableSboOverlap = {11};
 
 using ScaleGranularityShape = cute::Shape<cute::_1,cute::_128,cute::_128>;
 using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(ScaleGranularityShape{{}}));
@@ -346,9 +356,14 @@ using GemmKernel = DeepGemmUniversal<
   kUseNStageKernel
 >;
 
+using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, STAGES,
+                            cute::sizeof_bits_v<ElementA>, cute::sizeof_bits_v<ElementB>,
+                            cute::sizeof_bits_v<ElementCompute>,
+                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu>;
+
 extern "C"
-__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
-__global__ void {}(
+__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
+__global__ void {12}(
   typename GemmKernel::Params params
 ) {{
   extern __shared__ char smem[];
@@ -360,7 +375,8 @@ __global__ void {}(
             cute::get<1>(args.kernel_params.problem_shape), cute::get<2>(args.kernel_params.problem_shape),
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
-            args.launch_info.kKernelType, args.launch_info.kEnableSboOverlap, args.launch_info.kernel_name);
+            args.launch_info.kKernelType, args.launch_info.kEnableSboOverlap, args.launch_info.kernel_name,
+            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

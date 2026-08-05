@@ -17,6 +17,7 @@
 // #include "../heuristics/gemm_search_space.hpp"
 #include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
 #include "../../../deep_gemm/include/deep_gemm/densegemm_scheduler_cutlass3.cuh"
+#include "../../../deep_gemm/include/deep_gemm/gemm_occ_model.cuh"
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 
@@ -119,27 +120,36 @@ public:
     }
 
     static std::string generate_impl(const Args& args) {
+        // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
+        const PpuHwParams& hw = PpuHwParams::instance();
         return fmt::format(
             R"(
 #define BF16_HGRTC
 #include <bf16_gemm_cutlass3.cuh>
+#include <gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
 
-constexpr int SHAPE_N = {};
-constexpr int SHAPE_K = {};
-constexpr int BLOCK_M = {};
-constexpr int BLOCK_N = {};
-constexpr int BLOCK_K = {};
-constexpr int NUM_GROUPS = {};
-constexpr int WARP_M = {};
-constexpr int WARP_N = {};
-constexpr int STAGES = {};
+// Injected device hardware constants (host-side hggcDeviceGetAttribute query).
+constexpr int kHwTsmPerCu         = {13};
+constexpr int kHwMaxThreadsPerCta = {14};
+constexpr int kHwMaxWarpsPerCu    = {15};
+constexpr int kHwTotalVregPerCu   = {16};
 
-static constexpr GemmType kGemmType = GemmType::{};
-static constexpr KernelType kKernelType = KernelType::{}; //Default;
-static constexpr bool kEnableSboOverlap = {};// false;
+constexpr int SHAPE_N = {0};
+constexpr int SHAPE_K = {1};
+constexpr int BLOCK_M = {2};
+constexpr int BLOCK_N = {3};
+constexpr int BLOCK_K = {4};
+constexpr int NUM_GROUPS = {5};
+constexpr int WARP_M = {6};
+constexpr int WARP_N = {7};
+constexpr int STAGES = {8};
+
+static constexpr GemmType kGemmType = GemmType::{9};
+static constexpr KernelType kKernelType = KernelType::{10}; //Default;
+static constexpr bool kEnableSboOverlap = {11};// false;
 
 using ElementA    = cutlass::bfloat16_t;
 using ElementB    = cutlass::bfloat16_t;
@@ -257,9 +267,16 @@ using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
     TileScheduler,
     kEnableSboOverlap>;
 
+// Derive MinBlocksPerMultiprocessor from GemmOccModel with device hardware
+// constants injected by the host-side query (see kHw* above).
+using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, STAGES,
+                            cute::sizeof_bits_v<ElementA>, cute::sizeof_bits_v<ElementB>,
+                            cute::sizeof_bits_v<ElementCompute>,
+                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu>;
+
 extern "C"
-__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
-__global__ void {}(
+__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
+__global__ void {12}(
   typename GemmKernel::Params params
 ) {{
   extern __shared__ char smem[];
@@ -271,7 +288,8 @@ __global__ void {}(
             cute::get<1>(args.kernel_params.problem_shape), cute::get<2>(args.kernel_params.problem_shape),
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
-            args.launch_info.kKernelType, args.launch_info.kEnableSboOverlap, args.launch_info.kernel_name);
+            args.launch_info.kKernelType, args.launch_info.kEnableSboOverlap, args.launch_info.kernel_name,
+            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -384,6 +402,8 @@ public:
     }
 
     static std::string generate_impl(const Args& args) {
+        // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
+        const PpuHwParams& hw = PpuHwParams::instance();
         // Byte-identical to the original BF16DenseGemmHelper::generate_code output:
         // IsAlignedN is derived from the runtime problem N and block_n (n % block_n == 0).
         const int shape_n = cute::get<1>(args.kernel_params.problem_shape);
@@ -392,9 +412,16 @@ public:
             R"(
 #define BF16_HGRTC
 #include <bf16_densegemm_cutlass3.cuh>
+#include <gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
+
+// Injected device hardware constants (host-side hggcDeviceGetAttribute query).
+constexpr int kHwTsmPerCu         = {11};
+constexpr int kHwMaxThreadsPerCta = {12};
+constexpr int kHwMaxWarpsPerCu    = {13};
+constexpr int kHwTotalVregPerCu   = {14};
 
 constexpr int BLOCK_M = {0};
 constexpr int BLOCK_N = {1};
@@ -474,8 +501,13 @@ using GemmKernel = cutlass::gemm::kernel::BF16DenseGemmKernel<
     CollectiveEpilogue,
     TileScheduler>;
 
+using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumStages,
+                            cute::sizeof_bits_v<ElementAB>, cute::sizeof_bits_v<ElementAB>,
+                            cute::sizeof_bits_v<ElementCompute>,
+                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu>;
+
 extern "C"
-__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
+__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
 __global__ void {9}(
   typename GemmKernel::Params params
 ) {{
@@ -491,7 +523,8 @@ __global__ void {9}(
             args.launch_info.kDenseS2Opt ? "true" : "false",
             is_aligned_n ? "true" : "false",
             args.launch_info.kernel_name,
-            args.launch_info.overlap_prologue ? "true" : "false");
+            args.launch_info.overlap_prologue ? "true" : "false",
+            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
