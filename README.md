@@ -93,13 +93,15 @@ Use `m_grouped_gemm_fp8_fp8_bf16_nt_masked` for this purpose and consult the rel
 
 #### Fused MoE (with implicit permute)
 
-Unlike the standalone grouped GEMM layouts above (which expect tokens to already be routed and grouped per expert), the fused MoE path takes raw MoE routing results (`topk_ids`) and fuses the token permutation, per-expert block alignment, and grouped GEMM into a single flow. The "with implicitt ermute" naming distinguishes it from a plain grouped MoE GEMM: the permutation from token order to expert-grouped order is computed and applied inside these kernels, so no separate gather/scatter step is required.
+Unlike the standalone grouped GEMM layouts above (which expect tokens to already be routed and grouped per expert), the fused MoE path takes raw MoE routing results (`topk_ids`) and fuses the token permutation, per-expert block alignment, and grouped GEMM into a single flow. The "with implicit permute" naming distinguishes it from a plain grouped MoE GEMM: the permutation from token order to expert-grouped order is computed and applied inside these kernels, so no separate gather/scatter step is required.
 
-First call `deep_gemm.moe_align_block_size` with the input tokens and `topk_ids` to compute the block-aligned scheduling metadata (`m_rows`, `expert_ids_and_cumsum`, `sorted_token_ids`, `aligned_num_m_blocks`) together with the inverse permutation (`inv_perm`) and the auto-selected GEMM config. Then feed this metadata into one of the fused grouped GEMM kernels according to the input precision:
+First call `deep_gemm.moe_align_block_size` with the LHS/RHS inputs and `topk_ids` to compute the block-aligned scheduling metadata (`m_rows`, `expert_ids_and_cumsum`, `sorted_token_ids`, `aligned_num_m_blocks`) together with the inverse permutation (`inv_perm`), the per-token expert indices (`m_indices`), and the auto-selected GEMM config. Then feed this metadata into one of the fused grouped GEMM kernels according to the input precision:
 
 - `deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused`: fused MoE grouped GEMM with BF16 LHS/RHS and BF16 output.
 - `deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused`: fused MoE grouped GEMM with FP8 LHS/RHS (with scales) and BF16 output; supports both per-channel and blockwise quantization.
 - `deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_fused`: fused MoE grouped GEMM with INT8 LHS/RHS (with per-channel scales) and BF16 output.
+- `deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused`: fused MoE grouped GEMM with FP4 (mxfp4) LHS/RHS (with scales) and BF16 output.
+- `deep_gemm.m_grouped_gemm_w4a16_fused`: fused MoE grouped GEMM with 4-bit group-quantized weights and BF16 activation (W4A16), producing BF16 output.
 
 For more information, please refer to the `moe_align_block_size` and `m_grouped_gemm_*_nt_fused` function documentation.
 
@@ -117,6 +119,17 @@ For more information, please refer to the corresponding `*_mqa_logits` and `*_pa
 We provide a HyperConnection (HC) prenorm GEMM that fuses the prenorm square-sum reduction into a TF32 GEMM. Call `deep_gemm.tf32_hc_prenorm_gemm` with a BF16 input `a`, a TF32 weight `b`, and it produces the TF32 output `d` together with the per-row square sum `sqr_sum` used by the subsequent normalization. The K-split configuration is selected automatically based on the K dimension.
 
 For more information, please refer to the `tf32_hc_prenorm_gemm` function documentation.
+
+#### Einsum (batched GEMM with fused permute)
+
+We provide einsum-style batched GEMM interfaces that fuse a `(1,0,2)` permute on the LHS into the GEMM flow, currently supporting the `bhr,hdr->bhd` expression:
+
+- `deep_gemm.fp8_einsum`: FP8 LHS/RHS with FP32 scales (per-channel or blockwise) and BF16 output.
+- `deep_gemm.int8_einsum`: INT8 LHS/RHS with FP32 per-channel scales and BF16 output.
+
+Both take `(tensor, scales)` tuples as `a`/`b`, write to the BF16 output `d`, and optionally accumulate onto `c`.
+
+For more information, please refer to the `fp8_einsum` and `int8_einsum` function documentation.
 
 #### Utilities
 
