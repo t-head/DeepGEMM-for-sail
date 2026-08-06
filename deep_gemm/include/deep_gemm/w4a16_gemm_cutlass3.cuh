@@ -17,6 +17,7 @@
 #include "fused_gemm_util.cuh"
 #include "utils.cuh"
 #include "utils_cutlass3.h"
+#include "w4fa16_gemm.cuh"
 
 using namespace cute;
 
@@ -762,18 +763,17 @@ template <typename ElementB, typename ElementScale,
           int kNumGroups, int kNumStages, GemmType kGemmType,
           int kGroupSize = 32, int N_EXPAND = 1>
 class W4A16Gemm {
-  static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
-  static_assert((BlockN == 16) || (BlockN == 32) || (BlockN == 64) || (BlockN == 128) || (BlockN == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
-  static_assert((WarpM % 16 == 0), "WarpM must be divideable by 16.");
-  static_assert((WarpN == 64), "WarpN must be 64.");
-  static_assert((BlockK >= kGroupSize && BlockK % kGroupSize == 0), "BlockK must be multiple of group_size.");
-  static_assert((kGroupSize >= 16 && kGroupSize % 16 == 0), "Group_size must be multiple of 16 (mma_k).");
-
-  using Kernel = cutlass::gemm::kernel::W4A16GEMM<ElementB, ElementScale, ShapeN, ShapeK, BlockM, BlockN, BlockK, WarpM, WarpN, WarpK, kNumGroups, kNumStages, kGemmType, kGroupSize, N_EXPAND>;
+  static constexpr bool UseMmaKernel = cute::is_same_v<ElementB, uint8_t>;
+  static_assert(!UseMmaKernel || cute::is_same_v<ElementScale, uint8_t>, "W4A16GEMM_MMA requires uint8_t E8M0 scales");
+  using Kernel = cute::conditional_t<
+      UseMmaKernel,
+      cutlass::gemm::kernel::W4A16GEMM_MMA<ShapeN, ShapeK, BlockM, BlockN, BlockK, WarpM, WarpN, WarpK, kNumGroups, kNumStages, kGemmType, N_EXPAND>,
+      cutlass::gemm::kernel::W4A16GEMM<ElementB, ElementScale, ShapeN, ShapeK, BlockM, BlockN, BlockK, WarpM, WarpN, WarpK, kNumGroups, kNumStages, kGemmType, kGroupSize, N_EXPAND>>;
+  using ElementBPacked = cute::conditional_t<UseMmaKernel, const uint8_t*, const int*>;
 public:
     W4A16Gemm() = default;
 
-    static void run(const cutlass::bfloat16_t *a_ptr, const int *b_ptr, const ElementScale *scale_b_ptr, cutlass::bfloat16_t *d_ptr,
+    static void run(const cutlass::bfloat16_t *a_ptr, ElementBPacked b_ptr, const ElementScale *scale_b_ptr, cutlass::bfloat16_t *d_ptr,
                     int shape_m, int expected_m, hggcStream_t stream, int num_sms,
                     int *m_rows, typename Kernel::Arguments args) {
       int num_threads = Kernel::MaxThreadsPerBlock;
@@ -803,8 +803,9 @@ public:
 
       DgProfParam dg_prof_params;
       if (ProfilingInterface::Instance().get_op_info()) {
-        std::string dtype_name = cute::is_same_v<ElementB, cutlass::int4b_t> ? std::string("w4a16") :
-            (Kernel::E8M0_scale ? std::string("w4fa16") : std::string("w4fa16_s16"));
+        std::string dtype_name = UseMmaKernel ? std::string("w4fa16_mma") :
+            (cute::is_same_v<ElementB, cutlass::int4b_t> ? std::string("w4a16") :
+            (Kernel::E8M0_scale ? std::string("w4fa16") : std::string("w4fa16_s16")));
         dg_prof_params.set_params(
             kGemmType, false,
             dtype_name,

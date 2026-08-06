@@ -6,7 +6,7 @@ from .gemm import get_best_configs as bf16_get_best_configs
 from .gemm_int8 import get_best_configs as perchannel_get_best_configs
 from .gemm_fp8 import get_best_configs as fp8_blkwise_get_best_configs
 from .gemm_fp4 import get_best_configs as fp4_get_best_configs
-from .m_grouped_gemm_w4a16 import w4a16_get_best_configs
+from .m_grouped_gemm_w4a16 import W4A16Type, w4a16_get_best_configs
 from .utils import get_num_sms, ceil_div, GemmType, get_col_major_tma_aligned_tensor
 import os
 
@@ -172,9 +172,18 @@ def moe_align_block_size(
     assert topk_ids.dtype == torch.int32
 
     num_token, k = lhs.shape
-    num_groups, n, k_ = rhs.shape
     dtype = lhs.dtype
-    is_w4a16 = rhs.dtype == torch.int32
+    if rhs.dtype == torch.int32:
+        num_groups, packed_k, packed_n = rhs.shape
+        n, k_ = packed_n // 2, packed_k * 16
+        w4a16_type = W4A16Type.int4
+    elif dtype == torch.bfloat16 and rhs.dtype == torch.uint8:
+        num_groups, n, packed_k = rhs.shape
+        k_ = packed_k * 2
+        w4a16_type = W4A16Type.mxfp4_e8m0_mma
+    else:
+        num_groups, n, k_ = rhs.shape
+        w4a16_type = None
     numel = topk_ids.numel()
     topk = topk_ids.shape[1]
 
@@ -182,8 +191,8 @@ def moe_align_block_size(
     if config is None:
         expected_m = ceil_div(numel, num_groups)
         num_sms = get_num_sms()
-        if is_w4a16:
-            config = w4a16_get_best_configs(GemmType.GroupedFused, expected_m, n, k, num_groups, num_sms)
+        if w4a16_type is not None:
+            config = w4a16_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused, w4a16_type)
         elif dtype == torch.bfloat16:
             config = bf16_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
         elif perchannel_quant:
@@ -253,7 +262,7 @@ def moe_align_block_size(
         args=args
     )
     runtime(*args)
-    return_config = config if is_w4a16 else config[:7]
+    return_config = config if w4a16_type is not None else config[:7]
     # Drop smem_config (last item): only the first 7 tuning params are needed for non-W4A16 fused kernels
     return return_config, m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, inv_perm, m_indices
 

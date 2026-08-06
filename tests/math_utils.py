@@ -210,40 +210,83 @@ def _get_perms():
     scale_perm_chennel = []
     for i in range(4):
         scale_perm_chennel.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
-    return perm, scale_perm, scale_perm_chennel, scale_perm_e8m0
+    scale_perm_fp4_mma = []
+    for i in range(8):
+        for j in range(8):
+            scale_perm_fp4_mma.extend([2 * i + j * 16, 2 * i + j * 16 + 1])
+    print(scale_perm_fp4_mma)
+    return perm, scale_perm, scale_perm_chennel, scale_perm_e8m0, scale_perm_fp4_mma
 
-_perm, _scale_perm, _scale_perm_chennel, _scale_perm_e8m0 = _get_perms()
+_perm, _scale_perm, _scale_perm_chennel, _scale_perm_e8m0, _scale_perm_fp4_mma = _get_perms()
 
 
 def quant_w4a16(y, groupsize=32, d='w4a16'):
     """
-    Weight quantization for W4A16 (INT4), W4FA16 (FP4 with E8M0 scale) or
-    W4FA16_S16 (FP4 with BF16 scale).
+    Weight quantization for W4A16 (INT4), W4FA16 (FP4 with E8M0 scale),
+    W4FA16_S16 (FP4 with BF16 scale), or W4FA16_MMA (unpermuted FP4 with
+    E8M0 scale for the FP4-MMA dequant path).
 
     Args:
         y: weight tensor, shape (e, n, k), dtype=torch.bfloat16
         groupsize: quantization group size, default 32
-        d: 'w4a16' (default, INT4), 'w4fa16' (FP4 + E8M0 scale) or
-           'w4fa16_s16' (FP4 + BF16 scale)
+        d: 'w4a16' (default, INT4), 'w4fa16' (FP4 + E8M0 scale),
+           'w4fa16_s16' (FP4 + BF16 scale), or 'w4fa16_mma' (FP4 + E8M0
+           scale without weight permutation).
 
     Returns:
         refs: (e, k, n), dequantized reference for verification
-        qs: (e, k // 16, n * 2), int32, packed weights (8 nibbles per int32)
-        scales: (e, k // groupsize, n), per-group scale:
-            bfloat16 numerical scale for 'w4a16'/'w4fa16_s16', or raw E8M0
-            exponent bytes as uint8 for 'w4fa16' (same layout as SGLang's
-            MXFP4 Marlin path)
+        For d != 'w4fa16_mma':
+            qs: (e, k // 16, n * 2), int32, packed and permuted weights
+            scales: (e, k // groupsize, n), per-group scale
+        For d == 'w4fa16_mma':
+            qs: (e, n, k // 2), uint8, unpermuted packed FP4 weights;
+                even K is in the low nibble and odd K is in the high nibble
+            scales: (e, n // 64, k // 64, 128), uint8 E8M0 exponents;
+                the last dimension is [n_inner=0..63, k_group_inner=0..1]
     """
-    assert d in ('w4a16', 'w4fa16', 'w4fa16_s16'), \
-        f"d must be 'w4a16'/'w4fa16'/'w4fa16_s16', got {d}"
+    assert d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'), \
+        f"d must be 'w4a16'/'w4fa16'/'w4fa16_s16'/'w4fa16_mma', got {d}"
     quant_format = 'int4' if d == 'w4a16' else 'fp4'
-    use_e8m0 = (d == 'w4fa16')
+    use_e8m0 = d in ('w4fa16', 'w4fa16_mma')
     e, n, k = y.shape
     tile = 16
     maxq = 2 ** 4 - 1
     assert k % groupsize == 0
     assert k % tile == 0 and n % tile == 0
     assert y.dtype in [torch.half, torch.bfloat16]
+
+    if d == 'w4fa16_mma':
+        assert groupsize == 32, 'w4fa16_mma requires groupsize=32'
+        assert n % 64 == 0 and k % 64 == 0, \
+            'w4fa16_mma requires n and k to be multiples of 64'
+
+        # Keep the logical [N, K] order. Reuse the generic per-token FP4
+        # quantizer with group size 32, and do not apply MMA/Marlin
+        # permutation. per_token_cast_to_fp4 packs even K into the low nibble
+        # and odd K into the high nibble.
+        refs = torch.empty((e, n, k), dtype=torch.bfloat16, device=y.device)
+        qs = torch.empty((e, n, k // 2), dtype=torch.uint8, device=y.device)
+        scales_out = torch.empty((e, n // 64, k * 2), dtype=torch.uint8, device=y.device)
+
+        for i in range(e):
+            packed, scales = per_token_cast_to_fp4(
+                y[i],
+                use_ue8m0=True,
+                gran_k=groupsize,
+                use_packed_ue8m0=False,
+            )
+            refs[i].copy_(cast_back_from_fp4(packed, scales, gran_k=groupsize).to(torch.bfloat16))
+            qs[i].copy_(packed.view(torch.uint8))
+
+            # Convert numerical powers of two into raw E8M0 exponent bytes.
+            scales = scales.reshape(n, k // groupsize)
+            scales = ((scales.to(torch.float32).view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+            # [N,K/32] -> [N/64,64,K/64,2] -> [N/64,K/64,64,2] -> perm -> [N/64,K*2]
+            scales = scales.reshape(n // 64, 64, k // 64, 2).permute(0, 2, 1, 3).reshape(n // 64, k * 2)
+            scales = scales.reshape((-1, len(_scale_perm_fp4_mma)))[:, _scale_perm_fp4_mma].reshape(scales.shape).contiguous()
+            scales_out[i].copy_(scales)
+
+        return refs, qs, scales_out
 
     all_refs, all_qs, all_scales = [], [], []
 
