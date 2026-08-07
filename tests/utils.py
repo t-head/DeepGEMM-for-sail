@@ -679,7 +679,7 @@ def read_detail_from_nculog(filename):
 
 
 # devices = {
-#     "name": ["cycle", "tensor core efficiency", "waves"],
+#     "name": ["cycle", "tensor cell efficiency", "waves"],
 #      hopper tc: sm__pipe_tensor_type_hmma_hgmma_qgmma_imma_igmma_bmma_bgmma_cycles_active.avg.pct_of_peak_sustained_elapsed
 #     "gpu":  ["gpu__time_duration.sum", "sm__cycles_elapsed.max", "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active", "launch__waves_per_multiprocessor"],
 #     "ppu":  ["ppu__time_duration.sum","ce__cycles_elapsed.max", "cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed", "launch__waves_per_cu"],
