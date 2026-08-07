@@ -7,6 +7,9 @@
 // Fused permute(1,0,2) for a paired (A, SFA) tensor set.
 // Optimization: cp.async (async prefetch to SMEM) + cache-global stores (ppu.st.global.cg).
 // Single-buffered: load full tile, then store full tile.
+// Supports non-contiguous inputs via byte strides (stride0, stride1) for both a and sfa.
+// Requires a.stride(-1) == 1 (d2 direction contiguous for 16B vector loads).
+// SFA d2 direction can be non-contiguous (scalar fallback).
 // Supports non-16-byte-aligned dim2 via vectorized path + scalar tail.
 
 namespace deep_gemm {
@@ -27,30 +30,34 @@ __device__ __forceinline__ void st_global_cg_4(void* dst, int val) {
     asm volatile("ppu.st.global.cg.b32 [%0], %1;\n" :: "l"(dst), "r"(val));
 }
 
-__device__ __forceinline__ long long a_src_offset(int d0, int d1, int dim1, int dim2_a, int d2_vec, int vec_size) {
-    return ((long long)d0 * dim1 + d1) * dim2_a + d2_vec * vec_size;
+__device__ __forceinline__ long long a_src_offset(int d0, int d1,
+                                                 long long stride0_a_bytes, long long stride1_a_bytes,
+                                                 int d2_vec, int vec_size) {
+    return (long long)d0 * stride0_a_bytes + (long long)d1 * stride1_a_bytes + d2_vec * vec_size;
 }
 
 __device__ __forceinline__ long long a_dst_offset(int d1, int d0, int dim0, int dim2_a, int d2_vec, int vec_size) {
     return (long long)d1 * dim0 * dim2_a + (long long)d0 * dim2_a + d2_vec * vec_size;
 }
 
-__device__ __forceinline__ long long sfa_src_offset(int d0, int d1, int dim1, int dim2_sfa_bytes, int byte_offset) {
-    return ((long long)d0 * dim1 + d1) * dim2_sfa_bytes + byte_offset;
+__device__ __forceinline__ long long sfa_src_offset(int d0, int d1, int d2, long long stride0_sfa_bytes, long long stride1_sfa_bytes, long long stride2_sfa_bytes) {
+    return (long long)d0 * stride0_sfa_bytes + (long long)d1 * stride1_sfa_bytes + (long long)d2 * stride2_sfa_bytes;
 }
 
 __device__ __forceinline__ long long sfa_dst_offset(int d1, int d0, int dim0, int dim2_sfa_bytes, int byte_offset) {
     return (long long)d1 * dim0 * dim2_sfa_bytes + (long long)d0 * dim2_sfa_bytes + byte_offset;
 }
 
-template <int VEC_SIZE, int THREADS_PER_BLOCK, int ROWS_PER_ITER, int DIM1, int NUM_D2_VECS_A, int TAIL_BYTES_A, int DIM2_SFA_BYTES, int D1_TILE, bool USE_FAST_PATH>
+template <int VEC_SIZE, int THREADS_PER_BLOCK, int ROWS_PER_ITER, int DIM1, int NUM_D2_VECS_A, int TAIL_BYTES_A, int DIM2_SFA_BYTES, int D1_TILE, bool USE_FAST_PATH, bool SFA_D2_CONTIGUOUS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK)
 fused_permute_kernel(
     const char* __restrict__ src_a,
     char* __restrict__       dst_a,
     const char* __restrict__ src_sfa,
     char* __restrict__       dst_sfa,
-    int dim0, int dim2_a)
+    int dim0, int dim2_a,
+    long long stride0_a_bytes, long long stride1_a_bytes,
+    long long stride0_sfa_bytes, long long stride1_sfa_bytes, long long stride2_sfa_bytes)
 {
     const int d0_base = blockIdx.y * ROWS_PER_ITER;
 
@@ -67,7 +74,7 @@ fused_permute_kernel(
             for (int d0_offset = 0; d0_offset < ROWS_PER_ITER; ++d0_offset) {
                 int d0 = d0_base + d0_offset;
                 if (d0 < dim0) {
-                    long long src_off = a_src_offset(d0, d1, DIM1, dim2_a, d2_vec, VEC_SIZE);
+                    long long src_off = a_src_offset(d0, d1, stride0_a_bytes, stride1_a_bytes, d2_vec, VEC_SIZE);
                     long long dst_off = a_dst_offset(d1, d0, dim0, dim2_a, d2_vec, VEC_SIZE);
                     permute_vec_t val;
                     __builtin_memcpy(&val, src_a + src_off, VEC_SIZE);
@@ -84,7 +91,7 @@ fused_permute_kernel(
                 for (int d0_offset = 0; d0_offset < ROWS_PER_ITER; ++d0_offset) {
                     int d0 = d0_base + d0_offset;
                     if (d0 < dim0) {
-                        long long src_off = ((long long)d0 * DIM1 + d1) * dim2_a + tail_byte_offset;
+                        long long src_off = a_src_offset(d0, d1, stride0_a_bytes, stride1_a_bytes, 0, 1) + tail_byte_offset;
                         long long dst_off = (long long)d1 * dim0 * dim2_a + (long long)d0 * dim2_a + tail_byte_offset;
                         char val = src_a[src_off];
                         dst_a[dst_off] = val;
@@ -115,7 +122,7 @@ fused_permute_kernel(
                 int d0 = d0_base + d0_offset;
                 if (d0 < dim0) {
                     int d1 = d1_start + d1_local;
-                    long long src_off = a_src_offset(d0, d1, DIM1, dim2_a, d2_vec, VEC_SIZE);
+                    long long src_off = a_src_offset(d0, d1, stride0_a_bytes, stride1_a_bytes, d2_vec, VEC_SIZE);
                     cp_async_cg_16(smem + vec_idx * VEC_SIZE, src_a + src_off);
                 }
             }
@@ -156,7 +163,7 @@ fused_permute_kernel(
                     for (int d0_offset = 0; d0_offset < ROWS_PER_ITER; ++d0_offset) {
                         int d0 = d0_base + d0_offset;
                         if (d0 < dim0) {
-                            long long src_off = ((long long)d0 * DIM1 + d1) * dim2_a + tail_byte_offset;
+                            long long src_off = a_src_offset(d0, d1, stride0_a_bytes, stride1_a_bytes, 0, 1) + tail_byte_offset;
                             long long dst_off = (long long)d1 * dim0 * dim2_a + (long long)d0 * dim2_a + tail_byte_offset;
                             char val = src_a[src_off];
                             dst_a[dst_off] = val;
@@ -170,31 +177,25 @@ fused_permute_kernel(
 
     // ===== SFA: direct load/store =====
     constexpr int SFA_VEC = (DIM2_SFA_BYTES >= 16) ? 16 : DIM2_SFA_BYTES;
-    constexpr int VECS_PER_D1_SFA = DIM2_SFA_BYTES / SFA_VEC;
+    constexpr int SFA_UNIT = SFA_D2_CONTIGUOUS ? SFA_VEC : 4;
+    constexpr int UNITS_PER_D1_SFA = DIM2_SFA_BYTES / SFA_UNIT;
     auto copy_sfa_row = [&](int d1_s) {
-        if constexpr (DIM2_SFA_BYTES % 16 == 0) {
-            if (threadIdx.x * 16 >= DIM2_SFA_BYTES) return;
-            int byte_offset = threadIdx.x * 16;
-            #pragma unroll
-            for (int d0_offset = 0; d0_offset < ROWS_PER_ITER; ++d0_offset) {
-                int d0 = d0_base + d0_offset;
-                if (d0 < dim0) {
-                    long long src_off = sfa_src_offset(d0, d1_s, DIM1, DIM2_SFA_BYTES, byte_offset);
-                    long long dst_off = sfa_dst_offset(d1_s, d0, dim0, DIM2_SFA_BYTES, byte_offset);
+        if (threadIdx.x >= UNITS_PER_D1_SFA) return;
+        int byte_offset = threadIdx.x * SFA_UNIT;
+        #pragma unroll
+        for (int d0_offset = 0; d0_offset < ROWS_PER_ITER; ++d0_offset) {
+            int d0 = d0_base + d0_offset;
+            if (d0 < dim0) {
+                long long src_off = sfa_src_offset(d0, d1_s,
+                    SFA_D2_CONTIGUOUS ? 0 : threadIdx.x,
+                    stride0_sfa_bytes, stride1_sfa_bytes, stride2_sfa_bytes)
+                    + (SFA_D2_CONTIGUOUS ? byte_offset : 0);
+                long long dst_off = sfa_dst_offset(d1_s, d0, dim0, DIM2_SFA_BYTES, byte_offset);
+                if constexpr (SFA_UNIT == 16) {
                     permute_vec_t val;
                     __builtin_memcpy(&val, src_sfa + src_off, 16);
                     st_global_cg_16(dst_sfa + dst_off, val);
-                }
-            }
-        } else {
-            if (threadIdx.x * 4 >= DIM2_SFA_BYTES) return;
-            int byte_offset = threadIdx.x * 4;
-            #pragma unroll
-            for (int d0_offset = 0; d0_offset < ROWS_PER_ITER; ++d0_offset) {
-                int d0 = d0_base + d0_offset;
-                if (d0 < dim0) {
-                    long long src_off = sfa_src_offset(d0, d1_s, DIM1, DIM2_SFA_BYTES, byte_offset);
-                    long long dst_off = sfa_dst_offset(d1_s, d0, dim0, DIM2_SFA_BYTES, byte_offset);
+                } else {
                     int val;
                     __builtin_memcpy(&val, src_sfa + src_off, 4);
                     st_global_cg_4(dst_sfa + dst_off, val);
@@ -209,21 +210,26 @@ fused_permute_kernel(
             copy_sfa_row(blockIdx.x / D2_BLOCKS);
         }
     } else {
-        constexpr int TOTAL_VECS_SFA = D1_TILE * VECS_PER_D1_SFA;
+        constexpr int SFA_UNIT = SFA_D2_CONTIGUOUS ? SFA_VEC : 4;
+        constexpr int UNITS_PER_D1 = DIM2_SFA_BYTES / SFA_UNIT;
+        constexpr int TOTAL_UNITS_SFA = D1_TILE * UNITS_PER_D1;
         const int d1_start = blockIdx.x * D1_TILE;
-        if (threadIdx.x < TOTAL_VECS_SFA) {
-            int d1_local = threadIdx.x / VECS_PER_D1_SFA;
-            int local_vec_s = threadIdx.x - d1_local * VECS_PER_D1_SFA;
+        if (threadIdx.x < TOTAL_UNITS_SFA) {
+            int d1_local = threadIdx.x / UNITS_PER_D1;
+            int local_unit = threadIdx.x - d1_local * UNITS_PER_D1;
             int d1_s = d1_start + d1_local;
-            int byte_offset = local_vec_s * SFA_VEC;
-            
+
             #pragma unroll
             for (int d0_offset = 0; d0_offset < ROWS_PER_ITER; ++d0_offset) {
                 int d0 = d0_base + d0_offset;
                 if (d0 < dim0) {
-                    long long src_off = sfa_src_offset(d0, d1_s, DIM1, DIM2_SFA_BYTES, byte_offset);
-                    long long dst_off = sfa_dst_offset(d1_s, d0, dim0, DIM2_SFA_BYTES, byte_offset);
-                    if constexpr (SFA_VEC == 16) {
+                    long long src_off = sfa_src_offset(d0, d1_s,
+                        SFA_D2_CONTIGUOUS ? 0 : local_unit,
+                        stride0_sfa_bytes, stride1_sfa_bytes, stride2_sfa_bytes)
+                        + (SFA_D2_CONTIGUOUS ? local_unit * SFA_UNIT : 0);
+                    long long dst_off = sfa_dst_offset(d1_s, d0, dim0, DIM2_SFA_BYTES, local_unit * SFA_UNIT);
+
+                    if constexpr (SFA_UNIT == 16) {
                         permute_vec_t val;
                         __builtin_memcpy(&val, src_sfa + src_off, 16);
                         st_global_cg_16(dst_sfa + dst_off, val);

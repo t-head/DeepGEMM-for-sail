@@ -116,6 +116,7 @@ constexpr int TAIL_BYTES_A = {TAIL_BYTES_A};
 constexpr int DIM2_SFA_BYTES = {DIM2_SFA_BYTES};
 constexpr int D1_TILE = {D1_TILE};
 constexpr bool USE_FAST_PATH = {USE_FAST_PATH};
+constexpr bool SFA_D2_CONTIGUOUS = {SFA_D2_CONTIGUOUS};
 
 // Grid: fast path uses (DIM1 * D2_BLOCKS, grid_y), SMEM path uses (D1_GROUPS, grid_y)
 constexpr int D2_BLOCKS = (NUM_D2_VECS_A + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
@@ -127,36 +128,40 @@ dim3 block(THREADS_PER_BLOCK, 1, 1);
 // SMEM: 0 for fast path, full tile for SMEM transpose path
 constexpr int SMEM_SIZE = USE_FAST_PATH ? 0 : (ROWS_PER_ITER * D1_TILE * NUM_D2_VECS_A * VEC_SIZE);
 
-fused_permute_kernel<VEC_SIZE, THREADS_PER_BLOCK, ROWS_PER_ITER, DIM1, NUM_D2_VECS_A, TAIL_BYTES_A, DIM2_SFA_BYTES, D1_TILE, USE_FAST_PATH><<<grid, block, SMEM_SIZE, stream>>>(
+fused_permute_kernel<VEC_SIZE, THREADS_PER_BLOCK, ROWS_PER_ITER, DIM1, NUM_D2_VECS_A, TAIL_BYTES_A, DIM2_SFA_BYTES, D1_TILE, USE_FAST_PATH, SFA_D2_CONTIGUOUS><<<grid, block, SMEM_SIZE, stream>>>(
     (const char*)src_a, (char*)dst_a,
     (const char*)src_sfa, (char*)dst_sfa,
-    dim0, dim2_a);
+    dim0, dim2_a,
+    stride0_a_bytes, stride1_a_bytes,
+    stride0_sfa_bytes, stride1_sfa_bytes, stride2_sfa_bytes);
 __return_code = 0;
 """
 
 
 def fused_permute(a: torch.Tensor, sfa: torch.Tensor):
     """
-    Fused JIT kernel: permute(1,0,2).contiguous() for two 3-D tensors in one launch.
+    Fused JIT kernel: permute(1,0,2) for two 3-D tensors in one launch.
 
     Both tensors must share the same (dim0, dim1) but may have different dim2 and dtypes.
+    Supports non-contiguous inputs via byte strides for both a and sfa.
+    Requires a.stride(-1) == 1; sfa d2 direction can be non-contiguous (scalar fallback).
     Returns (out_a, out_sfa) with shape (dim1, dim0, dim2_x) for each.
     """
-    assert a.dim() == 3 and a.is_contiguous(), \
-        'fused_permute: tensor a must be a contiguous 3-D tensor'
-    assert sfa.dim() == 3 and sfa.is_contiguous(), \
-        'fused_permute: tensor sfa must be a contiguous 3-D tensor'
+    assert a.dim() == 3 and a.stride(-1) == 1, \
+        'fused_permute: tensor a must have stride(-1) == 1 for vectorized loads'
+    assert sfa.dim() == 3, \
+        'fused_permute: tensor sfa must be a 3-D tensor'
 
     dim0, dim1, dim2_a = a.shape
     dim0_s, dim1_s, dim2_sfa = sfa.shape
     assert dim0 == dim0_s and dim1 == dim1_s, \
         'fused_permute: dim0 and dim1 must match between a and sfa'
+    if any(d == 0 for d in (dim0, dim1, dim2_a, dim2_sfa)):
+        return
 
     out_a = torch.empty((dim1, dim0, dim2_a), dtype=a.dtype, device=a.device)
     out_sfa = torch.empty((dim1, dim0, dim2_sfa), dtype=sfa.dtype, device=sfa.device)
 
-    if dim0 == 0 or dim1 == 0:
-        return out_a, out_sfa
 
     # Convert to byte-level dimensions
     elem_size_a = a.element_size()
@@ -224,21 +229,35 @@ def fused_permute(a: torch.Tensor, sfa: torch.Tensor):
         while dim1 % d1_tile != 0:
             d1_tile -= 1
 
+    # Byte strides for non-contiguous support (d2 direction must be contiguous, stride(-1)==1)
+    stride0_a_bytes = a.stride(0) * elem_size_a
+    stride1_a_bytes = a.stride(1) * elem_size_a
+    stride0_sfa_bytes = sfa.stride(0) * elem_size_sfa
+    stride1_sfa_bytes = sfa.stride(1) * elem_size_sfa
+    stride2_sfa_bytes = sfa.stride(2) * elem_size_sfa
+    sfa_d2_contiguous = (sfa.stride(-1) == 1)
+
     global permute_includes, permute_template
     args = (a, out_a, sfa, out_sfa,
-            dim0, dim2_a_bytes, torch.cuda.current_stream())
+            dim0, dim2_a_bytes,
+            stride0_a_bytes, stride1_a_bytes,
+            stride0_sfa_bytes, stride1_sfa_bytes, stride2_sfa_bytes,
+            torch.cuda.current_stream())
     ElementA = "cutlass::float_e4m3_t" if a.dtype == torch.float8_e4m3fn else "int8_t"
     runtime = jit_tuner.compile_and_tune(
         name='fused_permute_'+ ElementA,
         keys={'VEC_SIZE': 16, 'THREADS_PER_BLOCK': threads_per_block, 'ROWS_PER_ITER': rows_per_iter,
                 'DIM1': dim1, 'NUM_D2_VECS_A': num_d2_vecs_a, 'TAIL_BYTES_A': tail_bytes_a,
                 'DIM2_SFA_BYTES': dim2_sfa_bytes, 'D1_TILE': d1_tile,
-                'USE_FAST_PATH': 'true' if use_fast_path else 'false'},
+                'USE_FAST_PATH': 'true' if use_fast_path else 'false',
+                'SFA_D2_CONTIGUOUS': 'true' if sfa_d2_contiguous else 'false'},
         space=(),
         includes=permute_includes,
         arg_defs=(('src_a',    a.dtype), ('dst_a',    a.dtype),
                   ('src_sfa',  sfa.dtype), ('dst_sfa',  sfa.dtype),
                   ('dim0',     int), ('dim2_a',   int),
+                  ('stride0_a_bytes',  int), ('stride1_a_bytes',  int),
+                  ('stride0_sfa_bytes', int), ('stride1_sfa_bytes', int), ('stride2_sfa_bytes', int),
                   ('stream',   torch.cuda.Stream)),
         template=permute_template,
         args=args,
