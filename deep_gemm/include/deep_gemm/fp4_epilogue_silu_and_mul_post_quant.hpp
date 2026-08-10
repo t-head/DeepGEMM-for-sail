@@ -7,7 +7,6 @@
 
 #include "cute/tensor.hpp"
 #include "cute/numeric/numeric_types.hpp"
-#include "cutlass/ppu_host_adapter.hpp"
 #include "cutlass/epilogue/thread/activation.h"
 #include "utils_rtc.cuh"
 

@@ -20,19 +20,19 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     // --- Scales layout check & preprocess ---
     torch::Tensor lhs_scales_t = lhs_scales;
     torch::Tensor rhs_scales_t = rhs_scales;
-    if (!check_mxfp4_scales_layout(lhs_scales_t, /*is_sfa=*/true)) {
+    if (!check_mxfp4_scales_layout(lhs_scales_t)) {
         lhs_scales_t = preprocess_mxfp4_scales(lhs_scales_t);
     }
-    if (!check_mxfp4_scales_layout(rhs_scales_t, /*is_sfa=*/false)) {
+    if (!check_mxfp4_scales_layout(rhs_scales_t)) {
         rhs_scales_t = post_preprocess_mxfp4_scales(rhs_scales_t);
-        if (!check_mxfp4_scales_layout(rhs_scales_t, /*is_sfa=*/false)) {
+        if (!check_mxfp4_scales_layout(rhs_scales_t)) {
             rhs_scales_t = preprocess_mxfp4_scales(rhs_scales_t);
         }
     }
 
     // Scale stride checks (validate post-preprocessing result)
-    DG_HOST_ASSERT(lhs_scales_t.stride(0) == 1 || lhs_scales_t.size(0) == 1);
-    DG_HOST_ASSERT(rhs_scales_t.stride(1) == 1 || rhs_scales_t.size(1) == 1);
+    DG_HOST_ASSERT(check_mxfp4_scales_layout(lhs_scales_t));
+    DG_HOST_ASSERT(check_mxfp4_scales_layout(rhs_scales_t));
 
     if (m == 0) return;
 
@@ -253,19 +253,19 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     // --- Scales layout check & preprocess ---
     torch::Tensor lhs_scales_t = lhs_scales;
     torch::Tensor rhs_scales_t = rhs_scales;
-    if (!check_mxfp4_scales_layout(lhs_scales_t, /*is_sfa=*/true)) {
+    if (!check_mxfp4_scales_layout(lhs_scales_t)) {
         lhs_scales_t = preprocess_mxfp4_scales(lhs_scales_t);
     }
-    if (!check_mxfp4_scales_layout(rhs_scales_t, /*is_sfa=*/false)) {
+    if (!check_mxfp4_scales_layout(rhs_scales_t)) {
         rhs_scales_t = post_preprocess_mxfp4_scales(rhs_scales_t);
-        if (!check_mxfp4_scales_layout(rhs_scales_t, /*is_sfa=*/false)) {
+        if (!check_mxfp4_scales_layout(rhs_scales_t)) {
             rhs_scales_t = preprocess_mxfp4_scales(rhs_scales_t);
         }
     }
 
     // Scale stride checks (validate post-preprocessing result)
-    DG_HOST_ASSERT(lhs_scales_t.stride(1) == 1 || lhs_scales_t.size(1) == 1);
-    DG_HOST_ASSERT(rhs_scales_t.stride(1) == 1 || rhs_scales_t.size(1) == 1);
+    DG_HOST_ASSERT(check_mxfp4_scales_layout(lhs_scales_t));
+    DG_HOST_ASSERT(check_mxfp4_scales_layout(rhs_scales_t));
 
     int num_sms = get_num_sms();
 

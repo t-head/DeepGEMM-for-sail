@@ -17,12 +17,26 @@ namespace deep_gemm_fp4_common {
 // ============================================================================
 
 /// Check whether the MXFP4 scale tensor has the correct layout (uint16, M/N-major)
-inline bool check_mxfp4_scales_layout(const torch::Tensor& scale, bool is_sfa) {
+// keep in sync with deep_gemm/jit_kernels/gemm_fp4.py
+// NOTE: Only the canonical packed layouts are accepted: an M/N-major scale as produced by
+// `preprocess_mxfp4_scales`, or its degenerate form when a dim has extent 1. Tensors
+// whose strides carry padding (for example a row slice of a larger buffer) are
+// rejected on purpose, even though they may be M/N-major.
+inline bool check_mxfp4_scales_layout(const torch::Tensor& scale) {
+    // A dim of extent 1 makes the transpose/permute round-trip in preprocess_mxfp4_scales
+    // a no-op, so the canonical layout of a degenerate shape is the plain contiguous one.
     bool is_mn_major = false;
     if (scale.dim() == 2) {
-        is_mn_major = (scale.stride(0) == 1 || scale.size(0) == 1);
+        const auto mn = scale.size(0);
+        const auto k = scale.size(1);
+        is_mn_major = (mn > 1 && k > 1) ? (scale.stride(0) == 1 && scale.stride(1) == mn)
+                              : (scale.stride(0) == k && scale.stride(1) == 1);
     } else if (scale.dim() == 3) {
-        is_mn_major = (scale.stride(1) == 1 || scale.size(1) == 1);
+        const auto mn = scale.size(1);
+        const auto k = scale.size(2);
+        is_mn_major = (mn > 1 && k > 1)
+            ? (scale.stride(0) == mn * k && scale.stride(1) == 1 && scale.stride(2) == mn)
+            : (scale.stride(0) == mn * k && scale.stride(1) == k && scale.stride(2) == 1);
     }
     return (scale.dtype() == torch::kUInt16) && is_mn_major;
 }

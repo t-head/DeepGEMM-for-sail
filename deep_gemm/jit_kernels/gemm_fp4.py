@@ -518,11 +518,26 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
 
     return min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
 
-def check_mxfp4_scales_layout(scale: torch.Tensor, is_sfa: bool) -> bool:
+def check_mxfp4_scales_layout(scale: torch.Tensor) -> bool:
     """
         check whether the layout of the MXFP4 scale is satisfied with the requirement.
+
+        NOTE: Only the canonical packed layouts are accepted: an M/N-major scale as produced by
+        `preprocess_mxfp4_scales`, or its degenerate form when a dim has extent 1. Tensors
+        whose strides carry padding (for example a row slice of a larger buffer) are
+        rejected on purpose, even though they may be M/N-major.
     """
-    is_mn_major = (((scale.dim() == 2) and (scale.stride(0) == 1 or scale.shape[0] == 1)) or ((scale.dim() == 3) and (scale.stride(1) == 1 or scale.shape[1] == 1)))
+
+    # A dim of extent 1 makes the transpose/permute round-trip in preprocess_mxfp4_scales
+    # a no-op, so the canonical layout of a degenerate shape is the plain contiguous one.
+    target_stride = None
+    if scale.dim() == 2:
+        MN, K = scale.shape
+        target_stride = (1, MN) if (MN > 1 and K > 1) else (K, 1)
+    elif scale.dim() == 3:
+        G, MN, K = scale.shape
+        target_stride = (MN * K, 1, MN) if (MN > 1 and K > 1) else (MN * K, K, 1)
+    is_mn_major = (scale.stride() == target_stride)
     if scale.dtype == torch.uint16 and is_mn_major:
         return True
 
@@ -591,27 +606,27 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
     n, k_ = rhs.shape
     m_, n_ = out.shape
 
-    if (not check_mxfp4_scales_layout(scale=lhs_scales, is_sfa=True)):
+    if (not check_mxfp4_scales_layout(scale=lhs_scales)):
         if not torch.compiler.is_compiling():
             warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFA inner DenseGemm interface.", UserWarning, stacklevel=3)
         lhs_scales = preprocess_mxfp4_scales(scale=lhs_scales)
-    if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+    if (not check_mxfp4_scales_layout(scale=rhs_scales)):
         if not torch.compiler.is_compiling():
-            warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFB inner DenseGemm interface. preprocess the weight scale might degrade the performance!", UserWarning, stacklevel=3)
+            warnings.warn(("[DeepGemm] Called preprocess_mxfp4_scales for SFB inner DenseGemm interface. "
+                          "preprocess the weight scale might degrade the performance!"), UserWarning, stacklevel=3)
         ### forward compatibility for release_2v1
         rhs_scales = _post_preprocess_mxfp4_scales(scale=rhs_scales)
-        if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+        if (not check_mxfp4_scales_layout(scale=rhs_scales)):
             rhs_scales = preprocess_mxfp4_scales(scale=rhs_scales)
 
     # Type and shape checks
     assert m == m_ and n == n_ and k == k_
     assert n > 0 and k > 0
-    assert lhs.dtype == torch.uint8 and lhs_scales.dtype == torch.uint16
-    assert rhs.dtype == torch.uint8 and rhs_scales.dtype == torch.uint16
+    assert lhs.dtype == torch.uint8 and rhs.dtype == torch.uint8
     assert (bias is None) or (bias.dtype == torch.float32)
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
-    assert (lhs_scales.stride(0) == 1 or lhs_scales.shape[0] == 1) and (rhs_scales.stride(0) == 1 or rhs_scales.shape[0] == 1)
+    assert check_mxfp4_scales_layout(scale=lhs_scales) and check_mxfp4_scales_layout(scale=rhs_scales)
     has_bias = True
     if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device); has_bias = False
 

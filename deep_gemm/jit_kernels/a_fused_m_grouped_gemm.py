@@ -558,12 +558,17 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
     # Type and shape checks
     assert k == k_ and n == n_
     assert lhs.dtype == torch.uint8 and rhs.dtype == torch.uint8
-    assert lhs_scales.dtype == torch.uint16 and rhs_scales.dtype == torch.uint16
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert out.is_contiguous()
     ### lhs_scales is k major for fp4 fused moe, which has better sfa acp efficiency.
-    assert lhs_scales.is_contiguous() and check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)
+    assert lhs_scales.dtype == torch.uint16, \
+        "fp4 fused MoE expects an uint16 SFA (uint8 E8M0 scales padded to an even count along K, then viewed as uint16)"
+    assert lhs_scales.shape == (num_token, ceil_div(ceil_div(k, 16), 2)), \
+        f"fp4 fused MoE expects a K-major uint16 SFA of shape {(num_token, ceil_div(ceil_div(k, 16), 2))}, got {tuple(lhs_scales.shape)}"
+    assert lhs_scales.is_contiguous(), \
+        "fp4 fused MoE expects an uint16 K-major (plain contiguous) SFA; do NOT call preprocess_mxfp4_scales on it"
+    assert check_mxfp4_scales_layout(scale=rhs_scales)
     assert k % 16 == 0, (
         "K must be a multiple of 16, "
         "so that 16 8-bit elements can be loaded with 128b aligned vectorized memory access."

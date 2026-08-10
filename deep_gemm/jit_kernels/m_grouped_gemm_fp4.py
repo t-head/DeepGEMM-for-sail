@@ -85,27 +85,27 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     m_, n_ = out.shape
     m__ = m_indices.numel()
 
-    if (not check_mxfp4_scales_layout(scale=lhs_scales, is_sfa=True)):
+    if (not check_mxfp4_scales_layout(scale=lhs_scales)):
         if not torch.compiler.is_compiling():
             warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFA inner GroupedNoPad interface.", UserWarning, stacklevel=3)
         lhs_scales = preprocess_mxfp4_scales(scale=lhs_scales)
-    if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+    if (not check_mxfp4_scales_layout(scale=rhs_scales)):
         if not torch.compiler.is_compiling():
-            warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFB inner GroupedNoPad interface. preprocess the weight scale might degrade the performance!", UserWarning, stacklevel=3)
+            warnings.warn(("[DeepGemm] Called preprocess_mxfp4_scales for SFB inner GroupedNoPad interface. "
+                          "preprocess the weight scale might degrade the performance!"), UserWarning, stacklevel=3)
         ### forward compatibility for release_2v1
         rhs_scales = _post_preprocess_mxfp4_scales(scale=rhs_scales)
-        if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+        if (not check_mxfp4_scales_layout(scale=rhs_scales)):
             rhs_scales = preprocess_mxfp4_scales(scale=rhs_scales)
 
     # Type and shape checks
     assert m == m_ == m__ and n == n_ and k == k_
     assert n > 0 and k > 0
     assert lhs.dtype == torch.uint8 and rhs.dtype == torch.uint8
-    assert lhs_scales.dtype == torch.uint16 and rhs_scales.dtype == torch.uint16
     assert bias is None or bias.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
-    assert (lhs_scales.stride(0) == 1 or lhs_scales.shape[0] == 1) and (rhs_scales.stride(1) == 1 or rhs_scales.shape[1] == 1) and m_indices.is_contiguous()
+    assert check_mxfp4_scales_layout(scale=lhs_scales) and check_mxfp4_scales_layout(scale=rhs_scales) and m_indices.is_contiguous()
 
     has_bias = True
     if bias is None: bias = torch.empty(0, dtype=torch.float32, device=lhs.device); has_bias = False
@@ -181,10 +181,19 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
 
     When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
     `out` must be uint8 of shape (num_groups, m, n // 4) and `out_scale` uint16 of shape
-    (num_groups, m, ceil_div(n // 4, 32)).
+    (num_groups, m, ceil_div(n // 4, 32)). The gemm1 weight must have been interleaved with
+    `preprocess_mxfp4_weight_for_act_and_quant_fusing` (before `preprocess_mxfp4_scales`), so
+    that the epilogue reads gate/up (W1/W3) pairs from adjacent N positions.
 
-    NOTE: when `out_scale` is not None, `out_scale` is re-strided **in place** to the N-major layout
-    (sfm * sfn, 1, sfm) expected by the Gemm2 SFA reader.
+    `swiglu_limit > 0` clamps before the activation: the gate is clamped from above only
+    (`min(gate, limit)`) and the up projection on both sides (`clamp(up, -limit, limit)`);
+    `0.0` or None disables the clamp.
+
+    Only the masked layout is supported (nopad is not), `n` must be a multiple of 64, and a
+    bias is not supported in the fused mode.
+
+    NOTE: when `out_scale` is not None, it is re-strided **in place** on return to the N-major
+    layout (sfm * sfn, 1, sfm) expected by the Gemm2 SFA reader.
     """
 
     lhs, lhs_scales = lhs_
@@ -210,16 +219,17 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
         epilogue_type, output_type = 'Default', torch.bfloat16
     num_groups___ = masked_m.numel()
 
-    if (not check_mxfp4_scales_layout(scale=lhs_scales, is_sfa=True)):
+    if (not check_mxfp4_scales_layout(scale=lhs_scales)):
         if not torch.compiler.is_compiling():
             warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFA inner GroupedMasked interface.", UserWarning, stacklevel=3)
         lhs_scales = preprocess_mxfp4_scales(scale=lhs_scales)
-    if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+    if (not check_mxfp4_scales_layout(scale=rhs_scales)):
         if not torch.compiler.is_compiling():
-            warnings.warn("[DeepGemm] Called preprocess_mxfp4_scales for SFB inner GroupedMasked interface. preprocess the weight scale might degrade the performance!", UserWarning, stacklevel=3)
+            warnings.warn(("[DeepGemm] Called preprocess_mxfp4_scales for SFB inner GroupedMasked interface. "
+                          "preprocess the weight scale might degrade the performance!"), UserWarning, stacklevel=3)
         ### forward compatibility for release_2v1
         rhs_scales = _post_preprocess_mxfp4_scales(scale=rhs_scales)
-        if (not check_mxfp4_scales_layout(scale=rhs_scales, is_sfa=False)):
+        if (not check_mxfp4_scales_layout(scale=rhs_scales)):
             rhs_scales = preprocess_mxfp4_scales(scale=rhs_scales)
 
     # Type and shape checks
@@ -227,11 +237,10 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     assert m == m_ and k == k_
     assert expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0
     assert lhs.dtype == torch.uint8 and rhs.dtype == torch.uint8
-    assert lhs_scales.dtype == torch.uint16 and rhs_scales.dtype == torch.uint16
     assert bias is None or bias.dtype == torch.float32
     assert masked_m.dtype == torch.int32
     assert lhs.is_contiguous() and rhs.is_contiguous()
-    assert (lhs_scales.stride(1) == 1 or lhs_scales.shape[1] == 1) and (rhs_scales.stride(1) == 1 or rhs_scales.shape[1] == 1)
+    assert check_mxfp4_scales_layout(scale=lhs_scales) and check_mxfp4_scales_layout(scale=rhs_scales)
     assert out.is_contiguous() and masked_m.is_contiguous()
 
     has_bias = True
@@ -300,6 +309,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     runtime(*args)
 
     if enable_silu_and_mul_quant_fusing:
+        ### sfm and sfn always > 1 for GroupedMasked(topk > 1).
         out_scale.as_strided_(size=(num_groups, sfm, sfn), stride=(sfm * sfn, 1, sfm))
 
     return (block_m, ceil_div(n, block_n))
