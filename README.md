@@ -33,7 +33,7 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 
 ```bash
 # Submodule must be cloned recursively
-git clone --recursive git@gitlab.alibaba-inc.com:PPU-Libraries/DeepGemm.git
+git clone --recursive git@github.com:t-head/DeepGEMM-for-sail.git
 # Make symbolic links for third-party (ACTLIZE) include directories
 python setup.py develop
 
