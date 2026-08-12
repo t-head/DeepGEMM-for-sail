@@ -23,22 +23,31 @@ namespace deep_gemm_fp4_common {
 // whose strides carry padding (for example a row slice of a larger buffer) are
 // rejected on purpose, even though they may be M/N-major.
 inline bool check_mxfp4_scales_layout(const torch::Tensor& scale) {
-    // A dim of extent 1 makes the transpose/permute round-trip in preprocess_mxfp4_scales
-    // a no-op, so the canonical layout of a degenerate shape is the plain contiguous one.
-    bool is_mn_major = false;
+    if (scale.dtype() != torch::kUInt16) return false;
+
+    // The canonical layout is always M/N-major: stride_MN == 1, stride_K == MN, stride_G == MN * K.
+    int64_t target_stride[3] = {};
     if (scale.dim() == 2) {
         const auto mn = scale.size(0);
-        const auto k = scale.size(1);
-        is_mn_major = (mn > 1 && k > 1) ? (scale.stride(0) == 1 && scale.stride(1) == mn)
-                              : (scale.stride(0) == k && scale.stride(1) == 1);
+        target_stride[0] = 1;
+        target_stride[1] = mn;
     } else if (scale.dim() == 3) {
         const auto mn = scale.size(1);
         const auto k = scale.size(2);
-        is_mn_major = (mn > 1 && k > 1)
-            ? (scale.stride(0) == mn * k && scale.stride(1) == 1 && scale.stride(2) == mn)
-            : (scale.stride(0) == mn * k && scale.stride(1) == k && scale.stride(2) == 1);
+        target_stride[0] = mn * k;
+        target_stride[1] = 1;
+        target_stride[2] = mn;
+    } else {
+        return false;
     }
-    return (scale.dtype() == torch::kUInt16) && is_mn_major;
+
+    // The stride of an extent-1 dim never participates in the address computation, so it is
+    // **unobservable** and must NOT be compared: for example a (G, 1, K) scale is byte-identical
+    // whether its MN stride is K or 1, which means that its stride might be (K, 1, 1) or (K, K, 1).
+    for (int64_t i = 0; i < scale.dim(); ++i) {
+        if (scale.size(i) > 1 && scale.stride(i) != target_stride[i]) return false;
+    }
+    return true;
 }
 
 /// Preprocess mxfp4 scales: uint8 -> pad if odd -> view as uint16 -> transpose to M/N-major

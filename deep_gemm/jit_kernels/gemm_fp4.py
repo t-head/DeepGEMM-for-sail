@@ -528,20 +528,23 @@ def check_mxfp4_scales_layout(scale: torch.Tensor) -> bool:
         rejected on purpose, even though they may be M/N-major.
     """
 
-    # A dim of extent 1 makes the transpose/permute round-trip in preprocess_mxfp4_scales
-    # a no-op, so the canonical layout of a degenerate shape is the plain contiguous one.
-    target_stride = None
+    if scale.dtype != torch.uint16:
+        return False
+
+    # The canonical layout is always M/N-major: stride_MN == 1, stride_K == MN, stride_G == MN * K.
     if scale.dim() == 2:
         MN, K = scale.shape
-        target_stride = (1, MN) if (MN > 1 and K > 1) else (K, 1)
+        target_stride = (1, MN)
     elif scale.dim() == 3:
         G, MN, K = scale.shape
-        target_stride = (MN * K, 1, MN) if (MN > 1 and K > 1) else (MN * K, K, 1)
-    is_mn_major = (scale.stride() == target_stride)
-    if scale.dtype == torch.uint16 and is_mn_major:
-        return True
+        target_stride = (MN * K, 1, MN)
+    else:
+        return False
 
-    return False
+    # The stride of an extent-1 dim never participates in the address computation, so it is
+    # **unobservable** and must NOT be compared: for example a (G, 1, K) scale is byte-identical
+    # whether its MN stride is K or 1, which means that its stride might be (K, 1, 1) or (K, K, 1).
+    return all(s == t for s, t, sz in zip(scale.stride(), target_stride, scale.shape) if sz > 1)
 
 def uint8_padding(scale: torch.Tensor) -> torch.Tensor:
     """
