@@ -43,11 +43,13 @@ inline bool check_mxfp4_scales_layout(const torch::Tensor& scale) {
 
 /// Preprocess mxfp4 scales: uint8 -> pad if odd -> view as uint16 -> transpose to M/N-major
 inline torch::Tensor preprocess_mxfp4_scales(const torch::Tensor& scale) {
-    DG_HOST_ASSERT(scale.dtype() == torch::kUInt8);
-    DG_HOST_ASSERT(scale.is_contiguous());
-    DG_HOST_ASSERT(scale.dim() == 2 || scale.dim() == 3);
-
     torch::Tensor s = scale;
+    // make scale contiguous for SGLang warmup.
+    if (!s.is_contiguous()) s = s.contiguous();
+    if (s.dtype() == torch::kUInt16) s = s.view(torch::kUInt8);
+    DG_HOST_ASSERT(s.dtype() == torch::kUInt8);
+    DG_HOST_ASSERT(s.dim() == 2 || s.dim() == 3);
+
     if (s.size(-1) % 2 != 0) {
         s = at::constant_pad_nd(s, {0, 1}, 0);
     }

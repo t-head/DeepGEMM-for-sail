@@ -564,8 +564,10 @@ def _post_preprocess_mxfp4_scales(scale: torch.Tensor) -> torch.Tensor:
     return scale
 
 def preprocess_mxfp4_scales(scale: torch.Tensor) -> torch.Tensor:
+    ### make scale contiguous for SGLang warmup.
+    if not scale.is_contiguous(): scale = scale.contiguous()
+    if scale.dtype == torch.uint16: scale = scale.view(torch.uint8)
     assert scale.dtype == torch.uint8, f"The dtype of scale to be preprocessed in MXFP4 should be torch.uint8 but got {scale.dtype}."
-    assert scale.is_contiguous(), f"Scales to be preprocessed in MXFP4 should be contiguous."
     assert scale.dim() == 2 or scale.dim() == 3, f"The rank of scale to be preprocessed in MXFP4 should be 2(dense/groupedNoPad) or 3(groupedMasked)."
     if (scale.shape[-1] % 2):
         scale = torch.nn.functional.pad(scale, (0, 1))
