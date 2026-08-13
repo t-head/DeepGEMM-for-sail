@@ -865,7 +865,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
                                   .kernel_params = params};
 
         const auto& code = BF16GemmRuntime::generate(args);
-        const auto& runtime = compiler->build("bf16_deep_gemm", code, block.x, SMSIZE);
+        const auto& runtime = compiler->build("bf16_deep_gemm", code, block.x, SMSIZE, ActlizeLib::kV050);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);

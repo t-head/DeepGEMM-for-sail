@@ -2,7 +2,10 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-#include "profiling_interface.hpp"
+// NOTES: host-only helpers, skipped when the header is pulled in by the C++ JIT
+#ifndef TF32_HC_PRENORM_HGRTC
+    #include "profiling_interface.hpp"
+#endif
 
 #include <hggc_runtime.h>
 #include <hggc/std/cstdint>
@@ -24,7 +27,9 @@
 #include "cute/ppu_util.hpp"
 #include <cute/arch/copy_ppu.hpp>
 
-#include "tools/util/include/cutlass/util/packed_stride.hpp"
+#ifndef TF32_HC_PRENORM_HGRTC
+    #include "tools/util/include/cutlass/util/packed_stride.hpp"
+#endif
 #include "scheduler_cutlass3.cuh"
 #include "utils_cutlass3.h"
 #include "utils.cuh"
@@ -225,19 +230,17 @@ __device__ __forceinline__ float reduce4(float x) {
 #endif // __HGGC_ARCH__ >= 150
 
 // ============================================================
-// Kernel (890P: AIU  | 810E: CuTe cp.async)
+// Kernel body (890P: AIU  | 810E: CuTe cp.async)
 // ============================================================
+// NOTES: the body lives in a `__device__` function so that both JIT flavours can share it:
+// the Python JIT launches `tf32_hc_prenorm_gemm_impl` below via `HcPrenormGemm::run`, while the
+// C++ JIT emits its own `extern "C" __global__` entry that forwards here.
 template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumSplits,
           bool kFastBF16ToTF32, bool kReduceSplits>
-CUTLASS_GLOBAL void
-#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
-__launch_bounds__(BLOCK_M * 2, 1)
-#else
-__launch_bounds__(BLOCK_M * 2, 2)
-#endif
-tf32_hc_prenorm_gemm_impl(
+CUTLASS_DEVICE void
+tf32_hc_prenorm_gemm_device(
     const float* __restrict__ fn,
     float* __restrict__ out,
     float* __restrict__ sqrsum,
@@ -512,6 +515,28 @@ tf32_hc_prenorm_gemm_impl(
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only supports PPU or newer");
 #endif
+}
+
+// Kernel entry used by the Python JIT (`HcPrenormGemm::run`)
+template <uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t kNumSplits,
+          bool kFastBF16ToTF32, bool kReduceSplits>
+CUTLASS_GLOBAL void
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
+__launch_bounds__(BLOCK_M * 2, 1)
+#else
+__launch_bounds__(BLOCK_M * 2, 2)
+#endif
+tf32_hc_prenorm_gemm_impl(
+    const float* __restrict__ fn,
+    float* __restrict__ out,
+    float* __restrict__ sqrsum,
+    const __ppu_bfloat16* __restrict__ x,
+    const uint32_t num_tokens) {
+    tf32_hc_prenorm_gemm_device<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
+                                kNumSplits, kFastBF16ToTF32, kReduceSplits>(
+        fn, out, sqrsum, x, num_tokens);
 }
 
 template <uint32_t SHAPE_N, uint32_t SHAPE_K,

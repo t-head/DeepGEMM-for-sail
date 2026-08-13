@@ -12,6 +12,7 @@
 // #include "layout.hpp"
 #include "../jit_kernels/impls/fp4_gemm.hpp"
 #include "../jit_kernels/impls/m_grouped_fp4_gemm.hpp"
+#include "../jit_kernels/impls/tf32_hc_prenorm_gemm.hpp"
 
 namespace deep_gemm::gemm {
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
@@ -606,6 +607,37 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_masked(
                                                  max_block_n.value_or(256), enable_sbo_overlap.value_or(false),
                                                  signal_tensor);
 }
+
+void tf32_hc_prenorm_gemm_nt(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                             const torch::Tensor& sqr_sum, std::optional<int> num_splits = std::nullopt,
+                             std::optional<ConfigTuple> configs = std::nullopt) {
+    const auto& [m, k] = get_shape<2>(a);
+    const auto& [n, k_] = get_shape<2>(b);
+
+    DG_HOST_ASSERT(k == k_);
+    DG_HOST_ASSERT(n > 0 and k > 0);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(a.is_contiguous(), "lhs must be contiguous");
+    TORCH_CHECK(b.is_contiguous(), "rhs must be contiguous");
+
+    // NOTES: the split-K partials are reduced in place, so `d` and `sqr_sum` always hold a single copy
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT((num_splits.has_value() ? (d.sizes() == std::vector<int64_t>{1, m, n})
+                                           : (d.sizes() == std::vector<int64_t>{m, n})));
+    TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+
+    DG_HOST_ASSERT(sqr_sum.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT((num_splits.has_value() ? (sqr_sum.sizes() == std::vector<int64_t>{1, m})
+                                           : (sqr_sum.sizes() == std::vector<int64_t>{m})));
+    TORCH_CHECK(sqr_sum.is_contiguous(), "sqr_sum must be contiguous");
+
+    if (m == 0) {
+        return;
+    }
+
+    tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k);
+}
 }
 
 static void register_apis(pybind11::module_& m) {
@@ -650,6 +682,9 @@ static void register_apis(pybind11::module_& m) {
           py::arg("b"), py::arg("bias"), py::arg("d"), py::arg("masked_m"), py::arg("expected_m"),
           py::arg("configs") = std::nullopt, py::arg("max_block_n") = 256,
           py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt);
+    // TF32 GEMMs
+    m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("sqr_sum"), py::arg("num_splits") = std::nullopt, py::arg("configs") = std::nullopt);
 }
 
 } // namespace deep_gemm::gemm

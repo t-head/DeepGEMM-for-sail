@@ -21,6 +21,12 @@
 
 namespace deep_gemm {
 
+// Selects which actlize library a kernel is compiled against (actlize_v1.0.0 or actlize_v0.5.0).
+// The choice belongs to the kernel (its generated code includes a header from one library or
+// the other), not to the chip: the host side already picks the runtime -- and thus the
+// library -- via `extra_info["use_actlize_v100"]`, so this is simply forwarded down to us.
+enum class ActlizeLib { kV100, kV050 };
+
 class Compiler {
 public:
     static std::filesystem::path library_root_path;
@@ -41,6 +47,25 @@ public:
                           std::istreambuf_iterator<char>());
         }
         return get_hex_digest(buffer);
+    }
+
+    // Single source of truth for the actlize include search paths, shared by the offline (HGCC)
+    // and runtime (HGRTC) compilers. The two libraries have colliding header names, so exactly
+    // one of them is put on the search path.
+    // NOTE: v0.5.0 additionally needs the include root itself -- its kernels include
+    // "accutlass.h", which lives there rather than under actlize_v0.5.0/. v1.0.0 kernels
+    // never reference it.
+    static std::vector<std::string> actlize_include_paths(ActlizeLib lib) {
+        const std::string inc = library_include_path.string();
+        std::vector<std::string> paths;
+        if (lib == ActlizeLib::kV050) {
+            paths.push_back(inc);
+            paths.push_back(inc + "/actlize_v0.5.0");
+        } else {
+            paths.push_back(inc + "/actlize_v1.0.0");
+        }
+        paths.push_back(inc + "/deep_gemm");
+        return paths;
     }
 
     static void prepare_init(const std::string& library_root_path,
@@ -104,8 +129,10 @@ public:
         std::filesystem::rename(tmp_file_path, path);
     }
 
-    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code, int32_t thread_num = 0, int32_t smem_size = 0) const {
-        const auto kernel_signature = fmt::format("{}$${}$${}$${}$${}", name, library_version, signature, flags, code);
+    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code, int32_t thread_num = 0, int32_t smem_size = 0, ActlizeLib lib = ActlizeLib::kV100) const {
+        // NOTE: `lib` participates in the signature because the include paths and tuning flags
+        // it selects are no longer part of `flags` (they are resolved per kernel in `compile`).
+        const auto kernel_signature = fmt::format("{}$${}$${}$${}$${}$${}", name, library_version, signature, flags, static_cast<int>(lib), code);
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache
@@ -117,7 +144,7 @@ public:
 
         // Compile into a temporary HGBIN
         const auto tmp_hgbin_path = get_tmp_file_path();
-        compile(code, dir_path, tmp_hgbin_path, name, thread_num, smem_size);
+        compile(code, dir_path, tmp_hgbin_path, name, thread_num, smem_size, lib);
 
         // Replace into the cache directory
         make_dirs(dir_path);
@@ -129,7 +156,7 @@ public:
         return runtime;
     }
 
-    virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, int32_t thread_num, int32_t smem_size) const = 0;
+    virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, int32_t thread_num, int32_t smem_size, ActlizeLib lib) const = 0;
 };
 
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_root_path);
@@ -169,7 +196,6 @@ public:
         // Flags are APPENDED to the ones seeded by the base Compiler ctor (-std=c++NN plus
         // the opt-in -lineinfo addition), so those are preserved here too.
         // All configurable paths come from environment variables or SDK detection.
-        const std::string inc = library_include_path.string();
 
         // --- Language & defines ---
         // NOTE: leading space is required -- the base flags do not always end with one
@@ -183,13 +209,9 @@ public:
             flags += "-arch=ppu_10 ";
         }
 
-        // --- Include paths (derived from library_include_path) ---
-        const bool use_actlize_v100 = is_ppu1v5_device() || get_env<int>("DG_USE_ACTLIZE_V100", 0);
-        if (use_actlize_v100) {
-            flags += fmt::format("-I{}/actlize_v1.0.0 -I{}/deep_gemm ", inc, inc);
-        } else {
-            flags += fmt::format("-I{} -I{}/actlize_v0.5.0 -I{}/deep_gemm ", inc, inc, inc);
-        }
+        // --- Include paths ---
+        // NOTE: the actlize include paths depend on the library each kernel was written
+        // against, so they are resolved per kernel in `compile` instead of being seeded here.
 
         // --- Output format & optimization ---
         flags += "-hgbin -ftemplate-depth=8192 -O3 -DNDEBUG ";
@@ -200,10 +222,8 @@ public:
 
         // NOTE: --ptxas-options=--register-usage-level=10 is intentionally not passed here
         std::string hgcc_extra_flags;
-        if (use_actlize_v100) {
-            flags += " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
-                     " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
-        }
+        // NOTE: the v1.0.0 codegen tuning flags moved into `compile` as well -- they apply to
+        // actlize_v1.0.0 kernels only, which is a per-kernel property.
 
         // >>> PORTING LANDMARK: source-language flag — dropped by the offline compat script
         //     (matched by the code below, NOT by this note); unused by the ported build.
@@ -212,7 +232,7 @@ public:
         // <<< PORTING LANDMARK: end of dropped source-language flag.
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, int32_t thread_num, int32_t smem_size) const override {
+    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, int32_t thread_num, int32_t smem_size, ActlizeLib lib) const override {
         // Write the code into the cache directory
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);
@@ -220,27 +240,34 @@ public:
         // Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use -Xllvm flags,
         // others only need -ppu-simt-branch=false (aligned with compiler.py logic)
         std::string per_kernel_flags;
-        if (is_ppu1v5_device() || get_env<int>("DG_USE_ACTLIZE_V100", 0)) {
+        if (lib == ActlizeLib::kV100) {
+            per_kernel_flags = " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
+                               " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
             const bool use_warp_interleaving = (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
                                                (name.find("fp8_deep_gemm") != std::string::npos) ||
                                                (name.find("mqa_logits") != std::string::npos &&
                                                 name.find("paged") == std::string::npos);
             if (!use_warp_interleaving) {
-                per_kernel_flags = " -Xllvm -ppu-simt-branch=false";
+                per_kernel_flags += " -Xllvm -ppu-simt-branch=false";
             } else {
-                per_kernel_flags = " -Xllvm -ppu-blksync-nb-schedule-boundary=true"
-                                   " -Xllvm -ppu-simt-branch=false"
-                                   " -Xllvm -ppu-adjust-tsm-valu-war=13"
-                                   " -Xllvm -ppu-reassign-subregs=true"
-                                   " -Xllvm -ppu-pref-fma-reuse=true"
-                                   " -Xllvm -ppu-pref-mma-reuse=true";
+                per_kernel_flags += " -Xllvm -ppu-blksync-nb-schedule-boundary=true"
+                                    " -Xllvm -ppu-simt-branch=false"
+                                    " -Xllvm -ppu-adjust-tsm-valu-war=13"
+                                    " -Xllvm -ppu-reassign-subregs=true"
+                                    " -Xllvm -ppu-pref-fma-reuse=true"
+                                    " -Xllvm -ppu-pref-mma-reuse=true";
             }
             if (name.find("w4a16") != std::string::npos) {
                 per_kernel_flags += " -Xllvm -sort-copy-before-coalesce";
             }
         }
+        // Include paths for the library this kernel was written against
+        std::string include_flags;
+        for (const auto& path: actlize_include_paths(lib))
+            include_flags += fmt::format("-I{} ", path);
+
         // Compile
-        const auto& command = fmt::format("{} {} -o {} {}{}", hgcc_path.c_str(), code_path.c_str(), hgbin_path.c_str(), flags, per_kernel_flags);
+        const auto& command = fmt::format("{} {} -o {} {}{}{}", hgcc_path.c_str(), code_path.c_str(), hgbin_path.c_str(), include_flags, flags, per_kernel_flags);
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running HGCC command: %s\n", command.c_str());
         const auto& [return_code, output] = call_external_command(command);
@@ -264,7 +291,7 @@ public:
     class RtcOptions {
         public:
         RtcOptions() = delete;
-        RtcOptions(acArch_t arch, bool use_actlize_v100, const std::string& name = "") {
+        RtcOptions(acArch_t arch, ActlizeLib lib, const std::string& name = "") {
             opts = {
             "--device-as-default-execution-space",
             "-DHGGC_COMPILER_WRAPPER_MODE",
@@ -290,13 +317,8 @@ public:
         #else
             includes_insert({sdk_include});
         #endif
-            std::string library_include_path_str = fmt::format("{}", library_include_path.c_str());
-            const bool force_actlize_v100 = get_env<int>("DG_USE_ACTLIZE_V100", 0);
-            if (arch == AC_PPU0010 && !force_actlize_v100) {
-                includes_insert({library_include_path_str+ "/actlize_v0.5.0", library_include_path_str + "/deep_gemm", library_include_path_str});
-            } else {
-                includes_insert({library_include_path_str+ "/actlize_v1.0.0", library_include_path_str + "/deep_gemm"});
-            }
+            // Include paths for the library this kernel was written against
+            includes_insert(Compiler::actlize_include_paths(lib));
         // #else
             opts_insert({
                 "-DNDEBUG",
@@ -321,7 +343,7 @@ public:
                     "--ppu-arch=ppu0015",
                 });
             }
-            if (arch == AC_PPU0015 || force_actlize_v100) {
+            if (lib == ActlizeLib::kV100) {
                 opts_insert({
                     "--ppu-tuning-options=-ppu-patch-fence-ppu=false",
                     "--ppu-tuning-options=-wno-loop-miss-transform",
@@ -388,17 +410,12 @@ public:
 
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, int32_t thread_num, int32_t smem_size) const override {
+    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, int32_t thread_num, int32_t smem_size, ActlizeLib lib) const override {
         // Write the code into the cache directory
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);
-        acArch_t arch = AC_PPU0010;
-        bool use_actlize_v100 = false;
-        if (is_ppu1v5_device()) {
-            arch = AC_PPU0015;
-            use_actlize_v100 = true;
-        }
-        RtcOptions opts(arch, use_actlize_v100, name);
+        acArch_t arch = is_ppu1v5_device() ? AC_PPU0015 : AC_PPU0010;
+        RtcOptions opts(arch, lib, name);
         // Print HGRTC compile options when DG_JIT_DEBUG is enabled
         if (get_env<int>("DG_JIT_DEBUG", 0)) {
             printf("HGRTC compile options (%zu):\n", opts.size());

@@ -933,7 +933,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
                                          .launch_args = {grid, block, SMSIZE},
                                          .kernel_params = params};
         const auto& code = INT8GemmRuntime::generate(args);
-        const auto& runtime = compiler->build("int8_deep_gemm", code, block.x, SMSIZE);
+        const auto& runtime = compiler->build("int8_deep_gemm", code, block.x, SMSIZE, ActlizeLib::kV050);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);

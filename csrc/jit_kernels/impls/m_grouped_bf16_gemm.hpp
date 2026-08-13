@@ -164,7 +164,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
                                           .kernel_params = params};
 
         const auto& code = BF16GemmRuntime::generate(args);
-        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_contiguous", code, block.x, SMSIZE);
+        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_contiguous", code, block.x, SMSIZE, ActlizeLib::kV050);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -343,7 +343,7 @@ static std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const to
                                           .kernel_params = params};
 
         const auto& code = BF16GemmRuntime::generate(args);
-        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_masked", code, block.x, SMSIZE);
+        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_masked", code, block.x, SMSIZE, ActlizeLib::kV050);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -682,7 +682,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
                                   .kernel_params = params};
 
         const auto& code = BF16GemmRuntime::generate(args);
-        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_NoPad", code, block.x, SMSIZE);
+        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_NoPad", code, block.x, SMSIZE, ActlizeLib::kV050);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
