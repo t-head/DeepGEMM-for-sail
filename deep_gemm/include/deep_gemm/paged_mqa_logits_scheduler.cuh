@@ -4,10 +4,13 @@
 
 namespace deep_gemm {
 
+// NOTES: the body lives in a `__device__` function so that both JIT flavours can share it: the
+// Python JIT launches the `__global__` below via `launch_paged_mqa_logits_metadata`, while the C++
+// JIT emits its own `extern "C" __global__` entry that forwards here.
 template <uint32_t SPLIT_KV, uint32_t kNumSMs>
-__global__
-void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t next_n,
-                                     const uint32_t* context_lens, uint32_t* schedule_metadata) {
+__device__ __forceinline__
+void smxx_paged_mqa_logits_metadata_device(const uint32_t batch_size, const uint32_t next_n,
+                                          const uint32_t* context_lens, uint32_t* schedule_metadata) {
     extern __shared__ uint32_t prefix_sum[];
     const uint32_t tid = threadIdx.x;
 
@@ -81,6 +84,14 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
         schedule_metadata[sm_idx * 2] = q_idx;
         schedule_metadata[sm_idx * 2 + 1] = kv_split_idx;
     }
+}
+
+// Kernel entry used by the Python JIT (`launch_paged_mqa_logits_metadata`)
+template <uint32_t SPLIT_KV, uint32_t kNumSMs>
+__global__
+void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t next_n,
+                                     const uint32_t* context_lens, uint32_t* schedule_metadata) {
+    smxx_paged_mqa_logits_metadata_device<SPLIT_KV, kNumSMs>(batch_size, next_n, context_lens, schedule_metadata);
 }
 
 template <uint32_t SPLIT_KV, uint32_t kNumSMs>

@@ -100,6 +100,16 @@ if should_init_deep_gemm_cpp:
         gemm_fp4_fp4_bf16_nt,
         # TF32 GEMMs
         tf32_hc_prenorm_gemm,
+        # Attention (MQA logits)
+        get_paged_mqa_logits_metadata,
+        bf16_mqa_logits,
+        fp8_mqa_logits,
+        int8_mqa_logits,
+        fp8_fp4_mqa_logits,
+        bf16_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+        int8_paged_mqa_logits,
+        fp8_fp4_paged_mqa_logits,
     )
 
 deep_gemm_cpp.init(

@@ -783,7 +783,12 @@ def read_cycle_from_nculog(filename):
         op = kernel_list[i]
         cycle = cycles_list[i]
         op_cycles[op] = cycle
-        if "gemm" in op.lower():
+        # NOTES: the C++ JIT names its kernels by dtype tag (e.g. `attention_mqa_logits_int8`), so
+        # unlike the Python JIT -- whose symbol carries `cutlass::gemm::kernel::...` -- "gemm" alone
+        # no longer identifies the kernel of interest. `metadata` is excluded so the tiny scheduling
+        # kernel is reported in `op_cycles` but not summed, keeping the totals comparable with the
+        # Python path (whose `smxx_*_metadata` matches neither term).
+        if ("gemm" in op.lower() or "attention" in op.lower()) and "metadata" not in op.lower():
             fwd_cycle_sum += cycle
             fwd_tc_sum = tc_list[i]
             fwd_hbm_sum = hbm_list[i]
@@ -807,6 +812,10 @@ def clean_casename(name):
     return name
 
 def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0"):
+    # Kernel filter for the PPU profiler. `attention_` is needed because the C++ JIT emits
+    # `attention_mqa_logits_*` / `attention_paged_mqa_logits_*`, which match none of the other terms
+    # (the Python JIT is covered by `device_kernel`). Without it the profiler silently reports 0.
+    ppu_kernel_name = "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*|attention_'"
     output_lines = list()
     headers = ["casename","time(us)","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"]
@@ -829,8 +838,11 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         script = f"{os.path.dirname(current_file_path)}/run_deep_gemm.py"
         if mode == "full":
             output_name = clean_casename(case)[:50]
-            cmd = "{} --set full --kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*' -o {} python {} --format {} \
-                2>&1 | tee {}".format("ncu" if dev == "gpu" else "acu", output_name, script, case, log_file)
+            cmd = "{} --set full {} -o {} python {} --format {} \
+                2>&1 | tee {}".format("ncu" if dev == "gpu" else "acu",
+                                      "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*'"
+                                      if dev == "gpu" else ppu_kernel_name,
+                                      output_name, script, case, log_file)
             ret = run_cmd(cmd)
             continue
         else:
@@ -851,7 +863,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
             _acc = "--disable_acc"
             cmd = '{} --clock-control none {} --metrics="{}"  \
                 --page=details python {} --format "{}" {} \
-                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", '--kernel-name regex:gemm*' if dev == "gpu" else "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*'", metrics_string, script, case, _acc, log_file)
+                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", '--kernel-name regex:gemm*' if dev == "gpu" else ppu_kernel_name, metrics_string, script, case, _acc, log_file)
 
         ret = run_cmd(cmd)
         result = "Fail"
