@@ -435,9 +435,7 @@ struct DeepGemmScheduler {
         if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {
             return int64_t(curr_group_idx) * params.shape_m * SFC_SHAPE_N;
         } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
-            return int64_t(curr_cumsum_m) * SFC_SHAPE_N;
-        } else if constexpr(kGemmType == GemmType::BatchGemm) {
-            return int64_t(curr_group_idx) * SFC_SHAPE_N;
+            return int64_t(curr_cumsum_m);
         } else {
             return 0;
         }

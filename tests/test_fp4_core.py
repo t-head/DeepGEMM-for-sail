@@ -384,9 +384,73 @@ def test_m_grouped_gemm_fused_loop(num_groups: int = None, m: int = None, n: int
                 test_m_grouped_gemm_fused(args)
     print("Passed\n")
 
+def test_m_grouped_gemm_nopad_silu_and_mul_post_quant(args) -> None:
+    num_groups, m, n, k, distribution, swiglu_limit = args['groups'], args['m'], args['n'], args['k'], args['distribution'], args['swiglu_limit']
+    bias = None
+
+    m, x, y, m_indices, _, _ = construct_nopad_base(num_groups, m, k, n, torch.uint8, distribution, 1)
+    out = torch.empty((m, (n // 4)), dtype=torch.uint8, device='cuda')
+    out_scale = torch.empty((m, ceil_div((n // 4), 32)), dtype=torch.uint16, device='cuda')
+    ### calculate ref_out in float32 dtype
+    ref_out = torch.empty((m, n), device='cuda', dtype=torch.float32)
+    for group_idx in range(num_groups):
+        mask = (m_indices == group_idx)
+        if mask.sum() == 0: continue
+
+        a_q, a_s = x[0][mask], x[1].contiguous().view(torch.uint8)[mask]
+        b_q, b_s = y[0][group_idx], y[1].contiguous().view(torch.uint8)[group_idx]
+
+        a_dq = dequantize_fp4_torch(a_q, a_s).to(torch.float)
+        b_dq = dequantize_fp4_torch(b_q, b_s).to(torch.float)
+
+        ref_out[mask] = a_dq @ b_dq.t()
+    ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
+
+    from deep_gemm import preprocess_mxfp4_weight_for_act_and_quant_fusing
+    weight_scale = y[1].contiguous().view(torch.uint8)
+    y_interleave = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y[0], weight_scale=weight_scale)
+
+    deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y_interleave, bias, out, m_indices, out_scale=out_scale, swiglu_limit=swiglu_limit)
+
+    ### Reference
+    if swiglu_limit > 0.0:
+        gate_clamped = torch.clamp(ref_out[:, :(ref_out.shape[-1]//2)], max=swiglu_limit)
+        up_clamped = torch.clamp(ref_out[:, (ref_out.shape[-1]//2):], min=-swiglu_limit, max=swiglu_limit)
+        silu = gate_clamped * torch.sigmoid(gate_clamped) * up_clamped
+    else:
+        silu = ref_out[:, :(ref_out.shape[-1]//2)] * torch.sigmoid(ref_out[:, :(ref_out.shape[-1]//2)]) * ref_out[:, (ref_out.shape[-1]//2):]
+    ref_quant_torch, ref_quant_scale_torch_ = quantize_fp4_torch(src_tensor=silu)
+    ref_quant_scale_torch = preprocess_mxfp4_scales(scale=ref_quant_scale_torch_)
+
+    ### Check
+    diff = calc_diff(out, ref_quant_torch).item()
+    diff_scale = calc_diff(out_scale, ref_quant_scale_torch).item()
+    if diff >= 0.00001 or diff_scale >= 0.00001:
+        print("ref_out:", ref_quant_torch)
+        print("out:", out)
+        print("ref_out_scale:", ref_quant_scale_torch)
+        print("out_scale:", out_scale)
+        torch.testing.assert_close(out, ref_quant_torch, rtol=1e-3, atol=1e-4)
+        torch.testing.assert_close(out_scale, ref_quant_scale_torch, rtol=1e-3, atol=1e-4)
+    assert diff < 0.00001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+    assert diff_scale < 0.00001, f'{m=}, {k=}, {n=}, {diff_scale:.5f}'
+    print(f"Passed with acc_check. {diff=}, {diff_scale=}\n")
+
+def test_m_grouped_gemm_nopad_silu_and_mul_post_quant_loop(num_groups: int = None, m: int = None, n: int = None, k: int = None) -> None:
+    print("Running GroupedNoPad GEMM with enable_silu_and_mul_quant_fusing test...")
+    print("Running default test suite...")
+    # DPSKV4FLASH(N4096K4096E256TOPK6) DPSKV4PRO(N6144K7168E384TOPK6)
+    for num_groups, expected_m_per_group in ((4, 256), (6, 256), ):
+        for k, n in ((4096, 4096), (7168, 6144)):
+            for swiglu_limit in (0.0, 10.0):
+                print(f"Testing with num_groups={num_groups}, m={num_groups * expected_m_per_group}, n={n}, k={k}")
+                args = {"groups": num_groups, "m": num_groups * expected_m_per_group, "n": n, "k": k, "distribution": "uniform", "swiglu_limit": swiglu_limit}
+                test_m_grouped_gemm_nopad_silu_and_mul_post_quant(args)
+    print("Passed\n")
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Process target function api test.")
-    parser.add_argument('--func', default=None, choices=["DenseGemm", "GroupedNoPad", "GroupedMasked", "GroupedFused", "GroupedMaskedSiluAndMulPostQuant"], required=False, help='target test func')
+    parser.add_argument('--func', default=None, choices=["DenseGemm", "GroupedNoPad", "GroupedMasked", "GroupedFused", "GroupedMaskedSiluAndMulPostQuant", "GroupedNoPadSiluAndMulPostQuant"], required=False, help='target test func')
     parser.add_argument('--num_groups', type=int, help='Number of groups for Grouped GEMM')
     parser.add_argument('--m', type=int, help='M dimension')
     parser.add_argument('--n', type=int, help='N dimension')
@@ -411,6 +475,9 @@ if __name__ == '__main__':
 
         if args.func in ['GroupedMaskedSiluAndMulPostQuant']:
             test_m_grouped_gemm_masked_silu_and_mul_post_quant_loop(num_groups, m, n, k)
+
+        if args.func in ['GroupedNoPadSiluAndMulPostQuant']:
+            test_m_grouped_gemm_nopad_silu_and_mul_post_quant_loop(num_groups, m, n, k)
     else:
         test_m_grouped_gemm_nopad_loop(num_groups, m, n, k)
         test_m_grouped_gemm_masked_loop(num_groups, m, n, k)

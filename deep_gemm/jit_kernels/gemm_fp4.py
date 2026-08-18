@@ -586,7 +586,7 @@ def preprocess_mxfp4_weight_for_act_and_quant_fusing(weight: torch.Tensor, weigh
     assert weight.dtype == torch.uint8 and weight_scale.dtype == torch.uint8, "The dtype of weight and weight_scale must be uint8, preprocess_mxfp4_weight_for_act_and_quant_fusing should be called before preprocess_mxfp4_scales."
     assert weight.is_contiguous() and weight_scale.is_contiguous(), "weight and weight_scale must be contiguous. preprocess_mxfp4_weight_for_act_and_quant_fusing should be called before preprocess_mxfp4_scales."
 
-    ### do interleaving to make up and gate be adjecent.
+    ### do interleaving to make up and gate be adjacent.
     num_groups, n, k = weight.shape
     assert n % 2 == 0, "N must be divideable by 2 for silu_and_mul."
     half_n = n // 2
