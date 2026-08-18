@@ -10,7 +10,6 @@ from . import deep_gemm_tuner
 from . import deep_gemm_cpp
 from .jit_kernels import (
     gemm_fp4_fp4_bf16_nt,
-    tf32_hc_prenorm_gemm,
     gemm_fp8_fp8_bf16_nt,
     gemm_int8_int8_bf16_nt,
     m_grouped_gemm_fp4_fp4_bf16_nt_masked,
@@ -72,6 +71,7 @@ from .deep_gemm_cpp import (
     m_grouped_gemm_int8_int8_bf16_nt_masked,
     m_grouped_gemm_int8_int8_bf16_nt_contiguous,
     m_grouped_gemm_int8_int8_bf16_nt_nopad,
+    tf32_hc_prenorm_gemm,
 )
 
 use_cpp_jit_for_python = os.environ.get('USE_CPP_JIT_FOR_PYTHON', '').lower()
@@ -98,8 +98,6 @@ if should_init_deep_gemm_cpp:
         m_grouped_gemm_fp4_fp4_bf16_nt_masked,
         m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
         gemm_fp4_fp4_bf16_nt,
-        # TF32 GEMMs
-        tf32_hc_prenorm_gemm,
         # Attention (MQA logits)
         get_paged_mqa_logits_metadata,
         bf16_mqa_logits,
