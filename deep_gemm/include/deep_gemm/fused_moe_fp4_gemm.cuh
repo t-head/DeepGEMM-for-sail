@@ -382,6 +382,10 @@ fp4_gemm_fused_moe_kernel(const QuantGemmArgs args) {
         // Load A, B shmem->regs for k_block+1
         // Copy gmem to smem before computing gemm on each k-pipe
         if (k_block == K_BLOCK_MAX - 1) {
+
+          cp_async_wait<kNumStages-2>();
+          __syncthreads();
+
           // Commit the smem for smem_pipe_read
           if (k_tile_count > 0) {
             copy_A_to_tsm<SrcT, ACopyInst, TilerA, BLOCK_M, BLOCK_K, STRIDE_AM>(
@@ -406,9 +410,6 @@ fp4_gemm_fused_moe_kernel(const QuantGemmArgs args) {
           // Slice the smem_pipe_read smem
           tCsA_p = tCsA(_,_,_,smem_pipe_read);
           tCsB_p = tCsB(_,_,_,smem_pipe_read);
-
-          cp_async_wait<kNumStages-1>();
-          __syncthreads();
         }
         // Load A, B shmem->regs for k_block+1
         auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static

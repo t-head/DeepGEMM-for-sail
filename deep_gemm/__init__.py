@@ -9,17 +9,17 @@ from . import jit
 from . import deep_gemm_tuner
 from . import deep_gemm_cpp
 from .jit_kernels import (
-    gemm_fp4_fp4_bf16_nt,
+    # gemm_fp4_fp4_bf16_nt,
     gemm_fp8_fp8_bf16_nt,
     gemm_int8_int8_bf16_nt,
-    m_grouped_gemm_fp4_fp4_bf16_nt_masked,
-    m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
+    # m_grouped_gemm_fp4_fp4_bf16_nt_masked,
+    # m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
     m_grouped_gemm_w4a16_masked,
     m_grouped_gemm_w4a16_nopad,
     m_grouped_gemm_w4a16_fused,
-    preprocess_mxfp4_scales,
+    # preprocess_mxfp4_scales,
     uint8_padding,
-    preprocess_mxfp4_weight_for_act_and_quant_fusing,
+    # preprocess_mxfp4_weight_for_act_and_quant_fusing,
     # m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
     # m_grouped_gemm_fp8_fp8_bf16_nt_masked,
     # m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
@@ -50,6 +50,7 @@ from .deep_gemm_cpp import (
     gemm_bf16_bf16_bf16_nt,
     # gemm_fp8_fp8_bf16_nt,
     # gemm_int8_int8_bf16_nt,
+    gemm_fp4_fp4_bf16_nt,
     m_grouped_gemm_bf16_bf16_bf16_nt_masked,
     m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
     m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
@@ -59,6 +60,8 @@ from .deep_gemm_cpp import (
     m_grouped_gemm_int8_int8_bf16_nt_masked,
     m_grouped_gemm_int8_int8_bf16_nt_contiguous,
     m_grouped_gemm_int8_int8_bf16_nt_nopad,
+    m_grouped_gemm_fp4_fp4_bf16_nt_masked,
+    m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
     tf32_hc_prenorm_gemm,
     # Attention kernels
     get_paged_mqa_logits_metadata,
@@ -72,6 +75,8 @@ from .deep_gemm_cpp import (
     fp8_fp4_paged_mqa_logits,
     fp8_einsum,
     int8_einsum,
+    preprocess_mxfp4_scales,
+    preprocess_mxfp4_weight_for_act_and_quant_fusing,
 )
 
 use_cpp_jit_for_python = os.environ.get('USE_CPP_JIT_FOR_PYTHON', '').lower()
@@ -95,9 +100,6 @@ if should_init_deep_gemm_cpp:
         # fp8_gemm_nt_skip_head_mid,
         gemm_fp8_fp8_bf16_nt,
         gemm_int8_int8_bf16_nt,
-        m_grouped_gemm_fp4_fp4_bf16_nt_masked,
-        m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
-        gemm_fp4_fp4_bf16_nt,
        # # BF16 Fused MoE GEMM
        # m_grouped_gemm_bf16_bf16_bf16_nt_fused,
        # # FP8/INT8 Fused MoE GEMM

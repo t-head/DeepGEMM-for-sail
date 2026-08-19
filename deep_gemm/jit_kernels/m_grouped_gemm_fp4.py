@@ -217,7 +217,6 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         ### sfm and sfn always > 1 for GroupedNoPad(topk > 1).
         out_scale.as_strided_(size=(sfm, sfn), stride=(1, sfm))
 
-    return out
 
 def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor],
                                           rhs_: Tuple[torch.Tensor, torch.Tensor],
