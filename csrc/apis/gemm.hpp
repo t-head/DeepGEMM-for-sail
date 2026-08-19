@@ -122,7 +122,7 @@ void fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                  const std::pair<torch::Tensor, torch::Tensor>& b,
                  const std::optional<torch::Tensor>& bias,
                  const torch::Tensor& d,
-                 std::optional<ConfigTuple> config = std::nullopt) {
+                 std::optional<ConfigTuple> configs = std::nullopt) {
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
@@ -137,9 +137,33 @@ void fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     DG_HOST_ASSERT(lhs.scalar_type() == torch::kUInt8);
     DG_HOST_ASSERT(rhs.scalar_type() == torch::kUInt8);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    // Scales carry mxfp4 e8m0 scales: either raw uint8 (pre-preprocess) or uint16 (post-preprocess).
+    DG_HOST_ASSERT(lhs_scales.scalar_type() == torch::kUInt16 || lhs_scales.scalar_type() == torch::kUInt8);
+    DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kUInt16 || rhs_scales.scalar_type() == torch::kUInt8);
+    DG_HOST_ASSERT(lhs_scales.dim() == 2);
+    DG_HOST_ASSERT(rhs_scales.dim() == 2);
     TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
     TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+
+    // --- Scales layout check & preprocess ---
+    torch::Tensor lhs_scales_t = lhs_scales;
+    torch::Tensor rhs_scales_t = rhs_scales;
+    if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(lhs_scales_t)) {
+        lhs_scales_t = deep_gemm_fp4_common::preprocess_mxfp4_scales(lhs_scales_t);
+    }
+    if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t)) {
+        rhs_scales_t = deep_gemm_fp4_common::post_preprocess_mxfp4_scales(rhs_scales_t);
+        if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t)) {
+            rhs_scales_t = deep_gemm_fp4_common::preprocess_mxfp4_scales(rhs_scales_t);
+        }
+    }
+
+    // Scale stride checks (validate post-preprocessing result)
+    DG_HOST_ASSERT(deep_gemm_fp4_common::check_mxfp4_scales_layout(lhs_scales_t));
+    DG_HOST_ASSERT(deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t));
+
+    if (m == 0) return;
 
     // Handle bias - create empty tensor if not provided
     torch::Tensor bias_tensor;
@@ -150,9 +174,7 @@ void fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         bias_tensor = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(lhs.device()));
     }
 
-    if (m == 0) return;
-
-    fp4_gemm(lhs, lhs_scales, rhs, rhs_scales, bias_tensor, d, m, n, k, config);
+    fp4_gemm(lhs, lhs_scales_t, rhs, rhs_scales_t, bias_tensor, d, m, n, k, configs);
 }
 
 void m_grouped_gemm_int8_int8_bf16_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -537,7 +559,9 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
     const torch::Tensor& d,
     const torch::Tensor& m_indices,
     std::optional<const torch::Tensor> m_rows = std::nullopt,
-    std::optional<ConfigTuple> config = std::nullopt) {
+    std::optional<ConfigTuple> configs = std::nullopt,
+    std::optional<torch::Tensor> out_scale = std::nullopt,
+    std::optional<double> swiglu_limit = std::nullopt) {
 
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
@@ -549,19 +573,67 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
     const auto& [m_, n_] = get_shape<2>(d);
     int m__ = m_indices.numel();
 
-    DG_HOST_ASSERT(m == m_ && m_ == m__ && k == k_ && n == n_);
+    DG_HOST_ASSERT(m == m_ && m_ == m__ && k == k_);
     DG_HOST_ASSERT(lhs.scalar_type() == torch::kUInt8);
     DG_HOST_ASSERT(rhs.scalar_type() == torch::kUInt8);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(m_indices.scalar_type() == torch::kInt32);
+
     TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
     TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
     TORCH_CHECK(m_indices.is_contiguous(), "m_indices must be contiguous");
 
+    // Undefined (rather than empty) means "no fused epilogue"; the impl keys off `defined()`.
+    at::Tensor out_scale_tensor;
+    if (out_scale.has_value() && out_scale->defined()) {
+        out_scale_tensor = *out_scale;
+    }
+
+    // When `out_scale` is given, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
+    // `d` becomes uint8 of shape (m, n / 4) and `out_scale` uint16 of shape
+    // (m, ceil_div(n / 4, 32)). Unlike the masked variant both are 2-D (no group dim).
+    const bool enable_silu_and_mul_quant_fusing = out_scale_tensor.defined() && out_scale_tensor.numel() > 0;
+    int sfm = 0, sfn = 0;
+    if (enable_silu_and_mul_quant_fusing) {
+        const int shape_n_out = n / 4;  // /2 for silu_and_mul, /2 for mxfp4 packing
+        sfm = m;
+        sfn = ceil_div(shape_n_out, 32);
+        DG_HOST_ASSERT(n_ == shape_n_out);
+        DG_HOST_ASSERT((out_scale_tensor.sizes() == std::vector<int64_t>{sfm, sfn}));
+        DG_HOST_ASSERT(d.scalar_type() == torch::kUInt8);
+        DG_HOST_ASSERT(out_scale_tensor.scalar_type() == torch::kUInt16);
+        DG_HOST_ASSERT(out_scale_tensor.is_contiguous() ||
+                       deep_gemm_fp4_common::check_mxfp4_scales_layout(out_scale_tensor));
+        DG_HOST_ASSERT(!(bias.has_value() && bias->defined() && bias->numel() > 0));
+    } else {
+        DG_HOST_ASSERT(!swiglu_limit.has_value() || *swiglu_limit == 0.0);  // only used with out_scale
+        DG_HOST_ASSERT(n_ == n);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    }
+
+    // --- Scales layout check & preprocess ---
+    torch::Tensor lhs_scales_t = lhs_scales;
+    torch::Tensor rhs_scales_t = rhs_scales;
+    if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(lhs_scales_t)) {
+        lhs_scales_t = deep_gemm_fp4_common::preprocess_mxfp4_scales(lhs_scales_t);
+    }
+    if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t)) {
+        rhs_scales_t = deep_gemm_fp4_common::post_preprocess_mxfp4_scales(rhs_scales_t);
+        if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t)) {
+            rhs_scales_t = deep_gemm_fp4_common::preprocess_mxfp4_scales(rhs_scales_t);
+        }
+    }
+
+    // Scale stride checks (validate post-preprocessing result)
+    DG_HOST_ASSERT(deep_gemm_fp4_common::check_mxfp4_scales_layout(lhs_scales_t));
+    DG_HOST_ASSERT(deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t));
+
+    if (m == 0) return;
+
     torch::Tensor bias_tensor;
     if (bias.has_value() && bias->defined() && bias->numel() > 0) {
         bias_tensor = *bias;
+        DG_HOST_ASSERT(bias_tensor.scalar_type() == torch::kFloat32);
     } else {
         bias_tensor = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(lhs.device()));
     }
@@ -573,10 +645,16 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
         m_rows_tensor = torch::Tensor();  // undefined
     }
 
-    if (m == 0) return;
+    m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(lhs, lhs_scales_t, rhs, rhs_scales_t, bias_tensor, d,
+                                                m_indices, m_rows_tensor, m, n, k, num_groups, configs,
+                                                out_scale_tensor, swiglu_limit.value_or(0.0));
 
-    m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(lhs, lhs_scales, rhs, rhs_scales, bias_tensor, d,
-                                                m_indices, m_rows_tensor, m, n, k, num_groups, config);
+    // Mirror the Python path: re-stride `out_scale` in place to the N-major layout (1, sfm) that
+    // the Gemm2 SFA reader expects. NOTE: this is 2-D here, unlike the masked variant's 3-D layout.
+    // `out_scale_tensor` shares the TensorImpl with the caller's tensor, so this is visible in Python.
+    if (enable_silu_and_mul_quant_fusing) {
+        out_scale_tensor.as_strided_({sfm, sfn}, {1, (int64_t)sfm});
+    }
 }
 
 void m_grouped_gemm_bf16_bf16_bf16_nt_fused(
@@ -715,22 +793,41 @@ void m_grouped_gemm_int8_int8_bf16_nt_fused(
         expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, configs);
 }
 
-static void m_grouped_gemm_fp4_fp4_bf16_nt_masked(
+static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
     const std::pair<torch::Tensor, torch::Tensor>& a,
     const std::pair<torch::Tensor, torch::Tensor>& b,
     const std::optional<torch::Tensor>& bias,
     const torch::Tensor& d,
     const torch::Tensor& masked_m,
     int expected_m,
-    std::optional<ConfigTuple> config = std::nullopt,
+    std::optional<ConfigTuple> configs = std::nullopt,
     std::optional<int> max_block_n = 256,
     std::optional<bool> enable_sbo_overlap = false,
-    std::optional<const torch::Tensor> signal = std::nullopt) {
+    std::optional<const torch::Tensor> signal = std::nullopt,
+    std::optional<torch::Tensor> out_scale = std::nullopt,
+    std::optional<double> swiglu_limit = std::nullopt) {
 
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
     const auto& rhs_scales = b.second;
+
+    const auto& [num_groups, m, k] = get_shape<3>(lhs);
+    const auto& [num_groups_, n, k_] = get_shape<3>(rhs);
+    const auto& [num_groups__, m_, n_] = get_shape<3>(d);
+    int num_groups___ = masked_m.numel();
+
+    DG_HOST_ASSERT(num_groups == num_groups_ && num_groups_ == num_groups__ && num_groups__ == num_groups___);
+    DG_HOST_ASSERT(m == m_ && k == k_);
+    DG_HOST_ASSERT(expected_m > 0 && m > 0 && n > 0 && k > 0 && num_groups > 0);
+    DG_HOST_ASSERT(lhs.scalar_type() == torch::kUInt8);
+    DG_HOST_ASSERT(rhs.scalar_type() == torch::kUInt8);
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt32);
+
+    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
+    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+    TORCH_CHECK(masked_m.is_contiguous(), "masked_m must be contiguous");
 
     at::Tensor signal_tensor;
     if (signal.has_value() && signal->defined()) {
@@ -739,26 +836,55 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_masked(
         signal_tensor = at::empty({0}, at::TensorOptions().dtype(at::kInt).device(d.device()));
     }
 
-    const auto& [num_groups, m, k] = get_shape<3>(lhs);
-    const auto& [num_groups_, n, k_] = get_shape<3>(rhs);
-    const auto& [num_groups__, m_, n_] = get_shape<3>(d);
-    int num_groups___ = masked_m.numel();
+    // Undefined (rather than empty) means "no fused epilogue"; the impl keys off `defined()`.
+    at::Tensor out_scale_tensor;
+    if (out_scale.has_value() && out_scale->defined()) {
+        out_scale_tensor = *out_scale;
+    }
 
-    DG_HOST_ASSERT(num_groups == num_groups_ && num_groups_ == num_groups__ && num_groups__ == num_groups___);
-    DG_HOST_ASSERT(m == m_ && n == n_ && k == k_);
-    DG_HOST_ASSERT(expected_m > 0 && m > 0 && n > 0 && k > 0 && num_groups > 0);
-    DG_HOST_ASSERT(lhs.scalar_type() == torch::kUInt8);
-    DG_HOST_ASSERT(rhs.scalar_type() == torch::kUInt8);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt32);
-    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
-    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
-    TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
-    TORCH_CHECK(masked_m.is_contiguous(), "masked_m must be contiguous");
+    // When `out_scale` is given, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
+    // `d` becomes uint8 of shape (num_groups, m, n / 4) and `out_scale` uint16 of shape
+    // (num_groups, m, ceil_div(n / 4, 32)). Bias is not supported in that mode.
+    const bool enable_silu_and_mul_quant_fusing = out_scale_tensor.defined() && out_scale_tensor.numel() > 0;
+    int sfm = 0, sfn = 0;
+    if (enable_silu_and_mul_quant_fusing) {
+        const int shape_n_out = n / 4;  // /2 for silu_and_mul, /2 for mxfp4 packing
+        sfm = m;
+        sfn = ceil_div(shape_n_out, 32);
+        DG_HOST_ASSERT(n_ == shape_n_out);
+        DG_HOST_ASSERT((out_scale_tensor.sizes() == std::vector<int64_t>{num_groups, sfm, sfn}));
+        DG_HOST_ASSERT(d.scalar_type() == torch::kUInt8);
+        DG_HOST_ASSERT(out_scale_tensor.scalar_type() == torch::kUInt16);
+        DG_HOST_ASSERT(out_scale_tensor.is_contiguous() ||
+                       deep_gemm_fp4_common::check_mxfp4_scales_layout(out_scale_tensor));
+        DG_HOST_ASSERT(!(bias.has_value() && bias->defined() && bias->numel() > 0));
+    } else {
+        DG_HOST_ASSERT(!swiglu_limit.has_value() || *swiglu_limit == 0.0);  // only used with out_scale
+        DG_HOST_ASSERT(n_ == n);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    }
+
+    // --- Scales layout check & preprocess ---
+    torch::Tensor lhs_scales_t = lhs_scales;
+    torch::Tensor rhs_scales_t = rhs_scales;
+    if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(lhs_scales_t)) {
+        lhs_scales_t = deep_gemm_fp4_common::preprocess_mxfp4_scales(lhs_scales_t);
+    }
+    if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t)) {
+        rhs_scales_t = deep_gemm_fp4_common::post_preprocess_mxfp4_scales(rhs_scales_t);
+        if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t)) {
+            rhs_scales_t = deep_gemm_fp4_common::preprocess_mxfp4_scales(rhs_scales_t);
+        }
+    }
+
+    // Scale stride checks (validate post-preprocessing result)
+    DG_HOST_ASSERT(deep_gemm_fp4_common::check_mxfp4_scales_layout(lhs_scales_t));
+    DG_HOST_ASSERT(deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t));
 
     torch::Tensor bias_tensor;
     if (bias.has_value() && bias->defined() && bias->numel() > 0) {
         bias_tensor = *bias;
+        DG_HOST_ASSERT(bias_tensor.scalar_type() == torch::kFloat32);
     } else {
         bias_tensor = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(lhs.device()));
     }
@@ -769,10 +895,21 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_masked(
         TORCH_CHECK(signal_tensor.scalar_type() == torch::kInt32, "signal must be int32");
     }
 
-    m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(lhs, lhs_scales, rhs, rhs_scales, bias_tensor, d,
-                                                 masked_m, m, n, k, num_groups, expected_m, config,
+    const auto& result = m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(lhs, lhs_scales_t, rhs, rhs_scales_t, bias_tensor, d,
+                                                 masked_m, m, n, k, num_groups, expected_m, configs,
                                                  max_block_n.value_or(256), enable_sbo_overlap.value_or(false),
-                                                 signal_tensor);
+                                                 signal_tensor,
+                                                 out_scale_tensor,
+                                                 swiglu_limit.value_or(0.0));
+
+    // Mirror the Python path: re-stride `out_scale` in place to the N-major layout
+    // (sfm * sfn, 1, sfm) that the Gemm2 SFA reader expects. `out_scale_tensor` shares the
+    // TensorImpl with the caller's tensor, so the re-stride is visible on the Python side.
+    if (enable_silu_and_mul_quant_fusing) {
+        out_scale_tensor.as_strided_({num_groups, sfm, sfn},
+                                     {(int64_t)sfm * sfn, 1, (int64_t)sfm});
+    }
+    return result;
 }
 
 void tf32_hc_prenorm_gemm_nt(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
@@ -857,13 +994,51 @@ static void register_apis(pybind11::module_& m) {
     // FP4 GEMMs
     m.def("gemm_fp4_fp4_bf16_nt", &fp4_gemm_nt, py::arg("a"), py::arg("b"), py::arg("bias"),
           py::arg("d"), py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_fp4_fp4_bf16_nt_nopad", &m_grouped_gemm_fp4_fp4_bf16_nt_nopad, py::arg("a"),
-          py::arg("b"), py::arg("bias"), py::arg("d"), py::arg("m_indices"),
-          py::arg("m_rows") = std::nullopt, py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_fp4_fp4_bf16_nt_masked", &m_grouped_gemm_fp4_fp4_bf16_nt_masked, py::arg("a"),
-          py::arg("b"), py::arg("bias"), py::arg("d"), py::arg("masked_m"), py::arg("expected_m"),
-          py::arg("configs") = std::nullopt, py::arg("max_block_n") = 256,
-          py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt);
+    m.def("m_grouped_gemm_fp4_fp4_bf16_nt_nopad", &m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
+          R"(MoE GroupedNoPad FP4 GEMM.
+
+When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
+`out` must be uint8 of shape (m, n // 4) and `out_scale` uint16 of shape
+(m, ceil_div(n // 4, 32)). The gemm1 weight must have been interleaved with
+`preprocess_mxfp4_weight_for_act_and_quant_fusing` (instead of `preprocess_mxfp4_scales`), so
+that the epilogue reads gate/up (W1/W3) pairs from adjacent N positions.
+
+`swiglu_limit > 0` clamps before the activation: the gate is clamped from above only
+(`min(gate, limit)`) and the up projection on both sides (`clamp(up, -limit, limit)`);
+`0.0` or None disables the clamp.
+
+Shape `n` must be a multiple of 64, and a bias is not supported in the fused mode.
+
+NOTE: when `out_scale` is not None, it is re-strided **in place** on return to the N-major
+layout (1, sfm) expected by the Gemm2 SFA reader. Unlike the masked variant, both `out` and
+`out_scale` are 2-D here (no group dimension) and the re-stride is (1, sfm) rather than
+(sfm * sfn, 1, sfm). Passing an already re-strided `out_scale` back in is supported.)",
+          py::arg("a"), py::arg("b"), py::arg("bias"), py::arg("d"), py::arg("m_indices"),
+          py::arg("m_rows") = std::nullopt, py::arg("configs") = std::nullopt,
+          py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt);
+    m.def("m_grouped_gemm_fp4_fp4_bf16_nt_masked", &m_grouped_gemm_fp4_fp4_bf16_nt_masked,
+          R"(MoE GroupedMasked FP4 GEMM.
+
+When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
+`out` must be uint8 of shape (num_groups, m, n // 4) and `out_scale` uint16 of shape
+(num_groups, m, ceil_div(n // 4, 32)). The gemm1 weight must have been interleaved with
+`preprocess_mxfp4_weight_for_act_and_quant_fusing` (before `preprocess_mxfp4_scales`), so
+that the epilogue reads gate/up (W1/W3) pairs from adjacent N positions.
+
+`swiglu_limit > 0` clamps before the activation: the gate is clamped from above only
+(`min(gate, limit)`) and the up projection on both sides (`clamp(up, -limit, limit)`);
+`0.0` or None disables the clamp.
+
+Shape `n` must be a multiple of 64, and a bias is not supported in the fused mode.
+
+NOTE: when `out_scale` is not None, it is re-strided **in place** on return to the N-major
+layout (sfm * sfn, 1, sfm) expected by the Gemm2 SFA reader.
+
+Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes both.)",
+          py::arg("a"), py::arg("b"), py::arg("bias"), py::arg("d"), py::arg("masked_m"),
+          py::arg("expected_m"), py::arg("configs") = std::nullopt, py::arg("max_block_n") = 256,
+          py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt,
+          py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt);
     // TF32 GEMMs
     m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("sqr_sum"), py::arg("num_splits") = std::nullopt, py::arg("configs") = std::nullopt);

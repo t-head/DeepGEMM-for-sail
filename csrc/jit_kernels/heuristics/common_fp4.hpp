@@ -1,6 +1,8 @@
 #pragma once
+#include <algorithm>
 #include <cassert>
 #include <map>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -79,6 +81,39 @@ inline torch::Tensor post_preprocess_mxfp4_scales(const torch::Tensor& scale) {
     return scale;
 }
 
+/// Interleave a fused-MoE gemm1 weight so that the epilogue reads gate/up (W1/W3) pairs from
+/// adjacent N positions, and return the matching preprocessed scale.
+// keep in sync with deep_gemm/jit_kernels/gemm_fp4.py
+// NOTE: must be called *before* `preprocess_mxfp4_scales`, never after. Both inputs are required to
+// still be raw contiguous uint8 here, which is exactly what `preprocess_mxfp4_scales` takes away:
+// it packs the scale into uint16 and re-strides it to N-major.
+inline std::pair<torch::Tensor, torch::Tensor> preprocess_mxfp4_weight_for_act_and_quant_fusing(
+        const torch::Tensor& weight, const torch::Tensor& weight_scale) {
+    DG_HOST_ASSERT(weight.dim() == 3);
+    DG_HOST_ASSERT(weight_scale.dim() == 3);
+    DG_HOST_ASSERT(weight.dtype() == torch::kUInt8);
+    DG_HOST_ASSERT(weight_scale.dtype() == torch::kUInt8);
+    DG_HOST_ASSERT(weight.is_contiguous());
+    DG_HOST_ASSERT(weight_scale.is_contiguous());
+
+    // do interleaving to make up and gate be adjacent.
+    const int64_t num_groups = weight.size(0), n = weight.size(1), k = weight.size(2);
+    DG_HOST_ASSERT(n % 2 == 0);  // silu_and_mul splits N in half
+    const int64_t half_n = n / 2;
+    const auto gate = weight.slice(1, 0, half_n);
+    const auto up = weight.slice(1, half_n, n);
+    // `at::stack` writes a fresh contiguous tensor, so the following `view` is always legal.
+    const auto weight_out = at::stack({gate, up}, 2).view({num_groups, n, k});
+
+    const int64_t sfn = weight_scale.size(1), sfk = weight_scale.size(2);
+    // `weight` is uint8, so one byte holds two fp4 values: sfk == ceil_div(2 * k, 32).
+    DG_HOST_ASSERT(weight_scale.size(0) == num_groups && sfn == n && sfk == ceil_div<int64_t>(k, 16));
+    const auto gate_scale = weight_scale.slice(1, 0, half_n);
+    const auto up_scale = weight_scale.slice(1, half_n, n);
+    const auto weight_scale_out = at::stack({gate_scale, up_scale}, 2).view({num_groups, sfn, sfk});
+    return {weight_out, preprocess_mxfp4_scales(weight_scale_out)};
+}
+
 // ============================================================================
 
 using TileConfig = std::map<std::tuple<int, int, int>, std::tuple<int, int, int>>;
@@ -89,6 +124,7 @@ inline const TileConfig& get_tile_config_normal() {
         {{16, 64, 256}, {16, 16, 4}},
         {{32, 128, 128}, {32, 64, 2}},
         {{32, 64, 128}, {32, 32, 2}},
+        {{64, 64, 128}, {32, 64, 3}},
         {{64, 128, 128}, {32, 64, 2}},
         {{128, 128, 128}, {32, 64, 2}},
         {{128, 256, 64}, {64, 64, 3}},
@@ -145,7 +181,7 @@ std::tuple<int, int, int> get_smem_config_fp4(int num_stages, int block_m, int b
     int smem_size = std::max(smem_size_d, smem_size_a + smem_size_b + smem_size_sfa + smem_size_sfb);
 
     // Swizzle and padding are not compatible
-    assert((swizzle_mode > 0) + (block_n_padding > 0) <= 1);
+    DG_HOST_ASSERT((swizzle_mode > 0) + (block_n_padding > 0) <= 1);
     return std::make_tuple(smem_size, swizzle_mode, block_n_padding);
 }
 
@@ -295,7 +331,7 @@ ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, 
         best_block_n = 64;
     }
 
-    assert(best_block_m != 0 && best_block_n != 0);
+    DG_HOST_ASSERT(best_block_m != 0 && best_block_n != 0);
 
     // Always pick the longest one
     int block_k = 128;
@@ -308,7 +344,7 @@ ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, 
 
     int num_waves = get_num_waves(best_block_m, best_block_n);
     int num_min_sms = num_sms;
-    assert(num_min_sms <= num_sms);
+    DG_HOST_ASSERT(num_min_sms <= num_sms);
 
     auto [bm_out, bn_out, warp_m, warp_n] = get_warp_mn_dense(best_block_m, best_block_n);
 
@@ -334,8 +370,8 @@ ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, 
         }
     }
 
-    assert(std::get<0>(best_smem_config) != 0);
-    assert(best_num_stages != 0);
+    DG_HOST_ASSERT(std::get<0>(best_smem_config) != 0);
+    DG_HOST_ASSERT(best_num_stages != 0);
 
     return std::make_tuple(std::min(num_min_sms, num_sms), bm_out, bn_out, block_k, warp_m, warp_n, best_num_stages,
                            best_smem_config);
@@ -352,7 +388,7 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
 
     std::vector<int> block_ms = (k > 768) ? std::vector<int>{256, 128, 64, 32, 16} : std::vector<int>{128, 64, 32, 16};
 
-    assert(max_block_n > 0 && (max_block_n & (max_block_n - 1)) == 0);
+    DG_HOST_ASSERT(max_block_n > 0 && (max_block_n & (max_block_n - 1)) == 0);
     int bit_length = 32 - __builtin_clz(static_cast<unsigned>(max_block_n));
     std::vector<int> block_ns;
     if (k >= 384) {
@@ -500,7 +536,7 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
         best_block_m = best_block_m * 2;
     }
 
-    assert(best_block_m != 0 && best_block_n != 0);
+    DG_HOST_ASSERT(best_block_m != 0 && best_block_n != 0);
 
     // Always pick the longest one
     int block_k = 64;
@@ -535,6 +571,23 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
         best_block_n = 64;
         block_k = 256;
     }
+    // for DeepSeek-V4 Pro EP
+    if ((n == 6144 && k == 3584) || (n == 7168 && k == 1536)) {
+        if (m < 6) {
+            if (best_block_m == 32 && best_block_n == 64) {
+                best_block_m = 64;
+                best_block_n = 64;
+                block_k = 128;
+                if (k == 1536) {
+                    best_block_n = 128;
+                }
+            }
+        } else if ((best_block_m == 32 || best_block_m == 64) && best_block_n == 256) {
+            best_block_m = 128;
+            best_block_n = 256;
+            block_k = 64;
+        }
+    }
 
     const TileConfig& tile_config =
         (k < 128 && !(best_block_n >= 128 && best_block_m >= 128)) ? get_tile_config_smallK() : get_tile_config_normal();
@@ -555,8 +608,10 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
 
     int num_waves = get_num_waves(best_block_m, best_block_n);
     int num_min_sms = num_sms;
-    assert(num_min_sms <= num_sms);
+    DG_HOST_ASSERT(num_min_sms <= num_sms);
 
+    // NOTE: Python rebinds best_block_m/best_block_n from get_warp_mn_grouped() before deciding
+    // stage_candidates, so the conditions below must use the post-call values (bm_out/bn_out).
     auto [bm_out, bn_out, warp_m, warp_n] = get_warp_mn_grouped(best_block_m, best_block_n);
 
     std::vector<int> stage_candidates;
@@ -568,15 +623,15 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     if (stage_candidates.empty()) {
         stage_candidates = {2};
     }
-    if (best_block_m <= 32) {
+    if (bm_out <= 32) {
         stage_candidates = {3, 2};
     } else {
         stage_candidates = {3};
     }
-    if (best_block_m >= 128 && best_block_n >= 128) {
+    if (bm_out >= 128 && bn_out >= 128) {
         stage_candidates = {3, 4};
     }
-    if (best_block_m == 128 && best_block_n == 256) {
+    if (bm_out == 128 && bn_out == 256) {
         if (k >= 768) {
             stage_candidates = {4};
         } else {
@@ -596,11 +651,80 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
         }
     }
 
-    assert(std::get<0>(best_smem_config) != 0);
-    assert(best_num_stages != 0);
+    DG_HOST_ASSERT(std::get<0>(best_smem_config) != 0);
+    DG_HOST_ASSERT(best_num_stages != 0);
 
     return std::make_tuple(std::min(num_min_sms, num_sms), bm_out, bn_out, block_k, warp_m, warp_n, best_num_stages,
                            best_smem_config);
+}
+
+/// Decide whether to enable the MoE dynamic-tile kernel and which variant to use.
+/// Returns (enable_moe_dynamic_tile, dynamic_tile_id), where dynamic_tile_id is the
+/// FP4DynamicTileId enumerator name -- "LargeEM", "LargeK", "LargeK_G2", "SmallEM", or
+/// "Disabled" when not enabled. Mirrors select_moe_dynamic_tile() in m_grouped_gemm_fp4.py.
+///
+/// NOTE: the shape lists compare against `k * 2` because `k` here counts fp4 elements while the
+/// model shapes are quoted in bf16 elements.
+inline std::pair<bool, std::string> select_moe_dynamic_tile(int n, int k, int expected_m, bool has_bias) {
+    const auto extra_info = get_extra_info();
+    const bool env_use_moe_dynamic_tile = extra_info.at("use_moe_dynamic_tile") != 0;
+    if (has_bias || !env_use_moe_dynamic_tile) {
+        return {false, "Disabled"};
+    }
+
+    // qwen3.8
+    static const std::vector<std::pair<int, int>> model_gemm1_shape_list = {{4096, 8192}};
+    static const std::vector<std::pair<int, int>> model_gemm2_shape_list = {{8192, 2048}};
+    const std::pair<int, int> shape{n, k * 2};
+    const auto in_list = [&shape](const std::vector<std::pair<int, int>>& list) {
+        return std::find(list.begin(), list.end(), shape) != list.end();
+    };
+
+    if (in_list(model_gemm1_shape_list)) {
+        // TODO: fix the stack issue for the large-EM case
+        if (expected_m < 6 || expected_m > 76) {
+            return {false, "Disabled"};
+        }
+    } else if (in_list(model_gemm2_shape_list)) {
+        if (expected_m < 6 || expected_m > 51) {
+            return {false, "Disabled"};
+        }
+    } else {
+        if (expected_m < 23) {
+            return {false, "Disabled"};
+        }
+    }
+
+    // select dynamic-tile variant: LargeEM, LargeK, LargeK_G2, SmallEM
+    std::string dynamic_tile_id;
+    if (k > 2048) {
+        dynamic_tile_id = (expected_m > 32) ? "LargeEM" : "LargeK";
+    } else if (expected_m > 117) {
+        dynamic_tile_id = "LargeEM";
+    } else {
+        dynamic_tile_id = (k <= 1024) ? "SmallEM" : "LargeK_G2";
+    }
+    return {true, dynamic_tile_id};
+}
+
+/// Device-side launch constants of Fp4DeepGemmDynamicTile that the host cannot derive: the kernel
+/// picks its tile shape from a table indexed by kDynamicTileId, so neither the shared-storage size
+/// nor the block thread count follow from get_smem_config_fp4() or the usual
+/// (block_m/warp_m)*(block_n/warp_n)*32 formula. Values were read back from hgcc by instantiating
+/// each variant; the generated kernel pins shared_storage_size with a static_assert so a device-side
+/// change fails to compile rather than corrupting memory / launching with the wrong block shape.
+struct DynamicTileLaunchConst {
+    int shared_storage_size;  // == Fp4DeepGemmDynamicTile::SharedStorageSize
+    int block_threads;        // == Fp4DeepGemmDynamicTile::MaxThreadsPerBlock (get_block_shape().x)
+};
+
+inline DynamicTileLaunchConst dynamic_tile_launch_const(const std::string& dynamic_tile_id) {
+    if (dynamic_tile_id == "LargeEM")   return {209600, 512};
+    if (dynamic_tile_id == "LargeK")    return {130976, 256};
+    if (dynamic_tile_id == "LargeK_G2") return {130912, 256};
+    if (dynamic_tile_id == "SmallEM")   return { 87264, 128};
+    DG_HOST_ASSERT(false && "unknown FP4DynamicTileId");
+    return {0, 0};
 }
 
 } // namespace deep_gemm_fp4_common
