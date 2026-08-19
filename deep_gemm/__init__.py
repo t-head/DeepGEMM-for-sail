@@ -34,16 +34,6 @@ from .jit_kernels import (
     m_grouped_gemm_fp8_fp8_bf16_nt_fused,
     m_grouped_gemm_int8_int8_bf16_nt_fused,
     m_grouped_gemm_fp4_fp4_bf16_nt_fused,
-    # Attention kernels
-    get_paged_mqa_logits_metadata,
-    fp8_mqa_logits,
-    bf16_mqa_logits,
-    int8_mqa_logits,
-    fp8_paged_mqa_logits,
-    bf16_paged_mqa_logits,
-    int8_paged_mqa_logits,
-    fp8_fp4_mqa_logits,
-    fp8_fp4_paged_mqa_logits,
     fp8_einsum,
     int8_einsum,
 )
@@ -72,6 +62,16 @@ from .deep_gemm_cpp import (
     m_grouped_gemm_int8_int8_bf16_nt_contiguous,
     m_grouped_gemm_int8_int8_bf16_nt_nopad,
     tf32_hc_prenorm_gemm,
+    # Attention kernels
+    get_paged_mqa_logits_metadata,
+    fp8_mqa_logits,
+    bf16_mqa_logits,
+    int8_mqa_logits,
+    fp8_paged_mqa_logits,
+    bf16_paged_mqa_logits,
+    int8_paged_mqa_logits,
+    fp8_fp4_mqa_logits,
+    fp8_fp4_paged_mqa_logits,
 )
 
 use_cpp_jit_for_python = os.environ.get('USE_CPP_JIT_FOR_PYTHON', '').lower()
@@ -98,16 +98,6 @@ if should_init_deep_gemm_cpp:
         m_grouped_gemm_fp4_fp4_bf16_nt_masked,
         m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
         gemm_fp4_fp4_bf16_nt,
-        # Attention (MQA logits)
-        get_paged_mqa_logits_metadata,
-        bf16_mqa_logits,
-        fp8_mqa_logits,
-        int8_mqa_logits,
-        fp8_fp4_mqa_logits,
-        bf16_paged_mqa_logits,
-        fp8_paged_mqa_logits,
-        int8_paged_mqa_logits,
-        fp8_fp4_paged_mqa_logits,
     )
 
 deep_gemm_cpp.init(

@@ -71,16 +71,18 @@ __global__ void {}(
 
 // ---------------------------------------------------------------- paged logits
 
-// Parameter block handed to the generated paged kernels -- our own fixed layout, not a mirror of
-// `PPUPagedMqaLogits<...>::Arguments`. The generated code unpacks it and builds the real `Params`
-// device-side, so a change to the kernel's struct cannot silently misalign the launch. One block
-// serves both flavours; FP4-only fields are left null for the others.
-struct PagedMqaLogitsHostParams {
+// Host-side mirror of `cutlass::gemm::kernel::PPUPagedMqaLogits<...>::Arguments`.
+//
+// NOTES: the paged kernel takes this struct directly as its kernel argument -- unlike the non-paged
+// one we deliberately do NOT wrap it in a `HostParams` block that the kernel unpacks. Constructing
+// `Params` inside the kernel costs registers, and this kernel's vreg budget is already tight
+// (measured 216/256): the wrapper pushed it to 232 with a 16-byte stack spill and demoted address
+// arithmetic from scalar to vector registers, costing ~20% throughput. No template-dependent field
+// types appear here, so mirroring the layout is safe.
+struct PagedMqaLogitsArguments {
     const void* ptr_q;
-    const uint32_t* q_sf;   // FP4 only (packed e8m0), null otherwise
     const void* ptr_k;
-    const uint32_t* k_sf;   // FP4 only (packed e8m0), null otherwise
-    const float* k_scales;  // FP8 / INT8 only, null for BF16 and FP4
+    const float* k_scales;
     const void* weights;
     uint32_t batch_size;
     uint64_t logits_stride;
@@ -92,29 +94,35 @@ struct PagedMqaLogitsHostParams {
     const uint32_t* schedule_meta;
 };
 
-// Initialiser lists for `AttnKernel::Params`, evaluated in the generated device code. The field order
-// follows each kernel's own `Arguments` declaration.
-static constexpr const char* kPagedParamsInit =
-    "(const ElementQK*)hp.ptr_q, (const ElementQK*)hp.ptr_k, hp.k_scales, "
-    "(const ElementWeights*)hp.weights, hp.batch_size, hp.logits_stride, hp.kv_cache_stride_bytes, "
-    "hp.block_table_stride, hp.context_lens, (ElementLogits*)hp.logits, hp.block_table, "
-    "hp.schedule_meta";
-static constexpr const char* kPagedFP4ParamsInit =
-    "(const ElementQK*)hp.ptr_q, hp.q_sf, (const ElementQK*)hp.ptr_k, hp.k_sf, "
-    "(const ElementWeights*)hp.weights, hp.batch_size, hp.logits_stride, hp.kv_cache_stride_bytes, "
-    "hp.block_table_stride, hp.context_lens, (ElementLogits*)hp.logits, hp.block_table, "
-    "hp.schedule_meta";
+// Host-side mirror of `PPUPagedMqaLogitsFP4<...>::Arguments`: same as above plus the packed e8m0
+// scale pointers for Q and K.
+struct PagedMqaLogitsFP4Arguments {
+    const void* ptr_q;
+    const uint32_t* q_sf;
+    const void* ptr_k;
+    const uint32_t* k_sf;
+    const void* weights;
+    uint32_t batch_size;
+    uint64_t logits_stride;
+    uint64_t kv_cache_stride_bytes;
+    uint32_t block_table_stride;
+    const uint32_t* context_lens;
+    void* logits;
+    const uint32_t* block_table;
+    const uint32_t* schedule_meta;
+};
 
 // One runtime for both paged flavours; they share the template parameter list up to the trailing
 // `SPLIT_MBLOCK` that only FP4 takes, emitted via `extra_template_args`.
-class PagedMqaLogitsRuntime final : public LaunchRuntime<PagedMqaLogitsRuntime> {
+template <typename ArgumentsT>
+class PagedMqaLogitsRuntime final : public LaunchRuntime<PagedMqaLogitsRuntime<ArgumentsT>> {
 public:
     struct LaunchInfo {
         std::string include_header, kernel_class;
         std::string element_qk, element_acc, element_logits, element_weights;
         int next_n, num_heads, head_dim;
         int block_kv, warp_kv, num_q_stages, num_kv_stages, split_kv;
-        std::string extra_template_args, params_init;
+        std::string extra_template_args;
         int smem_size, num_threads;
         std::string kernel_name;
     };
@@ -122,7 +130,7 @@ public:
     struct Args {
         LaunchInfo launch_info;
         LaunchArgs launch_args;
-        PagedMqaLogitsHostParams kernel_params;
+        ArgumentsT kernel_params;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -152,25 +160,6 @@ using AttnKernel = cutlass::gemm::kernel::{}<
   kNumQStages, kNumKVStages, SPLIT_KV{}
 >;
 
-// Must stay byte-identical to `deep_gemm::PagedMqaLogitsHostParams` on the host side
-struct HostParams {{
-  const void* ptr_q;
-  const uint32_t* q_sf;
-  const void* ptr_k;
-  const uint32_t* k_sf;
-  const float* k_scales;
-  const void* weights;
-  uint32_t batch_size;
-  uint64_t logits_stride;
-  uint64_t kv_cache_stride_bytes;
-  uint32_t block_table_stride;
-  const uint32_t* context_lens;
-  void* logits;
-  const uint32_t* block_table;
-  const uint32_t* schedule_meta;
-}};
-static_assert(sizeof(HostParams) == {}, "host/device parameter block size mismatch");
-
 // The host computes these instead of reading them off the kernel type, so pin them down here
 static_assert(AttnKernel::SharedStorageSize == {}, "host/device shared memory size mismatch");
 static_assert(AttnKernel::MaxThreadsPerBlock == {}, "host/device thread count mismatch");
@@ -178,9 +167,8 @@ static_assert(AttnKernel::MaxThreadsPerBlock == {}, "host/device thread count mi
 extern "C"
 __launch_bounds__(AttnKernel::MaxThreadsPerBlock, AttnKernel::MinBlocksPerMultiprocessor)
 __global__ void {}(
-  HostParams hp
+  typename AttnKernel::Params params
 ) {{
-  typename AttnKernel::Params params{{{}}};
   extern __shared__ char smem[];
   AttnKernel op;
   op(params, smem);
@@ -189,8 +177,8 @@ __global__ void {}(
 )",
             info.include_header, info.element_qk, info.element_acc, info.element_logits, info.element_weights,
             info.next_n, info.num_heads, info.head_dim, info.block_kv, info.warp_kv, info.num_q_stages,
-            info.num_kv_stages, info.split_kv, info.kernel_class, info.extra_template_args,
-            sizeof(PagedMqaLogitsHostParams), info.smem_size, info.num_threads, info.kernel_name, info.params_init);
+            info.num_kv_stages, info.split_kv, info.kernel_class, info.extra_template_args, info.smem_size,
+            info.num_threads, info.kernel_name);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -200,22 +188,22 @@ __global__ void {}(
 
 // Dispatch helper. Unlike the non-paged kernel the grid is not derived from occupancy: it is
 // `num_blocks`, which the caller took from the `schedule_meta` table built earlier.
+template <typename ArgumentsT>
 static void launch_paged_mqa_logits(const std::string& include_header, const std::string& kernel_class,
-                                    const std::string& extra_template_args, const std::string& params_init,
+                                    const std::string& extra_template_args,
                                     const deep_gemm_mqa_common::PagedTile& tile, const std::string& element_qk,
                                     const std::string& element_acc, const std::string& element_logits,
                                     const std::string& element_weights, int next_n, int num_heads, int head_dim,
                                     int block_kv, int smem_size, int num_threads, int num_blocks,
-                                    const std::string& kernel_name,
-                                    const PagedMqaLogitsHostParams& kernel_params) {
-    using Runtime = PagedMqaLogitsRuntime;
+                                    const std::string& kernel_name, const ArgumentsT& kernel_params) {
+    using Runtime = PagedMqaLogitsRuntime<ArgumentsT>;
     const dim3 block(num_threads, 1, 1);
     const dim3 grid(num_blocks, 1, 1);
 
     const auto& args = typename Runtime::Args{
         .launch_info = {include_header, kernel_class, element_qk, element_acc, element_logits, element_weights,
                         next_n, num_heads, head_dim, block_kv, tile.warp_kv, tile.stage_q, tile.stage_k,
-                        tile.split_kv, extra_template_args, params_init, smem_size, num_threads, kernel_name},
+                        tile.split_kv, extra_template_args, smem_size, num_threads, kernel_name},
         .launch_args = {grid, block, smem_size},
         .kernel_params = kernel_params,
     };
@@ -341,30 +329,30 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     const auto* block_table_ptr = reinterpret_cast<const uint32_t*>(block_table.data_ptr());
     const auto* schedule_meta_ptr = reinterpret_cast<const uint32_t*>(schedule_meta.data_ptr());
 
-    // One parameter block for both flavours; the generated code picks the fields it needs
-    const PagedMqaLogitsHostParams params{
-        q.data_ptr(),
-        is_fp4 ? reinterpret_cast<const uint32_t*>(q_sf->data_ptr()) : nullptr,
-        k.data_ptr(),
-        is_fp4 ? reinterpret_cast<const uint32_t*>(k_scales.data_ptr()) : nullptr,
-        (not is_fp4 and k_scales.defined()) ? k_scales.data_ptr<float>() : nullptr,
-        weights.data_ptr(),
-        static_cast<uint32_t>(batch_size),
-        static_cast<uint64_t>(aligned_max_context_len),
-        static_cast<uint64_t>(kv_cache_stride_bytes),
-        static_cast<uint32_t>(block_table_stride),
-        context_lens_ptr,
-        logits.data_ptr(),
-        block_table_ptr,
-        schedule_meta_ptr,
-    };
-
-    launch_paged_mqa_logits(is_fp4 ? "fp4_paged_mqa_logits.cuh" : "ppu_paged_mqa_logits.cuh",
-                            is_fp4 ? "PPUPagedMqaLogitsFP4" : "PPUPagedMqaLogits",
-                            is_fp4 ? (tile.split_mblock ? ", true" : ", false") : "",
-                            is_fp4 ? kPagedFP4ParamsInit : kPagedParamsInit, tile, element_qk, element_acc,
-                            element_logits, element_weights, next_n, num_heads, head_dim, block_kv, smem_size,
-                            num_threads, num_blocks, kernel_name, params);
+    if (is_fp4) {
+        launch_paged_mqa_logits(
+            "fp4_paged_mqa_logits.cuh", "PPUPagedMqaLogitsFP4", tile.split_mblock ? ", true" : ", false", tile,
+            element_qk, element_acc, element_logits, element_weights, next_n, num_heads, head_dim, block_kv, smem_size,
+            num_threads, num_blocks, kernel_name,
+            PagedMqaLogitsFP4Arguments{q.data_ptr(), reinterpret_cast<const uint32_t*>(q_sf->data_ptr()),
+                                       k.data_ptr(), reinterpret_cast<const uint32_t*>(k_scales.data_ptr()),
+                                       weights.data_ptr(), static_cast<uint32_t>(batch_size),
+                                       static_cast<uint64_t>(aligned_max_context_len),
+                                       static_cast<uint64_t>(kv_cache_stride_bytes),
+                                       static_cast<uint32_t>(block_table_stride), context_lens_ptr, logits.data_ptr(),
+                                       block_table_ptr, schedule_meta_ptr});
+    } else {
+        launch_paged_mqa_logits(
+            "ppu_paged_mqa_logits.cuh", "PPUPagedMqaLogits", "", tile, element_qk, element_acc, element_logits,
+            element_weights, next_n, num_heads, head_dim, block_kv, smem_size, num_threads, num_blocks, kernel_name,
+            PagedMqaLogitsArguments{q.data_ptr(), k.data_ptr(),
+                                    k_scales.defined() ? k_scales.data_ptr<float>() : nullptr, weights.data_ptr(),
+                                    static_cast<uint32_t>(batch_size),
+                                    static_cast<uint64_t>(aligned_max_context_len),
+                                    static_cast<uint64_t>(kv_cache_stride_bytes),
+                                    static_cast<uint32_t>(block_table_stride), context_lens_ptr, logits.data_ptr(),
+                                    block_table_ptr, schedule_meta_ptr});
+    }
 
     // NOTES: the kernel writes into the padded buffer, the caller only sees the valid window
     return logits.slice(1, 0, max_context_len);

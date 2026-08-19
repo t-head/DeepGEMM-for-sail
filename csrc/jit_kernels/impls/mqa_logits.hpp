@@ -18,45 +18,62 @@
 
 namespace deep_gemm {
 
-// Parameter block handed to the generated kernel. This is *our own* fixed layout, not a mirror of
-// `PPUMqaLogits<...>::Arguments`: the generated code unpacks it and builds the real `Params` on the
-// device side. That buys two things:
-//   - `stride_k` always travels as 64-bit and is narrowed to `StrideKType` by an explicit cast in
-//     device code, so the host needs no template and makes no assumptions about byte order;
-//   - the host never has to reproduce the kernel's struct layout, so a change to `Arguments` cannot
-//     silently misalign the launch (the generated code carries a `sizeof` assertion as a backstop).
-// One block serves both flavours; the fields a flavour does not use are left null.
-struct MqaLogitsHostParams {
+// Spells out `StrideKType` for the generated code, tied to the template argument so the two can
+// never drift apart.
+template <typename T>
+struct StrideKTypeName;
+template <>
+struct StrideKTypeName<uint32_t> {
+    static constexpr const char* value = "uint32_t";
+};
+template <>
+struct StrideKTypeName<uint64_t> {
+    static constexpr const char* value = "uint64_t";
+};
+
+// Host-side mirror of `cutlass::gemm::kernel::PPUMqaLogits<...>::Arguments`.
+//
+// NOTES: the kernel takes this struct directly as its kernel argument -- we deliberately do NOT
+// wrap it in a `HostParams` block that the kernel unpacks. Constructing `Params` inside the kernel
+// costs registers and can push a pressure-sensitive kernel over its vreg budget (a stack spill was
+// observed on the paged kernel from exactly that pattern). `StrideKType` is picked at runtime
+// (`uint32_t` or `uint64_t`) and changes the struct layout, hence the template; the value pointers
+// stay `void*` because their element types only exist inside the generated device code.
+template <typename StrideKType>
+struct MqaLogitsArguments {
     const void* ptr_q;
-    const uint32_t* q_sf;   // FP4 only (packed e8m0), null otherwise
     const void* ptr_k;
-    const uint32_t* k_sf;   // FP4 only (packed e8m0), null otherwise
-    const float* k_scales;  // FP8 / INT8 only, null for BF16 and FP4
+    const float* k_scales;
     const void* weights;
-    void* cu_seq_len_k_start;
-    void* cu_seq_len_k_end;
+    uint32_t* cu_seq_len_k_start;
+    uint32_t* cu_seq_len_k_end;
     void* logits;
     uint32_t seq_len_q;
     uint32_t seq_len_k;
-    uint64_t stride_k;
+    StrideKType stride_k;
 };
 
-// Initialiser lists for `AttnKernel::Params`, evaluated in the generated device code where the
-// element types exist. The field order follows each kernel's own `Arguments` declaration.
-static constexpr const char* kMqaLogitsParamsInit =
-    "(const ElementQK*)hp.ptr_q, (const ElementQK*)hp.ptr_k, hp.k_scales, "
-    "(const ElementWeights*)hp.weights, (uint32_t*)hp.cu_seq_len_k_start, "
-    "(uint32_t*)hp.cu_seq_len_k_end, (ElementLogits*)hp.logits, hp.seq_len_q, hp.seq_len_k, "
-    "static_cast<StrideKType>(hp.stride_k)";
-static constexpr const char* kMqaLogitsFP4ParamsInit =
-    "(const ElementQK*)hp.ptr_q, hp.q_sf, (const ElementQK*)hp.ptr_k, hp.k_sf, "
-    "(const ElementWeights*)hp.weights, (int*)hp.cu_seq_len_k_start, (int*)hp.cu_seq_len_k_end, "
-    "(ElementLogits*)hp.logits, (int)hp.seq_len_q, (int)hp.seq_len_k, "
-    "static_cast<StrideKType>(hp.stride_k)";
+// Host-side mirror of `cutlass::gemm::kernel::PPUMqaLogitsFP4<...>::Arguments`. Same shape as the
+// non-FP4 one plus the packed e8m0 scale pointers for Q and K.
+template <typename StrideKType>
+struct MqaLogitsFP4Arguments {
+    const void* ptr_q;
+    const uint32_t* q_sf;
+    const void* ptr_k;
+    const uint32_t* k_sf;
+    const void* weights;
+    int* cu_seq_len_k_start;
+    int* cu_seq_len_k_end;
+    void* logits;
+    int seq_len_q;
+    int seq_len_k;
+    StrideKType stride_k;
+};
 
-// NOTES: one runtime serves both flavours -- they take an identical template parameter list and now
-// also share a single host-side parameter block, so nothing here needs templating.
-class MqaLogitsRuntime final : public LaunchRuntime<MqaLogitsRuntime> {
+// The FP4 and non-FP4 kernels take an identical template parameter list, differing only in
+// header and class name, so one runtime serves both -- parameterised by the `Arguments` mirror.
+template <typename StrideKType, typename ArgumentsT>
+class MqaLogitsRuntime final : public LaunchRuntime<MqaLogitsRuntime<StrideKType, ArgumentsT>> {
 public:
     struct LaunchInfo {
         std::string include_header, kernel_class;
@@ -64,7 +81,7 @@ public:
         int num_heads, head_dim;
         int block_qh, block_kv, warp_qh, warp_kv;
         int num_q_stages, num_kv_stages;
-        std::string stride_k_type, params_init;
+        std::string stride_k_type;
         bool is_compressed_logits;
         int smem_size, num_threads;
         std::string kernel_name;
@@ -73,7 +90,7 @@ public:
     struct Args {
         LaunchInfo launch_info;
         LaunchArgs launch_args;
-        MqaLogitsHostParams kernel_params;
+        ArgumentsT kernel_params;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -105,23 +122,6 @@ using AttnKernel = cutlass::gemm::kernel::{}<
   kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits
 >;
 
-// Must stay byte-identical to `deep_gemm::MqaLogitsHostParams` on the host side
-struct HostParams {{
-  const void* ptr_q;
-  const uint32_t* q_sf;
-  const void* ptr_k;
-  const uint32_t* k_sf;
-  const float* k_scales;
-  const void* weights;
-  void* cu_seq_len_k_start;
-  void* cu_seq_len_k_end;
-  void* logits;
-  uint32_t seq_len_q;
-  uint32_t seq_len_k;
-  uint64_t stride_k;
-}};
-static_assert(sizeof(HostParams) == {}, "host/device parameter block size mismatch");
-
 // The host computes these instead of reading them off the kernel type, so pin them down here
 static_assert(AttnKernel::SharedStorageSize == {}, "host/device shared memory size mismatch");
 static_assert(AttnKernel::MaxThreadsPerBlock == {}, "host/device thread count mismatch");
@@ -129,10 +129,8 @@ static_assert(AttnKernel::MaxThreadsPerBlock == {}, "host/device thread count mi
 extern "C"
 __launch_bounds__(AttnKernel::MaxThreadsPerBlock, AttnKernel::MinBlocksPerMultiprocessor)
 __global__ void {}(
-  HostParams hp
+  typename AttnKernel::Params params
 ) {{
-  // `stride_k` arrives as 64-bit and is narrowed here, which is why the host needs no template
-  typename AttnKernel::Params params{{{}}};
   extern __shared__ char smem[];
   AttnKernel op;
   op(params, smem);
@@ -142,7 +140,7 @@ __global__ void {}(
             info.include_header, info.element_qk, info.element_acc, info.element_logits, info.element_weights,
             info.num_heads, info.head_dim, info.block_qh, info.block_kv, info.warp_qh, info.warp_kv,
             info.num_q_stages, info.num_kv_stages, info.stride_k_type, info.is_compressed_logits, info.kernel_class,
-            sizeof(MqaLogitsHostParams), info.smem_size, info.num_threads, info.kernel_name, info.params_init);
+            info.smem_size, info.num_threads, info.kernel_name);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -150,15 +148,15 @@ __global__ void {}(
     }
 };
 
-// Dispatch helper: builds, launches and reports
+// Dispatch helper: builds, launches and reports, for one concrete `StrideKType` / `Arguments` pair
+template <typename StrideKType, typename ArgumentsT>
 static void launch_mqa_logits(const std::string& include_header, const std::string& kernel_class,
-                              const std::string& stride_k_type, const std::string& params_init,
                               const deep_gemm_mqa_common::MqaLogitsConfig& config, const std::string& element_qk,
                               const std::string& element_acc, const std::string& element_logits,
                               const std::string& element_weights, int num_heads, int head_dim, bool is_compressed,
                               int smem_size, int num_threads, const std::string& kernel_name,
-                              const MqaLogitsHostParams& kernel_params) {
-    using Runtime = MqaLogitsRuntime;
+                              const ArgumentsT& kernel_params) {
+    using Runtime = MqaLogitsRuntime<StrideKType, ArgumentsT>;
     const int num_sms = get_num_sms();
     const dim3 block(num_threads, 1, 1);
     const dim3 grid(num_sms, 1, 1);
@@ -166,8 +164,8 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
     auto args = typename Runtime::Args{
         .launch_info = {include_header, kernel_class, element_qk, element_acc, element_logits, element_weights,
                         num_heads, head_dim, config.block_qh, config.block_kv, config.warp_qh, config.warp_kv,
-                        config.num_q_stages, config.num_kv_stages, stride_k_type, params_init, is_compressed,
-                        smem_size, num_threads, kernel_name},
+                        config.num_q_stages, config.num_kv_stages, StrideKTypeName<StrideKType>::value,
+                        is_compressed, smem_size, num_threads, kernel_name},
         .launch_args = {grid, block, smem_size},
         .kernel_params = kernel_params,
     };
@@ -252,28 +250,45 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     // `k_scales` is an empty tensor for BF16 and FP4 (FP4 uses `k_sf` instead)
     const float* k_scales_ptr = (is_fp4 or qk_dtype == torch::kBFloat16) ? nullptr : k_scales.data_ptr<float>();
 
-    // One parameter block for both flavours; the generated code picks the fields it needs and
-    // narrows `stride_k` to `StrideKType` on the device side
-    const MqaLogitsHostParams params{
-        q.data_ptr(),
-        is_fp4 ? reinterpret_cast<const uint32_t*>(q_sf->data_ptr()) : nullptr,
-        k.data_ptr(),
-        is_fp4 ? reinterpret_cast<const uint32_t*>(k_sf->data_ptr()) : nullptr,
-        k_scales_ptr,
-        weights.data_ptr(),
-        cu_seq_len_k_start.data_ptr(),
-        cu_seq_len_k_end.data_ptr(),
-        logits.data_ptr(),
-        static_cast<uint32_t>(seq_len_q),
-        static_cast<uint32_t>(seq_len_k),
-        static_cast<uint64_t>(aligned_seq_len_kv),
-    };
-
-    launch_mqa_logits(is_fp4 ? "fp4_mqa_logits.cuh" : "ppu_mqa_logits.cuh",
-                      is_fp4 ? "PPUMqaLogitsFP4" : "PPUMqaLogits", stride_k_type,
-                      is_fp4 ? kMqaLogitsFP4ParamsInit : kMqaLogitsParamsInit, config, element_qk, element_acc,
-                      element_logits, element_weights, num_heads, head_dim, is_compressed, smem_size, num_threads,
-                      kernel_name, params);
+    if (is_fp4) {
+        const auto* q_sf_ptr = reinterpret_cast<const uint32_t*>(q_sf->data_ptr());
+        const auto* k_sf_ptr = reinterpret_cast<const uint32_t*>(k_sf->data_ptr());
+        auto* ks_ptr = reinterpret_cast<int*>(cu_seq_len_k_start.data_ptr());
+        auto* ke_ptr = reinterpret_cast<int*>(cu_seq_len_k_end.data_ptr());
+        if (stride_k_type == "uint32_t") {
+            launch_mqa_logits<uint32_t>(
+                "fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
+                element_weights, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
+                MqaLogitsFP4Arguments<uint32_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights.data_ptr(),
+                                                ks_ptr, ke_ptr, logits.data_ptr(), seq_len_q, seq_len_k,
+                                                static_cast<uint32_t>(aligned_seq_len_kv)});
+        } else {
+            launch_mqa_logits<uint64_t>(
+                "fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
+                element_weights, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
+                MqaLogitsFP4Arguments<uint64_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights.data_ptr(),
+                                                ks_ptr, ke_ptr, logits.data_ptr(), seq_len_q, seq_len_k,
+                                                static_cast<uint64_t>(aligned_seq_len_kv)});
+        }
+    } else if (stride_k_type == "uint32_t") {
+        launch_mqa_logits<uint32_t>(
+            "ppu_mqa_logits.cuh", "PPUMqaLogits", config, element_qk, element_acc, element_logits, element_weights,
+            num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
+            MqaLogitsArguments<uint32_t>{q.data_ptr(), k.data_ptr(), k_scales_ptr, weights.data_ptr(),
+                                         reinterpret_cast<uint32_t*>(cu_seq_len_k_start.data_ptr()),
+                                         reinterpret_cast<uint32_t*>(cu_seq_len_k_end.data_ptr()), logits.data_ptr(),
+                                         static_cast<uint32_t>(seq_len_q), static_cast<uint32_t>(seq_len_k),
+                                         static_cast<uint32_t>(aligned_seq_len_kv)});
+    } else {
+        launch_mqa_logits<uint64_t>(
+            "ppu_mqa_logits.cuh", "PPUMqaLogits", config, element_qk, element_acc, element_logits, element_weights,
+            num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
+            MqaLogitsArguments<uint64_t>{q.data_ptr(), k.data_ptr(), k_scales_ptr, weights.data_ptr(),
+                                         reinterpret_cast<uint32_t*>(cu_seq_len_k_start.data_ptr()),
+                                         reinterpret_cast<uint32_t*>(cu_seq_len_k_end.data_ptr()), logits.data_ptr(),
+                                         static_cast<uint32_t>(seq_len_q), static_cast<uint32_t>(seq_len_k),
+                                         static_cast<uint64_t>(aligned_seq_len_kv)});
+    }
 
     // NOTES: the kernel writes into the padded buffer, the caller only sees the valid window
     logits = logits.slice(0, 0, seq_len_q).slice(1, 0, logits_cols);
