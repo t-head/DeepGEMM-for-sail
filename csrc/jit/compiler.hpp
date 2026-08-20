@@ -240,7 +240,7 @@ public:
         // Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use -Xllvm flags,
         // others only need -ppu-simt-branch=false (aligned with compiler.py logic)
         std::string per_kernel_flags;
-        if (lib == ActlizeLib::kV100) {
+        if (is_ppu1v5_device()) {
             per_kernel_flags = " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
                                " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
             const bool use_warp_interleaving = (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
@@ -343,7 +343,7 @@ public:
                     "--ppu-arch=ppu0015",
                 });
             }
-            if (lib == ActlizeLib::kV100) {
+            if (is_ppu1v5_device()) {
                 opts_insert({
                     "--ppu-tuning-options=-ppu-patch-fence-ppu=false",
                     "--ppu-tuning-options=-wno-loop-miss-transform",
