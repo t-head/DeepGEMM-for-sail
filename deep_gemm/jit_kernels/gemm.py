@@ -434,8 +434,8 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
         # Heuristic path: inject adaptive warp_k/dense_s2_opt (mirrors C++ bf16_gemm.hpp:664-668)
         if is_ppu1v5_device() and is_bf16_adaptive_enabled(m, n, k):
             dense_s2_opt = True
-            # tile 已是 adaptive tile（get_best_configs 命中 adaptive 分支），
-            # 直接用 get_warp_k 在该 tile 上求 warp_k，等价于 get_adaptive_configs(...)[6]
+            # The tile is already an adaptive tile selected by the adaptive branch in get_best_configs.
+            # Compute warp_k on this tile with get_warp_k, equivalent to get_adaptive_configs(...)[6].
             warp_k = get_warp_k(block_m, block_n, block_k, warp_m, warp_n, num_stages)
         else:
             dense_s2_opt = False

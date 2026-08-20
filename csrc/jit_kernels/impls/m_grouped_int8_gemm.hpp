@@ -456,7 +456,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
     }
 }
 
-// 实际实现：m_grouped_gemm_a8w8_per_channel_nt_masked_impl
+// real path: m_grouped_gemm_a8w8_per_channel_nt_masked_impl
 static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
     const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
     const torch::Tensor& rhs_scales, const torch::Tensor& out, const torch::Tensor& masked_m, const int& m,
@@ -1158,7 +1158,7 @@ static void m_grouped_gemm_int8_int8_bf16_nt_contiguous_impl(const torch::Tensor
                                                        num_groups, configs);
 }
 
-// 路由层：m_grouped_gemm_int8_int8_bf16_nt_xxx_impl -> m_grouped_gemm_a8w8_per_channel_nt_xxx
+// Routing layer: m_grouped_gemm_int8_int8_bf16_nt_xxx_impl -> m_grouped_gemm_a8w8_per_channel_nt_xxx
 static std::pair<int, int> m_grouped_gemm_int8_int8_bf16_nt_masked_impl(
     const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
     const torch::Tensor& rhs_scales, const torch::Tensor& out, const torch::Tensor& masked_m, const int& m,

@@ -53,7 +53,7 @@ def select_moe_dynamic_tile(n: int, k: int, expected_m: int, has_bias: bool) -> 
     ]
     # gemm1
     if (n, k * 2) in model_gemm1_shape_list:
-        #todo 修复大EM场景的stack问题
+        # TODO: Fix the stack issue for large-EM cases
         if(expected_m < 6 or expected_m > 76):
             return False, 'Disabled'
     # gemm2

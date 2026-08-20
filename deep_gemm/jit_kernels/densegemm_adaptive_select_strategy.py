@@ -519,7 +519,7 @@ def _select_tile_memory_bound(cutlass_n, cutlass_m, cutlass_k, num_sms, block_m,
     # Step 4: pick largest WN (for TC utilization) whose capacity covers
     # bn_wave_even AND gives total warps (WarpOnN * WarpOnM) >= 4.
     warp_on_m = block_m // warp_m
-    warp_n = 32 # BN < 16 * 4， (DG_N < ~2496): default WN=32 for balanced occupancy.
+    warp_n = 32 # BN < 16 * 4, (DG_N < ~2496): default WN=32 for balanced occupancy.
     #for wn in reversed(wn_candidates):
     for wn in wn_candidates:
         if achievable_bn(wn) >= bn_wave_even:
@@ -737,7 +737,7 @@ def _get_adaptive_configs_impl(m: int, n: int, k: int, num_sms: int):
     block_m = _select_blockm(m)
 
     if block_m <= 160:
-        # BM = WM = 144，WN = 16 ｜｜ 32, stack issue need to fix by compiler
+        # BM = WM = 144,WN = 16 || 32, stack issue need to fix by compiler
         if block_m == 144:
             block_m = 160
 
