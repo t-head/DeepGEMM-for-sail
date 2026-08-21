@@ -442,8 +442,9 @@ _REGISTER_WARPONN_CAP = {
     ( 80,  80, 32): (29, 29),  # theory=(24,29), sf higher than predicted
     ( 96,  48, 64): (14, 14),  # theory=(12,14), compiler register reuse
     ( 96,  96, 16): (31, 32),  # theory=(32,32), sf lower (stack=8B, negligible)
-    ( 96,  96, 32): (24, 24),  # theory=(24,29), ok lower than predicted
+    ( 96,  96, 32): (16, 16),  # theory=(24,29); for the hoisted-predicate
     ( 96,  96, 64): (14, 14),  # theory=( 0,14), sf better (compiler reuse)
+    (112, 112, 16): (22, 22),  # theory=(32,32); for m=104/112 large-N:
     (128,  64, 48): (12, 12),  # theory=(12,16), ok lower than predicted
     (144, 144, 16): (31, 32),  # theory=(24,32), sf higher than predicted
     (160,  80, 16): (15, 16),  # theory=(16,16), sf lower (stack=8B, negligible)
@@ -745,6 +746,12 @@ def _get_adaptive_configs_impl(m: int, n: int, k: int, num_sms: int):
         # stages, warp_k) are picked together. See `_select_tile_memory_bound`.
         warp_m = _get_warp_m(block_m)
         block_n, warp_n, block_k, num_stages, warp_k = _select_tile_memory_bound(n, m, k, num_sms, block_m, warp_m)
+        # 7x3 large-N reroute (calibration note above): a spilling 7x3 pick is
+        # re-selected with the spill-free BM=128/WM=64 layout. Stages feasibility
+        # for short K is handled inside the reselect (stages capped by K-iters).
+        if block_m == 112 and warp_m == 112 and warp_n == 48 and num_sms == 39:
+            block_m, warp_m = 128, 64
+            block_n, warp_n, block_k, num_stages, warp_k = _select_tile_memory_bound(n, m, k, num_sms, block_m, warp_m)
     else:
         # Compute-bound override (gated): try 16-warp WE-ideal first.
         ct = (_compute_bound_tile(block_m, m, n, k, num_sms)

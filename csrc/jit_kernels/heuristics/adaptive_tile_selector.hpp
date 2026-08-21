@@ -10,6 +10,7 @@
 #include <utility>
 #include <cassert>
 #include <climits>
+#include <cstdio>
 #include <string>
 
 #include "../../utils/math.hpp"
@@ -112,19 +113,20 @@ inline int spill_free_wn_cap(int wm, bool& found) {
 }
 
 // ============================================================
-// LUT: _REGISTER_WARPONN_CAP (27 entries, Python lines 396-427)
+// LUT: _REGISTER_WARPONN_CAP (25 entries, Python lines 396-427)
 // ============================================================
 struct WarpOnNCap {
     int bm, wm, wn, sf, ok;
 };
 
-static constexpr std::array<WarpOnNCap, 24> REGISTER_WARPONN_CAP = {{
-    // BM <= 160: memory-bound path (8 entries)
+static constexpr std::array<WarpOnNCap, 25> REGISTER_WARPONN_CAP = {{
+    // BM <= 160: memory-bound path (9 entries)
     { 80,  80, 32, 29, 29},
     { 96,  48, 64, 14, 14},
     { 96,  96, 16, 31, 32},
-    { 96,  96, 32, 24, 24},
+    { 96,  96, 32, 16, 16},
     { 96,  96, 64, 14, 14},
+    {112, 112, 16, 22, 22},
     {128,  64, 48, 12, 12},
     {144, 144, 16, 31, 32},
     {160,  80, 16, 15, 16},
@@ -765,6 +767,19 @@ inline AdaptiveResult get_adaptive_configs_impl(int m, int n, int k, int num_sms
         block_k = res.block_k;
         num_stages = res.num_stages;
         warp_k = res.warp_k;
+        // 7x3 large-N reroute (calibration note above): a spilling 7x3 pick is
+        // re-selected with the spill-free BM=128/WM=64 layout. Stages feasibility
+        // for short K is handled inside the reselect (stages capped by K-iters).
+        if (block_m == 112 && warp_m == 112 && warp_n == 48 && num_sms == 39) {
+            block_m = 128;
+            warp_m = 64;
+            res = select_tile_memory_bound(n, m, k, num_sms, block_m, warp_m);
+            block_n = res.block_n;
+            warp_n = res.warp_n;
+            block_k = res.block_k;
+            num_stages = res.num_stages;
+            warp_k = res.warp_k;
+        }
     } else {
         // Compute-bound override (gated): try 16-warp WE-ideal first
         auto ct = compute_tile_enabled() ? compute_bound_tile(block_m, m, n, k, num_sms) : std::nullopt;

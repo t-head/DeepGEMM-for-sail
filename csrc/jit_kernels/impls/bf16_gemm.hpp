@@ -494,6 +494,142 @@ __global__ void {9}(
     }
 };
 
+class DenseBF16GemmCuteFreeRuntime final : public LaunchRuntime<DenseBF16GemmCuteFreeRuntime> {
+public:
+    using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
+    using GemmProblemSize = cute::tuple<int32_t, int32_t, int32_t, int32_t>;
+
+    struct MainLoopArguments {
+        cutlass::bfloat16_t const* ptr_A;
+        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_A;
+        cutlass::bfloat16_t const* ptr_B;
+        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_B;
+    };
+
+    struct LinearCombinationArgs {
+        float alpha = 1.0f;               ///< scales accumulators
+        float beta = 0.0f;                ///< scales source tensor
+        float const* alpha_ptr = nullptr; ///< pointer to accumulator scalar - if not null, loads it from memory
+        float const* beta_ptr = nullptr;  ///< pointer to source scalar - if not null, loads it from memory
+        float const* const* alpha_ptr_array = nullptr; ///< array of pointers to accumulator scalar per group/batch
+        float const* const* beta_ptr_array = nullptr;  ///< array of pointers to source scalar per group/batch
+        float scale_a = float(1);
+        float scale_b = float(1);
+        float scale_c = float(1);
+        float scale_d = float(1);
+        float const* scale_a_ptr = nullptr;
+        float const* scale_b_ptr = nullptr;
+        float const* scale_c_ptr = nullptr;
+        float const* scale_d_ptr = nullptr;
+    };
+
+    // Epilogue
+    struct EpilogueArgs {
+        LinearCombinationArgs callback;
+        cutlass::bfloat16_t* ptr_C;
+        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C;
+
+        cutlass::bfloat16_t* ptr_D;
+        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D;
+    };
+
+    struct LaunchInfo {
+        int block_m, block_n, block_k, warp_m, warp_n;
+        int warp_k;           // WARP_K tile size for K-dim split (= block_k / WarpOnK). Used in WarpShape as Int<WARP_K>.
+        bool kDenseS2Opt;
+        int num_stages;
+        std::string gemm_type, kKernelType, kernel_name;
+        bool kEnableSboOverlap;
+    };
+
+    struct GemmArguments {
+        GemmUniversalMode mode;
+        GemmProblemSize problem_shape;
+        MainLoopArguments mainloopargs;
+        EpilogueArgs epilogueargs;
+        cutlass::KernelHardwareInfo hw_info;
+        DenseGemmTileSchedulerArguments scheduler{};
+        // Carried for API uniformity with bf16/fp8 GemmArguments and the grouped BF16 paths.
+        // The dense path leaves it null; to_underlying_arguments_rtc ignores it (GemmKernelParams has no signal field).
+        int32_t* signal{nullptr};
+    };
+
+    using CollectiveMainloopParams = MainLoopArguments;
+    using CollectiveEpilogueParams = EpilogueArgs;
+
+    struct GemmKernelParams {
+        GemmUniversalMode mode;
+        GemmProblemSize problem_shape;
+        CollectiveMainloopParams collective_mainloop_params;
+        CollectiveEpilogueParams collective_epilogue_params;
+        cutlass::KernelHardwareInfo hw_info;
+        DenseGemmTileSchedulerArguments scheduler;
+        void* workspace{nullptr}; // workspace,
+    };
+
+    struct Args {
+        LaunchInfo launch_info;
+        LaunchArgs launch_args;
+        GemmKernelParams kernel_params;
+    };
+
+    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace) {
+        auto problem_shape = args.problem_shape;
+        auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
+
+        int sm_count = args.hw_info.cu_count;
+        if (sm_count <= 0) {
+            CUTLASS_TRACE_HOST(
+                "  WARNING: Arguments do not include a valid SM count.\n"
+                "  For optimal performance, populate the arguments KernelHardwareInfo struct with the SM count.");
+            sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(args.hw_info.device_id);
+        }
+
+        CUTLASS_TRACE_HOST("to_underlying_arguments(): Setting persistent grid SM count to " << sm_count);
+
+        cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
+
+        return {args.mode, problem_shape,  args.mainloopargs, args.epilogueargs,
+                hw_info,   args.scheduler, workspace};
+    }
+
+    static std::string generate_impl(const Args& args) {
+        const auto& info = args.launch_info;
+        const int shape_n = cute::get<1>(args.kernel_params.problem_shape);
+        const bool is_aligned_n = (shape_n % info.block_n == 0);
+
+        return fmt::format(
+            R"(
+#define BF16_HGRTC
+#include <bf16_gemm_cute_free.cuh>
+
+namespace deep_gemm {{
+
+using GemmTypeTag = std::integral_constant<GemmType, GemmType::{0}>;
+
+using Kernel = BF16GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}, GemmTypeTag>;
+
+}} // namespace deep_gemm
+
+extern "C"
+__launch_bounds__(deep_gemm::Kernel::MaxThreadsPerBlock,
+                  deep_gemm::Kernel::MinBlocksPerMultiprocessor)
+__global__ void {10}(typename deep_gemm::Kernel::Params params) {{
+  extern __shared__ char smem[];
+  deep_gemm::Kernel kernel;
+  kernel(params, smem);
+}}
+)",
+            info.gemm_type,
+            info.block_m, info.block_n, info.block_k,
+            info.warp_m, info.warp_n, info.warp_k, info.num_stages,
+            info.kDenseS2Opt ? "true" : "false",
+            is_aligned_n ? "true" : "false",
+            info.kernel_name);
+    }
+
+};
+
 class BF16GemmRuntime final : public LaunchRuntime<BF16GemmRuntime> {
 public:
     struct LinearCombinationArgs {
@@ -640,8 +776,9 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
 
     Config cfg;
     if (configs.has_value()) {
-        // Explicit config path: unpack the 8-element public tuple; force warp_k = block_k, dense_s2_opt = false
-        // (mirrors deep_gemm/jit_kernels/gemm.py lines 406-408/422; adaptive is NOT re-evaluated here).
+        // Explicit config path: unpack the 8-element public tuple; force warp_k = block_k,
+        // dense_s2_opt = false (mirrors deep_gemm/jit_kernels/gemm.py lines 406-408/422;
+        // adaptive is NOT re-evaluated here).
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, /*warp_k=*/bk, nst, /*dense_s2_opt=*/false,
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
@@ -660,16 +797,15 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
         if (shape_large_aligned && is_ppu0010_device) {
             cfg = get_gemm_best_configs_v2(shape, 2, num_sms);
         } else {
-            // Heuristic path: get_best_configs now returns the baseline 8-tuple; adaptive
-            // warp_k/dense_s2_opt injection is done here (dense-only), mirroring gemm.py.
             auto [ns, bm, bn, bk, wm, wn, nst, sc] = deep_gemm_bf16_common::get_best_configs(m, n, k, 1, num_sms);
             int warp_k = bk;  // default: WarpOnK=1 (non-adaptive)
             bool dense_s2_opt = false;
             if (is_ppu1v5_device() && deep_gemm_adaptive::bf16_adaptive_enabled(m, n, k)) {
-                dense_s2_opt = true;
-                // BF16 adaptive: warp_k comes from the adaptive selector (Python gemm.py parity).
                 auto adaptive_cfg = deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms);
                 warp_k = std::get<6>(adaptive_cfg);
+            }
+            if (is_ppu1v5_device() && nst == 2) {
+                dense_s2_opt = true;
             }
             cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, warp_k, nst, dense_s2_opt, sc);
         }
@@ -702,7 +838,15 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
     dim3 grid = get_grid_shape(hw_info.cu_count);
     bool kEnableSboOverlap = false;
     if (is_ppu1v5_device()) {
-        const auto gemm_args = DenseBF16GemmCutlass3Runtime::GemmArguments{
+        warp_k = block_k;
+        const int warps_k = block_k / warp_k;
+        dim3 const block_cute_free = (block_m / warp_m) * (block_n / warp_n) * warps_k * 32;
+
+        std::string cute_free_kernel_name = "bf16_deep_gemm_cute_free";
+        int smem_cute_free = SMSIZE;
+
+        // generate_impl only reads problem_shape (for IsAlignedN) + launch_info.
+        const auto gemm_args = DenseBF16GemmCuteFreeRuntime::GemmArguments{
             .mode = cutlass::gemm::GemmUniversalMode::kGemm,
             .problem_shape = {m, n, k, 1},
             .mainloopargs = {input_a, stride_A, input_b, stride_B},
@@ -718,24 +862,49 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             .scheduler = {(uint32_t)m, (uint32_t)n, (uint32_t)k, nullptr},
         };
 
-        DenseBF16GemmCutlass3Runtime::GemmKernelParams params =
-            DenseBF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+        DenseBF16GemmCuteFreeRuntime::GemmKernelParams params =
+            DenseBF16GemmCuteFreeRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
-        auto args = DenseBF16GemmCutlass3Runtime::Args{
-            .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, dense_s2_opt, num_stages, "DenseGemm",
-                            "Default", "bf16_dense_gemm", false},
-            .launch_args = {grid, block, SMSIZE},
+        auto args = DenseBF16GemmCuteFreeRuntime::Args{
+            .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, dense_s2_opt, num_stages,
+                            "DenseGemm", "Default", cute_free_kernel_name, kEnableSboOverlap},
+            .launch_args = {grid, block_cute_free, smem_cute_free},
             .kernel_params = params,
         };
-        const auto& code = DenseBF16GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build("bf16_dense_gemm", code, block.x, SMSIZE);
+
+        const auto& code = DenseBF16GemmCuteFreeRuntime::generate(args);
+        const auto& runtime = compiler->build(cute_free_kernel_name, code, block_cute_free.x, smem_cute_free);
         const auto& kernel = runtime->kernel;
+
         int blocks_per_cu = 0;
-        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
-        args.launch_args.grid_dim.x *= blocks_per_cu;
-        // Preserve original dense-BF16 behavior: the persistent DenseGemm scheduler reads the final
-        // grid extent from the kernel params' hw_info.cu_count (was `params.hw_info.cu_count = grid.x`).
-        args.kernel_params.hw_info.cu_count = args.launch_args.grid_dim.x;
+        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block_cute_free.x, smem_cute_free);
+        dim3 grid_cute_free;
+        grid_cute_free.x = blocks_per_cu * num_sms_new;
+
+        // Must stay byte-identical to GemmKernel::Params (cute_free/kernel/gemm.cuh).
+        struct CuteFreeParams {
+            cutlass::bfloat16_t const* ptr_A;
+            cutlass::bfloat16_t const* ptr_B;
+            cutlass::bfloat16_t* ptr_D;
+            int M, N, K;
+            int lda, ldb, ldd;
+            DenseGemmTileSchedulerArguments scheduler;
+        };
+
+        CuteFreeParams hparams;
+        hparams.ptr_A = input_a;
+        hparams.ptr_B = input_b;
+        hparams.ptr_D = output;
+        hparams.M = m;
+        hparams.N = n;
+        hparams.K = k;
+        hparams.lda = k;    // A is row-major MxK
+        hparams.ldb = k;    // B is col-major KxN, stored as row-major NxK
+        hparams.ldd = n;    // D is row-major MxN
+        hparams.scheduler = DenseGemmTileSchedulerArguments{(uint32_t)m, (uint32_t)n, (uint32_t)k, nullptr};
+
+        const auto& stream = (hggcStream_t)0;
+        auto config = construct_launch_config(kernel, stream, smem_cute_free, grid_cute_free, block_cute_free);
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
@@ -744,7 +913,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
-        DenseBF16GemmCutlass3Runtime::launch(runtime, args);
+        DG_HGGC_CHECK(launch_kernel(kernel, config, hparams));
 
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
@@ -754,13 +923,13 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
             hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
 
-            printf("[DenseGemm_BF16:]\n");
+            printf("[DenseGemm_BF16_CuteFree:]\n");
             printf("group:%d, problem:[%d, %d, %d]\n", kNumGroups, m, n, k);
             printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
-                   args.launch_args.grid_dim.x);
-            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n",
-                   block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages);
-            printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
+                   grid_cute_free.x);
+            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n,
+                   block_k, warp_m, warp_n, warp_k, num_stages);
+            printf("SMSIZE:%d, vreg:%d, stack:%d\n", smem_cute_free, int(numRegs), int(localSize));
         }
     } else if (extra_info.at("use_actlize_v100")) {
         const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{

@@ -249,6 +249,10 @@ public:
                                                 name.find("paged") == std::string::npos);
             if (!use_warp_interleaving) {
                 per_kernel_flags += " -Xllvm -ppu-simt-branch=false";
+                const bool is_bf16_cute_free = name.find("bf16_deep_gemm_cute_free") != std::string::npos;
+                if (is_bf16_cute_free) {
+                    per_kernel_flags += " -Xllvm -ppu-pref-mma-reuse=true";
+                }
             } else {
                 per_kernel_flags += " -Xllvm -ppu-blksync-nb-schedule-boundary=true"
                                     " -Xllvm -ppu-simt-branch=false"
