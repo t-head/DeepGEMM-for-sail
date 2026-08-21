@@ -104,10 +104,6 @@ static dim3 get_grid_shape(int sm_count) {
     return dim3(sm_count, 1, 1);
 }
 
-static dim3 get_block_shape() {
-    return dim3(128, 1, 1);
-}
-
 int32_t next_power_of_two(uint32_t n) {
     if (n == 0)
         return 1;

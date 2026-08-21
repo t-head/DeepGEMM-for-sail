@@ -27,8 +27,8 @@ template <class _SrcT, GemmType kGemmType,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t WARP_M, uint32_t WARP_N,
           uint32_t BLOCK_SIZE, int kNumStages>
-__global__ __launch_bounds__(BLOCK_SIZE, 1) void
-a8w8_perchannel_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
+__device__ __forceinline__ void
+a8w8_perchannel_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
     constexpr uint32_t STRIDE_AM = SHAPE_K;
     constexpr uint32_t STRIDE_BE = SHAPE_N * SHAPE_K;
     constexpr uint32_t STRIDE_CM = SHAPE_N;
@@ -54,10 +54,10 @@ a8w8_perchannel_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
     using TileScheduler = FusedGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, kNumGroups>;
 
     // Shared memory
-    using TsmCfg = GemmSmemConfig<SrcT, kNumStages, BLOCK_M, BLOCK_N, BLOCK_K>;
+    constexpr uint32_t kSmemASize = smem_a_size(sizeof(SrcT), kNumStages, BLOCK_M, BLOCK_K);
     extern __shared__ __align__(128) uint8_t smem_buffer[];
     SrcT* smem_a = reinterpret_cast<SrcT*>(smem_buffer);
-    SrcT* smem_b = reinterpret_cast<SrcT*>(smem_buffer + TsmCfg::kSmemASize);
+    SrcT* smem_b = reinterpret_cast<SrcT*>(smem_buffer + kSmemASize);
 
     uint32_t thread_idx = threadIdx.x;
     int warp_idx = cutlass::canonical_warp_idx_sync();
@@ -356,6 +356,22 @@ a8w8_perchannel_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
     }
 }
 
+// Forwarding __global__ kernel — delegates to __device__ _impl (trampoline)
+template <class _SrcT, GemmType kGemmType,
+          uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t WARP_M, uint32_t WARP_N,
+          uint32_t BLOCK_SIZE, int kNumStages>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void
+a8w8_perchannel_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
+    a8w8_perchannel_quant_gemm_fused_moe_kernel_impl<
+        _SrcT, kGemmType,
+        SHAPE_N, SHAPE_K, kNumGroups,
+        BLOCK_M, BLOCK_N, BLOCK_K,
+        WARP_M, WARP_N, BLOCK_SIZE, kNumStages
+    >(args);
+}
+
 template <typename SrcT>
 struct TypeToString {
     static constexpr const char* value = "unsupported";
@@ -416,7 +432,7 @@ public:
 
         auto device_func = a8w8_perchannel_quant_gemm_fused_moe_kernel<
                               SrcT, kGemmType, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BlockSize, kNumStages>;
-        constexpr int smem_size = GemmSmemConfig<SrcT, kNumStages, BLOCK_M, BLOCK_N, BLOCK_K>::kTotalSize;
+        constexpr int smem_size = gemm_smem_total_size(sizeof(SrcT), kNumStages, BLOCK_M, BLOCK_N, BLOCK_K);
         CHECK_HGGC(hggcFuncSetAttribute(device_func, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         int max_blocks_per_cu = -1;
         CHECK_HGGC(hggcOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_cu, device_func, BlockSize, smem_size));

@@ -30,8 +30,8 @@ template <class _SrcT, GemmType kGemmType,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t WARP_M, uint32_t WARP_N,
           uint32_t BLOCK_SIZE, int kNumStages, int N_EXPAND>
-__global__ __launch_bounds__(BLOCK_SIZE, 1) void
-fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
+__device__ __forceinline__ void
+fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
     static constexpr uint32_t GROUP_M = 1;
     static constexpr uint32_t GROUP_N = 128;
     static constexpr uint32_t GROUP_K = 128;
@@ -64,12 +64,15 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
     using TileScheduler = FusedGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, kNumGroups>;
 
     // Shared memory
-    using TsmCfg = BlkwiseQuantGemmSmemConfig<SrcT, kNumStages, BLOCK_M, BLOCK_N, BLOCK_K>;
+    constexpr uint32_t kSmemASize = smem_a_size(sizeof(SrcT), kNumStages, BLOCK_M, BLOCK_K);
+    constexpr uint32_t kSmemBSize = smem_b_size(sizeof(SrcT), kNumStages, BLOCK_N, BLOCK_K);
+    constexpr uint32_t kTotalSize = blkwise_smem_total_size(sizeof(SrcT), kNumStages, BLOCK_M, BLOCK_N, BLOCK_K);
+    constexpr uint32_t kSmemScaleBSize = smem_scale_b_size(kNumStages, BLOCK_N, BLOCK_K);
     extern __shared__ __align__(128) uint8_t smem_buffer[];
     SrcT* smem_a = reinterpret_cast<SrcT*>(smem_buffer);
-    SrcT* smem_b = reinterpret_cast<SrcT*>(smem_buffer + TsmCfg::kSmemASize);
-    ElementScale* smem_scale_a = reinterpret_cast<ElementScale*>(smem_buffer + (TsmCfg::kSmemASize + TsmCfg::kSmemBSize));
-    ElementScale* smem_scale_b = reinterpret_cast<ElementScale*>(smem_buffer + (TsmCfg::kTotalSize - TsmCfg::kSmemScaleBSize));
+    SrcT* smem_b = reinterpret_cast<SrcT*>(smem_buffer + kSmemASize);
+    ElementScale* smem_scale_a = reinterpret_cast<ElementScale*>(smem_buffer + (kSmemASize + kSmemBSize));
+    ElementScale* smem_scale_b = reinterpret_cast<ElementScale*>(smem_buffer + (kTotalSize - kSmemScaleBSize));
 
     uint32_t thread_idx = threadIdx.x;
     int warp_idx = cutlass::canonical_warp_idx_sync();
@@ -438,6 +441,22 @@ fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
     }
 }
 
+// Forwarding __global__ kernel — delegates to __device__ _impl (trampoline)
+template <class _SrcT, GemmType kGemmType,
+          uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t WARP_M, uint32_t WARP_N,
+          uint32_t BLOCK_SIZE, int kNumStages, int N_EXPAND>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void
+fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
+    fp8_blockwise_quant_gemm_fused_moe_kernel_impl<
+        _SrcT, kGemmType,
+        SHAPE_N, SHAPE_K, kNumGroups,
+        BLOCK_M, BLOCK_N, BLOCK_K,
+        WARP_M, WARP_N, BLOCK_SIZE, kNumStages, N_EXPAND
+    >(args);
+}
+
 template <uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t WARP_M, uint32_t WARP_N, int32_t kNumStages,
@@ -487,7 +506,7 @@ public:
 
           auto device_func = fp8_blockwise_quant_gemm_fused_moe_kernel<
                 SrcT, kGemmType, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BlockSize, Stages, N_EXPAND>;
-          constexpr int smem_size = BlkwiseQuantGemmSmemConfig<SrcT, Stages, BLOCK_M, BLOCK_N, BLOCK_K>::kTotalSize;
+          constexpr int smem_size = blkwise_smem_total_size(sizeof(SrcT), Stages, BLOCK_M, BLOCK_N, BLOCK_K);
           CHECK_HGGC(hggcFuncSetAttribute(device_func, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
           int max_blocks_per_cu = -1;
           CHECK_HGGC(hggcOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_cu, device_func, BlockSize, smem_size));

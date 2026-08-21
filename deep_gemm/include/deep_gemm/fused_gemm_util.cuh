@@ -7,6 +7,8 @@
 #include "cute/atom/copy_traits_ppu0015_aiu.hpp"
 #include "cute/algorithm/ppu_copy.hpp"
 
+#include "fused_gemm_common.cuh"
+
 // ============================================================
 // Gemm_Hybrid_Operand: cp.async (GMEM->SMEM) + Swizzle<3,3,3> + SMEM->Reg
 // 890P: TSM_LD_SWZL for SMEM->Reg; 810E: ldmatrix (same as TensorOpPPU)
@@ -68,39 +70,8 @@ struct Gemm_Hybrid_Operand<ArchTag, Element, false,
 namespace deep_gemm {
 using cute::_;
 
-struct GemmArgs {
-  const void *__restrict__ a_ptr;
-  const void *__restrict__ b_ptr;
-  void *__restrict__ c_ptr;
-
-  const int *__restrict__ expert_ids_and_cumsum;
-  const int *__restrict__ sorted_token_ids;
-  const int *__restrict__ aligned_num_m_blocks;
-  uint32_t shape_m;
-};
-
-struct QuantGemmArgs : public GemmArgs{
-  const void *__restrict__ scale_a_ptr;
-  const void *__restrict__ scale_b_ptr;
-};
-
-// tsm.ld.swzl need 128B aligned
-template <typename SrcT, int kNumStages, int BLOCK_M, int BLOCK_N, int BLOCK_K>
-struct GemmSmemConfig {
-  static constexpr uint32_t kSmemASize = cute::round_up(kNumStages * BLOCK_M * BLOCK_K * sizeof(SrcT), 128);
-  static constexpr uint32_t kSmemBSize = cute::round_up(kNumStages * BLOCK_N * BLOCK_K * sizeof(SrcT), 128);
-  static constexpr uint32_t kTotalSize = kSmemASize + kSmemBSize;
-};
-
-template <typename SrcT, int kNumStages, int BLOCK_M, int BLOCK_N, int BLOCK_K>
-struct BlkwiseQuantGemmSmemConfig : public GemmSmemConfig<SrcT, kNumStages, BLOCK_M, BLOCK_N, BLOCK_K> {
-  using Base = GemmSmemConfig<SrcT, kNumStages, BLOCK_M, BLOCK_N, BLOCK_K>;
-  static constexpr uint32_t kSmemScaleASize = cute::round_up(
-      kNumStages * BLOCK_M * BLOCK_K / 128 * sizeof(float), 128);
-  static constexpr uint32_t kSmemScaleBSize = cute::round_up(
-      kNumStages * cute::ceil_div(BLOCK_N, 128) * BLOCK_K / 128 * sizeof(float), 256);
-  static constexpr uint32_t kTotalSize = Base::kTotalSize + kSmemScaleASize + kSmemScaleBSize;
-};
+// GemmSmemConfig / BlkwiseQuantGemmSmemConfig live in fused_gemm_common.cuh
+// (shared verbatim with the C++ JIT host runtimes); GemmSmemConfigFp4 stays below.
 
 template <int kNumStages, int BLOCK_M, int BLOCK_N, int BLOCK_K, typename MainloopFp4>
 struct GemmSmemConfigFp4 {
@@ -369,11 +340,6 @@ __forceinline__ __device__ void epilogue_with_tsm(TAcc& accum, TCcC& tCcC, TCC& 
   }
 };
 
-template <typename T>
-__device__ __host__  inline T round_up(T value, T alignment) {
-  return (value + alignment - 1) / alignment * alignment;
-}
-
 template <int N>
 constexpr int next_pow2() {
     int v = N - 1;
@@ -491,7 +457,7 @@ moe_align_warp_ordered_kernel(
         if (threadIdx.x < kNumGroups) {
             group_num = shared_cumsum[threadIdx.x];
             m_rows[threadIdx.x] = group_num;
-            padded = round_up(group_num, BLOCK_M);
+            padded = cute::round_up(group_num, BLOCK_M);
         }
         using BlockScan = cub::BlockScan<int32_t, BLOCK_SIZE>;
         __shared__ typename BlockScan::TempStorage temp_storage;
@@ -685,7 +651,7 @@ cumsum_expert_ids(
     int padded = 0;
     if (is_valid) {
         group_num = m_rows[tid];
-        padded = round_up(group_num, BLOCK_M);
+        padded = cute::round_up(group_num, BLOCK_M);
     }
 
     // CUB BlockScan: parallel prefix sum over padded counts

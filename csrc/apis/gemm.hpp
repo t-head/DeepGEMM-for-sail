@@ -13,6 +13,7 @@
 #include "../jit_kernels/impls/fp4_gemm.hpp"
 #include "../jit_kernels/impls/m_grouped_fp4_gemm.hpp"
 #include "../jit_kernels/impls/tf32_hc_prenorm_gemm.hpp"
+#include "../jit_kernels/impls/fused_moe_gemm.hpp"
 
 namespace deep_gemm::gemm {
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
@@ -577,6 +578,142 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
                                                 m_indices, m_rows_tensor, m, n, k, num_groups, config);
 }
 
+void m_grouped_gemm_bf16_bf16_bf16_nt_fused(
+    const torch::Tensor& lhs,
+    const torch::Tensor& rhs,
+    const torch::Tensor& out,
+    const torch::Tensor& m_rows,
+    const torch::Tensor& expert_ids_and_cumsum,
+    const torch::Tensor& sorted_token_ids,
+    const torch::Tensor& aligned_num_m_blocks,
+    FusedConfigTuple configs) {
+
+    const auto& [num_token, k] = get_shape<2>(lhs);
+    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
+    const auto& [m_sum, n_] = get_shape<2>(out);
+
+    DG_HOST_ASSERT(k == k_ && n == n_);
+    DG_HOST_ASSERT(lhs.dtype() == torch::kBFloat16);
+    DG_HOST_ASSERT(rhs.dtype() == torch::kBFloat16);
+    DG_HOST_ASSERT(out.dtype() == torch::kBFloat16);
+    DG_HOST_ASSERT(m_rows.dtype() == torch::kInt32);
+    DG_HOST_ASSERT(expert_ids_and_cumsum.dtype() == torch::kInt32);
+    DG_HOST_ASSERT(sorted_token_ids.dtype() == torch::kInt32);
+    DG_HOST_ASSERT(aligned_num_m_blocks.dtype() == torch::kInt32);
+    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
+    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+
+    m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
+        lhs, rhs, out, m_rows, expert_ids_and_cumsum,
+        sorted_token_ids, aligned_num_m_blocks, configs);
+}
+
+void m_grouped_gemm_fp8_fp8_bf16_nt_fused(
+    const std::pair<torch::Tensor, torch::Tensor>& lhs_,
+    const std::pair<torch::Tensor, torch::Tensor>& rhs_,
+    const torch::Tensor& out,
+    const torch::Tensor& m_rows,
+    const torch::Tensor& expert_ids_and_cumsum,
+    const torch::Tensor& sorted_token_ids,
+    const torch::Tensor& aligned_num_m_blocks,
+    FusedConfigTuple configs) {
+
+    const auto& lhs = lhs_.first;
+    const auto& lhs_scales = lhs_.second;
+    const auto& rhs = rhs_.first;
+    const auto& rhs_scales = rhs_.second;
+
+    const auto& [num_token, k] = get_shape<2>(lhs);
+    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
+    const auto& [m_sum, n_] = get_shape<2>(out);
+
+    DG_HOST_ASSERT(k == k_ && n == n_);
+    DG_HOST_ASSERT(lhs.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(rhs.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(lhs_scales.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(out.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(m_rows.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(expert_ids_and_cumsum.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(sorted_token_ids.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(aligned_num_m_blocks.scalar_type() == torch::kInt32);
+    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
+    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+    DG_HOST_ASSERT(k % 16 == 0);
+
+    // per-channel quant — branch condition mirrors the Python entry:
+    //   `if lhs_scales.shape == (num_token, 1) and rhs_scales.shape == (num_groups, n, 1)`
+    if (lhs_scales.sizes() == std::vector<int64_t>{num_token, 1}
+            && rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1}) {
+        m_grouped_gemm_perchannel_nt_fused_impl(
+            lhs, lhs_scales, rhs, rhs_scales, out, m_rows,
+            expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, configs);
+        return;
+    }
+
+    // blockwise quant
+    // Python computes `topk = int(m_sum / num_token)` first and then early-exits on
+    // `m_sum == 0`; we check the exit first to avoid the division when num_token == 0
+    // (behaviorally identical whenever Python does not raise ZeroDivisionError).
+    if (m_sum == 0) return;
+    int topk = static_cast<int>(m_sum / num_token);
+    DG_HOST_ASSERT(n % 128 == 0);
+    DG_HOST_ASSERT(k % 128 == 0);
+    DG_HOST_ASSERT(std::get<3>(configs) == 128);  // block_k
+
+    // Column-major (TMA-aligned) lhs scales — same transform as the Python entry
+    torch::Tensor lhs_scales_col_major = get_col_major_tma_aligned_tensor(lhs_scales);
+
+    m_grouped_gemm_blkwise_nt_fused_impl(
+        lhs, lhs_scales_col_major, rhs, rhs_scales, out, m_rows,
+        expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, topk, configs);
+}
+
+void m_grouped_gemm_int8_int8_bf16_nt_fused(
+    const std::pair<torch::Tensor, torch::Tensor>& lhs_,
+    const std::pair<torch::Tensor, torch::Tensor>& rhs_,
+    const torch::Tensor& out,
+    const torch::Tensor& m_rows,
+    const torch::Tensor& expert_ids_and_cumsum,
+    const torch::Tensor& sorted_token_ids,
+    const torch::Tensor& aligned_num_m_blocks,
+    FusedConfigTuple configs) {
+
+    const auto& lhs = lhs_.first;
+    const auto& lhs_scales = lhs_.second;
+    const auto& rhs = rhs_.first;
+    const auto& rhs_scales = rhs_.second;
+
+    const auto& [num_token, k] = get_shape<2>(lhs);
+    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
+    const auto& [m_sum, n_] = get_shape<2>(out);
+
+    // Mirrors the Python forward to the per-channel path; validates the
+    // per-channel inputs (the impl does not re-check them).
+    DG_HOST_ASSERT(k == k_ && n == n_);
+    DG_HOST_ASSERT(lhs.scalar_type() == torch::kInt8);
+    DG_HOST_ASSERT(rhs.scalar_type() == torch::kInt8);
+    DG_HOST_ASSERT(lhs_scales.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT((lhs_scales.sizes() == std::vector<int64_t>{num_token, 1}));
+    DG_HOST_ASSERT((rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1}));
+    DG_HOST_ASSERT(out.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(m_rows.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(expert_ids_and_cumsum.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(sorted_token_ids.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(aligned_num_m_blocks.scalar_type() == torch::kInt32);
+    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
+    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+    DG_HOST_ASSERT(k % 16 == 0);
+
+    m_grouped_gemm_perchannel_nt_fused_impl(
+        lhs, lhs_scales, rhs, rhs_scales, out, m_rows,
+        expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, configs);
+}
+
 static void m_grouped_gemm_fp4_fp4_bf16_nt_masked(
     const std::pair<torch::Tensor, torch::Tensor>& a,
     const std::pair<torch::Tensor, torch::Tensor>& b,
@@ -714,6 +851,20 @@ static void register_apis(pybind11::module_& m) {
     // TF32 GEMMs
     m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("sqr_sum"), py::arg("num_splits") = std::nullopt, py::arg("configs") = std::nullopt);
+    // BF16 Fused MoE GEMM
+    m.def("m_grouped_gemm_bf16_bf16_bf16_nt_fused", &m_grouped_gemm_bf16_bf16_bf16_nt_fused,
+          py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),
+          py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
+          py::arg("aligned_num_m_blocks"), py::arg("configs"));
+    // FP8/INT8 Fused MoE GEMMs
+    m.def("m_grouped_gemm_fp8_fp8_bf16_nt_fused", &m_grouped_gemm_fp8_fp8_bf16_nt_fused,
+          py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),
+          py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
+          py::arg("aligned_num_m_blocks"), py::arg("configs"));
+    m.def("m_grouped_gemm_int8_int8_bf16_nt_fused", &m_grouped_gemm_int8_int8_bf16_nt_fused,
+          py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),
+          py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
+          py::arg("aligned_num_m_blocks"), py::arg("configs"));
 }
 
 } // namespace deep_gemm::gemm
