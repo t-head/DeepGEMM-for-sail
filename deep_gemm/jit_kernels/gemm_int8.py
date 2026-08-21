@@ -11,7 +11,7 @@ from .gemm_int8_lut import get_best_configs_from_lut
 from .densegemm_adaptive_select_strategy import get_adaptive_configs, is_int8_adaptive_enabled, get_warp_k
 
 # C++ code templates
-includes = ('"deep_gemm/int8_gemm.cuh"', )
+includes = ('<deep_gemm/impls/int8_gemm.cuh>', )
 template = """
 using namespace deep_gemm;
 
@@ -36,7 +36,7 @@ gemm_t::run(out, nullptr, nullptr,
 
 # DenseGemm-only cutlass3 path: standalone kernel that reads N/K at runtime.
 # Do NOT reuse includes_densegemm/template_densegemm for grouped or MoE paths.
-includes_densegemm = ('"../deep_gemm/int8_densegemm_cutlass3.cuh"', )
+includes_densegemm = ('<deep_gemm/impls/int8_densegemm_cutlass3.cuh>', )
 template_densegemm = """
 using namespace deep_gemm;
 

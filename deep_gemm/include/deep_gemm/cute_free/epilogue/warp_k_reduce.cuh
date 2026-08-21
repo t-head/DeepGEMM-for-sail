@@ -12,7 +12,7 @@ namespace epilogue {
 // slice. This reduces them into warp_k == 0, which then runs the epilogue.
 //
 // Strategy: single write + single read pass (2 barriers), i.e. the equivalent of
-// cutlass3's "Strategy A" in warp_on_k_reduction.hpp. All warp_k > 0 groups write
+// cutlass3's "Strategy A" in warp_on_k_reduction.cuh. All warp_k > 0 groups write
 // to disjoint SMEM regions simultaneously, then warp_k == 0 reads and adds them.
 // A static_assert guarantees the region fits; we deliberately do NOT fall back to
 // the sequential/chunked strategies -- a config that does not fit fails to compile

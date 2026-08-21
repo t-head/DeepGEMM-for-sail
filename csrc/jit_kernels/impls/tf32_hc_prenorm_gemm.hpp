@@ -46,7 +46,7 @@ public:
         return fmt::format(
             R"(
 #define TF32_HC_PRENORM_HGRTC
-#include <tf32_hc_prenorm_gemm.cuh>
+#include <deep_gemm/impls/tf32_hc_prenorm_gemm.cuh>
 namespace deep_gemm {{
 
 constexpr uint32_t SHAPE_N = {};

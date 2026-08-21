@@ -10,7 +10,7 @@ from .gemm_search_space import MatmulHeuristicsTile
 from .densegemm_adaptive_select_strategy import get_adaptive_configs, is_bf16_adaptive_enabled, get_warp_k
 
 # C++ code templates
-includes = ('"deep_gemm/bf16_gemm.cuh"', )
+includes = ('<deep_gemm/impls/bf16_gemm.cuh>', )
 template = """
 using namespace deep_gemm;
 
@@ -34,7 +34,7 @@ gemm_t::run(out, nullptr, nullptr,
 
 # BF16 DenseGemm-only cutlass3 path: standalone kernel that reads N/K at runtime.
 # Do NOT reuse includes_bf16_densegemm/template_bf16_densegemm for grouped or MoE paths.
-includes_bf16_densegemm = ('"../deep_gemm/bf16_densegemm_cutlass3.cuh"', )
+includes_bf16_densegemm = ('<deep_gemm/impls/bf16_densegemm_cutlass3.cuh>', )
 template_bf16_densegemm = """
 using namespace deep_gemm;
 

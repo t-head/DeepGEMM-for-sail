@@ -3,7 +3,7 @@
 #include <torch/python.h>
 
 #include "exception.hpp"
-#include "../../deep_gemm/include/deep_gemm/utils_rtc.cuh"
+#include <deep_gemm/common/utils_rtc.cuh>
 
 namespace deep_gemm {
 

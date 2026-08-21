@@ -2,7 +2,7 @@
 
 #include <cstdint>
 #include "cutlass/bfloat16.h"
-#include "epilogue_traits.cuh"
+#include <deep_gemm/cute_free/epilogue/epilogue_traits.cuh>
 
 namespace deep_gemm {
 namespace epilogue {

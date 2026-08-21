@@ -15,8 +15,8 @@ def print_once(msg):
     print(f"\033[33m{msg}\033[0m")
 
 # C++ code templates
-includes = ('"../deep_gemm/ppu_mqa_logits.cuh"', )
-includes_fp4_mqa = ('"../deep_gemm/fp4_mqa_logits.cuh"', )
+includes = ('<deep_gemm/impls/ppu_mqa_logits.cuh>', )
+includes_fp4_mqa = ('<deep_gemm/impls/fp4_mqa_logits.cuh>', )
 template = """
 using namespace deep_gemm;
 
@@ -299,9 +299,9 @@ def int8_mqa_logits(q: torch.Tensor,
     return mqa_logits_common(q, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits, max_seqlen_k, logits_dtype=logits_dtype)
 
 
-includes_metadata = ('"../deep_gemm/paged_mqa_logits_scheduler.cuh"', )
-includes_paged = ('"../deep_gemm/ppu_paged_mqa_logits.cuh"', )
-includes_paged_fp4 = ('"../deep_gemm/fp4_paged_mqa_logits.cuh"', )
+includes_metadata = ('<deep_gemm/scheduler/paged_mqa_logits_scheduler.cuh>', )
+includes_paged = ('<deep_gemm/impls/ppu_paged_mqa_logits.cuh>', )
+includes_paged_fp4 = ('<deep_gemm/impls/fp4_paged_mqa_logits.cuh>', )
 template_paged_metadata = """
 using namespace deep_gemm;
 constexpr uint32_t SPLIT_KV = {SPLIT_KV};

@@ -52,7 +52,7 @@ public:
         const auto& p = args.template_params;
         return fmt::format(
             R"(
-#include <fused_permute.cuh>
+#include <deep_gemm/impls/fused_permute.cuh>
 
 extern "C"
 __global__ __launch_bounds__({})

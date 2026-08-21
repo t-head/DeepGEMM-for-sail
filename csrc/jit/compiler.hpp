@@ -52,9 +52,8 @@ public:
     // Single source of truth for the actlize include search paths, shared by the offline (HGCC)
     // and runtime (HGRTC) compilers. The two libraries have colliding header names, so exactly
     // one of them is put on the search path.
-    // NOTE: v0.5.0 additionally needs the include root itself -- its kernels include
-    // "accutlass.h", which lives there rather than under actlize_v0.5.0/. v1.0.0 kernels
-    // never reference it.
+    // NOTE: both branches need the include root itself so that angle-bracket
+    // includes like <deep_gemm/...> resolve correctly via -I include/.
     static std::vector<std::string> actlize_include_paths(ActlizeLib lib) {
         const std::string inc = library_include_path.string();
         std::vector<std::string> paths;
@@ -63,6 +62,7 @@ public:
             paths.push_back(inc + "/actlize_v0.5.0");
         } else {
             paths.push_back(inc + "/actlize_v1.0.0");
+            paths.push_back(inc);   // Resolve <deep_gemm/...> angle-bracket includes
         }
         paths.push_back(inc + "/deep_gemm");
         return paths;

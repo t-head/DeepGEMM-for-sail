@@ -11,7 +11,7 @@ from .utils import get_num_sms, ceil_div, GemmType, get_col_major_tma_aligned_te
 import os
 
 # C++ code templates
-includes_fusedmoe_gemm = ('"../deep_gemm/fused_moe_gemm.cuh"', )
+includes_fusedmoe_gemm = ('<deep_gemm/impls/fused_moe_gemm.cuh>', )
 template_fusedmoe_gemm = """
 using namespace deep_gemm;
 
@@ -37,7 +37,7 @@ fused_moe_gemm::run(out, lhs, rhs, m_rows, expert_ids_and_cumsum, sorted_token_i
 """
 
 includes_fusedmoe_gemm_with_blkwise_quant = (
-    '"../deep_gemm/fused_moe_gemm_with_blkwise_quant.cuh"',
+    '<deep_gemm/impls/fused_moe_gemm_with_blkwise_quant.cuh>',
 )
 template_fusedmoe_gemm_with_blkwise_quant = """
 using namespace deep_gemm;
@@ -65,7 +65,7 @@ fused_moe_gemm_with_blkwise_quant::run(out, lhs, rhs, lhs_scales, rhs_scales,
 """
 
 includes_fusedmoe_gemm_with_perchannel_quant = (
-    '"../deep_gemm/fused_moe_gemm_with_perchannel_quant.cuh"',
+    '<deep_gemm/impls/fused_moe_gemm_with_perchannel_quant.cuh>',
 )
 template_fusedmoe_gemm_with_perchannel_quant = """
 using namespace deep_gemm;
@@ -93,7 +93,7 @@ fused_moe_gemm_with_perchannel_quant::run(out, lhs, rhs, lhs_scales, rhs_scales,
             aligned_num_m_blocks, m, topk, stream, num_sms);
 """
 
-includes_fusedgemm_util_kernel = ('"../deep_gemm/fused_gemm_util.cuh"', )
+includes_fusedgemm_util_kernel = ('<deep_gemm/impls/fused_gemm_util.cuh>', )
 template_fusedgemm_util_kernel = """
 using namespace deep_gemm;
 
@@ -109,7 +109,7 @@ moe_align_block_size_kernel_launcher<BLOCK_M, kNumGroups, kTopK>(m_rows,
             intermediate_buffer, stream);
 """
 
-includes_fp4_fusedmoe_gemm = ('"../deep_gemm/fused_moe_fp4_gemm.cuh"', )
+includes_fp4_fusedmoe_gemm = ('<deep_gemm/impls/fused_moe_fp4_gemm.cuh>', )
 template_fp4_fusedmoe_gemm = """
 using namespace deep_gemm;
 // Templated args from Python JIT call

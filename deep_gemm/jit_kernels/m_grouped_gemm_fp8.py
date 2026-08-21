@@ -10,7 +10,7 @@ from .m_grouped_gemm_int8 import m_grouped_gemm_a8w8_per_channel_nt_nopad
 from .gemm import get_gemv_best_configs
 
 # C++ code templates
-includes = ('"../deep_gemm/fp8_gemm.cuh"', )
+includes = ('<deep_gemm/impls/fp8_gemm.cuh>', )
 template = """
 using namespace deep_gemm;
 
@@ -36,7 +36,7 @@ gemm_t::run(out, lhs, rhs,
             m, expected_m, stream, num_sms, smem_size, signal);
 """
 
-includes_gemv = ('"deep_gemm/blockwise_gemvt.cuh"', )
+includes_gemv = ('<deep_gemm/impls/blockwise_gemvt.cuh>', )
 template_gemv = """
 using namespace deep_gemm;
 

@@ -1,4 +1,4 @@
-#include "deep_gemm/fp8_gemm.cuh"
+#include "deep_gemm/impls/fp8_gemm.cuh"
 
 using namespace deep_gemm;
 

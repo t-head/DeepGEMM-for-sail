@@ -14,7 +14,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
 #include "../heuristics/common_mqa.hpp"
-#include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
+#include <deep_gemm/common/profiling_interface.cuh>
 
 namespace deep_gemm {
 
@@ -44,7 +44,7 @@ public:
     static std::string generate_impl(const Args& args) {
         return fmt::format(
             R"(
-#include <paged_mqa_logits_scheduler.cuh>
+#include <deep_gemm/scheduler/paged_mqa_logits_scheduler.cuh>
 namespace deep_gemm {{
 
 constexpr uint32_t SPLIT_KV = {};
@@ -366,7 +366,7 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
 
     if (is_fp4) {
         launch_paged_mqa_logits(
-            "fp4_paged_mqa_logits.cuh", "PPUPagedMqaLogitsFP4", tile.split_mblock ? ", true" : ", false", tile,
+            "deep_gemm/impls/fp4_paged_mqa_logits.cuh", "PPUPagedMqaLogitsFP4", tile.split_mblock ? ", true" : ", false", tile,
             element_qk, element_acc, element_logits, element_weights, dtype_tag, next_n, num_heads, head_dim, block_kv,
             smem_size, num_threads, num_blocks, kernel_name,
             PagedMqaLogitsFP4Arguments{q.data_ptr(), reinterpret_cast<const uint32_t*>(q_sf->data_ptr()),
@@ -378,7 +378,7 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
                                        block_table_ptr, schedule_meta_ptr});
     } else {
         launch_paged_mqa_logits(
-            "ppu_paged_mqa_logits.cuh", "PPUPagedMqaLogits", "", tile, element_qk, element_acc, element_logits,
+            "deep_gemm/impls/ppu_paged_mqa_logits.cuh", "PPUPagedMqaLogits", "", tile, element_qk, element_acc, element_logits,
             element_weights, dtype_tag, next_n, num_heads, head_dim, block_kv, smem_size, num_threads, num_blocks,
             kernel_name,
             PagedMqaLogitsArguments{q.data_ptr(), k.data_ptr(),

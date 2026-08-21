@@ -25,7 +25,7 @@ def get_w4a16_type(rhs_: Tuple[torch.Tensor, torch.Tensor], fp4_use_bf16_scale: 
 
 
 # C++ code templates
-includes = ('"../deep_gemm/w4a16_gemm_cutlass3.cuh"', )
+includes = ('<deep_gemm/impls/w4a16_gemm_cutlass3.cuh>', )
 w4a16_nopad_template = """
 using namespace deep_gemm;
 using ElementA = cutlass::bfloat16_t;

@@ -8,7 +8,7 @@ from .gemm import get_gemv_best_configs
 import os
 
 # C++ code templates
-includes = ('"deep_gemm/int8_gemm.cuh"', )
+includes = ('<deep_gemm/impls/int8_gemm.cuh>', )
 template = """
 using namespace deep_gemm;
 
@@ -32,7 +32,7 @@ gemm_t::run(out, grouped_layout, block_m_info,
             stream, num_sms, smem_size, signal);
 """
 
-includes_cutlass3 = ('"../deep_gemm/int8_gemm_cutlass3.cuh"', )
+includes_cutlass3 = ('<deep_gemm/impls/int8_gemm_cutlass3.cuh>', )
 template_cutlass3 = """
 using namespace deep_gemm;
 
@@ -58,7 +58,7 @@ gemm_t::run(out, grouped_layout, block_m_info,
             stream, num_sms, smem_size, signal);
 """
 
-includes_gemv = ('"deep_gemm/gemvt.cuh"', )
+includes_gemv = ('<deep_gemm/impls/gemvt.cuh>', )
 template_gemv = """
 using namespace deep_gemm;
 

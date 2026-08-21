@@ -9,7 +9,7 @@ from .gemm_fp8_lut import get_best_configs_from_lut
 from .gemm_int8 import gemm_a8w8_per_channel_nt
 
 # C++ code templates
-includes = ('"../deep_gemm/fp8_gemm.cuh"', )
+includes = ('<deep_gemm/impls/fp8_gemm.cuh>', )
 template = """
 using namespace deep_gemm;
 

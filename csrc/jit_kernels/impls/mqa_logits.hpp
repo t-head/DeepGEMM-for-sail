@@ -15,7 +15,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
 #include "../heuristics/common_mqa.hpp"
-#include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
+#include <deep_gemm/common/profiling_interface.cuh>
 
 namespace deep_gemm {
 
@@ -293,14 +293,14 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
         auto* ke_ptr = reinterpret_cast<int*>(cu_seq_len_k_end.data_ptr());
         if (stride_k_type == "uint32_t") {
             launch_mqa_logits<uint32_t>(
-                "fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
+                "deep_gemm/impls/fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
                 element_weights, dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
                 MqaLogitsFP4Arguments<uint32_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights.data_ptr(),
                                                 ks_ptr, ke_ptr, logits.data_ptr(), seq_len_q, seq_len_k,
                                                 static_cast<uint32_t>(aligned_seq_len_kv)});
         } else {
             launch_mqa_logits<uint64_t>(
-                "fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
+                "deep_gemm/impls/fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
                 element_weights, dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
                 MqaLogitsFP4Arguments<uint64_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights.data_ptr(),
                                                 ks_ptr, ke_ptr, logits.data_ptr(), seq_len_q, seq_len_k,
@@ -308,7 +308,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
         }
     } else if (stride_k_type == "uint32_t") {
         launch_mqa_logits<uint32_t>(
-            "ppu_mqa_logits.cuh", "PPUMqaLogits", config, element_qk, element_acc, element_logits, element_weights,
+            "deep_gemm/impls/ppu_mqa_logits.cuh", "PPUMqaLogits", config, element_qk, element_acc, element_logits, element_weights,
             dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
             MqaLogitsArguments<uint32_t>{q.data_ptr(), k.data_ptr(), k_scales_ptr, weights.data_ptr(),
                                          reinterpret_cast<uint32_t*>(cu_seq_len_k_start.data_ptr()),
@@ -317,7 +317,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
                                          static_cast<uint32_t>(aligned_seq_len_kv)});
     } else {
         launch_mqa_logits<uint64_t>(
-            "ppu_mqa_logits.cuh", "PPUMqaLogits", config, element_qk, element_acc, element_logits, element_weights,
+            "deep_gemm/impls/ppu_mqa_logits.cuh", "PPUMqaLogits", config, element_qk, element_acc, element_logits, element_weights,
             dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
             MqaLogitsArguments<uint64_t>{q.data_ptr(), k.data_ptr(), k_scales_ptr, weights.data_ptr(),
                                          reinterpret_cast<uint32_t*>(cu_seq_len_k_start.data_ptr()),

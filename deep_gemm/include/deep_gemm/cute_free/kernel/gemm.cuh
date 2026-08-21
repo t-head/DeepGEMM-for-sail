@@ -6,11 +6,11 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/memory_ppu.h"
-#include "cute_free/arch/ppu_common.cuh"
-#include "cute_free/mainloop/mainloop.cuh"
-#include "cute_free/epilogue/warp_k_reduce.cuh"
-#include "densegemm_scheduler_cutlass3.cuh"
-#include "utils_cutlass3.h"
+#include <deep_gemm/cute_free/arch/ppu_common.cuh>
+#include <deep_gemm/cute_free/mainloop/mainloop.cuh>
+#include <deep_gemm/cute_free/epilogue/warp_k_reduce.cuh>
+#include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
+#include <deep_gemm/common/utils_cutlass3.cuh>
 
 namespace deep_gemm {
 namespace kernel {
@@ -25,7 +25,7 @@ namespace kernel {
 // epilogue::Epilogue; those, together with the copy / mma atoms, are
 // injected as template parameters (the "atom" layer), so a new data type or
 // platform only needs a new set of atoms + a thin instance alias (see
-// bf16_gemm_cute_free.cuh).
+// impls/bf16_gemm_cute_free.cuh).
 //
 // Template parameters:
 //   Element_    : matrix element type (e.g. cutlass::bfloat16_t)

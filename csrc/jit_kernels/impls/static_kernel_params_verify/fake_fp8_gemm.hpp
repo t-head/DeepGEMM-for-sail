@@ -1,5 +1,5 @@
 #define FP8_HGRTC
-#include <../../../deep_gemm/include/deep_gemm/fp8_gemm.cuh>
+#include <deep_gemm/impls/fp8_gemm.cuh>
 namespace deep_gemm {
 using namespace cute;
 using cutlass::KernelHardwareInfo;

@@ -1,6 +1,6 @@
 namespace deep_gemm_int8 {
 #define FP8_HGRTC
-#include <../../../deep_gemm/include/deep_gemm/int8_gemm_cutlass3.cuh>
+#include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
 namespace deep_gemm {
 using namespace cute;
 using cutlass::KernelHardwareInfo;

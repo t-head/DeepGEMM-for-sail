@@ -10,7 +10,7 @@ from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, is_ppu1v5_device, GemmType
 from ..deep_gemm_tuner.autotune_fp4 import lookup_best_config
 # C++ code templates
-includes = ('"../deep_gemm/fp4_gemm_cutlass3.cuh"', )
+includes = ('<deep_gemm/impls/fp4_gemm_cutlass3.cuh>', )
 template = """
 using namespace deep_gemm;
 

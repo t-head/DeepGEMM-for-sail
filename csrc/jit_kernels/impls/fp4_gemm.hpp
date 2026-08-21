@@ -15,11 +15,11 @@
 #include "../../utils/layout_type_name.hpp"
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_fp4.hpp"
-#include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
+#include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
-#include "../../../deep_gemm/include/deep_gemm/utils_rtc.cuh"
-#include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
+#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/profiling_interface.cuh>
 
 using namespace deep_gemm_fp4_common;
 namespace deep_gemm {
@@ -216,7 +216,7 @@ public:
                 : "";
         return fmt::format(
             R"(
-#include <fp4_gemm_cutlass3.cuh>
+#include <deep_gemm/impls/fp4_gemm_cutlass3.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo; 
@@ -469,7 +469,7 @@ public:
     static std::string generate_impl(const Args& args) {
         return fmt::format(
             R"(
-#include <fp4_gemm_cutlass3_dynamic.cuh>
+#include <deep_gemm/impls/fp4_gemm_cutlass3_dynamic.cuh>
 namespace deep_gemm {{
 using namespace cute;
 

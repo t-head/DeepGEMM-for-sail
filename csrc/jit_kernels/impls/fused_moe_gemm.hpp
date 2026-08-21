@@ -15,8 +15,8 @@
 #include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
-#include "../../../deep_gemm/include/deep_gemm/fused_gemm_common.cuh"
-#include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
+#include <deep_gemm/common/fused_gemm_common.cuh>
+#include <deep_gemm/common/profiling_interface.cuh>
 
 namespace deep_gemm {
 
@@ -43,7 +43,7 @@ public:
     static std::string generate_impl(const Args& args) {
         return fmt::format(
             R"(
-#include "fused_moe_gemm.cuh"
+#include <deep_gemm/impls/fused_moe_gemm.cuh>
 
 namespace deep_gemm {{
 
@@ -212,7 +212,7 @@ public:
     static std::string generate_impl(const Args& args) {
         return fmt::format(
             R"(
-#include "fused_moe_gemm_with_blkwise_quant.cuh"
+#include <deep_gemm/impls/fused_moe_gemm_with_blkwise_quant.cuh>
 
 namespace deep_gemm {{
 
@@ -287,7 +287,7 @@ public:
     static std::string generate_impl(const Args& args) {
         return fmt::format(
             R"(
-#include "fused_moe_gemm_with_perchannel_quant.cuh"
+#include <deep_gemm/impls/fused_moe_gemm_with_perchannel_quant.cuh>
 
 namespace deep_gemm {{
 

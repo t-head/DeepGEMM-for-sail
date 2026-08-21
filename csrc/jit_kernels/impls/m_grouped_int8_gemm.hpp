@@ -18,8 +18,8 @@
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
-#include "../../../deep_gemm/include/deep_gemm/utils_rtc.cuh"
-#include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
+#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/profiling_interface.cuh>
 #include "int8_gemm.hpp"
 #include "../heuristics/predicated_tile_iterator_params.hpp"
 
@@ -83,7 +83,7 @@ public:
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
 #define INT8_HGRTC
-#include <int8_gemm_cutlass3.cuh>
+#include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
@@ -190,7 +190,7 @@ public:
         if (!args.launch_info.SmallK) {
             return fmt::format(R"(
 #define INT8_HGRTC
-#include <gemvt.cuh>
+#include <deep_gemm/impls/gemvt.cuh>
 namespace deep_gemm {{
 constexpr int BlockSize = {};
 constexpr int ThreadPerN = {};
@@ -218,7 +218,7 @@ void {}(const GemvtArgs args) {{
         } else {
             return fmt::format(R"(
 #define INT8_HGRTC
-#include <gemvt.cuh>
+#include <deep_gemm/impls/gemvt.cuh>
 namespace deep_gemm {{
 constexpr int BlockSize = {};
 constexpr int ThreadPerN = {};

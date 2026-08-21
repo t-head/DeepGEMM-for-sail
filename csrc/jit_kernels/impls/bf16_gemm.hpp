@@ -15,9 +15,9 @@
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_bf16.hpp"
 // #include "../heuristics/gemm_search_space.hpp"
-#include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
-#include "../../../deep_gemm/include/deep_gemm/densegemm_scheduler_cutlass3.cuh"
-#include "../../../deep_gemm/include/deep_gemm/gemm_occ_model.cuh"
+#include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
+#include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
+#include <deep_gemm/common/gemm_occ_model.cuh>
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 
@@ -125,8 +125,8 @@ public:
         return fmt::format(
             R"(
 #define BF16_HGRTC
-#include <bf16_gemm_cutlass3.cuh>
-#include <gemm_occ_model.cuh>
+#include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
+#include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
@@ -411,8 +411,8 @@ public:
         return fmt::format(
             R"(
 #define BF16_HGRTC
-#include <bf16_densegemm_cutlass3.cuh>
-#include <gemm_occ_model.cuh>
+#include <deep_gemm/impls/bf16_densegemm_cutlass3.cuh>
+#include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
@@ -641,7 +641,7 @@ public:
         return fmt::format(
             R"(
 #define BF16_HGRTC
-#include <bf16_gemm_cute_free.cuh>
+#include <deep_gemm/impls/bf16_gemm_cute_free.cuh>
 
 namespace deep_gemm {{
 
@@ -734,7 +734,7 @@ public:
         return fmt::format(
             R"(
 #define BF16_HGRTC
-#include <bf16_gemm.cuh>
+#include <deep_gemm/impls/bf16_gemm.cuh>
 namespace deep_gemm {{
 // using namespace cute;
 // using cutlass::KernelHardwareInfo;

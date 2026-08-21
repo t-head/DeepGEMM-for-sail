@@ -14,13 +14,13 @@
 #include "../../utils/layout_type_name.hpp"
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_fp8.hpp"
-#include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
-#include "../../../deep_gemm/include/deep_gemm/gemm_occ_model.cuh"
+#include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
+#include <deep_gemm/common/gemm_occ_model.cuh>
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
-#include "../../../deep_gemm/include/deep_gemm/utils_rtc.cuh"
-#include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
+#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/profiling_interface.cuh>
 #include "int8_gemm.hpp"
 
 using namespace deep_gemm_fp8_common;
@@ -237,8 +237,8 @@ public:
         return fmt::format(
             R"(
 #define FP8_HGRTC
-#include <fp8_gemm.cuh>
-#include <gemm_occ_model.cuh>
+#include <deep_gemm/impls/fp8_gemm.cuh>
+#include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;

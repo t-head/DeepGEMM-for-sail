@@ -39,9 +39,10 @@ def get_deep_gemm_version() -> str:
     include_dir = f'{os.path.dirname(os.path.abspath(__file__))}/../include/deep_gemm'
     assert os.path.exists(include_dir), f'Cannot find GEMM include directory {include_dir}'
     md5 = hashlib.md5()
-    for filename in filter(lambda x: x.endswith('.cuh'), sorted(os.listdir(include_dir))):
-        with open(f'{include_dir}/{filename}', 'rb') as f:
-            md5.update(f.read())
+    for root, _, files in os.walk(include_dir):
+        for filename in sorted(filter(lambda x: x.endswith('.cuh'), files)):
+            with open(os.path.join(root, filename), 'rb') as f:
+                md5.update(f.read())
 
     # Update `interleave_ffma.py`
     with open(f'{os.path.dirname(os.path.realpath(__file__))}/interleave_ffma.py', 'rb') as f:
@@ -170,6 +171,8 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
 
     # --- Include paths ---
     include_dirs = [get_jit_include_dir()]
+    if _jit_include_dir_default not in include_dirs:
+        include_dirs.append(_jit_include_dir_default)
     # Always include the deep_gemm headers (aligned with the C++ JIT compiler)
     deep_gemm_inc = f'{_jit_include_dir_default}/deep_gemm'
     if deep_gemm_inc not in include_dirs:

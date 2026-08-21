@@ -7,7 +7,7 @@ from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, GemmType, get_extra_info
 
 # C++ code templates
-includes = ('"../deep_gemm/fp4_gemm_cutlass3.cuh"', )
+includes = ('<deep_gemm/impls/fp4_gemm_cutlass3.cuh>', )
 template = """
 using namespace deep_gemm;
 

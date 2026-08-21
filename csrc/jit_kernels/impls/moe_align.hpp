@@ -53,7 +53,7 @@ public:
     static std::string generate_impl(const Args& args) {
         return fmt::format(
             R"(
-#include "fused_gemm_util.cuh"
+#include <deep_gemm/impls/fused_gemm_util.cuh>
 namespace deep_gemm {{
 extern "C" __launch_bounds__({}, 1)
 __global__ void {}(
@@ -146,7 +146,7 @@ public:
         case Phase::kCount:
             return fmt::format(
                 R"(
-#include "fused_gemm_util.cuh"
+#include <deep_gemm/impls/fused_gemm_util.cuh>
 namespace deep_gemm {{
 
 extern "C" __launch_bounds__({0}, 1)
@@ -167,7 +167,7 @@ __global__ void moe_align_p1(
         case Phase::kScan:
             return fmt::format(
                 R"(
-#include "fused_gemm_util.cuh"
+#include <deep_gemm/impls/fused_gemm_util.cuh>
 namespace deep_gemm {{
 
 extern "C" __launch_bounds__({0}, 1)
@@ -188,7 +188,7 @@ __global__ void moe_align_p2(
         case Phase::kCumsum:
             return fmt::format(
                 R"(
-#include "fused_gemm_util.cuh"
+#include <deep_gemm/impls/fused_gemm_util.cuh>
 namespace deep_gemm {{
 
 extern "C" __launch_bounds__({0}, 1)
@@ -209,7 +209,7 @@ __global__ void moe_align_p3(
         case Phase::kScatter:
             return fmt::format(
                 R"(
-#include "fused_gemm_util.cuh"
+#include <deep_gemm/impls/fused_gemm_util.cuh>
 namespace deep_gemm {{
 
 extern "C" __launch_bounds__({0}, 1)

@@ -15,14 +15,14 @@
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_int8.hpp"
 #include "../heuristics/predicated_tile_iterator_params.hpp"
-#include "../../../deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh"
-#include "../../../deep_gemm/include/deep_gemm/densegemm_scheduler_cutlass3.cuh"
-#include "../../../deep_gemm/include/deep_gemm/gemm_occ_model.cuh"
+#include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
+#include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
+#include <deep_gemm/common/gemm_occ_model.cuh>
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
-#include "../../../deep_gemm/include/deep_gemm/utils_rtc.cuh"
-#include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
+#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/profiling_interface.cuh>
 
 using namespace deep_gemm_int8;
 namespace deep_gemm {
@@ -139,8 +139,8 @@ public:
         const bool is_aligned_n = (shape_n % args.launch_info.block_n == 0);
         return fmt::format(R"(
 #define INT8_HGRTC
-#include <int8_densegemm_cutlass3.cuh>
-#include <gemm_occ_model.cuh>
+#include <deep_gemm/impls/int8_densegemm_cutlass3.cuh>
+#include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
@@ -368,8 +368,8 @@ public:
         const PpuHwParams& hw = PpuHwParams::instance();
         return fmt::format(R"(
 #define INT8_HGRTC
-#include <int8_gemm_cutlass3.cuh>
-#include <gemm_occ_model.cuh>
+#include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
+#include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
@@ -619,7 +619,7 @@ public:
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
 #define FP8_HGRTC
-#include <int8_gemm.cuh>
+#include <deep_gemm/impls/int8_gemm.cuh>
 namespace deep_gemm {{
 
 constexpr int SHAPE_N = {};

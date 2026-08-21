@@ -37,6 +37,7 @@ ppu_include = os.path.join(ppu_sdk, 'targets', 'x86_64-linux', 'include')
 sources = ['csrc/python_api.cpp']
 build_include_dirs = [
     ppu_include,
+    current_dir + '/deep_gemm/include',
     current_dir + '/third-party/actlize_v1.0.0/',
     current_dir + '/third-party/actlize_v1.0.0/include',
     current_dir + '/third-party/actlize_v1.0.0/tools',

@@ -7,7 +7,7 @@ from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout,
 from .gemm_fp8 import get_best_configs
 from .gemm_int8 import get_best_configs as get_best_int8_configs
 # C++ code templates
-includes = ('"../deep_gemm/fp8_gemm.cuh"', )
+includes = ('<deep_gemm/impls/fp8_gemm.cuh>', )
 template = """
 using namespace deep_gemm;
 
@@ -32,7 +32,7 @@ gemm_t::run(d, a, b, sfa,
             stream, num_sms, smem_size);
 """
 
-includes_cutlass2_int8 = ('"deep_gemm/int8_gemm.cuh"', )
+includes_cutlass2_int8 = ('<deep_gemm/impls/int8_gemm.cuh>', )
 template_cutlass2_int8 = """
 using namespace deep_gemm;
 
@@ -55,7 +55,7 @@ gemm_t::run(d, nullptr, nullptr,
             stream, num_sms, smem_size);
 """
 
-includes_cutlass3 = ('"../deep_gemm/int8_gemm_cutlass3.cuh"', )
+includes_cutlass3 = ('<deep_gemm/impls/int8_gemm_cutlass3.cuh>', )
 template_cutlass3 = """
 using namespace deep_gemm;
 
@@ -102,7 +102,7 @@ def int8_einsum(expr: str,
     else:
         raise ValueError(f"unsupported expr expression: {expr}!")
 # --- Fused permute(1,0,2) kernel: includes & template (Python JIT pattern) ---
-permute_includes = ('"../deep_gemm/fused_permute.cuh"', )
+permute_includes = ('<deep_gemm/impls/fused_permute.cuh>', )
 permute_template = """
 using namespace deep_gemm;
 

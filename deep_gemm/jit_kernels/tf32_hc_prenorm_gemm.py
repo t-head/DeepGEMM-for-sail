@@ -5,7 +5,7 @@ from typing import Tuple
 from .tuner import jit_tuner
 from .utils import get_num_sms, is_ppu1v5_device
 
-includes_cutlass3 = ('"../deep_gemm/tf32_hc_prenorm_gemm.cuh"', )
+includes_cutlass3 = ('<deep_gemm/impls/tf32_hc_prenorm_gemm.cuh>', )
 
 template_cutlass3 = """
 using namespace deep_gemm;
