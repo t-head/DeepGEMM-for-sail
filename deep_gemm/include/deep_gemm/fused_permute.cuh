@@ -49,8 +49,8 @@ __device__ __forceinline__ long long sfa_dst_offset(int d1, int d0, int dim0, in
 }
 
 template <int VEC_SIZE, int THREADS_PER_BLOCK, int ROWS_PER_ITER, int DIM1, int NUM_D2_VECS_A, int TAIL_BYTES_A, int DIM2_SFA_BYTES, int D1_TILE, bool USE_FAST_PATH, bool SFA_D2_CONTIGUOUS>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK)
-fused_permute_kernel(
+__device__ __forceinline__ void
+fused_permute_kernel_impl(
     const char* __restrict__ src_a,
     char* __restrict__       dst_a,
     const char* __restrict__ src_sfa,
@@ -242,6 +242,23 @@ fused_permute_kernel(
             }
         }
     }
+}
+
+template <int VEC_SIZE, int THREADS_PER_BLOCK, int ROWS_PER_ITER, int DIM1, int NUM_D2_VECS_A, int TAIL_BYTES_A, int DIM2_SFA_BYTES, int D1_TILE, bool USE_FAST_PATH, bool SFA_D2_CONTIGUOUS>
+__global__ __launch_bounds__(THREADS_PER_BLOCK)
+void
+fused_permute_kernel(
+    const char* __restrict__ src_a,
+    char* __restrict__       dst_a,
+    const char* __restrict__ src_sfa,
+    char* __restrict__       dst_sfa,
+    int dim0, int dim2_a,
+    long long stride0_a_bytes, long long stride1_a_bytes,
+    long long stride0_sfa_bytes, long long stride1_sfa_bytes, long long stride2_sfa_bytes)
+{
+    fused_permute_kernel_impl<VEC_SIZE, THREADS_PER_BLOCK, ROWS_PER_ITER, DIM1, NUM_D2_VECS_A, TAIL_BYTES_A, DIM2_SFA_BYTES, D1_TILE, USE_FAST_PATH, SFA_D2_CONTIGUOUS>(
+        src_a, dst_a, src_sfa, dst_sfa, dim0, dim2_a,
+        stride0_a_bytes, stride1_a_bytes, stride0_sfa_bytes, stride1_sfa_bytes, stride2_sfa_bytes);
 }
 
 }  // namespace deep_gemm

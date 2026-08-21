@@ -34,8 +34,6 @@ from .jit_kernels import (
     m_grouped_gemm_fp8_fp8_bf16_nt_fused,
     m_grouped_gemm_int8_int8_bf16_nt_fused,
     m_grouped_gemm_fp4_fp4_bf16_nt_fused,
-    fp8_einsum,
-    int8_einsum,
 )
 
 from .utils import (
@@ -72,6 +70,8 @@ from .deep_gemm_cpp import (
     int8_paged_mqa_logits,
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
+    fp8_einsum,
+    int8_einsum,
 )
 
 use_cpp_jit_for_python = os.environ.get('USE_CPP_JIT_FOR_PYTHON', '').lower()
