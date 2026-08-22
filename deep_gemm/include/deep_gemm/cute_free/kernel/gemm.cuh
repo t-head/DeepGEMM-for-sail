@@ -54,7 +54,7 @@ template <typename Element_,
           typename MmaAtom_, typename Epilogue_,
           int BLOCK_M, int BLOCK_N, int BLOCK_K,
           int WARP_M, int WARP_N, int WARP_K, int STAGES,
-          bool DenseS2Opt,
+          bool DenseS2Opt, bool OverlapPrologue,
           typename GemmTypeTag>
 struct GemmKernel {
   // ---- Injected atoms / types ----
@@ -69,7 +69,7 @@ struct GemmKernel {
   // Collective mainloop assembled from the injected copy / mma atoms.
   using Mainloop = mainloop::Mainloop<
       Element, G2SAtomA, G2SAtomB, S2RAtomA, S2RAtomB, MmaAtom,
-      BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, STAGES, DenseS2Opt>;
+      BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, STAGES, DenseS2Opt, OverlapPrologue>;
 
   static constexpr GemmType kGemmType = GemmTypeTag::value;
 
@@ -137,43 +137,66 @@ struct GemmKernel {
     using Scheduler = DenseGemmScheduler<BLOCK_M, BLOCK_N>;
     Scheduler scheduler(params.scheduler);
 
-    uint32_t m_block = 0;
-    uint32_t n_block = 0;
-    while (scheduler.fetch_next_work(m_block, n_block)) {
+    int warp_id = __shfl_sync(0xFFFFFFFFU, threadIdx.x / 32, 0);
+    int lane = threadIdx.x % 32;
+    int warp_mn  = warp_id % kWarpsMN;
+    int warp_k   = warp_id / kWarpsMN;
+    int warp_row = warp_mn / kWarpsN;
+    int warp_col = warp_mn % kWarpsN;
+
+    typename Mainloop::Params ml_params{
+        params.ptr_A, params.ptr_B, params.M, params.N, params.K,
+        params.lda, params.ldb};
+
+    if constexpr (OverlapPrologue) {
+      // --- Overlap path: hoist first tile's stage-0 G2S, then interleave
+      //     next-tile prologue with current-tile epilogue. ---
+      uint32_t m_block = 0, n_block = 0;
+      bool tile_valid = scheduler.fetch_next_work(m_block, n_block);
       int m_offset = static_cast<int>(m_block) * BLOCK_M;
       int n_offset = static_cast<int>(n_block) * BLOCK_N;
 
-      // Use __shfl_sync to get warp_id in scalar register (same as Cutlass3's
-      int warp_id = __shfl_sync(0xFFFFFFFFU, threadIdx.x / 32, 0);
-      int lane = threadIdx.x % 32;
-      // Warp decomposition must match cutlass3's (warp_idx_k = warp_idx / WarpOnMN,
-      // warp_idx_mn = warp_idx % WarpOnMN) so the two implementations stay
-      // comparable and any shared reduction layout lines up.
-      int warp_mn  = warp_id % kWarpsMN;
-      int warp_k   = warp_id / kWarpsMN;
-      int warp_row = warp_mn / kWarpsN;
-      int warp_col = warp_mn % kWarpsN;
+      // Hoist first tile's stage-0 G2S
+      if (tile_valid) {
+        Mainloop::issue_prologue_stage0(smem, warp_id, ml_params, m_offset, n_offset);
+      }
 
-      float accum[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread] = {};
+      while (tile_valid) {
+        float accum[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread] = {};
+        Mainloop::run(ml_params, smem, warp_id, warp_row, warp_col, warp_k,
+                      m_offset, n_offset, accum);
+        WarpKReduce::run(accum, reinterpret_cast<float*>(smem), warp_mn, warp_k, lane);
 
-      // Run the collective K-pipeline (prologue + mainloop), filling accum.
-      // With kWarpsK > 1 this leaves a PARTIAL sum over warp_k's K slice.
-      typename Mainloop::Params ml_params{
-          params.ptr_A, params.ptr_B, params.M, params.N, params.K,
-          params.lda, params.ldb};
-      Mainloop::run(ml_params, smem, warp_id, warp_row, warp_col, warp_k,
-                    m_offset, n_offset, accum);
+        // Fetch next tile + issue its stage-0 (overlaps epilogue below)
+        tile_valid = scheduler.fetch_next_work(m_block, n_block);
+        int m_next = static_cast<int>(m_block) * BLOCK_M;
+        int n_next = static_cast<int>(n_block) * BLOCK_N;
+        if (tile_valid) {
+          Mainloop::issue_prologue_stage0(smem, warp_id, ml_params, m_next, n_next);
+        }
 
-      // Reduce the K-split partials into warp_k == 0. No-op when kWarpsK == 1.
-      // Mainloop::run() ends with cp_async_wait<0>() + __syncthreads(), so the
-      // async copies are drained and every warp is done reading SMEM before we
-      // reuse it as the reduction scratch buffer.
-      WarpKReduce::run(accum, reinterpret_cast<float*>(smem), warp_mn, warp_k, lane);
-
-      // Only the warp_k == 0 group holds the full sum, so only it stores.
-      if (warp_k == 0) {
-        Epilogue::store(m_offset, n_offset, warp_row, warp_col, lane,
-                        params.ptr_D, params.ldd, params.M, params.N, accum);
+        // Epilogue (NoTsm: no SMEM usage, safe to run with G2S in flight)
+        if (warp_k == 0) {
+          Epilogue::store(m_offset, n_offset, warp_row, warp_col, lane,
+                          params.ptr_D, params.ldd, params.M, params.N, accum);
+        }
+        m_offset = m_next;
+        n_offset = n_next;
+      }
+    } else {
+      // --- Original non-overlap path (unchanged logic) ---
+      uint32_t m_block = 0, n_block = 0;
+      while (scheduler.fetch_next_work(m_block, n_block)) {
+        int m_offset = static_cast<int>(m_block) * BLOCK_M;
+        int n_offset = static_cast<int>(n_block) * BLOCK_N;
+        float accum[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread] = {};
+        Mainloop::run(ml_params, smem, warp_id, warp_row, warp_col, warp_k,
+                      m_offset, n_offset, accum);
+        WarpKReduce::run(accum, reinterpret_cast<float*>(smem), warp_mn, warp_k, lane);
+        if (warp_k == 0) {
+          Epilogue::store(m_offset, n_offset, warp_row, warp_col, lane,
+                          params.ptr_D, params.ldd, params.M, params.N, accum);
+        }
       }
     }
   }

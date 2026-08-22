@@ -40,7 +40,7 @@ class Runtime:
 
     def __call__(self, *args) -> int:
         if compile_mode == CompileMode.ONLY_COMPILE.value or os.environ.get('HGGC_WARM_UP', False):
-            return
+            return 0
         # Load SO file
         if self.lib is None or self.args is None:
             self.lib = ctypes.CDLL(os.path.join(self.path, 'kernel.so'))

@@ -382,7 +382,7 @@ const std::vector<std::vector<int>> CONFIG_TILE_GREATER_4096 = {{128, 128, 64, 6
                                                                 {256, 128, 64, 64, 64, 64, 2},
                                                                 {512, 128, 64, 64, 64, 64, 3},
                                                                 {128, 256, 64, 32, 128, 64, 2}};
-std::tuple<int, int, int, int, int, int, int, int, bool, std::tuple<int, int, int>>
+std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms) {
     MatmulHeuristicsTile candidate_tile(shape, dtype, CONFIG_TILE_GREATER_4096);
 
@@ -404,6 +404,6 @@ get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms) 
     int k = shape[2];
     std::tuple<int, int, int> best_smem_config = get_smem_config(stages, k, bm, bn, bk);
 
-    return {num_min_sms, bm, bn, bk, wm, wn, bk, stages, false, best_smem_config};
+    return {num_min_sms, bm, bn, bk, wm, wn, bk, stages, best_smem_config};
 }
 } // namespace deep_gemm_bf16_common

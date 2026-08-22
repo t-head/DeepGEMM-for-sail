@@ -18,6 +18,8 @@ Env knobs:
                        cap table with model fallback)
   DG_COMPUTE_TILE=0    disable the compute-bound 16-warp tile override
   DG_BF16_ADAPTIVE=0   (in gemm.py) bypass this selector entirely
+  DG_M512_OVH_K=64     per-tile overhead (in k-step equivalents) used by the
+                       M>512 wave-fit tile cost model
 """
 import math
 import os
@@ -662,6 +664,80 @@ def _compute_bound_tile(block_m, m, n, k, num_sms):
     return bn, wm, wn
 
 
+# M>512 wave-fit tile selection (gated override of the legacy 256x256 pin).
+# History (all A/B'd on the 462-case M>512 subset vs acblas / old dev,
+# compute-bound BF16 K=1024):
+#   - cross-BM makespan ladder: geomean 0.63 vs acblas (calibrated for
+#     m<=512; picks high-M-padding BM=192 tiles here).
+#   - free cost-model choice:   geomean ~1.00, but bimodal - 8-warp
+#     128x256 mispicks in multi-wave regions (M=640..1280 x N>=4608:
+#     -8..-11% vs old 256x256) and deep-wave BM=128 BN>=384 (doubled
+#     A-refetch: 128x512 family geomean 0.91 vs acblas).
+# Current policy: override the legacy 256x256 pin only when the geometry
+# case is unambiguous:
+#   - waves==1: fewer/less-padded tiles reliably win (underfilled grid);
+#   - waves>=2: require >=10% better M-padding utilization than BM=256
+#     (full-700 A/B: margin-1.111 bucket (M=1152 family) wins 37/43 at
+#     gm 0.935 vs old; margin-1.091 bucket (M=1408 family) loses at
+#     gm 1.026 — 1.08 mis-gated it, 1.10 rejects only that bucket).
+# BM=128 is capped at BN=256 (traffic bound, see above).
+_MGT512_BM_CONFIGS = (
+    (128, 64, ((256, 64),)),
+    (192, 48, ((128, 64), (256, 64))),
+    (256, 64, ((128, 64), (256, 64))),
+)
+# Per-tile overhead in k-step equivalents: pipeline fill/drain + epilogue
+# store, charged once per wave round. Makes small tiles pay for their
+# higher tile count, keeping BM=256 competitive where padding is free.
+_MGT512_OVH_K = int(os.environ.get('DG_M512_OVH_K', '64'))
+
+
+def _select_tile_m_gt_512(m, n, k, num_sms):
+    """Pick (BM, BN, WM, WN) for compute-bound M>512 shapes, or None to
+    keep the legacy 256x256x64/w64x64/S4 pin.
+
+    The kernel runs persistent-style (launch min(num_tiles, num_sms) blocks),
+    so runtime ~ waves * (tile_compute + tile_overhead) where
+      waves       = ceil(m_tiles * n_tiles / num_sms)
+      tile_compute = BM*BN*we_factor (WE-imbalance priced)
+      tile_overhead = (BM+BN) * OVH_K (prologue/epilogue amortization)
+    Padding is implicit: m_tiles/n_tiles round up, inflating both waves and
+    per-tile work, so high-padding BMs lose naturally.
+    """
+    # Small-N (incl. swapped) shapes: legacy pin is validated; ladder/model
+    # picks there regress 5-18% in compute-bound benchmarks. N>=2048 only.
+    if n < 2048:
+        return None
+    cands = []
+    for bm, wm, bn_list in _MGT512_BM_CONFIGS:
+        mt = ceil_div(m, bm)
+        wom = bm // wm
+        for bn, wn in bn_list:
+            tw = wom * (bn // wn)
+            if tw < 8 or tw > _MAX_WARPS_PER_BLOCK:
+                continue
+            if not _tile_spill_ok(wm, wn, tw):
+                continue
+            nt = ceil_div(n, bn)
+            blocks = mt * nt
+            waves = ceil_div(blocks, num_sms)
+            we = math.ceil(tw / _WE_PER_CU) * _WE_PER_CU / tw
+            cost = waves * (bm * bn * we + (bm + bn) * _MGT512_OVH_K)
+            cands.append((cost, waves, -bn, bm, bn, wm, wn, m / (mt * bm)))
+    if not cands:
+        return None
+    cands.sort()
+    cost, waves, _, bm, bn, wm, wn, m_util = cands[0]
+    if bm == 256:
+        return None  # legacy pin already optimal
+    if waves == 1:
+        return bm, bn, wm, wn  # wave-fit wins are reliable at 1 wave
+    base_util = max((c[7] for c in cands if c[3] == 256), default=1.0)
+    if m_util > base_util * 1.10:
+        return bm, bn, wm, wn  # real M-padding win
+    return None
+
+
 def _select_adaptive_smem(block_m, block_n):
     bound = _SMEM_SIZE / ((block_m + block_n) * _BASE_BLOCK_K * 2.0)
     best_bk, best_s = None, None
@@ -723,17 +799,25 @@ def get_adaptive_configs(m: int, n: int, k: int, num_sms: int):
 
 
 def _get_adaptive_configs_impl(m: int, n: int, k: int, num_sms: int):
-    # m > 512: compute-bound large-M, not covered by the wave-fit generalization.
-    # Hard-pin to 256x256x64/WM64/WN64/S4. The overlay otherwise snaps BN down
-    # to non-power-of-2 (e.g. m=527/n=5120/k=13824 -> BN=240/WN=48) which costs
-    # ~12% vs the natural square tile (active cycles -20%).
+    # m > 512: compute-bound large-M. Wave-fit BM/BN selection across
+    # BM in {128, 192, 256}: BM=256 padding waste (M%256 != 0) and low
+    # tile counts at small N cost up to 40% vs acblas in A/B benchmarks.
     if m > 512 and n > 512:
-        block_m, block_n, block_k = 256, 256, 64
-        warp_m, warp_n = 64, 64
-        num_stages = 4
-        warp_k = block_k
+        picked = _select_tile_m_gt_512(m, n, k, num_sms)
+        if picked is None:
+            # Legacy pin: 256x256x64, w64x64, S4 (validated default).
+            block_m, block_n, warp_m, warp_n = 256, 256, 64, 64
+            block_k, num_stages = 64, 4
+            warp_k = get_warp_k(block_m, block_n, block_k, warp_m, warp_n,
+                                num_stages)
+        else:
+            block_m, block_n, warp_m, warp_n = picked
+            block_k, num_stages = _select_adaptive_smem(block_m, block_n)
+            warp_k = get_warp_k(block_m, block_n, block_k, warp_m, warp_n,
+                                num_stages)
         num_tiles = ceil_div(m, block_m) * ceil_div(n, block_n)
-        return min(num_tiles, num_sms), block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages
+        return (min(num_tiles, num_sms), block_m, block_n, block_k,
+                warp_m, warp_n, warp_k, num_stages)
 
     block_m = _select_blockm(m)
 

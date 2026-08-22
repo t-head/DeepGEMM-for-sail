@@ -33,6 +33,7 @@ namespace deep_gemm {
 template <int BLOCK_M, int BLOCK_N, int BLOCK_K,
           int WARP_M, int WARP_N, int WARP_K, int STAGES,
           bool DenseS2Opt,
+          bool OverlapPrologue,
           bool IsAlignedN,
           typename GemmTypeTag>
 using BF16GemmCuteFreeKernel = kernel::GemmKernel<
@@ -44,7 +45,7 @@ using BF16GemmCuteFreeKernel = kernel::GemmKernel<
     mma::Bf16MmaAtom,                                          // MMA
     epilogue::Epilogue<cutlass::bfloat16_t, mma::Bf16MmaAtom::CLayout,
                              WARP_M, WARP_N, IsAlignedN>,      // Epilogue
-    BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, STAGES, DenseS2Opt,
+    BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, STAGES, DenseS2Opt, OverlapPrologue,
     GemmTypeTag>;
 
 } // namespace deep_gemm

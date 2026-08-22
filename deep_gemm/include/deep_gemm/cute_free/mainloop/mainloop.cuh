@@ -42,7 +42,7 @@ template <typename Element,
           typename MmaAtom,
           int BLOCK_M, int BLOCK_N, int BLOCK_K,
           int WARP_M, int WARP_N, int WARP_K, int STAGES,
-          bool DenseS2Opt>
+          bool DenseS2Opt, bool OverlapPrologue>
 struct Mainloop {
   // ---- Constants derived from the MMA atom + tile config ----
   static constexpr int kMmaM = MmaAtom::kMmaM;
@@ -476,10 +476,11 @@ struct Mainloop {
     Element* smem_a = reinterpret_cast<Element*>(smem);
     Element* smem_b = smem_a + STAGES * BLOCK_M * BLOCK_K;
 
-    // Prologue: fill STAGES tiles.
-    int k_tile_to_load = 0;
+    // Prologue: fill STAGES tiles (overlap variant starts from stage 1).
+    int k_tile_to_load = OverlapPrologue ? 1 : 0;
+    int s_start = OverlapPrologue ? 1 : 0;
     #pragma unroll
-    for (int s = 0; s < STAGES && k_tile_to_load < total_k_tiles; ++s) {
+    for (int s = s_start; s < STAGES && k_tile_to_load < total_k_tiles; ++s) {
       if (warp_id == 0) {
         G2SAtomA::load(smem_a + s * BLOCK_M * BLOCK_K, params.ptr_A,
                        params.M, params.lda, m_offset, k_tile_to_load * BLOCK_K);
@@ -520,6 +521,20 @@ struct Mainloop {
 
     cutlass::arch::cp_async_wait<0>();
     __syncthreads();
+  }
+
+  /// Issue stage-0 G2S for a single tile. Called by the kernel's overlap loop.
+  /// Only warp 0 issues; all warps observe the fence.
+  static __device__ __forceinline__ void issue_prologue_stage0(
+      char* smem, int warp_id, Params const& params,
+      int m_offset, int n_offset) {
+    Element* smem_a = reinterpret_cast<Element*>(smem);
+    Element* smem_b = smem_a + STAGES * BLOCK_M * BLOCK_K;
+    if (warp_id == 0) {
+      G2SAtomA::load(smem_a, params.ptr_A, params.M, params.lda, m_offset, 0);
+      G2SAtomB::load(smem_b, params.ptr_B, params.N, params.ldb, n_offset, 0);
+    }
+    cutlass::arch::cp_async_fence();
   }
 };
 

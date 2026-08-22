@@ -47,13 +47,17 @@ using namespace cute;
 
 namespace cutlass::gemm {
 
-template<int Stages_, typename Schedule_ = KernelAiuMultistage, bool DenseS2Opt_ = false>
+template<int Stages_, typename Schedule_ = KernelAiuMultistage, bool DenseS2Opt_ = false, bool OverlapPrologue_ = false>
 struct MainloopPPUAiuOpt {
   constexpr static int Stages = Stages_;
   using ArchTag = arch::PPU0015;
   using Schedule = Schedule_;
   using ClusterShape = Shape<_1,_1,_1>;
   static constexpr bool DenseS2Opt = DenseS2Opt_;
+  // Overlap the next tile's prologue (stage-0 AIU loads) with the current
+  // tile's epilogue. Host enables it only when wave > 3 (acblas parity),
+  // since the interleave smem layout / extra prefetch carries overhead.
+  static constexpr bool OverlapPrologue = OverlapPrologue_;
 };
 
 } // namespace cutlass::gemm
@@ -67,6 +71,7 @@ template <
   int Stages,
   class KernelSchedule,
   bool DenseS2Opt,
+  bool OverlapPrologue,
   class TileShape_,
   class ElementA_,
   class StrideA_,
@@ -83,7 +88,7 @@ template <
   class TransformB_>
 struct CollectiveMma<
     Arch_,
-    MainloopPPUAiuOpt<Stages, KernelSchedule, DenseS2Opt>,
+    MainloopPPUAiuOpt<Stages, KernelSchedule, DenseS2Opt, OverlapPrologue>,
     TileShape_,
     ElementA_,
     StrideA_,
@@ -101,7 +106,7 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopPPUAiuOpt<Stages, KernelSchedule>;
+  using DispatchPolicy = MainloopPPUAiuOpt<Stages, KernelSchedule, DenseS2Opt, OverlapPrologue>;
   using TileShape = TileShape_;
   using ElementA = ElementA_;
   using StrideA = StrideA_;
@@ -134,11 +139,32 @@ struct CollectiveMma<
       SmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
 
+  // OverlapPrologue: interleave A/B stage buffers (double the last stride so
+  // A and B stages alternate in one contiguous smem region), mirroring
+  // bf16_gemm_cutlass3_overlap_prologue.cuh. Total cosize is unchanged:
+  // (Stages-1)*(strideA+strideB) + strideA + strideB == cosizeA + cosizeB.
+  using SmemLayoutAInterleave = decltype(make_layout(shape(SmemLayoutA{}), make_stride(stride<0>(SmemLayoutA{}), stride<1>(SmemLayoutA{}), stride<2>(SmemLayoutA{}) + stride<2>(SmemLayoutB{}))));
+  using SmemLayoutBInterleave = decltype(make_layout(shape(SmemLayoutB{}), make_stride(stride<0>(SmemLayoutB{}), stride<1>(SmemLayoutB{}), stride<2>(SmemLayoutA{}) + stride<2>(SmemLayoutB{}))));
+
+  // tile256x256 && !NT trans, use sigle warp to issue AIU LOAD
+  static constexpr int WARP_NUM = cute::size(TiledMma{}) / 32;
+  static constexpr bool SplitAIU = (size<0>(TileShape{}) != 256 || size<1>(TileShape{}) != 256
+              || (is_same_v<StrideA, cutlass::detail::TagToStrideA_t<layout::ColumnMajor>>
+                  && is_same_v<StrideB, cutlass::detail::TagToStrideB_t<layout::RowMajor>>)) &&
+              WARP_NUM >= 2;
+
   static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
 
   struct SharedStorage {
     cute::array_aligned<ElementA, cute::cosize_v<SmemLayoutA>> smem_a;
     cute::array_aligned<ElementB, cute::cosize_v<SmemLayoutB>> smem_b;
+  };
+
+  // OverlapPrologue variant: A/B stages interleave inside one contiguous
+  // region, so smem_a alone must cover cosizeA + cosizeB elements.
+  // Total size equals SharedStorage's, so SharedStorageSize is unaffected.
+  struct SharedStorageInterleave {
+    cute::array_aligned<ElementA, cute::cosize_v<SmemLayoutA> + cute::cosize_v<SmemLayoutB>> smem_a;
   };
 
   // Host side kernel arguments
@@ -216,6 +242,47 @@ struct CollectiveMma<
     return cutlass::Status::kSuccess;
   }
 
+  /// OverlapPrologue: issue stage-0 AIU loads for a tile ahead of its MMA
+  /// (called for the first tile before the persistent loop, and for each
+  /// next tile between MMA and the current tile's epilogue).
+  template <
+    class... Ts
+  >
+  CUTLASS_DEVICE void
+  prologue(
+      cute::tuple<Ts...> const& load_inputs,
+      int thread_idx,
+      char *smem_buf) {
+    static_assert(OverlapPrologue, "prologue() is only available with OverlapPrologue enabled");
+    using namespace cute;
+
+    int warp_idx = canonical_warp_idx_sync();
+
+    Tensor gA = get<0>(load_inputs);
+    Tensor gB = get<1>(load_inputs);
+
+    // Construct interleaved shared memory tiles
+    SharedStorageInterleave& storage = *reinterpret_cast<SharedStorageInterleave*>(smem_buf);
+    Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutAInterleave{}); // (BLK_M,BLK_K,PIPE)
+    Tensor sB = make_tensor(make_smem_ptr(storage.smem_a.data() + size<0>(TileShape{}) * size<2>(TileShape{})), SmemLayoutBInterleave{}); // (BLK_N,BLK_K,PIPE)
+
+    // Partition the copying of A and B tiles across the threads
+    auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx);
+    auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
+
+    Tensor tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
+    Tensor tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
+    Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
+    Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
+
+    copy_aiu<SplitAIU>(
+      gmem_tiled_copy_A, tAgA(_,_,_,Int<0>{}), tAsA(_,_,_,Int<0>{}),
+      gmem_tiled_copy_B, tBgB(_,_,_,Int<0>{}), tBsB(_,_,_,Int<0>{}),
+      warp_idx
+    );
+    cp_async_fence();
+  }
+
   /// Perform a collective-scoped matrix multiply-accumulate
   template <
     class... Ts,
@@ -247,10 +314,26 @@ struct CollectiveMma<
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
 
-    // Construct shared memory tiles
+    // Construct shared memory tiles.
+    // OverlapPrologue: stage-0 was already issued by prologue() into the
+    // interleaved layout; the remaining stages target the same geometry.
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-    Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
-    Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
+    Tensor sA = [&]() {
+      if constexpr (OverlapPrologue) {
+        auto& s = *reinterpret_cast<SharedStorageInterleave*>(smem_buf);
+        return make_tensor(make_smem_ptr(s.smem_a.data()), SmemLayoutAInterleave{}); // (BLK_M,BLK_K,PIPE)
+      } else {
+        return make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{});     // (BLK_M,BLK_K,PIPE)
+      }
+    }();
+    Tensor sB = [&]() {
+      if constexpr (OverlapPrologue) {
+        auto& s = *reinterpret_cast<SharedStorageInterleave*>(smem_buf);
+        return make_tensor(make_smem_ptr(s.smem_a.data() + size<0>(TileShape{}) * size<2>(TileShape{})), SmemLayoutBInterleave{}); // (BLK_N,BLK_K,PIPE)
+      } else {
+        return make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{});     // (BLK_N,BLK_K,PIPE)
+      }
+    }();
 
     CUTE_STATIC_ASSERT_V(size<0>(gA) == size<0>(sA));                          // BLK_M
     CUTE_STATIC_ASSERT_V(size<1>(gA) == size<1>(sA));                          // BLK_K
@@ -269,10 +352,16 @@ struct CollectiveMma<
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
-    // Start async loads for all pipes but the last
+    // Start async loads for all pipes but the last.
+    // OverlapPrologue: stage 0 was already issued by prologue() — start from
+    // k_pipe = 1 with the stage-0 k-tile already consumed.
+    if constexpr (OverlapPrologue) {
+      --k_tile_count;
+      ++k_tile_iter;
+    }
     CUTLASS_PRAGMA_UNROLL
-    for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
-      copy_aiu(
+    for (int k_pipe = OverlapPrologue ? 1 : 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
+      copy_aiu<SplitAIU>(
         gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
         gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
         warp_idx
@@ -399,7 +488,7 @@ struct CollectiveMma<
           }
 
           if (k_tile_count > 0) {
-            copy_aiu(
+            copy_aiu<SplitAIU>(
               gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
               gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
               warp_idx
@@ -480,6 +569,9 @@ public:
   static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
   static constexpr uint32_t NumMmaWarpGroups = 1;
+
+  // Next-tile prologue overlap, carried by the mainloop dispatch policy.
+  static constexpr bool OverlapPrologue = DispatchPolicy::OverlapPrologue;
 
   using TileScheduler = TileScheduler_;
   using TileSchedulerArguments = typename TileScheduler::Arguments;
@@ -599,6 +691,123 @@ public:
     uint32_t m_coord, n_coord;
     uint32_t l_coord = 0;
     constexpr uint32_t L = 1;
+
+    if constexpr (OverlapPrologue) {
+      // Overlap variant (mirrors bf16_gemm_cutlass3_overlap_prologue.cuh):
+      // hoist the first tile's stage-0 loads out of the loop, then each
+      // iteration does MMA -> k-reduce -> fetch next + issue its stage-0
+      // loads -> epilogue, so the next tile's prologue overlaps the current
+      // tile's epilogue. MMA ends with cp_async_wait<0>/syncthreads and the
+      // k-reduce ends with syncthreads, so smem is free for the prefetch;
+      // the NoTsm epilogue does not touch smem.
+      bool tile_valid = deep_scheduler.fetch_next_work(m_coord, n_coord);
+      auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
+      uint32_t M = deep_scheduler.curr_problem_m();
+      auto problem_shape_MNKL = ProblemShape{M, N, K, L};
+      auto offset_m = deep_scheduler.curr_offset_m();
+      auto offset_a = deep_scheduler.curr_offset_a();
+      auto offset_b = deep_scheduler.curr_offset_b(m_coord);
+      const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
+      const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
+
+      CollectiveMainloop collective_mma_prologue(params.mainloop, take<0, 3>(problem_shape_MNKL));
+      auto load_inputs = collective_mma_prologue.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
+                                                           offset_m, ptr_A, ptr_B);
+      if (tile_valid) {
+        collective_mma_prologue.prologue(load_inputs, thread_idx, smem_buf);
+      }
+
+      while (tile_valid) {
+        CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
+        // Extract out partitioned A and B.
+        Tensor gA = get<0>(load_inputs);
+        Tensor gB = get<1>(load_inputs);
+
+        // Compute tile residues for predication
+        auto m_max_coord = M - size<0>(gA) * get<0>(blk_coord_mnkl);
+        auto n_max_coord = N - size<0>(gB) * get<1>(blk_coord_mnkl);
+        auto k_residue   = K - size<1>(gA) * size<2>(gA);
+        auto residue_mnk = make_tuple(m_max_coord, n_max_coord, k_residue);
+
+        // Allocate the tiled_mma and accumulators
+        TiledMma tiled_mma;
+        Tensor accumulators = make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
+        clear(accumulators);
+
+        auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
+        int  k_tile_count = size<2>(gA);
+
+        // Perform the collective scoped MMA
+        collective_mma(
+          accumulators,
+          load_inputs,
+          accumulators,
+          k_tile_iter, k_tile_count,
+          residue_mnk,
+          thread_idx,
+          smem_buf
+        );
+
+        int warp_idx = canonical_warp_idx_sync();
+        constexpr int WarpsPerK = WarpOnM * WarpOnN;
+        const int warp_k_idx = (WarpOnK > 1) ? (warp_idx / WarpsPerK) : 0;
+        if constexpr (WarpOnK > 1) {
+          using ReductionPolicy_ = cutlass::gemm::kernel::WarpOnKReductionPolicy<
+              CUTE_STATIC_V(get<0>(TileShape{})), CUTE_STATIC_V(get<1>(TileShape{})), CUTE_STATIC_V(get<2>(TileShape{})),
+              CUTE_STATIC_V(get<0>(TileShape{})) / WarpOnM,
+              CUTE_STATIC_V(get<1>(TileShape{})) / WarpOnN,
+              CUTE_STATIC_V(get<2>(TileShape{})) / WarpOnK,
+              DispatchPolicy::Stages,
+              int(sizeof(ElementA))>;
+          int lane_idx = threadIdx.x % 32;
+          cutlass::gemm::kernel::warp_on_k_reduce<ReductionPolicy_>(
+              accumulators, reinterpret_cast<float*>(smem_buf), warp_idx, lane_idx);
+        }
+
+        // Capture the current tile's epilogue state before fetching the next.
+        auto params_epilogue_local = params.epilogue;
+        params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
+        params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
+
+        // Fetch the next tile and issue its stage-0 loads, overlapping the
+        // epilogue below.
+        tile_valid = deep_scheduler.fetch_next_work(m_coord, n_coord);
+        M = deep_scheduler.curr_problem_m();
+        auto blk_coord_mnkl_next = make_coord(m_coord, n_coord, _, l_coord);
+        auto problem_shape_MNKL_next = ProblemShape{M, N, K, L};
+        auto offset_m_next = deep_scheduler.curr_offset_m();
+        auto offset_a_next = deep_scheduler.curr_offset_a();
+        auto offset_b_next = deep_scheduler.curr_offset_b(m_coord);
+        const ElementA* ptr_A_next = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a_next;
+        const ElementB* ptr_B_next = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b_next;
+        CollectiveMainloop collective_mma_next(params.mainloop, take<0, 3>(problem_shape_MNKL_next));
+        auto load_inputs_next = collective_mma_next.load_init(problem_shape_MNKL_next, blk_coord_mnkl_next, params.mainloop,
+                                                              offset_m_next, ptr_A_next, ptr_B_next);
+        if (tile_valid) {
+          collective_mma_next.prologue(load_inputs_next, thread_idx, smem_buf);
+        }
+
+        if (warp_k_idx == 0) {
+          // Epilogue and write to gD
+          CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
+          epilogue(
+            problem_shape_MNKL,
+            blk_shape,
+            blk_coord_mnkl,
+            accumulators,
+            tiled_mma,
+            residue_mnk,
+            thread_idx,
+            (char*)&shared_storage.tensors.epilogue
+          );
+        }
+
+        blk_coord_mnkl = blk_coord_mnkl_next;
+        problem_shape_MNKL = problem_shape_MNKL_next;
+        load_inputs = load_inputs_next;
+      } // Scheduler work fetch loop
+      return;
+    }
 
     while (deep_scheduler.fetch_next_work(m_coord, n_coord)) {
 
