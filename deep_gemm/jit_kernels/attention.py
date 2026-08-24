@@ -514,7 +514,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
             input=fused_kv_cache,
             size=(num_kv_blocks, block_kv * 4),
             stride=(kv_cache_stride_bytes, 1),
-            storage_offset=block_kv * head_dim,
+            storage_offset=fused_kv_cache.storage_offset() + block_kv * head_dim,
         ).view(torch.int32)
     elif q.dtype == torch.bfloat16:
         k_scales = torch.empty(0)
@@ -523,7 +523,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
             input=fused_kv_cache,
             size=(num_kv_blocks, block_kv * 4),
             stride=(kv_cache_stride_bytes, 1),
-            storage_offset=block_kv * head_dim,
+            storage_offset=fused_kv_cache.storage_offset() + block_kv * head_dim,
         ).view(dtype=torch.float)
 
     num_q_stages, num_kv_stages, split_kv, warp_kv, split_mblock, _ = get_paged_mqa_logits_tile(next_n, block_kv, num_heads, head_dim, q.element_size())

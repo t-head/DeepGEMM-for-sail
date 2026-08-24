@@ -286,7 +286,8 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     torch::Tensor k_scales;
     if (is_fp4 or qk_dtype != torch::kBFloat16) {
         k_scales = fused_kv_cache
-                       .as_strided({num_kv_blocks, block_kv * 4}, {kv_cache_stride_bytes, 1}, block_kv * head_dim)
+                       .as_strided({num_kv_blocks, block_kv * 4}, {kv_cache_stride_bytes, 1},
+                                   fused_kv_cache.storage_offset() + block_kv * head_dim)
                        .view(is_fp4 ? torch::kInt32 : torch::kFloat32);
     }
 

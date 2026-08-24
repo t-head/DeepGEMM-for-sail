@@ -274,6 +274,47 @@ def test_nvtx():
     print("Passed\n")
 
 
+def test_per_layer_cache_view():
+    num_kv_blocks, block_kv, num_heads, head_dim = 8, 64, 32, 128
+    num_layers = 4
+    max_context_len = num_kv_blocks * block_kv
+
+    v = (torch.arange(max_context_len) % 7 + 1).float()
+    s = 0.001 * (1 + torch.arange(max_context_len).float())
+    k = torch.full((max_context_len, head_dim), 0).to(torch.int8)
+    k[:] = v.to(torch.int8).unsqueeze(1)
+    page = torch.cat([k.view(torch.uint8).reshape(num_kv_blocks, block_kv * head_dim),
+                      torch.from_numpy(s.numpy().astype('<f4')).view(torch.uint8).reshape(num_kv_blocks, block_kv * 4)],
+                     dim=1).cuda()
+
+    q = torch.ones(1, 1, num_heads, head_dim, device='cuda').to(torch.int8)
+    weights = torch.full((1, num_heads), 1.0 / num_heads, device='cuda')
+    block_table = torch.arange(num_kv_blocks, dtype=torch.int32, device='cuda').unsqueeze(0)
+    context_lens = torch.full((1, 1), max_context_len, dtype=torch.int32, device='cuda')
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens, block_kv, deep_gemm.get_num_sms(),
+        metadata_extra=(1, num_heads, head_dim, 1))
+
+    def check(fused_kv_cache):
+        logits = deep_gemm.int8_paged_mqa_logits(
+            q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
+            max_context_len, clean_logits=False, logits_dtype=torch.float32)
+        return int((((logits.float().cpu()[0] / (head_dim * v * s)) - 1).abs() < 0.005).sum())
+
+    fused_kv_cache = torch.zeros(num_kv_blocks, block_kv * (head_dim + 4),
+                                 dtype=torch.uint8, device='cuda')
+    fused_kv_cache.copy_(page)
+    assert check(fused_kv_cache.view(num_kv_blocks, block_kv, 1, head_dim + 4)) == max_context_len
+
+    fused_kv_cache = torch.zeros(num_kv_blocks, num_layers, block_kv * (head_dim + 4),
+                                 dtype=torch.uint8, device='cuda')
+    fused_kv_cache[:, 3, :] = page
+    fused_kv_cache = fused_kv_cache[:, 3].view(num_kv_blocks, block_kv, 1, head_dim + 4)
+    assert fused_kv_cache.view(num_kv_blocks, block_kv, head_dim + 4).storage_offset() \
+        == 3 * block_kv * (head_dim + 4)
+    assert check(fused_kv_cache) == max_context_len
+
+
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -286,3 +327,4 @@ if __name__ == '__main__':
     test_ks_ke()
     test_mqa_logits_loop()
     test_paged_mqa_logits_loop()
+    test_per_layer_cache_view()
