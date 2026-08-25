@@ -98,11 +98,13 @@ if should_init_deep_gemm_cpp:
         m_grouped_gemm_fp4_fp4_bf16_nt_masked,
         m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
         gemm_fp4_fp4_bf16_nt,
-        # BF16 Fused MoE GEMM
-        m_grouped_gemm_bf16_bf16_bf16_nt_fused,
-        # FP8/INT8 Fused MoE GEMM
-        m_grouped_gemm_fp8_fp8_bf16_nt_fused,
-        m_grouped_gemm_int8_int8_bf16_nt_fused,
+       # # BF16 Fused MoE GEMM
+       # m_grouped_gemm_bf16_bf16_bf16_nt_fused,
+       # # FP8/INT8 Fused MoE GEMM
+       # m_grouped_gemm_fp8_fp8_bf16_nt_fused,
+       # m_grouped_gemm_int8_int8_bf16_nt_fused,
+       # # moe_align preprocessing
+       # moe_align_block_size,
     )
 
 deep_gemm_cpp.init(

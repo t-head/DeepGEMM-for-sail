@@ -14,6 +14,7 @@
 #include "../jit_kernels/impls/m_grouped_fp4_gemm.hpp"
 #include "../jit_kernels/impls/tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/fused_moe_gemm.hpp"
+#include "../jit_kernels/impls/moe_align.hpp"
 
 namespace deep_gemm::gemm {
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
@@ -804,6 +805,21 @@ void tf32_hc_prenorm_gemm_nt(const torch::Tensor& a, const torch::Tensor& b, con
 
     tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k);
 }
+
+// moe_align preprocessing (C++ JIT) — apis-layer interface owns input
+// validation; the impls layer (jit_kernels/impls/moe_align.hpp) only
+// orchestrates config resolution + kernel dispatch.
+MoeAlignReturn moe_align_block_size(
+    const torch::Tensor& lhs,
+    const torch::Tensor& rhs,
+    const torch::Tensor& topk_ids,
+    bool perchannel_quant = false,
+    std::optional<FusedConfigTuple> config = std::nullopt) {
+    DG_HOST_ASSERT(topk_ids.dtype() == torch::kInt32);
+    DG_HOST_ASSERT(topk_ids.dim() == 2);
+
+    return moe_align_block_size_impl(lhs, rhs, topk_ids, perchannel_quant, config);
+}
 }
 
 static void register_apis(pybind11::module_& m) {
@@ -865,6 +881,10 @@ static void register_apis(pybind11::module_& m) {
           py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),
           py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
           py::arg("aligned_num_m_blocks"), py::arg("configs"));
+    // moe_align preprocessing (C++ JIT)
+    m.def("moe_align_block_size", &moe_align_block_size,
+          py::arg("lhs"), py::arg("rhs"), py::arg("topk_ids"),
+          py::arg("perchannel_quant") = false, py::arg("config") = std::nullopt);
 }
 
 } // namespace deep_gemm::gemm

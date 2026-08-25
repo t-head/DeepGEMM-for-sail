@@ -357,8 +357,8 @@ constexpr int next_pow2() {
 // =============================================================================
 
 template <int BLOCK_M, int kNumGroups, int kTopK, int BLOCK_SIZE = 1024>
-__global__ __launch_bounds__(BLOCK_SIZE, 1) void
-moe_align_warp_ordered_kernel(
+__device__ __forceinline__ void
+moe_align_warp_ordered_kernel_impl(
     const int32_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ m_rows,
@@ -506,6 +506,25 @@ moe_align_warp_ordered_kernel(
     }
 }
 
+// Forwarding __global__ kernel — delegates to __device__ _impl (trampoline)
+template <int BLOCK_M, int kNumGroups, int kTopK, int BLOCK_SIZE = 1024>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void
+moe_align_warp_ordered_kernel(
+    const int32_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ m_rows,
+    int32_t* __restrict__ expert_ids_and_cumsum,
+    int32_t* __restrict__ aligned_num_m_blocks,
+    int32_t* __restrict__ inv_perm,
+    int32_t* __restrict__ m_indices,
+    int numel,
+    int s_total_ub)
+{
+    moe_align_warp_ordered_kernel_impl<BLOCK_M, kNumGroups, kTopK, BLOCK_SIZE>(
+        topk_ids, sorted_token_ids, m_rows, expert_ids_and_cumsum,
+        aligned_num_m_blocks, inv_perm, m_indices, numel, s_total_ub);
+}
+
 // =============================================================================
 // 4-kernel deterministic moe_align pipeline (ported from sglang final version)
 // Replaces the original single-kernel atomicAdd scatter with a fully
@@ -521,18 +540,17 @@ moe_align_warp_ordered_kernel(
 // Grid: NUM_BLOCKS blocks.  SMEM: kNumGroups * sizeof(int32_t).
 // ----------------------------------------------------------------------------
 template <int BLOCK_SIZE, int kNumGroups, int kTopK>
-__global__ void __launch_bounds__(BLOCK_SIZE, 1)
-block_count_with_fill(
+__device__ __forceinline__ void
+block_count_with_fill_impl(
     const int32_t* __restrict__ topk_ids,        // [numel] flattened topk_ids
     int32_t* __restrict__ sorted_token_ids,      // [s_total_ub] output, stride-filled with PAD_ID
     int32_t* __restrict__ block_counts,          // [NUM_BLOCKS * kNumGroups] output
     int numel,                                   // total elements = M * topk
-    int s_total_ub)                              // upper bound of s_total (= max_num_m_blocks * BLOCK_M)
+    int s_total_ub,                              // upper bound of s_total (= max_num_m_blocks * BLOCK_M)
+    int bid)                                     // logical block index
 {
-    int bid = blockIdx.x;
     int tid = threadIdx.x;
-    int num_blocks = gridDim.x;
-    size_t idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    size_t idx = static_cast<size_t>(bid) * BLOCK_SIZE + tid;
 
     // -- Fill PAD: stride-write shape_m to all of sorted_token_ids --
     int shape_m = numel / kTopK;
@@ -565,6 +583,20 @@ block_count_with_fill(
     }
 }
 
+// Forwarding __global__ kernel — delegates to __device__ _impl (trampoline)
+template <int BLOCK_SIZE, int kNumGroups, int kTopK>
+__global__ void __launch_bounds__(BLOCK_SIZE, 1)
+block_count_with_fill(
+    const int32_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ block_counts,
+    int numel,
+    int s_total_ub)
+{
+    block_count_with_fill_impl<BLOCK_SIZE, kNumGroups, kTopK>(
+        topk_ids, sorted_token_ids, block_counts, numel, s_total_ub, blockIdx.x);
+}
+
 // -- K2: local_scan ---------------------------------------------------------
 // Parallel exclusive scan across NUM_BLOCKS for each expert column.
 // Uses CUB BlockScan for O(log N) inter-thread prefix.
@@ -573,15 +605,15 @@ block_count_with_fill(
 // Output: local_offsets[num_blocks][kNumGroups], expert_counts[kNumGroups].
 // ----------------------------------------------------------------------------
 template <int BLOCK_SIZE>
-__global__ void __launch_bounds__(BLOCK_SIZE, 1)
-local_scan(
+__device__ __forceinline__ void
+local_scan_impl(
     const int32_t* __restrict__ block_counts,   // [num_blocks * kNumGroups]
     int32_t* __restrict__ local_offsets,         // [num_blocks * kNumGroups] output
     int32_t* __restrict__ expert_counts,          // [kNumGroups] output
     int kNumGroups,                              // runtime
-    int num_blocks)
+    int num_blocks,
+    int eid)                                     // expert index handled by this block
 {
-    int eid = blockIdx.x;
     int tid = threadIdx.x;
     if (eid >= kNumGroups) return;
 
@@ -623,6 +655,20 @@ local_scan(
     }
 }
 
+// Forwarding __global__ kernel — delegates to __device__ _impl (trampoline)
+template <int BLOCK_SIZE>
+__global__ void __launch_bounds__(BLOCK_SIZE, 1)
+local_scan(
+    const int32_t* __restrict__ block_counts,
+    int32_t* __restrict__ local_offsets,
+    int32_t* __restrict__ expert_counts,
+    int kNumGroups,
+    int num_blocks)
+{
+    local_scan_impl<BLOCK_SIZE>(
+        block_counts, local_offsets, expert_counts, kNumGroups, num_blocks, blockIdx.x);
+}
+
 // -- K3: cumsum_expert_ids --------------------------------------------------
 // Block-aligns expert token counts (from m_rows), computes element-level cumsum
 // via CUB BlockScan, and writes expert_ids_and_cumsum in DeepGEMM format.
@@ -632,8 +678,8 @@ local_scan(
 // Output: cumsum_out[kNumGroups] + expert_ids_and_cumsum + aligned_num_m_blocks.
 // ----------------------------------------------------------------------------
 template <int BLOCK_SIZE, int BLOCK_M, int kNumGroups>
-__global__ void __launch_bounds__(BLOCK_SIZE, 1)
-cumsum_expert_ids(
+__device__ __forceinline__ void
+cumsum_expert_ids_impl(
     const int32_t* __restrict__ m_rows,              // [kNumGroups] expert_counts from K2
     int32_t* __restrict__ expert_ids_and_cumsum,     // [max_num_m_blocks * 4] output (DeepGEMM format, uint4)
     int32_t* __restrict__ cumsum_out,                // [kNumGroups] element-level padded cumsum for K4
@@ -695,6 +741,19 @@ cumsum_expert_ids(
     }
 }
 
+// Forwarding __global__ kernel — delegates to __device__ _impl (trampoline)
+template <int BLOCK_SIZE, int BLOCK_M, int kNumGroups>
+__global__ void __launch_bounds__(BLOCK_SIZE, 1)
+cumsum_expert_ids(
+    const int32_t* __restrict__ m_rows,
+    int32_t* __restrict__ expert_ids_and_cumsum,
+    int32_t* __restrict__ cumsum_out,
+    int32_t* __restrict__ aligned_num_m_blocks)
+{
+    cumsum_expert_ids_impl<BLOCK_SIZE, BLOCK_M, kNumGroups>(
+        m_rows, expert_ids_and_cumsum, cumsum_out, aligned_num_m_blocks);
+}
+
 // -- K4: deterministic_scatter ----------------------------------------------
 // Thread<->expert 1:1 binding.  SMEM tile cooperative load + scan.
 // ZERO atomicAdd in scatter phase -- fully deterministic.
@@ -703,8 +762,8 @@ cumsum_expert_ids(
 // Output: sorted_token_ids (filled with token_idx = idx / topk).
 // ----------------------------------------------------------------------------
 template <int BLOCK_SIZE, int BLOCK_M, int kTopK>
-__global__ void __launch_bounds__(BLOCK_SIZE, 1)
-deterministic_scatter(
+__device__ __forceinline__ void
+deterministic_scatter_impl(
     const int32_t* __restrict__ topk_ids,            // [numel] flattened topk_ids
     int32_t* __restrict__ sorted_token_ids,           // [s_total_ub] output
     int32_t* __restrict__ inv_perm,                   // [numel] output
@@ -712,9 +771,9 @@ deterministic_scatter(
     const int32_t* __restrict__ cumsum,                // [kNumGroups] element-level padded cumsum from K3
     const int32_t* __restrict__ local_offsets,         // [num_blocks * kNumGroups]
     int numel,                                         // = M * topk
-    int kNumGroups)                                    // runtime
+    int kNumGroups,                                    // runtime
+    int bid)                                           // logical block index
 {
-    int bid = blockIdx.x;
     int tid = threadIdx.x;
     int idx = bid * BLOCK_SIZE + tid;
 
@@ -753,6 +812,24 @@ deterministic_scatter(
             }
         }
     }
+}
+
+// Forwarding __global__ kernel — delegates to __device__ _impl (trampoline)
+template <int BLOCK_SIZE, int BLOCK_M, int kTopK>
+__global__ void __launch_bounds__(BLOCK_SIZE, 1)
+deterministic_scatter(
+    const int32_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ inv_perm,
+    int32_t* __restrict__ m_indices,
+    const int32_t* __restrict__ cumsum,
+    const int32_t* __restrict__ local_offsets,
+    int numel,
+    int kNumGroups)
+{
+    deterministic_scatter_impl<BLOCK_SIZE, BLOCK_M, kTopK>(
+        topk_ids, sorted_token_ids, inv_perm, m_indices,
+        cumsum, local_offsets, numel, kNumGroups, blockIdx.x);
 }
 
 // -- Launcher ---------------------------------------------------------------
