@@ -200,7 +200,9 @@ public:
         // --- Language & defines ---
         // NOTE: leading space is required -- the base flags do not always end with one
         // (the optional debug/lineinfo appends have no trailing space).
-        flags += " -DUSE_HGGC -DUSE_CLANG -DUSE_ACWRAPPER ";
+        // SDK 2.1 uses hggc_runtime.h directly and no longer provides the
+        // legacy acwrapper_runtime.h compatibility header.
+        flags += " -DUSE_HGGC -DUSE_CLANG ";
 
         // --- Architecture ---
         if (is_ppu1v5_device()) {
@@ -214,7 +216,9 @@ public:
         // against, so they are resolved per kernel in `compile` instead of being seeded here.
 
         // --- Output format & optimization ---
-        flags += "-hgbin -ftemplate-depth=8192 -O3 -DNDEBUG ";
+        // ZW810E SDK 2.1 HGCC rejects -ftemplate-depth as a device-driver
+        // option; the kernels compile with the compiler default.
+        flags += "-hgbin -O3 -DNDEBUG ";
 
         // --- Host compiler flags (passed via -Xcompiler) ---
         flags += "-Xcompiler -fPIC ";
