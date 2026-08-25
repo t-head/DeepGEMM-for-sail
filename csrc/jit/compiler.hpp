@@ -176,7 +176,11 @@ class HGCCCompiler final: public Compiler {
         // Call the version command
         const auto& command = std::string(hgcc_path) + " --version";
         const auto& [return_code, output] = call_external_command(command);
-        DG_HOST_ASSERT(return_code == 0 and "Failed to query hgcc --version");
+        // SDK 2.1 HGCC rejects --version with exit code 3. Version discovery
+        // is cache-key metadata, not a compilation prerequisite, so preserve
+        // the documented best-effort behavior instead of disabling C++ JIT.
+        if (return_code != 0)
+            return "unknown";
 
         std::smatch match;
         if (std::regex_search(output, match, std::regex(R"(version (\d+\.\d+(?:\.\d+)?))")))
@@ -200,7 +204,9 @@ public:
         // --- Language & defines ---
         // NOTE: leading space is required -- the base flags do not always end with one
         // (the optional debug/lineinfo appends have no trailing space).
-        flags += " -DUSE_HGGC -DUSE_CLANG -DUSE_ACWRAPPER ";
+        // SDK 2.1 uses hggc_runtime.h directly and no longer provides the
+        // legacy acwrapper_runtime.h compatibility header.
+        flags += " -DUSE_HGGC -DUSE_CLANG ";
 
         // --- Architecture ---
         if (is_ppu1v5_device()) {
@@ -214,7 +220,9 @@ public:
         // against, so they are resolved per kernel in `compile` instead of being seeded here.
 
         // --- Output format & optimization ---
-        flags += "-hgbin -ftemplate-depth=8192 -O3 -DNDEBUG ";
+        // SDK 2.1 exposes this as a long driver option with a separate value;
+        // the Clang-style `-ftemplate-depth=8192` spelling is rejected.
+        flags += "-hgbin --ftemplate-depth 8192 -O3 -DNDEBUG ";
 
         // --- Host compiler flags (passed via -Xcompiler) ---
         flags += "-Xcompiler -fPIC ";

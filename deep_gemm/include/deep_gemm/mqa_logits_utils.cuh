@@ -238,29 +238,28 @@ void float_epilogue_reduce_weights(const AccTensor& accum, int m,
         return fmaxf(accum(j, m, n), 0) * weights[n * 4 + j % 4];
 #endif
     };
-    v_0 = 0; v_1 = 0;
+    // Preserve the established FP32 accumulation order. Group every MMA
+    // accumulator lane across N first, then combine the four lanes for each
+    // output. Interleaving lanes inside the N loop is mathematically equal,
+    // but changes rounding and can flip top-k membership at tie boundaries.
+    float sum[8] = {
+        transform(0, 0), transform(1, 0), transform(2, 0), transform(3, 0),
+        transform(4, 0), transform(5, 0), transform(6, 0), transform(7, 0)
+    };
     #pragma unroll
-    for (uint32_t n = 0; n < cute::size<2>(accum); ++n) {
-#if __HGGC_ARCH__ == 150
-        v_0 += transform(0, n);
-        v_0 += transform(1, n);
-        v_1 += transform(2, n);
-        v_1 += transform(3, n);
-        v_0 += transform(4, n);
-        v_0 += transform(5, n);
-        v_1 += transform(6, n);
-        v_1 += transform(7, n);
-#else
-        v_0 += transform(0, n);
-        v_0 += transform(1, n);
-        v_0 += transform(2, n);
-        v_0 += transform(3, n);
-        v_1 += transform(4, n);
-        v_1 += transform(5, n);
-        v_1 += transform(6, n);
-        v_1 += transform(7, n);
-#endif
+    for (uint32_t n = 1; n < cute::size<2>(accum); ++n) {
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            sum[k] += transform(k, n);
+        }
     }
+#if __HGGC_ARCH__ == 150
+    v_0 = sum[0] + sum[1] + sum[4] + sum[5];
+    v_1 = sum[2] + sum[3] + sum[6] + sum[7];
+#else
+    v_0 = sum[0] + sum[1] + sum[2] + sum[3];
+    v_1 = sum[4] + sum[5] + sum[6] + sum[7];
+#endif
 }
 
 // FP4 fma2 phase: weight access via tCrW tensor (no arch branching)

@@ -324,6 +324,12 @@ public:
                 float v_0, v_1;
                 deep_gemm::float_epilogue_reduce_weights(accum, m, weights, v_0, v_1);
 
+                // Apply the per-KV scale to each lane-local partial before
+                // the shuffle reduction. Moving it after the reduction is
+                // algebraically equivalent but changes the FP32 contract.
+                v_0 *= scale_kv_0;
+                v_1 *= scale_kv_1;
+
                 // Inter-thread reduction
                 deep_gemm::shfl_xor_reduce_2(v_0, v_1);
 
@@ -333,12 +339,12 @@ public:
                     const uint32_t rel_kv = kv_offset + mma_offset - seq_k_start[warp_q_idx];
                     const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
                     if (rel_kv + v_0_offset < len)
-                        params.logits[q_idx * params.stride_k + rel_kv + v_0_offset] = v_0 * scale_kv_0;
+                        params.logits[q_idx * params.stride_k + rel_kv + v_0_offset] = v_0;
                     if (rel_kv + v_1_offset < len)
-                        params.logits[q_idx * params.stride_k + rel_kv + v_1_offset] = v_1 * scale_kv_1;
+                        params.logits[q_idx * params.stride_k + rel_kv + v_1_offset] = v_1;
                 } else {
-                    params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_0_offset] = v_0 * scale_kv_0;
-                    params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_1_offset] = v_1 * scale_kv_1;
+                    params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_0_offset] = v_0;
+                    params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_1_offset] = v_1;
                 }
             } else {
                 // BF16 vectorized epilogue: separate cvt and fma2 phases with __ppu_sched_bound()
