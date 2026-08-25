@@ -124,7 +124,9 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
     hgcc_flags = [
         f'-std=c++{cpp_standard}',
         '-shared',                  # produce a .so rather than a raw binary
-        '-DUSE_HGGC', '-DUSE_CLANG', '-DUSE_ACWRAPPER',
+        # SDK 2.1 uses hggc_runtime.h directly and does not provide the legacy
+        # acwrapper_runtime.h compatibility header.
+        '-DUSE_HGGC', '-DUSE_CLANG',
     ]
 
     # --- Architecture ---
@@ -134,7 +136,9 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
         hgcc_flags.append('-arch=ppu_10')
 
     # --- Optimization ---
-    hgcc_flags.extend(['-ftemplate-depth=8192', '-O3', '-DNDEBUG'])
+    # SDK 2.1 exposes this as a long driver option with a separate value; the
+    # Clang-style `-ftemplate-depth=8192` spelling is rejected by HGCC.
+    hgcc_flags.extend(['--ftemplate-depth', '8192', '-O3', '-DNDEBUG'])
 
 
     # --- Host compiler flags (via -Xcompiler) ---
