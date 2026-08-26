@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple
+from typing import Optional, Tuple
 
 from .tuner import jit_tuner
 from .gemm import get_best_configs as bf16_get_best_configs
@@ -122,16 +122,18 @@ constexpr auto WARP_N = {WARP_N};
 constexpr auto BLOCK_K = {BLOCK_K};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
+constexpr auto kApplySwigluLimit = {kApplySwigluLimit};
 
 // Make a templated grouped GEMM
 using fused_moe_gemm_fp4 = Fp4FusedMoeGemm<N, K, kNumGroups,
             BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumStages,
-            GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelType::{KERNEL_TYPE}>;
+            GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelType::{KERNEL_TYPE},
+            EpilogueType::{EPILOGUE_TYPE}, kApplySwigluLimit>;
 
 // Launch kernel
 fused_moe_gemm_fp4::run(out, lhs, rhs, lhs_scales, rhs_scales,
             m_rows, expert_ids_and_cumsum, sorted_token_ids,
-            aligned_num_m_blocks, m, topk, stream, num_sms);
+            aligned_num_m_blocks, m, topk, stream, num_sms, out_scale, swiglu_limit);
 """
 
 def moe_align_block_size(
@@ -140,6 +142,7 @@ def moe_align_block_size(
     topk_ids: torch.Tensor,
     perchannel_quant: bool = False,
     config=None,
+    enable_silu_and_mul_quant_fusing: bool = False,
 ):
     """
     Align token assignments to blocks for MoE Grouped GEMM computation.
@@ -151,6 +154,8 @@ def moe_align_block_size(
                 indicating which expert each token selects.
         perchannel_quant: Whether per-channel quantization is used (affects auto-config selection).
         config: Optional GEMM config tuple. If None, auto-selected via get_best_configs.
+        enable_silu_and_mul_quant_fusing: Whether to fuse silu_and_mul_post_quant kernel
+                into fp4 fused_moe Epilogue.
 
     Returns:
         config: The GEMM config tuple used for block_m selection.
@@ -200,7 +205,9 @@ def moe_align_block_size(
         elif dtype == torch.float8_e4m3fn:
             config = fp8_blkwise_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
         elif dtype == torch.uint8:
-            config = fp4_get_best_configs(numel, expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
+            ### SiluAndMulPostQuant fusing only support block_n >= 64
+            min_block_n = 64 if enable_silu_and_mul_quant_fusing else 32
+            config = fp4_get_best_configs(numel, expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused, min_block_n=min_block_n)
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
     block_m = config[1]
@@ -559,7 +566,26 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
                                      expert_ids_and_cumsum: torch.Tensor,
                                      sorted_token_ids: torch.Tensor,
                                      aligned_num_m_blocks: torch.Tensor,
-                                     configs) -> None:
+                                     configs,
+                                     out_scale: Optional[torch.Tensor] = None,
+                                     swiglu_limit: Optional[float] = None) -> None:
+    """MoE GroupedFused FP4 GEMM.
+
+    When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
+    `out` must be uint8 of shape (m_sum, n // 4) and `out_scale` uint16 of shape
+    (m_sum, ceil_div(n // 4, 32)). The gemm1 weight must have been interleaved with
+    `preprocess_mxfp4_weight_for_act_and_quant_fusing` (instead of `preprocess_mxfp4_scales`), so
+    that the epilogue reads gate/up (W1/W3) pairs from adjacent N positions.
+
+    `swiglu_limit > 0` clamps before the activation: the gate is clamped from above only
+    (`min(gate, limit)`) and the up projection on both sides (`clamp(up, -limit, limit)`);
+    `0.0` or None disables the clamp.
+
+    Shape `n` must be a multiple of 64 in the fused mode.
+
+    NOTE: when `out_scale` is not None, it is re-strided **in place** on return to the N-major
+    layout (1, sfm) expected by the Gemm2 SFA reader.
+    """
     from .gemm_fp4 import check_mxfp4_scales_layout
 
     lhs, lhs_scales = lhs_
@@ -568,10 +594,31 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
     num_groups, n, k_ = rhs.shape
     m_sum, n_ = out.shape
 
+    enable_silu_and_mul_quant_fusing = out_scale is not None
+    if enable_silu_and_mul_quant_fusing:
+        shape_n_out = n // 4 ### /2: silu_and_mul; /2: quant mxfp4
+        sfm, sfn = m_sum, ceil_div(shape_n_out, 32)
+        assert n_ == shape_n_out, f'{n_=}, expected {shape_n_out}'
+        assert out_scale.shape == (sfm, sfn), \
+            f'out_scale shape {out_scale.shape}, expected {(sfm, sfn)}'
+        assert out.dtype == torch.uint8 and out_scale.dtype == torch.uint16
+        assert out_scale.is_contiguous() or check_mxfp4_scales_layout(scale=out_scale)
+        assert n % 64 == 0, (
+            f"n ({n}) must be divisible by 64 in the SiluAndMulPostQuant epilogue: "
+            "n // 4(act_func & quant) must stay a multiple of 16."
+        )
+        epilogue_type, output_type = 'SiluAndMulPostQuantFp4', torch.uint8
+    else:
+        assert swiglu_limit is None or swiglu_limit == 0.0, "swiglu_limit is only used when out_scale is not None."
+        assert n_ == n, f'{n_=}, expected {n}'
+        out_scale = torch.empty(0, dtype=torch.uint16, device=out.device)
+        assert out.dtype == torch.bfloat16
+        assert n % 2 == 0, f"n ({n}) must be divisible by 2)"
+        epilogue_type, output_type = 'Default', torch.bfloat16
+
     # Type and shape checks
-    assert k == k_ and n == n_
+    assert k == k_
     assert lhs.dtype == torch.uint8 and rhs.dtype == torch.uint8
-    assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert out.is_contiguous()
     ### lhs_scales is k major for fp4 fused moe, which has better sfa acp efficiency.
@@ -586,7 +633,6 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
         "K must be a multiple of 16, "
         "so that 16 8-bit elements can be loaded with 128b aligned vectorized memory access."
     )
-    assert n % 2 == 0, f"n ({n}) must be divisible by 2)"
 
     topk = int(m_sum / num_token)
     # Do nothing if `m_sum` is zero
@@ -596,10 +642,14 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
     ### parse tile config
     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = configs
 
+    swiglu_limit_ = 0.0 if (swiglu_limit is None) else swiglu_limit
+    kApplySwigluLimit = swiglu_limit_ > 0
+
     global includes_fp4_fusedmoe_gemm, template_fp4_fusedmoe_gemm
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m_rows,
             expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks,
-            num_token, topk, torch.cuda.current_stream(), int(num_sms))
+            num_token, topk, torch.cuda.current_stream(), int(num_sms),
+            out_scale, swiglu_limit_)
     kernel_type = 'Default'
     runtime = jit_tuner.compile_and_tune(
         name='fusedmoe_gemm_fp4_fp4_bf16_nt',
@@ -608,12 +658,14 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
                 'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages,
                 'ENABLE_SBO_OVERLAP': False,
                 'GEMM_TYPE': 'GroupedFused',
-                'KERNEL_TYPE': kernel_type},
+                'KERNEL_TYPE': kernel_type,
+                'EPILOGUE_TYPE': epilogue_type,
+                'kApplySwigluLimit': kApplySwigluLimit},
         space=(),
         includes=includes_fp4_fusedmoe_gemm,
         arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.uint16),
                 ('rhs', lhs.dtype), ('rhs_scales', torch.uint16),
-                ('out', torch.bfloat16),
+                ('out', output_type),
                 ('m_rows', torch.int32),
                 ('expert_ids_and_cumsum', torch.int32),
                 ('sorted_token_ids', torch.int32),
@@ -621,9 +673,17 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
                 ('m', int),
                 ('topk', int),
                 ('stream', torch.cuda.Stream),
-                ('num_sms', int)),
+                ('num_sms', int),
+                ('out_scale', torch.uint16),
+                ('swiglu_limit', float)),
         template=template_fp4_fusedmoe_gemm,
         jit_include_dir='actlize_v1.0.0',
         args=args
     )
     runtime(*args)
+
+    if enable_silu_and_mul_quant_fusing:
+        ### the sorted output rows are contiguous, so the SFD is M-major over the whole m_sum.
+        out_scale.as_strided_(size=(sfm, sfn), stride=(1, sfm))
+
+    return out

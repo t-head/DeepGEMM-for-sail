@@ -112,7 +112,7 @@ struct CollectiveMmaScaleFp4
   using SmemLayoutB = decltype(tile_to_shape(
       SmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
-  static constexpr int BlockKSF = size<2>(TileShape{}) / 32;  // must ensure BlockK is divideable by 32
+  static constexpr int BlockKSF = size<2>(TileShape{}) / 32;  // must ensure BlockK is divisible by 32
   using SmemLayoutSFA_ = decltype(tile_to_shape(
       SmemLayoutAtomSFA{},
       make_shape(shape<0>(TileShape{}), Int<BlockKSF>{}, Int<DispatchPolicy::Stages>{})));

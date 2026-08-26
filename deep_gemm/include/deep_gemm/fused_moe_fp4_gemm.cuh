@@ -12,6 +12,7 @@
 #include "cute/atom/copy_traits_ppu0015_aiu.hpp"
 #include "cute/algorithm/ppu_copy.hpp"
 #include "fp4_gemm_cutlass3.cuh"
+#include "fp4_epilogue_silu_and_mul_post_quant.hpp"
 
 #include "fused_scheduler.cuh"
 #include "fused_gemm_util.cuh"
@@ -55,7 +56,7 @@ public:
 
   static constexpr int ScaleGranularityK = 32;
   static constexpr int ScaleMsPerTile = BLOCK_M;
-  static constexpr int ScaleKsPerTile = BLOCK_K / ScaleGranularityK; // BlockK must divideable by 32
+  static constexpr int ScaleKsPerTile = BLOCK_K / ScaleGranularityK; // BlockK must divisible by 32
 
   static constexpr int SFATileM = TransSFA ? cute::max(ScaleMsPerTile, MinAiuContElemSize) : ScaleMsPerTile;
   static constexpr int SFATileK = TransSFA ? ScaleKsPerTile : cute::max(ScaleKsPerTile, MinAiuContElemSize);
@@ -88,13 +89,43 @@ public:
     ElementSFB, cutlass::detail::TagToStrideB_t<LayoutSFB>, typename GemmOperandSFB::GmemTiledCopy, typename GemmOperandSFB::SmemLayoutAtom>;
 };
 
+// The fused silu_and_mul + mxfp4 post-quant epilogue of the fp4 fused-MoE kernel, shared verbatim
+// with the GroupedNoPad / GroupedMasked fp4 GEMMs. Both the kernel and its host launcher read the
+// activation-tile shared-memory size off this trait; the `Default` specialization below keeps the
+// unfused kernel free of any epilogue instantiation.
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t SHAPE_N,
+          EpilogueType kEpilogueType, bool kApplySwigluLimit>
+struct Fp4FusedMoeEpilogue {
+  using OutputOp = cutlass::epilogue::thread::LinearCombination<
+      typename EpilogueTraits<EpilogueType::SiluAndMulPostQuantFp4>::ElementD, 2, float, float,
+      cutlass::epilogue::thread::ScaleType::Nothing, cutlass::FloatRoundStyle::round_to_nearest, float>;
+  using CollectiveEpilogue = cutlass::epilogue::collective::EpilogueSiluAndMulPostQuant<
+      cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
+      cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
+      OutputOp, cutlass::gemm::EpilogueDefault,
+      (SHAPE_N % BLOCK_N == 0), kApplySwigluLimit>;
+
+  static constexpr bool kEnabled = true;
+  static constexpr uint32_t kSmemSize = uint32_t(CollectiveEpilogue::get_shared_storage_size(BLOCK_M, BLOCK_N));
+};
+
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t SHAPE_N, bool kApplySwigluLimit>
+struct Fp4FusedMoeEpilogue<BLOCK_M, BLOCK_N, SHAPE_N, EpilogueType::Default, kApplySwigluLimit> {
+  using CollectiveEpilogue = void;
+
+  static constexpr bool kEnabled = false;
+  static constexpr uint32_t kSmemSize = 0u;
+};
+
 template <GemmType kGemmType,
           uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t WARP_M, uint32_t WARP_N,
-          uint32_t BLOCK_SIZE, int kNumStages, typename MockMainloopFp4>
+          uint32_t BLOCK_SIZE, int kNumStages, typename MockMainloopFp4,
+          EpilogueType kEpilogueType = EpilogueType::Default,
+          bool kApplySwigluLimit = false>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void
-fp4_gemm_fused_moe_kernel(const QuantGemmArgs args) {
+fp4_gemm_fused_moe_kernel(const Fp4QuantGemmArgs args) {
     static constexpr uint32_t GROUP_K = 32; // view as uint16
     static constexpr uint32_t ScaleMsPerTile = BLOCK_M;
     static constexpr uint32_t ScaleNsPerTile = BLOCK_N;
@@ -119,13 +150,19 @@ fp4_gemm_fused_moe_kernel(const QuantGemmArgs args) {
 
     using TileScheduler = FusedGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, kNumGroups>;
 
+    // Fused silu_and_mul + mxfp4 post-quant epilogue; see `Fp4FusedMoeEpilogue`.
+    using FusedEpilogueCfg = Fp4FusedMoeEpilogue<BLOCK_M, BLOCK_N, SHAPE_N, kEpilogueType, kApplySwigluLimit>;
+    using FusedEpilogue = typename FusedEpilogueCfg::CollectiveEpilogue;
+
+    static constexpr bool kFuseSiluAndMulPostQuant = FusedEpilogueCfg::kEnabled;
+
     // Shared memory
-    using TsmCfg = GemmSmemConfigFp4<kNumStages, BLOCK_M, BLOCK_N, BLOCK_K, MockMainloopFp4>;
+    using TsmCfg = GemmSmemConfigFp4<kNumStages, BLOCK_M, BLOCK_N, BLOCK_K, MockMainloopFp4, FusedEpilogueCfg::kSmemSize>;
     extern __shared__ __align__(128) uint8_t smem_buffer[];
     SrcT* smem_a = reinterpret_cast<SrcT*>(smem_buffer);
     SrcT* smem_b = reinterpret_cast<SrcT*>(smem_buffer + TsmCfg::kSmemASize);
-    SrcSFT* smem_sfa = reinterpret_cast<SrcSFT*>(smem_buffer + TsmCfg::kSmemASize + TsmCfg::kSmemBSize);
-    SrcSFT* smem_sfb = reinterpret_cast<SrcSFT*>(smem_buffer + TsmCfg::kSmemASize + TsmCfg::kSmemBSize + TsmCfg::kSmemSFASize);
+    SrcSFT* smem_sfa = reinterpret_cast<SrcSFT*>(smem_buffer + TsmCfg::kSmemScaleOffset);
+    SrcSFT* smem_sfb = reinterpret_cast<SrcSFT*>(smem_buffer + TsmCfg::kSmemScaleOffset + TsmCfg::kSmemSFASize);
 
     uint32_t thread_idx = threadIdx.x;
     int warp_idx = cutlass::canonical_warp_idx_sync();
@@ -207,7 +244,7 @@ fp4_gemm_fused_moe_kernel(const QuantGemmArgs args) {
     Tensor sSFA = make_tensor(make_smem_ptr(smem_sfa), SmemLayoutSFA{});
     // epilogue will not store m rows out of m_predicate.
     if constexpr (!kAligned) {
-      // clear(sSFA) in case of 255 in the uninitialized smem; BlockM is divideable by 16;
+      // clear(sSFA) in case of 255 in the uninitialized smem; BlockM is divisible by 16;
       constexpr uint32_t SFA_SIZE_IN_BYTE = TsmCfg::kSmemSFASize;
       constexpr uint32_t SFA_SIZE_IN_INST = SFA_SIZE_IN_BYTE / sizeof(uint128_t);
       uint128_t* smem_sfa_clear = reinterpret_cast<uint128_t*>(smem_sfa);
@@ -448,8 +485,39 @@ fp4_gemm_fused_moe_kernel(const QuantGemmArgs args) {
           "Accumulator count must have the same destination element count.");
 
       // acc write back
-      epilogue_no_tsm<AccT, DstT, SHAPE_N, BLOCK_N, STRIDE_CM>(accum, tCcC, args.c_ptr,
-          deep_scheduler.curr_block_m_offset, deep_scheduler.valid_m_in_block, blk_n_offset);
+      if constexpr (kFuseSiluAndMulPostQuant) {
+        // The rows this block owns are contiguous in the sorted (cumsum) output layout, exactly as
+        // in GroupedNoPad: advance D by `curr_block_m_offset` rows and the M-major SFD by
+        // `curr_block_m_offset` scale slots, then let the epilogue address the tile with m_coord 0.
+        constexpr int SHAPE_N_OUT = EpilogueTraits<kEpilogueType>::get_shape_n_out(SHAPE_N);
+        using ElementDOut = typename EpilogueTraits<kEpilogueType>::ElementD;
+        using StrideEpi = cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>;
+
+        auto stride_d = cutlass::make_cute_packed_stride(
+            StrideEpi{}, cute::make_shape((int)args.shape_m_out, (int)SHAPE_N, 1));
+        typename FusedEpilogue::Params epilogue_params{
+            {{1.0f, 0.0f}, nullptr, stride_d,
+             reinterpret_cast<ElementDOut*>(args.c_ptr) +
+                 int64_t(deep_scheduler.curr_block_m_offset) * SHAPE_N_OUT,
+             stride_d},
+            reinterpret_cast<uint16_t*>(args.sfd_ptr) + deep_scheduler.curr_block_m_offset,
+            args.shape_m_out, args.swiglu_limit};
+
+        auto problem_shape_mnkl = cute::make_shape(
+            (int)deep_scheduler.valid_m_in_block, (int)SHAPE_N, (int)SHAPE_K, 1);
+        auto residue_mnk = cute::make_tuple(
+            (int)deep_scheduler.valid_m_in_block, (int)(SHAPE_N - blk_n_offset), 0);
+
+        FusedEpilogue epilogue{epilogue_params};
+        epilogue(problem_shape_mnkl, TileShape{}, make_coord(_0{}, n_block_idx, _, _0{}),
+                accum, tiled_mma, residue_mnk, thread_idx, (char*)smem_buffer);
+        // The epilogue activation tile aliases the A/B segments, so the next tile must not start
+        // loading them before every warp is done reading it.
+        __syncthreads();
+      } else {
+        epilogue_no_tsm<AccT, DstT, SHAPE_N, BLOCK_N, STRIDE_CM>(accum, tCcC, args.c_ptr,
+            deep_scheduler.curr_block_m_offset, deep_scheduler.valid_m_in_block, blk_n_offset);
+      }
     }
 }
 
@@ -457,33 +525,43 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t WARP_M, uint32_t WARP_N, int32_t kNumStages,
           GemmType kGemmType, bool kEnableSboOverlap = false,
-          KernelType kKernelType = KernelType::Default>
+          KernelType kKernelType = KernelType::Default,
+          EpilogueType kEpilogueType = EpilogueType::Default,
+          bool kApplySwigluLimit = false>
 class Fp4FusedMoeGemm {
-    static_assert((SHAPE_K % 16 == 0), "SHAPE_K must be divideable by 16.");
-    static_assert((BLOCK_K % 32 == 0), "BlockK must be divideable by 32.");
-    static_assert((WARP_M <= 64) && (WARP_M % 16 == 0), "WarpM must be divideable by 16 and less than 64.");
-    static_assert((WARP_N <= 64) && (WARP_N % 16 == 0), "WarpN must be divideable by 16 and less than 64.");
+    static_assert((SHAPE_K % 16 == 0), "SHAPE_K must be divisible by 16.");
+    static_assert((BLOCK_K % 32 == 0), "BlockK must be divisible by 32.");
+    static_assert((WARP_M <= 64) && (WARP_M % 16 == 0), "WarpM must be divisible by 16 and less than 64.");
+    static_assert((WARP_N <= 64) && (WARP_N % 16 == 0), "WarpN must be divisible by 16 and less than 64.");
+    // `NExpand` and bias are not supported by this kernel, so pass the neutral values.
+    static_assert(EpilogueTraits<kEpilogueType>::is_valid_config(SHAPE_N, BLOCK_N, 1, false),
+      "SiluAndMulPostQuantFp4 Epilogue only support BlockN >= 64 and ShapeN % 64 == 0. ShapeN % 64 means ShapeN // 4(act_func&quant) / 16(scale_group).");
 
     using SrcT = uint8_t;
-    using DstT = __ppu_bfloat16;
+    using DstT = typename EpilogueTraits<kEpilogueType>::ElementDPtr;
     using SrcSFT = uint16_t;
     using MockMainloopFp4 = typename MockCollectiveMmaScaleFp4<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumStages>::CollectiveMainloop;
-
+    using FusedEpilogueCfg = Fp4FusedMoeEpilogue<BLOCK_M, BLOCK_N, SHAPE_N, kEpilogueType, kApplySwigluLimit>;
+    using TsmCfg = GemmSmemConfigFp4<kNumStages, BLOCK_M, BLOCK_N, BLOCK_K, MockMainloopFp4, FusedEpilogueCfg::kSmemSize>;
 public:
     Fp4FusedMoeGemm() = default;
 
     static void run(DstT* gmem_d, SrcT* gmem_a, SrcT* gmem_b, SrcSFT* gmem_sfa, SrcSFT* gmem_sfb,
                     int* m_rows, int* expert_ids_and_cumsum, int* sorted_token_ids,
                     int* aligned_num_m_blocks, uint32_t shape_m, uint32_t topk,
-                    hggcStream_t stream, int num_cus) {
+                    hggcStream_t stream, int num_cus,
+                    SrcSFT* gmem_sfd = nullptr, float swiglu_limit = 0.0f) {
 
-        QuantGemmArgs args;
+        Fp4QuantGemmArgs args;
 
         args.a_ptr = (void *)gmem_a;
         args.b_ptr = (void *)gmem_b;
         args.c_ptr = (void *)gmem_d;
         args.scale_a_ptr = (void *)gmem_sfa;
         args.scale_b_ptr = (void *)gmem_sfb;
+        args.sfd_ptr = (void *)gmem_sfd;
+        args.shape_m_out = shape_m * topk;
+        args.swiglu_limit = swiglu_limit;
 
         args.expert_ids_and_cumsum = expert_ids_and_cumsum;
         args.sorted_token_ids = sorted_token_ids;
@@ -502,8 +580,8 @@ public:
         // dispatch and launch kernel
         constexpr int BlockSize = BLOCK_M / WARP_M * BLOCK_N / WARP_N * 32;
 
-        auto device_func = fp4_gemm_fused_moe_kernel<kGemmType, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BlockSize, kNumStages, MockMainloopFp4>;
-        constexpr uint32_t smem_size = GemmSmemConfigFp4<kNumStages, BLOCK_M, BLOCK_N, BLOCK_K, MockMainloopFp4>::kTotalSize;
+        auto device_func = fp4_gemm_fused_moe_kernel<kGemmType, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BlockSize, kNumStages, MockMainloopFp4, kEpilogueType, kApplySwigluLimit>;
+        constexpr uint32_t smem_size = TsmCfg::kTotalSize;
         CHECK_HGGC(hggcFuncSetAttribute(device_func, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         int max_blocks_per_cu = -1;
         CHECK_HGGC(hggcOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_cu, device_func, BlockSize, smem_size));

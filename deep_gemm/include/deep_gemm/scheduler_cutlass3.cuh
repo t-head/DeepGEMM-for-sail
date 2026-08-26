@@ -475,20 +475,21 @@ struct DynamicTileBuilderConfig {
 /// at the selected builder's granularity.
 /// Inherits from DeepGemmScheduler to reuse offset helpers, params, and swizzle logic.
 template <GemmType kGemmType, int SHAPE_N_, int SHAPE_K_,
-          typename BuilderConfig_, int kNumGroups_, int kNum1DBlocksPerGroup = 2>
+          typename BuilderConfig_, int kNumGroups_, int kNum1DBlocksPerGroup = 2,
+          EpilogueType kEpilogueType = EpilogueType::Default>
 struct DynamicTileScheduler
     : public DeepGemmScheduler<kGemmType, SHAPE_N_, SHAPE_K_,
                                BuilderConfig_::BlockM[BuilderConfig_::kNumBuilders - 1],
                                BuilderConfig_::BlockN[BuilderConfig_::kNumBuilders - 1],
                                kNumGroups_,
                                ceil_div((uint32_t)SHAPE_N_, (uint32_t)BuilderConfig_::BlockN[BuilderConfig_::kNumBuilders - 1]),
-                               kNum1DBlocksPerGroup> {
+                               kNum1DBlocksPerGroup, kEpilogueType> {
     using Base = DeepGemmScheduler<kGemmType, SHAPE_N_, SHAPE_K_,
                                     BuilderConfig_::BlockM[BuilderConfig_::kNumBuilders - 1],
                                     BuilderConfig_::BlockN[BuilderConfig_::kNumBuilders - 1],
                                     kNumGroups_,
                                     ceil_div((uint32_t)SHAPE_N_, (uint32_t)BuilderConfig_::BlockN[BuilderConfig_::kNumBuilders - 1]),
-                                    kNum1DBlocksPerGroup>;
+                                    kNum1DBlocksPerGroup, kEpilogueType>;
     using BuilderConfig = BuilderConfig_;
     using Params = typename Base::Params;
 

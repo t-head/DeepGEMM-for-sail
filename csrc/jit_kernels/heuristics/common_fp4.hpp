@@ -378,7 +378,8 @@ ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, 
 }
 
 ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, int num_sms,
-                              bool is_grouped_nopad = false, bool is_grouped_masked = false, int max_block_n = 256) {
+                              bool is_grouped_nopad = false, bool is_grouped_masked = false,
+                              int max_block_n = 256, int min_block_n = 32) {
     // C++ layer does not perform device checking; is_ppu1v5_device() assert skipped
     (void)total_m;
 
@@ -389,14 +390,17 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     std::vector<int> block_ms = (k > 768) ? std::vector<int>{256, 128, 64, 32, 16} : std::vector<int>{128, 64, 32, 16};
 
     DG_HOST_ASSERT(max_block_n > 0 && (max_block_n & (max_block_n - 1)) == 0);
+    DG_HOST_ASSERT(min_block_n > 0 && (min_block_n & (min_block_n - 1)) == 0);
     int bit_length = 32 - __builtin_clz(static_cast<unsigned>(max_block_n));
+    int bit_length_min = 32 - __builtin_clz(static_cast<unsigned>(min_block_n)) - 1; // exponent of min_block_n
+    // `exp > bit_length_min - 1` mirrors python's right-open range stop, so min_block_n is included
     std::vector<int> block_ns;
     if (k >= 384) {
-        for (int exp = bit_length - 1; exp > 4; --exp) {
+        for (int exp = bit_length - 1; exp > (bit_length_min - 1); --exp) {
             block_ns.push_back(1 << exp);
         }
     } else {
-        for (int exp = bit_length - 2; exp > 4; --exp) {
+        for (int exp = bit_length - 2; exp > (bit_length_min - 1); --exp) {
             block_ns.push_back(1 << exp);
         }
     }

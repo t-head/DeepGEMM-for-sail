@@ -10,6 +10,8 @@
 #include "ppu_include.hpp"
 
 #include "fp4_mma.cuh"
+#include "utils_cutlass3.h"
+#include "fp4_epilogue_silu_and_mul_post_quant.hpp"
 
 namespace cutlass::gemm {
 
@@ -86,7 +88,9 @@ template <
   typename KernelAiuFp4DynamicTile,
   int TileId,
   bool hasBias = false,
-  int N_EXPAND = 1
+  int N_EXPAND = 1,
+  EpilogueType kEpilogueType = EpilogueType::Default,
+  bool kApplySwigluLimit = false
 >
 struct Fp4TypeBuilder {
   using LayoutA     = cutlass::layout::RowMajor;
@@ -111,6 +115,9 @@ struct Fp4TypeBuilder {
   static constexpr int WARP_N = KernelAiuFp4DynamicTile::TileConfigList[TileId][3];
   static constexpr int BLOCK_K = KernelAiuFp4DynamicTile::TileConfigList[TileId][4];
   static constexpr int kNumStages = KernelAiuFp4DynamicTile::TileConfigList[TileId][5];
+  static_assert(EpilogueTraits<kEpilogueType>::is_valid_config(SHAPE_N, BLOCK_N, N_EXPAND, hasBias),
+                "SiluAndMulPostQuantFp4 Epilogue only support BLOCK_N >= 64, SHAPE_N % 64 == 0, "
+                "N_EXPAND == 1 and hasBias == false.");
 
   using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
   using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>;
@@ -204,9 +211,20 @@ struct Fp4TypeBuilder {
     IsAligedN
   >;
 
-  using CollectiveEpilogue = CollectiveEpilogueNoTsm;
+  using CollectiveEpilogueSiluAndMulPostQuant = typename cutlass::epilogue::collective::EpilogueSiluAndMulPostQuant<
+    cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
+    cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
+    EpilogueOutputOp,
+    cutlass::gemm::EpilogueDefault,
+    IsAligedN,
+    kApplySwigluLimit
+  >;
 
-  using TileScheduler = ::deep_gemm::DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, kNumGroups>;
+  using CollectiveEpilogue = typename cutlass::platform::conditional<
+    kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4,
+    CollectiveEpilogueSiluAndMulPostQuant,
+    CollectiveEpilogueNoTsm
+  >::type;
 
   struct SharedStorage {
     // Mainloop and epilogue don't use smem concurrently since kernel is non-persistent, so we can use a union
@@ -226,7 +244,15 @@ struct Fp4TypeBuilder {
   >
   static CUTLASS_DEVICE void run(Params params, char* smem_buf, int M, int m_coord, int n_coord,
                           int64_t offset_a, int64_t offset_b, int64_t offset_m, int64_t offset_c,
-                          int64_t offset_scalea, int64_t offset_scaleb) {
+                          int64_t offset_scalea, int64_t offset_scaleb, int64_t offset_scalec) {
+    if constexpr (kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4) {
+      // Epilogue reuse the shared storage comes from mainloop.
+      // Make sure that the size of epilogue SharedStorage is less than Mainloop.
+      static_assert(CollectiveEpilogueSiluAndMulPostQuant::get_shared_storage_size(BLOCK_M, BLOCK_N)
+                    <= SharedStorageSize,
+                    "fused epilogue act tile exceeds the kernel shared storage");
+    }
+
     using namespace cute;
     int thread_idx = int(threadIdx.x);
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -282,6 +308,9 @@ struct Fp4TypeBuilder {
     // update params.epilogue for ptrC and ptrD
     auto params_epilogue_local = *(reinterpret_cast<typename CollectiveEpilogue::Params*>(&(params.epi_params)));
     params_epilogue_local.ptr_D += offset_c;
+    if constexpr (EpilogueTraits<kEpilogueType>::needs_sfd_offset) {
+      params_epilogue_local.ptr_SFD += offset_scalec;
+    }
 
     // Epilogue and write to gD
     CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
@@ -310,7 +339,9 @@ template <
   int SHAPE_N,
   int SHAPE_K,
   int kNumGroups,
-  FP4DynamicTileId kDynamicTileId
+  FP4DynamicTileId kDynamicTileId,
+  EpilogueType kEpilogueType,
+  bool kApplySwigluLimit
 >
 struct Fp4DeepGemmDynamicTile {
 
@@ -322,15 +353,20 @@ struct Fp4DeepGemmDynamicTile {
 
   using KernelAiuFp4DynamicTile = typename Fp4DynamicTileSelector<kDynamicTileId>::type;
   using Builder0 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
-                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 0>;
+                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 0,
+                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit>;
   using Builder1 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
-                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 1>;
+                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 1,
+                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit>;
   using Builder2 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
-                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 2>;
+                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 2,
+                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit>;
   using Builder3 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
-                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 3>;
+                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 3,
+                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit>;
   using Builder4 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
-                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 4>;
+                                  SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 4,
+                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit>;
   static constexpr uint32_t MaxThreadsPerBlock = Builder4::MaxThreadsPerBlock;
 
   using CollectiveEpilogue = typename Builder4::CollectiveEpilogue;
@@ -342,7 +378,7 @@ struct Fp4DeepGemmDynamicTile {
       Builder0::BLOCK_M, Builder1::BLOCK_M, Builder2::BLOCK_M, Builder3::BLOCK_M, Builder4::BLOCK_M,
       Builder0::BLOCK_N, Builder1::BLOCK_N, Builder2::BLOCK_N, Builder3::BLOCK_N, Builder4::BLOCK_N>;
   using TileScheduler = ::deep_gemm::DynamicTileScheduler<
-      kGemmType, SHAPE_N, SHAPE_K, BuilderConfig, kNumGroups>;
+      kGemmType, SHAPE_N, SHAPE_K, BuilderConfig, kNumGroups, 2 /*kNum1DBlocksPerGroup*/, kEpilogueType>;
   using StrideA            = typename Builder4::CollectiveMainloop::StrideA;
   using StrideB            = typename Builder4::CollectiveMainloop::StrideB;
   using StrideC            = typename Builder4::CollectiveEpilogue::StrideC;
@@ -406,14 +442,18 @@ struct Fp4DeepGemmDynamicTile {
       auto offset_c = deep_scheduler.curr_offset_c();
       auto offset_scalea = deep_scheduler.curr_offset_mxfp4_scalea();
       auto offset_scaleb = deep_scheduler.curr_offset_mxfp4_scaleb(m_block_idx);
+      int64_t offset_scalec = 0;
+      if constexpr (EpilogueTraits<kEpilogueType>::needs_sfd_offset) {
+        offset_scalec = deep_scheduler.curr_offset_c_scales();
+      }
 
       // Dispatch to the selected builder
       switch (builder_idx) {
-        case 0: Builder0::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb); break;
-        case 1: Builder1::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb); break;
-        case 2: Builder2::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb); break;
-        case 3: Builder3::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb); break;
-        default: Builder4::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb); break;
+        case 0: Builder0::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec); break;
+        case 1: Builder1::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec); break;
+        case 2: Builder2::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec); break;
+        case 3: Builder3::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec); break;
+        default: Builder4::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec); break;
       }
     }
   }

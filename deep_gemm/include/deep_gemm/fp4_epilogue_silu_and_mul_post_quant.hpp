@@ -28,7 +28,7 @@ template <
   bool IsAlignedN = false, // ProblemN % blockN == 0, used for deepgemm
   bool kApplySwigluLimit = false
 >
-class EpilogueNoTsmSiluAndMulQuant: public DefaultEpilogueNoTsm<StrideC_, StrideD_, ThreadEpilogueOp_, EpilogueSchedule_, IsAlignedN>{
+class EpilogueSiluAndMulPostQuant: public DefaultEpilogueNoTsm<StrideC_, StrideD_, ThreadEpilogueOp_, EpilogueSchedule_, IsAlignedN>{
 public:
   // Base class alias
   using Base = DefaultEpilogueNoTsm<StrideC_, StrideD_, ThreadEpilogueOp_, EpilogueSchedule_, IsAlignedN>;
@@ -68,7 +68,7 @@ public:
 
   // Note: assumed that params_ are cutted by compiler for Base class initialization.
   CUTLASS_HOST_DEVICE
-  EpilogueNoTsmSiluAndMulQuant(Params const& params_, SharedStorage const& shared_storage = SharedStorage())
+  EpilogueSiluAndMulPostQuant(Params const& params_, SharedStorage const& shared_storage = SharedStorage())
       : DefaultEpilogueNoTsm<StrideC_, StrideD_, ThreadEpilogueOp_, EpilogueSchedule_, IsAlignedN>(params_, shared_storage), params(params_), epilogue_op(params_.thread) { }
 
   static CUTLASS_DEVICE uint8_t pcnvt_f4x2_f32x2(float hi, float lo) {

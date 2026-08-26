@@ -161,13 +161,11 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedNoPad)
+        ### SiluAndMulPostQuant fusing only support block_n >= 64
+        min_block_n = 64 if enable_silu_and_mul_quant_fusing else 16
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedNoPad, min_block_n=min_block_n)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
         # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
-        if (enable_silu_and_mul_quant_fusing and block_n < 64):
-            ### SiluAndMulPostQuant fusing only support block_n >= 64
-            ### expand block_n only and keep warp_n the same
-            block_n = 64
 
     if m_rows is None:
         counts = torch.bincount(m_indices)
@@ -307,13 +305,12 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedMasked)
+        ### SiluAndMulPostQuant fusing only support block_n >= 64
+        min_block_n = 64 if enable_silu_and_mul_quant_fusing else 16
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedMasked, min_block_n=min_block_n)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
         # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
-        if (enable_silu_and_mul_quant_fusing and block_n < 64):
-            ### SiluAndMulPostQuant fusing only support block_n >= 64
-            ### expand block_n only and keep warp_n the same
-            block_n = 64
+
     ## the largest blockM_num is, num_groups - 1 only has 1 token, the last group has (m-1) tokens, blockM_num = num_group -1  + ceil_div(m + 1 - num_group, block_m)
     ## total line num: blockM_num + 1, line0 is used to store the real blockM_num
     ## total_size = (blockM_num + 1) * 4 * sizeof(int) Byte
