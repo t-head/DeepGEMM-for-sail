@@ -30,6 +30,17 @@ struct QuantGemmArgs : public GemmArgs{
   const void *__restrict__ scale_b_ptr;
 };
 
+// Extra arguments of the fp4 fused-MoE kernel when silu_and_mul + mxfp4 post-quant are fused into
+// the epilogue: `sfd_ptr` receives the e8m0 scales of the quantized output and `shape_m_out` is the
+// row count of the sorted output (`shape_m * topk`), which is the column stride of the M-major SFD.
+// The fields are appended in a derived struct so the `QuantGemmArgs` layout the other fused kernels
+// share with the C++ JIT host runtimes stays untouched.
+struct Fp4QuantGemmArgs : public QuantGemmArgs {
+  void *__restrict__ sfd_ptr;
+  uint32_t shape_m_out;
+  float swiglu_limit;
+};
+
 // tsm.ld.swzl need 128B aligned
 CUTE_HOST_DEVICE constexpr uint32_t smem_a_size(uint32_t elem_size, uint32_t num_stages,
                                                 uint32_t block_m, uint32_t block_k) {

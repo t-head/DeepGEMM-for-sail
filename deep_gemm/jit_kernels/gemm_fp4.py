@@ -277,9 +277,10 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
 @lru_cache(maxsize=None)
 def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_sms: int,
                      gemm_type: GemmType=GemmType.DenseGemm,
-                     max_block_n: int = 256) -> \
+                     max_block_n: int = 256,
+                     min_block_n: int = 32) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
-    assert is_ppu1v5_device(), "mxfp4 is noly supported on PPU-ZW890"
+    assert is_ppu1v5_device(), "mxfp4 is only supported on PPU-ZW890"
 
     # todo: add lut logic
     # use_heuristic = os.environ.get('USE_HEUR', 'False').lower() == 'true'
@@ -296,7 +297,9 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
     block_ms = (256, 128, 64, 32, 16) if k > 768 else (128, 64, 32, 16)
     # block_ns = (256, 128, 64, 32)
     assert max_block_n > 0 and (max_block_n & (max_block_n - 1)) == 0
-    block_ns = tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 1, 4, -1))) if k >= 384 else tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 2, 4, -1)))
+    assert min_block_n > 0 and (min_block_n & (min_block_n - 1)) == 0
+    # block_ns comes from a left-closed, right-open interval
+    block_ns = tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 1, min_block_n.bit_length() - 2, -1))) if k >= 384 else tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 2, min_block_n.bit_length() - 2, -1)))
 
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
@@ -588,7 +591,7 @@ def preprocess_mxfp4_weight_for_act_and_quant_fusing(weight: torch.Tensor, weigh
 
     ### do interleaving to make up and gate be adjacent.
     num_groups, n, k = weight.shape
-    assert n % 2 == 0, "N must be divideable by 2 for silu_and_mul."
+    assert n % 2 == 0, "N must be divisible by 2 for silu_and_mul."
     half_n = n // 2
     gate = weight[:, :half_n, :]
     up = weight[:, half_n:, :]

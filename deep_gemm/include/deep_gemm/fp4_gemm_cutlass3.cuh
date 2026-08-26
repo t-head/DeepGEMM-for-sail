@@ -1023,9 +1023,9 @@ class Fp4Gemm {
   static constexpr bool kEnableMoeDynamicTile = (kDynamicTileId != FP4DynamicTileId::Disabled);
   static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
   static_assert((BlockN == 16) || (BlockN == 32) || (BlockN == 64) || (BlockN == 128) || (BlockN == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
-  static_assert((BlockK % 32 == 0), "BlockK must be divideable by 32.");
-  static_assert((WarpM <= 64) && (WarpM % 16 == 0), "WarpM must be divideable by 16 and less than 64.");
-  static_assert((WarpN <= 64) && (WarpN % 16 == 0), "WarpN must be divideable by 16 and less than 64.");
+  static_assert((BlockK % 32 == 0), "BlockK must be divisible by 32.");
+  static_assert((WarpM <= 64) && (WarpM % 16 == 0), "WarpM must be divisible by 16 and less than 64.");
+  static_assert((WarpN <= 64) && (WarpN % 16 == 0), "WarpN must be divisible by 16 and less than 64.");
   static_assert(EpilogueTraits<kEpilogueType>::is_valid_config(ShapeN, BlockN, NExpand, hasBias), 
     "SiluAndMulPostQuantFp4 Epilogue only support BlockN >= 64, ShapeN % 64 == 0, Nexpand = 1 and hasBias = false. ShapeN % 64 means ShapeN // 4(act_func&quant) / 16(scale_group).");
 
@@ -1067,8 +1067,6 @@ public:
 
         hggcFuncAttributes attr;
         if constexpr (kEnableMoeDynamicTile) {
-            static_assert(kEpilogueType == EpilogueType::Default,
-                            "MoE dynamic tile does not support EpilogueType::SiluAndMulPostQuantFp4");
             auto launch_dynamic_tile_kernel = [&](auto gemm_kernel_) {
                 using GemmKernel = decltype(gemm_kernel_);
                 using TileScheduler = typename GemmKernel::TileScheduler;
@@ -1095,9 +1093,13 @@ public:
                 using ProblemShape = Shape<int,int,int,int>;
                 auto problem_shape_MNKL = ProblemShape{32, ShapeN, ShapeK, 1};
                 StrideBias stride_Bias = {};
-                cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(d_ptr);
+                ElementD* converted_output = reinterpret_cast<ElementD*>(d_ptr);
                 typename Epilogue::Arguments arg_epilogue = [&]() -> auto {
+                  if constexpr (kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4) {
+                    return typename Epilogue::Arguments{{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D}, sfd_ptr, shape_m, swiglu_limit};
+                  } else {
                     return typename Epilogue::Arguments{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D};
+                  }
                 }();
 
                 auto params_epilogue = Epilogue::to_underlying_arguments(problem_shape_MNKL, arg_epilogue, nullptr);
@@ -1122,8 +1124,8 @@ public:
                     hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
 
                     printf("[GemmGrouped-FP4-DynamicTile:]\n");
-                    printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d, dynamic_tile_id:%d\n",
-                        kNumGroups, shape_m, ShapeN, ShapeK, expected_m, GemmTypeS[static_cast<int>(kGemmType)], TileScheduler::kIsNoPadPreprocessLayout, DynamicTildId);
+                    printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d, dynamic_tile_id:%d, kEpilogueType:%s\n",
+                        kNumGroups, shape_m, ShapeN, ShapeK, expected_m, GemmTypeS[static_cast<int>(kGemmType)], TileScheduler::kIsNoPadPreprocessLayout, DynamicTildId, EpilogueTypeS[static_cast<int>(kEpilogueType)]);
 
                     printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                         BlockM, BlockN, BlockK, WarpM, WarpN, BlockK, kNumStages);
@@ -1157,7 +1159,7 @@ public:
 
             using GemmKernelDynamic = cutlass::gemm::kernel::Fp4DeepGemmDynamicTile<
                 kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAccumulator, ElementCompute,
-                ShapeN, ShapeK, kNumGroups, kDynamicTileId>;
+                ShapeN, ShapeK, kNumGroups, kDynamicTileId, kEpilogueType, kApplySwigluLimit>;
             launch_dynamic_tile_kernel(GemmKernelDynamic{});
         } else {
           // Core kernel configurations
@@ -1187,7 +1189,7 @@ public:
 
           constexpr int ScaleGranularityK = 32;
           constexpr int ScaleMsPerTile = BlockM;
-          constexpr int ScaleKsPerTile = BlockK / ScaleGranularityK; // BlockK must divideable by 32
+          constexpr int ScaleKsPerTile = BlockK / ScaleGranularityK; // BlockK must divisible by 32
 
           constexpr int SFATileM = TransSFA ? cute::max(ScaleMsPerTile, MinAiuContElemSize) : ScaleMsPerTile;
           constexpr int SFATileK = TransSFA ? ScaleKsPerTile : cute::max(ScaleKsPerTile, MinAiuContElemSize);
@@ -1255,7 +1257,7 @@ public:
             IsAlignedN
           >;
 
-          using CollectiveEpilogueNoTsmSiluAndMulQuant = typename cutlass::epilogue::collective::EpilogueNoTsmSiluAndMulQuant<
+          using CollectiveEpilogueSiluAndMulPostQuant = typename cutlass::epilogue::collective::EpilogueSiluAndMulPostQuant<
             cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
             cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
             EpilogueOutputOp,
@@ -1264,13 +1266,13 @@ public:
             kApplySwigluLimit
           >;
 
-          // CollectiveEpilogueNoTsm requires that N is divideable by 2
+          // CollectiveEpilogueNoTsm requires that N is divisible by 2
           using CollectiveEpilogue = typename cutlass::platform::conditional<
             hasBias || (ShapeN % 2 != 0),
             CollectiveEpilogueWithTsm,
             typename cutlass::platform::conditional<
               kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4,
-              CollectiveEpilogueNoTsmSiluAndMulQuant,
+              CollectiveEpilogueSiluAndMulPostQuant,
               CollectiveEpilogueNoTsm
             >::type
           >::type;
@@ -1290,7 +1292,7 @@ public:
           if constexpr (kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4) {
             // Epilogue reuse the shared storage comes from mainloop.
             // Make sure that the size of epilogue SharedStorage is less than Mainloop.
-            static_assert( CollectiveEpilogueNoTsmSiluAndMulQuant::get_shared_storage_size(BlockM, BlockN)
+            static_assert(CollectiveEpilogueSiluAndMulPostQuant::get_shared_storage_size(BlockM, BlockN)
                           <= GemmKernel::SharedStorageSize,
                           "fused epilogue act tile exceeds the kernel shared storage");
           }
@@ -1330,7 +1332,7 @@ public:
               if constexpr (hasBias || (ShapeN % 2 != 0)) {
                 return typename CollectiveEpilogueWithTsm::Arguments{{1.0, 0.0, nullptr, nullptr, c_ptr, stride_Bias}, nullptr, stride_C, converted_output, stride_D};
               } else if constexpr (kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4) {
-                return typename CollectiveEpilogueNoTsmSiluAndMulQuant::Arguments{{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D}, sfd_ptr, shape_m, swiglu_limit};
+                return typename CollectiveEpilogueSiluAndMulPostQuant::Arguments{{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D}, sfd_ptr, shape_m, swiglu_limit};
               } else {
                 return typename CollectiveEpilogueNoTsm::Arguments{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D};
               }

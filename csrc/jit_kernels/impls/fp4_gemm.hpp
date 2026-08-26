@@ -60,7 +60,7 @@ public:
     //   device type                             condition                    Epilogue::Params
     //   CollectiveEpilogueWithTsm               hasBias || SHAPE_N % 2 != 0         96 B
     //   CollectiveEpilogueNoTsm                 fast path                          136 B
-    //   CollectiveEpilogueNoTsmSiluAndMulQuant  fused, derives from NoTsm          152 B
+    //   CollectiveEpilogueSiluAndMulPostQuant   fused, derives from NoTsm          152 B
 
     // hasBias || SHAPE_N % 2 != 0 -> CollectiveEpilogueWithTsm
     struct EpilogueArgsWithTsm {
@@ -104,9 +104,9 @@ public:
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D;
     };
 
-    // fused -> CollectiveEpilogueNoTsmSiluAndMulQuant, whose Arguments derives from the NoTsm ones
+    // fused -> CollectiveEpilogueSiluAndMulPostQuant, whose Arguments derives from the NoTsm ones
     // and appends ptr_SFD / shape_m / swiglu_limit.
-    struct EpilogueArgsNoTsmSiluAndMulQuant {
+    struct EpilogueArgsSiluAndMulPostQuant {
         struct {
             float alpha = 1.0f;
             float beta = 0.0f;
@@ -138,7 +138,7 @@ public:
     // from them and appends three fields.
     static_assert(sizeof(EpilogueArgsWithTsm) == 96, "WithTsm epilogue params layout changed");
     static_assert(sizeof(EpilogueArgsNoTsm) == 136, "NoTsm epilogue params layout changed");
-    static_assert(sizeof(EpilogueArgsNoTsmSiluAndMulQuant) ==
+    static_assert(sizeof(EpilogueArgsSiluAndMulPostQuant) ==
                       sizeof(EpilogueArgsNoTsm) + sizeof(uint16_t*) + sizeof(uint32_t) + sizeof(float),
                   "fused epilogue params must be the NoTsm layout plus ptr_SFD/shape_m/swiglu_limit");
 
@@ -161,12 +161,13 @@ public:
     union KernelParams {
         GemmKernelParamsT<EpilogueArgsWithTsm> with_tsm;
         GemmKernelParamsT<EpilogueArgsNoTsm> no_tsm;
-        GemmKernelParamsT<EpilogueArgsNoTsmSiluAndMulQuant> no_tsm_silu_and_mul_quant;
+        GemmKernelParamsT<EpilogueArgsSiluAndMulPostQuant> silu_and_mul_post_quant;
     };
 
-    // The epilogue block is byte-identical to EpilogueArgsNoTsm, which is the only epilogue the
-    // dynamic-tile kernel supports (it static_asserts kEpilogueType == Default).
-    struct DynamicTileParams {
+    // fused -> CollectiveEpilogueSiluAndMulPostQuant, whose Arguments derives from the NoTsm ones
+    // and appends ptr_SFD / shape_m / swiglu_limit.
+    template <typename EpilogueArgsT>
+    struct DynamicTileParamsT {
         uint8_t* ptr_A = nullptr;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_A;
         uint8_t* ptr_B = nullptr;
@@ -175,15 +176,24 @@ public:
         cute::Stride<cute::Int<1>, int64_t, int64_t> stride_SFA;
         uint16_t* ptr_scale_B = nullptr;
         cute::Stride<cute::Int<1>, int64_t, int64_t> stride_SFB;
-        EpilogueArgsNoTsm epi_params;
+        EpilogueArgsT epi_params;
         uint32_t shape_m = 0;
         int32_t* grouped_layout = nullptr;
     };
 
-    static_assert(sizeof(DynamicTileParams) == 248, "DynamicTile params layout changed");
-    static_assert(offsetof(DynamicTileParams, epi_params) == 96, "DynamicTile epi_params moved");
-    static_assert(offsetof(DynamicTileParams, shape_m) == 232, "DynamicTile shape_m moved");
-    static_assert(offsetof(DynamicTileParams, grouped_layout) == 240, "DynamicTile grouped_layout moved");
+    union DynamicTileKernelParams {
+        DynamicTileParamsT<EpilogueArgsNoTsm> dynamic_tile_no_tsm;
+        DynamicTileParamsT<EpilogueArgsSiluAndMulPostQuant> dynamic_tile_silu_and_mul_post_quant;
+    };
+
+    static_assert(sizeof(DynamicTileParamsT<EpilogueArgsNoTsm>) == 248
+        && sizeof(DynamicTileParamsT<EpilogueArgsSiluAndMulPostQuant>) == 264, "DynamicTile params layout changed");
+    static_assert(offsetof(DynamicTileParamsT<EpilogueArgsNoTsm>, epi_params) == 96
+        && offsetof(DynamicTileParamsT<EpilogueArgsSiluAndMulPostQuant>, epi_params) == 96, "DynamicTile params layout changed");
+    static_assert(offsetof(DynamicTileParamsT<EpilogueArgsNoTsm>, shape_m) == 232
+        && offsetof(DynamicTileParamsT<EpilogueArgsSiluAndMulPostQuant>, shape_m) == 248, "DynamicTile shape_m moved");
+    static_assert(offsetof(DynamicTileParamsT<EpilogueArgsNoTsm>, grouped_layout) == 240
+        && offsetof(DynamicTileParamsT<EpilogueArgsSiluAndMulPostQuant>, grouped_layout) == 256, "DynamicTile grouped_layout moved");
 
     struct Args {
         LaunchInfo launch_info;
@@ -200,7 +210,7 @@ public:
         // whenever AlignmentD is 1 (the bias / odd-N configurations).
         const std::string fused_smem_guard =
             args.launch_info.epilogue_type == "SiluAndMulPostQuantFp4"
-                ? "static_assert(CollectiveEpilogueNoTsmSiluAndMulQuant::get_shared_storage_size(BLOCK_M, BLOCK_N)\n"
+                ? "static_assert(CollectiveEpilogueSiluAndMulPostQuant::get_shared_storage_size(BLOCK_M, BLOCK_N)\n"
                   "                  <= GemmKernel::SharedStorageSize,\n"
                   "              \"fused epilogue act tile exceeds the kernel shared storage\");\n"
                 : "";
@@ -344,7 +354,7 @@ using CollectiveEpilogueNoTsm = typename cutlass::epilogue::collective::DefaultE
     IsAligedN
 >;
 
-using CollectiveEpilogueNoTsmSiluAndMulQuant = typename cutlass::epilogue::collective::EpilogueNoTsmSiluAndMulQuant<
+using CollectiveEpilogueSiluAndMulPostQuant = typename cutlass::epilogue::collective::EpilogueSiluAndMulPostQuant<
     cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
     cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
     EpilogueOutputOp,
@@ -359,7 +369,7 @@ using CollectiveEpilogue = typename cutlass::platform::conditional<
     CollectiveEpilogueWithTsm,
     typename cutlass::platform::conditional<
         kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4,
-        CollectiveEpilogueNoTsmSiluAndMulQuant,
+        CollectiveEpilogueSiluAndMulPostQuant,
         CollectiveEpilogueNoTsm
     >::type
 >::type;
@@ -394,7 +404,7 @@ static_assert(GemmKernel::SharedStorageSize == {},
 // Fused-epilogue guard, emitted below only when kEpilogueType is SiluAndMulPostQuantFp4: that
 // epilogue reuses the mainloop's shared storage, so its activation tile has to fit inside
 // GemmKernel::SharedStorageSize. Nothing is emitted for the other epilogues -- naming
-// CollectiveEpilogueNoTsmSiluAndMulQuant here would instantiate it for every variant (see
+// CollectiveEpilogueSiluAndMulPostQuant here would instantiate it for every variant (see
 // `fused_smem_guard` in generate_impl for why `if constexpr` cannot be used instead).
 {}
 extern "C"
@@ -442,14 +452,18 @@ public:
         // FP4DynamicTileId enumerator name: "LargeEM", "LargeK", "LargeK_G2" or "SmallEM".
         std::string dynamic_tile_id;
         std::string gemm_type, kernel_name;
+        // Epilogue selection. "Default" or "SiluAndMulPostQuantFp4"; apply_swiglu_limit only
+        // matters for the fused epilogue.
+        std::string epilogue_type = "Default";
+        bool apply_swiglu_limit = false;
     };
 
-    using DynamicTileParams = FP4GemmRuntime::DynamicTileParams;
+    using DynamicTileKernelParams = FP4GemmRuntime::DynamicTileKernelParams;
 
     struct Args {
         LaunchInfo launch_info;
         LaunchArgs launch_args;
-        DynamicTileParams kernel_params;
+        DynamicTileKernelParams kernel_params;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -464,19 +478,24 @@ constexpr int SHAPE_K = {};
 constexpr int NUM_GROUPS = {};
 static constexpr auto kDynamicTileId = FP4DynamicTileId::{};
 static constexpr GemmType kGemmType = GemmType::{};
+static constexpr EpilogueType kEpilogueType = EpilogueType::{};
+static constexpr bool kApplySwigluLimit = {};
 
+using ElementD = typename EpilogueTraits<kEpilogueType>::ElementD;
 // The dynamic-tile kernel picks its own tile shape from kDynamicTileId, so no block/warp constants
-// are needed here. Element types must still match what the host filled into DynamicTileParams.
+// are needed here. Element types must still match what the host filled into DynamicTileKernelParams.
 using GemmKernel = cutlass::gemm::kernel::Fp4DeepGemmDynamicTile<
     kGemmType,
     cutlass::float4_t,      // ElementA
     cutlass::float4_t,      // ElementB
     float,                  // ElementC
-    cutlass::bfloat16_t,    // ElementD
+    ElementD,               // ElementD
     float,                  // ElementAccumulator
     float,                  // ElementCompute
     SHAPE_N, SHAPE_K, NUM_GROUPS,
-    kDynamicTileId
+    kDynamicTileId,
+    kEpilogueType,
+    kApplySwigluLimit
 >;
 
 // The dynamic-tile kernel decides its own tile shape from kDynamicTileId, so get_smem_config_fp4()
@@ -500,6 +519,7 @@ __global__ void {}(
 )",
             args.launch_info.n, args.launch_info.k, args.launch_info.num_groups,
             args.launch_info.dynamic_tile_id, args.launch_info.gemm_type,
+            args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit,
             args.launch_args.smem_size,
             args.launch_info.kernel_name);
     }

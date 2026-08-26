@@ -73,7 +73,8 @@ using cute::_;
 // GemmSmemConfig / BlkwiseQuantGemmSmemConfig live in fused_gemm_common.cuh
 // (shared verbatim with the C++ JIT host runtimes); GemmSmemConfigFp4 stays below.
 
-template <int kNumStages, int BLOCK_M, int BLOCK_N, int BLOCK_K, typename MainloopFp4>
+template <int kNumStages, int BLOCK_M, int BLOCK_N, int BLOCK_K, typename MainloopFp4,
+          uint32_t kEpilogueSmemSize = 0>
 struct GemmSmemConfigFp4 {
   // A is copied with cp.sync
   // the size of storage of cutlass::float4_t is uint8;
@@ -84,7 +85,14 @@ struct GemmSmemConfigFp4 {
   static constexpr auto kSmemSFASize = cute::cosize_v<typename MainloopFp4::SmemLayoutSFA> * sizeof(typename MainloopFp4::ElementSFA);
   static constexpr auto kSmemSFBSize = cute::cosize_v<typename MainloopFp4::SmemLayoutSFB> * sizeof(typename MainloopFp4::ElementSFB);
 
-  static constexpr uint32_t kTotalSize = kSmemASize + kSmemBSize + kSmemSFASize + kSmemSFBSize;
+  // A fused epilogue reuses the A/B segments as its activation tile, so the scale segments start
+  // past whichever of the two is larger. That keeps the one-time SFA zero fill valid across
+  // scheduler iterations, and only an epilogue larger than A+B costs extra shared memory.
+  static constexpr uint32_t kSmemEpilogueSize = cute::round_up(kEpilogueSmemSize, 128);
+  static constexpr uint32_t kSmemScaleOffset =
+      (kSmemASize + kSmemBSize) > kSmemEpilogueSize ? (kSmemASize + kSmemBSize) : kSmemEpilogueSize;
+
+  static constexpr uint32_t kTotalSize = kSmemScaleOffset + kSmemSFASize + kSmemSFBSize;
 };
 
 template <typename SrcT, typename ACopyInst, typename TilerA,

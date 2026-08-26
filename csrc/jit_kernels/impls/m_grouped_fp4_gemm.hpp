@@ -31,20 +31,12 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
         selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, 1));
     } else {
-        auto [ns, bm, bn, bk, wm, wn, nst, _sc] = deep_gemm_fp4_common::get_best_configs(
+        // SiluAndMulPostQuant fusing only supports block_n >= 64
+        int min_block_n = enable_silu_and_mul_quant_fusing ? 64 : 32;
+        selected_config = deep_gemm_fp4_common::get_best_configs(
             m, expected_m, n, k, num_groups, num_sms,
-            true /*is_grouped_nopad*/, false /*is_grouped_masked*/);
-        // SiluAndMulPostQuant fusing only supports block_n >= 64: expand block_n only and keep
-        // warp_n the same.
-        if (enable_silu_and_mul_quant_fusing && bn < 64) {
-            bn = 64;
-        }
-        // NOTE: unlike the Python path -- where `Fp4Gemm::run` launches with the device-side
-        // `GemmKernel::SharedStorageSize` and ignores this value -- the C++ JIT kernel uses
-        // `extern __shared__`, so this host-side estimate really is the launch's dynamic smem
-        // size. It must therefore be derived from the final block_n, after any clamping.
-        selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
-            deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, 1));
+            true /*is_grouped_nopad*/, false /*is_grouped_masked*/,
+            256 /*max_block_n*/, min_block_n /*min_block_n*/);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
@@ -171,7 +163,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     args.launch_args = {grid, block, SMSIZE};
 
     // Branch exactly like the device-side CollectiveEpilogue conditional in generate_impl:
-    //   hasBias || SHAPE_N % 2 != 0 ? WithTsm : (fused ? SiluAndMulQuant : NoTsm)
+    //   hasBias || SHAPE_N % 2 != 0 ? WithTsm : (fused ? SiluAndMulPostQuant : NoTsm)
     // The TSM fallback is checked first so host and device can never disagree on the layout.
     if (hasBias || n % 2 != 0) {
         auto& params = args.kernel_params.with_tsm;
@@ -193,7 +185,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
         params.workspace = nullptr;
         params.signal = signal_ptr;
     } else if (enable_silu_and_mul_quant_fusing) {
-        auto& params = args.kernel_params.no_tsm_silu_and_mul_quant;
+        auto& params = args.kernel_params.silu_and_mul_post_quant;
         params = {};
         params.mode = cutlass::gemm::GemmUniversalMode::kGemm;
         params.problem_shape = {m, n, k, 1};
@@ -293,18 +285,12 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, 1));
     } else {
-        auto [ns, bm, bn, bk, wm, wn, nst, _sc] = deep_gemm_fp4_common::get_best_configs(
+        // SiluAndMulPostQuant fusing only supports block_n >= 64
+        int min_block_n = enable_silu_and_mul_quant_fusing ? 64 : 32;
+        selected_config = deep_gemm_fp4_common::get_best_configs(
             m, expected_m, n, k, num_groups, num_sms,
-            false /*is_grouped_nopad*/, true /*is_grouped_masked*/, max_block_n);
-        // SiluAndMulPostQuant fusing only supports block_n >= 64: expand block_n only and keep
-        // warp_n the same.
-        if (enable_silu_and_mul_quant_fusing && bn < 64) {
-            bn = 64;
-        }
-        // NOTE: see the nopad variant -- for the C++ JIT this host-side smem estimate is the
-        // launch's dynamic smem size, so it must be derived from the final block_n.
-        selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
-            deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, 1));
+            false /*is_grouped_nopad*/, true /*is_grouped_masked*/,
+            max_block_n /*max_block_n*/, min_block_n /*min_block_n*/);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
@@ -340,9 +326,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         deep_gemm_fp4_common::select_moe_dynamic_tile(n, k, expected_m, hasBias);
     deep_gemm_fp4_common::DynamicTileLaunchConst dyn_launch{};
     if (enable_moe_dynamic_tile) {
-        // The dynamic-tile kernel only builds the Default epilogue (it static_asserts that), and
         // select_moe_dynamic_tile() already refuses a bias.
-        DG_HOST_ASSERT(!enable_silu_and_mul_quant_fusing);
         DG_HOST_ASSERT(!hasBias);
         // fix the block config to avoid unnecessary jit compile
         block_m = 128; block_n = 128; block_k = 64; warp_m = 64; warp_n = 64; num_stages = 3;
@@ -402,34 +386,62 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
 
     // ----- DynamicTile early-out: completely separate runtime & kernel -----
     if (enable_moe_dynamic_tile) {
-        FP4DynamicTileRuntime::DynamicTileParams params{};
-        params.ptr_A = ptr_A;
-        params.stride_A = stride_A;
-        params.ptr_B = ptr_B;
-        params.stride_B = stride_B;
-        params.ptr_scale_A = ptr_scale_A;
-        params.stride_SFA = stride_SFA;
-        params.ptr_scale_B = ptr_scale_B;
-        params.stride_SFB = stride_SFB;
-        params.epi_params = {
-            .thread = {1.0f, 0.0f, nullptr, nullptr, nullptr, nullptr,
-                       1.0f, 1.0f, 1.0f, 1.0f, nullptr, nullptr, nullptr, nullptr},
-            .ptr_C = ptr_C,
-            .stride_C = stride_C,
-            .ptr_D = ptr_D,
-            .stride_D = stride_D,
-        };
-        params.shape_m = (uint32_t)m;
-        params.grouped_layout = grouped_layout;
-
         FP4DynamicTileRuntime::Args dyn_args{};
         dyn_args.launch_info = {n, k, kNumGroups, dynamic_tile_id, "GroupedMasked",
-                                "fp4_grouped_deep_gemm_masked_dynamic_tile"};
+                                "fp4_grouped_deep_gemm_masked_dynamic_tile",
+                                enable_silu_and_mul_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
+                                enable_silu_and_mul_quant_fusing && swiglu_limit > 0.0};
         // The dynamic-tile kernel's block shape is get_block_shape() == MaxThreadsPerBlock, which
         // varies per kDynamicTileId and is unrelated to the fixed 128x128 block config above.
         dim3 const dyn_block = dyn_launch.block_threads;
         dyn_args.launch_args = {grid, dyn_block, SMSIZE};
-        dyn_args.kernel_params = params;
+
+        if (enable_silu_and_mul_quant_fusing) {
+            auto& params = dyn_args.kernel_params.dynamic_tile_silu_and_mul_post_quant;
+            params = {};
+            params.ptr_A = ptr_A;
+            params.stride_A = stride_A;
+            params.ptr_B = ptr_B;
+            params.stride_B = stride_B;
+            params.ptr_scale_A = ptr_scale_A;
+            params.stride_SFA = stride_SFA;
+            params.ptr_scale_B = ptr_scale_B;
+            params.stride_SFB = stride_SFB;
+            params.epi_params = {
+                .thread = {1.0f, 0.0f, nullptr, nullptr, nullptr, nullptr,
+                        1.0f, 1.0f, 1.0f, 1.0f, nullptr, nullptr, nullptr, nullptr},
+                .ptr_C = ptr_C,
+                .stride_C = stride_C,
+                .ptr_D = ptr_D_fused,
+                .stride_D = stride_D,
+                .ptr_SFD = ptr_SFD,
+                .shape_m = (uint32_t)m,
+                .swiglu_limit = (float)swiglu_limit,
+            };
+            params.shape_m = (uint32_t)m;
+            params.grouped_layout = grouped_layout;
+        } else {
+            auto& params = dyn_args.kernel_params.dynamic_tile_no_tsm;
+            params = {};
+            params.ptr_A = ptr_A;
+            params.stride_A = stride_A;
+            params.ptr_B = ptr_B;
+            params.stride_B = stride_B;
+            params.ptr_scale_A = ptr_scale_A;
+            params.stride_SFA = stride_SFA;
+            params.ptr_scale_B = ptr_scale_B;
+            params.stride_SFB = stride_SFB;
+            params.epi_params = {
+                .thread = {1.0f, 0.0f, nullptr, nullptr, nullptr, nullptr,
+                        1.0f, 1.0f, 1.0f, 1.0f, nullptr, nullptr, nullptr, nullptr},
+                .ptr_C = ptr_C,
+                .stride_C = stride_C,
+                .ptr_D = ptr_D,
+                .stride_D = stride_D,
+            };
+            params.shape_m = (uint32_t)m;
+            params.grouped_layout = grouped_layout;
+        }
 
         const auto& code = FP4DynamicTileRuntime::generate(dyn_args);
         const auto& runtime = compiler->build("fp4_grouped_deep_gemm_masked_dynamic_tile", code, dyn_block.x, SMSIZE);
@@ -465,7 +477,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     args.launch_args = {grid, block, SMSIZE};
 
     // Branch exactly like the device-side CollectiveEpilogue conditional in generate_impl:
-    //   hasBias || SHAPE_N % 2 != 0 ? WithTsm : (fused ? SiluAndMulQuant : NoTsm)
+    //   hasBias || SHAPE_N % 2 != 0 ? WithTsm : (fused ? SiluAndMulPostQuant : NoTsm)
     // The TSM fallback is checked first so host and device can never disagree on the layout.
     if (hasBias || n % 2 != 0) {
         auto& params = args.kernel_params.with_tsm;
@@ -487,7 +499,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         params.workspace = nullptr;
         params.signal = signal_ptr;
     } else if (enable_silu_and_mul_quant_fusing) {
-        auto& params = args.kernel_params.no_tsm_silu_and_mul_quant;
+        auto& params = args.kernel_params.silu_and_mul_post_quant;
         params = {};
         params.mode = cutlass::gemm::GemmUniversalMode::kGemm;
         params.problem_shape = {m, n, k, 1};
