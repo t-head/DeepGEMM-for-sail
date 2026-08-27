@@ -142,6 +142,7 @@ __device__ void batched_gemvt_kernel_small_k_impl(const GemvtArgs args) {
   int id_k = tid_k * alignmentMax;
 
   if ( off_expert >= args.num_experts
+        || off_expert < 0
         || pid_m >= args.num_tokens
         || (id_n + (NPerThread - 1) * NLoopStep) >= args.N
         || id_k >= args.K) {
