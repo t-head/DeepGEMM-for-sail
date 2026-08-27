@@ -448,12 +448,13 @@ using WarpShape_t = Shape<Int<WARP_M>, Int<WARP_N>, Int<WARP_K>>;
 static constexpr int WarpOnM = BLOCK_M / WARP_M;
 static constexpr int WarpOnN = BLOCK_N / WARP_N;
 static constexpr int WarpOnK = BLOCK_K / WARP_K;
+static_assert(BLOCK_K % WARP_K == 0, "BLOCK_K must be divisible by WARP_K");
 
 using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementAB, ElementAB, ElementAcc>::type;
 using TiledMma = TiledMMA<
     MMA_Atom<MmaInst>,
-    Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,
-    Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _16>>;
+    Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, Int<WarpOnK>>>,
+    Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, Int<WarpOnK * 16>>>;
 
 using KernelSchedule = cutlass::gemm::KernelAiuMultistage;
 using DispatchPolicy = cutlass::gemm::MainloopPPUAiuOpt<kNumStages, KernelSchedule, {7}, {10}>;
@@ -907,7 +908,9 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
 
         if (use_cute_free) {
         // --- CuteFree path (default) ---
-        warp_k = block_k;
+        // warp_k comes from the adaptive tile selector (std::get<6> of
+        // adaptive_cfg); WarpOnK (block_k / warp_k) is gated inside
+        // get_warp_k (memory-bound region only + env/guard checks).
         const int warps_k = block_k / warp_k;
         dim3 const block_cute_free = (block_m / warp_m) * (block_n / warp_n) * warps_k * 32;
         int smem_cute_free = SMSIZE;
@@ -1004,6 +1007,17 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
         }
         } else {
             // --- Cutlass3 path (DG_USE_CUTE=0) ---
+            // warp_k is obtained exactly as in the CuteFree path (adaptive
+            // tile selector, std::get<6> of adaptive_cfg); all WarpOnK gating
+            // (memory-bound region, K-depth gate, fat-tile cap, BK whitelist)
+            // lives inside get_warp_k, so both
+            // paths see identical BM/BN/BK/S/warp_k for the same shape.
+            // The JIT-codegened TiledMMA carries Int<WarpOnK> in its thread
+            // layout, so the threadblock must launch WarpOnK extra warp rows;
+            // BF16DenseGemmKernel performs the partial-sum combine via
+            // warp_on_k_reduce when WarpOnK > 1.
+            const int warps_k = block_k / warp_k;
+            dim3 const block_cutlass3 = (block_m / warp_m) * (block_n / warp_n) * warps_k * 32;
             const auto gemm_args = DenseBF16GemmCutlass3Runtime::GemmArguments{
                 .mode = cutlass::gemm::GemmUniversalMode::kGemm,
                 .problem_shape = {m, n, k, 1},
@@ -1027,11 +1041,11 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             auto args = DenseBF16GemmCutlass3Runtime::Args{
                 .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, /*dense_s2_opt=*/true, num_stages,
                                 "DenseGemm", "Default", "bf16_dense_gemm", false, /*overlap_prologue=*/overlap_on},
-                .launch_args = {grid, block, SMSIZE},
+                .launch_args = {grid, block_cutlass3, SMSIZE},
                 .kernel_params = params,
             };
             auto code = DenseBF16GemmCutlass3Runtime::generate(args);
-            auto runtime = compiler->build("bf16_dense_gemm", code, block.x, SMSIZE);
+            auto runtime = compiler->build("bf16_dense_gemm", code, block_cutlass3.x, SMSIZE);
             auto kernel = runtime->kernel;
 
             args.launch_args.grid_dim.x *= blocks_per_cu;

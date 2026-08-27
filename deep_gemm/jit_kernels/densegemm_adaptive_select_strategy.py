@@ -82,6 +82,10 @@ _REG_FILE_SIZE = 131072
 _NATURAL_REGS_PER_THREAD = 168
 _THREADS_PER_WARP = 32
 _MAX_WARPS_PER_BLOCK = _REG_FILE_SIZE // (_NATURAL_REGS_PER_THREAD * _THREADS_PER_WARP)
+# HW limits: a CU hosts at most 64 resident warps, while a single threadblock
+# supports at most 32 warps (1024 threads).
+_MAX_WARPS_PER_CU = 64
+_MAX_WARPS_PER_BLOCK_HW = 32
 _MISC_REGS = 20  # misc overhead: address gen, loop counters, predicates
 
 
@@ -772,8 +776,10 @@ def get_warp_k(block_m, block_n, block_k, warp_m, warp_n, num_stages):
     warp_on_m = max(1, block_m // warp_m)
     warp_on_n = max(1, block_n // warp_n)
     base_warps = warp_on_m * warp_on_n
-    warp_on_k_max = max(1, 32 // base_warps)
-    warp_on_k = block_k // 128
+    # Warp budget: a CU hosts at most 64 resident warps (NOT 32 — 32 is the
+    # per-threadblock limit), so K-split warps may grow up to that budget.
+    warp_on_k_max = max(1, _MAX_WARPS_PER_CU // base_warps)
+    warp_on_k = min(block_k // 128, max(1, _MAX_WARPS_PER_BLOCK_HW // base_warps))
 
     if block_k in (256, 512) and warp_on_k <= warp_on_k_max:
         return 128

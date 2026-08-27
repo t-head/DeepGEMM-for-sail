@@ -52,7 +52,9 @@ static constexpr int BASE_BLOCK_K        = 64;
 static constexpr int MAX_BLOCK_K         = 512;
 
 static constexpr int WE_PER_CU           = 8;
-// Hardware warp limit: 131072 regs / (128 regs/thread * 32 threads/warp) = 32 warps
+// Hardware warp limits: a CU hosts at most 64 resident warps, while a single
+// threadblock supports at most 32 warps (1024 threads).
+static constexpr int MAX_WARPS_PER_CU = 64;
 static constexpr int MAX_WARPS_PER_BLOCK = 32;
 
 // ============================================================
@@ -181,15 +183,49 @@ inline int max_bn_smem(int block_m, int stage) {
 // Return the WARP_K tile size (= block_k / WarpOnK), NOT the WarpOnK factor itself.
 // WarpOnK=1 -> warp_k = block_k (no K-split)
 // WarpOnK=2 -> warp_k = block_k / 2
-inline int get_warp_k(int block_m, int block_n, int block_k, int warp_m, int warp_n, int num_stages) {
+// allow_warp_on_k: WarpOnK is restricted to the memory-bound region; all other
+// regions pass false (default) and keep warp_k = block_k.
+// cutlass_k (actual GEMM K) has no default: callers must pass it explicitly so
+// the K-depth gate below can never silently see a stale value.
+inline int get_warp_k(int block_m, int block_n, int block_k, int cutlass_k,
+                      int warp_m, int warp_n, int num_stages,
+                      bool allow_warp_on_k = false) {
+    // Region gate: WarpOnK belongs to the memory-bound path only.
+    if (!allow_warp_on_k) return block_k;
+
+    // Gate 1 — K depth (A/B run 2026-08-25): only deep-K shapes benefit from
+    // K-splitting; below 6 K-iterations the partial-sum reduction cost wipes
+    // out the gain ((130,3072,512): K/BK=2, +12.67%; (2,7168,768): K/BK=3,
+    // -0.5%).
+    if (ceil_div(cutlass_k, block_k) < 6) return block_k;
+
     int warp_on_m = std::max(1, block_m / warp_m);
     int warp_on_n = std::max(1, block_n / warp_n);
     int base_warps = warp_on_m * warp_on_n;
-    int warp_on_k_max = std::max(1, 32 / base_warps);
-    int warp_on_k = block_k / 128;
+
+    // Warp budget guards — two distinct HW limits:
+    //  - per-CU: at most MAX_WARPS_PER_CU warps resident on one CU, shared
+    //    by the blocks_per_cu co-resident blocks;
+    //  - per-block: a threadblock holds at most MAX_WARPS_PER_BLOCK warps.
+    int smem_bytes = (block_m + block_n) * block_k * 2 * num_stages;
+    int blocks_per_cu = std::max(1, SMEM_SIZE / smem_bytes);
+    int warp_on_k_max = std::max(1, MAX_WARPS_PER_CU / (base_warps * blocks_per_cu));
+    int warp_on_k = std::min(block_k / 128,
+                             std::max(1, MAX_WARPS_PER_BLOCK / base_warps));
+
+    // Gate 2 — fat-tile warp cap (A/B run 2026-08-25): tiles whose warp grid
+    // is already >= 3 warps over-reduce under full K-split ((2,1536,7168):
+    // base_warps=3, BK=512, warp_on_k=4 -> 384 threads/TB, +6.86%); cap to
+    // warp_on_k=2 (warp_k=256 at BK=512). BK=256 keeps warp_on_k=2.
+    if (base_warps >= 3) warp_on_k = std::min(warp_on_k, 2);
+
+    // WarpKReduce capacity guard: Strategy-A SMEM reduction reserves
+    // (warp_on_k - 1) * BM * BN * 4 bytes inside the block SMEM budget
+    // (evaluated with the tightened warp_on_k).
+    if ((warp_on_k - 1) * block_m * block_n * 4 > smem_bytes) return block_k;
 
     if ((block_k == 256 || block_k == 512) && warp_on_k <= warp_on_k_max) {
-        return 128;
+        return block_k / warp_on_k;
     } else {
         return block_k;
     }
@@ -276,10 +312,19 @@ inline MemBoundResult select_tile_memory_bound(int cutlass_n, int cutlass_m, int
         block_k *= 2;
     }
 
+    // Short-K clamp: avoid BK >> K (heavy K-padding, single K-iteration).
+    while (ceil_div(cutlass_k, block_k) < 2 && block_k > BASE_BLOCK_K) {
+        block_k /= 2;
+    }
+    // Recompute the stages budget with the (possibly shrunk) BK.
+    max_stages = SMEM_SIZE / ((block_m + block_n) * block_k * 2);
+
     // Cap stages at 3; also bounded by K-iterations.
     int num_stages = std::min({max_stages, 3, ceil_div(cutlass_k, block_k)});
     num_stages = std::max(num_stages, 2);
-    int warp_k = get_warp_k(block_m, block_n, block_k, warp_m, warp_n_result, num_stages);
+    // Memory-bound region: the only caller allowed to enable WarpOnK.
+    int warp_k = get_warp_k(block_m, block_n, block_k, cutlass_k, warp_m, warp_n_result,
+                            num_stages, /*allow_warp_on_k=*/true);
 
     return {block_m, warp_m, block_n, warp_n_result, block_k, num_stages, warp_k};
 }
@@ -735,8 +780,9 @@ inline AdaptiveResult get_adaptive_configs_impl(int m, int n, int k, int num_sms
             auto [bk, s] = select_adaptive_smem(block_m, block_n, k);
             block_k = bk;
             num_stages = s;
-            warp_k = get_warp_k(block_m, block_n, block_k, warp_m, warp_n,
-                                num_stages);
+            // WarpOnK is memory-bound only: keep allow_warp_on_k=false here.
+            warp_k = get_warp_k(block_m, block_n, block_k, k, warp_m, warp_n,
+                                num_stages, /*allow_warp_on_k=*/false);
         } else {
             block_m = 256;
             block_n = 256;
@@ -820,7 +866,9 @@ inline AdaptiveResult get_adaptive_configs_impl(int m, int n, int k, int num_sms
             auto [bk, s] = select_adaptive_smem(block_m, block_n, k);
             block_k = bk;
             num_stages = s;
-            warp_k = get_warp_k(block_m, block_n, block_k, warp_m, warp_n, num_stages);
+            // WarpOnK is memory-bound only: keep allow_warp_on_k=false here.
+            warp_k = get_warp_k(block_m, block_n, block_k, k, warp_m, warp_n, num_stages,
+                                /*allow_warp_on_k=*/false);
         }
     }
 
