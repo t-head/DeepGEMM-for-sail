@@ -9,66 +9,6 @@
 
 namespace deep_gemm {
 
-torch::Tensor get_col_major_tma_aligned_tensor(const torch::Tensor& x) {
-    assert(x.dim() == 2 || x.dim() == 3);
-
-    bool remove_dim = false;
-    int64_t m = x.size(-2);
-    int64_t n = x.size(-1);
-    auto dtype = x.dtype();
-    auto device = x.device();
-
-    int64_t element_size = x.element_size();
-    // int64_t aligned_m = get_tma_aligned_size(m, element_size);
-    int64_t aligned_m = m;
-    torch::Tensor x_view = x;
-
-    if (x.dim() == 2) {
-        if (x.stride(0) == 1 && x.stride(1) == aligned_m) {
-            return x;
-        }
-        x_view = x.unsqueeze(0);
-        remove_dim = true;
-    }
-
-    int64_t b = x_view.size(0);
-
-    if (x_view.stride(0) == aligned_m * n && x_view.stride(1) == 1 && x_view.stride(2) == aligned_m) {
-        return remove_dim ? x_view.squeeze(0) : x_view;
-    }
-
-    auto options = torch::TensorOptions().dtype(dtype).device(device);
-    torch::Tensor aligned_x = torch::transpose(torch::empty({b, n, aligned_m}, options), 1, 2);
-
-    aligned_x.slice(1, 0, m).copy_(x_view);
-
-    aligned_x = aligned_x.slice(1, 0, m);
-
-    return remove_dim ? aligned_x.squeeze(0) : aligned_x;
-}
-
-torch::Tensor get_col_major_tensor(const torch::Tensor& x) {
-    TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "Only 2-D or 3-D tensors supported");
-
-    bool squeeze_dim = false;
-    torch::Tensor x_view = x;
-    if (x.dim() == 2) {
-        x_view = x.unsqueeze(0);
-        squeeze_dim = true;
-    }
-
-    const int64_t b = x_view.size(0);
-    const int64_t m = x_view.size(1);
-    const int64_t n = x_view.size(2);
-
-    // Allocate (B, N, M) then transpose the last two dims, so the result is column-major over (M, N).
-    auto options = torch::TensorOptions().dtype(x.dtype()).device(x.device());
-    torch::Tensor col_major = torch::empty({b, n, m}, options).transpose(-2, -1);
-    col_major.copy_(x_view);
-
-    return squeeze_dim ? col_major.squeeze(0) : col_major;
-}
-
 // The SM budget is owned by DeviceRuntime (jit/device_runtime.hpp) so that the pybind-exposed
 // set_num_sms() actually drives the kernels. This free function is kept as a thin alias because
 // every GEMM impl calls get_num_sms() unqualified; it now routes to that single source of truth.
@@ -100,17 +40,6 @@ std::unordered_map<std::string, int> get_extra_info(int m = 0, int n = 0, int k 
     extra_info["use_moe_dynamic_tile"] = get_env<int>("DG_USE_MOE_DYNAMIC_TILE", 0);
 
     return extra_info;
-}
-
-int get_m_alignment_for_contiguous_layout() {
-    /*
-    When we do a grouped GEMM in contiguous format, LHS are grouped into several batches along the M axis.
-    Since we deal with exactly one sub-matrix of RHS for each GEMM block, batch sizes above should align well
-        with GEMM block shape.
-    Returns:
-        Group-level alignment requirement for grouped contiguous layout, which is always 128.
-    */
-    return 128;
 }
 
 static dim3 get_grid_shape(int sm_count) {

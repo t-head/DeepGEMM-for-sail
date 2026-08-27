@@ -252,7 +252,7 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
     if (gemm_type != GemmType::GroupedContiguous) {
         block_ms = (k > 384) ? std::vector<int>{256, 192, 128, 64, 32, 16} : std::vector<int>{64, 32, 16};
     } else {
-        block_ms = {get_m_alignment_for_contiguous_layout()};
+        block_ms = {get_mk_alignment_for_contiguous_layout()};
     }
     assert(max_block_n > 0 && (max_block_n & (max_block_n - 1)) == 0);
     int bit_length = 32 - __builtin_clz(static_cast<unsigned>(max_block_n));

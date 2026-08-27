@@ -38,7 +38,7 @@ static auto get_shape(const torch::Tensor& t) {
 // Recipe
 static std::tuple<int, int, int>
 get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType& sfb_dtype) {
-    const auto& arch_major = device_runtime->get_arch_major();
+    const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 9) {
         DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
         return {1, 128, 128};
@@ -64,7 +64,7 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
         DG_HOST_ASSERT(sf.scalar_type() == type_check.value());
 
     // Always do shape checks
-    const auto& sf_dtype = sf.scalar_type();
+    const auto sf_dtype = sf.scalar_type();
     DG_HOST_ASSERT(sf_dtype == torch::kFloat or sf_dtype == torch::kInt);
     DG_HOST_ASSERT(sf.dim() == static_cast<int>(num_groups.has_value()) + 2);
     if (num_groups.has_value())
@@ -90,8 +90,74 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
     return sf;
 }
 
-// Value matrix layout
-static int get_mk_alignment_for_contiguous_layout() {
+torch::Tensor get_mn_major_tma_aligned_tensor(const torch::Tensor& x) {
+    assert(x.dim() == 2 || x.dim() == 3);
+
+    bool remove_dim = false;
+    int64_t m = x.size(-2);
+    int64_t n = x.size(-1);
+    auto dtype = x.dtype();
+    auto device = x.device();
+
+    int64_t element_size = x.element_size();
+    // int64_t aligned_m = get_tma_aligned_size(m, element_size);
+    int64_t aligned_m = m;
+    torch::Tensor x_view = x;
+
+    if (x.dim() == 2) {
+        if (x.stride(0) == 1 && x.stride(1) == aligned_m) {
+            return x;
+        }
+        x_view = x.unsqueeze(0);
+        remove_dim = true;
+    }
+
+    int64_t b = x_view.size(0);
+
+    if (x_view.stride(0) == aligned_m * n && x_view.stride(1) == 1 && x_view.stride(2) == aligned_m) {
+        return remove_dim ? x_view.squeeze(0) : x_view;
+    }
+
+    auto options = torch::TensorOptions().dtype(dtype).device(device);
+    torch::Tensor aligned_x = torch::transpose(torch::empty({b, n, aligned_m}, options), 1, 2);
+
+    aligned_x.slice(1, 0, m).copy_(x_view);
+
+    aligned_x = aligned_x.slice(1, 0, m);
+
+    return remove_dim ? aligned_x.squeeze(0) : aligned_x;
+}
+
+torch::Tensor get_col_major_tensor(const torch::Tensor& x) {
+    TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "Only 2-D or 3-D tensors supported");
+
+    bool squeeze_dim = false;
+    torch::Tensor x_view = x;
+    if (x.dim() == 2) {
+        x_view = x.unsqueeze(0);
+        squeeze_dim = true;
+    }
+
+    const int64_t b = x_view.size(0);
+    const int64_t m = x_view.size(1);
+    const int64_t n = x_view.size(2);
+
+    // Allocate (B, N, M) then transpose the last two dims, so the result is column-major over (M, N).
+    auto options = torch::TensorOptions().dtype(x.dtype()).device(x.device());
+    torch::Tensor col_major = torch::empty({b, n, m}, options).transpose(-2, -1);
+    col_major.copy_(x_view);
+
+    return squeeze_dim ? col_major.squeeze(0) : col_major;
+}
+
+int get_mk_alignment_for_contiguous_layout() {
+    /*
+    When we do a grouped GEMM in contiguous format, LHS are grouped into several batches along the M axis.
+    Since we deal with exactly one sub-matrix of RHS for each GEMM block, batch sizes above should align well
+        with GEMM block shape.
+    Returns:
+        Group-level alignment requirement for grouped contiguous layout, which is always 128.
+    */
     return 128;
 }
 

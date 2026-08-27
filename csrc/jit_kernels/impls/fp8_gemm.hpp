@@ -11,6 +11,7 @@
 #include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
+#include "../../utils/layout.hpp"
 #include "../../utils/layout_type_name.hpp"
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_fp8.hpp"
@@ -388,7 +389,7 @@ using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int
 static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
                      const torch::Tensor& rhs_scales, const torch::Tensor& out, const int& m, const int& n,
                      const int& k, std::optional<ConfigTuple> configs = std::nullopt) {
-    auto lhs_scales_aligned = get_col_major_tma_aligned_tensor(lhs_scales);
+    auto lhs_scales_aligned = get_mn_major_tma_aligned_tensor(lhs_scales);
     int num_sms = get_num_sms();
 
     ConfigTuple selected_config;

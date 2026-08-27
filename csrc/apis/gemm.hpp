@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../utils/compatibility.hpp"
+#include "../utils/layout.hpp"
 #include <torch/extension.h>
 #include "../jit_kernels/impls/fp8_gemm.hpp"
 
@@ -16,12 +17,14 @@
 #include "../jit_kernels/impls/fused_moe_gemm.hpp"
 #include "../jit_kernels/impls/moe_align.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a16_gemm.hpp"
+#include "../jit_kernels/impls/smxx_acblaslt.hpp"
 
 namespace deep_gemm::gemm {
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 // The 9-tuple returned by `w4a16_get_best_configs`:
 // (num_sms, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages, n_expand)
 using W4A16ConfigTuple = deep_gemm_w4a16_common::W4A16ConfigTuple;
+
 extern "C" {
 static bool early_return(const int& m, const int &n, const int& k,
                          const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
@@ -71,6 +74,21 @@ void gemm_bf16_bf16_bf16_nt(const torch::Tensor& a, const torch::Tensor& b, cons
     bf16_gemm(a, b, d, m, n, k, configs);
 }
 
+void gemm_bf16_bf16_bf16_nn(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                            std::optional<ConfigTuple> configs = std::nullopt) {
+    DG_HOST_UNREACHABLE("BF16 NN layout is not supported: kernel does not support non-NT layouts due to performance concerns");
+}
+
+void gemm_bf16_bf16_bf16_tn(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                            std::optional<ConfigTuple> configs = std::nullopt) {
+    DG_HOST_UNREACHABLE("BF16 TN layout is not supported: kernel does not support non-NT layouts due to performance concerns");
+}
+
+void gemm_bf16_bf16_bf16_tt(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                            std::optional<ConfigTuple> configs = std::nullopt) {
+    DG_HOST_UNREACHABLE("BF16 TT layout is not supported: kernel does not support non-NT layouts due to performance concerns");
+}
+
 void gemm_int8_int8_bf16_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& d,
                             std::optional<ConfigTuple> configs = std::nullopt) {
@@ -93,6 +111,24 @@ void gemm_int8_int8_bf16_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         return;
     }
     int8_gemm(a.first, a.second, b.first, b.second, d, m, n, k, configs);
+}
+
+void gemm_int8_int8_bf16_nn(const std::pair<torch::Tensor, torch::Tensor>& a,
+                            const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& d,
+                            std::optional<ConfigTuple> configs = std::nullopt) {
+    DG_HOST_UNREACHABLE("INT8 NN layout is not supported: kernel does not support non-NT layouts due to performance concerns");
+}
+
+void gemm_int8_int8_bf16_tn(const std::pair<torch::Tensor, torch::Tensor>& a,
+                            const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& d,
+                            std::optional<ConfigTuple> configs = std::nullopt) {
+    DG_HOST_UNREACHABLE("INT8 TN layout is not supported: kernel does not support non-NT layouts due to performance concerns");
+}
+
+void gemm_int8_int8_bf16_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                            const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& d,
+                            std::optional<ConfigTuple> configs = std::nullopt) {
+    DG_HOST_UNREACHABLE("INT8 TT layout is not supported: kernel does not support non-NT layouts due to performance concerns");
 }
 
 void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
@@ -120,6 +156,21 @@ void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pa
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
     TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
     fp8_gemm(a.first, a.second, b.first, b.second, d, m, n, k, configs);
+}
+
+void fp8_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
+                 const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt) {
+    DG_HOST_UNREACHABLE("FP8 NN layout is not supported: kernel does not support non-NT layouts due to performance concerns");
+}
+
+void fp8_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
+                 const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt) {
+    DG_HOST_UNREACHABLE("FP8 TN layout is not supported: kernel does not support non-NT layouts due to performance concerns");
+}
+
+void fp8_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
+                 const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt) {
+    DG_HOST_UNREACHABLE("FP8 TT layout is not supported: kernel does not support non-NT layouts due to performance concerns");
 }
 
 void fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -746,7 +797,7 @@ void m_grouped_gemm_fp8_fp8_bf16_nt_fused(
     DG_HOST_ASSERT(std::get<3>(configs) == 128);  // block_k
 
     // Column-major (TMA-aligned) lhs scales — same transform as the Python entry
-    torch::Tensor lhs_scales_col_major = get_col_major_tma_aligned_tensor(lhs_scales);
+    torch::Tensor lhs_scales_col_major = get_mn_major_tma_aligned_tensor(lhs_scales);
 
     m_grouped_gemm_blkwise_nt_fused_impl(
         lhs, lhs_scales_col_major, rhs, rhs_scales, out, m_rows,
@@ -1206,11 +1257,54 @@ static void m_grouped_gemm_w4a16_fused(const torch::Tensor& lhs,
                                     operands.m, operands.n, operands.k, operands.num_groups, operands.group_size,
                                     configs, fp4_use_bf16_scale);
 }
+
+static void acblaslt_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,
+                                            const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
+    // Shape must be `[M, K] @ [N, K].T`
+    major_check(a);
+    major_check(b);
+    const bool a_is_k_major = a.stride(-1) == 1;
+    const bool b_is_k_major = b.stride(-1) == 1;
+
+    // Type and shape checks
+    const auto [m , k ] = get_shape<2>(a);
+    const auto [n , k_] = get_shape<2>(b);
+    const auto [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+
+    // Early return for trivial cases
+    if (early_return(m, n, k, d, c))
+        return;
+
+    acblaslt_gemm(a, b, d, m, n, k, a_is_k_major, b_is_k_major, c.has_value());
 }
+
+static void acblaslt_gemm_nn(const torch::Tensor& a, const torch::Tensor& b,
+                                            const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
+    acblaslt_gemm_nt(a, b.transpose(0, 1), d, c);
+}
+
+static void acblaslt_gemm_tn(const torch::Tensor& a, const torch::Tensor& b,
+                                            const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
+    acblaslt_gemm_nt(a.transpose(0, 1), b.transpose(0, 1), d, c);
+}
+
+static void acblaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
+                                            const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
+    acblaslt_gemm_nt(a.transpose(0, 1), b, d, c);
+}
+}
+
 
 static void register_apis(pybind11::module_& m) {
     // BF16 GEMMs
     m.def("gemm_bf16_bf16_bf16_nt", &gemm_bf16_bf16_bf16_nt, py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("configs") = std::nullopt);
+    m.def("gemm_bf16_bf16_bf16_nn", &gemm_bf16_bf16_bf16_nn, py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("configs") = std::nullopt);
+    m.def("gemm_bf16_bf16_bf16_tn", &gemm_bf16_bf16_bf16_tn, py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("configs") = std::nullopt);
+    m.def("gemm_bf16_bf16_bf16_tt", &gemm_bf16_bf16_bf16_tt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("configs") = std::nullopt);
     m.def("m_grouped_gemm_bf16_bf16_bf16_nt_contiguous", &m_grouped_gemm_bf16_bf16_bf16_nt_contiguous, py::arg("lhs"),
           py::arg("rhs"), py::arg("out"), py::arg("m_indices"), py::arg("configs") = std::nullopt);
@@ -1220,7 +1314,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("m_grouped_gemm_bf16_bf16_bf16_nt_nopad", &m_grouped_gemm_bf16_bf16_bf16_nt_nopad, py::arg("lhs"),
           py::arg("rhs"), py::arg("out"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt,
           py::arg("configs") = std::nullopt);
-    // INT8 GEMMS
+    // INT8 GEMMs
     m.def("gemm_int8_int8_bf16_nt", &gemm_int8_int8_bf16_nt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("configs") = std::nullopt);
     m.def("m_grouped_gemm_int8_int8_bf16_nt_contiguous", &m_grouped_gemm_int8_int8_bf16_nt_contiguous, py::arg("a"),
@@ -1232,6 +1326,12 @@ static void register_apis(pybind11::module_& m) {
           py::arg("d"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt, py::arg("configs") = std::nullopt);
     // FP8 GEMMs
     m.def("gemm_fp8_fp8_bf16_nt", &fp8_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("configs") = std::nullopt);
+    m.def("gemm_fp8_fp8_bf16_nn", &fp8_gemm_nn, py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("configs") = std::nullopt);
+    m.def("gemm_fp8_fp8_bf16_tn", &fp8_gemm_tn, py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("configs") = std::nullopt);
+    m.def("gemm_fp8_fp8_bf16_tt", &fp8_gemm_tt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("configs") = std::nullopt);
     m.def("m_grouped_gemm_fp8_fp8_bf16_nt_contiguous", &m_grouped_gemm_fp8_fp8_bf16_nt_contiguous, py::arg("a"),
           py::arg("b"), py::arg("d"), py::arg("m_indices"), py::arg("configs") = std::nullopt);
@@ -1326,6 +1426,15 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
           py::arg("lhs"), py::arg("rhs"), py::arg("topk_ids"),
           py::arg("perchannel_quant") = false, py::arg("config") = std::nullopt,
           py::arg("enable_act_and_quant_fusing") = false);
+    // acBLASLt GEMMs
+    m.def("acblaslt_gemm_nt", &acblaslt_gemm_nt,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
+    m.def("acblaslt_gemm_nn", &acblaslt_gemm_nn,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
+    m.def("acblaslt_gemm_tn", &acblaslt_gemm_tn,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
+    m.def("acblaslt_gemm_tt", &acblaslt_gemm_tt,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
 }
 
 } // namespace deep_gemm::gemm

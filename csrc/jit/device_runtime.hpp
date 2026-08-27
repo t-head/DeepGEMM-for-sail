@@ -2,7 +2,7 @@
 
 #include <iostream>
 #include <string>
-
+#include <acblasLt.h>
 #include <hggc_runtime_api.h>
 #include <torch/version.h>
 #include <torch/torch.h>
@@ -14,11 +14,43 @@ namespace deep_gemm {
 
 class DeviceRuntime {
     int num_sms = 0, tc_util = 0;
+    bool enable_pdl = false;
     std::shared_ptr<hggcDeviceProp> cached_prop;
 
+    // acBLASLt utils
+    static constexpr size_t kAcblasLtWorkspaceSize = 32 * 1024 * 1024;
+
 public:
-    explicit DeviceRuntime() = default;
-    ~DeviceRuntime() = default;
+    acblasLtHandle_t acblaslt_handle = nullptr;
+    torch::Tensor acblaslt_workspace;
+    bool use_temp_acblaslt_workspace;
+
+    explicit DeviceRuntime() {
+        // Whether to create workspace tensor on each call instead of holding one.
+        // Enabled by compute-sanitizer tests, which trigger runtime errors
+        // when the workspace tensor is destructed after driver shutdown.
+        use_temp_acblaslt_workspace = get_env<int>("DG_USE_TEMP_ACBLASLT_WORKSPACE", 0) > 0;
+
+        DG_ACBLASLT_CHECK(acblasLtCreate(&acblaslt_handle));
+
+        if (not use_temp_acblaslt_workspace)
+            acblaslt_workspace = torch::empty({kAcblasLtWorkspaceSize}, dtype(torch::kByte).device(at::kCUDA));
+    }
+
+    ~DeviceRuntime() noexcept(false) {
+        if (acblaslt_handle != nullptr)
+            DG_ACBLASLT_CHECK(acblasLtDestroy(acblaslt_handle));
+    }
+
+    acblasLtHandle_t get_acblaslt_handle() const {
+        return acblaslt_handle;
+    }
+
+    torch::Tensor get_acblaslt_workspace() {
+        if (use_temp_acblaslt_workspace)
+            return torch::empty({kAcblasLtWorkspaceSize}, dtype(torch::kByte).device(at::kCUDA));
+        return acblaslt_workspace;
+    }
 
     std::shared_ptr<hggcDeviceProp> get_prop() {
         if (cached_prop == nullptr) {
@@ -83,6 +115,14 @@ public:
 
     int get_tc_util() const {
         return tc_util == 0 ? 100 : tc_util;
+    }
+
+    void set_pdl(const bool& new_enable_pdl) {
+        enable_pdl = new_enable_pdl;
+    }
+
+    bool get_pdl() const {
+        return enable_pdl;
     }
 };
 

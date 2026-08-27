@@ -48,7 +48,7 @@ build_include_dirs = [
     current_dir + '/third-party/actlize_v0.5.0/include/',
 ]
 
-build_libraries = ['hggc', 'hggcrt1', 'hgrtc']
+build_libraries = ['hggc', 'hggcrt1', 'hgrtc', 'acblasLt']
 build_library_dirs = [
     os.path.join(ppu_sdk, 'lib'),
 ]

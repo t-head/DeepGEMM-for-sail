@@ -39,7 +39,7 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     const auto& [groups, m, k] = get_shape<3>(a);
     const auto& [_, n, __] = get_shape<3>(b);
 
-    auto sfa_aligned = get_col_major_tma_aligned_tensor(sfa);
+    auto sfa_aligned = get_mn_major_tma_aligned_tensor(sfa);
 
     int num_sms = get_num_sms();
     ConfigTuple selected_config;

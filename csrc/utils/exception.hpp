@@ -1,8 +1,11 @@
 #pragma once
 
+#include <acblasLt.h>
 #include <exception>
 #include <string>
 #include <sstream>
+
+#include "compatibility.hpp"
 
 namespace deep_gemm {
 
@@ -39,7 +42,7 @@ do { \
 #ifndef DG_HGRTC_CHECK
 #define DG_HGRTC_CHECK(cmd) \
 do { \
-    const auto& e = (cmd); \
+    const auto e = (cmd); \
     if (e != HGRTC_SUCCESS) { \
         throw DGException("HGGCRTC", __FILE__, __LINE__, hgrtcGetErrorString(e)); \
     } \
@@ -49,7 +52,7 @@ do { \
 #ifndef DG_HGGC_DRIVER_CHECK
 #define DG_HGGC_DRIVER_CHECK(cmd) \
 do { \
-    const auto& e = (cmd); \
+    const auto e = (cmd); \
     if (e != HGGC_SUCCESS) { \
         std::stringstream ss; \
         const char *name, *info; \
@@ -63,11 +66,24 @@ do { \
 #ifndef DG_HGGC_RUNTIME_CHECK
 #define DG_HGGC_RUNTIME_CHECK(cmd) \
 do { \
-    const auto& e = (cmd); \
+    const auto e = (cmd); \
     if (e != hggcSuccess) { \
         std::stringstream ss; \
         ss << static_cast<int>(e) << " (" << hggcGetErrorName(e) << ", " << hggcGetErrorString(e) << ")"; \
         throw DGException("HGGC runtime", __FILE__, __LINE__, ss.str()); \
+    } \
+} while (0)
+#endif
+
+// NOTES: only expanded in translation units that include `<acblasLt.h>`
+#ifndef DG_ACBLASLT_CHECK
+#define DG_ACBLASLT_CHECK(cmd) \
+do { \
+    const auto e = (cmd); \
+    if (e != ACBLAS_STATUS_SUCCESS) { \
+        std::stringstream ss; \
+        ss << static_cast<int>(e) << " (" << acblasGetStatusString(e) << ")"; \
+        throw DGException("acBLASLt", __FILE__, __LINE__, ss.str()); \
     } \
 } while (0)
 #endif

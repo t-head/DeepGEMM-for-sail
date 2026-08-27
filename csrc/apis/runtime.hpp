@@ -1,7 +1,10 @@
 #pragma once
 
+#include <variant>
+
 #include "../jit/compiler.hpp"
 #include "../jit/device_runtime.hpp"
+#include "../jit_kernels/heuristics/runtime.hpp"
 
 namespace deep_gemm::runtime {
 
@@ -17,6 +20,24 @@ static void register_apis(pybind11::module_& m) {
     });
     m.def("get_tc_util", [&]() {
         return device_runtime->get_tc_util();
+    });
+    m.def("set_pdl", [&](const bool& new_enable_pdl) {
+        device_runtime->set_pdl(new_enable_pdl);
+    });
+    m.def("get_pdl", [&]() {
+        return device_runtime->get_pdl();
+    });
+    m.def("set_ignore_compile_dims", [&](const bool& new_value) {
+        heuristics_runtime->set_ignore_compile_dims(new_value);
+    });
+    m.def("set_block_size_multiple_of", [&](const std::variant<int, std::tuple<int, int>>& new_value) {
+        if (std::holds_alternative<int>(new_value)) {
+            auto x = std::get<int>(new_value);
+            heuristics_runtime->set_block_size_multiple_of(x, x);
+        } else {
+            auto [x, y] = std::get<std::tuple<int, int>>(new_value);
+            heuristics_runtime->set_block_size_multiple_of(x, y);
+        }
     });
 
     // COMPILE MODE (mirrors Python jit/runtime.py set/get_compile_mode; ONLY_COMPILE = 1 compiles but skips launch)

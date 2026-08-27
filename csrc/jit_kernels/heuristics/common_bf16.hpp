@@ -232,7 +232,7 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
             block_ms = {64, 32, 16};
         }
     } else {
-        block_ms = {get_m_alignment_for_contiguous_layout()};
+        block_ms = {get_mk_alignment_for_contiguous_layout()};
     }
 
     // Assert max_block_n is power of 2
