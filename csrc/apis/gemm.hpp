@@ -604,6 +604,7 @@ void m_grouped_gemm_bf16_bf16_bf16_nt_fused(
     TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
     TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+    DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
     m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
         lhs, rhs, out, m_rows, expert_ids_and_cumsum,
@@ -643,6 +644,7 @@ void m_grouped_gemm_fp8_fp8_bf16_nt_fused(
     TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
     DG_HOST_ASSERT(k % 16 == 0);
+    DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
     // per-channel quant — branch condition mirrors the Python entry:
     //   `if lhs_scales.shape == (num_token, 1) and rhs_scales.shape == (num_groups, n, 1)`
@@ -655,11 +657,8 @@ void m_grouped_gemm_fp8_fp8_bf16_nt_fused(
     }
 
     // blockwise quant
-    // Python computes `topk = int(m_sum / num_token)` first and then early-exits on
-    // `m_sum == 0`; we check the exit first to avoid the division when num_token == 0
-    // (behaviorally identical whenever Python does not raise ZeroDivisionError).
     if (m_sum == 0) return;
-    int topk = static_cast<int>(m_sum / num_token);
+    int topk = m_sum / num_token;
     DG_HOST_ASSERT(n % 128 == 0);
     DG_HOST_ASSERT(k % 128 == 0);
     DG_HOST_ASSERT(std::get<3>(configs) == 128);  // block_k
@@ -709,6 +708,7 @@ void m_grouped_gemm_int8_int8_bf16_nt_fused(
     TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
     DG_HOST_ASSERT(k % 16 == 0);
+    DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
     m_grouped_gemm_perchannel_nt_fused_impl(
         lhs, lhs_scales, rhs, rhs_scales, out, m_rows,

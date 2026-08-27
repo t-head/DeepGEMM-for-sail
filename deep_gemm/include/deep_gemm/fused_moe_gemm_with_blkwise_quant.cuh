@@ -489,11 +489,8 @@ public:
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()){
-            // check src type
-            std::string data_type = "fp8";
-            dg_prof_params.set_params(
-                GemmType::GroupedFused, false, data_type, kNumGroups, shape_m, SHAPE_N, SHAPE_K, 1,
-                m_rows, stream
+            dg_prof_params.set_fused_moe_params(
+                std::string("fp8"), std::string("block"), kNumGroups, shape_m, topk, SHAPE_N, SHAPE_K, m_rows, stream
             );
         }
         static constexpr int Stages = SHAPE_K < BLOCK_K * kNumStages ? SHAPE_K / BLOCK_K : kNumStages;

@@ -33,7 +33,7 @@ using fused_moe_gemm = FusedMoeGemm<N, K, kNumGroups,
 
 // Launch kernel
 fused_moe_gemm::run(out, lhs, rhs, m_rows, expert_ids_and_cumsum, sorted_token_ids,
-            aligned_num_m_blocks, m, stream, num_sms);
+            aligned_num_m_blocks, m, topk, stream, num_sms);
 """
 
 includes_fusedmoe_gemm_with_blkwise_quant = (
@@ -90,7 +90,7 @@ using fused_moe_gemm_with_perchannel_quant = FusedMoeGemmWithPerChannelQuant<
 // Launch kernel
 fused_moe_gemm_with_perchannel_quant::run(out, lhs, rhs, lhs_scales, rhs_scales,
             m_rows, expert_ids_and_cumsum, sorted_token_ids,
-            aligned_num_m_blocks, m, stream, num_sms);
+            aligned_num_m_blocks, m, topk, stream, num_sms);
 """
 
 includes_fusedgemm_util_kernel = ('"../deep_gemm/fused_gemm_util.cuh"', )
@@ -328,6 +328,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_fused(lhs: torch.Tensor,
      # Auto-tuning with compilation
     global includes_fusedmoe_gemm, template_fusedmoe_gemm
     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = configs
+    topk = int(m_sum / num_token)
     # torch.set_printoptions(threshold=10000000, linewidth=10000, precision=2, sci_mode=False)
     # print(expert_ids_and_cumsum.shape, expert_ids_and_cumsum)
     # print(sorted_token_ids, sorted_token_ids.shape)
@@ -336,7 +337,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_fused(lhs: torch.Tensor,
     # print("out_shape:", out.shape)
     # print("lhs_shape:", lhs.shape)
     args = (lhs, rhs, out, m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks,
-            num_token, torch.cuda.current_stream(), int(num_sms))
+            num_token, topk, torch.cuda.current_stream(), int(num_sms))
 
     kernel_type = 'Default'
     runtime = jit_tuner.compile_and_tune(
@@ -357,6 +358,7 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_fused(lhs: torch.Tensor,
                 ('sorted_token_ids', torch.int32),
                 ('aligned_num_m_blocks', torch.int32),
                 ('m', int),
+                ('topk', int),
                 ('stream', torch.cuda.Stream),
                 ('num_sms', int)),
         template=template_fusedmoe_gemm,
@@ -402,6 +404,7 @@ def m_grouped_gemm_perchannel_nt_fused(lhs_: Tuple[torch.Tensor],
     global includes_fusedmoe_gemm_with_perchannel_quant, template_fusedmoe_gemm_with_perchannel_quant
 
     num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = configs
+    topk = int(m_sum / num_token)
 
     # print(expert_ids_and_cumsum.shape, expert_ids_and_cumsum)
     # print(sorted_token_ids, sorted_token_ids.shape)
@@ -416,7 +419,7 @@ def m_grouped_gemm_perchannel_nt_fused(lhs_: Tuple[torch.Tensor],
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m_rows,
             expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks,
-            num_token, torch.cuda.current_stream(), int(num_sms))
+            num_token, topk, torch.cuda.current_stream(), int(num_sms))
 
     SrcT = "__hg_fp8_e4m3" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     kernel_type = 'Default'
@@ -438,6 +441,7 @@ def m_grouped_gemm_perchannel_nt_fused(lhs_: Tuple[torch.Tensor],
                 ('sorted_token_ids', torch.int32),
                 ('aligned_num_m_blocks', torch.int32),
                 ('m', int),
+                ('topk', int),
                 ('stream', torch.cuda.Stream),
                 ('num_sms', int)),
         template=template_fusedmoe_gemm_with_perchannel_quant,

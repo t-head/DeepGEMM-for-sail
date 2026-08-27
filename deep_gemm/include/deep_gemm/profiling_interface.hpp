@@ -120,6 +120,42 @@ void set_params(GemmType gemm_type, bool is_gemv,
     add_params("gpu", gpu);
 }
 
+void set_fused_moe_params(const std::string& data_type, const std::string& quant_type,
+                          int groups, int num_token, int topk,
+                          int n, int k, int* grouped_layout, hggcStream_t stream = 0) {
+    op_name_ = "GroupedFused";
+    add_argument("data_type");
+    add_argument("groups");
+    add_argument("num_token");
+    add_argument("topk");
+    add_argument("n");
+    add_argument("k");
+
+    add_params("data_type", data_type);
+    add_params("groups", groups);
+    add_params("num_token", num_token);
+    add_params("topk", topk);
+    add_params("n", n);
+    add_params("k", k);
+
+    stream_ = stream;
+    // Values consumed by distribution() for the per-expert token histogram
+    m_ = num_token;
+    group_ = groups;
+    grouped_layout_ = grouped_layout;
+    gemm_type_ = GemmType::GroupedFused;
+    is_gemv_ = false;
+    int gpu = -1;
+    hggcError_t result = hggcGetDevice(&gpu);
+    if (result != hggcSuccess) {
+        printf("get device id failed\n");
+        return;
+    }
+    device_id_ = gpu;
+    add_params("quant_type", quant_type);
+    add_params("gpu", gpu);
+}
+
 std::string format() {
     std::stringstream ss;
 

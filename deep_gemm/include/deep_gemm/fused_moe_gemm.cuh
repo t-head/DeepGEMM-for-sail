@@ -303,7 +303,7 @@ public:
 
     static void run(DstT* gmem_d, SrcT* gmem_a, SrcT* gmem_b,
                     int* m_rows, int* expert_ids_and_cumsum, int* sorted_token_ids,
-                    int* aligned_num_m_blocks, uint32_t shape_m,
+                    int* aligned_num_m_blocks, uint32_t shape_m, uint32_t topk,
                     hggcStream_t stream, int num_sms) {
 
         GemmArgs args;
@@ -318,12 +318,9 @@ public:
         args.shape_m = shape_m;
 
         DgProfParam dg_prof_params;
-        // check src type
-        std::string data_type = "bf16";
         if (ProfilingInterface::Instance().get_op_info()){
-            dg_prof_params.set_params(
-                GemmType::GroupedFused, false, data_type, kNumGroups, shape_m, SHAPE_N, SHAPE_K, 1,
-                m_rows, stream
+            dg_prof_params.set_fused_moe_params(
+                std::string("bf16"), std::string("non_quantized"), kNumGroups, shape_m, topk, SHAPE_N, SHAPE_K, m_rows, stream
             );
         }
         // dispatch and launch kernel

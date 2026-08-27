@@ -16,6 +16,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
 #include "../../../deep_gemm/include/deep_gemm/fused_gemm_common.cuh"
+#include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
 
 namespace deep_gemm {
 
@@ -113,7 +114,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
     // Unpack config
     auto [num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages] = configs;
 
-    // Compute launch parameters (block size written inline as in the .cuh run())
+    // Compute launch parameters
     int block_size = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(num_sms);
 
@@ -155,8 +156,21 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
         &blocks_per_cu, kernel, block_size, smem_size));
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
+    // Profiling instrumentation
+    hggcStream_t stream = (hggcStream_t)0;
+    int topk = m_sum / num_token;
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_fused_moe_params(
+            std::string("bf16"), std::string("non_quantized"),
+            (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), stream);
+    }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
     // Launch
     Bf16FusedMoeRuntime::launch(runtime, args);
+
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
     // Optional debug logging
     char* pEnv_params = std::getenv("show_log");
@@ -175,9 +189,8 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
 // ==========================================================================
 
 // FP8 blockwise-quant fused MoE GEMM runtime.
-// The kernel name embeds "fp8_deep_gemm" so the C++ JIT compiler applies the same
-// warp-interleaving LLVM flags as the Python path (whose kernel name
-// 'fusedmoe_gemm_fp8_fp8_bf16_nt' matches the 'gemm_fp8' pattern in compiler.py).
+// The kernel name embeds "fp8_deep_gemm" so the C++ JIT compiler selects the
+// warp-interleaving LLVM flags (compiler matches the 'gemm_fp8' name pattern).
 class Fp8BlkwiseFusedMoeRuntime final : public LaunchRuntime<Fp8BlkwiseFusedMoeRuntime> {
 public:
     struct LaunchInfo {
@@ -252,8 +265,7 @@ __global__ void {}(const QuantGemmArgs args) {{
 
 // A8W8 per-channel-quant fused MoE GEMM runtime (int8 or fp8 sources).
 // The kernel name deliberately avoids "fp8_deep_gemm"/"fp8_grouped_deep_gemm"/
-// "mqa_logits" substrings so the compiler flags match the Python path
-// ('fusedmoe_gemm_a8w8_nt_*' never matches the 'gemm_fp8' warp-interleaving pattern).
+// "mqa_logits" substrings so it never matches the 'gemm_fp8' warp-interleaving pattern.
 class A8W8PerchannelFusedMoeRuntime final : public LaunchRuntime<A8W8PerchannelFusedMoeRuntime> {
 public:
     struct LaunchInfo {
@@ -326,7 +338,7 @@ __global__ void {}(const QuantGemmArgs args) {{
 };
 
 // --------------------------------------------------------------------------
-// Shared per-channel fused MoE GEMM (mirrors m_grouped_gemm_perchannel_nt_fused)
+// Shared per-channel fused MoE GEMM
 // --------------------------------------------------------------------------
 static void m_grouped_gemm_perchannel_nt_fused_impl(
     const torch::Tensor& lhs,
@@ -350,16 +362,16 @@ static void m_grouped_gemm_perchannel_nt_fused_impl(
     // Unpack config
     auto [num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages] = configs;
 
-    // Compute launch parameters (block size written inline as in the .cuh run())
+    // Compute launch parameters
     int block_size = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(num_sms);
 
     // Smem: gemm_smem_total_size(elem 1, stages, BM, BN, BK) — sizeof(SrcT) == 1;
-    // the per-channel scales reuse the last-stage sA/sB smem, exactly as in the .cuh run().
+    // the per-channel scales reuse the last-stage sA/sB smem.
     int smem_size = static_cast<int>(
         gemm_smem_total_size(1, num_stages, block_m, block_n, block_k));
 
-    // Source type: fp8 or int8 (mirrors the Python SrcT selection)
+    // Source type: fp8 or int8
     const bool is_fp8 = (lhs.scalar_type() == torch::kFloat8_e4m3fn);
     const char* src_t = is_fp8 ? "__hg_fp8_e4m3" : "int8_t";
     const char* type_tag = is_fp8 ? "fp8" : "int8";
@@ -396,16 +408,29 @@ static void m_grouped_gemm_perchannel_nt_fused_impl(
     const auto& runtime = compiler->build(kernel_name, code, block_size, smem_size);
     const auto& kernel = runtime->kernel;
 
-    // Query occupancy and set grid (mirrors the .cuh run(): num_sms * max_blocks_per_cu)
+    // Query occupancy and set grid
     int blocks_per_cu = 0;
     DG_HGGC_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_cu, kernel, block_size, smem_size));
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
+    // Profiling instrumentation
+    hggcStream_t stream = (hggcStream_t)0;
+    int topk = m_sum / num_token;
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_fused_moe_params(
+            std::string(type_tag), std::string("channel"),
+            (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), stream);
+    }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
     // Launch
     A8W8PerchannelFusedMoeRuntime::launch(runtime, args);
 
-    // Optional debug logging (mirrors the .cuh run() show_log printout)
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+    // Optional debug logging
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
         printf("[C++ JIT FusedMoeGemm-Perchannel-%s:]\n", type_tag);
@@ -418,9 +443,9 @@ static void m_grouped_gemm_perchannel_nt_fused_impl(
 }
 
 // --------------------------------------------------------------------------
-// FP8 blockwise fused MoE GEMM — pure blockwise path (mirrors the Python
-// entry's blockwise branch; the per-channel routing, the m_sum == 0 exit, the
-// topk computation and the col-major scales transform live in the API layer)
+// FP8 blockwise fused MoE GEMM — pure blockwise path. The per-channel routing,
+// the m_sum == 0 exit, the topk computation and the col-major scales transform
+// live in the API layer.
 // --------------------------------------------------------------------------
 static void m_grouped_gemm_blkwise_nt_fused_impl(
     const torch::Tensor& lhs,
@@ -442,15 +467,14 @@ static void m_grouped_gemm_blkwise_nt_fused_impl(
     // Unpack config
     auto [num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages] = configs;
 
-    // Compute launch parameters (block size written inline as in the .cuh run())
+    // Compute launch parameters
     int block_size = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(num_sms);
 
-    // Stage truncation (mirrors the .cuh run():
-    //   Stages = SHAPE_K < BLOCK_K * kNumStages ? SHAPE_K / BLOCK_K : kNumStages)
+    // Stage truncation: Stages = SHAPE_K < BLOCK_K * kNumStages ? SHAPE_K / BLOCK_K : kNumStages
     int stages = (k < block_k * num_stages) ? (k / block_k) : num_stages;
 
-    // N_EXPAND dispatch (mirrors the .cuh run() wave computation)
+    // N_EXPAND dispatch (wave computation)
     int n_expand_sel = 1;
     if (k <= 512 && block_k == 128 && k % block_k == 0) {
         int expected_m = ceil_div(num_token * topk, num_groups);
@@ -472,7 +496,7 @@ static void m_grouped_gemm_blkwise_nt_fused_impl(
     // Static kernel name — the truncated stages and the final N_EXPAND are already
     // baked into the generated code (hence into the JIT cache-key digest). Still
     // contains the "fp8_deep_gemm" substring so the C++ JIT compiler selects the
-    // same warp-interleaving flags as the Python path (whose name matches 'gemm_fp8').
+    // warp-interleaving flags (compiler matches the 'gemm_fp8' name pattern).
     const std::string kernel_name = "fp8_deep_gemm_fused_moe_blkwise";
 
     // Build args (designated initializers cannot name base-class members, so
@@ -501,16 +525,28 @@ static void m_grouped_gemm_blkwise_nt_fused_impl(
     const auto& runtime = compiler->build(kernel_name, code, block_size, smem_size);
     const auto& kernel = runtime->kernel;
 
-    // Query occupancy and set grid (mirrors the .cuh run(): num_sms * max_blocks_per_cu)
+    // Query occupancy and set grid
     int blocks_per_cu = 0;
     DG_HGGC_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_cu, kernel, block_size, smem_size));
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
+    // Profiling instrumentation
+    hggcStream_t stream = (hggcStream_t)0;
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_fused_moe_params(
+            std::string("fp8"), std::string("block"),
+            (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), stream);
+    }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
     // Launch
     Fp8BlkwiseFusedMoeRuntime::launch(runtime, args);
 
-    // Optional debug logging (mirrors the .cuh run() show_log printout)
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+    // Optional debug logging
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
         printf("[C++ JIT FusedMoeGemmWithBlkwiseQuant-FP8:]\n");
