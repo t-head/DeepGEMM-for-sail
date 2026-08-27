@@ -980,6 +980,7 @@ def parse_deepgemm_string_re(s):
             torch.bfloat16: 'non_quantized',
             torch.int8 : 'channel',
             torch.float8_e4m3fn: 'block',
+            torch.uint8: 'group',
             'w4a16': 'group',
             'w4fa16': 'group',
             'w4fa16_s16': 'group',

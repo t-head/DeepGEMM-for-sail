@@ -144,6 +144,7 @@ public:
     const int* expert_ids_and_cumsum;
     const int* sorted_token_ids;
     const int* aligned_num_m_blocks;
+    int topk;
   };
   using Arguments = cute::conditional_t<Fused, FusedArguments, NormalArguments>;
 

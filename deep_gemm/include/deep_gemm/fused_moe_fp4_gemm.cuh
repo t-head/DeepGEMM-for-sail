@@ -493,8 +493,8 @@ public:
         if (ProfilingInterface::Instance().get_op_info()){
             // check src type
             std::string data_type = "fp4";
-            dg_prof_params.set_params(
-                GemmType::GroupedFused, false, data_type, kNumGroups, shape_m, SHAPE_N, SHAPE_K, 1,
+            dg_prof_params.set_fused_moe_params(
+                data_type, std::string("group"), kNumGroups, shape_m, topk, SHAPE_N, SHAPE_K,
                 m_rows, stream
             );
         }

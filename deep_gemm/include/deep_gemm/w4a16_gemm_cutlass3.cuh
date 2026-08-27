@@ -165,6 +165,7 @@ public:
     const int* expert_ids_and_cumsum;
     const int* sorted_token_ids;
     const int* aligned_num_m_blocks;
+    int topk;
   };
   using Arguments = cute::conditional_t<Fused, FusedArguments, NormalArguments>;
 
@@ -806,13 +807,19 @@ public:
         std::string dtype_name = UseMmaKernel ? std::string("w4fa16_mma") :
             (cute::is_same_v<ElementB, cutlass::int4b_t> ? std::string("w4a16") :
             (Kernel::E8M0_scale ? std::string("w4fa16") : std::string("w4fa16_s16")));
-        dg_prof_params.set_params(
-            kGemmType, false,
-            dtype_name,
-            kNumGroups, shape_m, ShapeN, ShapeK, expected_m,
-            m_rows, stream
-        );
-        dg_prof_params.add_params(std::string("quant_type"), std::string("group"));
+        if constexpr(kGemmType == GemmType::GroupedFused) {
+            dg_prof_params.set_fused_moe_params(
+                dtype_name, std::string("group"), kNumGroups, shape_m, args.topk,
+                ShapeN, ShapeK, m_rows, stream);
+        } else {
+            dg_prof_params.set_params(
+                kGemmType, false,
+                dtype_name,
+                kNumGroups, shape_m, ShapeN, ShapeK, expected_m,
+                m_rows, stream
+            );
+            dg_prof_params.add_params(std::string("quant_type"), std::string("group"));
+        }
         dg_prof_params.add_params(std::string("group_size"), kGroupSize);
       }
 

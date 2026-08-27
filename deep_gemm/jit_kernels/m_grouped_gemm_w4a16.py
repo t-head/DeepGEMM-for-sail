@@ -98,7 +98,7 @@ constexpr auto N_EXPAND = {N_EXPAND};
 using gemm_t = W4A16Gemm<ElementB, ElementScale, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kGroupSize, N_EXPAND>;
 gemm_t::run((const ElementA*) lhs, rhs, (const ElementScale*) rhs_scales, (ElementA*) out,
             m, expected_m, stream, num_sms,
-            m_rows, {expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks});
+            m_rows, {expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, topk});
 """
 
 def w4a16_get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type, w4a16_type):
@@ -261,9 +261,9 @@ def m_grouped_gemm_w4a16_common(w4a16_type: W4A16Type, gemm_type: GemmType, expe
             jit_include_dir='actlize_v1.0.0'
         )
     elif gemm_type == GemmType.GroupedFused:
-        expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks = scheduler_extra
+        expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, topk = scheduler_extra
         args = (lhs, rhs, rhs_scales, out, m, expected_m, torch.cuda.current_stream(), num_sms,
-                m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks)
+                m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, topk)
         runtime = jit_tuner.compile_and_tune(
             name=jit_name,
             keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
@@ -275,7 +275,8 @@ def m_grouped_gemm_w4a16_common(w4a16_type: W4A16Type, gemm_type: GemmType, expe
             arg_defs=(('lhs', torch.bfloat16), ('rhs', rhs.dtype), ('rhs_scales', scale_dtype), ('out', torch.bfloat16),
                     ('m', int), ('expected_m', int), ('stream', torch.cuda.Stream), ('num_sms', int),
                     ('m_rows', torch.int32),
-                    ('expert_ids_and_cumsum', torch.int32), ('sorted_token_ids', torch.int32), ('aligned_num_m_blocks', torch.int32)),
+                    ('expert_ids_and_cumsum', torch.int32), ('sorted_token_ids', torch.int32), ('aligned_num_m_blocks', torch.int32),
+                    ('topk', int)),
             template=w4a16_fused_template,
             args=args,
             jit_include_dir='actlize_v1.0.0'
@@ -302,7 +303,7 @@ def m_grouped_gemm_w4a16_fused(lhs: torch.Tensor,
     topk = m_sum // num_token
     assert num_groups >= topk
     expected_m = ceil_div(m_sum, num_groups)
-    m_grouped_gemm_w4a16_common(w4a16_type, GemmType.GroupedFused, expected_m, lhs, rhs_, out, configs, m_rows, (expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks))
+    m_grouped_gemm_w4a16_common(w4a16_type, GemmType.GroupedFused, expected_m, lhs, rhs_, out, configs, m_rows, (expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, topk))
 
 
 def m_grouped_gemm_w4a16_masked(lhs: torch.Tensor,
