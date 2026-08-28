@@ -372,8 +372,11 @@ public:
             copy(smem_tiled_copy_SFA, tCsSFA(_, _, k_block, kv_stage_idx), tCrSFA_copy_view(_, _, k_block));
         };
 
-        auto load_kv_s2r_mblock = [&](int k_block, uint32_t kv_stage_idx, int m_block) {
+        auto load_kv_a_s2r_mblock = [&](int k_block, uint32_t kv_stage_idx, int m_block) {
             copy(smem_tiled_copy_A, tCsA(_, m_block, k_block, kv_stage_idx), tCrA_copy_view(_, m_block, k_block));
+        };
+
+        auto load_kv_sfa_s2r_mblock = [&](int k_block, uint32_t kv_stage_idx, int m_block) {
             copy(smem_tiled_copy_SFA, tCsSFA(_, m_block, k_block, kv_stage_idx), tCrSFA_copy_view(_, m_block, k_block));
         };
 
@@ -504,10 +507,14 @@ public:
                 } else { // Interleaved mma and epilogue
                     constexpr int m_group = M_BLOCK / size<1>(tCrSFA);
                     constexpr int n_group = N_BLOCK / size<1>(tCrSFB);
+                    constexpr bool kReusePackedSFA = M_BLOCK == 4 and size<1>(tCrSFA) == 1;
                     for_each(make_int_sequence<M_BLOCK>{}, [&](auto m_block) {
                         if constexpr(m_block > 0) deep_gemm::warp_interleave_sync<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
                         for_each(make_int_sequence<K_BLOCK>{}, [&](auto k_block) {
-                            load_kv_s2r_mblock(k_block, kv_stage_idx, m_block);
+                            load_kv_a_s2r_mblock(k_block, kv_stage_idx, m_block);
+                            if constexpr (!kReusePackedSFA or m_block == 0) {
+                                load_kv_sfa_s2r_mblock(k_block, kv_stage_idx, m_block);
+                            }
                             for_each(make_int_sequence<N_BLOCK>{}, [&](auto n_block) {
                                 Tensor s = make_tensor<uint32_t>(Int<4>{});
                                 MMA_Atom<MmaInst> mma_atom;
