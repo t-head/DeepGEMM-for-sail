@@ -15,6 +15,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
 #include "../heuristics/common_mqa.hpp"
+#include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
 
 namespace deep_gemm {
 
@@ -153,10 +154,11 @@ template <typename StrideKType, typename ArgumentsT>
 static void launch_mqa_logits(const std::string& include_header, const std::string& kernel_class,
                               const deep_gemm_mqa_common::MqaLogitsConfig& config, const std::string& element_qk,
                               const std::string& element_acc, const std::string& element_logits,
-                              const std::string& element_weights, int num_heads, int head_dim, bool is_compressed,
-                              int smem_size, int num_threads, const std::string& kernel_name,
-                              const ArgumentsT& kernel_params) {
+                              const std::string& element_weights, const std::string& dtype_tag, int num_heads,
+                              int head_dim, bool is_compressed, int smem_size, int num_threads,
+                              const std::string& kernel_name, const ArgumentsT& kernel_params) {
     using Runtime = MqaLogitsRuntime<StrideKType, ArgumentsT>;
+    const bool is_fp4 = dtype_tag == "fp4";
     const int num_sms = get_num_sms();
     const dim3 block(num_threads, 1, 1);
     const dim3 grid(num_sms, 1, 1);
@@ -179,19 +181,53 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
     hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, runtime->kernel, num_threads, smem_size);
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
-    Runtime::launch(runtime, args);
-
+    // Reported before the launch, as `Attention::run` does, so the configuration is on screen even
+    // when the launch itself fails
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
-        printf("[mqa_logits:]\n");
-        printf("kNumHeads:%d, kHeadDim:%d, seq_len_q:%u, seq_len_k:%u\n", num_heads, head_dim,
-               kernel_params.seq_len_q, kernel_params.seq_len_k);
-        printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", config.block_qh,
-               config.block_kv, config.warp_qh, config.warp_kv, config.num_q_stages, config.num_kv_stages);
-        printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%u, num_threads:%d\n", num_sms, blocks_per_cu,
-               args.launch_args.grid_dim.x, num_threads);
-        printf("smem_size:%d, compressed_logits:%s\n", smem_size, is_compressed ? "true" : "false");
+
+        int num_regs = 0, local_size = 0;
+        hgFuncGetAttribute(&num_regs, HG_FUNC_ATTRIBUTE_NUM_REGS, runtime->kernel);
+        hgFuncGetAttribute(&local_size, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, runtime->kernel);
+
+        if (is_fp4) {
+            printf("[mqa_logits_fp4:]\n");
+            printf("kNumHeads:%d, kHeadDim:%d(packed), BLOCK_QH:%d, BLOCK_KV:%d\n", num_heads, head_dim,
+                   config.block_qh, config.block_kv);
+            printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", config.block_kv,
+                   config.block_qh, config.warp_kv, config.warp_qh, config.num_q_stages, config.num_kv_stages);
+            printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d, num_threads:%d\n", num_sms, blocks_per_cu,
+                   static_cast<int>(args.launch_args.grid_dim.x), num_threads);
+        } else {
+            printf("[mqa_logits:]\n");
+            printf("kNumHeads:%d, kHeadDim:%d, seq_len_q:%u, seq_len_k:%u, stride_k:%llu\n", num_heads, head_dim,
+                   static_cast<unsigned>(kernel_params.seq_len_q), static_cast<unsigned>(kernel_params.seq_len_k),
+                   static_cast<unsigned long long>(kernel_params.stride_k));
+            printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", config.block_qh,
+                   config.block_kv, config.warp_qh, config.warp_kv, config.num_q_stages, config.num_kv_stages);
+            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d, num_threads:%d\n", num_sms, blocks_per_cu,
+                   static_cast<int>(args.launch_args.grid_dim.x), num_threads);
+        }
+        printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, num_regs, local_size);
+        printf("compressed_logits:%s, ", is_compressed ? "true" : "false");
+        printf("weights_bf16:%s\n", element_weights == "__ppu_bfloat16" ? "true" : "false");
     }
+
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_mqa_logits_params(dtype_tag, static_cast<int>(kernel_params.seq_len_q),
+                                             static_cast<int>(kernel_params.seq_len_k), num_heads,
+                                             is_fp4 ? head_dim * 2 : head_dim, (hggcStream_t)0);
+        if (element_logits == "__ppu_bfloat16")
+            dg_prof_params.add_params("logits_dtype", std::string("bf16"));
+        if (element_weights == "__ppu_bfloat16")
+            dg_prof_params.add_params("weights_dtype", std::string("bf16"));
+    }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
+    Runtime::launch(runtime, args);
+
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
 }
 
 // Host entry for the non-paged MQA logits kernels. Picks the tile config, allocates the padded
@@ -258,14 +294,14 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
         if (stride_k_type == "uint32_t") {
             launch_mqa_logits<uint32_t>(
                 "fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
-                element_weights, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
+                element_weights, dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
                 MqaLogitsFP4Arguments<uint32_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights.data_ptr(),
                                                 ks_ptr, ke_ptr, logits.data_ptr(), seq_len_q, seq_len_k,
                                                 static_cast<uint32_t>(aligned_seq_len_kv)});
         } else {
             launch_mqa_logits<uint64_t>(
                 "fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
-                element_weights, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
+                element_weights, dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
                 MqaLogitsFP4Arguments<uint64_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights.data_ptr(),
                                                 ks_ptr, ke_ptr, logits.data_ptr(), seq_len_q, seq_len_k,
                                                 static_cast<uint64_t>(aligned_seq_len_kv)});
@@ -273,7 +309,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     } else if (stride_k_type == "uint32_t") {
         launch_mqa_logits<uint32_t>(
             "ppu_mqa_logits.cuh", "PPUMqaLogits", config, element_qk, element_acc, element_logits, element_weights,
-            num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
+            dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
             MqaLogitsArguments<uint32_t>{q.data_ptr(), k.data_ptr(), k_scales_ptr, weights.data_ptr(),
                                          reinterpret_cast<uint32_t*>(cu_seq_len_k_start.data_ptr()),
                                          reinterpret_cast<uint32_t*>(cu_seq_len_k_end.data_ptr()), logits.data_ptr(),
@@ -282,7 +318,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     } else {
         launch_mqa_logits<uint64_t>(
             "ppu_mqa_logits.cuh", "PPUMqaLogits", config, element_qk, element_acc, element_logits, element_weights,
-            num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
+            dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
             MqaLogitsArguments<uint64_t>{q.data_ptr(), k.data_ptr(), k_scales_ptr, weights.data_ptr(),
                                          reinterpret_cast<uint32_t*>(cu_seq_len_k_start.data_ptr()),
                                          reinterpret_cast<uint32_t*>(cu_seq_len_k_end.data_ptr()), logits.data_ptr(),

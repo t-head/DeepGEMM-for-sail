@@ -14,6 +14,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
 #include "../heuristics/common_mqa.hpp"
+#include "../../../deep_gemm/include/deep_gemm/profiling_interface.hpp"
 
 namespace deep_gemm {
 
@@ -193,10 +194,11 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
                                     const std::string& extra_template_args,
                                     const deep_gemm_mqa_common::PagedTile& tile, const std::string& element_qk,
                                     const std::string& element_acc, const std::string& element_logits,
-                                    const std::string& element_weights, int next_n, int num_heads, int head_dim,
-                                    int block_kv, int smem_size, int num_threads, int num_blocks,
-                                    const std::string& kernel_name, const ArgumentsT& kernel_params) {
+                                    const std::string& element_weights, const std::string& dtype_tag, int next_n,
+                                    int num_heads, int head_dim, int block_kv, int smem_size, int num_threads,
+                                    int num_blocks, const std::string& kernel_name, const ArgumentsT& kernel_params) {
     using Runtime = PagedMqaLogitsRuntime<ArgumentsT>;
+    const bool is_fp4 = dtype_tag == "fp4";
     const dim3 block(num_threads, 1, 1);
     const dim3 grid(num_blocks, 1, 1);
 
@@ -210,17 +212,49 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
 
     const auto& code = Runtime::generate(args);
     const auto& runtime = compiler->build(kernel_name, code, num_threads, smem_size);
-    Runtime::launch(runtime, args);
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
-        printf("[paged_mqa_logits:]\n");
-        printf("kNumHeads:%d, kHeadDim:%d, kNextN:%d, BLOCK_KV:%d, SPLIT_KV:%d\n", num_heads, head_dim, next_n,
-               block_kv, tile.split_kv);
-        printf("WARP_KV:%d, kNumQStages:%d, kNumKVStages:%d, split_mblock:%s\n", tile.warp_kv, tile.stage_q,
-               tile.stage_k, tile.split_mblock ? "true" : "false");
-        printf("threadblock_count:%d, num_threads:%d, smem_size:%d\n", num_blocks, num_threads, smem_size);
+        const int num_sms = get_num_sms();
+        int blocks_per_cu = 0;
+        hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, runtime->kernel, num_threads, smem_size);
+        int num_regs = 0, local_size = 0;
+        hgFuncGetAttribute(&num_regs, HG_FUNC_ATTRIBUTE_NUM_REGS, runtime->kernel);
+        hgFuncGetAttribute(&local_size, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, runtime->kernel);
+
+        printf("[paged_mqa_logits%s:]\n", is_fp4 ? "_fp4" : "");
+        printf("kNumHeads:%d, kHeadDim:%d%s, kNextN:%d, BLOCK_KV:%d, SPLIT_KV:%d\n", num_heads, head_dim,
+               is_fp4 ? "(packed)" : "", next_n, block_kv, tile.split_kv);
+        // Mirrors the kernel's own `BLOCK_M = BLOCK_KV`, `BLOCK_N = kNextN * kNumHeads`,
+        // `WARP_M = WARP_KV`, `WARP_N = kNumHeads`
+        printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", block_kv,
+               next_n * num_heads, tile.warp_kv, num_heads, tile.stage_q, tile.stage_k);
+        printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d, num_threads:%d\n", num_sms, blocks_per_cu,
+               num_blocks, num_threads);
+        printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, num_regs, local_size);
+        printf("weights_bf16:%s\n", element_weights == "__ppu_bfloat16" ? "true" : "false");
+        if (num_sms * blocks_per_cu != num_blocks) {
+            printf("Warning: num_blocks(%d) should equal to num_sms(%d) * max_blocks_per_cu(%d) = %d\n", num_blocks,
+                   num_sms, blocks_per_cu, num_sms * blocks_per_cu);
+        }
     }
+
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_paged_mqa_logits_params(
+            dtype_tag, static_cast<int>(kernel_params.batch_size), next_n, num_heads,
+            is_fp4 ? head_dim * 2 : head_dim,
+            reinterpret_cast<int*>(const_cast<uint32_t*>(kernel_params.context_lens)), (hggcStream_t)0);
+        if (element_logits == "__ppu_bfloat16")
+            dg_prof_params.add_params("logits_dtype", std::string("bf16"));
+        if (element_weights == "__ppu_bfloat16")
+            dg_prof_params.add_params("weights_dtype", std::string("bf16"));
+    }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
+    Runtime::launch(runtime, args);
+
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
 }
 
 // Host entry for the `schedule_metadata` table. `metadata_extra` = (next_n, num_heads, head_dim,
@@ -333,8 +367,8 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     if (is_fp4) {
         launch_paged_mqa_logits(
             "fp4_paged_mqa_logits.cuh", "PPUPagedMqaLogitsFP4", tile.split_mblock ? ", true" : ", false", tile,
-            element_qk, element_acc, element_logits, element_weights, next_n, num_heads, head_dim, block_kv, smem_size,
-            num_threads, num_blocks, kernel_name,
+            element_qk, element_acc, element_logits, element_weights, dtype_tag, next_n, num_heads, head_dim, block_kv,
+            smem_size, num_threads, num_blocks, kernel_name,
             PagedMqaLogitsFP4Arguments{q.data_ptr(), reinterpret_cast<const uint32_t*>(q_sf->data_ptr()),
                                        k.data_ptr(), reinterpret_cast<const uint32_t*>(k_scales.data_ptr()),
                                        weights.data_ptr(), static_cast<uint32_t>(batch_size),
@@ -345,7 +379,8 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     } else {
         launch_paged_mqa_logits(
             "ppu_paged_mqa_logits.cuh", "PPUPagedMqaLogits", "", tile, element_qk, element_acc, element_logits,
-            element_weights, next_n, num_heads, head_dim, block_kv, smem_size, num_threads, num_blocks, kernel_name,
+            element_weights, dtype_tag, next_n, num_heads, head_dim, block_kv, smem_size, num_threads, num_blocks,
+            kernel_name,
             PagedMqaLogitsArguments{q.data_ptr(), k.data_ptr(),
                                     k_scales.defined() ? k_scales.data_ptr<float>() : nullptr, weights.data_ptr(),
                                     static_cast<uint32_t>(batch_size),
