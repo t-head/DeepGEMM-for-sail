@@ -51,6 +51,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("init", [&](const std::string& library_root_path, const std::string& sdk_home_path) {
         Compiler::prepare_init(library_root_path, sdk_home_path);
         KernelRuntime::prepare_init(sdk_home_path);
+        IncludeParser::prepare_init(library_root_path);
     });
 }
 

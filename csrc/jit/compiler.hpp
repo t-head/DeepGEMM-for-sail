@@ -3,6 +3,7 @@
 #include <hggc_runtime_api.h>
 #include <hggc.h>
 #include <chrono>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <hgrtc.h>
@@ -17,6 +18,7 @@
 #include "../utils/utils.hpp"
 #include "cache.hpp"
 #include "device_runtime.hpp"
+#include "include_parser.hpp"
 #include "acarch.h"
 
 namespace deep_gemm {
@@ -32,22 +34,7 @@ public:
     static std::filesystem::path library_root_path;
     static std::filesystem::path library_include_path;
     static std::filesystem::path sdk_home;
-    static std::string library_version;
     mutable int blocks_per_cu = 1;
-
-    static std::string get_library_version() {
-        std::vector<char> buffer;
-        for (const auto& f: collect_files(library_include_path / "deep_gemm")) {
-            std::ifstream in(f, std::ios::binary);
-            DG_HOST_ASSERT(in.is_open());
-
-            // Append into the buffer
-            buffer.insert(buffer.end(),
-                          std::istreambuf_iterator<char>(in),
-                          std::istreambuf_iterator<char>());
-        }
-        return get_hex_digest(buffer);
-    }
 
     // Single source of truth for the actlize include search paths, shared by the offline (HGCC)
     // and runtime (HGRTC) compilers. The two libraries have colliding header names, so exactly
@@ -64,7 +51,6 @@ public:
             paths.push_back(inc + "/actlize_v1.0.0");
             paths.push_back(inc);   // Resolve <deep_gemm/...> angle-bracket includes
         }
-        paths.push_back(inc + "/deep_gemm");
         return paths;
     }
 
@@ -73,7 +59,6 @@ public:
         Compiler::library_root_path = library_root_path;
         Compiler::library_include_path = Compiler::library_root_path / "include";
         Compiler::sdk_home = sdk_home_path;
-        Compiler::library_version = get_library_version();
     }
 
     std::string signature, flags;
@@ -84,7 +69,6 @@ public:
         DG_HOST_ASSERT(not library_root_path.empty());
         DG_HOST_ASSERT(not library_include_path.empty());
         DG_HOST_ASSERT(not sdk_home.empty());
-        DG_HOST_ASSERT(not library_version.empty());
 
         // Cache settings
         cache_dir_path = std::filesystem::path(get_env<std::string>("HOME")) / ".deep_gemm";
@@ -109,49 +93,74 @@ public:
         return make_dirs(cache_dir_path / "tmp");
     }
 
-    std::filesystem::path get_tmp_file_path() const {
-        return make_tmp_dir() / get_uuid();
+    static void fsync_path(const std::filesystem::path& path) {
+        const auto fd = ::open(path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            ::fsync(fd);
+            ::close(fd);
+        }
     }
 
-    int32_t get_max_block_per_cu() {
-        return Compiler::blocks_per_cu;
+    // Recursively fsync a directory: files and subdirectories first (bottom-up), then the directory itself
+    // NOTES: ensures data and directory entries are visible on other nodes in distributed filesystems
+    static void fsync_dir(const std::filesystem::path& dir_path) { // NOLINT(*-no-recursion)
+        for (const auto& entry: std::filesystem::directory_iterator(dir_path)) {
+            if (entry.is_directory())
+                fsync_dir(entry.path());
+            else if (entry.is_regular_file())
+                fsync_path(entry.path());
+        }
+        fsync_path(dir_path);
     }
 
     void put(const std::filesystem::path& path, const std::string& data) const {
-        const auto tmp_file_path = get_tmp_file_path();
-
-        // Write into the temporary file
-        std::ofstream out(tmp_file_path, std::ios::binary);
+        std::ofstream out(path, std::ios::binary);
         DG_HOST_ASSERT(out.write(data.data(), data.size()));
         out.close();
 
-        // Atomically replace
-        std::filesystem::rename(tmp_file_path, path);
+        // NOTES: fsync to ensure the data is visible to other processes (e.g., NVCC)
+        // on distributed filesystems, where `close()` alone does not guarantee persistence
+        fsync_path(path);
     }
 
     std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code, int32_t thread_num = 0, int32_t smem_size = 0, ActlizeLib lib = ActlizeLib::kV100) const {
         // NOTE: `lib` participates in the signature because the include paths and tuning flags
         // it selects are no longer part of `flags` (they are resolved per kernel in `compile`).
-        const auto kernel_signature = fmt::format("{}$${}$${}$${}$${}$${}", name, library_version, signature, flags, static_cast<int>(lib), code);
+        const auto kernel_signature = fmt::format("{}$${}$${}$${}$${}", name, signature, flags, static_cast<int>(lib), code);
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache
         if (const auto& runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
             return runtime;
 
-        // Create the kernel directory
-        make_dirs(dir_path);
+        // Compile into a temporary directory, then atomically rename the whole directory
+        // NOTES: renaming a directory is atomic on both local and distributed filesystems,
+        // avoiding the stale inode issue that occurs when renaming individual files
+        const auto tmp_dir_path = make_tmp_dir() / get_uuid();
+        make_dirs(tmp_dir_path);
 
         // Compile into a temporary HGBIN
-        const auto tmp_hgbin_path = get_tmp_file_path();
-        compile(code, dir_path, tmp_hgbin_path, name, thread_num, smem_size, lib);
+        const auto tmp_hgbin_path = tmp_dir_path / "kernel.hgbin";
+        compile(code, tmp_dir_path, tmp_hgbin_path, name, thread_num, smem_size, lib);
 
-        // Replace into the cache directory
-        make_dirs(dir_path);
-        std::filesystem::rename(tmp_hgbin_path, dir_path / "kernel.hgbin");
+        // Fsync before rename to ensure visibility on distributed filesystems
+        fsync_dir(tmp_dir_path);
+
+        // Atomically rename the temporary directory to the final cache path
+        // NOTES: if another rank already created dir_path, rename will fail — that's fine
+        make_dirs(dir_path.parent_path());
+        std::error_code error_code;
+        std::filesystem::rename(tmp_dir_path, dir_path, error_code);
+        if (error_code) {
+            // Another rank beat us, then clean up our dir and use the existing one
+            // NOTES: avoid `std::filesystem::remove_all` here — it can segfault on
+            // distributed filesystems, when concurrent processes operate
+            // on the same parent directory, causing stale directory entries
+            safe_remove_all(tmp_dir_path);
+        }
 
         // Put into the runtime cache
-        const auto& runtime = kernel_runtime_cache->get(dir_path);
+        const auto runtime = kernel_runtime_cache->get(dir_path);
         DG_HOST_ASSERT(runtime != nullptr);
         return runtime;
     }
@@ -162,7 +171,6 @@ public:
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_root_path);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_include_path);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, sdk_home);
-DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_version);
 
 class HGCCCompiler final: public Compiler {
     std::filesystem::path hgcc_path;
@@ -174,8 +182,8 @@ class HGCCCompiler final: public Compiler {
         DG_HOST_ASSERT(std::filesystem::exists(hgcc_path) and "hgcc compiler not found");
 
         // Call the version command
-        const auto& command = std::string(hgcc_path) + " --version";
-        const auto& [return_code, output] = call_external_command(command);
+        const auto command = std::string(hgcc_path) + " --version";
+        const auto [return_code, output] = call_external_command(command);
         DG_HOST_ASSERT(return_code == 0 and "Failed to query hgcc --version");
 
         std::smatch match;
@@ -234,7 +242,7 @@ public:
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, int32_t thread_num, int32_t smem_size, ActlizeLib lib) const override {
         // Write the code into the cache directory
-        const auto& code_path = dir_path / "kernel.cu";
+        const auto code_path = dir_path / "kernel.cu";
         put(code_path, code);
 
         // Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use -Xllvm flags,
@@ -271,10 +279,14 @@ public:
             include_flags += fmt::format("-I{} ", path);
 
         // Compile
-        const auto& command = fmt::format("{} {} -o {} {}{}{}", hgcc_path.c_str(), code_path.c_str(), hgbin_path.c_str(), include_flags, flags, per_kernel_flags);
+        // Avoid cwd files shadowing C++ standard library headers
+        const auto compile_dir = make_tmp_dir();
+        const auto command = fmt::format("cd {} && {} {} -o {} {}{}{}",
+            compile_dir.c_str(), hgcc_path.c_str(), code_path.c_str(), hgbin_path.c_str(),
+            include_flags, flags, per_kernel_flags);
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running HGCC command: %s\n", command.c_str());
-        const auto& [return_code, output] = call_external_command(command);
+        const auto [return_code, output] = call_external_command(command);
         if (return_code != 0) {
             printf("HGCC compilation failed: %s\n", output.c_str());
             DG_HOST_ASSERT(false and "HGCC compilation failed");
@@ -455,23 +467,6 @@ public:
         put(hgbin_path, hgbin_data);
         // Cleanup
         DG_HGRTC_CHECK(hgrtcDestroyProgram(&program));
-
-        HGmodule module;
-        hgModuleLoadData(&module, hgbin_data.data());
-
-        HGfunction kernel_func;
-        hgModuleGetFunction(&kernel_func, module, name.c_str());
-
-        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_cu,
-        kernel_func,
-        thread_num,
-        smem_size
-        );
-
-        if (result != HGGC_SUCCESS) {
-            printf("Get Max active blocks per SM failed!\n");
-        }
     }
 };
 

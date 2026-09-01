@@ -13,7 +13,6 @@
 // #include "layout.hpp"
 #include "../jit_kernels/impls/fp4_gemm.hpp"
 #include "../jit_kernels/impls/m_grouped_fp4_gemm.hpp"
-#include "../jit_kernels/impls/tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/fused_moe_gemm.hpp"
 #include "../jit_kernels/impls/moe_align.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a16_gemm.hpp"
@@ -1068,37 +1067,6 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
     return result;
 }
 
-void tf32_hc_prenorm_gemm_nt(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
-                             const torch::Tensor& sqr_sum, std::optional<int> num_splits = std::nullopt,
-                             std::optional<ConfigTuple> configs = std::nullopt) {
-    const auto& [m, k] = get_shape<2>(a);
-    const auto& [n, k_] = get_shape<2>(b);
-
-    DG_HOST_ASSERT(k == k_);
-    DG_HOST_ASSERT(n > 0 and k > 0);
-    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(b.scalar_type() == torch::kFloat32);
-    TORCH_CHECK(a.is_contiguous(), "lhs must be contiguous");
-    TORCH_CHECK(b.is_contiguous(), "rhs must be contiguous");
-
-    // NOTES: the split-K partials are reduced in place, so `d` and `sqr_sum` always hold a single copy
-    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT((num_splits.has_value() ? (d.sizes() == std::vector<int64_t>{1, m, n})
-                                           : (d.sizes() == std::vector<int64_t>{m, n})));
-    TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
-
-    DG_HOST_ASSERT(sqr_sum.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT((num_splits.has_value() ? (sqr_sum.sizes() == std::vector<int64_t>{1, m})
-                                           : (sqr_sum.sizes() == std::vector<int64_t>{m})));
-    TORCH_CHECK(sqr_sum.is_contiguous(), "sqr_sum must be contiguous");
-
-    if (m == 0) {
-        return;
-    }
-
-    tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k);
-}
-
 // moe_align preprocessing (C++ JIT) — apis-layer interface owns input
 // validation; the impls layer (jit_kernels/impls/moe_align.hpp) only
 // orchestrates config resolution + kernel dispatch.
@@ -1260,11 +1228,8 @@ static void m_grouped_gemm_w4a16_fused(const torch::Tensor& lhs,
 
 static void acblaslt_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,
                                             const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
-    // Shape must be `[M, K] @ [N, K].T`
-    major_check(a);
-    major_check(b);
-    const bool a_is_k_major = a.stride(-1) == 1;
-    const bool b_is_k_major = b.stride(-1) == 1;
+    const auto major_a = get_major_type_ab(a);
+    const auto major_b = get_major_type_ab(b);
 
     // Type and shape checks
     const auto [m , k ] = get_shape<2>(a);
@@ -1276,7 +1241,7 @@ static void acblaslt_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,
     if (early_return(m, n, k, d, c))
         return;
 
-    acblaslt_gemm(a, b, d, m, n, k, a_is_k_major, b_is_k_major, c.has_value());
+    acblaslt_gemm(a, b, d, m, n, k, major_a, major_b, c.has_value());
 }
 
 static void acblaslt_gemm_nn(const torch::Tensor& a, const torch::Tensor& b,
@@ -1398,9 +1363,6 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
     m.def("m_grouped_gemm_w4a16_fused", &m_grouped_gemm_w4a16_fused, py::arg("lhs"), py::arg("rhs_"),
           py::arg("out"), py::arg("m_rows"), py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
           py::arg("aligned_num_m_blocks"), py::arg("configs"), py::arg("fp4_use_bf16_scale") = false);
-    // TF32 GEMMs
-    m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("sqr_sum"), py::arg("num_splits") = std::nullopt, py::arg("configs") = std::nullopt);
     // BF16 Fused MoE GEMM
     m.def("m_grouped_gemm_bf16_bf16_bf16_nt_fused", &m_grouped_gemm_bf16_bf16_bf16_nt_fused,
           py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),

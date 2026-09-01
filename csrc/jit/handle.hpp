@@ -39,6 +39,9 @@ DECL_LAZY_HGGC_DRIVER_FUNCTION(hgFuncSetAttribute);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgModuleLoad);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgModuleUnload);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgModuleGetFunction);
+DECL_LAZY_HGGC_DRIVER_FUNCTION(hgLibraryLoadFromFile);
+DECL_LAZY_HGGC_DRIVER_FUNCTION(hgLibraryUnload);
+DECL_LAZY_HGGC_DRIVER_FUNCTION(hgKernelGetFunction);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgLaunchKernelEx);
 
 #if DG_TENSORMAP_COMPATIBLE
@@ -69,7 +72,7 @@ static KernelHandle load_kernel(const std::filesystem::path& hgbin_path, const s
 }
 
 static void unload_library(const LibraryHandle& library) {
-    const auto& error = hggcLibraryUnload(library);
+    const auto error = hggcLibraryUnload(library);
     DG_HOST_ASSERT(error == hggcSuccess or error == hggcErrorHggcrtUnloading);
 }
 
@@ -96,10 +99,18 @@ static auto launch_kernel(const KernelHandle& kernel, const LaunchConfigHandle& 
 #else
 
 // Use HGGC driver API
-using LibraryHandle = HGmodule;
 using KernelHandle = HGfunction;
 using LaunchConfigHandle = HGlaunchConfig;
 using LaunchAttrHandle = HGlaunchAttribute;
+
+#if HGGC_VERSION >= 12040
+    #define DG_JIT_USE_LIBRARY_ENUM_KERNELS
+    DECL_LAZY_HGGC_DRIVER_FUNCTION(hgLibraryGetKernelCount);
+    DECL_LAZY_HGGC_DRIVER_FUNCTION(hgLibraryEnumerateKernels);
+    using LibraryHandle = HGlibrary;
+#else
+    using LibraryHandle = HGmodule;
+#endif
 
 #define DG_HGGC_CHECK DG_HGGC_DRIVER_CHECK
 
@@ -107,8 +118,26 @@ static KernelHandle load_kernel(const std::filesystem::path& hgbin_path, const s
                                 LibraryHandle* library_opt = nullptr) {
     LibraryHandle library;
     KernelHandle kernel;
+
+#ifdef DG_JIT_USE_LIBRARY_ENUM_KERNELS
+    DG_HGGC_DRIVER_CHECK(lazy_hgLibraryLoadFromFile(&library, hgbin_path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+    unsigned int num_kernels;
+    DG_HGGC_DRIVER_CHECK(lazy_hgLibraryGetKernelCount(&num_kernels, library));
+    if (num_kernels != 1) {
+        const auto dir_path = hgbin_path.parent_path();
+        printf("Corrupted JIT cache directory (expected 1 kernel, found %u): %s, "
+               "please run `rm -rf %s` and restart your task.\n",
+               num_kernels, dir_path.c_str(), dir_path.c_str());
+        DG_HOST_ASSERT(false and "Corrupted JIT cache directory");
+    }
+
+    HGkernel hg_kernel;
+    DG_HGGC_DRIVER_CHECK(lazy_hgLibraryEnumerateKernels(&hg_kernel, 1, library));
+    DG_HGGC_DRIVER_CHECK(lazy_hgKernelGetFunction(&kernel, hg_kernel));
+#else
     DG_HGGC_DRIVER_CHECK(lazy_hgModuleLoad(&library, hgbin_path.c_str()));
     DG_HGGC_DRIVER_CHECK(lazy_hgModuleGetFunction(&kernel, library, func_name.c_str()));
+#endif
 
     if (library_opt != nullptr)
         *library_opt = library;
@@ -116,7 +145,11 @@ static KernelHandle load_kernel(const std::filesystem::path& hgbin_path, const s
 }
 
 static void unload_library(const LibraryHandle& library) {
-    const auto& error = lazy_hgModuleUnload(library);
+#ifdef DG_JIT_USE_LIBRARY_ENUM_KERNELS
+    const auto error = lazy_hgLibraryUnload(library);
+#else
+    const auto error = lazy_hgModuleUnload(library);
+#endif
     DG_HOST_ASSERT(error == HGGC_SUCCESS or error == HGGC_ERROR_DEINITIALIZED);
 }
 

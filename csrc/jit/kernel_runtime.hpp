@@ -5,12 +5,13 @@
 #include "../utils/system.hpp"
 #include "device_runtime.hpp"
 #include "handle.hpp"
+#include "include_parser.hpp"
 
 namespace deep_gemm {
 
 struct LaunchArgs {
-    dim3 grid_dim;
-    dim3 block_dim;
+    dim3 grid_dim; // the z dim is always 1
+    dim3 block_dim; // the y,z dims are always 1
     int smem_size;
 };
 
@@ -26,11 +27,20 @@ public:
         DG_HOST_ASSERT(not sdk_home.empty());
 
         // NOLINT(*-pro-type-member-init)
-        const auto& hgobjdump_path = sdk_home / "../bin" / "hgobjdump";
-        const auto& hgbin_path = dir_path / "kernel.hgbin";
+        const auto hgobjdump_path = sdk_home / "bin" / "hgobjdump";
+        const auto hgbin_path = dir_path / "kernel.hgbin";
         if (get_env<int>("DG_JIT_DEBUG"))
             printf("Loading HGBIN: %s\n", hgbin_path.c_str());
 
+        // Record start time
+        std::chrono::high_resolution_clock::time_point start_time;
+        if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_JIT_PRINT_LOAD_TIME"))
+            start_time = std::chrono::high_resolution_clock::now();
+
+#ifdef DG_JIT_USE_LIBRARY_ENUM_KERNELS
+        // Load from the library
+        kernel = load_kernel(hgbin_path, {}, &library);
+#else
         // Find the only symbol
         // TODO: use kernel enumeration for newer drivers
         const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal",
@@ -49,6 +59,13 @@ public:
         }
 
         kernel = load_kernel(hgbin_path, expected_name, &library);
+#endif
+
+        // Print load time
+        if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_JIT_PRINT_LOAD_TIME")) {
+            std::chrono::duration<double, std::milli> load_time = std::chrono::high_resolution_clock::now() - start_time;
+            printf("Load time (%s): %.2lf ms\n", dir_path.c_str(), load_time.count());
+        }
     }
 
     static void prepare_init(const std::string& sdk_home_path) {
@@ -56,7 +73,19 @@ public:
     }
 
     static bool check_validity(const std::filesystem::path& dir_path) {
-        return std::filesystem::exists(dir_path / "kernel.cu") and std::filesystem::exists(dir_path / "kernel.hgbin");
+        if (not std::filesystem::exists(dir_path))
+            return false;
+
+        // NOTES: if the directory exists, `kernel.cu` and `kernel.hgbin` must both exist,
+        // because the directory is created atomically via rename
+        if (not std::filesystem::exists(dir_path / "kernel.cu") or
+            not std::filesystem::exists(dir_path / "kernel.hgbin")) {
+            printf("Corrupted JIT cache directory (missing kernel.cu or kernel.hgbin): %s, "
+                   "please run `rm -rf %s` and restart your task.\n",
+                   dir_path.c_str(), dir_path.c_str());
+            DG_HOST_ASSERT(false and "Corrupted JIT cache directory");
+        }
+        return true;
     }
 
     ~KernelRuntime() noexcept(false) {
@@ -96,9 +125,17 @@ class LaunchRuntime {
 public:
     template <typename Args>
     static std::string generate(const Args& args) {
-        const auto& code = Derived::generate_impl(args);
-        if (get_env<int>("DG_JIT_DEBUG", 0))
-            printf("Generated kernel code: %s\n", code.c_str());
+        auto code = Derived::generate_impl(args);
+
+        // NOTES: we require that `generate_impl`'s includes never change
+        static std::string include_hash;
+        if (include_hash.empty())
+            include_hash = include_parser->get_hash_value(code);
+
+        // TODO: optimize string concat performance
+        code = fmt::format("// Includes' hash value: {}\n{}", include_hash, code);
+        if (get_env<int>("DG_JIT_DEBUG"))
+            printf("Generated kernel code:\n%s\n", code.c_str());
         return code;
     }
 

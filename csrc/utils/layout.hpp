@@ -9,12 +9,21 @@
 namespace deep_gemm {
 
 // Major-ness stuffs
+// Hand-written replacement for cute::UMMA::Major: the PPU actlize port does not
+// provide cute::UMMA, so define the minimal major-ness enum used by the APIs here.
+enum class MajorType { K = 0, MN = 1 };
+
 static void major_check(const torch::Tensor& t) {
     const auto dim = t.dim();
     DG_HOST_ASSERT(dim == 2 or dim == 3);
     if (dim == 3)
         DG_HOST_ASSERT(t.stride(0) == t.size(-2) * t.size(-1));
     DG_HOST_ASSERT(t.stride(-2) == 1 or t.stride(-1) == 1);
+}
+
+static MajorType get_major_type_ab(const torch::Tensor& t) {
+    major_check(t);
+    return t.stride(-1) == 1 ? MajorType::K : MajorType::MN;
 }
 
 static void check_major_type_cd(const torch::Tensor& t) {

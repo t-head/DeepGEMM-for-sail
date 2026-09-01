@@ -100,19 +100,19 @@ static void call_acblaslt_api(const acblasOperation_t& trans_a,
 static void acblaslt_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs,
                           const torch::Tensor& out,
                           const int& m, const int& n, const int& k,
-                          const bool& a_is_k_major, const bool& b_is_k_major,
+                          const MajorType& a_major, const MajorType& b_major,
                           const bool& accumulate) {
-    const auto trans_a = b_is_k_major ? ACBLAS_OP_T : ACBLAS_OP_N;
-    const auto trans_b = a_is_k_major ? ACBLAS_OP_N : ACBLAS_OP_T;
+    const auto trans_a = b_major == MajorType::K ? ACBLAS_OP_T : ACBLAS_OP_N;
+    const auto trans_b = a_major == MajorType::K ? ACBLAS_OP_N : ACBLAS_OP_T;
 
     // Matrix layouts
     const auto hggc_type_a = at::cuda::ScalarTypeToCudaDataType(rhs.scalar_type());
     const auto hggc_type_b = at::cuda::ScalarTypeToCudaDataType(lhs.scalar_type());
     const auto hggc_type_d = at::cuda::ScalarTypeToCudaDataType(out.scalar_type());
-    const auto layout_a = b_is_k_major ? get_acblaslt_layout(hggc_type_a, k, n, rhs.stride(0))
-                                       : get_acblaslt_layout(hggc_type_a, n, k, rhs.stride(1));
-    const auto layout_b = a_is_k_major ? get_acblaslt_layout(hggc_type_b, k, m, lhs.stride(0))
-                                       : get_acblaslt_layout(hggc_type_b, m, k, lhs.stride(1));
+    const auto layout_a = b_major == MajorType::K ? get_acblaslt_layout(hggc_type_a, k, n, rhs.stride(0))
+                                                           : get_acblaslt_layout(hggc_type_a, n, k, rhs.stride(1));
+    const auto layout_b = a_major == MajorType::K ? get_acblaslt_layout(hggc_type_b, k, m, lhs.stride(0))
+                                                          : get_acblaslt_layout(hggc_type_b, m, k, lhs.stride(1));
     const auto layout_d = get_acblaslt_layout(hggc_type_d, n, m, out.stride(0));
 
     call_acblaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, accumulate);

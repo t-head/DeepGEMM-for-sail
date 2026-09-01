@@ -1,5 +1,5 @@
 #pragma once
-#include <cub/cub.cuh>
+#include <cub/block/block_scan.cuh>
 #include <deep_gemm/common/utils_rtc.cuh>
 
 #include "cute/ppu_tensor_mix.hpp"
