@@ -35,9 +35,10 @@ constexpr auto kNumQStages = {kNumQStages};
 constexpr auto kNumKVStages = {kNumKVStages};
 using StrideKType = {StrideKType};
 constexpr bool kIsCompressedLogits = {kIsCompressedLogits};
+constexpr uint32_t kScaleMode = {kScaleMode};
 
 // Make a templated GEMM
-using atten_t = Attention<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits>;
+using atten_t = Attention<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits, kScaleMode>;
 
 // Launch kernel
 atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, (uint32_t*)cu_seq_len_k_start, (uint32_t*)cu_seq_len_k_end, logits,
@@ -61,9 +62,10 @@ constexpr int kNumQStages = {kNumQStages};
 constexpr int kNumKVStages = {kNumKVStages};
 using StrideKType = {StrideKType};
 constexpr bool kIsCompressedLogits = {kIsCompressedLogits};
+constexpr uint32_t kScaleMode = deep_gemm::kScaleModeWeights;
 
 // Make a templated GEMM
-using atten_t = AttentionFP4<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits>;
+using atten_t = AttentionFP4<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits, kScaleMode>;
 
 // Launch kernel
 atten_t::run((const ElementQK*)q, (const uint32_t*)q_sf, (const ElementQK*)k, (const uint32_t*)k_sf, weights,
@@ -94,7 +96,8 @@ def mqa_logits_common(q: torch.Tensor,
                       max_seqlen_k: int = 0,
                       logits_dtype: torch.dtype = torch.float32,
                       q_sf: Optional[torch.Tensor] = None,
-                      k_sf: Optional[torch.Tensor] = None):
+                      k_sf: Optional[torch.Tensor] = None,
+                      q_scale: Optional[torch.Tensor] = None):
     """MQA logits (non-paged) for FP8/BF16/INT8/FP4.
 
     Args:
@@ -109,7 +112,9 @@ def mqa_logits_common(q: torch.Tensor,
                FP8/INT8: float32 [seq_len_k]
                BF16:     empty tensor (unused)
                FP4:      empty tensor (unused, k_sf is used instead)
-        weights:           [seq_len_q, num_heads], float32 or bfloat16
+        weights:           [seq_len_q, num_heads], float32 or bfloat16.
+                           An empty tensor (numel == 0) selects the avg variant:
+                           logits = sum_h(relu(q·k)) * q_scale * k_scale / sqrt(head_dim)
         cu_seq_len_k_start: int32 [seq_len_q]
         cu_seq_len_k_end:   int32 [seq_len_q]
         clean_logits: whether to mask out-of-range logits with -inf
@@ -119,27 +124,44 @@ def mqa_logits_common(q: torch.Tensor,
                Packed from uint8 e8m0 (4×uint8 per int32). None for FP8/BF16/INT8.
         k_sf:  UE8M0 scale for K (FP4 only), int32 [seq_len_k]
                Packed from uint8 e8m0 (4×uint8 per int32). None for FP8/BF16/INT8.
+        q_scale: avg variant only (empty weights, FP8 only), float32 extra multiplier:
+               per-Q-row [seq_len_q] or a broadcast scalar (numel == 1). None means 1.0.
     """
     is_fp4 = q_sf is not None
     num_sms = get_num_sms()
     stream = torch.cuda.current_stream()
 
+    # An empty weights tensor selects the avg variant (no per-head weights)
+    use_weights = weights.numel() > 0
+
     # --- Shape extraction & validation ---
     seq_len_q, num_heads, head_dim = q.shape
     seq_len_k, head_dim_ = k.shape
-    seq_len_, num_heads_ = weights.shape
-    assert(seq_len_q == seq_len_)
-    assert(num_heads == num_heads_)
+
+    if not use_weights:
+        assert not is_fp4, "avg variant supports fp8 only"
+        assert q.dtype == torch.float8_e4m3fn, "avg variant supports fp8 only"
+        assert logits_dtype == torch.float32, "avg variant supports float32 logits only"
+        if q_scale is not None:
+            # Per-Q-row vector [seq_len_q] or a broadcast scalar (numel == 1, any dim)
+            assert(q_scale.numel() == 1 or (q_scale.dim() == 1 and q_scale.numel() == seq_len_q))
+            assert(q_scale.dtype == torch.float32)
+            assert(q_scale.is_contiguous())
+    else:
+        seq_len_, num_heads_ = weights.shape
+        assert(seq_len_q == seq_len_)
+        assert(num_heads == num_heads_)
+        assert(num_heads != 4), "num_heads == 4 supports the avg variant only (pass empty weights)"
+        assert(weights.is_contiguous())
+        assert(weights.dtype == torch.float32 or (logits_dtype == torch.bfloat16 and weights.dtype == torch.bfloat16))
+        if logits_dtype == torch.float32:
+            assert weights.dtype == torch.float32, "fp32 logits requires fp32 weights"
     assert(cu_seq_len_k_start.size(0) == seq_len_q)
     assert(cu_seq_len_k_end.size(0) == seq_len_q)
     assert(q.is_contiguous() and k.is_contiguous())
-    assert(weights.is_contiguous())
     assert(cu_seq_len_k_start.is_contiguous())
     assert(cu_seq_len_k_end.is_contiguous())
-    assert(weights.dtype == torch.float32 or (logits_dtype == torch.bfloat16 and weights.dtype == torch.bfloat16))
     assert(logits_dtype in (torch.float32, torch.bfloat16))
-    if logits_dtype == torch.float32:
-        assert weights.dtype == torch.float32, "fp32 logits requires fp32 weights"
     assert(cu_seq_len_k_start.dtype == torch.int32)
     assert(cu_seq_len_k_end.dtype == torch.int32)
 
@@ -189,6 +211,9 @@ def mqa_logits_common(q: torch.Tensor,
             ElementQK, ElementAcc = 'cutlass::float_e4m3_t', 'float'
             warp_kv = 32 if num_heads == 32 else 64
             block_kv = warp_kv * 4
+            if num_heads == 4:
+                assert logits_dtype == torch.float32, "num_heads == 4 supports float32 logits only"
+                block_q, block_qh, warp_qh, warp_kv, block_kv = 32, 128, 16, 64, 128
         elif q.dtype == torch.int8:
             ElementQK, ElementAcc = 'int8_t', "int32_t"
             warp_kv = 32 if num_heads == 32 else 64
@@ -215,9 +240,22 @@ def mqa_logits_common(q: torch.Tensor,
         logits = logits[0:seq_len_q, 0:max_seqlen_k]
     else:
         logits = logits[0:seq_len_q, 0:seq_len_k]
-    kWeightsBF16 = (logits_dtype == torch.bfloat16 and weights.dtype == torch.bfloat16)
+    kWeightsBF16 = (use_weights and logits_dtype == torch.bfloat16 and weights.dtype == torch.bfloat16)
     ElementWeights = "__ppu_bfloat16" if kWeightsBF16 else "float"
     ElementLogits = "float" if logits_dtype == torch.float32 else "__ppu_bfloat16"
+
+    # Scale mode selects what the `weights` argument slot carries (see mqa_logits_utils.cuh):
+    # weights = per-(q, head) weights; q_row / q_scalar = avg with the per-Q-row / broadcast
+    # scalar scale in the slot; unity = avg without any Q-row scale (placeholder, never dereferenced)
+    if use_weights:
+        scale_mode, weights_arg = 'deep_gemm::kScaleModeWeights', weights
+    elif q_scale is None:
+        scale_mode = 'deep_gemm::kScaleModeUnity'
+        weights_arg = torch.empty(1, dtype=torch.float32, device=q.device)
+    elif q_scale.numel() == 1:
+        scale_mode, weights_arg = 'deep_gemm::kScaleModeQScalar', q_scale
+    else:
+        scale_mode, weights_arg = 'deep_gemm::kScaleModeQRow', q_scale
 
     # --- JIT compilation ---
     jit_keys = {'ElementQK': ElementQK, 'ElementAcc': ElementAcc,
@@ -226,7 +264,8 @@ def mqa_logits_common(q: torch.Tensor,
                 'BLOCK_QH': block_qh, 'BLOCK_KV': block_kv,
                 'WARP_QH': warp_qh, 'WARP_KV': warp_kv,
                 'kNumQStages': num_q_stages, 'kNumKVStages': num_kv_stages,
-                'StrideKType': stride_k_type, 'kIsCompressedLogits': is_compressed}
+                'StrideKType': stride_k_type, 'kIsCompressedLogits': is_compressed,
+                'kScaleMode': scale_mode}
 
     if is_fp4:
         global includes_fp4_mqa, template_fp4_mqa
@@ -244,13 +283,14 @@ def mqa_logits_common(q: torch.Tensor,
             template=template_fp4_mqa, args=args, jit_include_dir='actlize_v1.0.0')
     else:
         global includes, template
-        args = (q, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
+        args = (q, k, k_scales, weights_arg, cu_seq_len_k_start, cu_seq_len_k_end, logits,
                 seq_len_q, seq_len_k, aligned_seq_len_kv, stream, num_sms)
+        kernel_suffix = '' if use_weights else ('_avg_scaled' if q_scale is not None else '_avg')
         runtime = jit_tuner.compile_and_tune(
-            name='attention_mqa_logits_' + ElementQK,
+            name='attention_mqa_logits_' + ElementQK + kernel_suffix,
             keys=jit_keys, space=(),
             includes=includes,
-            arg_defs=(('q', q.dtype), ('k', k.dtype), ('k_scales', torch.float), ('weights', weights.dtype),
+            arg_defs=(('q', q.dtype), ('k', k.dtype), ('k_scales', torch.float), ('weights', weights_arg.dtype),
                       ('cu_seq_len_k_start', torch.int32), ('cu_seq_len_k_end', torch.int32), ('logits', logits_dtype),
                       ('seq_len_q', int), ('seq_len_k', int), ('aligned_seq_len_kv', int),
                       ('stream', torch.cuda.Stream), ('num_sms', int)),
@@ -286,6 +326,20 @@ def fp8_mqa_logits(q: torch.Tensor,
                    logits_dtype: torch.dtype = torch.float32):
     k, k_scales = kv_s
     return mqa_logits_common(q, k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits, max_seqlen_k, logits_dtype=logits_dtype)
+
+def fp8_mqa_avg_logits(q: torch.Tensor,
+                       kv_s: Tuple[torch.Tensor],
+                       cu_seq_len_k_start: torch.Tensor,
+                       cu_seq_len_k_end: torch.Tensor,
+                       clean_logits: bool = True,
+                       max_seqlen_k: int = 0,
+                       q_scale: Optional[torch.Tensor] = None,
+                       logits_dtype: torch.dtype = torch.float32):
+    """Avg MQA logits (non-paged): logits = sum_h(relu(q·k)) * q_scale * k_scale / sqrt(head_dim)."""
+    k, k_scales = kv_s
+    return mqa_logits_common(q, k, k_scales, torch.empty(0), cu_seq_len_k_start, cu_seq_len_k_end,
+                             clean_logits, max_seqlen_k, logits_dtype=logits_dtype,
+                             q_scale=q_scale)
 
 def int8_mqa_logits(q: torch.Tensor,
                    kv_s: Tuple[torch.Tensor],
@@ -325,9 +379,11 @@ constexpr uint32_t WARP_KV = {WARP_KV};
 constexpr uint32_t kNumQStages = {kNumQStages};
 constexpr uint32_t kNumKVStages = {kNumKVStages};
 constexpr uint32_t SPLIT_KV = {SPLIT_KV};
+constexpr bool SPLIT_MBLOCK = false;
+constexpr uint32_t kScaleMode = {kScaleMode};
 
 // Make a templated GEMM
-using atten_t = PagedAttention<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNextN, kNumHeads, kHeadDim, BLOCK_KV, WARP_KV, kNumQStages, kNumKVStages, SPLIT_KV>;
+using atten_t = PagedAttention<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNextN, kNumHeads, kHeadDim, BLOCK_KV, WARP_KV, kNumQStages, kNumKVStages, SPLIT_KV, SPLIT_MBLOCK, kScaleMode>;
 
 // Launch kernel
 atten_t::run((const ElementQK*)q, (const ElementQK*)k, k_scales, weights, batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride,
@@ -350,9 +406,10 @@ constexpr uint32_t kNumQStages = {kNumQStages};
 constexpr uint32_t kNumKVStages = {kNumKVStages};
 constexpr uint32_t SPLIT_KV = {SPLIT_KV};
 constexpr bool SPLIT_MBLOCK = {SPLIT_MBLOCK};
+constexpr uint32_t kScaleMode = deep_gemm::kScaleModeWeights;
 
 // Make a templated GEMM
-using atten_t = PagedAttentionFP4<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNextN, kNumHeads, kHeadDim, BLOCK_KV, WARP_KV, kNumQStages, kNumKVStages, SPLIT_KV, SPLIT_MBLOCK>;
+using atten_t = PagedAttentionFP4<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNextN, kNumHeads, kHeadDim, BLOCK_KV, WARP_KV, kNumQStages, kNumKVStages, SPLIT_KV, SPLIT_MBLOCK, kScaleMode>;
 
 // Launch kernel
 atten_t::run((const ElementQK*)q, (const uint32_t*)q_sf, (const ElementQK*)k, (const uint32_t*)k_scales, weights, batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride,
@@ -429,7 +486,9 @@ def paged_mqa_logits_common(q: torch.Tensor,
                FP8/BF16/INT8: [num_kv_blocks, block_kv, 1, head_dim + scale_bytes]
                FP4:           [num_kv_blocks, block_kv, 1, head_dim_packed + scale_bytes]
                Per-row layout: [values (head_dim or head_dim_packed bytes), scale (scale_bytes bytes)]
-        weights:       [batch * next_n, num_heads], float32 or bfloat16
+        weights:       [batch * next_n, num_heads], float32 or bfloat16.
+                       An empty tensor (numel == 0) selects the avg variant (aligned with PAI,
+                       no per-Q-row scale): logits = sum_h(relu(q·k)) * k_scale / sqrt(head_dim)
         context_lens:  int32 [batch_size, next_n]
         block_table:   int32 [batch_size, max_block_len]
         schedule_meta: int32 [num_blocks+1, 2]
@@ -441,13 +500,15 @@ def paged_mqa_logits_common(q: torch.Tensor,
     """
     is_fp4 = q_sf is not None
 
+    # An empty weights tensor selects the avg variant (no per-head weights)
+    use_weights = weights.numel() > 0
+
     batch_size, next_n, num_heads, head_dim = q.shape
     num_kv_blocks, block_kv, num_heads_kv, kv_last_dim = fused_kv_cache.shape
     # Only 2D context_lens [batch_size, next_n] is supported
     assert context_lens.dim() == 2, "context_lens must be 2D [batch_size, next_n]"
     assert context_lens.size(1) == next_n, f"context_lens next_n={context_lens.size(1)} != q next_n={next_n}"
     batch_size_ = context_lens.size(0)
-    batch_size_next_n, num_heads_ = weights.shape
     batch_size__, max_block_len = block_table.shape
     schedule_meta_size, meta_info_size = schedule_meta.shape
     kv_cache_stride_bytes = fused_kv_cache.stride(0)
@@ -455,8 +516,21 @@ def paged_mqa_logits_common(q: torch.Tensor,
 
     num_sms = get_num_sms()
     assert(batch_size == batch_size_ and batch_size == batch_size__)
-    assert(batch_size_next_n == batch_size * next_n)
-    assert(num_heads == num_heads_ and num_heads_kv == 1)
+    if not use_weights:
+        assert not is_fp4, "avg variant supports fp8 only"
+        assert q.dtype == torch.float8_e4m3fn, "avg variant supports fp8 only"
+        assert logits_dtype == torch.float32, "avg variant supports float32 logits only"
+    else:
+        batch_size_next_n, num_heads_ = weights.shape
+        assert(batch_size_next_n == batch_size * next_n)
+        assert(weights.is_contiguous())
+        assert(weights.dtype == torch.float32 or (logits_dtype == torch.bfloat16 and weights.dtype == torch.bfloat16))
+        if logits_dtype == torch.float32:
+            assert weights.dtype == torch.float32, "fp32 logits requires fp32 weights"
+    # 4 heads are padded to 16 inside the paged kernel (avg variant only)
+    if num_heads == 4:
+        assert not use_weights, "num_heads == 4 supports the avg variant only (pass empty weights)"
+    assert(num_heads_kv == 1)
     assert((schedule_meta_size - 1) % num_sms == 0 and meta_info_size == 2)
     assert(1 <= next_n <= 6)
     assert(block_kv == 64)
@@ -465,11 +539,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
     assert(fused_kv_cache.stride(1) == kv_last_dim)
     assert(fused_kv_cache.stride(2) == kv_last_dim)
     assert(fused_kv_cache.stride(3) == 1)
-    assert(weights.is_contiguous())
-    assert(weights.dtype == torch.float32 or (logits_dtype == torch.bfloat16 and weights.dtype == torch.bfloat16))
     assert(logits_dtype in (torch.float32, torch.bfloat16))
-    if logits_dtype == torch.float32:
-        assert weights.dtype == torch.float32, "fp32 logits requires fp32 weights"
     assert(context_lens.is_contiguous())
     assert(context_lens.dtype == torch.int32)
     assert(block_table.stride(1) == 1)
@@ -537,15 +607,22 @@ def paged_mqa_logits_common(q: torch.Tensor,
     logits_stride = aligned_max_context_len
 
     ElementLogits = "float" if logits_dtype == torch.float32 else "__ppu_bfloat16"
-    kWeightsBF16 = (logits_dtype == torch.bfloat16 and weights.dtype == torch.bfloat16)
+    kWeightsBF16 = (use_weights and logits_dtype == torch.bfloat16 and weights.dtype == torch.bfloat16)
     ElementWeights = "__ppu_bfloat16" if kWeightsBF16 else "float"
     stream = torch.cuda.current_stream()
+    # Scale mode selects what the `weights` argument slot carries (see mqa_logits_utils.cuh):
+    # weights = per-(q, head) weights; unity = avg without any Q-row scale
+    if use_weights:
+        scale_mode, weights_arg = 'deep_gemm::kScaleModeWeights', weights
+    else:
+        scale_mode = 'deep_gemm::kScaleModeUnity'
+        weights_arg = torch.empty(1, dtype=torch.float32, device=q.device)
 
     jit_keys = {'ElementLogits': ElementLogits, 'ElementWeights': ElementWeights,
                 'kNextN': next_n, 'kNumHeads': num_heads,
                 'kHeadDim': head_dim, 'BLOCK_KV': block_kv, 'WARP_KV': warp_kv,
                 'kNumQStages': num_q_stages, 'kNumKVStages': num_kv_stages,
-                'SPLIT_KV': split_kv}
+                'SPLIT_KV': split_kv, 'kScaleMode': scale_mode}
 
     if not is_fp4:
         assert not split_mblock, "SPLIT_MBLOCK is only supported for FP4 paged kernel"
@@ -575,14 +652,14 @@ def paged_mqa_logits_common(q: torch.Tensor,
         elif q.dtype == torch.int8:
             ElementQK = 'int8_t'
             ElementAcc = "int32_t"
-        args = (q, k, k_scales, weights, batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride, context_lens, logits,
+        args = (q, k, k_scales, weights_arg, batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride, context_lens, logits,
                 block_table, schedule_meta, stream, num_sms, schedule_meta_size - 1)
         runtime = jit_tuner.compile_and_tune(
-            name='attention_paged_mqa_logits_' + ElementQK,
+            name='attention_paged_mqa_logits_' + ElementQK + ('' if use_weights else '_avg'),
             keys={**jit_keys, 'ElementQK': ElementQK, 'ElementAcc': ElementAcc},
             space=(),
             includes=includes_paged,
-            arg_defs=(('q', q.dtype), ('k', k.dtype), ('k_scales', torch.float), ('weights', weights.dtype),
+            arg_defs=(('q', q.dtype), ('k', k.dtype), ('k_scales', torch.float), ('weights', weights_arg.dtype),
                       ('batch_size', int), ('logits_stride', int), ('kv_cache_stride_bytes', int), ('block_table_stride', int), ('context_lens', torch.int32),
                       ('logits', logits_dtype), ('block_table', torch.int32), ('schedule_meta', torch.int32),
                       ('stream', torch.cuda.Stream), ('num_sms', int), ('num_blocks', int)),
@@ -615,6 +692,21 @@ def fp8_paged_mqa_logits(q: torch.Tensor,
                          clean_logits: bool = True,
                          logits_dtype: torch.dtype = torch.float32):
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype=logits_dtype)
+
+def fp8_paged_mqa_avg_logits(q: torch.Tensor,
+                             fused_kv_cache: torch.Tensor,
+                             context_lens: torch.Tensor,
+                             block_table: torch.Tensor,
+                             schedule_meta: torch.Tensor,
+                             max_context_len: int,
+                             clean_logits: bool = False,
+                             logits_dtype: torch.dtype = torch.float32,
+                             indices: Optional[torch.Tensor] = None):
+    """Avg paged MQA logits: logits = sum_h(relu(q·k)) * k_scale / sqrt(head_dim)."""
+    if indices is not None:
+        print_once("Warning: indices (varlen) is not supported on PPU, falling back to non-varlen mode (performance may be affected)")
+    return paged_mqa_logits_common(q, fused_kv_cache, torch.empty(0), context_lens, block_table, schedule_meta,
+                                   max_context_len, clean_logits, logits_dtype=logits_dtype)
 
 def int8_paged_mqa_logits(q: torch.Tensor,
                          fused_kv_cache: torch.Tensor,

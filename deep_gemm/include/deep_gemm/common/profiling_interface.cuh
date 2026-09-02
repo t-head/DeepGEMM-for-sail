@@ -32,8 +32,8 @@ void initialize_args(GemmType gemm_type, bool is_gemv, int m, int group, int* gr
     }
 }
 
-void set_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv, int num_heads, int head_dim, hggcStream_t stream = 0) {
-    op_name_ = "MqaLogits";
+void set_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv, int num_heads, int head_dim, hggcStream_t stream = 0, bool is_avg = false) {
+    op_name_ = is_avg ? "MqaAvgLogits" : "MqaLogits";
     add_argument("data_type");
     add_argument("seq_len_q");
     add_argument("seq_len_kv");
@@ -56,8 +56,8 @@ void set_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv,
     device_id_ = -1; // avoid check_support_dump print
 }
 
-void set_paged_mqa_logits_params(std::string data_type, int batch_size, int next_n, int num_heads, int head_dim, int* context_lens, hggcStream_t stream = 0) {
-    op_name_ = "PagedMqaLogits";
+void set_paged_mqa_logits_params(std::string data_type, int batch_size, int next_n, int num_heads, int head_dim, int* context_lens, hggcStream_t stream = 0, bool is_avg = false) {
+    op_name_ = is_avg ? "PagedMqaAvgLogits" : "PagedMqaLogits";
     add_argument("data_type");
     add_argument("batch_size");
     add_argument("next_n");

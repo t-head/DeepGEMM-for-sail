@@ -490,4 +490,9 @@ def get_paged_mqa_logits_tile(next_n, block_kv, num_heads, head_dim, datasize):
     tile_key = (datasize, next_n, num_heads, head_dim)
     if tile_key in tile_map:
         return tile_map[tile_key]
+    # 4 heads are padded to 16 in the paged kernel: search with 16 heads and
+    # ceil(next_n / 4) warp-tile "tokens" (fp4 keeps its own kernel layout)
+    if num_heads == 4 and not is_fp4:
+        num_heads = 16
+        next_n = ceil_div(next_n, 4)
     return search_tile()

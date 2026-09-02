@@ -21,13 +21,15 @@ template <typename ElementQK, typename ElementAcc, typename ElementLogits, typen
           int kNumHeads, int kHeadDim, int BLOCK_QH,
           int BLOCK_KV, int WARP_QH, int WARP_KV, int kNumQStages, int kNumKVStages,
           typename StrideKType = uint32_t,
-          bool kIsCompressedLogits = false>
+          bool kIsCompressedLogits = false,
+          uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
 class PPUMqaLogitsFP4 {
 public:
     static_assert(cute::is_same_v<ElementQK, uint8_t>, "FP4 MQA logits requires uint8_t ElementQK");
     static_assert(kHeadDim == 64, "FP4 packed head_dim must be 64 (original 128 / 2)");
     static_assert(cute::is_same_v<StrideKType, uint32_t> || cute::is_same_v<StrideKType, uint64_t>,
                   "StrideKType must be uint32_t or uint64_t");
+    static_assert(kScaleMode == deep_gemm::kScaleModeWeights, "FP4 supports the weights mode only");
 
     static constexpr int BLOCK_M = BLOCK_KV;
     static constexpr int BLOCK_N = BLOCK_QH;
@@ -561,7 +563,8 @@ template <typename ElementQK, typename ElementAcc, typename ElementLogits, typen
           int kNumHeads, int kHeadDim, int BLOCK_QH,
           int BLOCK_KV, int WARP_QH, int WARP_KV, int kNumQStages, int kNumKVStages,
           typename StrideKType = uint32_t,
-          bool kIsCompressedLogits = false>
+          bool kIsCompressedLogits = false,
+          uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
 class AttentionFP4 {
 public:
     static void run(const ElementQK* ptr_q, const uint32_t* q_sf, const ElementQK* ptr_k, const uint32_t* k_sf,
@@ -570,7 +573,7 @@ public:
                     int num_sms) {
         using AttnKernel =
             cutlass::gemm::kernel::PPUMqaLogitsFP4<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNumHeads, kHeadDim, BLOCK_QH,
-                                                    BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits>;
+                                                    BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits, kScaleMode>;
 
         static constexpr int BLOCK_M = AttnKernel::BLOCK_M;
         static constexpr int BLOCK_N = AttnKernel::BLOCK_N;

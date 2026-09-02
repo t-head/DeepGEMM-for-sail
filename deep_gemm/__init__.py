@@ -70,6 +70,8 @@ from .deep_gemm_cpp import (
     int8_paged_mqa_logits,
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
+    fp8_mqa_avg_logits,
+    fp8_paged_mqa_avg_logits,
     fp8_einsum,
     int8_einsum,
     preprocess_mxfp4_scales,

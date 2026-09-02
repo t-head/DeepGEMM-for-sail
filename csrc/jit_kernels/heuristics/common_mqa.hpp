@@ -185,7 +185,15 @@ static PagedTile get_paged_mqa_logits_tile(int next_n, int block_kv, int num_hea
         {{1, 3, 64, 64}, {1, 3, 128, 64, true, 5}},
     };
     const auto& it = tile_map.find({datasize, next_n, num_heads, head_dim});
-    return it != tile_map.end() ? it->second : search_tile();
+    if (it != tile_map.end())
+        return it->second;
+    // 4 heads are padded to 16 in the paged kernel: search with 16 heads and
+    // ceil(next_n / 4) warp-tile "tokens" (fp4 keeps its own kernel layout)
+    if (num_heads == 4 and not is_fp4) {
+        num_heads = 16;
+        next_n = (next_n + 3) / 4;
+    }
+    return search_tile();
 }
 
 static MqaLogitsConfig get_best_configs(torch::ScalarType qk_dtype, int num_heads, int seq_len_k,
@@ -214,7 +222,15 @@ static MqaLogitsConfig get_best_configs(torch::ScalarType qk_dtype, int num_head
 
     config.num_q_stages = 1;
     config.num_kv_stages = 3;
-    if (qk_dtype == torch::kBFloat16) {
+    if (num_heads == 4) {
+        // 4-head avg tile: BLOCK_QH = 128 with WARP_QH = 16 keeps a legal MMA N tile
+        // (WARP_Q = 4 covers 4 q tokens per warp); weighted H = 4 is rejected by the host
+        config.block_q = 32;
+        config.block_qh = 128;
+        config.warp_qh = 16;
+        config.warp_kv = 64;
+        config.block_kv = 128;
+    } else if (qk_dtype == torch::kBFloat16) {
         config.block_kv = 128, config.warp_kv = 32;
     } else {
         // FP8 / INT8 share the same tiling

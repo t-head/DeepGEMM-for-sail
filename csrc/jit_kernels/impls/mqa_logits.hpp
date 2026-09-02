@@ -84,6 +84,7 @@ public:
         int num_q_stages, num_kv_stages;
         std::string stride_k_type;
         bool is_compressed_logits;
+        std::string scale_mode;
         int smem_size, num_threads;
         std::string kernel_name;
     };
@@ -116,11 +117,12 @@ constexpr uint32_t kNumQStages = {};
 constexpr uint32_t kNumKVStages = {};
 using StrideKType = {};
 constexpr bool kIsCompressedLogits = {};
+constexpr uint32_t kScaleMode = {};
 
 using AttnKernel = cutlass::gemm::kernel::{}<
   ElementQK, ElementAcc, ElementLogits, ElementWeights,
   kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV,
-  kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits
+  kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits, kScaleMode
 >;
 
 // The host computes these instead of reading them off the kernel type, so pin them down here
@@ -140,8 +142,8 @@ __global__ void {}(
 )",
             info.include_header, info.element_qk, info.element_acc, info.element_logits, info.element_weights,
             info.num_heads, info.head_dim, info.block_qh, info.block_kv, info.warp_qh, info.warp_kv,
-            info.num_q_stages, info.num_kv_stages, info.stride_k_type, info.is_compressed_logits, info.kernel_class,
-            info.smem_size, info.num_threads, info.kernel_name);
+            info.num_q_stages, info.num_kv_stages, info.stride_k_type, info.is_compressed_logits, info.scale_mode,
+            info.kernel_class, info.smem_size, info.num_threads, info.kernel_name);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -155,10 +157,11 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
                               const deep_gemm_mqa_common::MqaLogitsConfig& config, const std::string& element_qk,
                               const std::string& element_acc, const std::string& element_logits,
                               const std::string& element_weights, const std::string& dtype_tag, int num_heads,
-                              int head_dim, bool is_compressed, int smem_size, int num_threads,
-                              const std::string& kernel_name, const ArgumentsT& kernel_params) {
+                              int head_dim, bool is_compressed, const std::string& scale_mode, int smem_size,
+                              int num_threads, const std::string& kernel_name, const ArgumentsT& kernel_params) {
     using Runtime = MqaLogitsRuntime<StrideKType, ArgumentsT>;
     const bool is_fp4 = dtype_tag == "fp4";
+    const bool is_avg = scale_mode != "deep_gemm::kScaleModeWeights";
     const int num_sms = get_num_sms();
     const dim3 block(num_threads, 1, 1);
     const dim3 grid(num_sms, 1, 1);
@@ -167,7 +170,7 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
         .launch_info = {include_header, kernel_class, element_qk, element_acc, element_logits, element_weights,
                         num_heads, head_dim, config.block_qh, config.block_kv, config.warp_qh, config.warp_kv,
                         config.num_q_stages, config.num_kv_stages, StrideKTypeName<StrideKType>::value,
-                        is_compressed, smem_size, num_threads, kernel_name},
+                        is_compressed, scale_mode, smem_size, num_threads, kernel_name},
         .launch_args = {grid, block, smem_size},
         .kernel_params = kernel_params,
     };
@@ -217,7 +220,7 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_mqa_logits_params(dtype_tag, static_cast<int>(kernel_params.seq_len_q),
                                              static_cast<int>(kernel_params.seq_len_k), num_heads,
-                                             is_fp4 ? head_dim * 2 : head_dim, (hggcStream_t)0);
+                                             is_fp4 ? head_dim * 2 : head_dim, (hggcStream_t)0, is_avg);
         if (element_logits == "__ppu_bfloat16")
             dg_prof_params.add_params("logits_dtype", std::string("bf16"));
         if (element_weights == "__ppu_bfloat16")
@@ -241,10 +244,28 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
                                 const torch::Tensor& cu_seq_len_k_end, int seq_len_q, int seq_len_k, int num_heads,
                                 int head_dim, bool clean_logits, int max_seqlen_k, torch::ScalarType logits_dtype,
                                 const std::optional<torch::Tensor>& q_sf,
-                                const std::optional<torch::Tensor>& k_sf) {
+                                const std::optional<torch::Tensor>& k_sf,
+                                const std::optional<torch::Tensor>& q_scale = std::nullopt) {
     const bool is_fp4 = q_sf.has_value();
     const auto& qk_dtype = q.scalar_type();
     const bool is_compressed = max_seqlen_k > 0;
+    // Avg variant: an empty weights tensor selects it, and the `weights` kernel slot then
+    // carries `q_scale` (nullptr for the unity mode -- the kernel never dereferences it)
+    const bool is_avg = weights.numel() == 0;
+    std::string scale_mode = "deep_gemm::kScaleModeWeights";
+    const void* weights_ptr = weights.data_ptr();
+    if (is_avg) {
+        if (not q_scale.has_value()) {
+            scale_mode = "deep_gemm::kScaleModeUnity";
+            weights_ptr = nullptr;
+        } else if (q_scale->numel() == 1) {
+            scale_mode = "deep_gemm::kScaleModeQScalar";
+            weights_ptr = q_scale->data_ptr();
+        } else {
+            scale_mode = "deep_gemm::kScaleModeQRow";
+            weights_ptr = q_scale->data_ptr();
+        }
+    }
 
     const auto& config =
         deep_gemm_mqa_common::get_best_configs(qk_dtype, num_heads, seq_len_k, logits_dtype, is_fp4);
@@ -281,7 +302,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     const int smem_size = deep_gemm_mqa_common::get_smem_config(
         config, head_dim, static_cast<int>(q.element_size()), static_cast<int>(weights.element_size()), is_fp4);
     const int num_threads = deep_gemm_mqa_common::get_num_threads(config);
-    const auto& kernel_name = "attention_mqa_logits_" + dtype_tag;
+    const auto& kernel_name = "attention_mqa_logits_" + dtype_tag + (is_avg ? "_avg" : "");
 
     // `k_scales` is an empty tensor for BF16 and FP4 (FP4 uses `k_sf` instead)
     const float* k_scales_ptr = (is_fp4 or qk_dtype == torch::kBFloat16) ? nullptr : k_scales.data_ptr<float>();
@@ -294,14 +315,16 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
         if (stride_k_type == "uint32_t") {
             launch_mqa_logits<uint32_t>(
                 "deep_gemm/impls/fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
-                element_weights, dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
+                element_weights, dtype_tag, num_heads, head_dim, is_compressed, scale_mode, smem_size, num_threads,
+                kernel_name,
                 MqaLogitsFP4Arguments<uint32_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights.data_ptr(),
                                                 ks_ptr, ke_ptr, logits.data_ptr(), seq_len_q, seq_len_k,
                                                 static_cast<uint32_t>(aligned_seq_len_kv)});
         } else {
             launch_mqa_logits<uint64_t>(
                 "deep_gemm/impls/fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
-                element_weights, dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
+                element_weights, dtype_tag, num_heads, head_dim, is_compressed, scale_mode, smem_size, num_threads,
+                kernel_name,
                 MqaLogitsFP4Arguments<uint64_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights.data_ptr(),
                                                 ks_ptr, ke_ptr, logits.data_ptr(), seq_len_q, seq_len_k,
                                                 static_cast<uint64_t>(aligned_seq_len_kv)});
@@ -309,8 +332,8 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     } else if (stride_k_type == "uint32_t") {
         launch_mqa_logits<uint32_t>(
             "deep_gemm/impls/ppu_mqa_logits.cuh", "PPUMqaLogits", config, element_qk, element_acc, element_logits, element_weights,
-            dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
-            MqaLogitsArguments<uint32_t>{q.data_ptr(), k.data_ptr(), k_scales_ptr, weights.data_ptr(),
+            dtype_tag, num_heads, head_dim, is_compressed, scale_mode, smem_size, num_threads, kernel_name,
+            MqaLogitsArguments<uint32_t>{q.data_ptr(), k.data_ptr(), k_scales_ptr, weights_ptr,
                                          reinterpret_cast<uint32_t*>(cu_seq_len_k_start.data_ptr()),
                                          reinterpret_cast<uint32_t*>(cu_seq_len_k_end.data_ptr()), logits.data_ptr(),
                                          static_cast<uint32_t>(seq_len_q), static_cast<uint32_t>(seq_len_k),
@@ -318,8 +341,8 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     } else {
         launch_mqa_logits<uint64_t>(
             "deep_gemm/impls/ppu_mqa_logits.cuh", "PPUMqaLogits", config, element_qk, element_acc, element_logits, element_weights,
-            dtype_tag, num_heads, head_dim, is_compressed, smem_size, num_threads, kernel_name,
-            MqaLogitsArguments<uint64_t>{q.data_ptr(), k.data_ptr(), k_scales_ptr, weights.data_ptr(),
+            dtype_tag, num_heads, head_dim, is_compressed, scale_mode, smem_size, num_threads, kernel_name,
+            MqaLogitsArguments<uint64_t>{q.data_ptr(), k.data_ptr(), k_scales_ptr, weights_ptr,
                                          reinterpret_cast<uint32_t*>(cu_seq_len_k_start.data_ptr()),
                                          reinterpret_cast<uint32_t*>(cu_seq_len_k_end.data_ptr()), logits.data_ptr(),
                                          static_cast<uint32_t>(seq_len_q), static_cast<uint32_t>(seq_len_k),

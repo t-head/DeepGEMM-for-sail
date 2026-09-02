@@ -62,6 +62,8 @@ from .attention import (
     int8_paged_mqa_logits,
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
+    fp8_mqa_avg_logits,
+    fp8_paged_mqa_avg_logits,
 )
 
 from .einsum import (

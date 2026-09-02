@@ -18,11 +18,13 @@ namespace cutlass::gemm::kernel {
 // ============================================================================
 
 template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights, uint32_t kNextN, uint32_t kNumHeads,
-          uint32_t kHeadDim, uint32_t BLOCK_KV, uint32_t WARP_KV, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t SPLIT_KV, bool SPLIT_MBLOCK>
+          uint32_t kHeadDim, uint32_t BLOCK_KV, uint32_t WARP_KV, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t SPLIT_KV,
+          bool SPLIT_MBLOCK, uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
 class PPUPagedMqaLogitsFP4 {
 public:
     static_assert(cute::is_same_v<ElementQK, uint8_t>, "FP4 paged MQA logits requires uint8_t ElementQK");
     static_assert(kHeadDim == 64, "FP4 packed head_dim must be 64 (original 128 / 2)");
+    static_assert(kScaleMode == deep_gemm::kScaleModeWeights, "FP4 supports the weights mode only");
 
     static constexpr int BLOCK_M = BLOCK_KV;
     static constexpr int BLOCK_N = kNextN * kNumHeads;
@@ -622,7 +624,8 @@ public:
 namespace deep_gemm {
 
 template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights, uint32_t kNextN, uint32_t kNumHeads,
-          uint32_t kHeadDim, uint32_t BLOCK_KV, uint32_t WARP_KV, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t SPLIT_KV, bool SPLIT_MBLOCK>
+          uint32_t kHeadDim, uint32_t BLOCK_KV, uint32_t WARP_KV, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t SPLIT_KV,
+          bool SPLIT_MBLOCK, uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
 class PagedAttentionFP4 {
 public:
     static void run(const ElementQK* ptr_q, const uint32_t* q_sf, const ElementQK* ptr_k, const uint32_t* k_sf,
@@ -632,7 +635,7 @@ public:
                     const uint32_t* schedule_meta, hggcStream_t stream, int num_sms, int num_blocks) {
         using AttnKernel =
             cutlass::gemm::kernel::PPUPagedMqaLogitsFP4<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNextN, kNumHeads,
-                                                         kHeadDim, BLOCK_KV, WARP_KV, kNumQStages, kNumKVStages, SPLIT_KV, SPLIT_MBLOCK>;
+                                                         kHeadDim, BLOCK_KV, WARP_KV, kNumQStages, kNumKVStages, SPLIT_KV, SPLIT_MBLOCK, kScaleMode>;
 
         static constexpr int BLOCK_M = AttnKernel::BLOCK_M;
         static constexpr int BLOCK_N = AttnKernel::BLOCK_N;

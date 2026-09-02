@@ -23,6 +23,9 @@ def call_test_func(gemm_type, func_args):
         "Normal": test_gemm,
         "MqaLogits": test_mqa_logits,
         "PagedMqaLogits": test_paged_mqa_logits,
+        # Avg variants reuse the same test functions, which branch on gemm_type
+        "MqaAvgLogits": test_mqa_logits,
+        "PagedMqaAvgLogits": test_paged_mqa_logits,
     }
     if gemm_type in supported_call_funcs.keys():
         test_func = supported_call_funcs[gemm_type]

@@ -31,6 +31,24 @@ __device__ __inline__ uint32_t ld_shared_u32(const uint32_t* ptr) {
 namespace deep_gemm {
 
 // ============================================================
+// Scale mode: selects what the kernel's `weights` argument slot carries
+// and how it is applied in the epilogue
+// ============================================================
+
+// kScaleModeWeights: per-(q, head) weights, logits = sum_h(relu(qk) * w) * k_scale
+// kScaleModeQRow:    avg variant, per-Q-row float scale in the weights slot,
+//                    logits = sum_h(relu(qk)) * scale_q * k_scale / sqrt(head_dim)
+// kScaleModeQScalar: avg variant, broadcast scalar float scale in the weights slot
+//                    (same formula, scale_q shared by every Q row)
+// kScaleModeUnity:   avg variant without any Q-row scale (scale_q = 1)
+enum QScaleMode : uint32_t {
+    kScaleModeWeights = 0,
+    kScaleModeQRow = 1,
+    kScaleModeQScalar = 2,
+    kScaleModeUnity = 3,
+};
+
+// ============================================================
 // Non-paged block scheduler helpers
 // ============================================================
 
@@ -261,6 +279,75 @@ void float_epilogue_reduce_weights(const AccTensor& accum, int m,
         v_1 += transform(7, n);
 #endif
     }
+}
+
+// Avg (unweighted) epilogue reduce: plain ReLU sum over heads, same j->v_0/v_1
+// grouping as `float_epilogue_reduce_weights` (only the weights multiply is dropped)
+template <typename AccTensor>
+__forceinline__ __device__
+void float_epilogue_reduce_avg(const AccTensor& accum, int m,
+                               float& v_0, float& v_1) {
+    auto transform = [&](uint32_t j, uint32_t n) {
+        return fmaxf(accum(j, m, n), 0);
+    };
+    v_0 = 0; v_1 = 0;
+    #pragma unroll
+    for (uint32_t n = 0; n < cute::size<2>(accum); ++n) {
+#if __HGGC_ARCH__ == 150
+        v_0 += transform(0, n);
+        v_0 += transform(1, n);
+        v_1 += transform(2, n);
+        v_1 += transform(3, n);
+        v_0 += transform(4, n);
+        v_0 += transform(5, n);
+        v_1 += transform(6, n);
+        v_1 += transform(7, n);
+#else
+        v_0 += transform(0, n);
+        v_0 += transform(1, n);
+        v_1 += transform(2, n);
+        v_1 += transform(3, n);
+        v_1 += transform(4, n);
+        v_1 += transform(5, n);
+        v_0 += transform(6, n);
+        v_0 += transform(7, n);
+#endif
+    }
+}
+
+// ============================================================
+// WARP_Q == 4 (4 heads) epilogue helpers: a warp covers 4 q tokens x 4 heads
+// (WARP_QH = 16). C-fragment mapping per docs/mma/ppu_mma_thread_distribution.html.
+// Arch 150 only: PPU 1.0 has no fp8 MMA, so the 4-head fp8 tiles that instantiate
+// WARP_Q == 4 never compile there. Avg-only (the host rejects weighted H = 4).
+// ============================================================
+
+// 4-head in-thread head sums (requires MmaIterN == 1, accum(j, m, 0)):
+// lane T holds heads {2*(T&1), 2*(T&1)+1} of q_{T/2} (j 0-3) and q_{2+T/2} (j 4-7).
+// sums[t][r] is the row-G/row-(G+8) half of warp-local q token 2*t + T/2.
+template <typename AccTensor>
+__forceinline__ __device__
+void float_epilogue_reduce_wq4(const AccTensor& accum, int m,
+                               float (&sums)[2][2]) {
+    auto transform = [&](int j) {
+        return fmaxf(accum(j, m, 0), 0);
+    };
+    #pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        sums[0][r] = transform(2 * r) + transform(2 * r + 1);         // q_{T/2}
+        sums[1][r] = transform(4 + 2 * r) + transform(5 + 2 * r);     // q_{2+T/2}
+    }
+}
+
+// Cross-lane merge for the 4-head layout: a single xor round suffices —
+// lane T^1 holds the complementary head pair of the same q tokens
+__forceinline__ __device__
+void shfl_xor_reduce_wq4(float (&sums)[2][2]) {
+    #pragma unroll
+    for (int t = 0; t < 2; ++t)
+        #pragma unroll
+        for (int r = 0; r < 2; ++r)
+            sums[t][r] += __shfl_xor_sync(0xffffffffu, sums[t][r], 1);
 }
 
 // FP4 fma2 phase: weight access via tCrW tensor (no arch branching)
