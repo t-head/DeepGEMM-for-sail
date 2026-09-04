@@ -803,6 +803,115 @@ __global__ void {}(
         DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
+
+// Dense GEMV (m == 1) JIT runtime. Host-side mirror of the device GemvDenseArgs
+// in deep_gemm/impls/gemv_dense.cuh -- the two PODs must stay field-for-field
+// identical (same convention as GemvRuntime::GemvtArgs vs gemvt.cuh), since the
+// kernel receives it by value.
+class DenseGemvRuntime final : public LaunchRuntime<DenseGemvRuntime> {
+public:
+    struct GemvDenseArgs {
+        int N;
+        int K;
+        const void* x_ptr;   // lhs [1, K]
+        const void* w_ptr;   // rhs [N, K] row-major
+        void* y_ptr;         // out [1, N]
+        int64_t stride_wn;   // W row stride (elements, == K for contiguous rhs)
+    };
+
+    struct LaunchInfo {
+        int block_x, block_y, k_per_thread;
+        std::string kernel_name;
+    };
+
+    struct Args {
+        LaunchInfo launch_info;
+        LaunchArgs launch_args;
+        GemvDenseArgs kernel_params;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(
+            R"(
+#include <deep_gemm/impls/gemv_dense.cuh>
+
+namespace deep_gemm {{
+
+extern "C" __global__
+void {}(const GemvDenseArgs args) {{
+    gemv_dense_kernel_impl<__ppu_bfloat16, __ppu_bfloat16, float,
+                           int4, int4, {}, {}, {}>(args);
+}}
+
+}}
+)",
+            args.launch_info.kernel_name,
+            args.launch_info.block_x, args.launch_info.block_y, args.launch_info.k_per_thread);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    }
+};
+
+// bf16 dense GEMV fast path (m == 1). Returns true when the kernel was
+// launched; false means the shape is not covered and the caller must fall
+// back to the tile path.
+static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
+                            const torch::Tensor& out, const int& m, const int& n, const int& k) {
+    DG_HOST_ASSERT(m == 1);
+    TORCH_CHECK(lhs.is_contiguous() && rhs.is_contiguous() && out.is_contiguous(),
+                "dense gemv requires contiguous tensors");
+
+    int block_x = 0, block_y = 0, k_per_thread = 0;
+    if (!deep_gemm_bf16_common::dense_gemv_select_configs(n, k, rhs.data_ptr(), lhs.data_ptr(),
+                                                          block_x, block_y, k_per_thread))
+        return false;
+
+    DenseGemvRuntime::GemvDenseArgs params;
+    params.N = n;
+    params.K = k;
+    params.x_ptr = lhs.data_ptr<at::BFloat16>();
+    params.w_ptr = rhs.data_ptr<at::BFloat16>();
+    params.y_ptr = out.data_ptr<at::BFloat16>();
+    params.stride_wn = k;
+
+    dim3 block(block_x, block_y);
+    dim3 grid(ceil_div(n, block_y));
+
+    auto args = DenseGemvRuntime::Args{
+        .launch_info = {block_x, block_y, k_per_thread, "gemv_dense_bf16"},
+        .launch_args = {grid, block, 0},
+        .kernel_params = params,
+    };
+    const auto& code = DenseGemvRuntime::generate(args);
+    const auto& runtime = compiler->build("gemv_dense_bf16", code, block.x * block.y, 0);
+    const auto& kernel = runtime->kernel;
+
+    static constexpr GemmType kGemmType = GemmType::DenseGemm;
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_params(kGemmType, false, std::string("bf16"), 1, m, n, k, 0, nullptr,
+                                  (hggcStream_t)0);
+    }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    DenseGemvRuntime::launch(runtime, args);
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+    char* pEnv_params = std::getenv("show_log");
+    if (pEnv_params && isdigit(*pEnv_params)) {
+        int numRegs = 0, localSize = 0;
+        hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+        hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+
+        printf("[DenseGemm_BF16_GemV:]\n");
+        printf("group:%d, problem:[%d, %d, %d]\n", 1, m, n, k);
+        printf("BlockX:%d, BlockY:%d, k_per_thread:%d\n", block_x, block_y, k_per_thread);
+        printf("threadblock_count:%d, vreg:%d, stack:%d\n", (int)grid.x, int(numRegs), int(localSize));
+    }
+    return true;
+}
+
 // 8-element public boundary ConfigTuple (matches Python/vLLM stable contract).
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out, const int& m,
@@ -875,6 +984,13 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
     dim3 grid = get_grid_shape(hw_info.cu_count);
     bool kEnableSboOverlap = false;
     if (is_ppu1v5_device()) {
+        // Dense GEMV fast path (m == 1): SIMT kernel avoids the tile path's
+        // BM=16 padding (15/16 lane waste at m == 1).
+        // Explicit configs still force the tile path (escape hatch for tuning).
+        if (m == 1 && !configs.has_value() && gemv_dense_bf16(lhs, rhs, out, m, n, k)) {
+            return;
+        }
+
         // Runtime path selection: DG_USE_CUTE=0 selects original CUTLASS 3 path
         bool use_cute_free = true;
         if (const char* env_ct = std::getenv("DG_USE_CUTE")) {

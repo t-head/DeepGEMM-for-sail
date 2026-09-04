@@ -134,6 +134,53 @@ std::tuple<int, int, int, int, int, bool> get_gemv_best_configs(int m, int n, in
     return std::make_tuple(BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, SmallK);
 }
 
+// Dense GEMV (m == 1) launch-config selection. BlockX keys on
+// add_times = k / (16B / sizeof(bf16)) so the per-thread serial K chain stays
+// ~14 16B loads; BlockY = 128 / BlockX rows per block keep the grid dense.
+// Returns false when the shape/alignment is not covered; the caller falls back
+// to the tile path.
+bool dense_gemv_select_configs(int n, int k, const void* w, const void* x,
+                               int& block_x, int& block_y, int& k_per_thread) {
+    if (get_env<int>("DG_DISABLE_DENSE_GEMV", 0))
+        return false;
+    // Too few output rows: the grid would idle most CUs; the tile path's BM=16
+    // padding loss is also small there.
+    if (n < 64 || k < 8)
+        return false;
+    // bf16 + int4 (16B) vector loads: k must be a multiple of 8 elements and both
+    // base pointers 16B aligned (rhs rows then stay aligned too, stride == k).
+    constexpr int kElemAlign = 16 / 2;
+    if (k % kElemAlign != 0)
+        return false;
+    if ((reinterpret_cast<uintptr_t>(w) & 0xF) != 0 || (reinterpret_cast<uintptr_t>(x) & 0xF) != 0)
+        return false;
+
+    k_per_thread = 2;
+    const int add_times = k / kElemAlign;
+    constexpr int block_size = 128;
+    if (n <= 100) {
+        // One fat block per row, full-block K reduction (BlockX == 128
+        // exercises the cross-warp SMEM reduce).
+        block_x = 128;
+    } else if (add_times <= 2) {
+        block_x = 2;
+    } else if (add_times <= 4) {
+        block_x = 4;
+    } else if (add_times <= 8) {
+        block_x = 8;
+    } else if (add_times <= 64) {
+        block_x = 16;
+    } else if (add_times <= 512) {
+        block_x = 32;
+    } else if (add_times <= 1024) {
+        block_x = 64;
+    } else {
+        block_x = 128;
+    }
+    block_y = block_size / block_x;
+    return true;
+}
+
 // Returns 8-element tuple: (num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config)
 // NOTE: baseline 8-element contract. Adaptive warp_k/dense_s2_opt injection is done in the dense impl
 // (bf16_gemm.hpp), so MoE grouped callers unpack this tuple directly without narrowing.
