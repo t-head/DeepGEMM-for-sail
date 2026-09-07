@@ -34,8 +34,8 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 ```bash
 # Submodule must be cloned recursively
 git clone --recursive git@github.com:t-head/DeepGEMM-for-sail.git
-# Make symbolic links for third-party (ACTLIZE) include directories
-python setup.py develop
+# Make symbolic links for third-party (ACTLIZE) include directories and build
+bash develop.sh
 
 # Test JIT compilation
 python tests/test_jit.py
@@ -47,7 +47,7 @@ python tests/test_core.py
 ### Installation
 
 ```bash
-python setup.py install
+bash install.sh
 ```
 
 Then, import `deep_gemm` in your Python project, and enjoy!

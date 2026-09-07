@@ -71,15 +71,18 @@ class PostDevelopCommand(develop):
 
     @staticmethod
     def make_jit_include_symlinks():
-        # Make symbolic links of third-party include directories
+        # Make symbolic links of third-party include directories, one subdirectory per actlize
+        # library so that their colliding headers do not shadow each other
         for d in third_party_include_dirs:
             dirname = d.split('/')[-1]
             actlize_dirname = d.split('/')[1]
             src_dir = f'{current_dir}/{d}'
-            dst_dir = f'{current_dir}/deep_gemm/include/{dirname}' if actlize_dirname == 'actlize_v0.5.0' else  f'{current_dir}/deep_gemm/include/actlize_v1.0.0/{dirname}'
+            dst_parent = f'{current_dir}/deep_gemm/include/{actlize_dirname}'
+            dst_dir = f'{dst_parent}/{dirname}'
             assert os.path.exists(src_dir)
+            os.makedirs(dst_parent, exist_ok=True)
 
-            if os.path.exists(dst_dir):
+            if os.path.islink(dst_dir) or os.path.exists(dst_dir):
                 assert os.path.islink(dst_dir)
                 os.unlink(dst_dir)
 
@@ -118,9 +121,8 @@ class CustomBuildPy(build_py):
             dirname = d.split('/')[-1]
             actlize_dirname = d.split('/')[1]
             src_dir = os.path.join(current_dir, d)
-            include_dir = build_include_dir
-            if actlize_dirname == 'actlize_v1.0.0':
-                include_dir = include_dir + '/actlize_v1.0.0'
+            include_dir = os.path.join(build_include_dir, actlize_dirname)
+            os.makedirs(include_dir, exist_ok=True)
             dst_dir = os.path.join(include_dir, dirname)
 
             # Remove existing directory if it exists

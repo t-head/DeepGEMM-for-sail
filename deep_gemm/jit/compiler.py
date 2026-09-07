@@ -14,7 +14,8 @@ from .template import typename_map
 runtime_cache = RuntimeCache()
 
 _jit_include_dir_default = f'{os.path.dirname(os.path.abspath(__file__))}/../include'
-_jit_include_dir = _jit_include_dir_default
+_jit_include_dir_actlize_v050 = f'{_jit_include_dir_default}/actlize_v0.5.0'
+_jit_include_dir = _jit_include_dir_actlize_v050
 
 def hash_to_hex(s: str) -> str:
     md5 = hashlib.md5()
@@ -26,7 +27,7 @@ def set_jit_include_dir(new_jit_include_dir : str = None) -> None:
     if new_jit_include_dir :
         _jit_include_dir = f'{os.path.dirname(os.path.abspath(__file__))}/../include' + "/" + new_jit_include_dir
     else:
-        _jit_include_dir = _jit_include_dir_default
+        _jit_include_dir = _jit_include_dir_actlize_v050
     # print("--------------------------- set_jit_include_dir = ", _jit_include_dir)
 
 def get_jit_include_dir() -> str:
