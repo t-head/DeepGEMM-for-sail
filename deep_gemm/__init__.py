@@ -14,9 +14,6 @@ from .jit_kernels import (
     gemm_int8_int8_bf16_nt,
     # m_grouped_gemm_fp4_fp4_bf16_nt_masked,
     # m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
-    m_grouped_gemm_w4a16_masked,
-    m_grouped_gemm_w4a16_nopad,
-    m_grouped_gemm_w4a16_fused,
     # preprocess_mxfp4_scales,
     uint8_padding,
     # preprocess_mxfp4_weight_for_act_and_quant_fusing,
@@ -77,6 +74,10 @@ from .deep_gemm_cpp import (
     int8_einsum,
     preprocess_mxfp4_scales,
     preprocess_mxfp4_weight_for_act_and_quant_fusing,
+    # W4A16 / W4FA16 GEMMs
+    m_grouped_gemm_w4a16_nopad,
+    m_grouped_gemm_w4a16_masked,
+    m_grouped_gemm_w4a16_fused,
 )
 
 use_cpp_jit_for_python = os.environ.get('USE_CPP_JIT_FOR_PYTHON', '').lower()

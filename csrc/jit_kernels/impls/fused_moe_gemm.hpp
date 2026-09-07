@@ -21,7 +21,7 @@
 namespace deep_gemm {
 
 // 7-element config tuple for fused MoE kernels: (num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages)
-using FusedConfigTuple = std::tuple<int, int, int, int, int, int, int>;
+using FusedCommonConfigTuple = std::tuple<int, int, int, int, int, int, int>;
 
 class Bf16FusedMoeRuntime final : public LaunchRuntime<Bf16FusedMoeRuntime> {
 public:
@@ -103,7 +103,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
     const torch::Tensor& expert_ids_and_cumsum,
     const torch::Tensor& sorted_token_ids,
     const torch::Tensor& aligned_num_m_blocks,
-    const FusedConfigTuple& configs)
+    const FusedCommonConfigTuple& configs)
 {
     const auto& [num_token, k] = get_shape<2>(lhs);
     const auto& [num_groups, n, k_] = get_shape<3>(rhs);
@@ -350,7 +350,7 @@ static void m_grouped_gemm_perchannel_nt_fused_impl(
     const torch::Tensor& expert_ids_and_cumsum,
     const torch::Tensor& sorted_token_ids,
     const torch::Tensor& aligned_num_m_blocks,
-    const FusedConfigTuple& configs)
+    const FusedCommonConfigTuple& configs)
 {
     const auto& [num_token, k] = get_shape<2>(lhs);
     const auto& [num_groups, n, k_] = get_shape<3>(rhs);
@@ -458,7 +458,7 @@ static void m_grouped_gemm_blkwise_nt_fused_impl(
     const torch::Tensor& sorted_token_ids,
     const torch::Tensor& aligned_num_m_blocks,
     int topk,
-    const FusedConfigTuple& configs)
+    const FusedCommonConfigTuple& configs)
 {
     const auto& [num_token, k] = get_shape<2>(lhs);
     const auto& [num_groups, n, k_] = get_shape<3>(rhs);

@@ -15,9 +15,13 @@
 #include "../jit_kernels/impls/tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/fused_moe_gemm.hpp"
 #include "../jit_kernels/impls/moe_align.hpp"
+#include "../jit_kernels/impls/m_grouped_w4a16_gemm.hpp"
 
 namespace deep_gemm::gemm {
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
+// The 9-tuple returned by `w4a16_get_best_configs`:
+// (num_sms, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages, n_expand)
+using W4A16ConfigTuple = deep_gemm_w4a16_common::W4A16ConfigTuple;
 extern "C" {
 static bool early_return(const int& m, const int &n, const int& k,
                          const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
@@ -665,7 +669,7 @@ void m_grouped_gemm_bf16_bf16_bf16_nt_fused(
     const torch::Tensor& expert_ids_and_cumsum,
     const torch::Tensor& sorted_token_ids,
     const torch::Tensor& aligned_num_m_blocks,
-    FusedConfigTuple configs) {
+    FusedCommonConfigTuple configs) {
 
     const auto& [num_token, k] = get_shape<2>(lhs);
     const auto& [num_groups, n, k_] = get_shape<3>(rhs);
@@ -697,7 +701,7 @@ void m_grouped_gemm_fp8_fp8_bf16_nt_fused(
     const torch::Tensor& expert_ids_and_cumsum,
     const torch::Tensor& sorted_token_ids,
     const torch::Tensor& aligned_num_m_blocks,
-    FusedConfigTuple configs) {
+    FusedCommonConfigTuple configs) {
 
     const auto& lhs = lhs_.first;
     const auto& lhs_scales = lhs_.second;
@@ -757,7 +761,7 @@ void m_grouped_gemm_int8_int8_bf16_nt_fused(
     const torch::Tensor& expert_ids_and_cumsum,
     const torch::Tensor& sorted_token_ids,
     const torch::Tensor& aligned_num_m_blocks,
-    FusedConfigTuple configs) {
+    FusedCommonConfigTuple configs) {
 
     const auto& lhs = lhs_.first;
     const auto& lhs_scales = lhs_.second;
@@ -946,16 +950,158 @@ void tf32_hc_prenorm_gemm_nt(const torch::Tensor& a, const torch::Tensor& b, con
 // moe_align preprocessing (C++ JIT) — apis-layer interface owns input
 // validation; the impls layer (jit_kernels/impls/moe_align.hpp) only
 // orchestrates config resolution + kernel dispatch.
+//
+// NOTES: `config` is the dtype-dependent tuple `MoeAlignConfig` models -- 7 params for the bf16 /
+// int8 / fp8 fused kernels, 9 for the W4A16 ones -- so both widths are accepted and returned here.
 MoeAlignReturn moe_align_block_size(
     const torch::Tensor& lhs,
     const torch::Tensor& rhs,
     const torch::Tensor& topk_ids,
     bool perchannel_quant = false,
-    std::optional<FusedConfigTuple> config = std::nullopt) {
+    std::optional<FusedCommonConfigTuple> config = std::nullopt) {
     DG_HOST_ASSERT(topk_ids.dtype() == torch::kInt32);
     DG_HOST_ASSERT(topk_ids.dim() == 2);
 
     return moe_align_block_size_impl(lhs, rhs, topk_ids, perchannel_quant, config);
+    }
+// The problem sizes the W4A16 implementations need, derived from the operands here so the API layer
+// owns the shape contract.
+struct W4A16Operands {
+    int m, n, k, num_groups, group_size;
+};
+
+// Shape, dtype and layout checks shared by the three W4A16 entries. The operand layout depends only on
+// `w4a16_type`, which is why upstream kept these in `m_grouped_gemm_w4a16_common` instead of per entry;
+// they live here so malformed operands are rejected at the API boundary like the FP8/INT8 entries do.
+//
+// NOTES: an empty problem short-circuits before the operand checks, exactly as upstream did -- nothing
+// gets launched, so its shapes are never inspected.
+static W4A16Operands check_w4a16_operands(deep_gemm_w4a16_common::W4A16Type w4a16_type,
+                                          const torch::Tensor& lhs, const torch::Tensor& rhs,
+                                          const torch::Tensor& rhs_scales, const torch::Tensor& out,
+                                          GemmType gemm_type) {
+    const bool is_mma = deep_gemm_w4a16_common::uses_mma_kernel(w4a16_type);
+
+    int m, k, n_;
+    if (gemm_type == GemmType::GroupedMasked) {
+        m = static_cast<int>(lhs.size(1)), k = static_cast<int>(lhs.size(2));
+        n_ = static_cast<int>(out.size(2));
+    } else {
+        m = static_cast<int>(lhs.size(0)), k = static_cast<int>(lhs.size(1));
+        n_ = static_cast<int>(out.size(1));
+    }
+    const int num_groups = static_cast<int>(rhs.size(0));
+    // The MMA weight is already N-major, the packed one carries two N elements per int32
+    const int n = is_mma ? n_ : static_cast<int>(rhs.size(2)) / 2;
+
+    const int64_t scale_elements_per_group = rhs_scales.size(1) * rhs_scales.size(2);
+    DG_HOST_ASSERT(static_cast<int64_t>(k) * n % scale_elements_per_group == 0);
+    const int group_size = static_cast<int>(static_cast<int64_t>(k) * n / scale_elements_per_group);
+    // W4A16 only supports group_size=32
+    DG_HOST_ASSERT(group_size == 32);
+
+    const W4A16Operands operands{m, n, k, num_groups, group_size};
+    // Type and shape checks
+    if (m == 0)
+        return operands;
+    // K must be a multiple of group_size
+    DG_HOST_ASSERT(k % group_size == 0);
+    DG_HOST_ASSERT(n == n_);
+    if (is_mma) {
+        // w4fa16_mma weight dtype must be uint8, shaped (num_groups, n, k / 2)
+        DG_HOST_ASSERT(rhs.scalar_type() == torch::kUInt8);
+        DG_HOST_ASSERT(rhs.dim() == 3 and rhs.size(0) == num_groups and rhs.size(1) == n and rhs.size(2) == k / 2);
+        // w4fa16_mma scale dtype must be uint8, shaped (num_groups, n / 64, k * 2)
+        DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kUInt8);
+        DG_HOST_ASSERT(rhs_scales.dim() == 3 and rhs_scales.size(0) == num_groups and
+                       rhs_scales.size(1) == n / 64 and rhs_scales.size(2) == k * 2);
+    } else {
+        DG_HOST_ASSERT(rhs.dim() == 3 and rhs.size(0) == num_groups and rhs.size(1) == k / 16 and
+                       rhs.size(2) == n * 2);
+        DG_HOST_ASSERT(rhs_scales.dim() == 3 and rhs_scales.size(0) == num_groups and
+                       rhs_scales.size(1) == k / group_size and rhs_scales.size(2) == n);
+        DG_HOST_ASSERT(rhs.scalar_type() == torch::kInt32);
+    }
+    DG_HOST_ASSERT(n > 0 and k > 0 and n % 64 == 0 and k % 16 == 0);
+    DG_HOST_ASSERT(lhs.scalar_type() == torch::kBFloat16);
+    if (w4a16_type == deep_gemm_w4a16_common::W4A16Type::mxfp4_e8m0) {
+        // W4FA16 E8M0 scale dtype must be uint8
+        DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kUInt8);
+    } else if (not is_mma) {
+        // W4A16 BF16 scale dtype must be bfloat16
+        DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kBFloat16);
+    }
+    DG_HOST_ASSERT(out.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous());
+    DG_HOST_ASSERT(rhs_scales.is_contiguous());
+    return operands;
+}
+
+// NOTES: the weight and its scale arrive as one pair because they are always produced together by the
+// quantizer; `w4a16_type` is resolved here for the operand checks and again inside the implementation,
+// which needs it to pick `ElementB` / `ElementScale`
+static void m_grouped_gemm_w4a16_nopad(const torch::Tensor& lhs,
+                                       const std::pair<torch::Tensor, torch::Tensor>& rhs_,
+                                       const torch::Tensor& out,
+                                       const torch::Tensor& m_indices,
+                                       const std::optional<torch::Tensor>& m_rows = std::nullopt,
+                                       std::optional<W4A16ConfigTuple> configs = std::nullopt,
+                                       bool fp4_use_bf16_scale = false) {
+    const auto& rhs = rhs_.first;
+    const auto& rhs_scales = rhs_.second;
+    const auto w4a16_type = deep_gemm_w4a16_common::get_w4a16_type(rhs.scalar_type(), rhs_scales.scalar_type(),
+                                                                  fp4_use_bf16_scale);
+    const auto& operands = check_w4a16_operands(w4a16_type, lhs, rhs, rhs_scales, out, GemmType::GroupedNoPad);
+    if (operands.m == 0)
+        return;
+
+    m_grouped_gemm_w4a16_nopad_impl(lhs, rhs, rhs_scales, out, m_indices,
+                                    m_rows.value_or(torch::Tensor()),
+                                    operands.m, operands.n, operands.k, operands.num_groups, operands.group_size,
+                                    configs, fp4_use_bf16_scale);
+}
+
+static void m_grouped_gemm_w4a16_masked(const torch::Tensor& lhs,
+                                        const std::pair<torch::Tensor, torch::Tensor>& rhs_,
+                                        const torch::Tensor& out,
+                                        const torch::Tensor& masked_m,
+                                        int expected_m,
+                                        std::optional<W4A16ConfigTuple> configs = std::nullopt,
+                                        bool fp4_use_bf16_scale = false) {
+    const auto& rhs = rhs_.first;
+    const auto& rhs_scales = rhs_.second;
+    const auto w4a16_type = deep_gemm_w4a16_common::get_w4a16_type(rhs.scalar_type(), rhs_scales.scalar_type(),
+                                                                  fp4_use_bf16_scale);
+    const auto& operands = check_w4a16_operands(w4a16_type, lhs, rhs, rhs_scales, out, GemmType::GroupedMasked);
+    if (operands.m == 0)
+        return;
+
+    m_grouped_gemm_w4a16_masked_impl(lhs, rhs, rhs_scales, out, masked_m,
+                                     operands.m, operands.n, operands.k, operands.num_groups, operands.group_size,
+                                     expected_m, configs, fp4_use_bf16_scale);
+}
+
+static void m_grouped_gemm_w4a16_fused(const torch::Tensor& lhs,
+                                       const std::pair<torch::Tensor, torch::Tensor>& rhs_,
+                                       const torch::Tensor& out,
+                                       const torch::Tensor& m_rows,
+                                       const torch::Tensor& expert_ids_and_cumsum,
+                                       const torch::Tensor& sorted_token_ids,
+                                       const torch::Tensor& aligned_num_m_blocks,
+                                       const W4A16ConfigTuple& configs,
+                                       bool fp4_use_bf16_scale = false) {
+    const auto& rhs = rhs_.first;
+    const auto& rhs_scales = rhs_.second;
+    const auto w4a16_type = deep_gemm_w4a16_common::get_w4a16_type(rhs.scalar_type(), rhs_scales.scalar_type(),
+                                                                  fp4_use_bf16_scale);
+    const auto& operands = check_w4a16_operands(w4a16_type, lhs, rhs, rhs_scales, out, GemmType::GroupedFused);
+    if (operands.m == 0)
+        return;
+
+    m_grouped_gemm_w4a16_fused_impl(lhs, rhs, rhs_scales, out, m_rows, expert_ids_and_cumsum,
+                                    sorted_token_ids, aligned_num_m_blocks,
+                                    operands.m, operands.n, operands.k, operands.num_groups, operands.group_size,
+                                    configs, fp4_use_bf16_scale);
 }
 }
 
@@ -1039,6 +1185,16 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
           py::arg("expected_m"), py::arg("configs") = std::nullopt, py::arg("max_block_n") = 256,
           py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt,
           py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt);
+    // W4A16 / W4FA16 GEMMs
+    m.def("m_grouped_gemm_w4a16_nopad", &m_grouped_gemm_w4a16_nopad, py::arg("lhs"), py::arg("rhs_"),
+          py::arg("out"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt,
+          py::arg("configs") = std::nullopt, py::arg("fp4_use_bf16_scale") = false);
+    m.def("m_grouped_gemm_w4a16_masked", &m_grouped_gemm_w4a16_masked, py::arg("lhs"), py::arg("rhs_"),
+          py::arg("out"), py::arg("masked_m"), py::arg("expected_m"), py::arg("configs") = std::nullopt,
+          py::arg("fp4_use_bf16_scale") = false);
+    m.def("m_grouped_gemm_w4a16_fused", &m_grouped_gemm_w4a16_fused, py::arg("lhs"), py::arg("rhs_"),
+          py::arg("out"), py::arg("m_rows"), py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
+          py::arg("aligned_num_m_blocks"), py::arg("configs"), py::arg("fp4_use_bf16_scale") = false);
     // TF32 GEMMs
     m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("sqr_sum"), py::arg("num_splits") = std::nullopt, py::arg("configs") = std::nullopt);

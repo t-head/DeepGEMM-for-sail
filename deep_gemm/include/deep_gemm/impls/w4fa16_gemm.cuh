@@ -3,6 +3,13 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #pragma clang diagnostic ignored "-Wswitch"
 
+#ifndef W4A16_HGRTC
+    #include <deep_gemm/common/profiling_interface.cuh>
+    #include <deep_gemm/common/utils.cuh>
+#else
+    #include <deep_gemm/common/utils_rtc.cuh>
+#endif
+
 #include "cute/ppu_tensor_mix.hpp"
 #include "cutlass/gemm/config/gemm_operands.hpp"
 #include "cute/atom/mma_traits_ppu0010.hpp"

@@ -6,8 +6,10 @@
 // deterministic K1->K2->K3->K4 phases are built and launched one by one).
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <tuple>
+#include <variant>
 #include <torch/python.h>
 
 #include "../../jit/compiler.hpp"
@@ -20,7 +22,8 @@
 #include "../heuristics/common_bf16.hpp"
 #include "../heuristics/common_fp8.hpp"
 #include "../heuristics/common_int8.hpp"
-#include "fused_moe_gemm.hpp"  // FusedConfigTuple
+#include "../heuristics/common_w4a16.hpp"
+#include "fused_moe_gemm.hpp"  // FusedCommonConfigTuple
 
 namespace deep_gemm {
 
@@ -261,8 +264,13 @@ __global__ void moe_align_p4(
 // =============================================================================
 // Host impl fn — mirrors Python moe_align_block_size in a_fused_m_grouped_gemm.py
 // =============================================================================
+// The config slot is dtype-dependent, exactly as in Python (`return_config = config if w4a16_type is
+// not None else config[:7]`): the W4A16 flavours hand back the full 9-tuple their fused GEMM unpacks,
+// while every other dtype drops the trailing `smem_config` and forwards only the first 7 tuning params.
+using FusedConfigTuple = std::variant<FusedCommonConfigTuple, deep_gemm_w4a16_common::W4A16ConfigTuple>;
+
 using MoeAlignReturn = std::tuple<
-    FusedConfigTuple,      // config (7-tuple, matches Python config[:7] for non-w4a16)
+    FusedConfigTuple,        // config (7-tuple, or the W4A16 9-tuple)
     torch::Tensor,         // m_rows
     torch::Tensor,         // expert_ids_and_cumsum
     torch::Tensor,         // sorted_token_ids
@@ -281,13 +289,22 @@ static MoeAlignReturn moe_align_block_size_impl(
     // (csrc/apis/gemm.hpp); this impl only orchestrates config resolution
     // + kernel dispatch and no longer re-checks its inputs.
     const auto& [num_token, k] = get_shape<2>(lhs);
-    const auto& [num_groups_l, n, k_] = get_shape<3>(rhs);
-    (void)num_token;
-    (void)k_;
+    const auto& [num_groups_l, rhs_dim1, rhs_dim2] = get_shape<3>(rhs);
     int num_groups = static_cast<int>(num_groups_l);
+    int n = rhs_dim1;
+    // NOTES: only the weight is in scope here, not its scales, so an `int32` weight cannot be told
+    // apart from `mxfp4_e8m0` / `mxfp4_bf16` and upstream just labels it `int4`. Harmless for config
+    // selection -- `get_best_configs` only branches on `mxfp4_e8m0_mma` -- so the label is mirrored.
+    std::optional<deep_gemm_w4a16_common::W4A16Type> w4a16_type;
+    if (rhs.dtype() == torch::kInt32) {
+        n = rhs_dim2 / 2;
+        w4a16_type = deep_gemm_w4a16_common::W4A16Type::int4;
+    } else if (lhs.dtype() == torch::kBFloat16 and rhs.dtype() == torch::kUInt8) {
+        w4a16_type = deep_gemm_w4a16_common::W4A16Type::mxfp4_e8m0_mma;
+    }
+
     int numel = static_cast<int>(topk_ids.numel());
     int topk  = static_cast<int>(topk_ids.size(1));
-
     // Resolve config (mirrors Python dtype/perchannel dispatch)
     FusedConfigTuple config;
     if (config_in.has_value()) {
@@ -295,16 +312,19 @@ static MoeAlignReturn moe_align_block_size_impl(
     } else {
         const int num_sms = get_num_sms();
         const int expected_m = ceil_div(numel, num_groups);
-        auto take_first_7 = [](const auto& full) -> FusedConfigTuple {
-            return FusedConfigTuple{std::get<0>(full), std::get<1>(full), std::get<2>(full),
+        auto take_first_7 = [](const auto& full) -> FusedCommonConfigTuple {
+            return FusedCommonConfigTuple{std::get<0>(full), std::get<1>(full), std::get<2>(full),
                                     std::get<3>(full), std::get<4>(full), std::get<5>(full),
                                     std::get<6>(full)};
         };
-        const bool is_w4a16 = (rhs.dtype() == torch::kInt32);
-        if (is_w4a16) {
-            TORCH_CHECK(false,
-                        "moe_align_block_size (C++ JIT): auto-config for w4a16 (int32 rhs) is "
-                        "not ported yet; pass an explicit `config` or unset USE_CPP_JIT_FOR_PYTHON");
+        if (w4a16_type.has_value()) {
+            // Forwarded whole: the W4A16 fused GEMM unpacks all 9 params, `warp_k` and `n_expand`
+            // included, so there is nothing to truncate here
+            const auto& c = deep_gemm_w4a16_common::get_best_configs(
+                expected_m, n, static_cast<int>(k), num_groups, num_sms, GemmType::GroupedFused, *w4a16_type);
+            config = deep_gemm_w4a16_common::W4A16ConfigTuple{c.num_sms, c.block_m, c.block_n, c.block_k,
+                                                             c.warp_m, c.warp_n, c.warp_k, c.num_stages,
+                                                             c.n_expand};
         } else if (lhs.dtype() == torch::kBFloat16) {
             config = take_first_7(deep_gemm_bf16_common::get_best_configs(
                 expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms));
@@ -321,10 +341,10 @@ static MoeAlignReturn moe_align_block_size_impl(
         } else {
             TORCH_CHECK(false,
                         "moe_align_block_size (C++ JIT): unsupported lhs dtype "
-                        "(supported: bf16 / int8-perchannel / fp8-e4m3fn; w4a16 and fp4 pending)");
+                        "(supported: bf16 / int8-perchannel / fp8-e4m3fn / w4a16; fp4 pending)");
         }
     }
-    int block_m = std::get<1>(config);
+    const int block_m = std::visit([](const auto& c) { return std::get<1>(c); }, config);
     DG_HOST_ASSERT(num_groups > 0);
     DG_HOST_ASSERT(block_m > 0);
 

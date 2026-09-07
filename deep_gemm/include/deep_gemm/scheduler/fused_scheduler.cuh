@@ -1,5 +1,5 @@
 #pragma once
-#include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/common/utils_rtc.cuh>
 namespace deep_gemm {
 
 template <GemmType kGemmType,

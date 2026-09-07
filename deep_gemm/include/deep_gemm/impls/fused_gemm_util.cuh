@@ -1,6 +1,6 @@
 #pragma once
 #include <cub/cub.cuh>
-#include "utils_rtc.cuh"
+#include <deep_gemm/common/utils_rtc.cuh>
 
 #include "cute/ppu_tensor_mix.hpp"
 #include "cutlass/gemm/config/gemm_operands.hpp"
@@ -916,5 +916,4 @@ void moe_align_block_size_kernel_launcher(
                 numel, kNumGroups);
     }
 }
-
 } // namespace deep_gemm
