@@ -5,6 +5,7 @@
 #include <queue>
 #include <fstream>
 #include <sstream>
+#include <utility>
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
@@ -107,21 +108,24 @@ private:
     int _bpp;
     int reg_db;
     std::vector<std::vector<int>> _config_tile;
-    std::unordered_map<int, bool> _filter_metric;
+    // Must preserve insertion order: this is the metric priority used by _multi_phase_topk,
+    // matching the dict literal in gemm_search_space.py. An unordered container would let the
+    // hash bucket layout decide the priority and silently reverse it.
+    std::vector<std::pair<int, bool>> _filter_metric;
     HWMetric _hw_metric;
 
 public:
     MatmulHeuristicsTile(const std::vector<int>& shape, int bpp, const std::vector<std::vector<int>>& config_tile = {})
         : _shape(shape), _bpp(bpp), reg_db(2), _config_tile(config_tile) {
-        _filter_metric[BLOCK_RLOADSIZE] = MIN_TOPK;
-        _filter_metric[BLOCK_UTILS] = MAX_TOPK;
-        _filter_metric[WAVE] = MIN_TOPK;
-        _filter_metric[LAST_WAVE_BLOCK] = MAX_TOPK;
-        _filter_metric[WARPS_PER_CU] = MIN_TOPK;
-        _filter_metric[L2_UTILS] = MAX_TOPK;
-        _filter_metric[SHAREMEM_UTILS] = MAX_TOPK;
-        _filter_metric[REGS_RLOADSIZE_PER_CU] = MIN_TOPK;
-        _filter_metric[REG_UTILS] = MAX_TOPK;
+        _filter_metric = {{BLOCK_RLOADSIZE, MIN_TOPK},
+                          {BLOCK_UTILS, MAX_TOPK},
+                          {WAVE, MIN_TOPK},
+                          {LAST_WAVE_BLOCK, MAX_TOPK},
+                          {WARPS_PER_CU, MIN_TOPK},
+                          {L2_UTILS, MAX_TOPK},
+                          {SHAREMEM_UTILS, MAX_TOPK},
+                          {REGS_RLOADSIZE_PER_CU, MIN_TOPK},
+                          {REG_UTILS, MAX_TOPK}};
     }
 
     std::vector<std::vector<int>> _add_candidate_tile(const std::vector<std::vector<int>>& candidate_tile,
