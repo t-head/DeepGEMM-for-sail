@@ -25,7 +25,7 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 
 - ZW 610 / 610E / 810 / 810E / M890
 - Python 3.8 or above
-- PPU SDK 12.3 or above
+- PPU SDK 2.2 or above
 - PyTorch 2.1 or above
 - ACTLIZE for PPU: v1.0.0
 
@@ -60,12 +60,13 @@ This library focuses on high-performance tensor cell kernels and related LLM com
 
 #### Data Precisions
 
-| Algorithm | INT8 | FP4 | FP8 | BF16 |
-| :--- | :---: | :---: | :---: | :---: |
-| **Non-grouped** | ✅ | ✅ | ✅ | ✅ |
-| **Contiguous** | ✅ | ✅ | ✅ | ✅ |
-| **No-pad** | ✅ | ✅ | ✅ | ✅ |
-| **Masked** | ✅ | ✅ | ✅ | ✅ |
+| Algorithm | INT8 | FP4 | FP8 | BF16 | W4A16 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Non-grouped** | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Contiguous** | ✅ | ❌ | ✅ | ✅ | ❌ |
+| **No-pad** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Masked** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Fused** | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 #### Normal dense GEMMs (non-grouped)
 
@@ -133,15 +134,33 @@ Both take `(tensor, scales)` tuples as `a`/`b`, write to the BF16 output `d`, an
 
 For more information, please refer to the `fp8_einsum` and `int8_einsum` function documentation.
 
+#### Interfaces exposed but not yet implemented
+
+For API compatibility with the upstream DeepGEMM, some symbols are exported by `deep_gemm` but are **not yet ported to the PPU build**. Calling them raises `NotImplementedError`:
+
+- K-axis grouped GEMMs: `k_grouped_fp8_gemm_nt_contiguous`, `k_grouped_fp8_gemm_tn_contiguous`, `k_grouped_bf16_gemm_tn_contiguous`
+- M-grouped NN contiguous: `m_grouped_fp8_gemm_nn_contiguous`
+- FP8xFP4 dense GEMMs: `fp8_fp4_gemm_nt`, `fp8_fp4_gemm_nn`, `fp8_fp4_gemm_tn`, `fp8_fp4_gemm_tt`
+- FP8xFP4 M-grouped GEMMs: `m_grouped_fp8_fp4_gemm_nt_contiguous`, `m_grouped_fp8_fp4_gemm_nn_contiguous`, `m_grouped_fp8_fp4_gemm_nt_masked`
+- `fp8_gemm_nt_skip_head_mid`
+
+In addition, the dense GEMM kernels only implement the NT layout. The `nn` / `tn` / `tt` variants (`bf16_gemm_{nn,tn,tt}`, `fp8_gemm_{nn,tn,tt}`) are exposed for naming completeness but raise an error, because non-NT layouts are not supported for performance reasons. Use the `acblaslt_gemm_{nt, nn, tn, tt}` fallback if a non-NT layout is required.
+
 #### Utilities
 
 The library provides some utility functions besides the above kernels:
 
-- `deep_gemm.set_num_sms`: set the maximum SM count to use
-- `deep_gemm.get_num_sms`: get the current SM maximum count
-- `deep_gemm.get_m_alignment_for_contiguous_layout`: get the group-level alignment requirement for grouped contiguous layout
+- `deep_gemm.set_num_sms` / `get_num_sms`: set/get the maximum CU count to use
+- `deep_gemm.set_tc_util` / `get_tc_util`: set/get an approximated tensor cell utilization ratio
+- `deep_gemm.set_pdl` / `get_pdl`: enable/disable Programmatic Dependent Launch (PDL)
+- `deep_gemm.set_compile_mode` / `get_compile_mode`: set/get the JIT compile mode
+- `deep_gemm.set_ignore_compile_dims`: configure dimensions to ignore during JIT compilation
+- `deep_gemm.set_block_size_multiple_of`: constrain block sizes to be multiples of a given value
+- `deep_gemm.get_mk_alignment_for_contiguous_layout`: get the group-level M/K alignment requirement for grouped contiguous layout
 - `deep_gemm.get_tma_aligned_size`: get the required AIU alignment size
-- `deep_gemm.get_col_major_tma_aligned_tensor`: get a column-major AIU-aligned tensor
+- `deep_gemm.get_mn_major_tma_aligned_tensor`: get an MN-major AIU-aligned tensor
+- `deep_gemm.get_col_major_tensor`: get a column-major tensor
+- `deep_gemm.transform_sf_into_required_layout`: transform scaling factors into the layout required by the target recipe
 
 The library also provides some environment variables, which may be useful:
 
@@ -154,8 +173,13 @@ The library also provides some environment variables, which may be useful:
   - `DG_JIT_USE_HGRTC`: `0` or `1`, use HGRTC instead of HGCC, faster compilation but maybe have lower performance for some cases, `0` by default
   - `DG_JIT_HGCC_COMPILER`: string, specified compiler path; will find in `PPU_SDK` or `PPU_HOME` env by default
 - **Compiler options**
+  - `DG_CPP_STANDARD`: integer, C++ standard version, `17` by default
+  - `DG_JIT_DISABLE_PCH`: `0` or `1`, disable precompiled headers during JIT compilation, `0` by default
   - `DG_JIT_PTXAS_VERBOSE`: `0` or `1`, show detailed PTXAS compiler output, `0` by default
-  - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print HGCC compilation command, `0` by default
+  - `DG_JIT_WITH_LINEINFO`: `0` or `1`, embed source line info for profiling tools, `0` by default
+  - `DG_JIT_PRINT_LOAD_TIME`: `0` or `1`, print the kernel load time, `0` by default
+- **Runtime**
+  - `DG_USE_PYTORCH_ACBLASLT_HANDLE`: `0` or `1`, use the PyTorch-managed acBLASLt handle instead of the built-in one, `0` by default
 - **Testing**
   - `DG_USE_PPU_TOOLS`: `0` or `1`, skip the built-in Kineto profiling to stay compatible with external tools (Asight Systems / Asight Compute / Compute Sanitizer), `0` by default
 

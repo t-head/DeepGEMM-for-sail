@@ -17,7 +17,7 @@ def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[
         try:
             x, y, out, ref_out = construct(m, k, n, torch.uint8)
 
-            deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, None, out, configs)
+            deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, None, out, configs=configs)
             torch.cuda.synchronize()
 
             diff = calc_diff(out, ref_out.to('cuda').to(torch.bfloat16))

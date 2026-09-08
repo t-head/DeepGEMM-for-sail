@@ -38,15 +38,15 @@ def test_func_dense(cycle, tid, m, n, k, d, tile_list, x, y, out, ref_out):
         print("scan_tile = ", tile_config)
         print("test_gemm->test_func: ", m, n, k, d)
         if d == torch.bfloat16:
-            deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out, tile_config)
+            deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out, configs=tile_config)
         elif d == torch.float8_e4m3fn:
-            deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out, tile_config)
+            deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out, configs=tile_config)
         elif d == torch.uint8:
             m, n = out.shape
             bias = torch.zeros((m, n), device='cuda', dtype=torch.float)
-            deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, bias, out, tile_config)
+            deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, bias, out, configs=tile_config)
         else:
-            deep_gemm.gemm_int8_int8_bf16_nt(x, y, out, tile_config)
+            deep_gemm.gemm_int8_int8_bf16_nt(x, y, out, configs=tile_config)
         if not cycle and not os.environ.get('HGGC_WARM_UP', False):
             diff = calc_diff(out, ref_out)
             if diff >= 0.001:
@@ -92,11 +92,11 @@ def test_func_contiguous(cycle, tid, m, n, k, d, tile_list, x, y, out, m_indices
         print("scan_tile = ", tile_config)
         print("test_func_contiguous: ", m, n, k, d)
         if d == torch.bfloat16:
-            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices, tile_config)
+            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices, configs=tile_config)
         elif d == torch.int8:
-            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices, tile_config)
+            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices, configs=tile_config)
         else:
-            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices, tile_config)
+            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices, configs=tile_config)
 
         if not cycle and not os.environ.get('HGGC_WARM_UP', False):
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
@@ -146,11 +146,11 @@ def test_func_masked(cycle, tid, m, n, k, d, tile_list, x, y, out, masked_m, em,
         print("test_func_masked: ", m, n, k, d)
 
         if (d == torch.bfloat16):
-            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, em, tile_config)
+            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, em, configs=tile_config)
         elif d == torch.float8_e4m3fn:
-            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, em, tile_config)
+            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, em, configs=tile_config)
         else:
-            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, em, tile_config)
+            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(x, y, out, masked_m, em, configs=tile_config)
 
         if not cycle and not os.environ.get('HGGC_WARM_UP', False):
             for j in range(num_groups):
@@ -204,13 +204,13 @@ def test_func_nopad(cycle, tid, m, n, k, d, tile_list, x, y, out, m_indices, dis
         print("test_func_nopad: ", m, n, k, d)
 
         if (d == torch.bfloat16):
-            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices, distribute, tile_config)
+            deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices, distribute, configs=tile_config)
         elif d == torch.float8_e4m3fn:
-            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices, distribute, tile_config)
+            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices, distribute, configs=tile_config)
         elif d == torch.uint8:
-            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices, distribute, tile_config)
+            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices, distribute, configs=tile_config)
         else:
-            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices, distribute, tile_config)
+            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices, distribute, configs=tile_config)
 
         if not cycle and not os.environ.get('HGGC_WARM_UP', False):
             out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)

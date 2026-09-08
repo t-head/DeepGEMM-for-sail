@@ -266,7 +266,7 @@ def run_explicit_config_case():
     out = torch.empty((1, 896), device='cuda', dtype=torch.bfloat16)
     ref = x @ w.t()
     configs = (39, 16, 64, 64, 16, 32, 2, (24576, 128, 0))
-    deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out, configs)
+    deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out, configs=configs)
     torch.cuda.synchronize()
     diff = calc_diff(out, ref)
     assert diff < 0.001, f"explicit-config tile path failed: calc_diff={diff:.6f}"
