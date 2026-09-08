@@ -15,6 +15,7 @@ except:
 import deep_gemm
 import random
 import torch
+import torch.nn.functional as F
 from typing import Tuple, Callable
 from enum import Enum
 import ast
@@ -256,7 +257,8 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
         x_int8, y_int8 = per_token_cast_to_int8(x), per_token_cast_to_int8(y)
         return  (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.uint8:
-        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, preprocess_mxfp4_scales
+        from deep_gemm import preprocess_mxfp4_scales
+        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch
         A = torch.randn(m, k, dtype=torch.bfloat16, device='cuda').contiguous()
         B = torch.randn(n, k, dtype=torch.bfloat16, device='cuda').contiguous()
         a, a_scale = quantize_fp4_torch(A)
@@ -388,9 +390,40 @@ def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=Fals
         print(f"distribution:{group_m_list}")
     return group_m_list
 
+def silu_and_mul_post_quant_torch(ref_out: torch.Tensor, swiglu_limit: float = 0.0):
+    """weight consists [gate, up]"""
+    from test_fp4_core import quantize_fp4_torch
+
+    d2 = ref_out.shape[-1]
+    assert d2 % 2 == 0, f"the last dim must be even, got {d2}"
+    gate, up = ref_out.split(d2 // 2, dim=-1)
+
+    if swiglu_limit is not None and swiglu_limit > 0.0:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+
+    silu =  F.silu(gate) * up
+    ref_out_quanted, ref_out_quanted_scale = quantize_fp4_torch(src_tensor=silu)
+    return ref_out_quanted, ref_out_quanted_scale
+
+def quantize_fp4_weight_torch(weight: torch.Tensor):
+    ### for GroupedNoPad & GroupedFused
+    from test_fp4_core import quantize_fp4_torch
+
+    num_groups, n, k = weight.shape
+
+    y_fp4 = torch.empty((num_groups, n, int(k / 2)), device='cuda', dtype=torch.uint8)
+    y_fp4_scale_list = []
+    for i in range(num_groups):
+        b_packed, b_s = quantize_fp4_torch(weight[i])
+        y_fp4[i] = b_packed
+        y_fp4_scale_list.append(b_s)
+    y_fp4_scale = torch.stack(y_fp4_scale_list, dim=0)
+
+    return y_fp4, y_fp4_scale
 
 
-def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: int, topk:int, d: torch.dtype, quant_type: str, group_size = 32, nopad = False) -> \
+def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: int, topk:int, d: torch.dtype, quant_type: str, group_size = 32, nopad = False, **kwargs) -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
 
@@ -489,13 +522,60 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
         else:
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    elif d == torch.uint8:
+        from deep_gemm import preprocess_mxfp4_scales, preprocess_mxfp4_weight_for_act_and_quant_fusing
+        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch
+
+        epilogue_type = kwargs.get("epilogue_type", "Default")
+        swiglu_limit = kwargs.get("swiglu_limit", 0.0)
+        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            ### meta_data
+            out_quanted = torch.empty((num_token * topk, (n // 4)), dtype=torch.uint8, device=tensor_device)
+            out_quanted_scale = torch.empty((num_token * topk, ceil_div((n // 4), 32)), dtype=torch.uint16, device=tensor_device)
+            ref_out = ref_out.to(torch.float)
+            ref_out_quanted = None
+            ref_out_quanted_scale = None
+
+        x_fp4, x_fp4_scale = quantize_fp4_torch(x)
+        x_fp4_scale = x_fp4_scale.view(torch.uint16) # x_fp4_scale is K-Major for GroupedFused
+        y_fp4, y_fp4_scale = quantize_fp4_weight_torch(weight=y)
+        y_fp4_, y_fp4_scale_ = y_fp4.clone(), y_fp4_scale.clone()
+        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            y_fp4, y_fp4_scale = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y_fp4, weight_scale=y_fp4_scale)
+        else:
+            y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
+
+        # Recompute ref_out from fp4-dequantized values for accurate comparison
+        if _acc_check and not nopad:
+            ref_out_list = []
+            k_, sfk_ = x_fp4.shape[-1], x_fp4_scale.shape[-1]
+            x_fp4_permuted = x_fp4.view(num_token, -1, k_).repeat(1, topk, 1).reshape(-1, k_)
+            x_fp4_scale_permuted = x_fp4_scale.view(num_token, -1, sfk_).repeat(1, topk, 1).reshape(-1, sfk_).view(torch.uint8)
+            topk_ids_ = topk_ids.view(-1)
+            for i in range(num_groups):
+                mask = (topk_ids_ == i)
+                if mask.sum():
+                    ref_out_group = dequantize_fp4_torch(x_fp4_permuted[mask], x_fp4_scale_permuted[mask]).to(torch.float) @ dequantize_fp4_torch(y_fp4_[i], y_fp4_scale_[i]).to(torch.float).transpose(0, 1)
+                    ref_out_list.append(ref_out_group)
+            ref_out = torch.concat(ref_out_list, dim=0)
+
+            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+                ### Reference                
+                ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit)
+                ref_out_quanted_scale = preprocess_mxfp4_scales(scale=ref_out_quanted_scale)
+
+                return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
+            else:
+                ref_out = ref_out.to(torch.bfloat16)
+
+        return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
 
-def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, distribution: str, alignment: int, quant_type: str = "block", group_size = 32) -> \
+def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, distribution: str, alignment: int, quant_type: str = "block", group_size = 32, **kwargs) -> \
         Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
     group_ms = construct_group_m_list(distribution, num_groups, m)
@@ -550,31 +630,49 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return m, (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.uint8:
-        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, preprocess_mxfp4_scales
+        from deep_gemm import preprocess_mxfp4_scales, preprocess_mxfp4_weight_for_act_and_quant_fusing
+        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch
+
+        epilogue_type = kwargs.get("epilogue_type", "Default")
+        swiglu_limit = kwargs.get("swiglu_limit", 0.0)
+        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            ### meta_data
+            out_quanted = torch.empty((m, (n // 4)), dtype=torch.uint8, device=tensor_device)
+            out_quanted_scale = torch.empty((m, ceil_div((n // 4), 32)), dtype=torch.uint16, device=tensor_device)
+            ref_out = ref_out.to(torch.float)
+            ref_out_quanted = None
+            ref_out_quanted_scale = None
+
+        # Quantize x (whole tensor) and y (per group) to fp4
+        x_fp4 = quantize_fp4_torch(x)
+        x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4[1])
+        y_fp4, y_fp4_scale = quantize_fp4_weight_torch(weight=y)
+        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            y_fp4, y_fp4_scale = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y_fp4, weight_scale=y_fp4_scale)
+        else:
+            y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
+
         # Recompute ref_out from fp4-dequantized values for accurate comparison
         if _acc_check:
             start = 0
             for i, group_m in enumerate(group_ms):
                 aligned_end = start + ceil_div(group_m, alignment) * alignment
-                a_q, a_s = quantize_fp4_torch(x[start:aligned_end].to(torch.bfloat16).to('cuda'))
-                b_q, b_s = quantize_fp4_torch(y[i].to(torch.bfloat16).to('cuda'))
+                a_q, a_s = quantize_fp4_torch(x[start:aligned_end])
+                b_q, b_s = quantize_fp4_torch(y[i])
                 a_dq = dequantize_fp4_torch(a_q, a_s).to(torch.float)
                 b_dq = dequantize_fp4_torch(b_q, b_s).to(torch.float)
                 ref_out[start:aligned_end] = a_dq @ b_dq.t()
                 start = aligned_end
             ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
-        # Quantize x (whole tensor) and y (per group) to fp4
-        x_fp4 = quantize_fp4_torch(x.to(torch.bfloat16).to('cuda'))
-        x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4[1])
-        y_fp4_packed = torch.empty((num_groups, n, int(k / 2)), device='cuda', dtype=torch.uint8)
-        y_fp4_scale_list = []
-        for i in range(num_groups):
-            b_packed, b_s = quantize_fp4_torch(y[i].to(torch.bfloat16).to('cuda'))
-            y_fp4_packed[i] = b_packed
-            y_fp4_scale_list.append(b_s)
-        y_fp4_scale = torch.stack(y_fp4_scale_list, dim=0)
-        y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
-        return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4_packed.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+
+            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+                ### Reference
+                ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit)
+                ref_out_quanted_scale = preprocess_mxfp4_scales(scale=ref_out_quanted_scale)
+
+                return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
+
+        return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
         return m, x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     else:
@@ -582,7 +680,7 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
         exit(1)
 
 def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, distribution: str,
-                             enable_sbo_overlap: bool = False, quant_type: str = "block", group_size: int = 32):
+                             enable_sbo_overlap: bool = False, quant_type: str = "block", group_size: int = 32, **kwargs):
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
     # Construct mask
     list_m =  construct_group_m_list(distribution, num_groups, max_m, is_mask=True, em=expected_m_per_group)
@@ -602,7 +700,6 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
         ref_out = torch.einsum('gmk,gnk->gmn', x, y)
     else:
         ref_out = torch.empty_like(out)
-
 
     max_signal_size = num_groups * ceil_div(max_m, 64)
     signal = torch.zeros(max_signal_size, dtype=torch.int32, device=tensor_device) if enable_sbo_overlap else torch.empty(0).int()
@@ -637,14 +734,26 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     elif d == torch.uint8:
-        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch, preprocess_mxfp4_scales
+        from deep_gemm import preprocess_mxfp4_scales, preprocess_mxfp4_weight_for_act_and_quant_fusing
+        from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch
+
+        epilogue_type = kwargs.get("epilogue_type", "Default")
+        swiglu_limit = kwargs.get("swiglu_limit", 0.0)
+        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            ### meta_data
+            out_quanted = torch.empty((num_groups, max_m, (n // 4)), dtype=torch.uint8, device=tensor_device)
+            out_quanted_scale = torch.empty((num_groups, max_m, ceil_div((n // 4), 32)), dtype=torch.uint16, device=tensor_device)
+            ref_out = ref_out.to(torch.float)
+            ref_out_quanted = None
+            ref_out_quanted_scale = None
+
         # Quantize x and y per group to fp4 and compute ref from dequantized values
         x_fp4_list, x_fp4_scale_list = [], []
         y_fp4_list, y_fp4_scale_list = [], []
         x_ref_list, y_ref_list = [], []
         for i in range(num_groups):
-            a_q, a_s = quantize_fp4_torch(x[i].to('cuda'))
-            b_q, b_s = quantize_fp4_torch(y[i].to('cuda'))
+            a_q, a_s = quantize_fp4_torch(x[i])
+            b_q, b_s = quantize_fp4_torch(y[i])
             x_fp4_list.append(a_q)
             x_fp4_scale_list.append(a_s)
             y_fp4_list.append(b_q)
@@ -654,11 +763,24 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
         x_fp4 = torch.stack(x_fp4_list, dim=0)
         x_fp4_scale = preprocess_mxfp4_scales(scale=torch.stack(x_fp4_scale_list, dim=0))
         y_fp4 = torch.stack(y_fp4_list, dim=0)
-        y_fp4_scale = preprocess_mxfp4_scales(scale=torch.stack(y_fp4_scale_list, dim=0))
+        y_fp4_scale = torch.stack(y_fp4_scale_list, dim=0)
+        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            y_fp4, y_fp4_scale = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y_fp4, weight_scale=y_fp4_scale)
+        else:
+            y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
+
         if _acc_check:
             x_ref = torch.stack(x_ref_list, dim=0)
             y_ref = torch.stack(y_ref_list, dim=0)
             ref_out = torch.einsum('gmk,gnk->gmn', x_ref, y_ref)
+
+            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+                ### Reference
+                ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit)
+                ref_out_quanted_scale = preprocess_mxfp4_scales(scale=ref_out_quanted_scale)
+
+                return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda')), signal.to('cuda'), max_m
+
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda').to(torch.bfloat16), signal.to('cuda'), max_m
     elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
@@ -943,7 +1065,7 @@ def read_numbers_from_file(file_path):
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
-    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size", "logits_dtype", "weights_dtype", "c4_compressed"]
+    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size", "logits_dtype", "weights_dtype", "c4_compressed", "epilogue_type", "swiglu_limit"]
     supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm"]
     supported_indexer_epilogue_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
@@ -1208,6 +1330,8 @@ def test_m_grouped_gemm_masked(args) -> None:
 
     num_groups, m, n, k, d, distribution = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
+    epilogue_type = args.get("epilogue_type", "Default")
+    swiglu_limit = args.get("swiglu_limit", 0.0)
 
     if isinstance(enable_sbo_overlap, str):
         enable_sbo_overlap = enable_sbo_overlap.lower() == 'true'
@@ -1216,7 +1340,7 @@ def test_m_grouped_gemm_masked(args) -> None:
     group_size = args.get('group_size', 32)
     if use_ppu:
         expected_m_per_group = ceil_div(m, num_groups)
-        x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type, group_size=group_size)
+        x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit)
 
         expected_m_per_group = estimate_expected_m(m, num_groups, masked_m) if "em" not in args.keys() else args["em"]
         print(f"test_m_grouped_gemm_masked->test_func: GroupedMasked,groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},em:{expected_m_per_group},max_m:{max_m},distribution:{masked_m},sbo_overlap:{enable_sbo_overlap}")
@@ -1231,7 +1355,15 @@ def test_m_grouped_gemm_masked(args) -> None:
             result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal)
         elif d == torch.uint8:
-            result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
+            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+                out, out_scale = out
+                ref_out, ref_out_scale = ref_out
+                result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
+                                                                    enable_sbo_overlap=enable_sbo_overlap, signal=signal,
+                                                                    out_scale=out_scale, swiglu_limit=swiglu_limit)
+            else:
+                # `Default` epilogue
+                result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
             deep_gemm.m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group, fp4_use_bf16_scale=(d == 'w4fa16_s16'))
@@ -1257,6 +1389,7 @@ def test_m_grouped_gemm_masked(args) -> None:
             block_m, threshold = result
             check_signal(num_groups, max_m, block_m, threshold, signal, masked_m)
 
+        diff, diff_scale = None, None
         for j in range(num_groups):
             diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
             if (masked_m[j] != 0):
@@ -1265,7 +1398,14 @@ def test_m_grouped_gemm_masked(args) -> None:
                     print(f"out[{j}]:", out[j, :masked_m[j].item()])
                     # torch.testing.assert_close(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()], rtol=5e-1, atol=2)
                 assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
-        print("Passed with acc_check\n")
+            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+                diff_scale = calc_diff(out_scale[j, :masked_m[j].item()], ref_out_scale[j, :masked_m[j].item()])
+                if (masked_m[j] != 0):
+                    if diff_scale >= 0.00001:
+                        print(f"ref_out_scale[{j}]:", ref_out_scale[j, :masked_m[j].item()])
+                        print(f"out_scale[{j}]:", out_scale[j, :masked_m[j].item()])
+                    assert diff_scale < 0.00001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff_scale:.5f}'
+        print(f"Passed with acc_check. {diff=}, {diff_scale=}\n")
     else:
         print("Passed without acc_check\n")
     if get_benchmark():
@@ -1301,13 +1441,15 @@ def test_m_grouped_gemm_fused(args) -> None:
     num_token, topk = args['num_token'], args['topk']
     quant_type = args.get('quant_type')
     group_size = args.get('group_size', 32)
+    epilogue_type = args.get("epilogue_type", "Default")
+    swiglu_limit = args.get("swiglu_limit", 0.0)
     if use_ppu:
-        x, y, topk_ids, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type, group_size)
+        x, y, topk_ids, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type, group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit)
         # Extract main tensors for moe_align (may be tuples for quantized inputs)
         x_tensor = x[0] if isinstance(x, (tuple, list)) else x
         y_tensor = y[0] if isinstance(y, (tuple, list)) else y
         is_perchannel = quant_type == 'channel'
-        configs, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, _, _ = deep_gemm.moe_align_block_size(x_tensor, y_tensor, topk_ids, is_perchannel)
+        configs, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, _, _ = deep_gemm.moe_align_block_size(x_tensor, y_tensor, topk_ids, is_perchannel, enable_act_and_quant_fusing=(epilogue_type == "SiluAndMulPostQuantFp4"))
 
         if d == torch.bfloat16:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
@@ -1315,6 +1457,13 @@ def test_m_grouped_gemm_fused(args) -> None:
             deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d == torch.float8_e4m3fn:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+        elif d == torch.uint8:
+            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+                out, out_scale = out
+                ref_out, ref_out_scale = ref_out
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs, out_scale=out_scale, swiglu_limit=swiglu_limit)
+            else:
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
             deep_gemm.m_grouped_gemm_w4a16_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs, fp4_use_bf16_scale=(d == 'w4fa16_s16'))
         else:
@@ -1325,13 +1474,20 @@ def test_m_grouped_gemm_fused(args) -> None:
         exit(1)
     if _acc_check:
         diff = calc_diff(out, ref_out)
+        diff_scale = None
         if diff >= 0.0015 or torch.isnan(diff) or torch.isinf(diff):
             # torch.set_printoptions(threshold=10000000, linewidth=10000, precision=2, sci_mode=False)
             print("ref_out:", ref_out)
             print("out:", out)
             torch.testing.assert_close(out, ref_out, rtol=5e-1, atol=2)
         assert diff < 0.0015, f'{num_token=}, {k=}, {n=}, {diff:.5f}'
-        print("Passed with acc_check\n")
+        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            diff_scale = calc_diff(out_scale, ref_out_scale)
+            if diff_scale >= 0.00001:
+                print("ref_out_scale:", ref_out_scale)
+                print("out_scale:", out_scale)
+            assert diff_scale < 0.00001, f'{num_token=}, {k=}, {n=}, {diff_scale:.5f}'
+        print(f"Passed with acc_check, {diff=}, {diff_scale=}\n")
     else:
         print("Passed without acc_check\n")
 
@@ -1343,9 +1499,11 @@ def test_m_grouped_gemm_nopad(args) -> None:
     group_size = args.get('group_size', 32)
     if quant_type in args: UT += f",quant_type:{quant_type}"
     if group_size in args: UT += f",group_size:{group_size}"
+    epilogue_type = args.get("epilogue_type", "Default")
+    swiglu_limit = args.get("swiglu_limit", 0.0)
     print(UT)
     if use_ppu:
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1, quant_type=quant_type, group_size=group_size)
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit)
         # topk = 8
         # num_token = m // topk
         # x, y, m_indices, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type, group_size, True)
@@ -1356,7 +1514,12 @@ def test_m_grouped_gemm_nopad(args) -> None:
         elif d == torch.float8_e4m3fn:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
         elif d == torch.uint8:
-            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
+            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+                out, out_scale = out
+                ref_out, ref_out_scale = ref_out
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices, out_scale=out_scale, swiglu_limit=swiglu_limit)
+            else:
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
             deep_gemm.m_grouped_gemm_w4a16_nopad(x, y, out, m_indices, fp4_use_bf16_scale=(d == 'w4fa16_s16'))
         else:
@@ -1369,13 +1532,20 @@ def test_m_grouped_gemm_nopad(args) -> None:
     if _acc_check:
         # out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
         diff = calc_diff(out, ref_out)
+        diff_scale = None
         if diff >= 0.0015:
             print("ref_out:", ref_out)
             print("out:", out)
             torch.testing.assert_close(out, ref_out, rtol=5e-1, atol=2)
 
         assert diff < 0.0015, f'{m=}, {k=}, {n=}, {diff:.5f}'
-        print("Passed with acc_check\n")
+        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            diff_scale = calc_diff(out_scale, ref_out_scale)
+            if diff_scale >= 0.00001:
+                print("ref_out_scale:", ref_out_scale)
+                print("out_scale:", out_scale)
+            assert diff_scale < 0.00001, f'{m=}, {k=}, {n=}, {diff_scale:.5f}'
+        print(f"Passed with acc_check, {diff=}, {diff_scale=}\n")
     else:
         print("Passed without acc_check\n")
     if get_benchmark():

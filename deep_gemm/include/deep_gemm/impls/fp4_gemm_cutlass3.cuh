@@ -1151,6 +1151,8 @@ public:
                         kGemmType, false, std::string("fp4"), kNumGroups, shape_m, ShapeN, ShapeK, expected_m,
                         grouped_layout, stream
                     );
+                    dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
+                    dg_prof_params.add_params("swiglu_limit", swiglu_limit);
                 }
                 ProfilingInterface::Instance().instrument(true, dg_prof_params);
                 cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
@@ -1382,6 +1384,8 @@ public:
                   kGemmType, false, std::string("fp4"), kNumGroups, shape_m, ShapeN, ShapeK, expected_m,
                   grouped_layout, stream
               );
+              dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
+              dg_prof_params.add_params("swiglu_limit", swiglu_limit);
           }
 
           ProfilingInterface::Instance().instrument(true, dg_prof_params);

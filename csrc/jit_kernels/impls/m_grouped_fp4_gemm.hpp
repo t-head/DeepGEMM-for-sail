@@ -41,6 +41,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
 
     int kNumGroups = num_groups;
     static constexpr GemmType kGemmType = GemmType::GroupedNoPad;
+    const EpilogueType kEpilogueType = enable_act_and_quant_fusing ? EpilogueType::SiluAndMulPostQuantFp4 : EpilogueType::Default;
 
     // N_EXPAND logic, keep in sync with m_grouped_gemm_fp4.py (nopad).
     // The fused epilogue requires n_expand == 1 (EpilogueTraits::is_valid_config).
@@ -232,6 +233,8 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m, m_rows_tensor.data_ptr<int32_t>(),
                                   (hggcStream_t)0);
+        dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
+        dg_prof_params.add_params("swiglu_limit", swiglu_limit);
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -290,6 +293,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
 
     int kNumGroups = num_groups;
     static constexpr GemmType kGemmType = GemmType::GroupedMasked;
+    const EpilogueType kEpilogueType = enable_act_and_quant_fusing ? EpilogueType::SiluAndMulPostQuantFp4 : EpilogueType::Default;
 
     // N_EXPAND logic for masked, keep in sync with m_grouped_gemm_fp4.py (masked).
     // The fused epilogue requires n_expand == 1 (EpilogueTraits::is_valid_config).
@@ -446,6 +450,8 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m,
                                       grouped_layout, stream);
+            dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
+            dg_prof_params.add_params("swiglu_limit", swiglu_limit);
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
         FP4DynamicTileRuntime::launch(runtime, dyn_args);
@@ -543,6 +549,8 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m, grouped_layout,
                                   stream);
+        dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
+        dg_prof_params.add_params("swiglu_limit", swiglu_limit);
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 

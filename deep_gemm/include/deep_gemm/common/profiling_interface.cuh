@@ -287,6 +287,10 @@ std::string val_to_string(const std::string& val) {
     return val;
 }
 
+std::string val_to_string(const char* val) {
+    return val == nullptr ? "" : val;
+}
+
 void add_argument(const std::string& name) {
     std::string init_val = "";
     if (args_.find(name) != args_.end()) {

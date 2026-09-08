@@ -594,6 +594,8 @@ public:
                 data_type, std::string("group"), kNumGroups, shape_m, topk, SHAPE_N, SHAPE_K,
                 m_rows, stream
             );
+            dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
+            dg_prof_params.add_params("swiglu_limit", swiglu_limit);
         }
         // dispatch and launch kernel
         constexpr int BlockSize = BLOCK_M / WARP_M * BLOCK_N / WARP_N * 32;

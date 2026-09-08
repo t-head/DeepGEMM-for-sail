@@ -46,6 +46,7 @@ def call_test_func(gemm_type, func_args):
         "MqaAvgLogits": test_mqa_logits,
         "PagedMqaAvgLogits": test_paged_mqa_logits,
     }
+
     if gemm_type in supported_call_funcs.keys():
         test_func = supported_call_funcs[gemm_type]
         judge_device_type()

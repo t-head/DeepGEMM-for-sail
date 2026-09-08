@@ -196,7 +196,7 @@ std::tuple<int, int, int> get_smem_config_fp4(int num_stages, int block_m, int b
 }
 
 int get_fused_smem_size_fp4(int num_stages, int block_m, int block_n, int block_k,
-                            bool enable_silu_and_mul_quant_fusing) {
+                            bool enable_act_quant_fusing) {
     const auto round_up_128 = [](int value) { return ceil_div(value, 128) * 128; };
     const auto [sfa_per_stage, invalid_sfa_size] = get_sf_per_stage_size(block_m, block_k);
     const auto [sfb_per_stage, invalid_sfb_size] = get_sf_per_stage_size(block_n, block_k);
@@ -206,7 +206,7 @@ int get_fused_smem_size_fp4(int num_stages, int block_m, int block_n, int block_
     const int smem_sfa_size = num_stages * sfa_per_stage - invalid_sfa_size;
     const int smem_sfb_size = num_stages * sfb_per_stage - invalid_sfb_size;
     // `Fp4FusedMoeEpilogue::kSmemSize`, which is 0 for the default (bf16) epilogue
-    const int epilogue_smem_size = enable_silu_and_mul_quant_fusing
+    const int epilogue_smem_size = enable_act_quant_fusing
         ? round_up_128(block_m * (block_n / 2 + 4) * static_cast<int>(sizeof(float)))
         : 0;
     return std::max(smem_a_size + smem_b_size, epilogue_smem_size) + smem_sfa_size + smem_sfb_size;
