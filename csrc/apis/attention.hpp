@@ -209,6 +209,7 @@ torch::Tensor bf16_mqa_logits(const torch::Tensor& q, const torch::Tensor& kv, c
                               const torch::Tensor& cu_seq_len_k_start, const torch::Tensor& cu_seq_len_k_end,
                               bool clean_logits = true, int max_seqlen_k = 0,
                               torch::ScalarType logits_dtype = torch::kFloat32) {
+    DG_HOST_ASSERT(q.scalar_type() == torch::kBFloat16);
     // BF16 carries no per-token KV scale
     const auto& k_scales = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
     return mqa_logits_common(q, kv, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits,
@@ -219,6 +220,7 @@ torch::Tensor fp8_mqa_logits(const torch::Tensor& q, const std::pair<torch::Tens
                              const torch::Tensor& weights, const torch::Tensor& cu_seq_len_k_start,
                              const torch::Tensor& cu_seq_len_k_end, bool clean_logits = true, int max_seqlen_k = 0,
                              torch::ScalarType logits_dtype = torch::kFloat32) {
+    DG_HOST_ASSERT(q.scalar_type() == torch::kFloat8_e4m3fn);
     return mqa_logits_common(q, kv_s.first, kv_s.second, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits,
                              max_seqlen_k, logits_dtype);
 }
@@ -227,6 +229,7 @@ torch::Tensor int8_mqa_logits(const torch::Tensor& q, const std::pair<torch::Ten
                               const torch::Tensor& weights, const torch::Tensor& cu_seq_len_k_start,
                               const torch::Tensor& cu_seq_len_k_end, bool clean_logits = true, int max_seqlen_k = 0,
                               torch::ScalarType logits_dtype = torch::kFloat32) {
+    DG_HOST_ASSERT(q.scalar_type() == torch::kInt8);
     return mqa_logits_common(q, kv_s.first, kv_s.second, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits,
                              max_seqlen_k, logits_dtype);
 }
@@ -245,10 +248,12 @@ torch::Tensor fp8_fp4_mqa_logits(const std::pair<torch::Tensor, std::optional<to
                                  bool clean_logits = true, int max_seqlen_k = 0,
                                  torch::ScalarType logits_dtype = torch::kFloat32) {
     if (q.second.has_value()) {
+        DG_HOST_ASSERT(q.first.scalar_type() == torch::kInt8);
         const auto& empty = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(q.first.device()));
         return mqa_logits_common(q.first, kv.first, empty, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits,
                                  max_seqlen_k, logits_dtype, q.second, kv.second);
     }
+    DG_HOST_ASSERT(q.first.scalar_type() == torch::kFloat8_e4m3fn);
     return mqa_logits_common(q.first, kv.first, kv.second, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits,
                              max_seqlen_k, logits_dtype);
 }
@@ -283,6 +288,7 @@ torch::Tensor bf16_paged_mqa_logits(const torch::Tensor& q, const torch::Tensor&
                                     const torch::Tensor& block_table, const torch::Tensor& schedule_meta,
                                     int max_context_len, bool clean_logits = true,
                                     torch::ScalarType logits_dtype = torch::kFloat32) {
+    DG_HOST_ASSERT(q.scalar_type() == torch::kBFloat16);
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
                                    max_context_len, clean_logits, logits_dtype);
 }
@@ -292,6 +298,7 @@ torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q, const torch::Tensor& 
                                    const torch::Tensor& block_table, const torch::Tensor& schedule_meta,
                                    int max_context_len, bool clean_logits = true,
                                    torch::ScalarType logits_dtype = torch::kFloat32) {
+    DG_HOST_ASSERT(q.scalar_type() == torch::kFloat8_e4m3fn);
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
                                    max_context_len, clean_logits, logits_dtype);
 }
@@ -301,12 +308,13 @@ torch::Tensor int8_paged_mqa_logits(const torch::Tensor& q, const torch::Tensor&
                                     const torch::Tensor& block_table, const torch::Tensor& schedule_meta,
                                     int max_context_len, bool clean_logits = true,
                                     torch::ScalarType logits_dtype = torch::kFloat32) {
+    DG_HOST_ASSERT(q.scalar_type() == torch::kInt8);
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
                                    max_context_len, clean_logits, logits_dtype);
 }
 
 // Unified FP8/FP4 entry point (paged). `q = (q_fp, optional q_sf)`: presence of `q_sf` selects the
-// FP4 kernel, otherwise the FP8/INT8/BF16 one. See `paged_mqa_logits_common` for tensor layouts.
+// FP4 kernel, otherwise the FP8 one. See `paged_mqa_logits_common` for tensor layouts.
 // `indices` (varlen) is accepted for API compatibility but unsupported on PPU.
 torch::Tensor fp8_fp4_paged_mqa_logits(const std::pair<torch::Tensor, std::optional<torch::Tensor>>& q,
                                        const torch::Tensor& fused_kv_cache, const torch::Tensor& weights,
@@ -318,6 +326,10 @@ torch::Tensor fp8_fp4_paged_mqa_logits(const std::pair<torch::Tensor, std::optio
     if (indices.has_value())
         print_once("Warning: indices (varlen) is not supported on PPU, falling back to non-varlen mode "
                    "(performance may be affected)");
+    if (q.second.has_value())
+        DG_HOST_ASSERT(q.first.scalar_type() == torch::kInt8);
+    else
+        DG_HOST_ASSERT(q.first.scalar_type() == torch::kFloat8_e4m3fn);
     return paged_mqa_logits_common(q.first, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
                                    max_context_len, clean_logits, logits_dtype, q.second);
 }
