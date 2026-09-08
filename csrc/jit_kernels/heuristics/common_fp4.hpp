@@ -11,6 +11,7 @@
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
+#include <deep_gemm/common/utils_rtc.cuh>
 using namespace deep_gemm;
 namespace deep_gemm_fp4_common {
 
@@ -378,12 +379,12 @@ ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, 
 }
 
 ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, int num_sms,
-                              bool is_grouped_nopad = false, bool is_grouped_masked = false,
+                              GemmType gemm_type = GemmType::DenseGemm,
                               int max_block_n = 256, int min_block_n = 32) {
     // C++ layer does not perform device checking; is_ppu1v5_device() assert skipped
     (void)total_m;
 
-    if (num_groups == 1 && !is_grouped_nopad && !is_grouped_masked) {
+    if (gemm_type == GemmType::DenseGemm) {
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms);
     }
 

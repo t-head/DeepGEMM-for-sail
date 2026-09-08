@@ -5,6 +5,7 @@
 #include "../../utils/utils.hpp"
 #include "gemm_search_space.hpp"
 #include "adaptive_tile_selector.hpp"
+#include <deep_gemm/common/utils_rtc.cuh>
 
 using namespace deep_gemm;
 namespace deep_gemm_bf16_common {
@@ -148,17 +149,17 @@ ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms) {
     return std::make_tuple(sms, bm, bn, bk, wm, wn, stages, smem);
 }
 
-ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_grouped_contiguous = false,
-                              bool is_grouped_masked = false, int max_block_n = 256) {
+ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
+                              GemmType gemm_type = GemmType::DenseGemm, int max_block_n = 256) {
     // Adaptive tile selection for DenseGemm (BF16). warp_k/dense_s2_opt are injected in the dense
     // impl; here we only apply the adaptive tile choice and return the 8-tuple.
-    if (num_groups == 1 && !is_grouped_contiguous && !is_grouped_masked && is_ppu1v5_device() &&
+    if (gemm_type == GemmType::DenseGemm && is_ppu1v5_device() &&
         deep_gemm_adaptive::bf16_adaptive_enabled(m, n, k)) {
         return get_adaptive_configs_bf16(m, n, k, num_sms);
     }
     // Generate block_ms
     std::vector<int> block_ms;
-    if (!is_grouped_contiguous) {
+    if (gemm_type != GemmType::GroupedContiguous) {
         if (k >= 384) {
             block_ms = {256, 128, 64, 32, 16};
         } else {
@@ -213,7 +214,7 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms, 
 
     // Decide block sizes by waves
     int best_block_m = 0, best_block_n = 0;
-    int min_n_threshold = (num_groups == 1 && !is_grouped_contiguous && !is_grouped_masked) ? 1 : 32;
+    int min_n_threshold = gemm_type == GemmType::DenseGemm ? 1 : 32;
     for (int block_m : block_ms) {
         // Filter block_ns
         std::vector<int> block_ns_after_filter;

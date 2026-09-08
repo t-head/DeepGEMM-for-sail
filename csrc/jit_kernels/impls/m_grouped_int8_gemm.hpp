@@ -264,7 +264,8 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
     } else {
-        cfg = deep_gemm_int8::get_best_configs(m, n, k, num_groups, num_sms, true);
+        cfg = deep_gemm_int8::get_best_configs(
+            m, n, k, num_groups, num_sms, GemmType::GroupedContiguous);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -469,7 +470,8 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
     } else {
-        cfg = deep_gemm_int8::get_best_configs(expected_m, n, k, num_groups, num_sms, false, true, max_block_n);
+        cfg = deep_gemm_int8::get_best_configs(
+            expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked, max_block_n);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -921,7 +923,8 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
     } else {
-        cfg = deep_gemm_int8::get_best_configs(expected_m, n, k, num_groups, num_sms);
+        cfg = deep_gemm_int8::get_best_configs(
+            expected_m, n, k, num_groups, num_sms, GemmType::GroupedNoPad);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;

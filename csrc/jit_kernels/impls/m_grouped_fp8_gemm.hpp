@@ -49,7 +49,8 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(const torch::Tensor& 
         selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_fp8_common::get_smem_config(nst, k, bm, bn, bk));
     } else {
-        selected_config = deep_gemm_fp8_common::get_best_configs(m, n, k, num_groups, num_sms, true);
+        selected_config = deep_gemm_fp8_common::get_best_configs(
+            m, n, k, num_groups, num_sms, GemmType::GroupedContiguous);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
@@ -169,7 +170,8 @@ static std::pair<int, int> m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(
         selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_fp8_common::get_smem_config(nst, k, bm, bn, bk));
     } else {
-        selected_config = deep_gemm_fp8_common::get_best_configs(expected_m, n, k, num_groups, num_sms, false, true, max_block_n);
+        selected_config = deep_gemm_fp8_common::get_best_configs(
+            expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked, max_block_n);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
@@ -293,7 +295,8 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, 
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_fp8_common::get_smem_config(nst, k, bm, bn, bk));
     } else {
-        cfg = deep_gemm_fp8_common::get_best_configs(expected_m, n, k, num_groups, num_sms);
+        cfg = deep_gemm_fp8_common::get_best_configs(
+            expected_m, n, k, num_groups, num_sms, GemmType::GroupedNoPad);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;

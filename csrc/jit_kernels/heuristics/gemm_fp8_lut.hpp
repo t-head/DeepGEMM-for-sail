@@ -6,6 +6,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <deep_gemm/common/utils_rtc.cuh>
 
 namespace deep_gemm_fp8_lut {
 
@@ -116,12 +117,12 @@ inline const MNKDict& get_fp8_nopad_list() {
 // Look up the best config tile from the static LUTs.
 // Returns std::nullopt when no entry matches (equivalent to Python returning None).
 inline std::optional<Tile> get_best_configs_from_lut(int m, int n, int k,
-                                                     int groups,
-                                                     bool is_grouped_contiguous,
-                                                     bool is_grouped_masked) {
-    if (!is_grouped_contiguous && !is_grouped_masked && groups > 1) {
+                                                     int groups, GemmType gemm_type) {
+    (void)groups;
+    if (gemm_type == GemmType::GroupedNoPad) {
         return get_fp8_nopad_list().query(m, n, k);
-    } else if (!is_grouped_contiguous && !is_grouped_masked && groups == 1) {
+    }
+    if (gemm_type == GemmType::DenseGemm) {
         const int m_aligned = ((m + 15) / 16) * 16;
         const auto key = std::make_tuple(m_aligned, n, k);
         const auto& dense = get_fp8_dense_list();

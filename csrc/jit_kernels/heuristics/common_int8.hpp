@@ -9,6 +9,7 @@
 #include "../../utils/utils.hpp"
 #include "gemm_int8_lut.hpp"
 #include "adaptive_tile_selector.hpp"
+#include <deep_gemm/common/utils_rtc.cuh>
 using namespace deep_gemm;
 namespace deep_gemm_int8 {
 
@@ -89,23 +90,6 @@ int get_smem_occ(int block_m, int block_n, int block_k, int num_stages) {
     return ppu_capacity / smem_size;
 }
 
-std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
-get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms, bool is_grouped_contiguous = false,
-                        bool is_grouped_masked = false) {
-    // todo: add more tiles for ppu1.5
-    int best_block_m = 256;
-    int best_block_n = 256;
-    int best_block_k = 128;
-    int best_warp_m = 64;
-    int best_warp_n = 64;
-    int best_stages = 4;
-
-    auto best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1);
-    int num_min_sms = get_sm_count();
-
-    return std::make_tuple(num_min_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n,
-                           best_stages, best_smem_config);
-}
 
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) {
@@ -325,15 +309,15 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
 }
 
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
-get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms, bool is_grouped_contiguous = false,
-                        bool is_grouped_masked = false, int max_block_n = 256) {
-    if (num_groups == 1 && is_grouped_contiguous == false && is_grouped_masked == false) {
+get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
+                        GemmType gemm_type, int max_block_n = 256) {
+    if (gemm_type == GemmType::DenseGemm || gemm_type == GemmType::BatchGemm) {
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms);
     }
 
     // FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
     std::vector<int> block_ms;
-    if (!is_grouped_contiguous) {
+    if (gemm_type != GemmType::GroupedContiguous) {
         if (k >= 384) {
             block_ms = {256, 128, 64, 32, 16};
         } else {
@@ -613,8 +597,8 @@ get_adaptive_configs_int8(int m, int n, int k, int num_sms) {
 }
 
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
-get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_grouped_contiguous = false,
-                 bool is_grouped_masked = false, int max_block_n = 256) {
+get_best_configs(int m, int n, int k, int num_groups, int num_sms,
+                 GemmType gemm_type = GemmType::DenseGemm, int max_block_n = 256) {
     auto lut_result = deep_gemm_int8_lut::get_best_configs_from_lut(m, n, k);
     if (num_groups == 1 && lut_result.has_value()) {
         int best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages;
@@ -628,17 +612,16 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_group
     }
     // Adaptive tile selection for DenseGemm (INT8). warp_k/dense_s2_opt are injected in the dense
     // impl; here we only apply the adaptive tile choice (incl. bk *= 2) and return the 8-tuple.
-    if (num_groups == 1 && !is_grouped_contiguous && !is_grouped_masked && is_ppu1v5_device() &&
+    if (gemm_type == GemmType::DenseGemm && is_ppu1v5_device() &&
         deep_gemm_adaptive::int8_adaptive_enabled(m, n, k)) {
         return get_adaptive_configs_int8(m, n, k, num_sms);
     }
     if (is_ppu1v5_device()) {
-        return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, is_grouped_contiguous, is_grouped_masked,
-                                       max_block_n);
+        return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, gemm_type, max_block_n);
     }
     // FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
     std::vector<int> block_ms;
-    if (!is_grouped_contiguous) {
+    if (gemm_type != GemmType::GroupedContiguous) {
         if (k > 384) {
             block_ms = {256, 128, 64, 32, 16};
         } else {
@@ -695,7 +678,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms, bool is_group
 
     // Decide block sizes by waves
     int best_block_m = 0, best_block_n = 0;
-    int min_n_threshold = (num_groups == 1 && is_grouped_contiguous == false && is_grouped_masked == false) ? 1 : 32;
+    int min_n_threshold = gemm_type == GemmType::DenseGemm ? 1 : 32;
 
     for (int block_m : block_ms) {
         // NOTES:

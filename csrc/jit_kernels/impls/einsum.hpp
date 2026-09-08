@@ -48,7 +48,8 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
         selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_fp8_common::get_smem_config(nst, k, bm, bn, bk));
     } else {
-        selected_config = deep_gemm_fp8_common::get_best_configs_dense(m, n, k, groups, num_sms);
+        selected_config = deep_gemm_fp8_common::get_best_configs(
+            m, n, k, groups, num_sms, GemmType::BatchGemm);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
@@ -170,7 +171,8 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
         if (is_ppu1v5_device()) {
             selected_config = deep_gemm_int8::get_best_configs_dense_ppu1v5(m, n, k, groups, num_sms);
         } else {
-            selected_config = deep_gemm_int8::get_best_configs(m, n, k, groups, num_sms, false, false);
+            selected_config = deep_gemm_int8::get_best_configs(
+                m, n, k, groups, num_sms, GemmType::BatchGemm);
         }
     }
 

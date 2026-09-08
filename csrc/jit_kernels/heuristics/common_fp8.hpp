@@ -233,10 +233,8 @@ ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num
 }
 
 static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
-                                     bool is_grouped_contiguous = false, bool is_grouped_masked = false,
-                                     int max_block_n = 256) {
-    auto lut_result = deep_gemm_fp8_lut::get_best_configs_from_lut(
-        m, n, k, num_groups, is_grouped_contiguous, is_grouped_masked);
+                                     GemmType gemm_type = GemmType::DenseGemm, int max_block_n = 256) {
+    auto lut_result = deep_gemm_fp8_lut::get_best_configs_from_lut(m, n, k, num_groups, gemm_type);
     if (lut_result.has_value()) {
         int best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages;
         std::tie(best_block_m, best_block_n, best_block_k,
@@ -246,12 +244,12 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
                                best_warp_m, best_warp_n, best_stages, best_smem_config);
     }
 
-    if (num_groups == 1 && is_grouped_contiguous == false && is_grouped_masked == false) {
+    if (gemm_type == GemmType::DenseGemm || gemm_type == GemmType::BatchGemm) {
         auto result = get_best_configs_dense(m, n, k, num_groups, num_sms);
         return result;
     }
     std::vector<int> block_ms;
-    if (!is_grouped_contiguous) {
+    if (gemm_type != GemmType::GroupedContiguous) {
         block_ms = (k > 384) ? std::vector<int>{256, 192, 128, 64, 32, 16} : std::vector<int>{64, 32, 16};
     } else {
         block_ms = {get_m_alignment_for_contiguous_layout()};
@@ -344,7 +342,7 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
         }
     }
 
-    if (!is_grouped_contiguous) {
+    if (gemm_type != GemmType::GroupedContiguous) {
         if (m > 256 && n >= 256) {
             best_block_m = 192;
             best_block_n = 256;

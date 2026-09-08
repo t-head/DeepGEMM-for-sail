@@ -34,8 +34,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
         // SiluAndMulPostQuant fusing only supports block_n >= 64
         int min_block_n = enable_silu_and_mul_quant_fusing ? 64 : 32;
         selected_config = deep_gemm_fp4_common::get_best_configs(
-            m, expected_m, n, k, num_groups, num_sms,
-            true /*is_grouped_nopad*/, false /*is_grouped_masked*/,
+            m, expected_m, n, k, num_groups, num_sms, GemmType::GroupedNoPad,
             256 /*max_block_n*/, min_block_n /*min_block_n*/);
     }
 
@@ -288,8 +287,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         // SiluAndMulPostQuant fusing only supports block_n >= 64
         int min_block_n = enable_silu_and_mul_quant_fusing ? 64 : 32;
         selected_config = deep_gemm_fp4_common::get_best_configs(
-            m, expected_m, n, k, num_groups, num_sms,
-            false /*is_grouped_nopad*/, true /*is_grouped_masked*/,
+            m, expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked,
             max_block_n /*max_block_n*/, min_block_n /*min_block_n*/);
     }
 

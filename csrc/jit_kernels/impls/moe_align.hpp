@@ -327,13 +327,16 @@ static MoeAlignReturn moe_align_block_size_impl(
                                                              c.n_expand};
         } else if (lhs.dtype() == torch::kBFloat16) {
             config = take_first_7(deep_gemm_bf16_common::get_best_configs(
-                expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms));
+                expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms,
+                GemmType::GroupedFused));
         } else if (perchannel_quant) {
             config = take_first_7(deep_gemm_int8::get_best_configs(
-                expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms));
+                expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms,
+                GemmType::GroupedFused));
         } else if (lhs.dtype() == torch::kFloat8_e4m3fn) {
             config = take_first_7(deep_gemm_fp8_common::get_best_configs(
-                expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms));
+                expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms,
+                GemmType::GroupedFused));
         } else if (lhs.dtype() == torch::kUInt8) {
             TORCH_CHECK(false,
                         "moe_align_block_size (C++ JIT): auto-config for fp4 (uint8 lhs) is "
