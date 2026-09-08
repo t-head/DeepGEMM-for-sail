@@ -58,6 +58,13 @@ def get_arch_major() -> int:
     major, minor = torch.cuda.get_device_capability()
     return major
 
+def get_arch_version() -> int:
+    # Compute capability as a single comparable integer (major * 10 + minor):
+    # PPU1.0 (ZW810E) reports 8.0 -> 80, PPU1.5 (ZW890) reports 8.9 -> 89.
+    # Usage: `get_arch_version() >= 89` means "PPU1.5 (sm_89) or later".
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
+
 def test_filter(condition: Callable):
     def decorator(func):
         @functools.wraps(func)
@@ -833,8 +840,11 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         # metrics = devices.get(dev, [])
         # metrics_string = ', '.join(metrics) if metrics else ""
         current_file_path = os.path.abspath(__file__)
-        pattern = r"data_type:(bf16|int8|fp8|tf32|fp4)"
-        dtype = re.search(pattern, case).groups()[0]
+        # pattern = r"data_type:(bf16|int8|fp8|tf32|fp4)"
+        # dtype = re.search(pattern, case).groups()[0]
+        pattern = r"data_type:([a-zA-Z0-9_]+)"
+        dtype_match = re.search(pattern, case)
+        dtype = dtype_match.groups()[0] if dtype_match else "unknown"
         script = f"{os.path.dirname(current_file_path)}/run_deep_gemm.py"
         if mode == "full":
             output_name = clean_casename(case)[:50]
@@ -1032,7 +1042,7 @@ def convert_data_type_to_dtype(data_type):
         return data_type
     elif data_type in ["bf16", "torch.bfloat16"]:
         return torch.bfloat16
-    elif data_type in ["tf32", "torch.float32"]:
+    elif data_type in ["fp32", "tf32", "torch.float32"]:
         return torch.float32
     elif data_type in ["int8", "torch.int8"]:
         return torch.int8

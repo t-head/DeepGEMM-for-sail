@@ -1,13 +1,32 @@
 import os
+import gc
+import sys
 import torch
 import random
 import deep_gemm
-from utils import parse_deepgemm_string_re, read_cmds_from_file
+from utils import parse_deepgemm_string_re, read_cmds_from_file, get_arch_version
 from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad, test_m_grouped_gemm_fused
 from utils import test_mqa_logits, test_paged_mqa_logits
 from utils import set_acc_check, set_benchmark
 from utils import judge_device_type, set_ref_backend
 import atexit
+
+def device_version_supported(one_case):
+    """Per-case device version gate.
+
+    Returns (supported, reason). Cases that rely on hardware capabilities
+    absent on the current device are skipped instead of failing, so the same
+    caselist can run on both PPU1.0 and PPU1.5.
+    """
+    data_type = one_case.get('data_type')
+    # fp4 (mxfp4, ue8m0 scale) GEMM/attention kernels require PPU1.5 (sm_89) or later,
+    # see the device assert in deep_gemm/jit_kernels/gemm_fp4.py
+    if data_type == torch.uint8 and get_arch_version() < 89:
+        return False, "fp4(mxfp4) requires PPU1.5 (ZW890, sm_89) or later"
+    # fp8 GEMM kernels hang on PPU1.0 (ZW810E), require PPU1.5 (sm_89) or later
+    if data_type == torch.float8_e4m3fn and get_arch_version() < 89:
+        return False, "fp8 requires PPU1.5 (ZW890, sm_89) or later"
+    return True, ""
 def device_sync_at_exit():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -68,17 +87,31 @@ if __name__ == '__main__':
         if len(dg_cases) == 0:
             print("no dg_cases found")
             exit(-1)
-        if args.case_idx:
+        if args.case_idx is not None:
+            if not 1 <= args.case_idx <= len(dg_cases):
+                print(f"ERROR: --case_idx must be between 1 and {len(dg_cases)}")
+                sys.exit(2)
             dg_cases = [dg_cases[args.case_idx-1]]
     else:
         print("ERROR: must give --caselist or --format")
         exit(1)
     total = len(dg_cases)
+    failures = []
+    skipped = []
     for idx, one_case in enumerate(dg_cases):
         print(f'Profiling {idx + 1}/{total}')
         print(f'case info:{one_case}')
+        supported, reason = device_version_supported(one_case)
+        if not supported:
+            skipped.append((idx + 1, reason))
+            print(f"> Skipped (device version gate): {reason}\n", flush=True)
+            continue
         try:
             call_test_func(one_case['gemm_type'], one_case)
         except Exception as e:
-            print(f"❌ Test {idx} failed with error: {e}")
-            continue
+            failures.append((idx + 1, str(e)))
+            print(f"❌ Test {idx + 1} failed with error: {e}")
+            del e  # release traceback-held tensors immediately
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
