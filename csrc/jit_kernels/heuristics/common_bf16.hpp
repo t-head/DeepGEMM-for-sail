@@ -155,7 +155,7 @@ bool dense_gemv_select_configs(int n, int k, const void* w, const void* x,
     if ((reinterpret_cast<uintptr_t>(w) & 0xF) != 0 || (reinterpret_cast<uintptr_t>(x) & 0xF) != 0)
         return false;
 
-    // Performance gate: the tensor-core tile path beats the SIMT kernel in
+    // Performance gate: the tile path beats the SIMT kernel in
     // the large-n x large-k corner; thresholds from 4900-case one-shot scans.
     constexpr int kGemvTileGateN = 3072;
     constexpr int kGemvTileGateK = 3584;
