@@ -10,7 +10,7 @@ Covers:
      inputs (fp32 accumulation keeps the relative error scale-invariant).
   6. Repeat-call determinism (same inputs -> bit-exact outputs).
   7. Fallback conditions (small n, unaligned k, m == 2, explicit configs,
-     env kill switch).
+     env kill switch, and the large-n x large-k tile gate).
   8. Optional performance comparison GEMV vs tile (--benchmark).
 """
 import argparse
@@ -25,13 +25,20 @@ from deep_gemm import calc_diff, bench_kineto
 # (m, n, k, expect_gemv): accuracy + dispatch (torch.profiler kernel-name) check
 DISPATCH_CASES = [
     (1, 896, 7168, True),   # c2 : add_times=896 -> BlockX=64, BlockY=2
-    (1, 7168, 3584, True),  # c3 : add_times=448 -> BlockX=32, BlockY=4
-    (1, 3584, 7168, True),  # c9 : add_times=896 -> BlockX=64, BlockY=2
-    (1, 2112, 7168, True),  # c13: add_times=896 -> BlockX=64, BlockY=2
+    (1, 7168, 3584, False), # c3 : inside the tile gate (n >= 3072 && k >= 3584);
+                            #      crossover n* ~ 5376 at k=3584 -> tile faster
+    (1, 3584, 7168, False), # c9 : inside the tile gate; crossover n* ~ 2688 at
+                            #      k=7168 -> tile faster
+    (1, 2112, 7168, True),  # c13: add_times=896 -> BlockX=64, BlockY=2 (below gate N)
     (1, 80, 7168, True),    # n <= 100 branch: BlockX=128 + cross-warp SMEM reduce
     (1, 897, 7168, True),   # n not divisible by BlockY=2: tail-block row clamp
     (1, 128, 16, True),     # add_times=2 -> BlockX=2 (warp spans 16 rows)
     (1, 128, 8200, True),   # add_times > 1024 -> BlockX=128, BlockY=1
+    (1, 3072, 3584, False), # tile-gate corner: both thresholds met exactly
+    (1, 2944, 8960, True),  # just below gate N: small n x large k stays GEMV
+    (1, 8960, 3456, True),  # just below gate K: large n x mid k stays GEMV
+    (1, 8960, 8960, False), # deepest gate corner: tile wins by ~8-11%
+    (1, 8960, 1024, True),  # large n x small k: GEMV (tile weak zone)
     (1, 32, 7168, False),   # n < 64 -> tile fallback
     (1, 896, 7172, False),  # k % 8 != 0 -> tile fallback
     (2, 896, 7168, False),  # m == 2 -> tile fallback

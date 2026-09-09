@@ -137,8 +137,8 @@ std::tuple<int, int, int, int, int, bool> get_gemv_best_configs(int m, int n, in
 // Dense GEMV (m == 1) launch-config selection. BlockX keys on
 // add_times = k / (16B / sizeof(bf16)) so the per-thread serial K chain stays
 // ~14 16B loads; BlockY = 128 / BlockX rows per block keep the grid dense.
-// Returns false when the shape/alignment is not covered; the caller falls back
-// to the tile path.
+// Returns false when the shape/alignment is not covered or when the tile path
+// is faster; the caller falls back to the tile path.
 bool dense_gemv_select_configs(int n, int k, const void* w, const void* x,
                                int& block_x, int& block_y, int& k_per_thread) {
     if (get_env<int>("DG_DISABLE_DENSE_GEMV", 0))
@@ -153,6 +153,13 @@ bool dense_gemv_select_configs(int n, int k, const void* w, const void* x,
     if (k % kElemAlign != 0)
         return false;
     if ((reinterpret_cast<uintptr_t>(w) & 0xF) != 0 || (reinterpret_cast<uintptr_t>(x) & 0xF) != 0)
+        return false;
+
+    // Performance gate: the tensor-core tile path beats the SIMT kernel in
+    // the large-n x large-k corner; thresholds from 4900-case one-shot scans.
+    constexpr int kGemvTileGateN = 3072;
+    constexpr int kGemvTileGateK = 3584;
+    if (n >= kGemvTileGateN && k >= kGemvTileGateK)
         return false;
 
     k_per_thread = 2;
