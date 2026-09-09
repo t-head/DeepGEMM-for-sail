@@ -536,14 +536,16 @@ static void fp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                      const int& m, const int& n, const int& k,
                      std::optional<ConfigTuple> configs = std::nullopt) {
     int num_sms = get_num_sms();
+    // Determine bias
+    bool hasBias = bias.numel() > 0;
 
     ConfigTuple selected_config;
     if (configs.has_value()) {
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
         selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
-            deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, 1));
+            deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, n, hasBias, false /*enable_act_and_quant_fusing*/));
     } else {
-        selected_config = deep_gemm_fp4_common::get_best_configs(m, m, n, k, 1, num_sms);
+        selected_config = deep_gemm_fp4_common::get_best_configs(m, m, n, k, 1, num_sms, hasBias, false /*enable_act_and_quant_fusing*/);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
@@ -570,9 +572,6 @@ static void fp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
 
     auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, 0, 1));
     auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, 1));
-
-    // Determine bias
-    bool hasBias = bias.numel() > 0;
 
     // Get data pointers
     uint8_t* ptr_A = lhs.data_ptr<uint8_t>();

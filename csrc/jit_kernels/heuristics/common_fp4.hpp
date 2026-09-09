@@ -160,24 +160,33 @@ std::pair<int, int> get_sf_per_stage_size(int block_mn, int block_k) {
 }
 
 std::tuple<int, int, int> get_smem_config_fp4(int num_stages, int block_m, int block_n, int warp_m, int warp_n,
-                                              int block_k = 128, int bpp = 1) {
+                                              int block_k, int shape_n, bool has_bias,
+                                              bool enable_act_and_quant_fusing, int bpp = 1) {
     // Try swizzle first, as it does not waste shared memory
     int swizzle_mode = 128;
     int block_n_padding = 0;
+    int warp_on_m = block_m / warp_m;
 
-    int smem_d = block_m * (block_n + block_n_padding);
     int smem_a_per_stage = block_m * block_k;
     int smem_b_per_stage = block_n * block_k;
 
     auto [smem_sfa_per_stage, invalid_sfa_element_size] = get_sf_per_stage_size(block_m, block_k);
     auto [smem_sfb_per_stage, invalid_sfb_element_size] = get_sf_per_stage_size(block_n, block_k);
 
-    // output dtype of fp4 is bf16 currently
-    int smem_size_d = smem_d * 2;
+    int smem_size_d = 0;  // default: using CollectiveEpilogueNoTsm
     int smem_size_a = num_stages * smem_a_per_stage * bpp;
     int smem_size_b = num_stages * smem_b_per_stage * bpp;
     int smem_size_sfa = num_stages * smem_sfa_per_stage * bpp - invalid_sfa_element_size;
     int smem_size_sfb = num_stages * smem_sfb_per_stage * bpp - invalid_sfb_element_size;
+
+    // re-calculate epilogue smem size to fit into different epilogue type
+    if (shape_n % 2 != 0 || has_bias) {
+        // using CollectiveEpilogueWithTsm
+        smem_size_d = warp_on_m * 16 * block_n * static_cast<int>(sizeof(float));
+    } else if (enable_act_and_quant_fusing) {
+        // using CollectiveEpilogueSiluAndMulPostQuant
+        smem_size_d = (block_m * ((block_n / 2) + 4)) * static_cast<int>(sizeof(float)); // 4 means padding
+    }
 
     int smem_size = std::max(smem_size_d, smem_size_a + smem_size_b + smem_size_sfa + smem_size_sfb);
 
@@ -186,20 +195,20 @@ std::tuple<int, int, int> get_smem_config_fp4(int num_stages, int block_m, int b
     return std::make_tuple(smem_size, swizzle_mode, block_n_padding);
 }
 
-int get_smem_occ(int block_m, int block_n, int block_k, int num_stages, int warp_m, int warp_n) {
+int get_smem_occ(int block_m, int block_n, int block_k, int num_stages, int warp_m, int warp_n, int shape_n, bool has_bias, bool enable_act_and_quant_fusing) {
     if (block_m == 0) {
         return 0;
     }
 
     // use static suppose.
     const int ppu_capacity = 262144;
-    int smem_size = std::get<0>(get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k));
+    int smem_size = std::get<0>(get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k, shape_n, has_bias, enable_act_and_quant_fusing));
     return ppu_capacity / smem_size;
 }
 
 using ConfigResult = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 
-ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) {
+ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms, bool has_bias, bool enable_act_and_quant_fusing) {
     std::vector<int> block_ms = {256, 128, 64, 32, 16};
     std::vector<int> block_ns = {256, 128, 64, 32, 16};
 
@@ -288,8 +297,8 @@ ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, 
 
             auto [tmp_block_m, tmp_block_n, tmp_warp_m, tmp_warp_n] = get_warp_mn_dense(block_m, block_n);
             auto [tmp_best_block_m, tmp_best_block_n, tmp_best_warp_m, tmp_best_warp_n] = get_warp_mn_dense(best_block_m, best_block_n);
-            int num_occ = get_smem_occ(tmp_block_m, tmp_block_n, 128, 2, tmp_warp_m, tmp_warp_n);
-            int best_num_occ = get_smem_occ(tmp_best_block_m, tmp_best_block_n, 128, 2, tmp_best_warp_m, tmp_best_warp_n);
+            int num_occ = get_smem_occ(tmp_block_m, tmp_block_n, 128, 2, tmp_warp_m, tmp_warp_n, n, has_bias, enable_act_and_quant_fusing);
+            int best_num_occ = get_smem_occ(tmp_best_block_m, tmp_best_block_n, 128, 2, tmp_best_warp_m, tmp_best_warp_n, n, has_bias, enable_act_and_quant_fusing);
 
             if (best_block_m == 0 || best_block_n == 0) {
                 success = true;
@@ -364,7 +373,7 @@ ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, 
     const int ppu_capacity = 262144;
 
     for (int num_stages : stage_candidates) {
-        best_smem_config = get_smem_config_fp4(num_stages, bm_out, bn_out, warp_m, warp_n, block_k, 1);
+        best_smem_config = get_smem_config_fp4(num_stages, bm_out, bn_out, warp_m, warp_n, block_k, n, has_bias, enable_act_and_quant_fusing);
         if (std::get<0>(best_smem_config) <= ppu_capacity) {
             best_num_stages = num_stages;
             break;
@@ -379,19 +388,23 @@ ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, 
 }
 
 ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, int num_sms,
+                              bool has_bias,
+                              bool enable_act_and_quant_fusing,
                               GemmType gemm_type = GemmType::DenseGemm,
                               int max_block_n = 256, int min_block_n = 32) {
     // C++ layer does not perform device checking; is_ppu1v5_device() assert skipped
     (void)total_m;
 
     if (gemm_type == GemmType::DenseGemm) {
-        return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms);
+        return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing);
     }
 
     std::vector<int> block_ms = (k > 768) ? std::vector<int>{256, 128, 64, 32, 16} : std::vector<int>{128, 64, 32, 16};
 
     DG_HOST_ASSERT(max_block_n > 0 && (max_block_n & (max_block_n - 1)) == 0);
     DG_HOST_ASSERT(min_block_n > 0 && (min_block_n & (min_block_n - 1)) == 0);
+    // SiluAndMulPostQuant fusing only supports block_n >= 64
+    min_block_n = (enable_act_and_quant_fusing && min_block_n < 64) ? 64 : min_block_n;
     int bit_length = 32 - __builtin_clz(static_cast<unsigned>(max_block_n));
     int bit_length_min = 32 - __builtin_clz(static_cast<unsigned>(min_block_n)) - 1; // exponent of min_block_n
     // `exp > bit_length_min - 1` mirrors python's right-open range stop, so min_block_n is included
@@ -494,8 +507,8 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
 
             auto [tmp_block_m, tmp_block_n, tmp_warp_m, tmp_warp_n] = get_warp_mn_grouped(block_m, block_n);
             auto [tmp_best_block_m, tmp_best_block_n, tmp_best_warp_m, tmp_best_warp_n] = get_warp_mn_grouped(best_block_m, best_block_n);
-            int num_occ = get_smem_occ(tmp_block_m, tmp_block_n, 128, 2, tmp_warp_m, tmp_warp_n);
-            int best_num_occ = get_smem_occ(tmp_best_block_m, tmp_best_block_n, 128, 2, tmp_best_warp_m, tmp_best_warp_n);
+            int num_occ = get_smem_occ(tmp_block_m, tmp_block_n, 128, 2, tmp_warp_m, tmp_warp_n, n, has_bias, enable_act_and_quant_fusing);
+            int best_num_occ = get_smem_occ(tmp_best_block_m, tmp_best_block_n, 128, 2, tmp_best_warp_m, tmp_best_warp_n, n, has_bias, enable_act_and_quant_fusing);
 
             if (best_block_m == 0 || best_block_n == 0) {
                 success = true;
@@ -600,7 +613,7 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     auto it = tile_config.find({best_block_m, best_block_n, block_k});
     if (it != tile_config.end()) {
         auto [warp_m, warp_n, num_stages] = it->second;
-        auto best_smem_config = get_smem_config_fp4(num_stages, best_block_m, best_block_n, warp_m, warp_n, block_k, 1);
+        auto best_smem_config = get_smem_config_fp4(num_stages, best_block_m, best_block_n, warp_m, warp_n, block_k, n, has_bias, enable_act_and_quant_fusing);
         return std::make_tuple(num_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, num_stages, best_smem_config);
     }
 
@@ -649,7 +662,7 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     const int ppu_capacity = 262144;
 
     for (int num_stages : stage_candidates) {
-        best_smem_config = get_smem_config_fp4(num_stages, bm_out, bn_out, warp_m, warp_n, block_k, 1);
+        best_smem_config = get_smem_config_fp4(num_stages, bm_out, bn_out, warp_m, warp_n, block_k, n, has_bias, enable_act_and_quant_fusing);
         if (std::get<0>(best_smem_config) <= ppu_capacity) {
             best_num_stages = num_stages;
             break;
