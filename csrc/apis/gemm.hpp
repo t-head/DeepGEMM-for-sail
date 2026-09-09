@@ -592,9 +592,9 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
     // When `out_scale` is given, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
     // `d` becomes uint8 of shape (m, n / 4) and `out_scale` uint16 of shape
     // (m, ceil_div(n / 4, 32)). Unlike the masked variant both are 2-D (no group dim).
-    const bool enable_silu_and_mul_quant_fusing = out_scale_tensor.defined() && out_scale_tensor.numel() > 0;
+    const bool enable_act_and_quant_fusing = out_scale_tensor.defined() && out_scale_tensor.numel() > 0;
     int sfm = 0, sfn = 0;
-    if (enable_silu_and_mul_quant_fusing) {
+    if (enable_act_and_quant_fusing) {
         const int shape_n_out = n / 4;  // /2 for silu_and_mul, /2 for mxfp4 packing
         sfm = m;
         sfn = ceil_div(shape_n_out, 32);
@@ -652,7 +652,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
     // Mirror the Python path: re-stride `out_scale` in place to the N-major layout (1, sfm) that
     // the Gemm2 SFA reader expects. NOTE: this is 2-D here, unlike the masked variant's 3-D layout.
     // `out_scale_tensor` shares the TensorImpl with the caller's tensor, so this is visible in Python.
-    if (enable_silu_and_mul_quant_fusing) {
+    if (enable_act_and_quant_fusing) {
         out_scale_tensor.as_strided_({sfm, sfn}, {1, (int64_t)sfm});
     }
 }
@@ -845,9 +845,9 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
     // When `out_scale` is given, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
     // `d` becomes uint8 of shape (num_groups, m, n / 4) and `out_scale` uint16 of shape
     // (num_groups, m, ceil_div(n / 4, 32)). Bias is not supported in that mode.
-    const bool enable_silu_and_mul_quant_fusing = out_scale_tensor.defined() && out_scale_tensor.numel() > 0;
+    const bool enable_act_and_quant_fusing = out_scale_tensor.defined() && out_scale_tensor.numel() > 0;
     int sfm = 0, sfn = 0;
-    if (enable_silu_and_mul_quant_fusing) {
+    if (enable_act_and_quant_fusing) {
         const int shape_n_out = n / 4;  // /2 for silu_and_mul, /2 for mxfp4 packing
         sfm = m;
         sfn = ceil_div(shape_n_out, 32);
@@ -905,7 +905,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
     // Mirror the Python path: re-stride `out_scale` in place to the N-major layout
     // (sfm * sfn, 1, sfm) that the Gemm2 SFA reader expects. `out_scale_tensor` shares the
     // TensorImpl with the caller's tensor, so the re-stride is visible on the Python side.
-    if (enable_silu_and_mul_quant_fusing) {
+    if (enable_act_and_quant_fusing) {
         out_scale_tensor.as_strided_({num_groups, sfm, sfn},
                                      {(int64_t)sfm * sfn, 1, (int64_t)sfm});
     }

@@ -449,7 +449,7 @@ def get_search_space(d: torch.dtype, gemm_type: str) -> list:
 
     return tile_list_rtn
 
-def get_full_search_space(k) -> list:
+def get_full_search_space(k, n) -> list:
     from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
     block_ms = [256, 128, 64, 32, 16]
     block_ns = [256, 128, 64, 32, 16]
@@ -470,7 +470,7 @@ def get_full_search_space(k) -> list:
                             ### for those cases with super small k.
                         if not stage_candidates: stage_candidates = (2, )
                         for num_stages in stage_candidates:
-                            best_smem_config = get_smem_config_fp4(num_stages, BLOCK_M, BLOCK_N, WARP_M, WARP_N, BLOCK_K)
+                            best_smem_config = get_smem_config_fp4(num_stages, BLOCK_M, BLOCK_N, WARP_M, WARP_N, BLOCK_K, n, False, False)
                             ppu_capacity = 262144
                             if best_smem_config[0] <= ppu_capacity:
                                 configs.append([BLOCK_M, BLOCK_N, WARP_M, WARP_N, BLOCK_K, num_stages])
@@ -505,10 +505,10 @@ def precompile_kernels(search_space, M, N, K, num_experts, topk_experts, gemm_ty
     def compile_and_validate(config, gemm_type):
         from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4, get_num_sms
         num_sms = get_num_sms()
-        smem_config = get_smem_config_fp4(2, 256, 256, 64, 64, 128)
+        smem_config = get_smem_config_fp4(2, 256, 256, 64, 64, 128, N, False, False)
         ref_config = (num_sms, 256, 256, 128, 64, 64, 2, smem_config)
         block_m, block_n, block_k, warp_m, warp_n, num_stages = config
-        smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
+        smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k, N, False, False)
         config = (num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config)
         if gemm_type == "GroupedNoPad":
             group_ms = construct_uniform_m_list("uniform", num_experts, M*topk_experts)
@@ -995,7 +995,7 @@ def autotune_all(
         topk_experts = case_list[0]["topk_experts"]
 
         # search_space = get_search_space(torch.uint8, gemm_type=gemm_type)
-        search_space = get_full_search_space(K)
+        search_space = get_full_search_space(K, N)
         config_list = []
         for tile in search_space:
             block_m, block_n, warp_m, warp_n, block_k, num_stages = tile

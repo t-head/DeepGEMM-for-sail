@@ -51,4 +51,6 @@ All notable changes to DeepGemm for PPU will be documented in this file.
   - Small M (numel <= 16384): WarpOrdered single-kernel path (deterministic,
     tokens sorted within each expert)
   - Large M: deterministic 4-kernel path (zero global atomicAdd)
+  - `enable_act_and_quant_fusing=True` must be passed when the FP4 gemm1 runs with the fused
+    act + MXFP4 post-quant epilogue, so that the queried config satisfies `BlockN >= 64`
 - **INT8 einsum**: new `int8_einsum` interface alongside `fp8_einsum`.

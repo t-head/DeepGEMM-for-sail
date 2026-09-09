@@ -20,7 +20,8 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     const torch::Tensor& out_scale = torch::Tensor(),
     double swiglu_limit = 0.0) {
     // When `out_scale` is provided, silu_and_mul + mxfp4 post-quant are fused into the epilogue.
-    const bool enable_silu_and_mul_quant_fusing = out_scale.defined() && out_scale.numel() > 0;
+    const bool enable_act_and_quant_fusing = out_scale.defined() && out_scale.numel() > 0;
+    const bool hasBias = bias.numel() > 0;
 
     int num_sms = get_num_sms();
     int expected_m = ceil_div(m, num_groups);
@@ -29,14 +30,11 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     if (configs.has_value()) {
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
         selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
-            deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, 1));
+            deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, n, hasBias, enable_act_and_quant_fusing));
     } else {
-        // SiluAndMulPostQuant fusing only supports block_n >= 64
-        int min_block_n = enable_silu_and_mul_quant_fusing ? 64 : 32;
         selected_config = deep_gemm_fp4_common::get_best_configs(
-            m, expected_m, n, k, num_groups, num_sms,
-            true /*is_grouped_nopad*/, false /*is_grouped_masked*/,
-            256 /*max_block_n*/, min_block_n /*min_block_n*/);
+            m, expected_m, n, k, num_groups, num_sms, hasBias, enable_act_and_quant_fusing,
+            true /*is_grouped_nopad*/, false /*is_grouped_masked*/);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
@@ -45,15 +43,13 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     int kNumGroups = num_groups;
     static constexpr GemmType kGemmType = GemmType::GroupedNoPad;
 
-    bool hasBias = bias.numel() > 0;
-
     // N_EXPAND logic, keep in sync with m_grouped_gemm_fp4.py (nopad).
     // The fused epilogue requires n_expand == 1 (EpilogueTraits::is_valid_config).
     int n_expand = 1;
-    if (k <= 512 && n % (block_n * 4) == 0 && !hasBias && !enable_silu_and_mul_quant_fusing) {
+    if (k <= 512 && n % (block_n * 4) == 0 && !hasBias && !enable_act_and_quant_fusing) {
         n_expand = 4;
     }
-    if (k <= 128 && n % (block_n * 8) == 0 && !hasBias && !enable_silu_and_mul_quant_fusing) {
+    if (k <= 128 && n % (block_n * 8) == 0 && !hasBias && !enable_act_and_quant_fusing) {
         n_expand = 8;
     }
 
@@ -61,7 +57,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     // hasBias) in utils_rtc.cuh.
     // `!hasBias` plus `n % 64 == 0` (which implies n is even) are also what keep the TSM fallback
     // from claiming this shape ahead of the fused epilogue in the branch chain below.
-    if (enable_silu_and_mul_quant_fusing) {
+    if (enable_act_and_quant_fusing) {
         DG_HOST_ASSERT(!hasBias);
         DG_HOST_ASSERT(n_expand == 1);
         DG_HOST_ASSERT(block_n >= 64 && block_n % 64 == 0);
@@ -93,11 +89,11 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     uint8_t* ptr_B = rhs.data_ptr<uint8_t>();
     uint16_t* ptr_scale_B = rhs_scales.data_ptr<uint16_t>();
     // In the fused epilogue `out` is uint8 (packed mxfp4) rather than bfloat16.
-    cutlass::bfloat16_t* ptr_D = enable_silu_and_mul_quant_fusing
+    cutlass::bfloat16_t* ptr_D = enable_act_and_quant_fusing
                                      ? nullptr
                                      : reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
-    uint8_t* ptr_D_fused = enable_silu_and_mul_quant_fusing ? out.data_ptr<uint8_t>() : nullptr;
-    uint16_t* ptr_SFD = enable_silu_and_mul_quant_fusing ? out_scale.data_ptr<uint16_t>() : nullptr;
+    uint8_t* ptr_D_fused = enable_act_and_quant_fusing ? out.data_ptr<uint8_t>() : nullptr;
+    uint16_t* ptr_SFD = enable_act_and_quant_fusing ? out_scale.data_ptr<uint16_t>() : nullptr;
     float* ptr_C = nullptr;
 
     // Compute m_rows from m_indices if not provided
@@ -158,8 +154,8 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     FP4GemmRuntime::Args args{};
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
                         n, k, "GroupedNoPad", "fp4_grouped_deep_gemm_nopad", hasBias, n_expand, false,
-                        enable_silu_and_mul_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
-                        enable_silu_and_mul_quant_fusing && swiglu_limit > 0.0};
+                        enable_act_and_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
+                        enable_act_and_quant_fusing && swiglu_limit > 0.0};
     args.launch_args = {grid, block, SMSIZE};
 
     // Branch exactly like the device-side CollectiveEpilogue conditional in generate_impl:
@@ -184,7 +180,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
         params.scheduler = TileSchedulerArguments((uint32_t)m, layout_info);
         params.workspace = nullptr;
         params.signal = signal_ptr;
-    } else if (enable_silu_and_mul_quant_fusing) {
+    } else if (enable_act_and_quant_fusing) {
         auto& params = args.kernel_params.silu_and_mul_post_quant;
         params = {};
         params.mode = cutlass::gemm::GemmUniversalMode::kGemm;
@@ -275,7 +271,8 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     const torch::Tensor& out_scale = torch::Tensor(),
     double swiglu_limit = 0.0) {
     // When `out_scale` is provided, silu_and_mul + mxfp4 post-quant are fused into the epilogue.
-    const bool enable_silu_and_mul_quant_fusing = out_scale.defined() && out_scale.numel() > 0;
+    const bool enable_act_and_quant_fusing = out_scale.defined() && out_scale.numel() > 0;
+    const bool hasBias = bias.numel() > 0;
 
     int num_sms = get_num_sms();
 
@@ -283,14 +280,11 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     if (configs.has_value()) {
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
         selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
-            deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, 1));
+            deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, n, hasBias, enable_act_and_quant_fusing));
     } else {
-        // SiluAndMulPostQuant fusing only supports block_n >= 64
-        int min_block_n = enable_silu_and_mul_quant_fusing ? 64 : 32;
         selected_config = deep_gemm_fp4_common::get_best_configs(
-            m, expected_m, n, k, num_groups, num_sms,
-            false /*is_grouped_nopad*/, true /*is_grouped_masked*/,
-            max_block_n /*max_block_n*/, min_block_n /*min_block_n*/);
+            m, expected_m, n, k, num_groups, num_sms, hasBias, enable_act_and_quant_fusing,
+            false /*is_grouped_nopad*/, true /*is_grouped_masked*/, max_block_n);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
@@ -299,12 +293,10 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     int kNumGroups = num_groups;
     static constexpr GemmType kGemmType = GemmType::GroupedMasked;
 
-    bool hasBias = bias.numel() > 0;
-
     // N_EXPAND logic for masked, keep in sync with m_grouped_gemm_fp4.py (masked).
     // The fused epilogue requires n_expand == 1 (EpilogueTraits::is_valid_config).
     int n_expand = 1;
-    if (k <= 512 && expected_m > 2 && n % (block_n * 4) == 0 && !hasBias && !enable_silu_and_mul_quant_fusing) {
+    if (k <= 512 && expected_m > 2 && n % (block_n * 4) == 0 && !hasBias && !enable_act_and_quant_fusing) {
         n_expand = 4;
     }
 
@@ -312,7 +304,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     // hasBias) in utils_rtc.cuh.
     // `!hasBias` plus `n % 64 == 0` (which implies n is even) are also what keep the TSM fallback
     // from claiming this shape ahead of the fused epilogue in the branch chain below.
-    if (enable_silu_and_mul_quant_fusing) {
+    if (enable_act_and_quant_fusing) {
         DG_HOST_ASSERT(!hasBias);
         DG_HOST_ASSERT(n_expand == 1);
         DG_HOST_ASSERT(block_n >= 64 && block_n % 64 == 0);
@@ -362,11 +354,11 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     uint8_t* ptr_B = rhs.data_ptr<uint8_t>();
     uint16_t* ptr_scale_B = rhs_scales.data_ptr<uint16_t>();
     // In the fused epilogue `out` is uint8 (packed mxfp4) rather than bfloat16.
-    cutlass::bfloat16_t* ptr_D = enable_silu_and_mul_quant_fusing
+    cutlass::bfloat16_t* ptr_D = enable_act_and_quant_fusing
                                      ? nullptr
                                      : reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
-    uint8_t* ptr_D_fused = enable_silu_and_mul_quant_fusing ? out.data_ptr<uint8_t>() : nullptr;
-    uint16_t* ptr_SFD = enable_silu_and_mul_quant_fusing ? out_scale.data_ptr<uint16_t>() : nullptr;
+    uint8_t* ptr_D_fused = enable_act_and_quant_fusing ? out.data_ptr<uint8_t>() : nullptr;
+    uint16_t* ptr_SFD = enable_act_and_quant_fusing ? out_scale.data_ptr<uint16_t>() : nullptr;
     float* ptr_C = nullptr;
 
     // Grouped layout for masked: masked_m contains per-group row counts
@@ -389,14 +381,14 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         FP4DynamicTileRuntime::Args dyn_args{};
         dyn_args.launch_info = {n, k, kNumGroups, dynamic_tile_id, "GroupedMasked",
                                 "fp4_grouped_deep_gemm_masked_dynamic_tile",
-                                enable_silu_and_mul_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
-                                enable_silu_and_mul_quant_fusing && swiglu_limit > 0.0};
+                                enable_act_and_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
+                                enable_act_and_quant_fusing && swiglu_limit > 0.0};
         // The dynamic-tile kernel's block shape is get_block_shape() == MaxThreadsPerBlock, which
         // varies per kDynamicTileId and is unrelated to the fixed 128x128 block config above.
         dim3 const dyn_block = dyn_launch.block_threads;
         dyn_args.launch_args = {grid, dyn_block, SMSIZE};
 
-        if (enable_silu_and_mul_quant_fusing) {
+        if (enable_act_and_quant_fusing) {
             auto& params = dyn_args.kernel_params.dynamic_tile_silu_and_mul_post_quant;
             params = {};
             params.ptr_A = ptr_A;
@@ -472,8 +464,8 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     FP4GemmRuntime::Args args{};
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
                         n, k, "GroupedMasked", "fp4_grouped_deep_gemm_masked", hasBias, n_expand, enable_sbo_overlap,
-                        enable_silu_and_mul_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
-                        enable_silu_and_mul_quant_fusing && swiglu_limit > 0.0};
+                        enable_act_and_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
+                        enable_act_and_quant_fusing && swiglu_limit > 0.0};
     args.launch_args = {grid, block, SMSIZE};
 
     // Branch exactly like the device-side CollectiveEpilogue conditional in generate_impl:
@@ -498,7 +490,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         params.scheduler = TileSchedulerArguments((uint32_t)m, grouped_layout);
         params.workspace = nullptr;
         params.signal = signal_ptr;
-    } else if (enable_silu_and_mul_quant_fusing) {
+    } else if (enable_act_and_quant_fusing) {
         auto& params = args.kernel_params.silu_and_mul_post_quant;
         params = {};
         params.mode = cutlass::gemm::GemmUniversalMode::kGemm;

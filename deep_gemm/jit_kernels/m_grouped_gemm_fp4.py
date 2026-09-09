@@ -105,8 +105,8 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     m_, n_ = out.shape
     m__ = m_indices.numel()
 
-    enable_silu_and_mul_quant_fusing = out_scale is not None
-    if enable_silu_and_mul_quant_fusing:
+    enable_act_and_quant_fusing = out_scale is not None
+    if enable_act_and_quant_fusing:
         shape_n_out = n // 4 ### /2: silu_and_mul; /2: quant mxfp4
         sfm, sfn = m, ceil_div(shape_n_out, 32)
         assert n_ == shape_n_out, f'{n_=}, expected {shape_n_out}'
@@ -161,9 +161,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        ### SiluAndMulPostQuant fusing only support block_n >= 64
-        min_block_n = 64 if enable_silu_and_mul_quant_fusing else 16
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedNoPad, min_block_n=min_block_n)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing, gemm_type=GemmType.GroupedNoPad)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
         # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
 
@@ -181,9 +179,9 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     block_m_info = torch.empty((num_groups + ceil_div(m + 1 - num_groups, block_m)) * 4, dtype=torch.int32, device=m_rows.device)
     n_expand = 1
 
-    if k <= 512 and n % (block_n * 4) == 0 and not has_bias and not enable_silu_and_mul_quant_fusing:
+    if k <= 512 and n % (block_n * 4) == 0 and not has_bias and not enable_act_and_quant_fusing:
         n_expand = 4
-    if k <= 128 and n % (block_n * 8) == 0 and not has_bias and not enable_silu_and_mul_quant_fusing:
+    if k <= 128 and n % (block_n * 8) == 0 and not has_bias and not enable_act_and_quant_fusing:
         n_expand = 8
 
     swiglu_limit_ = 0.0 if (swiglu_limit is None) else swiglu_limit
@@ -211,7 +209,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     # Run the kernel
     runtime(*args)
 
-    if enable_silu_and_mul_quant_fusing:
+    if enable_act_and_quant_fusing:
         ### sfm and sfn always > 1 for GroupedNoPad(topk > 1).
         out_scale.as_strided_(size=(sfm, sfn), stride=(1, sfm))
 
@@ -247,8 +245,8 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     num_groups_, n, k_ = rhs.shape
     num_groups__, m_, n_ = out.shape
 
-    enable_silu_and_mul_quant_fusing = out_scale is not None
-    if enable_silu_and_mul_quant_fusing:
+    enable_act_and_quant_fusing = out_scale is not None
+    if enable_act_and_quant_fusing:
         shape_n_out = n // 4 ### /2: silu_and_mul; /2: quant mxfp4
         sfm, sfn = m, ceil_div(shape_n_out, 32)
         assert n_ == shape_n_out, f'{n_=}, expected {shape_n_out}'
@@ -305,9 +303,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        ### SiluAndMulPostQuant fusing only support block_n >= 64
-        min_block_n = 64 if enable_silu_and_mul_quant_fusing else 16
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedMasked, min_block_n=min_block_n)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing, gemm_type=GemmType.GroupedMasked)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
         # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
 
@@ -318,7 +314,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
         (num_groups + ceil_div(m + 1 - num_groups, block_m)) * 4, dtype=torch.int32, device=masked_m.device)
 
     n_expand = 1
-    if k <= 512 and expected_m > 2 and n % (block_n * 4) == 0 and not has_bias and not enable_silu_and_mul_quant_fusing:
+    if k <= 512 and expected_m > 2 and n % (block_n * 4) == 0 and not has_bias and not enable_act_and_quant_fusing:
         n_expand = 4
 
     EnableMoeDynamicTile, DynamicTileId = select_moe_dynamic_tile(
@@ -356,7 +352,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     # Run the kernel
     runtime(*args)
 
-    if enable_silu_and_mul_quant_fusing:
+    if enable_act_and_quant_fusing:
         ### sfm and sfn always > 1 for GroupedMasked(topk > 1).
         out_scale.as_strided_(size=(num_groups, sfm, sfn), stride=(sfm * sfn, 1, sfm))
 

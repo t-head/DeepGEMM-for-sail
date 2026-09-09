@@ -466,7 +466,7 @@ if __name__ == "__main__":
             # only run num_stage == target_stage, because run all configs take too much time (>7200s)
             continue
         sm = get_num_sms()
-        smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
+        smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k, n, False, False)
         config_list.append((sm, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config))
 
     results = test_all_configs(config_list, gemm_type, f'{gemm_type}_kernel_config_results_{m}{n}{k}_double.txt', f'{gemm_type}_kernel_config_results_{m}{n}{k}_double.json', m, n, k, num_groups)

@@ -142,7 +142,7 @@ def moe_align_block_size(
     topk_ids: torch.Tensor,
     perchannel_quant: bool = False,
     config=None,
-    enable_silu_and_mul_quant_fusing: bool = False,
+    enable_act_and_quant_fusing: bool = False,
 ):
     """
     Align token assignments to blocks for MoE Grouped GEMM computation.
@@ -154,7 +154,7 @@ def moe_align_block_size(
                 indicating which expert each token selects.
         perchannel_quant: Whether per-channel quantization is used (affects auto-config selection).
         config: Optional GEMM config tuple. If None, auto-selected via get_best_configs.
-        enable_silu_and_mul_quant_fusing: Whether to fuse silu_and_mul_post_quant kernel
+        enable_act_and_quant_fusing: Whether to fuse silu_and_mul_post_quant kernel
                 into fp4 fused_moe Epilogue.
 
     Returns:
@@ -205,9 +205,11 @@ def moe_align_block_size(
         elif dtype == torch.float8_e4m3fn:
             config = fp8_blkwise_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
         elif dtype == torch.uint8:
-            ### SiluAndMulPostQuant fusing only support block_n >= 64
-            min_block_n = 64 if enable_silu_and_mul_quant_fusing else 32
-            config = fp4_get_best_configs(numel, expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused, min_block_n=min_block_n)
+            ### the fused MoE fp4 kernel has no bias path, and the `block_n >= 64` clamp required by
+            ### the fused epilogue is applied inside fp4_get_best_configs
+            config = fp4_get_best_configs(numel, expected_m, n, k, num_groups, num_sms, has_bias=False,
+                                          enable_act_and_quant_fusing=enable_act_and_quant_fusing,
+                                          gemm_type=GemmType.GroupedFused)
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
     block_m = config[1]
@@ -594,8 +596,8 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
     num_groups, n, k_ = rhs.shape
     m_sum, n_ = out.shape
 
-    enable_silu_and_mul_quant_fusing = out_scale is not None
-    if enable_silu_and_mul_quant_fusing:
+    enable_act_and_quant_fusing = out_scale is not None
+    if enable_act_and_quant_fusing:
         shape_n_out = n // 4 ### /2: silu_and_mul; /2: quant mxfp4
         sfm, sfn = m_sum, ceil_div(shape_n_out, 32)
         assert n_ == shape_n_out, f'{n_=}, expected {shape_n_out}'
@@ -682,7 +684,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
     )
     runtime(*args)
 
-    if enable_silu_and_mul_quant_fusing:
+    if enable_act_and_quant_fusing:
         ### the sorted output rows are contiguous, so the SFD is M-major over the whole m_sum.
         out_scale.as_strided_(size=(sfm, sfn), stride=(1, sfm))
 

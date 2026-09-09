@@ -66,25 +66,33 @@ def get_sf_per_stage_size(block_mn: int, block_k: int) -> Tuple[int, int]:
         return (base_smem_sf_size + sf_padding_size, invalid_sf_element_size)
 
 @lru_cache(maxsize=None)
-def get_smem_config_fp4(num_stages: int, block_m: int, block_n: int, warp_m: int, warp_n: int, block_k: int = 128, bpp: int = 1) -> Tuple[int, int, int]:
+def get_smem_config_fp4(num_stages: int, block_m: int, block_n: int, warp_m: int, warp_n: int, block_k: int, shape_n: int, has_bias: bool, enable_act_and_quant_fusing: bool, bpp: int = 1) -> Tuple[int, int, int]:
     # Try swizzle first, as it does not waste shared memory
     swizzle_mode = 128
     # block_n_padding = get_block_n_padding_for_smem_d(block_n) if swizzle_mode == 0 else 0
     block_n_padding = 0
+    warp_on_m = block_m // warp_m
 
-    smem_d = block_m * (block_n + block_n_padding)
     smem_a_per_stage = block_m * block_k
     smem_b_per_stage = block_n * block_k
     # smem_barrier = num_stages * 8 * 2
     smem_sfa_per_stage, invalid_sfa_element_size = get_sf_per_stage_size(block_m, block_k)
     smem_sfb_per_stage, invalid_sfb_element_size = get_sf_per_stage_size(block_n, block_k)
 
-    ### output dtype of fp4 is bf16 currently
-    smem_size_d = smem_d * 2
+    smem_size_d = 0  ### default: using CollectiveEpilogueNoTsm
     smem_size_a = num_stages * smem_a_per_stage * bpp
     smem_size_b = num_stages * smem_b_per_stage * bpp
     smem_size_sfa = num_stages * smem_sfa_per_stage * bpp - invalid_sfa_element_size
     smem_size_sfb = num_stages * smem_sfb_per_stage * bpp - invalid_sfb_element_size
+
+    ### re-calculate epilogue smem size to fit into different epilogue type
+    if shape_n % 2 != 0 or has_bias:
+        ### using CollectiveEpilogueWithTsm: cosize(SmemLayoutO) == (warp_on_m * 16) * block_n floats
+        smem_size_d = warp_on_m * 16 * block_n * 4
+    elif enable_act_and_quant_fusing:
+        ### using CollectiveEpilogueSiluAndMulPostQuant, keep in sync with
+        ### EpilogueSiluAndMulPostQuant::get_shared_storage_size (+4 floats per row == TSM_PADDING)
+        smem_size_d = block_m * ((block_n // 2) + 4) * 4
 
     smem_size = max(smem_size_d, smem_size_a + smem_size_b + smem_size_sfa + smem_size_sfb)
 
@@ -93,18 +101,21 @@ def get_smem_config_fp4(num_stages: int, block_m: int, block_n: int, warp_m: int
 
     return smem_size, swizzle_mode, block_n_padding
 
-def get_smem_occ(block_m: int, block_n: int, block_k: int, num_stages: int, warp_m: int, warp_n: int) -> Tuple[int]:
+def get_smem_occ(block_m: int, block_n: int, block_k: int, num_stages: int, warp_m: int, warp_n: int,
+                 shape_n: int, has_bias: bool, enable_act_and_quant_fusing: bool) -> Tuple[int]:
     if block_m is None:
         return 0
 
     # use static suppose.
     ppu_capacity = 262144
-    smem_size = get_smem_config_fp4(num_stages=num_stages, block_m=block_m, block_n=block_n, block_k=block_k, warp_m=warp_m, warp_n=warp_n)[0]
+    smem_size = get_smem_config_fp4(num_stages=num_stages, block_m=block_m, block_n=block_n, block_k=block_k, warp_m=warp_m, warp_n=warp_n,
+                                    shape_n=shape_n, has_bias=has_bias, enable_act_and_quant_fusing=enable_act_and_quant_fusing)[0]
 
     return ppu_capacity // smem_size
 
 @lru_cache(maxsize=None)
-def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: int) -> \
+def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: int,
+                                  has_bias: bool, enable_act_and_quant_fusing: bool) -> \
         Tuple[int, int, int, int, int, int, int, int, int, dict]:
 
     #FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
@@ -168,7 +179,7 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
 
             tmp_block_m, tmp_block_n, tmp_warp_m, tmp_warp_n = get_warp_mn_dense(m, n, k, block_m, block_n)
             tmp_best_block_m, tmp_best_block_n, tmp_best_warp_m, tmp_best_warp_n = get_warp_mn_dense(m, n, k, best_block_m, best_block_n)
-            num_occ, best_num_occ = get_smem_occ(tmp_block_m, tmp_block_n, 128, 2, warp_m=tmp_warp_m, warp_n=tmp_warp_n), get_smem_occ(tmp_best_block_m, tmp_best_block_n, 128, 2, warp_m=tmp_best_warp_m, warp_n=tmp_best_warp_n)
+            num_occ, best_num_occ = get_smem_occ(tmp_block_m, tmp_block_n, 128, 2, warp_m=tmp_warp_m, warp_n=tmp_warp_n, shape_n=n, has_bias=has_bias, enable_act_and_quant_fusing=enable_act_and_quant_fusing), get_smem_occ(tmp_best_block_m, tmp_best_block_n, 128, 2, warp_m=tmp_best_warp_m, warp_n=tmp_best_warp_n, shape_n=n, has_bias=has_bias, enable_act_and_quant_fusing=enable_act_and_quant_fusing)
 
             # print(f"block_m:{block_m}, block_n:{block_n}, best_block_m:{best_block_m}, best_block_n:{best_block_n}")
             # print(f'num_occ:{num_occ}, best_num_occ:{best_num_occ}')
@@ -254,7 +265,7 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
 
     best_occ = 0
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config_fp4(num_stages, best_block_m, best_block_n, warp_m, warp_n, block_k, 1)
+        best_smem_config = get_smem_config_fp4(num_stages, best_block_m, best_block_n, warp_m, warp_n, block_k, n, has_bias, enable_act_and_quant_fusing)
         # print(f"num_stages:{num_stages}, best_smem_config:{best_smem_config}")
         if best_smem_config[0] <= ppu_capacity:
             # occ = ppu_capacity // best_smem_config[0]
@@ -276,6 +287,8 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
 
 @lru_cache(maxsize=None)
 def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_sms: int,
+                     has_bias: bool,
+                     enable_act_and_quant_fusing: bool,
                      gemm_type: GemmType=GemmType.DenseGemm,
                      max_block_n: int = 256,
                      min_block_n: int = 32) -> \
@@ -292,12 +305,14 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
     #   if configs is not None:
     #       return configs
     if gemm_type == GemmType.DenseGemm:
-        return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms)
+        return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing)
 
     block_ms = (256, 128, 64, 32, 16) if k > 768 else (128, 64, 32, 16)
     # block_ns = (256, 128, 64, 32)
     assert max_block_n > 0 and (max_block_n & (max_block_n - 1)) == 0
     assert min_block_n > 0 and (min_block_n & (min_block_n - 1)) == 0
+    ### SiluAndMulPostQuant fusing only supports block_n >= 64
+    min_block_n = 64 if (enable_act_and_quant_fusing and min_block_n < 64) else min_block_n
     # block_ns comes from a left-closed, right-open interval
     block_ns = tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 1, min_block_n.bit_length() - 2, -1))) if k >= 384 else tuple(map(lambda x: 2**x, range(max_block_n.bit_length() - 2, min_block_n.bit_length() - 2, -1)))
 
@@ -362,7 +377,7 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
 
             tmp_block_m, tmp_block_n, tmp_warp_m, tmp_warp_n = get_warp_mn_grouped(m, n, k, block_m, block_n)
             tmp_best_block_m, tmp_best_block_n, tmp_best_warp_m, tmp_best_warp_n = get_warp_mn_grouped(m, n, k, best_block_m, best_block_n)
-            num_occ, best_num_occ = get_smem_occ(tmp_block_m, tmp_block_n, 128, 2, warp_m=tmp_warp_m, warp_n=tmp_warp_n), get_smem_occ(tmp_best_block_m, tmp_best_block_n, 128, 2, warp_m=tmp_best_warp_m, warp_n=tmp_best_warp_n)
+            num_occ, best_num_occ = get_smem_occ(tmp_block_m, tmp_block_n, 128, 2, warp_m=tmp_warp_m, warp_n=tmp_warp_n, shape_n=n, has_bias=has_bias, enable_act_and_quant_fusing=enable_act_and_quant_fusing), get_smem_occ(tmp_best_block_m, tmp_best_block_n, 128, 2, warp_m=tmp_best_warp_m, warp_n=tmp_best_warp_n, shape_n=n, has_bias=has_bias, enable_act_and_quant_fusing=enable_act_and_quant_fusing)
 
             # print(f"block_m:{block_m}, block_n:{block_n}, best_block_m:{best_block_m}, best_block_n:{best_block_n}")
             # print(f'num_occ:{num_occ}, best_num_occ:{best_num_occ}')
@@ -463,7 +478,7 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
     warp_stage = tile_config.get((best_block_m, best_block_n, block_k))
     if warp_stage:
         warp_m, warp_n, num_stages = warp_stage
-        best_smem_config = get_smem_config_fp4(num_stages, best_block_m, best_block_n, warp_m, warp_n, block_k, 1)
+        best_smem_config = get_smem_config_fp4(num_stages, best_block_m, best_block_n, warp_m, warp_n, block_k, n, has_bias, enable_act_and_quant_fusing)
         return num_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, num_stages, best_smem_config
 
     #todo: opt this logic
@@ -499,7 +514,7 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
 
     best_occ = 0
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config_fp4(num_stages, best_block_m, best_block_n, warp_m, warp_n, block_k, 1)
+        best_smem_config = get_smem_config_fp4(num_stages, best_block_m, best_block_n, warp_m, warp_n, block_k, n, has_bias, enable_act_and_quant_fusing)
         # print(f"num_stages:{num_stages}, best_smem_config:{best_smem_config}")
         if best_smem_config[0] <= ppu_capacity:
             occ = ppu_capacity // best_smem_config[0]
@@ -651,7 +666,7 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
         # import ipdb; ipdb.set_trace()
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, m, n, k, 1, num_sms)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, m, n, k, 1, num_sms, has_bias, enable_act_and_quant_fusing=False)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
         # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
 
