@@ -7,7 +7,9 @@ import torch.multiprocessing as mp
 import copy
 
 import deep_gemm
-from deep_gemm import bench_kineto, calc_diff, ceil_div, get_m_alignment_for_contiguous_layout, get_col_major_tensor
+from deep_gemm import bench_kineto, get_m_alignment_for_contiguous_layout, get_col_major_tensor
+
+from math_utils import ceil_div, calc_diff
 from deep_gemm.jit_kernels.gemm_int8 import get_smem_config
 from deep_gemm.jit_kernels.utils import get_search_space, get_num_sms
 from utils import read_numbers_from_file, parse_dump_file, parse_deepgemm_string_re, judge_device_type

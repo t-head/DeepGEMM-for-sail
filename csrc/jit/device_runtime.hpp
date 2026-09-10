@@ -1,5 +1,8 @@
 #pragma once
 
+#include <iostream>
+#include <string>
+
 #include <hggc_runtime_api.h>
 #include <torch/version.h>
 #include <torch/torch.h>
@@ -54,8 +57,18 @@ public:
     }
 
     int get_num_sms() {
-        if (num_sms == 0)
-            num_sms = get_prop()->multiProcessorCount;
+        if (num_sms == 0) {
+            const auto prop = get_prop();
+            std::cout << "device_props.name:" << prop->name << std::endl;
+            const std::string device_name(prop->name);
+            // Synced from the legacy free function deep_gemm::get_num_sms() (utils/utils.hpp):
+            // ZW810E/ZW610E expose a reduced SM budget, other devices use the full count.
+            if (device_name.find("ZW810E") != std::string::npos or device_name.find("ZW610E") != std::string::npos) {
+                num_sms = 20;
+            } else {
+                num_sms = prop->multiProcessorCount;
+            }
+        }
         return num_sms;
     }
 
@@ -73,6 +86,6 @@ public:
     }
 };
 
-static auto device_runtime = LazyInit<DeviceRuntime>([](){ return std::make_shared<DeviceRuntime>(); });
+inline auto device_runtime = LazyInit<DeviceRuntime>([](){ return std::make_shared<DeviceRuntime>(); });
 
 } // namespace deep_gemm

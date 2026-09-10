@@ -8,25 +8,8 @@ PPU_HOME = os.environ.get('PPU_SDK') or os.environ.get('PPU_HOME') or '/usr/loca
 from . import jit
 from . import deep_gemm_tuner
 from . import deep_gemm_cpp
-from .jit_kernels import (
-    # gemm_fp4_fp4_bf16_nt,
-    gemm_fp8_fp8_bf16_nt,
-    gemm_int8_int8_bf16_nt,
-    # m_grouped_gemm_fp4_fp4_bf16_nt_masked,
-    # m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
-    # preprocess_mxfp4_scales,
-    uint8_padding,
-    # preprocess_mxfp4_weight_for_act_and_quant_fusing,
-    # m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-    # m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-    # m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
-    ceil_div,
-    set_num_sms, get_num_sms,
-    get_col_major_tma_aligned_tensor,
-    get_col_major_tensor,
-    get_m_alignment_for_contiguous_layout,
-)
 
+# Benchmarking / correctness utilities
 from .utils import (
     bench,
     bench_kineto,
@@ -34,89 +17,81 @@ from .utils import (
     transform_sf_into_required_layout,
 )
 
-from .jit import set_compile_mode, get_compile_mode
-# Import functions from the CPP module
-
+# Configs
 from .deep_gemm_cpp import (
+    set_num_sms,
+    get_num_sms,
+    set_compile_mode,
+    get_compile_mode,
+)
+
+# Layout utilities
+from .deep_gemm_cpp import (
+    get_col_major_tma_aligned_tensor,
+    get_col_major_tensor,
+    get_m_alignment_for_contiguous_layout,
+)
+
+# DeepGEMM Kernels
+from .deep_gemm_cpp import (
+    # BF16 GEMMs
     gemm_bf16_bf16_bf16_nt,
-    # gemm_fp8_fp8_bf16_nt,
-    # gemm_int8_int8_bf16_nt,
-    gemm_fp4_fp4_bf16_nt,
-    m_grouped_gemm_bf16_bf16_bf16_nt_masked,
     m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
+    m_grouped_gemm_bf16_bf16_bf16_nt_masked,
     m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
+    m_grouped_gemm_bf16_bf16_bf16_nt_fused,
+    # INT8 GEMMs
+    gemm_int8_int8_bf16_nt,
+    m_grouped_gemm_int8_int8_bf16_nt_contiguous,
+    m_grouped_gemm_int8_int8_bf16_nt_masked,
+    m_grouped_gemm_int8_int8_bf16_nt_nopad,
+    m_grouped_gemm_int8_int8_bf16_nt_fused,
+    # FP8 GEMMs
+    gemm_fp8_fp8_bf16_nt,
     m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
     m_grouped_gemm_fp8_fp8_bf16_nt_masked,
     m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
-    m_grouped_gemm_int8_int8_bf16_nt_masked,
-    m_grouped_gemm_int8_int8_bf16_nt_contiguous,
-    m_grouped_gemm_int8_int8_bf16_nt_nopad,
+    m_grouped_gemm_fp8_fp8_bf16_nt_fused,
+    # FP4 GEMMs
+    gemm_fp4_fp4_bf16_nt,
     m_grouped_gemm_fp4_fp4_bf16_nt_masked,
     m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
-    tf32_hc_prenorm_gemm,
-    # Attention kernels
-    get_paged_mqa_logits_metadata,
-    fp8_mqa_logits,
-    bf16_mqa_logits,
-    int8_mqa_logits,
-    fp8_paged_mqa_logits,
-    bf16_paged_mqa_logits,
-    int8_paged_mqa_logits,
-    fp8_fp4_mqa_logits,
-    fp8_fp4_paged_mqa_logits,
-    fp8_mqa_avg_logits,
-    fp8_paged_mqa_avg_logits,
-    fp8_einsum,
-    int8_einsum,
+    m_grouped_gemm_fp4_fp4_bf16_nt_fused,
+    # MoE kernels
+    moe_align_block_size,
+    # FP4 scale / weight preprocessing
     preprocess_mxfp4_scales,
     preprocess_mxfp4_weight_for_act_and_quant_fusing,
     # W4A16 / W4FA16 GEMMs
     m_grouped_gemm_w4a16_nopad,
     m_grouped_gemm_w4a16_masked,
     m_grouped_gemm_w4a16_fused,
-    moe_align_block_size,
-    m_grouped_gemm_bf16_bf16_bf16_nt_fused,
-    m_grouped_gemm_fp8_fp8_bf16_nt_fused,
-    m_grouped_gemm_int8_int8_bf16_nt_fused,
-    m_grouped_gemm_fp4_fp4_bf16_nt_fused,
+    # TF32 hyperconnection kernels
+    tf32_hc_prenorm_gemm,
+    # Einsum kernels
+    fp8_einsum,
+    int8_einsum,
+    # Attention kernels (MQA logits)
+    get_paged_mqa_logits_metadata,
+    bf16_mqa_logits,
+    fp8_mqa_logits,
+    fp8_mqa_avg_logits,
+    int8_mqa_logits,
+    fp8_fp4_mqa_logits,
+    # Attention kernels (paged MQA logits)
+    bf16_paged_mqa_logits,
+    fp8_paged_mqa_logits,
+    int8_paged_mqa_logits,
+    fp8_paged_mqa_avg_logits,
+    fp8_fp4_paged_mqa_logits,
 )
-
-use_cpp_jit_for_python = os.environ.get('USE_CPP_JIT_FOR_PYTHON', '').lower()
-should_init_deep_gemm_cpp = use_cpp_jit_for_python in ('1', 'true', 'yes', 'on')
-if should_init_deep_gemm_cpp:
-    # from .deep_gemm_cpp import (
-    #     set_num_sms,
-    #     get_num_sms,
-    #     set_tc_util,
-    #     get_tc_util,
-    # )
-    # DeepGEMM Kernels
-    from .deep_gemm_cpp import (
-        # FP8 GEMMs
-        # gemm_fp8_fp8_bf16_nt,
-        # fp8_gemm_nn,
-        # fp8_gemm_tn, fp8_gemm_tt,
-        # m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-        # m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-        # m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
-        # fp8_gemm_nt_skip_head_mid,
-        gemm_fp8_fp8_bf16_nt,
-        gemm_int8_int8_bf16_nt,
-       # # BF16 Fused MoE GEMM
-       # m_grouped_gemm_bf16_bf16_bf16_nt_fused,
-       # # FP8/INT8 Fused MoE GEMM
-       # m_grouped_gemm_fp8_fp8_bf16_nt_fused,
-       # m_grouped_gemm_int8_int8_bf16_nt_fused,
-       # # moe_align preprocessing
-       # moe_align_block_size,
-    )
 
 deep_gemm_cpp.init(
     os.path.dirname(os.path.abspath(__file__)), # Library root directory path
     PPU_HOME         # SDK root
 )
 
-# Some alias for APIs
+# Some aliases for APIs
 fp8_gemm_nt = gemm_fp8_fp8_bf16_nt
 fp8_m_grouped_gemm_nt_masked = m_grouped_gemm_fp8_fp8_bf16_nt_masked
 m_grouped_fp8_gemm_nt_contiguous = m_grouped_gemm_fp8_fp8_bf16_nt_contiguous

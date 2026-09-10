@@ -19,6 +19,14 @@ static void register_apis(pybind11::module_& m) {
         return device_runtime->get_tc_util();
     });
 
+    // COMPILE MODE (mirrors Python jit/runtime.py set/get_compile_mode; ONLY_COMPILE = 1 compiles but skips launch)
+    m.def("set_compile_mode", [](const int& mode) {
+        set_compile_mode(mode);
+    });
+    m.def("get_compile_mode", []() {
+        return get_compile_mode();
+    });
+
     m.def("init", [&](const std::string& library_root_path, const std::string& sdk_home_path) {
         Compiler::prepare_init(library_root_path, sdk_home_path);
         KernelRuntime::prepare_init(sdk_home_path);

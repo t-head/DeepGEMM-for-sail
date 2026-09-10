@@ -3,7 +3,8 @@ import torch.nn.functional as F
 import time
 from typing import Tuple
 import deep_gemm
-from deep_gemm import calc_diff, ceil_div, preprocess_mxfp4_scales, moe_align_block_size
+from deep_gemm import preprocess_mxfp4_scales, moe_align_block_size
+from math_utils import ceil_div, calc_diff
 from utils import construct, check_signal, construct_group_m_list, get_ref_backend, find_next_power_of_2
 from utils import construct_contiguous_grouped as construct_nopad_base
 from utils import construct_grouped_masked as construct_masked_base

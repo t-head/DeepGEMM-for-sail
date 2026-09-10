@@ -5,6 +5,7 @@
 #include <hggc_runtime_api.h>
 #include "math.hpp"
 #include "system.hpp"
+#include "../jit/device_runtime.hpp"
 
 namespace deep_gemm {
 
@@ -46,21 +47,33 @@ torch::Tensor get_col_major_tma_aligned_tensor(const torch::Tensor& x) {
     return remove_dim ? aligned_x.squeeze(0) : aligned_x;
 }
 
-int get_num_sms() {
-    static int* _num_sms = nullptr;
-    if (_num_sms == nullptr) {
-        _num_sms = new int(0);
-        hggcDeviceProp device_props;
-        hggcGetDeviceProperties(&device_props, 0);
-        std::cout << "device_props.name:" << device_props.name << std::endl;
-        std::string device_name(device_props.name);
-        if (device_name.find("ZW810E") != std::string::npos || device_name.find("ZW610E") != std::string::npos) {
-            *_num_sms = 20;
-        } else {
-            *_num_sms = device_props.multiProcessorCount;
-        }
+torch::Tensor get_col_major_tensor(const torch::Tensor& x) {
+    TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "Only 2-D or 3-D tensors supported");
+
+    bool squeeze_dim = false;
+    torch::Tensor x_view = x;
+    if (x.dim() == 2) {
+        x_view = x.unsqueeze(0);
+        squeeze_dim = true;
     }
-    return *_num_sms;
+
+    const int64_t b = x_view.size(0);
+    const int64_t m = x_view.size(1);
+    const int64_t n = x_view.size(2);
+
+    // Allocate (B, N, M) then transpose the last two dims, so the result is column-major over (M, N).
+    auto options = torch::TensorOptions().dtype(x.dtype()).device(x.device());
+    torch::Tensor col_major = torch::empty({b, n, m}, options).transpose(-2, -1);
+    col_major.copy_(x_view);
+
+    return squeeze_dim ? col_major.squeeze(0) : col_major;
+}
+
+// The SM budget is owned by DeviceRuntime (jit/device_runtime.hpp) so that the pybind-exposed
+// set_num_sms() actually drives the kernels. This free function is kept as a thin alias because
+// every GEMM impl calls get_num_sms() unqualified; it now routes to that single source of truth.
+int get_num_sms() {
+    return device_runtime->get_num_sms();
 }
 
 bool is_ppu1v5_device() {

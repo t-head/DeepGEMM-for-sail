@@ -8,10 +8,10 @@ import math
 import os
 from functools import lru_cache
 from typing import Tuple, List, Optional
+from math_utils import ceil_div
 try:
     from deep_gemm import (
         get_m_alignment_for_contiguous_layout,
-        ceil_div,
         get_num_sms
     )
     from deep_gemm.jit_kernels.gemm_int8 import get_smem_config
