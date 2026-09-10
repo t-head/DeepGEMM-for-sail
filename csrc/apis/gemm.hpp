@@ -565,7 +565,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
     std::optional<const torch::Tensor> m_rows = std::nullopt,
     std::optional<ConfigTuple> configs = std::nullopt,
     std::optional<torch::Tensor> out_scale = std::nullopt,
-    std::optional<double> swiglu_limit = std::nullopt) {
+    std::optional<float> swiglu_limit = std::nullopt) {
 
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
@@ -610,7 +610,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
                        deep_gemm_fp4_common::check_mxfp4_scales_layout(out_scale_tensor));
         DG_HOST_ASSERT(!(bias.has_value() && bias->defined() && bias->numel() > 0));
     } else {
-        DG_HOST_ASSERT(!swiglu_limit.has_value() || *swiglu_limit == 0.0);  // only used with out_scale
+        DG_HOST_ASSERT(!swiglu_limit.has_value() || *swiglu_limit == 0.0f);  // only used with out_scale
         DG_HOST_ASSERT(n_ == n);
         DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     }
@@ -651,7 +651,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
 
     m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(lhs, lhs_scales_t, rhs, rhs_scales_t, bias_tensor, d,
                                                 m_indices, m_rows_tensor, m, n, k, num_groups, configs,
-                                                out_scale_tensor, swiglu_limit.value_or(0.0));
+                                                out_scale_tensor, swiglu_limit.value_or(0.0f));
 
     // Mirror the Python path: re-stride `out_scale` in place to the N-major layout (1, sfm) that
     // the Gemm2 SFA reader expects. NOTE: this is 2-D here, unlike the masked variant's 3-D layout.
@@ -797,6 +797,107 @@ void m_grouped_gemm_int8_int8_bf16_nt_fused(
         expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, configs);
 }
 
+// MoE GroupedFused FP4 GEMM. The lhs scale is K-major packed uint16, while rhs_scales must use the
+// N-major layout produced by preprocess_mxfp4_scales. With out_scale, the epilogue writes packed
+// uint8 activations and per-row E8M0 scales, then this API re-strides out_scale for Gemm2's SFA read.
+void m_grouped_gemm_fp4_fp4_bf16_nt_fused(
+    const std::pair<torch::Tensor, torch::Tensor>& lhs_,
+    const std::pair<torch::Tensor, torch::Tensor>& rhs_,
+    const torch::Tensor& out,
+    const torch::Tensor& m_rows,
+    const torch::Tensor& expert_ids_and_cumsum,
+    const torch::Tensor& sorted_token_ids,
+    const torch::Tensor& aligned_num_m_blocks,
+    FusedCommonConfigTuple configs,
+    std::optional<torch::Tensor> out_scale = std::nullopt,
+    std::optional<float> swiglu_limit = std::nullopt) {
+
+    const auto& lhs = lhs_.first;
+    const auto& lhs_scales = lhs_.second;
+    const auto& rhs = rhs_.first;
+    const auto& rhs_scales = rhs_.second;
+    const auto& [num_token, k] = get_shape<2>(lhs);
+    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
+    const auto& [m_sum, n_out] = get_shape<2>(out);
+
+    torch::Tensor out_scale_tensor;
+    const bool enable_act_and_quant_fusing =
+        out_scale.has_value() && out_scale->defined();
+    const float swiglu_limit_value = swiglu_limit.value_or(0.0f);
+
+    DG_HOST_ASSERT(k == k_);
+    DG_HOST_ASSERT(lhs.scalar_type() == torch::kUInt8);
+    DG_HOST_ASSERT(rhs.scalar_type() == torch::kUInt8);
+    TORCH_CHECK(
+        lhs_scales.scalar_type() == torch::kUInt16,
+        "fp4 fused MoE expects an uint16 SFA (uint8 E8M0 scales padded to an even count along K, "
+        "then viewed as uint16)");
+    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
+    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+    const auto expected_lhs_scales_k = ceil_div(ceil_div(k, 16), 2);
+    const auto expected_lhs_scales_shape = std::vector<int64_t>{num_token, expected_lhs_scales_k};
+    TORCH_CHECK(
+        lhs_scales.sizes() == expected_lhs_scales_shape,
+        "fp4 fused MoE expects a K-major uint16 SFA of shape (", num_token, ", ",
+        expected_lhs_scales_k, "), got ", lhs_scales.sizes());
+    TORCH_CHECK(
+        lhs_scales.is_contiguous(),
+        "fp4 fused MoE expects an uint16 K-major (plain contiguous) SFA; "
+        "do NOT call preprocess_mxfp4_scales on it");
+    DG_HOST_ASSERT(deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales));
+    TORCH_CHECK(
+        k % 16 == 0,
+        "K must be a multiple of 16, so that 16 8-bit elements can be loaded with 128b aligned "
+        "vectorized memory access.");
+    TORCH_CHECK(num_token > 0, "division by zero");
+
+    int64_t sfm = 0;
+    int64_t sfn = 0;
+    if (enable_act_and_quant_fusing) {
+        out_scale_tensor = *out_scale;
+        const int64_t shape_n_out = n / 4;  // /2 silu_and_mul, /2 mxfp4 packing
+        sfm = m_sum;
+        sfn = ceil_div(shape_n_out, static_cast<int64_t>(32));
+        TORCH_CHECK(n_out == shape_n_out, "n_=", n_out, ", expected ", shape_n_out);
+        TORCH_CHECK(
+            out_scale_tensor.sizes() == std::vector<int64_t>({sfm, sfn}),
+            "out_scale shape ", out_scale_tensor.sizes(), ", expected (", sfm, ", ", sfn, ")");
+        DG_HOST_ASSERT(out.scalar_type() == torch::kUInt8);
+        DG_HOST_ASSERT(out_scale_tensor.scalar_type() == torch::kUInt16);
+        DG_HOST_ASSERT(out_scale_tensor.is_contiguous() ||
+                       deep_gemm_fp4_common::check_mxfp4_scales_layout(out_scale_tensor));
+        TORCH_CHECK(
+            n % 64 == 0,
+            "n (", n, ") must be divisible by 64 in the SiluAndMulPostQuant epilogue: "
+            "n // 4(act_func & quant) must stay a multiple of 16.");
+    } else {
+        TORCH_CHECK(
+            !swiglu_limit.has_value() || swiglu_limit_value == 0.0f,
+            "swiglu_limit is only used when out_scale is not None.");
+        TORCH_CHECK(n_out == n, "n_=", n_out, ", expected ", n);
+        DG_HOST_ASSERT(out.scalar_type() == torch::kBFloat16);
+        TORCH_CHECK(n % 2 == 0, "n (", n, ") must be divisible by 2.");
+    }
+
+    // Python returns before Runtime.__call__, so arg_defs does not check scheduler dtypes for empty output.
+    if (m_sum == 0) return;
+
+    DG_HOST_ASSERT(m_rows.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(expert_ids_and_cumsum.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(sorted_token_ids.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(aligned_num_m_blocks.scalar_type() == torch::kInt32);
+
+    m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
+        lhs, lhs_scales, rhs, rhs_scales, out, m_rows, expert_ids_and_cumsum,
+        sorted_token_ids, aligned_num_m_blocks, configs, out_scale_tensor,
+        swiglu_limit_value);
+
+    if (enable_act_and_quant_fusing) {
+        out_scale_tensor.as_strided_({sfm, sfn}, {1, sfm});
+    }
+}
+
 static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
     const std::pair<torch::Tensor, torch::Tensor>& a,
     const std::pair<torch::Tensor, torch::Tensor>& b,
@@ -809,7 +910,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
     std::optional<bool> enable_sbo_overlap = false,
     std::optional<const torch::Tensor> signal = std::nullopt,
     std::optional<torch::Tensor> out_scale = std::nullopt,
-    std::optional<double> swiglu_limit = std::nullopt) {
+    std::optional<float> swiglu_limit = std::nullopt) {
 
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
@@ -863,7 +964,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
                        deep_gemm_fp4_common::check_mxfp4_scales_layout(out_scale_tensor));
         DG_HOST_ASSERT(!(bias.has_value() && bias->defined() && bias->numel() > 0));
     } else {
-        DG_HOST_ASSERT(!swiglu_limit.has_value() || *swiglu_limit == 0.0);  // only used with out_scale
+        DG_HOST_ASSERT(!swiglu_limit.has_value() || *swiglu_limit == 0.0f);  // only used with out_scale
         DG_HOST_ASSERT(n_ == n);
         DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     }
@@ -904,7 +1005,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
                                                  max_block_n.value_or(256), enable_sbo_overlap.value_or(false),
                                                  signal_tensor,
                                                  out_scale_tensor,
-                                                 swiglu_limit.value_or(0.0));
+                                                 swiglu_limit.value_or(0.0f));
 
     // Mirror the Python path: re-stride `out_scale` in place to the N-major layout
     // (sfm * sfn, 1, sfm) that the Gemm2 SFA reader expects. `out_scale_tensor` shares the
@@ -958,11 +1059,13 @@ MoeAlignReturn moe_align_block_size(
     const torch::Tensor& rhs,
     const torch::Tensor& topk_ids,
     bool perchannel_quant = false,
-    std::optional<FusedCommonConfigTuple> config = std::nullopt) {
+    std::optional<FusedCommonConfigTuple> config = std::nullopt,
+    bool enable_act_and_quant_fusing = false) {
     DG_HOST_ASSERT(topk_ids.dtype() == torch::kInt32);
     DG_HOST_ASSERT(topk_ids.dim() == 2);
 
-    return moe_align_block_size_impl(lhs, rhs, topk_ids, perchannel_quant, config);
+    return moe_align_block_size_impl(lhs, rhs, topk_ids, perchannel_quant, config,
+                                     enable_act_and_quant_fusing);
     }
 // The problem sizes the W4A16 implementations need, derived from the operands here so the API layer
 // owns the shape contract.
@@ -1212,10 +1315,17 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
           py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),
           py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
           py::arg("aligned_num_m_blocks"), py::arg("configs"));
+    // FP4 Fused MoE GEMM
+    m.def("m_grouped_gemm_fp4_fp4_bf16_nt_fused", &m_grouped_gemm_fp4_fp4_bf16_nt_fused,
+          py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),
+          py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
+          py::arg("aligned_num_m_blocks"), py::arg("configs"),
+          py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt);
     // moe_align preprocessing (C++ JIT)
     m.def("moe_align_block_size", &moe_align_block_size,
           py::arg("lhs"), py::arg("rhs"), py::arg("topk_ids"),
-          py::arg("perchannel_quant") = false, py::arg("config") = std::nullopt);
+          py::arg("perchannel_quant") = false, py::arg("config") = std::nullopt,
+          py::arg("enable_act_and_quant_fusing") = false);
 }
 
 } // namespace deep_gemm::gemm

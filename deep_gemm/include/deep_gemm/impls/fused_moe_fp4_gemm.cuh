@@ -124,8 +124,8 @@ template <GemmType kGemmType,
           uint32_t BLOCK_SIZE, int kNumStages, typename MockMainloopFp4,
           EpilogueType kEpilogueType = EpilogueType::Default,
           bool kApplySwigluLimit = false>
-__global__ __launch_bounds__(BLOCK_SIZE, 1) void
-fp4_gemm_fused_moe_kernel(const Fp4QuantGemmArgs args) {
+__device__ __forceinline__ void
+fp4_gemm_fused_moe_kernel_impl(const Fp4QuantGemmArgs args) {
     static constexpr uint32_t GROUP_K = 32; // view as uint16
     static constexpr uint32_t ScaleMsPerTile = BLOCK_M;
     static constexpr uint32_t ScaleNsPerTile = BLOCK_N;
@@ -519,6 +519,24 @@ fp4_gemm_fused_moe_kernel(const Fp4QuantGemmArgs args) {
             deep_scheduler.curr_block_m_offset, deep_scheduler.valid_m_in_block, blk_n_offset);
       }
     }
+}
+
+// Forwarding __global__ kernel — delegates to the shared __device__ implementation so both the
+// regular Python-JIT launcher below and the C++ JIT generated named entry point use identical code.
+template <GemmType kGemmType,
+          uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t WARP_M, uint32_t WARP_N,
+          uint32_t BLOCK_SIZE, int kNumStages, typename MockMainloopFp4,
+          EpilogueType kEpilogueType = EpilogueType::Default,
+          bool kApplySwigluLimit = false>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void
+fp4_gemm_fused_moe_kernel(const Fp4QuantGemmArgs args) {
+    fp4_gemm_fused_moe_kernel_impl<
+        kGemmType, SHAPE_N, SHAPE_K, kNumGroups,
+        BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N,
+        BLOCK_SIZE, kNumStages, MockMainloopFp4,
+        kEpilogueType, kApplySwigluLimit>(args);
 }
 
 template <uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,

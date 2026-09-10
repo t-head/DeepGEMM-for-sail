@@ -18,7 +18,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     const int& m, const int& n, const int& k, const int& num_groups,
     std::optional<ConfigTuple> configs = std::nullopt,
     const torch::Tensor& out_scale = torch::Tensor(),
-    double swiglu_limit = 0.0) {
+    float swiglu_limit = 0.0f) {
     // When `out_scale` is provided, silu_and_mul + mxfp4 post-quant are fused into the epilogue.
     const bool enable_act_and_quant_fusing = out_scale.defined() && out_scale.numel() > 0;
     const bool hasBias = bias.numel() > 0;
@@ -154,7 +154,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
                         n, k, "GroupedNoPad", "fp4_grouped_deep_gemm_nopad", hasBias, n_expand, false,
                         enable_act_and_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
-                        enable_act_and_quant_fusing && swiglu_limit > 0.0};
+                        enable_act_and_quant_fusing && swiglu_limit > 0.0f};
     args.launch_args = {grid, block, SMSIZE};
 
     // Branch exactly like the device-side CollectiveEpilogue conditional in generate_impl:
@@ -194,7 +194,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
             .stride_D = stride_D,
             .ptr_SFD = ptr_SFD,
             .shape_m = (uint32_t)m,
-            .swiglu_limit = (float)swiglu_limit,
+            .swiglu_limit = swiglu_limit,
         };
         params.hw_info = hw_info;
         params.scheduler = TileSchedulerArguments((uint32_t)m, layout_info);
@@ -268,7 +268,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     bool enable_sbo_overlap = false,
     const torch::Tensor& signal = torch::Tensor(),
     const torch::Tensor& out_scale = torch::Tensor(),
-    double swiglu_limit = 0.0) {
+    float swiglu_limit = 0.0f) {
     // When `out_scale` is provided, silu_and_mul + mxfp4 post-quant are fused into the epilogue.
     const bool enable_act_and_quant_fusing = out_scale.defined() && out_scale.numel() > 0;
     const bool hasBias = bias.numel() > 0;
@@ -380,7 +380,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         dyn_args.launch_info = {n, k, kNumGroups, dynamic_tile_id, "GroupedMasked",
                                 "fp4_grouped_deep_gemm_masked_dynamic_tile",
                                 enable_act_and_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
-                                enable_act_and_quant_fusing && swiglu_limit > 0.0};
+                                enable_act_and_quant_fusing && swiglu_limit > 0.0f};
         // The dynamic-tile kernel's block shape is get_block_shape() == MaxThreadsPerBlock, which
         // varies per kDynamicTileId and is unrelated to the fixed 128x128 block config above.
         dim3 const dyn_block = dyn_launch.block_threads;
@@ -406,7 +406,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
                 .stride_D = stride_D,
                 .ptr_SFD = ptr_SFD,
                 .shape_m = (uint32_t)m,
-                .swiglu_limit = (float)swiglu_limit,
+                .swiglu_limit = swiglu_limit,
             };
             params.shape_m = (uint32_t)m;
             params.grouped_layout = grouped_layout;
@@ -463,7 +463,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
                         n, k, "GroupedMasked", "fp4_grouped_deep_gemm_masked", hasBias, n_expand, enable_sbo_overlap,
                         enable_act_and_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
-                        enable_act_and_quant_fusing && swiglu_limit > 0.0};
+                        enable_act_and_quant_fusing && swiglu_limit > 0.0f};
     args.launch_args = {grid, block, SMSIZE};
 
     // Branch exactly like the device-side CollectiveEpilogue conditional in generate_impl:
@@ -503,7 +503,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
             .stride_D = stride_D,
             .ptr_SFD = ptr_SFD,
             .shape_m = (uint32_t)m,
-            .swiglu_limit = (float)swiglu_limit,
+            .swiglu_limit = swiglu_limit,
         };
         params.hw_info = hw_info;
         params.scheduler = TileSchedulerArguments((uint32_t)m, grouped_layout);

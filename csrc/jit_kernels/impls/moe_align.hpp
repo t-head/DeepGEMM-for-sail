@@ -20,6 +20,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
 #include "../heuristics/common_bf16.hpp"
+#include "../heuristics/common_fp4.hpp"
 #include "../heuristics/common_fp8.hpp"
 #include "../heuristics/common_int8.hpp"
 #include "../heuristics/common_w4a16.hpp"
@@ -283,7 +284,8 @@ static MoeAlignReturn moe_align_block_size_impl(
     const torch::Tensor& rhs,
     const torch::Tensor& topk_ids,
     bool perchannel_quant = false,
-    std::optional<FusedConfigTuple> config_in = std::nullopt)
+    std::optional<FusedConfigTuple> config_in = std::nullopt,
+    bool enable_act_and_quant_fusing = false)
 {
     // Input validation (topk_ids dtype/shape) lives in the apis layer
     // (csrc/apis/gemm.hpp); this impl only orchestrates config resolution
@@ -338,13 +340,13 @@ static MoeAlignReturn moe_align_block_size_impl(
                 expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms,
                 GemmType::GroupedFused));
         } else if (lhs.dtype() == torch::kUInt8) {
-            TORCH_CHECK(false,
-                        "moe_align_block_size (C++ JIT): auto-config for fp4 (uint8 lhs) is "
-                        "not ported yet; pass an explicit `config` or unset USE_CPP_JIT_FOR_PYTHON");
+            config = take_first_7(deep_gemm_fp4_common::get_best_configs(
+                numel, expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms,
+                false /*has_bias*/, enable_act_and_quant_fusing, GemmType::GroupedFused));
         } else {
             TORCH_CHECK(false,
                         "moe_align_block_size (C++ JIT): unsupported lhs dtype "
-                        "(supported: bf16 / int8-perchannel / fp8-e4m3fn / w4a16; fp4 pending)");
+                        "(supported: bf16 / int8-perchannel / fp8-e4m3fn / fp4 / w4a16)");
         }
     }
     const int block_m = std::visit([](const auto& c) { return std::get<1>(c); }, config);
@@ -352,7 +354,10 @@ static MoeAlignReturn moe_align_block_size_impl(
     DG_HOST_ASSERT(block_m > 0);
 
     // Sizes (mirror Python)
-    int max_num_m_blocks = num_groups - 1 + ceil_div(numel + 1 - num_groups, block_m);
+    // Python spells this `ceil_div(numel + 1 - num_groups, block_m)`, but its `ceil_div` floors the
+    // division while ours truncates, and the dividend is negative whenever numel < num_groups.
+    // Inline the ceil_div expansion over floor_div to keep the buffer shapes identical.
+    int max_num_m_blocks = num_groups - 1 + floor_div(numel + 1 - num_groups + block_m - 1, block_m);
     int block_size_pow2  = static_cast<int>(next_power_of_two(static_cast<uint32_t>(num_groups)));
     int s_total_ub       = max_num_m_blocks * block_m;
     int num_blocks_pad   = ceil_div(s_total_ub, block_size_pow2);

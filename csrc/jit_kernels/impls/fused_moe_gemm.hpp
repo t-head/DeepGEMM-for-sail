@@ -15,6 +15,7 @@
 #include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
+#include "../heuristics/common_fp4.hpp"
 #include <deep_gemm/common/fused_gemm_common.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
 
@@ -337,6 +338,81 @@ __global__ void {}(const QuantGemmArgs args) {{
     }
 };
 
+// FP4 fused MoE GEMM runtime. The generated named entry calls the same device implementation as
+// Fp4FusedMoeGemm::run, keeping the Python-JIT and C++-JIT kernels identical.
+class Fp4FusedMoeRuntime final : public LaunchRuntime<Fp4FusedMoeRuntime> {
+public:
+    struct LaunchInfo {
+        int shape_n, shape_k, num_groups;
+        int block_m, block_n, block_k;
+        int warp_m, warp_n;
+        int block_size;
+        int num_stages;
+        std::string epilogue_type;
+        bool apply_swiglu_limit;
+        std::string kernel_name;
+    };
+
+    struct Args {
+        LaunchInfo launch_info;
+        LaunchArgs launch_args;
+        Fp4QuantGemmArgs kernel_params;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(
+            R"(
+#include <deep_gemm/impls/fused_moe_fp4_gemm.cuh>
+
+namespace deep_gemm {{
+
+constexpr uint32_t SHAPE_N    = {};
+constexpr uint32_t SHAPE_K    = {};
+constexpr uint32_t NUM_GROUPS = {};
+constexpr uint32_t BLOCK_M    = {};
+constexpr uint32_t BLOCK_N    = {};
+constexpr uint32_t BLOCK_K    = {};
+constexpr uint32_t WARP_M     = {};
+constexpr uint32_t WARP_N     = {};
+constexpr uint32_t BLOCK_SIZE = {};
+constexpr int      STAGES     = {};
+
+using MockMainloopFp4 = typename MockCollectiveMmaScaleFp4<
+    BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, STAGES>::CollectiveMainloop;
+static constexpr GemmType kGemmType = GemmType::GroupedFused;
+
+extern "C"
+__launch_bounds__(BLOCK_SIZE, 1)
+__global__ void {}(const Fp4QuantGemmArgs args) {{
+    fp4_gemm_fused_moe_kernel_impl<
+        kGemmType, SHAPE_N, SHAPE_K, NUM_GROUPS,
+        BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N,
+        BLOCK_SIZE, STAGES, MockMainloopFp4,
+        EpilogueType::{}, {}>(args);
+}}
+
+}}  // namespace deep_gemm
+)",
+            args.launch_info.shape_n,
+            args.launch_info.shape_k,
+            args.launch_info.num_groups,
+            args.launch_info.block_m,
+            args.launch_info.block_n,
+            args.launch_info.block_k,
+            args.launch_info.warp_m,
+            args.launch_info.warp_n,
+            args.launch_info.block_size,
+            args.launch_info.num_stages,
+            args.launch_info.kernel_name,
+            args.launch_info.epilogue_type,
+            args.launch_info.apply_swiglu_limit);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    }
+};
+
 // --------------------------------------------------------------------------
 // Shared per-channel fused MoE GEMM
 // --------------------------------------------------------------------------
@@ -438,6 +514,99 @@ static void m_grouped_gemm_perchannel_nt_fused_impl(
         printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                block_m, block_n, block_k, warp_m, warp_n, block_k, num_stages);
         printf("grid:%d, block:%d, smem:%d, tb_per_cu:%d\n",
+               num_sms * blocks_per_cu, block_size, smem_size, blocks_per_cu);
+    }
+}
+
+// --------------------------------------------------------------------------
+// FP4 fused MoE GEMM
+// --------------------------------------------------------------------------
+static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
+    const torch::Tensor& lhs,
+    const torch::Tensor& lhs_scales,
+    const torch::Tensor& rhs,
+    const torch::Tensor& rhs_scales,
+    const torch::Tensor& out,
+    const torch::Tensor& m_rows,
+    const torch::Tensor& expert_ids_and_cumsum,
+    const torch::Tensor& sorted_token_ids,
+    const torch::Tensor& aligned_num_m_blocks,
+    const FusedCommonConfigTuple& configs,
+    const torch::Tensor& out_scale,
+    float swiglu_limit)
+{
+    const auto& [num_token, k] = get_shape<2>(lhs);
+    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
+    const int64_t m_sum = out.size(0);
+
+    // Python returns before JIT compilation for an empty sorted output.
+    if (m_sum == 0) return;
+
+    const auto [num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages] = configs;
+    const bool enable_act_and_quant_fusing = out_scale.defined();
+    const bool apply_swiglu_limit = swiglu_limit > 0.0f;
+    const int topk = static_cast<int>(m_sum / num_token);
+    const int block_size = (block_m / warp_m) * (block_n / warp_n) * 32;
+    dim3 grid = get_grid_shape(num_sms);
+
+    // Smem: get_fused_smem_size_fp4(stages, BM, BN, BK, fusing) — mirrors GemmSmemConfigFp4.
+    const int smem_size = deep_gemm_fp4_common::get_fused_smem_size_fp4(
+        num_stages, block_m, block_n, block_k, enable_act_and_quant_fusing);
+
+    const std::string kernel_name = "fp4_fused_moe_gemm";
+    Fp4QuantGemmArgs kernel_params{};
+    kernel_params.a_ptr = lhs.data_ptr();
+    kernel_params.b_ptr = rhs.data_ptr();
+    kernel_params.c_ptr = out.data_ptr();
+    kernel_params.expert_ids_and_cumsum = expert_ids_and_cumsum.data_ptr<int32_t>();
+    kernel_params.sorted_token_ids = sorted_token_ids.data_ptr<int32_t>();
+    kernel_params.aligned_num_m_blocks = aligned_num_m_blocks.data_ptr<int32_t>();
+    kernel_params.shape_m = static_cast<uint32_t>(num_token);
+    kernel_params.scale_a_ptr = lhs_scales.data_ptr();
+    kernel_params.scale_b_ptr = rhs_scales.data_ptr();
+    kernel_params.sfd_ptr = enable_act_and_quant_fusing ? out_scale.data_ptr() : nullptr;
+    kernel_params.shape_m_out = static_cast<uint32_t>(m_sum);
+    kernel_params.swiglu_limit = swiglu_limit;
+
+    auto args = Fp4FusedMoeRuntime::Args{
+        .launch_info = {static_cast<int>(n), static_cast<int>(k), static_cast<int>(num_groups),
+                        block_m, block_n, block_k, warp_m, warp_n, block_size, num_stages,
+                        enable_act_and_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
+                        apply_swiglu_limit, kernel_name},
+        .launch_args = {grid, dim3(block_size), smem_size},
+        .kernel_params = kernel_params
+    };
+
+    const auto& code = Fp4FusedMoeRuntime::generate(args);
+    const auto& runtime = compiler->build(kernel_name, code, block_size, smem_size);
+    const auto& kernel = runtime->kernel;
+
+    int blocks_per_cu = 0;
+    DG_HGGC_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_cu, kernel, block_size, smem_size));
+    args.launch_args.grid_dim.x *= blocks_per_cu;
+
+    hggcStream_t stream = (hggcStream_t)0;
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_fused_moe_params(
+            std::string("fp4"), std::string("group"), static_cast<int>(num_groups),
+            static_cast<int>(num_token), topk, static_cast<int>(n), static_cast<int>(k),
+            m_rows.data_ptr<int32_t>(), stream);
+    }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    Fp4FusedMoeRuntime::launch(runtime, args);
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+    char* pEnv_params = std::getenv("show_log");
+    if (pEnv_params && isdigit(*pEnv_params)) {
+        printf("[C++ JIT FusedMoeGemm-FP4:]\n");
+        printf("group:%d, problem:[%d, %d, %d], gemm_type:GroupedFused, kernel_type:Default\n",
+               static_cast<int>(num_groups), static_cast<int>(num_token), static_cast<int>(n),
+               static_cast<int>(k));
+        printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
+               block_m, block_n, block_k, warp_m, warp_n, block_k, num_stages);
+        printf("grid:%d, block:%d, smem_size:%d, tb_per_cu:%d\n",
                num_sms * blocks_per_cu, block_size, smem_size, blocks_per_cu);
     }
 }

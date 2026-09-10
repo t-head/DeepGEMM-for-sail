@@ -25,12 +25,6 @@ from .jit_kernels import (
     get_col_major_tma_aligned_tensor,
     get_col_major_tensor,
     get_m_alignment_for_contiguous_layout,
-    #fused kernel
-    moe_align_block_size,
-    m_grouped_gemm_bf16_bf16_bf16_nt_fused,
-    m_grouped_gemm_fp8_fp8_bf16_nt_fused,
-    m_grouped_gemm_int8_int8_bf16_nt_fused,
-    m_grouped_gemm_fp4_fp4_bf16_nt_fused,
 )
 
 from .utils import (
@@ -80,6 +74,11 @@ from .deep_gemm_cpp import (
     m_grouped_gemm_w4a16_nopad,
     m_grouped_gemm_w4a16_masked,
     m_grouped_gemm_w4a16_fused,
+    moe_align_block_size,
+    m_grouped_gemm_bf16_bf16_bf16_nt_fused,
+    m_grouped_gemm_fp8_fp8_bf16_nt_fused,
+    m_grouped_gemm_int8_int8_bf16_nt_fused,
+    m_grouped_gemm_fp4_fp4_bf16_nt_fused,
 )
 
 use_cpp_jit_for_python = os.environ.get('USE_CPP_JIT_FOR_PYTHON', '').lower()
