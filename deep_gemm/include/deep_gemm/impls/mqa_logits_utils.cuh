@@ -48,6 +48,23 @@ enum QScaleMode : uint32_t {
     kScaleModeUnity = 3,
 };
 
+// Single bf16x2 convert of two f32 sources (r = {hi, lo}); the .relu variant
+// clamps negatives to zero at convert time (how the avg epilogues apply ReLU).
+// Defined ahead of every use in this file (weights s2r helpers come first).
+__forceinline__ __device__
+uint32_t cvt_rte_bf16x2_f32(float hi, float lo) {
+    uint32_t r;
+    asm volatile("ppu.cvt.rtte.bf16x2.f32 %0, %1, %2;\n" : "=r"(r) : "f"(hi), "f"(lo));
+    return r;
+}
+
+__forceinline__ __device__
+uint32_t cvt_rte_bf16x2_f32_relu(float hi, float lo) {
+    uint32_t r;
+    asm volatile("ppu.cvt.rtte.bf16x2.f32.relu %0, %1, %2;\n" : "=r"(r) : "f"(hi), "f"(lo));
+    return r;
+}
+
 // ============================================================
 // Non-paged block scheduler helpers
 // ============================================================
@@ -106,11 +123,7 @@ __forceinline__ __device__ void load_weights_from_copy_view(
         }
     } else {
         for (int j = 0; j < elem_weights; j += 2) {
-            uint32_t d;
-            asm volatile("ppu.cvt.rtte.bf16x2.f32 %0, %1, %2;\n"
-                         : "=r"(d)
-                         : "f"(tCrW_copy_view(j + 1)), "f"(tCrW_copy_view(j)));
-            *reinterpret_cast<uint32_t*>(&weights[j]) = d;
+            *reinterpret_cast<uint32_t*>(&weights[j]) = cvt_rte_bf16x2_f32(tCrW_copy_view(j + 1), tCrW_copy_view(j));
         }
     }
 }
@@ -167,11 +180,7 @@ __forceinline__ __device__ void load_weights_from_smem_ld_shared(
             w0 = ld_shared(smem_weights_staged + (j / 2) * 8 + (j & 1) * 4 + lane_idx % 4);
             w1 = ld_shared(smem_weights_staged + ((j + 1) / 2) * 8 + ((j + 1) & 1) * 4 + lane_idx % 4);
 #endif
-            uint32_t d;
-            asm volatile("ppu.cvt.rtte.bf16x2.f32 %0, %1, %2;\n"
-                         : "=r"(d)
-                         : "f"(w1), "f"(w0));
-            *reinterpret_cast<uint32_t*>(&weights[j]) = d;
+            *reinterpret_cast<uint32_t*>(&weights[j]) = cvt_rte_bf16x2_f32(w1, w0);
         }
     }
 }
@@ -214,9 +223,7 @@ void cvt_accum_to_bf16x2_buf(const AccTensor& accum, int m,
         int n = idx / 4;
         int sub = idx % 4;
         int j = sub * 2;
-        asm volatile("ppu.cvt.rtte.bf16x2.f32.relu %0, %1, %2;\n"
-                     : "=r"(cvt_buf[idx])
-                     : "f"((float)accum(j + 1, m, n)), "f"((float)accum(j, m, n)));
+        cvt_buf[idx] = cvt_rte_bf16x2_f32_relu(accum(j + 1, m, n), accum(j, m, n));
     }
 }
 

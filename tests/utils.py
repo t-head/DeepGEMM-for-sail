@@ -1556,7 +1556,7 @@ def test_mqa_logits(args) -> None:
 
     if is_avg:
         assert data_type == torch.float8_e4m3fn, "MQA Avg Logits supports fp8 only"
-        assert logits_dtype == torch.float32, "MQA Avg Logits supports float32 logits only"
+        assert logits_dtype in (torch.float32, torch.bfloat16), "MQA Avg Logits supports float32 or bf16 logits"
 
     q = torch.randn(seq_len_q, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
     kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
@@ -1678,7 +1678,7 @@ def test_paged_mqa_logits(args) -> None:
 
     if is_avg:
         assert data_type == torch.float8_e4m3fn, "Paged MQA Avg Logits supports fp8 only"
-        assert logits_dtype == torch.float32, "MQA Avg Logits supports float32 logits only"
+        assert logits_dtype in (torch.float32, torch.bfloat16), "Paged MQA Avg Logits supports float32 or bf16 logits"
 
     max_model_len = 262144
     blocksize = 64
@@ -1794,7 +1794,7 @@ def test_paged_mqa_logits(args) -> None:
         from math_utils import calc_diff
         diff = calc_diff(logits_masked, ref_logits_masked)
         threshold = 1.5e-3 if logits_dtype == torch.bfloat16 else 1e-3
-        if torch.isnan(torch.tensor(diff)) or diff >= 1e-3:
+        if torch.isnan(torch.tensor(diff)) or diff >= threshold:
             print(f"ERROR: Accuracy check failed, diff={diff}")
             exit(1)
         else:

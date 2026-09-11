@@ -29,6 +29,9 @@ public:
 
   static constexpr int BLOCK_Q = kNextN;
   static constexpr int WARP_Q = kNumHeads == 4 ? 4 : 1;
+  // 4-head avg tile: parity-split epilogue, each lane loads/stores only its own
+  // kv row half (see operator()). Applies to both float and bf16 logits
+  static constexpr bool kWq4 = WARP_Q == 4;
   static constexpr int kNumMathWarpGroups = SPLIT_KV / BLOCK_KV;
 
   using StrideAB = Stride<Int<BLOCK_K>, _1>;
@@ -301,6 +304,9 @@ public:
     const auto& warp_offset = warp_m_idx * WARP_M;
     const auto& v_0_offset = lane_idx / 4 + 0;
     const auto& v_1_offset = lane_idx / 4 + 8;
+    // Lane-parity kv row half used by the kWq4 epilogue split
+    const uint32_t r_mine = lane_idx & 1;
+    const uint32_t v_offset_mine = r_mine ? v_1_offset : v_0_offset;
     uint32_t warp_q_idx = warp_n_idx;
     int warp_group_id = warp_idx / 8;
 
@@ -330,8 +336,11 @@ public:
         tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes;
         if constexpr(load_kv_scale) {
             tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / 4;
-            copy_aiu<true>(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv),
-                           gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv), local_warp_idx);
+            // Split the value/scale AIU copies across warps 0/1 only when the group
+            // has >= 2 warps; otherwise warp 0 issues both (as fp4's SPLIT_AIU)
+            constexpr bool SPLIT_AIU = (WarpOnGroup >= 2);
+            copy_aiu<SPLIT_AIU>(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv),
+                                gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv), local_warp_idx);
         } else {
             copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), local_warp_idx);
         }
@@ -375,11 +384,20 @@ public:
         float * smem_kv_scales = sSFA(_,_,smem_pipe_read_kv).data().get();
         for (int m = 0; m < kMmaIterM; m++) {
             uint32_t mma_offset = m * InstM;
-            scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
-            scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
-            if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
-                scale_kv_array[m * 2    ] *= kInvSqrtHeadDim;
-                scale_kv_array[m * 2 + 1] *= kInvSqrtHeadDim;
+            if constexpr (kWq4) {
+                // Each lane stores only its own parity's kv row in the kWq4 epilogue,
+                // so it only loads that row's scale
+                scale_kv_array[m] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
+                if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
+                    scale_kv_array[m] *= kInvSqrtHeadDim;
+                }
+            } else {
+                scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
+                scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
+                if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
+                    scale_kv_array[m * 2    ] *= kInvSqrtHeadDim;
+                    scale_kv_array[m * 2 + 1] *= kInvSqrtHeadDim;
+                }
             }
         }
     };
@@ -391,28 +409,47 @@ public:
         CUTE_STATIC_ASSERT(WARP_Q == 1 || WARP_Q == 4);
         for (int m = 0; m < kMmaIterM; m++) {
             uint32_t mma_offset = m * InstM;
-            float scale_kv_0 = scale_kv_array[m * 2];
-            float scale_kv_1 = scale_kv_array[m * 2 + 1];
+            float scale_kv_0, scale_kv_1;
+            if constexpr (!kWq4) {
+                scale_kv_0 = scale_kv_array[m * 2];
+                scale_kv_1 = scale_kv_array[m * 2 + 1];
+            }
 
-            if constexpr (cute::is_same_v<ElementLogits, float> && kNumHeads == 4
-                          && kScaleMode == deep_gemm::kScaleModeUnity) {
-                // 4-head tiles: reuse the non-paged wq4 helpers; the token guard
-                // skips pad tokens (their stores would hit the next request's rows)
+            if constexpr (kWq4 && kScaleMode == deep_gemm::kScaleModeUnity) {
+                // 4-head avg epilogue, parity split as the non-paged kernel: each lane
+                // stores its own parity's kv row; the token guard skips pad tokens
                 static constexpr int kQPerLane = 2;
                 CUTE_STATIC_ASSERT(MmaIterN{} == 1);
-                float sums[kQPerLane][2];
-                deep_gemm::float_epilogue_reduce_wq4(accum, m, sums);
-                deep_gemm::shfl_xor_reduce_wq4(sums);
-
                 const uint32_t lane_in_quad = lane_idx % 4;
                 #pragma unroll
                 for (int t = 0; t < kQPerLane; ++t) {
-                    // sums[t] belongs to warp-local token 2*t + lane_in_quad/2
-                    const uint32_t token = warp_q_idx * WARP_Q + 2 * t + lane_in_quad / 2;
-                    if (token < kNextN) {
-                        auto kv_offset = (q_idx * kNextN + token) * params.logits_stride + kv_idx * BLOCK_KV;
-                        params.logits[kv_offset + warp_offset + mma_offset + v_0_offset] = sums[t][0] * scale_kv_0;
-                        params.logits[kv_offset + warp_offset + mma_offset + v_1_offset] = sums[t][1] * scale_kv_1;
+                    if constexpr (cute::is_same_v<ElementLogits, float>) {
+                        float sums[kQPerLane][2];
+                        deep_gemm::float_epilogue_reduce_wq4(accum, m, sums);
+                        const float recv = __shfl_xor_sync(0xffffffffu, sums[t][r_mine ^ 1], 1);
+                        const float total = sums[t][r_mine] + recv;
+                        const uint32_t token = warp_q_idx * WARP_Q + 2 * t + lane_in_quad / 2;
+                        if (token < kNextN) {
+                            auto kv_offset = (q_idx * kNextN + token) * params.logits_stride + kv_idx * BLOCK_KV;
+                            params.logits[kv_offset + warp_offset + mma_offset + v_offset_mine] = total * scale_kv_array[m];
+                        }
+                    } else {
+                        // BF16: cvt relu-packs the two rows of one head (lo = v_0,
+                        // hi = v_1), hadd2 sums the lane's two heads
+                        uint32_t pa, pb;
+                        pa = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(4 * t + 2, m, 0), accum(4 * t + 0, m, 0));
+                        pb = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(4 * t + 3, m, 0), accum(4 * t + 1, m, 0));
+                        const __ppu_bfloat162 partial = __hadd2(reinterpret_cast<__ppu_bfloat162&>(pa),
+                                                                reinterpret_cast<__ppu_bfloat162&>(pb));
+                        const uint32_t recv = __shfl_xor_sync(0xffffffffu, reinterpret_cast<const uint32_t&>(partial), 1);
+                        const __ppu_bfloat162 total2 = __hadd2(partial, reinterpret_cast<const __ppu_bfloat162&>(recv));
+                        const __ppu_bfloat16 total = r_mine ? __high2bfloat16(total2) : __low2bfloat16(total2);
+                        const uint32_t token = warp_q_idx * WARP_Q + 2 * t + lane_in_quad / 2;
+                        if (token < kNextN) {
+                            auto kv_offset = (q_idx * kNextN + token) * params.logits_stride + kv_idx * BLOCK_KV;
+                            params.logits[kv_offset + warp_offset + mma_offset + v_offset_mine] =
+                                __hmul(total, (__ppu_bfloat16)scale_kv_array[m]);
+                        }
                     }
                 }
             } else if constexpr (cute::is_same_v<ElementLogits, float>) {

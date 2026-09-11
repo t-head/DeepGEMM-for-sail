@@ -183,16 +183,20 @@ static PagedTile get_paged_mqa_logits_tile(int next_n, int block_kv, int num_hea
         {{1, 6, 32, 64}, {1, 3, 64, 64, true, 8}},
         {{1, 2, 64, 64}, {1, 3, 256, 64, true, 4}},
         {{1, 3, 64, 64}, {1, 3, 128, 64, true, 5}},
+        // 4-head avg tiles: the kernel pads 4 heads to 16, so lookup with 16 heads
+        // and ceil(next_n / 4) "tokens" (next_n 1-4 -> 1, 5-8 -> 2)
+        {{1, 1, 16, 128}, {1, 3, 128, 32, false, 4}},
+        {{1, 2, 16, 128}, {1, 3, 128, 32, false, 4}},
     };
-    const auto& it = tile_map.find({datasize, next_n, num_heads, head_dim});
-    if (it != tile_map.end())
-        return it->second;
-    // 4 heads are padded to 16 in the paged kernel: search with 16 heads and
+    // 4 heads are padded to 16 in the paged kernel: look up with 16 heads and
     // ceil(next_n / 4) warp-tile "tokens" (fp4 keeps its own kernel layout)
     if (num_heads == 4 and not is_fp4) {
         num_heads = 16;
         next_n = (next_n + 3) / 4;
     }
+    const auto& it = tile_map.find({datasize, next_n, num_heads, head_dim});
+    if (it != tile_map.end())
+        return it->second;
     return search_tile();
 }
 

@@ -398,7 +398,9 @@ public:
             auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
             tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes;
             tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / sizeof(uint32_t);
-            constexpr bool SPLIT_AIU = (BLOCK_KV > WARP_KV);
+            // Split the value/scale AIU copies across warps 0/1 only when the group
+            // has >= 2 warps; otherwise warp 0 issues both
+            constexpr bool SPLIT_AIU = (WarpOnGroup >= 2);
             copy_aiu<SPLIT_AIU>(gmem_tiled_copy_A, tAgA(_, _, _, 0), tAsA(_, _, _, smem_pipe_write_kv), gmem_tiled_copy_SFA,
                            tSFAgSFA(_, _, _, 0), tSFAsSFA(_, _, _, smem_pipe_write_kv), local_warp_idx);
 

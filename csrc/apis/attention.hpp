@@ -67,7 +67,8 @@ static torch::Tensor mqa_logits_common(const torch::Tensor& q, const torch::Tens
     if (is_avg) {
         TORCH_CHECK(not is_fp4, "avg variant supports fp8 only");
         TORCH_CHECK(q.scalar_type() == torch::kFloat8_e4m3fn, "avg variant supports fp8 only");
-        TORCH_CHECK(logits_dtype == torch::kFloat32, "avg variant supports float32 logits only");
+        TORCH_CHECK(logits_dtype == torch::kFloat32 || logits_dtype == torch::kBFloat16,
+                    "avg variant supports float32 or bfloat16 logits");
         if (q_scale.has_value()) {
             TORCH_CHECK(q_scale->scalar_type() == torch::kFloat32, "q_scale must be float32");
             TORCH_CHECK(q_scale->is_contiguous(), "q_scale must be contiguous");
@@ -166,7 +167,8 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
     if (is_avg) {
         TORCH_CHECK(not is_fp4, "avg variant supports fp8 only");
         TORCH_CHECK(q.scalar_type() == torch::kFloat8_e4m3fn, "avg variant supports fp8 only");
-        TORCH_CHECK(logits_dtype == torch::kFloat32, "avg variant supports float32 logits only");
+        TORCH_CHECK(logits_dtype == torch::kFloat32 || logits_dtype == torch::kBFloat16,
+                    "avg variant supports float32 or bfloat16 logits");
     } else if (num_heads == 4) {
         TORCH_CHECK(false, "num_heads == 4 supports the avg variant only (pass empty weights)");
     }
@@ -296,6 +298,7 @@ torch::Tensor fp8_mqa_avg_logits(const torch::Tensor& q, const std::pair<torch::
                                  bool clean_logits = true, int max_seqlen_k = 0,
                                  const std::optional<torch::Tensor>& q_scale = std::nullopt,
                                  torch::ScalarType logits_dtype = torch::kFloat32) {
+    DG_HOST_ASSERT(q.scalar_type() == torch::kFloat8_e4m3fn);
     const auto& empty = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
     return mqa_logits_common(q, kv_s.first, kv_s.second, empty, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits,
                              max_seqlen_k, logits_dtype, std::nullopt, std::nullopt, q_scale);
@@ -311,7 +314,7 @@ torch::Tensor fp8_paged_mqa_avg_logits(const torch::Tensor& q, const torch::Tens
     if (indices.has_value())
         print_once("Warning: indices (varlen) is not supported on PPU, falling back to non-varlen mode "
                    "(performance may be affected)");
-    TORCH_CHECK(logits_dtype == torch::kFloat32, "avg variant supports float32 logits only");
+    DG_HOST_ASSERT(q.scalar_type() == torch::kFloat8_e4m3fn);
     const auto& empty = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
     return paged_mqa_logits_common(q, fused_kv_cache, empty, context_lens, block_table, schedule_meta,
                                    max_context_len, clean_logits, logits_dtype);

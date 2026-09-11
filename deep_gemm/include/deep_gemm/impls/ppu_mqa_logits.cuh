@@ -26,6 +26,9 @@ public:
   static constexpr int WARP_N = WARP_QH;
   static constexpr int BLOCK_Q = BLOCK_QH / kNumHeads;
   static constexpr int WARP_Q = WARP_QH / kNumHeads;
+  // WARP_Q == 4 (4-head avg tile): parity-split epilogue, each lane loads/stores
+  // only its own kv row half (see operator()). Applies to both float and bf16 logits
+  static constexpr bool kWq4 = WARP_Q == 4;
 
   using StrideAB = Stride<Int<BLOCK_K>, _1>;
 
@@ -277,6 +280,9 @@ public:
     const auto& warp_offset = (warp_idx % WarpOnM) * WARP_M;
     const auto& v_0_offset = lane_idx / 4 + 0;
     const auto& v_1_offset = lane_idx / 4 + 8;
+    // Lane-parity kv row half used by the kWq4 epilogue split
+    const uint32_t r_mine = lane_idx & 1;
+    const uint32_t v_offset_mine = r_mine ? v_1_offset : v_0_offset;
     uint32_t warp_q_idx = warp_idx / WarpOnM;
     int warp_group_id = warp_idx / 8;
 
@@ -329,11 +335,20 @@ public:
         float * smem_kv_scales = sSFA(_,_,kv_stage_idx).data().get();
         for (int m = 0; m < kMmaIterM; m++) {
             uint32_t mma_offset = m * InstM;
-            scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
-            scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
-            if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
-                scale_kv_array[m * 2    ] *= kInvSqrtHeadDim;
-                scale_kv_array[m * 2 + 1] *= kInvSqrtHeadDim;
+            if constexpr (kWq4) {
+                // Each lane stores only its own parity's kv row in the WARP_Q==4
+                // epilogue, so it only loads that row's scale
+                scale_kv_array[m] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
+                if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
+                    scale_kv_array[m] *= kInvSqrtHeadDim;
+                }
+            } else {
+                scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
+                scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
+                if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
+                    scale_kv_array[m * 2    ] *= kInvSqrtHeadDim;
+                    scale_kv_array[m * 2 + 1] *= kInvSqrtHeadDim;
+                }
             }
         }
     };
@@ -346,24 +361,26 @@ public:
         CUTE_STATIC_ASSERT(WARP_Q == 1 || WARP_Q == 4);
         for (int m = 0; m < kMmaIterM; m++) {
             uint32_t mma_offset = m * InstM;
-            float scale_kv_0 = scale_kv_array[m * 2];
-            float scale_kv_1 = scale_kv_array[m * 2 + 1];
-            if constexpr (kScaleMode != deep_gemm::kScaleModeWeights && WARP_Q == 1) {
-                if constexpr (kScaleMode == deep_gemm::kScaleModeQRow) {
-                    scale_kv_0 *= scale_q_row[0];
-                    scale_kv_1 *= scale_q_row[0];
-                } else {
-                    scale_kv_0 *= scale_q;
-                    scale_kv_1 *= scale_q;
+            float scale_kv_0, scale_kv_1;
+            if constexpr (!kWq4) {
+                scale_kv_0 = scale_kv_array[m * 2];
+                scale_kv_1 = scale_kv_array[m * 2 + 1];
+                if constexpr (kScaleMode != deep_gemm::kScaleModeWeights && WARP_Q == 1) {
+                    if constexpr (kScaleMode == deep_gemm::kScaleModeQRow) {
+                        scale_kv_0 *= scale_q_row[0];
+                        scale_kv_1 *= scale_q_row[0];
+                    } else {
+                        scale_kv_0 *= scale_q;
+                        scale_kv_1 *= scale_q;
+                    }
                 }
             }
 
-            if constexpr (cute::is_same_v<ElementLogits, float> && WARP_Q == 4) {
+            if constexpr (cute::is_same_v<ElementLogits, float> && kWq4) {
                 static constexpr int kQPerLane = 2;
                 CUTE_STATIC_ASSERT(MmaIterN{} == 1);
                 float sums[kQPerLane][2];
                 deep_gemm::float_epilogue_reduce_wq4(accum, m, sums);
-                deep_gemm::shfl_xor_reduce_wq4(sums);
 
                 const uint32_t q_base = block_q_idx * BLOCK_Q + warp_q_idx * WARP_Q;
                 const uint32_t lane_in_quad = lane_idx % 4;
@@ -376,18 +393,18 @@ public:
                         scale_q_t = scale_q_row[local_q_warp];
                     else if constexpr (kScaleMode == deep_gemm::kScaleModeQScalar)
                         scale_q_t = scale_q;
+                    const float recv = __shfl_xor_sync(0xffffffffu, sums[t][r_mine ^ 1], 1);
+                    const float total = sums[t][r_mine] + recv;
+                    const float scale_kv_r = scale_kv_array[m];
                     const uint32_t q_idx = q_base + local_q_warp;
                     if constexpr (kIsCompressedLogits) {
                         const uint32_t lq = warp_q_idx * WARP_Q + local_q_warp;
                         const uint32_t rel_kv = kv_offset + mma_offset - seq_k_start[lq];
                         const uint32_t len = seq_k_end[lq] - seq_k_start[lq];
-                        if (rel_kv + v_0_offset < len)
-                            params.logits[q_idx * params.stride_k + rel_kv + v_0_offset] = sums[t][0] * scale_kv_0 * scale_q_t;
-                        if (rel_kv + v_1_offset < len)
-                            params.logits[q_idx * params.stride_k + rel_kv + v_1_offset] = sums[t][1] * scale_kv_1 * scale_q_t;
+                        if (rel_kv + v_offset_mine < len)
+                            params.logits[q_idx * params.stride_k + rel_kv + v_offset_mine] = total * scale_kv_r * scale_q_t;
                     } else {
-                        params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_0_offset] = sums[t][0] * scale_kv_0 * scale_q_t;
-                        params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_1_offset] = sums[t][1] * scale_kv_1 * scale_q_t;
+                        params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_offset_mine] = total * scale_kv_r * scale_q_t;
                     }
                 }
             } else if constexpr (cute::is_same_v<ElementLogits, float> && WARP_Q == 1) {
@@ -414,6 +431,56 @@ public:
                 } else {
                     params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_0_offset] = v_0 * scale_kv_0;
                     params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_1_offset] = v_1 * scale_kv_1;
+                }
+            } else if constexpr (cute::is_same_v<ElementLogits, __ppu_bfloat16> && kWq4) {
+                // BF16 t-packed epilogue: each bf16x2 packs the two q tokens of one
+                // kv row (lo = t0, hi = t1); select/scale/mul run once per m, not per t
+                CUTE_STATIC_ASSERT(MmaIterN{} == 1);
+                const uint32_t q_base = block_q_idx * BLOCK_Q + warp_q_idx * WARP_Q;
+                const uint32_t lane_in_quad = lane_idx % 4;
+
+                uint32_t pa0, pb0, pa1, pb1;
+                pa0 = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(4, m, 0), accum(0, m, 0));
+                pb0 = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(5, m, 0), accum(1, m, 0));
+                pa1 = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(6, m, 0), accum(2, m, 0));
+                pb1 = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(7, m, 0), accum(3, m, 0));
+                __ppu_bfloat162 partial0 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(pa0),
+                                                   reinterpret_cast<__ppu_bfloat162&>(pb0));
+                __ppu_bfloat162 partial1 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(pa1),
+                                                   reinterpret_cast<__ppu_bfloat162&>(pb1));
+                const uint32_t recv0 = __shfl_xor_sync(0xffffffffu, reinterpret_cast<const uint32_t&>(partial0), 1);
+                const uint32_t recv1 = __shfl_xor_sync(0xffffffffu, reinterpret_cast<const uint32_t&>(partial1), 1);
+                __ppu_bfloat162 total0 = __hadd2(partial0, reinterpret_cast<const __ppu_bfloat162&>(recv0));
+                __ppu_bfloat162 total1 = __hadd2(partial1, reinterpret_cast<const __ppu_bfloat162&>(recv1));
+                __ppu_bfloat162 total = r_mine ? total1 : total0;
+
+                // Scale both t outputs with one packed cvt + one packed mul;
+                // QRow's per-row scale_q rides in the two f32 cvt sources
+                float scale_lo = scale_kv_array[m], scale_hi = scale_kv_array[m];
+                if constexpr (kScaleMode == deep_gemm::kScaleModeQRow) {
+                    scale_lo *= scale_q_row[lane_in_quad / 2];
+                    scale_hi *= scale_q_row[2 + lane_in_quad / 2];
+                } else if constexpr (kScaleMode == deep_gemm::kScaleModeQScalar) {
+                    scale_lo *= scale_q;
+                    scale_hi *= scale_q;
+                }
+                const uint32_t scale2 = deep_gemm::cvt_rte_bf16x2_f32(scale_hi, scale_lo);
+                const __ppu_bfloat162 out2 = __hmul2(total, reinterpret_cast<const __ppu_bfloat162&>(scale2));
+
+                const uint32_t q_idx_lo = q_base + lane_in_quad / 2;
+                const uint32_t q_idx_hi = q_base + 2 + lane_in_quad / 2;
+                if constexpr (kIsCompressedLogits) {
+                    const uint32_t lq_lo = warp_q_idx * WARP_Q + lane_in_quad / 2;
+                    const uint32_t lq_hi = warp_q_idx * WARP_Q + 2 + lane_in_quad / 2;
+                    const uint32_t rel_lo = kv_offset + mma_offset - seq_k_start[lq_lo];
+                    const uint32_t rel_hi = kv_offset + mma_offset - seq_k_start[lq_hi];
+                    if (rel_lo + v_offset_mine < seq_k_end[lq_lo] - seq_k_start[lq_lo])
+                        params.logits[q_idx_lo * params.stride_k + rel_lo + v_offset_mine] = __low2bfloat16(out2);
+                    if (rel_hi + v_offset_mine < seq_k_end[lq_hi] - seq_k_start[lq_hi])
+                        params.logits[q_idx_hi * params.stride_k + rel_hi + v_offset_mine] = __high2bfloat16(out2);
+                } else {
+                    params.logits[q_idx_lo * params.stride_k + kv_offset + mma_offset + v_offset_mine] = __low2bfloat16(out2);
+                    params.logits[q_idx_hi * params.stride_k + kv_offset + mma_offset + v_offset_mine] = __high2bfloat16(out2);
                 }
             } else {
                 // BF16 vectorized epilogue: separate cvt and fma2 phases with __ppu_sched_bound()
