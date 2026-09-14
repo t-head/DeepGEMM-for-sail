@@ -177,6 +177,9 @@ public:
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         std::string gemm_type, kKernelType, kernel_name;
         bool kEnableSboOverlap;
+        // Only meaningful for `GemmType::BatchGemm`. `true` keeps the transposed `[M, B, N]`
+        // output used by `einsum("bhr,hdr->bhd")`; `false` emits a plain `[B, M, N]` output.
+        bool kTransposedBatchOutput = true;
     };
 
     // Main Arguments
@@ -245,10 +248,10 @@ using namespace cute;
 using cutlass::KernelHardwareInfo;
 
 // Injected device hardware constants (host-side hggcDeviceGetAttribute query).
-constexpr int kHwTsmPerCu         = {13};
-constexpr int kHwMaxThreadsPerCta = {14};
-constexpr int kHwMaxWarpsPerCu    = {15};
-constexpr int kHwTotalVregPerCu   = {16};
+constexpr int kHwTsmPerCu         = {14};
+constexpr int kHwMaxThreadsPerCta = {15};
+constexpr int kHwMaxWarpsPerCu    = {16};
+constexpr int kHwTotalVregPerCu   = {17};
 
 constexpr int SHAPE_N = {0};
 constexpr int SHAPE_K = {1};
@@ -263,6 +266,7 @@ constexpr int STAGES = {8};
 static constexpr GemmType kGemmType = GemmType::{9};
 static constexpr KernelType kKernelType = KernelType::{10}; //Default;
 static constexpr bool kEnableSboOverlap = {11};
+static constexpr bool kTransposedBatchOutput = {12};
 
 using ScaleGranularityShape = cute::Shape<cute::_1,cute::_128,cute::_128>;
 using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(ScaleGranularityShape{{}}));
@@ -278,7 +282,11 @@ using TileScheduler = DeepGemmScheduler<
   SHAPE_K,
   BLOCK_M,
   BLOCK_N * N_EXPAND,
-  NUM_GROUPS
+  NUM_GROUPS,
+  ceil_div((uint32_t)SHAPE_N, (uint32_t)(BLOCK_N * N_EXPAND)),
+  2,
+  EpilogueType::Default,
+  kTransposedBatchOutput
 >;
 
 static constexpr bool UseAIU = true;
@@ -364,7 +372,7 @@ using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K,
 
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
-__global__ void {12}(
+__global__ void {13}(
   typename GemmKernel::Params params
 ) {{
   extern __shared__ char smem[];
@@ -376,7 +384,7 @@ __global__ void {12}(
             cute::get<1>(args.kernel_params.problem_shape), cute::get<2>(args.kernel_params.problem_shape),
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
-            args.launch_info.kKernelType, args.launch_info.kEnableSboOverlap, args.launch_info.kernel_name,
+            args.launch_info.kKernelType, args.launch_info.kEnableSboOverlap, args.launch_info.kTransposedBatchOutput, args.launch_info.kernel_name,
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
     }
 

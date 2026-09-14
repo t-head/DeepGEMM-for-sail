@@ -35,7 +35,8 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
              const torch::Tensor& b, const torch::Tensor& sfb,
              const torch::Tensor& d,
              const std::optional<torch::Tensor>& c,
-             std::optional<ConfigTuple> configs = std::nullopt) {
+             std::optional<ConfigTuple> configs = std::nullopt,
+             bool transposed_out = true) {
     const auto& [groups, m, k] = get_shape<3>(a);
     const auto& [_, n, __] = get_shape<3>(b);
 
@@ -67,7 +68,12 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
 
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, groups));
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, groups));
-    auto stride_D = StrideA{(int64_t)groups * n, cute::Int<1>{}, (int64_t)n};
+    // Transposed `[M, B, N]` output: a row spans every batch, and the scheduler advances
+    // `ptr_D` by one row segment per batch. Plain `[B, M, N]` output: rows are contiguous
+    // within a batch, and the scheduler advances `ptr_D` by a whole `M x N` matrix.
+    auto stride_D = transposed_out
+                        ? StrideA{(int64_t)groups * n, cute::Int<1>{}, (int64_t)n}
+                        : StrideA{(int64_t)n, cute::Int<1>{}, (int64_t)m * n};
 
     LayoutSFA layout_SFA;
     LayoutSFB layout_SFB;
@@ -111,7 +117,8 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     FP8GemmRuntime::GemmKernelParams params = FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
     auto args = FP8GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                                                     "BatchGemm", "Default", "batch_fp8_deep_gemm", false},
+                                                     "BatchGemm", "Default", "batch_fp8_deep_gemm", false,
+                                                     transposed_out},
                                      .launch_args = {grid, block, SMSIZE},
                                      .kernel_params = params};
 
@@ -155,7 +162,8 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
               const torch::Tensor& b, const torch::Tensor& sfb,
               const torch::Tensor& d,
               const std::optional<torch::Tensor>& c,
-              std::optional<ConfigTuple> configs = std::nullopt) {
+              std::optional<ConfigTuple> configs = std::nullopt,
+              bool transposed_out = true) {
     const auto& [groups, m, k] = get_shape<3>(a);
     const auto& [_, n, __] = get_shape<3>(b);
 
@@ -185,7 +193,12 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
 
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, groups));
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, groups));
-    auto stride_D = StrideA{(int64_t)groups * n, cute::Int<1>{}, (int64_t)n};
+    // Transposed `[M, B, N]` output: a row spans every batch, and the scheduler advances
+    // `ptr_D` by one row segment per batch. Plain `[B, M, N]` output: rows are contiguous
+    // within a batch, and the scheduler advances `ptr_D` by a whole `M x N` matrix.
+    auto stride_D = transposed_out
+                        ? StrideA{(int64_t)groups * n, cute::Int<1>{}, (int64_t)n}
+                        : StrideA{(int64_t)n, cute::Int<1>{}, (int64_t)m * n};
 
     torch::Dtype dtype = a.dtype().toScalarType();
     const void* converted_input_a = nullptr;
@@ -244,7 +257,7 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
 
         auto args = INT8GemmCutlass3Runtime::Args{
             .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                            "BatchGemm", "Default", kernel_name, false},
+                            "BatchGemm", "Default", kernel_name, false, transposed_out},
             .launch_args = {grid, block, SMSIZE},
             .kernel_params = params,
             .type_info = type_info};
@@ -282,6 +295,10 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
             printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
         }
     } else {
+        // The legacy EpilogueVisitor kernel recomputes `params_D` internally for
+        // `GemmType::BatchGemm`, hardcoding the transposed `[M, B, N]` addressing.
+        TORCH_CHECK(transposed_out,
+                    "int8_bmm: plain [B, M, N] output requires the actlize_v100 backend");
         int64_t stride, increment_row, increment_group, increment_cluster;
         int64_t advance_row, advance_group, advance_cluster, advance_tile;
         using ElementType = int8_t;

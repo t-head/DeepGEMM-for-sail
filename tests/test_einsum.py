@@ -24,6 +24,24 @@ def test_int8_bhr_hdr_bhd(quant_type: str = "channel"):
     print()
 
 
+@test_filter(lambda: is_ppu1v5_device())
+def test_fp8_bhr_hdr_hbd(quant_type: str = "block"):
+    print('Testing FP8 "bhr, hdr -> hbd":')
+    for h, r, d in [(8, 4096, 1024)]:
+        for b in (4, 32, 128, 4096, 8192):
+            args = {"h":h,"b":b, "r":r, "d":d, "data_type":torch.float8_e4m3fn, "quant_type": quant_type, "expr": 'bhr,hdr->hbd'}
+            test_einsum(args)
+    print()
+
+def test_int8_bhr_hdr_hbd(quant_type: str = "channel"):
+    print('Testing INT8 "bhr, hdr -> hbd":')
+    for h, r, d in [(8, 4096, 1024)]:
+        for b in (4, 32, 128, 4096, 8192):
+            args = {"h":h,"b":b, "r":r, "d":d, "data_type":torch.int8, "quant_type": quant_type, "expr": 'bhr,hdr->hbd'}
+            test_einsum(args)
+    print()
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -34,4 +52,8 @@ if __name__ == '__main__':
     test_fp8_bhr_hdr_bhd()
     test_fp8_bhr_hdr_bhd("channel")
     test_int8_bhr_hdr_bhd("channel")
+
+    test_fp8_bhr_hdr_hbd()
+    test_fp8_bhr_hdr_hbd("channel")
+    test_int8_bhr_hdr_hbd("channel")
 

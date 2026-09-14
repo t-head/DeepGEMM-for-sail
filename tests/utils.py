@@ -1974,13 +1974,17 @@ def test_paged_mqa_logits(args) -> None:
 def test_einsum(args) -> None:
     b, h, r, d, data_type, expr = args['b'], args['h'], args['r'], args['d'], args["data_type"], args["expr"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
-    if expr == 'bhr,hdr->bhd':
+    if expr in ('bhr,hdr->bhd', 'bhr,hdr->hbd'):
+        # The two expressions take the same inputs and the same quantization; they differ only in
+        # the output layout, which the C++ side picks via `transposed_out`. `bhd` gets the strided
+        # [b, h, d] view, `hbd` the plain packed [h, b, d].
         tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
         x = torch.randn((b, h, r), device=tensor_device, dtype=torch.bfloat16)
         y = torch.randn((h, d, r), device=tensor_device, dtype=torch.bfloat16)
-        out = torch.empty((b, h, d), device='cuda', dtype=torch.bfloat16)
+        out_shape = (b, h, d) if expr == 'bhr,hdr->bhd' else (h, b, d)
+        out = torch.empty(out_shape, device='cuda', dtype=torch.bfloat16)
         if _acc_check:
-            ref_out = torch.einsum('bhr,hdr->bhd', x, y)
+            ref_out = torch.einsum(expr, x, y)
         else:
             ref_out = torch.empty_like(out)
         if data_type == torch.float8_e4m3fn:
@@ -1998,7 +2002,7 @@ def test_einsum(args) -> None:
                     x_fp8[0][i], x_fp8[1][i] = per_custom_dims_cast_to_fp8(x[i], (0, ), False, True)
                 for i in range(h):
                     y_fp8[0][i], y_fp8[1][i] = per_custom_dims_cast_to_fp8(y[i], (0, ), False, True)
-            deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, out)
+            deep_gemm.fp8_einsum(expr, x_fp8, y_fp8, out)
         elif data_type == torch.int8 and quant_type == 'channel':
             x_fp8 = (torch.empty_like(x, dtype=torch.int8), torch.empty((b, h, 1), device=tensor_device, dtype=torch.float))
             y_fp8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((h, d, 1), device=tensor_device, dtype=torch.float))
@@ -2006,7 +2010,7 @@ def test_einsum(args) -> None:
                 x_fp8[0][i], x_fp8[1][i] = per_token_cast_to_int8(x[i])
             for i in range(h):
                 y_fp8[0][i], y_fp8[1][i] = per_token_cast_to_int8(y[i])
-            deep_gemm.int8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, out)
+            deep_gemm.int8_einsum(expr, x_fp8, y_fp8, out)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)

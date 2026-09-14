@@ -310,6 +310,9 @@ public:
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         std::string gemm_type, kKernelType, kernel_name;
         bool kEnableSboOverlap;
+        // Only meaningful for `GemmType::BatchGemm`. `true` keeps the transposed `[M, B, N]`
+        // output used by `einsum("bhr,hdr->bhd")`; `false` emits a plain `[B, M, N]` output.
+        bool kTransposedBatchOutput = true;
     };
 
     struct GemmArguments {
@@ -375,10 +378,10 @@ using namespace cute;
 using cutlass::KernelHardwareInfo;
 
 // Injected device hardware constants (host-side hggcDeviceGetAttribute query).
-constexpr int kHwTsmPerCu         = {14};
-constexpr int kHwMaxThreadsPerCta = {15};
-constexpr int kHwMaxWarpsPerCu    = {16};
-constexpr int kHwTotalVregPerCu   = {17};
+constexpr int kHwTsmPerCu         = {15};
+constexpr int kHwMaxThreadsPerCta = {16};
+constexpr int kHwMaxWarpsPerCu    = {17};
+constexpr int kHwTotalVregPerCu   = {18};
 
 constexpr int SHAPE_N = {0};
 constexpr int SHAPE_K = {1};
@@ -504,8 +507,11 @@ using CollectiveEpilogue = typename cutlass::platform::conditional<
 >::type;
 
 static constexpr GemmType kGemmType = GemmType::{12};
+constexpr bool kTransposedBatchOutput = {13};
 
-using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS>;
+using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS,
+                                        ceil_div((uint32_t)SHAPE_N, (uint32_t)(BLOCK_N * N_EXPAND)), 2,
+                                        EpilogueType::Default, kTransposedBatchOutput>;
 using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
     Shape<int,int,int,int>,
     CollectiveMainloop,
@@ -520,7 +526,7 @@ using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K,
 
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
-__global__ void {13}(
+__global__ void {14}(
   typename GemmKernel::Params params
 ) {{
   extern __shared__ char smem[];
@@ -534,7 +540,7 @@ __global__ void {13}(
                            args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
                            args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages,
                            args.type_info, args.launch_info.kEnableSboOverlap, args.launch_info.kKernelType,
-                           args.launch_info.gemm_type, args.launch_info.kernel_name,
+                           args.launch_info.gemm_type, args.launch_info.kTransposedBatchOutput, args.launch_info.kernel_name,
                            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
     }
 
