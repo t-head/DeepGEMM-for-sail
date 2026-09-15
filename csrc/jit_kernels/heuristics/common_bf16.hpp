@@ -112,6 +112,18 @@ std::tuple<int, int, int, int, int, bool> get_gemv_best_configs(int m, int n, in
                 NPerThread = 1;
                 SWZL_SIZE_M = 1;
             }
+        } else if (dtype == torch::kInt8 && k % (32 * Alignment) == 0 && n % 32 == 0) {
+            // int8 K aligns to 512 but not 1024 (K=1536/2560/3584...).
+            ThreadPerN = 32;
+            NUM_UNROLL = 1;
+            SWZL_SIZE_M = 1;
+            if (m >= 16 * 8) {
+                NPerThread = 4;
+            } else if (m >= 4 * 8) {
+                NPerThread = 2;
+            } else {
+                NPerThread = 1;
+            }
         } else if (k % (8 * Alignment) == 0) {
             ThreadPerN = 8;
             NUM_UNROLL = 1;

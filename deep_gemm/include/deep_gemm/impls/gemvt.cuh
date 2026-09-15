@@ -487,7 +487,7 @@ public:
             // launch small_k gemm_v
             size_t grid_x = args.num_tokens;
             constexpr int NPerBlock = NPerThread * BlockSize / ThreadPerN;
-            size_t grid_y = args.N / NPerBlock;
+            size_t grid_y = ceil_div(args.N, NPerBlock);
             args.total_blocks = grid_x * grid_y;
             constexpr int MAX_K = NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type);
             constexpr int MIN_ALIGNMENT = 16 / sizeof(src_type); // for int4 copy

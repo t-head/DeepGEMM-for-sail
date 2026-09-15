@@ -254,7 +254,11 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_nopad(lhs: Tuple[torch.Tensor],
         # NPerThread = 1
         BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, USE_SMALL_K = get_gemv_best_configs(m, n, k, num_groups, num_sms, lhs.dtype)
 
-        if ThreadPerN != -1:
+        # GemV kernel requires N % NPerBlock == 0: both the host-side grid_y
+        # and the per-thread boundary check assume full N-tiles.  Fall back to
+        # the general GEMM path when N is not a multiple of NPerBlock.
+        n_per_block = (NPerThread * BlockSize // ThreadPerN) if ThreadPerN != -1 else 1
+        if ThreadPerN != -1 and n % n_per_block == 0:
             args = (lhs, rhs, out,
                 m_indices, m,
                 torch.cuda.current_stream())

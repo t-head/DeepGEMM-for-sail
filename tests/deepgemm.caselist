@@ -713,3 +713,7 @@ qwen3,[DeepGemm]--format=GroupedNoPad,data_type:int8,groups:100,m:64,n:64,k:1536
 qwen3,[DeepGemm] --format=GroupedNoPad,data_type:int8,groups:100,m:64,n:160,k:1536,distribution:[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
 qwen3,[DeepGemm] --format=GroupedNoPad,data_type:int8,groups:4,m:2,n:24,k:384,distribution:[1,1,0,0]
 qwen3,[DeepGemm] --format=GroupedNoPad,data_type:int8,groups:4,m:2,n:48,k:384,distribution:[1,1,0,0]
+qwen3,[DeepGemm] --format=GroupedNoPad,data_type:int8,groups:512,m:80,n:320,k:2560
+qwen3,[DeepGemm] --format=GroupedNoPad,data_type:int8,groups:512,m:80,n:160,k:2560
+qwen3,[DeepGemm] --format=GroupedNoPad,data_type:int8,groups:512,m:80,n:2560,k:160
+qwen3,[DeepGemm] --format=GroupedNoPad,data_type:int8,groups:512,m:80,n:2560,k:80
