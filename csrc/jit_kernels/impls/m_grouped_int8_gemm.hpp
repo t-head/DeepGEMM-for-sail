@@ -791,7 +791,13 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         std::tie(BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, SMALL_K) =
             deep_gemm_bf16_common::get_gemv_best_configs(m, n, k, num_groups, num_sms, torch::kInt8);
         if (ThreadPerN != -1 and lhs.dtype().toScalarType() == torch::kInt8) {
-            use_gemv = true;
+            // GemV kernel requires N % NPerBlock == 0: both the host-side grid_y
+            // and the per-thread boundary check assume full N-tiles.  Fall back to
+            // the general GEMM path when N is not a multiple of NPerBlock.
+            int NPerBlock = NPerThread * BlockSize / ThreadPerN;
+            if (n % NPerBlock == 0) {
+                use_gemv = true;
+            }
         }
     }
     int* layout_info = reinterpret_cast<int32_t*>(m_indices.data_ptr<int32_t>());
@@ -867,7 +873,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         } else {
             size_t grid_x = gemmv_args.num_tokens;
             int NPerBlock = NPerThread * BlockSize / ThreadPerN;
-            size_t grid_y = gemmv_args.N / NPerBlock;
+            size_t grid_y = ceil_div(n, NPerBlock);
             gemmv_args.total_blocks = grid_x * grid_y;
             int MAX_K = NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type);
             int MIN_ALIGNMENT = 16 / sizeof(src_type); // for int4 copy

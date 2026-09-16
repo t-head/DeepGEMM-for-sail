@@ -153,6 +153,17 @@ def get_gemv_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             else:
                 NPerThread = 1
                 SWZL_SIZE_M = 1
+        elif dtype == torch.int8 and k % (32 * Alignment) == 0 and n % 32 == 0:
+            # int8 K aligns to 512 but not 1024 (K=1536/2560/3584...).
+            ThreadPerN = 32
+            NUM_UNROLL = 1
+            SWZL_SIZE_M = 1
+            if m >= 16 * 8:
+                NPerThread = 4
+            elif m >= 4 * 8:
+                NPerThread = 2
+            else:
+                NPerThread = 1
         elif k % (8 * Alignment) == 0:
             ThreadPerN = 8
             NUM_UNROLL = 1

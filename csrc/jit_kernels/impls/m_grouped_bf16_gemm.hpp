@@ -395,7 +395,13 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
         std::tie(BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, SMALL_K) =
             deep_gemm_bf16_common::get_gemv_best_configs(m, n, k, num_groups, num_sms, torch::kBFloat16);
         if (ThreadPerN != -1) {
-            use_gemv = true;
+            // GemV kernel requires N % NPerBlock == 0: both the host-side grid_y
+            // and the per-thread boundary check assume full N-tiles.  Fall back to
+            // the general GEMM path when N is not a multiple of NPerBlock.
+            int NPerBlock = NPerThread * BlockSize / ThreadPerN;
+            if (n % NPerBlock == 0) {
+                use_gemv = true;
+            }
         }
     }
     int* layout_info = reinterpret_cast<int32_t*>(m_indices.data_ptr<int32_t>());
@@ -471,7 +477,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
         } else {
             size_t grid_x = gemmv_args.num_tokens;
             int NPerBlock = NPerThread * BlockSize / ThreadPerN;
-            size_t grid_y = gemmv_args.N / NPerBlock;
+            size_t grid_y = ceil_div(n, NPerBlock);
             gemmv_args.total_blocks = grid_x * grid_y;
             int MAX_K = NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type);
             int MIN_ALIGNMENT = 16 / sizeof(src_type); // for int4 copy
@@ -502,6 +508,19 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
             GemvRuntime::launch(runtime, args);
             ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
+            char* pEnv_params = std::getenv("show_log");
+            if (pEnv_params && isdigit(*pEnv_params)) {
+                int numRegs = 0, localSize = 0;
+                hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+                hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+
+                printf("[GemV-BF16:]\n");
+                printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
+                printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, NUM_UNROLL:%d, SWZL_SIZE_M:%d\n",
+                       BlockSize, NPerThread, ThreadPerN, NPerBlock, NUM_UNROLL, SWZL_SIZE_M);
+                printf("threadblock_count:%d, vreg:%d, stack:%d\n", gemmv_args.total_blocks, int(numRegs),
+                       int(localSize));
+            }
             return;
         }
     }

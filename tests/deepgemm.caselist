@@ -581,3 +581,7 @@ kimi,[DeepGemm] --format=GroupedFused,data_type:w4a16,groups:384,num_token:8,top
 kimi,[DeepGemm] --format=GroupedNoPad,data_type:w4fa16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
 kimi,[DeepGemm] --format=GroupedMasked,data_type:w4fa16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
 kimi,[DeepGemm] --format=GroupedFused,data_type:w4fa16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_type:group,group_size:32
+qwen3,[DeepGemm] --format=GroupedNoPad,data_type:int8,groups:512,m:80,n:320,k:2560
+qwen3,[DeepGemm] --format=GroupedNoPad,data_type:int8,groups:512,m:80,n:160,k:2560
+qwen3,[DeepGemm] --format=GroupedNoPad,data_type:int8,groups:512,m:80,n:2560,k:160
+qwen3,[DeepGemm] --format=GroupedNoPad,data_type:int8,groups:512,m:80,n:2560,k:80
