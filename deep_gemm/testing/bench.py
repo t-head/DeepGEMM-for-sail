@@ -85,8 +85,8 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     is_tuple = isinstance(kernel_names, tuple)
 
     # Skip profiling
-    # Conflict with Nsight Systems, Nsight Compute and Compute Sanitizer
-    if int(os.environ.get('DG_USE_NVIDIA_TOOLS', 0)):
+    # Conflict with Asight Systems, Asight Compute and Compute Sanitizer
+    if int(os.environ.get('DG_USE_PPU_TOOLS', 0)):
         return (1, ) * len(kernel_names) if is_tuple else 1
 
     # By default, flush L2 with an excessive 8 GB memset to give the GPU some (literal) chill time without full idle

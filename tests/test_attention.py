@@ -3,7 +3,7 @@ import torch
 from typing import Tuple
 
 import deep_gemm
-from bench import *
+from deep_gemm.testing.bench import *
 from utils import test_mqa_logits, test_paged_mqa_logits, set_acc_check
 from deep_gemm.jit_kernels.utils import is_ppu1v5_device
 

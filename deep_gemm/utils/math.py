@@ -23,7 +23,7 @@ def pack_ue8m0_to_int(x: torch.Tensor):
     return (x_int >> 23).to(torch.uint8).view(torch.int)
 
 
-def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
+def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool = False, gran_k: int = 128,
                           use_packed_ue8m0: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     assert not use_packed_ue8m0 or use_ue8m0
@@ -49,7 +49,7 @@ def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     return x_fp8, sf
 
 
-def per_channel_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+def per_channel_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool = False, gran_k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(0) % gran_k == 0
     m, n = x.shape
     x_view = x.view(-1, gran_k, n)
@@ -59,7 +59,7 @@ def per_channel_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128)
     return (x_view * (1.0 / sf.unsqueeze(1))).to(torch.float8_e4m3fn).view(m, n), sf
 
 
-def per_block_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+def per_block_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool = False, gran_k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
     x_padded = torch.zeros((align(m, gran_k), align(n, gran_k)), dtype=x.dtype, device=x.device)
@@ -72,13 +72,29 @@ def per_block_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128) -
     return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(x_view.size(0), x_view.size(2))
 
 
-def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims: Tuple, use_ue8m0: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims: Tuple, use_ue8m0: bool = False, keep_scale_dim: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     excluded_dims = tuple([i for i in range(x.dim()) if i not in set(dims)])
     x_amax = x.abs().float().amax(dim=excluded_dims, keepdim=True).clamp(1e-4)
     sf = x_amax / 448.0
     sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
     x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
+    if keep_scale_dim:
+        return x_scaled, sf
     return x_scaled, sf.squeeze()
+
+
+def per_token_cast_to_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2
+    m, n = x.shape
+
+    x_view = x.view(m, -1, n)
+    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+
+    scale = 127.0 / x_amax.unsqueeze(2)
+    x_normalized = x_view * scale
+    x_int8 = x_normalized.round().clamp(-128, 127).to(torch.int8)
+    x_int8 = x_int8.view(m, -1)
+    return x_int8, (x_amax / 127.0).view(m, -1)
 
 
 def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:

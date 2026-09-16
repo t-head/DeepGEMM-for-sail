@@ -157,7 +157,7 @@ The library also provides some environment variables, which may be useful:
   - `DG_JIT_PTXAS_VERBOSE`: `0` or `1`, show detailed PTXAS compiler output, `0` by default
   - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print HGCC compilation command, `0` by default
 - **Testing**
-  - `DG_NSYS_PROFILING`: `0` or `1`, Asight-system compatible testing, `0` by default
+  - `DG_USE_PPU_TOOLS`: `0` or `1`, skip the built-in Kineto profiling to stay compatible with external tools (Asight Systems / Asight Compute / Compute Sanitizer), `0` by default
 
 For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
 
