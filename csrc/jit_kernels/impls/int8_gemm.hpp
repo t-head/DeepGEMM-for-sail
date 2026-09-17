@@ -19,6 +19,8 @@
 #include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 #include "cutlass/gemm/gemm.h"
+#include "cutlass/epilogue/collective/detail.hpp"
+#include "cutlass/epilogue/fusion/ppu_callbacks.hpp"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
 #include <deep_gemm/common/utils_rtc.cuh>
@@ -326,18 +328,39 @@ public:
     };
 
     using CollectiveMainloopParams = MainLoopArguments;
-    using CollectiveEpilogueParams = EpilogueArgs;
 
-    struct GemmKernelParams {
+    // One epilogue-params layout per device generation (must match the device Params bytes).
+    using EpilogueParamNoTsm = EpilogueArgs;  // PPU1.5: the args are the params, as-is
+    struct EpilogueParamWithTsm {
+        using TsmTree = cutlass::epilogue::fusion::PPUEVT<
+            cutlass::epilogue::fusion::PPUCompute<cutlass::multiplies, cutlass::bfloat16_t, float,
+                                                  cutlass::FloatRoundStyle::round_to_nearest>,
+            cutlass::epilogue::fusion::PPUScalarBroadcast<float, cute::Stride<cute::_0, cute::_0, int64_t>>,
+            cutlass::epilogue::fusion::PPUAccFetch>;
+        typename TsmTree::Params thread{};
+        cutlass::bfloat16_t* ptr_C{};
+        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C{};
+        cutlass::bfloat16_t* ptr_D{};
+        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D{};
+    };
+
+    template <typename EpilogueParamsT>
+    struct GemmKernelParamsT {
         GemmUniversalMode mode;
         GemmProblemSize problem_shape;
         CollectiveMainloopParams collective_mainloop_params;
-        CollectiveEpilogueParams collective_epilogue_params;
+        EpilogueParamsT collective_epilogue_params;
         cutlass::KernelHardwareInfo hw_info;
         TileSchedulerArguments scheduler;
         void* workspace{nullptr}; // workspace,
         int32_t* signal{nullptr};
     };
+    // Same prefix for both generations; the member filled by to_underlying_arguments_rtc must match the device compile.
+    union KernelParams {
+        GemmKernelParamsT<EpilogueParamWithTsm> with_tsm;
+        GemmKernelParamsT<EpilogueParamNoTsm> no_tsm;
+    };
+    using GemmKernelParams = KernelParams;
 
     struct Args {
         LaunchInfo launch_info;
@@ -362,13 +385,40 @@ public:
 
         cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
 
-        return {args.mode, problem_shape,  args.mainloopargs, args.epilogueargs,
-                hw_info,   args.scheduler, workspace,         args.signal};
+        // NoTsm ignores alpha (ScaleType::Nothing) while TSM applies it; pin the {1, 0} contract.
+        DG_HOST_ASSERT(args.epilogueargs.callback.alpha == 1.0f && args.epilogueargs.callback.alpha_ptr == nullptr &&
+                       args.epilogueargs.callback.beta == 0.0f && args.epilogueargs.callback.beta_ptr == nullptr);
+
+        // Same decision source as the injected kWithTsmEpilogue; must match the device compile.
+        // Initialize the selected union member directly to start its lifetime.
+        if (is_ppu1v5_device()) {
+            return KernelParams{.no_tsm = GemmKernelParamsT<EpilogueParamNoTsm>{
+                args.mode, problem_shape, args.mainloopargs, args.epilogueargs,
+                hw_info, args.scheduler, workspace, args.signal}};
+        } else {
+            // Map the flat inputs on the host (once per launch); the device converts nothing.
+            return KernelParams{.with_tsm = GemmKernelParamsT<EpilogueParamWithTsm>{
+                args.mode, problem_shape, args.mainloopargs,
+                {{args.epilogueargs.callback.alpha, args.epilogueargs.callback.alpha_ptr},
+                 args.epilogueargs.ptr_C, args.epilogueargs.stride_C,
+                 args.epilogueargs.ptr_D, args.epilogueargs.stride_D},
+                hw_info, args.scheduler, workspace, args.signal}};
+        }
     }
 
     static std::string generate_impl(const Args& args) {
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
+        // One snapshot drives both the union member read and the injected epilogue flag.
+        const bool is_ppu1v5 = is_ppu1v5_device();
+        // Read the common head (mode/problem_shape/mainloop) through the matching member.
+        const GemmProblemSize problem_shape = is_ppu1v5 ? args.kernel_params.no_tsm.problem_shape
+                                                        : args.kernel_params.with_tsm.problem_shape;
+        // Injected into the generated source; same source as to_underlying_arguments_rtc.
+        const bool with_tsm_epilogue = not is_ppu1v5;
+        // sizeof of what the driver copies; the device asserts it equals its own Params size.
+        const auto host_params_size = with_tsm_epilogue ? sizeof(args.kernel_params.with_tsm)
+                                                        : sizeof(args.kernel_params.no_tsm);
         return fmt::format(R"(
 #define INT8_HGRTC
 #include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
@@ -486,8 +536,10 @@ using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueN
     cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
     cutlass::gemm::EpilogueDefault,
     IsAlignedN>;
+// PPU1.0 (810E) TSM epilogue: CollectiveBuilder (EpilogueSimtVectorized) -> EpilogueEvt with the
+// ScaledAcc op; the host mirrors its Params (see INT8GemmCutlass3Runtime::EpilogueParamWithTsm).
 static constexpr int AlignmentC = 16 / sizeof(ElementC);
-using DefaultOperation = cutlass::epilogue::fusion::LinearCombination<ElementD, ElementCompute>;
+using DefaultOperation = cutlass::epilogue::fusion::ScaledAcc<ElementD, ElementCompute>;
 using EpilogueSchedule = typename cutlass::epilogue::EpilogueSimtVectorized;
 using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, cutlass::arch::OpClassTensorOp,
@@ -499,9 +551,11 @@ using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::Colle
     EpilogueSchedule,
     DefaultOperation
 >::CollectiveOp;
-static constexpr bool EpilogueWithTsm = false;
+
+// Injected epilogue choice (is_ppu1v5_device()); matches to_underlying_arguments_rtc.
+static constexpr bool kWithTsmEpilogue = {19};
 using CollectiveEpilogue = typename cutlass::platform::conditional<
-    EpilogueWithTsm,
+    kWithTsmEpilogue,
     CollectiveEpilogue_withTsm,
     CollectiveEpilogue_noTsm
 >::type;
@@ -519,6 +573,9 @@ using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
     TileScheduler,
     kEnableSboOverlap>;
 
+// Host/device Params ABI check (the driver copies sizeof(device Params) bytes from the host struct).
+static_assert(sizeof(GemmKernel::Params) == {20}, "host/device kernel Params size mismatch");
+
 using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, STAGES,
                             cute::sizeof_bits_v<ElementA>, cute::sizeof_bits_v<ElementB>,
                             cute::sizeof_bits_v<ElementCompute>,
@@ -535,13 +592,14 @@ __global__ void {14}(
 }}
 }}
 )",
-                           cute::get<1>(args.kernel_params.problem_shape),
-                           cute::get<2>(args.kernel_params.problem_shape), args.launch_info.block_m,
+                           cute::get<1>(problem_shape),
+                           cute::get<2>(problem_shape), args.launch_info.block_m,
                            args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
                            args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages,
                            args.type_info, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_type,
                            args.launch_info.gemm_type, args.launch_info.transposed_batch_output, args.launch_info.kernel_name,
-                           hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
+                           hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
+                           with_tsm_epilogue, host_params_size);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {

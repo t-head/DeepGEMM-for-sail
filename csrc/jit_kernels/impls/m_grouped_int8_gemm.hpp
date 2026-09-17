@@ -1034,7 +1034,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
 
         // Default, MultistageOnN, MoeDynamicTile, OverlapPrologue, OverlapMainloop
         auto kernel_type = "Default";
-        if (k < 4096) {
+        if (k < 4096 && is_ppu1v5_device()) {
             kernel_type = "OverlapPrologue";
         }
         auto args =
