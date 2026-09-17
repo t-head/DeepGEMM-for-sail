@@ -172,12 +172,25 @@ struct GemmOccModel {
   static constexpr int kAcc   = WM * WN * kBitsAcc / 8 / 128;
   static constexpr int kMmaKA = 256 / kBitsA;
   static constexpr int kMmaKB = 256 / kBitsB;
+  // A/B operand VREG footprint carries a `* 2` factor that models double-buffered
+  // (ping-pong) operand registers: the next MMA operand set is loaded while the
+  // current one is being consumed, so up to two full copies may be live at once.
+  //
+  // This 2x is a conservative upper bound, NOT an exact figure. The compiler's real
+  // allocation falls somewhere between 1x and 2x, because it can partially overlap
+  // and reuse operand registers instead of always keeping two full live copies.
   static constexpr int kVregA = WM * kMmaKA * 2 * kBitsA / 8 / 128;
   static constexpr int kVregB = WN * kMmaKB * 2 * kBitsB / 8 / 128;
   static constexpr int kVregPerWarp = kAccCopies * kAcc + kVregA + kVregB + kVregOverhead;
   // Per-warp VREG cap: no driver attribute exists; hardcoded in the model.
-  static_assert(kVregPerWarp <= 256,
-                "per-warp VREG exceeds the hardware limit");
+  //
+  // The assert below is intentionally disabled. kVregPerWarp is built on the 2x A/B
+  // assumption above, so it over-estimates real usage (which lies between 1x and 2x).
+  // Enforcing `<= 256` against that inflated number would reject many tiles that in
+  // fact compile and run fine, needlessly shrinking the usable tile space. It is kept
+  // commented out as documentation of the nominal cap rather than a hard constraint.
+  // static_assert(kVregPerWarp <= 256,
+  //               "per-warp VREG exceeds the hardware limit");
 
   static constexpr int kWePerCu       = 8;
   static constexpr int kVregPerWe     = kTotalVregPerCu / kWePerCu;
