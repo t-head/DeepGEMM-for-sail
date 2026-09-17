@@ -821,6 +821,8 @@ public:
 
     struct LaunchInfo {
         int block_x, block_y, k_per_thread;
+        int m;   // 1 or 2
+        int npt; // W rows per thread (m == 2 policy: 2 shares the x load pair)
         std::string kernel_name;
     };
 
@@ -831,6 +833,10 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        const bool is_m2 = args.launch_info.m == 2;
+        const char* entry = is_m2 ? "gemv_dense_m2_kernel_impl" : "gemv_dense_kernel_impl";
+        // m2 entry carries a trailing NPT template arg (1 or 2 W rows/thread); m1 has none.
+        const std::string npt_arg = is_m2 ? fmt::format(", {}", args.launch_info.npt) : "";
         return fmt::format(
             R"(
 #include <deep_gemm/impls/gemv_dense.cuh>
@@ -839,14 +845,15 @@ namespace deep_gemm {{
 
 extern "C" __global__
 void {}(const GemvDenseArgs args) {{
-    gemv_dense_kernel_impl<__ppu_bfloat16, __ppu_bfloat16, float,
-                           int4, int4, {}, {}, {}>(args);
+    {}<__ppu_bfloat16, __ppu_bfloat16, float,
+       int4, int4, {}, {}, {}{}>(args);
 }}
 
 }}
 )",
-            args.launch_info.kernel_name,
-            args.launch_info.block_x, args.launch_info.block_y, args.launch_info.k_per_thread);
+            args.launch_info.kernel_name, entry,
+            args.launch_info.block_x, args.launch_info.block_y, args.launch_info.k_per_thread,
+            npt_arg);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -854,18 +861,17 @@ void {}(const GemvDenseArgs args) {{
     }
 };
 
-// bf16 dense GEMV fast path (m == 1). Returns true when the kernel was
-// launched; false means the shape is not covered and the caller must fall
-// back to the tile path.
+// bf16 dense GEMV fast path (m == 1 or 2). Returns true when launched; false
+// means the shape is uncovered and the caller must fall back to the tile path.
 static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
                             const torch::Tensor& out, const int& m, const int& n, const int& k) {
-    DG_HOST_ASSERT(m == 1);
+    DG_HOST_ASSERT(m == 1 || m == 2);
     TORCH_CHECK(lhs.is_contiguous() && rhs.is_contiguous() && out.is_contiguous(),
                 "dense gemv requires contiguous tensors");
 
-    int block_x = 0, block_y = 0, k_per_thread = 0;
-    if (!deep_gemm_bf16_common::dense_gemv_select_configs(n, k, rhs.data_ptr(), lhs.data_ptr(),
-                                                          block_x, block_y, k_per_thread))
+    int block_x = 0, block_y = 0, k_per_thread = 0, npt = 1;
+    if (!deep_gemm_bf16_common::dense_gemv_select_configs(m, n, k, rhs.data_ptr(), lhs.data_ptr(),
+                                                          block_x, block_y, k_per_thread, npt))
         return false;
 
     DenseGemvRuntime::GemvDenseArgs params;
@@ -877,15 +883,19 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
     params.stride_wn = k;
 
     dim3 block(block_x, block_y);
-    dim3 grid(ceil_div(n, block_y));
+    dim3 grid(ceil_div(n, block_y * npt));
 
+    // m == 2 -> dual-accumulator variant; npt == 2 walks two W rows/thread sharing
+    // (x0, x1), each block owning block_y * npt rows. Names split so a trace shows npt.
+    const char* kernel_name = m == 1 ? "gemv_dense_bf16"
+                                     : (npt == 2 ? "gemv_dense_m2r2_bf16" : "gemv_dense_m2_bf16");
     auto args = DenseGemvRuntime::Args{
-        .launch_info = {block_x, block_y, k_per_thread, "gemv_dense_bf16"},
+        .launch_info = {block_x, block_y, k_per_thread, m, npt, kernel_name},
         .launch_args = {grid, block, 0},
         .kernel_params = params,
     };
     const auto& code = DenseGemvRuntime::generate(args);
-    const auto& runtime = compiler->build("gemv_dense_bf16", code, block.x * block.y, 0);
+    const auto& runtime = compiler->build(kernel_name, code, block.x * block.y, 0);
     const auto& kernel = runtime->kernel;
 
     static constexpr GemmType kGemmType = GemmType::DenseGemm;
@@ -906,7 +916,8 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
 
         printf("[DenseGemm_BF16_GemV:]\n");
         printf("group:%d, problem:[%d, %d, %d]\n", 1, m, n, k);
-        printf("BlockX:%d, BlockY:%d, k_per_thread:%d\n", block_x, block_y, k_per_thread);
+        printf("BlockX:%d, BlockY:%d, k_per_thread:%d, npt:%d\n", block_x, block_y, k_per_thread,
+               npt);
         printf("threadblock_count:%d, vreg:%d, stack:%d\n", (int)grid.x, int(numRegs), int(localSize));
     }
     return true;
@@ -984,10 +995,9 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
     dim3 grid = get_grid_shape(hw_info.cu_count);
     bool enable_sbo_overlap = false;
     if (is_ppu1v5_device()) {
-        // Dense GEMV fast path (m == 1): SIMT kernel avoids the tile path's
-        // BM=16 padding (15/16 lane waste at m == 1).
-        // Explicit configs still force the tile path (escape hatch for tuning).
-        if (m == 1 && !configs.has_value() && gemv_dense_bf16(lhs, rhs, out, m, n, k)) {
+        // Dense GEMV fast path (m == 1 or 2): SIMT avoids the tile path's BM=16
+        // padding (15/16 lane waste at m==1, 14/16 at m==2). Explicit configs force tile.
+        if ((m == 1 || m == 2) && !configs.has_value() && gemv_dense_bf16(lhs, rhs, out, m, n, k)) {
             return;
         }
 

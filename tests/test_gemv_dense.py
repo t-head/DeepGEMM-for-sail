@@ -1,4 +1,4 @@
-"""Dense GEMV (m == 1) bf16 fast-path tests.
+"""Dense GEMV (m == 1 / m == 2) bf16 fast-path tests.
 
 Covers:
   1. The four Kimi K3 decode shapes (c2/c3/c9/c13) -- accuracy vs torch matmul.
@@ -9,9 +9,11 @@ Covers:
   5. Data distributions: zero inputs (exact-zero output) and large-amplitude
      inputs (fp32 accumulation keeps the relative error scale-invariant).
   6. Repeat-call determinism (same inputs -> bit-exact outputs).
-  7. Fallback conditions (small n, unaligned k, m == 2, explicit configs,
+  7. Fallback conditions (small n, unaligned k, m >= 3, explicit configs,
      env kill switch, and the large-n x large-k tile gate).
-  8. Optional performance comparison GEMV vs tile (--benchmark).
+  8. m == 2 dual-accumulator variant (two W rows per thread share the x
+     loads) across ladder branches, k tails, odd n, determinism.
+  9. Optional performance comparison GEMV vs tile (--benchmark).
 """
 import argparse
 import os
@@ -39,9 +41,13 @@ DISPATCH_CASES = [
     (1, 8960, 3456, True),  # just below gate K: large n x mid k stays GEMV
     (1, 8960, 8960, False), # deepest gate corner: tile wins by ~8-11%
     (1, 8960, 1024, True),  # large n x small k: GEMV (tile weak zone)
-    (1, 32, 7168, False),   # n < 64 -> tile fallback
+    (1, 32, 7168, True),    # 8 <= n < 64: GEMV (MIN_N lowered 64 -> 8)
+    (1, 4, 7168, False),    # n < MIN_N(8) -> tile fallback
     (1, 896, 7172, False),  # k % 8 != 0 -> tile fallback
-    (2, 896, 7168, False),  # m == 2 -> tile fallback
+    (2, 128, 7168, True),   # m == 2, n <= 512 -> dual-accumulator GEMV
+    (2, 896, 7168, True),   # m == 2, 512 < n <= 2048: npt=2 GEMV (512 is the npt gate, not tile)
+    (2, 4096, 7168, False), # m == 2, n > M2_MAX_N(2048) -> tile fallback
+    (3, 896, 7168, False),  # m == 3 -> tile fallback
 ]
 
 # (n, k): accuracy-only coverage of the remaining ladder branches/boundaries
@@ -73,6 +79,23 @@ K_TAIL_CASES = [
 ]
 
 RANDOM_CASES = 32
+
+# (n, k): m == 2 accuracy across both kernels. n<=512 or k<2048 -> single-row op
+# (npt=1); n>512 && k>=2048 -> two-W-rows op (npt=2). Covers k/odd-n tails; n<=2048.
+M2_CASES = [
+    (512, 7168),   # npt=1: BlockX=64, BlockY=2 -> 2 rows/block
+    (511, 7168),   # npt=1 odd n: last-block row 511 out of range -> warp early-return
+    (80, 7168),    # n <= 100 branch: BlockX=128 + cross-warp SMEM reduce
+    (128, 8200),   # npt=1: BlockX=128, BlockY=1 -> 1 row/block
+    (128, 16),     # npt=1: BlockX=2, BlockY=64, pure residual loop
+    (512, 1032),   # npt=1: BlockX=32, 2 main strides + residual vector
+    (512, 2056),   # npt=1: BlockX=32, 4 main strides + residual vector
+    (256, 4616),   # npt=1: BlockX=64, BlockY=2
+    (64, 4096),    # n <= 100 branch: BlockX=128, BlockY=1 (npt=1)
+    (897, 7168),   # npt=2 odd n: r2 row1 clamp + whole-warp early-return tail
+    (1537, 7168),  # npt=2 odd n: r2 tail on a deeper grid
+    (1024, 7168),  # npt=2 even n: r2, grid divides evenly (no tail)
+]
 
 
 def make_inputs(m, n, k, mode='normal'):
@@ -122,7 +145,7 @@ def run_dispatch_case(m, n, k, expect_gemv):
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
         torch.cuda.synchronize()
-    saw_gemv = any('gemv_dense_bf16' in ev.key for ev in prof.key_averages())
+    saw_gemv = any('gemv_dense' in ev.key for ev in prof.key_averages())
     assert saw_gemv == expect_gemv, \
         f"dispatch mismatch: m={m}, n={n}, k={k}: gemv_kernel={saw_gemv}, expected={expect_gemv}"
     return diff
@@ -161,6 +184,30 @@ def test_random_loop() -> None:
         k = 8 * random.randint(1, 1024)
         worst = max(worst, run_accuracy(1, n, k))
     print(f'  worst calc_diff={worst:.2e}  Passed')
+    print('Passed\n')
+
+
+def test_m2_loop() -> None:
+    print('Testing m == 2 dual-accumulator GEMV:')
+    worst = 0.0
+    for n, k in M2_CASES:
+        diff = run_accuracy(2, n, k)
+        worst = max(worst, diff)
+        print(f'  2x{n}x{k}: calc_diff={diff:.2e}  Passed')
+    print(f'  worst calc_diff={worst:.2e}')
+
+    # Repeat determinism (both rows bit-exact across calls)
+    x, w = make_inputs(2, 512, 7168)
+    out = torch.empty((2, 512), device='cuda', dtype=torch.bfloat16)
+    ref = None
+    for i in range(3):
+        deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+        torch.cuda.synchronize()
+        if ref is None:
+            ref = out.clone()
+        else:
+            assert torch.equal(out, ref), f"m=2 repeat call {i} produced different output"
+    print('  3 calls bit-exact  Passed')
     print('Passed\n')
 
 
@@ -208,6 +255,10 @@ def run_bypass_cases() -> None:
     run_env_kill_case()
     print('Passed\n')
 
+    print('Testing DG_DENSE_GEMV_M2_MAX_N gate override:')
+    run_m2_gate_env_case()
+    print('Passed\n')
+
 
 def run_explicit_config_case():
     """Explicit tile configs must bypass the GEMV fast path (tuning escape hatch)."""
@@ -234,6 +285,31 @@ def run_env_kill_case():
         del os.environ['DG_DISABLE_DENSE_GEMV']
     diff = calc_diff(out, ref)
     assert diff < 0.001, f"env-kill tile path failed: calc_diff={diff:.6f}"
+
+
+def run_m2_gate_env_case():
+    """DG_DENSE_GEMV_M2_MAX_N lifts the m == 2 n-gate (scan/tuning escape hatch).
+
+    The full-grid m=2 scans rely on this mechanism to measure the GEMV path
+    above the default gate, so assert both routing (profiler) and accuracy.
+    """
+    x, w = make_inputs(2, 1024, 7168)
+    out = torch.empty((2, 1024), device='cuda', dtype=torch.bfloat16)
+    ref = x @ w.t()
+    os.environ['DG_DENSE_GEMV_M2_MAX_N'] = '4096'
+    try:
+        deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+        torch.cuda.synchronize()
+        diff = calc_diff(out, ref)
+        assert diff < 0.001, f"m=2 gate-override accuracy failed: calc_diff={diff:.6f}"
+        from torch.profiler import profile, ProfilerActivity
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+            torch.cuda.synchronize()
+        saw_gemv = any('gemv_dense' in ev.key for ev in prof.key_averages())
+        assert saw_gemv, "DG_DENSE_GEMV_M2_MAX_N failed to lift the m=2 gate"
+    finally:
+        del os.environ['DG_DENSE_GEMV_M2_MAX_N']
 
 
 def run_benchmark():
@@ -265,9 +341,9 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    parser = argparse.ArgumentParser(description='Dense GEMV (m == 1) fast-path tests.')
+    parser = argparse.ArgumentParser(description='Dense GEMV (m == 1 / m == 2) fast-path tests.')
     parser.add_argument('--func', default=None, nargs='*',
-                        choices=['Dispatch', 'Ladder', 'KTail', 'Random', 'Data', 'Repeat', 'Bypass'],
+                        choices=['Dispatch', 'Ladder', 'KTail', 'Random', 'M2', 'Data', 'Repeat', 'Bypass'],
                         help='target test funcs (default: all)')
     parser.add_argument('--benchmark', default=False, action='store_true')
     parser.add_argument('--verbose', default=False, action='store_true')
@@ -281,6 +357,7 @@ if __name__ == '__main__':
         'Ladder': test_ladder_loop,
         'KTail': test_k_tail_loop,
         'Random': test_random_loop,
+        'M2': test_m2_loop,
         'Data': test_data_loop,
         'Repeat': test_repeat_loop,
         'Bypass': run_bypass_cases,

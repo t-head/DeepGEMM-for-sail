@@ -146,18 +146,19 @@ std::tuple<int, int, int, int, int, bool> get_gemv_best_configs(int m, int n, in
     return std::make_tuple(BlockSize, ThreadPerN, NUM_UNROLL, SWZL_SIZE_M, NPerThread, SmallK);
 }
 
-// Dense GEMV (m == 1) launch-config selection. BlockX keys on
-// add_times = k / (16B / sizeof(bf16)) so the per-thread serial K chain stays
-// ~14 16B loads; BlockY = 128 / BlockX rows per block keep the grid dense.
-// Returns false when the shape/alignment is not covered or when the tile path
-// is faster; the caller falls back to the tile path.
-bool dense_gemv_select_configs(int n, int k, const void* w, const void* x,
-                               int& block_x, int& block_y, int& k_per_thread) {
+// Dense GEMV (m == 1 or 2) launch-config selection: BlockX keys on k/8, BlockY =
+// 128/BlockX. Returns false when uncovered or the tile path is faster (fall back).
+bool dense_gemv_select_configs(int m, int n, int k, const void* w, const void* x,
+                               int& block_x, int& block_y, int& k_per_thread, int& npt) {
     if (get_env<int>("DG_DISABLE_DENSE_GEMV", 0))
         return false;
-    // Too few output rows: the grid would idle most CUs; the tile path's BM=16
-    // padding loss is also small there.
-    if (n < 64 || k < 8)
+    // m == 2 tile gate: above this n the tile path wins despite ~8x wasted math
+    // (A/B: +9% at n=1536, -13% at n=4608). Env-tunable; lower than m == 1's 3072.
+    if (m == 2 && n > get_env<int>("DG_DENSE_GEMV_M2_MAX_N", 2048))
+        return false;
+    // Below this launch overhead dominates; tile pins BN=16 and loses on tiny n
+    // (n=12 k=7168: 9.60 vs GEMV 3.80 us, 2.5x). Env-tunable for A/B.
+    if (n < get_env<int>("DG_DENSE_GEMV_MIN_N", 8) || k < 8)
         return false;
     // bf16 + int4 (16B) vector loads: k must be a multiple of 8 elements and both
     // base pointers 16B aligned (rhs rows then stay aligned too, stride == k).
@@ -167,11 +168,23 @@ bool dense_gemv_select_configs(int n, int k, const void* w, const void* x,
     if ((reinterpret_cast<uintptr_t>(w) & 0xF) != 0 || (reinterpret_cast<uintptr_t>(x) & 0xF) != 0)
         return false;
 
-    // Performance gate: the tile path beats the SIMT kernel in
-    // the large-n x large-k corner; thresholds from 4900-case one-shot scans.
+    // m == 2 rows-per-thread: npt=2 shares one (x0,x1) pair over two W rows, cutting
+    // x traffic to m == 1 level. n>512 && k>=2048 -> npt=2 else 1; m == 1 untouched.
+    constexpr int kM2NptGateN = 512;
+    constexpr int kM2NptGateK = 2048;
+    npt = (m == 2 && n > kM2NptGateN && k >= kM2NptGateK) ? 2 : 1;
+    // DG_DENSE_GEMV_M2_NPT: force npt to 1 or 2 for A/B sweeps (ignored at m==1).
+    if (m == 2) {
+        const int npt_override = get_env<int>("DG_DENSE_GEMV_M2_NPT", 0);
+        if (npt_override == 1 || npt_override == 2)
+            npt = npt_override;
+    }
+
+    // m == 1 tile gate: in the large-n x large-k corner SIMT FMA loses to tile
+    // (~1.81 vs 1.87 TB/s). 4900-case scans put the crossover at n>=2944 && k>=3584.
     constexpr int kGemvTileGateN = 3072;
     constexpr int kGemvTileGateK = 3584;
-    if (n >= kGemvTileGateN && k >= kGemvTileGateK)
+    if (m == 1 && n >= kGemvTileGateN && k >= kGemvTileGateK)
         return false;
 
     k_per_thread = 2;
