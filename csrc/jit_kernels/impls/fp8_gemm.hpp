@@ -175,11 +175,11 @@ public:
 
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
-        std::string gemm_type, kKernelType, kernel_name;
-        bool kEnableSboOverlap;
+        std::string gemm_type, kernel_type, kernel_name;
+        bool enable_sbo_overlap;
         // Only meaningful for `GemmType::BatchGemm`. `true` keeps the transposed `[M, B, N]`
         // output used by `einsum("bhr,hdr->bhd")`; `false` emits a plain `[B, M, N]` output.
-        bool kTransposedBatchOutput = true;
+        bool transposed_batch_output = true;
     };
 
     // Main Arguments
@@ -384,7 +384,7 @@ __global__ void {13}(
             cute::get<1>(args.kernel_params.problem_shape), cute::get<2>(args.kernel_params.problem_shape),
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
-            args.launch_info.kKernelType, args.launch_info.kEnableSboOverlap, args.launch_info.kTransposedBatchOutput, args.launch_info.kernel_name,
+            args.launch_info.kernel_type, args.launch_info.enable_sbo_overlap, args.launch_info.transposed_batch_output, args.launch_info.kernel_name,
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
     }
 

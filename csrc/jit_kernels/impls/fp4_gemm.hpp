@@ -35,7 +35,7 @@ public:
         std::string gemm_type, kernel_name;
         bool hasBias;
         int n_expand;
-        bool kEnableSboOverlap;
+        bool enable_sbo_overlap;
         // Epilogue selection. "Default" or "SiluAndMulPostQuantFp4"; apply_swiglu_limit only
         // matters for the fused epilogue.
         std::string epilogue_type = "Default";
@@ -421,7 +421,7 @@ __global__ void {}(
             args.launch_info.n, args.launch_info.k,
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
-            args.launch_info.kEnableSboOverlap, args.launch_info.hasBias, args.launch_info.n_expand,
+            args.launch_info.enable_sbo_overlap, args.launch_info.hasBias, args.launch_info.n_expand,
             args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit,
             args.launch_args.smem_size,
             fused_smem_guard,

@@ -56,7 +56,7 @@ public:
 
     struct LaunchInfo {
         int num_groups, num_stages, shape_n, shape_k;
-        std::string gemm_type, kKernelType, kernel_name;
+        std::string gemm_type, kernel_type, kernel_name;
         bool k_large_em;
     };
 

@@ -65,8 +65,8 @@ public:
 
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
-        std::string gemm_type, kKernelType, kernel_name;
-        bool kEnableSboOverlap;
+        std::string gemm_type, kernel_type, kernel_name;
+        bool enable_sbo_overlap;
     };
 
     struct GemmArguments {
@@ -288,7 +288,7 @@ __global__ void {12}(
             cute::get<1>(args.kernel_params.problem_shape), cute::get<2>(args.kernel_params.problem_shape),
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
-            args.launch_info.kKernelType, args.launch_info.kEnableSboOverlap, args.launch_info.kernel_name,
+            args.launch_info.kernel_type, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
     }
 
@@ -343,10 +343,10 @@ public:
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n;
         int warp_k;           // WARP_K tile size for K-dim split (= block_k / WarpOnK). Used in WarpShape as Int<WARP_K>.
-        bool kDenseS2Opt;
+        bool dense_s2_opt;
         int num_stages;
-        std::string gemm_type, kKernelType, kernel_name;
-        bool kEnableSboOverlap;
+        std::string gemm_type, kernel_type, kernel_name;
+        bool enable_sbo_overlap;
         bool overlap_prologue; // next-tile prologue overlap, enabled by host when wave > 3 (acblas parity)
     };
 
@@ -521,7 +521,7 @@ __global__ void {9}(
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.warp_k,
             args.launch_info.num_stages,
-            args.launch_info.kDenseS2Opt ? "true" : "false",
+            args.launch_info.dense_s2_opt ? "true" : "false",
             is_aligned_n ? "true" : "false",
             args.launch_info.kernel_name,
             args.launch_info.overlap_prologue ? "true" : "false",
@@ -575,10 +575,10 @@ public:
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n;
         int warp_k;           // WARP_K tile size for K-dim split (= block_k / WarpOnK). Used in WarpShape as Int<WARP_K>.
-        bool kDenseS2Opt;
+        bool dense_s2_opt;
         int num_stages;
-        std::string gemm_type, kKernelType, kernel_name;
-        bool kEnableSboOverlap;
+        std::string gemm_type, kernel_type, kernel_name;
+        bool enable_sbo_overlap;
         bool overlap_prologue;
     };
 
@@ -663,7 +663,7 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             info.gemm_type,
             info.block_m, info.block_n, info.block_k,
             info.warp_m, info.warp_n, info.warp_k, info.num_stages,
-            info.kDenseS2Opt ? "true" : "false",
+            info.dense_s2_opt ? "true" : "false",
             is_aligned_n ? "true" : "false",
             info.kernel_name,
             info.overlap_prologue ? "true" : "false");
@@ -683,7 +683,7 @@ public:
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages, shape_n, shape_k;
         std::string gemm_type, kernel_name;
-        bool kEnableSboOverlap;
+        bool enable_sbo_overlap;
     };
 
     struct ProblemVisitorParams {
@@ -795,7 +795,7 @@ __global__ void {}(
 )",
             args.launch_info.shape_n, args.launch_info.shape_k, args.launch_info.block_m, args.launch_info.block_n,
             args.launch_info.block_k, args.launch_info.num_groups, args.launch_info.warp_m, args.launch_info.warp_n,
-            args.launch_info.num_stages, args.launch_info.gemm_type, args.launch_info.kEnableSboOverlap,
+            args.launch_info.num_stages, args.launch_info.gemm_type, args.launch_info.enable_sbo_overlap,
             args.launch_info.kernel_name);
     }
 
@@ -982,7 +982,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
     hw_info.cu_count = num_sms_new;
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
-    bool kEnableSboOverlap = false;
+    bool enable_sbo_overlap = false;
     if (is_ppu1v5_device()) {
         // Dense GEMV fast path (m == 1): SIMT kernel avoids the tile path's
         // BM=16 padding (15/16 lane waste at m == 1).
@@ -1061,7 +1061,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             overlap_on ? "bf16_deep_gemm_cute_free_ovlp" : "bf16_deep_gemm_cute_free";
         auto args = DenseBF16GemmCuteFreeRuntime::Args{
             .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, /*dense_s2_opt=*/true, num_stages,
-                            "DenseGemm", "Default", cute_free_kernel_name, kEnableSboOverlap, overlap_on},
+                            "DenseGemm", "Default", cute_free_kernel_name, enable_sbo_overlap, overlap_on},
             .launch_args = {grid, block_cute_free, smem_cute_free},
             .kernel_params = params,
         };
@@ -1217,7 +1217,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
 
         auto args = BF16GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
                                                                   num_stages, "DenseGemm", "Default", "bf16_deep_gemm",
-                                                                  kEnableSboOverlap},
+                                                                  enable_sbo_overlap},
                                                   .launch_args = {grid, block, SMSIZE},
                                                   .kernel_params = params};
 
@@ -1293,7 +1293,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
 
         auto args =
             BF16GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, n,
-                                                  k, "DenseGemm", "bf16_deep_gemm", kEnableSboOverlap},
+                                                  k, "DenseGemm", "bf16_deep_gemm", enable_sbo_overlap},
                                   .launch_args = {grid, block, SMSIZE},
                                   .kernel_params = params};
 

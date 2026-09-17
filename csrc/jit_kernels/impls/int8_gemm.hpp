@@ -70,10 +70,10 @@ public:
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n;
         int warp_k;           // WARP_K tile size for K-dim split (= block_k / WarpOnK). Used in WarpShape as Int<WARP_K>.
-        bool kDenseS2Opt;
+        bool dense_s2_opt;
         int num_stages;
-        std::string gemm_type, kKernelType, kernel_name;
-        bool kEnableSboOverlap;
+        std::string gemm_type, kernel_type, kernel_name;
+        bool enable_sbo_overlap;
     };
 
     struct GemmArguments {
@@ -253,7 +253,7 @@ __global__ void {10}(
                        args.launch_info.warp_n,
                        args.launch_info.warp_k,
                        args.launch_info.num_stages,
-                       args.launch_info.kDenseS2Opt,
+                       args.launch_info.dense_s2_opt,
                        is_aligned_n ? "true" : "false",
                        args.launch_info.kernel_name,
                        hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
@@ -308,11 +308,11 @@ public:
 
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
-        std::string gemm_type, kKernelType, kernel_name;
-        bool kEnableSboOverlap;
+        std::string gemm_type, kernel_type, kernel_name;
+        bool enable_sbo_overlap;
         // Only meaningful for `GemmType::BatchGemm`. `true` keeps the transposed `[M, B, N]`
         // output used by `einsum("bhr,hdr->bhd")`; `false` emits a plain `[B, M, N]` output.
-        bool kTransposedBatchOutput = true;
+        bool transposed_batch_output = true;
     };
 
     struct GemmArguments {
@@ -539,8 +539,8 @@ __global__ void {14}(
                            cute::get<2>(args.kernel_params.problem_shape), args.launch_info.block_m,
                            args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
                            args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages,
-                           args.type_info, args.launch_info.kEnableSboOverlap, args.launch_info.kKernelType,
-                           args.launch_info.gemm_type, args.launch_info.kTransposedBatchOutput, args.launch_info.kernel_name,
+                           args.type_info, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_type,
+                           args.launch_info.gemm_type, args.launch_info.transposed_batch_output, args.launch_info.kernel_name,
                            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
     }
 
@@ -561,7 +561,7 @@ public:
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages, shape_n, shape_k;
         std::string gemm_type, kernel_name;
-        bool kEnableSboOverlap;
+        bool enable_sbo_overlap;
     };
 
     struct ProblemVisitorParams {
@@ -706,7 +706,7 @@ __global__ void {}(
                            args.launch_info.shape_n, args.launch_info.shape_k, args.launch_info.block_m,
                            args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
                            args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages,
-                           args.launch_info.kEnableSboOverlap, args.launch_info.gemm_type,
+                           args.launch_info.enable_sbo_overlap, args.launch_info.gemm_type,
                            args.launch_info.kernel_name);
     }
 

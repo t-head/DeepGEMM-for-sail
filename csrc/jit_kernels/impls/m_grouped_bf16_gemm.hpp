@@ -64,7 +64,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     hw_info.cu_count = num_sms_new;
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
-    bool kEnableSboOverlap = false;
+    bool enable_sbo_overlap = false;
     if (extra_info["use_actlize_v100"]) {
         const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{
             .mode = cutlass::gemm::GemmUniversalMode::kGemm,
@@ -86,7 +86,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
             BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
         auto args = BF16GemmCutlass3Runtime::Args{
             .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "GroupedContiguous",
-                            "Default", "bf16_grouped_deep_gemm_contiguous", kEnableSboOverlap},
+                            "Default", "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap},
             .launch_args = {grid, block, SMSIZE},
             .kernel_params = params};
         const auto& code = BF16GemmCutlass3Runtime::generate(args);
@@ -160,7 +160,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
 
         auto args = BF16GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
                                                           num_stages, n, k, "GroupedContiguous",
-                                                          "bf16_grouped_deep_gemm_contiguous", kEnableSboOverlap},
+                                                          "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap},
                                           .launch_args = {grid, block, SMSIZE},
                                           .kernel_params = params};
 
@@ -560,7 +560,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
     hw_info.cu_count = num_sms_new;
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
-    bool kEnableSboOverlap = false;
+    bool enable_sbo_overlap = false;
     at::Tensor m_rows_tensor;
 
     if (!m_rows.has_value() || !m_rows->defined()) {
@@ -699,7 +699,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
 
         auto args =
             BF16GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, n,
-                                                  k, "GroupedNoPad", "bf16_grouped_deep_gemm_NoPad", kEnableSboOverlap},
+                                                  k, "GroupedNoPad", "bf16_grouped_deep_gemm_NoPad", enable_sbo_overlap},
                                   .launch_args = {grid, block, SMSIZE},
                                   .kernel_params = params};
 
