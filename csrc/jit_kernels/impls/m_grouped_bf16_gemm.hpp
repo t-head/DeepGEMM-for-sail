@@ -99,7 +99,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      grouped_layout, (hggcStream_t)0);
+                                      grouped_layout, current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -174,7 +174,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      grouped_layout, (hggcStream_t)0);
+                                      grouped_layout, current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -279,7 +279,7 @@ static std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const to
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      grouped_layout, (hggcStream_t)0);
+                                      grouped_layout, current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -354,7 +354,7 @@ static std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const to
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      grouped_layout, (hggcStream_t)0);
+                                      grouped_layout, current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -409,7 +409,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
     int* layout_info = reinterpret_cast<int32_t*>(m_indices.data_ptr<int32_t>());
     if (use_gemv) {
         DgProfParam dg_prof_params;
-        hggcStream_t stream = (hggcStream_t)0;
+        hggcStream_t stream = current_stream();
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(GemmType::GroupedNoPad, true, std::string("bf16"), num_groups, m, n, k, expected_m,
                                       layout_info, stream);
@@ -637,7 +637,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      m_rows_tensor.data_ptr<int32_t>(), (hggcStream_t)0);
+                                      m_rows_tensor.data_ptr<int32_t>(), current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -713,7 +713,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      m_rows_tensor.data_ptr<int32_t>(), (hggcStream_t)0);
+                                      m_rows_tensor.data_ptr<int32_t>(), current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 

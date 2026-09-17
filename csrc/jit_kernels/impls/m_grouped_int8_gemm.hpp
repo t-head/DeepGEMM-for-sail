@@ -352,7 +352,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, expected_m, grouped_layout,
-                                      (hggcStream_t)0);
+                                      current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -432,7 +432,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("int8"), kNumGroups, m, n, k, expected_m,
-                                      grouped_layout, (hggcStream_t)0);
+                                      grouped_layout, current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -624,7 +624,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, expected_m, grouped_layout,
-                                      (hggcStream_t)0);
+                                      current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -671,7 +671,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, expected_m, grouped_layout,
-                                      (hggcStream_t)0);
+                                      current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -751,7 +751,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("int8"), kNumGroups, m, n, k, expected_m,
-                                      grouped_layout, (hggcStream_t)0);
+                                      grouped_layout, current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -805,7 +805,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     int* layout_info = reinterpret_cast<int32_t*>(m_indices.data_ptr<int32_t>());
     if (use_gemv) {
         DgProfParam dg_prof_params;
-        hggcStream_t stream = (hggcStream_t)0;
+        hggcStream_t stream = current_stream();
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(GemmType::GroupedNoPad, true, std::string("int8"), num_groups, m, n, k, expected_m,
                                       layout_info, stream);
@@ -1054,7 +1054,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, expected_m, layout_info,
-                                      (hggcStream_t)0);
+                                      current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -1133,7 +1133,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("int8"), kNumGroups, m, n, k, expected_m,
-                                      m_rows_tensor.data_ptr<int32_t>(), (hggcStream_t)0);
+                                      m_rows_tensor.data_ptr<int32_t>(), current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 

@@ -6,6 +6,7 @@
 #include <hggc_runtime_api.h>
 #include <torch/version.h>
 #include <torch/torch.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include "../utils/exception.hpp"
 #include "../utils/lazy_init.hpp"
@@ -151,5 +152,13 @@ public:
 };
 
 inline auto device_runtime = LazyInit<DeviceRuntime>([](){ return std::make_shared<DeviceRuntime>(); });
+
+// The stream the caller (vLLM/SGLang) is currently on, as an HGGC handle. Torch hands it back
+// as `CUstream_st*` while HGGC takes `HGstream_st*` -- unrelated pointer types naming the same
+// object, so `reinterpret_cast` is the only well-formed conversion. Kept here instead of at every
+// launch site; after cudafy the two types coincide and the cast degenerates to a no-op.
+inline hggcStream_t current_stream() {
+    return reinterpret_cast<hggcStream_t>(at::cuda::getCurrentCUDAStream().stream());
+}
 
 } // namespace deep_gemm

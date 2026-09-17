@@ -220,7 +220,7 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_mqa_logits_params(dtype_tag, static_cast<int>(kernel_params.seq_len_q),
                                              static_cast<int>(kernel_params.seq_len_k), num_heads,
-                                             is_fp4 ? head_dim * 2 : head_dim, (hggcStream_t)0, is_avg);
+                                             is_fp4 ? head_dim * 2 : head_dim, current_stream(), is_avg);
         if (element_logits == "__ppu_bfloat16")
             dg_prof_params.add_params("logits_dtype", std::string("bf16"));
         if (element_weights == "__ppu_bfloat16")

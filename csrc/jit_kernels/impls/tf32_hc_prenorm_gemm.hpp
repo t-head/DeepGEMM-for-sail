@@ -109,7 +109,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& lhs, const torch::Tensor& 
 
     // NOTES: `LaunchRuntime::launch` always uses the default stream, so the zero-fill required by
     // the `atomicAdd` reduction must be ordered on that very stream
-    const auto& stream = (hggcStream_t)0;
+    const auto& stream = current_stream();
     if constexpr (reduce_splits) {
         DG_HGGC_RUNTIME_CHECK(
             hggcMemsetAsync(out.data_ptr(), 0, static_cast<size_t>(m) * n * sizeof(float), stream));

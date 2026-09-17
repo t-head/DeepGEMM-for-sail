@@ -148,7 +148,7 @@ public:
             return;
 
         const auto& kernel = kernel_runtime->kernel;
-        const auto& stream = (hggcStream_t)0;  // default stream
+        const auto& stream = current_stream();
         const LaunchArgs& launch_args = args.launch_args;
         auto config =
             construct_launch_config(kernel, stream, launch_args.smem_size, launch_args.grid_dim, launch_args.block_dim);

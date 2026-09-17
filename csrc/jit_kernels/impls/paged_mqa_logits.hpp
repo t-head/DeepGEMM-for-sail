@@ -248,7 +248,7 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
         dg_prof_params.set_paged_mqa_logits_params(
             dtype_tag, static_cast<int>(kernel_params.batch_size), next_n, num_heads,
             is_fp4 ? head_dim * 2 : head_dim,
-            reinterpret_cast<int*>(const_cast<uint32_t*>(kernel_params.context_lens)), (hggcStream_t)0, is_avg);
+            reinterpret_cast<int*>(const_cast<uint32_t*>(kernel_params.context_lens)), current_stream(), is_avg);
         if (element_logits == "__ppu_bfloat16")
             dg_prof_params.add_params("logits_dtype", std::string("bf16"));
         if (element_weights == "__ppu_bfloat16")

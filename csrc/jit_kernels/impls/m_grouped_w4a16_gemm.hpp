@@ -163,7 +163,7 @@ static void launch_w4a16_gemm(const W4A16LaunchInfo& info, W4A16Type w4a16_type,
     // NOTES: the occupancy query reports 0 once the dynamic shared memory passes the default 48 KiB cap,
     // so raise the cap first -- `compute_occupancy_for_kernel`, which `run` used, did the same. The
     // config built here is only wanted for that side effect; `Runtime::launch` builds its own.
-    construct_launch_config(kernel, (hggcStream_t)0, info.smem_size, args.launch_args.grid_dim,
+    construct_launch_config(kernel, current_stream(), info.smem_size, args.launch_args.grid_dim,
                             args.launch_args.block_dim);
     int blocks_per_cu = 0;
     hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, info.num_threads, info.smem_size);
@@ -178,10 +178,10 @@ static void launch_w4a16_gemm(const W4A16LaunchInfo& info, W4A16Type w4a16_type,
         if (gemm_type == GemmType::GroupedFused) {
             dg_prof_params.set_fused_moe_params(get_profiling_dtype_name(w4a16_type), std::string("group"),
                                                 info.num_groups, m, topk, info.n, info.k, m_rows_ptr,
-                                                (hggcStream_t)0);
+                                                current_stream());
         } else {
             dg_prof_params.set_params(gemm_type, false, get_profiling_dtype_name(w4a16_type), info.num_groups, m,
-                                      info.n, info.k, expected_m, m_rows_ptr, (hggcStream_t)0);
+                                      info.n, info.k, expected_m, m_rows_ptr, current_stream());
             dg_prof_params.add_params(std::string("quant_type"), std::string("group"));
         }
         dg_prof_params.add_params(std::string("group_size"), info.group_size);

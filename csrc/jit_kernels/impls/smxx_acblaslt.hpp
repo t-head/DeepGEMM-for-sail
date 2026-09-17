@@ -59,7 +59,7 @@ static void call_acblaslt_api(const acblasOperation_t& trans_a,
     const auto handle = device_runtime->get_acblaslt_handle();
     const auto workspace = device_runtime->get_acblaslt_workspace();
     const auto workspace_bytes = workspace.nbytes();
-    const auto stream = (hggcStream_t)0;  // default stream
+    const auto stream = current_stream();
 
     // Algorithm selection
     acblasLtMatmulPreference_t pref;

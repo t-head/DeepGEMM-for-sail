@@ -892,7 +892,7 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("bf16"), 1, m, n, k, 0, nullptr,
-                                  (hggcStream_t)0);
+                                  current_stream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
     DenseGemvRuntime::launch(runtime, args);
@@ -1092,13 +1092,12 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
         hparams.ldd = n;    // D is row-major MxN
         hparams.scheduler = DenseGemmTileSchedulerArguments{(uint32_t)m, (uint32_t)n, (uint32_t)k, nullptr};
 
-        const auto& stream = (hggcStream_t)0;
+        const auto& stream = current_stream();
         auto config = construct_launch_config(kernel, stream, smem_cute_free, grid_cute_free, block_cute_free);
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, nullptr,
-                                      (hggcStream_t)0);
+            dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, nullptr, stream);
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -1171,7 +1170,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             DgProfParam dg_prof_params;
             if (ProfilingInterface::Instance().get_op_info()) {
                 dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, nullptr,
-                                          (hggcStream_t)0);
+                                          current_stream());
             }
             ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -1230,7 +1229,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, grouped_layout,
-                                      (hggcStream_t)0);
+                                      current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -1307,7 +1306,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, grouped_layout,
-                                      (hggcStream_t)0);
+                                      current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 

@@ -135,7 +135,7 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, 0, nullptr,
-                                  (hggcStream_t)0);
+                                  current_stream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -272,7 +272,7 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, nullptr,
-                                      (hggcStream_t)0);
+                                      current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -350,7 +350,7 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, nullptr,
-                                      (hggcStream_t)0);
+                                      current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
