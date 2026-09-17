@@ -232,7 +232,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m, m_rows_tensor.data_ptr<int32_t>(),
-                                  (hggcStream_t)0);
+                                  current_stream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -443,7 +443,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, dyn_block.x, SMSIZE);
         dyn_args.launch_args.grid_dim.x *= blocks_per_cu;
 
-        hggcStream_t stream = (hggcStream_t)0;
+        hggcStream_t stream = current_stream();
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m,
@@ -539,7 +539,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
-    hggcStream_t stream = (hggcStream_t)0;
+    hggcStream_t stream = current_stream();
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {

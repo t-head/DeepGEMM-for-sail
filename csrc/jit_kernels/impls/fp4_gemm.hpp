@@ -655,7 +655,7 @@ static void fp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, 0, grouped_layout,
-                                  (hggcStream_t)0);
+                                  current_stream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 

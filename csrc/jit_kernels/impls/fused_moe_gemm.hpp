@@ -157,7 +157,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     // Profiling instrumentation
-    hggcStream_t stream = (hggcStream_t)0;
+    hggcStream_t stream = current_stream();
     int topk = m_sum / num_token;
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
@@ -415,7 +415,7 @@ static void m_grouped_gemm_perchannel_nt_fused_impl(
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     // Profiling instrumentation
-    hggcStream_t stream = (hggcStream_t)0;
+    hggcStream_t stream = current_stream();
     int topk = m_sum / num_token;
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
@@ -532,7 +532,7 @@ static void m_grouped_gemm_blkwise_nt_fused_impl(
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     // Profiling instrumentation
-    hggcStream_t stream = (hggcStream_t)0;
+    hggcStream_t stream = current_stream();
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_fused_moe_params(
