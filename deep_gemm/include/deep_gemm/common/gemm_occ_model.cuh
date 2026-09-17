@@ -195,6 +195,9 @@ struct GemmOccModel {
   static constexpr int kWePerCu       = 8;
   static constexpr int kVregPerWe     = kTotalVregPerCu / kWePerCu;
   static constexpr int kMaxWarpsPerWe = kMaxWarpsPerCu / kWePerCu;
+  // A single warp's VREG footprint must fit within one WE's VREG budget.
+  static_assert(kVregPerWarp <= kVregPerWe,
+                "per-warp VREG exceeds the per-WE budget; occupancy would be 0");
   static constexpr int kWarpsPerWe =
       cute::min(kMaxWarpsPerWe, kVregPerWe / kVregPerWarp);
   static_assert(kWePerCu * kWarpsPerWe >= kWarpsPerCta,
