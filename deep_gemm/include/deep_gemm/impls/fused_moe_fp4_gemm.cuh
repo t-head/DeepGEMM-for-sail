@@ -213,6 +213,8 @@ fp4_gemm_fused_moe_kernel_impl(const Fp4QuantGemmArgs args) {
     constexpr uint32_t ACP_SFA_ITER = ceil_div(NumThreads_Needed, BLOCK_SIZE);
     static_assert(32 % ScaleKsPerTile == 0,
                   "ScaleKsPerTile must divide the warp size for the lane-on-k sfa g2s mapping.");
+    // Whether the flattened thread mapping overshoots BLOCK_M rows (tail threads that must not write smem).
+    constexpr bool kSfaHasTail = (NumThreads_Needed % BLOCK_SIZE) != 0;
     // one warp group (2 warps, 64 threads) covers `64 / ScaleKsPerTile` rows of m,
     // the 2 warps in a group interleave on m (even/odd) to avoid tsm bank conflict of contiguous 2B in the same bank.
     uint32_t parity = warp_idx & 1;
@@ -223,7 +225,7 @@ fp4_gemm_fused_moe_kernel_impl(const Fp4QuantGemmArgs args) {
     constexpr uint32_t tid_m_block_offset = BLOCK_SIZE / ScaleKsPerTile;
 
     using SmemLayoutSFA = typename MockMainloopFp4::SmemLayoutSFA;
-    auto copy_SFA_to_tsm = [&](int pipe_write, uint32_t k_idx, const int* blk_token_base, const uint32_t* token_offsets = nullptr) {
+    auto copy_SFA_to_tsm = [&](int pipe_write, uint32_t k_idx, const uint32_t* token_offsets, const bool* row_valid) {
       bool k_valid = true;
       if constexpr (!kAligned) {
         k_valid = ((k_idx * ScaleKsPerTile + tid_k) < ShapeScaleKs);
@@ -232,11 +234,21 @@ fp4_gemm_fused_moe_kernel_impl(const Fp4QuantGemmArgs args) {
       for(uint32_t idx = 0; idx < ACP_SFA_ITER; idx++) {
         uint32_t tid_m = tid_m_base + idx * tid_m_block_offset;
         uint32_t token_offset = token_offsets[idx];
-        bool token_mask = token_offset < shape_m && k_valid;
         SrcSFT* src_ptr = (SrcSFT*)args.scale_a_ptr + (tid_k + k_idx * ScaleKsPerTile) + token_offset * ShapeScaleKs;
         SrcSFT* dst_ptr = (SrcSFT*)smem_sfa + SmemLayoutSFA{}(make_coord(make_coord(tid_m % 64, tid_m / 64), tid_k, pipe_write));
-        if (token_mask) {
-          // acp b16 does not have zfill field.
+        // acp b16 does not have zfill field.
+        if constexpr (!kAligned) {
+          // k tail is data-dependent on k_idx, so this path must stay predicated.
+          bool token_mask = row_valid[idx] && k_valid;
+          asm volatile(".reg .pred p; ppu.cmpp.ne.b32 p, %2, 0; @p ppu.cp.async.cg.shared.global [%0], [%1], 2;" : : "r"(dst_ptr), "l"(src_ptr), "r"(token_mask));
+        } else if constexpr (kSfaHasTail) {
+          // src is clamped in-bounds per block; only tail threads (tid_m past BLOCK_M) must skip the
+          // smem write. The guard is token/k-independent.
+          bool m_in_range = tid_m < ScaleMsPerTile;
+          asm volatile(".reg .pred p; ppu.cmpp.ne.b32 p, %2, 0; @p ppu.cp.async.cg.shared.global [%0], [%1], 2;" : : "r"(dst_ptr), "l"(src_ptr), "r"(m_in_range));
+        } else {
+          // Aligned, no tail: every (clamped) row is safe to read and write -> unconditional copy,
+          // no emask on the async engine.
           asm volatile("ppu.cp.async.cg.shared.global [%0], [%1], 2;" : : "r"(dst_ptr), "l"(src_ptr));
         }
       }
@@ -333,6 +345,9 @@ fp4_gemm_fused_moe_kernel_impl(const Fp4QuantGemmArgs args) {
     TileScheduler deep_scheduler(args.aligned_num_m_blocks, args.expert_ids_and_cumsum);
 
     uint32_t token_offsets[ACP_SFA_ITER];
+    // SFA g2s predicate, precomputed once per block: a token_offset of `shape_m` marks either a
+    // padding row (sorted_token_ids sentinel) or a tail thread past BLOCK_M.
+    bool sfa_row_valid[ACP_SFA_ITER];
     #pragma clang loop licm(disable)
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
       auto blk_coord_mnkl = make_coord(m_block_idx, n_block_idx, _, _1{});
@@ -344,7 +359,10 @@ fp4_gemm_fused_moe_kernel_impl(const Fp4QuantGemmArgs args) {
       for(uint32_t idx = 0; idx < ACP_SFA_ITER; idx++) {
         uint32_t tid_m = tid_m_base + idx * tid_m_block_offset;
         // M block predicate: `NumThreads_Needed` may not be a multiple of BLOCK_SIZE, guard the tail iteration
-        token_offsets[idx] = tid_m < ScaleMsPerTile ? __ldg(blk_token_base + tid_m) : shape_m;
+        uint32_t raw_offset = tid_m < ScaleMsPerTile ? __ldg(blk_token_base + tid_m) : shape_m;
+        sfa_row_valid[idx] = raw_offset < shape_m;
+        // Clamp padding/tail rows to a valid in-bounds row (row 0) so the aligned hot path can copy unconditionally
+        token_offsets[idx] = sfa_row_valid[idx] ? raw_offset : 0u;
       }
 
       // gmem_b in block
@@ -369,7 +387,7 @@ fp4_gemm_fused_moe_kernel_impl(const Fp4QuantGemmArgs args) {
               tAsA(_,_,_,k_pipe), args.a_ptr,
               blk_token_base, BLOCK_K * k_tile_iter, shape_m, thread_idx);
           copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,k_pipe), warp_idx);
-          copy_SFA_to_tsm(k_pipe, k_tile_iter, blk_token_base, token_offsets);
+          copy_SFA_to_tsm(k_pipe, k_tile_iter, token_offsets, sfa_row_valid);
           if (warp_idx == 1) {
             copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,k_tile_iter), tSFBsSFB(_,_,_,k_pipe));
           }
@@ -429,7 +447,7 @@ fp4_gemm_fused_moe_kernel_impl(const Fp4QuantGemmArgs args) {
               tAsA(_,_,_,smem_pipe_write), args.a_ptr,
               blk_token_base, BLOCK_K * k_tile_iter, shape_m, thread_idx);
             copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,smem_pipe_write), warp_idx);
-            copy_SFA_to_tsm(smem_pipe_write, k_tile_iter, blk_token_base, token_offsets);
+            copy_SFA_to_tsm(smem_pipe_write, k_tile_iter, token_offsets, sfa_row_valid);
             if (warp_idx == 1) {
               copy(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,k_tile_iter), tSFBsSFB(_,_,_,smem_pipe_write));
             }
