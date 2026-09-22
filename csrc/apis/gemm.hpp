@@ -859,7 +859,8 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
     const std::string& compiled_dims = "nk",
     std::optional<torch::Tensor> out_scale = std::nullopt,
     std::optional<float> swiglu_limit = std::nullopt,
-    std::optional<ConfigTuple> configs = std::nullopt) {
+    std::optional<ConfigTuple> configs = std::nullopt,
+    std::optional<std::string> activation_type = std::nullopt) {
 
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
@@ -905,6 +906,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
         DG_HOST_ASSERT(!(bias.has_value() && bias->defined() && bias->numel() > 0));
     } else {
         DG_HOST_ASSERT(!swiglu_limit.has_value() || *swiglu_limit == 0.0f);  // only used with out_scale
+        DG_HOST_ASSERT(!activation_type.has_value());                        // only used with out_scale
         DG_HOST_ASSERT(n_ == n);
         DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     }
@@ -947,7 +949,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
     if (arch_major == 8) {
         m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(lhs, lhs_scales_t, rhs, rhs_scales_t, bias_tensor, d,
                                                     m_indices, m_rows_tensor, m, n, k, num_groups, configs,
-                                                    out_scale_tensor, swiglu_limit.value_or(0.0f));
+                                                    out_scale_tensor, swiglu_limit.value_or(0.0f), activation_type.value_or("silu_and_mul"));
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -1129,7 +1131,8 @@ void m_grouped_gemm_fp4_fp4_bf16_nt_fused(
     const torch::Tensor& aligned_num_m_blocks,
     FusedCommonConfigTuple configs,
     std::optional<torch::Tensor> out_scale = std::nullopt,
-    std::optional<float> swiglu_limit = std::nullopt) {
+    std::optional<float> swiglu_limit = std::nullopt,
+    std::optional<std::string> activation_type = std::nullopt) {
 
     const auto& lhs = lhs_.first;
     const auto& lhs_scales = lhs_.second;
@@ -1194,6 +1197,8 @@ void m_grouped_gemm_fp4_fp4_bf16_nt_fused(
         TORCH_CHECK(
             !swiglu_limit.has_value() || swiglu_limit_value == 0.0f,
             "swiglu_limit is only used when out_scale is not None.");
+        TORCH_CHECK(!activation_type.has_value(),
+            "activation_type is only used when out_scale is not None.");
         TORCH_CHECK(n_out == n, "n_=", n_out, ", expected ", n);
         DG_HOST_ASSERT(out.scalar_type() == torch::kBFloat16);
         TORCH_CHECK(n % 2 == 0, "n (", n, ") must be divisible by 2.");
@@ -1210,7 +1215,7 @@ void m_grouped_gemm_fp4_fp4_bf16_nt_fused(
     m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
         lhs, lhs_scales, rhs, rhs_scales, out, m_rows, expert_ids_and_cumsum,
         sorted_token_ids, aligned_num_m_blocks, configs, out_scale_tensor,
-        swiglu_limit_value);
+        swiglu_limit_value, activation_type.value_or("silu_and_mul"));
 
     if (enable_act_and_quant_fusing) {
         out_scale_tensor.as_strided_({sfm, sfn}, {1, sfm});
@@ -1234,7 +1239,8 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
     std::optional<const torch::Tensor> signal = std::nullopt,
     std::optional<torch::Tensor> out_scale = std::nullopt,
     std::optional<float> swiglu_limit = std::nullopt,
-    std::optional<ConfigTuple> configs = std::nullopt) {
+    std::optional<ConfigTuple> configs = std::nullopt,
+    std::optional<std::string> activation_type = std::nullopt) {
 
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
@@ -1294,6 +1300,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
         DG_HOST_ASSERT(!(bias.has_value() && bias->defined() && bias->numel() > 0));
     } else {
         DG_HOST_ASSERT(!swiglu_limit.has_value() || *swiglu_limit == 0.0f);  // only used with out_scale
+        DG_HOST_ASSERT(!activation_type.has_value());                        // only used with out_scale
         DG_HOST_ASSERT(n_ == n);
         DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     }
@@ -1337,7 +1344,8 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
                                                      max_block_n.value_or(256), enable_sbo_overlap.value_or(false),
                                                      signal_tensor,
                                                      out_scale_tensor,
-                                                     swiglu_limit.value_or(0.0f));
+                                                     swiglu_limit.value_or(0.0f),
+                                                     activation_type.value_or("silu_and_mul"));
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -1639,9 +1647,12 @@ When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the
 `preprocess_mxfp4_weight_for_act_and_quant_fusing` (instead of `preprocess_mxfp4_scales`), so
 that the epilogue reads gate/up (W1/W3) pairs from adjacent N positions.
 
-`swiglu_limit > 0` clamps before the activation: the gate is clamped from above only
-(`min(gate, limit)`) and the up projection on both sides (`clamp(up, -limit, limit)`);
-`0.0` or None disables the clamp.
+`swiglu_limit > 0` clamps around the activation; `0.0` or None disables the clamp. The exact
+clamp order depends on `activation_type` (only used together with `out_scale`):
+  - `silu_and_mul` (default): clamp BEFORE the activation. The gate is clamped from above only
+    (`min(gate, limit)`) and the up projection on both sides (`clamp(up, -limit, limit)`).
+  - `silu_and_mul_step` (STEP models): silu FIRST, then clamp `silu(gate)` from above
+    (`min(silu(gate), limit)`); the up projection is still clamped to `[-limit, limit]`.
 
 Shape `n` must be a multiple of 64, and a bias is not supported in the fused mode.
 
@@ -1651,7 +1662,8 @@ layout (1, sfm) expected by the Gemm2 SFA reader. Unlike the masked variant, bot
 (sfm * sfn, 1, sfm). Passing an already re-strided `out_scale` back in is supported.)",
           py::arg("a"), py::arg("b"), py::arg("bias"), py::arg("d"), py::arg("m_indices"),
           py::arg("m_rows") = std::nullopt, py::arg("compiled_dims") = "nk",
-          py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt, py::arg("configs") = std::nullopt);
+          py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt, py::arg("configs") = std::nullopt,
+          py::arg("activation_type") = std::nullopt);
     m.def("m_grouped_gemm_fp4_fp4_bf16_nt_masked", &m_grouped_gemm_fp4_fp4_bf16_nt_masked,
           R"(MoE GroupedMasked FP4 GEMM.
 
@@ -1661,9 +1673,12 @@ When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the
 `preprocess_mxfp4_weight_for_act_and_quant_fusing` (before `preprocess_mxfp4_scales`), so
 that the epilogue reads gate/up (W1/W3) pairs from adjacent N positions.
 
-`swiglu_limit > 0` clamps before the activation: the gate is clamped from above only
-(`min(gate, limit)`) and the up projection on both sides (`clamp(up, -limit, limit)`);
-`0.0` or None disables the clamp.
+`swiglu_limit > 0` clamps around the activation; `0.0` or None disables the clamp. The exact
+clamp order depends on `activation_type` (only used together with `out_scale`):
+  - `silu_and_mul` (default): clamp BEFORE the activation. The gate is clamped from above only
+    (`min(gate, limit)`) and the up projection on both sides (`clamp(up, -limit, limit)`).
+  - `silu_and_mul_step` (STEP models): silu FIRST, then clamp `silu(gate)` from above
+    (`min(silu(gate), limit)`); the up projection is still clamped to `[-limit, limit]`.
 
 Shape `n` must be a multiple of 64, and a bias is not supported in the fused mode.
 
@@ -1677,7 +1692,8 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
           py::arg("max_block_n") = 256,
           py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt,
-          py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt, py::arg("configs") = std::nullopt);
+          py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt, py::arg("configs") = std::nullopt,
+          py::arg("activation_type") = std::nullopt);
     // W4A16 / W4FA16 GEMMs
     m.def("m_grouped_gemm_w4a16_nopad", &m_grouped_gemm_w4a16_nopad, py::arg("lhs"), py::arg("rhs_"),
           py::arg("out"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt,
@@ -1707,7 +1723,8 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
           py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),
           py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
           py::arg("aligned_num_m_blocks"), py::arg("configs"),
-          py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt);
+          py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt,
+          py::arg("activation_type") = std::nullopt);
     // moe_align preprocessing (C++ JIT)
     m.def("moe_align_block_size", &moe_align_block_size,
           py::arg("lhs"), py::arg("rhs"), py::arg("topk_ids"),

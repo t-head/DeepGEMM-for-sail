@@ -11,9 +11,10 @@ namespace deep_gemm {
 enum class EpilogueType {
     Default,
     SiluAndMulPostQuantFp4,
+    SiluAndMulStepPostQuantFp4,    // STEP Models
 };
 
-inline constexpr const char* EpilogueTypeS[] = { "Default", "SiluAndMulPostQuantFp4"};
+inline constexpr const char* EpilogueTypeS[] = { "Default", "SiluAndMulPostQuantFp4", "SiluAndMulStepPostQuantFp4"};
 
 template <EpilogueType T>
 struct EpilogueTraits {
@@ -49,5 +50,17 @@ struct EpilogueTraits<EpilogueType::SiluAndMulPostQuantFp4> {
         return math::ceil_div(shape_n / kOutElemsPerByte, kQuantGroupSize);
     }
 };
+
+template <>
+struct EpilogueTraits<EpilogueType::SiluAndMulStepPostQuantFp4>: EpilogueTraits<EpilogueType::SiluAndMulPostQuantFp4> {};
+
+// The fused activation + mxfp4 post-quant epilogue is shared by every activation variant
+// (currently plain swiglu and the STEP silu-then-clamp variant, and any future activation types).
+// Any host/device code that selects the fused epilogue path must treat all of them alike -- only
+// the in-epilogue activation math differs
+__device__ __host__ constexpr bool is_act_and_quant_fused(EpilogueType t) {
+    return t == EpilogueType::SiluAndMulPostQuantFp4
+        || t == EpilogueType::SiluAndMulStepPostQuantFp4;
+}
 
 } // namespace deep_gemm

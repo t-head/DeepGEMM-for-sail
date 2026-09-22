@@ -5,7 +5,7 @@ from typing import Tuple
 import deep_gemm
 from deep_gemm import preprocess_mxfp4_scales, moe_align_block_size
 from math_utils import ceil_div, calc_diff
-from utils import construct, check_signal, construct_group_m_list, get_ref_backend, find_next_power_of_2
+from utils import construct, check_signal, construct_group_m_list, get_ref_backend, find_next_power_of_2, silu_and_mul_post_quant_torch
 from utils import construct_contiguous_grouped as construct_nopad_base
 from utils import construct_grouped_masked as construct_masked_base
 import argparse
@@ -253,6 +253,7 @@ def test_gemm_loop(m: int = None, n: int = None, k: int = None) -> None:
 
 def test_m_grouped_gemm_masked_silu_and_mul_post_quant(args) -> None:
     num_groups, m, n, k, distribution, swiglu_limit = args['groups'], args['m'], args['n'], args['k'], args['distribution'], args['swiglu_limit']
+    activation_type = args.get('activation_type', 'silu_and_mul')
     enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
 
     expected_m_per_group = ceil_div(m, num_groups)
@@ -261,16 +262,14 @@ def test_m_grouped_gemm_masked_silu_and_mul_post_quant(args) -> None:
     from deep_gemm import preprocess_mxfp4_weight_for_act_and_quant_fusing
     weight_scale = y[1].contiguous().view(torch.uint8)
     y_interleave = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y[0], weight_scale=weight_scale)
-    result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y_interleave, bias, out, masked_m, expected_m_per_group, enable_sbo_overlap=enable_sbo_overlap, signal=signal, out_scale=out_scale, swiglu_limit=swiglu_limit)
+    result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
+        x, y_interleave, bias, out, masked_m, expected_m_per_group,
+        enable_sbo_overlap=enable_sbo_overlap, signal=signal, out_scale=out_scale,
+        swiglu_limit=swiglu_limit, activation_type=activation_type)
 
     ### Reference
-    if swiglu_limit > 0.0:
-        gate_clamped = torch.clamp(ref_out[:, :, :(ref_out.shape[-1]//2)], max=swiglu_limit)
-        up_clamped = torch.clamp(ref_out[:, :, (ref_out.shape[-1]//2):], min=-swiglu_limit, max=swiglu_limit)
-        silu = gate_clamped * torch.sigmoid(gate_clamped) * up_clamped
-    else:
-        silu = ref_out[:, :, :(ref_out.shape[-1]//2)] * torch.sigmoid(ref_out[:, :, :(ref_out.shape[-1]//2)]) * ref_out[:, :, (ref_out.shape[-1]//2):]
-    ref_quant_torch, ref_quant_scale_torch_ = quantize_fp4_torch(src_tensor=silu)
+    ref_quant_torch, ref_quant_scale_torch_ = silu_and_mul_post_quant_torch(
+        ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=activation_type)
     ref_quant_scale_torch = preprocess_mxfp4_scales(scale=ref_quant_scale_torch_)
 
     ### Check
@@ -297,9 +296,11 @@ def test_m_grouped_gemm_masked_silu_and_mul_post_quant_loop(num_groups: int = No
     print("Running default test suite...")
     for num_groups, expected_m_per_group in ((8, 31), (8, 256),):
         for k, n in ((4096, 4096), (8192, 4096), (1024, 4096), (4096, 4032),):
-            for swiglu_limit in (0.0, 10.0):
-                print(f"Testing with num_groups={num_groups}, m={num_groups * expected_m_per_group}, n={n}, k={k}")
-                args = {"groups": num_groups, "m": num_groups * expected_m_per_group, "n": n, "k": k, "distribution": "uniform", "swiglu_limit": swiglu_limit}
+            for swiglu_limit, activation_type in ((0.0, "silu_and_mul"),
+                                                  (10.0, "silu_and_mul"),
+                                                  (10.0, "silu_and_mul_step")):
+                print(f"Testing with num_groups={num_groups}, m={num_groups * expected_m_per_group}, n={n}, k={k}, {activation_type=}")
+                args = {"groups": num_groups, "m": num_groups * expected_m_per_group, "n": n, "k": k, "distribution": "uniform", "swiglu_limit": swiglu_limit, "activation_type": activation_type}
                 test_m_grouped_gemm_masked_silu_and_mul_post_quant(args)
     print("Passed\n")
         
@@ -396,6 +397,7 @@ def test_m_grouped_gemm_fused_loop(num_groups: int = None, m: int = None, n: int
 
 def test_m_grouped_gemm_fused_silu_and_mul_post_quant(args) -> None:
     num_groups, m, n, k, topk, distribution, swiglu_limit = args['groups'], args['m'], args['n'], args['k'], args['topk'], args['distribution'], args['swiglu_limit']
+    activation_type = args.get('activation_type', 'silu_and_mul')
     x, y, topk_ids, out, out_scale, ref_out = construct_grouped_fused(
         num_groups, m, k, n, topk, distribution, 1, enable_act_and_quant_fusing=True)
 
@@ -406,18 +408,14 @@ def test_m_grouped_gemm_fused_silu_and_mul_post_quant(args) -> None:
     config, m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, inv_perm, expert_ids = (
         moe_align_block_size(x[0], y[0], topk_ids, False, enable_act_and_quant_fusing=True)
     )
-    deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y_interleave, out, m_rows, expert_ids_and_cumsum,
-                                                   sorted_token_ids, aligned_num_m_blocks, config,
-                                                   out_scale=out_scale, swiglu_limit=swiglu_limit)
+    deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(
+        x, y_interleave, out, m_rows, expert_ids_and_cumsum, sorted_token_ids,
+        aligned_num_m_blocks, config, out_scale=out_scale, swiglu_limit=swiglu_limit,
+        activation_type=activation_type)
 
     ### Reference
-    if swiglu_limit > 0.0:
-        gate_clamped = torch.clamp(ref_out[:, :(ref_out.shape[-1]//2)], max=swiglu_limit)
-        up_clamped = torch.clamp(ref_out[:, (ref_out.shape[-1]//2):], min=-swiglu_limit, max=swiglu_limit)
-        silu = gate_clamped * torch.sigmoid(gate_clamped) * up_clamped
-    else:
-        silu = ref_out[:, :(ref_out.shape[-1]//2)] * torch.sigmoid(ref_out[:, :(ref_out.shape[-1]//2)]) * ref_out[:, (ref_out.shape[-1]//2):]
-    ref_quant_torch, ref_quant_scale_torch_ = quantize_fp4_torch(src_tensor=silu)
+    ref_quant_torch, ref_quant_scale_torch_ = silu_and_mul_post_quant_torch(
+        ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=activation_type)
     ref_quant_scale_torch = preprocess_mxfp4_scales(scale=ref_quant_scale_torch_)
 
     ### Check
@@ -445,14 +443,17 @@ def test_m_grouped_gemm_fused_silu_and_mul_post_quant_loop(num_groups: int = Non
         ### gemm1 shapes: n is 2 * intermediate_size (gate & up)
         for num_groups, topk, m in ((8, 8, 16), (8, 8, 256), (32, 4, 512)):
             for k, n in ((4096, 4096), (4096, 1024)):
-                for swiglu_limit in (0.0, 10.0):
-                    print(f"Testing with num_groups={num_groups}, m={m}, n={n}, k={k}, topk={topk}, {swiglu_limit=}")
-                    args = {"groups": num_groups, "m": m, "n": n, "k": k, "topk": topk, "distribution": "uniform", "swiglu_limit": swiglu_limit}
+                for swiglu_limit, activation_type in ((0.0, "silu_and_mul"),
+                                                      (10.0, "silu_and_mul"),
+                                                      (10.0, "silu_and_mul_step")):
+                    print(f"Testing with num_groups={num_groups}, m={m}, n={n}, k={k}, topk={topk}, {swiglu_limit=}, {activation_type=}")
+                    args = {"groups": num_groups, "m": m, "n": n, "k": k, "topk": topk, "distribution": "uniform", "swiglu_limit": swiglu_limit, "activation_type": activation_type}
                     test_m_grouped_gemm_fused_silu_and_mul_post_quant(args)
     print("Passed\n")
 
 def test_m_grouped_gemm_nopad_silu_and_mul_post_quant(args) -> None:
     num_groups, m, n, k, distribution, swiglu_limit = args['groups'], args['m'], args['n'], args['k'], args['distribution'], args['swiglu_limit']
+    activation_type = args.get('activation_type', 'silu_and_mul')
     bias = None
 
     m, x, y, m_indices, _, _ = construct_nopad_base(num_groups, m, k, n, torch.uint8, distribution, 1)
@@ -477,16 +478,13 @@ def test_m_grouped_gemm_nopad_silu_and_mul_post_quant(args) -> None:
     weight_scale = y[1].contiguous().view(torch.uint8)
     y_interleave = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y[0], weight_scale=weight_scale)
 
-    deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y_interleave, bias, out, m_indices, out_scale=out_scale, swiglu_limit=swiglu_limit)
+    deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
+        x, y_interleave, bias, out, m_indices, out_scale=out_scale,
+        swiglu_limit=swiglu_limit, activation_type=activation_type)
 
     ### Reference
-    if swiglu_limit > 0.0:
-        gate_clamped = torch.clamp(ref_out[:, :(ref_out.shape[-1]//2)], max=swiglu_limit)
-        up_clamped = torch.clamp(ref_out[:, (ref_out.shape[-1]//2):], min=-swiglu_limit, max=swiglu_limit)
-        silu = gate_clamped * torch.sigmoid(gate_clamped) * up_clamped
-    else:
-        silu = ref_out[:, :(ref_out.shape[-1]//2)] * torch.sigmoid(ref_out[:, :(ref_out.shape[-1]//2)]) * ref_out[:, (ref_out.shape[-1]//2):]
-    ref_quant_torch, ref_quant_scale_torch_ = quantize_fp4_torch(src_tensor=silu)
+    ref_quant_torch, ref_quant_scale_torch_ = silu_and_mul_post_quant_torch(
+        ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=activation_type)
     ref_quant_scale_torch = preprocess_mxfp4_scales(scale=ref_quant_scale_torch_)
 
     ### Check
@@ -509,9 +507,11 @@ def test_m_grouped_gemm_nopad_silu_and_mul_post_quant_loop(num_groups: int = Non
     # DPSKV4FLASH(N4096K4096E256TOPK6) DPSKV4PRO(N6144K7168E384TOPK6)
     for num_groups, expected_m_per_group in ((4, 256), ):
         for k, n in ((4096, 4096), ):
-            for swiglu_limit in (0.0, 10.0):
-                print(f"Testing with num_groups={num_groups}, m={num_groups * expected_m_per_group}, n={n}, k={k}")
-                args = {"groups": num_groups, "m": num_groups * expected_m_per_group, "n": n, "k": k, "distribution": "uniform", "swiglu_limit": swiglu_limit}
+            for swiglu_limit, activation_type in ((0.0, "silu_and_mul"),
+                                                  (10.0, "silu_and_mul"),
+                                                  (10.0, "silu_and_mul_step")):
+                print(f"Testing with num_groups={num_groups}, m={num_groups * expected_m_per_group}, n={n}, k={k}, {activation_type=}")
+                args = {"groups": num_groups, "m": num_groups * expected_m_per_group, "n": n, "k": k, "distribution": "uniform", "swiglu_limit": swiglu_limit, "activation_type": activation_type}
                 test_m_grouped_gemm_nopad_silu_and_mul_post_quant(args)
     print("Passed\n")
 

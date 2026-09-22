@@ -2,7 +2,7 @@ import torch
 import warnings
 from typing import Tuple, Optional
 
-from .gemm_fp4 import get_best_configs, get_smem_config_fp4, check_mxfp4_scales_layout, preprocess_mxfp4_scales, _post_preprocess_mxfp4_scales
+from .gemm_fp4 import get_best_configs, get_smem_config_fp4, check_mxfp4_scales_layout, preprocess_mxfp4_scales, _post_preprocess_mxfp4_scales, get_fp4_epilogue_type
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, GemmType, get_extra_info
 
@@ -79,7 +79,8 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
                                          m_indices: torch.Tensor, m_rows: torch.Tensor = None,
                                          configs = None,
                                          out_scale: Optional[torch.Tensor] = None,
-                                         swiglu_limit: Optional[float] = None) -> None:
+                                         swiglu_limit: Optional[float] = None,
+                                         activation_type: Optional[str] = None) -> None:
     """MoE GroupedNoPad FP4 GEMM.
 
     When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
@@ -88,9 +89,9 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     `preprocess_mxfp4_weight_for_act_and_quant_fusing` (instead of `preprocess_mxfp4_scales`), so
     that the epilogue reads gate/up (W1/W3) pairs from adjacent N positions.
 
-    `swiglu_limit > 0` clamps before the activation: the gate is clamped from above only
-    (`min(gate, limit)`) and the up projection on both sides (`clamp(up, -limit, limit)`);
-    `0.0` or None disables the clamp.
+    `swiglu_limit > 0` enables clamping; `activation_type` selects the ordering:
+    `silu_and_mul` clamps the gate before silu, while `silu_and_mul_step` clamps silu(gate)
+    afterwards. The up projection is clamped to `[-limit, limit]` in both variants.
 
     Shape `n` must be a multiple of 64, and a bias is not supported in the fused mode.
 
@@ -115,9 +116,11 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         assert out.dtype == torch.uint8 and out_scale.dtype == torch.uint16
         assert out_scale.is_contiguous() or check_mxfp4_scales_layout(scale=out_scale)
         assert bias is None, "bias not None is not supported in SiluAndMulPostQuant Epilogue."
-        epilogue_type, output_type = 'SiluAndMulPostQuantFp4', torch.uint8
+        epilogue_type = get_fp4_epilogue_type(activation_type or 'silu_and_mul')
+        output_type = torch.uint8
     else:
         assert swiglu_limit is None or swiglu_limit == 0.0, "swiglu_limit is only used when out_scale is not None."
+        assert activation_type is None, "activation_type is only used when out_scale is not None."
         assert n_ == n, f'{n_=}, expected {n}'
         out_scale = torch.empty(0, dtype=torch.uint16, device=out.device)
         assert out.dtype == torch.bfloat16
@@ -220,7 +223,8 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
                                           masked_m: torch.Tensor, expected_m: int, configs=None,
                                           enable_sbo_overlap: bool = False, signal: torch.Tensor = torch.empty(0).int(),
                                           out_scale: Optional[torch.Tensor] = None,
-                                          swiglu_limit: Optional[float] = None) -> None:
+                                          swiglu_limit: Optional[float] = None,
+                                          activation_type: Optional[str] = None) -> None:
     """MoE GroupedMasked FP4 GEMM.
 
     When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
@@ -229,9 +233,9 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     `preprocess_mxfp4_weight_for_act_and_quant_fusing` (instead of `preprocess_mxfp4_scales`), so
     that the epilogue reads gate/up (W1/W3) pairs from adjacent N positions.
 
-    `swiglu_limit > 0` clamps before the activation: the gate is clamped from above only
-    (`min(gate, limit)`) and the up projection on both sides (`clamp(up, -limit, limit)`);
-    `0.0` or None disables the clamp.
+    `swiglu_limit > 0` enables clamping; `activation_type` selects the ordering:
+    `silu_and_mul` clamps the gate before silu, while `silu_and_mul_step` clamps silu(gate)
+    afterwards. The up projection is clamped to `[-limit, limit]` in both variants.
 
     Shape `n` must be a multiple of 64, and a bias is not supported in the fused mode.
 
@@ -255,9 +259,11 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
         assert out.dtype == torch.uint8 and out_scale.dtype == torch.uint16
         assert out_scale.is_contiguous() or check_mxfp4_scales_layout(scale=out_scale)
         assert bias is None, "bias not None is not supported in SiluAndMulPostQuant Epilogue."
-        epilogue_type, output_type = 'SiluAndMulPostQuantFp4', torch.uint8
+        epilogue_type = get_fp4_epilogue_type(activation_type or 'silu_and_mul')
+        output_type = torch.uint8
     else:
         assert swiglu_limit is None or swiglu_limit == 0.0, "swiglu_limit is only used when out_scale is not None."
+        assert activation_type is None, "activation_type is only used when out_scale is not None."
         assert n_ == n, f'{n_=}, expected {n}'
         out_scale = torch.empty(0, dtype=torch.uint16, device=out.device)
         assert out.dtype == torch.bfloat16

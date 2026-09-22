@@ -106,7 +106,7 @@ struct Fp4FusedMoeEpilogue {
       cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
       cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>,
       OutputOp, cutlass::gemm::EpilogueDefault,
-      (SHAPE_N % BLOCK_N == 0), kApplySwigluLimit>;
+      (SHAPE_N % BLOCK_N == 0), kApplySwigluLimit, kEpilogueType>;
 
   static constexpr bool kEnabled = true;
   static constexpr uint32_t kSmemSize = uint32_t(CollectiveEpilogue::get_shared_storage_size(BLOCK_M, BLOCK_N));
@@ -612,7 +612,7 @@ public:
             // check src type
             std::string data_type = "fp4";
             dg_prof_params.set_fused_moe_params(
-                data_type, std::string("group"), kNumGroups, shape_m, topk, SHAPE_N, SHAPE_K,
+                data_type, std::string("group"), kNumGroups, shape_m, topk, SHAPE_N, SHAPE_K*2,
                 m_rows, stream
             );
             dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);

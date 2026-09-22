@@ -1098,7 +1098,7 @@ public:
                 StrideBias stride_Bias = {};
                 ElementD* converted_output = reinterpret_cast<ElementD*>(d_ptr);
                 typename Epilogue::Arguments arg_epilogue = [&]() -> auto {
-                  if constexpr (kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4) {
+                  if constexpr (is_act_and_quant_fused(kEpilogueType)) {
                     return typename Epilogue::Arguments{{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D}, sfd_ptr, shape_m, swiglu_limit};
                   } else {
                     return typename Epilogue::Arguments{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D};
@@ -1151,7 +1151,7 @@ public:
                 DgProfParam dg_prof_params;
                 if (ProfilingInterface::Instance().get_op_info()){
                     dg_prof_params.set_params(
-                        kGemmType, false, std::string("fp4"), kNumGroups, shape_m, ShapeN, ShapeK, expected_m,
+                        kGemmType, false, std::string("fp4"), kNumGroups, shape_m, ShapeN, ShapeK*2, expected_m,
                         grouped_layout, stream
                     );
                     dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
@@ -1268,7 +1268,8 @@ public:
             EpilogueOutputOp,
             cutlass::gemm::EpilogueDefault,
             IsAlignedN,
-            kApplySwigluLimit
+            kApplySwigluLimit,
+            kEpilogueType
           >;
 
           // CollectiveEpilogueNoTsm requires that N is divisible by 2
@@ -1276,7 +1277,7 @@ public:
             hasBias || (ShapeN % 2 != 0),
             CollectiveEpilogueWithTsm,
             typename cutlass::platform::conditional<
-              kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4,
+              is_act_and_quant_fused(kEpilogueType),
               CollectiveEpilogueSiluAndMulPostQuant,
               CollectiveEpilogueNoTsm
             >::type
@@ -1294,7 +1295,7 @@ public:
               kEpilogueType
           >;
 
-          if constexpr (kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4) {
+          if constexpr (is_act_and_quant_fused(kEpilogueType)) {
             // Epilogue reuse the shared storage comes from mainloop.
             // Make sure that the size of epilogue SharedStorage is less than Mainloop.
             static_assert(CollectiveEpilogueSiluAndMulPostQuant::get_shared_storage_size(BlockM, BlockN)
@@ -1336,7 +1337,7 @@ public:
           typename CollectiveEpilogue::Arguments epilogue_arguments = [&]() -> auto {
               if constexpr (hasBias || (ShapeN % 2 != 0)) {
                 return typename CollectiveEpilogueWithTsm::Arguments{{1.0, 0.0, nullptr, nullptr, c_ptr, stride_Bias}, nullptr, stride_C, converted_output, stride_D};
-              } else if constexpr (kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4) {
+              } else if constexpr (is_act_and_quant_fused(kEpilogueType)) {
                 return typename CollectiveEpilogueSiluAndMulPostQuant::Arguments{{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D}, sfd_ptr, shape_m, swiglu_limit};
               } else {
                 return typename CollectiveEpilogueNoTsm::Arguments{{1.0f, 0.0f}, c_ptr, stride_C, converted_output, stride_D};
@@ -1384,7 +1385,7 @@ public:
           DgProfParam dg_prof_params;
           if (ProfilingInterface::Instance().get_op_info()) {
               dg_prof_params.set_params(
-                  kGemmType, false, std::string("fp4"), kNumGroups, shape_m, ShapeN, ShapeK, expected_m,
+                  kGemmType, false, std::string("fp4"), kNumGroups, shape_m, ShapeN, ShapeK*2, expected_m,
                   grouped_layout, stream
               );
               dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);

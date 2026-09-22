@@ -752,3 +752,6 @@ self_design,[DeepGemm] --format=PagedMqaAvgLogits,data_type:fp8,batch_size:8,nex
 self_design,[DeepGemm] --format=SparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:1024,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:256,use_unaligned_ks:0,check_metadata:1
 self_design,[DeepGemm] --format=SparseMqaLogits,data_type:fp4,seq_len_q:9,seq_len_kv:639,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:128,use_unaligned_ks:1,check_metadata:1
 self_design,[DeepGemm] --format=PagedSparseMqaLogits,data_type:fp4,seq_len_q:313,seq_len_kv:1023,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,check_metadata:1
+step4_ep8,[DeepGemm] --format=GroupedNoPad,data_type:fp4,groups:44,m:2048,n:3072,k:4096,distribution:uniform,epilogue_type:SiluAndMulStepPostQuantFp4,swiglu_limit:7.0000
+step4_ep8,[DeepGemm] --format=GroupedFused,data_type:fp4,groups:44,num_token:256,topk:8,n:3072,k:4096,distribution:uniform,epilogue_type:SiluAndMulStepPostQuantFp4,swiglu_limit:7.0000
+step4_ep8,[DeepGemm] --format=GroupedMasked,data_type:fp4,groups:352,m:2048,n:3072,k:4096,em:256,distribution:uniform,epilogue_type:SiluAndMulStepPostQuantFp4,swiglu_limit:7.0000

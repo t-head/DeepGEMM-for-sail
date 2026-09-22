@@ -18,7 +18,8 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     const int& m, const int& n, const int& k, const int& num_groups,
     std::optional<ConfigTuple> configs = std::nullopt,
     const torch::Tensor& out_scale = torch::Tensor(),
-    float swiglu_limit = 0.0f) {
+    float swiglu_limit = 0.0f,
+    std::string activation_type = "silu_and_mul") {
     // When `out_scale` is provided, silu_and_mul + mxfp4 post-quant are fused into the epilogue.
     const bool enable_act_and_quant_fusing = out_scale.defined() && out_scale.numel() > 0;
     const bool hasBias = bias.numel() > 0;
@@ -41,7 +42,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
 
     int kNumGroups = num_groups;
     static constexpr GemmType kGemmType = GemmType::GroupedNoPad;
-    const EpilogueType kEpilogueType = enable_act_and_quant_fusing ? EpilogueType::SiluAndMulPostQuantFp4 : EpilogueType::Default;
+    const EpilogueType kEpilogueType = enable_act_and_quant_fusing ? get_epilogue_type(activation_type) : EpilogueType::Default;
 
     // N_EXPAND logic, keep in sync with m_grouped_gemm_fp4.py (nopad).
     // The fused epilogue requires n_expand == 1 (EpilogueTraits::is_valid_config).
@@ -154,7 +155,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     FP4GemmRuntime::Args args{};
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
                         n, k, "GroupedNoPad", "fp4_grouped_deep_gemm_nopad", hasBias, n_expand, false,
-                        enable_act_and_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
+                        EpilogueTypeS[static_cast<int>(kEpilogueType)],
                         enable_act_and_quant_fusing && swiglu_limit > 0.0f};
     args.launch_args = {grid, block, SMSIZE};
 
@@ -231,7 +232,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m, m_rows_tensor.data_ptr<int32_t>(), 
+        dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k*2, expected_m, m_rows_tensor.data_ptr<int32_t>(),
                                   current_stream());
         dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
         dg_prof_params.add_params("swiglu_limit", swiglu_limit);
@@ -271,7 +272,8 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     bool enable_sbo_overlap = false,
     const torch::Tensor& signal = torch::Tensor(),
     const torch::Tensor& out_scale = torch::Tensor(),
-    float swiglu_limit = 0.0f) {
+    float swiglu_limit = 0.0f,
+    std::string activation_type = "silu_and_mul") {
     // When `out_scale` is provided, silu_and_mul + mxfp4 post-quant are fused into the epilogue.
     const bool enable_act_and_quant_fusing = out_scale.defined() && out_scale.numel() > 0;
     const bool hasBias = bias.numel() > 0;
@@ -293,7 +295,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
 
     int kNumGroups = num_groups;
     static constexpr GemmType kGemmType = GemmType::GroupedMasked;
-    const EpilogueType kEpilogueType = enable_act_and_quant_fusing ? EpilogueType::SiluAndMulPostQuantFp4 : EpilogueType::Default;
+    const EpilogueType kEpilogueType = enable_act_and_quant_fusing ? get_epilogue_type(activation_type) : EpilogueType::Default;
 
     // N_EXPAND logic for masked, keep in sync with m_grouped_gemm_fp4.py (masked).
     // The fused epilogue requires n_expand == 1 (EpilogueTraits::is_valid_config).
@@ -383,7 +385,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         FP4DynamicTileRuntime::Args dyn_args{};
         dyn_args.launch_info = {n, k, kNumGroups, dynamic_tile_id, "GroupedMasked",
                                 "fp4_grouped_deep_gemm_masked_dynamic_tile",
-                                enable_act_and_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
+                                EpilogueTypeS[static_cast<int>(kEpilogueType)],
                                 enable_act_and_quant_fusing && swiglu_limit > 0.0f};
         // The dynamic-tile kernel's block shape is get_block_shape() == MaxThreadsPerBlock, which
         // varies per kDynamicTileId and is unrelated to the fixed 128x128 block config above.
@@ -447,7 +449,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m,
+            dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k*2, expected_m,
                                       grouped_layout, current_stream());
             dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
             dg_prof_params.add_params("swiglu_limit", swiglu_limit);
@@ -467,7 +469,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     FP4GemmRuntime::Args args{};
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
                         n, k, "GroupedMasked", "fp4_grouped_deep_gemm_masked", hasBias, n_expand, enable_sbo_overlap,
-                        enable_act_and_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
+                        EpilogueTypeS[static_cast<int>(kEpilogueType)],
                         enable_act_and_quant_fusing && swiglu_limit > 0.0f};
     args.launch_args = {grid, block, SMSIZE};
 
@@ -544,7 +546,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m, grouped_layout,
+        dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k*2, expected_m, grouped_layout,
                                   current_stream());
         dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
         dg_prof_params.add_params("swiglu_limit", swiglu_limit);
