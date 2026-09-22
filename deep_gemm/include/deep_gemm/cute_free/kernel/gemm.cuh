@@ -3,9 +3,9 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "cutlass/cutlass.h"
-#include "cutlass/arch/arch.h"
-#include "cutlass/arch/memory_ppu.h"
+#include <cutlass/cutlass.h>
+#include <cutlass/arch/arch.h>
+#include <cutlass/arch/memory_ppu.h>
 #include <deep_gemm/cute_free/arch/ppu_common.cuh>
 #include <deep_gemm/cute_free/mainloop/mainloop.cuh>
 #include <deep_gemm/cute_free/epilogue/warp_k_reduce.cuh>

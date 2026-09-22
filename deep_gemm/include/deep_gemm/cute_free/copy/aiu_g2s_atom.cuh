@@ -1,7 +1,7 @@
 #pragma once
 
 #include <type_traits>
-#include "cutlass/bfloat16.h"
+#include <cutlass/bfloat16.h>
 #include <deep_gemm/cute_free/arch/ppu_tc02_copy.cuh>
 #include <deep_gemm/cute_free/copy/copy_traits.cuh>
 

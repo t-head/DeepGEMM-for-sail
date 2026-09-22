@@ -2,11 +2,11 @@
 #include <cub/block/block_scan.cuh>
 #include <deep_gemm/common/utils_rtc.cuh>
 
-#include "cute/ppu_tensor_mix.hpp"
-#include "cutlass/gemm/config/gemm_operands.hpp"
-#include "cute/atom/copy_traits_ppu0010_aiu.hpp"
-#include "cute/atom/copy_traits_ppu0015_aiu.hpp"
-#include "cute/algorithm/ppu_copy.hpp"
+#include <cute/ppu_tensor_mix.hpp>
+#include <cutlass/gemm/config/gemm_operands.hpp>
+#include <cute/atom/copy_traits_ppu0010_aiu.hpp>
+#include <cute/atom/copy_traits_ppu0015_aiu.hpp>
+#include <cute/algorithm/ppu_copy.hpp>
 
 #include <deep_gemm/common/fused_gemm_common.cuh>
 

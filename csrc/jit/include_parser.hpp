@@ -28,9 +28,10 @@ class IncludeParser {
                 if (filename.substr(0, 9) == "deep_gemm")  // We only parse `<deep_gemm/*>`
                     includes.push_back(filename);
             } else {
-                // Silently skip non-angle-bracket includes (e.g., #include "...") and
-                // angle-bracket includes without deep_gemm/ prefix (e.g., standard library headers).
-                // Only <deep_gemm/*> includes are tracked for cache invalidation.
+                std::string error_info = fmt::format("Non-standard include: {}", include_str);
+                if (file_path != "")
+                    error_info += fmt::format(" ({})", file_path.string());
+                DG_HOST_UNREACHABLE(error_info);
             }
         }
         return includes;

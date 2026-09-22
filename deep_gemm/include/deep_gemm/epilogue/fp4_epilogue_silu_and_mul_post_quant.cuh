@@ -1,13 +1,13 @@
 #pragma once
 
-#include "cutlass/cutlass.h"
-#include "cutlass/gemm/dispatch_policy.hpp"
-#include "cutlass/epilogue/collective/detail.hpp"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
+#include <cutlass/cutlass.h>
+#include <cutlass/gemm/dispatch_policy.hpp>
+#include <cutlass/epilogue/collective/detail.hpp>
+#include <cutlass/epilogue/collective/default_epilogue.hpp>
 
-#include "cute/tensor.hpp"
-#include "cute/numeric/numeric_types.hpp"
-#include "cutlass/epilogue/thread/activation.h"
+#include <cute/tensor.hpp>
+#include <cute/numeric/numeric_types.hpp>
+#include <cutlass/epilogue/thread/activation.h>
 #include <deep_gemm/common/utils_rtc.cuh>
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

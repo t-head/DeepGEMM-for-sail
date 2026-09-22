@@ -8,21 +8,21 @@
 
 #include <iostream>
 
-#include "accutlass.h"
-#include "cutlass/array.h"
-#include "cutlass/numeric_conversion.h"
-#include "cutlass/tensor_ref.h"
+#include <accutlass.h>
+#include <cutlass/array.h>
+#include <cutlass/numeric_conversion.h>
+#include <cutlass/tensor_ref.h>
 
-#include "aiu/gemm/device/aiugemm_grouped.h"
+#include <aiu/gemm/device/aiugemm_grouped.h>
 
-#include "aiu/gemm/kernel/default_gemm_grouped.h"
+#include <aiu/gemm/kernel/default_gemm_grouped.h>
 
-#include "aiu/gemm/kernel/default_gemm.h"
+#include <aiu/gemm/kernel/default_gemm.h>
 
-#include "aiu/gemm/threadblock/default_mma.h"
+#include <aiu/gemm/threadblock/default_mma.h>
 
-#include "cutlass/epilogue/threadblock/epilogue_with_visitor.h"
-#include "cutlass/epilogue/threadblock/epilogue_per_row_per_col_scale.h"
+#include <cutlass/epilogue/threadblock/epilogue_with_visitor.h>
+#include <cutlass/epilogue/threadblock/epilogue_per_row_per_col_scale.h>
 #include <deep_gemm/common/utils.cuh>
 
 namespace deep_gemm {

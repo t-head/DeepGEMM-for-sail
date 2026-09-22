@@ -5,12 +5,12 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
 
-#include "cute/ppu_tensor_mix.hpp"
-#include "cutlass/gemm/config/gemm_operands.hpp"
+#include <cute/ppu_tensor_mix.hpp>
+#include <cutlass/gemm/config/gemm_operands.hpp>
 
-#include "cute/atom/mma_traits_ppu0015.hpp"
-#include "cute/atom/copy_traits_ppu0015_aiu.hpp"
-#include "cute/algorithm/ppu_copy.hpp"
+#include <cute/atom/mma_traits_ppu0015.hpp>
+#include <cute/atom/copy_traits_ppu0015_aiu.hpp>
+#include <cute/algorithm/ppu_copy.hpp>
 #include <deep_gemm/impls/fp4_gemm_cutlass3.cuh>
 #include <deep_gemm/epilogue/fp4_epilogue_silu_and_mul_post_quant.cuh>
 

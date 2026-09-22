@@ -113,7 +113,7 @@ public:
         fsync_path(dir_path);
     }
 
-    void put(const std::filesystem::path& path, const std::string& data) const {
+    static void put(const std::filesystem::path& path, const std::string& data) {
         std::ofstream out(path, std::ios::binary);
         DG_HOST_ASSERT(out.write(data.data(), data.size()));
         out.close();

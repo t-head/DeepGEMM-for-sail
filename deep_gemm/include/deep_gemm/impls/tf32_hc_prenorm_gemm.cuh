@@ -11,29 +11,29 @@
 #include <hggc/std/cstdint>
 #include <hggc_bf16.h>
 
-#include "cutlass/cutlass.h"
-#include "cutlass/arch/arch.h"
-#include "cutlass/arch/mma.h"
+#include <cutlass/cutlass.h>
+#include <cutlass/arch/arch.h>
+#include <cutlass/arch/mma.h>
 #include <cutlass/tfloat32.h>
-#include "cutlass/gemm/dispatch_policy.hpp"
-#include "cutlass/gemm/collective/collective_mma.hpp"
-#include "cutlass/detail/layout.hpp"
+#include <cutlass/gemm/dispatch_policy.hpp>
+#include <cutlass/gemm/collective/collective_mma.hpp>
+#include <cutlass/detail/layout.hpp>
 
-#include "cute/algorithm/functional.hpp"
-#include "cute/atom/mma_atom.hpp"
-#include "cute/algorithm/gemm.hpp"
-#include "cute/tensor_predicate.hpp"
-#include "cute/numeric/arithmetic_tuple.hpp"
-#include "cute/ppu_util.hpp"
+#include <cute/algorithm/functional.hpp>
+#include <cute/atom/mma_atom.hpp>
+#include <cute/algorithm/gemm.hpp>
+#include <cute/tensor_predicate.hpp>
+#include <cute/numeric/arithmetic_tuple.hpp>
+#include <cute/ppu_util.hpp>
 #include <cute/arch/copy_ppu.hpp>
 
 #ifndef TF32_HC_PRENORM_HGRTC
-    #include "tools/util/include/cutlass/util/packed_stride.hpp"
+    #include <tools/util/include/cutlass/util/packed_stride.hpp>
 #endif
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/common/utils.cuh>
-#include "ppu_include.hpp"
+#include <ppu_include.hpp>
 
 using namespace cute;
 

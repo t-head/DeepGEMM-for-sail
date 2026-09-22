@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include "cutlass/bfloat16.h"
+#include <cutlass/bfloat16.h>
 #include <deep_gemm/cute_free/epilogue/epilogue_traits.cuh>
 
 namespace deep_gemm {

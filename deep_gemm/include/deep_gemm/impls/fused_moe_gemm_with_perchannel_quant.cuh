@@ -5,14 +5,14 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
 
-#include "cute/ppu_tensor_mix.hpp"
-#include "cutlass/gemm/config/gemm_operands.hpp"
+#include <cute/ppu_tensor_mix.hpp>
+#include <cutlass/gemm/config/gemm_operands.hpp>
 
-#include "cute/atom/mma_traits_ppu0010.hpp"
-#include "cute/atom/mma_traits_ppu0015.hpp"
-#include "cute/atom/copy_traits_ppu0010_aiu.hpp"
-#include "cute/atom/copy_traits_ppu0015_aiu.hpp"
-#include "cute/algorithm/ppu_copy.hpp"
+#include <cute/atom/mma_traits_ppu0010.hpp>
+#include <cute/atom/mma_traits_ppu0015.hpp>
+#include <cute/atom/copy_traits_ppu0010_aiu.hpp>
+#include <cute/atom/copy_traits_ppu0015_aiu.hpp>
+#include <cute/algorithm/ppu_copy.hpp>
 
 #include <deep_gemm/scheduler/fused_scheduler.cuh>
 #include <deep_gemm/impls/fused_gemm_util.cuh>

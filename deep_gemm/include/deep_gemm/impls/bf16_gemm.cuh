@@ -6,15 +6,15 @@
 #include <deep_gemm/common/profiling_interface.cuh>
 #include <deep_gemm/common/utils.cuh>
 
-#include "accutlass.h"
-#include "cutlass/array.h"
-#include "cutlass/numeric_conversion.h"
-#include "cutlass/tensor_ref.h"
+#include <accutlass.h>
+#include <cutlass/array.h>
+#include <cutlass/numeric_conversion.h>
+#include <cutlass/tensor_ref.h>
 
-#include "aiu/gemm/device/aiugemm_grouped.h"
-#include "aiu/gemm/kernel/default_gemm_grouped.h"
-#include "aiu/gemm/kernel/default_gemm.h"
-#include "aiu/gemm/threadblock/default_mma.h"
+#include <aiu/gemm/device/aiugemm_grouped.h>
+#include <aiu/gemm/kernel/default_gemm_grouped.h>
+#include <aiu/gemm/kernel/default_gemm.h>
+#include <aiu/gemm/threadblock/default_mma.h>
 
 
 namespace deep_gemm {

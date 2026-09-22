@@ -2,12 +2,12 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-#include "cutlass/cutlass.h"
-#include "cutlass/arch/arch.h"
-#include "cutlass/arch/mma.h"
-#include "cutlass/gemm/dispatch_policy.hpp"
+#include <cutlass/cutlass.h>
+#include <cutlass/arch/arch.h>
+#include <cutlass/arch/mma.h>
+#include <cutlass/gemm/dispatch_policy.hpp>
 
-#include "ppu_include.hpp"
+#include <ppu_include.hpp>
 
 #include <deep_gemm/mma/fp4_mma.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>

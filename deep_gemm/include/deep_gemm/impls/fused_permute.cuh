@@ -1,8 +1,8 @@
 #pragma once
 
 #include <hggc_pipeline.h>
-#include "cutlass/arch/memory.h"
-#include "cutlass/arch/memory_ppu.h"
+#include <cutlass/arch/memory.h>
+#include <cutlass/arch/memory_ppu.h>
 
 // Fused permute(1,0,2) for a paired (A, SFA) tensor set.
 // Optimization: cp.async (async prefetch to SMEM) + cache-global stores (ppu.st.global.cg).

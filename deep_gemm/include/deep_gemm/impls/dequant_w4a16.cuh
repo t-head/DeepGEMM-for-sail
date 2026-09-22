@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cutlass/arch/arch.h"
-#include "cutlass/bfloat16.h"
-#include "cutlass/float4.h"
+#include <cutlass/arch/arch.h>
+#include <cutlass/bfloat16.h>
+#include <cutlass/float4.h>
 
 namespace deep_gemm {
 

@@ -6,13 +6,13 @@
 */
 
 #include <deep_gemm/common/utils_rtc.cuh>
-#include "cutlass/coord.h"
-#include "cutlass/kernel_hardware_info.h"
-#include "cutlass/workspace.h"
-#include "cutlass/platform/platform.h"
-#include "cutlass/fast_math.h"
-#include "cutlass/gemm_coord.hpp"
-#include "cutlass/cutlass.h"
+#include <cutlass/coord.h>
+#include <cutlass/kernel_hardware_info.h>
+#include <cutlass/workspace.h>
+#include <cutlass/platform/platform.h>
+#include <cutlass/fast_math.h>
+#include <cutlass/gemm_coord.hpp>
+#include <cutlass/cutlass.h>
 
 ////////////////////////////////////////////////////////////////////////////////
 

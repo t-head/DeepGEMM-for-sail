@@ -2,8 +2,8 @@
 #define DEEP_GEMM_UTILS_CUTLASS3_H
 
 #include <hggc_fp8.h>
-#include "cutlass/cutlass.h"
-#include "cutlass/device_kernel.h"
+#include <cutlass/cutlass.h>
+#include <cutlass/device_kernel.h>
 
 struct KernelAiuMultistageOnN {
   constexpr static int N_EXPAND = 4;

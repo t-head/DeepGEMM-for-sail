@@ -24,9 +24,9 @@
 //   - All quantities are computed purely from template parameters (constexpr), no
 //     runtime cost.
 
-#include "cute/config.hpp"
-#include "cute/numeric/integral_constant.hpp"
-#include "cute/numeric/math.hpp"
+#include <cute/config.hpp>
+#include <cute/numeric/integral_constant.hpp>
+#include <cute/numeric/math.hpp>
 #include <deep_gemm/common/utils_rtc.cuh>
 
 namespace deep_gemm {

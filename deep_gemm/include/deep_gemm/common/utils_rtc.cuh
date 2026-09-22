@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cutlass/numeric_types.h"
+#include <cutlass/numeric_types.h>
 
 
 enum class GemmType {

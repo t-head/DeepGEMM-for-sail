@@ -11,8 +11,7 @@
 #include "../utils/exception.hpp"
 #include "../utils/lazy_init.hpp"
 
-// Not support currently
-#define PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE 0
+#define PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE (TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3))
 
 namespace deep_gemm {
 
@@ -59,12 +58,12 @@ public:
     acblasLtHandle_t get_acblaslt_handle() const {
 #if PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE
         if (use_pytorch_managed_acblaslt_handle)
-            DG_HOST_UNREACHABLE("PyTorch-managed acBLASLt handle not yet available on PPU");
+            return at::cuda::getCurrentCUDABlasLtHandle();
 #endif
         return acblaslt_handle;
     }
 
-    torch::Tensor get_acblaslt_workspace() {
+    torch::Tensor get_acblaslt_workspace() const {
         if (use_temp_acblaslt_workspace)
             return torch::empty({kAcblasLtWorkspaceSize}, dtype(torch::kByte).device(at::kCUDA));
         return acblaslt_workspace;

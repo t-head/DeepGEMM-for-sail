@@ -16,7 +16,7 @@
 // =============================================================================
 
 #include <cstdint>
-#include "cutlass/bfloat16.h"
+#include <cutlass/bfloat16.h>
 #include <deep_gemm/cute_free/copy/aiu_g2s_atom.cuh>
 #include <deep_gemm/cute_free/copy/tsm_s2r_atom.cuh>
 #include <deep_gemm/cute_free/mma/mma_atom.cuh>

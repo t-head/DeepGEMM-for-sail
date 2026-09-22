@@ -6,8 +6,8 @@
  **************************************************************************************************/
 #pragma once
 
-#include "cutlass/cutlass.h"
-#include "cute/tensor.hpp"
+#include <cutlass/cutlass.h>
+#include <cute/tensor.hpp>
 
 namespace cutlass::gemm::kernel {
 

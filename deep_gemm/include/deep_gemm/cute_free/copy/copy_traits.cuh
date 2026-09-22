@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cutlass/bfloat16.h"
+#include <cutlass/bfloat16.h>
 
 namespace deep_gemm {
 namespace copy {

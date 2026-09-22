@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-#include "cute/int_tuple.hpp"
+#include <cute/int_tuple.hpp>
 
 // Shared host/device definitions for the fused MoE GEMM kernels and the C++
 // JIT host runtimes: the kernel argument structs and the shared-memory size
