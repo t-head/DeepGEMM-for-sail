@@ -5,7 +5,7 @@ from .tuner import jit_tuner
 from .gemm import get_best_configs as bf16_get_best_configs
 from .gemm_int8 import get_best_configs as perchannel_get_best_configs
 from .gemm_fp8 import get_best_configs as fp8_blkwise_get_best_configs
-from .gemm_fp4 import get_best_configs as fp4_get_best_configs
+from .gemm_fp4 import get_best_configs as fp4_get_best_configs, get_fp4_epilogue_type
 from .m_grouped_gemm_w4a16 import W4A16Type, w4a16_get_best_configs
 from .utils import get_num_sms, ceil_div, GemmType, get_col_major_tma_aligned_tensor
 import os
@@ -570,7 +570,8 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
                                      aligned_num_m_blocks: torch.Tensor,
                                      configs,
                                      out_scale: Optional[torch.Tensor] = None,
-                                     swiglu_limit: Optional[float] = None) -> None:
+                                     swiglu_limit: Optional[float] = None,
+                                     activation_type: Optional[str] = None) -> None:
     """MoE GroupedFused FP4 GEMM.
 
     When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
@@ -579,9 +580,9 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
     `preprocess_mxfp4_weight_for_act_and_quant_fusing` (instead of `preprocess_mxfp4_scales`), so
     that the epilogue reads gate/up (W1/W3) pairs from adjacent N positions.
 
-    `swiglu_limit > 0` clamps before the activation: the gate is clamped from above only
-    (`min(gate, limit)`) and the up projection on both sides (`clamp(up, -limit, limit)`);
-    `0.0` or None disables the clamp.
+    `swiglu_limit > 0` enables clamping; `activation_type` selects the ordering:
+    `silu_and_mul` clamps the gate before silu, while `silu_and_mul_step` clamps silu(gate)
+    afterwards. The up projection is clamped to `[-limit, limit]` in both variants.
 
     Shape `n` must be a multiple of 64 in the fused mode.
 
@@ -609,9 +610,11 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
             f"n ({n}) must be divisible by 64 in the SiluAndMulPostQuant epilogue: "
             "n // 4(act_func & quant) must stay a multiple of 16."
         )
-        epilogue_type, output_type = 'SiluAndMulPostQuantFp4', torch.uint8
+        epilogue_type = get_fp4_epilogue_type(activation_type or 'silu_and_mul')
+        output_type = torch.uint8
     else:
         assert swiglu_limit is None or swiglu_limit == 0.0, "swiglu_limit is only used when out_scale is not None."
+        assert activation_type is None, "activation_type is only used when out_scale is not None."
         assert n_ == n, f'{n_=}, expected {n}'
         out_scale = torch.empty(0, dtype=torch.uint16, device=out.device)
         assert out.dtype == torch.bfloat16

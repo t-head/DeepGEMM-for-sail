@@ -36,8 +36,8 @@ public:
         bool hasBias;
         int n_expand;
         bool enable_sbo_overlap;
-        // Epilogue selection. "Default" or "SiluAndMulPostQuantFp4"; apply_swiglu_limit only
-        // matters for the fused epilogue.
+        // Epilogue selection: "Default" or an activation + post-quant variant;
+        // apply_swiglu_limit only matters for fused activation epilogues.
         std::string epilogue_type = "Default";
         bool apply_swiglu_limit = false;
     };
@@ -209,7 +209,7 @@ public:
         // would still instantiate the DefaultEpilogueNoTsm base and trip `kOutputAlignment == 2`
         // whenever AlignmentD is 1 (the bias / odd-N configurations).
         const std::string fused_smem_guard =
-            args.launch_info.epilogue_type == "SiluAndMulPostQuantFp4"
+            args.launch_info.epilogue_type != "Default"
                 ? "static_assert(CollectiveEpilogueSiluAndMulPostQuant::get_shared_storage_size(BLOCK_M, BLOCK_N)\n"
                   "                  <= GemmKernel::SharedStorageSize,\n"
                   "              \"fused epilogue act tile exceeds the kernel shared storage\");\n"
@@ -360,7 +360,8 @@ using CollectiveEpilogueSiluAndMulPostQuant = typename cutlass::epilogue::collec
     EpilogueOutputOp,
     cutlass::gemm::EpilogueDefault,
     IsAligedN,
-    kApplySwigluLimit
+    kApplySwigluLimit,
+    kEpilogueType
 >;
 
 // Keep the selection identical to Fp4Gemm::run in fp4_gemm_cutlass3.cuh
@@ -368,7 +369,7 @@ using CollectiveEpilogue = typename cutlass::platform::conditional<
     hasBias || (SHAPE_N % 2 != 0),
     CollectiveEpilogueWithTsm,
     typename cutlass::platform::conditional<
-        kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4,
+        is_act_and_quant_fused(kEpilogueType),
         CollectiveEpilogueSiluAndMulPostQuant,
         CollectiveEpilogueNoTsm
     >::type
@@ -442,9 +443,9 @@ __global__ void {}(
 // CollectiveEpilogue / TileScheduler aliases. Emitting one combined template would instantiate
 // types the dynamic-tile kernel never uses and make the placeholder list far harder to keep in sync.
 //
-// Mirrors the `if constexpr (kEnableMoeDynamicTile)` branch of Fp4Gemm::run. Only the Default
-// epilogue is supported there (the kernel static_asserts it), which is why this path reuses
-// FP4GemmRuntime::EpilogueArgsNoTsm and does not carry a fused variant.
+// Mirrors the `if constexpr (kEnableMoeDynamicTile)` branch of Fp4Gemm::run. DynamicTile supports
+// both the Default epilogue and fused activation + post-quant variants, so its host params union
+// carries both the NoTsm and fused layouts.
 class FP4DynamicTileRuntime final : public LaunchRuntime<FP4DynamicTileRuntime> {
 public:
     struct LaunchInfo {
@@ -452,8 +453,8 @@ public:
         // FP4DynamicTileId enumerator name: "LargeEM", "LargeK", "LargeK_G2" or "SmallEM".
         std::string dynamic_tile_id;
         std::string gemm_type, kernel_name;
-        // Epilogue selection. "Default" or "SiluAndMulPostQuantFp4"; apply_swiglu_limit only
-        // matters for the fused epilogue.
+        // Epilogue selection: "Default" or an activation + post-quant variant;
+        // apply_swiglu_limit only matters for fused activation epilogues.
         std::string epilogue_type = "Default";
         bool apply_swiglu_limit = false;
     };

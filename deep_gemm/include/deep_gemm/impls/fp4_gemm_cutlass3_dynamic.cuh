@@ -217,11 +217,12 @@ struct Fp4TypeBuilder {
     EpilogueOutputOp,
     cutlass::gemm::EpilogueDefault,
     IsAligedN,
-    kApplySwigluLimit
+    kApplySwigluLimit,
+    kEpilogueType
   >;
 
   using CollectiveEpilogue = typename cutlass::platform::conditional<
-    kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4,
+    is_act_and_quant_fused(kEpilogueType),
     CollectiveEpilogueSiluAndMulPostQuant,
     CollectiveEpilogueNoTsm
   >::type;
@@ -245,7 +246,7 @@ struct Fp4TypeBuilder {
   static CUTLASS_DEVICE void run(Params params, char* smem_buf, int M, int m_coord, int n_coord,
                           int64_t offset_a, int64_t offset_b, int64_t offset_m, int64_t offset_c,
                           int64_t offset_scalea, int64_t offset_scaleb, int64_t offset_scalec) {
-    if constexpr (kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4) {
+    if constexpr (is_act_and_quant_fused(kEpilogueType)) {
       // Epilogue reuse the shared storage comes from mainloop.
       // Make sure that the size of epilogue SharedStorage is less than Mainloop.
       static_assert(CollectiveEpilogueSiluAndMulPostQuant::get_shared_storage_size(BLOCK_M, BLOCK_N)

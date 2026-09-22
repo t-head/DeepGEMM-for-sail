@@ -9,6 +9,20 @@ from functools import lru_cache
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, is_ppu1v5_device, GemmType
 from ..deep_gemm_tuner.autotune_fp4 import lookup_best_config
+
+
+def get_fp4_epilogue_type(activation_type: str) -> str:
+    """Map a canonical activation name to its EpilogueType enumerator name."""
+    activation_types = {
+        'silu_and_mul': 'SiluAndMulPostQuantFp4',
+        'silu_and_mul_step': 'SiluAndMulStepPostQuantFp4',
+    }
+    if activation_type not in activation_types:
+        supported = ', '.join(activation_types)
+        raise ValueError(f'unsupported activation_type: {activation_type}; supported: {supported}')
+    return activation_types[activation_type]
+
+
 # C++ code templates
 includes = ('<deep_gemm/impls/fp4_gemm_cutlass3.cuh>', )
 template = """

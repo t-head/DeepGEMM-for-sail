@@ -390,19 +390,48 @@ def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=Fals
         print(f"distribution:{group_m_list}")
     return group_m_list
 
-def silu_and_mul_post_quant_torch(ref_out: torch.Tensor, swiglu_limit: float = 0.0):
-    """weight consists [gate, up]"""
+def is_act_and_quant_fused(epilogue_type: str) -> bool:
+    """True for any fused silu_and_mul + mxfp4 post-quant epilogue variant (standard or STEP)."""
+    return epilogue_type in ("SiluAndMulPostQuantFp4", "SiluAndMulStepPostQuantFp4")
+
+
+def epilogue_type_to_activation(epilogue_type: str) -> str:
+    """Map a fused EpilogueType enumerator name to the activation_type string the kernel expects."""
+    return {
+        "SiluAndMulPostQuantFp4": "silu_and_mul",
+        "SiluAndMulStepPostQuantFp4": "silu_and_mul_step",
+    }[epilogue_type]
+
+
+def silu_and_mul_post_quant_torch(ref_out: torch.Tensor, swiglu_limit: float = 0.0,
+                                 activation_type: str = "silu_and_mul"):
+    """weight consists [gate, up]
+
+    activation_type selects the clamp ordering (only matters when swiglu_limit > 0):
+      - "silu_and_mul": clamp the gate from above BEFORE silu.
+      - "silu_and_mul_step": silu FIRST, then clamp silu(gate) from above (STEP models).
+    In both cases the up projection is clamped to [-limit, limit].
+    """
     from test_fp4_core import quantize_fp4_torch
 
     d2 = ref_out.shape[-1]
     assert d2 % 2 == 0, f"the last dim must be even, got {d2}"
     gate, up = ref_out.split(d2 // 2, dim=-1)
 
-    if swiglu_limit is not None and swiglu_limit > 0.0:
-        gate = gate.clamp(max=swiglu_limit)
-        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    assert activation_type in ("silu_and_mul", "silu_and_mul_step"), \
+        f"unsupported activation_type {activation_type!r}"
+    is_step = activation_type == "silu_and_mul_step"
 
-    silu =  F.silu(gate) * up
+    if swiglu_limit is not None and swiglu_limit > 0.0:
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+        if is_step:
+            # STEP: silu first, then clamp silu(gate) from above.
+            silu = (F.silu(gate).clamp(max=swiglu_limit)) * up
+        else:
+            # standard swiglu: clamp the gate before silu.
+            silu = F.silu(gate.clamp(max=swiglu_limit)) * up
+    else:
+        silu = F.silu(gate) * up
     ref_out_quanted, ref_out_quanted_scale = quantize_fp4_torch(src_tensor=silu)
     return ref_out_quanted, ref_out_quanted_scale
 
@@ -528,7 +557,7 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
 
         epilogue_type = kwargs.get("epilogue_type", "Default")
         swiglu_limit = kwargs.get("swiglu_limit", 0.0)
-        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+        if is_act_and_quant_fused(epilogue_type):
             ### meta_data
             out_quanted = torch.empty((num_token * topk, (n // 4)), dtype=torch.uint8, device=tensor_device)
             out_quanted_scale = torch.empty((num_token * topk, ceil_div((n // 4), 32)), dtype=torch.uint16, device=tensor_device)
@@ -540,7 +569,7 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
         x_fp4_scale = x_fp4_scale.view(torch.uint16) # x_fp4_scale is K-Major for GroupedFused
         y_fp4, y_fp4_scale = quantize_fp4_weight_torch(weight=y)
         y_fp4_, y_fp4_scale_ = y_fp4.clone(), y_fp4_scale.clone()
-        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+        if is_act_and_quant_fused(epilogue_type):
             y_fp4, y_fp4_scale = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y_fp4, weight_scale=y_fp4_scale)
         else:
             y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
@@ -559,9 +588,9 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
                     ref_out_list.append(ref_out_group)
             ref_out = torch.concat(ref_out_list, dim=0)
 
-            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            if is_act_and_quant_fused(epilogue_type):
                 ### Reference
-                ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit)
+                ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
                 ref_out_quanted_scale = preprocess_mxfp4_scales(scale=ref_out_quanted_scale)
 
                 return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
@@ -635,7 +664,7 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
 
         epilogue_type = kwargs.get("epilogue_type", "Default")
         swiglu_limit = kwargs.get("swiglu_limit", 0.0)
-        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+        if is_act_and_quant_fused(epilogue_type):
             ### meta_data
             out_quanted = torch.empty((m, (n // 4)), dtype=torch.uint8, device=tensor_device)
             out_quanted_scale = torch.empty((m, ceil_div((n // 4), 32)), dtype=torch.uint16, device=tensor_device)
@@ -647,7 +676,7 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
         x_fp4 = quantize_fp4_torch(x)
         x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4[1])
         y_fp4, y_fp4_scale = quantize_fp4_weight_torch(weight=y)
-        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+        if is_act_and_quant_fused(epilogue_type):
             y_fp4, y_fp4_scale = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y_fp4, weight_scale=y_fp4_scale)
         else:
             y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
@@ -665,9 +694,9 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
                 start = aligned_end
             ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
 
-            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            if is_act_and_quant_fused(epilogue_type):
                 ### Reference
-                ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit)
+                ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
                 ref_out_quanted_scale = preprocess_mxfp4_scales(scale=ref_out_quanted_scale)
 
                 return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
@@ -739,7 +768,7 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
 
         epilogue_type = kwargs.get("epilogue_type", "Default")
         swiglu_limit = kwargs.get("swiglu_limit", 0.0)
-        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+        if is_act_and_quant_fused(epilogue_type):
             ### meta_data
             out_quanted = torch.empty((num_groups, max_m, (n // 4)), dtype=torch.uint8, device=tensor_device)
             out_quanted_scale = torch.empty((num_groups, max_m, ceil_div((n // 4), 32)), dtype=torch.uint16, device=tensor_device)
@@ -764,7 +793,7 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
         x_fp4_scale = preprocess_mxfp4_scales(scale=torch.stack(x_fp4_scale_list, dim=0))
         y_fp4 = torch.stack(y_fp4_list, dim=0)
         y_fp4_scale = torch.stack(y_fp4_scale_list, dim=0)
-        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+        if is_act_and_quant_fused(epilogue_type):
             y_fp4, y_fp4_scale = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y_fp4, weight_scale=y_fp4_scale)
         else:
             y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
@@ -774,9 +803,9 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
             y_ref = torch.stack(y_ref_list, dim=0)
             ref_out = torch.einsum('gmk,gnk->gmn', x_ref, y_ref)
 
-            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            if is_act_and_quant_fused(epilogue_type):
                 ### Reference
-                ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit)
+                ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
                 ref_out_quanted_scale = preprocess_mxfp4_scales(scale=ref_out_quanted_scale)
 
                 return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda')), signal.to('cuda'), max_m
@@ -1374,12 +1403,13 @@ def test_m_grouped_gemm_masked(args) -> None:
             result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal)
         elif d == torch.uint8:
-            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            if is_act_and_quant_fused(epilogue_type):
                 out, out_scale = out
                 ref_out, ref_out_scale = ref_out
                 result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal,
-                                                                    out_scale=out_scale, swiglu_limit=swiglu_limit)
+                                                                    out_scale=out_scale, swiglu_limit=swiglu_limit,
+                                                                    activation_type=epilogue_type_to_activation(epilogue_type))
             else:
                 # `Default` epilogue
                 result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
@@ -1417,7 +1447,7 @@ def test_m_grouped_gemm_masked(args) -> None:
                     print(f"out[{j}]:", out[j, :masked_m[j].item()])
                     # torch.testing.assert_close(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()], rtol=5e-1, atol=2)
                 assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
-            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            if is_act_and_quant_fused(epilogue_type):
                 diff_scale = calc_diff(out_scale[j, :masked_m[j].item()], ref_out_scale[j, :masked_m[j].item()])
                 if (masked_m[j] != 0):
                     if diff_scale >= 0.00001:
@@ -1468,7 +1498,7 @@ def test_m_grouped_gemm_fused(args) -> None:
         x_tensor = x[0] if isinstance(x, (tuple, list)) else x
         y_tensor = y[0] if isinstance(y, (tuple, list)) else y
         is_perchannel = quant_type == 'channel'
-        configs, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, _, _ = deep_gemm.moe_align_block_size(x_tensor, y_tensor, topk_ids, is_perchannel, enable_act_and_quant_fusing=(epilogue_type == "SiluAndMulPostQuantFp4"))
+        configs, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, _, _ = deep_gemm.moe_align_block_size(x_tensor, y_tensor, topk_ids, is_perchannel, enable_act_and_quant_fusing=is_act_and_quant_fused(epilogue_type))
 
         if d == torch.bfloat16:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
@@ -1477,10 +1507,10 @@ def test_m_grouped_gemm_fused(args) -> None:
         elif d == torch.float8_e4m3fn:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d == torch.uint8:
-            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            if is_act_and_quant_fused(epilogue_type):
                 out, out_scale = out
                 ref_out, ref_out_scale = ref_out
-                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs, out_scale=out_scale, swiglu_limit=swiglu_limit)
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs, out_scale=out_scale, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
             else:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
@@ -1500,7 +1530,7 @@ def test_m_grouped_gemm_fused(args) -> None:
             print("out:", out)
             torch.testing.assert_close(out, ref_out, rtol=5e-1, atol=2)
         assert diff < 0.0015, f'{num_token=}, {k=}, {n=}, {diff:.5f}'
-        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+        if is_act_and_quant_fused(epilogue_type):
             diff_scale = calc_diff(out_scale, ref_out_scale)
             if diff_scale >= 0.00001:
                 print("ref_out_scale:", ref_out_scale)
@@ -1533,10 +1563,10 @@ def test_m_grouped_gemm_nopad(args) -> None:
         elif d == torch.float8_e4m3fn:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
         elif d == torch.uint8:
-            if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+            if is_act_and_quant_fused(epilogue_type):
                 out, out_scale = out
                 ref_out, ref_out_scale = ref_out
-                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices, out_scale=out_scale, swiglu_limit=swiglu_limit)
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices, out_scale=out_scale, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
             else:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
@@ -1558,7 +1588,7 @@ def test_m_grouped_gemm_nopad(args) -> None:
             torch.testing.assert_close(out, ref_out, rtol=5e-1, atol=2)
 
         assert diff < 0.0015, f'{m=}, {k=}, {n=}, {diff:.5f}'
-        if epilogue_type in ["SiluAndMulPostQuantFp4"]:
+        if is_act_and_quant_fused(epilogue_type):
             diff_scale = calc_diff(out_scale, ref_out_scale)
             if diff_scale >= 0.00001:
                 print("ref_out_scale:", ref_out_scale)

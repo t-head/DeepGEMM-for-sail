@@ -774,4 +774,22 @@ inline DynamicTileLaunchConst dynamic_tile_launch_const(const std::string& dynam
     return {0, 0};
 }
 
+// fused epilogue variant
+inline EpilogueType get_epilogue_type(const std::string& activation_type) {
+    static const std::map<std::string, EpilogueType> kActivationTypes = {
+        {"silu_and_mul",      EpilogueType::SiluAndMulPostQuantFp4},
+        {"silu_and_mul_step", EpilogueType::SiluAndMulStepPostQuantFp4},
+    };
+    const auto it = kActivationTypes.find(activation_type);
+    if (it == kActivationTypes.end()) {
+        // Build the "supported" list from the table itself so it never drifts out of sync.
+        std::string supported;
+        for (const auto& kv : kActivationTypes)
+            supported += (supported.empty() ? "" : ", ") + kv.first;
+        DG_HOST_UNREACHABLE("unsupported activation_type: " + activation_type +
+                            "; supported: " + supported);
+    }
+    return it->second;
+}
+
 } // namespace deep_gemm_fp4_common

@@ -531,7 +531,8 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
     const torch::Tensor& aligned_num_m_blocks,
     const FusedCommonConfigTuple& configs,
     const torch::Tensor& out_scale,
-    float swiglu_limit)
+    float swiglu_limit,
+    std::string activation_type = "silu_and_mul")
 {
     const auto& [num_token, k] = get_shape<2>(lhs);
     const auto& [num_groups, n, k_] = get_shape<3>(rhs);
@@ -543,6 +544,8 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
     const auto [num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages] = configs;
     const bool enable_act_and_quant_fusing = out_scale.defined();
     const bool apply_swiglu_limit = swiglu_limit > 0.0f;
+    const EpilogueType kEpilogueType = enable_act_and_quant_fusing
+        ? deep_gemm_fp4_common::get_epilogue_type(activation_type) : EpilogueType::Default;
     const int topk = static_cast<int>(m_sum / num_token);
     const int block_size = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(num_sms);
@@ -569,7 +572,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
     auto args = Fp4FusedMoeRuntime::Args{
         .launch_info = {static_cast<int>(n), static_cast<int>(k), static_cast<int>(num_groups),
                         block_m, block_n, block_k, warp_m, warp_n, block_size, num_stages,
-                        enable_act_and_quant_fusing ? "SiluAndMulPostQuantFp4" : "Default",
+                        EpilogueTypeS[static_cast<int>(kEpilogueType)],
                         apply_swiglu_limit, kernel_name},
         .launch_args = {grid, dim3(block_size), smem_size},
         .kernel_params = kernel_params
@@ -588,8 +591,10 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_fused_moe_params(
             std::string("fp4"), std::string("group"), static_cast<int>(num_groups),
-            static_cast<int>(num_token), topk, static_cast<int>(n), static_cast<int>(k),
+            static_cast<int>(num_token), topk, static_cast<int>(n), static_cast<int>(k)*2,
             m_rows.data_ptr<int32_t>(), current_stream());
+        dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
+        dg_prof_params.add_params("swiglu_limit", swiglu_limit);
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
     Fp4FusedMoeRuntime::launch(runtime, args);

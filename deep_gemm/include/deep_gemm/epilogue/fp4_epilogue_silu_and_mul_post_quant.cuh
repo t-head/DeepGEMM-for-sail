@@ -26,7 +26,8 @@ template <
   class ThreadEpilogueOp_,
   class EpilogueSchedule_,
   bool IsAlignedN = false, // ProblemN % blockN == 0, used for deepgemm
-  bool kApplySwigluLimit = false
+  bool kApplySwigluLimit = false,
+  EpilogueType kEpilogueVariant = EpilogueType::SiluAndMulPostQuantFp4
 >
 class EpilogueSiluAndMulPostQuant: public DefaultEpilogueNoTsm<StrideC_, StrideD_, ThreadEpilogueOp_, EpilogueSchedule_, IsAlignedN>{
 public:
@@ -38,6 +39,15 @@ public:
   using typename Base::ElementAccumulator;
   using typename Base::FragmentAccumulator;
   using Base::kIsAlignedN;
+
+  // STEP models clamp silu(gate) AFTER the activation instead of clamping the gate before it.
+  static constexpr bool kSiluThenClamp = (kEpilogueVariant == EpilogueType::SiluAndMulStepPostQuantFp4);
+
+  // Clamp only happens when swiglu_limit is enabled. The standard swiglu clamps the gate BEFORE
+  // silu (used in two loops below, hence the alias); the STEP variant clamps silu(gate) AFTER it
+  // (a single use, spelled out inline as `kApplySwigluLimit && kSiluThenClamp`). With the limit
+  // disabled both collapse to plain silu(gate) * up.
+  static constexpr bool kClampBeforeSilu = kApplySwigluLimit && !kSiluThenClamp;
 
   using VectorTypeOutputScale = Array<uint8_t, 2>;
   static constexpr int TSM_PADDING = 4; // padding 1 float for bankconflict
@@ -251,7 +261,8 @@ public:
             FragmentAccumulator input_array = *reinterpret_cast<const FragmentAccumulator*>(accumulators(make_coord(_, mma_m, mma_n), warp_iter_m, warp_iter_n).data());
 
             // 0. sigmoid only for better compute deps
-            if constexpr (kApplySwigluLimit) {
+            if constexpr (kClampBeforeSilu) {
+              // standard swiglu: clamp the gate from above, then sigmoid the clamped gate.
               // using mul_accums[warp_iter_n][mma_n] to store gate_clamped
               mul_accums[warp_iter_n][mma_n] = min(input_array[0], params.swiglu_limit);
               sigmoid_accums[warp_iter_n][mma_n] = sigmoid_accumulator(mul_accums[warp_iter_n][mma_n]);
@@ -263,11 +274,17 @@ public:
 
         cute::for_each(make_int_sequence<WARP_ITER_N_NUM>{}, [&](auto warp_iter_n) {
           cute::for_each(make_int_sequence<MMA_N>{}, [&](auto mma_n) {
-            if constexpr (kApplySwigluLimit) {
+            if constexpr (kClampBeforeSilu) {
+              // silu(gate_clamped) = gate_clamped * sigmoid(gate_clamped)
               mul_accums[warp_iter_n][mma_n] = mul_accumulator(mul_accums[warp_iter_n][mma_n], sigmoid_accums[warp_iter_n][mma_n]);
             } else {
+              // silu(gate) = gate * sigmoid(gate)
               FragmentAccumulator input_array = *reinterpret_cast<const FragmentAccumulator*>(accumulators(make_coord(_, mma_m, mma_n), warp_iter_m, warp_iter_n).data());
               mul_accums[warp_iter_n][mma_n] = mul_accumulator(input_array[0], sigmoid_accums[warp_iter_n][mma_n]);
+              if constexpr (kApplySwigluLimit && kSiluThenClamp) {
+                // STEP models: clamp silu(gate) from above AFTER the activation.
+                mul_accums[warp_iter_n][mma_n] = min(mul_accums[warp_iter_n][mma_n], params.swiglu_limit);
+              }
             }
           });
         });
