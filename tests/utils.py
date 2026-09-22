@@ -230,6 +230,19 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
         Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor], torch.Tensor]:
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
     x = torch.randn((m, k), device=tensor_device, dtype=torch.bfloat16)
+    if d == torch.float32:
+        # Match upstream prenorm coverage: sample the weights directly in FP32.
+        y = torch.randn((n, k), device=tensor_device, dtype=torch.float32)
+        out = torch.empty((m, n), device=tensor_device, dtype=torch.float32)
+        out_s = torch.empty((m,), device=tensor_device, dtype=torch.float32)
+        if _acc_check:
+            ref_out = x.float() @ y.t()
+            ref_s = x.float().square().sum(-1)
+        else:
+            ref_out = torch.empty_like(out)
+            ref_s = torch.empty_like(out_s)
+        return x.to('cuda'), y.to('cuda'), out.to('cuda'), out_s.to('cuda'), ref_out.to('cuda'), ref_s.to('cuda')
+
     y = torch.randn((n, k), device=tensor_device, dtype=torch.bfloat16)
     out = torch.empty((m, n), device=tensor_device, dtype=torch.bfloat16)
 
@@ -240,19 +253,6 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
 
     if d == torch.bfloat16:
         return x.to('cuda'), y.to('cuda'), out.to('cuda'), ref_out.to('cuda')
-    elif d == torch.float32:
-        y = y.to(torch.float32)
-        out = torch.empty((m, n), device=tensor_device, dtype=torch.float32)
-        out_s = torch.ones((m, ), device=tensor_device, dtype=torch.float32)
-
-        if _acc_check:
-            ref_out = x.float() @ y.t()
-            ref_s = x.float().square().sum(-1)
-        else:
-            ref_out = torch.empty_like(out)
-            ref_s = torch.empty_like(out_s)
-
-        return x.to('cuda'), y.to('cuda'), out.to('cuda'), out_s.to('cuda'), ref_out.to('cuda'), ref_s.to('cuda')
     elif d == torch.int8:
         x_int8, y_int8 = per_token_cast_to_int8(x), per_token_cast_to_int8(y)
         return  (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), out.to('cuda'), ref_out.to('cuda')

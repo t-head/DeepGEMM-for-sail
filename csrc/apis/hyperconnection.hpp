@@ -31,13 +31,13 @@ void tf32_hc_prenorm_gemm_nt(const torch::Tensor& a, const torch::Tensor& b, con
 
     // NOTES: the split-K partials are reduced in place, so `d` and `sqr_sum` always hold a single copy
     DG_HOST_ASSERT(d.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT((num_splits.has_value() ? (d.sizes() == std::vector<int64_t>{1, m, n})
-                                           : (d.sizes() == std::vector<int64_t>{m, n})));
+    DG_HOST_ASSERT((d.sizes() == std::vector<int64_t>{1, m, n} or
+                    d.sizes() == std::vector<int64_t>{m, n}));
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
 
     DG_HOST_ASSERT(sqr_sum.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT((num_splits.has_value() ? (sqr_sum.sizes() == std::vector<int64_t>{1, m})
-                                           : (sqr_sum.sizes() == std::vector<int64_t>{m})));
+    DG_HOST_ASSERT((sqr_sum.sizes() == std::vector<int64_t>{1, m} or
+                    sqr_sum.sizes() == std::vector<int64_t>{m}));
     TORCH_CHECK(sqr_sum.is_contiguous(), "sqr_sum must be contiguous");
 
     if (m == 0) {
