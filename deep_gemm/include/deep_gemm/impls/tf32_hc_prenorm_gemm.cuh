@@ -4,6 +4,7 @@
 
 // NOTES: host-only helpers, skipped when the header is pulled in by the C++ JIT
 #ifndef TF32_HC_PRENORM_HGRTC
+    #include <deep_gemm/common/types.cuh>
     #include <deep_gemm/common/profiling_interface.cuh>
 #endif
 
@@ -32,7 +33,8 @@
 #endif
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
-#include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/math.cuh>
 #include <ppu_include.hpp>
 
 using namespace cute;

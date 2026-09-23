@@ -1,9 +1,17 @@
 #pragma once
 #include <hgtx3/hgToolsExt.h>
 #include <hggc_runtime.h>
-#include <string>
+#include <cstdlib>
+#include <iomanip>
 #include <iostream>
-#include <deep_gemm/common/utils.cuh>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/types.cuh>
 
 
 class DgProfParam {

@@ -2,6 +2,9 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/common/types.cuh>
+
 using namespace cute;
 
 namespace cutlass::gemm::collective {

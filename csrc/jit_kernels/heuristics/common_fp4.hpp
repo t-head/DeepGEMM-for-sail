@@ -12,7 +12,7 @@
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
 #include "runtime_lut.hpp"
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/types.cuh>
 using namespace deep_gemm;
 namespace deep_gemm_fp4_common {
 

@@ -1,7 +1,7 @@
 #pragma once
 #include <ppu_include.hpp>
 #include <deep_gemm/common/cute_tie.cuh>
-#include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
 

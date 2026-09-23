@@ -4,7 +4,9 @@
     \brief Parameters structures for deepgemm schedulers
 */
 
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/epilogue/epilogue_traits.cuh>
 #include <cutlass/coord.h>
 #include <cutlass/kernel_hardware_info.h>
 #include <cutlass/workspace.h>

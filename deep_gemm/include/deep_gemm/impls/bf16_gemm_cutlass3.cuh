@@ -4,10 +4,13 @@
 
 #ifndef BF16_HGRTC
     #include <deep_gemm/common/profiling_interface.cuh>
-    #include <deep_gemm/common/utils.cuh>
-#else
-    #include <deep_gemm/common/utils_rtc.cuh>
 #endif
+
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/scheduler/block_info.cuh>
+#include <deep_gemm/tix/utils.cuh>
+
 // #include <iostream>
 
 #include <cutlass/cutlass.h>

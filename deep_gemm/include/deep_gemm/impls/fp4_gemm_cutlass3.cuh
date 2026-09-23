@@ -2,7 +2,10 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #include <cutlass/cutlass.h>
-#include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/epilogue/epilogue_traits.cuh>
+#include <deep_gemm/scheduler/block_info.cuh>
 #include <iostream>
 #include <deep_gemm/common/profiling_interface.cuh>
 

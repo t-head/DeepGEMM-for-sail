@@ -1,6 +1,6 @@
 #pragma once
 #include <cub/block/block_scan.cuh>
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/math.cuh>
 
 #include <cute/ppu_tensor_mix.hpp>
 #include <cutlass/gemm/config/gemm_operands.hpp>

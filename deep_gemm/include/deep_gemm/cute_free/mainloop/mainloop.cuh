@@ -5,7 +5,7 @@
 #include <cutlass/arch/arch.h>
 #include <cutlass/arch/memory_ppu.h>
 #include <deep_gemm/cute_free/arch/ppu_common.cuh>
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/math.cuh>
 
 namespace deep_gemm {
 namespace mainloop {

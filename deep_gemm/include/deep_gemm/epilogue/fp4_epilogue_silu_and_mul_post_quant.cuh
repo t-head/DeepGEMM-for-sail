@@ -8,7 +8,8 @@
 #include <cute/tensor.hpp>
 #include <cute/numeric/numeric_types.hpp>
 #include <cutlass/epilogue/thread/activation.h>
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/epilogue/epilogue_traits.cuh>
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 

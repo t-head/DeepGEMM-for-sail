@@ -1,4 +1,5 @@
 #pragma once
+#include <deep_gemm/common/math.cuh>
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 
 namespace cutlass::gemm::kernel {

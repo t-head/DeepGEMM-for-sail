@@ -1,4 +1,6 @@
 #pragma once
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/common/types.cuh>
 #include <deep_gemm/impls/gemvt.cuh>
 
 namespace deep_gemm {

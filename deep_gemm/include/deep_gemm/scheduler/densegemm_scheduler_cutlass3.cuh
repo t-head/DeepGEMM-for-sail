@@ -5,7 +5,8 @@
     num_n_blocks is computed at RUNTIME from params.shape_n.
 */
 
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
 #include <cutlass/coord.h>
 #include <cutlass/kernel_hardware_info.h>
 #include <cutlass/workspace.h>

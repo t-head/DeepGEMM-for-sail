@@ -3,6 +3,9 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 // #include <iostream>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/scheduler/block_info.cuh>
 #include <hggc_fp8.h>
 #ifndef FP8_HGRTC
     #include <deep_gemm/common/profiling_interface.cuh>
@@ -29,6 +32,7 @@
 #include <tools/util/include/cutlass/util/packed_stride.hpp>
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
+#include <deep_gemm/tix/utils.cuh>
 #include <cutlass/gemm/collective/ppu_mma_aiu_multistage_with_scale.hpp>
 namespace deep_gemm {
 using namespace cute;

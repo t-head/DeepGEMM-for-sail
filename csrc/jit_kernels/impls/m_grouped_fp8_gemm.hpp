@@ -19,7 +19,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
 #include "int8_gemm.hpp"
 #include "fp8_gemm.hpp"

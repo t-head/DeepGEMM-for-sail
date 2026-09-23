@@ -2,7 +2,10 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-#include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/epilogue/epilogue_traits.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
 
 #include <cute/ppu_tensor_mix.hpp>

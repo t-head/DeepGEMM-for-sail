@@ -5,10 +5,11 @@
 
 #ifndef W4A16_HGRTC
     #include <deep_gemm/common/profiling_interface.cuh>
-    #include <deep_gemm/common/utils.cuh>
-#else
-    #include <deep_gemm/common/utils_rtc.cuh>
 #endif
+
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
+
 
 #include <cute/ppu_tensor_mix.hpp>
 #include <cutlass/gemm/config/gemm_operands.hpp>
@@ -22,7 +23,6 @@
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/scheduler/fused_scheduler.cuh>
 #include <deep_gemm/impls/fused_gemm_util.cuh>
-#include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
 
 using namespace cute;

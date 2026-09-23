@@ -1,13 +1,11 @@
 #pragma once
 
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
-#include <fstream>
-#include <iostream>
 #include <string>
-#include <vector>
-#include <functional>
-#include <iomanip>
-#include <deep_gemm/common/utils_rtc.cuh>
+
+#include <hggc_runtime_api.h>
 
 class AssertionException : public std::exception {
 private:

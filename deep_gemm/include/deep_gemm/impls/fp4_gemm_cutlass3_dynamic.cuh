@@ -1,6 +1,8 @@
 #pragma once
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/epilogue/epilogue_traits.cuh>
 
 #include <cutlass/cutlass.h>
 #include <cutlass/arch/arch.h>

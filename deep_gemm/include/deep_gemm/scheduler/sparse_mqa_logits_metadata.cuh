@@ -1,6 +1,8 @@
 #pragma once
 
-#include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/tix/utils.cuh>
 #include <deep_gemm/impls/sparse_mqa_logits_layout.cuh>
 
 // Sparse MQA logits metadata kernel, ported from open-source DeepGEMM 26/09

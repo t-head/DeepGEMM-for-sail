@@ -25,7 +25,10 @@
 
 #include <ppu_include.hpp>
 #include <deep_gemm/common/utils_cutlass3.cuh>
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/scheduler/block_info.cuh>
+#include <deep_gemm/tix/utils.cuh>
 
 using namespace cute;
 

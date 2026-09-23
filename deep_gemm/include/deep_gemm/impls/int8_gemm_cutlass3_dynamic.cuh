@@ -1,3 +1,4 @@
+#include <deep_gemm/common/types.cuh>
 #include <cutlass/cutlass.h>
 #include <cutlass/arch/arch.h>
 #include <cutlass/arch/mma.h>

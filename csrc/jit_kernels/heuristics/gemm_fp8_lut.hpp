@@ -6,7 +6,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/types.cuh>
 
 namespace deep_gemm_fp8_lut {
 
