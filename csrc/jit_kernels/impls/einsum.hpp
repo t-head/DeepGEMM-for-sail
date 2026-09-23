@@ -233,8 +233,8 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     dim3 grid = get_grid_shape(hw_info.cu_count);
 
     static constexpr GemmType kGemmType = GemmType::BatchGemm;
-
-    if (extra_info["use_actlize_v100"]) {
+    bool is_use_actlize_v100 = extra_info["use_actlize_v100"] || !transposed_out;
+    if (is_use_actlize_v100) {
         const auto gemm_args = INT8GemmCutlass3Runtime::GemmArguments{
             .mode = cutlass::gemm::GemmUniversalMode::kGemm,
             .problem_shape = {m, n, k, groups},
@@ -295,10 +295,6 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
             printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
         }
     } else {
-        // The legacy EpilogueVisitor kernel recomputes `params_D` internally for
-        // `GemmType::BatchGemm`, hardcoding the transposed `[M, B, N]` addressing.
-        TORCH_CHECK(transposed_out,
-                    "int8_bmm: plain [B, M, N] output requires the actlize_v100 backend");
         int64_t stride, increment_row, increment_group, increment_cluster;
         int64_t advance_row, advance_group, advance_cluster, advance_tile;
         using ElementType = int8_t;
