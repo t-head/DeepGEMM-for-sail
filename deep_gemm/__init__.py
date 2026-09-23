@@ -82,18 +82,24 @@ from .deep_gemm_cpp import (
     fp8_einsum,
     int8_einsum,
     # Attention kernels (MQA logits)
-    get_paged_mqa_logits_metadata,
     bf16_mqa_logits,
-    fp8_mqa_logits,
-    fp8_mqa_avg_logits,
     int8_mqa_logits,
+    fp8_mqa_logits,
     fp8_fp4_mqa_logits,
     # Attention kernels (paged MQA logits)
+    get_paged_mqa_logits_metadata,
     bf16_paged_mqa_logits,
-    fp8_paged_mqa_logits,
     int8_paged_mqa_logits,
-    fp8_paged_mqa_avg_logits,
+    fp8_paged_mqa_logits,
     fp8_fp4_paged_mqa_logits,
+    # Attention kernels (avg MQA logits)
+    fp8_mqa_avg_logits,
+    fp8_paged_mqa_avg_logits,
+    # Attention kernels (sparse MQA logits)
+    get_sparse_mqa_logits_metadata,
+    fp8_fp4_sparse_mqa_logits,
+    get_paged_sparse_mqa_logits_metadata,
+    fp8_fp4_paged_sparse_mqa_logits,
 )
 
 deep_gemm_cpp.init(

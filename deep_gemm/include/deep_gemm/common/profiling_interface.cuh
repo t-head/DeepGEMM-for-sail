@@ -56,6 +56,38 @@ void set_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv,
     device_id_ = -1; // avoid check_support_dump print
 }
 
+void set_sparse_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv, int num_heads, int head_dim,
+                                  int sparse_block_kv, int num_max_sparse_blocks, bool use_unaligned_ks,
+                                  bool is_paged = false, hggcStream_t stream = 0) {
+    op_name_ = is_paged ? "PagedSparseMqaLogits" : "SparseMqaLogits";
+    add_argument("data_type");
+    add_argument("seq_len_q");
+    add_argument("seq_len_kv");
+    add_argument("num_heads");
+    add_argument("head_dim");
+    add_argument("sparse_block_kv");
+    add_argument("num_max_sparse_blocks");
+    add_argument("use_unaligned_ks");
+
+    add_params("data_type", data_type);
+    add_params("seq_len_q", seq_len_q);
+    add_params("seq_len_kv", seq_len_kv);
+    add_params("num_heads", num_heads);
+    add_params("head_dim", head_dim);
+    add_params("sparse_block_kv", sparse_block_kv);
+    add_params("num_max_sparse_blocks", num_max_sparse_blocks);
+    add_params("use_unaligned_ks", use_unaligned_ks);
+
+    stream_ = stream;
+    // Set default values (unused)
+    m_ = seq_len_q;
+    group_ = 1;
+    grouped_layout_ = nullptr;
+    gemm_type_ = GemmType::DenseGemm;
+    is_gemv_ = false;
+    device_id_ = -1; // avoid check_support_dump print
+}
+
 void set_paged_mqa_logits_params(std::string data_type, int batch_size, int next_n, int num_heads, int head_dim, int* context_lens, hggcStream_t stream = 0, bool is_avg = false) {
     op_name_ = is_avg ? "PagedMqaAvgLogits" : "PagedMqaLogits";
     add_argument("data_type");

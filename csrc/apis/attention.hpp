@@ -9,6 +9,7 @@
 
 #include "../jit_kernels/impls/mqa_logits.hpp"
 #include "../jit_kernels/impls/paged_mqa_logits.hpp"
+#include "../jit_kernels/impls/sparse_mqa_logits.hpp"
 
 namespace deep_gemm::attention {
 
@@ -396,6 +397,186 @@ torch::Tensor fp8_fp4_paged_mqa_logits(const std::pair<torch::Tensor, std::optio
                                    max_context_len, clean_logits, logits_dtype, q.second);
 }
 
+// ---- Sparse MQA logits (DeepSeek V4.1 DSA indexer; ported from open-source 26/09) ----
+// MXFP4 only.
+//
+// `sparse_kv_block_indices[num_q_tokens, num_max_sparse_blocks]` holds, per token, a
+// strictly-increasing prefix of its selected absolute KV block ids (each block covers
+// `sparse_block_kv` tokens anchored to the global token grid; with `use_unaligned_ks` the anchor
+// carries a `ks % sparse_block_kv` offset). The valid count is inferred from the KV length:
+// min(num_max_sparse_blocks, ceil_div(kv_end - kv_start, sparse_block_kv)); the tail padding is
+// never read. Output logits are slot-compacted bf16: column = slot * sparse_block_kv + token_in_block.
+torch::Tensor get_sparse_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_start,
+                                             const torch::Tensor& cu_seq_len_k_end,
+                                             int num_kv_tokens,
+                                             const torch::Tensor& sparse_kv_block_indices,
+                                             torch::ScalarType qk_dtype,
+                                             int sparse_block_kv, bool use_unaligned_ks = false) {
+    const int num_q_tokens = static_cast<int>(cu_seq_len_k_start.size(0));
+    DG_HOST_ASSERT(num_q_tokens > 0 and cu_seq_len_k_end.size(0) == num_q_tokens);
+    DG_HOST_ASSERT(cu_seq_len_k_start.scalar_type() == torch::kInt32 and cu_seq_len_k_end.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(cu_seq_len_k_start.is_contiguous() and cu_seq_len_k_end.is_contiguous());
+    DG_HOST_ASSERT(sparse_kv_block_indices.dim() == 2 and sparse_kv_block_indices.size(0) == num_q_tokens);
+    DG_HOST_ASSERT(sparse_kv_block_indices.scalar_type() == torch::kInt32 and sparse_kv_block_indices.is_contiguous());
+    DG_HOST_ASSERT(num_kv_tokens > 0);
+    DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
+    sparse_mqa_logits::get_sparse_split_kv(qk_dtype);  // MXFP4 only.
+    const int num_max_sparse_blocks = static_cast<int>(sparse_kv_block_indices.size(1));
+    const int64_t num_metadata_bytes = sparse_mqa_logits::get_num_sparse_metadata_bytes(
+        num_q_tokens, num_max_sparse_blocks, sparse_block_kv, sparse_mqa_logits::get_num_sparse_slots());
+    auto metadata = torch::empty({num_metadata_bytes},
+                                 sparse_kv_block_indices.options().dtype(torch::kUInt8));
+    // Cross-CTA coordination: WorkspaceState counters + one QBlockInfo per token. Process-wide
+    // cache, self-cleaning (the kernel resets the counters at the end).
+    const int64_t num_workspace_bytes =
+        static_cast<int64_t>(sizeof(sparse_mqa_logits::WorkspaceState)) +
+        static_cast<int64_t>(num_q_tokens) * sizeof(sparse_mqa_logits::QBlockInfo);
+    auto& workspace = sparse_mqa_logits::get_sparse_workspace(metadata.options(), num_workspace_bytes);
+    sparse_mqa_logits::launch_sparse_mqa_logits_metadata(
+        metadata, workspace, static_cast<uint32_t>(num_q_tokens), static_cast<uint32_t>(num_kv_tokens),
+        static_cast<uint32_t>(num_max_sparse_blocks), static_cast<uint32_t>(sparse_block_kv),
+        reinterpret_cast<const uint32_t*>(cu_seq_len_k_start.data_ptr<int>()),
+        reinterpret_cast<const uint32_t*>(cu_seq_len_k_end.data_ptr<int>()),
+        reinterpret_cast<const uint32_t*>(sparse_kv_block_indices.data_ptr<int>()),
+        use_unaligned_ks);
+    return metadata;
+}
+
+// Paged counterpart: KV windows are [0, context_lens[q]) per token; the physical location of a
+// selected logical block resolves through `block_table` (one row per Q token). `indices[q]` is
+// the request id of token q — Q blocks (kBlockQ = 2) only pair tokens of the same request. No
+// unaligned-ks support (pages are whole sparse blocks by construction).
+torch::Tensor get_paged_sparse_mqa_logits_metadata(const torch::Tensor& context_lens,
+                                                   const torch::Tensor& block_table,
+                                                   const torch::Tensor& indices, int page_kv,
+                                                   const torch::Tensor& sparse_kv_block_indices,
+                                                   torch::ScalarType qk_dtype, int sparse_block_kv) {
+    const int num_q_tokens = static_cast<int>(context_lens.size(0));
+    DG_HOST_ASSERT(num_q_tokens > 0 and block_table.size(0) == num_q_tokens and indices.size(0) == num_q_tokens);
+    DG_HOST_ASSERT(context_lens.scalar_type() == torch::kInt32 and context_lens.is_contiguous());
+    DG_HOST_ASSERT(block_table.scalar_type() == torch::kInt32 and block_table.is_contiguous() and
+                   block_table.dim() == 2);
+    DG_HOST_ASSERT(indices.scalar_type() == torch::kInt32 and indices.is_contiguous());
+    DG_HOST_ASSERT(sparse_kv_block_indices.dim() == 2 and sparse_kv_block_indices.size(0) == num_q_tokens);
+    DG_HOST_ASSERT(sparse_kv_block_indices.scalar_type() == torch::kInt32 and sparse_kv_block_indices.is_contiguous());
+    DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
+    DG_HOST_ASSERT(page_kv % sparse_block_kv == 0);
+    sparse_mqa_logits::get_sparse_split_kv(qk_dtype);  // MXFP4 only.
+    const int num_max_sparse_blocks = static_cast<int>(sparse_kv_block_indices.size(1));
+    const int64_t num_metadata_bytes = sparse_mqa_logits::get_num_sparse_metadata_bytes(
+        num_q_tokens, num_max_sparse_blocks, sparse_block_kv, sparse_mqa_logits::get_num_sparse_slots(),
+        /*is_paged=*/true);
+    auto metadata = torch::empty({num_metadata_bytes},
+                                 sparse_kv_block_indices.options().dtype(torch::kUInt8));
+    const int64_t num_workspace_bytes =
+        static_cast<int64_t>(sizeof(sparse_mqa_logits::WorkspaceState)) +
+        static_cast<int64_t>(num_q_tokens) * sizeof(sparse_mqa_logits::QBlockInfo);
+    auto& workspace = sparse_mqa_logits::get_sparse_workspace(metadata.options(), num_workspace_bytes);
+    sparse_mqa_logits::launch_sparse_mqa_logits_metadata(
+        metadata, workspace, static_cast<uint32_t>(num_q_tokens), /*num_kv_tokens=*/1,
+        static_cast<uint32_t>(num_max_sparse_blocks), static_cast<uint32_t>(sparse_block_kv),
+        /*cu_seq_len_k_start=*/nullptr, /*cu_seq_len_k_end=*/nullptr,
+        reinterpret_cast<const uint32_t*>(sparse_kv_block_indices.data_ptr<int>()),
+        /*use_unaligned_ks=*/false,
+        /*is_paged=*/true, static_cast<uint32_t>(page_kv),
+        reinterpret_cast<const uint32_t*>(context_lens.data_ptr<int>()),
+        reinterpret_cast<const uint32_t*>(block_table.data_ptr<int>()),
+        static_cast<uint32_t>(block_table.stride(0)),
+        reinterpret_cast<const uint32_t*>(indices.data_ptr<int>()));
+    return metadata;
+}
+
+// Computes logits only on the per-token selected KV blocks prebuilt in `metadata` (by
+// `get_sparse_mqa_logits_metadata`). Layout constraints mirror the open-source 26/09 API:
+// heads=32 / head_dim=128 are layout constants; weights must be bf16.
+torch::Tensor fp8_fp4_sparse_mqa_logits(const std::pair<torch::Tensor, torch::Tensor>& q,
+                                        const std::pair<torch::Tensor, torch::Tensor>& kv,
+                                        const torch::Tensor& weights, const torch::Tensor& metadata,
+                                        int num_max_sparse_blocks, int sparse_block_kv,
+                                        bool use_unaligned_ks = false) {
+    DG_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096);
+    DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
+    const auto& q_fp = q.first;
+    const auto& q_sf = q.second;
+    const auto& kv_fp = kv.first;
+    const auto& kv_sf = kv.second;
+    DG_HOST_ASSERT(q_fp.scalar_type() == torch::kInt8 and q_fp.is_contiguous());
+    DG_HOST_ASSERT(kv_fp.scalar_type() == torch::kInt8 and kv_fp.is_contiguous());
+    const auto q_shape = q_fp.sizes();  // [num_q_tokens, kNumHeads, kHeadDim / 2]
+    const int num_q_tokens = static_cast<int>(q_shape[0]);
+    DG_HOST_ASSERT(q_shape.size() == 3 and
+                   q_shape[1] == static_cast<int64_t>(sparse_mqa_logits::kNumHeads) and
+                   q_shape[2] == static_cast<int64_t>(sparse_mqa_logits::kHeadDim / 2));
+    DG_HOST_ASSERT(q_sf.scalar_type() == torch::kInt32 and q_sf.is_contiguous() and
+                   q_sf.dim() == 2 and q_sf.size(0) == num_q_tokens and
+                   q_sf.size(1) == static_cast<int64_t>(sparse_mqa_logits::kNumHeads));
+    DG_HOST_ASSERT(kv_fp.dim() == 2 and kv_fp.size(1) == sparse_mqa_logits::kHeadDim / 2);
+    DG_HOST_ASSERT(kv_sf.scalar_type() == torch::kInt32 and kv_sf.is_contiguous() and kv_sf.numel() == kv_fp.size(0));
+    DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16 and weights.is_contiguous() and
+                   weights.dim() == 2 and weights.size(0) == num_q_tokens and
+                   weights.size(1) == static_cast<int64_t>(sparse_mqa_logits::kNumHeads));
+    DG_HOST_ASSERT(metadata.scalar_type() == torch::kUInt8 and metadata.is_contiguous() and metadata.dim() == 1 and
+                   // Skip full header validation to avoid synchronizing the stream
+                   metadata.numel() >= static_cast<int64_t>(sizeof(sparse_mqa_logits::MetadataHeader)));
+    const int num_output_tokens = num_max_sparse_blocks * sparse_block_kv;
+    const int logits_stride = align(num_output_tokens, 512);  // 1024B row alignment for bf16
+    auto logits = torch::empty({align(num_q_tokens, static_cast<int>(sparse_mqa_logits::kBlockQ)), logits_stride},
+                               q_fp.options().dtype(torch::kBFloat16));
+    logits = logits.slice(0, 0, num_q_tokens);
+    sparse_mqa_logits::launch_fp4_sparse_mqa_logits(
+        q_fp, q_sf, kv_fp, kv_sf, weights, metadata, logits,
+        static_cast<uint32_t>(logits_stride), static_cast<uint32_t>(sparse_block_kv),
+        static_cast<uint32_t>(num_q_tokens), static_cast<uint32_t>(kv_fp.size(0)),
+        static_cast<uint32_t>(num_max_sparse_blocks), use_unaligned_ks);
+    return logits;
+}
+
+// Paged counterpart of `fp8_fp4_sparse_mqa_logits`: `kv_cache` is the fused fp4 cache viewed as
+// `[num_pages, page_kv, 1, head_dim/2 + 4]` uint8 (each packed 64B token row trails a 4B SF
+// u32), with 512B-aligned page stride. Consumes the metadata built by
+// `get_paged_sparse_mqa_logits_metadata`.
+torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::pair<torch::Tensor, torch::Tensor>& q,
+                                              const torch::Tensor& kv_cache, const torch::Tensor& weights,
+                                              const torch::Tensor& metadata,
+                                              int num_max_sparse_blocks, int sparse_block_kv) {
+    DG_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096);
+    DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
+    const auto& q_fp = q.first;
+    const auto& q_sf = q.second;
+    const auto q_shape = q_fp.sizes();  // [num_q_tokens, kNumHeads, kHeadDim / 2]
+    const int num_q_tokens = static_cast<int>(q_shape[0]);
+    DG_HOST_ASSERT(q_shape.size() == 3 and
+                   q_shape[1] == static_cast<int64_t>(sparse_mqa_logits::kNumHeads) and
+                   q_shape[2] == static_cast<int64_t>(sparse_mqa_logits::kHeadDim / 2));
+    DG_HOST_ASSERT(q_fp.scalar_type() == torch::kInt8 and q_fp.is_contiguous());
+    DG_HOST_ASSERT(q_sf.scalar_type() == torch::kInt32 and q_sf.is_contiguous() and
+                   q_sf.dim() == 2 and q_sf.size(0) == num_q_tokens and
+                   q_sf.size(1) == static_cast<int64_t>(sparse_mqa_logits::kNumHeads));
+    const int64_t head_dim_with_sf = sparse_mqa_logits::kHeadDim / 2 + sizeof(uint32_t);
+    DG_HOST_ASSERT(kv_cache.scalar_type() == torch::kUInt8 and kv_cache.dim() == 4 and
+                   kv_cache.size(2) == 1 and kv_cache.size(3) == head_dim_with_sf and
+                   kv_cache.stride(1) == head_dim_with_sf and kv_cache.stride(3) == 1 and
+                   kv_cache.stride(0) % 512 == 0);
+    DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16 and weights.is_contiguous() and
+                   weights.dim() == 2 and weights.size(0) == num_q_tokens and
+                   weights.size(1) == static_cast<int64_t>(sparse_mqa_logits::kNumHeads));
+    DG_HOST_ASSERT(metadata.scalar_type() == torch::kUInt8 and metadata.is_contiguous() and metadata.dim() == 1 and
+                   metadata.numel() >= static_cast<int64_t>(sizeof(sparse_mqa_logits::MetadataHeader)));
+    const int page_kv = static_cast<int>(kv_cache.size(1));
+    DG_HOST_ASSERT(page_kv % sparse_block_kv == 0);
+    const int num_output_tokens = num_max_sparse_blocks * sparse_block_kv;
+    const int logits_stride = align(num_output_tokens, 512);  // 1024B row alignment for bf16
+    auto logits = torch::empty({align(num_q_tokens, static_cast<int>(sparse_mqa_logits::kBlockQ)), logits_stride},
+                               q_fp.options().dtype(torch::kBFloat16));
+    logits = logits.slice(0, 0, num_q_tokens);
+    sparse_mqa_logits::launch_fp4_paged_sparse_mqa_logits(
+        q_fp, q_sf, kv_cache, weights, metadata, logits,
+        static_cast<uint32_t>(logits_stride), static_cast<uint32_t>(sparse_block_kv),
+        static_cast<uint32_t>(num_q_tokens), /*seq_len_kv=*/static_cast<uint32_t>(kv_cache.size(0) * page_kv),
+        static_cast<uint32_t>(num_max_sparse_blocks));
+    return logits;
+}
+
 }
 
 static void register_apis(pybind11::module_& m) {
@@ -412,6 +593,21 @@ static void register_apis(pybind11::module_& m) {
     m.def("fp8_fp4_mqa_logits", &fp8_fp4_mqa_logits, py::arg("q"), py::arg("kv"), py::arg("weights"),
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"), py::arg("clean_logits") = true,
           py::arg("max_seqlen_k") = 0, py::arg("logits_dtype") = torch::kFloat32);
+    // Sparse MQA logits (contiguous + paged)
+    m.def("get_sparse_mqa_logits_metadata", &get_sparse_mqa_logits_metadata,
+          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"), py::arg("num_kv_tokens"),
+          py::arg("sparse_kv_block_indices"), py::arg("qk_dtype"), py::arg("sparse_block_kv"),
+          py::arg("use_unaligned_ks") = false);
+    m.def("fp8_fp4_sparse_mqa_logits", &fp8_fp4_sparse_mqa_logits,
+          py::arg("q"), py::arg("kv"), py::arg("weights"), py::arg("metadata"),
+          py::arg("num_max_sparse_blocks"), py::arg("sparse_block_kv"),
+          py::arg("use_unaligned_ks") = false);
+    m.def("get_paged_sparse_mqa_logits_metadata", &get_paged_sparse_mqa_logits_metadata,
+          py::arg("context_lens"), py::arg("block_table"), py::arg("indices"), py::arg("page_kv"),
+          py::arg("sparse_kv_block_indices"), py::arg("qk_dtype"), py::arg("sparse_block_kv"));
+    m.def("fp8_fp4_paged_sparse_mqa_logits", &fp8_fp4_paged_sparse_mqa_logits,
+          py::arg("q"), py::arg("kv_cache"), py::arg("weights"), py::arg("metadata"),
+          py::arg("num_max_sparse_blocks"), py::arg("sparse_block_kv"));
     m.def("fp8_mqa_avg_logits", &fp8_mqa_avg_logits, py::arg("q"), py::arg("kv_s"),
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"), py::arg("clean_logits") = true,
           py::arg("max_seqlen_k") = 0, py::arg("q_scale") = std::nullopt,
