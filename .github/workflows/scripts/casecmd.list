@@ -1,0 +1,16 @@
+# DeepGEMM PR unit-test commands
+# Each non-empty, non-comment line is executed as a shell command.
+# NOTE: For debugging only line 11 (w4a16 GroupedNoPad) is enabled; the rest
+# are temporarily commented out. Uncomment to restore the full suite.
+
+# python ./tests/test_core.py
+# python ./tests/test_attention.py
+# python ./tests/test_jit.py
+# python ./tests/run_deep_gemm.py --format=DenseGemm,data_type:tf32,m:8192,n:24,k:16384
+# python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:int8,groups:32,m:4096,n:4096,k:7168,em:128,distribution:uniform
+# python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:bf16,groups:16,m:4096,n:1024,k:2048,em:256,distribution:uniform
+# python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:int8,groups:256,num_token:256,topk:8,n:256,k:6144
+# python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:int8,groups:256,num_token:2048,topk:8,n:6144,k:128
+# python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:bf16,groups:256,num_token:64,topk:8,n:256,k:6144
+# python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:bf16,groups:256,num_token:256,topk:8,n:6144,k:128
+python ./tests/run_deep_gemm.py --format=GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
