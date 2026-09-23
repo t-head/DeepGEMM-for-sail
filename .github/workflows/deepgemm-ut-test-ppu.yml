@@ -1,0 +1,185 @@
+name: deepgemm ut test     # Workflow name displayed on the Actions page
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        required: false
+        type: string
+        default: '["ZW-M890P", "OAM-810E"]'
+      source_mode:
+        description: "Source layout mode. Supported values: deepgemm, actlize0.5.0, actlize1.0.0."
+        required: false
+        type: string
+        default: deepgemm
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PPU_BASE_IMAGE: ${{ secrets.PPU_BASE_IMAGE }}
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pair each runner with its dedicated caselist; build and test run separately per board.
+        include:
+          - runner: ZW-M890P
+            caselist: casecmd_890p.list
+          - runner: OAM-810E
+            caselist: casecmd_810e.list
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the base..head diff below resolves both ends.
+          fetch-depth: 0
+          # Fetch submodules (e.g. third-party/actlize_*, third-party/fmt) at checkout time, recursively.
+          submodules: recursive
+          persist-credentials: false
+      - name: Build and Test on PPU
+        id: ppu-test
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=${{ matrix.runner }}"
+          namespace: ppu-sched
+          timeout_minutes: 300
+          command: |
+            set -ex
+            # Fix the image's unreachable pip and GitHub mirror settings before cloning sources.
+            unset PIP_INDEX_URL
+            git config --global --unset-all url.https://ai-gerrit.eng.t-head.cn/Public/Github/.insteadOf 2>/dev/null || true
+            git config --global --add safe.directory '*'
+            SOURCE_MODE='${{ inputs.source_mode }}'
+            case "$SOURCE_MODE" in
+              ""|deepgemm)
+                cd /workspace/source
+                ;;
+              actlize0.5.0)
+                cd /workspace
+                DEEPGEMM_SOURCE=$(mktemp -d /workspace/deepgemm-source.XXXXXX)
+                rmdir "$DEEPGEMM_SOURCE"
+                git clone --recurse-submodules -b main \
+                  https://github.com/t-head/DeepGEMM-for-sail.git "$DEEPGEMM_SOURCE"
+                ACTLIZE_V100_SOURCE=$(mktemp -d /workspace/actlize-v100-source.XXXXXX)
+                rmdir "$ACTLIZE_V100_SOURCE"
+                git clone --recurse-submodules -b v1.0.0 \
+                  https://github.com/t-head/actlize.git "$ACTLIZE_V100_SOURCE"
+
+                ACTLIZE_V050_SOURCE=$(mktemp -d /workspace/actlize-v050-source.XXXXXX)
+                rmdir "$ACTLIZE_V050_SOURCE"
+                mv /workspace/source "$ACTLIZE_V050_SOURCE"
+                rm -rf "$DEEPGEMM_SOURCE/third-party/actlize_v0.5.0"
+                rm -rf "$DEEPGEMM_SOURCE/third-party/actlize_v1.0.0"
+                mkdir -p "$DEEPGEMM_SOURCE/third-party"
+                mv "$ACTLIZE_V050_SOURCE" "$DEEPGEMM_SOURCE/third-party/actlize_v0.5.0"
+                mv "$ACTLIZE_V100_SOURCE" "$DEEPGEMM_SOURCE/third-party/actlize_v1.0.0"
+                mv "$DEEPGEMM_SOURCE" /workspace/source
+                cd /workspace/source
+                ;;
+              actlize1.0.0)
+                cd /workspace
+                DEEPGEMM_SOURCE=$(mktemp -d /workspace/deepgemm-source.XXXXXX)
+                rmdir "$DEEPGEMM_SOURCE"
+                git clone --recurse-submodules -b main \
+                  https://github.com/t-head/DeepGEMM-for-sail.git "$DEEPGEMM_SOURCE"
+                ACTLIZE_V050_SOURCE=$(mktemp -d /workspace/actlize-v050-source.XXXXXX)
+                rmdir "$ACTLIZE_V050_SOURCE"
+                git clone --recurse-submodules -b v0.5.0 \
+                  https://github.com/t-head/actlize.git "$ACTLIZE_V050_SOURCE"
+
+                ACTLIZE_V100_SOURCE=$(mktemp -d /workspace/actlize-v100-source.XXXXXX)
+                rmdir "$ACTLIZE_V100_SOURCE"
+                mv /workspace/source "$ACTLIZE_V100_SOURCE"
+                rm -rf "$DEEPGEMM_SOURCE/third-party/actlize_v0.5.0"
+                rm -rf "$DEEPGEMM_SOURCE/third-party/actlize_v1.0.0"
+                mkdir -p "$DEEPGEMM_SOURCE/third-party"
+                mv "$ACTLIZE_V050_SOURCE" "$DEEPGEMM_SOURCE/third-party/actlize_v0.5.0"
+                mv "$ACTLIZE_V100_SOURCE" "$DEEPGEMM_SOURCE/third-party/actlize_v1.0.0"
+                mv "$DEEPGEMM_SOURCE" /workspace/source
+                cd /workspace/source
+                ;;
+              *)
+                echo "Unsupported source_mode: $SOURCE_MODE"
+                exit 1
+                ;;
+            esac
+            # PPU SDK and torch are pre-installed in the docker image
+            source /usr/local/PPU_SDK/envsetup.sh || true
+            which hgcc || true
+            echo $PPU_SDK
+            pip install ray[adag]==2.40.0 --no-deps
+            pip install setuptools==69.5.1
+            # Match setup.py setup_requires exactly so the build never re-fetches it from the (unreachable) internal index.
+            pip install setuptools-scm==9.2.2
+            pip install numpy==1.26.4 junit-xml rich
+            pip install --upgrade pytest
+            export MAX_JOBS=20
+            export PYTORCH_SAIL_ARCH="ppu_10;ppu_15"
+            # Submodules are initialized by checkout or the source_mode clones above.
+            echo "START TO BUILD WHEEL"
+            LOG_FILE="build.log"
+            ERROR_LOG="error.log"
+            echo "Building wheel..."
+            python ./setup.py bdist_wheel > "$LOG_FILE" 2> "$ERROR_LOG"
+            EXIT_CODE=$?
+
+            # Check the build result.
+            if [ $EXIT_CODE -ne 0 ]; then
+                echo "Build failed with exit code $EXIT_CODE"
+                cat "$ERROR_LOG" # Show error details
+                echo "----- last 1000 lines of $LOG_FILE -----"
+                tail -n 1000 "$LOG_FILE"
+                exit 1
+            else
+                echo "✅ Build succeeded!"
+                echo "----- last 200 lines of $LOG_FILE -----"
+                tail -n 200 "$LOG_FILE"
+            fi
+            echo "START TO INSTALL WHEEL"
+            pip install ./dist/*.whl --force-reinstall
+            echo "START TO TEST CASES"
+            set +e
+            python .github/workflows/scripts/pr-deepgemm-ut.py \
+              --caselist .github/workflows/scripts/${{ matrix.caselist }}
+            TEST_EXIT_CODE=$?
+            # Record the runtime environment alongside the JUnit report.
+            python3 .github/workflows/scripts/generate-env-info.py \
+            --docker-image "${{ env.SAIL_IMAGE }}" \
+            --output env_info.json
+            # Copy the JUnit report and runtime information to NAS for the runner.
+            # Keep results per runner so the parallel matrix jobs do not collide.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            mkdir -p "$NAS_RESULT_DIR"
+            cp test-results.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
+            cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
+            exit "$TEST_EXIT_CODE"
+          cleanup_policy: on_success
+
+      - name: Test summary (${{ matrix.runner }})
+        if: always()
+        shell: bash
+        run: |
+          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+          XML_FILE="$NAS_RESULT_DIR/test-results.xml"
+          ENV_FILE="$NAS_RESULT_DIR/env_info.json"
+          echo "## Runner: ${{ matrix.runner }}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ! -f "$XML_FILE" ]]; then
+            echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          python3 .github/workflows/scripts/display-test-summary.py \
+            "$XML_FILE" --env-info "$ENV_FILE"
