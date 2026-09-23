@@ -7,7 +7,7 @@ template <GemmType kGemmType,
     uint32_t SHAPE_N_, uint32_t SHAPE_K_,
     uint32_t BLOCK_M_, uint32_t BLOCK_N_,
     uint32_t kNumGroups_,
-    uint32_t kNumNBlocks = ceil_div(SHAPE_N_, BLOCK_N_),
+    uint32_t kNumNBlocks = math::ceil_div(SHAPE_N_, BLOCK_N_),
     uint32_t kNum1DBlocksPerGroup = 2>
 struct FusedGemmScheduler {
 public:
@@ -52,7 +52,7 @@ public:
     uint4 data = __ldg(expert_ids_and_cumsum_ + block_m_idx);
     curr_group_idx = data.x;
     curr_group_m = data.y;
-    uint32_t num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
+    uint32_t num_m_blocks = math::ceil_div(curr_group_m, BLOCK_M);
     uint32_t block_idx_in_m = next_block_idx - data.z * kNumNBlocks;
     get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);
     cumsum_m_block_idx = m_block_idx + data.z;

@@ -65,7 +65,7 @@ template <
   class StrideSFB_,
   class GmemTiledCopySFB_,
   class SmemLayoutAtomSFB_,
-  FP4DynamicTileId kDynamicTileId = FP4DynamicTileId::Disabled>
+  deep_gemm::FP4DynamicTileId kDynamicTileId = deep_gemm::FP4DynamicTileId::Disabled>
 struct CollectiveMmaScaleFp4
 {
   //
@@ -565,7 +565,7 @@ struct CollectiveMmaScaleFp4
           smem_pipe_write = smem_pipe_read;
         }
   };
-    if constexpr (kDynamicTileId != FP4DynamicTileId::LargeEM) {
+    if constexpr (kDynamicTileId != deep_gemm::FP4DynamicTileId::LargeEM) {
       for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block)
       {
         process_kblock_iterations(k_block);

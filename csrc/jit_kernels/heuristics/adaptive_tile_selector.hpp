@@ -17,7 +17,7 @@
 
 namespace deep_gemm_adaptive {
 
-using ::ceil_div;
+using ::deep_gemm::ceil_div;
 
 inline bool bf16_adaptive_enabled(int m, int n, int k) {
     // 0: force disable, 1: force enable, other values: use default

@@ -281,7 +281,7 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
                                      make_coord(n_coord / n_factor,_));
       Tensor tSFBgSFB = gmem_thr_copy_SFB.partition_S(gSFB);
 
-      static constexpr int K_TILE_COUNT = ceil_div(SHAPE_K, BLOCK_K);
+      static constexpr int K_TILE_COUNT = math::ceil_div(SHAPE_K, BLOCK_K);
 
       int k_tile_iter  = 0;
       int k_tile_count = K_TILE_COUNT;
@@ -533,8 +533,8 @@ public:
           ProfilingInterface::Instance().instrument(false, dg_prof_params);
         };
         if constexpr(SHAPE_K <= 512 && (BLOCK_K == 128) && (SHAPE_K % BLOCK_K == 0)) {
-          int expected_m = ceil_div(shape_m * topk, kNumGroups);
-          int wave = ceil_div(ceil_div(expected_m, BLOCK_M) * ceil_div(SHAPE_N, BLOCK_N), num_sms);
+          int expected_m = math::ceil_div(shape_m * topk, kNumGroups);
+          int wave = math::ceil_div(math::ceil_div(expected_m, BLOCK_M) * math::ceil_div(SHAPE_N, BLOCK_N), num_sms);
           switch (wave) {
           case 1:
             launch_kernel(_1{});

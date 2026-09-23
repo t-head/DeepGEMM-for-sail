@@ -10,6 +10,8 @@
 
 namespace deep_gemm_fp8_lut {
 
+using deep_gemm::GemmType;
+
 // 6-tuple tile: (block_m, block_n, block_k, warp_m, warp_n, num_stages)
 using Tile = std::tuple<int, int, int, int, int, int>;
 

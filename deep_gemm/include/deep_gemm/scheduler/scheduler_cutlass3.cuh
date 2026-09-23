@@ -58,7 +58,7 @@ template <GemmType kGemmType,
           uint32_t SHAPE_N_, uint32_t SHAPE_K_,
           uint32_t BLOCK_M_, uint32_t BLOCK_N_,
           uint32_t kNumGroups_,
-          uint32_t kNumNBlocks = ceil_div(SHAPE_N_, BLOCK_N_),
+          uint32_t kNumNBlocks = math::ceil_div(SHAPE_N_, BLOCK_N_),
           uint32_t kNum1DBlocksPerGroup = 2,
           EpilogueType kEpilogueType = EpilogueType::Default,
           bool kTransposedBatchOutput = true>
@@ -95,7 +95,7 @@ struct DeepGemmScheduler {
     // --- Device-only methods below (guarded from host compilation) ---
 
     CUTLASS_DEVICE explicit DeepGemmScheduler(Params const& params_, const int warp_group_id = 0) : params(params_), current_iter(warp_group_id) {
-        num_aligned_m_blocks = ceil_div(params_.shape_m, BLOCK_M);
+        num_aligned_m_blocks = math::ceil_div(params_.shape_m, BLOCK_M);
         if constexpr(kGemmType == GemmType::DenseGemm || kGemmType == GemmType::BatchGemm) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if constexpr(kGemmType == GemmType::GroupedContiguous) {
@@ -161,7 +161,7 @@ struct DeepGemmScheduler {
             curr_group_idx = data.x;
             curr_group_m = data.y;
             uint32_t block_idx_in_m = next_block_idx - data.z * kNumNBlocks;
-            uint32_t num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
+            uint32_t num_m_blocks = math::ceil_div(curr_group_m, BLOCK_M);
             get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);
             if constexpr(kGemmType == GemmType::GroupedFused) {
                 m_block_idx += data.z;
@@ -179,7 +179,7 @@ struct DeepGemmScheduler {
                 }
                 // Within the current group
                 curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
-                num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
+                num_m_blocks = math::ceil_div(curr_group_m, BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
                 if (next_block_idx < current_m_block_cumsum * kNumNBlocks)
                     break;
@@ -238,7 +238,7 @@ struct DeepGemmScheduler {
             curr_group_idx = data.x;
             curr_group_m = data.y;
             uint32_t block_idx_in_m = data.z * kNumNBlocks + next_block_idx % kNumNBlocks;
-            uint32_t num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
+            uint32_t num_m_blocks = math::ceil_div(curr_group_m, BLOCK_M);
             curr_cumsum_m = data.w;
             get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);
         } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
@@ -254,7 +254,7 @@ struct DeepGemmScheduler {
                 // Within the current group
                 curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
                 n_expand = get_n_expand<kEnableNExpand>(curr_group_m);
-                num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
+                num_m_blocks = math::ceil_div(curr_group_m, BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
                 curr_cumsum_blocks_prev = curr_cumsum_blocks;
                 int curr_cumsum_blocks_next = curr_cumsum_blocks + num_m_blocks * kNumNBlocks / n_expand;
@@ -366,7 +366,7 @@ struct DeepGemmScheduler {
     __device__ __forceinline__ int64_t curr_offset_mxfp4_scalea() const
     {
         // scales are organized in uint16_t
-        uint32_t shape_k_scale = ceil_div(SHAPE_K, (uint32_t)32);
+        uint32_t shape_k_scale = math::ceil_div(SHAPE_K, (uint32_t)32);
         if constexpr (kGemmType == GemmType::GroupedNoPad) {
             // /4 means uint8_t to uint32_t;
             return int64_t(curr_cumsum_m);
@@ -404,7 +404,7 @@ struct DeepGemmScheduler {
     __device__ __forceinline__ int64_t curr_offset_mxfp4_scaleb(const int m_block_idx = 0) const
     {
         // scale are organized in uint16_t
-        uint32_t shape_k_scale = ceil_div(SHAPE_K, (uint32_t)32);
+        uint32_t shape_k_scale = math::ceil_div(SHAPE_K, (uint32_t)32);
 
         return int64_t(curr_group_idx) * SHAPE_N * shape_k_scale;
     }
@@ -495,13 +495,13 @@ struct DynamicTileScheduler
                                BuilderConfig_::BlockM[BuilderConfig_::kNumBuilders - 1],
                                BuilderConfig_::BlockN[BuilderConfig_::kNumBuilders - 1],
                                kNumGroups_,
-                               ceil_div((uint32_t)SHAPE_N_, (uint32_t)BuilderConfig_::BlockN[BuilderConfig_::kNumBuilders - 1]),
+                               math::ceil_div((uint32_t)SHAPE_N_, (uint32_t)BuilderConfig_::BlockN[BuilderConfig_::kNumBuilders - 1]),
                                kNum1DBlocksPerGroup, kEpilogueType> {
     using Base = DeepGemmScheduler<kGemmType, SHAPE_N_, SHAPE_K_,
                                     BuilderConfig_::BlockM[BuilderConfig_::kNumBuilders - 1],
                                     BuilderConfig_::BlockN[BuilderConfig_::kNumBuilders - 1],
                                     kNumGroups_,
-                                    ceil_div((uint32_t)SHAPE_N_, (uint32_t)BuilderConfig_::BlockN[BuilderConfig_::kNumBuilders - 1]),
+                                    math::ceil_div((uint32_t)SHAPE_N_, (uint32_t)BuilderConfig_::BlockN[BuilderConfig_::kNumBuilders - 1]),
                                     kNum1DBlocksPerGroup, kEpilogueType>;
     using BuilderConfig = BuilderConfig_;
     using Params = typename Base::Params;
@@ -543,8 +543,8 @@ struct DynamicTileScheduler
                 int builder_block_m = BuilderConfig::get_block_m(curr_builder_idx);
                 int builder_block_n = BuilderConfig::get_block_n(curr_builder_idx);
 
-                num_m_blocks = ceil_div(this->curr_group_m, (uint32_t)builder_block_m);
-                int num_n_blocks = ceil_div((uint32_t)SHAPE_N_, (uint32_t)builder_block_n);
+                num_m_blocks = math::ceil_div(this->curr_group_m, (uint32_t)builder_block_m);
+                int num_n_blocks = math::ceil_div((uint32_t)SHAPE_N_, (uint32_t)builder_block_n);
                 curr_num_blocks = num_m_blocks * num_n_blocks;
 
                 curr_cumsum_blocks_prev = this->curr_cumsum_blocks;

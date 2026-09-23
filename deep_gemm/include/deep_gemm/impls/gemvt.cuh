@@ -116,7 +116,7 @@ __device__ void batched_gemvt_kernel_small_k_impl(const GemvtArgs args) {
   acc_type results[NPerThread];
 
   int num_pid_m = args.num_tokens;
-  int num_pid_n = ceil_div(args.N, NPerBlock);
+  int num_pid_n = math::ceil_div(args.N, NPerBlock);
   int num_pid_in_group = GROUP_SIZE_M * num_pid_n;
   int group_id = blockIdx.x / num_pid_in_group;
   int first_pid_m = group_id * GROUP_SIZE_M;
@@ -290,7 +290,7 @@ __device__ void batched_gemvt_kernel_impl(const GemvtArgs args) {
     acc_type accum[NUM_UNROLL * BlockM * NPerThread];
 
     int num_pid_m = args.num_tokens;
-    int num_pid_n = ceil_div(args.N, NPerBlock);
+    int num_pid_n = math::ceil_div(args.N, NPerBlock);
     int num_pid_in_group = GROUP_SIZE_M * num_pid_n;
 
     int block_id = blockIdx.x;
@@ -455,7 +455,7 @@ public:
         if (SMALL_K == false) {
             size_t grid_x = shape_m;
             constexpr uint32_t NPerBlock = NPerThread * BlockSize / ThreadPerN;
-            size_t grid_y = ceil_div(SHAPE_N, NPerBlock);
+            size_t grid_y = math::ceil_div(SHAPE_N, NPerBlock);
             args.total_blocks = grid_x * grid_y;
             // check GEMM_K alignment
             if(args.K % (NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type)) != 0) {
@@ -488,7 +488,7 @@ public:
             // launch small_k gemm_v
             size_t grid_x = args.num_tokens;
             constexpr int NPerBlock = NPerThread * BlockSize / ThreadPerN;
-            size_t grid_y = ceil_div(args.N, NPerBlock);
+            size_t grid_y = math::ceil_div(args.N, NPerBlock);
             args.total_blocks = grid_x * grid_y;
             constexpr int MAX_K = NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type);
             constexpr int MIN_ALIGNMENT = 16 / sizeof(src_type); // for int4 copy

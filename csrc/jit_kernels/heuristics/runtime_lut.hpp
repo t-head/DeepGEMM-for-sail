@@ -20,6 +20,8 @@
 
 namespace deep_gemm_lut {
 
+using deep_gemm::GemmType;
+
 using Tile = std::tuple<int, int, int, int, int, int>;
 enum class RuntimeLutKind { FP8Blockwise, FP8Channelwise, INT8, BF16, FP4 };
 using RuntimeKey = std::tuple<int, int, int, int>; // (n, k, num_groups, m); grouped GEMMs use lower_bound on m

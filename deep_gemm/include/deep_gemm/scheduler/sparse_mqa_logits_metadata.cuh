@@ -156,7 +156,7 @@ __device__ __forceinline__ uint32_t build_paged_schedule(
         const uint32_t q_token_idx = q_token_begin + tid;
         const QBlockInfo q_block_info = q_token_idx < num_q_tokens ? q_block_infos[q_token_idx] : QBlockInfo(0, 0);
         const uint32_t num_kv_splits = q_block_info.num_kv_splits;
-        const uint32_t num_q_entries = ceil_div(num_kv_splits, kNumKVSplitsPerEntry);
+        const uint32_t num_q_entries = math::ceil_div(num_kv_splits, kNumKVSplitsPerEntry);
         uint32_t num_batch_entries;
         const uint32_t entry_begin = num_entries + cta_exclusive_sum_u32<kNumThreads>(
             num_q_entries, warp_sums, num_batch_entries);
@@ -176,7 +176,7 @@ __device__ __forceinline__ uint32_t build_paged_schedule(
         __syncthreads();
     }
 
-    const uint32_t num_waves = max(1u, ceil_div(num_entries, kNumSlots));
+    const uint32_t num_waves = max(1u, math::ceil_div(num_entries, kNumSlots));
     for (uint32_t entry_idx = num_entries + tid; entry_idx < num_waves * kNumSlots; entry_idx += kNumThreads)
         schedule_entries[entry_idx] = ScheduleEntry(0, 0, 0, 0);
     __syncthreads();
@@ -305,7 +305,7 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
                         if constexpr (not kUseUnalignedKs)
                             DG_DEVICE_ASSERT(kv_end == kv_begin or kv_begin % SPARSE_BLOCK_KV == 0);
                     }
-                    return min(num_max_sparse_blocks, ceil_div(kv_end - kv_begin, SPARSE_BLOCK_KV));
+                    return min(num_max_sparse_blocks, math::ceil_div(kv_end - kv_begin, SPARSE_BLOCK_KV));
                 };
                 q_block.q_token_base = q_token_idx;
                 q_block.num_q_tokens = num_q_block_tokens;
@@ -395,7 +395,7 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
         uint32_t num_merged_kv_blocks;
         const uint32_t merged_kv_block_base = cta_exclusive_sum_u32<kNumThreads>(
             num_merged_kv_blocks_in_thread, warp_sums, num_merged_kv_blocks);
-        const uint32_t num_kv_splits_in_q_block = ceil_div(num_merged_kv_blocks, kNumKVBlocksPerSplit);
+        const uint32_t num_kv_splits_in_q_block = math::ceil_div(num_merged_kv_blocks, kNumKVBlocksPerSplit);
         if (tid == 0) {
             q_block.kv_split_base = num_kv_splits_in_q_block == 0 ? 0 :
                 atomic_add_relaxed_global_u32(&workspace_state->num_kv_splits, num_kv_splits_in_q_block);

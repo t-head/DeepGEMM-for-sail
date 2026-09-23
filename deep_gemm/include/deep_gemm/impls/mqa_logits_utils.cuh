@@ -95,7 +95,7 @@ load_schedule(uint32_t block_q_idx, uint32_t q_iter_idx, uint32_t q_iter_offset,
     start = start / 4 * 4;
     return {(q_iter_idx + q_iter_offset) % kNumQStages,
             ((q_iter_idx + q_iter_offset) / kNumQStages) & 1,
-            start, end, ceil_div(end - start, static_cast<uint32_t>(BLOCK_KV))};
+            start, end, math::ceil_div(end - start, static_cast<uint32_t>(BLOCK_KV))};
 }
 
 __forceinline__ __device__

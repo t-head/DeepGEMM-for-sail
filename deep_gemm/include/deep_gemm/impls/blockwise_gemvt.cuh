@@ -48,7 +48,7 @@ __global__ void batched_blockwise_gemvt_kernel_small_k(const BlockWiseGemvtArgs 
   constexpr int NLoopStep = BlockSize / ThreadPerN;
 
   int num_pid_m = args.num_tokens;
-  int num_pid_n = ceil_div(args.N, NPerBlock);
+  int num_pid_n = math::ceil_div(args.N, NPerBlock);
   int num_pid_in_group = GROUP_SIZE_M * num_pid_n;
   int group_id = blockIdx.x / num_pid_in_group;
   int first_pid_m = group_id * GROUP_SIZE_M;

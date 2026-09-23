@@ -213,7 +213,7 @@ fp4_gemm_fused_moe_kernel_impl(const Fp4QuantGemmArgs args) {
     //  *(lane-on-k): `ScaleKsPerTile` lanes share one row, their b16 requests are contiguous and
     //    collapsed into one gmem request, at the cost of a `ScaleKsPerTile`-way tsm write bank conflict
     constexpr uint32_t NumThreads_Needed = ScaleMsPerTile * ScaleKsPerTile;
-    constexpr uint32_t ACP_SFA_ITER = ceil_div(NumThreads_Needed, BLOCK_SIZE);
+    constexpr uint32_t ACP_SFA_ITER = math::ceil_div(NumThreads_Needed, BLOCK_SIZE);
     static_assert(32 % ScaleKsPerTile == 0,
                   "ScaleKsPerTile must divide the warp size for the lane-on-k sfa g2s mapping.");
     // Whether the flattened thread mapping overshoots BLOCK_M rows (tail threads that must not write smem).

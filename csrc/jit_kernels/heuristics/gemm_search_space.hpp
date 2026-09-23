@@ -1,3 +1,5 @@
+#pragma once
+
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -11,9 +13,8 @@
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
 
-inline int align(int x, int y) {
-    return ceil_div(x, y) * y;
-}
+namespace deep_gemm {
+
 
 class MatmulHeuristicsTile {
 public:
@@ -802,3 +803,5 @@ public:
         file.close();
     }
 };
+
+} // namespace deep_gemm

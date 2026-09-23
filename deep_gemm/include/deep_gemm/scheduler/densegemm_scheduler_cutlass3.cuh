@@ -76,8 +76,8 @@ struct DenseGemmScheduler {
 
     CUTLASS_DEVICE explicit DenseGemmScheduler(Params const& params_, const int warp_group_id = 0)
         : current_iter(warp_group_id), params(params_) {
-        num_aligned_m_blocks = ceil_div(params_.shape_m, BLOCK_M);
-        num_n_blocks = ceil_div(params_.shape_n, BLOCK_N);
+        num_aligned_m_blocks = math::ceil_div(params_.shape_m, BLOCK_M);
+        num_n_blocks = math::ceil_div(params_.shape_n, BLOCK_N);
         num_blocks = num_aligned_m_blocks * num_n_blocks;
     }
 

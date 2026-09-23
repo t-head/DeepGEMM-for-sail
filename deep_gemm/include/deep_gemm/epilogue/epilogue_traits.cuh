@@ -6,6 +6,8 @@
 
 #include <deep_gemm/common/math.cuh>
 
+namespace deep_gemm {
+
 enum class EpilogueType {
     Default,
     SiluAndMulPostQuantFp4,
@@ -44,6 +46,8 @@ struct EpilogueTraits<EpilogueType::SiluAndMulPostQuantFp4> {
     }
 
     static constexpr int get_shape_sfn_out(const int shape_n) {
-        return ceil_div(shape_n / kOutElemsPerByte, kQuantGroupSize);
+        return math::ceil_div(shape_n / kOutElemsPerByte, kQuantGroupSize);
     }
 };
+
+} // namespace deep_gemm

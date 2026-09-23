@@ -868,8 +868,8 @@ void moe_align_block_size_kernel_launcher(
 
     // -- 4-kernel fallback --
     // -- Runtime parameters --
-    constexpr int BLOCK_SIZE = next_power_of_two(kNumGroups);      // K1, K4
-    constexpr int K3_BLOCK  = next_power_of_two(kNumGroups + 1);  // K3 only
+    constexpr int BLOCK_SIZE = math::next_power_of_two(kNumGroups);      // K1, K4
+    constexpr int K3_BLOCK  = math::next_power_of_two(kNumGroups + 1);  // K3 only
     constexpr int K2_BLOCK  = 256;                          // K2 scan
 
     int num_blocks_pad = cute::ceil_div(s_total_ub, BLOCK_SIZE);

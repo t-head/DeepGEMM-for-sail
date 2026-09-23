@@ -1,5 +1,6 @@
 #pragma once
 
+namespace deep_gemm {
 
 enum class GemmType {
     DenseGemm,
@@ -29,3 +30,5 @@ enum class KernelType {
 };
 
 const char* KernelTypeS[] = { "Default", "MultistageOnN", "MoeDynamicTile", "OverlapPrologue", "OverlapMainloop"};
+
+} // namespace deep_gemm

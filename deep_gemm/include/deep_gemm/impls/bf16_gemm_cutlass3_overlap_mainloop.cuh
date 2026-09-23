@@ -446,6 +446,8 @@ CUTLASS_PRAGMA_UNROLL
 
 namespace cutlass::gemm::kernel {
 
+using deep_gemm::GemmType;
+
 template <
   class ProblemShape_,
   class CollectiveMainloop_,

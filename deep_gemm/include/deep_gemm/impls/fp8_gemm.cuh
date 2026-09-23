@@ -353,7 +353,7 @@ public:
 
         if (threadIdx.x == 0) {
           atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
-                  * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
+                  * math::ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
         }
       }
     } // Scheduler work fetch loop
@@ -998,7 +998,7 @@ public:
 
         if (threadIdx.x == 0) {
           atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
-                  * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
+                  * math::ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
         }
       }
     } // Scheduler work fetch loop
@@ -1147,7 +1147,7 @@ public:
         int* layout_info = grouped_layout;
         // compute block_m_info
         if (TileScheduler::kIsNoPadPreprocessLayout) {
-            uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+            uint32_t block_size = max(32, math::next_power_of_two(kNumGroups));
             computeBlockInfoKernel<BLOCK_M><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
             layout_info = block_m_info;
         }

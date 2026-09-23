@@ -71,6 +71,7 @@ struct KernelAiuDynamicTileTPSmallK {
 
 namespace cutlass::gemm::kernel {
 
+using deep_gemm::GemmType;
 
 template <
   GemmType kGemmType,

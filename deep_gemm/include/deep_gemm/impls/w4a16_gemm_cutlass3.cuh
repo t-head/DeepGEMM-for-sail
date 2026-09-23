@@ -30,6 +30,8 @@ using namespace cute;
 
 namespace cutlass::gemm::kernel {
 
+using deep_gemm::GemmType;
+
 template <typename ElementB, typename ElementScale,
           int ShapeN, int ShapeK,
           int BlockM, int BlockN, int BlockK,
@@ -801,7 +803,7 @@ public:
       } else {
         int* layout_info = m_rows;
         if constexpr(Kernel::TileScheduler::kIsNoPadPreprocessLayout) {
-          uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+          uint32_t block_size = max(32, math::next_power_of_two(kNumGroups));
           computeBlockInfoKernel<BlockM><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(m_rows), kNumGroups, reinterpret_cast<uint32_t*>(args.block_m_info));
           layout_info = args.block_m_info;
           NoPadPreprocessLayout = true;

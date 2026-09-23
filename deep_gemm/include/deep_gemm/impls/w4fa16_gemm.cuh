@@ -29,6 +29,8 @@ using namespace cute;
 
 namespace cutlass::gemm::kernel {
 
+using deep_gemm::GemmType;
+
 template <int ShapeN, int ShapeK,
           int BlockM, int BlockN, int BlockK,
           int WarpM, int WarpN, int WarpK,

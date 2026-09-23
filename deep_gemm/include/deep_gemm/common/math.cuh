@@ -5,6 +5,7 @@
 
 #include <cutlass/cutlass.h>
 
+namespace deep_gemm::math {
 
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T ceil_div(T a, T b) {
@@ -26,3 +27,5 @@ CUTLASS_HOST_DEVICE constexpr uint32_t next_power_of_two(uint32_t n) {
   n |= n >> 16;
   return n + 1;
 }
+
+} // namespace deep_gemm::math

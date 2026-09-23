@@ -16,7 +16,7 @@ void smxx_paged_mqa_logits_metadata_device(const uint32_t batch_size, const uint
 
     // load context lens (2D indexing: take last token's context_len per request)
     for (uint32_t k = tid; k < batch_size; k += blockDim.x) {
-        prefix_sum[k] = ceil_div(__ldg(context_lens + k * next_n + next_n - 1), SPLIT_KV);
+        prefix_sum[k] = math::ceil_div(__ldg(context_lens + k * next_n + next_n - 1), SPLIT_KV);
     }
     __syncthreads();
 
@@ -126,7 +126,7 @@ struct PagedMQALogitsScheduler {
         end_q_idx = end_pack.x, end_kv_idx = end_pack.y * kNumMathWarpGroups;
 
         uint32_t idx = current_q_idx * kNextN + kNextN - 1;
-        current_num_kv = current_q_idx < batch_size ? ceil_div(__ldg(this->context_lens + idx), BLOCK_KV) : 0;
+        current_num_kv = current_q_idx < batch_size ? math::ceil_div(__ldg(this->context_lens + idx), BLOCK_KV) : 0;
     }
 
     __device__ __forceinline__ bool fetch_next_task(uint32_t &q_idx, uint32_t &kv_idx, uint32_t &num_kv) {
@@ -142,7 +142,7 @@ struct PagedMQALogitsScheduler {
             ++ current_q_idx;
             current_kv_idx = 0;
             uint32_t idx = current_q_idx * kNextN + kNextN - 1;
-            current_num_kv = current_q_idx < batch_size ? ceil_div(__ldg(this->context_lens + idx), BLOCK_KV) : 0;
+            current_num_kv = current_q_idx < batch_size ? math::ceil_div(__ldg(this->context_lens + idx), BLOCK_KV) : 0;
         }
 
         return true;
