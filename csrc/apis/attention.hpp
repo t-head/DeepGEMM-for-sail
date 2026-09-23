@@ -66,6 +66,7 @@ static torch::Tensor mqa_logits_common(const torch::Tensor& q, const torch::Tens
     // the optional q_scale rides in the kernel's weights slot
     const bool is_avg = weights.numel() == 0;
     if (is_avg) {
+        TORCH_CHECK(num_heads == 4, "avg variant supports num_heads == 4 only");
         TORCH_CHECK(not is_fp4, "avg variant supports fp8 only");
         TORCH_CHECK(q.scalar_type() == torch::kFloat8_e4m3fn, "avg variant supports fp8 only");
         TORCH_CHECK(logits_dtype == torch::kFloat32 || logits_dtype == torch::kBFloat16,
@@ -166,6 +167,7 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
     // 4-head tiles are padded to 16 inside the kernel and are avg-only
     const bool is_avg = weights.numel() == 0;
     if (is_avg) {
+        TORCH_CHECK(num_heads == 4, "avg variant supports num_heads == 4 only");
         TORCH_CHECK(not is_fp4, "avg variant supports fp8 only");
         TORCH_CHECK(q.scalar_type() == torch::kFloat8_e4m3fn, "avg variant supports fp8 only");
         TORCH_CHECK(logits_dtype == torch::kFloat32 || logits_dtype == torch::kBFloat16,
