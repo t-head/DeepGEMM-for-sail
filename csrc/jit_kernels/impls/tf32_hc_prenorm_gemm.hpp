@@ -1,12 +1,13 @@
 #pragma once
 
 #include <torch/python.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
-#include <vector>
+#include <list>
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
 #include "../../jit/kernel_runtime.hpp"
@@ -28,6 +29,7 @@ public:
         uint32_t num_splits;
         uint32_t num_threads, num_stages;
         bool fast_bf16_to_tf32;
+        uint32_t kernel_variant;
         std::string kernel_name;
     };
 
@@ -66,6 +68,7 @@ constexpr uint32_t NUM_SPLITS = {};
 constexpr uint32_t NUM_THREADS = {};
 constexpr uint32_t NUM_STAGES = {};
 constexpr bool FAST_BF16_TO_TF32 = {};
+constexpr uint32_t KERNEL_VARIANT = {};
 
 extern "C"
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
@@ -88,7 +91,7 @@ __global__ void {}(
     BLOCK_M, BLOCK_N, BLOCK_K,
     NUM_SPLITS,
     FAST_BF16_TO_TF32,
-    NUM_THREADS, NUM_STAGES
+    NUM_THREADS, NUM_STAGES, KERNEL_VARIANT
   >(fn, out, sqrsum, x, num_tokens, ws, ws_s, counter);
 }}
 }}
@@ -96,7 +99,7 @@ __global__ void {}(
             args.launch_info.shape_n, args.launch_info.shape_k, args.launch_info.block_m,
             args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_splits,
             args.launch_info.num_threads, args.launch_info.num_stages,
-            args.launch_info.fast_bf16_to_tf32, args.launch_info.kernel_name);
+            args.launch_info.fast_bf16_to_tf32, args.launch_info.kernel_variant, args.launch_info.kernel_name);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -107,17 +110,40 @@ __global__ void {}(
     }
 };
 
-// NOTES: a buffer already handed to the kernel may be baked into a CUDA graph, so growing must not
-// free the old one -- it is moved to `retired` and kept for the process lifetime. Rounding sizes up
-// to a power of two bounds how many times that can happen.
+class Tf32HcRoundBRuntime final : public LaunchRuntime<Tf32HcRoundBRuntime> {
+public:
+    struct Args { LaunchArgs launch_args; float* src; float* dst; uint32_t count; };
+    static std::string generate_impl(const Args&) {
+        return R"(
+#define TF32_HC_PRENORM_HGRTC
+#include <deep_gemm/impls/tf32_hc_prenorm_gemm.cuh>
+extern "C" __global__ void tf32_hc_round_b(const float* src, float* dst, uint32_t count) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        const uint32_t bits = cutlass::NumericConverter<cutlass::tfloat32_t, float>::convert(src[i]).raw();
+        dst[i] = __uint_as_float(bits);
+    }
+}
+)";
+    }
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_CHECK(launch_kernel(kernel, config, args.src, args.dst, args.count));
+    }
+};
+
+// Captures allocate separate scratch from the PyTorch graph-private pool.
 struct Tf32ScratchBuffers {
+    torch::Tensor rounded_b;
     torch::Tensor ws;
     torch::Tensor ws_s;
     std::unordered_map<int, torch::Tensor> counters;
-    std::vector<torch::Tensor> retired;
 };
+// Serialize B prepass submission; isolate scratch by device and stream.
+static std::mutex tf32_round_b_submit_mutex;
 static std::mutex tf32_scratch_mutex;
-static std::unordered_map<int64_t, Tf32ScratchBuffers> tf32_scratch;
+static constexpr size_t kTf32ScratchStreams = 16;
+using Tf32ScratchCache = std::list<std::pair<uintptr_t, Tf32ScratchBuffers>>;
+static std::unordered_map<int64_t, Tf32ScratchCache> tf32_scratch;
 
 static int64_t round_up_pow2(const int64_t& x) {
     int64_t p = 1;
@@ -128,7 +154,7 @@ static int64_t round_up_pow2(const int64_t& x) {
 
 static void tf32_hc_prenorm_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out,
                                  const torch::Tensor& sqr_sum, const int& m, const int& n, const int& k) {
-    const auto& [block_m, block_n, block_k, num_splits_i, num_threads_i, num_stages, smem_size] =
+    const auto& [block_m, block_n, block_k, num_splits_i, num_threads_i, num_stages, smem_size, kernel_variant] =
         deep_gemm_tf32_common::get_best_configs(m, n, k);
     const uint32_t num_splits = static_cast<uint32_t>(num_splits_i);
 
@@ -139,30 +165,42 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& lhs, const torch::Tensor& 
     const dim3 grid(grid_m, num_splits, 1);
     const dim3 block(num_threads, 1, 1);
 
-    torch::Tensor ws, ws_s, counter;
+    torch::Tensor ws, ws_s, counter, rounded_b;
     {
-        std::lock_guard<std::mutex> lock(tf32_scratch_mutex);
-        auto& scratch = tf32_scratch[lhs.get_device()];
+        Tf32ScratchBuffers graph_scratch;
+        auto* selected = &graph_scratch;
+        std::unique_lock<std::mutex> lock(tf32_scratch_mutex, std::defer_lock);
+        if (c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None) {
+            lock.lock();
+            auto& cache = tf32_scratch[lhs.get_device()];
+            const auto stream = reinterpret_cast<uintptr_t>(current_stream());
+            const auto it = std::find_if(cache.begin(), cache.end(),
+                                         [&](const auto& entry) { return entry.first == stream; });
+            if (it == cache.end()) {
+                cache.emplace_front(stream, Tf32ScratchBuffers{});
+                if (cache.size() > kTf32ScratchStreams) cache.pop_back();
+            } else {
+                cache.splice(cache.begin(), cache, it);
+            }
+            selected = &cache.front().second;
+        }
+        auto& scratch = *selected;
         const auto float_opts = torch::TensorOptions().dtype(torch::kFloat32).device(lhs.device());
-        const int64_t ws_numel = static_cast<int64_t>(num_splits) * m * n;
-        const int64_t ws_s_numel = static_cast<int64_t>(num_splits) * m;
-        if (not scratch.ws.defined() or scratch.ws.numel() < ws_numel) {
-            if (scratch.ws.defined())
-                scratch.retired.push_back(scratch.ws);
-            scratch.ws = torch::empty({round_up_pow2(ws_numel)}, float_opts);
+        const auto ensure_capacity = [&](torch::Tensor& buffer, int64_t count, bool zero = false) {
+            if (!buffer.defined() || buffer.numel() < count) {
+                const auto capacity = round_up_pow2(count);
+                buffer = zero ? torch::zeros({capacity}, float_opts.dtype(torch::kInt32))
+                              : torch::empty({capacity}, float_opts);
+            }
+        };
+        if (kernel_variant & 1024u) {
+            ensure_capacity(scratch.rounded_b, int64_t(n) * k);
+            rounded_b = scratch.rounded_b;
         }
-        if (not scratch.ws_s.defined() or scratch.ws_s.numel() < ws_s_numel) {
-            if (scratch.ws_s.defined())
-                scratch.retired.push_back(scratch.ws_s);
-            scratch.ws_s = torch::empty({round_up_pow2(ws_s_numel)}, float_opts);
-        }
+        ensure_capacity(scratch.ws, int64_t(num_splits) * m * n);
+        ensure_capacity(scratch.ws_s, int64_t(num_splits) * m);
         auto& counter_slot = scratch.counters[static_cast<int>(num_splits)];
-        if (not counter_slot.defined() or counter_slot.numel() < static_cast<int64_t>(grid_m)) {
-            if (counter_slot.defined())
-                scratch.retired.push_back(counter_slot);
-            counter_slot = torch::zeros({round_up_pow2(static_cast<int64_t>(grid_m))},
-                                        torch::TensorOptions().dtype(torch::kInt32).device(lhs.device()));
-        }
+        ensure_capacity(counter_slot, grid_m, true);
         ws = scratch.ws;
         ws_s = scratch.ws_s;
         counter = counter_slot;
@@ -173,9 +211,9 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& lhs, const torch::Tensor& 
         .launch_info = {static_cast<uint32_t>(n), static_cast<uint32_t>(k), static_cast<uint32_t>(block_m),
                         static_cast<uint32_t>(block_n), static_cast<uint32_t>(block_k),
                         num_splits, num_threads, static_cast<uint32_t>(num_stages),
-                        fast_bf16_to_tf32, kernel_name},
+                        fast_bf16_to_tf32, kernel_variant, kernel_name},
         .launch_args = {grid, block, smem_size},
-        .kernel_args = {rhs.data_ptr<float>(), out.data_ptr<float>(), sqr_sum.data_ptr<float>(), lhs.data_ptr(),
+        .kernel_args = {(kernel_variant & 1024u) ? rounded_b.data_ptr<float>() : rhs.data_ptr<float>(), out.data_ptr<float>(), sqr_sum.data_ptr<float>(), lhs.data_ptr(),
                         ws.data_ptr<float>(), ws_s.data_ptr<float>(), counter.data_ptr<int>(),
                         static_cast<uint32_t>(m)},
     };
@@ -187,12 +225,21 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& lhs, const torch::Tensor& 
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_params(
             GemmType::DenseGemm, false, std::string("tf32"),
-            1, m, n, k, 1, nullptr, (hggcStream_t)0);
+            1, m, n, k, 1, nullptr, current_stream());
         dg_prof_params.add_params("num_splits", int(num_splits));
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
-    Tf32HcPrenormGemmRuntime::launch(runtime, args);
+    if (kernel_variant & 1024u) {
+        Tf32HcRoundBRuntime::Args pack_args{{dim3(ceil_div(n * k, 256)), dim3(256), 0}, rhs.data_ptr<float>(), rounded_b.data_ptr<float>(), uint32_t(n * k)};
+        const auto& pack_code = Tf32HcRoundBRuntime::generate(pack_args);
+        const auto& pack_runtime = compiler->build("tf32_hc_round_b", pack_code, 256, 0);
+        std::lock_guard<std::mutex> lock(tf32_round_b_submit_mutex);
+        Tf32HcRoundBRuntime::launch(pack_runtime, pack_args);
+        Tf32HcPrenormGemmRuntime::launch(runtime, args);
+    } else {
+        Tf32HcPrenormGemmRuntime::launch(runtime, args);
+    }
 
     ProfilingInterface::Instance().instrument(false, dg_prof_params);
 

@@ -15,14 +15,16 @@ struct PrenormConfig {
     int num_splits;
     int num_threads, num_stages;
     int smem_size;
+    uint32_t kernel_variant;
 };
 
-// Dynamic shared memory consumed by the kernel: the CuTe path keeps `num_stages` padded A/B tiles,
-// while the fused 890P path always claims 32KB.
-// NOTES: this mirrors the `kSmemSize` computed inside `HcPrenormGemm::run` in
-// `tf32_hc_prenorm_gemm.cuh`, keep both in sync
+// Keep shared-memory sizing consistent with the device template.
 static int get_smem_config(const int& block_m, const int& block_n, const int& block_k,
-                           const int& num_stages) {
+                           const int& num_stages, uint32_t kernel_variant = 0) {
+    if (is_ppu1v5_device()) {
+        const int a_bytes = (kernel_variant & 1) ? block_m * 64 * 2 : 8192;
+        return 2 * (a_bytes + 8192) * (block_k / 64);
+    }
     const auto& smem_cute = static_cast<int>(num_stages * (block_m * (block_k + 8) * sizeof(uint16_t) +
                                                            block_n * (block_k + 4) * sizeof(float)));
     const int kSmemFused = block_k == 128 ? 65536 : 32768;
@@ -93,7 +95,7 @@ static int get_num_splits(const int& m, const int& k, const int& block_m, const 
 // NOTES: `block_m` defaults to 64, from which the kernel derives `BLOCK_M * 2` threads per block
 static PrenormConfig get_best_configs(const int& m, const int& n, const int& k) {
     const int forced_block_m = get_env_int("DG_TF32_BLOCK_M");
-    const int block_m =
+    int block_m =
         (forced_block_m > 0 and forced_block_m % 16 == 0 and forced_block_m <= 256) ? forced_block_m : 64;
     const int forced_block_k = get_env_int("DG_TF32_BLOCK_K");
     const int block_k =
@@ -114,9 +116,115 @@ static PrenormConfig get_best_configs(const int& m, const int& n, const int& k) 
     const int forced_stages = is_ppu1v5_device() ? 0 : get_env_int("DG_TF32_NUM_STAGES");
     const int num_stages = (forced_stages >= 2 and forced_stages <= 8) ? forced_stages : 2;
 
-    return PrenormConfig{block_m, block_n, block_k, get_num_splits(m, k, block_m, block_k),
-                         num_threads, num_stages,
-                         get_smem_config(block_m, block_n, block_k, num_stages)};
+    // Preserve explicit overrides.
+    int num_splits = get_num_splits(m, k, block_m, block_k);
+    const bool tune_890p = is_ppu1v5_device() and n == 24 and
+                          forced_block_m == 0 and forced_block_k == 0 and
+                          get_env_int("DG_TF32_NUM_SPLITS") == 0;
+    if (tune_890p) {
+        const bool shorter_k = k == 16384 or k == 20480;
+        if ((m <= 20 and shorter_k) or (m <= 32 and k == 20480))
+            num_splits = 64;
+    }
+    const bool tune_810e = n == 24 and block_n == 32 and
+                          forced_block_m == 0 and forced_block_k == 0 and
+                          forced_threads == 0 and forced_stages == 0 and
+                          get_env_int("DG_TF32_NUM_SPLITS") == 0;
+    if (tune_810e) {
+        // Warp 3 reduces the square sum without changing its summation order.
+        if (not is_ppu1v5_device() and m == 16 and k == 28672) {
+            constexpr int bm = 16, bk = 64, threads = 128, stages = 2;
+            constexpr uint32_t variant = 1u << 20;
+            constexpr int smem = stages * (bm * (bk + 8) * sizeof(uint16_t) +
+                                          32 * (bk + 4) * sizeof(float));
+            return PrenormConfig{bm, block_n, bk, 64, threads, stages, smem, variant};
+        }
+        // Load-only warps help these small shapes; the MMA and reduction stay unchanged.
+        const bool known_k = k == 16384 or k == 20480 or k == 28672;
+        // Use exact TC01 stage storage.
+        if (known_k and (m == 60 or m == 128 or (m == 32 and k == 16384))) {
+            constexpr int bm = 32, bk = 64, stages = 2;
+            const int threads = m == 32 ? 256 : 128;
+            constexpr uint32_t variant = 256u | 512u;
+            constexpr int smem = stages * (bm * (bk + 8) * sizeof(uint16_t) +
+                                          32 * (bk + 4) * sizeof(float));
+            return PrenormConfig{bm, block_n, bk, m == 128 ? 32 : 64,
+                                threads, stages, smem, variant};
+        }
+        if (known_k and (m == 24 or (m == 32 and k != 16384))) {
+            return PrenormConfig{64, block_n, 64, 64, 256, 2,
+                get_smem_config(64, block_n, 64, 2), 0};
+        }
+        // TC01: bit 256 = packed loads; bit 512 = quad reuse.
+        struct Tuned810Config { int m, block_m, num_splits; };
+        static constexpr Tuned810Config configs[] = {
+            { 1248, 128,  8},
+            { 4096, 128, 16},
+            { 8192, 256, 16},
+            { 9984, 128,  1},
+            {19968, 128,  1},
+        };
+        if (k == 16384 or k == 20480 or k == 28672) {
+            for (const auto& c : configs) {
+                if (m == c.m) {
+                    const bool shuffle_a = m <= 8192 or (m == 9984 and k != 28672) or
+                                           (m == 19968 and k == 16384);
+                    // Round B once per call for reuse across CTAs.
+                    const bool rounded_b = m == 4096 or m == 8192 or m == 9984 or m == 19968;
+                    // Specialize async-copy addressing for complete M tiles; keep a tail fallback.
+                    const bool full_tile_copy = m == 8192 or m == 9984 or m == 19968;
+                    // Each warp reuses B across two M16 groups.
+                    const bool reuse_b = m == 8192;
+                    const uint32_t variant = 256u | ((shuffle_a or rounded_b) ? 512u : 0u) |
+                                             (rounded_b ? 1024u : 0u) | (full_tile_copy ? 2048u : 0u) |
+                                             (reuse_b ? 4096u : 0u);
+                    return PrenormConfig{c.block_m, block_n, 64, c.num_splits,
+                        c.block_m * 2, 2, get_smem_config(c.block_m, block_n, 64, 2, variant), variant};
+                }
+            }
+        }
+    }
+    uint32_t kernel_variant = 0;
+    if (tune_890p) {
+        // Measured N=24 configurations; variant bits are defined in the device template.
+        struct TileConfig { int block_m, num_splits; uint32_t variant; };
+        struct TunedConfig { int m; TileConfig by_k[3]; };
+        // K columns: 16384, 20480, 28672; entries: {block_m, splits, variant}.
+        const int k_index = k == 16384 ? 0 : k == 20480 ? 1 : k == 28672 ? 2 : -1;
+        static constexpr TunedConfig configs[] = {
+            {   16, {{ 64, 64,  27}, { 64, 64,  27}, { 64, 64,  27}}},
+            {   20, {{ 64, 64,  43}, { 64, 64,  43}, { 64, 64,  43}}},
+            {   24, {{ 64, 64,  19}, { 64, 64,  19}, { 64, 64,  59}}},
+            {   32, {{ 64, 64,  19}, { 64, 64,  27}, { 64, 64,  19}}},
+            {   60, {{ 32, 64,  19}, { 32, 64,  19}, { 32, 32,   3}}},
+            {  128, {{ 32, 32,   3}, { 32, 32,   7}, { 32, 32,   3}}},
+            { 1248, {{ 96, 16,   7}, { 96, 16,   7}, { 96, 16,   7}}},
+            { 4096, {{ 64,  4,   7}, {112,  4,   7}, { 96,  4,  71}}},
+            { 8192, {{ 64,  2,   7}, { 64,  2, 135}, {112,  2,   7}}},
+            { 9984, {{ 64,  2,   5}, { 64,  2,   5}, { 64,  2,   5}}},
+            {19968, {{ 64,  1,   7}, {128,  1,   7}, {128,  1,   5}}},
+        };
+        for (const auto& c : configs) {
+            if (m == c.m and k_index >= 0) {
+                const auto& tile = c.by_k[k_index];
+                block_m = tile.block_m;
+                num_splits = tile.num_splits;
+                kernel_variant = tile.variant;
+                // Split-major scratch and extra reduction warps preserve the sum order.
+                if (m == 24 || m == 32 || m == 60 ||
+                    (m == 128 && (k == 16384 || k == 20480)))
+                    kernel_variant |= (1u << 22) | (1u << 23);
+                break;
+            }
+        }
+    }
+    // The two measured M-reuse schedules cover 32 rows per physical warp.
+    const int warp_m_groups = (kernel_variant & (64u | 128u)) ? 2 : 1;
+    const int launch_threads = (tune_890p && (kernel_variant & (1u << 23))) ? 256 :
+                               (tune_890p ? block_m * 2 / warp_m_groups : num_threads);
+    return PrenormConfig{block_m, block_n, block_k, num_splits,
+                         launch_threads, num_stages,
+                         get_smem_config(block_m, block_n, block_k, num_stages, kernel_variant), kernel_variant};
 }
 
 } // namespace deep_gemm_tf32_common

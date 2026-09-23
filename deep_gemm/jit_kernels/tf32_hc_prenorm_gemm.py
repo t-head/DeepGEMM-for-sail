@@ -1,4 +1,6 @@
 import math
+from collections import OrderedDict
+from threading import Lock
 import torch
 from typing import Tuple
 
@@ -34,8 +36,8 @@ def _align(x: int, alignment: int) -> int:
     return ((x + alignment - 1) // alignment) * alignment
 
 _ws_cache = {}
-_counter_cache = {}
-_retired = []
+_ws_lock = Lock()
+_MAX_CACHED_STREAMS = 16
 
 
 def _round_up_pow2(x: int) -> int:
@@ -43,27 +45,24 @@ def _round_up_pow2(x: int) -> int:
 
 
 def _get_workspace(m: int, n: int, num_splits: int, grid_m: int, device, stream):
-    key = (device.type, -1 if device.index is None else device.index, stream.cuda_stream)
-    need_d, need_s = num_splits * m * n, num_splits * m
+    with _ws_lock:
+        # Graph-owned allocations must not alias the eager cache.
+        scratch = {}
+        if not torch.cuda.is_current_stream_capturing():
+            key = (device.type, -1 if device.index is None else device.index)
+            cache = _ws_cache.setdefault(key, OrderedDict())
+            scratch = cache.setdefault(stream.cuda_stream, {})
+            cache.move_to_end(stream.cuda_stream)
+            if len(cache) > _MAX_CACHED_STREAMS:
+                cache.popitem(last=False)
 
-    ws, ws_s = _ws_cache.get(key, (None, None))
-    if ws is None or ws.numel() < need_d:
-        if ws is not None:
-            _retired.append(ws)
-        ws = torch.empty(_round_up_pow2(need_d), device=device, dtype=torch.float32)
-    if ws_s is None or ws_s.numel() < need_s:
-        if ws_s is not None:
-            _retired.append(ws_s)
-        ws_s = torch.empty(_round_up_pow2(need_s), device=device, dtype=torch.float32)
-    _ws_cache[key] = (ws, ws_s)
-
-    counter = _counter_cache.get(key + (num_splits,))
-    if counter is None or counter.numel() < grid_m:
-        if counter is not None:
-            _retired.append(counter)
-        counter = torch.zeros(_round_up_pow2(grid_m), device=device, dtype=torch.int)
-        _counter_cache[key + (num_splits,)] = counter
-    return ws, ws_s, counter
+        for name, count in (("ws", num_splits * m * n), ("ws_s", num_splits * m)):
+            if name not in scratch or scratch[name].numel() < count:
+                scratch[name] = torch.empty(_round_up_pow2(count), device=device, dtype=torch.float32)
+        counters = scratch.setdefault("counters", {})
+        if num_splits not in counters or counters[num_splits].numel() < grid_m:
+            counters[num_splits] = torch.zeros(_round_up_pow2(grid_m), device=device, dtype=torch.int)
+        return scratch["ws"], scratch["ws_s"], counters[num_splits]
 
 def tf32_hc_prenorm_gemm(a: torch.Tensor,
                        b: torch.Tensor,
@@ -79,6 +78,28 @@ def tf32_hc_prenorm_gemm(a: torch.Tensor,
     assert a.dtype == torch.bfloat16
     assert b.dtype == torch.float32
     assert a.is_contiguous() and b.is_contiguous()
+
+    d_shape = (m, n)
+    s_shape = (m,)
+
+    if d is None:
+        d = torch.empty(d_shape, device=a.device, dtype=torch.float32)
+    else:
+        assert d.dtype == torch.float32
+        assert d.shape in (d_shape, (1, *d_shape)), (
+            f"expected d.shape=={d_shape} or {(1, *d_shape)}, got {tuple(d.shape)}")
+        assert d.is_contiguous()
+
+    if sqr_sum is None:
+        sqr_sum = torch.empty(s_shape, device=a.device, dtype=torch.float32)
+    else:
+        assert sqr_sum.dtype == torch.float32
+        assert sqr_sum.shape in (s_shape, (1, *s_shape)), (
+            f"expected sqr_sum.shape=={s_shape} or {(1, *s_shape)}, got {tuple(sqr_sum.shape)}")
+        assert sqr_sum.is_contiguous()
+
+    if m == 0:
+        return
 
     if is_ppu1v5_device():
         block_n = min(_align(n, 8), 32)
@@ -106,25 +127,6 @@ def tf32_hc_prenorm_gemm(a: torch.Tensor,
     assert k_blocks % num_splits == 0 and k_blocks // num_splits >= 2, (
         f'num_splits={num_splits} must divide k_blocks={k_blocks} evenly and leave '
         f'at least two K blocks per split')
-
-    d_shape = (m, n)
-    s_shape = (m,)
-
-    if d is None:
-        d = torch.empty(d_shape, device=a.device, dtype=torch.float32)
-    else:
-        assert d.dtype == torch.float32
-        assert d.shape in (d_shape, (1, *d_shape)), (
-            f"expected d.shape=={d_shape} or {(1, *d_shape)}, got {tuple(d.shape)}")
-        assert d.is_contiguous()
-
-    if sqr_sum is None:
-        sqr_sum = torch.empty(s_shape, device=a.device, dtype=torch.float32)
-    else:
-        assert sqr_sum.dtype == torch.float32
-        assert sqr_sum.shape in (s_shape, (1, *s_shape)), (
-            f"expected sqr_sum.shape=={s_shape} or {(1, *s_shape)}, got {tuple(sqr_sum.shape)}")
-        assert sqr_sum.is_contiguous()
 
     smem_size = 0
 

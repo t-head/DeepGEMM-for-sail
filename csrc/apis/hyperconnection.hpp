@@ -14,11 +14,6 @@ namespace deep_gemm::hyperconnection {
 void tf32_hc_prenorm_gemm_nt(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
                              const torch::Tensor& sqr_sum, std::optional<int> num_splits = std::nullopt,
                              std::optional<ConfigTuple> configs = std::nullopt) {
-    // A and B must be K-major, D must be N-major
-    DG_HOST_ASSERT(get_major_type_ab(a) == MajorType::K);
-    DG_HOST_ASSERT(get_major_type_ab(b) == MajorType::K);
-    check_major_type_cd(d);
-
     const auto& [m, k] = get_shape<2>(a);
     const auto& [n, k_] = get_shape<2>(b);
 
@@ -43,6 +38,11 @@ void tf32_hc_prenorm_gemm_nt(const torch::Tensor& a, const torch::Tensor& b, con
     if (m == 0) {
         return;
     }
+
+    // A and B must be K-major, D must be N-major
+    DG_HOST_ASSERT(get_major_type_ab(a) == MajorType::K);
+    DG_HOST_ASSERT(get_major_type_ab(b) == MajorType::K);
+    check_major_type_cd(d);
 
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
