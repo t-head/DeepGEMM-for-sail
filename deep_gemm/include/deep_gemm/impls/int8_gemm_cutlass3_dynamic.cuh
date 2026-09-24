@@ -212,6 +212,7 @@ struct PPUTypeBuilder {
       k_tile_iter, k_tile_count,
       residue_mnk,
       thread_idx,
+      canonical_warp_idx_sync(),
       smem_buf
     );
 

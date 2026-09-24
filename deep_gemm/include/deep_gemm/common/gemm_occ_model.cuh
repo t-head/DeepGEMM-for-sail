@@ -4,16 +4,20 @@
 // cutlass3-style GEMM kernels on PPU. C++ JIT kernel templates
 // (bf16/int8/fp8 cutlass3 host wrappers) derive
 // `__launch_bounds__(MaxThreadsPerBlock, MinBlocksPerMultiprocessor)` from
-// tile-shape / dtype-size / blockwise-ness.
+// tile shape, element sizes, and the epilogue TSM mode.
 //
 // Notes:
 //   - This header does not depend on any `cutlass::` type; callers pass the
 //     element sizes in bits (e.g. cute's `sizeof_bits_v<ElementX>`), so it can be
 //     included independently of the numeric type headers.
 //   - `kIsBlockwise` defaults to false (non-blockwise kernels); blockwise-quantized
-//     kernels must pass true explicitly. It only affects the SMEM scale buffers and
-//     the doubled ACC VREG footprint; everything else is dtype/GemmType agnostic.
-//   - Hardware constants are mandatory trailing template parameters, injected by
+//     kernels must pass true explicitly. It accounts for doubled ACC VREGs and
+//     the current SFA fragment; additional costs come from kVregOverhead.
+//   - `kSmemBytesPerCta` is the kernel's real per-CTA shared-memory footprint,
+//     passed as `GemmKernel::SharedStorageSize` (== sizeof(GemmKernel::SharedStorage),
+//     the mainloop/epilogue union). It is the authoritative value the launch
+//     requests, so no scalar SMEM estimate (stages / bits / epilogue mode) is needed.
+//   - Hardware constants are mandatory template parameters, injected by
 //     the host-side JIT generator (bf16/int8/fp8_gemm.hpp generate_impl) from
 //     hggcDeviceGetAttribute queries, so the model carries no hardcoded spec
 //     values and new SKUs require no code change.
@@ -70,20 +74,16 @@ private:
 //   BM/BN/BK          : CTA tile shape
 //   WM/WN/WK          : warp tile shape; WK defaults to BK (no K-split/reduction).
 //                        BF16 kernels using WarpOnK reduction can pass a smaller WK.
-//   kNumStages        : pipeline stage count
+//   kSmemBytesPerCta  : kernel per-CTA SMEM footprint; pass GemmKernel::SharedStorageSize
 //   kBitsA/B/Acc      : element size in bits, e.g. cute::sizeof_bits_v<ElementA>
 //                        (16 for bf16, 8 for fp8/int8, 4 for fp4); expressed in
 //                        bits, not bytes, so packed formats like fp4 (0.5
 //                        byte/element) are representable.
-//   kIsBlockwise      : whether the kernel is blockwise-quantized (decides whether the
-//                        SMEM scale buffer exists and whether VREG carries a doubled
-//                        ACC accumulator); defaults to false, blockwise kernels pass
-//                        true.
-//   kVregOverhead     : optional per-warp VREG slack for address/loop-variable
-//                        registers that this model does not otherwise account for
-//                        (see fp8_occ_model_doc.md known limitations); defaults to 0,
-//                        matching the existing fp8_occ_model.py behavior. May need
-//                        tuning later against measured `show_log=1` VREG counts.
+//   kIsBlockwise      : whether the kernel is blockwise-quantized (decides whether VREG
+//                        carries doubled ACC and the current SFA fragment); defaults to false,
+//                        blockwise kernels pass true.
+//   kVregOverhead     : caller-provided additional VREG budget, including cp.async
+//                        addresses (SFA data is counted separately); defaults to 0.
 //   kTsmPerCu / kMaxThreadsPerCta / kMaxWarpsPerCu / kTotalVregPerCu:
 //   REQUIRED hardware constants injected by the host-side JIT generator (see Notes
 //   above); no defaults - the model must not hardcode any spec value.
@@ -91,14 +91,14 @@ private:
 // Usage (sketch):
 //   // kIsBlockwise may be omitted (non-blockwise default).
 //   using Occ = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K,
-//                            kNumStages, cute::sizeof_bits_v<ElementA>,
+//                            GemmKernel::SharedStorageSize, cute::sizeof_bits_v<ElementA>,
 //                            cute::sizeof_bits_v<ElementB>,
 //                            cute::sizeof_bits_v<ElementAcc>,
 //                            kTsmPerCu, kMaxThreadsPerCta, kMaxWarpsPerCu,
 //                            kTotalVregPerCu>;
 //   // Blockwise-quantized kernel: pass kIsBlockwise = true explicitly.
 //   using OccBlk = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K,
-//                            kNumStages, cute::sizeof_bits_v<ElementA>,
+//                            GemmKernel::SharedStorageSize, cute::sizeof_bits_v<ElementA>,
 //                            cute::sizeof_bits_v<ElementB>,
 //                            cute::sizeof_bits_v<ElementAcc>,
 //                            kTsmPerCu, kMaxThreadsPerCta, kMaxWarpsPerCu,
@@ -107,7 +107,7 @@ private:
 // ---------------------------------------------------------------------------
 template <int BM, int BN, int BK,
           int WM, int WN, int WK,
-          int kNumStages,
+          int kSmemBytesPerCta,
           int kBitsA, int kBitsB, int kBitsAcc,
           int kTsmPerCu,
           int kMaxThreadsPerCta,
@@ -117,7 +117,8 @@ template <int BM, int BN, int BK,
           int kVregOverhead = 0>
 struct GemmOccModel {
   // ---- Template parameter validity (fail fast on illegal instantiations) ----
-  static_assert(kNumStages >= 1, "kNumStages must be at least 1");
+  static_assert(kSmemBytesPerCta > 0,
+                "kSmemBytesPerCta must be positive (pass GemmKernel::SharedStorageSize)");
   static_assert(BM % WM == 0 && BN % WN == 0 && BK % WK == 0,
                 "CTA tile must be divisible by the warp tile");
   static_assert(256 % kBitsA == 0 && 256 % kBitsB == 0,
@@ -138,26 +139,9 @@ struct GemmOccModel {
   // =========================================================================
   // 1) SMEM occupancy
   // =========================================================================
-  static constexpr int64_t kSmemA =
-      cute::round_up(int64_t(kNumStages) * BM * BK * kBitsA / 8, int64_t{128});
-  static constexpr int64_t kSmemB =
-      cute::round_up(int64_t(kNumStages) * BN * BK * kBitsB / 8, int64_t{128});
-  // fp32 dequant scale size in bytes, used by the blockwise SMEM scale buffers.
-  static constexpr int kScaleBytes = 4;
-
-  static constexpr int64_t kSmemScaleA =
-      kIsBlockwise
-          ? cute::round_up(int64_t(kNumStages) * BM * (BK / 128) * kScaleBytes, int64_t{128})
-          : 0;
-  static constexpr int64_t kSmemScaleB =
-      kIsBlockwise
-          ? cute::round_up(int64_t(kNumStages) * ceil_div(BN, 128) * (BK / 128) * kScaleBytes,
-                     int64_t{256})
-          : 0;
-  static constexpr int64_t kSmemBytes = kSmemA + kSmemB + kSmemScaleA + kSmemScaleB;
-  static_assert(kSmemBytes <= kTsmPerCu,
+  static_assert(kSmemBytesPerCta <= kTsmPerCu,
                 "SMEM footprint must fit in the per-CU TSM limit");
-  static constexpr int kSmemOcc = int(kTsmPerCu / kSmemBytes);
+  static constexpr int kSmemOcc = kTsmPerCu / kSmemBytesPerCta;
 
   // =========================================================================
   // 2) Thread/warp occupancy
@@ -181,16 +165,14 @@ struct GemmOccModel {
   // and reuse operand registers instead of always keeping two full live copies.
   static constexpr int kVregA = WM * kMmaKA * 2 * kBitsA / 8 / 128;
   static constexpr int kVregB = WN * kMmaKB * 2 * kBitsB / 8 / 128;
-  static constexpr int kVregPerWarp = kAccCopies * kAcc + kVregA + kVregB + kVregOverhead;
-  // Per-warp VREG cap: no driver attribute exists; hardcoded in the model.
-  //
-  // The assert below is intentionally disabled. kVregPerWarp is built on the 2x A/B
-  // assumption above, so it over-estimates real usage (which lies between 1x and 2x).
-  // Enforcing `<= 256` against that inflated number would reject many tiles that in
-  // fact compile and run fine, needlessly shrinking the usable tile space. It is kept
-  // commented out as documentation of the nominal cap rather than a hard constraint.
-  // static_assert(kVregPerWarp <= 256,
-  //               "per-warp VREG exceeds the hardware limit");
+  // The current PPU 16x16 MMA accumulator layout gives each lane two M rows.
+  // FP32 SFA broadcasts over N; only the current K scale fragment is resident.
+  static constexpr int kMmaRows = 16;
+  static constexpr int kMmaRowsPerThread = 2;
+  static constexpr int kVregSFA =
+      kIsBlockwise ? cute::ceil_div(WM, kMmaRows) * kMmaRowsPerThread : 0;
+  static constexpr int kVregPerWarp =
+      kAccCopies * kAcc + kVregA + kVregB + kVregSFA + kVregOverhead;
 
   static constexpr int kWePerCu       = 8;
   static constexpr int kVregPerWe     = kTotalVregPerCu / kWePerCu;
@@ -200,9 +182,9 @@ struct GemmOccModel {
                 "per-warp VREG exceeds the per-WE budget; occupancy would be 0");
   static constexpr int kWarpsPerWe =
       cute::min(kMaxWarpsPerWe, kVregPerWe / kVregPerWarp);
-  static_assert(kWePerCu * kWarpsPerWe >= kWarpsPerCta,
-                "VREG budget cannot host a single CTA");
-  static constexpr int kVregOcc = (kWePerCu * kWarpsPerWe) / kWarpsPerCta;
+
+  static constexpr int kVregOcc = kWePerCu * kWarpsPerWe >= kWarpsPerCta
+            ? (kWePerCu * kWarpsPerWe) / kWarpsPerCta : 1;
 
   // =========================================================================
   // Final occupancy = min of the three independent constraints.

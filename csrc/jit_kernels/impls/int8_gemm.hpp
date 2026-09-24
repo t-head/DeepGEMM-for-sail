@@ -19,8 +19,6 @@
 #include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 #include "cutlass/gemm/gemm.h"
-#include "cutlass/epilogue/collective/detail.hpp"
-#include "cutlass/epilogue/fusion/ppu_callbacks.hpp"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
 #include <deep_gemm/common/utils_rtc.cuh>
@@ -231,10 +229,14 @@ using GemmKernel = cutlass::gemm::kernel::DenseGemmKernel<
     CollectiveEpilogue,
     TileScheduler>;
 
-using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, STAGES,
+// scale-A/B cp.async addresses: each stream keeps a 64-bit global address and a
+// 32-bit shared address, for 2 * 3 = 6 VREGs; A/B use the AIU load path.
+constexpr int kVregOverhead = 6;
+using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, GemmKernel::SharedStorageSize,
                             cute::sizeof_bits_v<ElementA>, cute::sizeof_bits_v<ElementB>,
                             cute::sizeof_bits_v<ElementCompute>,
-                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu>;
+                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu,
+                            false, kVregOverhead>;
 
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
@@ -332,12 +334,7 @@ public:
     // One epilogue-params layout per device generation (must match the device Params bytes).
     using EpilogueParamNoTsm = EpilogueArgs;  // PPU1.5: the args are the params, as-is
     struct EpilogueParamWithTsm {
-        using TsmTree = cutlass::epilogue::fusion::PPUEVT<
-            cutlass::epilogue::fusion::PPUCompute<cutlass::multiplies, cutlass::bfloat16_t, float,
-                                                  cutlass::FloatRoundStyle::round_to_nearest>,
-            cutlass::epilogue::fusion::PPUScalarBroadcast<float, cute::Stride<cute::_0, cute::_0, int64_t>>,
-            cutlass::epilogue::fusion::PPUAccFetch>;
-        typename TsmTree::Params thread{};
+        struct {} thread{};
         cutlass::bfloat16_t* ptr_C{};
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C{};
         cutlass::bfloat16_t* ptr_D{};
@@ -385,7 +382,7 @@ public:
 
         cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
 
-        // NoTsm ignores alpha (ScaleType::Nothing) while TSM applies it; pin the {1, 0} contract.
+        // Both epilogues only convert the accumulator; enforce the {alpha=1, beta=0} contract.
         DG_HOST_ASSERT(args.epilogueargs.callback.alpha == 1.0f && args.epilogueargs.callback.alpha_ptr == nullptr &&
                        args.epilogueargs.callback.beta == 0.0f && args.epilogueargs.callback.beta_ptr == nullptr);
 
@@ -398,10 +395,11 @@ public:
         } else {
             // Map the flat inputs on the host (once per launch); the device converts nothing.
             return KernelParams{.with_tsm = GemmKernelParamsT<EpilogueParamWithTsm>{
-                args.mode, problem_shape, args.mainloopargs,
-                {{args.epilogueargs.callback.alpha, args.epilogueargs.callback.alpha_ptr},
-                 args.epilogueargs.ptr_C, args.epilogueargs.stride_C,
-                 args.epilogueargs.ptr_D, args.epilogueargs.stride_D},
+                args.mode, problem_shape, args.mainloopargs, {
+                    {},
+                    args.epilogueargs.ptr_C, args.epilogueargs.stride_C,
+                    args.epilogueargs.ptr_D, args.epilogueargs.stride_D
+                },
                 hw_info, args.scheduler, workspace, args.signal}};
         }
     }
@@ -536,10 +534,13 @@ using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueN
     cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
     cutlass::gemm::EpilogueDefault,
     IsAlignedN>;
-// PPU1.0 (810E) TSM epilogue: CollectiveBuilder (EpilogueSimtVectorized) -> EpilogueEvt with the
-// ScaledAcc op; the host mirrors its Params (see INT8GemmCutlass3Runtime::EpilogueParamWithTsm).
+
+// TSM epilogue for alpha=1, beta=0;
 static constexpr int AlignmentC = 16 / sizeof(ElementC);
-using DefaultOperation = cutlass::epilogue::fusion::ScaledAcc<ElementD, ElementCompute>;
+using DefaultOperation = cutlass::epilogue::fusion::PPUEVT<
+    cutlass::epilogue::fusion::PPUCompute<cutlass::epilogue::thread::Identity, ElementD, ElementCompute,
+                                       cutlass::FloatRoundStyle::round_to_nearest>,
+    cutlass::epilogue::fusion::PPUAccFetch>;
 using EpilogueSchedule = typename cutlass::epilogue::EpilogueSimtVectorized;
 using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, cutlass::arch::OpClassTensorOp,
@@ -551,6 +552,7 @@ using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::Colle
     EpilogueSchedule,
     DefaultOperation
 >::CollectiveOp;
+
 
 // Injected epilogue choice (is_ppu1v5_device()); matches to_underlying_arguments_rtc.
 static constexpr bool kWithTsmEpilogue = {19};
@@ -576,10 +578,14 @@ using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
 // Host/device Params ABI check (the driver copies sizeof(device Params) bytes from the host struct).
 static_assert(sizeof(GemmKernel::Params) == {20}, "host/device kernel Params size mismatch");
 
-using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, STAGES,
+// scale-A/B cp.async addresses: each stream keeps a 64-bit global address and a
+// 32-bit shared address, for 2 * 3 = 6 VREGs; A/B use the AIU load path.
+constexpr int kVregOverhead = 6;
+using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, GemmKernel::SharedStorageSize,
                             cute::sizeof_bits_v<ElementA>, cute::sizeof_bits_v<ElementB>,
                             cute::sizeof_bits_v<ElementCompute>,
-                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu>;
+                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu,
+                            false, kVregOverhead>;
 
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)

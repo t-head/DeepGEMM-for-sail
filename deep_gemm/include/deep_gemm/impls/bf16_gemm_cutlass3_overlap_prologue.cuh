@@ -172,6 +172,7 @@ struct CollectiveMma<
   prologue(
       cute::tuple<Ts...> const& load_inputs,
       int thread_idx,
+      int warp_idx,
       char *smem_buf) {
     using namespace cute;
 
@@ -179,8 +180,6 @@ struct CollectiveMma<
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
     static_assert(rank(SmemLayoutB{}) == 3,
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
-
-    int warp_idx = canonical_warp_idx_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -231,6 +230,7 @@ struct CollectiveMma<
       KTileIterator k_tile_iter, int k_tile_count,
       ResidueMNK residue_mnk,
       int thread_idx,
+      int warp_idx,
       char *smem_buf) {
     using namespace cute;
 
@@ -240,8 +240,6 @@ struct CollectiveMma<
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
     static_assert(rank(SmemLayoutB{}) == 3,
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
-
-    int warp_idx = canonical_warp_idx_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -650,7 +648,7 @@ public:
     const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
     auto load_inputs = collective_mma_prologue.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
                                                   offset_m, expert_id, ptr_A, ptr_B);
-    collective_mma_prologue.prologue(load_inputs, thread_idx, smem_buf);
+    collective_mma_prologue.prologue(load_inputs, thread_idx, warp_idx, smem_buf);
 
     while (tile_valid) {
       CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
@@ -680,6 +678,7 @@ public:
         k_tile_iter, k_tile_count,
         residue_mnk,
         thread_idx,
+        warp_idx,
         smem_buf
       );
 
@@ -703,7 +702,7 @@ public:
       const ElementB* ptr_B_next = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b_next;
       load_inputs = collective_mma_next.load_init(problem_shape_MNKL_next, blk_coord_mnkl_next, params.mainloop,
                                                     offset_m_next, expert_id_next, ptr_A_next, ptr_B_next);
-      collective_mma_next.prologue(load_inputs, thread_idx, smem_buf);
+      collective_mma_next.prologue(load_inputs, thread_idx, warp_idx, smem_buf);
 
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};

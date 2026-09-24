@@ -177,6 +177,7 @@ struct CollectiveMma<
   prologue(
       cute::tuple<Ts...> const& load_inputs,
       int thread_idx,
+      int warp_idx,
       char *smem_buf) {
     using namespace cute;
 
@@ -184,8 +185,6 @@ struct CollectiveMma<
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
     static_assert(rank(SmemLayoutB{}) == 3,
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
-
-    int warp_idx = canonical_warp_idx_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -248,8 +247,6 @@ struct CollectiveMma<
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
     static_assert(rank(SmemLayoutB{}) == 3,
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
-
-    //int warp_idx = canonical_warp_idx_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -692,7 +689,7 @@ public:
     int smem_pipe_read = (warp_group_id * size<2>(get<0>(load_inputs))) % DispatchPolicy::Stages;
 
     if (warp_group_id == 0) {
-      collective_mma_prologue.prologue(load_inputs, thread_idx, smem_buf);
+      collective_mma_prologue.prologue(load_inputs, thread_idx, warp_idx, smem_buf);
     } else {
       CUTLASS_PRAGMA_UNROLL
       for (int k_pipe = 1; k_pipe < DispatchPolicy::Stages; ++k_pipe) {

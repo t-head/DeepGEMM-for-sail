@@ -365,10 +365,14 @@ using GemmKernel = DeepGemmUniversal<
   kUseNStageKernel
 >;
 
-using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, STAGES,
+// scale-A cp.async address keeps a 64-bit global address and a 32-bit shared
+// address, for 3 VREGs; A/B use the AIU load path.
+constexpr int kVregOverhead = 3;
+using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, GemmKernel::SharedStorageSize,
                             cute::sizeof_bits_v<ElementA>, cute::sizeof_bits_v<ElementB>,
                             cute::sizeof_bits_v<ElementCompute>,
-                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu>;
+                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu,
+                            true, kVregOverhead>;
 
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)

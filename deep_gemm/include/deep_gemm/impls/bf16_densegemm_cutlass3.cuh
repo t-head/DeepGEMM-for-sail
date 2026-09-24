@@ -252,11 +252,10 @@ struct CollectiveMma<
   prologue(
       cute::tuple<Ts...> const& load_inputs,
       int thread_idx,
+      int warp_idx,
       char *smem_buf) {
     static_assert(OverlapPrologue, "prologue() is only available with OverlapPrologue enabled");
     using namespace cute;
-
-    int warp_idx = canonical_warp_idx_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -299,6 +298,7 @@ struct CollectiveMma<
       KTileIterator k_tile_iter, int k_tile_count,
       ResidueMNK residue_mnk,
       int thread_idx,
+      int warp_idx,
       char *smem_buf) {
     using namespace cute;
 
@@ -308,8 +308,6 @@ struct CollectiveMma<
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
     static_assert(rank(SmemLayoutB{}) == 3,
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
-
-    int warp_idx = canonical_warp_idx_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -684,6 +682,7 @@ public:
     static_assert(cute::rank(StrideD{}) == 3, "StrideD must be rank-3: [M, N, L].");
 
     int thread_idx = int(threadIdx.x);
+    int warp_idx = canonical_warp_idx_sync();
     auto blk_shape = TileShape{};
 
     TileScheduler deep_scheduler(params.scheduler);
@@ -714,7 +713,7 @@ public:
       auto load_inputs = collective_mma_prologue.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
                                                            offset_m, ptr_A, ptr_B);
       if (tile_valid) {
-        collective_mma_prologue.prologue(load_inputs, thread_idx, smem_buf);
+        collective_mma_prologue.prologue(load_inputs, thread_idx, warp_idx, smem_buf);
       }
 
       while (tile_valid) {
@@ -745,10 +744,10 @@ public:
           k_tile_iter, k_tile_count,
           residue_mnk,
           thread_idx,
+          warp_idx,
           smem_buf
         );
 
-        int warp_idx = canonical_warp_idx_sync();
         constexpr int WarpsPerK = WarpOnM * WarpOnN;
         const int warp_k_idx = (WarpOnK > 1) ? (warp_idx / WarpsPerK) : 0;
         if constexpr (WarpOnK > 1) {
@@ -784,7 +783,7 @@ public:
         auto load_inputs_next = collective_mma_next.load_init(problem_shape_MNKL_next, blk_coord_mnkl_next, params.mainloop,
                                                               offset_m_next, ptr_A_next, ptr_B_next);
         if (tile_valid) {
-          collective_mma_next.prologue(load_inputs_next, thread_idx, smem_buf);
+          collective_mma_next.prologue(load_inputs_next, thread_idx, warp_idx, smem_buf);
         }
 
         if (warp_k_idx == 0) {
@@ -852,10 +851,10 @@ public:
         k_tile_iter, k_tile_count,
         residue_mnk,
         thread_idx,
+        warp_idx,
         smem_buf
       );
 
-      int warp_idx = canonical_warp_idx_sync();
       constexpr int WarpsPerK = WarpOnM * WarpOnN;
       const int warp_k_idx = (WarpOnK > 1) ? (warp_idx / WarpsPerK) : 0;
       if constexpr (WarpOnK > 1) {

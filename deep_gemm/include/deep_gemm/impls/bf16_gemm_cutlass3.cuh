@@ -784,6 +784,7 @@ struct CollectiveMma<
       KTileIterator k_tile_iter, int k_tile_count,
       ResidueMNK residue_mnk,
       int thread_idx,
+      int warp_idx,
       char *smem_buf) {
     using namespace cute;
 
@@ -793,8 +794,6 @@ struct CollectiveMma<
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
     static_assert(rank(SmemLayoutB{}) == 3,
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
-
-    int warp_idx = canonical_warp_idx_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -1245,6 +1244,7 @@ public:
         k_tile_iter, k_tile_count,
         residue_mnk,
         thread_idx,
+        warp_idx,
         smem_buf
       );
 

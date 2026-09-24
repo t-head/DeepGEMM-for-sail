@@ -309,7 +309,6 @@ public:
     //   printf("EpilogueSharedStorage size = %d\n", sizeof(CollectiveEpilogue::SharedStorage));
     // }
 
-    // int warp_idx = cutlass::canonical_warp_idx_sync();
     // Kernel level shared memory storage
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
@@ -941,6 +940,7 @@ struct CollectiveMma<
       KTileIterator k_tile_iter, int k_tile_count,
       ResidueMNK residue_mnk,
       int thread_idx,
+      int warp_idx,
       char *smem_buf) {
     using namespace cute;
 
@@ -950,8 +950,6 @@ struct CollectiveMma<
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
     static_assert(rank(SmemLayoutB{}) == 3,
       "MainloopPPUCpAsync must have a pipeline mode in the smem layout.");
-
-    int warp_idx = canonical_warp_idx_sync();
 
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
@@ -1480,7 +1478,13 @@ public:
 
       // Compute tile residues for predication
       auto m_max_coord = M - size<0>(gA) * get<0>(blk_coord_mnkl);                             // M - BLK_M * m_coord
-      auto n_max_coord = N - size<0>(gB) * get<1>(blk_coord_mnkl);                             // N - BLK_N * n_coord
+      const auto n_max_coord = [&] {
+        if constexpr (N % size<1>(TileShape{}) == 0) {
+          return size<1>(TileShape{});
+        } else {
+          return N - size<0>(gB) * get<1>(blk_coord_mnkl);
+        }
+      }();
       auto k_residue   = K - size<1>(gA) * size<2>(gA);                                        // K - BLK_K * k_coord_max
       auto residue_mnk = make_tuple(m_max_coord, n_max_coord, k_residue);
 
@@ -1500,6 +1504,7 @@ public:
         k_tile_iter, k_tile_count,
         residue_mnk,
         thread_idx,
+        warp_idx,
         smem_buf
       );
 
@@ -1507,7 +1512,7 @@ public:
       auto params_epilogue_local = params.epilogue;
       params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
       params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
-      
+
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
       epilogue(
