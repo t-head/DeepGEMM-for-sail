@@ -447,7 +447,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m,
+            dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k * 2, expected_m,
                                       grouped_layout, current_stream());
             dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
             dg_prof_params.add_params("swiglu_limit", swiglu_limit);
@@ -544,7 +544,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m, grouped_layout,
+        dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k * 2, expected_m, grouped_layout,
                                   current_stream());
         dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
         dg_prof_params.add_params("swiglu_limit", swiglu_limit);

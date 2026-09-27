@@ -153,9 +153,9 @@ def generate_m_grouped_contiguous(num_groups: int, m: int, n: int, k: int, distr
     return m, a_fp8, b_fp8, m_indices, d, ref_d
 
 def generate_m_grouped_masked(num_groups: int, m: int, n: int, k: int, distribution: str, expected_m_per_group: int,
-                              use_ue8m0: bool = False, use_bf16: bool = False):
-    list_m =  construct_group_m_list(distribution, num_groups, m, is_mask=True, em=expected_m_per_group)
-    max_m = find_next_power_of_2(list_m)
+                              use_ue8m0: bool = False, use_bf16: bool = False, padding_m=0):
+    list_m = construct_group_m_list(distribution, num_groups, m, is_mask=True)
+    max_m = get_masked_padding_m(list_m, padding_m)
     masked_m = torch.tensor(list_m, device='cuda', dtype=torch.int)
     assert masked_m.amax().item() <= max_m
 
@@ -346,49 +346,49 @@ def truncated_zipf(num_experts, tokens, a=1.1, random_seed=None):
     return count
 
 def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=False, seed=0, em=0):
-    group_m_list = list()
-    if is_mask and em != 0:
-        expected_m_per_group = em
-    else:
-        expected_m_per_group = ceil_div(m, num_groups)
-    if distribution == None: # default value
-        distribution = "uniform"
-    if type(distribution) is list:
-        return distribution
-    elif distribution.endswith("dump") or distribution.endswith("bin"):
+    if num_groups == 0:
+        raise ValueError('groups must be positive')
+    expected_m_per_group = ceil_div(m, num_groups)
+    distribution = 'uniform' if distribution is None else distribution
+    explicit = isinstance(distribution, list)
+    if explicit:
+        group_m_list = distribution
+    elif distribution.endswith(('dump', 'bin')):
         print(f"Read dump from {distribution}")
         group_m_list = read_numbers_from_file(distribution)
-        if len(group_m_list) < num_groups:
-            for i in range(len(group_m_list), num_groups):
-                group_m_list.append(0)
+        group_m_list += [0] * max(0, num_groups - len(group_m_list))
+        explicit = True
+    elif is_mask and m == 0:
+        return [0] * num_groups
     elif distribution == "uniform":
         random.seed(seed)
         group_m_list = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
     elif distribution == "normal" or distribution == "gaussian":
         random.seed(seed)
-        # avg is expected_m_per_group, sigma is expected_m_per_group * 0.5
         group_m_list = [max(0, int(random.gauss(expected_m_per_group, expected_m_per_group * 0.5))) for _ in range(num_groups)]
     elif "zipf" in distribution:
         np.random.seed(seed)
         random.seed(seed)
         zipf_a = 1.1 if "." not in distribution else float(distribution.replace("zipf",""))
         group_m_list = truncated_zipf(num_groups, m, a=zipf_a)
-        # dist = np.random.zipf(zipf_a, num_groups)
-        # Add noise to zipf distribution to avoid many identical values
-        # noise = [random.gauss(0, 1) for _ in range(num_groups)]
-        # dist = dist + noise
-        # scale = expected_m_per_group * num_groups / dist.sum()
-        # group_m_list = [max(0, x) for x in np.round(dist * scale).astype(int)]
     else:
         print("ERROR: Unsupported distribution type, please check!")
         exit(1)
-    if not is_mask:
-        group_m_list = round_m_list_sum_to_m(group_m_list, m)
-        assert sum(group_m_list) <= m, f"sum(m_list)={sum(group_m_list)} must <= m_sum={m}"
-    group_m_list = sorted(group_m_list, reverse=True)
-    if show_log:
-        print(f"distribution:{group_m_list}")
-    return group_m_list
+
+    if explicit:
+        if len(group_m_list) != num_groups:
+            raise ValueError('distribution must contain one count per expert')
+        if any(isinstance(x, bool) or not isinstance(x, (int, np.integer)) for x in group_m_list):
+            raise ValueError('distribution counts must be integers')
+    if explicit and is_mask:
+        # Explicit masked counts define the total and retain expert order.
+        return [int(x) for x in group_m_list]
+    if isinstance(distribution, list):
+        return group_m_list
+    # Random distributions share nopad's total correction; em is only a scheduler hint.
+    group_m_list = round_m_list_sum_to_m(group_m_list, m)
+    assert sum(group_m_list) == m, f"sum(m_list)={sum(group_m_list)} must equal m_sum={m}"
+    return sorted(group_m_list, reverse=True)
 
 def silu_and_mul_post_quant_torch(ref_out: torch.Tensor, swiglu_limit: float = 0.0):
     """weight consists [gate, up]"""
@@ -679,13 +679,22 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
 
-def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, distribution: str,
-                             enable_sbo_overlap: bool = False, quant_type: str = "block", group_size: int = 32, **kwargs):
+def get_masked_padding_m(counts, padding_m=0):
+    padding_m = int(padding_m)
+    if padding_m == 0:
+        return max(128, find_next_power_of_2(counts))
+    if padding_m < max(counts):
+        raise ValueError('padding_m must accommodate every expert')
+    return padding_m
+
+
+def construct_grouped_masked(num_groups: int, m: int, expected_m_per_group: int, k: int, n: int, d: torch.dtype, distribution: str,
+                             enable_sbo_overlap: bool = False, quant_type: str = "block", group_size: int = 32, padding_m=0, **kwargs):
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
     # Construct mask
-    list_m =  construct_group_m_list(distribution, num_groups, max_m, is_mask=True, em=expected_m_per_group)
+    list_m = construct_group_m_list(distribution, num_groups, m, is_mask=True)
     masked_m = torch.tensor(list_m, device=tensor_device, dtype=torch.int)
-    max_m = max(128, find_next_power_of_2(list_m))
+    max_m = get_masked_padding_m(list_m, padding_m)
     assert masked_m.amax().item() <= max_m, f"max masked_m={masked_m.amax().item()}, allowed max_m={max_m}"
 
     x = torch.randn((num_groups, max_m, k), device=tensor_device, dtype=torch.bfloat16)
@@ -1055,17 +1064,12 @@ def read_numbers_from_file(file_path):
         for line in file:
             stripped_line = line.strip()
             if stripped_line:
-                try:
-                    number = int(stripped_line)
-                    numbers.append(number)
-                except ValueError:
-                    print(f"Warning: skip invalid: {stripped_line}")
+                numbers.append(int(stripped_line))
     return numbers
 
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
-    supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size", "logits_dtype", "weights_dtype", "c4_compressed", "epilogue_type", "swiglu_limit", "sparse_block_kv", "num_max_sparse_blocks", "use_unaligned_ks"]
     supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", ]
     supported_indexer_epilogue_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
@@ -1316,15 +1320,6 @@ def test_m_grouped_gemm_contiguous(args) -> None:
         f'{(valid_m * k + num_groups * k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     return
 
-def estimate_expected_m(max_m, group_size, m_indices):
-    assert group_size != 0
-    estimate = round_up(int(max_m // group_size), 16)
-    max_m = round_up(min(max(m_indices.tolist()), max_m), 16)
-    # clamp estimate
-    estimate = max(estimate, 16)
-    estimate = min(max_m, estimate)
-    return estimate
-
 def test_m_grouped_gemm_masked(args) -> None:
     print('Testing grouped masked GEMM:')
 
@@ -1338,12 +1333,17 @@ def test_m_grouped_gemm_masked(args) -> None:
 
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     group_size = args.get('group_size', 32)
+    distribution = construct_group_m_list(distribution, num_groups, m, is_mask=True)
+    m = sum(distribution)
+    max_m = get_masked_padding_m(distribution, args.get('padding_m', 0))
+    expected_m_per_group = args.get('em', 1 if m == 0 else ceil_div(m, num_groups))
+    dtype_name = {torch.bfloat16: 'bf16', torch.int8: 'int8', torch.float8_e4m3fn: 'fp8', torch.uint8: 'fp4'}.get(d, d)
+    case = (f'GroupedMasked,data_type:{dtype_name},groups:{num_groups},m:{m},n:{n},k:{k},'
+            f'em:{expected_m_per_group},padding_m:{max_m},distribution:{distribution},'
+            f'quant_type:{quant_type},group_size:{group_size},enable_sbo_overlap:{int(enable_sbo_overlap)}')
+    print(f'test_m_grouped_gemm_masked->test_func: {case}')
     if use_ppu:
-        expected_m_per_group = ceil_div(m, num_groups)
-        x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit)
-
-        expected_m_per_group = estimate_expected_m(m, num_groups, masked_m) if "em" not in args.keys() else args["em"]
-        print(f"test_m_grouped_gemm_masked->test_func: GroupedMasked,groups:{num_groups},m:{m},n:{n},k:{k},data_type:{d},em:{expected_m_per_group},max_m:{max_m},distribution:{masked_m},sbo_overlap:{enable_sbo_overlap}")
+        x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit, padding_m=max_m)
 
         if d == torch.bfloat16:
             result = deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
@@ -1371,15 +1371,14 @@ def test_m_grouped_gemm_masked(args) -> None:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
     else:
-        expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
         if d == torch.bfloat16:
-            x, y, masked_m, out, ref_out = generate_m_grouped_masked(num_groups, m, n, k, distribution, expected_m_per_group, use_bf16=True)
+            x, y, masked_m, out, ref_out = generate_m_grouped_masked(num_groups, m, n, k, distribution, expected_m_per_group, use_bf16=True, padding_m=max_m)
             deep_gemm.m_grouped_bf16_gemm_nt_masked(x, y, out, masked_m, expected_m_per_group)
         elif d == torch.float8_e4m3fn:
             kernel_type = get_kernel_types(d)
             use_ue8m0 = get_ue8m0_usage(kernel_type)
             disable_ue8m0_cast = not use_ue8m0
-            x, y, masked_m, out, ref_out = generate_m_grouped_masked(num_groups, m, n, k, distribution, expected_m_per_group, use_ue8m0=use_ue8m0)
+            x, y, masked_m, out, ref_out = generate_m_grouped_masked(num_groups, m, n, k, distribution, expected_m_per_group, use_ue8m0=use_ue8m0, padding_m=max_m)
             deep_gemm.m_grouped_fp8_gemm_nt_masked(x, y, out, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
         else:
             print("ERROR: Unsupported dtype, please check!")
