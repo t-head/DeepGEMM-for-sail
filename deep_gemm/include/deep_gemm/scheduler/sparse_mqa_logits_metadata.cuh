@@ -498,7 +498,7 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
 
     // The last CTA acquires all producer writes and builds the schedule
     if (tid == 0) {
-        const bool is_last_cta = atomic_add_release_global(reinterpret_cast<int*>(&workspace_state->num_finished_ctas), 1) +
+        const bool is_last_cta = tix::atomic_add_release_global(reinterpret_cast<int*>(&workspace_state->num_finished_ctas), 1) +
                                      1 == static_cast<int>(gridDim.x);
         if (is_last_cta)
             ld_acquire_global_u32(&workspace_state->num_finished_ctas);

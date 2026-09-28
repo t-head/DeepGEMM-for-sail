@@ -1,6 +1,7 @@
 #pragma once
 #include <cub/block/block_scan.cuh>
 #include <deep_gemm/common/math.cuh>
+#include <deep_gemm/tix/cvt.cuh>
 
 #include <cute/ppu_tensor_mix.hpp>
 #include <cutlass/gemm/config/gemm_operands.hpp>
@@ -232,7 +233,7 @@ __forceinline__ __device__ void epilogue_no_tsm(TAcc& accum, const TCcC& tCcC, v
           for (int mma_n = 0; mma_n < size<0,2>(tCcC); ++mma_n) {
             AccT* acc_ptr = cute::raw_pointer_cast(accum(make_coord(_, mma_m, mma_n), warp_m, warp_n).data());
             uint32_t d;
-            asm volatile("ppu.cvt.rtte.bf16x2.f32 %0, %1, %2;\n" : "=r"(d) : "f"(acc_ptr[1]), "f"(acc_ptr[0]));
+            d = tix::cvt_rte_bf16x2_f32(acc_ptr[1], acc_ptr[0]);
 
             size_t n_idx = get<1>(tCcC(make_coord(_0{}, mma_m, mma_n), warp_m, warp_n));
             uint32_t* dst_ptr = reinterpret_cast<uint32_t*>(cur_c_ptr + n_idx);

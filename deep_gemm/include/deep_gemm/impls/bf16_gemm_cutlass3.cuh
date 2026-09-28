@@ -602,7 +602,7 @@ public:
         __syncthreads();
 
         if (threadIdx.x == 0) {
-          atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
+          deep_gemm::tix::atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
                   * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
         }
       }
@@ -1280,7 +1280,7 @@ public:
         __syncthreads();
 
         if (threadIdx.x == 0) {
-          atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
+          deep_gemm::tix::atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
                   * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_coord, 1);
         }
       }

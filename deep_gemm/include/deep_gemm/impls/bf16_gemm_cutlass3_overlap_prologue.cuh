@@ -1,6 +1,7 @@
 #pragma once
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
+#include <deep_gemm/tix/utils.cuh>
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
@@ -733,7 +734,7 @@ public:
         __syncthreads();
 
         if (threadIdx.x == 0) {
-          atomic_add_release_global(params.signal + curr_group_idx
+          deep_gemm::tix::atomic_add_release_global(params.signal + curr_group_idx
                   * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + curr_m_coord, 1);
         }
       }

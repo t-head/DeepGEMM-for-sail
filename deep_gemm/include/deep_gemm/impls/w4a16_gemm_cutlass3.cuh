@@ -11,7 +11,7 @@
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/scheduler/block_info.cuh>
 
-
+#include <deep_gemm/tix/cvt.cuh>
 #include <cute/ppu_tensor_mix.hpp>
 #include <cutlass/gemm/config/gemm_operands.hpp>
 #include <cute/atom/mma_traits_ppu0010.hpp>
@@ -518,7 +518,7 @@ public:
           if (!cond) continue;
           #if __HGGC_ARCH__ == 150
             uint32_t d;
-            asm volatile("ppu.cvt.rtte.bf16x2.f32 %0, %1, %2;\n" : "=r"(d) : "f"(accum(i+1)), "f"(accum(i)));
+            d = deep_gemm::tix::cvt_rte_bf16x2_f32(accum(i+1), accum(i));
             *reinterpret_cast<uint32_t*>(dst_ptr) = d;
           #else
             *dst_ptr = ElementD(accum(i));

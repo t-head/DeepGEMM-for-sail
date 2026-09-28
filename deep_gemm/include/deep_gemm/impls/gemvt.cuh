@@ -12,6 +12,7 @@
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
+#include <deep_gemm/tix/cp_async.cuh>
 
 namespace deep_gemm {
 
@@ -63,44 +64,6 @@ HGGC_DEVICE_ONLY void dot_op(src_type *src_a, src_type *src_x, acc_type &val) {
     val = val + acc_type(src_a[i] * src_x[i]);
     }
     return;
-}
-
-__device__ __forceinline__
-uint32_t SmemU32Addr(const void *smemptr) {
-    uint32_t u32addr;
-    asm (
-        "{.reg .u64 u64addr;\n"
-        " ppu.cvta.to.shared.u64 u64addr, %1;\n"
-        " ppu.cvt.u32.u64 %0, u64addr; }\n"
-        : "=r"(u32addr)
-        : "l"(smemptr)
-    );
-    return u32addr;
-}
-
-__device__ __forceinline__
-void LdgSts128(const void* smemPtr,
-               const void *gmemPtr,
-               bool guard = true) {
-    auto smemAddr = SmemU32Addr(smemPtr);
-    asm volatile (
-        "{.reg.pred p;\n"
-        " ppu.cmpp.ne.b32 p, %2, 0;\n"
-        " @p ppu.cp.async.cg.shared.global [%0], [%1], 16;}\n"
-        :
-        : "r"(smemAddr), "l"(gmemPtr), "r"((int)guard)
-    );
-}
-
-__device__ __forceinline__
-void LdgStsGroupCommit() {
-    asm volatile ("ppu.cp.async.commit_group;\n");
-}
-
-template <int N>
-__device__ __forceinline__
-void LdgStsGroupWait() {
-    asm volatile ("ppu.cp.async.wait_group %0;\n" : : "n"(N));
 }
 
 template <typename src_type, typename dst_type, typename acc_type,
@@ -170,10 +133,10 @@ __device__ void batched_gemvt_kernel_small_k_impl(const GemvtArgs args) {
 
   // load B to shared
   for (int stage = 0; stage < Stages; stage++) {
-    LdgSts128(&(shared[stage][tid_n][tid_k * alignmentB]), b_ptr_start + stage * NLoopStep * args.stride_bn);
-    LdgStsGroupCommit();
+    tix::LdgSts128(&(shared[stage][tid_n][tid_k * alignmentB]), b_ptr_start + stage * NLoopStep * args.stride_bn);
+    tix::LdgStsGroupCommit();
   }
-  LdgStsGroupWait<Stages - 1>();
+  tix::LdgStsGroupWait<Stages - 1>();
 
   HGGC_PRAGMA_UNROLL
   for (int nloop = 0; nloop < NPerThread; nloop++) {
@@ -194,15 +157,15 @@ __device__ void batched_gemvt_kernel_small_k_impl(const GemvtArgs args) {
     dot_op<src_type, acc_type, alignmentMax>((src_type *)&vreg_a,
                                              (src_type *)(vreg_b + nloop),
                                              accum[nloop]);
-    LdgStsGroupWait<Stages - 2>();
+    tix::LdgStsGroupWait<Stages - 2>();
 
     int load_next_n = nloop + Stages;
     if (nloop < NPerThread - 2) {
       // load next B to shared
       int next_stage = load_next_n % Stages;
       auto b_ptr_next = b_ptr_start + load_next_n * NLoopStep * args.stride_bn;
-      LdgSts128(&(shared[next_stage][tid_n][tid_k * alignmentB]), b_ptr_next, load_next_n < NPerThread);
-      LdgStsGroupCommit();
+      tix::LdgSts128(&(shared[next_stage][tid_n][tid_k * alignmentB]), b_ptr_next, load_next_n < NPerThread);
+      tix::LdgStsGroupCommit();
     }
   }
 

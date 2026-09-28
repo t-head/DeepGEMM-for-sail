@@ -1,4 +1,6 @@
 #pragma once
+#include <deep_gemm/tix/cvt.cuh>
+#include <deep_gemm/tix/ld_st.cuh>
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 #include <deep_gemm/scheduler/paged_mqa_logits_scheduler.cuh>
@@ -301,7 +303,7 @@ public:
     auto tSFQgSFQ = tSFBgSFB;
 
     constexpr bool load_kv_scale = sizeof(ElementQK) == 1;
-    const auto& lane_idx = get_lane_idx();
+    const auto& lane_idx = deep_gemm::tix::get_lane_idx();
     int warp_m_idx = local_warp_idx % WarpOnM;
     int warp_n_idx = local_warp_idx / WarpOnM;
     const auto& warp_offset = warp_m_idx * WARP_M;
@@ -438,13 +440,13 @@ public:
             if constexpr (kWq4) {
                 // Each lane stores only its own parity's kv row in the kWq4 epilogue,
                 // so it only loads that row's scale
-                scale_kv_array[m] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
+                scale_kv_array[m] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
                     scale_kv_array[m] *= kInvSqrtHeadDim;
                 }
             } else {
-                scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
-                scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
+                scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
+                scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
                     scale_kv_array[m * 2    ] *= kInvSqrtHeadDim;
                     scale_kv_array[m * 2 + 1] *= kInvSqrtHeadDim;
@@ -488,8 +490,8 @@ public:
                         // BF16: cvt relu-packs the two rows of one head (lo = v_0,
                         // hi = v_1), hadd2 sums the lane's two heads
                         uint32_t pa, pb;
-                        pa = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(4 * t + 2, m, 0), accum(4 * t + 0, m, 0));
-                        pb = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(4 * t + 3, m, 0), accum(4 * t + 1, m, 0));
+                        pa = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(4 * t + 2, m, 0), accum(4 * t + 0, m, 0));
+                        pb = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(4 * t + 3, m, 0), accum(4 * t + 1, m, 0));
                         const __ppu_bfloat162 partial = __hadd2(reinterpret_cast<__ppu_bfloat162&>(pa),
                                                                 reinterpret_cast<__ppu_bfloat162&>(pb));
                         const uint32_t recv = __shfl_xor_sync(0xffffffffu, reinterpret_cast<const uint32_t&>(partial), 1);
