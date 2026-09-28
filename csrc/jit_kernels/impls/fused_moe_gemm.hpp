@@ -158,13 +158,12 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     // Profiling instrumentation
-    hggcStream_t stream = current_stream();
     int topk = m_sum / num_token;
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_fused_moe_params(
             std::string("bf16"), std::string("non_quantized"),
-            (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), stream);
+            (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), current_stream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -491,13 +490,12 @@ static void m_grouped_gemm_perchannel_nt_fused_impl(
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     // Profiling instrumentation
-    hggcStream_t stream = current_stream();
     int topk = m_sum / num_token;
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_fused_moe_params(
             std::string(type_tag), std::string("channel"),
-            (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), stream);
+            (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), current_stream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -586,13 +584,12 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
         &blocks_per_cu, kernel, block_size, smem_size));
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
-    hggcStream_t stream = current_stream();
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_fused_moe_params(
             std::string("fp4"), std::string("group"), static_cast<int>(num_groups),
             static_cast<int>(num_token), topk, static_cast<int>(n), static_cast<int>(k),
-            m_rows.data_ptr<int32_t>(), stream);
+            m_rows.data_ptr<int32_t>(), current_stream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
     Fp4FusedMoeRuntime::launch(runtime, args);
@@ -701,12 +698,11 @@ static void m_grouped_gemm_blkwise_nt_fused_impl(
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     // Profiling instrumentation
-    hggcStream_t stream = current_stream();
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_fused_moe_params(
             std::string("fp8"), std::string("block"),
-            (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), stream);
+            (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), current_stream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 

@@ -805,10 +805,9 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     int* layout_info = reinterpret_cast<int32_t*>(m_indices.data_ptr<int32_t>());
     if (use_gemv) {
         DgProfParam dg_prof_params;
-        hggcStream_t stream = current_stream();
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(GemmType::GroupedNoPad, true, std::string("int8"), num_groups, m, n, k, expected_m,
-                                      layout_info, stream);
+                                      layout_info, current_stream());
         }
         cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
         auto gemmv_args = GemvRuntime::GemvtArgs{

@@ -786,8 +786,7 @@ using WorkConfigTuple = std::tuple<int, int, int, int, int, int, int, int, bool,
 static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                                      const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                                      const torch::Tensor& out, const int& m, const int& n, const int& k,
-                                     std::optional<ConfigTuple> configs = std::nullopt,
-                                     hggcStream_t stream = current_stream()) {
+                                     std::optional<ConfigTuple> configs = std::nullopt) {
     TORCH_CHECK(rhs_scales.is_contiguous(), "rhs_scales must be contiguous");
     if (m == 0) {
         return;
@@ -903,7 +902,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout, stream);
+            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout, current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -962,7 +961,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout, stream);
+            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout, current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -1042,7 +1041,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("int8"), kNumGroups, m, n, k, 0, grouped_layout, stream);
+            dg_prof_params.set_params(kGemmType, false, std::string("int8"), kNumGroups, m, n, k, 0, grouped_layout, current_stream());
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 

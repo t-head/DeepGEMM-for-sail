@@ -445,11 +445,10 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, dyn_block.x, SMSIZE);
         dyn_args.launch_args.grid_dim.x *= blocks_per_cu;
 
-        hggcStream_t stream = current_stream();
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m,
-                                      grouped_layout, stream);
+                                      grouped_layout, current_stream());
             dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
             dg_prof_params.add_params("swiglu_limit", swiglu_limit);
         }
@@ -543,12 +542,10 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
-    hggcStream_t stream = current_stream();
-
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, expected_m, grouped_layout,
-                                  stream);
+                                  current_stream());
         dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
         dg_prof_params.add_params("swiglu_limit", swiglu_limit);
     }
