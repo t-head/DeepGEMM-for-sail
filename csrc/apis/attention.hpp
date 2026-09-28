@@ -545,15 +545,15 @@ torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::pair<torch::Tensor, tor
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
     const auto& q_fp = q.first;
     const auto& q_sf = q.second;
-    const auto q_shape = q_fp.sizes();  // [num_q_tokens, kNumHeads, kHeadDim / 2]
-    const int num_q_tokens = static_cast<int>(q_shape[0]);
-    DG_HOST_ASSERT(q_shape.size() == 3 and
-                   q_shape[1] == static_cast<int64_t>(sparse_mqa_logits::kNumHeads) and
-                   q_shape[2] == static_cast<int64_t>(sparse_mqa_logits::kHeadDim / 2));
+    DG_HOST_ASSERT(q_fp.dim() == 4);
+    const auto [num_q_tokens, next_n, num_heads, head_dim_packed] = get_shape<4>(q_fp);
+    DG_HOST_ASSERT(num_q_tokens > 0 and next_n == 1 and
+                   num_heads == sparse_mqa_logits::kNumHeads and
+                   head_dim_packed == sparse_mqa_logits::kHeadDim / 2);
     DG_HOST_ASSERT(q_fp.scalar_type() == torch::kInt8 and q_fp.is_contiguous());
     DG_HOST_ASSERT(q_sf.scalar_type() == torch::kInt32 and q_sf.is_contiguous() and
-                   q_sf.dim() == 2 and q_sf.size(0) == num_q_tokens and
-                   q_sf.size(1) == static_cast<int64_t>(sparse_mqa_logits::kNumHeads));
+                   q_sf.dim() == 3 and q_sf.size(0) == num_q_tokens and
+                   q_sf.size(1) == 1 and q_sf.size(2) == num_heads);
     const int64_t head_dim_with_sf = sparse_mqa_logits::kHeadDim / 2 + sizeof(uint32_t);
     DG_HOST_ASSERT(kv_cache.scalar_type() == torch::kUInt8 and kv_cache.dim() == 4 and
                    kv_cache.size(2) == 1 and kv_cache.size(3) == head_dim_with_sf and
@@ -568,7 +568,7 @@ torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::pair<torch::Tensor, tor
     DG_HOST_ASSERT(page_kv % sparse_block_kv == 0);
     const int num_output_tokens = num_max_sparse_blocks * sparse_block_kv;
     const int logits_stride = align(num_output_tokens, 512);  // 1024B row alignment for bf16
-    auto logits = torch::empty({align(num_q_tokens, static_cast<int>(sparse_mqa_logits::kBlockQ)), logits_stride},
+    auto logits = torch::empty({align<int64_t>(num_q_tokens, sparse_mqa_logits::kBlockQ), logits_stride},
                                q_fp.options().dtype(torch::kBFloat16));
     logits = logits.slice(0, 0, num_q_tokens);
     sparse_mqa_logits::launch_fp4_paged_sparse_mqa_logits(

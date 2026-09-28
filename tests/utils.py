@@ -2426,7 +2426,7 @@ def test_sparse_mqa_logits(args) -> None:
         q = torch.randn(seq_len_q, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
         weights = torch.randn(seq_len_q, num_heads, device='cuda', dtype=torch.bfloat16)
         q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-        q_in = (q_fp4[0].view(seq_len_q, num_heads, head_dim // 2), q_fp4[1].view(seq_len_q, num_heads))
+        q_in = (q_fp4[0].view(seq_len_q, 1, num_heads, head_dim // 2), q_fp4[1].view(seq_len_q, 1, num_heads))
 
         # ks = 0 for every token: absolute sparse block ids from the pool start
         sparse_indices, num_blocks_per_q = make_sparse_kv_block_indices(
@@ -2437,14 +2437,12 @@ def test_sparse_mqa_logits(args) -> None:
         # cycle CSV): dense paged fp4 kernel, gathered at the selected positions
         gathered_ref, valid_mask = None, None
         if get_acc_check():
-            q_in_4d = (q_fp4[0].view(seq_len_q, 1, num_heads, head_dim // 2),
-                       q_fp4[1].view(seq_len_q, 1, num_heads))
             context_lens_2d = context_lens.unsqueeze(-1)
             schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
                 context_lens_2d, page_kv, deep_gemm.get_num_sms(),
                 metadata_extra=(1, num_heads, head_dim // 2, 1))
             full_logits = deep_gemm.fp8_fp4_paged_mqa_logits(
-                q=q_in_4d, fused_kv_cache=kv_cache_fp4, weights=weights, context_lens=context_lens_2d,
+                q=q_in, fused_kv_cache=kv_cache_fp4, weights=weights, context_lens=context_lens_2d,
                 block_table=block_table, schedule_meta=schedule_meta,
                 max_context_len=max(context_lens_list), clean_logits=False, logits_dtype=torch.bfloat16)
             gathered_ref, valid_mask = gather_sparse_reference(
