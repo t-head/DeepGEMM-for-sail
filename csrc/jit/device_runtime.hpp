@@ -6,6 +6,7 @@
 #include <hggc_runtime_api.h>
 #include <torch/version.h>
 #include <torch/torch.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 
 #include "../utils/exception.hpp"
