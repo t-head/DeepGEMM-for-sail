@@ -322,7 +322,7 @@ static void launch_fp4_sparse_mqa_logits_impl(
             "fp4", static_cast<int>(seq_len_q), static_cast<int>(seq_len_kv),
             static_cast<int>(sparse_mqa_logits::kNumHeads), static_cast<int>(sparse_mqa_logits::kHeadDim),
             static_cast<int>(sparse_block_kv), static_cast<int>(num_max_sparse_blocks), use_unaligned_ks,
-            is_paged);
+            is_paged, current_stream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
     SparseMqaLogitsFP4Runtime::launch(runtime, args);
