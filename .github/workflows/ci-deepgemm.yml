@@ -1,0 +1,49 @@
+name: deepgemm checkin     # ① Workflow 名称（显示在 Actions 页面）
+
+# ② 触发条件
+on:
+  workflow_dispatch:                                       # 支持手动触发（网页/API）
+  pull_request:
+    branches: ['v1.1.0_v0.1.0_release']                                       # 目标 main 的 PR
+    types: [opened, synchronize, reopened]
+  # push:
+  #   branches: ['feature/add-ci-workflow-rel']                                       # 调试时打开
+
+permissions:                    # ③ Token 权限
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: ci-ppu-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true                 # 新运行自动取消旧的
+
+jobs:
+  
+  # Stage 1: 密钥扫描预检（组织级 reusable workflow）
+  precheck:
+    name: Pre-check
+    uses: t-head/.github/.github/workflows/user-precheck.yml@main
+  # TODO: add smoketest if necessary
+
+  # Stage 2: AI 代码审查
+  ai-code-review:
+    name: AI Code Review (Copilot Gate)
+    needs: precheck
+    uses: t-head/.github/.github/workflows/ai-code-review.yml@main
+    secrets: inherit
+
+  # Stage 3: 人工审批门禁
+  human-review:
+    name: Human Review Gate
+    # TODO: change to ai-code-review
+    needs: precheck
+    uses: t-head/.github/.github/workflows/human-review.yml@main
+    secrets: inherit
+
+  deepgemm-ut-tests-ppu:
+    name: deepgemm UT Tests PPU
+    # TODO: change to human-review
+    needs: precheck
+    uses: ./.github/workflows/deepgemm-ut-test-ppu.yml
+    secrets: inherit
