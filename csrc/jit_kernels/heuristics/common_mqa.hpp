@@ -89,8 +89,8 @@ static int get_paged_num_threads(const PagedTile& tile, int next_n) {
 // Faithful port of `get_paged_mqa_logits_tile`: a lookup table with a search fallback.
 // NOTES: `weights_size` / `logits_size` are hardcoded to 4 upstream even when the tensors are
 // BF16; kept as-is so the tile choice matches the Python path exactly.
-static PagedTile get_paged_mqa_logits_tile(int next_n, int block_kv, int num_heads, int head_dim, int datasize) {
-    DG_HOST_ASSERT(block_kv == 64);
+static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_heads, int head_dim, int datasize) {
+    DG_HOST_ASSERT(page_kv == 32 or page_kv == 64 or page_kv == 128);
     const bool is_fp4 = datasize == 1 and head_dim == 64;
     constexpr int weights_size = 4, logits_size = 4;
 

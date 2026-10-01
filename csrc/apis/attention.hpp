@@ -135,8 +135,8 @@ static torch::Tensor mqa_logits_common(const torch::Tensor& q, const torch::Tens
 //                   FP4:           [batch, next_n, num_heads, head_dim_packed], dtype = int8,
 //                                  where head_dim_packed = original_head_dim / 2 = 64
 //   fused_kv_cache: fused KV cache, uint8.
-//                   FP8/BF16/INT8: [num_kv_blocks, block_kv, 1, head_dim + scale_bytes]
-//                   FP4:           [num_kv_blocks, block_kv, 1, head_dim_packed + scale_bytes]
+//                   FP8/BF16/INT8: [num_kv_blocks, page_kv, 1, head_dim + scale_bytes]
+//                   FP4:           [num_kv_blocks, page_kv, 1, head_dim_packed + scale_bytes]
 //                   Per-row layout: [values (head_dim or head_dim_packed bytes),
 //                                    scale (scale_bytes bytes)]
 //                   The value and scale views are recovered here via `as_strided`.
@@ -157,7 +157,7 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
     const bool is_fp4 = q_sf.has_value();
 
     const auto& [batch_size, next_n, num_heads, head_dim] = get_shape<4>(q);
-    const auto& [num_kv_blocks, block_kv, num_heads_kv, kv_last_dim] = get_shape<4>(fused_kv_cache);
+    const auto& [num_kv_blocks, page_kv, num_heads_kv, kv_last_dim] = get_shape<4>(fused_kv_cache);
     DG_HOST_ASSERT(context_lens.dim() == 2);
     DG_HOST_ASSERT(context_lens.size(1) == next_n);
     const auto& [schedule_meta_size, meta_info_size] = get_shape<2>(schedule_meta);
@@ -191,7 +191,7 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
     DG_HOST_ASSERT(num_heads_kv == 1);
     DG_HOST_ASSERT((schedule_meta_size - 1) % num_sms == 0 and meta_info_size == 2);
     DG_HOST_ASSERT(1 <= next_n and next_n <= 6);
-    DG_HOST_ASSERT(block_kv == 64);
+    DG_HOST_ASSERT(page_kv == 32 or page_kv == 64 or page_kv == 128);
 
     TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
     DG_HOST_ASSERT(fused_kv_cache.stride(1) == kv_last_dim);
@@ -235,7 +235,7 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
     TORCH_CHECK(not clean_logits, "clean_logits not supported with 2D context_lens, use external masking");
 
     return paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, batch_size, next_n,
-                            num_heads, head_dim, num_kv_blocks, block_kv, schedule_meta_size, max_context_len,
+                            num_heads, head_dim, num_kv_blocks, page_kv, schedule_meta_size, max_context_len,
                             logits_dtype, q_sf);
 }
 
@@ -330,7 +330,7 @@ torch::Tensor fp8_paged_mqa_avg_logits(const torch::Tensor& q, const torch::Tens
 // being passed positionally. That check is unnecessary here -- pybind rejects a tuple for
 // `std::optional<torch::Tensor>` with a TypeError before the body runs.
 torch::Tensor get_paged_mqa_logits_metadata(
-    const torch::Tensor& context_lens, int block_kv, int num_sms, std::optional<torch::Tensor> indices = std::nullopt,
+    const torch::Tensor& context_lens, int page_kv, int num_sms, std::optional<torch::Tensor> indices = std::nullopt,
     std::optional<std::tuple<int, int, int, int>> metadata_extra = std::nullopt) {
     if (indices.has_value())
         print_once("Warning: indices (varlen) is not supported on PPU, falling back to non-varlen mode "
@@ -345,7 +345,7 @@ torch::Tensor get_paged_mqa_logits_metadata(
     // shared memory limit
     DG_HOST_ASSERT(batch_size <= 65536);
 
-    return paged_mqa_logits_metadata(context_lens, batch_size, block_kv, num_sms, metadata_extra);
+    return paged_mqa_logits_metadata(context_lens, batch_size, page_kv, num_sms, metadata_extra);
 }
 
 torch::Tensor bf16_paged_mqa_logits(const torch::Tensor& q, const torch::Tensor& fused_kv_cache,

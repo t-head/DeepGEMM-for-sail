@@ -7,13 +7,13 @@ namespace cutlass::gemm::kernel {
 
 template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights,
           uint32_t kNextN, uint32_t kNumHeads,
-          uint32_t kHeadDim, uint32_t BLOCK_KV, uint32_t WARP_KV,
+          uint32_t kHeadDim, uint32_t PAGE_KV, uint32_t SPLIT_KV, uint32_t BLOCK_KV, uint32_t WARP_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
-          uint32_t SPLIT_KV,
           bool SPLIT_MBLOCK = false,
           uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
 class PPUPagedMqaLogits {
 public:
+    static_assert(PAGE_KV == 32 || PAGE_KV == 64 || PAGE_KV == 128, "Invalid KV page size");
   static_assert(not SPLIT_MBLOCK, "SPLIT_MBLOCK is only supported for FP4");
   // Avg variant (kScaleMode = kScaleModeUnity): no per-head weights,
   // logits = sum_h(relu(qk)) * k_scale / sqrt(kHeadDim)
@@ -68,7 +68,9 @@ public:
   static constexpr bool WarpInterleaving = (MaxThreadsPerBlock == 512);
   static_assert(!(WarpInterleaving && kNumQStages == 1), "warp-interleave does not support stage_q = 1");
 
-  using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementQK, false, Int<BLOCK_M>, Int<BLOCK_K>, false>;
+  // Match each page32 transfer's swizzle; BF16 keeps its split-K layout.
+  static constexpr int kKVSmemRows = sizeof(ElementQK) == 2 ? BLOCK_M : (PAGE_KV < BLOCK_KV ? PAGE_KV : BLOCK_KV);
+  using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementQK, false, Int<kKVSmemRows>, Int<BLOCK_K>, false>;
   using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementQK, false, Int<BLOCK_N>, Int<BLOCK_K>, true>;
 
   // A
@@ -332,20 +334,68 @@ public:
     };
 
     auto load_kv_g2s = [&](uint32_t q_idx, uint32_t kv_idx) {
-        auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
-        tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes;
-        if constexpr(load_kv_scale) {
-            tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / 4;
-            // Split the value/scale AIU copies across warps 0/1 only when the group
-            // has >= 2 warps; otherwise warp 0 issues both (as fp4's SPLIT_AIU)
-            constexpr bool SPLIT_AIU = (WarpOnGroup >= 2);
-            copy_aiu<SPLIT_AIU>(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv),
-                                gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv), local_warp_idx);
+        if constexpr (PAGE_KV == BLOCK_KV) {
+            auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
+            tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes;
+            if constexpr(load_kv_scale) {
+                tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / 4;
+                // Split the value/scale AIU copies across warps 0/1 only when the group
+                // has >= 2 warps; otherwise warp 0 issues both (as fp4's SPLIT_AIU)
+                constexpr bool SPLIT_AIU = (WarpOnGroup >= 2);
+                copy_aiu<SPLIT_AIU>(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv),
+                    gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv), local_warp_idx);
+            } else {
+                copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), local_warp_idx);
+            }
+            if (thread_print) {
+                printf("  copy_k q_idx = %d, kv_idx = %d, kv_offset = %d, wg = %d, stage = %d\n", q_idx, kv_idx, kv_offset, warp_group_idx, smem_pipe_write_kv);
+            }
         } else {
-            copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), local_warp_idx);
-        }
-        if (thread_print) {
-            printf("  copy_k q_idx = %d, kv_idx = %d, kv_offset = %d, wg = %d, stage = %d\n", q_idx, kv_idx, kv_offset, warp_group_idx, smem_pipe_write_kv);
+            // Assemble one compute tile from page-local AIU copies.
+            constexpr uint32_t kCopyRows = PAGE_KV < BLOCK_KV ? PAGE_KV : BLOCK_KV;
+            using ChunkKV = cutlass::gemm::config::DefaultGemm_AIU_Operand<
+                ArchTag, ElementQK, false, Int<kCopyRows>, Int<BLOCK_K>, false>;
+            using ChunkSF = cutlass::gemm::config::DefaultGemm_AIU_Operand<
+                ArchTag, float, false, _1, Int<kCopyRows>, false, 0, false>;
+            using ChunkKVCopy = typename ChunkKV::CopyInst;
+            using ChunkSFCopy = typename ChunkSF::CopyInst;
+            const uint32_t context_len = PAGE_KV < BLOCK_KV
+                ? __ldg(params.context_lens + q_idx * kNextN + kNextN - 1) : 0;
+            const uint32_t first_page = kv_idx * BLOCK_KV / PAGE_KV;
+            CUTE_UNROLL
+            for (uint32_t row = 0; row < BLOCK_KV; row += kCopyRows) {
+                const uint32_t token = kv_idx * BLOCK_KV + row;
+                const bool valid_page = PAGE_KV >= BLOCK_KV || token < context_len;
+                const uint32_t logical_page = valid_page ? token / PAGE_KV : first_page;
+                const uint32_t physical_page = __ldg(params.block_table + q_idx * params.block_table_stride + logical_page);
+                const uint32_t row_in_page = valid_page ? token % PAGE_KV : 0;
+                cute::AiuDesc kv_desc;
+                kv_desc.template init<ElementQK, false, kCopyRows, BLOCK_K>(
+                    nullptr, kCopyRows, BLOCK_K, StrideAB{});
+                if (local_warp_idx == 0 && lane_idx == 0) {
+                    auto src = reinterpret_cast<const ElementQK*>(
+                        reinterpret_cast<const uint8_t*>(params.ptr_k) + physical_page * params.kv_cache_stride_bytes * sizeof(ElementQK)) + row_in_page * BLOCK_K;
+                    CUTE_UNROLL
+                    for (int k = 0; k < BLOCK_K; k += ChunkKV::CUBE_W) {
+                        auto dst_k = shared_storage.smem_k.data() + SmemLayoutA{}(make_coord(row, k, smem_pipe_write_kv, warp_group_idx));
+                        ChunkKVCopy::copy(dst_k, src, kv_desc, k, 0, 0);
+                    }
+                }
+                if constexpr (load_kv_scale) {
+                    cute::AiuDesc sf_desc;
+                    sf_desc.template init<float, false, 1, kCopyRows>(
+                        nullptr, 1, kCopyRows, Stride<Int<kCopyRows>, _1>{});
+                    constexpr uint32_t kScaleWarp = WarpOnGroup >= 2 ? 1 : 0;
+                    if (local_warp_idx == kScaleWarp && lane_idx == 0) {
+                        auto dst = shared_storage.smem_k_scales.data() + SmemLayoutSFA{}(make_coord(0, row, smem_pipe_write_kv, warp_group_idx));
+                        auto src = reinterpret_cast<const float*>(
+                            reinterpret_cast<const uint8_t*>(params.k_scales) + physical_page * params.kv_cache_stride_bytes) + row_in_page;
+                        CUTE_UNROLL
+                        for (int k = 0; k < kCopyRows; k += ChunkSF::CUBE_W)
+                            ChunkSFCopy::copy(dst + k, src, sf_desc, k, 0, 0);
+                    }
+                }
+            }
         }
     };
 
@@ -599,9 +649,8 @@ namespace deep_gemm {
 
 template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights,
           uint32_t kNextN, uint32_t kNumHeads,
-          uint32_t kHeadDim, uint32_t BLOCK_KV, uint32_t WARP_KV,
+          uint32_t kHeadDim, uint32_t PAGE_KV, uint32_t SPLIT_KV, uint32_t BLOCK_KV, uint32_t WARP_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
-          uint32_t SPLIT_KV,
           bool SPLIT_MBLOCK = false,
           uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
 class PagedAttention {
@@ -625,7 +674,7 @@ public:
                     const uint32_t* block_table, const uint32_t* schedule_meta,
                     hggcStream_t stream, int num_sms, int num_blocks) {
 
-        using AttnKernel = cutlass::gemm::kernel::PPUPagedMqaLogits<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNextN, kNumHeads, kHeadDim, BLOCK_KV, WARP_KV, kNumQStages, kNumKVStages, SPLIT_KV, SPLIT_MBLOCK, kScaleMode>;
+        using AttnKernel = cutlass::gemm::kernel::PPUPagedMqaLogits<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNextN, kNumHeads, kHeadDim, PAGE_KV, SPLIT_KV, BLOCK_KV, WARP_KV, kNumQStages, kNumKVStages, SPLIT_MBLOCK, kScaleMode>;
 
         static constexpr int BLOCK_M = AttnKernel::BLOCK_M;
         static constexpr int BLOCK_N = AttnKernel::BLOCK_N;
