@@ -307,8 +307,10 @@ static void launch_fp4_sparse_mqa_logits_impl(
         constexpr int kNumHeads = 32;      // sparse layout constant
         constexpr int kHeadDimPacked = 64; // 128 / 2 packed fp4
         printf("[sparse_mqa_logits_fp4:]\n");
-        printf("kNumHeads:%d, kHeadDim:%d(packed), BLOCK_QH:%d, BLOCK_KV:%d, SPARSE_BLOCK_KV:%u\n",
-               kNumHeads, kHeadDimPacked, config.block_qh, config.block_kv, sparse_block_kv);
+        printf("kNumHeads:%d, kHeadDim:%d(packed), BLOCK_QH:%d", kNumHeads, kHeadDimPacked, config.block_qh);
+        if (is_paged)
+            printf(", PAGE_KV:%u", page_kv);
+        printf(", SPARSE_BLOCK_KV:%u\n", sparse_block_kv);
         printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n",
                config.block_kv, config.block_qh, config.warp_kv, config.warp_qh, kQStages, kKVStages);
         printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d, num_threads:%d\n",

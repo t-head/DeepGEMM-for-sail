@@ -462,7 +462,7 @@ torch::Tensor get_paged_sparse_mqa_logits_metadata(const torch::Tensor& context_
     DG_HOST_ASSERT(sparse_kv_block_indices.dim() == 2 and sparse_kv_block_indices.size(0) == num_q_tokens);
     DG_HOST_ASSERT(sparse_kv_block_indices.scalar_type() == torch::kInt32 and sparse_kv_block_indices.is_contiguous());
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
-    DG_HOST_ASSERT(page_kv % sparse_block_kv == 0);
+    DG_HOST_ASSERT(page_kv > 0 and page_kv % sparse_block_kv == 0);
     sparse_mqa_logits::get_sparse_split_kv(qk_dtype);  // MXFP4 only.
     const int num_max_sparse_blocks = static_cast<int>(sparse_kv_block_indices.size(1));
     const int64_t num_metadata_bytes = sparse_mqa_logits::get_num_sparse_metadata_bytes(
@@ -556,8 +556,9 @@ torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::pair<torch::Tensor, tor
                    q_sf.size(1) == 1 and q_sf.size(2) == num_heads);
     const int64_t head_dim_with_sf = sparse_mqa_logits::kHeadDim / 2 + sizeof(uint32_t);
     DG_HOST_ASSERT(kv_cache.scalar_type() == torch::kUInt8 and kv_cache.dim() == 4 and
-                   kv_cache.size(2) == 1 and kv_cache.size(3) == head_dim_with_sf and
+                   kv_cache.size(0) > 0 and kv_cache.size(2) == 1 and kv_cache.size(3) == head_dim_with_sf and
                    kv_cache.stride(1) == head_dim_with_sf and kv_cache.stride(3) == 1 and
+                   kv_cache.stride(0) > 0 and kv_cache.stride(0) <= std::numeric_limits<int>::max() and
                    kv_cache.stride(0) % 512 == 0);
     DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16 and weights.is_contiguous() and
                    weights.dim() == 2 and weights.size(0) == num_q_tokens and
@@ -565,7 +566,7 @@ torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::pair<torch::Tensor, tor
     DG_HOST_ASSERT(metadata.scalar_type() == torch::kUInt8 and metadata.is_contiguous() and metadata.dim() == 1 and
                    metadata.numel() >= static_cast<int64_t>(sizeof(sparse_mqa_logits::MetadataHeader)));
     const int page_kv = static_cast<int>(kv_cache.size(1));
-    DG_HOST_ASSERT(page_kv % sparse_block_kv == 0);
+    DG_HOST_ASSERT(page_kv > 0 and page_kv % sparse_block_kv == 0);
     const int num_output_tokens = num_max_sparse_blocks * sparse_block_kv;
     const int logits_stride = align(num_output_tokens, 512);  // 1024B row alignment for bf16
     auto logits = torch::empty({align<int64_t>(num_q_tokens, sparse_mqa_logits::kBlockQ), logits_stride},

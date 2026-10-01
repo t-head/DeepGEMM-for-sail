@@ -247,7 +247,7 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
     constexpr uint32_t kNumKVSplitsPerEntry = 8;  // upstream host constant (bounded paged entries)
     constexpr uint32_t kNumMergedBlocksCap = kBlockQ * kNumMaxBlocksCap;
     constexpr uint32_t kNumKVBlocksPerThread = (kNumMergedBlocksCap + kNumThreads - 1) / kNumThreads;
-    DG_STATIC_ASSERT(not kIsPaged or PAGE_KV % SPARSE_BLOCK_KV == 0, "Invalid page shape");
+    DG_STATIC_ASSERT(not kIsPaged or (PAGE_KV > 0 and PAGE_KV % SPARSE_BLOCK_KV == 0), "Invalid page shape");
     DG_STATIC_ASSERT(not kIsPaged or not kUseUnalignedKs, "Paged sparse MQA does not use ks");
 
     const uint32_t tid = threadIdx.x;

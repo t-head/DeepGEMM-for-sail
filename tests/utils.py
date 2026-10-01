@@ -2386,7 +2386,7 @@ def test_sparse_mqa_logits(args) -> None:
         # Paged KV: ks = 0 per token, ke = context_lens[q]; the fused fp4
         # cache interleaves a trailing 4B SF per token row; block_table resolves logical pages.
         page_kv = args.get('page_kv', 64)
-        assert page_kv % sparse_block_kv == 0
+        assert page_kv > 0 and page_kv % sparse_block_kv == 0
         rng = random.Random(seq_len_q * 1000003 + seq_len_kv + sparse_block_kv)
         num_requests = min(rng.randint(2, 4), seq_len_q)
         request_ends = sorted(rng.sample(range(1, seq_len_q), num_requests - 1)) + [seq_len_q]
@@ -2437,14 +2437,40 @@ def test_sparse_mqa_logits(args) -> None:
         # cycle CSV): dense paged fp4 kernel, gathered at the selected positions
         gathered_ref, valid_mask = None, None
         if get_acc_check():
-            context_lens_2d = context_lens.unsqueeze(-1)
-            schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
-                context_lens_2d, page_kv, deep_gemm.get_num_sms(),
-                metadata_extra=(1, num_heads, head_dim // 2, 1))
-            full_logits = deep_gemm.fp8_fp4_paged_mqa_logits(
-                q=q_in, fused_kv_cache=kv_cache_fp4, weights=weights, context_lens=context_lens_2d,
-                block_table=block_table, schedule_meta=schedule_meta,
-                max_context_len=max(context_lens_list), clean_logits=False, logits_dtype=torch.bfloat16)
+            if page_kv == 64:
+                context_lens_2d = context_lens.unsqueeze(-1)
+                schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+                    context_lens_2d, page_kv, deep_gemm.get_num_sms(),
+                    metadata_extra=(1, num_heads, head_dim // 2, 1))
+                full_logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+                    q=q_in, fused_kv_cache=kv_cache_fp4, weights=weights, context_lens=context_lens_2d,
+                    block_table=block_table, schedule_meta=schedule_meta,
+                    max_context_len=max(context_lens_list), clean_logits=False, logits_dtype=torch.bfloat16)
+            else:
+                # Reconstruct logical KV so the reference is independent of dense page-size support.
+                page_data = kv_cache_fp4.view(total_pages, -1)
+                packed_dim = head_dim // 2
+                page_fp = page_data[:, :page_kv * packed_dim].view(total_pages, page_kv, packed_dim)
+                page_sf = page_data[:, page_kv * packed_dim:].view(torch.int32)
+                full_logits = torch.full((seq_len_q, max(context_lens_list)), float('-inf'),
+                                         device='cuda', dtype=torch.bfloat16)
+                begin = 0
+                for size in request_sizes:
+                    end = begin + size
+                    num_pages = ceil_div(max(context_lens_list[begin:end]), page_kv)
+                    pages = block_table[begin, :num_pages].long()
+                    logical_fp = page_fp[pages].reshape(-1, packed_dim).view(torch.int8)
+                    logical_sf = page_sf[pages].reshape(-1)
+                    request_q = (q_in[0][begin:end].view(size, num_heads, packed_dim),
+                                 q_in[1][begin:end].view(size, num_heads))
+                    request_logits = deep_gemm.fp8_fp4_mqa_logits(
+                        q=request_q, kv=(logical_fp, logical_sf), weights=weights[begin:end],
+                        cu_seq_len_k_start=torch.zeros(size, device='cuda', dtype=torch.int32),
+                        cu_seq_len_k_end=context_lens[begin:end], clean_logits=False,
+                        max_seqlen_k=int(logical_fp.size(0)), logits_dtype=torch.bfloat16)
+                    width = min(full_logits.size(1), request_logits.size(1))
+                    full_logits[begin:end, :width] = request_logits[:, :width]
+                    begin = end
             gathered_ref, valid_mask = gather_sparse_reference(
                 full_logits, sparse_indices, num_blocks_per_q, torch.zeros_like(context_lens), context_lens,
                 sparse_block_kv)
