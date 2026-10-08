@@ -2,13 +2,38 @@
 
 #include <torch/extension.h>
 
+#include <variant>
+
 #include "../jit_kernels/heuristics/common_fp4.hpp"
 #include "../utils/layout.hpp"
 #include "../utils/utils.hpp"
 
 namespace deep_gemm::layout {
 
+static torch::Tensor transform_sf_into_required_layout(
+        const torch::Tensor& sf,
+        const int& mn, const int& k,
+        const std::variant<std::tuple<int, int, int>, std::tuple<int, int>>& recipe,
+        const std::optional<int>& num_groups,
+        const std::optional<bool>& is_sfa,
+        const bool& disable_ue8m0_cast,
+        const std::optional<torch::Tensor>& psum_layout = std::nullopt) {
+    const auto arch_major = device_runtime->get_arch_major();
+
+    if (arch_major == 8)
+        return sf.contiguous();
+
+    DG_HOST_UNREACHABLE("Unknown SF transformation");
+}
+
 static void register_apis(pybind11::module_& m) {
+    m.def("transform_sf_into_required_layout", &transform_sf_into_required_layout,
+          py::arg("sf"), py::arg("mn"), py::arg("k"), py::arg("recipe"),
+          py::arg("num_groups") = std::nullopt,
+          py::arg("is_sfa") = std::nullopt,
+          py::arg("disable_ue8m0_cast") = false,
+          py::arg("psum_layout") = std::nullopt);
+
     // FP4 AUXILIARY KERNELs
     m.def("preprocess_mxfp4_scales",
           &deep_gemm_fp4_common::preprocess_mxfp4_scales,

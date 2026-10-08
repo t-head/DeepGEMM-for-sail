@@ -25,6 +25,7 @@ from .deep_gemm_cpp import (
 
 # Layout utilities
 from .deep_gemm_cpp import (
+    transform_sf_into_required_layout,
     get_mn_major_tma_aligned_tensor,
     get_col_major_tensor,
     get_mk_alignment_for_contiguous_layout,
