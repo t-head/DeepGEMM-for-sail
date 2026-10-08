@@ -400,7 +400,7 @@ static MoeAlignReturn moe_align_block_size_impl(
         };
 
         const auto& code    = MoeAlignWarpOrderedRuntime::generate(args);
-        const auto& runtime = compiler->build(kernel_name, code, K0_BLOCK_SIZE, smem);
+        const auto& runtime = compiler->build(kernel_name, code);
         MoeAlignWarpOrderedRuntime::launch(runtime, args);
     } else {
         // Per-phase block widths, matching the reference launcher: BLOCK_SIZE is a template
@@ -455,9 +455,7 @@ static MoeAlignReturn moe_align_block_size_impl(
         // ordered K1->K2->K3->K4 because they all go to the same stream.
         for (const auto& phase_args : phases) {
             const auto& code    = MoeAlignFallbackRuntime::generate(phase_args);
-            const auto& runtime = compiler->build(MoeAlignFallbackRuntime::symbol_name(phase_args.phase), code,
-                                                 static_cast<int>(phase_args.launch_args.block_dim.x),
-                                                 phase_args.launch_args.smem_size);
+            const auto& runtime = compiler->build(MoeAlignFallbackRuntime::symbol_name(phase_args.phase), code);
             MoeAlignFallbackRuntime::launch(runtime, phase_args);
         }
     }

@@ -122,7 +122,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(const torch::Tensor& 
                              .kernel_params = params};
 
     const auto& code = FP8GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp8_grouped_deep_gemm_contiguous", code, block.x, SMSIZE);
+    const auto& runtime = compiler->build("fp8_grouped_deep_gemm_contiguous", code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
     HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -242,7 +242,7 @@ static std::pair<int, int> m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(
                                      .kernel_params = params};
 
     const auto& code = FP8GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp8_grouped_deep_gemm_masked", code, block.x, SMSIZE);
+    const auto& runtime = compiler->build("fp8_grouped_deep_gemm_masked", code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
     HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -391,7 +391,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, 
                                      .kernel_params = params};
 
     const auto& code = FP8GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp8_grouped_deep_gemm_NoPad", code, block.x, SMSIZE);
+    const auto& runtime = compiler->build("fp8_grouped_deep_gemm_NoPad", code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
 

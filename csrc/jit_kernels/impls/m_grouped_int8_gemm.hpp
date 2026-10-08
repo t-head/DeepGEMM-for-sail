@@ -343,7 +343,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
                                                   .type_info = type_info};
 
         const auto& code = INT8GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build(kernel_name, code, block.x, SMSIZE);
+        const auto& runtime = compiler->build(kernel_name, code);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -423,7 +423,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
                                                  .launch_args = {grid, block, SMSIZE},
                                                  .kernel_params = params};
         const auto& code = INT8GemmRuntime::generate(args);
-        const auto& runtime = compiler->build("int8_grouped_deep_gemm_contiguous_cutlass2", code, block.x, SMSIZE, ActlizeLib::kV050);
+        const auto& runtime = compiler->build("int8_grouped_deep_gemm_contiguous_cutlass2", code, ActlizeLib::kV050);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -615,7 +615,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
             .kernel_params = gemm_args,
             .type_info = type_info};
         const auto& code = DynamicTileRuntime::generate(args);
-        const auto& runtime = compiler->build(kernel_name, code, block_new.x, SMSIZE);
+        const auto& runtime = compiler->build(kernel_name, code);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block_new.x, SMSIZE);
@@ -662,7 +662,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
                                                   .type_info = type_info};
 
         const auto& code = INT8GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build(kernel_name, code, block.x, SMSIZE);
+        const auto& runtime = compiler->build(kernel_name, code);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -741,7 +741,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
                                                  .launch_args = {grid, block, SMSIZE},
                                                  .kernel_params = params};
         const auto& code = INT8GemmRuntime::generate(args);
-        const auto& runtime = compiler->build(kernel_name, code, block.x, SMSIZE, ActlizeLib::kV050);
+        const auto& runtime = compiler->build(kernel_name, code, ActlizeLib::kV050);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -851,7 +851,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
                                           .launch_args = {grid, block, 0},
                                           .kernel_params = gemmv_args};
             const auto& code = GemvRuntime::generate(args);
-            const auto& runtime = compiler->build("batched_gemvt_kernel", code, block.x, 0);
+            const auto& runtime = compiler->build("batched_gemvt_kernel", code);
             const auto& kernel = runtime->kernel;
             ProfilingInterface::Instance().instrument(true, dg_prof_params);
             GemvRuntime::launch(runtime, args);
@@ -899,7 +899,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
                                           .kernel_params = gemmv_args};
 
             const auto& code = GemvRuntime::generate(args);
-            const auto& runtime = compiler->build("batched_gemvt_small_k_kernel", code, block.x, 0);
+            const auto& runtime = compiler->build("batched_gemvt_small_k_kernel", code);
             const auto& kernel = runtime->kernel;
             ProfilingInterface::Instance().instrument(true, dg_prof_params);
             GemvRuntime::launch(runtime, args);
@@ -1044,7 +1044,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
                                           .type_info = type_info};
 
         const auto& code = INT8GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build(kernel_name, code, block.x, SMSIZE);
+        const auto& runtime = compiler->build(kernel_name, code);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -1123,7 +1123,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
                                                  .launch_args = {grid, block, SMSIZE},
                                                  .kernel_params = params};
         const auto& code = INT8GemmRuntime::generate(args);
-        const auto& runtime = compiler->build(kernel_name, code, block.x, SMSIZE, ActlizeLib::kV050);
+        const auto& runtime = compiler->build(kernel_name, code, ActlizeLib::kV050);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);

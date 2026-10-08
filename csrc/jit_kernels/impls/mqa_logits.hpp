@@ -176,7 +176,7 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
     };
 
     const auto& code = Runtime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code, num_threads, smem_size);
+    const auto& runtime = compiler->build(kernel_name, code);
 
     // Persistent kernel: one wave of `num_sms * blocks_per_cu` blocks, mirroring
     // `num_sms * compute_occupancy_for_kernel<AttnKernel>()` in `Attention::run`

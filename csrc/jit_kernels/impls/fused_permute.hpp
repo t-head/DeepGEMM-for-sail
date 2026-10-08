@@ -210,7 +210,7 @@ fused_permute(const torch::Tensor& a, const torch::Tensor& sfa) {
     };
 
     const auto& code = FusedPermuteRuntime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code, threads_per_block, smem_size);
+    const auto& runtime = compiler->build(kernel_name, code);
     FusedPermuteRuntime::launch(runtime, args);
 
     return {out_a, out_sfa};

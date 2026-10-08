@@ -123,7 +123,7 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
                                      .kernel_params = params};
 
     const auto& code = FP8GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("batch_fp8_deep_gemm", code, block.x, SMSIZE);
+    const auto& runtime = compiler->build("batch_fp8_deep_gemm", code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
     HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -263,7 +263,7 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
             .type_info = type_info};
 
         const auto& code = INT8GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build(kernel_name, code, block.x, SMSIZE);
+        const auto& runtime = compiler->build(kernel_name, code);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
@@ -337,7 +337,7 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
             .kernel_params = params};
 
         const auto& code = INT8GemmRuntime::generate(args);
-        const auto& runtime = compiler->build(kernel_name, code, block.x, SMSIZE, ActlizeLib::kV050);
+        const auto& runtime = compiler->build(kernel_name, code, ActlizeLib::kV050);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);

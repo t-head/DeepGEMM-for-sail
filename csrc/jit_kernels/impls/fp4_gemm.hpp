@@ -645,7 +645,7 @@ static void fp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
     }
 
     const auto& code = FP4GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp4_deep_gemm", code, block.x, SMSIZE);
+    const auto& runtime = compiler->build("fp4_deep_gemm", code);
     const auto& kernel = runtime->kernel;
 
     int blocks_per_cu = 0;

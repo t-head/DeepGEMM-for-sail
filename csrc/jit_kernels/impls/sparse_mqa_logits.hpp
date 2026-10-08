@@ -182,7 +182,7 @@ static void launch_sparse_mqa_logits_metadata(const torch::Tensor& metadata, tor
                         reinterpret_cast<uint8_t*>(workspace.data_ptr())},
     };
     const auto& code = SparseMqaLogitsMetadataRuntime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code, static_cast<int>(kNumThreads), smem_size);
+    const auto& runtime = compiler->build(kernel_name, code);
     SparseMqaLogitsMetadataRuntime::launch(runtime, args);
 }
 
@@ -292,7 +292,7 @@ static void launch_fp4_sparse_mqa_logits_impl(
                           logits_stride},
     };
     const auto& code = SparseMqaLogitsFP4Runtime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code, kNumThreads, smem_size);
+    const auto& runtime = compiler->build(kernel_name, code);
 
     // Reported before the launch, as the dense `launch_mqa_logits` does, so the configuration is
     // on screen even when the launch itself fails

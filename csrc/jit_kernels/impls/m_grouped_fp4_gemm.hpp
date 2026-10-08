@@ -222,7 +222,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     }
 
     const auto& code = FP4GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp4_grouped_deep_gemm_nopad", code, block.x, SMSIZE);
+    const auto& runtime = compiler->build("fp4_grouped_deep_gemm_nopad", code);
     const auto& kernel = runtime->kernel;
 
     int blocks_per_cu = 0;
@@ -438,7 +438,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         }
 
         const auto& code = FP4DynamicTileRuntime::generate(dyn_args);
-        const auto& runtime = compiler->build("fp4_grouped_deep_gemm_masked_dynamic_tile", code, dyn_block.x, SMSIZE);
+        const auto& runtime = compiler->build("fp4_grouped_deep_gemm_masked_dynamic_tile", code);
         const auto& kernel = runtime->kernel;
 
         int blocks_per_cu = 0;
@@ -535,7 +535,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     }
 
     const auto& code = FP4GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp4_grouped_deep_gemm_masked", code, block.x, SMSIZE);
+    const auto& runtime = compiler->build("fp4_grouped_deep_gemm_masked", code);
     const auto& kernel = runtime->kernel;
 
     int blocks_per_cu = 0;

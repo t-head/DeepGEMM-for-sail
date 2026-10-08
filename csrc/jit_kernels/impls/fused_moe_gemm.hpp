@@ -148,7 +148,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
 
     // Generate code and compile
     const auto& code = Bf16FusedMoeRuntime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code, block_size, smem_size);
+    const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
 
     // Query occupancy and set grid
@@ -480,7 +480,7 @@ static void m_grouped_gemm_perchannel_nt_fused_impl(
 
     // Generate code and compile
     const auto& code = A8W8PerchannelFusedMoeRuntime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code, block_size, smem_size);
+    const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
 
     // Query occupancy and set grid
@@ -576,7 +576,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
     };
 
     const auto& code = Fp4FusedMoeRuntime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code, block_size, smem_size);
+    const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
 
     int blocks_per_cu = 0;
@@ -688,7 +688,7 @@ static void m_grouped_gemm_blkwise_nt_fused_impl(
 
     // Generate code and compile
     const auto& code = Fp8BlkwiseFusedMoeRuntime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code, block_size, smem_size);
+    const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
 
     // Query occupancy and set grid

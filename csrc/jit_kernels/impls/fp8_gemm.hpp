@@ -489,7 +489,7 @@ static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, 
                                      .kernel_params = params};
 
     const auto& code = FP8GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp8_deep_gemm", code, block.x, SMSIZE);
+    const auto& runtime = compiler->build("fp8_deep_gemm", code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
     HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);

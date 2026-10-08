@@ -219,7 +219,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& lhs, const torch::Tensor& 
     };
 
     const auto& code = Tf32HcPrenormGemmRuntime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code, num_threads, smem_size);
+    const auto& runtime = compiler->build(kernel_name, code);
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
@@ -233,7 +233,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& lhs, const torch::Tensor& 
     if (kernel_variant & 1024u) {
         Tf32HcRoundBRuntime::Args pack_args{{dim3(ceil_div(n * k, 256)), dim3(256), 0}, rhs.data_ptr<float>(), rounded_b.data_ptr<float>(), uint32_t(n * k)};
         const auto& pack_code = Tf32HcRoundBRuntime::generate(pack_args);
-        const auto& pack_runtime = compiler->build("tf32_hc_round_b", pack_code, 256, 0);
+        const auto& pack_runtime = compiler->build("tf32_hc_round_b", pack_code);
         std::lock_guard<std::mutex> lock(tf32_round_b_submit_mutex);
         Tf32HcRoundBRuntime::launch(pack_runtime, pack_args);
         Tf32HcPrenormGemmRuntime::launch(runtime, args);

@@ -155,7 +155,7 @@ static void launch_w4a16_gemm(const W4A16LaunchInfo& info, W4A16Type w4a16_type,
     };
 
     const auto& code = Runtime::generate(args);
-    const auto& runtime = compiler->build(info.kernel_name, code, info.num_threads, info.smem_size);
+    const auto& runtime = compiler->build(info.kernel_name, code);
     const auto& kernel = runtime->kernel;
 
     // Persistent kernel, replicating `W4A16Gemm::run`: occupancy is capped at 8 blocks per CU, and the

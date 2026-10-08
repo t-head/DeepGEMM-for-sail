@@ -123,7 +123,7 @@ public:
         fsync_path(path);
     }
 
-    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code, int32_t thread_num = 0, int32_t smem_size = 0, ActlizeLib lib = ActlizeLib::kV100) const {
+    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code, ActlizeLib lib = ActlizeLib::kV100) const {
         // NOTE: `lib` participates in the signature because the include paths and tuning flags
         // it selects are no longer part of `flags` (they are resolved per kernel in `compile`).
         const auto kernel_signature = fmt::format("{}$${}$${}$${}$${}", name, signature, flags, static_cast<int>(lib), code);
@@ -141,7 +141,7 @@ public:
 
         // Compile into a temporary HGBIN
         const auto tmp_hgbin_path = tmp_dir_path / "kernel.hgbin";
-        compile(code, tmp_dir_path, tmp_hgbin_path, name, thread_num, smem_size, lib);
+        compile(code, tmp_dir_path, tmp_hgbin_path, name, lib);
 
         // Fsync before rename to ensure visibility on distributed filesystems
         fsync_dir(tmp_dir_path);
@@ -165,7 +165,7 @@ public:
         return runtime;
     }
 
-    virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, int32_t thread_num, int32_t smem_size, ActlizeLib lib) const = 0;
+    virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, ActlizeLib lib) const = 0;
 };
 
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_root_path);
@@ -240,7 +240,7 @@ public:
         // <<< PORTING LANDMARK: end of dropped source-language flag.
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, int32_t thread_num, int32_t smem_size, ActlizeLib lib) const override {
+    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, ActlizeLib lib) const override {
         // Write the code into the cache directory
         const auto code_path = dir_path / "kernel.cu";
         put(code_path, code);
@@ -426,7 +426,7 @@ public:
 
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, int32_t thread_num, int32_t smem_size, ActlizeLib lib) const override {
+    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, ActlizeLib lib) const override {
         // Write the code into the cache directory
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);

@@ -219,7 +219,7 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
     };
 
     const auto& code = Runtime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code, num_threads, smem_size);
+    const auto& runtime = compiler->build(kernel_name, code);
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
@@ -297,7 +297,7 @@ static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens
                         reinterpret_cast<uint32_t*>(schedule_metadata.data_ptr())},
     };
     const auto& code = PagedMqaLogitsMetadataRuntime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code, num_threads, smem_size);
+    const auto& runtime = compiler->build(kernel_name, code);
     PagedMqaLogitsMetadataRuntime::launch(runtime, args);
 
     return schedule_metadata;
