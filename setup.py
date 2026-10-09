@@ -144,12 +144,6 @@ def custom_version_scheme(version):
     return '2.0.0'
 
 if __name__ == '__main__':
-    # noinspection PyBroadException
-    try:
-        cmd = ['git', 'rev-parse', '--short', 'HEAD']
-        revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
-    except:
-        revision = ''
     extra_cxx_args = ["-O3", "-std=c++17", "-DUSE_HGGC"]
     extra_hgcc_args = ["-O3", "-std=c++17", "--use_fast_math", "-DUSE_HGGC"]
 
@@ -171,9 +165,14 @@ if __name__ == '__main__':
         }))
     setuptools.setup(
         name='deep_gemm',
+        # 从 Git tag 推导版本；非 tag 提交包含开发版本号、提交哈希及脏工作区标记。
+        # 无 Git 元数据时，可通过 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DEEP_GEMM 指定版本。
         use_scm_version={
-            "local_scheme": custom_local_scheme,
-            "version_scheme": custom_version_scheme,
+            "root": ".",
+            "relative_to": __file__,
+            "fallback_root": current_dir,
+            "version_scheme": "guess-next-dev",
+            "local_scheme": "node-and-date",
         },
         packages=find_packages('.'), # old version: packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels', 'deep_gemm/deep_gemm_tuner'],,
         package_data={

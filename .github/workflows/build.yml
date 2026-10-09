@@ -1,0 +1,71 @@
+name: Build Demo
+
+# 本仓库使用相对路径调用模板，模板工具也检出同一个提交；仅允许 t-head 组织内的仓库调用。
+# 在调用方仓库或授权给调用方仓库的组织级 Actions Secrets 中配置 RELEASE_USERNAME 和 RELEASE_TOKEN。
+# 跨仓库使用时，将 jobs.build.uses 改为 t-head/DeepGEMM-for-sail/.github/workflows/matrix-release.yml@<SHA>，
+# 仅 tag 触发时发布 GitHub Release；调用 job 需授权 contents: write，模板内仅发布 job 使用写权限。
+# template_repository 改为 t-head/DeepGEMM-for-sail，template_ref 使用相同的 SHA。
+# prepare_matrix.py 中的 SDK/Torch 下载地址目前仍为占位，补齐后再手动触发实际构建。
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: '构建和发布的包名'
+        required: true
+        type: string
+        default: deep_gemm
+      framework:
+        description: '依赖的框架名称，例如 torch'
+        required: true
+        type: string
+        default: torch
+      python_versions:
+        description: 'JSON 数组，候选值：38、310、312'
+        required: true
+        type: string
+        default: '["310"]'
+      os_versions:
+        description: 'JSON 数组，候选值：ubuntu2004、ubuntu2204、ubuntu2404、alios7u2'
+        required: true
+        type: string
+        default: '["ubuntu2204"]'
+      hggcrt_versions:
+        description: 'JSON 数组，候选值：2、3'
+        required: true
+        type: string
+        default: '["3"]'
+      torch_versions:
+        description: 'JSON 数组，候选值：2.8.0、2.10.0、2.13.0'
+        required: true
+        type: string
+        default: '["2.8.0"]'
+      sdk_versions:
+        description: 'JSON 数组，候选值：2.1.0、2.2.0'
+        required: true
+        type: string
+        default: '["2.1.0"]'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/matrix-release.yml
+    permissions:
+      contents: write
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+    with:
+      package_name: ${{ inputs.package_name }}
+      framework: ${{ inputs.framework }}
+      template_repository: ${{ github.repository }}
+      template_ref: ${{ github.sha }}
+      python_versions: ${{ inputs.python_versions }}
+      os_versions: ${{ inputs.os_versions }}
+      hggcrt_versions: ${{ inputs.hggcrt_versions }}
+      torch_versions: ${{ inputs.torch_versions }}
+      sdk_versions: ${{ inputs.sdk_versions }}
+      build_command: |
+        python3 -m pip install --no-input 'setuptools>=61' 'setuptools-scm==9.2.2' wheel ninja
+        python3 setup.py bdist_wheel

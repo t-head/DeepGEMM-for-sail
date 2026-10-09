@@ -1,0 +1,552 @@
+name: Reusable Matrix Release
+
+# 数组使用 JSON 字符串传参，镜像映射维护在 .github/scripts/prepare_matrix.py。
+# 手动触发入口见 build.yml；本文件供本仓库及其他仓库通过 job 级 uses 调用。
+# 跨仓库调用时，template_ref 必须与 uses 中的版本一致，推荐固定为 commit SHA。
+# 私有模板仓库需允许跨仓库调用，并通过 template_token 提供模板代码的只读权限。
+on:
+  workflow_call:
+    inputs:
+      package_name:
+        description: '构建和发布的包名，例如 deep_gemm；不参与矩阵展开'
+        required: true
+        type: string
+      framework:
+        description: '依赖的框架名称，例如 torch；不参与矩阵展开'
+        required: true
+        type: string
+      python_versions:
+        description: 'JSON 数组，候选值：38、310、312，例如 ["38","310"]'
+        required: true
+        type: string
+        default: '["310"]'
+      os_versions:
+        description: 'JSON 数组，候选值：ubuntu2004、ubuntu2204、ubuntu2404、alios7u2'
+        required: true
+        type: string
+        default: '["ubuntu2204"]'
+      hggcrt_versions:
+        description: 'JSON 数组，候选值：2、3，例如 ["2","3"]'
+        required: true
+        type: string
+        default: '["3"]'
+      torch_versions:
+        description: 'JSON 数组，候选值：2.8.0、2.10.0、2.13.0'
+        required: true
+        type: string
+        default: '["2.8.0"]'
+      sdk_versions:
+        description: 'JSON 数组，候选值：2.1.0、2.2.0'
+        required: true
+        type: string
+        default: '["2.1.0"]'
+      template_repository:
+        description: '保存本工作流及 prepare_matrix.py 的仓库，格式为 owner/repo'
+        type: string
+        default: t-head/DeepGEMM-for-sail
+      template_ref:
+        description: '模板代码版本，必须与调用本工作流的 ref 一致；本仓库相对路径调用传 github.sha'
+        required: true
+        type: string
+      build_command:
+        description: '在调用方仓库根目录执行的 Bash 编译命令，支持多行；仅接受可信配置'
+        required: true
+        type: string
+    secrets:
+      template_token:
+        description: '检出私有模板仓库的只读 token；同仓库或公开模板通常无需提供'
+        required: false
+      release_username:
+        description: '发布使用的用户名，由调用方仓库或组织级 Actions Secret 提供'
+        required: true
+      release_token:
+        description: '发布使用的 token，由调用方仓库或组织级 Actions Secret 提供'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-matrix:
+    name: 校验输入并生成矩阵
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: 校验调用方组织
+        shell: bash
+        env:
+          CALLER_ORGANIZATION: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          shopt -s nocasematch
+          # 固定允许的组织，不能从调用方可修改的 input 中获取。
+          if [[ "$CALLER_ORGANIZATION" != "t-head" ]]; then
+            printf '%s\n' '::error::只允许 t-head 组织内的仓库调用此工作流' >&2
+            exit 1
+          fi
+
+      - name: 检出模板工具
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.template_repository }}
+          ref: ${{ inputs.template_ref }}
+          path: ci-template
+          token: ${{ secrets.template_token || github.token }}
+          persist-credentials: false
+      - name: 解析版本数组和镜像映射
+        id: matrix
+        shell: bash
+        env:
+          INPUTS_JSON: ${{ toJSON(inputs) }}
+        run: python3 ci-template/.github/scripts/prepare_matrix.py
+
+  build-sdist:
+    name: 构建源码包
+    needs: prepare-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出调用方仓库及完整版本历史
+        uses: actions/checkout@v4
+        with:
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 检出源码包模板
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.template_repository }}
+          ref: ${{ inputs.template_ref }}
+          path: ci-template
+          token: ${{ secrets.template_token || github.token }}
+          persist-credentials: false
+
+      - name: 配置源码包构建 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装源码包构建依赖
+        shell: bash
+        run: python -m pip install --no-input setuptools wheel packaging 'setuptools-scm==9.2.2'
+
+      - name: 填充模板并构建源码包
+        shell: bash
+        env:
+          pkg_name: ${{ inputs.package_name }}
+          framework: ${{ inputs.framework }}
+        run: |
+          set -euo pipefail
+          # 限制替换值，避免破坏 sed 表达式或生成的 Python 字符串。
+          if [[ ! "$pkg_name" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]]; then
+            printf '%s\n' '::error::package_name 必须是合法的 Python 包名' >&2
+            exit 1
+          fi
+          if [[ -n "$framework" && ! "$framework" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$ ]]; then
+            printf '%s\n' '::error::framework 必须为空或合法的 Python 模块名' >&2
+            exit 1
+          fi
+
+          # 只读取调用方仓库的 Git 版本；去掉已有本地后缀，避免出现两个加号。
+          version="$(python -c 'from setuptools_scm import get_version; from packaging.version import Version; print(Version(get_version(root="source", local_scheme="no-local-version")).public)')"
+          build_version="${version}+oe"
+
+          for placeholder in 'PACKAGE_NAME = ""' 'framework = ""' 'build_version = ""'; do
+            if ! grep -Fxq "$placeholder" ci-template/.github/scripts/setup.py; then
+              printf '%s\n' '::error::源码包模板缺少预期占位字段' >&2
+              exit 1
+            fi
+          done
+
+          # 在独立目录中生成源码包，保留调用方原始构建配置不变。
+          mkdir -p sdist
+          sed \
+            -e "s|^PACKAGE_NAME = \"\"$|PACKAGE_NAME = \"$pkg_name\"|" \
+            -e "s|^framework = \"\"$|framework = \"$framework\"|" \
+            -e "s|^build_version = \"\"$|build_version = \"$build_version\"|" \
+            ci-template/.github/scripts/setup.py > sdist/setup.py
+          export __FAKE_BUILD="FAKE_WHEEL"
+          (cd sdist && python setup.py sdist)
+
+      - name: 保存源码包构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.package_name }}-sdist
+          path: sdist/dist/*.tar.gz
+          if-no-files-found: error
+
+  matrix-job:
+    name: py${{ matrix.python_version }} / ${{ matrix.os_version }} / hggcrt${{ matrix.hggcrt_version }} / torch${{ matrix.torch_version }} / sdk${{ matrix.sdk_version }}
+    needs: [prepare-matrix, build-sdist]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
+    container:
+      image: ${{ matrix.image }}
+    env:
+      PYTHON_VERSION: ${{ matrix.python_version }}
+      OS_VERSION: ${{ matrix.os_version }}
+      HGGCRT_VERSION: ${{ matrix.hggcrt_version }}
+      TORCH_VERSION: ${{ matrix.torch_version }}
+      SDK_VERSION: ${{ matrix.sdk_version }}
+      CONTAINER_IMAGE: ${{ matrix.image }}
+      TORCH_URL: ${{ matrix.torch_url }}
+      SDK_URL: ${{ matrix.sdk_url }}
+    defaults:
+      run:
+        shell: sh
+    steps:
+      - name: 输出当前矩阵参数
+        run: |
+          printf '%s\n' \
+            "PYTHON_VERSION=$PYTHON_VERSION" \
+            "OS_VERSION=$OS_VERSION" \
+            "HGGCRT_VERSION=$HGGCRT_VERSION" \
+            "TORCH_VERSION=$TORCH_VERSION" \
+            "SDK_VERSION=$SDK_VERSION" \
+            "TORCH_URL=$TORCH_URL" \
+            "SDK_URL=$SDK_URL" \
+            "CONTAINER_IMAGE=$CONTAINER_IMAGE"
+      # - name: 安装 SDK 和 Torch
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
+      #     : "${SDK_URL:?SDK_URL 为空，请先实现 SDK 下载地址查询}"
+      #     : "${TORCH_URL:?TORCH_URL 为空，请先实现 Torch 下载地址查询}"
+
+      #     # 保留 wheel 的版本和兼容性标签，并处理 URL 查询参数及百分号编码。
+      #     torch_wheel="$(python3 -c 'import os, posixpath; from urllib.parse import unquote, urlsplit; print(posixpath.basename(unquote(urlsplit(os.environ["TORCH_URL"]).path)))')"
+      #     if [[ ! "$torch_wheel" =~ ^torch-[a-zA-Z0-9_.+-]+\.whl$ ]]; then
+      #       printf '%s\n' '::error::TORCH_URL 路径必须包含有效的 torch-*.whl 文件名' >&2
+      #       exit 1
+      #     fi
+
+      #     download_dir="$(mktemp -d)"
+      #     curl --fail --show-error --location --retry 3 --connect-timeout 30 \
+      #       --proto '=http,https' --proto-redir '=http,https' \
+      #       --output "$download_dir/ppu-sdk.run" -- "$SDK_URL"
+      #     curl --fail --show-error --location --retry 3 --connect-timeout 30 \
+      #       --proto '=http,https' --proto-redir '=http,https' \
+      #       --output "$download_dir/$torch_wheel" -- "$TORCH_URL"
+
+      #     bash "$download_dir/ppu-sdk.run" --prefix=/usr/local/ --silent
+      #     ln -sf /usr/local/PPU_SDK/CUDA_SDK /usr/local/cuda
+      #     source /usr/local/PPU_SDK/envsetup.sh
+      #     echo "NCCL_INCLUDE_DIR=${CUDA_PATH}/include" >> "$GITHUB_ENV"
+      #     echo "NCCL_LIB_DIR=${CUDA_PATH}/lib64" >> "$GITHUB_ENV"
+      #     python3 -m pip install --no-input "$download_dir/$torch_wheel"
+      # 默认检出调用方仓库及其触发版本，不是模板仓库。
+      - name: 检出待编译仓库
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 编译
+        shell: bash
+        env:
+          BUILD_COMMAND: ${{ inputs.build_command }}
+        run: |
+          set -eo pipefail
+          : "${BUILD_COMMAND:?build_command 不能为空}"
+          source /usr/local/PPU_SDK/envsetup.sh
+          bash -e -o pipefail -c "$BUILD_COMMAND"
+
+      - name: 上传 wheel 到 Artifactory
+        shell: bash
+        env:
+          ARTIFACTORY_URL: https://download.t-head.cn/artifactory/pypi_generic/
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          RELEASE_USERNAME: ${{ secrets.release_username }}
+          RELEASE_TOKEN: ${{ secrets.release_token }}
+        run: |
+          set -euo pipefail
+          : "${RELEASE_USERNAME:?发布用户名不能为空}"
+          : "${RELEASE_TOKEN:?发布 token 不能为空}"
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if (( ${#wheels[@]} == 0 )); then
+            printf '%s\n' '::error::dist 目录中未找到 wheel 文件' >&2
+            exit 1
+          fi
+
+          # 先校验全部文件及目标路径，再发送带凭据的上传请求。
+          upload_urls=()
+          for wheel in "${wheels[@]}"; do
+            if [[ ! -f "$wheel" || -L "$wheel" ]]; then
+              printf '%s\n' '::error::上传产物必须是普通 wheel 文件，不能是符号链接' >&2
+              exit 1
+            fi
+            upload_url="$(python3 - "$wheel" <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          from urllib.parse import quote
+
+          filename = Path(sys.argv[1]).name
+          match = re.fullmatch(
+              r"(?P<name>[A-Za-z0-9_][A-Za-z0-9_.]*)-"
+              r"(?P<version>[0-9][A-Za-z0-9.!+_]*)-"
+              r"(?:[0-9][A-Za-z0-9_.]*-)?"
+              r"[A-Za-z0-9_.]+-[A-Za-z0-9_.]+-[A-Za-z0-9_.]+\.whl",
+              filename,
+          )
+          if match is None:
+              raise SystemExit("::error::wheel 文件名格式不合法")
+          package_name = os.environ["PACKAGE_NAME"]
+          if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", package_name):
+              raise SystemExit("::error::package_name 必须是合法的 Python 包名")
+          normalize = lambda name: re.sub(r"[-_.]+", "-", name).lower()
+          if normalize(match["name"]) != normalize(package_name):
+              raise SystemExit("::error::wheel 包名与 package_name 不一致")
+          components = (package_name, match["version"], filename)
+          print(os.environ["ARTIFACTORY_URL"].rstrip("/") + "/" + "/".join(quote(part, safe="") for part in components))
+          PY
+          )"
+            upload_urls+=("$upload_url")
+          done
+
+          # 上传目录沿用现有下载布局，构建方需保证不同矩阵配置的 wheel 文件名不冲突。
+          for index in "${!wheels[@]}"; do
+            wheel="${wheels[$index]}"
+            # 不跟随重定向，避免向其他地址发送产物或发布凭据。
+            status="$(curl --fail --silent --show-error --retry 3 \
+              --connect-timeout 30 --max-time 600 --proto '=https' \
+              --user "$RELEASE_USERNAME:$RELEASE_TOKEN" \
+              --upload-file "$wheel" --output /dev/null --write-out '%{http_code}' \
+              -- "${upload_urls[$index]}")"
+            if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+              printf '%s\n' "::error::Artifactory 上传失败，HTTP 状态码：$status" >&2
+              exit 1
+            fi
+            printf '已上传 %s\n' "${wheel##*/}"
+          done
+
+      - name: 保存 GitHub Release wheel 产物
+        if: ${{ github.ref_type == 'tag' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.package_name }}-release-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+          path: dist/*.whl
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: 记录矩阵任务成功
+        shell: bash
+        run: printf 'success\n' > "$RUNNER_TEMP/matrix-success.txt"
+
+      - name: 保存矩阵任务成功标记
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.package_name }}-matrix-success-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/matrix-success.txt
+          if-no-files-found: error
+
+  publish-github-release:
+    name: 发布 wheel 到调用方 GitHub Release
+    needs: [build-sdist, matrix-job]
+    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.build-sdist.result == 'success' && (needs.matrix-job.result == 'success' || needs.matrix-job.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: github-release-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: 下载本次运行尝试的 wheel 产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.package_name }}-release-wheels-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: release-wheels
+          merge-multiple: false
+
+      - name: 创建 Release 并上传 wheel
+        uses: actions/github-script@v7
+        env:
+          PACKAGE_NAME: ${{ inputs.package_name }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const crypto = require('crypto');
+            if (!context.ref.startsWith('refs/tags/')) {
+              throw new Error('仅允许 tag 触发时发布 GitHub Release');
+            }
+            const tag = context.ref.slice('refs/tags/'.length);
+            const normalize = name => name.replace(/[-_.]+/g, '-').toLowerCase();
+            const wheels = new Map();
+            const root = path.resolve('release-wheels');
+            // 分目录读取，先检查同名产物，避免合并 artifact 时静默覆盖。
+            if (fs.existsSync(root)) {
+              for (const directory of fs.readdirSync(root, {withFileTypes: true})) {
+                if (!directory.isDirectory()) continue;
+                const artifactPath = path.join(root, directory.name);
+                for (const file of fs.readdirSync(artifactPath, {withFileTypes: true})) {
+                  if (!file.name.endsWith('.whl')) continue;
+                  if (!file.isFile()) throw new Error('wheel 产物必须是普通文件');
+                  const match = file.name.match(/^([A-Za-z0-9_][A-Za-z0-9_.]*)-([0-9][A-Za-z0-9.!+_]*)-(?:[0-9][A-Za-z0-9_.]*-)?[A-Za-z0-9_.]+-[A-Za-z0-9_.]+-[A-Za-z0-9_.]+\.whl$/);
+                  if (!match || normalize(match[1]) !== normalize(process.env.PACKAGE_NAME)) {
+                    throw new Error('wheel 文件名不合法或包名与 package_name 不一致');
+                  }
+                  const filename = path.join(artifactPath, file.name);
+                  const digest = 'sha256:' + crypto.createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
+                  const previous = wheels.get(file.name);
+                  if (previous && previous.digest !== digest) {
+                    throw new Error(`不同矩阵生成了同名但内容不同的 wheel：${file.name}`);
+                  }
+                  wheels.set(file.name, {filename, digest});
+                }
+              }
+            }
+            if (wheels.size === 0) {
+              core.info('没有成功的 wheel 产物，跳过 GitHub Release');
+              return;
+            }
+
+            // context.repo 指向调用方；发布前确认 tag 未被移动，不创建或移动 Git tag。
+            const repo = context.repo;
+            const {data: commit} = await github.rest.repos.getCommit({...repo, ref: context.ref});
+            if (commit.sha !== context.sha) {
+              throw new Error('触发 tag 的当前提交与构建提交不一致，停止发布');
+            }
+            let release;
+            try {
+              ({data: release} = await github.rest.repos.getReleaseByTag({...repo, tag}));
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              ({data: release} = await github.rest.repos.createRelease({
+                ...repo, tag_name: tag, target_commitish: context.sha, name: tag,
+                body: '由矩阵流水线构建的 wheel 包。', draft: false
+              }));
+            }
+            const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+              ...repo, release_id: release.id, per_page: 100
+            });
+            const existing = new Map(assets.map(asset => [asset.name, asset]));
+            // 全部检查通过后再上传；已有附件缺少摘要或内容不同都不自动覆盖。
+            for (const [name, wheel] of wheels) {
+              const asset = existing.get(name);
+              if (asset && (asset.state !== 'uploaded' || asset.digest !== wheel.digest)) {
+                throw new Error(`Release 已有同名附件且无法确认内容一致：${name}`);
+              }
+            }
+            for (const [name, wheel] of wheels) {
+              if (existing.has(name)) {
+                core.info(`附件内容相同，跳过：${name}`);
+                continue;
+              }
+              const data = fs.readFileSync(wheel.filename);
+              await github.rest.repos.uploadReleaseAsset({
+                ...repo, release_id: release.id, name, data,
+                headers: {'content-type': 'application/octet-stream', 'content-length': data.length}
+              });
+              core.info(`已上传 Release 附件：${name}`);
+            }
+
+  publish-sdist:
+    name: 至少一个矩阵任务成功后发布源码包
+    needs: [build-sdist, matrix-job]
+    # 即使矩阵汇总为 failure 也检查成功标记；取消、跳过或源码包构建失败时不发布。
+    if: ${{ !cancelled() && needs.build-sdist.result == 'success' && (needs.matrix-job.result == 'success' || needs.matrix-job.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 下载本次运行尝试的成功标记
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.package_name }}-matrix-success-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: matrix-results
+          merge-multiple: false
+
+      - name: 判断是否有矩阵任务成功
+        id: matrix-success
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          any_success = any(
+              path.is_file() and not path.is_symlink() and path.read_text(encoding="utf-8") == "success\n"
+              for path in Path("matrix-results").glob("*/matrix-success.txt")
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"any_success={str(any_success).lower()}\n")
+          print("检测到成功任务，将发布源码包" if any_success else "没有成功的矩阵任务，跳过源码包发布")
+          PY
+
+      - name: 下载待发布源码包
+        if: ${{ steps.matrix-success.outputs.any_success == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.package_name }}-sdist
+          path: sdist-dist
+
+      - name: 上传源码包到 Artifactory
+        if: ${{ steps.matrix-success.outputs.any_success == 'true' }}
+        shell: bash
+        env:
+          ARTIFACTORY_URL: https://download.t-head.cn/artifactory/pypi_generic/
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          RELEASE_USERNAME: ${{ secrets.release_username }}
+          RELEASE_TOKEN: ${{ secrets.release_token }}
+        run: |
+          set -euo pipefail
+          : "${RELEASE_USERNAME:?发布用户名不能为空}"
+          : "${RELEASE_TOKEN:?发布 token 不能为空}"
+          shopt -s nullglob
+          archives=(sdist-dist/*.tar.gz)
+          if (( ${#archives[@]} != 1 )); then
+            printf '%s\n' '::error::源码包产物必须包含且仅包含一个 tar.gz 文件' >&2
+            exit 1
+          fi
+          archive="${archives[0]}"
+          if [[ ! -f "$archive" || -L "$archive" ]]; then
+            printf '%s\n' '::error::源码包必须是普通文件，不能是符号链接' >&2
+            exit 1
+          fi
+          upload_url="$(python3 - "$archive" <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          from urllib.parse import quote
+
+          filename = Path(sys.argv[1]).name
+          match = re.fullmatch(
+              r"(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)-"
+              r"(?P<version>[0-9][A-Za-z0-9.!_]*\+oe)\.tar\.gz",
+              filename,
+          )
+          if match is None:
+              raise SystemExit("::error::源码包文件名或 +oe 版本后缀不合法")
+          package_name = os.environ["PACKAGE_NAME"]
+          if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", package_name):
+              raise SystemExit("::error::package_name 必须是合法的 Python 包名")
+          normalize = lambda name: re.sub(r"[-_.]+", "-", name).lower()
+          if normalize(match["name"]) != normalize(package_name):
+              raise SystemExit("::error::源码包包名与 package_name 不一致")
+          components = (package_name, match["version"], filename)
+          print(os.environ["ARTIFACTORY_URL"].rstrip("/") + "/" + "/".join(quote(part, safe="") for part in components))
+          PY
+          )"
+          # 沿用 wheel 的上传目录布局和认证方式，不跟随重定向。
+          status="$(curl --fail --silent --show-error --retry 3 \
+            --connect-timeout 30 --max-time 600 --proto '=https' \
+            --user "$RELEASE_USERNAME:$RELEASE_TOKEN" \
+            --upload-file "$archive" --output /dev/null --write-out '%{http_code}' \
+            -- "$upload_url")"
+          if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+            printf '%s\n' "::error::Artifactory 上传失败，HTTP 状态码：$status" >&2
+            exit 1
+          fi
+          printf '已上传源码包 %s\n' "${archive##*/}"
