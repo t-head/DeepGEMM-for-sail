@@ -7,6 +7,10 @@ name: Build Demo
 # template_repository 改为 t-head/DeepGEMM-for-sail，template_ref 使用相同的 SHA。
 # prepare_matrix.py 中的 SDK/Torch 下载地址目前仍为占位，补齐后再手动触发实际构建。
 on:
+  # 临时调试入口：仅当前开发分支的 push 触发，不响应 tag push。
+  push:
+    branches:
+      - feat/add-release-workflow
   workflow_dispatch:
     inputs:
       package_name:
@@ -54,18 +58,30 @@ jobs:
     permissions:
       contents: write
     secrets:
-      release_username: ${{ secrets.RELEASE_USERNAME }}
-      release_token: ${{ secrets.RELEASE_TOKEN }}
+      release_username: ${{ github.event_name != 'push' && secrets.RELEASE_USERNAME || '' }}
+      release_token: ${{ github.event_name != 'push' && secrets.RELEASE_TOKEN || '' }}
     with:
-      package_name: ${{ inputs.package_name }}
-      framework: ${{ inputs.framework }}
+      # push 没有 workflow_dispatch inputs，使用固定调试参数且禁止发布。
+      publish: ${{ github.event_name != 'push' }}
+      package_name: ${{ github.event_name == 'push' && 'deep_gemm' || inputs.package_name }}
+      framework: ${{ github.event_name == 'push' && 'torch' || inputs.framework }}
       template_repository: ${{ github.repository }}
       template_ref: ${{ github.sha }}
-      python_versions: ${{ inputs.python_versions }}
-      os_versions: ${{ inputs.os_versions }}
-      hggcrt_versions: ${{ inputs.hggcrt_versions }}
-      torch_versions: ${{ inputs.torch_versions }}
-      sdk_versions: ${{ inputs.sdk_versions }}
+      python_versions: ${{ github.event_name == 'push' && '["312"]' || inputs.python_versions }}
+      os_versions: ${{ github.event_name == 'push' && '["ubuntu2404"]' || inputs.os_versions }}
+      hggcrt_versions: ${{ github.event_name == 'push' && '["3"]' || inputs.hggcrt_versions }}
+      torch_versions: ${{ github.event_name == 'push' && '["2.10.0"]' || inputs.torch_versions }}
+      sdk_versions: ${{ github.event_name == 'push' && '["2.2.0"]' || inputs.sdk_versions }}
       build_command: |
-        python3 -m pip install --no-input 'setuptools>=61' 'setuptools-scm==9.2.2' wheel ninja
+        unset PIP_INDEX_URL
+        source /usr/local/PPU_SDK/envsetup.sh || true
+        which hgcc || true
+        echo $PPU_SDK
+        pip install ray[adag]==2.40.0 --no-deps
+        pip install setuptools==69.5.1
+        pip install setuptools-scm==9.2.2
+        pip install numpy==1.26.4 junit-xml rich
+        python3 -m pip install wheel ninja
+        python3 -m pip show setuptools setuptools-scm packaging
+        export PYTORCH_SAIL_ARCH="ppu_10;ppu_15"
         python3 setup.py bdist_wheel

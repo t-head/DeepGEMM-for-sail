@@ -111,7 +111,7 @@ def method_names(result):
 
 def test_tag_only_gate_and_partial_matrix_failure(workflow, release_job):
     assert release_job["if"] == (
-        "${{ !cancelled() && github.ref_type == 'tag' && needs.build-sdist.result == 'success' && "
+        "${{ !cancelled() && inputs.publish && github.ref_type == 'tag' && needs.build-sdist.result == 'success' && "
         "(needs.matrix-job.result == 'success' || needs.matrix-job.result == 'failure') }}"
     )
     assert set(release_job["needs"]) == {"build-sdist", "matrix-job"}
@@ -120,7 +120,7 @@ def test_tag_only_gate_and_partial_matrix_failure(workflow, release_job):
     steps = workflow["jobs"]["matrix-job"]["steps"]
     save = next(step for step in steps if step.get("name") == "保存 GitHub Release wheel 产物")
     assert steps[steps.index(save) - 1]["name"] == "上传 wheel 到 Artifactory"
-    assert save["if"] == "${{ github.ref_type == 'tag' }}"
+    assert save["if"] == "${{ inputs.publish && github.ref_type == 'tag' }}"
     assert save["uses"] == "actions/upload-artifact@v4"
     assert save["with"]["path"] == "dist/*.whl"
     assert save["with"]["if-no-files-found"] == "error"

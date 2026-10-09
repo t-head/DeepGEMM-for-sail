@@ -7,6 +7,10 @@ name: Reusable Matrix Release
 on:
   workflow_call:
     inputs:
+      publish:
+        description: '是否发布到 Artifactory 和 GitHub Release；false 时只构建并保存调试产物'
+        type: boolean
+        default: true
       package_name:
         description: '构建和发布的包名，例如 deep_gemm；不参与矩阵展开'
         required: true
@@ -57,11 +61,11 @@ on:
         description: '检出私有模板仓库的只读 token；同仓库或公开模板通常无需提供'
         required: false
       release_username:
-        description: '发布使用的用户名，由调用方仓库或组织级 Actions Secret 提供'
-        required: true
+        description: 'publish 为 true 时必须提供的发布用户名，来自调用方仓库或组织级 Actions Secret'
+        required: false
       release_token:
-        description: '发布使用的 token，由调用方仓库或组织级 Actions Secret 提供'
-        required: true
+        description: 'publish 为 true 时必须提供的发布 token，来自调用方仓库或组织级 Actions Secret'
+        required: false
 
 permissions:
   contents: read
@@ -182,7 +186,7 @@ jobs:
     name: py${{ matrix.python_version }} / ${{ matrix.os_version }} / hggcrt${{ matrix.hggcrt_version }} / torch${{ matrix.torch_version }} / sdk${{ matrix.sdk_version }}
     needs: [prepare-matrix, build-sdist]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
@@ -259,6 +263,7 @@ jobs:
           bash -e -o pipefail -c "$BUILD_COMMAND"
 
       - name: 上传 wheel 到 Artifactory
+        if: ${{ inputs.publish }}
         shell: bash
         env:
           ARTIFACTORY_URL: https://download.t-head.cn/artifactory/pypi_generic/
@@ -330,7 +335,7 @@ jobs:
           done
 
       - name: 保存 GitHub Release wheel 产物
-        if: ${{ github.ref_type == 'tag' }}
+        if: ${{ inputs.publish && github.ref_type == 'tag' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.package_name }}-release-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
@@ -338,11 +343,22 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+      - name: 保存调试 wheel 产物
+        if: ${{ !inputs.publish }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.package_name }}-debug-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+          path: dist/*.whl
+          if-no-files-found: error
+          compression-level: 0
+
       - name: 记录矩阵任务成功
+        if: ${{ inputs.publish }}
         shell: bash
         run: printf 'success\n' > "$RUNNER_TEMP/matrix-success.txt"
 
       - name: 保存矩阵任务成功标记
+        if: ${{ inputs.publish }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.package_name }}-matrix-success-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
@@ -352,7 +368,7 @@ jobs:
   publish-github-release:
     name: 发布 wheel 到调用方 GitHub Release
     needs: [build-sdist, matrix-job]
-    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.build-sdist.result == 'success' && (needs.matrix-job.result == 'success' || needs.matrix-job.result == 'failure') }}
+    if: ${{ !cancelled() && inputs.publish && github.ref_type == 'tag' && needs.build-sdist.result == 'success' && (needs.matrix-job.result == 'success' || needs.matrix-job.result == 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -456,7 +472,7 @@ jobs:
     name: 至少一个矩阵任务成功后发布源码包
     needs: [build-sdist, matrix-job]
     # 即使矩阵汇总为 failure 也检查成功标记；取消、跳过或源码包构建失败时不发布。
-    if: ${{ !cancelled() && needs.build-sdist.result == 'success' && (needs.matrix-job.result == 'success' || needs.matrix-job.result == 'failure') }}
+    if: ${{ !cancelled() && inputs.publish && needs.build-sdist.result == 'success' && (needs.matrix-job.result == 'success' || needs.matrix-job.result == 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

@@ -79,7 +79,7 @@ def test_upload_follows_build_and_credentials_are_step_scoped(workflow, upload_s
     assert job["steps"][job["steps"].index(upload_step) - 1]["name"] == "编译"
     assert upload_step["name"] == "上传 wheel 到 Artifactory"
     assert upload_step["shell"] == "bash"
-    assert "if" not in upload_step
+    assert upload_step["if"] == "${{ inputs.publish }}"
     assert "continue-on-error" not in upload_step
     assert upload_step["env"] == {
         "ARTIFACTORY_URL": ARTIFACTORY_URL,

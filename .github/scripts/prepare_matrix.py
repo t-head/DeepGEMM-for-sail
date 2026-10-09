@@ -7,7 +7,8 @@ import re
 IMAGES_MAP = {
     "ubuntu2004-py38": "registry.cn-hangzhou.aliyuncs.com/aliyun-ai/pytorch:2.8.0-py38-cu117",
     "ubuntu2204-py310": "registry.cn-hangzhou.aliyuncs.com/aliyun-ai/pytorch:2.8.0-py310-cu117",
-    "ubuntu2404-py312-sdk2.2.0-hggcrt3-torch2.13.0": "reg.docker.alibaba-inc.com/aisw/thead-ppu:2.2.0-hggcrt3-ubuntu24.04-py312-20261005",
+    "ubuntu2404-py312-sdk2.2.0-hggcrt3-torch2.13.0": "download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-hggcrt3-py312-20261005",
+    "ubuntu2404-py312-sdk2.2.0-hggcrt3-torch2.10.0": "download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005",
     "alios7u2-py38": "registry.cn-hangzhou.aliyuncs.com/aliyun-ai/pytorch:2.8.0-py38-cu117",
     "alios7u2-py310": "registry.cn-hangzhou.aliyuncs.com/aliyun-ai/pytorch:2.8.0-py310-cu117",
     "alios7u2-py312": "registry.cn-hangzhou.aliyuncs.com/aliyun-ai/pytorch:2.8.0-py312-cu117",

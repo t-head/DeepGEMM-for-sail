@@ -94,7 +94,7 @@ def render_artifact_expression(expression, index="0", run="100", attempt="2"):
 def test_publish_waits_for_all_matrix_jobs_and_handles_aggregate_failure(publish_job):
     assert set(publish_job["needs"]) == {"build-sdist", "matrix-job"}
     assert publish_job["if"] == (
-        "${{ !cancelled() && needs.build-sdist.result == 'success' && "
+        "${{ !cancelled() && inputs.publish && needs.build-sdist.result == 'success' && "
         "(needs.matrix-job.result == 'success' || needs.matrix-job.result == 'failure') }}"
     )
     assert "strategy" not in publish_job
@@ -109,7 +109,7 @@ def test_markers_only_follow_successful_wheel_upload(workflow, workspace, run_st
     assert create["name"] == "记录矩阵任务成功"
     assert save["uses"] == "actions/upload-artifact@v4"
     for step in (create, save):
-        assert "if" not in step
+        assert step["if"] == "${{ inputs.publish }}"
         assert "continue-on-error" not in step
     result = run_step(create, RUNNER_TEMP=str(workspace))
     assert result.returncode == 0, result.stderr
