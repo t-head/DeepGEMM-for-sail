@@ -1,56 +1,44 @@
 # Changelog
 
-All notable changes to DeepGemm for PPU will be documented in this file.
+This document records user-visible changes for formal DeepGEMM-for-sail releases, with the latest release listed first.
 
-## [1.1.0] - 2026-08-06
+DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
-### Added
+## [1.1.0+v0.1.0](https://github.com/t-head/DeepGEMM-for-sail/tree/v1.1.0_v0.1.0_release) — Initial Public Release
 
-- **W4A16 MXFP4 weight support**: extends the W4A16 grouped GEMM interface to
-  accept FP4 (MXFP4) weights with E8M0 scales, adding `fp4_use_bf16_scale`
-  keyword argument to all three kernel variants:
-  - `m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group, *, fp4_use_bf16_scale=False)`
-  - `m_grouped_gemm_w4a16_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs, *, fp4_use_bf16_scale=False)`
-  - `m_grouped_gemm_w4a16_nopad(x, y, out, m_indices, *, fp4_use_bf16_scale=False)`
-  The scale tensor `y[1]` dtype selects the weight path:
-  - `uint8` → E8M0 scale — MXFP4 (`w4fa16`)
-  - `bfloat16` (default) → INT4 quantized (`w4a16`)
-  - `bfloat16` + `fp4_use_bf16_scale=True` → FP4 with BF16 scale (`w4fa16_s16`)
-- **Fused silu_and_mul + MXFP4 post-quant epilogue (MoE gemm1)**: for the masked
-  grouped FP4 GEMM, `silu_and_mul` and the MXFP4 post-quantization are fused into the
-  GEMM epilogue, so gemm1 writes packed FP4 values plus E8M0 scales directly instead of
-  a BF16 tensor that a standalone kernel has to read back. Opt-in through two new
-  keyword arguments (**disabled by default**):
-  - `m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs, rhs, bias, out, masked_m, expected_m, ..., out_scale=None, swiglu_limit=0.0)`
-  - passing `out_scale` enables the fusion: `out` becomes `uint8` of shape
-    `(num_groups, m, n // 4)` and `out_scale` `uint16` of shape
-    `(num_groups, m, ceil_div(n // 4, 32))`. On return, `out_scale` is re-strided **in
-    place** to the N-major layout `(sfm * sfn, 1, sfm)` expected by the gemm2 SFA reader.
-  - `swiglu_limit > 0` applies the clamp before silu (gate clamped from above, up clamped
-    on both sides); `0.0` or `None` disables it
-  - constraints: `GroupedMasked` only (`GroupedNoPad` not supported yet), `ShapeN % 64 == 0`,
-    `BlockN >= 64` (raised automatically), bias not supported
-- **`preprocess_mxfp4_weight_for_act_and_quant_fusing(weight, weight_scale)`**: interleaves
-  the gate/up (W1/W3) halves of the gemm1 weight and its E8M0 scales so that the fused
-  epilogue can read gate/up pairs from adjacent N positions. Must be called before
-  `preprocess_mxfp4_scales`.
-- **Fused MoE GEMM path**: replaces scatter-based physical data movement with
-  `moe_align` index remapping; fuses gather-load A + contiguous-load B +
-  grouped GEMM + epilogue into a single kernel, covering all supported
-  precisions:
-  - BF16: `m_grouped_gemm_bf16_bf16_bf16_nt_fused` (890P / 810E)
-  - INT8 per-channel: `m_grouped_gemm_int8_int8_bf16_nt_fused` (890P / 810E)
-  - FP8 per-channel / blockwise: `m_grouped_gemm_fp8_fp8_bf16_nt_fused` (890P)
-  - FP4 (mxfp4): `m_grouped_gemm_fp4_fp4_bf16_nt_fused` (890) (LHS_scale must be uint16 K-major / plain
-    contiguous, unlike the uint16 M-major LHS_scale of the other FP4 interfaces; RHS_scale stays MN-major)
-  - W4A16: `m_grouped_gemm_w4a16_fused`
-- **`moe_align_block_size` auxiliary kernel**: preprocesses `topk_ids` into the
-  index format directly consumable by the GEMM kernels (`sorted_token_ids` +
-  `expert_ids_and_cumsum` in uint4 layout + `inv_perm` + `m_indices`); a single
-  call returns 7 values including the automatically queried GEMM config:
-  - Small M (numel <= 16384): WarpOrdered single-kernel path (deterministic,
-    tokens sorted within each expert)
-  - Large M: deterministic 4-kernel path (zero global atomicAdd)
-  - `enable_act_and_quant_fusing=True` must be passed when the FP4 gemm1 runs with the fused
-    act + MXFP4 post-quant epilogue, so that the queried config satisfies `BlockN >= 64`
-- **INT8 einsum**: new `int8_einsum` interface alongside `fp8_einsum`.
+This is the first formal public release of DeepGEMM for PPU. The version identifier follows the repository's current release naming convention.
+
+### Platform Support
+
+- Supports ZW 610 / 610E / 810 / 810E / M890 platforms.
+
+### Kernels and Operators
+
+- Provides BF16, INT8, and FP8 dense and grouped NT GEMMs in contiguous, masked, and no-pad layouts.
+- Provides MXFP4 dense, grouped masked, and grouped no-pad NT GEMMs.
+- Provides W4A16 grouped masked, no-pad, and fused MoE kernels for INT4 and MXFP4 weights.
+- Provides implicit-permute fused MoE GEMMs for BF16, INT8, FP8, MXFP4, and W4A16 workloads, with `moe_align_block_size` generating routing and scheduling metadata.
+- Adds optional fused `silu_and_mul` plus MXFP4 post-quantization epilogues for FP4 MoE GEMM1 paths.
+- Provides non-paged and paged MQA-logits operators for BF16, INT8, FP8, and FP4 inputs.
+- Provides TF32 HyperConnection prenorm GEMM with fused per-row square-sum reduction.
+- Provides FP8 and INT8 einsum-style batched GEMMs with fused LHS permutation for `bhr,hdr->bhd`.
+
+### JIT and Runtime
+
+- Integrates the PPU toolchain with offline HGCC compilation and optional HGRTC runtime compilation.
+- Provides C++ and Python-template JIT paths with runtime specialization for shapes, layouts, tile configurations, pipeline stages, and precision modes.
+- Adds persistent kernel caching, in-process runtime caching, compile-only warm-up support, and configurable compiler diagnostics.
+- Launches JIT-compiled kernels on the caller's current PyTorch stream.
+
+### Performance and Scheduling
+
+- Uses persistent warp-interleaved execution to overlap data movement, MMA instructions, and promotion operations.
+- Provides unified rasterized block scheduling, unaligned tile sizes, and block tiles up to `256x256` for improved L2 reuse and wave utilization.
+- Adds adaptive tile selection and prologue-overlap scheduling for BF16 DenseGEMM on M890.
+- Adds deterministic fused MoE routing for both small and large routed-token workloads.
+
+### Build and Validation
+
+- Provides `develop.sh` for in-tree development builds and `install.sh` for wheel-based installation.
+- Packages the JIT headers, ACTLIZE dependencies, and shipped tuning configurations with the Python package.
+- Provides format- and caselist-driven correctness and profiling tools for dense, grouped, fused MoE, and attention workloads.
