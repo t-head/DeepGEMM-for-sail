@@ -19,6 +19,21 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 - **Warp interleave execution design**: The PPU kernels adopt a warp interleave design to overlap data movement, MMA instructions, and promotion operations during GEMM execution.
 - **PPU-oriented scheduling and block-size choices**: The fork keeps the unified scheduler, rasterization strategy, fully JIT design, and unaligned block-size support, while enabling PPU-oriented larger block sizes up to `256x256`.
 
+## Release Notes
+
+### 1.1.0+v0.1.0 — Initial Public Release
+
+This is the first formal public release of DeepGEMM for PPU. The `1.1.0+v0.1.0` identifier follows the current DeepGEMM-for-sail release naming convention and is maintained independently of the upstream DeepGEMM project.
+
+Highlights:
+
+- Native PPU runtime and JIT compilation through HGCC and HGRTC.
+- BF16, INT8, FP8, and MXFP4 GEMM kernels across supported dense and grouped layouts, with W4A16 support for no-pad, masked, and fused MoE workloads.
+- Fused MoE with implicit permutation, MQA and paged MQA scoring, a TF32 HyperConnection prenorm GEMM, and FP8/INT8 einsum.
+- Support for ZW 610 / 610E / 810 / 810E / M890 platforms.
+
+See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
+
 ## Quick Start
 
 ### Requirements
