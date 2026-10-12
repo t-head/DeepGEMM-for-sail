@@ -1340,9 +1340,7 @@ public:
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(
-                GemmType::DenseGemm, false, std::string("tf32"),
-                1, m, SHAPE_N, SHAPE_K, 1, nullptr, stream);
+            dg_prof_params.set_hc_prenorm_params(m, SHAPE_N, SHAPE_K, stream);
             dg_prof_params.add_params("num_splits", int(kNumSplits));
         }
 
