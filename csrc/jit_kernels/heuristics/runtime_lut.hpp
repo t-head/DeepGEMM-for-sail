@@ -23,7 +23,7 @@ namespace deep_gemm_lut {
 using deep_gemm::GemmType;
 
 using Tile = std::tuple<int, int, int, int, int, int>;
-enum class RuntimeLutKind { FP8Blockwise, FP8Channelwise, INT8, BF16, FP4 };
+enum class RuntimeLutKind { FP8Blockwise, FP8Channelwise, INT8, A8W4INT8, BF16, FP4 };
 using RuntimeKey = std::tuple<int, int, int, int>; // (n, k, num_groups, m); grouped GEMMs use lower_bound on m
 using RuntimeTable = std::map<RuntimeKey, Tile>;
 using TableId = std::pair<RuntimeLutKind, GemmType>;
@@ -33,6 +33,7 @@ inline const char* get_runtime_lut_kind_name(RuntimeLutKind kind) {
         case RuntimeLutKind::FP8Blockwise: return "fp8_blockwise";
         case RuntimeLutKind::FP8Channelwise: return "fp8_channelwise";
         case RuntimeLutKind::INT8: return "int8";
+        case RuntimeLutKind::A8W4INT8: return "a8w4_int8";
         case RuntimeLutKind::BF16: return "bf16";
         case RuntimeLutKind::FP4: return "fp4";
     }

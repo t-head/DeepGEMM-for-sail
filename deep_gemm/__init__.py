@@ -85,6 +85,10 @@ from .deep_gemm_cpp import (
     m_grouped_gemm_fp8_fp4_bf16_nt_nopad,
     m_grouped_gemm_fp8_fp4_bf16_nt_masked,
     m_grouped_gemm_fp8_fp4_bf16_nt_fused,
+    # A8W4 INT8 GEMMs / device weight preprocessing
+    m_grouped_gemm_int8_int4_bf16_nt_masked,
+    m_grouped_gemm_int8_int4_bf16_nt_nopad,
+    preprocess_a8w4_weight,
     # W4A16 / W4FA16 GEMMs
     m_grouped_gemm_w4a16_nopad,
     m_grouped_gemm_w4a16_masked,
