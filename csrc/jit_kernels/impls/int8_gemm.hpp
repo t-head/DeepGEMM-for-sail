@@ -317,6 +317,7 @@ public:
         // Only meaningful for `GemmType::BatchGemm`. `true` keeps the transposed `[M, B, N]`
         // output used by `einsum("bhr,hdr->bhd")`; `false` emits a plain `[B, M, N]` output.
         bool transposed_batch_output = true;
+        bool a8w4_int8 = false;
     };
 
     struct GemmArguments {
@@ -419,7 +420,7 @@ public:
                                                         : sizeof(args.kernel_params.no_tsm);
         return fmt::format(R"(
 #define INT8_HGRTC
-#include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
+#include <deep_gemm/impls/a8w4_int8_gemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
@@ -440,6 +441,7 @@ constexpr int NUM_GROUPS = {5};
 constexpr int WARP_M = {6};
 constexpr int WARP_N = {7};
 constexpr int STAGES = {8};
+constexpr bool kA8W4Int8 = {21};
 
 #if __HGGC_ARCH__ == 100
 using ArchTag = cutlass::arch::PPU0010;
@@ -450,7 +452,7 @@ using ArchTag = cutlass::arch::PPU0015;
 using         ElementA    = {9};
 using         LayoutA     = cutlass::layout::RowMajor;
 
-using         ElementB    = ElementA;
+using         ElementB    = cute::conditional_t<kA8W4Int8, cutlass::int4b_t, ElementA>;
 using         LayoutB     = cutlass::layout::ColumnMajor;
 
 using         ElementD    = cutlass::bfloat16_t;
@@ -475,7 +477,7 @@ static constexpr int WarpOnN = BLOCK_N / WARP_N;
 constexpr bool kEnableSboOverlap = {10};
 constexpr KernelType kKernelType = KernelType::{11};
 
-using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementA,ElementB,ElementAccumulator>::type;
+using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementA,ElementA,ElementAccumulator>::type;
 using TiledMma = TiledMMA<
     MMA_Atom<MmaInst>,
     Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
@@ -504,7 +506,7 @@ static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
 static constexpr int SmemLayoutStageStrideA = EnableOverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
 static constexpr int SmemLayoutStageStrideB = EnableOverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
 using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
-using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
+using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
 
 // A
 using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
@@ -516,15 +518,22 @@ using SmemCopyAtomB = typename DefaultOperandB::SmemCopyAtom;
 using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
 
 // Mainloop
-using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+using A8W8CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
     ArchTag,
     DispatchPolicy, TileShape,
     ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
-    ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
+    ElementA, cutlass::detail::TagToStrideB_t<LayoutB>,
     TiledMma,
     GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,  // A
     GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity   // B
 >;
+#if __HGGC_ARCH__ == 100
+using A8W4CollectiveMainloop = deep_gemm::A8W4CollectiveMma<ArchTag, STAGES, TileShape, WarpShape>;
+#else
+static_assert(!kA8W4Int8, "A8W4 INT8 is only supported on PPU0010");
+using A8W4CollectiveMainloop = A8W8CollectiveMainloop;
+#endif
+using CollectiveMainloop = cute::conditional_t<kA8W4Int8, A8W4CollectiveMainloop, A8W8CollectiveMainloop>;
 // Epilogue
 static constexpr bool IsAlignedN = SHAPE_N % BLOCK_N == 0 ? true : false;
 // reduce vreg to use ScaleType::Nothing for alpha=1 & beta=0
@@ -605,7 +614,7 @@ __global__ void {14}(
                            args.type_info, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_type,
                            args.launch_info.gemm_type, args.launch_info.transposed_batch_output, args.launch_info.kernel_name,
                            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
-                           with_tsm_epilogue, host_params_size);
+                           with_tsm_epilogue, host_params_size, args.launch_info.a8w4_int8);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {

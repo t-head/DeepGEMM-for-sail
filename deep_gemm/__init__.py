@@ -8,6 +8,7 @@ PPU_HOME = os.environ.get('PPU_SDK') or os.environ.get('PPU_HOME') or '/usr/loca
 from . import jit
 from . import deep_gemm_tuner
 from . import deep_gemm_cpp
+from .utils.math import preprocess_a8w4_weight
 
 # Configs
 from .deep_gemm_cpp import (
@@ -54,6 +55,9 @@ from .deep_gemm_cpp import (
     m_grouped_gemm_int8_int8_bf16_nt_masked,
     m_grouped_gemm_int8_int8_bf16_nt_nopad,
     m_grouped_gemm_int8_int8_bf16_nt_fused,
+    m_grouped_gemm_int8_int4_bf16_nt_contiguous,
+    m_grouped_gemm_int8_int4_bf16_nt_masked,
+    m_grouped_gemm_int8_int4_bf16_nt_nopad,
     # FP8 GEMMs
     gemm_fp8_fp8_bf16_nt,
     gemm_fp8_fp8_bf16_nn,

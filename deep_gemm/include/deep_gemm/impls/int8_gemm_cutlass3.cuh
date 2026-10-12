@@ -358,7 +358,9 @@ public:
       auto offset_a = deep_scheduler.curr_offset_a();
       auto offset_b = deep_scheduler.curr_offset_b();
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
-      const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
+      const ElementB* ptr_B = reinterpret_cast<const ElementB*>(
+          reinterpret_cast<const uint8_t*>(params.mainloop.ptr_B) +
+          offset_b * cutlass::sizeof_bits<ElementB>::value / 8);
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
@@ -1460,7 +1462,9 @@ public:
       auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
 
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
-      const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
+      const ElementB* ptr_B = reinterpret_cast<const ElementB*>(
+          reinterpret_cast<const uint8_t*>(params.mainloop.ptr_B) +
+          offset_b * cutlass::sizeof_bits<ElementB>::value / 8);
 
       // if (thread0()) {
       //   printf("M = %d, N = %d, K = %d, offset_m = %d, expert_id = %d, offset_a = %d, offset_b = %d, m_coord = %d, n_coord = %d, ptr_A = %p, ptr_B = %p\n",

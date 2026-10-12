@@ -486,6 +486,92 @@ void m_grouped_gemm_int8_int8_bf16_nt_nopad(const std::pair<torch::Tensor, torch
     }
 }
 
+static void check_a8w4_int8_common(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
+                                   const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
+                                   const torch::Tensor& out, int num_groups, int n, int k) {
+    TORCH_CHECK(lhs.dim() == 2 || lhs.dim() == 3, "A8W4 lhs must be 2D or 3D");
+    TORCH_CHECK(rhs.dim() == 3, "A8W4 rhs must be 3D");
+    TORCH_CHECK(out.dim() == lhs.dim(), "A8W4 output rank must match lhs rank");
+    TORCH_CHECK(!is_ppu1v5_device(), "A8W4 INT8 is only supported on PPU0010");
+    TORCH_CHECK(get_extra_info()["use_actlize_v100"],
+                "A8W4 INT8 requires DG_USE_ACTLIZE_V100=1");
+    TORCH_CHECK(k % 64 == 0, "A8W4 INT8 requires K to be a multiple of 64");
+    // The PPU0010 TSM epilogue stores eight BF16 values (16 bytes) per R2G vector and predicates
+    // only the vector origin, so an N tail inside that vector would overwrite the next output row.
+    TORCH_CHECK(n % 8 == 0, "A8W4 INT8 requires N to be a multiple of 8");
+    TORCH_CHECK(lhs.scalar_type() == torch::kInt8, "A8W4 lhs must be int8");
+    TORCH_CHECK(rhs.scalar_type() == torch::kInt8, "A8W4 packed rhs must use torch.int8 storage");
+    TORCH_CHECK(lhs_scales.scalar_type() == torch::kFloat32, "A8W4 lhs scales must be float32");
+    TORCH_CHECK(rhs_scales.scalar_type() == torch::kFloat32, "A8W4 rhs scales must be float32");
+    TORCH_CHECK(out.scalar_type() == torch::kBFloat16, "A8W4 output must be bfloat16");
+    TORCH_CHECK(rhs.size(0) == num_groups && rhs.size(1) == n && rhs.size(2) * 2 == k,
+                "A8W4 rhs must have shape [num_groups, n, k / 2]");
+    TORCH_CHECK(rhs_scales.sizes() == std::vector<int64_t>({num_groups, n, 1}),
+                "A8W4 rhs scales must have shape [num_groups, n, 1]");
+    TORCH_CHECK(lhs.is_contiguous() && lhs_scales.is_contiguous() && rhs.is_contiguous() &&
+                    rhs_scales.is_contiguous() && out.is_contiguous(),
+                "A8W4 tensors must be contiguous");
+}
+
+void m_grouped_gemm_int8_int4_bf16_nt_contiguous(
+    const std::pair<torch::Tensor, torch::Tensor>& a,
+    const std::pair<torch::Tensor, torch::Tensor>& b,
+    const torch::Tensor& out, const torch::Tensor& m_indices,
+    std::optional<ConfigTuple> configs = std::nullopt) {
+    const auto& [m, k] = get_shape<2>(a.first);
+    const int num_groups = b.first.size(0);
+    const int n = b.first.size(1);
+    check_a8w4_int8_common(a.first, a.second, b.first, b.second, out, num_groups, n, k);
+    TORCH_CHECK(out.sizes() == std::vector<int64_t>({m, n}), "A8W4 output must have shape [m, n]");
+    TORCH_CHECK(a.second.sizes() == std::vector<int64_t>({m, 1}), "A8W4 lhs scales must have shape [m, 1]");
+    TORCH_CHECK(m_indices.scalar_type() == torch::kInt32 && m_indices.is_contiguous() && m_indices.numel() == m,
+                "A8W4 m_indices must be contiguous int32 with m elements");
+    if (m == 0) return;
+    m_grouped_gemm_int8_int4_bf16_nt_contiguous_impl(
+        a.first, a.second, b.first, b.second, out, m_indices, m, n, k, num_groups, configs);
+}
+
+std::pair<int, int> m_grouped_gemm_int8_int4_bf16_nt_masked(
+    const std::pair<torch::Tensor, torch::Tensor>& a,
+    const std::pair<torch::Tensor, torch::Tensor>& b,
+    const torch::Tensor& out, const torch::Tensor& masked_m, int expected_m,
+    std::optional<int> max_block_n = 256, std::optional<ConfigTuple> configs = std::nullopt) {
+    const auto& [num_groups, m, k] = get_shape<3>(a.first);
+    const int n = b.first.size(1);
+    check_a8w4_int8_common(a.first, a.second, b.first, b.second, out, num_groups, n, k);
+    TORCH_CHECK(out.sizes() == std::vector<int64_t>({num_groups, m, n}),
+                "A8W4 output must have shape [num_groups, m, n]");
+    TORCH_CHECK(a.second.sizes() == std::vector<int64_t>({num_groups, m, 1}),
+                "A8W4 lhs scales must have shape [num_groups, m, 1]");
+    TORCH_CHECK(masked_m.scalar_type() == torch::kInt32 && masked_m.is_contiguous() &&
+                    masked_m.numel() == num_groups,
+                "A8W4 masked_m must be contiguous int32 with num_groups elements");
+    TORCH_CHECK(expected_m > 0 && m > 0, "A8W4 expected_m and m must be positive");
+    auto signal = at::empty({0}, at::TensorOptions().dtype(at::kInt).device(out.device()));
+    return m_grouped_gemm_int8_int4_bf16_nt_masked_impl(
+        a.first, a.second, b.first, b.second, out, masked_m, m, n, k, num_groups,
+        expected_m, configs, max_block_n.value_or(256), signal);
+}
+
+void m_grouped_gemm_int8_int4_bf16_nt_nopad(
+    const std::pair<torch::Tensor, torch::Tensor>& a,
+    const std::pair<torch::Tensor, torch::Tensor>& b,
+    const torch::Tensor& out, const torch::Tensor& m_indices,
+    std::optional<const torch::Tensor> m_rows = std::nullopt,
+    std::optional<ConfigTuple> configs = std::nullopt) {
+    const auto& [m, k] = get_shape<2>(a.first);
+    const int num_groups = b.first.size(0);
+    const int n = b.first.size(1);
+    check_a8w4_int8_common(a.first, a.second, b.first, b.second, out, num_groups, n, k);
+    TORCH_CHECK(out.sizes() == std::vector<int64_t>({m, n}), "A8W4 output must have shape [m, n]");
+    TORCH_CHECK(a.second.sizes() == std::vector<int64_t>({m, 1}), "A8W4 lhs scales must have shape [m, 1]");
+    TORCH_CHECK(m_indices.scalar_type() == torch::kInt32 && m_indices.is_contiguous() && m_indices.numel() == m,
+                "A8W4 m_indices must be contiguous int32 with m elements");
+    if (m == 0) return;
+    m_grouped_gemm_int8_int4_bf16_nt_nopad_impl(
+        a.first, a.second, b.first, b.second, out, m_indices, m, n, k, num_groups, m_rows, configs);
+}
+
 void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
                                                const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& d,
                                                const torch::Tensor& m_indices,
@@ -1590,6 +1676,15 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,
           py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
+    // A8W4 INT8 MoE GEMMs. Build packed rhs with deep_gemm.preprocess_a8w4_weight.
+    m.def("m_grouped_gemm_int8_int4_bf16_nt_contiguous", &m_grouped_gemm_int8_int4_bf16_nt_contiguous,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"), py::arg("configs") = std::nullopt);
+    m.def("m_grouped_gemm_int8_int4_bf16_nt_masked", &m_grouped_gemm_int8_int4_bf16_nt_masked,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"), py::arg("expected_m"),
+          py::arg("max_block_n") = 256, py::arg("configs") = std::nullopt);
+    m.def("m_grouped_gemm_int8_int4_bf16_nt_nopad", &m_grouped_gemm_int8_int4_bf16_nt_nopad,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"),
+          py::arg("m_rows") = std::nullopt, py::arg("configs") = std::nullopt);
     // FP8 GEMMs
     m.def("gemm_fp8_fp8_bf16_nt", &fp8_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
