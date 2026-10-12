@@ -4,6 +4,7 @@
 
 #include <variant>
 
+#include "../jit_kernels/heuristics/common_a8w4_int8.hpp"
 #include "../jit_kernels/heuristics/common_fp4.hpp"
 #include "../jit_kernels/heuristics/common_preprocess.hpp"
 #include "../utils/layout.hpp"
@@ -48,23 +49,27 @@ static void register_apis(pybind11::module_& m) {
         .value("FP8_CHANNEL", deep_gemm_preprocess_common::PreprocessMode::FP8_CHANNEL)
         .value("FP8_BLOCK", deep_gemm_preprocess_common::PreprocessMode::FP8_BLOCK)
         .value("INT8", deep_gemm_preprocess_common::PreprocessMode::INT8)
-        .value("BF16", deep_gemm_preprocess_common::PreprocessMode::BF16);
+        .value("BF16", deep_gemm_preprocess_common::PreprocessMode::BF16)
+        .value("W4A8_INT8", deep_gemm_preprocess_common::PreprocessMode::W4A8_INT8);
     m.def("preprocess_weights_and_scales",
           [](const deep_gemm_preprocess_common::PreprocessMode mode, bool fuse_activation,
              const std::optional<torch::Tensor>& weight, const std::optional<const torch::Tensor>& weight_scale) -> py::tuple {
               auto result = deep_gemm_preprocess_common::preprocess_weights_and_scales(
                   mode, fuse_activation, weight.value_or(torch::Tensor{}), weight_scale);
               const py::object prepared_weight = result.weight.defined() ? py::cast(result.weight) : py::none();
+              const py::object prepared_weight_scale = result.scale.defined() ? py::cast(result.scale) : py::none();
               if (mode == deep_gemm_preprocess_common::PreprocessMode::W4A8_MXFP4_MMA)
                   return py::make_tuple(prepared_weight, result.scale, result.inv_scale);
-              return py::make_tuple(prepared_weight, result.scale);
+              return py::make_tuple(prepared_weight, prepared_weight_scale);
           },
           py::arg("mode"), py::arg("fuse_activation"), py::arg("weight") = std::nullopt,
           py::arg("weight_scale") = std::nullopt);
     m.def("preprocess_mxfp4_weight_for_act_and_quant_fusing",
           &deep_gemm_preprocess_common::preprocess_mxfp4_weight_for_act_and_quant_fusing,
           py::arg("weight"), py::arg("weight_scale"));
-
+    m.def("preprocess_a8w4_weight",
+          &deep_gemm_preprocess_common::preprocess_a8w4_weight,
+          py::arg("weight"));
     m.def("get_tma_aligned_size", &get_tma_aligned_size);
     m.def("get_mk_alignment_for_contiguous_layout", &get_mk_alignment_for_contiguous_layout);
     m.def("get_mn_major_tma_aligned_tensor", &get_mn_major_tma_aligned_tensor, py::arg("x"));

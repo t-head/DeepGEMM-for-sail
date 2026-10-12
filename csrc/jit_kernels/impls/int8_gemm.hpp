@@ -316,6 +316,8 @@ public:
         // Only meaningful for `GemmType::Batched`. `true` keeps the transposed `[M, B, N]`
         // output used by `einsum("bhr,hdr->bhd")`; `false` emits a plain `[B, M, N]` output.
         bool transposed_batch_output = true;
+        // `true` selects the PPU0010 A8W4 INT8 mainloop (packed signed INT4 weights).
+        bool a8w4_int8 = false;
     };
 
     struct GemmArguments {
@@ -419,6 +421,7 @@ public:
         return fmt::format(R"(
 #define INT8_HGRTC
 #include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
+#include <deep_gemm/impls/a8w4_int8_gemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
@@ -439,6 +442,7 @@ constexpr int NUM_GROUPS = {5};
 constexpr int WARP_M = {6};
 constexpr int WARP_N = {7};
 constexpr int STAGES = {8};
+constexpr bool kA8W4Int8 = {21};
 
 #if __HGGC_ARCH__ == 100
 using ArchTag = cutlass::arch::PPU0010;
@@ -449,7 +453,7 @@ using ArchTag = cutlass::arch::PPU0015;
 using         ElementA    = {9};
 using         LayoutA     = cutlass::layout::RowMajor;
 
-using         ElementB    = ElementA;
+using         ElementB    = cute::conditional_t<kA8W4Int8, cutlass::int4b_t, ElementA>;
 using         LayoutB     = cutlass::layout::ColumnMajor;
 
 using         ElementD    = cutlass::bfloat16_t;
@@ -474,7 +478,7 @@ static constexpr int WarpOnN = BLOCK_N / WARP_N;
 constexpr bool kEnableSboOverlap = {10};
 constexpr KernelStrategy kKernelStrategy = KernelStrategy::{11};
 
-using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementA,ElementB,ElementAccumulator>::type;
+using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementA,ElementA,ElementAccumulator>::type;
 using TiledMma = TiledMMA<
     MMA_Atom<MmaInst>,
     Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
@@ -503,7 +507,7 @@ static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
 static constexpr int SmemLayoutStageStrideA = EnableOverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
 static constexpr int SmemLayoutStageStrideB = EnableOverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
 using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
-using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
+using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
 
 // A
 using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
@@ -515,15 +519,45 @@ using SmemCopyAtomB = typename DefaultOperandB::SmemCopyAtom;
 using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
 
 // Mainloop
-using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+using A8W8CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
     ArchTag,
     DispatchPolicy, TileShape,
     ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
-    ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
+    ElementA, cutlass::detail::TagToStrideB_t<LayoutB>,
     TiledMma,
     GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,  // A
     GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity   // B
 >;
+#if __HGGC_ARCH__ == 100
+static_assert(cute::is_same_v<ElementA, int8_t>, "PPU0010 INT8 runtime requires INT8 operands");
+// A8W4 reuses the A8W8 MMA atom and A operand; only the value tile expands from K32 to K64,
+// while B uses the packed-INT4 copy/layout definitions.
+using A8W4TiledMma = TiledMMA<
+    MMA_Atom<MmaInst>,
+    Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,
+    Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _64>>;
+using A8W4DefaultOperandB = deep_gemm::A8W4PackedOperandB<ArchTag, BLOCK_N, BLOCK_K>;
+using A8W4DispatchPolicy = cutlass::gemm::MainloopPPUAiuA8W4<
+    STAGES, cutlass::gemm::KernelAiuMultistage>;
+using A8W4CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+    ArchTag,
+    A8W4DispatchPolicy, TileShape,
+    int8_t, cutlass::detail::TagToStrideA_t<cutlass::layout::RowMajor>,
+    cutlass::int4b_t, cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>,
+    A8W4TiledMma,
+    GmemTiledCopyA,
+    SmemLayoutAtomA,
+    SmemCopyAtomA,
+    cute::identity,
+    typename A8W4DefaultOperandB::GmemTiledCopy,
+    typename A8W4DefaultOperandB::SmemLayoutAtom,
+    typename A8W4DefaultOperandB::SmemCopyAtom,
+    cute::identity>;
+#else
+static_assert(!kA8W4Int8, "A8W4 INT8 is only supported on PPU0010");
+using A8W4CollectiveMainloop = A8W8CollectiveMainloop;
+#endif
+using CollectiveMainloop = cute::conditional_t<kA8W4Int8, A8W4CollectiveMainloop, A8W8CollectiveMainloop>;
 // Epilogue
 static constexpr bool IsAlignedN = SHAPE_N % BLOCK_N == 0 ? true : false;
 // reduce vreg to use ScaleType::Nothing for alpha=1 & beta=0
@@ -580,11 +614,25 @@ static_assert(sizeof(GemmKernel::Params) == {20}, "host/device kernel Params siz
 // scale-A/B cp.async addresses: each stream keeps a 64-bit global address and a
 // 32-bit shared address, for 2 * 3 = 6 VREGs; A/B use the AIU load path.
 constexpr int kVregOverhead = 6;
+
+// A8W4 extra per-warp VREG beyond GemmOccModel. GemmOccModel already estimates the A/B operands
+// with a 2x upper bound (WARP_M/2 and WARP_N/2), so the expanded INT8 B operand is already covered.
+// But A8W4 converts INT4->INT8 in-register, where the packed INT4 B and the expanded INT8 B are
+// live at the same time, so add the packed B fragment (WARP_N/4). The remaining terms: BlockM<64
+// preloads all scale and keeps it resident across the mainloop; BLOCK_K>=128 software-pipelines a
+// 2nd k-block; +20 reserves converter temps / cp.async addresses / scheduler / epilogue.
+constexpr int kA8W4ExtraVreg = kA8W4Int8
+    ? (WARP_N / 4                                                     // packed INT4 B, live beside the expanded INT8 B
+       + (BLOCK_M < 64 ? 2 * (WARP_M / 16) + 4 * (WARP_N / 16) : 0)   // preloaded scale resident across the mainloop
+       + (BLOCK_K >= 128 ? 6 : 0)                                     // 2nd software-pipelined k-block
+       + 20)                                                          // converter temps + addresses + scheduler/epilogue reserve
+    : 0;
+constexpr int kTotalVregOverhead = kA8W4Int8 ? kA8W4ExtraVreg : kVregOverhead;
 using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, GemmKernel::SharedStorageSize,
                             cute::sizeof_bits_v<ElementA>, cute::sizeof_bits_v<ElementB>,
                             cute::sizeof_bits_v<ElementCompute>,
                             kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu,
-                            false, kVregOverhead>;
+                            false, kTotalVregOverhead>;
 
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
@@ -604,7 +652,7 @@ __global__ void {14}(
                            args.type_info, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_strategy,
                            args.launch_info.gemm_type, args.launch_info.transposed_batch_output, args.launch_info.kernel_name,
                            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
-                           with_tsm_epilogue, host_params_size);
+                           with_tsm_epilogue, host_params_size, args.launch_info.a8w4_int8);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
