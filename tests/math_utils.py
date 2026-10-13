@@ -12,7 +12,6 @@ from deep_gemm.utils.math import (
     per_block_cast_to_fp8,
     per_custom_dims_cast_to_fp8,
     per_token_cast_to_int8,
-    preprocess_a8w4_weight,
     _quantize_to_fp4_e2m1,
     per_token_cast_to_fp4,
     transpose_packed_fp4,
@@ -27,11 +26,13 @@ round_up = align
 
 def per_channel_cast_to_packed_int4(x: torch.Tensor):
     """Quantize the last dimension to signed INT4 and pack adjacent K values."""
+    from deep_gemm import pack_a8w4_weight, preprocess_a8w4_weight
+
     assert x.dim() >= 2 and x.shape[-1] % 2 == 0
     amax = x.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
     scale = amax / 7.0
     quant = (x.float() / scale).round().clamp(-8, 7).to(torch.int8)
-    packed = preprocess_a8w4_weight(quant.contiguous())
+    packed = preprocess_a8w4_weight(pack_a8w4_weight(quant.contiguous()))
     return packed, scale.float().contiguous(), quant
 
 

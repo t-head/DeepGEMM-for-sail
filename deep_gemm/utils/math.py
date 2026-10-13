@@ -97,23 +97,6 @@ def per_token_cast_to_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
     return x_int8, (x_amax / 127.0).view(m, -1)
 
 
-def preprocess_a8w4_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Permute and pack signed INT4 MoE weights for the A8W4 INT8 kernels.
-
-    ``weight`` is contiguous int8 with logical shape ``[..., N, K]`` and values
-    in ``[-8, 7]``. The result has shape ``[..., N, K // 2]`` with two INT4
-    values per byte.
-    """
-    assert weight.dtype == torch.int8 and weight.is_contiguous()
-    assert weight.dim() >= 2 and weight.shape[-1] % 32 == 0
-    block = torch.arange(32, device=weight.device)
-    read = (block % 8) // 4 * 16 + block // 8 * 4 + block % 4
-    permuted = weight.view(*weight.shape[:-1], -1, 32)[..., read].flatten(-2)
-    low = permuted[..., 0::2].to(torch.int16) & 0x0F
-    high = (permuted[..., 1::2].to(torch.int16) & 0x0F) << 4
-    return (low | high).to(torch.int8).contiguous()
-
-
 def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
     ax = x.abs()
     # {0, 0.5, 1, 1.5, 2, 3, 4, 6}

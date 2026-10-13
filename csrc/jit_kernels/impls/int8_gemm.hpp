@@ -317,6 +317,7 @@ public:
         // Only meaningful for `GemmType::BatchGemm`. `true` keeps the transposed `[M, B, N]`
         // output used by `einsum("bhr,hdr->bhd")`; `false` emits a plain `[B, M, N]` output.
         bool transposed_batch_output = true;
+        // `true` selects the PPU0010 A8W4 INT8 mainloop (packed signed INT4 weights).
         bool a8w4_int8 = false;
     };
 
@@ -528,7 +529,30 @@ using A8W8CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
     GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity   // B
 >;
 #if __HGGC_ARCH__ == 100
-using A8W4CollectiveMainloop = deep_gemm::A8W4CollectiveMma<ArchTag, STAGES, TileShape, WarpShape>;
+static_assert(cute::is_same_v<ElementA, int8_t>, "PPU0010 INT8 runtime requires INT8 operands");
+// A8W4 reuses the A8W8 MMA atom and A operand; only the value tile expands from K32 to K64,
+// while B uses the packed-INT4 copy/layout definitions.
+using A8W4TiledMma = TiledMMA<
+    MMA_Atom<MmaInst>,
+    Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,
+    Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _64>>;
+using A8W4DefaultOperandB = deep_gemm::A8W4PackedOperandB<ArchTag, BLOCK_N, BLOCK_K>;
+using A8W4DispatchPolicy = cutlass::gemm::MainloopPPUAiuA8W4<
+    STAGES, cutlass::gemm::KernelAiuMultistage>;
+using A8W4CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+    ArchTag,
+    A8W4DispatchPolicy, TileShape,
+    int8_t, cutlass::detail::TagToStrideA_t<cutlass::layout::RowMajor>,
+    cutlass::int4b_t, cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>,
+    A8W4TiledMma,
+    GmemTiledCopyA,
+    SmemLayoutAtomA,
+    SmemCopyAtomA,
+    cute::identity,
+    typename A8W4DefaultOperandB::GmemTiledCopy,
+    typename A8W4DefaultOperandB::SmemLayoutAtom,
+    typename A8W4DefaultOperandB::SmemCopyAtom,
+    cute::identity>;
 #else
 static_assert(!kA8W4Int8, "A8W4 INT8 is only supported on PPU0010");
 using A8W4CollectiveMainloop = A8W8CollectiveMainloop;

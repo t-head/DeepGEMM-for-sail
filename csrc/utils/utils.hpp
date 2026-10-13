@@ -26,6 +26,12 @@ bool is_ppu1v5_device() {
     }
 }
 
+bool is_ppu1v0_device() {
+    hggcDeviceProp device_prop;
+    hggcGetDeviceProperties(&device_prop, 0);
+    return device_prop.major == 8 && device_prop.minor == 0;
+}
+
 int get_sm_count() {
     hggcDeviceProp device_prop;
     hggcGetDeviceProperties(&device_prop, 0);

@@ -89,61 +89,78 @@ struct A8W4PackedOperandB {
       cute::Stride<cute::Int<AiuContElements>, cute::_1>>;
 };
 
-template <typename Arch, int Stages, typename TileShape_, typename WarpShape_>
-class A8W4CollectiveMma {
-public:
-  static_assert(cute::is_same_v<Arch, cutlass::arch::PPU0010>, "A8W4 is only supported on PPU0010");
+} // namespace deep_gemm
 
+namespace cutlass::gemm {
+
+template <int Stages_, typename Schedule_ = KernelAiuMultistage>
+struct MainloopPPUAiuA8W4 {
+  static constexpr int Stages = Stages_;
+  using ArchTag = arch::PPU0010;
+  using Schedule = Schedule_;
+  using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+};
+
+} // namespace cutlass::gemm
+
+namespace cutlass::gemm::collective {
+
+template <
+    int Stages, typename KernelSchedule,
+    typename TileShape_, typename StrideA_, typename StrideB_,
+    typename TiledMma_, typename GmemTiledCopyA_, typename SmemLayoutAtomA_, typename SmemCopyAtomA_,
+    typename TransformA_, typename GmemTiledCopyB_, typename SmemLayoutAtomB_, typename SmemCopyAtomB_,
+    typename TransformB_>
+struct CollectiveMma<
+    cutlass::arch::PPU0010, MainloopPPUAiuA8W4<Stages, KernelSchedule>, TileShape_,
+    int8_t, StrideA_, cutlass::int4b_t, StrideB_, TiledMma_,
+    GmemTiledCopyA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_,
+    GmemTiledCopyB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_> {
+public:
+  using DispatchPolicy = MainloopPPUAiuA8W4<Stages, KernelSchedule>;
   using TileShape = TileShape_;
-  using WarpShape = WarpShape_;
   using ElementA = int8_t;
+  using StrideA = StrideA_;
   using ElementB = cutlass::int4b_t;
-  using ElementAccumulator = int32_t;
+  using StrideB = StrideB_;
+  using TiledMma = TiledMma_;
+  using ElementAccumulator = typename TiledMma::ValTypeC;
   using ElementScale = float;
-  using StrideA = cutlass::detail::TagToStrideA_t<cutlass::layout::RowMajor>;
-  using StrideB = cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>;
-  using ArchTag = Arch;
-  using DispatchPolicy = cutlass::gemm::MainloopPPUAiuA8W8<Stages, cutlass::gemm::KernelAiuMultistage>;
+  using GmemTiledCopyA = GmemTiledCopyA_;
+  using GmemTiledCopyB = GmemTiledCopyB_;
+  using SmemLayoutAtomA = SmemLayoutAtomA_;
+  using SmemLayoutAtomB = SmemLayoutAtomB_;
+  using SmemCopyAtomA = SmemCopyAtomA_;
+  using SmemCopyAtomB = SmemCopyAtomB_;
+  using TransformA = TransformA_;
+  using TransformB = TransformB_;
+  using ArchTag = cutlass::arch::PPU0010;
+
+  static_assert(Stages >= 2, "A8W4 requires at least two pipeline stages");
 
   static constexpr int BlockM = cute::size<0>(TileShape{});
   static constexpr int BlockN = cute::size<1>(TileShape{});
   static constexpr int BlockK = cute::size<2>(TileShape{});
-  static constexpr int WarpM = cute::size<0>(WarpShape{});
-  static constexpr int WarpN = cute::size<1>(WarpShape{});
-  static constexpr int WarpOnM = BlockM / WarpM;
-  static constexpr int WarpOnN = BlockN / WarpN;
-
-  using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<
-      Arch, ElementA, ElementA, ElementAccumulator>::type;
-  using TiledMma = cute::TiledMMA<
-      cute::MMA_Atom<MmaInst>,
-      cute::Layout<cute::Shape<cute::Int<WarpOnM>, cute::Int<WarpOnN>, cute::_1>>,
-      cute::Tile<cute::Int<WarpOnM * 16>, cute::Int<WarpOnN * 16>, cute::_64>>;
+  static constexpr int WarpOnM = cute::size<1>(typename TiledMma::ThrLayoutVMNK{});
+  static constexpr int WarpOnN = cute::size<2>(typename TiledMma::ThrLayoutVMNK{});
 
 private:
-  using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<
-      Arch, ElementA, false, cute::Int<BlockM>, cute::Int<BlockK>, false>;
-  using DefaultOperandB = A8W4PackedOperandB<Arch, BlockN, BlockK>;
-  using Base = cutlass::gemm::collective::CollectiveMma<
-      Arch,
+  // Reuse actlize's mixed-input collective only for descriptor construction, shared-memory layouts,
+  // copy atoms, and load_init(). A8W4 does not call its operator(); mma_mainloop() below is custom.
+  using MixedInputBase = cutlass::gemm::collective::CollectiveMma<
+      ArchTag,
       cutlass::gemm::MainloopPPUAiuMixedInput<
           Stages, cute::Int<1>, cutlass::gemm::KernelAiuMultistageMixedInput>,
       cute::tuple<TileShape>,
       ElementA, StrideA,
       cute::tuple<ElementB>, StrideB,
       TiledMma,
-      typename DefaultOperandA::GmemTiledCopy,
-      typename DefaultOperandA::SmemLayoutAtom,
-      typename DefaultOperandA::SmemCopyAtom,
-      cute::identity,
-      typename DefaultOperandB::GmemTiledCopy,
-      typename DefaultOperandB::SmemLayoutAtom,
-      typename DefaultOperandB::SmemCopyAtom,
-      cute::identity>;
-  using BaseParams = typename Base::Params;
+      GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, TransformA,
+      GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, TransformB>;
+  using MixedInputBaseParams = typename MixedInputBase::Params;
 
 public:
-  using SharedStorage = typename Base::SharedStorage;
+  using SharedStorage = typename MixedInputBase::SharedStorage;
 
   struct Arguments {
     ElementA const* ptr_A;
@@ -156,15 +173,15 @@ public:
   using Params = Arguments;
 
 private:
-  Base base_{};
-  BaseParams base_params_{};
+  MixedInputBase base_{};
+  MixedInputBaseParams base_params_{};
   Params params_;
   ElementScale const* tile_scale_a_ = nullptr;
   ElementScale const* tile_scale_b_ = nullptr;
 
 public:
   template <typename ProblemShape>
-  CUTLASS_DEVICE A8W4CollectiveMma(Params params, ProblemShape) : params_(params) {
+  CUTLASS_DEVICE CollectiveMma(Params params, ProblemShape) : params_(params) {
     base_params_.ptr_A = params.ptr_A;
     base_params_.dA = params.dA;
     base_params_.ptr_B = params.ptr_B;
@@ -196,7 +213,6 @@ public:
       KTileIterator k_tile_iter, int k_tile_count, ResidueMNK residue,
       int thread_idx, int, char* smem_buf) {
     auto mma_acc = cute::make_fragment_like<ElementAccumulator>(accum);
-    cute::clear(mma_acc);
 
     // Each thread owns 2 rows x 4 cols per 16x16 accumulator atom (value i: row 8 * (i / 4), col 4 * (i % 4)
     // relative to its first element); atoms repeat every WarpOnM * 16 rows and WarpOnN * 16 cols.
@@ -255,8 +271,9 @@ private:
       FrgTensorAcc& accum, TensorA const& gA, TensorB const& gB,
       KTileIterator k_tile_iter, int k_tile_count, int thread_idx, char* smem_buf) {
     using namespace cute;
-    using SmemLayoutA = typename Base::SmemLayoutA;
-    using SmemLayoutB = typename Base::SmemLayoutB;
+    clear(accum);
+    using SmemLayoutA = typename MixedInputBase::SmemLayoutA;
+    using SmemLayoutB = typename MixedInputBase::SmemLayoutB;
     constexpr int kStages = Stages;
 
     int warp_idx = cutlass::canonical_warp_idx_sync();
@@ -292,21 +309,24 @@ private:
     Tensor tCrA = thr_mma.partition_fragment_A(sA(_, _, 0));      // (MMA,MMA_M,MMA_K)
     Tensor tCrB_mma = thr_mma.partition_fragment_B(sB(_, _, 0));  // (MMA,MMA_N,MMA_K)
 
-    // Packed INT4 B is loaded from smem with the INT8 MMA fragment layout, then converted in registers.
-    using TiledMmaS8 = TiledMMA<MMA_Atom<PPU0010_16x16x32_S32S8S8S32_TN>,
-                                Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,
-                                Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _32>>;
-    TiledMmaS8 tiled_mma_s8;
-    auto thr_mma_s8 = tiled_mma_s8.get_thread_slice(thread_idx);
+    // Recasting packed INT4 smem as int8 halves its logical K extent, so the load partition uses a
+    // K32 value tile for the same physical K64 data covered by the compute TiledMma. This helper only
+    // defines the register/load layout; all MMA computation still uses the template TiledMma.
+    static_assert(size<2>(typename TiledMma::AtomShape_MNK{}) == 32, "A8W4 requires a K32 MMA atom");
+    using LoadTiledMma = TiledMMA<typename TiledMma::Atom,
+                                  Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,
+                                  Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _32>>;
+    LoadTiledMma load_tiled_mma;
+    auto load_thr_mma = load_tiled_mma.get_thread_slice(thread_idx);
 
-    auto smem_tiled_copy_A = make_tiled_copy_A(typename Base::SmemCopyAtomA{}, tiled_mma);
+    auto smem_tiled_copy_A = make_tiled_copy_A(typename MixedInputBase::SmemCopyAtomA{}, tiled_mma);
     auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(warp_idx * 32);
     Tensor tCsA = smem_thr_copy_A.partition_S(make_mix_tensor_like(sA));  // (CPY,CPY_M,CPY_K,PIPE)
     Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);                // (CPY,CPY_M,CPY_K)
 
     auto sB_s8 = recast<int8_t>(sB);
-    Tensor tCrB_load = thr_mma_s8.partition_fragment_B(sB_s8(_, _, 0));
-    auto smem_tiled_copy_B = make_tiled_copy_B(typename Base::SmemCopyAtomB{}, tiled_mma_s8);
+    Tensor tCrB_load = load_thr_mma.partition_fragment_B(sB_s8(_, _, 0));
+    auto smem_tiled_copy_B = make_tiled_copy_B(typename MixedInputBase::SmemCopyAtomB{}, load_tiled_mma);
     auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(warp_idx * 32);
     Tensor tCsB = smem_thr_copy_B.partition_S(make_mix_tensor_like(sB_s8));  // (CPY,CPY_N,CPY_K,PIPE)
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB_load);             // (CPY,CPY_N,CPY_K)
@@ -358,7 +378,8 @@ private:
         CUTLASS_PRAGMA_UNROLL
         for (int k_atom = 0; k_atom < K_ATOM_PER_COPY; ++k_atom) {
           const int atom_idx = k_block * K_ATOM_PER_COPY + k_atom;
-          cute::gemm(tiled_mma, tCrA(_, _, atom_idx), tCrB_mma(_, _, atom_idx), accum);
+          cute::gemm(tiled_mma, accum,
+                     tCrA(_, _, atom_idx), tCrB_mma(_, _, atom_idx), accum);
         }
       }
     }
@@ -377,4 +398,4 @@ public:
   static size_t get_workspace_size(ProblemShape const&, Arguments const&) { return 0; }
 };
 
-} // namespace deep_gemm
+} // namespace cutlass::gemm::collective

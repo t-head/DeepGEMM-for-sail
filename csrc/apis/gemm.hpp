@@ -492,15 +492,18 @@ static void check_a8w4_int8_common(const torch::Tensor& lhs, const torch::Tensor
     TORCH_CHECK(lhs.dim() == 2 || lhs.dim() == 3, "A8W4 lhs must be 2D or 3D");
     TORCH_CHECK(rhs.dim() == 3, "A8W4 rhs must be 3D");
     TORCH_CHECK(out.dim() == lhs.dim(), "A8W4 output rank must match lhs rank");
-    TORCH_CHECK(!is_ppu1v5_device(), "A8W4 INT8 is only supported on PPU0010");
+    TORCH_CHECK(is_ppu1v0_device(), "A8W4 INT8 is only supported on PPU0010");
     TORCH_CHECK(get_extra_info()["use_actlize_v100"],
                 "A8W4 INT8 requires DG_USE_ACTLIZE_V100=1");
-    TORCH_CHECK(k % 64 == 0, "A8W4 INT8 requires K to be a multiple of 64");
+    // The weight permutation and the PPU0010 INT8 MMA operate on 32-element K groups. The
+    // mainloop K tile is 64, but AIU padz safely zero-fills its second K32 atom on the tail tile.
+    TORCH_CHECK(k % 32 == 0, "A8W4 INT8 requires K to be a multiple of 32");
     // The PPU0010 TSM epilogue stores eight BF16 values (16 bytes) per R2G vector and predicates
     // only the vector origin, so an N tail inside that vector would overwrite the next output row.
     TORCH_CHECK(n % 8 == 0, "A8W4 INT8 requires N to be a multiple of 8");
     TORCH_CHECK(lhs.scalar_type() == torch::kInt8, "A8W4 lhs must be int8");
-    TORCH_CHECK(rhs.scalar_type() == torch::kInt8, "A8W4 packed rhs must use torch.int8 storage");
+    TORCH_CHECK(rhs.scalar_type() == torch::kUInt8,
+                "A8W4 packed rhs must use torch.uint8 storage (see deep_gemm.pack_a8w4_weight)");
     TORCH_CHECK(lhs_scales.scalar_type() == torch::kFloat32, "A8W4 lhs scales must be float32");
     TORCH_CHECK(rhs_scales.scalar_type() == torch::kFloat32, "A8W4 rhs scales must be float32");
     TORCH_CHECK(out.scalar_type() == torch::kBFloat16, "A8W4 output must be bfloat16");
@@ -1676,7 +1679,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,
           py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
-    // A8W4 INT8 MoE GEMMs. Build packed rhs with deep_gemm.preprocess_a8w4_weight.
+    // A8W4 INT8 MoE GEMMs. Build packed rhs with deep_gemm.pack_a8w4_weight + deep_gemm.preprocess_a8w4_weight.
     m.def("m_grouped_gemm_int8_int4_bf16_nt_contiguous", &m_grouped_gemm_int8_int4_bf16_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"), py::arg("configs") = std::nullopt);
     m.def("m_grouped_gemm_int8_int4_bf16_nt_masked", &m_grouped_gemm_int8_int4_bf16_nt_masked,

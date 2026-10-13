@@ -4,6 +4,7 @@
 
 #include <variant>
 
+#include "../jit_kernels/heuristics/common_a8w4.hpp"
 #include "../jit_kernels/heuristics/common_fp4.hpp"
 #include "../utils/layout.hpp"
 #include "../utils/utils.hpp"
@@ -41,6 +42,14 @@ static void register_apis(pybind11::module_& m) {
     m.def("preprocess_mxfp4_weight_for_act_and_quant_fusing",
           &deep_gemm_fp4_common::preprocess_mxfp4_weight_for_act_and_quant_fusing,
           py::arg("weight"), py::arg("weight_scale"));
+
+    // A8W4 AUXILIARY KERNELs
+    m.def("pack_a8w4_weight",
+          &deep_gemm_a8w4_common::pack_a8w4_weight,
+          py::arg("weight"));
+    m.def("preprocess_a8w4_weight",
+          &deep_gemm_a8w4_common::preprocess_a8w4_weight,
+          py::arg("weight"));
     
     m.def("get_tma_aligned_size", &get_tma_aligned_size);
     m.def("get_mk_alignment_for_contiguous_layout", &get_mk_alignment_for_contiguous_layout);

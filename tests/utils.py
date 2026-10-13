@@ -607,19 +607,6 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
         return m, x.to('cuda'), y.to('cuda'), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.int8:
         x_int8 = per_token_cast_to_int8(x)
-        if quant_type == 'a8w4':
-            y_packed, y_scale, y_int4 = per_channel_cast_to_packed_int4(y)
-            if _acc_check:
-                start = 0
-                for i, group_m in enumerate(group_ms):
-                    actual_end = start + group_m
-                    aligned_end = start + ceil_div(group_m, alignment) * alignment
-                    accum = x_int8[0][start:actual_end].float() @ y_int4[i].float().t()
-                    ref_out[start:actual_end] = accum * x_int8[1][start:actual_end].float() * y_scale[i].t().float()
-                    ref_out[actual_end:aligned_end].zero_()
-                    start = aligned_end
-            return m, (x_int8[0].to('cuda'), x_int8[1].to('cuda')), \
-                (y_packed.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
         y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device=tensor_device, dtype=torch.float))
         for i in range(num_groups):
             y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
@@ -688,6 +675,21 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
         return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
         return m, x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    elif d == 'w4a8_int8':
+        assert quant_type == 'channel', "W4A8 INT8 only supports per-channel weight scales"
+        x_int8 = per_token_cast_to_int8(x)
+        y_packed, y_scale, y_int4 = per_channel_cast_to_packed_int4(y)
+        if _acc_check:
+            start = 0
+            for i, group_m in enumerate(group_ms):
+                actual_end = start + group_m
+                aligned_end = start + ceil_div(group_m, alignment) * alignment
+                accum = x_int8[0][start:actual_end].float() @ y_int4[i].float().t()
+                ref_out[start:actual_end] = accum * x_int8[1][start:actual_end].float() * y_scale[i].t().float()
+                ref_out[actual_end:aligned_end].zero_()
+                start = aligned_end
+        return m, (x_int8[0].to('cuda'), x_int8[1].to('cuda')), \
+            (y_packed.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
@@ -723,14 +725,6 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
         x_int8 = (torch.empty_like(x, dtype=torch.int8), torch.empty((num_groups, max_m, 1), device=tensor_device, dtype=torch.float))
         for i in range(num_groups):
             x_int8[0][i], x_int8[1][i] = per_token_cast_to_int8(x[i])
-        if quant_type == 'a8w4':
-            y_packed, y_scale, y_int4 = per_channel_cast_to_packed_int4(y)
-            if _acc_check:
-                accum = torch.einsum('gmk,gnk->gmn', x_int8[0].float(), y_int4.float())
-                ref_out = (accum * x_int8[1].float() * y_scale.transpose(1, 2).float()).to(torch.bfloat16)
-            return (x_int8[0].to('cuda'), x_int8[1].to('cuda')), \
-                (y_packed.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), \
-                out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
         y_int8 = (torch.empty_like(y, dtype=torch.int8), torch.empty((num_groups, n, 1), device=tensor_device, dtype=torch.float))
         for i in range(num_groups):
             y_int8[0][i], y_int8[1][i] = per_token_cast_to_int8(y[i])
@@ -806,6 +800,18 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda').to(torch.bfloat16), signal.to('cuda'), max_m
     elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
+    elif d == 'w4a8_int8':
+        assert quant_type == 'channel', "W4A8 INT8 only supports per-channel weight scales"
+        x_int8 = (torch.empty_like(x, dtype=torch.int8), torch.empty((num_groups, max_m, 1), device=tensor_device, dtype=torch.float))
+        for i in range(num_groups):
+            x_int8[0][i], x_int8[1][i] = per_token_cast_to_int8(x[i])
+        y_packed, y_scale, y_int4 = per_channel_cast_to_packed_int4(y)
+        if _acc_check:
+            accum = torch.einsum('gmk,gnk->gmn', x_int8[0].float(), y_int4.float())
+            ref_out = (accum * x_int8[1].float() * y_scale.transpose(1, 2).float()).to(torch.bfloat16)
+        return (x_int8[0].to('cuda'), x_int8[1].to('cuda')), \
+            (y_packed.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), \
+            out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     else:
         print("ERROR: Unsupported dtype, please check!")
         exit(1)
@@ -1090,7 +1096,7 @@ def parse_deepgemm_string_re(s):
     supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size", "logits_dtype", "weights_dtype", "c4_compressed", "epilogue_type", "swiglu_limit", "sparse_block_kv", "num_max_sparse_blocks", "use_unaligned_ks"]
     supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", ]
     supported_indexer_epilogue_type = ["fp32", "bf16"]
-    supported_quant_type = ["non_quantized", "block", "channel", "group", "a8w4"]
+    supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
     dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm),(.+)"
     pattern = re.compile(dg_params)
@@ -1138,7 +1144,8 @@ def parse_deepgemm_string_re(s):
             'w4a16': 'group',
             'w4fa16': 'group',
             'w4fa16_s16': 'group',
-            'w4fa16_mma': 'group'
+            'w4fa16_mma': 'group',
+            'w4a8_int8': 'channel'
         }
         result["quant_type"] = quant_type_defaults.get(result["data_type"], 'block')
     return result
@@ -1194,7 +1201,7 @@ def convert_data_type_to_dtype(data_type):
         return torch.uint8
     elif data_type in ["fp8", "torch.float8_e4m3fn"]:
         return torch.float8_e4m3fn
-    elif data_type in ["w4a16", "w4fa16", "w4fa16_s16", "w4fa16_mma"]:
+    elif data_type in ["w4a16", "w4fa16", "w4fa16_s16", "w4fa16_mma", "w4a8_int8"]:
         return data_type
     else:
         print(f"ERROR: Unsupported dtype: {data_type}, please check!")
@@ -1290,10 +1297,9 @@ def test_m_grouped_gemm_contiguous(args) -> None:
         if d == torch.bfloat16:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
         elif d == torch.int8:
-            if quant_type == 'a8w4':
-                deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_contiguous(x, y, out, m_indices)
-            else:
-                deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
+            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
+        elif d == 'w4a8_int8':
+            deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_contiguous(x, y, out, m_indices)
         else:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices)
     else:
@@ -1328,12 +1334,11 @@ def test_m_grouped_gemm_contiguous(args) -> None:
             if d == torch.bfloat16:
                 deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
             elif d == torch.int8:
-                if quant_type == 'a8w4':
-                    deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_contiguous(x, y, out, m_indices)
-                else:
-                    deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
+                deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
             elif d == torch.float8_e4m3fn:
                 deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices)
+            elif d == 'w4a8_int8':
+                deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_contiguous(x, y, out, m_indices)
             else:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)
@@ -1377,14 +1382,9 @@ def test_m_grouped_gemm_masked(args) -> None:
             result = deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
                                                                       enable_sbo_overlap=enable_sbo_overlap, signal=signal)
         elif d == torch.int8:
-            if quant_type == 'a8w4':
-                assert not enable_sbo_overlap, "A8W4 INT8 does not support SBO overlap"
-                result = deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_masked(
-                    x, y, out, masked_m, expected_m_per_group)
-            else:
-                result = deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
-                    x, y, out, masked_m, expected_m_per_group,
-                    enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+            result = deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
+                x, y, out, masked_m, expected_m_per_group,
+                enable_sbo_overlap=enable_sbo_overlap, signal=signal)
         elif d == torch.float8_e4m3fn:
             result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal)
@@ -1401,6 +1401,10 @@ def test_m_grouped_gemm_masked(args) -> None:
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
             deep_gemm.m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group, fp4_use_bf16_scale=(d == 'w4fa16_s16'))
+        elif d == 'w4a8_int8':
+            assert not enable_sbo_overlap, "W4A8 INT8 does not support SBO overlap"
+            result = deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_masked(
+                x, y, out, masked_m, expected_m_per_group)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
@@ -1449,19 +1453,18 @@ def test_m_grouped_gemm_masked(args) -> None:
                 result = deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
                                                                         enable_sbo_overlap=enable_sbo_overlap, signal=signal)
             elif d == torch.int8:
-                if quant_type == 'a8w4':
-                    result = deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_masked(
-                        x, y, out, masked_m, expected_m_per_group)
-                else:
-                    result = deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
-                        x, y, out, masked_m, expected_m_per_group,
-                        enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+                result = deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
+                    x, y, out, masked_m, expected_m_per_group,
+                    enable_sbo_overlap=enable_sbo_overlap, signal=signal)
             elif d == torch.float8_e4m3fn:
                 result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
                                                                         enable_sbo_overlap=enable_sbo_overlap, signal=signal)
             elif d == torch.uint8:
                 result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
                                                                         enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+            elif d == 'w4a8_int8':
+                result = deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_masked(
+                    x, y, out, masked_m, expected_m_per_group)
             else:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)
@@ -1549,10 +1552,7 @@ def test_m_grouped_gemm_nopad(args) -> None:
         if d == torch.bfloat16:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
         elif d == torch.int8:
-            if quant_type == 'a8w4':
-                deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_nopad(x, y, out, m_indices)
-            else:
-                deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
+            deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
         elif d == torch.float8_e4m3fn:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
         elif d == torch.uint8:
@@ -1564,6 +1564,8 @@ def test_m_grouped_gemm_nopad(args) -> None:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
             deep_gemm.m_grouped_gemm_w4a16_nopad(x, y, out, m_indices, fp4_use_bf16_scale=(d == 'w4fa16_s16'))
+        elif d == 'w4a8_int8':
+            deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_nopad(x, y, out, m_indices)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
@@ -1596,14 +1598,13 @@ def test_m_grouped_gemm_nopad(args) -> None:
             if d == torch.bfloat16:
                 deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)
             elif d == torch.int8:
-                if quant_type == 'a8w4':
-                    deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_nopad(x, y, out, m_indices)
-                else:
-                    deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
+                deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(x, y, out, m_indices)
             elif d == torch.float8_e4m3fn:
                 deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
             elif d == torch.uint8:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
+            elif d == 'w4a8_int8':
+                deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_nopad(x, y, out, m_indices)
             else:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)
