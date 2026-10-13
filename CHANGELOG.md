@@ -64,13 +64,13 @@ This is the first formal public release of DeepGEMM for PPU. The version identif
 
 ### Platform Support
 
-- Supports ZW 610 / 610E / 810 / 810E / M890 platforms.
+- Supports Zhenwu 610 / 610E / 810 / 810E / M890 platforms.
 
 ### Kernels and Operators
 
 - Provides BF16, INT8, and FP8 dense NT GEMMs, plus grouped NT GEMMs in contiguous, masked, and no-pad layouts.
 - Provides MXFP4 dense, grouped masked, and grouped no-pad NT GEMMs.
-- Provides W4A16 grouped masked, no-pad, and fused MoE kernels, using MXFP4 weights on M890 and INT4 weights on ZW 610 / 610E / 810 / 810E.
+- Provides W4A16 grouped masked, no-pad, and fused MoE kernels, using MXFP4 weights on M890 and INT4 weights on Zhenwu 610 / 610E / 810 / 810E.
 - Provides implicit-permute fused MoE GEMMs for BF16, INT8, FP8, MXFP4, and W4A16 workloads, with `moe_align_block_size` generating routing and scheduling metadata.
 - Adds optional fused `silu_and_mul` plus MXFP4 post-quantization epilogues for FP4 MoE GEMM1 paths.
 - Provides non-paged and paged MQA-logits operators for BF16, INT8, FP8, and FP4 inputs.
