@@ -470,8 +470,9 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
     } else {
+        const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         cfg = deep_gemm_int8::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked, max_block_n);
+            expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked, max_block_n, lut_kind);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -928,8 +929,9 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
     } else {
+        const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         cfg = deep_gemm_int8::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::GroupedNoPad);
+            expected_m, n, k, num_groups, num_sms, GemmType::GroupedNoPad, 256, lut_kind);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;

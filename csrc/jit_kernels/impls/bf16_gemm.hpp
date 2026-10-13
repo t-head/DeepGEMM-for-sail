@@ -980,9 +980,6 @@ using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int
 static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out, const int& m,
                       const int& n, const int& k, std::optional<ConfigTuple> configs = std::nullopt) {
     int num_sms = get_num_sms();
-    hggcDeviceProp device_props;
-    hggcGetDeviceProperties(&device_props, 0);
-    std::vector<int> shape = {m, n, k};
     static constexpr GemmType kGemmType = GemmType::DenseGemm;
 
     using Config = std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>;
@@ -996,28 +993,16 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, /*warp_k=*/bk, nst,
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
     } else {
-        bool shape_large_aligned = true;
-        for (int64_t a : shape) {
-            if (!(a >= 4096 && (a % 64 == 0))) {
-                shape_large_aligned = false;
-                break;
-            }
+        bool from_runtime_lut = false;
+        auto best = deep_gemm_bf16_common::get_best_configs(
+            m, n, k, 1, num_sms, kGemmType, 256, &from_runtime_lut);
+        auto [ns, bm, bn, bk, wm, wn, nst, sc] = best;
+        int warp_k = bk;
+        if (!from_runtime_lut && is_ppu1v5_device() &&
+            deep_gemm_adaptive::bf16_adaptive_enabled(m, n, k)) {
+            warp_k = std::get<6>(deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms));
         }
-
-        std::string dev_name(device_props.name);
-        bool is_ppu0010_device = (dev_name.find("ZW810E") != std::string::npos) || (dev_name.find("ZW810") != std::string::npos);
-
-        if (shape_large_aligned && is_ppu0010_device) {
-            cfg = get_gemm_best_configs_v2(shape, 2, num_sms);
-        } else {
-            auto [ns, bm, bn, bk, wm, wn, nst, sc] = deep_gemm_bf16_common::get_best_configs(m, n, k, 1, num_sms);
-            int warp_k = bk;  // default: WarpOnK=1 (non-adaptive)
-            if (is_ppu1v5_device() && deep_gemm_adaptive::bf16_adaptive_enabled(m, n, k)) {
-                auto adaptive_cfg = deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms);
-                warp_k = std::get<6>(adaptive_cfg);
-            }
-            cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, warp_k, nst, sc);
-        }
+        cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, warp_k, nst, sc);
     }
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages, smem_config] = cfg;
     auto extra_info = get_extra_info();

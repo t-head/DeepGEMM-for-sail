@@ -4,6 +4,7 @@
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
 #include "gemm_fp8_lut.hpp"
+#include "runtime_lut.hpp"
 
 using namespace deep_gemm;
 namespace deep_gemm_fp8_common {
@@ -232,16 +233,24 @@ ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num
     return result;
 }
 
+static ConfigResult make_config_result(int num_sms, int k, int block_m, int block_n, int block_k,
+                                       int warp_m, int warp_n, int stages) {
+    auto smem_config = get_smem_config(stages, k, block_m, block_n, block_k);
+    return std::make_tuple(num_sms, block_m, block_n, block_k,
+                           warp_m, warp_n, stages, smem_config);
+}
+
 static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
                                      GemmType gemm_type = GemmType::DenseGemm, int max_block_n = 256) {
-    auto lut_result = deep_gemm_fp8_lut::get_best_configs_from_lut(m, n, k, num_groups, gemm_type);
-    if (lut_result.has_value()) {
-        int best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages;
-        std::tie(best_block_m, best_block_n, best_block_k,
-                 best_warp_m, best_warp_n, best_stages) = lut_result.value();
-        auto best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k);
-        return std::make_tuple(num_sms, best_block_m, best_block_n, best_block_k,
-                               best_warp_m, best_warp_n, best_stages, best_smem_config);
+    const auto runtime_tile = deep_gemm_lut::get_runtime_config(
+        m, n, k, num_groups, gemm_type, deep_gemm_lut::RuntimeLutKind::FP8Blockwise);
+    const auto tile = runtime_tile
+        ? runtime_tile
+        : deep_gemm_fp8_lut::get_best_configs_from_lut(m, n, k, num_groups, gemm_type);
+    if (tile) {
+        auto [best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages] = *tile;
+        return make_config_result(num_sms, k, best_block_m, best_block_n, best_block_k,
+                                  best_warp_m, best_warp_n, best_stages);
     }
 
     if (gemm_type == GemmType::DenseGemm || gemm_type == GemmType::BatchGemm) {

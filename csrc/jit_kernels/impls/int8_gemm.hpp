@@ -803,10 +803,14 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
     } else {
         // Heuristic path: get_best_configs now returns the baseline 8-tuple; adaptive warp_k/dense_s2_opt
         // injection is done here (dense-only), mirroring deep_gemm/jit_kernels/gemm.py.
-        auto [ns, bm, bn, bk, wm, wn, nst, sc] = deep_gemm_int8::get_best_configs(m, n, k, 1, num_sms);
+        const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
+        bool from_runtime_lut = false;
+        auto [ns, bm, bn, bk, wm, wn, nst, sc] = deep_gemm_int8::get_best_configs(
+            m, n, k, 1, num_sms, GemmType::DenseGemm, 256, lut_kind, &from_runtime_lut);
         int warp_k = bk;  // default: WarpOnK=1
         bool dense_s2_opt = false;
-        if (is_ppu1v5_device() && deep_gemm_adaptive::int8_adaptive_enabled(m, n, k)) {
+        if (!from_runtime_lut && is_ppu1v5_device() &&
+            deep_gemm_adaptive::int8_adaptive_enabled(m, n, k)) {
             dense_s2_opt = true;
             // warp_k remains = block_k (WarpOnK=1 for INT8; adaptive warp_k TODO)
         }

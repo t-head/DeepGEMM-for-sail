@@ -5,6 +5,7 @@
 #include "../../utils/utils.hpp"
 #include "gemm_search_space.hpp"
 #include "adaptive_tile_selector.hpp"
+#include "runtime_lut.hpp"
 #include <deep_gemm/common/utils_rtc.cuh>
 
 using namespace deep_gemm;
@@ -218,6 +219,9 @@ bool dense_gemv_select_configs(int m, int n, int k, const void* w, const void* x
 // (bf16_gemm.hpp), so MoE grouped callers unpack this tuple directly without narrowing.
 using ConfigResult = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 
+std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>
+get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms);
+
 // Adaptive tile selection for DenseGemm (BF16). warp_k/dense_s2_opt are injected in the dense
 // impl; here we only apply the adaptive tile choice and return the 8-tuple.
 ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms) {
@@ -229,7 +233,26 @@ ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms) {
 }
 
 ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
-                              GemmType gemm_type = GemmType::DenseGemm, int max_block_n = 256) {
+                              GemmType gemm_type = GemmType::DenseGemm, int max_block_n = 256,
+                              bool* from_runtime_lut = nullptr) {
+    if (from_runtime_lut) *from_runtime_lut = false;
+    if (auto tile = deep_gemm_lut::get_runtime_config(
+            m, n, k, num_groups, gemm_type, deep_gemm_lut::RuntimeLutKind::BF16)) {
+        auto [bm, bn, bk, wm, wn, stages] = *tile;
+        if (from_runtime_lut) *from_runtime_lut = true;
+        return ConfigResult{num_sms, bm, bn, bk, wm, wn, stages,
+                            get_smem_config(stages, k, bm, bn, bk, 2)};
+    }
+    if (gemm_type == GemmType::DenseGemm && m >= 4096 && n >= 4096 && k >= 4096 &&
+        m % 64 == 0 && n % 64 == 0 && k % 64 == 0) {
+        const std::string device_name(device_runtime->get_prop()->name);
+        if (device_name.find("ZW810") != std::string::npos) {
+            auto [ns, bm, bn, bk, wm, wn, wk, stages, smem] =
+                get_gemm_best_configs_v2({m, n, k}, 2, num_sms);
+            (void)wk;
+            return ConfigResult{ns, bm, bn, bk, wm, wn, stages, smem};
+        }
+    }
     // Adaptive tile selection for DenseGemm (BF16). warp_k/dense_s2_opt are injected in the dense
     // impl; here we only apply the adaptive tile choice and return the 8-tuple.
     if (gemm_type == GemmType::DenseGemm && is_ppu1v5_device() &&
@@ -453,8 +476,8 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         warp_n = best_block_n / 4;
     }
 
-    return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n,
-                           best_num_stages, best_smem_config);
+    return ConfigResult{std::min(num_min_sms, num_sms), best_block_m, best_block_n,
+                        block_k, warp_m, warp_n, best_num_stages, best_smem_config};
 }
 
 // Pre-configured optimal tiling greater than or equal to 4096

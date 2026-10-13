@@ -11,6 +11,7 @@
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
+#include "runtime_lut.hpp"
 #include <deep_gemm/common/utils_rtc.cuh>
 using namespace deep_gemm;
 namespace deep_gemm_fp4_common {
@@ -412,6 +413,17 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     // C++ layer does not perform device checking; is_ppu1v5_device() assert skipped
     (void)total_m;
 
+    if (auto tile = deep_gemm_lut::get_runtime_config(
+            m, n, k * 2, num_groups, gemm_type, deep_gemm_lut::RuntimeLutKind::FP4)) {
+        // The FP4 input is packed two elements per byte; LUT keys use logical K.
+        auto [bm, bn, bk, wm, wn, stages] = *tile;
+        // The fused epilogue requires block_n to be a positive multiple of 64.
+        if (!enable_act_and_quant_fusing || (bn >= 64 && bn % 64 == 0)) {
+            return {num_sms, bm, bn, bk, wm, wn, stages,
+                    get_smem_config_fp4(stages, bm, bn, wm, wn, bk, n,
+                                        has_bias, enable_act_and_quant_fusing)};
+        }
+    }
     if (gemm_type == GemmType::DenseGemm) {
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing);
     }

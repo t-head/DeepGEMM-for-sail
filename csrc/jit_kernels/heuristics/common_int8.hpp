@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <tuple>
 #include <algorithm>
 #include <unordered_map>
@@ -8,10 +9,17 @@
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
 #include "gemm_int8_lut.hpp"
+#include "runtime_lut.hpp"
 #include "adaptive_tile_selector.hpp"
 #include <deep_gemm/common/utils_rtc.cuh>
 using namespace deep_gemm;
 namespace deep_gemm_int8 {
+
+inline deep_gemm_lut::RuntimeLutKind get_a8w8_lut_kind(at::ScalarType dtype) {
+    return dtype == at::ScalarType::Float8_e4m3fn
+        ? deep_gemm_lut::RuntimeLutKind::FP8Channelwise
+        : deep_gemm_lut::RuntimeLutKind::INT8;
+}
 
 std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, int block_n, int block_k = 128,
                                           int bpp = 1) {
@@ -598,9 +606,19 @@ get_adaptive_configs_int8(int m, int n, int k, int num_sms) {
 
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_best_configs(int m, int n, int k, int num_groups, int num_sms,
-                 GemmType gemm_type = GemmType::DenseGemm, int max_block_n = 256) {
-    auto lut_result = deep_gemm_int8_lut::get_best_configs_from_lut(m, n, k);
-    if (num_groups == 1 && lut_result.has_value()) {
+                 GemmType gemm_type = GemmType::DenseGemm, int max_block_n = 256,
+                 std::optional<deep_gemm_lut::RuntimeLutKind> runtime_lut_kind = std::nullopt,
+                 bool* from_runtime_lut = nullptr) {
+    if (from_runtime_lut) *from_runtime_lut = false;
+    std::optional<deep_gemm_int8_lut::Tile> lut_result;
+    if (runtime_lut_kind.has_value()) {
+        lut_result = deep_gemm_lut::get_runtime_config(m, n, k, num_groups, gemm_type, *runtime_lut_kind);
+        if (from_runtime_lut) *from_runtime_lut = lut_result.has_value();
+    }
+    if (!lut_result.has_value()) {
+        lut_result = deep_gemm_int8_lut::get_best_configs_from_lut(m, n, k, gemm_type);
+    }
+    if (lut_result.has_value()) {
         int best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages;
         std::tie(best_block_m, best_block_n, best_block_k,
                  best_warp_m, best_warp_n, best_stages) = lut_result.value();
