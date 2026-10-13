@@ -11,7 +11,7 @@ enum class GemmType {
     BatchGemm,
 };
 
-const char* GemmTypeS[] = { "DenseGemm", "GroupedContiguous", "GroupedMasked", "GroupedNoPad", "GroupedFused", "BatchGemm"};
+inline constexpr const char* GemmTypeS[] = { "DenseGemm", "GroupedContiguous", "GroupedMasked", "GroupedNoPad", "GroupedFused", "BatchGemm"};
 
 enum class FP4DynamicTileId : int {
     Disabled  = -1,
@@ -29,6 +29,6 @@ enum class KernelType {
     OverlapMainloop
 };
 
-const char* KernelTypeS[] = { "Default", "MultistageOnN", "MoeDynamicTile", "OverlapPrologue", "OverlapMainloop"};
+inline constexpr const char* KernelTypeS[] = { "Default", "MultistageOnN", "MoeDynamicTile", "OverlapPrologue", "OverlapMainloop"};
 
 } // namespace deep_gemm

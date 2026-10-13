@@ -13,7 +13,7 @@ enum class EpilogueType {
     SiluAndMulPostQuantFp4,
 };
 
-const char* EpilogueTypeS[] = { "Default", "SiluAndMulPostQuantFp4"};
+inline constexpr const char* EpilogueTypeS[] = { "Default", "SiluAndMulPostQuantFp4"};
 
 template <EpilogueType T>
 struct EpilogueTraits {
