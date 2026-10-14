@@ -197,6 +197,68 @@ E/N/K alignment from the raw `[E,N,K/32]` scales. Supplying a weight tensor
 preserves the existing return format; W4A8 also checks its shape against the scales. Fusion and other
 weight modes still require weights; all supported modes require scales.
 
+#### Standalone SiLU / SiTU activation (M890)
+
+The activation interfaces are `silu_and_mul(mode, input, *, ...)` and
+`situ_and_mul(mode, input, *, beta, linear_beta=None, ...)`. The first
+`mode` argument is **required** and must be an `ActivationQuantMode`;
+omitting it, passing None, or using the old `quant=` keyword is unsupported.
+Input is contiguous BF16 `[...,2*N]` in concatenated `[gate,up]` order.
+
+| Mode | Output | Scales / constraints |
+| :--- | :--- | :--- |
+| `BF16` | BF16 tensor | No scale; any positive N |
+| `FP8_CHANNEL` | E4M3 tensor | FP32 per-row `[...,1]` |
+| `FP8_BLOCK` | E4M3 tensor | FP32 group-128 `[...,N/128]`; N%128=0 |
+| `MXFP4` | Packed E2M1 uint8 `[...,N/2]` | Group-32 E8M0; even N |
+| `MXFP8` | E4M3 tensor | Natural uint8 group-32 E8M0 `[...,ceil(N/32)]` |
+
+BF16 mode returns one tensor; all quantized modes return `(values, scales)`.
+MXFP4 defaults to `reorder_scale=True`, producing uint16 M-major scales
+with logical `[M,ceil(N/64)]` or `[E,T,ceil(N/64)]` shape; this view may be
+non-contiguous and should be passed directly to the matching GEMM.
+The default reordered MXFP4 mode requires rank-2 or rank-3 input.
+`reorder_scale=False` instead returns natural uint8
+`[...,ceil(N/32)]` scales. This option is only accepted for MXFP4.
+FP8-block dense scales are contiguous; masked scales use an M-major
+`[E,T,N/128]` view backed by `[E,N/128,align(T,4)]` storage, with invalid
+and padding scale rows zeroed.
+
+```python
+import deep_gemm as dg
+
+M = dg.ActivationQuantMode
+bf16 = dg.silu_and_mul(M.BF16, gate_up)
+fp8, block_scale = dg.silu_and_mul(M.FP8_BLOCK, gate_up, swiglu_limit=2.1)
+# SiTU with gate/up softcaps; down_inv is the GEMM2 weight_inv_scale.
+q, row_scale = dg.situ_and_mul(
+    M.FP8_CHANNEL, gate_up, beta=4.0, linear_beta=25.0,
+    weight_inv_scale=down_inv)
+# row_scale already includes down_inv and is passed directly to W4A8 GEMM2.
+```
+
+For masked inputs use BF16 `[E,T,2*N]` and contiguous device int32
+`masked_m` of shape `[E]`. Both APIs accept `masked_m=masked_m` and an
+optional `expected_m` hint. The hint only chooses the number of row slots;
+the device loops over all valid rows, including when the hint is smaller
+than the actual count. Output values are written only in valid rows.
+
+SiLU computes `gate * sigmoid(gate) * up`. Optional positive
+`swiglu_limit` clamps gate from above and up on both sides. Clamp boundaries
+round to BF16; activation, multiplication, amax, scale computation and
+normalization use FP32 with native PPU sigmoid. SiTU uses
+`beta*tanh(gate/beta)*sigmoid(gate)` for the gate and optionally
+`linear_beta*tanh(up/linear_beta)` for up; beta and a supplied linear_beta
+must be positive finite values.
+
+`weight_inv_scale` is only accepted for FP8-channel and multiplies the
+returned scale, leaving the quantized codes unchanged. The kernels process
+eight consecutive elements per thread and use native packed conversions
+and vector stores. Fallback paths support partial tiles and unaligned input. MXFP4/MXFP8
+share a single-warp double-buffered load pipeline; FP8-channel retains a
+whole-row amax reduction. Run `python tests/test_activation.py` for the
+standalone correctness suite.
+
 #### MQA logits
 
 We provide Multi-Query Attention (MQA) logits kernels that compute the query-key logits used by the LLM attention indexer. Both a non-paged variant (for contiguous KV) and a paged variant (for a paged KV cache with a block table) are supported, across BF16, INT8, FP8, and FP4 precisions.

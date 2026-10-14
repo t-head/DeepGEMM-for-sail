@@ -70,13 +70,18 @@ from .deep_gemm_cpp import (
     m_grouped_gemm_fp4_fp4_bf16_nt_fused,
     # MoE kernels
     moe_align_block_size,
-    # FP4 scale / weight preprocessing
-    preprocess_mxfp4_scales,
+    # SiLU / SiTU activation with explicit output mode and optional quantization
+    ActivationQuantMode,
+    silu_and_mul,
+    situ_and_mul,
+    # Unified weight preprocessing
     preprocess_weights_and_scales,
+    # deprecated scale-only alias of preprocess_weights_and_scales(MXFP4, False)
+    preprocess_mxfp4_scales,
     # deprecated alias of preprocess_weights_and_scales(MXFP4, True)
     preprocess_mxfp4_weight_for_act_and_quant_fusing,
     PreprocessMode,
-    # W4FA8 (PPU1.5, per-row FP8 activation)
+    # W4FA8 (mxfp4 weights, per-row FP8 activation)
     m_grouped_gemm_fp8_fp4_bf16_nt_nopad,
     m_grouped_gemm_fp8_fp4_bf16_nt_masked,
     m_grouped_gemm_fp8_fp4_bf16_nt_fused,
