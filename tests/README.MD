@@ -60,3 +60,23 @@ python ./test_core.py
 test_core.py options:
   -h, --help            show this help message and exit
   --func {DenseGemm,GroupedContiguous,GroupedMasked,DenseGemm}  target test func
+
+# Experimental tuning
+
+See the [migration policy](../README.md#experimental-autotuning-and-lut-conversion).
+
+```bash
+python tests/deepgemm_autotune.py \
+  --format 'DenseGemm,data_type:int8,m:80,n:4096,k:1024' --output-dir lut
+
+python tests/tools/convert_runtime_lut.py old-tuner-results.json \
+  --output-dir lut --device-name PPU-ZW810E
+```
+
+Input is legacy tuned JSON, e.g. files in `deep_gemm/deep_gemm_tuner/configs/`;
+case lists are unsupported. Outputs are `<device-name>_<kind>_<gemm-type>.lut`.
+Use the exact device name and set `SAIL_DEEPGEMM_LUT_PATH` to the output directory.
+
+FP8 without a recipe requires `--fp8-quant-type blockwise|channelwise`.
+FP4 Masked requires `--fp4-masked-m source-m|expected-m`.
+Use `--force` to overwrite files. Conflicting tiles for one key are rejected.
