@@ -4,44 +4,19 @@
 #include <tuple>
 #include <vector>
 #include <torch/torch.h>
+#include <deep_gemm/common/utils_rtc.cuh>
 
 namespace deep_gemm_a8w4_common {
 
 // ============================================================================
-// A8W4 INT8 Weight Pack & Preprocess Utilities
+// A8W4 INT8 Device Weight Preprocess
 // ============================================================================
-// Weights are prepared in two steps, mirroring the usual quant -> pack -> layout-preprocess flow:
-//   1. `pack_a8w4_weight`: int8 values in [-8, 7] -> standard packed INT4 bytes (uint8).
-//   2. `preprocess_a8w4_weight`: reorder those bytes into the layout the A8W4 kernels expect.
+// The model stores weights in the portable packed signed-INT4 format. This device-aware transform
+// only reorders packed bytes into the layout expected by the PPU A8W4 kernels.
 
-/// Pack signed INT4 values (stored one per int8) into bytes along the last dimension.
-/// `weight` is contiguous int8 with shape [..., K] and values in [-8, 7]; the result is uint8 with shape
-/// [..., K / 2] where byte i holds k = 2 * i in the low nibble and k = 2 * i + 1 in the high nibble.
-// NOTE: uint8 is only a raw byte container; each nibble keeps its own two's-complement sign bit.
-inline torch::Tensor pack_a8w4_weight(const torch::Tensor& weight) {
-    TORCH_CHECK(weight.dtype() == torch::kInt8, "pack_a8w4_weight: weight must be int8");
-    TORCH_CHECK(weight.is_contiguous(), "pack_a8w4_weight: weight must be contiguous");
-    TORCH_CHECK(weight.dim() >= 1, "pack_a8w4_weight: weight must have at least 1 dimension");
-    const int64_t k = weight.size(-1);
-    TORCH_CHECK(k % 2 == 0, "pack_a8w4_weight: the last dimension must be even, got ", k);
-    if (weight.numel() > 0) {
-        // A single device-to-host copy of (min, max); the packing below stays on `weight`'s device
-        const auto [min_val, max_val] = weight.aminmax();
-        const auto range = torch::stack({min_val, max_val}).to(torch::kCPU);
-        const int lo = range[0].item<int>(), hi = range[1].item<int>();
-        TORCH_CHECK(lo >= -8 && hi <= 7, "pack_a8w4_weight: values must be in [-8, 7], got [", lo, ", ", hi, "]");
-    }
-
-    // Reinterpret the two's-complement bytes, so masking / shifting are plain logical bit operations
-    const auto bytes = weight.view(torch::kUInt8);
-    const auto low = bytes.slice(-1, 0, k, 2).bitwise_and(0x0F);
-    const auto high = bytes.slice(-1, 1, k, 2).__lshift__(4);
-    return low.bitwise_or(high).contiguous();
-}
-
-/// Reorder packed INT4 MoE weights into the layout of the A8W4 INT8 kernels.
-/// `weight` is the contiguous uint8 output of `pack_a8w4_weight` with shape [..., N, K / 2]; the result
-/// has the same shape and dtype.
+/// Reorder portable packed signed-INT4 MoE weights into the PPU A8W4 kernel layout.
+/// `weight` is contiguous uint8 with shape [..., N, K / 2]. Byte i stores logical k=2*i in the low
+/// nibble and k=2*i+1 in the high nibble, both in two's-complement signed-INT4 representation.
 // NOTE: the reorder is a byte gather inside every 16-byte (32-element K) group; nibbles never cross
 // bytes, so each byte keeps its (even k, odd k) pair. Output byte j takes packed byte src[j]:
 //   j      :  0  1  2  3 |  4  5  6  7 |  8  9 10 11 | 12 13 14 15
@@ -50,7 +25,7 @@ inline torch::Tensor pack_a8w4_weight(const torch::Tensor& weight) {
 // its two K32 INT8-MMA atoms without any cross-lane shuffle.
 inline torch::Tensor preprocess_a8w4_weight(const torch::Tensor& weight) {
     TORCH_CHECK(weight.dtype() == torch::kUInt8,
-                "preprocess_a8w4_weight: weight must be the uint8 output of pack_a8w4_weight");
+                "preprocess_a8w4_weight: weight must use portable packed signed-INT4 uint8 storage");
     TORCH_CHECK(weight.is_contiguous(), "preprocess_a8w4_weight: weight must be contiguous");
     TORCH_CHECK(weight.dim() >= 2, "preprocess_a8w4_weight: weight must have shape [..., N, K / 2]");
     const int64_t k_bytes = weight.size(-1);
@@ -77,6 +52,66 @@ inline std::tuple<int, int, int> get_smem_config_a8w4(int num_stages, int block_
     const int mainloop_size = num_stages * (block_m * block_k + block_n * block_k / 2);
     const int epilogue_size = block_m * block_n * static_cast<int>(sizeof(c10::BFloat16));
     return std::make_tuple(std::max(mainloop_size, epilogue_size), 128, 0);
+}
+
+// ============================================================================
+// A8W4 INT8 Heuristic Finalization
+// ============================================================================
+
+struct A8W4HeuristicConfig {
+    int block_m;
+    int block_n;
+    int block_k;
+    int warp_m;
+    int warp_n;
+    int num_stages;
+};
+
+// Run the shared INT8 search to completion first, then replace its final result only for measured
+// A8W4 workload classes. Unmatched shapes retain the complete shared-search configuration.
+inline A8W4HeuristicConfig finalize_heuristic_config(
+        int m, int n, int k, int num_groups, GemmType gemm_type,
+        int block_m, int block_n, int block_k, int warp_m, int warp_n, int num_stages) {
+    A8W4HeuristicConfig config{block_m, block_n, block_k, warp_m, warp_n, num_stages};
+
+    // Wide short-K, e.g. GLM gemm2 N=6144/K=256. Validated by TP and EP sweeps.
+    const bool is_wide_short_k =
+        gemm_type != GemmType::GroupedContiguous && n > 512 && k <= 256;
+    if (is_wide_short_k) {
+        return {32, 128, 128, 32, 32, 2};
+    }
+
+    // Large prefill: BM256/BN256 or BN512 collapses to one CTA/CU. BM128/BN256 preserves
+    // two resident CTAs on the measured PPU0010 workloads.
+    if (gemm_type != GemmType::GroupedContiguous && k >= 4096 && m > 48 &&
+        (block_m > 128 || block_n > 256)) {
+        return {128, 256, 128, 64, 64, 2};
+    }
+
+    // Long-K gemm1 transition region. Keep measured configurations explicit until broader shape
+    // coverage justifies replacing them with a cost model.
+    if (gemm_type != GemmType::GroupedContiguous && n <= 512 && k >= 4096) {
+        if (m <= 16) {
+            return {16, 64, 256, 16, 16, 2};
+        }
+        if (m <= 48) {
+            return {64, 128, 128, 32, 32, 3};
+        }
+    }
+
+    // Preserve the original packed-B BM16 small-N normalization for unmatched A8W4 shapes.
+    if (config.block_m == 16 && n <= 512) {
+        config.block_n = 64;
+        config.warp_m = 16;
+        config.warp_n = 16;
+    }
+
+    const int m_per_group = gemm_type == GemmType::GroupedContiguous
+        ? (m + num_groups - 1) / num_groups : m;
+    if (m_per_group < 6 && (config.block_m == 16 || config.block_m == 32)) {
+        config.num_stages = 2;
+    }
+    return config;
 }
 
 // ============================================================================

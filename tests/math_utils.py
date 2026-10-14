@@ -24,15 +24,29 @@ from deep_gemm.testing.numeric import calc_diff, count_bytes
 round_up = align
 
 
+def pack_standard_int4_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Pack signed INT4 values into the portable uint8 model-storage format."""
+    assert weight.dtype == torch.int8 and weight.is_contiguous()
+    assert weight.dim() >= 1 and weight.shape[-1] % 2 == 0
+    if weight.numel():
+        lo, hi = weight.aminmax()
+        assert int(lo) >= -8 and int(hi) <= 7
+    k = weight.shape[-1]
+    raw = weight.view(torch.uint8)
+    low = raw[..., 0:k:2].bitwise_and(0x0F)
+    high = raw[..., 1:k:2].__lshift__(4)
+    return low.bitwise_or(high).contiguous()
+
+
 def per_channel_cast_to_packed_int4(x: torch.Tensor):
-    """Quantize the last dimension to signed INT4 and pack adjacent K values."""
-    from deep_gemm import pack_a8w4_weight, preprocess_a8w4_weight
+    """Quantize, portable-pack, then apply the device-aware A8W4 permutation."""
+    from deep_gemm import preprocess_a8w4_weight
 
     assert x.dim() >= 2 and x.shape[-1] % 2 == 0
     amax = x.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
     scale = amax / 7.0
     quant = (x.float() / scale).round().clamp(-8, 7).to(torch.int8)
-    packed = preprocess_a8w4_weight(pack_a8w4_weight(quant.contiguous()))
+    packed = preprocess_a8w4_weight(pack_standard_int4_weight(quant.contiguous()))
     return packed, scale.float().contiguous(), quant
 
 

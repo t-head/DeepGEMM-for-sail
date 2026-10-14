@@ -503,7 +503,7 @@ static void check_a8w4_int8_common(const torch::Tensor& lhs, const torch::Tensor
     TORCH_CHECK(n % 8 == 0, "A8W4 INT8 requires N to be a multiple of 8");
     TORCH_CHECK(lhs.scalar_type() == torch::kInt8, "A8W4 lhs must be int8");
     TORCH_CHECK(rhs.scalar_type() == torch::kUInt8,
-                "A8W4 packed rhs must use torch.uint8 storage (see deep_gemm.pack_a8w4_weight)");
+                "A8W4 rhs must use portable packed signed-INT4 torch.uint8 storage");
     TORCH_CHECK(lhs_scales.scalar_type() == torch::kFloat32, "A8W4 lhs scales must be float32");
     TORCH_CHECK(rhs_scales.scalar_type() == torch::kFloat32, "A8W4 rhs scales must be float32");
     TORCH_CHECK(out.scalar_type() == torch::kBFloat16, "A8W4 output must be bfloat16");
@@ -1679,7 +1679,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,
           py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
-    // A8W4 INT8 MoE GEMMs. Build packed rhs with deep_gemm.pack_a8w4_weight + deep_gemm.preprocess_a8w4_weight.
+    // A8W4 INT8 MoE GEMMs. The model stores portable packed signed-INT4 rhs; call
+    // deep_gemm.preprocess_a8w4_weight after loading it to apply the device-specific permutation.
     m.def("m_grouped_gemm_int8_int4_bf16_nt_contiguous", &m_grouped_gemm_int8_int4_bf16_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"), py::arg("configs") = std::nullopt);
     m.def("m_grouped_gemm_int8_int4_bf16_nt_masked", &m_grouped_gemm_int8_int4_bf16_nt_masked,

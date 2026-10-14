@@ -263,17 +263,18 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
     ConfigTuple cfg;
     if (configs.has_value()) {
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
-        cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
-            deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
+        auto smem_config = is_a8w4
+            ? deep_gemm_a8w4_common::get_smem_config_a8w4(nst, bm, bn, bk)
+            : deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1);
+        cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst, smem_config);
     } else {
         cfg = deep_gemm_int8::get_best_configs(
-            m, n, k, num_groups, num_sms, GemmType::GroupedContiguous);
+            m, n, k, num_groups, num_sms, GemmType::GroupedContiguous,
+            /*max_block_n=*/256, /*runtime_lut_kind=*/std::nullopt,
+            /*from_runtime_lut=*/nullptr, /*is_a8w4=*/is_a8w4);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
-    if (is_a8w4) {
-        smem_config = deep_gemm_a8w4_common::get_smem_config_a8w4(num_stages, block_m, block_n, block_k);
-    }
     int expected_m = ceil_div(m, num_groups);
     auto extra_info = get_extra_info();
     auto SMSIZE = std::get<0>(smem_config);
@@ -476,18 +477,17 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
     ConfigTuple cfg;
     if (configs.has_value()) {
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
-        cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
-            deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
+        auto smem_config = is_a8w4
+            ? deep_gemm_a8w4_common::get_smem_config_a8w4(nst, bm, bn, bk)
+            : deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1);
+        cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst, smem_config);
     } else {
-        const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         cfg = deep_gemm_int8::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked, max_block_n, lut_kind);
+            expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked, max_block_n, /*runtime_lut_kind=*/std::nullopt,
+            /*from_runtime_lut=*/nullptr, /*is_a8w4=*/is_a8w4);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
-    if (is_a8w4) {
-        smem_config = deep_gemm_a8w4_common::get_smem_config_a8w4(num_stages, block_m, block_n, block_k);
-    }
     auto extra_info = get_extra_info();
     auto SMSIZE = std::get<0>(smem_config);
     int kNumGroups = num_groups;
@@ -945,18 +945,18 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     ConfigTuple cfg;
     if (configs.has_value()) {
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
-        cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
-            deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
+        auto smem_config = is_a8w4
+            ? deep_gemm_a8w4_common::get_smem_config_a8w4(nst, bm, bn, bk)
+            : deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1);
+        cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst, smem_config);
     } else {
-        const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         cfg = deep_gemm_int8::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::GroupedNoPad, 256, lut_kind);
+            expected_m, n, k, num_groups, num_sms, GemmType::GroupedNoPad,
+            /*max_block_n=*/256, /*runtime_lut_kind=*/std::nullopt,
+            /*from_runtime_lut=*/nullptr, /*is_a8w4=*/is_a8w4);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
-    if (is_a8w4) {
-        smem_config = deep_gemm_a8w4_common::get_smem_config_a8w4(num_stages, block_m, block_n, block_k);
-    }
     auto extra_info = get_extra_info();
     auto SMSIZE = std::get<0>(smem_config);
 

@@ -73,11 +73,10 @@ from .deep_gemm_cpp import (
     # FP4 scale / weight preprocessing
     preprocess_mxfp4_scales,
     preprocess_mxfp4_weight_for_act_and_quant_fusing,
-    # A8W4 INT8 GEMMs / weight preprocessing
+    # A8W4 INT8 GEMMs / device weight preprocessing
     m_grouped_gemm_int8_int4_bf16_nt_contiguous,
     m_grouped_gemm_int8_int4_bf16_nt_masked,
     m_grouped_gemm_int8_int4_bf16_nt_nopad,
-    pack_a8w4_weight,
     preprocess_a8w4_weight,
     # W4A16 / W4FA16 GEMMs
     m_grouped_gemm_w4a16_nopad,

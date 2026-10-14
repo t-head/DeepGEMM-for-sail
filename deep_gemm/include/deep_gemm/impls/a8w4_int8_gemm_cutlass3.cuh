@@ -213,51 +213,86 @@ public:
       KTileIterator k_tile_iter, int k_tile_count, ResidueMNK residue,
       int thread_idx, int, char* smem_buf) {
     auto mma_acc = cute::make_fragment_like<ElementAccumulator>(accum);
-
-    // Each thread owns 2 rows x 4 cols per 16x16 accumulator atom (value i: row 8 * (i / 4), col 4 * (i % 4)
-    // relative to its first element); atoms repeat every WarpOnM * 16 rows and WarpOnN * 16 cols.
-    // Load these scales once before the mainloop so their latency overlaps the MMAs.
     static_assert(cute::size<0>(FrgTensorD{}) == 8, "Unexpected PPU0010 int8 accumulator fragment");
     constexpr int kMmaM = cute::size<1>(FrgTensorD{});
     constexpr int kMmaN = cute::size<2>(FrgTensorD{});
-    TiledMma tiled_mma;
-    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-    auto coords = thread_mma.partition_C(
-        cute::make_identity_tensor(cute::make_shape(cute::Int<BlockM>{}, cute::Int<BlockN>{})));
-    const int row0 = cute::get<0>(coords(0, 0, 0));
-    const int col0 = cute::get<1>(coords(0, 0, 0));
-    // A single base pointer per operand keeps every scale load an immediate-offset access.
-    ElementScale const* scale_a_ptr = tile_scale_a_ + row0;
-    ElementScale const* scale_b_ptr = tile_scale_b_ + col0;
-    // The N residue is static when N is a multiple of BLOCK_N, so the column predicate folds away.
-    constexpr bool kAlignedN = cute::is_static_v<cute::remove_cvref_t<decltype(cute::get<1>(residue))>>;
-    float scale_a[kMmaM][2], scale_b[kMmaN][4];
-    CUTLASS_PRAGMA_UNROLL
-    for (int m = 0; m < kMmaM; ++m) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int r = 0; r < 2; ++r) {
-        const int offset = m * WarpOnM * 16 + r * 8;
-        scale_a[m][r] = row0 + offset < cute::get<0>(residue) ? __ldg(scale_a_ptr + offset) : 0.0f;
-      }
-    }
-    CUTLASS_PRAGMA_UNROLL
-    for (int n = 0; n < kMmaN; ++n) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int c = 0; c < 4; ++c) {
-        const int offset = n * WarpOnN * 16 + c * 4;
-        scale_b[n][c] = (kAlignedN || col0 + offset < cute::get<1>(residue)) ? __ldg(scale_b_ptr + offset) : 0.0f;
-      }
-    }
-
-    mma_mainloop(mma_acc, cute::get<0>(inputs), cute::get<1>(inputs), k_tile_iter, k_tile_count, thread_idx, smem_buf);
-
-    CUTLASS_PRAGMA_UNROLL
-    for (int n = 0; n < kMmaN; ++n) {
+    // Small decode tiles keep scales live across the mainloop to hide VMEM latency. Larger M tiles
+    // load only one output atom's six unique scales at a time after MMA, avoiding scale-array spills.
+    if constexpr (BlockM < 64) {
+      TiledMma tiled_mma;
+      auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+      auto coords = thread_mma.partition_C(
+          cute::make_identity_tensor(cute::make_shape(cute::Int<BlockM>{}, cute::Int<BlockN>{})));
+      const int row0 = cute::get<0>(coords(0, 0, 0));
+      const int col0 = cute::get<1>(coords(0, 0, 0));
+      ElementScale const* scale_a_ptr = tile_scale_a_ + row0;
+      ElementScale const* scale_b_ptr = tile_scale_b_ + col0;
+      constexpr bool kAlignedN = cute::is_static_v<cute::remove_cvref_t<decltype(cute::get<1>(residue))>>;
+      float scale_a[kMmaM][2], scale_b[kMmaN][4];
       CUTLASS_PRAGMA_UNROLL
       for (int m = 0; m < kMmaM; ++m) {
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < 8; ++i) {
-          accum(i, m, n) = mma_acc(i, m, n) * scale_a[m][i / 4] * scale_b[n][i % 4];
+        for (int r = 0; r < 2; ++r) {
+          const int offset = m * WarpOnM * 16 + r * 8;
+          scale_a[m][r] = row0 + offset < cute::get<0>(residue) ? __ldg(scale_a_ptr + offset) : 0.0f;
+        }
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < kMmaN; ++n) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int c = 0; c < 4; ++c) {
+          const int offset = n * WarpOnN * 16 + c * 4;
+          scale_b[n][c] = (kAlignedN || col0 + offset < cute::get<1>(residue)) ? __ldg(scale_b_ptr + offset) : 0.0f;
+        }
+      }
+
+      mma_mainloop(mma_acc, cute::get<0>(inputs), cute::get<1>(inputs), k_tile_iter, k_tile_count,
+                   thread_idx, smem_buf);
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < kMmaN; ++n) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int m = 0; m < kMmaM; ++m) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < 8; ++i) {
+            accum(i, m, n) = mma_acc(i, m, n) * scale_a[m][i / 4] * scale_b[n][i % 4];
+          }
+        }
+      }
+    } else {
+      mma_mainloop(mma_acc, cute::get<0>(inputs), cute::get<1>(inputs), k_tile_iter, k_tile_count,
+                   thread_idx, smem_buf);
+
+      TiledMma tiled_mma;
+      auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+      auto coords = thread_mma.partition_C(
+          cute::make_identity_tensor(cute::make_shape(cute::Int<BlockM>{}, cute::Int<BlockN>{})));
+      const int row0 = cute::get<0>(coords(0, 0, 0));
+      const int col0 = cute::get<1>(coords(0, 0, 0));
+      ElementScale const* scale_a_ptr = tile_scale_a_ + row0;
+      ElementScale const* scale_b_ptr = tile_scale_b_ + col0;
+      constexpr bool kAlignedN = cute::is_static_v<cute::remove_cvref_t<decltype(cute::get<1>(residue))>>;
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < kMmaN; ++n) {
+        const int col_offset = n * WarpOnN * 16;
+        const float sb0 = (kAlignedN || col0 + col_offset < cute::get<1>(residue)) ? __ldg(scale_b_ptr + col_offset) : 0.0f;
+        const float sb1 = (kAlignedN || col0 + col_offset + 4 < cute::get<1>(residue)) ? __ldg(scale_b_ptr + col_offset + 4) : 0.0f;
+        const float sb2 = (kAlignedN || col0 + col_offset + 8 < cute::get<1>(residue)) ? __ldg(scale_b_ptr + col_offset + 8) : 0.0f;
+        const float sb3 = (kAlignedN || col0 + col_offset + 12 < cute::get<1>(residue)) ? __ldg(scale_b_ptr + col_offset + 12) : 0.0f;
+        CUTLASS_PRAGMA_UNROLL
+        for (int m = 0; m < kMmaM; ++m) {
+          const int row_offset = m * WarpOnM * 16;
+          const float sa0 = row0 + row_offset < cute::get<0>(residue) ? __ldg(scale_a_ptr + row_offset) : 0.0f;
+          const float sa1 = row0 + row_offset + 8 < cute::get<0>(residue) ? __ldg(scale_a_ptr + row_offset + 8) : 0.0f;
+          accum(0, m, n) = mma_acc(0, m, n) * sa0 * sb0;
+          accum(1, m, n) = mma_acc(1, m, n) * sa0 * sb1;
+          accum(2, m, n) = mma_acc(2, m, n) * sa0 * sb2;
+          accum(3, m, n) = mma_acc(3, m, n) * sa0 * sb3;
+          accum(4, m, n) = mma_acc(4, m, n) * sa1 * sb0;
+          accum(5, m, n) = mma_acc(5, m, n) * sa1 * sb1;
+          accum(6, m, n) = mma_acc(6, m, n) * sa1 * sb2;
+          accum(7, m, n) = mma_acc(7, m, n) * sa1 * sb3;
         }
       }
     }

@@ -43,10 +43,7 @@ static void register_apis(pybind11::module_& m) {
           &deep_gemm_fp4_common::preprocess_mxfp4_weight_for_act_and_quant_fusing,
           py::arg("weight"), py::arg("weight_scale"));
 
-    // A8W4 AUXILIARY KERNELs
-    m.def("pack_a8w4_weight",
-          &deep_gemm_a8w4_common::pack_a8w4_weight,
-          py::arg("weight"));
+    // A8W4 DEVICE PREPROCESS
     m.def("preprocess_a8w4_weight",
           &deep_gemm_a8w4_common::preprocess_a8w4_weight,
           py::arg("weight"));

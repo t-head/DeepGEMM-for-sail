@@ -614,11 +614,20 @@ static_assert(sizeof(GemmKernel::Params) == {20}, "host/device kernel Params siz
 // scale-A/B cp.async addresses: each stream keeps a 64-bit global address and a
 // 32-bit shared address, for 2 * 3 = 6 VREGs; A/B use the AIU load path.
 constexpr int kVregOverhead = 6;
+
+// A8W4 large-M tiles need extra headroom for unpack/dequant temporaries. Without accounting for
+// them, launch_bounds over-constrains VREGs and the compiler spills scheduler/epilogue state.
+// Dequantization keeps the unique FP32 scales for one warp output tile resident in VREGs:
+// 2 ScaleA registers per M16 atom and 4 ScaleB registers per N16 atom, plus 2 registers for
+// scale-address/coordinate bookkeeping. The total is 2 * (WARP_M / 16) + 4 * (WARP_N / 16) + 2.
+constexpr int kA8W4LargeTileOverhead = kA8W4Int8 && BLOCK_M >= 64
+    ? 2 * (WARP_M / 16) + 4 * (WARP_N / 16) + 2 : 0;
+constexpr int kTotalVregOverhead = kVregOverhead + kA8W4LargeTileOverhead;
 using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, GemmKernel::SharedStorageSize,
                             cute::sizeof_bits_v<ElementA>, cute::sizeof_bits_v<ElementB>,
                             cute::sizeof_bits_v<ElementCompute>,
                             kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu,
-                            false, kVregOverhead>;
+                            false, kTotalVregOverhead>;
 
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
