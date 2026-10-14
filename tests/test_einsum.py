@@ -3,8 +3,8 @@ import torch
 from typing import Tuple
 import os
 import deep_gemm
-from utils import test_einsum, test_filter
-from deep_gemm.jit_kernels.utils import is_ppu1v5_device
+from deep_gemm.testing import test_filter
+from utils import is_ppu1v5_device, test_einsum
 
 @test_filter(lambda: is_ppu1v5_device())
 def test_fp8_bhr_hdr_bhd(quant_type: str = "block"):

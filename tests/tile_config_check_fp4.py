@@ -5,11 +5,10 @@ from typing import List, Dict, Tuple
 import deep_gemm
 import argparse
 import copy
-from deep_gemm.jit_kernels.utils import get_num_sms
+from deep_gemm import get_num_sms
 from utils import construct, construct_contiguous_grouped, construct_group_m_list, split_list_into_groups
-from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
+from utils import SMEM_CONFIG_UNUSED
 from math_utils import ceil_div, calc_diff
-from deep_gemm.jit_kernels.utils import get_search_space
 
 # This tile config check file only support MXFP4
 def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[bool, str]:
@@ -465,7 +464,6 @@ if __name__ == "__main__":
             # only run num_stage == target_stage, because run all configs take too much time (>7200s)
             continue
         sm = get_num_sms()
-        smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k, n, False, False)
-        config_list.append((sm, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config))
+        config_list.append((sm, block_m, block_n, block_k, warp_m, warp_n, num_stages, SMEM_CONFIG_UNUSED))
 
     results = test_all_configs(config_list, gemm_type, f'{gemm_type}_kernel_config_results_{m}{n}{k}_double.txt', f'{gemm_type}_kernel_config_results_{m}{n}{k}_double.json', m, n, k, num_groups)

@@ -2,7 +2,6 @@
   "OAM-810E": [
     "python ./tests/test_core.py",
     "python ./tests/test_attention.py",
-    "python ./tests/test_jit.py",
     "python ./tests/run_deep_gemm.py --format=DenseGemm,data_type:tf32,m:8192,n:24,k:16384",
     "python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:int8,groups:32,m:4096,n:4096,k:7168,em:128,distribution:uniform --thread_count=32",
     "python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:bf16,groups:16,m:4096,n:1024,k:2048,em:256,distribution:uniform --thread_count=32",
@@ -17,7 +16,6 @@
     "python ./tests/test_fp4_core.py",
     "python ./tests/test_fp8_core.py",
     "python ./tests/test_attention.py",
-    "python ./tests/test_jit.py",
     "python ./tests/run_deep_gemm.py --format=DenseGemm,data_type:tf32,m:8192,n:24,k:16384",
     "python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:int8,groups:32,m:4096,n:4096,k:7168,em:128,distribution:uniform --thread_count=32",
     "python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:bf16,groups:16,m:4096,n:1024,k:2048,em:256,distribution:uniform --thread_count=32",

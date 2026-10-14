@@ -11,6 +11,7 @@ try:
 except:
     from deep_gemm import get_mn_major_tma_aligned_tensor
     from deep_gemm.testing import bench_kineto
+from deep_gemm.testing import get_arch_major
 
 import deep_gemm
 import random
@@ -21,9 +22,6 @@ from enum import Enum
 import ast
 from math_utils import *
 import numpy as np
-from deep_gemm.jit_kernels.gemm import get_best_configs as bf16_get_best_configs
-from deep_gemm.jit_kernels.gemm_fp8 import get_best_configs as fp8_blkwise_get_best_configs
-from deep_gemm.jit_kernels.gemm_int8 import get_best_configs as perchannel_get_best_configs
 
 global _acc_check, _benchmark, _ref_backend
 global use_ppu, show_log
@@ -55,10 +53,6 @@ class MajorTypeAB(Enum):
     def is_mn_major(self):
         return self.value == 1
 
-def get_arch_major() -> int:
-    major, minor = torch.cuda.get_device_capability()
-    return major
-
 def get_arch_version() -> int:
     # Compute capability as a single comparable integer (major * 10 + minor):
     # PPU1.0 (ZW810E) reports 8.0 -> 80, PPU1.5 (ZW890) reports 8.9 -> 89.
@@ -66,18 +60,14 @@ def get_arch_version() -> int:
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor
 
-def test_filter(condition: Callable):
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            if condition():
-                func(*args, **kwargs)
-            else:
-                print(f'{func.__name__}:')
-                print(f' > Filtered by {condition}')
-                print()
-        return wrapper
-    return decorator
+def is_ppu1v5_device() -> bool:
+    return get_arch_version() == 89
+
+# The 8th element of a `configs=` tile tuple is never read: every explicit-config branch in
+# csrc/jit_kernels/impls/*.hpp unpacks it as `_sc` and recomputes the shared-memory size from the
+# dtype-specific formula. The public ConfigTuple shape is fixed, so tile builders only need a
+# placeholder of the right shape.
+SMEM_CONFIG_UNUSED = (0, 0, 0)
 
 def get_kernel_types(dtype: torch.dtype) -> KernelType:
     if dtype == torch.bfloat16:

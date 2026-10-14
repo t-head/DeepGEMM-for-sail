@@ -1,13 +1,9 @@
 import random
 import torch
-from typing import Tuple
 
 import deep_gemm
-from deep_gemm.testing.bench import *
-from utils import test_mqa_logits, test_paged_mqa_logits, set_acc_check
 from utils import test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, set_acc_check, parse_deepgemm_string_re
-from deep_gemm.jit_kernels.utils import is_ppu1v5_device
-
+from utils import is_ppu1v5_device
 
 def test_ks_ke():
     # Single INT8 case: seq_len_q=1 with ks != 0, manually constructed (not via test_mqa_logits).

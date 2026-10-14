@@ -2,7 +2,7 @@ import random
 import torch
 import torch.nn.functional as F
 import deep_gemm
-from deep_gemm.jit_kernels.utils import is_ppu1v5_device
+from utils import is_ppu1v5_device
 from utils import construct_group_m_list, construct_contiguous_grouped, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad, test_m_grouped_gemm_fused
 from utils import set_acc_check, get_acc_check, set_benchmark, get_benchmark
 from math_utils import quant_w4a16, calc_diff

@@ -52,9 +52,6 @@ git clone --recursive git@github.com:t-head/DeepGEMM-for-sail.git
 # Make symbolic links for third-party (ACTLIZE) include directories and build
 bash develop.sh
 
-# Test JIT compilation
-python tests/test_jit.py
-
 # Test all GEMM implements (normal, contiguous-grouped and masked-grouped)
 python tests/test_core.py
 ```

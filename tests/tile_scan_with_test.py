@@ -10,11 +10,10 @@ import deep_gemm
 from deep_gemm import bench_kineto, get_m_alignment_for_contiguous_layout, get_col_major_tensor
 
 from math_utils import ceil_div, calc_diff
-from deep_gemm.jit_kernels.gemm_int8 import get_smem_config
-from deep_gemm.jit_kernels.utils import get_search_space, get_num_sms
+from deep_gemm import get_num_sms
 from utils import read_numbers_from_file, parse_dump_file, parse_deepgemm_string_re, judge_device_type
 from utils import construct, construct_contiguous_grouped, construct_grouped_masked, split_list_into_groups
-from deepgemm_tools import get_supported_configs, get_best_configs
+from utils import SMEM_CONFIG_UNUSED
 
 def call_test_func(gemm_type, func_args):
     supported_call_funcs = {
@@ -65,7 +64,7 @@ def test_gemm(d: torch.dtype, args = None) -> None:
         print('use default testcase')
 
     x, y, out, ref_out = construct(m, k, n, d)
-    tile_list = get_tile_list(d, m, n, k, num_group, 'dense', True)
+    tile_list = get_tile_list(d, m, n, k, num_group, 'dense')
 
     enable_multithread = not bool(cycle)
     if enable_multithread:
@@ -115,7 +114,7 @@ def test_m_grouped_gemm_contiguous(d: torch.dtype, args=None) -> None:
     else:
         print('use default testcase')
     m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, get_m_alignment_for_contiguous_layout())
-    tile_list = get_tile_list(d, m, n, k, num_groups, 'contiguous', True)
+    tile_list = get_tile_list(d, m, n, k, num_groups, 'contiguous')
 
     enable_multithread = not bool(cycle)
     if enable_multithread:
@@ -173,7 +172,7 @@ def test_m_grouped_gemm_masked(d: torch.dtype, args) -> None:
 
     x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, max_m, expected_m_per_group, k, n, d, distribution)
 
-    tile_list = get_tile_list(d, max_m, n, k, num_groups, 'masked', True)
+    tile_list = get_tile_list(d, max_m, n, k, num_groups, 'masked')
 
     enable_multithread = not bool(cycle)
     if enable_multithread:
@@ -237,13 +236,7 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, args = None) -> None:
         distribute = torch.tensor(distribution, dtype=torch.int32, device='cuda')
 
     m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1)
-    tile_list = get_tile_list(d, m, n, k, num_groups, 'nopad', True)
-    '''
-    block_m, block_n, block_k, warp_m, warp_n, num_stages = 64, 256, 128, 32, 32, 3
-    smem_config = get_smem_config(num_stages, k, block_m, block_n, block_k, 1)
-    sm = get_num_sms()
-    tile_list = [(sm, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config)]
-    '''
+    tile_list = get_tile_list(d, m, n, k, num_groups, 'nopad')
 
     enable_multithread = not bool(cycle)
     if enable_multithread:
@@ -265,7 +258,184 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, args = None) -> None:
         test_func_nopad(cycle, 0, m, n, k, d, tile_list, x, y, out, m_indices, distribute, ref_out)
     return
 
-def get_tile_list(d: torch.dtype, m: int, n: int, k: int, num_groups: int, gemm_type: str=None, from_deepgemm: bool=True):
+def get_search_space(d: torch.dtype, gemm_type : str, m:int=0, n:int=0, k:int=0) -> list:
+
+    assert gemm_type in ('nopad', 'masked', 'dense','contiguous')
+
+    block_k = 64 if d == torch.bfloat16 else 128
+    tile_list = [
+        # blockM = 16
+        [16, 64, 16, 16, block_k, 2],
+        [16, 64, 16, 16, block_k, 3],
+        [16, 64, 16, 16, block_k, 4],
+        [16, 64, 16, 16, block_k, 5],
+        [16, 64, 16, 16, block_k * 2, 2],
+        [16, 64, 16, 16, block_k * 2, 3],
+        [16, 64, 16, 16, block_k * 2, 4],
+        [16, 64, 16, 16, block_k * 2, 5],
+
+        [16, 128, 16, 32, block_k, 2],
+        [16, 128, 16, 32, block_k, 3],
+        [16, 128, 16, 32, block_k, 4],
+        [16, 128, 16, 32, block_k * 2, 2],
+        [16, 128, 16, 32, block_k * 2, 3],
+        [16, 128, 16, 32, block_k * 2, 4],
+        [16, 128, 16, 16, block_k, 2],
+        [16, 128, 16, 16, block_k, 3],
+        [16, 128, 16, 16, block_k, 4],
+        [16, 128, 16, 16, block_k * 2, 2],
+        [16, 128, 16, 16, block_k * 2, 3],
+        [16, 128, 16, 16, block_k * 2, 4],
+
+        [16, 256, 16, 64, block_k, 2],
+        [16, 256, 16, 64, block_k, 3],
+        [16, 256, 16, 64, block_k * 2, 2],
+        [16, 256, 16, 64, block_k * 2, 3],
+
+
+        # blockM = 32
+        [32, 64, 16, 32, block_k, 2],
+        [32, 64, 16, 32, block_k, 3],
+        [32, 64, 16, 32, block_k, 4],
+        [32, 64, 16, 32, block_k, 5],
+        [32, 64, 16, 32, block_k * 2, 2],
+        [32, 64, 16, 32, block_k * 2, 3],
+        [32, 64, 16, 32, block_k * 2, 4],
+        [32, 64, 16, 16, block_k, 2],
+        [32, 64, 16, 16, block_k, 3],
+        [32, 64, 16, 16, block_k * 2, 2],
+        [32, 64, 16, 16, block_k * 2, 3],
+
+        [32, 128, 16, 64, block_k, 2],
+        [32, 128, 16, 64, block_k, 3],
+        [32, 128, 16, 64, block_k, 4],
+        [32, 128, 16, 64, block_k * 2, 2],
+        [32, 128, 16, 64, block_k * 2, 3],
+        [32, 128, 16, 32, block_k, 2],
+        [32, 128, 16, 32, block_k, 3],
+        [32, 128, 16, 32, block_k * 2, 2],
+        [32, 128, 16, 32, block_k * 2, 3],
+
+        [32, 256, 16, 64, block_k, 2],
+        [32, 256, 16, 64, block_k, 3],
+        [32, 256, 16, 64, block_k * 2, 2],
+        [32, 256, 16, 64, block_k * 2, 3],
+
+
+        # blockM = 48
+        [48, 64, 16, 16, block_k, 2],
+        [48, 64, 16, 16, block_k * 2, 2],
+        [48, 64, 16, 16, block_k, 3],
+        [48, 64, 16, 16, block_k * 2, 3],
+        [48, 64, 16, 32, block_k, 2],
+        [48, 64, 16, 32, block_k * 2, 2],
+        [48, 64, 16, 32, block_k, 3],
+        [48, 64, 16, 32, block_k * 2, 3],
+
+        [48, 128, 48, 32, block_k, 2],
+        [48, 128, 48, 32, block_k * 2, 2],
+        [48, 128, 48, 32, block_k, 3],
+        [48, 128, 48, 32, block_k * 2, 3],
+
+
+        # blockM = 64
+        [64, 64, 32, 32, block_k, 2],
+        [64, 64, 32, 32, block_k, 3],
+        [64, 64, 32, 32, block_k, 4],
+        [64, 64, 32, 32, block_k * 2, 2],
+        [64, 64, 32, 32, block_k * 2, 3],
+        [64, 64, 32, 32, block_k * 2, 4],
+
+        [64, 128, 32, 64, block_k, 2],
+        [64, 128, 32, 64, block_k, 3],
+        [64, 128, 32, 32, block_k, 2],
+        [64, 128, 32, 32, block_k, 3],
+        [64, 128, 32, 64, block_k * 2, 2],
+        [64, 128, 32, 64, block_k * 2, 3],
+        [64, 128, 32, 32, block_k * 2, 2],
+        [64, 128, 32, 32, block_k * 2, 3],
+
+        [64, 256, 32, 64, block_k, 2],
+        [64, 256, 32, 64, block_k, 3],
+        [64, 256, 32, 64, block_k * 2, 2],
+        [64, 256, 32, 64, block_k * 2, 3]
+    ]
+
+    if 'dense' in gemm_type:
+        tile_list.extend([
+            # blockM = 128
+            [128, 128, 64, 64, block_k    , 2],
+            [128, 128, 64, 64, block_k    , 3],
+            [128, 128, 64, 64, block_k    , 4],
+            [128, 128, 64, 64, block_k * 2, 3],
+            [128, 256, 64, 64, block_k    , 2],
+            [128, 256, 64, 64, block_k    , 3],
+
+            # blockM = 160
+            [160, 128, 80, 64, block_k    , 2],
+            [160, 128, 80, 64, block_k    , 3],
+            [160, 128, 80, 64, block_k    , 4],
+            [160, 128, 80, 64, block_k * 2, 3],
+            [160, 256, 80, 64, block_k    , 2],
+            [160, 256, 80, 64, block_k    , 4],
+
+            # blockM = 192
+            [192, 128, 48, 64, block_k    , 2],
+            [192, 128, 48, 64, block_k    , 3],
+            [192, 128, 48, 64, block_k    , 4],
+            [192, 128, 48, 64, block_k * 2, 3],
+            [192, 256, 48, 64, block_k    , 2],
+            [192, 256, 48, 64, block_k    , 4],
+
+            # blockM = 256
+            [256, 64, 32, 64, block_k,      2],
+            [256, 64, 32, 64, block_k,      3],
+            [256, 64, 32, 64, block_k * 2,  2],
+            [256, 64, 32, 64, block_k * 2,  3],
+            [256, 128, 64, 64, block_k    , 2],
+            [256, 128, 64, 64, block_k    , 3],
+            [256, 128, 64, 64, block_k    , 4],
+            [256, 256, 64, 64, block_k,     4],
+
+            # blockM = 320
+            [320, 128, 80, 64, block_k    , 2],
+            [320, 128, 80, 64, block_k    , 3],
+            [320, 128, 80, 64, block_k    , 4],
+            [320, 256, 80, 64, block_k    , 2],
+            [320, 256, 80, 64, block_k    , 3],
+
+            # blockK = 64B
+            [128, 128, 64, 64, int(block_k / 2), 2],
+            [128, 256, 64, 64, int(block_k / 2), 2],
+            [256, 128, 64, 64, int(block_k / 2), 2],
+        ])
+
+    tile_list_rtn = []
+    if d == torch.float8_e4m3fn:
+        for tile in tile_list:
+            if tile[0] in (16, 32, 64, 128, 192) and tile[4] == block_k:
+                tile_list_rtn.append(tile)
+                # if tile[4] == block_k and tile[0] != 192:
+                #     tile_copy = copy.deepcopy(tile)
+                #     tile_copy[4] = int(block_k / 2)
+                #     tile_list_rtn.append(tile_copy)
+        return tile_list_rtn
+
+    # add block_k / 2 tile for k <256
+    if k != 0 and k <= 512:
+        for tile in tile_list:
+            tile_list_rtn.append(tile)
+            if tile[4] == block_k:
+                tile_copy = copy.deepcopy(tile)
+                tile_copy[4] = int(block_k / 2)
+                tile_list_rtn.append(tile_copy)
+    else:
+        tile_list_rtn = tile_list
+
+    return tile_list_rtn
+
+
+def get_tile_list(d: torch.dtype, m: int, n: int, k: int, num_groups: int, gemm_type: str=None):
     """
     Returns search space according input gemm type
 
@@ -275,17 +445,14 @@ def get_tile_list(d: torch.dtype, m: int, n: int, k: int, num_groups: int, gemm_
     Returns:
         The a tuple like get_best_configs()
     """
-    if from_deepgemm:
-        search_space = get_search_space(d, gemm_type, m, n, k)
-        config_list = []
-        for tile in search_space:
-            block_m, block_n, warp_m, warp_n, block_k, num_stages = tile
-            smem_config = get_smem_config(num_stages, k, block_m, block_n, block_k, 1)
-            sm = get_num_sms()
-            config_list.append((sm, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config))
-        return config_list
-    else:
-        return get_supported_configs(m, n, k, num_groups, 39)
+    search_space = get_search_space(d, gemm_type, m, n, k)
+    config_list = []
+    for tile in search_space:
+        block_m, block_n, warp_m, warp_n, block_k, num_stages = tile
+        smem_config = SMEM_CONFIG_UNUSED
+        sm = get_num_sms()
+        config_list.append((sm, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config))
+    return config_list
 
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
