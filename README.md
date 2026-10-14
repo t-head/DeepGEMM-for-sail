@@ -67,6 +67,15 @@ bash install.sh
 
 Then, import `deep_gemm` in your Python project, and enjoy!
 
+## Experimental Autotuning and LUT Conversion
+
+The [autotuner](tests/deepgemm_autotune.py) and
+[JSON-to-LUT converter](tests/tools/convert_runtime_lut.py) are experimental.
+The legacy tuner remains available. It will be removed after a trial period,
+once the new tuner is merged, framework tests pass, and frameworks switch.
+
+See [tests/README.MD](tests/README.MD) for usage.
+
 ## Interfaces
 
 #### Notices
