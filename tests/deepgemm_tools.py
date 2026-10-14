@@ -8,7 +8,7 @@ import math
 import os
 from functools import lru_cache
 from typing import Tuple, List, Optional
-from math_utils import ceil_div
+from deep_gemm.utils.math import ceil_div
 try:
     from deep_gemm import (
         get_m_alignment_for_contiguous_layout,

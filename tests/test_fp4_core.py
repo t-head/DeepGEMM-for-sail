@@ -4,7 +4,8 @@ import time
 from typing import Tuple
 import deep_gemm
 from deep_gemm import preprocess_mxfp4_scales, moe_align_block_size
-from math_utils import ceil_div, calc_diff
+from deep_gemm.utils.math import ceil_div
+from deep_gemm.testing.numeric import calc_diff
 from utils import construct, check_signal, construct_group_m_list, get_ref_backend, find_next_power_of_2
 from utils import construct_contiguous_grouped as construct_nopad_base
 from utils import construct_grouped_masked as construct_masked_base
@@ -258,9 +259,9 @@ def test_m_grouped_gemm_masked_silu_and_mul_post_quant(args) -> None:
     expected_m_per_group = ceil_div(m, num_groups)
     x, y, bias, masked_m, out, out_scale, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, distribution, enable_sbo_overlap, with_bias=False, enable_act_and_quant_fusing=True)
 
-    from deep_gemm import preprocess_mxfp4_weight_for_act_and_quant_fusing
+    from deep_gemm import preprocess_weights_and_scales, PreprocessMode
     weight_scale = y[1].contiguous().view(torch.uint8)
-    y_interleave = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y[0], weight_scale=weight_scale)
+    y_interleave = preprocess_weights_and_scales(mode=PreprocessMode.MXFP4, fuse_activation=True, weight=y[0], weight_scale=weight_scale)
     result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y_interleave, bias, out, masked_m, expected_m_per_group, enable_sbo_overlap=enable_sbo_overlap, signal=signal, out_scale=out_scale, swiglu_limit=swiglu_limit)
 
     ### Reference
@@ -399,9 +400,9 @@ def test_m_grouped_gemm_fused_silu_and_mul_post_quant(args) -> None:
     x, y, topk_ids, out, out_scale, ref_out = construct_grouped_fused(
         num_groups, m, k, n, topk, distribution, 1, enable_act_and_quant_fusing=True)
 
-    from deep_gemm import preprocess_mxfp4_weight_for_act_and_quant_fusing
+    from deep_gemm import preprocess_weights_and_scales, PreprocessMode
     weight_scale = y[1].contiguous().view(torch.uint8)
-    y_interleave = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y[0], weight_scale=weight_scale)
+    y_interleave = preprocess_weights_and_scales(mode=PreprocessMode.MXFP4, fuse_activation=True, weight=y[0], weight_scale=weight_scale)
 
     config, m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, inv_perm, expert_ids = (
         moe_align_block_size(x[0], y[0], topk_ids, False, enable_act_and_quant_fusing=True)
@@ -473,9 +474,9 @@ def test_m_grouped_gemm_nopad_silu_and_mul_post_quant(args) -> None:
         ref_out[mask] = a_dq @ b_dq.t()
     ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
 
-    from deep_gemm import preprocess_mxfp4_weight_for_act_and_quant_fusing
+    from deep_gemm import preprocess_weights_and_scales, PreprocessMode
     weight_scale = y[1].contiguous().view(torch.uint8)
-    y_interleave = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y[0], weight_scale=weight_scale)
+    y_interleave = preprocess_weights_and_scales(mode=PreprocessMode.MXFP4, fuse_activation=True, weight=y[0], weight_scale=weight_scale)
 
     deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y_interleave, bias, out, m_indices, out_scale=out_scale, swiglu_limit=swiglu_limit)
 

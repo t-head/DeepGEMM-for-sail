@@ -6,7 +6,7 @@ from .gemm_fp4 import (
     gemm_fp4_fp4_bf16_nt,
     preprocess_mxfp4_scales,
     uint8_padding,
-    preprocess_mxfp4_weight_for_act_and_quant_fusing
+    preprocess_mxfp4_weight_for_act_and_quant_fusing,
 )
 from .m_grouped_gemm import (
     # m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
@@ -30,18 +30,7 @@ from .m_grouped_gemm_fp4 import (
     m_grouped_gemm_fp4_fp4_bf16_nt_masked,
     m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
 )
-from .m_grouped_gemm_w4a16 import (
-    m_grouped_gemm_w4a16_masked,
-    m_grouped_gemm_w4a16_nopad,
-    m_grouped_gemm_w4a16_fused,
-)
-from .a_fused_m_grouped_gemm import (
-    moe_align_block_size,
-    m_grouped_gemm_bf16_bf16_bf16_nt_fused,
-    m_grouped_gemm_fp8_fp8_bf16_nt_fused,
-    m_grouped_gemm_int8_int8_bf16_nt_fused,
-    m_grouped_gemm_fp4_fp4_bf16_nt_fused,
-)
+
 
 from .utils import (
     ceil_div, set_num_sms, get_num_sms, get_case_id,

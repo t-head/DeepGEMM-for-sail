@@ -5,6 +5,7 @@
 #include <variant>
 
 #include "../jit_kernels/heuristics/common_fp4.hpp"
+#include "../jit_kernels/heuristics/common_preprocess.hpp"
 #include "../utils/layout.hpp"
 #include "../utils/utils.hpp"
 
@@ -38,10 +39,23 @@ static void register_apis(pybind11::module_& m) {
     m.def("preprocess_mxfp4_scales",
           &deep_gemm_fp4_common::preprocess_mxfp4_scales,
           py::arg("scale"));
+    py::enum_<deep_gemm_preprocess_common::PreprocessMode>(m, "PreprocessMode")
+        .value("MXFP4", deep_gemm_preprocess_common::PreprocessMode::MXFP4)
+        .value("W4A16_MXFP4", deep_gemm_preprocess_common::PreprocessMode::W4A16_MXFP4)
+        .value("W4A16_MXFP4_MMA", deep_gemm_preprocess_common::PreprocessMode::W4A16_MXFP4_MMA)
+        .value("W4A8_MXFP4_MMA", deep_gemm_preprocess_common::PreprocessMode::W4A8_MXFP4_MMA)
+        .value("W4A16_INT4", deep_gemm_preprocess_common::PreprocessMode::W4A16_INT4)
+        .value("FP8_CHANNEL", deep_gemm_preprocess_common::PreprocessMode::FP8_CHANNEL)
+        .value("FP8_BLOCK", deep_gemm_preprocess_common::PreprocessMode::FP8_BLOCK)
+        .value("INT8", deep_gemm_preprocess_common::PreprocessMode::INT8)
+        .value("BF16", deep_gemm_preprocess_common::PreprocessMode::BF16);
+    m.def("preprocess_weights_and_scales",
+          &deep_gemm_preprocess_common::preprocess_weights_and_scales,
+          py::arg("mode"), py::arg("fuse_activation"), py::arg("weight"), py::arg("weight_scale"));
     m.def("preprocess_mxfp4_weight_for_act_and_quant_fusing",
-          &deep_gemm_fp4_common::preprocess_mxfp4_weight_for_act_and_quant_fusing,
+          &deep_gemm_preprocess_common::preprocess_mxfp4_weight_for_act_and_quant_fusing,
           py::arg("weight"), py::arg("weight_scale"));
-    
+
     m.def("get_tma_aligned_size", &get_tma_aligned_size);
     m.def("get_mk_alignment_for_contiguous_layout", &get_mk_alignment_for_contiguous_layout);
     m.def("get_mn_major_tma_aligned_tensor", &get_mn_major_tma_aligned_tensor, py::arg("x"));

@@ -295,7 +295,7 @@ static MoeAlignReturn moe_align_block_size_impl(
     int num_groups = static_cast<int>(num_groups_l);
     int n = rhs_dim1;
     // NOTES: only the weight is in scope here, not its scales, so an `int32` weight cannot be told
-    // apart from `mxfp4_e8m0` / `mxfp4_bf16` and upstream just labels it `int4`. Harmless for config
+    // apart from `mxfp4_e8m0` and upstream just labels it `int4`. Harmless for config
     // selection -- `get_best_configs` only branches on `mxfp4_e8m0_mma` -- so the label is mirrored.
     std::optional<deep_gemm_w4a16_common::W4A16Type> w4a16_type;
     if (rhs.dtype() == torch::kInt32) {

@@ -83,39 +83,6 @@ inline torch::Tensor post_preprocess_mxfp4_scales(const torch::Tensor& scale) {
     return scale;
 }
 
-/// Interleave a fused-MoE gemm1 weight so that the epilogue reads gate/up (W1/W3) pairs from
-/// adjacent N positions, and return the matching preprocessed scale.
-// keep in sync with deep_gemm/jit_kernels/gemm_fp4.py
-// NOTE: must be called *before* `preprocess_mxfp4_scales`, never after. Both inputs are required to
-// still be raw contiguous uint8 here, which is exactly what `preprocess_mxfp4_scales` takes away:
-// it packs the scale into uint16 and re-strides it to N-major.
-inline std::pair<torch::Tensor, torch::Tensor> preprocess_mxfp4_weight_for_act_and_quant_fusing(
-        const torch::Tensor& weight, const torch::Tensor& weight_scale) {
-    DG_HOST_ASSERT(weight.dim() == 3);
-    DG_HOST_ASSERT(weight_scale.dim() == 3);
-    DG_HOST_ASSERT(weight.dtype() == torch::kUInt8);
-    DG_HOST_ASSERT(weight_scale.dtype() == torch::kUInt8);
-    DG_HOST_ASSERT(weight.is_contiguous());
-    DG_HOST_ASSERT(weight_scale.is_contiguous());
-
-    // do interleaving to make up and gate be adjacent.
-    const int64_t num_groups = weight.size(0), n = weight.size(1), k = weight.size(2);
-    DG_HOST_ASSERT(n % 2 == 0);  // silu_and_mul splits N in half
-    const int64_t half_n = n / 2;
-    const auto gate = weight.slice(1, 0, half_n);
-    const auto up = weight.slice(1, half_n, n);
-    // `at::stack` writes a fresh contiguous tensor, so the following `view` is always legal.
-    const auto weight_out = at::stack({gate, up}, 2).view({num_groups, n, k});
-
-    const int64_t sfn = weight_scale.size(1), sfk = weight_scale.size(2);
-    // `weight` is uint8, so one byte holds two fp4 values: sfk == ceil_div(2 * k, 32).
-    DG_HOST_ASSERT(weight_scale.size(0) == num_groups && sfn == n && sfk == ceil_div<int64_t>(k, 16));
-    const auto gate_scale = weight_scale.slice(1, 0, half_n);
-    const auto up_scale = weight_scale.slice(1, half_n, n);
-    const auto weight_scale_out = at::stack({gate_scale, up_scale}, 2).view({num_groups, sfn, sfk});
-    return {weight_out, preprocess_mxfp4_scales(weight_scale_out)};
-}
-
 // ============================================================================
 
 using TileConfig = std::map<std::tuple<int, int, int>, std::tuple<int, int, int>>;

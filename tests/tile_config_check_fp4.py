@@ -8,7 +8,8 @@ import copy
 from deep_gemm.jit_kernels.utils import get_num_sms
 from utils import construct, construct_contiguous_grouped, construct_group_m_list, split_list_into_groups
 from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
-from math_utils import ceil_div, calc_diff
+from deep_gemm.utils.math import ceil_div
+from deep_gemm.testing.numeric import calc_diff
 from deep_gemm.jit_kernels.utils import get_search_space
 
 # This tile config check file only support MXFP4
