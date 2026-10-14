@@ -166,6 +166,29 @@ void set_hc_prenorm_params(int m, int n, int k, hggcStream_t stream = 0) {
     op_name_ = "HcPrenormGemm";
 }
 
+void set_mega_mhc_params(int m, int hidden, int sinkhorn_iters, hggcStream_t stream = 0) {
+    op_name_ = "MegaMhc";
+    add_argument("data_type");
+    add_argument("m");
+    add_argument("hidden");
+    add_argument("mode");
+    add_argument("sinkhorn_iters");
+
+    add_params("data_type", "bf16");
+    add_params("m", m);
+    add_params("hidden", hidden);
+    add_params("mode", "shifted");
+    add_params("sinkhorn_iters", sinkhorn_iters);
+
+    stream_ = stream;
+    m_ = m;
+    group_ = 1;
+    grouped_layout_ = nullptr;
+    gemm_type_ = GemmType::DenseGemm;
+    is_gemv_ = false;
+    device_id_ = -1;
+}
+
 void set_fused_moe_params(const std::string& data_type, const std::string& quant_type,
                           int groups, int num_token, int topk,
                           int n, int k, int* grouped_layout, hggcStream_t stream = 0) {

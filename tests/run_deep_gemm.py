@@ -6,7 +6,7 @@ import random
 import deep_gemm
 from utils import parse_deepgemm_string_re, read_cmds_from_file, get_arch_version
 from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad, test_m_grouped_gemm_fused
-from utils import test_hc_prenorm_gemm, test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits
+from utils import test_hc_prenorm_gemm, test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, test_mega_mhc
 from utils import set_acc_check, set_benchmark
 from utils import judge_device_type, set_ref_backend
 import atexit
@@ -19,6 +19,9 @@ def device_version_supported(one_case):
     caselist can run on both PPU1.0 and PPU1.5.
     """
     data_type = one_case.get('data_type')
+    if one_case.get('gemm_type') == 'MegaMhc':
+        if get_arch_version() != 89 or 'M890' not in torch.cuda.get_device_name():
+            return False, 'Mega-mHC requires Zhenwu M890P (sm_89)'
     # fp4 (mxfp4, ue8m0 scale) GEMM/attention kernels require PPU1.5 (sm_89) or later,
     # see the device assert in deep_gemm/jit_kernels/gemm_fp4.py
     if data_type == torch.uint8 and get_arch_version() < 89:
@@ -49,6 +52,7 @@ def call_test_func(gemm_type, func_args):
         # Sparse MQA logits (both flavors share the test function, which branches on gemm_type)
         "SparseMqaLogits": test_sparse_mqa_logits,
         "PagedSparseMqaLogits": test_sparse_mqa_logits,
+        "MegaMhc": test_mega_mhc,
     }
 
     if gemm_type in supported_call_funcs.keys():

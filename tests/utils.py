@@ -936,7 +936,7 @@ def read_cycle_from_nculog(filename):
         # no longer identifies the kernel of interest. `metadata` is excluded so the tiny scheduling
         # kernel is reported in `op_cycles` but not summed, keeping the totals comparable with the
         # Python path (whose `smxx_*_metadata` matches neither term).
-        if ("gemm" in op.lower() or "attention" in op.lower()) and "metadata" not in op.lower():
+        if ("gemm" in op.lower() or "attention" in op.lower() or "mhc" in op.lower()) and "metadata" not in op.lower():
             fwd_cycle_sum += cycle
             fwd_tc_sum = tc_list[i]
             fwd_hbm_sum = hbm_list[i]
@@ -963,7 +963,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
     # Kernel filter for the PPU profiler. `attention_` is needed because the C++ JIT emits
     # `attention_mqa_logits_*` / `attention_paged_mqa_logits_*`, which match none of the other terms
     # (the Python JIT is covered by `device_kernel`). Without it the profiler silently reports 0.
-    ppu_kernel_name = "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*|attention_'"
+    ppu_kernel_name = "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*|attention_|mhc'"
     output_lines = list()
     headers = ["casename","time(us)","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"]
@@ -1085,11 +1085,11 @@ def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
     supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size", "logits_dtype", "weights_dtype", "c4_compressed", "epilogue_type", "swiglu_limit", "sparse_block_kv", "num_max_sparse_blocks", "use_unaligned_ks"]
-    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", ]
+    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", "MegaMhc"]
     supported_indexer_epilogue_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
-    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm),(.+)"
+    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc),(.+)"
     pattern = re.compile(dg_params)
     m = pattern.search(s.strip("."))
     if not m:
@@ -2714,6 +2714,33 @@ def test_einsum(args) -> None:
                 f'{2 * b * h * r * d / t / 1e12:4.0f} TFLOPS | '
                 f'{count_bytes((x_fp8, y_fp8, out)) / t / 1e9:4.0f} GB/s | ')
                 # f'{t_cublaslt / t:4.2f} x')
+
+
+def test_mega_mhc(args):
+    from test_mega_mhc import check
+
+    dtype = args['data_type']
+    mode = args.get('mode', 'shifted')
+    if dtype != torch.bfloat16:
+        raise ValueError('MegaMhc only supports data_type:bf16')
+    if mode != 'shifted':
+        raise ValueError('MegaMhc only supports V4.1 Flash shifted mode')
+    if 'sf_layout' in args or 'shared_sf_block_m' in args:
+        raise ValueError('MegaMhc BF16 output does not use scale layouts')
+    if get_acc_check() and get_ref_backend() != 'device':
+        raise ValueError("ref_backend only supports 'device' for MegaMhc")
+    kwargs = dict(tokens=args['m'], hidden=args.get('hidden', 5120),
+                  num_sinkhorn_iters=args.get('sinkhorn_iters', 20),
+                  benchmark=get_benchmark(), check_accuracy=get_acc_check())
+    num_sms = args.get('num_sms')
+    original_num_sms = deep_gemm.get_num_sms()
+    try:
+        if num_sms is not None:
+            deep_gemm.set_num_sms(num_sms)
+        return check(**kwargs)
+    finally:
+        if num_sms is not None:
+            deep_gemm.set_num_sms(original_num_sms)
 
 
 def read_cmds_from_file(casefile):

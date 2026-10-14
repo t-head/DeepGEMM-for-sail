@@ -253,6 +253,10 @@ public:
                 per_kernel_flags += " -Xllvm -sort-copy-before-coalesce";
             }
         }
+        if (name == "ppu_mega_mhc_single")
+            per_kernel_flags += " -Xllvm -ppu-reassign-subregs=true"
+                                " -Xllvm -ppu-pref-fma-reuse=true"
+                                " -Xllvm -ppu-pref-mma-reuse=true";
         // Include paths for actlize and DeepGEMM headers
         std::string include_flags;
         for (const auto& path: actlize_include_paths())

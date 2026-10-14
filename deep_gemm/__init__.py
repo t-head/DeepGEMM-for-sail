@@ -77,8 +77,9 @@ from .deep_gemm_cpp import (
     m_grouped_gemm_w4a16_nopad,
     m_grouped_gemm_w4a16_masked,
     m_grouped_gemm_w4a16_fused,
-    # TF32 hyperconnection kernels
+    # Hyperconnection kernels
     tf32_hc_prenorm_gemm,
+    mega_mhc,
     # Einsum kernels
     fp8_einsum,
     int8_einsum,
