@@ -4,6 +4,31 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
+## Unreleased
+
+### Changed
+
+- **Unified weight preprocessing**: introduces
+  `preprocess_weights_and_scales(mode, fuse_activation, weight, weight_scale)`
+  and exports `PreprocessMode`. Both `mode` and `fuse_activation` are explicit
+  arguments; the function returns the processed weights and scales (plus
+  `weight_inv_scale` for `W4A8_MXFP4_MMA`). With `fuse_activation=False`,
+  `MXFP4` and `W4A8_MXFP4_MMA` also accept omitted or `None` weights and
+  return `None` in the weight slot. Scales remain required; W4A8 derives
+  dimensions and alignment from `[E,N,K/32]` scales.
+- **W4 preprocessing layouts**: accepts naturally packed weights and group-32
+  scales for `W4A16_INT4`, `W4A16_MXFP4`, `W4A16_MXFP4_MMA`, and
+  `W4A8_MXFP4_MMA` with `fuse_activation=False`. Applies the corresponding
+  weight/scale rearrangements; MMA modes retain the natural packed weight layout.
+  The W4A8 preprocessing mode rearranges the adjusted E8M0 scales in `[114, 140]`.
+- **MXFP4 preprocessing**: `PreprocessMode.MXFP4` with
+  `fuse_activation=False` preserves packed weights and converts E8M0 scales
+  to padded uint16 M/N-major layout. With `fuse_activation=True`, gate/up
+  weights and scales are interleaved before the same scale conversion.
+  `preprocess_mxfp4_scales` remains as a deprecated scale-only alias, and
+  `preprocess_mxfp4_weight_for_act_and_quant_fusing` remains as a deprecated
+  activation-fusion alias. Unsupported mode/fusion combinations report an error.
+
 ## [1.1.0+v0.1.0](https://github.com/t-head/DeepGEMM-for-sail/tree/v1.1.0_v0.1.0_release) — Initial Public Release
 
 This is the first formal public release of DeepGEMM for PPU. The version identifier follows the repository's current release naming convention.

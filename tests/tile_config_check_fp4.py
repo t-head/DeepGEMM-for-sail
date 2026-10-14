@@ -8,7 +8,8 @@ import copy
 from deep_gemm import get_num_sms
 from utils import construct, construct_contiguous_grouped, construct_group_m_list, split_list_into_groups
 from utils import SMEM_CONFIG_UNUSED
-from math_utils import ceil_div, calc_diff
+from deep_gemm.utils.math import ceil_div
+from deep_gemm.testing.numeric import calc_diff
 
 # This tile config check file only support MXFP4
 def test_kernel_config(configs: Tuple, m, n, k, num_groups, gemm_type) -> Tuple[bool, str]:

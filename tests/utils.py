@@ -20,7 +20,13 @@ import torch.nn.functional as F
 from typing import Tuple, Callable
 from enum import Enum
 import ast
-from math_utils import *
+from deep_gemm.utils.math import (
+    ceil_div, align as round_up, per_token_cast_to_fp8, per_block_cast_to_fp8,
+    per_custom_dims_cast_to_fp8, per_token_cast_to_int8, per_token_cast_to_fp4,
+    cast_back_from_fp4,
+)
+from deep_gemm.testing.numeric import calc_diff, count_bytes
+from quantization import quant_w4, quant_activation
 import numpy as np
 
 global _acc_check, _benchmark, _ref_backend
@@ -425,6 +431,19 @@ def silu_and_mul_post_quant_torch(ref_out: torch.Tensor, swiglu_limit: float = 0
     ref_out_quanted, ref_out_quanted_scale = quantize_fp4_torch(src_tensor=silu)
     return ref_out_quanted, ref_out_quanted_scale
 
+def prepare_w4_weights(y, group_size=32, d='w4a16'):
+    """Quantize test weights, then let the production API prepare the kernel layout."""
+    modes = {
+        'w4a16': deep_gemm.PreprocessMode.W4A16_INT4,
+        'w4fa16': deep_gemm.PreprocessMode.W4A16_MXFP4,
+        'w4fa16_mma': deep_gemm.PreprocessMode.W4A16_MXFP4_MMA,
+        'w4fa8_mma': deep_gemm.PreprocessMode.W4A8_MXFP4_MMA,
+    }
+    ref, packed, scales = quant_w4(y, group_size, d)
+    weight, scale = deep_gemm.preprocess_weights_and_scales(modes[d], False, packed, scales)
+    return ref, weight, scale
+
+
 def quantize_fp4_weight_torch(weight: torch.Tensor):
     ### for GroupedNoPad & GroupedFused
     from test_fp4_core import quantize_fp4_torch
@@ -452,10 +471,9 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
 
     x = torch.randn((num_token, k), device=tensor_device, dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
-    if d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
+    if d in ('w4a16', 'w4fa16', 'w4fa16_mma', 'w4fa8_mma'):
         assert quant_type == 'group'
-        # use y_dequant instead of origin y
-        y, y_quant, y_scale = quant_w4a16(y, group_size, d)
+        y, y_quant, y_scale = prepare_w4_weights(y, group_size, d)
 
     out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
     ref_out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
@@ -588,7 +606,10 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
                 ref_out = ref_out.to(torch.bfloat16)
 
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
-    elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
+    elif d == 'w4fa8_mma':
+        x_quant = quant_activation(x)
+        return (x_quant[0].to('cuda'),x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     else:
         print("ERROR: Unsupported dtype, please check!")
@@ -602,10 +623,9 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
     m_indices = torch.empty(m, device=tensor_device, dtype=torch.int32)
     x = torch.randn((m, k), device=tensor_device, dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
-    if d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
+    if d in ('w4a16', 'w4fa16', 'w4fa16_mma', 'w4fa8_mma'):
         assert quant_type == 'group'
-        # use y_dequant instead of origin y
-        y, y_quant, y_scale = quant_w4a16(y, group_size, d)
+        y, y_quant, y_scale = prepare_w4_weights(y, group_size, d)
 
     out = torch.empty((m, n), device=tensor_device, dtype=torch.bfloat16)
     ref_out = torch.randn((m, n), device=tensor_device, dtype=torch.bfloat16)
@@ -692,7 +712,10 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
                 return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
 
         return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
-    elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
+    elif d == 'w4fa8_mma':
+        x_quant = quant_activation(x)
+        return m, (x_quant[0].to('cuda'), x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return m, x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     else:
         print("ERROR: Unsupported dtype, please check!")
@@ -710,10 +733,9 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
     x = torch.randn((num_groups, max_m, k), device=tensor_device, dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
     out = torch.empty((num_groups, max_m, n), device=tensor_device, dtype=torch.bfloat16)
-    if d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
+    if d in ('w4a16', 'w4fa16', 'w4fa16_mma', 'w4fa8_mma'):
         assert quant_type == 'group'
-        # use y_dequant instead of origin y
-        y, y_quant, y_scale = quant_w4a16(y, group_size, d)
+        y, y_quant, y_scale = prepare_w4_weights(y, group_size, d)
 
     if _acc_check:
         ref_out = torch.einsum('gmk,gnk->gmn', x, y)
@@ -801,7 +823,10 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
                 return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda')), signal.to('cuda'), max_m
 
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda').to(torch.bfloat16), signal.to('cuda'), max_m
-    elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
+    elif d == 'w4fa8_mma':
+        x_quant = quant_activation(x)
+        return (x_quant[0].to('cuda'), x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
+    elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     else:
         print("ERROR: Unsupported dtype, please check!")
@@ -1136,8 +1161,8 @@ def parse_deepgemm_string_re(s):
             torch.uint8: 'group',
             'w4a16': 'group',
             'w4fa16': 'group',
-            'w4fa16_s16': 'group',
-            'w4fa16_mma': 'group'
+            'w4fa16_mma': 'group',
+            'w4fa8_mma': 'group'
         }
         result["quant_type"] = quant_type_defaults.get(result["data_type"], 'block')
     return result
@@ -1193,7 +1218,7 @@ def convert_data_type_to_dtype(data_type):
         return torch.uint8
     elif data_type in ["fp8", "torch.float8_e4m3fn"]:
         return torch.float8_e4m3fn
-    elif data_type in ["w4a16", "w4fa16", "w4fa16_s16", "w4fa16_mma"]:
+    elif data_type in ["w4a16", "w4fa16", "w4fa16_mma", "w4fa8_mma"]:
         return data_type
     else:
         print(f"ERROR: Unsupported dtype: {data_type}, please check!")
@@ -1404,8 +1429,10 @@ def test_m_grouped_gemm_masked(args) -> None:
                 # `Default` epilogue
                 result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal)
-        elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
-            deep_gemm.m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group, fp4_use_bf16_scale=(d == 'w4fa16_s16'))
+        elif d == 'w4fa8_mma':
+            deep_gemm.m_grouped_gemm_w4a8_masked(x, y, out, masked_m, expected_m_per_group)
+        elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
+            deep_gemm.m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
@@ -1462,6 +1489,10 @@ def test_m_grouped_gemm_masked(args) -> None:
             elif d == torch.uint8:
                 result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
                                                                         enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+            elif d == 'w4fa8_mma':
+                deep_gemm.m_grouped_gemm_w4a8_masked(x, y, out, masked_m, expected_m_per_group)
+            elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
+                deep_gemm.m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group)
             else:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)
@@ -1503,8 +1534,10 @@ def test_m_grouped_gemm_fused(args) -> None:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs, out_scale=out_scale, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
             else:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
-        elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
-            deep_gemm.m_grouped_gemm_w4a16_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs, fp4_use_bf16_scale=(d == 'w4fa16_s16'))
+        elif d == 'w4fa8_mma':
+            deep_gemm.m_grouped_gemm_w4a8_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+        elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
+            deep_gemm.m_grouped_gemm_w4a16_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
@@ -1559,8 +1592,10 @@ def test_m_grouped_gemm_nopad(args) -> None:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices, out_scale=out_scale, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
             else:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
-        elif d in ('w4a16', 'w4fa16', 'w4fa16_s16', 'w4fa16_mma'):
-            deep_gemm.m_grouped_gemm_w4a16_nopad(x, y, out, m_indices, fp4_use_bf16_scale=(d == 'w4fa16_s16'))
+        elif d == 'w4fa8_mma':
+            deep_gemm.m_grouped_gemm_w4a8_nopad(x, y, out, m_indices)
+        elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
+            deep_gemm.m_grouped_gemm_w4a16_nopad(x, y, out, m_indices)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
@@ -1598,6 +1633,10 @@ def test_m_grouped_gemm_nopad(args) -> None:
                 deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
             elif d == torch.uint8:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
+            elif d == 'w4fa8_mma':
+                deep_gemm.m_grouped_gemm_w4a8_nopad(x, y, out, m_indices)
+            elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
+                deep_gemm.m_grouped_gemm_w4a16_nopad(x, y, out, m_indices)
             else:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)
@@ -1857,7 +1896,6 @@ def test_mqa_logits(args) -> None:
         logits_masked = logits.masked_fill(neginf_mask, 0)
         ref_logits_masked = ref_logits.masked_fill(ref_neginf_mask, 0)
 
-        from math_utils import calc_diff
         diff = calc_diff(logits_masked, ref_logits_masked)
         if torch.isnan(diff) or diff >= 1e-3:
             print(f"ERROR: Accuracy check failed, diff={diff}")
@@ -2001,7 +2039,6 @@ def test_paged_mqa_logits(args) -> None:
         logits_masked = logits.masked_fill(ref_neginf_mask, 0)
         ref_logits_masked = ref_logits.masked_fill(ref_neginf_mask, 0)
 
-        from math_utils import calc_diff
         diff = calc_diff(logits_masked, ref_logits_masked)
         threshold = 1.5e-3 if logits_dtype == torch.bfloat16 else 1e-3
         if torch.isnan(diff) or diff >= threshold:
@@ -2611,7 +2648,6 @@ def test_sparse_mqa_logits(args) -> None:
                              + block_offsets[:, None, None] + kv_offsets).flatten(1)
             kv_gathered = kv_dequant[token_indices.clamp(min=0, max=num_kv_tokens - 1)]
             ref_logits = ref_sparse_mqa_logits(q_dequant, kv_gathered, weights, valid_mask)
-            from math_utils import calc_diff
             diff = calc_diff(gathered_ref.masked_fill(~valid_mask, 0).float(), ref_logits.float())
             threshold = 1.5e-3
             if torch.isnan(diff) or diff >= threshold:

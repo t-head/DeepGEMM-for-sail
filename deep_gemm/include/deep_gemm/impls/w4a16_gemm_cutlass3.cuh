@@ -47,6 +47,9 @@ public:
   // basic
   static constexpr bool Fused = (kGemmType == GemmType::GroupedFused);
   static constexpr bool E8M0_scale = cute::is_same_v<ElementScale, uint8_t>;
+  static_assert((cute::is_same_v<ElementB, cutlass::int4b_t> && cute::is_same_v<ElementScale, cutlass::bfloat16_t>) ||
+                (cute::is_same_v<ElementB, cutlass::float4_t> && E8M0_scale),
+                "W4A16 supports INT4 with BF16 scales or MXFP4 with E8M0 scales");
   static constexpr int N = ShapeN;
   static constexpr int K = ShapeK;
   static constexpr int L = kNumGroups;
@@ -815,7 +818,7 @@ public:
       if (ProfilingInterface::Instance().get_op_info()) {
         std::string dtype_name = UseMmaKernel ? std::string("w4fa16_mma") :
             (cute::is_same_v<ElementB, cutlass::int4b_t> ? std::string("w4a16") :
-            (Kernel::E8M0_scale ? std::string("w4fa16") : std::string("w4fa16_s16")));
+             std::string("w4fa16"));
         if constexpr(kGemmType == GemmType::GroupedFused) {
             dg_prof_params.set_fused_moe_params(
                 dtype_name, std::string("group"), kNumGroups, shape_m, args.topk,

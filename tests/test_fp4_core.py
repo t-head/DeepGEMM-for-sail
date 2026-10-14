@@ -3,8 +3,9 @@ import torch.nn.functional as F
 import time
 from typing import Tuple
 import deep_gemm
-from deep_gemm import preprocess_mxfp4_scales, moe_align_block_size
-from math_utils import ceil_div, calc_diff
+from deep_gemm import preprocess_weights_and_scales, PreprocessMode, moe_align_block_size
+from deep_gemm.utils.math import ceil_div
+from deep_gemm.testing.numeric import calc_diff
 from utils import construct, check_signal, construct_group_m_list, get_ref_backend, find_next_power_of_2, silu_and_mul_post_quant_torch
 from utils import construct_contiguous_grouped as construct_nopad_base
 from utils import construct_grouped_masked as construct_masked_base
@@ -102,6 +103,42 @@ def test_gemm(args):
     assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
     print(f"Passed with acc_check. diff: {diff}\n")
 
+
+def test_mxfp4_preprocessing():
+    for device in ('cpu', 'cuda'):
+        for prefix in ((5,), (2, 5)):
+            for groups in (1, 3, 4):
+                shape = (*prefix, groups * 2)
+                count = 1
+                for extent in shape:
+                    count *= extent
+                raw = (torch.arange(count, device=device) % 27 + 114).byte().reshape(shape)[..., ::2]
+                # Explicit byte packing in a separate reference, including zero padding.
+                host = raw.cpu().int()
+                if groups % 2:
+                    host = F.pad(host, (0, 1))
+                expected = (host[..., ::2] | (host[..., 1::2] << 8)).to(torch.uint16)
+                expected = expected.transpose(-1, -2).contiguous().transpose(-1, -2)
+                weight = torch.zeros((*prefix, groups * 16), device=device, dtype=torch.uint8)
+                for scale in (raw, expected.to(device)):
+                    prepared, actual = preprocess_weights_and_scales(PreprocessMode.MXFP4, False, weight, scale)
+                    assert prepared.data_ptr() == weight.data_ptr()
+                    absent, scale_only = preprocess_weights_and_scales(PreprocessMode.MXFP4, False, None, scale)
+                    assert absent is None
+                    default, omitted = preprocess_weights_and_scales(PreprocessMode.MXFP4, False, weight_scale=scale)
+                    assert default is None
+                    for result in (actual, scale_only, omitted, deep_gemm.preprocess_mxfp4_scales(scale=scale)):
+                        assert result.dtype == expected.dtype and result.shape == expected.shape
+                        assert result.stride() == expected.stride() and torch.equal(result.cpu(), expected)
+        try:
+            preprocess_weights_and_scales(PreprocessMode.MXFP4, False)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('accepted missing MXFP4 scales')
+        print(f'PASS unified MXFP4 weights, scale-only, defaults and legacy alias: {device}')
+
+
 def test_m_grouped_gemm_nopad(args) -> None:
     num_groups, m, n, k, distribution = args['groups'], args['m'], args['n'], args['k'], args['distribution']
     with_bias = args.get("with_bias", True)
@@ -185,10 +222,12 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
 
     x_fp4 = torch.stack(x_fp4, dim=0)
     x_fp4_scale = torch.stack(x_fp4_scale, dim=0)
-    x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4_scale)
+    _, x_fp4_scale = deep_gemm.preprocess_weights_and_scales(
+        deep_gemm.PreprocessMode.MXFP4, False, weight_scale=x_fp4_scale)
     y_fp4 = torch.stack(y_fp4, dim=0)
     y_fp4_scale = torch.stack(y_fp4_scale, dim=0)
-    y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
+    y_fp4, y_fp4_scale = preprocess_weights_and_scales(
+        PreprocessMode.MXFP4, False, y_fp4, y_fp4_scale)
     x_ref = torch.stack(x_ref, dim=0)
     y_ref = torch.stack(y_ref, dim=0)
 
@@ -259,9 +298,8 @@ def test_m_grouped_gemm_masked_silu_and_mul_post_quant(args) -> None:
     expected_m_per_group = ceil_div(m, num_groups)
     x, y, bias, masked_m, out, out_scale, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, distribution, enable_sbo_overlap, with_bias=False, enable_act_and_quant_fusing=True)
 
-    from deep_gemm import preprocess_mxfp4_weight_for_act_and_quant_fusing
     weight_scale = y[1].contiguous().view(torch.uint8)
-    y_interleave = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y[0], weight_scale=weight_scale)
+    y_interleave = preprocess_weights_and_scales(mode=PreprocessMode.MXFP4, fuse_activation=True, weight=y[0], weight_scale=weight_scale)
     result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
         x, y_interleave, bias, out, masked_m, expected_m_per_group,
         enable_sbo_overlap=enable_sbo_overlap, signal=signal, out_scale=out_scale,
@@ -270,7 +308,8 @@ def test_m_grouped_gemm_masked_silu_and_mul_post_quant(args) -> None:
     ### Reference
     ref_quant_torch, ref_quant_scale_torch_ = silu_and_mul_post_quant_torch(
         ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=activation_type)
-    ref_quant_scale_torch = preprocess_mxfp4_scales(scale=ref_quant_scale_torch_)
+    _, ref_quant_scale_torch = deep_gemm.preprocess_weights_and_scales(
+        deep_gemm.PreprocessMode.MXFP4, False, weight_scale=ref_quant_scale_torch_)
 
     ### Check
     max_diff, max_diff_scale = 0, 0
@@ -339,7 +378,8 @@ def construct_grouped_fused(num_groups: int, m: int, k: int, n: int, topk: int, 
         y_scale.append(y_fp4_tuple[1][i])
     y_fp4 = y_fp4_tuple[0]
     y_scale_fp4_ = torch.stack(y_scale, dim=0)
-    y_scale_fp4 = preprocess_mxfp4_scales(scale=y_scale_fp4_)
+    y_fp4, y_scale_fp4 = preprocess_weights_and_scales(
+        PreprocessMode.MXFP4, False, y_fp4, y_scale_fp4_)
 
     ### 2. calculate reference output
     ### the fused epilogue reference needs the pre-activation gemm result in float32
@@ -401,9 +441,8 @@ def test_m_grouped_gemm_fused_silu_and_mul_post_quant(args) -> None:
     x, y, topk_ids, out, out_scale, ref_out = construct_grouped_fused(
         num_groups, m, k, n, topk, distribution, 1, enable_act_and_quant_fusing=True)
 
-    from deep_gemm import preprocess_mxfp4_weight_for_act_and_quant_fusing
     weight_scale = y[1].contiguous().view(torch.uint8)
-    y_interleave = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y[0], weight_scale=weight_scale)
+    y_interleave = preprocess_weights_and_scales(mode=PreprocessMode.MXFP4, fuse_activation=True, weight=y[0], weight_scale=weight_scale)
 
     config, m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, inv_perm, expert_ids = (
         moe_align_block_size(x[0], y[0], topk_ids, False, enable_act_and_quant_fusing=True)
@@ -416,7 +455,8 @@ def test_m_grouped_gemm_fused_silu_and_mul_post_quant(args) -> None:
     ### Reference
     ref_quant_torch, ref_quant_scale_torch_ = silu_and_mul_post_quant_torch(
         ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=activation_type)
-    ref_quant_scale_torch = preprocess_mxfp4_scales(scale=ref_quant_scale_torch_)
+    _, ref_quant_scale_torch = deep_gemm.preprocess_weights_and_scales(
+        deep_gemm.PreprocessMode.MXFP4, False, weight_scale=ref_quant_scale_torch_)
 
     ### Check
     diff = calc_diff(out, ref_quant_torch).item()
@@ -474,9 +514,8 @@ def test_m_grouped_gemm_nopad_silu_and_mul_post_quant(args) -> None:
         ref_out[mask] = a_dq @ b_dq.t()
     ref_out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_out), ref_out)
 
-    from deep_gemm import preprocess_mxfp4_weight_for_act_and_quant_fusing
     weight_scale = y[1].contiguous().view(torch.uint8)
-    y_interleave = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y[0], weight_scale=weight_scale)
+    y_interleave = preprocess_weights_and_scales(mode=PreprocessMode.MXFP4, fuse_activation=True, weight=y[0], weight_scale=weight_scale)
 
     deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
         x, y_interleave, bias, out, m_indices, out_scale=out_scale,
@@ -485,7 +524,8 @@ def test_m_grouped_gemm_nopad_silu_and_mul_post_quant(args) -> None:
     ### Reference
     ref_quant_torch, ref_quant_scale_torch_ = silu_and_mul_post_quant_torch(
         ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=activation_type)
-    ref_quant_scale_torch = preprocess_mxfp4_scales(scale=ref_quant_scale_torch_)
+    _, ref_quant_scale_torch = deep_gemm.preprocess_weights_and_scales(
+        deep_gemm.PreprocessMode.MXFP4, False, weight_scale=ref_quant_scale_torch_)
 
     ### Check
     diff = calc_diff(out, ref_quant_torch).item()
@@ -516,6 +556,7 @@ def test_m_grouped_gemm_nopad_silu_and_mul_post_quant_loop(num_groups: int = Non
     print("Passed\n")
 
 if __name__ == '__main__':
+    test_mxfp4_preprocessing()
     parser = argparse.ArgumentParser(description="Process target function api test.")
     parser.add_argument('--func', default=None, choices=["DenseGemm", "GroupedNoPad", "GroupedMasked", "GroupedFused", "GroupedMaskedSiluAndMulPostQuant", "GroupedNoPadSiluAndMulPostQuant", "GroupedFusedSiluAndMulPostQuant"], required=False, help='target test func')
     parser.add_argument('--num_groups', type=int, help='Number of groups for Grouped GEMM')

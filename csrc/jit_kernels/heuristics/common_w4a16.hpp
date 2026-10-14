@@ -20,23 +20,21 @@ namespace deep_gemm_w4a16_common {
 enum class W4A16Type {
     int4,
     mxfp4_e8m0,
-    mxfp4_bf16,
     mxfp4_e8m0_mma,
 };
 
-// Faithful port of `get_w4a16_type`: a `uint8` weight means the packed-FP4 MMA kernel, otherwise the
-// scale dtype (or the caller's override) picks between int4, raw E8M0 and BF16 scales
-static W4A16Type get_w4a16_type(torch::ScalarType rhs_dtype, torch::ScalarType rhs_scales_dtype,
-                                bool fp4_use_bf16_scale) {
+// A uint8 weight selects FP4 MMA; int32 weights use INT4/BF16 or MXFP4/E8M0.
+static W4A16Type get_w4a16_type(torch::ScalarType rhs_dtype, torch::ScalarType rhs_scales_dtype) {
     if (rhs_dtype == torch::kUInt8) {
+        TORCH_CHECK(rhs_scales_dtype == torch::kUInt8, "W4FA16 MMA requires E8M0 scales");
         // w4fa16_mma is only supported on PPU1.5
         DG_HOST_ASSERT(is_ppu1v5_device());
         return W4A16Type::mxfp4_e8m0_mma;
     }
-    if (fp4_use_bf16_scale)
-        return W4A16Type::mxfp4_bf16;
+    TORCH_CHECK(rhs_dtype == torch::kInt32, "W4A16 permuted weights must be int32");
     if (rhs_scales_dtype == torch::kUInt8)
         return W4A16Type::mxfp4_e8m0;
+    TORCH_CHECK(rhs_scales_dtype == torch::kBFloat16, "INT4 W4A16 requires BF16 scales");
     return W4A16Type::int4;
 }
 
@@ -64,7 +62,7 @@ static std::string get_profiling_dtype_name(W4A16Type w4a16_type) {
         case W4A16Type::mxfp4_e8m0_mma: return "w4fa16_mma";
         case W4A16Type::int4:           return "w4a16";
         case W4A16Type::mxfp4_e8m0:     return "w4fa16";
-        default:                        return "w4fa16_s16";
+        default: DG_HOST_UNREACHABLE("Unsupported W4A16 type");
     }
 }
 

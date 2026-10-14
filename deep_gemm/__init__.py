@@ -72,7 +72,10 @@ from .deep_gemm_cpp import (
     moe_align_block_size,
     # FP4 scale / weight preprocessing
     preprocess_mxfp4_scales,
+    preprocess_weights_and_scales,
+    # deprecated alias of preprocess_weights_and_scales(MXFP4, True)
     preprocess_mxfp4_weight_for_act_and_quant_fusing,
+    PreprocessMode,
     # W4A16 / W4FA16 GEMMs
     m_grouped_gemm_w4a16_nopad,
     m_grouped_gemm_w4a16_masked,
