@@ -6,6 +6,20 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ## Unreleased
 
+### Added
+
+- **M890 W4A8 MoE GEMMs**: adds `m_grouped_gemm_fp8_fp4_bf16_nt_nopad`,
+  `m_grouped_gemm_fp8_fp4_bf16_nt_masked`, and `m_grouped_gemm_fp8_fp4_bf16_nt_fused` for per-row
+  E4M3 activations and group-32 MXFP4 weights. Uses FP4 MMA dequantization
+  to E5M2, E4M3 x E5M2 MMA, FP32 accumulation, and BF16 output.
+- **W4A8 scheduling and scale handling**: provides independent automatic
+  tile/resource selection, fused gather with grouped unpadded output, and
+  masked valid-row execution. Requires `N%64=0` and `K%128=0`.
+  `W4A8_MXFP4_MMA` preprocessing returns a third scalar `weight_inv_scale`,
+  applies a shared power-of-two exponent shift into `[114,140]`, and rejects
+  exponent codes 0 and 255 or exponent ranges spanning more than 26. The
+  inverse is applied to activation row scales exactly once per GEMM.
+
 ### Changed
 
 - **Unified weight preprocessing**: introduces

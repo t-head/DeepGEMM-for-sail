@@ -23,6 +23,9 @@
     "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:int8,groups:256,num_token:2048,topk:8,n:6144,k:128",
     "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:bf16,groups:256,num_token:64,topk:8,n:256,k:6144",
     "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:bf16,groups:256,num_token:256,topk:8,n:6144,k:128",
-    "python ./tests/run_deep_gemm.py --format=GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32"
+    "python ./tests/run_deep_gemm.py --format=GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32",
+    "python ./tests/run_deep_gemm.py --format=GroupedNoPad,data_type:w4fa8_mma,groups:4,m:35,n:64,k:128,quant_type:group,group_size:32",
+    "python ./tests/run_deep_gemm.py --format=GroupedMasked,data_type:w4fa8_mma,groups:4,m:67,n:192,k:256,distribution:[0,1,33,67],quant_type:group,group_size:32",
+    "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:w4fa8_mma,groups:8,num_token:17,topk:3,n:192,k:256,quant_type:group,group_size:32"
   ]
 }

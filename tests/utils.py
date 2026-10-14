@@ -253,7 +253,6 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
         x_int8, y_int8 = per_token_cast_to_int8(x), per_token_cast_to_int8(y)
         return  (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.uint8:
-        from deep_gemm import preprocess_mxfp4_scales
         from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch
         A = torch.randn(m, k, dtype=torch.bfloat16, device='cuda').contiguous()
         B = torch.randn(n, k, dtype=torch.bfloat16, device='cuda').contiguous()
@@ -262,8 +261,10 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
         a_dequant = dequantize_fp4_torch(a, a_scale)
         b_dequant = dequantize_fp4_torch(b, b_scale)
         out = torch.zeros(m, n, dtype=torch.bfloat16, device='cuda')
-        a_scale = preprocess_mxfp4_scales(scale=a_scale)
-        b_scale = preprocess_mxfp4_scales(scale=b_scale)
+        _, a_scale = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.MXFP4, False, weight_scale=a_scale)
+        b, b_scale = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.MXFP4, False, b, b_scale)
         ref_out = torch.mm(a_dequant, b_dequant.T)
         ref_out = ref_out.to(torch.bfloat16)
         return (a, a_scale), (b, b_scale), out, ref_out
@@ -440,8 +441,12 @@ def prepare_w4_weights(y, group_size=32, d='w4a16'):
         'w4fa8_mma': deep_gemm.PreprocessMode.W4A8_MXFP4_MMA,
     }
     ref, packed, scales = quant_w4(y, group_size, d)
-    weight, scale = deep_gemm.preprocess_weights_and_scales(modes[d], False, packed, scales)
-    return ref, weight, scale
+    if d == 'w4fa8_mma':
+        _, scales, inverse = deep_gemm.preprocess_weights_and_scales(
+            modes[d], False, weight_scale=scales)
+        return ref, packed, scales, inverse
+    prepared = deep_gemm.preprocess_weights_and_scales(modes[d], False, packed, scales)
+    return ref, prepared[0], prepared[1], 1.0
 
 
 def quantize_fp4_weight_torch(weight: torch.Tensor):
@@ -473,7 +478,7 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
     y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
     if d in ('w4a16', 'w4fa16', 'w4fa16_mma', 'w4fa8_mma'):
         assert quant_type == 'group'
-        y, y_quant, y_scale = prepare_w4_weights(y, group_size, d)
+        y, y_quant, y_scale, y_inv_scale = prepare_w4_weights(y, group_size, d)
 
     out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
     ref_out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
@@ -560,7 +565,6 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.uint8:
-        from deep_gemm import preprocess_mxfp4_scales, preprocess_mxfp4_weight_for_act_and_quant_fusing
         from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch
 
         epilogue_type = kwargs.get("epilogue_type", "Default")
@@ -578,9 +582,11 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
         y_fp4, y_fp4_scale = quantize_fp4_weight_torch(weight=y)
         y_fp4_, y_fp4_scale_ = y_fp4.clone(), y_fp4_scale.clone()
         if is_act_and_quant_fused(epilogue_type):
-            y_fp4, y_fp4_scale = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y_fp4, weight_scale=y_fp4_scale)
+            y_fp4, y_fp4_scale = deep_gemm.preprocess_weights_and_scales(
+                deep_gemm.PreprocessMode.MXFP4, True, y_fp4, y_fp4_scale)
         else:
-            y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
+            y_fp4, y_fp4_scale = deep_gemm.preprocess_weights_and_scales(
+                deep_gemm.PreprocessMode.MXFP4, False, y_fp4, y_fp4_scale)
 
         # Recompute ref_out from fp4-dequantized values for accurate comparison
         if _acc_check and not nopad:
@@ -599,7 +605,8 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
             if is_act_and_quant_fused(epilogue_type):
                 ### Reference
                 ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
-                ref_out_quanted_scale = preprocess_mxfp4_scales(scale=ref_out_quanted_scale)
+                _, ref_out_quanted_scale = deep_gemm.preprocess_weights_and_scales(
+                    deep_gemm.PreprocessMode.MXFP4, False, weight_scale=ref_out_quanted_scale)
 
                 return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
             else:
@@ -607,7 +614,7 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
 
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == 'w4fa8_mma':
-        x_quant = quant_activation(x)
+        x_quant = quant_activation(x, y_inv_scale)
         return (x_quant[0].to('cuda'),x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
@@ -625,7 +632,7 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
     y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
     if d in ('w4a16', 'w4fa16', 'w4fa16_mma', 'w4fa8_mma'):
         assert quant_type == 'group'
-        y, y_quant, y_scale = prepare_w4_weights(y, group_size, d)
+        y, y_quant, y_scale, y_inv_scale = prepare_w4_weights(y, group_size, d)
 
     out = torch.empty((m, n), device=tensor_device, dtype=torch.bfloat16)
     ref_out = torch.randn((m, n), device=tensor_device, dtype=torch.bfloat16)
@@ -669,7 +676,6 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return m, (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.uint8:
-        from deep_gemm import preprocess_mxfp4_scales, preprocess_mxfp4_weight_for_act_and_quant_fusing
         from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch
 
         epilogue_type = kwargs.get("epilogue_type", "Default")
@@ -684,12 +690,15 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
 
         # Quantize x (whole tensor) and y (per group) to fp4
         x_fp4 = quantize_fp4_torch(x)
-        x_fp4_scale = preprocess_mxfp4_scales(scale=x_fp4[1])
+        _, x_fp4_scale = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.MXFP4, False, weight_scale=x_fp4[1])
         y_fp4, y_fp4_scale = quantize_fp4_weight_torch(weight=y)
         if is_act_and_quant_fused(epilogue_type):
-            y_fp4, y_fp4_scale = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y_fp4, weight_scale=y_fp4_scale)
+            y_fp4, y_fp4_scale = deep_gemm.preprocess_weights_and_scales(
+                deep_gemm.PreprocessMode.MXFP4, True, y_fp4, y_fp4_scale)
         else:
-            y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
+            y_fp4, y_fp4_scale = deep_gemm.preprocess_weights_and_scales(
+                deep_gemm.PreprocessMode.MXFP4, False, y_fp4, y_fp4_scale)
 
         # Recompute ref_out from fp4-dequantized values for accurate comparison
         if _acc_check:
@@ -707,13 +716,14 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
             if is_act_and_quant_fused(epilogue_type):
                 ### Reference
                 ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
-                ref_out_quanted_scale = preprocess_mxfp4_scales(scale=ref_out_quanted_scale)
+                _, ref_out_quanted_scale = deep_gemm.preprocess_weights_and_scales(
+                    deep_gemm.PreprocessMode.MXFP4, False, weight_scale=ref_out_quanted_scale)
 
                 return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
 
         return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == 'w4fa8_mma':
-        x_quant = quant_activation(x)
+        x_quant = quant_activation(x, y_inv_scale)
         return m, (x_quant[0].to('cuda'), x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return m, x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
@@ -735,7 +745,7 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
     out = torch.empty((num_groups, max_m, n), device=tensor_device, dtype=torch.bfloat16)
     if d in ('w4a16', 'w4fa16', 'w4fa16_mma', 'w4fa8_mma'):
         assert quant_type == 'group'
-        y, y_quant, y_scale = prepare_w4_weights(y, group_size, d)
+        y, y_quant, y_scale, y_inv_scale = prepare_w4_weights(y, group_size, d)
 
     if _acc_check:
         ref_out = torch.einsum('gmk,gnk->gmn', x, y)
@@ -775,7 +785,6 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
             x_fp8 = (x_fp8[0], get_mn_major_tma_aligned_tensor(x_fp8[1]))
         return (x_fp8[0].to('cuda'),x_fp8[1].to('cuda')), (y_fp8[0].to('cuda'), y_fp8[1].to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     elif d == torch.uint8:
-        from deep_gemm import preprocess_mxfp4_scales, preprocess_mxfp4_weight_for_act_and_quant_fusing
         from test_fp4_core import quantize_fp4_torch, dequantize_fp4_torch
 
         epilogue_type = kwargs.get("epilogue_type", "Default")
@@ -802,13 +811,16 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
             x_ref_list.append(dequantize_fp4_torch(a_q, a_s).to(torch.float))
             y_ref_list.append(dequantize_fp4_torch(b_q, b_s).to(torch.float))
         x_fp4 = torch.stack(x_fp4_list, dim=0)
-        x_fp4_scale = preprocess_mxfp4_scales(scale=torch.stack(x_fp4_scale_list, dim=0))
+        _, x_fp4_scale = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.MXFP4, False, weight_scale=torch.stack(x_fp4_scale_list, dim=0))
         y_fp4 = torch.stack(y_fp4_list, dim=0)
         y_fp4_scale = torch.stack(y_fp4_scale_list, dim=0)
         if is_act_and_quant_fused(epilogue_type):
-            y_fp4, y_fp4_scale = preprocess_mxfp4_weight_for_act_and_quant_fusing(weight=y_fp4, weight_scale=y_fp4_scale)
+            y_fp4, y_fp4_scale = deep_gemm.preprocess_weights_and_scales(
+                deep_gemm.PreprocessMode.MXFP4, True, y_fp4, y_fp4_scale)
         else:
-            y_fp4_scale = preprocess_mxfp4_scales(scale=y_fp4_scale)
+            y_fp4, y_fp4_scale = deep_gemm.preprocess_weights_and_scales(
+                deep_gemm.PreprocessMode.MXFP4, False, y_fp4, y_fp4_scale)
 
         if _acc_check:
             x_ref = torch.stack(x_ref_list, dim=0)
@@ -818,13 +830,14 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
             if is_act_and_quant_fused(epilogue_type):
                 ### Reference
                 ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
-                ref_out_quanted_scale = preprocess_mxfp4_scales(scale=ref_out_quanted_scale)
+                _, ref_out_quanted_scale = deep_gemm.preprocess_weights_and_scales(
+                    deep_gemm.PreprocessMode.MXFP4, False, weight_scale=ref_out_quanted_scale)
 
                 return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda')), signal.to('cuda'), max_m
 
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda').to(torch.bfloat16), signal.to('cuda'), max_m
     elif d == 'w4fa8_mma':
-        x_quant = quant_activation(x)
+        x_quant = quant_activation(x, y_inv_scale)
         return (x_quant[0].to('cuda'), x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
@@ -1430,7 +1443,7 @@ def test_m_grouped_gemm_masked(args) -> None:
                 result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal)
         elif d == 'w4fa8_mma':
-            deep_gemm.m_grouped_gemm_w4a8_masked(x, y, out, masked_m, expected_m_per_group)
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
             deep_gemm.m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group)
         else:
@@ -1490,7 +1503,7 @@ def test_m_grouped_gemm_masked(args) -> None:
                 result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
                                                                         enable_sbo_overlap=enable_sbo_overlap, signal=signal)
             elif d == 'w4fa8_mma':
-                deep_gemm.m_grouped_gemm_w4a8_masked(x, y, out, masked_m, expected_m_per_group)
+                deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
             elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
                 deep_gemm.m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group)
             else:
@@ -1535,7 +1548,7 @@ def test_m_grouped_gemm_fused(args) -> None:
             else:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d == 'w4fa8_mma':
-            deep_gemm.m_grouped_gemm_w4a8_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
             deep_gemm.m_grouped_gemm_w4a16_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
         else:
@@ -1593,7 +1606,7 @@ def test_m_grouped_gemm_nopad(args) -> None:
             else:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
         elif d == 'w4fa8_mma':
-            deep_gemm.m_grouped_gemm_w4a8_nopad(x, y, out, m_indices)
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(x, y, out, m_indices)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
             deep_gemm.m_grouped_gemm_w4a16_nopad(x, y, out, m_indices)
         else:
@@ -1634,7 +1647,7 @@ def test_m_grouped_gemm_nopad(args) -> None:
             elif d == torch.uint8:
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
             elif d == 'w4fa8_mma':
-                deep_gemm.m_grouped_gemm_w4a8_nopad(x, y, out, m_indices)
+                deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(x, y, out, m_indices)
             elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
                 deep_gemm.m_grouped_gemm_w4a16_nopad(x, y, out, m_indices)
             else:
