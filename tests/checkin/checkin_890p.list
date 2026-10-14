@@ -1,7 +1,10 @@
 # DeepGEMM PR check-in caselist for Zhenwu 890P
 # Run with: python tests/run_deep_gemm.py --caselist tests/checkin/checkin_890p.list
-# Minimal per-type correctness set, superset of checkin_810e.list: adds the
-# 890P-only dtypes (fp8 / fp4 / tf32 / w4fa16) on the same core shapes.
+# Minimal per-type correctness set with 890P-only dtypes (fp8 / fp4).
+# W4A16 INT4 and MXFP4 VALU paths are covered on both 810E and 890P.
+# W4A16 MXFP4 MMA is additionally covered on 890P.
+# MQA coverage focuses on FP8/FP4, plus one BF16 and one INT8 smoke case.
+# Eight paged MQA cases total, including avg, sparse, and the INT8 smoke case.
 # Sections are split per UT type; append new cases under the matching section.
 
 # ============ DenseGemm ============
@@ -20,9 +23,6 @@ DenseGemm,data_type:int8,m:2048,n:512,k:7168
 DenseGemm,data_type:fp8,m:2048,n:4096,k:7168
 DenseGemm,data_type:fp8,m:2048,n:4096,k:7168,quant_type:channel
 
-# --- DenseGemm / tf32 ---
-DenseGemm,data_type:tf32,m:8192,n:24,k:16384
-
 # ============ GroupedMasked ============
 
 # --- GroupedMasked / int8 ---
@@ -39,6 +39,15 @@ GroupedMasked,data_type:fp8,groups:16,m:4096,n:4096,k:7168,em:12,distribution:zi
 # --- GroupedMasked / fp4 ---
 GroupedMasked,data_type:fp4,groups:32,m:16384,n:4096,k:4096,em:512,distribution:uniform
 
+# --- GroupedMasked / w4a16 ---
+GroupedMasked,data_type:w4a16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
+
+# --- GroupedMasked / w4fa16 (MXFP4 VALU) ---
+GroupedMasked,data_type:w4fa16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
+
+# --- GroupedMasked / w4fa16_mma (MXFP4 MMA) ---
+GroupedMasked,data_type:w4fa16_mma,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
+
 # ============ GroupedNoPad ============
 
 # --- GroupedNoPad / bf16 ---
@@ -51,8 +60,14 @@ GroupedNoPad,data_type:fp8,groups:16,m:4096,n:4096,k:7168,distribution:gaussian,
 # --- GroupedNoPad / fp4 ---
 GroupedNoPad,data_type:fp4,groups:256,m:4096,n:512,k:4096,em:16,distribution:uniform
 
-# --- GroupedNoPad / w4fa16 ---
+# --- GroupedNoPad / w4a16 ---
+GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
+
+# --- GroupedNoPad / w4fa16 (MXFP4 VALU) ---
 GroupedNoPad,data_type:w4fa16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
+
+# --- GroupedNoPad / w4fa16_mma (MXFP4 MMA) ---
+GroupedNoPad,data_type:w4fa16_mma,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
 
 # ============ GroupedContiguous ============
 
@@ -79,22 +94,66 @@ GroupedFused,data_type:fp8,groups:256,num_token:1024,topk:8,n:256,k:6144
 # --- GroupedFused / fp4 ---
 GroupedFused,data_type:fp4,groups:256,num_token:4096,topk:6,n:512,k:4096,distribution:uniform
 
+# --- GroupedFused / w4a16 ---
+GroupedFused,data_type:w4a16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_type:group,group_size:32
+
+# --- GroupedFused / w4fa16 (MXFP4 VALU) ---
+GroupedFused,data_type:w4fa16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_type:group,group_size:32
+
+# --- GroupedFused / w4fa16_mma (MXFP4 MMA) ---
+GroupedFused,data_type:w4fa16_mma,groups:384,num_token:8,topk:8,n:512,k:7168,quant_type:group,group_size:32
+
 # ============ MqaLogits ============
 
-# --- MqaLogits / int8 ---
-MqaLogits,data_type:int8,seq_len_q:8191,seq_len_kv:8191,num_heads:64,head_dim:128
+# --- MqaLogits / fp8 ---
+MqaLogits,data_type:fp8,seq_len_q:1024,seq_len_kv:1024,num_heads:64,head_dim:128
+MqaLogits,data_type:fp8,seq_len_q:8192,seq_len_kv:8192,num_heads:64,head_dim:128
+MqaLogits,data_type:fp8,seq_len_q:8192,seq_len_kv:8192,num_heads:64,head_dim:128,c4_compressed:1
+
+# --- MqaLogits / fp4 ---
+MqaLogits,data_type:fp4,seq_len_q:8192,seq_len_kv:8192,num_heads:64,head_dim:128,logits_dtype:bf16
+MqaLogits,data_type:fp4,seq_len_q:2048,seq_len_kv:4096,num_heads:32,head_dim:128,logits_dtype:bf16
+MqaLogits,data_type:fp4,seq_len_q:1024,seq_len_kv:8192,num_heads:64,head_dim:128,logits_dtype:fp32
 
 # --- MqaLogits / bf16 ---
 MqaLogits,data_type:bf16,seq_len_q:512,seq_len_kv:3072,num_heads:64,head_dim:128
 
-# --- MqaLogits / fp8 ---
-MqaLogits,data_type:fp8,seq_len_q:1024,seq_len_kv:1024,num_heads:64,head_dim:128
-
 # ============ PagedMqaLogits ============
 
-# --- PagedMqaLogits / bf16 ---
-PagedMqaLogits,data_type:bf16,batch_size:8,next_n:1,avg_context_len:1024
-PagedMqaLogits,data_type:bf16,batch_size:8,next_n:1,avg_context_len:65536
-
 # --- PagedMqaLogits / fp8 ---
-PagedMqaLogits,data_type:fp8,batch_size:64,next_n:1,avg_context_len:2048
+PagedMqaLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:32,logits_dtype:fp32
+PagedMqaLogits,data_type:fp8,batch_size:64,next_n:2,num_heads:64,head_dim:128,avg_context_len:8192,page_kv:128,logits_dtype:fp32
+
+# --- PagedMqaLogits / fp4 ---
+PagedMqaLogits,data_type:fp4,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1],page_kv:64,logits_dtype:bf16
+PagedMqaLogits,data_type:fp4,batch_size:64,next_n:6,num_heads:64,head_dim:128,avg_context_len:8192,page_kv:64,logits_dtype:bf16
+
+# --- PagedMqaLogits / int8 ---
+PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,avg_context_len:2048
+
+# ============ MqaAvgLogits ============
+
+# --- MqaAvgLogits / fp8 ---
+MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:2,logits_dtype:fp32
+MqaAvgLogits,data_type:fp8,seq_len_q:129,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32
+MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16
+
+# ============ PagedMqaAvgLogits ============
+
+# --- PagedMqaAvgLogits / fp8 ---
+PagedMqaAvgLogits,data_type:fp8,batch_size:8,next_n:5,num_heads:4,head_dim:128,avg_context_len:1024,logits_dtype:bf16,page_kv:128
+
+# ============ SparseMqaLogits ============
+
+# --- SparseMqaLogits / fp4 ---
+SparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:1024,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:256,use_unaligned_ks:0,check_metadata:1
+SparseMqaLogits,data_type:fp4,seq_len_q:9,seq_len_kv:639,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:128,use_unaligned_ks:1,check_metadata:1
+SparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:1024,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:256,use_unaligned_ks:0,check_metadata:1
+SparseMqaLogits,data_type:fp4,seq_len_q:9,seq_len_kv:639,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,use_unaligned_ks:1,check_metadata:1
+SparseMqaLogits,data_type:fp4,seq_len_q:2,seq_len_kv:0,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:4,use_unaligned_ks:0,check_metadata:1
+
+# ============ PagedSparseMqaLogits ============
+
+# --- PagedSparseMqaLogits / fp4 ---
+PagedSparseMqaLogits,data_type:fp4,seq_len_q:313,seq_len_kv:1023,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,check_metadata:1
+PagedSparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:65536,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:128,check_metadata:1
