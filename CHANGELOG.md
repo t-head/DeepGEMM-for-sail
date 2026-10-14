@@ -19,6 +19,21 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   applies a shared power-of-two exponent shift into `[114,140]`, and rejects
   exponent codes 0 and 255 or exponent ranges spanning more than 26. The
   inverse is applied to activation row scales exactly once per GEMM.
+- **M890 standalone activation**: adds `silu_and_mul(mode, input, ...)`
+  and `situ_and_mul(mode, input, *, beta, ...)`, with a required first
+  `ActivationQuantMode` argument: `BF16`, `FP8_CHANNEL`, `FP8_BLOCK`,
+  `MXFP4`, or `MXFP8`. BF16 returns a tensor; quantized modes return values
+  and scales. Supports dense/batched inputs and masked expert inputs;
+  `expected_m` is a scheduling hint and never limits valid-row coverage.
+- **Activation quantization and execution**: supports FP32 per-row or
+  group-128 FP8 scales, natural MXFP8 scales, and natural or reordered
+  M-major MXFP4 scales. FP8-channel can fold a GEMM weight inverse into its
+  returned row scales. Processes eight consecutive elements per
+  thread with native packed conversions, vector stores, and a shared
+  MXFP4/MXFP8 double-buffered pipeline. Partial tiles and unaligned input
+  are supported.
+  Clamp boundaries round to BF16; other intermediate arithmetic uses
+  FP32 with native PPU sigmoid. SiTU supports configurable gate/up softcaps.
 
 ### Changed
 

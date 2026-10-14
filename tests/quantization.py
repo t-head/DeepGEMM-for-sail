@@ -72,8 +72,10 @@ def decode_weight(packed, scales):
 
 def quant_activation(x, weight_inv_scale=1.0):
     """Quantize E4M3, then fold the weight inverse into the FP32 output row scale."""
-    scale = (x.float().abs().amax(-1, keepdim=True) / 448).clamp_min(1e-12)
-    quantized = (x.float() / scale).to(torch.float8_e4m3fn)
+    amax = x.float().abs().amax(-1, keepdim=True).clamp_min(1e-10)
+    scale = amax * (1.0 / 448.0)
+    inverse = 448.0 / amax
+    quantized = (x.float() * inverse).clamp(-448, 448).to(torch.float8_e4m3fn)
     if weight_inv_scale != 1.0:
         scale *= weight_inv_scale
     return quantized, scale
