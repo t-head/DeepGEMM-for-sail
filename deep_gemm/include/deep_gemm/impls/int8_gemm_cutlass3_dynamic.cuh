@@ -92,7 +92,11 @@ struct PPUTypeBuilder {
   using OperatorClass = cutlass::arch::OpClassTensorOp;
   static constexpr bool TransA = false;
   static constexpr bool TransB = false;
+#if __HGGC_ARCH__ == 100
+  using ArchTag = cutlass::arch::PPU0010;
+#else
   using ArchTag = cutlass::arch::PPU0015;
+#endif
 
   using ProblemShape = Shape<int,int,int,int>;
 
