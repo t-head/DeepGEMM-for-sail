@@ -211,10 +211,13 @@ public:
         flags += " -DUSE_HGGC -DUSE_CLANG -DUSE_ACWRAPPER ";
 
         // --- Architecture ---
-        if (is_ppu1v5_device()) {
+        const auto arch = get_ppu_arch();
+        if (arch == AC_PPU0015) {
             flags += "-arch=ppu_15 ";
-        } else {
+        } else if (arch == AC_PPU0010) {
             flags += "-arch=ppu_10 ";
+        } else {
+            DG_HOST_UNREACHABLE("Unknown PPU architecture");
         }
 
         // --- Include paths ---
@@ -248,7 +251,7 @@ public:
         // Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use -Xllvm flags,
         // others only need -ppu-simt-branch=false (aligned with compiler.py logic)
         std::string per_kernel_flags;
-        if (is_ppu1v5_device()) {
+        if (get_ppu_arch() == AC_PPU0015) {
             per_kernel_flags = " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
                                " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
             const bool use_warp_interleaving = (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
@@ -358,8 +361,10 @@ public:
                 opts_insert({
                     "--ppu-arch=ppu0015",
                 });
+            } else {
+                DG_HOST_UNREACHABLE("Unknown PPU architecture");
             }
-            if (is_ppu1v5_device()) {
+            if (get_ppu_arch() == AC_PPU0015) {
                 opts_insert({
                     "--ppu-tuning-options=-ppu-patch-fence-ppu=false",
                     "--ppu-tuning-options=-wno-loop-miss-transform",
@@ -430,7 +435,7 @@ public:
         // Write the code into the cache directory
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);
-        acArch_t arch = is_ppu1v5_device() ? AC_PPU0015 : AC_PPU0010;
+        acArch_t arch = get_ppu_arch();
         RtcOptions opts(arch, lib, name);
         // Print HGRTC compile options when DG_JIT_DEBUG is enabled
         if (get_env<int>("DG_JIT_DEBUG", 0)) {
@@ -471,8 +476,7 @@ public:
 };
 
 static auto compiler = LazyInit<Compiler>([]() -> std::shared_ptr<Compiler> {
-    const int default_use_hgrtc = is_ppu1v5_device() ? 0 : 0;
-    if (get_env<int>("DG_JIT_USE_HGRTC", default_use_hgrtc)) {
+    if (get_env<int>("DG_JIT_USE_HGRTC", 0)) {
         return std::make_shared<HGRTCCompiler>();
     } else {
         return std::make_shared<HGCCCompiler>();
