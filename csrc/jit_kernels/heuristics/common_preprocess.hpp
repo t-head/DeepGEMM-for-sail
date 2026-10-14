@@ -1,4 +1,5 @@
 #pragma once
+#include <cmath>
 #include <string>
 #include <utility>
 #include <torch/torch.h>
@@ -20,6 +21,13 @@ enum class PreprocessMode {
     INT8,             // int8 weight with per-channel scales
     BF16,             // unquantized bf16 weight
     W4A8_MXFP4_MMA,   // E4M3 activation, FP4 MMA dequant with E8M0 scales
+};
+
+struct PreprocessedWeights {
+    torch::Tensor weight;
+    torch::Tensor scale;
+    // Only used in W4A8_MXFP4_MMA: Fold into the activation row scale
+    float inv_scale = 1.0f;
 };
 
 inline const char* preprocess_mode_name(const PreprocessMode& mode) {
@@ -46,7 +54,7 @@ inline const char* preprocess_mode_name(const PreprocessMode& mode) {
 // The MXFP4 activation-fusion branch must run before `preprocess_mxfp4_scales`. Its inputs must
 // still be raw contiguous uint8 here, which is exactly what `preprocess_mxfp4_scales` takes away:
 // it packs the scale into uint16 and re-strides it to N-major.
-inline std::pair<torch::Tensor, torch::Tensor> preprocess_weights_and_scales(
+inline PreprocessedWeights preprocess_weights_and_scales(
         const PreprocessMode& mode, bool fuse_activation,
         const torch::Tensor& weight, const std::optional<const torch::Tensor>& weight_scale) {
     if ((mode == PreprocessMode::W4A16_INT4 || mode == PreprocessMode::W4A16_MXFP4)
@@ -123,9 +131,20 @@ inline std::pair<torch::Tensor, torch::Tensor> preprocess_weights_and_scales(
         TORCH_CHECK(scales.scalar_type()==torch::kUInt8 && scales.sizes()==std::vector<int64_t>({e,n,k/32}),
                     name, " raw E8M0 scales must be uint8 [E,N,K/32]");
         TORCH_CHECK(packed.device()==scales.device(), "weights and scales must share a device");
+        int exponent_shift = 0;
+        torch::Tensor adjusted_scales = scales;
         if (w4a8) {
-            TORCH_CHECK(((scales >= 114) & (scales <= 140)).all().item<bool>(),
-                        "W4FA8 E8M0 scale outside [114,140]; multiscale fallback is not implemented");
+            const int min_scale = scales.min().item<int>();
+            const int max_scale = scales.max().item<int>();
+            TORCH_CHECK(min_scale > 0 && max_scale < 255 && max_scale - min_scale <= 26,
+                        "W4FA8 E8M0 scale range [", min_scale, ",", max_scale,
+                        "] cannot fit [114,140]: 0/255 are invalid and spread must be <=26");
+            if (min_scale < 114)
+                exponent_shift = 114 - min_scale;
+            else if (max_scale > 140)
+                exponent_shift = 140 - max_scale;
+            if (exponent_shift != 0)
+                adjusted_scales = scales.to(torch::kInt16).add(exponent_shift).to(torch::kUInt8);
         }
         std::vector<int64_t> perm;
         for (int i=0;i<8;++i) for(int j=0;j<8;++j) {
@@ -133,9 +152,9 @@ inline std::pair<torch::Tensor, torch::Tensor> preprocess_weights_and_scales(
             perm.push_back(2*i+16*j+1);
         }
         const auto indices=at::tensor(perm,at::TensorOptions().dtype(at::kLong)).to(scales.device());
-        auto rearranged=scales.reshape({e,n/64,64,k/64,2}).permute({0,1,3,2,4}).contiguous();
+        auto rearranged=adjusted_scales.reshape({e,n/64,64,k/64,2}).permute({0,1,3,2,4}).contiguous();
         rearranged=rearranged.reshape({-1,128}).index_select(1,indices).reshape({e,n/64,k*2}).contiguous();
-        return {packed.contiguous(),rearranged};
+        return {packed.contiguous(), rearranged, std::ldexp(1.0f, -exponent_shift)};
     }
     if (mode == PreprocessMode::MXFP4 && fuse_activation) {
         DG_HOST_ASSERT(weight.dim() == 3);
@@ -171,7 +190,8 @@ inline std::pair<torch::Tensor, torch::Tensor> preprocess_weights_and_scales(
 /// the MXFP4 + fuse_activation interleaving, so forward it instead of duplicating the logic.
 inline std::pair<torch::Tensor, torch::Tensor> preprocess_mxfp4_weight_for_act_and_quant_fusing(
         const torch::Tensor& weight, const torch::Tensor& weight_scale) {
-    return preprocess_weights_and_scales(PreprocessMode::MXFP4, true, weight, weight_scale);
+    auto result = preprocess_weights_and_scales(PreprocessMode::MXFP4, true, weight, weight_scale);
+    return {result.weight, result.scale};
 }
 
 } // namespace deep_gemm_preprocess_common

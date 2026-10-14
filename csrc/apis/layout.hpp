@@ -50,7 +50,14 @@ static void register_apis(pybind11::module_& m) {
         .value("INT8", deep_gemm_preprocess_common::PreprocessMode::INT8)
         .value("BF16", deep_gemm_preprocess_common::PreprocessMode::BF16);
     m.def("preprocess_weights_and_scales",
-          &deep_gemm_preprocess_common::preprocess_weights_and_scales,
+          [](const deep_gemm_preprocess_common::PreprocessMode mode, bool fuse_activation,
+             const torch::Tensor& weight, const std::optional<const torch::Tensor>& weight_scale) {
+              auto result = deep_gemm_preprocess_common::preprocess_weights_and_scales(
+                  mode, fuse_activation, weight, weight_scale);
+              if (mode == deep_gemm_preprocess_common::PreprocessMode::W4A8_MXFP4_MMA)
+                  return py::make_tuple(result.weight, result.scale, result.inv_scale);
+              return py::make_tuple(result.weight, result.scale);
+          },
           py::arg("mode"), py::arg("fuse_activation"), py::arg("weight"), py::arg("weight_scale"));
     m.def("preprocess_mxfp4_weight_for_act_and_quant_fusing",
           &deep_gemm_preprocess_common::preprocess_mxfp4_weight_for_act_and_quant_fusing,

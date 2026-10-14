@@ -421,8 +421,8 @@ def prepare_w4_weights(y, group_size=32, d='w4a16'):
         'w4fa8_mma': deep_gemm.PreprocessMode.W4A8_MXFP4_MMA,
     }
     ref, packed, scales = quant_w4(y, group_size, d)
-    weight, scale = deep_gemm.preprocess_weights_and_scales(modes[d], False, packed, scales)
-    return ref, weight, scale
+    prepared = deep_gemm.preprocess_weights_and_scales(modes[d], False, packed, scales)
+    return ref, prepared[0], prepared[1], prepared[2] if d == 'w4fa8_mma' else 1.0
 
 
 def quantize_fp4_weight_torch(weight: torch.Tensor):
@@ -454,7 +454,7 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
     y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
     if d in ('w4a16', 'w4fa16', 'w4fa16_mma', 'w4fa8_mma'):
         assert quant_type == 'group'
-        y, y_quant, y_scale = prepare_w4_weights(y, group_size, d)
+        y, y_quant, y_scale, y_inv_scale = prepare_w4_weights(y, group_size, d)
 
     out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
     ref_out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
@@ -588,7 +588,7 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
 
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == 'w4fa8_mma':
-        x_quant = quant_activation(x)
+        x_quant = quant_activation(x, y_inv_scale)
         return (x_quant[0].to('cuda'),x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
@@ -606,7 +606,7 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
     y = torch.randn((num_groups, n, k), device=tensor_device, dtype=torch.bfloat16)
     if d in ('w4a16', 'w4fa16', 'w4fa16_mma', 'w4fa8_mma'):
         assert quant_type == 'group'
-        y, y_quant, y_scale = prepare_w4_weights(y, group_size, d)
+        y, y_quant, y_scale, y_inv_scale = prepare_w4_weights(y, group_size, d)
 
     out = torch.empty((m, n), device=tensor_device, dtype=torch.bfloat16)
     ref_out = torch.randn((m, n), device=tensor_device, dtype=torch.bfloat16)
@@ -694,7 +694,7 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
 
         return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == 'w4fa8_mma':
-        x_quant = quant_activation(x)
+        x_quant = quant_activation(x, y_inv_scale)
         return m, (x_quant[0].to('cuda'), x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return m, x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
@@ -716,7 +716,7 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
     out = torch.empty((num_groups, max_m, n), device=tensor_device, dtype=torch.bfloat16)
     if d in ('w4a16', 'w4fa16', 'w4fa16_mma', 'w4fa8_mma'):
         assert quant_type == 'group'
-        y, y_quant, y_scale = prepare_w4_weights(y, group_size, d)
+        y, y_quant, y_scale, y_inv_scale = prepare_w4_weights(y, group_size, d)
 
     if _acc_check:
         ref_out = torch.einsum('gmk,gnk->gmn', x, y)
@@ -805,7 +805,7 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
 
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda').to(torch.bfloat16), signal.to('cuda'), max_m
     elif d == 'w4fa8_mma':
-        x_quant = quant_activation(x)
+        x_quant = quant_activation(x, y_inv_scale)
         return (x_quant[0].to('cuda'), x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m

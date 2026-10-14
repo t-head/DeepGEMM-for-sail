@@ -70,7 +70,10 @@ def decode_weight(packed, scales):
     return values[codes] * torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
 
 
-def quant_activation(x):
-    """E4M3 activation with FP32 per-row scale; accepts batched rows too."""
+def quant_activation(x, weight_inv_scale=1.0):
+    """Quantize E4M3, then fold the weight inverse into the FP32 output row scale."""
     scale = (x.float().abs().amax(-1, keepdim=True) / 448).clamp_min(1e-12)
-    return (x.float() / scale).to(torch.float8_e4m3fn), scale
+    quantized = (x.float() / scale).to(torch.float8_e4m3fn)
+    if weight_inv_scale != 1.0:
+        scale *= weight_inv_scale
+    return quantized, scale

@@ -6,17 +6,32 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ## Unreleased
 
+### Added
+
+- **M890 W4A8 MoE GEMMs**: adds `m_grouped_gemm_w4a8_nopad`,
+  `m_grouped_gemm_w4a8_masked`, and `m_grouped_gemm_w4a8_fused` for per-row
+  E4M3 activations and group-32 MXFP4 weights. Uses FP4 MMA dequantization
+  to E5M2, E4M3 x E5M2 MMA, FP32 accumulation, and BF16 output.
+- **W4A8 scheduling and scale handling**: provides independent automatic
+  tile/resource selection, fused gather with grouped unpadded output, and
+  masked valid-row execution. Requires `N%64=0` and `K%128=0`.
+  `W4A8_MXFP4_MMA` preprocessing returns a third scalar `weight_inv_scale`,
+  applies a shared power-of-two exponent shift into `[114,140]`, and rejects
+  exponent codes 0 and 255 or exponent ranges spanning more than 26. The
+  inverse is applied to activation row scales exactly once per GEMM.
+
 ### Changed
 
 - **Unified weight preprocessing**: introduces
   `preprocess_weights_and_scales(mode, fuse_activation, weight, weight_scale)`
   and exports `PreprocessMode`. Both `mode` and `fuse_activation` are explicit
-  arguments; the function returns the processed weights and scales.
+  arguments; the function returns the processed weights and scales (plus
+  `weight_inv_scale` for `W4A8_MXFP4_MMA`).
 - **W4 preprocessing layouts**: accepts naturally packed weights and group-32
   scales for `W4A16_INT4`, `W4A16_MXFP4`, `W4A16_MXFP4_MMA`, and
   `W4A8_MXFP4_MMA` with `fuse_activation=False`. Applies the corresponding
   weight/scale rearrangements; MMA modes retain the natural packed weight layout.
-  The W4A8 preprocessing mode validates E8M0 scales in `[114, 140]`.
+  The W4A8 preprocessing mode rearranges the adjusted E8M0 scales in `[114, 140]`.
 - **MXFP4 gate/up preprocessing**: preserves gate/up interleaving for
   `PreprocessMode.MXFP4` with `fuse_activation=True`, before
   `preprocess_mxfp4_scales`. The old
