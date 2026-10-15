@@ -257,21 +257,16 @@ using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int
 static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
     const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
     const torch::Tensor& rhs_scales, const torch::Tensor& out, const torch::Tensor& m_indices, const int& m,
-    const int& n, const int& k, const int& num_groups, std::optional<ConfigTuple> configs,
-    bool is_a8w4 = false) {
+    const int& n, const int& k, const int& num_groups, std::optional<ConfigTuple> configs) {
     int num_sms = get_num_sms();
     ConfigTuple cfg;
     if (configs.has_value()) {
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
-        auto smem_config = is_a8w4
-            ? deep_gemm_a8w4_common::get_smem_config_a8w4(nst, bm, bn, bk)
-            : deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1);
-        cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst, smem_config);
+        cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
+            deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
     } else {
         cfg = deep_gemm_int8::get_best_configs(
-            m, n, k, num_groups, num_sms, GemmType::GroupedContiguous,
-            /*max_block_n=*/256, /*runtime_lut_kind=*/std::nullopt,
-            /*from_runtime_lut=*/nullptr, /*is_a8w4=*/is_a8w4);
+            m, n, k, num_groups, num_sms, GemmType::GroupedContiguous);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -309,11 +304,10 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
     std::string profile_type;
     if (dtype == torch::kInt8) {
         converted_input_a = lhs.data_ptr<int8_t>();
-        // A8W4 rhs is raw packed INT4 bytes stored as torch.uint8
-        converted_input_b = is_a8w4 ? rhs.data_ptr() : rhs.data_ptr<int8_t>();
+        converted_input_b = rhs.data_ptr<int8_t>();
         type_info = "int8_t";
-        kernel_name = is_a8w4 ? "a8w4_int8_grouped_deep_gemm_contiguous" : "int8_grouped_deep_gemm_contiguous";
-        profile_type = is_a8w4 ? "w4a8_int8" : "int8";
+        kernel_name = "int8_grouped_deep_gemm_contiguous";
+        profile_type = "int8";
     } else {
         converted_input_a = reinterpret_cast<const void*>(lhs.data_ptr<at::Float8_e4m3fn>());
         converted_input_b = reinterpret_cast<const void*>(rhs.data_ptr<at::Float8_e4m3fn>());
@@ -344,9 +338,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
 
         auto args = INT8GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
                                                                   num_stages, "GroupedContiguous", "Default",
-                                                                  kernel_name, /*enable_sbo_overlap=*/false,
-                                                                  /*transposed_batch_output=*/true,
-                                                                  is_a8w4},
+                                                                  kernel_name, /*enable_sbo_overlap=*/false},
                                                   .launch_args = {grid, block, SMSIZE},
                                                   .kernel_params = params,
                                                   .type_info = type_info};
@@ -384,7 +376,6 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
             printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
         }
     } else {
-        DG_HOST_ASSERT(!is_a8w4);
         int64_t stride, increment_row, increment_group, increment_cluster;
         int64_t advance_row, advance_group, advance_cluster, advance_tile;
         using ElementType = int8_t;
@@ -482,9 +473,11 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
             : deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1);
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst, smem_config);
     } else {
+        const auto lut_kind = is_a8w4 ? deep_gemm_int8::get_a8w4_lut_kind()
+                                      : deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         cfg = deep_gemm_int8::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked, max_block_n, /*runtime_lut_kind=*/std::nullopt,
-            /*from_runtime_lut=*/nullptr, /*is_a8w4=*/is_a8w4);
+            expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked, max_block_n,
+            /*runtime_lut_kind=*/lut_kind, /*from_runtime_lut=*/nullptr, /*is_a8w4=*/is_a8w4);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -950,9 +943,11 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
             : deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1);
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst, smem_config);
     } else {
+        const auto lut_kind = is_a8w4 ? deep_gemm_int8::get_a8w4_lut_kind()
+                                      : deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         cfg = deep_gemm_int8::get_best_configs(
             expected_m, n, k, num_groups, num_sms, GemmType::GroupedNoPad,
-            /*max_block_n=*/256, /*runtime_lut_kind=*/std::nullopt,
+            /*max_block_n=*/256, /*runtime_lut_kind=*/lut_kind,
             /*from_runtime_lut=*/nullptr, /*is_a8w4=*/is_a8w4);
     }
 
@@ -1216,14 +1211,6 @@ static void m_grouped_gemm_int8_int8_bf16_nt_nopad_impl(const torch::Tensor& lhs
     // Route to per-channel implementation
     m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(lhs, lhs_scales, rhs, rhs_scales, out, m_indices, m, n, k, num_groups,
                                                   m_rows, configs);
-}
-
-static void m_grouped_gemm_int8_int4_bf16_nt_contiguous_impl(
-    const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
-    const torch::Tensor& rhs_scales, const torch::Tensor& out, const torch::Tensor& m_indices,
-    const int m, const int n, const int k, const int num_groups, std::optional<ConfigTuple> configs) {
-    m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
-        lhs, lhs_scales, rhs, rhs_scales, out, m_indices, m, n, k, num_groups, configs, /*is_a8w4=*/true);
 }
 
 static std::pair<int, int> m_grouped_gemm_int8_int4_bf16_nt_masked_impl(

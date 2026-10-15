@@ -22,6 +22,10 @@ inline deep_gemm_lut::RuntimeLutKind get_a8w8_lut_kind(at::ScalarType dtype) {
         : deep_gemm_lut::RuntimeLutKind::INT8;
 }
 
+inline deep_gemm_lut::RuntimeLutKind get_a8w4_lut_kind() {
+    return deep_gemm_lut::RuntimeLutKind::A8W4INT8;
+}
+
 std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, int block_n, int block_k = 128,
                                           int bpp = 1, int element_b_bits = 8) {
     DG_HOST_ASSERT(element_b_bits == 4 || element_b_bits == 8);
@@ -614,38 +618,36 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
                  bool* from_runtime_lut = nullptr,
                  bool is_a8w4 = false) {
     const int element_b_bits = is_a8w4 ? 4 : 8;
-    if (!is_a8w4) {
-        if (from_runtime_lut) *from_runtime_lut = false;
-        std::optional<deep_gemm_int8_lut::Tile> lut_result;
-        if (runtime_lut_kind.has_value()) {
-            lut_result = deep_gemm_lut::get_runtime_config(m, n, k, num_groups, gemm_type, *runtime_lut_kind);
-            if (from_runtime_lut) *from_runtime_lut = lut_result.has_value();
-        }
-        if (!lut_result.has_value()) {
-            lut_result = deep_gemm_int8_lut::get_best_configs_from_lut(m, n, k, gemm_type);
-        }
-        if (lut_result.has_value()) {
-            int best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages;
-            std::tie(best_block_m, best_block_n, best_block_k,
-                    best_warp_m, best_warp_n, best_stages) = lut_result.value();
-            auto best_smem_config = get_smem_config(best_stages, k,
-                                                    best_block_m, best_block_n,
-                                                    best_block_k, 1);
-            return std::make_tuple(num_sms, best_block_m, best_block_n, best_block_k,
-                                best_warp_m, best_warp_n, best_stages, best_smem_config);
-        }
-        // Adaptive tile selection for DenseGemm (INT8). warp_k/dense_s2_opt are injected in the dense
-        // impl; here we only apply the adaptive tile choice (incl. bk *= 2) and return the 8-tuple.
-        if (gemm_type == GemmType::DenseGemm && is_ppu1v5_device() &&
-            deep_gemm_adaptive::int8_adaptive_enabled(m, n, k)) {
-            return get_adaptive_configs_int8(m, n, k, num_sms);
-        }
-        if (is_ppu1v5_device()) {
-            return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, gemm_type, max_block_n);
-        }
-    } else {
-        DG_HOST_ASSERT(is_ppu1v0_device());
-        DG_HOST_ASSERT(gemm_type != GemmType::DenseGemm);
+    // A8W4 is only implemented for grouped GEMMs on PPU1.0.
+    DG_HOST_ASSERT(!is_a8w4 || (is_ppu1v0_device() && gemm_type != GemmType::DenseGemm));
+    if (from_runtime_lut) *from_runtime_lut = false;
+    std::optional<deep_gemm_int8_lut::Tile> lut_result;
+    if (runtime_lut_kind.has_value()) {
+        lut_result = deep_gemm_lut::get_runtime_config(m, n, k, num_groups, gemm_type, *runtime_lut_kind);
+        if (from_runtime_lut) *from_runtime_lut = lut_result.has_value();
+    }
+    // The built-in LUT contains A8W8 configs only; A8W4 falls back from its runtime LUT to its heuristic finalizer.
+    if (!is_a8w4 && !lut_result.has_value()) {
+        lut_result = deep_gemm_int8_lut::get_best_configs_from_lut(m, n, k, gemm_type);
+    }
+    if (lut_result.has_value()) {
+        int best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages;
+        std::tie(best_block_m, best_block_n, best_block_k,
+                 best_warp_m, best_warp_n, best_stages) = lut_result.value();
+        const auto best_smem_config = is_a8w4
+            ? deep_gemm_a8w4_common::get_smem_config_a8w4(best_stages, best_block_m, best_block_n, best_block_k)
+            : get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1);
+        return std::make_tuple(num_sms, best_block_m, best_block_n, best_block_k,
+                               best_warp_m, best_warp_n, best_stages, best_smem_config);
+    }
+    // Adaptive tile selection for DenseGemm (INT8). warp_k/dense_s2_opt are injected in the dense
+    // impl; here we only apply the adaptive tile choice (incl. bk *= 2) and return the 8-tuple.
+    if (gemm_type == GemmType::DenseGemm && is_ppu1v5_device() &&
+        deep_gemm_adaptive::int8_adaptive_enabled(m, n, k)) {
+        return get_adaptive_configs_int8(m, n, k, num_sms);
+    }
+    if (is_ppu1v5_device()) {
+        return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, gemm_type, max_block_n);
     }
     // FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
     std::vector<int> block_ms;

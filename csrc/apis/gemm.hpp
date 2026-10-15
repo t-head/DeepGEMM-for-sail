@@ -516,24 +516,6 @@ static void check_a8w4_int8_common(const torch::Tensor& lhs, const torch::Tensor
                 "A8W4 tensors must be contiguous");
 }
 
-void m_grouped_gemm_int8_int4_bf16_nt_contiguous(
-    const std::pair<torch::Tensor, torch::Tensor>& a,
-    const std::pair<torch::Tensor, torch::Tensor>& b,
-    const torch::Tensor& out, const torch::Tensor& m_indices,
-    std::optional<ConfigTuple> configs = std::nullopt) {
-    const auto& [m, k] = get_shape<2>(a.first);
-    const int num_groups = b.first.size(0);
-    const int n = b.first.size(1);
-    check_a8w4_int8_common(a.first, a.second, b.first, b.second, out, num_groups, n, k);
-    TORCH_CHECK(out.sizes() == std::vector<int64_t>({m, n}), "A8W4 output must have shape [m, n]");
-    TORCH_CHECK(a.second.sizes() == std::vector<int64_t>({m, 1}), "A8W4 lhs scales must have shape [m, 1]");
-    TORCH_CHECK(m_indices.scalar_type() == torch::kInt32 && m_indices.is_contiguous() && m_indices.numel() == m,
-                "A8W4 m_indices must be contiguous int32 with m elements");
-    if (m == 0) return;
-    m_grouped_gemm_int8_int4_bf16_nt_contiguous_impl(
-        a.first, a.second, b.first, b.second, out, m_indices, m, n, k, num_groups, configs);
-}
-
 std::pair<int, int> m_grouped_gemm_int8_int4_bf16_nt_masked(
     const std::pair<torch::Tensor, torch::Tensor>& a,
     const std::pair<torch::Tensor, torch::Tensor>& b,
@@ -1681,8 +1663,6 @@ static void register_apis(pybind11::module_& m) {
           py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
     // A8W4 INT8 MoE GEMMs. The model stores portable packed signed-INT4 rhs; call
     // deep_gemm.preprocess_a8w4_weight after loading it to apply the device-specific permutation.
-    m.def("m_grouped_gemm_int8_int4_bf16_nt_contiguous", &m_grouped_gemm_int8_int4_bf16_nt_contiguous,
-          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"), py::arg("configs") = std::nullopt);
     m.def("m_grouped_gemm_int8_int4_bf16_nt_masked", &m_grouped_gemm_int8_int4_bf16_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"), py::arg("expected_m"),
           py::arg("max_block_n") = 256, py::arg("configs") = std::nullopt);
