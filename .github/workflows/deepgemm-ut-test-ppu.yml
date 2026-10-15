@@ -1,4 +1,4 @@
-name: deepgemm ut test     # Workflow name displayed on the Actions page
+name: deepgemm ut test
 
 on:
   workflow_call:
@@ -27,20 +27,20 @@ jobs:
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 360
+    # The command covers pip installs, the full bdist_wheel build and every
+    # case in the board's caselist. First runs compile all JIT kernels on a
+    # cold cache (test_core ~2580s, tile_scan comparable on ZW810E), so keep
+    # the job ceiling well above the expected total.
+    timeout-minutes: 480
     strategy:
       fail-fast: false
       matrix:
-        # Pair each runner with its dedicated caselist; build and test run separately per board.
-        include:
-          - runner: ZW-M890P
-            caselist: casecmd_890p.list
-          - runner: OAM-810E
-            caselist: casecmd_810e.list
+        # Each runner selects its command group (same key) from
+        # scripts/testcase.json via pr-deepgemm-ut.py --suite.
+        runner: [ZW-M890P, OAM-810E]
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history so the base..head diff below resolves both ends.
           fetch-depth: 0
           # Fetch submodules (e.g. third-party/actlize_*, third-party/fmt) at checkout time, recursively.
           submodules: recursive
@@ -50,11 +50,16 @@ jobs:
         uses: t-head/ppu-scheduler-action@main
         with:
           image: ${{ env.SAIL_IMAGE }}
+          container_options: |
+            cpus: "40"
           nnodes: 0
           nproc_per_node: 1
           node_selector: "board-type=${{ matrix.runner }}"
           namespace: ppu-sched
-          timeout_minutes: 300
+          # Ceiling for the whole command (env setup + build + all cases).
+          # Expected totals grow with the per-case cold-cache ceilings in
+          # pr-deepgemm-ut.py; 420min leaves headroom over the observed runs.
+          timeout_minutes: 420
           command: |
             set -ex
             # Fix the image's unreachable pip and GitHub mirror settings before cloning sources.
@@ -135,10 +140,9 @@ jobs:
             python ./setup.py bdist_wheel > "$LOG_FILE" 2> "$ERROR_LOG"
             EXIT_CODE=$?
 
-            # Check the build result.
             if [ $EXIT_CODE -ne 0 ]; then
                 echo "Build failed with exit code $EXIT_CODE"
-                cat "$ERROR_LOG" # Show error details
+                cat "$ERROR_LOG"
                 echo "----- last 1000 lines of $LOG_FILE -----"
                 tail -n 1000 "$LOG_FILE"
                 exit 1
@@ -152,13 +156,12 @@ jobs:
             echo "START TO TEST CASES"
             set +e
             python .github/workflows/scripts/pr-deepgemm-ut.py \
-              --caselist .github/workflows/scripts/${{ matrix.caselist }}
+              --caselist .github/workflows/scripts/testcase.json \
+              --suite ${{ matrix.runner }}
             TEST_EXIT_CODE=$?
-            # Record the runtime environment alongside the JUnit report.
             python3 .github/workflows/scripts/generate-env-info.py \
             --docker-image "${{ env.SAIL_IMAGE }}" \
             --output env_info.json
-            # Copy the JUnit report and runtime information to NAS for the runner.
             # Keep results per runner so the parallel matrix jobs do not collide.
             NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
             mkdir -p "$NAS_RESULT_DIR"

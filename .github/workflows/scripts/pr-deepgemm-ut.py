@@ -3,15 +3,23 @@ import os
 import sys
 import time
 import argparse
+import json
 import re
 import signal
 from junit_xml import TestCase, TestSuite
 
-# Configuration: output file name and per-case timeout limits
 OUTPUT_XML = "test-results.xml"
 DEFAULT_TIMEOUT_SECONDS = 1200
+# Ceilings are sized for the first run of a fresh CI workspace, where every
+# JIT kernel must be compiled by hgcc on a cold kernel cache. Measured on
+# ZW810E (PR #15, commit 35fb2c0): test_core.py alone needs ~2580s single
+# process; tile_scan_with_test.py spends most of its wall time compiling
+# per-tile kernels, which also exceeds the 1200s default on a cold cache.
+# Keep these comfortably above the observed times so slow-but-passing runs
+# are not killed.
 CASE_TIMEOUT_OVERRIDES = {
-    "tests/test_core.py": 1800,
+    "tests/test_core.py": 3600,
+    "tests/tile_scan_with_test.py": 3600,
     "tests/test_fp4_core.py": 3000,
     "tests/test_fp8_core.py": 2100,
 }
@@ -127,6 +135,32 @@ def parse_commands(filepath, is_sh):
     return test_commands
 
 
+def load_caselist(caselist_path, suite=""):
+    """Load test commands from a caselist.
+
+    A .json caselist (testcase.json) maps suite keys (board names) to command
+    arrays; `suite` selects the key. Plain .list/.sh caselists keep the legacy
+    line-based parsing.
+    """
+    if not caselist_path.endswith(".json"):
+        is_sh = os.path.splitext(caselist_path)[1].lower() == ".sh"
+        return parse_commands(caselist_path, is_sh)
+
+    with open(caselist_path, "r", encoding="utf-8") as f:
+        cases = json.load(f)
+    if not suite:
+        sys.exit("--suite is required when the caselist is a .json file")
+    if suite not in cases:
+        sys.exit(
+            f"Suite '{suite}' not found in {caselist_path}; "
+            f"available suites: {sorted(cases)}"
+        )
+    commands = [str(raw).strip() for raw in cases[suite] if str(raw).strip()]
+    if not commands:
+        sys.exit(f"Suite '{suite}' in {caselist_path} is empty")
+    return commands
+
+
 def resolve_build_dir(build_dir):
     """Resolve the test working directory; default to the DeepGEMM repository root."""
     if build_dir:
@@ -135,22 +169,17 @@ def resolve_build_dir(build_dir):
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 
 
-def run_cases(caselist_path, build_dir, output_xml=OUTPUT_XML):
+def run_cases(caselist_path, build_dir, output_xml=OUTPUT_XML, suite=""):
     if not os.path.exists(caselist_path):
         print(f"Error: test list file not found: {caselist_path}")
         sys.exit(1)
 
-    # Determine file type by extension
-    is_sh = os.path.splitext(caselist_path)[1].lower() == ".sh"
-
-    # Parse commands based on file type
-    test_commands = parse_commands(caselist_path, is_sh)
+    test_commands = load_caselist(caselist_path, suite)
 
     if not test_commands:
         print("No valid test commands found in list")
-        return
+        sys.exit(1)
 
-    # Switch to build directory
     try:
         os.chdir(build_dir)
         print(f"Working directory changed to: {os.getcwd()}")
@@ -162,7 +191,6 @@ def run_cases(caselist_path, build_dir, output_xml=OUTPUT_XML):
     global_passed_count = 0
     total_count = len(test_commands)
 
-    # Run all cases
     for i, cmd in enumerate(test_commands, 1):
         try:
             junit_case_obj, is_success = run_one_case(i, cmd, total_count)
@@ -177,7 +205,6 @@ def run_cases(caselist_path, build_dir, output_xml=OUTPUT_XML):
     output_xml_dir = os.path.dirname(output_xml_path)
     os.makedirs(output_xml_dir, exist_ok=True)
 
-    # Generate JUnit XML report
     suite = TestSuite("DeepGEMM PR Tests", all_test_objects)
     with open(output_xml_path, 'w', encoding='utf-8') as f:
         TestSuite.to_file(f, [suite], prettyprint=True)
@@ -191,7 +218,16 @@ def run_cases(caselist_path, build_dir, output_xml=OUTPUT_XML):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run DeepGEMM PR tests from a caselist.")
-    parser.add_argument("--caselist", required=True, help="Path to the caselist.list or run.sh file")
+    parser.add_argument(
+        "--caselist",
+        required=True,
+        help="Path to a testcase.json caselist or a legacy .list/.sh caselist",
+    )
+    parser.add_argument(
+        "--suite",
+        default="",
+        help="Suite key selecting the command group from a testcase.json caselist (board name, e.g. ZW-M890P).",
+    )
     parser.add_argument(
         "--build-dir",
         help="Directory in which test commands run. Defaults to the DeepGEMM repository root.",
@@ -209,4 +245,4 @@ if __name__ == "__main__":
     caselist_abs_path = os.path.abspath(args.caselist)
     build_dir = resolve_build_dir(args.build_dir)
 
-    run_cases(caselist_abs_path, build_dir, args.output_xml)
+    run_cases(caselist_abs_path, build_dir, args.output_xml, args.suite)
