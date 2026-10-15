@@ -169,6 +169,7 @@ if __name__ == '__main__':
             "cxx": extra_cxx_args,
             "hgcc": extra_hgcc_args,
         }))
+
     setuptools.setup(
         name='deep_gemm',
         use_scm_version={
@@ -182,7 +183,8 @@ if __name__ == '__main__':
                 'include/actlize_v0.5.0/**/*',
                 'include/actlize_v1.0.0/**/*',
                 'deep_gemm_tuner/configs/*',
-            ]
+            ],
+            'megamoe': ['include/megamoe/**/*'],
         },
         ext_modules=ext_modules,
         zip_safe=False,

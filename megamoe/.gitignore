@@ -1,0 +1,27 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Formatting tool caches
+.ruff_cache/
+.yapf_cache/
+
+# Written documents stay out of git (working artifacts)
+docs/
+
+# Scratch space for temporary artifacts
+tmp/
+
+# Environment file (host credentials) and vendored sources
+remote_env.sh
+third_party/

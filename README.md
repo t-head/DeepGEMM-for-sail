@@ -123,6 +123,25 @@ First call `deep_gemm.moe_align_block_size` with the LHS/RHS inputs and `topk_id
 
 For more information, please refer to the `moe_align_block_size` and `m_grouped_gemm_*_nt_fused` function documentation.
 
+#### MegaMoE
+
+```python
+import deep_gemm
+
+buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
+)
+
+transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
+
+buffer.x[:num_tokens].copy_(x_bf16)
+buffer.topk_idx[:num_tokens].copy_(topk_idx)
+buffer.topk_weights[:num_tokens].copy_(topk_weights)
+
+y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+deep_gemm.fp4_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
+```
+
 #### MQA logits
 
 We provide Multi-Query Attention (MQA) logits kernels that compute the query-key logits used by the LLM attention indexer. Both a non-paged variant (for contiguous KV) and a paged variant (for a paged KV cache with a block table) are supported, across BF16, INT8, FP8, and FP4 precisions.

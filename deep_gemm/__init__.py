@@ -204,6 +204,16 @@ from . import utils
 from .utils import *
 from .testing import bench_kineto, calc_diff
 
+try:
+    from . import mega
+    from .mega import (
+        get_symm_buffer_for_mega_moe,
+        transform_weights_for_mega_moe,
+        fp4_fp4_mega_moe,
+    )
+except Exception as e:
+    print(f'Failed to load mega kernels, please check the megamoe directory: {e}')
+
 # Legacy Triton kernels
 try:
     from . import legacy
