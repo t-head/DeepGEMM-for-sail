@@ -634,9 +634,9 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         int best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages;
         std::tie(best_block_m, best_block_n, best_block_k,
                  best_warp_m, best_warp_n, best_stages) = lut_result.value();
-        const auto best_smem_config = is_a8w4
-            ? deep_gemm_a8w4_common::get_smem_config_a8w4(best_stages, best_block_m, best_block_n, best_block_k)
-            : get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1);
+        const auto best_smem_config = get_smem_config(
+            best_stages, k, best_block_m, best_block_n, best_block_k,
+            /*bpp=*/1, /*element_b_bits=*/element_b_bits);
         return std::make_tuple(num_sms, best_block_m, best_block_n, best_block_k,
                                best_warp_m, best_warp_n, best_stages, best_smem_config);
     }
@@ -914,8 +914,9 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         warp_m = config.warp_m;
         warp_n = config.warp_n;
         best_num_stages = config.num_stages;
-        best_smem_config = deep_gemm_a8w4_common::get_smem_config_a8w4(
-            best_num_stages, best_block_m, best_block_n, block_k);
+        best_smem_config = get_smem_config(
+            best_num_stages, k, best_block_m, best_block_n, block_k,
+            /*bpp=*/1, /*element_b_bits=*/element_b_bits);
         DG_HOST_ASSERT(std::get<0>(best_smem_config) <= ppu_capacity);
     }
 

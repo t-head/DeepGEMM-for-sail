@@ -468,9 +468,9 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
     ConfigTuple cfg;
     if (configs.has_value()) {
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
-        auto smem_config = is_a8w4
-            ? deep_gemm_a8w4_common::get_smem_config_a8w4(nst, bm, bn, bk)
-            : deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1);
+        auto smem_config = deep_gemm_int8::get_smem_config(
+            nst, k, bm, bn, bk, /*bpp=*/1,
+            /*element_b_bits=*/is_a8w4 ? 4 : 8);
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst, smem_config);
     } else {
         const auto lut_kind = is_a8w4 ? deep_gemm_int8::get_a8w4_lut_kind()
@@ -938,9 +938,9 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     ConfigTuple cfg;
     if (configs.has_value()) {
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
-        auto smem_config = is_a8w4
-            ? deep_gemm_a8w4_common::get_smem_config_a8w4(nst, bm, bn, bk)
-            : deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1);
+        auto smem_config = deep_gemm_int8::get_smem_config(
+            nst, k, bm, bn, bk, /*bpp=*/1,
+            /*element_b_bits=*/is_a8w4 ? 4 : 8);
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst, smem_config);
     } else {
         const auto lut_kind = is_a8w4 ? deep_gemm_int8::get_a8w4_lut_kind()

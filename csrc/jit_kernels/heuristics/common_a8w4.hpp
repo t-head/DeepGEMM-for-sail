@@ -1,7 +1,5 @@
 #pragma once
-#include <algorithm>
 #include <cstdint>
-#include <tuple>
 #include <vector>
 #include <torch/torch.h>
 #include <deep_gemm/common/utils_rtc.cuh>
@@ -39,19 +37,6 @@ inline torch::Tensor preprocess_a8w4_weight(const torch::Tensor& weight) {
     grouped_shape.push_back(4);
     return weight.view(torch::kInt16).view(grouped_shape).transpose(-1, -2).contiguous()
         .flatten(-3).view(torch::kUInt8);
-}
-
-// ============================================================================
-// A8W4 INT8 Shared Memory Config
-// ============================================================================
-
-/// A8W4 reuses the INT8 tile and stage selection; only the shared memory size differs.
-// Same as deep_gemm_int8::get_smem_config except that B packs two int4 per byte along K.
-// The epilogue reuses the mainloop shared memory, so the buffer must cover both.
-inline std::tuple<int, int, int> get_smem_config_a8w4(int num_stages, int block_m, int block_n, int block_k) {
-    const int mainloop_size = num_stages * (block_m * block_k + block_n * block_k / 2);
-    const int epilogue_size = block_m * block_n * static_cast<int>(sizeof(c10::BFloat16));
-    return std::make_tuple(std::max(mainloop_size, epilogue_size), 128, 0);
 }
 
 // ============================================================================
