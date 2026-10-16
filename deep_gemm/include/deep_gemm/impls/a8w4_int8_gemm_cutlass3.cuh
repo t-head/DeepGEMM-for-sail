@@ -11,20 +11,27 @@ struct MixGemmNumericArrayConverter<int8_t, int4b_t, 8> {
   using result_type = Array<int8_t, 8>;
   using source_type = Array<int4b_t, 8>;
 
+  CUTLASS_DEVICE static uint32_t convert_four(uint32_t packed) {
+    // Preprocessing transposes {a,b,c,d,e,f,g,h} to {a,e,b,f,c,g,d,h} and changes
+    // signed two's-complement nibbles into unsigned values biased by 8. One LOP3 therefore
+    // extracts four nibbles into independent byte lanes while setting each lane's high bit.
+    static constexpr uint32_t kNibbleMask = 0x0f0f0f0f;
+    static constexpr uint32_t kByteMsb = 0x80808080;
+    static constexpr uint32_t kZeroPoint = 0x08080808;
+    static constexpr uint32_t kAndOrLut = (0xf0 & 0xcc) | 0xaa;
+    uint32_t expanded;
+    asm volatile("ppu.lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(expanded)
+                 : "r"(packed), "n"(kNibbleMask), "n"(kByteMsb), "n"(kAndOrLut));
+    return (expanded - kZeroPoint) ^ kByteMsb;
+  }
+
   CUTLASS_DEVICE static result_type convert(source_type const& source) {
-    using v2i16 = __attribute__((__vector_size__(4))) short;
     result_type result;
     const uint32_t packed = reinterpret_cast<uint32_t const&>(source);
     auto* dst = reinterpret_cast<uint32_t*>(&result);
-    // Move nibble pairs {1,0}/{3,2} and {5,4}/{7,6} into the high byte of each 16-bit lane
-    const v2i16 lo_pairs = reinterpret_cast<v2i16>(__byte_perm(packed, packed, 0x1000));
-    const v2i16 hi_pairs = reinterpret_cast<v2i16>(__byte_perm(packed, packed, 0x3020));
-    // Sign-extend odd and even nibbles with 16x2 shifts
-    const v2i16 lo_odd = lo_pairs >> 12, lo_even = (lo_pairs << 4) >> 12;
-    const v2i16 hi_odd = hi_pairs >> 12, hi_even = (hi_pairs << 4) >> 12;
-    // Interleave back to {n3, n2, n1, n0} and {n7, n6, n5, n4}
-    dst[0] = __byte_perm(reinterpret_cast<uint32_t>(lo_even), reinterpret_cast<uint32_t>(lo_odd), 0x6240);
-    dst[1] = __byte_perm(reinterpret_cast<uint32_t>(hi_even), reinterpret_cast<uint32_t>(hi_odd), 0x6240);
+    dst[0] = convert_four(packed);
+    dst[1] = convert_four(packed >> 4);
     return result;
   }
 

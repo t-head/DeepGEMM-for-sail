@@ -15,12 +15,11 @@ namespace deep_gemm_a8w4_common {
 /// Reorder portable packed signed-INT4 MoE weights into the PPU A8W4 kernel layout.
 /// `weight` is contiguous uint8 with shape [..., N, K / 2]. Byte i stores logical k=2*i in the low
 /// nibble and k=2*i+1 in the high nibble, both in two's-complement signed-INT4 representation.
-// NOTE: the reorder is a byte gather inside every 16-byte (32-element K) group; nibbles never cross
-// bytes, so each byte keeps its (even k, odd k) pair. Output byte j takes packed byte src[j]:
-//   j      :  0  1  2  3 |  4  5  6  7 |  8  9 10 11 | 12 13 14 15
-//   src[j] :  0  1  8  9 |  2  3 10 11 |  4  5 12 13 |  6  7 14 15
-// i.e. a 2x4 -> 4x2 transpose of 2-byte units, so one TSM_LD hands each lane exactly the K values of
-// its two K32 INT8-MMA atoms without any cross-lane shuffle.
+// First transpose 2-byte units inside every 16-byte (32-element K) group so one TSM_LD hands each
+// lane the K values of its two K32 INT8-MMA atoms. Then transpose each eight-nibble converter group
+// from {a,b,c,d,e,f,g,h} to packed bytes {a,e}, {b,f}, {c,g}, {d,h}. Finally toggle every nibble's
+// sign bit, changing two's-complement INT4 into the unsigned, zero-point-8 encoding consumed by the
+// seven-instruction register converter.
 inline torch::Tensor preprocess_a8w4_weight(const torch::Tensor& weight) {
     TORCH_CHECK(weight.dtype() == torch::kUInt8,
                 "preprocess_a8w4_weight: weight must use portable packed signed-INT4 uint8 storage");
@@ -35,8 +34,25 @@ inline torch::Tensor preprocess_a8w4_weight(const torch::Tensor& weight) {
     grouped_shape.back() = k_bytes / 16;
     grouped_shape.push_back(2);
     grouped_shape.push_back(4);
-    return weight.view(torch::kInt16).view(grouped_shape).transpose(-1, -2).contiguous()
+    auto reordered = weight.view(torch::kInt16).view(grouped_shape).transpose(-1, -2).contiguous()
         .flatten(-3).view(torch::kUInt8);
+
+    std::vector<int64_t> converter_shape = reordered.sizes().vec();
+    converter_shape.back() = k_bytes / 4;
+    converter_shape.push_back(4);
+    auto blocks = reordered.view(converter_shape);
+    auto low = blocks.bitwise_and(0x0f);
+    auto high = blocks.bitwise_right_shift(4);
+    auto pack_nibbles = [](const torch::Tensor& lower, const torch::Tensor& upper) {
+        return lower.bitwise_or(upper.bitwise_left_shift(4));
+    };
+    auto transposed = torch::stack({
+        pack_nibbles(low.select(-1, 0), low.select(-1, 2)),
+        pack_nibbles(high.select(-1, 0), high.select(-1, 2)),
+        pack_nibbles(low.select(-1, 1), low.select(-1, 3)),
+        pack_nibbles(high.select(-1, 1), high.select(-1, 3)),
+    }, -1);
+    return transposed.bitwise_xor(0x88).flatten(-2);
 }
 
 // ============================================================================
