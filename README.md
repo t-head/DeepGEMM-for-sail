@@ -14,6 +14,8 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 
 - **PPU runtime and JIT integration**: The runtime compilation path is adapted to the PPU SDK environment. Kernel compilation, compiler selection, debug output, and cache behavior are controlled through PPU-oriented JIT environment variables such as `DG_JIT_USE_HGRTC`.
 - **Supported precision modes**: The PPU version supports INT8, FP4, FP8, and BF16 across non-grouped GEMM and grouped GEMM layouts, covering both dense GEMM and MoE grouped GEMM scenarios.
+- **Standalone activation on M890**: SiLU and SiTU with BF16, per-row/per-block FP8, MXFP4, or MXFP8 output, including masked expert batches and explicit output-mode selection.
+- **W4A8 MoE on M890**: E4M3 per-row activations and group-32 MXFP4 weights, with FP32 accumulation and BF16 output for nopad, masked, and fused routing layouts.
 - **Additional nopad grouped GEMM layout**: In addition to contiguous and masked grouped GEMM layouts, this fork introduces a nopad layout. It uses an index tensor to describe per-expert token counts, avoiding mandatory M-block padding for variable-token MoE workloads and reducing unnecessary data movement.
 - **AIU-oriented alignment requirements**: The PPU version replaces the original alignment assumptions with AIU-aligned scaling factors and AIU-aligned utility tensors, matching the data movement requirements described by this fork.
 - **Warp interleave execution design**: The PPU kernels adopt a warp interleave design to overlap data movement, MMA instructions, and promotion operations during GEMM execution.
@@ -75,13 +77,13 @@ This library focuses on high-performance tensor cell kernels and related LLM com
 
 #### Data Precisions
 
-| Algorithm | INT8 | FP4 | FP8 | BF16 | W4A16 |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Non-grouped** | ✅ | ✅ | ✅ | ✅ | ❌ |
-| **Contiguous** | ✅ | ❌ | ✅ | ✅ | ❌ |
-| **No-pad** | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Masked** | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Fused** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Algorithm | INT8 | FP4 | FP8 | BF16 | W4A16 | W4A8 (M890) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Non-grouped** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| **Contiguous** | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| **No-pad** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Masked** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Fused** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 #### Normal dense GEMMs (non-grouped)
 
@@ -107,7 +109,7 @@ During the inference decoding phase, when HGGC Graph is enabled and the CPU is u
 
 Use `m_grouped_gemm_fp8_fp8_bf16_nt_masked` for this purpose and consult the relevant documentation. An example usage is to use the output of low-latency kernels from [DeepEP](https://github.com/deepseek-ai/DeepEP) as input.
 
-For the FP4 masked GEMM, the `silu_and_mul` activation and the MXFP4 quantization that follows it can optionally be fused into the epilogue, so that MoE gemm1 writes the packed FP4 values and their E8M0 scales directly instead of a BF16 tensor that a standalone kernel has to read back. The fusion is **disabled by default**; pass an `out_scale` tensor to `deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked` to enable it, and interleave the gemm1 weight once with `deep_gemm.preprocess_mxfp4_weight_for_act_and_quant_fusing` beforehand. Refer to the `m_grouped_gemm_fp4_fp4_bf16_nt_masked` documentation for the tensor layouts, the `swiglu_limit` argument and the current limitations.
+For the FP4 masked GEMM, the `silu_and_mul` activation and the MXFP4 quantization that follows it can optionally be fused into the epilogue, so that MoE gemm1 writes the packed FP4 values and their E8M0 scales directly instead of a BF16 tensor that a standalone kernel has to read back. The fusion is **disabled by default**; pass an `out_scale` tensor to `deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked` to enable it, and interleave the gemm1 weight once with `deep_gemm.preprocess_weights_and_scales(mode=deep_gemm.PreprocessMode.MXFP4, fuse_activation=True)` beforehand. Refer to the `m_grouped_gemm_fp4_fp4_bf16_nt_masked` documentation for the tensor layouts, the `swiglu_limit` argument and the current limitations.
 
 #### Fused MoE (with implicit permute)
 
@@ -119,9 +121,130 @@ First call `deep_gemm.moe_align_block_size` with the LHS/RHS inputs and `topk_id
 - `deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused`: fused MoE grouped GEMM with FP8 LHS/RHS (with scales) and BF16 output; supports both per-channel and blockwise quantization.
 - `deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_fused`: fused MoE grouped GEMM with INT8 LHS/RHS (with per-channel scales) and BF16 output.
 - `deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused`: fused MoE grouped GEMM with FP4 (mxfp4) LHS/RHS (with scales) and BF16 output. Note that this path expects the **LHS scale (SFA) in uint16 K-major layout**, that is a plain contiguous `(num_token, ceil_div(k // 32, 2))` uint16 tensor, rather than the uint16 M-major layout produced by `preprocess_mxfp4_scales` that the masked/nopad/dense FP4 interfaces expect; the RHS scale (SFB) stays MN-major. To build it, pad the `ceil_div(k, 32)` uint8 E8M0 scales to an even count along K and then view them as uint16; passing a `preprocess_mxfp4_scales` output as SFA here will fail the contiguity assertion.
+- `deep_gemm.m_grouped_gemm_w4a8_fused`: fused routing gather with per-row E4M3 activations, group-32 MXFP4 weights, and BF16 output on M890.
 - `deep_gemm.m_grouped_gemm_w4a16_fused`: fused MoE grouped GEMM with 4-bit group-quantized weights and BF16 activation (W4A16), producing BF16 output.
 
 For more information, please refer to the `moe_align_block_size` and `m_grouped_gemm_*_nt_fused` function documentation.
+
+#### W4A8 MoE GEMMs (M890)
+
+The W4A8 implementation accepts per-row E4M3 activations and group-32
+MXFP4 E2M1 weights.
+The kernel dequantizes weights to E5M2 using FP4 MMA, performs E4M3 x E5M2
+MMA, accumulates in FP32, and writes BF16. It supports these expert layouts:
+
+| API | Activation / row-scale shape | Output shape |
+| :--- | :--- | :--- |
+| `m_grouped_gemm_w4a8_nopad` | `[M,K]` / `[M,1]`, grouped by expert | `[M,N]` |
+| `m_grouped_gemm_w4a8_masked` | `[E,T,K]` / `[E,T,1]` | `[E,T,N]`, valid rows only |
+| `m_grouped_gemm_w4a8_fused` | `[num_token,K]` / `[num_token,1]`, original token order | `[num_token*topk,N]`, grouped by expert |
+
+Activation scales are FP32. Weights are naturally packed uint8 `[E,N,K/2]`
+(even K elements in the low nibble), with raw uint8 E8M0 scales
+`[E,N,K/32]`. `N % 64 == 0` and `K % 128 == 0` are required; arbitrary
+N/K padding is not performed. GEMM operands and metadata must be contiguous
+on the same PPU device; routing/count metadata uses int32.
+
+Weight preprocessing is performed once during model initialization. The
+function returns a tuple containing the processed weights, rearranged
+scales, and a scalar `weight_inv_scale`.
+It applies a common power-of-two shift to bring weight-scale exponents into
+`[114,140]` when necessary. Exponent codes 0 and 255, and exponent ranges
+spanning more than 26, are rejected. The returned inverse must be applied
+to the activation row scales exactly once per GEMM; the E4M3 codes remain
+unchanged:
+
+```python
+import deep_gemm as dg
+
+# packed_weight and raw_weight_scale are checkpoint tensors described above.
+weight, weight_scale, weight_inv_scale = dg.preprocess_weights_and_scales(
+    dg.PreprocessMode.W4A8_MXFP4_MMA, False, packed_weight, raw_weight_scale)
+lhs = (a_e4m3, row_scale * weight_inv_scale)
+rhs = (weight, weight_scale)
+config, rows, experts, tokens, aligned, inv_perm, m_indices = dg.moe_align_block_size(
+    a_e4m3, weight, topk_ids)
+dg.m_grouped_gemm_w4a8_fused(
+    lhs, rhs, out, rows, experts, tokens, aligned, config)
+```
+
+The fused path gathers activations and their scales with the same token
+index. Its output already uses the grouped, unpadded row order consumed by
+nopad. The fused interface integrates routing gather with GEMM execution. Weight
+preprocessing uses `fuse_activation=False` to preserve concatenated
+gate/up rows. Activation
+and top-k combine remain separate operations.
+
+Nopad accepts per-row expert `m_indices` and optional per-expert `m_rows`;
+rows must already be grouped by expert. Masked accepts device-side
+`masked_m` counts and an `expected_m` scheduling hint. Computation is
+restricted to the valid rows specified by `masked_m`. Nopad/masked select configurations internally unless
+an explicit config tuple is supplied. The fused config comes from
+`moe_align_block_size`. Configuration selection remains internal to the
+C++ runtime.
+Run `python tests/test_w4a8.py` for correctness coverage.
+
+#### Standalone SiLU / SiTU activation (M890)
+
+The activation interfaces are `silu_and_mul(mode, input, *, ...)` and
+`situ_and_mul(mode, input, *, beta, linear_beta=None, ...)`. The first
+`mode` argument is **required** and must be an `ActivationQuantMode`;
+omitting it, passing None, or using the old `quant=` keyword is unsupported.
+Input is contiguous BF16 `[...,2*N]` in concatenated `[gate,up]` order.
+
+| Mode | Output | Scales / constraints |
+| :--- | :--- | :--- |
+| `BF16` | BF16 tensor | No scale; any positive N |
+| `FP8_CHANNEL` | E4M3 tensor | FP32 per-row `[...,1]` |
+| `FP8_BLOCK` | E4M3 tensor | FP32 group-128 `[...,N/128]`; N%128=0 |
+| `MXFP4` | Packed E2M1 uint8 `[...,N/2]` | Group-32 E8M0; even N |
+| `MXFP8` | E4M3 tensor | Natural uint8 group-32 E8M0 `[...,ceil(N/32)]` |
+
+BF16 mode returns one tensor; all quantized modes return `(values, scales)`.
+MXFP4 defaults to `reorder_scale=True`, producing uint16 M-major scales
+with logical `[M,ceil(N/64)]` or `[E,T,ceil(N/64)]` shape; this view may be
+non-contiguous and should be passed directly to the matching GEMM.
+The default reordered MXFP4 mode requires rank-2 or rank-3 input.
+`reorder_scale=False` instead returns natural uint8
+`[...,ceil(N/32)]` scales. This option is only accepted for MXFP4.
+FP8-block dense scales are contiguous; masked scales use an M-major
+`[E,T,N/128]` view backed by `[E,N/128,align(T,4)]` storage, with invalid
+and padding scale rows zeroed.
+
+```python
+import deep_gemm as dg
+
+M = dg.ActivationQuantMode
+bf16 = dg.silu_and_mul(M.BF16, gate_up)
+fp8, block_scale = dg.silu_and_mul(M.FP8_BLOCK, gate_up, swiglu_limit=2.1)
+# SiTU with gate/up softcaps; down_inv is the GEMM2 weight_inv_scale.
+q, row_scale = dg.situ_and_mul(
+    M.FP8_CHANNEL, gate_up, beta=4.0, linear_beta=25.0,
+    weight_inv_scale=down_inv)
+# row_scale already includes down_inv and is passed directly to W4A8 GEMM2.
+```
+
+For masked inputs use BF16 `[E,T,2*N]` and contiguous device int32
+`masked_m` of shape `[E]`. Both APIs accept `masked_m=masked_m` and an
+optional `expected_m` hint. The hint only chooses the number of row slots;
+the device loops over all valid rows, including when the hint is smaller
+than the actual count. Output values are written only in valid rows.
+
+SiLU computes `gate * sigmoid(gate) * up`. Optional positive
+`swiglu_limit` clamps gate from above and up on both sides. Clamp boundaries
+round to BF16; activation, multiplication, amax, scale computation and
+normalization use FP32 with native PPU sigmoid. SiTU uses
+`beta*tanh(gate/beta)*sigmoid(gate)` for the gate and optionally
+`linear_beta*tanh(up/linear_beta)` for up; beta and a supplied linear_beta
+must be positive finite values.
+
+`weight_inv_scale` is only accepted for FP8-channel and multiplies the
+returned scale, leaving the quantized codes unchanged. The kernels process
+eight consecutive elements per thread and use native packed conversions
+and vector stores. Fallback paths support partial tiles and unaligned input. MXFP4/MXFP8
+share a single-warp double-buffered load pipeline; FP8-channel retains a
+whole-row amax reduction. Run `python tests/test_activation.py` for the
+standalone correctness suite.
 
 #### MQA logits
 

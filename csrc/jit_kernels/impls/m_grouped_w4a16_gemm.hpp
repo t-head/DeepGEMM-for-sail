@@ -339,9 +339,8 @@ static void m_grouped_gemm_w4a16_nopad_impl(const torch::Tensor& lhs, const torc
                                            const torch::Tensor& rhs_scales, const torch::Tensor& out,
                                            const torch::Tensor& m_indices, const torch::Tensor& m_rows,
                                            int m, int n, int k, int num_groups, int group_size,
-                                           std::optional<W4A16ConfigTuple> configs = std::nullopt,
-                                           bool fp4_use_bf16_scale = false) {
-    const auto w4a16_type = get_w4a16_type(rhs.scalar_type(), rhs_scales.scalar_type(), fp4_use_bf16_scale);
+                                           std::optional<W4A16ConfigTuple> configs = std::nullopt) {
+    const auto w4a16_type = get_w4a16_type(rhs.scalar_type(), rhs_scales.scalar_type());
     const int expected_m = ceil_div(m, num_groups);
     const auto& config = configs.has_value() ? unpack_w4a16_config(*configs)
                                              : get_best_configs(expected_m, n, k, num_groups, get_num_sms(),
@@ -374,9 +373,8 @@ static void m_grouped_gemm_w4a16_masked_impl(const torch::Tensor& lhs, const tor
                                             const torch::Tensor& rhs_scales, const torch::Tensor& out,
                                             const torch::Tensor& masked_m,
                                             int m, int n, int k, int num_groups, int group_size, int expected_m,
-                                            std::optional<W4A16ConfigTuple> configs = std::nullopt,
-                                            bool fp4_use_bf16_scale = false) {
-    const auto w4a16_type = get_w4a16_type(rhs.scalar_type(), rhs_scales.scalar_type(), fp4_use_bf16_scale);
+                                            std::optional<W4A16ConfigTuple> configs = std::nullopt) {
+    const auto w4a16_type = get_w4a16_type(rhs.scalar_type(), rhs_scales.scalar_type());
     const auto& config = configs.has_value() ? unpack_w4a16_config(*configs)
                                              : get_best_configs(expected_m, n, k, num_groups, get_num_sms(),
                                                                 GemmType::GroupedMasked, w4a16_type);
@@ -391,8 +389,8 @@ static void m_grouped_gemm_w4a16_fused_impl(const torch::Tensor& lhs, const torc
                                            const torch::Tensor& sorted_token_ids,
                                            const torch::Tensor& aligned_num_m_blocks,
                                            int m, int n, int k, int num_groups, int group_size,
-                                           const W4A16ConfigTuple& configs, bool fp4_use_bf16_scale = false) {
-    const auto w4a16_type = get_w4a16_type(rhs.scalar_type(), rhs_scales.scalar_type(), fp4_use_bf16_scale);
+                                           const W4A16ConfigTuple& configs) {
+    const auto w4a16_type = get_w4a16_type(rhs.scalar_type(), rhs_scales.scalar_type());
     const auto config = unpack_w4a16_config(configs);
     // `m` is the `num_token` the API layer read off `lhs`
     const int64_t num_token = m;

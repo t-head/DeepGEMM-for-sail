@@ -24,6 +24,7 @@
 #include "../heuristics/common_fp8.hpp"
 #include "../heuristics/common_int8.hpp"
 #include "../heuristics/common_w4a16.hpp"
+#include "m_grouped_w4a8_gemm.hpp"
 #include "fused_moe_gemm.hpp"  // FusedCommonConfigTuple
 
 namespace deep_gemm {
@@ -268,10 +269,12 @@ __global__ void moe_align_p4(
 // The config slot is dtype-dependent, exactly as in Python (`return_config = config if w4a16_type is
 // not None else config[:7]`): the W4A16 flavours hand back the full 9-tuple their fused GEMM unpacks,
 // while every other dtype drops the trailing `smem_config` and forwards only the first 7 tuning params.
-using FusedConfigTuple = std::variant<FusedCommonConfigTuple, deep_gemm_w4a16_common::W4A16ConfigTuple>;
+// W4A16 and W4A8 share the wire format, but own their configuration policies.
+using FusedMmaConfigTuple = std::tuple<int, int, int, int, int, int, int, int, int>;
+using FusedConfigTuple = std::variant<FusedCommonConfigTuple, FusedMmaConfigTuple>;
 
 using MoeAlignReturn = std::tuple<
-    FusedConfigTuple,        // config (7-tuple, or the W4A16 9-tuple)
+    FusedConfigTuple,        // config (7-tuple, or the MMA 9-tuple)
     torch::Tensor,         // m_rows
     torch::Tensor,         // expert_ids_and_cumsum
     torch::Tensor,         // sorted_token_ids
@@ -295,7 +298,7 @@ static MoeAlignReturn moe_align_block_size_impl(
     int num_groups = static_cast<int>(num_groups_l);
     int n = rhs_dim1;
     // NOTES: only the weight is in scope here, not its scales, so an `int32` weight cannot be told
-    // apart from `mxfp4_e8m0` / `mxfp4_bf16` and upstream just labels it `int4`. Harmless for config
+    // apart from `mxfp4_e8m0` and upstream just labels it `int4`. Harmless for config
     // selection -- `get_best_configs` only branches on `mxfp4_e8m0_mma` -- so the label is mirrored.
     std::optional<deep_gemm_w4a16_common::W4A16Type> w4a16_type;
     if (rhs.dtype() == torch::kInt32) {
@@ -319,7 +322,11 @@ static MoeAlignReturn moe_align_block_size_impl(
                                     std::get<3>(full), std::get<4>(full), std::get<5>(full),
                                     std::get<6>(full)};
         };
-        if (w4a16_type.has_value()) {
+        if (lhs.scalar_type() == torch::kFloat8_e4m3fn && rhs.scalar_type() == torch::kUInt8) {
+            const auto c = deep_gemm::w4a8::get_best_configs(expected_m, n, k, num_groups, GemmType::GroupedFused);
+            deep_gemm::w4a8::check_config(c, n, k, GemmType::GroupedFused);
+            config = deep_gemm::w4a8::pack_config(c);
+        } else if (w4a16_type.has_value()) {
             // Forwarded whole: the W4A16 fused GEMM unpacks all 9 params, `warp_k` and `n_expand`
             // included, so there is nothing to truncate here
             const auto& c = deep_gemm_w4a16_common::get_best_configs(
