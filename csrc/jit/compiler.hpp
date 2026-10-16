@@ -456,4 +456,19 @@ static auto compiler = LazyInit<Compiler>([]() -> std::shared_ptr<Compiler> {
     }
 });
 
+template <typename Tag>
+inline std::shared_ptr<KernelRuntime> compile_native_kernel(
+    const std::string& name, const NativeKernelArgs& args) {
+    using Runtime = NativeKernelRuntime<Tag>;
+    const auto code = Runtime::generate(args);
+    return compiler->build(name, code);
+}
+
+template <typename Tag>
+inline void run_native_kernel(const std::string& name, const NativeKernelArgs& args) {
+    using Runtime = NativeKernelRuntime<Tag>;
+    const auto runtime = compile_native_kernel<Tag>(name, args);
+    Runtime::launch(runtime, args);
+}
+
 } // namespace deep_gemm

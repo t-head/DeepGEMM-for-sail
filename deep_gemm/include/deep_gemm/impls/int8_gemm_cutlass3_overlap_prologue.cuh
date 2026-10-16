@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
@@ -638,7 +639,8 @@ template <
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
   class TileScheduler_,
-  bool kEnableSboOverlap
+  bool kEnableSboOverlap,
+  bool kUseReplicaWeights
 >
 class DeepGemmUniversal<
   ProblemShape_,
@@ -646,7 +648,7 @@ class DeepGemmUniversal<
   CollectiveEpilogue_,
   TileScheduler_,
   kEnableSboOverlap,
-  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistageOverlapPrologue, typename CollectiveMainloop_::DispatchPolicy::Schedule>>> {
+  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistageOverlapPrologue, typename CollectiveMainloop_::DispatchPolicy::Schedule>>, kUseReplicaWeights> {
 public:
 public:
   //
@@ -709,7 +711,7 @@ public:
   // static_assert(EnableOverlapPrologue, "Mainloop one stage smem of A+B must be larger than epilogue smem to do overlap !");
 
   // Device side arguments
-  struct Arguments {
+  struct StandardArguments {
     GemmUniversalMode mode{};
     ProblemShape problem_shape{};
     MainloopArguments mainloop{};
@@ -719,8 +721,24 @@ public:
     int32_t* signal{nullptr};
   };
 
+  // Device side arguments
+  struct ReplicaArguments {
+    GemmUniversalMode mode{};
+    ProblemShape problem_shape{};
+    MainloopArguments mainloop{};
+    EpilogueArguments epilogue{};
+    KernelHardwareInfo hw_info{};
+    TileSchedulerArguments scheduler{};
+    int32_t* signal{nullptr};
+    ElementB const* rhs_replicas{nullptr};
+    float const* rhs_replica_scales{nullptr};
+    uint32_t num_master_groups{TileScheduler::kNumGroups};
+  };
+
+  using Arguments = std::conditional_t<kUseReplicaWeights, ReplicaArguments, StandardArguments>;
+
   // Kernel entry point API
-  struct Params {
+  struct StandardParams {
     GemmUniversalMode mode{};
     ProblemShape problem_shape{};
     MainloopParams mainloop{};
@@ -730,6 +748,21 @@ public:
     void* workspace{nullptr};
     int32_t* signal{nullptr};
   };
+
+  struct ReplicaParams {
+    GemmUniversalMode mode{};
+    ProblemShape problem_shape{};
+    MainloopParams mainloop{};
+    EpilogueParams epilogue{};
+    KernelHardwareInfo hw_info{};
+    TileSchedulerArguments scheduler{};
+    void* workspace{nullptr};
+    int32_t* signal{nullptr};
+    ElementB const* rhs_replicas{nullptr};
+    float const* rhs_replica_scales{nullptr};
+    uint32_t num_master_groups{TileScheduler::kNumGroups};
+  };
+  using Params = std::conditional_t<kUseReplicaWeights, ReplicaParams, StandardParams>;
 
   //
   // Methods
@@ -775,7 +808,7 @@ public:
     // subtile will not be used, therefore separate reduction will not be enabled.
     constexpr uint32_t NumEpilogueSubTiles = 1; //CollectiveEpilogue::get_store_pipe_increment(TileShape{});
 
-    return {
+    Params result{
       args.mode,
       problem_shape,
       CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, mainloop_workspace),
@@ -785,6 +818,12 @@ public:
       workspace,
       args.signal
     };
+    if constexpr (kUseReplicaWeights) {
+      result.rhs_replicas = args.rhs_replicas;
+      result.rhs_replica_scales = args.rhs_replica_scales;
+      result.num_master_groups = args.num_master_groups;
+    }
+    return result;
   }
 
   static bool
@@ -862,14 +901,22 @@ public:
     auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, 0);
     uint32_t M = deep_scheduler.curr_problem_m();
     auto problem_shape_MNKL = ProblemShape{M, N, K, L};
-    CollectiveMainloop collective_mma_prologue(params.mainloop, take<0, 3>(problem_shape_MNKL));
     auto offset_m = deep_scheduler.curr_offset_m();
     auto expert_id = deep_scheduler.problem_index();
     auto offset_a = deep_scheduler.curr_offset_a();
     auto offset_b = deep_scheduler.curr_offset_b(m_coord);
-    const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
-    const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
-    auto load_inputs = collective_mma_prologue.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
+    auto mainloop_params = params.mainloop;
+    if constexpr (kUseReplicaWeights) {
+      if (params.rhs_replicas != nullptr && expert_id >= params.num_master_groups) {
+        offset_b = int64_t(expert_id - params.num_master_groups) * N * K;
+        mainloop_params.ptr_B = params.rhs_replicas;
+        mainloop_params.ptr_scale_B = params.rhs_replica_scales;
+      }
+    }
+    CollectiveMainloop collective_mma_prologue(mainloop_params, take<0, 3>(problem_shape_MNKL));
+    const ElementA* ptr_A = reinterpret_cast<const ElementA*>(mainloop_params.ptr_A) + offset_a;
+    const ElementB* ptr_B = reinterpret_cast<const ElementB*>(mainloop_params.ptr_B) + offset_b;
+    auto load_inputs = collective_mma_prologue.load_init(problem_shape_MNKL, blk_coord_mnkl, mainloop_params,
                                                   offset_m, offset_b, ptr_A, ptr_B);
     int k_tile_count = size<2>(get<0>(load_inputs));
     int k_tile_iter = 0;
@@ -878,7 +925,7 @@ public:
 
     //#pragma clang loop licm(disable)
     while (tile_valid) {
-      CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
+      CollectiveMainloop collective_mma(mainloop_params, take<0, 3>(problem_shape_MNKL));
       // Extract out partitioned A and B.
       Tensor gA = get<0>(load_inputs);
       Tensor gB = get<1>(load_inputs);
@@ -900,13 +947,21 @@ public:
       M = deep_scheduler.curr_problem_m();
       auto blk_coord_mnkl_next = make_coord(m_coord, n_coord, _, 0);
       auto problem_shape_MNKL_next = ProblemShape{M, N, K, L};
-      CollectiveMainloop collective_mma_next(params.mainloop, take<0, 3>(problem_shape_MNKL_next));
       auto offset_m_next = deep_scheduler.curr_offset_m();
       auto expert_id_next = deep_scheduler.problem_index();
       auto offset_a_next = deep_scheduler.curr_offset_a();
       auto offset_b_next = deep_scheduler.curr_offset_b(m_coord);
-      const ElementA* ptr_A_next = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a_next;
-      const ElementB* ptr_B_next = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b_next;
+      auto mainloop_params_next = params.mainloop;
+      if constexpr (kUseReplicaWeights) {
+        if (params.rhs_replicas != nullptr && expert_id_next >= params.num_master_groups) {
+          offset_b_next = int64_t(expert_id_next - params.num_master_groups) * N * K;
+          mainloop_params_next.ptr_B = params.rhs_replicas;
+          mainloop_params_next.ptr_scale_B = params.rhs_replica_scales;
+        }
+      }
+      CollectiveMainloop collective_mma_next(mainloop_params_next, take<0, 3>(problem_shape_MNKL_next));
+      const ElementA* ptr_A_next = reinterpret_cast<const ElementA*>(mainloop_params_next.ptr_A) + offset_a_next;
+      const ElementB* ptr_B_next = reinterpret_cast<const ElementB*>(mainloop_params_next.ptr_B) + offset_b_next;
 
       // Allocate the tiled_mma and the accumulators for the (M,N) blk_shape
       TiledMma tiled_mma;
@@ -928,7 +983,7 @@ public:
         smem_buf
       );
 
-      load_inputs = collective_mma_next.load_init(problem_shape_MNKL_next, blk_coord_mnkl_next, params.mainloop,
+      load_inputs = collective_mma_next.load_init(problem_shape_MNKL_next, blk_coord_mnkl_next, mainloop_params_next,
                                                       offset_m_next, offset_b_next, ptr_A_next, ptr_B_next);
       k_tile_count = size<2>(get<0>(load_inputs));
       k_tile_iter = 0;
@@ -955,6 +1010,7 @@ public:
 
       blk_coord_mnkl = blk_coord_mnkl_next;
       problem_shape_MNKL = problem_shape_MNKL_next;
+      mainloop_params = mainloop_params_next;
 
       if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
         cp_async_wait<0>();

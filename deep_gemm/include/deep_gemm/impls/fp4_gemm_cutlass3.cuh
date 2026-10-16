@@ -1,6 +1,7 @@
 #pragma once
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
+#include <type_traits>
 #include <cutlass/cutlass.h>
 #include <deep_gemm/common/utils.cuh>
 #include <iostream>
@@ -45,6 +46,12 @@ using namespace cute;
 namespace deep_gemm {
 using cutlass::KernelHardwareInfo;
 
+struct NoopFp4ScatterPolicy {
+  static constexpr bool kEnabled = false;
+  template <typename Base> using Arguments = Base;
+  template <typename Base> using Params = Base;
+};
+
 template <
   class ProblemShape_,
   class CollectiveMainloop_,
@@ -53,7 +60,9 @@ template <
   bool hasBias = false,
   int nExpand = 1,
   bool kEnableSboOverlap = false,
-  EpilogueType kEpilogueType = EpilogueType::Default
+  EpilogueType kEpilogueType = EpilogueType::Default,
+  bool kUseReplicaWeights = false,
+  typename ScatterPolicy = NoopFp4ScatterPolicy
 >
 class DeepGemmUniversal;
 
@@ -64,7 +73,9 @@ template <
   class TileScheduler_,
   bool hasBias_,
   int nExpand,
-  EpilogueType kEpilogueType
+  EpilogueType kEpilogueType,
+  bool kUseReplicaWeights,
+  typename ScatterPolicy
 >
 class DeepGemmUniversal <
   ProblemShape_,
@@ -74,13 +85,17 @@ class DeepGemmUniversal <
   hasBias_,
   nExpand,
   false,
-  kEpilogueType
+  kEpilogueType,
+  kUseReplicaWeights,
+  ScatterPolicy
 > {
   public:
   //
   // Type Aliases
   //
   using ProblemShape = ProblemShape_;
+  static_assert(!kUseReplicaWeights && !ScatterPolicy::kEnabled,
+                "FP4 replica/scatter requires NExpand == 1");
 
   static_assert(rank(ProblemShape{}) == 3 or rank(ProblemShape{}) == 4,
     "ProblemShape{} should be <M,N,K> or <M,N,K,L>");
@@ -657,7 +672,9 @@ template <
   class CollectiveEpilogue_,
   class TileScheduler_,
   bool hasBias_,
-  EpilogueType kEpilogueType
+  EpilogueType kEpilogueType,
+  bool kUseReplicaWeights,
+  typename ScatterPolicy
 >
 class DeepGemmUniversal <
   ProblemShape_,
@@ -667,13 +684,18 @@ class DeepGemmUniversal <
   hasBias_,
   1,
   false,
-  kEpilogueType
+  kEpilogueType,
+  kUseReplicaWeights,
+  ScatterPolicy
 > {
 public:
   //
   // Type Aliases
   //
   using ProblemShape = ProblemShape_;
+  static constexpr bool kHasBias = hasBias_;
+  static_assert(!ScatterPolicy::kEnabled || kUseReplicaWeights,
+                "FP4 scatter uses the shared replica mainloop");
 
   static_assert(rank(ProblemShape{}) == 3 or rank(ProblemShape{}) == 4,
     "ProblemShape{} should be <M,N,K> or <M,N,K,L>");
@@ -746,7 +768,7 @@ public:
 #endif
 
   // Device side arguments
-  struct Arguments {
+  struct StandardArguments {
     GemmUniversalMode mode{};
     ProblemShape problem_shape{};
     MainloopArguments mainloop{};
@@ -759,7 +781,7 @@ public:
 #endif
 
 #if SAIL_SYNC_IN_CE
-    Arguments(
+    StandardArguments(
       GemmUniversalMode mode_ = GemmUniversalMode{},
       ProblemShape problem_shape_ = ProblemShape{},
       MainloopArguments mainloop_ = MainloopArguments{},
@@ -772,8 +794,39 @@ public:
 #endif
   };
 
+  struct ReplicaArguments {
+    GemmUniversalMode mode{};
+    ProblemShape problem_shape{};
+    MainloopArguments mainloop{};
+    EpilogueArguments epilogue{};
+    KernelHardwareInfo hw_info{};
+    TileSchedulerArguments scheduler{};
+    int32_t* signal{nullptr};
+    ElementB const* ptr_B_replica{nullptr};
+    ElementSFB const* ptr_scale_B_replica{nullptr};
+    int32_t num_master_groups{0};
+#if SAIL_SYNC_IN_CE
+    int *ptr_sync_ce = nullptr;
+#endif
+
+#if SAIL_SYNC_IN_CE
+    ReplicaArguments(
+      GemmUniversalMode mode_ = GemmUniversalMode{},
+      ProblemShape problem_shape_ = ProblemShape{},
+      MainloopArguments mainloop_ = MainloopArguments{},
+      EpilogueArguments epilogue_ = EpilogueArguments{},
+      KernelHardwareInfo hw_info_ = KernelHardwareInfo{},
+      TileSchedulerArguments scheduler_ = TileSchedulerArguments{},
+      int32_t* signal_ = nullptr)
+    : mode(mode_), problem_shape(problem_shape_), mainloop(mainloop_),
+      epilogue(epilogue_), hw_info(hw_info_), scheduler(scheduler_), signal(signal_){}
+#endif
+  };
+  using BaseArguments = std::conditional_t<kUseReplicaWeights, ReplicaArguments, StandardArguments>;
+  using Arguments = typename ScatterPolicy::template Arguments<BaseArguments>;
+
   // Kernel entry point API
-  struct Params {
+  struct StandardParams {
     GemmUniversalMode mode{};
     ProblemShape problem_shape{};
     MainloopParams mainloop{};
@@ -786,6 +839,25 @@ public:
     int *ptr_sync_ce = nullptr;
 #endif
   };
+
+  struct ReplicaParams {
+    GemmUniversalMode mode{};
+    ProblemShape problem_shape{};
+    MainloopParams mainloop{};
+    EpilogueParams epilogue{};
+    KernelHardwareInfo hw_info{};
+    TileSchedulerParams scheduler{};
+    void* workspace{nullptr};
+    int32_t* signal{nullptr};
+    ElementB const* ptr_B_replica{nullptr};
+    ElementSFB const* ptr_scale_B_replica{nullptr};
+    int32_t num_master_groups{0};
+#if SAIL_SYNC_IN_CE
+    int *ptr_sync_ce = nullptr;
+#endif
+  };
+  using BaseParams = std::conditional_t<kUseReplicaWeights, ReplicaParams, StandardParams>;
+  using Params = typename ScatterPolicy::template Params<BaseParams>;
 
   //
   // Methods
@@ -822,6 +894,26 @@ public:
     TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(grouped_layout,
       problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
 
+    if constexpr (kUseReplicaWeights) {
+      Params result{};
+      result.mode = args.mode;
+      result.problem_shape = problem_shape;
+      result.mainloop = CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, workspace);
+      result.epilogue = CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, workspace);
+      result.hw_info = hw_info;
+      result.scheduler = scheduler;
+      result.workspace = workspace;
+      result.signal = args.signal;
+      result.ptr_B_replica = args.ptr_B_replica;
+      result.ptr_scale_B_replica = args.ptr_scale_B_replica;
+      result.num_master_groups = args.num_master_groups;
+#if SAIL_SYNC_IN_CE
+      result.ptr_sync_ce = args.ptr_sync_ce;
+#endif
+      if constexpr (ScatterPolicy::kEnabled)
+        ScatterPolicy::copy_arguments(result, args);
+      return result;
+    } else {
     return {
       args.mode,
       args.problem_shape,
@@ -832,6 +924,7 @@ public:
       workspace,
       args.signal
     };
+    }
   }
 
   static bool
@@ -930,6 +1023,8 @@ public:
       auto l_coord = 0;
 
       uint32_t M = deep_scheduler.curr_problem_m();
+      if constexpr (ScatterPolicy::kEnabled)
+        M = ScatterPolicy::problem_m(params, deep_scheduler, M);
 
       auto problem_shape_MNKL = ProblemShape{M, N, K, L};
 
@@ -937,10 +1032,20 @@ public:
       auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
       auto offset_scalea = deep_scheduler.curr_offset_mxfp4_scalea();
       auto offset_scaleb = deep_scheduler.curr_offset_mxfp4_scaleb(m_block_idx);
+      if constexpr (ScatterPolicy::kEnabled)
+        ScatterPolicy::input_offsets(params, deep_scheduler, offset_a, offset_scalea);
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
       const ElementSFA* ptr_scale_A = reinterpret_cast<const ElementSFA*>(params.mainloop.ptr_scale_A) + offset_scalea;
       const ElementSFB* ptr_scale_B = reinterpret_cast<const ElementSFB*>(params.mainloop.ptr_scale_B) + offset_scaleb;
+      if constexpr (kUseReplicaWeights) {
+        const int group = deep_scheduler.problem_index();
+        if (params.ptr_B_replica != nullptr && group >= params.num_master_groups) {
+          const int replica = group - params.num_master_groups;
+          ptr_B = params.ptr_B_replica + int64_t(replica) * TileScheduler::SHAPE_N * TileScheduler::SHAPE_K;
+          ptr_scale_B = params.ptr_scale_B_replica + int64_t(replica) * TileScheduler::SHAPE_N * cute::ceil_div(TileScheduler::SHAPE_K, 32);
+        }
+      }
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       // update actual global ptr offset
@@ -980,6 +1085,12 @@ public:
         smem_buf
       );
 
+      if constexpr (ScatterPolicy::kEnabled) {
+        ScatterPolicy::template epilogue<DeepGemmUniversal>(
+            params, deep_scheduler, m_block_idx, n_block_idx,
+            problem_shape_MNKL, accumulators, tiled_mma, residue_mnk,
+            thread_idx, smem_buf, shared_storage);
+      } else {
       // Update the pointer to C and D of MXFP4 in the epilogue parameters
       auto params_epilogue_local = params.epilogue;
       params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
@@ -1001,6 +1112,7 @@ public:
         thread_idx,
         (char*)&shared_storage.tensors.epilogue
       );
+      }
     }
   }
 };

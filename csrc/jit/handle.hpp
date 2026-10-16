@@ -90,10 +90,15 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel, co
     return config;
 }
 
+static auto launch_kernel_parameters(const KernelHandle& kernel,
+                                      const LaunchConfigHandle& config, void** args) {
+    return hggcLaunchKernelExC(&config, kernel, args);
+}
+
 template <typename... ActTypes>
 static auto launch_kernel(const KernelHandle& kernel, const LaunchConfigHandle& config, ActTypes&&... args) {
     void* ptr_args[] = {&args...};
-    return hggcLaunchKernelExC(&config, kernel, ptr_args);
+    return launch_kernel_parameters(kernel, config, ptr_args);
 }
 
 #else
@@ -173,11 +178,16 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel, co
     return config;
 }
 
+static auto launch_kernel_parameters(const KernelHandle& kernel,
+                                      const LaunchConfigHandle& config, void** args) {
+    return lazy_hgLaunchKernelEx(&config, kernel, args, nullptr);
+}
+
 template <typename... ActTypes>
 static auto launch_kernel(const KernelHandle& kernel, const LaunchConfigHandle& config, ActTypes&&... args) {
     // void *ptr_args[] = { &args... };
     void* ptr_args[] = {(void*)(&args)...};
-    return lazy_hgLaunchKernelEx(&config, kernel, ptr_args, nullptr);
+    return launch_kernel_parameters(kernel, config, ptr_args);
 }
 
 #endif

@@ -59,6 +59,41 @@ struct MainloopPPUAiuA8W8OverlapPrologue {
 
 #include <deep_gemm/impls/int8_gemm_cutlass3_dynamic.cuh>
 
+
+namespace deep_gemm {
+// Shared channelwise tile computation. Scatter policies retain their own
+// transport/scheduling, while standard GEMM and fused scatter use one SF/MMA path.
+template <typename CollectiveMainloop, int ShapeN, bool kCanonicalNResidue = true,
+          typename ProblemShape, typename BlockCoord, typename Params,
+          typename ElementA, typename ElementB, typename Accumulators>
+CUTLASS_DEVICE __forceinline__ auto compute_channelwise_tile(
+    ProblemShape const& problem_shape, BlockCoord const& block_coord, Params const& params,
+    uint32_t m, int offset_m, int64_t offset_b, ElementA const* a, ElementB const* b,
+    Accumulators& accumulators, int thread_idx, int warp_idx, char* smem_buf) {
+  using namespace cute;
+  using TileShape = typename CollectiveMainloop::TileShape;
+  CollectiveMainloop collective_mma(params, take<0, 3>(problem_shape));
+  auto load_inputs = collective_mma.load_init(problem_shape, block_coord, params,
+                                               m, offset_m, offset_b, a, b);
+  auto g_a = get<0>(load_inputs);
+  auto g_b = get<1>(load_inputs);
+  const auto m_residue = m - size<0>(g_a) * get<0>(block_coord);
+  const auto n_residue = [&] {
+    if constexpr (kCanonicalNResidue && ShapeN % size<1>(TileShape{}) == 0)
+      return size<1>(TileShape{});
+    else
+      return ShapeN - size<0>(g_b) * get<1>(block_coord);
+  }();
+  const auto k_residue = get<2>(problem_shape) - size<1>(g_a) * size<2>(g_a);
+  auto residue = make_tuple(m_residue, n_residue, k_residue);
+  auto k_tile_iter = make_coord_iterator(shape<2>(g_a));
+  const int k_tile_count = size<2>(g_a);
+  collective_mma(accumulators, load_inputs, accumulators, k_tile_iter,
+                 k_tile_count, residue, thread_idx, warp_idx, smem_buf);
+  return residue;
+}
+} // namespace deep_gemm
+
 namespace cutlass::gemm::kernel {
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -68,7 +103,8 @@ template <
   class CollectiveEpilogueOrThreadblockSwizzle_,
   class TileScheduler_ = void,
   bool kEnableSboOverlap = false,
-  class Enable = void
+  class Enable = void,
+  bool kUseReplicaWeights = false
 >
 class DeepGemmUniversal;
 
@@ -85,7 +121,7 @@ class DeepGemmUniversal<
   CollectiveEpilogue_,
   TileScheduler_,
   kEnableSboOverlap,
-  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistageOnN, typename CollectiveMainloop_::DispatchPolicy::Schedule>>> {
+  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistageOnN, typename CollectiveMainloop_::DispatchPolicy::Schedule>>, false> {
 public:
   //
   // Type Aliases
@@ -1236,7 +1272,7 @@ class DeepGemmUniversal<
   CollectiveEpilogue_,
   TileScheduler_,
   kEnableSboOverlap,
-  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistage, typename CollectiveMainloop_::DispatchPolicy::Schedule>>> {
+  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistage, typename CollectiveMainloop_::DispatchPolicy::Schedule>>, false> {
 public:
 public:
   //
@@ -1468,45 +1504,14 @@ public:
       // }
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
-      CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
-
-      auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
-                                                  M, offset_m, offset_b, ptr_A, ptr_B);
-      // Extract out partitioned A and B.
-      Tensor gA = get<0>(load_inputs);
-      Tensor gB = get<1>(load_inputs);
-
-      // Compute tile residues for predication
-      auto m_max_coord = M - size<0>(gA) * get<0>(blk_coord_mnkl);                             // M - BLK_M * m_coord
-      const auto n_max_coord = [&] {
-        if constexpr (N % size<1>(TileShape{}) == 0) {
-          return size<1>(TileShape{});
-        } else {
-          return N - size<0>(gB) * get<1>(blk_coord_mnkl);
-        }
-      }();
-      auto k_residue   = K - size<1>(gA) * size<2>(gA);                                        // K - BLK_K * k_coord_max
-      auto residue_mnk = make_tuple(m_max_coord, n_max_coord, k_residue);
-
-      // Allocate the tiled_mma and the accumulators for the (M,N) blk_shape
       TiledMma tiled_mma;
-      Tensor accumulators = make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape))); // (MMA,MMA_M,MMA_N)
+      Tensor accumulators = make_fragment_like<ElementCompute>(
+          partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
       clear(accumulators);
-
-      auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
-      int  k_tile_count = size<2>(gA);
-
-      // Perform the collective scoped MMA
-      collective_mma(
-        accumulators,
-        load_inputs,
-        accumulators,
-        k_tile_iter, k_tile_count,
-        residue_mnk,
-        thread_idx,
-        warp_idx,
-        smem_buf
-      );
+      auto residue_mnk = deep_gemm::compute_channelwise_tile<CollectiveMainloop, N>(
+          problem_shape_MNKL, blk_coord_mnkl, params.mainloop, M,
+          offset_m, offset_b, ptr_A, ptr_B, accumulators,
+          thread_idx, warp_idx, smem_buf);
 
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
