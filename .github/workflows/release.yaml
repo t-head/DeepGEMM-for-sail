@@ -1,0 +1,90 @@
+name: Release Pypi
+
+# 调用独立模板仓库 ppu-release-action，uses 与 template_ref 必须使用同一版本。
+# 在调用方仓库或授权给调用方仓库的组织级 Actions Secrets 中配置 RELEASE_USERNAME、RELEASE_TOKEN、DATA_TOKEN。
+# tag 触发时保存 Release wheel 产物。
+on:
+  # 仅推送 tag 自动触发，或手动填写参数触发。
+  push:
+    tags:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: '构建和发布的包名'
+        required: true
+        type: string
+        default: deep_gemm
+      framework:
+        description: '依赖的框架名称，例如 torch'
+        required: true
+        type: string
+        default: torch
+      python_versions:
+        description: 'JSON 数组，候选值：38、310、312'
+        required: true
+        type: string
+        default: '["312"]'
+      os_versions:
+        description: 'JSON 数组，候选值：ubuntu2004、ubuntu2204、ubuntu2404、alios7u2'
+        required: true
+        type: string
+        default: '["ubuntu2404"]'
+      runtime_versions:
+        description: 'JSON 数组，候选值：2、3'
+        required: true
+        type: string
+        default: '["3"]'
+      torch_versions:
+        description: 'JSON 数组，候选值：2.8.0、2.10.0、2.13.0；[""] 表示不包含 Torch 版本'
+        required: true
+        type: string
+        default: '["2.10.0"]'
+      sdk_versions:
+        description: 'JSON 数组，候选值：2.1.0、2.2.0'
+        required: true
+        type: string
+        default: '["2.2.0"]'
+      tag_version:
+        description: '代码版本，用于构建和发布多个whl包的场景，手动指定tag'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: t-head/ppu-release-action/.github/workflows/matrix-release.yml@master
+    permissions:
+      contents: write
+    secrets:
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      data_token: ${{ secrets.DATA_TOKEN }}
+    with:
+      # 手动触发使用填写的参数；tag push 没有 inputs，使用与手动入口一致的默认值。
+      package_name: ${{ inputs.package_name || 'deep_gemm' }}
+      framework: ${{ inputs.framework || 'torch' }}
+      template_repository: t-head/ppu-release-action
+      template_ref: master
+      python_versions: ${{ inputs.python_versions || '["312"]' }}
+      os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
+      runtime_versions: ${{ inputs.runtime_versions || '["3"]' }}
+      torch_versions: ${{ inputs.torch_versions || '["2.10.0"]' }}
+      sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
+      tag_version: ${{ inputs.tag_version || ''}}
+      build_command: |
+        unset PIP_INDEX_URL
+        source /usr/local/PPU_SDK/envsetup.sh || true
+        which hgcc || true
+        echo $PPU_SDK
+        pip install ray[adag]==2.40.0 --no-deps
+        pip install setuptools==69.5.1
+        pip install setuptools-scm==9.2.2
+        pip install numpy==1.26.4 junit-xml rich
+        python3 -m pip install wheel ninja
+        python3 -m pip show setuptools setuptools-scm packaging
+        export PYTORCH_SAIL_ARCH="ppu_10;ppu_15"
+        python3 setup.py bdist_wheel
