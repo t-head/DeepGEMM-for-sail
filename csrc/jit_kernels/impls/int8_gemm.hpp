@@ -615,11 +615,15 @@ static_assert(sizeof(GemmKernel::Params) == {20}, "host/device kernel Params siz
 // 32-bit shared address, for 2 * 3 = 6 VREGs; A/B use the AIU load path.
 constexpr int kVregOverhead = 6;
 
-// A8W4 large-M tiles need extra headroom for unpack/dequant temporaries. Without accounting for
-// them, launch_bounds over-constrains VREGs and the compiler spills scheduler/epilogue state.
-// Dequantization keeps the unique FP32 scales for one warp output tile resident in VREGs:
-// 2 ScaleA registers per M16 atom and 4 ScaleB registers per N16 atom, plus 2 registers for
-// scale-address/coordinate bookkeeping. The total is 2 * (WARP_M / 16) + 4 * (WARP_N / 16) + 2.
+// A8W4 large-M tiles need extra VREG headroom. Without it launch_bounds over-constrains the
+// register file and the compiler spills scheduler/epilogue state.
+// The post-mainloop dequant path (BlockM >= 64) loads scales per output atom in a fully-unrolled
+// loop; the large accumulator (mma_acc + accum both live) combined with unrolled scale loads and
+// address temporaries creates peak pressure that the base model does not capture.
+// The formula below is an empirical proxy that scales with warp tile size:
+// 2 * (WARP_M / 16) + 4 * (WARP_N / 16) + 2.
+// For BlockM < 64, scales are preloaded into small arrays before the mainloop; the smaller
+// accumulator keeps total VREG usage within the base overhead.
 constexpr int kA8W4LargeTileOverhead = kA8W4Int8 && BLOCK_M >= 64
     ? 2 * (WARP_M / 16) + 4 * (WARP_N / 16) + 2 : 0;
 constexpr int kTotalVregOverhead = kVregOverhead + kA8W4LargeTileOverhead;

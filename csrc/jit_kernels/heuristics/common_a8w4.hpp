@@ -52,51 +52,70 @@ struct A8W4HeuristicConfig {
     int num_stages;
 };
 
-// Run the shared INT8 search to completion first, then replace its final result only for measured
-// A8W4 workload classes. Unmatched shapes retain the complete shared-search configuration.
+// Run the shared INT8 search to completion first, then replace its final result
+// for grouped (Masked / NoPad) A8W4 workloads.  The M-based tile selection below
+// is derived from cross-EP ACExt A8W4 LUT analysis (ep1/ep8/ep16, four (N,K)
+// combinations).  GroupedContiguous retains the original shared-search result.
 inline A8W4HeuristicConfig finalize_heuristic_config(
         int m, int n, int k, int num_groups, GemmType gemm_type,
         int block_m, int block_n, int block_k, int warp_m, int warp_n, int num_stages) {
     A8W4HeuristicConfig config{block_m, block_n, block_k, warp_m, warp_n, num_stages};
 
-    // Wide short-K, e.g. GLM gemm2 N=6144/K=256. Validated by TP and EP sweeps.
-    const bool is_wide_short_k =
-        gemm_type != GemmType::GroupedContiguous && n > 512 && k <= 256;
-    if (is_wide_short_k) {
+    // ---- Rule 1: Wide short-K (unchanged) ----
+    // GLM gemm2 N=6144/K=256.  Validated by TP NoPad 13-point sweep.
+    if (n > 512 && k <= 256) {
         return {32, 128, 128, 32, 32, 2};
     }
 
-    // Large prefill: BM256/BN256 or BN512 collapses to one CTA/CU. BM128/BN256 preserves
-    // two resident CTAs on the measured PPU0010 workloads.
-    if (gemm_type != GemmType::GroupedContiguous && k >= 4096 && m > 48 &&
-        (block_m > 128 || block_n > 256)) {
-        return {128, 256, 128, 64, 64, 2};
-    }
-
-    // Long-K gemm1 transition region. Keep measured configurations explicit until broader shape
-    // coverage justifies replacing them with a cost model.
-    if (gemm_type != GemmType::GroupedContiguous && n <= 512 && k >= 4096) {
+    // ---- Rule 2: Long-K small-N (GLM gemm1 N=512/K=6144) ----
+    // The shared INT8 search already produces good results for this shape class.
+    // Only override M<=16 (verified BM16 decode tile) and very small M_per_group
+    // stage adjustment; all other M values retain the shared-search configuration.
+    if (n <= 512 && k >= 4096) {
         if (m <= 16) {
             return {16, 64, 256, 16, 16, 2};
         }
         if (m <= 48) {
             return {64, 128, 128, 32, 32, 3};
         }
+        // M>48: preserve the shared-search tile but ensure stage=2 for very small M.
+        const int m_per_group = (m + num_groups - 1) / num_groups;
+        if (m_per_group < 6 && (config.block_m == 16 || config.block_m == 32)) {
+            config.num_stages = 2;
+        }
+        // Normalize BM16 small-N warp shape for packed-B.
+        if (config.block_m == 16) {
+            config.block_n = 64;
+            config.warp_m = 16;
+            config.warp_n = 16;
+        }
+        return config;
     }
 
-    // Preserve the original packed-B BM16 small-N normalization for unmatched A8W4 shapes.
-    if (config.block_m == 16 && n <= 512) {
-        config.block_n = 64;
-        config.warp_m = 16;
-        config.warp_n = 16;
-    }
+    // ---- Rule 3: M-based tile selection for remaining grouped shapes ----
+    // Applies to N>512 (e.g. N=4096/K=7168, N=7168/K=2048).
+    //
+    // A8W8 uses dynamic tile for these shapes (BM256/BN256 when expected_m>73).
+    // A8W4 cannot use dynamic tile, so we replicate the large-tile selection here.
+    // With BM16/BN64 on N=4096, tile count per expert explodes (384 tiles at m=86)
+    // and scheduling overhead dominates.  Large tiles cut this by 20-30x.
 
-    const int m_per_group = gemm_type == GemmType::GroupedContiguous
-        ? (m + num_groups - 1) / num_groups : m;
-    if (m_per_group < 6 && (config.block_m == 16 || config.block_m == 32)) {
-        config.num_stages = 2;
+    // Large expected_m: match A8W8 dynamic tile's large-EM path.
+    if (m > 73) {
+        return {128, 256, 128, 64, 64, 2};
     }
-    return config;
+    // Medium expected_m: BM64 keeps tile count compact on large-N shapes.
+    // Without this, BM16 at m=30-73 produces excessive tile count
+    // (e.g. 96 tiles/expert at m=43/N=4096) causing 30-40% regression.
+    if (m > 32) {
+        return {64, 128, 128, 32, 32, 2};
+    }
+    // Small-medium expected_m: BM16 with larger BN for reasonable tile count.
+    if (m > 16) {
+        return {16, 128, 128, 16, 32, 2};
+    }
+    // Small expected_m (decode).
+    return {16, 64, 256, 16, 16, 2};
 }
 
 // ============================================================================
