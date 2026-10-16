@@ -1056,11 +1056,11 @@ def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
     supported_keys = ["data_type", "groups", "m", "n", "k", "distribution", "em", "enable_sbo_overlap", "num_token", "topk", "group_size", "logits_dtype", "weights_dtype", "c4_compressed", "epilogue_type", "swiglu_limit", "sparse_block_kv", "num_max_sparse_blocks", "use_unaligned_ks"]
-    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", ]
+    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", ]
     supported_indexer_epilogue_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
-    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm),(.+)"
+    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm),(.+)"
     pattern = re.compile(dg_params)
     m = pattern.search(s.strip("."))
     if not m:
@@ -1077,6 +1077,8 @@ def parse_deepgemm_string_re(s):
         if value.startswith('[') and value.endswith(']'):
             result[key] = ast.literal_eval(value)
         elif key == "data_type":
+            if result["gemm_type"] == "HcPrenormGemm" and value != "tf32":
+                raise ValueError("HcPrenormGemm requires data_type:tf32")
             result[key] = convert_data_type_to_dtype(value)
         elif key == "quant_type":
             if value not in supported_quant_type:
@@ -1168,20 +1170,44 @@ def convert_data_type_to_dtype(data_type):
         print(f"ERROR: Unsupported dtype: {data_type}, please check!")
         exit(1)
 
+def test_hc_prenorm_gemm(args) -> None:
+    if _acc_check and get_ref_backend() != "device":
+        raise ValueError("HC prenorm accuracy checks require --ref_backend=device")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    m, n, k = args['m'], args['n'], args['k']
+    if args['data_type'] != torch.float32:
+        raise ValueError("HcPrenormGemm requires data_type:tf32")
+    print(f"Testing HcPrenormGemm,m:{m},n:{n},k:{k},data_type:tf32")
+    x, y, out, out_s, ref_out, ref_s = construct(m, k, n, torch.float32)
+
+    def test_func():
+        deep_gemm.tf32_hc_prenorm_gemm(x, y, out, out_s, num_splits=None)
+
+    test_func()
+    if _acc_check:
+        for name, actual, expected in (("out", out, ref_out), ("sqr_sum", out_s, ref_s)):
+            diff = calc_diff(actual, expected)
+            assert diff < 1e-8, f'{m=}, {n=}, {k=}, {name=}, {diff=:.10g}'
+        print("Passed with acc_check\n")
+    else:
+        print("Passed without acc_check\n")
+    if get_benchmark():
+        times = bench_kineto(test_func, ('tf32_hc_prenorm_gemm', 'tf32_hc_round_b'),
+                             suppress_kineto_output=True)
+        print(f' > HcPrenormGemm (m={m}, n={n}, k={k}): {sum(times) * 1e6:.3f} us')
+
 def test_gemm(args) -> None:
     print('Testing GEMM:')
     m, n, k, d = args['m'], args['n'], args['k'], args["data_type"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     print(f"test_gemm->test_func: DenseGemm,m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")
+    if d == torch.float32:
+        raise ValueError("DenseGemm does not implement FP32 GEMM; use HcPrenormGemm,data_type:tf32 for prenorm")
     if use_ppu:
-        if d == torch.float32:
-            x, y, out, out_s, ref_out, ref_s = construct(m, k, n, d, quant_type=quant_type)
-        else:
-            x, y, out, ref_out = construct(m, k, n, d, quant_type=quant_type)
+        x, y, out, ref_out = construct(m, k, n, d, quant_type=quant_type)
         if d == torch.bfloat16:
             deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
-        elif d == torch.float32:
-            deep_gemm.tf32_hc_prenorm_gemm(x, y, out, out_s, num_splits=None)
         elif d == torch.int8:
             deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
         elif d == torch.float8_e4m3fn:
@@ -1208,18 +1234,11 @@ def test_gemm(args) -> None:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
     if _acc_check:
-        tf32_threshold = 1e-8 if d == torch.float32 else 0.001
-        if d == torch.float32:
-            diff_s = calc_diff(out_s, ref_s)
-            if diff_s >= tf32_threshold:
-                print("ref_out_s:", ref_s)
-                print("out_s:", out_s)
-            assert diff_s < tf32_threshold, f'{m=}, {k=}, {n=}, {diff_s:.10f}'
         diff = calc_diff(out, ref_out)
-        if diff >= tf32_threshold:
+        if diff >= 0.001:
             print("ref_out:", ref_out)
             print("out:", out)
-        assert diff < tf32_threshold, f'{m=}, {k=}, {n=}, {diff:.10f}'
+        assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.10f}'
         print("Passed with acc_check\n")
     else:
         print("Passed without acc_check\n")

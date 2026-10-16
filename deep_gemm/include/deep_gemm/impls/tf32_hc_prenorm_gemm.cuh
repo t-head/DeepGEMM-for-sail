@@ -799,7 +799,7 @@ tf32_hc_prenorm_gemm_device(
     constexpr uint32_t kKBlocks = SHAPE_K / BLOCK_K;
     constexpr uint32_t kKPerSplit = kKBlocks / kNumSplits;
     DG_STATIC_ASSERT(kKBlocks % kNumSplits == 0, "K blocks must divide evenly across splits");
-    DG_STATIC_ASSERT(kKPerSplit >= 2, "Each split needs at least two K blocks");
+    DG_STATIC_ASSERT(kKPerSplit >= 1, "Each split needs at least one K block");
     constexpr uint32_t NUM_STEPS = kKPerSplit;
     constexpr uint32_t NUM_MAIN = NUM_STEPS >= 2 ? NUM_STEPS - 2 : 0;
     const uint32_t kb0 = k_split_idx * kKPerSplit * BLOCK_K;
@@ -878,7 +878,17 @@ tf32_hc_prenorm_gemm_device(
         }
     };
 
-    if constexpr ((kKernelVariant & 32) && NUM_STEPS <= 8) {
+    if constexpr (NUM_STEPS == 1) {
+        ldA(0, 0); ldB(0, 0); cp_async_fence();
+        cp_async_wait<0>();
+        __syncthreads();
+        #pragma unroll
+        for (int kh = 0; kh < kKH; ++kh) {
+            if (is_mma_thread) {
+                rdA(0, kh); cvtSq(); doGemm(0, kh);
+            }
+        }
+    } else if constexpr ((kKernelVariant & 32) && NUM_STEPS <= 8) {
     if constexpr (kKernelVariant & 4) {
         constexpr uint32_t kStages = NUM_STEPS < 2 ? NUM_STEPS : 2;
         #pragma unroll
@@ -1340,9 +1350,7 @@ public:
 
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(
-                GemmType::DenseGemm, false, std::string("tf32"),
-                1, m, SHAPE_N, SHAPE_K, 1, nullptr, stream);
+            dg_prof_params.set_hc_prenorm_params(m, SHAPE_N, SHAPE_K, stream);
             dg_prof_params.add_params("num_splits", int(kNumSplits));
         }
 

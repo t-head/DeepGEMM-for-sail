@@ -123,10 +123,10 @@ def tf32_hc_prenorm_gemm(a: torch.Tensor,
     while num_splits > 1 and (k_blocks % num_splits or k_blocks // num_splits < 2):
         num_splits //= 2
 
-    assert k_blocks >= 2, f'K={k} is too small, need at least two blocks of {block_k}'
-    assert k_blocks % num_splits == 0 and k_blocks // num_splits >= 2, (
+    assert k_blocks >= 1, f'K={k} is too small, need at least one block of {block_k}'
+    assert k_blocks % num_splits == 0 and k_blocks // num_splits >= 1, (
         f'num_splits={num_splits} must divide k_blocks={k_blocks} evenly and leave '
-        f'at least two K blocks per split')
+        f'at least one K block per split')
 
     smem_size = 0
 

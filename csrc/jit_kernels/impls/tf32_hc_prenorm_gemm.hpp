@@ -223,9 +223,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& lhs, const torch::Tensor& 
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(
-            GemmType::DenseGemm, false, std::string("tf32"),
-            1, m, n, k, 1, nullptr, current_stream());
+        dg_prof_params.set_hc_prenorm_params(m, n, k, current_stream());
         dg_prof_params.add_params("num_splits", int(num_splits));
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);

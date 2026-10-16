@@ -152,6 +152,11 @@ void set_params(GemmType gemm_type, bool is_gemv,
     add_params("gpu", gpu);
 }
 
+void set_hc_prenorm_params(int m, int n, int k, hggcStream_t stream = 0) {
+    set_params(GemmType::DenseGemm, false, "tf32", 1, m, n, k, 1, nullptr, stream);
+    op_name_ = "HcPrenormGemm";
+}
+
 void set_fused_moe_params(const std::string& data_type, const std::string& quant_type,
                           int groups, int num_token, int topk,
                           int n, int k, int* grouped_layout, hggcStream_t stream = 0) {
