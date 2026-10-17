@@ -1,4 +1,6 @@
 #pragma once
+#include <deep_gemm/tix/ld_st.cuh>
+#include <deep_gemm/common/math.cuh>
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 
 namespace cutlass::gemm::kernel {
@@ -220,7 +222,7 @@ public:
         int thread_idx = int(threadIdx.x);
         int warp_m_idx = warp_idx % WarpOnM;
         int warp_n_idx = warp_idx / WarpOnM;
-        int lane_idx = get_lane_idx();
+        int lane_idx = deep_gemm::tix::get_lane_idx();
 
         // ── Shared memory ─────────────────────────────────────────────────
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);

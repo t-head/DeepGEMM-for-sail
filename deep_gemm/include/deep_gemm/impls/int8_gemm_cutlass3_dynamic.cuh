@@ -1,3 +1,4 @@
+#include <deep_gemm/common/types.cuh>
 #include <cutlass/cutlass.h>
 #include <cutlass/arch/arch.h>
 #include <cutlass/arch/mma.h>
@@ -70,6 +71,7 @@ struct KernelAiuDynamicTileTPSmallK {
 
 namespace cutlass::gemm::kernel {
 
+using deep_gemm::GemmType;
 
 template <
   GemmType kGemmType,

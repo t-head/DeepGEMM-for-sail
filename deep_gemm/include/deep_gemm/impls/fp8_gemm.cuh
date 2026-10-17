@@ -3,6 +3,9 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 // #include <iostream>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/scheduler/block_info.cuh>
 #include <hggc_fp8.h>
 #ifndef FP8_HGRTC
     #include <deep_gemm/common/profiling_interface.cuh>
@@ -29,6 +32,7 @@
 #include <tools/util/include/cutlass/util/packed_stride.hpp>
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
+#include <deep_gemm/tix/utils.cuh>
 #include <cutlass/gemm/collective/ppu_mma_aiu_multistage_with_scale.hpp>
 namespace deep_gemm {
 using namespace cute;
@@ -348,8 +352,8 @@ public:
         __syncthreads();
 
         if (threadIdx.x == 0) {
-          atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
-                  * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
+          tix::atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
+                  * math::ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
         }
       }
     } // Scheduler work fetch loop
@@ -993,8 +997,8 @@ public:
         __syncthreads();
 
         if (threadIdx.x == 0) {
-          atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
-                  * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
+          tix::atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
+                  * math::ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
         }
       }
     } // Scheduler work fetch loop
@@ -1143,7 +1147,7 @@ public:
         int* layout_info = grouped_layout;
         // compute block_m_info
         if (TileScheduler::kIsNoPadPreprocessLayout) {
-            uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+            uint32_t block_size = max(32, math::next_power_of_two(kNumGroups));
             computeBlockInfoKernel<BLOCK_M><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
             layout_info = block_m_info;
         }

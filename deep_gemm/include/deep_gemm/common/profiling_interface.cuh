@@ -1,18 +1,27 @@
 #pragma once
 #include <hgtx3/hgToolsExt.h>
 #include <hggc_runtime.h>
-#include <string>
+#include <cstdlib>
+#include <iomanip>
 #include <iostream>
-#include <deep_gemm/common/utils.cuh>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/types.cuh>
 
 
 class DgProfParam {
 public:
+    using GemmType = deep_gemm::GemmType;
 
 DgProfParam() {}
 
 void initialize_args(GemmType gemm_type, bool is_gemv, int m, int group, int* grouped_layout, int device_id, hggcStream_t stream = 0) {
-    op_name_ = GemmTypeS[static_cast<int>(gemm_type)];
+    op_name_ = deep_gemm::GemmTypeS[static_cast<int>(gemm_type)];
     m_ = m;
     group_ = group;
     grouped_layout_ = grouped_layout;

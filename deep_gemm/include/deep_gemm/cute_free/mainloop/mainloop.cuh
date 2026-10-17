@@ -5,7 +5,7 @@
 #include <cutlass/arch/arch.h>
 #include <cutlass/arch/memory_ppu.h>
 #include <deep_gemm/cute_free/arch/ppu_common.cuh>
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/math.cuh>
 
 namespace deep_gemm {
 namespace mainloop {
@@ -470,7 +470,7 @@ struct Mainloop {
       int m_offset, int n_offset,
       float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread]) {
 
-    int total_k_tiles = ceil_div(params.K, BLOCK_K);
+    int total_k_tiles = math::ceil_div(params.K, BLOCK_K);
 
     // Smem base pointers
     Element* smem_a = reinterpret_cast<Element*>(smem);

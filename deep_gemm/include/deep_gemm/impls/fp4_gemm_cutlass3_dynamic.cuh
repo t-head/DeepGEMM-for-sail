@@ -1,6 +1,8 @@
 #pragma once
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/epilogue/epilogue_traits.cuh>
 
 #include <cutlass/cutlass.h>
 #include <cutlass/arch/arch.h>
@@ -19,7 +21,7 @@ constexpr static int Fp4TileLength = 5;
 constexpr static int Fp4ElementsPerTile = 6; // BLOCK_M, BLOCK_N, warpM, warpN, blockK, stages
 
 struct KernelAiuFp4DynamicTileLargeEM {
-  constexpr static FP4DynamicTileId DynamicTildId = FP4DynamicTileId::LargeEM;
+  constexpr static deep_gemm::FP4DynamicTileId DynamicTildId = deep_gemm::FP4DynamicTileId::LargeEM;
   constexpr static int TileConfigList[Fp4TileLength][Fp4ElementsPerTile] = {
     {64,  256, 32, 32, 128, 4},
     {64,  256, 32, 32, 128, 4},
@@ -30,7 +32,7 @@ struct KernelAiuFp4DynamicTileLargeEM {
 }; // max
 
 struct KernelAiuFp4DynamicTileLargeK {
-  constexpr static FP4DynamicTileId DynamicTildId = FP4DynamicTileId::LargeK;
+  constexpr static deep_gemm::FP4DynamicTileId DynamicTildId = deep_gemm::FP4DynamicTileId::LargeK;
   constexpr static int TileConfigList[Fp4TileLength][Fp4ElementsPerTile] = {
     {32, 256, 32, 32, 128, 3},
     {64, 256, 32, 64, 128, 3},
@@ -41,7 +43,7 @@ struct KernelAiuFp4DynamicTileLargeK {
 };
 
 struct KernelAiuFp4DynamicTileLargeK_G2 {
-  constexpr static FP4DynamicTileId DynamicTildId = FP4DynamicTileId::LargeK_G2;
+  constexpr static deep_gemm::FP4DynamicTileId DynamicTildId = deep_gemm::FP4DynamicTileId::LargeK_G2;
   constexpr static int TileConfigList[Fp4TileLength][Fp4ElementsPerTile] = {
     { 32, 256, 32, 32, 128, 3},
     { 64, 256, 32, 64, 128, 3},
@@ -52,7 +54,7 @@ struct KernelAiuFp4DynamicTileLargeK_G2 {
 };
 
 struct KernelAiuFp4DynamicTileSmallEM {
-  constexpr static FP4DynamicTileId DynamicTildId = FP4DynamicTileId::SmallEM;
+  constexpr static deep_gemm::FP4DynamicTileId DynamicTildId = deep_gemm::FP4DynamicTileId::SmallEM;
   constexpr static int TileConfigList[Fp4TileLength][Fp4ElementsPerTile] = {
     {16, 128, 16, 32, 128, 3},
     {32, 128, 32, 32, 128, 4},
@@ -63,16 +65,17 @@ struct KernelAiuFp4DynamicTileSmallEM {
 };
 
 // Select FP4 dynamic-tile variant by FP4DynamicTileId
-template <FP4DynamicTileId kDynamicTileId> struct Fp4DynamicTileSelector;
-template <> struct Fp4DynamicTileSelector<FP4DynamicTileId::LargeEM>   { using type = KernelAiuFp4DynamicTileLargeEM; };
-template <> struct Fp4DynamicTileSelector<FP4DynamicTileId::LargeK>    { using type = KernelAiuFp4DynamicTileLargeK; };
-template <> struct Fp4DynamicTileSelector<FP4DynamicTileId::LargeK_G2> { using type = KernelAiuFp4DynamicTileLargeK_G2; };
-template <> struct Fp4DynamicTileSelector<FP4DynamicTileId::SmallEM>   { using type = KernelAiuFp4DynamicTileSmallEM; };
+template <deep_gemm::FP4DynamicTileId kDynamicTileId> struct Fp4DynamicTileSelector;
+template <> struct Fp4DynamicTileSelector<deep_gemm::FP4DynamicTileId::LargeEM>   { using type = KernelAiuFp4DynamicTileLargeEM; };
+template <> struct Fp4DynamicTileSelector<deep_gemm::FP4DynamicTileId::LargeK>    { using type = KernelAiuFp4DynamicTileLargeK; };
+template <> struct Fp4DynamicTileSelector<deep_gemm::FP4DynamicTileId::LargeK_G2> { using type = KernelAiuFp4DynamicTileLargeK_G2; };
+template <> struct Fp4DynamicTileSelector<deep_gemm::FP4DynamicTileId::SmallEM>   { using type = KernelAiuFp4DynamicTileSmallEM; };
 
 }
 
 namespace cutlass::gemm::kernel {
 
+using deep_gemm::GemmType;
 
 template <
   GemmType kGemmType,
@@ -89,7 +92,7 @@ template <
   int TileId,
   bool hasBias = false,
   int N_EXPAND = 1,
-  EpilogueType kEpilogueType = EpilogueType::Default,
+  deep_gemm::EpilogueType kEpilogueType = deep_gemm::EpilogueType::Default,
   bool kApplySwigluLimit = false
 >
 struct Fp4TypeBuilder {
@@ -115,7 +118,7 @@ struct Fp4TypeBuilder {
   static constexpr int WARP_N = KernelAiuFp4DynamicTile::TileConfigList[TileId][3];
   static constexpr int BLOCK_K = KernelAiuFp4DynamicTile::TileConfigList[TileId][4];
   static constexpr int kNumStages = KernelAiuFp4DynamicTile::TileConfigList[TileId][5];
-  static_assert(EpilogueTraits<kEpilogueType>::is_valid_config(SHAPE_N, BLOCK_N, N_EXPAND, hasBias),
+  static_assert(deep_gemm::EpilogueTraits<kEpilogueType>::is_valid_config(SHAPE_N, BLOCK_N, N_EXPAND, hasBias),
                 "SiluAndMulPostQuantFp4 Epilogue only support BLOCK_N >= 64, SHAPE_N % 64 == 0, "
                 "N_EXPAND == 1 and hasBias == false.");
 
@@ -221,7 +224,7 @@ struct Fp4TypeBuilder {
   >;
 
   using CollectiveEpilogue = typename cutlass::platform::conditional<
-    kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4,
+    kEpilogueType == deep_gemm::EpilogueType::SiluAndMulPostQuantFp4,
     CollectiveEpilogueSiluAndMulPostQuant,
     CollectiveEpilogueNoTsm
   >::type;
@@ -245,7 +248,7 @@ struct Fp4TypeBuilder {
   static CUTLASS_DEVICE void run(Params params, char* smem_buf, int M, int m_coord, int n_coord,
                           int64_t offset_a, int64_t offset_b, int64_t offset_m, int64_t offset_c,
                           int64_t offset_scalea, int64_t offset_scaleb, int64_t offset_scalec) {
-    if constexpr (kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4) {
+    if constexpr (kEpilogueType == deep_gemm::EpilogueType::SiluAndMulPostQuantFp4) {
       // Epilogue reuse the shared storage comes from mainloop.
       // Make sure that the size of epilogue SharedStorage is less than Mainloop.
       static_assert(CollectiveEpilogueSiluAndMulPostQuant::get_shared_storage_size(BLOCK_M, BLOCK_N)
@@ -308,7 +311,7 @@ struct Fp4TypeBuilder {
     // update params.epilogue for ptrC and ptrD
     auto params_epilogue_local = *(reinterpret_cast<typename CollectiveEpilogue::Params*>(&(params.epi_params)));
     params_epilogue_local.ptr_D += offset_c;
-    if constexpr (EpilogueTraits<kEpilogueType>::needs_sfd_offset) {
+    if constexpr (deep_gemm::EpilogueTraits<kEpilogueType>::needs_sfd_offset) {
       params_epilogue_local.ptr_SFD += offset_scalec;
     }
 
@@ -339,8 +342,8 @@ template <
   int SHAPE_N,
   int SHAPE_K,
   int kNumGroups,
-  FP4DynamicTileId kDynamicTileId,
-  EpilogueType kEpilogueType,
+  deep_gemm::FP4DynamicTileId kDynamicTileId,
+  deep_gemm::EpilogueType kEpilogueType,
   bool kApplySwigluLimit
 >
 struct Fp4DeepGemmDynamicTile {
@@ -443,7 +446,7 @@ struct Fp4DeepGemmDynamicTile {
       auto offset_scalea = deep_scheduler.curr_offset_mxfp4_scalea();
       auto offset_scaleb = deep_scheduler.curr_offset_mxfp4_scaleb(m_block_idx);
       int64_t offset_scalec = 0;
-      if constexpr (EpilogueTraits<kEpilogueType>::needs_sfd_offset) {
+      if constexpr (deep_gemm::EpilogueTraits<kEpilogueType>::needs_sfd_offset) {
         offset_scalec = deep_scheduler.curr_offset_c_scales();
       }
 

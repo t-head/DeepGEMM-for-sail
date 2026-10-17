@@ -1,6 +1,7 @@
 #pragma once
 
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/gemm.h>
 #include <cutlass/matrix_coord.h>
@@ -188,7 +189,7 @@ struct Scheduler
             curr_group_idx = data.x;
             curr_group_m = data.y;
             uint32_t block_idx_in_m = next_block_idx - data.z * num_n_blocks;
-            uint32_t num_m_blocks = ceil_div(curr_group_m, ThreadblockShape::kM);
+            uint32_t num_m_blocks = math::ceil_div(curr_group_m, ThreadblockShape::kM);
             curr_m_start = data.w;
             get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);
             curr_m = (curr_group_m - (m_block_idx * ThreadblockShape::kM)) < ThreadblockShape::kM
@@ -205,7 +206,7 @@ struct Scheduler
                 }
                 // Within the current group
                 curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
-                num_m_blocks = ceil_div(curr_group_m, ThreadblockShape::kM);
+                num_m_blocks = math::ceil_div(curr_group_m, ThreadblockShape::kM);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
                 if (next_block_idx < current_m_block_cumsum * num_n_blocks)
                     break;

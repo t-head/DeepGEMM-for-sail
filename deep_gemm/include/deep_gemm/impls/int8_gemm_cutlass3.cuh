@@ -25,7 +25,10 @@
 
 #include <ppu_include.hpp>
 #include <deep_gemm/common/utils_cutlass3.cuh>
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/scheduler/block_info.cuh>
+#include <deep_gemm/tix/utils.cuh>
 
 using namespace cute;
 
@@ -60,6 +63,8 @@ struct MainloopPPUAiuA8W8OverlapPrologue {
 #include <deep_gemm/impls/int8_gemm_cutlass3_dynamic.cuh>
 
 namespace cutlass::gemm::kernel {
+
+using deep_gemm::GemmType;
 
 ///////////////////////////////////////////////////////////////////////////////
 template <
@@ -678,7 +683,7 @@ public:
         __syncthreads();
 
         if (threadIdx.x == 0) {
-          atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
+          deep_gemm::tix::atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
                   * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
         }
       }
@@ -1223,6 +1228,8 @@ CUTLASS_PRAGMA_UNROLL
 
 namespace cutlass::gemm::kernel {
 
+using deep_gemm::GemmType;
+
 template <
   class ProblemShape_,
   class CollectiveMainloop_,
@@ -1531,7 +1538,7 @@ public:
         __syncthreads();
 
         if (threadIdx.x == 0) {
-          atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
+          deep_gemm::tix::atomic_add_release_global(params.signal + deep_scheduler.curr_group_idx
                   * ceil_div(deep_scheduler.params.shape_m, TileScheduler::BLOCK_M) + m_block_idx, 1);
         }
       }
@@ -1611,7 +1618,7 @@ public:
             int* layout_info = grouped_layout;
             // compute block_m_info
             if (TileScheduler::kIsNoPadPreprocessLayout) {
-                uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+                uint32_t block_size = max(32, math::next_power_of_two(kNumGroups));
                 computeBlockInfoKernel<TileScheduler::BLOCK_M><<<1, block_size, 0, stream>>>(
                   reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
                 layout_info = block_m_info;
@@ -1762,7 +1769,7 @@ public:
           int* layout_info = grouped_layout;
           // compute block_m_info
           if (TileScheduler::kIsNoPadPreprocessLayout) {
-              uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+              uint32_t block_size = max(32, math::next_power_of_two(kNumGroups));
               computeBlockInfoKernel<BLOCK_M><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
               layout_info = block_m_info;
           }

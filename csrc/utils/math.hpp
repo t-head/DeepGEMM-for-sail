@@ -3,9 +3,13 @@
 #include <torch/python.h>
 
 #include "exception.hpp"
-#include <deep_gemm/common/utils_rtc.cuh>
 
 namespace deep_gemm {
+
+template <typename T>
+static constexpr T ceil_div(const T& a, const T& b) {
+    return (a + b - 1) / b;
+}
 
 // Rounds toward negative infinity, like Python's `//`. C++'s `/` truncates toward zero, so the
 // two disagree once the dividend goes negative; use this in formulas ported from Python that can.

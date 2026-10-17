@@ -11,7 +11,7 @@
 #include "gemm_int8_lut.hpp"
 #include "runtime_lut.hpp"
 #include "adaptive_tile_selector.hpp"
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/types.cuh>
 using namespace deep_gemm;
 namespace deep_gemm_int8 {
 

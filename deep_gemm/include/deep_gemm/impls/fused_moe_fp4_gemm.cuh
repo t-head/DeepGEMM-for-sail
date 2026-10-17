@@ -2,7 +2,10 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-#include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/epilogue/epilogue_traits.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
 
 #include <cute/ppu_tensor_mix.hpp>
@@ -210,7 +213,7 @@ fp4_gemm_fused_moe_kernel_impl(const Fp4QuantGemmArgs args) {
     //  *(lane-on-k): `ScaleKsPerTile` lanes share one row, their b16 requests are contiguous and
     //    collapsed into one gmem request, at the cost of a `ScaleKsPerTile`-way tsm write bank conflict
     constexpr uint32_t NumThreads_Needed = ScaleMsPerTile * ScaleKsPerTile;
-    constexpr uint32_t ACP_SFA_ITER = ceil_div(NumThreads_Needed, BLOCK_SIZE);
+    constexpr uint32_t ACP_SFA_ITER = math::ceil_div(NumThreads_Needed, BLOCK_SIZE);
     static_assert(32 % ScaleKsPerTile == 0,
                   "ScaleKsPerTile must divide the warp size for the lane-on-k sfa g2s mapping.");
     // Whether the flattened thread mapping overshoots BLOCK_M rows (tail threads that must not write smem).

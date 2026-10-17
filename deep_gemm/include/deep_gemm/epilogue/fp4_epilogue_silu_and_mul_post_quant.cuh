@@ -8,7 +8,8 @@
 #include <cute/tensor.hpp>
 #include <cute/numeric/numeric_types.hpp>
 #include <cutlass/epilogue/thread/activation.h>
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/epilogue/epilogue_traits.cuh>
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -209,7 +210,7 @@ public:
     auto [m_coord, n_coord, k_coord, l_coord] = blk_coord_mnkl;
     Tensor gD = gD_mnl(_,_,m_coord,n_coord,l_coord);                                                 // (BLK_M,BLK_N)
 
-    constexpr int kOutElemsPerByte = EpilogueTraits<EpilogueType::SiluAndMulPostQuantFp4>::kOutElemsPerByte;
+    constexpr int kOutElemsPerByte = deep_gemm::EpilogueTraits<deep_gemm::EpilogueType::SiluAndMulPostQuantFp4>::kOutElemsPerByte;
     auto gD_ptr = params.ptr_D + (cute::raw_pointer_cast(gD.data()) - params.ptr_D) / kOutElemsPerByte;
 
     // Partition source and destination tiles to match the accumulator partitioning

@@ -1,4 +1,7 @@
 #pragma once
+#include <deep_gemm/tix/cvt.cuh>
+#include <deep_gemm/tix/ld_st.cuh>
+#include <deep_gemm/common/math.cuh>
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 
 namespace cutlass::gemm::kernel {
@@ -276,7 +279,7 @@ public:
     auto tQgQ = tBgB;
     auto tSFQgSFQ = tSFBgSFB;
 
-    const auto& lane_idx = get_lane_idx();
+    const auto& lane_idx = deep_gemm::tix::get_lane_idx();
     const auto& warp_offset = (warp_idx % WarpOnM) * WARP_M;
     const auto& v_0_offset = lane_idx / 4 + 0;
     const auto& v_1_offset = lane_idx / 4 + 8;
@@ -338,13 +341,13 @@ public:
             if constexpr (kWq4) {
                 // Each lane stores only its own parity's kv row in the WARP_Q==4
                 // epilogue, so it only loads that row's scale
-                scale_kv_array[m] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
+                scale_kv_array[m] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
                     scale_kv_array[m] *= kInvSqrtHeadDim;
                 }
             } else {
-                scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
-                scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
+                scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
+                scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
                     scale_kv_array[m * 2    ] *= kInvSqrtHeadDim;
                     scale_kv_array[m * 2 + 1] *= kInvSqrtHeadDim;
@@ -440,10 +443,10 @@ public:
                 const uint32_t lane_in_quad = lane_idx % 4;
 
                 uint32_t pa0, pb0, pa1, pb1;
-                pa0 = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(4, m, 0), accum(0, m, 0));
-                pb0 = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(5, m, 0), accum(1, m, 0));
-                pa1 = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(6, m, 0), accum(2, m, 0));
-                pb1 = deep_gemm::cvt_rte_bf16x2_f32_relu(accum(7, m, 0), accum(3, m, 0));
+                pa0 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(4, m, 0), accum(0, m, 0));
+                pb0 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(5, m, 0), accum(1, m, 0));
+                pa1 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(6, m, 0), accum(2, m, 0));
+                pb1 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(7, m, 0), accum(3, m, 0));
                 __ppu_bfloat162 partial0 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(pa0),
                                                    reinterpret_cast<__ppu_bfloat162&>(pb0));
                 __ppu_bfloat162 partial1 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(pa1),
@@ -464,7 +467,7 @@ public:
                     scale_lo *= scale_q;
                     scale_hi *= scale_q;
                 }
-                const uint32_t scale2 = deep_gemm::cvt_rte_bf16x2_f32(scale_hi, scale_lo);
+                const uint32_t scale2 = deep_gemm::tix::cvt_rte_bf16x2_f32(scale_hi, scale_lo);
                 const __ppu_bfloat162 out2 = __hmul2(total, reinterpret_cast<const __ppu_bfloat162&>(scale2));
 
                 const uint32_t q_idx_lo = q_base + lane_in_quad / 2;

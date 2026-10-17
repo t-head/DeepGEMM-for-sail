@@ -1,5 +1,8 @@
 #pragma once
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/common/types.cuh>
 #include <deep_gemm/impls/gemvt.cuh>
+#include <deep_gemm/tix/cp_async.cuh>
 
 namespace deep_gemm {
 
@@ -46,7 +49,7 @@ __global__ void batched_blockwise_gemvt_kernel_small_k(const BlockWiseGemvtArgs 
   constexpr int NLoopStep = BlockSize / ThreadPerN;
 
   int num_pid_m = args.num_tokens;
-  int num_pid_n = ceil_div(args.N, NPerBlock);
+  int num_pid_n = math::ceil_div(args.N, NPerBlock);
   int num_pid_in_group = GROUP_SIZE_M * num_pid_n;
   int group_id = blockIdx.x / num_pid_in_group;
   int first_pid_m = group_id * GROUP_SIZE_M;
@@ -100,10 +103,10 @@ __global__ void batched_blockwise_gemvt_kernel_small_k(const BlockWiseGemvtArgs 
 
   // load B to shared
   for (int stage = 0; stage < Stages; stage++) {
-    LdgSts128(&(shared[stage][tid_n][tid_k * alignmentB]), b_ptr_start + stage * NLoopStep * args.stride_bn);
-    LdgStsGroupCommit();
+    tix::LdgSts128(&(shared[stage][tid_n][tid_k * alignmentB]), b_ptr_start + stage * NLoopStep * args.stride_bn);
+    tix::LdgStsGroupCommit();
   }
-  LdgStsGroupWait<Stages - 1>();
+  tix::LdgStsGroupWait<Stages - 1>();
 
   HGGC_PRAGMA_UNROLL
   for (int nloop = 0; nloop < NPerThread; nloop++) {
@@ -114,15 +117,15 @@ __global__ void batched_blockwise_gemvt_kernel_small_k(const BlockWiseGemvtArgs 
     cvt_dot_op<src_type, acc_type, alignmentMax>((src_type *)&vreg_a,
                                              (src_type *)(vreg_b + nloop),
                                              accum[nloop]);
-    LdgStsGroupWait<Stages - 2>();
+    tix::LdgStsGroupWait<Stages - 2>();
 
     int load_next_n = nloop + Stages;
     if (nloop < NPerThread - 2) {
       // load next B to shared
       int next_stage = load_next_n % Stages;
       auto b_ptr_next = b_ptr_start + load_next_n * NLoopStep * args.stride_bn;
-      LdgSts128(&(shared[next_stage][tid_n][tid_k * alignmentB]), b_ptr_next, load_next_n < NPerThread);
-      LdgStsGroupCommit();
+      tix::LdgSts128(&(shared[next_stage][tid_n][tid_k * alignmentB]), b_ptr_next, load_next_n < NPerThread);
+      tix::LdgStsGroupCommit();
     }
   }
   float scale_ab;

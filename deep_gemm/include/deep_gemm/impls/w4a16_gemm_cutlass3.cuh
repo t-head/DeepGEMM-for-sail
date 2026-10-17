@@ -5,11 +5,13 @@
 
 #ifndef W4A16_HGRTC
     #include <deep_gemm/common/profiling_interface.cuh>
-    #include <deep_gemm/common/utils.cuh>
-#else
-    #include <deep_gemm/common/utils_rtc.cuh>
 #endif
 
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/scheduler/block_info.cuh>
+
+#include <deep_gemm/tix/cvt.cuh>
 #include <cute/ppu_tensor_mix.hpp>
 #include <cutlass/gemm/config/gemm_operands.hpp>
 #include <cute/atom/mma_traits_ppu0010.hpp>
@@ -27,6 +29,8 @@
 using namespace cute;
 
 namespace cutlass::gemm::kernel {
+
+using deep_gemm::GemmType;
 
 template <typename ElementB, typename ElementScale,
           int ShapeN, int ShapeK,
@@ -514,7 +518,7 @@ public:
           if (!cond) continue;
           #if __HGGC_ARCH__ == 150
             uint32_t d;
-            asm volatile("ppu.cvt.rtte.bf16x2.f32 %0, %1, %2;\n" : "=r"(d) : "f"(accum(i+1)), "f"(accum(i)));
+            d = deep_gemm::tix::cvt_rte_bf16x2_f32(accum(i+1), accum(i));
             *reinterpret_cast<uint32_t*>(dst_ptr) = d;
           #else
             *dst_ptr = ElementD(accum(i));
@@ -799,7 +803,7 @@ public:
       } else {
         int* layout_info = m_rows;
         if constexpr(Kernel::TileScheduler::kIsNoPadPreprocessLayout) {
-          uint32_t block_size = max(32, next_power_of_two(kNumGroups));
+          uint32_t block_size = max(32, math::next_power_of_two(kNumGroups));
           computeBlockInfoKernel<BlockM><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(m_rows), kNumGroups, reinterpret_cast<uint32_t*>(args.block_m_info));
           layout_info = args.block_m_info;
           NoPadPreprocessLayout = true;

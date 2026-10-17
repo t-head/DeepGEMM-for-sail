@@ -15,10 +15,12 @@
 #include <tuple>
 #include <vector>
 
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/types.cuh>
 #include "../../jit/device_runtime.hpp"
 
 namespace deep_gemm_lut {
+
+using deep_gemm::GemmType;
 
 using Tile = std::tuple<int, int, int, int, int, int>;
 enum class RuntimeLutKind { FP8Blockwise, FP8Channelwise, INT8, BF16, FP4 };

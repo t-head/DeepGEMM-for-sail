@@ -1,4 +1,6 @@
 #pragma once
+#include <deep_gemm/tix/ld_st.cuh>
+#include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 #include <deep_gemm/scheduler/paged_mqa_logits_scheduler.cuh>
 
@@ -248,7 +250,7 @@ public:
         }();
         int warp_m_idx = local_warp_idx % WarpOnM;
         int warp_n_idx = local_warp_idx / WarpOnM;
-        int lane_idx = get_lane_idx();
+        int lane_idx = deep_gemm::tix::get_lane_idx();
         int warp_group_id = warp_idx / 8;
 
         // Kernel level shared memory storage

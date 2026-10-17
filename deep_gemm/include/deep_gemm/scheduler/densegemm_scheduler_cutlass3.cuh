@@ -5,7 +5,8 @@
     num_n_blocks is computed at RUNTIME from params.shape_n.
 */
 
-#include <deep_gemm/common/utils_rtc.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/math.cuh>
 #include <cutlass/coord.h>
 #include <cutlass/kernel_hardware_info.h>
 #include <cutlass/workspace.h>
@@ -75,8 +76,8 @@ struct DenseGemmScheduler {
 
     CUTLASS_DEVICE explicit DenseGemmScheduler(Params const& params_, const int warp_group_id = 0)
         : current_iter(warp_group_id), params(params_) {
-        num_aligned_m_blocks = ceil_div(params_.shape_m, BLOCK_M);
-        num_n_blocks = ceil_div(params_.shape_n, BLOCK_N);
+        num_aligned_m_blocks = math::ceil_div(params_.shape_m, BLOCK_M);
+        num_n_blocks = math::ceil_div(params_.shape_n, BLOCK_N);
         num_blocks = num_aligned_m_blocks * num_n_blocks;
     }
 
