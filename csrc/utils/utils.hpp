@@ -5,6 +5,7 @@
 #include <hggc_runtime_api.h>
 #include "math.hpp"
 #include "system.hpp"
+#include "../jit/acarch.h"
 #include "../jit/device_runtime.hpp"
 
 namespace deep_gemm {
@@ -23,6 +24,17 @@ bool is_ppu1v5_device() {
         return true;
     } else {
         return false;
+    }
+}
+
+static acArch_t get_ppu_arch() {
+    const auto [major, minor] = device_runtime->get_arch_pair();
+    if (major == 8 and minor == 9) {
+        return AC_PPU0015;
+    } else if (major == 8 and minor == 0) {
+        return AC_PPU0010;
+    } else {
+        return AC_PPU_MAX_ARCH;
     }
 }
 
