@@ -1,0 +1,257 @@
+#pragma once
+
+#include <cutlass/cutlass.h>
+#include <hggc_bf16.h>
+#include <hggc_runtime.h>
+#include <cstdint>
+#include <math.h>
+
+namespace deep_gemm::mega_moe::fp4 {
+
+template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t GROUPS_PER_BLOCK = 8,
+          uint32_t BLOCK_THREADS = GROUPS_PER_BLOCK * 32>
+CUTLASS_DEVICE void fp4_mega_moe_pre_dispatch_kernel_device(
+    const __ppu_bfloat16* __restrict__ hidden_states,
+    const int64_t* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    uint8_t* __restrict__ staged_tokens,
+    uint8_t* __restrict__ staged_scales,
+    int64_t* __restrict__ input_topk_idx,
+    float* __restrict__ input_topk_weights,
+    uint32_t num_tokens) {
+
+    static_assert(HIDDEN % 64 == 0, "HIDDEN must be a multiple of 64 for paired MXFP4 scales");
+    static_assert(BLOCK_THREADS == GROUPS_PER_BLOCK * 32, "one warp per MXFP4 group");
+
+    constexpr uint32_t kGroupSize = 32;
+    constexpr uint32_t kTokenBytes = HIDDEN / 2;
+    constexpr uint32_t kNumGroups = HIDDEN / kGroupSize;
+    constexpr uint32_t kSfBytes = kNumGroups;
+
+    const uint32_t token = blockIdx.x;
+    const uint32_t group_tile = blockIdx.y;
+    if (token >= num_tokens) {
+        return;
+    }
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5;
+    const uint32_t lane = tid & 31u;
+    const uint32_t group = group_tile * GROUPS_PER_BLOCK + warp;
+
+    if (group < kNumGroups) {
+        const uint32_t col = group * kGroupSize + lane;
+        const __ppu_bfloat16* row = hidden_states + static_cast<uint64_t>(token) * HIDDEN;
+        const float val = __bfloat162float(row[col]);
+
+        float absmax = fabsf(val);
+        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, 1));
+        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, 2));
+        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, 4));
+        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, 8));
+        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, 16));
+        absmax = fmaxf(absmax, 1e-10f);
+
+        const float dequant_scale = absmax * (1.0f / 6.0f);
+        const uint32_t scale_exp = (__float_as_uint(dequant_scale) + 0x007fffffu) & 0x7f800000u;
+        const float scale_f = __uint_as_float(scale_exp);
+
+        float inv_scale;
+        asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv_scale) : "f"(scale_f));
+        const float q = val * inv_scale;
+
+        if (lane == 0) {
+            staged_scales[static_cast<uint64_t>(token) * kSfBytes + group] =
+                static_cast<uint8_t>(scale_exp >> 23);
+        }
+
+        const float q_partner = __shfl_xor_sync(0xffffffffu, q, 1);
+        if ((lane & 1u) == 0u) {
+            uint32_t packed;
+            asm volatile(
+                "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
+                : "=r"(packed) : "f"(q), "f"(q_partner));
+            staged_tokens[static_cast<uint64_t>(token) * kTokenBytes + group * 16u + lane / 2u] =
+                static_cast<uint8_t>(packed);
+        }
+    }
+
+    if (group_tile == 0) {
+        for (uint32_t k = tid; k < TOP_K; k += BLOCK_THREADS) {
+            const uint64_t off = static_cast<uint64_t>(token) * TOP_K + k;
+            input_topk_idx[off] = topk_ids[off];
+            input_topk_weights[off] = topk_weights[off];
+        }
+    }
+}
+
+template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t GROUPS_PER_BLOCK = 8,
+          uint32_t BLOCK_THREADS = GROUPS_PER_BLOCK * 32>
+__global__ __launch_bounds__(BLOCK_THREADS, 2) void
+fp4_mega_moe_pre_dispatch_kernel(
+    const __ppu_bfloat16* __restrict__ hidden_states,
+    const int64_t* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    uint8_t* __restrict__ staged_tokens,
+    uint8_t* __restrict__ staged_scales,
+    int64_t* __restrict__ input_topk_idx,
+    float* __restrict__ input_topk_weights,
+    uint32_t num_tokens) {
+    fp4_mega_moe_pre_dispatch_kernel_device<HIDDEN, TOP_K, GROUPS_PER_BLOCK, BLOCK_THREADS>(hidden_states, topk_ids, topk_weights, staged_tokens, staged_scales, input_topk_idx, input_topk_weights, num_tokens);
+}
+
+template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t BLOCK_THREADS = 256>
+CUTLASS_DEVICE void fp4_mega_moe_pre_dispatch_vec_kernel_device(
+    const __ppu_bfloat16* __restrict__ hidden_states,
+    const int64_t* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    uint8_t* __restrict__ staged_tokens,
+    uint8_t* __restrict__ staged_scales,
+    int64_t* __restrict__ input_topk_idx,
+    float* __restrict__ input_topk_weights,
+    uint32_t num_tokens) {
+
+    static_assert(HIDDEN % 64 == 0, "HIDDEN must be a multiple of 64 for paired MXFP4 scales");
+    constexpr uint32_t kVecElems = 8;
+    constexpr uint32_t kThreadsPerGroup = 4;
+    constexpr uint32_t kTokenBytes = HIDDEN / 2;
+    constexpr uint32_t kNumGroups = HIDDEN / 32;
+    constexpr uint32_t kSfBytes = kNumGroups;
+    constexpr uint32_t kNumVecs = HIDDEN / kVecElems;
+    static_assert(BLOCK_THREADS % 32 == 0, "BLOCK_THREADS must be warp-aligned");
+    static_assert(BLOCK_THREADS <= kNumVecs, "BLOCK_THREADS must not exceed HIDDEN/8");
+    constexpr bool kEvenVecSchedule = (kNumVecs % BLOCK_THREADS) == 0;
+    constexpr uint32_t kIters = kNumVecs / BLOCK_THREADS;
+
+    const uint32_t tid = threadIdx.x;
+    for (uint32_t token = blockIdx.x; token < num_tokens; token += gridDim.x) {
+        const uint4* row_vec = reinterpret_cast<const uint4*>(
+            hidden_states + static_cast<uint64_t>(token) * HIDDEN);
+        uint32_t* token_words = reinterpret_cast<uint32_t*>(
+            staged_tokens + static_cast<uint64_t>(token) * kTokenBytes);
+        uint8_t* sf_row = staged_scales + static_cast<uint64_t>(token) * kSfBytes;
+
+        if constexpr (kEvenVecSchedule) {
+            uint4 cur_bits = row_vec[tid];
+            #pragma unroll 1
+            for (uint32_t iter = 0; iter < kIters; ++iter) {
+                const uint32_t vec = tid + iter * BLOCK_THREADS;
+                uint4 next_bits = cur_bits;
+                if (iter + 1u < kIters) {
+                    next_bits = row_vec[tid + (iter + 1u) * BLOCK_THREADS];
+                }
+                const uint4 bits = cur_bits;
+                const __ppu_bfloat162* pairs = reinterpret_cast<const __ppu_bfloat162*>(&bits);
+
+                float vals[kVecElems];
+                float local_max = 0.0f;
+                #pragma unroll
+                for (uint32_t i = 0; i < kVecElems / 2; ++i) {
+                    const float2 f = __bfloat1622float2(pairs[i]);
+                    vals[2 * i + 0] = f.x;
+                    vals[2 * i + 1] = f.y;
+                    local_max = fmaxf(local_max, fmaxf(fabsf(f.x), fabsf(f.y)));
+                }
+
+                local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 1));
+                local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 2));
+                local_max = fmaxf(local_max, 1e-10f);
+
+                const float dequant_scale = local_max * (1.0f / 6.0f);
+                const uint32_t scale_exp = (__float_as_uint(dequant_scale) + 0x007fffffu) & 0x7f800000u;
+                const float scale_f = __uint_as_float(scale_exp);
+                float inv_scale;
+                asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv_scale) : "f"(scale_f));
+
+                uint32_t b0, b1, b2, b3;
+                asm volatile(
+                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
+                    : "=r"(b0) : "f"(vals[0] * inv_scale), "f"(vals[1] * inv_scale));
+                asm volatile(
+                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
+                    : "=r"(b1) : "f"(vals[2] * inv_scale), "f"(vals[3] * inv_scale));
+                asm volatile(
+                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
+                    : "=r"(b2) : "f"(vals[4] * inv_scale), "f"(vals[5] * inv_scale));
+                asm volatile(
+                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
+                    : "=r"(b3) : "f"(vals[6] * inv_scale), "f"(vals[7] * inv_scale));
+                token_words[vec] = (b0 & 0xffu) | ((b1 & 0xffu) << 8) |
+                                   ((b2 & 0xffu) << 16) | ((b3 & 0xffu) << 24);
+
+                if ((vec & (kThreadsPerGroup - 1u)) == 0u) {
+                    sf_row[vec / kThreadsPerGroup] = static_cast<uint8_t>(scale_exp >> 23);
+                }
+                cur_bits = next_bits;
+            }
+        } else {
+            for (uint32_t vec = tid; vec < kNumVecs; vec += BLOCK_THREADS) {
+                const uint4 bits = row_vec[vec];
+                const __ppu_bfloat162* pairs = reinterpret_cast<const __ppu_bfloat162*>(&bits);
+
+                float vals[kVecElems];
+                float local_max = 0.0f;
+                #pragma unroll
+                for (uint32_t i = 0; i < kVecElems / 2; ++i) {
+                    const float2 f = __bfloat1622float2(pairs[i]);
+                    vals[2 * i + 0] = f.x;
+                    vals[2 * i + 1] = f.y;
+                    local_max = fmaxf(local_max, fmaxf(fabsf(f.x), fabsf(f.y)));
+                }
+
+                const uint32_t mask = __activemask();
+                local_max = fmaxf(local_max, __shfl_xor_sync(mask, local_max, 1));
+                local_max = fmaxf(local_max, __shfl_xor_sync(mask, local_max, 2));
+                local_max = fmaxf(local_max, 1e-10f);
+
+                const float dequant_scale = local_max * (1.0f / 6.0f);
+                const uint32_t scale_exp = (__float_as_uint(dequant_scale) + 0x007fffffu) & 0x7f800000u;
+                const float scale_f = __uint_as_float(scale_exp);
+                float inv_scale;
+                asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv_scale) : "f"(scale_f));
+
+                uint32_t b0, b1, b2, b3;
+                asm volatile(
+                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
+                    : "=r"(b0) : "f"(vals[0] * inv_scale), "f"(vals[1] * inv_scale));
+                asm volatile(
+                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
+                    : "=r"(b1) : "f"(vals[2] * inv_scale), "f"(vals[3] * inv_scale));
+                asm volatile(
+                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
+                    : "=r"(b2) : "f"(vals[4] * inv_scale), "f"(vals[5] * inv_scale));
+                asm volatile(
+                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
+                    : "=r"(b3) : "f"(vals[6] * inv_scale), "f"(vals[7] * inv_scale));
+                token_words[vec] = (b0 & 0xffu) | ((b1 & 0xffu) << 8) |
+                                   ((b2 & 0xffu) << 16) | ((b3 & 0xffu) << 24);
+
+                if ((vec & (kThreadsPerGroup - 1u)) == 0u) {
+                    sf_row[vec / kThreadsPerGroup] = static_cast<uint8_t>(scale_exp >> 23);
+                }
+            }
+        }
+
+        for (uint32_t k = tid; k < TOP_K; k += BLOCK_THREADS) {
+            const uint64_t off = static_cast<uint64_t>(token) * TOP_K + k;
+            input_topk_idx[off] = topk_ids[off];
+            input_topk_weights[off] = topk_weights[off];
+        }
+    }
+}
+
+template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t BLOCK_THREADS = 256>
+__global__ __launch_bounds__(BLOCK_THREADS, 4) void
+fp4_mega_moe_pre_dispatch_vec_kernel(
+    const __ppu_bfloat16* __restrict__ hidden_states,
+    const int64_t* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    uint8_t* __restrict__ staged_tokens,
+    uint8_t* __restrict__ staged_scales,
+    int64_t* __restrict__ input_topk_idx,
+    float* __restrict__ input_topk_weights,
+    uint32_t num_tokens) {
+    fp4_mega_moe_pre_dispatch_vec_kernel_device<HIDDEN, TOP_K, BLOCK_THREADS>(hidden_states, topk_ids, topk_weights, staged_tokens, staged_scales, input_topk_idx, input_topk_weights, num_tokens);
+}
+
+}  // namespace deep_gemm::mega_moe::fp4

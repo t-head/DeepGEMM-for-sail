@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstddef>
+#include <type_traits>
 #include <optional>
 #include <string>
 
@@ -21,6 +23,9 @@
 
 using namespace deep_gemm_w4a16_common;
 namespace deep_gemm {
+using deep_gemm_w4a16_common::PPUW4ConfigTuple;
+using deep_gemm_w4a16_common::ppu_w4_config;
+using deep_gemm_w4a16_common::ppu_w4a16_preprocess_weights;
 
 // Host-side mirror of `FusedGemmScheduler<...>::Params`.
 //
@@ -52,6 +57,39 @@ struct W4A16GemmArguments {
     SchedulerArgsT scheduler;
 };
 
+// Host mirror of the GEMM2 scatter parameters.
+// Mirror PODs keep the original device Params ABI and avoid reconstructing it
+// inside the kernel. Generated sizeof/offsetof checks reject ABI drift.
+template <typename Scheduler>
+struct W4A16ScatterArguments {
+    const void* ptr_a;
+    const void* ptr_b;
+    const void* ptr_scale;
+    const void* ptr_b_replicas;
+    const void* ptr_scale_replicas;
+    uint32_t num_master_groups;
+    void* ptr_d;
+    int num_token;
+    int topk;
+    const int32_t* sorted_token_ids;
+    const int64_t* packed_src_info;
+    const int64_t* sym_offsets;
+    const int32_t* valid_m_rows;
+    int rank;
+    int max_tokens;
+    float situ_beta;
+    float situ_linear_beta;
+    Scheduler scheduler;
+};
+
+struct W4A16ScatterLaunchInfo {
+    deep_gemm_w4a16_common::W4A16Config config;
+    GemmType type;
+    int n, k, num_groups, group_size;
+    int threads, smem;
+    std::string name;
+};
+
 // Everything the generated code needs, all resolved on the host
 struct W4A16LaunchInfo {
     std::string element_b, element_scale;
@@ -68,13 +106,16 @@ struct W4A16LaunchInfo {
 // One runtime serves both W4A16 kernels: they only differ by class name and template parameter list,
 // neither of which affects the kernel argument layout. The scheduler arm does, so that stays a
 // template parameter.
-template <typename SchedulerArgsT>
-class W4A16GemmRuntime final : public LaunchRuntime<W4A16GemmRuntime<SchedulerArgsT>> {
+template <typename SchedulerArgsT, bool Scatter = false>
+class W4A16GemmRuntime final : public LaunchRuntime<W4A16GemmRuntime<SchedulerArgsT, Scatter>> {
 public:
+    using Params = std::conditional_t<Scatter,
+        W4A16ScatterArguments<SchedulerArgsT>,
+        W4A16GemmArguments<SchedulerArgsT>>;
     struct Args {
         W4A16LaunchInfo launch_info;
         LaunchArgs launch_args;
-        W4A16GemmArguments<SchedulerArgsT> kernel_params;
+        Params kernel_params;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -82,6 +123,11 @@ public:
         // `W4A16GEMM_MMA` hardcodes the weight/scale element types and the group size, so its template
         // parameter list drops those three
         const std::string kernel_type =
+            Scatter ? fmt::format(
+                "cutlass::gemm::kernel::W4A16GEMM_MMA<N, K, BLOCK_M, BLOCK_N, BLOCK_K, "
+                "WARP_M, WARP_N, WARP_K, kNumGroups, kNumStages, GemmType::{}, N_EXPAND, "
+                "true, false, true>",
+                info.gemm_type_name) :
             info.use_mma_kernel
                 ? fmt::format("cutlass::gemm::kernel::W4A16GEMM_MMA<\n"
                               "  N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K,\n"
@@ -118,7 +164,7 @@ using GemmKernel = {};
 // The host computes these instead of reading them off the kernel type, so pin them down here
 static_assert(sizeof(typename GemmKernel::SharedStorage) == {}, "host/device shared memory size mismatch");
 static_assert(GemmKernel::MaxThreadsPerBlock == {}, "host/device thread count mismatch");
-
+{}
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
 __global__ void {}(
@@ -132,7 +178,12 @@ __global__ void {}(
 )",
             info.element_b, info.element_scale, info.n, info.k, info.block_m, info.block_n, info.warp_m, info.warp_n,
             info.warp_k, info.block_k, info.num_groups, info.num_stages, info.group_size, info.n_expand, kernel_type,
-            info.smem_size, info.num_threads, info.kernel_name);
+            info.smem_size, info.num_threads,
+            Scatter ? fmt::format(
+                "static_assert(sizeof(GemmKernel::Params) == {}, \"W4 Params ABI mismatch\");\n"
+                "static_assert(offsetof(GemmKernel::Params, scheduler) == {}, \"W4 scheduler ABI mismatch\");",
+                sizeof(Params), offsetof(Params, scheduler)) : "",
+            info.kernel_name);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -142,11 +193,11 @@ __global__ void {}(
 
 // Dispatch helper: builds, launches and reports, for one concrete scheduler arm. Mirrors the launch
 // tail of `W4A16Gemm::run`.
-template <typename SchedulerArgsT>
+template <typename SchedulerArgsT, bool Scatter = false>
 static void launch_w4a16_gemm(const W4A16LaunchInfo& info, W4A16Type w4a16_type, GemmType gemm_type, int num_sms, int m,
                               int expected_m, int topk, int32_t* m_rows_ptr, bool no_pad_preprocess_layout,
-                              const W4A16GemmArguments<SchedulerArgsT>& kernel_params) {
-    using Runtime = W4A16GemmRuntime<SchedulerArgsT>;
+                              const typename W4A16GemmRuntime<SchedulerArgsT, Scatter>::Params& kernel_params) {
+    using Runtime = W4A16GemmRuntime<SchedulerArgsT, Scatter>;
 
     auto args = typename Runtime::Args{
         .launch_info = info,
@@ -294,7 +345,7 @@ static void m_grouped_gemm_w4a16_common(W4A16Type w4a16_type, GemmType gemm_type
             FusedSchedulerArguments{aligned_num_m_blocks.data_ptr<int32_t>(),
                                     expert_ids_and_cumsum.data_ptr<int32_t>()},
         };
-        launch_w4a16_gemm(info, w4a16_type, gemm_type, config.num_sms, m, expected_m, topk, m_rows_ptr,
+        launch_w4a16_gemm<FusedSchedulerArguments>(info, w4a16_type, gemm_type, config.num_sms, m, expected_m, topk, m_rows_ptr,
                           false /*no_pad_preprocess_layout*/, kernel_params);
         return;
     }
@@ -303,18 +354,8 @@ static void m_grouped_gemm_w4a16_common(W4A16Type w4a16_type, GemmType gemm_type
     // `DeepGemmScheduler::kIsNoPadPreprocessLayout`; the `GroupedFused` half of that predicate is
     // handled by the branch above
     const bool no_pad_preprocess_layout = gemm_type == GemmType::MGroupedNoPad and num_groups >= 128;
-    if (no_pad_preprocess_layout) {
-        const uint32_t block_size = std::max(32, next_power_of_two(num_groups));
-        auto compute_block_info_args = ComputeBlockInfoKernelRuntime::Args{
-            .launch_attr_args = {reinterpret_cast<const uint32_t*>(m_rows_ptr), static_cast<uint32_t>(num_groups),
-                                 reinterpret_cast<uint32_t*>(block_m_info.data_ptr<int32_t>())},
-            .launch_args = {1, block_size, 0},
-        };
-        const auto& code_blockinfo = ComputeBlockInfoKernelRuntime::generate(config.block_m);
-        const auto& runtime_blockinfo = compiler->build("computeBlockInfoKernel", code_blockinfo);
-        ComputeBlockInfoKernelRuntime::launch(runtime_blockinfo, compute_block_info_args);
-        layout_info = block_m_info.data_ptr<int32_t>();
-    }
+    layout_info = prepare_grouped_nopad_layout(gemm_type, num_groups, config.block_m,
+                                                m_rows, block_m_info);
 
     // NOTES: `num_token` / `sorted_token_ids` are only read by the fused scheduler, so they are zeroed
     // here -- the Python path left them uninitialised for the same reason
@@ -327,7 +368,7 @@ static void m_grouped_gemm_w4a16_common(W4A16Type w4a16_type, GemmType gemm_type
         nullptr,
         TileSchedulerArguments(static_cast<uint32_t>(m), layout_info),
     };
-    launch_w4a16_gemm(info, w4a16_type, gemm_type, config.num_sms, m, expected_m, topk, m_rows_ptr,
+    launch_w4a16_gemm<TileSchedulerArguments>(info, w4a16_type, gemm_type, config.num_sms, m, expected_m, topk, m_rows_ptr,
                       no_pad_preprocess_layout, kernel_params);
 }
 
@@ -405,6 +446,22 @@ static void m_grouped_gemm_w4a16_fused_impl(const torch::Tensor& lhs, const torc
                                 num_groups, group_size, config, m_rows, torch::Tensor(),
                                 expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks,
                                 static_cast<int>(topk));
+}
+
+static void launch_w4a16_scatter(const W4A16ScatterLaunchInfo& info,
+                           const W4A16ScatterArguments<TileSchedulerArguments>& params,
+                           int m, int expected_m, const torch::Tensor& rows) {
+    const auto& c = info.config;
+    const W4A16LaunchInfo shared{
+        "cutlass::float4_t", "uint8_t",
+        info.n, info.k, c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, c.warp_k,
+        info.num_groups, c.num_stages, info.group_size, c.n_expand,
+        get_gemm_type_name(info.type), false, info.smem, info.threads, info.name,
+    };
+    launch_w4a16_gemm<TileSchedulerArguments, true>(shared,
+        W4A16Type::mxfp4_e8m0,
+        info.type, c.num_sms, m, expected_m, 0, rows.data_ptr<int32_t>(),
+        info.type == GemmType::MGroupedNoPad && info.num_groups >= 128, params);
 }
 
 } // namespace deep_gemm

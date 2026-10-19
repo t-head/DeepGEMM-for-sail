@@ -285,6 +285,39 @@ Both take `(tensor, scales)` tuples as `a`/`b`, write to the BF16 output `d`, an
 
 For more information, please refer to the `fp8_einsum` and `int8_einsum` function documentation.
 
+#### MegaMoE
+
+MegaMoE supports W4A4, W4A16 and W8A8 routed MoE pipelines on PPU1.5.
+The public compute interface has four stages, imported from `deep_gemm`:
+`mega_moe_pre_dispatch`, `mega_moe_dispatch_gemm1`,
+`mega_moe_gemm2_scatter` and `mega_moe_combine`. Precision, activation and
+output quantization are explicit parameters with a checked support matrix. See the
+[precision-specific end-to-end examples and test commands](tests/README.MD#routed-moe-correctness-tests).
+
+The source follows the native extension layout:
+
+| Path | Responsibility |
+| --- | --- |
+| `deep_gemm/__init__.py` | Public compute APIs imported directly from `.deep_gemm_cpp` |
+| `csrc/python_api.cpp` | `PYBIND11_MODULE` entry, registering the API groups |
+| `csrc/apis/mega_moe.hpp` | Public function definitions, input validation/normalization and Python binding adapters |
+| `csrc/jit_kernels/impls/mega_moe*.hpp` | Typed `_impl` entrypoints, workspace/scheduler/argument assembly, source generation, JIT compilation and launch |
+| `csrc/jit_kernels/heuristics/mega_moe.hpp` | C++ configuration types and tile, shared-memory and scheduling policies |
+| `deep_gemm/mega_moe.py` | Symmetric buffer ownership and process-group lifecycle |
+| `deep_gemm/include/deep_gemm/` | Device kernels and shared layouts |
+
+`deep_gemm_cpp` is the compiled extension module (`deep_gemm_cpp*.so`), built
+from `csrc/python_api.cpp` and the headers it includes; it is not a Python file.
+Standalone grouped GEMMs continue to use `csrc/apis/gemm.hpp`.
+MegaMoE follows the same API/implementation split: internal calls use tensors,
+scalars and typed C++ configurations. Python configuration dictionaries are
+converted at the API boundary; internal launch code does not depend on Python
+objects or positional Python tuples.
+Configuration queries, row metadata preparation and load-time weight
+preprocessing remain separate helpers. The precision/activation-specific
+compute exports and their Python forwarding modules have been removed.
+The blockwise FP8 test retains a private dispatch-only helper for its staged GEMM1 reference.
+
 #### Interfaces exposed but not yet implemented
 
 For API compatibility with the upstream DeepGEMM, some symbols are exported by `deep_gemm` but are **not yet ported to the PPU build**. Calling them raises `NotImplementedError`:

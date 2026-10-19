@@ -106,8 +106,12 @@ public:
         fsync_path(path);
     }
 
+    virtual std::string get_kernel_flags(const std::string&) const {
+        return {};
+    }
+
     std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
-        const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
+        const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags + get_kernel_flags(name), code);
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache
@@ -220,17 +224,19 @@ public:
         // <<< PORTING LANDMARK: end of dropped source-language flag.
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const override {
-        // Write the code into the cache directory
-        const auto code_path = dir_path / "kernel.cu";
-        put(code_path, code);
-
-        // Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use -Xllvm flags,
-        // others only need -ppu-simt-branch=false (aligned with compiler.py logic)
+    std::string get_kernel_flags(const std::string& name) const override {
+        // Per-kernel PPU tuning, shared by the compiler command and cache key.
         std::string per_kernel_flags;
         if (get_ppu_arch() == AC_PPU0015) {
-            per_kernel_flags = " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
-                               " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
+#ifdef HGGC_COMPILER_WRAPPER_MODE
+            // The PPU SDK's CUDA-compatible compiler defines this macro.
+            // SDK 2.2.0 O3 codegen adds register copies to this scatter's MMA loop;
+            // use O2 until the regression is resolved and revalidated.
+            if (name == "m_grouped_gemm_fp8_channelwise_moe_scatter")
+                per_kernel_flags += " --dopt=2 ";
+#endif
+            per_kernel_flags += " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
+                                " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
             const bool use_warp_interleaving = (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
                                                (name.find("fp8_deep_gemm") != std::string::npos) ||
                                                (name.find("mqa_logits") != std::string::npos &&
@@ -257,6 +263,14 @@ public:
             per_kernel_flags += " -Xllvm -ppu-reassign-subregs=true"
                                 " -Xllvm -ppu-pref-fma-reuse=true"
                                 " -Xllvm -ppu-pref-mma-reuse=true";
+        return per_kernel_flags;
+    }
+
+    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const override {
+        // Write the code into the cache directory
+        const auto code_path = dir_path / "kernel.cu";
+        put(code_path, code);
+
         // Include paths for actlize and DeepGEMM headers
         std::string include_flags;
         for (const auto& path: actlize_include_paths())
@@ -267,7 +281,7 @@ public:
         const auto compile_dir = make_tmp_dir();
         const auto command = fmt::format("cd {} && {} {} -o {} {}{}{}",
             compile_dir.c_str(), hgcc_path.c_str(), code_path.c_str(), hgbin_path.c_str(),
-            include_flags, flags, per_kernel_flags);
+            include_flags, flags, get_kernel_flags(name));
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running HGCC command: %s\n", command.c_str());
         const auto [return_code, output] = call_external_command(command);
@@ -463,5 +477,20 @@ static auto compiler = LazyInit<Compiler>([]() -> std::shared_ptr<Compiler> {
         return std::make_shared<HGCCCompiler>();
     }
 });
+
+template <typename Tag>
+inline std::shared_ptr<KernelRuntime> compile_native_kernel(
+    const std::string& name, const NativeKernelArgs& args) {
+    using Runtime = NativeKernelRuntime<Tag>;
+    const auto code = Runtime::generate(args);
+    return compiler->build(name, code);
+}
+
+template <typename Tag>
+inline void run_native_kernel(const std::string& name, const NativeKernelArgs& args) {
+    using Runtime = NativeKernelRuntime<Tag>;
+    const auto runtime = compile_native_kernel<Tag>(name, args);
+    Runtime::launch(runtime, args);
+}
 
 } // namespace deep_gemm

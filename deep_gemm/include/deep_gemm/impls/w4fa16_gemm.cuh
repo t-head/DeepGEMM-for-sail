@@ -35,7 +35,8 @@ template <int ShapeN, int ShapeK,
           int BlockM, int BlockN, int BlockK,
           int WarpM, int WarpN, int WarpK,
           int kNumGroups, int kNumStages, GemmType kGemmType,
-          int N_EXPAND = 1>
+          int N_EXPAND = 1, bool kMoeScatter = false, bool kFusedSitu = false,
+          bool kUseReplicaWeights = false>
 class W4A16GEMM_MMA {
 public:
   using ElementA = cutlass::bfloat16_t;
@@ -47,10 +48,17 @@ public:
   // basic
   static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   static constexpr bool E8M0_scale = true;
+  static constexpr bool kExtendedParams = kMoeScatter || kFusedSitu || kUseReplicaWeights;
+  static_assert(!kMoeScatter || kGemmType == GemmType::MGroupedNoPad, "Scatter requires grouped no-pad");
+  static_assert(!kFusedSitu || kGemmType == GemmType::MGroupedNoPad, "SiTU requires grouped no-pad");
+  static_assert(!(kMoeScatter && kFusedSitu), "Scatter and SiTU are separate epilogues");
+
   static constexpr bool scale_use_ld_matrix = true;
   static constexpr int N = ShapeN;
   static constexpr int K = ShapeK;
   static constexpr int K2 = K / 2;
+  // One 128-byte scale tile covers 64 columns and two K=32 groups.
+  static constexpr int ScaleStride = ((K + 63) / 64) * 128;
   static constexpr int L = kNumGroups;
   static constexpr int BlockK2 = BlockK / 2;
   static constexpr int WarpK2 = WarpK / 2;
@@ -143,6 +151,7 @@ public:
         cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutScale>> smem_scale;
       }; // mainloop
       cute::array_aligned<ElementAcc, cute::cosize_v<SmemLayoutReduce>> smem_reduce; // epilogue cta reduce
+      cute::array_aligned<ElementD, (kMoeScatter || kFusedSitu) ? BlockM * BlockN : 1> smem_moe_scatter;
     };
   };
 
@@ -157,7 +166,7 @@ public:
   };
   using Arguments = cute::conditional_t<Fused, FusedArguments, NormalArguments>;
 
-  struct Params {
+  struct StandardParams {
     const ElementA* ptr_a;
     const uint8_t* ptr_b;
     const ElementScale* ptr_scale;
@@ -167,7 +176,7 @@ public:
     typename TileScheduler::Params scheduler;
 
     CUTLASS_HOST
-    Params(const ElementA* ptr_a_,
+    StandardParams(const ElementA* ptr_a_,
           const uint8_t* ptr_b_,
           const ElementScale* ptr_scale_,
           ElementD* ptr_d_)
@@ -176,6 +185,39 @@ public:
           ptr_scale(ptr_scale_),
           ptr_d(ptr_d_) {}
   };
+
+  struct ExtendedParams {
+    const ElementA* ptr_a;
+    const uint8_t* ptr_b;
+    const ElementScale* ptr_scale;
+    const uint8_t* ptr_b_replicas = nullptr;
+    const ElementScale* ptr_scale_replicas = nullptr;
+    uint32_t num_master_groups = L;
+    ElementD* ptr_d;
+    int num_token;
+    int topk;
+    const int* sorted_token_ids;
+    const int64_t* packed_src_info = nullptr;
+    const int64_t* sym_offsets = nullptr;
+    const int* valid_m_rows = nullptr;
+    int rank = 0;
+    int max_tokens = 0;
+    float situ_beta = 4.0f;
+    float situ_linear_beta = 25.0f;
+    typename TileScheduler::Params scheduler;
+
+    CUTLASS_HOST_DEVICE
+    ExtendedParams(const ElementA* ptr_a_,
+          const uint8_t* ptr_b_,
+          const ElementScale* ptr_scale_,
+          ElementD* ptr_d_)
+        : ptr_a(ptr_a_),
+          ptr_b(ptr_b_),
+          ptr_scale(ptr_scale_),
+          ptr_d(ptr_d_) {}
+  };
+  using Params = cute::conditional_t<kExtendedParams, ExtendedParams, StandardParams>;
+
 
   // for constexpr patial initialize
   struct NoTensor {};
@@ -252,13 +294,13 @@ public:
 
     auto strideA = make_stride(Int<K>{}, _1{});
     auto strideB = make_stride(Int<K2>{}, _1{}, Int<N * K2>{});
-    auto strideScale = make_stride(Int<K * 2>{}, _1{}, Int<K * N / 32>{});
+    auto strideScale = make_stride(Int<ScaleStride>{}, _1{}, Int<(N / 64) * ScaleStride>{});
     auto strideD = make_stride(Int<N>{}, _1{});
     GmemTiledCopyA gmem_tiled_copy_A;
     GmemTiledCopyB gmem_tiled_copy_B;
     GmemTiledCopyScale gmem_tiled_copy_scale;
     gmem_tiled_copy_B.desc_.template init<uint8_t, false, BlockN, BlockK2>(nullptr, N, K2, strideB);
-    gmem_tiled_copy_scale.desc_.template init<ElementScale, false, BlockN / 64, BlockK * 2>(nullptr, N / 64, K * 2, strideScale);
+    gmem_tiled_copy_scale.desc_.template init<ElementScale, false, BlockN / 64, BlockK * 2>(nullptr, N / 64, ScaleStride, strideScale);
     uint32_t thread_idx_A = Fused ? CopyAConfig::logical_thread_idx(thread_idx) : thread_idx;
     int thread_idx_B = (warp_idx / WarpsOnM) * NumThreadsPerWarp + lane_idx;
     auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx_A);
@@ -323,15 +365,33 @@ public:
 
       int coord_l = deep_scheduler.curr_group_idx;
       n_block_idx *= N_EXPAND;
+      int activation_rows = 0;
+      if constexpr (!Fused) activation_rows = deep_scheduler.curr_group_m;
+      if constexpr (kFusedSitu) {
+        if (params.valid_m_rows != nullptr)
+          activation_rows = __ldg(params.valid_m_rows + coord_l);
+        // Keep padded expert offsets, but neither load nor compute empty tiles.
+        if (m_block_idx * BlockM >= activation_rows) continue;
+      }
 
-      const uint8_t* ptr_b_l = params.ptr_b + int64_t(coord_l) * N * K2;
+      int weight_group = coord_l;
+      const uint8_t* weight_base = params.ptr_b;
+      const ElementScale* scale_base = params.ptr_scale;
+      if constexpr (kExtendedParams) {
+        if (params.ptr_b_replicas != nullptr && coord_l >= static_cast<int>(params.num_master_groups)) {
+          weight_group -= params.num_master_groups;
+          weight_base = params.ptr_b_replicas;
+          scale_base = params.ptr_scale_replicas;
+        }
+      }
+      const uint8_t* ptr_b_l = weight_base + int64_t(weight_group) * N * K2;
       Tensor mB_nk = make_tensor(make_gmem_ptr(ptr_b_l), make_shape(Int<N>{}, Int<K2>{}), make_stride(Int<K2>{}, _1{}));
       Tensor mB_nk_mix = make_mix_tensor_like(mB_nk);
       Tensor gB = local_tile(mB_nk_mix, TilerB{}, make_coord(n_block_idx,_));
       Tensor tBgB = gmem_thr_copy_B.partition_S(gB);
 
-      Tensor mScale_nkl = make_tensor(make_gmem_ptr(params.ptr_scale), make_shape(Int<N / 64>{}, Int<K * 2>{}, Int<L>{}), strideScale);
-      Tensor mScale_nk = make_mix_tensor_like(mScale_nkl(_,_,coord_l));
+      Tensor mScale_nkl = make_tensor(make_gmem_ptr(scale_base), make_shape(Int<N / 64>{}, Int<ScaleStride>{}, Int<L>{}), strideScale);
+      Tensor mScale_nk = make_mix_tensor_like(mScale_nkl(_,_,weight_group));
       Tensor gScale = local_tile(mScale_nk, TilerScale{}, make_coord(n_block_idx,_));
       Tensor tSgS = gmem_thr_copy_scale.partition_S(gScale);
 
@@ -339,7 +399,7 @@ public:
       uint32_t token_offsets[CopyAConfig::M_ITER];
       auto [tAgA, residual_m, gD] = [&]() {
         if constexpr(!Fused) {
-          int M = deep_scheduler.curr_group_m;
+          int M = activation_rows;
           gmem_tiled_copy_A.desc_.template init<ElementA, false, BlockM, BlockK>(nullptr, M, K, strideA);
           Tensor mA_mkl = make_tensor(make_gmem_ptr(params.ptr_a + deep_scheduler.curr_offset_a()), make_shape(M, Int<K>{}), strideA); // (m,k)
           Tensor mA_mk = make_mix_tensor_like(mA_mkl); // (m,k)
@@ -486,6 +546,166 @@ public:
 
         constexpr int align_elems = 2;
         Tensor tDcD = thr_mma.partition_C(cD);
+        if constexpr(kFusedSitu) {
+#if defined(__HGGC_ARCH__)
+          static_assert(__HGGC_ARCH__ == 150,
+                        "W4A16 fused SiTU requires PPU0015.");
+#endif
+          static_assert(WarpsOnK == 1,
+                        "W4A16 fused SiTU requires one K warp.");
+          static_assert(BlockN % 16 == 0,
+                        "W4A16 fused SiTU requires complete G=8 pairs.");
+
+          // The PPU0015 m16n16 accumulator assigns one thread's G=8 physical
+          // gate/up pair as [gate row0 x2, gate row1 x2, up row0 x2,
+          // up row1 x2]. Pair these register fragments directly. This keeps
+          // the required FP32 -> BF16 activation boundary while eliminating
+          // the dense shared tile and both CTA barriers from the first fused
+          // implementation.
+          static_assert(size(tDcD) % 8 == 0,
+                        "SiTU accumulator groups must contain gate/up pairs.");
+          const float inv_beta = __ppu_rcpf(params.situ_beta);
+          const float inv_linear_beta =
+              __ppu_rcpf(params.situ_linear_beta);
+          CUTLASS_PRAGMA_UNROLL
+          for (int group = 0; group < size(tDcD); group += 8) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int row_in_group = 0; row_in_group < 2; ++row_in_group) {
+              const int gate_idx = group + row_in_group * 2;
+              const int up_idx = gate_idx + 4;
+              const int local_m = static_cast<int>(get<0>(tDcD(gate_idx)));
+              if (local_m >= residual_m) continue;
+              const int physical_gate_col =
+                  static_cast<int>(get<1>(tDcD(gate_idx)));
+
+              uint32_t gate_bits;
+              uint32_t up_bits;
+              asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n"
+                           : "=r"(gate_bits)
+                           : "f"(accum(gate_idx + 1)),
+                             "f"(accum(gate_idx)));
+              asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n"
+                           : "=r"(up_bits)
+                           : "f"(accum(up_idx + 1)),
+                             "f"(accum(up_idx)));
+              const auto gate_pair =
+                  *reinterpret_cast<const __ppu_bfloat162*>(&gate_bits);
+              const auto up_pair =
+                  *reinterpret_cast<const __ppu_bfloat162*>(&up_bits);
+              const float2 gate = __bfloat1622float2(gate_pair);
+              const float2 up = __bfloat1622float2(up_pair);
+
+              const float gate_out0 = params.situ_beta
+                  * cutlass::fast_tanh(gate.x * inv_beta)
+                  * __ppu_sgmdf(gate.x);
+              const float gate_out1 = params.situ_beta
+                  * cutlass::fast_tanh(gate.y * inv_beta)
+                  * __ppu_sgmdf(gate.y);
+              const float up_out0 = params.situ_linear_beta
+                  * cutlass::fast_tanh(up.x * inv_linear_beta);
+              const float up_out1 = params.situ_linear_beta
+                  * cutlass::fast_tanh(up.y * inv_linear_beta);
+
+              uint32_t out_bits;
+              asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n"
+                           : "=r"(out_bits)
+                           : "f"(gate_out1 * up_out1),
+                             "f"(gate_out0 * up_out0));
+              const int64_t global_m =
+                  static_cast<int64_t>(deep_scheduler.curr_cumsum_m)
+                  + static_cast<int64_t>(m_block_idx) * BlockM + local_m;
+              const int compact_n =
+                  static_cast<int>(n_block_idx) * (BlockN / 2)
+                  + (physical_gate_col / 16) * 8
+                  + physical_gate_col % 8;
+              *reinterpret_cast<uint32_t*>(
+                  params.ptr_d + global_m * (N / 2) + compact_n) = out_bits;
+            }
+          }
+          return;
+        }
+
+        if constexpr(kMoeScatter) {
+#if defined(__HGGC_ARCH__)
+          static_assert(__HGGC_ARCH__ == 150,
+                        "W4A16 direct MoE scatter requires PPU0015.");
+#endif
+          static_assert(WarpsOnK == 1,
+                        "W4A16 direct MoE scatter requires one K warp.");
+          static_assert(BlockN % 256 == 0,
+                        "W4A16 direct MoE scatter requires full warp stores (256 columns).");
+          static_assert(N % BlockN == 0,
+                        "W4A16 direct MoE scatter requires full N tiles.");
+          static_assert(
+              BlockM * BlockN * sizeof(ElementD) <= 262144,
+              "W4A16 direct MoE scatter tile exceeds PPU0015 shared memory.");
+
+          // Reuse the mainloop/epilogue union after GEMM. The accumulator is
+          // distributed across the CTA, so transpose BF16 pairs into a dense
+          // row-major shared tile before assigning complete rows to warps.
+          auto* tile_smem = reinterpret_cast<uint32_t*>(
+              storage.smem_moe_scatter.data());
+          // Mainloop and scatter reuse the same dynamic shared-memory arena.
+          __syncthreads();
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(tDcD); i += 2) {
+            const int row = static_cast<int>(get<0>(tDcD(i)));
+            const int col = static_cast<int>(get<1>(tDcD(i)));
+            uint32_t pair;
+            asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n"
+                         : "=r"(pair) : "f"(accum(i + 1)), "f"(accum(i)));
+            tile_smem[row * (BlockN / 2) + col / 2] = pair;
+          }
+          __syncthreads();
+
+          const int row_start = static_cast<int>(m_block_idx) * BlockM;
+          const int group_valid = __ldg(params.valid_m_rows + coord_l);
+          const int valid_m = group_valid > row_start
+              ? cute::min(BlockM, group_valid - row_start) : 0;
+          const int pool_row_base =
+              static_cast<int>(deep_scheduler.curr_cumsum_m) + row_start;
+          const int n_start = static_cast<int>(n_block_idx) * BlockN;
+          constexpr int kNumWarps = MaxThreadsPerBlock / NumThreadsPerWarp;
+          const int scatter_warp_idx = thread_idx / NumThreadsPerWarp;
+
+          for (int row = scatter_warp_idx; row < valid_m;
+               row += kNumWarps) {
+            const int64_t packed = __ldg(
+                params.packed_src_info + pool_row_base + row);
+            const uint32_t packed_low = static_cast<uint32_t>(packed);
+            const uint32_t dst_rank = static_cast<uint32_t>(packed >> 32);
+            const uint32_t dst_token = packed_low & 0x00ffffffu;
+            const uint32_t dst_topk = packed_low >> 24;
+            auto* local_dst_row = params.ptr_d +
+                (static_cast<int64_t>(dst_topk) * params.max_tokens +
+                 dst_token) * N;
+            auto* dst_row = reinterpret_cast<ElementD*>(
+                params.sym_offsets[dst_rank] +
+                reinterpret_cast<int64_t>(local_dst_row));
+            const auto* src_vectors = reinterpret_cast<const uint4*>(
+                tile_smem + row * (BlockN / 2));
+            auto* dst_vectors = reinterpret_cast<uint4*>(dst_row + n_start);
+            CUTLASS_PRAGMA_UNROLL
+            for (int vector_base = 0; vector_base < BlockN / 8;
+                 vector_base += NumThreadsPerWarp) {
+              const int vector = vector_base + lane_idx;
+              const uint4 payload = __ppu_shared_load_bulk_b32x4(
+                  src_vectors + vector);
+              if (dst_rank != static_cast<uint32_t>(params.rank)) {
+                __ppu_remote_store_bulk_ncp_b32x4(
+                    reinterpret_cast<void*>(dst_vectors + vector), payload);
+              } else {
+                __ppu_global_store_bulk_b32x4(
+                    reinterpret_cast<void*>(dst_vectors + vector), payload);
+              }
+            }
+          }
+          // Persistent CTAs may immediately reuse this union for another tile.
+          __syncthreads();
+          return;
+        }
+
+
         auto tDgD = thr_mma.partition_C(gD);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tDcD); i += align_elems) {
@@ -525,7 +745,7 @@ public:
           if constexpr(N_EXPAND > 1) {
             if (next_k_tile_idx == k_tile_count) {
               tBgB.data() = tBgB.data() + BlockN * K2;
-              tSgS.data() = tSgS.data() + BlockN * K / 32;
+              tSgS.data() = tSgS.data() + (BlockN / 64) * ScaleStride;
             }
             if (next_k_tile_idx < k_tile_count || n_iter < N_EXPAND - 1) {
               g2s(next_k_tile_idx % k_tile_count, current_stage);
