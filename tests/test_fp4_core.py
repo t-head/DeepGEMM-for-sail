@@ -8,82 +8,11 @@ from math_utils import ceil_div, calc_diff
 from utils import construct, check_signal, construct_group_m_list, get_ref_backend, find_next_power_of_2
 from utils import construct_contiguous_grouped as construct_nopad_base
 from utils import construct_grouped_masked as construct_masked_base
+from utils import quantize_fp4_torch, dequantize_fp4_torch
 import argparse
 
 # torch.cuda.manual_seed(42)
 
-def right_shift_unsigned(x, shift):
-    return (x >> shift) & ((1 << (32 - shift)) - 1)
-
-def quantize_fp4_torch(src_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    assert src_tensor.dtype in {torch.float32, torch.bfloat16, torch.float16}
-    device = src_tensor.device
-    *batch_dims, N, K = src_tensor.shape
-    assert K % 2 == 0
-
-    src = src_tensor.to(torch.float32)
-    padded_K = ((K + 31) // 32) * 32
-    pad_amount = padded_K - K
-    padded_src = F.pad(src, (0, pad_amount))
-    valid_mask = F.pad(torch.ones_like(src, dtype=torch.bool), (0, pad_amount))
-
-    abs_src = torch.abs(padded_src)
-    abs_src = torch.where(valid_mask, abs_src, torch.tensor(-1.0, device=device))
-    abs_groups = abs_src.view(*batch_dims, N, padded_K // 32, 32)
-    max_val, _ = abs_groups.max(dim=-1, keepdim=True)
-
-    dequant_scale = max_val / 6.0
-    ds_int = dequant_scale.view(torch.int32)
-    ds_int_rounded = (ds_int + 0x007FFFFF) & 0x7F800000
-    dequant_scale_rounded = ds_int_rounded.view(torch.float32)
-    quant_scale = torch.where(dequant_scale_rounded == 0, torch.tensor(0.0, device=device), 1.0 / dequant_scale_rounded)
-
-    padded_src_groups = padded_src.view(*batch_dims, N, padded_K // 32, 32)
-    quant_tensor = padded_src_groups * quant_scale
-    quant_tensor = quant_tensor.view(*batch_dims, N, padded_K)[..., :K]
-
-    q_int = quant_tensor.contiguous().view(torch.int32)
-    signs = q_int & 0x80000000
-    exponents = right_shift_unsigned(q_int, 23) & 0xFF
-    mantissas = q_int & 0x7FFFFF
-
-    E8_BIAS, E2_BIAS = 127, 1
-    mantissas = torch.where(exponents < E8_BIAS, (0x400000 | right_shift_unsigned(mantissas, 1)) >> (E8_BIAS - exponents - 1), mantissas)
-    exponents = torch.maximum(exponents, torch.tensor(E8_BIAS - E2_BIAS, device=device)) - (E8_BIAS - E2_BIAS)
-
-    e2m1_tmp = right_shift_unsigned(((exponents << 2) | right_shift_unsigned(mantissas, 21)) + 1, 1)
-    e2m1_tmp = torch.minimum(e2m1_tmp, torch.tensor(0x7, device=device))
-    e2m1_value = (right_shift_unsigned(signs, 28) | e2m1_tmp).to(torch.uint8)
-
-    e2m1_value = e2m1_value.view(*batch_dims, N, K // 2, 2)
-    packed_tensor = e2m1_value[..., 0] | (e2m1_value[..., 1] << 4)
-    scale_uint8 = (ds_int_rounded.squeeze(-1) >> 23).to(torch.uint8)
-
-    return packed_tensor, scale_uint8
-
-def dequantize_fp4_torch(quant_tensor: torch.Tensor, scale: torch.Tensor, target_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    assert quant_tensor.dtype == torch.uint8 and scale.dtype == torch.uint8
-    assert target_dtype in {torch.float32, torch.bfloat16, torch.float16}
-
-    device = quant_tensor.device
-    *batch_dims, N, packed_K = quant_tensor.shape
-    K = packed_K * 2
-
-    quant_int = quant_tensor.to(torch.int32)
-    evens = quant_int & 0xF
-    odds = (quant_int >> 4) & 0xF
-
-    vals = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-    lookup_table = torch.tensor(vals + [-v for v in vals], dtype=torch.float32, device=device)
-    fp32_tensor = torch.stack([lookup_table[evens], lookup_table[odds]], dim=-1).view(*batch_dims, N, K)
-
-    dq_scale = (scale.to(torch.int32) << 23).view(torch.float32)
-    padded_K = dq_scale.shape[-1] * 32
-    padded_tensor = F.pad(fp32_tensor, (0, padded_K - K))
-    padded_tensor = padded_tensor.view(*batch_dims, N, dq_scale.shape[-1], 32)
-    out_padded = (padded_tensor * dq_scale.unsqueeze(-1)).view(*batch_dims, N, padded_K)
-
-    return out_padded[..., :K].to(target_dtype)
 
 def test_gemm(args):
     m, n, k = args['m'], args['n'], args['k']
