@@ -284,11 +284,17 @@ public:
       auto offset_scalea = deep_scheduler.curr_offset_scalea();
       auto offset_a = deep_scheduler.curr_offset_a();
       auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
+      const auto scale_offset_b = offset_b;
+      if constexpr (TileScheduler::GEMM_TYPE == GemmType::BatchGemm) {
+        const int64_t batch_idx = deep_scheduler.problem_index();
+        offset_a = batch_idx * get<2>(params.mainloop.dA);
+        offset_b = batch_idx * get<2>(params.mainloop.dB);
+      }
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
 
       const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_scalea;
-      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + offset_b / 128 / 128;
+      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + scale_offset_b / 128 / 128;
       auto mk_layout = make_layout(
         make_shape(make_shape(Int<1>{}, M),
                   make_shape(Int<128>{}, cute::ceil_div(K, 128))),
@@ -334,7 +340,7 @@ public:
       );
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
-      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
+      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dD));
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
       epilogue(
@@ -620,10 +626,16 @@ public:
       auto offset_scalea = deep_scheduler.curr_offset_scalea();
       auto offset_a = deep_scheduler.curr_offset_a();
       auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
+      const auto scale_offset_b = offset_b;
+      if constexpr (TileScheduler::GEMM_TYPE == GemmType::BatchGemm) {
+        const int64_t batch_idx = deep_scheduler.problem_index();
+        offset_a = batch_idx * get<2>(params.mainloop.dA);
+        offset_b = batch_idx * get<2>(params.mainloop.dB);
+      }
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
       const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_scalea;
-      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + offset_b / 128 / 128;
+      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + scale_offset_b / 128 / 128;
       auto mk_layout = make_layout(
         make_shape(make_shape(Int<1>{}, M),
                   make_shape(Int<128>{}, cute::ceil_div(K, 128))),
@@ -968,8 +980,8 @@ public:
         } // while k_tile_count
          // update params.epilogue for ptrC and ptrD
         auto params_epilogue_local = params.epilogue;
-        params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
-        params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
+        params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dC));
+        params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dD));
         // Epilogue and write to gD
         CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
         epilogue(

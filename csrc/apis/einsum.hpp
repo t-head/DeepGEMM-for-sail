@@ -18,19 +18,15 @@ void int8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
               std::optional<std::tuple<int, int, int>> recipe,
               const std::string& compiled_dims = "",
               std::optional<ConfigTuple> configs = std::nullopt,
-              bool transposed_out = false) {
+              const std::string& expr = "") {
     // Shape must be `[B, M, K] @ [B, N, K].T`
-    DG_HOST_ASSERT(a.stride(-1) == 1 or a.stride(-2) == 1);
-    DG_HOST_ASSERT(b.stride(-1) == 1 or b.stride(-2) == 1);
+    DG_HOST_ASSERT(a.stride(-1) == 1);
+    DG_HOST_ASSERT(b.stride(-1) == 1);
     DG_HOST_ASSERT(d.stride(-1) == 1);
     const auto& [batch_size, m, k] = get_shape<3>(a);
     const auto& [batch_size_, n, k_] = get_shape<3>(b);
-    // `d` is `[M, B, N]` when transposed (the layout `einsum("bhr,hdr->bhd")` needs),
-    // otherwise a plain `[B, M, N]`
-    const auto& d_shape = get_shape<3>(d);
-    const auto batch_size__ = transposed_out ? std::get<1>(d_shape) : std::get<0>(d_shape);
-    const auto m_ = transposed_out ? std::get<0>(d_shape) : std::get<1>(d_shape);
-    const auto n_ = std::get<2>(d_shape);
+    DG_HOST_ASSERT(sfa.dim() == 3 and sfa.size(0) == batch_size and sfa.size(1) == m);
+    const auto& [batch_size__, m_, n_] = get_shape<3>(d);
 
     // Type and shape checks
     DG_HOST_ASSERT(batch_size == batch_size_ && batch_size_ == batch_size__);
@@ -43,15 +39,11 @@ void int8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     DG_HOST_ASSERT(sfb.scalar_type() == torch::kFloat32);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
-    // The plain `[B, M, N]` epilogue addressing assumes a fully packed output
-    if (not transposed_out)
-        DG_HOST_ASSERT(d.is_contiguous());
-
     // Early return for trivial cases
     if (batch_size == 0 or gemm::early_return(m, n, k, d, c))
         return;
 
-    int8_bmm_impl(a, sfa, b, sfb, d, c, configs, transposed_out);
+    int8_bmm_impl(a, sfa, b, sfb, d, c, configs, expr);
 }
 
 void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -61,26 +53,22 @@ void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
              std::optional<std::tuple<int, int, int>> recipe,
              const std::string& compiled_dims = "",
              std::optional<ConfigTuple> configs = std::nullopt,
-             bool transposed_out = false) {
+             const std::string& expr = "") {
     // Shape must be `[B, M, K] @ [B, N, K].T`
-    DG_HOST_ASSERT(a.stride(-1) == 1 or a.stride(-2) == 1);
-    DG_HOST_ASSERT(b.stride(-1) == 1 or b.stride(-2) == 1);
+    DG_HOST_ASSERT(a.stride(-1) == 1);
+    DG_HOST_ASSERT(b.stride(-1) == 1);
     DG_HOST_ASSERT(d.stride(-1) == 1);
     const auto& [batch_size, m, k] = get_shape<3>(a);
     const auto& [batch_size_, n, k_] = get_shape<3>(b);
+    DG_HOST_ASSERT(sfa.dim() == 3 and sfa.size(0) == batch_size and sfa.size(1) == m);
 
     // Per-channel scale fallback
     if (sfa.sizes() == std::vector<int64_t>{batch_size, m, 1} &&
         sfb.sizes() == std::vector<int64_t>{batch_size_, n, 1}) {
-        return int8_bmm(a, sfa, b, sfb, d, c, recipe, compiled_dims, configs, transposed_out);
+        return int8_bmm(a, sfa, b, sfb, d, c, recipe, compiled_dims, configs, expr);
     }
 
-    // `d` is `[M, B, N]` when transposed (the layout `einsum("bhr,hdr->bhd")` needs),
-    // otherwise a plain `[B, M, N]`
-    const auto& d_shape = get_shape<3>(d);
-    const auto batch_size__ = transposed_out ? std::get<1>(d_shape) : std::get<0>(d_shape);
-    const auto m_ = transposed_out ? std::get<0>(d_shape) : std::get<1>(d_shape);
-    const auto n_ = std::get<2>(d_shape);
+    const auto& [batch_size__, m_, n_] = get_shape<3>(d);
     DG_HOST_ASSERT(batch_size == batch_size_ && batch_size_ == batch_size__);
     DG_HOST_ASSERT(m == m_ && n == n_ && k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0);
@@ -90,15 +78,11 @@ void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     DG_HOST_ASSERT(sfb.scalar_type() == torch::kFloat32);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
-    // The plain `[B, M, N]` epilogue addressing assumes a fully packed output
-    if (not transposed_out)
-        DG_HOST_ASSERT(d.is_contiguous());
-
     // Early return for trivial cases
     if (batch_size == 0 or gemm::early_return(m, n, k, d, c))
         return;
 
-    fp8_bmm_impl(a, sfa, b, sfb, d, c, configs, transposed_out);
+    fp8_bmm_impl(a, sfa, b, sfb, d, c, configs, expr);
 }
 
 void int8_einsum(const std::string& expr,
@@ -112,17 +96,15 @@ void int8_einsum(const std::string& expr,
     if (expr == "bhr,hdr->bhd") {
         // Permute dims to satisfy the order of (batch_size, m, n, k)
         // (batch_size, m, n, k): (h, b, d, r)
-        auto& lhs = a.first;
-        auto& lhs_scales = a.second;
-        auto [perm_a, perm_sfa] = fused_permute(lhs, lhs_scales);
-        int8_bmm(perm_a, perm_sfa, b.first, b.second, d, c, recipe, "nk", std::nullopt,
-                 /*transposed_out=*/true);
+        const auto perm_a = a.first.permute({1, 0, 2});
+        const auto perm_sfa = a.second.permute({1, 0, 2});
+        const auto perm_d = d.permute({1, 0, 2});
+        const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
+        int8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk", std::nullopt, expr);
     } else if (expr == "bhr,hdr->hbd") {
-        auto& lhs = a.first;
-        auto& lhs_scales = a.second;
-        auto [perm_a, perm_sfa] = fused_permute(lhs, lhs_scales);
-        int8_bmm(perm_a, perm_sfa, b.first, b.second, d, c, recipe, "nk", std::nullopt,
-                 /*transposed_out=*/false);
+        const auto perm_a = a.first.permute({1, 0, 2});
+        const auto perm_sfa = a.second.permute({1, 0, 2});
+        int8_bmm(perm_a, perm_sfa, b.first, b.second, d, c, recipe, "nk", std::nullopt, expr);
     } else if (expr == "bhd,hdr->bhr") {
         throw std::runtime_error("bhd,hdr->bhr is not yet supported in PPU int8_einsum.");
     } else if (expr == "bhd,bhr->hdr") {
@@ -143,17 +125,15 @@ void fp8_einsum(const std::string& expr,
     if (expr == "bhr,hdr->bhd") {
         // Permute dims to satisfy the order of (batch_size, m, n, k)
         // (batch_size, m, n, k): (h, b, d, r)
-        auto& lhs = a.first;
-        auto& lhs_scales = a.second;
-        auto [perm_a, perm_sfa] = fused_permute(lhs, lhs_scales);
-        fp8_bmm(perm_a, perm_sfa, b.first, b.second, d, c, recipe, "nk", std::nullopt,
-                /*transposed_out=*/true);
+        const auto perm_a = a.first.permute({1, 0, 2});
+        const auto perm_sfa = a.second.permute({1, 0, 2});
+        const auto perm_d = d.permute({1, 0, 2});
+        const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
+        fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk", std::nullopt, expr);
     } else if (expr == "bhr,hdr->hbd") {
-        auto& lhs = a.first;
-        auto& lhs_scales = a.second;
-        auto [perm_a, perm_sfa] = fused_permute(lhs, lhs_scales);
-        fp8_bmm(perm_a, perm_sfa, b.first, b.second, d, c, recipe, "nk", std::nullopt,
-                /*transposed_out=*/false);
+        const auto perm_a = a.first.permute({1, 0, 2});
+        const auto perm_sfa = a.second.permute({1, 0, 2});
+        fp8_bmm(perm_a, perm_sfa, b.first, b.second, d, c, recipe, "nk", std::nullopt, expr);
     } else if (expr == "bhd,hdr->bhr") {
         throw std::runtime_error("bhd,hdr->bhr is not yet supported in PPU fp8_einsum.");
     } else if (expr == "bhd,bhr->hdr") {

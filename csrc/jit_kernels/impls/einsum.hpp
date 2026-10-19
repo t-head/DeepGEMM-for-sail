@@ -23,7 +23,6 @@
 #include <deep_gemm/common/profiling_interface.cuh>
 #include "fp8_gemm.hpp"
 #include "int8_gemm.hpp"
-#include "fused_permute.hpp"
 
 using namespace deep_gemm_fp8_common;
 namespace deep_gemm {
@@ -35,11 +34,12 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
              const torch::Tensor& d,
              const std::optional<torch::Tensor>& c,
              std::optional<ConfigTuple> configs = std::nullopt,
-             bool transposed_out = true) {
+             const std::string& expr = "") {
     const auto& [groups, m, k] = get_shape<3>(a);
     const auto& [_, n, __] = get_shape<3>(b);
 
     auto sfa_aligned = get_mn_major_tma_aligned_tensor(sfa);
+    auto sfb_contiguous = sfb.contiguous();
 
     int num_sms = get_num_sms();
     ConfigTuple selected_config;
@@ -65,14 +65,9 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
     using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
-    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, groups));
-    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, groups));
-    // Transposed `[M, B, N]` output: a row spans every batch, and the scheduler advances
-    // `ptr_D` by one row segment per batch. Plain `[B, M, N]` output: rows are contiguous
-    // within a batch, and the scheduler advances `ptr_D` by a whole `M x N` matrix.
-    auto stride_D = transposed_out
-                        ? StrideA{(int64_t)groups * n, cute::Int<1>{}, (int64_t)n}
-                        : StrideA{(int64_t)n, cute::Int<1>{}, (int64_t)m * n};
+    auto stride_A = StrideA{a.stride(1), cute::Int<1>{}, a.stride(0)};
+    auto stride_B = StrideB{b.stride(1), cute::Int<1>{}, b.stride(0)};
+    auto stride_D = StrideA{d.stride(1), cute::Int<1>{}, d.stride(0)};
 
     LayoutSFA layout_SFA;
     LayoutSFB layout_SFB;
@@ -86,7 +81,7 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     cutlass::bfloat16_t* converted_output =
         reinterpret_cast<cutlass::bfloat16_t*>(d.data_ptr<at::BFloat16>());
     float* scales_a_ptr = sfa_aligned.data_ptr<float>();
-    float* scales_b_ptr = sfb.data_ptr<float>();
+    float* scales_b_ptr = sfb_contiguous.data_ptr<float>();
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
@@ -116,8 +111,7 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     FP8GemmRuntime::GemmKernelParams params = FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
     auto args = FP8GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                                                     "BatchGemm", "Default", "batch_fp8_deep_gemm", false,
-                                                     transposed_out},
+                                                     "BatchGemm", "Default", "batch_fp8_deep_gemm", false},
                                      .launch_args = {grid, block, SMSIZE},
                                      .kernel_params = params};
 
@@ -135,6 +129,8 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, 0, nullptr,
                                   current_stream());
+        dg_prof_params.add_params("quant_type", "block");
+        dg_prof_params.add_params("expr", expr);
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -162,7 +158,7 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
               const torch::Tensor& d,
               const std::optional<torch::Tensor>& c,
               std::optional<ConfigTuple> configs = std::nullopt,
-              bool transposed_out = true) {
+              const std::string& expr = "") {
     const auto& [groups, m, k] = get_shape<3>(a);
     const auto& [_, n, __] = get_shape<3>(b);
 
@@ -189,14 +185,9 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     using StrideB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
 
-    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, groups));
-    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, groups));
-    // Transposed `[M, B, N]` output: a row spans every batch, and the scheduler advances
-    // `ptr_D` by one row segment per batch. Plain `[B, M, N]` output: rows are contiguous
-    // within a batch, and the scheduler advances `ptr_D` by a whole `M x N` matrix.
-    auto stride_D = transposed_out
-                        ? StrideA{(int64_t)groups * n, cute::Int<1>{}, (int64_t)n}
-                        : StrideA{(int64_t)n, cute::Int<1>{}, (int64_t)m * n};
+    auto stride_A = StrideA{a.stride(1), cute::Int<1>{}, a.stride(0)};
+    auto stride_B = StrideB{b.stride(1), cute::Int<1>{}, b.stride(0)};
+    auto stride_D = StrideA{d.stride(1), cute::Int<1>{}, d.stride(0)};
 
     torch::Dtype dtype = a.dtype().toScalarType();
     const void* converted_input_a = nullptr;
@@ -232,11 +223,12 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
 
     static constexpr GemmType kGemmType = GemmType::BatchGemm;
 
-    const auto gemm_args = INT8GemmCutlass3Runtime::GemmArguments{
+    const auto gemm_args = INT8BatchGemmCutlass3Runtime::GemmArguments{
         .mode = cutlass::gemm::GemmUniversalMode::kGemm,
         .problem_shape = {m, n, k, groups},
-        .mainloopargs = {converted_input_a, stride_A, converted_input_b, stride_B,
-                         scales_a_ptr, scales_b_ptr},
+        .mainloopargs = {{converted_input_a, stride_A, converted_input_b, stride_B,
+                          scales_a_ptr, scales_b_ptr},
+                         {sfa.stride(1), sfa.stride(0)}, {sfb.stride(1), sfb.stride(0)}},
         .epilogueargs =
             {
                 {1, 0},
@@ -249,17 +241,17 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
         .scheduler = {(uint32_t)m, nullptr},
         .signal = nullptr};
 
-    INT8GemmCutlass3Runtime::GemmKernelParams params =
-        INT8GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+    INT8BatchGemmCutlass3Runtime::GemmKernelParams params =
+        INT8BatchGemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
-    auto args = INT8GemmCutlass3Runtime::Args{
+    auto args = INT8BatchGemmCutlass3Runtime::Args{
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                        "BatchGemm", "Default", kernel_name, false, transposed_out},
+                        "BatchGemm", "Default", kernel_name, false},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = params,
         .type_info = type_info};
 
-    const auto& code = INT8GemmCutlass3Runtime::generate(args);
+    const auto& code = INT8BatchGemmCutlass3Runtime::generate(args);
     const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
@@ -270,10 +262,12 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, nullptr,
                                   current_stream());
+        dg_prof_params.add_params("quant_type", "channel");
+        dg_prof_params.add_params("expr", expr);
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
-    INT8GemmCutlass3Runtime::launch(runtime, args);
+    INT8BatchGemmCutlass3Runtime::launch(runtime, args);
 
     ProfilingInterface::Instance().instrument(false, dg_prof_params);
 

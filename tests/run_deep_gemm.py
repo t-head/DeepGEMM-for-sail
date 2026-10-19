@@ -5,7 +5,7 @@ import torch
 import random
 import deep_gemm
 from utils import parse_deepgemm_string_re, read_cmds_from_file, get_arch_version
-from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad, test_m_grouped_gemm_fused
+from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad, test_m_grouped_gemm_fused, test_batchgemm
 from utils import test_hc_prenorm_gemm, test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits
 from utils import set_acc_check, set_benchmark
 from utils import judge_device_type, set_ref_backend
@@ -41,6 +41,7 @@ def call_test_func(gemm_type, func_args):
         "DenseGemm": test_gemm,
         "HcPrenormGemm": test_hc_prenorm_gemm,
         "Normal": test_gemm,
+        "BatchGemm": test_batchgemm,
         "MqaLogits": test_mqa_logits,
         "PagedMqaLogits": test_paged_mqa_logits,
         # Avg variants reuse the same test functions, which branch on gemm_type

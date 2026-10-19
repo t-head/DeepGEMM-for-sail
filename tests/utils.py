@@ -1,6 +1,7 @@
 import os
 import csv
 import subprocess
+import shlex
 import re
 import traceback
 import functools
@@ -943,9 +944,10 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         os.makedirs("./logs")
     total = len(cases)
     for idx, case in enumerate(cases):
+        case_arg = shlex.quote(case)
         print(f'Profiling {idx + 1}/{total} on device{gpu_id}')
         print(f'case name:{case}')
-        log_file = f"./logs/gpu{gpu_id}_{case.replace(' ','').replace(',', '_').replace(':', '_').replace('/','_').replace('.','_')[:100]}.log"
+        log_file = f"./logs/gpu{gpu_id}_{clean_casename(case)[:100]}.log"
         cmd = "rm -f "+ log_file
         run_cmd(cmd)
         # gpu
@@ -964,7 +966,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
                 2>&1 | tee {}".format("ncu" if dev == "gpu" else "acu",
                                       "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*'"
                                       if dev == "gpu" else ppu_kernel_name,
-                                      output_name, script, case, log_file)
+                                      output_name, script, case_arg, log_file)
             ret = run_cmd(cmd)
             continue
         else:
@@ -984,8 +986,8 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
 
             _acc = "--disable_acc"
             cmd = '{} --clock-control none {} --metrics="{}"  \
-                --page=details python {} --format "{}" {} \
-                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", '--kernel-name regex:gemm*' if dev == "gpu" else ppu_kernel_name, metrics_string, script, case, _acc, log_file)
+                --page=details python {} --format {} {} \
+                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", '--kernel-name regex:gemm*' if dev == "gpu" else ppu_kernel_name, metrics_string, script, case_arg, _acc, log_file)
 
         ret = run_cmd(cmd)
         result = "Fail"
@@ -999,7 +1001,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
 
         if _acc_check:
             # check accuracy
-            cmd = "python {} --format {}".format(script, case)
+            cmd = "python {} --format {}".format(script, case_arg)
             ret = run_cmd(cmd)
             if ret.returncode == 0:
                 result = "Pass"
@@ -1069,7 +1071,7 @@ def parse_deepgemm_string_re(s):
     grps = m.groups()
     if grps[0] in supported_gemm_type:
         result['gemm_type'] = grps[0]
-    param_pattern = r"(\w+):(\[.*?\]|[^,]+)"
+    param_pattern = r"(\w+):(\[.*?\]|.+?)(?=,\s*\w+:|$)"
     match_string = re.findall(param_pattern, grps[1])
     if len(match_string) == 0:
         print("ERROR: wrong deepgemm format input, please check!!")
@@ -2619,12 +2621,17 @@ def test_sparse_mqa_logits(args) -> None:
         print("Accuracy check passed\n")
     return
 
+def test_batchgemm(args) -> None:
+    case = dict(args, b=args["m"], h=args["groups"], r=args["k"], d=args["n"])
+    test_einsum(case)
+
+
 def test_einsum(args) -> None:
     b, h, r, d, data_type, expr = args['b'], args['h'], args['r'], args['d'], args["data_type"], args["expr"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     if expr in ('bhr,hdr->bhd', 'bhr,hdr->hbd'):
         # The two expressions take the same inputs and the same quantization; they differ only in
-        # the output layout, which the C++ side picks via `transposed_out`. `bhd` gets the strided
+        # the output layout, represented by the output view and its strides. `bhd` gets the strided
         # [b, h, d] view, `hbd` the plain packed [h, b, d].
         tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
         x = torch.randn((b, h, r), device=tensor_device, dtype=torch.bfloat16)
@@ -2677,7 +2684,8 @@ def test_einsum(args) -> None:
         print("Passed without acc_check\n")
 
     if get_benchmark():
-        t = bench_kineto(lambda: deep_gemm.fp8_einsum(expr, x_fp8, y_fp8, out), 'gemm', suppress_kineto_output=True)
+        fn = deep_gemm.int8_einsum if data_type == torch.int8 else deep_gemm.fp8_einsum
+        t = bench_kineto(lambda: fn(expr, x_fp8, y_fp8, out), 'gemm', suppress_kineto_output=True)
         # t_cublaslt = bench_kineto(lambda: deep_gemm.einsum(expr, x, y, z, use_cublaslt=True), 'nvjet', suppress_kineto_output=True)
         print(f' > Perf ({b=:4.0f}, {h=}, {r=}, {d=}): ',
                 f'{t * 1e6:4.0f} us | '

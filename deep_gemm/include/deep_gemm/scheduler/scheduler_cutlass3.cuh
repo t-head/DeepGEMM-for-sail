@@ -51,17 +51,13 @@ using TileSchedulerParams = TileSchedulerArguments;
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
-// `kTransposedBatchOutput` only affects `GemmType::BatchGemm`. It defaults to `true` because
-// the original BatchGemm user is `einsum("bhr,hdr->bhd")`, whose output `[M, B, N]` keeps the
-// batch dim in the middle. Pass `false` for a plain `[B, M, N]` batched output.
 template <GemmType kGemmType,
           uint32_t SHAPE_N_, uint32_t SHAPE_K_,
           uint32_t BLOCK_M_, uint32_t BLOCK_N_,
           uint32_t kNumGroups_,
           uint32_t kNumNBlocks = math::ceil_div(SHAPE_N_, BLOCK_N_),
           uint32_t kNum1DBlocksPerGroup = 2,
-          EpilogueType kEpilogueType = EpilogueType::Default,
-          bool kTransposedBatchOutput = true>
+          EpilogueType kEpilogueType = EpilogueType::Default>
 struct DeepGemmScheduler {
     constexpr static uint32_t SHAPE_N = SHAPE_N_;
     constexpr static uint32_t SHAPE_K = SHAPE_K_;
@@ -419,21 +415,14 @@ struct DeepGemmScheduler {
         }
     }
 
-    __device__ __forceinline__ int64_t curr_offset_c() const
+    __device__ __forceinline__ int64_t curr_offset_c(int64_t output_batch_stride = 0) const
     {
         if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {
             return int64_t(curr_group_idx) * params.shape_m * SHAPE_N_OUT;
         } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
             return int64_t(curr_cumsum_m) * SHAPE_N_OUT;
         } else if constexpr(kGemmType == GemmType::BatchGemm) {
-            // Transposed `[M, B, N]`: a batch only advances by one row segment, and the row
-            // stride carried by `stride_D` spans all batches. Plain `[B, M, N]`: a batch
-            // advances by a whole `M x N` matrix.
-            if constexpr (kTransposedBatchOutput) {
-                return int64_t(curr_group_idx) * SHAPE_N_OUT;
-            } else {
-                return int64_t(curr_group_idx) * params.shape_m * SHAPE_N_OUT;
-            }
+            return int64_t(curr_group_idx) * output_batch_stride;
         } else {
             return 0;
         }
