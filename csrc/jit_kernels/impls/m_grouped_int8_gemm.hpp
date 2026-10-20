@@ -424,6 +424,14 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
     if (enable_sbo_overlap) {
         // disable dynamic tile if enable_sbo_overlap, as the kNumNBlocks is not static
         enable_moe_dynamic_tile = false;
+        // The kernel writes signal at group_idx * ceil_div(shape_m, BLOCK_M) + m_block_idx, so the
+        // required size depends on the block_m picked here (final, as dynamic tile is off above).
+        // Without this check an undersized buffer is written out of bounds silently.
+        const int64_t required_signal_numel = static_cast<int64_t>(num_groups) * ceil_div(m, block_m);
+        TORCH_CHECK(signal.numel() >= required_signal_numel,
+                    "signal is too small for enable_sbo_overlap: needs num_groups * ceil_div(m, block_m) = ",
+                    required_signal_numel, " (num_groups=", num_groups, ", m=", m, ", block_m=", block_m,
+                    ") but signal has ", signal.numel(), " elements");
     }
 
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
@@ -978,10 +986,10 @@ static std::pair<int, int> m_grouped_gemm_int8_int4_bf16_nt_masked_impl(
     const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
     const torch::Tensor& rhs_scales, const torch::Tensor& out, const torch::Tensor& masked_m,
     const int m, const int n, const int k, const int num_groups, const int expected_m,
-    std::optional<ConfigTuple> configs, int max_block_n, const torch::Tensor& signal) {
+    std::optional<ConfigTuple> configs, int max_block_n, bool enable_sbo_overlap, const torch::Tensor& signal) {
     return m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
         lhs, lhs_scales, rhs, rhs_scales, out, masked_m, m, n, k, num_groups, expected_m,
-        configs, max_block_n, /*enable_sbo_overlap=*/false, signal, /*is_a8w4=*/true);
+        configs, max_block_n, enable_sbo_overlap, signal, /*is_a8w4=*/true);
 }
 
 static void m_grouped_gemm_int8_int4_bf16_nt_nopad_impl(

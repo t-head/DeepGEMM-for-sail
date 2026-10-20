@@ -535,11 +535,16 @@ static void check_a8w4_int8_common(const torch::Tensor& lhs, const torch::Tensor
                 "A8W4 tensors must be contiguous");
 }
 
+// Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes both. With
+// `enable_sbo_overlap` the caller owns `signal`: int32, zeroed before every call, and large enough
+// for num_groups * ceil_div(m, block_m) entries, since the kernel strides it by the selected BLOCK_M.
 std::pair<int, int> m_grouped_gemm_int8_int4_bf16_nt_masked(
     const std::pair<torch::Tensor, torch::Tensor>& a,
     const std::pair<torch::Tensor, torch::Tensor>& b,
     const torch::Tensor& out, const torch::Tensor& masked_m, int expected_m,
-    std::optional<int> max_block_n = 256, std::optional<ConfigTuple> configs = std::nullopt) {
+    std::optional<int> max_block_n = 256,
+    std::optional<bool> enable_sbo_overlap = false, std::optional<const torch::Tensor> signal = std::nullopt,
+    std::optional<ConfigTuple> configs = std::nullopt) {
     const auto& [num_groups, m, k] = get_shape<3>(a.first);
     const int n = b.first.size(1);
     check_a8w4_int8_common(a.first, a.second, b.first, b.second, out, num_groups, n, k);
@@ -551,10 +556,23 @@ std::pair<int, int> m_grouped_gemm_int8_int4_bf16_nt_masked(
                     masked_m.numel() == num_groups,
                 "A8W4 masked_m must be contiguous int32 with num_groups elements");
     TORCH_CHECK(expected_m > 0 && m > 0, "A8W4 expected_m and m must be positive");
-    auto signal = at::empty({0}, at::TensorOptions().dtype(at::kInt).device(out.device()));
+
+    at::Tensor signal_tensor;
+    if (signal.has_value() && signal->defined()) {
+        signal_tensor = *signal;
+    } else {
+        signal_tensor = at::empty({0}, at::TensorOptions().dtype(at::kInt).device(out.device()));
+    }
+
+    if (enable_sbo_overlap.value_or(false)) {
+        TORCH_CHECK(signal_tensor.defined(), "signal must be defined when enable_sbo_overlap is true");
+        TORCH_CHECK(signal_tensor.is_contiguous(), "signal must be contiguous");
+        TORCH_CHECK(signal_tensor.scalar_type() == torch::kInt32, "signal must be int32");
+    }
+
     return m_grouped_gemm_int8_int4_bf16_nt_masked_impl(
         a.first, a.second, b.first, b.second, out, masked_m, m, n, k, num_groups,
-        expected_m, configs, max_block_n.value_or(256), signal);
+        expected_m, configs, max_block_n.value_or(256), enable_sbo_overlap.value_or(false), signal_tensor);
 }
 
 void m_grouped_gemm_int8_int4_bf16_nt_nopad(
@@ -1783,7 +1801,8 @@ static void register_apis(pybind11::module_& m) {
     // deep_gemm.preprocess_a8w4_weight after loading it to apply the device-specific permutation.
     m.def("m_grouped_gemm_int8_int4_bf16_nt_masked", &m_grouped_gemm_int8_int4_bf16_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"), py::arg("expected_m"),
-          py::arg("max_block_n") = 256, py::arg("configs") = std::nullopt);
+          py::arg("max_block_n") = 256, py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt,
+          py::arg("configs") = std::nullopt);
     m.def("m_grouped_gemm_int8_int4_bf16_nt_nopad", &m_grouped_gemm_int8_int4_bf16_nt_nopad,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"),
           py::arg("m_rows") = std::nullopt, py::arg("configs") = std::nullopt);
