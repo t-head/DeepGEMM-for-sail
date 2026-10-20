@@ -1302,7 +1302,7 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t WARP_M, uint32_t WARP_N,
           uint32_t kNumGroups, uint32_t kNumStages,
           GemmType kGemmType, bool kEnableSboOverlap = false,
-          KernelType kKernelType = KernelType::Default>
+          KernelStrategy kKernelStrategy = KernelStrategy::Default>
 class Gemm {
 
 public:
@@ -1340,22 +1340,22 @@ public:
             Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
             Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _16>>;       // 1x1x1 value group
 
-        static constexpr int N_EXPAND = kKernelType == KernelType::MultistageOnN && (SHAPE_N % (BLOCK_N) == 0) ? KernelAiuMultistageOnN::N_EXPAND : 1;
+        static constexpr int N_EXPAND = kKernelStrategy == KernelStrategy::MultistageOnN && (SHAPE_N % (BLOCK_N) == 0) ? KernelAiuMultistageOnN::N_EXPAND : 1;
         using KernelSchedule = cute::conditional_t<
-            kKernelType == KernelType::OverlapMainloop,
+            kKernelStrategy == KernelStrategy::OverlapMainloop,
             KernelAiuMultistageOverlapMainloop,
             cute::conditional_t<
-              kKernelType == KernelType::OverlapPrologue,
+              kKernelStrategy == KernelStrategy::OverlapPrologue,
               KernelAiuMultistageOverlapPrologue,
               cute::conditional_t<
-                kKernelType == KernelType::MultistageOnN,
+                kKernelStrategy == KernelStrategy::MultistageOnN,
                 KernelAiuMultistageOnN,
                 cutlass::gemm::KernelAiuMultistage>>>;
         using DispatchPolicy = cute::conditional_t<
-            kKernelType == KernelType::OverlapMainloop,
+            kKernelStrategy == KernelStrategy::OverlapMainloop,
             cutlass::gemm::MainloopPPUOverlapMainloop<kNumStages, KernelSchedule>,
             cute::conditional_t<
-              kKernelType == KernelType::OverlapPrologue,
+              kKernelStrategy == KernelStrategy::OverlapPrologue,
               cutlass::gemm::MainloopPPUOverlapPrologue<kNumStages, KernelSchedule>,
               cutlass::gemm::MainloopPPUAiuOpt<kNumStages, KernelSchedule>>>;
 
@@ -1363,8 +1363,8 @@ public:
         static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
         static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
 
-        static constexpr int SmemLayoutStageStrideA = kKernelType == KernelType::OverlapMainloop || kKernelType == KernelType::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
-        static constexpr int SmemLayoutStageStrideB = kKernelType == KernelType::OverlapMainloop || kKernelType == KernelType::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
+        static constexpr int SmemLayoutStageStrideA = kKernelStrategy == KernelStrategy::OverlapMainloop || kKernelStrategy == KernelStrategy::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
+        static constexpr int SmemLayoutStageStrideB = kKernelStrategy == KernelStrategy::OverlapMainloop || kKernelStrategy == KernelStrategy::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
         using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
         using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
         // using t1 = DefaultOperandB::xhzhao;
@@ -1492,8 +1492,8 @@ public:
             hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
 
             printf("[GemmGrouped-BF16: bf16_gemm_cutlass3.cuh]\n");
-            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kernel_type:%s, kIsNoPadPreprocessLayout: %d\n",
-                kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)], KernelTypeS[static_cast<int>(kKernelType)], TileScheduler::kIsNoPadPreprocessLayout);
+            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kernel_strategy:%s, kIsNoPadPreprocessLayout: %d\n",
+                kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)], KernelStrategyS[static_cast<int>(kKernelStrategy)], TileScheduler::kIsNoPadPreprocessLayout);
 
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                 BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);

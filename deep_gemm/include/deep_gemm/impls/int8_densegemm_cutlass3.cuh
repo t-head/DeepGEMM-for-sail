@@ -881,11 +881,11 @@ template <typename ElementAB, typename ElementAcc,
           uint32_t WARP_M, uint32_t WARP_N, uint32_t WARP_K,
           uint32_t kNumStages,
           bool kDenseS2Opt = false,
-          KernelType kKernelType = KernelType::Default,
+          KernelStrategy kKernelStrategy = KernelStrategy::Default,
           bool IsAlignedN_ = true>
 class DenseGemm {
 public:
-    static_assert(kKernelType == KernelType::Default, "int8 DenseGemm only supports the Default kernel type");
+    static_assert(kKernelStrategy == KernelStrategy::Default, "int8 DenseGemm only supports the Default kernel strategy");
 
     DenseGemm() = default;
 

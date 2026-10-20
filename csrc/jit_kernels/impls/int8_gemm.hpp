@@ -71,7 +71,7 @@ public:
         int warp_k;           // WARP_K tile size for K-dim split (= block_k / WarpOnK). Used in WarpShape as Int<WARP_K>.
         bool dense_s2_opt;
         int num_stages;
-        std::string gemm_type, kernel_type, kernel_name;
+        std::string gemm_type, kernel_strategy, kernel_name;
         bool enable_sbo_overlap;
     };
 
@@ -311,7 +311,7 @@ public:
 
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
-        std::string gemm_type, kernel_type, kernel_name;
+        std::string gemm_type, kernel_strategy, kernel_name;
         bool enable_sbo_overlap;
         // Only meaningful for `GemmType::Batched`. `true` keeps the transposed `[M, B, N]`
         // output used by `einsum("bhr,hdr->bhd")`; `false` emits a plain `[B, M, N]` output.
@@ -472,18 +472,18 @@ static constexpr int WarpOnM = BLOCK_M / WARP_M;
 static constexpr int WarpOnN = BLOCK_N / WARP_N;
 
 constexpr bool kEnableSboOverlap = {10};
-constexpr KernelType kKernelType = KernelType::{11};
+constexpr KernelStrategy kKernelStrategy = KernelStrategy::{11};
 
 using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementA,ElementB,ElementAccumulator>::type;
 using TiledMma = TiledMMA<
     MMA_Atom<MmaInst>,
     Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
     Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _32>>;       // 1x1x1 value group
-constexpr int EnableMultistageOnN = kKernelType == KernelType::MultistageOnN
+constexpr int EnableMultistageOnN = kKernelStrategy == KernelStrategy::MultistageOnN
                                     && (SHAPE_N % (BLOCK_N) == 0)
                                     && (SHAPE_K > (BLOCK_K * STAGES));
 static constexpr int N_EXPAND = EnableMultistageOnN ? KernelAiuMultistageOnN::N_EXPAND : 1;
-constexpr int EnableOverlapPrologue = kKernelType == KernelType::OverlapPrologue;
+constexpr int EnableOverlapPrologue = kKernelStrategy == KernelStrategy::OverlapPrologue;
                                           // && (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(int8_t) >= WarpOnM * 16 * BLOCK_N * sizeof(int32_t); // to impl
 
 using KernelSchedule = cute::conditional_t<
@@ -601,7 +601,7 @@ __global__ void {14}(
                            cute::get<2>(problem_shape), args.launch_info.block_m,
                            args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
                            args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages,
-                           args.type_info, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_type,
+                           args.type_info, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_strategy,
                            args.launch_info.gemm_type, args.launch_info.transposed_batch_output, args.launch_info.kernel_name,
                            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
                            with_tsm_epilogue, host_params_size);

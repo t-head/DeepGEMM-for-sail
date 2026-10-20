@@ -17,7 +17,7 @@ static size_t get_int8_tample_params_size() {
 
   constexpr bool EnableMultistageOnN_ = false;
   constexpr bool kEnableSboOverlap = false;
-  constexpr KernelType kKernelType = KernelType::Default;
+  constexpr KernelStrategy kKernelStrategy = KernelStrategy::Default;
   using ElementA    = int8_t;
   using ElementB    = int8_t;
   using ElementAB    = int8_t;
@@ -44,11 +44,11 @@ static size_t get_int8_tample_params_size() {
       Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
       Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _32>>;       // 1x1x1 value group
 
-  constexpr int EnableMultistageOnN = kKernelType == KernelType::MultistageOnN
+  constexpr int EnableMultistageOnN = kKernelStrategy == KernelStrategy::MultistageOnN
                                       && (SHAPE_N % (BLOCK_N) == 0)
                                       && (SHAPE_K > (BLOCK_K * STAGES));
   static constexpr int N_EXPAND = EnableMultistageOnN ? KernelAiuMultistageOnN::N_EXPAND : 1;
-  constexpr int EnableOverlapPrologue = kKernelType == KernelType::OverlapPrologue;
+  constexpr int EnableOverlapPrologue = kKernelStrategy == KernelStrategy::OverlapPrologue;
                                   // && (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(int8_t) >= WarpOnM * 16 * BLOCK_N * sizeof(int32_t); // to impl
 
   using KernelSchedule = cute::conditional_t<

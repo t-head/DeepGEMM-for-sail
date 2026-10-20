@@ -564,7 +564,7 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t WARP_M, uint32_t WARP_N, int32_t kNumStages,
           GemmType kGemmType, bool kEnableSboOverlap = false,
-          KernelType kKernelType = KernelType::Default,
+          KernelStrategy kKernelStrategy = KernelStrategy::Default,
           EpilogueType kEpilogueType = EpilogueType::Default,
           bool kApplySwigluLimit = false>
 class Fp4FusedMoeGemm {
@@ -636,8 +636,8 @@ public:
             hggcFuncGetAttributes(&attr, device_func);
 
             printf("[FusedMoeGemm-FP4:]\n");
-            printf("group:%d, problem:[%d, %d, %d], gemm_type:%s, kernel_type:%s\n",
-                kNumGroups, shape_m, SHAPE_N, SHAPE_K, GemmTypeS[static_cast<int>(kGemmType)], KernelTypeS[static_cast<int>(kKernelType)]);
+            printf("group:%d, problem:[%d, %d, %d], gemm_type:%s, kernel_strategy:%s\n",
+                kNumGroups, shape_m, SHAPE_N, SHAPE_K, GemmTypeS[static_cast<int>(kGemmType)], KernelStrategyS[static_cast<int>(kKernelStrategy)]);
 
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                 BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);

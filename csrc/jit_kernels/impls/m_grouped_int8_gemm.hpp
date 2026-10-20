@@ -55,7 +55,7 @@ public:
 
     struct LaunchInfo {
         int num_groups, num_stages, shape_n, shape_k;
-        std::string gemm_type, kernel_type, kernel_name;
+        std::string gemm_type, kernel_strategy, kernel_name;
         bool k_large_em;
     };
 
@@ -869,13 +869,13 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         INT8GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
     // Default, MultistageOnN, MoeDynamicTile, OverlapPrologue, OverlapMainloop
-    auto kernel_type = "Default";
+    auto kernel_strategy = "Default";
     if (k < 4096 && is_ppu1v5_device()) {
-        kernel_type = "OverlapPrologue";
+        kernel_strategy = "OverlapPrologue";
     }
     auto args =
         INT8GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                      num_stages, "MGroupedNoPad", kernel_type, kernel_name, false},
+                                                      num_stages, "MGroupedNoPad", kernel_strategy, kernel_name, false},
                                       .launch_args = {grid, block, SMSIZE},
                                       .kernel_params = params,
                                       .type_info = type_info};

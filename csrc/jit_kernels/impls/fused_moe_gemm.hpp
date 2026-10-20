@@ -603,7 +603,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
         printf("[C++ JIT FusedMoeGemm-FP4:]\n");
-        printf("group:%d, problem:[%d, %d, %d], gemm_type:GroupedFused, kernel_type:Default\n",
+        printf("group:%d, problem:[%d, %d, %d], gemm_type:GroupedFused, kernel_strategy:Default\n",
                static_cast<int>(num_groups), static_cast<int>(num_token), static_cast<int>(n),
                static_cast<int>(k));
         printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",

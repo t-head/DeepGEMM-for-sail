@@ -1560,7 +1560,7 @@ template <typename ElementAB, typename ElementAcc,
           uint32_t kNumGroups, uint32_t kNumStages,
           GemmType kGemmType,
           bool kEnableSboOverlap = false,
-          KernelType kKernelType = KernelType::Default>
+          KernelStrategy kKernelStrategy = KernelStrategy::Default>
 class Gemm {
 
 public:
@@ -1594,7 +1594,7 @@ public:
         hggcFuncAttributes attr;
         int DynamicTildId = 0;
 
-        if constexpr (kKernelType == KernelType::MoeDynamicTile) {
+        if constexpr (kKernelStrategy == KernelStrategy::MoeDynamicTile) {
           auto launch_dynamic_tile_kernel = [&](auto gemm_kernel_) {
             using GemmKernel = decltype(gemm_kernel_);
             using TileScheduler = typename GemmKernel::TileScheduler;
@@ -1672,11 +1672,11 @@ public:
               Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
               Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _32>>;       // 1x1x1 value group
 
-          constexpr int EnableMultistageOnN = kKernelType == KernelType::MultistageOnN
+          constexpr int EnableMultistageOnN = kKernelStrategy == KernelStrategy::MultistageOnN
                                               && (SHAPE_N % (BLOCK_N) == 0)
                                               && (SHAPE_K > (BLOCK_K * kNumStages));
           static constexpr int N_EXPAND = EnableMultistageOnN ? KernelAiuMultistageOnN::N_EXPAND : 1;
-          constexpr int EnableOverlapPrologue = kKernelType == KernelType::OverlapPrologue;
+          constexpr int EnableOverlapPrologue = kKernelStrategy == KernelStrategy::OverlapPrologue;
                                           // && (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(int8_t) >= WarpOnM * 16 * BLOCK_N * sizeof(int32_t); // to impl
 
           using KernelSchedule = cute::conditional_t<
@@ -1827,11 +1827,11 @@ public:
         const int threadblock_count = num_sms * max_blocks_per_cu;
         char *pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
-          static const bool kEnableMoeDynamicTile = kKernelType == KernelType::MoeDynamicTile;
+          static const bool kEnableMoeDynamicTile = kKernelStrategy == KernelStrategy::MoeDynamicTile;
           printf("[GemmGrouped-A8W8:]\n");
-          printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d, kernel_type:%s\n",
+          printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d, kernel_strategy:%s\n",
               kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)],
-              kIsNoPadPreprocessLayout, KernelTypeS[static_cast<int>(kKernelType)]);
+              kIsNoPadPreprocessLayout, KernelStrategyS[static_cast<int>(kKernelStrategy)]);
           if constexpr (!kEnableMoeDynamicTile) {
             printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
                 BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);

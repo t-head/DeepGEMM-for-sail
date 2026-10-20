@@ -2,6 +2,8 @@
 
 namespace deep_gemm {
 
+enum class MajorType { K = 0, MN = 1 };
+
 enum class GemmType {
     Normal                              = 0,
     MGroupedContiguous                  = 1,
@@ -28,13 +30,21 @@ enum class FP4DynamicTileId : int {
 };
 
 enum class KernelType {
+    Kernel1D1D = 0,
+    Kernel1D2D = 1,
+    KernelNoSF = 2
+};
+
+enum class KernelStrategy {
     Default,
     MultistageOnN,
     MoeDynamicTile,
     OverlapPrologue,
-    OverlapMainloop
+    OverlapMainloop,
 };
 
-inline constexpr const char* KernelTypeS[] = { "Default", "MultistageOnN", "MoeDynamicTile", "OverlapPrologue", "OverlapMainloop"};
+inline constexpr const char* KernelStrategyS[] = {
+    "Default", "MultistageOnN", "MoeDynamicTile", "OverlapPrologue", "OverlapMainloop"
+};
 
 } // namespace deep_gemm

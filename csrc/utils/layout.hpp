@@ -1,6 +1,7 @@
 #pragma once
 
 #include <torch/python.h>
+#include <deep_gemm/common/types.cuh>
 
 #include "math.hpp"
 #include "exception.hpp"
@@ -8,10 +9,7 @@
 
 namespace deep_gemm {
 
-// Major-ness stuffs
-// Hand-written replacement for cute::UMMA::Major: the PPU actlize port does not
-// provide cute::UMMA, so define the minimal major-ness enum used by the APIs here.
-enum class MajorType { K = 0, MN = 1 };
+
 
 static void major_check(const torch::Tensor& t) {
     const auto dim = t.dim();
