@@ -361,7 +361,7 @@ torch::Tensor bf16_paged_mqa_logits(const torch::Tensor& q, const torch::Tensor&
 torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q, const torch::Tensor& fused_kv_cache,
                                    const torch::Tensor& weights, const torch::Tensor& context_lens,
                                    const torch::Tensor& block_table, const torch::Tensor& schedule_meta,
-                                   int max_context_len, bool clean_logits = true,
+                                   int max_context_len, bool clean_logits = false,
                                    torch::ScalarType logits_dtype = torch::kFloat32) {
     DG_HOST_ASSERT(q.scalar_type() == torch::kFloat8_e4m3fn);
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
@@ -624,7 +624,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("max_context_len"), py::arg("clean_logits") = true, py::arg("logits_dtype") = torch::kFloat32);
     m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits, py::arg("q"), py::arg("fused_kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"), py::arg("max_context_len"),
-          py::arg("clean_logits") = true, py::arg("logits_dtype") = torch::kFloat32);
+          py::arg("clean_logits") = false, py::arg("logits_dtype") = torch::kFloat32);
     m.def("int8_paged_mqa_logits", &int8_paged_mqa_logits, py::arg("q"), py::arg("fused_kv_cache"),
           py::arg("weights"), py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
           py::arg("max_context_len"), py::arg("clean_logits") = true, py::arg("logits_dtype") = torch::kFloat32);
