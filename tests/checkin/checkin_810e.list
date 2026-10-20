@@ -1,7 +1,7 @@
 # DeepGEMM PR check-in caselist for Zhenwu 810E
 # Run with: python tests/run_deep_gemm.py --caselist tests/checkin/checkin_810e.list
 # Minimal per-type correctness set: each gemm type / dtype keeps a small number of
-# representative shapes only. FP4/FP8/tf32 and W4A16 MXFP4 MMA require 890P.
+# representative shapes only. FP4/FP8 and W4A16 MXFP4 MMA require 890P.
 # W4A16 INT4 and MXFP4 VALU paths are covered on both 810E and 890P.
 # MQA coverage focuses on INT8, plus one BF16 smoke case.
 # Sections are split per UT type; append new cases under the matching section.
@@ -17,6 +17,22 @@ DenseGemm,data_type:bf16,m:256,n:512,k:7168
 # --- DenseGemm / int8 ---
 DenseGemm,data_type:int8,m:2048,n:4096,k:7168
 DenseGemm,data_type:int8,m:2048,n:512,k:7168
+
+# ============ HcPrenormGemm ============
+
+HcPrenormGemm,data_type:tf32,m:3,n:24,k:16384
+HcPrenormGemm,data_type:tf32,m:16,n:24,k:28672
+HcPrenormGemm,data_type:tf32,m:24,n:24,k:20480
+HcPrenormGemm,data_type:tf32,m:32,n:24,k:16384
+HcPrenormGemm,data_type:tf32,m:60,n:24,k:20480
+HcPrenormGemm,data_type:tf32,m:128,n:24,k:16384
+HcPrenormGemm,data_type:tf32,m:1248,n:24,k:20480
+HcPrenormGemm,data_type:tf32,m:4096,n:24,k:16384
+HcPrenormGemm,data_type:tf32,m:8192,n:24,k:28672
+HcPrenormGemm,data_type:tf32,m:9984,n:24,k:20480
+HcPrenormGemm,data_type:tf32,m:64,n:8,k:128
+HcPrenormGemm,data_type:tf32,m:64,n:16,k:128
+HcPrenormGemm,data_type:tf32,m:1024,n:32,k:64
 
 # ============ GroupedMasked ============
 
