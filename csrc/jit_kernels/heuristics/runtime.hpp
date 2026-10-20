@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "../../jit/device_runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/lazy_init.hpp"
@@ -7,9 +9,12 @@
 namespace deep_gemm {
 
 class HeuristicsRuntime {
+    static constexpr int kLegacyMKAlignmentForContiguousLayout = 128;
+
     bool ignore_compile_dims = false;
     int block_m_multiple_of = 1;
     int block_n_multiple_of = 1;
+    int mk_alignment_for_contiguous_layout = kLegacyMKAlignmentForContiguousLayout;
 
 public:
     void set_ignore_compile_dims(const bool& new_value) {
@@ -31,6 +36,17 @@ public:
 
     int get_block_n_multiple_of() const {
         return block_n_multiple_of;
+    }
+
+    void set_mk_alignment_for_contiguous_layout(const int& new_value) {
+        mk_alignment_for_contiguous_layout = new_value;
+    }
+
+    int get_mk_alignment_for_contiguous_layout() const {
+        return mk_alignment_for_contiguous_layout;
+    }
+    int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m) const {
+        return get_mk_alignment_for_contiguous_layout();
     }
 };
 
