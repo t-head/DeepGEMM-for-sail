@@ -257,25 +257,6 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
         stage_candidates = {4};
     }
 
-    int best_occ = 0;
-    for (int num_stages : stage_candidates) {
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1);
-
-        if (std::get<0>(best_smem_config) <= ppu_capacity) {
-            int occ = ppu_capacity / std::get<0>(best_smem_config);
-            if (k < 512 || (best_block_m > 64 && best_block_n >= 64) && occ >= best_occ) {
-                // compute block use higher occ rather than large stage
-                best_num_stages = num_stages;
-                best_occ = occ;
-            } else {
-                best_num_stages = num_stages;
-                break;
-            }
-        }
-    }
-
-    assert(best_num_stages != 0);
-
     // Recompute the minimal number of SMs required
     // NOTES: less L2 cache usage and less GPU frequency drop
     int num_waves = get_num_waves(best_block_m, best_block_n);
@@ -311,6 +292,26 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
         warp_m = (best_block_m != 32) ? best_block_m / 2 : best_block_m;
         warp_n = best_block_n / 4;
     }
+
+    int best_occ = 0;
+    for (int num_stages : stage_candidates) {
+        const auto smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1);
+        const int smem_size = std::get<0>(smem_config);
+        if (smem_size <= ppu_capacity) {
+            const int occ = ppu_capacity / smem_size;
+            best_smem_config = smem_config;
+            if (k < 512 || (best_block_m > 64 && best_block_n >= 64) && occ >= best_occ) {
+                // compute block use higher occ rather than large stage
+                best_num_stages = num_stages;
+                best_occ = occ;
+            } else {
+                best_num_stages = num_stages;
+                break;
+            }
+        }
+    }
+
+    assert(best_num_stages != 0);
 
     return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n,
                            best_num_stages, best_smem_config);
@@ -526,25 +527,6 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
         stage_candidates = {4};
     }
 
-    int best_occ = 0;
-    for (int num_stages : stage_candidates) {
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1);
-
-        if (std::get<0>(best_smem_config) <= ppu_capacity) {
-            int occ = ppu_capacity / std::get<0>(best_smem_config);
-            if (k < 512 || (best_block_m > 32 && best_block_n >= 64) && occ >= best_occ) {
-                // compute block use higher occ rather than large stage
-                best_num_stages = num_stages;
-                best_occ = occ;
-            } else {
-                best_num_stages = num_stages;
-                break;
-            }
-        }
-    }
-
-    assert(best_num_stages != 0);
-
     // Recompute the minimal number of SMs required
     // NOTES: less L2 cache usage and less GPU frequency drop
     int num_waves = get_num_waves(best_block_m, best_block_n);
@@ -583,6 +565,26 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
         warp_m = (best_block_m != 32) ? best_block_m / 2 : best_block_m;
         warp_n = 64;
     }
+
+    int best_occ = 0;
+    for (int num_stages : stage_candidates) {
+        const auto smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1);
+        const int smem_size = std::get<0>(smem_config);
+        if (smem_size <= ppu_capacity) {
+            const int occ = ppu_capacity / smem_size;
+            best_smem_config = smem_config;
+            if (k < 512 || (best_block_m > 32 && best_block_n >= 64) && occ >= best_occ) {
+                // compute block use higher occ rather than large stage
+                best_num_stages = num_stages;
+                best_occ = occ;
+            } else {
+                best_num_stages = num_stages;
+                break;
+            }
+        }
+    }
+
+    assert(best_num_stages != 0);
 
     return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n,
                            best_num_stages, best_smem_config);
