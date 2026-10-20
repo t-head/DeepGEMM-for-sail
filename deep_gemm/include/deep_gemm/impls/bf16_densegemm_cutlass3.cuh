@@ -1030,7 +1030,7 @@ public:
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
             dg_prof_params.set_params(
-                GemmType::DenseGemm, false, std::string("bf16"), 1, shape_m, shape_n, shape_k, shape_m,
+                GemmType::Normal, false, std::string("bf16"), 1, shape_m, shape_n, shape_k, shape_m,
                 nullptr, stream
             );
         }

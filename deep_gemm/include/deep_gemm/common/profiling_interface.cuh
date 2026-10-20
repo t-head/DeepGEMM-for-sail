@@ -30,13 +30,13 @@ void initialize_args(GemmType gemm_type, bool is_gemv, int m, int group, int* gr
     gemm_type_ = gemm_type;
     is_gemv_ = is_gemv;
     add_argument("data_type");
-    if (gemm_type_ != GemmType::DenseGemm){
+    if (gemm_type_ != GemmType::Normal){
         add_argument("groups");
     }
     add_argument("m");
     add_argument("n");
     add_argument("k");
-    if (gemm_type_ == GemmType::GroupedMasked){
+    if (gemm_type_ == GemmType::MGroupedMasked){
         add_argument("em");
     }
 }
@@ -60,7 +60,7 @@ void set_mqa_logits_params(std::string data_type, int seq_len_q, int seq_len_kv,
     m_ = seq_len_q;
     group_ = 1;
     grouped_layout_ = nullptr;
-    gemm_type_ = GemmType::DenseGemm;
+    gemm_type_ = GemmType::Normal;
     is_gemv_ = false;
     device_id_ = -1; // avoid check_support_dump print
 }
@@ -92,7 +92,7 @@ void set_sparse_mqa_logits_params(std::string data_type, int seq_len_q, int seq_
     m_ = seq_len_q;
     group_ = 1;
     grouped_layout_ = nullptr;
-    gemm_type_ = GemmType::DenseGemm;
+    gemm_type_ = GemmType::Normal;
     is_gemv_ = false;
     device_id_ = -1; // avoid check_support_dump print
 }
@@ -117,7 +117,7 @@ void set_paged_mqa_logits_params(std::string data_type, int batch_size, int next
     group_ = batch_size;
     grouped_layout_ = context_lens;
     next_n_ = next_n;
-    gemm_type_ = GemmType::GroupedNoPad;
+    gemm_type_ = GemmType::MGroupedNoPad;
     is_gemv_ = false;
     int gpu = -1;
     hggcError_t result = hggcGetDevice(&gpu);
@@ -149,20 +149,20 @@ void set_params(GemmType gemm_type, bool is_gemv,
     }
     initialize_args(gemm_type, is_gemv, m, group, grouped_layout, gpu, stream);
     add_params("data_type", data_type);
-    if (gemm_type_ != GemmType::DenseGemm){
+    if (gemm_type_ != GemmType::Normal){
         add_params("groups", group);
     }
     add_params("m", m);
     add_params("n", n);
     add_params("k", k);
-    if (gemm_type_ == GemmType::GroupedMasked){
+    if (gemm_type_ == GemmType::MGroupedMasked){
         add_params("em", em);
     }
     add_params("gpu", gpu);
 }
 
 void set_hc_prenorm_params(int m, int n, int k, hggcStream_t stream = 0) {
-    set_params(GemmType::DenseGemm, false, "tf32", 1, m, n, k, 1, nullptr, stream);
+    set_params(GemmType::Normal, false, "tf32", 1, m, n, k, 1, nullptr, stream);
     op_name_ = "HcPrenormGemm";
 }
 
@@ -184,7 +184,7 @@ void set_mega_mhc_params(int m, int hidden, int sinkhorn_iters, hggcStream_t str
     m_ = m;
     group_ = 1;
     grouped_layout_ = nullptr;
-    gemm_type_ = GemmType::DenseGemm;
+    gemm_type_ = GemmType::Normal;
     is_gemv_ = false;
     device_id_ = -1;
 }
@@ -212,7 +212,7 @@ void set_fused_moe_params(const std::string& data_type, const std::string& quant
     m_ = num_token;
     group_ = groups;
     grouped_layout_ = grouped_layout;
-    gemm_type_ = GemmType::GroupedFused;
+    gemm_type_ = GemmType::MGroupedFused;
     is_gemv_ = false;
     int gpu = -1;
     hggcError_t result = hggcGetDevice(&gpu);
@@ -278,7 +278,7 @@ void distribution() {
         }
     } else {
         // Original gemm distribution logic
-        bool need_bincount = (gemm_type_ == GemmType::GroupedContiguous || is_gemv_ );
+        bool need_bincount = (gemm_type_ == GemmType::MGroupedContiguous || is_gemv_ );
         int size = need_bincount ? m_ : group_;
         int* tmp = new int[size];
         CHECK_HGGC(hggcMemcpyAsync(tmp, grouped_layout_, sizeof(int) * size, hggcMemcpyDeviceToHost, stream_));
@@ -321,7 +321,7 @@ bool check_support_dump(){
     if (target_device_id != -1 && target_device_id != device_id_ && !is_paged_mqa_logits()) {
         return false;
     }
-    if (gemm_type_ == GemmType::DenseGemm || gemm_type_ == GemmType::BatchGemm) {
+    if (gemm_type_ == GemmType::Normal || gemm_type_ == GemmType::Batched) {
         printf("\ndump_group_m not supported for normal gemm.\n");
         return false;
     }

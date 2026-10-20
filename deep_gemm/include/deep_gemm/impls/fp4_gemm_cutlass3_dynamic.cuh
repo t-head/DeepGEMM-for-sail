@@ -353,7 +353,7 @@ struct Fp4DeepGemmDynamicTile {
   static constexpr uint32_t NumMmaWarpGroups = 1;
   using ProblemShape = Shape<int,int,int,int>;
 
-  static constexpr bool IsEP = (kGemmType == GemmType::GroupedMasked);
+  static constexpr bool IsEP = (kGemmType == GemmType::MGroupedMasked);
 
   using KernelAiuFp4DynamicTile = typename Fp4DynamicTileSelector<kDynamicTileId>::type;
   using Builder0 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,

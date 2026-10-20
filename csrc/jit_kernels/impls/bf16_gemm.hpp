@@ -817,7 +817,7 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
     const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
 
-    static constexpr GemmType kGemmType = GemmType::DenseGemm;
+    static constexpr GemmType kGemmType = GemmType::Normal;
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("bf16"), 1, m, n, k, 0, nullptr,
@@ -847,7 +847,7 @@ using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int
 static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out, const int& m,
                       const int& n, const int& k, std::optional<ConfigTuple> configs = std::nullopt) {
     int num_sms = get_num_sms();
-    static constexpr GemmType kGemmType = GemmType::DenseGemm;
+    static constexpr GemmType kGemmType = GemmType::Normal;
 
     using Config = std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 
@@ -974,7 +974,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             overlap_on ? "bf16_deep_gemm_cute_free_ovlp" : "bf16_deep_gemm_cute_free";
         auto args = DenseBF16GemmCuteFreeRuntime::Args{
             .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, /*dense_s2_opt=*/true, num_stages,
-                            "DenseGemm", "Default", cute_free_kernel_name, enable_sbo_overlap, overlap_on},
+                            "Normal", "Default", cute_free_kernel_name, enable_sbo_overlap, overlap_on},
             .launch_args = {grid, block_cute_free, smem_cute_free},
             .kernel_params = params,
         };
@@ -1068,7 +1068,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             // Single compilation: overlap decision is baked into the generated code.
             auto args = DenseBF16GemmCutlass3Runtime::Args{
                 .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, /*dense_s2_opt=*/true, num_stages,
-                                "DenseGemm", "Default", "bf16_dense_gemm", false, /*overlap_prologue=*/overlap_on},
+                                "Normal", "Default", "bf16_dense_gemm", false, /*overlap_prologue=*/overlap_on},
                 .launch_args = {grid, block_cutlass3, SMSIZE},
                 .kernel_params = params,
             };
@@ -1128,7 +1128,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
         auto args = BF16GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                                  num_stages, "DenseGemm", "Default", "bf16_deep_gemm",
+                                                                  num_stages, "Normal", "Default", "bf16_deep_gemm",
                                                                   enable_sbo_overlap},
                                                   .launch_args = {grid, block, SMSIZE},
                                                   .kernel_params = params};

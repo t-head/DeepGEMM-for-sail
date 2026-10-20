@@ -560,7 +560,7 @@ static void fp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
     using StrideC = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     using StrideD = cute::Stride<int64_t, cute::Int<1>, int64_t>;
 
-    static constexpr GemmType kGemmType = GemmType::DenseGemm;
+    static constexpr GemmType kGemmType = GemmType::Normal;
 
     // A/B data strides: float4_t packed as uint8, M/N-major
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
@@ -596,7 +596,7 @@ static void fp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
 
     FP4GemmRuntime::Args args{};
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                        n, k, "DenseGemm", "fp4_deep_gemm", hasBias, n_expand, false,
+                        n, k, "Normal", "fp4_deep_gemm", hasBias, n_expand, false,
                         "Default", false};
     args.launch_args = {grid, block, SMSIZE};
 

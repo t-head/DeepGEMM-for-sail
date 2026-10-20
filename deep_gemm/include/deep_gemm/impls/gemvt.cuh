@@ -410,7 +410,7 @@ public:
         }
         if (ProfilingInterface::Instance().get_op_info()){
             dg_prof_params.set_params(
-                GemmType::GroupedNoPad, true, data_type, kNumGroups, shape_m, SHAPE_N, SHAPE_K, 1,
+                GemmType::MGroupedNoPad, true, data_type, kNumGroups, shape_m, SHAPE_N, SHAPE_K, 1,
                 grouped_layout, stream
             );
         }

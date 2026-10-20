@@ -44,7 +44,7 @@ struct Scheduler
 
     static const GemmType kGemmType = GemmType_;
 #ifdef EnableGroupNoPadOpt
-    constexpr static bool kIsNoPadPreprocessLayout = kGemmType == GemmType::GroupedNoPad and kNumGroups_ >= 128;
+    constexpr static bool kIsNoPadPreprocessLayout = kGemmType == GemmType::MGroupedNoPad and kNumGroups_ >= 128;
 #else
     constexpr static bool kIsNoPadPreprocessLayout = false;
 #endif
@@ -114,13 +114,13 @@ struct Scheduler
         num_n_blocks = cutlass::ceil_div(params_.gemm_n, ThreadblockShape::kN);
 
         curr_group_idx = 0;
-        if constexpr (kGemmType == GemmType::DenseGemm || kGemmType == GemmType::BatchGemm) {
+        if constexpr (kGemmType == GemmType::Normal || kGemmType == GemmType::Batched) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
-        } else if (kGemmType == GemmType::GroupedContiguous) {
+        } else if (kGemmType == GemmType::MGroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
-        } else if (kGemmType == GemmType::GroupedMasked) {
+        } else if (kGemmType == GemmType::MGroupedMasked) {
             curr_cumsum = curr_m_start = curr_m = 0;
-        } else if (kGemmType == GemmType::GroupedNoPad) {
+        } else if (kGemmType == GemmType::MGroupedNoPad) {
             if (kIsNoPadPreprocessLayout) {
                 num_aligned_m_blocks = params_.grouped_layout[0]; // total blocks in m, block_m_sum
                 curr_cumsum = curr_group_m = curr_m = 0;
@@ -138,14 +138,14 @@ struct Scheduler
     template <bool kIgnoreGroupedForGroupedContiguous=true>
     CUTLASS_DEVICE uint32_t get_global_idx(const uint32_t shape_dim, const uint32_t block_size,
                                                     const uint32_t& block_idx, const uint32_t& m_block_idx=0) {
-        if constexpr (kGemmType == GemmType::DenseGemm || kGemmType == GemmType::BatchGemm) {
+        if constexpr (kGemmType == GemmType::Normal || kGemmType == GemmType::Batched) {
             return block_idx * block_size;
-        } else if constexpr (kGemmType == GemmType::GroupedContiguous) {
+        } else if constexpr (kGemmType == GemmType::MGroupedContiguous) {
             auto offset = kIgnoreGroupedForGroupedContiguous ? 0 : __ldg(params.grouped_layout + m_block_idx * ThreadblockShape::kM);
             return offset * shape_dim + block_idx * block_size;
-        } else if constexpr (kGemmType == GemmType::GroupedMasked) {
+        } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
             return curr_group_idx * shape_dim + block_idx * block_size;
-        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
+        } else if constexpr (kGemmType == GemmType::MGroupedNoPad) {
             return (kIgnoreGroupedForGroupedContiguous ?
                 curr_m_start : curr_group_idx * shape_dim) + block_idx * block_size;
         }
@@ -195,7 +195,7 @@ struct Scheduler
             curr_m = (curr_group_m - (m_block_idx * ThreadblockShape::kM)) < ThreadblockShape::kM
                      ? (curr_group_m - (m_block_idx * ThreadblockShape::kM))
                      : ThreadblockShape::kM;
-        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
+        } else if (kGemmType == GemmType::MGroupedMasked || kGemmType == GemmType::MGroupedNoPad) {
             uint32_t num_m_blocks;
             while (true) {
                 // End of the task
@@ -218,7 +218,7 @@ struct Scheduler
             curr_m = (curr_group_m - (m_block_idx * ThreadblockShape::kM)) < ThreadblockShape::kM
                      ? (curr_group_m - (m_block_idx * ThreadblockShape::kM))
                      : ThreadblockShape::kM;
-        } else if constexpr (kGemmType == GemmType::BatchGemm) {
+        } else if constexpr (kGemmType == GemmType::Batched) {
             if (next_block_idx >= num_blocks * params.problem_count)
                 return false;
             curr_group_idx = next_block_idx / num_blocks;
@@ -230,7 +230,7 @@ struct Scheduler
 
             get_swizzled_block_idx(num_aligned_m_blocks, next_block_idx, m_block_idx, n_block_idx);
 
-            if (kGemmType == GemmType::GroupedContiguous)
+            if (kGemmType == GemmType::MGroupedContiguous)
                 curr_group_idx = __ldg(params.grouped_layout + m_block_idx * ThreadblockShape::kM);
         }
 

@@ -310,11 +310,11 @@ class DeepGemmUniversal <
     using X = Underscore;
 
     int warp_idx = cutlass::canonical_warp_idx_sync();
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedMasked) {
       // group is small 8|16, just prefetch one cacheline
       __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
     }
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedNoPad) {
       // each warp prefetch one cacheline
       if (warp_idx < N_PREFETCH_CACHELINE) {
         __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx << 5)));
@@ -890,11 +890,11 @@ public:
     // Preconditions
     CUTE_STATIC_ASSERT(is_static<TileShape>::value);
 
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedMasked) {
       // group is small 8|16, just prefetch one cacheline
       __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
     }
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedNoPad) {
       // each warp prefetch one cacheline
       int warp_idx = cutlass::canonical_warp_idx_sync();
       if (warp_idx < N_PREFETCH_CACHELINE) {

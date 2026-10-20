@@ -264,7 +264,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
             deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
     } else {
         cfg = deep_gemm_int8::get_best_configs(
-            m, n, k, num_groups, num_sms, GemmType::GroupedContiguous);
+            m, n, k, num_groups, num_sms, GemmType::MGroupedContiguous);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -290,7 +290,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
 
-    static constexpr GemmType kGemmType = GemmType::GroupedContiguous;
+    static constexpr GemmType kGemmType = GemmType::MGroupedContiguous;
     torch::Dtype dtype = lhs.dtype().toScalarType();
 
     const void* converted_input_a = nullptr;
@@ -333,7 +333,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
         INT8GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
     auto args = INT8GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                              num_stages, "GroupedContiguous", "Default",
+                                                              num_stages, "MGroupedContiguous", "Default",
                                                               kernel_name, false},
                                               .launch_args = {grid, block, SMSIZE},
                                               .kernel_params = params,
@@ -389,7 +389,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
     } else {
         const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         cfg = deep_gemm_int8::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked, max_block_n, lut_kind);
+            expected_m, n, k, num_groups, num_sms, GemmType::MGroupedMasked, max_block_n, lut_kind);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -432,7 +432,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
 
-    static constexpr GemmType kGemmType = GemmType::GroupedMasked;
+    static constexpr GemmType kGemmType = GemmType::MGroupedMasked;
     torch::Dtype dtype = lhs.dtype().toScalarType();
 
     int32_t* signal_ptr = reinterpret_cast<int32_t*>(signal.data_ptr<int32_t>());
@@ -475,7 +475,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
             kLargeEM = true;
         }
         int flag = 0;
-        static constexpr bool IsEP = (kGemmType == GemmType::GroupedMasked);
+        static constexpr bool IsEP = (kGemmType == GemmType::MGroupedMasked);
 
         if (IsEP) {
             if (kLargeEM) {
@@ -528,7 +528,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
         smem_config = deep_gemm_int8::get_smem_config(num_stages, k, block_m, block_n, block_k, 1);
         SMSIZE = std::get<0>(smem_config);
         auto args = DynamicTileRuntime::Args{
-            .launch_info = {kNumGroups, num_stages, n, k, "GroupedMasked", "MoeDynamicTile", kernel_name, kLargeEM},
+            .launch_info = {kNumGroups, num_stages, n, k, "MGroupedMasked", "MoeDynamicTile", kernel_name, kLargeEM},
             .launch_args = {grid, block_new, SMSIZE},
             .kernel_params = gemm_args,
             .type_info = type_info};
@@ -572,7 +572,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
         INT8GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
     auto args = INT8GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                              num_stages, "GroupedMasked", "Default", kernel_name,
+                                                              num_stages, "MGroupedMasked", "Default", kernel_name,
                                                               enable_sbo_overlap},
                                               .launch_args = {grid, block, SMSIZE},
                                               .kernel_params = params,
@@ -644,7 +644,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     if (use_gemv) {
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(GemmType::GroupedNoPad, true, std::string("int8"), num_groups, m, n, k, expected_m,
+            dg_prof_params.set_params(GemmType::MGroupedNoPad, true, std::string("int8"), num_groups, m, n, k, expected_m,
                                       layout_info, current_stream());
         }
         cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
@@ -768,7 +768,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     } else {
         const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         cfg = deep_gemm_int8::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::GroupedNoPad, 256, lut_kind);
+            expected_m, n, k, num_groups, num_sms, GemmType::MGroupedNoPad, 256, lut_kind);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -792,7 +792,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
 
-    static constexpr GemmType kGemmType = GemmType::GroupedNoPad;
+    static constexpr GemmType kGemmType = GemmType::MGroupedNoPad;
 
     at::Tensor m_rows_tensor;
     if (!m_rows.has_value() || !m_rows->defined()) {
@@ -875,7 +875,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     }
     auto args =
         INT8GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                      num_stages, "GroupedNoPad", kernel_type, kernel_name, false},
+                                                      num_stages, "MGroupedNoPad", kernel_type, kernel_name, false},
                                       .launch_args = {grid, block, SMSIZE},
                                       .kernel_params = params,
                                       .type_info = type_info};

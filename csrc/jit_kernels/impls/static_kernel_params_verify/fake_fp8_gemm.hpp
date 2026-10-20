@@ -23,7 +23,7 @@ static size_t get_fp8_tample_params_size() {
   constexpr int N_EXPAND = kUseNStageKernel ? 4 : 1;
 
   using TileScheduler = DeepGemmScheduler<
-    GemmType::DenseGemm, 
+    GemmType::Normal,
     SHAPE_N, 
     SHAPE_K, 
     BLOCK_M, 

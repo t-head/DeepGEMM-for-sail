@@ -37,7 +37,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
     } else {
         cfg = deep_gemm_bf16_common::get_best_configs(
-            m, n, k, 1, num_sms, GemmType::GroupedContiguous);
+            m, n, k, 1, num_sms, GemmType::MGroupedContiguous);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -45,7 +45,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     auto SMSIZE = std::get<0>(smem_config);
 
     int kNumGroups = num_groups;
-    static constexpr GemmType kGemmType = GemmType::GroupedContiguous;
+    static constexpr GemmType kGemmType = GemmType::MGroupedContiguous;
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     using StrideB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
 
@@ -83,7 +83,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     BF16GemmCutlass3Runtime::GemmKernelParams params =
         BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
     auto args = BF16GemmCutlass3Runtime::Args{
-        .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "GroupedContiguous",
+        .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "MGroupedContiguous",
                         "Default", "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = params};
@@ -137,7 +137,7 @@ static std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const to
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
     } else {
         cfg = deep_gemm_bf16_common::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked, max_block_n);
+            expected_m, n, k, num_groups, num_sms, GemmType::MGroupedMasked, max_block_n);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -146,7 +146,7 @@ static std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const to
     auto SMSIZE = std::get<0>(smem_config);
 
     int kNumGroups = num_groups;
-    static constexpr GemmType kGemmType = GemmType::GroupedMasked;
+    static constexpr GemmType kGemmType = GemmType::MGroupedMasked;
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     using StrideB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
 
@@ -186,7 +186,7 @@ static std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const to
         BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
     auto args = BF16GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                              num_stages, "GroupedMasked", "Default",
+                                                              num_stages, "MGroupedMasked", "Default",
                                                               "bf16_grouped_deep_gemm_masked", enable_sbo_overlap},
                                               .launch_args = {grid, block, SMSIZE},
                                               .kernel_params = params};
@@ -235,7 +235,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
     bool SMALL_K;
     int num_sms = get_num_sms();
     int expected_m = ceil_div(m, num_groups);
-    static constexpr GemmType kGemmType = GemmType::GroupedNoPad;
+    static constexpr GemmType kGemmType = GemmType::MGroupedNoPad;
     bool use_gemv = false;
     if ((k % 16 == 0 && ((m <= 2 * num_groups * 0.75 && k <= 32 * 8) || (m < 0.65 * num_groups && k > 256)) &&
          !is_ppu1v5_device()) ||
@@ -256,7 +256,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
     if (use_gemv) {
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(GemmType::GroupedNoPad, true, std::string("bf16"), num_groups, m, n, k, expected_m,
+            dg_prof_params.set_params(GemmType::MGroupedNoPad, true, std::string("bf16"), num_groups, m, n, k, expected_m,
                                       layout_info, current_stream());
         }
         cutlass::bfloat16_t* converted_output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
@@ -378,7 +378,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
     } else {
         cfg = deep_gemm_bf16_common::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::GroupedNoPad);
+            expected_m, n, k, num_groups, num_sms, GemmType::MGroupedNoPad);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -466,7 +466,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
     BF16GemmCutlass3Runtime::GemmKernelParams params =
         BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
     auto args = BF16GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                              num_stages, "GroupedNoPad", "Default",
+                                                              num_stages, "MGroupedNoPad", "Default",
                                                               "bf16_grouped_deep_gemm_NoPad", false},
                                               .launch_args = {grid, block, SMSIZE},
                                               .kernel_params = params};

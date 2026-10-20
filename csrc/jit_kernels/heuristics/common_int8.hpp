@@ -320,13 +320,13 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
                         GemmType gemm_type, int max_block_n = 256) {
-    if (gemm_type == GemmType::DenseGemm || gemm_type == GemmType::BatchGemm) {
+    if (gemm_type == GemmType::Normal || gemm_type == GemmType::Batched) {
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms);
     }
 
     // FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
     std::vector<int> block_ms;
-    if (gemm_type != GemmType::GroupedContiguous) {
+    if (gemm_type != GemmType::MGroupedContiguous) {
         if (k >= 384) {
             block_ms = {256, 128, 64, 32, 16};
         } else {
@@ -608,7 +608,7 @@ get_adaptive_configs_int8(int m, int n, int k, int num_sms) {
 
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_best_configs(int m, int n, int k, int num_groups, int num_sms,
-                 GemmType gemm_type = GemmType::DenseGemm, int max_block_n = 256,
+                 GemmType gemm_type = GemmType::Normal, int max_block_n = 256,
                  std::optional<deep_gemm_lut::RuntimeLutKind> runtime_lut_kind = std::nullopt,
                  bool* from_runtime_lut = nullptr) {
     if (from_runtime_lut) *from_runtime_lut = false;
@@ -632,7 +632,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     }
     // Adaptive tile selection for DenseGemm (INT8). warp_k/dense_s2_opt are injected in the dense
     // impl; here we only apply the adaptive tile choice (incl. bk *= 2) and return the 8-tuple.
-    if (gemm_type == GemmType::DenseGemm && is_ppu1v5_device() &&
+    if (gemm_type == GemmType::Normal && is_ppu1v5_device() &&
         deep_gemm_adaptive::int8_adaptive_enabled(m, n, k)) {
         return get_adaptive_configs_int8(m, n, k, num_sms);
     }
@@ -641,7 +641,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     }
     // FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
     std::vector<int> block_ms;
-    if (gemm_type != GemmType::GroupedContiguous) {
+    if (gemm_type != GemmType::MGroupedContiguous) {
         if (k > 384) {
             block_ms = {256, 128, 64, 32, 16};
         } else {
@@ -698,7 +698,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
 
     // Decide block sizes by waves
     int best_block_m = 0, best_block_n = 0;
-    int min_n_threshold = gemm_type == GemmType::DenseGemm ? 1 : 32;
+    int min_n_threshold = gemm_type == GemmType::Normal ? 1 : 32;
 
     for (int block_m : block_ms) {
         // NOTES:

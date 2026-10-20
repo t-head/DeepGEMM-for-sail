@@ -69,9 +69,9 @@ static std::string get_profiling_dtype_name(W4A16Type w4a16_type) {
 // `GemmType::{}` as spelled in the generated code, mirroring the Python `gemm_type.name`
 static std::string get_gemm_type_name(GemmType gemm_type) {
     switch (gemm_type) {
-        case GemmType::GroupedNoPad:  return "GroupedNoPad";
-        case GemmType::GroupedMasked: return "GroupedMasked";
-        case GemmType::GroupedFused:  return "GroupedFused";
+        case GemmType::MGroupedNoPad:  return "MGroupedNoPad";
+        case GemmType::MGroupedMasked: return "MGroupedMasked";
+        case GemmType::MGroupedFused:  return "MGroupedFused";
         default: DG_HOST_ASSERT(false);
     }
     return {};
@@ -147,7 +147,7 @@ static W4A16Config get_best_configs(int expected_m, int n, int k, int num_groups
             if (n % (block_n * n_expand) == 0)
                 break;
         }
-        if (warp_m == 64 and gemm_type == GemmType::GroupedFused and w4a16_type == W4A16Type::mxfp4_e8m0_mma)
+        if (warp_m == 64 and gemm_type == GemmType::MGroupedFused and w4a16_type == W4A16Type::mxfp4_e8m0_mma)
             n_expand = 1; // n_expand > 1 will cause vreg exceeds the 256 limit
     }
 

@@ -35,7 +35,7 @@ template <int ShapeN, int ShapeK,
 class W4A8GEMM_MMA {
 public:
   static_assert(N_EXPAND >= 1 && N_EXPAND <= 4);
-  static_assert(N_EXPAND == 1 || (kGemmType == GemmType::GroupedNoPad && kNumStages == 2 && BlockK == WarpK));
+  static_assert(N_EXPAND == 1 || (kGemmType == GemmType::MGroupedNoPad && kNumStages == 2 && BlockK == WarpK));
   static_assert(N_EXPAND == 1 || ShapeN % (BlockN * N_EXPAND) == 0);
   using ElementA = cutlass::float_e4m3_t;
   using ElementB = cutlass::float4_t; // fp4
@@ -46,7 +46,7 @@ public:
   static constexpr bool ResidentA = N_EXPAND > 1 && WarpM == 64 && ShapeK <= BlockK * kNumStages;
   static constexpr bool CacheRowScale = N_EXPAND > 1 && WarpM == 64 && ShapeK <= 512;
   // basic
-  static constexpr bool Fused = (kGemmType == GemmType::GroupedFused);
+  static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   // A packed K64 slice feeds two K32 MMA steps for every M tile and grouped kind.
   static constexpr bool BatchDequant = WarpN == 64 && WarpK == 128;
   static constexpr bool E8M0_scale = true;

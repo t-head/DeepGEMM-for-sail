@@ -185,7 +185,7 @@ inline const std::map<std::tuple<int, int, int>, Tile>& get_int8_dense_a8w8_lut_
 // PPU1.5 devices use the *_1v5 table; otherwise the PPU1.0 table is used.
 // Returns std::nullopt when no entry matches (equivalent to Python returning None).
 inline std::optional<Tile> get_best_configs_from_lut(int m, int n, int k, GemmType gemm_type) {
-    if (gemm_type != GemmType::DenseGemm) return std::nullopt;
+    if (gemm_type != GemmType::Normal) return std::nullopt;
     const auto& gemm_dense_lut =
         deep_gemm::is_ppu1v5_device() ? get_int8_dense_a8w8_lut_1v5()
                                       : get_int8_dense_a8w8_lut();

@@ -323,33 +323,33 @@ static MoeAlignReturn moe_align_block_size_impl(
                                     std::get<6>(full)};
         };
         if (lhs.scalar_type() == torch::kFloat8_e4m3fn && rhs.scalar_type() == torch::kUInt8) {
-            const auto c = deep_gemm::w4fa8::get_best_configs(expected_m, n, k, num_groups, GemmType::GroupedFused);
-            deep_gemm::w4fa8::check_config(c, n, k, GemmType::GroupedFused);
+            const auto c = deep_gemm::w4fa8::get_best_configs(expected_m, n, k, num_groups, GemmType::MGroupedFused);
+            deep_gemm::w4fa8::check_config(c, n, k, GemmType::MGroupedFused);
             config = deep_gemm::w4fa8::pack_config(c);
         } else if (w4a16_type.has_value()) {
             // Forwarded whole: the W4A16 fused GEMM unpacks all 9 params, `warp_k` and `n_expand`
             // included, so there is nothing to truncate here
             const auto& c = deep_gemm_w4a16_common::get_best_configs(
-                expected_m, n, static_cast<int>(k), num_groups, num_sms, GemmType::GroupedFused, *w4a16_type);
+                expected_m, n, static_cast<int>(k), num_groups, num_sms, GemmType::MGroupedFused, *w4a16_type);
             config = deep_gemm_w4a16_common::W4A16ConfigTuple{c.num_sms, c.block_m, c.block_n, c.block_k,
                                                              c.warp_m, c.warp_n, c.warp_k, c.num_stages,
                                                              c.n_expand};
         } else if (lhs.dtype() == torch::kBFloat16) {
             config = take_first_7(deep_gemm_bf16_common::get_best_configs(
                 expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms,
-                GemmType::GroupedFused));
+                GemmType::MGroupedFused));
         } else if (perchannel_quant) {
             config = take_first_7(deep_gemm_int8::get_best_configs(
                 expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms,
-                GemmType::GroupedFused));
+                GemmType::MGroupedFused));
         } else if (lhs.dtype() == torch::kFloat8_e4m3fn) {
             config = take_first_7(deep_gemm_fp8_common::get_best_configs(
                 expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms,
-                GemmType::GroupedFused));
+                GemmType::MGroupedFused));
         } else if (lhs.dtype() == torch::kUInt8) {
             config = take_first_7(deep_gemm_fp4_common::get_best_configs(
                 numel, expected_m, static_cast<int>(n), static_cast<int>(k), num_groups, num_sms,
-                false /*has_bias*/, enable_act_and_quant_fusing, GemmType::GroupedFused));
+                false /*has_bias*/, enable_act_and_quant_fusing, GemmType::MGroupedFused));
         } else {
             TORCH_CHECK(false,
                         "moe_align_block_size (C++ JIT): unsupported lhs dtype "

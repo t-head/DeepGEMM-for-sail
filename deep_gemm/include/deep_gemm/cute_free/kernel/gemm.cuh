@@ -73,7 +73,7 @@ struct GemmKernel {
 
   static constexpr GemmType kGemmType = GemmTypeTag::value;
 
-  static_assert(kGemmType == GemmType::DenseGemm,
+  static_assert(kGemmType == GemmType::Normal,
                 "GemmKernel currently supports DenseGemm only");
 
   static constexpr int kMmaM = MmaAtom::kMmaM;

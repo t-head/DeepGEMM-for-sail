@@ -175,7 +175,7 @@ static void launch_w4a16_gemm(const W4A16LaunchInfo& info, W4A16Type w4a16_type,
     if (ProfilingInterface::Instance().get_op_info()) {
         // The fused arm is reported in token/topk terms instead of the m/em ones, and
         // `set_fused_moe_params` records `quant_type` itself, so only the other arm adds it
-        if (gemm_type == GemmType::GroupedFused) {
+        if (gemm_type == GemmType::MGroupedFused) {
             dg_prof_params.set_fused_moe_params(get_profiling_dtype_name(w4a16_type), std::string("group"),
                                                 info.num_groups, m, topk, info.n, info.k, m_rows_ptr,
                                                 current_stream());
@@ -283,7 +283,7 @@ static void m_grouped_gemm_w4a16_common(W4A16Type w4a16_type, GemmType gemm_type
     void* ptr_d = out.data_ptr();
     int32_t* m_rows_ptr = m_rows.data_ptr<int32_t>();
 
-    if (gemm_type == GemmType::GroupedFused) {
+    if (gemm_type == GemmType::MGroupedFused) {
         const W4A16GemmArguments<FusedSchedulerArguments> kernel_params{
             ptr_a,
             ptr_b,
@@ -302,7 +302,7 @@ static void m_grouped_gemm_w4a16_common(W4A16Type w4a16_type, GemmType gemm_type
     int32_t* layout_info = m_rows_ptr;
     // `DeepGemmScheduler::kIsNoPadPreprocessLayout`; the `GroupedFused` half of that predicate is
     // handled by the branch above
-    const bool no_pad_preprocess_layout = gemm_type == GemmType::GroupedNoPad and num_groups >= 128;
+    const bool no_pad_preprocess_layout = gemm_type == GemmType::MGroupedNoPad and num_groups >= 128;
     if (no_pad_preprocess_layout) {
         const uint32_t block_size = std::max(32, next_power_of_two(num_groups));
         auto compute_block_info_args = ComputeBlockInfoKernelRuntime::Args{
@@ -344,7 +344,7 @@ static void m_grouped_gemm_w4a16_nopad_impl(const torch::Tensor& lhs, const torc
     const int expected_m = ceil_div(m, num_groups);
     const auto& config = configs.has_value() ? unpack_w4a16_config(*configs)
                                              : get_best_configs(expected_m, n, k, num_groups, get_num_sms(),
-                                                                GemmType::GroupedNoPad, w4a16_type);
+                                                                GemmType::MGroupedNoPad, w4a16_type);
     const int block_m = config.block_m;
 
     // Derive per-group row counts from `m_indices` when the caller did not supply them
@@ -365,7 +365,7 @@ static void m_grouped_gemm_w4a16_nopad_impl(const torch::Tensor& lhs, const torc
         at::empty({(num_groups + ceil_div(m + 1 - num_groups, block_m)) * 4},
                   at::TensorOptions().dtype(at::kInt).device(m_rows_tensor.device()));
 
-    m_grouped_gemm_w4a16_common(w4a16_type, GemmType::GroupedNoPad, expected_m, lhs, rhs, rhs_scales, out, m, n, k,
+    m_grouped_gemm_w4a16_common(w4a16_type, GemmType::MGroupedNoPad, expected_m, lhs, rhs, rhs_scales, out, m, n, k,
                                 num_groups, group_size, config, m_rows_tensor, block_m_info);
 }
 
@@ -377,9 +377,9 @@ static void m_grouped_gemm_w4a16_masked_impl(const torch::Tensor& lhs, const tor
     const auto w4a16_type = get_w4a16_type(rhs.scalar_type(), rhs_scales.scalar_type());
     const auto& config = configs.has_value() ? unpack_w4a16_config(*configs)
                                              : get_best_configs(expected_m, n, k, num_groups, get_num_sms(),
-                                                                GemmType::GroupedMasked, w4a16_type);
+                                                                GemmType::MGroupedMasked, w4a16_type);
 
-    m_grouped_gemm_w4a16_common(w4a16_type, GemmType::GroupedMasked, expected_m, lhs, rhs, rhs_scales, out, m, n, k,
+    m_grouped_gemm_w4a16_common(w4a16_type, GemmType::MGroupedMasked, expected_m, lhs, rhs, rhs_scales, out, m, n, k,
                                 num_groups, group_size, config, masked_m);
 }
 
@@ -401,7 +401,7 @@ static void m_grouped_gemm_w4a16_fused_impl(const torch::Tensor& lhs, const torc
     DG_HOST_ASSERT(num_groups >= topk);
     const int expected_m = ceil_div(static_cast<int>(m_sum), num_groups);
 
-    m_grouped_gemm_w4a16_common(w4a16_type, GemmType::GroupedFused, expected_m, lhs, rhs, rhs_scales, out, m, n, k,
+    m_grouped_gemm_w4a16_common(w4a16_type, GemmType::MGroupedFused, expected_m, lhs, rhs, rhs_scales, out, m, n, k,
                                 num_groups, group_size, config, m_rows, torch::Tensor(),
                                 expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks,
                                 static_cast<int>(topk));

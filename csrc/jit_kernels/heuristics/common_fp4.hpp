@@ -358,7 +358,7 @@ ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, 
 ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, int num_sms,
                               bool has_bias,
                               bool enable_act_and_quant_fusing,
-                              GemmType gemm_type = GemmType::DenseGemm,
+                              GemmType gemm_type = GemmType::Normal,
                               int max_block_n = 256, int min_block_n = 32) {
     // C++ layer does not perform device checking; is_ppu1v5_device() assert skipped
     (void)total_m;
@@ -374,7 +374,7 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
                                         has_bias, enable_act_and_quant_fusing)};
         }
     }
-    if (gemm_type == GemmType::DenseGemm) {
+    if (gemm_type == GemmType::Normal) {
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing);
     }
 

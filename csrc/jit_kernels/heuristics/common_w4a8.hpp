@@ -35,7 +35,7 @@ static void check_config(const W4A8Config& c, int n, int k, GemmType kind) {
     DG_HOST_ASSERT(k % c.block_k == 0 and c.num_stages >= 2 and c.num_stages <= 4);
     DG_HOST_ASSERT(c.n_expand >= 1 and c.n_expand <= 4);
     if (c.n_expand > 1) {
-        DG_HOST_ASSERT(kind == GemmType::GroupedNoPad and c.num_stages == 2);
+        DG_HOST_ASSERT(kind == GemmType::MGroupedNoPad and c.num_stages == 2);
         DG_HOST_ASSERT(c.block_k == c.warp_k);
         DG_HOST_ASSERT(n % (c.block_n * c.n_expand) == 0);
     }
@@ -53,15 +53,15 @@ static int get_smem_size(const W4A8Config& c) {
 // Bound M before rounding so even a large tuning hint cannot overflow.
 static W4A8Config get_best_configs(int expected_m, int n, int k, int groups, GemmType kind) {
     DG_HOST_ASSERT(expected_m >= 0 && groups > 0 && n > 0 && n % 64 == 0 && k > 0);
-    DG_HOST_ASSERT(kind == GemmType::GroupedFused || kind == GemmType::GroupedNoPad || kind == GemmType::GroupedMasked);
+    DG_HOST_ASSERT(kind == GemmType::MGroupedFused || kind == GemmType::MGroupedNoPad || kind == GemmType::MGroupedMasked);
     int bm = 16;
     while (bm < expected_m && bm < 64) bm *= 2;
     const int bn = n >= 256 ? 256 : n >= 128 ? 128 : 64;
     // M32/N256 has enough shared memory for three stages at four CTAs/SM
     // (64,512 bytes per CTA). M16 and M64 lose residency with a third stage.
-    const int stages = kind == GemmType::GroupedMasked && bm == 32 && bn == 256 ? 3 : 2;
+    const int stages = kind == GemmType::MGroupedMasked && bm == 32 && bn == 256 ? 3 : 2;
     W4A8Config c{get_num_sms(),bm,bn,128,bm,64,128,stages,1};
-    if (kind == GemmType::GroupedNoPad and k <= 512 and k % c.block_k == 0 and
+    if (kind == GemmType::MGroupedNoPad and k <= 512 and k % c.block_k == 0 and
         c.num_stages == 2 and c.block_k == c.warp_k) {
         for (const int candidate : {4, 3, 2}) {
             if (n % (bn * candidate) == 0) {
@@ -75,9 +75,9 @@ static W4A8Config get_best_configs(int expected_m, int n, int k, int groups, Gem
 }
 static const char* get_gemm_type_name(GemmType kind) {
     switch (kind) {
-        case GemmType::GroupedFused: return "GroupedFused";
-        case GemmType::GroupedNoPad: return "GroupedNoPad";
-        case GemmType::GroupedMasked: return "GroupedMasked";
+        case GemmType::MGroupedFused: return "MGroupedFused";
+        case GemmType::MGroupedNoPad: return "MGroupedNoPad";
+        case GemmType::MGroupedMasked: return "MGroupedMasked";
         default: DG_HOST_ASSERT(false);
     }
     return "";

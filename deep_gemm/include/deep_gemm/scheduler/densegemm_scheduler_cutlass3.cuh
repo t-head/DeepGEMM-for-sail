@@ -54,7 +54,7 @@ template <uint32_t BLOCK_M_, uint32_t BLOCK_N_, uint32_t kNum1DBlocksPerGroup = 
 struct DenseGemmScheduler {
     constexpr static uint32_t BLOCK_M = BLOCK_M_;
     constexpr static uint32_t BLOCK_N = BLOCK_N_;
-    constexpr static GemmType GEMM_TYPE = GemmType::DenseGemm;
+    constexpr static GemmType GEMM_TYPE = GemmType::Normal;
     constexpr static bool kIsTMAMulticastOnA = false;
     constexpr static bool kIsNoPadPreprocessLayout = false;
     constexpr static uint32_t SHAPE_N = 0;    // Runtime N; 0 signals shape-agnostic

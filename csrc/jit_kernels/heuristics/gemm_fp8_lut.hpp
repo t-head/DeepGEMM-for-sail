@@ -121,10 +121,10 @@ inline const MNKDict& get_fp8_nopad_list() {
 inline std::optional<Tile> get_best_configs_from_lut(int m, int n, int k,
                                                      int groups, GemmType gemm_type) {
     (void)groups;
-    if (gemm_type == GemmType::GroupedNoPad) {
+    if (gemm_type == GemmType::MGroupedNoPad) {
         return get_fp8_nopad_list().query(m, n, k);
     }
-    if (gemm_type == GemmType::DenseGemm) {
+    if (gemm_type == GemmType::Normal) {
         const int m_aligned = ((m + 15) / 16) * 16;
         const auto key = std::make_tuple(m_aligned, n, k);
         const auto& dense = get_fp8_dense_list();

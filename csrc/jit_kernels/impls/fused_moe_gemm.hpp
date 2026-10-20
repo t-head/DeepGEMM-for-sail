@@ -60,7 +60,7 @@ constexpr uint32_t BLOCK_SIZE = {};
 constexpr int      STAGES     = {};
 
 using SrcT = cutlass::bfloat16_t;
-static constexpr GemmType kGemmType = GemmType::GroupedFused;
+static constexpr GemmType kGemmType = GemmType::MGroupedFused;
 
 extern "C"
 __launch_bounds__(BLOCK_SIZE, 1)
@@ -229,7 +229,7 @@ constexpr int      STAGES     = {};
 constexpr int      N_EXPAND   = {};
 
 using SrcT = __hg_fp8_e4m3;
-static constexpr GemmType kGemmType = GemmType::GroupedFused;
+static constexpr GemmType kGemmType = GemmType::MGroupedFused;
 
 extern "C"
 __launch_bounds__(BLOCK_SIZE, 1)
@@ -303,7 +303,7 @@ constexpr uint32_t BLOCK_SIZE = {};
 constexpr int      STAGES     = {};
 
 using SrcT = {};
-static constexpr GemmType kGemmType = GemmType::GroupedFused;
+static constexpr GemmType kGemmType = GemmType::MGroupedFused;
 
 extern "C"
 __launch_bounds__(BLOCK_SIZE, 1)
@@ -378,7 +378,7 @@ constexpr int      STAGES     = {};
 
 using MockMainloopFp4 = typename MockCollectiveMmaScaleFp4<
     BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, STAGES>::CollectiveMainloop;
-static constexpr GemmType kGemmType = GemmType::GroupedFused;
+static constexpr GemmType kGemmType = GemmType::MGroupedFused;
 
 extern "C"
 __launch_bounds__(BLOCK_SIZE, 1)

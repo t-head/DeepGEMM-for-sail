@@ -234,7 +234,7 @@ static ConfigResult make_config_result(int num_sms, int k, int block_m, int bloc
 }
 
 static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
-                                     GemmType gemm_type = GemmType::DenseGemm, int max_block_n = 256) {
+                                     GemmType gemm_type = GemmType::Normal, int max_block_n = 256) {
     const auto runtime_tile = deep_gemm_lut::get_runtime_config(
         m, n, k, num_groups, gemm_type, deep_gemm_lut::RuntimeLutKind::FP8Blockwise);
     const auto tile = runtime_tile
@@ -246,12 +246,12 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
                                   best_warp_m, best_warp_n, best_stages);
     }
 
-    if (gemm_type == GemmType::DenseGemm || gemm_type == GemmType::BatchGemm) {
+    if (gemm_type == GemmType::Normal || gemm_type == GemmType::Batched) {
         auto result = get_best_configs_dense(m, n, k, num_groups, num_sms);
         return result;
     }
     std::vector<int> block_ms;
-    if (gemm_type != GemmType::GroupedContiguous) {
+    if (gemm_type != GemmType::MGroupedContiguous) {
         block_ms = (k > 384) ? std::vector<int>{256, 192, 128, 64, 32, 16} : std::vector<int>{64, 32, 16};
     } else {
         block_ms = {get_mk_alignment_for_contiguous_layout()};
@@ -344,7 +344,7 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
         }
     }
 
-    if (gemm_type != GemmType::GroupedContiguous) {
+    if (gemm_type != GemmType::MGroupedContiguous) {
         if (m > 256 && n >= 256) {
             best_block_m = 192;
             best_block_n = 256;

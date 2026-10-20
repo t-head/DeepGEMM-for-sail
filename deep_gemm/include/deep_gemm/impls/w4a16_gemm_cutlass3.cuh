@@ -45,7 +45,7 @@ public:
   using ElementAcc = float;
 
   // basic
-  static constexpr bool Fused = (kGemmType == GemmType::GroupedFused);
+  static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   static constexpr bool E8M0_scale = cute::is_same_v<ElementScale, uint8_t>;
   static_assert((cute::is_same_v<ElementB, cutlass::int4b_t> && cute::is_same_v<ElementScale, cutlass::bfloat16_t>) ||
                 (cute::is_same_v<ElementB, cutlass::float4_t> && E8M0_scale),
@@ -799,7 +799,7 @@ public:
 
       typename Kernel::Params params{a_ptr, b_ptr, scale_b_ptr, d_ptr};
       bool NoPadPreprocessLayout = false;
-      if constexpr(kGemmType == GemmType::GroupedFused) {
+      if constexpr(kGemmType == GemmType::MGroupedFused) {
         params.num_token = shape_m;
         params.sorted_token_ids = args.sorted_token_ids;
         params.scheduler = {args.aligned_num_m_blocks, args.expert_ids_and_cumsum};
@@ -819,7 +819,7 @@ public:
         std::string dtype_name = UseMmaKernel ? std::string("w4fa16_mma") :
             (cute::is_same_v<ElementB, cutlass::int4b_t> ? std::string("w4a16") :
              std::string("w4fa16"));
-        if constexpr(kGemmType == GemmType::GroupedFused) {
+        if constexpr(kGemmType == GemmType::MGroupedFused) {
             dg_prof_params.set_fused_moe_params(
                 dtype_name, std::string("group"), kNumGroups, shape_m, args.topk,
                 ShapeN, ShapeK, m_rows, stream);

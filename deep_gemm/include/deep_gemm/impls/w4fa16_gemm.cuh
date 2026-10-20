@@ -45,7 +45,7 @@ public:
   using ElementScale = uint8_t; // e8m0 scale
 
   // basic
-  static constexpr bool Fused = (kGemmType == GemmType::GroupedFused);
+  static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   static constexpr bool E8M0_scale = true;
   static constexpr bool scale_use_ld_matrix = true;
   static constexpr int N = ShapeN;

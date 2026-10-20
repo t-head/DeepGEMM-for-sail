@@ -51,7 +51,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(const torch::Tensor& 
             deep_gemm_fp8_common::get_smem_config(nst, k, bm, bn, bk));
     } else {
         selected_config = deep_gemm_fp8_common::get_best_configs(
-            m, n, k, num_groups, num_sms, GemmType::GroupedContiguous);
+            m, n, k, num_groups, num_sms, GemmType::MGroupedContiguous);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
@@ -82,7 +82,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(const torch::Tensor& 
     layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
     int32_t* grouped_layout = reinterpret_cast<int32_t*>(m_indices.data_ptr<int32_t>());
 
-    static constexpr GemmType kGemmType = GemmType::GroupedContiguous;
+    static constexpr GemmType kGemmType = GemmType::MGroupedContiguous;
 
     cutlass::float_e4m3_t* converted_input_b =
         reinterpret_cast<cutlass::float_e4m3_t*>(rhs.data_ptr<at::Float8_e4m3fn>());
@@ -117,7 +117,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(const torch::Tensor& 
 
     auto args =
         FP8GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                                             "GroupedContiguous", "Default", "fp8_grouped_deep_gemm_contiguous", false},
+                                             "MGroupedContiguous", "Default", "fp8_grouped_deep_gemm_contiguous", false},
                              .launch_args = {grid, block, SMSIZE},
                              .kernel_params = params};
 
@@ -170,7 +170,7 @@ static std::pair<int, int> m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(
             deep_gemm_fp8_common::get_smem_config(nst, k, bm, bn, bk));
     } else {
         selected_config = deep_gemm_fp8_common::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::GroupedMasked, max_block_n);
+            expected_m, n, k, num_groups, num_sms, GemmType::MGroupedMasked, max_block_n);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
@@ -199,7 +199,7 @@ static std::pair<int, int> m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(
     layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
     layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
 
-    static constexpr GemmType kGemmType = GemmType::GroupedMasked;
+    static constexpr GemmType kGemmType = GemmType::MGroupedMasked;
 
     int32_t* grouped_layout = reinterpret_cast<int32_t*>(masked_m.data_ptr<int32_t>());
     int32_t* signal_ptr = reinterpret_cast<int32_t*>(signal.data_ptr<int32_t>());
@@ -236,7 +236,7 @@ static std::pair<int, int> m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(
     FP8GemmRuntime::GemmKernelParams params = FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
     auto args = FP8GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                                                     "GroupedMasked", "Default", "fp8_grouped_deep_gemm_masked",
+                                                     "MGroupedMasked", "Default", "fp8_grouped_deep_gemm_masked",
                                                      enable_sbo_overlap},
                                      .launch_args = {grid, block, SMSIZE},
                                      .kernel_params = params};
@@ -293,7 +293,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, 
             deep_gemm_fp8_common::get_smem_config(nst, k, bm, bn, bk));
     } else {
         cfg = deep_gemm_fp8_common::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::GroupedNoPad);
+            expected_m, n, k, num_groups, num_sms, GemmType::MGroupedNoPad);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -302,7 +302,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, 
     // std::cout << "num_sms_new is " << num_sms_new << " block_m is " << block_m << " block_n is " << block_n << "
     // block_k is " << block_k << std::endl; std::cout << " warp_m is " << warp_m << " warp_n is " << warp_n << "
     // num_stages is " << num_stages << " SMSIZE is " << SMSIZE << std::endl;
-    static constexpr GemmType kGemmType = GemmType::GroupedNoPad;
+    static constexpr GemmType kGemmType = GemmType::MGroupedNoPad;
     int kNumGroups = num_groups;
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     using StrideB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
@@ -386,7 +386,7 @@ static void m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(const torch::Tensor& lhs, 
     FP8GemmRuntime::GemmKernelParams params = FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
     auto args = FP8GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                                                     "GroupedNoPad", "Default", "fp8_grouped_deep_gemm_NoPad", false},
+                                                     "MGroupedNoPad", "Default", "fp8_grouped_deep_gemm_NoPad", false},
                                      .launch_args = {grid, block, SMSIZE},
                                      .kernel_params = params};
 

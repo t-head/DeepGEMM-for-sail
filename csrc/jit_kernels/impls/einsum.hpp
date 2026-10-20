@@ -49,7 +49,7 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
             deep_gemm_fp8_common::get_smem_config(nst, k, bm, bn, bk));
     } else {
         selected_config = deep_gemm_fp8_common::get_best_configs(
-            m, n, k, groups, num_sms, GemmType::BatchGemm);
+            m, n, k, groups, num_sms, GemmType::Batched);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
@@ -94,7 +94,7 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
 
-    static constexpr GemmType kGemmType = GemmType::BatchGemm;
+    static constexpr GemmType kGemmType = GemmType::Batched;
 
     const auto gemm_args = FP8GemmRuntime::GemmArguments{
         .mode = cutlass::gemm::GemmUniversalMode::kGemm,
@@ -116,7 +116,7 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     FP8GemmRuntime::GemmKernelParams params = FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
     auto args = FP8GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                                                     "BatchGemm", "Default", "batch_fp8_deep_gemm", false,
+                                                     "Batched", "Default", "batch_fp8_deep_gemm", false,
                                                      transposed_out},
                                      .launch_args = {grid, block, SMSIZE},
                                      .kernel_params = params};
@@ -178,7 +178,7 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
             selected_config = deep_gemm_int8::get_best_configs_dense_ppu1v5(m, n, k, groups, num_sms);
         } else {
             selected_config = deep_gemm_int8::get_best_configs(
-                m, n, k, groups, num_sms, GemmType::BatchGemm);
+                m, n, k, groups, num_sms, GemmType::Batched);
         }
     }
 
@@ -230,7 +230,7 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
 
-    static constexpr GemmType kGemmType = GemmType::BatchGemm;
+    static constexpr GemmType kGemmType = GemmType::Batched;
 
     const auto gemm_args = INT8GemmCutlass3Runtime::GemmArguments{
         .mode = cutlass::gemm::GemmUniversalMode::kGemm,
@@ -254,7 +254,7 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
 
     auto args = INT8GemmCutlass3Runtime::Args{
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                        "BatchGemm", "Default", kernel_name, false, transposed_out},
+                        "Batched", "Default", kernel_name, false, transposed_out},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = params,
         .type_info = type_info};

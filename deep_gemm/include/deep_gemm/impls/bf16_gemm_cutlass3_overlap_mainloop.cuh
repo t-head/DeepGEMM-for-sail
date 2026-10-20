@@ -644,10 +644,10 @@ public:
     CUTE_STATIC_ASSERT(is_static<TileShape>::value);
 
     int warp_idx = canonical_warp_idx_sync();
-    if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+    if (TileScheduler::GEMM_TYPE == GemmType::MGroupedMasked) {
       // group is small 8|16, just prefetch one cacheline
       __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
-    } else if (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+    } else if (TileScheduler::GEMM_TYPE == GemmType::MGroupedNoPad) {
       // each warp prefetch one cacheline
       if (warp_idx < N_PREFETCH_CACHELINE) {
         __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx<<5)));
@@ -766,7 +766,7 @@ public:
         (char*)&shared_storage.epilogue + warp_group_id * EpilogueSmemStride
       );
 
-      if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+      if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::MGroupedMasked) {
         cp_async_wait<0>();
         __ppu_barrier_sync(3 + warp_group_id, MaxThreadsPerBlock);
         if (thread_idx == 0) {

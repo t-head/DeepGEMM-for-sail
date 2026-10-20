@@ -233,7 +233,7 @@ ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms) {
 }
 
 ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
-                              GemmType gemm_type = GemmType::DenseGemm, int max_block_n = 256,
+                              GemmType gemm_type = GemmType::Normal, int max_block_n = 256,
                               bool* from_runtime_lut = nullptr) {
     if (from_runtime_lut) *from_runtime_lut = false;
     if (auto tile = deep_gemm_lut::get_runtime_config(
@@ -243,7 +243,7 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         return ConfigResult{num_sms, bm, bn, bk, wm, wn, stages,
                             get_smem_config(stages, k, bm, bn, bk, 2)};
     }
-    if (gemm_type == GemmType::DenseGemm && m >= 4096 && n >= 4096 && k >= 4096 &&
+    if (gemm_type == GemmType::Normal && m >= 4096 && n >= 4096 && k >= 4096 &&
         m % 64 == 0 && n % 64 == 0 && k % 64 == 0) {
         const std::string device_name(device_runtime->get_prop()->name);
         if (device_name.find("ZW810") != std::string::npos) {
@@ -255,13 +255,13 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     }
     // Adaptive tile selection for DenseGemm (BF16). warp_k/dense_s2_opt are injected in the dense
     // impl; here we only apply the adaptive tile choice and return the 8-tuple.
-    if (gemm_type == GemmType::DenseGemm && is_ppu1v5_device() &&
+    if (gemm_type == GemmType::Normal && is_ppu1v5_device() &&
         deep_gemm_adaptive::bf16_adaptive_enabled(m, n, k)) {
         return get_adaptive_configs_bf16(m, n, k, num_sms);
     }
     // Generate block_ms
     std::vector<int> block_ms;
-    if (gemm_type != GemmType::GroupedContiguous) {
+    if (gemm_type != GemmType::MGroupedContiguous) {
         if (k >= 384) {
             block_ms = {256, 128, 64, 32, 16};
         } else {
@@ -316,7 +316,7 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
 
     // Decide block sizes by waves
     int best_block_m = 0, best_block_n = 0;
-    int min_n_threshold = gemm_type == GemmType::DenseGemm ? 1 : 32;
+    int min_n_threshold = gemm_type == GemmType::Normal ? 1 : 32;
     for (int block_m : block_ms) {
         // Filter block_ns
         std::vector<int> block_ns_after_filter;

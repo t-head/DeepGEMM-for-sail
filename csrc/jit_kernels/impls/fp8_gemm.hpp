@@ -177,7 +177,7 @@ public:
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         std::string gemm_type, kernel_type, kernel_name;
         bool enable_sbo_overlap;
-        // Only meaningful for `GemmType::BatchGemm`. `true` keeps the transposed `[M, B, N]`
+        // Only meaningful for `GemmType::Batched`. `true` keeps the transposed `[M, B, N]`
         // output used by `einsum("bhr,hdr->bhd")`; `false` emits a plain `[B, M, N]` output.
         bool transposed_batch_output = true;
     };
@@ -438,8 +438,8 @@ static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, 
     int* block_m_info = nullptr;
     int* layout_info = grouped_layout;
 
-    static constexpr GemmType kGemmType = GemmType::DenseGemm;
-    constexpr static bool kIsNoPadPreprocessLayout = kGemmType == GemmType::GroupedNoPad && kNumGroups >= 128;
+    static constexpr GemmType kGemmType = GemmType::Normal;
+    constexpr static bool kIsNoPadPreprocessLayout = kGemmType == GemmType::MGroupedNoPad && kNumGroups >= 128;
     if (kIsNoPadPreprocessLayout) {
         uint32_t block_size = std::max(32, next_power_of_two(kNumGroups));
         auto compute_block_info_args = ComputeBlockInfoKernelRuntime::Args{
@@ -484,7 +484,7 @@ static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, 
     FP8GemmRuntime::GemmKernelParams params = FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
     auto args = FP8GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                                                     "DenseGemm", "Default", "fp8_deep_gemm", false},
+                                                     "Normal", "Default", "fp8_deep_gemm", false},
                                      .launch_args = {grid, block, SMSIZE},
                                      .kernel_params = params};
 

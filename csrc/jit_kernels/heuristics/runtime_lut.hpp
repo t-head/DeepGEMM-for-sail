@@ -41,12 +41,12 @@ inline const char* get_runtime_lut_kind_name(RuntimeLutKind kind) {
 
 inline const char* get_gemm_type_name(GemmType gemm_type) {
     switch (gemm_type) {
-        case GemmType::DenseGemm: return "densegemm";
-        case GemmType::GroupedContiguous: return "groupedcontiguous";
-        case GemmType::GroupedMasked: return "groupedmasked";
-        case GemmType::GroupedNoPad: return "groupednopad";
-        case GemmType::GroupedFused: return "groupedfused";
-        case GemmType::BatchGemm: return "batchgemm";
+        case GemmType::Normal: return "densegemm";
+        case GemmType::MGroupedContiguous: return "groupedcontiguous";
+        case GemmType::MGroupedMasked: return "groupedmasked";
+        case GemmType::MGroupedNoPad: return "groupednopad";
+        case GemmType::MGroupedFused: return "groupedfused";
+        case GemmType::Batched: return "batchgemm";
     }
     throw std::runtime_error("Unsupported GEMM type");
 }
@@ -89,9 +89,9 @@ inline RuntimeTableState& get_runtime_table_state(RuntimeLutKind kind, GemmType 
 }
 
 inline bool supports_runtime_lut(GemmType gemm_type) {
-    return gemm_type == GemmType::DenseGemm ||
-           gemm_type == GemmType::GroupedNoPad ||
-           gemm_type == GemmType::GroupedMasked;
+    return gemm_type == GemmType::Normal ||
+           gemm_type == GemmType::MGroupedNoPad ||
+           gemm_type == GemmType::MGroupedMasked;
 }
 
 inline RuntimeTable load_runtime_lut(const std::string& path, GemmType gemm_type) {
@@ -119,7 +119,7 @@ inline RuntimeTable load_runtime_lut(const std::string& path, GemmType gemm_type
                 c = ' ';
             }
         }
-        const bool grouped = gemm_type != GemmType::DenseGemm;
+        const bool grouped = gemm_type != GemmType::Normal;
         const size_t expected = grouped ? 10 : 9;
 
         std::istringstream input(line);
@@ -149,7 +149,7 @@ inline RuntimeTable load_runtime_lut(const std::string& path, GemmType gemm_type
         const int block_k = values[offset + 5], warp_m = values[offset + 6];
         const int warp_n = values[offset + 7], stages = values[offset + 8];
         if (std::any_of(values.begin(), values.end(), [](int value) { return value <= 0; }) ||
-            (gemm_type == GemmType::DenseGemm && m % 16 != 0) ||
+            (gemm_type == GemmType::Normal && m % 16 != 0) ||
             warp_m > block_m || warp_n > block_n ||
             block_m % warp_m != 0 || block_n % warp_n != 0) {
             throw std::runtime_error("Invalid runtime LUT dimensions at " + path + ":" +
@@ -179,10 +179,10 @@ inline std::optional<Tile> get_runtime_config(int m, int n, int k, int num_group
     if (path.empty()) return std::nullopt;
     auto& state = get_runtime_table_state(kind, gemm_type);
     ensure_runtime_lut_loaded(state, kind, gemm_type, path.c_str());
-    const int lookup_m = gemm_type == GemmType::DenseGemm ? ((m + 15) / 16) * 16 : m;
-    const auto key = std::make_tuple(n, k, gemm_type == GemmType::DenseGemm ? 1 : num_groups, lookup_m);
+    const int lookup_m = gemm_type == GemmType::Normal ? ((m + 15) / 16) * 16 : m;
+    const auto key = std::make_tuple(n, k, gemm_type == GemmType::Normal ? 1 : num_groups, lookup_m);
     const auto& table = state.table;
-    const auto it = gemm_type == GemmType::DenseGemm ? table.find(key) : table.lower_bound(key);
+    const auto it = gemm_type == GemmType::Normal ? table.find(key) : table.lower_bound(key);
     return it == table.end() || std::get<0>(it->first) != n || std::get<1>(it->first) != k ||
            std::get<2>(it->first) != std::get<2>(key)
                ? std::nullopt : std::optional<Tile>(it->second);

@@ -237,10 +237,10 @@ public:
     using namespace cute;
     using X = Underscore;
     int warp_idx = cutlass::canonical_warp_idx_sync();
-    if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+    if (TileScheduler::GEMM_TYPE == GemmType::MGroupedMasked) {
       // group is small 8|16, just prefetch one cacheline
       __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
-    } else if (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+    } else if (TileScheduler::GEMM_TYPE == GemmType::MGroupedNoPad) {
       // each warp prefetch one cacheline
       if (warp_idx < N_PREFETCH_CACHELINE) {
         __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx<<5)));
@@ -347,7 +347,7 @@ public:
         thread_idx,
         (char*)&shared_storage.tensors.epilogue
       );
-      if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+      if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::MGroupedMasked) {
         cp_async_wait<0>();
         __syncthreads();
 
@@ -573,10 +573,10 @@ public:
     using X = Underscore;
 
     int warp_idx = cutlass::canonical_warp_idx_sync();
-    if (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+    if (TileScheduler::GEMM_TYPE == GemmType::MGroupedMasked) {
       // group is small 8|16, just prefetch one cacheline
       __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
-    } else if (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+    } else if (TileScheduler::GEMM_TYPE == GemmType::MGroupedNoPad) {
       // each warp prefetch one cacheline
       if (warp_idx < N_PREFETCH_CACHELINE) {
         __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx<<5)));
@@ -992,7 +992,7 @@ public:
         }
       } // for n_iter
 
-      if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
+      if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::MGroupedMasked) {
         cp_async_wait<0>();
         __syncthreads();
 
@@ -1125,7 +1125,7 @@ public:
         StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(shape_m, SHAPE_K, 1));
         StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(SHAPE_N, SHAPE_K, 1));
         StrideD stride_D;
-        if constexpr (kGemmType == GemmType::BatchGemm) {
+        if constexpr (kGemmType == GemmType::Batched) {
           // BHD output: D[b,h,d] has offset b*H*D + h*D + d
           // In the kernel's (batch=h, M=b, N=d) model:
           //   row stride = H*D = kNumGroups * SHAPE_N

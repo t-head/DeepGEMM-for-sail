@@ -123,7 +123,7 @@ static size_t get_int8_tample_params_size() {
       CollectiveEpilogue_noTsm
   >::type;
 
-  using TileScheduler = DeepGemmScheduler<GemmType::DenseGemm, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS>;
+  using TileScheduler = DeepGemmScheduler<GemmType::Normal, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS>;
   using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
       int8_t,
       Shape<int,int,int,int>,

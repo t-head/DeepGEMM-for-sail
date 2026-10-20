@@ -271,7 +271,7 @@ struct DeepGemmDynamicTile {
   using ElementScale = float;
   using ProblemShape = Shape<int,int,int,int>;
 
-  static constexpr bool IsEP = (kGemmType == GemmType::GroupedMasked);
+  static constexpr bool IsEP = (kGemmType == GemmType::MGroupedMasked);
 
   using KernelAiuDynamicTile = typename cutlass::platform::conditional<
           IsEP,

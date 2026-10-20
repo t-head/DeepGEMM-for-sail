@@ -34,14 +34,14 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
             deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, n, hasBias, enable_act_and_quant_fusing));
     } else {
         selected_config = deep_gemm_fp4_common::get_best_configs(
-            m, expected_m, n, k, num_groups, num_sms, hasBias, enable_act_and_quant_fusing, GemmType::GroupedNoPad);
+            m, expected_m, n, k, num_groups, num_sms, hasBias, enable_act_and_quant_fusing, GemmType::MGroupedNoPad);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
     auto SMSIZE = std::get<0>(smem_config);
 
     int kNumGroups = num_groups;
-    static constexpr GemmType kGemmType = GemmType::GroupedNoPad;
+    static constexpr GemmType kGemmType = GemmType::MGroupedNoPad;
     const EpilogueType kEpilogueType = enable_act_and_quant_fusing ? get_epilogue_type(activation_type) : EpilogueType::Default;
 
     // N_EXPAND logic, keep in sync with m_grouped_gemm_fp4.py (nopad).
@@ -154,7 +154,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
 
     FP4GemmRuntime::Args args{};
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                        n, k, "GroupedNoPad", "fp4_grouped_deep_gemm_nopad", hasBias, n_expand, false,
+                        n, k, "MGroupedNoPad", "fp4_grouped_deep_gemm_nopad", hasBias, n_expand, false,
                         EpilogueTypeS[static_cast<int>(kEpilogueType)],
                         enable_act_and_quant_fusing && swiglu_limit > 0.0f};
     args.launch_args = {grid, block, SMSIZE};
@@ -287,14 +287,14 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
             deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, n, hasBias, enable_act_and_quant_fusing));
     } else {
         selected_config = deep_gemm_fp4_common::get_best_configs(
-            m, expected_m, n, k, num_groups, num_sms, hasBias, enable_act_and_quant_fusing, GemmType::GroupedMasked, max_block_n);
+            m, expected_m, n, k, num_groups, num_sms, hasBias, enable_act_and_quant_fusing, GemmType::MGroupedMasked, max_block_n);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
     auto SMSIZE = std::get<0>(smem_config);
 
     int kNumGroups = num_groups;
-    static constexpr GemmType kGemmType = GemmType::GroupedMasked;
+    static constexpr GemmType kGemmType = GemmType::MGroupedMasked;
     const EpilogueType kEpilogueType = enable_act_and_quant_fusing ? get_epilogue_type(activation_type) : EpilogueType::Default;
 
     // N_EXPAND logic for masked, keep in sync with m_grouped_gemm_fp4.py (masked).
@@ -383,7 +383,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     // ----- DynamicTile early-out: completely separate runtime & kernel -----
     if (enable_moe_dynamic_tile) {
         FP4DynamicTileRuntime::Args dyn_args{};
-        dyn_args.launch_info = {n, k, kNumGroups, dynamic_tile_id, "GroupedMasked",
+        dyn_args.launch_info = {n, k, kNumGroups, dynamic_tile_id, "MGroupedMasked",
                                 "fp4_grouped_deep_gemm_masked_dynamic_tile",
                                 EpilogueTypeS[static_cast<int>(kEpilogueType)],
                                 enable_act_and_quant_fusing && swiglu_limit > 0.0f};
@@ -468,7 +468,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
 
     FP4GemmRuntime::Args args{};
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                        n, k, "GroupedMasked", "fp4_grouped_deep_gemm_masked", hasBias, n_expand, enable_sbo_overlap,
+                        n, k, "MGroupedMasked", "fp4_grouped_deep_gemm_masked", hasBias, n_expand, enable_sbo_overlap,
                         EpilogueTypeS[static_cast<int>(kEpilogueType)],
                         enable_act_and_quant_fusing && swiglu_limit > 0.0f};
     args.launch_args = {grid, block, SMSIZE};

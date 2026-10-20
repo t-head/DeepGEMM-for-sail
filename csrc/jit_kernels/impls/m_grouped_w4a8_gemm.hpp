@@ -84,7 +84,7 @@ static void launch(const W4A8Config& c, int m, int n, int k, int groups, GemmTyp
     args.launch_args.grid_dim = dim3(c.num_sms < 20 ? c.num_sms : c.num_sms * std::min(8, blocks));
     DgProfParam prof;
     if (ProfilingInterface::Instance().get_op_info()) {
-        if (kind == GemmType::GroupedFused)
+        if (kind == GemmType::MGroupedFused)
             prof.set_fused_moe_params("w4fa8_mma", "group", groups, m, topk, n, k, m_rows, current_stream());
         else {
             prof.set_params(kind, false, "w4fa8_mma", groups, m, n, k, expected_m, m_rows, current_stream());
@@ -110,9 +110,9 @@ static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torc
                 const torch::Tensor& expert_ids = {}, const torch::Tensor& token_ids = {},
                 const torch::Tensor& aligned_blocks = {}) {
     const int groups = b.size(0), n = b.size(1), k = a.size(-1);
-    const int m = kind == GemmType::GroupedMasked ? a.size(1) : a.size(0);
+    const int m = kind == GemmType::MGroupedMasked ? a.size(1) : a.size(0);
     check_config(c, n, k, kind);
-    if (kind == GemmType::GroupedFused) {
+    if (kind == GemmType::MGroupedFused) {
         const Arguments<W4A8FusedSchedulerArguments> params{a.data_ptr(), b.data_ptr(), scale.data_ptr(), d.data_ptr(),
             a_scale.data_ptr<float>(), m, token_ids.data_ptr<int32_t>(),
             {aligned_blocks.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>()}};
@@ -120,7 +120,7 @@ static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torc
     } else {
         torch::Tensor scratch;
         auto layout = rows.data_ptr<int32_t>();
-        if (kind == GemmType::GroupedNoPad && groups >= 128) {
+        if (kind == GemmType::MGroupedNoPad && groups >= 128) {
             TORCH_CHECK(groups <= 1024, "W4FA8 nopad supports at most 1024 experts");
             scratch = at::empty({(groups + ceil_div(m + 1 - groups, c.block_m))*4}, rows.options());
             auto args = ComputeBlockInfoKernelRuntime::Args{
