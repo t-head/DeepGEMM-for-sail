@@ -40,34 +40,34 @@ from .deep_gemm_cpp import (
 # DeepGEMM Kernels
 from .deep_gemm_cpp import (
     # BF16 GEMMs
-    gemm_bf16_bf16_bf16_nt,
-    gemm_bf16_bf16_bf16_nn,
-    gemm_bf16_bf16_bf16_tn,
-    gemm_bf16_bf16_bf16_tt,
-    m_grouped_gemm_bf16_bf16_bf16_nt_contiguous,
-    m_grouped_gemm_bf16_bf16_bf16_nt_masked,
-    m_grouped_gemm_bf16_bf16_bf16_nt_nopad,
-    m_grouped_gemm_bf16_bf16_bf16_nt_fused,
+    bf16_gemm_nt,
+    bf16_gemm_nn,
+    bf16_gemm_tn,
+    bf16_gemm_tt,
+    m_grouped_bf16_gemm_nt_contiguous,
+    m_grouped_bf16_gemm_nt_masked,
+    m_grouped_bf16_gemm_nt_nopad,
+    m_grouped_bf16_gemm_nt_fused,
     # INT8 GEMMs
-    gemm_int8_int8_bf16_nt,
-    m_grouped_gemm_int8_int8_bf16_nt_contiguous,
-    m_grouped_gemm_int8_int8_bf16_nt_masked,
-    m_grouped_gemm_int8_int8_bf16_nt_nopad,
-    m_grouped_gemm_int8_int8_bf16_nt_fused,
+    int8_gemm_nt,
+    m_grouped_int8_gemm_nt_contiguous,
+    m_grouped_int8_gemm_nt_masked,
+    m_grouped_int8_gemm_nt_nopad,
+    m_grouped_int8_gemm_nt_fused,
     # FP8 GEMMs
-    gemm_fp8_fp8_bf16_nt,
-    gemm_fp8_fp8_bf16_nn,
-    gemm_fp8_fp8_bf16_tn,
-    gemm_fp8_fp8_bf16_tt,
-    m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-    m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-    m_grouped_gemm_fp8_fp8_bf16_nt_nopad,
-    m_grouped_gemm_fp8_fp8_bf16_nt_fused,
+    fp8_gemm_nt,
+    fp8_gemm_nn,
+    fp8_gemm_tn,
+    fp8_gemm_tt,
+    m_grouped_fp8_gemm_nt_contiguous,
+    m_grouped_fp8_gemm_nt_masked,
+    m_grouped_fp8_gemm_nt_nopad,
+    m_grouped_fp8_gemm_nt_fused,
     # FP4 GEMMs
-    gemm_fp4_fp4_bf16_nt,
-    m_grouped_gemm_fp4_fp4_bf16_nt_masked,
-    m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
-    m_grouped_gemm_fp4_fp4_bf16_nt_fused,
+    fp4_gemm_nt,
+    m_grouped_fp4_gemm_nt_masked,
+    m_grouped_fp4_gemm_nt_nopad,
+    m_grouped_fp4_gemm_nt_fused,
     # MoE kernels
     moe_align_block_size,
     # SiLU / SiTU activation with explicit output mode and optional quantization
@@ -153,52 +153,52 @@ get_col_major_tma_aligned_tensor = get_mn_major_tma_aligned_tensor
 get_m_alignment_for_contiguous_layout = get_mk_alignment_for_contiguous_layout
 
 # ---------------------------------------------------------------------------
-# The latest APIs compatibility aliases
+# Compatibility aliases for legacy APIs
 # ---------------------------------------------------------------------------
 
 # --- BF16 dense GEMM ---
-bf16_gemm_nt = gemm_bf16_bf16_bf16_nt
-bf16_gemm_nn = gemm_bf16_bf16_bf16_nn
-bf16_gemm_tn = gemm_bf16_bf16_bf16_tn
-bf16_gemm_tt = gemm_bf16_bf16_bf16_tt
+gemm_bf16_bf16_bf16_nt = bf16_gemm_nt
+gemm_bf16_bf16_bf16_nn = bf16_gemm_nn
+gemm_bf16_bf16_bf16_tn = bf16_gemm_tn
+gemm_bf16_bf16_bf16_tt = bf16_gemm_tt
 
 # --- BF16 M-grouped GEMM ---
-m_grouped_bf16_gemm_nt_contiguous = m_grouped_gemm_bf16_bf16_bf16_nt_contiguous
-m_grouped_bf16_gemm_nt_masked = m_grouped_gemm_bf16_bf16_bf16_nt_masked
-m_grouped_bf16_gemm_nt_nopad = m_grouped_gemm_bf16_bf16_bf16_nt_nopad
-m_grouped_bf16_gemm_nt_fused = m_grouped_gemm_bf16_bf16_bf16_nt_fused
+m_grouped_gemm_bf16_bf16_bf16_nt_contiguous = m_grouped_bf16_gemm_nt_contiguous
+m_grouped_gemm_bf16_bf16_bf16_nt_masked = m_grouped_bf16_gemm_nt_masked
+m_grouped_gemm_bf16_bf16_bf16_nt_nopad = m_grouped_bf16_gemm_nt_nopad
+m_grouped_gemm_bf16_bf16_bf16_nt_fused = m_grouped_bf16_gemm_nt_fused
 
 # --- INT8 dense GEMM ---
-int8_gemm_nt = gemm_int8_int8_bf16_nt
+gemm_int8_int8_bf16_nt = int8_gemm_nt
 
 # --- INT8 M-grouped GEMM ---
-m_grouped_int8_gemm_nt_contiguous = m_grouped_gemm_int8_int8_bf16_nt_contiguous
-m_grouped_int8_gemm_nt_masked = m_grouped_gemm_int8_int8_bf16_nt_masked
-m_grouped_int8_gemm_nt_nopad = m_grouped_gemm_int8_int8_bf16_nt_nopad
-m_grouped_int8_gemm_nt_fused = m_grouped_gemm_int8_int8_bf16_nt_fused
+m_grouped_gemm_int8_int8_bf16_nt_contiguous = m_grouped_int8_gemm_nt_contiguous
+m_grouped_gemm_int8_int8_bf16_nt_masked = m_grouped_int8_gemm_nt_masked
+m_grouped_gemm_int8_int8_bf16_nt_nopad = m_grouped_int8_gemm_nt_nopad
+m_grouped_gemm_int8_int8_bf16_nt_fused = m_grouped_int8_gemm_nt_fused
 
 # --- FP8 dense GEMM ---
 # The latest APIs return FP32 for results
-fp8_gemm_nt = gemm_fp8_fp8_bf16_nt
-fp8_gemm_nn = gemm_fp8_fp8_bf16_nn
-fp8_gemm_tn = gemm_fp8_fp8_bf16_tn
-fp8_gemm_tt = gemm_fp8_fp8_bf16_tt
+gemm_fp8_fp8_bf16_nt = fp8_gemm_nt
+gemm_fp8_fp8_bf16_nn = fp8_gemm_nn
+gemm_fp8_fp8_bf16_tn = fp8_gemm_tn
+gemm_fp8_fp8_bf16_tt = fp8_gemm_tt
 
 # --- FP8 M-grouped GEMM
-m_grouped_fp8_gemm_nt_contiguous = m_grouped_gemm_fp8_fp8_bf16_nt_contiguous
-m_grouped_fp8_gemm_nt_masked = m_grouped_gemm_fp8_fp8_bf16_nt_masked
-m_grouped_fp8_gemm_nt_nopad = m_grouped_gemm_fp8_fp8_bf16_nt_nopad
-m_grouped_fp8_gemm_nt_fused = m_grouped_gemm_fp8_fp8_bf16_nt_fused
+m_grouped_gemm_fp8_fp8_bf16_nt_contiguous = m_grouped_fp8_gemm_nt_contiguous
+m_grouped_gemm_fp8_fp8_bf16_nt_masked = m_grouped_fp8_gemm_nt_masked
+m_grouped_gemm_fp8_fp8_bf16_nt_nopad = m_grouped_fp8_gemm_nt_nopad
+m_grouped_gemm_fp8_fp8_bf16_nt_fused = m_grouped_fp8_gemm_nt_fused
 
-fp8_m_grouped_gemm_nt_masked = m_grouped_gemm_fp8_fp8_bf16_nt_masked
+fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
 
 # --- FP4 dense GEMM ---
-fp4_gemm_nt = gemm_fp4_fp4_bf16_nt
+gemm_fp4_fp4_bf16_nt = fp4_gemm_nt
 
 # --- FP4 M-grouped GEMM
-m_grouped_fp4_gemm_nt_masked = m_grouped_gemm_fp4_fp4_bf16_nt_masked
-m_grouped_fp4_gemm_nt_nopad = m_grouped_gemm_fp4_fp4_bf16_nt_nopad
-m_grouped_fp4_gemm_nt_fused = m_grouped_gemm_fp4_fp4_bf16_nt_fused
+m_grouped_gemm_fp4_fp4_bf16_nt_masked = m_grouped_fp4_gemm_nt_masked
+m_grouped_gemm_fp4_fp4_bf16_nt_nopad = m_grouped_fp4_gemm_nt_nopad
+m_grouped_gemm_fp4_fp4_bf16_nt_fused = m_grouped_fp4_gemm_nt_fused
 
 # --- FP8 FP4 dense GEMM ---
 fp8_fp4_gemm_nt = unimplemented

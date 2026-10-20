@@ -56,10 +56,12 @@ static bool early_return(const int& m, const int &n, const int& k,
     return false;
 }
 
-void gemm_bf16_bf16_bf16_nt(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
-                            const std::optional<torch::Tensor>& c,
-                            const std::string& compiled_dims,
-                            std::optional<ConfigTuple> configs = std::nullopt) {
+void bf16_gemm_nt(const torch::Tensor& a,
+                  const torch::Tensor& b,
+                  const torch::Tensor& d,
+                  const std::optional<torch::Tensor>& c,
+                  const std::string& compiled_dims,
+                  std::optional<ConfigTuple> configs = std::nullopt) {
     const auto major_a = get_major_type_ab(a);
     const auto major_b = get_major_type_ab(b);
     check_major_type_cd(d);
@@ -84,32 +86,39 @@ void gemm_bf16_bf16_bf16_nt(const torch::Tensor& a, const torch::Tensor& b, cons
     }
 }
 
-void gemm_bf16_bf16_bf16_nn(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
-                            const std::optional<torch::Tensor>& c,
-                            const std::string& compiled_dims,
-                            std::optional<ConfigTuple> configs = std::nullopt) {
+void bf16_gemm_nn(const torch::Tensor& a,
+                  const torch::Tensor& b,
+                  const torch::Tensor& d,
+                  const std::optional<torch::Tensor>& c,
+                  const std::string& compiled_dims,
+                  std::optional<ConfigTuple> configs = std::nullopt) {
     DG_HOST_UNREACHABLE("BF16 NN layout is not supported: kernel does not support non-NT layouts due to performance concerns");
 }
 
-void gemm_bf16_bf16_bf16_tn(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
-                            const std::optional<torch::Tensor>& c,
-                            const std::string& compiled_dims,
-                            std::optional<ConfigTuple> configs = std::nullopt) {
+void bf16_gemm_tn(const torch::Tensor& a,
+                  const torch::Tensor& b,
+                  const torch::Tensor& d,
+                  const std::optional<torch::Tensor>& c,
+                  const std::string& compiled_dims,
+                  std::optional<ConfigTuple> configs = std::nullopt) {
     DG_HOST_UNREACHABLE("BF16 TN layout is not supported: kernel does not support non-NT layouts due to performance concerns");
 }
 
-void gemm_bf16_bf16_bf16_tt(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
-                            const std::optional<torch::Tensor>& c,
-                            const std::string& compiled_dims,
-                            std::optional<ConfigTuple> configs = std::nullopt) {
+void bf16_gemm_tt(const torch::Tensor& a,
+                  const torch::Tensor& b,
+                  const torch::Tensor& d,
+                  const std::optional<torch::Tensor>& c,
+                  const std::string& compiled_dims,
+                  std::optional<ConfigTuple> configs = std::nullopt) {
     DG_HOST_UNREACHABLE("BF16 TT layout is not supported: kernel does not support non-NT layouts due to performance concerns");
 }
 
-void gemm_int8_int8_bf16_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
-                            const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& d,
-                            const std::optional<torch::Tensor>& c,
-                            const std::string& compiled_dims,
-                            std::optional<ConfigTuple> configs = std::nullopt) {
+void int8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                  const std::pair<torch::Tensor, torch::Tensor>& b,
+                  const torch::Tensor& d,
+                  const std::optional<torch::Tensor>& c,
+                  const std::string& compiled_dims,
+                  std::optional<ConfigTuple> configs = std::nullopt) {
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
     check_major_type_cd(d);
@@ -138,7 +147,8 @@ void gemm_int8_int8_bf16_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     }
 }
 
-void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
+void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                 const std::pair<torch::Tensor, torch::Tensor>& b,
                  const torch::Tensor& d,
                  const std::optional<torch::Tensor>& c,
                  const std::optional<std::tuple<int, int, int>>& recipe,
@@ -166,7 +176,7 @@ void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pa
     if ((lhs_scales.sizes() == std::vector<int64_t>{m, 1}) && (rhs_scales.sizes() == std::vector<int64_t>{n, 1})) {
         const auto arch_major = device_runtime->get_arch_major();
         if (arch_major == 8) {
-            return gemm_int8_int8_bf16_nt(a, b, d, c, compiled_dims, configs);
+            return int8_gemm_nt(a, b, d, c, compiled_dims, configs);
         } else {
             DG_HOST_UNREACHABLE("Unsupported architecture");
         }
@@ -192,7 +202,8 @@ void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pa
     }
 }
 
-void fp8_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
+void fp8_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a,
+                 const std::pair<torch::Tensor, torch::Tensor>& b,
                  const torch::Tensor& d,
                  const std::optional<torch::Tensor>& c,
                  const std::optional<std::tuple<int, int, int>>& recipe,
@@ -204,7 +215,8 @@ void fp8_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pa
     DG_HOST_UNREACHABLE("FP8 NN layout is not supported: kernel does not support non-NT layouts due to performance concerns");
 }
 
-void fp8_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
+void fp8_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a,
+                 const std::pair<torch::Tensor, torch::Tensor>& b,
                  const torch::Tensor& d,
                  const std::optional<torch::Tensor>& c,
                  const std::optional<std::tuple<int, int, int>>& recipe,
@@ -216,7 +228,8 @@ void fp8_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pa
     DG_HOST_UNREACHABLE("FP8 TN layout is not supported: kernel does not support non-NT layouts due to performance concerns");
 }
 
-void fp8_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
+void fp8_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                 const std::pair<torch::Tensor, torch::Tensor>& b,
                  const torch::Tensor& d,
                  const std::optional<torch::Tensor>& c,
                  const std::optional<std::tuple<int, int, int>>& recipe,
@@ -305,18 +318,19 @@ void fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     }
 }
 
-void m_grouped_gemm_int8_int8_bf16_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
-                                                 const std::pair<torch::Tensor, torch::Tensor>& b,
-                                                 const torch::Tensor& d, const torch::Tensor& m_indices,
-                                                 const std::optional<std::tuple<int,int,int>>& recipe,
-                                                 const std::optional<std::tuple<int,int>>& recipe_a,
-                                                 const std::optional<std::tuple<int,int>>& recipe_b,
-                                                 const std::string& compiled_dims,
-                                                 const bool disable_ue8m0_cast,
-                                                 const bool use_psum_layout,
-                                                 const bool ensure_zero_padding,
-                                                 const std::optional<int> expected_m_for_psum_layout,
-                                                 std::optional<ConfigTuple> configs = std::nullopt) {
+void m_grouped_int8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                       const std::pair<torch::Tensor, torch::Tensor>& b,
+                                       const torch::Tensor& d,
+                                       const torch::Tensor& m_indices,
+                                       const std::optional<std::tuple<int,int,int>>& recipe,
+                                       const std::optional<std::tuple<int,int>>& recipe_a,
+                                       const std::optional<std::tuple<int,int>>& recipe_b,
+                                       const std::string& compiled_dims,
+                                       const bool disable_ue8m0_cast,
+                                       const bool use_psum_layout,
+                                       const bool ensure_zero_padding,
+                                       const std::optional<int> expected_m_for_psum_layout,
+                                       std::optional<ConfigTuple> configs = std::nullopt) {
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
@@ -363,17 +377,20 @@ void m_grouped_gemm_int8_int8_bf16_nt_contiguous(const std::pair<torch::Tensor, 
     }
 }
 
-std::pair<int, int> m_grouped_gemm_int8_int8_bf16_nt_masked(
-    const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
-    const torch::Tensor& d, const torch::Tensor& masked_m, int expected_m,
-    const std::optional<std::tuple<int,int,int>>& recipe,
-    const std::optional<std::tuple<int,int>>& recipe_a,
-    const std::optional<std::tuple<int,int>>& recipe_b,
-    const std::string& compiled_dims,
-    const bool disable_ue8m0_cast,
-    std::optional<int> max_block_n = 256,
-    std::optional<bool> enable_sbo_overlap = false, std::optional<const torch::Tensor> signal = std::nullopt,
-    std::optional<ConfigTuple> configs = std::nullopt) {
+std::pair<int, int> m_grouped_int8_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                  const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                  const torch::Tensor& d,
+                                                  const torch::Tensor& masked_m,
+                                                  int expected_m,
+                                                  const std::optional<std::tuple<int,int,int>>& recipe,
+                                                  const std::optional<std::tuple<int,int>>& recipe_a,
+                                                  const std::optional<std::tuple<int,int>>& recipe_b,
+                                                  const std::string& compiled_dims,
+                                                  const bool disable_ue8m0_cast,
+                                                  std::optional<int> max_block_n = 256,
+                                                  std::optional<bool> enable_sbo_overlap = false,
+                                                  std::optional<const torch::Tensor> signal = std::nullopt,
+                                                  std::optional<ConfigTuple> configs = std::nullopt) {
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
@@ -433,19 +450,20 @@ std::pair<int, int> m_grouped_gemm_int8_int8_bf16_nt_masked(
     }
 }
 
-void m_grouped_gemm_int8_int8_bf16_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& a,
-                                            const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& d,
-                                            const torch::Tensor& m_indices,
-                                            std::optional<const torch::Tensor> m_rows = std::nullopt,
-                                            const std::optional<std::tuple<int,int,int>>& recipe = std::nullopt,
-                                            const std::optional<std::tuple<int,int>>& recipe_a = std::nullopt,
-                                            const std::optional<std::tuple<int,int>>& recipe_b = std::nullopt,
-                                            const std::string& compiled_dims = "nk",
-                                            const bool disable_ue8m0_cast = false,
-                                            const bool use_psum_layout = false,
-                                            const bool ensure_zero_padding = true,
-                                            const std::optional<int> expected_m_for_psum_layout = std::nullopt,
-                                            std::optional<ConfigTuple> configs = std::nullopt) {
+void m_grouped_int8_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                  const std::pair<torch::Tensor, torch::Tensor>& b,
+                                  const torch::Tensor& d,
+                                  const torch::Tensor& m_indices,
+                                  std::optional<const torch::Tensor> m_rows = std::nullopt,
+                                  const std::optional<std::tuple<int,int,int>>& recipe = std::nullopt,
+                                  const std::optional<std::tuple<int,int>>& recipe_a = std::nullopt,
+                                  const std::optional<std::tuple<int,int>>& recipe_b = std::nullopt,
+                                  const std::string& compiled_dims = "nk",
+                                  const bool disable_ue8m0_cast = false,
+                                  const bool use_psum_layout = false,
+                                  const bool ensure_zero_padding = true,
+                                  const std::optional<int> expected_m_for_psum_layout = std::nullopt,
+                                  std::optional<ConfigTuple> configs = std::nullopt) {
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
@@ -488,18 +506,19 @@ void m_grouped_gemm_int8_int8_bf16_nt_nopad(const std::pair<torch::Tensor, torch
     }
 }
 
-void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
-                                               const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& d,
-                                               const torch::Tensor& m_indices,
-                                               std::optional<std::tuple<int, int, int>> recipe,
-                                               std::optional<std::tuple<int, int>> recipe_a,
-                                               std::optional<std::tuple<int, int>> recipe_b,
-                                               const std::string& compiled_dims,
-                                               const bool& disable_ue8m0_cast,
-                                               const bool& use_psum_layout,
-                                               const bool& ensure_zero_padding,
-                                               const std::optional<int>& expected_m_for_psum_layout,
-                                               std::optional<ConfigTuple> configs = std::nullopt) {
+void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                      const std::pair<torch::Tensor, torch::Tensor>& b,
+                                      const torch::Tensor& d,
+                                      const torch::Tensor& m_indices,
+                                      std::optional<std::tuple<int, int, int>> recipe,
+                                      std::optional<std::tuple<int, int>> recipe_a,
+                                      std::optional<std::tuple<int, int>> recipe_b,
+                                      const std::string& compiled_dims,
+                                      const bool& disable_ue8m0_cast,
+                                      const bool& use_psum_layout,
+                                      const bool& ensure_zero_padding,
+                                      const std::optional<int>& expected_m_for_psum_layout,
+                                      std::optional<ConfigTuple> configs = std::nullopt) {
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
@@ -521,10 +540,10 @@ void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(const std::pair<torch::Tensor, to
         (rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1})) {
         const auto arch_major = device_runtime->get_arch_major();
         if (arch_major == 8) {
-            return m_grouped_gemm_int8_int8_bf16_nt_contiguous(a, b, d, m_indices,
-                                                                 std::nullopt, std::nullopt, std::nullopt,
-                                                                 compiled_dims, false, false, true, std::nullopt,
-                                                                 configs);
+            return m_grouped_int8_gemm_nt_contiguous(a, b, d, m_indices,
+                                                     std::nullopt, std::nullopt, std::nullopt,
+                                                     compiled_dims, false, false, true, std::nullopt,
+                                                     configs);
         } else {
             DG_HOST_UNREACHABLE("Unsupported architecture");
         }
@@ -568,17 +587,20 @@ void m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(const std::pair<torch::Tensor, to
     }
 }
 
-std::pair<int, int> m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-    const std::pair<torch::Tensor, torch::Tensor>& a, const std::pair<torch::Tensor, torch::Tensor>& b,
-    const torch::Tensor& d, const torch::Tensor& masked_m, int expected_m,
-    std::optional<std::tuple<int, int, int>> recipe,
-    std::optional<std::tuple<int, int>> recipe_a,
-    std::optional<std::tuple<int, int>> recipe_b,
-    const std::string& compiled_dims,
-    const bool& disable_ue8m0_cast,
-    std::optional<int> max_block_n = 256,
-    std::optional<bool> enable_sbo_overlap = false, std::optional<const torch::Tensor> signal = std::nullopt,
-    std::optional<ConfigTuple> configs = std::nullopt) {
+std::pair<int, int> m_grouped_fp8_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                 const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                 const torch::Tensor& d,
+                                                 const torch::Tensor& masked_m,
+                                                 int expected_m,
+                                                 std::optional<std::tuple<int, int, int>> recipe,
+                                                 std::optional<std::tuple<int, int>> recipe_a,
+                                                 std::optional<std::tuple<int, int>> recipe_b,
+                                                 const std::string& compiled_dims,
+                                                 const bool& disable_ue8m0_cast,
+                                                 std::optional<int> max_block_n = 256,
+                                                 std::optional<bool> enable_sbo_overlap = false,
+                                                 std::optional<const torch::Tensor> signal = std::nullopt,
+                                                 std::optional<ConfigTuple> configs = std::nullopt) {
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
@@ -605,10 +627,10 @@ std::pair<int, int> m_grouped_gemm_fp8_fp8_bf16_nt_masked(
         (rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1})) {
         const auto arch_major = device_runtime->get_arch_major();
         if (arch_major == 8) {
-            return m_grouped_gemm_int8_int8_bf16_nt_masked(a, b, d, masked_m, expected_m,
-                                                           std::nullopt, std::nullopt, std::nullopt,
-                                                           compiled_dims, false,
-                                                           max_block_n, enable_sbo_overlap, signal, configs);
+            return m_grouped_int8_gemm_nt_masked(a, b, d, masked_m, expected_m,
+                                                 std::nullopt, std::nullopt, std::nullopt,
+                                                 compiled_dims, false,
+                                                 max_block_n, enable_sbo_overlap, signal, configs);
         } else {
             DG_HOST_UNREACHABLE("Unsupported architecture");
         }
@@ -650,19 +672,20 @@ std::pair<int, int> m_grouped_gemm_fp8_fp8_bf16_nt_masked(
     }
 }
 
-void m_grouped_gemm_fp8_fp8_bf16_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& a,
-                                          const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& d,
-                                          const torch::Tensor& m_indices,
-                                          std::optional<const torch::Tensor> m_rows = std::nullopt,
-                                          std::optional<std::tuple<int, int, int>> recipe = std::nullopt,
-                                          std::optional<std::tuple<int, int>> recipe_a = std::nullopt,
-                                          std::optional<std::tuple<int, int>> recipe_b = std::nullopt,
-                                          const std::string& compiled_dims = "nk",
-                                          const bool& disable_ue8m0_cast = false,
-                                          const bool& use_psum_layout = false,
-                                          const bool& ensure_zero_padding = true,
-                                          const std::optional<int>& expected_m_for_psum_layout = std::nullopt,
-                                          std::optional<ConfigTuple> configs = std::nullopt) {
+void m_grouped_fp8_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                 const std::pair<torch::Tensor, torch::Tensor>& b,
+                                 const torch::Tensor& d,
+                                 const torch::Tensor& m_indices,
+                                 std::optional<const torch::Tensor> m_rows = std::nullopt,
+                                 std::optional<std::tuple<int, int, int>> recipe = std::nullopt,
+                                 std::optional<std::tuple<int, int>> recipe_a = std::nullopt,
+                                 std::optional<std::tuple<int, int>> recipe_b = std::nullopt,
+                                 const std::string& compiled_dims = "nk",
+                                 const bool& disable_ue8m0_cast = false,
+                                 const bool& use_psum_layout = false,
+                                 const bool& ensure_zero_padding = true,
+                                 const std::optional<int>& expected_m_for_psum_layout = std::nullopt,
+                                 std::optional<ConfigTuple> configs = std::nullopt) {
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
@@ -677,10 +700,10 @@ void m_grouped_gemm_fp8_fp8_bf16_nt_nopad(const std::pair<torch::Tensor, torch::
         (rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1})) {
         const auto arch_major = device_runtime->get_arch_major();
         if (arch_major == 8) {
-            return m_grouped_gemm_int8_int8_bf16_nt_nopad(a, b, d, m_indices, m_rows,
-                                                          std::nullopt, std::nullopt, std::nullopt,
-                                                          compiled_dims, false, false, true, std::nullopt,
-                                                          configs);
+            return m_grouped_int8_gemm_nt_nopad(a, b, d, m_indices, m_rows,
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                compiled_dims, false, false, true, std::nullopt,
+                                                configs);
         } else {
             DG_HOST_UNREACHABLE("Unsupported architecture");
         }
@@ -717,13 +740,13 @@ void m_grouped_gemm_fp8_fp8_bf16_nt_nopad(const std::pair<torch::Tensor, torch::
     }
 }
 
-void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(const torch::Tensor& lhs, const torch::Tensor& rhs,
-                                                 const torch::Tensor& out, const torch::Tensor& m_indices,
-                                                 const std::string& compiled_dims,
-                                                 const bool& use_psum_layout,
-                                                 const bool& ensure_zero_padding,
-                                                 const std::optional<int>& expected_m_for_psum_layout,
-                                                 std::optional<ConfigTuple> configs = std::nullopt) {
+void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& lhs, const torch::Tensor& rhs,
+                                       const torch::Tensor& out, const torch::Tensor& m_indices,
+                                       const std::string& compiled_dims,
+                                       const bool& use_psum_layout,
+                                       const bool& ensure_zero_padding,
+                                       const std::optional<int>& expected_m_for_psum_layout,
+                                       std::optional<ConfigTuple> configs = std::nullopt) {
     const auto major_a = get_major_type_ab(lhs);
     const auto major_b = get_major_type_ab(rhs);
     DG_HOST_ASSERT(major_a == MajorType::K);
@@ -765,11 +788,13 @@ void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(const torch::Tensor& lhs, const
     }
 }
 
-std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked(
-    const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out, const torch::Tensor& masked_m,
-    int expected_m, const std::string& compiled_dims, std::optional<int> max_block_n = 256,
-    std::optional<bool> enable_sbo_overlap = false, std::optional<const torch::Tensor> signal = std::nullopt,
-    std::optional<ConfigTuple> configs = std::nullopt) {
+std::pair<int, int> m_grouped_bf16_gemm_nt_masked(const torch::Tensor& lhs, const torch::Tensor& rhs,
+                                                  const torch::Tensor& out, const torch::Tensor& masked_m,
+                                                  int expected_m, const std::string& compiled_dims,
+                                                  std::optional<int> max_block_n = 256,
+                                                  std::optional<bool> enable_sbo_overlap = false,
+                                                  std::optional<const torch::Tensor> signal = std::nullopt,
+                                                  std::optional<ConfigTuple> configs = std::nullopt) {
     at::Tensor signal_tensor;
     if (signal.has_value() && signal->defined()) {
         signal_tensor = *signal;
@@ -816,14 +841,14 @@ std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked(
     }
 }
 
-void m_grouped_gemm_bf16_bf16_bf16_nt_nopad(const torch::Tensor& lhs, const torch::Tensor& rhs,
-                                            const torch::Tensor& out, const torch::Tensor& m_indices,
-                                            std::optional<const torch::Tensor> m_rows = std::nullopt,
-                                            const std::string& compiled_dims = "nk",
-                                            const bool& use_psum_layout = false,
-                                            const bool& ensure_zero_padding = true,
-                                            const std::optional<int>& expected_m_for_psum_layout = std::nullopt,
-                                            std::optional<ConfigTuple> configs = std::nullopt) {
+void m_grouped_bf16_gemm_nt_nopad(const torch::Tensor& lhs, const torch::Tensor& rhs,
+                                  const torch::Tensor& out, const torch::Tensor& m_indices,
+                                  std::optional<const torch::Tensor> m_rows = std::nullopt,
+                                  const std::string& compiled_dims = "nk",
+                                  const bool& use_psum_layout = false,
+                                  const bool& ensure_zero_padding = true,
+                                  const std::optional<int>& expected_m_for_psum_layout = std::nullopt,
+                                  std::optional<ConfigTuple> configs = std::nullopt) {
     const auto& [m, k] = get_shape<2>(lhs);
     const auto& [num_groups, n, k_] = get_shape<3>(rhs);
     const auto& [m_, n_] = get_shape<2>(out);
@@ -851,18 +876,17 @@ void m_grouped_gemm_bf16_bf16_bf16_nt_nopad(const torch::Tensor& lhs, const torc
     }
 }
 
-static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
-    const std::pair<torch::Tensor, torch::Tensor>& a,
-    const std::pair<torch::Tensor, torch::Tensor>& b,
-    const std::optional<torch::Tensor>& bias,
-    const torch::Tensor& d,
-    const torch::Tensor& m_indices,
-    std::optional<const torch::Tensor> m_rows = std::nullopt,
-    const std::string& compiled_dims = "nk",
-    std::optional<torch::Tensor> out_scale = std::nullopt,
-    std::optional<float> swiglu_limit = std::nullopt,
-    std::optional<ConfigTuple> configs = std::nullopt,
-    std::optional<std::string> activation_type = std::nullopt) {
+static void m_grouped_fp4_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                        const std::pair<torch::Tensor, torch::Tensor>& b,
+                                        const std::optional<torch::Tensor>& bias,
+                                        const torch::Tensor& d,
+                                        const torch::Tensor& m_indices,
+                                        std::optional<const torch::Tensor> m_rows = std::nullopt,
+                                        const std::string& compiled_dims = "nk",
+                                        std::optional<torch::Tensor> out_scale = std::nullopt,
+                                        std::optional<float> swiglu_limit = std::nullopt,
+                                        std::optional<ConfigTuple> configs = std::nullopt,
+                                        std::optional<std::string> activation_type = std::nullopt) {
 
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
@@ -964,15 +988,12 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
     }
 }
 
-void m_grouped_gemm_bf16_bf16_bf16_nt_fused(
-    const torch::Tensor& lhs,
-    const torch::Tensor& rhs,
-    const torch::Tensor& out,
-    const torch::Tensor& m_rows,
-    const torch::Tensor& expert_ids_and_cumsum,
-    const torch::Tensor& sorted_token_ids,
-    const torch::Tensor& aligned_num_m_blocks,
-    FusedCommonConfigTuple configs) {
+void m_grouped_bf16_gemm_nt_fused(const torch::Tensor& lhs, const torch::Tensor& rhs,
+                                  const torch::Tensor& out, const torch::Tensor& m_rows,
+                                  const torch::Tensor& expert_ids_and_cumsum,
+                                  const torch::Tensor& sorted_token_ids,
+                                  const torch::Tensor& aligned_num_m_blocks,
+                                  FusedCommonConfigTuple configs) {
 
     const auto& [num_token, k] = get_shape<2>(lhs);
     const auto& [num_groups, n, k_] = get_shape<3>(rhs);
@@ -1001,15 +1022,14 @@ void m_grouped_gemm_bf16_bf16_bf16_nt_fused(
     }
 }
 
-void m_grouped_gemm_fp8_fp8_bf16_nt_fused(
-    const std::pair<torch::Tensor, torch::Tensor>& lhs_,
-    const std::pair<torch::Tensor, torch::Tensor>& rhs_,
-    const torch::Tensor& out,
-    const torch::Tensor& m_rows,
-    const torch::Tensor& expert_ids_and_cumsum,
-    const torch::Tensor& sorted_token_ids,
-    const torch::Tensor& aligned_num_m_blocks,
-    FusedCommonConfigTuple configs) {
+void m_grouped_fp8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& lhs_,
+                                 const std::pair<torch::Tensor, torch::Tensor>& rhs_,
+                                 const torch::Tensor& out,
+                                 const torch::Tensor& m_rows,
+                                 const torch::Tensor& expert_ids_and_cumsum,
+                                 const torch::Tensor& sorted_token_ids,
+                                 const torch::Tensor& aligned_num_m_blocks,
+                                 FusedCommonConfigTuple configs) {
 
     const auto& lhs = lhs_.first;
     const auto& lhs_scales = lhs_.second;
@@ -1071,15 +1091,14 @@ void m_grouped_gemm_fp8_fp8_bf16_nt_fused(
     }
 }
 
-void m_grouped_gemm_int8_int8_bf16_nt_fused(
-    const std::pair<torch::Tensor, torch::Tensor>& lhs_,
-    const std::pair<torch::Tensor, torch::Tensor>& rhs_,
-    const torch::Tensor& out,
-    const torch::Tensor& m_rows,
-    const torch::Tensor& expert_ids_and_cumsum,
-    const torch::Tensor& sorted_token_ids,
-    const torch::Tensor& aligned_num_m_blocks,
-    FusedCommonConfigTuple configs) {
+void m_grouped_int8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& lhs_,
+                                  const std::pair<torch::Tensor, torch::Tensor>& rhs_,
+                                  const torch::Tensor& out,
+                                  const torch::Tensor& m_rows,
+                                  const torch::Tensor& expert_ids_and_cumsum,
+                                  const torch::Tensor& sorted_token_ids,
+                                  const torch::Tensor& aligned_num_m_blocks,
+                                  FusedCommonConfigTuple configs) {
 
     const auto& lhs = lhs_.first;
     const auto& lhs_scales = lhs_.second;
@@ -1123,18 +1142,17 @@ void m_grouped_gemm_int8_int8_bf16_nt_fused(
 // MoE GroupedFused FP4 GEMM. The lhs scale is K-major packed uint16, while rhs_scales must use the
 // N-major layout produced by preprocess_mxfp4_scales. With out_scale, the epilogue writes packed
 // uint8 activations and per-row E8M0 scales, then this API re-strides out_scale for Gemm2's SFA read.
-void m_grouped_gemm_fp4_fp4_bf16_nt_fused(
-    const std::pair<torch::Tensor, torch::Tensor>& lhs_,
-    const std::pair<torch::Tensor, torch::Tensor>& rhs_,
-    const torch::Tensor& out,
-    const torch::Tensor& m_rows,
-    const torch::Tensor& expert_ids_and_cumsum,
-    const torch::Tensor& sorted_token_ids,
-    const torch::Tensor& aligned_num_m_blocks,
-    FusedCommonConfigTuple configs,
-    std::optional<torch::Tensor> out_scale = std::nullopt,
-    std::optional<float> swiglu_limit = std::nullopt,
-    std::optional<std::string> activation_type = std::nullopt) {
+void m_grouped_fp4_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& lhs_,
+                                 const std::pair<torch::Tensor, torch::Tensor>& rhs_,
+                                 const torch::Tensor& out,
+                                 const torch::Tensor& m_rows,
+                                 const torch::Tensor& expert_ids_and_cumsum,
+                                 const torch::Tensor& sorted_token_ids,
+                                 const torch::Tensor& aligned_num_m_blocks,
+                                 FusedCommonConfigTuple configs,
+                                 std::optional<torch::Tensor> out_scale = std::nullopt,
+                                 std::optional<float> swiglu_limit = std::nullopt,
+                                 std::optional<std::string> activation_type = std::nullopt) {
 
     const auto& lhs = lhs_.first;
     const auto& lhs_scales = lhs_.second;
@@ -1224,25 +1242,24 @@ void m_grouped_gemm_fp4_fp4_bf16_nt_fused(
     }
 }
 
-static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked(
-    const std::pair<torch::Tensor, torch::Tensor>& a,
-    const std::pair<torch::Tensor, torch::Tensor>& b,
-    const std::optional<torch::Tensor>& bias,
-    const torch::Tensor& d,
-    const torch::Tensor& masked_m,
-    int expected_m,
-    const std::optional<std::tuple<int,int,int>>& recipe,
-    const std::optional<std::tuple<int,int>>& recipe_a,
-    const std::optional<std::tuple<int,int>>& recipe_b,
-    const std::string& compiled_dims,
-    const bool disable_ue8m0_cast,
-    std::optional<int> max_block_n = 256,
-    std::optional<bool> enable_sbo_overlap = false,
-    std::optional<const torch::Tensor> signal = std::nullopt,
-    std::optional<torch::Tensor> out_scale = std::nullopt,
-    std::optional<float> swiglu_limit = std::nullopt,
-    std::optional<ConfigTuple> configs = std::nullopt,
-    std::optional<std::string> activation_type = std::nullopt) {
+static std::pair<int, int> m_grouped_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                        const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                        const std::optional<torch::Tensor>& bias,
+                                                        const torch::Tensor& d,
+                                                        const torch::Tensor& masked_m,
+                                                        int expected_m,
+                                                        const std::optional<std::tuple<int,int,int>>& recipe,
+                                                        const std::optional<std::tuple<int,int>>& recipe_a,
+                                                        const std::optional<std::tuple<int,int>>& recipe_b,
+                                                        const std::string& compiled_dims,
+                                                        const bool disable_ue8m0_cast,
+                                                        std::optional<int> max_block_n = 256,
+                                                        std::optional<bool> enable_sbo_overlap = false,
+                                                        std::optional<const torch::Tensor> signal = std::nullopt,
+                                                        std::optional<torch::Tensor> out_scale = std::nullopt,
+                                                        std::optional<float> swiglu_limit = std::nullopt,
+                                                        std::optional<ConfigTuple> configs = std::nullopt,
+                                                        std::optional<std::string> activation_type = std::nullopt) {
 
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
@@ -1650,89 +1667,89 @@ static void acblaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
 
 static void register_apis(pybind11::module_& m) {
     // BF16 GEMMs
-    m.def("gemm_bf16_bf16_bf16_nt", &gemm_bf16_bf16_bf16_nt, py::arg("a"), py::arg("b"), py::arg("d"),
+    m.def("bf16_gemm_nt", &bf16_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
-    m.def("gemm_bf16_bf16_bf16_nn", &gemm_bf16_bf16_bf16_nn, py::arg("a"), py::arg("b"), py::arg("d"),
+    m.def("bf16_gemm_nn", &bf16_gemm_nn, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
-    m.def("gemm_bf16_bf16_bf16_tn", &gemm_bf16_bf16_bf16_tn, py::arg("a"), py::arg("b"), py::arg("d"),
+    m.def("bf16_gemm_tn", &bf16_gemm_tn, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
-    m.def("gemm_bf16_bf16_bf16_tt", &gemm_bf16_bf16_bf16_tt, py::arg("a"), py::arg("b"), py::arg("d"),
+    m.def("bf16_gemm_tt", &bf16_gemm_tt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_bf16_bf16_bf16_nt_contiguous", &m_grouped_gemm_bf16_bf16_bf16_nt_contiguous, py::arg("lhs"),
+    m.def("m_grouped_bf16_gemm_nt_contiguous", &m_grouped_bf16_gemm_nt_contiguous, py::arg("lhs"),
           py::arg("rhs"), py::arg("out"), py::arg("m_indices"), py::arg("compiled_dims") = "nk",
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,
           py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_bf16_bf16_bf16_nt_masked", &m_grouped_gemm_bf16_bf16_bf16_nt_masked, py::arg("lhs"),
+    m.def("m_grouped_bf16_gemm_nt_masked", &m_grouped_bf16_gemm_nt_masked, py::arg("lhs"),
           py::arg("rhs"), py::arg("out"), py::arg("masked_m"), py::arg("expected_m"), py::arg("compiled_dims") = "nk",
           py::arg("max_block_n") = 256, py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt,
           py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_bf16_bf16_bf16_nt_nopad", &m_grouped_gemm_bf16_bf16_bf16_nt_nopad, py::arg("lhs"),
+    m.def("m_grouped_bf16_gemm_nt_nopad", &m_grouped_bf16_gemm_nt_nopad, py::arg("lhs"),
           py::arg("rhs"), py::arg("out"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("use_psum_layout") = false,
           py::arg("ensure_zero_padding") = true,
           py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
     // INT8 GEMMs
-    m.def("gemm_int8_int8_bf16_nt", &gemm_int8_int8_bf16_nt, py::arg("a"), py::arg("b"), py::arg("d"),
+    m.def("int8_gemm_nt", &int8_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_int8_int8_bf16_nt_contiguous", &m_grouped_gemm_int8_int8_bf16_nt_contiguous, py::arg("a"),
+    m.def("m_grouped_int8_gemm_nt_contiguous", &m_grouped_int8_gemm_nt_contiguous, py::arg("a"),
           py::arg("b"), py::arg("d"), py::arg("m_indices"),
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,
           py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_int8_int8_bf16_nt_masked", &m_grouped_gemm_int8_int8_bf16_nt_masked, py::arg("a"),
+    m.def("m_grouped_int8_gemm_nt_masked", &m_grouped_int8_gemm_nt_masked, py::arg("a"),
           py::arg("b"), py::arg("d"), py::arg("masked_m"), py::arg("expected_m"),
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
           py::arg("max_block_n") = 256, py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt,
           py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_int8_int8_bf16_nt_nopad", &m_grouped_gemm_int8_int8_bf16_nt_nopad, py::arg("a"), py::arg("b"),
+    m.def("m_grouped_int8_gemm_nt_nopad", &m_grouped_int8_gemm_nt_nopad, py::arg("a"), py::arg("b"),
           py::arg("d"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt,
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,
           py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
     // FP8 GEMMs
-    m.def("gemm_fp8_fp8_bf16_nt", &fp8_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
+    m.def("fp8_gemm_nt", &fp8_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false, py::arg("configs") = std::nullopt);
-    m.def("gemm_fp8_fp8_bf16_nn", &fp8_gemm_nn, py::arg("a"), py::arg("b"), py::arg("d"),
+    m.def("fp8_gemm_nn", &fp8_gemm_nn, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false, py::arg("configs") = std::nullopt);
-    m.def("gemm_fp8_fp8_bf16_tn", &fp8_gemm_tn, py::arg("a"), py::arg("b"), py::arg("d"),
+    m.def("fp8_gemm_tn", &fp8_gemm_tn, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false, py::arg("configs") = std::nullopt);
-    m.def("gemm_fp8_fp8_bf16_tt", &fp8_gemm_tt, py::arg("a"), py::arg("b"), py::arg("d"),
+    m.def("fp8_gemm_tt", &fp8_gemm_tt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false, py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_fp8_fp8_bf16_nt_contiguous", &m_grouped_gemm_fp8_fp8_bf16_nt_contiguous, py::arg("a"),
+    m.def("m_grouped_fp8_gemm_nt_contiguous", &m_grouped_fp8_gemm_nt_contiguous, py::arg("a"),
           py::arg("b"), py::arg("d"), py::arg("m_indices"),
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,
           py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_fp8_fp8_bf16_nt_masked", &m_grouped_gemm_fp8_fp8_bf16_nt_masked, py::arg("a"), py::arg("b"),
+    m.def("m_grouped_fp8_gemm_nt_masked", &m_grouped_fp8_gemm_nt_masked, py::arg("a"), py::arg("b"),
           py::arg("d"), py::arg("masked_m"), py::arg("expected_m"),
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
           py::arg("max_block_n") = 256, py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt,
           py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_fp8_fp8_bf16_nt_nopad", &m_grouped_gemm_fp8_fp8_bf16_nt_nopad, py::arg("a"), py::arg("b"),
+    m.def("m_grouped_fp8_gemm_nt_nopad", &m_grouped_fp8_gemm_nt_nopad, py::arg("a"), py::arg("b"),
           py::arg("d"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt,
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,
           py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
     // FP4 GEMMs
-    m.def("gemm_fp4_fp4_bf16_nt", &fp4_gemm_nt, py::arg("a"), py::arg("b"), py::arg("bias"),
+    m.def("fp4_gemm_nt", &fp4_gemm_nt, py::arg("a"), py::arg("b"), py::arg("bias"),
           py::arg("d"), py::arg("c") = std::nullopt,
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false, py::arg("configs") = std::nullopt);
-    m.def("m_grouped_gemm_fp4_fp4_bf16_nt_nopad", &m_grouped_gemm_fp4_fp4_bf16_nt_nopad,
+    m.def("m_grouped_fp4_gemm_nt_nopad", &m_grouped_fp4_gemm_nt_nopad,
           R"(MoE GroupedNoPad FP4 GEMM.
 
 When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
@@ -1758,7 +1775,7 @@ layout (1, sfm) expected by the Gemm2 SFA reader. Unlike the masked variant, bot
           py::arg("m_rows") = std::nullopt, py::arg("compiled_dims") = "nk",
           py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt, py::arg("configs") = std::nullopt,
           py::arg("activation_type") = std::nullopt);
-    m.def("m_grouped_gemm_fp4_fp4_bf16_nt_masked", &m_grouped_gemm_fp4_fp4_bf16_nt_masked,
+    m.def("m_grouped_fp4_gemm_nt_masked", &m_grouped_fp4_gemm_nt_masked,
           R"(MoE GroupedMasked FP4 GEMM.
 
 When `out_scale` is not None, silu_and_mul + mxfp4 post-quant are fused into the epilogue:
@@ -1801,21 +1818,21 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
           py::arg("out"), py::arg("m_rows"), py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
           py::arg("aligned_num_m_blocks"), py::arg("configs"));
     // BF16 Fused MoE GEMM
-    m.def("m_grouped_gemm_bf16_bf16_bf16_nt_fused", &m_grouped_gemm_bf16_bf16_bf16_nt_fused,
+    m.def("m_grouped_bf16_gemm_nt_fused", &m_grouped_bf16_gemm_nt_fused,
           py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),
           py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
           py::arg("aligned_num_m_blocks"), py::arg("configs"));
     // FP8/INT8 Fused MoE GEMMs
-    m.def("m_grouped_gemm_fp8_fp8_bf16_nt_fused", &m_grouped_gemm_fp8_fp8_bf16_nt_fused,
+    m.def("m_grouped_fp8_gemm_nt_fused", &m_grouped_fp8_gemm_nt_fused,
           py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),
           py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
           py::arg("aligned_num_m_blocks"), py::arg("configs"));
-    m.def("m_grouped_gemm_int8_int8_bf16_nt_fused", &m_grouped_gemm_int8_int8_bf16_nt_fused,
+    m.def("m_grouped_int8_gemm_nt_fused", &m_grouped_int8_gemm_nt_fused,
           py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),
           py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
           py::arg("aligned_num_m_blocks"), py::arg("configs"));
     // FP4 Fused MoE GEMM
-    m.def("m_grouped_gemm_fp4_fp4_bf16_nt_fused", &m_grouped_gemm_fp4_fp4_bf16_nt_fused,
+    m.def("m_grouped_fp4_gemm_nt_fused", &m_grouped_fp4_gemm_nt_fused,
           py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"),
           py::arg("expert_ids_and_cumsum"), py::arg("sorted_token_ids"),
           py::arg("aligned_num_m_blocks"), py::arg("configs"),
