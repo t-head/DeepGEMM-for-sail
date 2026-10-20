@@ -24,7 +24,7 @@ constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 
 // Make a templated GEMM
-using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, GemmType::BatchGemm>;
+using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, GemmType::Batched>;
 
 // Launch kernel
 gemm_t::run(d, a, b, sfa,
@@ -49,7 +49,7 @@ constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 
 // Make a templated grouped GEMM
-using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::BatchGemm>;
+using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::Batched>;
 
 // Launch kernel
 gemm_t::run(d, nullptr, nullptr,
@@ -304,7 +304,7 @@ def fp8_bmm(a: torch.Tensor, sfa: torch.Tensor,
     if configs is not None:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, groups, num_sms, gemm_type=GemmType.BatchGemm)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, groups, num_sms, gemm_type=GemmType.Batched)
 
     args = (a, sfa, b, sfb, d, m, torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
@@ -358,7 +358,7 @@ def int8_bmm(a: torch.Tensor, sfa: torch.Tensor,
     if configs is not None:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_int8_configs(m, n, k, groups, num_sms, gemm_type=GemmType.BatchGemm)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_int8_configs(m, n, k, groups, num_sms, gemm_type=GemmType.Batched)
 
     args = (a, sfa, b, sfb, d, m, torch.cuda.current_stream(), num_sms, smem_config[0])
 

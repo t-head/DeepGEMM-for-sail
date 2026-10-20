@@ -24,7 +24,7 @@ constexpr auto kNumGroups = 1;
 constexpr auto kNumStages = {NUM_STAGES};
 
 using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N,
-                    kNumGroups, kNumStages, GemmType::DenseGemm>;
+                    kNumGroups, kNumStages, GemmType::Normal>;
 
 gemm_t::run(out, nullptr, nullptr,
             m, 0, lhs, rhs,
@@ -50,7 +50,7 @@ constexpr auto kNumStages = {NUM_STAGES};
 constexpr bool kIsAlignedN = {IS_ALIGNED_N};
 
 // Make a templated BF16 DenseGemm (no SHAPE_N/K in template - uses runtime args)
-using gemm_t = BF16DenseGemm<ElementAB, ElementAcc, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumStages, {DENSE_S2_OPT}, KernelType::{KERNEL_TYPE}, kIsAlignedN>;
+using gemm_t = BF16DenseGemm<ElementAB, ElementAcc, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumStages, {DENSE_S2_OPT}, KernelStrategy::{KERNEL_STRATEGY}, kIsAlignedN>;
 
 // Launch kernel
 gemm_t::run(out, m, n, k, lhs, rhs,
@@ -194,15 +194,15 @@ def get_adaptive_configs_bf16(m: int, n: int, k: int, num_sms: int):
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     gemm_type: GemmType=GemmType.DenseGemm, max_block_n: int = 256) -> \
+                     gemm_type: GemmType=GemmType.Normal, max_block_n: int = 256) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
 
     # Adaptive tile selector for bf16 DenseGemm on PPU1.5
-    if is_bf16_adaptive_enabled(m, n, k) and is_ppu1v5_device() and gemm_type == GemmType.DenseGemm:
+    if is_bf16_adaptive_enabled(m, n, k) and is_ppu1v5_device() and gemm_type == GemmType.Normal:
         return get_adaptive_configs_bf16(m, n, k, num_sms)
 
     #FIXME: block m can add 16, and blockM/N could be 512
-    if gemm_type != GemmType.GroupedContiguous:
+    if gemm_type != GemmType.MGroupedContiguous:
         # block_ms = (32, 64, 128, 256)
         block_ms = (256, 128, 64, 32, 16) if k >= 384 else (64, 32, 16)
     else:
@@ -224,7 +224,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
-    min_n_threshold = 1 if gemm_type == GemmType.DenseGemm else 32
+    min_n_threshold = 1 if gemm_type == GemmType.Normal else 32
     for block_m in block_ms:
         if is_ppu1v5_device() and ((m >= 128 and k > 2048) or m >= 256):
             block_ns_after_filter = filter(lambda bn: (bn != n and n >= min_n_threshold) and not (block_m == 16 and bn <= 32), block_ns)
@@ -449,7 +449,7 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
         else:
             dense_s2_opt = False
 
-    kernel_type = 'Default'
+    kernel_strategy = 'Default'
 
     if is_ppu1v5_device():
         # PPU1.5 DenseGemm path: N and K are runtime args, not compile keys.
@@ -459,7 +459,7 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
             keys={'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                   'WARP_M': warp_m, 'WARP_N': warp_n, 'WARP_K': warp_k,
                   'NUM_STAGES': num_stages,
-                  'KERNEL_TYPE': kernel_type,
+                  'KERNEL_STRATEGY': kernel_strategy,
                   'DENSE_S2_OPT': 'true' if dense_s2_opt else 'false',
                   'IS_ALIGNED_N': 'true' if n % block_n == 0 else 'false'},
             space=(),

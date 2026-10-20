@@ -303,7 +303,7 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
 def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_sms: int,
                      has_bias: bool,
                      enable_act_and_quant_fusing: bool,
-                     gemm_type: GemmType=GemmType.DenseGemm,
+                     gemm_type: GemmType=GemmType.Normal,
                      max_block_n: int = 256,
                      min_block_n: int = 32) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
@@ -318,7 +318,7 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
     #       configs = lookup_best_config(total_m, n, k * 2, num_groups, False)
     #   if configs is not None:
     #       return configs
-    if gemm_type == GemmType.DenseGemm:
+    if gemm_type == GemmType.Normal:
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing)
 
     block_ms = (256, 128, 64, 32, 16) if k > 768 else (128, 64, 32, 16)
@@ -689,7 +689,7 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
         name='gemm_fp4_fp4_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': 1,
-              'NUM_STAGES': num_stages,'GEMM_TYPE': 'DenseGemm', 'HAS_BIAS': has_bias},
+              'NUM_STAGES': num_stages,'GEMM_TYPE': 'Normal', 'HAS_BIAS': has_bias},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),

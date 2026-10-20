@@ -27,8 +27,8 @@ constexpr auto kNumGroups = 1;
 constexpr auto kNumStages = {NUM_STAGES};
 
 using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
-                    WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm,
-                    false, KernelType::{KERNEL_TYPE}>;
+                    WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::Normal,
+                    false, KernelStrategy::{KERNEL_STRATEGY}>;
 
 gemm_t::run(out, nullptr, nullptr,
             m, 0, (ElementAB*)lhs, lhs_scales, (ElementAB*)rhs, rhs_scales,
@@ -54,7 +54,7 @@ constexpr auto kNumStages = {NUM_STAGES};
 constexpr bool kIsAlignedN = {IS_ALIGNED_N};
 
 // Make a templated DenseGemm (no SHAPE_N/K in template - uses runtime args)
-using gemm_t = DenseGemm<ElementAB, ElementAcc, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumStages, {DENSE_S2_OPT}, KernelType::{KERNEL_TYPE}, kIsAlignedN>;
+using gemm_t = DenseGemm<ElementAB, ElementAcc, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumStages, {DENSE_S2_OPT}, KernelStrategy::{KERNEL_STRATEGY}, kIsAlignedN>;
 
 // Launch kernel
 gemm_t::run(out, m, n, k, (ElementAB*)lhs, lhs_scales, (ElementAB*)rhs, rhs_scales,
@@ -268,13 +268,13 @@ def get_best_configs_dense_ppu1v5(m: int, n: int, k: int, num_groups: int, num_s
 
 @lru_cache(maxsize=None)
 def get_best_configs_ppu1v5(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     gemm_type: GemmType = GemmType.DenseGemm, max_block_n: int = 256) -> \
+                     gemm_type: GemmType = GemmType.Normal, max_block_n: int = 256) -> \
         Tuple[int, int, int, int, int, int, int, int, int, dict]:
-    if gemm_type == GemmType.DenseGemm or gemm_type == GemmType.BatchGemm:
+    if gemm_type == GemmType.Normal or gemm_type == GemmType.Batched:
        return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms)
 
     #FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
-    if gemm_type != GemmType.GroupedContiguous:
+    if gemm_type != GemmType.MGroupedContiguous:
         block_ms = (256, 128, 64, 32, 16) if k >= 384 else (128, 64, 32, 16)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
@@ -466,7 +466,7 @@ def get_adaptive_configs_int8(m: int, n: int, k: int, num_sms: int):
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     gemm_type: GemmType = GemmType.DenseGemm,
+                     gemm_type: GemmType = GemmType.Normal,
                      max_block_n: int = 256) -> \
         Tuple[int, int, int, int, int, int, int, int, int, dict]:
     lut_result = get_best_configs_from_lut(m, n, k)
@@ -475,12 +475,12 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         best_smem_config = get_smem_config(best_stages, k, best_block_m, best_block_n, best_block_k, 1)
         return num_sms, best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages, best_smem_config
     # Adaptive tile selector for int8 DenseGemm on PPU1.5
-    if is_int8_adaptive_enabled(m, n, k) and is_ppu1v5_device() and gemm_type == GemmType.DenseGemm:
+    if is_int8_adaptive_enabled(m, n, k) and is_ppu1v5_device() and gemm_type == GemmType.Normal:
         return get_adaptive_configs_int8(m, n, k, num_sms)
     if is_ppu1v5_device():
         return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, gemm_type, max_block_n)
     #FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
-    if gemm_type != GemmType.GroupedContiguous:
+    if gemm_type != GemmType.MGroupedContiguous:
         block_ms = (256, 128, 64, 32, 16) if k > 384 else (64, 32, 16)
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
@@ -498,7 +498,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
-    min_n_threshold = 1 if gemm_type == GemmType.DenseGemm else 32
+    min_n_threshold = 1 if gemm_type == GemmType.Normal else 32
     for block_m in block_ms:
         # NOTES:
         # for PPU1.0: the block sizes can not be too large, so at least one dim less than 128
@@ -675,9 +675,9 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Do nothing if `m` is zero
     if m == 0:
         return
-    kernel_type = 'Default'
+    kernel_strategy = 'Default'
     # if k < 4096:
-    #     kernel_type = 'OverlapPrologue'
+    #     kernel_strategy = 'OverlapPrologue'
 
     # Auto-tuning with compilation
     num_sms = get_num_sms()
@@ -710,7 +710,7 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
                   'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                   'WARP_M': warp_m, 'WARP_N': warp_n, 'WARP_K': warp_k,
                   'NUM_STAGES': num_stages,
-                  'KERNEL_TYPE': kernel_type,
+                  'KERNEL_STRATEGY': kernel_strategy,
                   'DENSE_S2_OPT': 'true' if dense_s2_opt else 'false',
                   'IS_ALIGNED_N': 'true' if n % block_n == 0 else 'false'},
             space=(),
@@ -731,7 +731,7 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
             keys={'ElementAB': ElementAB, 'ElementAcc': ElementAcc,
                   'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                   'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages,
-                  'KERNEL_TYPE': kernel_type},
+                  'KERNEL_STRATEGY': kernel_strategy},
             space=(),
             includes=includes_int8_cutlass3,
             arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),

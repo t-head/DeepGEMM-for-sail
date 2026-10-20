@@ -44,7 +44,7 @@ class MNKDict:
         return self.tiles[key][best_m]
 
 @lru_cache(maxsize=None)
-def get_best_configs_from_lut(m: int, n: int, k: int, groups: int, gemm_type: GemmType=GemmType.DenseGemm) -> \
+def get_best_configs_from_lut(m: int, n: int, k: int, groups: int, gemm_type: GemmType=GemmType.Normal) -> \
     Tuple[int, int, int, int, int, int]:
     fp8_dense_list = {
         ( 64, 2304, 4096): ( 32,  64, 128, 16, 32, 5),
@@ -72,9 +72,9 @@ def get_best_configs_from_lut(m: int, n: int, k: int, groups: int, gemm_type: Ge
         (  32,   256,  2048, ( 64, 256, 128, 32, 64, 3)),
     ])
 
-    if gemm_type == GemmType.GroupedNoPad:
+    if gemm_type == GemmType.MGroupedNoPad:
         return fp8_nopad_list.query(m, n, k)
-    elif gemm_type == GemmType.DenseGemm:
+    elif gemm_type == GemmType.Normal:
         m_aligned = ((m + 15) // 16) * 16
         key = (m_aligned, n, k)
         if key in fp8_dense_list.keys():

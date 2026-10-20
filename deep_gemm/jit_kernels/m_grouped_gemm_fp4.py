@@ -164,7 +164,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing, gemm_type=GemmType.GroupedNoPad)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing, gemm_type=GemmType.MGroupedNoPad)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
         # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
 
@@ -195,7 +195,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
         name='m_grouped_gemm_fp4_fp4_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': num_groups,
-              'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': False, 'GEMM_TYPE': 'GroupedNoPad', 'N_EXPAND' : n_expand, 'HAS_BIAS': has_bias, 'DynamicTileId': 'Disabled', 'EPILOGUE_TYPE': epilogue_type, 'kApplySwigluLimit': kApplySwigluLimit},
+              'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': False, 'GEMM_TYPE': 'MGroupedNoPad', 'N_EXPAND' : n_expand, 'HAS_BIAS': has_bias, 'DynamicTileId': 'Disabled', 'EPILOGUE_TYPE': epilogue_type, 'kApplySwigluLimit': kApplySwigluLimit},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),
@@ -309,7 +309,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing, gemm_type=GemmType.GroupedMasked)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, expected_m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing, gemm_type=GemmType.MGroupedMasked)
         # num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages = (num_sms, 256, 256, 128, 64, 64, 3)
         # smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k)
 
@@ -339,7 +339,7 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages, 'ENABLE_SBO_OVERLAP': enable_sbo_overlap,
-              'GEMM_TYPE': 'GroupedMasked', 'N_EXPAND' : n_expand, 'HAS_BIAS': has_bias,
+              'GEMM_TYPE': 'MGroupedMasked', 'N_EXPAND' : n_expand, 'HAS_BIAS': has_bias,
               'DynamicTileId': DynamicTileId, 'EPILOGUE_TYPE': epilogue_type, 'kApplySwigluLimit': kApplySwigluLimit},
         space=(),
         includes=includes,

@@ -26,7 +26,7 @@ constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
 
 // Make a templated grouped GEMM
-using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelType::{KERNEL_TYPE}>;
+using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelStrategy::{KERNEL_STRATEGY}>;
 
 // Launch kernel
 gemm_t::run(out, grouped_layout, block_m_info,
@@ -95,7 +95,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedContiguous)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, gemm_type=GemmType.MGroupedContiguous)
     expected_m = ceil_div(m, num_groups)
 
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
@@ -107,7 +107,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
             torch.cuda.current_stream(), num_sms, smem_config[0], torch.empty(0).int())
 
     ## Default, MultistageOnN, OverlapPrologue, OverlapMainloop
-    kernel_type = 'Default'
+    kernel_strategy = 'Default'
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_int8_int8_bf16_nt',
         keys={'ElementAB' : ElementAB, "ElementAcc" : ElementAcc,
@@ -116,8 +116,8 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'ENABLE_SBO_OVERLAP': False,
-              'GEMM_TYPE': 'GroupedContiguous',
-              'KERNEL_TYPE': kernel_type},
+              'GEMM_TYPE': 'MGroupedContiguous',
+              'KERNEL_STRATEGY': kernel_strategy},
         space=(),
         includes=includes_cutlass3,
         arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
@@ -182,10 +182,10 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedMasked, max_block_n=max_block_n)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.MGroupedMasked, max_block_n=max_block_n)
 
     ## Default, MultistageOnN, MoeDynamicTile, OverlapPrologue, OverlapMainloop
-    kernel_type = 'Default'
+    kernel_strategy = 'Default'
 
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
@@ -203,7 +203,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
     if enable_moe_dynamic_tile:
         # fix the block config to avoid unecessary jit compile
         block_m, block_n, block_k, warp_m, warp_n, num_stages = (128, 128, 128, 64, 64, 3)
-        kernel_type = 'MoeDynamicTile'
+        kernel_strategy = 'MoeDynamicTile'
 
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
@@ -217,8 +217,8 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
               'WARP_M': warp_m, 'WARP_N': warp_n,
               'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
               'ENABLE_SBO_OVERLAP': enable_sbo_overlap,
-              'GEMM_TYPE': 'GroupedMasked',
-              'KERNEL_TYPE': kernel_type},
+              'GEMM_TYPE': 'MGroupedMasked',
+              'KERNEL_STRATEGY': kernel_strategy},
         space=(),
         includes=includes_cutlass3,
         arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
@@ -324,19 +324,19 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
         if configs:
             num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
         else:
-            num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedNoPad)
+            num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.MGroupedNoPad)
 
         ## Default, MultistageOnN, MoeDynamicTile, OverlapPrologue, OverlapMainloop
-        kernel_type = 'Default'
+        kernel_strategy = 'Default'
         if k < 4096:
-            kernel_type = 'OverlapPrologue'
+            kernel_strategy = 'OverlapPrologue'
 
         ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
         ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
         # if enable_moe_dynamic_tile:
         #     # fix the block config to avoid unecessary jit compile
         #     block_m, block_n, block_k, warp_m, warp_n, num_stages = (128, 128, 128, 64, 64, 3)
-        #     kernel_type = 'MoeDynamicTile'
+        #     kernel_strategy = 'MoeDynamicTile'
 
         if m_rows is None:
             counts = torch.bincount(m_indices)
@@ -361,8 +361,8 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
                   'WARP_M': warp_m, 'WARP_N': warp_n,
                   'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
                   'ENABLE_SBO_OVERLAP': False,
-                  'GEMM_TYPE': 'GroupedNoPad',
-                  'KERNEL_TYPE': kernel_type
+                  'GEMM_TYPE': 'MGroupedNoPad',
+                  'KERNEL_STRATEGY': kernel_strategy
                   },
             space=(),
             includes=includes_cutlass3,

@@ -29,7 +29,7 @@ constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
 // Make a templated grouped GEMM
 using fused_moe_gemm = FusedMoeGemm<N, K, kNumGroups,
             BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumStages,
-            GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelType::{KERNEL_TYPE}>;
+            GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelStrategy::{KERNEL_STRATEGY}>;
 
 // Launch kernel
 fused_moe_gemm::run(out, lhs, rhs, m_rows, expert_ids_and_cumsum, sorted_token_ids,
@@ -56,7 +56,7 @@ constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
 // Make a templated grouped GEMM
 using fused_moe_gemm_with_blkwise_quant = FusedMoeGemmWithBlkwiseQuant<
             N, K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumStages,
-            GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelType::{KERNEL_TYPE}>;
+            GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelStrategy::{KERNEL_STRATEGY}>;
 
 // Launch kernel
 fused_moe_gemm_with_blkwise_quant::run(out, lhs, rhs, lhs_scales, rhs_scales,
@@ -85,7 +85,7 @@ constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
 // Make a templated grouped GEMM
 using fused_moe_gemm_with_perchannel_quant = FusedMoeGemmWithPerChannelQuant<
             SrcT, N, K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumStages,
-            GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelType::{KERNEL_TYPE}>;
+            GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelStrategy::{KERNEL_STRATEGY}>;
 
 // Launch kernel
 fused_moe_gemm_with_perchannel_quant::run(out, lhs, rhs, lhs_scales, rhs_scales,
@@ -127,7 +127,7 @@ constexpr auto kApplySwigluLimit = {kApplySwigluLimit};
 // Make a templated grouped GEMM
 using fused_moe_gemm_fp4 = Fp4FusedMoeGemm<N, K, kNumGroups,
             BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumStages,
-            GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelType::{KERNEL_TYPE},
+            GemmType::{GEMM_TYPE}, kEnableSboOverlap, KernelStrategy::{KERNEL_STRATEGY},
             EpilogueType::{EPILOGUE_TYPE}, kApplySwigluLimit>;
 
 // Launch kernel
@@ -197,19 +197,19 @@ def moe_align_block_size(
         expected_m = ceil_div(numel, num_groups)
         num_sms = get_num_sms()
         if w4a16_type is not None:
-            config = w4a16_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused, w4a16_type)
+            config = w4a16_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.MGroupedFused, w4a16_type)
         elif dtype == torch.bfloat16:
-            config = bf16_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
+            config = bf16_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.MGroupedFused)
         elif perchannel_quant:
-            config = perchannel_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
+            config = perchannel_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.MGroupedFused)
         elif dtype == torch.float8_e4m3fn:
-            config = fp8_blkwise_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.GroupedFused)
+            config = fp8_blkwise_get_best_configs(expected_m, n, k, num_groups, num_sms, GemmType.MGroupedFused)
         elif dtype == torch.uint8:
             ### the fused MoE fp4 kernel has no bias path, and the `block_n >= 64` clamp required by
             ### the fused epilogue is applied inside fp4_get_best_configs
             config = fp4_get_best_configs(numel, expected_m, n, k, num_groups, num_sms, has_bias=False,
                                           enable_act_and_quant_fusing=enable_act_and_quant_fusing,
-                                          gemm_type=GemmType.GroupedFused)
+                                          gemm_type=GemmType.MGroupedFused)
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
     block_m = config[1]
@@ -348,15 +348,15 @@ def m_grouped_gemm_bf16_bf16_bf16_nt_fused(lhs: torch.Tensor,
     args = (lhs, rhs, out, m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks,
             num_token, topk, torch.cuda.current_stream(), int(num_sms))
 
-    kernel_type = 'Default'
+    kernel_strategy = 'Default'
     runtime = jit_tuner.compile_and_tune(
         name='fusedmoe_gemm_bf16_bf16_bf16_nt',
         keys={'N': n, 'K': k, 'NUM_GROUPS': num_groups,
                 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                 'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages,
                 'ENABLE_SBO_OVERLAP': False,
-                'GEMM_TYPE': 'GroupedFused',
-                'KERNEL_TYPE': kernel_type},
+                'GEMM_TYPE': 'MGroupedFused',
+                'KERNEL_STRATEGY': kernel_strategy},
         space=(),
         includes=includes_fusedmoe_gemm,
         arg_defs=(('lhs', torch.bfloat16),
@@ -431,15 +431,15 @@ def m_grouped_gemm_perchannel_nt_fused(lhs_: Tuple[torch.Tensor],
             num_token, topk, torch.cuda.current_stream(), int(num_sms))
 
     SrcT = "__hg_fp8_e4m3" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
-    kernel_type = 'Default'
+    kernel_strategy = 'Default'
     runtime = jit_tuner.compile_and_tune(
         name='fusedmoe_gemm_a8w8_nt_' + SrcT,
         keys={'SrcT' : SrcT, 'N': n, 'K': k, 'NUM_GROUPS': num_groups,
                 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                 'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages,
                 'ENABLE_SBO_OVERLAP': False,
-                'GEMM_TYPE': 'GroupedFused',
-                'KERNEL_TYPE': kernel_type},
+                'GEMM_TYPE': 'MGroupedFused',
+                'KERNEL_STRATEGY': kernel_strategy},
         space=(),
         includes=includes_fusedmoe_gemm_with_perchannel_quant,
         arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
@@ -522,15 +522,15 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
             expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks,
             num_token, topk, torch.cuda.current_stream(), int(num_sms))
 
-    kernel_type = 'Default'
+    kernel_strategy = 'Default'
     runtime = jit_tuner.compile_and_tune(
         name='fusedmoe_gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'NUM_GROUPS': num_groups,
                 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                 'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages,
                 'ENABLE_SBO_OVERLAP': False,
-                'GEMM_TYPE': 'GroupedFused',
-                'KERNEL_TYPE': kernel_type},
+                'GEMM_TYPE': 'MGroupedFused',
+                'KERNEL_STRATEGY': kernel_strategy},
         space=(),
         includes=includes_fusedmoe_gemm_with_blkwise_quant,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
@@ -655,15 +655,15 @@ def m_grouped_gemm_fp4_fp4_bf16_nt_fused(lhs_: Tuple[torch.Tensor],
             expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks,
             num_token, topk, torch.cuda.current_stream(), int(num_sms),
             out_scale, swiglu_limit_)
-    kernel_type = 'Default'
+    kernel_strategy = 'Default'
     runtime = jit_tuner.compile_and_tune(
         name='fusedmoe_gemm_fp4_fp4_bf16_nt',
         keys={'N': n, 'K': k, 'NUM_GROUPS': num_groups,
                 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
                 'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages,
                 'ENABLE_SBO_OVERLAP': False,
-                'GEMM_TYPE': 'GroupedFused',
-                'KERNEL_TYPE': kernel_type,
+                'GEMM_TYPE': 'MGroupedFused',
+                'KERNEL_STRATEGY': kernel_strategy,
                 'EPILOGUE_TYPE': epilogue_type,
                 'kApplySwigluLimit': kApplySwigluLimit},
         space=(),

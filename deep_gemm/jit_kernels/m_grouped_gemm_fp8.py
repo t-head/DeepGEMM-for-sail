@@ -119,7 +119,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs_: Tuple[torch.Tensor, torch.Te
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedContiguous)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, gemm_type=GemmType.MGroupedContiguous)
     expected_m = ceil_div(m, num_groups)
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices, m_indices, m, expected_m,
@@ -133,7 +133,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs_: Tuple[torch.Tensor, torch.Te
               'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages,
               'ENABLE_SBO_OVERLAP': False,
-              'GEMM_TYPE': 'GroupedContiguous'},
+              'GEMM_TYPE': 'MGroupedContiguous'},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
@@ -214,7 +214,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedMasked, max_block_n=max_block_n)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.MGroupedMasked, max_block_n=max_block_n)
 
     # Extra checks for TMA store
     # if num_groups > 1 and m > block_m:
@@ -232,7 +232,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs_: Tuple[torch.Tensor, torch.Tensor
               'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages,
               'ENABLE_SBO_OVERLAP': enable_sbo_overlap,
-              'GEMM_TYPE': 'GroupedMasked'},
+              'GEMM_TYPE': 'MGroupedMasked'},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
@@ -322,7 +322,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
-        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedNoPad)
+        num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.MGroupedNoPad)
 
     if m_rows is None:
         counts = torch.bincount(m_indices)
@@ -350,7 +350,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs_: Tuple[torch.Tensor, torch.Tensor]
             'BLOCK_N_PADDING': smem_config[2],
             'NUM_GROUPS': num_groups, 'NUM_STAGES': num_stages,
             'ENABLE_SBO_OVERLAP': False,
-            'GEMM_TYPE': 'GroupedNoPad'},
+            'GEMM_TYPE': 'MGroupedNoPad'},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
