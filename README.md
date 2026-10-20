@@ -6,7 +6,7 @@ This repository is a PPU-oriented fork of [DeepGEMM](https://github.com/deepseek
 
 DeepGEMM for PPU focuses on the supported core computation primitives used by dense models, MoE models, and related LLM workloads. The fork updates the build and runtime path for the PPU SDK environment, replaces the original device-specific assumptions with PPU-oriented execution requirements, and extends the supported layouts and data types for PPU use cases.
 
-Supported PPU platforms include ZW 610 / 610E / 810 / 810E / M890. Runtime compilation is handled through the PPU toolchain, with HGCC / HGRTC support exposed through the JIT configuration options.
+Supported PPU platforms include Zhenwu 610 / 610E / 810 / 810E / M890. Runtime compilation is handled through the PPU toolchain, with HGCC / HGRTC support exposed through the JIT configuration options.
 
 ## Core Features and Optimizations
 
@@ -30,7 +30,7 @@ Highlights:
 - Native PPU runtime and JIT compilation through HGCC and HGRTC.
 - BF16, INT8, FP8, and MXFP4 GEMM kernels across supported dense and grouped layouts, with W4A16 support for no-pad, masked, and fused MoE workloads.
 - Fused MoE with implicit permutation, MQA and paged MQA scoring, a TF32 HyperConnection prenorm GEMM, and FP8/INT8 einsum.
-- Support for ZW 610 / 610E / 810 / 810E / M890 platforms.
+- Support for Zhenwu 610 / 610E / 810 / 810E / M890 platforms.
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 
@@ -38,7 +38,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 
 ### Requirements
 
-- ZW 610 / 610E / 810 / 810E / M890
+- Zhenwu 610 / 610E / 810 / 810E / M890
 - Python 3.8 or above
 - PPU SDK 12.3 or above
 - PyTorch 2.1 or above
