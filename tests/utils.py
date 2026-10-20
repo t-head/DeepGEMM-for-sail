@@ -767,7 +767,10 @@ def construct_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: 
     else:
         ref_out = torch.empty_like(out)
 
-    max_signal_size = num_groups * ceil_div(max_m, 64)
+    # The kernel strides `signal` by ceil_div(m, BLOCK_M) of the tile it actually selected, which is
+    # only known after the call. Size for the smallest BLOCK_M the INT8 heuristics can return (16) so
+    # that A8W4's small-M tiles (BM16/BM32) cannot write past the buffer.
+    max_signal_size = num_groups * ceil_div(max_m, 16)
     signal = torch.zeros(max_signal_size, dtype=torch.int32, device=tensor_device) if enable_sbo_overlap else torch.empty(0).int()
 
     if d == torch.bfloat16:
@@ -1477,9 +1480,9 @@ def test_m_grouped_gemm_masked(args) -> None:
         elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
             deep_gemm.m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group)
         elif d == 'w4a8_int8':
-            assert not enable_sbo_overlap, "W4A8 INT8 does not support SBO overlap"
             result = deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_masked(
-                x, y, out, masked_m, expected_m_per_group)
+                x, y, out, masked_m, expected_m_per_group,
+                enable_sbo_overlap=enable_sbo_overlap, signal=signal)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
@@ -1543,7 +1546,8 @@ def test_m_grouped_gemm_masked(args) -> None:
                 deep_gemm.m_grouped_gemm_w4a16_masked(x, y, out, masked_m, expected_m_per_group)
             elif d == 'w4a8_int8':
                 result = deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_masked(
-                    x, y, out, masked_m, expected_m_per_group)
+                    x, y, out, masked_m, expected_m_per_group,
+                    enable_sbo_overlap=enable_sbo_overlap, signal=signal)
             else:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)
