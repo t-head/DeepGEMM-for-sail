@@ -38,6 +38,9 @@ GroupedMasked,data_type:fp8,groups:16,m:4096,n:4096,k:7168,em:12,distribution:zi
 
 # --- GroupedMasked / fp4 ---
 GroupedMasked,data_type:fp4,groups:32,m:16384,n:4096,k:4096,em:512,distribution:uniform
+GroupedMasked,data_type:fp4,groups:32,m:16384,n:4096,k:2048,em:512,distribution:uniform
+GroupedMasked,data_type:fp4,groups:32,m:16384,n:4096,k:4096,em:512,distribution:uniform,epilogue_type:SiluAndMulPostQuantFp4,swiglu_limit:10.0000
+GroupedMasked,data_type:fp4,groups:352,m:2048,n:3072,k:4096,em:256,distribution:uniform,epilogue_type:SiluAndMulStepPostQuantFp4,swiglu_limit:7.0000
 
 # --- GroupedMasked / w4a16 ---
 GroupedMasked,data_type:w4a16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
@@ -59,6 +62,9 @@ GroupedNoPad,data_type:fp8,groups:16,m:4096,n:4096,k:7168,distribution:gaussian,
 
 # --- GroupedNoPad / fp4 ---
 GroupedNoPad,data_type:fp4,groups:256,m:4096,n:512,k:4096,em:16,distribution:uniform
+GroupedNoPad,data_type:fp4,groups:256,m:4096,n:4096,k:256,em:16,distribution:uniform
+GroupedNoPad,data_type:fp4,groups:256,m:4096,n:512,k:4096,em:16,distribution:uniform,epilogue_type:SiluAndMulPostQuantFp4,swiglu_limit:10.0000
+GroupedNoPad,data_type:fp4,groups:44,m:2048,n:3072,k:4096,distribution:uniform,epilogue_type:SiluAndMulStepPostQuantFp4,swiglu_limit:7.0000
 
 # --- GroupedNoPad / w4a16 ---
 GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
@@ -93,6 +99,8 @@ GroupedFused,data_type:fp8,groups:256,num_token:1024,topk:8,n:256,k:6144
 
 # --- GroupedFused / fp4 ---
 GroupedFused,data_type:fp4,groups:256,num_token:4096,topk:6,n:512,k:4096,distribution:uniform
+GroupedFused,data_type:fp4,groups:256,num_token:4096,topk:6,n:512,k:4096,distribution:uniform,epilogue_type:SiluAndMulPostQuantFp4,swiglu_limit:10.0000
+GroupedFused,data_type:fp4,groups:44,num_token:256,topk:8,n:3072,k:4096,distribution:uniform,epilogue_type:SiluAndMulStepPostQuantFp4,swiglu_limit:7.0000
 
 # --- GroupedFused / w4a16 ---
 GroupedFused,data_type:w4a16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_type:group,group_size:32
