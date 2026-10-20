@@ -10,8 +10,8 @@
 namespace deep_gemm {
 
 struct LaunchArgs {
-    dim3 grid_dim; // the z dim is always 1
-    dim3 block_dim; // the y,z dims are always 1
+    dim3 grid_dim;
+    dim3 block_dim;
     int smem_size;
 };
 
