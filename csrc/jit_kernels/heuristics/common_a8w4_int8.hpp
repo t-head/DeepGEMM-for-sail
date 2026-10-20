@@ -88,5 +88,48 @@ inline A8W4HeuristicConfig finalize_heuristic_config(
 }
 
 // ============================================================================
+// A8W4 INT8 GroupedNoPad GEMV
+// ============================================================================
+
+struct A8W4GemvConfig {
+    int block_size;
+    int thread_per_n;
+    int n_per_thread;
+    int num_unroll;
+    int swizzle_m;
+};
+
+// Decide whether a GroupedNoPad call with `m` routed rows over `num_groups` experts should use the
+// GEMV kernel, and pick its launch shape. Short K keeps the A8W8 routing gate: GEMV wins through
+// 1.5 rows/expert. For long K, an A8W4 launch-shape scan shows the crossover at 0.5 rows/expert
+// (GLM K=6144: +8.5% at 0.5, but -5.1% by 0.75; EP8 switches to GEMM before 0.67).
+// Every thread consumes one K32 group (16 packed rhs bytes) per step.
+inline bool get_gemv_config(int m, int n, int k, int num_groups, A8W4GemvConfig& config) {
+    if (!((m <= 2 * num_groups * 0.75 && k <= 256) || (m <= 0.5 * num_groups && k > 256)))
+        return false;
+
+    const int num_k32 = k / 32;
+    if (num_k32 <= 32) {
+        // Short K: a single K pass per thread; the scan's robust shape across GLM K=256 is
+        // 64 threads, 8 K threads/output and 8 outputs/thread.
+        int thread_per_n = 1;
+        while (thread_per_n * 2 <= num_k32 && thread_per_n < 8)
+            thread_per_n *= 2;
+        config = {/*block_size=*/64, thread_per_n, /*n_per_thread=*/8, /*num_unroll=*/1, /*swizzle_m=*/1};
+    } else {
+        // Long K: 16 K threads leave 16 independent N lanes in a 256-thread block; four outputs per
+        // lane amortize lhs loads. Unroll two K32 groups and predicate the odd tail in the kernel.
+        config = {/*block_size=*/256, /*thread_per_n=*/16, /*n_per_thread=*/4, /*num_unroll=*/2,
+                  /*swizzle_m=*/1};
+    }
+
+    // The kernel has no N tail: shrink the per-thread N work until full blocks tile N.
+    const int n_loop_step = config.block_size / config.thread_per_n;
+    while (config.n_per_thread > 1 && n % (config.n_per_thread * n_loop_step) != 0)
+        config.n_per_thread /= 2;
+    return n % (config.n_per_thread * n_loop_step) == 0;
+}
+
+// ============================================================================
 
 } // namespace deep_gemm_a8w4_common
