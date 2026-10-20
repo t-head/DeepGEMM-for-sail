@@ -251,6 +251,36 @@ void {}(const GemvtArgs args) {{
     }
 };
 
+class A8W4GemvRuntime final : public LaunchRuntime<A8W4GemvRuntime> {
+public:
+    struct Args {
+        deep_gemm_a8w4_common::A8W4GemvConfig config;
+        std::string kernel_name;
+        LaunchArgs launch_args;
+        GemvRuntime::GemvtArgs kernel_params;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/a8w4_int8_gemvt.cuh>
+namespace deep_gemm {{
+
+extern "C" __global__
+void {}(const GemvtArgs args) {{
+    a8w4_batched_gemvt_kernel_impl<{}, {}, {}, {}, {}>(args);
+}}
+
+}}
+)",
+                           args.kernel_name, args.config.block_size, args.config.thread_per_n,
+                           args.config.n_per_thread, args.config.num_unroll, args.config.swizzle_m);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    }
+};
+
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 
 static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
@@ -635,6 +665,19 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
     return std::make_pair(block_m, ceil_div(n, block_n));
 }
 
+static bool should_use_a8w4_gemv(bool is_a8w4, bool has_explicit_config, const void* lhs_ptr,
+                                 const void* rhs_ptr, int m, int n, int k, int num_groups,
+                                 deep_gemm_a8w4_common::A8W4GemvConfig& config) {
+    // Explicit configs request the tile GEMM; the environment switch supports controlled A/B tests.
+    // The GEMV kernel issues 16-byte vector loads from both operands.
+    // The API guarantees K % 32 == 0, so lhs's K-byte stride and rhs's K/2-byte
+    // stride preserve 16-byte alignment for every row.
+    return is_a8w4 && !has_explicit_config && !get_env<int>("DG_A8W4_DISABLE_GEMV", 0) &&
+           reinterpret_cast<uintptr_t>(lhs_ptr) % 16 == 0 &&
+           reinterpret_cast<uintptr_t>(rhs_ptr) % 16 == 0 &&
+           deep_gemm_a8w4_common::get_gemv_config(m, n, k, num_groups, config);
+}
+
 static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                                                           const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                                                           const torch::Tensor& out, const torch::Tensor& m_indices,
@@ -664,6 +707,66 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         }
     }
     int* layout_info = reinterpret_cast<int32_t*>(m_indices.data_ptr<int32_t>());
+    deep_gemm_a8w4_common::A8W4GemvConfig a8w4_gemv_config;
+    const bool a8w4_use_gemv = should_use_a8w4_gemv(
+        is_a8w4, configs.has_value(), lhs.data_ptr(), rhs.data_ptr(), m, n, k, num_groups, a8w4_gemv_config);
+    if (a8w4_use_gemv) {
+        DgProfParam dg_prof_params;
+        if (ProfilingInterface::Instance().get_op_info()) {
+            dg_prof_params.set_params(GemmType::MGroupedNoPad, true, std::string("w4a8_int8"), num_groups, m, n, k,
+                                      expected_m, m_indices.data_ptr<int32_t>(), current_stream());
+        }
+        const int n_per_block = a8w4_gemv_config.n_per_thread * a8w4_gemv_config.block_size /
+                                a8w4_gemv_config.thread_per_n;
+        auto gemv_args = GemvRuntime::GemvtArgs{
+            .N = n,
+            .K = k,
+            .a_ptr = lhs.data_ptr(),
+            .b_ptr = rhs.data_ptr(),
+            .c_ptr = out.data_ptr(),
+            .topk_weights_ptr = nullptr,
+            .alphaCol = rhs_scales.data_ptr<float>(),
+            .alphaRow = lhs_scales.data_ptr<float>(),
+            .num_tokens = m,
+            .num_experts = num_groups,
+            .expert_ids_ptr = layout_info,
+            .stride_am = k,
+            .stride_ak = 1,
+            .stride_be = static_cast<int64_t>(n) * (k / 2),
+            .stride_bk = 1,
+            .stride_bn = k / 2,
+            .stride_cm = n,
+            .stride_cn = 1,
+        };
+        gemv_args.total_blocks = static_cast<int64_t>(m) * (n / n_per_block);
+        const std::string kernel_name = "a8w4_int8_batched_gemvt_kernel";
+        dim3 grid = static_cast<unsigned>(gemv_args.total_blocks);
+        dim3 block = a8w4_gemv_config.block_size;
+        auto args = A8W4GemvRuntime::Args{.config = a8w4_gemv_config,
+                                          .kernel_name = kernel_name,
+                                          .launch_args = {grid, block, 0},
+                                          .kernel_params = gemv_args};
+        const auto& code = A8W4GemvRuntime::generate(args);
+        const auto& runtime = compiler->build(kernel_name, code);
+        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+        A8W4GemvRuntime::launch(runtime, args);
+        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+        char* pEnv_params = std::getenv("show_log");
+        if (pEnv_params && isdigit(*pEnv_params)) {
+            int numRegs = 0, localSize = 0;
+            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, runtime->kernel);
+            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, runtime->kernel);
+            printf("[GemV-A8W4-INT8:]\n");
+            printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
+            printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, NUM_UNROLL:%d, SWZL_SIZE_M:%d\n",
+                   a8w4_gemv_config.block_size, a8w4_gemv_config.n_per_thread, a8w4_gemv_config.thread_per_n,
+                   n_per_block, a8w4_gemv_config.num_unroll, a8w4_gemv_config.swizzle_m);
+            printf("threadblock_count:%d, vreg:%d, stack:%d\n", int(gemv_args.total_blocks), int(numRegs),
+                   int(localSize));
+        }
+        return;
+    }
     if (use_gemv) {
         DgProfParam dg_prof_params;
         if (ProfilingInterface::Instance().get_op_info()) {
