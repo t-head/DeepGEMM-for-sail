@@ -35,7 +35,7 @@ struct ThreadConfig {
     int num_non_epilogue_threads;
     int num_epilogue_threads;
 
-    static ThreadConfig sm90(const int& num_tma_threads, const int& num_math_threads) {
+    static ThreadConfig with_tma_math_threads(const int& num_tma_threads, const int& num_math_threads) {
         auto config = ThreadConfig();
         config.num_threads = num_tma_threads + num_math_threads;
         config.num_tma_threads = num_tma_threads;
@@ -43,13 +43,6 @@ struct ThreadConfig {
         return config;
     }
 
-    static ThreadConfig sm100(const int& num_non_epilogue_threads, const int& num_epilogue_threads) {
-        auto config = ThreadConfig();
-        config.num_threads = num_non_epilogue_threads + num_epilogue_threads;
-        config.num_non_epilogue_threads = num_non_epilogue_threads;
-        config.num_epilogue_threads = num_epilogue_threads;
-        return config;
-    }
 };
 
 static bool is_multicast_legal(const int& shape_dim, const int& block_dim, const int& num_multicast, const int& num_sms,
