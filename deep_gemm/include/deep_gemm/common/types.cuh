@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cutlass/detail/helper_macros.hpp>
+
 namespace deep_gemm {
 
 enum class MajorType { K = 0, MN = 1 };
@@ -15,6 +17,22 @@ enum class GemmType {
     MGroupedNoPad                       = 7,
     MGroupedFused                       = 8,
 };
+
+constexpr CUTLASS_HOST_DEVICE bool is_m_grouped_contiguous(const GemmType& gemm_type) {
+    switch (gemm_type) {
+        case GemmType::MGroupedContiguous:                  return true;
+        case GemmType::MGroupedContiguousWithPsumLayout:    return true;
+        default: return false;
+    }
+}
+
+constexpr CUTLASS_HOST_DEVICE bool is_k_grouped_contiguous(const GemmType& gemm_type) {
+    switch (gemm_type) {
+        case GemmType::KGroupedContiguous:                  return true;
+        case GemmType::KGroupedContiguousWithPsumLayout:    return true;
+        default: return false;
+    }
+}
 
 inline constexpr const char* GemmTypeS[] = {
     "DenseGemm", "GroupedContiguous", "GroupedMasked", "KGroupedContiguous", "BatchGemm",
