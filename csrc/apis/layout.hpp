@@ -51,7 +51,7 @@ static void register_apis(pybind11::module_& m) {
         .value("BF16", deep_gemm_preprocess_common::PreprocessMode::BF16);
     m.def("preprocess_weights_and_scales",
           [](const deep_gemm_preprocess_common::PreprocessMode mode, bool fuse_activation,
-             const std::optional<torch::Tensor>& weight, const std::optional<const torch::Tensor>& weight_scale) {
+             const std::optional<torch::Tensor>& weight, const std::optional<const torch::Tensor>& weight_scale) -> py::tuple {
               auto result = deep_gemm_preprocess_common::preprocess_weights_and_scales(
                   mode, fuse_activation, weight.value_or(torch::Tensor{}), weight_scale);
               const py::object prepared_weight = result.weight.defined() ? py::cast(result.weight) : py::none();
