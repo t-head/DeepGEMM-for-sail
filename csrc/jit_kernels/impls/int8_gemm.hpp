@@ -442,7 +442,8 @@ constexpr int NUM_GROUPS = {5};
 constexpr int WARP_M = {6};
 constexpr int WARP_N = {7};
 constexpr int STAGES = {8};
-constexpr bool kA8W4Int8 = {21};
+#define DG_A8W4_INT8 {21}
+constexpr bool kA8W4Int8 = DG_A8W4_INT8;
 
 #if __HGGC_ARCH__ == 100
 using ArchTag = cutlass::arch::PPU0010;
@@ -519,16 +520,11 @@ using SmemCopyAtomB = typename DefaultOperandB::SmemCopyAtom;
 using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
 
 // Mainloop
-using A8W8CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-    ArchTag,
-    DispatchPolicy, TileShape,
-    ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
-    ElementA, cutlass::detail::TagToStrideB_t<LayoutB>,
-    TiledMma,
-    GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,  // A
-    GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity   // B
->;
-#if __HGGC_ARCH__ == 100
+// Select the mainloop with #if, not a runtime conditional_t: conditional_t instantiates both
+// branches, so A8W4's static_asserts (BlockK % 64, Stages >= 2) would also constrain every A8W8
+// kernel sharing this template. The #else keeps the upstream A8W8 definition verbatim, so A8W4 is
+// a purely additive overlay and neither path instantiates the other's types.
+#if __HGGC_ARCH__ == 100 && DG_A8W4_INT8
 static_assert(cute::is_same_v<ElementA, int8_t>, "PPU0010 INT8 runtime requires INT8 operands");
 // A8W4 reuses the A8W8 MMA atom and A operand; only the value tile expands from K32 to K64,
 // while B uses the packed-INT4 copy/layout definitions.
@@ -553,11 +549,18 @@ using A8W4CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
     typename A8W4DefaultOperandB::SmemLayoutAtom,
     typename A8W4DefaultOperandB::SmemCopyAtom,
     cute::identity>;
+using CollectiveMainloop = A8W4CollectiveMainloop;
 #else
-static_assert(!kA8W4Int8, "A8W4 INT8 is only supported on PPU0010");
-using A8W4CollectiveMainloop = A8W8CollectiveMainloop;
+using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+    ArchTag,
+    DispatchPolicy, TileShape,
+    ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
+    ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
+    TiledMma,
+    GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,  // A
+    GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity   // B
+>;
 #endif
-using CollectiveMainloop = cute::conditional_t<kA8W4Int8, A8W4CollectiveMainloop, A8W8CollectiveMainloop>;
 // Epilogue
 static constexpr bool IsAlignedN = SHAPE_N % BLOCK_N == 0 ? true : false;
 // reduce vreg to use ScaleType::Nothing for alpha=1 & beta=0
@@ -652,7 +655,7 @@ __global__ void {14}(
                            args.type_info, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_strategy,
                            args.launch_info.gemm_type, args.launch_info.transposed_batch_output, args.launch_info.kernel_name,
                            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
-                           with_tsm_epilogue, host_params_size, args.launch_info.a8w4_int8);
+                           with_tsm_epilogue, host_params_size, static_cast<int>(args.launch_info.a8w4_int8));
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {

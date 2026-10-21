@@ -419,12 +419,16 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
             nst, k, bm, bn, bk, /*bpp=*/1,
             /*element_b_bits=*/is_a8w4 ? 4 : 8);
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst, smem_config);
+    } else if (is_a8w4) {
+        const auto lut_kind = deep_gemm_a8w4_common::get_a8w4_lut_kind();
+        cfg = deep_gemm_a8w4_common::get_best_configs(
+            expected_m, n, k, num_groups, num_sms, GemmType::MGroupedMasked,
+            /*runtime_lut_kind=*/lut_kind, /*from_runtime_lut=*/nullptr);
     } else {
-        const auto lut_kind = is_a8w4 ? deep_gemm_int8::get_a8w4_lut_kind()
-                                      : deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
+        const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         cfg = deep_gemm_int8::get_best_configs(
             expected_m, n, k, num_groups, num_sms, GemmType::MGroupedMasked, max_block_n,
-            /*runtime_lut_kind=*/lut_kind, /*from_runtime_lut=*/nullptr, /*is_a8w4=*/is_a8w4);
+            /*runtime_lut_kind=*/lut_kind, /*from_runtime_lut=*/nullptr);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -893,13 +897,17 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
             nst, k, bm, bn, bk, /*bpp=*/1,
             /*element_b_bits=*/is_a8w4 ? 4 : 8);
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst, smem_config);
+    } else if (is_a8w4) {
+        const auto lut_kind = deep_gemm_a8w4_common::get_a8w4_lut_kind();
+        cfg = deep_gemm_a8w4_common::get_best_configs(
+            expected_m, n, k, num_groups, num_sms, GemmType::MGroupedNoPad,
+            /*runtime_lut_kind=*/lut_kind, /*from_runtime_lut=*/nullptr);
     } else {
-        const auto lut_kind = is_a8w4 ? deep_gemm_int8::get_a8w4_lut_kind()
-                                      : deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
+        const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         cfg = deep_gemm_int8::get_best_configs(
             expected_m, n, k, num_groups, num_sms, GemmType::MGroupedNoPad,
             /*max_block_n=*/256, /*runtime_lut_kind=*/lut_kind,
-            /*from_runtime_lut=*/nullptr, /*is_a8w4=*/is_a8w4);
+            /*from_runtime_lut=*/nullptr);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
