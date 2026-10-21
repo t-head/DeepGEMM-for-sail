@@ -226,19 +226,14 @@ except Exception as e:
 
 # MegaMoE compute APIs
 from .deep_gemm_cpp import (
+    fp4_fp4_mega_moe,
+    bf16_fp4_mega_moe,
+    fp8_fp8_mega_moe,
     mega_moe_pre_dispatch,
-    mega_moe_dispatch_gemm1,
-    mega_moe_gemm2_scatter,
-    mega_moe_combine,
 )
 
-# Tuning configuration and load-time weight preparation
-from .deep_gemm_cpp import (
-    MegaMoETuningConfig,
-    get_mega_moe_tuning_config,
-    interleave_fp8_blockwise_mega_moe_weights,
-    preprocess_w4a16_mxfp4,
-)
+# Load-time weight preparation
+from .deep_gemm_cpp import transform_weights_for_mega_moe
 
 # Symmetric-memory ownership and process-group helpers
 from .mega_moe import get_symm_buffer_for_mega_moe

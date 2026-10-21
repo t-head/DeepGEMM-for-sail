@@ -9,11 +9,12 @@ import os
 import statistics
 import tempfile
 
-import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+from deep_gemm.jit_kernels.utils import is_ppu1v5_device
 
 
 # Per-rank input tokens for production model correctness/performance cases.
@@ -47,9 +48,9 @@ class MoECase:
     worlds: tuple[int, ...] = (1, 2, 4, 8)
     input_scale: float = 1.0
     reference_tokens: int = 8
-    scatter_tile: tuple[int, int, int, int, int, int] | None = None
     precision: str = "w4a4"
     extra_replicas_per_rank: int = 0
+    routing: str = "round_robin"
 
     def require_world(self):
         world = dist.get_world_size()
@@ -64,6 +65,11 @@ def moe_process_group(request=None):
     if not torch.cuda.is_available():
         raise RuntimeError("requires a PPU runtime")
     torch.cuda.set_device(int(os.getenv("LOCAL_RANK", "0")))
+    if not is_ppu1v5_device():
+        message = "MegaMoE requires PPU1.5"
+        if request is not None:
+            pytest.skip(message)
+        raise RuntimeError(message)
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     owned = not dist.is_initialized()
@@ -101,39 +107,10 @@ def moe_group(request):
         yield group
 
 
-class CombineBarrier:
-    """One persistent generation counter per rank and one local completion flag.
-
-    Construct collectively outside graph capture. Reuse on one stream, with
-    the same number of mega_moe_combine calls on every rank, including empty ones.
-    """
-
-    def __init__(self, group):
-        import torch.distributed._symmetric_memory as symm_mem
-
-        world = dist.get_world_size(group)
-        self.flag = symm_mem.empty(1, dtype=torch.int32, device="cuda")
-        self.handle = symm_mem.rendezvous(self.flag, group=group)
-        self.pointers = torch.tensor([
-            self.handle.get_buffer(rank, (1,), torch.int32).data_ptr()
-            for rank in range(world)
-        ], dtype=torch.int64, device="cuda")
-        self.done = torch.zeros(1, dtype=torch.int32, device="cuda")
-        self.flag.zero_()
-        torch.cuda.synchronize()
-        dist.barrier(group=group)
-
-
 def gather(tensor):
     tensors = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
     dist.all_gather(tensors, tensor)
     return torch.stack(tensors)
-
-
-def interleave_gate_up(tensor):
-    experts, n, *rest = tensor.shape
-    return torch.stack((tensor[:, :n // 2].reshape(experts, -1, 8, *rest),
-                        tensor[:, n // 2:].reshape(experts, -1, 8, *rest)), 2).reshape_as(tensor).contiguous()
 
 
 def activation(projection, kind="swiglu", clamp=0.0):
@@ -180,29 +157,105 @@ def split_expert_weights(weights):
     return tuple(t[:-1].clone() for t in weights), tuple(t[-1:].clone() for t in weights)
 
 
+def make_routes(case, tokens, rng):
+    """Distinct top-k experts for balanced, random or 80%-hot routing."""
+    token = torch.arange(tokens, device="cuda")[:, None]
+    slot = torch.arange(case.topk, device="cuda")[None, :]
+    if case.routing == "round_robin":
+        return ((token * case.topk + slot + dist.get_rank() * 17) % case.experts).contiguous()
+    if case.routing not in ("random", "skewed"):
+        raise ValueError(f"unsupported routing distribution: {case.routing}")
+    ids = torch.rand(tokens, case.experts, device="cuda", generator=rng).topk(case.topk, dim=1).indices
+    if case.routing == "skewed":
+        ids = torch.where(token % 5 != 0, slot.expand_as(ids), ids)
+    return ids.contiguous()
+
+
 def make_inputs(case, requested, rng, edge_cases):
     rank, world = dist.get_rank(), dist.get_world_size()
     count = 0 if edge_cases and world > 1 and requested == 1 and rank == world - 1 else requested
     source = torch.randn(requested, case.hidden, device="cuda", dtype=torch.bfloat16,
                          generator=rng) * (0.5 * case.input_scale)
-    token = torch.arange(requested, device="cuda")[:, None]
-    slot = torch.arange(case.topk, device="cuda")[None, :]
-    ids = ((token * case.topk + slot + rank * 17) % case.experts).contiguous()
+    ids = make_routes(case, requested, rng)
     weights = torch.rand(requested, case.topk, device="cuda", generator=rng).softmax(-1)
     ids[count:], weights[count:] = -1, 0
     if edge_cases and count > 1:
-        ids[0, 0], weights[0, 0] = -1, 0
+        # Invalid IDs must mask even a nonzero routing weight.
+        ids[0, 0] = -1
         weights[1, 0] = 0
     return source, ids, weights, count
+
+
+def check_workspace_options(case, group):
+    """All failures must occur before collective symmetric allocation."""
+    import deep_gemm as dg
+
+    options = dict(num_experts=case.experts, num_max_tokens_per_rank=case.capacity,
+                   num_topk=case.topk, hidden=case.hidden, precision=case.precision,
+                   intermediate_hidden=case.intermediate)
+    invalid = [({"precision": "unsupported"}, "precision must be"),
+               ({"intermediate_hidden": 127}, "intermediate_hidden"),
+               ({"hidden": case.hidden + 1}, "hidden must be divisible"),
+               ({"num_topk": 17}, "Invalid MegaMoE"),
+               ({"num_max_tokens_per_rank": 0}, "Invalid MegaMoE")]
+    if case.precision.startswith("fp8_"):
+        invalid += [({"block_m": 16}, "requires block_m="),
+                    ({"block_m": 192}, "requires block_m="),
+                    ({"num_experts": 129 * group.size()}, "at most 128 local physical experts")]
+        if case.precision == "fp8_blockwise":
+            invalid.append(({"block_m": 256}, "blockwise dispatch requires block_m=128"))
+    elif case.precision == "w4a16":
+        invalid += [({"num_experts": 128 * group.size()}, "fewer than 128 local physical experts")]
+    else:
+        invalid += [({"block_m": 16}, "set BLOCK_M through overrides")]
+    for changed, message in invalid:
+        with pytest.raises((ValueError, RuntimeError), match=message):
+            dg.get_symm_buffer_for_mega_moe(group, **{**options, **changed})
+
+
+def check_complete_entry(entry, output, w1, w2, buffer, source, ids, weights, **options):
+    """Reject malformed calls before advancing the collective compute protocol."""
+    import deep_gemm as dg
+
+    with pytest.raises(RuntimeError, match="call mega_moe_pre_dispatch"):
+        entry(output, w1, w2, buffer, **options)
+    dg.mega_moe_pre_dispatch(source, ids, weights, buffer)
+    with pytest.raises(RuntimeError, match="unsupported precision/activation"):
+        entry(output, w1, w2, buffer, **{**options, "activation": "unsupported"})
+    unsupported_activation = {"w4a4": "swiglu_oai", "w4a16": "swiglu",
+                              "fp8_channelwise": "situ", "fp8_blockwise": "situ"}[buffer.precision]
+    with pytest.raises(RuntimeError, match="unsupported precision/activation"):
+        entry(output, w1, w2, buffer, **{**options, "activation": unsupported_activation})
+    for changed, message in (
+        ({"activation_limit": float("nan")}, "activation_limit"),
+        ({"activation_alpha": float("nan")}, "activation_alpha"),
+        ({"situ_beta": float("nan")}, "SiTU parameters|situ_beta"),
+        ({"situ_linear_beta": 0.0}, "SiTU parameters|situ_beta"),
+    ):
+        with pytest.raises(RuntimeError, match=message):
+            entry(output, w1, w2, buffer, **{**options, **changed})
+    with pytest.raises(RuntimeError, match="tensor device, dtype or layout"):
+        entry(output.float(), w1, w2, buffer, **options)
+    bad_w2 = (w2[0][:, :-1].contiguous(), w2[1])
+    with pytest.raises(RuntimeError, match="tensor shape"):
+        entry(output, w1, bad_w2, buffer, **options)
+    other = dg.fp4_fp4_mega_moe if buffer.precision != "w4a4" else dg.bf16_fp4_mega_moe
+    with pytest.raises(RuntimeError, match="does not match workspace precision"):
+        other(output, w1, w2, buffer)
 
 
 def run_forward(case, source, requested, pipeline, reference, *, combine, check=True,
                 reference_tokens=0, max_diff=.0005, max_relative_l2=None,
                 replicas=False, edge_cases=False, benchmark=None, verbose=True,
-                routing_weights=None):
+                routing_weights=None, routing_ids=None, workspace=None):
     """One complete forward for correctness, graph replay and optional end-to-end timing."""
     rank, world, count = dist.get_rank(), dist.get_world_size(), source.shape[0]
     compile_kernels(pipeline)
+    block_info = workspace._gemm2_block_info if workspace is not None else None
+    if block_info is not None:
+        # Scheduler metadata must be regenerated, including after route changes
+        # and replay with empty experts; old contents must never be consumed.
+        block_info.fill_(-1)
     combine.fill_(float("nan"))
     torch.cuda.synchronize()
     dist.barrier()
@@ -211,25 +264,38 @@ def run_forward(case, source, requested, pipeline, reference, *, combine, check=
     report = dict(case=case.name, precision=case.precision, ep=world, tokens_per_rank=counts,
                   hidden=case.hidden, intermediate=case.intermediate, experts=case.experts,
                   capacity=case.capacity, topk=case.topk, activation=case.activation,
-                  scatter_dtype="bf16", routing="round_robin", split_weights=replicas,
+                  scatter_dtype="bf16", routing=case.routing, split_weights=replicas,
                   edge_cases=edge_cases, correctness=dict(status="not_checked"))
     if check:
         checked = min(requested, reference_tokens) if reference_tokens else requested
-        expected = reference(checked)
-        assert actual.isfinite().all(), (rank, "nonfinite pipeline output")
-        sample = actual[:min(count, checked)]
-        metrics = torch.tensor([float(calc_diff(sample, expected)), relative_l2(sample, expected)],
-                               device="cuda")
-        dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
-        assert metrics[0].item() < max_diff, (case.name, "pipeline diff", metrics.tolist())
-        if max_relative_l2 is not None:
-            assert metrics[1].item() < max_relative_l2, (case.name, "pipeline relative L2", metrics.tolist())
+        replay_metrics = []
+        def check_reference(result):
+            expected = reference(checked)
+            assert result.isfinite().all(), (rank, "nonfinite pipeline output")
+            sample = result[:min(count, checked)]
+            metrics = torch.tensor([float(calc_diff(sample, expected)), relative_l2(sample, expected)],
+                                   device="cuda")
+            dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
+            assert metrics[0].item() < max_diff, (case.name, "pipeline diff", metrics.tolist())
+            if max_relative_l2 is not None:
+                assert metrics[1].item() < max_relative_l2, (case.name, "pipeline relative L2", metrics.tolist())
+            replay_metrics.append(metrics.tolist())
+            return metrics
+
+        metrics = check_reference(actual)
         report["correctness"] = dict(status="passed", max_pipeline_diff=metrics[0].item(),
                                      max_relative_l2=metrics[1].item(),
                                      checked_tokens_per_rank=[min(n, checked) for n in counts])
-        check_graph_replay(pipeline, actual, input_tensor=source, routing_weights=routing_weights)
+        check_graph_replay(pipeline, actual, input_tensor=source, routing_weights=routing_weights,
+                           routing_ids=routing_ids, check_reference=check_reference, combine=combine)
+        report["correctness"]["max_replay_pipeline_diff"] = max(m[0] for m in replay_metrics[1:])
+        report["correctness"]["max_replay_relative_l2"] = max(m[1] for m in replay_metrics[1:])
+        report["correctness"]["changed_routes_reference_checked"] = True
         if routing_weights is not None:
             report["correctness"]["routing_weight_replay_checked"] = True
+        if workspace is not None:
+            assert workspace._gemm2_block_info is block_info, "GEMM2 replaced workspace scratch"
+            report["correctness"]["workspace_reuse_checked"] = True
     if benchmark is not None:
         timing = benchmark_pipeline(pipeline, expected=actual if check else None, **benchmark)
         timing["scope"] = "pre_dispatch_to_combine"
@@ -247,6 +313,7 @@ def run_cli(cases, runner, description):
     parser.add_argument("--case", choices=[c.name for c in cases], default=cases[0].name)
     parser.add_argument("--tokens", type=int, nargs="+", help="tokens per rank; defaults to the case table")
     parser.add_argument("--capacity", type=int, help="workspace token capacity")
+    parser.add_argument("--routing", choices=("round_robin", "random", "skewed"), default="round_robin")
     parser.add_argument("--benchmark", action="store_true", help="also time the complete forward")
     parser.add_argument("--no-check", action="store_true", help="performance only; requires --benchmark")
     parser.add_argument("--reference-tokens", type=int, default=0, help="check first N tokens/rank; 0 checks all")
@@ -259,7 +326,7 @@ def run_cli(cases, runner, description):
     args = parser.parse_args()
     case = next(c for c in cases if c.name == args.case)
     case = replace(case, tokens=tuple(args.tokens) if args.tokens is not None else case.tokens,
-                   capacity=args.capacity if args.capacity is not None else case.capacity)
+                   capacity=args.capacity if args.capacity is not None else case.capacity, routing=args.routing)
     if case.capacity < 1 or any(n < 0 or n > case.capacity for n in case.tokens):
         parser.error("tokens must be nonnegative and no larger than a positive capacity")
     if args.reference_tokens < 0 or args.warmup < 0 or args.iterations < 1 or args.repeats < 1:
@@ -283,8 +350,9 @@ def relative_l2(actual, expected):
             / expected.float().norm().clamp_min(1e-8)).item()
 
 
-def check_graph_replay(pipeline, expected, *, input_tensor=None, routing_weights=None):
-    """Check replay generations, optionally changing inputs to expose stale reads."""
+def check_graph_replay(pipeline, expected, *, input_tensor=None, routing_weights=None, routing_ids=None,
+                       check_reference=None, combine=None):
+    """Recycle state with changing data; check eager and replay against a Torch oracle."""
     for _ in range(3):
         pipeline()
     torch.cuda.synchronize()
@@ -292,32 +360,51 @@ def check_graph_replay(pipeline, expected, *, input_tensor=None, routing_weights
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         result = pipeline()
-    saved = input_tensor.clone() if input_tensor is not None else None
-    for factor in (0.0, -1.0, 1.0):
-        reference = expected
-        if saved is not None:
-            input_tensor.copy_(saved * factor)
-            reference = pipeline().clone()
+
+    def compare():
+        if combine is not None:
+            combine.fill_(float("nan"))
+            torch.cuda.synchronize()
+            dist.barrier()
+        eager = pipeline().clone()
+        torch.cuda.synchronize()
+        dist.barrier()
+        if combine is not None:
+            combine.fill_(float("nan"))
             torch.cuda.synchronize()
             dist.barrier()
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        assert result.isfinite().all(), "recycled routes read an unproduced slot"
+        torch.testing.assert_close(result, eager, rtol=0, atol=0)
+        if check_reference is not None:
+            check_reference(result)
         dist.barrier()
-    # The last replay uses the original inputs, so downstream timing and
-    # correctness checks still see the caller's original workspace contents.
+
+    if input_tensor is not None:
+        saved = input_tensor.clone()
+        for factor in (0.0, -1.0, 1.0):
+            input_tensor.copy_(saved * factor)
+            compare()
+    else:
+        compare()
+    if routing_ids is not None:
+        saved_ids = routing_ids.clone()
+        hot_routes = torch.arange(saved_ids.shape[1], device=saved_ids.device).expand_as(saved_ids)
+        for changed in (hot_routes, torch.full_like(saved_ids, -1), saved_ids):
+            routing_ids.copy_(changed)
+            compare()
+        # Return to original routing before changing weights.
     if routing_weights is not None:
         saved_weights = routing_weights.clone()
-        routing_weights.zero_()
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.count_nonzero(result).item() == 0, "graph replay used stale routing weights"
-        dist.barrier()
-        routing_weights.copy_(saved_weights)
-        graph.replay()
-        torch.cuda.synchronize()
+        slots = torch.arange(saved_weights.shape[1], device=saved_weights.device)
+        # Include tiny, nonuniform and zero routing weights. Do not renormalize:
+        # callers may supply weights whose sum is not one.
+        factors = torch.where(slots == 0, 0.0, 10.0 ** (-slots.float()))
+        for changed in (saved_weights * factors, torch.zeros_like(saved_weights), saved_weights):
+            routing_weights.copy_(changed)
+            compare()
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
-        dist.barrier()
 
 
 def benchmark_pipeline(pipeline, *, warmup=10, iterations=100, repeats=5,
@@ -370,43 +457,12 @@ def benchmark_pipeline(pipeline, *, warmup=10, iterations=100, repeats=5,
                 samples_max_rank_us=samples)
 
 
-def clear_dispatch_counts(buffer, experts):
-    """Preserve generation flags; only recycle per-invocation route counts."""
-    offset = buffer._layout.get("off_ws", 0) + 32
-    count_bytes = (2 * experts + experts // dist.get_world_size()) * 8
-    buffer.buffer[offset:offset + count_bytes].zero_()
-
-
 def calc_diff(x, y):
     x, y = x.double(), y.double()
     return (x - y).square().sum() / (x.square() + y.square()).sum().clamp_min(1e-30)
 
-def _get_weight_perm():
-    perm = []
-    for i in range(32):
-        perm1 = []
-        col = i // 4
-        for block in [0, 1]:
-            for row in [
-                2 * (i % 4),
-                2 * (i % 4) + 1,
-                2 * (i % 4 + 4),
-                2 * (i % 4 + 4) + 1
-            ]:
-                perm1.append(16 * row + col + 8 * block)
-        for j in range(4):
-            perm.extend([p + 256 * j for p in perm1])
-
-    perm = np.array(perm)
-    interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
-    perm = perm.reshape((-1, 8))[:, interleave].ravel()
-    perm = torch.from_numpy(perm)
-    return perm
-
-_perm = _get_weight_perm()
-
 def quant_w4a16_mxfp4(y, groupsize=32):
-    """Quantize [E, N, K] weights to raw W4A16-packed E2M1 values and UE8M0 scales."""
+    """Quantize [E, N, K] weights to canonical K-paired E2M1 values and UE8M0 scales."""
     e, n, k = y.shape
     tile = 16
     assert groupsize == 32
@@ -437,23 +493,10 @@ def quant_w4a16_mxfp4(y, groupsize=32):
     refs = (e2m1_lut[codes.long()].view(e, k // groupsize, groupsize, n)
             * scale_fp32.unsqueeze(2)).view(e, k, n).transpose(1, 2).to(y.dtype)
 
-    all_qs = []
-    for expert in range(e):
-        packed_order = codes[expert]
-        packed_order = packed_order.view(k // tile, tile, n // tile, tile)
-        packed_order = packed_order.permute(0, 2, 1, 3).reshape(k // tile, n * tile)
-        packed_order = packed_order.reshape(-1, _perm.numel())[:, _perm].reshape(packed_order.shape)
-        packed_order = packed_order.to(torch.int32)
-
-        packed = torch.zeros(
-            (packed_order.shape[0], packed_order.shape[1] // 8),
-            dtype=torch.int32, device=y.device)
-        for nibble in range(8):
-            packed |= packed_order[:, nibble::8] << (4 * nibble)
-        all_qs.append(packed)
-
-    raw_scale = (scale_bits >> 23).to(torch.uint8)
-    return refs, torch.stack(all_qs), raw_scale
+    row_codes = codes.transpose(1, 2).contiguous()
+    packed = row_codes[..., 0::2] | (row_codes[..., 1::2] << 4)
+    raw_scale = (scale_bits >> 23).to(torch.uint8).transpose(1, 2).contiguous()
+    return refs, packed, raw_scale
 
 def quantize_fp4_rne(src_tensor):
     src = src_tensor.float()

@@ -26,6 +26,12 @@ inline void reset_done(const torch::Tensor& done) {
         DG_HGGC_RUNTIME_CHECK(hggcMemsetAsync(done.data_ptr(), 0, sizeof(int32_t), current_stream()));
 }
 
+inline void recycle_dispatch_counts(const torch::Tensor& counts) {
+    if (get_compile_mode() == static_cast<int>(CompileMode::COMPILE_AND_RUN) &&
+        get_env<std::string>("HGGC_WARM_UP").empty())
+        DG_HGGC_RUNTIME_CHECK(hggcMemsetAsync(counts.data_ptr(), 0, counts.nbytes(), current_stream()));
+}
+
 inline void barrier_reduce_impl(const torch::Tensor& buf, const torch::Tensor& weights, int tokens,
                                 int hidden, int topk, int capacity, const torch::Tensor& pointers,
                                 int rank, int world, const torch::Tensor& done,

@@ -18,7 +18,6 @@ import sys
 import pytest
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 
 # Direct execution should exercise this checkout, even if another is installed.
 if __name__ == "__main__":
@@ -26,8 +25,8 @@ if __name__ == "__main__":
 
 import deep_gemm as dg
 from moe_test_utils import (
-    MODEL_TOKENS, CombineBarrier, MoECase, activation, run_forward, run_cli,
-    clear_dispatch_counts, compile_kernels, dequantize_fp4_torch, gather, interleave_gate_up,
+    check_complete_entry, check_workspace_options, make_routes, MODEL_TOKENS, MoECase, activation,
+    run_forward, run_cli, compile_kernels, dequantize_fp4_torch, gather,
     moe_group, quantize_fp4_rne, split_expert_weights,
 )
 
@@ -45,115 +44,42 @@ CASES = (
 )
 
 
-def _pack_gemm1_scales(scales, block_n=256):
-    # Each N tile is K-major; a whole-expert transpose mixes tile scales.
-    chunks = []
-    for expert in scales:
-        processed = dg.preprocess_mxfp4_scales(expert)
-        chunks.extend(tile.t().contiguous().flatten() for tile in processed.split(block_n))
-    return torch.cat(chunks).view(scales.shape[0], -1)
-
-
 class W4A4MoE:
-    """Reusable example workspace for one routed MoE layer.
-
-    Pass local expert weights as uint8 (packed FP4 [E, N, K/2], raw E8M0
-    scales [E, N, K/32]) tuples; GEMM1 rows are [gate; up]. Call set_inputs() before
-    compile()/forward(), reusing the workspace across token counts. All ranks,
-    including empty ranks, must invoke forward() the same number of times.
-    """
+    """Load weights and allocate once; pre-dispatch and compute on each forward."""
 
     def __init__(self, case, group, gemm1_weights, gemm2_weights):
         self.case = case
         self.rank, self.world = dist.get_rank(), dist.get_world_size()
         self.epr = case.experts // self.world
         self.reference_weights = gemm1_weights, gemm2_weights
-        self.w1, self.s1 = (interleave_gate_up(t) for t in gemm1_weights)
-        self.s1_packed = _pack_gemm1_scales(self.s1)
-        self.w2, s2 = gemm2_weights
-        self.s2_packed = dg.preprocess_mxfp4_scales(s2)
+        self.w1, self.w2 = dg.transform_weights_for_mega_moe(
+            gemm1_weights, gemm2_weights, precision="w4a4")
         self.buf = dg.get_symm_buffer_for_mega_moe(
             group, case.experts, case.capacity, case.topk, case.hidden,
-            precision="w4a4", intermediate_hidden=2 * case.intermediate)
-        self.aq = torch.empty(self.buf.num_pool, case.intermediate // 2, dtype=torch.uint8, device="cuda")
-        self.asc = torch.empty(case.intermediate // 64, self.buf.num_pool, dtype=torch.uint16, device="cuda").t()
-        (self.rows, self.valid, self.offsets, self.src_rows, self.src_offsets,
-         self.token_meta) = self.buf.get_gemm2_metadata()
-        self.combine = symm_mem.empty(case.topk * case.capacity * case.hidden, dtype=torch.bfloat16, device="cuda")
-        self.combine_handle = symm_mem.rendezvous(self.combine, group=group)
-        pointers = [self.combine_handle.get_buffer(r, (self.combine.numel(),), torch.bfloat16).data_ptr()
-                    for r in range(self.world)]
-        self.peer_offsets = torch.tensor([p - pointers[self.rank] for p in pointers], dtype=torch.int64)
-        self.barrier = CombineBarrier(group)
-        self.combine.zero_()
-        clear_dispatch_counts(self.buf, case.experts)
-        torch.cuda.synchronize()
-        dist.barrier()
+            precision="w4a4", intermediate_hidden=case.intermediate)
+        # Private storage is accessed only for the NaN fault-injection test.
+        self.combine = self.buf._combine
 
     def set_inputs(self, hidden_states, topk_ids, topk_weights, *, split_weights=False):
-        """Bind inputs and select layouts before graph capture or timing."""
-        c = self.case
-        count = hidden_states.shape[0]
-        if count > c.capacity or hidden_states.shape != (count, c.hidden):
-            raise ValueError("hidden_states must be [tokens <= capacity, hidden]")
-        if topk_ids.shape != (count, c.topk) or topk_weights.shape != topk_ids.shape:
-            raise ValueError("routing IDs and weights must be [tokens, topk]")
-        if split_weights and self.epr < 2:
-            raise ValueError("split weights require at least two local experts")
         self.source, self.ids, self.weights = hidden_states, topk_ids, topk_weights
-        self.count = count
-        self.tuning = dg.get_mega_moe_tuning_config(
-            self.world, c.experts, c.topk, c.hidden, c.intermediate, count,
-            precision="w4a4", activation=c.activation)
-        # Pre-dispatch refreshes and masks this view on every replay. Do not copy
-        # routing weights here: their values may change after graph capture.
-        self.reduce_weights = self.buf.input_topk_weights[:count]
+        self.count = hidden_states.shape[0]
+        self.output = torch.empty_like(hidden_states)
         if split_weights and not hasattr(self, "split_gemm1"):
-            self.split_gemm1 = split_expert_weights((self.w1, self.s1_packed))
-            self.split_gemm2 = split_expert_weights((self.w2, self.s2_packed))
-        self.gemm1, self.gemm1_replicas = (self.split_gemm1 if split_weights
-                                          else ((self.w1, self.s1_packed), None))
-        self.gemm2, self.gemm2_replicas = (self.split_gemm2 if split_weights
-                                          else ((self.w2, self.s2_packed), None))
-
-    def pre_dispatch(self):
-        dg.mega_moe_pre_dispatch(
-            self.source, self.ids, self.weights, self.buf, self.count, precision="w4a4")
-
-    def dispatch_gemm1(self):
-        self.gemm1_block_m = dg.mega_moe_dispatch_gemm1(
-            self.buf, self.gemm1, self.aq, self.rank, self.count, precision="w4a4",
-            activation=self.case.activation, activation_limit=self.case.clamp or None,
-            output_quantization="mxfp4", out_scales=self.asc, rhs_replicas=self.gemm1_replicas,
-            tuning=self.tuning)
-
-    def gemm2_scatter(self):
-        c = self.case
-        dg.mega_moe_gemm2_scatter(
-            (self.aq, self.asc), self.gemm2, self.token_meta, self.combine,
-            self.peer_offsets, self.rows, self.valid, self.rank, c.capacity, c.topk,
-            precision="w4a4", row_offsets=self.src_offsets,
-            rhs_replicas=self.gemm2_replicas, tuning=self.tuning)
-
-    def combine_output(self):
-        c = self.case
-        return dg.mega_moe_combine(
-            self.combine, self.reduce_weights, self.count, c.hidden,
-            c.topk, c.capacity, self.barrier.pointers, self.rank, self.world,
-            self.barrier.done, tuning=self.tuning)
+            self.split_gemm1 = split_expert_weights(self.w1)
+            self.split_gemm2 = split_expert_weights(self.w2)
+        self.gemm1, self.gemm1_replicas = self.split_gemm1 if split_weights else (self.w1, None)
+        self.gemm2, self.gemm2_replicas = self.split_gemm2 if split_weights else (self.w2, None)
 
     def forward(self):
-        """Complete BF16-input -> BF16-output routed MoE, with device synchronization."""
-        self.pre_dispatch()
-        self.dispatch_gemm1()
-        self.gemm2_scatter()
-        clear_dispatch_counts(self.buf, self.case.experts)
-        # Every rank participates, even when its returned output is empty.
-        return self.combine_output()
+        dg.mega_moe_pre_dispatch(self.source, self.ids, self.weights, self.buf)
+        dg.fp4_fp4_mega_moe(
+            self.output, self.gemm1, self.gemm2, self.buf,
+            activation=self.case.activation, activation_limit=self.case.clamp or None,
+            w1_replicas=self.gemm1_replicas, w2_replicas=self.gemm2_replicas)
+        return self.output
 
     def compile(self):
-        """Precompile stages before entering cooperative device barriers."""
-        compile_kernels(self.pre_dispatch, self.dispatch_gemm1, self.gemm2_scatter, self.combine_output)
+        compile_kernels(self.forward)
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -217,18 +143,18 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
              splits=(False,), benchmark=None, verbose=True):
     """Shared CLI/pytest runner; references and data preparation are not timed."""
     rank, world = dist.get_rank(), dist.get_world_size()
+    if check and case.name.startswith("smoke"):
+        check_workspace_options(case, group)
     rng = torch.Generator(device="cuda").manual_seed(20261016 + rank)
     source = torch.randn(case.capacity, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .5
     w1 = make_weights(case.experts // world, 2 * case.intermediate, case.hidden, .5, rng)
     w2 = make_weights(case.experts // world, case.hidden, case.intermediate, .125, rng)
     moe = W4A4MoE(case, group, w1, w2)
     reports = []
-    token = torch.arange(case.capacity, device="cuda")[:, None]
-    slot = torch.arange(case.topk, device="cuda")[None, :]
     try:
         for requested in case.tokens:
             count = 0 if edge_cases and world > 1 and requested == 1 and rank == world - 1 else requested
-            ids = ((token * case.topk + slot + rank * 17) % case.experts).contiguous()
+            ids = make_routes(case, case.capacity, rng)
             weights = torch.rand(case.capacity, case.topk, device="cuda", generator=rng).softmax(-1)
             ids[count:], weights[count:] = -1, 0
             if edge_cases and count > 1:
@@ -237,13 +163,18 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
                 weights[1, 0] = 0
             for split in splits:
                 moe.set_inputs(source[:count], ids[:count], weights[:count], split_weights=split)
+                if check and case.name.startswith("smoke") and not split and requested == case.tokens[0]:
+                    check_complete_entry(
+                        dg.fp4_fp4_mega_moe, moe.output, moe.gemm1, moe.gemm2, moe.buf,
+                        moe.source, moe.ids, moe.weights, activation=case.activation,
+                        activation_limit=case.clamp or None)
                 report = run_forward(
                     case, source[:count], requested, moe.forward,
                     lambda checked: reference_output(moe, source, ids, weights, checked),
-                    combine=moe.combine, check=check, reference_tokens=reference_tokens,
+                    combine=moe.combine, workspace=moe.buf, check=check, reference_tokens=reference_tokens,
                     max_diff=.003, replicas=split, edge_cases=edge_cases,
                     benchmark=benchmark, verbose=verbose,
-                    routing_weights=moe.weights)
+                    routing_weights=moe.weights, routing_ids=moe.ids)
                 reports.append(report)
     finally:
         moe.close()

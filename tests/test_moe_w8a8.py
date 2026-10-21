@@ -12,21 +12,19 @@ import sys
 import pytest
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import deep_gemm as dg
 from moe_test_utils import (
-    MODEL_TOKENS, CombineBarrier, MoECase, activation, clear_dispatch_counts, gather,
-    interleave_gate_up, make_inputs, moe_group, quantize_fp8_blocks, quantize_fp8_rows,
+    check_complete_entry, check_workspace_options, MODEL_TOKENS, MoECase, activation, gather,
+    make_inputs, moe_group, quantize_fp8_blocks, quantize_fp8_rows,
     run_cli, run_forward, split_expert_weights,
 )
 
 CHANNELWISE_CASES = tuple(replace(c, precision="fp8_channelwise") for c in (
-    MoECase("smoke_channelwise", 512, 256, 16, 2, 64, tokens=(1, 0, 33, 8), worlds=(4, 8),
-            scatter_tile=(32, 256, 128, 16, 64, 2)),
+    MoECase("smoke_channelwise", 512, 256, 16, 2, 64, tokens=(1, 0, 33, 8), worlds=(1, 2, 4, 8)),
     MoECase("minimax_m3", 6144, 3072, 128, 4, 4096, tokens=MODEL_TOKENS,
             activation="swiglu_oai", clamp=7.0, worlds=(8,)),
     MoECase("qwen38_flash", 2560, 640, 512, 10, 8192, tokens=MODEL_TOKENS,
@@ -71,68 +69,44 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
              splits=(False,), benchmark=None, verbose=True, block_m=None):
     c = case
     rank, world = dist.get_rank(), dist.get_world_size()
+    if check and case.name.startswith("smoke"):
+        check_workspace_options(case, group)
     epr, blockwise = c.experts // world, c.precision == "fp8_blockwise"
     quantize = quantize_fp8_blocks if blockwise else quantize_fp8_rows
     rng = torch.Generator(device="cuda").manual_seed(20260909 + rank)
     w1, s1 = make_weights(epr, 2 * c.intermediate, c.hidden, rng, blockwise, .125)
     w2, s2 = make_weights(epr, c.hidden, c.intermediate, rng, blockwise, .015625)
-    packed_g1 = (dg.interleave_fp8_blockwise_mega_moe_weights(w1, s1) if blockwise
-                 else (interleave_gate_up(w1), interleave_gate_up(s1)))
+    packed_g1, packed_g2 = dg.transform_weights_for_mega_moe((w1, s1), (w2, s2), precision=c.precision)
     buf = dg.get_symm_buffer_for_mega_moe(
-        group, c.experts, c.capacity, c.topk, c.hidden, precision=c.precision, block_m=block_m)
-    activated = torch.empty(buf.num_pool, c.intermediate, dtype=torch.bfloat16, device="cuda")
-    aq = torch.empty_like(activated, dtype=torch.float8_e4m3fn)
-    scales = (torch.empty(c.intermediate // 128, buf.num_pool, device="cuda").t() if blockwise
-              else torch.empty(buf.num_pool, 1, device="cuda"))
-    rows, valid, offsets, _, _, meta = buf.get_gemm2_metadata()
-    # Default scatter schedules from GEMM1 row counts; it does not consume m_indices.
-    indices = torch.empty(buf.num_pool, dtype=torch.int32, device="cuda")
-    combine = symm_mem.empty(c.topk * c.capacity * c.hidden, dtype=torch.bfloat16, device="cuda")
-    handle = symm_mem.rendezvous(combine, group=group)
-    pointers = [handle.get_buffer(r, (combine.numel(),), torch.bfloat16).data_ptr() for r in range(world)]
-    peer_offsets = torch.tensor([p - pointers[rank] for p in pointers], dtype=torch.int64, device="cuda")
-    barrier = CombineBarrier(group)
-    # The tiny channelwise case needs a complete BN256 scatter transaction.
-    scatter_config = (dg.get_num_sms(), *c.scatter_tile, (0, 0, 0)) if c.scatter_tile else None
+        group, c.experts, c.capacity, c.topk, c.hidden,
+        precision=c.precision, intermediate_hidden=c.intermediate, block_m=block_m)
     reports = []
     try:
         for split in splits:
             g1, r1 = split_expert_weights(packed_g1) if split else (packed_g1, None)
-            g2, r2 = split_expert_weights((w2, s2)) if split else ((w2, s2), None)
-            for requested in c.tokens:
+            g2, r2 = split_expert_weights(packed_g2) if split else (packed_g2, None)
+            for token_index, requested in enumerate(c.tokens):
                 source, ids, weights, count = make_inputs(c, requested, rng, edge_cases)
-                if check and edge_cases and not blockwise and world > 1:
-                    tuning = dg.get_mega_moe_tuning_config(
-                        world, c.experts, c.topk, c.hidden, c.intermediate, requested,
-                        precision=c.precision, activation=c.activation)
-                    # Exercise a tuned rank alongside an empty rank using the
-                    # fallback tile, without changing the symmetric allocation.
-                    if tuning.gemm1_block_m is not None and rank == world - 1:
-                        count = 0
-                        ids.fill_(-1)
-                        weights.zero_()
-                tuning = dg.get_mega_moe_tuning_config(
-                    world, c.experts, c.topk, c.hidden, c.intermediate, count,
-                    precision=c.precision, activation=c.activation)
+                if (check and edge_cases and not blockwise and world > 1
+                        and not c.name.startswith("smoke") and rank == world - 1):
+                    # Empty peers use fallback tuning alongside the other ranks,
+                    # without changing the symmetric allocation.
+                    count = 0
+                    ids.fill_(-1)
+                    weights.zero_()
+                output = torch.empty(count, c.hidden, dtype=torch.bfloat16, device="cuda")
 
                 def forward():
-                    dg.mega_moe_pre_dispatch(
-                        source[:count], ids[:count], weights[:count], buf, count, precision=c.precision)
-                    dg.mega_moe_dispatch_gemm1(
-                        buf, g1, aq, rank, count, precision=c.precision, activation=c.activation,
-                        output_quantization="fp8", out_scales=scales, rhs_replicas=r1,
-                        bf16_scratch=None if blockwise else activated, activation_limit=c.clamp or None,
-                        tuning=tuning)
-                    scatter_args = (dict(row_offsets=offsets) if blockwise else
-                                    dict(m_indices=indices, configs=scatter_config, kernel_type="Default",
-                                         validate_metadata=False))
-                    dg.mega_moe_gemm2_scatter(
-                        (aq, scales), g2, meta, combine, peer_offsets, rows, valid, rank, c.capacity, c.topk,
-                        precision=c.precision, rhs_replicas=r2, tuning=tuning, **scatter_args)
-                    clear_dispatch_counts(buf, c.experts)
-                    return dg.mega_moe_combine(
-                        combine, weights[:count], count, c.hidden, c.topk, c.capacity,
-                        barrier.pointers, rank, world, barrier.done, tuning=tuning)
+                    dg.mega_moe_pre_dispatch(source[:count], ids[:count], weights[:count], buf)
+                    dg.fp8_fp8_mega_moe(
+                        output, g1, g2, buf, activation=c.activation, activation_limit=c.clamp or None,
+                        w1_replicas=r1, w2_replicas=r2)
+                    return output
+
+                if check and c.name.startswith("smoke") and not split and token_index == 0:
+                    check_complete_entry(
+                        dg.fp8_fp8_mega_moe, output, g1, g2, buf, source[:count], ids[:count], weights[:count],
+                        activation=c.activation, activation_limit=c.clamp or None)
 
                 def reference(checked):
                     q, s = quantize(source[:checked])
@@ -155,8 +129,8 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
                     return expected.view(world, checked, c.hidden)[rank, :min(count, checked)].bfloat16()
 
                 reports.append(run_forward(
-                    c, source[:count], requested, forward, reference, combine=combine,
-                    check=check, reference_tokens=reference_tokens, replicas=split,
+                    c, source[:count], requested, forward, reference, combine=buf._combine, routing_weights=weights[:count], routing_ids=ids[:count],
+                    workspace=buf, check=check, reference_tokens=reference_tokens, replicas=split,
                     edge_cases=edge_cases, benchmark=benchmark, verbose=verbose))
     finally:
         buf.destroy()

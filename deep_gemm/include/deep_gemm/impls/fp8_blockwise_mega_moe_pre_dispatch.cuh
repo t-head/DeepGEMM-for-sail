@@ -29,7 +29,7 @@ CUTLASS_DEVICE void pre_dispatch_kernel_device(
     for (int slot = threadIdx.x; slot < kTopk; slot += kThreads) {
         const int64_t index = int64_t(row) * kTopk + slot;
         output_ids[index] = ids[index];
-        output_weights[index] = weights[index];
+        output_weights[index] = ids[index] >= 0 ? weights[index] : 0.0f;
     }
 }
 

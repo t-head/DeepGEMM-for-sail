@@ -400,15 +400,14 @@ inline void w4a16_pre_dispatch_impl(
     const torch::Tensor& staged_tokens, const torch::Tensor& staged_ids,
     const torch::Tensor& staged_weights, int tokens, int hidden, int topk) {
     const bool copy_tokens = input.data_ptr() != staged_tokens.data_ptr();
-    const bool copy_routes = ids.data_ptr() != staged_ids.data_ptr() ||
-                             weights.data_ptr() != staged_weights.data_ptr();
-    if (!tokens || (!copy_tokens && !copy_routes)) return;
+    // Even inputs already in the workspace need invalid routing weights masked.
+    if (!tokens) return;
     const auto c = mega_moe_config::w4a16_pre_dispatch_config(hidden, topk);
     const int vector = (hidden % 8 == 0 &&
         ((reinterpret_cast<uintptr_t>(input.data_ptr()) |
           reinterpret_cast<uintptr_t>(staged_tokens.data_ptr())) & 15) == 0) ? 8 : 1;
     const int token_blocks = copy_tokens ? ceil_div(int64_t(tokens) * hidden / vector, int64_t(c.block_threads)) : 0;
-    const int route_blocks = copy_routes ? ceil_div(int64_t(tokens) * topk, int64_t(c.block_threads)) : 0;
+    const int route_blocks = ceil_div(int64_t(tokens) * topk, int64_t(c.block_threads));
     launch<Bf16MegaMoePreDispatchTag>("w4a16_mega_moe_pre_dispatch", R"DGMEGA(
 #include <deep_gemm/impls/w4a16_mega_moe_pre_dispatch.cuh>
 extern "C" __device__ __constant__ uint32_t ppu_native_smem_bytes = 0;

@@ -105,7 +105,7 @@ CUTLASS_DEVICE void fp8_mega_moe_pre_dispatch_kernel_device(
     if (tid < TOP_K) {
         const uint64_t off = static_cast<uint64_t>(token) * TOP_K + tid;
         input_topk_idx[off] = topk_ids[off];
-        input_topk_weights[off] = topk_weights[off];
+        input_topk_weights[off] = topk_ids[off] >= 0 ? topk_weights[off] : 0.0f;
     }
 }
 

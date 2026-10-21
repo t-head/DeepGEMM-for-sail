@@ -456,15 +456,31 @@ inline void fp4_scatter_kernel_dispatch(
             valid_rows, src_offsets);
 }
 
+inline torch::Tensor scatter_block_info(const torch::Tensor& rows, int m, int groups, int block_m,
+                                       const std::optional<torch::Tensor>& workspace) {
+    if (groups < 128)
+        return rows;
+    const int64_t required = 4LL * (1 + groups + ceil_div(m, block_m));
+    // Complete entries reuse workspace storage. Standalone staged calls retain
+    // their internal allocation when no workspace was supplied.
+    if (!workspace)
+        return torch::empty({required}, rows.options());
+    TORCH_CHECK(workspace->scalar_type() == torch::kInt32 && workspace->is_contiguous() &&
+                    workspace->device() == rows.device() && workspace->numel() >= required,
+                "MegaMoE GEMM2 block-info workspace has an invalid device, dtype, layout or size");
+    return *workspace;
+}
+
 inline void m_grouped_gemm_fp8_blockwise_with_scatter_impl(
     const torch::Tensor& a, const torch::Tensor& sa, const torch::Tensor& b, const torch::Tensor& sb,
     const torch::Tensor& out, const torch::Tensor& padded_rows, const torch::Tensor& valid_rows,
     const torch::Tensor& row_offsets, const torch::Tensor& packed_src_info, const torch::Tensor& combine,
     const torch::Tensor& peer_offsets, const torch::Tensor& rw, const torch::Tensor& rs, int m, int n, int k,
     int groups, int masters, int max_tokens, int topk, int rank, int ranks,
-    std::optional<int> expected, const mega_moe_config::Gemm2Tuning& tuning) {
+    std::optional<int> expected, const mega_moe_config::Gemm2Tuning& tuning,
+    const std::optional<torch::Tensor>& workspace = std::nullopt) {
     const auto c = mega_moe_config::fp8_blockwise_scatter_config(n, k, groups, masters, expected, tuning);
-    auto info = torch::empty({4 * (1 + groups + ceil_div(m, c.block_m))}, padded_rows.options());
+    const auto info = scatter_block_info(padded_rows, m, groups, c.block_m, workspace);
     mega_moe_native::block_scatter_kernel(
         c, a, sa, b, sb, out, padded_rows, valid_rows, row_offsets, packed_src_info, combine, peer_offsets,
         info, m, max_tokens, topk, rank, ranks, get_num_sms(), rw, rs);
@@ -478,14 +494,15 @@ inline void m_grouped_gemm_fp8_channelwise_with_scatter_impl(
     int k, int groups, int masters, int world_size, int rank, int max_tokens, int hidden, int num_topk,
     bool checked, std::optional<mega_moe_config::Config> configs,
     std::optional<std::string> kernel_type_override, std::optional<bool> rolling_pair_scatter,
-    std::optional<int> num_sms_override, const mega_moe_config::Gemm2Tuning& tuning = {}) {
+    std::optional<int> num_sms_override, const mega_moe_config::Gemm2Tuning& tuning = {},
+    const std::optional<torch::Tensor>& workspace = std::nullopt) {
     auto [config, c] = mega_moe_config::channel_scatter_policy(
         m, n, k, groups, masters, world_size, max_tokens, num_topk,
         valid.data_ptr() != physical.data_ptr(), configs, kernel_type_override,
         rolling_pair_scatter, num_sms_override, tuning);
     const auto [sms, bm, bn, bk, wm, wn, stages, smem] = config;
     c.check_packed_routes = checked;
-    const auto info = torch::empty({(groups + ceil_div(m + 1 - groups, bm)) * 4}, physical.options());
+    const auto info = scatter_block_info(physical, m, groups, bm, workspace);
     const auto out = combine_buf.reshape({-1}).narrow(0, 0, n).view({1, n});
     mega_moe_native::channel_scatter_kernel(c, lhs, sa, rhs, sb, rw, rs, out, m, physical, info, sms,
                                             token_meta, combine_buf, hidden * 2, max_tokens, num_topk,
@@ -511,14 +528,13 @@ inline void m_grouped_gemm_fp4_with_scatter_impl(
     std::optional<mega_moe_config::Config> configs, std::optional<int> expected_m,
     std::optional<torch::Tensor> combine_scales,
     std::optional<torch::Tensor> scale_offsets, int scale_block_n,
-    const torch::Tensor& src_m_offsets, const mega_moe_config::Gemm2Tuning& tuning = {}) {
+    const torch::Tensor& src_m_offsets, const mega_moe_config::Gemm2Tuning& tuning = {},
+    const std::optional<torch::Tensor>& workspace = std::nullopt) {
     const int em = expected_m ? std::max(1, *expected_m) : ceil_div(m, groups);
     const auto cfg =
         mega_moe_config::fp4_scatter_config(m, n, k, groups, configs, provided_rows, false, fp8, em);
     const auto [sms, bm, bn, bk, wm, wn, stages, smem] = cfg;
-    const auto info = groups < 128
-                          ? physical
-                          : torch::empty({(groups + ceil_div(m + 1 - groups, bm)) * 4}, physical.options());
+    const auto info = scatter_block_info(physical, m, groups, bm, workspace);
     const auto out = fp8 ? torch::empty({m, n}, lhs.options().dtype(torch::kBFloat16))
                          : combine_buf.reshape({-1}).narrow(0, 0, n).view({1, n});
     const bool side = fp8 && combine_scales.has_value();
@@ -576,7 +592,8 @@ inline void m_grouped_gemm_w4a16_mxfp4_with_scatter_impl(
     const torch::Tensor& sym_offsets, const torch::Tensor& valid_m_rows, int rank, int max_tokens, int topk,
     std::optional<PPUW4ConfigTuple> requested,
     const std::optional<std::pair<torch::Tensor, torch::Tensor>>& replicas,
-    std::optional<int> expected, const mega_moe_config::Gemm2Tuning& tuning = {}) {
+    std::optional<int> expected, const mega_moe_config::Gemm2Tuning& tuning = {},
+    const std::optional<torch::Tensor>& workspace = std::nullopt) {
     constexpr auto type = GemmType::MGroupedNoPad;
     constexpr int group_size = 32;
     const int m = lhs.size(0), k = lhs.size(1), n = rhs.size(1), master_groups = rhs.size(0);
@@ -589,8 +606,7 @@ inline void m_grouped_gemm_w4a16_mxfp4_with_scatter_impl(
     const PPUW4ConfigTuple selected_tuple{selected.num_sms, selected.block_m,   selected.block_n,
                                           selected.block_k, selected.warp_m,    selected.warp_n,
                                           selected.warp_k,  selected.num_stages};
-    const auto block_info =
-        torch::empty({(groups + ceil_div(m + 1 - groups, selected.block_m)) * 4}, rows.options());
+    const auto block_info = scatter_block_info(rows, m, groups, selected.block_m, workspace);
     auto c = ppu_w4_config(expected_m, n, k, selected_tuple);
     TORCH_CHECK(c.warp_n == 64 and c.warp_k % 64 == 0, "Invalid W4A16 warp shape");
     TORCH_CHECK(c.block_k == c.warp_k and c.block_n % 256 == 0 and n % c.block_n == 0,

@@ -89,14 +89,14 @@ buffer = dg.get_symm_buffer_for_mega_moe(
     num_topk=topk,
     hidden=hidden,
     precision="w4a4",
-    intermediate_hidden=2 * intermediate,
+    intermediate_hidden=intermediate,
 )
 ```
 
 `precision` accepts `w4a4`, `w4a16`, `fp8_channelwise` and `fp8_blockwise`,
-matching the compute APIs. W4 buffers require `intermediate_hidden` including
-both gate and up projections. FP8 buffers describe transport only and reject
-this argument; their scale layout is selected by `precision`.
+matching the compute APIs. Every precision requires `intermediate_hidden=I`,
+the activated intermediate width; GEMM1 width 2I is derived internally. The
+workspace owns both stages' scratch, route metadata, combine and barrier state.
 
 Tile selection is handled internally. W4A4 accepts
 `gemm1_block_n`, `gemm1_block_k` and `config_override`; W4A16 and FP8 accept
@@ -137,18 +137,9 @@ after dispatch/GEMM1.
 
 ## Measured configurations and fallback
 
-The model pipelines query a read-only C++ tuning configuration once per input
-shape, before graph capture, and pass it to GEMM1, GEMM2/scatter and combine:
-
-```python
-tuning = dg.get_mega_moe_tuning_config(
-    num_ranks=8, num_experts=384, num_topk=6, hidden=7168,
-    intermediate_hidden=3072, num_tokens=1024,
-    precision="w4a4", activation="swiglu")
-# Pass tuning=tuning to mega_moe_dispatch_gemm1,
-# mega_moe_gemm2_scatter and mega_moe_combine.
-print(tuning.profile)  # deepseek_v4_pro; empty string means fallback
-```
+The complete MoE entries select and cache tuning configurations internally
+from the input dimensions, precision, activation and actual token count.
+Callers do not construct or pass tuning objects.
 
 Here `intermediate_hidden` is the expert intermediate width, before doubling
 for the gate/up projection. The table matches precision, activation, EP size,
@@ -162,29 +153,23 @@ Unlisted counts or devices fall back to
 the heuristics. FP8 blockwise uses its existing heuristics.
 Profiles cover quantized GEMM1 output (BF16 for W4A16) and BF16 scatter.
 
-Profiles provide only measured overrides; unset fields use the existing
-precision-specific heuristics. Explicit API configuration and environment
-overrides take precedence. The read-only properties expose table hints, not
-the fully resolved configuration after those overrides. Set
-`DG_MOE_USE_TUNED_CONFIGS=0` before querying to disable the table. Calls without
-`tuning` use the default selectors without measured overrides. Re-query
-when the token count or model configuration changes; mismatched configurations
-are rejected before launch. The query does not read routing tensors or copy
-their contents to the CPU.
+Profiles provide only measured overrides; unset fields use the
+precision-specific heuristics. Explicit workspace options and supported
+environment overrides take precedence. Set `DG_MOE_USE_TUNED_CONFIGS=0`
+before workspace allocation to disable measured profiles. Internal selection
+does not read routing tensors or copy their contents to the CPU.
 
-For decode, `buffer_block_m` describes collective allocation;
-`gemm1_tile`, `gemm1_separate_dispatch` and `dispatch_threads` describe the
-compute and communication launches. `gemm2_tile` describes the scatter launch.
-For W4A4, `gemm2_m_tiles_per_group` controls the existing GEMM2 scheduler:
-`1` traverses all N tiles of one M tile before the next; `None` retains the
-default interleaving of two M tiles. Only measured profiles override this field.
+Decode profiles specify the collective buffer tile, GEMM1 tile and dispatch
+launch geometry, plus GEMM2 and combine settings. W4A4 profiles can traverse
+all N tiles of one M tile before moving to the next; the fallback interleaves
+two M tiles. Only measured profiles override this order.
 Combine always reduces one complete token row per CTA, including a synchronization
 CTA on empty ranks. It uses 256 threads for at least 512 local tokens, 1024 threads
 for at most 64 local tokens with hidden size above 4096, and 512 threads otherwise.
 This policy uses the actual combine token count, independently of the tuning table.
-`gemm1_dynamic_queue=None` selects the backend's automatic policy;
-`True` and `False` explicitly enable and disable it. In particular, blockwise
-FP8 cannot override an explicit `False` with its automatic queue heuristic.
+Profiles can enable or disable the GEMM1 dynamic queue internally; an unset
+policy uses the backend heuristic. Blockwise FP8 respects an explicit profile
+choice before applying its automatic queue heuristic.
 The automatic BM128/BM192 and queue thresholds are empirical fallback choices,
 not hardware requirements.
 
@@ -193,118 +178,28 @@ precision-specific fallback, override handling and validation remain in
 `csrc/jit_kernels/heuristics/mega_moe.hpp`. Launchers consume the resulting
 configuration without maintaining a separate model table.
 
-## Four-stage compute interface
+## Complete compute interface
 
-All precision examples call the same native functions:
-
-```python
-mega_moe_pre_dispatch(hidden_states, topk_ids, topk_weights, buffer, num_tokens,
-                      precision=...)
-mega_moe_dispatch_gemm1(buffer, rhs, out, rank, num_tokens,
-                       precision=..., activation=..., output_quantization=...)
-mega_moe_gemm2_scatter(lhs, rhs, token_meta, combine_buf, sym_offsets,
-                      m_rows, valid_m_rows, rank, max_tokens, topk, precision=...)
-mega_moe_combine(combine_buf, weights, num_tokens, hidden, topk, max_tokens,
-                 flag_ptrs, rank, world_size, done_flag)
-```
-
-The `precision` selector is required for the first three stages. It must match
-the workspace and preprocessed weights. `rhs` is always `(weight, scales)`;
-GEMM2 `lhs` is a BF16 tensor for W4A16 and `(tensor, scales)` otherwise.
-GEMM1 writes the caller-provided `out` and returns the dispatch row block size.
-
-All precisions produce GEMM2 row layouts and routing metadata inside dispatch/GEMM1.
-Obtain the persistent views once with `buffer.get_gemm2_metadata()`; no separate
-prepare call or caller-owned metadata output tensors are needed. W4A4 selects
-GEMM2 padding internally, independently of the GEMM1 tile. Pass the same tuning
-object to both stages so they use the same token count and selection policy:
+All precision examples allocate one reusable library workspace, transform both
+weight pairs, then call pre-dispatch and one complete output-first entry:
 
 ```python
-meta = buffer.get_gemm2_metadata()
-tuning = dg.get_mega_moe_tuning_config(
-    world_size, num_experts, topk, hidden, intermediate, num_tokens,
-    precision="w4a4", activation="swiglu")
-mega_moe_dispatch_gemm1(
-    buffer, rhs, fp4_out, rank, num_tokens, precision="w4a4",
-    activation="swiglu", output_quantization="mxfp4", out_scales=fp4_scales,
-    tuning=tuning)
-mega_moe_gemm2_scatter(
-    (fp4_out, fp4_scales), rhs2, meta.token_meta, combine_buf, sym_offsets,
-    meta.m_rows, meta.valid_m_rows, rank, capacity, topk, precision="w4a4",
-    row_offsets=meta.src_m_offsets, tuning=tuning)
+w1, w2 = dg.transform_weights_for_mega_moe(w1_raw, w2_raw, precision="w4a4")
+buffer = dg.get_symm_buffer_for_mega_moe(
+    group, num_experts, capacity, topk, hidden,
+    precision="w4a4", intermediate_hidden=intermediate)
+y = torch.empty_like(hidden_states)
+
+dg.mega_moe_pre_dispatch(hidden_states, topk_ids, topk_weights, buffer)
+dg.fp4_fp4_mega_moe(y, w1, w2, buffer, activation="swiglu")
 ```
 
-The supported W4A4 GEMM2 M tiles are 16, 32, 64, 128 and 256. For MXFP4 GEMM1
-output, omitted or zero `gemm2_block_m` selects the GEMM2 tile automatically;
-without `tuning`, both stages select it from workspace capacity. BF16 GEMM1
-output retains the GEMM1 padding. Explicit GEMM2 `configs` or `expected_m`
-overrides must be paired with a matching GEMM1 `gemm2_block_m`. BF16 and FP8
-scatter use the same default padding. Other precisions use their dispatch
-row layout. Metadata is recomputed for current routing on every launch and
-Graph replay, including empty ranks. All precisions apply routing weights
-after GEMM2, during combine.
-Only `valid_m_rows` rows per expert contain defined activation and route data;
-padding must not be consumed as a routed row.
-
-
-| `precision` | GEMM1 `activation` | `output_quantization` | GEMM2 scatter output |
-| --- | --- | --- | --- |
-| `w4a4` | `None`, `swiglu`, `step`, `situ` | `None` (BF16); `mxfp4` requires an activation | BF16 or FP8 |
-| `w4a16` | `situ` | `None` (BF16) | BF16 |
-| `fp8_channelwise` | `swiglu`, `swiglu_oai` | `None` (BF16) or `fp8` (per-token scales) | BF16 |
-| `fp8_blockwise` | `None` | `None` (raw BF16 projection) | BF16 |
-| `fp8_blockwise` | `swiglu`, `swiglu_oai` | `fp8` (128-element block scales) | BF16 |
-
-Unsupported combinations raise before dispatch; the selector does not silently
-change activation or quantization. Optional `activation_limit` is a positive
-finite clamp; use `None` to disable it. `activation_alpha` is accepted only for
-`swiglu_oai` (default 1.702). SiTU uses `situ_beta=4` and
-`situ_linear_beta=25`.
-
-Quantized GEMM1 output requires `out_scales`. The channelwise path also requires
-`bf16_scratch`, preserving the existing fused/separate-quantization scheduling
-without a hidden large allocation. All GEMM1 and GEMM2 paths accept
-`rhs_replicas=(weight, scales)`. Physical expert slots are ordered as masters
-followed by replicas on each rank; their total must match the workspace. W4A4 GEMM1 takes only the tile-packed
-uint16 scale layout, prepared once as shown in `_pack_gemm1_scales`.
-
-For example, channelwise FP8 with SwiGLU-OAI and quantized GEMM1 output uses:
-
-```python
-dg.mega_moe_dispatch_gemm1(
-    buffer, (w13, w13_scales), quant_output, rank, num_tokens,
-    precision="fp8_channelwise", activation="swiglu_oai",
-    output_quantization="fp8", out_scales=quant_scales,
-    bf16_scratch=activated, activation_limit=7.0, activation_alpha=1.702)
-```
-
-GEMM2 requires `m_indices` for channelwise FP8 and `row_offsets` for blockwise
-FP8. W4A4 requires `row_offsets=meta.src_m_offsets` for the activation and
-scale inputs, which retain GEMM1 row padding. Packed routes follow GEMM2 padding.
-`configs` retains the existing backend tile tuple; blockwise FP8 selects BM128
-or BM192 internally, using `tuning.gemm2_tile` when supplied by a profile.
-Blockwise GEMM1 weights must be prepared with
-`interleave_fp8_blockwise_mega_moe_weights`: it interleaves 128 gate rows and
-128 up rows and retains native `[experts, N/128, K/128]` scales. Previously
-cached G8 weights and expanded `[experts, N/8, K/128]` scales must be regenerated
-from logical weights and native scales; the old scale shape is rejected.
-Options specific to a different backend are rejected. See each precision
-file for the workspace allocation and complete call chain. Each pipeline uses
-public APIs. References compute the entire MoE from source inputs, routing and
-logical expert weights with Torch, without consuming kernel intermediates.
-
-Workspace layout and scatter tile queries are internal implementation details.
-Use `get_symm_buffer_for_mega_moe` for allocation and
-`get_mega_moe_tuning_config` for measured workload presets with heuristic fallback.
-
-The metadata views contain `m_rows`, `valid_m_rows`, `m_offsets`, `src_m_rows`,
-`src_m_offsets` and `token_meta`. All precisions use packed int64 `[pool]`
-routes in GEMM2 row order: rank in bits 63:32, top-k slot in bits 31:24,
-and token in bits 23:0. Dispatch/GEMM1 writes these routes together with the
-row metadata; `get_gemm2_metadata()` only returns views and launches no kernel.
-Activation tensors stay in their source layout. All precisions use the same
-metadata accessor; GEMM1 no longer accepts separate `m_rows` or `packed_src`
-output parameters.
+Use `bf16_fp4_mega_moe` for W4A16 SiTU, and `fp8_fp8_mega_moe` for FP8
+channelwise or blockwise. The workspace precision selects the FP8 backend.
+The complete entry owns metadata, scratch, tuning selection, GEMM2/scatter,
+count recycling and combine. It writes directly into `y`.
+[The public calling contract](../README.md#megamoe) documents weight layouts,
+activation support and workspace reuse.
 
 The primary model matrix uses **1024, 2048 and 4096 input tokens per rank**,
 defined by `MODEL_TOKENS` in `moe_test_utils.py`. These are generated MoE layer
@@ -411,19 +306,23 @@ For MiniMax blockwise, use `tests/test_moe_w8a8.py --case minimax_m3_blockwise`;
 two, four or eight nodes provide EP16, EP32 or EP64. All participating devices
 must support Torch symmetric-memory peer access within the same fabric domain.
 
-All precisions apply routing weights in `mega_moe_combine`, after GEMM2.
-Pass the FP32 routing weights with invalid routing IDs masked to zero.
-GEMM1 activation and output quantization operate on unweighted values.
-The W4A4 example uses `buffer.input_topk_weights[:num_tokens]` for combine-stage
-weighting: pre-dispatch refreshes this view and zeros invalid routes on every
-launch. This keeps changing router weights visible during graph replay without
-an additional masking kernel.
+All precisions apply original routing weights once, during combine after GEMM2.
+Pass them only to `mega_moe_pre_dispatch`; the library masks invalid routes and
+refreshes the weight view on every graph replay. Quantization scales remain
+separate from routing weights.
 
 The CLI checks every requested token by default. `--reference-tokens N` limits
 the numerical comparison to the first N tokens on each rank while still running
 the complete workload. Pytest uses bounded references for large model cases and
 checks every smoke token. Correctness also checks finite output, a poisoned
-combine buffer and repeated graph replay with changed inputs.
+combine buffer and repeated graph replay with changed inputs. The changed
+inputs/routes/weights are checked against the independent Torch reference with
+the same numerical thresholds, as well as bitwise against eager execution.
+
+`--routing round_robin` retains the original balanced distribution.
+`--routing random` chooses distinct random experts per token;
+`--routing skewed` sends 80% of tokens to the same top-k experts. All three
+precision runners support these options and record the choice in their JSON.
 
 `--edge-cases` injects masked routes, zero routing weights and an empty final
 rank when `--tokens` includes 1. `--replicas` places the final local physical
@@ -449,48 +348,25 @@ EP, token counts and timing mode fixed when comparing results.
 
 ## Pipeline and synchronization
 
-Every precision example uses the public pre-dispatch, dispatch/GEMM1,
-GEMM2/scatter and combine APIs in sequence on one stream. GEMM1 also prepares
-GEMM2 metadata. Scatter completes its local/remote stores; combine performs
-the cross-rank barrier and reduction. There is no separate IPC barrier call.
-All precisions multiply each valid route by its routing weight during combine.
+Each example allocates a library workspace and transforms logical weights once.
+Its forward function calls `mega_moe_pre_dispatch` and the corresponding
+complete entry point (`fp4_fp4_mega_moe`, `bf16_fp4_mega_moe`, or
+`fp8_fp8_mega_moe`), writing into a preallocated BF16 output.
+See the [public API contract](../README.md#megamoe) for a standalone example.
+Normal forward code does not allocate communication buffers or access metadata.
 
-The BF16 combine buffer is `[topk, capacity, hidden]`. Invalid routes must have
-zero combine weights so the reducer skips unwritten slots. `CombineBarrier`
-owns one peer-visible generation counter per rank and one local completion
-flag. All ranks, including empty ranks, invoke the pipeline in the same order.
-Keep these buffers alive across graph replay. The next dispatch synchronizes
-buffer reuse; each concurrent MoE invocation needs its own state.
+The workspace owns the generation barrier, local completion flag, scratch,
+route metadata and BF16 combine storage. All ranks, including empty ones,
+invoke the pipeline in the same order on one stream. Keep the workspace and
+weights alive across graph replay; overlapping invocations need separate
+workspaces. Counters are recycled by the library before the next invocation.
 
-`compile_kernels` compiles and loads native kernels without launching them,
-then all ranks synchronize before entering cooperative device barriers.
-The router and shared-expert branch are outside these routed MoE examples.
-
-## Reusing the W4A4 example
-
-`W4A4MoE` in `test_moe_w4a4.py` is a reusable example workspace, not another
-library API. It preprocesses logical GEMM1 weights and raw scales into groups
-of eight gate rows followed by eight up rows: `g0,...,g7,u0,...,u7,g8,...`.
-SwiGLU, STEP and SiTU use this G8 layout for BF16 and MXFP4 output.
-Gate/up projections and their clamps are rounded to BF16; activation arithmetic
-uses FP32, then rounds to BF16 before MXFP4 quantization. Routing weights are
-applied during combine. Library callers must apply the same G8
-row permutation to weights and raw E8M0 scales before packing scales into
-GEMM1 N tiles; see `interleave_gate_up` and `_pack_gemm1_scales` in the example.
-Previously prepared G1 weights and scales must be rebuilt in G8 order.
-
-After initializing a process group:
-
-```python
-from test_moe_w4a4 import W4A4MoE
-
-# w1/w2: (packed FP4, raw E8M0 scales) for local logical expert weights.
-# w1 rows are [gate; up]. Input dtypes are BF16, int64 and float32.
-moe = W4A4MoE(case, group, w1, w2)
-moe.set_inputs(hidden_states, topk_ids, topk_weights)
-moe.compile()
-output = moe.forward()
-# Call compile() on all ranks again after binding new input shapes.
-torch.cuda.synchronize()
-moe.close()
-```
+Tests poison private combine storage with NaNs exclusively for fault injection.
+Graph checks change inputs, routes (including all-invalid routes) and weights
+between consecutive calls and compare eager and captured results exactly.
+Every changed workload is also checked against the independent numerical
+reference, including tiny/nonuniform weights and all-zero weights. Smoke runs
+check unsupported public factory/entry combinations before cooperative compute.
+`compile_kernels` compiles native kernels without launching them, then ranks
+synchronize before entering cooperative device barriers. The router and
+shared-expert branch are outside these routed MoE examples.

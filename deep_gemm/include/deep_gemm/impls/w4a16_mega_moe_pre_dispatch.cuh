@@ -28,8 +28,7 @@ CUTLASS_DEVICE void pre_dispatch_kernel_device(
         if (route < int64_t(num_tokens) * kTopk) {
             if (topk_ids != staged_ids)
                 staged_ids[route] = topk_ids[route];
-            if (topk_weights != staged_weights)
-                staged_weights[route] = topk_weights[route];
+            staged_weights[route] = topk_ids[route] >= 0 ? topk_weights[route] : 0.0f;
         }
     }
 }
