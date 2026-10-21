@@ -2,7 +2,7 @@
 # Run with: python tests/run_deep_gemm.py --caselist tests/checkin/checkin_890p.list
 # Minimal per-type correctness set with 890P-only dtypes (fp8 / fp4).
 # W4A16 INT4 and MXFP4 VALU paths are covered on both 810E and 890P.
-# W4A16 MXFP4 MMA is additionally covered on 890P.
+# W4A16 MXFP4 MMA and W4FA8 (MXFP4 weights / per-row FP8 activation) are covered on 890P.
 # MQA coverage focuses on FP8/FP4, plus one BF16 and one INT8 smoke case.
 # Eight paged MQA cases total, including avg, sparse, and the INT8 smoke case.
 # Sections are split per UT type; append new cases under the matching section.
@@ -96,6 +96,10 @@ GroupedMasked,data_type:w4fa16,groups:96,m:3072,n:2048,k:7168,quant_type:group,g
 # --- GroupedMasked / w4fa16_mma (MXFP4 MMA) ---
 GroupedMasked,data_type:w4fa16_mma,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
 
+# --- GroupedMasked / w4fa8_mma (MXFP4 weights / FP8 activation) ---
+GroupedMasked,data_type:w4fa8_mma,groups:4,m:101,n:192,k:256,em:26,distribution:[0,1,33,67],quant_type:group,group_size:32
+GroupedMasked,data_type:w4fa8_mma,groups:28,m:448,n:6144,k:4096,em:16,distribution:uniform,quant_type:group,group_size:32
+
 # ============ GroupedNoPad ============
 
 # --- GroupedNoPad / bf16 ---
@@ -123,6 +127,11 @@ GroupedNoPad,data_type:w4fa16,groups:384,m:3072,n:512,k:7168,quant_type:group,gr
 
 # --- GroupedNoPad / w4fa16_mma (MXFP4 MMA) ---
 GroupedNoPad,data_type:w4fa16_mma,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
+
+# --- GroupedNoPad / w4fa8_mma (MXFP4 weights / FP8 activation) ---
+GroupedNoPad,data_type:w4fa8_mma,groups:4,m:35,n:64,k:128,distribution:[0,1,17,17],quant_type:group,group_size:32
+GroupedNoPad,data_type:w4fa8_mma,groups:4,m:83,n:768,k:128,distribution:[0,1,17,65],quant_type:group,group_size:32
+GroupedNoPad,data_type:w4fa8_mma,groups:384,m:3072,n:512,k:7168,distribution:uniform,quant_type:group,group_size:32
 
 # ============ GroupedContiguous ============
 
@@ -159,6 +168,10 @@ GroupedFused,data_type:w4fa16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_t
 
 # --- GroupedFused / w4fa16_mma (MXFP4 MMA) ---
 GroupedFused,data_type:w4fa16_mma,groups:384,num_token:8,topk:8,n:512,k:7168,quant_type:group,group_size:32
+
+# --- GroupedFused / w4fa8_mma (MXFP4 weights / FP8 activation) ---
+GroupedFused,data_type:w4fa8_mma,groups:8,num_token:17,topk:3,n:192,k:256,quant_type:group,group_size:32
+GroupedFused,data_type:w4fa8_mma,groups:28,num_token:256,topk:8,n:768,k:3584,quant_type:group,group_size:32
 
 # ============ MqaLogits ============
 
