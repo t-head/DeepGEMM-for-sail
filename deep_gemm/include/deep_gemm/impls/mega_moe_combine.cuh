@@ -3,20 +3,11 @@
 #include <hggc_bf16.h>
 #include <hggc_fp16.h>
 #include <hggc_fp8.h>
+#include <deep_gemm/tix/sys_atomics.cuh>
 
 namespace deep_gemm::mega_moe::detail {
 
 constexpr uint64_t kBarrierTimeoutCycles = 600000000000ULL;
-
-__device__ __forceinline__ int32_t load_barrier_flag(const int32_t* ptr) {
-    int32_t value;
-    asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(value) : "l"(ptr) : "memory");
-    return value;
-}
-
-__device__ __forceinline__ void combine_fence() {
-    asm volatile("fence.acq_rel.sys;" ::: "memory");
-}
 
 // Every rank enqueues this kernel after its scatter on the same stream. Each
 // flag points to one zero-initialized, peer-visible int32 generation counter.
@@ -29,18 +20,17 @@ __device__ __forceinline__ void combine_barrier(int32_t** flags, int rank, int w
         if (tid < 32) {
             int32_t generation = 0;
             // Order completed scatter writes before publishing this rank.
-            combine_fence();
+            tix::fence_acq_rel_sys();
             if (tid == 0) {
-                generation = static_cast<int32_t>(static_cast<uint32_t>(load_barrier_flag(flags[rank])) + 1u);
-                asm volatile("st.volatile.global.s32 [%0], %1;"
-                             :: "l"(flags[rank]), "r"(generation) : "memory");
+                generation = static_cast<int32_t>(static_cast<uint32_t>(tix::load_volatile(flags[rank])) + 1u);
+                tix::store_volatile(flags[rank], generation);
             }
             generation = __shfl_sync(0xffffffffu, generation, 0);
             const auto start = clock64();
             while (true) {
                 bool arrived = true;
                 for (int peer_rank = tid; peer_rank < world; peer_rank += 32) {
-                    const int32_t peer = load_barrier_flag(flags[peer_rank]);
+                    const int32_t peer = tix::load_volatile(flags[peer_rank]);
                     // A peer may be one generation ahead. Unsigned subtraction
                     // handles the int32 wraparound without signed overflow.
                     arrived &= static_cast<int32_t>(static_cast<uint32_t>(peer) -
@@ -51,24 +41,24 @@ __device__ __forceinline__ void combine_barrier(int32_t** flags, int rank, int w
                 if (clock64() - start > kBarrierTimeoutCycles) {
                     if (tid == 0)
                         printf("MegaMoE combine barrier timeout: rank=%d generation=%d\n", rank, generation);
-                    asm volatile("trap;");
+                    asm volatile("ppu.trap;");
                 }
             }
-            combine_fence();
+            tix::fence_acq_rel_sys();
             if (tid == 0)
                 atomicExch(done, 1);
         }
     } else if (tid == 0) {
         const auto start = clock64();
-        while (load_barrier_flag(done) == 0) {
+        while (tix::load_volatile(done) == 0) {
             if (clock64() - start > kBarrierTimeoutCycles)
-                asm volatile("trap;");
+                asm volatile("ppu.trap;");
         }
     }
     // One thread acquires completion for the CTA; the converged CTA barrier
     // orders all consumers after that acquire. Data loads bypass the L1 cache.
     if (tid == 0)
-        combine_fence();
+        tix::fence_acq_rel_sys();
 #if __HGGC_ARCH__ == 150
     __ppu_barrier_sync_nocnt(0, 1);
 #else

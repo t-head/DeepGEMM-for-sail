@@ -30,11 +30,12 @@
 // routing can be validated independently of the FP4 details (gemm1 is gated by
 // `kEnableGemm1`).
 //
-// All cross-rank "lock" primitives are the PPU-verified `.sys` PTX wrappers
-// (see tests/test_ppu_sys_scope.py and ptx/sys_atomics.cuh).
+// Cross-rank acquire/release operations use the scope-aware PPU wrappers in
+// tix/sys_atomics.cuh.
 // ============================================================================
 
 #include <cstdint>
+#include <cute/arch/copy_ppu.hpp>
 #include <hggc_runtime.h>
 #include <hggc_bf16.h>
 #include <deep_gemm/layout/mega_moe_common.cuh>
@@ -167,7 +168,7 @@ CUTLASS_DEVICE void mega_moe_dispatch_handshake(
             } else {
                 const uint64_t send_value =
                     (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
-                const uint64_t old_value = ptx::atomic_add_sys(
+                const uint64_t old_value = tix::atomic_add_sys(
                     workspace.get_expert_send_count_ptr(i), send_value);
                 smem_expert_count[i] = static_cast<uint32_t>(old_value);
             }
@@ -216,7 +217,7 @@ CUTLASS_DEVICE void mega_moe_dispatch_handshake(
                 workspace.get_expert_recv_count_ptr(
                     sym_buffer.rank_idx, local_expert_idx),
                 dst_rank_idx) = expert_status & 0xffffffffull;
-            ptx::atomic_add_sys(
+            tix::atomic_add_sys(
                 sym_buffer.map(
                     workspace.get_expert_recv_count_sum_ptr(local_expert_idx),
                     dst_rank_idx),
@@ -728,25 +729,27 @@ dispatch_gemm1_body(
                         auto* ms = pull_sf + warp_idx * sf_bytes;
                         // Commit scales first so their transpose can overlap the token copy.
                         for (uint32_t i = lane_idx; i < sf_bytes/16; i += 32)
-                            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
-                                :: "r"((unsigned)__cvta_generic_to_shared(ms + i*16)), "l"(rsf + i*16));
-                        asm volatile("cp.async.commit_group;\n" ::);
+                            cute::PPU_CP_ASYNC_CACHEALWAYS<uint4>::copy(
+                                *reinterpret_cast<const uint4*>(rsf + i*16),
+                                *reinterpret_cast<uint4*>(ms + i*16));
+                        cute::cp_async_fence();
                         for (uint32_t i = lane_idx; i < token_bytes/16; i += 32)
-                            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
-                                :: "r"((unsigned)__cvta_generic_to_shared(mt + i*16)), "l"(rt + i*16));
-                        asm volatile("cp.async.commit_group;\n" ::);
+                            cute::PPU_CP_ASYNC_CACHEALWAYS<uint4>::copy(
+                                *reinterpret_cast<const uint4*>(rt + i*16),
+                                *reinterpret_cast<uint4*>(mt + i*16));
+                        cute::cp_async_fence();
                         asm volatile("" ::: "memory");
                         uint32_t gemm2_pool_idx = 0;
                         if constexpr (kGemm2BlockM != 0)
                             gemm2_pool_idx = dist_get<kPerLaneSlots>(l_gemm2_off, bi.e) + actual_t;
                         asm volatile("" ::: "memory");
-                        asm volatile("cp.async.wait_group 1;\n" ::);
+                        cute::cp_async_wait<1>();
                         __syncwarp();
                         // Each scale column keeps the allocated BLOCK_M row stride.
                         for (uint32_t j = lane_idx; j < kSfCols; j += 32)
                             sfa_base[j * BLOCK_M + t] = static_cast<uint16_t>(ms[2*j]) |
                                 (static_cast<uint16_t>(ms[2*j+1]) << 8);
-                        asm volatile("cp.async.wait_all;\n" ::);
+                        cute::cp_async_wait<0>();
                         __syncwarp();
                         warp_copy_bytes(
                             dispatched_token_pool + static_cast<uint64_t>(pool_idx) * token_bytes,
@@ -787,7 +790,7 @@ dispatch_gemm1_body(
                     if (publish_arrivals) {
                         __syncthreads();
                         if (thread_idx == 0)
-                            ptx::red_add_rel(
+                            tix::red_add_rel(
                                 workspace.get_l1_arrival_count_ptr(g), 1u);
                         __syncthreads();
                     }
@@ -802,7 +805,7 @@ dispatch_gemm1_body(
                         __threadfence();
                         __syncthreads();
                         if (thread_idx == 0)
-                            ptx::red_add_rel(workspace.get_l1_arrival_count_ptr(g), 1u);
+                            tix::red_add_rel(workspace.get_l1_arrival_count_ptr(g), 1u);
                     }
                 }
             } else {
@@ -814,7 +817,7 @@ dispatch_gemm1_body(
                             // finished its token, SFA, weight, and metadata stores.
                             __syncthreads();
                             if (thread_idx == 0)
-                                ptx::red_add_rel(
+                                tix::red_add_rel(
                                     workspace.get_l1_arrival_count_ptr(g), 1u);
                         }
                     }
@@ -920,7 +923,7 @@ dispatch_gemm1_body(
                         m_block_idx * BLOCK_M,
                         umin(group_m, (m_block_idx + 1) * BLOCK_M)};
                     if constexpr (kSmSpecialization && kEnableRemotePull) {
-                        while (ptx::ld_acq(
+                        while (tix::ld_acq(
                                    workspace.get_l1_arrival_count_ptr(g)) < kNumPullCTAs);
                     }
 

@@ -2,6 +2,7 @@
 
 #include <cutlass/cutlass.h>
 #include <hggc_bf16.h>
+#include <hggc_fp8.h>
 #include <hggc_runtime.h>
 #include <cstdint>
 #include <math.h>
@@ -11,7 +12,7 @@ namespace deep_gemm::mega_moe::fp8_channelwise {
 // BF16 -> E4M3 row quantization and local token-quad staging for the FP8
 // MegaMoE path. The quantization contract intentionally matches the existing
 // per-token FP8 operator: per-token absmax / 448.f followed by
-// cvt.rn.satfinite.e4m3x2.f32. Writing router metadata from the same CTA
+// the SDK's saturating round-to-nearest E4M3 conversion. Writing router metadata from the same CTA
 // removes temporary FP8/scale tensors and the four follow-up copies.
 template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t BLOCK_THREADS = 256>
 CUTLASS_DEVICE void fp8_mega_moe_pre_dispatch_kernel_device(
@@ -94,10 +95,8 @@ CUTLASS_DEVICE void fp8_mega_moe_pre_dispatch_kernel_device(
             const float2 values = __bfloat1622float2(pairs[i]);
             const float q0 = values.x * scale_inv;
             const float q1 = values.y * scale_inv;
-            uint16_t packed;
-            asm volatile(
-                "cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
-                : "=h"(packed) : "f"(q1), "f"(q0));
+            const uint16_t packed = __hg_cvt_float2_to_fp8x2(
+                make_float2(q0, q1), __HG_SATFINITE, __HG_E4M3);
             output_packed[vec * (kVecElems / 2) + i] = packed;
         }
     }

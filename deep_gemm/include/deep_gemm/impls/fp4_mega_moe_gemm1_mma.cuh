@@ -23,19 +23,17 @@
 #include <hggc_bf16.h>
 
 #include <cutlass/fast_math.h>
+#include <deep_gemm/tix/cvt.cuh>
 #include <deep_gemm/impls/fp4_gemm_cutlass3.cuh>
 
 namespace deep_gemm::mega_moe::fp4 {
 
-// hggc_bf16.hpp guards tanh.approx.bf16x2 with NVIDIA's SM90 macro. PPU0015
-// reports cc=8.9, so spell the packed BF16 input/output TIX operation directly
-// instead of taking the CUDA header's fallback. TIX is a virtual ISA: the
-// current ppu0015 backend lowers this operation to scalar v.tanh.f32 physical
-// instructions, which is intentionally checked by the benchmark and hgobjdump.
+// Match hggc_bf16.hpp's packed tanh operation directly: the CUDA-compatible
+// headers gate their equivalent on SM90, while this kernel targets PPU0015.
 __device__ __forceinline__ __ppu_bfloat162 ppu_tanh_approx_bf16x2(
         const __ppu_bfloat162 value) {
     __ppu_bfloat162 result;
-    asm volatile("tanh.approx.bf16x2 %0, %1;"
+    asm volatile("ppu.tanh.approx.bf16x2 %0, %1;"
                  : "=r"(__BFLOAT162_TO_UI(result))
                  : "r"(__BFLOAT162_TO_CUI(value)));
     return result;
@@ -510,27 +508,8 @@ __device__ __forceinline__ void gemm1_mma_block(
                 for (int i = 0; i < kElemPerThread; ++i)
                     q[i] = values[i] * sf_inv;
 
-                uint32_t packed0, packed1;
-                asm volatile(
-                    "{ .reg .b8 r0, r1, r2, r3; "
-                    "cvt.rn.satfinite.e2m1x2.f32 r0, %2, %1; "
-                    "cvt.rn.satfinite.e2m1x2.f32 r1, %4, %3; "
-                    "cvt.rn.satfinite.e2m1x2.f32 r2, %6, %5; "
-                    "cvt.rn.satfinite.e2m1x2.f32 r3, %8, %7; "
-                    "mov.b32 %0, {r0, r1, r2, r3}; }"
-                    : "=r"(packed0)
-                    : "f"(q[0]), "f"(q[1]), "f"(q[2]), "f"(q[3]),
-                      "f"(q[4]), "f"(q[5]), "f"(q[6]), "f"(q[7]));
-                asm volatile(
-                    "{ .reg .b8 r0, r1, r2, r3; "
-                    "cvt.rn.satfinite.e2m1x2.f32 r0, %2, %1; "
-                    "cvt.rn.satfinite.e2m1x2.f32 r1, %4, %3; "
-                    "cvt.rn.satfinite.e2m1x2.f32 r2, %6, %5; "
-                    "cvt.rn.satfinite.e2m1x2.f32 r3, %8, %7; "
-                    "mov.b32 %0, {r0, r1, r2, r3}; }"
-                    : "=r"(packed1)
-                    : "f"(q[8]), "f"(q[9]), "f"(q[10]), "f"(q[11]),
-                      "f"(q[12]), "f"(q[13]), "f"(q[14]), "f"(q[15]));
+                const uint32_t packed0 = tix::cvt_rte_fp4x8_f32(q);
+                const uint32_t packed1 = tix::cvt_rte_fp4x8_f32(q + 8);
                 auto* out = reinterpret_cast<uint2*>(
                     fp4_output + (uint64_t)m_row * ld_fp4 + elem_base / 2);
                 *out = make_uint2(packed0, packed1);
@@ -566,8 +545,7 @@ __device__ __forceinline__ void gemm1_mma_block(
                                         v1 = fminf(fmaxf(v1, -clamp_limit), clamp_limit);
                                     }
                                 }
-                                uint32_t packed;
-                                asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(packed) : "f"(v1), "f"(v0));
+                                const uint32_t packed = tix::cvt_rte_bf16x2_f32(v1, v0);
                                 dst[i] = packed;
                             }
                             if constexpr (kVec % 2 == 1) {

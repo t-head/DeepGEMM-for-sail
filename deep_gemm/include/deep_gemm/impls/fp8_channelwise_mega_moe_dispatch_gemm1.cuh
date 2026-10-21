@@ -59,8 +59,8 @@ CUTLASS_DEVICE void warp_quantize_bf16_row_cached(
                 cached[(elem / (32 * kVec)) * (kVec / 2) + i]);
             const float value0 = value.x * scale_inv;
             const float value1 = value.y * scale_inv;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n"
-                : "=h"(packed2[i]) : "f"(value1), "f"(value0));
+            packed2[i] = __hg_cvt_float2_to_fp8x2(
+                make_float2(value0, value1), __HG_SATFINITE, __HG_E4M3);
         }
         *reinterpret_cast<uint4*>(dst + elem) = packed;
     }
@@ -413,7 +413,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
             }
             __syncthreads();
             if (thread_idx == 0)
-                ptx::red_add_rel(
+                tix::red_add_rel(
                     workspace.get_l1_arrival_count_ptr(g), 1u);
         }
     }
@@ -484,7 +484,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
 
             constexpr uint32_t kRequiredArrivals =
                 kNumPullCTAs / (kTripleBlockPull ? 3 : kPairedBlockPull ? 2 : 1);
-            while (ptx::ld_acq(
+            while (tix::ld_acq(
                        workspace.get_l1_arrival_count_ptr(global_m_block)) < kRequiredArrivals);
 
             const bool use_replica =

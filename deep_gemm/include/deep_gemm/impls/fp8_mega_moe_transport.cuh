@@ -97,8 +97,8 @@ CUTLASS_DEVICE void warp_quantize_bf16_row(
             const float2 value = __bfloat1622float2(src2[i]);
             const float value0 = value.x * scale_inv;
             const float value1 = value.y * scale_inv;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n"
-                : "=h"(packed2[i]) : "f"(value1), "f"(value0));
+            packed2[i] = __hg_cvt_float2_to_fp8x2(
+                make_float2(value0, value1), __HG_SATFINITE, __HG_E4M3);
         }
         *reinterpret_cast<uint4*>(dst + elem) = packed;
     }
@@ -188,7 +188,7 @@ CUTLASS_DEVICE void dispatch_handshake(
     for (uint32_t i = thread_idx; i < kNumExperts; i += kNumThreads) {
         const uint64_t value = (1ull << 32) |
             static_cast<uint64_t>(smem_expert_count[i]);
-        const uint64_t old = ptx::atomic_add_sys(
+        const uint64_t old = tix::atomic_add_sys(
             workspace.get_expert_send_count_ptr(i), value);
         smem_expert_count[i] = static_cast<uint32_t>(old & 0xffffffffull);
     }
@@ -218,7 +218,7 @@ CUTLASS_DEVICE void dispatch_handshake(
                 workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx,
                                                      local_expert),
                 dst_rank) = status & 0xffffffffull;
-            ptx::atomic_add_sys(
+            tix::atomic_add_sys(
                 sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(
                                     local_expert), dst_rank),
                 status);

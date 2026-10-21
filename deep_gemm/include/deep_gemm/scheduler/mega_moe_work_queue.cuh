@@ -2,7 +2,7 @@
 
 #include <cstdint>
 #include <cutlass/cutlass.h>
-#include <deep_gemm/ptx/sys_atomics.cuh>
+#include <deep_gemm/tix/sys_atomics.cuh>
 
 namespace deep_gemm::mega_moe {
 

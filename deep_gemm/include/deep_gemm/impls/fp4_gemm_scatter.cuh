@@ -164,7 +164,7 @@ __device__ __forceinline__ void scatter_store_fp8x16(
     uint4* ptr, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
 #if __HGGC_ARCH__ == 150
     asm volatile(
-        "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
+        "ppu.st.global.v4.b32 [%0], {%1, %2, %3, %4};"
         :: "l"(ptr), "r"(x), "r"(y), "r"(z), "r"(w) : "memory");
 #else
     *ptr = make_uint4(x, y, z, w);

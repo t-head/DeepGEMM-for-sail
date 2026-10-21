@@ -5,6 +5,8 @@
 #include <hggc_runtime.h>
 #include <cstdint>
 #include <math.h>
+#include <deep_gemm/tix/cvt.cuh>
+#include <deep_gemm/tix/utils.cuh>
 
 namespace deep_gemm::mega_moe::fp4 {
 
@@ -69,24 +71,12 @@ CUTLASS_DEVICE void fp4_mega_moe_pre_dispatch_kernel_device(
                 const float dequant_scale = local_max * (1.0f / 6.0f);
                 const uint32_t scale_exp = (__float_as_uint(dequant_scale) + 0x007fffffu) & 0x7f800000u;
                 const float scale_f = __uint_as_float(scale_exp);
-                float inv_scale;
-                asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv_scale) : "f"(scale_f));
+                const float inv_scale = tix::reciprocal_approx_ftz(scale_f);
 
-                uint32_t b0, b1, b2, b3;
-                asm volatile(
-                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
-                    : "=r"(b0) : "f"(vals[0] * inv_scale), "f"(vals[1] * inv_scale));
-                asm volatile(
-                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
-                    : "=r"(b1) : "f"(vals[2] * inv_scale), "f"(vals[3] * inv_scale));
-                asm volatile(
-                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
-                    : "=r"(b2) : "f"(vals[4] * inv_scale), "f"(vals[5] * inv_scale));
-                asm volatile(
-                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
-                    : "=r"(b3) : "f"(vals[6] * inv_scale), "f"(vals[7] * inv_scale));
-                token_words[vec] = (b0 & 0xffu) | ((b1 & 0xffu) << 8) |
-                                   ((b2 & 0xffu) << 16) | ((b3 & 0xffu) << 24);
+                #pragma unroll
+                for (uint32_t i = 0; i < kVecElems; ++i)
+                    vals[i] *= inv_scale;
+                token_words[vec] = tix::cvt_rte_fp4x8_f32(vals);
 
                 if ((vec & (kThreadsPerGroup - 1u)) == 0u) {
                     sf_row[vec / kThreadsPerGroup] = static_cast<uint8_t>(scale_exp >> 23);
@@ -116,24 +106,12 @@ CUTLASS_DEVICE void fp4_mega_moe_pre_dispatch_kernel_device(
                 const float dequant_scale = local_max * (1.0f / 6.0f);
                 const uint32_t scale_exp = (__float_as_uint(dequant_scale) + 0x007fffffu) & 0x7f800000u;
                 const float scale_f = __uint_as_float(scale_exp);
-                float inv_scale;
-                asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv_scale) : "f"(scale_f));
+                const float inv_scale = tix::reciprocal_approx_ftz(scale_f);
 
-                uint32_t b0, b1, b2, b3;
-                asm volatile(
-                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
-                    : "=r"(b0) : "f"(vals[0] * inv_scale), "f"(vals[1] * inv_scale));
-                asm volatile(
-                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
-                    : "=r"(b1) : "f"(vals[2] * inv_scale), "f"(vals[3] * inv_scale));
-                asm volatile(
-                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
-                    : "=r"(b2) : "f"(vals[4] * inv_scale), "f"(vals[5] * inv_scale));
-                asm volatile(
-                    "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
-                    : "=r"(b3) : "f"(vals[6] * inv_scale), "f"(vals[7] * inv_scale));
-                token_words[vec] = (b0 & 0xffu) | ((b1 & 0xffu) << 8) |
-                                   ((b2 & 0xffu) << 16) | ((b3 & 0xffu) << 24);
+                #pragma unroll
+                for (uint32_t i = 0; i < kVecElems; ++i)
+                    vals[i] *= inv_scale;
+                token_words[vec] = tix::cvt_rte_fp4x8_f32(vals);
 
                 if ((vec & (kThreadsPerGroup - 1u)) == 0u) {
                     sf_row[vec / kThreadsPerGroup] = static_cast<uint8_t>(scale_exp >> 23);

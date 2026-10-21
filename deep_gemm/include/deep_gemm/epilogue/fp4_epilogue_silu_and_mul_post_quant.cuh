@@ -1,5 +1,7 @@
 #pragma once
 
+#include <deep_gemm/tix/cvt.cuh>
+
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/dispatch_policy.hpp>
 #include <cutlass/epilogue/collective/detail.hpp>
@@ -83,11 +85,7 @@ public:
       : DefaultEpilogueNoTsm<StrideC_, StrideD_, ThreadEpilogueOp_, EpilogueSchedule_, IsAlignedN>(params_, shared_storage), params(params_), epilogue_op(params_.thread) { }
 
   static CUTLASS_DEVICE uint8_t pcnvt_f4x2_f32x2(float hi, float lo) {
-    uint8_t b;
-    asm ("ppu.cvt.rtte.satfinite.e2m1x2.f32 %0, %1, %2;\n"
-      : "=c"(b)
-      : "f"(hi), "f"(lo));
-    return b;
+    return deep_gemm::tix::cvt_rte_fp4x2_f32(hi, lo);
   }
 
   // `smem_act_tensor_ptr` is already advanced to the row of the current step_m, so all the

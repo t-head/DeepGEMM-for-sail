@@ -389,7 +389,7 @@ public:
               const uint32_t first = (deep_scheduler.curr_cumsum_m + row) / params.dispatch_block_m;
               const uint32_t last = (deep_scheduler.curr_cumsum_m + cute::min(row + uint32_t(BlockM), valid) - 1) / params.dispatch_block_m;
               for (uint32_t g = first; g <= last; ++g)
-                while (deep_gemm::ptx::ld_acq(params.arrival_counts + g) == 0) {}
+                while (deep_gemm::tix::ld_acq(params.arrival_counts + g) == 0) {}
             }
             return true;
           }

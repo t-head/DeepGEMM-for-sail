@@ -311,7 +311,7 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
             __threadfence();
             __syncthreads();
             if (thread == 0)
-                ptx::red_add_rel(ws.get_l1_arrival_count_ptr(g), 1u);
+                tix::red_add_rel(ws.get_l1_arrival_count_ptr(g), 1u);
         }
     }
     if (sm >= kPullCTAs || kDynamicWork) {
@@ -342,7 +342,7 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
                 const uint32_t base = pool_base + local_begin;
                 const uint32_t first = base / kBlockM, last = (base + valid - 1) / kBlockM;
                 for (uint32_t ready = first; ready <= last; ++ready)
-                    while (ptx::ld_acq(ws.get_l1_arrival_count_ptr(ready)) == 0) {}
+                    while (tix::ld_acq(ws.get_l1_arrival_count_ptr(ready)) == 0) {}
                 asm volatile("" ::: "memory");
                 uint32_t weight_expert = expert;
                 const uint8_t* weight_base = w1;
