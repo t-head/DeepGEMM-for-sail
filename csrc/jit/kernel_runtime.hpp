@@ -120,6 +120,11 @@ inline int get_compile_mode() {
     return static_cast<int>(compile_mode_ref());
 }
 
+inline bool is_compile_only() {
+    return get_compile_mode() == static_cast<int>(CompileMode::ONLY_COMPILE) or
+           not get_env<std::string>("HGGC_WARM_UP").empty();
+}
+
 template <typename Derived>
 class LaunchRuntime {
 public:
@@ -143,8 +148,7 @@ public:
     static void launch(const std::shared_ptr<KernelRuntime>& kernel_runtime, const Args& args) {
         // Compile-only / warm-up mode: Compiler::build already compiled + cached the kernel above, so
         // skip the actual launch. Mirrors Python `Runtime.__call__` ONLY_COMPILE / HGGC_WARM_UP check.
-        if (get_compile_mode() == static_cast<int>(CompileMode::ONLY_COMPILE) or
-            not get_env<std::string>("HGGC_WARM_UP").empty())
+        if (is_compile_only())
             return;
 
         const auto& kernel = kernel_runtime->kernel;

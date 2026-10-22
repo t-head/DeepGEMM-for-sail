@@ -440,13 +440,33 @@ def prepare_w4_weights(y, group_size=32, d='w4a16'):
         'w4fa16_mma': deep_gemm.PreprocessMode.W4A16_MXFP4_MMA,
         'w4fa8_mma': deep_gemm.PreprocessMode.W4A8_MXFP4_MMA,
     }
-    ref, packed, scales = quant_w4(y, group_size, d)
+    warm_up = bool(os.environ.get('HGGC_WARM_UP'))
+    if warm_up:
+        # Only shapes/layouts reach GEMM compilation; launch is suppressed by
+        # the runtime. Avoid quantizing and decoding full reference weights
+        # (several GiB per expert bank) in every parallel compiler process.
+        # W4 preprocessing permutes each expert independently using Torch.
+        # Prepare one expert, then repeat its final layout: processing the
+        # entire bank here would still create huge INT32 temporary tensors.
+        assert group_size == 32 and y.shape[-1] % group_size == 0
+        assert y.dtype in (torch.float16, torch.bfloat16)
+        ref = y
+        packed = torch.zeros((1, y.shape[1], y.shape[-1] // 2), device=y.device, dtype=torch.uint8)
+        scale_dtype = torch.bfloat16 if d == 'w4a16' else torch.uint8
+        scales = torch.full((1, y.shape[1], y.shape[-1] // group_size),
+                            1 if d == 'w4a16' else 127, device=y.device, dtype=scale_dtype)
+    else:
+        ref, packed, scales = quant_w4(y, group_size, d)
+
+    def full_expert_bank(tensor):
+        return tensor.expand(y.shape[0], *tensor.shape[1:]).contiguous() if warm_up else tensor
+
     if d == 'w4fa8_mma':
         _, scales, inverse = deep_gemm.preprocess_weights_and_scales(
             modes[d], False, weight_scale=scales)
-        return ref, packed, scales, inverse
+        return ref, full_expert_bank(packed), full_expert_bank(scales), inverse
     prepared = deep_gemm.preprocess_weights_and_scales(modes[d], False, packed, scales)
-    return ref, prepared[0], prepared[1], 1.0
+    return ref, full_expert_bank(prepared[0]), full_expert_bank(prepared[1]), 1.0
 
 
 def quantize_fp4_weight_torch(weight: torch.Tensor):
@@ -574,8 +594,8 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
             out_quanted = torch.empty((num_token * topk, (n // 4)), dtype=torch.uint8, device=tensor_device)
             out_quanted_scale = torch.empty((num_token * topk, ceil_div((n // 4), 32)), dtype=torch.uint16, device=tensor_device)
             ref_out = ref_out.to(torch.float)
-            ref_out_quanted = None
-            ref_out_quanted_scale = None
+            ref_out_quanted = torch.empty_like(out_quanted)
+            ref_out_quanted_scale = torch.empty_like(out_quanted_scale)
 
         x_fp4, x_fp4_scale = quantize_fp4_torch(x)
         x_fp4_scale = x_fp4_scale.view(torch.uint16) # x_fp4_scale is K-Major for GroupedFused
@@ -607,11 +627,11 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
                 ref_out_quanted, ref_out_quanted_scale = silu_and_mul_post_quant_torch(ref_out=ref_out, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
                 _, ref_out_quanted_scale = deep_gemm.preprocess_weights_and_scales(
                     deep_gemm.PreprocessMode.MXFP4, False, weight_scale=ref_out_quanted_scale)
-
-                return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
             else:
                 ref_out = ref_out.to(torch.bfloat16)
 
+        if is_act_and_quant_fused(epilogue_type):
+            return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == 'w4fa8_mma':
         x_quant = quant_activation(x, y_inv_scale)
@@ -685,8 +705,8 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
             out_quanted = torch.empty((m, (n // 4)), dtype=torch.uint8, device=tensor_device)
             out_quanted_scale = torch.empty((m, ceil_div((n // 4), 32)), dtype=torch.uint16, device=tensor_device)
             ref_out = ref_out.to(torch.float)
-            ref_out_quanted = None
-            ref_out_quanted_scale = None
+            ref_out_quanted = torch.empty_like(out_quanted)
+            ref_out_quanted_scale = torch.empty_like(out_quanted_scale)
 
         # Quantize x (whole tensor) and y (per group) to fp4
         x_fp4 = quantize_fp4_torch(x)
@@ -719,8 +739,8 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
                 _, ref_out_quanted_scale = deep_gemm.preprocess_weights_and_scales(
                     deep_gemm.PreprocessMode.MXFP4, False, weight_scale=ref_out_quanted_scale)
 
-                return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
-
+        if is_act_and_quant_fused(epilogue_type):
+            return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
         return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == 'w4fa8_mma':
         x_quant = quant_activation(x, y_inv_scale)
@@ -803,8 +823,8 @@ def construct_grouped_masked(num_groups: int, m: int, expected_m_per_group: int,
             out_quanted = torch.empty((num_groups, max_m, (n // 4)), dtype=torch.uint8, device=tensor_device)
             out_quanted_scale = torch.empty((num_groups, max_m, ceil_div((n // 4), 32)), dtype=torch.uint16, device=tensor_device)
             ref_out = ref_out.to(torch.float)
-            ref_out_quanted = None
-            ref_out_quanted_scale = None
+            ref_out_quanted = torch.empty_like(out_quanted)
+            ref_out_quanted_scale = torch.empty_like(out_quanted_scale)
 
         # Quantize x and y per group to fp4 and compute ref from dequantized values
         x_fp4_list, x_fp4_scale_list = [], []
@@ -817,8 +837,9 @@ def construct_grouped_masked(num_groups: int, m: int, expected_m_per_group: int,
             x_fp4_scale_list.append(a_s)
             y_fp4_list.append(b_q)
             y_fp4_scale_list.append(b_s)
-            x_ref_list.append(dequantize_fp4_torch(a_q, a_s).to(torch.float))
-            y_ref_list.append(dequantize_fp4_torch(b_q, b_s).to(torch.float))
+            if _acc_check:
+                x_ref_list.append(dequantize_fp4_torch(a_q, a_s).to(torch.float))
+                y_ref_list.append(dequantize_fp4_torch(b_q, b_s).to(torch.float))
         x_fp4 = torch.stack(x_fp4_list, dim=0)
         _, x_fp4_scale = deep_gemm.preprocess_weights_and_scales(
             deep_gemm.PreprocessMode.MXFP4, False, weight_scale=torch.stack(x_fp4_scale_list, dim=0))
@@ -842,8 +863,8 @@ def construct_grouped_masked(num_groups: int, m: int, expected_m_per_group: int,
                 _, ref_out_quanted_scale = deep_gemm.preprocess_weights_and_scales(
                     deep_gemm.PreprocessMode.MXFP4, False, weight_scale=ref_out_quanted_scale)
 
-                return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda')), signal.to('cuda'), max_m
-
+        if is_act_and_quant_fused(epilogue_type):
+            return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda')), signal.to('cuda'), max_m
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda').to(torch.bfloat16), signal.to('cuda'), max_m
     elif d == 'w4fa8_mma':
         x_quant = quant_activation(x, y_inv_scale)
@@ -1127,11 +1148,11 @@ def read_numbers_from_file(file_path):
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
-    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", "MegaMhc"]
+    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", "MegaMhc", "AttentionRegression", "Preprocess", "Activation"]
     supported_indexer_epilogue_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
-    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc),(.+)"
+    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation),(.+)"
     pattern = re.compile(dg_params)
     m = pattern.search(s.strip("."))
     if not m:
@@ -1140,7 +1161,8 @@ def parse_deepgemm_string_re(s):
     grps = m.groups()
     if grps[0] in supported_gemm_type:
         result['gemm_type'] = grps[0]
-    param_pattern = r"(\w+):(\[.*?\]|[^,]+)"
+    # A field ends at the next key, not at commas inside lists or einsum expressions.
+    param_pattern = r"(\w+):(.+?)(?=,\w+:|$)"
     match_string = re.findall(param_pattern, grps[1])
     if len(match_string) == 0:
         print("ERROR: wrong deepgemm format input, please check!!")
@@ -1275,8 +1297,15 @@ def test_gemm(args) -> None:
     print(f"test_gemm->test_func: DenseGemm,m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")
     if d == torch.float32:
         raise ValueError("DenseGemm does not implement FP32 GEMM; use HcPrenormGemm,data_type:tf32 for prenorm")
+    bias = None
+    if args.get('with_bias', False):
+        if d != torch.uint8:
+            raise ValueError('with_bias is only implemented for FP4')
+        bias = torch.randn(1, n, dtype=torch.float32, device='cuda')
     if use_ppu:
         x, y, out, ref_out = construct(m, k, n, d, quant_type=quant_type)
+        if bias is not None and _acc_check:
+            ref_out = (ref_out.float() + bias).to(torch.bfloat16)
         if d == torch.bfloat16:
             deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
         elif d == torch.int8:
@@ -1284,7 +1313,7 @@ def test_gemm(args) -> None:
         elif d == torch.float8_e4m3fn:
             deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out)
         elif d == torch.uint8:
-            deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, None, out)
+            deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, bias, out)
         else:
             print("ERROR: Unsupported dtype, please check!")
             exit(1)
@@ -1324,7 +1353,7 @@ def test_gemm(args) -> None:
             elif d == torch.float8_e4m3fn:
                 deep_gemm.gemm_fp8_fp8_bf16_nt(x, y, out)
             elif d == torch.uint8:
-                deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, None, out)
+                deep_gemm.gemm_fp4_fp4_bf16_nt(x, y, bias, out)
             else:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)
@@ -1396,6 +1425,14 @@ def test_m_grouped_gemm_contiguous(args) -> None:
         f'{(valid_m * k + num_groups * k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     return
 
+def make_grouped_fp4_bias(args):
+    if not args.get('with_bias', False):
+        return None
+    if args['data_type'] != torch.uint8 or is_act_and_quant_fused(args.get('epilogue_type', 'Default')):
+        raise ValueError('with_bias requires FP4 with the Default epilogue')
+    return torch.randn(args['groups'], args['n'], dtype=torch.float32, device='cuda')
+
+
 def test_m_grouped_gemm_masked(args) -> None:
     print('Testing grouped masked GEMM:')
 
@@ -1420,6 +1457,9 @@ def test_m_grouped_gemm_masked(args) -> None:
     print(f'test_m_grouped_gemm_masked->test_func: {case}')
     if use_ppu:
         x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit, padding_m=max_m)
+        bias = make_grouped_fp4_bias(args)
+        if bias is not None and _acc_check:
+            ref_out = (ref_out.float() + bias.unsqueeze(1)).to(torch.bfloat16)
 
         if d == torch.bfloat16:
             result = deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
@@ -1434,13 +1474,13 @@ def test_m_grouped_gemm_masked(args) -> None:
             if is_act_and_quant_fused(epilogue_type):
                 out, out_scale = out
                 ref_out, ref_out_scale = ref_out
-                result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
+                result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, bias, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal,
                                                                     out_scale=out_scale, swiglu_limit=swiglu_limit,
                                                                     activation_type=epilogue_type_to_activation(epilogue_type))
             else:
                 # `Default` epilogue
-                result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
+                result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, bias, out, masked_m, expected_m_per_group,
                                                                     enable_sbo_overlap=enable_sbo_overlap, signal=signal)
         elif d == 'w4fa8_mma':
             deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
@@ -1499,7 +1539,7 @@ def test_m_grouped_gemm_masked(args) -> None:
                 result = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group,
                                                                         enable_sbo_overlap=enable_sbo_overlap, signal=signal)
             elif d == torch.uint8:
-                result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, None, out, masked_m, expected_m_per_group,
+                result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, bias, out, masked_m, expected_m_per_group,
                                                                         enable_sbo_overlap=enable_sbo_overlap, signal=signal)
             elif d == 'w4fa8_mma':
                 deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
@@ -1588,6 +1628,9 @@ def test_m_grouped_gemm_nopad(args) -> None:
     print(UT)
     if use_ppu:
         m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit)
+        bias = make_grouped_fp4_bias(args)
+        if bias is not None and _acc_check:
+            ref_out = (ref_out.float() + bias[m_indices.long()]).to(torch.bfloat16)
         # topk = 8
         # num_token = m // topk
         # x, y, m_indices, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type, group_size, True)
@@ -1601,9 +1644,9 @@ def test_m_grouped_gemm_nopad(args) -> None:
             if is_act_and_quant_fused(epilogue_type):
                 out, out_scale = out
                 ref_out, ref_out_scale = ref_out
-                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices, out_scale=out_scale, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices, out_scale=out_scale, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
             else:
-                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices)
         elif d == 'w4fa8_mma':
             deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(x, y, out, m_indices)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
@@ -1644,7 +1687,7 @@ def test_m_grouped_gemm_nopad(args) -> None:
             elif d == torch.float8_e4m3fn:
                 deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(x, y, out, m_indices)
             elif d == torch.uint8:
-                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, None, out, m_indices)
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices)
             elif d == 'w4fa8_mma':
                 deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(x, y, out, m_indices)
             elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
@@ -2525,7 +2568,8 @@ def test_sparse_mqa_logits(args) -> None:
         # Ground truth (acc mode only — perf mode must not launch the dense kernel into the
         # cycle CSV): dense paged fp4 kernel, gathered at the selected positions
         gathered_ref, valid_mask = None, None
-        if get_acc_check():
+        # Precompile the dense JIT reference without inspecting its outputs.
+        if get_acc_check() or os.environ.get('HGGC_WARM_UP'):
             if page_kv == 64:
                 context_lens_2d = context_lens.unsqueeze(-1)
                 schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
@@ -2560,14 +2604,15 @@ def test_sparse_mqa_logits(args) -> None:
                     width = min(full_logits.size(1), request_logits.size(1))
                     full_logits[begin:end, :width] = request_logits[:, :width]
                     begin = end
-            gathered_ref, valid_mask = gather_sparse_reference(
-                full_logits, sparse_indices, num_blocks_per_q, torch.zeros_like(context_lens), context_lens,
-                sparse_block_kv)
+            if get_acc_check():
+                gathered_ref, valid_mask = gather_sparse_reference(
+                    full_logits, sparse_indices, num_blocks_per_q, torch.zeros_like(context_lens), context_lens,
+                    sparse_block_kv)
 
         metadata = deep_gemm.get_paged_sparse_mqa_logits_metadata(
             context_lens=context_lens, block_table=block_table, indices=request_ids, page_kv=page_kv,
             sparse_kv_block_indices=sparse_indices, qk_dtype=q_in[0].dtype, sparse_block_kv=sparse_block_kv)
-        if args.get('check_metadata', 0):
+        if args.get('check_metadata', 0) and get_acc_check():
             decoded = decode_sparse_metadata(metadata, sparse_block_kv)
             ref_meta = ref_paged_sparse_metadata(
                 sparse_indices, num_blocks_per_q, context_lens, block_table, request_ids, page_kv,
@@ -2635,44 +2680,46 @@ def test_sparse_mqa_logits(args) -> None:
     # selected positions. The sparse kernel must match this bitwise (same block-scale MMA
     # grouping and same ReLU+weighted-sum epilogue).
     gathered_ref, valid_mask = None, None
-    if get_acc_check():
+    # Precompile the dense JIT reference without inspecting its outputs.
+    if get_acc_check() or os.environ.get('HGGC_WARM_UP'):
         full_logits = deep_gemm.fp8_fp4_mqa_logits(
             q=q_in, kv=kv_in, weights=weights, cu_seq_len_k_start=context_starts, cu_seq_len_k_end=context_ends,
             clean_logits=False, max_seqlen_k=int(num_kv_tokens), logits_dtype=torch.bfloat16)
-        gathered_ref, valid_mask = gather_sparse_reference(
-            full_logits, sparse_indices, num_blocks_per_q, context_starts, context_ends, sparse_block_kv)
+        if get_acc_check():
+            gathered_ref, valid_mask = gather_sparse_reference(
+                full_logits, sparse_indices, num_blocks_per_q, context_starts, context_ends, sparse_block_kv)
 
-        # Reference harness self-check: FP32 torch recompute at the gathered positions vs the
-        # gathered dense output. This validates generation/gather/mask logic.
-        if not valid_mask.any():
-            # All-empty selections (e.g. seq_len_kv:0 edge case): nothing to compare; the sparse
-            # kernel flow below must still run (empty selection is a legal metadata case)
-            print("Sparse reference harness check skipped (no valid positions)")
-        elif seq_len_q * num_max_sparse_blocks * sparse_block_kv > (1 << 25):
-            # FP32 torch recompute materializes q_width x head_dim gathered KV (~256B/position);
-            # skip on V4.1-scale cases (candidate_topk_blocks=2048) to avoid tens-of-GB spikes —
-            # the dense-gather bitwise compare below remains the correctness check
-            print("Sparse reference harness check skipped (case too large for FP32 recompute)")
-        else:
-            kv_offsets = torch.arange(sparse_block_kv, device='cuda', dtype=torch.int64)
-            block_offsets = (context_starts % sparse_block_kv).to(torch.int64)
-            token_indices = (sparse_indices.long().unsqueeze(-1) * sparse_block_kv
-                             + block_offsets[:, None, None] + kv_offsets).flatten(1)
-            kv_gathered = kv_dequant[token_indices.clamp(min=0, max=num_kv_tokens - 1)]
-            ref_logits = ref_sparse_mqa_logits(q_dequant, kv_gathered, weights, valid_mask)
-            diff = calc_diff(gathered_ref.masked_fill(~valid_mask, 0).float(), ref_logits.float())
-            threshold = 1.5e-3
-            if torch.isnan(diff) or diff >= threshold:
-                print(f"ERROR: Sparse reference harness check failed, diff={diff}")
-                exit(1)
+            # Reference harness self-check: FP32 torch recompute at the gathered positions vs the
+            # gathered dense output. This validates generation/gather/mask logic.
+            if not valid_mask.any():
+                # All-empty selections (e.g. seq_len_kv:0 edge case): nothing to compare; the sparse
+                # kernel flow below must still run (empty selection is a legal metadata case)
+                print("Sparse reference harness check skipped (no valid positions)")
+            elif seq_len_q * num_max_sparse_blocks * sparse_block_kv > (1 << 25):
+                # FP32 torch recompute materializes q_width x head_dim gathered KV (~256B/position);
+                # skip on V4.1-scale cases (candidate_topk_blocks=2048) to avoid tens-of-GB spikes —
+                # the dense-gather bitwise compare below remains the correctness check
+                print("Sparse reference harness check skipped (case too large for FP32 recompute)")
             else:
-                print("Sparse reference harness check passed")
+                kv_offsets = torch.arange(sparse_block_kv, device='cuda', dtype=torch.int64)
+                block_offsets = (context_starts % sparse_block_kv).to(torch.int64)
+                token_indices = (sparse_indices.long().unsqueeze(-1) * sparse_block_kv
+                                 + block_offsets[:, None, None] + kv_offsets).flatten(1)
+                kv_gathered = kv_dequant[token_indices.clamp(min=0, max=num_kv_tokens - 1)]
+                ref_logits = ref_sparse_mqa_logits(q_dequant, kv_gathered, weights, valid_mask)
+                diff = calc_diff(gathered_ref.masked_fill(~valid_mask, 0).float(), ref_logits.float())
+                threshold = 1.5e-3
+                if torch.isnan(diff) or diff >= threshold:
+                    print(f"ERROR: Sparse reference harness check failed, diff={diff}")
+                    exit(1)
+                else:
+                    print("Sparse reference harness check passed")
 
     metadata = deep_gemm.get_sparse_mqa_logits_metadata(
         cu_seq_len_k_start=context_starts, cu_seq_len_k_end=context_ends, num_kv_tokens=int(num_kv_tokens),
         sparse_kv_block_indices=sparse_indices, qk_dtype=q_in[0].dtype,
         sparse_block_kv=sparse_block_kv, use_unaligned_ks=use_unaligned_ks)
-    if args.get('check_metadata', 0):
+    if args.get('check_metadata', 0) and get_acc_check():
         # Decode the kernel's metadata and verify against the Python reference
         decoded = decode_sparse_metadata(metadata, sparse_block_kv)
         ref_meta = ref_sparse_metadata(
@@ -2696,6 +2743,15 @@ def test_sparse_mqa_logits(args) -> None:
             exit(1)
         print("Accuracy check passed\n")
     return
+
+def test_batch_gemm(args) -> None:
+    # BatchGemm describes [groups, m, k] @ [groups, n, k].T using einsum.
+    normalized = dict(args)
+    for axis, field in (("b", "m"), ("h", "groups"), ("r", "k"), ("d", "n")):
+        normalized[axis] = args[field]
+    normalized.setdefault("expr", "bhr,hdr->bhd")
+    test_einsum(normalized)
+
 
 def test_einsum(args) -> None:
     b, h, r, d, data_type, expr = args['b'], args['h'], args['r'], args['d'], args["data_type"], args["expr"]
@@ -2755,7 +2811,8 @@ def test_einsum(args) -> None:
         print("Passed without acc_check\n")
 
     if get_benchmark():
-        t = bench_kineto(lambda: deep_gemm.fp8_einsum(expr, x_fp8, y_fp8, out), 'gemm', suppress_kineto_output=True)
+        einsum = deep_gemm.int8_einsum if data_type == torch.int8 else deep_gemm.fp8_einsum
+        t = bench_kineto(lambda: einsum(expr, x_fp8, y_fp8, out), 'gemm', suppress_kineto_output=True)
         # t_cublaslt = bench_kineto(lambda: deep_gemm.einsum(expr, x, y, z, use_cublaslt=True), 'nvjet', suppress_kineto_output=True)
         print(f' > Perf ({b=:4.0f}, {h=}, {r=}, {d=}): ',
                 f'{t * 1e6:4.0f} us | '

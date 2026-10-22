@@ -37,7 +37,6 @@ HcPrenormGemm,data_type:tf32,m:1024,n:32,k:64
 # ============ BatchGemm ============
 
 # --- BatchGemm / int8 ---
-# Requires the separate BatchGemm runner/platform-support patch.
 BatchGemm,data_type:int8,groups:128,m:64,n:128,k:512,quant_type:channel,expr:bhr,hdr->bhd
 BatchGemm,data_type:int8,groups:128,m:4096,n:128,k:512,quant_type:channel,expr:bhr,hdr->bhd
 BatchGemm,data_type:int8,groups:128,m:64,n:512,k:128,quant_type:channel,expr:bhr,hdr->bhd
@@ -46,16 +45,22 @@ BatchGemm,data_type:int8,groups:8,m:64,n:1024,k:4096,quant_type:channel,expr:bhr
 BatchGemm,data_type:int8,groups:8,m:4096,n:1024,k:4096,quant_type:channel,expr:bhr,hdr->bhd
 BatchGemm,data_type:int8,groups:16,m:64,n:1024,k:4096,quant_type:channel,expr:bhr,hdr->bhd
 BatchGemm,data_type:int8,groups:16,m:4096,n:1024,k:4096,quant_type:channel,expr:bhr,hdr->bhd
+# Alternate batch output layout (groups=h, m=b, n=d, k=r).
+BatchGemm,data_type:int8,groups:8,m:32,n:128,k:512,quant_type:channel,expr:bhr,hdr->hbd
 
 # ============ GroupedMasked ============
 
 # --- GroupedMasked / int8 ---
 GroupedMasked,data_type:int8,groups:16,m:4096,n:1024,k:7168,em:256,distribution:zipf
 GroupedMasked,data_type:int8,groups:256,m:65536,n:4096,k:7168,em:256,distribution:uniform
+# SBO overlap and signal checks.
+GroupedMasked,data_type:int8,groups:4,m:1024,n:4096,k:7168,em:256,enable_sbo_overlap:true
 
 # --- GroupedMasked / bf16 ---
 GroupedMasked,data_type:bf16,groups:16,m:4096,n:4096,k:7168,em:12,distribution:zipf
 GroupedMasked,data_type:bf16,groups:16,m:4096,n:4096,k:7168,em:12,distribution:[45,200,30,18,13,21,31,3,5,17,17,16,18,15,18,13]
+# SBO overlap and signal checks.
+GroupedMasked,data_type:bf16,groups:4,m:1024,n:4096,k:7168,em:256,enable_sbo_overlap:true
 
 # --- GroupedMasked / w4a16 ---
 GroupedMasked,data_type:w4a16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
@@ -88,6 +93,9 @@ GroupedNoPad,data_type:w4fa16,groups:384,m:3072,n:512,k:7168,quant_type:group,gr
 GroupedContiguous,data_type:bf16,groups:16,m:4096,n:4096,k:7168,distribution:gaussian
 GroupedContiguous,data_type:bf16,groups:32,m:8192,n:2048,k:2048,distribution:uniform
 
+# --- GroupedContiguous / int8 ---
+GroupedContiguous,data_type:int8,groups:4,m:128,n:512,k:1024,distribution:uniform
+
 # ============ GroupedFused ============
 
 # --- GroupedFused / bf16 ---
@@ -116,9 +124,19 @@ MqaLogits,data_type:bf16,seq_len_q:512,seq_len_kv:3072,num_heads:64,head_dim:128
 
 # ============ PagedMqaLogits ============
 
+# --- PagedMqaLogits / bf16 ---
+# Empty and partial pages.
+PagedMqaLogits,data_type:bf16,batch_size:4,next_n:1,num_heads:32,head_dim:128,distribution:[0,1,63,128],page_kv:64,logits_dtype:fp32
+
 # --- PagedMqaLogits / int8 ---
 PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,avg_context_len:2048
 PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:32
 PagedMqaLogits,data_type:int8,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1]
 PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,logits_dtype:bf16,weights_dtype:bf16
 PagedMqaLogits,data_type:int8,batch_size:64,next_n:4,num_heads:64,head_dim:128,avg_context_len:8192
+
+# ============ AttentionRegression ============
+
+# --- AttentionRegression / int8 ---
+AttentionRegression,data_type:int8,case:ks_ke
+AttentionRegression,data_type:int8,case:cache_view
