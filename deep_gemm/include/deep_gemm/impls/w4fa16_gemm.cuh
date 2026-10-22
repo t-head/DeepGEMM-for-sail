@@ -864,6 +864,13 @@ public:
         run_m_tile(cute::Int<size<1>(accum)>{});
       }
     }
+    if constexpr (kMoeScatter) {
+#if __HGGC_ARCH__ == 150
+      // Drain once after all tiles, on every local/remote store producer.
+      __ppu_wait_remote_vstcnt(0);
+      __ppu_wait_vstcnt(0);
+#endif
+    }
   }
 };
 

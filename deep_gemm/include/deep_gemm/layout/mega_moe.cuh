@@ -83,7 +83,6 @@ struct Workspace {
     uint32_t num_ranks, num_experts;
     uint32_t num_experts_per_rank;
     uint32_t num_max_tokens_per_rank;
-    uint32_t num_max_recv_tokens_per_expert;
 
     // Pool capacity: all local experts share a contiguous token pool
     uint32_t num_max_pool_tokens;
@@ -102,7 +101,6 @@ struct Workspace {
         num_ranks(num_ranks), num_experts(num_experts),
         num_max_tokens_per_rank(num_max_tokens_per_rank) {
         num_experts_per_rank = num_experts / num_ranks;
-        num_max_recv_tokens_per_expert = num_ranks * num_max_tokens_per_rank;
         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
         num_max_pool_blocks = num_max_pool_tokens / kMinCandidateBlockM;
     }
@@ -126,8 +124,8 @@ struct Workspace {
         // L2 block arrival mask
         num_bytes += num_max_pool_blocks * sizeof(uint64_t);
 
-        // Dispatch pulling source token-topk
-        num_bytes += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * sizeof(int);
+        // Each (expert, source rank) list contains at most one entry per source token.
+        num_bytes += uint64_t(num_experts_per_rank) * num_ranks * num_max_tokens_per_rank * sizeof(uint32_t);
 
         // Combine push source indices
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
@@ -204,8 +202,7 @@ struct Workspace {
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
         const auto base = get_l2_arrival_mask_ptr(num_max_pool_blocks);
         return reinterpret_cast<uint32_t*>(base) +
-            expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
-            rank_idx * num_max_recv_tokens_per_expert + token_idx;
+            (uint64_t(expert_idx) * num_ranks + rank_idx) * num_max_tokens_per_rank + token_idx;
     }
 
     CUTLASS_HOST_DEVICE

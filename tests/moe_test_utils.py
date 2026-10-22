@@ -8,6 +8,7 @@ import json
 import os
 import statistics
 import tempfile
+import time
 
 import pytest
 import torch
@@ -190,6 +191,22 @@ def check_workspace_options(case, group):
     """All failures must occur before collective symmetric allocation."""
     import deep_gemm as dg
 
+    # Query large layouts without allocating them. The routing table is
+    # [local expert, source rank, source capacity], with 64-bit byte offsets.
+    layout_config = dict(NUM_RANKS=64, NUM_EXPERTS=1024, NUM_TOPK=1,
+                         TOKEN_BYTES=256, SF_BYTES=16)
+    for fp4 in (False, True):
+        for capacity in (65536, 1 << 22):
+            config = {**layout_config, "NMTPR": capacity}
+            layout = dg.deep_gemm_cpp._ppu_mega_moe_layout(config, fp4)
+            blocks = layout["num_pool_blocks"]
+            routing_start = layout["woff_rcs"] + 16 * 8 + ((blocks + 1) // 2 * 2) * 4 + blocks * 8
+            assert layout["woff_meta"] - routing_start == 1024 * capacity * 4
+            workspace_end = layout["woff_meta"] + layout["num_pool"] * 12 + 4
+            assert layout["ws_bytes"] == (workspace_end + 15) // 16 * 16
+        with pytest.raises(RuntimeError, match="signed 32-bit row index range"):
+            dg.deep_gemm_cpp._ppu_mega_moe_layout({**config, "NUM_TOPK": 16}, fp4)
+
     options = dict(num_experts=case.experts, num_max_tokens_per_rank=case.capacity,
                    num_topk=case.topk, hidden=case.hidden, precision=case.precision,
                    intermediate_hidden=case.intermediate)
@@ -287,10 +304,13 @@ def run_forward(case, source, requested, pipeline, reference, *, combine, check=
                                      max_relative_l2=metrics[1].item(),
                                      checked_tokens_per_rank=[min(n, checked) for n in counts])
         check_graph_replay(pipeline, actual, input_tensor=source, routing_weights=routing_weights,
-                           routing_ids=routing_ids, check_reference=check_reference, combine=combine)
+                           routing_ids=routing_ids, check_reference=check_reference, combine=combine,
+                           num_experts=case.experts if edge_cases else None)
         report["correctness"]["max_replay_pipeline_diff"] = max(m[0] for m in replay_metrics[1:])
         report["correctness"]["max_replay_relative_l2"] = max(m[1] for m in replay_metrics[1:])
         report["correctness"]["changed_routes_reference_checked"] = True
+        if edge_cases and world > 1:
+            report["correctness"]["cross_rank_visibility_checked"] = True
         if routing_weights is not None:
             report["correctness"]["routing_weight_replay_checked"] = True
         if workspace is not None:
@@ -322,7 +342,8 @@ def run_cli(cases, runner, description):
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--replicas", action="store_true", help="use separate master/replica weight buffers")
-    parser.add_argument("--edge-cases", action="store_true", help="include empty ranks and masked/zero-weight routes")
+    parser.add_argument("--edge-cases", action="store_true",
+                        help="include empty ranks, masked routes and staggered cross-rank replay")
     args = parser.parse_args()
     case = next(c for c in cases if c.name == args.case)
     case = replace(case, tokens=tuple(args.tokens) if args.tokens is not None else case.tokens,
@@ -351,7 +372,7 @@ def relative_l2(actual, expected):
 
 
 def check_graph_replay(pipeline, expected, *, input_tensor=None, routing_weights=None, routing_ids=None,
-                       check_reference=None, combine=None):
+                       check_reference=None, combine=None, num_experts=None):
     """Recycle state with changing data; check eager and replay against a Torch oracle."""
     for _ in range(3):
         pipeline()
@@ -361,25 +382,43 @@ def check_graph_replay(pipeline, expected, *, input_tensor=None, routing_weights
     with torch.cuda.graph(graph):
         result = pipeline()
 
-    def compare():
+    rank, world = dist.get_rank(), dist.get_world_size()
+    check_peers = num_experts is not None and world > 1
+    generation = 0
+
+    def compare(expect_zero=False):
+        nonlocal generation
         if combine is not None:
             combine.fill_(float("nan"))
+            result.fill_(float("nan"))
             torch.cuda.synchronize()
             dist.barrier()
+        # Stagger a rotating rank after poisoning all receive buffers. The
+        # complete entry must synchronize its own scatter and combine stages.
+        if check_peers and rank == generation % world:
+            time.sleep(.003)
+        # Replay must produce its own intermediates before eager can refresh them.
+        graph.replay()
+        replayed = result.clone()
+        torch.cuda.synchronize()
+        dist.barrier()
+        if combine is not None:
+            combine.fill_(float("nan"))
+            result.fill_(float("nan"))
+            torch.cuda.synchronize()
+            dist.barrier()
+        if check_peers and rank == generation % world:
+            time.sleep(.003)
         eager = pipeline().clone()
         torch.cuda.synchronize()
-        dist.barrier()
-        if combine is not None:
-            combine.fill_(float("nan"))
-            torch.cuda.synchronize()
-            dist.barrier()
-        graph.replay()
-        torch.cuda.synchronize()
-        assert result.isfinite().all(), "recycled routes read an unproduced slot"
-        torch.testing.assert_close(result, eager, rtol=0, atol=0)
+        assert replayed.isfinite().all(), "recycled routes read an unproduced slot"
+        torch.testing.assert_close(replayed, eager, rtol=0, atol=0)
+        if expect_zero:
+            assert torch.count_nonzero(replayed) == 0, "inactive routes must produce exact zeros"
         if check_reference is not None:
-            check_reference(result)
+            check_reference(replayed)
         dist.barrier()
+        generation += 1
 
     if input_tensor is not None:
         saved = input_tensor.clone()
@@ -391,9 +430,23 @@ def check_graph_replay(pipeline, expected, *, input_tensor=None, routing_weights
     if routing_ids is not None:
         saved_ids = routing_ids.clone()
         hot_routes = torch.arange(saved_ids.shape[1], device=saved_ids.device).expand_as(saved_ids)
-        for changed in (hot_routes, torch.full_like(saved_ids, -1), saved_ids):
-            routing_ids.copy_(changed)
+        if check_peers:
+            experts_per_rank = num_experts // world
+            # Send to the next rank, then concentrate work on the last rank.
+            # The last rank has no input in the one-token edge case but must
+            # still compute remote experts. Wrap slots for small expert counts.
+            for destination in ((rank + 1) % world, world - 1):
+                routing_ids.copy_((destination * experts_per_rank + hot_routes) % num_experts)
+                compare()
+            rng = torch.Generator(device=saved_ids.device).manual_seed(20261022 + rank)
+            routing_ids.copy_(torch.rand(saved_ids.shape[0], num_experts,
+                                        device=saved_ids.device, generator=rng)
+                              .topk(saved_ids.shape[1], dim=1).indices)
             compare()
+        for changed, expect_zero in ((hot_routes, False), (torch.full_like(saved_ids, -1), True),
+                                     (saved_ids, False)):
+            routing_ids.copy_(changed)
+            compare(expect_zero=expect_zero)
         # Return to original routing before changing weights.
     if routing_weights is not None:
         saved_weights = routing_weights.clone()
@@ -401,9 +454,10 @@ def check_graph_replay(pipeline, expected, *, input_tensor=None, routing_weights
         # Include tiny, nonuniform and zero routing weights. Do not renormalize:
         # callers may supply weights whose sum is not one.
         factors = torch.where(slots == 0, 0.0, 10.0 ** (-slots.float()))
-        for changed in (saved_weights * factors, torch.zeros_like(saved_weights), saved_weights):
+        for changed, expect_zero in ((saved_weights * factors, False),
+                                     (torch.zeros_like(saved_weights), True), (saved_weights, False)):
             routing_weights.copy_(changed)
-            compare()
+            compare(expect_zero=expect_zero)
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
@@ -502,7 +556,7 @@ def quantize_fp4_rne(src_tensor):
     src = src_tensor.float()
     *batch, n, k = src.shape
     grouped = src.reshape(*batch,n,k//32,32)
-    amax = grouped.abs().amax(-1)
+    amax = grouped.abs().amax(-1).clamp_min(1e-10)
     bits = ((amax / 6.0).contiguous().view(torch.int32) + 0x007fffff) & 0x7f800000
     scale = bits.view(torch.float32)
     normalized = (grouped / scale.unsqueeze(-1)).nan_to_num().reshape_as(src)

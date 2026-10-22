@@ -32,9 +32,9 @@ from moe_test_utils import (
 
 # FP4 dispatch copies scales in 16-byte chunks, so smoke H is at least 512.
 CASES = (
-    MoECase("smoke_swiglu", 512, 256, 8, 2, 64, tokens=(1, 0, 33, 8), clamp=2.0),
-    MoECase("smoke_step", 512, 256, 8, 2, 64, tokens=(1, 0, 33, 8), activation="step", clamp=2.0),
-    MoECase("smoke_situ", 512, 256, 8, 2, 64, tokens=(1, 0, 33, 8), activation="situ"),
+    MoECase("smoke_swiglu", 512, 256, 8, 2, 129, tokens=(1, 0, 33, 129, 8), clamp=2.0),
+    MoECase("smoke_step", 512, 256, 8, 2, 129, tokens=(1, 0, 33, 129, 8), activation="step", clamp=2.0),
+    MoECase("smoke_situ", 512, 256, 8, 2, 129, tokens=(1, 0, 33, 129, 8), activation="situ"),
     MoECase("deepseek_v4_pro", 7168, 3072, 384, 6, 8192, tokens=MODEL_TOKENS, clamp=10.0, worlds=(8,)),
     MoECase("deepseek_v4_flash", 4096, 2048, 256, 6, 4096, tokens=MODEL_TOKENS, clamp=10.0, worlds=(4,)),
     MoECase("glm52", 6144, 2048, 256, 8, 4096, tokens=MODEL_TOKENS, worlds=(8,)),
@@ -152,7 +152,7 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
     moe = W4A4MoE(case, group, w1, w2)
     reports = []
     try:
-        for requested in case.tokens:
+        for token_index, requested in enumerate(case.tokens):
             count = 0 if edge_cases and world > 1 and requested == 1 and rank == world - 1 else requested
             ids = make_routes(case, case.capacity, rng)
             weights = torch.rand(case.capacity, case.topk, device="cuda", generator=rng).softmax(-1)
@@ -163,7 +163,7 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
                 weights[1, 0] = 0
             for split in splits:
                 moe.set_inputs(source[:count], ids[:count], weights[:count], split_weights=split)
-                if check and case.name.startswith("smoke") and not split and requested == case.tokens[0]:
+                if check and case.name.startswith("smoke") and not split and token_index == 0:
                     check_complete_entry(
                         dg.fp4_fp4_mega_moe, moe.output, moe.gemm1, moe.gemm2, moe.buf,
                         moe.source, moe.ids, moe.weights, activation=case.activation,

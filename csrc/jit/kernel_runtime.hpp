@@ -224,6 +224,8 @@ public:
 
 inline int native_kernel_occupancy(const std::shared_ptr<KernelRuntime>& runtime,
                                    int threads, int dynamic_smem = 0) {
+    // Occupancy must use the same dynamic shared-memory limit as launch.
+    construct_launch_config(runtime->kernel, current_stream(), dynamic_smem, dim3(1), dim3(threads));
     int blocks = 0;
 #if HGGCRT_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
     DG_HGGC_CHECK(hggcOccupancyMaxActiveBlocksPerMultiprocessor(

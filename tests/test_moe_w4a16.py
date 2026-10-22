@@ -24,7 +24,7 @@ from moe_test_utils import (
 )
 
 CASES = (
-    MoECase("smoke", 256, 128, 32, 2, 64, tokens=(1, 0, 33, 8), activation="situ",
+    MoECase("smoke", 256, 128, 32, 2, 129, tokens=(1, 0, 33, 129, 8), activation="situ",
             worlds=(1, 2, 4, 8, 16, 32), precision="w4a16"),
     MoECase("kimi_k3", 3584, 3072, 896, 16, 4096, tokens=(4, 8, 16, 32, 64, 128, *MODEL_TOKENS),
             activation="situ", worlds=(8, 16, 32), precision="w4a16", extra_replicas_per_rank=1),
@@ -68,7 +68,7 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
                 precision="w4a16", intermediate_hidden=c.intermediate,
                 num_tokens_per_rank=bucket)
             try:
-                for requested in counts:
+                for token_index, requested in enumerate(counts):
                     source, ids, weights, count = make_inputs(c, requested, rng, edge_cases)
                     # Keep the collective allocation bucket when this rank is
                     # empty: rank-local tuning must not change the protocol.
@@ -83,7 +83,7 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
                         dg.bf16_fp4_mega_moe(output, g1, g2, buf, w1_replicas=r1, w2_replicas=r2)
                         return output
 
-                    if check and c.name.startswith("smoke") and not split and requested == c.tokens[0]:
+                    if check and c.name.startswith("smoke") and not split and token_index == 0:
                         check_complete_entry(
                             dg.bf16_fp4_mega_moe, output, g1, g2, buf, source[:count], ids[:count], weights[:count],
                             activation=c.activation, activation_limit=c.clamp or None)
@@ -117,7 +117,8 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
 def test_pipeline(case, moe_group):
     case.require_world()
-    run_case(case, moe_group, edge_cases=True, splits=(False, True), verbose=False,
+    splits = (False, True) if case.experts // dist.get_world_size() > 1 else (False,)
+    run_case(case, moe_group, edge_cases=True, splits=splits, verbose=False,
              reference_tokens=0 if case.name == "smoke" else case.reference_tokens)
 
 

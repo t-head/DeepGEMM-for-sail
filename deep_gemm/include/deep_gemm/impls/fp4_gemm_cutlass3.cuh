@@ -1117,6 +1117,13 @@ public:
       );
       }
     }
+    if constexpr (ScatterPolicy::kEnabled) {
+#if __HGGC_ARCH__ == 150
+      // Every producer drains its stores before the following combine can run.
+      __ppu_wait_remote_vstcnt(0);
+      __ppu_wait_vstcnt(0);
+#endif
+    }
   }
 };
 

@@ -23,7 +23,7 @@ env:
 
 jobs:
   build-test:
-    name: Build & Test (${{ matrix.runner }})
+    name: Build & Test (${{ matrix.suite }})
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -35,9 +35,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each runner selects its command group (same key) from
-        # scripts/testcase.json via pr-deepgemm-ut.py --suite.
-        runner: [ZW-M890P, OAM-810E]
+        # Board selection and allocated devices match each caselist suite.
+        include:
+          - runner: ZW-M890P
+            suite: ZW-M890P
+            nproc_per_node: 1
+          - runner: OAM-810E
+            suite: OAM-810E
+            nproc_per_node: 1
+          - runner: ZW-M890P
+            suite: ZW-M890P-EP2
+            nproc_per_node: 2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,7 +61,7 @@ jobs:
           container_options: |
             cpus: "40"
           nnodes: 0
-          nproc_per_node: 1
+          nproc_per_node: ${{ matrix.nproc_per_node }}
           node_selector: "board-type=${{ matrix.runner }}"
           namespace: ppu-sched
           # Ceiling for the whole command (env setup + build + all cases).
@@ -128,27 +136,27 @@ jobs:
             set +e
             python .github/workflows/scripts/pr-deepgemm-ut.py \
               --caselist .github/workflows/scripts/testcase.json \
-              --suite ${{ matrix.runner }}
+              --suite ${{ matrix.suite }}
             TEST_EXIT_CODE=$?
             python3 .github/workflows/scripts/generate-env-info.py \
             --docker-image "${{ env.SAIL_IMAGE }}" \
             --output env_info.json
-            # Keep results per runner so the parallel matrix jobs do not collide.
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            # Keep the single-device and EP2 reports in separate directories.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite }}"
             mkdir -p "$NAS_RESULT_DIR"
             cp test-results.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
             exit "$TEST_EXIT_CODE"
           cleanup_policy: on_success
 
-      - name: Test summary (${{ matrix.runner }})
+      - name: Test summary (${{ matrix.suite }})
         if: always()
         shell: bash
         run: |
-          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite }}"
           XML_FILE="$NAS_RESULT_DIR/test-results.xml"
           ENV_FILE="$NAS_RESULT_DIR/env_info.json"
-          echo "## Runner: ${{ matrix.runner }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Suite: ${{ matrix.suite }}" >> "$GITHUB_STEP_SUMMARY"
 
           if [[ ! -f "$XML_FILE" ]]; then
             echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"

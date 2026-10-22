@@ -24,7 +24,7 @@ from moe_test_utils import (
 )
 
 CHANNELWISE_CASES = tuple(replace(c, precision="fp8_channelwise") for c in (
-    MoECase("smoke_channelwise", 512, 256, 16, 2, 64, tokens=(1, 0, 33, 8), worlds=(1, 2, 4, 8)),
+    MoECase("smoke_channelwise", 512, 256, 16, 2, 129, tokens=(1, 0, 33, 129, 8), worlds=(1, 2, 4, 8)),
     MoECase("minimax_m3", 6144, 3072, 128, 4, 4096, tokens=MODEL_TOKENS,
             activation="swiglu_oai", clamp=7.0, worlds=(8,)),
     MoECase("qwen38_flash", 2560, 640, 512, 10, 8192, tokens=MODEL_TOKENS,
@@ -34,7 +34,7 @@ CHANNELWISE_CASES = tuple(replace(c, precision="fp8_channelwise") for c in (
             clamp=10.0, input_scale=16, worlds=(4,)),
 ))
 BLOCKWISE_CASES = (
-    MoECase("smoke_blockwise", 256, 128, 8, 2, 64, tokens=(1, 0, 33, 8), precision="fp8_blockwise"),
+    MoECase("smoke_blockwise", 256, 128, 8, 2, 129, tokens=(1, 0, 33, 129, 8), precision="fp8_blockwise"),
     MoECase("minimax_m3_blockwise", 7168, 5120, 384, 4, 4096, tokens=(64, *MODEL_TOKENS),
             activation="swiglu_oai", clamp=7.0, worlds=(8, 16, 32, 64), precision="fp8_blockwise"),
 )
@@ -128,9 +128,10 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
                     dist.all_reduce(expected)
                     return expected.view(world, checked, c.hidden)[rank, :min(count, checked)].bfloat16()
 
+                # Match the FP8 grouped contiguous/masked GEMM error threshold.
                 reports.append(run_forward(
                     c, source[:count], requested, forward, reference, combine=buf._combine, routing_weights=weights[:count], routing_ids=ids[:count],
-                    workspace=buf, check=check, reference_tokens=reference_tokens, replicas=split,
+                    workspace=buf, check=check, reference_tokens=reference_tokens, max_diff=.001, replicas=split,
                     edge_cases=edge_cases, benchmark=benchmark, verbose=verbose))
     finally:
         buf.destroy()

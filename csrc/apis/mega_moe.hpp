@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <limits>
 #include <pybind11/stl.h>
 #include "../jit_kernels/impls/mega_moe.hpp"
 #include "../jit_kernels/impls/mega_moe_scatter.hpp"
@@ -783,6 +784,8 @@ static std::map<std::string, int64_t> symmetric_layout(const std::map<std::strin
     const auto value = [&](const char* key) {
         const auto found = config.find(key);
         TORCH_CHECK(found != config.end(), "missing MegaMoE configuration key: ", key);
+        TORCH_CHECK(found->second >= 0 && uint64_t(found->second) <= std::numeric_limits<uint32_t>::max(),
+                    "MegaMoE configuration value is out of range: ", key);
         return uint32_t(found->second);
     };
     const auto ranks = value("NUM_RANKS"), experts = value("NUM_EXPERTS");
@@ -790,6 +793,11 @@ static std::map<std::string, int64_t> symmetric_layout(const std::map<std::strin
     const auto capacity = value("NMTPR"), topk = value("NUM_TOPK");
     TORCH_CHECK(capacity < (1u << 24) && topk <= 256,
                 "packed routes require tokens < 2^24 and topk <= 256");
+    // GEMM row counts and offsets are signed 32-bit. Validate before the
+    // workspace constructor computes the device-side pool size in uint32_t.
+    const auto pool_rows = layout::get_num_max_pool_tokens<uint64_t>(ranks, capacity, topk, experts / ranks);
+    TORCH_CHECK(pool_rows <= std::numeric_limits<int32_t>::max(),
+                "MegaMoE token pool exceeds the signed 32-bit row index range");
     const uint64_t token_bytes = value("TOKEN_BYTES"), scale_bytes = value("SF_BYTES");
     const layout::Workspace workspace(nullptr, ranks, experts, capacity, topk);
     const auto align16 = [](uint64_t bytes) { return (bytes + 15) / 16 * 16; };
