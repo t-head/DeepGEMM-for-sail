@@ -117,7 +117,7 @@ __global__ void computeBlockInfoKernel(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.launch_attr_args.grouped_layout,
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.launch_attr_args.grouped_layout,
                                             args.launch_attr_args.num_groups, args.launch_attr_args.block_m_info));
     }
 };
@@ -393,7 +393,7 @@ __global__ void {13}(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
 

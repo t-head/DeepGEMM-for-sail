@@ -66,7 +66,7 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
             get_smem_size(c), get_num_threads(c), sizeof(Arguments<Scheduler>));
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
     }
 };
 
@@ -79,7 +79,7 @@ static void launch(const W4A8Config& c, int m, int n, int k, int groups, GemmTyp
     const auto& runtime = compiler->build("m_grouped_gemm_w4fa8_mma", R::generate(args));
     construct_launch_config(runtime->kernel, current_stream(), smem, args.launch_args.grid_dim, args.launch_args.block_dim);
     int blocks = 0;
-    DG_HGGC_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, runtime->kernel, threads, smem));
+    DG_HGGC_UNIFIED_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, runtime->kernel, threads, smem));
     DG_HOST_ASSERT(blocks > 0);
     args.launch_args.grid_dim = dim3(c.num_sms < 20 ? c.num_sms : c.num_sms * std::min(8, blocks));
     DgProfParam prof;

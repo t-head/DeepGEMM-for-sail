@@ -79,7 +79,7 @@ void {}(
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, const Args& args) {
         const auto& a = args.permute_args;
-        DG_HGGC_CHECK(launch_kernel(kernel, config,
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
             a.src_a, a.dst_a, a.src_sfa, a.dst_sfa,
             a.dim0, a.dim2_a,
             a.stride0_a_bytes, a.stride1_a_bytes,

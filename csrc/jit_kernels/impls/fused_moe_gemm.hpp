@@ -89,7 +89,7 @@ __global__ void {}(const GemmArgs args) {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
 
@@ -153,7 +153,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
 
     // Query occupancy and set grid
     int blocks_per_cu = 0;
-    DG_HGGC_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
+    DG_HGGC_UNIFIED_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_cu, kernel, block_size, smem_size));
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
@@ -259,7 +259,7 @@ __global__ void {}(const QuantGemmArgs args) {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
 
@@ -333,7 +333,7 @@ __global__ void {}(const QuantGemmArgs args) {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
 
@@ -408,7 +408,7 @@ __global__ void {}(const Fp4QuantGemmArgs args) {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
 
@@ -485,7 +485,7 @@ static void m_grouped_gemm_perchannel_nt_fused_impl(
 
     // Query occupancy and set grid
     int blocks_per_cu = 0;
-    DG_HGGC_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
+    DG_HGGC_UNIFIED_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_cu, kernel, block_size, smem_size));
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
@@ -583,7 +583,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
     const auto& kernel = runtime->kernel;
 
     int blocks_per_cu = 0;
-    DG_HGGC_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
+    DG_HGGC_UNIFIED_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_cu, kernel, block_size, smem_size));
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
@@ -698,7 +698,7 @@ static void m_grouped_gemm_blkwise_nt_fused_impl(
 
     // Query occupancy and set grid
     int blocks_per_cu = 0;
-    DG_HGGC_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
+    DG_HGGC_UNIFIED_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_cu, kernel, block_size, smem_size));
     args.launch_args.grid_dim.x *= blocks_per_cu;
 

@@ -65,7 +65,7 @@ void {}(const void* input, void* output, void* scales, const int32_t* masked_m, 
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         auto& p = args.params;
-        DG_HGGC_CHECK(launch_kernel(kernel, config, p.input, p.output, p.scales, p.masked_m, p.rows_per_batch, p.row_slots, p.limit, p.weight_inv_scale, p.beta, p.linear_beta));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, p.input, p.output, p.scales, p.masked_m, p.rows_per_batch, p.row_slots, p.limit, p.weight_inv_scale, p.beta, p.linear_beta));
     }
 };
 namespace activation {

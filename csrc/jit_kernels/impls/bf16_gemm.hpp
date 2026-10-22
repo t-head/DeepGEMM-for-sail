@@ -345,7 +345,7 @@ __global__ void {12}(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
 
@@ -581,7 +581,7 @@ __global__ void {9}(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, configs, args.kernel_params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, configs, args.kernel_params));
     }
 };
 
@@ -776,7 +776,7 @@ void {}(const GemvDenseArgs args) {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
 
@@ -1014,7 +1014,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
         }
         ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
-        DG_HGGC_CHECK(launch_kernel(kernel, config, hparams));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, hparams));
 
         ProfilingInterface::Instance().instrument(false, dg_prof_params);
 

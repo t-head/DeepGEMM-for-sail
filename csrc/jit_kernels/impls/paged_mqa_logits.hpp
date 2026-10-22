@@ -68,7 +68,7 @@ __global__ void {}(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_args.batch_size, args.kernel_args.next_n,
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_args.batch_size, args.kernel_args.next_n,
                                     args.kernel_args.context_lens, args.kernel_args.schedule_metadata));
     }
 };
@@ -190,7 +190,7 @@ __global__ void {}(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
 
