@@ -180,7 +180,7 @@ inline void apply_gemm1_tuning(DispatchConfig& c, const Gemm1Tuning& tuning,
             c.*field = value;
     };
     // A workspace may impose a smaller tile/packed-scale layout than the
-    // measured profile. Retain its existing selector in that case.
+    // measured profile. Use the workspace's tile selector in that case.
     const bool use_tile = tuning.tile && (!max_bn || (*tuning.tile)[1] <= max_bn) &&
                           (!max_bk || (*tuning.tile)[2] <= max_bk);
     if (use_tile) {
@@ -214,7 +214,7 @@ inline DispatchConfig dispatch_config(int ranks, int experts, int topk, int capa
     return c;
 }
 
-// Preserve the W4 dispatch thread/tile policy in terms of transport bytes.
+// Select W4 dispatch threads and tiles from the transport byte count.
 // W4A16 selects its actual MMA tile separately in w4a16_dispatch_tile.
 inline DispatchConfig w4_dispatch_config(DispatchConfig c, int intermediate, int tokens,
                                          int bn, int bk, int wm, int wn, int stages,
@@ -230,7 +230,7 @@ inline DispatchConfig w4_dispatch_config(DispatchConfig c, int intermediate, int
     std::tuple<int, int, int> smem;
     std::tie(selected_sms, bm, bn, bk, wm, wn, stages, smem) =
         fp4_config(total_m, em, intermediate, bytes, epr, sms, GemmType::MGroupedNoPad, bn);
-    // Preserve the measured persistent-GEMM corrections in shape-based bins.
+    // Apply measured persistent-GEMM corrections in shape-based bins.
     const bool wide = max_bn >= 256 && intermediate % 256 == 0 && bytes % 128 == 0;
     if (wide && epr >= sms && em >= 2 && em <= 5) {
         bm = 256;
@@ -379,7 +379,7 @@ inline Config fp4_scatter_config(int m, int n, int k, int groups, std::optional<
         stages = fields[5];
     } else if (low_latency) {
         const bool quant = fp8.value_or(get_env<std::string>("DG_MOE_SCATTER_FP8", "0") == "1");
-        // Keep the existing tuned bins; this refactor does not retune kernels.
+        // Select measured low-latency tile configurations by group count and expected M.
         if (!quant && groups == 12 && em <= 64) {
             bm = 64;
             bk = 64;
@@ -512,7 +512,7 @@ inline void fp8_blockwise_gemm1_config(DispatchConfig& c, int tokens, int n, boo
     c.gemm1_stages = 4;
     c.num_threads = threads(c.gemm1_compute_m, c.gemm1_block_n, c.gemm1_warp_m, c.gemm1_warp_n);
     const double waves = double(groups) * ceil_div(em, c.gemm1_compute_m) * ceil_div(n, 256) / c.num_sms;
-    // The imported fallback favors a queue for medium-depth BM192 workloads;
+    // The fallback favors a queue for medium-depth BM192 workloads;
     // keep an explicit on/off choice authoritative over this empirical window.
     constexpr int queue_min_waves = 32, queue_max_waves = 64;
     c.gemm1_dynamic_queue = tuning.dynamic_queue.value_or(

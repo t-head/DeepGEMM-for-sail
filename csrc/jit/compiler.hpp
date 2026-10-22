@@ -231,7 +231,7 @@ public:
 #ifdef HGGC_COMPILER_WRAPPER_MODE
             // The PPU SDK's CUDA-compatible compiler defines this macro.
             // SDK 2.2.0 O3 codegen adds register copies to this scatter's MMA loop;
-            // use O2 until the regression is resolved and revalidated.
+            // O2 limits register traffic in that loop.
             if (name == "m_grouped_gemm_fp8_channelwise_moe_scatter")
                 per_kernel_flags += " --dopt=2 ";
 #endif

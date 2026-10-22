@@ -10,7 +10,7 @@ namespace deep_gemm::mega_moe::w4a16 {
 //
 // Measured profiles select the rank-local G1 queue. Dedicated pull CTAs publish
 // each M block independently, then join consumers after all their own pulls.
-// Other profiles retain the serial pull-then-GEMM handoff.
+// Other profiles use a serial pull-then-GEMM handoff.
 template <
     uint32_t kNumRanks,
     uint32_t kNumCTAs,

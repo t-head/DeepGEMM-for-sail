@@ -10,10 +10,9 @@
 namespace deep_gemm::mega_moe::fp8_channelwise {
 
 // BF16 -> E4M3 row quantization and local token-quad staging for the FP8
-// MegaMoE path. The quantization contract intentionally matches the existing
-// per-token FP8 operator: per-token absmax / 448.f followed by
-// the SDK's saturating round-to-nearest E4M3 conversion. Writing router metadata from the same CTA
-// removes temporary FP8/scale tensors and the four follow-up copies.
+// MegaMoE path. Quantization uses per-token absmax / 448.f followed by
+// the SDK's saturating round-to-nearest E4M3 conversion. The same CTA writes
+// quantized tokens, scales and router metadata directly to the staging buffer.
 template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t BLOCK_THREADS = 256>
 CUTLASS_DEVICE void fp8_mega_moe_pre_dispatch_kernel_device(
         const __ppu_bfloat16* __restrict__ hidden_states,

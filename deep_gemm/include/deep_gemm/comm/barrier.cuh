@@ -1,19 +1,14 @@
 #pragma once
 
-// Cross-rank / grid synchronization for mega-MoE. The algorithm is
-// architecture-independent; only the underlying TIX primitives differ. Ported
-// from sgl_DeepGEMM (deep_gemm/include/deep_gemm/comm/barrier.cuh), with the
-// SM100 cluster path removed (PPU has no thread-block clusters) and the
-// `sync_scope` functor expected to perform a block-wide barrier
-// (`__syncthreads()`).
+// Cross-rank and grid synchronization for MegaMoE using PPU TIX atomics.
+// The `sync_scope` functor performs a block-wide barrier (`__syncthreads()`).
 #include <deep_gemm/tix/sys_atomics.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 
 namespace deep_gemm::comm {
 
-// Grid-wide barrier across all SMs of one rank (idea from
-// `cooperative_groups::this_grid().sync()`), driven by a single global counter.
+// Grid-wide barrier across all SMs of one rank, driven by a global counter.
 template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0,
           uint32_t kPollBackoffCycles = 0, typename sync_scope_t>
 CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,

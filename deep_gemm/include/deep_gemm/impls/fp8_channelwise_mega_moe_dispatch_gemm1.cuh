@@ -80,7 +80,7 @@ CUTLASS_DEVICE void warp_quantize_bf16_row_common(
 }
 
 // Flatten valid expert rows for quantization, then map back to pool offsets.
-// The physical activation layout and GEMM2 metadata remain unchanged.
+// Quantized rows use the pool offsets described by the GEMM2 metadata.
 template <uint32_t kEPR, uint32_t kWidth>
 CUTLASS_DEVICE void fp8_mega_moe_quantize_valid_pool_kernel_device(
         const int32_t* metadata, const __ppu_bfloat16* input,
@@ -425,8 +425,8 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
             __syncthreads(); // first claim only: every warp retires the shared word
         }
         // Consumer CTAs schedule the complete grouped-GEMM work list while
-        // waiting only for the M block they need. This is the actual
-        // producer/consumer overlap missing from the previous fused kernel.
+        // waiting only for the M block they need, overlapping data transport
+        // with GEMM execution.
         const uint32_t gemm_sm_idx = cta_idx - kNumPullCTAs;
         uint32_t current_iter = 0;
         uint32_t current_expert = 0;

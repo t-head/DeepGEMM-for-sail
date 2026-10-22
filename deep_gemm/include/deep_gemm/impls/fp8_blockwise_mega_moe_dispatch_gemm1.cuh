@@ -107,7 +107,7 @@ __device__ __forceinline__ void swiglu_quant_epilogue(
                         (g.x / (1.0f + __expf(-g.x))) * u.x,
                         (g.y / (1.0f + __expf(-g.y))) * u.y);
                 }
-                // Preserve the existing BF16 activation rounding boundary.
+                // Round the activation to BF16 before FP8 quantization.
                 activated = __bfloat1622float2(__float22bfloat162_rn(activated));
             }
             values[2 * i] = activated.x;

@@ -1,8 +1,6 @@
 #pragma once
 
-// Cross-rank pointer mapping for symmetric memory. Architecture-independent:
-// pure pointer arithmetic over per-rank base offsets. Ported verbatim from
-// sgl_DeepGEMM (deep_gemm/include/deep_gemm/layout/sym_buffer.cuh).
+// Cross-rank pointer mapping for symmetric memory using per-rank base offsets.
 #include <deep_gemm/layout/mega_moe_common.cuh>
 
 namespace deep_gemm::layout {

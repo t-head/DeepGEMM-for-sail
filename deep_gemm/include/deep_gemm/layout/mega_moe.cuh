@@ -1,13 +1,7 @@
 #pragma once
 
-// Mega-MoE metadata / workspace layout. Architecture-independent: only pointer
-// offset math over the symmetric workspace region. Ported from sgl_DeepGEMM
-// (deep_gemm/include/deep_gemm/layout/mega_moe.cuh).
-//
-// NOTE: The L2 arrival mask and combine `TokenSrcMetadata` regions are kept in
-// the layout so the offset chain matches the reference byte-for-byte (makes the
-// dispatch+gemm1 intermediate state directly cross-checkable, and keeps the
-// layout combine-ready). They cost negligible reserved bytes for this stage.
+// Symmetric MegaMoE workspace layout. Byte offsets describe counters,
+// arrival masks, source-token metadata, dispatch pools and GEMM outputs.
 #include <deep_gemm/layout/mega_moe_common.cuh>
 
 namespace deep_gemm::layout {

@@ -62,6 +62,12 @@ test_core.py options:
   --func {DenseGemm,GroupedContiguous,GroupedMasked,DenseGemm}  target test func
 # Routed MoE correctness and performance tests
 
+MegaMoE tests target ZW-M890P. Device checks use the
+`is_ppu1v5_device()` architecture predicate. On other architectures, pytest
+skips the MoE tests and direct CLI execution reports an error before process-group
+initialization. CI runs these tests only in the ZW-M890P suites; the OAM-810E
+suite runs shared-operator regressions.
+
 The MoE tests share one end-to-end runner between pytest and the command line.
 Select precision by file and model by `--case` or pytest ID; model dimensions, activation, routing limits and EP sizes
 are declared in each precision file. Add a model to those tables instead of
@@ -76,6 +82,34 @@ copying a test script.
 `moe_test_utils.py` contains process-group setup, common runtime helpers and
 independent Torch references, including FP4 round-to-nearest-even quantization.
 All-zero references have a defined zero error.
+
+Run the shared end-to-end smoke cases on two idle ZW-M890P devices:
+
+```bash
+torchrun --standalone --nproc-per-node=2 -m pytest -q -s -k smoke \
+  tests/test_moe_w4a4.py tests/test_moe_w4a16.py tests/test_moe_w8a8.py
+```
+
+Use `--nproc-per-node=8` for EP8. Each smoke case reuses its workspace across
+1, 0, 33, 129 and 8 tokens, including an empty last rank in the one-token case.
+The same precision-specific weight preparation and independent Torch reference
+serve the CLI, pytest and synchronization checks; every smoke token is checked.
+The shared replay helper changes inputs, routes and routing weights, including
+next-rank and last-rank destinations, random routes, hot experts and fully inactive routes.
+Before each checked replay or eager call, receive and output buffers are poisoned
+with NaN and one rotating rank starts late. This checks that an empty source rank
+still computes remote expert work. No host barrier is inserted between scatter
+and combine. Inactive routes must produce exact zeros.
+
+The normalized squared-error thresholds are 0.003 for W4A4, 0.0005 for W4A16
+and 0.001 for FP8, matching the existing FP8 grouped contiguous/masked GEMM
+tests. W4A16 also requires relative L2 below 0.005. Replay outputs are saved
+before eager execution and compared bitwise with it, then checked against the
+independent reference.
+
+CI runs these cases in the separate `ZW-M890P-EP2` suite with two devices in one
+worker pod. The launcher checks device count and architecture before testing.
+Single-device board suites retain their existing commands and separate reports.
 
 ## Symmetric workspace
 
@@ -150,7 +184,7 @@ additional W4A4 EP8 profile at exactly 8192 tokens per rank, with GEMM2 tile
 `128,256,64,64,64,3`; its other stages use the default selectors. Each profile
 declares its token counts explicitly, including the six K3 EP32 decode counts.
 Unlisted counts or devices fall back to
-the heuristics. FP8 blockwise uses its existing heuristics.
+the heuristics. FP8 blockwise uses its backend heuristics.
 Profiles cover quantized GEMM1 output (BF16 for W4A16) and BF16 scatter.
 
 Profiles provide only measured overrides; unset fields use the
@@ -232,10 +266,37 @@ case includes 4, 8, 16, 32, 64 and 128 tokens per rank in addition to prefill.
 All model rows run the three primary token counts; MiMo also runs 8192 tokens
 per rank to cover its tuned profile. Capacity is the buffer limit, not the
 number of tokens passed to each forward. The small smoke cases use
-1, 0, 33 and 8 tokens to cover empty ranks, all-empty calls and partial tiles.
+1, 0, 33, 129 and 8 tokens to cover empty ranks, all-empty calls and partial tiles.
 This table describes configured coverage, not a record that every case has
 passed on hardware. These tests exercise BF16 scatter/combine; optional FP8
 scatter/combine remains implemented but is outside this test matrix.
+
+## Accuracy checks and comparison methodology
+
+The test runners use independent Torch references built from source tensors and
+logical quantized weights. They model each precision's activation quantization
+and BF16 rounding. The normalized squared-error metric is
+`sum((actual-reference)^2) / max(sum(actual^2+reference^2), 1e-30)`.
+Its threshold is 0.003 for W4A4, 0.0005 for W4A16 and 0.001 for FP8. The FP8
+threshold matches the existing grouped contiguous/masked GEMM tests. Relative
+L2 is reported for every precision; W4A16 also requires it below 0.005. Graph
+and eager outputs must match bitwise. Changed inputs, routes and routing weights
+are checked against the independent reference with the same thresholds.
+
+`--reference-tokens 0` checks every token; a positive value samples that many
+tokens per rank and reports the sample size. `--edge-cases` includes a zero-token
+rank at the 1-token test point, invalid IDs and zero weights. Replay checks
+concentrated routes, no valid routes, tiny/nonuniform/zero weights, and return
+to the original inputs; combine storage is poisoned with NaNs between calls.
+`--replicas` uses separate master/replica weight allocations.
+
+Graph latency is the median of per-repeat maximum-rank means. For A/B
+comparisons, keep model, precision, routing distribution, seeds, capacity,
+replicas, EP and timing mode identical. Include input staging/quantization,
+communication, both GEMMs, activation, scatter/combine and counter cleanup;
+exclude one-time weight transformation, JIT and reference evaluation.
+The commands below exercise these checks; device and CI results must be
+recorded for the revision being tested.
 
 ## Running correctness and performance tests
 
@@ -253,7 +314,7 @@ export NCCL_IB_DISABLE=1 NCCL_SOCKET_IFNAME=eth0 GLOO_SOCKET_IFNAME=eth0
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
   -m pytest tests/test_moe_w4a4.py tests/test_moe_w4a16.py tests/test_moe_w8a8.py \
   -k smoke -q
-# Channelwise FP8 smoke requires EP4 or EP8.
+# Channelwise FP8 smoke supports EP1, EP2, EP4 and EP8; this example uses EP4.
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
   tests/test_moe_w8a8.py --case smoke_channelwise --tokens 1 0 33 8 \
   --edge-cases --replicas --benchmark
@@ -261,7 +322,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
 # DeepSeek V4 Pro: correctness and full-pipeline graph timing.
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 torchrun --standalone --nproc-per-node=8 tests/test_moe_w4a4.py \
-  --case deepseek_v4_pro --tokens 1024 2048 4096 \
+  --case deepseek_v4_pro --tokens 1024 2048 4096 --routing random \
   --benchmark --warmup 10 --iterations 100 --repeats 5
 
 # MiMo V2.6 Pro: fallback and measured GEMM2 profile.
@@ -319,16 +380,17 @@ combine buffer and repeated graph replay with changed inputs. The changed
 inputs/routes/weights are checked against the independent Torch reference with
 the same numerical thresholds, as well as bitwise against eager execution.
 
-`--routing round_robin` retains the original balanced distribution.
+`--routing round_robin` selects a balanced distribution.
 `--routing random` chooses distinct random experts per token;
 `--routing skewed` sends 80% of tokens to the same top-k experts. All three
 precision runners support these options and record the choice in their JSON.
 
 `--edge-cases` injects masked routes, zero routing weights and an empty final
-rank when `--tokens` includes 1. `--replicas` places the final local physical
-expert in a separate allocation for both GEMMs. For W4A16 Kimi K3, it retains
-896 masters globally and adds one replica slot per rank (912 physical experts
-at EP16 or 928 at EP32). Other cases split their existing physical slots. Pytest exercises both
+rank when `--tokens` includes 1. With multiple ranks it also exercises targeted
+remote routing and staggered launches in the shared replay checks. `--replicas` places the final local physical
+expert in a separate allocation for both GEMMs. W4A16 Kimi K3 uses
+896 masters globally and one replica slot per rank (912 physical experts
+at EP16 or 928 at EP32). Other cases split their physical slots. Pytest exercises both
 ordinary and replica weights where the case has enough local experts.
 
 Performance results are JSON objects printed by rank 0, one per token count.

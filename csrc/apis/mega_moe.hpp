@@ -986,8 +986,8 @@ int mega_moe_dispatch_gemm1(const py::object& buffer, const Pair& rhs, const Ten
                         gemm2_block_m == 128 || gemm2_block_m == 256,
                         "W4A4 GEMM2 metadata requires BLOCK_M in {16,32,64,128,256}");
         }
-        // The TC backend consumes the packed uint16 scales. Its legacy raw
-        // scale pointer is unused; no second scale layout is part of this API.
+        // The TC backend consumes packed uint16 scales. The raw-scale argument
+        // is unused; this API accepts a single scale layout.
         return fp4_mega_moe_dispatch_gemm1(
             buffer, rank, num_tokens, rhs.first, rhs.second.view(torch::kUInt8), rhs.second,
             activation_limit.value_or(0.0f), false, quant ? OptTensor(out) : std::nullopt, out_scales, quant,

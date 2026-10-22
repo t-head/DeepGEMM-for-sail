@@ -251,8 +251,8 @@ template <
     bool kEnableGemm1 = false,
     uint32_t kGemm1N = 0,
     uint32_t kTokenBytes = 0,
-    uint32_t kGemm1BlockN = 0,  // gemm1 N-tile; 0 => full N (single tile, legacy)
-    uint32_t kGemm1BlockK = 0,  // gemm1 K-tile; 0 => full K (single tile, legacy)
+    uint32_t kGemm1BlockN = 0,  // gemm1 N-tile; 0 => full N (single tile)
+    uint32_t kGemm1BlockK = 0,  // gemm1 K-tile; 0 => full K (single tile)
     uint32_t kGemm1SfbBlockN = kGemm1BlockN,  // physical canonical SFB N-tile
     bool kEnableRemotePull = true,  // false isolates GEMM1 from dispatch traffic
     bool kEnableRemotePush = false, // BF16 source rank pushes rows with ICN stores
@@ -681,8 +681,7 @@ dispatch_gemm1_body(
             uint16_t* sfa_base = sfa_scratch + static_cast<uint64_t>(g) * (BLOCK_M * kSfCols);
             if constexpr (kEnableRemotePull) {
                 // Cache this expert's per-rank token ranges once per warp and
-                // M block.  The old path made lane 0 serially reload up to all
-                // rank counts for every token.  Here the first kNumRanks lanes
+                // M block. The first kNumRanks lanes
                 // load the counts in parallel and build an inclusive prefix;
                 // each token then resolves its source with one warp ballot.
                 uint32_t src_count = lane_idx < kNumRanks
@@ -825,7 +824,7 @@ dispatch_gemm1_body(
             }
 
             // Grid sync: ensure all SMs' pull writes are visible before GEMM.
-            // Replaces per-block spin-wait barriers with 1 grid_sync.
+            // Publish all pulled blocks with one grid-wide synchronization.
             if constexpr (!kSmSpecialization) {
                 if (synchronize_pull)
                     comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/2>(
@@ -1024,11 +1023,8 @@ dispatch_gemm1_body(
 }
 
 // ----------------------------------------------------------------------------
-// Thin `__global__` shim around the `__device__` impl above. Keeps the original
-// kernel entry name + signature (defaults included) so the Python JIT launch
-// template (`fp4_mega_moe.py`) launches it unchanged. The C++ JIT path does NOT
-// use this shim; it emits its own `extern "C" __global__` wrapper that forwards
-// to `dispatch_gemm1_device`.
+// Direct `__global__` entry for the device implementation above. The C++ JIT
+// emits an `extern "C" __global__` wrapper calling `dispatch_gemm1_device`.
 // ----------------------------------------------------------------------------
 template <
     uint32_t kNumRanks, uint32_t kNumCTAs, uint32_t kNumThreads,

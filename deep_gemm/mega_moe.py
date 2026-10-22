@@ -273,7 +273,7 @@ class MegaMoEDispatchGemm1SymmBuffer(_MegaMoEWorkspace):
 
     @property
     def gemm1_output(self) -> torch.Tensor:
-        # Backward-compatible lazy view for non-quantized/debug callers.
+        # Lazily allocate the compact BF16 output for non-quantized callers.
         return self.get_gemm1_output(fused_swiglu=True)
 
     def get_gemm1_output(self, fused_swiglu: bool) -> torch.Tensor:

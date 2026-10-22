@@ -1,21 +1,13 @@
 #pragma once
 
 // ============================================================================
-// PPU mega-MoE GEMM1 Tensor Core path (tc3).
+// PPU MegaMoE GEMM1 FP4 Tensor Cell path.
 // ----------------------------------------------------------------------------
-// Device-side wiring of the self-contained mxfp4 mainloop
-// `CollectiveMmaScaleFp4::operator()` so the fused dispatch+gemm1 kernel can run
-// gemm1 on the PPU FP4 Tensor Core instead of the naive CUDA-core dequant GEMM.
+// The fused dispatch/GEMM1 kernel uses the MXFP4 mainloop
+// `CollectiveMmaScaleFp4::operator()` and a BF16 activation/quantization epilogue.
 //
 // This header pulls in the full CUTLASS3 stack via fp4_gemm_cutlass3.cuh
-// for the FP4 Tensor Core mainloop.
-//
-// Verified wiring (tests/test_fp4_mma_standalone.py, diff=0):
-//   construct collective(args, problem) -> load_init -> clear(accum)
-//   -> operator()(accum, load_inputs, accum, k_tile_iter, k_tile_count,
-//                 residue_mnk, thread_idx, smem_buf)
-//   -> hand-written epilogue (thr_mma.partition_C, fp32 -> bf16).
-// SF layout convert verified in tests/test_fp4_sf_convert.py.
+// for the FP4 Tensor Cell mainloop.
 // ============================================================================
 
 #include <cstdint>
@@ -196,8 +188,8 @@ struct Gemm1MmaConfig {
 };
 
 // ----------------------------------------------------------------------------
-// Compile-time stage picker: mirror the dense baseline (get_best_configs /
-// get_smem_config_fp4) "always pick the longest stage that fits the smem cap".
+// Compile-time stage picker: select the largest stage count that fits the
+// shared-memory cap, matching get_best_configs / get_smem_config_fp4.
 // Gemm1MmaConfig::CollectiveMainloop::SharedStorage grows ~linearly with Stages,
 // so we descend from the desired upper bound `DesiredStages` and stop at the
 // first stage whose SharedStorage fits `kSmemCap`. This MUST be evaluated
@@ -352,7 +344,7 @@ __device__ __forceinline__ void gemm1_mma_block(
                           "compact epilogue must fit in mainloop shared memory");
         }
 
-        // G8 stores gate/up in adjacent N fragments. Use the original MMA
+        // G8 stores gate/up in adjacent N fragments. Use the MMA
         // fragment coordinates for both BF16 output and BF16 quantization staging.
         CUTLASS_PRAGMA_UNROLL
         for (int warp_m = 0; warp_m < size<1>(tCgD); ++warp_m) {
@@ -518,7 +510,7 @@ __device__ __forceinline__ void gemm1_mma_block(
         }
 
     } else {
-        // Original epilogue: write all N cols (with optional clamp based on is_gate).
+        // Unfused epilogue: write all N columns with optional gate/up clamping.
         CUTLASS_PRAGMA_UNROLL
         for (int warp_m = 0; warp_m < size<1>(tCgD); ++warp_m) {
             CUTLASS_PRAGMA_UNROLL

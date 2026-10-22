@@ -223,8 +223,8 @@ static W4A16Config ppu_w4_config(int expected_m, int n, int k,
     return c;
 }
 
-// Convert the fork's packed INT32 storage once at weight load to the mainline
-// logical [E,N,K/2] bytes. Quantized values are preserved exactly.
+// Convert packed INT32 [E,K/16,2N] weights at load time to logical
+// [E,N,K/2] bytes. Quantized values are preserved exactly.
 static torch::Tensor ppu_w4a16_preprocess_weights(const torch::Tensor& input) {
     TORCH_CHECK(input.scalar_type() == torch::kInt32 and input.dim() == 3 and input.is_contiguous(),
                 "W4A16 MXFP4 weights must be contiguous int32 [E,K/16,2N]");
@@ -258,7 +258,7 @@ static torch::Tensor ppu_w4a16_preprocess_scales(const torch::Tensor& input) {
         scale = torch::zeros({e, groups + 1, n}, input.options());
         scale.index_put_({Slice(), Slice(0, groups), Slice()}, input);
     }
-    // Mainline's 8x8 transpose acts on pairs of consecutive K-group scales.
+    // The 8x8 transpose acts on pairs of consecutive K-group scales.
     return scale.transpose(1, 2).reshape({e, n / 64, 8, 8, (groups + 1) / 2, 2})
         .permute({0, 1, 4, 3, 2, 5}).contiguous().view({e, n / 64, ((groups + 1) / 2) * 128});
 }

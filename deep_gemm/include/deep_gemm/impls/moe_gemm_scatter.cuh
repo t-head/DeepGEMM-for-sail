@@ -710,7 +710,7 @@ struct MoeOverlapGlobalDStorage {
   };
 };
 
-// Scatter-aware overlap epilogue; the GEMM mainloop retains its original ABI.
+// Scatter-aware overlap epilogue using the GEMM mainloop's parameter ABI.
 template <
     class BaseCollectiveEpilogue_,
     class MainloopSharedStorage_,

@@ -52,7 +52,7 @@ struct TuningConfig {
 };
 
 // These are measured overrides, not complete kernel configurations. Empty
-// fields retain the existing family-specific selector. Token counts match
+// fields use the family-specific selector. Token counts match
 // exactly: no nearest-model matching or interpolation into unmeasured ranges.
 struct TuningCase {
     int tokens;

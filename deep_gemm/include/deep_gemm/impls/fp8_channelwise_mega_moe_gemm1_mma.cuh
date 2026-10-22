@@ -127,7 +127,7 @@ __device__ __forceinline__ void gemm1_swiglu_mma_block(
         residue_mnk, thread_idx, cutlass::canonical_warp_idx_sync(), smem_buf,
         queue_counter, next_ticket);
 
-    // Collective's final barrier publishes the ticket; the original epilogue
+    // Collective's final barrier publishes the ticket; the epilogue
     // barrier below retires every thread's read before the next MMA uses SMEM.
     if (prefetched_work != nullptr) *prefetched_work = *next_ticket;
     // G=8 preprocessing stores [gate8, up8, gate8, up8, ...]. The physical
@@ -197,7 +197,7 @@ __device__ __forceinline__ void gemm1_swiglu_mma_block(
                         }
                         const float2 gf = __bfloat1622float2(bg);
                         const float2 uf = __bfloat1622float2(bu);
-                        // Keep ordinary SwiGLU arithmetic unchanged. M3 uses
+                        // SwiGLU uses an FP32 gate/sigmoid product. M3 applies
                         // FP32 alpha and up bias after BF16 projection/clamp.
                         const float lhs0 = gf.x * __ppu_sgmdf(
                             kSwiGLUOAI ? swiglu_alpha * gf.x : gf.x);

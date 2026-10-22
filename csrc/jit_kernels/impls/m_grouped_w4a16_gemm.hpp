@@ -58,7 +58,7 @@ struct W4A16GemmArguments {
 };
 
 // Host mirror of the GEMM2 scatter parameters.
-// Mirror PODs keep the original device Params ABI and avoid reconstructing it
+// Host-side PODs match the device Params ABI and avoid reconstructing it
 // inside the kernel. Generated sizeof/offsetof checks reject ABI drift.
 template <typename Scheduler>
 struct W4A16ScatterArguments {
