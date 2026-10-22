@@ -31,7 +31,7 @@ ppu_sdk = os.environ.get('PPU_SDK') or os.environ.get('PPU_HOME') or '/usr/local
 if not os.path.isfile(os.path.join(ppu_sdk, 'bin', 'hgcc')):
     compiler = shutil.which('hgcc')
     if compiler:
-        ppu_sdk = os.path.dirname(os.path.dirname(os.path.abspath(compiler)))
+        ppu_sdk = os.path.dirname(os.path.dirname(os.path.realpath(compiler)))
 ppu_include = os.path.join(ppu_sdk, 'targets', 'x86_64-linux', 'include')
 
 sources = ['csrc/python_api.cpp']

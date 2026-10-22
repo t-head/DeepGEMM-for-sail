@@ -10,7 +10,7 @@ PPU_HOME = os.environ.get('PPU_SDK') or os.environ.get('PPU_HOME') or '/usr/loca
 if not os.path.isfile(os.path.join(PPU_HOME, 'bin', 'hgcc')):
     compiler = shutil.which('hgcc')
     if compiler:
-        PPU_HOME = os.path.dirname(os.path.dirname(os.path.abspath(compiler)))
+        PPU_HOME = os.path.dirname(os.path.dirname(os.path.realpath(compiler)))
 
 
 def run_hgobjdump(file_path):
