@@ -7,7 +7,6 @@
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/epilogue/epilogue_traits.cuh>
-#include <type_traits>
 #include <cutlass/coord.h>
 #include <cutlass/kernel_hardware_info.h>
 #include <cutlass/workspace.h>
@@ -50,26 +49,6 @@ struct TileSchedulerArguments
 };
 using TileSchedulerParams = TileSchedulerArguments;
 
-// Optional work interval used by fused SiTU and distributed GEMM launches.
-// The default scheduler retains its original argument layout.
-struct WorkRangeTileSchedulerArguments {
-    int* grouped_layout;
-    uint32_t shape_m;
-    uint32_t work_begin;
-    uint32_t work_end;
-
-    CUTLASS_HOST_DEVICE
-    WorkRangeTileSchedulerArguments(uint32_t m = 0, int* layout = nullptr,
-                                    uint32_t begin = 0, uint32_t end = 0xffffffffu)
-        : grouped_layout(layout), shape_m(m), work_begin(begin), work_end(end) {}
-
-    CUTLASS_HOST_DEVICE
-    WorkRangeTileSchedulerArguments(int* layout, uint32_t m,
-                                    uint32_t begin = 0, uint32_t end = 0xffffffffu)
-        : WorkRangeTileSchedulerArguments(m, layout, begin, end) {}
-};
-using WorkRangeTileSchedulerParams = WorkRangeTileSchedulerArguments;
-
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
 // `kTransposedBatchOutput` only affects `GemmType::Batched`. It defaults to `true` because
@@ -82,8 +61,7 @@ template <GemmType kGemmType,
           uint32_t kNumNBlocks = math::ceil_div(SHAPE_N_, BLOCK_N_),
           uint32_t kNum1DBlocksPerGroup = 2,
           EpilogueType kEpilogueType = EpilogueType::Default,
-          bool kTransposedBatchOutput = true,
-          bool kUseWorkRange = false>
+          bool kTransposedBatchOutput = true>
 struct DeepGemmScheduler {
     constexpr static uint32_t SHAPE_N = SHAPE_N_;
     constexpr static uint32_t SHAPE_K = SHAPE_K_;
@@ -109,8 +87,8 @@ struct DeepGemmScheduler {
     // Only used for masked layout
     uint32_t curr_group_idx, curr_cumsum, curr_cumsum_blocks, curr_group_m, curr_cumsum_m;
     // Host-callable methods and type definitions
-    using Arguments = std::conditional_t<kUseWorkRange, WorkRangeTileSchedulerArguments, TileSchedulerArguments>;
-    using Params = Arguments;
+    using Arguments = TileSchedulerArguments;
+    using Params = TileSchedulerParams;
     Params const& params;
 
 #if defined(__HGGC__)
@@ -171,16 +149,7 @@ struct DeepGemmScheduler {
     }
 
     CUTLASS_DEVICE bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        const auto next_block_idx = [&] {
-            if constexpr (kUseWorkRange)
-                return params.work_begin + (current_iter++) * gridDim.x + blockIdx.x;
-            else
-                return (current_iter++) * gridDim.x + blockIdx.x;
-        }();
-        if constexpr (kUseWorkRange) {
-            if (next_block_idx >= params.work_end)
-                return false;
-        }
+        const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
         if constexpr(kIsNoPadPreprocessLayout) {
             if (next_block_idx >= num_blocks) {
                 m_block_idx = num_aligned_m_blocks;
@@ -337,10 +306,6 @@ struct DeepGemmScheduler {
         // dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shape_mnkl, tile_shape, cluster_shape);
         auto problem_shape = cutlass::gemm::to_gemm_coord(problem_shape_mnkl);
         Params params(problem_shape.m(), groups_layout);
-        if constexpr (kUseWorkRange) {
-            params.work_begin = arguments.work_begin;
-            params.work_end = arguments.work_end;
-        }
         return params;
     }
 

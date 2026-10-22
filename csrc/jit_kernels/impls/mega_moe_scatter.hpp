@@ -14,7 +14,7 @@ using ScaleStride = cute::Stride<cute::Int<1>, int64_t, int64_t>;
 using Problem = FP4GemmRuntime::GemmProblemSize;
 using Mode = FP4GemmRuntime::GemmUniversalMode;
 
-using ScatterScheduler = WorkRangeTileSchedulerArguments;
+using ScatterScheduler = TileSchedulerArguments;
 
 struct ChannelScatter {
     void* combine_base = nullptr;
@@ -256,7 +256,7 @@ inline void channel_scatter_kernel(const ScatterConfig& config, const torch::Ten
         params.problem_shape = {m, n, k, 1};
         params.mainloop = mainloop;
         params.epilogue = {epilogue, scatter, device_pointer(output)};
-        params.scheduler = {layout, uint32_t(m)};
+        params.scheduler = {uint32_t(m), layout};
         params.rhs_replicas = device_pointer(rhs_replicas);
         params.rhs_replica_scales = device_pointer<float>(rhs_replica_scales);
         params.num_master_groups = masters;
@@ -267,7 +267,7 @@ inline void channel_scatter_kernel(const ScatterConfig& config, const torch::Ten
         params.problem_shape = {m, n, k, 1};
         params.mainloop = mainloop;
         params.epilogue = epilogue;
-        params.scheduler = {layout, uint32_t(m)};
+        params.scheduler = {uint32_t(m), layout};
         params.scatter = scatter;
         params.rhs_replicas = device_pointer(rhs_replicas);
         params.rhs_replica_scales = device_pointer<float>(rhs_replica_scales);
@@ -311,7 +311,7 @@ inline void block_scatter_kernel(const ScatterConfig& config,
                                 uint32_t(rank), uint32_t(ranks), nullptr, uint32_t(groups)},
                                device_pointer<int32_t>(row_offsets)};
     params.epilogue.base_ptr_D = device_pointer(output);
-    params.scheduler = {{layout, uint32_t(m)}, device_pointer<int32_t>(row_offsets)};
+    params.scheduler = {{uint32_t(m), layout}, device_pointer<int32_t>(row_offsets)};
     params.rhs_replicas = device_pointer(rhs_replicas);
     params.rhs_replica_scales = device_pointer<float>(rhs_replica_scales);
     params.num_master_groups = config.num_master_groups;
@@ -358,7 +358,7 @@ inline void fp4_scatter_kernel(
         sb,        device_pointer<uint16_t>(lhs_scales), sfa, device_pointer<uint16_t>(rhs_scales),
         sfb};
     params.epilogue = {{1, 0}, nullptr, sc, device_pointer<cutlass::bfloat16_t>(output), sd};
-    params.scheduler = {layout, uint32_t(m)};
+    params.scheduler = {uint32_t(m), layout};
     params.moe_combine_buf.base = device_pointer(combine);
     params.moe_combine_buf.hidden_bytes = hidden_bytes;
     params.moe_combine_buf.max_tokens_per_rank = max_tokens;

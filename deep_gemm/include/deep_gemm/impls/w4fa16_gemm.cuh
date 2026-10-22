@@ -58,8 +58,9 @@ public:
   static constexpr int N = ShapeN;
   static constexpr int K = ShapeK;
   static constexpr int K2 = K / 2;
-  // One 128-byte scale tile covers 64 columns and two K=32 groups.
-  static constexpr int ScaleStride = ((K + 63) / 64) * 128;
+  // MegaMoE pads pairs of K=32 scale groups to 128 bytes per 64 columns.
+  // Ordinary GEMM accepts the compact [E, N/64, K*2] scale layout.
+  static constexpr int ScaleStride = kExtendedParams ? ((K + 63) / 64) * 128 : K * 2;
   static constexpr int L = kNumGroups;
   static constexpr int BlockK2 = BlockK / 2;
   static constexpr int WarpK2 = WarpK / 2;

@@ -680,12 +680,13 @@ static void check_w4a16_scatter(const torch::Tensor& lhs, const torch::Tensor& r
     const int groups = master_groups + (replicas ? replica_rhs.size(0) : 0);
     TORCH_CHECK(is_ppu1v5_device(), "W4A16 MXFP4 requires PPU1.5 and group size 32");
     TORCH_CHECK(n > 0 and n % 64 == 0 and k > 0 and k % group_size == 0, "Invalid W4A16 N/K/group size");
+    TORCH_CHECK(k % 64 == 0, "W4A16 MegaMoE requires K divisible by 64 for paired scales");
     const auto check_weight = [&](const torch::Tensor& weight, const torch::Tensor& scale) {
         TORCH_CHECK(weight.dim() == 3 and scale.dim() == 3 and scale.size(0) == weight.size(0),
                     "Invalid W4A16 weight/scale rank");
         TORCH_CHECK(weight.size(1) == n and weight.size(2) == k / 2 and scale.size(1) == n / 64 and
-                        scale.size(2) == ceil_div(k, 64) * 128,
-                    "MXFP4 requires mainline [E,N,K/2] weights and [E,N/64,ceil(K/64)*128] scales");
+                        scale.size(2) == k * 2,
+                    "W4A16 MegaMoE requires [E,N,K/2] weights and [E,N/64,K*2] scales");
     };
     check_weight(rhs, scales);
     TORCH_CHECK(lhs.scalar_type() == torch::kBFloat16 and combine.scalar_type() == torch::kBFloat16 and
@@ -999,7 +1000,8 @@ int mega_moe_dispatch_gemm1(const py::object& buffer, const Pair& rhs, const Ten
         const int masters = rhs.first.size(0), replicas = rhs_replicas ? rw.size(0) : 0;
         TORCH_CHECK(masters + replicas == epr,
                     "W4A16 GEMM1 master and replica counts must match local physical experts");
-        TORCH_CHECK(k % 64 == 0 && n % 16 == 0 && capacity.token_bytes == k * 2);
+        TORCH_CHECK(k % 64 == 0, "W4A16 MegaMoE requires K divisible by 64 for paired scales");
+        TORCH_CHECK(n % 16 == 0 && capacity.token_bytes == k * 2);
         const auto ptrs = field<Tensor>(buffer, "buf_ptrs");
         const auto device = field<Tensor>(buffer, "buffer").device();
         const auto check_weight = [&](const Tensor& weight, const Tensor& scales, int groups) {

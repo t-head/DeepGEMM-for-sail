@@ -857,7 +857,7 @@ public:
     using TileScheduler = DeepGemmScheduler<
         GemmTypeValue, ShapeN, ShapeK,
         BlockM, BlockN, NumGroups, math::ceil_div(ShapeN, BlockN), 2,
-        EpilogueType::Default, true, true>;
+        EpilogueType::Default>;
     static constexpr bool UseBm256S4AccumulatorPairStaging =
         KernelStrategyValue == KernelStrategy::Default &&
         BlockM == 256 && BlockN == 256 && BlockK == 128 &&

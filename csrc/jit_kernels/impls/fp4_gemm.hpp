@@ -401,7 +401,7 @@ using CollectiveEpilogue = typename cutlass::platform::conditional<
 // fused epilogue's SFD addressing.
 using TileScheduler = DeepGemmScheduler<
     kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS,
-    ceil_div(SHAPE_N, BLOCK_N * N_EXPAND), {}, kEpilogueType, true, kUseReplicaWeights>;
+    ceil_div(SHAPE_N, BLOCK_N * N_EXPAND), {}, kEpilogueType>;
 
 using GemmKernel = typename deep_gemm::DeepGemmUniversal<
     Shape<int,int,int,int>,

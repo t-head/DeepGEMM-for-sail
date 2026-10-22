@@ -175,9 +175,9 @@ private:
 template <int N, int K, int BlockM, int Groups>
 struct ValidRowsPoolScheduler
     : DeepGemmScheduler<GemmType::MGroupedNoPad, N, K, BlockM, 256, Groups,
-        math::ceil_div(N, 256), 2, EpilogueType::Default, true, true> {
+        math::ceil_div(N, 256), 2, EpilogueType::Default> {
     using Base = DeepGemmScheduler<GemmType::MGroupedNoPad, N, K, BlockM, 256, Groups,
-        math::ceil_div(N, 256), 2, EpilogueType::Default, true, true>;
+        math::ceil_div(N, 256), 2, EpilogueType::Default>;
     struct Params : Base::Params {
         const int32_t* pool_row_offsets{nullptr};
         CUTLASS_HOST_DEVICE Params() : Base::Params() {}
