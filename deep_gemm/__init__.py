@@ -1,9 +1,14 @@
 import os
+import shutil
 import subprocess
 import torch
 
-# SDK root: env PPU_SDK > env PPU_HOME > default
+# SDK root: env PPU_SDK > env PPU_HOME > default, then the compiler on PATH.
 PPU_HOME = os.environ.get('PPU_SDK') or os.environ.get('PPU_HOME') or '/usr/local/PPU_SDK'
+if not os.path.isfile(os.path.join(PPU_HOME, 'bin', 'hgcc')):
+    compiler = shutil.which('hgcc')
+    if compiler:
+        PPU_HOME = os.path.dirname(os.path.dirname(os.path.abspath(compiler)))
 
 from . import jit
 from . import deep_gemm_tuner
