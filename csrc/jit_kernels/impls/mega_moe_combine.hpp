@@ -30,22 +30,21 @@ inline void barrier_reduce_impl(const torch::Tensor& buf, const torch::Tensor& w
                                 int hidden, int topk, int capacity, const torch::Tensor& pointers,
                                 int rank, int world, const torch::Tensor& done,
                                 const std::optional<torch::Tensor>& scales, int scale_block_n,
-                                const torch::Tensor& out, const mega_moe_config::CombineTuning& tuning = {}) {
+                                const torch::Tensor& out) {
     reset_done(done);
     const bool fp8 = buf.scalar_type() == torch::kFloat8_e4m3fn;
     const bool scaled = scales.has_value();
-    const int chunk = mega_moe_config::chunked_reduce(tokens, fp8 && !scaled, tuning) ? 256 : 0;
-    const int threads = chunk ? chunk : 512;
+    const int threads = mega_moe_config::combine_num_threads(tokens, hidden);
     const int scale_tiles = scaled ? ceil_div(hidden, scale_block_n) : 0;
     const int shift = fp8 && !scaled && !mega_moe_config::fp8_unit_scale()
                           ? get_env<int>("DG_MOE_SCATTER_FP8_EXP_SHIFT", 0) : 0;
     const auto body = fmt::format(
-        "barrier_reduce_kernel<{}, {}, {}, {}, {}>(b, s, w, y, t, h, c, st, sn, shift, p, r, ws, d);",
-        topk, fp8, scaled, chunk, threads);
+        "barrier_reduce_kernel<{}, {}, {}, {}>(b, s, w, y, t, h, c, st, sn, shift, p, r, ws, d);",
+        topk, fp8, scaled, threads);
     run_aux("barrier_reduce",
             "const void* b, const uint64_t* s, const float* w, __ppu_bfloat16* y, int t, int h, int c, "
             "int st, int sn, int shift, int32_t** p, int r, int ws, int32_t* d",
-            body, dim3(std::max(tokens, 1), chunk ? ceil_div(hidden / 8, chunk) : 1), threads,
+            body, dim3(std::max(tokens, 1), 1), threads,
             {buf.data_ptr(), scaled ? scales->data_ptr() : nullptr, weights.data_ptr(), out.data_ptr(),
              int32_t(tokens), int32_t(hidden), int32_t(capacity), int32_t(scale_tiles), int32_t(scale_block_n),
              int32_t(shift), pointers.data_ptr(), int32_t(rank), int32_t(world), done.data_ptr()});

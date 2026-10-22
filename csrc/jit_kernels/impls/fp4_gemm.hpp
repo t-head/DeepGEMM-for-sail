@@ -210,7 +210,8 @@ public:
     // The optional include and entry switch keep the generated source shared.
     static std::string generate_code(const Args& args, bool replicas = false,
                                      const std::string& policy = "",
-                                     const std::string& extra_include = "", bool emit_entry = true) {
+                                     const std::string& extra_include = "", bool emit_entry = true,
+                                     int m_tiles_per_group = 2) {
         // Mirrors the guard in Fp4Gemm::run: the fused epilogue reuses the mainloop's shared storage,
         // so its activation tile must fit in what the kernel already reserves.
         // Emitted only for the fused variant instead of using `if constexpr` in the generated kernel:
@@ -400,7 +401,7 @@ using CollectiveEpilogue = typename cutlass::platform::conditional<
 // fused epilogue's SFD addressing.
 using TileScheduler = DeepGemmScheduler<
     kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS,
-    ceil_div(SHAPE_N, BLOCK_N * N_EXPAND), 2, kEpilogueType, true, kUseReplicaWeights>;
+    ceil_div(SHAPE_N, BLOCK_N * N_EXPAND), {}, kEpilogueType, true, kUseReplicaWeights>;
 
 using GemmKernel = typename deep_gemm::DeepGemmUniversal<
     Shape<int,int,int,int>,
@@ -435,7 +436,7 @@ using GemmKernel = typename deep_gemm::DeepGemmUniversal<
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.enable_sbo_overlap, args.launch_info.hasBias, args.launch_info.n_expand,
-            args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit, replicas,
+            args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit, replicas, m_tiles_per_group,
             policy.empty() ? "" : ", " + policy,
             replicas ? "" : fmt::format(
                 "static_assert(GemmKernel::SharedStorageSize == {}, \"host/device FP4 shared memory mismatch\");",

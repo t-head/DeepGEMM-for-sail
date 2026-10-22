@@ -38,11 +38,14 @@ __device__ __forceinline__ void combine_barrier(int32_t** flags, int rank, int w
             generation = __shfl_sync(0xffffffffu, generation, 0);
             const auto start = clock64();
             while (true) {
-                const int32_t peer = tid < world ? load_barrier_flag(flags[tid]) : generation;
-                // Peers can be one generation ahead. Unsigned subtraction also
-                // handles int32 wraparound without signed overflow.
-                const bool arrived = static_cast<int32_t>(static_cast<uint32_t>(peer) -
-                                                         static_cast<uint32_t>(generation)) >= 0;
+                bool arrived = true;
+                for (int peer_rank = tid; peer_rank < world; peer_rank += 32) {
+                    const int32_t peer = load_barrier_flag(flags[peer_rank]);
+                    // A peer may be one generation ahead. Unsigned subtraction
+                    // handles the int32 wraparound without signed overflow.
+                    arrived &= static_cast<int32_t>(static_cast<uint32_t>(peer) -
+                                                    static_cast<uint32_t>(generation)) >= 0;
+                }
                 if (__all_sync(0xffffffffu, arrived))
                     break;
                 if (clock64() - start > kBarrierTimeoutCycles) {
@@ -103,7 +106,7 @@ __device__ __forceinline__ void load_combine_vector(
     }
 }
 
-template <int kTopk, bool kFp8, bool kScaled, int kChunkVecs, int kThreads>
+template <int kTopk, bool kFp8, bool kScaled, int kThreads>
 __device__ __forceinline__ void barrier_reduce_kernel(
     const void* buf, const uint64_t* scales, const float* weights, __ppu_bfloat16* output,
     int tokens, int hidden, int capacity, int scale_tiles, int scale_block_n, int fp8_exp_shift,
@@ -112,8 +115,6 @@ __device__ __forceinline__ void barrier_reduce_kernel(
     const int token = blockIdx.x;
     if (token >= tokens)
         return;
-    const int begin = kChunkVecs ? blockIdx.y * kChunkVecs : 0;
-    const int end = kChunkVecs ? min(begin + kChunkVecs, hidden / 8) : hidden / 8;
     float route_weights[kTopk];
     #pragma unroll
     for (int slot = 0; slot < kTopk; ++slot) {
@@ -121,7 +122,7 @@ __device__ __forceinline__ void barrier_reduce_kernel(
         if constexpr (kFp8 && !kScaled)
             route_weights[slot] *= ldexpf(1.0f, fp8_exp_shift);
     }
-    for (int vector = begin + threadIdx.x; vector < end; vector += kThreads) {
+    for (int vector = threadIdx.x; vector < hidden / 8; vector += kThreads) {
         float2 acc[4] = {};
         #pragma unroll
         for (int slot = 0; slot < kTopk; ++slot) {

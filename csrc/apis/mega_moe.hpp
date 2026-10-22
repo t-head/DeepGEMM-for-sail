@@ -35,7 +35,7 @@ static Precision parse_precision(const std::string& precision) {
 TuningConfig get_mega_moe_tuning_config(int ranks, int experts, int topk, int hidden,
                                        int intermediate, int tokens, const std::string& precision,
                                        const std::string& act) {
-    TORCH_CHECK(ranks > 0 && ranks <= 32 && experts > 0 && experts % ranks == 0 &&
+    TORCH_CHECK(ranks > 0 && ranks <= (precision == "fp8_blockwise" ? 64 : 32) && experts > 0 && experts % ranks == 0 &&
                 topk > 0 && topk <= 16 && topk <= experts && hidden > 0 && intermediate > 0 && tokens >= 0,
                 "Invalid MegaMoE tuning workload");
     TORCH_CHECK(act == "swiglu" || act == "swiglu_oai" || act == "situ" || act == "step",
@@ -62,6 +62,8 @@ static DispatchConfig read_dispatch_config(const py::dict& values) {
     for (const auto& [key, member] : mega_moe_config::dispatch_config_fields)
         if (values.contains(key))
             c.*member = values[key].cast<int>();
+    if (values.contains("ENABLE_REMOTE_PUSH"))
+        c.enable_remote_push = values["ENABLE_REMOTE_PUSH"].cast<int>() != 0;
     return c;
 }
 
@@ -72,6 +74,7 @@ static std::map<std::string, int> dispatch_config_dict(const DispatchConfig& c, 
         if (fp4 || (name != "CHUNK_BLOCKS" && name.rfind("GEMM1_", 0) != 0))
             values[key] = c.*member;
     }
+    values["ENABLE_REMOTE_PUSH"] = c.enable_remote_push;
     return values;
 }
 
@@ -106,11 +109,13 @@ static DispatchConfig launch_config(const py::object& buffer, int tokens) {
     if (!cache.contains(key)) {
         DispatchConfig c;
         if (py::hasattr(buffer, "bf16_hidden")) {
+            const auto capacity = read_dispatch_config(field<py::dict>(buffer, "_capacity_cfg"));
             c = mega_moe_config::w4a16_dispatch_config(
                 field<int>(buffer, "num_ranks"), field<int>(buffer, "num_experts"),
                 field<int>(buffer, "num_topk"), field<int>(buffer, "bf16_hidden"),
                 field<int>(buffer, "intermediate_hidden"), field<int>(buffer, "num_max_tokens_per_rank"),
-                tokens, read_dispatch_config(field<py::dict>(buffer, "_capacity_cfg")).block_m);
+                tokens, capacity.block_m);
+            c.enable_remote_push = capacity.enable_remote_push;
         } else {
             const auto overrides = field<std::optional<mega_moe_config::Overrides>>(buffer, "_config_override");
             c = mega_moe_config::fp4_dispatch_config(
@@ -145,8 +150,11 @@ static std::map<std::string, int> dispatch_config(
     int num_ranks, int num_experts, int num_topk, int hidden, int num_max_tokens_per_rank,
     const std::string& precision, std::optional<int> intermediate_hidden,
     std::optional<int> block_m, std::optional<int> gemm1_block_n, std::optional<int> gemm1_block_k,
-    const std::optional<mega_moe_config::Overrides>& overrides) {
+    const std::optional<mega_moe_config::Overrides>& overrides, std::optional<int> token_bucket) {
     const auto kind = parse_precision(precision);
+    TORCH_CHECK(!token_bucket || (kind == Precision::W4A16 && *token_bucket > 0 &&
+                                 *token_bucket <= num_max_tokens_per_rank),
+                "num_tokens_per_rank requires a common W4A16 bucket within capacity");
     if (kind == Precision::W4A4) {
         TORCH_CHECK(intermediate_hidden && !block_m,
                     "w4a4 requires intermediate_hidden; set BLOCK_M through overrides");
@@ -159,15 +167,15 @@ static std::map<std::string, int> dispatch_config(
                 "GEMM1 tile options and overrides are only supported for w4a4");
     if (kind == Precision::W4A16) {
         TORCH_CHECK(intermediate_hidden, "w4a16 requires intermediate_hidden");
-        return dispatch_config_dict(mega_moe_config::w4a16_dispatch_config(
+        return dispatch_config_dict(mega_moe_config::w4a16_buffer_config(
             num_ranks, num_experts, num_topk, hidden, *intermediate_hidden, num_max_tokens_per_rank,
-            num_max_tokens_per_rank, block_m.value_or(64)));
+            token_bucket, block_m));
     }
     TORCH_CHECK(!intermediate_hidden, "FP8 dispatch configuration does not select GEMM1 tiles");
     const bool blockwise = kind == Precision::FP8Blockwise;
     return dispatch_config_dict(mega_moe_config::fp8_dispatch_config(
         num_ranks, num_experts, num_topk, hidden, num_max_tokens_per_rank,
-        block_m.value_or(blockwise ? 128 : 256), blockwise), false);
+        block_m, blockwise), false);
 }
 
 // BF16 and FP4 dispatch / fused GEMM1.
@@ -180,16 +188,17 @@ static void bf16_mega_moe_pre_dispatch(const Tensor& hidden_states, const Tensor
     check_shape(topk_ids, {num_tokens, field<int>(buffer, "num_topk")});
     check_shape(topk_weights, topk_ids.sizes());
     TORCH_CHECK(num_tokens >= 0 && num_tokens <= field<int>(buffer, "num_max_tokens_per_rank"));
-    if (num_tokens) {
-        field<Tensor>(buffer, "input_token_bf16").narrow(0, 0, num_tokens).copy_(hidden_states);
-        field<Tensor>(buffer, "input_topk_idx").narrow(0, 0, num_tokens).copy_(topk_ids);
-        field<Tensor>(buffer, "input_topk_weights").narrow(0, 0, num_tokens).copy_(topk_weights);
-    }
+    const auto tokens = field<Tensor>(buffer, "input_token_bf16"),
+               ids = field<Tensor>(buffer, "input_topk_idx"),
+               weights = field<Tensor>(buffer, "input_topk_weights");
+    TORCH_CHECK(hidden_states.device() == tokens.device() && topk_ids.device() == tokens.device() &&
+                topk_weights.device() == tokens.device(), "BF16 pre-dispatch inputs must share the buffer device");
+    mega_moe_native::w4a16_pre_dispatch_impl(hidden_states, topk_ids, topk_weights, tokens, ids, weights,
+                                           num_tokens, hidden_states.size(1), topk_ids.size(1));
 }
 static void fp4_mega_moe_pre_dispatch(const Tensor& hidden_states, const Tensor& topk_ids,
                                const Tensor& topk_weights, const Tensor& input_token, const Tensor& input_sf,
-                               const Tensor& input_topk_idx, const Tensor& input_topk_weights, int num_tokens,
-                               int groups_per_block, std::optional<int> vec_block_threads) {
+                               const Tensor& input_topk_idx, const Tensor& input_topk_weights, int num_tokens) {
     TORCH_CHECK(is_ppu1v5_device());
     check_tensor(hidden_states, torch::kBFloat16);
     check_tensor(topk_ids, torch::kInt64);
@@ -204,13 +213,11 @@ static void fp4_mega_moe_pre_dispatch(const Tensor& hidden_states, const Tensor&
                 input_topk_idx.size(1) == topk && input_topk_weights.size(1) == topk);
     for (const auto& t : {input_token, input_sf, input_topk_idx, input_topk_weights, topk_ids, topk_weights})
         TORCH_CHECK(t.size(0) >= num_tokens);
-    TORCH_CHECK(groups_per_block > 0 && groups_per_block <= 32);
-    const int threads = vec_block_threads.value_or(
-        integer("MEGA_MOE_PRE_DISPATCH_VEC_BLOCK_THREADS", mega_moe_config::pre_dispatch_threads(hidden)));
+    const int threads = mega_moe_config::pre_dispatch_threads(hidden);
     TORCH_CHECK(threads > 0 && threads % 32 == 0 && threads <= hidden / 8);
     mega_moe_native::fp4_mega_moe_pre_dispatch_impl(hidden_states, topk_ids, topk_weights, input_token,
                                                     input_sf, input_topk_idx, input_topk_weights, num_tokens,
-                                                    hidden, topk, groups_per_block, threads);
+                                                    hidden, topk, threads);
 }
 
 static int fp4_mega_moe_dispatch_gemm1(const py::object& buffer, int rank, int num_tokens, Tensor gemm1_weight,
@@ -332,7 +339,7 @@ static int run_fp8_gemm1(const py::object& buffer, int rank, int num_tokens, con
                          const Tensor& scales, const Tensor& output, OptTensor quant, OptTensor quant_scale,
                          std::optional<float> limit, std::optional<bool> paired,
                          std::optional<bool> triple, OptTensor replicas, OptTensor replica_scales,
-                         std::optional<float> alpha, std::optional<bool> separate,
+                         std::optional<float> alpha,
                          std::optional<std::string> selected, const mega_moe_config::Gemm1Tuning& tuning = {}) {
     auto c = read_dispatch_config(field<py::dict>(buffer, "_cfg"));
     validate_rank(c, rank, num_tokens);
@@ -352,8 +359,7 @@ static int run_fp8_gemm1(const py::object& buffer, int rank, int num_tokens, con
     check_tensor(rw, torch::kFloat8_e4m3fn);
     check_tensor(rs, torch::kFloat32);
     TORCH_CHECK(masters + (replicas ? rw.size(0) : 0) == c.num_experts_per_rank);
-    TORCH_CHECK(hidden == field<int>(buffer, "hidden") && hidden % 128 == 0 && n % 256 == 0 &&
-                c.block_m == 256 && c.num_threads == 512);
+    TORCH_CHECK(hidden == field<int>(buffer, "hidden") && hidden % 128 == 0 && n % 256 == 0);
     check_shape(output, {pool, n / 2});
     if (quant) {
         TORCH_CHECK(quant_scale);
@@ -365,7 +371,8 @@ static int run_fp8_gemm1(const py::object& buffer, int rank, int num_tokens, con
     const auto [oai, activation_alpha] = fp8_activation_config(alpha, selected);
     return mega_moe_native::fp8_mega_moe_dispatch_gemm1_impl(
         c, field<Tensor>(buffer, "buf_ptrs"), rank, num_tokens, weight, scales, rw, rs, masters, output,
-        quant, quant_scale, limit, paired, triple, oai, activation_alpha, separate, tuning);
+        quant, quant_scale, limit, paired, triple, oai, activation_alpha, tuning,
+        field<std::optional<int>>(buffer, "_block_m_override"));
 }
 static void fp8_blockwise_mega_moe_pre_dispatch(const py::object& buffer, const Tensor& hidden_states,
                                          const Tensor& topk_ids, const Tensor& topk_weights) {
@@ -387,26 +394,22 @@ static void check_blockwise_buffer(const py::object& buffer, int rank, int token
     const auto c = read_dispatch_config(field<py::dict>(buffer, "_cfg"));
     validate_rank(c, rank, tokens);
     const int ranks = c.num_ranks, hidden = field<int>(buffer, "hidden");
-    TORCH_CHECK((ranks == 1 || ranks == 2 || ranks == 4 || ranks == 8) && hidden % 128 == 0 &&
+    TORCH_CHECK((ranks > 0 && ranks <= 64) && hidden % 128 == 0 &&
                 field<int>(buffer, "num_scales") == hidden / 128);
-}
-static int fp8_blockwise_mega_moe_dispatch(const py::object& buffer, int rank, int num_tokens) {
-    check_blockwise_buffer(buffer, rank, num_tokens);
-    const auto c = read_dispatch_config(field<py::dict>(buffer, "_cfg"));
-    mega_moe_native::fp8_blockwise_mega_moe_dispatch_impl(c, field<Tensor>(buffer, "buf_ptrs"), rank,
-                                                          num_tokens);
-    return c.block_m;
 }
 static int fp8_blockwise_mega_moe_dispatch_gemm1(const py::object& buffer, int rank, int num_tokens,
                                           const Tensor& weight, const Tensor& weight_scales,
                                           const Tensor& output, OptTensor output_scales,
                                           std::optional<float> swiglu_limit, OptPair weight_replicas,
-                                          std::optional<std::string> activation_type) {
+                                          std::optional<std::string> activation_type, float alpha,
+                                          const mega_moe_config::Gemm1Tuning& tuning) {
     check_blockwise_buffer(buffer, rank, num_tokens);
     auto c = read_dispatch_config(field<py::dict>(buffer, "_cfg"));
     const bool quant = output_scales.has_value(), clamp = swiglu_limit.has_value();
     const float limit = swiglu_limit.value_or(0.0f);
-    TORCH_CHECK(!activation_type || (quant && *activation_type == "silu_and_mul"));
+    const bool oai = activation_type == std::optional<std::string>("swiglu_oai");
+    TORCH_CHECK(!activation_type || (quant && (*activation_type == "silu_and_mul" || oai)));
+    TORCH_CHECK(std::isfinite(alpha) && alpha > 0);
     TORCH_CHECK(!clamp || (quant && std::isfinite(limit) && limit >= 0));
     check_tensor(weight, torch::kFloat8_e4m3fn);
     check_tensor(weight_scales, torch::kFloat32);
@@ -421,30 +424,30 @@ static int fp8_blockwise_mega_moe_dispatch_gemm1(const py::object& buffer, int r
     check_tensor(rs, torch::kFloat32);
     if (weight_replicas) {
         check_shape(rw, {rw.size(0), n, hidden});
-        check_shape(rs, {rw.size(0), n / (quant ? 8 : 128), hidden / 128});
+        check_shape(rs, {rw.size(0), n / 128, hidden / 128});
     }
     const int groups = e + (weight_replicas ? rw.size(0) : 0);
     TORCH_CHECK(e > 0 && groups == c.num_experts_per_rank && groups <= 128);
-    check_shape(weight_scales, {e, n / (quant ? 8 : 128), hidden / 128});
+    check_shape(weight_scales, {e, n / 128, hidden / 128});
     check_shape(output, {pool, quant ? n / 2 : n});
     if (quant) {
         check_tensor(*output_scales, torch::kFloat32, false);
         check_shape(*output_scales, {pool, n / 256});
         TORCH_CHECK(n % 256 == 0 && output_scales->stride(0) == 1 && output_scales->stride(1) == pool);
     }
-    TORCH_CHECK(c.block_m == 128);
     return mega_moe_native::fp8_blockwise_mega_moe_dispatch_gemm1_impl(
-        c, field<Tensor>(buffer, "buf_ptrs"), weight, weight_scales, output, rw, rs,
-        rank, num_tokens, n, e, quant, clamp, limit, output_scales);
+        c, field<Tensor>(buffer, "buf_ptrs"), field<Tensor>(buffer, "local_pool"),
+        weight, weight_scales, output, rw, rs,
+        rank, num_tokens, n, e, quant, clamp, limit, output_scales, oai, alpha, tuning);
 }
 Pair interleave_fp8_blockwise_mega_moe_weights(const Tensor& weight, const Tensor& scales) {
     TORCH_CHECK(weight.dim() == 3 && weight.scalar_type() == torch::kFloat8_e4m3fn);
     const int e = weight.size(0), n = weight.size(1), k = weight.size(2);
     TORCH_CHECK(n % 256 == 0 && k % 128 == 0 && scales.scalar_type() == torch::kFloat32);
     check_shape(scales, {e, n / 128, k / 128});
-    auto packed = weight.view(torch::kUInt8).reshape({e, 2, n / 16, 8, k}).transpose(1, 2).contiguous();
-    auto sf = scales.repeat_interleave(16, 1).reshape({e, 2, n / 16, k / 128}).transpose(1, 2).contiguous();
-    return {packed.reshape({e, n, k}).view(weight.scalar_type()), sf.reshape({e, n / 8, k / 128})};
+    auto packed = weight.view(torch::kUInt8).reshape({e, 2, n / 256, 128, k}).transpose(1, 2).contiguous();
+    auto sf = scales.reshape({e, 2, n / 256, k / 128}).transpose(1, 2).contiguous();
+    return {packed.reshape({e, n, k}).view(weight.scalar_type()), sf.reshape({e, n / 128, k / 128})};
 }
 
 // Grouped GEMM2 with scatter.
@@ -464,7 +467,8 @@ static void m_grouped_gemm_fp4_with_scatter(const Pair& lhs_, const Pair& rhs_, 
                                      int num_topk, OptTensor valid_m_rows,
                                      OptTensor combine_scales, OptTensor scale_offsets, int scale_block_n,
                                      std::optional<bool> force_fp8_scatter, OptTensor src_m_offsets,
-                                     std::optional<int> expected_m, OptPair rhs_replicas_) {
+                                     std::optional<int> expected_m, OptPair rhs_replicas_,
+                                     const mega_moe_config::Gemm2Tuning& tuning) {
     const auto& lhs = lhs_.first;
     const auto& rhs = rhs_.first;
     TORCH_CHECK(lhs.dim() == 2 && rhs.dim() == 3);
@@ -491,7 +495,9 @@ static void m_grouped_gemm_fp4_with_scatter(const Pair& lhs_, const Pair& rhs_, 
     check_tensor(combine_buf, fp8 ? torch::kUInt8 : torch::kBFloat16);
     TORCH_CHECK(combine_buf.numel() >= int64_t(num_topk) * max_tokens * hidden);
     check_tensor(token_meta, torch::kInt64);
-    TORCH_CHECK(token_meta.dim() == 1 && token_meta.numel() >= m);
+    TORCH_CHECK(token_meta.dim() == 1 && token_meta.numel() >= m,
+                "packed metadata must be int64 [pool]");
+    TORCH_CHECK(src_m_offsets, "W4A4 activations require src_m_offsets as row_offsets");
     const auto rows = m_rows.value_or(Tensor());
     TORCH_CHECK(rows.defined() || m_indices, "m_indices is required when m_rows is omitted");
     Tensor physical =
@@ -508,13 +514,15 @@ static void m_grouped_gemm_fp4_with_scatter(const Pair& lhs_, const Pair& rhs_, 
     mega_moe_native::m_grouped_gemm_fp4_with_scatter_impl(
         lhs, sa, rhs, sb, replica, rs, physical, valid, token_meta, combine_buf, sym_offsets, m, n, k, groups,
         masters, rank, world_size, max_tokens, hidden, num_topk, m_rows.has_value(), fp8, shift,
-        configs, expected_m, combine_scales, scale_offsets, scale_block_n, src_m_offsets);
+        configs, expected_m, combine_scales, scale_offsets, scale_block_n, *src_m_offsets, tuning);
 }
 static void m_grouped_gemm_fp8_blockwise_with_scatter(const Pair& lhs, const Pair& rhs, OptTensor scratch,
                                                const Tensor& padded_rows, const Tensor& valid_rows,
                                                const Tensor& row_offsets, const Tensor& packed_src_info,
                                                const Tensor& combine, const Tensor& peer_offsets,
-                                               int max_tokens, int topk, int rank, OptPair rhs_replicas) {
+                                               int max_tokens, int topk, int rank, OptPair rhs_replicas,
+                                               std::optional<int> expected,
+                                               const mega_moe_config::Gemm2Tuning& tuning) {
     const auto& [a, sa] = lhs;
     const auto& [b, sb] = rhs;
     check_tensor(a, torch::kFloat8_e4m3fn);
@@ -547,12 +555,12 @@ static void m_grouped_gemm_fp8_blockwise_with_scatter(const Pair& lhs, const Pai
     check_shape(sb, {masters, n / 128, k / 128});
     TORCH_CHECK(out.dim() == 2 && (out.size(0) == m || out.size(0) == 1) && out.size(1) == n);
     check_shape(packed_src_info, {m});
-    TORCH_CHECK((ranks == 1 || ranks == 2 || ranks == 4 || ranks == 8) && rank >= 0 && rank < ranks);
+    TORCH_CHECK((ranks > 0 && ranks <= 64) && rank >= 0 && rank < ranks);
     TORCH_CHECK(max_tokens > 0 && max_tokens < (1 << 24) && topk > 0 && topk <= 256 &&
                 combine.numel() == int64_t(topk) * max_tokens * n);
     mega_moe_native::m_grouped_gemm_fp8_blockwise_with_scatter_impl(
         a, sa, b, sb, out, padded_rows, valid_rows, row_offsets, packed_src_info, combine, peer_offsets, rw,
-        rs, m, n, k, groups, masters, max_tokens, topk, rank, ranks);
+        rs, m, n, k, groups, masters, max_tokens, topk, rank, ranks, expected, tuning);
 }
 
 static void validate_grouped_rows(const Tensor& indices, const Tensor& rows, const Tensor& valid, int m,
@@ -688,7 +696,9 @@ static void m_grouped_gemm_w4a16_mxfp4_with_scatter(const Tensor& lhs, const Pai
                                              const Tensor& packed_src_info, const Tensor& combine_buf,
                                              const Tensor& sym_offsets, const Tensor& valid_m_rows,
                                              const Tensor& m_rows, int rank, int max_tokens, int topk,
-                                             std::optional<PPUW4ConfigTuple> configs, OptPair rhs_replicas_) {
+                                             std::optional<PPUW4ConfigTuple> configs, OptPair rhs_replicas_,
+                                             std::optional<int> expected_m,
+                                             const mega_moe_config::Gemm2Tuning& tuning = {}) {
     TORCH_CHECK(lhs.dim() == 2 && rhs_.first.dim() == 3);
     const int m = lhs.size(0), n = rhs_.first.size(1),
               groups = rhs_.first.size(0) + (rhs_replicas_ ? rhs_replicas_->first.size(0) : 0);
@@ -697,7 +707,7 @@ static void m_grouped_gemm_w4a16_mxfp4_with_scatter(const Tensor& lhs, const Pai
                         valid_m_rows, rank, max_tokens, topk, rhs_replicas_);
     mega_moe_native::m_grouped_gemm_w4a16_mxfp4_with_scatter_impl(
         lhs, rhs_.first, rhs_.second, combine_buf, m_rows, packed_src_info, sym_offsets, valid_m_rows, rank,
-        max_tokens, topk, configs, rhs_replicas_);
+        max_tokens, topk, configs, rhs_replicas_, expected_m, tuning);
 }
 Pair preprocess_w4a16_mxfp4(const Pair& rhs_) {
     return {ppu_w4a16_preprocess_weights(rhs_.first),
@@ -726,7 +736,7 @@ torch::Tensor mega_moe_combine(const torch::Tensor& buf, const torch::Tensor& we
     check_tensor(weights, torch::kFloat32);
     TORCH_CHECK(weights.numel() >= int64_t(tokens) * topk);
     TORCH_CHECK(buf.numel() >= int64_t(capacity) * hidden * topk);
-    TORCH_CHECK(world > 0 && world <= 32 && rank >= 0 && rank < world);
+    TORCH_CHECK(world > 0 && world <= 64 && rank >= 0 && rank < world);
     check_tensor(pointers, torch::kInt64);
     check_tensor(done, torch::kInt32);
     TORCH_CHECK(pointers.numel() == world && done.numel() == 1);
@@ -742,8 +752,7 @@ torch::Tensor mega_moe_combine(const torch::Tensor& buf, const torch::Tensor& we
     }
     auto out = torch::empty({tokens, hidden}, buf.options().dtype(torch::kBFloat16));
     mega_moe_aux::barrier_reduce_impl(buf, weights, tokens, hidden, topk, capacity, pointers, rank, world,
-                                      done, scales, scale_block_n, out,
-                                      tuning ? tuning->combine : mega_moe_config::CombineTuning{});
+                                      done, scales, scale_block_n, out);
     return out;
 }
 
@@ -763,16 +772,19 @@ static std::map<std::string, int64_t> symmetric_layout(const std::map<std::strin
     const uint64_t token_bytes = value("TOKEN_BYTES"), scale_bytes = value("SF_BYTES");
     const layout::Workspace workspace(nullptr, ranks, experts, capacity, topk);
     const auto align16 = [](uint64_t bytes) { return (bytes + 15) / 16 * 16; };
+    // Keep source and landing token rows aligned independently of metadata size.
+    const auto align128 = [](uint64_t bytes) { return (bytes + 127) / 128 * 128; };
     const uint64_t ws_bytes = workspace.get_num_bytes();
     const uint64_t pool = workspace.num_max_pool_tokens;
-    const uint64_t off_it = align16(ws_bytes);
+    const uint64_t off_it = align128(ws_bytes);
     const uint64_t off_isf = align16(off_it + uint64_t(capacity) * token_bytes);
     const uint64_t off_iti = align16(off_isf + uint64_t(capacity) * scale_bytes);
     const uint64_t off_itw = align16(off_iti + uint64_t(capacity) * topk * sizeof(int64_t));
-    const uint64_t off_pt = align16(off_itw + uint64_t(capacity) * topk * sizeof(float));
+    const uint64_t off_pt = align128(off_itw + uint64_t(capacity) * topk * sizeof(float));
     const uint64_t off_psf = align16(off_pt + pool * token_bytes);
     const uint64_t off_pw = align16(off_psf + pool * scale_bytes);
-    const uint64_t off_meta = align16(off_pw + pool * sizeof(float));
+    // W4 routing weights stay on the source rank for combine.
+    const uint64_t off_meta = fp4 ? off_pw : align16(off_pw + pool * sizeof(float));
     const uint64_t off_packed = off_meta + layout::Gemm2Metadata::rows_bytes(experts / ranks);
     std::map<std::string, int64_t> output{
         {"total", off_packed + pool * sizeof(int64_t)},
@@ -785,7 +797,6 @@ static std::map<std::string, int64_t> symmetric_layout(const std::map<std::strin
         {"off_itw", off_itw},
         {"off_pt", off_pt},
         {"off_psf", off_psf},
-        {"off_pw", off_pw},
         {"num_pool", pool},
         {"num_pool_blocks", workspace.num_max_pool_blocks},
         {"woff_rc", reinterpret_cast<uintptr_t>(workspace.get_expert_recv_count_ptr(0, 0))},
@@ -793,6 +804,8 @@ static std::map<std::string, int64_t> symmetric_layout(const std::map<std::strin
         {"woff_meta", reinterpret_cast<uintptr_t>(workspace.get_token_src_metadata_ptr(0))},
         {"ws_bytes", ws_bytes},
     };
+    if (!fp4)
+        output["off_pw"] = off_pw;
     if (fp4) {
         output["off_out"] = 0;
         output["woff_arr"] = reinterpret_cast<uintptr_t>(workspace.get_l1_arrival_count_ptr(0));
@@ -837,7 +850,7 @@ void mega_moe_pre_dispatch(const Tensor& hidden_states, const Tensor& topk_ids,
     else if (kind == Precision::W4A4)
         fp4_mega_moe_pre_dispatch(input, ids, weights, field<Tensor>(buffer, "input_token"),
                                  field<Tensor>(buffer, "input_sf"), field<Tensor>(buffer, "input_topk_idx"),
-                                 field<Tensor>(buffer, "input_topk_weights"), num_tokens, 8, std::nullopt);
+                                 field<Tensor>(buffer, "input_topk_weights"), num_tokens);
     else if (kind == Precision::FP8Channelwise)
         fp8_mega_moe_pre_dispatch(input, ids, weights, field<Tensor>(buffer, "input_token").view(torch::kUInt8),
                                  field<Tensor>(buffer, "input_scale"), field<Tensor>(buffer, "input_topk_idx"),
@@ -861,7 +874,8 @@ static std::string check_gemm1_options(Precision kind, const std::optional<std::
     else if (kind == Precision::FP8Channelwise)
         supported = (act == "swiglu" || act == "swiglu_oai") && (quant.empty() || quant == "fp8");
     else
-        supported = (act.empty() && quant.empty()) || (act == "swiglu" && quant == "fp8");
+        supported = (act.empty() && quant.empty()) ||
+                    ((act == "swiglu" || act == "swiglu_oai") && quant == "fp8");
     TORCH_CHECK(supported, "unsupported precision/activation/output_quantization combination");
     return act == "swiglu" ? "silu_and_mul" : act == "step" ? "silu_and_mul_step" :
            act == "situ" ? "situ_and_mul" : act;
@@ -933,28 +947,44 @@ int mega_moe_dispatch_gemm1(const py::object& buffer, const Pair& rhs, const Ten
             gemm2_block_m, gemm1_tuning);
     }
     if (kind == Precision::W4A16) {
-        TORCH_CHECK(!rhs_replicas, "W4A16 GEMM1 does not support split replica weights");
         const auto capacity = read_dispatch_config(field<py::dict>(buffer, "_capacity_cfg"));
         validate_rank(capacity, rank, num_tokens);
         const int epr = capacity.num_experts_per_rank, k = field<int>(buffer, "bf16_hidden"),
                   n = field<int>(buffer, "intermediate_hidden");
+        TORCH_CHECK(rhs.first.dim() == 3 && (!rhs_replicas || rhs_replicas->first.dim() == 3),
+                    "W4A16 GEMM1 weights must have shape [experts, N, K/2]");
+        const auto rw = rhs_replicas ? rhs_replicas->first : rhs.first,
+                   rs = rhs_replicas ? rhs_replicas->second : rhs.second;
+        const int masters = rhs.first.size(0), replicas = rhs_replicas ? rw.size(0) : 0;
+        TORCH_CHECK(masters + replicas == epr,
+                    "W4A16 GEMM1 master and replica counts must match local physical experts");
         TORCH_CHECK(k % 64 == 0 && n % 16 == 0 && capacity.token_bytes == k * 2);
         TORCH_CHECK(std::isfinite(situ_beta) && situ_beta > 0 && std::isfinite(situ_linear_beta) &&
                     situ_linear_beta > 0);
-        check_tensor(rhs.first, torch::kUInt8);
-        check_tensor(rhs.second, torch::kUInt8);
-        check_shape(rhs.first, {epr, n, k / 2});
-        check_shape(rhs.second, {epr, n / 64, k * 2});
+        const auto ptrs = field<Tensor>(buffer, "buf_ptrs");
+        const auto device = field<Tensor>(buffer, "buffer").device();
+        const auto check_weight = [&](const Tensor& weight, const Tensor& scales, int groups) {
+            check_tensor(weight, torch::kUInt8);
+            check_tensor(scales, torch::kUInt8);
+            check_shape(weight, {groups, n, k / 2});
+            check_shape(scales, {groups, n / 64, k * 2});
+            TORCH_CHECK(weight.device() == device && scales.device() == device,
+                        "W4A16 GEMM1 weights must be on the buffer device");
+        };
+        check_weight(rhs.first, rhs.second, masters);
+        if (rhs_replicas)
+            check_weight(rw, rs, replicas);
         check_tensor(out, torch::kBFloat16);
         check_shape(out, {field<int>(buffer, "num_pool"), n / 2});
+        TORCH_CHECK(out.device() == device, "W4A16 GEMM1 output must be on the buffer device");
         const mega_moe_native::W4A16ActivationConfig activation_config{
             mega_moe_native::W4A16ActivationConfig::Type::SiTU, situ_beta, situ_linear_beta};
-        auto config = launch_config(buffer, num_tokens);
-        mega_moe_config::apply_gemm1_tuning(config, gemm1_tuning,
+        const auto config = mega_moe_config::w4a16_gemm1_config(
+            launch_config(buffer, num_tokens), n, gemm1_tuning,
             field<std::optional<mega_moe_config::Overrides>>(buffer, "_config_override"));
         return mega_moe_native::w4a16_dispatch_gemm1_impl(
-            config, field<Tensor>(buffer, "buf_ptrs"), rhs.first,
-            rhs.second, out, rank, num_tokens, n, activation_config);
+            config, ptrs, rhs.first, rhs.second, rw, rs, masters,
+            out, rank, num_tokens, activation_config);
     }
     if (kind == Precision::FP8Channelwise) {
         TORCH_CHECK(!quant || bf16_scratch, "quantized FP8 channelwise GEMM1 requires bf16_scratch");
@@ -965,11 +995,13 @@ int mega_moe_dispatch_gemm1(const py::object& buffer, const Pair& rhs, const Ten
                              out_scales, activation_limit, std::nullopt, std::nullopt,
                              rhs_replicas ? OptTensor(rhs_replicas->first) : std::nullopt,
                              rhs_replicas ? OptTensor(rhs_replicas->second) : std::nullopt,
-                             alpha, std::nullopt, act, gemm1_tuning);
+                             alpha, act, gemm1_tuning);
     }
     return fp8_blockwise_mega_moe_dispatch_gemm1(buffer, rank, num_tokens, rhs.first, rhs.second, out,
                                                 out_scales, activation_limit, rhs_replicas,
-                                                act.empty() ? std::nullopt : std::optional<std::string>(act));
+                                                act.empty() ? std::nullopt : std::optional<std::string>(act),
+                                                activation_alpha.value_or(act == "swiglu_oai" ? 1.702f : 1.0f),
+                                                gemm1_tuning);
 }
 
 using MoEInput = std::variant<Tensor, Pair>;
@@ -995,7 +1027,8 @@ void mega_moe_gemm2_scatter(const MoEInput& lhs, const Pair& rhs, const Tensor& 
                 "combine_scales and scale_offsets must be supplied together");
     TORCH_CHECK(combine_scales ? scale_block_n >= 64 && scale_block_n % 8 == 0 : scale_block_n == 0,
                 "combine_scales requires scale_block_n >= 64 aligned to 8; otherwise it must be zero");
-    TORCH_CHECK(!expected_m || kind == Precision::W4A4, "expected_m is only supported by W4A4 GEMM2");
+    TORCH_CHECK(!expected_m || kind != Precision::FP8Channelwise,
+                "expected_m is not supported by FP8 channelwise GEMM2");
     TORCH_CHECK(kind == Precision::FP8Channelwise ||
                 (!m_indices && kernel_type == "Default" && validate_metadata &&
                  !check_packed_routes && !rolling_pair_scatter && !num_sms),
@@ -1004,8 +1037,8 @@ void mega_moe_gemm2_scatter(const MoEInput& lhs, const Pair& rhs, const Tensor& 
                 "row_offsets is only supported by W4A4 or FP8 blockwise GEMM2");
     TORCH_CHECK(rhs.first.dim() == 3);
     const int hidden = rhs.first.size(1), world = sym_offsets.numel();
-    TORCH_CHECK(world > 0 && world <= 32 && rank >= 0 && rank < world,
-                "the unified pipeline supports at most 32 ranks");
+    TORCH_CHECK(world > 0 && world <= (kind == Precision::FP8Blockwise ? 64 : 32) && rank >= 0 && rank < world,
+                "unsupported MegaMoE rank count");
     if (tuning) {
         const int groups = rhs.first.size(0) + (rhs_replicas ? rhs_replicas->first.size(0) : 0);
         const int intermediate = rhs.first.size(2) *
@@ -1018,7 +1051,10 @@ void mega_moe_gemm2_scatter(const MoEInput& lhs, const Pair& rhs, const Tensor& 
         TORCH_CHECK(std::holds_alternative<Tensor>(lhs), "W4A16 lhs must be a BF16 tensor");
         return m_grouped_gemm_w4a16_mxfp4_with_scatter(
             std::get<Tensor>(lhs), rhs, token_meta, combine_buf, sym_offsets, valid_m_rows, m_rows,
-            rank, max_tokens, topk, configs.cast<std::optional<PPUW4ConfigTuple>>(), rhs_replicas);
+            rank, max_tokens, topk, configs.cast<std::optional<PPUW4ConfigTuple>>(), rhs_replicas,
+            expected_m ? expected_m : tuning ? std::optional<int>(
+                ceil_div(tuning->workload.tokens * topk, tuning->workload.experts / world)) : std::nullopt,
+            tuning ? tuning->gemm2 : mega_moe_config::Gemm2Tuning{});
     }
     TORCH_CHECK(std::holds_alternative<Pair>(lhs), "quantized lhs must be a (tensor, scales) pair");
     const auto& input = std::get<Pair>(lhs);
@@ -1033,7 +1069,7 @@ void mega_moe_gemm2_scatter(const MoEInput& lhs, const Pair& rhs, const Tensor& 
             input, rhs, std::nullopt, token_meta, fp8 ? combine_buf.view(torch::kUInt8) : combine_buf,
             sym_offsets, rank, world, max_tokens, hidden, m_rows, config,
             topk, valid_m_rows, combine_scales, scale_offsets, scale_block_n, fp8, row_offsets,
-            expected_m, rhs_replicas);
+            expected_m, rhs_replicas, tuning ? tuning->gemm2 : mega_moe_config::Gemm2Tuning{});
     }
     if (kind == Precision::FP8Channelwise) {
         TORCH_CHECK(m_indices, "FP8 channelwise GEMM2 requires m_indices");
@@ -1047,7 +1083,11 @@ void mega_moe_gemm2_scatter(const MoEInput& lhs, const Pair& rhs, const Tensor& 
                 "FP8 blockwise GEMM2 requires row_offsets and uses its built-in tile configuration");
     return m_grouped_gemm_fp8_blockwise_with_scatter(input, rhs, std::nullopt, m_rows, valid_m_rows,
                                                    *row_offsets, token_meta, combine_buf, sym_offsets,
-                                                   max_tokens, topk, rank, rhs_replicas);
+                                                   max_tokens, topk, rank, rhs_replicas,
+                                                   expected_m ? expected_m : tuning ? std::optional<int>(
+                                                       ceil_div(tuning->workload.tokens * topk,
+                                                                tuning->workload.experts / world)) : std::nullopt,
+                                                   tuning ? tuning->gemm2 : mega_moe_config::Gemm2Tuning{});
 }
 
 // Python bindings.
@@ -1056,15 +1096,18 @@ void register_apis(py::module_& m) {
         .def_readonly("profile", &TuningConfig::profile)
         .def_property_readonly("num_tokens", [](const TuningConfig& c) { return c.workload.tokens; })
         .def_property_readonly("gemm1_tile", [](const TuningConfig& c) { return c.gemm1.tile; })
+        .def_property_readonly("gemm1_dynamic_queue", [](const TuningConfig& c) { return c.gemm1.dynamic_queue; })
+        .def_property_readonly("gemm1_separate_dispatch", [](const TuningConfig& c) { return c.gemm1.separate_dispatch; })
+        .def_property_readonly("dispatch_threads", [](const TuningConfig& c) { return c.gemm1.dispatch_threads; })
+        .def_property_readonly("buffer_block_m", [](const TuningConfig& c) { return c.buffer.block_m; })
         .def_property_readonly("gemm1_block_m", [](const TuningConfig& c) { return c.gemm1.block_m; })
         .def_property_readonly("pull_sms", [](const TuningConfig& c) { return c.gemm1.pull_sms; })
         .def_property_readonly("pull_mode", [](const TuningConfig& c) -> std::optional<std::string> {
             return c.gemm1.pull_mode ? std::optional<std::string>(mega_moe_config::pull_mode_name(*c.gemm1.pull_mode))
                                     : std::nullopt;
         })
-        .def_property_readonly("separate_quant", [](const TuningConfig& c) { return c.gemm1.separate_quant; })
         .def_property_readonly("gemm2_tile", [](const TuningConfig& c) { return c.gemm2.tile; })
-        .def_property_readonly("reduce_chunked", [](const TuningConfig& c) { return c.combine.chunked; });
+        .def_property_readonly("gemm2_m_tiles_per_group", [](const TuningConfig& c) { return c.gemm2.m_tiles_per_group; });
     m.def("get_mega_moe_tuning_config", &get_mega_moe_tuning_config,
           py::arg("num_ranks"), py::arg("num_experts"), py::arg("num_topk"), py::arg("hidden"),
           py::arg("intermediate_hidden"), py::arg("num_tokens"), py::kw_only(),
@@ -1095,16 +1138,12 @@ void register_apis(py::module_& m) {
           py::kw_only(), py::arg("combine_scales") = py::none(), py::arg("scale_block_n") = 0,
           py::arg("tuning") = py::none());
     m.def("_ppu_mega_moe_layout", &symmetric_layout, py::arg("config"), py::arg("fp4"));
-    m.def("_select_glm_channelwise_scatter_config", &mega_moe_config::channel_scatter_config,
-          py::arg("expected_m"), py::arg("n"), py::arg("k"), py::arg("num_groups"), py::arg("num_sms"));
     m.def("_mega_moe_dispatch_config", &dispatch_config, py::arg("num_ranks"),
           py::arg("num_experts"), py::arg("num_topk"), py::arg("hidden"), py::arg("num_max_tokens_per_rank"),
           py::kw_only(), py::arg("precision"), py::arg("intermediate_hidden") = py::none(),
           py::arg("block_m") = py::none(),
           py::arg("gemm1_block_n") = py::none(), py::arg("gemm1_block_k") = py::none(),
-          py::arg("overrides") = py::none());
-    m.def("_fp8_blockwise_mega_moe_dispatch", &fp8_blockwise_mega_moe_dispatch, py::arg("buffer"),
-          py::arg("rank"), py::arg("num_tokens"));
+          py::arg("overrides") = py::none(), py::arg("num_tokens_per_rank") = py::none());
     m.def("interleave_fp8_blockwise_mega_moe_weights", &interleave_fp8_blockwise_mega_moe_weights,
           py::arg("weight"), py::arg("scales"));
     m.def("preprocess_w4a16_mxfp4", &preprocess_w4a16_mxfp4, py::arg("rhs_"));

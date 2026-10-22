@@ -45,8 +45,8 @@ struct TokenSrcMetadata {
     uint32_t topk_idx;
 };
 
-// GEMM2 views follow the routed-weight pool. All dispatch backends publish the
-// same layout; GEMM1 and GEMM2 may use different expert padding in the FP4 path.
+// All dispatch backends publish these GEMM2 views at their metadata base.
+// GEMM1 and GEMM2 may use different expert padding in the FP4 path.
 struct Gemm2Metadata {
     int32_t *rows, *valid_rows, *offsets, *src_rows, *src_offsets;
     int64_t* packed_routes;
@@ -132,6 +132,9 @@ struct Workspace {
         // Combine push source indices
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
 
+        // Rank-local G1 queue; never aliases L2 source-push arrival masks.
+        num_bytes += sizeof(uint32_t);
+
         // Align to TMA descriptor requirements
         num_bytes = math::align<uint64_t>(num_bytes, 16);
         return num_bytes;
@@ -203,6 +206,11 @@ struct Workspace {
         return reinterpret_cast<uint32_t*>(base) +
             expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
             rank_idx * num_max_recv_tokens_per_expert + token_idx;
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_gemm1_work_count_ptr() const {
+        return reinterpret_cast<uint32_t*>(get_token_src_metadata_ptr(num_max_pool_tokens));
     }
 
     // For combine usages

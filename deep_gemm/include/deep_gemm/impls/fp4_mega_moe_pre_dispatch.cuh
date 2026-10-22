@@ -8,8 +8,7 @@
 
 namespace deep_gemm::mega_moe::fp4 {
 
-template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t GROUPS_PER_BLOCK = 8,
-          uint32_t BLOCK_THREADS = GROUPS_PER_BLOCK * 32>
+template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t BLOCK_THREADS = 256>
 CUTLASS_DEVICE void fp4_mega_moe_pre_dispatch_kernel_device(
     const __ppu_bfloat16* __restrict__ hidden_states,
     const int64_t* __restrict__ topk_ids,
@@ -21,97 +20,7 @@ CUTLASS_DEVICE void fp4_mega_moe_pre_dispatch_kernel_device(
     uint32_t num_tokens) {
 
     static_assert(HIDDEN % 64 == 0, "HIDDEN must be a multiple of 64 for paired MXFP4 scales");
-    static_assert(BLOCK_THREADS == GROUPS_PER_BLOCK * 32, "one warp per MXFP4 group");
-
-    constexpr uint32_t kGroupSize = 32;
-    constexpr uint32_t kTokenBytes = HIDDEN / 2;
-    constexpr uint32_t kNumGroups = HIDDEN / kGroupSize;
-    constexpr uint32_t kSfBytes = kNumGroups;
-
-    const uint32_t token = blockIdx.x;
-    const uint32_t group_tile = blockIdx.y;
-    if (token >= num_tokens) {
-        return;
-    }
-
-    const uint32_t tid = threadIdx.x;
-    const uint32_t warp = tid >> 5;
-    const uint32_t lane = tid & 31u;
-    const uint32_t group = group_tile * GROUPS_PER_BLOCK + warp;
-
-    if (group < kNumGroups) {
-        const uint32_t col = group * kGroupSize + lane;
-        const __ppu_bfloat16* row = hidden_states + static_cast<uint64_t>(token) * HIDDEN;
-        const float val = __bfloat162float(row[col]);
-
-        float absmax = fabsf(val);
-        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, 1));
-        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, 2));
-        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, 4));
-        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, 8));
-        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, 16));
-        absmax = fmaxf(absmax, 1e-10f);
-
-        const float dequant_scale = absmax * (1.0f / 6.0f);
-        const uint32_t scale_exp = (__float_as_uint(dequant_scale) + 0x007fffffu) & 0x7f800000u;
-        const float scale_f = __uint_as_float(scale_exp);
-
-        float inv_scale;
-        asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv_scale) : "f"(scale_f));
-        const float q = val * inv_scale;
-
-        if (lane == 0) {
-            staged_scales[static_cast<uint64_t>(token) * kSfBytes + group] =
-                static_cast<uint8_t>(scale_exp >> 23);
-        }
-
-        const float q_partner = __shfl_xor_sync(0xffffffffu, q, 1);
-        if ((lane & 1u) == 0u) {
-            uint32_t packed;
-            asm volatile(
-                "{ .reg .b8 r; cvt.rn.satfinite.e2m1x2.f32 r, %2, %1; cvt.u32.u8 %0, r; }"
-                : "=r"(packed) : "f"(q), "f"(q_partner));
-            staged_tokens[static_cast<uint64_t>(token) * kTokenBytes + group * 16u + lane / 2u] =
-                static_cast<uint8_t>(packed);
-        }
-    }
-
-    if (group_tile == 0) {
-        for (uint32_t k = tid; k < TOP_K; k += BLOCK_THREADS) {
-            const uint64_t off = static_cast<uint64_t>(token) * TOP_K + k;
-            input_topk_idx[off] = topk_ids[off];
-            input_topk_weights[off] = topk_weights[off];
-        }
-    }
-}
-
-template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t GROUPS_PER_BLOCK = 8,
-          uint32_t BLOCK_THREADS = GROUPS_PER_BLOCK * 32>
-__global__ __launch_bounds__(BLOCK_THREADS, 2) void
-fp4_mega_moe_pre_dispatch_kernel(
-    const __ppu_bfloat16* __restrict__ hidden_states,
-    const int64_t* __restrict__ topk_ids,
-    const float* __restrict__ topk_weights,
-    uint8_t* __restrict__ staged_tokens,
-    uint8_t* __restrict__ staged_scales,
-    int64_t* __restrict__ input_topk_idx,
-    float* __restrict__ input_topk_weights,
-    uint32_t num_tokens) {
-    fp4_mega_moe_pre_dispatch_kernel_device<HIDDEN, TOP_K, GROUPS_PER_BLOCK, BLOCK_THREADS>(hidden_states, topk_ids, topk_weights, staged_tokens, staged_scales, input_topk_idx, input_topk_weights, num_tokens);
-}
-
-template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t BLOCK_THREADS = 256>
-CUTLASS_DEVICE void fp4_mega_moe_pre_dispatch_vec_kernel_device(
-    const __ppu_bfloat16* __restrict__ hidden_states,
-    const int64_t* __restrict__ topk_ids,
-    const float* __restrict__ topk_weights,
-    uint8_t* __restrict__ staged_tokens,
-    uint8_t* __restrict__ staged_scales,
-    int64_t* __restrict__ input_topk_idx,
-    float* __restrict__ input_topk_weights,
-    uint32_t num_tokens) {
-
-    static_assert(HIDDEN % 64 == 0, "HIDDEN must be a multiple of 64 for paired MXFP4 scales");
+    // Four lanes quantize one 32-value MXFP4 group; each lane loads eight BF16 values.
     constexpr uint32_t kVecElems = 8;
     constexpr uint32_t kThreadsPerGroup = 4;
     constexpr uint32_t kTokenBytes = HIDDEN / 2;
@@ -234,15 +143,17 @@ CUTLASS_DEVICE void fp4_mega_moe_pre_dispatch_vec_kernel_device(
 
         for (uint32_t k = tid; k < TOP_K; k += BLOCK_THREADS) {
             const uint64_t off = static_cast<uint64_t>(token) * TOP_K + k;
-            input_topk_idx[off] = topk_ids[off];
-            input_topk_weights[off] = topk_weights[off];
+            const auto expert = topk_ids[off];
+            input_topk_idx[off] = expert;
+            // Combine can consume this refreshed view without reading unwritten slots.
+            input_topk_weights[off] = expert >= 0 ? topk_weights[off] : 0.0f;
         }
     }
 }
 
 template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t BLOCK_THREADS = 256>
 __global__ __launch_bounds__(BLOCK_THREADS, 4) void
-fp4_mega_moe_pre_dispatch_vec_kernel(
+fp4_mega_moe_pre_dispatch_kernel(
     const __ppu_bfloat16* __restrict__ hidden_states,
     const int64_t* __restrict__ topk_ids,
     const float* __restrict__ topk_weights,
@@ -251,7 +162,7 @@ fp4_mega_moe_pre_dispatch_vec_kernel(
     int64_t* __restrict__ input_topk_idx,
     float* __restrict__ input_topk_weights,
     uint32_t num_tokens) {
-    fp4_mega_moe_pre_dispatch_vec_kernel_device<HIDDEN, TOP_K, BLOCK_THREADS>(hidden_states, topk_ids, topk_weights, staged_tokens, staged_scales, input_topk_idx, input_topk_weights, num_tokens);
+    fp4_mega_moe_pre_dispatch_kernel_device<HIDDEN, TOP_K, BLOCK_THREADS>(hidden_states, topk_ids, topk_weights, staged_tokens, staged_scales, input_topk_idx, input_topk_weights, num_tokens);
 }
 
 }  // namespace deep_gemm::mega_moe::fp4

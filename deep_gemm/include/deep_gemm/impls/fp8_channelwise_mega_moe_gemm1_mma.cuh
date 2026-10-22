@@ -91,7 +91,8 @@ __device__ __forceinline__ void gemm1_swiglu_mma_block(
         __ppu_bfloat16* __restrict__ d_ptr,
         int ld_d, int valid_m, int M, int N, int K,
         int thread_idx, char* smem_buf, float swiglu_limit,
-        float swiglu_alpha) {
+        float swiglu_alpha, uint32_t* queue_counter = nullptr,
+        uint32_t* next_ticket = nullptr, uint32_t* prefetched_work = nullptr) {
     using namespace cute;
     using CollectiveMainloop = typename Cfg::CollectiveMainloop;
     using StrideA = typename Cfg::StrideA;
@@ -123,8 +124,12 @@ __device__ __forceinline__ void gemm1_swiglu_mma_block(
     KTileIter k_tile_iter{0};
     collective(
         accum, load_inputs, accum, k_tile_iter, size<2>(gA),
-        residue_mnk, thread_idx, cutlass::canonical_warp_idx_sync(), smem_buf);
+        residue_mnk, thread_idx, cutlass::canonical_warp_idx_sync(), smem_buf,
+        queue_counter, next_ticket);
 
+    // Collective's final barrier publishes the ticket; the original epilogue
+    // barrier below retires every thread's read before the next MMA uses SMEM.
+    if (prefetched_work != nullptr) *prefetched_work = *next_ticket;
     // G=8 preprocessing stores [gate8, up8, gate8, up8, ...]. The physical
     // C-fragment therefore pairs consecutive mma_n slices. Match the production
     // numerical order: FP32 accum -> BF16 -> optional BF16 clamp -> SwiGLU ->

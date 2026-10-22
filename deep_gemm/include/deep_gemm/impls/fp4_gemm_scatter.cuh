@@ -325,11 +325,11 @@ __device__ __forceinline__ void scatter_pack_store_fp8_row(
 template <uint32_t kBlockM, uint32_t kBlockN, uint32_t kThreadNum,
           Fp8ScaleMode kSideScaleMode, uint32_t kMaxRanks = 64>
 __device__ __forceinline__ void
-scatter_packed_fp8(
+scatter_fp8(
     const __ppu_bfloat16* __restrict__ tile_d,
     uint32_t valid_m, uint32_t n_start, uint32_t shape_n,
     uint32_t pool_row_base,
-    const int64_t* __restrict__ packed_src_info,
+    const int64_t* __restrict__ token_meta,
     const CombineBuffer& combine_buf,
     const SymBufferLite<kMaxRanks>& sym_buffer,
     int exp_shift)
@@ -341,11 +341,10 @@ scatter_packed_fp8(
     for (uint32_t row = tid / 32; row < valid_m; row += kThreadNum / 32) {
         uint32_t lane = tid % 32;
         uint32_t pool_row = pool_row_base + row;
-        int64_t packed = packed_src_info[pool_row];
-        uint32_t packed_low = static_cast<uint32_t>(packed & 0xFFFFFFFF);
-        uint32_t rank_idx = static_cast<uint32_t>((packed >> 32) & 0xFFFFFFFF);
-        uint32_t token_idx = packed_low & 0x00FFFFFF;
-        uint32_t topk_idx = (packed_low >> 24) & 0xFF;
+        const uint64_t packed = __ldg(token_meta + pool_row);
+        const uint32_t rank_idx = packed >> 32;
+        const uint32_t token_idx = packed & 0x00FFFFFFu;
+        const uint32_t topk_idx = (packed >> 24) & 0xFFu;
 
         uint4* dst_base = reinterpret_cast<uint4*>(
             sym_buffer.offsets[rank_idx] +
@@ -606,13 +605,14 @@ __device__ __forceinline__ void scatter_pack_store_fp8_row(
 namespace deep_gemm::mega_moe::fp4 {
 // Only routing and fused epilogue behavior live here. GEMM, SF loads, replicas,
 // and the persistent tile loop belong to the mainline FP4 universal kernel.
-template <bool kFp8Output = false, mega_moe::Fp8ScaleMode kScaleMode = mega_moe::Fp8ScaleMode::Fixed, int kFp8ExpShift = 0>
+template <bool kFp8Output = false, mega_moe::Fp8ScaleMode kScaleMode = mega_moe::Fp8ScaleMode::Fixed,
+          int kFp8ExpShift = 0>
 struct ScatterPolicy {
   static constexpr bool kEnabled = true;
   struct State {
     mega_moe::detail::CombineBuffer moe_combine_buf{};
     mega_moe::detail::SymBufferLite<> moe_sym_buffer{};
-    const int64_t* moe_packed_src_info{nullptr};
+    const int64_t* moe_token_meta{nullptr};
     const int32_t* moe_valid_m_rows{nullptr};
     const int32_t* moe_src_m_offsets{nullptr};
   };
@@ -657,9 +657,9 @@ struct ScatterPolicy {
       constexpr int kTileN_ = CUTE_STATIC_V(get<1>(TileShape{}));
 
       uint32_t valid_m_sc = 0;
-      uint32_t pool_row_base_sc = 0;
+      uint32_t route_row_base = 0;
       uint32_t n_start_sc = n_block_idx * kTileN_;
-      if (params.moe_packed_src_info != nullptr) {
+      if (params.moe_token_meta != nullptr) {
         uint32_t group_valid_m_sc = params.moe_valid_m_rows != nullptr
             ? static_cast<uint32_t>(__ldg(
                   params.moe_valid_m_rows + deep_scheduler.curr_group_idx))
@@ -668,8 +668,8 @@ struct ScatterPolicy {
         uint32_t remaining_m_sc =
             group_valid_m_sc > row_start_sc ? group_valid_m_sc - row_start_sc : 0;
         valid_m_sc = cute::min(static_cast<uint32_t>(kTileM_), remaining_m_sc);
-        pool_row_base_sc =
-            deep_scheduler.curr_cumsum_m + m_block_idx * kTileM_;
+        // Packed routes follow GEMM2 padding; A/SFA keep their source offsets.
+        route_row_base = deep_scheduler.curr_cumsum_m + m_block_idx * kTileM_;
       }
 
       // Update the pointer to C and D of MXFP4 in the epilogue parameters
@@ -686,7 +686,7 @@ struct ScatterPolicy {
         static_assert(CollectiveEpilogue::kIsAlignedN,
             "direct fragment scatter requires an aligned N tile");
 
-        if (params.moe_packed_src_info != nullptr) {
+        if (params.moe_token_meta != nullptr) {
           using ThreadEpilogueOp =
               typename CollectiveEpilogue::ThreadEpilogueOp;
           using FragmentAccumulator =
@@ -758,14 +758,10 @@ struct ScatterPolicy {
           CUTLASS_PRAGMA_UNROLL
           for (uint32_t row = warp_idx;
                row < valid_m_sc; row += kNumWarps) {
-            int64_t packed = __ldg(
-                params.moe_packed_src_info + pool_row_base_sc + row);
-            uint32_t packed_low =
-                static_cast<uint32_t>(packed & 0xFFFFFFFF);
-            uint32_t rank_idx =
-                static_cast<uint32_t>((packed >> 32) & 0xFFFFFFFF);
-            uint32_t token_idx = packed_low & 0x00FFFFFF;
-            uint32_t topk_idx = (packed_low >> 24) & 0xFF;
+            const uint64_t packed = __ldg(params.moe_token_meta + route_row_base + row);
+            const uint32_t rank_idx = packed >> 32;
+            const uint32_t token_idx = packed & 0x00FFFFFFu;
+            const uint32_t topk_idx = (packed >> 24) & 0xFFu;
             auto* dst_row = reinterpret_cast<__ppu_bfloat16*>(
                 params.moe_sym_buffer.offsets[rank_idx] +
                 reinterpret_cast<int64_t>(
@@ -821,15 +817,15 @@ struct ScatterPolicy {
       // Optional FP8 combine format is materialized in D before packing.
       // BF16 output has already scattered directly from the accumulator tile.
       if constexpr (kFp8Output) {
-        if (params.moe_packed_src_info == nullptr)
+        if (params.moe_token_meta == nullptr)
           return;
         const auto* tile_d = reinterpret_cast<const __ppu_bfloat16*>(
             params_epilogue_local.ptr_D + m_block_idx * kTileM_ * N);
         __syncthreads();
-        mega_moe::detail::scatter_packed_fp8<
+        mega_moe::detail::scatter_fp8<
             kTileM_, kTileN_, MaxThreadsPerBlock, kScaleMode>(
             tile_d, valid_m_sc, n_start_sc, static_cast<uint32_t>(N),
-            pool_row_base_sc, params.moe_packed_src_info,
+            route_row_base, params.moe_token_meta,
             params.moe_combine_buf, params.moe_sym_buffer,
             kFp8ExpShift);
       }

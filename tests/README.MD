@@ -60,18 +60,18 @@ python ./test_core.py
 test_core.py options:
   -h, --help            show this help message and exit
   --func {DenseGemm,GroupedContiguous,GroupedMasked,DenseGemm}  target test func
-# Routed MoE correctness tests
+# Routed MoE correctness and performance tests
 
-The MoE tests use pytest and one process-group fixture. Select precision by file
-and model by pytest ID; model dimensions, activation, routing limits and EP sizes
+The MoE tests share one end-to-end runner between pytest and the command line.
+Select precision by file and model by `--case` or pytest ID; model dimensions, activation, routing limits and EP sizes
 are declared in each precision file. Add a model to those tables instead of
 copying a test script.
 
 | File | Coverage |
 | --- | --- |
-| `test_moe_w4a4.py` | Runnable correctness/benchmark example; DeepSeek V4 Pro / Flash, GLM5.2, Kimi K3 and Qwen3.8 2.4T; SwiGLU / STEP / SiTU; FP4 pre-dispatch → fused GEMM1/activation/quantization → GEMM2/BF16 scatter → combine; replica weights |
-| `test_moe_w4a16.py` | Small / Kimi K3 shapes, fused dispatch/G1/SiTU → GEMM2/BF16 scatter → combine; replica weights, complete EP8/16 pipelines |
-| `test_moe_w8a8.py` | Channelwise GLM5.2 / GLM5.3 Flash / Qwen3.8 Flash / MiniMax M3, plus blockwise smoke; independent stage and pipeline references |
+| `test_moe_w4a4.py` | Runnable correctness/benchmark example; DeepSeek V4 Pro / Flash, GLM5.2, Kimi K3, Qwen3.8 2.4T and MiMo V2.6 Pro; SwiGLU / STEP / SiTU; FP4 pre-dispatch → fused GEMM1/activation/quantization → GEMM2/BF16 scatter → combine; replica weights |
+| `test_moe_w4a16.py` | Small / Kimi K3 shapes, fused dispatch/G1/SiTU → GEMM2/BF16 scatter → combine; replica weights, EP8/16/32 and EP32 decode cases |
+| `test_moe_w8a8.py` | Channelwise GLM5.2 / GLM5.3 Flash / Qwen3.8 Flash / MiniMax M3; blockwise SwiGLU smoke and MiniMax SwiGLU-OAI shape at EP8/16/32/64; complete pipelines with independent Torch references |
 
 `moe_test_utils.py` contains process-group setup, common runtime helpers and
 independent Torch references, including FP4 round-to-nearest-even quantization.
@@ -103,9 +103,37 @@ Tile selection is handled internally. W4A4 accepts
 `block_m`. Omitting these options preserves the backend defaults and allows
 measured tuning hints to apply. Explicit W4A16 `block_m` takes precedence over
 the tuning table. Unsupported combinations fail before collective allocation.
+For FP8 channelwise, `block_m` selects both dispatch granularity and the GEMM1
+tile (128 or 256). FP8 blockwise keeps dispatch/padding at 128 rows and selects
+the GEMM1 compute tile independently (128 or 192 for FP8 output).
 The buffer owns a fixed-capacity arena and can be reused across token counts,
 including calls with zero local tokens. Release it with `buffer.destroy()`
 after all ranks have finished using it.
+
+Peer-visible allocations use `torch.distributed._symmetric_memory` directly.
+Blockwise FP8 keeps its expert landing pools in local Torch allocations;
+input staging and cross-rank control data remain symmetric.
+
+For W4A16 decode, `num_tokens_per_rank` optionally selects a common workload
+bucket at allocation time. Every rank must supply the same bucket, even when
+their actual input counts differ. The Kimi K3 EP32 table matches exactly
+4, 8, 16, 32, 64 and 128 tokens, with 896 physical experts or 928 with replicas.
+These profiles use buffer BM16, except the 32-token profile uses BM32.
+Unmatched or disabled profiles use BM64; explicit `block_m` overrides this
+choice. Capacity remains the upper bound on input length. The W4A16 test
+selects allocation buckets from the table without model-name branches.
+The decode profiles launch dispatch and GEMM1 separately so they can
+use independent thread counts and resident CTA counts. Row and route preparation
+remains fused into dispatch, and the public pipeline calls stay the same.
+
+W4A16 pre-dispatch copies BF16 tokens, routing IDs and weights in one launch.
+Upstream producers may instead write directly to the three tensors returned by
+`buffer.input_views(num_tokens)` and pass those views to `mega_moe_pre_dispatch`.
+An input that already aliases its destination is not copied. Keep the buffer
+alive and order writes and the pipeline on the same stream. W4A16 resets
+consumed dispatch counters internally; read valid rows from
+`buffer.get_gemm2_metadata().valid_m_rows`, rather than retaining receive counters
+after dispatch/GEMM1.
 
 ## Measured configurations and fallback
 
@@ -126,8 +154,12 @@ Here `intermediate_hidden` is the expert intermediate width, before doubling
 for the gate/up projection. The table matches precision, activation, EP size,
 expert count, top-k, hidden/intermediate dimensions and tokens per rank exactly.
 It contains the measured W4A4, W4A16 and FP8 channelwise model configurations
-at 1024, 2048 and 4096 tokens on ZW-M890P with 39 SMs. No profile is selected
-for other token counts or devices. FP8 blockwise uses its existing heuristics.
+at 1024, 2048 and 4096 tokens on ZW-M890P with 39 SMs. MiMo V2.6 Pro has an
+additional W4A4 EP8 profile at exactly 8192 tokens per rank, with GEMM2 tile
+`128,256,64,64,64,3`; its other stages use the default selectors. Each profile
+declares its token counts explicitly, including the six K3 EP32 decode counts.
+Unlisted counts or devices fall back to
+the heuristics. FP8 blockwise uses its existing heuristics.
 Profiles cover quantized GEMM1 output (BF16 for W4A16) and BF16 scatter.
 
 Profiles provide only measured overrides; unset fields use the existing
@@ -139,6 +171,22 @@ the fully resolved configuration after those overrides. Set
 when the token count or model configuration changes; mismatched configurations
 are rejected before launch. The query does not read routing tensors or copy
 their contents to the CPU.
+
+For decode, `buffer_block_m` describes collective allocation;
+`gemm1_tile`, `gemm1_separate_dispatch` and `dispatch_threads` describe the
+compute and communication launches. `gemm2_tile` describes the scatter launch.
+For W4A4, `gemm2_m_tiles_per_group` controls the existing GEMM2 scheduler:
+`1` traverses all N tiles of one M tile before the next; `None` retains the
+default interleaving of two M tiles. Only measured profiles override this field.
+Combine always reduces one complete token row per CTA, including a synchronization
+CTA on empty ranks. It uses 256 threads for at least 512 local tokens, 1024 threads
+for at most 64 local tokens with hidden size above 4096, and 512 threads otherwise.
+This policy uses the actual combine token count, independently of the tuning table.
+`gemm1_dynamic_queue=None` selects the backend's automatic policy;
+`True` and `False` explicitly enable and disable it. In particular, blockwise
+FP8 cannot override an explicit `False` with its automatic queue heuristic.
+The automatic BM128/BM192 and queue thresholds are empirical fallback choices,
+not hardware requirements.
 
 The table lives in `csrc/jit_kernels/heuristics/mega_moe_tuning.hpp`;
 precision-specific fallback, override handling and validation remain in
@@ -165,7 +213,7 @@ the workspace and preprocessed weights. `rhs` is always `(weight, scales)`;
 GEMM2 `lhs` is a BF16 tensor for W4A16 and `(tensor, scales)` otherwise.
 GEMM1 writes the caller-provided `out` and returns the dispatch row block size.
 
-All precisions produce GEMM2 row layouts and packed routes inside dispatch/GEMM1.
+All precisions produce GEMM2 row layouts and routing metadata inside dispatch/GEMM1.
 Obtain the persistent views once with `buffer.get_gemm2_metadata()`; no separate
 prepare call or caller-owned metadata output tensors are needed. W4A4 selects
 GEMM2 padding internally, independently of the GEMM1 tile. Pass the same tuning
@@ -181,7 +229,7 @@ mega_moe_dispatch_gemm1(
     activation="swiglu", output_quantization="mxfp4", out_scales=fp4_scales,
     tuning=tuning)
 mega_moe_gemm2_scatter(
-    (fp4_out, fp4_scales), rhs2, meta.packed_src_info, combine_buf, sym_offsets,
+    (fp4_out, fp4_scales), rhs2, meta.token_meta, combine_buf, sym_offsets,
     meta.m_rows, meta.valid_m_rows, rank, capacity, topk, precision="w4a4",
     row_offsets=meta.src_m_offsets, tuning=tuning)
 ```
@@ -193,8 +241,8 @@ output retains the GEMM1 padding. Explicit GEMM2 `configs` or `expected_m`
 overrides must be paired with a matching GEMM1 `gemm2_block_m`. BF16 and FP8
 scatter use the same default padding. Other precisions use their dispatch
 row layout. Metadata is recomputed for current routing on every launch and
-Graph replay, including empty ranks. Activation, rounding and router-weight
-placement retain each precision's numerical contract.
+Graph replay, including empty ranks. All precisions apply routing weights
+after GEMM2, during combine.
 Only `valid_m_rows` rows per expert contain defined activation and route data;
 padding must not be consumed as a routed row.
 
@@ -205,19 +253,19 @@ padding must not be consumed as a routed row.
 | `w4a16` | `situ` | `None` (BF16) | BF16 |
 | `fp8_channelwise` | `swiglu`, `swiglu_oai` | `None` (BF16) or `fp8` (per-token scales) | BF16 |
 | `fp8_blockwise` | `None` | `None` (raw BF16 projection) | BF16 |
-| `fp8_blockwise` | `swiglu` | `fp8` (128-element block scales) | BF16 |
+| `fp8_blockwise` | `swiglu`, `swiglu_oai` | `fp8` (128-element block scales) | BF16 |
 
 Unsupported combinations raise before dispatch; the selector does not silently
 change activation or quantization. Optional `activation_limit` is a positive
 finite clamp; use `None` to disable it. `activation_alpha` is accepted only for
 `swiglu_oai` (default 1.702). SiTU uses `situ_beta=4` and
-`situ_linear_beta=25`. FP8 blockwise does not support SwiGLU-OAI.
+`situ_linear_beta=25`.
 
 Quantized GEMM1 output requires `out_scales`. The channelwise path also requires
 `bf16_scratch`, preserving the existing fused/separate-quantization scheduling
-without a hidden large allocation. W4A16 GEMM1 currently does not accept split
-replica weights; the other GEMM1 paths and all GEMM2 paths
-accept `rhs_replicas=(weight, scales)`. W4A4 GEMM1 takes only the tile-packed
+without a hidden large allocation. All GEMM1 and GEMM2 paths accept
+`rhs_replicas=(weight, scales)`. Physical expert slots are ordered as masters
+followed by replicas on each rank; their total must match the workspace. W4A4 GEMM1 takes only the tile-packed
 uint16 scale layout, prepared once as shown in `_pack_gemm1_scales`.
 
 For example, channelwise FP8 with SwiGLU-OAI and quantized GEMM1 output uses:
@@ -231,22 +279,32 @@ dg.mega_moe_dispatch_gemm1(
 ```
 
 GEMM2 requires `m_indices` for channelwise FP8 and `row_offsets` for blockwise
-FP8. W4A4 uses `row_offsets` when GEMM1 and GEMM2 have different row padding.
-`configs` retains the existing backend tile tuple; blockwise FP8 uses its built-in
-tile. Options specific to a different backend are rejected. See each precision
-file for the workspace allocation and complete call chain. W4A16 references use
-Torch tensors and ordinary grouped GEMM; its pipeline uses only public APIs.
-Blockwise FP8 retains a private dispatch-only helper for its staged GEMM1 reference.
+FP8. W4A4 requires `row_offsets=meta.src_m_offsets` for the activation and
+scale inputs, which retain GEMM1 row padding. Packed routes follow GEMM2 padding.
+`configs` retains the existing backend tile tuple; blockwise FP8 selects BM128
+or BM192 internally, using `tuning.gemm2_tile` when supplied by a profile.
+Blockwise GEMM1 weights must be prepared with
+`interleave_fp8_blockwise_mega_moe_weights`: it interleaves 128 gate rows and
+128 up rows and retains native `[experts, N/128, K/128]` scales. Previously
+cached G8 weights and expanded `[experts, N/8, K/128]` scales must be regenerated
+from logical weights and native scales; the old scale shape is rejected.
+Options specific to a different backend are rejected. See each precision
+file for the workspace allocation and complete call chain. Each pipeline uses
+public APIs. References compute the entire MoE from source inputs, routing and
+logical expert weights with Torch, without consuming kernel intermediates.
 
 Workspace layout and scatter tile queries are internal implementation details.
 Use `get_symm_buffer_for_mega_moe` for allocation and
 `get_mega_moe_tuning_config` for measured workload presets with heuristic fallback.
 
 The metadata views contain `m_rows`, `valid_m_rows`, `m_offsets`, `src_m_rows`,
-`src_m_offsets` and `packed_src_info`. When W4A4 source and destination padding
-differ, pass `meta.src_m_offsets` as GEMM2 `row_offsets`. Activation tensors stay
-in their source layout. W4A16 and FP8 callers use the same metadata accessor;
-GEMM1 no longer accepts separate `m_rows` or `packed_src` output parameters.
+`src_m_offsets` and `token_meta`. All precisions use packed int64 `[pool]`
+routes in GEMM2 row order: rank in bits 63:32, top-k slot in bits 31:24,
+and token in bits 23:0. Dispatch/GEMM1 writes these routes together with the
+row metadata; `get_gemm2_metadata()` only returns views and launches no kernel.
+Activation tensors stay in their source layout. All precisions use the same
+metadata accessor; GEMM1 no longer accepts separate `m_rows` or `packed_src`
+output parameters.
 
 The primary model matrix uses **1024, 2048 and 4096 input tokens per rank**,
 defined by `MODEL_TOKENS` in `moe_test_utils.py`. These are generated MoE layer
@@ -259,205 +317,180 @@ inputs/weights with model dimensions, not checkpoint-based full-model tests.
 | GLM5.2 / `glm52` | W4A4 (MXFP4) | 8 | SwiGLU | 4096 |
 | GLM5.2 / `glm52` | W8A8 FP8 channelwise | 8 | SwiGLU | 4096 |
 | GLM5.3 Flash / `glm53_flash` | W8A8 FP8 channelwise | 4 | SwiGLU, limit 10 | 4096 |
-| Kimi K3 / `kimi_k3` | W4A4 (MXFP4) | 16 | SiTU | 4096 |
-| Kimi K3 / `kimi_k3_compute_*` | W4A16 (FP4 weights, BF16 activations) | 16 | SiTU | 4096 |
-| Qwen3.8 2.4T / `qwen38_2_4t` | W4A4 (MXFP4) | 16 | SwiGLU | 4096 |
+| Kimi K3 / `kimi_k3` | W4A4 (MXFP4) | 8, 16 | SiTU | 4096 |
+| Kimi K3 / `kimi_k3` | W4A16 (FP4 weights, BF16 activations) | 8, 16, 32 | SiTU | 4096 |
+| Qwen3.8 Max (2.4T) / `qwen38_2_4t` | W4A4 (MXFP4) | 8, 16 | SwiGLU | 4096 |
 | Qwen3.8 Flash / `qwen38_flash` | W8A8 FP8 channelwise | 4 | SwiGLU | 8192 |
 | MiniMax M3 / `minimax_m3` | W8A8 FP8 channelwise | 8 | SwiGLU-OAI, alpha 1.702, limit 7 | 4096 |
+| MiniMax blockwise shape / `minimax_m3_blockwise` | W8A8 FP8 blockwise | 8, 16, 32, 64 | SwiGLU-OAI, alpha 1.702, limit 7 | 4096 |
+| MiMo V2.6 Pro / `mimo_v26_pro` | W4A4 (MXFP4) | 8 | SwiGLU | 8192 |
 
 MiniMax M3 follows the checkpoint
 `MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken`: its weights use static
 per-channel FP8 scales, its activations use dynamic per-token FP8 scales, and
 `hidden_act=swigluoai`. The model case preserves this quantization and activation
-contract. Blockwise FP8 remains covered by the generic smoke pipeline.
+contract. The separate `minimax_m3_blockwise` case uses H7168, I5120, 384
+experts and top-k 4; it is not a precision toggle for the channelwise case.
+Its token counts include 64 plus the primary matrix. The W4A16 `kimi_k3`
+case includes 4, 8, 16, 32, 64 and 128 tokens per rank in addition to prefill.
 
-All rows run the three primary token counts. Capacity is the buffer limit, not
-the number of tokens passed to each forward. Small/empty/masked-route cases
-remain in the smoke tests. W4A16 validates routing and landed token bytes inside
-its public fused pipeline; there is no separate transport-only case. This table
-describes configured coverage, not a record that every case has passed on hardware.
+All model rows run the three primary token counts; MiMo also runs 8192 tokens
+per rank to cover its tuned profile. Capacity is the buffer limit, not the
+number of tokens passed to each forward. The small smoke cases use
+1, 0, 33 and 8 tokens to cover empty ranks, all-empty calls and partial tiles.
+This table describes configured coverage, not a record that every case has
+passed on hardware. These tests exercise BF16 scatter/combine; optional FP8
+scatter/combine remains implemented but is outside this test matrix.
 
-Run from the repository root in a PPU runtime, after assigning free devices:
+## Running correctness and performance tests
+
+All three precision files accept the same command-line options. The default
+runs the complete pipeline and checks its BF16 output against an independent
+Torch reference. Add `--benchmark` to measure that same pipeline.
+
+Run from the built repository root after selecting free devices:
 
 ```bash
 export PYTHONPATH="$PWD:$PWD/tests${PYTHONPATH:+:$PYTHONPATH}"
 export NCCL_IB_DISABLE=1 NCCL_SOCKET_IFNAME=eth0 GLOO_SOCKET_IFNAME=eth0
-# Single-device tests: no fixed rendezvous port is needed.
-CUDA_VISIBLE_DEVICES=0 python -m pytest tests/test_moe_w4a4.py tests/test_moe_w4a16.py tests/test_moe_w8a8.py -k smoke -q
-# See the full matrix without allocating distributed buffers.
-python -m pytest tests/test_moe_w8a8.py --collect-only -q
-# EP2 W4A4 and blockwise W8A8 pipelines, including remote BF16 scatter.
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
-  --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29876 \
-  -m pytest tests/test_moe_w4a4.py tests/test_moe_w8a8.py \
-  -k 'smoke and (test_pipeline or blockwise_pipeline)' -q
-# EP8 channelwise MiniMax M3 pipeline at 1024/2048/4096 tokens per rank.
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.run \
-  --nproc-per-node=8 --master-addr=127.0.0.1 --master-port=29876 \
-  -m pytest tests/test_moe_w8a8.py -k 'channelwise_pipeline and minimax_m3' -q
-# EP4 channelwise GLM5.3 at the same three token counts.
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run \
-  --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29876 \
-  -m pytest tests/test_moe_w8a8.py -k 'channelwise_pipeline and glm53_flash' -q
+
+# Small complete pipelines, including graph replay and separate replica weights.
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
+  -m pytest tests/test_moe_w4a4.py tests/test_moe_w4a16.py tests/test_moe_w8a8.py \
+  -k smoke -q
+# Channelwise FP8 smoke requires EP4 or EP8.
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
+  tests/test_moe_w8a8.py --case smoke_channelwise --tokens 1 0 33 8 \
+  --edge-cases --replicas --benchmark
+
+# DeepSeek V4 Pro: correctness and full-pipeline graph timing.
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+torchrun --standalone --nproc-per-node=8 tests/test_moe_w4a4.py \
+  --case deepseek_v4_pro --tokens 1024 2048 4096 \
+  --benchmark --warmup 10 --iterations 100 --repeats 5
+
+# MiMo V2.6 Pro: fallback and measured GEMM2 profile.
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+torchrun --standalone --nproc-per-node=8 tests/test_moe_w4a4.py \
+  --case mimo_v26_pro --tokens 1024 2048 4096 8192 \
+  --benchmark --warmup 10 --iterations 100 --repeats 5
+
+# FP8 uses the same interface.
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
+  tests/test_moe_w8a8.py --case glm53_flash --tokens 1024 2048 4096 --benchmark
+
+# W4A16 single-device smoke; add --replicas to exercise separate weight buffers.
+CUDA_VISIBLE_DEVICES=0 python tests/test_moe_w4a16.py \
+  --case smoke --tokens 1 0 33 8 --edge-cases --replicas --benchmark
+
+# Inspect configured cases without creating a process group.
+python -m pytest tests/test_moe_w4a4.py tests/test_moe_w4a16.py tests/test_moe_w8a8.py \
+  --collect-only -q
 ```
 
-This suite targets BF16 scatter/combine. FP8 scatter/combine remains implemented
-but is outside this test matrix for now. W4A4 Kimi covers BF16 combine with top-k 16.
-Scatter and combine are checked within the precision pipelines, without separate
-component test entrypoints.
-
-Launch the same pytest selection on every rank. Tests whose model requires a
-different EP size are skipped explicitly. Kimi W4A4/W4A16 and Qwen3.8 2.4T W4A4
-model cases require a two-node EP16 launch. The single-rank W4A16 `situ_large_shape` case uses four
-experts/top-k 2 for an additional shape check; it is not a Kimi model case.
-W4A4 smoke H is at least 512 because dispatch copies
-scale data in 16-byte units. Large model cases can allocate substantial weight
-and routing buffers: select `smoke` for a quick check.
-
-W4A16 and W8A8 currently expose pytest correctness entrypoints. W4A4 also has a
-standalone runner for correctness and performance, sharing the same `forward()`
-with pytest. Existing dense GEMM and attention entrypoints are unchanged.
-
-## W4A4 end-to-end example and benchmark
-
-`W4A4MoE.forward()` in `test_moe_w4a4.py` shows the complete call sequence:
-
-```text
-BF16 hidden states + top-k IDs/weights
-  -> FP4 pre-dispatch
-  -> dispatch + GEMM1 + activation + weighted FP4 quantization
-  -> GEMM2 row/metadata preparation
-  -> GEMM2 + BF16 scatter
-  -> dispatch count cleanup
-  -> mega_moe_combine (cross-rank barrier + weighted reduce)
-  -> BF16 output
-```
-
-All precision paths use `deep_gemm.mega_moe_combine` after GEMM2/scatter on the
-same stream. The scatter kernels finish their local/remote stores; only
-`mega_moe_combine` waits for peer ranks and reduces the local combine buffer.
-There is no separate `ipc_barrier` or local-only reduce entrypoint.
-
-The former standalone IPC-barrier call sites are covered in the precision tests:
-
-| Test | Coverage |
-| --- | --- |
-| `test_moe_w4a16.py::test_pipeline` | EP1, H/I=256/128 and 3584/3072, four tokens, fused GEMM2/scatter immediately followed by reduce, replica weights, poisoned destinations and changed-input graph replay |
-| `test_moe_w8a8.py::test_channelwise_scatter_combine[default_ep2]` | EP2, M/N/K=257/512/2048, partial BM256 tile, local/remote BF16 scatter and weighted reduce |
-| `test_moe_w8a8.py::test_channelwise_scatter_combine[overlap_padded_ep2]` | EP2, M/N/K=512/512/2048, four groups with 128 physical rows and valid prefixes 127/65/63/1, BM64 `OverlapPrologue`, zero padding metadata |
-
-Both EP2 cases check every received element, untouched rows, allocation guards,
-and barrier generations over eight changing-input/routing rounds, including
-graph replay. The device consumer runs directly after scatter; host barriers
-only protect buffer reuse between rounds.
+Kimi K3 and Qwen3.8 Max support EP8 on one eight-device node with
+`--nproc-per-node=8`. For EP16, on each of two eight-device nodes,
+use the same command and set `NODE_RANK` to 0 or 1 and `MASTER_ADDR` to the
+first node's reachable address:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m pytest -q tests/test_moe_w4a16.py::test_pipeline
-CUDA_VISIBLE_DEVICES=0,1 torchrun --master-addr=127.0.0.1 --master-port=29876 \
-  --nproc-per-node=2 -m pytest -q tests/test_moe_w8a8.py::test_channelwise_scatter_combine
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
+  --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port=29876 \
+  tests/test_moe_w4a16.py --case kimi_k3 --tokens 1024 2048 4096 --benchmark
 ```
 
-The combine buffer is `[topk, max_tokens, hidden]` (BF16 or E4M3 FP8); weights
-are contiguous FP32 `[num_tokens, topk]`. Invalid routes must have zero weights;
-the reducer skips those slots without reading them. FP8 may additionally pass
-`combine_scales` (packed BF16 scale in the low 16 bits of each int64) and
-`scale_block_n`. Without side scales, the FP8 exponent shift must match scatter.
-For W4A4 FP8 scatter, set `output_quantization="fp8"` on `mega_moe_gemm2_scatter`
-and pass a `torch.float8_e4m3fn` combine buffer to both scatter and combine.
-BF16 and FP8 share the synchronization and reduction implementation and return
-BF16. All scatter producers and combine use this slot-major layout; the former
-`DG_MOE_COMBINE_TOKEN_MAJOR` override has been removed. W4A4/W4A16 scatter requires
-complete N tiles with `BLOCK_N` divisible by 256 because BF16 bulk stores involve
-a full warp. FP8 side scales use the supplied grouping without device-side
-clamping: `scale_block_n` must be at least 64, aligned to 8, divide `BLOCK_N`, and
-produce at most four groups per tile. Explicit scale tensors are honored even
-if legacy environment overrides disagree.
+Use the communication environment appropriate to the machine topology on both
+nodes. Pytest skips model cases whose required EP does not match the launch;
+the CLI reports an error for an incompatible `--case`.
 
-`test_moe_w4a4.py::test_fp8_combine_pipeline` covers fixed-scale FP8 and static /
-dynamic side scales with 64/128/256-column groups, invalid groups and tiles,
-poisoned scale storage, adjacent scatter/combine and graph replay. These optional
-FP8 checks share the W4A4 end-to-end setup; model benchmarks still use BF16 scatter.
+For Kimi K3 decode, use four eight-device nodes with `--nnodes=4` and
+`--node-rank=0..3`, then select
+`--case kimi_k3 --tokens 4 8 16 32 64 128 --benchmark`.
+For MiniMax blockwise, use `tests/test_moe_w8a8.py --case minimax_m3_blockwise`;
+two, four or eight nodes provide EP16, EP32 or EP64. All participating devices
+must support Torch symmetric-memory peer access within the same fabric domain.
 
-`flag_ptrs` is a device int64 table of one peer-visible int32 counter per rank,
-initialized to zero once. `done_flag` is one local int32, reset by the launcher
-on the same stream for each invocation (also during graph replay). The tests'
-`CombineBarrier` helper owns these buffers. Every rank must invoke the collective
-in the same order, including `num_tokens=0`; each concurrent MoE invocation needs
-its own state. Keep buffers alive and do not reset counters while calls are in
-flight. Before reusing a combine buffer, all readers of the previous iteration
-must finish: the next MegaMoE dispatch supplies this synchronization in the full
-pipeline. Callers using only scatter/reduce must arrange that reuse boundary.
+All precisions apply routing weights in `mega_moe_combine`, after GEMM2.
+Pass the FP32 routing weights with invalid routing IDs masked to zero.
+GEMM1 activation and output quantization operate on unweighted values.
+The W4A4 example uses `buffer.input_topk_weights[:num_tokens]` for combine-stage
+weighting: pre-dispatch refreshes this view and zeros invalid routes on every
+launch. This keeps changing router weights visible during graph replay without
+an additional masking kernel.
 
-The router and shared-expert branch are outside this routed MoE example. The
-workspace and preprocessed local expert weights are reused across invocations.
-The `W4A4MoE` class is an example in this test file, not an additional library API.
-To reuse it with your tensors after initializing a process group:
+The CLI checks every requested token by default. `--reference-tokens N` limits
+the numerical comparison to the first N tokens on each rank while still running
+the complete workload. Pytest uses bounded references for large model cases and
+checks every smoke token. Correctness also checks finite output, a poisoned
+combine buffer and repeated graph replay with changed inputs.
+
+`--edge-cases` injects masked routes, zero routing weights and an empty final
+rank when `--tokens` includes 1. `--replicas` places the final local physical
+expert in a separate allocation for both GEMMs. For W4A16 Kimi K3, it retains
+896 masters globally and adds one replica slot per rank (912 physical experts
+at EP16 or 928 at EP32). Other cases split their existing physical slots. Pytest exercises both
+ordinary and replica weights where the case has enough local experts.
+
+Performance results are JSON objects printed by rank 0, one per token count.
+They include precision, shape, EP, actual tokens per rank, replica/edge options,
+correctness errors and timing samples. `benchmark.max_rank_us` gives
+min/median/max across samples; each sample is the maximum across ranks of their
+mean forward latency in microseconds. Throughput uses the sum of actual tokens
+and the median latency.
+
+Timing includes all device work from pre-dispatch through combine, including
+cross-rank synchronization. JIT, weight/input generation, reference computation,
+validation and host barriers are outside timing. Graph mode captures
+`--iterations` complete forwards; `--mode eager` measures the same calls with
+Python launch gaps. `--no-check` is allowed only with `--benchmark`, for timing
+after correctness has already been established. Keep `--capacity`, routing,
+EP, token counts and timing mode fixed when comparing results.
+
+## Pipeline and synchronization
+
+Every precision example uses the public pre-dispatch, dispatch/GEMM1,
+GEMM2/scatter and combine APIs in sequence on one stream. GEMM1 also prepares
+GEMM2 metadata. Scatter completes its local/remote stores; combine performs
+the cross-rank barrier and reduction. There is no separate IPC barrier call.
+All precisions multiply each valid route by its routing weight during combine.
+
+The BF16 combine buffer is `[topk, capacity, hidden]`. Invalid routes must have
+zero combine weights so the reducer skips unwritten slots. `CombineBarrier`
+owns one peer-visible generation counter per rank and one local completion
+flag. All ranks, including empty ranks, invoke the pipeline in the same order.
+Keep these buffers alive across graph replay. The next dispatch synchronizes
+buffer reuse; each concurrent MoE invocation needs its own state.
+
+`compile_kernels` compiles and loads native kernels without launching them,
+then all ranks synchronize before entering cooperative device barriers.
+The router and shared-expert branch are outside these routed MoE examples.
+
+## Reusing the W4A4 example
+
+`W4A4MoE` in `test_moe_w4a4.py` is a reusable example workspace, not another
+library API. It preprocesses logical GEMM1 weights and raw scales into groups
+of eight gate rows followed by eight up rows: `g0,...,g7,u0,...,u7,g8,...`.
+SwiGLU, STEP and SiTU use this G8 layout for BF16 and MXFP4 output.
+Gate/up projections and their clamps are rounded to BF16; activation arithmetic
+uses FP32, then rounds to BF16 before MXFP4 quantization. Routing weights are
+applied during combine. Library callers must apply the same G8
+row permutation to weights and raw E8M0 scales before packing scales into
+GEMM1 N tiles; see `interleave_gate_up` and `_pack_gemm1_scales` in the example.
+Previously prepared G1 weights and scales must be rebuilt in G8 order.
+
+After initializing a process group:
 
 ```python
 from test_moe_w4a4 import W4A4MoE
 
-# w1/w2: local logical expert weights, each (packed FP4, raw E8M0 scales).
-# w1 rows are [gate; up]. Inputs are contiguous CUDA tensors with dtypes
-# BF16, int64 and float32 for hidden_states, topk_ids and topk_weights.
+# w1/w2: (packed FP4, raw E8M0 scales) for local logical expert weights.
+# w1 rows are [gate; up]. Input dtypes are BF16, int64 and float32.
 moe = W4A4MoE(case, group, w1, w2)
 moe.set_inputs(hidden_states, topk_ids, topk_weights)
-moe.compile()  # Finish JIT on every rank before cooperative kernels run.
+moe.compile()
 output = moe.forward()
-# Reuse forward(); after binding new inputs, call compile() again on all ranks.
+# Call compile() on all ranks again after binding new input shapes.
 torch.cuda.synchronize()
 moe.close()
 ```
-
-Run from the built repository root in a PPU runtime. Direct script execution
-loads this checkout. Keep the distributed environment above for torchrun.
-
-```bash
-# Single PPU: complete pipeline checked against independent Torch references.
-CUDA_VISIBLE_DEVICES=0 python tests/test_moe_w4a4.py \
-  --case smoke_swiglu --tokens 33
-
-# Two PPUs: empty rank/all-empty calls, masked slots and split replica weights.
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
-  tests/test_moe_w4a4.py --case smoke_situ --tokens 1 0 33 \
-  --edge-cases --replicas
-
-# Eight PPUs: all tokens checked at the three primary sizes, then graph timing.
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc-per-node=8 \
-  tests/test_moe_w4a4.py --case deepseek_v4_pro --tokens 1024 2048 4096 --benchmark \
-  --warmup 10 --iterations 100 --repeats 5
-
-# Eager timing, or performance only after correctness has been established.
-CUDA_VISIBLE_DEVICES=0 python tests/test_moe_w4a4.py \
-  --case smoke_step --tokens 33 --benchmark --mode eager
-CUDA_VISIBLE_DEVICES=0 python tests/test_moe_w4a4.py \
-  --case smoke_swiglu --tokens 33 --benchmark --no-check
-```
-
-The CLI checks every requested token by default. `--reference-tokens N` explicitly
-limits numerical reference checks to the first N tokens per rank; route counts
-and metadata are still checked for all routes. Pytest keeps bounded references
-for large model cases and checks every smoke token. Both use the independent FP4
-full-pipeline reference and a GEMM2/scatter/combine reference based on actual
-GEMM1 output, so activation quantization error cannot hide scatter/reduce errors.
-
-Benchmark output is one JSON object per token count on rank 0. It records model
-shape, EP size, actual token counts on all ranks, workspace capacity, correctness
-status/errors, execution mode, timing samples and global token throughput.
-`benchmark.max_rank_us` reports min/median/max across samples; **each sample is
-the maximum across ranks of their mean forward latency**, in microseconds.
-Throughput uses the sum of actual tokens across ranks and that median latency.
-
-JIT, weight/input generation, CPU layout selection, reference computation,
-validation and host barriers are outside timing. Every timed invocation includes
-all kernels from pre-dispatch through combine, including device synchronization.
-Graph mode captures a batch of `--iterations` complete forwards; eager mode calls
-the same forward from Python and its device-event time includes launch gaps.
-All ranks use identical warmup/iteration/repeat counts. Defaults use round-robin
-routing without injected edge cases; `--edge-cases` and `--replicas` are explicit
-and recorded in the result. `--capacity` changes the workspace capacity without
-changing the token count, so keep it fixed when comparing measurements.
-
-MoE warmup uses `compile_kernels` from `moe_test_utils.py` to compile and load
-native kernels serially without launching them. The helper restores the previous
-compile mode and propagates compiler failures. All ranks finish warmup before
-entering cooperative device barriers.

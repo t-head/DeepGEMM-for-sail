@@ -43,6 +43,7 @@
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/impls/fp4_mega_moe_gemm1_mma.cuh>
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
+#include <deep_gemm/scheduler/mega_moe_work_queue.cuh>
 
 namespace deep_gemm::mega_moe::fp4 {
 
@@ -118,114 +119,124 @@ CUTLASS_DEVICE uint32_t lane_exclusive_scan(const uint32_t& val, const uint32_t&
 template <
     uint32_t kNumRanks, uint32_t kNumCTAs, uint32_t kNumThreads,
     uint32_t kNumExperts, uint32_t kNumExpertsPerRank, uint32_t kNumTopk,
-    bool kWritePullIndices = true,
-    bool kWritePushSlots = false
->
+    bool kWritePullIndices = true, bool kWritePushSlots = false,
+    bool kDecodeHandshake = false>
 CUTLASS_DEVICE void mega_moe_dispatch_handshake(
         const layout::Workspace& workspace,
         const layout::SymBuffer<kNumRanks>& sym_buffer,
-        const int64_t* __restrict__ input_topk_idx,   // [num_tokens, kNumTopk]
-        uint32_t* __restrict__ smem_expert_count,      // [kNumExperts]
+        const int64_t* __restrict__ input_topk_idx,
+        uint32_t* __restrict__ smem_expert_count,
         const uint32_t& num_tokens,
         const uint32_t& cta_idx,
         const uint32_t& thread_idx) {
-
     const auto block_sync = [=]() { __syncthreads(); };
 
-    // ---- 0) Zero shared expert count ----
-    for (uint32_t i = thread_idx; i < kNumExperts; i += kNumThreads)
-        smem_expert_count[i] = 0;
-    __syncthreads();
+    // Small decode batches fit in one routing CTA. The remaining CTAs wait
+    // at the cross-rank barrier's epilogue and then help transport payloads.
+    const bool single_count_cta = kDecodeHandshake && num_tokens <= 128;
+    if (!single_count_cta || cta_idx == 0) {
 
-    // Iterate this rank's (token, topk) pairs assigned to this thread, calling
-    // `process(token_topk_idx, expert_idx)` for each valid routed pair.
-    const auto for_each_routed = [&](const auto& process) {
-        const uint32_t total = num_tokens * kNumTopk;
-        for (uint32_t p = cta_idx * kNumThreads + thread_idx; p < total;
-             p += kNumCTAs * kNumThreads) {
-            const int expert_idx = static_cast<int>(__ldg(input_topk_idx + p));
-            if (expert_idx >= 0 and expert_idx < static_cast<int>(kNumExperts))
-                process(p, static_cast<uint32_t>(expert_idx));
+        for (uint32_t i = thread_idx; i < kNumExperts; i += kNumThreads)
+            smem_expert_count[i] = 0;
+        __syncthreads();
+
+        const auto for_each_routed = [&](const auto& process) {
+            const uint32_t total = num_tokens * kNumTopk;
+            const uint32_t first = single_count_cta ? thread_idx
+                : cta_idx * kNumThreads + thread_idx;
+            const uint32_t stride = single_count_cta ? kNumThreads : kNumCTAs * kNumThreads;
+            for (uint32_t p = first; p < total; p += stride) {
+                const int expert_idx = static_cast<int>(__ldg(input_topk_idx + p));
+                if (expert_idx >= 0 &&
+                    expert_idx < static_cast<int>(kNumExperts)) {
+                    process(p, static_cast<uint32_t>(expert_idx));
+                }
+            }
+        };
+
+        for_each_routed([&](const uint32_t&, const uint32_t& expert_idx) {
+            atomicAdd_block(smem_expert_count + expert_idx, 1u);
+        });
+        __syncthreads();
+
+        for (uint32_t i = thread_idx; i < kNumExperts; i += kNumThreads) {
+            if (single_count_cta) {
+                *workspace.get_expert_send_count_ptr(i) =
+                    (static_cast<uint64_t>(kNumCTAs) << 32) | smem_expert_count[i];
+                smem_expert_count[i] = 0;
+            } else {
+                const uint64_t send_value =
+                    (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
+                const uint64_t old_value = ptx::atomic_add_sys(
+                    workspace.get_expert_send_count_ptr(i), send_value);
+                smem_expert_count[i] = static_cast<uint32_t>(old_value);
+            }
         }
-    };
+        __syncthreads();
 
-    // ---- 1) Count tokens per (global) expert into shared ----
-    for_each_routed([&](const uint32_t& /*ttid*/, const uint32_t& expert_idx) {
-        atomicAdd_block(smem_expert_count + expert_idx, 1u);
-    });
-    __syncthreads();
+        if constexpr (kWritePullIndices) {
+            for_each_routed([&](const uint32_t& token_topk_idx,
+                                const uint32_t& expert_idx) {
+                const uint32_t dst_rank_idx = expert_idx / kNumExpertsPerRank;
+                const uint32_t local_expert_idx =
+                    expert_idx % kNumExpertsPerRank;
+                const uint32_t dst_slot_idx =
+                    atomicAdd_block(smem_expert_count + expert_idx, 1u);
+                auto* dst_ptr = workspace.get_src_token_topk_idx_ptr(
+                    local_expert_idx, sym_buffer.rank_idx, dst_slot_idx);
+                *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            });
+        } else if constexpr (kWritePushSlots) {
+            for_each_routed([&](const uint32_t& token_topk_idx,
+                                const uint32_t& expert_idx) {
+                const uint32_t dst_slot_idx =
+                    atomicAdd_block(smem_expert_count + expert_idx, 1u);
+                *workspace.get_l2_arrival_mask_ptr(token_topk_idx) = dst_slot_idx;
+            });
+        }
 
-    // ---- 2) Reserve a contiguous send-slot range per expert across all SMs ----
-    // expert_send_count packs: high 32 bits = #SMs contributed, low 32 = #tokens.
-    for (uint32_t i = thread_idx; i < kNumExperts; i += kNumThreads) {
-        const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
-        // old low-32 = this SM's starting slot for the expert
-        const uint64_t old_val = ptx::atomic_add_sys(workspace.get_expert_send_count_ptr(i), send_value);
-        smem_expert_count[i] = static_cast<uint32_t>(old_val & 0xffffffffu);
-    }
-    __syncthreads();
-
-    // ---- 3) Write source token-topk indices into the DEST rank's workspace ----
-    // Pull dispatch resolves source rows from this list. Push dispatch already
-    // owns the local source row and can skip the extra remote metadata write.
-    if constexpr (kWritePullIndices) {
-        for_each_routed([&](const uint32_t& token_topk_idx, const uint32_t& expert_idx) {
-            const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-            const auto local_expert_idx = expert_idx % kNumExpertsPerRank;
-            const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1u);
-            auto* dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                local_expert_idx, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
-        });
-    } else if constexpr (kWritePushSlots) {
-        // Preserve the source-side slot selected by the same per-CTA prefix
-        // protocol. Push dispatch consumes it later without a hot-loop global
-        // atomic. The L2 mask region is otherwise unused by the BF16 path and
-        // is capacity-sized for every routed pair.
-        for_each_routed([&](const uint32_t& token_topk_idx, const uint32_t& expert_idx) {
-            const auto dst_slot_idx =
-                atomicAdd_block(smem_expert_count + expert_idx, 1u);
-            *workspace.get_l2_arrival_mask_ptr(token_topk_idx) = dst_slot_idx;
-        });
-    }
-
-    // ---- 4) Grid sync so every SM finished writing send counts / src indices ----
-    // Stagger polling across SMs. Without backoff, rare launches can spend
-    // milliseconds hammering this single counter cache line before SM0 flips
-    // the generation bit, even though the routed-index work is already done.
-    comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/0,
+    } // Route counting and metadata publication.
+    if (single_count_cta) {
+        // CTA 0 owns every preceding write; a block barrier orders its
+        // metadata/count stores before count exchange and release signals.
+        __syncthreads();
+    } else {
+        comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/0,
                     /*kPollBackoffCycles=*/128>(
-        workspace, cta_idx, thread_idx, block_sync);
+            workspace, cta_idx, thread_idx, block_sync);
+    }
 
-    // ---- 5) SM0 publishes per-(src_rank, local_expert) recv counts to dest ----
     if (cta_idx == 0) {
         for (uint32_t i = thread_idx; i < kNumExperts; i += kNumThreads) {
-            const auto dst_rank_idx = i / kNumExpertsPerRank;
-            const auto local_expert_idx = i % kNumExpertsPerRank;
-            const uint64_t expert_status = *workspace.get_expert_send_count_ptr(i);
-            // recv_count[this_rank][local_expert] on dest rank = #tokens we send
+            const uint32_t dst_rank_idx = i / kNumExpertsPerRank;
+            const uint32_t local_expert_idx = i % kNumExpertsPerRank;
+            const uint64_t expert_status =
+                *workspace.get_expert_send_count_ptr(i);
             *sym_buffer.map(
-                workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, local_expert_idx),
+                workspace.get_expert_recv_count_ptr(
+                    sym_buffer.rank_idx, local_expert_idx),
                 dst_rank_idx) = expert_status & 0xffffffffull;
-            // recv_count_sum[local_expert] on dest rank += packed(#SMs, #tokens)
             ptx::atomic_add_sys(
-                sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(local_expert_idx), dst_rank_idx),
+                sym_buffer.map(
+                    workspace.get_expert_recv_count_sum_ptr(local_expert_idx),
+                    dst_rank_idx),
                 expert_status);
         }
     }
     __syncthreads();
 
-    // ---- 6) Cross-rank barrier: all ranks done publishing counts/indices ----
-    comm::cross_rank_barrier<kNumRanks, kNumCTAs, kNumThreads, /*idx=*/0, /*tag=*/0>(
-        workspace, sym_buffer, cta_idx, thread_idx, block_sync, true, true);
+    comm::cross_rank_barrier<
+        kNumRanks, kNumCTAs, kNumThreads, /*idx=*/0, /*tag=*/0>(
+        workspace, sym_buffer, cta_idx, thread_idx, block_sync,
+        !single_count_cta, true);
 }
 
 // ----------------------------------------------------------------------------
 // Fused kernel entry.
 //
-// Phase A: dispatch handshake. Phase B: overlapped pull/prefix GEMM.
-// Phase C: optional full-grid tail GEMM. The compile-time probes can still
-// isolate communication or compute for performance analysis.
+// Dispatch handshake precedes overlapped pull and GEMM1. In queue mode,
+// producers join the compute queue after their own pulls; each M block
+// retains its arrival check. Compile-time modes can isolate either phase.
 // ----------------------------------------------------------------------------
 template <
     uint32_t kNumRanks, uint32_t kNumCTAs, uint32_t kNumThreads,
@@ -236,8 +247,6 @@ template <
     uint32_t kNumGemmCTAs = kNumCTAs,
     bool kSmSpecialization = false,
     uint32_t kPullSlots = 8,
-    uint32_t kTailGemmBlocks = 0,
-    uint32_t kTailGemmPercent = 0,
     bool kEnableGemm1 = false,
     uint32_t kGemm1N = 0,
     uint32_t kTokenBytes = 0,
@@ -253,7 +262,11 @@ template <
     bool kSituTanhBf16x2 = false, // compile-time: packed BF16x2 SiTU tanh
     bool kFusedSitu = false, // compile-time: eliminate inactive GLU epilogue
     bool kSiluThenClamp = false,
-    uint32_t kGemm2BlockM = 0
+    uint32_t kGemm2BlockM = 0,
+    bool kIndependentBlockPull = false,
+    bool kDecodeHandshake = false,
+    bool kResetReceiveCounts = false,
+    bool kDynamicWork = false
 >
 // NOTE: the kernel body lives in this `__device__` impl (NOT the `__global__`)
 // so it can be reused by two launch paths: the Python JIT launches the thin
@@ -264,14 +277,13 @@ template <
 __device__ void
 dispatch_gemm1_body(
         void* workspace_base,
-        const layout::SymBuffer<kNumRanks> sym_buffer,
+        const layout::SymBuffer<kNumRanks>& sym_buffer,
         const int64_t* __restrict__ input_topk_idx,
-        const float* __restrict__ input_topk_weights,
         const uint8_t* __restrict__ input_token,
         const uint8_t* __restrict__ input_sf,
         uint8_t* __restrict__ dispatched_token_pool,
         uint8_t* __restrict__ dispatched_scale_pool,
-        float* __restrict__ dispatched_weights_pool,
+        void* __restrict__ gemm2_metadata,
         const uint32_t num_tokens,
         const uint32_t num_max_tokens_per_rank,
         const uint32_t token_bytes,
@@ -323,7 +335,7 @@ dispatch_gemm1_body(
             kNumRanks, kNumCTAs, kNumThreads, kNumExperts,
             kNumExpertsPerRank, kNumTopk,
             /*kWritePullIndices=*/!kEnableRemotePush,
-            /*kWritePushSlots=*/kEnableRemotePush>(
+            /*kWritePushSlots=*/kEnableRemotePush, kDecodeHandshake>(
             workspace, sym_buffer, input_topk_idx, smem_expert_count,
             num_tokens, cta_idx, thread_idx);
     }
@@ -339,6 +351,10 @@ dispatch_gemm1_body(
         static_assert(!kEnableGemm1,
                       "source-push dispatch runs in dispatch-only mode");
 
+        static_assert(kGemm2BlockM == 0 || kGemm2BlockM == BLOCK_M,
+                      "push dispatch requires matching source and GEMM2 padding");
+        const layout::Gemm2Metadata push_meta(gemm2_metadata, kNumExpertsPerRank);
+
         // The destination publishes its expert-padded row offsets in the
         // temporary L1-arrival prefix. Source slot indices were already
         // materialized per routed pair by the handshake.
@@ -349,51 +365,32 @@ dispatch_gemm1_body(
                     *workspace.get_l1_arrival_count_ptr(e) = pool_row_offset;
                     const uint32_t rows = static_cast<uint32_t>(
                         *workspace.get_expert_recv_count_sum_ptr(e));
+                    if constexpr (kGemm2BlockM != 0)
+                        push_meta.store_rows(e, rows, math::ceil_div(rows, BLOCK_M) * BLOCK_M,
+                                             pool_row_offset, math::ceil_div(rows, BLOCK_M) * BLOCK_M,
+                                             pool_row_offset);
                     pool_row_offset += math::ceil_div(rows, BLOCK_M) * BLOCK_M;
                 }
             }
         }
 
-        // All ranks must publish pool offsets before sources map remote
-        // landing addresses.
-        comm::cross_rank_barrier<
-            kNumRanks, kNumCTAs, kNumThreads,
-            /*kGridSyncIndex=*/2, /*kTag=*/1>(
-            workspace, sym_buffer, cta_idx, thread_idx, block_sync, true, true);
-
-        // Precompute one final destination row base per global expert:
-        //   padded expert pool base + rows contributed by lower source ranks.
-        // This removes both the system atomic and remote offset load from the
-        // per-route hot loop.
+        // Destinations own the receive counts. Publish each source's final
+        // landing base from local prefixes instead of rereading peer counts.
         if (cta_idx == 0) {
-            for (uint32_t expert_idx = thread_idx;
-                 expert_idx < kNumExperts; expert_idx += kNumThreads) {
-                const uint32_t dst_rank_idx =
-                    expert_idx / kNumExpertsPerRank;
-                const uint32_t local_expert_idx =
-                    expert_idx % kNumExpertsPerRank;
-                uint32_t src_prefix = 0;
-                for (uint32_t src_rank_idx = 0;
-                     src_rank_idx < sym_buffer.rank_idx; ++src_rank_idx) {
-                    const auto* remote_count = sym_buffer.map(
-                        workspace.get_expert_recv_count_ptr(
-                            src_rank_idx, local_expert_idx),
-                        dst_rank_idx);
-                    src_prefix += static_cast<uint32_t>(
-                        ptx::ld_acq_sys(remote_count));
+            __syncthreads();
+            for (uint32_t e = thread_idx; e < kNumExpertsPerRank; e += kNumThreads) {
+                uint32_t base = *workspace.get_l1_arrival_count_ptr(e);
+                const uint32_t expert = sym_buffer.rank_idx * kNumExpertsPerRank + e;
+                for (uint32_t src = 0; src < kNumRanks; ++src) {
+                    *sym_buffer.map(workspace.get_expert_send_count_ptr(expert), src) =
+                        static_cast<uint64_t>(base) << 32;
+                    base += static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(src, e));
                 }
-                const auto* remote_pool_offset = sym_buffer.map(
-                    workspace.get_l1_arrival_count_ptr(local_expert_idx),
-                    dst_rank_idx);
-                const uint32_t final_base = src_prefix +
-                    ptx::ld_acq_sys(remote_pool_offset);
-                *workspace.get_expert_send_count_ptr(expert_idx) =
-                    static_cast<uint64_t>(final_base) << 32;
             }
         }
-
-        comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/3>(
-            workspace, cta_idx, thread_idx, block_sync);
+        comm::cross_rank_barrier<
+            kNumRanks, kNumCTAs, kNumThreads, /*kGridSyncIndex=*/2, /*kTag=*/1>(
+            workspace, sym_buffer, cta_idx, thread_idx, block_sync, true, true);
 
         const uint32_t total_routes = num_tokens * kNumTopk;
         for (uint32_t p = global_warp_idx; p < total_routes;
@@ -450,19 +447,13 @@ dispatch_gemm1_body(
             }
 
             if (lane_idx == 0) {
-                const float topk_weight = __ldg(input_topk_weights + p);
-                auto* dst_weight = sym_buffer.map(
-                    dispatched_weights_pool + pool_idx, dst_rank_idx);
                 auto* dst_meta = sym_buffer.map(
                     workspace.get_token_src_metadata_ptr(pool_idx),
                     dst_rank_idx);
                 if (dst_rank_idx == sym_buffer.rank_idx) {
-                    *dst_weight = topk_weight;
                     *dst_meta = {
                         sym_buffer.rank_idx, p / kNumTopk, p % kNumTopk};
                 } else {
-                    __ppu_remote_store_bulk_ncp_b32(
-                        dst_weight, __float_as_uint(topk_weight));
                     __ppu_remote_store_bulk_ncp_b32(
                         &dst_meta->rank_idx, sym_buffer.rank_idx);
                     __ppu_remote_store_bulk_ncp_b32(
@@ -492,9 +483,20 @@ dispatch_gemm1_body(
 
         comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/1>(
             workspace, cta_idx, thread_idx, block_sync);
+        if constexpr (kGemm2BlockM != 0) {
+            for (uint32_t e = cta_idx; e < kNumExpertsPerRank; e += kNumCTAs) {
+                const uint32_t offset = push_meta.src_offsets[e];
+                for (uint32_t row = thread_idx; row < uint32_t(push_meta.valid_rows[e]); row += kNumThreads) {
+                    const auto route = *workspace.get_token_src_metadata_ptr(offset + row);
+                    push_meta.store_route(offset + row, route.rank_idx, route.token_idx, route.topk_idx);
+                }
+            }
+        }
         const uint32_t flat = cta_idx * kNumThreads + thread_idx;
         const uint32_t stride = kNumCTAs * kNumThreads;
-        for (uint32_t i = flat; i < kNumExperts; i += stride)
+        constexpr uint32_t count_words = kResetReceiveCounts
+            ? 2 * kNumExperts + kNumExpertsPerRank : kNumExperts;
+        for (uint32_t i = flat; i < count_words; i += stride)
             *workspace.get_expert_send_count_ptr(i) = 0;
         return;
     }
@@ -527,10 +529,9 @@ dispatch_gemm1_body(
     __syncwarp();
 
     const layout::Gemm2Metadata gemm2_meta(
-        dispatched_weights_pool + workspace.num_max_pool_tokens, kNumExpertsPerRank);
+        gemm2_metadata, kNumExpertsPerRank);
     uint32_t l_gemm2_off[kPerLaneSlots] = {};
     if constexpr (kGemm2BlockM != 0) {
-        static_assert(!kEnableRemotePush);
         uint32_t total = 0;
         #pragma unroll
         for (uint32_t s = 0; s < kPerLaneSlots; ++s) {
@@ -557,9 +558,9 @@ dispatch_gemm1_body(
     const auto dget_nmb = [&](uint32_t e) { return math::ceil_div(dget_nr(e), BLOCK_M); };
 
     // -------- Cooperative pull + scheduler GEMM --------
-    // Specialized producer CTAs publish each block independently while
-    // consumer CTAs run the prefix. A tail grid handoff reclaims all SMs for
-    // the final GEMM range. Shared memory is reused for pull staging and GEMM.
+    // Specialized producers publish each block independently, then join the
+    // consumers' tile queue after their own pulls. Shared memory is reused
+    // for pull staging and GEMM.
     if constexpr (kEnableGemm1 || kEnableRemotePull) {
         // Dispatch-only callers may use the token pool as an opaque byte
         // transport (for example BF16 activations feeding a separate W4A16
@@ -580,13 +581,14 @@ dispatch_gemm1_body(
         using Cfg = Gemm1MmaConfig<BLOCK_M, kBlockN, kBlockK,
                                         kGemm1WarpM, kGemm1WarpN, kGemm1Stages,
                                         kSfbBlockN>;
-        static_assert(kNumThreads >= Cfg::ThreadNum,
+        static_assert(!kEnableGemm1 || kNumThreads >= Cfg::ThreadNum,
                       "CTA must contain every gemm1 TiledMMA thread");
         static_assert(kNumThreads == Cfg::ThreadNum || !kQuantizeOutput,
                       "extra producer warps do not support fused quantization");
-
-        // Each active pull warp owns one private staging slot. A warp reuses
-        // that slot sequentially when a producer owns more than kPullSlots tokens.
+        static_assert(!kDynamicWork || (kSmSpecialization && kEnableRemotePull && kEnableGemm1 &&
+                                       kNumThreads == Cfg::ThreadNum),
+                      "the GEMM1 queue requires specialized pull and a full MMA CTA");
+        // Each pull warp owns private token and scale staging.
         static_assert(kNumPullCTAs > 0 && kNumPullCTAs <= kNumCTAs,
                       "producer SM count must be in [1, NUM_SMS]");
         static_assert(kNumGemmCTAs > 0 && kNumGemmCTAs <= kNumCTAs,
@@ -595,11 +597,6 @@ dispatch_gemm1_body(
                       "SM specialization requires remote pull or GEMM1");
         static_assert(!kSmSpecialization || kNumPullCTAs + kNumGemmCTAs == kNumCTAs,
                       "specialized producer and consumer SMs must cover the grid");
-        static_assert(kTailGemmPercent <= 100,
-                      "tail GEMM percentage must be in [0, 100]");
-        static_assert((kTailGemmBlocks == 0 && kTailGemmPercent == 0) ||
-                          (kSmSpecialization && kEnableRemotePull && kEnableGemm1),
-                      "tail GEMM stealing requires specialized pull+GEMM");
         static_assert(kPullSlots > 0 && kPullSlots <= kNumWarpsPerBlock,
                       "pull slots must fit in the CTA warp count");
         constexpr uint32_t kPullStagingBytes =
@@ -662,6 +659,13 @@ dispatch_gemm1_body(
         // diverge, then rendezvous once so no consumer can observe stale ready
         // counts from a previous launch.
         if constexpr (kSmSpecialization) {
+            static_assert(!kIndependentBlockPull || (!kEnableGemm1 && kEnableRemotePull && !kEnableRemotePush));
+            if constexpr (kIndependentBlockPull)
+                if (cta_idx == 0 && thread_idx == 0)
+                    *workspace.get_gemm1_work_count_ptr() = 0;
+            if constexpr (kDynamicWork)
+                if (cta_idx == 0 && thread_idx == 0)
+                    *workspace.get_gemm1_work_count_ptr() = 0;
             for (uint32_t g = cta_idx * kNumThreads + thread_idx; g < total_blocks;
                  g += kNumCTAs * kNumThreads)
                 *workspace.get_l1_arrival_count_ptr(g) = 0;
@@ -669,7 +673,7 @@ dispatch_gemm1_body(
                 workspace, cta_idx, thread_idx, block_sync);
         }
         // Pull one M block cooperatively. Every producer CTA owns a contiguous
-        // token slice; its active warps stage one token each with cp.async.
+        // token slice; each active warp stages one token and its scales at a time.
         const auto coop_pull = [&] (
                 uint32_t g, uint32_t pull_idx, uint32_t pull_count) {
             auto bi = resolve_block(g);
@@ -705,62 +709,52 @@ dispatch_gemm1_body(
                     const uint32_t t = my_start + batch * kPullSlots + warp_idx;
                     if (warp_idx < kPullSlots && t < my_start + my_count) {
                         const uint32_t actual_t = bi.tok_lo + t;
+                        const uint32_t mask = __ballot_sync(0xffffffffu,
+                            lane_idx < kNumRanks && actual_t >= src_begin && actual_t < src_end);
                         uint32_t r = 0, slot = 0, stk = 0;
-                        const uint32_t src_mask = __ballot_sync(
-                            0xffffffffu,
-                            lane_idx < kNumRanks &&
-                                actual_t >= src_begin && actual_t < src_end);
-                        if (src_mask) {
-                            r = static_cast<uint32_t>(__ffs(src_mask) - 1);
-                            const uint32_t range_begin = __shfl_sync(
-                                0xffffffffu, src_begin, r);
-                            slot = actual_t - range_begin;
+                        if (mask) {
+                            r = static_cast<uint32_t>(__ffs(mask) - 1);
+                            slot = actual_t - __shfl_sync(0xffffffffu, src_begin, r);
                         }
                         if (lane_idx == 0)
                             stk = *workspace.get_src_token_topk_idx_ptr(bi.e, r, slot);
                         stk = __shfl_sync(0xffffffffu, stk, 0);
+                        const uint32_t pool_idx = bi.epool_base + actual_t;
                         const auto* rt = sym_buffer.map(
-                            input_token + (uint64_t)(stk/kNumTopk)*token_bytes, r);
+                            input_token + static_cast<uint64_t>(stk/kNumTopk) * token_bytes, r);
                         const auto* rsf = sym_buffer.map(
-                            input_sf + (uint64_t)(stk/kNumTopk)*sf_bytes, r);
-                        float topk_weight = 0.0f;
+                            input_sf + static_cast<uint64_t>(stk/kNumTopk) * sf_bytes, r);
+                        auto* mt = pull_tok + warp_idx * token_bytes;
+                        auto* ms = pull_sf + warp_idx * sf_bytes;
+                        // Commit scales first so their transpose can overlap the token copy.
+                        for (uint32_t i = lane_idx; i < sf_bytes/16; i += 32)
+                            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                                :: "r"((unsigned)__cvta_generic_to_shared(ms + i*16)), "l"(rsf + i*16));
+                        asm volatile("cp.async.commit_group;\n" ::);
+                        for (uint32_t i = lane_idx; i < token_bytes/16; i += 32)
+                            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                                :: "r"((unsigned)__cvta_generic_to_shared(mt + i*16)), "l"(rt + i*16));
+                        asm volatile("cp.async.commit_group;\n" ::);
+                        asm volatile("" ::: "memory");
                         uint32_t gemm2_pool_idx = 0;
                         if constexpr (kGemm2BlockM != 0)
                             gemm2_pool_idx = dist_get<kPerLaneSlots>(l_gemm2_off, bi.e) + actual_t;
-                        const uint32_t pool_idx = bi.epool_base + actual_t;
-                        auto* dst_token = dispatched_token_pool
-                            + static_cast<uint64_t>(pool_idx) * token_bytes;
-                        uint8_t* ms = pull_sf + warp_idx * sf_bytes;
-                        uint8_t* mt = pull_tok + warp_idx * token_bytes;
-                        for (uint32_t i = lane_idx; i < token_bytes/16; i += 32)
-                            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
-                                :: "r"((unsigned)__cvta_generic_to_shared(mt+i*16)),
-                                   "l"(rt+i*16));
-                        for (uint32_t i = lane_idx; i < sf_bytes/16; i += 32)
-                            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
-                                :: "r"((unsigned)__cvta_generic_to_shared(ms+i*16)),
-                                   "l"(rsf+i*16));
-                        asm volatile("cp.async.commit_group;\n" ::);
                         asm volatile("" ::: "memory");
-                        // Read the route weight while token and scale copies are in flight.
-                        if (lane_idx == 0)
-                            topk_weight = *sym_buffer.map(input_topk_weights + stk, r);
-                        asm volatile("" ::: "memory");
+                        asm volatile("cp.async.wait_group 1;\n" ::);
+                        __syncwarp();
+                        // Each scale column keeps the allocated BLOCK_M row stride.
+                        for (uint32_t j = lane_idx; j < kSfCols; j += 32)
+                            sfa_base[j * BLOCK_M + t] = static_cast<uint16_t>(ms[2*j]) |
+                                (static_cast<uint16_t>(ms[2*j+1]) << 8);
                         asm volatile("cp.async.wait_all;\n" ::);
                         __syncwarp();
-                        warp_copy_bytes(dst_token, mt, token_bytes, lane_idx);
-                        // Each scale column keeps the allocated BLOCK_M row stride.
-                        for (uint32_t j = lane_idx; j < kSfCols; j += 32) {
-                            uint16_t v = (uint16_t)ms[2*j] | ((uint16_t)ms[2*j+1] << 8);
-                            sfa_base[j*BLOCK_M + t] = v;
-                        }
+                        warp_copy_bytes(
+                            dispatched_token_pool + static_cast<uint64_t>(pool_idx) * token_bytes,
+                            mt, token_bytes, lane_idx);
                         if (lane_idx == 0) {
-                            dispatched_weights_pool[pool_idx] = topk_weight;
-                            *workspace.get_token_src_metadata_ptr(pool_idx) =
-                                {r, stk/kNumTopk, stk%kNumTopk};
-                            if constexpr (kGemm2BlockM != 0) {
+                            *workspace.get_token_src_metadata_ptr(pool_idx) = {r, stk/kNumTopk, stk%kNumTopk};
+                            if constexpr (kGemm2BlockM != 0)
                                 gemm2_meta.store_route(gemm2_pool_idx, r, stk/kNumTopk, stk%kNumTopk);
-                            }
                         }
                         __syncwarp();
                     }
@@ -798,6 +792,19 @@ dispatch_gemm1_body(
                         __syncthreads();
                     }
                 }
+            } else if constexpr (kIndependentBlockPull) {
+                if (cta_idx < kNumPullCTAs) {
+                    for (uint32_t g = cta_idx; g < total_blocks; g += kNumPullCTAs) {
+                        coop_pull(g, 0, 1);
+#if __HGGC_ARCH__ == 150
+                        __ppu_wait_vstcnt(0);
+#endif
+                        __threadfence();
+                        __syncthreads();
+                        if (thread_idx == 0)
+                            ptx::red_add_rel(workspace.get_l1_arrival_count_ptr(g), 1u);
+                    }
+                }
             } else {
                 if (cta_idx < kNumPullCTAs) {
                     for (uint32_t g = 0; g < total_blocks; ++g) {
@@ -829,75 +836,40 @@ dispatch_gemm1_body(
             // Finish the N tiles of one M block before advancing M.
             constexpr uint32_t kMBlocksPerSwizzleGroup = 1;
             const uint32_t total_gemm_work = total_blocks * kNumNBlocks;
-            const uint32_t percent_tail_m_blocks = kTailGemmPercent > 0
-                ? umin(
-                      total_blocks,
-                      math::ceil_div(total_blocks * kTailGemmPercent, 100u))
-                : 0;
-            uint32_t tail_m_blocks = kTailGemmPercent > 0
-                ? (kTailGemmBlocks > 0
-                       ? umin(percent_tail_m_blocks, kTailGemmBlocks)
-                       : percent_tail_m_blocks)
-                : umin(total_blocks, kTailGemmBlocks);
-            // The percentage-derived split can leave one partially occupied
-            // scheduler wave on each side of the rendezvous. Starting from the
-            // existing split, move only toward the configured cap and only
-            // when the idealized wave count strictly decreases. Compute once
-            // per warp and broadcast to avoid doing the tiny search per lane.
-            if constexpr (kSmSpecialization && kTailGemmBlocks > 0) {
-                const uint32_t max_tail_m_blocks =
-                    umin(total_blocks, kTailGemmBlocks);
-                if (tail_m_blocks < max_tail_m_blocks) {
-                    if ((thread_idx & 31u) == 0) {
-                        uint32_t best_tail_m_blocks = tail_m_blocks;
-                        uint32_t best_waves =
-                            math::ceil_div(
-                                (total_blocks - tail_m_blocks) * kNumNBlocks,
-                                kNumGemmCTAs) +
-                            math::ceil_div(
-                                tail_m_blocks * kNumNBlocks, kNumCTAs);
-                        for (uint32_t candidate = tail_m_blocks + 1;
-                             candidate <= max_tail_m_blocks; ++candidate) {
-                            const uint32_t candidate_waves =
-                                math::ceil_div(
-                                    (total_blocks - candidate) * kNumNBlocks,
-                                    kNumGemmCTAs) +
-                                math::ceil_div(candidate * kNumNBlocks, kNumCTAs);
-                            if (candidate_waves < best_waves) {
-                                best_waves = candidate_waves;
-                                best_tail_m_blocks = candidate;
-                            }
-                        }
-                        tail_m_blocks = best_tail_m_blocks;
-                    }
-                    tail_m_blocks = __shfl_sync(0xffffffffu, tail_m_blocks, 0);
-                }
-            }
-            const uint32_t tail_work_begin =
-                (total_blocks - tail_m_blocks) * kNumNBlocks;
             const bool initial_gemm_sm =
                 cta_idx >= kGemmSMOffset && cta_idx < kGemmSMOffset + kNumGemmCTAs;
             const uint32_t initial_gemm_sm_idx = cta_idx - kGemmSMOffset;
 
-            // Execute a contiguous range of the swizzled grouped-GEMM work list.
-            // The initial range uses only consumer SMs and waits per M block;
-            // after all producers finish, the tail range can use all SMs.
-            const auto run_gemm_range = [&] (
-                    uint32_t work_begin, uint32_t work_end,
-                    uint32_t scheduler_sms, uint32_t scheduler_sm_idx,
-                    bool wait_for_arrival) {
+            // All queue participants retain per-M-block readiness checks.
+            // Non-queue configurations use static assignment.
+            const auto run_gemm1 = [&] () {
                 uint32_t current_iter = 0;
                 uint32_t curr_group_idx = 0;
                 uint32_t curr_group_block_off = 0;
+                // Every participant claims one tile from the same queue.
+                // Tickets increase monotonically, so the expert cursor is reusable.
+                const mega_moe::WorkQueue queue{
+                    workspace.get_gemm1_work_count_ptr(), reinterpret_cast<uint32_t*>(smem_buf)};
                 const auto fetch_next_gemm1_work = [&] (
                         uint32_t& group_idx,
                         uint32_t& group_block_off,
                         uint32_t& m_block_idx,
                         uint32_t& n_block_idx,
                         uint32_t& group_m) {
-                    const uint32_t next_block_idx =
-                        work_begin + (current_iter++) * scheduler_sms + scheduler_sm_idx;
-                    if (next_block_idx >= work_end)
+                    uint32_t next_block_idx;
+                    if constexpr (kDynamicWork) {
+                        // Quantization and pull already retire shared loads.
+                        // BF16 output needs a barrier before the next claim.
+                        if constexpr (!kQuantizeOutput)
+                            __syncthreads();
+                        queue.prime(thread_idx);
+                        next_block_idx = queue.current();
+                        // Retire ticket reads before MMA reuses this storage.
+                        __syncthreads();
+                    } else {
+                        next_block_idx = (current_iter++) * kNumGemmCTAs + initial_gemm_sm_idx;
+                    }
+                    if (next_block_idx >= total_gemm_work)
                         return false;
                     while (curr_group_idx < kNumExpertsPerRank) {
                         const uint32_t curr_group_m = dget_nr(curr_group_idx);
@@ -948,10 +920,8 @@ dispatch_gemm1_body(
                         m_block_idx * BLOCK_M,
                         umin(group_m, (m_block_idx + 1) * BLOCK_M)};
                     if constexpr (kSmSpecialization && kEnableRemotePull) {
-                        if (wait_for_arrival) {
-                            while (ptx::ld_acq(
-                                       workspace.get_l1_arrival_count_ptr(g)) < kNumPullCTAs);
-                        }
+                        while (ptx::ld_acq(
+                                   workspace.get_l1_arrival_count_ptr(g)) < kNumPullCTAs);
                     }
 
                     const bool is_gate = (n_block_idx * kBlockN < kGemm1N / 2);
@@ -1020,31 +990,13 @@ dispatch_gemm1_body(
                             : nullptr,
                         static_cast<int>(kGemm1N / 4),
                         static_cast<int>(workspace.num_max_pool_tokens
-                                         * sizeof(uint16_t)), rank,
-                        dispatched_weights_pool,
-                        static_cast<int>(bi.pool_base));
+                                         * sizeof(uint16_t)));
                 }
             };
 
-            if (initial_gemm_sm) {
+            if (initial_gemm_sm || kDynamicWork) {
                 if (thread_idx < Cfg::ThreadNum)
-                    run_gemm_range(
-                        0, tail_work_begin, kNumGemmCTAs,
-                        initial_gemm_sm_idx, /*wait_for_arrival=*/true);
-                __syncthreads();
-            }
-
-            if constexpr (kTailGemmBlocks > 0 || kTailGemmPercent > 0) {
-                // Producers arrive after their final pull; consumers arrive
-                // after finishing the prefix. Stagger polling across SMs so an
-                // early side does not continuously hammer the barrier line.
-                comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/3,
-                                /*kPollBackoffCycles=*/128>(
-                    workspace, cta_idx, thread_idx, block_sync);
-                if (thread_idx < Cfg::ThreadNum)
-                    run_gemm_range(
-                        tail_work_begin, total_gemm_work, kNumCTAs, cta_idx,
-                        /*wait_for_arrival=*/false);
+                    run_gemm1();
                 __syncthreads();
             }
 
@@ -1058,7 +1010,12 @@ dispatch_gemm1_body(
     {
         const uint32_t flat   = cta_idx * kNumThreads + thread_idx;
         const uint32_t stride = kNumCTAs * kNumThreads;
-        for (uint32_t i = flat; i < kNumExperts; i += stride)
+        // W4A16 has materialized rows/routes and no longer reads counts after
+        // dispatch. Recycle its receive counts here as well as send counts;
+        // the final combine barrier orders reuse against all peer ranks.
+        constexpr uint32_t count_words = kResetReceiveCounts
+            ? 2 * kNumExperts + kNumExpertsPerRank : kNumExperts;
+        for (uint32_t i = flat; i < count_words; i += stride)
             *workspace.get_expert_send_count_ptr(i) = 0;
     }
 }
@@ -1079,8 +1036,6 @@ template <
     uint32_t kNumGemmCTAs = kNumCTAs,
     bool kSmSpecialization = false,
     uint32_t kPullSlots = 8,
-    uint32_t kTailGemmBlocks = 0,
-    uint32_t kTailGemmPercent = 0,
     bool kEnableGemm1 = false,
     uint32_t kGemm1N = 0,
     uint32_t kTokenBytes = 0,
@@ -1096,18 +1051,19 @@ template <
     bool kSituTanhBf16x2 = false,
     bool kFusedSitu = false,
     bool kSiluThenClamp = false,
-    uint32_t kGemm2BlockM = 0
+    uint32_t kGemm2BlockM = 0,
+    bool kIndependentBlockPull = false,
+    bool kDynamicWork = false
 >
 CUTLASS_DEVICE void dispatch_gemm1_device(
         void* workspace_base,
-        const layout::SymBuffer<kNumRanks> sym_buffer,
+        const layout::SymBuffer<kNumRanks>& sym_buffer,
         const int64_t* __restrict__ input_topk_idx,
-        const float* __restrict__ input_topk_weights,
         const uint8_t* __restrict__ input_token,
         const uint8_t* __restrict__ input_sf,
         uint8_t* __restrict__ dispatched_token_pool,
         uint8_t* __restrict__ dispatched_scale_pool,
-        float* __restrict__ dispatched_weights_pool,
+        void* __restrict__ gemm2_metadata,
         const uint32_t num_tokens,
         const uint32_t num_max_tokens_per_rank,
         const uint32_t token_bytes,
@@ -1138,13 +1094,14 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     dispatch_gemm1_body<
         kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank, kNumTopk,
         BLOCK_M, kChunkBlocks, kNumPullCTAs, kNumGemmCTAs,
-        kSmSpecialization, kPullSlots, kTailGemmBlocks, kTailGemmPercent, kEnableGemm1,
+        kSmSpecialization, kPullSlots, kEnableGemm1,
         kGemm1N, kTokenBytes, kGemm1BlockN, kGemm1BlockK, kGemm1SfbBlockN,
         kEnableRemotePull, kEnableRemotePush,
         kGemm1WarpM, kGemm1WarpN, kGemm1Stages, kQuantizeOutput,
-        kSituTanhBf16x2, kFusedSitu, kSiluThenClamp, kGemm2BlockM>(
-        workspace_base, sym_buffer, input_topk_idx, input_topk_weights,
-        input_token, input_sf, dispatched_token_pool, dispatched_scale_pool, dispatched_weights_pool,
+        kSituTanhBf16x2, kFusedSitu, kSiluThenClamp, kGemm2BlockM, kIndependentBlockPull,
+        /*kDecodeHandshake=*/false, /*kResetReceiveCounts=*/false, kDynamicWork>(
+        workspace_base, sym_buffer, input_topk_idx,
+        input_token, input_sf, dispatched_token_pool, dispatched_scale_pool, gemm2_metadata,
         num_tokens, num_max_tokens_per_rank, token_bytes, sf_bytes,
         gemm1_weight, gemm1_weight_sf, gemm1_output, gemm1_output_stride,
         gemm1_weight_sf_u16, gemm1_weight_replicas,
@@ -1166,8 +1123,6 @@ template <
     uint32_t kNumGemmCTAs = kNumCTAs,
     bool kSmSpecialization = false,
     uint32_t kPullSlots = 8,
-    uint32_t kTailGemmBlocks = 0,
-    uint32_t kTailGemmPercent = 0,
     bool kEnableGemm1 = false,
     uint32_t kGemm1N = 0,
     uint32_t kTokenBytes = 0,
@@ -1183,19 +1138,20 @@ template <
     bool kSituTanhBf16x2 = false,
     bool kFusedSitu = false,
     bool kSiluThenClamp = false,
-    uint32_t kGemm2BlockM = 0
+    uint32_t kGemm2BlockM = 0,
+    bool kIndependentBlockPull = false,
+    bool kDynamicWork = false
 >
 __global__ __launch_bounds__(kNumThreads, 1) void
 dispatch_gemm1_kernel(
         void* workspace_base,
         const layout::SymBuffer<kNumRanks> sym_buffer,
         const int64_t* __restrict__ input_topk_idx,
-        const float* __restrict__ input_topk_weights,
         const uint8_t* __restrict__ input_token,
         const uint8_t* __restrict__ input_sf,
         uint8_t* __restrict__ dispatched_token_pool,
         uint8_t* __restrict__ dispatched_scale_pool,
-        float* __restrict__ dispatched_weights_pool,
+        void* __restrict__ gemm2_metadata,
         const uint32_t num_tokens,
         const uint32_t num_max_tokens_per_rank,
         const uint32_t token_bytes,
@@ -1223,7 +1179,7 @@ dispatch_gemm1_kernel(
         bool finalize_dispatch = true,
         bool synchronize_pull = true,
         bool publish_arrivals = false) {
-    dispatch_gemm1_device<kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank, kNumTopk, BLOCK_M, kChunkBlocks, kNumPullCTAs, kNumGemmCTAs, kSmSpecialization, kPullSlots, kTailGemmBlocks, kTailGemmPercent, kEnableGemm1, kGemm1N, kTokenBytes, kGemm1BlockN, kGemm1BlockK, kGemm1SfbBlockN, kEnableRemotePull, kEnableRemotePush, kGemm1WarpM, kGemm1WarpN, kGemm1Stages, kQuantizeOutput, kSituTanhBf16x2, kFusedSitu, kSiluThenClamp, kGemm2BlockM>(workspace_base, sym_buffer, input_topk_idx, input_topk_weights, input_token, input_sf, dispatched_token_pool, dispatched_scale_pool, dispatched_weights_pool, num_tokens, num_max_tokens_per_rank, token_bytes, sf_bytes, gemm1_weight, gemm1_weight_sf, gemm1_output, gemm1_output_stride, gemm1_weight_sf_u16, gemm1_weight_replicas, gemm1_weight_sf_u16_replicas, num_master_experts, sfa_scratch, activation_clamp, fused_swiglu, fused_situ, situ_beta, situ_linear_beta, fp4_output, scale_output, rank, pull_begin_block, pull_end_block, resume_dispatch, finalize_dispatch, synchronize_pull, publish_arrivals);
+    dispatch_gemm1_device<kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank, kNumTopk, BLOCK_M, kChunkBlocks, kNumPullCTAs, kNumGemmCTAs, kSmSpecialization, kPullSlots, kEnableGemm1, kGemm1N, kTokenBytes, kGemm1BlockN, kGemm1BlockK, kGemm1SfbBlockN, kEnableRemotePull, kEnableRemotePush, kGemm1WarpM, kGemm1WarpN, kGemm1Stages, kQuantizeOutput, kSituTanhBf16x2, kFusedSitu, kSiluThenClamp, kGemm2BlockM, kIndependentBlockPull, kDynamicWork>(workspace_base, sym_buffer, input_topk_idx, input_token, input_sf, dispatched_token_pool, dispatched_scale_pool, gemm2_metadata, num_tokens, num_max_tokens_per_rank, token_bytes, sf_bytes, gemm1_weight, gemm1_weight_sf, gemm1_output, gemm1_output_stride, gemm1_weight_sf_u16, gemm1_weight_replicas, gemm1_weight_sf_u16_replicas, num_master_experts, sfa_scratch, activation_clamp, fused_swiglu, fused_situ, situ_beta, situ_linear_beta, fp4_output, scale_output, rank, pull_begin_block, pull_end_block, resume_dispatch, finalize_dispatch, synchronize_pull, publish_arrivals);
 }
 
 } // namespace deep_gemm::mega_moe::fp4

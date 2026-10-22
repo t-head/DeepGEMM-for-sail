@@ -294,6 +294,46 @@ The public compute interface has four stages, imported from `deep_gemm`:
 output quantization are explicit parameters with a checked support matrix. See the
 [precision-specific end-to-end examples and test commands](tests/README.MD#routed-moe-correctness-tests).
 
+FP8 channelwise, FP8 blockwise and W4A16 share a rank-local G1 work queue.
+Pull CTAs join computation after publishing all their input blocks; consumers
+still wait only for the input blocks required by their current GEMM tile.
+Channelwise prefetches one next tile using the existing MMA/epilogue barriers;
+W4A16 claims one tile at a time; blockwise retains its measured two-tile batch.
+`get_mega_moe_tuning_config(...).gemm1_dynamic_queue` is `True` or `False` for an
+explicit profile choice, and `None` for the backend's automatic policy. On ZW-M890P with 39 CUs,
+these queue profiles cover GLM52 channelwise EP8 at 32/1024 tokens per rank and
+GLM53 Flash channelwise EP4 at 1024 tokens per rank. Other counts retain the existing
+schedule. No queue-mode environment variable is required.
+
+GLM53 Flash channelwise EP4 at 1024 tokens per rank also selects BM128 for
+dispatch/GEMM1, with WM32 and 512 threads. Other channelwise profiles retain
+BM256. The symmetric workspace layout is independent of this rank-local tile;
+the same workspace can switch tiles as input counts change, including empty
+ranks. Omit `block_m` to use these profiles; an explicit 128 or 256 overrides
+the table. GEMM2 consumes the row metadata produced by each invocation.
+
+Kimi K3 W4A16 EP8 at 1024/2048/4096 tokens per rank uses separate pull dispatch
+and GEMM1 launches, with 64-row transport padding and a BM128 SiTU GEMM1 tile.
+The two launches use independent CTA geometry; SiTU remains fused into GEMM1.
+
+FP8 channelwise always quantizes the activated BF16 G1 output in a
+stream-ordered standalone kernel before G2. Quantization walks only valid
+expert rows from the G1 metadata and preserves their pool offsets. Its launch
+uses 128 threads per CTA and four CTAs per configured SM, independently of the
+G1 tile. Widths with partial vector iterations use a predicated tail. There is
+no quantization-mode environment variable or model-specific placement policy.
+
+W4A16 supports SiTU with small-token dispatch and compute tiles for Kimi K3
+EP32 decode. Blockwise FP8 supports SwiGLU and SwiGLU-OAI, native 128-by-128
+weight scales, BM128/BM192 compute tiles and up to 64 peer ranks.
+K3 decode profiles include the buffer tile, separate dispatch/GEMM1 launch
+geometry, GEMM2 tile and combine configuration in the same tuning table.
+Blockwise gate/up weights use G128 interleaving; regenerate cached G8 weights
+and expanded scales with `interleave_fp8_blockwise_mega_moe_weights`.
+Symmetric allocations use Torch directly; blockwise expert landing pools
+use local allocations. The four-stage API and fused GEMM2 metadata preparation
+are shared across these configurations.
+
 The source follows the native extension layout:
 
 | Path | Responsibility |
@@ -313,10 +353,10 @@ MegaMoE follows the same API/implementation split: internal calls use tensors,
 scalars and typed C++ configurations. Python configuration dictionaries are
 converted at the API boundary; internal launch code does not depend on Python
 objects or positional Python tuples.
-Configuration queries, row metadata preparation and load-time weight
-preprocessing remain separate helpers. The precision/activation-specific
+Configuration queries and load-time weight preprocessing remain helpers;
+dispatch/GEMM1 produces GEMM2 row and route metadata in the same kernel.
+The precision/activation-specific
 compute exports and their Python forwarding modules have been removed.
-The blockwise FP8 test retains a private dispatch-only helper for its staged GEMM1 reference.
 
 #### Interfaces exposed but not yet implemented
 

@@ -107,6 +107,53 @@ CUTLASS_DEVICE void warp_quantize_bf16_row(
 // Same counter and source-index protocol as fp4_mega_moe_dispatch_gemm1.cuh.
 // The data dtype does not participate in Phase A, so keeping an independent,
 // small copy lets this header avoid the FP4 Tensor-Core dependency.
+// One source range per lane and per 32-rank chunk. EP64 needs two chunks;
+// shuffling by 32 is not a prefix scan across two warps. All methods must be
+// called by a converged warp, with the same expert/row in every lane.
+template <uint32_t kNumRanks>
+struct WarpSourceRanges {
+    static_assert(kNumRanks > 0 && kNumRanks <= 64);
+    static constexpr uint32_t kChunks = (kNumRanks + 31) / 32;
+    uint32_t begin[kChunks], end[kChunks];
+
+    CUTLASS_DEVICE WarpSourceRanges(const layout::Workspace& ws,
+                                    uint32_t expert, uint32_t lane) {
+        uint32_t carry = 0;
+        #pragma unroll
+        for (uint32_t chunk = 0; chunk < kChunks; ++chunk) {
+            const uint32_t rank = chunk * 32 + lane;
+            const uint32_t count = rank < kNumRanks
+                ? uint32_t(*ws.get_expert_recv_count_ptr(rank, expert)) : 0;
+            uint32_t prefix = count;
+            #pragma unroll
+            for (uint32_t offset = 1; offset < 32 && offset < kNumRanks; offset <<= 1) {
+                const uint32_t value = __shfl_up_sync(0xffffffffu, prefix, offset);
+                if (lane >= offset) prefix += value;
+            }
+            begin[chunk] = carry + prefix - count;
+            end[chunk] = carry + prefix;
+            if constexpr (kChunks > 1)
+                carry += __shfl_sync(0xffffffffu, prefix, 31);
+        }
+    }
+
+    struct Source { uint32_t rank, slot; };
+    CUTLASS_DEVICE Source resolve(uint32_t row, uint32_t lane) const {
+        Source source{kNumRanks, 0};
+        #pragma unroll
+        for (uint32_t chunk = 0; chunk < kChunks; ++chunk) {
+            const uint32_t mask = __ballot_sync(0xffffffffu,
+                chunk * 32 + lane < kNumRanks && row >= begin[chunk] && row < end[chunk]);
+            if (mask) {
+                const uint32_t owner = uint32_t(__ffs(mask) - 1);
+                source = {chunk * 32 + owner,
+                          row - __shfl_sync(0xffffffffu, begin[chunk], owner)};
+            }
+        }
+        return source;
+    }
+};
+
 template <
     uint32_t kNumRanks, uint32_t kNumCTAs, uint32_t kNumThreads,
     uint32_t kNumExperts, uint32_t kNumExpertsPerRank, uint32_t kNumTopk>
@@ -182,152 +229,6 @@ CUTLASS_DEVICE void dispatch_handshake(
     comm::cross_rank_barrier<kNumRanks, kNumCTAs, kNumThreads, /*idx=*/0,
                          /*tag=*/0>(
         workspace, sym_buffer, cta_idx, thread_idx, block_sync, true, true);
-}
-
-// Dispatch E4M3-token rows to expert-major local pools.  Every CTA remains
-// resident for the two global barriers; then one CTA owns each local expert's
-// pool rows, avoiding a second inter-CTA handoff before grouped GEMM.
-template <
-    uint32_t kNumRanks, uint32_t kNumCTAs, uint32_t kNumThreads,
-    uint32_t kNumExperts, uint32_t kNumExpertsPerRank, uint32_t kNumTopk,
-    uint32_t kBlockM, uint32_t kTokenBytes, uint32_t kNumScales = 1>
-CUTLASS_DEVICE void
-dispatch_fp8_device(
-        void* workspace_base,
-        const layout::SymBuffer<kNumRanks> sym_buffer,
-        const int64_t* __restrict__ input_topk_idx,
-        const float* __restrict__ input_topk_weights,
-        const uint8_t* __restrict__ input_token,
-        const float* __restrict__ input_scale,
-        uint8_t* __restrict__ token_pool,
-        float* __restrict__ scale_pool,
-        float* __restrict__ topk_weight_pool,
-        const uint32_t num_tokens,
-        const uint32_t num_max_tokens_per_rank,
-        unsigned char* smem_buf) {
-    static_assert(kNumThreads >= 32 && kNumThreads % 32 == 0,
-                  "dispatch CTA must contain whole warps");
-    static_assert(kTokenBytes % 16 == 0,
-                  "FP8 dispatch requires 16-byte aligned rows");
-
-    const uint32_t cta_idx = blockIdx.x;
-    const uint32_t thread_idx = threadIdx.x;
-    const uint32_t warp_idx = thread_idx / 32;
-    const uint32_t lane_idx = thread_idx % 32;
-    constexpr uint32_t kNumWarps = kNumThreads / 32;
-
-    const layout::Workspace workspace(
-        workspace_base, kNumRanks, kNumExperts, num_max_tokens_per_rank,
-        kNumTopk);
-    auto* smem_expert_count = reinterpret_cast<uint32_t*>(smem_buf);
-    constexpr uint32_t kCountBytes = kNumExperts * sizeof(uint32_t);
-    constexpr uint32_t kTokenScratchOffset = (kCountBytes + 15u) & ~15u;
-    uint8_t* smem_token =
-        smem_buf + kTokenScratchOffset + warp_idx * kTokenBytes;
-    const auto block_sync = [=]() { __syncthreads(); };
-
-    mega_moe::detail::dispatch_handshake<
-        kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank,
-        kNumTopk>(
-        workspace, sym_buffer, input_topk_idx, smem_expert_count, num_tokens,
-        cta_idx, thread_idx);
-
-    const layout::Gemm2Metadata gemm2_meta(
-        topk_weight_pool + workspace.num_max_pool_tokens, kNumExpertsPerRank);
-    // The workspace reserves each expert an independently padded kBlockM
-    // range, shared by dispatch, grouped GEMM and GEMM2 scatter.
-    for (uint32_t e = cta_idx; e < kNumExpertsPerRank; e += kNumCTAs) {
-        uint32_t pool_base = 0;
-        for (uint32_t prior = 0; prior < e; ++prior) {
-            const uint32_t prior_recv = static_cast<uint32_t>(
-                *workspace.get_expert_recv_count_sum_ptr(prior));
-            pool_base += math::ceil_div(prior_recv, kBlockM) * kBlockM;
-        }
-        const uint32_t num_recv = static_cast<uint32_t>(
-            *workspace.get_expert_recv_count_sum_ptr(e));
-
-        if (thread_idx == 0) {
-            const uint32_t padded = math::ceil_div(num_recv, kBlockM) * kBlockM;
-            gemm2_meta.store_rows(e, num_recv, padded, pool_base, padded, pool_base);
-        }
-
-        // The first kNumRanks lanes load this expert's source ranges in
-        // parallel.  All rows assigned to this warp reuse the resulting
-        // inclusive prefix instead of lane 0 scanning every rank per row.
-        uint32_t src_count = lane_idx < kNumRanks
-            ? static_cast<uint32_t>(
-                  *workspace.get_expert_recv_count_ptr(lane_idx, e))
-            : 0;
-        uint32_t src_end = src_count;
-        #pragma unroll
-        for (uint32_t offset = 1; offset < kNumRanks; offset <<= 1) {
-            const uint32_t value =
-                __shfl_up_sync(0xffffffffu, src_end, offset);
-            if (lane_idx >= offset)
-                src_end += value;
-        }
-        const uint32_t src_begin = src_end - src_count;
-
-        for (uint32_t local_row = warp_idx; local_row < num_recv;
-             local_row += kNumWarps) {
-            const uint32_t src_mask = __ballot_sync(
-                0xffffffffu, lane_idx < kNumRanks &&
-                    local_row >= src_begin && local_row < src_end);
-            const uint32_t src_rank =
-                static_cast<uint32_t>(__ffs(src_mask) - 1);
-            const uint32_t range_begin = __shfl_sync(
-                0xffffffffu, src_begin, src_rank);
-            const uint32_t src_slot = local_row - range_begin;
-            uint32_t src_token_topk = 0;
-            if (lane_idx == 0)
-                src_token_topk = *workspace.get_src_token_topk_idx_ptr(
-                    e, src_rank, src_slot);
-            src_token_topk = __shfl_sync(0xffffffffu, src_token_topk, 0);
-
-            const uint32_t src_token = src_token_topk / kNumTopk;
-            const uint32_t src_topk = src_token_topk % kNumTopk;
-            const uint32_t pool_row = pool_base + local_row;
-            const uint8_t* src_token_ptr = sym_buffer.map(
-                input_token + static_cast<uint64_t>(src_token) * kTokenBytes,
-                src_rank);
-
-            mega_moe::detail::warp_async_copy_global_to_shared(
-                smem_token, src_token_ptr, kTokenBytes, lane_idx);
-            // Input scales are token-major; the landing pool is K-group
-            // major so the native blockwise GEMM can consume it directly.
-            for (uint32_t sf = lane_idx; sf < kNumScales; sf += 32) {
-                const float value = *sym_buffer.map(
-                    input_scale + static_cast<uint64_t>(src_token) * kNumScales + sf,
-                    src_rank);
-                scale_pool[static_cast<uint64_t>(sf)
-                           * workspace.num_max_pool_tokens + pool_row] = value;
-            }
-            float topk_weight = 0.0f;
-            if (lane_idx == 0) {
-                topk_weight = *sym_buffer.map(
-                    input_topk_weights + src_token_topk, src_rank);
-            }
-            asm volatile("" ::: "memory");
-            cute::cp_async_wait<0>();
-            __syncwarp();
-            mega_moe::detail::warp_copy_bytes(
-                token_pool + static_cast<uint64_t>(pool_row) * kTokenBytes,
-                smem_token, kTokenBytes, lane_idx);
-
-            if (lane_idx == 0) {
-                topk_weight_pool[pool_row] = topk_weight;
-                *workspace.get_token_src_metadata_ptr(pool_row) = {
-                    src_rank, src_token, src_topk};
-                gemm2_meta.store_route(pool_row, src_rank, src_token, src_topk);
-            }
-            __syncwarp();
-        }
-    }
-
-    // The caller reads recv_count_sum and token_src_metadata after this kernel;
-    // do not clear dispatch counters until its G2/scatter phase completes.
-    comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/1>(
-        workspace, cta_idx, thread_idx, block_sync);
 }
 
 }  // namespace deep_gemm::mega_moe::detail

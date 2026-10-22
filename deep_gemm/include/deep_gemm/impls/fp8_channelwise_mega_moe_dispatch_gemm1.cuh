@@ -2,13 +2,13 @@
 
 // Channelwise FP8 fused MegaMoE; shared routing is independent of GEMM dtype/layout.
 #include <deep_gemm/impls/fp8_mega_moe_transport.cuh>
+#include <deep_gemm/scheduler/mega_moe_work_queue.cuh>
 #include <deep_gemm/impls/fp8_channelwise_mega_moe_gemm1_mma.cuh>
 
 namespace deep_gemm::mega_moe::fp8_channelwise {
 
 // Cache the BF16 pairs loaded for amax and reuse them for FP8 conversion.
-// The measured 3072-wide activation needs 48 packed pairs per lane. Keep
-// the existing helper for other shapes to avoid increasing register demand.
+// Complete 512-element warp iterations keep every cached vector in bounds.
 template <int kHidden>
 CUTLASS_DEVICE void warp_quantize_bf16_row_cached(
         const __ppu_bfloat16* __restrict__ input,
@@ -66,34 +66,46 @@ CUTLASS_DEVICE void warp_quantize_bf16_row_cached(
     }
 }
 
-// Quantize valid expert-major rows after a stream-ordered GEMM boundary.
-// Keeping this stage separate avoids extending persistent GEMM register
-// lifetimes through the whole-grid quantization rendezvous.
-template <uint32_t kEPR, uint32_t kWidth, uint32_t kBlockM>
-CUTLASS_DEVICE void fp8_mega_moe_quantize_local_pool_kernel_device(
-        const int64_t* counts, const __ppu_bfloat16* input,
+// Quantize one row using cached vectors or a predicated vector tail.
+// Cached conversion requires complete 512-element warp iterations; the
+// generic loader predicates the last 16-element vectors for narrower tails.
+template <int kHidden>
+CUTLASS_DEVICE void warp_quantize_bf16_row_common(
+    const __ppu_bfloat16* input, cutlass::float_e4m3_t* output,
+    float* scales, uint32_t row, uint32_t lane) {
+    if constexpr (kHidden % 512 == 0)
+        warp_quantize_bf16_row_cached<kHidden>(input, output, scales, row, lane);
+    else
+        mega_moe::detail::warp_quantize_bf16_row<kHidden>(input, output, scales, row, lane);
+}
+
+// Flatten valid expert rows for quantization, then map back to pool offsets.
+// The physical activation layout and GEMM2 metadata remain unchanged.
+template <uint32_t kEPR, uint32_t kWidth>
+CUTLASS_DEVICE void fp8_mega_moe_quantize_valid_pool_kernel_device(
+        const int32_t* metadata, const __ppu_bfloat16* input,
         cutlass::float_e4m3_t* output, float* scales) {
     static_assert(kEPR > 0 && kEPR <= 128);
+    const layout::Gemm2Metadata meta(const_cast<int32_t*>(metadata), kEPR);
     constexpr uint32_t kChunks = (kEPR + 31) / 32;
     const uint32_t lane = threadIdx.x % 32;
-    const uint32_t warps = blockDim.x / 32;
-    const uint32_t warp = blockIdx.x * warps + threadIdx.x / 32;
-    uint32_t rows[kChunks], begin[kChunks], end[kChunks];
-    uint32_t base = 0;
+    const uint32_t warp = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    uint32_t begin[kChunks], end[kChunks], source[kChunks];
+    uint32_t total = 0;
     #pragma unroll
     for (uint32_t chunk = 0; chunk < kChunks; ++chunk) {
         const uint32_t expert = chunk * 32 + lane;
-        rows[chunk] = expert < kEPR ? static_cast<uint32_t>(counts[expert]) : 0;
-        const uint32_t blocks = math::ceil_div(rows[chunk], kBlockM);
-        uint32_t prefix = blocks;
+        const uint32_t rows = expert < kEPR ? meta.valid_rows[expert] : 0;
+        source[chunk] = expert < kEPR ? meta.src_offsets[expert] : 0;
+        uint32_t prefix = rows;
         #pragma unroll
         for (uint32_t off = 1; off < 32; off <<= 1) {
             const uint32_t value = __shfl_up_sync(0xffffffffu, prefix, off);
             if (lane >= off) prefix += value;
         }
-        begin[chunk] = (base + prefix - blocks) * kBlockM;
-        end[chunk] = (base + prefix) * kBlockM;
-        base += __shfl_sync(0xffffffffu, prefix, 31);
+        begin[chunk] = total + prefix - rows;
+        end[chunk] = total + prefix;
+        total += __shfl_sync(0xffffffffu, prefix, 31);
     }
     const auto at = [&](const uint32_t* values, uint32_t expert) {
         uint32_t value = 0;
@@ -103,19 +115,12 @@ CUTLASS_DEVICE void fp8_mega_moe_quantize_local_pool_kernel_device(
         return __shfl_sync(0xffffffffu, value, expert % 32);
     };
     uint32_t expert = 0;
-    for (uint32_t row = warp; row < base * kBlockM; row += gridDim.x * warps) {
+    for (uint32_t row = warp; row < total; row += gridDim.x * (blockDim.x / 32)) {
         while (expert < kEPR && row >= at(end, expert)) ++expert;
         if (expert >= kEPR) break;
-        if (row - at(begin, expert) < at(rows, expert))
-            warp_quantize_bf16_row_cached<kWidth>(input, output, scales, row, lane);
+        const uint32_t pool_row = at(source, expert) + row - at(begin, expert);
+        warp_quantize_bf16_row_common<kWidth>(input, output, scales, pool_row, lane);
     }
-}
-
-template <uint32_t kEPR, uint32_t kWidth, uint32_t kBlockM>
-__global__ void fp8_mega_moe_quantize_local_pool_kernel(
-        const int64_t* counts, const __ppu_bfloat16* input,
-        cutlass::float_e4m3_t* output, float* scales) {
-    fp8_mega_moe_quantize_local_pool_kernel_device<kEPR, kWidth, kBlockM>(counts, input, output, scales);
 }
 
 template <
@@ -124,9 +129,8 @@ template <
     uint32_t kBlockM, uint32_t kTokenBytes, uint32_t kGemm1N,
     uint32_t kBlockN, uint32_t kBlockK, uint32_t kWarpM,
     uint32_t kWarpN, uint32_t kStages, uint32_t kNumPullCTAs,
-    bool kQuantizeOutput = false,
     bool kPairedBlockPull = false, bool kTripleBlockPull = false,
-    bool kSwiGLUOAI = false>
+    bool kSwiGLUOAI = false, bool kDynamicWork = false>
 CUTLASS_DEVICE void dispatch_gemm1_device(
         void* workspace_base,
         const layout::SymBuffer<kNumRanks>& sym_buffer,
@@ -143,8 +147,6 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         const float* __restrict__ gemm1_weight_scale_replicas,
         const uint32_t num_master_experts,
         __ppu_bfloat16* __restrict__ swiglu_output,
-        cutlass::float_e4m3_t* __restrict__ quant_output,
-        float* __restrict__ quant_scale,
         const float swiglu_limit,
         const float swiglu_alpha,
         const uint32_t num_tokens,
@@ -253,6 +255,17 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         return __shfl_sync(0xffffffffu, local_begin, e % 32);
     };
 
+    auto* queue_counter = workspace.get_gemm1_work_count_ptr();
+    // Mainloop returns after its final CTA barrier; its storage is free
+    // until the next tile. The register-only activation leaves this word intact.
+    // The scale copy occupies the first M*sizeof(float) bytes of one A stage.
+    // Keep the ticket outside that range. MMA can overwrite it only after all
+    // threads consumed its value and passed the epilogue rendezvous.
+    static_assert(kBlockM * sizeof(float) + sizeof(uint32_t) <= kBlockM * kBlockK);
+    auto& queue_ticket = *reinterpret_cast<uint32_t*>(smem_buf + kBlockM * sizeof(float));
+    const mega_moe::WorkQueue queue{queue_counter, &queue_ticket};
+    if constexpr (kDynamicWork)
+        if (cta_idx == 0 && thread_idx == 0) *queue_counter = 0;
     // Arrival counters are persistent workspace state. Clear the exact active
     // prefix before producer and consumer CTAs diverge.
     for (uint32_t g = cta_idx * kNumThreads + thread_idx;
@@ -403,7 +416,14 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                 ptx::red_add_rel(
                     workspace.get_l1_arrival_count_ptr(g), 1u);
         }
-    } else {
+    }
+    if (kDynamicWork || cta_idx >= kNumPullCTAs) {
+        uint32_t prefetched_work = 0;
+        if constexpr (kDynamicWork) {
+            queue.prime(thread_idx);
+            prefetched_work = queue.current();
+            __syncthreads(); // first claim only: every warp retires the shared word
+        }
         // Consumer CTAs schedule the complete grouped-GEMM work list while
         // waiting only for the M block they need. This is the actual
         // producer/consumer overlap missing from the previous fused kernel.
@@ -412,8 +432,12 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         uint32_t current_expert = 0;
         uint32_t current_block_begin = 0;
         while (true) {
-            const uint32_t work_idx =
-                current_iter++ * kNumGemmCTAs + gemm_sm_idx;
+            uint32_t work_idx;
+            if constexpr (kDynamicWork) {
+                work_idx = prefetched_work;
+            } else {
+                work_idx = current_iter++ * kNumGemmCTAs + gemm_sm_idx;
+            }
             if (work_idx >= total_work)
                 break;
 
@@ -458,12 +482,10 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
             const uint32_t valid_m = mega_moe::detail::umin(
                 kBlockM, group_m - m_block * kBlockM);
 
+            constexpr uint32_t kRequiredArrivals =
+                kNumPullCTAs / (kTripleBlockPull ? 3 : kPairedBlockPull ? 2 : 1);
             while (ptx::ld_acq(
-                       workspace.get_l1_arrival_count_ptr(global_m_block))
-                   < (kTripleBlockPull
-                          ? kNumPullCTAs / 3
-                          : (kPairedBlockPull
-                                 ? kNumPullCTAs / 2 : kNumPullCTAs)));
+                       workspace.get_l1_arrival_count_ptr(global_m_block)) < kRequiredArrivals);
 
             const bool use_replica =
                 current_expert >= num_master_experts;
@@ -496,53 +518,14 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                 static_cast<int>(kTokenBytes),
                 static_cast<int>(thread_idx),
                 reinterpret_cast<char*>(smem_buf),
-                swiglu_limit, swiglu_alpha);
+                swiglu_limit, swiglu_alpha,
+                kDynamicWork ? queue_counter : nullptr,
+                kDynamicWork ? &queue_ticket : nullptr,
+                kDynamicWork ? &prefetched_work : nullptr);
         }
     }
 
-    if constexpr (kQuantizeOutput) {
-        // Producers and consumers must rendezvous before the whole-row
-        // quantizer can redistribute valid rows across the complete grid.
-        comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/1,
-                        /*kPollBackoffCycles=*/128>(
-            workspace, cta_idx, thread_idx, block_sync);
 
-        const uint32_t quant_warp = cta_idx * kNumWarps + warp_idx;
-        constexpr uint32_t kQuantWarpStride = kNumCTAs * kNumWarps;
-        uint32_t quant_expert = 0;
-        for (uint32_t padded_row = quant_warp;
-             padded_row < total_m_blocks * kBlockM;
-             padded_row += kQuantWarpStride) {
-            const uint32_t global_m_block = padded_row / kBlockM;
-            const uint32_t row_in_block = padded_row % kBlockM;
-            while (quant_expert < kNumExpertsPerRank) {
-                const uint32_t begin = dget_block_begin(quant_expert);
-                const uint32_t blocks =
-                    math::ceil_div(dget_m(quant_expert), kBlockM);
-                if (global_m_block < begin + blocks)
-                    break;
-                ++quant_expert;
-            }
-            if (quant_expert >= kNumExpertsPerRank)
-                break;
-            const uint32_t expert_block_begin =
-                dget_block_begin(quant_expert);
-            const uint32_t expert_row =
-                (global_m_block - expert_block_begin) * kBlockM
-                + row_in_block;
-            if (expert_row < dget_m(quant_expert)) {
-                if constexpr (kSwiGLUOAI && kGemm1N == 6144) {
-                    mega_moe::fp8_channelwise::warp_quantize_bf16_row_cached<kGemm1N / 2>(
-                        swiglu_output, quant_output, quant_scale,
-                        padded_row, lane_idx);
-                } else {
-                    mega_moe::detail::warp_quantize_bf16_row<kGemm1N / 2>(
-                        swiglu_output, quant_output, quant_scale,
-                        padded_row, lane_idx);
-                }
-            }
-        }
-    }
 }
 
 template <
@@ -551,9 +534,8 @@ template <
     uint32_t kBlockM, uint32_t kTokenBytes, uint32_t kGemm1N,
     uint32_t kBlockN, uint32_t kBlockK, uint32_t kWarpM,
     uint32_t kWarpN, uint32_t kStages, uint32_t kNumPullCTAs,
-    bool kQuantizeOutput = false,
     bool kPairedBlockPull = false, bool kTripleBlockPull = false,
-    bool kSwiGLUOAI = false>
+    bool kSwiGLUOAI = false, bool kDynamicWork = false>
 __global__ __launch_bounds__(kNumThreads, 1) void
 dispatch_gemm1_kernel(
         void* workspace_base,
@@ -571,13 +553,11 @@ dispatch_gemm1_kernel(
         const float* __restrict__ gemm1_weight_scale_replicas,
         const uint32_t num_master_experts,
         __ppu_bfloat16* __restrict__ swiglu_output,
-        cutlass::float_e4m3_t* __restrict__ quant_output,
-        float* __restrict__ quant_scale,
         const float swiglu_limit,
         const float swiglu_alpha,
         const uint32_t num_tokens,
         const uint32_t num_max_tokens_per_rank) {
-    dispatch_gemm1_device<kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank, kNumTopk, kBlockM, kTokenBytes, kGemm1N, kBlockN, kBlockK, kWarpM, kWarpN, kStages, kNumPullCTAs, kQuantizeOutput, kPairedBlockPull, kTripleBlockPull, kSwiGLUOAI>(workspace_base, sym_buffer, input_topk_idx, input_topk_weights, input_token, input_scale, token_pool, scale_pool, topk_weight_pool, gemm1_weight, gemm1_weight_scale, gemm1_weight_replicas, gemm1_weight_scale_replicas, num_master_experts, swiglu_output, quant_output, quant_scale, swiglu_limit, swiglu_alpha, num_tokens, num_max_tokens_per_rank);
+    dispatch_gemm1_device<kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank, kNumTopk, kBlockM, kTokenBytes, kGemm1N, kBlockN, kBlockK, kWarpM, kWarpN, kStages, kNumPullCTAs, kPairedBlockPull, kTripleBlockPull, kSwiGLUOAI, kDynamicWork>(workspace_base, sym_buffer, input_topk_idx, input_topk_weights, input_token, input_scale, token_pool, scale_pool, topk_weight_pool, gemm1_weight, gemm1_weight_scale, gemm1_weight_replicas, gemm1_weight_scale_replicas, num_master_experts, swiglu_output, swiglu_limit, swiglu_alpha, num_tokens, num_max_tokens_per_rank);
 }
 
 }  // namespace deep_gemm::mega_moe::fp8_channelwise

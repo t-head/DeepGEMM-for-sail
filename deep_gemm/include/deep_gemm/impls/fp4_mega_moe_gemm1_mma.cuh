@@ -181,7 +181,8 @@ struct Gemm1MmaConfig {
         typename GemmOperandA::GmemTiledCopy, typename GemmOperandA::SmemLayoutAtom, typename GemmOperandA::SmemCopyAtom, TransformA,
         typename GemmOperandB::GmemTiledCopy, typename GemmOperandB::SmemLayoutAtom, typename GemmOperandB::SmemCopyAtom, TransformB,
         ElementSFA, StrideSFA, typename GemmOperandSFA::GmemTiledCopy, typename GemmOperandSFA::SmemLayoutAtom,
-        ElementSFB, StrideSFB, typename GemmOperandSFB::GmemTiledCopy, typename GemmOperandSFB::SmemLayoutAtom>;
+        ElementSFB, StrideSFB, typename GemmOperandSFB::GmemTiledCopy, typename GemmOperandSFB::SmemLayoutAtom,
+        FP4DynamicTileId::Disabled, -1>;
     using WideCollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaScaleFp4<
         DispatchPolicy, TileShapeMNK,
         ElementA, StrideA,
@@ -242,12 +243,6 @@ struct Gemm1PickStage<BlockM, BlockN, BlockK, WarpM, WarpN, 1,
 // N-major SFB. `smem_buf` must be >= sizeof(CollectiveMainloop::SharedStorage).
 // M/N/K are the (compile-time-valued) BlockM / N / K_packed.
 // ----------------------------------------------------------------------------
-// NOTE: marked __noinline__ on purpose. At real DeepSeek-V4 scale K=7168
-// (K_packed=3584) the CUTLASS mainloop fully unrolls ~112 K-tiles; if this is
-// inlined into the giant fused dispatch+gemm1 cooperative kernel, LLVM `opt`
-// optimizes the whole blown-up function and compile time explodes (>15min and
-// climbing). Keeping it a separate function caps `opt` to this body alone and
-// makes the N-tile loop just call it, so compile stays bounded.
 template <class Cfg, bool kQuantizeOutput = false,
           bool kSituTanhBf16x2 = false,
           bool kFusedSitu = false,
@@ -271,10 +266,7 @@ __device__ __forceinline__ void gemm1_mma_block(
     uint8_t* __restrict__ fp4_output = nullptr,    // [M, N/4] packed FP4 (kQuantizeOutput)
     uint8_t* __restrict__ scale_output = nullptr,  // byte view of packed/transposed uint16 E8M0 scales
     int ld_fp4 = 0,                      // leading dimension of fp4_output (bytes)
-    int ld_scale = 0,                    // byte stride between adjacent uint16 scale-pair rows
-    int rank = 0,                        // rank index (for debug only)
-    const float* __restrict__ topk_weights_pool = nullptr,  // [num_pool] per-token routing weights
-    int pool_base = 0) {                 // base offset in pool for this M-block
+    int ld_scale = 0) {                  // byte stride between adjacent uint16 scale-pair rows
 
     using namespace cute;
     using CollectiveMainloop = typename Cfg::CollectiveMainloop;
@@ -334,8 +326,7 @@ __device__ __forceinline__ void gemm1_mma_block(
                    residue_mnk, thread_idx, smem_buf);
     }
 
-    // ---- epilogue: per-row predication + bf16x2 PTX ----
-    // Fused SwiGLU and SiTU-GLU share the G=8 interleaved gate/up layout and
+    // Fused activations use eight gate rows followed by eight up rows and
     // compact [M, N/2] output. The JIT embeds the selected mode and SiTU betas,
     // allowing the compiler to remove the inactive activation branch.
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
@@ -350,294 +341,105 @@ __device__ __forceinline__ void gemm1_mma_block(
     const bool fused_glu = fused_swiglu || fused_situ || kFusedSitu;
 
     if (fused_glu) {
-        // Fused SwiGLU: G=8 interleaved weights → mma_n=0=gate, mma_n=1=up.
-        // Pair (mma_n, mma_n+1), compute silu(clamp(gate))*clamp(up),
-        // write COMPACT bf16 output [M, N/2] (all swiglu results packed, no gaps).
-        // Thread-to-element mapping (16×16 MMA, 32 threads):
-        //   thread t holds 4 elements: (t/4, t%4*2), (t/4, t%4*2+1),
-        //   (t/4+8, t%4*2), (t/4+8, t%4*2+1) within the MMA tile.
-        // i=0 → row_a, cols 0,1; i=1 → row_b (+8), cols 0,1.
-        // tCcD already gives per-thread coordinates; no manual offset needed.
-        if constexpr (!kQuantizeOutput) {
+        constexpr int kTileM = int(cute::size<0>(TileShapeMNK{}));
+        constexpr int kTileN = int(cute::size<1>(TileShapeMNK{}));
+        constexpr int kCompactN = kTileN / 2;
+        constexpr int kCompactStride = kCompactN;
+        auto* compact_smem = reinterpret_cast<__ppu_bfloat16*>(smem_buf);
+        if constexpr (kQuantizeOutput) {
+            static_assert(kTileN % 128 == 0,
+                          "fused MXFP4 tile N must contain complete scale pairs");
+            static_assert(kTileM * kCompactStride * sizeof(__ppu_bfloat16) <=
+                              sizeof(typename CollectiveMainloop::SharedStorage),
+                          "compact epilogue must fit in mainloop shared memory");
+        }
+
+        // G8 stores gate/up in adjacent N fragments. Use the original MMA
+        // fragment coordinates for both BF16 output and BF16 quantization staging.
+        CUTLASS_PRAGMA_UNROLL
+        for (int warp_m = 0; warp_m < size<1>(tCgD); ++warp_m) {
             CUTLASS_PRAGMA_UNROLL
-            for (int warp_m = 0; warp_m < size<1>(tCgD); ++warp_m) {
+            for (int mma_m = 0; mma_m < size<1>(shape<0>(tCgD)); ++mma_m) {
+                const int base_m = get<0>(tCcD(
+                    make_coord(Int<0>{}, mma_m, Int<0>{}), warp_m, Int<0>{}));
+                if (base_m >= valid_m)
+                    continue;
                 CUTLASS_PRAGMA_UNROLL
-                for (int mma_m = 0; mma_m < size<1>(shape<0>(tCgD)); ++mma_m) {
-                    if (get<0>(tCcD(make_coord(Int<0>{}, mma_m, Int<0>{}), warp_m, Int<0>{})) < valid_m) {
-                        int base_m = get<0>(tCcD(make_coord(Int<0>{}, mma_m, Int<0>{}), warp_m, Int<0>{}));
-                        float topk_w0 = 1.0f;
-                        float topk_w1 = 1.0f;
-                        if (topk_weights_pool) {
-                            topk_w0 = __ldg(&topk_weights_pool[pool_base + base_m]);
-                            if (base_m + 8 < valid_m) {
-                                topk_w1 = __ldg(
-                                    &topk_weights_pool[pool_base + base_m + 8]);
-                            }
-                        }
+                for (int warp_n = 0; warp_n < size<2>(tCgD); ++warp_n) {
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int mma_n = 0; mma_n < size<2>(shape<0>(tCgD)); mma_n += 2) {
+                        auto gate_chunk = accum(make_coord(_, mma_m, mma_n), warp_m, warp_n);
+                        auto up_chunk = accum(make_coord(_, mma_m, mma_n + 1), warp_m, warp_n);
+                        const auto* g_acc = reinterpret_cast<const float*>(gate_chunk.data());
+                        const auto* u_acc = reinterpret_cast<const float*>(up_chunk.data());
+                        constexpr int kVec = int(cute::size(gate_chunk));
+                        const int tile_n = get<1>(tCcD(
+                            make_coord(Int<0>{}, mma_m, mma_n), warp_m, warp_n));
+                        const int compact_n = (tile_n / 16) * 8 + tile_n % 8;
                         CUTLASS_PRAGMA_UNROLL
-                        for (int warp_n = 0; warp_n < size<2>(tCgD); ++warp_n) {
-                            CUTLASS_PRAGMA_UNROLL
-                            for (int mma_n = 0; mma_n < size<2>(shape<0>(tCgD)); mma_n += 2) {
-                                auto gate_chunk = accum(make_coord(_, mma_m, mma_n), warp_m, warp_n);
-                                auto up_chunk   = accum(make_coord(_, mma_m, mma_n + 1), warp_m, warp_n);
-                                auto* g_acc = reinterpret_cast<const float*>(gate_chunk.data());
-                                auto* u_acc = reinterpret_cast<const float*>(up_chunk.data());
-                                constexpr int kVec = int(cute::size(gate_chunk));
-                                // Thread-level physical N (tCcD already per-thread)
-                                int tile_n = get<1>(tCcD(make_coord(Int<0>{}, mma_m, mma_n), warp_m, warp_n));
-                                // Compact N: with G=8 interleaving, gate at [0-7, 16-23, ...]
-                                int compact_n = (tile_n / 16) * 8 + (tile_n % 8);
-                                CUTLASS_PRAGMA_UNROLL
-                                for (int i = 0; i < kVec / 2; ++i) {
-                                    // SM100-aligned: fp32→bf16→clamp(bf16)→fp32→silu→mul
-                                    __ppu_bfloat162 bg = __float22bfloat162_rn(make_float2(g_acc[2*i], g_acc[2*i+1]));
-                                    __ppu_bfloat162 bu = __float22bfloat162_rn(make_float2(u_acc[2*i], u_acc[2*i+1]));
-                                    if (clamp_limit > 0.0f) {
-                                        __ppu_bfloat16 cb = __float2bfloat16(clamp_limit);
-                                        __ppu_bfloat162 c = {cb, cb};
-                                        __ppu_bfloat162 nc = {__float2bfloat16(-clamp_limit), __float2bfloat16(-clamp_limit)};
-                                        if constexpr (!kSiluThenClamp)
-                                            bg = __hmin2(bg, c);
-                                        bu = __hmax2(bu, nc);
-                                        bu = __hmin2(bu, c);
-                                    }
-                                    float2 gf = __bfloat1622float2(bg);
-                                    float2 uf = __bfloat1622float2(bu);
-                                    float lhs0, lhs1, rhs0, rhs1;
-                                    if (kFusedSitu || fused_situ) {
-                                        const float inv_beta = 1.0f / situ_beta;
-                                        const float inv_linear_beta =
-                                            1.0f / situ_linear_beta;
-                                        if constexpr (kSituTanhBf16x2) {
-                                            const __ppu_bfloat162 gate_arg =
-                                                __hmul2(
-                                                    bg,
-                                                    __float2bfloat162_rn(
-                                                        inv_beta));
-                                            const __ppu_bfloat162 up_arg =
-                                                __hmul2(
-                                                    bu,
-                                                    __float2bfloat162_rn(
-                                                        inv_linear_beta));
-                                            const float2 gate_tanh =
-                                                __bfloat1622float2(
-                                                    ppu_tanh_approx_bf16x2(gate_arg));
-                                            const float2 up_tanh =
-                                                __bfloat1622float2(
-                                                    ppu_tanh_approx_bf16x2(up_arg));
-                                            lhs0 = situ_beta * gate_tanh.x
-                                                * __ppu_sgmdf(gf.x);
-                                            lhs1 = situ_beta * gate_tanh.y
-                                                * __ppu_sgmdf(gf.y);
-                                            rhs0 = situ_linear_beta * up_tanh.x;
-                                            rhs1 = situ_linear_beta * up_tanh.y;
-                                        } else {
-                                            lhs0 = situ_beta
-                                                * cutlass::fast_tanh(gf.x * inv_beta)
-                                                * __ppu_sgmdf(gf.x);
-                                            lhs1 = situ_beta
-                                                * cutlass::fast_tanh(gf.y * inv_beta)
-                                                * __ppu_sgmdf(gf.y);
-                                            rhs0 = situ_linear_beta
-                                                * cutlass::fast_tanh(uf.x * inv_linear_beta);
-                                            rhs1 = situ_linear_beta
-                                                * cutlass::fast_tanh(uf.y * inv_linear_beta);
-                                        }
-                                    } else {
-                                        float denom0 = 1.0f + __expf(-gf.x);
-                                        float denom1 = 1.0f + __expf(-gf.y);
-                                        float rcp0, rcp1;
-                                        asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp0) : "f"(denom0));
-                                        asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp1) : "f"(denom1));
-                                        lhs0 = gf.x * rcp0;
-                                        lhs1 = gf.y * rcp1;
-                                        rhs0 = uf.x;
-                                        rhs1 = uf.y;
-                                    }
-                                    if constexpr (kSiluThenClamp) {
-                                        if (clamp_limit > 0.0f) {
-                                            lhs0 = fminf(lhs0, clamp_limit);
-                                            lhs1 = fminf(lhs1, clamp_limit);
-                                        }
-                                    }
-                                    // Row for this i: i=0→row_a, i=1→row_b (+8)
-                                    int m_row = base_m + i * 8;
-                                    if (m_row >= valid_m)
-                                        continue;
-                                    float w = (i == 0) ? topk_w0 : topk_w1;
-                                    __ppu_bfloat16* out = d_ptr + (uint64_t)m_row * ld_d + compact_n;
-                                    out[0] = __float2bfloat16(lhs0 * rhs0 * w);
-                                    out[1] = __float2bfloat16(lhs1 * rhs1 * w);
+                        for (int i = 0; i < kVec / 2; ++i) {
+                            auto bg = __float22bfloat162_rn(make_float2(g_acc[2 * i], g_acc[2 * i + 1]));
+                            auto bu = __float22bfloat162_rn(make_float2(u_acc[2 * i], u_acc[2 * i + 1]));
+                            if (clamp_limit > 0.0f) {
+                                const auto limit = __float2bfloat162_rn(clamp_limit);
+                                const auto neg_limit = __float2bfloat162_rn(-clamp_limit);
+                                if constexpr (!kSiluThenClamp)
+                                    bg = __hmin2(bg, limit);
+                                bu = __hmin2(__hmax2(bu, neg_limit), limit);
+                            }
+                            const float2 gf = __bfloat1622float2(bg);
+                            const float2 uf = __bfloat1622float2(bu);
+                            float lhs0, lhs1, rhs0, rhs1;
+                            if (kFusedSitu || fused_situ) {
+                                const float inv_beta = 1.0f / situ_beta;
+                                const float inv_linear_beta = 1.0f / situ_linear_beta;
+                                if constexpr (kSituTanhBf16x2) {
+                                    const auto gate_arg = __hmul2(bg, __float2bfloat162_rn(inv_beta));
+                                    const auto up_arg = __hmul2(bu, __float2bfloat162_rn(inv_linear_beta));
+                                    const float2 gate_tanh = __bfloat1622float2(ppu_tanh_approx_bf16x2(gate_arg));
+                                    const float2 up_tanh = __bfloat1622float2(ppu_tanh_approx_bf16x2(up_arg));
+                                    lhs0 = situ_beta * gate_tanh.x * __ppu_sgmdf(gf.x);
+                                    lhs1 = situ_beta * gate_tanh.y * __ppu_sgmdf(gf.y);
+                                    rhs0 = situ_linear_beta * up_tanh.x;
+                                    rhs1 = situ_linear_beta * up_tanh.y;
+                                } else {
+                                    lhs0 = situ_beta * cutlass::fast_tanh(gf.x * inv_beta) * __ppu_sgmdf(gf.x);
+                                    lhs1 = situ_beta * cutlass::fast_tanh(gf.y * inv_beta) * __ppu_sgmdf(gf.y);
+                                    rhs0 = situ_linear_beta * cutlass::fast_tanh(uf.x * inv_linear_beta);
+                                    rhs1 = situ_linear_beta * cutlass::fast_tanh(uf.y * inv_linear_beta);
                                 }
+                            } else {
+                                lhs0 = gf.x * __ppu_sgmdf(gf.x);
+                                lhs1 = gf.y * __ppu_sgmdf(gf.y);
+                                rhs0 = uf.x;
+                                rhs1 = uf.y;
+                            }
+                            if constexpr (kSiluThenClamp) {
+                                if (clamp_limit > 0.0f) {
+                                    lhs0 = fminf(lhs0, clamp_limit);
+                                    lhs1 = fminf(lhs1, clamp_limit);
+                                }
+                            }
+                            const int row = base_m + i * 8;
+                            if (row >= valid_m)
+                                continue;
+                            if constexpr (kQuantizeOutput) {
+                                auto* out = compact_smem + uint64_t(row) * kCompactStride + compact_n;
+                                out[0] = __float2bfloat16(lhs0 * rhs0);
+                                out[1] = __float2bfloat16(lhs1 * rhs1);
+                            } else {
+                                auto* out = d_ptr + uint64_t(row) * ld_d + compact_n;
+                                out[0] = __float2bfloat16(lhs0 * rhs0);
+                                out[1] = __float2bfloat16(lhs1 * rhs1);
                             }
                         }
                     }
                 }
             }
         }
-
-        // Block-local two-phase epilogue. First run the production SwiGLU +
-        // top-k epilogue and materialize only the compact BF16 result in the
-        // mainloop shared-memory arena. After the barrier, remap each subwarp
-        // to one row and perform only MXFP4 quantization. This keeps the accumulator
-        // dead across the barrier without a raw HBM round-trip or grid sync.
+        // BF16 output is written directly. MXFP4 stages BF16 activations in
+        // shared memory, then remaps each subwarp to one row for quantization.
         if constexpr (kQuantizeOutput) {
-            constexpr int kTileM = int(cute::size<0>(TileShapeMNK{}));
-            constexpr int kTileN = int(cute::size<1>(TileShapeMNK{}));
-            constexpr int kCompactN = kTileN / 2;
-            static_assert(kTileN % 128 == 0,
-                          "fused MXFP4 tile N must contain complete scale pairs");
-            static_assert(
-                kTileM * kCompactN * sizeof(__ppu_bfloat16) <=
-                    sizeof(typename CollectiveMainloop::SharedStorage),
-                "compact BF16 epilogue must fit in mainloop shared memory");
-            auto* compact_smem =
-                reinterpret_cast<__ppu_bfloat16*>(smem_buf);
-
-            // Phase 1: exactly the production numerical path:
-            // FP32 accum -> BF16 gate/up -> BF16 clamp -> FP32 SwiGLU/top-k
-            // -> BF16 result. Store [M, N/2] compact BF16 in row-major shared.
-            CUTLASS_PRAGMA_UNROLL
-            for (int warp_m = 0; warp_m < size<1>(tCgD); ++warp_m) {
-                CUTLASS_PRAGMA_UNROLL
-                for (int mma_m = 0; mma_m < size<1>(shape<0>(tCgD)); ++mma_m) {
-                    const int base_m = get<0>(tCcD(
-                        make_coord(Int<0>{}, mma_m, Int<0>{}),
-                        warp_m, Int<0>{}));
-                    if (base_m < valid_m) {
-                        float topk_w0 = 1.0f;
-                        float topk_w1 = 1.0f;
-                        if (topk_weights_pool) {
-                            topk_w0 = __ldg(
-                                topk_weights_pool + pool_base + base_m);
-                            if (base_m + 8 < valid_m) {
-                                topk_w1 = __ldg(
-                                    topk_weights_pool + pool_base + base_m + 8);
-                            }
-                        }
-                        CUTLASS_PRAGMA_UNROLL
-                        for (int warp_n = 0;
-                             warp_n < size<2>(tCgD); ++warp_n) {
-                            CUTLASS_PRAGMA_UNROLL
-                            for (int mma_n = 0;
-                                 mma_n < size<2>(shape<0>(tCgD));
-                                 mma_n += 2) {
-                                auto gate_chunk = accum(
-                                    make_coord(_, mma_m, mma_n),
-                                    warp_m, warp_n);
-                                auto up_chunk = accum(
-                                    make_coord(_, mma_m, mma_n + 1),
-                                    warp_m, warp_n);
-                                const auto* g_acc =
-                                    reinterpret_cast<const float*>(
-                                        gate_chunk.data());
-                                const auto* u_acc =
-                                    reinterpret_cast<const float*>(
-                                        up_chunk.data());
-                                constexpr int kVec =
-                                    int(cute::size(gate_chunk));
-                                const int tile_n = get<1>(tCcD(
-                                    make_coord(Int<0>{}, mma_m, mma_n),
-                                    warp_m, warp_n));
-                                const int compact_n =
-                                    (tile_n / 16) * 8 + tile_n % 8;
-                                CUTLASS_PRAGMA_UNROLL
-                                for (int i = 0; i < kVec / 2; ++i) {
-                                    __ppu_bfloat162 bg =
-                                        __float22bfloat162_rn(make_float2(
-                                            g_acc[2 * i], g_acc[2 * i + 1]));
-                                    __ppu_bfloat162 bu =
-                                        __float22bfloat162_rn(make_float2(
-                                            u_acc[2 * i], u_acc[2 * i + 1]));
-                                    if (clamp_limit > 0.0f) {
-                                        const __ppu_bfloat16 cb =
-                                            __float2bfloat16(clamp_limit);
-                                        const __ppu_bfloat162 c = {cb, cb};
-                                        const __ppu_bfloat162 nc = {
-                                            __float2bfloat16(-clamp_limit),
-                                            __float2bfloat16(-clamp_limit)};
-                                        if constexpr (!kSiluThenClamp)
-                                            bg = __hmin2(bg, c);
-                                        bu = __hmax2(bu, nc);
-                                        bu = __hmin2(bu, c);
-                                    }
-                                    const float2 gf =
-                                        __bfloat1622float2(bg);
-                                    const float2 uf =
-                                        __bfloat1622float2(bu);
-                                    float lhs0, lhs1, rhs0, rhs1;
-                                    if (kFusedSitu || fused_situ) {
-                                        const float inv_beta =
-                                            1.0f / situ_beta;
-                                        const float inv_linear_beta =
-                                            1.0f / situ_linear_beta;
-                                        if constexpr (kSituTanhBf16x2) {
-                                            const __ppu_bfloat162 gate_arg =
-                                                __hmul2(
-                                                    bg,
-                                                    __float2bfloat162_rn(
-                                                        inv_beta));
-                                            const __ppu_bfloat162 up_arg =
-                                                __hmul2(
-                                                    bu,
-                                                    __float2bfloat162_rn(
-                                                        inv_linear_beta));
-                                            const float2 gate_tanh =
-                                                __bfloat1622float2(
-                                                    ppu_tanh_approx_bf16x2(gate_arg));
-                                            const float2 up_tanh =
-                                                __bfloat1622float2(
-                                                    ppu_tanh_approx_bf16x2(up_arg));
-                                            lhs0 = situ_beta * gate_tanh.x
-                                                * __ppu_sgmdf(gf.x);
-                                            lhs1 = situ_beta * gate_tanh.y
-                                                * __ppu_sgmdf(gf.y);
-                                            rhs0 = situ_linear_beta * up_tanh.x;
-                                            rhs1 = situ_linear_beta * up_tanh.y;
-                                        } else {
-                                            lhs0 = situ_beta
-                                                * cutlass::fast_tanh(gf.x * inv_beta)
-                                                * __ppu_sgmdf(gf.x);
-                                            lhs1 = situ_beta
-                                                * cutlass::fast_tanh(gf.y * inv_beta)
-                                                * __ppu_sgmdf(gf.y);
-                                            rhs0 = situ_linear_beta
-                                                * cutlass::fast_tanh(
-                                                    uf.x * inv_linear_beta);
-                                            rhs1 = situ_linear_beta
-                                                * cutlass::fast_tanh(
-                                                    uf.y * inv_linear_beta);
-                                        }
-                                    } else {
-                                        lhs0 = gf.x * __ppu_sgmdf(gf.x);
-                                        lhs1 = gf.y * __ppu_sgmdf(gf.y);
-                                        rhs0 = uf.x;
-                                        rhs1 = uf.y;
-                                    }
-                                    if constexpr (kSiluThenClamp) {
-                                        if (clamp_limit > 0.0f) {
-                                            lhs0 = fminf(lhs0, clamp_limit);
-                                            lhs1 = fminf(lhs1, clamp_limit);
-                                        }
-                                    }
-                                    const int m_row = base_m + i * 8;
-                                    if (m_row >= valid_m)
-                                        continue;
-                                    const float w =
-                                        (i == 0) ? topk_w0 : topk_w1;
-                                    __ppu_bfloat16* out = compact_smem
-                                        + (uint64_t)m_row * kCompactN
-                                        + compact_n;
-                                    out[0] = __float2bfloat16(
-                                        lhs0 * rhs0 * w);
-                                    out[1] = __float2bfloat16(
-                                        lhs1 * rhs1 * w);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             __syncthreads();
 
             // Phase 2 mirrors silu_and_mul_post_quant_mxfp4's mapping:
@@ -671,7 +473,7 @@ __device__ __forceinline__ void gemm1_mma_block(
                 if (row_valid) {
                     const auto* src = reinterpret_cast<const __ppu_bfloat162*>(
                         compact_smem
-                        + (uint64_t)m_row * kCompactN + elem_base);
+                        + (uint64_t)m_row * kCompactStride + elem_base);
                     CUTLASS_PRAGMA_UNROLL
                     for (int i = 0; i < kElemPerThread / 2; ++i) {
                         const float2 value2 = __bfloat1622float2(src[i]);

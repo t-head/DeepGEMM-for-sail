@@ -982,7 +982,8 @@ struct CollectiveMma<
       ResidueMNK residue_mnk,
       int thread_idx,
       int warp_idx,
-      char *smem_buf) {
+      char *smem_buf,
+      uint32_t* queue_counter = nullptr, uint32_t* queue_ticket = nullptr) {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorD>::value, "D tensor must be rmem resident.");
@@ -1247,6 +1248,8 @@ CUTLASS_PRAGMA_UNROLL
       }
     }
 
+    if (queue_counter != nullptr && thread_idx == 0)
+      *queue_ticket = atomicAdd(queue_counter, 1u);
     __syncthreads();
     // if(thread0()) {
     //   printf("    mainloop with a8w8, mma_acc[0] = %.4f, tCrSA[0] = %.8f, accum[0] = %.8f\n",

@@ -73,7 +73,10 @@ struct BlockScatterParams {
     FP8GemmRuntime::MainLoopArguments mainloop;
     ScatterEpilogue<FP8GemmRuntime::EpilogueArgs, BlockScatter> epilogue;
     cutlass::KernelHardwareInfo hw_info;
-    ScatterScheduler scheduler;
+    struct Scheduler {
+        ScatterScheduler base;
+        const int32_t* pool_row_offsets = nullptr;
+    } scheduler;
     void* workspace = nullptr;
     int32_t* signal = nullptr;
     const void* rhs_replicas = nullptr;
@@ -126,7 +129,7 @@ struct Fp4ReplicaParams {
 struct Fp4ScatterState {
     Fp4CombineBuffer moe_combine_buf;
     Fp4SymmetricBuffer moe_sym_buffer;
-    const int64_t* moe_packed_src_info = nullptr;
+    const int64_t* moe_token_meta = nullptr;
     const int32_t* moe_valid_m_rows = nullptr;
     const int32_t* moe_src_m_offsets = nullptr;
 };
@@ -287,7 +290,7 @@ inline void block_scatter_kernel(const ScatterConfig& config,
     const int m = num_rows, n = config.n, k = config.k, groups = config.num_groups;
     if (m == 0)
         return;
-    const auto layout = prepare_grouped_nopad_layout(GemmType::MGroupedNoPad, groups, 128, rows, block_info);
+    const auto layout = prepare_grouped_nopad_layout(GemmType::MGroupedNoPad, groups, config.block_m, valid_rows, block_info);
     const auto sa = packed_stride(m, k), sb = packed_stride(n, k), sd = packed_stride(m, n);
     const auto problem = cute::make_shape(m, n, k, 1);
     BlockScatterParams params{};
@@ -308,17 +311,21 @@ inline void block_scatter_kernel(const ScatterConfig& config,
                                 uint32_t(rank), uint32_t(ranks), nullptr, uint32_t(groups)},
                                device_pointer<int32_t>(row_offsets)};
     params.epilogue.base_ptr_D = device_pointer(output);
-    params.scheduler = {layout, uint32_t(m)};
+    params.scheduler = {{layout, uint32_t(m)}, device_pointer<int32_t>(row_offsets)};
     params.rhs_replicas = device_pointer(rhs_replicas);
     params.rhs_replica_scales = device_pointer<float>(rhs_replica_scales);
     params.num_master_groups = config.num_master_groups;
-    scatter_launch<BlockFp8ScatterTag>("fp8_blockwise_mega_moe_gemm2_scatter", R"DGSOURCE(
+    // Chunked BM192 uses the grouped FP8 compiler scheduling policy.
+    const std::string entry = config.scratch_rows ? "fp8_grouped_deep_gemm_mega_moe_blockwise_scatter"
+                                                 : "fp8_blockwise_mega_moe_gemm2_scatter";
+    scatter_launch<BlockFp8ScatterTag>(entry, R"DGSOURCE(
 #define PPU_FP8_DEVICE_ONLY
 #include <deep_gemm/impls/fp8_gemm_blockwise_scatter.cuh>
-using Family = deep_gemm::mega_moe::fp8_blockwise::Gemm2Scatter<{N},{K},{GROUPS},{MASTER_GROUPS},{NUM_STAGES}>;
+using Family = deep_gemm::mega_moe::fp8_blockwise::Gemm2Scatter<{N},{K},{GROUPS},{MASTER_GROUPS},{NUM_STAGES},{BLOCK_M},{SCRATCH_ROWS}>;
 using Kernel = typename Family::Kernel;
+static_assert(Family::kNumThreads == {NUM_THREADS}, "blockwise scatter launch must match its MMA tile");
 )DGSOURCE",
-                                       config, params, num_sms, 512);
+                                       config, params, num_sms, config.num_threads);
 }
 
 struct Fp4MegaScatterTag {};
@@ -329,11 +336,11 @@ inline void fp4_scatter_kernel(
     const ScatterConfig& config, const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
     const torch::Tensor& rhs, const torch::Tensor& rhs_scales, const torch::Tensor& rhs_replicas,
     const torch::Tensor& rhs_replica_scales, const torch::Tensor& output, int num_rows,
-    const torch::Tensor& rows, const torch::Tensor& block_info, const torch::Tensor& packed_src,
+    const torch::Tensor& rows, const torch::Tensor& block_info, const torch::Tensor& token_meta,
     const torch::Tensor& combine, int hidden_bytes, int max_tokens, int topk, const torch::Tensor& scales,
     const torch::Tensor& scale_offsets, int scale_tiles, int scale_block_n, int use_side_scale,
     const torch::Tensor& peer_offsets, int rank_idx, int num_ranks,
-    const torch::Tensor& valid_rows, const torch::Tensor& src_offsets, int use_src_offsets) {
+    const torch::Tensor& valid_rows, const torch::Tensor& src_offsets) {
     const int m = num_rows, n = config.n, k = config.k, groups = config.num_groups;
     if (m == 0)
         return;
@@ -375,10 +382,9 @@ inline void fp4_scatter_kernel(
                     "FP4 side-scale offsets must be a CPU int64 table");
         std::copy_n(scale_offsets.data_ptr<int64_t>(), ranks, params.moe_combine_buf.scale_offsets);
     }
-    params.moe_packed_src_info = device_pointer<int64_t>(packed_src);
+    params.moe_token_meta = device_pointer<int64_t>(token_meta);
     params.moe_valid_m_rows = device_pointer<int32_t>(valid_rows);
-    if (use_src_offsets)
-        params.moe_src_m_offsets = device_pointer<int32_t>(src_offsets);
+    params.moe_src_m_offsets = device_pointer<int32_t>(src_offsets);
     params.ptr_B_replica = device_pointer<uint8_t>(rhs_replicas);
     params.ptr_scale_B_replica = device_pointer<uint16_t>(rhs_replica_scales);
     params.num_master_groups = config.num_master_groups;
@@ -403,7 +409,8 @@ inline void fp4_scatter_kernel(
     const auto policy = fmt::format("deep_gemm::mega_moe::fp4::ScatterPolicy<{}, deep_gemm::mega_moe::Fp8ScaleMode::{}, {}>",
                                     config.fp8_output, scale_mode, config.fp8_exp_shift);
     auto body = FP4GemmRuntime::generate_code(shared, true, policy,
-                                              "#include <deep_gemm/impls/fp4_gemm_scatter.cuh>", false);
+                                              "#include <deep_gemm/impls/fp4_gemm_scatter.cuh>", false,
+                                              config.m_tiles_per_group);
     body += "using Kernel = deep_gemm::GemmKernel;\n";
     body += "static_assert(sizeof(deep_gemm::mega_moe::detail::CombineBuffer)==560, \"FP4 combine ABI mismatch\");\n";
     body += fmt::format("static_assert(sizeof(deep_gemm::mega_moe::detail::SymBufferLite<>) == {}, \"FP4 symmetric ABI mismatch\");\n", sizeof(Fp4SymmetricBuffer));
@@ -414,7 +421,7 @@ inline void fp4_scatter_kernel(
         {"ptr_sync_ce", offsetof(Params, ptr_sync_ce)},
         {"moe_combine_buf", offsetof(Params, moe_combine_buf)},
         {"moe_sym_buffer", offsetof(Params, moe_sym_buffer)},
-        {"moe_packed_src_info", offsetof(Params, moe_packed_src_info)},
+        {"moe_token_meta", offsetof(Params, moe_token_meta)},
         {"moe_valid_m_rows", offsetof(Params, moe_valid_m_rows)},
         {"moe_src_m_offsets", offsetof(Params, moe_src_m_offsets)},
     };
@@ -430,23 +437,23 @@ inline void fp4_scatter_kernel_dispatch(
     const ScatterConfig& config, const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
     const torch::Tensor& rhs, const torch::Tensor& rhs_scales, const torch::Tensor& rhs_replicas,
     const torch::Tensor& rhs_replica_scales, const torch::Tensor& output, int num_rows,
-    const torch::Tensor& rows, const torch::Tensor& block_info, const torch::Tensor& packed_src,
+    const torch::Tensor& rows, const torch::Tensor& block_info, const torch::Tensor& token_meta,
     const torch::Tensor& combine, int hidden_bytes, int max_tokens, int topk, const torch::Tensor& scales,
     const torch::Tensor& scale_offsets, int scale_tiles, int scale_block_n, int use_side_scale,
     const torch::Tensor& peer_offsets, int rank_idx, int num_ranks,
-    const torch::Tensor& valid_rows, const torch::Tensor& src_offsets, int use_src_offsets) {
+    const torch::Tensor& valid_rows, const torch::Tensor& src_offsets) {
     if (config.n % 2)
         fp4_scatter_kernel<Fp4ScatterEpilogueWithTsm, Fp4MegaScatterWithTsmTag>(
             config, lhs, lhs_scales, rhs, rhs_scales, rhs_replicas, rhs_replica_scales, output, num_rows,
-            rows, block_info, packed_src, combine, hidden_bytes, max_tokens, topk, scales, scale_offsets,
+            rows, block_info, token_meta, combine, hidden_bytes, max_tokens, topk, scales, scale_offsets,
             scale_tiles, scale_block_n, use_side_scale, peer_offsets, rank_idx, num_ranks,
-            valid_rows, src_offsets, use_src_offsets);
+            valid_rows, src_offsets);
     else
         fp4_scatter_kernel<FP4GemmRuntime::EpilogueArgsNoTsm, Fp4MegaScatterTag>(
             config, lhs, lhs_scales, rhs, rhs_scales, rhs_replicas, rhs_replica_scales, output, num_rows,
-            rows, block_info, packed_src, combine, hidden_bytes, max_tokens, topk, scales, scale_offsets,
+            rows, block_info, token_meta, combine, hidden_bytes, max_tokens, topk, scales, scale_offsets,
             scale_tiles, scale_block_n, use_side_scale, peer_offsets, rank_idx, num_ranks,
-            valid_rows, src_offsets, use_src_offsets);
+            valid_rows, src_offsets);
 }
 
 inline void m_grouped_gemm_fp8_blockwise_with_scatter_impl(
@@ -454,14 +461,10 @@ inline void m_grouped_gemm_fp8_blockwise_with_scatter_impl(
     const torch::Tensor& out, const torch::Tensor& padded_rows, const torch::Tensor& valid_rows,
     const torch::Tensor& row_offsets, const torch::Tensor& packed_src_info, const torch::Tensor& combine,
     const torch::Tensor& peer_offsets, const torch::Tensor& rw, const torch::Tensor& rs, int m, int n, int k,
-    int groups, int masters, int max_tokens, int topk, int rank, int ranks) {
-    auto info = torch::empty({4 * (1 + groups + ceil_div(m, 128))}, padded_rows.options());
-    ScatterConfig c;
-    c.n = n;
-    c.k = k;
-    c.num_groups = groups;
-    c.num_master_groups = masters;
-    c.num_stages = mega_moe_config::fp8_blockwise_scatter_stages(n, k, groups, masters);
+    int groups, int masters, int max_tokens, int topk, int rank, int ranks,
+    std::optional<int> expected, const mega_moe_config::Gemm2Tuning& tuning) {
+    const auto c = mega_moe_config::fp8_blockwise_scatter_config(n, k, groups, masters, expected, tuning);
+    auto info = torch::empty({4 * (1 + groups + ceil_div(m, c.block_m))}, padded_rows.options());
     mega_moe_native::block_scatter_kernel(
         c, a, sa, b, sb, out, padded_rows, valid_rows, row_offsets, packed_src_info, combine, peer_offsets,
         info, m, max_tokens, topk, rank, ranks, get_num_sms(), rw, rs);
@@ -508,7 +511,7 @@ inline void m_grouped_gemm_fp4_with_scatter_impl(
     std::optional<mega_moe_config::Config> configs, std::optional<int> expected_m,
     std::optional<torch::Tensor> combine_scales,
     std::optional<torch::Tensor> scale_offsets, int scale_block_n,
-    std::optional<torch::Tensor> src_m_offsets) {
+    const torch::Tensor& src_m_offsets, const mega_moe_config::Gemm2Tuning& tuning = {}) {
     const int em = expected_m ? std::max(1, *expected_m) : ceil_div(m, groups);
     const auto cfg =
         mega_moe_config::fp4_scatter_config(m, n, k, groups, configs, provided_rows, false, fp8, em);
@@ -555,14 +558,16 @@ inline void m_grouped_gemm_fp4_with_scatter_impl(
     c.num_stages = stages;
     c.fp8_output = fp8;
     c.fp8_exp_shift = shift;
+    c.m_tiles_per_group = tuning.m_tiles_per_group.value_or(2);
+    TORCH_CHECK(c.m_tiles_per_group == 1 || c.m_tiles_per_group == 2,
+                "W4A4 scatter requires one or two M tiles per scheduler group");
     c.fp8_scale_mode = !side ? mega_moe::Fp8ScaleMode::Fixed
         : side_mode == 2 ? mega_moe::Fp8ScaleMode::SideDynamic : mega_moe::Fp8ScaleMode::SideStatic;
 
     mega_moe_native::fp4_scatter_kernel_dispatch(
         c, lhs, sa, rhs, sb, replica, rs, out, m, physical, info, token_meta, combine_buf,
         fp8 ? hidden : hidden * 2, max_tokens, num_topk, cs, so, tiles, scale_block_n, side_mode, sym_offsets,
-        rank, world_size, valid, src_m_offsets.value_or(valid),
-        int(src_m_offsets.has_value()));
+        rank, world_size, valid, src_m_offsets);
 }
 
 inline void m_grouped_gemm_w4a16_mxfp4_with_scatter_impl(
@@ -570,15 +575,17 @@ inline void m_grouped_gemm_w4a16_mxfp4_with_scatter_impl(
     const torch::Tensor& combine, const torch::Tensor& rows, const torch::Tensor& packed_src_info,
     const torch::Tensor& sym_offsets, const torch::Tensor& valid_m_rows, int rank, int max_tokens, int topk,
     std::optional<PPUW4ConfigTuple> requested,
-    const std::optional<std::pair<torch::Tensor, torch::Tensor>>& replicas) {
+    const std::optional<std::pair<torch::Tensor, torch::Tensor>>& replicas,
+    std::optional<int> expected, const mega_moe_config::Gemm2Tuning& tuning = {}) {
     constexpr auto type = GemmType::MGroupedNoPad;
     constexpr int group_size = 32;
     const int m = lhs.size(0), k = lhs.size(1), n = rhs.size(1), master_groups = rhs.size(0);
     const auto replica_rhs = replicas ? replicas->first : rhs;
     const auto replica_scales = replicas ? replicas->second : scales;
     const int groups = master_groups + (replicas ? replica_rhs.size(0) : 0);
-    const int expected_m = ceil_div(m, groups);
-    const auto selected = mega_moe_config::w4a16_scatter_config(expected_m, n, k, requested);
+    const int expected_m = expected.value_or(ceil_div(m, groups));
+    TORCH_CHECK(expected_m >= 0);
+    const auto selected = mega_moe_config::w4a16_scatter_config(expected_m, n, k, requested, tuning);
     const PPUW4ConfigTuple selected_tuple{selected.num_sms, selected.block_m,   selected.block_n,
                                           selected.block_k, selected.warp_m,    selected.warp_n,
                                           selected.warp_k,  selected.num_stages};

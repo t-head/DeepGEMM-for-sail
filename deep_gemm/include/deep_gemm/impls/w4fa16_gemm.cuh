@@ -1,4 +1,5 @@
 #pragma once
+#include <deep_gemm/scheduler/mega_moe_work_queue.cuh>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #pragma clang diagnostic ignored "-Wswitch"
@@ -36,7 +37,7 @@ template <int ShapeN, int ShapeK,
           int WarpM, int WarpN, int WarpK,
           int kNumGroups, int kNumStages, GemmType kGemmType,
           int N_EXPAND = 1, bool kMoeScatter = false, bool kFusedSitu = false,
-          bool kUseReplicaWeights = false>
+          bool kUseReplicaWeights = false, bool kDynamicWork = false>
 class W4A16GEMM_MMA {
 public:
   using ElementA = cutlass::bfloat16_t;
@@ -76,19 +77,21 @@ public:
   >;
   using ArchTag = cutlass::arch::PPU0015;
   static constexpr int WarpsOnM = BlockM / WarpM;
-  static constexpr int WarpsOnN = BlockN / WarpN; // WarpN = 64
+  static constexpr int WarpsOnN = BlockN / WarpN;
+  static_assert(WarpN == 64 || (kFusedSitu && BlockM == 128 && WarpM == 128 && WarpN == 32),
+                "32-column warps require the BM128 SiTU layout");
   static constexpr int WarpsOnK = BlockK / WarpK;
 
   // fp4 mma => dequant
   using FP4MmaInst = PPU0015_16x16x64_F32F4F4F32_TN;
-  using FP4PermutationMNK = Tile<Layout<Shape<_16, Int<WarpsOnN>, _4>, Stride<_1, Int<WarpN>, _16>>, _16, Int<WarpsOnK * 32>>;
+  using FP4PermutationMNK = Tile<Layout<Shape<_16, Int<WarpsOnN>, Int<WarpN / 16>>, Stride<_1, Int<WarpN>, _16>>, _16, Int<WarpsOnK * 32>>;
   using FP4TiledMma = TiledMMA<MMA_Atom<FP4MmaInst>, Layout<Shape<Int<WarpsOnN>, _1, Int<WarpsOnK>>>, FP4PermutationMNK>;
 
   // bf16 mma
   using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementA, ElementA, ElementAcc>::type;
   using PermutationMNK = Tile<
     Int<WarpsOnM * 16>,
-    Layout<Shape<_16, Int<WarpsOnN>, _4>, Stride<_1, _64, _16>>,
+    Layout<Shape<_16, Int<WarpsOnN>, Int<WarpN / 16>>, Stride<_1, Int<WarpN>, _16>>,
     Int<WarpsOnK * 16>,
   >;
   using TiledMma = TiledMMA<MMA_Atom<MmaInst>, Layout<Shape<Int<WarpsOnM>, Int<WarpsOnN>, Int<WarpsOnK>>>, PermutationMNK>;
@@ -133,7 +136,7 @@ public:
   using ScaleCopyTraits = Copy_Traits<ScaleCopyOp>;
   using SmemCopyAtomScale = Copy_Atom<ScaleCopyTraits, ElementScale>;
   using SmemThrLayoutScale = Layout<
-    Shape<Int<WarpsOnN>, Shape<_32, Int<WarpsOnK>>>,
+    Shape<Int<BlockN / 64>, Shape<_32, Int<WarpsOnK>>>,
     Stride<Int<32 * WarpsOnK>, Stride<_1, _32>>
   >;
   using SmemValLayoutScale = Layout<Shape<_1, _4>>;
@@ -151,7 +154,7 @@ public:
         cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutScale>> smem_scale;
       }; // mainloop
       cute::array_aligned<ElementAcc, cute::cosize_v<SmemLayoutReduce>> smem_reduce; // epilogue cta reduce
-      cute::array_aligned<ElementD, (kMoeScatter || kFusedSitu) ? BlockM * BlockN : 1> smem_moe_scatter;
+      cute::array_aligned<ElementD, kMoeScatter ? BlockM * BlockN : 1> smem_moe_scatter;
     };
   };
 
@@ -216,7 +219,14 @@ public:
           ptr_scale(ptr_scale_),
           ptr_d(ptr_d_) {}
   };
-  using Params = cute::conditional_t<kExtendedParams, ExtendedParams, StandardParams>;
+  struct QueueParams : ExtendedParams {
+    using ExtendedParams::ExtendedParams;
+    uint32_t* queue_counter = nullptr;
+    uint32_t* arrival_counts = nullptr;
+    uint32_t dispatch_block_m = 0;
+  };
+  using Params = cute::conditional_t<kDynamicWork, QueueParams,
+      cute::conditional_t<kExtendedParams, ExtendedParams, StandardParams>>;
 
 
   // for constexpr patial initialize
@@ -347,7 +357,7 @@ public:
     Tensor tCsB = smem_thr_copy_B.partition_S(mix_sB);
     Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(fp4_tCrB);
 
-    int thread_idx_nk = (warpn_idx * WarpsOnK + warpk_idx) * NumThreadsPerWarp;
+    int thread_idx_nk = ((warpn_idx / (64 / WarpN)) * WarpsOnK + warpk_idx) * NumThreadsPerWarp;
     if constexpr(not scale_use_ld_matrix) {
       thread_idx_nk += lane_idx;
     } else {
@@ -360,18 +370,53 @@ public:
     Tensor tCrS = recast<uint32_t>(tCrS_copy_view);
 
     uint32_t m_block_idx, n_block_idx;
+    __shared__ uint32_t queue_ticket;
+    const auto fetch_work = [&]() {
+      if constexpr (!kDynamicWork) return deep_scheduler.fetch_next_work(m_block_idx, n_block_idx);
+      else {
+        static_assert(kFusedSitu && kNumGroups < 128 && N_EXPAND == 1);
+        const deep_gemm::mega_moe::WorkQueue queue{params.queue_counter, &queue_ticket};
+        queue.prime(thread_idx);
+        const uint32_t work = queue.current();
+        while (deep_scheduler.curr_group_idx < L) {
+          deep_scheduler.curr_group_m = __ldg(params.scheduler.grouped_layout + deep_scheduler.curr_group_idx);
+          const uint32_t mb = deep_gemm::math::ceil_div(deep_scheduler.curr_group_m, uint32_t(BlockM));
+          if (work < (deep_scheduler.curr_cumsum + mb) * N_Blocks) {
+            deep_scheduler.get_swizzled_block_idx(mb, work - deep_scheduler.curr_cumsum * N_Blocks, m_block_idx, n_block_idx);
+            const uint32_t row = m_block_idx * BlockM;
+            const uint32_t valid = __ldg(params.valid_m_rows + deep_scheduler.curr_group_idx);
+            if (row < valid) {
+              const uint32_t first = (deep_scheduler.curr_cumsum_m + row) / params.dispatch_block_m;
+              const uint32_t last = (deep_scheduler.curr_cumsum_m + cute::min(row + uint32_t(BlockM), valid) - 1) / params.dispatch_block_m;
+              for (uint32_t g = first; g <= last; ++g)
+                while (deep_gemm::ptx::ld_acq(params.arrival_counts + g) == 0) {}
+            }
+            return true;
+          }
+          deep_scheduler.curr_cumsum += mb;
+          deep_scheduler.curr_cumsum_m += deep_scheduler.curr_group_m;
+          ++deep_scheduler.curr_group_idx;
+        }
+        return false;
+      }
+    };
     #pragma clang loop licm(disable)
-    while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
+    while (fetch_work()) {
 
       int coord_l = deep_scheduler.curr_group_idx;
       n_block_idx *= N_EXPAND;
       int activation_rows = 0;
       if constexpr (!Fused) activation_rows = deep_scheduler.curr_group_m;
-      if constexpr (kFusedSitu) {
+      if constexpr (kFusedSitu || kMoeScatter) {
         if (params.valid_m_rows != nullptr)
           activation_rows = __ldg(params.valid_m_rows + coord_l);
         // Keep padded expert offsets, but neither load nor compute empty tiles.
-        if (m_block_idx * BlockM >= activation_rows) continue;
+        if (m_block_idx * BlockM >= activation_rows) {
+          // A skipped tile never enters the mainloop's CTA barriers. Retire
+          // every ticket read before the leader can overwrite shared_ticket.
+          if constexpr (kDynamicWork) __syncthreads();
+          continue;
+        }
       }
 
       int weight_group = coord_l;
@@ -462,6 +507,9 @@ public:
             uint32_t d;
             uint32_t addr = cute::cast_smem_ptr_to_uint(cute::raw_pointer_cast(tCsS(_,_,fp4_k_block,stage_idx).data()));
             asm volatile("ppu.tc02.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];" : "=r"(d) : "r"(addr));
+            // Scale groups cover 64 columns; each 32-column warp selects its half.
+            if constexpr (WarpN == 32)
+              d = __shfl_xor_sync(0xffffffffu, d, (warpn_idx & 1) * 2);
             tCrS(0,0,fp4_k_block) = d;
           }
         }
@@ -721,84 +769,98 @@ public:
         }
       };
 
-      // mainloop
-      constexpr int k_tile_count = size<2>(gB);
-      int current_stage = 0;
-      // Prologue
-      CUTLASS_PRAGMA_UNROLL
-      for (int k_pipe = 0; k_pipe < kNumStages-1; k_pipe++) {
-        if (k_pipe < k_tile_count) {
-          g2s(k_pipe, k_pipe);
-        }
-        current_stage++;
-        cp_async_fence();
-      }
-      cp_async_wait<kNumStages-2>();
-      __syncthreads();
-
-      #pragma unroll
-      for (int n_iter = 0; n_iter < N_EXPAND; n_iter++) {
-        clear(accum);
-        auto process_k_tile_iteration = [&](int k_tile_idx) {
-          int stage_idx = (k_tile_idx + n_iter * k_tile_count) % kNumStages;
-          int next_k_tile_idx = k_tile_idx + kNumStages - 1;
-          if constexpr(N_EXPAND > 1) {
-            if (next_k_tile_idx == k_tile_count) {
-              tBgB.data() = tBgB.data() + BlockN * K2;
-              tSgS.data() = tSgS.data() + (BlockN / 64) * ScaleStride;
-            }
-            if (next_k_tile_idx < k_tile_count || n_iter < N_EXPAND - 1) {
-              g2s(next_k_tile_idx % k_tile_count, current_stage);
-            }
-          } else {
-            if (next_k_tile_idx < k_tile_count) {
-              g2s(next_k_tile_idx, current_stage);
-            }
+      // Choose the valid M fragments outside the K loop; preserve MMA order.
+      auto run_m_tile = [&](auto m_fragments) {
+        // mainloop
+        constexpr int k_tile_count = size<2>(gB);
+        int current_stage = 0;
+        // Prologue
+        CUTLASS_PRAGMA_UNROLL
+        for (int k_pipe = 0; k_pipe < kNumStages-1; k_pipe++) {
+          if (k_pipe < k_tile_count) {
+            g2s(k_pipe, k_pipe);
           }
+          current_stage++;
           cp_async_fence();
-          current_stage = (current_stage + 1) % kNumStages;
+        }
+        cp_async_wait<kNumStages-2>();
+        __syncthreads();
 
-          s2r_copy_B_and_scale(stage_idx);
-
-          for_each(make_int_sequence<K_BLOCK_MAX >{}, [&] (auto k_block_ic) {
-            constexpr int k_block = decltype(k_block_ic)::value;
-            s2r_copy_A(stage_idx, k_block);
-
-            clear(fp4_accum);
-            #pragma unroll
-            for (int n_block = 0; n_block < 4; n_block++) {
-              fp4_mma_dequant(n_block, k_block);
-              quant_fp32C_to_bf16B(n_block, k_block);
-
-              #pragma unroll
-              for (int m_block = 0; m_block < size<1>(accum); m_block++) {
-                cute::gemm(tiled_mma, tCrA(_,m_block,k_block), tCrB(_,n_block,k_block), accum(_,m_block,n_block));
+        #pragma unroll
+        for (int n_iter = 0; n_iter < N_EXPAND; n_iter++) {
+          clear(accum);
+          auto process_k_tile_iteration = [&](int k_tile_idx) {
+            int stage_idx = (k_tile_idx + n_iter * k_tile_count) % kNumStages;
+            int next_k_tile_idx = k_tile_idx + kNumStages - 1;
+            if constexpr(N_EXPAND > 1) {
+              if (next_k_tile_idx == k_tile_count) {
+                tBgB.data() = tBgB.data() + BlockN * K2;
+                tSgS.data() = tSgS.data() + (BlockN / 64) * ScaleStride;
+              }
+              if (next_k_tile_idx < k_tile_count || n_iter < N_EXPAND - 1) {
+                g2s(next_k_tile_idx % k_tile_count, current_stage);
+              }
+            } else {
+              if (next_k_tile_idx < k_tile_count) {
+                g2s(next_k_tile_idx, current_stage);
               }
             }
-          });
+            cp_async_fence();
+            current_stage = (current_stage + 1) % kNumStages;
 
-          cp_async_wait<kNumStages - 2>();
-          __syncthreads();
-        };
+            s2r_copy_B_and_scale(stage_idx);
 
-        if constexpr(k_tile_count <= 4) {
-          #pragma unroll
-          for (int k_tile_idx = 0; k_tile_idx < k_tile_count; k_tile_idx++) {
-            process_k_tile_iteration(k_tile_idx);
+            for_each(make_int_sequence<K_BLOCK_MAX >{}, [&] (auto k_block_ic) {
+              constexpr int k_block = decltype(k_block_ic)::value;
+              s2r_copy_A(stage_idx, k_block);
+
+              clear(fp4_accum);
+              #pragma unroll
+              for (int n_block = 0; n_block < WarpN / 16; n_block++) {
+                fp4_mma_dequant(n_block, k_block);
+                quant_fp32C_to_bf16B(n_block, k_block);
+
+                #pragma unroll
+                for (int m_block = 0; m_block < decltype(m_fragments)::value; m_block++) {
+                  cute::gemm(tiled_mma, tCrA(_,m_block,k_block), tCrB(_,n_block,k_block), accum(_,m_block,n_block));
+                }
+              }
+            });
+
+            cp_async_wait<kNumStages - 2>();
+            __syncthreads();
+          };
+
+          if constexpr(k_tile_count <= 4) {
+            #pragma unroll
+            for (int k_tile_idx = 0; k_tile_idx < k_tile_count; k_tile_idx++) {
+              process_k_tile_iteration(k_tile_idx);
+            }
+          } else {
+            #pragma unroll 1
+            for (int k_tile_idx = 0; k_tile_idx < k_tile_count; k_tile_idx++) {
+              process_k_tile_iteration(k_tile_idx);
+            }
           }
-        } else {
-          #pragma unroll 1
-          for (int k_tile_idx = 0; k_tile_idx < k_tile_count; k_tile_idx++) {
-            process_k_tile_iteration(k_tile_idx);
-          }
-        }
 
-        if (n_iter > 0) {
-          n_block_idx++;
-          gD.data() = gD.data() + BlockN;
+          if (n_iter > 0) {
+            n_block_idx++;
+            gD.data() = gD.data() + BlockN;
+          }
+          epilogue_cta_reduce();
+          epilogue_no_tsm();
         }
-        epilogue_cta_reduce();
-        epilogue_no_tsm();
+      };
+      if constexpr ((kFusedSitu || kMoeScatter) && BlockM == 128 &&
+                    (WarpM == 64 || (kFusedSitu && WarpM == 128 && WarpN == 32))) {
+        constexpr int rows_per_fragment = WarpsOnM * 16;
+        if (kFusedSitu && rows_per_fragment == 16 && residual_m <= 16) run_m_tile(cute::Int<1>{});
+        else if (residual_m <= 32) run_m_tile(cute::Int<32 / rows_per_fragment>{});
+        else if (residual_m <= 64) run_m_tile(cute::Int<64 / rows_per_fragment>{});
+        else if (residual_m <= 96) run_m_tile(cute::Int<96 / rows_per_fragment>{});
+        else run_m_tile(cute::Int<size<1>(accum)>{});
+      } else {
+        run_m_tile(cute::Int<size<1>(accum)>{});
       }
     }
   }

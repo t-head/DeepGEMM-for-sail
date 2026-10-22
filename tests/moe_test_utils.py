@@ -1,8 +1,10 @@
 """Shared runtime helpers and independent numerical references for MoE tests."""
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
+import argparse
+import json
 import os
 import statistics
 import tempfile
@@ -46,6 +48,8 @@ class MoECase:
     input_scale: float = 1.0
     reference_tokens: int = 8
     scatter_tile: tuple[int, int, int, int, int, int] | None = None
+    precision: str = "w4a4"
+    extra_replicas_per_rank: int = 0
 
     def require_world(self):
         world = dist.get_world_size()
@@ -133,15 +137,15 @@ def interleave_gate_up(tensor):
 
 
 def activation(projection, kind="swiglu", clamp=0.0):
-    """Independent Torch oracle after the kernel's BF16 projection rounding."""
-    gate, up = projection.bfloat16().float().chunk(2, -1)
+    """Independent Torch activation; the caller supplies projection precision."""
+    gate, up = projection.float().chunk(2, -1)
     if kind == "situ":
         return 4 * torch.tanh(gate / 4) * torch.sigmoid(gate) * 25 * torch.tanh(up / 25)
     if clamp > 0:
         up = up.clamp(-clamp, clamp)
         if kind != "step":
             gate = gate.clamp(max=clamp)
-    if kind == "swigluoai":
+    if kind == "swiglu_oai":
         return gate * torch.sigmoid(1.702 * gate) * (up + 1)
     gate = torch.nn.functional.silu(gate)
     if kind == "step" and clamp > 0:
@@ -151,8 +155,127 @@ def activation(projection, kind="swiglu", clamp=0.0):
 
 def quantize_fp8_rows(tensor):
     values = tensor.float()
-    scales = values.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448
-    return (values * scales.reciprocal()).clamp(-448, 448).to(torch.float8_e4m3fn), scales
+    # Use a device FP32 divisor: Torch replaces division by a CPU scalar with
+    # reciprocal multiplication, which can cross an E4M3 rounding midpoint.
+    # Preserve the kernel's FP32 scale -> reciprocal -> multiply order.
+    fp8_max = values.new_tensor(448.0)
+    scales = values.abs().amax(-1, keepdim=True).clamp_min(1e-10) / fp8_max
+    q = (values * scales.reciprocal()).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return q, scales
+
+
+def quantize_fp8_blocks(tensor):
+    # Keep the independent blockwise oracle on CPU: device Torch's approximate
+    # reciprocal can move an E4M3 rounding midpoint to the adjacent FP8 value.
+    # This reference runs outside graph capture and the benchmark region.
+    shape = tensor.shape
+    values = tensor.cpu().float().reshape(*shape[:-1], shape[-1] // 128, 128)
+    scales = values.abs().amax(-1).clamp_min(1e-10) / 448
+    q = (values / scales[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return q.reshape(shape).to(tensor.device), scales.to(tensor.device)
+
+
+def split_expert_weights(weights):
+    """Independent allocations expose an ignored or incorrectly offset replica pointer."""
+    return tuple(t[:-1].clone() for t in weights), tuple(t[-1:].clone() for t in weights)
+
+
+def make_inputs(case, requested, rng, edge_cases):
+    rank, world = dist.get_rank(), dist.get_world_size()
+    count = 0 if edge_cases and world > 1 and requested == 1 and rank == world - 1 else requested
+    source = torch.randn(requested, case.hidden, device="cuda", dtype=torch.bfloat16,
+                         generator=rng) * (0.5 * case.input_scale)
+    token = torch.arange(requested, device="cuda")[:, None]
+    slot = torch.arange(case.topk, device="cuda")[None, :]
+    ids = ((token * case.topk + slot + rank * 17) % case.experts).contiguous()
+    weights = torch.rand(requested, case.topk, device="cuda", generator=rng).softmax(-1)
+    ids[count:], weights[count:] = -1, 0
+    if edge_cases and count > 1:
+        ids[0, 0], weights[0, 0] = -1, 0
+        weights[1, 0] = 0
+    return source, ids, weights, count
+
+
+def run_forward(case, source, requested, pipeline, reference, *, combine, check=True,
+                reference_tokens=0, max_diff=.0005, max_relative_l2=None,
+                replicas=False, edge_cases=False, benchmark=None, verbose=True,
+                routing_weights=None):
+    """One complete forward for correctness, graph replay and optional end-to-end timing."""
+    rank, world, count = dist.get_rank(), dist.get_world_size(), source.shape[0]
+    compile_kernels(pipeline)
+    combine.fill_(float("nan"))
+    torch.cuda.synchronize()
+    dist.barrier()
+    actual = pipeline().clone()
+    counts = gather(torch.tensor(count, device="cuda")).tolist()
+    report = dict(case=case.name, precision=case.precision, ep=world, tokens_per_rank=counts,
+                  hidden=case.hidden, intermediate=case.intermediate, experts=case.experts,
+                  capacity=case.capacity, topk=case.topk, activation=case.activation,
+                  scatter_dtype="bf16", routing="round_robin", split_weights=replicas,
+                  edge_cases=edge_cases, correctness=dict(status="not_checked"))
+    if check:
+        checked = min(requested, reference_tokens) if reference_tokens else requested
+        expected = reference(checked)
+        assert actual.isfinite().all(), (rank, "nonfinite pipeline output")
+        sample = actual[:min(count, checked)]
+        metrics = torch.tensor([float(calc_diff(sample, expected)), relative_l2(sample, expected)],
+                               device="cuda")
+        dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
+        assert metrics[0].item() < max_diff, (case.name, "pipeline diff", metrics.tolist())
+        if max_relative_l2 is not None:
+            assert metrics[1].item() < max_relative_l2, (case.name, "pipeline relative L2", metrics.tolist())
+        report["correctness"] = dict(status="passed", max_pipeline_diff=metrics[0].item(),
+                                     max_relative_l2=metrics[1].item(),
+                                     checked_tokens_per_rank=[min(n, checked) for n in counts])
+        check_graph_replay(pipeline, actual, input_tensor=source, routing_weights=routing_weights)
+        if routing_weights is not None:
+            report["correctness"]["routing_weight_replay_checked"] = True
+    if benchmark is not None:
+        timing = benchmark_pipeline(pipeline, expected=actual if check else None, **benchmark)
+        timing["scope"] = "pre_dispatch_to_combine"
+        timing["tokens_per_second"] = sum(counts) * 1e6 / timing["max_rank_us"]["median"]
+        report["benchmark"] = timing
+    if verbose and rank == 0:
+        print(json.dumps(report), flush=True)
+    dist.barrier()
+    return report
+
+
+def run_cli(cases, runner, description):
+    parser = argparse.ArgumentParser(description=description,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--case", choices=[c.name for c in cases], default=cases[0].name)
+    parser.add_argument("--tokens", type=int, nargs="+", help="tokens per rank; defaults to the case table")
+    parser.add_argument("--capacity", type=int, help="workspace token capacity")
+    parser.add_argument("--benchmark", action="store_true", help="also time the complete forward")
+    parser.add_argument("--no-check", action="store_true", help="performance only; requires --benchmark")
+    parser.add_argument("--reference-tokens", type=int, default=0, help="check first N tokens/rank; 0 checks all")
+    parser.add_argument("--mode", choices=("graph", "eager"), default="graph")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--replicas", action="store_true", help="use separate master/replica weight buffers")
+    parser.add_argument("--edge-cases", action="store_true", help="include empty ranks and masked/zero-weight routes")
+    args = parser.parse_args()
+    case = next(c for c in cases if c.name == args.case)
+    case = replace(case, tokens=tuple(args.tokens) if args.tokens is not None else case.tokens,
+                   capacity=args.capacity if args.capacity is not None else case.capacity)
+    if case.capacity < 1 or any(n < 0 or n > case.capacity for n in case.tokens):
+        parser.error("tokens must be nonnegative and no larger than a positive capacity")
+    if args.reference_tokens < 0 or args.warmup < 0 or args.iterations < 1 or args.repeats < 1:
+        parser.error("reference-tokens/warmup must be nonnegative; iterations/repeats must be positive")
+    if args.no_check and not args.benchmark:
+        parser.error("--no-check requires --benchmark")
+    with moe_process_group() as group:
+        world = dist.get_world_size()
+        if world not in case.worlds or case.experts % world:
+            raise ValueError(f"{case.name} requires EP{case.worlds}; launched EP{world}")
+        if args.replicas and case.experts // world < 2:
+            raise ValueError("--replicas requires at least two local experts")
+        timing = dict(warmup=args.warmup, iterations=args.iterations,
+                      repeats=args.repeats, mode=args.mode) if args.benchmark else None
+        runner(case, group, check=not args.no_check, reference_tokens=args.reference_tokens,
+               edge_cases=args.edge_cases, splits=(args.replicas,), benchmark=timing)
 
 
 def relative_l2(actual, expected):
@@ -160,7 +283,7 @@ def relative_l2(actual, expected):
             / expected.float().norm().clamp_min(1e-8)).item()
 
 
-def check_graph_replay(pipeline, expected, *, input_tensor=None):
+def check_graph_replay(pipeline, expected, *, input_tensor=None, routing_weights=None):
     """Check replay generations, optionally changing inputs to expose stale reads."""
     for _ in range(3):
         pipeline()
@@ -183,6 +306,18 @@ def check_graph_replay(pipeline, expected, *, input_tensor=None):
         dist.barrier()
     # The last replay uses the original inputs, so downstream timing and
     # correctness checks still see the caller's original workspace contents.
+    if routing_weights is not None:
+        saved_weights = routing_weights.clone()
+        routing_weights.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(result).item() == 0, "graph replay used stale routing weights"
+        dist.barrier()
+        routing_weights.copy_(saved_weights)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        dist.barrier()
 
 
 def benchmark_pipeline(pipeline, *, warmup=10, iterations=100, repeats=5,
@@ -246,7 +381,7 @@ def calc_diff(x, y):
     x, y = x.double(), y.double()
     return (x - y).square().sum() / (x.square() + y.square()).sum().clamp_min(1e-30)
 
-def _get_perms():
+def _get_weight_perm():
     perm = []
     for i in range(32):
         perm1 = []
@@ -266,15 +401,9 @@ def _get_perms():
     interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
     perm = perm.reshape((-1, 8))[:, interleave].ravel()
     perm = torch.from_numpy(perm)
-    scale_perm = []
-    for i in range(8):
-        scale_perm.extend([i + 8 * j for j in range(8)])
-    scale_perm_single = []
-    for i in range(4):
-        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
-    return perm, scale_perm, scale_perm_single
+    return perm
 
-_perm, _scale_perm, _scale_perm_single = _get_perms()
+_perm = _get_weight_perm()
 
 def quant_w4a16_mxfp4(y, groupsize=32):
     """Quantize [E, N, K] weights to raw W4A16-packed E2M1 values and UE8M0 scales."""

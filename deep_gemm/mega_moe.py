@@ -25,7 +25,7 @@ class MegaMoEGemm2Metadata(NamedTuple):
     m_offsets: torch.Tensor
     src_m_rows: torch.Tensor
     src_m_offsets: torch.Tensor
-    packed_src_info: torch.Tensor
+    token_meta: torch.Tensor
 
 
 def _gemm2_metadata_views(buffer):
@@ -143,6 +143,19 @@ class MegaMoEDispatchGemm1SymmBuffer:
         return self.input_token.view(torch.bfloat16).view(
             self._cfg['NMTPR'], self.bf16_hidden)
 
+    def input_views(self, num_tokens: int):
+        """BF16 token, routing-ID and weight views for a producer on the MoE stream.
+
+        Pass these views to pre_dispatch to avoid another copy. Reuse the views
+        only after the preceding invocation has finished consuming its inputs.
+        """
+        if not hasattr(self, 'bf16_hidden'):
+            raise ValueError("input_views requires a W4A16 buffer")
+        if not 0 <= num_tokens <= self.num_max_tokens_per_rank:
+            raise ValueError("input view exceeds token capacity")
+        return (self.input_token_bf16[:num_tokens], self.input_topk_idx[:num_tokens],
+                self.input_topk_weights[:num_tokens])
+
     @property
     def input_sf(self) -> torch.Tensor:
         c = self._cfg
@@ -192,11 +205,6 @@ class MegaMoEDispatchGemm1SymmBuffer:
         )
 
     @property
-    def dispatched_topk_weights(self) -> torch.Tensor:
-        return self._slice(
-            self._layout['off_pw'], (self.num_pool,), torch.float32)
-
-    @property
     def gemm1_output(self) -> torch.Tensor:
         # Backward-compatible lazy view for non-quantized/debug callers.
         return self.get_gemm1_output(fused_swiglu=True)
@@ -216,6 +224,9 @@ class MegaMoEDispatchGemm1SymmBuffer:
         for explicit tile overrides.
         Other paths retain the dispatch layout. Views are ready on the same
         stream after GEMM1, including Graph replay and zero-token invocations.
+
+        All precisions use packed int64 routes indexed by m_offsets.
+        W4A4 activations and scales retain the layout indexed by src_m_offsets.
         """
         return _gemm2_metadata_views(self)
 
@@ -234,13 +245,15 @@ class MegaMoEDispatchGemm1SymmBuffer:
         self.group = None
 
 class Fp8MegaMoEDispatchSymmBuffer:
-    """One symmetric arena for FP8 routing and expert-major landing pools."""
+    """FP8 routing workspace with optional local expert landing pools."""
 
-    def __init__(self, group, config: Dict[str, int]):
+    def __init__(self, group, config: Dict[str, int], *, local_pool: bool = False,
+                 block_m_override: Optional[int] = None):
         import torch.distributed._symmetric_memory as symm_mem
 
         self.group = group
         self._cfg = dict(config)
+        self._block_m_override = block_m_override
         self._layout = _compute_fp8_layout(self._cfg)
         self.num_ranks = int(config["NUM_RANKS"])
         self.num_experts = int(config["NUM_EXPERTS"])
@@ -251,18 +264,16 @@ class Fp8MegaMoEDispatchSymmBuffer:
         self.block_m = int(config["BLOCK_M"])
         self.num_pool = int(self._layout["num_pool"])
 
-        self._buffer = symm_mem.empty(
-            int(self._layout["total"]), dtype=torch.uint8, device="cuda")
+        self._pool_offset = int(self._layout["off_pt"]) if local_pool else int(self._layout["total"])
+        self._pool_buffer = (torch.empty(int(self._layout["total"]) - self._pool_offset,
+                                        dtype=torch.uint8, device="cuda") if local_pool else None)
+        self._buffer = symm_mem.empty(self._pool_offset, dtype=torch.uint8, device="cuda")
         self._buffer.zero_()
         self._handle = symm_mem.rendezvous(self._buffer, group=group)
         group.barrier()
         torch.cuda.synchronize()
-        ptrs = [
-            self._handle.get_buffer(
-                rank, (int(self._layout["total"]), ), torch.uint8,
-                storage_offset=0).data_ptr()
-            for rank in range(self.num_ranks)
-        ]
+        ptrs = [self._handle.get_buffer(r, (self._pool_offset,), torch.uint8,
+                                       storage_offset=0).data_ptr() for r in range(self.num_ranks)]
         self._buf_ptrs = torch.tensor(ptrs, dtype=torch.int64, device="cpu")
 
     def _slice(self, off: int, shape, dtype: torch.dtype) -> torch.Tensor:
@@ -270,7 +281,15 @@ class Fp8MegaMoEDispatchSymmBuffer:
         for extent in shape:
             numel *= int(extent)
         nbytes = numel * torch.empty((), dtype=dtype).element_size()
-        return self._buffer[int(off): int(off) + nbytes].view(dtype).view(*shape)
+        start = int(off)
+        storage = self._buffer
+        if start >= self._pool_offset:
+            storage, start = self._pool_buffer, start - self._pool_offset
+        return storage[start: start + nbytes].view(dtype).view(*shape)
+
+    @property
+    def local_pool(self) -> torch.Tensor:
+        return self._pool_buffer if self._pool_buffer is not None else self._buffer[self._layout["off_pt"]:]
 
     @property
     def buffer(self) -> torch.Tensor:
@@ -348,6 +367,7 @@ class Fp8MegaMoEDispatchSymmBuffer:
         return _gemm2_metadata_views(self)
 
     def destroy(self) -> None:
+        self._pool_buffer = None
         self._handle = None
         self._buffer = None
         self._buf_ptrs = None
@@ -359,6 +379,7 @@ def get_symm_buffer_for_mega_moe(
         block_m: Optional[int] = None,
         gemm1_block_n: Optional[int] = None, gemm1_block_k: Optional[int] = None,
         config_override: Optional[Dict[str, int]] = None,
+        num_tokens_per_rank: Optional[int] = None,
 ) -> Union[MegaMoEDispatchGemm1SymmBuffer, Fp8MegaMoEDispatchSymmBuffer]:
     """Allocate one reusable MegaMoE symmetric workspace on every rank.
 
@@ -367,21 +388,37 @@ def get_symm_buffer_for_mega_moe(
     (``2 * intermediate``); FP8 transport buffers do not take this argument.
     ``hidden`` is always the logical input width.
 
-    W4A4 accepts GEMM1 N/K tile limits and config_override; W4A16 and FP8
-    accept block_m. Unsupported combinations fail before any collective
-    allocation. All ranks must call this function with matching dimensions.
+    W4A4 accepts GEMM1 N/K tile limits and config_override; W4A16 accepts
+    block_m. FP8 channelwise supports block_m=128 or 256; omitting it enables
+    per-call tuning with a BM256 fallback. An explicit block_m takes precedence
+    over the tuning table. FP8 blockwise uses block_m=128 for dispatch/padding;
+    its GEMM1 compute tile is selected independently (128 or 192 for FP8 output).
+    Unsupported combinations fail before any collective allocation.
+    All ranks must use matching dimensions.
+    W4A16 ``num_tokens_per_rank`` is an optional common workload bucket for
+    tile and dispatch selection, independent of capacity and each rank's actual
+    input length. All ranks must supply the same bucket; explicit block_m wins.
+    The selected push/pull protocol stays fixed for the workspace lifetime,
+    including empty-rank calls. Omitting the bucket retains pull dispatch.
+
+    All precisions use packed int64 routes. W4A4 requires
+    ``row_offsets=meta.src_m_offsets`` for its GEMM2 activation and scale inputs.
+
+    With UltraEP, ``num_experts`` counts global physical slots, including
+    replicas. Pass remapped physical routing IDs to pre-dispatch and
+    ``rhs_replicas=(weight, scale)`` to both GEMMs. Each rank's slots contain
+    masters first, then replicas; their weights use the same preprocessing.
     """
     ranks = int(group.size())
-    if not (0 < ranks <= 32 and num_experts > 0 and num_experts % ranks == 0
+    if not (0 < ranks <= (64 if precision == "fp8_blockwise" else 32) and num_experts > 0 and num_experts % ranks == 0
             and 0 < num_topk <= min(16, num_experts) and 0 < num_max_tokens_per_rank < (1 << 24)):
         raise ValueError("invalid MegaMoE ranks, expert count, top-k or token capacity")
-    if precision == "fp8_blockwise" and ranks not in (1, 2, 4, 8):
-        raise ValueError("blockwise MegaMoE currently targets intra-node EP1/2/4/8")
     config = deep_gemm_cpp._mega_moe_dispatch_config(
         num_ranks=ranks, num_experts=num_experts, num_topk=num_topk, hidden=hidden,
         num_max_tokens_per_rank=num_max_tokens_per_rank, precision=precision,
         intermediate_hidden=intermediate_hidden, block_m=block_m,
-        gemm1_block_n=gemm1_block_n, gemm1_block_k=gemm1_block_k, overrides=config_override)
+        gemm1_block_n=gemm1_block_n, gemm1_block_k=gemm1_block_k, overrides=config_override,
+        num_tokens_per_rank=num_tokens_per_rank)
     if not is_ppu1v5_device():
         raise RuntimeError("MegaMoE requires PPU1.5")
 
@@ -392,10 +429,12 @@ def get_symm_buffer_for_mega_moe(
         pass
 
     if precision in ("fp8_channelwise", "fp8_blockwise"):
-        return Fp8MegaMoEDispatchSymmBuffer(group, config)
+        return Fp8MegaMoEDispatchSymmBuffer(
+            group, config, local_pool=precision == "fp8_blockwise", block_m_override=block_m)
     bf16 = precision == "w4a16"
     if bf16:
-        config_override = {"BLOCK_M": block_m} if block_m is not None else None
+        config_override = ({"BLOCK_M": config["BLOCK_M"]}
+                           if block_m is not None or num_tokens_per_rank is not None else None)
     return MegaMoEDispatchGemm1SymmBuffer(
         group, config,
         gemm1_block_n=_DEFAULT_GEMM1_BLOCK_N if gemm1_block_n is None else gemm1_block_n,

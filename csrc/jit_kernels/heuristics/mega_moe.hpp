@@ -13,11 +13,13 @@
 
 namespace deep_gemm::mega_moe_config {
 struct DispatchConfig {
+    // Dispatch/padding granularity. FP8 blockwise chooses its GEMM1 tile separately.
     int block_m = 0;
     int chunk_blocks = 0;
     int clamp = 0;
     float clamp_value = 0;
     bool enable_gemm1 = false;
+    bool gemm1_dynamic_queue = false;
     bool enable_remote_pull = false;
     bool enable_remote_push = false;
     bool quantize_output = false;
@@ -27,6 +29,7 @@ struct DispatchConfig {
     int gemm1_block_k = 0;
     int gemm1_block_n = 0;
     int gemm1_n = 0;
+    int gemm1_compute_m = 128;  // FP8 GEMM1 tile; channelwise shares the dispatch granularity.
     int gemm1_stages = 0;
     int gemm1_warp_m = 0;
     int gemm1_warp_n = 0;
@@ -54,8 +57,6 @@ struct DispatchConfig {
     bool sm_specialization = false;
     float swiglu_alpha = 0;
     bool swiglu_oai = false;
-    int tail_gemm_blocks = 0;
-    int tail_gemm_percent = 0;
     int token_bytes = 0;
     int triple_block_pull = 0;
     int w4_block_k = 0;
@@ -68,17 +69,17 @@ struct DispatchConfig {
 };
 
 struct PreDispatchConfig {
-    int groups_per_block = 0;
+    int block_threads = 0;
     int hidden = 0;
     int num_sms = 0;
     int topk = 0;
-    int vec_block_threads = 0;
 };
 
 struct ScatterConfig {
     int block_k = 0;
     int block_m = 0;
     int block_n = 0;
+    int scratch_rows = 0;
     bool bm128_overlap_pair_staging = false;
     bool check_packed_routes = false;
     int k = 0;
@@ -89,7 +90,9 @@ struct ScatterConfig {
     int n = 0;
     int num_groups = 0;
     int num_master_groups = 0;
+    int m_tiles_per_group = 2;
     int num_stages = 0;
+    int num_threads = 0;
     bool rolling_pair_scatter = false;
     bool use_padded_valid_rows = false;
     int warp_m = 0;
@@ -159,10 +162,17 @@ inline int pre_dispatch_threads(int hidden) {
             return t;
     return 32;
 }
-inline bool vector_pre_dispatch(int tokens) {
-    return tokens >= 256;
+inline PreDispatchConfig w4a16_pre_dispatch_config(int hidden, int topk) {
+    return {256, hidden, get_num_sms(), topk};
 }
-
+inline int dispatch_pull_slots(int num_launch_threads, int token_bytes, int scale_bytes) {
+    // Match the device pull-staging limit; pull and GEMM reuse this storage.
+    constexpr int max_staging_bytes = 256 * 1024;
+    TORCH_CHECK(num_launch_threads > 0 && num_launch_threads % 32 == 0);
+    TORCH_CHECK(token_bytes > 0 && scale_bytes >= 0 && token_bytes <= max_staging_bytes - scale_bytes,
+                "MegaMoE pull staging must fit at least one token and its scales in 256 KiB");
+    return std::min({16, num_launch_threads / 32, max_staging_bytes / (token_bytes + scale_bytes)});
+}
 inline void apply_gemm1_tuning(DispatchConfig& c, const Gemm1Tuning& tuning,
                                const std::optional<Overrides>& overrides, int max_bn = 0, int max_bk = 0) {
     const auto set = [&](const char* key, int DispatchConfig::* field, int value) {
@@ -282,17 +292,54 @@ inline DispatchConfig w4a16_dispatch_config(int ranks, int experts, int topk, in
                                             int capacity, int tokens, int bm) {
     TORCH_CHECK(hidden > 0 && hidden % 32 == 0);
     TORCH_CHECK(bm == 16 || bm == 32 || bm == 64 || bm == 128 || bm == 256);
-    return w4_dispatch_config(dispatch_config(ranks, experts, topk, capacity, hidden * 2, 0),
-                              intermediate, tokens, 256, 128, 32, 64, 3, Overrides{{"BLOCK_M", bm}});
+    Overrides overrides{{"BLOCK_M", bm}};
+    if (bm < 64) overrides["GEMM1_WARP_M"] = bm;
+    auto c = w4_dispatch_config(dispatch_config(ranks, experts, topk, capacity, hidden * 2, 0),
+                                intermediate, tokens, 256, 128, 32, 64, 3, overrides);
+    // The FP4 selector provides a scheduling hint, but its narrow N warp
+    // shapes are not W4A16 MMA shapes. Normalize against the actual N tile
+    // before sizing transport or applying a later block-M tuning override.
+    const int bn = intermediate % 256 == 0 ? 256 : 128;
+    const int nwarps = bn / 64;
+    const int mwarps = bm < 64 ? 1 : std::clamp(c.num_threads / (nwarps * 32), 1, 4);
+    c.gemm1_block_n = bn;
+    c.gemm1_warp_m = bm / mwarps;
+    c.gemm1_warp_n = 64;
+    c.num_threads = mwarps * nwarps * 32;
+    return c;
 }
+inline DispatchConfig w4a16_buffer_config(int ranks, int experts, int topk, int hidden, int intermediate,
+                                         int capacity, std::optional<int> bucket, std::optional<int> requested) {
+    // Every rank uses the same allocation bucket, including ranks whose later
+    // forwards are empty. Transport protocols cannot be selected independently.
+    const auto profile = bucket
+        ? tuning_config({Precision::W4A16, ranks, experts, topk, hidden, intermediate / 2,
+                         *bucket, "situ"}).buffer : BufferTuning{};
+    auto c = w4a16_dispatch_config(ranks, experts, topk, hidden, intermediate, capacity, capacity,
+                                   requested.value_or(profile.block_m.value_or(64)));
+    c.enable_remote_push = profile.push_dispatch;
+    return c;
+}
+inline int fp8_dispatch_block_m(std::optional<int> requested, bool blockwise) {
+    const int bm = requested.value_or(blockwise ? 128 : 256);
+    if (blockwise) {
+        TORCH_CHECK(bm == 128, "FP8 blockwise dispatch requires block_m=128; "
+                    "the GEMM1 compute tile is selected separately");
+    } else {
+        TORCH_CHECK(bm == 128 || bm == 256,
+                    "FP8 channelwise dispatch/GEMM1 requires block_m=128 or 256");
+    }
+    return bm;
+}
+
 inline DispatchConfig fp8_dispatch_config(int ranks, int experts, int topk, int hidden, int capacity,
-                                          int bm, bool blockwise) {
+                                          std::optional<int> requested_block_m, bool blockwise) {
     TORCH_CHECK(hidden > 0 && hidden % (blockwise ? 128 : 16) == 0);
-    TORCH_CHECK(bm == 16 || bm == 32 || bm == 64 || bm == 128 || bm == 256);
+    const int bm = fp8_dispatch_block_m(requested_block_m, blockwise);
     auto c = dispatch_config(ranks, experts, topk, capacity, hidden, blockwise ? 4 * hidden / 128 : 4);
     c.num_sms = integer("SGLANG_PPU_FP8_MEGA_MOE_NUM_SMS", get_num_sms());
     TORCH_CHECK(c.num_sms > 0 && c.num_sms <= get_num_sms());
-    c.num_threads = bm == 256 ? 512 : 256;
+    c.num_threads = blockwise ? 256 : 512;
     c.block_m = bm;
     return c;
 }
@@ -392,6 +439,12 @@ inline Config fp4_pipeline_scatter_config(int m, int n, int k, int groups,
     const int em = expected ? std::max(1, *expected)
                    : tuning ? std::max(1, ceil_div(tuning->workload.tokens * tuning->workload.topk, groups))
                             : ceil_div(m, groups);
+    if (!requested && get_env<std::string>("DG_MOE_SCATTER_CONFIG").empty() &&
+        tuning && tuning->gemm2.tile) {
+        const auto& t = *tuning->gemm2.tile;
+        requested = Config{get_num_sms(), t[0], t[1], t[2], t[3], t[4], t[5],
+                           fp4_smem(t[5], t[0], t[1], t[3], t[4], t[2])};
+    }
     return fp4_scatter_config(m, n, k, groups, requested, true, false, false, em);
 }
 
@@ -414,35 +467,93 @@ inline void fp8_pull_config(DispatchConfig& c, std::optional<bool> paired,
 }
 
 inline void fp8_gemm1_config(DispatchConfig& c, std::optional<bool> paired,
-                             std::optional<bool> triple, const Gemm1Tuning& tuning) {
+                             std::optional<bool> triple, const Gemm1Tuning& tuning,
+                             std::optional<int> block_m = std::nullopt) {
+    // Pull reads unpadded source rows; only this rank's landing pool and GEMM
+    // metadata use BM. Workspace offsets and peer handshakes are independent
+    // of BM, so the same allocation supports per-call and per-rank selection.
+    c.block_m = fp8_dispatch_block_m(block_m.value_or(tuning.block_m.value_or(c.block_m)), false);
+    c.gemm1_compute_m = c.block_m;
     c.gemm1_block_n = 256;
     c.gemm1_block_k = 128;
-    c.gemm1_warp_m = 64;
+    c.gemm1_warp_m = c.gemm1_compute_m / 4;
     c.gemm1_warp_n = 64;
     c.gemm1_stages = 4;
+    c.num_threads = threads(c.gemm1_compute_m, c.gemm1_block_n, c.gemm1_warp_m, c.gemm1_warp_n);
+    c.gemm1_dynamic_queue = tuning.dynamic_queue.value_or(false);
     fp8_pull_config(c, paired, triple, "triple", tuning);
 }
 
-inline void fp8_blockwise_gemm1_config(DispatchConfig& c) {
-    c.pull_sms = integer("MEGA_MOE_PULL_SMS", 8);
+inline int blockwise_compute_m(std::optional<int> expected_m, int groups, int n, int sms) {
+    TORCH_CHECK(groups > 0 && n > 0 && sms > 0 && (!expected_m || *expected_m >= 0));
+    if (!expected_m || *expected_m <= 128) return 128;
+    const int m128 = ceil_div(*expected_m, 128), m192 = ceil_div(*expected_m, 192);
+    if (groups * m192 * ceil_div(n, 256) < sms && m128 > m192) return 128;
+    // Empirical fallback: BM192 may trade up to 12.5% more padded rows for
+    // lower per-row overhead. This is a tuning budget, not a kernel constraint.
+    constexpr int padding_budget_numerator = 9, padding_budget_denominator = 8;
+    return int64_t(m192) * 192 * padding_budget_denominator <=
+           int64_t(m128) * 128 * padding_budget_numerator ? 192 : 128;
+}
+
+inline void fp8_blockwise_gemm1_config(DispatchConfig& c, int tokens, int n, bool quant,
+                                       const Gemm1Tuning& tuning) {
+    c.block_m = fp8_dispatch_block_m(c.block_m, true);
+    const int groups = c.num_experts_per_rank;
+    const int em = ceil_div(int64_t(tokens) * c.num_topk, int64_t(groups));
+    c.gemm1_compute_m = tuning.block_m.value_or(quant ? blockwise_compute_m(em, groups, n, c.num_sms) : 128);
+    TORCH_CHECK(c.gemm1_compute_m == 128 || (quant && c.gemm1_compute_m == 192),
+                "FP8 blockwise GEMM1 requires compute block_m=128, or 192 with FP8 output");
+    TORCH_CHECK(!tuning.tile, "blockwise GEMM1 accepts block_m, not a full tile override");
+    c.gemm1_block_n = quant ? 256 : 128;
+    c.gemm1_block_k = 128;
+    c.gemm1_warp_m = c.gemm1_compute_m / 4;
+    c.gemm1_warp_n = c.gemm1_block_n / 4;
+    c.gemm1_stages = 4;
+    c.num_threads = threads(c.gemm1_compute_m, c.gemm1_block_n, c.gemm1_warp_m, c.gemm1_warp_n);
+    const double waves = double(groups) * ceil_div(em, c.gemm1_compute_m) * ceil_div(n, 256) / c.num_sms;
+    // The imported fallback favors a queue for medium-depth BM192 workloads;
+    // keep an explicit on/off choice authoritative over this empirical window.
+    constexpr int queue_min_waves = 32, queue_max_waves = 64;
+    c.gemm1_dynamic_queue = tuning.dynamic_queue.value_or(
+        quant && c.gemm1_compute_m == 192 && waves >= queue_min_waves && waves <= queue_max_waves);
+    // Bound dedicated pull CTAs to a quarter of the grid. Wider GEMMs leave
+    // more computation per pulled row, so they need a smaller pull fraction.
+    constexpr int pull_grid_divisor = 4, pull_balance_columns = 512;
+    const int limit = std::max(1, c.num_sms / pull_grid_divisor);
+    int pulls = std::min(limit, std::max(1, ceil_div(c.num_sms * pull_balance_columns, n + pull_balance_columns)));
+    pulls = std::min(limit, pulls * std::max(ceil_div(c.num_ranks, 32), c.gemm1_dynamic_queue ? 2 : 1));
+    c.pull_sms = integer("MEGA_MOE_PULL_SMS", tuning.pull_sms.value_or(pulls));
     TORCH_CHECK(c.pull_sms > 0 && c.pull_sms < c.num_sms);
 }
 
-inline int fp8_blockwise_scatter_stages(int n, int k, int groups, int masters) {
-    return (n == 4096 && k == 2048 && masters == 72) ||
-           (n == 2560 && k == 640 && groups == 128) ? 3 : 2;
+inline ScatterConfig fp8_blockwise_scatter_config(int n, int k, int groups, int masters,
+                                                   std::optional<int> expected,
+                                                   const Gemm2Tuning& tuning) {
+    ScatterConfig c;
+    c.n = n;
+    c.k = k;
+    c.num_groups = groups;
+    c.num_master_groups = masters;
+    c.block_m = blockwise_compute_m(expected, groups, n, get_num_sms());
+    c.num_stages = std::min(c.block_m == 192 ? 4 : 3, std::max(2, k / 128));
+    if (tuning.tile) {
+        const auto& t = *tuning.tile;
+        TORCH_CHECK(t[1] == 256 && t[2] == 128 && t[3] == t[0] / 4 && t[4] == 64,
+                    "unsupported blockwise GEMM2 tile");
+        c.block_m = t[0];
+        c.num_stages = t[5];
+    }
+    TORCH_CHECK((c.block_m == 128 || c.block_m == 192) && c.num_stages >= 2 && c.num_stages <= 4);
+    c.block_n = 256;
+    c.block_k = 128;
+    c.warp_m = c.block_m / 4;
+    c.warp_n = 64;
+    c.num_threads = threads(c.block_m, c.block_n, c.warp_m, c.warp_n);
+    c.scratch_rows = c.block_m == 192 || c.num_stages == 4 ? 32 : 0;
+    return c;
 }
 
-inline std::optional<std::pair<Config, std::string>> channel_scatter_config(int expected_m, int n, int k,
-                                                                            int groups, int sms) {
-    if (n != 6144 || k != 2048 || groups < 32 || groups > 34)
-        return std::nullopt;
-    const int bm = expected_m <= 16 ? 32 : expected_m <= 32 ? 64 : expected_m <= 128 ? 128 : 256;
-    const int wm = bm == 256 ? 64 : 32, stages = expected_m <= 32 ? 3 : 4;
-    Config config{sms, bm, 256,    128,
-                  wm,  64, stages, deep_gemm_int8::get_smem_config(stages, k, bm, 256, 128, 1)};
-    return std::make_pair(config, bm == 256 ? "Default" : "OverlapPrologue");
-}
 // Keep dispatch scheduling independent of buffer ownership and kernel argument assembly.
 inline void fp4_dispatch_schedule(DispatchConfig& c, const DispatchConfig& capacity, int num_tokens,
                                   bool dynamic, bool bf16, bool dispatch_only, bool split, bool glu,
@@ -462,15 +573,9 @@ inline void fp4_dispatch_schedule(DispatchConfig& c, const DispatchConfig& capac
     const bool specialized = !dispatch_only && !latency && flag("MEGA_MOE_SM_SPECIALIZATION", true);
     const int producers = latency ? 0 : integer("MEGA_MOE_PRODUCER_WARPS", push && bf16 ? 8 : 0);
     TORCH_CHECK(producers >= 0 && producers <= 16);
-    const int max_slots = c.num_threads / 32 + producers;
-    const int slots = latency ? std::min(2, max_slots)
-                              : integer("MEGA_MOE_PULL_SLOTS", std::min(specialized ? 16 : 8, max_slots));
-    TORCH_CHECK(slots >= 1 && slots <= max_slots);
-    const bool tail_default = specialized && gemm && pull && !std::getenv("MEGA_MOE_TAIL_GEMM_BLOCKS") &&
-                              !std::getenv("MEGA_MOE_TAIL_GEMM_PERCENT");
-    const int tail_blocks = latency ? 0 : integer("MEGA_MOE_TAIL_GEMM_BLOCKS", tail_default ? 19 : 0);
-    const int tail_percent = latency ? 0 : integer("MEGA_MOE_TAIL_GEMM_PERCENT", tail_default ? 27 : 0);
-    TORCH_CHECK(tail_blocks >= 0 && tail_percent >= 0 && tail_percent <= 100);
+    c.gemm1_dynamic_queue = specialized && gemm && pull && producers == 0 &&
+                            tuning.dynamic_queue.value_or(true);
+    const int slots = dispatch_pull_slots(c.num_threads + producers * 32, c.token_bytes, c.sf_bytes);
     int pulls, gemms;
     if (specialized) {
         pulls = integer("MEGA_MOE_PULL_SMS", std::getenv("MEGA_MOE_GEMM_SMS")
@@ -483,7 +588,6 @@ inline void fp4_dispatch_schedule(DispatchConfig& c, const DispatchConfig& capac
     }
     TORCH_CHECK(pulls >= 1 && pulls <= sms && gemms >= 1 && gemms <= sms);
     TORCH_CHECK(!specialized || ((gemm || pull) && pulls + gemms == sms));
-    TORCH_CHECK(!(tail_blocks || tail_percent) || (specialized && gemm && pull));
     c.enable_gemm1 = gemm;
     c.enable_remote_pull = pull;
     c.enable_remote_push = push;
@@ -492,48 +596,68 @@ inline void fp4_dispatch_schedule(DispatchConfig& c, const DispatchConfig& capac
     c.gemm_sms = gemms;
     c.sm_specialization = specialized;
     c.pull_slots = slots;
-    c.tail_gemm_blocks = tail_blocks;
-    c.tail_gemm_percent = tail_percent;
 }
 
 inline void w4a16_dispatch_tile(DispatchConfig& c, int n) {
     const int bn = n % 256 == 0 ? 256 : 128, warps = c.num_threads / 32, mwarps = warps / (bn / 64);
     TORCH_CHECK(warps * 32 == c.num_threads && warps % (bn / 64) == 0 &&
                 (mwarps == 1 || mwarps == 2 || mwarps == 4));
-    c.pull_slots = std::min(8, warps);
-    c.w4_block_m = 64 * mwarps;
+    c.pull_slots = dispatch_pull_slots(c.num_threads, c.token_bytes, c.sf_bytes);
+    c.w4_block_m = c.block_m < 64 ? c.block_m * mwarps : 64 * mwarps;
     c.w4_block_n = bn;
     c.w4_block_k = 128;
-    c.w4_warp_m = 64;
+    c.w4_warp_m = c.block_m < 64 ? c.block_m : 64;
     c.w4_warp_n = 64;
     c.w4_warp_k = 128;
     c.w4_stages = 2;
 }
 
-// GLM prefill quantization policy; explicit API/environment overrides take priority.
-inline bool fp8_separate_quant(const DispatchConfig& c, int num_tokens, int masters, int n, int hidden,
-                               std::optional<bool> separate, const Gemm1Tuning& tuning = {}) {
-    bool split = c.swiglu_oai && num_tokens >= 1024 && c.num_ranks == 8 && c.num_experts == 128 &&
-                 c.num_topk == 4 && masters == 16 && n == 6144 && hidden == 6144 && !c.paired_block_pull;
-    split = tuning.separate_quant.value_or(split);
-    if (separate)
-        split = *separate;
-    else {
-        const auto mode = get_env<std::string>("MEGA_MOE_QUANT_MODE", "auto");
-        TORCH_CHECK(mode == "auto" || mode == "fused" || mode == "separate");
-        if (mode != "auto")
-            split = mode == "separate";
+struct W4A16Gemm1Config {
+    DispatchConfig dispatch;
+    int gemm_threads;
+    bool separate_dispatch;
+};
+
+inline W4A16Gemm1Config w4a16_gemm1_config(
+    DispatchConfig c, int n, const Gemm1Tuning& tuning,
+    const std::optional<Overrides>& overrides) {
+    c.gemm1_n = n;
+    c.gemm1_dynamic_queue = tuning.dynamic_queue.value_or(false);
+    if (tuning.separate_dispatch || c.enable_remote_push) {
+        TORCH_CHECK((tuning.tile || c.enable_remote_push) && !c.gemm1_dynamic_queue,
+                    "separate W4A16 dispatch requires an MMA tile and no fused work queue");
+        if (tuning.tile) {
+            const auto& t = *tuning.tile;
+            c.w4_block_m = t[0]; c.w4_block_n = t[1]; c.w4_block_k = t[2];
+            c.w4_warp_m = t[3]; c.w4_warp_n = t[4]; c.w4_warp_k = t[2];
+            c.w4_stages = t[5];
+        } else {
+            // An empty or unmatched rank still follows the workspace's push
+            // protocol, with the ordinary W4A16 GEMM geometry.
+            w4a16_dispatch_tile(c, n);
+        }
+        const int gemm_threads = threads(c.w4_block_m, c.w4_block_n, c.w4_warp_m, c.w4_warp_n);
+        c.num_threads = tuning.dispatch_threads.value_or(c.num_threads);
+        c.pull_slots = dispatch_pull_slots(c.num_threads, c.token_bytes, c.sf_bytes);
+        return {c, gemm_threads, true};
     }
-    return split;
+    apply_gemm1_tuning(c, tuning, overrides);
+    // The measured queue profile owns its pull/compute partition.
+    TORCH_CHECK(!c.gemm1_dynamic_queue || tuning.pull_sms,
+                "W4A16 dynamic queue requires a pull CTA count in the tuning profile");
+    c.num_pull_sms = c.gemm1_dynamic_queue ? *tuning.pull_sms : c.num_sms;
+    TORCH_CHECK(!c.gemm1_dynamic_queue || (c.num_pull_sms > 0 && c.num_pull_sms < c.num_sms));
+    w4a16_dispatch_tile(c, n);
+    return {c, c.num_threads, false};
 }
 
 inline bool channel_pair_staging(const Config& config, const std::string& kernel, int m, int n, int k,
                                  int groups, int em, int world_size, int max_tokens, int num_topk,
                                  bool rolling) {
     const auto [ns, bm, bn, bk, wm, wn, stages, smem] = config;
-    return m == 4096 && n == 6144 && k == 2048 && groups == 32 && em == 128 && bm == 128 && bn == 256 &&
-           bk == 128 && wm == 32 && wn == 64 && stages == 4 && kernel == "OverlapPrologue" &&
-           world_size == 8 && max_tokens == 512 && num_topk == 8 && !rolling;
+    return channel_pair_staging_default(m, n, k, groups, em, world_size, max_tokens, num_topk) &&
+           bm == 128 && bn == 256 && bk == 128 && wm == 32 && wn == 64 && stages == 4 &&
+           kernel == "OverlapPrologue" && !rolling;
 }
 
 inline std::pair<Config, ScatterConfig> channel_scatter_policy(
@@ -544,21 +668,19 @@ inline std::pair<Config, ScatterConfig> channel_scatter_policy(
     const int em = ceil_div(m, groups), physical_sms = get_num_sms();
     int sms = sms_override.value_or(integer("DG_CHANNELWISE_SCATTER_NUM_SMS", physical_sms));
     TORCH_CHECK(sms > 0 && sms <= physical_sms);
-    std::string kernel = kernel_override.value_or(k < 4096 ? "OverlapPrologue" : "Default");
+    std::string kernel = kernel_override.value_or("Default");
     TORCH_CHECK(kernel == "Default" || kernel == "OverlapPrologue");
-    if (!requested && tuning.tile) {
+    if (!requested && tuning.tile &&
+        (!tuning.capacity || *tuning.capacity == capacity) &&
+        (!tuning.requires_no_replicas || masters == groups)) {
         const auto& t = *tuning.tile;
         requested = Config{sms, t[0], t[1], t[2], t[3], t[4], t[5],
             deep_gemm_int8::get_smem_config(t[5], k, t[0], t[1], t[2], 1)};
     }
-    if (!requested) {
-        if (const auto selected = channel_scatter_config(em, n, k, groups, sms)) {
-            requested = selected->first;
-            if (!kernel_override)
-                kernel = selected->second;
-        } else
-            requested = deep_gemm_int8::get_best_configs(em, n, k, groups, sms, GemmType::MGroupedNoPad, 256);
-    }
+    if (!requested)
+        requested = deep_gemm_int8::get_best_configs(
+            em, n, k, groups, sms, GemmType::MGroupedNoPad, 256,
+            std::nullopt, nullptr, /*fixed_block_n=*/256);
     const auto [ns, bm, bn, bk, wm, wn, stages, smem] = *requested;
     TORCH_CHECK(bn == 256 && n % bn == 0, "channelwise scatter requires complete 256-column tiles");
     const bool rolling = rolling_override.value_or(
@@ -585,8 +707,14 @@ inline std::pair<Config, ScatterConfig> channel_scatter_policy(
 }
 
 inline auto w4a16_scatter_config(int em, int n, int k,
-                                 const std::optional<deep_gemm_w4a16_common::PPUW4ConfigTuple>& configs) {
+                                 std::optional<deep_gemm_w4a16_common::PPUW4ConfigTuple> configs,
+                                 const Gemm2Tuning& tuning = {}) {
     TORCH_CHECK(n > 0 && n % 256 == 0, "W4A16 scatter requires N divisible by 256");
+    if (!configs && tuning.tile) {
+        const auto& t = *tuning.tile;
+        configs = deep_gemm_w4a16_common::PPUW4ConfigTuple{
+            get_num_sms(), t[0], t[1], t[2], t[3], t[4], t[2], t[5]};
+    }
     auto c = deep_gemm_w4a16_common::ppu_w4_config(em, n, k, configs);
     if (!configs) {
         c.block_n = std::max(256, std::min(c.block_n, n) / 256 * 256);
@@ -599,12 +727,14 @@ inline auto w4a16_scatter_config(int em, int n, int k,
     return c;
 }
 
-inline bool chunked_reduce(int tokens, bool fp8 = false, const CombineTuning& tuning = {}) {
-    const char* value = std::getenv(fp8 ? "DG_MOE_FP8_REDUCE_CHUNKED" : "DG_MOE_REDUCE_CHUNKED");
-    if (fp8 && value == nullptr)
-        value = std::getenv("DG_MOE_REDUCE_CHUNKED");
-    return value != nullptr ? std::atoi(value) != 0
-                            : tuning.chunked.value_or(!fp8 && tokens >= 64 && tokens <= 2048);
+inline int combine_num_threads(int tokens, int hidden) {
+    // One CTA per token. Use the actual local row count, not buffer capacity
+    // or dispatch padding, to balance row parallelism and work per thread.
+    if (tokens >= 512)
+        return 256;
+    if (tokens <= 64 && hidden > 4096)
+        return 1024;
+    return 512;
 }
 
 } // namespace deep_gemm::mega_moe_config
