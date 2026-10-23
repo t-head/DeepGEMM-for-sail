@@ -43,9 +43,11 @@ static void check_config(const W4A8Config& c, int n, int k, GemmType kind) {
     DG_HOST_ASSERT(get_num_threads(c) <= 1024);
 }
 
-static int get_smem_size(const W4A8Config& c) {
-    const int mainloop = (c.block_m*c.block_k + c.block_n*c.block_k/2 +
-                         c.block_n*c.block_k/32) * c.num_stages;
+static int get_smem_size(const W4A8Config& c, int k) {
+    const bool resident_a = c.n_expand > 1 && c.warp_m == 64 && k <= 384;
+    const int a_slots = resident_a ? std::max(c.num_stages, k / c.block_k) : c.num_stages;
+    const int mainloop = c.block_m*c.block_k*a_slots +
+                        (c.block_n*c.block_k/2 + c.block_n*c.block_k/32)*c.num_stages;
     const int reduction = 16*64*(c.block_n/64)*(c.block_k/c.warp_k)*4;
     return std::max(mainloop, reduction);
 }

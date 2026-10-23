@@ -97,6 +97,12 @@ struct GemmSmemConfigFp4 {
   static constexpr uint32_t kTotalSize = kSmemScaleOffset + kSmemSFASize + kSmemSFBSize;
 };
 
+struct FusedAClearInst {
+  CUTE_HOST_DEVICE static void copy(const cutlass::uint128_t&, cutlass::uint128_t& dst, bool valid) {
+    if (!valid) dst = cutlass::uint128_t{};
+  }
+};
+
 template <typename SrcT, typename ACopyInst, typename TilerA,
          uint32_t BLOCK_M, uint32_t BLOCK_K, uint32_t STRIDE_AM,
          class TAsA, class... Ts>
@@ -121,7 +127,11 @@ __forceinline__ __device__ void copy_A_to_tsm(TAsA&& tAsA, const void* src_ptr, 
         const cutlass::uint128_t* src_ptr128 = reinterpret_cast<const cutlass::uint128_t*>(reinterpret_cast<const SrcT*>(src_ptr)
               + token_offset * STRIDE_AM + (k_iter * TILER_N) + tid_k * KPerThread + stage_offset);
         cutlass::uint128_t* dst_ptr128 = reinterpret_cast<cutlass::uint128_t*>(cute::raw_pointer_cast(tAsA(_,m_iter,k_iter).data()));
-        ACopyInst::copy(*src_ptr128, *dst_ptr128, token_mask);
+        if constexpr (std::is_same_v<ACopyInst, cute::PPU_CP_ASYNC_CACHEALWAYS<cutlass::uint128_t>>) {
+          if (token_mask) ACopyInst::copy(*src_ptr128, *dst_ptr128);
+        } else {
+          ACopyInst::copy(*src_ptr128, *dst_ptr128, token_mask);
+        }
       }
     }
   }
@@ -192,7 +202,11 @@ __forceinline__ __device__ void copy_A_to_tsm_impl(
             k_iter * Config::TILER_N + tid_k * Config::KPerThread + stage_offset);
         cutlass::uint128_t* dst_ptr128 = reinterpret_cast<cutlass::uint128_t*>(
             cute::raw_pointer_cast(tAsA(_,m_iter,k_iter).data()));
-        ACopyInst::copy(*src_ptr128, *dst_ptr128, token_mask);
+        if constexpr (std::is_same_v<ACopyInst, cute::PPU_CP_ASYNC_CACHEALWAYS<cutlass::uint128_t>>) {
+          if (token_mask) ACopyInst::copy(*src_ptr128, *dst_ptr128);
+        } else {
+          ACopyInst::copy(*src_ptr128, *dst_ptr128, token_mask);
+        }
       }
     }
   }
@@ -210,6 +224,20 @@ __forceinline__ __device__ void copy_A_to_tsm(
       stage_offset, shape_m, thread_idx);
 }
 
+
+template <typename SrcT, typename TilerA,
+          uint32_t BLOCK_M, uint32_t BLOCK_K, uint32_t STRIDE_AM, int STAGES,
+          int THREAD_NUM, class TAsA>
+__forceinline__ __device__ void clear_invalid_A_to_tsm(
+    TAsA&& tAsA, const void* src_ptr, const uint32_t* token_offsets,
+    uint32_t shape_m, uint32_t thread_idx, cute::Int<THREAD_NUM> threads) {
+  // Invalid rows stay zero across K; the caller's prologue barrier publishes these stores.
+  CUTE_UNROLL
+  for (int stage = 0; stage < STAGES; ++stage) {
+    copy_A_to_tsm<SrcT, FusedAClearInst, TilerA, BLOCK_M, BLOCK_K, STRIDE_AM>(
+        tAsA(_,_,_,stage), src_ptr, token_offsets, 0, shape_m, thread_idx, threads);
+  }
+}
 
 template <typename AccT, typename DstT,
          uint32_t SHAPE_N, uint32_t BLOCK_N, uint32_t STRIDE_CM,

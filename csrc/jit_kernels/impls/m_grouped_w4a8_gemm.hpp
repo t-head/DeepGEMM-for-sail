@@ -63,7 +63,7 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
 }}
 )", a.n, a.k, c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, c.warp_k,
             a.groups, c.num_stages, get_gemm_type_name(a.kind), c.n_expand,
-            get_smem_size(c), get_num_threads(c), sizeof(Arguments<Scheduler>));
+            get_smem_size(c, a.k), get_num_threads(c), sizeof(Arguments<Scheduler>));
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
@@ -74,7 +74,7 @@ template<class Scheduler>
 static void launch(const W4A8Config& c, int m, int n, int k, int groups, GemmType kind, int expected_m,
                    int topk, int32_t* m_rows, const Arguments<Scheduler>& params) {
     using R = Runtime<Scheduler>;
-    const int threads = get_num_threads(c), smem = get_smem_size(c);
+    const int threads = get_num_threads(c), smem = get_smem_size(c, k);
     typename R::Args args{c, n, k, groups, kind, {dim3(c.num_sms), dim3(threads), smem}, params};
     const auto& runtime = compiler->build("m_grouped_gemm_w4fa8_mma", R::generate(args));
     construct_launch_config(runtime->kernel, current_stream(), smem, args.launch_args.grid_dim, args.launch_args.block_dim);
