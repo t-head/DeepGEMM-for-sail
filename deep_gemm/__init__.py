@@ -222,3 +222,18 @@ try:
     from . import legacy
 except Exception as e:
     print(f'Failed to load legacy DeepGEMM Triton kernels: {e}')
+
+
+# MegaMoE compute APIs
+from .deep_gemm_cpp import (
+    fp4_fp4_mega_moe,
+    bf16_fp4_mega_moe,
+    fp8_fp8_mega_moe,
+    mega_moe_pre_dispatch,
+)
+
+# Load-time weight preparation
+from .deep_gemm_cpp import transform_weights_for_mega_moe
+
+# Symmetric-memory ownership and process-group helpers
+from .mega_moe import get_symm_buffer_for_mega_moe

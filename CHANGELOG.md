@@ -4,7 +4,7 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
-## Unreleased
+## 2.1.0 — Unreleased
 
 ### Added
 
@@ -57,6 +57,29 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   `preprocess_mxfp4_scales` remains as a deprecated scale-only alias, and
   `preprocess_mxfp4_weight_for_act_and_quant_fusing` remains as a deprecated
   activation-fusion alias. Unsupported mode/fusion combinations report an error.
+
+### MegaMoE
+
+- Adds MegaMoE support on ZW-M890P for W4A4, BF16/FP4 and FP8
+  channelwise/blockwise, with a common symmetric-workspace factory and weight
+  transformation. See the [MegaMoE calling contract](README.md#megamoe).
+- Provides a pipeline for activation, quantization, dispatch/GEMM1, GEMM2/scatter,
+  weighted combine and communication-state recycling. The workspace
+  owns and reuses its scratch allocations, including during graph replay.
+- Supplies original routing weights once at pre-dispatch; all complete entries
+  apply them once in combine. `intermediate_hidden` specifies the activated
+  intermediate width I.
+- Rejects unsupported precision/activation, tile, dimension and expert-count
+  combinations before allocation or compute launch.
+- Adds public-entry regression coverage for changing routes, masked and empty
+  inputs, workspace reuse and graph replay, with selectable balanced, random
+  and skewed routing for end-to-end benchmarking.
+- Tunes Kimi K3 W4A16 EP32 prefill with separate dispatch/GEMM1 geometry and
+  source-push transport selected by the common workspace allocation bucket.
+  The communication protocol remains consistent when a rank has no input tokens.
+- Uses PPU instruction wrappers for MegaMoE synchronization, asynchronous copy
+  and numeric conversion.
+- Declares the SCM version plugin as a build dependency for package metadata.
 
 ## [1.1.0+v0.1.0](https://github.com/t-head/DeepGEMM-for-sail/tree/v1.1.0_v0.1.0_release) — Initial Public Release
 

@@ -23,6 +23,12 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 
 ## Release Notes
 
+### 2.1.0 — Unreleased
+
+Adds MegaMoE support on ZW-M890P, reusable workspaces and common weight
+preparation. See the [MegaMoE calling contract](#megamoe) and
+[release notes](CHANGELOG.md#210--unreleased).
+
 ### 1.1.0+v0.1.0 — Initial Public Release
 
 This is the first formal public release of DeepGEMM for PPU. The `1.1.0+v0.1.0` identifier follows the current DeepGEMM-for-sail release naming convention and is maintained independently of the upstream DeepGEMM project.
@@ -284,6 +290,212 @@ We provide einsum-style batched GEMM interfaces that fuse a `(1,0,2)` permute on
 Both take `(tensor, scales)` tuples as `a`/`b`, write to the BF16 output `d`, and optionally accumulate onto `c`.
 
 For more information, please refer to the `fp8_einsum` and `int8_einsum` function documentation.
+
+#### MegaMoE
+
+MegaMoE supports W4A4, W4A16 and W8A8 routed MoE pipelines only on ZW-M890P.
+Allocate a workspace with `get_symm_buffer_for_mega_moe`, transform both expert
+weights once with `transform_weights_for_mega_moe`, then call
+`mega_moe_pre_dispatch` followed by one complete output-first entry point:
+`fp4_fp4_mega_moe`, `bf16_fp4_mega_moe` or `fp8_fp8_mega_moe`.
+These entries own dispatch/GEMM1, GEMM2/scatter, counter recycling and combine.
+The calling contract below covers supported layouts and workspace reuse;
+see the [precision-specific end-to-end tests](tests/README.MD#routed-moe-correctness-and-performance-tests).
+
+##### Upstream API reference and differences
+
+The calling convention follows upstream DeepGEMM commit
+[`66081d4c9c7d7c44f13fea402e5b622aa0f409c2`](https://github.com/deepseek-ai/DeepGEMM/blob/66081d4c9c7d7c44f13fea402e5b622aa0f409c2/deep_gemm/mega/__init__.py):
+a reusable symmetric workspace, common load-time weight transformation and an
+output-first complete MoE call. This is the API reference; the PPU backend uses
+its own multi-kernel pipeline.
+
+| Interface aspect | PPU calling convention and reason |
+| --- | --- |
+| Workspace | `get_symm_buffer_for_mega_moe` allocates a PPU workspace that owns scratch, metadata and communication state. |
+| Complete compute names | `fp4_fp4_mega_moe`, `bf16_fp4_mega_moe` and `fp8_fp8_mega_moe` identify the supported activation/input and weight precisions. |
+| Input preparation | Explicit `mega_moe_pre_dispatch` accepts BF16 states and performs input quantization/staging before the complete compute call. Router and shared experts stay outside the library. |
+| Scatter/combine format | Complete entries use BF16 scatter/combine. |
+| Physical replicas | Optional `w1_replicas` and `w2_replicas` accept separate physical-expert allocations. Callers supply logical-to-physical routing, with the same physical order for both GEMMs. |
+
+##### Supported complete entries
+
+| Entry | Workspace precision | GEMM1 activation | Output |
+| --- | --- | --- | --- |
+| `fp4_fp4_mega_moe` | `w4a4` | SwiGLU, Step, SiTU | BF16 |
+| `bf16_fp4_mega_moe` | `w4a16` | SiTU only | BF16 |
+| `fp8_fp8_mega_moe` | `fp8_channelwise` | SwiGLU, SwiGLU-OAI | BF16 |
+| `fp8_fp8_mega_moe` | `fp8_blockwise` | SwiGLU, SwiGLU-OAI | BF16 |
+
+Use `activation="swiglu"`, `"step"`, `"situ"` or `"swiglu_oai"`.
+`activation_limit` optionally sets a finite positive clamp for supported SwiGLU
+variants; SiTU uses `situ_beta=4` and `situ_linear_beta=25`.
+OAI defaults to `activation_alpha=1.702`. Unsupported combinations raise before
+dispatch/GEMM1. Workspace precision determines output quantization between the
+two GEMMs. The default tuning selector uses actual local token count, not
+capacity. Configuration is selected and cached internally.
+
+##### Allocation and weight preparation
+
+`hidden` is the input/output width H. `intermediate_hidden` is the width I
+after activation. Each expert's logical GEMM1 weights have shape `[2I, H]`,
+with rows ordered `[gate; up]`; GEMM2 weights have shape `[H, I]`.
+I must be a positive multiple of 128. H must be a positive multiple of 512 for
+W4A4, or 256 otherwise. Local physical expert counts must agree across ranks.
+The current kernel limits are:
+
+| Precision | EP limit | Local physical experts (including replicas) | Workspace block M |
+| --- | --- | --- | --- |
+| W4A4 | 32 | Determined by the selected dispatch/GEMM configuration | Selected by tuning |
+| W4A16 | 32 | 1–127 | Selected by tuning or an explicit supported tile |
+| FP8 channelwise | 8 | 1–128 | 128 or 256; selected per call, or explicitly fixed |
+| FP8 blockwise | 64 | 1–128 | 128 |
+
+Omit `block_m` for the normal calling convention. These are implementation
+limits, not a claim that every EP/shape combination has device validation.
+Global physical experts must be divisible by EP; top-k is 1–16 and no larger
+than the expert count. Capacity must be positive and below 2^24.
+
+Pass quantized `(weight, scale)` pairs to `transform_weights_for_mega_moe`:
+
+| Precision | Weight storage | Raw scales |
+| --- | --- | --- |
+| W4A4/W4A16 | uint8 `[E, N, K/2]`, adjacent K nibbles, low nibble first | uint8 UE8M0 `[E, N, K/32]` |
+| FP8 channelwise | E4M3 `[E, N, K]` | FP32 `[E, N, 1]` |
+| FP8 blockwise | E4M3 `[E, N, K]` | FP32 `[E, N/128, K/128]` |
+
+The transformation does not quantize weights. It rearranges G1 into G8
+(gate/up groups of eight), or G128 for blockwise FP8, and packs scales for the
+backend. Do not pass previously transformed tensors through it again.
+Transform at model load time, outside graph capture and timing. The returned
+pairs are passed directly to the complete compute entry.
+
+```python
+import torch
+import deep_gemm as dg
+
+# group is initialized; the current device is selected on every rank.
+# w1_raw/w2_raw are quantized pairs in the table's logical layouts.
+w1, w2 = dg.transform_weights_for_mega_moe(w1_raw, w2_raw, precision="w4a4")
+buffer = dg.get_symm_buffer_for_mega_moe(
+    group, num_experts=384, num_max_tokens_per_rank=4096,
+    num_topk=6, hidden=7168, intermediate_hidden=3072, precision="w4a4")
+y = torch.empty_like(x)  # x: BF16 [local_tokens, 7168]
+
+def forward():
+    # IDs: contiguous int64; original weights: contiguous FP32 [local_tokens, 6].
+    dg.mega_moe_pre_dispatch(x, topk_ids, topk_weights, buffer)
+    dg.fp4_fp4_mega_moe(y, w1, w2, buffer,
+                      activation="swiglu", activation_limit=10.0)
+    return y
+
+# Compile every stage on all ranks before launching cooperative kernels.
+previous_mode = dg.get_compile_mode()
+dg.set_compile_mode(1)  # compile/load only
+try:
+    forward()
+finally:
+    dg.set_compile_mode(previous_mode)
+group.barrier().wait()
+forward()  # warm up before graph capture
+# Reuse the same workspace for subsequent calls, including new routing values.
+# After all work/graphs using it have completed:
+torch.cuda.synchronize()
+buffer.destroy()
+```
+
+##### State and routing contract
+
+Allocation is collective, outside capture. The workspace owns activation and
+scale scratch, route metadata, GEMM2 scheduler scratch, combine storage, dispatch
+counts and barrier state. Scheduler scratch is sized for the workspace capacity
+and reused when token counts, routes or tuning tiles change; no caller-managed
+reset is needed. Count reset, cross-rank generation barrier and stream-ordered completion
+reset are internal. Callers never clear counters or construct peer pointers.
+
+All ranks, including ranks with zero tokens, issue the same number of calls in
+the same order. Use one stream per workspace and keep its storage alive while
+any graph or kernel references it. Concurrent invocations require separate
+workspaces. `y` is contiguous BF16 `[local_tokens, H]` on the workspace device.
+`local_tokens` is inferred by pre-dispatch and must not exceed capacity.
+For W4A16, `num_tokens_per_rank` can choose a common allocation bucket;
+this must be identical across ranks even if one rank's actual input is empty.
+It selects transport padding and the workspace's push/pull protocol, which
+remains fixed when actual token counts change. Kimi K3 EP32 prefill buckets
+1024, 2048 and 4096 use source push followed by independently scheduled GEMM1.
+Omitting this optional hint retains pull dispatch. For example, add
+`num_tokens_per_rank=1024` to workspace allocation for that prefill bucket;
+do not substitute an independently measured rank-local count.
+
+Provide the original top-k weights only to pre-dispatch. Every precision
+applies them exactly once in combine, after GEMM2 BF16 conversion. W4A4
+activation quantization therefore operates on unweighted values. These are
+routing weights, not the quantization scales used by GEMM. Invalid routes
+(`ID=-1`) are masked internally; zero-weight combine slots are never read.
+Graph replay re-reads current input IDs and weights and safely recycles state.
+The caller supplies distinct valid expert IDs within each token's top-k list.
+
+##### Implementation and tuning
+
+FP8 channelwise, FP8 blockwise and W4A16 share a rank-local G1 work queue.
+Pull CTAs join computation after publishing all their input blocks; consumers
+wait only for the input blocks required by their current GEMM tile.
+Channelwise prefetches one next tile using the MMA/epilogue barriers;
+W4A16 claims one tile at a time; blockwise claims two tiles per batch.
+Measured profiles select the queue policy internally. On ZW-M890P with 39 CUs,
+these queue profiles cover GLM52 channelwise EP8 at 32/1024 tokens per rank and
+GLM53 Flash channelwise EP4 at 1024 tokens per rank. Other counts use the
+default schedule. No queue-mode environment variable is required.
+
+GLM53 Flash channelwise EP4 at 1024 tokens per rank also selects BM128 for
+dispatch/GEMM1, with WM32 and 512 threads. Other channelwise profiles use
+BM256. The symmetric workspace layout is independent of this rank-local tile;
+the same workspace can switch tiles as input counts change, including empty
+ranks. Omit `block_m` to use these profiles; an explicit 128 or 256 overrides
+the table. GEMM2 consumes the row metadata produced by each invocation.
+
+Kimi K3 W4A16 EP8 at 1024/2048/4096 tokens per rank uses separate pull dispatch
+and GEMM1 launches, with 64-row transport padding and a BM128 SiTU GEMM1 tile.
+The two launches use independent CTA geometry; SiTU remains fused into GEMM1.
+
+FP8 channelwise always quantizes the activated BF16 G1 output in a
+stream-ordered standalone kernel before G2. Quantization walks only valid
+expert rows from the G1 metadata and preserves their pool offsets. Its launch
+uses 128 threads per CTA and four CTAs per configured SM, independently of the
+G1 tile. Widths with partial vector iterations use a predicated tail. There is
+no quantization-mode environment variable or model-specific placement policy.
+
+W4A16 supports SiTU with small-token dispatch and compute tiles for Kimi K3
+EP32 decode. Blockwise FP8 supports SwiGLU and SwiGLU-OAI, native 128-by-128
+weight scales, BM128/BM192 compute tiles and up to 64 peer ranks.
+K3 decode profiles include the buffer tile, separate dispatch/GEMM1 launch
+geometry, GEMM2 tile and combine configuration in the same tuning table.
+Blockwise gate/up weights use G128 interleaving. Prepare weights and scales
+from their logical representation with `transform_weights_for_mega_moe`.
+Symmetric allocations use Torch directly; blockwise expert landing pools
+use local allocations. The complete entry points reuse the staged kernels and fused GEMM2 metadata preparation.
+
+The source follows the native extension layout:
+
+| Path | Responsibility |
+| --- | --- |
+| `deep_gemm/__init__.py` | Public compute APIs imported directly from `.deep_gemm_cpp` |
+| `csrc/python_api.cpp` | `PYBIND11_MODULE` entry, registering the API groups |
+| `csrc/apis/mega_moe.hpp` | Public function definitions, input validation/normalization and Python binding adapters |
+| `csrc/jit_kernels/impls/mega_moe*.hpp` | Typed `_impl` entrypoints, workspace/scheduler/argument assembly, source generation, JIT compilation and launch |
+| `csrc/jit_kernels/heuristics/mega_moe.hpp` | C++ configuration types and tile, shared-memory and scheduling policies |
+| `deep_gemm/mega_moe.py` | Symmetric buffer ownership and process-group lifecycle |
+| `deep_gemm/include/deep_gemm/` | Device kernels and shared layouts |
+
+`deep_gemm_cpp` is the compiled extension module (`deep_gemm_cpp*.so`), built
+from `csrc/python_api.cpp` and the headers it includes; it is not a Python file.
+Standalone grouped GEMMs use `csrc/apis/gemm.hpp`.
+MegaMoE follows the same API/implementation split: internal calls use tensors,
+scalars and typed C++ configurations. Python configuration dictionaries are
+converted at the API boundary; internal launch code does not depend on Python
+objects or positional Python tuples.
+Configuration queries and load-time weight preprocessing are helper APIs;
+dispatch/GEMM1 produces GEMM2 row and route metadata in the same kernel.
 
 #### Interfaces exposed but not yet implemented
 

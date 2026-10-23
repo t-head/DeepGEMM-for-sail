@@ -3,6 +3,8 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <optional>
+#include <vector>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -174,7 +176,8 @@ static int get_num_threads(const W4A16Config& config, bool is_mma) {
 // NOTES: `W4A16Gemm::run` just took `sizeof(Kernel::SharedStorage)`; the C++ JIT has to know the size
 // before the kernel is compiled, hence the replica here. The generated code carries a `static_assert`
 // against the real `sizeof`, so any drift fails at compile time rather than silently.
-static int get_smem_config(const W4A16Config& config, bool is_mma, int scale_element_size, int group_size) {
+static int get_smem_config(const W4A16Config& config, bool is_mma, int scale_element_size, int group_size,
+                           bool extra_epilogue = false) {
     constexpr int kElementASize = 2;   // cutlass::bfloat16_t
     constexpr int kElementAccSize = 4; // float
     constexpr int kElementDSize = 2;   // cutlass::bfloat16_t
@@ -195,7 +198,69 @@ static int get_smem_config(const W4A16Config& config, bool is_mma, int scale_ele
     // `SmemLayoutC` is `EpilogueConfig::SmemLayoutO`, shaped (WarpsOnM * 16, BlockN)
     const int smem_c = is_mma ? 0 : warps_on_m * 16 * config.block_n * kElementDSize;
 
-    return std::max({smem_a + smem_b + smem_scale, smem_reduce, smem_c});
+    const int smem_extra_epilogue = extra_epilogue ? config.block_m * config.block_n * kElementDSize : 0;
+    return std::max({smem_a + smem_b + smem_scale, smem_reduce, smem_c, smem_extra_epilogue});
+}
+
+using PPUW4ConfigTuple = std::tuple<int, int, int, int, int, int, int, int>;
+
+// MegaMoE scatter reuses the mainline MXFP4 selector and accepts tile overrides.
+static W4A16Config ppu_w4_config(int expected_m, int n, int k,
+        const std::optional<PPUW4ConfigTuple>& requested = std::nullopt) {
+    W4A16Config c{};
+    if (requested) {
+        std::tie(c.num_sms, c.block_m, c.block_n, c.block_k,
+                 c.warp_m, c.warp_n, c.warp_k, c.num_stages) = *requested;
+    } else {
+        c = get_best_configs(expected_m, n, k, 1, get_num_sms(), GemmType::MGroupedNoPad,
+                             W4A16Type::mxfp4_e8m0_mma);
+    }
+    DG_HOST_ASSERT(c.num_sms > 0 and c.block_m > 0 and c.block_n > 0 and c.block_k > 0);
+    DG_HOST_ASSERT(c.warp_m > 0 and c.warp_n > 0 and c.warp_k > 0 and c.num_stages > 0);
+    DG_HOST_ASSERT(c.block_m % c.warp_m == 0 and c.block_n % c.warp_n == 0 and c.block_k % c.warp_k == 0);
+    TORCH_CHECK(c.block_k % 128 == 0, "MXFP4 MMA requires BLOCK_K divisible by 128");
+    c.n_expand = 1;
+    return c;
+}
+
+// Convert packed INT32 [E,K/16,2N] weights at load time to logical
+// [E,N,K/2] bytes. Quantized values are preserved exactly.
+static torch::Tensor ppu_w4a16_preprocess_weights(const torch::Tensor& input) {
+    TORCH_CHECK(input.scalar_type() == torch::kInt32 and input.dim() == 3 and input.is_contiguous(),
+                "W4A16 MXFP4 weights must be contiguous int32 [E,K/16,2N]");
+    const int64_t e = input.size(0), slices = input.size(1), words = input.size(2);
+    TORCH_CHECK(slices % 2 == 0 and words % 128 == 0, "W4A16 MXFP4 requires K divisible by 32 and N by 64");
+    std::vector<int64_t> indices(512), shifts(512);
+    for (int n = 0; n < 64; ++n) {
+        for (int kb = 0; kb < 8; ++kb) {
+            indices[n * 8 + kb] = (n % 8 * 4 + kb % 4) * 4 + n / 16;
+            shifts[n * 8 + kb] = 4 * (kb / 4 + 2 * (n % 16 / 8));
+        }
+    }
+    const auto options = torch::TensorOptions().dtype(torch::kInt64);
+    const auto order = torch::from_blob(indices.data(), {512}, options).to(input.device());
+    const auto shift = torch::from_blob(shifts.data(), {512}, options).to(input.device());
+    const auto selected = input.view({e, slices, words / 128, 128}).index_select(-1, order).to(torch::kInt64);
+    const auto lo = torch::bitwise_and(torch::bitwise_right_shift(selected, shift), 15);
+    const auto hi = torch::bitwise_and(torch::bitwise_right_shift(selected, shift + 16), 15);
+    return torch::bitwise_or(lo, torch::bitwise_left_shift(hi, 4)).to(torch::kUInt8)
+        .view({e, slices, words / 128, 64, 8}).permute({0, 2, 3, 1, 4})
+        .contiguous().view({e, words / 2, slices * 8});
+}
+
+static torch::Tensor ppu_w4a16_preprocess_scales(const torch::Tensor& input) {
+    using namespace torch::indexing;
+    TORCH_CHECK(input.scalar_type() == torch::kUInt8 and input.dim() == 3 and input.is_contiguous() and
+                input.size(2) % 64 == 0, "W4A16 MXFP4 scales must be uint8 [E,K/32,N]");
+    const int64_t e = input.size(0), groups = input.size(1), n = input.size(2);
+    auto scale = input;
+    if (groups % 2) {
+        scale = torch::zeros({e, groups + 1, n}, input.options());
+        scale.index_put_({Slice(), Slice(0, groups), Slice()}, input);
+    }
+    // The 8x8 transpose acts on pairs of consecutive K-group scales.
+    return scale.transpose(1, 2).reshape({e, n / 64, 8, 8, (groups + 1) / 2, 2})
+        .permute({0, 1, 4, 3, 2, 5}).contiguous().view({e, n / 64, ((groups + 1) / 2) * 128});
 }
 
 } // namespace deep_gemm_w4a16_common

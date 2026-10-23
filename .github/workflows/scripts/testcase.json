@@ -26,6 +26,15 @@
     "python ./tests/run_deep_gemm.py --format=GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32",
     "python ./tests/run_deep_gemm.py --format=GroupedNoPad,data_type:w4fa8_mma,groups:4,m:35,n:64,k:128,quant_type:group,group_size:32",
     "python ./tests/run_deep_gemm.py --format=GroupedMasked,data_type:w4fa8_mma,groups:4,m:67,n:192,k:256,distribution:[0,1,33,67],quant_type:group,group_size:32",
-    "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:w4fa8_mma,groups:8,num_token:17,topk:3,n:192,k:256,quant_type:group,group_size:32"
+    "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:w4fa8_mma,groups:8,num_token:17,topk:3,n:192,k:256,quant_type:group,group_size:32",
+    "python ./tests/test_moe_w4a4.py --case smoke_swiglu --tokens 1 0 33 8 --routing random --edge-cases",
+    "python ./tests/test_moe_w4a4.py --case smoke_step --tokens 1 0 33 8 --routing random --edge-cases",
+    "python ./tests/test_moe_w4a4.py --case smoke_situ --tokens 1 0 33 8 --routing random --edge-cases",
+    "python ./tests/test_moe_w4a16.py --case smoke --tokens 1 0 33 8 --routing random --edge-cases",
+    "python ./tests/test_moe_w8a8.py --case smoke_channelwise --tokens 1 0 33 8 --routing random --edge-cases",
+    "python ./tests/test_moe_w8a8.py --case smoke_blockwise --tokens 1 0 33 8 --routing random --edge-cases"
+  ],
+  "ZW-M890P-EP2": [
+    "python -c \"import torch; from deep_gemm.jit_kernels.utils import is_ppu1v5_device; assert torch.cuda.device_count() >= 2 and is_ppu1v5_device(), 'MegaMoE EP2 CI requires two visible PPU1.5 devices'\" && NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1 python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=2 --max-restarts=0 -m pytest -q -s --disable-warnings -x -k smoke ./tests/test_moe_w4a4.py ./tests/test_moe_w4a16.py ./tests/test_moe_w8a8.py"
   ]
 }

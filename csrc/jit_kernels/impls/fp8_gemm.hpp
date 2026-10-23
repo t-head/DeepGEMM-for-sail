@@ -122,6 +122,26 @@ __global__ void computeBlockInfoKernel(
     }
 };
 
+// Shared no-pad scheduler preprocessing for ordinary and replica kernels.
+inline int32_t* prepare_grouped_nopad_layout(GemmType type, int groups, int block_m,
+                                             const torch::Tensor& rows,
+                                             const torch::Tensor& block_info) {
+    auto* layout = rows.data_ptr<int32_t>();
+    if (type != GemmType::MGroupedNoPad || groups < 128)
+        return layout;
+    TORCH_CHECK(block_info.defined() && block_info.scalar_type() == torch::kInt32,
+                "Grouped no-pad scheduler needs an int32 block-info workspace");
+    const auto args = ComputeBlockInfoKernelRuntime::Args{
+        .launch_attr_args = {reinterpret_cast<const uint32_t*>(layout), static_cast<uint32_t>(groups),
+                            reinterpret_cast<uint32_t*>(block_info.data_ptr<int32_t>())},
+        .launch_args = {dim3(1), dim3(std::max(32, next_power_of_two(groups))), 0},
+    };
+    const auto code = ComputeBlockInfoKernelRuntime::generate(block_m);
+    const auto runtime = compiler->build("computeBlockInfoKernel", code);
+    ComputeBlockInfoKernelRuntime::launch(runtime, args);
+    return block_info.data_ptr<int32_t>();
+}
+
 class FP8GemmRuntime final : public LaunchRuntime<FP8GemmRuntime> {
 public:
     using ScaleGranularityShape = cute::Shape<cute::_1, cute::_128, cute::_128>;
