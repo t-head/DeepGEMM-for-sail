@@ -71,8 +71,8 @@ struct MqaLogitsFP4Arguments {
     StrideKType stride_k;
 };
 
-// The FP4 and non-FP4 kernels take an identical template parameter list, differing only in
-// header and class name, so one runtime serves both -- parameterised by the `Arguments` mirror.
+// A shared runtime serves FP4 and non-FP4 kernels through the `Arguments` mirror.
+// FP4 may append its output-specific schedule parameters to the common template list.
 template <typename StrideKType, typename ArgumentsT>
 class MqaLogitsRuntime final : public LaunchRuntime<MqaLogitsRuntime<StrideKType, ArgumentsT>> {
 public:
@@ -84,9 +84,12 @@ public:
         int num_q_stages, num_kv_stages;
         std::string stride_k_type;
         bool is_compressed_logits;
-        std::string scale_mode;
+        QScaleMode scale_mode;
         int smem_size, num_threads;
         std::string kernel_name;
+        int fp4_m_block_group = 0;
+        bool fp4_q_owner_epilogue = false;
+        bool fp4_balance_output_tiles = false;
     };
 
     struct Args {
@@ -97,6 +100,11 @@ public:
 
     static std::string generate_impl(const Args& args) {
         const auto& info = args.launch_info;
+        std::string schedule_suffix;
+        if (info.kernel_class == "PPUMqaLogitsFP4") {
+            schedule_suffix = fmt::format(", {}, {}, {}", info.fp4_m_block_group,
+                                          info.fp4_q_owner_epilogue, info.fp4_balance_output_tiles);
+        }
         return fmt::format(
             R"(
 #include <{}>
@@ -122,7 +130,7 @@ constexpr uint32_t kScaleMode = {};
 using AttnKernel = cutlass::gemm::kernel::{}<
   ElementQK, ElementAcc, ElementLogits, ElementWeights,
   kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV,
-  kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits, kScaleMode
+  kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits, kScaleMode{}
 >;
 
 // The host computes these instead of reading them off the kernel type, so pin them down here
@@ -142,8 +150,8 @@ __global__ void {}(
 )",
             info.include_header, info.element_qk, info.element_acc, info.element_logits, info.element_weights,
             info.num_heads, info.head_dim, info.block_qh, info.block_kv, info.warp_qh, info.warp_kv,
-            info.num_q_stages, info.num_kv_stages, info.stride_k_type, info.is_compressed_logits, info.scale_mode,
-            info.kernel_class, info.smem_size, info.num_threads, info.kernel_name);
+            info.num_q_stages, info.num_kv_stages, info.stride_k_type, info.is_compressed_logits, static_cast<uint32_t>(info.scale_mode),
+            info.kernel_class, schedule_suffix, info.smem_size, info.num_threads, info.kernel_name);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -157,11 +165,11 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
                               const deep_gemm_mqa_common::MqaLogitsConfig& config, const std::string& element_qk,
                               const std::string& element_acc, const std::string& element_logits,
                               const std::string& element_weights, const std::string& dtype_tag, int num_heads,
-                              int head_dim, bool is_compressed, const std::string& scale_mode, int smem_size,
+                              int head_dim, bool is_compressed, QScaleMode scale_mode, int smem_size,
                               int num_threads, const std::string& kernel_name, const ArgumentsT& kernel_params) {
     using Runtime = MqaLogitsRuntime<StrideKType, ArgumentsT>;
     const bool is_fp4 = dtype_tag == "fp4";
-    const bool is_avg = scale_mode != "deep_gemm::kScaleModeWeights";
+    const bool is_avg = scale_mode != kScaleModeWeights;
     const int num_sms = get_num_sms();
     const dim3 block(num_threads, 1, 1);
     const dim3 grid(num_sms, 1, 1);
@@ -170,7 +178,8 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
         .launch_info = {include_header, kernel_class, element_qk, element_acc, element_logits, element_weights,
                         num_heads, head_dim, config.block_qh, config.block_kv, config.warp_qh, config.warp_kv,
                         config.num_q_stages, config.num_kv_stages, StrideKTypeName<StrideKType>::value,
-                        is_compressed, scale_mode, smem_size, num_threads, kernel_name},
+                        is_compressed, scale_mode, smem_size, num_threads, kernel_name,
+                        config.m_block_group, config.q_owner_epilogue, config.balance_output_tiles},
         .launch_args = {grid, block, smem_size},
         .kernel_params = kernel_params,
     };
@@ -178,11 +187,20 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
     const auto& code = Runtime::generate(args);
     const auto& runtime = compiler->build(kernel_name, code);
 
-    // Persistent kernel: one wave of `num_sms * blocks_per_cu` blocks, mirroring
-    // `num_sms * compute_occupancy_for_kernel<AttnKernel>()` in `Attention::run`
+    // The selected output schedule determines the number of independent worker tasks.
     int blocks_per_cu = 0;
     hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, runtime->kernel, num_threads, smem_size);
-    args.launch_args.grid_dim.x *= blocks_per_cu;
+    const uint64_t capacity = static_cast<uint64_t>(num_sms) * blocks_per_cu;
+    args.launch_args.grid_dim.x = static_cast<unsigned>(capacity);
+    if (is_fp4 and is_avg) {
+        const uint64_t seq_len_q = kernel_params.seq_len_q;
+        const uint64_t block_q = config.block_q;
+        const uint64_t num_q_blocks = seq_len_q / block_q + (seq_len_q % block_q != 0);
+        const uint64_t num_output_tasks = num_q_blocks * (config.balance_output_tiles ? 2 : 1);
+        // Preserve a valid launch for the existing empty-Q AVG path.
+        args.launch_args.grid_dim.x = static_cast<unsigned>(
+            std::min(capacity, std::max(uint64_t{1}, num_output_tasks)));
+    }
 
     // Reported before the launch, as `Attention::run` does, so the configuration is on screen even
     // when the launch itself fails
@@ -195,6 +213,10 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
 
         if (is_fp4) {
             printf("[mqa_logits_fp4:]\n");
+            printf("q_owner_epilogue:%d, balance_output_tiles:%d\n",
+                   config.q_owner_epilogue, config.balance_output_tiles);
+            printf("m_block_group:%d, schedule:%s, warp_interleaving:%d\n", config.m_block_group,
+                   config.m_block_group == 0 ? "coarse" : "grouped", num_threads == 512);
             printf("kNumHeads:%d, kHeadDim:%d(packed), BLOCK_QH:%d, BLOCK_KV:%d\n", num_heads, head_dim,
                    config.block_qh, config.block_kv);
             printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", config.block_kv,
@@ -252,23 +274,24 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     // Avg variant: an empty weights tensor selects it, and the `weights` kernel slot then
     // carries `q_scale` (nullptr for the unity mode -- the kernel never dereferences it)
     const bool is_avg = weights.numel() == 0;
-    std::string scale_mode = "deep_gemm::kScaleModeWeights";
+    QScaleMode scale_mode = kScaleModeWeights;
     const void* weights_ptr = weights.data_ptr();
     if (is_avg) {
         if (not q_scale.has_value()) {
-            scale_mode = "deep_gemm::kScaleModeUnity";
+            scale_mode = kScaleModeUnity;
             weights_ptr = nullptr;
         } else if (q_scale->numel() == 1) {
-            scale_mode = "deep_gemm::kScaleModeQScalar";
+            scale_mode = kScaleModeQScalar;
             weights_ptr = q_scale->data_ptr();
         } else {
-            scale_mode = "deep_gemm::kScaleModeQRow";
+            scale_mode = kScaleModeQRow;
             weights_ptr = q_scale->data_ptr();
         }
     }
 
-    const auto& config =
-        deep_gemm_mqa_common::get_best_configs(qk_dtype, num_heads, seq_len_k, logits_dtype, is_fp4);
+    const auto config = deep_gemm_mqa_common::get_best_configs(
+        q.scalar_type(), seq_len_q, seq_len_k, num_heads, logits_dtype,
+        is_fp4, get_num_sms(), is_compressed, scale_mode);
 
     const int aligned_seq_len = align(seq_len_q, config.block_q);
     const int logits_stride_alignment = deep_gemm_mqa_common::get_logits_stride_alignment(logits_dtype);
@@ -317,7 +340,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
                 "deep_gemm/impls/fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
                 element_weights, dtype_tag, num_heads, head_dim, is_compressed, scale_mode, smem_size, num_threads,
                 kernel_name,
-                MqaLogitsFP4Arguments<uint32_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights.data_ptr(),
+                MqaLogitsFP4Arguments<uint32_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights_ptr,
                                                 ks_ptr, ke_ptr, logits.data_ptr(), seq_len_q, seq_len_k,
                                                 static_cast<uint32_t>(aligned_seq_len_kv)});
         } else {
@@ -325,7 +348,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
                 "deep_gemm/impls/fp4_mqa_logits.cuh", "PPUMqaLogitsFP4", config, element_qk, element_acc, element_logits,
                 element_weights, dtype_tag, num_heads, head_dim, is_compressed, scale_mode, smem_size, num_threads,
                 kernel_name,
-                MqaLogitsFP4Arguments<uint64_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights.data_ptr(),
+                MqaLogitsFP4Arguments<uint64_t>{q.data_ptr(), q_sf_ptr, k.data_ptr(), k_sf_ptr, weights_ptr,
                                                 ks_ptr, ke_ptr, logits.data_ptr(), seq_len_q, seq_len_k,
                                                 static_cast<uint64_t>(aligned_seq_len_kv)});
         }

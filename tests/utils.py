@@ -1816,7 +1816,7 @@ def test_mqa_logits(args) -> None:
     print("test_mqa_logits->test_func: {},data_type:{},seq_len_q:{},seq_len_kv:{},num_heads:{},head_dim:{},c4_compressed:{},compressed_logits:{},weights_dtype:{},logits_dtype:{},q_scale:{}".format(args.get('gemm_type', 'MqaLogits'), data_type, seq_len_q, seq_len_kv, num_heads, head_dim, c4_compressed, compressed_logits, weights_dtype, logits_dtype, q_scale_mode))
 
     if is_avg:
-        assert data_type == torch.float8_e4m3fn, "MQA Avg Logits supports fp8 only"
+        assert data_type in (torch.float8_e4m3fn, torch.uint8), "MQA Avg Logits supports fp8 or fp4 only"
         assert logits_dtype in (torch.float32, torch.bfloat16), "MQA Avg Logits supports float32 or bf16 logits"
 
     q = torch.randn(seq_len_q, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
@@ -1832,6 +1832,10 @@ def test_mqa_logits(args) -> None:
     max_seqlen_k = (ke - ks).max().item() if compressed_logits else 0
     clean_logits_arg = not compressed_logits
     q_scale = None
+    if q_scale_mode == 1:
+        q_scale = torch.rand(seq_len_q, device='cuda', dtype=torch.float32) + 0.5
+    elif q_scale_mode == 2:
+        q_scale = torch.tensor(2.5, device='cuda', dtype=torch.float32)
 
     if data_type == torch.bfloat16:
         logits = deep_gemm.bf16_mqa_logits(q, kv, weights, ks, ke,
@@ -1841,10 +1845,6 @@ def test_mqa_logits(args) -> None:
         q_fp8 = q.to(torch.float8_e4m3fn)
         kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0, ), False)
         if is_avg:
-            if q_scale_mode == 1:
-                q_scale = torch.rand(seq_len_q, device='cuda', dtype=torch.float32) + 0.5
-            elif q_scale_mode == 2:
-                q_scale = torch.tensor(2.5, device='cuda', dtype=torch.float32)
             logits = deep_gemm.fp8_mqa_avg_logits(q_fp8, kv_fp8, ks, ke,
                                                   clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k,
                                                   q_scale=q_scale, logits_dtype=logits_dtype)
@@ -1869,15 +1869,27 @@ def test_mqa_logits(args) -> None:
         kv_in = (kv_fp4[0], kv_fp4[1].squeeze(-1))
         kv_dequant = cast_back_from_fp4(kv_fp4[0], kv_fp4[1], gran_k=32, use_packed_ue8m0=True).view(seq_len_kv, head_dim).to(torch.bfloat16)
         q, kv = q_dequant, kv_dequant
-        logits = deep_gemm.fp8_fp4_mqa_logits(
-            q=q_in, kv=kv_in, weights=weights,
-            cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
-            clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k,
-            logits_dtype=logits_dtype,
-        )
+        if is_avg:
+            logits = deep_gemm.fp8_fp4_mqa_avg_logits(
+                q=q_in, kv=kv_in,
+                cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
+                clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k,
+                q_scale=q_scale, logits_dtype=logits_dtype,
+            )
+        else:
+            logits = deep_gemm.fp8_fp4_mqa_logits(
+                q=q_in, kv=kv_in, weights=weights,
+                cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
+                clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k,
+                logits_dtype=logits_dtype,
+            )
     else:
         print("ERROR: Unsupported dtype for MQA Logits, please check!")
         exit(1)
+
+    if is_avg:
+        assert logits.dtype == logits_dtype
+        assert logits.shape == (seq_len_q, max_seqlen_k if compressed_logits else seq_len_kv)
 
     # Compute reference
     ref_logits = None

@@ -24,14 +24,15 @@ template <typename ElementQK, typename ElementAcc, typename ElementLogits, typen
           int BLOCK_KV, int WARP_QH, int WARP_KV, int kNumQStages, int kNumKVStages,
           typename StrideKType = uint32_t,
           bool kIsCompressedLogits = false,
-          uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
+          uint32_t kScaleMode = deep_gemm::kScaleModeWeights,
+          int kMBlockGroup = cute::is_same_v<ElementLogits, float> ? 0 : 1,
+          bool kQOwnerEpilogue = false, bool kBalanceOutputTiles = false>
 class PPUMqaLogitsFP4 {
 public:
     static_assert(cute::is_same_v<ElementQK, uint8_t>, "FP4 MQA logits requires uint8_t ElementQK");
     static_assert(kHeadDim == 64, "FP4 packed head_dim must be 64 (original 128 / 2)");
     static_assert(cute::is_same_v<StrideKType, uint32_t> || cute::is_same_v<StrideKType, uint64_t>,
                   "StrideKType must be uint32_t or uint64_t");
-    static_assert(kScaleMode == deep_gemm::kScaleModeWeights, "FP4 supports the weights mode only");
 
     static constexpr int BLOCK_M = BLOCK_KV;
     static constexpr int BLOCK_N = BLOCK_QH;
@@ -44,6 +45,9 @@ public:
     using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
     static constexpr int WarpOnM = BLOCK_M / WARP_M;
     static constexpr int WarpOnN = BLOCK_N / WARP_N;
+
+    static constexpr float kInvSqrtHeadDim = 0x1.6a09e6p-4f;
+
 
     // ── MMA: F32F4F4F32 (16×16×64) ────────────────────────────────────
     using MmaInst = PPU0015_16x16x64_F32F4F4F32_TN;
@@ -61,7 +65,20 @@ public:
     static constexpr int NumThreadsPerCTA = size(TiledMma{});
     static constexpr int MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
     static constexpr int MinBlocksPerMultiprocessor = 1;
-    static constexpr bool WarpInterleaving = (NumThreadsPerCTA == 512);
+    // G=0 selects the original FP32 coarse schedule; positive G groups M blocks.
+    static_assert(kMBlockGroup >= 0, "M-block group must be nonnegative");
+    static_assert(cute::is_same_v<ElementLogits, float> || kMBlockGroup > 0,
+                  "BF16 M-block group must be positive");
+    static constexpr bool WarpInterleaving = NumThreadsPerCTA == 512;
+    // Output ownership and task distribution are independent of M-block grouping.
+    static constexpr bool kIsAvg = kScaleMode != deep_gemm::kScaleModeWeights;
+    static_assert(!kQOwnerEpilogue ||
+                  (kIsAvg && kNumHeads == 4 && WARP_Q == 4 && MmaIterN == 1),
+                  "Q-owner requires H4 AVG with WARP_Q=4");
+    static_assert(!kBalanceOutputTiles ||
+                  (kIsAvg && kNumHeads == 4 && kNumQStages == 1),
+                  "balanced output tiles require H4 AVG with one Q stage");
+
 
     // ── AIU operands for Q/K ────────────────────────────────────────────
     using DefaultOperandA =
@@ -311,7 +328,7 @@ public:
         Tensor tCrSFB = recast<uint32_t>(tCrSFB_copy_view);
 
         // ── Weights s2r setup ─────────────────────────────────────────────
-        constexpr int elem_weights = kNumHeads / 4;
+        constexpr int elem_weights = WARP_QH / 4;
         Tensor sW_copy = make_tensor(sW.data(), sWCopyLayout{});
         SmemTiledCopyWeights smem_tiled_copy_weights;
         auto smem_thr_copy_weights = smem_tiled_copy_weights.get_slice(warp_n_idx * 4 + lane_idx % 4);
@@ -321,11 +338,55 @@ public:
         // For bf16 weights: tCrW points directly to tCrW_copy_view's data (no separate weights array)
         // For float weights: tCrW points to weights array (populated by cvt in load_q_s2r)
         ElementLogits weights[elem_weights];
+        // Avg variants
+        // FP32 Q-owner combines the two output factors once per Q load.
+        // Arithmetic remains FP32; reassociation may change the final rounding.
+        float scale_q = 1.0f;
+        if constexpr (kScaleMode == deep_gemm::kScaleModeQScalar) {
+            scale_q = __ldg(params.weights);
+            if constexpr (cute::is_same_v<ElementLogits, float> && kQOwnerEpilogue)
+                scale_q *= kInvSqrtHeadDim;
+        }
+        // Only kScaleModeQRow reads scale_q_row
+        float scale_q_row[WARP_Q];
+
         Tensor tCrW = make_tensor(static_cast<ElementLogits*>(weights), WeightRegLayout{});
 
         // ── Block scheduler (non-paged) ───────────────────────────────────
-        const auto& num_q_blocks = ceil_div(params.seq_len_q, BLOCK_Q);
+        // The template permits balancing; every CTA probes the same global
+        // rows and selects the same scheduler. Sampling is a performance
+        // heuristic, not a proof that every row has a long/full window.
+        bool balance_active = false;
+        if constexpr (kBalanceOutputTiles) {
+            if (params.seq_len_q <= 0 || params.seq_len_k <= 0) return;
+            const uint32_t probe_q[3] = {
+                0u, static_cast<uint32_t>(params.seq_len_q / 2),
+                static_cast<uint32_t>(params.seq_len_q - 1)};
+            balance_active = true;
+            #pragma unroll
+            for (int probe = 0; probe < 3; ++probe) {
+                const int probe_start = min(max(__ldg(params.cu_seq_len_k_start + probe_q[probe]), 0), params.seq_len_k);
+                const int probe_end = min(max(__ldg(params.cu_seq_len_k_end + probe_q[probe]), 0), params.seq_len_k);
+                const uint32_t probe_span = probe_end > probe_start
+                    ? static_cast<uint32_t>(probe_end - probe_start) : 0u;
+                // Widen before multiplying: exact span >= 3*K/4, including
+                // K values not divisible by four, without unsigned underflow.
+                balance_active &= uint64_t(probe_span) * 4 >= uint64_t(params.seq_len_k) * 3;
+            }
+        }
+        const auto& num_q_blocks = deep_gemm::math::ceil_div(params.seq_len_q, BLOCK_Q);
         uint32_t block_q_idx = blockIdx.x, q_iter_idx = 0;
+        uint32_t full_kv_blocks = 0;
+        uint64_t output_tile_idx = 0, output_tile_end = 0;
+        if constexpr (kBalanceOutputTiles) {
+            if (balance_active) {
+                // Divide independent output tiles, never the dot-product dimension.
+                full_kv_blocks = deep_gemm::math::ceil_div(params.seq_len_k, BLOCK_KV);
+                const uint64_t full_tile_count = uint64_t(num_q_blocks) * full_kv_blocks;
+                output_tile_idx = full_tile_count * blockIdx.x / gridDim.x;
+                output_tile_end = full_tile_count * (uint64_t(blockIdx.x) + 1) / gridDim.x;
+            }
+        }
         // Per-token KV range arrays for compressed logits mode (dead code when kIsCompressedLogits=false)
         uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
 
@@ -342,15 +403,22 @@ public:
         const auto& v_1_offset = lane_idx / 4 + 8;
         uint32_t warp_q_idx = warp_idx / WarpOnM;
         int warp_group_id = warp_idx / 8;
+        // Lane-parity kv row half used by the kWq4 epilogue split
+        const uint32_t r_mine = lane_idx & 1;
+        const uint32_t v_offset_mine = r_mine ? v_1_offset : v_0_offset;
 
         auto load_q_g2s = [&](uint32_t block_q_idx, uint32_t q_stage_idx) {
             int residual_n = (params.seq_len_q - block_q_idx * BLOCK_Q) * kNumHeads;
             gmem_tiled_copy_B.desc_.dim_h = residual_n;
             gmem_tiled_copy_SFB.desc_.dim_w = residual_n;
-            gmem_tiled_copy_weight.desc_.dim_w = residual_n;
             copy_aiu(gmem_tiled_copy_B, tBgB(_, _, _, 0), tBsB(_, _, _, q_stage_idx), warp_idx);
-            copy_aiu<true>(gmem_tiled_copy_SFB, tSFBgSFB(_, _, _, 0), tSFBsSFB(_, _, _, q_stage_idx), gmem_tiled_copy_weight,
-                           tWgW(_, _, _, 0), tWsW(_, _, _, q_stage_idx), warp_idx);
+            if constexpr (kScaleMode == deep_gemm::kScaleModeWeights) {
+                gmem_tiled_copy_weight.desc_.dim_w = residual_n;
+                copy_aiu<true>(gmem_tiled_copy_SFB, tSFBgSFB(_, _, _, 0), tSFBsSFB(_, _, _, q_stage_idx), gmem_tiled_copy_weight,
+                               tWgW(_, _, _, 0), tWsW(_, _, _, q_stage_idx), warp_idx);
+            } else {
+                copy_aiu(gmem_tiled_copy_SFB, tSFBgSFB(_, _, _, 0), tSFBsSFB(_, _, _, q_stage_idx), warp_idx);
+            }
         };
 
         auto load_kv_g2s = [&](uint32_t kv_start, uint32_t kv_end, uint32_t kv_block_idx, uint32_t smem_stage) {
@@ -366,9 +434,20 @@ public:
         auto load_q_s2r = [&](uint32_t q_stage_idx) {
             copy(smem_tiled_copy_B, tCsB(_, _, _, q_stage_idx), tCrB_copy_view);
             copy(smem_tiled_copy_SFB, tCsSFB(_, _, _, q_stage_idx), tCrSFB_copy_view);
-            copy(smem_tiled_copy_weights, tCsW(_, _, _, q_stage_idx), tCrW_copy_view);
-            deep_gemm::load_weights_from_copy_view<ElementWeights, ElementLogits>(
-                tCrW_copy_view, weights, elem_weights);
+            if constexpr (kScaleMode == deep_gemm::kScaleModeWeights) {
+                copy(smem_tiled_copy_weights, tCsW(_, _, _, q_stage_idx), tCrW_copy_view);
+                deep_gemm::load_weights_from_copy_view<ElementWeights, ElementLogits>(
+                    tCrW_copy_view, weights, elem_weights);
+            } else if constexpr (kScaleMode == deep_gemm::kScaleModeQRow) {
+                // The weights slot carries the per-Q-row float scale; clamped for partial tail blocks
+                #pragma unroll
+                for (uint32_t i = 0; i < WARP_Q; ++i) {
+                    const uint32_t q_idx = min(block_q_idx * BLOCK_Q + warp_q_idx * WARP_Q + i, params.seq_len_q - 1);
+                    scale_q_row[i] = __ldg(params.weights + q_idx);
+                    if constexpr (cute::is_same_v<ElementLogits, float> && kQOwnerEpilogue)
+                        scale_q_row[i] *= kInvSqrtHeadDim;
+                }
+            }
         };
 
         auto load_kv_s2r = [&](int k_block, uint32_t kv_stage_idx) {
@@ -380,14 +459,14 @@ public:
             copy(smem_tiled_copy_A, tCsA(_, m_block, k_block, kv_stage_idx), tCrA_copy_view(_, m_block, k_block));
         };
 
-        auto load_kv_sfa_s2r_mblock = [&](int k_block, uint32_t kv_stage_idx, int m_block) {
-            copy(smem_tiled_copy_SFA, tCsSFA(_, m_block, k_block, kv_stage_idx), tCrSFA_copy_view(_, m_block, k_block));
+        auto load_kv_sfa_s2r_group = [&](int k_block, uint32_t kv_stage_idx, int scale_group) {
+            copy(smem_tiled_copy_SFA, tCsSFA(_, scale_group, k_block, kv_stage_idx), tCrSFA_copy_view(_, scale_group, k_block));
         };
 
         auto epilogue_mblock = [&](uint32_t kv_start, uint32_t kv_block_idx, int m_block) {
             // Reduce over heads and store logits
             static constexpr int kNumAccumPerMma = size<0>(accum);
-            CUTE_STATIC_ASSERT(kNumHeads % 8 == 0);
+            CUTE_STATIC_ASSERT(kNumHeads % 4 == 0);
             const auto& kv_offset = kv_start + kv_block_idx * BLOCK_KV + warp_offset;
             {
                 int m = m_block;
@@ -397,57 +476,261 @@ public:
 
                 if constexpr (cute::is_same_v<ElementLogits, float>) {
                     float v_0, v_1;
-                    deep_gemm::float_epilogue_reduce_tCrW(accum, m, tCrW, v_0, v_1);
-                    deep_gemm::shfl_xor_reduce_2(v_0, v_1);
-                    if constexpr (kIsCompressedLogits) {
-                        const uint32_t rel_kv = static_cast<uint32_t>(logits_kv_offset) - seq_k_start[warp_q_idx];
-                        const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
-                        if (rel_kv + v_0_offset < len)
-                            params.logits[logits_q_offset + rel_kv + v_0_offset] = v_0;
-                        if (rel_kv + v_1_offset < len)
-                            params.logits[logits_q_offset + rel_kv + v_1_offset] = v_1;
+                    if constexpr (kScaleMode == deep_gemm::kScaleModeWeights) {
+                        deep_gemm::float_epilogue_reduce_tCrW(accum, m, tCrW, v_0, v_1);
+                        deep_gemm::shfl_xor_reduce_2(v_0, v_1);
+                        if constexpr (kIsCompressedLogits) {
+                            const uint32_t rel_kv = static_cast<uint32_t>(logits_kv_offset) - seq_k_start[warp_q_idx];
+                            const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
+                            if (rel_kv + v_0_offset < len)
+                                params.logits[logits_q_offset + rel_kv + v_0_offset] = v_0;
+                            if (rel_kv + v_1_offset < len)
+                                params.logits[logits_q_offset + rel_kv + v_1_offset] = v_1;
+                        } else {
+                            params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = v_0;
+                            params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = v_1;
+                        }
                     } else {
-                        params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = v_0;
-                        params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = v_1;
+                        if constexpr (kQOwnerEpilogue) {
+                            // Adjacent lanes own
+                            // different Q tokens, each writing both KV row halves.
+                            // Exactly two xor shuffles, unchanged head-pair grouping.
+                            CUTE_STATIC_ASSERT(MmaIterN == 1);
+                            CUTE_STATIC_ASSERT(WARP_Q == 4 && kNumHeads == 4);
+                            float sums[2][2];
+                            deep_gemm::float_epilogue_reduce_wq4(accum, m, sums);
+                            const uint32_t lane_in_quad = lane_idx % 4;
+                            const uint32_t q_owner = lane_idx & 1;
+                            const uint32_t local_q_warp = 2 * q_owner + lane_in_quad / 2;
+                            const uint32_t q_idx = block_q_idx * BLOCK_Q + warp_q_idx * WARP_Q + local_q_warp;
+                            float scale_q_t = kInvSqrtHeadDim;
+                            if constexpr (kScaleMode == deep_gemm::kScaleModeQRow)
+                                scale_q_t = scale_q_row[local_q_warp];
+                            else if constexpr (kScaleMode == deep_gemm::kScaleModeQScalar)
+                                scale_q_t = scale_q;
+
+                            // A single Q-row base serves both outputs. Lane T^1 sends
+                            // the same Q token's complementary head pair for each row.
+                            const float recv_lo = __shfl_xor_sync(0xffffffffu, sums[q_owner ^ 1][0], 1);
+                            const float total_lo = sums[q_owner][0] + recv_lo;
+                            const float recv_hi = __shfl_xor_sync(0xffffffffu, sums[q_owner ^ 1][1], 1);
+                            const float total_hi = sums[q_owner][1] + recv_hi;
+                            const float out_lo = total_lo * scale_q_t;
+                            const float out_hi = total_hi * scale_q_t;
+                            if constexpr (kIsCompressedLogits) {
+                                const uint32_t lq = warp_q_idx * WARP_Q + local_q_warp;
+                                // Finish each unsigned relative column before adding the 64-bit row base.
+                                const uint32_t rel_lo = kv_offset + mma_offset + v_0_offset - seq_k_start[lq];
+                                const uint32_t rel_hi = kv_offset + mma_offset + v_1_offset - seq_k_start[lq];
+                                const uint32_t len = seq_k_end[lq] - seq_k_start[lq];
+                                if (rel_lo < len)
+                                    params.logits[q_idx * params.stride_k + rel_lo] = out_lo;
+                                if (rel_hi < len)
+                                    params.logits[q_idx * params.stride_k + rel_hi] = out_hi;
+                            } else {
+                                auto* out_ptr = params.logits + q_idx * params.stride_k + kv_offset + mma_offset + v_0_offset;
+                                out_ptr[0] = out_lo;
+                                out_ptr[8] = out_hi;
+                            }
+                        } else {
+                            static constexpr int kQPerLane = 2;
+                            // CUTE_STATIC_ASSERT(MmaIterN{} == 1);
+                            float sums[kQPerLane][2];
+                            deep_gemm::float_epilogue_reduce_wq4(accum, m, sums);
+                            const uint32_t q_base = block_q_idx * BLOCK_Q + warp_q_idx * WARP_Q;
+                            const uint32_t lane_in_quad = lane_idx % 4;
+                            #pragma unroll
+                            for (int t = 0; t < kQPerLane; ++t) {
+                                // sums[t] belongs to warp-local q token 2*t + lane_in_quad/2
+                                const uint32_t local_q_warp = 2 * t + lane_in_quad / 2;
+                                float scale_q_t = 1.0f;
+                                if constexpr (kScaleMode == deep_gemm::kScaleModeQRow)
+                                    scale_q_t = scale_q_row[local_q_warp];
+                                else if constexpr (kScaleMode == deep_gemm::kScaleModeQScalar)
+                                    scale_q_t = scale_q;
+                                const float recv = __shfl_xor_sync(0xffffffffu, sums[t][r_mine ^ 1], 1);
+                                const float total = sums[t][r_mine] + recv;
+                                const uint32_t q_idx = q_base + local_q_warp;
+                                if constexpr (kIsCompressedLogits) {
+                                    const uint32_t lq = warp_q_idx * WARP_Q + local_q_warp;
+                                    const uint32_t rel_kv = kv_offset + mma_offset + v_offset_mine - seq_k_start[lq];
+                                    const uint32_t len = seq_k_end[lq] - seq_k_start[lq];
+                                    if (rel_kv < len)
+                                        params.logits[q_idx * params.stride_k + rel_kv] = total * kInvSqrtHeadDim * scale_q_t;
+                                } else {
+                                    params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_offset_mine] = total * kInvSqrtHeadDim * scale_q_t;
+                                }
+                            }
+                        }
                     }
                 } else {
-                    // bf16 output: separate cvt and fma2 phases with __ppu_sched_bound()
-                    constexpr int kTotalTransforms = 4 * size<2>(accum);
-                    __ppu_bfloat162 sum_0 = {0, 0};
-                    __ppu_bfloat162 sum_1 = {0, 0};
-                    uint32_t cvt_buf[kTotalTransforms];
+                    if constexpr (kScaleMode == deep_gemm::kScaleModeWeights) {
+                        // bf16 output: separate cvt and fma2 phases with __ppu_sched_bound()
+                        constexpr int kTotalTransforms = 4 * size<2>(accum);
+                        __ppu_bfloat162 sum_0 = {0, 0};
+                        __ppu_bfloat162 sum_1 = {0, 0};
+                        uint32_t cvt_buf[kTotalTransforms];
 
-                    // cvt phase: issue all ppu.cvt.rtte.bf16x2.f32.relu
-                    deep_gemm::cvt_accum_to_bf16x2_buf<kTotalTransforms>(accum, m, cvt_buf);
-                    __ppu_sched_bound();
-                    // fma2 phase: issue all __hfma2
-                    deep_gemm::fma2_phase_tCrW<kTotalTransforms>(cvt_buf, tCrW, sum_0, sum_1);
-                    __ppu_bfloat16 v_0_bf = __hadd(__low2bfloat16(sum_0), __high2bfloat16(sum_0));
-                    __ppu_bfloat16 v_1_bf = __hadd(__low2bfloat16(sum_1), __high2bfloat16(sum_1));
-                    __ppu_bfloat162 packed = deep_gemm::shfl_xor_reduce_bf16x2({v_0_bf, v_1_bf});
-                    if constexpr (kIsCompressedLogits) {
-                        const uint32_t rel_kv = static_cast<uint32_t>(logits_kv_offset) - seq_k_start[warp_q_idx];
-                        const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
-                        if (rel_kv + v_0_offset < len)
-                            params.logits[logits_q_offset + rel_kv + v_0_offset] = __low2bfloat16(packed);
-                        if (rel_kv + v_1_offset < len)
-                            params.logits[logits_q_offset + rel_kv + v_1_offset] = __high2bfloat16(packed);
+                        // cvt phase: issue all ppu.cvt.rtte.bf16x2.f32.relu
+                        deep_gemm::cvt_accum_to_bf16x2_buf<kTotalTransforms>(accum, m, cvt_buf);
+                        __ppu_sched_bound();
+                        // fma2 phase: issue all __hfma2
+                        deep_gemm::fma2_phase_tCrW<kTotalTransforms>(cvt_buf, tCrW, sum_0, sum_1);
+                        __ppu_bfloat16 v_0_bf = __hadd(__low2bfloat16(sum_0), __high2bfloat16(sum_0));
+                        __ppu_bfloat16 v_1_bf = __hadd(__low2bfloat16(sum_1), __high2bfloat16(sum_1));
+                        __ppu_bfloat162 packed = deep_gemm::shfl_xor_reduce_bf16x2({v_0_bf, v_1_bf});
+                        if constexpr (kIsCompressedLogits) {
+                            const uint32_t rel_kv = static_cast<uint32_t>(logits_kv_offset) - seq_k_start[warp_q_idx];
+                            const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
+                            if (rel_kv + v_0_offset < len)
+                                params.logits[logits_q_offset + rel_kv + v_0_offset] = __low2bfloat16(packed);
+                            if (rel_kv + v_1_offset < len)
+                                params.logits[logits_q_offset + rel_kv + v_1_offset] = __high2bfloat16(packed);
+                        } else {
+                            params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = __low2bfloat16(packed);
+                            params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = __high2bfloat16(packed);
+                        }
                     } else {
-                        params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = __low2bfloat16(packed);
-                        params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = __high2bfloat16(packed);
+                        if constexpr (kQOwnerEpilogue) {
+                            // BF16 Q-owner: pack two KV rows of the same Q token.
+                            // lo = KV row 0, hi = KV row 1; no FP32 reduction.
+                            CUTE_STATIC_ASSERT(MmaIterN == 1);
+                            CUTE_STATIC_ASSERT(WARP_Q == 4 && kNumHeads == 4);
+                            const uint32_t lane_in_quad = lane_idx % 4;
+                            const uint32_t q_owner = lane_idx & 1;
+                            const uint32_t local_q_warp = 2 * q_owner + lane_in_quad / 2;
+                            const uint32_t q_idx = block_q_idx * BLOCK_Q + warp_q_idx * WARP_Q + local_q_warp;
+                            uint32_t pa0, pb0, pa1, pb1;
+                            pa0 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(2, m, 0), accum(0, m, 0));
+                            pb0 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(3, m, 0), accum(1, m, 0));
+                            pa1 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(6, m, 0), accum(4, m, 0));
+                            pb1 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(7, m, 0), accum(5, m, 0));
+                            __ppu_bfloat162 partial0 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(pa0),
+                                                            reinterpret_cast<__ppu_bfloat162&>(pb0));
+                            __ppu_bfloat162 partial1 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(pa1),
+                                                            reinterpret_cast<__ppu_bfloat162&>(pb1));
+                            // The neighbor owns the opposite Q token. It must send
+                            // its non-owned partial so this lane receives its own Q.
+                            const __ppu_bfloat162 partial_mine = q_owner ? partial1 : partial0;
+                            const __ppu_bfloat162 partial_send = q_owner ? partial0 : partial1;
+                            const uint32_t recv = __shfl_xor_sync(0xffffffffu, reinterpret_cast<const uint32_t&>(partial_send), 1);
+                            __ppu_bfloat162 total = __hadd2(partial_mine, reinterpret_cast<const __ppu_bfloat162&>(recv));
+                            // Both packed values belong to one Q: preserve FP32
+                            // scale construction, then BF16 scale cvt and BF16 mul.
+                            float scale_q_t = kInvSqrtHeadDim;
+                            if constexpr (kScaleMode == deep_gemm::kScaleModeQRow)
+                                scale_q_t *= scale_q_row[local_q_warp];
+                            else if constexpr (kScaleMode == deep_gemm::kScaleModeQScalar)
+                                scale_q_t *= scale_q;
+                            const uint32_t scale2 = deep_gemm::tix::cvt_rte_bf16x2_f32(scale_q_t, scale_q_t);
+                            const __ppu_bfloat162 out2 = __hmul2(total, reinterpret_cast<const __ppu_bfloat162&>(scale2));
+                            if constexpr (kIsCompressedLogits) {
+                                const uint32_t lq = warp_q_idx * WARP_Q + local_q_warp;
+                                // Finish each unsigned relative column before adding the 64-bit row base.
+                                const uint32_t rel_lo = kv_offset + mma_offset + v_0_offset - seq_k_start[lq];
+                                const uint32_t rel_hi = kv_offset + mma_offset + v_1_offset - seq_k_start[lq];
+                                const uint32_t len = seq_k_end[lq] - seq_k_start[lq];
+                                if (rel_lo < len)
+                                    params.logits[q_idx * params.stride_k + rel_lo] = __low2bfloat16(out2);
+                                if (rel_hi < len)
+                                    params.logits[q_idx * params.stride_k + rel_hi] = __high2bfloat16(out2);
+                            } else {
+                                auto* out_ptr = params.logits + q_idx * params.stride_k + kv_offset + mma_offset + v_0_offset;
+                                out_ptr[0] = __low2bfloat16(out2);
+                                out_ptr[8] = __high2bfloat16(out2);
+                            }
+                        } else {
+                            // BF16 t-packed epilogue: each bf16x2 packs the two q tokens of one
+                            // kv row (lo = t0, hi = t1); select/scale/mul run once per m, not per t
+                            CUTE_STATIC_ASSERT(MmaIterN == 1);
+                            const uint32_t q_base = block_q_idx * BLOCK_Q + warp_q_idx * WARP_Q;
+                            const uint32_t lane_in_quad = lane_idx % 4;
+
+                            uint32_t pa0, pb0, pa1, pb1;
+                            pa0 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(4, m, 0), accum(0, m, 0));
+                            pb0 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(5, m, 0), accum(1, m, 0));
+                            pa1 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(6, m, 0), accum(2, m, 0));
+                            pb1 = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(accum(7, m, 0), accum(3, m, 0));
+                            __ppu_bfloat162 partial0 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(pa0),
+                                                            reinterpret_cast<__ppu_bfloat162&>(pb0));
+                            __ppu_bfloat162 partial1 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(pa1),
+                                                            reinterpret_cast<__ppu_bfloat162&>(pb1));
+                            const uint32_t recv0 = __shfl_xor_sync(0xffffffffu, reinterpret_cast<const uint32_t&>(partial0), 1);
+                            const uint32_t recv1 = __shfl_xor_sync(0xffffffffu, reinterpret_cast<const uint32_t&>(partial1), 1);
+                            __ppu_bfloat162 total0 = __hadd2(partial0, reinterpret_cast<const __ppu_bfloat162&>(recv0));
+                            __ppu_bfloat162 total1 = __hadd2(partial1, reinterpret_cast<const __ppu_bfloat162&>(recv1));
+                            __ppu_bfloat162 total = r_mine ? total1 : total0;
+
+                            // Scale both t outputs with one packed cvt + one packed mul;
+                            // QRow's per-row scale_q rides in the two f32 cvt sources
+                            float scale_lo = kInvSqrtHeadDim, scale_hi = kInvSqrtHeadDim;
+                            if constexpr (kScaleMode == deep_gemm::kScaleModeQRow) {
+                                scale_lo *= scale_q_row[lane_in_quad / 2];
+                                scale_hi *= scale_q_row[2 + lane_in_quad / 2];
+                            } else if constexpr (kScaleMode == deep_gemm::kScaleModeQScalar) {
+                                scale_lo *= scale_q;
+                                scale_hi *= scale_q;
+                            }
+                            const uint32_t scale2 = deep_gemm::tix::cvt_rte_bf16x2_f32(scale_hi, scale_lo);
+                            const __ppu_bfloat162 out2 = __hmul2(total, reinterpret_cast<const __ppu_bfloat162&>(scale2));
+
+                            const uint32_t q_idx_lo = q_base + lane_in_quad / 2;
+                            const uint32_t q_idx_hi = q_base + 2 + lane_in_quad / 2;
+                            if constexpr (kIsCompressedLogits) {
+                                const uint32_t lq_lo = warp_q_idx * WARP_Q + lane_in_quad / 2;
+                                const uint32_t lq_hi = warp_q_idx * WARP_Q + 2 + lane_in_quad / 2;
+                                const uint32_t rel_lo = kv_offset + mma_offset + v_offset_mine - seq_k_start[lq_lo];
+                                const uint32_t rel_hi = kv_offset + mma_offset + v_offset_mine - seq_k_start[lq_hi];
+                                if (rel_lo < seq_k_end[lq_lo] - seq_k_start[lq_lo])
+                                    params.logits[q_idx_lo * params.stride_k + rel_lo] = __low2bfloat16(out2);
+                                if (rel_hi < seq_k_end[lq_hi] - seq_k_start[lq_hi])
+                                    params.logits[q_idx_hi * params.stride_k + rel_hi] = __high2bfloat16(out2);
+                            } else {
+                                params.logits[q_idx_lo * params.stride_k + kv_offset + mma_offset + v_offset_mine] = __low2bfloat16(out2);
+                                params.logits[q_idx_hi * params.stride_k + kv_offset + mma_offset + v_offset_mine] = __high2bfloat16(out2);
+                            }
+                        }
                     }
                 }
             }
         };
 
         // ── Outer loop: Q blocks ──────────────────────────────────────────
-        while (block_q_idx < num_q_blocks) {
+        // Test the range before dividing by full_kv_blocks, including empty Q/K.
+        while (balance_active ? output_tile_idx < output_tile_end
+                              : block_q_idx < num_q_blocks) {
+            uint64_t segment_end = 0;
+            uint32_t full_first = 0, full_last = 0;
+            if constexpr (kBalanceOutputTiles) {
+                if (balance_active) {
+                    block_q_idx = static_cast<uint32_t>(output_tile_idx / full_kv_blocks);
+                    full_first = static_cast<uint32_t>(output_tile_idx % full_kv_blocks);
+                    const uint64_t q_tile_end = (uint64_t(block_q_idx) + 1) * full_kv_blocks;
+                    segment_end = q_tile_end < output_tile_end ? q_tile_end : output_tile_end;
+                    full_last = full_first + static_cast<uint32_t>(segment_end - output_tile_idx);
+                }
+            }
             CUTE_TIE_DECL(
                 (deep_gemm::load_schedule<BLOCK_Q, kNumQStages, BLOCK_KV, kIsCompressedLogits>(
                     block_q_idx, q_iter_idx, 0, params.seq_len_q, params.seq_len_k,
                     params.cu_seq_len_k_start, params.cu_seq_len_k_end,
                     seq_k_start, seq_k_end)),
                 q_stage_idx, q_phase, kv_start, kv_end, num_kv_blocks);
+
+            if constexpr (kBalanceOutputTiles) {
+                if (balance_active) {
+                    // Clip this worker's virtual segment to the scheduled window;
+                    // retain load_schedule's original aligned KV origin.
+                    const uint32_t first_kv_tile = min(full_first, num_kv_blocks);
+                    const uint32_t last_kv_tile = min(full_last, num_kv_blocks);
+                    const uint32_t original_kv_start = kv_start;
+                    const uint32_t original_kv_end = kv_end;
+                    kv_start = original_kv_start + first_kv_tile * BLOCK_KV;
+                    num_kv_blocks = last_kv_tile - first_kv_tile;
+                    kv_end = num_kv_blocks ? min(original_kv_end, original_kv_start + last_kv_tile * BLOCK_KV) : kv_start;
+                }
+            }
+
 
             // ── Offset Q / K / scale data pointers ──────────────────────────
             tAgA.data() = tKgK.data() + kv_start * BLOCK_K;
@@ -497,7 +780,9 @@ public:
                 constexpr int M_BLOCK = size<1>(accum);
                 constexpr int N_BLOCK = size<2>(accum);
                 constexpr int K_BLOCK = size<2>(tCrA);
-                if constexpr (cute::is_same_v<ElementLogits, float>) {
+                // FP32 defaults to the original coarse path; positive G shares the
+                // grouped schedule below while retaining the FP32 epilogue.
+                if constexpr (cute::is_same_v<ElementLogits, float> && kMBlockGroup == 0) {
                     for_each(make_int_sequence<K_BLOCK>{}, [&](auto k_block) {
                         load_kv_s2r(k_block, kv_stage_idx);
                         cute::gemm(tiled_mma, accum, tCrA(_, _, k_block), tCrSFA(_, _, k_block), tCrB(_, _, k_block),
@@ -508,34 +793,70 @@ public:
                     for (int m_block = 0; m_block < size<1>(accum); m_block++) {
                         epilogue_mblock(kv_start, kv_block_idx, m_block);
                     }
-                } else { // Interleaved mma and epilogue
+                } else { // Grouped S2R/MMA and epilogue, independent of output precision
+                    static_assert(kMBlockGroup > 0 && M_BLOCK % kMBlockGroup == 0, "invalid M-block group");
+                    // Each packed SFA entry serves m_group MMA M blocks.
                     constexpr int m_group = M_BLOCK / size<1>(tCrSFA);
                     constexpr int n_group = N_BLOCK / size<1>(tCrSFB);
-                    constexpr bool kReusePackedSFA = M_BLOCK == 4 and size<1>(tCrSFA) == 1;
-                    for_each(make_int_sequence<M_BLOCK>{}, [&](auto m_block) {
-                        if constexpr(m_block > 0) deep_gemm::warp_interleave_sync<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
-                        for_each(make_int_sequence<K_BLOCK>{}, [&](auto k_block) {
-                            load_kv_a_s2r_mblock(k_block, kv_stage_idx, m_block);
-                            if constexpr (!kReusePackedSFA or m_block == 0) {
-                                load_kv_sfa_s2r_mblock(k_block, kv_stage_idx, m_block);
-                            }
-                            for_each(make_int_sequence<N_BLOCK>{}, [&](auto n_block) {
-                                Tensor s = make_tensor<uint32_t>(Int<4>{});
-                                MMA_Atom<MmaInst> mma_atom;
-                                Tensor d = accum(_, m_block, n_block);
-                                Tensor a = tCrA(_, m_block, k_block);
-                                Tensor b = tCrB(_, n_block, k_block);
-                                Tensor c = accum(_, m_block, n_block);
-                                s[0] = tCrSFA(_, _, k_block)[m_block / m_group];
-                                s[1] = tCrSFB(_, _, k_block)[n_block / n_group];
-                                s[2] = m_block % m_group;
-                                s[3] = n_block % n_group;
-                                cute::mma_unpack(mma_atom, d, a, b, c, s);
+                    // G=1 keeps the original grouped schedule. Larger groups expose independent
+                    // MMA work before each handoff; epilogue arithmetic stays dtype-specific.
+                    if constexpr (kMBlockGroup == 1) {
+                        for_each(make_int_sequence<M_BLOCK>{}, [&](auto m_block) {
+                            if constexpr(m_block > 0) deep_gemm::warp_interleave_sync<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
+                            for_each(make_int_sequence<K_BLOCK>{}, [&](auto k_block) {
+                                load_kv_a_s2r_mblock(k_block, kv_stage_idx, m_block);
+                                if constexpr (m_block % m_group == 0) {
+                                    load_kv_sfa_s2r_group(k_block, kv_stage_idx, m_block / m_group);
+                                }
+                                for_each(make_int_sequence<N_BLOCK>{}, [&](auto n_block) {
+                                    Tensor s = make_tensor<uint32_t>(Int<4>{});
+                                    MMA_Atom<MmaInst> mma_atom;
+                                    Tensor d = accum(_, m_block, n_block);
+                                    Tensor a = tCrA(_, m_block, k_block);
+                                    Tensor b = tCrB(_, n_block, k_block);
+                                    Tensor c = accum(_, m_block, n_block);
+                                    s[0] = tCrSFA(_, _, k_block)[m_block / m_group];
+                                    s[1] = tCrSFB(_, _, k_block)[n_block / n_group];
+                                    s[2] = m_block % m_group;
+                                    s[3] = n_block % n_group;
+                                    cute::mma_unpack(mma_atom, d, a, b, c, s);
+                                });
+                            });
+                            deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
+                            epilogue_mblock(kv_start, kv_block_idx, m_block);
+                        });
+                    } else {
+                        for_each(make_int_sequence<M_BLOCK / kMBlockGroup>{}, [&](auto group_block) {
+                            if constexpr(group_block > 0) deep_gemm::warp_interleave_sync<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
+                            for_each(make_int_sequence<kMBlockGroup>{}, [&](auto group_offset) {
+                                constexpr int m_block = decltype(group_block)::value * kMBlockGroup + decltype(group_offset)::value;
+                                for_each(make_int_sequence<K_BLOCK>{}, [&](auto k_block) {
+                                    load_kv_a_s2r_mblock(k_block, kv_stage_idx, m_block);
+                                    if constexpr (m_block % m_group == 0) {
+                                        load_kv_sfa_s2r_group(k_block, kv_stage_idx, m_block / m_group);
+                                    }
+                                    for_each(make_int_sequence<N_BLOCK>{}, [&](auto n_block) {
+                                        Tensor s = make_tensor<uint32_t>(Int<4>{});
+                                        MMA_Atom<MmaInst> mma_atom;
+                                        Tensor d = accum(_, m_block, n_block);
+                                        Tensor a = tCrA(_, m_block, k_block);
+                                        Tensor b = tCrB(_, n_block, k_block);
+                                        Tensor c = accum(_, m_block, n_block);
+                                        s[0] = tCrSFA(_, _, k_block)[m_block / m_group];
+                                        s[1] = tCrSFB(_, _, k_block)[n_block / n_group];
+                                        s[2] = m_block % m_group;
+                                        s[3] = n_block % n_group;
+                                        cute::mma_unpack(mma_atom, d, a, b, c, s);
+                                    });
+                                });
+                            });
+                            deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
+                            for_each(make_int_sequence<kMBlockGroup>{}, [&](auto group_offset) {
+                                constexpr int m_block = decltype(group_block)::value * kMBlockGroup + decltype(group_offset)::value;
+                                epilogue_mblock(kv_start, kv_block_idx, m_block);
                             });
                         });
-                        deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
-                        epilogue_mblock(kv_start, kv_block_idx, m_block);
-                    });
+                    }
                 }
 
                 // Wait for next K
@@ -552,7 +873,16 @@ public:
             __syncthreads();
 
             // Jump to next Q block
-            CUTE_TIE(deep_gemm::get_next_block_q_idx(block_q_idx, q_iter_idx), block_q_idx, q_iter_idx);
+            if constexpr (kBalanceOutputTiles) {
+                if (balance_active) {
+                    output_tile_idx = segment_end;
+                    ++q_iter_idx;
+                } else {
+                    CUTE_TIE(deep_gemm::get_next_block_q_idx(block_q_idx, q_iter_idx), block_q_idx, q_iter_idx);
+                }
+            } else {
+                CUTE_TIE(deep_gemm::get_next_block_q_idx(block_q_idx, q_iter_idx), block_q_idx, q_iter_idx);
+            }
         } // end Q loop
     }
 };

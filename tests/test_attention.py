@@ -152,6 +152,28 @@ def test_mqa_avg_logits_loop():
         'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16',
         'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:2,logits_dtype:fp32',
     ]
+    # FP4 prefill: cross both output dtypes with all three Q-scale modes.
+    # Q=129 leaves a partial Q tile. KV=258 covers short KV, including
+    # the third KV128 block, for both dense and compressed output.
+    # KV=1025 exercises compressed output;
+    # KV=8193 enables default KV balancing, with every window > 3/4 of KV.
+    prefill_cases += [
+        f'MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:{seq_len_kv},'
+        f'num_heads:4,head_dim:128,q_scale:{q_scale},logits_dtype:{logits_dtype},'
+        f'compressed_logits:{compressed_logits}'
+        for logits_dtype in ('fp32', 'bf16')
+        for q_scale in (0, 1, 2)
+        for seq_len_kv, compressed_logits in ((258, 0), (258, 1), (513, 0), (1025, 1), (8193, 0))
+    ]
+    # On 39 CUs, Q4096/KV4096 selects four MMA M blocks with G=2 for
+    # both output dtypes. BF16 also enables warp interleaving, exercising
+    # the synchronization between groups rather than just a single group.
+    prefill_cases += [
+        f'MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,'
+        f'num_heads:4,head_dim:128,q_scale:{q_scale},logits_dtype:{logits_dtype}'
+        for logits_dtype in ('fp32', 'bf16')
+        for q_scale in (0, 1, 2)
+    ]
     # Paged decode covers the four-head tile, empty contexts, and multiple next tokens.
     paged_cases = [
         'PagedMqaAvgLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:4,head_dim:128,distribution:[0,1,127,1024],logits_dtype:bf16,page_kv:32',
