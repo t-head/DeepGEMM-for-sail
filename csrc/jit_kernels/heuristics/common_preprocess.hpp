@@ -21,6 +21,7 @@ enum class PreprocessMode {
     INT8,             // int8 weight with per-channel scales
     BF16,             // unquantized bf16 weight
     W4A8_MXFP4_MMA,   // E4M3 activation, FP4 MMA dequant with E8M0 scales
+    W4A8_INT8,        // w4a8 int4 weight with per-channel scales
 };
 
 struct PreprocessedWeights {
@@ -41,6 +42,7 @@ inline const char* preprocess_mode_name(const PreprocessMode& mode) {
         case PreprocessMode::FP8_BLOCK:       return "fp8-block";
         case PreprocessMode::INT8:            return "int8";
         case PreprocessMode::BF16:            return "bf16";
+        case PreprocessMode::W4A8_INT8:       return "w4a8-int8";
     }
     return "unknown";
 }
@@ -205,20 +207,85 @@ inline PreprocessedWeights preprocess_weights_and_scales(
             scales = scales.permute({0, 2, 1}).contiguous().permute({0, 2, 1});
         return {weight_out, scales};
     }
+    // ============================================================================
+    // A8W4 INT8 Device Weight Preprocess
+    // ============================================================================
+    // The model stores weights in the portable packed signed-INT4 format. This device-aware transform
+    // only reorders packed bytes into the layout expected by the PPU A8W4 kernels.
+
+    /// Reorder portable packed signed-INT4 MoE weights into the PPU A8W4 kernel layout.
+    /// `weight` is contiguous uint8 with shape [..., N, K / 2]. Byte i stores logical k=2*i in the low
+    /// nibble and k=2*i+1 in the high nibble, both in two's-complement signed-INT4 representation.
+    // First transpose 2-byte units inside every 16-byte (32-element K) group so one TSM_LD hands each
+    // lane the K values of its two K32 INT8-MMA atoms. Then transpose each eight-nibble converter group
+    // from {a,b,c,d,e,f,g,h} to packed bytes {a,e}, {b,f}, {c,g}, {d,h}. Finally toggle every nibble's
+    // sign bit, changing two's-complement INT4 into the unsigned, zero-point-8 encoding consumed by the
+    // seven-instruction register converter.
+    if (mode == PreprocessMode::W4A8_INT8) {
+        TORCH_CHECK(!fuse_activation, "Fuse activation and quant functions into A8W4-INT8 path is not supported.");
+        auto weight_out = weight;
+        auto scale_out = weight_scale.value_or(torch::Tensor{});
+        TORCH_CHECK(weight.dtype() == torch::kUInt8,
+                    "preprocess_weights_and_scales[w4a8-int8]: weight must use portable packed signed-INT4 uint8 storage");
+        TORCH_CHECK(weight.is_contiguous(), "preprocess_weights_and_scales[w4a8-int8]: weight must be contiguous");
+        TORCH_CHECK(weight.dim() >= 2, "preprocess_weights_and_scales[w4a8-int8]: weight must have shape [..., N, K / 2]");
+        const int64_t k_bytes = weight.size(-1);
+        TORCH_CHECK(k_bytes % 16 == 0,
+                    "preprocess_weights_and_scales[w4a8-int8]: K must be a multiple of 32 (K / 2 = ", k_bytes, ")");
+
+        // [..., K / 32, j1 = 2, j2 = 4, bytes = 2] 2-byte units
+        // -> [..., K / 32, j2 = 4, j1 = 2, bytes = 2], so one TSM_LD hands each lane the K values of
+        // its two K32 INT8-MMA atoms. Keep the transform in uint8 so a contiguous input with an odd
+        // storage offset does not require int16 alignment.
+        std::vector<int64_t> grouped_shape = weight.sizes().vec();
+        grouped_shape.back() = k_bytes / 16;  // K32 groups: 16 packed bytes each
+        grouped_shape.push_back(2);           // j1: two halves of the K32 group
+        grouped_shape.push_back(4);           // j2: four 2-byte units per half
+        grouped_shape.push_back(2);           // bytes: the two bytes of one unit
+        auto reordered = weight.view(grouped_shape).transpose(-3, -2).contiguous().flatten(-4);
+
+        // [..., K / 8, bytes = 4]: one converter group of eight nibbles {a,b,c,d,e,f,g,h},
+        // stored as bytes {a,b}, {c,d}, {e,f}, {g,h} (low nibble first).
+        std::vector<int64_t> converter_shape = reordered.sizes().vec();
+        converter_shape.back() = k_bytes / 4;  // converter groups: 4 packed bytes each
+        converter_shape.push_back(4);          // bytes: the four bytes of one group
+        auto blocks = reordered.view(converter_shape);
+        auto low = blocks.bitwise_and(0x0f);        // per byte: a, c, e, g
+        auto high = blocks.bitwise_right_shift(4);  // per byte: b, d, f, h
+        auto pack_nibbles = [](const torch::Tensor& lower, const torch::Tensor& upper) {
+            return lower.bitwise_or(upper.bitwise_left_shift(4));
+        };
+        // {a,b,c,d,e,f,g,h} -> bytes {a,e}, {b,f}, {c,g}, {d,h}, so the converter reads
+        // a..d from the low nibbles and e..h from the high nibbles of one uint32.
+        auto transposed = torch::stack({
+            pack_nibbles(low.select(-1, 0), low.select(-1, 2)),    // {a,e}
+            pack_nibbles(high.select(-1, 0), high.select(-1, 2)),  // {b,f}
+            pack_nibbles(low.select(-1, 1), low.select(-1, 3)),    // {c,g}
+            pack_nibbles(high.select(-1, 1), high.select(-1, 3)),  // {d,h}
+        }, -1);
+        // Flip each nibble's sign bit: two's-complement INT4 v -> unsigned v + 8.
+        weight_out = transposed.bitwise_xor(0x88).flatten(-2);
+        return {weight_out, scale_out};
+    }
     DG_HOST_UNREACHABLE(fmt::format("preprocess mode '{}' with fuse_activation={} is not implemented",
                                     preprocess_mode_name(mode), fuse_activation));
 }
 
+/// Deprecated weight-only alias; preserve the original dtype, padding and stride behavior.
+inline torch::Tensor preprocess_a8w4_weight(const torch::Tensor& weight) {
+    return preprocess_weights_and_scales(PreprocessMode::W4A8_INT8, /*fuse_activation=*/false, weight, torch::Tensor{}).weight;
+}
+
 /// Deprecated scale-only alias; preserve the original dtype, padding and stride behavior.
 inline torch::Tensor preprocess_mxfp4_scales(const torch::Tensor& scale) {
-    return preprocess_weights_and_scales(PreprocessMode::MXFP4, false, torch::Tensor{}, scale).scale;
+    return preprocess_weights_and_scales(PreprocessMode::MXFP4, /*fuse_activation=*/false, torch::Tensor{}, scale).scale;
 }
 
 /// Deprecated alias kept for forward compatibility with the pre-rename API: it exposed exactly
 /// the MXFP4 + fuse_activation interleaving, so forward it instead of duplicating the logic.
 inline std::pair<torch::Tensor, torch::Tensor> preprocess_mxfp4_weight_for_act_and_quant_fusing(
         const torch::Tensor& weight, const torch::Tensor& weight_scale) {
-    auto result = preprocess_weights_and_scales(PreprocessMode::MXFP4, true, weight, weight_scale);
+    auto result = preprocess_weights_and_scales(PreprocessMode::MXFP4, /*fuse_activation=*/true, weight, weight_scale);
     return {result.weight, result.scale};
 }
 

@@ -22,7 +22,8 @@ inline deep_gemm_lut::RuntimeLutKind get_a8w8_lut_kind(at::ScalarType dtype) {
 }
 
 std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, int block_n, int block_k = 128,
-                                          int bpp = 1) {
+                                          int bpp = 1, int element_b_bits = 8) {
+    DG_HOST_ASSERT(element_b_bits == 4 || element_b_bits == 8);
     // Try swizzle first
     int swizzle_mode = 128;
     // int block_n_padding = (swizzle_mode == 0) ? get_block_n_padding_for_smem_d(block_n) : 0;
@@ -34,7 +35,7 @@ std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, in
 
     int smem_size_d = smem_d * 2;
     int smem_size_a = num_stages * smem_a_per_stage * bpp;
-    int smem_size_b = num_stages * smem_b_per_stage * bpp;
+    int smem_size_b = num_stages * smem_b_per_stage * bpp * element_b_bits / 8;
 
     int smem_size = std::max(smem_size_d, smem_size_a + smem_size_b);
 
