@@ -19,6 +19,12 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   applies a shared power-of-two exponent shift into `[114,140]`, and rejects
   exponent codes 0 and 255 or exponent ranges spanning more than 26. The
   inverse is applied to activation row scales exactly once per GEMM.
+- **M810 A8W4 INT8 MoE GEMMs**: adds `m_grouped_gemm_int8_int4_bf16_nt_masked`
+  and `m_grouped_gemm_int8_int4_bf16_nt_nopad` for INT8 per-token activations and
+  portable packed signed-INT4 per-channel weights on Zhenwu 610 / 610E / 810 / 810E
+  (PPU0010). Converts INT4 to INT8 in-register for INT8 x INT8 MMA with INT32
+  accumulation and BF16 output. Requires `K%32=0` and `N%8=0`; checkpoint weights
+  need `preprocess_a8w4_weight` for the device-specific permutation.
 - **M890 standalone activation**: adds `silu_and_mul(mode, input, ...)`
   and `situ_and_mul(mode, input, *, beta, ...)`, with a required first
   `ActivationQuantMode` argument: `BF16`, `FP8_CHANNEL`, `FP8_BLOCK`,

@@ -16,6 +16,7 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 - **Supported precision modes**: The PPU version supports INT8, FP4, FP8, and BF16 across non-grouped GEMM and grouped GEMM layouts, covering both dense GEMM and MoE grouped GEMM scenarios.
 - **Standalone activation on M890**: SiLU and SiTU with BF16, per-row/per-block FP8, MXFP4, or MXFP8 output, including masked expert batches and explicit output-mode selection.
 - **W4A8 MoE on M890**: E4M3 per-row activations and group-32 MXFP4 weights, with FP32 accumulation and BF16 output for nopad, masked, and fused routing layouts.
+- **A8W4 INT8 MoE on M810**: INT8 per-token activations and portable packed signed-INT4 per-channel weights, with INT32 accumulation and BF16 output for nopad and masked grouped layouts on Zhenwu 610 / 610E / 810 / 810E.
 - **Additional nopad grouped GEMM layout**: In addition to contiguous and masked grouped GEMM layouts, this fork introduces a nopad layout. It uses an index tensor to describe per-expert token counts, avoiding mandatory M-block padding for variable-token MoE workloads and reducing unnecessary data movement.
 - **AIU-oriented alignment requirements**: The PPU version replaces the original alignment assumptions with AIU-aligned scaling factors and AIU-aligned utility tensors, matching the data movement requirements described by this fork.
 - **Warp interleave execution design**: The PPU kernels adopt a warp interleave design to overlap data movement, MMA instructions, and promotion operations during GEMM execution.
@@ -74,13 +75,13 @@ This library focuses on high-performance tensor cell kernels and related LLM com
 
 #### Data Precisions
 
-| Algorithm | INT8 | FP4 | FP8 | BF16 | W4A16 | W4A8 (M890) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Non-grouped** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| **Contiguous** | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ |
-| **No-pad** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Masked** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Fused** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Algorithm | INT8 | FP4 | FP8 | BF16 | W4A16 | W4A8 (M890) | A8W4 INT8 (M810) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Non-grouped** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| **Contiguous** | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| **No-pad** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Masked** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Fused** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 
 #### Normal dense GEMMs (non-grouped)
 
@@ -196,6 +197,33 @@ the first result is then `None`. W4A8 also returns `weight_inv_scale` and derive
 E/N/K alignment from the raw `[E,N,K/32]` scales. Supplying a weight tensor
 preserves the existing return format; W4A8 also checks its shape against the scales. Fusion and other
 weight modes still require weights; all supported modes require scales.
+
+#### A8W4 INT8 MoE GEMMs (M810)
+
+The A8W4 INT8 path accepts INT8 activations with FP32 per-token scales and portable packed signed-INT4 weights with FP32 per-channel scales, and writes BF16. It runs on Zhenwu 610 / 610E / 810 / 810E and supports the grouped nopad and masked expert layouts:
+
+| API | Activation / row-scale shape | Weight / weight-scale shape | Output shape |
+| :--- | :--- | :--- | :--- |
+| `m_grouped_gemm_int8_int4_bf16_nt_nopad` | `[M,K]` / `[M,1]`, grouped by expert | `[E,N,K/2]` / `[E,N,1]` | `[M,N]` |
+| `m_grouped_gemm_int8_int4_bf16_nt_masked` | `[E,T,K]` / `[E,T,1]` | `[E,N,K/2]` / `[E,N,1]` | `[E,T,N]`, valid rows only |
+
+The kernel converts the packed INT4 weights to INT8 in-register, runs INT8 x INT8 MMA with INT32 accumulation, and scales each result by the per-token activation scale and the per-channel weight scale (both FP32) before writing BF16. Activations are `torch.int8`; weights use portable packed signed-INT4 `torch.uint8` storage `[E,N,K/2]` (two INT4 values per byte); all scales are FP32. `K % 32 == 0` and `N % 8 == 0` are required, and all operands and metadata must be contiguous on the same PPU device.
+
+Weight preprocessing runs once during model initialization. The checkpoint stores the portable packed signed-INT4 weight; call `preprocess_a8w4_weight` after loading to apply the device-specific permutation before passing it as the GEMM `b` operand. The FP32 per-channel weight scales `[E,N,1]` are used as-is and are not preprocessed:
+
+```python
+import deep_gemm as dg
+
+# packed_int4_weight is the checkpoint tensor [E, N, K/2] (torch.uint8).
+weight = dg.preprocess_a8w4_weight(packed_int4_weight)
+lhs = (a_int8, a_scale)       # masked: [E,T,K] int8 / [E,T,1] fp32
+rhs = (weight, weight_scale)  # [E,N,K/2] uint8 / [E,N,1] fp32
+# Masked returns (block_m, ceil_div(n, block_n)) and computes only the masked_m valid rows.
+block_m, n_blocks = dg.m_grouped_gemm_int8_int4_bf16_nt_masked(
+    lhs, rhs, out, masked_m, expected_m)
+```
+
+Masked/nopad follow the standard grouped GEMM argument semantics described above (`masked_m`/`expected_m`, `m_indices`/`m_rows`, internal `configs` selection); masked additionally supports optional SBO overlap (`enable_sbo_overlap` + `signal`). For correctness coverage, run `tests/run_deep_gemm.py` with `data_type:w4a8_int8`, or the `w4a8_int8` entries in `tests/deepgemm.caselist`.
 
 #### Standalone SiLU / SiTU activation (M890)
 
