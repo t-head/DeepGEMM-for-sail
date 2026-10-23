@@ -131,7 +131,7 @@ inline TuningConfig select_tuning(const TuningWorkload& w, const std::string& de
           {2048, separate_gemm1(reuse128), {}, {64}},
           {4096, separate_gemm1(reuse128), {}, {64}}}},
         {"kimi_k3", P::W4A16, 16, 896, 16, 3584, 3072, "situ",
-         {{1024, separate_gemm1(reuse128)}, {2048, {{}, 256}}, {4096, {{}, 256}}}},
+         {{1024, separate_gemm1(reuse128)}, {2048, separate_gemm1(reuse128)}, {4096, {{}, 256}}}},
         {"kimi_k3", P::W4A16, 32, 896, 16, 3584, 3072, "situ", k3_ep32},
         {"kimi_k3", P::W4A16, 32, 928, 16, 3584, 3072, "situ", k3_ep32},
         {"minimax_m3", P::FP8Channelwise, 8, 128, 4, 6144, 3072, "swiglu_oai",
