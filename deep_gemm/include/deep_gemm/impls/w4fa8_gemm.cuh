@@ -43,7 +43,9 @@ public:
   using ElementAcc = float;
   using ElementScale = uint8_t; // e8m0 scale
 
-  static constexpr bool ResidentA = N_EXPAND > 1 && WarpM == 64 && ShapeK <= BlockK * kNumStages;
+  // A fourth slot reduces CTA residency for the default N256 tile.
+  static constexpr bool ResidentA = N_EXPAND > 1 && WarpM == 64 && ShapeK <= 384;
+  static constexpr int ASlots = ResidentA && ShapeK / BlockK > kNumStages ? ShapeK / BlockK : kNumStages;
   static constexpr bool CacheRowScale = N_EXPAND > 1 && WarpM == 64 && ShapeK <= 512;
   // basic
   static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
@@ -107,7 +109,7 @@ public:
   using GmemTiledCopyA = typename DefaultOperandA::GmemTiledCopy;
   using TilerA = typename GmemTiledCopyA::Tiler_MN;
   using CopyAConfig = deep_gemm::CopyAToTsmConfig<ElementA, TilerA, BlockM, BlockK, MaxThreadsPerBlock>;
-  using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtomA{}, make_shape(Int<BlockM>{}, Int<BlockK>{}, Int<kNumStages>{})));
+  using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtomA{}, make_shape(Int<BlockM>{}, Int<BlockK>{}, Int<ASlots>{})));
 
   // sW => fp4 weights
   using TilerB = Shape<Int<BlockN>, Int<BlockK2>>;
@@ -285,7 +287,7 @@ public:
     constexpr int K_BLOCK_MAX = size<2>(tCrA_copy_view);
 
     auto smem_tiled_copy_B = make_tiled_copy_A(SmemCopyAtomB{}, fp4_tiled_mma); // fp4 B is matrixA in fp4 gemm
-    auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(thread_idx_B);
+    auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice((warp_idx / WarpsOnM) * NumThreadsPerWarp);
     auto mix_sB = make_mix_tensor_like(sB);
     Tensor tCsB = smem_thr_copy_B.partition_S(mix_sB);
     Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(fp4_tCrB);
@@ -340,6 +342,9 @@ public:
           const int* blk_token_base = params.sorted_token_ids + deep_scheduler.cumsum_m_block_idx * BlockM;
           deep_gemm::prefetch_A_token_offsets<ElementA, TilerA, BlockM, BlockK, MaxThreadsPerBlock>(
               token_offsets, blk_token_base, params.num_token, thread_idx);
+          deep_gemm::clear_invalid_A_to_tsm<ElementA, TilerA, BlockM, BlockK, K, kNumStages>(
+              tAsA, params.ptr_a, token_offsets, params.num_token, thread_idx,
+              Int<MaxThreadsPerBlock>{});
           Tensor mD_mn = make_tensor(make_gmem_ptr(params.ptr_d + deep_scheduler.curr_block_m_offset * N), make_shape(Int<BlockM>{}, Int<N>{}), strideD); // (m,n)
           Tensor gD = local_tile(mD_mn, TileShape{}, make_coord(_0{}, n_block_idx, _), Step<_1, _1, X>{}); // (BLK_M,BLK_N)
           int residual_m = deep_scheduler.valid_m_in_block;
@@ -353,7 +358,7 @@ public:
             copy(gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,k_pipe));
           }
         } else { // async copy
-          deep_gemm::copy_A_to_tsm<ElementA, ACopyInst, TilerA, BlockM, BlockK, K>(
+          deep_gemm::copy_A_to_tsm<ElementA, cute::PPU_CP_ASYNC_CACHEALWAYS<cutlass::uint128_t>, TilerA, BlockM, BlockK, K>(
               tAsA(_,_,_,k_pipe), params.ptr_a, token_offsets,
               BlockK * k_tile_iter, params.num_token, thread_idx,
               Int<MaxThreadsPerBlock>{});
@@ -368,7 +373,7 @@ public:
         }
       };
 
-      // Retain the complete short-K A tile in the existing shared stages across N.
+      // Retain the complete short-K A tile in dedicated shared slots across N.
       int a_tiles_loaded = 0;
       auto g2s = [&](int k_tile_iter, int k_pipe) {
         if constexpr (ResidentA) {
@@ -567,7 +572,7 @@ public:
 
       // mainloop
       constexpr int k_tile_count = size<2>(gB);
-      int current_stage = 0;
+      uint32_t current_stage = 0;
       // Prologue
       CUTLASS_PRAGMA_UNROLL
       for (int k_pipe = 0; k_pipe < kNumStages-1; k_pipe++) {
@@ -652,8 +657,9 @@ public:
             process_k_tile_iteration(k_tile_idx);
           }
         } else {
+          process_k_tile_iteration(0);
           #pragma unroll 1
-          for (int k_tile_idx = 0; k_tile_idx < k_tile_count; k_tile_idx++) {
+          for (int k_tile_idx = 1; k_tile_idx < k_tile_count; k_tile_idx++) {
             process_k_tile_iteration(k_tile_idx);
           }
         }

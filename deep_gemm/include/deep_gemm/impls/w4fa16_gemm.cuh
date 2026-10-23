@@ -300,6 +300,7 @@ public:
     constexpr int K_BLOCK_MAX = size<2>(tCrA_copy_view);
 
     auto smem_tiled_copy_B = make_tiled_copy_A(SmemCopyAtomB{}, fp4_tiled_mma); // fp4 B is matrixA in fp4 gemm
+    // Warp-uniform B copy coordinates regress Kimi TP8 down GEMM performance.
     auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(thread_idx_B);
     auto mix_sB = make_mix_tensor_like(sB);
     Tensor tCsB = smem_thr_copy_B.partition_S(mix_sB);
@@ -355,6 +356,9 @@ public:
           const int* blk_token_base = params.sorted_token_ids + deep_scheduler.cumsum_m_block_idx * BlockM;
           deep_gemm::prefetch_A_token_offsets<ElementA, TilerA, BlockM, BlockK, MaxThreadsPerBlock>(
               token_offsets, blk_token_base, params.num_token, thread_idx);
+          deep_gemm::clear_invalid_A_to_tsm<ElementA, TilerA, BlockM, BlockK, K, kNumStages>(
+              tAsA, params.ptr_a, token_offsets, params.num_token, thread_idx,
+              Int<MaxThreadsPerBlock>{});
           Tensor mD_mn = make_tensor(make_gmem_ptr(params.ptr_d + deep_scheduler.curr_block_m_offset * N), make_shape(Int<BlockM>{}, Int<N>{}), strideD); // (m,n)
           Tensor gD = local_tile(mD_mn, TileShape{}, make_coord(_0{}, n_block_idx, _), Step<_1, _1, X>{}); // (BLK_M,BLK_N)
           int residual_m = deep_scheduler.valid_m_in_block;
@@ -368,7 +372,7 @@ public:
             copy(gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,k_pipe));
           }
         } else { // async copy
-          deep_gemm::copy_A_to_tsm<ElementA, ACopyInst, TilerA, BlockM, BlockK, K>(
+          deep_gemm::copy_A_to_tsm<ElementA, cute::PPU_CP_ASYNC_CACHEALWAYS<cutlass::uint128_t>, TilerA, BlockM, BlockK, K>(
               tAsA(_,_,_,k_pipe), params.ptr_a, token_offsets,
               BlockK * k_tile_iter, params.num_token, thread_idx,
               Int<MaxThreadsPerBlock>{});

@@ -37,8 +37,15 @@ public:
     uint32_t in_group_idx = block_idx % num_blocks_per_group;
     uint32_t num_blocks_in_group = min(kNum1DBlocksPerGroup, primary_num_blocks - first_block_idx);
 
-    m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
-    n_block_idx = in_group_idx / num_blocks_in_group;
+    if constexpr (kNum1DBlocksPerGroup == 2) {
+      // Valid work items have one or two M blocks in the swizzle group.
+      const uint32_t shift = num_blocks_in_group - 1;
+      m_block_idx = first_block_idx + (in_group_idx & shift);
+      n_block_idx = in_group_idx >> shift;
+    } else {
+      m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
+      n_block_idx = in_group_idx / num_blocks_in_group;
+    }
   }
 
   __device__ __forceinline__ bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
