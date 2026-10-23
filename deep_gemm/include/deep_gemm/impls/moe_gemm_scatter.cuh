@@ -940,18 +940,17 @@ public:
           size(thread_shared_output) == size(accumulators));
 
       if constexpr (kUseAccumulatorPairStaging) {
-        // BM128/W32x64 and BM256/W64x64 both instantiate the same 4x4
-        // warp TiledMMA. Its innermost fragment is one adjacent N pair,
+        // The innermost MMA fragment is one adjacent N pair,
         // so convert/store two accumulators with one BF16x2 transaction.
         static_assert(
-            BlockM == 128 && BlockN == 256 && kThreadCount == 512,
-            "overlap pair staging requires BM128/BN256/512 threads");
+            BlockN == 256 && kThreadCount >= 128 && kThreadCount % 128 == 0,
+            "pair staging requires BN256 and complete N-warp groups");
         static_assert(
-            decltype(size<1>(accumulator_coords))::value == 2,
-            "BM128 pair staging requires two repeat-M groups");
+            decltype(size<1>(accumulator_coords))::value * (kThreadCount / 8) == BlockM,
+            "pair staging repeat-M groups must span the M tile");
         static_assert(
             decltype(size<2>(accumulator_coords))::value == 4,
-            "BM128 pair staging requires four repeat-N groups");
+            "pair staging requires four repeat-N groups");
         static_assert(
             decltype(size<0>(shape<0>(accumulator_coords)))::value == 2,
             "pair staging requires two adjacent fragment values");
@@ -970,7 +969,7 @@ public:
                 ExpectedAtomLayoutC>,
             "pair staging requires PPU0015 row-major accumulators");
         constexpr auto probe_identity =
-            make_identity_tensor(make_shape(_128{}, _256{}));
+            make_identity_tensor(make_shape(Int<BlockM>{}, _256{}));
         constexpr auto probe_coords =
             TiledMma{}.get_thread_slice(_0{}).partition_C(
                 probe_identity);

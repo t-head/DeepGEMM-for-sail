@@ -192,6 +192,20 @@ public:
       }
     }
 
+    // Bound the persistent loop by the grouped M tiles. The preprocessed
+    // scheduler already carries this bound and checks it in fetch_next_work.
+    uint32_t m_tiles = 0;
+    if constexpr (!TileScheduler::kIsNoPadPreprocessLayout) {
+      const uint32_t lane = threadIdx.x % 32;
+      for (uint32_t e = lane; e < TileScheduler::kNumGroups; e += 32)
+        m_tiles += math::ceil_div(
+            static_cast<uint32_t>(__ldg(params.scheduler.grouped_layout + e)),
+            uint32_t(BlockM));
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        m_tiles += __shfl_xor_sync(0xffffffffu, m_tiles, off);
+    }
+    const uint32_t work_tiles = m_tiles * math::ceil_div(N, BlockN);
     TileScheduler scheduler(params.scheduler);
     SharedStorage& shared_storage =
         *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -200,7 +214,8 @@ public:
 
     uint32_t m_block_idx;
     uint32_t n_block_idx;
-    while (true) {
+    while (TileScheduler::kIsNoPadPreprocessLayout ||
+           scheduler.current_iter * gridDim.x + blockIdx.x < work_tiles) {
       bool has_work;
       if constexpr (
           GemmScatter::kExactRemoteFirstSegmentSchedule) {

@@ -197,8 +197,8 @@ template <int N, int K, int Groups, int MasterGroups, int Stages, int BlockM, in
 struct Gemm2Scatter {
     // Native blockwise mainloop and GroupedNoPad scheduler, with the existing
     // shared MoE epilogue adapter. The checkpoint scales remain 128x128.
-    static_assert((BlockM == 128 || BlockM == 192) && Stages >= 2 && Stages <= 4);
-    using G = Fp8Gemm<N, K, BlockM, 256, 128, BlockM / 4, 64, 0, 0, Groups, Stages,
+    static_assert((BlockM == 32 || BlockM == 128 || BlockM == 192) && Stages >= 2 && Stages <= 4);
+    using G = Fp8Gemm<N, K, BlockM, 256, 128, (BlockM < 64 ? 16 : BlockM / 4), 64, 0, 0, Groups, Stages,
                      GemmType::MGroupedNoPad>;
     using Mainloop = typename G::CollectiveMainloop;
     static constexpr int kNumThreads = cute::size(typename Mainloop::TiledMma{});

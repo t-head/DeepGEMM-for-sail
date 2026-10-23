@@ -502,12 +502,13 @@ inline void fp8_blockwise_gemm1_config(DispatchConfig& c, int tokens, int n, boo
     const int groups = c.num_experts_per_rank;
     const int em = ceil_div(int64_t(tokens) * c.num_topk, int64_t(groups));
     c.gemm1_compute_m = tuning.block_m.value_or(quant ? blockwise_compute_m(em, groups, n, c.num_sms) : 128);
-    TORCH_CHECK(c.gemm1_compute_m == 128 || (quant && c.gemm1_compute_m == 192),
-                "FP8 blockwise GEMM1 requires compute block_m=128, or 192 with FP8 output");
+    TORCH_CHECK(c.gemm1_compute_m == 128 ||
+                (quant && (c.gemm1_compute_m == 32 || c.gemm1_compute_m == 192)),
+                "FP8 blockwise GEMM1 requires compute block_m=128, or 32/192 with FP8 output");
     TORCH_CHECK(!tuning.tile, "blockwise GEMM1 accepts block_m, not a full tile override");
     c.gemm1_block_n = quant ? 256 : 128;
     c.gemm1_block_k = 128;
-    c.gemm1_warp_m = c.gemm1_compute_m / 4;
+    c.gemm1_warp_m = std::max(16, c.gemm1_compute_m / 4);
     c.gemm1_warp_n = c.gemm1_block_n / 4;
     c.gemm1_stages = 4;
     c.num_threads = threads(c.gemm1_compute_m, c.gemm1_block_n, c.gemm1_warp_m, c.gemm1_warp_n);
@@ -539,15 +540,16 @@ inline ScatterConfig fp8_blockwise_scatter_config(int n, int k, int groups, int 
     c.num_stages = std::min(c.block_m == 192 ? 4 : 3, std::max(2, k / 128));
     if (tuning.tile) {
         const auto& t = *tuning.tile;
-        TORCH_CHECK(t[1] == 256 && t[2] == 128 && t[3] == t[0] / 4 && t[4] == 64,
+        TORCH_CHECK(t[1] == 256 && t[2] == 128 && t[3] == std::max(16, t[0] / 4) && t[4] == 64,
                     "unsupported blockwise GEMM2 tile");
         c.block_m = t[0];
         c.num_stages = t[5];
     }
-    TORCH_CHECK((c.block_m == 128 || c.block_m == 192) && c.num_stages >= 2 && c.num_stages <= 4);
+    TORCH_CHECK((c.block_m == 32 || c.block_m == 128 || c.block_m == 192) &&
+                c.num_stages >= 2 && c.num_stages <= 4);
     c.block_n = 256;
     c.block_k = 128;
-    c.warp_m = c.block_m / 4;
+    c.warp_m = std::max(16, c.block_m / 4);
     c.warp_n = 64;
     c.num_threads = threads(c.block_m, c.block_n, c.warp_m, c.warp_n);
     c.scratch_rows = c.block_m == 192 || c.num_stages == 4 ? 32 : 0;

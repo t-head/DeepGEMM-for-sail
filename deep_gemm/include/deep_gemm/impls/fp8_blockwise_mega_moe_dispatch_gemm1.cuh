@@ -11,9 +11,9 @@ namespace deep_gemm::mega_moe::fp8_blockwise {
 // Gate/up retain native 128-row blockwise weight-scale groups.
 template <int kN, int kK, Gemm1Epilogue kEpilogue = Gemm1Epilogue::IdentityBf16, int kComputeM = 128>
 struct Gemm1 : Fp8Gemm<kN, kK, kComputeM, (kEpilogue == Gemm1Epilogue::SwiGluFp8) ? 256 : 128, 128,
-                      kComputeM / 4, (kEpilogue == Gemm1Epilogue::SwiGluFp8) ? 64 : 32, 0, 128, 1, 4, GemmType::Normal> {
+                      (kComputeM < 64 ? 16 : kComputeM / 4), (kEpilogue == Gemm1Epilogue::SwiGluFp8) ? 64 : 32, 0, 128, 1, 4, GemmType::Normal> {
     using Base = Fp8Gemm<kN, kK, kComputeM, (kEpilogue == Gemm1Epilogue::SwiGluFp8) ? 256 : 128, 128,
-                         kComputeM / 4, (kEpilogue == Gemm1Epilogue::SwiGluFp8) ? 64 : 32, 0, 128, 1, 4, GemmType::Normal>;
+                         (kComputeM < 64 ? 16 : kComputeM / 4), (kEpilogue == Gemm1Epilogue::SwiGluFp8) ? 64 : 32, 0, 128, 1, 4, GemmType::Normal>;
     using ScaleShape = cute::Shape<cute::_1, cute::_128, cute::_128>;
     using ScaleConfig = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<
         ScaleShape, false, true>(ScaleShape{}));
@@ -245,7 +245,8 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
             }
         }
     }
-    static_assert(kComputeM == 128 || (kComputeM == 192 && kEpilogue == Gemm1Epilogue::SwiGluFp8));
+    static_assert(kComputeM == 128 ||
+        ((kComputeM == 32 || kComputeM == 192) && kEpilogue == Gemm1Epilogue::SwiGluFp8));
     constexpr uint32_t kWorkBatch = 2;
     auto* work_counter = ws.get_gemm1_work_count_ptr();
     __shared__ uint32_t cta_work;
