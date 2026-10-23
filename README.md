@@ -197,6 +197,18 @@ E/N/K alignment from the raw `[E,N,K/32]` scales. Supplying a weight tensor
 preserves the existing return format; W4A8 also checks its shape against the scales. Fusion and other
 weight modes still require weights; all supported modes require scales.
 
+**W4A16 migration from 2.0.0:**
+`m_grouped_gemm_w4a16_{nopad,masked,fused}` no longer accept
+`fp4_use_bf16_scale`, including an explicit `False`. The MXFP4 weight path
+with BF16 scales has also been removed. For MXFP4 weights with E8M0 scales,
+use `PreprocessMode.W4A16_MXFP4` or `W4A16_MXFP4_MMA`; for INT4 weights
+with BF16 scales, use `PreprocessMode.W4A16_INT4`. These modes require
+`fuse_activation=False`. Existing MXFP4-with-BF16-scale data must be
+converted to a supported quantization format and layout before use;
+removing the keyword alone is insufficient. See the
+[preprocessing implementation](csrc/jit_kernels/heuristics/common_preprocess.hpp)
+for the required weight and scale layouts.
+
 #### Standalone SiLU / SiTU activation (M890)
 
 The activation interfaces are `silu_and_mul(mode, input, *, ...)` and
@@ -266,13 +278,66 @@ We provide Multi-Query Attention (MQA) logits kernels that compute the query-key
 - Non-paged: `deep_gemm.bf16_mqa_logits`, `deep_gemm.int8_mqa_logits`, `deep_gemm.fp8_mqa_logits`, and the unified `deep_gemm.fp8_fp4_mqa_logits`. These take the query, key-value pair (with scales for the quantized variants), per-token weights, and the `cu_seq_len_k_start` / `cu_seq_len_k_end` range tensors, and return the masked logits.
 - Paged: `deep_gemm.bf16_paged_mqa_logits`, `deep_gemm.int8_paged_mqa_logits`, `deep_gemm.fp8_paged_mqa_logits`, and the unified `deep_gemm.fp8_fp4_paged_mqa_logits`. These operate on a fused KV cache with a `block_table` and schedule metadata for variable-length sequences. Call `deep_gemm.get_paged_mqa_logits_metadata` first to compute the scheduling metadata.
 
+Regular paged MQA supports `page_kv` values of **32, 64, and 128**.
+Paged logits require external masking of positions outside each context;
+`clean_logits=True` is unsupported. `fp8_paged_mqa_logits` now defaults to
+`clean_logits=False`, matching this requirement.
+
 For more information, please refer to the corresponding `*_mqa_logits` and `*_paged_mqa_logits` function documentation.
+
+#### Sparse MQA logits (Zhenwu M890P)
+
+Sparse MQA computes indexer logits only for selected KV blocks, for both
+prefill and paged decode. The current implementation supports **MXFP4
+only**, despite the `fp8_fp4` API prefix, with **32 heads** and
+**head dimension 128**. Build metadata with the matching helper before
+calling the logits kernel:
+
+| Layout | Metadata API | Logits API | Packed Q / Q scale shapes |
+| :--- | :--- | :--- | :--- |
+| Non-paged | `get_sparse_mqa_logits_metadata` | `fp8_fp4_sparse_mqa_logits` | `[T,32,64]` / `[T,32]` |
+| Paged | `get_paged_sparse_mqa_logits_metadata` | `fp8_fp4_paged_sparse_mqa_logits` | `[T,1,32,64]` / `[T,1,32]` |
+
+Here `T` is the number of query tokens. Q stores packed MXFP4 codes in
+contiguous int8 tensors, and Q scales pack the E8M0 bytes into contiguous
+int32 tensors. Paged decode requires `next_n=1`. Per-token head weights
+are contiguous BF16 `[T,32]`.
+
+`sparse_block_kv` is **8 or 16**, and `num_max_sparse_blocks` must be a
+positive multiple of 4, at most 4096. The selected KV block indices are
+contiguous int32 `[T,num_max_sparse_blocks]`, with a strictly increasing
+valid prefix in each row. Paged sparse MQA requires a positive `page_kv`
+that is a multiple of `sparse_block_kv`; its fused uint8 KV cache has shape
+`[num_pages,page_kv,1,68]` and a 512-byte-aligned page stride.
+
+The output is BF16 with shape
+`[T,round_up(num_max_sparse_blocks*sparse_block_kv,512)]`.
+Logical columns are compacted by selected block slot:
+`column = slot*sparse_block_kv + token_in_block`, rather than absolute KV
+token position. Padding columns are not additional KV positions.
+See the [attention API](csrc/apis/attention.hpp) for metadata and layout
+requirements and [attention tests](tests/test_attention.py) for supported
+cases.
 
 #### HyperConnection (HC) prenorm GEMM
 
 We provide a HyperConnection (HC) prenorm GEMM that fuses the prenorm square-sum reduction into a TF32 GEMM. Call `deep_gemm.tf32_hc_prenorm_gemm` with a BF16 input `a`, a TF32 weight `b`, and it produces the TF32 output `d` together with the per-row square sum `sqr_sum` used by the subsequent normalization. The K-split configuration is selected automatically based on the K dimension.
 
 For more information, please refer to the `tf32_hc_prenorm_gemm` function documentation.
+
+#### Mega-mHC for DeepSeek V4.1 Flash (M890P)
+
+`deep_gemm.mega_mhc` implements the fused shifted mHC computation used by
+**DeepSeek V4.1 Flash** on **Zhenwu M890P**. The current interface
+supports `hc_mult=4`, hidden size `5120`, and BF16 output. It computes the
+updated residual, mix coefficients, and RMSNorm output into caller-provided
+output buffers.
+
+The `y_bf16` output is required. FP8 output and its scale-output parameters
+are not supported by the current implementation. See the
+[API definition](csrc/apis/mega_mhc.hpp) for argument and layout requirements,
+and [the reference and correctness tests](tests/test_mega_mhc.py) for a
+complete invocation.
 
 #### Einsum (batched GEMM with fused permute)
 
@@ -331,10 +396,38 @@ The library also provides some environment variables, which may be useful:
   - `DG_JIT_PRINT_LOAD_TIME`: `0` or `1`, print the kernel load time, `0` by default
 - **Runtime**
   - `DG_USE_PYTORCH_ACBLASLT_HANDLE`: `0` or `1`, use the PyTorch-managed acBLASLt handle instead of the built-in one, `0` by default
+  - `SAIL_DEEPGEMM_LUT_PATH`: directory containing external GEMM tuning tables; unset by default. See [External GEMM tuning tables](#external-gemm-tuning-tables).
 - **Testing**
   - `DG_USE_PPU_TOOLS`: `0` or `1`, skip the built-in Kineto profiling to stay compatible with external tools (Asight Systems / Asight Compute / Compute Sanitizer), `0` by default
 
 For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
+
+#### External GEMM tuning tables
+
+Set `SAIL_DEEPGEMM_LUT_PATH` before the first GEMM call. Tables are loaded
+on demand and cached for the process lifetime. Files use the name
+`<device_name>_<precision>_<gemm_type>.lut`, where `device_name` is the
+runtime device property name, including any spaces. Supported precision
+names are `bf16`, `int8`, `fp8_blockwise`, `fp8_channelwise`, and `fp4`;
+supported GEMM types are `densegemm`, `groupednopad`, and `groupedmasked`.
+
+Each non-comment row contains positive integers in the following order
+(whitespace-separated; `#` starts a comment):
+
+```text
+# densegemm: 9 integers
+M N K BLOCK_M BLOCK_N BLOCK_K WARP_M WARP_N STAGES
+# groupednopad / groupedmasked: 10 integers
+NUM_GROUPS M N K BLOCK_M BLOCK_N BLOCK_K WARP_M WARP_N STAGES
+```
+
+Dense lookup rounds M up to a multiple of 16 and requires an exact match.
+Grouped lookup matches N, K, and group count, then selects the smallest
+table M greater than or equal to the requested M. Missing or malformed
+files, or queries with no matching entry, fall back to built-in
+configuration selection. These tables supply configurations; they do not
+run an automatic tuning search. See the
+[LUT loader](csrc/jit_kernels/heuristics/runtime_lut.hpp) for validation rules.
 
 ## Optimizations
 

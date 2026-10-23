@@ -8,6 +8,22 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **Mega-mHC for DeepSeek V4.1 Flash**: adds `mega_mhc` for fused shifted
+  mHC computation on Zhenwu M890P, with `hc_mult=4`, hidden size
+  `5120`, and BF16 output. Writes the updated residual, mix coefficients,
+  and RMSNorm output into caller-provided buffers; FP8 output is not supported.
+- **MXFP4 sparse MQA**: adds `get_sparse_mqa_logits_metadata`,
+  `fp8_fp4_sparse_mqa_logits`, `get_paged_sparse_mqa_logits_metadata`, and
+  `fp8_fp4_paged_sparse_mqa_logits` for sparse prefill and paged decode on
+  Zhenwu M890P. Supports 32 heads, head dimension 128, and sparse KV blocks of
+  8 or 16 tokens. Returns BF16 logits compacted by selected block slot;
+  paged Q uses `[T,1,32,64]` packed codes and `[T,1,32]` scales.
+- **External GEMM tuning tables**: adds `SAIL_DEEPGEMM_LUT_PATH` for dense,
+  grouped nopad, and grouped masked GEMMs, with device/precision-specific
+  files and fallback to built-in configuration selection.
+- **STEP FP4 epilogues**: adds `activation_type="silu_and_mul_step"` to
+  FP4 grouped nopad, masked, and fused activation/quantization epilogues
+  enabled by `out_scale`. This mode clamps the gate result after SiLU.
 - **M890 W4A8 MoE GEMMs**: adds `m_grouped_gemm_fp8_fp4_bf16_nt_nopad`,
   `m_grouped_gemm_fp8_fp4_bf16_nt_masked`, and `m_grouped_gemm_fp8_fp4_bf16_nt_fused` for per-row
   E4M3 activations and group-32 MXFP4 weights. Uses FP4 MMA dequantization
@@ -37,6 +53,16 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Changed
 
+- **Paged MQA page sizes**: extends regular paged MQA from page size 64
+  to 32, 64, and 128.
+- **Canonical GEMM bindings**: promotes existing short GEMM names to the
+  C++ bindings, while retaining the corresponding old long names as
+  Python top-level aliases. Callers importing old names directly from
+  `deep_gemm.deep_gemm_cpp` must migrate to the short names or top-level
+  `deep_gemm` imports.
+- **Scale-layout helper**: moves `transform_sf_into_required_layout` from
+  Python utils to a C++ binding. Import it from `deep_gemm`; the old
+  `deep_gemm.utils` definition has been removed.
 - **Unified weight preprocessing**: introduces
   `preprocess_weights_and_scales(mode, fuse_activation, weight, weight_scale)`
   and exports `PreprocessMode`. Both `mode` and `fuse_activation` are explicit
@@ -57,6 +83,26 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   `preprocess_mxfp4_scales` remains as a deprecated scale-only alias, and
   `preprocess_mxfp4_weight_for_act_and_quant_fusing` remains as a deprecated
   activation-fusion alias. Unsupported mode/fusion combinations report an error.
+
+### Removed
+
+- **W4A16 MXFP4 with BF16 scales**: removes `fp4_use_bf16_scale` from
+  `m_grouped_gemm_w4a16_nopad`, `m_grouped_gemm_w4a16_masked`, and
+  `m_grouped_gemm_w4a16_fused`, together with the MXFP4-with-BF16-scale
+  path. Explicitly passing the old keyword, even as `False`, is no longer
+  accepted. Old MXFP4-with-BF16-scale data must be converted to a supported
+  format and preprocessed with the matching W4A16 mode; deleting the
+  keyword alone does not migrate that data. INT4 weights with BF16 scales
+  remain supported.
+
+### Fixed
+
+- Defaults `fp8_paged_mqa_logits` to `clean_logits=False`, matching the
+  existing requirement to mask out-of-context positions externally.
+  `clean_logits=True` remains unsupported for paged MQA.
+- Fixes compilation with PyTorch 2.13.
+- Fixes the dynamic INT8 GEMM architecture selection on Zhenwu 810E and
+  calculates INT8 shared-memory requirements from the final tile configuration.
 
 ## [1.1.0+v0.1.0](https://github.com/t-head/DeepGEMM-for-sail/tree/v1.1.0_v0.1.0_release) — Initial Public Release
 
