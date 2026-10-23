@@ -35,6 +35,7 @@ static void* get_driver_handle() {
 
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgGetErrorName);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgGetErrorString);
+DECL_LAZY_HGGC_DRIVER_FUNCTION(hgFuncGetAttribute);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgFuncSetAttribute);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgModuleLoad);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgModuleUnload);
@@ -44,9 +45,7 @@ DECL_LAZY_HGGC_DRIVER_FUNCTION(hgLibraryUnload);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgKernelGetFunction);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgLaunchKernelEx);
 
-#if DG_TENSORMAP_COMPATIBLE
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgTensorMapEncodeTiled);
-#endif
 
 #if HGGCRT_VERSION >= 12080 and defined(DG_JIT_USE_RUNTIME_API)
 
@@ -134,6 +133,8 @@ static KernelHandle load_kernel(const std::filesystem::path& hgbin_path, const s
     HGkernel hg_kernel;
     DG_HGGC_DRIVER_CHECK(lazy_hgLibraryEnumerateKernels(&hg_kernel, 1, library));
     DG_HGGC_DRIVER_CHECK(lazy_hgKernelGetFunction(&kernel, hg_kernel));
+    if (get_env<int>("DG_JIT_DEBUG"))
+        printf("Loaded kernel via library enumeration (count=%u): %s\n", num_kernels, hgbin_path.c_str());
 #else
     DG_HGGC_DRIVER_CHECK(lazy_hgModuleLoad(&library, hgbin_path.c_str()));
     DG_HGGC_DRIVER_CHECK(lazy_hgModuleGetFunction(&kernel, library, func_name.c_str()));

@@ -28,7 +28,6 @@ public:
     static std::filesystem::path library_root_path;
     static std::filesystem::path library_include_path;
     static std::filesystem::path sdk_home;
-    mutable int blocks_per_cu = 1;
 
     // Single source of truth for the actlize include search paths, shared by the offline (HGCC)
     // and runtime (HGRTC) compilers.
