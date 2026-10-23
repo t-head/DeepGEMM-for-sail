@@ -103,7 +103,7 @@ __global__ void {}(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_args.rhs, args.kernel_args.out,
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_args.rhs, args.kernel_args.out,
                                     args.kernel_args.sqr_sum, args.kernel_args.lhs,
                                     args.kernel_args.num_tokens,
                                     args.kernel_args.ws, args.kernel_args.ws_s, args.kernel_args.counter));
@@ -127,7 +127,7 @@ extern "C" __global__ void tf32_hc_round_b(const float* src, float* dst, uint32_
 )";
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.src, args.dst, args.count));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.src, args.dst, args.count));
     }
 };
 

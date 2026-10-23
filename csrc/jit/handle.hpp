@@ -56,7 +56,7 @@ using KernelHandle = hggcKernel_t;
 using LaunchConfigHandle = hggcLaunchConfig_t;
 using LaunchAttrHandle = hggcLaunchAttribute;
 
-#define DG_HGGC_CHECK DG_HGGC_RUNTIME_CHECK
+#define DG_HGGC_UNIFIED_CHECK DG_HGGC_RUNTIME_CHECK
 
 static KernelHandle load_kernel(const std::filesystem::path& hgbin_path, const std::string& func_name,
                                 LibraryHandle* library_opt = nullptr) {
@@ -112,7 +112,7 @@ using LaunchAttrHandle = HGlaunchAttribute;
     using LibraryHandle = HGmodule;
 #endif
 
-#define DG_HGGC_CHECK DG_HGGC_DRIVER_CHECK
+#define DG_HGGC_UNIFIED_CHECK DG_HGGC_DRIVER_CHECK
 
 static KernelHandle load_kernel(const std::filesystem::path& hgbin_path, const std::string& func_name,
                                 LibraryHandle* library_opt = nullptr) {

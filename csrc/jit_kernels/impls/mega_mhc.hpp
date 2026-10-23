@@ -58,7 +58,7 @@ __global__ __launch_bounds__({}) void {}(deep_gemm::mhc::Args args) {{
             config.attrs = &attr;
             config.numAttrs = 1;
         }
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_args));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_args));
     }
 };
 

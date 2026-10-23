@@ -126,7 +126,7 @@ __global__ void {}(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config,
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.kernel_args.num_q_tokens, args.kernel_args.num_kv_tokens,
             args.kernel_args.cu_seq_len_k_start, args.kernel_args.cu_seq_len_k_end,
             args.kernel_args.context_lens, args.kernel_args.block_table, args.kernel_args.block_table_stride,
@@ -251,7 +251,7 @@ __global__ void {}(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
 

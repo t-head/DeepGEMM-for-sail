@@ -86,7 +86,7 @@ __global__ void {}(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config,
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.kernel_params.topk_ids,
             args.kernel_params.sorted_token_ids,
             args.kernel_params.m_rows,
@@ -243,19 +243,19 @@ __global__ void moe_align_p4(
         auto& p = args.kernel_params;
         switch (args.phase) {
         case Phase::kCount:
-            DG_HGGC_CHECK(launch_kernel(kernel, config,
+            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
                 p.topk_ids, p.sorted_token_ids, p.block_counts, p.numel, p.s_total_ub));
             break;
         case Phase::kScan:
-            DG_HGGC_CHECK(launch_kernel(kernel, config,
+            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
                 p.block_counts, p.local_offsets, p.m_rows, p.num_groups, p.num_blocks));
             break;
         case Phase::kCumsum:
-            DG_HGGC_CHECK(launch_kernel(kernel, config,
+            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
                 p.m_rows, p.expert_ids_and_cumsum, p.cumsum, p.aligned_num_m_blocks));
             break;
         case Phase::kScatter:
-            DG_HGGC_CHECK(launch_kernel(kernel, config,
+            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
                 p.topk_ids, p.sorted_token_ids, p.inv_perm, p.m_indices,
                 p.cumsum, p.local_offsets, p.numel, p.num_groups));
             break;

@@ -136,7 +136,7 @@ __global__ void {}(
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, args.kernel_params));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
 
