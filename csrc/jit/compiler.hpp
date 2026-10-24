@@ -2,6 +2,7 @@
 
 #include <hggc_runtime_api.h>
 #include <hggc.h>
+#include <algorithm>
 #include <chrono>
 #include <fcntl.h>
 #include <filesystem>
@@ -37,6 +38,32 @@ public:
         return {inc + "/actlize_v1.0.0", inc};
     }
 
+    static std::vector<std::string> sdk_include_paths() {
+        std::vector<std::string> paths;
+        std::vector<std::filesystem::path> roots;
+#if defined(__aarch64__)
+        roots.push_back(sdk_home / "targets/aarch64-linux/include");
+#else
+        roots.push_back(sdk_home / "targets/x86_64-linux/include");
+#endif
+        roots.push_back(sdk_home / "include");
+        auto add_directory = [&](const std::filesystem::path& path) {
+            if (std::filesystem::is_directory(path)) {
+                const auto canonical = std::filesystem::canonical(path).string();
+                if (std::find(paths.begin(), paths.end(), canonical) == paths.end())
+                    paths.push_back(canonical);
+            }
+        };
+        for (const auto& root: roots) {
+            add_directory(root);
+            add_directory(root / "cccl");
+            add_directory(root / "hggc/std");
+            add_directory(root / "cccl/hggc/std");
+            add_directory(root / "thrust/system/hggc");
+        }
+        return paths;
+    }
+
     static void prepare_init(const std::string& library_root_path,
                              const std::string& sdk_home_path) {
         Compiler::library_root_path = library_root_path;
@@ -59,9 +86,7 @@ public:
             cache_dir_path = env_cache_dir_path;
 
         // The compiler flags applied to all derived compilers.
-        // NOTE: keep only options this compiler actually accepts here -- it rejects both
-        // --diag-suppress=... and --ptxas-options=..., so neither is seeded. Everything
-        // seeded below is inherited by the derived compilers.
+        // Offline diagnostics are selected by the debug options below.
         signature = "unknown-compiler";
         flags = fmt::format("-std=c++{} ",
                             //"--ptxas-options=--register-usage-level=10",
@@ -156,9 +181,7 @@ DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, sdk_home);
 class HGCCCompiler final: public Compiler {
     std::filesystem::path hgcc_path;
 
-    // >>> PORTING LANDMARK: get_hgcc_version() — the offline compat script rewrites this whole
-    //     method (matched by its signature below, NOT by this note). Interior edits are safe.
-    // Query the hgcc driver version (best-effort; never fatal on format mismatch)
+    // Compiler drivers report either a release or a version number.
     std::string get_hgcc_version() const {
         DG_HOST_ASSERT(std::filesystem::exists(hgcc_path) and "hgcc compiler not found");
 
@@ -168,11 +191,10 @@ class HGCCCompiler final: public Compiler {
         DG_HOST_ASSERT(return_code == 0 and "Failed to query hgcc --version");
 
         std::smatch match;
-        if (std::regex_search(output, match, std::regex(R"(version (\d+\.\d+(?:\.\d+)?))")))
+        if (std::regex_search(output, match, std::regex(R"((?:release|version)\s+(\d+\.\d+(?:\.\d+)?))", std::regex::icase)))
             return match[1].str();
         return "unknown";
     }
-    // <<< PORTING LANDMARK: end of get_hgcc_version().
 
 public:
     HGCCCompiler() {
@@ -180,7 +202,12 @@ public:
         hgcc_path = sdk_home / "bin" / "hgcc";
         if (const auto& env_hgcc_path = get_env<std::string>("DG_JIT_HGCC_COMPILER"); not env_hgcc_path.empty())
             hgcc_path = env_hgcc_path;
+        else if (const auto& env_hgcc_path = get_env<std::string>("DG_HGCC_COMPILER"); not env_hgcc_path.empty())
+            hgcc_path = env_hgcc_path;
         signature = fmt::format("HGCC{}", get_hgcc_version());
+
+        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0) or get_env("DG_JIT_PTXAS_CHECK", 0))
+            flags += " --resource-usage -Xllvm -ppu-warn-lmem-usage";
 
         // Flags are APPENDED to the ones seeded by the base Compiler ctor (-std=c++NN plus
         // the opt-in -lineinfo addition), so those are preserved here too.
@@ -205,7 +232,7 @@ public:
         // Resolved in `compile` for both offline and runtime compilers.
 
         // --- Output format & optimization ---
-        flags += "-hgbin -ftemplate-depth=8192 -O3 -DNDEBUG ";
+        flags += "-hgbin -ftemplate-depth=8192 -O3 -DNDEBUG --expt-relaxed-constexpr --expt-extended-lambda ";
 
         // --- Host compiler flags (passed via -Xcompiler) ---
         flags += "-Xcompiler -fPIC ";
@@ -213,11 +240,8 @@ public:
 
         // NOTE: --ptxas-options=--register-usage-level=10 is intentionally not passed here
 
-        // >>> PORTING LANDMARK: source-language flag — dropped by the offline compat script
-        //     (matched by the code below, NOT by this note); unused by the ported build.
         // --- Source language ---
         flags += " -x hg ";
-        // <<< PORTING LANDMARK: end of dropped source-language flag.
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const override {
@@ -278,7 +302,7 @@ public:
 
         // Check local memory usage
         if (get_env("DG_JIT_PTXAS_CHECK", 0))
-            DG_HOST_ASSERT(not std::regex_search(output, std::regex(R"(Local memory used)")));
+            DG_HOST_ASSERT(not std::regex_search(output, std::regex(R"(Local memory (?:is )?used)")));
 
         // Print PTXAS log
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))
@@ -306,17 +330,7 @@ public:
                 opts.emplace_back("--include-path=" + path);
             }
             };
-            if (getenv("PPU_HOME") == nullptr) {
-              printf("No PPU_HOME exist\n");
-            }
-            std::string sdk_include = std::string(getenv("PPU_HOME")) + "/include";
-
-        #if defined(HGGC_VERSION) && HGGC_VERSION >= 13000
-            std::string sdk_include_cccl = std::string(getenv("PPU_HOME")) + "/include/cccl";
-            includes_insert({sdk_include, sdk_include_cccl});
-        #else
-            includes_insert({sdk_include});
-        #endif
+            includes_insert(Compiler::sdk_include_paths());
             // Include paths for actlize and DeepGEMM headers
             includes_insert(Compiler::actlize_include_paths());
         // #else
@@ -408,7 +422,7 @@ public:
         // Override the compiler signature
         int major, minor;
         DG_HGRTC_CHECK(hgrtcVersion(&major, &minor));
-        signature = fmt::format("HGRTC{}.{}", major, minor);
+        signature = fmt::format("RTC{}.{}", major, minor);
 
     }
 

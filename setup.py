@@ -11,15 +11,11 @@ import re
 
 
 def get_ppu_sdk_version():
+    # PCH follows the native SDK release, not the API version advertised by a
+    # compatible compiler. Query the compiler belonging to the selected SDK.
     try:
-        output = subprocess.check_output(['clang', '--version'], stderr=subprocess.STDOUT).decode('utf-8')
-        match = re.search(r'\((\d+)\.(\d+)\.(\d+)(?:-[^)]*)?\)', output)
-        if match:
-            return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-    except Exception:
-        pass
-    try:
-        output = subprocess.check_output(['hgcc', '--version'], stderr=subprocess.STDOUT).decode('utf-8')
+        compiler = os.path.join(ppu_sdk, 'bin', 'hgcc')
+        output = subprocess.check_output([compiler, '--version'], stderr=subprocess.STDOUT).decode('utf-8')
         match = re.search(r'Release version (\d+)\.(\d+)\.(\d+)', output)
         if match:
             return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
@@ -30,13 +26,20 @@ def get_ppu_sdk_version():
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
 
-# PPU SDK path — provides hggc headers for actlize
-ppu_sdk = os.environ.get('PPU_SDK', '/usr/local/PPU_SDK')
+# SDK root: env PPU_SDK > env PPU_HOME > default, then the compiler on PATH.
+ppu_sdk = os.environ.get('PPU_SDK') or os.environ.get('PPU_HOME') or '/usr/local/PPU_SDK'
+if not os.path.isfile(os.path.join(ppu_sdk, 'bin', 'hgcc')):
+    compiler = shutil.which('hgcc')
+    if compiler:
+        ppu_sdk = os.path.dirname(os.path.dirname(os.path.realpath(compiler)))
 ppu_include = os.path.join(ppu_sdk, 'targets', 'x86_64-linux', 'include')
 
 sources = ['csrc/python_api.cpp']
-build_include_dirs = [
+build_include_dirs = [path for path in (
     ppu_include,
+    os.path.join(ppu_sdk, 'include'),
+    os.path.join(ppu_sdk, 'include', 'cccl'),
+) if os.path.isdir(path)] + [
     current_dir + '/deep_gemm/include',
     current_dir + '/third-party/actlize_v1.0.0/',
     current_dir + '/third-party/actlize_v1.0.0/include',
@@ -46,9 +49,12 @@ build_include_dirs = [
 ]
 
 build_libraries = ['hggc', 'hggcrt1', 'hgrtc', 'acblasLt']
-build_library_dirs = [
+# Search real libraries before the driver stubs used only at link time.
+build_library_dirs = [path for path in (
     os.path.join(ppu_sdk, 'lib'),
-]
+    os.path.join(ppu_sdk, 'lib64'),
+    os.path.join(ppu_sdk, 'lib64', 'stubs'),
+) if os.path.isdir(path)]
 
 third_party_include_dirs = [
     'third-party/actlize_v1.0.0/include/cute',

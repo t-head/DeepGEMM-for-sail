@@ -889,8 +889,8 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, expected_m, layout_info,
-                                  current_stream());
+        dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, expected_m,
+                                  m_rows_tensor.data_ptr<int32_t>(), current_stream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
