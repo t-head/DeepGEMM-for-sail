@@ -65,7 +65,8 @@ template <
   class StrideSFB_,
   class GmemTiledCopySFB_,
   class SmemLayoutAtomSFB_,
-  deep_gemm::FP4DynamicTileId kDynamicTileId = deep_gemm::FP4DynamicTileId::Disabled>
+  deep_gemm::FP4DynamicTileId kDynamicTileId = deep_gemm::FP4DynamicTileId::Disabled,
+  int SFBBlockN_ = -1>
 struct CollectiveMmaScaleFp4
 {
   //
@@ -114,12 +115,15 @@ struct CollectiveMmaScaleFp4
       SmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
   static constexpr int BlockKSF = size<2>(TileShape{}) / 32;  // must ensure BlockK is divisible by 32
+  static constexpr bool UseWideSFB = SFBBlockN_ > 0;
+  static constexpr int SFBBlockN = UseWideSFB ? SFBBlockN_ : size<1>(TileShape{});
+  static_assert(SFBBlockN >= size<1>(TileShape{}), "SFB tile must cover the GEMM N tile");
   using SmemLayoutSFA_ = decltype(tile_to_shape(
       SmemLayoutAtomSFA{},
       make_shape(shape<0>(TileShape{}), Int<BlockKSF>{}, Int<DispatchPolicy::Stages>{})));
   using SmemLayoutSFB_ = decltype(tile_to_shape(
       SmemLayoutAtomSFB{},
-      make_shape(shape<1>(TileShape{}), Int<BlockKSF>{}, Int<DispatchPolicy::Stages>{})));
+      make_shape(Int<SFBBlockN>{}, Int<BlockKSF>{}, Int<DispatchPolicy::Stages>{})));
 
   template<int block_mn_sf>
   static constexpr int deduce_smem_swizzle_padding_sf(cute::Int<block_mn_sf>) {
@@ -163,14 +167,15 @@ struct CollectiveMmaScaleFp4
   static constexpr auto smem_layout_sfa = deduce_smem_layout_sf(SmemLayoutSFA_{}, Int<SwizzlePaddingSFA>{});
   using SmemLayoutSFA = decltype(smem_layout_sfa);
 
-  static constexpr int SwizzlePaddingSFB = deduce_smem_swizzle_padding_sf(shape<1>(TileShape{}));
+  static constexpr int SwizzlePaddingSFB = deduce_smem_swizzle_padding_sf(Int<SFBBlockN>{});
   static constexpr auto smem_layout_sfb = deduce_smem_layout_sf(SmemLayoutSFB_{}, Int<SwizzlePaddingSFB>{});
   using SmemLayoutSFB = decltype(smem_layout_sfb);
 
   static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
 
   // warp_num == 1, use sigle warp to issue AIU LOAD
-  static constexpr bool SplitAIU = (warp_on_m * warp_on_n) > 1 && (size<0>(TileShape{}) != 256 || size<1>(TileShape{}) != 256);
+  static constexpr bool SplitAIU = (warp_on_m * warp_on_n) > 1 &&
+      (size<0>(TileShape{}) != 256 || size<1>(TileShape{}) != 256);
   static constexpr int AIU_SFA_WARP = (SplitAIU && (warp_on_m * warp_on_n) > 2) ? 2 : 0;
   static constexpr int AIU_SFB_WARP = (SplitAIU && (warp_on_m * warp_on_n) > 3) ? 3 : 0;
 
@@ -238,7 +243,11 @@ struct CollectiveMmaScaleFp4
 
     using TilerSFB = typename GmemTiledCopySFB::Tiler_MN;
     constexpr bool TransSFB = true;
+    if constexpr (UseWideSFB) {
+      gmem_tiled_copy_SFB.desc_.template init<ElementSFB, TransSFB, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(nullptr, SFBBlockN, SFK, params.dSFB);
+    } else {
     gmem_tiled_copy_SFB.desc_.template init<ElementSFB, TransSFB, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(nullptr, N, SFK, params.dSFB);
+    }
   };
 
   template <class ProblemShape_MNKL, class BlockCoord_MNKL>
@@ -264,11 +273,17 @@ struct CollectiveMmaScaleFp4
     Tensor mSFA_mk = make_tensor(make_gmem_ptr(params_.ptr_scale_A), mSFA_layout);
     Tensor gSFA = local_tile(make_mix_tensor_like(mSFA_mk), make_shape(shape<0>(TileShape{}), Int<BlockKSF>{}), make_coord(m_coord, _)); // (BLK_M,BLK_K,k)
 
-    auto mSFB_layout = make_layout(make_shape(N, cute::ceil_div(K, 16 * 2)), LayoutLeft{}); // uint16_t
-    Tensor mSFB_nk = make_tensor(make_gmem_ptr(params_.ptr_scale_B), mSFB_layout);
-    Tensor gSFB = local_tile(make_mix_tensor_like(mSFB_nk), make_shape(shape<1>(TileShape{}), Int<BlockKSF>{}), make_coord(n_coord, _)); // (BLK_N,BLK_K,k)
-
-    return cute::make_tuple(gA, gB, gSFA, gSFB);
+    if constexpr (UseWideSFB) {
+      auto mSFB_layout = make_layout(make_shape(Int<SFBBlockN>{}, cute::ceil_div(K, 16 * 2)), LayoutLeft{}); // uint16_t
+      Tensor mSFB_nk = make_tensor(make_gmem_ptr(params_.ptr_scale_B), mSFB_layout);
+      Tensor gSFB = local_tile(make_mix_tensor_like(mSFB_nk), make_shape(Int<SFBBlockN>{}, Int<BlockKSF>{}), make_coord(0, _)); // (SFB_BLK_N,BLK_K,k)
+      return cute::make_tuple(gA, gB, gSFA, gSFB);
+    } else {
+      auto mSFB_layout = make_layout(make_shape(N, cute::ceil_div(K, 16 * 2)), LayoutLeft{}); // uint16_t
+      Tensor mSFB_nk = make_tensor(make_gmem_ptr(params_.ptr_scale_B), mSFB_layout);
+      Tensor gSFB = local_tile(make_mix_tensor_like(mSFB_nk), make_shape(shape<1>(TileShape{}), Int<BlockKSF>{}), make_coord(n_coord, _)); // (BLK_N,BLK_K,k)
+      return cute::make_tuple(gA, gB, gSFA, gSFB);
+    }
   }
 
   template <class ProblemShape>
@@ -294,7 +309,7 @@ struct CollectiveMmaScaleFp4
   }
 
   template <typename SmemLayoutSF, int warp_iter_num, int warp_iter_stride>
-  static CUTLASS_DEVICE void cal_ldmat_offset(int& base_offset, SmemLayoutSF& smem_layout_sf, const int lane_idx, const int warp_mn_idx, cute::Int<warp_iter_num>, cute::Int<warp_iter_stride>) {
+  static CUTLASS_DEVICE void cal_ldmat_offset(int& base_offset, SmemLayoutSF& smem_layout_sf, const int lane_idx, const int warp_mn_idx, cute::Int<warp_iter_num>, cute::Int<warp_iter_stride>, const int mn_offset = 0) {
     constexpr int inner_shape = size<0, 0>(cute::shape(SmemLayoutSF{}));
     constexpr int inner_stride = size<0, 1>(cute::stride(SmemLayoutSF{}));
 
@@ -306,7 +321,7 @@ struct CollectiveMmaScaleFp4
       int warp_offset = warp_mn_idx * 16;
       int group_offset = group_idx * warp_iter_stride;
       int down_offset = is_down * 8;
-      int offset_ = warp_offset + group_offset + down_offset;
+      int offset_ = mn_offset + warp_offset + group_offset + down_offset;
       base_offset = (offset_ % inner_shape) + (offset_ / inner_shape) * inner_stride;
     }
   }
@@ -341,7 +356,7 @@ struct CollectiveMmaScaleFp4
       KTileIterator k_tile_iter, int k_tile_count,
       ResidueMNK residue_mnk,
       int thread_idx,
-      char *smem_buf)
+      char *smem_buf, int sfb_n_offset = 0)
   {
     using namespace cute;
 
@@ -512,7 +527,12 @@ struct CollectiveMmaScaleFp4
     int base_offset_sfa = 0;
     int base_offset_sfb = 0;
     cal_ldmat_offset(base_offset_sfa, SmemLayoutSFA{}, lane_idx, warp_m_idx, Int<warp_iter_num_sfa>{}, Int<warp_iter_stride_sfa>{});
+    if constexpr (UseWideSFB) {
+      cal_ldmat_offset(base_offset_sfb, SmemLayoutSFB{}, lane_idx, warp_n_idx,
+                       Int<warp_iter_num_sfb>{}, Int<warp_iter_stride_sfb>{}, sfb_n_offset);
+    } else {
     cal_ldmat_offset(base_offset_sfb, SmemLayoutSFB{}, lane_idx, warp_n_idx, Int<warp_iter_num_sfb>{}, Int<warp_iter_stride_sfb>{});
+    }
     // PREFETCH register pipeline
     if (K_BLOCK_MAX > 1) {
       // Wait until our first prefetched tile is loaded in

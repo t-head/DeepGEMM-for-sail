@@ -24,6 +24,12 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 
 ## Release Notes
 
+### 2.1.0 — Unreleased
+
+Adds W4A4 MegaMoE with reusable workspaces and load-time weight preparation.
+See the [MegaMoE calling contract](#megamoe) and
+[release notes](CHANGELOG.md#210--unreleased).
+
 ### 1.1.0+v0.1.0 — Initial Public Release
 
 This is the first formal public release of DeepGEMM for PPU. The `1.1.0+v0.1.0` identifier follows the current DeepGEMM-for-sail release naming convention and is maintained independently of the upstream DeepGEMM project.
@@ -394,6 +400,136 @@ We provide einsum-style batched GEMM interfaces that fuse a `(1,0,2)` permute on
 Both take `(tensor, scales)` tuples as `a`/`b`, write to the BF16 output `d`, and optionally accumulate onto `c`.
 
 For more information, please refer to the `fp8_einsum` and `int8_einsum` function documentation.
+
+#### MegaMoE
+
+MegaMoE provides the W4A4 / MXFP4 routed MoE pipeline on PPU1.5, validated on
+ZW-M890P. After BF16 input preparation, one `fp4_fp4_mega_moe` call runs
+cross-rank dispatch with GEMM1, activation and output quantization, followed
+by GEMM2/scatter and a separate barrier/reduce kernel that writes BF16 output.
+The library owns scratch, communication state and per-call counter recycling.
+The router and shared experts are outside this pipeline.
+
+Public functions are exported from `deep_gemm.mega` and the package root.
+The buffer contract follows upstream
+[`5081f851`](https://github.com/deepseek-ai/DeepGEMM/blob/5081f8513af57e61696de4f4f04b0e707ffb503e/deep_gemm/mega/__init__.py);
+the common compute arguments follow SM90 `fp8_mega_moe`:
+`y, l1_weights, l2_weights, sym_buffer, cumulative_local_expert_recv_stats,
+recipe, activation, activation_clamp, fast_math`. They accept positional or
+keyword calls. PPU uses `mma_type="fp4xfp4"` and `recipe=(1, 1, 32)` for group-32
+UE8M0 scales; SM90 FP8 operands and recipes are not interchangeable. The
+BF16 preparation helper, Step/SiTU activations, keyword-only SiTU coefficients
+and separate replica weight arguments are PPU extensions.
+
+```python
+import torch
+import deep_gemm as dg
+
+# EP8: select the current device and initialize group on every rank.
+# Transform the raw (packed MXFP4 weight, UE8M0 scale) pairs once at load time.
+l1_weights, l2_weights = dg.transform_weights_for_mega_moe(l1_weights_raw, l2_weights_raw)
+sym_buffer = dg.get_symm_buffer_for_mega_moe(
+    group, num_experts=384, num_max_tokens_per_rank=4096,
+    num_topk=6, hidden=7168, intermediate_hidden=3072)
+y = torch.empty_like(x)  # BF16 [local_tokens, H]
+
+def forward():
+    dg.mega_moe_pre_dispatch(x, topk_ids, topk_weights, sym_buffer)
+    dg.fp4_fp4_mega_moe(y, l1_weights, l2_weights, sym_buffer,
+                      activation="swiglu", activation_clamp=10.0, fast_math=True)
+    return y
+```
+
+`hidden` is input/output width H, and `intermediate_hidden` is activated width I;
+GEMM1 derives 2I internally. H must be a positive multiple of 512 and I of 128.
+EP is 1–32. The global physical expert count must be divisible by EP, with at
+most 1024 experts per rank; top-k is 1–16 and no larger than the expert count.
+Capacity is positive and below 2^24, and the derived token pool must fit signed
+32-bit row indices. W4A16/FP8 MegaMoE and nonzero `num_shared_experts` are not
+supported. The [test guide](tests/README.MD#routed-moe-correctness-and-performance-tests)
+lists validated model, shape and EP combinations.
+
+For Step or SiTU, pass the same `activation` to workspace allocation, weight
+transformation and compute. For clamp limit `L=activation_clamp`:
+
+| `activation` | Clamp behavior |
+|---|---|
+| `swiglu` | Upper-bound gate by L and clamp up to `[-L,L]` before activation. |
+| `step` | Upper-bound SiLU(gate) by L and clamp up to `[-L,L]` before multiplication. |
+| `situ` | Requires `activation_clamp=None`; uses `situ_beta=4` and `situ_linear_beta=25`. |
+
+For SwiGLU/Step, `activation_clamp=None` or `+inf` disables clipping, zero is a
+valid threshold, and negative values or NaN are rejected. `fast_math=True` uses
+PPU approximate activation math; `False` uses `expf`, division and `tanhf` without
+changing GEMM accumulation, BF16 rounding or MXFP4 quantization.
+
+Pass raw `(weight, scale)` pairs to `transform_weights_for_mega_moe` once at load
+time. Weights are contiguous uint8 `[E,N,K/2]`, with adjacent K nibbles packed
+low nibble first; group-32 UE8M0 scales are uint8 `[E,N,K/32]`. GEMM1's logical
+rows are `[gate; up]`. The transform interleaves rows in groups of eight and
+packs scales without requantization. Use its returned pairs directly, without
+transforming them again. GEMM2's transformed uint16 scales have shape `[E,H,I/64]`
+and dense column-major strides `[H*(I/64),1,H]`; broadcast or strided selections
+must be materialized in that layout. NVFP4 scales and rank-2 weights are unsupported.
+
+By default, each weight pair contains all `num_experts / EP` local physical
+slots. UltraEP may instead supply independently allocated banks through
+`l1_weights_replicas` and `l2_weights_replicas`, both together or neither.
+Transform master and replica pairs separately. Local slots are ordered
+`[masters, replicas]`, with counts summing to `num_experts / EP`; GEMM1 and
+GEMM2 must use the same partition and order. The external router selects these
+physical IDs. Forward and graph replay do not concatenate or copy weights.
+
+`mega_moe_pre_dispatch` quantizes BF16 inputs and stages their routes. A
+preceding operator may instead fill the public input views directly:
+
+| View | Type and shape |
+|---|---|
+| `sym_buffer.x` | packed MXFP4 uint8 `[capacity,H/2]` |
+| `sym_buffer.x_sf` | UE8M0 uint8 `[capacity,H/32]` |
+| `sym_buffer.topk_idx` | int64 `[capacity,topk]` |
+| `sym_buffer.topk_weights` | FP32 `[capacity,topk]` |
+
+Fill the first `y.shape[0]` rows before each call. Input routes must be contiguous;
+valid physical IDs must be distinct within each token, including after external
+remapping. Repeated masked IDs such as `-1` are allowed. IDs outside
+`[0,num_experts)` are ignored even with nonzero routing weights. The original
+routing weights are applied once in final combine, independently of quantization
+scales; zero weights skip reading their combine slots. Duplicate valid IDs are
+unsupported and are not checked through a host synchronization.
+
+The workspace includes inputs, intermediate activations/scales, metadata,
+scratch, combine storage and synchronization state in one allocation. Multiple
+ranks register it once; EP1 uses ordinary `torch.empty` without rendezvous.
+`SymmBuffer(group, num_experts, capacity, topk, H, I)` and the factory return the
+same buffer type. The factory retains deprecated `use_fp8_dispatch`; only
+`None` or `False` is compatible with this backend.
+
+All ranks call in the same order, including empty ranks. Reuse a workspace
+sequentially on one stream, with inputs and outputs alive through execution;
+concurrent forwards require separate workspaces. Graph replay may change inputs
+and routes while retaining storage and shapes. No caller counter resets are
+needed. `SymmBuffer(..., base=existing)` aliases an allocation and handle without
+resetting state; the process group, device and complete layout must match.
+Aliases also execute sequentially on one stream. Call `destroy()` after pending
+work ends; destroying one alias does not invalidate another live alias.
+
+Optional `cumulative_local_expert_recv_stats` is a contiguous INT32 device tensor
+with one element per local physical expert. Each call adds received valid
+assignments, including zero-weight routes and excluding invalid IDs. Initialize
+it once and retain it across graph replay; workspace recycling never clears it.
+
+C++ APIs validate and slice the buffer, impls compile and launch the stages,
+and heuristics select and cache configurations. Tile selection and metadata
+preparation remain internal. Measured profiles match actual tokens and workload;
+unmatched cases use a resource-checked heuristic based on expected random expert
+loads. Other routing distributions are supported but may have different optimal
+configurations. Launch occupancy is checked against the compiled kernel.
+
+See the [test guide](tests/README.MD#routed-moe-correctness-and-performance-tests)
+for correctness thresholds, model benchmarks, optional DeepEP comparisons and
+manual single-device and multi-device tests. These APIs are additive in release
+2.1.0; existing GEMM callers need no migration.
 
 #### Interfaces exposed but not yet implemented
 
