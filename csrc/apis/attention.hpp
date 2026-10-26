@@ -459,12 +459,7 @@ torch::Tensor get_sparse_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_s
         num_q_tokens, num_max_sparse_blocks, sparse_block_kv, sparse_mqa_logits::get_num_sparse_slots());
     auto metadata = torch::empty({num_metadata_bytes},
                                  sparse_kv_block_indices.options().dtype(torch::kUInt8));
-    // Cross-CTA coordination: WorkspaceState counters + one QBlockInfo per token. Process-wide
-    // cache, self-cleaning (the kernel resets the counters at the end).
-    const int64_t num_workspace_bytes =
-        static_cast<int64_t>(sizeof(sparse_mqa_logits::WorkspaceState)) +
-        static_cast<int64_t>(num_q_tokens) * sizeof(sparse_mqa_logits::QBlockInfo);
-    auto& workspace = sparse_mqa_logits::get_sparse_workspace(metadata.options(), num_workspace_bytes);
+    auto& workspace = sparse_mqa_logits::get_sparse_workspace(metadata.options(), num_q_tokens);
     sparse_mqa_logits::launch_sparse_mqa_logits_metadata(
         metadata, workspace, static_cast<uint32_t>(num_q_tokens), static_cast<uint32_t>(num_kv_tokens),
         static_cast<uint32_t>(num_max_sparse_blocks), static_cast<uint32_t>(sparse_block_kv),
@@ -501,10 +496,7 @@ torch::Tensor get_paged_sparse_mqa_logits_metadata(const torch::Tensor& context_
         /*is_paged=*/true);
     auto metadata = torch::empty({num_metadata_bytes},
                                  sparse_kv_block_indices.options().dtype(torch::kUInt8));
-    const int64_t num_workspace_bytes =
-        static_cast<int64_t>(sizeof(sparse_mqa_logits::WorkspaceState)) +
-        static_cast<int64_t>(num_q_tokens) * sizeof(sparse_mqa_logits::QBlockInfo);
-    auto& workspace = sparse_mqa_logits::get_sparse_workspace(metadata.options(), num_workspace_bytes);
+    auto& workspace = sparse_mqa_logits::get_sparse_workspace(metadata.options(), num_q_tokens);
     sparse_mqa_logits::launch_sparse_mqa_logits_metadata(
         metadata, workspace, static_cast<uint32_t>(num_q_tokens), /*num_kv_tokens=*/1,
         static_cast<uint32_t>(num_max_sparse_blocks), static_cast<uint32_t>(sparse_block_kv),

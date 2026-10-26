@@ -3,8 +3,11 @@
 #include <cctype>
 #include <cstdint>
 #include <limits>
+#include <unordered_map>
 
 #include <torch/extension.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include <deep_gemm/common/profiling_interface.cuh>
 #include <deep_gemm/impls/sparse_mqa_logits_layout.cuh>
@@ -136,15 +139,24 @@ __global__ void {}(
     }
 };
 
-// Launches the sparse metadata kernel for one contiguous-KV call. The workspace is a process-wide
-// cache, grown on demand and self-cleaning (the kernel resets the WorkspaceState counters at the
-// end), so the tensor outlives the API call while the async launch is still in flight.
-static torch::Tensor sparse_workspace_cache;
-
-static torch::Tensor& get_sparse_workspace(const torch::TensorOptions& options, const int64_t num_bytes) {
-    if (not sparse_workspace_cache.defined() or sparse_workspace_cache.numel() < num_bytes)
-        sparse_workspace_cache = torch::zeros({num_bytes}, options);
-    return sparse_workspace_cache;
+// Captured kernels retain the workspace address. Match upstream's fixed-capacity, per-stream
+// cache so a larger eager call cannot free storage still referenced by a graph. Counters are
+// reset by the metadata kernel; one-time zeroing must happen during warmup, outside capture.
+static torch::Tensor& get_sparse_workspace(const torch::TensorOptions& options, const int num_q_tokens) {
+    constexpr int kNumMaxQTokens = 1 << 20;
+    constexpr int64_t kNumWorkspaceBytes = sizeof(WorkspaceState) +
+        static_cast<int64_t>(kNumMaxQTokens) * sizeof(QBlockInfo);
+    DG_HOST_ASSERT(num_q_tokens > 0 and num_q_tokens <= kNumMaxQTokens);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    DG_HOST_ASSERT(options.device() == stream.device());
+    static std::unordered_map<c10::cuda::CUDAStream, torch::Tensor> workspaces;
+    auto& workspace = workspaces[stream];
+    if (not workspace.defined()) {
+        DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None and
+                       "Warm up sparse MQA metadata on this device/stream before graph capture");
+        workspace = torch::zeros({kNumWorkspaceBytes}, options.dtype(torch::kUInt8));
+    }
+    return workspace;
 }
 
 static void launch_sparse_mqa_logits_metadata(const torch::Tensor& metadata, torch::Tensor& workspace,
