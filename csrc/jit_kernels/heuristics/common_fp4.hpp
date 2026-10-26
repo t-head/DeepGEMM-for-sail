@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cassert>
 #include <map>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -95,19 +96,12 @@ inline const TileConfig& get_tile_config_smallK() {
     return config;
 }
 
-std::pair<int, int> get_sf_per_stage_size(int block_mn, int block_k) {
-    int bpp = 2;                           // bpp=2 means sizeof(uint16)
-    int smem_sf_k = ceil_div(block_k, 32); // uint16
-    int base_smem_sf_size = block_mn * smem_sf_k * bpp;
-
-    if (block_mn <= 64) {
-        return {base_smem_sf_size, 0};
-    } else {
-        int aiu_num_on_m = ceil_div(block_mn, 64);
-        int sf_padding_size = 16 * aiu_num_on_m * bpp; // 16 means padding 16 rows for bank conflicts
-        int invalid_sf_element_size = 16 * bpp;        // -16 means cute::cosize will only reserve spaces until the last valid element
-        return {base_smem_sf_size + sf_padding_size, invalid_sf_element_size};
-    }
+// uint16 scale storage, including the AIU bank-conflict padding. cosize omits
+// the unused tail of the last stage, so callers subtract the second result once.
+inline constexpr std::pair<int, int> get_sf_per_stage_size(int block_mn, int block_k) {
+    const int bytes = block_mn * ((block_k + 31) / 32) * 2;
+    return block_mn <= 64 ? std::pair{bytes, 0}
+                         : std::pair{bytes + 32 * ((block_mn + 63) / 64), 32};
 }
 
 std::tuple<int, int, int> get_smem_config_fp4(int num_stages, int block_m, int block_n, int warp_m, int warp_n,
@@ -359,16 +353,27 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
                               bool has_bias,
                               bool enable_act_and_quant_fusing,
                               GemmType gemm_type = GemmType::Normal,
-                              int max_block_n = 256, int min_block_n = 32) {
+                              int max_block_n = 256, int min_block_n = 32,
+                              bool apply_tile_corrections = true, std::optional<int> fixed_block_m = std::nullopt,
+                              const TileConfig* tile_overrides = nullptr, bool use_runtime_lut = true) {
     // C++ layer does not perform device checking; is_ppu1v5_device() assert skipped
     (void)total_m;
 
-    if (auto tile = deep_gemm_lut::get_runtime_config(
-            m, n, k * 2, num_groups, gemm_type, deep_gemm_lut::RuntimeLutKind::FP4)) {
+    // A raised lower bound is a caller's layout constraint, including LUT
+    // entries and later tile corrections. The default keeps legacy selection.
+    const bool constrained_block_n = min_block_n > 32;
+    const auto valid_block_n = [=](int bn) {
+        return !constrained_block_n ||
+               (bn >= min_block_n && bn <= max_block_n && (bn & (bn - 1)) == 0 && n % bn == 0);
+    };
+    DG_HOST_ASSERT(!constrained_block_n || min_block_n <= max_block_n);
+
+    if (auto tile = use_runtime_lut ? deep_gemm_lut::get_runtime_config(
+            m, n, k * 2, num_groups, gemm_type, deep_gemm_lut::RuntimeLutKind::FP4) : std::nullopt) {
         // The FP4 input is packed two elements per byte; LUT keys use logical K.
         auto [bm, bn, bk, wm, wn, stages] = *tile;
         // The fused epilogue requires block_n to be a positive multiple of 64.
-        if (!enable_act_and_quant_fusing || (bn >= 64 && bn % 64 == 0)) {
+        if ((!fixed_block_m || bm == *fixed_block_m) && valid_block_n(bn) && (!enable_act_and_quant_fusing || (bn >= 64 && bn % 64 == 0))) {
             return {num_sms, bm, bn, bk, wm, wn, stages,
                     get_smem_config_fp4(stages, bm, bn, wm, wn, bk, n,
                                         has_bias, enable_act_and_quant_fusing)};
@@ -378,7 +383,10 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing);
     }
 
-    std::vector<int> block_ms = (k > 768) ? std::vector<int>{256, 128, 64, 32, 16} : std::vector<int>{128, 64, 32, 16};
+    DG_HOST_ASSERT(!fixed_block_m || (*fixed_block_m >= 16 && *fixed_block_m <= 256 &&
+                                    (*fixed_block_m & (*fixed_block_m - 1)) == 0));
+    std::vector<int> block_ms = fixed_block_m ? std::vector<int>{*fixed_block_m}
+        : (k > 768) ? std::vector<int>{256, 128, 64, 32, 16} : std::vector<int>{128, 64, 32, 16};
 
     DG_HOST_ASSERT(max_block_n > 0 && (max_block_n & (max_block_n - 1)) == 0);
     DG_HOST_ASSERT(min_block_n > 0 && (min_block_n & (min_block_n - 1)) == 0);
@@ -393,7 +401,8 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
             block_ns.push_back(1 << exp);
         }
     } else {
-        for (int exp = bit_length - 2; exp > (bit_length_min - 1); --exp) {
+        const int first_exp = constrained_block_n ? std::max(bit_length - 2, bit_length_min) : bit_length - 2;
+        for (int exp = first_exp; exp > (bit_length_min - 1); --exp) {
             block_ns.push_back(1 << exp);
         }
     }
@@ -424,7 +433,7 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
         return double(block_m * block_n) / (block_m + block_n);
     };
 
-    auto get_warp_mn_grouped = [n, k](int block_m_, int block_n_) -> std::tuple<int, int, int, int> {
+    auto get_warp_mn_grouped = [m, n, k, constrained_block_n](int block_m_, int block_n_) -> std::tuple<int, int, int, int> {
         if (block_m_ == 0 || block_n_ == 0) {
             return {0, 0, 0, 0};
         }
@@ -449,8 +458,10 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
             warp_n_ = (block_n_ <= 128) ? block_n_ / 2 : block_n_ / 4;
         } else if (block_m_ == 16) {
             warp_m_ = 16;
-            block_n_ = (n < 512) ? 64 : block_n_;
-            warp_n_ = 16;
+            block_n_ = (n < 512 && !constrained_block_n) ? 64 : block_n_;
+            // The single-row shortcut uses the wide-N warp mapping below
+            // when its original BN64 is excluded by the caller's layout.
+            warp_n_ = constrained_block_n && m < 2 ? std::min(block_n_, 64) : 16;
         } else if (block_n_ == 128 || block_n_ == 256) {
             warp_m_ = (block_m_ != 32) ? block_m_ / 2 : block_m_;
             warp_n_ = 64;
@@ -464,14 +475,22 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     int best_block_m = 0, best_block_n = 0;
     for (int block_m : block_ms) {
         std::vector<int> block_ns_after_filter;
-        bool use_loose_filter = (m >= 96 && k > 1024) || (m >= 256 && k >= 512);
+        bool use_loose_filter = fixed_block_m || (m >= 96 && k > 1024) || (m >= 256 && k >= 512);
         for (int bn : block_ns) {
+            if (!valid_block_n(bn))
+                continue;
             if (use_loose_filter) {
-                if ((bn != n && n >= 32) && !(block_m == 16 && bn <= 32)) {
+                if (((bn != n || constrained_block_n) && n >= 32) && !(block_m == 16 && bn <= 32)) {
                     block_ns_after_filter.push_back(bn);
                 }
             } else {
-                if ((block_m <= 128 || bn <= 128) && (bn != n && n >= 32) && !(block_m == 16 && bn <= 32)) {
+                // A constrained fused caller may use a larger M tile when it
+                // adds no padded rows relative to BM128. The legacy filter
+                // otherwise excludes BM256 for intermediate M / packed K,
+                // even though it halves B loads and task count at equal MMA work.
+                const bool equal_padding = !apply_tile_corrections &&
+                    ceil_div(m, block_m) * block_m <= ceil_div(m, 128) * 128;
+                if ((block_m <= 128 || bn <= 128 || equal_padding) && ((bn != n || constrained_block_n) && n >= 32) && !(block_m == 16 && bn <= 32)) {
                     block_ns_after_filter.push_back(bn);
                 }
             }
@@ -524,12 +543,12 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
         }
     }
 
-    if ((best_block_m - 10 <= m && m <= best_block_m) && best_block_m == 16) {
+    if (apply_tile_corrections && (best_block_m - 10 <= m && m <= best_block_m) && best_block_m == 16) {
         best_block_m = best_block_m * 2;
     }
 
     // qwen3-next & deepseek gemm2 need to fix some issues
-    if ((best_block_m - 10 <= m && m <= best_block_m) && (best_block_m == 32 || best_block_m == 64) && k >= 192) {
+    if (apply_tile_corrections && (best_block_m - 10 <= m && m <= best_block_m) && (best_block_m == 32 || best_block_m == 64) && k >= 192) {
         best_block_m = best_block_m * 2;
     }
 
@@ -548,28 +567,29 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     if (k <= 256) {
         block_k = 128;
         // for deepseek-pro tp8 gemm2
-        if (k == 192 && best_block_m == 128 && best_block_n == 128) {
+        if (apply_tile_corrections && k == 192 && best_block_m == 128 && best_block_n == 128) {
             block_k = 64;
         }
     }
 
-    if (m < 6 && n >= 512) {
+    const int small_block_n = constrained_block_n ? min_block_n : 64;
+    if (apply_tile_corrections && m < 6 && n >= 512 && valid_block_n(small_block_n)) {
         if (m < 2) {
             best_block_m = 16;
         } else {
             best_block_m = 32;
         }
-        best_block_n = 64;
+        best_block_n = small_block_n;
         block_k = 128;
     }
     // for deepseek-v4 pro tp16 gemm1 smallN
-    if (m < 2 && n < 512) {
+    if (apply_tile_corrections && m < 2 && n < 512 && valid_block_n(small_block_n)) {
         best_block_m = 16;
-        best_block_n = 64;
+        best_block_n = small_block_n;
         block_k = 256;
     }
     // for DeepSeek-V4 Pro EP
-    if ((n == 6144 && k == 3584) || (n == 7168 && k == 1536)) {
+    if (apply_tile_corrections && ((n == 6144 && k == 3584) || (n == 7168 && k == 1536))) {
         if (m < 6) {
             if (best_block_m == 32 && best_block_n == 64) {
                 best_block_m = 64;
@@ -586,8 +606,11 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
         }
     }
 
-    const TileConfig& tile_config =
-        (k < 128 && !(best_block_n >= 128 && best_block_m >= 128)) ? get_tile_config_smallK() : get_tile_config_normal();
+    const TileConfig& tile_config = tile_overrides &&
+            tile_overrides->count({best_block_m, best_block_n, block_k})
+        ? *tile_overrides
+        : (k < 128 && !(best_block_n >= 128 && best_block_m >= 128))
+            ? get_tile_config_smallK() : get_tile_config_normal();
 
     auto it = tile_config.find({best_block_m, best_block_n, block_k});
     if (it != tile_config.end()) {
@@ -597,8 +620,8 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     }
 
     // todo: opt this logic
-    if (m >= 520 && k <= 768) {
-        if (best_block_m == 128 && best_block_n == 256) {
+    if (apply_tile_corrections && m >= 520 && k <= 768) {
+        if (best_block_m == 128 && best_block_n == 256 && valid_block_n(best_block_m)) {
             std::swap(best_block_m, best_block_n);
         }
     }
@@ -610,6 +633,7 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     // NOTE: Python rebinds best_block_m/best_block_n from get_warp_mn_grouped() before deciding
     // stage_candidates, so the conditions below must use the post-call values (bm_out/bn_out).
     auto [bm_out, bn_out, warp_m, warp_n] = get_warp_mn_grouped(best_block_m, best_block_n);
+    DG_HOST_ASSERT(valid_block_n(bn_out));
 
     std::vector<int> stage_candidates;
     for (int s : {8, 7, 6, 5, 4, 3, 2}) {
