@@ -168,6 +168,7 @@ get_m_alignment_for_contiguous_layout = get_mk_alignment_for_contiguous_layout
 
 # --- BF16 dense GEMM ---
 gemm_bf16_bf16_bf16_nt = bf16_gemm_nt
+gemm_bf16_bf16_fp32_nt = bf16_gemm_nt
 gemm_bf16_bf16_bf16_nn = bf16_gemm_nn
 gemm_bf16_bf16_bf16_tn = bf16_gemm_tn
 gemm_bf16_bf16_bf16_tt = bf16_gemm_tt

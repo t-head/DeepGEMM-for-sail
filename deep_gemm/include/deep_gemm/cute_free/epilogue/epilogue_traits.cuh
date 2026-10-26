@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <hggc_runtime.h>
 #include <cutlass/bfloat16.h>
 
 namespace deep_gemm {
@@ -32,6 +33,17 @@ struct EpilogueElementTraits<cutlass::bfloat16_t> {
     asm("ppu.cvt.rtte.bf16x2.f32 %0, %1, %2;\n"
         : "=r"(packed) : "f"(hi), "f"(lo));
     return packed;
+  }
+};
+
+template <>
+struct EpilogueElementTraits<float> {
+  using StorageType = float;
+  using PackedType = float2;
+  static constexpr int kVecWidth = 2;
+
+  static __device__ __forceinline__ PackedType cvt_pack(float hi, float lo) {
+    return make_float2(lo, hi);
   }
 };
 

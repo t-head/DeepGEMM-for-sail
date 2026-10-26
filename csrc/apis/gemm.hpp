@@ -71,12 +71,14 @@ void bf16_gemm_nt(const torch::Tensor& a,
     const auto& [m_, n_] = get_shape<2>(d);
 
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
-    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    TORCH_CHECK(a.scalar_type() == torch::kBFloat16, "lhs must be BF16");
+    TORCH_CHECK(b.scalar_type() == torch::kBFloat16, "rhs must be BF16");
+    TORCH_CHECK(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat,
+                "out must be BF16 or FP32");
     TORCH_CHECK(a.is_contiguous(), "lhs must be contiguous");
     TORCH_CHECK(b.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+    TORCH_CHECK(n % 2 == 0, "BF16 dense GEMM requires even N, got ", n);
     if (early_return(m, n, k, d, c)) return;
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {

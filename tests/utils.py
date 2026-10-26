@@ -249,6 +249,27 @@ def construct(m: int, k: int, n: int, d: torch.dtype, quant_type: str = "block")
 
     if d == torch.bfloat16:
         return x.to('cuda'), y.to('cuda'), out.to('cuda'), ref_out.to('cuda')
+    elif d == "bf16_bf16_fp32":
+        # BF16 inputs with an FP32 output: inputs match the BF16 path above,
+        # only the output/reference are FP32 (no final BF16 rounding).
+        if _acc_check:
+            # Deterministic guard: plant one product whose exact FP32 value is not
+            # BF16-representable. Zero the rest of y's first row so out[0, 0] is
+            # that single product alone — immune to accumulation-order differences
+            # between the kernel and the reference, keeping the bit-exact check
+            # below valid. If the kernel (wrongly) rounded the result through
+            # BF16, out[0, 0] would differ from the FP32 reference by the rounding
+            # step, which the strict check rejects.
+            # 0.1 (bf16) * 0.2 (bf16) = 0.02001953125 exactly in FP32, but
+            # bf16(0.02001953125) != 0.02001953125.
+            y[0, :].zero_()
+            y[0, 0] = 0.2
+            x[0, 0] = 0.1
+            ref_out = x.float() @ y.float().t()
+        else:
+            ref_out = torch.empty((m, n), device=tensor_device, dtype=torch.float32)
+        out = torch.empty((m, n), device=tensor_device, dtype=torch.float32)
+        return x.to('cuda'), y.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == torch.int8:
         x_int8, y_int8 = per_token_cast_to_int8(x), per_token_cast_to_int8(y)
         return  (x_int8[0].to('cuda'), x_int8[1].to('cuda')), (y_int8[0].to('cuda'), y_int8[1].to('cuda')), out.to('cuda'), ref_out.to('cuda')
@@ -1207,7 +1228,8 @@ def parse_deepgemm_string_re(s):
             'w4fa16': 'group',
             'w4fa16_mma': 'group',
             'w4fa8_mma': 'group',
-            'w4a8_int8': 'channel'
+            'w4a8_int8': 'channel',
+            'bf16_bf16_fp32': 'non_quantized'
         }
         result["quant_type"] = quant_type_defaults.get(result["data_type"], 'block')
     return result
@@ -1265,6 +1287,9 @@ def convert_data_type_to_dtype(data_type):
         return torch.float8_e4m3fn
     elif data_type in ["w4a16", "w4fa16", "w4fa16_mma", "w4fa8_mma", "w4a8_int8"]:
         return data_type
+    elif data_type in ["bf16_bf16_fp32"]:
+        # DenseGemm only: BF16 inputs with an FP32 output (deep_gemm.gemm_bf16_bf16_fp32_nt).
+        return data_type
     else:
         print(f"ERROR: Unsupported dtype: {data_type}, please check!")
         exit(1)
@@ -1307,6 +1332,8 @@ def test_gemm(args) -> None:
         x, y, out, ref_out = construct(m, k, n, d, quant_type=quant_type)
         if d == torch.bfloat16:
             deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
+        elif d == "bf16_bf16_fp32":
+            deep_gemm.gemm_bf16_bf16_fp32_nt(x, y, out)
         elif d == torch.int8:
             deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
         elif d == torch.float8_e4m3fn:
@@ -1338,6 +1365,13 @@ def test_gemm(args) -> None:
             print("ref_out:", ref_out)
             print("out:", out)
         assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.10f}'
+        if d == "bf16_bf16_fp32":
+            # Strict check: the FP32-output path must not round the result back
+            # through BF16. calc_diff (cosine-based) alone tolerates that rounding,
+            # so compare the planted non-BF16-representable element bit-exactly.
+            assert out[0, 0] == ref_out[0, 0].item(), \
+                f'FP32 output was BF16-rounded: out[0,0]={out[0, 0].item()!r}, ' \
+                f'ref={ref_out[0, 0].item()!r}'
         print("Passed with acc_check\n")
     else:
         print("Passed without acc_check\n")
@@ -1347,6 +1381,8 @@ def test_gemm(args) -> None:
         def test_func():
             if d == torch.bfloat16:
                 deep_gemm.gemm_bf16_bf16_bf16_nt(x, y, out)
+            elif d == "bf16_bf16_fp32":
+                deep_gemm.gemm_bf16_bf16_fp32_nt(x, y, out)
             elif d == torch.int8:
                 deep_gemm.gemm_int8_int8_bf16_nt(x, y, out)
             elif d == torch.float8_e4m3fn:

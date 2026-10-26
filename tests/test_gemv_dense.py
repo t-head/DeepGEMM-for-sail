@@ -12,8 +12,10 @@ Covers:
   7. Fallback conditions (small n, unaligned k, m >= 3, explicit configs,
      env kill switch, and the large-n x large-k tile gate).
   8. m == 2 dual-accumulator variant (two W rows per thread share the x
-     loads) across ladder branches, k tails, odd n, determinism.
-  9. Optional performance comparison GEMV vs tile (--benchmark).
+     loads) across ladder branches, k tails, even-n tails, determinism.
+  9. Odd-N rejection at the API level (bf16_gemm_nt requires even N for
+     float2 packed stores; odd N never reaches the kernel).
+ 10. Optional performance comparison GEMV vs tile (--benchmark).
 """
 import argparse
 import os
@@ -33,7 +35,7 @@ DISPATCH_CASES = [
                             #      k=7168 -> tile faster
     (1, 2112, 7168, True),  # c13: add_times=896 -> BlockX=64, BlockY=2 (below gate N)
     (1, 80, 7168, True),    # n <= 100 branch: BlockX=128 + cross-warp SMEM reduce
-    (1, 897, 7168, True),   # n not divisible by BlockY=2: tail-block row clamp
+    (1, 896, 7168, True),   # tail-block row clamp (n even, not divisible by BlockY=2)
     (1, 128, 16, True),     # add_times=2 -> BlockX=2 (warp spans 16 rows)
     (1, 128, 8200, True),   # add_times > 1024 -> BlockX=128, BlockY=1
     (1, 3072, 3584, False), # tile-gate corner: both thresholds met exactly
@@ -53,7 +55,7 @@ DISPATCH_CASES = [
 # (n, k): accuracy-only coverage of the remaining ladder branches/boundaries
 LADDER_CASES = [
     (100, 7168),   # n == 100: last n of the fat-block branch
-    (101, 7168),   # n == 101: first n of the add_times ladder
+    (102, 7168),   # n == 102: first even n above the fat-block branch
     (128, 8),      # smallest accepted k, pure residual loop (stride > k)
     (896, 8),      # add_times=1 -> BlockX=2, BlockY=64
     (128, 24),     # add_times=3 -> BlockX=4, BlockY=32
@@ -81,10 +83,10 @@ K_TAIL_CASES = [
 RANDOM_CASES = 32
 
 # (n, k): m == 2 accuracy across both kernels. n<=512 or k<2048 -> single-row op
-# (npt=1); n>512 && k>=2048 -> two-W-rows op (npt=2). Covers k/odd-n tails; n<=2048.
+# (npt=1); n>512 && k>=2048 -> two-W-rows op (npt=2). Covers k/even-n tails; n<=2048.
 M2_CASES = [
     (512, 7168),   # npt=1: BlockX=64, BlockY=2 -> 2 rows/block
-    (511, 7168),   # npt=1 odd n: last-block row 511 out of range -> warp early-return
+    (510, 7168),   # npt=1 even n, not divisible by BlockY=2: last-block row clamp
     (80, 7168),    # n <= 100 branch: BlockX=128 + cross-warp SMEM reduce
     (128, 8200),   # npt=1: BlockX=128, BlockY=1 -> 1 row/block
     (128, 16),     # npt=1: BlockX=2, BlockY=64, pure residual loop
@@ -92,8 +94,8 @@ M2_CASES = [
     (512, 2056),   # npt=1: BlockX=32, 4 main strides + residual vector
     (256, 4616),   # npt=1: BlockX=64, BlockY=2
     (64, 4096),    # n <= 100 branch: BlockX=128, BlockY=1 (npt=1)
-    (897, 7168),   # npt=2 odd n: r2 row1 clamp + whole-warp early-return tail
-    (1537, 7168),  # npt=2 odd n: r2 tail on a deeper grid
+    (898, 7168),   # npt=2 even n, not divisible by 2: r2 row1 clamp + tail warp
+    (1536, 7168),  # npt=2 even n: r2 tail on a deeper grid
     (1024, 7168),  # npt=2 even n: r2, grid divides evenly (no tail)
 ]
 
@@ -180,7 +182,8 @@ def test_random_loop() -> None:
     random.seed(0)
     worst = 0.0
     for _ in range(RANDOM_CASES):
-        n = random.randint(64, 8192)
+        # bf16_gemm_nt requires even N (float2 packed stores), so sweep even n only.
+        n = 2 * random.randint(32, 4096)
         k = 8 * random.randint(1, 1024)
         worst = max(worst, run_accuracy(1, n, k))
     print(f'  worst calc_diff={worst:.2e}  Passed')
@@ -243,6 +246,25 @@ def test_repeat_loop() -> None:
         else:
             assert torch.equal(out, ref), f"repeat call {i} produced different output"
     print('  3 calls bit-exact  Passed')
+    print('Passed\n')
+
+
+def test_odd_n_rejection_loop() -> None:
+    print('Testing odd-N rejection at the API level (even-N contract):')
+    # bf16_gemm_nt rejects odd N with TORCH_CHECK before any kernel launch
+    # (float2 packed stores). These must raise, not silently compute.
+    for m, n, k in [(1, 897, 7168), (1, 101, 7168), (1, 511, 7168),
+                    (2, 897, 7168), (2, 1537, 7168), (1, 2048 + 1, 7168)]:
+        x, w = make_inputs(m, n, k)
+        out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+        try:
+            deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+            torch.cuda.synchronize()
+        except RuntimeError as e:
+            assert 'even N' in str(e), f'expected even-N rejection, got: {e}'
+            print(f'  {m}x{n}x{k}: rejected  Passed')
+        else:
+            raise AssertionError(f'odd N={n} was not rejected (m={m}, k={k})')
     print('Passed\n')
 
 
@@ -343,7 +365,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Dense GEMV (m == 1 / m == 2) fast-path tests.')
     parser.add_argument('--func', default=None, nargs='*',
-                        choices=['Dispatch', 'Ladder', 'KTail', 'Random', 'M2', 'Data', 'Repeat', 'Bypass'],
+                        choices=['Dispatch', 'Ladder', 'KTail', 'Random', 'M2', 'Data', 'Repeat', 'OddN', 'Bypass'],
                         help='target test funcs (default: all)')
     parser.add_argument('--benchmark', default=False, action='store_true')
     parser.add_argument('--verbose', default=False, action='store_true')
@@ -360,6 +382,7 @@ if __name__ == '__main__':
         'M2': test_m2_loop,
         'Data': test_data_loop,
         'Repeat': test_repeat_loop,
+        'OddN': test_odd_n_rejection_loop,
         'Bypass': run_bypass_cases,
     }
     for name in (args.func if args.func is not None else funcs):

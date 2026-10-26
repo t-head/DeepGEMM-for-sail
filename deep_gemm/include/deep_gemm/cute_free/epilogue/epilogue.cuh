@@ -22,7 +22,7 @@ namespace epilogue {
 // own epilogue mapping.
 //
 //   CLayoutT  : accumulator layout (e.g. mma::Tc02Mma16x16x16CLayout)
-//   Element   : output element type (currently cutlass::bfloat16_t)
+//   Element   : output element type (cutlass::bfloat16_t or float)
 //   WARP_M    : warp tile M (sets kMmasPerWarpM = WARP_M / kMmaM)
 //   WARP_N    : warp tile N (sets kMmasPerWarpN = WARP_N / kMmaN)
 //   IsAlignedN: whether N is a multiple of BLOCK_N (eliminates col checks)
@@ -30,6 +30,7 @@ namespace epilogue {
 
 template <typename Element, typename CLayoutT, int WARP_M, int WARP_N, bool IsAlignedN>
 struct Epilogue {
+  using ElementOutput = Element;
   using CLayout = CLayoutT;
   using ElemTraits  = EpilogueElementTraits<Element>;
   using StorageType = typename ElemTraits::StorageType;

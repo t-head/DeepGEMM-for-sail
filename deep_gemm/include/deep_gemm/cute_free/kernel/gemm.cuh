@@ -65,6 +65,7 @@ struct GemmKernel {
   using S2RAtomB = S2RAtomB_;
   using MmaAtom  = MmaAtom_;
   using Epilogue = Epilogue_;
+  using ElementOutput = typename Epilogue::ElementOutput;
 
   // Collective mainloop assembled from the injected copy / mma atoms.
   using Mainloop = mainloop::Mainloop<
@@ -106,7 +107,7 @@ struct GemmKernel {
   struct Params {
     Element const* ptr_A;
     Element const* ptr_B;
-    Element* ptr_D;
+    ElementOutput* ptr_D;
     int M, N, K;
     int lda, ldb, ldd;
     DenseGemmTileSchedulerArguments scheduler;

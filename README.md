@@ -87,6 +87,10 @@ This library focuses on high-performance tensor cell kernels and related LLM com
 
 To perform a basic non-grouped FP8 GEMM, call the `deep_gemm.gemm_fp8_fp8_bf16_nt` function. For more details, please refer to the function documentation.
 
+BF16 dense GEMM: `deep_gemm.bf16_gemm_nt(a, b, out)` computes `out = a @ b.T`
+with contiguous BF16 inputs. On 810E and 890P, `out` supports BF16 or FP32;
+N must be even.
+
 #### Grouped GEMMs (contiguous layout)
 
 Unlike traditional grouped GEMMs in ACTLIZE, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape.

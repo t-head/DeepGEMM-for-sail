@@ -2,6 +2,7 @@
 
 #include <torch/python.h>
 #include <cstdint>
+#include <type_traits>
 #include <hggc_fp8.h>
 #include "cute/tensor.hpp"
 #include "../../jit/compiler.hpp"
@@ -24,7 +25,10 @@
 using namespace deep_gemm_bf16_common;
 namespace deep_gemm {
 
-class BF16GemmCutlass3Runtime final : public LaunchRuntime<BF16GemmCutlass3Runtime> {
+// Output type is part of the generated source (and therefore the JIT cache key).
+// Grouped GEMMs retain the BF16 specialization through the alias below.
+template <typename ElementOutput>
+class BF16GemmCutlass3RuntimeT final : public LaunchRuntime<BF16GemmCutlass3RuntimeT<ElementOutput>> {
 public:
     using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
     using GemmProblemSize = cute::tuple<int32_t, int32_t, int32_t, int32_t>;
@@ -56,10 +60,10 @@ public:
     // Epilogue
     struct EpilogueArgs {
         LinearCombinationArgs callback;
-        cutlass::bfloat16_t* ptr_C;
+        ElementOutput* ptr_C;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C;
 
-        cutlass::bfloat16_t* ptr_D;
+        ElementOutput* ptr_D;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D;
     };
 
@@ -85,9 +89,9 @@ public:
     using EpilogueParamNoTsm = EpilogueArgs;  // PPU1.5: the args are the params, as-is
     struct EpilogueParamWithTsm {
         struct {} thread{};
-        cutlass::bfloat16_t* ptr_C{};
+        ElementOutput* ptr_C{};
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C{};
-        cutlass::bfloat16_t* ptr_D{};
+        ElementOutput* ptr_D{};
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D{};
     };
 
@@ -196,7 +200,7 @@ static constexpr bool kEnableSboOverlap = {11};// false;
 
 using ElementA    = cutlass::bfloat16_t;
 using ElementB    = cutlass::bfloat16_t;
-using ElementC    = cutlass::bfloat16_t;
+using ElementC    = {19};
 using LayoutA     = cutlass::layout::RowMajor;
 using LayoutB     = cutlass::layout::ColumnMajor;
 using LayoutC     = cutlass::layout::RowMajor;
@@ -341,7 +345,8 @@ __global__ void {12}(
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
-            with_tsm_epilogue, host_params_size);
+            with_tsm_epilogue, host_params_size,
+            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -349,11 +354,14 @@ __global__ void {12}(
     }
 };
 
+using BF16GemmCutlass3Runtime = BF16GemmCutlass3RuntimeT<cutlass::bfloat16_t>;
+
 // Dedicated BF16 DenseGemm runtime (standalone kernel, no SHAPE_N/K template params).
 // Architecture-aligned with DenseINT8GemmCutlass3Runtime. The MoE grouped-path runtime
 // (BF16GemmCutlass3Runtime) is intentionally left untouched so that m_grouped_bf16_gemm.hpp
 // stays byte-identical to baseline 753f28f.
-class DenseBF16GemmCutlass3Runtime final : public LaunchRuntime<DenseBF16GemmCutlass3Runtime> {
+template <typename ElementOutput>
+class DenseBF16GemmCutlass3RuntimeT final : public LaunchRuntime<DenseBF16GemmCutlass3RuntimeT<ElementOutput>> {
 public:
     using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
     using GemmProblemSize = cute::tuple<int32_t, int32_t, int32_t, int32_t>;
@@ -385,10 +393,10 @@ public:
     // Epilogue
     struct EpilogueArgs {
         LinearCombinationArgs callback;
-        cutlass::bfloat16_t* ptr_C;
+        ElementOutput* ptr_C;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C;
 
-        cutlass::bfloat16_t* ptr_D;
+        ElementOutput* ptr_D;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D;
     };
 
@@ -489,7 +497,7 @@ using ElementAcc = float;
 using LayoutA = cutlass::layout::RowMajor;
 using LayoutB = cutlass::layout::ColumnMajor;
 using LayoutC = cutlass::layout::RowMajor;
-using ElementC = cutlass::bfloat16_t;
+using ElementC = {15};
 using ElementD = ElementC;
 using LayoutD = cutlass::layout::RowMajor;
 using ElementCompute = float;
@@ -577,7 +585,8 @@ __global__ void {9}(
             is_aligned_n ? "true" : "false",
             args.launch_info.kernel_name,
             args.launch_info.overlap_prologue ? "true" : "false",
-            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
+            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
+            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
@@ -585,7 +594,8 @@ __global__ void {9}(
     }
 };
 
-class DenseBF16GemmCuteFreeRuntime final : public LaunchRuntime<DenseBF16GemmCuteFreeRuntime> {
+template <typename ElementOutput>
+class DenseBF16GemmCuteFreeRuntimeT final : public LaunchRuntime<DenseBF16GemmCuteFreeRuntimeT<ElementOutput>> {
 public:
     using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
     using GemmProblemSize = cute::tuple<int32_t, int32_t, int32_t, int32_t>;
@@ -617,10 +627,10 @@ public:
     // Epilogue
     struct EpilogueArgs {
         LinearCombinationArgs callback;
-        cutlass::bfloat16_t* ptr_C;
+        ElementOutput* ptr_C;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C;
 
-        cutlass::bfloat16_t* ptr_D;
+        ElementOutput* ptr_D;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D;
     };
 
@@ -699,7 +709,7 @@ namespace deep_gemm {{
 
 using GemmTypeTag = std::integral_constant<GemmType, GemmType::{0}>;
 
-using Kernel = BF16GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {11}, {9}, GemmTypeTag>;
+using Kernel = BF16GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {11}, {9}, GemmTypeTag{12}>;
 
 }} // namespace deep_gemm
 
@@ -718,7 +728,8 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             info.dense_s2_opt ? "true" : "false",
             is_aligned_n ? "true" : "false",
             info.kernel_name,
-            info.overlap_prologue ? "true" : "false");
+            info.overlap_prologue ? "true" : "false",
+            std::is_same_v<ElementOutput, float> ? ", float" : "");
     }
 
 };
@@ -743,6 +754,7 @@ public:
         int m;   // 1 or 2
         int npt; // W rows per thread (m == 2 policy: 2 shares the x load pair)
         std::string kernel_name;
+        bool output_fp32 = false;
     };
 
     struct Args {
@@ -764,13 +776,14 @@ namespace deep_gemm {{
 
 extern "C" __global__
 void {}(const GemvDenseArgs args) {{
-    {}<__ppu_bfloat16, __ppu_bfloat16, float,
+    {}<__ppu_bfloat16, {}, float,
        int4, int4, {}, {}, {}{}>(args);
 }}
 
 }}
 )",
             args.launch_info.kernel_name, entry,
+            args.launch_info.output_fp32 ? "float" : "__ppu_bfloat16",
             args.launch_info.block_x, args.launch_info.block_y, args.launch_info.k_per_thread,
             npt_arg);
     }
@@ -798,7 +811,7 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
     params.K = k;
     params.x_ptr = lhs.data_ptr<at::BFloat16>();
     params.w_ptr = rhs.data_ptr<at::BFloat16>();
-    params.y_ptr = out.data_ptr<at::BFloat16>();
+    params.y_ptr = out.data_ptr();
     params.stride_wn = k;
 
     dim3 block(block_x, block_y);
@@ -806,10 +819,12 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
 
     // m == 2 -> dual-accumulator variant; npt == 2 walks two W rows/thread sharing
     // (x0, x1), each block owning block_y * npt rows. Names split so a trace shows npt.
-    const char* kernel_name = m == 1 ? "gemv_dense_bf16"
+    std::string kernel_name = m == 1 ? "gemv_dense_bf16"
                                      : (npt == 2 ? "gemv_dense_m2r2_bf16" : "gemv_dense_m2_bf16");
+    const bool output_fp32 = out.scalar_type() == torch::kFloat;
+    if (output_fp32) kernel_name += "_fp32";
     auto args = DenseGemvRuntime::Args{
-        .launch_info = {block_x, block_y, k_per_thread, m, npt, kernel_name},
+        .launch_info = {block_x, block_y, k_per_thread, m, npt, kernel_name, output_fp32},
         .launch_args = {grid, block, 0},
         .kernel_params = params,
     };
@@ -844,8 +859,9 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
 
 // 8-element public boundary ConfigTuple (matches Python/vLLM stable contract).
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
-static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out, const int& m,
-                      const int& n, const int& k, std::optional<ConfigTuple> configs = std::nullopt) {
+template <typename ElementOutput>
+static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out, const int& m,
+                           const int& n, const int& k, std::optional<ConfigTuple> configs = std::nullopt) {
     int num_sms = get_num_sms();
     static constexpr GemmType kGemmType = GemmType::Normal;
 
@@ -888,7 +904,6 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
 
     cutlass::bfloat16_t* input_b = reinterpret_cast<cutlass::bfloat16_t*>(rhs.data_ptr<at::BFloat16>());
     cutlass::bfloat16_t* input_a = reinterpret_cast<cutlass::bfloat16_t*>(lhs.data_ptr<at::BFloat16>());
-    cutlass::bfloat16_t* output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
 
     // TODO get hw info from real env
     cutlass::KernelHardwareInfo hw_info;
@@ -897,7 +912,10 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
     bool enable_sbo_overlap = false;
+    auto* output = static_cast<ElementOutput*>(out.data_ptr());
     if (is_ppu1v5_device()) {
+        using CuteRuntime = DenseBF16GemmCuteFreeRuntimeT<ElementOutput>;
+        using CutlassRuntime = DenseBF16GemmCutlass3RuntimeT<ElementOutput>;
         // Dense GEMV fast path (m == 1 or 2): SIMT avoids the tile path's BM=16
         // padding (15/16 lane waste at m==1, 14/16 at m==2). Explicit configs force tile.
         if ((m == 1 || m == 2) && !configs.has_value() && gemv_dense_bf16(lhs, rhs, out, m, n, k)) {
@@ -945,7 +963,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
         int smem_cute_free = SMSIZE;
 
         // generate_impl only reads problem_shape (for IsAlignedN) + launch_info.
-        const auto gemm_args = DenseBF16GemmCuteFreeRuntime::GemmArguments{
+        const auto gemm_args = typename CuteRuntime::GemmArguments{
             .mode = cutlass::gemm::GemmUniversalMode::kGemm,
             .problem_shape = {m, n, k, 1},
             .mainloopargs = {input_a, stride_A, input_b, stride_B},
@@ -961,8 +979,8 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             .scheduler = {(uint32_t)m, (uint32_t)n, (uint32_t)k, nullptr},
         };
 
-        DenseBF16GemmCuteFreeRuntime::GemmKernelParams params =
-            DenseBF16GemmCuteFreeRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
+        typename CuteRuntime::GemmKernelParams params =
+            CuteRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
         dim3 grid_cute_free;
         grid_cute_free.x = blocks_per_cu * num_sms_new;
@@ -972,14 +990,14 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
         // kernel. Single compilation, single launch.
         std::string cute_free_kernel_name =
             overlap_on ? "bf16_deep_gemm_cute_free_ovlp" : "bf16_deep_gemm_cute_free";
-        auto args = DenseBF16GemmCuteFreeRuntime::Args{
+        auto args = typename CuteRuntime::Args{
             .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, /*dense_s2_opt=*/true, num_stages,
                             "Normal", "Default", cute_free_kernel_name, enable_sbo_overlap, overlap_on},
             .launch_args = {grid, block_cute_free, smem_cute_free},
             .kernel_params = params,
         };
 
-        auto code = DenseBF16GemmCuteFreeRuntime::generate(args);
+        auto code = CuteRuntime::generate(args);
         auto runtime = compiler->build(cute_free_kernel_name, code);
         auto kernel = runtime->kernel;
 
@@ -987,7 +1005,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
         struct CuteFreeParams {
             cutlass::bfloat16_t const* ptr_A;
             cutlass::bfloat16_t const* ptr_B;
-            cutlass::bfloat16_t* ptr_D;
+            ElementOutput* ptr_D;
             int M, N, K;
             int lda, ldb, ldd;
             DenseGemmTileSchedulerArguments scheduler;
@@ -1046,7 +1064,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             // warp_on_k_reduce when WarpOnK > 1.
             const int warps_k = block_k / warp_k;
             dim3 const block_cutlass3 = (block_m / warp_m) * (block_n / warp_n) * warps_k * 32;
-            const auto gemm_args = DenseBF16GemmCutlass3Runtime::GemmArguments{
+            const auto gemm_args = typename CutlassRuntime::GemmArguments{
                 .mode = cutlass::gemm::GemmUniversalMode::kGemm,
                 .problem_shape = {m, n, k, 1},
                 .mainloopargs = {input_a, stride_A, input_b, stride_B},
@@ -1062,17 +1080,17 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
                 .scheduler = {(uint32_t)m, (uint32_t)n, (uint32_t)k, nullptr},
             };
 
-            DenseBF16GemmCutlass3Runtime::GemmKernelParams params =
-                DenseBF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+            typename CutlassRuntime::GemmKernelParams params =
+                CutlassRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
             // Single compilation: overlap decision is baked into the generated code.
-            auto args = DenseBF16GemmCutlass3Runtime::Args{
+            auto args = typename CutlassRuntime::Args{
                 .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, /*dense_s2_opt=*/true, num_stages,
                                 "Normal", "Default", "bf16_dense_gemm", false, /*overlap_prologue=*/overlap_on},
                 .launch_args = {grid, block_cutlass3, SMSIZE},
                 .kernel_params = params,
             };
-            auto code = DenseBF16GemmCutlass3Runtime::generate(args);
+            auto code = CutlassRuntime::generate(args);
             auto runtime = compiler->build("bf16_dense_gemm", code);
             auto kernel = runtime->kernel;
 
@@ -1087,7 +1105,7 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             }
             ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
-            DenseBF16GemmCutlass3Runtime::launch(runtime, args);
+            CutlassRuntime::launch(runtime, args);
 
             ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
@@ -1108,62 +1126,83 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
             }
         }
     } else {
-        const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{
-            .mode = cutlass::gemm::GemmUniversalMode::kGemm,
-            .problem_shape = {m, n, k, 1},
-            .mainloopargs = {input_a, stride_A, input_b, stride_B},
-            .epilogueargs =
-                {
-                    {1, 0},
-                    output,
-                    stride_D,
-                    output,
-                    stride_D,
-                },
-            .hw_info = hw_info,
-            .scheduler = {(uint32_t)m, layout_info},
-            .signal = nullptr};
+        // Keep input/mainloop configuration unchanged and specialize only the epilogue.
+        auto launch = [&](auto* output) {
+            using OutputType = std::remove_pointer_t<decltype(output)>;
+            using Runtime = BF16GemmCutlass3RuntimeT<OutputType>;
+            // The TSM epilogue shares storage with the BF16 mainloop. FP32 stores
+            // can require twice the BF16 epilogue storage, including explicit configs.
+            const int smem_size = std::max(SMSIZE, int(block_m * block_n * sizeof(OutputType)));
+            const auto gemm_args = typename Runtime::GemmArguments{
+                .mode = cutlass::gemm::GemmUniversalMode::kGemm,
+                .problem_shape = {m, n, k, 1},
+                .mainloopargs = {input_a, stride_A, input_b, stride_B},
+                .epilogueargs =
+                    {
+                        {1, 0},
+                        output,
+                        stride_D,
+                        output,
+                        stride_D,
+                    },
+                .hw_info = hw_info,
+                .scheduler = {(uint32_t)m, layout_info},
+                .signal = nullptr};
 
-        BF16GemmCutlass3Runtime::GemmKernelParams params =
-            BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+            auto params = Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
-        auto args = BF16GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                                  num_stages, "Normal", "Default", "bf16_deep_gemm",
-                                                                  enable_sbo_overlap},
-                                                  .launch_args = {grid, block, SMSIZE},
-                                                  .kernel_params = params};
+            auto args = typename Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
+                                                               num_stages, "Normal", "Default", "bf16_deep_gemm",
+                                                               enable_sbo_overlap},
+                                               .launch_args = {grid, block, smem_size},
+                                               .kernel_params = params};
 
-        const auto& code = BF16GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build("bf16_deep_gemm", code);
-        const auto& kernel = runtime->kernel;
-        int blocks_per_cu = 0;
-        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
-        args.launch_args.grid_dim.x *= blocks_per_cu;
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, grouped_layout,
-                                      current_stream());
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+            const auto& code = Runtime::generate(args);
+            const auto& runtime = compiler->build("bf16_deep_gemm", code);
+            const auto& kernel = runtime->kernel;
+            int blocks_per_cu = 0;
+            HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, smem_size);
+            args.launch_args.grid_dim.x *= blocks_per_cu;
+            DgProfParam dg_prof_params;
+            if (ProfilingInterface::Instance().get_op_info()) {
+                dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, grouped_layout,
+                                          current_stream());
+            }
+            ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
-        BF16GemmCutlass3Runtime::launch(runtime, args);
+            Runtime::launch(runtime, args);
 
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+            ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
-        char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            int numRegs = 0, localSize = 0;
-            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+            char* pEnv_params = std::getenv("show_log");
+            if (pEnv_params && isdigit(*pEnv_params)) {
+                int numRegs = 0, localSize = 0;
+                hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+                hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
 
-            printf("[DenseGemm_BF16:]\n");
-            printf("group:%d, problem:[%d, %d, %d]\n", kNumGroups, m, n, k);
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
-                   args.launch_args.grid_dim.x);
-            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n, block_k,
-                   warp_m, warp_n, block_k, num_stages);
-            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
+                printf("[DenseGemm_BF16:]\n");
+                printf("group:%d, problem:[%d, %d, %d]\n", kNumGroups, m, n, k);
+                printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
+                       args.launch_args.grid_dim.x);
+                printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n, block_k,
+                       warp_m, warp_n, block_k, num_stages);
+                printf("SMSIZE:%d, vreg:%d, stack:%d\n",smem_size, int(numRegs), int(localSize));
+            }
+        };
+        if (out.scalar_type() == torch::kFloat) {
+            launch(out.data_ptr<float>());
+        } else {
+            launch(reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>()));
         }
     }
+}
+// Public launcher: the input type remains BF16; only the output is dispatched.
+static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out,
+                      const int& m, const int& n, const int& k,
+                      std::optional<ConfigTuple> configs = std::nullopt) {
+    if (out.scalar_type() == torch::kFloat)
+        bf16_gemm_impl<float>(lhs, rhs, out, m, n, k, configs);
+    else
+        bf16_gemm_impl<cutlass::bfloat16_t>(lhs, rhs, out, m, n, k, configs);
 }
 } // namespace deep_gemm
