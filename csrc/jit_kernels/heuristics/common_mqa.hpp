@@ -95,8 +95,15 @@ static int get_paged_num_threads(const PagedTile& tile, int next_n) {
 // Faithful port of `get_paged_mqa_logits_tile`: a lookup table with a search fallback.
 // NOTES: `weights_size` / `logits_size` are hardcoded to 4 upstream even when the tensors are
 // BF16; kept as-is so the tile choice matches the Python path exactly.
-static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_heads, int head_dim, int datasize) {
+static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_heads, int head_dim, int datasize,
+                                          bool is_fp4_avg = false) {
     DG_HOST_ASSERT(page_kv == 32 or page_kv == 64 or page_kv == 128);
+    // FP4 AVG packs four Q tokens per 16-column MMA tile. Its explicit flag
+    // distinguishes packed FP4 D128 from FP8 D64, which share the same shape.
+    if (is_fp4_avg)
+        return {1, 3, 128, 32, false, 4};
+
+    // Preserve the existing shape-based policy for all older callers.
     const bool is_fp4 = datasize == 1 and head_dim == 64;
     constexpr int weights_size = 4, logits_size = 4;
 
@@ -195,7 +202,7 @@ static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_head
         {{1, 2, 16, 128}, {1, 3, 128, 32, false, 4}},
     };
     // 4 heads are padded to 16 in the paged kernel: look up with 16 heads and
-    // ceil(next_n / 4) warp-tile "tokens" (fp4 keeps its own kernel layout)
+    // ceil(next_n / 4) warp-tile "tokens" (FP4 AVG is handled above).
     if (num_heads == 4 and not is_fp4) {
         num_heads = 16;
         next_n = (next_n + 3) / 4;

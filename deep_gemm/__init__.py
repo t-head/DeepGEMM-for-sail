@@ -119,6 +119,7 @@ from .deep_gemm_cpp import (
     fp8_fp4_mqa_avg_logits,
     fp8_mqa_avg_logits,
     fp8_paged_mqa_avg_logits,
+    fp8_fp4_paged_mqa_avg_logits,
     # Attention kernels (sparse MQA logits)
     get_sparse_mqa_logits_metadata,
     fp8_fp4_sparse_mqa_logits,

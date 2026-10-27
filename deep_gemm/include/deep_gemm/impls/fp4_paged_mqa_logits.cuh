@@ -14,7 +14,7 @@ namespace cutlass::gemm::kernel {
 //   - kHeadDim is the *packed* dimension (original_head_dim / 2 = 64)
 //   - Additional q_sf (Q scale factor, uint8 e8m0) parameter
 //   - k_sf is uint8 e8m0 (not float32 per-token scale)
-//   - Q/K/q_sf/k_sf/weights all use AIU load
+//   - Q/K/q_sf/k_sf and optional weights use AIU load
 //   - Output dtype controlled by ElementLogits (float or bfloat16)
 //   - MMA atom: F32F4F4F32 (16x16x64)
 // ============================================================================
@@ -28,13 +28,19 @@ public:
     static_assert(PAGE_KV == 32 || PAGE_KV == 64 || PAGE_KV == 128, "Invalid KV page size");
     static_assert(cute::is_same_v<ElementQK, uint8_t>, "FP4 paged MQA logits requires uint8_t ElementQK");
     static_assert(kHeadDim == 64, "FP4 packed head_dim must be 64 (original 128 / 2)");
-    static_assert(kScaleMode == deep_gemm::kScaleModeWeights, "FP4 supports the weights mode only");
+    static_assert(kScaleMode == deep_gemm::kScaleModeWeights || kScaleMode == deep_gemm::kScaleModeUnity,
+                  "FP4 paged MQA supports weighted or unity-scale AVG mode");
+    static constexpr bool kIsAvg = kScaleMode == deep_gemm::kScaleModeUnity;
+    static_assert(!kIsAvg || kNumHeads == 4, "FP4 paged AVG requires 4 heads");
+    static constexpr int kMmaNumHeads = kIsAvg ? 16 : kNumHeads;
+    static constexpr int kQueriesPerWarp = kMmaNumHeads / kNumHeads;
+    static constexpr float kInvSqrtHeadDim = 0.08838834764831844f; // 1 / sqrt(128)
 
     static constexpr int BLOCK_M = BLOCK_KV;
-    static constexpr int BLOCK_N = kNextN * kNumHeads;
+    static constexpr int BLOCK_N = ((kNextN + kQueriesPerWarp - 1) / kQueriesPerWarp) * kMmaNumHeads;
     static constexpr int BLOCK_K = 64; // kHeadDim = 64
     static constexpr int WARP_M = WARP_KV;
-    static constexpr int WARP_N = kNumHeads;
+    static constexpr int WARP_N = kMmaNumHeads;
 
     static constexpr int kNumMathWarpGroups = SPLIT_KV / BLOCK_KV;
 
@@ -62,8 +68,12 @@ public:
     static constexpr bool WarpInterleaving = (MaxThreadsPerBlock == 512);
     static_assert(!(WarpInterleaving && kNumQStages == 1), "warp-interleave does not support stage_q = 1");
 
+    // A page32 copy fills half a 64-row KV stage. The TSM stage stride must
+    // still span the whole compute tile, not one page-local AIU copy.
     using DefaultOperandA =
-        cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, ElementQK, false, Int<(PAGE_KV < BLOCK_KV ? PAGE_KV : BLOCK_KV)>, Int<BLOCK_K>, false>;
+        cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, ElementQK, false,
+            Int<(PAGE_KV < BLOCK_KV ? PAGE_KV : BLOCK_KV)>, Int<BLOCK_K>, false,
+            kIsAvg ? BLOCK_M * BLOCK_K : 0>;
     using DefaultOperandB =
         cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, ElementQK, false, Int<BLOCK_N>, Int<BLOCK_K>, true>;
     // A (K/V)
@@ -132,6 +142,15 @@ public:
     // SFA/SFB/Weight s2r layouts
     MQA_DEFINE_FP4_S2R_LAYOUTS(WarpOnM, MmaIterM, kNumKVStages, BLOCK_M,
                                WarpOnN, MmaIterN, kNumQStages, BLOCK_N)
+    // The scale copy packs four MMA-block selector slots per warp. Narrow
+    // AVG warps consume fewer slots; repeat their valid scales in the unused
+    // slots instead of reading past the warp's scale rows (or the allocation).
+    template <int WarpCount, int MmaIters, int Stages, int Rows>
+    using AvgSFTransLayout = Layout<
+        Shape<Shape<Int<WarpCount>, Shape<Int<MmaIters>, Int<(MmaIters < 4 ? 4 / MmaIters : 1)>>>,
+              Shape<_2, _8, _2>, Int<Stages>>,
+        Stride<Stride<Int<MmaIters * 32>, Stride<_32, _0>>,
+               Stride<_16, _2, _1>, Int<Rows * 2>>>;
     // SmemTiledCopyWeights: use conditional copy atom type (same as fp4_mqa_logits.cuh)
     using WeightCopyAtomType = cute::conditional_t<cute::is_same_v<ElementWeights, __ppu_bfloat16>, uint32_t, uint64_t>;
     using SmemTiledCopyWeights = decltype(make_tiled_copy(
@@ -198,6 +217,12 @@ public:
             nullptr, 1, BLOCK_N, StrideSFB{});
         gmem_tiled_copy_weight.desc_.template init<ElementWeights, false, get<0>(TilerWeight{}), get<1>(TilerWeight{})>(
             nullptr, 1, BLOCK_N, StrideSFB{});
+        if constexpr (kIsAvg) {
+            // Pad the MMA tile, not the request: next_n=1/5/6 has fewer valid
+            // Q heads and scale words than BLOCK_N. AIU fills the rest with zero.
+            gmem_tiled_copy_B.desc_.dim_h = kNextN * kNumHeads;
+            gmem_tiled_copy_SFB.desc_.dim_w = kNextN * kNumHeads;
+        }
     };
 
     CUTLASS_DEVICE auto load_init(Params const& params) {
@@ -321,7 +346,9 @@ public:
 
         // SFA s2r: recast smem as uint16_t, then apply transposed layout for MMA consumption
         Tensor sSFAUint16 = recast<uint16_t>(sSFA);
-        Tensor sSFATrans = make_tensor(sSFAUint16.data(), sSFATransLayout{});
+        using SFATransLayout = cute::conditional_t<kIsAvg,
+            AvgSFTransLayout<WarpOnM, MmaIterM, kNumKVStages, BLOCK_M>, sSFATransLayout>;
+        Tensor sSFATrans = make_tensor(sSFAUint16.data(), SFATransLayout{});
 
         SmemTiledCopySFA smem_tiled_copy_SFA;
         auto smem_thr_copy_SFA = smem_tiled_copy_SFA.get_slice(warp_m_idx * 32 + lane_idx);
@@ -332,7 +359,9 @@ public:
 
         // SFB s2r: recast smem as uint16_t, then apply transposed layout for MMA consumption
         Tensor sSFBUint16 = recast<uint16_t>(sSFB);
-        Tensor sSFBTrans = make_tensor(sSFBUint16.data(), sSFBTransLayout{});
+        using SFBTransLayout = cute::conditional_t<kIsAvg,
+            AvgSFTransLayout<WarpOnN, MmaIterN, kNumQStages, BLOCK_N>, sSFBTransLayout>;
+        Tensor sSFBTrans = make_tensor(sSFBUint16.data(), SFBTransLayout{});
 
         SmemTiledCopySFB smem_tiled_copy_SFB;
         auto smem_thr_copy_SFB = smem_tiled_copy_SFB.get_slice(warp_n_idx * 32 + lane_idx);
@@ -353,7 +382,7 @@ public:
             params.batch_size, blockIdx.x, params.context_lens, params.schedule_meta);
         DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
 
-        constexpr int elem_weights = kNumHeads / 4;
+        constexpr int elem_weights = kMmaNumHeads / 4;
         ElementLogits weights[elem_weights];
         Tensor sW_copy = make_tensor(sW.data(), sWCopyLayout{});
         SmemTiledCopyWeights smem_tiled_copy_weights;
@@ -373,6 +402,8 @@ public:
         const auto& warp_offset = warp_m_idx * WARP_M;
         const auto& v_0_offset = lane_idx / 4 + 0;
         const auto& v_1_offset = lane_idx / 4 + 8;
+        const uint32_t r_mine = lane_idx & 1;
+        const uint32_t v_offset_mine = r_mine ? v_1_offset : v_0_offset;
 
         uint32_t q_idx = scheduler.current_q_idx;
         uint32_t kv_idx_base;
@@ -382,13 +413,18 @@ public:
 
         // Load Q (packed FP4) + q_sf (e8m0) + weights from gmem to smem
         auto load_q_g2s = [&](uint32_t q_idx) {
-            auto q_offset = q_idx * BLOCK_N;
+            auto q_offset = q_idx * kNextN * kNumHeads;
             tBgB.data() = tQgQ.data() + q_offset * kHeadDim;
             tSFBgSFB.data() = tSFQgSFQ.data() + q_offset;
-            tWgW.data() = tWgW_base.data() + q_offset;
             copy_aiu(gmem_tiled_copy_B, tBgB(_, _, _, 0), tBsB(_, _, _, smem_pipe_write_q), warp_idx);
-            copy_aiu<true>(gmem_tiled_copy_SFB, tSFBgSFB(_, _, _, 0), tSFBsSFB(_, _, _, smem_pipe_write_q),
-                           gmem_tiled_copy_weight, tWgW(_, _, _, 0), tWsW(_, _, _, smem_pipe_write_q), warp_idx);
+            if constexpr (kIsAvg) {
+                // Quantization scales are still mandatory for FP4 AVG.
+                copy_aiu(gmem_tiled_copy_SFB, tSFBgSFB(_, _, _, 0), tSFBsSFB(_, _, _, smem_pipe_write_q), warp_idx);
+            } else {
+                tWgW.data() = tWgW_base.data() + q_offset;
+                copy_aiu<true>(gmem_tiled_copy_SFB, tSFBgSFB(_, _, _, 0), tSFBsSFB(_, _, _, smem_pipe_write_q),
+                               gmem_tiled_copy_weight, tWgW(_, _, _, 0), tWsW(_, _, _, smem_pipe_write_q), warp_idx);
+            }
 
             if (thread_print) {
                 printf("  copy_q q_idx = %d, q_offset = %d, stage = %d\n", q_idx, q_offset, smem_pipe_write_q);
@@ -462,9 +498,11 @@ public:
         auto load_q_s2r = [&]() {
             copy(smem_tiled_copy_B, tCsB(_, _, _, smem_pipe_read_q), tCrB_copy_view);
             copy(smem_tiled_copy_SFB, tCsSFB(_, _, _, smem_pipe_read_q), tCrSFB_copy_view);
-            copy(smem_tiled_copy_weights, tCsW(_, _, _, smem_pipe_read_q), tCrW_copy_view);
-            deep_gemm::load_weights_from_copy_view<ElementWeights, ElementLogits>(
-                tCrW_copy_view, weights, elem_weights);
+            if constexpr (!kIsAvg) {
+                copy(smem_tiled_copy_weights, tCsW(_, _, _, smem_pipe_read_q), tCrW_copy_view);
+                deep_gemm::load_weights_from_copy_view<ElementWeights, ElementLogits>(
+                    tCrW_copy_view, weights, elem_weights);
+            }
 
             if (thread_print) {
                 printf("    copy q to vreg, q_stage_idx = %d,\n", smem_pipe_read_q);
@@ -505,10 +543,29 @@ public:
         auto epilogue_mblock = [&](int q_idx, int kv_idx, int m_block) {
             // Reduce over heads and store logits
             static constexpr int kNumAccumPerMma = size<0>(accum);
-            CUTE_STATIC_ASSERT(kNumHeads % 8 == 0);
 
             int m = m_block;
-            {
+            if constexpr (kIsAvg) {
+                CUTE_STATIC_ASSERT(MmaIterN == 1 && kQueriesPerWarp == 4);
+                const uint32_t lane_in_quad = lane_idx % 4;
+                const uint32_t token_base = warp_n_idx * kQueriesPerWarp;
+                const uint32_t logits_kv_offset = kv_idx * BLOCK_KV + warp_offset + m * InstM + v_offset_mine;
+                // Accumulate the four heads in FP32 for both output types;
+                // BF16 conversion happens only at the final store.
+                float sums[2][2];
+                deep_gemm::float_epilogue_reduce_wq4(accum, m, sums);
+                #pragma unroll
+                for (int t = 0; t < 2; ++t) {
+                    const float recv = __shfl_xor_sync(0xffffffffu, sums[t][r_mine ^ 1], 1);
+                    const float total = sums[t][r_mine] + recv;
+                    const uint32_t token = token_base + 2 * t + lane_in_quad / 2;
+                    if (token < kNextN) {
+                        const auto logits_q_offset = (q_idx * kNextN + token) * params.logits_stride;
+                        params.logits[logits_q_offset + logits_kv_offset] = static_cast<ElementLogits>(total * kInvSqrtHeadDim);
+                    }
+                }
+            } else {
+                CUTE_STATIC_ASSERT(kNumHeads % 8 == 0);
                 int mma_offset = m * InstM;
                 auto logits_q_offset = (q_idx * kNextN + warp_n_idx) * params.logits_stride;
                 auto logits_kv_offset = kv_idx * BLOCK_KV + warp_offset + mma_offset;
