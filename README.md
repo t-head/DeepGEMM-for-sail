@@ -89,7 +89,9 @@ To perform a basic non-grouped FP8 GEMM, call the `deep_gemm.gemm_fp8_fp8_bf16_n
 
 BF16 dense GEMM: `deep_gemm.bf16_gemm_nt(a, b, out)` computes `out = a @ b.T`
 with contiguous BF16 inputs. On 810E and 890P, `out` supports BF16 or FP32;
-N must be even.
+N must be even. The FP32-output variant is also exposed as the alias
+`deep_gemm.gemm_bf16_bf16_fp32_nt(a, b, out)`; it keeps full FP32
+accumulator precision (no final BF16 rounding).
 
 #### Grouped GEMMs (contiguous layout)
 

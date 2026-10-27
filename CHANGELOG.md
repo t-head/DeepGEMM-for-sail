@@ -4,7 +4,23 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
-## Unreleased
+## [2.2.0](https://github.com/t-head/DeepGEMM-for-sail/pull/71) — 2026-10-27
+
+### Added
+
+- **A8W4 INT8 MoE GEMMs**: adds `m_grouped_gemm_int8_int4_bf16_nt_masked`
+  and `m_grouped_gemm_int8_int4_bf16_nt_nopad` for INT8 per-token activations and
+  portable packed signed-INT4 per-channel weights on Zhenwu 610 / 610E / 810 / 810E
+  (PPU001). Converts INT4 to INT8 in-register for INT8 x INT8 MMA with INT32
+  accumulation and BF16 output. Requires `K%32=0` and `N%8=0`; checkpoint weights
+  need `preprocess_a8w4_weight` for the device-specific permutation.
+- **BF16 dense GEMM with FP32 output**: `bf16_gemm_nt` now accepts an FP32
+  output tensor for BF16 x BF16 inputs on Zhenwu 810E and M890P, exposed via
+  the new Python alias `gemm_bf16_bf16_fp32_nt`. The FP32 variant avoids the
+  final BF16 rounding of the accumulator. Requires even N; user facing dtype
+  and even-N guards use `TORCH_CHECK`.
+
+## [2.1.0](https://github.com/t-head/DeepGEMM-for-sail/commit/4ae322e) — 2026-10-23
 
 ### Added
 
@@ -35,12 +51,6 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   applies a shared power-of-two exponent shift into `[114,140]`, and rejects
   exponent codes 0 and 255 or exponent ranges spanning more than 26. The
   inverse is applied to activation row scales exactly once per GEMM.
-- **A8W4 INT8 MoE GEMMs**: adds `m_grouped_gemm_int8_int4_bf16_nt_masked`
-  and `m_grouped_gemm_int8_int4_bf16_nt_nopad` for INT8 per-token activations and
-  portable packed signed-INT4 per-channel weights on Zhenwu 610 / 610E / 810 / 810E
-  (PPU001). Converts INT4 to INT8 in-register for INT8 x INT8 MMA with INT32
-  accumulation and BF16 output. Requires `K%32=0` and `N%8=0`; checkpoint weights
-  need `preprocess_a8w4_weight` for the device-specific permutation.
 - **M890 standalone activation**: adds `silu_and_mul(mode, input, ...)`
   and `situ_and_mul(mode, input, *, beta, ...)`, with a required first
   `ActivationQuantMode` argument: `BF16`, `FP8_CHANNEL`, `FP8_BLOCK`,
