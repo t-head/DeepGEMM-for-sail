@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cmath>
 #include <optional>
 #include <string>
 
@@ -34,6 +35,7 @@ struct Arguments {
     void* d;
     const float* a_scale;
     int num_token;
+    float inv_scale;
     const int* sorted_token_ids;
     Scheduler scheduler;
 };
@@ -52,7 +54,7 @@ public:
         const auto& c = a.config;
         return fmt::format(R"(
 #include <deep_gemm/impls/w4fa8_gemm.cuh>
-using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}>;
+using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}{}>;
 static_assert(sizeof(Kernel::SharedStorage) == {}, "shared memory mismatch");
 static_assert(Kernel::MaxThreadsPerBlock == {}, "thread count mismatch");
 static_assert(sizeof(Kernel::Params) == {}, "kernel argument size mismatch");
@@ -63,6 +65,7 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
 }}
 )", a.n, a.k, c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, c.warp_k,
             a.groups, c.num_stages, get_gemm_type_name(a.kind), c.n_expand,
+            a.params.inv_scale == 1.0f ? "" : ", true",
             get_smem_size(c, a.k), get_num_threads(c), sizeof(Arguments<Scheduler>));
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -106,15 +109,16 @@ static void launch(const W4A8Config& c, int m, int n, int k, int groups, GemmTyp
 
 static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torch::Tensor& b,
                 const torch::Tensor& scale, const torch::Tensor& d, const torch::Tensor& rows,
-                GemmType kind, int expected_m, const W4A8Config& c,
+                GemmType kind, int expected_m, const W4A8Config& c, float inv_scale = 1.0f,
                 const torch::Tensor& expert_ids = {}, const torch::Tensor& token_ids = {},
                 const torch::Tensor& aligned_blocks = {}) {
+    TORCH_CHECK(std::isfinite(inv_scale) && inv_scale > 0, "inv_scale must be finite and positive");
     const int groups = b.size(0), n = b.size(1), k = a.size(-1);
     const int m = kind == GemmType::MGroupedMasked ? a.size(1) : a.size(0);
     check_config(c, n, k, kind);
     if (kind == GemmType::MGroupedFused) {
         const Arguments<W4A8FusedSchedulerArguments> params{a.data_ptr(), b.data_ptr(), scale.data_ptr(), d.data_ptr(),
-            a_scale.data_ptr<float>(), m, token_ids.data_ptr<int32_t>(),
+            a_scale.data_ptr<float>(), m, inv_scale, token_ids.data_ptr<int32_t>(),
             {aligned_blocks.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>()}};
         launch(c,m,n,k,groups,kind,expected_m,d.size(0)/m,rows.data_ptr<int32_t>(),params);
     } else {
@@ -133,7 +137,7 @@ static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torc
             layout = scratch.data_ptr<int32_t>();
         }
         const Arguments<TileSchedulerArguments> params{a.data_ptr(),b.data_ptr(),scale.data_ptr(),d.data_ptr(),
-            a_scale.data_ptr<float>(),0,nullptr,TileSchedulerArguments(static_cast<uint32_t>(m),layout)};
+            a_scale.data_ptr<float>(),0,inv_scale,nullptr,TileSchedulerArguments(static_cast<uint32_t>(m),layout)};
         launch(c,m,n,k,groups,kind,expected_m,0,rows.data_ptr<int32_t>(),params);
     }
 }

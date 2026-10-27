@@ -1667,7 +1667,7 @@ static void check_w4fa8_indices(const torch::Tensor& t, const torch::Tensor& a) 
 static void m_grouped_gemm_fp8_fp4_bf16_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& a,
                                       const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& out,
                                       const torch::Tensor& indices, std::optional<torch::Tensor> rows = std::nullopt,
-                                      std::optional<W4A8ConfigTuple> configs = std::nullopt) {
+                                      std::optional<W4A8ConfigTuple> configs = std::nullopt, float inv_scale = 1.0f) {
     check_w4fa8_operands(a, b, out, GemmType::MGroupedNoPad);
     const int m = a.first.size(-2), n = b.first.size(1), k = a.first.size(-1), num_groups = b.first.size(0);
     check_w4fa8_indices(indices, a.first);
@@ -1684,13 +1684,13 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_nopad(const std::pair<torch::Tensor, 
     const int em = ceil_div(m, num_groups);
     auto c = configs.has_value() ? deep_gemm::w4fa8::unpack_config(*configs)
                                  : deep_gemm::w4fa8::get_best_configs(em, n, k, num_groups, GemmType::MGroupedNoPad);
-    deep_gemm::w4fa8::run(a.first, a.second, b.first, b.second, out, counts, GemmType::MGroupedNoPad, em, c);
+    deep_gemm::w4fa8::run(a.first, a.second, b.first, b.second, out, counts, GemmType::MGroupedNoPad, em, c, inv_scale);
 }
 
 static void m_grouped_gemm_fp8_fp4_bf16_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
                                        const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& out,
                                        const torch::Tensor& rows, int expected_m,
-                                       std::optional<W4A8ConfigTuple> configs = std::nullopt) {
+                                       std::optional<W4A8ConfigTuple> configs = std::nullopt, float inv_scale = 1.0f) {
     check_w4fa8_operands(a, b, out, GemmType::MGroupedMasked);
     const int m = a.first.size(-2), n = b.first.size(1), k = a.first.size(-1), num_groups = b.first.size(0);
     check_w4fa8_indices(rows, a.first);
@@ -1700,14 +1700,14 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_masked(const std::pair<torch::Tensor,
     auto c = configs.has_value()
                  ? deep_gemm::w4fa8::unpack_config(*configs)
                  : deep_gemm::w4fa8::get_best_configs(expected_m, n, k, num_groups, GemmType::MGroupedMasked);
-    deep_gemm::w4fa8::run(a.first, a.second, b.first, b.second, out, rows, GemmType::MGroupedMasked, expected_m, c);
+    deep_gemm::w4fa8::run(a.first, a.second, b.first, b.second, out, rows, GemmType::MGroupedMasked, expected_m, c, inv_scale);
 }
 
 static void m_grouped_gemm_fp8_fp4_bf16_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& a,
                                       const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& out,
                                       const torch::Tensor& rows, const torch::Tensor& experts,
                                       const torch::Tensor& tokens, const torch::Tensor& aligned,
-                                      const W4A8ConfigTuple& configs) {
+                                      const W4A8ConfigTuple& configs, float inv_scale = 1.0f) {
     check_w4fa8_operands(a, b, out, GemmType::MGroupedFused);
     const int m = a.first.size(0), num_groups = b.first.size(0);
     for (const auto& t : {rows, experts, tokens, aligned})
@@ -1717,7 +1717,7 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_fused(const std::pair<torch::Tensor, 
         return;
     auto c = deep_gemm::w4fa8::unpack_config(configs);
     deep_gemm::w4fa8::run(a.first, a.second, b.first, b.second, out, rows, GemmType::MGroupedFused,
-                         ceil_div(int(out.size(0)), num_groups), c, experts, tokens, aligned);
+                         ceil_div(int(out.size(0)), num_groups), c, inv_scale, experts, tokens, aligned);
 }
 
 static void acblaslt_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,
@@ -1904,9 +1904,9 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
           py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt,
           py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt, py::arg("configs") = std::nullopt,
           py::arg("activation_type") = std::nullopt);
-    m.def("m_grouped_gemm_fp8_fp4_bf16_nt_nopad",&m_grouped_gemm_fp8_fp4_bf16_nt_nopad,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_indices"),py::arg("m_rows")=std::nullopt,py::arg("configs")=std::nullopt);
-    m.def("m_grouped_gemm_fp8_fp4_bf16_nt_masked",&m_grouped_gemm_fp8_fp4_bf16_nt_masked,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("masked_m"),py::arg("expected_m"),py::arg("configs")=std::nullopt);
-    m.def("m_grouped_gemm_fp8_fp4_bf16_nt_fused",&m_grouped_gemm_fp8_fp4_bf16_nt_fused,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_rows"),py::arg("expert_ids_and_cumsum"),py::arg("sorted_token_ids"),py::arg("aligned_num_m_blocks"),py::arg("configs"));
+    m.def("m_grouped_gemm_fp8_fp4_bf16_nt_nopad",&m_grouped_gemm_fp8_fp4_bf16_nt_nopad,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_indices"),py::arg("m_rows")=std::nullopt,py::arg("configs")=std::nullopt,py::arg("inv_scale")=1.0f);
+    m.def("m_grouped_gemm_fp8_fp4_bf16_nt_masked",&m_grouped_gemm_fp8_fp4_bf16_nt_masked,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("masked_m"),py::arg("expected_m"),py::arg("configs")=std::nullopt,py::arg("inv_scale")=1.0f);
+    m.def("m_grouped_gemm_fp8_fp4_bf16_nt_fused",&m_grouped_gemm_fp8_fp4_bf16_nt_fused,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_rows"),py::arg("expert_ids_and_cumsum"),py::arg("sorted_token_ids"),py::arg("aligned_num_m_blocks"),py::arg("configs"),py::arg("inv_scale")=1.0f);
     // W4A16 / W4FA16 GEMMs
     m.def("m_grouped_gemm_w4a16_nopad", &m_grouped_gemm_w4a16_nopad, py::arg("lhs"), py::arg("rhs_"),
           py::arg("out"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt,

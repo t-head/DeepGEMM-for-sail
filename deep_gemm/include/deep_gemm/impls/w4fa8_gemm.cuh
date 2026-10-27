@@ -31,7 +31,7 @@ template <int ShapeN, int ShapeK,
           int BlockM, int BlockN, int BlockK,
           int WarpM, int WarpN, int WarpK,
           int kNumGroups, int kNumStages, GemmType kGemmType,
-          int N_EXPAND = 1>
+          int N_EXPAND = 1, bool ApplyInvScale = false>
 class W4A8GEMM_MMA {
 public:
   static_assert(N_EXPAND >= 1 && N_EXPAND <= 4);
@@ -169,6 +169,7 @@ public:
     ElementD* ptr_d;
     const float* ptr_a_scale;
     int num_token;
+    float inv_scale;
     const int* sorted_token_ids;
     typename TileScheduler::Params scheduler;
 
@@ -498,6 +499,10 @@ public:
         }
       };
 
+      auto apply_inv_scale = [&](float scale) {
+        if constexpr (ApplyInvScale) return scale * params.inv_scale;
+        else return scale;
+      };
       // Reuse each lane's row scales across all N_EXPAND outputs of this work item.
       auto cached_row_scale = make_tensor<float>(make_shape(size<1>(accum), Int<2>{}));
       // Borrow the last A stage until the prologue has loaded row scales into registers.
@@ -522,7 +527,7 @@ public:
             for (int row = 0; row < 2; ++row) {
               const int local_row = get<0>(row_coords(2 * row, m, 0));
               if (local_row < residual_m) {
-                cached_row_scale(m, row) = smem_row_scale[local_row];
+                cached_row_scale(m, row) = apply_inv_scale(smem_row_scale[local_row]);
               }
             }
           }
@@ -550,7 +555,7 @@ public:
               scale_row = params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + local_row];
             else
               scale_row = deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + local_row;
-            const float a_scale = CacheRowScale ? cached_row_scale(m, row) : params.ptr_a_scale[scale_row];
+            const float a_scale = CacheRowScale ? cached_row_scale(m, row) : apply_inv_scale(params.ptr_a_scale[scale_row]);
             CUTLASS_PRAGMA_UNROLL
             for (int n = 0; n < size<2>(accum); ++n) {
               CUTLASS_PRAGMA_UNROLL

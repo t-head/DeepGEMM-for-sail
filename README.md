@@ -153,8 +153,10 @@ scales, and a scalar `weight_inv_scale`.
 It applies a common power-of-two shift to bring weight-scale exponents into
 `[114,140]` when necessary. Exponent codes 0 and 255, and exponent ranges
 spanning more than 26, are rejected. The returned inverse must be applied
-to the activation row scales exactly once per GEMM; the E4M3 codes remain
-unchanged:
+exactly once per GEMM. Either fold it into the activation row scales or pass
+it as the optional scalar `inv_scale` to any of the three W4FA8 GEMM APIs.
+`inv_scale` must be finite and positive; its default value of `1.0` skips
+the extra multiplication. The E4M3 codes remain unchanged:
 
 ```python
 import deep_gemm as dg
@@ -162,12 +164,13 @@ import deep_gemm as dg
 # packed_weight and raw_weight_scale are checkpoint tensors described above.
 _, weight_scale, weight_inv_scale = dg.preprocess_weights_and_scales(
     dg.PreprocessMode.W4A8_MXFP4_MMA, False, weight_scale=raw_weight_scale)
-lhs = (a_e4m3, row_scale * weight_inv_scale)
+lhs = (a_e4m3, row_scale)
 rhs = (packed_weight, weight_scale)
 config, rows, experts, tokens, aligned, inv_perm, m_indices = dg.moe_align_block_size(
     a_e4m3, packed_weight, topk_ids)
 dg.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
-    lhs, rhs, out, rows, experts, tokens, aligned, config)
+    lhs, rhs, out, rows, experts, tokens, aligned, config,
+    inv_scale=weight_inv_scale)
 ```
 
 The fused path gathers activations and their scales with the same token
