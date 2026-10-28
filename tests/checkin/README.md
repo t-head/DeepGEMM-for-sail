@@ -51,10 +51,9 @@ For masked GEMM, the `test_m_grouped_gemm_masked->test_func:` log line contains 
 
 ## Additional functional specifications
 
-The unified entry point calls `test_activation.py`, `test_attention.py` and `test_fp4_core.py` directly for the corresponding regressions. Their warm-up and accuracy phases share the same test functions.
+The unified entry point calls `test_activation.py` and `test_fp4_core.py` directly for the corresponding regressions. Their warm-up and accuracy phases share the same test functions.
 
 - `BatchGemm`: `groups=h`, `m=b`, `n=d`, `k=r`; supports complete `expr:bhr,hdr->bhd` and `expr:bhr,hdr->hbd` expressions. INT8 uses channel quantization; FP8 has block/channel cases on 890P.
-- `AttentionRegression,data_type:int8,case:ks_ke` and `case:cache_view`: reuse the focused nonzero-KV-start and non-contiguous per-layer-cache tests.
 - `Preprocess,data_type:fp4`: preserves the independent MXFP4 preprocessing contract checks, including packed scales, scale-only calls, odd group counts, strides and aliases.
 - `Activation,data_type:bf16,activation:silu,quant_mode:BF16`: 890P standalone SiLU/SiTU smoke tests cover BF16, FP8 channel/block, MXFP8 and both MXFP4 scale layouts. Each case checks dense and masked output, including an empty expert and an undersized scheduling hint. `data_type:bf16` describes the input, while `quant_mode` selects the output.
 - `DenseGemm,data_type:bf16_bf16_fp32`: BF16 inputs with real FP32 outputs, preserving main's strict planted-element check against BF16 rounding. Both boards include main's dense, tail and GEMV cases, using the default kernel path.

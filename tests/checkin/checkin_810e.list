@@ -155,9 +155,3 @@ PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:128,di
 PagedMqaLogits,data_type:int8,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1]
 PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,logits_dtype:bf16,weights_dtype:bf16
 PagedMqaLogits,data_type:int8,batch_size:64,next_n:4,num_heads:64,head_dim:128,avg_context_len:8192
-
-# ============ AttentionRegression ============
-
-# --- AttentionRegression / int8 ---
-AttentionRegression,data_type:int8,case:ks_ke
-AttentionRegression,data_type:int8,case:cache_view

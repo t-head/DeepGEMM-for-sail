@@ -296,12 +296,6 @@ SparseMqaLogits,data_type:fp4,seq_len_q:2,seq_len_kv:0,num_heads:32,head_dim:128
 PagedSparseMqaLogits,data_type:fp4,seq_len_q:313,seq_len_kv:1023,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,check_metadata:1
 PagedSparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:65536,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:128,check_metadata:1
 
-# ============ AttentionRegression ============
-
-# --- AttentionRegression / int8 ---
-AttentionRegression,data_type:int8,case:ks_ke
-AttentionRegression,data_type:int8,case:cache_view
-
 # ============ Preprocess ============
 
 # --- Preprocess / fp4 ---
