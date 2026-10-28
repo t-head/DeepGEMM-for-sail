@@ -97,6 +97,28 @@ BF16 dense GEMM: `deep_gemm.bf16_gemm_nt(a, b, out)` computes `out = a @ b.T`
 with contiguous BF16 inputs. On 810E and 890P, `out` supports BF16 or FP32;
 N must be even.
 
+#### FP8 GEMM + ReduceScatter
+
+`deep_gemm.fp8_gemm_nt_reduce_scatter(lhs, rhs, out, comm=ctx, configs=None)` fuses FP8 GEMM and ReduceScatter on PPU0015 with single-host TP2/TP4. It infers M/N/K from the inputs and writes the BF16 `[M/TP,N]` shard into the caller's output tensor. FP32 scale shapes select blockwise (A1×128/W128×128) or per-row/per-channel quantization; both share `deep_gemm.GemmReduceScatterContext`.
+
+The context accepts `preset="decode"` (fused profiles with native fallback) or `preset="native"`. Explicit `configs=(num_sms, BM, BN, BK, WM, WN, stages, smem)` override the preset, following the existing GEMM tuple convention; C++ recomputes SMEM for the selected tile. General shapes require positive M/N/K, M divisible by TP, N divisible by 16, and local M (`M/TP`) in `{1,2,4,8}` or a multiple of 16. Packet indices, including padded rows, must fit in int32. Blockwise K must exceed 512 and be divisible by 128; channelwise K can be any positive multiple of 32. Explicit configurations use BK128 for blockwise and BK64/128/256 for channelwise. Blockwise BN must divide 128, be a multiple of 128, or equal the specially handled 192. The 39-CU restriction applies only to selection of the tuned decode profiles.
+
+Set the current device and initialize the default process group before constructing contexts collectively. All ranks must use matching shapes and call order; serialize calls across streams. Each call and captured graph uses its explicit output, so writing another output does not overwrite earlier results. Warm up outside Graph capture and retain contexts, inputs and outputs until pending work and captured graphs are released. Call `ctx.reset_state()` collectively outside capture before 2**31 calls.
+
+```python
+import torch
+import deep_gemm
+
+ctx = deep_gemm.GemmReduceScatterContext(m, n, k_local)
+out = torch.empty((m // tp, n), dtype=torch.bfloat16, device="cuda")
+# FP8 E4M3 data: A[M,Klocal], W[N,Klocal]; FP32 scales:
+# A[M,Klocal/128], W[ceil(N/128),Klocal/128] for blockwise,
+# or A[M,1], W[N,1] for channelwise.
+deep_gemm.fp8_gemm_nt_reduce_scatter((a_fp8, a_scales), (w_fp8, w_scales), out, comm=ctx)
+```
+
+Run the shared [correctness and benchmark entry point](tests/test_gemm_comm.py) with `torchrun --standalone --nproc_per_node=2 tests/test_gemm_comm.py --skew`; use four processes for TP4, add `--extended` for general-shape coverage and `--benchmark` for timings. Both quantizations use the public `deep_gemm.fp8_gemm_nt` C++ JIT baseline. The default M list includes 8/16/32/64/128/256/512/1024/2048/4096 with N=7168 and K=24576/TP.
+
 #### Grouped GEMMs (contiguous layout)
 
 Unlike traditional grouped GEMMs in ACTLIZE, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape.

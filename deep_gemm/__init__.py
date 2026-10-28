@@ -36,6 +36,9 @@ from .deep_gemm_cpp import (
     get_mk_alignment_for_contiguous_layout,
 )
 
+# Fused GEMM and communication
+from .gemm_comm import GemmReduceScatterContext, fp8_gemm_nt_reduce_scatter
+
 # acblasLt GEMMs
 from .deep_gemm_cpp import (
     acblaslt_gemm_nt, acblaslt_gemm_nn,
