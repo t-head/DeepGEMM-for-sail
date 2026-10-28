@@ -335,7 +335,7 @@ torch::Tensor fp8_mqa_avg_logits(const torch::Tensor& q, const std::pair<torch::
 // Unified paged FP8/FP4 AVG (4 heads, unity mode: no additional q_scale).
 // FP4 uses packed head_dim = 64 (logical head_dim = 128) and mandatory q_sf;
 // FP8 uses an absent q_sf. KV values/scales use the page layout documented above.
-// Build FP4 AVG metadata with metadata_extra=(next_n, 4, 64, 1), is_fp4=True.
+// Build FP4 AVG metadata with metadata_extra=(next_n, 4, 64, 1).
 torch::Tensor fp8_fp4_paged_mqa_avg_logits(const std::pair<torch::Tensor, std::optional<torch::Tensor>>& q,
                                           const torch::Tensor& fused_kv_cache,
                                           const torch::Tensor& context_lens, const torch::Tensor& block_table,
@@ -364,8 +364,8 @@ torch::Tensor fp8_paged_mqa_avg_logits(const torch::Tensor& q, const torch::Tens
 
 // Builds the `schedule_metadata` table. `metadata_extra` = (next_n, num_heads, q.size(-1), q.element_size());
 // FP4 therefore uses the packed head dimension (64) and element_size = 1.
-// FP4 AVG requires is_fp4=True, e.g. metadata_extra=(next_n, 4, 64, 1), is_fp4=True;
-// without the flag this tuple retains the existing FP8 D64 tile policy.
+// FP4 AVG uses metadata_extra=(next_n, 4, 64, 1), sharing the stored-shape
+// scheduling policy with FP8 D64.
 // Older callers may omit metadata_extra to use the compatibility tile.
 //
 // NOTES: the Python version also asserts that `indices` is not a tuple, to catch `metadata_extra`
@@ -373,8 +373,7 @@ torch::Tensor fp8_paged_mqa_avg_logits(const torch::Tensor& q, const torch::Tens
 // `std::optional<torch::Tensor>` with a TypeError before the body runs.
 torch::Tensor get_paged_mqa_logits_metadata(
     const torch::Tensor& context_lens, int page_kv, int num_sms, std::optional<torch::Tensor> indices = std::nullopt,
-    std::optional<std::tuple<int, int, int, int>> metadata_extra = std::nullopt, bool is_fp4 = false) {
-    TORCH_CHECK(not is_fp4 or metadata_extra.has_value(), "is_fp4=True requires metadata_extra");
+    std::optional<std::tuple<int, int, int, int>> metadata_extra = std::nullopt) {
     if (indices.has_value())
         print_once("Warning: indices (varlen) is not supported on PPU, falling back to non-varlen mode "
                    "(performance may be affected)");
@@ -388,7 +387,7 @@ torch::Tensor get_paged_mqa_logits_metadata(
     // shared memory limit
     DG_HOST_ASSERT(batch_size <= 65536);
 
-    return paged_mqa_logits_metadata(context_lens, batch_size, page_kv, num_sms, metadata_extra, is_fp4);
+    return paged_mqa_logits_metadata(context_lens, batch_size, page_kv, num_sms, metadata_extra);
 }
 
 torch::Tensor bf16_paged_mqa_logits(const torch::Tensor& q, const torch::Tensor& fused_kv_cache,
@@ -665,7 +664,7 @@ static void register_apis(pybind11::module_& m) {
     // Paged MQA logits
     m.def("get_paged_mqa_logits_metadata", &get_paged_mqa_logits_metadata, py::arg("context_lens"),
           py::arg("block_kv"), py::arg("num_sms"), py::arg("indices") = std::nullopt,
-          py::arg("metadata_extra") = std::nullopt, py::arg("is_fp4") = false);
+          py::arg("metadata_extra") = std::nullopt);
     m.def("bf16_paged_mqa_logits", &bf16_paged_mqa_logits, py::arg("q"), py::arg("fused_kv_cache"),
           py::arg("weights"), py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
           py::arg("max_context_len"), py::arg("clean_logits") = false, py::arg("logits_dtype") = torch::kFloat32);

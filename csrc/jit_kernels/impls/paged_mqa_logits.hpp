@@ -264,12 +264,11 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
 }
 
 // Host entry for the `schedule_metadata` table. `metadata_extra` = (next_n, num_heads, head_dim,
-// element_size); when absent we fall back to the compatibility tile. An explicit
-// is_fp4 distinguishes FP4 AVG's packed D64 from the existing FP8 D64 policy.
+// element_size); when absent we fall back to the compatibility tile. Use the
+// same stored-shape tile selection as the compute entry below.
 static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens, int batch_size, int page_kv,
                                               int num_sms,
-                                              const std::optional<std::tuple<int, int, int, int>>& metadata_extra,
-                                              bool is_fp4 = false) {
+                                              const std::optional<std::tuple<int, int, int, int>>& metadata_extra) {
     DG_HOST_ASSERT(page_kv == 32 or page_kv == 64 or page_kv == 128);
     int next_n = context_lens.size(1);
     int tb_per_cu = 1;
@@ -279,8 +278,7 @@ static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens
         const auto& [extra_next_n, num_heads, head_dim, element_size] = *metadata_extra;
         next_n = extra_next_n;
         const auto& tile =
-            deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size,
-                                                          is_fp4 and num_heads == 4);
+            deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
         split_kv = tile.split_kv, tb_per_cu = tile.tb_per_cu;
     }
 
@@ -338,12 +336,11 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     }
 
     const auto& tile = deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim,
-                                                                      static_cast<int>(q.element_size()),
-                                                                      is_fp4 and is_avg);
+                                                                      static_cast<int>(q.element_size()));
     if (is_fp4 and is_avg)
         TORCH_CHECK(schedule_meta_size - 1 == get_num_sms() * tile.tb_per_cu,
-                    "FP4 paged AVG requires metadata built with metadata_extra=(next_n, 4, 64, 1), "
-                    "is_fp4=True and the current num_sms");
+                    "FP4 paged AVG requires metadata built with metadata_extra=(next_n, 4, 64, 1) "
+                    "and the current num_sms");
     if (not is_fp4)
         TORCH_CHECK(not tile.split_mblock, "SPLIT_MBLOCK is only supported for FP4 paged kernel");
 
