@@ -47,6 +47,8 @@ python tests/run_deep_gemm.py --caselist tests/checkin/checkin_890p.list --case_
 
 `--case_idx` counts executable cases, excluding comments and blank lines. Warm-up is recognized by this entry point as well.
 
+For masked GEMM, the `test_m_grouped_gemm_masked->test_func:` log line contains a replayable `--format` specification with the generated expert counts, padding, scheduler hint, epilogue, clipping limit and bias setting. Pass that specification to `tests/run_deep_gemm.py --format` to repeat the same case configuration.
+
 ## Additional functional specifications
 
 The unified entry point calls `test_activation.py`, `test_attention.py` and `test_fp4_core.py` directly for the corresponding regressions. Their warm-up and accuracy phases share the same test functions.

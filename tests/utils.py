@@ -150,7 +150,7 @@ def generate_m_grouped_contiguous(num_groups: int, m: int, n: int, k: int, distr
 
 def generate_m_grouped_masked(num_groups: int, m: int, n: int, k: int, distribution: str, expected_m_per_group: int,
                               use_ue8m0: bool = False, use_bf16: bool = False, padding_m=0):
-    list_m = construct_group_m_list(distribution, num_groups, m, is_mask=True)
+    list_m = construct_group_m_list(distribution, num_groups, m, is_mask=True, em=expected_m_per_group)
     max_m = get_masked_padding_m(list_m, padding_m)
     masked_m = torch.tensor(list_m, device='cuda', dtype=torch.int)
     assert masked_m.amax().item() <= max_m
@@ -364,49 +364,49 @@ def truncated_zipf(num_experts, tokens, a=1.1, random_seed=None):
     return count
 
 def construct_group_m_list(distribution, num_groups = int, m = int, is_mask=False, seed=0, em=0):
-    if num_groups == 0:
-        raise ValueError('groups must be positive')
-    expected_m_per_group = ceil_div(m, num_groups)
-    distribution = 'uniform' if distribution is None else distribution
-    explicit = isinstance(distribution, list)
-    if explicit:
-        group_m_list = distribution
-    elif distribution.endswith(('dump', 'bin')):
+    group_m_list = list()
+    if is_mask and em != 0:
+        expected_m_per_group = em
+    else:
+        expected_m_per_group = ceil_div(m, num_groups)
+    if distribution == None: # default value
+        distribution = "uniform"
+    if type(distribution) is list:
+        return distribution
+    elif distribution.endswith("dump") or distribution.endswith("bin"):
         print(f"Read dump from {distribution}")
         group_m_list = read_numbers_from_file(distribution)
-        group_m_list += [0] * max(0, num_groups - len(group_m_list))
-        explicit = True
-    elif is_mask and m == 0:
-        return [0] * num_groups
+        if len(group_m_list) < num_groups:
+            for i in range(len(group_m_list), num_groups):
+                group_m_list.append(0)
     elif distribution == "uniform":
         random.seed(seed)
         group_m_list = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
     elif distribution == "normal" or distribution == "gaussian":
         random.seed(seed)
+        # avg is expected_m_per_group, sigma is expected_m_per_group * 0.5
         group_m_list = [max(0, int(random.gauss(expected_m_per_group, expected_m_per_group * 0.5))) for _ in range(num_groups)]
     elif "zipf" in distribution:
         np.random.seed(seed)
         random.seed(seed)
         zipf_a = 1.1 if "." not in distribution else float(distribution.replace("zipf",""))
         group_m_list = truncated_zipf(num_groups, m, a=zipf_a)
+        # dist = np.random.zipf(zipf_a, num_groups)
+        # Add noise to zipf distribution to avoid many identical values
+        # noise = [random.gauss(0, 1) for _ in range(num_groups)]
+        # dist = dist + noise
+        # scale = expected_m_per_group * num_groups / dist.sum()
+        # group_m_list = [max(0, x) for x in np.round(dist * scale).astype(int)]
     else:
         print("ERROR: Unsupported distribution type, please check!")
         exit(1)
-
-    if explicit:
-        if len(group_m_list) != num_groups:
-            raise ValueError('distribution must contain one count per expert')
-        if any(isinstance(x, bool) or not isinstance(x, (int, np.integer)) for x in group_m_list):
-            raise ValueError('distribution counts must be integers')
-    if explicit and is_mask:
-        # Explicit masked counts define the total and retain expert order.
-        return [int(x) for x in group_m_list]
-    if isinstance(distribution, list):
-        return group_m_list
-    # Random distributions share nopad's total correction; em is only a scheduler hint.
-    group_m_list = round_m_list_sum_to_m(group_m_list, m)
-    assert sum(group_m_list) == m, f"sum(m_list)={sum(group_m_list)} must equal m_sum={m}"
-    return sorted(group_m_list, reverse=True)
+    if not is_mask:
+        group_m_list = round_m_list_sum_to_m(group_m_list, m)
+        assert sum(group_m_list) <= m, f"sum(m_list)={sum(group_m_list)} must <= m_sum={m}"
+    group_m_list = sorted(group_m_list, reverse=True)
+    if show_log:
+        print(f"distribution:{group_m_list}")
+    return group_m_list
 
 def is_act_and_quant_fused(epilogue_type: str) -> bool:
     """True for any fused silu_and_mul + mxfp4 post-quant epilogue variant (standard or STEP)."""
@@ -800,7 +800,7 @@ def construct_grouped_masked(num_groups: int, m: int, expected_m_per_group: int,
                              enable_sbo_overlap: bool = False, quant_type: str = "block", group_size: int = 32, padding_m=0, **kwargs):
     tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
     # Construct mask
-    list_m = construct_group_m_list(distribution, num_groups, m, is_mask=True)
+    list_m = construct_group_m_list(distribution, num_groups, m, is_mask=True, em=expected_m_per_group)
     masked_m = torch.tensor(list_m, device=tensor_device, dtype=torch.int)
     max_m = get_masked_padding_m(list_m, padding_m)
     assert masked_m.amax().item() <= max_m, f"max masked_m={masked_m.amax().item()}, allowed max_m={max_m}"
@@ -1194,7 +1194,11 @@ def read_numbers_from_file(file_path):
         for line in file:
             stripped_line = line.strip()
             if stripped_line:
-                numbers.append(int(stripped_line))
+                try:
+                    number = int(stripped_line)
+                    numbers.append(number)
+                except ValueError:
+                    print(f"Warning: skip invalid: {stripped_line}")
     return numbers
 
 def parse_deepgemm_string_re(s):
@@ -1515,14 +1519,25 @@ def test_m_grouped_gemm_masked(args) -> None:
 
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     group_size = args.get('group_size', 32)
-    distribution = construct_group_m_list(distribution, num_groups, m, is_mask=True)
-    m = sum(distribution)
-    max_m = get_masked_padding_m(distribution, args.get('padding_m', 0))
-    expected_m_per_group = args.get('em', 1 if m == 0 else ceil_div(m, num_groups))
+    # Input distribution historically uses ceil(m/groups), independently of the
+    # optional scheduler hint. Keep the actual counts for an exact replay.
+    input_expected_m = ceil_div(m, num_groups)
+    distribution = [int(count) for count in construct_group_m_list(
+        distribution, num_groups, m, is_mask=True, em=input_expected_m)]
+    padding_m = args.get('padding_m', 0)
+    max_m = (get_masked_padding_m(distribution, padding_m) if use_ppu or padding_m
+             else find_next_power_of_2(distribution))
+    if use_ppu:
+        estimate = max(round_up(m // num_groups, 16), 16)
+        estimate = min(round_up(min(max(distribution), m), 16), estimate)
+        expected_m_per_group = args.get('em', estimate)
+    else:
+        expected_m_per_group = args.get('em', input_expected_m)
     dtype_name = {torch.bfloat16: 'bf16', torch.int8: 'int8', torch.float8_e4m3fn: 'fp8', torch.uint8: 'fp4'}.get(d, d)
     case = (f'GroupedMasked,data_type:{dtype_name},groups:{num_groups},m:{m},n:{n},k:{k},'
             f'em:{expected_m_per_group},padding_m:{max_m},distribution:{distribution},'
-            f'quant_type:{quant_type},group_size:{group_size},enable_sbo_overlap:{int(enable_sbo_overlap)}')
+            f'quant_type:{quant_type},group_size:{group_size},enable_sbo_overlap:{int(enable_sbo_overlap)},'
+            f'epilogue_type:{epilogue_type},swiglu_limit:{swiglu_limit},with_bias:{int(bool(args.get("with_bias", False)))}')
     print(f'test_m_grouped_gemm_masked->test_func: {case}')
     if use_ppu:
         x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit, padding_m=max_m)

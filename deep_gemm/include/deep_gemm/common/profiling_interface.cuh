@@ -152,11 +152,10 @@ void set_params(GemmType gemm_type, bool is_gemv,
     if (gemm_type_ != GemmType::Normal){
         add_params("groups", group);
     }
-    add_params("m", gemm_type_ == GemmType::MGroupedMasked ? em * group : m);
+    add_params("m", m);
     add_params("n", n);
     add_params("k", k);
     if (gemm_type_ == GemmType::MGroupedMasked){
-        add_params("padding_m", m);
         add_params("em", em);
     }
     add_params("gpu", gpu);
@@ -244,18 +243,6 @@ bool is_paged_mqa_logits() {
     return op_name_ == "PagedMqaLogits";
 }
 
-bool is_masked_gemm() const {
-    return gemm_type_ == GemmType::MGroupedMasked;
-}
-
-// True while the profiling interface is being launched from inside an active
-// stream graph capture (see check_support_dump, which bails out in that case).
-bool is_in_graph_capture() const {
-    hggcStreamCaptureStatus captureStatus;
-    hggcStreamIsCapturing(stream_, &captureStatus);
-    return captureStatus != hggcStreamCaptureStatusNone;
-}
-
 void distribution() {
     hggcDeviceSynchronize();
 
@@ -314,17 +301,10 @@ void distribution() {
             outDist << counts[group_ - 1] << "].";
             delete[] counts;
         } else {
-            int64_t total = 0;
-            for (int i = 0; i < size; ++i) {
-                if (i) outDist << ",";
-                outDist << tmp[i];
-                total += tmp[i];
+            for (int i = 0; i < size - 1; ++i) {
+                outDist << tmp[i] << ",";
             }
-            outDist << "].";
-            if (is_masked_gemm()) {
-                // Update the existing slot: masked m is the valid total, not tensor capacity.
-                args_.at("m") = std::to_string(total);
-            }
+            outDist << tmp[size - 1] << "].";
         }
         delete[] tmp;
     }
@@ -426,11 +406,6 @@ public:
 
         if (start) {
             if ((show_params_ || (params.is_paged_mqa_logits() && use_hgtx_)) && params.check_support_dump()) {
-                params.distribution();
-            } else if (params.is_masked_gemm() && use_hgtx_ && !params.is_in_graph_capture() && params.check_support_dump()) {
-                // Masked m in the HGTX trace must be the valid total, not the tensor
-                // capacity. Collecting it costs a device sync plus a D2H copy, so only
-                // do it when the m slot is actually used (outside graph capture).
                 params.distribution();
             }
             std::string op_name = params.format();

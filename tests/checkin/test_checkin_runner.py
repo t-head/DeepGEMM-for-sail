@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import random
 from pathlib import Path
 import runpy
 import subprocess
@@ -85,6 +86,70 @@ class ParserTests(unittest.TestCase):
             (root / 'part.list').write_text('# no tests\n')
             with self.assertRaisesRegex(ValueError, 'Empty'):
                 run_checkin.load_cases(root / 'part.list')
+
+
+class MaskedReplayTests(unittest.TestCase):
+    def namespace(self):
+        tree = ast.parse((ROOT / 'tests/utils.py').read_text())
+        names = {'construct_group_m_list', 'round_m_list_sum_to_m', 'find_next_power_of_2',
+                 'get_masked_padding_m', 'is_act_and_quant_fused', 'test_m_grouped_gemm_masked'}
+        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        namespace = parser_namespace()
+        torch = namespace['torch']
+        torch.Tensor = type('Tensor', (), {})
+        namespace.update(random=random, np=SimpleNamespace(integer=int), show_log=False,
+                         ceil_div=lambda a, b: (a + b - 1) // b,
+                         round_up=lambda a, b: (a + b - 1) // b * b,
+                         use_ppu=True, _acc_check=False, get_benchmark=lambda: False,
+                         epilogue_type_to_activation=lambda value: value)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), 'utils.py', 'exec'), namespace)
+        return namespace
+
+    def test_masked_distribution_preserves_base_semantics(self):
+        namespace = self.namespace()
+        generate = namespace['construct_group_m_list']
+        counts = generate('uniform', 256, 256, is_mask=True, em=1)
+        self.assertEqual((sum(counts), counts.count(0), max(counts)), (136, 120, 1))
+        self.assertEqual(generate('uniform', 4, 128, is_mask=True, em=1), [1, 1, 0, 0])
+        self.assertEqual(generate([0, 1, 7, 17], 4, 128, is_mask=True, em=1), [0, 1, 7, 17])
+
+    def test_printed_masked_cases_replay_same_arguments(self):
+        namespace = self.namespace()
+        calls = []
+        def construct(groups, m, expected_m, k, n, dtype, distribution, **kwargs):
+            calls.append(('inputs', groups, m, k, n, tuple(distribution), kwargs['padding_m'],
+                          kwargs['epilogue_type'], kwargs['swiglu_limit'], kwargs['quant_type'],
+                          kwargs['group_size'], kwargs['enable_sbo_overlap']))
+            fused = namespace['is_act_and_quant_fused'](kwargs['epilogue_type'])
+            out = ('out', 'scale') if fused else 'out'
+            ref = ('ref', 'ref_scale') if fused else 'ref'
+            return 'x', 'y', 'mask', out, ref, 'signal', kwargs['padding_m']
+        def launch(x, y, bias, out, mask, expected_m, **kwargs):
+            calls.append(('launch', bias, out, expected_m, kwargs))
+        namespace['construct_grouped_masked'] = construct
+        namespace['make_grouped_fp4_bias'] = lambda args: 'bias' if args.get('with_bias') else None
+        namespace['deep_gemm'] = SimpleNamespace(m_grouped_gemm_fp4_fp4_bf16_nt_masked=launch)
+        parse = namespace['parse_deepgemm_string_re']
+        run = namespace['test_m_grouped_gemm_masked']
+        specs = (
+            'GroupedMasked,data_type:fp4,groups:4,m:128,n:512,k:512,with_bias:1',
+            'GroupedMasked,data_type:fp4,groups:4,m:128,n:512,k:512,em:12,'
+            'distribution:[0,1,7,17],padding_m:256,epilogue_type:SiluAndMulStepPostQuantFp4,swiglu_limit:7',
+        )
+        for spec in specs:
+            with self.subTest(spec=spec):
+                calls.clear()
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    run(parse(spec))
+                original = list(calls)
+                line = next(line for line in output.getvalue().splitlines()
+                            if line.startswith('test_m_grouped_gemm_masked->test_func: '))
+                replay = line.split(': ', 1)[1]
+                calls.clear()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    run(parse(replay))
+                self.assertEqual(calls, original)
 
 
 class ReusableWorkerTests(unittest.TestCase):
