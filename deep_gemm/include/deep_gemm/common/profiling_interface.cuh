@@ -152,10 +152,11 @@ void set_params(GemmType gemm_type, bool is_gemv,
     if (gemm_type_ != GemmType::Normal){
         add_params("groups", group);
     }
-    add_params("m", m);
+    add_params("m", gemm_type_ == GemmType::MGroupedMasked ? em * group : m);
     add_params("n", n);
     add_params("k", k);
     if (gemm_type_ == GemmType::MGroupedMasked){
+        add_params("padding_m", m);
         add_params("em", em);
     }
     add_params("gpu", gpu);
@@ -243,6 +244,10 @@ bool is_paged_mqa_logits() {
     return op_name_ == "PagedMqaLogits";
 }
 
+bool is_masked_gemm() const {
+    return gemm_type_ == GemmType::MGroupedMasked;
+}
+
 void distribution() {
     hggcDeviceSynchronize();
 
@@ -301,10 +306,17 @@ void distribution() {
             outDist << counts[group_ - 1] << "].";
             delete[] counts;
         } else {
-            for (int i = 0; i < size - 1; ++i) {
-                outDist << tmp[i] << ",";
+            int64_t total = 0;
+            for (int i = 0; i < size; ++i) {
+                if (i) outDist << ",";
+                outDist << tmp[i];
+                total += tmp[i];
             }
-            outDist << tmp[size - 1] << "].";
+            outDist << "].";
+            if (is_masked_gemm()) {
+                // Update the existing slot: masked m is the valid total, not tensor capacity.
+                args_.at("m") = std::to_string(total);
+            }
         }
         delete[] tmp;
     }
@@ -405,7 +417,7 @@ public:
         }
 
         if (start) {
-            if ((show_params_ || (params.is_paged_mqa_logits() && use_hgtx_)) && params.check_support_dump()) {
+            if ((show_params_ || ((params.is_paged_mqa_logits() || params.is_masked_gemm()) && use_hgtx_)) && params.check_support_dump()) {
                 params.distribution();
             }
             std::string op_name = params.format();

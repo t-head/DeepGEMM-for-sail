@@ -5,7 +5,7 @@ import deep_gemm
 from utils import test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, set_acc_check, parse_deepgemm_string_re
 from utils import is_ppu1v5_device
 
-def test_ks_ke():
+def test_ks_ke(check_accuracy=True):
     # Single INT8 case: seq_len_q=1 with ks != 0, manually constructed (not via test_mqa_logits).
     # Verifies the kernel correctly offsets into KV when the valid window does not start at 0.
     # Only q[0, 0, 0]=1 and k[4, 0]=5 are non-zero, so logits[0, 4] = relu(1*5) * 1 * 1 = 5.
@@ -26,12 +26,14 @@ def test_ks_ke():
     ref = (scores.relu() * weights[:, :, None]).sum(dim=1)  # [1, 6]
     ref = ref * k_scale[None, :]
     actual = deep_gemm.int8_mqa_logits(q, (k, k_scale), weights, ks, ke, clean_logits=False)
+    if not check_accuracy:
+        return
     torch.testing.assert_close(actual[0, 4].float(), ref[0, 4].float(), rtol=1e-3, atol=1e-3)
     print(f'  INT8 ks!=0 case: expected[0,4]={ref[0, 4].item():.4f}, actual[0,4]={actual[0, 4].item():.4f}')
     print("Passed\n")
 
 
-def test_per_layer_cache_view():
+def test_per_layer_cache_view(check_accuracy=True):
     num_kv_blocks, block_kv, num_heads, head_dim = 8, 64, 32, 128
     num_layers = 4
     max_context_len = num_kv_blocks * block_kv
@@ -56,12 +58,14 @@ def test_per_layer_cache_view():
         logits = deep_gemm.int8_paged_mqa_logits(
             q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
             max_context_len, clean_logits=False, logits_dtype=torch.float32)
-        return int((((logits.float().cpu()[0] / (head_dim * v * s)) - 1).abs() < 0.005).sum())
+        if check_accuracy:
+            valid = int((((logits.float().cpu()[0] / (head_dim * v * s)) - 1).abs() < 0.005).sum())
+            assert valid == max_context_len
 
     fused_kv_cache = torch.zeros(num_kv_blocks, block_kv * (head_dim + 4),
                                  dtype=torch.uint8, device='cuda')
     fused_kv_cache.copy_(page)
-    assert check(fused_kv_cache.view(num_kv_blocks, block_kv, 1, head_dim + 4)) == max_context_len
+    check(fused_kv_cache.view(num_kv_blocks, block_kv, 1, head_dim + 4))
 
     fused_kv_cache = torch.zeros(num_kv_blocks, num_layers, block_kv * (head_dim + 4),
                                  dtype=torch.uint8, device='cuda')
@@ -69,7 +73,7 @@ def test_per_layer_cache_view():
     fused_kv_cache = fused_kv_cache[:, 3].view(num_kv_blocks, block_kv, 1, head_dim + 4)
     assert fused_kv_cache.view(num_kv_blocks, block_kv, head_dim + 4).storage_offset() \
         == 3 * block_kv * (head_dim + 4)
-    assert check(fused_kv_cache) == max_context_len
+    check(fused_kv_cache)
 
 
 

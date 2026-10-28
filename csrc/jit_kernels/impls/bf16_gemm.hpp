@@ -999,6 +999,8 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
 
         auto code = CuteRuntime::generate(args);
         auto runtime = compiler->build(cute_free_kernel_name, code);
+        if (is_compile_only())
+            return;
         auto kernel = runtime->kernel;
 
         // Must stay byte-identical to GemmKernel::Params (cute_free/kernel/gemm.cuh).

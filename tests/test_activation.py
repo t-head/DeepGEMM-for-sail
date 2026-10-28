@@ -609,6 +609,74 @@ def test_launch_parameter_reuse():
     print('PASS activation parameter reuse across JIT launches')
 
 
+def assert_masked_rows_equal(masked, dense, counts):
+    dense_outputs = dense if isinstance(dense, tuple) else (dense,)
+    masked_outputs = masked if isinstance(masked, tuple) else (masked,)
+    for expert, count in enumerate(counts):
+        if count == 0:
+            continue
+        for output, ref in zip(masked_outputs, dense_outputs):
+            output, ref = output[expert, :count], ref[expert, :count]
+            # Only FP8 needs a byte comparison. Scale tensors may have singleton
+            # or empty axes whose strides contiguous() deliberately preserves;
+            # reinterpreting those FP32/uint16 tensors as bytes is invalid.
+            if output.dtype == torch.float8_e4m3fn:
+                output, ref = output.view(torch.uint8), ref.view(torch.uint8)
+            assert torch.equal(output, ref), 'masked activation output mismatch'
+
+
+def test_checkin_activation(args, check_accuracy=True):
+    from quantization import quant_activation
+
+    mode_name = args['quant_mode']
+    mode = getattr(deep_gemm.ActivationQuantMode, mode_name)
+    situ = args['activation'] == 'situ'
+    if args['activation'] not in ('silu', 'situ'):
+        raise ValueError('activation must be silu or situ')
+    fn = deep_gemm.situ_and_mul if situ else deep_gemm.silu_and_mul
+    n = 256 if mode_name == 'FP8_BLOCK' else 128
+    x = (torch.randn(3, 7, 2 * n, device='cuda') * 4).bfloat16()
+    x[1, 0].zero_()
+    counts = torch.tensor([0, 1, 7], device='cuda', dtype=torch.int32)
+    opts = {'beta': 4., 'linear_beta': 25.} if situ else {'swiglu_limit': 2.}
+    if mode_name == 'MXFP4':
+        opts['reorder_scale'] = bool(args.get('reorder_scale', 1))
+    if mode_name == 'FP8_CHANNEL':
+        opts['weight_inv_scale'] = .03125
+    dense = fn(mode, x, **opts)
+    masked = fn(mode, x, masked_m=counts, expected_m=1, **opts)
+    if not check_accuracy:
+        return
+    value = situ_reference(x, 4., 25.) if situ else activation_reference(x, 2.)
+    if mode_name == 'BF16':
+        actual, expected = dense, value.bfloat16()
+    elif mode_name == 'FP8_CHANNEL':
+        q, scale = quant_activation(value, .03125)
+        torch.testing.assert_close(dense[1], scale, rtol=2e-5, atol=1e-12)
+        actual, expected = dense[0].float() * dense[1], q.float() * scale
+    elif mode_name == 'FP8_BLOCK':
+        grouped = value.reshape(3, 7, n // 128, 128)
+        amax = grouped.abs().amax(-1).clamp_min(1e-10)
+        scale = amax * (1. / 448.)
+        q = (grouped * (448. / amax).unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+        torch.testing.assert_close(dense[1], scale, rtol=2e-6, atol=1e-12)
+        actual = dense[0].float().reshape_as(grouped) * dense[1].unsqueeze(-1)
+        expected = q.float() * scale.unsqueeze(-1)
+    else:
+        fp4 = mode_name == 'MXFP4'
+        ref_data, raw = reference(x, fp4, 2., value=value)
+        scales = dense[1]
+        if fp4 and opts.get('reorder_scale', True):
+            packed = scales.to(torch.int32)
+            scales = torch.stack((packed & 255, packed >> 8), -1).flatten(-2)[..., :n // 32].byte()
+        assert torch.equal(scales, raw), f'{mode_name}: scale mismatch'
+        actual, expected = decode(dense[0], scales, fp4), decode(ref_data, raw, fp4)
+    diff = float(calc_diff(actual, expected))
+    assert torch.isfinite(actual).all() and diff < .0015, f'{mode_name}: {diff=}'
+    assert_masked_rows_equal(masked, dense, (0, 1, 7))
+    print(f'Passed activation={args["activation"]}, mode={mode_name}, masked/dense, {diff=}')
+
+
 if __name__ == '__main__':
     torch.manual_seed(13)
     test_unified_api_contract()
