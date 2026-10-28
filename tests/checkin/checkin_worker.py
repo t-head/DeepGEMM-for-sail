@@ -38,7 +38,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--result-fd', type=int, required=True)
     args = parser.parse_args()
-    for line in sys.stdin:
+    # Legacy tests may call exit(), which closes sys.stdin before raising SystemExit.
+    # Keep the request pipe on its own descriptor so the next case can run.
+    requests = os.fdopen(os.dup(sys.stdin.fileno()))
+    for line in requests:
         request = json.loads(line)
         error = ''
         # Redirect native compiler/runtime output too; the result uses a separate

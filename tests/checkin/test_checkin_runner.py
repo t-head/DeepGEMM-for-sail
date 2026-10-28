@@ -101,6 +101,7 @@ def device_version_supported(case): return case['gemm_type']!='unsupported','uns
 def call_test_func(kind, args):
  os.write(1,b'native output\\n')
  if kind=='bad': raise AssertionError('injected accuracy failure')
+ if kind=='legacy_exit': exit(1)
 '''
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -111,9 +112,10 @@ def call_test_func(kind, args):
                 worker = run_checkin.Worker('run', root)
                 try:
                     results = [worker.run(i, spec, 'run', root, 5)
-                               for i, spec in enumerate(('ok', 'bad', 'unsupported', 'ok'), 1)]
-                    self.assertEqual([bool(r.error) for r in results], [False, True, True, False])
-                    for index in (1, 2, 4):
+                               for i, spec in enumerate(('ok', 'bad', 'unsupported', 'legacy_exit', 'ok'), 1)]
+                    self.assertEqual([bool(r.error) for r in results], [False, True, True, True, False])
+                    self.assertIn('SystemExit: 1', results[3].error)
+                    for index in (1, 2, 5):
                         output = (root / f'run-{index:04d}.log').read_text()
                         self.assertIn('native output', output)
                         self.assertIn('accuracy True', output)
