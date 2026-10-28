@@ -1519,9 +1519,10 @@ def test_m_grouped_gemm_masked(args) -> None:
 
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     group_size = args.get('group_size', 32)
-    # Input distribution historically uses ceil(m/groups), independently of the
-    # optional scheduler hint. Keep the actual counts for an exact replay.
-    input_expected_m = ceil_div(m, num_groups)
+    # PPU input generation used ceil(m/groups); CUDA used the explicit em when
+    # supplied. Keep the actual counts for an exact replay on either backend.
+    input_expected_m = (ceil_div(m, num_groups) if use_ppu
+                        else args.get('em', ceil_div(m, num_groups)))
     distribution = [int(count) for count in construct_group_m_list(
         distribution, num_groups, m, is_mask=True, em=input_expected_m)]
     padding_m = args.get('padding_m', 0)
