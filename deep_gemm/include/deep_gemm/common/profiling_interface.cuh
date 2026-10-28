@@ -248,6 +248,14 @@ bool is_masked_gemm() const {
     return gemm_type_ == GemmType::MGroupedMasked;
 }
 
+// True while the profiling interface is being launched from inside an active
+// stream graph capture (see check_support_dump, which bails out in that case).
+bool is_in_graph_capture() const {
+    hggcStreamCaptureStatus captureStatus;
+    hggcStreamIsCapturing(stream_, &captureStatus);
+    return captureStatus != hggcStreamCaptureStatusNone;
+}
+
 void distribution() {
     hggcDeviceSynchronize();
 
@@ -417,7 +425,12 @@ public:
         }
 
         if (start) {
-            if ((show_params_ || ((params.is_paged_mqa_logits() || params.is_masked_gemm()) && use_hgtx_)) && params.check_support_dump()) {
+            if ((show_params_ || (params.is_paged_mqa_logits() && use_hgtx_)) && params.check_support_dump()) {
+                params.distribution();
+            } else if (params.is_masked_gemm() && use_hgtx_ && !params.is_in_graph_capture() && params.check_support_dump()) {
+                // Masked m in the HGTX trace must be the valid total, not the tensor
+                // capacity. Collecting it costs a device sync plus a D2H copy, so only
+                // do it when the m slot is actually used (outside graph capture).
                 params.distribution();
             }
             std::string op_name = params.format();

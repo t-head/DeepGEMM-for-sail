@@ -1214,7 +1214,8 @@ def parse_deepgemm_string_re(s):
     if grps[0] in supported_gemm_type:
         result['gemm_type'] = grps[0]
     # A field ends at the next key, not at commas inside lists or einsum expressions.
-    param_pattern = r"(\w+):(.+?)(?=,\w+:|$)"
+    # Allow optional whitespace after the comma before the next key.
+    param_pattern = r"(\w+):(.+?)(?=,\s*\w+:|$)"
     match_string = re.findall(param_pattern, grps[1])
     if len(match_string) == 0:
         print("ERROR: wrong deepgemm format input, please check!!")
