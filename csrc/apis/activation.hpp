@@ -31,80 +31,123 @@ static ActivationMaskArgs check_mask(const torch::Tensor& input, const torch::Te
     TORCH_CHECK(capacity <= std::numeric_limits<int>::max(), "masked row capacity exceeds indexing limits");
     return make_activation_mask(input, masked_m, expected_m);
 }
+static void check_route_ids(const torch::Tensor& input, int64_t rows,
+                            const std::optional<torch::Tensor>& route_ids, ActivationMaskArgs& mask) {
+    if (!route_ids) return;
+    TORCH_CHECK(!mask.masked(), "route_ids and masked_m are mutually exclusive");
+    TORCH_CHECK(route_ids->device() == input.device() && route_ids->scalar_type() == torch::kInt32 &&
+                route_ids->is_contiguous() && route_ids->numel() == rows,
+                "route_ids must be contiguous int32 on the input device with one entry per row");
+    mask.masked_m = route_ids->data_ptr<int32_t>();
+    mask.route_masked = true;
+}
 static ActivationSoftcapArgs check_softcap(float beta, const std::optional<float>& linear_beta) {
     TORCH_CHECK(std::isfinite(beta) && beta > 0, "SiTU beta must be finite and positive");
     TORCH_CHECK(!linear_beta || (std::isfinite(*linear_beta) && *linear_beta > 0),
                 "SiTU linear_beta must be finite and positive, or None");
-    return {true, beta, linear_beta.value_or(0.0f)};
+    return {ActivationMode::SITU, beta, linear_beta.value_or(0.0f)};
 }
 
-enum class ActivationQuantMode { FP8_CHANNEL, MXFP4, MXFP8, FP8_BLOCK, BF16 };
 
 static py::object dispatch_activation(
-        ActivationQuantMode mode, const torch::Tensor& input,
+        QuantMode mode, const torch::Tensor& input,
         const std::optional<torch::Tensor>& masked_m, const std::optional<int>& expected_m,
         float limit, float inverse, const std::optional<bool>& reorder_scale,
-        ActivationSoftcapArgs softcap = {}) {
+        ActivationSoftcapArgs softcap = {},
+        const std::optional<torch::Tensor>& route_ids = std::nullopt) {
     TORCH_CHECK(masked_m || !expected_m, "expected_m requires masked_m");
-    TORCH_CHECK(mode == ActivationQuantMode::FP8_CHANNEL || inverse == 1.0f,
+    TORCH_CHECK(mode == QuantMode::FP8_CHANNEL || inverse == 1.0f,
                 "weight_inv_scale is only supported for FP8_CHANNEL");
-    TORCH_CHECK(mode == ActivationQuantMode::MXFP4 || !reorder_scale,
+    TORCH_CHECK(mode == QuantMode::MXFP4 || !reorder_scale,
                 "reorder_scale is only supported for MXFP4");
     auto mask = masked_m ? check_mask(input, *masked_m, expected_m) : ActivationMaskArgs{};
     const auto [n, rows] = check_input(input, limit);
-    if (mode == ActivationQuantMode::FP8_CHANNEL)
+    check_route_ids(input, rows, route_ids, mask);
+    if (mode == QuantMode::FP8_CHANNEL)
         TORCH_CHECK(std::isfinite(inverse) && inverse > 0, "inverse scale must be finite and positive");
-    if (mode == ActivationQuantMode::MXFP4) {
+    if (mode == QuantMode::MXFP4) {
         TORCH_CHECK(n % 2 == 0, "MXFP4 requires even output N");
         TORCH_CHECK(!reorder_scale.value_or(true) || input.dim() == 2 || input.dim() == 3,
                     "PPU1.5 scale layout requires rank 2 or 3");
     }
-    if (mode == ActivationQuantMode::FP8_BLOCK)
+    if (mode == QuantMode::FP8_BLOCK)
         TORCH_CHECK(n % 128 == 0, "FP8_BLOCK requires output N divisible by 128");
     switch (mode) {
-        case ActivationQuantMode::BF16:
+        case QuantMode::BF16:
             return py::cast(run_activation(input, n, rows, limit, mask, softcap));
-        case ActivationQuantMode::FP8_CHANNEL:
+        case QuantMode::FP8_CHANNEL:
             return py::cast(run_activation_fp8_channel(input, n, rows, limit, inverse, mask, softcap));
-        case ActivationQuantMode::MXFP4:
+        case QuantMode::MXFP4:
             return py::cast(run_activation_mxfp4(input, n, rows, limit, reorder_scale.value_or(true), mask, softcap));
-        case ActivationQuantMode::FP8_BLOCK:
+        case QuantMode::FP8_BLOCK:
             return py::cast(run_activation_tiled<true>(input, n, rows, limit, mask, softcap));
-        case ActivationQuantMode::MXFP8:
+        case QuantMode::MXFP8:
             return py::cast(run_activation_mx<false>(input, n, rows, limit, mask, softcap));
     }
     TORCH_CHECK(false, "unsupported activation quantization mode");
 }
 
+// Unified activation selection and parameter checks.
+static py::object dispatch_activation_mode(ActivationMode activation_mode, QuantMode quant_mode,
+        const torch::Tensor& input, const std::optional<torch::Tensor>& mask,
+        const std::optional<int>& hint, const std::optional<float>& limit,
+        const std::optional<float>& beta, const std::optional<float>& linear_beta,
+        float inverse, const std::optional<bool>& reorder,
+        const std::optional<torch::Tensor>& route_ids = std::nullopt) {
+    ActivationSoftcapArgs activation;
+    if (activation_mode == ActivationMode::SITU) {
+        TORCH_CHECK(!limit, "swiglu_limit is only supported for SILU and SILU_STEP");
+        TORCH_CHECK(beta.has_value(), "SITU requires beta");
+        activation = check_softcap(*beta, linear_beta);
+    } else {
+        TORCH_CHECK(activation_mode == ActivationMode::SILU || activation_mode == ActivationMode::SILU_STEP,
+                    "unsupported activation mode");
+        TORCH_CHECK(!beta && !linear_beta, "beta and linear_beta are only supported for SITU");
+        activation.mode = activation_mode;
+    }
+    return dispatch_activation(quant_mode, input, mask, hint, limit.value_or(0.0f), inverse, reorder, activation, route_ids);
+}
+
 static void register_apis(pybind11::module_& m) {
-    py::enum_<ActivationQuantMode>(m, "ActivationQuantMode")
-        .value("BF16", ActivationQuantMode::BF16)
-        .value("FP8_CHANNEL", ActivationQuantMode::FP8_CHANNEL)
-        .value("MXFP4", ActivationQuantMode::MXFP4)
-        .value("MXFP8", ActivationQuantMode::MXFP8)
-        .value("FP8_BLOCK", ActivationQuantMode::FP8_BLOCK);
-    using Mask = std::optional<torch::Tensor>;
+    py::enum_<ActivationMode>(m, "ActivationMode")
+        .value("SILU", ActivationMode::SILU)
+        .value("SITU", ActivationMode::SITU)
+        .value("SILU_STEP", ActivationMode::SILU_STEP);
+    py::enum_<QuantMode>(m, "QuantMode")
+        .value("BF16", QuantMode::BF16)
+        .value("FP8_CHANNEL", QuantMode::FP8_CHANNEL)
+        .value("MXFP4", QuantMode::MXFP4)
+        .value("MXFP8", QuantMode::MXFP8)
+        .value("FP8_BLOCK", QuantMode::FP8_BLOCK);
     using Hint = std::optional<int>;
     using Limit = std::optional<float>;
     using Reorder = std::optional<bool>;
-    m.def("silu_and_mul", [](ActivationQuantMode mode, const torch::Tensor& input, Mask mask, Hint hint,
-                              Limit limit, float inverse, Reorder reorder) {
-        return dispatch_activation(mode, input, mask, hint, limit.value_or(0.0f), inverse, reorder);
-    }, py::arg("mode"), py::arg("input"), py::kw_only(),
-       py::arg("masked_m") = std::nullopt, py::arg("expected_m") = std::nullopt,
-       py::arg("swiglu_limit") = std::nullopt, py::arg("weight_inv_scale") = 1.0f,
+    const char* doc =
+        "Activation(gate)*up with SILU, SITU or SILU_STEP. BF16 returns a tensor; other modes return (values, scales). "
+        "SILU clamps gate before SiLU; SILU_STEP clamps after SiLU. None or zero swiglu_limit disables clipping. "
+        "SITU requires beta; linear_beta=None leaves up uncapped. QuantMode selects BF16, FP8_CHANNEL, MXFP4, MXFP8 or FP8_BLOCK. "
+        "MXFP4 reorder_scale defaults to true (PPU1.5 uint16 M-major); false returns raw uint8 scales. "
+        "The dense entry point accepts optional contiguous int32 route_ids and skips negative rows; skipped values/scales are unspecified.";
+    m.def("activation_and_mul", [](ActivationMode activation_mode, QuantMode quant_mode,
+            const torch::Tensor& input, Limit limit, Limit beta, Limit linear_beta,
+            float inverse, Reorder reorder,
+            std::optional<torch::Tensor> route_ids) {
+        return dispatch_activation_mode(activation_mode, quant_mode, input, std::nullopt, std::nullopt,
+                                        limit, beta, linear_beta, inverse, reorder, route_ids);
+    }, py::arg("activation_mode"), py::arg("quant_mode"), py::arg("input"), py::kw_only(),
+       py::arg("swiglu_limit") = std::nullopt, py::arg("beta") = std::nullopt,
+       py::arg("linear_beta") = std::nullopt, py::arg("weight_inv_scale") = 1.0f,
        py::arg("reorder_scale") = std::nullopt,
-       "SiLU(gate)*up; mode is required; BF16 returns a tensor, other modes return (values, scales). "
-       "FP8_BLOCK uses group128 FP32 scales (masked scales are M-major with rows aligned to 4). "
-       "MXFP4 reorder_scale defaults to true (uint16 M-major); false returns raw uint8 scales.");
-    m.def("situ_and_mul", [](ActivationQuantMode mode, const torch::Tensor& input, float beta, Limit linear_beta,
-                              Mask mask, Hint hint, float inverse, Reorder reorder) {
-        return dispatch_activation(mode, input, mask, hint, 0.0f, inverse, reorder,
-                                   check_softcap(beta, linear_beta));
-    }, py::arg("mode"), py::arg("input"), py::kw_only(), py::arg("beta"), py::arg("linear_beta") = std::nullopt,
-       py::arg("masked_m") = std::nullopt,
-       py::arg("expected_m") = std::nullopt, py::arg("weight_inv_scale") = 1.0f,
-       py::arg("reorder_scale") = std::nullopt,
-       "SiTU(gate)*up; mode is required; BF16 returns a tensor, other modes return (values, scales).");
+       py::arg("route_ids") = std::nullopt,
+       doc);
+    m.def("activation_and_mul_masked", [](ActivationMode activation_mode, QuantMode quant_mode,
+            const torch::Tensor& input, const torch::Tensor& masked_m, Hint expected_m,
+            Limit limit, Limit beta, Limit linear_beta, float inverse, Reorder reorder) {
+        return dispatch_activation_mode(activation_mode, quant_mode, input, masked_m, expected_m,
+                                        limit, beta, linear_beta, inverse, reorder);
+    }, py::arg("activation_mode"), py::arg("quant_mode"), py::arg("input"), py::arg("masked_m"), py::kw_only(),
+       py::arg("expected_m") = std::nullopt, py::arg("swiglu_limit") = std::nullopt,
+       py::arg("beta") = std::nullopt, py::arg("linear_beta") = std::nullopt,
+       py::arg("weight_inv_scale") = 1.0f, py::arg("reorder_scale") = std::nullopt, doc);
 }
 } // namespace deep_gemm::activation

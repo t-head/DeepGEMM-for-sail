@@ -2,7 +2,8 @@
 #include <cstdint>
 
 namespace deep_gemm {
-enum class ActivationOutputMode { BF16, FP8_CHANNEL, MXFP4, MXFP8, FP8_BLOCK };
+enum class ActivationMode { SILU, SITU, SILU_STEP };
+enum class QuantMode { BF16, FP8_CHANNEL, MXFP4, MXFP8, FP8_BLOCK };
 
 // Each channel thread owns eight consecutive columns; wider rows use more rounds.
 constexpr int activation_fp8_channel_threads(int n) {

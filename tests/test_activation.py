@@ -6,6 +6,13 @@ import deep_gemm
 from deep_gemm.testing.numeric import calc_diff
 
 
+def activation_api(activation_mode, quant_mode, input, *, masked_m=None, **kwargs):
+    """Exercise dense and masked entry points with the same numerical cases."""
+    if masked_m is not None:
+        return deep_gemm.activation_and_mul_masked(activation_mode, quant_mode, input, masked_m, **kwargs)
+    return deep_gemm.activation_and_mul(activation_mode, quant_mode, input, **kwargs)
+
+
 def activation_reference(x, limit=0.):
     gate, up = x.float().chunk(2, dim=-1)
     if limit > 0:
@@ -28,15 +35,15 @@ def test_fp8_channel_activation():
         x = (torch.randn(2, 3, 2*n, device='cuda') * 4).bfloat16()
         x[0, 0].zero_()
         expected_q, expected_s = quant_activation(activation_reference(x, limit))
-        aq, scale = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.FP8_CHANNEL, x, swiglu_limit=limit)
+        aq, scale = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.FP8_CHANNEL, x, swiglu_limit=limit)
         assert aq.shape == (2, 3, n) and scale.shape == (2, 3, 1)
         assert aq.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
         torch.testing.assert_close(scale, expected_s, rtol=2e-6, atol=1e-12)
         check(aq.float()*scale, expected_q.float()*expected_s, f'activation N={n} limit={limit}')
-        folded_q, folded_s = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.FP8_CHANNEL, x, swiglu_limit=limit, weight_inv_scale=0.03125)
+        folded_q, folded_s = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.FP8_CHANNEL, x, swiglu_limit=limit, weight_inv_scale=0.03125)
         assert torch.equal(aq.view(torch.uint8), folded_q.view(torch.uint8))
         torch.testing.assert_close(folded_s, scale * .03125, rtol=0, atol=0)
-    aq, scale = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.FP8_CHANNEL, torch.empty(0, 256, device='cuda', dtype=torch.bfloat16))
+    aq, scale = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.FP8_CHANNEL, torch.empty(0, 256, device='cuda', dtype=torch.bfloat16))
     assert aq.shape == (0, 128) and scale.shape == (0, 1)
 
 
@@ -44,11 +51,11 @@ def test_bf16_activation():
     for n, limit in ((17, 0.), (128, 0.), (384, 2.)):
         x = (torch.randn(2, 3, 2*n, device='cuda') * 4).bfloat16()
         x[0, 0].zero_()
-        actual = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.BF16, x, swiglu_limit=limit)
+        actual = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.BF16, x, swiglu_limit=limit)
         assert actual.shape == (2, 3, n) and actual.dtype == torch.bfloat16
         torch.testing.assert_close(actual, activation_reference(x, limit).bfloat16(), rtol=.008, atol=1e-6)
         check(actual, activation_reference(x, limit).bfloat16(), f'BF16 activation N={n} limit={limit}')
-    actual = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.BF16, torch.empty(0, 256, device='cuda', dtype=torch.bfloat16))
+    actual = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.BF16, torch.empty(0, 256, device='cuda', dtype=torch.bfloat16))
     assert actual.shape == (0, 128)
 
 
@@ -103,9 +110,9 @@ def test_mx_activation():
             for limit in (0., 2.1):
                 for fp4 in (True, False):
                     if fp4:
-                        data, scales = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, input, swiglu_limit=limit, reorder_scale=False)
+                        data, scales = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, input, swiglu_limit=limit, reorder_scale=False)
                     else:
-                        data, scales = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP8, input, swiglu_limit=limit)
+                        data, scales = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP8, input, swiglu_limit=limit)
                     ref_data, ref_scales = reference(input, fp4, limit)
                     assert data.shape == (*shape[:-1], n//2 if fp4 else n)
                     assert data.dtype == (torch.uint8 if fp4 else torch.float8_e4m3fn)
@@ -115,7 +122,7 @@ def test_mx_activation():
                     diff = calc_diff(actual, expected).item()
                     assert torch.isfinite(actual).all() and diff < .0015, (n, limit, fp4, diff)
                     if fp4:
-                        packed, reordered = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, input, swiglu_limit=limit)
+                        packed, reordered = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, input, swiglu_limit=limit)
                         assert torch.equal(packed, data)
                         _, layout_ref = deep_gemm.preprocess_weights_and_scales(
                             deep_gemm.PreprocessMode.MXFP4, False, weight_scale=scales)
@@ -126,21 +133,21 @@ def test_mx_activation():
                     print(f'PASS MX activation {n=} {batched=} {limit=} {fp4=}: diff={diff:.8g}')
     for shape in ((0, 256), (2, 0, 96), (0, 17, 64)):
         input = torch.empty(shape, device='cuda', dtype=torch.bfloat16)
-        for api in (partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP4), partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP8)):
+        for api in (partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4), partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP8)):
             data, scales = api(input)
             assert data.numel() == scales.numel() == 0
     print('PASS MX activation empty tensors')
 
     # Odd MXFP8 row strides require byte stores and a single-element final pair.
     input = torch.randn(2, 7, 34, device='cuda', dtype=torch.bfloat16)
-    data, scales = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP8, input)
+    data, scales = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP8, input)
     ref_data, ref_scales = reference(input, False, 0.)
     assert torch.equal(scales, ref_scales)
     assert torch.equal(data.view(torch.uint8), ref_data.view(torch.uint8))
     print('PASS MXFP8 odd N pair-store fallback')
     # Positive limits rounding to BF16 zero must still apply clipping.
     input = torch.randn(3, 64, device='cuda', dtype=torch.bfloat16)
-    packed, scales = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, input, swiglu_limit=1e-42, reorder_scale=False)
+    packed, scales = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, input, swiglu_limit=1e-42, reorder_scale=False)
     assert ((packed & 0x77) == 0).all()
     assert torch.equal(scales, reference(input, True, 1e-42)[1])
     print('PASS MXFP4 positive limit rounding to BF16 zero')
@@ -158,7 +165,7 @@ def test_fp4_gemm_consumption():
     ref_weight = cast_back_from_fp4(packed, scale, gran_k=32).float()
     outputs = []
     for reorder in (False, True):
-        lhs = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, input, reorder_scale=reorder)
+        lhs = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, input, reorder_scale=reorder)
         out = torch.empty(17, 64, device='cuda', dtype=torch.bfloat16)
         deep_gemm.gemm_fp4_fp4_bf16_nt(lhs, rhs, None, out)
         raw = reference(input, True, 0.)[1]
@@ -177,16 +184,16 @@ def test_masked_activation():
         x[2, 0].zero_()
         for limit in (None, 2.1):
             variants = (
-                (partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.BF16),
-                 partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.BF16), {}),
-                (partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.FP8_CHANNEL),
-                 partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.FP8_CHANNEL), {'weight_inv_scale': .03125}),
-                (partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP4),
-                 partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP4), {'reorder_scale': False}),
-                (partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP4),
-                 partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP4), {}),
-                (partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP8),
-                 partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP8), {}),
+                (partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.BF16),
+                 partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.BF16), {}),
+                (partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.FP8_CHANNEL),
+                 partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.FP8_CHANNEL), {'weight_inv_scale': .03125}),
+                (partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4),
+                 partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4), {'reorder_scale': False}),
+                (partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4),
+                 partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4), {}),
+                (partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP8),
+                 partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP8), {}),
             )
             for dense, masked, kwargs in variants:
                 expected = dense(x, swiglu_limit=limit, **kwargs)
@@ -213,10 +220,10 @@ def test_masked_activation():
     for shape in ((4, 17, 256), (4, 0, 96), (0, 17, 256)):
         x = torch.zeros(shape, device='cuda', dtype=torch.bfloat16)
         empty = torch.zeros(shape[0], device='cuda', dtype=torch.int32)
-        for masked in (partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.BF16),
-                       partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.FP8_CHANNEL),
-                       partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP4),
-                       partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP8)):
+        for masked in (partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.BF16),
+                       partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.FP8_CHANNEL),
+                       partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4),
+                       partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP8)):
             result = masked(x, masked_m=empty, expected_m=0)
             output = result[0] if isinstance(result, tuple) else result
             assert output.shape[:2] == shape[:2]
@@ -241,7 +248,7 @@ def test_masked_fp4_gemm_consumption():
         deep_gemm.PreprocessMode.MXFP4, False, packed.view(torch.uint8).reshape(e,64,n//2), raw)
     ref_weight = cast_back_from_fp4(packed, scales, gran_k=32).reshape(e,64,n).float()
     for reorder in (False, True):
-        data, scales = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, x, masked_m=counts, expected_m=1, reorder_scale=reorder)
+        data, scales = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, x, masked_m=counts, expected_m=1, reorder_scale=reorder)
         lhs = (data, scales)
         out = torch.empty(e,t,64,device='cuda',dtype=torch.bfloat16)
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(lhs, rhs, None, out, counts, 8)
@@ -275,8 +282,8 @@ def test_situ_activation():
             for suffix, kwargs in (('', {}), ('_post_per_token_quant_fp8', {'weight_inv_scale': .03125}),
                                    ('_post_quant_mxfp4', {'reorder_scale': False}),
                                    ('_post_quant_mxfp4', {}), ('_post_quant_mxfp8', {})):
-                quant = {'': deep_gemm.ActivationQuantMode.BF16, '_post_per_token_quant_fp8': deep_gemm.ActivationQuantMode.FP8_CHANNEL, '_post_quant_mxfp4': deep_gemm.ActivationQuantMode.MXFP4, '_post_quant_mxfp8': deep_gemm.ActivationQuantMode.MXFP8}[suffix]
-                dense = partial(deep_gemm.situ_and_mul, quant)
+                quant = {'': deep_gemm.QuantMode.BF16, '_post_per_token_quant_fp8': deep_gemm.QuantMode.FP8_CHANNEL, '_post_quant_mxfp4': deep_gemm.QuantMode.MXFP4, '_post_quant_mxfp8': deep_gemm.QuantMode.MXFP8}[suffix]
+                dense = partial(activation_api, deep_gemm.ActivationMode.SITU, quant)
                 masked = dense
                 actual = dense(x, beta=beta, linear_beta=linear_beta, **kwargs)
                 if suffix == '':
@@ -323,9 +330,9 @@ def test_situ_activation():
     for shape in ((0, 256), (4, 0, 256), (0, 17, 256)):
         x = torch.empty(shape, device='cuda', dtype=torch.bfloat16)
         if len(shape) == 2:
-            result = deep_gemm.situ_and_mul(deep_gemm.ActivationQuantMode.BF16, x, beta=4.0, linear_beta=25.0)
+            result = activation_api(deep_gemm.ActivationMode.SITU, deep_gemm.QuantMode.BF16, x, beta=4.0, linear_beta=25.0)
         else:
-            result = deep_gemm.situ_and_mul(deep_gemm.ActivationQuantMode.BF16, x, masked_m=torch.zeros(shape[0], device='cuda', dtype=torch.int32), beta=4.0)
+            result = activation_api(deep_gemm.ActivationMode.SITU, deep_gemm.QuantMode.BF16, x, masked_m=torch.zeros(shape[0], device='cuda', dtype=torch.int32), beta=4.0)
         assert result.shape == (*shape[:-1], 128)
     print('PASS SiTU empty inputs')
 
@@ -337,8 +344,8 @@ def test_mxfp4_pipeline():
     for n in (10, 34, 254, 256, 258, 512, 2048):
         x = (torch.randn(3, 9, 2*n, device='cuda') * 4).bfloat16()
         for situ in (False, True):
-            dense = partial(deep_gemm.situ_and_mul, deep_gemm.ActivationQuantMode.MXFP4) if situ else partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP4)
-            masked = partial(deep_gemm.situ_and_mul, deep_gemm.ActivationQuantMode.MXFP4) if situ else partial(deep_gemm.silu_and_mul, deep_gemm.ActivationQuantMode.MXFP4)
+            dense = partial(activation_api, deep_gemm.ActivationMode.SITU, deep_gemm.QuantMode.MXFP4) if situ else partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4)
+            masked = partial(activation_api, deep_gemm.ActivationMode.SITU, deep_gemm.QuantMode.MXFP4) if situ else partial(activation_api, deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4)
             params = {'beta': 4., 'linear_beta': 25.} if situ else {'swiglu_limit': 2.1}
             data, raw = dense(x, reorder_scale=False, **params)
             if situ:
@@ -366,13 +373,13 @@ def test_mxfp4_pipeline():
             view.copy_(x)
             assert view.is_contiguous() and view.data_ptr() % 16 != 0
             for limit in (None, 2.1):
-                aligned = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, x, swiglu_limit=limit)
-                unaligned = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, view, swiglu_limit=limit)
+                aligned = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, x, swiglu_limit=limit)
+                unaligned = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, view, swiglu_limit=limit)
                 assert all(torch.equal(a,b) for a,b in zip(aligned,unaligned))
         # Natural scales also support more than one leading batch dimension.
         rank4 = x.reshape(1,3,9,2*n)
-        actual = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, rank4, reorder_scale=False)
-        expected = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, x, reorder_scale=False)
+        actual = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, rank4, reorder_scale=False)
+        expected = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, x, reorder_scale=False)
         assert all(torch.equal(a.reshape(b.shape), b) for a,b in zip(actual,expected))
     print('PASS MXFP4 pipeline tails, scale layouts, unaligned inputs and masked reuse')
 
@@ -382,15 +389,15 @@ def test_mxfp8_pipeline():
     for n in (17, 255, 256, 257, 768):
         x = (torch.randn(3, 9, 2*n, device='cuda') * 4).bfloat16()
         for situ, limit in ((False, None), (False, 2.1), (True, None)):
-            fn = deep_gemm.situ_and_mul if situ else deep_gemm.silu_and_mul
+            fn = partial(activation_api, deep_gemm.ActivationMode.SITU) if situ else partial(activation_api, deep_gemm.ActivationMode.SILU)
             params = {'beta': 4., 'linear_beta': 25.} if situ else {'swiglu_limit': limit}
-            data, scales = fn(deep_gemm.ActivationQuantMode.MXFP8, x, **params)
+            data, scales = fn(deep_gemm.QuantMode.MXFP8, x, **params)
             value = situ_reference(x, 4., 25.) if situ else activation_reference(x, limit or 0.)
             ref_data, ref_scales = reference(x, False, 0., value=value)
             assert torch.equal(scales, ref_scales)
             check(decode(data, scales, False), decode(ref_data, ref_scales, False),
                   f'MXFP8 pipeline {n=} {situ=} {limit=}')
-            aq, sf = fn(deep_gemm.ActivationQuantMode.MXFP8, x, masked_m=counts, expected_m=1, **params)
+            aq, sf = fn(deep_gemm.QuantMode.MXFP8, x, masked_m=counts, expected_m=1, **params)
             for e, valid in enumerate((0, 3, 9)):
                 assert torch.equal(aq[e, :valid].view(torch.uint8), data[e, :valid].view(torch.uint8))
                 assert torch.equal(sf[e, :valid], scales[e, :valid])
@@ -398,7 +405,7 @@ def test_mxfp8_pipeline():
                 storage = torch.empty(x.numel()+1, device='cuda', dtype=torch.bfloat16)
                 view = storage[1:].view_as(x)
                 view.copy_(x)
-                uq, us = fn(deep_gemm.ActivationQuantMode.MXFP8, view, **params)
+                uq, us = fn(deep_gemm.QuantMode.MXFP8, view, **params)
                 assert torch.equal(uq.view(torch.uint8), data.view(torch.uint8))
                 assert torch.equal(us, scales)
     print('PASS MXFP8 pipeline tails, odd row strides, unaligned inputs and masked reuse')
@@ -415,12 +422,12 @@ def test_fp8_channel_vec8():
         x[2, 0, n - 1] = 20
         x[2, 0, 2 * n - 1] = 32
         for situ in (False, True):
-            fn = deep_gemm.situ_and_mul if situ else deep_gemm.silu_and_mul
+            fn = partial(activation_api, deep_gemm.ActivationMode.SITU) if situ else partial(activation_api, deep_gemm.ActivationMode.SILU)
             params = {'beta': 4., 'linear_beta': 25.} if situ else {'swiglu_limit': 2.1}
             value = situ_reference(x, 4., 25.) if situ else activation_reference(x, 2.1)
             ref_q, ref_s = quant_activation(value, .03125)
-            q, scale = fn(deep_gemm.ActivationQuantMode.FP8_CHANNEL, x, weight_inv_scale=0.03125, **params)
-            mq, ms = fn(deep_gemm.ActivationQuantMode.FP8_CHANNEL, x, weight_inv_scale=0.03125, masked_m=counts, expected_m=1, **params)
+            q, scale = fn(deep_gemm.QuantMode.FP8_CHANNEL, x, weight_inv_scale=0.03125, **params)
+            mq, ms = fn(deep_gemm.QuantMode.FP8_CHANNEL, x, weight_inv_scale=0.03125, masked_m=counts, expected_m=1, **params)
             torch.testing.assert_close(scale, ref_s, rtol=2e-6, atol=1e-12)
             check(q.float() * scale, ref_q.float() * ref_s, f'channel vec8 N={n} situ={situ}')
             for e, valid in enumerate((0, 3, 9)):
@@ -430,7 +437,7 @@ def test_fp8_channel_vec8():
 
 
 def test_fp8_block_activation():
-    mode = deep_gemm.ActivationQuantMode.FP8_BLOCK
+    mode = deep_gemm.QuantMode.FP8_BLOCK
     counts = torch.tensor([0, 3, 9], device='cuda', dtype=torch.int32)
     for n in (128, 256, 384, 768, 2048):
         storage = (torch.randn(3 * 9 * 2 * n + 1, device='cuda') * 4).bfloat16()
@@ -440,7 +447,7 @@ def test_fp8_block_activation():
         for g in range(n // 128):
             x[..., n + g * 128:n + (g + 1) * 128] *= 2. ** (g % 5 - 2)
         for situ in (False, True):
-            fn = deep_gemm.situ_and_mul if situ else deep_gemm.silu_and_mul
+            fn = partial(activation_api, deep_gemm.ActivationMode.SITU) if situ else partial(activation_api, deep_gemm.ActivationMode.SILU)
             for limit in ((0.,) if situ else (0., 1.003, 2.1)):
                 params = {'beta': 4., 'linear_beta': 25.} if situ else {'swiglu_limit': limit}
                 value = situ_reference(x, 4., 25.) if situ else activation_reference(x, limit)
@@ -452,8 +459,8 @@ def test_fp8_block_activation():
                 aligned_q, aligned_scale = fn(mode, x.clone(), **params)
                 assert torch.equal(q.view(torch.uint8), aligned_q.view(torch.uint8))
                 assert torch.equal(scale, aligned_scale)
-                bf16 = fn(deep_gemm.ActivationQuantMode.BF16, x, **params)
-                assert torch.equal(bf16, fn(deep_gemm.ActivationQuantMode.BF16, x.clone(), **params))
+                bf16 = fn(deep_gemm.QuantMode.BF16, x, **params)
+                assert torch.equal(bf16, fn(deep_gemm.QuantMode.BF16, x.clone(), **params))
                 check(bf16.float(), value, f'BF16 vec8 N={n} situ={situ} limit={limit}')
                 assert q.shape == (3, 9, n) and scale.shape == (3, 9, n // 128)
                 assert q.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
@@ -475,11 +482,11 @@ def test_fp8_block_activation():
         x = torch.empty(shape, dtype=torch.bfloat16, device='cuda')
         for masked in (False, True):
             opts = {'masked_m': torch.zeros(shape[0], dtype=torch.int32, device='cuda')} if masked else {}
-            q, scale = deep_gemm.silu_and_mul(mode, x, **opts)
+            q, scale = activation_api(deep_gemm.ActivationMode.SILU, mode, x, **opts)
             assert q.shape == (*shape[:-1], 128) and scale.shape == (*shape[:-1], 1)
     for n, opts in ((129, {}), (128, {'weight_inv_scale': .5}), (128, {'reorder_scale': False})):
         try:
-            deep_gemm.silu_and_mul(mode, torch.zeros(2, 2 * n, device='cuda', dtype=torch.bfloat16), **opts)
+            activation_api(deep_gemm.ActivationMode.SILU, mode, torch.zeros(2, 2 * n, device='cuda', dtype=torch.bfloat16), **opts)
         except RuntimeError:
             pass
         else:
@@ -489,36 +496,30 @@ def test_fp8_block_activation():
 
 def test_unified_api_contract():
     x = torch.zeros(2, 128, device='cuda', dtype=torch.bfloat16)
-    for api, base in ((deep_gemm.silu_and_mul, {}), (deep_gemm.situ_and_mul, {'beta': 4.})):
-        for mode, bad in ((deep_gemm.ActivationQuantMode.BF16, {'expected_m': 1}),
-                          (deep_gemm.ActivationQuantMode.BF16, {'weight_inv_scale': 2.}),
-                          (deep_gemm.ActivationQuantMode.MXFP8, {'weight_inv_scale': 2.}),
-                          (deep_gemm.ActivationQuantMode.FP8_CHANNEL, {'reorder_scale': False}),
-                          (deep_gemm.ActivationQuantMode.BF16, {'reorder_scale': True}),
-                          ('fp8', {}), (None, {})):
-            try:
-                api(mode, x, **base, **bad)
-            except (RuntimeError, TypeError):
-                pass
-            else:
-                raise AssertionError(f'accepted invalid activation options: {mode}, {bad}')
-        for args, kwargs in (((x,), base), ((x,), {**base, 'quant': deep_gemm.ActivationQuantMode.MXFP8}),
-                             ((), {'input': x, **base})):
-            try:
-                api(*args, **kwargs)
-            except TypeError:
-                pass
-            else:
-                raise AssertionError('mode must be explicitly supplied')
-        expected = api(deep_gemm.ActivationQuantMode.BF16, x, **base)
-        actual = api(mode=deep_gemm.ActivationQuantMode.BF16, input=x, **base)
-        assert torch.equal(actual, expected)
-    for prefix in ('silu_and_mul', 'situ_and_mul'):
-        for suffix in ('_masked', '_post_per_token_quant_fp8', '_post_quant_mxfp4',
-                       '_post_quant_mxfp8', '_masked_post_per_token_quant_fp8',
-                       '_masked_post_quant_mxfp4', '_masked_post_quant_mxfp8'):
-            assert not hasattr(deep_gemm, prefix + suffix)
-            assert not hasattr(deep_gemm.deep_gemm_cpp, prefix + suffix)
+    silu, situ = deep_gemm.ActivationMode.SILU, deep_gemm.ActivationMode.SITU
+    bf16 = deep_gemm.QuantMode.BF16
+    for activation, options in ((silu, {'beta': 4.}), (silu, {'linear_beta': 2.}),
+                                 (situ, {}), (situ, {'beta': 4., 'swiglu_limit': 0.}),
+                                 (situ, {'beta': 0.}), (silu, {'expected_m': 1}),
+                                 (silu, {'weight_inv_scale': 2.}), (silu, {'reorder_scale': False})):
+        try:
+            deep_gemm.activation_and_mul(activation, bf16, x, **options)
+        except (RuntimeError, TypeError):
+            pass
+        else:
+            raise AssertionError((activation, options))
+    for args in ((x,), (silu, x), (None, bf16, x), (silu, None, x)):
+        try:
+            deep_gemm.activation_and_mul(*args)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError('activation_mode and quant_mode must be supplied')
+    actual = deep_gemm.activation_and_mul(activation_mode=silu, quant_mode=bf16, input=x)
+    assert torch.equal(actual, deep_gemm.activation_and_mul(silu, bf16, x))
+    for old in ('ActivationQuantMode', 'silu_and_mul', 'situ_and_mul'):
+        assert not hasattr(deep_gemm, old)
+        assert not hasattr(deep_gemm.deep_gemm_cpp, old)
     print('PASS unified activation API validation and removed bindings')
 
 
@@ -526,15 +527,15 @@ def test_bf16_clamp_boundary():
     # Only the clamp boundary rounds to BF16: 1.003 becomes 1.0.
     x = torch.full((1, 256), 2., device='cuda', dtype=torch.bfloat16)
     x[0, 128] = .1279296875
-    data, scales = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, x, swiglu_limit=1.003, reorder_scale=False)
+    data, scales = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, x, swiglu_limit=1.003, reorder_scale=False)
     expected, expected_scales = reference(x, True, 1.003)
     assert torch.equal(data, expected) and torch.equal(scales, expected_scales)
     assert (data[0, 0] & 15).item() == 1
-    for mode in (deep_gemm.ActivationQuantMode.BF16, deep_gemm.ActivationQuantMode.FP8_CHANNEL,
-                 deep_gemm.ActivationQuantMode.MXFP4, deep_gemm.ActivationQuantMode.MXFP8):
-        actual = deep_gemm.silu_and_mul(mode, x, swiglu_limit=1.003)
-        rounded = deep_gemm.silu_and_mul(mode, x, swiglu_limit=1.0)
-        if mode == deep_gemm.ActivationQuantMode.BF16:
+    for mode in (deep_gemm.QuantMode.BF16, deep_gemm.QuantMode.FP8_CHANNEL,
+                 deep_gemm.QuantMode.MXFP4, deep_gemm.QuantMode.MXFP8):
+        actual = activation_api(deep_gemm.ActivationMode.SILU, mode, x, swiglu_limit=1.003)
+        rounded = activation_api(deep_gemm.ActivationMode.SILU, mode, x, swiglu_limit=1.0)
+        if mode == deep_gemm.QuantMode.BF16:
             assert torch.equal(actual, rounded)
         else:
             for a, b in zip(actual, rounded):
@@ -552,7 +553,7 @@ def test_mxfp4_fp32_rounding():
     x[:, 128:] = .1875  # Other elements are exactly 6, fixing E8M0 scale to 1.
     x[0, 0] = 1.5
     x[0, 128] = .611328125
-    data, scales = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, x, reorder_scale=False)
+    data, scales = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, x, reorder_scale=False)
     assert (scales == 127).all()
     assert (data[0, 0] & 15).item() == 1
     ref_data, ref_scales = reference(x, True, 0.)
@@ -571,16 +572,16 @@ def test_scale_arithmetic():
     amax = value.abs().amax(-1, keepdim=True).clamp_min(1e-10)
     expected_scale = amax * (1. / 448.)
     expected_q = (value * (448. / amax)).clamp(-448, 448).to(torch.float8_e4m3fn)
-    q, scale = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.FP8_CHANNEL, x)
+    q, scale = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.FP8_CHANNEL, x)
     assert torch.equal(scale, expected_scale)
     assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
-    folded_q, folded_scale = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.FP8_CHANNEL, x, weight_inv_scale=0.125)
+    folded_q, folded_scale = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.FP8_CHANNEL, x, weight_inv_scale=0.125)
     assert torch.equal(q.view(torch.uint8), folded_q.view(torch.uint8))
     assert torch.equal(folded_scale, expected_scale * .125)
     # Overflowing BF16 products produce E8M0 exponent 255 rather than clamping
     # to 254. This checks the scale encoding, not accuracy of nonfinite data.
     overflow = torch.full((1, 256), 2. ** 70, device='cuda', dtype=torch.bfloat16)
-    _, scales = deep_gemm.silu_and_mul(deep_gemm.ActivationQuantMode.MXFP4, overflow, reorder_scale=False)
+    _, scales = activation_api(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.MXFP4, overflow, reorder_scale=False)
     assert (scales == 255).all()
     print('PASS FP8 scale/inverse arithmetic, zero/tiny rows, and unclamped MXFP4 exponent')
 
@@ -595,12 +596,12 @@ def test_launch_parameter_reuse():
         inverse = 2. ** (step - 2)
         for situ in (False, True):
             params = {'beta': float(step + 1), 'linear_beta': float(step + 3)} if situ else {'swiglu_limit': float(step)}
-            fn = deep_gemm.situ_and_mul if situ else deep_gemm.silu_and_mul
+            fn = partial(activation_api, deep_gemm.ActivationMode.SITU) if situ else partial(activation_api, deep_gemm.ActivationMode.SILU)
             value = situ_reference(x, params['beta'], params['linear_beta']) if situ else activation_reference(x, params['swiglu_limit'])
             expected_q, expected_scale = quant_activation(value, inverse)
             for masked in (False, True):
                 mask = {'masked_m': counts, 'expected_m': step} if masked else {}
-                q, scale = fn(deep_gemm.ActivationQuantMode.FP8_CHANNEL, x, weight_inv_scale=inverse, **params, **mask)
+                q, scale = fn(deep_gemm.QuantMode.FP8_CHANNEL, x, weight_inv_scale=inverse, **params, **mask)
                 for e, valid in enumerate((0, 2, 5) if masked else (5, 5, 5)):
                     if valid:
                         check(q[e, :valid].float() * scale[e, :valid],
@@ -629,11 +630,11 @@ def test_checkin_activation(args, check_accuracy=True):
     from quantization import quant_activation
 
     mode_name = args['quant_mode']
-    mode = getattr(deep_gemm.ActivationQuantMode, mode_name)
+    mode = getattr(deep_gemm.QuantMode, mode_name)
     situ = args['activation'] == 'situ'
-    if args['activation'] not in ('silu', 'situ'):
-        raise ValueError('activation must be silu or situ')
-    fn = deep_gemm.situ_and_mul if situ else deep_gemm.silu_and_mul
+    if args['activation'] not in ('silu', 'situ', 'silu_step'):
+        raise ValueError('activation must be silu, situ or silu_step')
+    fn = partial(activation_api, getattr(deep_gemm.ActivationMode, args['activation'].upper()))
     n = 256 if mode_name == 'FP8_BLOCK' else 128
     x = (torch.randn(3, 7, 2 * n, device='cuda') * 4).bfloat16()
     x[1, 0].zero_()
@@ -648,6 +649,9 @@ def test_checkin_activation(args, check_accuracy=True):
     if not check_accuracy:
         return
     value = situ_reference(x, 4., 25.) if situ else activation_reference(x, 2.)
+    if args['activation'] == 'silu_step':
+        gate, up = x.float().chunk(2, -1)
+        value = F.silu(gate).clamp(max=2.) * up.clamp(-2., 2.)
     if mode_name == 'BF16':
         actual, expected = dense, value.bfloat16()
     elif mode_name == 'FP8_CHANNEL':
@@ -677,9 +681,113 @@ def test_checkin_activation(args, check_accuracy=True):
     print(f'Passed activation={args["activation"]}, mode={mode_name}, masked/dense, {diff=}')
 
 
+def test_step_and_route_ids():
+    from quantization import quant_activation
+    for activation in (deep_gemm.ActivationMode.SILU, deep_gemm.ActivationMode.SITU,
+                       deep_gemm.ActivationMode.SILU_STEP):
+        for mode in (deep_gemm.QuantMode.BF16, deep_gemm.QuantMode.FP8_CHANNEL,
+                     deep_gemm.QuantMode.FP8_BLOCK, deep_gemm.QuantMode.MXFP4, deep_gemm.QuantMode.MXFP8):
+            for n in ((384,) if mode == deep_gemm.QuantMode.FP8_BLOCK else (34, 256)):
+                # Nonaligned input exercises the guarded loading path.
+                x = (torch.randn(2 * 19 * 2 * n + 1, device='cuda') * 4).bfloat16()[1:].view(2, 19, 2*n)
+                opts = {'beta': 4., 'linear_beta': 25.} if activation == deep_gemm.ActivationMode.SITU else {'swiglu_limit': 1.003}
+                gate, up = x.float().chunk(2, -1)
+                if activation == deep_gemm.ActivationMode.SITU:
+                    value = situ_reference(x, 4., 25.)
+                elif activation == deep_gemm.ActivationMode.SILU_STEP:
+                    value = F.silu(gate).clamp(max=1.) * up.clamp(-1., 1.)
+                else:
+                    value = activation_reference(x, 1.003)
+                for reorder in ((False, True) if mode == deep_gemm.QuantMode.MXFP4 else (None,)):
+                    options = dict(opts)
+                    if reorder is not None:
+                        options['reorder_scale'] = reorder
+                    api = partial(deep_gemm.activation_and_mul, activation, mode)
+                    dense = api(x, **options)
+                    ids = torch.arange(38, device='cuda', dtype=torch.int32).view(2, 19) % 4 - 1
+                    valid = ids >= 0
+                    routed = api(x, route_ids=ids, **options)
+                    def compare_valid(actual, expected, selected):
+                        aa = actual if isinstance(actual, tuple) else (actual,)
+                        bb = expected if isinstance(expected, tuple) else (expected,)
+                        for a, b in zip(aa, bb):
+                            if a.dtype == torch.float8_e4m3fn:
+                                a, b = a.view(torch.uint8), b.view(torch.uint8)
+                            if a.dtype == torch.uint16:
+                                a, b = a.int(), b.int()
+                            assert torch.equal(a[selected], b[selected])
+                    compare_valid(routed, dense, valid)
+                    counts = torch.tensor([0, 19], device='cuda', dtype=torch.int32)
+                    masked = deep_gemm.activation_and_mul_masked(activation, mode, x, counts, expected_m=1, **options)
+                    compare_valid(masked, dense, torch.arange(2, device='cuda')[:, None].expand(2, 19) == 1)
+                    if mode == deep_gemm.QuantMode.BF16:
+                        check(dense, value.bfloat16(), 'step BF16 reference')
+                    elif mode == deep_gemm.QuantMode.FP8_CHANNEL:
+                        q, sf = quant_activation(value)
+                        torch.testing.assert_close(dense[1], sf, rtol=2e-5, atol=1e-12)
+                        check(dense[0].float()*dense[1], q.float()*sf, 'step row FP8 reference')
+                    elif mode == deep_gemm.QuantMode.FP8_BLOCK:
+                        grouped = value.reshape(2, 19, n//128, 128)
+                        amax = grouped.abs().amax(-1).clamp_min(1e-10)
+                        sf = amax / 448.
+                        q = (grouped * (448./amax)[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+                        torch.testing.assert_close(dense[1], sf, rtol=2e-6, atol=1e-12)
+                        check(dense[0].float().reshape_as(grouped)*dense[1][..., None], q.float()*sf[..., None], 'step block FP8 reference')
+                    else:
+                        fp4 = mode == deep_gemm.QuantMode.MXFP4
+                        q, raw = reference(x, fp4, 0., value=value)
+                        sf = dense[1]
+                        if reorder:
+                            packed = sf.to(torch.int32)
+                            sf = torch.stack((packed & 255, packed >> 8), -1).flatten(-2)[..., :(n+31)//32].byte()
+                        assert torch.equal(sf, raw)
+                        check(decode(dense[0], sf, fp4), decode(q, raw, fp4), 'step MX reference')
+                    # Route decisions must be read again on graph replay.
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        replayed = api(x, route_ids=ids, **options)
+                    ids.fill_(-1)
+                    graph.replay()
+                    ids.fill_(0)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    compare_valid(replayed, dense, torch.ones_like(ids, dtype=torch.bool))
+    # Dense persistent slots: skipped rows must advance the async pipeline stage.
+    for mode in (deep_gemm.QuantMode.BF16, deep_gemm.QuantMode.FP8_CHANNEL,
+                 deep_gemm.QuantMode.FP8_BLOCK, deep_gemm.QuantMode.MXFP4, deep_gemm.QuantMode.MXFP8):
+        x = torch.randn(2, 1031, 512, device='cuda', dtype=torch.bfloat16)
+        ids = torch.arange(2062, device='cuda', dtype=torch.int32).view(2, 1031) % 3 - 1
+        api = partial(deep_gemm.activation_and_mul, deep_gemm.ActivationMode.SILU_STEP, mode,
+                      swiglu_limit=2.1)
+        dense = api(x)
+        routed = api(x, route_ids=ids)
+        for a, b in zip(routed if isinstance(routed, tuple) else (routed,),
+                        dense if isinstance(dense, tuple) else (dense,)):
+            if a.dtype == torch.float8_e4m3fn:
+                a, b = a.view(torch.uint8), b.view(torch.uint8)
+            if a.dtype == torch.uint16:
+                a, b = a.int(), b.int()
+            assert torch.equal(a[ids >= 0], b[ids >= 0])
+    x = torch.zeros(2, 128, device='cuda', dtype=torch.bfloat16)
+    for ids in (torch.zeros(2, dtype=torch.int32), torch.zeros(2, device='cuda'),
+                torch.zeros(3, device='cuda', dtype=torch.int32),
+                torch.zeros(4, device='cuda', dtype=torch.int32)[::2]):
+        try:
+            deep_gemm.activation_and_mul(deep_gemm.ActivationMode.SILU, deep_gemm.QuantMode.BF16, x, route_ids=ids)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('invalid route_ids accepted')
+    empty = x[:0]
+    assert deep_gemm.activation_and_mul(deep_gemm.ActivationMode.SILU_STEP, deep_gemm.QuantMode.BF16,
+                                       empty, route_ids=torch.empty(0, device='cuda', dtype=torch.int32)).shape == (0, 64)
+    print('PASS SILU_STEP, route_ids, masked low hints, graph replay and route validation')
+
+
 if __name__ == '__main__':
     torch.manual_seed(13)
     test_unified_api_contract()
+    test_step_and_route_ids()
     test_scale_arithmetic()
     test_mxfp4_fp32_rounding()
     test_bf16_clamp_boundary()

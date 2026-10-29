@@ -317,3 +317,6 @@ Activation,data_type:bf16,activation:situ,quant_mode:FP8_BLOCK
 Activation,data_type:bf16,activation:situ,quant_mode:MXFP8
 Activation,data_type:bf16,activation:situ,quant_mode:MXFP4
 Activation,data_type:bf16,activation:situ,quant_mode:MXFP4,reorder_scale:0
+Activation,data_type:bf16,activation:silu_step,quant_mode:BF16
+Activation,data_type:bf16,activation:silu_step,quant_mode:FP8_CHANNEL
+Activation,data_type:bf16,activation:silu_step,quant_mode:MXFP4

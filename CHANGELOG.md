@@ -41,12 +41,16 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   (PPU001). Converts INT4 to INT8 in-register for INT8 x INT8 MMA with INT32
   accumulation and BF16 output. Requires `K%32=0` and `N%8=0`; checkpoint weights
   need `preprocess_a8w4_weight` for the device-specific permutation.
-- **M890 standalone activation**: adds `silu_and_mul(mode, input, ...)`
-  and `situ_and_mul(mode, input, *, beta, ...)`, with a required first
-  `ActivationQuantMode` argument: `BF16`, `FP8_CHANNEL`, `FP8_BLOCK`,
-  `MXFP4`, or `MXFP8`. BF16 returns a tensor; quantized modes return values
-  and scales. Supports dense/batched inputs and masked expert inputs;
-  `expected_m` is a scheduling hint and never limits valid-row coverage.
+- **M890 standalone activation**: adds
+  `activation_and_mul(activation_mode, quant_mode, input, ...)` and
+  `activation_and_mul_masked(activation_mode, quant_mode, input, masked_m, ...)`.
+  Required `ActivationMode` selects `SILU`, `SITU`, or `SILU_STEP`; required
+  `QuantMode` selects `BF16`, `FP8_CHANNEL`, `FP8_BLOCK`, `MXFP4`, or `MXFP8`.
+  BF16 returns a tensor; quantized modes return values and scales.
+  Dense `route_ids` skips negative rows on device, including graph replay;
+  skipped values/scales are unspecified. Masked `expected_m` is a scheduling
+  hint and never limits valid-row coverage. `SILU_STEP` clamps after SiLU.
+  Replaces the `silu_and_mul` / `situ_and_mul` and `ActivationQuantMode` bindings.
 - **Activation quantization and execution**: supports FP32 per-row or
   group-128 FP8 scales, natural MXFP8 scales, and natural or reordered
   M-major MXFP4 scales. FP8-channel can fold a GEMM weight inverse into its
