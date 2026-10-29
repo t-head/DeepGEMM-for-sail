@@ -8,14 +8,16 @@
 #include <deep_gemm/tix/cp_async.cuh>
 
 namespace deep_gemm {
-template<bool Clamp>
+template<bool Clamp, bool Step = false>
 __device__ __forceinline__ float silu_and_mul_value(float gate, float up, float limit) {
     if constexpr (Clamp) {
         const float bound = float(cutlass::bfloat16_t(limit));
-        gate = fminf(gate, bound);
+        if constexpr (!Step) gate = fminf(gate, bound);
         up = fminf(fmaxf(up, -bound), bound);
     }
-    return (gate * __ppu_sgmdf(gate)) * up;
+    float activated = gate * __ppu_sgmdf(gate);
+    if constexpr (Clamp && Step) activated = fminf(activated, float(cutlass::bfloat16_t(limit)));
+    return activated * up;
 }
 
 __device__ __forceinline__ float situ_and_mul_value(float gate, float up, float beta, float linear_beta) {
@@ -58,7 +60,7 @@ __device__ __forceinline__ void activation_pack_fp8_eight(const float* values, f
 }
 
 // BF16 and group128 FP8 use one warp per 256 columns, eight elements per thread.
-template<int N, bool FP8Block, bool Situ, bool Masked, bool Clamp, bool VectorLoads>
+template<int N, bool FP8Block, bool Situ, bool Masked, bool Clamp, bool VectorLoads, bool RouteMasked, bool Step>
 __device__ void activation_tiled(const ActivationParams& p) {
     constexpr int Tiles = (N + 255) / 256;
     constexpr int Groups = N / 128;
@@ -82,6 +84,7 @@ __device__ void activation_tiled(const ActivationParams& p) {
     }
     for (int local_row = blockIdx.y; local_row < valid; local_row += gridDim.y) {
         const int64_t row = int64_t(expert) * p.rows_per_batch + local_row;
+        if constexpr (RouteMasked) if (p.masked_m[row] < 0) continue;
         alignas(16) cutlass::bfloat16_t gate[8], up[8];
         activation_load_eight<N, VectorLoads>(static_cast<const cutlass::bfloat16_t*>(p.input), row, col, gate, up);
         if constexpr (Clamp && !Situ) {
@@ -91,7 +94,7 @@ __device__ void activation_tiled(const ActivationParams& p) {
             auto* upv = reinterpret_cast<__ppu_bfloat162*>(up);
             #pragma unroll
             for (int j=0; j<4; ++j) {
-                gp[j] = __hmin2(gp[j],hi);
+                if constexpr (!Step) gp[j] = __hmin2(gp[j],hi);
                 upv[j] = __hmin2(__hmax2(upv[j],lo),hi);
             }
         }
@@ -100,7 +103,7 @@ __device__ void activation_tiled(const ActivationParams& p) {
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
             values[i] = Situ ? situ_and_mul_value(float(gate[i]), float(up[i]), p.beta, p.linear_beta)
-                             : silu_and_mul_value<false>(float(gate[i]), float(up[i]), p.limit);
+                             : silu_and_mul_value<Clamp && Step, Step>(float(gate[i]), float(up[i]), p.limit);
             if constexpr (FP8Block) maximum = fmaxf(maximum, fabsf(values[i]));
         }
         if constexpr (FP8Block) {
@@ -136,7 +139,7 @@ __device__ void activation_tiled(const ActivationParams& p) {
 
 namespace deep_gemm {
 // One CTA per row, eight consecutive columns per thread and work round.
-template<int N, int Threads, bool Situ = false, bool Clamp = false>
+template<int N, int Threads, bool Situ = false, bool Clamp = false, bool Step = false>
 __device__ void activation_fp8_channel_impl(const cutlass::bfloat16_t* input,
                                   cutlass::float_e4m3_t* output, float* scales,
                                   float weight_inv_scale, float limit, int64_t row, float beta = 1.0f, float linear_beta = 0.0f) {
@@ -153,7 +156,7 @@ __device__ void activation_fp8_channel_impl(const cutlass::bfloat16_t* input,
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const float value = Situ ? situ_and_mul_value(float(gate[i]), float(up[i]), beta, linear_beta)
-                                     : silu_and_mul_value<Clamp>(float(gate[i]), float(up[i]), limit);
+                                     : silu_and_mul_value<Clamp, Step>(float(gate[i]), float(up[i]), limit);
             values[r][i] = value;
             maximum = fmaxf(maximum, fabsf(value));
         }
@@ -206,7 +209,7 @@ __device__ __forceinline__ uint32_t pack_eight(const float* q) {
     return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
 }
 
-template<int N, bool Reordered, bool Masked, bool Clamp, bool VectorLoads, bool Situ, bool FP8>
+template<int N, bool Reordered, bool Masked, bool Clamp, bool VectorLoads, bool Situ, bool FP8, bool RouteMasked, bool Step>
 __device__ void run(const cutlass::bfloat16_t* input, void* output, uint8_t* scales,
                    int rows_per_batch, const int32_t* masked_m, int row_slots,
                    float limit, float beta, float linear_beta) {
@@ -228,7 +231,7 @@ __device__ void run(const cutlass::bfloat16_t* input, void* output, uint8_t* sca
     const auto* in = reinterpret_cast<const __ppu_bfloat16*>(input) + int64_t(expert) * rows_per_batch * (2*N);
     auto* out = static_cast<uint8_t*>(output) + int64_t(expert) * rows_per_batch * (FP8 ? N : N/2);
     auto load = [&](int stage, int64_t t) {
-        if (t < valid) {
+        if (t < valid && (!RouteMasked || masked_m[int64_t(expert) * rows_per_batch + t] >= 0)) {
             const auto* row = in + int64_t(t) * (2*N);
             if constexpr (VectorLoads) {
                 deep_gemm::tix::LdgSts128(gate_smem[stage][tid], row + col);
@@ -249,6 +252,12 @@ __device__ void run(const cutlass::bfloat16_t* input, void* output, uint8_t* sca
         load(1-compute_stage, t+row_slots);
         if constexpr (VectorLoads) deep_gemm::tix::LdgStsGroupWait<1>();
         __syncthreads();
+        if constexpr (RouteMasked) {
+            if (masked_m[int64_t(expert) * rows_per_batch + t] < 0) {
+                compute_stage = 1 - compute_stage;
+                continue;
+            }
+        }
         auto* gates = reinterpret_cast<__ppu_bfloat162*>(gate_smem[compute_stage][tid]);
         auto* ups = reinterpret_cast<__ppu_bfloat162*>(up_smem[compute_stage][tid]);
         float fp32[8], maximum = 0;
@@ -258,7 +267,7 @@ __device__ void run(const cutlass::bfloat16_t* input, void* output, uint8_t* sca
             if constexpr (Clamp && !Situ) {
                 const auto hi = __float2bfloat162_rn(limit);
                 const auto lo = __float2bfloat162_rn(-limit);
-                gate = __hmin2(gate,hi);
+                if constexpr (!Step) gate = __hmin2(gate,hi);
                 up = __hmin2(__hmax2(up,lo),hi);
             }
             const float g0 = __bfloat162float(__low2bfloat16(gate));
@@ -269,8 +278,8 @@ __device__ void run(const cutlass::bfloat16_t* input, void* output, uint8_t* sca
                 fp32[2*i] = situ_and_mul_value(g0,u0,beta,linear_beta);
                 fp32[2*i+1] = situ_and_mul_value(g1,u1,beta,linear_beta);
             } else {
-                fp32[2*i] = (g0 * __ppu_sgmdf(g0)) * u0;
-                fp32[2*i+1] = (g1 * __ppu_sgmdf(g1)) * u1;
+                fp32[2*i] = silu_and_mul_value<Clamp && Step, Step>(g0,u0,limit);
+                fp32[2*i+1] = silu_and_mul_value<Clamp && Step, Step>(g1,u1,limit);
             }
             maximum = fmaxf(maximum,fmaxf(fabsf(fp32[2*i]),fabsf(fp32[2*i+1])));
         }
@@ -336,21 +345,21 @@ __device__ void run(const cutlass::bfloat16_t* input, void* output, uint8_t* sca
 } // namespace deep_gemm::activation_mx
 
 namespace deep_gemm {
-template<int N, ActivationOutputMode Mode, bool Situ, bool Clamp>
+template<int N, QuantMode Mode, bool Situ, bool Clamp, bool Step>
 __device__ __forceinline__ void activation_quant_row(const ActivationParams& p, int64_t row) {
     const auto* input = static_cast<const cutlass::bfloat16_t*>(p.input);
-    if constexpr (Mode == ActivationOutputMode::FP8_CHANNEL)
-        activation_fp8_channel_impl<N, activation_fp8_channel_threads(N), Situ, Clamp>(input, static_cast<cutlass::float_e4m3_t*>(p.output),
+    if constexpr (Mode == QuantMode::FP8_CHANNEL)
+        activation_fp8_channel_impl<N, activation_fp8_channel_threads(N), Situ, Clamp, Step>(input, static_cast<cutlass::float_e4m3_t*>(p.output),
             static_cast<float*>(p.scales), p.weight_inv_scale, p.limit, row, p.beta, p.linear_beta);
 
 }
 
-template<int N, ActivationOutputMode Mode, bool Situ, bool Masked, bool Reordered, bool Clamp, bool VectorLoads>
+template<int N, QuantMode Mode, bool Situ, bool Masked, bool Reordered, bool Clamp, bool VectorLoads, bool RouteMasked, bool Step>
 __device__ void activation_quant(const ActivationParams& p) {
-    if constexpr (Mode == ActivationOutputMode::BF16 || Mode == ActivationOutputMode::FP8_BLOCK) {
-        activation_tiled<N, Mode == ActivationOutputMode::FP8_BLOCK, Situ, Masked, Clamp, VectorLoads>(p);
-    } else if constexpr (Mode == ActivationOutputMode::MXFP4 || Mode == ActivationOutputMode::MXFP8) {
-        activation_mx::run<N, Reordered, Masked, Clamp, VectorLoads, Situ, Mode == ActivationOutputMode::MXFP8>(
+    if constexpr (Mode == QuantMode::BF16 || Mode == QuantMode::FP8_BLOCK) {
+        activation_tiled<N, Mode == QuantMode::FP8_BLOCK, Situ, Masked, Clamp, VectorLoads, RouteMasked, Step>(p);
+    } else if constexpr (Mode == QuantMode::MXFP4 || Mode == QuantMode::MXFP8) {
+        activation_mx::run<N, Reordered, Masked, Clamp, VectorLoads, Situ, Mode == QuantMode::MXFP8, RouteMasked, Step>(
             static_cast<const cutlass::bfloat16_t*>(p.input), p.output, static_cast<uint8_t*>(p.scales),
             p.rows_per_batch, p.masked_m, p.row_slots, p.limit, p.beta, p.linear_beta);
     } else {
@@ -361,11 +370,12 @@ __device__ void activation_quant(const ActivationParams& p) {
             const int valid = p.masked_m[expert];
             for (int64_t local_row = slot; local_row < valid; local_row += p.row_slots) {
                 const int64_t row = int64_t(expert) * p.rows_per_batch + local_row;
-                activation_quant_row<N, Mode, Situ, Clamp>(p, row);
-                if constexpr (Mode == ActivationOutputMode::FP8_CHANNEL) __syncthreads();
+                activation_quant_row<N, Mode, Situ, Clamp, Step>(p, row);
+                if constexpr (Mode == QuantMode::FP8_CHANNEL) __syncthreads();
             }
         } else {
-            activation_quant_row<N, Mode, Situ, Clamp>(p, work);
+            if constexpr (RouteMasked) if (p.masked_m[work] < 0) return;
+            activation_quant_row<N, Mode, Situ, Clamp, Step>(p, work);
         }
     }
 }
