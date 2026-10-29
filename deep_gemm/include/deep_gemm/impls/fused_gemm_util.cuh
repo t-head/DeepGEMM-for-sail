@@ -97,6 +97,16 @@ struct GemmSmemConfigFp4 {
   static constexpr uint32_t kTotalSize = kSmemScaleOffset + kSmemSFASize + kSmemSFBSize;
 };
 
+// Full copies skip invalid rows; clear their shared slots once before the K loop.
+struct FusedACopyInst {
+  CUTE_HOST_DEVICE static void copy(const cutlass::uint128_t& src, cutlass::uint128_t& dst, bool valid) {
+    const uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&dst);
+    asm volatile("{\n.reg .pred p;\n"
+                 "ppu.setp.ne.u32 p, %2, 0;\n"
+                 "@p ppu.cp.async.ca.shared.global.LLC::128B [%0], [%1], 16;\n}"
+                 :: "r"(smem_addr), "l"(&src), "r"(uint32_t(valid)));
+  }
+};
 struct FusedAClearInst {
   CUTE_HOST_DEVICE static void copy(const cutlass::uint128_t&, cutlass::uint128_t& dst, bool valid) {
     if (!valid) dst = cutlass::uint128_t{};
@@ -127,11 +137,7 @@ __forceinline__ __device__ void copy_A_to_tsm(TAsA&& tAsA, const void* src_ptr, 
         const cutlass::uint128_t* src_ptr128 = reinterpret_cast<const cutlass::uint128_t*>(reinterpret_cast<const SrcT*>(src_ptr)
               + token_offset * STRIDE_AM + (k_iter * TILER_N) + tid_k * KPerThread + stage_offset);
         cutlass::uint128_t* dst_ptr128 = reinterpret_cast<cutlass::uint128_t*>(cute::raw_pointer_cast(tAsA(_,m_iter,k_iter).data()));
-        if constexpr (std::is_same_v<ACopyInst, cute::PPU_CP_ASYNC_CACHEALWAYS<cutlass::uint128_t>>) {
-          if (token_mask) ACopyInst::copy(*src_ptr128, *dst_ptr128);
-        } else {
-          ACopyInst::copy(*src_ptr128, *dst_ptr128, token_mask);
-        }
+        ACopyInst::copy(*src_ptr128, *dst_ptr128, token_mask);
       }
     }
   }
@@ -202,11 +208,7 @@ __forceinline__ __device__ void copy_A_to_tsm_impl(
             k_iter * Config::TILER_N + tid_k * Config::KPerThread + stage_offset);
         cutlass::uint128_t* dst_ptr128 = reinterpret_cast<cutlass::uint128_t*>(
             cute::raw_pointer_cast(tAsA(_,m_iter,k_iter).data()));
-        if constexpr (std::is_same_v<ACopyInst, cute::PPU_CP_ASYNC_CACHEALWAYS<cutlass::uint128_t>>) {
-          if (token_mask) ACopyInst::copy(*src_ptr128, *dst_ptr128);
-        } else {
-          ACopyInst::copy(*src_ptr128, *dst_ptr128, token_mask);
-        }
+        ACopyInst::copy(*src_ptr128, *dst_ptr128, token_mask);
       }
     }
   }

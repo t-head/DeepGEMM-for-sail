@@ -359,7 +359,7 @@ public:
             copy(gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,k_pipe));
           }
         } else { // async copy
-          deep_gemm::copy_A_to_tsm<ElementA, cute::PPU_CP_ASYNC_CACHEALWAYS<cutlass::uint128_t>, TilerA, BlockM, BlockK, K>(
+          deep_gemm::copy_A_to_tsm<ElementA, deep_gemm::FusedACopyInst, TilerA, BlockM, BlockK, K>(
               tAsA(_,_,_,k_pipe), params.ptr_a, token_offsets,
               BlockK * k_tile_iter, params.num_token, thread_idx,
               Int<MaxThreadsPerBlock>{});
