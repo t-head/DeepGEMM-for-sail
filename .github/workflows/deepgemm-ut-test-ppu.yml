@@ -6,13 +6,24 @@ on:
       matrix:
         required: false
         type: string
-        default: '["ZW-M890P", "OAM-810E"]'
+        default: '["ZW-M890P", "ZW-810E"]'
       source_mode:
         description: "Source layout mode. Supported values: deepgemm, actlize1.0.0."
         required: false
         type: string
         default: deepgemm
   workflow_dispatch:
+    inputs:
+      matrix:
+        description: "JSON array of PPU runner board types"
+        required: false
+        type: string
+        default: '["ZW-M890P", "ZW-810E"]'
+      source_mode:
+        description: "Source layout mode. Supported values: deepgemm, actlize1.0.0."
+        required: false
+        type: string
+        default: deepgemm
 
 permissions:
   contents: read
@@ -36,7 +47,7 @@ jobs:
       matrix:
         # Each board selects a functional caselist via run_checkin.py --suite.
         # Compile in isolated processes, then execute accuracy checks serially.
-        runner: [ZW-M890P, OAM-810E]
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "ZW-810E"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,7 +57,7 @@ jobs:
           persist-credentials: false
       - name: Build and Test on PPU
         id: ppu-test
-        uses: t-head/ppu-scheduler-action@main
+        uses: t-head/ci-infra/cluster-run@main
         with:
           image: ${{ env.SAIL_IMAGE }}
           container_options: |
