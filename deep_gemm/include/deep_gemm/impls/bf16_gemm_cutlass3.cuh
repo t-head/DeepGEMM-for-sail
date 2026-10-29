@@ -775,6 +775,8 @@ struct CollectiveMma<
 
   /// Perform a collective-scoped matrix multiply-accumulate
   template <
+    bool PeelFirstK = false,
+    bool StaticK256 = false,
     class... Ts,
     class FrgTensorD,
     class FrgTensorC,
@@ -902,8 +904,9 @@ struct CollectiveMma<
       copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
     }
 
-    CUTLASS_PRAGMA_NO_UNROLL
-    while (k_tile_count > -(DispatchPolicy::Stages)) {
+    // Keep one BK iteration implementation for normal, peeled and static-K
+    // schedules. Peeling exposes the zero accumulator to the first MMA.
+    auto process_k_tile = [&]() {
       // Pipeline the outer products with a static for loop.
       //
       // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
@@ -961,6 +964,19 @@ struct CollectiveMma<
         }
       }); // for_each
 
+    };
+    if constexpr (StaticK256) {
+      static_assert(PeelFirstK && std::is_same_v<ArchTag, cutlass::arch::PPU0010>);
+      CUTE_STATIC_ASSERT_V(size<2>(TileShape{}) == Int<64>{});
+      static_assert(DispatchPolicy::Stages == 2 || DispatchPolicy::Stages == 3);
+      for_each(make_int_sequence<4>{}, [&](auto) { process_k_tile(); });
+    } else {
+      if constexpr (PeelFirstK) {
+        CUTE_STATIC_ASSERT_V(K_BLOCK_MAX > Int<1>{});
+        if (k_tile_count > -(DispatchPolicy::Stages)) process_k_tile();
+      }
+      CUTLASS_PRAGMA_NO_UNROLL
+      while (k_tile_count > -(DispatchPolicy::Stages)) process_k_tile();
     }
 
     // TODO: original cutlass3 miss this sync
@@ -1508,3 +1524,168 @@ public:
 };  // namespace deep_gemm
 
 #pragma clang diagnostic pop
+
+namespace deep_gemm {
+
+struct Model810eReduceParams {
+    const float* partial;
+    void* d;
+    int64_t count;
+};
+
+template <typename Output, int Splits>
+__device__ void model_810e_reduce(const Model810eReduceParams p) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= p.count) return;
+    float value = 0.0f;
+    #pragma unroll
+    for (int s = 0; s < Splits; ++s)
+        value += p.partial[int64_t(s) * p.count + i];
+    // BF16 conversion occurs only after all FP32 split partials are summed.
+    static_cast<Output*>(p.d)[i] = Output(value);
+}
+
+
+template <class Mainloop, typename Output, int Splits>
+struct Model810eDenseKernel {
+    template <class Params>
+    CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
+        using namespace cute;
+        using Tile = typename Mainloop::TileShape;
+        using Mma = typename Mainloop::TiledMma;
+        constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{}), BK = size<2>(Tile{});
+        const int m = get<0>(p.problem_shape), n = get<1>(p.problem_shape);
+        const int k = get<2>(p.problem_shape);
+        const int mi = int(blockIdx.y), ni = int(blockIdx.x), split = int(blockIdx.z);
+        // Partition complete BK tiles. The API enforces K%BK=0 and at least one
+        // tile per split, so AIU never reads across a logical row's K boundary.
+        const int begin = ((k / BK) * split / Splits) * BK;
+        const int length = ((k / BK) * (split + 1) / Splits) * BK - begin;
+        auto problem = make_shape(m, n, length, 1);
+        auto coord = make_coord(mi, ni, _, 0);
+        Mainloop loop(p.mainloop, take<0, 3>(problem));
+        auto inputs = loop.load_init(problem, coord, p.mainloop, 0, 0,
+                                     p.mainloop.ptr_A + begin, p.mainloop.ptr_B + begin);
+        auto gA = get<0>(inputs);
+        auto residue = make_tuple(m - mi * BM, n - ni * BN,
+                                  length - size<1>(gA) * size<2>(gA));
+        Mma mma;
+        auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
+        clear(accum);
+        auto iter = make_coord_iterator(shape<2>(gA));
+        loop(accum, inputs, accum, iter, size<2>(gA), residue,
+             int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
+        auto coords = mma.get_slice(int(threadIdx.x)).partition_C(
+            make_identity_tensor(make_shape(Int<BM>{}, Int<BN>{})));
+        CUTE_UNROLL
+        for (int i = 0; i < size(accum); ++i) {
+            const int row = mi * BM + get<0>(coords(i));
+            const int col = ni * BN + get<1>(coords(i));
+            if (row < m && col < n) {
+                const int64_t offset = int64_t(row) * n + col;
+                if constexpr (Splits == 1)
+                    p.epilogue.ptr_D[offset] = Output(accum(i));
+                else
+                    static_cast<float*>(p.workspace)[int64_t(split) * m * n + offset] = accum(i);
+            }
+        }
+    }
+};
+
+template <class Mainloop>
+struct Model810eBatchedKernel {
+    template <class Params>
+    CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
+        using namespace cute;
+        using Tile = typename Mainloop::TileShape;
+        using Mma = typename Mainloop::TiledMma;
+        constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{});
+        const int m = get<0>(p.problem_shape), n = get<1>(p.problem_shape);
+        const int k = get<2>(p.problem_shape);
+        const int batch = int(blockIdx.z), mi = int(blockIdx.y), ni = int(blockIdx.x);
+        auto problem = make_shape(m, n, k, 1);
+        auto coord = make_coord(mi, ni, _, 0);
+        Mainloop loop(p.mainloop, take<0, 3>(problem));
+        auto inputs = loop.load_init(problem, coord, p.mainloop, 0, 0,
+            p.mainloop.ptr_A + int64_t(batch) * get<2>(p.mainloop.dA),
+            p.mainloop.ptr_B + int64_t(batch) * get<2>(p.mainloop.dB));
+        auto gA = get<0>(inputs);
+        auto residue = make_tuple(m - mi * BM, n - ni * BN,
+                                  k - size<1>(gA) * size<2>(gA));
+        Mma mma;
+        auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
+        clear(accum);
+        auto iter = make_coord_iterator(shape<2>(gA));
+        loop(accum, inputs, accum, iter, size<2>(gA), residue,
+             int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
+        // TiledMma supplies the 810E lane mapping; CUDA/890P formulas differ.
+        auto coords = mma.get_slice(int(threadIdx.x)).partition_C(
+            make_identity_tensor(make_shape(Int<BM>{}, Int<BN>{})));
+        CUTE_UNROLL
+        for (int i = 0; i < size(accum); ++i) {
+            const int row = mi * BM + get<0>(coords(i));
+            const int col = ni * BN + get<1>(coords(i));
+            if (row < m && col < n) {
+                const int64_t offset = int64_t(batch) * get<2>(p.epilogue.dD) +
+                                       int64_t(row) * get<0>(p.epilogue.dD) + col;
+                p.epilogue.ptr_D[offset] = cutlass::bfloat16_t(accum(i));
+            }
+        }
+    }
+};
+
+template <class Base, bool StaticK256 = false>
+struct Model810eFirstKPeel : Base {
+    using Base::Base;
+    template <class... Args>
+    CUTLASS_DEVICE void operator()(Args&&... args) {
+        Base::template operator()<true, StaticK256>(static_cast<Args&&>(args)...);
+    }
+};
+
+// Input descriptors retain the caller's row strides. Batch and split-K both
+// use grid.z, but only batch changes input bases; split-K changes the K interval.
+template <class Mainloop, class Epilogue, bool SplitK, int Splits, bool GridMFirst, bool StaticM36 = false>
+struct Model810eTsmKernel {
+    template <class Params>
+    CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
+        using namespace cute;
+        using Tile = typename Mainloop::TileShape;
+        using Mma = typename Mainloop::TiledMma;
+        constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{}), BK = size<2>(Tile{});
+        const int m = StaticM36 ? 36 : get<0>(p.problem_shape), n = StaticM36 ? 512 : get<1>(p.problem_shape);
+        const int k = StaticM36 ? 256 : get<2>(p.problem_shape), groups = get<3>(p.problem_shape);
+        const int mi = GridMFirst ? int(blockIdx.x) : int(blockIdx.y);
+        const int ni = GridMFirst ? int(blockIdx.y) : int(blockIdx.x);
+        const int zi = int(blockIdx.z);
+        const int begin = SplitK ? ((k / BK) * zi / Splits) * BK : 0;
+        const int length = SplitK ? ((k / BK) * (zi + 1) / Splits) * BK - begin : k;
+        const auto* ptr_a = p.mainloop.ptr_A + (SplitK ? int64_t(begin) : int64_t(zi) * get<2>(p.mainloop.dA));
+        const auto* ptr_b = p.mainloop.ptr_B + (SplitK ? int64_t(begin) : int64_t(zi) * get<2>(p.mainloop.dB));
+        const auto input_problem = make_shape(m, n, length, 1);
+        const auto input_coord = make_coord(mi, ni, _, 0);
+        Mainloop loop(p.mainloop, take<0, 3>(input_problem));
+        auto inputs = loop.load_init(input_problem, input_coord, p.mainloop, 0, 0, ptr_a, ptr_b);
+        auto gA = get<0>(inputs);
+        auto residue = make_tuple(m - mi * BM, n - ni * BN,
+                                  length - size<1>(gA) * size<2>(gA));
+        Mma mma;
+        auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
+        clear(accum);
+        auto iter = make_coord_iterator(shape<2>(gA));
+        loop(accum, inputs, accum, iter, size<2>(gA), residue,
+             int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
+
+        // The AIU mainloop ends with cp_async_wait<0>() and __syncthreads().
+        // Reuse its storage for the software-swizzled epilogue only after that
+        // barrier. These are fresh register writes, not reads of AIU data.
+        auto& epi_storage = *reinterpret_cast<typename Epilogue::SharedStorage*>(smem);
+        Epilogue epilogue{p.epilogue, epi_storage};
+        // Output strides and z coordinate are real. For split-K the host builds
+        // a FLOAT epilogue and D[splits,M,N], so no partial BF16 rounding occurs.
+        epilogue(make_shape(m, n, length, groups), Tile{}, make_coord(mi, ni, _, zi),
+                 accum, mma, residue, int(threadIdx.x), smem);
+    }
+};
+
+} // namespace deep_gemm

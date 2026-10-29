@@ -1,4 +1,6 @@
 #pragma once
+#include <array>
+#include <cstdint>
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
@@ -509,4 +511,132 @@ get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms) 
 
     return {num_min_sms, bm, bn, bk, wm, wn, bk, stages, best_smem_config};
 }
+// Exact 810E tiles selected from cold-cache measurements. Unmatched shapes
+// continue through the general BF16 heuristics. Tile fields are
+// BM, BN, BK, WM, WN, stages, split-K, then optional scheduling flags.
+enum class Model810eDispatchKind { Direct, TSM, Standard, Hybrid };
+enum class Model810eOutputType { BF16, FP32 };
+
+struct Model810eDispatchTile {
+    int bm, bn, bk, wm, wn, stages, splits;
+    int grid_m_first = 0;
+    int peel_first_k = 0;
+    int static_m36 = 0;
+    int static_k256 = 0;
+};
+
+struct Model810eDenseDispatchEntry {
+    int64_t m, n, k;
+    Model810eOutputType output;
+    Model810eDispatchKind kind;
+    Model810eDispatchTile tile;
+    // Hybrid divides only the M dimension; both halves cover the complete K.
+    int split_m = 0;
+    Model810eDispatchTile tail_tile{};
+};
+
+struct Model810eBatchDispatchEntry {
+    int64_t batch, m, n, k;
+    int64_t lhs_ld, rhs_ld, out_ld;
+    int64_t lhs_batch_stride, rhs_batch_stride, out_batch_stride;
+    Model810eOutputType output;
+    Model810eDispatchKind kind;
+    Model810eDispatchTile tile;
+};
+
+inline constexpr std::array<Model810eDenseDispatchEntry, 86> kModel810eDenseDispatch{{
+    {6, 128, 8192, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 32}},
+    {16, 64, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 64, 64, 16, 32, 2, 56}},
+    {16, 384, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 16}},
+    {16, 512, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 16}},
+    {16, 1024, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 8}},
+    {16, 2048, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 256, 16, 16, 3, 1}},
+    {32, 128, 6144, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 32}},
+    {32, 768, 6144, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 8}},
+    {32, 1536, 6144, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 4}},
+    {32, 6144, 384, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 128, 64, 32, 32, 2, 1}},
+    {32, 25008, 6144, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 128, 128, 16, 32, 3, 1}},
+    {32, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 128, 128, 16, 32, 3, 1}},
+    {36, 64, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 64, 64, 32, 32, 2, 32}},
+    {36, 128, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 32, 128, 16, 16, 3, 8}},
+    {36, 288, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {64, 64, 64, 32, 32, 2, 32}},
+    {36, 4096, 1536, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {36, 4096, 8192, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {36, 8192, 128, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 32, 32, 32, 2, 1}},
+    {36, 24576, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 2, 1}},
+    {36, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {40, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 32, 3, 1}},
+    {64, 96, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 2, 20}},
+    {64, 320, 10240, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 16}},
+    {64, 512, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 8}},
+    {64, 640, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 8}},
+    {64, 4864, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {64, 7168, 3584, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {64, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {140, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {148, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {152, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {160, 96, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 8}},
+    {160, 336, 10240, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 4}},
+    {160, 512, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 4}},
+    {160, 640, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 2}},
+    {160, 12800, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {160, 13312, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {160, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {192, 512, 8192, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 2, 10}},
+    {256, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {128, 128, 64, 32, 64, 2, 1}},
+    {288, 384, 5120, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {32, 64, 64, 16, 32, 3, 2}},
+    {288, 129280, 5120, Model810eOutputType::BF16, Model810eDispatchKind::Hybrid, {128, 128, 64, 32, 64, 2, 1}, 256, {32, 128, 64, 16, 32, 3, 1}},
+    {384, 64, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 16, 64, 16, 16, 3, 4}},
+    {384, 256, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 4}},
+    {384, 512, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 2}},
+    {384, 1024, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 1}},
+    {384, 2048, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 1}},
+    {4000, 128, 6144, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 3, 1}},
+    {4000, 768, 6144, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {64, 256, 64, 32, 64, 3, 1}},
+    {4000, 1536, 6144, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 2, 1}},
+    {4000, 3072, 6144, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {4000, 6144, 384, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {4000, 6144, 1024, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {4000, 6144, 1536, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {4096, 2112, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 2, 1}},
+    {4096, 6016, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1, 1, 1}},
+    {4096, 7168, 768, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {4096, 7168, 1536, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {4096, 7168, 3584, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {8192, 24, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 32, 64, 32, 32, 3, 1}},
+    {8192, 64, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {256, 64, 64, 64, 32, 3, 1}},
+    {8192, 256, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 2, 1}},
+    {8192, 320, 10240, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {256, 64, 64, 64, 32, 5, 1}},
+    {8192, 336, 10240, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 3, 1}},
+    {8192, 384, 7168, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 3, 1}},
+    {8192, 512, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {64, 128, 64, 32, 32, 3, 1}},
+    {8192, 512, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 3, 1}},
+    {8192, 512, 7168, Model810eOutputType::FP32, Model810eDispatchKind::Standard, {128, 128, 64, 32, 64, 3, 1}},
+    {8192, 640, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {8192, 2048, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {8192, 2048, 7168, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {8192, 10240, 320, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {8192, 10240, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {8192, 12800, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {16384, 8192, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {16384, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1, 1, 1}},
+    {19968, 512, 5120, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {32768, 4, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 16, 64, 16, 16, 3, 8}},
+    {32768, 128, 4096, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {128, 128, 64, 64, 32, 3, 1}},
+    {32768, 288, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 2, 1}},
+    {32768, 512, 128, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {32768, 1536, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {32768, 4096, 512, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1, 0, 1}},
+    {90112, 3072, 512, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {102400, 8192, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {102400, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {128, 128, 64, 32, 64, 2, 1}},
+}};
+inline constexpr std::array<Model810eBatchDispatchEntry, 4> kModel810eBatchDispatch{{
+    {64, 36, 256, 512, 32768, 512, 16384, 512, 131072, 256, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {64, 36, 512, 256, 16384, 256, 512, 256, 131072, 18432, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 2, 1, 0, 1, 1, 1}},
+    {64, 2048, 256, 512, 32768, 512, 16384, 512, 131072, 256, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {64, 2048, 512, 256, 16384, 256, 512, 256, 131072, 1048576, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+}};
+
 } // namespace deep_gemm_bf16_common
