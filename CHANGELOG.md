@@ -8,6 +8,24 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **BF16 x FP32 dense GEMM**: adds `bf16xfp32_gemm_nt` (alias `gemm_bf16xfp32`)
+  and `get_gemm_bf16xfp32_workspace`, compatible with the Tencent/hpc-ops
+  `gemm_bf16xfp32` API. Computes `D = x @ (w_high + w_low * scale)^T` on the
+  BF16 tensor cores with FP32 accumulation, where the FP32 weight is supplied
+  as two BF16 matrices (typically `scale = 1/256`, i.e. the BF16 high part plus
+  a scaled residual). Inputs are BF16 row-major `[m, k]` activations and
+  `[n, k]` weights (NT layout); output is BF16 or FP32 row-major `[m, n]`.
+  Zhenwu M890P (PPU1.5) uses a fused dual-B cute-free kernel: a single
+  interleaved K pipeline per output tile carries A + W_high + W_low in every
+  stage (A is streamed once), two back-to-back MMAs per k-step feed two FP32
+  accumulators that are combined in registers and stored once (mirroring the
+  hpc-ops SMEM layout); stage counts are pruned to the per-CU SMEM budget and
+  m = 1/2 dispatch to the dedicated GEMV kernel as two passes composed in
+  FP32. Other PPU devices fall back to two BF16 GEMMs composed through an
+  FP32 intermediate. The `use_splitk` and
+  `split_flag` arguments are accepted for API compatibility: this build
+  performs no K-split, so the int32 workspace `[ceil(max_tokens/16),
+  ceil(n/64)]` is never written and stays zero. Requires `N % 2 == 0`.
 - **Mega-mHC for DeepSeek V4.1 Flash**: adds `mega_mhc` for fused shifted
   mHC computation on Zhenwu M890P, with `hc_mult=4`, hidden size
   `5120`, and BF16 output. Writes the updated residual, mix coefficients,
