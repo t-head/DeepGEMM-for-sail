@@ -78,9 +78,8 @@ from .deep_gemm_cpp import (
     # MoE kernels
     moe_align_block_size,
     # SiLU / SiTU activation with explicit output mode and optional quantization
-    ActivationQuantMode,
-    silu_and_mul,
-    situ_and_mul,
+    ActivationMode, QuantMode,
+    activation_and_mul, activation_and_mul_masked,
     # Unified weight preprocessing
     preprocess_weights_and_scales,
     # deprecated scale-only alias of preprocess_weights_and_scales(MXFP4, False)

@@ -5,7 +5,7 @@ import deep_gemm
 from utils import test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, set_acc_check, parse_deepgemm_string_re
 from utils import is_ppu1v5_device
 
-def test_ks_ke():
+def test_ks_ke(check_accuracy=True):
     # Single INT8 case: seq_len_q=1 with ks != 0, manually constructed (not via test_mqa_logits).
     # Verifies the kernel correctly offsets into KV when the valid window does not start at 0.
     # Only q[0, 0, 0]=1 and k[4, 0]=5 are non-zero, so logits[0, 4] = relu(1*5) * 1 * 1 = 5.
@@ -26,12 +26,14 @@ def test_ks_ke():
     ref = (scores.relu() * weights[:, :, None]).sum(dim=1)  # [1, 6]
     ref = ref * k_scale[None, :]
     actual = deep_gemm.int8_mqa_logits(q, (k, k_scale), weights, ks, ke, clean_logits=False)
+    if not check_accuracy:
+        return
     torch.testing.assert_close(actual[0, 4].float(), ref[0, 4].float(), rtol=1e-3, atol=1e-3)
     print(f'  INT8 ks!=0 case: expected[0,4]={ref[0, 4].item():.4f}, actual[0,4]={actual[0, 4].item():.4f}')
     print("Passed\n")
 
 
-def test_per_layer_cache_view():
+def test_per_layer_cache_view(check_accuracy=True):
     num_kv_blocks, block_kv, num_heads, head_dim = 8, 64, 32, 128
     num_layers = 4
     max_context_len = num_kv_blocks * block_kv
@@ -56,12 +58,14 @@ def test_per_layer_cache_view():
         logits = deep_gemm.int8_paged_mqa_logits(
             q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
             max_context_len, clean_logits=False, logits_dtype=torch.float32)
-        return int((((logits.float().cpu()[0] / (head_dim * v * s)) - 1).abs() < 0.005).sum())
+        if check_accuracy:
+            valid = int((((logits.float().cpu()[0] / (head_dim * v * s)) - 1).abs() < 0.005).sum())
+            assert valid == max_context_len
 
     fused_kv_cache = torch.zeros(num_kv_blocks, block_kv * (head_dim + 4),
                                  dtype=torch.uint8, device='cuda')
     fused_kv_cache.copy_(page)
-    assert check(fused_kv_cache.view(num_kv_blocks, block_kv, 1, head_dim + 4)) == max_context_len
+    check(fused_kv_cache.view(num_kv_blocks, block_kv, 1, head_dim + 4))
 
     fused_kv_cache = torch.zeros(num_kv_blocks, num_layers, block_kv * (head_dim + 4),
                                  dtype=torch.uint8, device='cuda')
@@ -69,7 +73,7 @@ def test_per_layer_cache_view():
     fused_kv_cache = fused_kv_cache[:, 3].view(num_kv_blocks, block_kv, 1, head_dim + 4)
     assert fused_kv_cache.view(num_kv_blocks, block_kv, head_dim + 4).storage_offset() \
         == 3 * block_kv * (head_dim + 4)
-    assert check(fused_kv_cache) == max_context_len
+    check(fused_kv_cache)
 
 
 
@@ -215,6 +219,169 @@ def test_sparse_mqa_logits_loop():
     print("Passed\n")
 
 
+def test_sparse_workspace():
+    """Check sparse workspace lifetime across graph replay and larger eager calls.
+
+    Packed FP4 inputs use an exact analytic logits reference. Metadata is also
+    checked against the existing sparse schedule reference on two streams.
+    """
+    if not is_ppu1v5_device():
+        print('Skipping sparse workspace: requires PPU1.5')
+        return
+    from utils import decode_sparse_metadata, ref_paged_sparse_metadata, verify_paged_sparse_metadata
+
+    PAGE_KV = 128
+    BLOCK_KV = 8
+    TOPK_BLOCKS = 32
+    NUM_PAGES = 32
+
+    class PagedCase:
+        def __init__(self, rows, phase=0):
+            self.rows = rows
+            self.q = (
+                torch.full((rows, 1, 32, 64), 0x22, dtype=torch.int8, device="cuda"),
+                torch.full((rows, 1, 32), 0x7F7F7F7F, dtype=torch.int32, device="cuda"),
+            )
+            self.weights = torch.full((rows, 32), 1 / 32, dtype=torch.bfloat16, device="cuda")
+            # Fused page: all packed K payloads followed by all scale words.
+            # E2M1 code 2 = 1, code 4 = 2; E8M0 byte 127 = scale 1.
+            storage = torch.empty((NUM_PAGES, PAGE_KV * 68), dtype=torch.uint8, device="cuda")
+            for page in range(NUM_PAGES):
+                storage[page, : PAGE_KV * 64].fill_(0x22 if page % 2 == 0 else 0x44)
+            storage[:, PAGE_KV * 64 :].fill_(0x7F)
+            self.kv = storage.view(NUM_PAGES, PAGE_KV, 1, 68)
+            self.lens = torch.empty(rows, dtype=torch.int32, device="cuda")
+            self.table = torch.empty((rows, 9), dtype=torch.int32, device="cuda")
+            self.blocks = torch.empty((rows, TOPK_BLOCKS), dtype=torch.int32, device="cuda")
+            self.requests = torch.tensor([i // 3 for i in range(rows)], dtype=torch.int32, device="cuda")
+            self.update(phase)
+
+        def update(self, phase):
+            boundaries = [127, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025]
+            lens = [boundaries[(i + phase) % len(boundaries)] for i in range(self.rows)]
+            # Same request => identical table rows, including a pair crossing a page.
+            tables = [[(j * 7 + (i // 3) * 3 + phase) % NUM_PAGES for j in range(9)]
+                      for i in range(self.rows)]
+            blocks, counts, expected, valid = [], [], [], []
+            for length, table in zip(lens, tables):
+                available = (length + BLOCK_KV - 1) // BLOCK_KV
+                count = min(available, TOPK_BLOCKS)
+                selected = list(range(count))
+                if available > count:
+                    selected[-1] = available - 1
+                blocks.append(selected + [0] * (TOPK_BLOCKS - count))
+                counts.append(count)
+                row_expected, row_valid = [], []
+                for slot in range(TOPK_BLOCKS):
+                    block = blocks[-1][slot]
+                    physical_page = table[block // (PAGE_KV // BLOCK_KV)]
+                    for token in range(BLOCK_KV):
+                        row_expected.append(128 * (1 + physical_page % 2))
+                        row_valid.append(slot < count and block * BLOCK_KV + token < length)
+                expected.append(row_expected)
+                valid.append(row_valid)
+            self.lens.copy_(torch.tensor(lens, dtype=torch.int32))
+            self.table.copy_(torch.tensor(tables, dtype=torch.int32))
+            self.blocks.copy_(torch.tensor(blocks, dtype=torch.int32))
+            self.counts = counts
+            self.expected = torch.tensor(expected, dtype=torch.bfloat16)
+            self.valid = torch.tensor(valid, dtype=torch.bool)
+
+        def run(self):
+            metadata = deep_gemm.get_paged_sparse_mqa_logits_metadata(
+                self.lens, self.table, self.requests, PAGE_KV,
+                self.blocks, torch.int8, BLOCK_KV,
+            )
+            logits = deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
+                self.q, self.kv, self.weights, metadata, TOPK_BLOCKS, BLOCK_KV,
+            )
+            return metadata, logits
+
+        def check(self, outputs):
+            metadata, logits = outputs
+            ref = ref_paged_sparse_metadata(
+                self.blocks, self.counts, self.lens, self.table, self.requests,
+                PAGE_KV, BLOCK_KV, TOPK_BLOCKS,
+            )
+            verify_paged_sparse_metadata(
+                decode_sparse_metadata(metadata, BLOCK_KV), ref, self.rows, self.requests,
+            )
+            actual = logits[:, : TOPK_BLOCKS * BLOCK_KV].cpu()
+            torch.testing.assert_close(actual[self.valid], self.expected[self.valid], rtol=0, atol=0)
+
+
+    def capture(case, stream):
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                case.run()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = case.run()
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        case.check(outputs)
+        return graph, outputs
+
+    print("device:", torch.cuda.get_device_name(), "DeepGemm:", deep_gemm.__file__, flush=True)
+    torch.cuda.init()
+    first, second = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(first):
+        small_a = PagedCase(9)
+    with torch.cuda.stream(second):
+        small_b = PagedCase(13, phase=3)
+    first.synchronize()
+    second.synchronize()
+    graph_a, output_a = capture(small_a, first)
+    graph_b, output_b = capture(small_b, second)
+    print("PASS: capture + exact logits/metadata reference on two streams", flush=True)
+
+    # 2048 query rows exceed either captured case's old workspace allocation.
+    # Release the eager intermediates and keep allocator churn alive through replay.
+    with torch.cuda.stream(first):
+        large = PagedCase(2048, phase=5)
+        large_outputs = large.run()
+    first.synchronize()
+    large.check(large_outputs)
+    del large_outputs, large
+    torch.cuda.synchronize()
+    churn = [torch.full((384 + rows * 8,), 0xA5, dtype=torch.uint8, device="cuda")
+             for rows in (9, 13, 512, 2048)]
+    torch.cuda.synchronize()
+    print("PASS: 2048-row eager call after small captures", flush=True)
+
+    for phase in range(20):
+        with torch.cuda.stream(first):
+            small_a.update(phase)
+            graph_a.replay()
+        with torch.cuda.stream(second):
+            small_b.update(phase + 3)
+            graph_b.replay()
+        first.synchronize()
+        second.synchronize()
+        small_a.check(output_a)
+        small_b.check(output_b)
+    assert len(churn) == 4
+    print("PASS: 40 replays, changing lengths/page mappings, exact metadata + logits", flush=True)
+
+    cold_stream = torch.cuda.Stream()
+    with torch.cuda.stream(cold_stream):
+        cold_case = PagedCase(3)
+    cold_stream.synchronize()
+    try:
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=cold_stream):
+            cold_case.run()
+    except RuntimeError as error:
+        assert "Warm up sparse MQA metadata" in str(error), str(error)
+    else:
+        raise AssertionError("First workspace allocation during capture must be rejected")
+    graph_c, output_c = capture(cold_case, cold_stream)
+    cold_case.check(output_c)
+    print("PASS: cold capture rejected; warmup then capture/replay succeeds", flush=True)
+
+
+
 def test_nvtx():
     print('Testing nvtx dump:')
     import torch.cuda.nvtx as nvtx
@@ -242,3 +409,4 @@ if __name__ == '__main__':
     test_paged_mqa_logits_loop()
     test_mqa_avg_logits_loop()
     test_sparse_mqa_logits_loop()
+    test_sparse_workspace()

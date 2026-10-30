@@ -30,6 +30,75 @@ def test_grouped_gemm():
         runners[args['gemm_type']](args)
 
 
+def test_inv_scale():
+    def compare(call, lhs, shape, name, valid_mask=None):
+        for inverse in (1.0, .03125, .3, 2.0):
+            reference = torch.full(shape, -123., device='cuda', dtype=torch.bfloat16)
+            output = torch.full_like(reference, -123.)
+            call((lhs[0], lhs[1] * inverse), reference)
+            call(lhs, output, inv_scale=inverse)
+            assert torch.equal(output, reference), (name, inverse)
+            if valid_mask is not None:
+                assert (output[~valid_mask] == -123.).all(), (name, inverse, "padding overwritten")
+        for inverse in (0., -1., float('inf'), float('nan')):
+            try:
+                call(lhs, output, inv_scale=inverse)
+            except RuntimeError as error:
+                assert 'inv_scale must be finite and positive' in str(error)
+            else:
+                raise AssertionError(f'accepted invalid {inverse=}')
+        print(f'PASS inv_scale {name}: folded-scale equivalence and invalid values')
+
+    counts = [0, 1, 17, 65]
+    rows = torch.tensor(counts, device='cuda', dtype=torch.int32)
+    indices = torch.repeat_interleave(torch.arange(4, device='cuda', dtype=torch.int32), rows.long())
+    sms = deep_gemm.get_num_sms()
+    # Cover uncached scales, resident A with cached scales, and K-warp reduction.
+    for k, config in [(128, (sms, 16, 256, 128, 16, 64, 128, 2, 1)),
+                      (384, (sms, 64, 256, 128, 64, 64, 128, 2, 3)),
+                      (256, (sms, 32, 128, 128, 32, 64, 64, 2, 1))]:
+        n = 768
+        packed = torch.randint(256, (4, n, k//2), device='cuda', dtype=torch.uint8)
+        raw = torch.randint(109, 125, (4, n, k//32), device='cuda', dtype=torch.uint8)
+        raw[0, 0, 0] = 109
+        rhs = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+        assert rhs[2] == .03125
+        lhs = quant_activation(torch.randn(sum(counts), k, device='cuda', dtype=torch.bfloat16))
+        def nopad(a, out, **kwargs):
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(a, rhs[:2], out, indices, rows, config, **kwargs)
+        compare(nopad, lhs, (sum(counts), n), f'nopad {k=} {config=}')
+        out = torch.empty(sum(counts), n, device='cuda', dtype=torch.bfloat16)
+        nopad(lhs, out, inv_scale=rhs[2])
+        start = 0
+        for expert, count in enumerate(counts):
+            if count:
+                a = lhs[0][start:start+count].float() * lhs[1][start:start+count]
+                ref = (a @ decode_weight(packed[expert], raw[expert]).T).bfloat16()
+                assert calc_diff(out[start:start+count], ref) < .0015
+            start += count
+
+    lhs, rhs, routes, out, _ = utils.construct_non_permute_grouped(
+        8, 17, 256, 192, 3, 'w4fa8_mma', 'group', 32)
+    config, counts, experts, tokens, aligned, _, _ = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routes)
+    def fused(a, output, **kwargs):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+            a, rhs, output, counts, experts, tokens, aligned, config, **kwargs)
+    compare(fused, lhs, tuple(out.shape), 'fused gather and repeated token use')
+
+    k, n, capacity = 256, 192, 67
+    packed = torch.randint(256, (4, n, k//2), device='cuda', dtype=torch.uint8)
+    raw = torch.full((4, n, k//32), 127, device='cuda', dtype=torch.uint8)
+    rhs = deep_gemm.preprocess_weights_and_scales(
+        deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+    lhs = quant_activation(torch.randn(4, capacity, k, device='cuda', dtype=torch.bfloat16))
+    rows = torch.tensor([0, 1, 33, 67], device='cuda', dtype=torch.int32)
+    def masked(a, output, **kwargs):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(a, rhs[:2], output, rows, 25, **kwargs)
+    valid = torch.arange(capacity, device='cuda')[None, :] < rows[:, None]
+    compare(masked, lhs, (4, capacity, n), 'masked valid rows and untouched padding', valid)
+
+
 def test_nopad_expert_limit():
     # The count-preprocessing kernel has storage for at most 32 warps.
     for groups in (1024, 1025):
@@ -399,6 +468,7 @@ if __name__ == '__main__':
 
     if is_ppu1v5_device():
         test_grouped_gemm()
+        test_inv_scale()
         test_nopad_expert_limit()
         test_nopad_n_expand()
         test_nopad_resident_a_and_scales()

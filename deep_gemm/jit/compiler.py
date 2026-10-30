@@ -10,6 +10,7 @@ from typing import Tuple
 from . import interleave_ffma
 from .runtime import Runtime, RuntimeCache
 from .template import typename_map
+from .. import PPU_HOME
 
 runtime_cache = RuntimeCache()
 
@@ -53,26 +54,26 @@ def get_deep_gemm_version() -> str:
 @functools.lru_cache(maxsize=None)
 def get_hgcc_compiler() -> Tuple[str, str]:
     """Find hgcc compiler path and version.
-    Checks DG_JIT_HGCC_COMPILER env var first, then falls back to PPU_SDK default path.
+    Checks DG_JIT_HGCC_COMPILER first, then uses the SDK selected by the package.
     """
     paths = []
     if os.getenv('DG_JIT_HGCC_COMPILER'):
         paths.append(os.getenv('DG_JIT_HGCC_COMPILER'))
-    # Default PPU SDK hgcc path
-    paths.append('/usr/local/PPU_SDK/bin/hgcc')
+    # Use the same SDK as package initialization and the C++ JIT.
+    paths.append(os.path.join(PPU_HOME, 'bin', 'hgcc'))
 
-    version_pattern = re.compile(r'version (\d+\.\d+)')
+    version_pattern = re.compile(r'(?:release|version)\s+(\d+\.\d+(?:\.\d+)?)', re.IGNORECASE)
     for path in paths:
         if os.path.exists(path):
             try:
-                output = os.popen(f'{path} --version 2>&1').read()
+                output = subprocess.check_output([path, '--version'], stderr=subprocess.STDOUT, text=True)
                 match = version_pattern.search(output)
                 version = match.group(1) if match else 'unknown'
             except Exception:
                 version = 'unknown'
             return path, version
     raise RuntimeError('Cannot find any available hgcc compiler. '
-                       'Set DG_JIT_HGCC_COMPILER or ensure /usr/local/PPU_SDK/bin/hgcc exists.')
+                       f'Set DG_JIT_HGCC_COMPILER or ensure {PPU_HOME}/bin/hgcc exists.')
 
 
 @functools.lru_cache(maxsize=None)

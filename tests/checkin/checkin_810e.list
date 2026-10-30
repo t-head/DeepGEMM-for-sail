@@ -1,0 +1,157 @@
+# DeepGEMM PR check-in caselist for Zhenwu 810E
+# Run with: python tests/run_deep_gemm.py --caselist tests/checkin/checkin_810e.list
+# Minimal per-type correctness set: each gemm type / dtype keeps a small number of
+# representative shapes only. FP4/FP8 and W4A16 MXFP4 MMA require 890P.
+# W4A16 INT4 and MXFP4 VALU paths are covered on both 810E and 890P.
+# MQA coverage focuses on INT8, plus one BF16 smoke case.
+# Sections are split per UT type; append new cases under the matching section.
+
+# ============ DenseGemm ============
+
+# --- DenseGemm / bf16 ---
+# Small M with N/K tails, retained from the legacy shape sweep.
+DenseGemm,data_type:bf16,m:64,n:2112,k:576
+DenseGemm,data_type:bf16,m:2048,n:4096,k:7168
+DenseGemm,data_type:bf16,m:2048,n:512,k:7168
+DenseGemm,data_type:bf16,m:256,n:4096,k:7168
+DenseGemm,data_type:bf16,m:256,n:512,k:7168
+
+# --- DenseGemm / int8 ---
+# Small M with N/K tails, retained from the legacy shape sweep.
+DenseGemm,data_type:int8,m:64,n:2112,k:576
+DenseGemm,data_type:int8,m:2048,n:4096,k:7168
+DenseGemm,data_type:int8,m:2048,n:512,k:7168
+
+# --- DenseGemm / bf16_bf16_fp32 ---
+DenseGemm,data_type:bf16_bf16_fp32,m:2048,n:4096,k:7168
+DenseGemm,data_type:bf16_bf16_fp32,m:132,n:3072,k:1536
+DenseGemm,data_type:bf16_bf16_fp32,m:2,n:8192,k:7168
+
+# ============ HcPrenormGemm ============
+
+HcPrenormGemm,data_type:tf32,m:3,n:24,k:16384
+HcPrenormGemm,data_type:tf32,m:16,n:24,k:28672
+HcPrenormGemm,data_type:tf32,m:24,n:24,k:20480
+HcPrenormGemm,data_type:tf32,m:32,n:24,k:16384
+HcPrenormGemm,data_type:tf32,m:60,n:24,k:20480
+HcPrenormGemm,data_type:tf32,m:128,n:24,k:16384
+HcPrenormGemm,data_type:tf32,m:1248,n:24,k:20480
+HcPrenormGemm,data_type:tf32,m:4096,n:24,k:16384
+HcPrenormGemm,data_type:tf32,m:8192,n:24,k:28672
+HcPrenormGemm,data_type:tf32,m:8192,n:24,k:16384
+HcPrenormGemm,data_type:tf32,m:9984,n:24,k:20480
+HcPrenormGemm,data_type:tf32,m:64,n:8,k:128
+HcPrenormGemm,data_type:tf32,m:64,n:16,k:128
+HcPrenormGemm,data_type:tf32,m:1024,n:32,k:64
+
+# ============ BatchGemm ============
+
+# --- BatchGemm / int8 ---
+BatchGemm,data_type:int8,groups:128,m:64,n:128,k:512,quant_type:channel,expr:bhr,hdr->bhd
+BatchGemm,data_type:int8,groups:128,m:4096,n:128,k:512,quant_type:channel,expr:bhr,hdr->bhd
+BatchGemm,data_type:int8,groups:128,m:64,n:512,k:128,quant_type:channel,expr:bhr,hdr->bhd
+BatchGemm,data_type:int8,groups:128,m:4096,n:512,k:128,quant_type:channel,expr:bhr,hdr->bhd
+BatchGemm,data_type:int8,groups:8,m:64,n:1024,k:4096,quant_type:channel,expr:bhr,hdr->bhd
+BatchGemm,data_type:int8,groups:8,m:4096,n:1024,k:4096,quant_type:channel,expr:bhr,hdr->bhd
+BatchGemm,data_type:int8,groups:16,m:64,n:1024,k:4096,quant_type:channel,expr:bhr,hdr->bhd
+BatchGemm,data_type:int8,groups:16,m:4096,n:1024,k:4096,quant_type:channel,expr:bhr,hdr->bhd
+# Alternate batch output layout (groups=h, m=b, n=d, k=r).
+BatchGemm,data_type:int8,groups:8,m:32,n:128,k:512,quant_type:channel,expr:bhr,hdr->hbd
+
+# ============ GroupedMasked ============
+
+# --- GroupedMasked / int8 ---
+GroupedMasked,data_type:int8,groups:16,m:4096,n:1024,k:7168,em:256,distribution:zipf
+GroupedMasked,data_type:int8,groups:256,m:65536,n:4096,k:7168,em:256,distribution:uniform
+# SBO overlap and signal checks.
+GroupedMasked,data_type:int8,groups:4,m:1024,n:4096,k:7168,em:256,enable_sbo_overlap:true
+
+# --- GroupedMasked / bf16 ---
+GroupedMasked,data_type:bf16,groups:16,m:4096,n:4096,k:7168,em:12,distribution:zipf
+GroupedMasked,data_type:bf16,groups:16,m:4096,n:4096,k:7168,em:12,distribution:[45,200,30,18,13,21,31,3,5,17,17,16,18,15,18,13]
+# SBO overlap and signal checks.
+GroupedMasked,data_type:bf16,groups:4,m:1024,n:4096,k:7168,em:256,enable_sbo_overlap:true
+
+# --- GroupedMasked / w4a8_int8 (INT8 activation / packed INT4 weight) ---
+GroupedMasked,data_type:w4a8_int8,groups:16,m:4096,n:4096,k:7168,em:12,distribution:normal
+GroupedMasked,data_type:w4a8_int8,groups:4,m:256,n:512,k:32,em:100
+
+# --- GroupedMasked / w4a16 ---
+GroupedMasked,data_type:w4a16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
+
+# --- GroupedMasked / w4fa16 (MXFP4 VALU) ---
+GroupedMasked,data_type:w4fa16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
+
+# ============ GroupedNoPad ============
+
+# --- GroupedNoPad / bf16 ---
+GroupedNoPad,data_type:bf16,groups:16,m:4096,n:4096,k:7168,distribution:gaussian
+GroupedNoPad,data_type:bf16,groups:16,m:8,n:512,k:128,distribution:uniform
+GroupedNoPad,data_type:bf16,groups:16,m:8,n:512,k:1024,distribution:uniform
+GroupedNoPad,data_type:bf16,groups:128,m:1088,n:384,k:4096,em:9,distribution:[1,30,1,1,1,5,1,7,0,1,3,0,2,21,0,34,1,44,5,1,7,1,0,8,0,36,1,2,1,3,2,0,1,21,0,9,4,44,3,1,1,2,15,0,0,1,10,1,2,0,3,3,2,36,0,2,45,1,2,0,86,0,0,0,2,4,0,0,1,0,1,3,2,31,0,58,0,1,0,0,0,0,15,1,2,0,17,61,1,4,0,0,1,2,16,3,3,1,2,1,0,0,0,2,85,0,1,0,1,41,10,1,0,39,0,10,0,3,3,0,12,0,55,1,1,1,16,58]
+
+# --- GroupedNoPad / int8 ---
+GroupedNoPad,data_type:int8,groups:32,m:4096,n:4096,k:7168,em:128,distribution:uniform
+GroupedNoPad,data_type:int8,groups:16,m:8,n:512,k:128,distribution:uniform
+GroupedNoPad,data_type:int8,groups:16,m:8,n:512,k:1024,distribution:uniform
+
+# --- GroupedNoPad / w4a8_int8 (INT8 activation / packed INT4 weight) ---
+GroupedNoPad,data_type:w4a8_int8,groups:16,m:4096,n:4096,k:7168,distribution:zipf
+GroupedNoPad,data_type:w4a8_int8,groups:4,m:128,n:512,k:160,distribution:normal
+GroupedNoPad,data_type:w4a8_int8,groups:16,m:8,n:512,k:6144,distribution:normal
+GroupedNoPad,data_type:w4a8_int8,groups:16,m:16,n:6144,k:256,distribution:normal
+
+# --- GroupedNoPad / w4a16 ---
+GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
+
+# --- GroupedNoPad / w4fa16 (MXFP4 VALU) ---
+GroupedNoPad,data_type:w4fa16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32
+
+# ============ GroupedContiguous ============
+
+# --- GroupedContiguous / bf16 ---
+GroupedContiguous,data_type:bf16,groups:16,m:4096,n:4096,k:7168,distribution:gaussian
+GroupedContiguous,data_type:bf16,groups:32,m:8192,n:2048,k:2048,distribution:uniform
+
+# --- GroupedContiguous / int8 ---
+GroupedContiguous,data_type:int8,groups:4,m:128,n:512,k:1024,distribution:uniform
+
+# ============ GroupedFused ============
+
+# --- GroupedFused / bf16 ---
+GroupedFused,data_type:bf16,groups:256,num_token:256,topk:8,n:6144,k:128
+GroupedFused,data_type:bf16,groups:256,num_token:4096,topk:8,n:6144,k:128
+GroupedFused,data_type:bf16,groups:256,num_token:64,topk:8,n:256,k:6144
+
+# --- GroupedFused / int8 ---
+GroupedFused,data_type:int8,groups:256,num_token:2048,topk:8,n:6144,k:128
+GroupedFused,data_type:int8,groups:256,num_token:256,topk:8,n:256,k:6144
+
+# --- GroupedFused / w4a16 ---
+GroupedFused,data_type:w4a16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_type:group,group_size:32
+
+# --- GroupedFused / w4fa16 (MXFP4 VALU) ---
+GroupedFused,data_type:w4fa16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_type:group,group_size:32
+
+# ============ MqaLogits ============
+
+# --- MqaLogits / int8 ---
+MqaLogits,data_type:int8,seq_len_q:8191,seq_len_kv:8191,num_heads:64,head_dim:128
+MqaLogits,data_type:int8,seq_len_q:4096,seq_len_kv:8192,num_heads:64,head_dim:128,compressed_logits:1
+MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,logits_dtype:bf16,weights_dtype:bf16
+
+# --- MqaLogits / bf16 ---
+MqaLogits,data_type:bf16,seq_len_q:512,seq_len_kv:3072,num_heads:64,head_dim:128
+
+# ============ PagedMqaLogits ============
+
+# --- PagedMqaLogits / bf16 ---
+# Empty and partial pages.
+PagedMqaLogits,data_type:bf16,batch_size:4,next_n:1,num_heads:32,head_dim:128,distribution:[0,1,63,128],page_kv:64,logits_dtype:fp32
+
+# --- PagedMqaLogits / int8 ---
+PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,avg_context_len:2048
+PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:32
+PagedMqaLogits,data_type:int8,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1]
+PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,logits_dtype:bf16,weights_dtype:bf16
+PagedMqaLogits,data_type:int8,batch_size:64,next_n:4,num_heads:64,head_dim:128,avg_context_len:8192

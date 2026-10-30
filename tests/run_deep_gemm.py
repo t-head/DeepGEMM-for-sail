@@ -7,7 +7,8 @@ import deep_gemm
 from utils import parse_deepgemm_string_re, read_cmds_from_file, get_arch_version
 from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad, test_m_grouped_gemm_fused
 from utils import test_hc_prenorm_gemm, test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, test_mega_mhc
-from utils import set_acc_check, set_benchmark
+from utils import test_batch_gemm
+from utils import get_acc_check, set_acc_check, set_benchmark
 from utils import judge_device_type, set_ref_backend
 import atexit
 
@@ -19,6 +20,9 @@ def device_version_supported(one_case):
     caselist can run on both PPU1.0 and PPU1.5.
     """
     data_type = one_case.get('data_type')
+    if one_case.get('gemm_type') == 'Activation' or data_type in ('w4fa16_mma', 'w4fa8_mma'):
+        if get_arch_version() < 89:
+            return False, 'Activation and W4 MMA require PPU1.5 (sm_89) or later'
     if one_case.get('gemm_type') == 'MegaMhc':
         if get_arch_version() != 89 or 'M890' not in torch.cuda.get_device_name():
             return False, 'Mega-mHC requires Zhenwu M890P (sm_89)'
@@ -35,6 +39,24 @@ def device_sync_at_exit():
         torch.cuda.synchronize()
         print("Device synchronized on exit.")
 atexit.register(device_sync_at_exit)
+
+
+def run_attention_regression(args):
+    from test_attention import test_ks_ke, test_per_layer_cache_view
+    functions = {'ks_ke': test_ks_ke, 'cache_view': test_per_layer_cache_view}
+    return functions[args['case']](check_accuracy=get_acc_check())
+
+
+def run_preprocessing_regression(args):
+    from test_fp4_core import test_mxfp4_preprocessing
+    return test_mxfp4_preprocessing(check_accuracy=get_acc_check())
+
+
+def run_activation_regression(args):
+    from test_activation import test_checkin_activation
+    return test_checkin_activation(args, check_accuracy=get_acc_check())
+
+
 def call_test_func(gemm_type, func_args):
     supported_call_funcs = {
         "GroupedContiguous": test_m_grouped_gemm_contiguous,
@@ -53,6 +75,10 @@ def call_test_func(gemm_type, func_args):
         "SparseMqaLogits": test_sparse_mqa_logits,
         "PagedSparseMqaLogits": test_sparse_mqa_logits,
         "MegaMhc": test_mega_mhc,
+        "BatchGemm": test_batch_gemm,
+        "AttentionRegression": run_attention_regression,
+        "Preprocess": run_preprocessing_regression,
+        "Activation": run_activation_regression,
     }
 
     if gemm_type in supported_call_funcs.keys():
@@ -60,8 +86,7 @@ def call_test_func(gemm_type, func_args):
         judge_device_type()
         return test_func(func_args)
     else:
-        print("invalid test function\n")
-        exit(1)
+        raise ValueError(f"Unsupported test function: {gemm_type}")
 
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -78,14 +103,16 @@ if __name__ == '__main__':
     parser.add_argument('--format',  type=str, default=None, help="Case cmd to describe problem size.")
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the folder of DG cases')
     parser.add_argument('--case_idx', default=None, type=int, required=False, help='the line index(1~line) of case in caselist file')
+    parser.add_argument("--require_supported", action="store_true", help="Fail if a case is unsupported on this device")
     parser.add_argument("--disable_acc", action="store_true", help="if or not open accuracy check")
     parser.add_argument('--benchmark', default=False, action="store_true", required=False, help='specify if run benchmark')
     parser.add_argument('--ref_backend', default="device", type=str, required=False, choices=["host", "device"], help='specify the backend used to compute ref output')
 
     args = parser.parse_args()
-    set_benchmark(args.benchmark)
+    warm_up = bool(os.environ.get("HGGC_WARM_UP"))
+    set_benchmark(args.benchmark and not warm_up)
     set_ref_backend(args.ref_backend)
-    if args.disable_acc:
+    if args.disable_acc or warm_up:
         set_acc_check(0)
     dg_cases = list()
     if args.format:
@@ -113,14 +140,20 @@ if __name__ == '__main__':
         supported, reason = device_version_supported(one_case)
         if not supported:
             skipped.append((idx + 1, reason))
+            if args.require_supported:
+                failures.append((idx + 1, reason))
             print(f"> Skipped (device version gate): {reason}\n", flush=True)
             continue
         try:
             call_test_func(one_case['gemm_type'], one_case)
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             failures.append((idx + 1, str(e)))
             print(f"❌ Test {idx + 1} failed with error: {e}")
             del e  # release traceback-held tensors immediately
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    executed = total - len(skipped)
+    print(f"Summary: total={total}, executed={executed}, skipped={len(skipped)}, failures={len(failures)}, warm_up={warm_up}")
+    sys.exit(1 if failures or executed == 0 else 0)

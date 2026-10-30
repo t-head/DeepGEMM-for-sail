@@ -545,7 +545,29 @@ def tune_gemm_config(
 
     return best_config
 
-import ray
+try:
+    import ray
+except ImportError:
+    # Inference-only installs do not need the Ray autotuner. Keep the module
+    # importable so SGLang can load DeepGEMM without installing Ray.
+    class _RayStub:
+        @staticmethod
+        def remote(*args, **kwargs):
+            if len(args) == 1 and callable(args[0]) and not kwargs:
+                return args[0]
+
+            def decorator(obj):
+                return obj
+
+            return decorator
+
+        @staticmethod
+        def _unavailable(*args, **kwargs):
+            raise RuntimeError("Ray is required for DeepGEMM autotuning")
+
+        init = available_resources = get = _unavailable
+
+    ray = _RayStub()
 
 
 @ray.remote(num_gpus=1)

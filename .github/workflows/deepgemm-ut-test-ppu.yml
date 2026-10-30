@@ -6,13 +6,24 @@ on:
       matrix:
         required: false
         type: string
-        default: '["ZW-M890P", "OAM-810E"]'
+        default: '["ZW-M890P", "ZW-810E"]'
       source_mode:
         description: "Source layout mode. Supported values: deepgemm, actlize1.0.0."
         required: false
         type: string
         default: deepgemm
   workflow_dispatch:
+    inputs:
+      matrix:
+        description: "JSON array of PPU runner board types"
+        required: false
+        type: string
+        default: '["ZW-M890P", "ZW-810E"]'
+      source_mode:
+        description: "Source layout mode. Supported values: deepgemm, actlize1.0.0."
+        required: false
+        type: string
+        default: deepgemm
 
 permissions:
   contents: read
@@ -27,17 +38,16 @@ jobs:
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
-    # The command covers pip installs, the full bdist_wheel build and every
-    # case in the board's caselist. First runs compile all JIT kernels on a
-    # cold cache (test_core ~2580s, tile_scan comparable on ZW810E), so keep
-    # the job ceiling well above the expected total.
+    # The command includes setup, wheel construction, parallel cold-cache JIT
+    # compilation and serial accuracy checks. Retain the existing ceiling
+    # until board measurements establish a smaller end-to-end limit.
     timeout-minutes: 480
     strategy:
       fail-fast: false
       matrix:
-        # Each runner selects its command group (same key) from
-        # scripts/testcase.json via pr-deepgemm-ut.py --suite.
-        runner: [ZW-M890P, OAM-810E]
+        # Each board selects a functional caselist via run_checkin.py --suite.
+        # Compile in isolated processes, then execute accuracy checks serially.
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "ZW-810E"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,7 +57,7 @@ jobs:
           persist-credentials: false
       - name: Build and Test on PPU
         id: ppu-test
-        uses: t-head/ppu-scheduler-action@main
+        uses: t-head/ci-infra/cluster-run@main
         with:
           image: ${{ env.SAIL_IMAGE }}
           container_options: |
@@ -56,9 +66,8 @@ jobs:
           nproc_per_node: 1
           node_selector: "board-type=${{ matrix.runner }}"
           namespace: ppu-sched
-          # Ceiling for the whole command (env setup + build + all cases).
-          # Expected totals grow with the per-case cold-cache ceilings in
-          # pr-deepgemm-ut.py; 420min leaves headroom over the observed runs.
+          # Ceiling for environment setup, wheel build and both check-in phases.
+          # Each case also has a separate timeout in run_checkin.py.
           timeout_minutes: 420
           command: |
             set -ex
@@ -126,9 +135,9 @@ jobs:
             pip install ./dist/*.whl --force-reinstall
             echo "START TO TEST CASES"
             set +e
-            python .github/workflows/scripts/pr-deepgemm-ut.py \
-              --caselist .github/workflows/scripts/testcase.json \
-              --suite ${{ matrix.runner }}
+            python tests/checkin/run_checkin.py \
+              --suite ${{ matrix.runner }} \
+              --compile-workers 16
             TEST_EXIT_CODE=$?
             python3 .github/workflows/scripts/generate-env-info.py \
             --docker-image "${{ env.SAIL_IMAGE }}" \
@@ -138,6 +147,7 @@ jobs:
             mkdir -p "$NAS_RESULT_DIR"
             cp test-results.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
+            cp -r checkin-logs "$NAS_RESULT_DIR/" 2>/dev/null || true
             exit "$TEST_EXIT_CODE"
           cleanup_policy: on_success
 

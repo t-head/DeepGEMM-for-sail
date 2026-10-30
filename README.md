@@ -153,8 +153,10 @@ scales, and a scalar `weight_inv_scale`.
 It applies a common power-of-two shift to bring weight-scale exponents into
 `[114,140]` when necessary. Exponent codes 0 and 255, and exponent ranges
 spanning more than 26, are rejected. The returned inverse must be applied
-to the activation row scales exactly once per GEMM; the E4M3 codes remain
-unchanged:
+exactly once per GEMM. Either fold it into the activation row scales or pass
+it as the optional scalar `inv_scale` to any of the three W4FA8 GEMM APIs.
+`inv_scale` must be finite and positive; its default value of `1.0` skips
+the extra multiplication. The E4M3 codes remain unchanged:
 
 ```python
 import deep_gemm as dg
@@ -162,12 +164,13 @@ import deep_gemm as dg
 # packed_weight and raw_weight_scale are checkpoint tensors described above.
 _, weight_scale, weight_inv_scale = dg.preprocess_weights_and_scales(
     dg.PreprocessMode.W4A8_MXFP4_MMA, False, weight_scale=raw_weight_scale)
-lhs = (a_e4m3, row_scale * weight_inv_scale)
+lhs = (a_e4m3, row_scale)
 rhs = (packed_weight, weight_scale)
 config, rows, experts, tokens, aligned, inv_perm, m_indices = dg.moe_align_block_size(
     a_e4m3, packed_weight, topk_ids)
 dg.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
-    lhs, rhs, out, rows, experts, tokens, aligned, config)
+    lhs, rhs, out, rows, experts, tokens, aligned, config,
+    inv_scale=weight_inv_scale)
 ```
 
 The fused path gathers activations and their scales with the same token
@@ -243,10 +246,11 @@ Masked/nopad follow the standard grouped GEMM argument semantics described above
 
 #### Standalone SiLU / SiTU activation (M890)
 
-The activation interfaces are `silu_and_mul(mode, input, *, ...)` and
-`situ_and_mul(mode, input, *, beta, linear_beta=None, ...)`. The first
-`mode` argument is **required** and must be an `ActivationQuantMode`;
-omitting it, passing None, or using the old `quant=` keyword is unsupported.
+The interfaces are `activation_and_mul(activation_mode, quant_mode, input, *, ...)`
+and `activation_and_mul_masked(activation_mode, quant_mode, input, masked_m, *, ...)`.
+Both mode arguments are required: `ActivationMode` selects `SILU`, `SITU`, or
+`SILU_STEP`; `QuantMode` selects the output type. The old `silu_and_mul`,
+`situ_and_mul`, and `ActivationQuantMode` bindings have been removed.
 Input is contiguous BF16 `[...,2*N]` in concatenated `[gate,up]` order.
 
 | Mode | Output | Scales / constraints |
@@ -271,25 +275,34 @@ and padding scale rows zeroed.
 ```python
 import deep_gemm as dg
 
-M = dg.ActivationQuantMode
-bf16 = dg.silu_and_mul(M.BF16, gate_up)
-fp8, block_scale = dg.silu_and_mul(M.FP8_BLOCK, gate_up, swiglu_limit=2.1)
+A, Q = dg.ActivationMode, dg.QuantMode
+bf16 = dg.activation_and_mul(A.SILU, Q.BF16, gate_up)
+fp8, block_scale = dg.activation_and_mul(
+    A.SILU_STEP, Q.FP8_BLOCK, gate_up, swiglu_limit=2.1, route_ids=route_ids)
+masked_bf16 = dg.activation_and_mul_masked(
+    A.SILU_STEP, Q.BF16, expert_gate_up, masked_m, expected_m=expected_m)
 # SiTU with gate/up softcaps; down_inv is the GEMM2 weight_inv_scale.
-q, row_scale = dg.situ_and_mul(
-    M.FP8_CHANNEL, gate_up, beta=4.0, linear_beta=25.0,
+q, row_scale = dg.activation_and_mul(
+    A.SITU, Q.FP8_CHANNEL, gate_up, beta=4.0, linear_beta=25.0,
     weight_inv_scale=down_inv)
 # row_scale already includes down_inv and is passed directly to W4A8 GEMM2.
 ```
 
 For masked inputs use BF16 `[E,T,2*N]` and contiguous device int32
-`masked_m` of shape `[E]`. Both APIs accept `masked_m=masked_m` and an
+`masked_m` of shape `[E]` through `activation_and_mul_masked`, with an
 optional `expected_m` hint. The hint only chooses the number of row slots;
 the device loops over all valid rows, including when the hint is smaller
 than the actual count. Output values are written only in valid rows.
 
+The dense entry point accepts optional contiguous device int32 `route_ids`
+with one entry per input row (any shape). Negative IDs skip the row; skipped
+values/scales are unspecified. IDs are checked on device on every call or graph replay.
+
 SiLU computes `gate * sigmoid(gate) * up`. Optional positive
 `swiglu_limit` clamps gate from above and up on both sides. Clamp boundaries
-round to BF16; activation, multiplication, amax, scale computation and
+round to BF16. `SILU_STEP` instead clamps `SiLU(gate)` from above before
+multiplying by the clamped up. None or zero disables clipping in either mode.
+Activation, multiplication, amax, scale computation and
 normalization use FP32 with native PPU sigmoid. SiTU uses
 `beta*tanh(gate/beta)*sigmoid(gate)` for the gate and optionally
 `linear_beta*tanh(up/linear_beta)` for up; beta and a supplied linear_beta

@@ -104,7 +104,7 @@ def test_gemm(args):
     print(f"Passed with acc_check. diff: {diff}\n")
 
 
-def test_mxfp4_preprocessing():
+def test_mxfp4_preprocessing(check_accuracy=True):
     for device in ('cpu', 'cuda'):
         for prefix in ((5,), (2, 5)):
             for groups in (1, 3, 4):
@@ -129,7 +129,8 @@ def test_mxfp4_preprocessing():
                     assert default is None
                     for result in (actual, scale_only, omitted, deep_gemm.preprocess_mxfp4_scales(scale=scale)):
                         assert result.dtype == expected.dtype and result.shape == expected.shape
-                        assert result.stride() == expected.stride() and torch.equal(result.cpu(), expected)
+                        if check_accuracy:
+                            assert result.stride() == expected.stride() and torch.equal(result.cpu(), expected)
         try:
             preprocess_weights_and_scales(PreprocessMode.MXFP4, False)
         except RuntimeError:
