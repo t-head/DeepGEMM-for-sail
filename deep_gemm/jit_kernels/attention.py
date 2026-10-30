@@ -472,7 +472,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
                             block_table: torch.Tensor,
                             schedule_meta: torch.Tensor,
                             max_context_len: int,
-                            clean_logits: bool = True,
+                            clean_logits: bool = False,
                             logits_dtype: torch.dtype = torch.float32,
                             q_sf: Optional[torch.Tensor] = None):
     """Paged MQA logits for FP8/BF16/INT8/FP4.
@@ -482,10 +482,14 @@ def paged_mqa_logits_common(q: torch.Tensor,
                FP8/BF16/INT8: [batch, next_n, num_heads, head_dim], dtype = float8_e4m3fn/bfloat16/int8
                FP4:           [batch, next_n, num_heads, head_dim_packed], dtype = int8
                               where head_dim_packed = original_head_dim // 2 = 64
-        fused_kv_cache: fused KV cache, uint8
-               FP8/BF16/INT8: [num_kv_blocks, block_kv, 1, head_dim + scale_bytes]
-               FP4:           [num_kv_blocks, block_kv, 1, head_dim_packed + scale_bytes]
-               Per-row layout: [values (head_dim or head_dim_packed bytes), scale (scale_bytes bytes)]
+        fused_kv_cache:
+               FP8/INT8: uint8 [num_kv_blocks, block_kv, 1, head_dim + 4]
+               FP4:      uint8 [num_kv_blocks, block_kv, 1, head_dim_packed + 4]
+               Each quantized page stores all rows' values first, then all rows' scales:
+               [block_kv * value_bytes][block_kv * 4 scale bytes]. The shape is a storage
+               view, not an interleaved per-row layout. FP8/INT8 scales are float32;
+               FP4 scales are packed UE8M0 (int32).
+               BF16: bfloat16 [num_kv_blocks, block_kv, 1, head_dim], without scales.
         weights:       [batch * next_n, num_heads], float32 or bfloat16.
                        An empty tensor (numel == 0) selects the avg variant (aligned with PAI,
                        no per-Q-row scale): logits = sum_h(relu(q·k)) * k_scale / sqrt(head_dim)
@@ -493,7 +497,7 @@ def paged_mqa_logits_common(q: torch.Tensor,
         block_table:   int32 [batch_size, max_block_len]
         schedule_meta: int32 [num_blocks+1, 2]
         max_context_len: maximum context length
-        clean_logits:  whether to mask out-of-range logits with -inf
+        clean_logits:  must be False; 2D context_lens requires external masking
         logits_dtype:  output logits dtype, torch.float32 or torch.bfloat16
         q_sf:  UE8M0 scale for Q (FP4 only), int32 [batch, next_n, num_heads]
                Packed from uint8 e8m0 (4×uint8 per int32). None for FP8/BF16/INT8.
@@ -678,7 +682,7 @@ def bf16_paged_mqa_logits(q: torch.Tensor,
                           block_table: torch.Tensor,
                           schedule_meta: torch.Tensor,
                           max_context_len: int,
-                          clean_logits: bool = True,
+                          clean_logits: bool = False,
                           logits_dtype: torch.dtype = torch.float32):
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype=logits_dtype)
 
@@ -689,7 +693,7 @@ def fp8_paged_mqa_logits(q: torch.Tensor,
                          block_table: torch.Tensor,
                          schedule_meta: torch.Tensor,
                          max_context_len: int,
-                         clean_logits: bool = True,
+                         clean_logits: bool = False,
                          logits_dtype: torch.dtype = torch.float32):
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype=logits_dtype)
 
@@ -715,7 +719,7 @@ def int8_paged_mqa_logits(q: torch.Tensor,
                          block_table: torch.Tensor,
                          schedule_meta: torch.Tensor,
                          max_context_len: int,
-                         clean_logits: bool = True,
+                         clean_logits: bool = False,
                          logits_dtype: torch.dtype = torch.float32):
     return paged_mqa_logits_common(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype=logits_dtype)
 

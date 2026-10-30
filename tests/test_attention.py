@@ -194,6 +194,76 @@ def test_mqa_avg_logits_loop():
     print("Passed\n")
 
 
+def test_fp4_paged_mqa_avg_logits_loop():
+    if not is_ppu1v5_device():
+        print('Skipping FP4 paged AVG MQA logits: requires PPU1.5')
+        return
+    print('Testing FP4 Paged Avg MQA Logits:')
+    set_acc_check(True)
+    for logits_dtype in ('fp32', 'bf16'):
+        for next_n in (1, 4, 5, 6):
+            for page_kv in (32, 64, 128):
+                # Empty/short requests, both sides of page boundaries, and
+                # a partial final KV128 split. next_n=5/6 needs a second group of four Qs.
+                contexts = [513, 1, page_kv + 1, 0, page_kv - 1, 2 * page_kv + 3, page_kv]
+                case = (f'PagedMqaAvgLogits,data_type:fp4,batch_size:{len(contexts)},'
+                        f'next_n:{next_n},num_heads:4,head_dim:128,distribution:{contexts},'
+                        f'page_kv:{page_kv},max_context_len:1024,logits_dtype:{logits_dtype}')
+                test_paged_mqa_logits(parse_deepgemm_string_re(case))
+        # A single request checks the final padded Q tile without a following
+        # request's Q allocation that could accidentally satisfy an invalid load.
+        case = (f'PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:6,'
+                f'num_heads:4,head_dim:128,distribution:[129],page_kv:128,'
+                f'max_context_len:256,logits_dtype:{logits_dtype}')
+        test_paged_mqa_logits(parse_deepgemm_string_re(case))
+        # There are four CTAs/CU and one split per request in this configuration.
+        # More than two requests/CTA forces Q reloads within a running CTA,
+        # covering both the 16-column and 32-column padded Q layouts.
+        batch_size = 8 * deep_gemm.get_num_sms() + 1
+        for next_n, page_kv in ((1, 128), (4, 64), (5, 32), (6, 32)):
+            case = (f'PagedMqaAvgLogits,data_type:fp4,batch_size:{batch_size},next_n:{next_n},'
+                    f'num_heads:4,head_dim:128,avg_context_len:17,page_kv:{page_kv},'
+                    f'max_context_len:128,logits_dtype:{logits_dtype},check_request_switch:1')
+            test_paged_mqa_logits(parse_deepgemm_string_re(case))
+        # Mix empty, one-split and multi-split requests: advance through several
+        # KV iterations for one Q, skip empty requests, then reload the next Q.
+        case = (f'PagedMqaAvgLogits,data_type:fp4,batch_size:{batch_size},next_n:6,'
+                f'num_heads:4,head_dim:128,context_pattern:[17,0,129,257,65,513],page_kv:128,'
+                f'max_context_len:1024,logits_dtype:{logits_dtype},check_request_switch:1')
+        test_paged_mqa_logits(parse_deepgemm_string_re(case))
+    print("Passed\n")
+
+
+
+def test_fp4_paged_mqa_avg_rejects_incompatible_metadata():
+    if not is_ppu1v5_device():
+        print('Skipping FP4 paged AVG metadata validation: requires PPU1.5')
+        return
+    # The old four-field metadata tuple also describes FP8 with real D64.
+    # Omitting the new selector must be rejected before the FP4 AVG kernel
+    # interprets an old split64 schedule as split128.
+    q = torch.zeros((1, 1, 4, 64), device='cuda', dtype=torch.int8)
+    q_sf = torch.full((1, 1, 4), 0x7f7f7f7f, device='cuda', dtype=torch.int32)
+    cache = torch.zeros((2, 64 * 68), device='cuda', dtype=torch.uint8)
+    cache[:, 64 * 64:] = 127  # Packed UE8M0 unit scales after the page's K values.
+    cache = cache.view(2, 64, 1, 68)
+    contexts = torch.tensor([[65]], device='cuda', dtype=torch.int32)
+    table = torch.tensor([[1, 0]], device='cuda', dtype=torch.int32)
+    num_sms = deep_gemm.get_num_sms()
+    for kwargs in ({}, {'metadata_extra': (1, 4, 64, 1), 'is_fp4': False}):
+        metadata = deep_gemm.get_paged_mqa_logits_metadata(contexts, 64, num_sms, **kwargs)
+        assert metadata.size(0) != num_sms * 4 + 1, 'case must use incompatible metadata'
+        try:
+            deep_gemm.fp8_fp4_paged_mqa_avg_logits(
+                (q, q_sf), cache, contexts, table, metadata, 128)
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            assert 'metadata' in message or 'schedule' in message, str(exc)
+        else:
+            raise AssertionError('FP4 AVG must reject incompatible metadata before launching')
+    print('FP4 paged AVG rejects both incompatible metadata paths\n')
+
+
 def test_sparse_mqa_logits_loop():
     if not is_ppu1v5_device():
         print('Skipping sparse MQA logits: requires PPU1.5')
@@ -408,5 +478,7 @@ if __name__ == '__main__':
     test_mqa_logits_loop()
     test_paged_mqa_logits_loop()
     test_mqa_avg_logits_loop()
+    test_fp4_paged_mqa_avg_logits_loop()
+    test_fp4_paged_mqa_avg_rejects_incompatible_metadata()
     test_sparse_mqa_logits_loop()
     test_sparse_workspace()
