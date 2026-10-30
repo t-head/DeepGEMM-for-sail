@@ -4,10 +4,20 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
-## Unreleased
+## 2.1.0 — Unreleased
 
 ### Added
 
+- **W4A4 MegaMoE**: adds the complete MXFP4 routed MoE pipeline with BF16
+  output on PPU1.5, validated on ZW-M890P. Exports workspace allocation,
+  weight transformation, input preparation and `fp4_fp4_mega_moe` through
+  `deep_gemm.mega` and the package root. Supports SwiGLU, Step, SiTU and
+  separate UltraEP replica weight banks; original routing weights are applied
+  once in combine. Reusable workspaces manage communication and scratch state,
+  including empty ranks and graph replay. Includes correctness tests and optional
+  DeepEP benchmarks.
+  See the [calling contract](README.md#megamoe) and
+  [test guide](tests/README.MD#routed-moe-correctness-and-performance-tests).
 - **Mega-mHC for DeepSeek V4.1 Flash**: adds `mega_mhc` for fused shifted
   mHC computation on Zhenwu M890P, with `hc_mult=4`, hidden size
   `5120`, and BF16 output. Writes the updated residual, mix coefficients,

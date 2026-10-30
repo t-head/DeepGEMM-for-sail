@@ -17,6 +17,9 @@ import xml.etree.ElementTree as ET
 
 import run_checkin
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'daily'))
+import run_daily
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -85,7 +88,6 @@ class ParserTests(unittest.TestCase):
             (root / 'part.list').write_text('# no tests\n')
             with self.assertRaisesRegex(ValueError, 'Empty'):
                 run_checkin.load_cases(root / 'part.list')
-
 
 
 class ReusableWorkerTests(unittest.TestCase):
@@ -191,31 +193,30 @@ class ScriptChecksTests(unittest.TestCase):
                         self.assertEqual(json.loads((root / 'runner-args.json').read_text()),
                                          ['--suite', suite, '--compile-workers', '16'])
 
-    def test_daily_retains_original_script_and_tile_commands_verbatim(self):
-        original = json.loads((ROOT / '.github/workflows/scripts/testcase.json').read_text())
-        for suite, scripts in (
-            ('OAM-810E', ['test_core.py', 'test_attention.py']),
-            ('ZW-M890P', ['test_core.py', 'test_fp4_core.py', 'test_fp8_core.py', 'test_attention.py']),
-        ):
+    def test_daily_retains_script_and_tile_commands(self):
+        for suite in run_daily.DAILY_SUITES:
             with self.subTest(suite=suite):
-                selected = run_checkin.load_script_checks(suite)
-                expected = [f'python ./tests/{script}' for script in scripts]
-                expected += [cmd for cmd in original[suite] if 'tests/tile_scan_with_test.py' in cmd]
-                self.assertEqual(selected, expected)
-                self.assertEqual(len(selected), len(scripts) + 2)
+                selected = run_daily.load_script_checks(suite)
+                # Every referenced tests/test_*.py script must exist.
+                for cmd in selected:
+                    script = cmd.split()[1]
+                    if script.startswith('./tests/test_'):
+                        self.assertTrue((ROOT / script).exists(), script)
+                # Two explicit tile scans per board.
+                self.assertEqual(sum('tile_scan_with_test.py' in cmd for cmd in selected), 2)
                 self.assertFalse(any('DG_USE_CUTE=0' in cmd for cmd in selected))
 
     def test_new_interfaces_are_in_the_matching_board_caselists(self):
-        original = json.loads((ROOT / '.github/workflows/scripts/testcase.json').read_text())
         parse = parser_namespace()['parse_deepgemm_string_re']
         for suite, filename in run_checkin.SUITES.items():
             cases = run_checkin.load_cases(ROOT / 'tests/checkin' / filename)
-            for cmd in original[suite]:
-                if cmd.startswith('python ') and any(dtype in cmd for dtype in
+            daily_cmds = run_daily.load_script_checks(suite)
+            for cmd in daily_cmds:
+                if cmd.startswith('python ') and 'run_deep_gemm.py' in cmd and any(dtype in cmd for dtype in
                         ('data_type:bf16_bf16_fp32', 'data_type:w4a8_int8')):
                     self.assertIn(cmd.split('--format=', 1)[1], cases)
             parsed = [parse(case) for case in cases]
-            if suite == 'OAM-810E':
+            if suite == 'ZW-810E':
                 self.assertEqual(sum(case['data_type'] == 'w4a8_int8' for case in parsed), 6)
             else:
                 avg = [case for case in parsed if case['gemm_type'] == 'MqaAvgLogits'
@@ -225,54 +226,50 @@ class ScriptChecksTests(unittest.TestCase):
                 self.assertEqual({case.get('compressed_logits', 0) for case in avg}, {0, 1})
                 self.assertTrue({258, 513, 1025, 8193}.issubset({case['seq_len_kv'] for case in avg}))
 
-    def test_legacy_subprocess_environment_and_junit_failures(self):
-        script = '''import argparse,json,os,sys,xml.etree.ElementTree as ET
-p=argparse.ArgumentParser()
-for arg in ('caselist','suite','build-dir','output-xml'): p.add_argument('--'+arg)
-a=p.parse_args()
-print('warmup_present='+str('HGGC_WARM_UP' in os.environ))
-commands=json.load(open(a.caselist))[a.suite]
-if commands==['missing']: sys.exit(3)
-root=ET.Element('testsuites');suite=ET.SubElement(root,'testsuite')
-for command in commands:
- case=ET.SubElement(suite,'testcase',name=command,time='1.25')
- if command in ('failure','error','skipped'): ET.SubElement(case,command)
-ET.ElementTree(root).write(a.output_xml)
-if commands==['exit-only']:sys.exit(2)
-'''
+    def test_script_checks_run_commands_inline_with_failure_detection(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            scripts = root / '.github/workflows/scripts'
-            scripts.mkdir(parents=True)
-            (scripts / 'pr-deepgemm-ut.py').write_text(script)
-            commands = ['ok', 'failure', 'error', 'skipped']
-            (scripts / 'testcase.json').write_text(json.dumps({'OAM-810E': commands}))
-            with mock.patch.object(run_checkin, 'REPO_ROOT', root), \
-                    contextlib.redirect_stdout(io.StringIO()):
-                for warm in ('1', '0'):
-                    with mock.patch.dict(os.environ, HGGC_WARM_UP=warm):
-                        results = run_checkin.run_script_checks('OAM-810E', root / 'logs')
-                    self.assertEqual([bool(result.error) for result in results], [False, True, True, True])
-                    self.assertTrue(all(result.elapsed == 1.25 for result in results))
-                    self.assertIn('warmup_present=False', (root / 'logs/script-checks.log').read_text())
-                    run_checkin.write_report(results, root / 'merged.xml')
-                    xml = ET.parse(root / 'merged.xml').getroot()
-                    self.assertEqual(xml.get('failures'), '3')
-                    self.assertTrue(all(case.get('classname') == 'DeepGEMM.script'
-                                        for case in xml.findall('testcase')))
-                for command in ('missing', 'exit-only'):
-                    (scripts / 'testcase.json').write_text(json.dumps({'OAM-810E': [command]}))
-                    results = run_checkin.run_script_checks('OAM-810E', root / 'logs')
-                    self.assertEqual(len(results), 1)
-                    self.assertTrue(results[0].error)
+            log_dir = Path(directory)
+            # Success: exit code 0 and no failure keyword.
+            ok = run_daily.run_script_command(1, 'echo hello', 1, log_dir)
+            self.assertEqual(ok.error, '')
+            # Failure keyword in output marks the case failed.
+            keyword = run_daily.run_script_command(1, 'echo AssertionError raised', 1, log_dir)
+            self.assertIn('Failure keyword', keyword.error)
+            # Non-zero exit code marks the case failed.
+            failed = run_daily.run_script_command(1, 'exit 7', 1, log_dir)
+            self.assertIn('Exit code 7', failed.error)
+            # Timeout kills the process group and records the ceiling.
+            with mock.patch.object(run_daily, 'script_timeout', return_value=.3):
+                timed = run_daily.run_script_command(1, 'sleep 30', 1, log_dir)
+            self.assertIn('Timeout after 0.3s', timed.error)
+            for result in (ok, keyword, failed, timed):
+                self.assertTrue((log_dir / f'script-{result.index:04d}.log').exists())
 
-    def test_only_daily_runs_scripts_after_accuracy_and_propagates_failures(self):
-        for phase, error, include, expected in (
-            ('all', '', False, False), ('all', '', True, True),
-            ('all', 'compile failed', True, False),
-            ('compile', '', True, False), ('run', '', True, True),
+    def test_script_checks_remove_warmup_and_aggregate_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_dir = Path(directory)
+            command = f'{sys.executable} -c "import os; print(\'warmup_present=\'+str(\'HGGC_WARM_UP\' in os.environ))"'
+            with mock.patch.object(run_daily, 'load_script_checks', return_value=[command]), \
+                    mock.patch.object(run_daily, 'REPO_ROOT', Path(directory)), \
+                    mock.patch.dict(os.environ, {'HGGC_WARM_UP': '1'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                results = run_daily.run_script_checks('ZW-810E', log_dir)
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].error, '')
+            self.assertIn('warmup_present=False', (log_dir / 'script-0001.log').read_text())
+            run_checkin.write_report(results, log_dir / 'merged.xml')
+            xml = ET.parse(log_dir / 'merged.xml').getroot()
+            self.assertEqual(xml.get('failures'), '0')
+            self.assertEqual(len(xml.findall('testcase')), 1)
+            self.assertTrue(all(case.get('classname') == 'DeepGEMM.script'
+                                for case in xml.findall('testcase')))
+
+    def test_daily_runs_scripts_after_accuracy_and_propagates_failures(self):
+        for phase, error, expected in (
+            ('all', '', True), ('all', 'compile failed', False),
+            ('compile', '', False), ('run', '', True),
         ):
-            with self.subTest(phase=phase, error=error, include=include):
+            with self.subTest(phase=phase, error=error):
                 events = []
                 def execute(*args):
                     events.append('caselist')
@@ -280,24 +277,113 @@ if commands==['exit-only']:sys.exit(2)
                 def scripts(*args):
                     events.append('scripts')
                     return [run_checkin.Result(1, 'legacy', 'script', 0, 'failed', Path('unused'))]
-                args = ['--suite', 'OAM-810E', '--phase', phase]
-                if include:
-                    args.append('--include-daily-scripts')
-                with mock.patch.object(run_checkin, 'execute', side_effect=execute), \
-                        mock.patch.object(run_checkin, 'run_script_checks', side_effect=scripts), \
-                        mock.patch.object(run_checkin, 'write_report'), \
+                with mock.patch.object(run_daily, 'execute', side_effect=execute), \
+                        mock.patch.object(run_daily, 'run_script_checks', side_effect=scripts), \
+                        mock.patch.object(run_daily, 'write_report'), \
                         contextlib.redirect_stdout(io.StringIO()):
-                    code = run_checkin.main(args)
+                    code = run_daily.main(['--suite', 'ZW-810E', '--phase', phase])
                 self.assertEqual(events, ['caselist', 'scripts'] if expected else ['caselist'])
                 self.assertEqual(code, int(bool(error) or expected))
+
+    def test_daily_defaults_to_checkin_and_lists_only_selected_cases(self):
+        for suite, filename in run_checkin.SUITES.items():
+            cases = run_checkin.load_cases(ROOT / 'tests/checkin' / filename)
+            for skip in (False, True):
+                options = ['--skip-checkin'] if skip else []
+                output = io.StringIO()
+                with self.subTest(suite=suite, skip=skip), \
+                        mock.patch.object(run_daily, 'load_cases', return_value=cases) as load, \
+                        mock.patch.object(run_daily, 'execute') as execute, \
+                        mock.patch.object(run_daily, 'run_script_checks') as scripts, \
+                        mock.patch.object(run_daily, 'write_report') as report, \
+                        contextlib.redirect_stdout(output):
+                    code = run_daily.main(['--suite', suite, '--list', *options])
+                    self.assertEqual(code, 0)
+                    if skip:
+                        load.assert_not_called()
+                        self.assertEqual(output.getvalue(), '')
+                    else:
+                        load.assert_called_once_with(ROOT / 'tests/checkin' / filename)
+                        self.assertEqual(output.getvalue().splitlines(),
+                                         [f'{i}: {spec}' for i, spec in enumerate(cases, 1)])
+                    execute.assert_not_called()
+                    scripts.assert_not_called()
+                    report.assert_not_called()
+
+    def test_daily_skip_checkin_runs_only_scripts_and_keeps_failure_logs(self):
+        for suite in run_daily.DAILY_SUITES:
+            for phase in ('all', 'run'):
+                for fail in (False, True):
+                    with self.subTest(suite=suite, phase=phase, fail=fail), \
+                            tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        report = root / 'results.xml'
+                        logs = root / 'logs'
+                        commands = ['echo ready', 'echo AssertionError' if fail else 'echo done']
+                        with mock.patch.object(run_daily, 'load_cases') as load, \
+                                mock.patch.object(run_daily, 'execute') as execute, \
+                                mock.patch.object(run_daily, 'load_script_checks', return_value=commands) as scripts, \
+                                contextlib.redirect_stdout(io.StringIO()):
+                            code = run_daily.main([
+                                '--suite', suite, '--skip-checkin', '--phase', phase,
+                                '--output-xml', str(report), '--log-dir', str(logs)])
+                        load.assert_not_called()
+                        execute.assert_not_called()
+                        scripts.assert_called_once_with(suite)
+                        self.assertEqual(code, int(fail))
+                        xml = ET.parse(report).getroot()
+                        self.assertEqual(xml.get('tests'), '2')
+                        self.assertEqual(xml.get('failures'), str(int(fail)))
+                        self.assertEqual([case.get('classname') for case in xml.findall('testcase')],
+                                         ['DeepGEMM.script', 'DeepGEMM.script'])
+                        self.assertEqual((logs / 'script-0001.log').read_text().strip(), 'ready')
+                        self.assertEqual((logs / 'script-0002.log').read_text().strip(),
+                                         'AssertionError' if fail else 'done')
+                        if fail:
+                            self.assertIn('AssertionError', xml.find('testcase/failure').text)
+
+    def test_daily_skip_checkin_rejects_incompatible_options(self):
+        for options, message in (
+            (['--caselist', 'custom.list'], '--suite'),
+            (['--suite', 'ZW-810E', '--phase', 'compile'], '--phase compile'),
+        ):
+            stderr = io.StringIO()
+            with self.subTest(options=options), \
+                    mock.patch.object(run_daily, 'load_cases') as load, \
+                    mock.patch.object(run_daily, 'execute') as execute, \
+                    mock.patch.object(run_daily, 'run_script_checks') as scripts, \
+                    mock.patch.object(run_daily, 'write_report') as report, \
+                    contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    run_daily.main(['--skip-checkin', *options])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(message, stderr.getvalue())
+                load.assert_not_called()
+                execute.assert_not_called()
+                scripts.assert_not_called()
+                report.assert_not_called()
+
+    def test_daily_custom_caselist_still_runs_without_scripts(self):
+        cases = ['DenseGemm,data_type:bf16,m:2,n:128,k:128']
+        with mock.patch.object(run_daily, 'load_cases', return_value=cases) as load, \
+                mock.patch.object(run_daily, 'execute', return_value=[]) as execute, \
+                mock.patch.object(run_daily, 'run_script_checks') as scripts, \
+                mock.patch.object(run_daily, 'write_report'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(run_daily.main(['--caselist', 'custom.list']), 0)
+        load.assert_called_once_with(Path('custom.list'))
+        execute.assert_called_once_with(cases, 16, Path('checkin-logs').resolve(), 1200, 'all')
+        scripts.assert_not_called()
 
     def test_daily_entry_lists_sweeps_from_any_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             for suite in run_checkin.SUITES:
-                output = subprocess.check_output(
-                    [sys.executable, str(ROOT / 'tests/daily/run_daily.py'),
-                     '--suite', suite, '--list-daily-scripts'], cwd=directory, text=True)
-                self.assertEqual(output.splitlines(), run_checkin.load_script_checks(suite))
+                for options in ([], ['--skip-checkin']):
+                    with self.subTest(suite=suite, options=options):
+                        output = subprocess.check_output(
+                            [sys.executable, str(ROOT / 'tests/daily/run_daily.py'),
+                             '--suite', suite, '--list-daily-scripts', *options], cwd=directory, text=True)
+                        self.assertEqual(output.splitlines(), run_daily.load_script_checks(suite))
 
     def test_fp4_default_epilogue_retains_legacy_accuracy_boundary(self):
         tree = ast.parse((ROOT / 'tests/utils.py').read_text())
@@ -332,10 +418,9 @@ class SchedulingTests(unittest.TestCase):
         for options, expected in (([], 16), (['--compile-workers', '4'], 4)):
             with self.subTest(options=options), \
                     mock.patch.object(run_checkin, 'execute', return_value=[]) as execute, \
-                    mock.patch.object(run_checkin, 'run_script_checks', return_value=[]), \
                     mock.patch.object(run_checkin, 'write_report'), \
                     contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(run_checkin.main(['--suite', 'OAM-810E', *options]), 0)
+                self.assertEqual(run_checkin.main(['--suite', 'ZW-810E', *options]), 0)
                 self.assertEqual(execute.call_args.args[1], expected)
 
     def test_compile_barrier_and_serial_accuracy(self):

@@ -55,7 +55,7 @@ public:
   // A fourth slot reduces CTA residency for the default N256 tile.
   static constexpr bool ResidentA = N_EXPAND > 1 && WarpM == 64 && ShapeK <= 384;
   static constexpr int ASlots = ResidentA && ShapeK / BlockK > kNumStages ? ShapeK / BlockK : kNumStages;
-  static constexpr bool CacheRowScale = N_EXPAND > 1 && WarpM == 64 && ShapeK <= 512;
+  static constexpr bool CacheRowScale = N_EXPAND > 1 && WarpM >= 32 && ShapeK <= 512;
   // basic
   static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   // A packed K64 slice feeds two K32 MMA steps for every M tile and grouped kind.
@@ -499,8 +499,8 @@ public:
                 auto* dst = reinterpret_cast<cutlass::uint128_t*>(raw_pointer_cast(tAsA(_, mi, ki, k_pipe).data()));
                 if constexpr (Routed)
                   ACopyInst::copy(*src, *dst, token < uint32_t(params.num_token));
-                else if (token < uint32_t(params.num_token))
-                  cute::PPU_CP_ASYNC_CACHEALWAYS<cutlass::uint128_t>::copy(*src, *dst);
+                else
+                  deep_gemm::FusedACopyInst::copy(*src, *dst, token < uint32_t(params.num_token));
               }
             }
           }

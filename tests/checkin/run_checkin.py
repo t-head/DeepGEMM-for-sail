@@ -12,7 +12,6 @@ from pathlib import Path
 import re
 import select
 import signal
-import shlex
 import subprocess
 import sys
 import threading
@@ -20,7 +19,7 @@ import time
 import xml.etree.ElementTree as ET
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SUITES = {'OAM-810E': 'checkin_810e.list', 'ZW-M890P': 'checkin_890p.list'}
+SUITES = {'ZW-810E': 'checkin_810e.list', 'ZW-M890P': 'checkin_890p.list'}
 _worker_context = threading.local()
 
 
@@ -148,64 +147,6 @@ def load_cases(path, stack=()):
     return cases
 
 
-def load_script_checks(suite):
-    """Select original shape/tile sweeps for the explicit daily mode."""
-    path = REPO_ROOT / '.github/workflows/scripts/testcase.json'
-    commands = json.loads(path.read_text())[suite]
-    selected = []
-    for command in commands:
-        words = shlex.split(command)
-        # Plain operator invocations are represented by the board caselist.
-        # DG_USE_CUTE=0 is an intentionally retired fallback, not a check-in target.
-        if words and words[0] == 'DG_USE_CUTE=0':
-            continue
-        if (len(words) == 3 and words[0] in ('python', 'python3')
-                and Path(words[1]).name == 'run_deep_gemm.py'
-                and words[2].startswith('--format=')):
-            continue
-        selected.append(command)
-    return selected
-
-
-def run_script_checks(suite, log_dir):
-    """Reuse legacy command execution, timeout and failure-keyword checks."""
-    commands = load_script_checks(suite)
-    if not commands:
-        return []
-    log_dir = Path(log_dir).resolve()
-    log_dir.mkdir(parents=True, exist_ok=True)
-    selection = log_dir / 'script-checks.json'
-    selection.write_text(json.dumps({suite: commands}, indent=2) + '\n')
-    report = log_dir / 'script-checks.xml'
-    report.unlink(missing_ok=True)
-    log = log_dir / 'script-checks.log'
-    env = dict(os.environ)
-    env.pop('HGGC_WARM_UP', None)
-    command = [sys.executable, str(REPO_ROOT / '.github/workflows/scripts/pr-deepgemm-ut.py'),
-               '--caselist', str(selection), '--suite', suite,
-               '--build-dir', str(REPO_ROOT), '--output-xml', str(report)]
-    start = time.monotonic()
-    try:
-        with log.open('w') as output:
-            process = subprocess.run(command, cwd=REPO_ROOT, env=env,
-                                     stdout=output, stderr=subprocess.STDOUT)
-        cases = list(ET.parse(report).getroot().iter('testcase'))
-        if len(cases) != len(commands):
-            raise ValueError(f'Expected {len(commands)} script results, got {len(cases)}')
-        results = []
-        for index, (spec, case) in enumerate(zip(commands, cases), 1):
-            failed = any(case.find(tag) is not None for tag in ('failure', 'error', 'skipped'))
-            results.append(Result(index, spec, 'script', float(case.get('time', 0)),
-                                  'Legacy script check failed; see script-checks.log' if failed else '', log))
-        if process.returncode and not any(result.error for result in results):
-            results[-1].error = f'Script runner exit code {process.returncode}; see script-checks.log'
-    except (OSError, ValueError, ET.ParseError) as exc:
-        results = [Result(1, 'Legacy script checks', 'script', time.monotonic() - start, str(exc), log)]
-    for result in results:
-        print(f'Script [{result.index}/{len(commands)}] {result.spec}: {result.error or "OK"}', flush=True)
-    return results
-
-
 def run_case(index, spec, phase, log_dir, timeout, base_env=None):
     worker = getattr(_worker_context, 'worker', None)
     if worker is not None and base_env is None:
@@ -328,16 +269,7 @@ def main(argv=None):
     parser.add_argument('--output-xml', type=Path, default=Path('test-results.xml'))
     parser.add_argument('--log-dir', type=Path, default=Path('checkin-logs'))
     parser.add_argument('--list', action='store_true', help='Print the selected cases without importing Torch')
-    parser.add_argument('--list-daily-scripts', action='store_true', help='Print the full shape/tile sweeps without running them')
-    parser.add_argument('--include-daily-scripts', action='store_true', help='Also run full shape/tile sweeps (daily entry only)')
     args = parser.parse_args(argv)
-    if args.include_daily_scripts and not args.suite:
-        parser.error('--include-daily-scripts requires --suite')
-    if args.list_daily_scripts:
-        if not args.suite:
-            parser.error('--list-daily-scripts requires --suite')
-        print('\n'.join(load_script_checks(args.suite)))
-        return 0
     path = REPO_ROOT / 'tests/checkin' / SUITES[args.suite] if args.suite else args.caselist
     try:
         cases = load_cases(path)
@@ -348,9 +280,6 @@ def main(argv=None):
             print(f'{i}: {spec}')
         return 0
     results = execute(cases, args.compile_workers, args.log_dir.resolve(), args.timeout, args.phase)
-    if (args.include_daily_scripts and args.suite and args.phase != 'compile'
-            and not any(result.phase == 'compile' and result.error for result in results)):
-        results.extend(run_script_checks(args.suite, args.log_dir))
     write_report(results, args.output_xml)
     failed = sum(bool(result.error) for result in results)
     print(f'Phase={args.phase}, cases={len(cases)}, phase results={len(results)}, failures={failed}')

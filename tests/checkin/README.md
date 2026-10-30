@@ -1,9 +1,9 @@
 # Functional check-in
 
-Check-in keeps representative cases for supported operators and independent execution paths. Full shape/distribution/tile sweeps belong in daily functional lists; performance measurements belong in perf lists. Check-in runs only the board functional caselist. The complete original scripts and tile scans in `.github/workflows/scripts/testcase.json` run through the explicit daily entry in `tests/daily/run_daily.py`; they are not appended to default check-in. The retired `DG_USE_CUTE=0` fallback is excluded.
+Check-in keeps representative cases for supported operators and independent execution paths. Full shape/distribution/tile sweeps belong in daily functional lists; performance measurements belong in perf lists. Check-in runs only the board functional caselist. The test scripts and tile scans in `tests/daily/daily_810e.list` / `tests/daily/daily_890p.list` run through the explicit daily entry in `tests/daily/run_daily.py`; they are not appended to default check-in. The retired `DG_USE_CUTE=0` fallback is excluded.
 
 ```bash
-python tests/checkin/run_checkin.py --suite OAM-810E
+python tests/checkin/run_checkin.py --suite ZW-810E
 python tests/checkin/run_checkin.py --suite ZW-M890P
 # Fewer workers can reduce process startup overhead with an already warm JIT cache:
 python tests/checkin/run_checkin.py --suite ZW-M890P --compile-workers 4
@@ -23,15 +23,18 @@ For W4 weights, warm-up prepares one synthetic expert through the production pre
 
 Default check-in does not run the full `test_core.py`, `test_fp4_core.py`, `test_fp8_core.py`, `test_attention.py` shape loops or either tile sweep. Required functionality stays in the operator cases: small-M/N/K tails, quantization layouts, masked overlap/signals, attention regression/metadata checks and preprocessing contracts. FP4 default-epilogue NoPad/Fused checks retain the old strict `0.001` accuracy boundary; fused activation/quantization paths retain their existing thresholds.
 
-For full shape and explicit-tile coverage, use the daily entry. It first runs the functional caselist, then the original selected script commands through `pr-deepgemm-ut.py`, retaining per-command timeouts and failure-output detection. Both tile scans keep `--thread_count=32`. Daily scripts run after accuracy even if accuracy fails, and never after a compile failure. `HGGC_WARM_UP` is removed for real checks. Results appear as `DeepGEMM.script` alongside compile/run results. Raw script output and report are in `checkin-logs/script-checks.*`.
+For full shape and explicit-tile coverage, use the daily entry. It first runs the functional caselist, then the board-specific daily list (`tests/daily/daily_810e.list` / `tests/daily/daily_890p.list`) directly, retaining per-command timeouts and failure-output detection. Both tile scans keep `--thread_count=32`. Daily scripts run after accuracy even if accuracy fails, and never after a compile failure. `HGGC_WARM_UP` is removed for real checks. Results appear as `DeepGEMM.script` alongside compile/run results. Raw script output is in `checkin-logs/script-*.log`.
 
 ```bash
-python tests/daily/run_daily.py --suite OAM-810E
+python tests/daily/run_daily.py --suite ZW-810E
 python tests/daily/run_daily.py --suite ZW-M890P
+python tests/daily/run_daily.py --suite ZW-M890P --skip-checkin
 python tests/daily/run_daily.py --suite ZW-M890P --list-daily-scripts
 ```
 
-The equivalent shared-runner option is `--include-daily-scripts`, which requires `--suite`. Full cold-cache shape sweeps can exceed the original script timeouts; daily is not the check-in latency target. `--phase compile` remains compilation-only, including for the daily entry.
+The daily entry runs the checkin functional list by default. Add `--skip-checkin` to run only the board-specific daily list while still generating reports and retaining failure logs. This option requires `--suite` and cannot be combined with `--caselist` or `--phase compile`. It does not affect the standalone checkin entry.
+
+The daily-only sweep logic (sweep lists, per-command timeouts and failure-output detection) lives in `tests/daily/run_daily.py`; `run_checkin.py` keeps only shared scheduling and reporting and has no sweep options. Full cold-cache shape sweeps can exceed the original script timeouts; daily is not the check-in latency target. `--phase compile` remains compilation-only, including for the daily entry.
 
 The shared CI workflow uses the functional check-in with sixteen compiler workers in both `deepgemm` and `actlize1.0.0` source modes. The actlize mode clones DeepGEMM main and replaces its actlize submodule before building; both modes require `tests/checkin/run_checkin.py`.
 

@@ -36,14 +36,12 @@ jobs:
   # Stage 3: 人工审批门禁
   human-review:
     name: Human Review Gate
-    # TODO: change to ai-code-review
-    needs: precheck
+    needs: ai-code-review
     uses: t-head/.github/.github/workflows/human-review.yml@main
     secrets: inherit
 
   deepgemm-ut-tests-ppu:
     name: deepgemm UT Tests PPU
-    # TODO: change to human-review
-    needs: precheck
+    needs: human-review
     uses: ./.github/workflows/deepgemm-ut-test-ppu.yml
     secrets: inherit

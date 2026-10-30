@@ -232,3 +232,13 @@ try:
     from . import legacy
 except Exception as e:
     print(f'Failed to load legacy DeepGEMM Triton kernels: {e}')
+
+
+# Mega kernels
+from .mega import (
+    SymmBuffer,
+    get_symm_buffer_for_mega_moe,
+    transform_weights_for_mega_moe,
+    fp4_fp4_mega_moe,
+    mega_moe_pre_dispatch,
+)
