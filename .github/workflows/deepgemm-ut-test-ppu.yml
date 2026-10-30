@@ -34,7 +34,7 @@ env:
 
 jobs:
   build-test:
-    name: Build & Test (${{ matrix.runner }})
+    name: Build & Test (${{ matrix.suite == 'board' && matrix.runner || matrix.suite }})
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -45,9 +45,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each board selects a functional caselist via run_checkin.py --suite.
-        # Compile in isolated processes, then execute accuracy checks serially.
+        # Respect the selected boards; MegaMoE check-in runs only on M890P.
         runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "ZW-810E"]') }}
+        suite: [board, ZW-M890P-MegaMoE]
+        exclude:
+          - runner: ZW-810E
+            suite: ZW-M890P-MegaMoE
     steps:
       - uses: actions/checkout@v4
         with:
@@ -106,7 +109,7 @@ jobs:
             echo $PPU_SDK
             pip install ray[adag]==2.40.0 --no-deps
             pip install setuptools==69.5.1
-            # Match setup.py setup_requires exactly so the build never re-fetches it from the (unreachable) internal index.
+            # Preinstall the SCM version plugin used by setup.py.
             pip install setuptools-scm==9.2.2
             pip install numpy==1.26.4 junit-xml rich
             pip install --upgrade pytest
@@ -133,17 +136,23 @@ jobs:
             fi
             echo "START TO INSTALL WHEEL"
             pip install ./dist/*.whl --force-reinstall
+            if [ '${{ matrix.suite }}' = 'ZW-M890P-MegaMoE' ]; then
+              # MegaMoE tests import this checkout. Populate its extension
+              # and third-party JIT includes through the existing develop hook.
+              python ./setup.py develop --no-deps
+              python -c 'from pathlib import Path; import deep_gemm; assert Path(deep_gemm.__file__).resolve().parent == Path("deep_gemm").resolve(); print("Testing checkout:", deep_gemm.__file__)'
+            fi
             echo "START TO TEST CASES"
             set +e
             python tests/checkin/run_checkin.py \
-              --suite ${{ matrix.runner }} \
+              --suite ${{ matrix.suite == 'board' && matrix.runner || matrix.suite }} \
               --compile-workers 16
             TEST_EXIT_CODE=$?
             python3 .github/workflows/scripts/generate-env-info.py \
             --docker-image "${{ env.SAIL_IMAGE }}" \
             --output env_info.json
-            # Keep results per runner so the parallel matrix jobs do not collide.
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            # Keep board check-in and MegaMoE reports in separate directories.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}"
             mkdir -p "$NAS_RESULT_DIR"
             cp test-results.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
@@ -151,14 +160,14 @@ jobs:
             exit "$TEST_EXIT_CODE"
           cleanup_policy: on_success
 
-      - name: Test summary (${{ matrix.runner }})
+      - name: Test summary (${{ matrix.suite == 'board' && matrix.runner || matrix.suite }})
         if: always()
         shell: bash
         run: |
-          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}"
           XML_FILE="$NAS_RESULT_DIR/test-results.xml"
           ENV_FILE="$NAS_RESULT_DIR/env_info.json"
-          echo "## Runner: ${{ matrix.runner }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Suite: ${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}" >> "$GITHUB_STEP_SUMMARY"
 
           if [[ ! -f "$XML_FILE" ]]; then
             echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"

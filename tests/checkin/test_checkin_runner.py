@@ -184,14 +184,33 @@ class ScriptChecksTests(unittest.TestCase):
             runner.write_text("import json,sys; from pathlib import Path; "
                               "Path('runner-args.json').write_text(json.dumps(sys.argv[1:]))")
             for mode in ('deepgemm', 'actlize1.0.0'):
-                for suite in run_checkin.SUITES:
+                for suite in (*run_checkin.SUITES, *run_checkin.SCRIPT_SUITES):
                     with self.subTest(mode=mode, suite=suite):
+                        board = suite if suite in run_checkin.SUITES else 'ZW-M890P'
                         env = dict(os.environ, SOURCE_MODE=mode,
                                    PATH=str(bin_dir) + os.pathsep + os.environ.get('PATH', ''))
-                        subprocess.run(['bash', '-c', command.replace('${{ matrix.runner }}', suite)],
-                                       cwd=root, env=env, check=True)
+                        (root / 'runner-args.json').unlink(missing_ok=True)
+                        rendered = command.replace('${{ matrix.runner }}', board)
+                        rendered = rendered.replace(
+                            "${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}", suite)
+                        subprocess.run(['bash', '-c', rendered], cwd=root, env=env, check=True)
                         self.assertEqual(json.loads((root / 'runner-args.json').read_text()),
                                          ['--suite', suite, '--compile-workers', '16'])
+
+    def test_functional_suite_runs_without_legacy_json_and_reports_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'check.py').write_text(
+                "import os,sys\nassert 'HGGC_WARM_UP' not in os.environ\n"
+                "print('functional failure', file=sys.stderr)\nsys.exit(1)\n")
+            with mock.patch.object(run_checkin, 'REPO_ROOT', root), \
+                 mock.patch.dict(run_checkin.SCRIPT_SUITES, {'smoke': ['check.py']}), \
+                 mock.patch.dict(os.environ, {'HGGC_WARM_UP': '1'}):
+                report = root / 'result.xml'
+                result = run_checkin.main(['--suite', 'smoke', '--log-dir', str(root / 'logs'),
+                                          '--output-xml', str(report), '--timeout', '5'])
+            self.assertEqual(result, 1)
+            self.assertIn('functional failure', ET.parse(report).find('.//failure').text)
 
     def test_daily_retains_script_and_tile_commands(self):
         for suite in run_daily.DAILY_SUITES:
