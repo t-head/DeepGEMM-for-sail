@@ -1,6 +1,7 @@
 #pragma once
 #include <deep_gemm/tix/cvt.cuh>
 #include <deep_gemm/tix/ld_st.cuh>
+#include <deep_gemm/tix/utils.cuh>
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 #include <deep_gemm/scheduler/paged_mqa_logits_scheduler.cuh>

@@ -2,16 +2,10 @@
 
 #include <cstdint>
 
-// HGGC inline-asm lane-id and shared-memory load primitives, lifted verbatim
+// HGGC inline-asm shared-memory load primitives, lifted verbatim
 // from impls/mqa_logits_utils.cuh.
 
 namespace deep_gemm::tix {
-
-__forceinline__ __device__ uint32_t get_lane_idx() {
-    uint32_t lane_id;
-    asm("ppu.mov.u32 %0, %laneid;" : "=r"(lane_id));
-    return lane_id;
-}
 
 __device__ __forceinline__ float ld_shared(const float* ptr) {
     float ret;
