@@ -1,5 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <chrono>
+#include <sstream>
+#include <vector>
+
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
 #include "../utils/system.hpp"
@@ -27,7 +32,6 @@ public:
         DG_HOST_ASSERT(not sdk_home.empty());
 
         // NOLINT(*-pro-type-member-init)
-        const auto hgobjdump_path = sdk_home / "bin" / "hgobjdump";
         const auto hgbin_path = dir_path / "kernel.hgbin";
         if (get_env<int>("DG_JIT_DEBUG"))
             printf("Loading HGBIN: %s\n", hgbin_path.c_str());
@@ -41,24 +45,36 @@ public:
         // Load from the library
         kernel = load_kernel(hgbin_path, {}, &library);
 #else
+        const auto hgobjdump_path = sdk_home / "bin" / "hgobjdump";
         // Find the only symbol
         // TODO: use kernel enumeration for newer drivers
-        const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal",
-                                                        "__assertfail"};
-        const auto& [exit_code, symbols] = call_external_command(
-            fmt::format("{} --dump-elf-symbols=0 {}", hgobjdump_path.c_str(), hgbin_path.c_str()));
-        if (get_env<int>("DG_JIT_DEBUG"))
-            printf("symbols: %s\n", symbols.c_str());
-        std::string expected_name = dir_path.filename().string();
-        if (expected_name.rfind("kernel.", 0) == 0) {
-            expected_name = expected_name.substr(7); // remove "kernel."
-        }
-        size_t dot_pos = expected_name.find('.');
-        if (dot_pos != std::string::npos) {
-            expected_name = expected_name.substr(0, dot_pos);
+        const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
+        const auto [exit_code, symbols] = call_external_command(fmt::format("{} --dump-elf-symbols=0 {}", hgobjdump_path.c_str(), hgbin_path.c_str()));
+        DG_HOST_ASSERT(exit_code == 0);
+        std::istringstream iss(symbols);
+        std::vector<std::string> symbol_names;
+        for (std::string line; std::getline(iss, line); ) {
+            if (line.find(" F ") != std::string::npos and line.find(".text.kernel.") != std::string::npos and
+                std::none_of(illegal_names.begin(), illegal_names.end(),
+                [&](const auto name) { return line.find(name) != std::string::npos; })) {
+                const auto last_space = line.rfind(' ');
+                symbol_names.push_back(line.substr(last_space + 1));
+            }
         }
 
-        kernel = load_kernel(hgbin_path, expected_name, &library);
+        // Print symbols
+        if (symbol_names.size() != 1 or get_env<int>("DG_JIT_DEBUG")) {
+            printf("Symbols: ");
+            printf(" > HGBIN: %s\n", hgbin_path.c_str());
+            printf(" > Raw symbols: %s\n", symbols.c_str());
+            printf(" > Parsed symbols:\n");
+            for (const auto& symbol: symbol_names)
+                printf("   > %s, ", symbol.c_str());
+        }
+        DG_HOST_ASSERT(symbol_names.size() == 1);
+
+        // Load from the library
+        kernel = load_kernel(hgbin_path, symbol_names[0], &library);
 #endif
 
         // Print load time
