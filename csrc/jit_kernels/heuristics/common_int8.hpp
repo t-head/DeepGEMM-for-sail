@@ -8,6 +8,7 @@
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
+#include "runtime.hpp"
 #include "gemm_int8_lut.hpp"
 #include "runtime_lut.hpp"
 #include "adaptive_tile_selector.hpp"
@@ -334,7 +335,7 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
             block_ms = {128, 64, 32, 16};
         }
     } else {
-        block_ms = {get_mk_alignment_for_contiguous_layout()};
+        block_ms = {heuristics_runtime->get_mk_alignment_for_contiguous_layout()};
     }
 
     // block_ns = (256, 128, 64, 32)
@@ -649,7 +650,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
             block_ms = {64, 32, 16};
         }
     } else {
-        block_ms = {get_mk_alignment_for_contiguous_layout()};
+        block_ms = {heuristics_runtime->get_mk_alignment_for_contiguous_layout()};
     }
 
     // block_ns = (256, 128, 64, 32)

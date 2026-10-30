@@ -15,6 +15,7 @@
 #include "runtime_lut.hpp"
 #include "common_preprocess.hpp"
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/epilogue/epilogue_traits.cuh>
 using namespace deep_gemm;
 namespace deep_gemm_fp4_common {
 

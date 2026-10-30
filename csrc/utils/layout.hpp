@@ -37,6 +37,8 @@ static bool fp8_requires_k_major() {
 // Tensor utils
 template <int N>
 static auto get_shape(const torch::Tensor& t) {
+    DG_HOST_ASSERT(t.is_cuda());
+    DG_HOST_ASSERT(t.dim() == N);
     return [&t] <size_t... Is> (std::index_sequence<Is...>) {
         return std::make_tuple(static_cast<int>(t.sizes()[Is])...);
     }(std::make_index_sequence<N>());
@@ -157,15 +159,5 @@ torch::Tensor get_col_major_tensor(const torch::Tensor& x) {
     return squeeze_dim ? col_major.squeeze(0) : col_major;
 }
 
-int get_mk_alignment_for_contiguous_layout() {
-    /*
-    When we do a grouped GEMM in contiguous format, LHS are grouped into several batches along the M axis.
-    Since we deal with exactly one sub-matrix of RHS for each GEMM block, batch sizes above should align well
-        with GEMM block shape.
-    Returns:
-        Group-level alignment requirement for grouped contiguous layout, which is always 128.
-    */
-    return 128;
-}
 
 } // namespace deep_gemm
