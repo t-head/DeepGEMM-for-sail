@@ -709,7 +709,7 @@ struct CollectiveMma<
   // Device side kernel params
   using Params = Arguments;
 
-  // sm90 realization put TMA_A into params directly
+  // Copy descriptors are initialized on device rather than passed through Params.
   // put gmem_tiled_copy here and copy desc in kernel to simplify rtc usage
   GmemTiledCopyA gmem_tiled_copy_A;
   GmemTiledCopyB gmem_tiled_copy_B;
