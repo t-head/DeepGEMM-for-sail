@@ -319,7 +319,7 @@ public:
         args.shape_m = shape_m;
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()){
+        if (ProfilingInterface::instance().get_op_info()){
             dg_prof_params.set_fused_moe_params(
                 std::string("bf16"), std::string("non_quantized"), kNumGroups, shape_m, topk, SHAPE_N, SHAPE_K, m_rows, stream
             );
@@ -351,9 +351,9 @@ public:
             printf("grid:%d, vreg:%d, smem_size: %d, tb_per_cu:%d, stack:%d\n",
                 sm_count, int(attr.numRegs), smem_size, max_blocks_per_cu, int(attr.localSizeBytes));
         }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+        ProfilingInterface::instance().instrument(true, dg_prof_params);
         device_func<<<grid, BlockSize, smem_size, stream>>>(args);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        ProfilingInterface::instance().instrument(false, dg_prof_params);
     }
 };
 

@@ -128,17 +128,17 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     }
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (ProfilingInterface::instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, 0, nullptr,
                                   current_stream());
         dg_prof_params.add_params("quant_type", "block");
         dg_prof_params.add_params("expr", expr);
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    ProfilingInterface::instance().instrument(true, dg_prof_params);
 
     FP8GemmRuntime::launch(runtime, args);
 
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    ProfilingInterface::instance().instrument(false, dg_prof_params);
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
         int numRegs = 0, localSize = 0;
@@ -263,17 +263,17 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (ProfilingInterface::instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, nullptr,
                                   current_stream());
         dg_prof_params.add_params("quant_type", "channel");
         dg_prof_params.add_params("expr", expr);
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    ProfilingInterface::instance().instrument(true, dg_prof_params);
 
     INT8BatchGemmCutlass3Runtime::launch(runtime, args);
 
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    ProfilingInterface::instance().instrument(false, dg_prof_params);
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {

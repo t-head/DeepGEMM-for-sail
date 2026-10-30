@@ -204,7 +204,7 @@ public:
         else {
             data_type = "unsupported";
         }
-        if (ProfilingInterface::Instance().get_op_info()){
+        if (ProfilingInterface::instance().get_op_info()){
             dg_prof_params.set_params(
                 GemmType::MGroupedNoPad, true, data_type, kNumGroups, shape_m, SHAPE_N, SHAPE_K, 1,
                 grouped_layout, stream
@@ -249,9 +249,9 @@ public:
 
             }
 
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
+            ProfilingInterface::instance().instrument(true, dg_prof_params);
             device_func<<<grid_x * grid_y, BlockSize, 0, stream>>>(args);
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
+            ProfilingInterface::instance().instrument(false, dg_prof_params);
 
         }
     }

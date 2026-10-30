@@ -95,15 +95,15 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (ProfilingInterface::instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
                                   grouped_layout, current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    ProfilingInterface::instance().instrument(true, dg_prof_params);
 
     BF16GemmCutlass3Runtime::launch(runtime, args);
 
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    ProfilingInterface::instance().instrument(false, dg_prof_params);
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
@@ -198,15 +198,15 @@ static std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const to
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (ProfilingInterface::instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
                                   grouped_layout, current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    ProfilingInterface::instance().instrument(true, dg_prof_params);
 
     BF16GemmCutlass3Runtime::launch(runtime, args);
 
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    ProfilingInterface::instance().instrument(false, dg_prof_params);
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
@@ -255,7 +255,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
     int* layout_info = reinterpret_cast<int32_t*>(m_indices.data_ptr<int32_t>());
     if (use_gemv) {
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
+        if (ProfilingInterface::instance().get_op_info()) {
             dg_prof_params.set_params(GemmType::MGroupedNoPad, true, std::string("bf16"), num_groups, m, n, k, expected_m,
                                       layout_info, current_stream());
         }
@@ -303,9 +303,9 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
             const auto& code = GemvRuntime::generate(args);
             const auto& runtime = compiler->build("batched_gemvt_kernel", code);
             const auto& kernel = runtime->kernel;
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
+            ProfilingInterface::instance().instrument(true, dg_prof_params);
             GemvRuntime::launch(runtime, args);
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
+            ProfilingInterface::instance().instrument(false, dg_prof_params);
 
             char* pEnv_params = std::getenv("show_log");
             if (pEnv_params && isdigit(*pEnv_params)) {
@@ -351,9 +351,9 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
             const auto& code = GemvRuntime::generate(args);
             const auto& runtime = compiler->build("batched_gemvt_small_k_kernel", code);
             const auto& kernel = runtime->kernel;
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
+            ProfilingInterface::instance().instrument(true, dg_prof_params);
             GemvRuntime::launch(runtime, args);
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
+            ProfilingInterface::instance().instrument(false, dg_prof_params);
 
             char* pEnv_params = std::getenv("show_log");
             if (pEnv_params && isdigit(*pEnv_params)) {
@@ -478,15 +478,15 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (ProfilingInterface::instance().get_op_info()) {
         dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
                                   m_rows_tensor.data_ptr<int32_t>(), current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    ProfilingInterface::instance().instrument(true, dg_prof_params);
 
     BF16GemmCutlass3Runtime::launch(runtime, args);
 
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    ProfilingInterface::instance().instrument(false, dg_prof_params);
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {

@@ -408,7 +408,7 @@ public:
         else {
             data_type = "unsupported";
         }
-        if (ProfilingInterface::Instance().get_op_info()){
+        if (ProfilingInterface::instance().get_op_info()){
             dg_prof_params.set_params(
                 GemmType::MGroupedNoPad, true, data_type, kNumGroups, shape_m, SHAPE_N, SHAPE_K, 1,
                 grouped_layout, stream
@@ -444,9 +444,9 @@ public:
                 printf("threadblock_count:%d, vreg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
 
             }
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
+            ProfilingInterface::instance().instrument(true, dg_prof_params);
             device_func<<<grid, BlockSize, 0, stream>>>(args);
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
+            ProfilingInterface::instance().instrument(false, dg_prof_params);
         } else {
             // launch small_k gemm_v
             size_t grid_x = args.num_tokens;
@@ -487,11 +487,11 @@ public:
 
             }
 
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
+            ProfilingInterface::instance().instrument(true, dg_prof_params);
             // batched_gemvt_kernel_small_k<src_type, dst_type, float, load_atype, load_btype,
             //     BlockSize, ThreadPerN, NPerThread, 1, SWZL_SIZE_M, Stages><<<grid_x * grid_y, BlockSize, 0, stream>>>(args);
             device_func<<<grid_x * grid_y, BlockSize, 0, stream>>>(args);
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
+            ProfilingInterface::instance().instrument(false, dg_prof_params);
 
         }
     }

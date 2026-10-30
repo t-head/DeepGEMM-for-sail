@@ -1211,16 +1211,16 @@ public:
         }
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()){
+        if (ProfilingInterface::instance().get_op_info()){
             dg_prof_params.set_params(
                 kGemmType, false, std::string("fp8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
                 grouped_layout, stream
             );
         }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+        ProfilingInterface::instance().instrument(true, dg_prof_params);
 
         cutlass::device_kernel<GemmKernel><<<grid, block, sharemem_size, stream>>>(params);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        ProfilingInterface::instance().instrument(false, dg_prof_params);
 
   }
 };

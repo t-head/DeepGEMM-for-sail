@@ -1002,15 +1002,15 @@ public:
         int smem_size_kernel = GemmKernel::SharedStorageSize;
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
+        if (ProfilingInterface::instance().get_op_info()) {
             dg_prof_params.set_params(
                 GemmType::Normal, false, std::string("int8"), 1, shape_m, shape_n, shape_k, shape_m,
                 nullptr, stream
             );
         }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+        ProfilingInterface::instance().instrument(true, dg_prof_params);
         cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        ProfilingInterface::instance().instrument(false, dg_prof_params);
 
         hggcFuncAttributes attr;
         hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);

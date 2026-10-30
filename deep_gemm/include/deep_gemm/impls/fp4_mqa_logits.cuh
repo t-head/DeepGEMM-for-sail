@@ -927,7 +927,7 @@ public:
         int smem_size_kernel = AttnKernel::SharedStorageSize;
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
+        if (ProfilingInterface::instance().get_op_info()) {
             dg_prof_params.set_mqa_logits_params("fp4", seq_len_q, seq_len_k, kNumHeads, kHeadDim * 2, stream);
             if constexpr (cute::is_same_v<ElementLogits, __ppu_bfloat16>) {
                 dg_prof_params.add_params("logits_dtype", std::string("bf16"));
@@ -953,9 +953,9 @@ public:
             printf("weights_bf16:%s\n", cute::is_same_v<ElementWeights, __ppu_bfloat16> ? "true" : "false");
         }
 
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+        ProfilingInterface::instance().instrument(true, dg_prof_params);
         cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        ProfilingInterface::instance().instrument(false, dg_prof_params);
     }
 };
 

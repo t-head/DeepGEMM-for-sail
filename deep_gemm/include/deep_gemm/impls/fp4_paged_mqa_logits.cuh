@@ -828,7 +828,7 @@ public:
         int smem_size_kernel = AttnKernel::SharedStorageSize;
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
+        if (ProfilingInterface::instance().get_op_info()) {
             dg_prof_params.set_paged_mqa_logits_params("fp4", batch_size, kNextN, kNumHeads, kHeadDim * 2,
                                                        reinterpret_cast<int*>(const_cast<uint32_t*>(context_lens)),
                                                        stream);
@@ -861,9 +861,9 @@ public:
             }
         }
 
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+        ProfilingInterface::instance().instrument(true, dg_prof_params);
         cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        ProfilingInterface::instance().instrument(false, dg_prof_params);
     }
 };
 

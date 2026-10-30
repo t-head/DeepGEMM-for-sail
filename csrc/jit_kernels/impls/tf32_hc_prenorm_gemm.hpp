@@ -222,11 +222,11 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& lhs, const torch::Tensor& 
     const auto& runtime = compiler->build(kernel_name, code);
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (ProfilingInterface::instance().get_op_info()) {
         dg_prof_params.set_hc_prenorm_params(m, n, k, current_stream());
         dg_prof_params.add_params("num_splits", int(num_splits));
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    ProfilingInterface::instance().instrument(true, dg_prof_params);
 
     if (kernel_variant & 1024u) {
         Tf32HcRoundBRuntime::Args pack_args{{dim3(ceil_div(n * k, 256)), dim3(256), 0}, rhs.data_ptr<float>(), rounded_b.data_ptr<float>(), uint32_t(n * k)};
@@ -239,7 +239,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& lhs, const torch::Tensor& 
         Tf32HcPrenormGemmRuntime::launch(runtime, args);
     }
 
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    ProfilingInterface::instance().instrument(false, dg_prof_params);
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
