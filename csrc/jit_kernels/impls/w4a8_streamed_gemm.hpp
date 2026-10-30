@@ -362,7 +362,7 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
     log_streamed_config(execution, int(a.size(0)), n, k, groups, m, chunk, parts, prepared->second);
 
     DgProfParam prof;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (ProfilingInterface::instance().get_op_info()) {
         if (is_fused)
             prof.set_fused_moe_params("w4fa8_mma", "group", groups, a.size(0), m / a.size(0), n, k,
                                       rows.data_ptr<int32_t>(), caller);
@@ -373,7 +373,7 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
         }
         prof.add_params(std::string("group_size"), 32);
     }
-    ProfilingInterface::Instance().instrument(true, prof);
+    ProfilingInterface::instance().instrument(true, prof);
     // Decode anew on every invocation; each buffer obeys the weight budget.
     // A dense full-N plan has one part and needs only one buffer.
     std::array<torch::Tensor, 2> scratch;
@@ -476,7 +476,7 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
         }
         throw;
     }
-    ProfilingInterface::Instance().instrument(false, prof);
+    ProfilingInterface::instance().instrument(false, prof);
     if (!capturing)
         prepared->second.warmed = true;
     return true;

@@ -1,6 +1,7 @@
 #pragma once
 #include <hgtx3/hgToolsExt.h>
 #include <hggc_runtime.h>
+#include <algorithm>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -130,11 +131,9 @@ void set_paged_mqa_logits_params(std::string data_type, int batch_size, int next
 
 template <typename T>
 void add_params(const std::string& key, const T& val) {
-    if (args_.find(key) == args_.end()) {
-        args_.insert(std::make_pair(key, val_to_string(val)));
-    }
-    args_.at(key) = val_to_string(val);
-    insertionOrder.push_back(key);
+    if (std::find(insertionOrder.begin(), insertionOrder.end(), key) == insertionOrder.end())
+        insertionOrder.push_back(key);
+    args_[key] = val_to_string(val);
 }
 
 void set_params(GemmType gemm_type, bool is_gemv,
@@ -413,7 +412,7 @@ public:
     ProfilingInterface(ProfilingInterface const&) = delete;
     void operator=(ProfilingInterface const&) = delete;
 
-    static ProfilingInterface& Instance() {
+    static ProfilingInterface& instance() {
         static ProfilingInterface instance;
         return instance;
   }
