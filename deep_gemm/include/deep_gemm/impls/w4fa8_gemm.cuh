@@ -34,6 +34,7 @@ template <int ShapeN, int ShapeK,
           int N_EXPAND = 1, bool ApplyInvScale = false>
 class W4A8GEMM_MMA {
 public:
+  static_assert(WarpN == 16 || WarpN == 32 || WarpN == 64);
   static_assert(N_EXPAND >= 1 && N_EXPAND <= 4);
   static_assert(N_EXPAND == 1 || (kGemmType == GemmType::MGroupedNoPad && kNumStages == 2 && BlockK == WarpK));
   static_assert(N_EXPAND == 1 || ShapeN % (BlockN * N_EXPAND) == 0);
@@ -50,7 +51,7 @@ public:
   // basic
   static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   // A packed K64 slice feeds two K32 MMA steps for every M tile and grouped kind.
-  static constexpr bool BatchDequant = WarpN == 64 && WarpK == 128;
+  static constexpr bool BatchDequant = WarpK == 128;
   static constexpr bool E8M0_scale = true;
   static constexpr bool scale_use_ld_matrix = true;
   static constexpr int N = ShapeN;
@@ -78,14 +79,14 @@ public:
 
   // fp4 mma => dequant
   using FP4MmaInst = PPU0015_16x16x64_F32F4F4F32_TN;
-  using FP4PermutationMNK = Tile<Layout<Shape<_16, Int<WarpsOnN>, _4>, Stride<_1, Int<WarpN>, _16>>, _16, Int<WarpsOnK * 32>>;
+  using FP4PermutationMNK = Tile<Layout<Shape<_16, Int<WarpsOnN>, Int<WarpN / 16>>, Stride<_1, Int<WarpN>, _16>>, _16, Int<WarpsOnK * 32>>;
   using FP4TiledMma = TiledMMA<MMA_Atom<FP4MmaInst>, Layout<Shape<Int<WarpsOnN>, _1, Int<WarpsOnK>>>, FP4PermutationMNK>;
 
   // Mixed E4M3 activation x E5M2 dequantized weight MMA
   using MmaInst = PPU0015_16x16x32_F32E4M3E5M2F32_TN;
   using PermutationMNK = Tile<
     Int<WarpsOnM * 16>,
-    Layout<Shape<_16, Int<WarpsOnN>, _4>, Stride<_1, _64, _16>>,
+    Layout<Shape<_16, Int<WarpsOnN>, Int<WarpN / 16>>, Stride<_1, Int<WarpN>, _16>>,
     Int<WarpsOnK * 32>
   >;
   using TiledMma = TiledMMA<MMA_Atom<MmaInst>, Layout<Shape<Int<WarpsOnM>, Int<WarpsOnN>, Int<WarpsOnK>>>, PermutationMNK>;
@@ -130,7 +131,7 @@ public:
   using ScaleCopyTraits = Copy_Traits<ScaleCopyOp>;
   using SmemCopyAtomScale = Copy_Atom<ScaleCopyTraits, ElementScale>;
   using SmemThrLayoutScale = Layout<
-    Shape<Int<WarpsOnN>, Shape<_32, Int<WarpsOnK>>>,
+    Shape<Int<BlockN / 64>, Shape<_32, Int<WarpsOnK>>>,
     Stride<Int<32 * WarpsOnK>, Stride<_1, _32>>
   >;
   using SmemValLayoutScale = Layout<Shape<_1, _4>>;
@@ -259,7 +260,8 @@ public:
     FP4TiledMma fp4_tiled_mma;
     auto fp4_thr_mma = fp4_tiled_mma.get_thread_slice(thread_idx_B);
     Tensor fp4_tCrB = fp4_thr_mma.partition_fragment_A(sB(_,_,0));
-    Tensor fp4_accum = partition_fragment_C(fp4_tiled_mma, Shape<Int<BlockN>, Int<BlockK>>{})(_,_,0);
+    // Own the sliced register fragment instead of retaining a view into a temporary.
+    auto fp4_accum = make_fragment_like<ElementAcc>(partition_fragment_C(fp4_tiled_mma, Shape<Int<BlockN>, Int<BlockK>>{})(_,_,0));
 
     TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
@@ -293,7 +295,9 @@ public:
     Tensor tCsB = smem_thr_copy_B.partition_S(mix_sB);
     Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(fp4_tCrB);
 
-    int thread_idx_nk = (warpn_idx * WarpsOnK + warpk_idx) * NumThreadsPerWarp;
+    // Native scale packing is organized in N64 units. Adjacent narrow
+    // N warps load the same scale word and select their N16 sub-fragment.
+    int thread_idx_nk = ((warpn_idx / (64 / WarpN)) * WarpsOnK + warpk_idx) * NumThreadsPerWarp;
     if constexpr(not scale_use_ld_matrix) {
       thread_idx_nk += lane_idx;
     } else {
@@ -400,6 +404,10 @@ public:
             uint32_t d;
             uint32_t addr = cute::cast_smem_ptr_to_uint(cute::raw_pointer_cast(tCsS(_,_,fp4_k_block,stage_idx).data()));
             asm volatile("ppu.tc02.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];" : "=r"(d) : "r"(addr));
+            if constexpr (WarpN < 64) {
+              const int source_lane = (lane_idx & ~3) + (lane_idx & (WarpN / 16 - 1)) + (warpn_idx % (64 / WarpN)) * (WarpN / 16);
+              d = __shfl_sync(0xffffffffu, d, source_lane);
+            }
             tCrS(0,0,fp4_k_block) = d;
           }
         }
@@ -416,6 +424,10 @@ public:
             uint32_t d;
             uint32_t addr = cute::cast_smem_ptr_to_uint(cute::raw_pointer_cast(tCsS(_,_,fp4_k_block,stage_idx).data()));
             asm volatile("ppu.tc02.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];" : "=r"(d) : "r"(addr));
+            if constexpr (WarpN < 64) {
+              const int source_lane = (lane_idx & ~3) + (lane_idx & (WarpN / 16 - 1)) + (warpn_idx % (64 / WarpN)) * (WarpN / 16);
+              d = __shfl_sync(0xffffffffu, d, source_lane);
+            }
             tCrS(0,0,fp4_k_block) = d;
           }
         }
@@ -620,10 +632,13 @@ public:
             constexpr int k_block = decltype(k_block_ic)::value;
             if constexpr (BatchDequant && k_block % 2 == 0)
               s2r_copy_B_and_scale_slice(stage_idx, k_block / 2);
-            s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
+            // Wide-M A fragments must not overlap the FP4 dequantization
+            // scratch registers; load A after the B fragment is converted.
+            if constexpr (WarpM <= 64 || !BatchDequant)
+              s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
 
             #pragma unroll
-            for (int n_block = 0; n_block < 4; n_block++) {
+            for (int n_block = 0; n_block < WarpN / 16; n_block++) {
               CUTE_UNROLL
               for (int half = 0; half < 2; ++half) {
                 auto dequant_accum = fp4_accum(_, n_block);
@@ -640,10 +655,12 @@ public:
               }
             }
             if constexpr (BatchDequant) {
+              if constexpr (WarpM > 64)
+                s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
               // Convert the whole warp N tile before consuming it, giving the
               // compiler independent FP4 operations to hide conversion latency.
               #pragma unroll
-              for (int n_block = 0; n_block < 4; ++n_block) {
+              for (int n_block = 0; n_block < WarpN / 16; ++n_block) {
                 #pragma unroll
                 for (int m_block = 0; m_block < size<1>(accum); ++m_block) {
                   cute::gemm(tiled_mma, tCrA(_,m_block,k_block), tCrB(_,n_block,k_block), accum(_,m_block,n_block));

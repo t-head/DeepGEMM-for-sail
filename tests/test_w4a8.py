@@ -458,6 +458,104 @@ def test_masked_shifted_scale():
     print('PASS masked shifted scale and per-expert rows')
 
 
+
+
+
+def test_tuned_nopad_dispatch():
+    # Cover all three small-M kernels, uneven/empty experts, explicit native
+    # configs, optional row counts and non-default output scaling.
+    for groups, n, k in ((28, 6144, 3584), (56, 3584, 3072)):
+        packed = torch.randint(256, (groups, n, k // 2), device='cuda', dtype=torch.uint8)
+        raw = torch.full((groups, n, k // 32), 127, device='cuda', dtype=torch.uint8)
+        rhs = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+        for mean_rows in (1, 17, 33):
+            counts = [mean_rows] * groups
+            counts[0] += counts[-1]
+            counts[-1] = 0
+            rows = torch.tensor(counts, device='cuda', dtype=torch.int32)
+            indices = torch.repeat_interleave(torch.arange(groups, device='cuda', dtype=torch.int32), rows.long())
+            quantized = quant_activation(torch.randn(sum(counts), k, device='cuda', dtype=torch.bfloat16))
+            lhs = quantized[0], quantized[1] * rhs[2]
+            output = torch.full((sum(counts), n), float('nan'), device='cuda', dtype=torch.bfloat16)
+            reference = torch.empty_like(output)
+            begin = 0
+            for expert, count in enumerate(counts):
+                if count:
+                    a = lhs[0][begin:begin + count].float() * quantized[1][begin:begin + count]
+                    reference[begin:begin + count] = (a @ decode_weight(packed[expert], raw[expert]).T).bfloat16()
+                begin += count
+            call = deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad
+            call(lhs, rhs[:2], output, indices, rows)
+            assert torch.isfinite(output).all()
+            assert calc_diff(output, reference) < .0015
+            baseline = output.clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                call(lhs, rhs[:2], output, indices, rows)
+            lhs[1].neg_()
+            graph.replay()
+            assert torch.equal(output, -baseline)
+            lhs[1].neg_()
+            call(lhs, rhs[:2], output, indices, rows, inv_scale=.25)
+            assert calc_diff(output, reference * .25) < .0015
+            call(lhs, rhs[:2], output, indices)
+            assert calc_diff(output, reference) < .0015
+            configs = (deep_gemm.get_num_sms(), 16, 256, 128, 16, 64, 128, 2, 1)
+            call(lhs, rhs[:2], output, indices, rows, configs)
+            assert calc_diff(output, reference) < .0015
+        del packed, raw, rhs, lhs, output, reference, baseline, graph
+        torch.cuda.empty_cache()
+    print('PASS native W4A8 small-M dispatch, configs, scales and Graph inputs')
+
+
+def test_tuned_fused_dispatch():
+    # Constant-K E2M1 codes give a reference independent of the optimized MMA.
+    groups, n, k, tokens, topk = 896, 768, 3584, 8192, 16
+    codes = (torch.arange(groups, device='cuda')[:, None] + torch.arange(n, device='cuda')[None, :]) % 16
+    packed = (codes.to(torch.uint8) * 17)[:, :, None].expand(groups, n, k // 2).contiguous()
+    raw = torch.full((groups, n, k // 32), 127, device='cuda', dtype=torch.uint8)
+    rhs = deep_gemm.preprocess_weights_and_scales(
+        deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+    values = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.], device='cuda')
+    weight = values[codes]
+    quantized = quant_activation(torch.randn(tokens, k, device='cuda', dtype=torch.bfloat16))
+    lhs = quantized[0], quantized[1] * rhs[2]
+    for balanced in (True, False):
+        routes = ((torch.arange(tokens * topk, device='cuda').reshape(tokens, topk) % groups).int()
+                  if balanced else torch.rand(tokens, groups, device='cuda').topk(topk, dim=1).indices.int())
+        configs, rows, experts, sorted_tokens, aligned, _, _ = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routes)
+        order = routes.flatten().argsort(stable=True)
+        source = order // topk
+        counts = torch.bincount(routes.flatten().long(), minlength=groups).cpu().tolist()
+        sums = (lhs[0].float().sum(1) * quantized[1][:, 0])[source]
+        reference = torch.empty(tokens * topk, n, device='cuda', dtype=torch.bfloat16)
+        begin = 0
+        for expert, count in enumerate(counts):
+            reference[begin:begin + count] = (sums[begin:begin + count, None] * weight[expert]).bfloat16()
+            begin += count
+        output = torch.full_like(reference, float('nan'))
+        def call():
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+                lhs, rhs[:2], output, rows, experts, sorted_tokens, aligned, configs)
+        call()
+        assert torch.isfinite(output).all()
+        assert calc_diff(output, reference) < .003
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+        lhs[1].neg_()
+        graph.replay()
+        assert calc_diff(output, -reference) < .003
+        lhs[1].zero_()
+        graph.replay()
+        assert torch.equal(output, torch.zeros_like(output))
+        # Restore a fresh activation scale for the other routing distribution.
+        quantized = quant_activation(torch.randn(tokens, k, device='cuda', dtype=torch.bfloat16))
+        lhs = quantized[0], quantized[1] * rhs[2]
+    print('PASS native W4A8 routed dispatch, balanced/random routes and Graph inputs')
+
+
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -469,6 +567,8 @@ if __name__ == '__main__':
     if is_ppu1v5_device():
         test_grouped_gemm()
         test_inv_scale()
+        test_tuned_nopad_dispatch()
+        test_tuned_fused_dispatch()
         test_nopad_expert_limit()
         test_nopad_n_expand()
         test_nopad_resident_a_and_scales()

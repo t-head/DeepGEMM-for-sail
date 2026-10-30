@@ -1669,6 +1669,7 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_nopad(const std::pair<torch::Tensor, 
                                       const torch::Tensor& indices, std::optional<torch::Tensor> rows = std::nullopt,
                                       std::optional<W4A8ConfigTuple> configs = std::nullopt, float inv_scale = 1.0f) {
     check_w4fa8_operands(a, b, out, GemmType::MGroupedNoPad);
+    const c10::cuda::CUDAGuard device_guard(a.first.device());
     const int m = a.first.size(-2), n = b.first.size(1), k = a.first.size(-1), num_groups = b.first.size(0);
     check_w4fa8_indices(indices, a.first);
     TORCH_CHECK(indices.dim() == 1 && indices.numel() == m, "m_indices shape mismatch");
@@ -1684,6 +1685,18 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_nopad(const std::pair<torch::Tensor, 
     const int em = ceil_div(m, num_groups);
     auto c = configs.has_value() ? deep_gemm::w4fa8::unpack_config(*configs)
                                  : deep_gemm::w4fa8::get_best_configs(em, n, k, num_groups, GemmType::MGroupedNoPad);
+    if (inv_scale == 1.0f && !configs.has_value() && !is_compile_only() && is_ppu1v5_device()) {
+        if (rows.has_value() && deep_gemm::w4fa8::try_run_specialized(
+                a.first,a.second,b.first,b.second,out,counts,GemmType::MGroupedNoPad,c))
+            return;
+        const int tile_n = deep_gemm::w4fa8::streamed_tile_n(n,k,num_groups);
+        const int minimum_rows = deep_gemm::w4fa8::streamed_min_rows(n,k,num_groups,m,c.num_sms);
+        if (tile_n && int64_t(m) >= int64_t(num_groups)*minimum_rows) {
+            deep_gemm::w4fa8::streamed::run_streamed(
+                a.first,a.second,b.first,b.second,out,counts,tile_n,c.num_sms,rows.has_value());
+            return;
+        }
+    }
     deep_gemm::w4fa8::run(a.first, a.second, b.first, b.second, out, counts, GemmType::MGroupedNoPad, em, c, inv_scale);
 }
 
@@ -1692,6 +1705,7 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_masked(const std::pair<torch::Tensor,
                                        const torch::Tensor& rows, int expected_m,
                                        std::optional<W4A8ConfigTuple> configs = std::nullopt, float inv_scale = 1.0f) {
     check_w4fa8_operands(a, b, out, GemmType::MGroupedMasked);
+    const c10::cuda::CUDAGuard device_guard(a.first.device());
     const int m = a.first.size(-2), n = b.first.size(1), k = a.first.size(-1), num_groups = b.first.size(0);
     check_w4fa8_indices(rows, a.first);
     TORCH_CHECK(rows.dim() == 1 && rows.numel() == num_groups && expected_m >= 0, "masked_m shape or expected_m invalid");
@@ -1709,6 +1723,7 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_fused(const std::pair<torch::Tensor, 
                                       const torch::Tensor& tokens, const torch::Tensor& aligned,
                                       const W4A8ConfigTuple& configs, float inv_scale = 1.0f) {
     check_w4fa8_operands(a, b, out, GemmType::MGroupedFused);
+    const c10::cuda::CUDAGuard device_guard(a.first.device());
     const int m = a.first.size(0), num_groups = b.first.size(0);
     for (const auto& t : {rows, experts, tokens, aligned})
         check_w4fa8_indices(t, a.first);
@@ -1716,6 +1731,9 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_fused(const std::pair<torch::Tensor, 
     if (!m)
         return;
     auto c = deep_gemm::w4fa8::unpack_config(configs);
+    if (inv_scale == 1.0f && deep_gemm::w4fa8::try_run_specialized(
+            a.first,a.second,b.first,b.second,out,rows,GemmType::MGroupedFused,c,tokens))
+        return;
     deep_gemm::w4fa8::run(a.first, a.second, b.first, b.second, out, rows, GemmType::MGroupedFused,
                          ceil_div(int(out.size(0)), num_groups), c, inv_scale, experts, tokens, aligned);
 }
