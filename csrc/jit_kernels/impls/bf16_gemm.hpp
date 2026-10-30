@@ -1683,6 +1683,7 @@ static void model_810e_dispatch_dense_entry(const Model810eDenseDispatchEntry& e
 static bool model_810e_dispatch_dense(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
     if constexpr (kModel810eDenseDispatch.size() == 0) return false;
     if (!model_810e_dispatch_device()) return false;
+    if (get_num_sms() < device_runtime->get_prop()->multiProcessorCount) return false;
     // Native input descriptors require aligned bases; preserve the
     // original fallback for unusual contiguous views with a storage offset.
     if ((reinterpret_cast<uintptr_t>(a.data_ptr()) & 15) != 0 ||
