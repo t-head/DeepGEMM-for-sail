@@ -12,10 +12,10 @@ if not os.path.isfile(os.path.join(PPU_HOME, 'bin', 'hgcc')):
 
 from . import jit
 from . import deep_gemm_tuner
-from . import deep_gemm_cpp
+from . import _C
 
 # Configs
-from .deep_gemm_cpp import (
+from ._C import (
     set_num_sms,
     get_num_sms,
     set_tc_util,
@@ -29,7 +29,7 @@ from .deep_gemm_cpp import (
 )
 
 # Layout utilities
-from .deep_gemm_cpp import (
+from ._C import (
     transform_sf_into_required_layout,
     get_mn_major_tma_aligned_tensor,
     get_col_major_tensor,
@@ -37,13 +37,13 @@ from .deep_gemm_cpp import (
 )
 
 # acblasLt GEMMs
-from .deep_gemm_cpp import (
+from ._C import (
     acblaslt_gemm_nt, acblaslt_gemm_nn,
     acblaslt_gemm_tn, acblaslt_gemm_tt,
 )
 
 # DeepGEMM Kernels
-from .deep_gemm_cpp import (
+from ._C import (
     # BF16 GEMMs
     bf16_gemm_nt,
     bf16_gemm_nn,
@@ -128,14 +128,14 @@ from .deep_gemm_cpp import (
     fp8_fp4_paged_sparse_mqa_logits,
 )
 
-deep_gemm_cpp.init(
+_C.init(
     os.path.dirname(os.path.abspath(__file__)), # Library root directory path
     PPU_HOME         # SDK root
 )
 
 
 # Unimplemented kernels are instead routed to a unified `unimplemented` function below.
-# from .deep_gemm_cpp import (
+# from ._C import (
 #     # K-Grouped
 #     k_grouped_fp8_gemm_nt_contiguous,
 #     k_grouped_fp8_gemm_tn_contiguous,

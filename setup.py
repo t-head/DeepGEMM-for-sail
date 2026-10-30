@@ -182,7 +182,7 @@ if __name__ == '__main__':
 
     ext_modules = []
     ext_modules.append(
-        CppExtension(name='deep_gemm.deep_gemm_cpp',
+        CppExtension(name='deep_gemm._C',
                         sources=sources,
                         include_dirs=build_include_dirs,
                         libraries=build_libraries,

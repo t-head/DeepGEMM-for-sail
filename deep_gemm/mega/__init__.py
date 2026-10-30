@@ -10,7 +10,7 @@ import warnings
 import torch
 import torch.distributed as dist
 
-from .. import deep_gemm_cpp
+from .. import _C
 from ..jit_kernels.utils import is_ppu1v5_device
 
 __all__ = [
@@ -49,9 +49,9 @@ class SymmBuffer:
         if mma_type != "fp4xfp4":
             raise ValueError("PPU MegaMoE requires mma_type='fp4xfp4' (MXFP4)")
         _check_activation(activation)
-        alignment = deep_gemm_cpp.get_token_alignment_for_mega_moe()
+        alignment = _C.get_token_alignment_for_mega_moe()
         num_max_tokens_per_rank = (num_max_tokens_per_rank + alignment - 1) // alignment * alignment
-        total, slice_inputs = deep_gemm_cpp.get_symm_buffer_size_for_mega_moe(
+        total, slice_inputs = _C.get_symm_buffer_size_for_mega_moe(
             group.size(), num_experts, num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden, mma_type, activation, num_shared_experts)
         self.group, self.num_ranks = group, group.size()
@@ -192,7 +192,7 @@ def mega_moe_pre_dispatch(
     operator. The complete call derives its actual token count from y.shape[0].
     """
     _check_buffer(sym_buffer)
-    deep_gemm_cpp.mega_moe_pre_dispatch(
+    _C.mega_moe_pre_dispatch(
         hidden_states, topk_idx, topk_weights,
         sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights, num_tokens)
 
@@ -236,7 +236,7 @@ def fp4_fp4_mega_moe(
             or not isinstance(l1_weights[0], torch.Tensor)
             or l1_weights[0].ndim != 3 or l1_weights[0].shape[1] != 2 * sym_buffer.intermediate_hidden):
         raise ValueError("l1_weights must match the workspace intermediate_hidden")
-    deep_gemm_cpp.fp4_fp4_mega_moe(
+    _C.fp4_fp4_mega_moe(
         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
