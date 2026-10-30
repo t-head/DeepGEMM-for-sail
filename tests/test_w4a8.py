@@ -160,6 +160,11 @@ def test_nopad_n_expand():
             out.fill_(float('nan'))
             deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(gemm_lhs, rhs[:2], out, indices, rows, selected)
             assert torch.equal(out, baseline), (groups, n, k, expand)
+        if bm == 32 and k <= 512 and expand > 1:
+            out.fill_(float('nan'))
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+                gemm_lhs, rhs[:2], out, indices, rows, config[:-1] + (expand,), inv_scale=.25)
+            assert torch.equal(out, baseline * .25), (groups, n, k, expand)
         # Explicit expansion remains valid above the automatic short-K threshold.
         if k == 768:
             deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(gemm_lhs, rhs[:2], out, indices, rows, config[:-1] + (4,))

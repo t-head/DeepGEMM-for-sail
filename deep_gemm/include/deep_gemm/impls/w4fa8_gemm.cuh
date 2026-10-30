@@ -46,7 +46,7 @@ public:
   // A fourth slot reduces CTA residency for the default N256 tile.
   static constexpr bool ResidentA = N_EXPAND > 1 && WarpM == 64 && ShapeK <= 384;
   static constexpr int ASlots = ResidentA && ShapeK / BlockK > kNumStages ? ShapeK / BlockK : kNumStages;
-  static constexpr bool CacheRowScale = N_EXPAND > 1 && WarpM == 64 && ShapeK <= 512;
+  static constexpr bool CacheRowScale = N_EXPAND > 1 && WarpM >= 32 && ShapeK <= 512;
   // basic
   static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   // A packed K64 slice feeds two K32 MMA steps for every M tile and grouped kind.
@@ -359,7 +359,7 @@ public:
             copy(gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,k_pipe));
           }
         } else { // async copy
-          deep_gemm::copy_A_to_tsm<ElementA, cute::PPU_CP_ASYNC_CACHEALWAYS<cutlass::uint128_t>, TilerA, BlockM, BlockK, K>(
+          deep_gemm::copy_A_to_tsm<ElementA, deep_gemm::FusedACopyInst, TilerA, BlockM, BlockK, K>(
               tAsA(_,_,_,k_pipe), params.ptr_a, token_offsets,
               BlockK * k_tile_iter, params.num_token, thread_idx,
               Int<MaxThreadsPerBlock>{});
