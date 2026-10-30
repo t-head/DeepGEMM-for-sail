@@ -226,7 +226,6 @@ dispatch_gemm1_device(
         const uint8_t* __restrict__ input_token,
         const uint8_t* __restrict__ input_sf,
         uint8_t* __restrict__ dispatched_token_pool,
-        uint8_t* __restrict__ dispatched_scale_pool,
         void* __restrict__ gemm2_metadata,
         int32_t* __restrict__ cumulative_local_expert_recv_stats,
         const uint32_t num_tokens,
