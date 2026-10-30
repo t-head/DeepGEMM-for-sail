@@ -46,7 +46,7 @@ public:
         return mk_alignment_for_contiguous_layout;
     }
     int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m) const {
-        return get_mk_alignment_for_contiguous_layout();
+        return kLegacyMKAlignmentForContiguousLayout;
     }
 };
 
