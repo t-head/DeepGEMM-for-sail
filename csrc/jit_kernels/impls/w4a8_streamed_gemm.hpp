@@ -38,7 +38,7 @@ class StreamedDecodeRuntime final : public LaunchRuntime<StreamedDecodeRuntime> 
         bool empty_flat = false;
     };
     static bool full_n_fast(const Args& a) {
-        return a.tile_n == a.n && a.n >= 3584 && a.k >= 3072 && uint64_t(a.groups) * a.n * a.k <= UINT32_MAX;
+        return a.tile_n == a.n && a.n % 512 == 0 && a.k % 128 == 0 && uint64_t(a.groups) * a.n * a.k <= UINT32_MAX;
     }
     static std::string kernel_name(const Args& a) {
         // Reuse the established FP8 compiler options for this integer-to-FP8 decoder.
@@ -111,75 +111,6 @@ void fp8_grouped_deep_gemm_w4a8_streamed_core(Params params) {{
     }
 };
 
-// Full-width tiles remain a strict subset of the experts and are decoded anew.
-static void run_streamed_serial(const torch::Tensor& a, const torch::Tensor& a_scale, const torch::Tensor& b,
-                                const torch::Tensor& scale, const torch::Tensor& d, const torch::Tensor& rows,
-                                int tile_n, int num_sms) {
-    const int groups = b.size(0), n = b.size(1), k = a.size(1), m = a.size(0);
-    constexpr int chunk = 14, threads = 512, core_smem = 256 * 1024;
-    DgProfParam prof;
-    if (ProfilingInterface::Instance().get_op_info()) {
-        prof.set_params(GemmType::MGroupedNoPad, false, "w4fa8_streamed", groups, m, n, k, ceil_div(m, groups),
-                        rows.data_ptr<int32_t>(), current_stream());
-        prof.add_params(std::string("group_size"), 32);
-    }
-    ProfilingInterface::Instance().instrument(true, prof);
-    auto scratch = at::empty({int64_t(chunk) * tile_n * k + 8}, b.options());
-    auto ones = at::ones({chunk, tile_n, 1}, a_scale.options());
-    auto output = reinterpret_cast<cutlass::bfloat16_t*>(d.data_ptr());
-    const auto stride_input = cute::Stride<int64_t, cute::Int<1>, int64_t>{k, cute::Int<1>{}, 0};
-    const auto stride_output = cute::Stride<int64_t, cute::Int<1>, int64_t>{n, cute::Int<1>{}, 0};
-    const int remainder = groups % chunk;
-    for (int local_groups : {chunk, remainder}) {
-        if (!local_groups || local_groups > groups)
-            continue;
-        StreamedDecodeRuntime::Args decode{
-            n,
-            k,
-            tile_n,
-            local_groups,
-            {dim3(std::min<int64_t>((int64_t(local_groups) * tile_n * k / 16 + 255) / 256, int64_t(num_sms) * 8)),
-             dim3(256), 0},
-            {}};
-        StreamedCoreRuntime::Args core{n, k, tile_n, local_groups, {dim3(num_sms), dim3(threads), core_smem}, {}};
-        const auto& decoder =
-            compiler->build(StreamedDecodeRuntime::kernel_name(decode), StreamedDecodeRuntime::generate(decode));
-        const auto& gemm =
-            compiler->build("fp8_grouped_deep_gemm_w4a8_streamed_core", StreamedCoreRuntime::generate(core));
-        construct_launch_config(gemm->kernel, current_stream(), core_smem, core.launch_args.grid_dim,
-                                core.launch_args.block_dim);
-        int blocks = 0;
-        DG_HGGC_UNIFIED_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, gemm->kernel, threads, core_smem));
-        DG_HOST_ASSERT(blocks > 0);
-        core.launch_args.grid_dim = dim3(num_sms * blocks);
-        for (int group_start = 0; group_start < groups; group_start += chunk) {
-            if (std::min(chunk, groups - group_start) != local_groups)
-                continue;
-            auto range =
-                reinterpret_cast<const int32_t*>(scratch.data_ptr<uint8_t>() + int64_t(local_groups) * tile_n * k);
-            for (int start = 0; start < n; start += tile_n) {
-                decode.params = {b.data_ptr<uint8_t>() + int64_t(group_start) * n * k / 2,
-                                 scale.data_ptr<uint8_t>() + int64_t(group_start) * n * k / 32,
-                                 scratch.data_ptr<uint8_t>(),
-                                 start,
-                                 rows.data_ptr<int32_t>(),
-                                 group_start};
-                StreamedDecodeRuntime::launch(decoder, decode);
-                core.params = {StreamedInt8::GemmUniversalMode::kGemm,
-                               {m, tile_n, k, 1},
-                               {a.data_ptr(), stride_input, scratch.data_ptr(), stride_input, a_scale.data_ptr<float>(),
-                                ones.data_ptr<float>()},
-                               {{}, output + start, stride_output, output + start, stride_output},
-                               {a.get_device(), num_sms},
-                               {uint32_t(m), rows.data_ptr<int32_t>() + group_start, range},
-                               nullptr,
-                               nullptr};
-                StreamedCoreRuntime::launch(gemm, core);
-            }
-        }
-    }
-    ProfilingInterface::Instance().instrument(false, prof);
-}
 // Resources contain stream/event identities only. Every call allocates and
 // overwrites its own pair of partial weight tiles.
 struct StreamedAsyncContext {
@@ -189,7 +120,7 @@ struct StreamedAsyncContext {
     std::vector<hggcEvent_t> decoded, consumed;
     std::mutex submit_mutex;
     // Shape readiness is CPU metadata only; no decoded weights are retained.
-    using ShapeKey = std::tuple<int, int, int, int, int, bool>;
+    using ShapeKey = std::tuple<int, int, int, int, int, int, bool, bool>;
     std::set<ShapeKey> warmed_shapes;
 
     explicit StreamedAsyncContext(int device_) : device(device_) {}
@@ -276,7 +207,7 @@ static bool run_streamed_async(const torch::Tensor& a, const torch::Tensor& a_sc
     // The entire event submission is atomic with respect to other host callers
     // using this caller stream; previously queued waits retain their event record.
     std::lock_guard<std::mutex> lock(context->submit_mutex);
-    const StreamedAsyncContext::ShapeKey key{n, k, groups, num_sms, chunk, ramp};
+    const StreamedAsyncContext::ShapeKey key{m, n, k, groups, num_sms, chunk, ramp, allow_sparse};
     // A captured call may only reuse resources and kernels warmed on this caller.
     if (capturing && (!context->warmed_shapes.count(key) || context->decoded.size() < size_t(parts) ||
                       context->consumed.size() < size_t(parts)))
@@ -299,20 +230,12 @@ static bool run_streamed_async(const torch::Tensor& a, const torch::Tensor& a_sc
         // Row32 lanes cover1024 K values per warp. Only the short-call tail path
         // uses the measured fence-free decoder; other paths retain V4.
         pair.decode.skip_fence = short_call && (k % 1024 != 0);
-        // Ordinary calls prune empty experts; captured calls retain the exact
-        // accepted decoder. Both variants are prepared before capture.
-        pair.decode.empty_flat = allow_sparse && short_call && !capturing &&
-                                 nonempty_streamed_eligible(groups, m, n, k, num_sms) &&
-                                 context->warmed_shapes.count(key);
+        // Active experts are read on the device on every call, including
+        // Graph replay; empty experts never require decoded weight traffic.
+        pair.decode.empty_flat = allow_sparse;
         pair.core = {n, k, n, local_groups, {dim3(num_sms), dim3(threads), core_smem}, {}};
         pair.decoder = compiler->build(StreamedDecodeRuntime::kernel_name(pair.decode),
                                        StreamedDecodeRuntime::generate(pair.decode));
-        if (!capturing && !context->warmed_shapes.count(key)) {
-            auto graph_decode = pair.decode;
-            graph_decode.empty_flat = false;
-            compiler->build(StreamedDecodeRuntime::kernel_name(graph_decode),
-                            StreamedDecodeRuntime::generate(graph_decode));
-        }
         pair.gemm =
             compiler->build("fp8_grouped_deep_gemm_w4a8_streamed_core", StreamedCoreRuntime::generate(pair.core));
         construct_launch_config(pair.gemm->kernel, context->compute, core_smem, pair.core.launch_args.grid_dim,
@@ -324,29 +247,14 @@ static bool run_streamed_async(const torch::Tensor& a, const torch::Tensor& a_sc
         pair.core.launch_args.grid_dim = dim3(num_sms * blocks);
     }
 
-    // A newly capturing caller still uses the serial14 fallback. Loading a
-    // previously unseen module during capture is unsupported by SDK2.2, so an
-    // ordinary adaptive4 warmup also prepares that fallback without launching it.
-    if (!capturing && (ramp || chunk != 14) && !context->warmed_shapes.count(key)) {
-        for (int local_groups : {14, groups % 14}) {
-            if (!local_groups)
-                continue;
-            StreamedDecodeRuntime::Args decode{n, k, n, local_groups, {dim3(1), dim3(256), 0}, {}};
-            StreamedCoreRuntime::Args core{n, k, n, local_groups, {dim3(num_sms), dim3(threads), core_smem}, {}};
-            compiler->build(StreamedDecodeRuntime::kernel_name(decode), StreamedDecodeRuntime::generate(decode));
-            const auto fallback =
-                compiler->build("fp8_grouped_deep_gemm_w4a8_streamed_core", StreamedCoreRuntime::generate(core));
-            construct_launch_config(fallback->kernel, caller, core_smem, core.launch_args.grid_dim,
-                                    core.launch_args.block_dim);
-        }
-    }
     if (!capturing)
         context->warmed_shapes.insert(key);
 
     DgProfParam prof;
     if (ProfilingInterface::Instance().get_op_info()) {
-        prof.set_params(GemmType::MGroupedNoPad, false, "w4fa8_streamed_async", groups, m, n, k, ceil_div(m, groups),
+        prof.set_params(GemmType::MGroupedNoPad, false, "w4fa8_mma", groups, m, n, k, ceil_div(m, groups),
                         rows.data_ptr<int32_t>(), caller);
+        prof.add_params(std::string("quant_type"), std::string("group"));
         prof.add_params(std::string("group_size"), 32);
     }
     ProfilingInterface::Instance().instrument(true, prof);
@@ -433,22 +341,18 @@ static bool run_streamed_async(const torch::Tensor& a, const torch::Tensor& a_sc
     return true;
 }
 
-static void run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, const torch::Tensor& b,
+// Return before allocating or loading any module when capture has not been
+// warmed on this caller stream. The API can then use its prepared native path.
+static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, const torch::Tensor& b,
                          const torch::Tensor& scale, const torch::Tensor& d, const torch::Tensor& rows, int tile_n,
                          int num_sms, bool allow_sparse) {
     const c10::cuda::CUDAGuard device_guard(a.device());
     hggcStreamCaptureStatus capture = hggcStreamCaptureStatusNone;
     DG_HGGC_RUNTIME_CHECK(hggcStreamIsCapturing(current_stream(), &capture));
-    // Cold capture keeps the established serial route. Warm capture uses only
-    // preexisting caller-owned streams/events and already compiled kernel shapes.
-    if (tile_n == b.size(1) && full_width_streamed(b.size(1), a.size(1), b.size(0)) &&
-        get_compile_mode() != static_cast<int>(CompileMode::ONLY_COMPILE) &&
-        get_env<std::string>("HGGC_WARM_UP").empty()) {
-        auto context = streamed_async_context(a.get_device(), current_stream(), capture == hggcStreamCaptureStatusNone);
-        if (context && run_streamed_async(a, a_scale, b, scale, d, rows, num_sms, context,
-                                          capture != hggcStreamCaptureStatusNone, allow_sparse))
-            return;
-    }
-    run_streamed_serial(a, a_scale, b, scale, d, rows, tile_n, num_sms);
+    if (tile_n != b.size(1) || !full_width_streamed(b.size(1), a.size(1), b.size(0)) || is_compile_only())
+        return false;
+    const bool capturing = capture != hggcStreamCaptureStatusNone;
+    auto context = streamed_async_context(a.get_device(), current_stream(), !capturing);
+    return context && run_streamed_async(a, a_scale, b, scale, d, rows, num_sms, context, capturing, allow_sparse);
 }
 } // namespace deep_gemm::w4fa8::streamed

@@ -49,12 +49,17 @@ template <class Scheduler> class Runtime final : public LaunchRuntime<Runtime<Sc
         GemmType kind;
         LaunchArgs launch_args;
         Arguments<Scheduler> params;
+        NativeStrategy strategy = NativeStrategy::Default;
+        int device = 0;
+        std::pair<int, int> cache_variant() const { return {int(strategy), int(kind)}; }
     };
+    static const char* name() { return "m_grouped_gemm_w4fa8_mma"; }
     static std::string generate_impl(const Args& a) {
         const auto& c = a.config;
-        return fmt::format(R"(
+        return fmt::format(
+            R"(
 #include <deep_gemm/impls/w4fa8_gemm.cuh>
-using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}{}>;
+using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}, {}, deep_gemm::w4fa8::NativeStrategy::{}, {}>;
 static_assert(sizeof(Kernel::SharedStorage) == {}, "shared memory mismatch");
 static_assert(Kernel::MaxThreadsPerBlock == {}, "thread count mismatch");
 static_assert(sizeof(Kernel::Params) == {}, "kernel argument size mismatch");
@@ -64,15 +69,35 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
     Kernel{{}}(params, smem);
 }}
 )",
-                           a.n, a.k, c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, c.warp_k, a.groups,
-                           c.num_stages, get_gemm_type_name(a.kind), c.n_expand,
-                           a.params.inv_scale == 1.0f ? "" : ", true", get_smem_size(c, a.k), get_num_threads(c),
-                           sizeof(Arguments<Scheduler>));
+            a.n, a.k, c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, c.warp_k, a.groups, c.num_stages,
+            get_gemm_type_name(a.kind), c.n_expand, a.params.inv_scale != 1.0f ? "true" : "false",
+            a.strategy == NativeStrategy::Routed    ? "Routed"
+            : a.strategy == NativeStrategy::Compact ? "Compact"
+                                                    : "Default",
+            a.strategy == NativeStrategy::Routed
+                ? fmt::format("deep_gemm::w4fa8::W4A8RoutedScheduler<{}, {}, {}, {}>", a.n, a.k, c.block_m, c.block_n)
+                : "void",
+            a.launch_args.smem_size, get_num_threads(c), sizeof(Arguments<Scheduler>));
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
     }
 };
+
+static DgProfParam make_profile(GemmType kind, int groups, int m, int n, int k, int expected_m, int topk,
+                                int32_t* rows) {
+    DgProfParam prof;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        if (kind == GemmType::MGroupedFused)
+            prof.set_fused_moe_params("w4fa8_mma", "group", groups, m, topk, n, k, rows, current_stream());
+        else {
+            prof.set_params(kind, false, "w4fa8_mma", groups, m, n, k, expected_m, rows, current_stream());
+            prof.add_params(std::string("quant_type"), std::string("group"));
+        }
+        prof.add_params(std::string("group_size"), 32);
+    }
+    return prof;
+}
 
 template <class Scheduler>
 static void launch(const W4A8Config& c, int m, int n, int k, int groups, GemmType kind, int expected_m, int topk,
@@ -87,16 +112,7 @@ static void launch(const W4A8Config& c, int m, int n, int k, int groups, GemmTyp
     DG_HGGC_UNIFIED_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, runtime->kernel, threads, smem));
     DG_HOST_ASSERT(blocks > 0);
     args.launch_args.grid_dim = dim3(c.num_sms < 20 ? c.num_sms : c.num_sms * std::min(8, blocks));
-    DgProfParam prof;
-    if (ProfilingInterface::Instance().get_op_info()) {
-        if (kind == GemmType::MGroupedFused)
-            prof.set_fused_moe_params("w4fa8_mma", "group", groups, m, topk, n, k, m_rows, current_stream());
-        else {
-            prof.set_params(kind, false, "w4fa8_mma", groups, m, n, k, expected_m, m_rows, current_stream());
-            prof.add_params(std::string("quant_type"), std::string("group"));
-        }
-        prof.add_params(std::string("group_size"), 32);
-    }
+    auto prof = make_profile(kind, groups, m, n, k, expected_m, topk, m_rows);
     if (const char* log = std::getenv("show_log"); log && isdigit(*log)) {
         int regs = 0, stack = 0;
         hgFuncGetAttribute(&regs, HG_FUNC_ATTRIBUTE_NUM_REGS, runtime->kernel);
@@ -171,7 +187,7 @@ template <class R>
 static std::optional<SpecializedKernel> prepare_specialized(const typename R::Args& args, bool capturing) {
     using Key = std::tuple<int, int, int, int, W4A8ConfigTuple, std::pair<int, int>>;
     static std::mutex mutex;
-    static std::map<Key, SpecializedKernel> kernels;
+    static std::map<Key, std::optional<SpecializedKernel>> kernels;
     const Key key{args.device, args.n, args.k, args.groups, pack_config(args.config), args.cache_variant()};
     std::lock_guard<std::mutex> lock(mutex);
     if (const auto it = kernels.find(key); it != kernels.end())
@@ -180,57 +196,25 @@ static std::optional<SpecializedKernel> prepare_specialized(const typename R::Ar
     if (capturing)
         return std::nullopt;
     const auto runtime = compiler->build(R::name(), R::generate(args));
+    construct_launch_config(runtime->kernel, current_stream(), args.launch_args.smem_size, args.launch_args.grid_dim,
+                            args.launch_args.block_dim);
+    int local_bytes = 0;
+    DG_HGGC_UNIFIED_CHECK(hgFuncGetAttribute(&local_bytes, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, runtime->kernel));
+    if (!fits_compiled_strategy(local_bytes))
+        return kernels.emplace(key, std::nullopt).first->second;
     int blocks = 0;
     DG_HGGC_UNIFIED_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks, runtime->kernel, args.launch_args.block_dim.x, args.launch_args.smem_size));
-    TORCH_CHECK(blocks > 0, "W4A8 specialization has no resident CTA");
+    if (blocks == 0)
+        return kernels.emplace(key, std::nullopt).first->second;
     return kernels.emplace(key, SpecializedKernel{runtime, blocks}).first->second;
 }
 
-struct SmallMArguments {
-    const void* a;
-    const void* b;
-    const void* scale;
-    void* d;
-    const float* a_scale;
-    int num_token;
-    const int* sorted_token_ids;
-    TileSchedulerArguments scheduler;
+struct RoutedSchedulerArguments {
+    const uint8_t* meta;
 };
-
-class SmallMRuntime final : public LaunchRuntime<SmallMRuntime> {
-  public:
-    struct Args {
-        W4A8Config config;
-        int n, k, groups, device, variant = 0;
-        LaunchArgs launch_args;
-        SmallMArguments params;
-        std::pair<int, int> cache_variant() const { return {variant, 0}; }
-    };
-    static const char* name() { return "m_grouped_gemm_w4fa8_mma"; }
-    static std::string generate_impl(const Args& a) {
-        const auto& c = a.config;
-        return fmt::format(R"(
-#include <deep_gemm/impls/w4a8_small_m.cuh>
-using Kernel = cutlass::gemm::kernel::W4A8SmallMGemm<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::MGroupedNoPad, {}, {}, {}>;
-static_assert(sizeof(Kernel::SharedStorage) == {}, "small-M shared memory mismatch");
-static_assert(sizeof(Kernel::Params) == {}, "small-M parameter ABI mismatch");
-extern "C" __global__ __launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
-void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
-    extern __shared__ char smem[];
-    Kernel{{}}(params, smem);
-}}
-// device={}
-)",
-                           a.n, a.k, c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, c.warp_k, a.groups,
-                           c.num_stages, c.n_expand, kSmallMPolicy.k_batch,
-                           kSmallMPolicy.schedule_bound ? "true" : "false", a.launch_args.smem_size,
-                           sizeof(SmallMArguments), a.device);
-    }
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
-    }
-};
+using SmallMRuntime = Runtime<TileSchedulerArguments>;
+using RoutedRuntime = Runtime<RoutedSchedulerArguments>;
 
 class RoutedMetadataRuntime final : public LaunchRuntime<RoutedMetadataRuntime> {
   public:
@@ -247,75 +231,13 @@ class RoutedMetadataRuntime final : public LaunchRuntime<RoutedMetadataRuntime> 
 #include <deep_gemm/scheduler/w4a8_routed_scheduler.cuh>
 extern "C" __global__ __launch_bounds__(256)
 void w4a8_routed_metadata(deep_gemm::w4fa8::RoutedMetadataArguments p) {{
-    deep_gemm::w4fa8::build_w4a8_routed_metadata<{}, {}, {}, {}, {}>(
-        p.rows, p.fast_lo, p.fast_hi, p.old_lo, p.old_hi, p.max_extra_rows);
+    deep_gemm::w4fa8::build_w4a8_routed_metadata<{}, {}, {}, {}>(
+        p.rows, p.lower, p.upper);
 }}
 // device={}
 )",
-                           a.groups, routed_config(true, GemmType::MGroupedNoPad).block_m,
-                           routed_config(false, GemmType::MGroupedNoPad).block_m, a.token_block_m,
-                           a.variant ? "true" : "false", a.device);
-    }
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
-    }
-};
-
-class RoutedRuntime final : public LaunchRuntime<RoutedRuntime> {
-  public:
-    struct Args {
-        W4A8Config config;
-        int n, k, groups, device, variant;
-        GemmType kind;
-        LaunchArgs launch_args;
-        RoutedGemmArguments params;
-        std::pair<int, int> cache_variant() const { return {variant, 0}; }
-    };
-    static const char* name() { return "m_grouped_gemm_w4a8_routed"; }
-    static std::string generate_impl(const Args& a) {
-        const auto& c = a.config;
-        const bool fused = a.kind == GemmType::MGroupedFused;
-        const int distance = fused ? -1 : 1;
-        const bool preload = !fused && c.block_m == routed_config(true, a.kind).block_m;
-        const bool reload = fused && c.block_k == 128;
-        const auto types =
-            fmt::format(R"(
-#include <deep_gemm/impls/w4a8_routed.cuh>
-using Kernel = cutlass::gemm::kernel::W4A8RoutedGemm<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}, {}, false, {}>;
-using Fast = cutlass::gemm::kernel::W4A8RoutedGemm<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}, {}, true, {}>;
-static_assert(sizeof(Kernel::SharedStorage) == {}, "routed shared memory mismatch");
-)",
-                        a.n, a.k, c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, c.warp_k, a.groups, c.num_stages,
-                        get_gemm_type_name(a.kind), distance, preload ? "true" : "false", reload ? "true" : "false",
-                        a.n, a.k, c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, c.warp_k, a.groups, c.num_stages,
-                        get_gemm_type_name(a.kind), distance, preload ? "true" : "false", reload ? "true" : "false",
-                        a.launch_args.smem_size);
-        const std::string invoke = fused ? R"(
-    Kernel::Params args{reinterpret_cast<const Kernel::ElementA*>(p.a),p.b,p.scale,
-        reinterpret_cast<Kernel::ElementD*>(p.d),p.a_scale,p.num_token,p.sorted_token_ids,{p.old_metadata}};
-    Kernel{}(args,smem);
-)"
-                                         : R"(
-    const auto* range=reinterpret_cast<const int32_t*>(p.fast_metadata);
-    if (__ldg(range+1)>__ldg(range)) {
-        Fast::Params args{reinterpret_cast<const Fast::ElementA*>(p.a),p.b,p.scale,
-            reinterpret_cast<Fast::ElementD*>(p.d),p.a_scale,p.num_token,nullptr,{p.fast_metadata}};
-        Fast{}(args,smem);
-    } else {
-        Kernel::Params args{reinterpret_cast<const Kernel::ElementA*>(p.a),p.b,p.scale,
-            reinterpret_cast<Kernel::ElementD*>(p.d),p.a_scale,p.num_token,nullptr,{p.old_metadata}};
-        Kernel{}(args,smem);
-    }
-)";
-        return types + fmt::format(R"(
-extern "C" __global__ __launch_bounds__({}, 1)
-void m_grouped_gemm_w4a8_routed(deep_gemm::w4fa8::RoutedGemmArguments p) {{
-    extern __shared__ __align__(128) char smem[];
-{}
-}}
-// device={}
-)",
-                                   get_num_threads(c), invoke, a.device);
+                           a.groups, routed_config(true, GemmType::MGroupedNoPad, a.n, a.k).block_m,
+                           routed_config(false, GemmType::MGroupedNoPad, a.n, a.k).block_m, a.token_block_m, a.device);
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
@@ -325,22 +247,27 @@ void m_grouped_gemm_w4a8_routed(deep_gemm::w4fa8::RoutedGemmArguments p) {{
 static bool run_small_m(const torch::Tensor& a, const torch::Tensor& a_scale, const torch::Tensor& b,
                         const torch::Tensor& scale, const torch::Tensor& d, const torch::Tensor& rows, bool capturing) {
     const int m = a.size(0), n = b.size(1), k = a.size(1), groups = b.size(0);
-    const auto c = small_m_config(ceil_div(m, groups));
+    const auto c = small_m_config(ceil_div(m, groups), n);
     const int threads = get_num_threads(c), smem = specialized_smem_size(c, k, false);
     SmallMRuntime::Args args{c,
                              n,
                              k,
                              groups,
-                             a.get_device(),
-                             0,
+                             GemmType::MGroupedNoPad,
                              {dim3(c.num_sms), dim3(threads), smem},
                              {a.data_ptr(), b.data_ptr(), scale.data_ptr(), d.data_ptr(), a_scale.data_ptr<float>(), 0,
-                              nullptr, TileSchedulerArguments(uint32_t(m), rows.data_ptr<int32_t>())}};
+                              1.0f, nullptr, TileSchedulerArguments(uint32_t(m), rows.data_ptr<int32_t>())},
+                             NativeStrategy::Compact,
+                             a.get_device()};
     const auto prepared = prepare_specialized<SmallMRuntime>(args, capturing);
     if (!prepared)
         return false;
     args.launch_args.grid_dim = dim3(c.num_sms * std::min(8, prepared->active_blocks));
+    auto prof =
+        make_profile(GemmType::MGroupedNoPad, groups, m, n, k, ceil_div(m, groups), 0, rows.data_ptr<int32_t>());
+    ProfilingInterface::Instance().instrument(true, prof);
     SmallMRuntime::launch(prepared->runtime, args);
+    ProfilingInterface::Instance().instrument(false, prof);
     return true;
 }
 
@@ -349,17 +276,19 @@ static bool run_routed(const torch::Tensor& a, const torch::Tensor& a_scale, con
                        const torch::Tensor& tokens, GemmType kind, const W4A8Config& original, bool capturing) {
     const int n = b.size(1), k = a.size(-1), groups = b.size(0), m = d.size(0), device = a.get_device();
     const bool fused = kind == GemmType::MGroupedFused;
-    const auto lo = routed_config(true, kind), hi = routed_config(false, kind);
+    const auto lo = routed_config(true, kind, n, k), hi = routed_config(false, kind, n, k);
     RoutedMetadataRuntime::Args meta{lo, n, k, groups, device, int(!fused), original.block_m, {dim3(1), dim3(256), 0},
                                      {}};
-    RoutedRuntime::Args low{
-        lo,     n,         k,    groups,
-        device, int(kind), kind, {dim3(lo.num_sms), dim3(get_num_threads(lo)), specialized_smem_size(lo, k, true)},
-        {}};
-    RoutedRuntime::Args high{
-        hi,     n,         k,    groups,
-        device, int(kind), kind, {dim3(hi.num_sms), dim3(get_num_threads(hi)), specialized_smem_size(hi, k, true)},
-        {}};
+    RoutedRuntime::Args low{lo,    n,
+                            k,     groups,
+                            kind,  {dim3(lo.num_sms), dim3(get_num_threads(lo)), specialized_smem_size(lo, k, true)},
+                            {},    NativeStrategy::Routed,
+                            device};
+    RoutedRuntime::Args high{hi,    n,
+                             k,     groups,
+                             kind,  {dim3(hi.num_sms), dim3(get_num_threads(hi)), specialized_smem_size(hi, k, true)},
+                             {},    NativeStrategy::Routed,
+                             device};
     const auto metadata = prepare_specialized<RoutedMetadataRuntime>(meta, capturing);
     const auto low_kernel = prepare_specialized<RoutedRuntime>(low, capturing);
     const auto high_kernel = prepare_specialized<RoutedRuntime>(high, capturing);
@@ -368,39 +297,40 @@ static bool run_routed(const torch::Tensor& a, const torch::Tensor& a_scale, con
     auto buffer = [&](int bm) {
         return at::empty({int64_t(kRoutedMetadataBytes) + int64_t(32) * (ceil_div(m, bm) + groups)}, b.options());
     };
-    auto fast_lo = buffer(lo.block_m), fast_hi = buffer(hi.block_m);
-    auto old_lo = fused ? fast_lo : buffer(lo.block_m), old_hi = fused ? fast_hi : buffer(hi.block_m);
-    meta.params = {rows.data_ptr<int32_t>(),   fast_lo.data_ptr<uint8_t>(), fast_hi.data_ptr<uint8_t>(),
-                   old_lo.data_ptr<uint8_t>(), old_hi.data_ptr<uint8_t>(),  m / 1024};
+    auto lower = buffer(lo.block_m), upper = buffer(hi.block_m);
+    meta.params = {rows.data_ptr<int32_t>(), lower.data_ptr<uint8_t>(), upper.data_ptr<uint8_t>()};
+    auto prof = make_profile(kind, groups, fused ? a.size(0) : m, n, k, ceil_div(m, groups),
+                             fused ? d.size(0) / a.size(0) : 0, rows.data_ptr<int32_t>());
+    ProfilingInterface::Instance().instrument(true, prof);
     RoutedMetadataRuntime::launch(metadata->runtime, meta);
-    auto invoke = [&](RoutedRuntime::Args& args, const SpecializedKernel& prepared, const torch::Tensor& fast,
-                      const torch::Tensor& fallback) {
+    auto invoke = [&](RoutedRuntime::Args& args, const SpecializedKernel& prepared, const torch::Tensor& layout) {
         args.params = {a.data_ptr(),
                        b.data_ptr<uint8_t>(),
                        scale.data_ptr<uint8_t>(),
                        d.data_ptr(),
                        a_scale.data_ptr<float>(),
                        int(a.size(0)),
+                       1.0f,
                        fused ? tokens.data_ptr<int32_t>() : nullptr,
-                       fast.data_ptr<uint8_t>(),
-                       fallback.data_ptr<uint8_t>()};
+                       {layout.data_ptr<uint8_t>()}};
         args.launch_args.grid_dim = dim3(args.config.num_sms * std::min(8, prepared.active_blocks));
         RoutedRuntime::launch(prepared.runtime, args);
     };
-    invoke(low, *low_kernel, fast_lo, old_lo);
-    invoke(high, *high_kernel, fast_hi, old_hi);
+    invoke(low, *low_kernel, lower);
+    invoke(high, *high_kernel, upper);
+    ProfilingInterface::Instance().instrument(false, prof);
     return true;
 }
 
 static bool try_run_specialized(const torch::Tensor& a, const torch::Tensor& a_scale, const torch::Tensor& b,
                                 const torch::Tensor& scale, const torch::Tensor& d, const torch::Tensor& rows,
                                 GemmType kind, const W4A8Config& c, const torch::Tensor& tokens = {}) {
-    if (is_compile_only() || !use_tuned_device())
+    if (is_compile_only() || !supports_native_strategy())
         return false;
     const int m = a.size(0), n = b.size(1), k = a.size(-1), groups = b.size(0);
     const bool small = kind == GemmType::MGroupedNoPad && small_m_eligible(groups, m, n, k);
-    const bool routed =
-        has_routed_profile(groups, m, n, k, kind) && (kind != GemmType::MGroupedFused || is_default_routed_config(c));
+    const bool routed = routed_eligible(groups, d.size(0), n, k, kind, c) &&
+                        (kind != GemmType::MGroupedFused || (tokens.dim() == 2 && tokens.size(1) == c.block_m));
     if (!small && !routed)
         return false;
     hggcStreamCaptureStatus status = hggcStreamCaptureStatusNone;

@@ -1,5 +1,13 @@
 #pragma once
 #include <cstdint>
+namespace deep_gemm::w4fa8 {
+enum class NativeStrategy { Default, Compact, Routed };
+template <class Storage, int Rows> struct RowScaleStorage : Storage {
+  alignas(128) float row_scales[2][Rows];
+};
+template <class Storage> struct RowScaleStorage<Storage, 0> : Storage {};
+} // namespace deep_gemm::w4fa8
+
 namespace deep_gemm::w4fa8_streamed {
 struct GroupedRowRangeArguments {
   uint32_t shape_m;
@@ -21,21 +29,7 @@ namespace deep_gemm::w4fa8 {
 inline constexpr int kRoutedMetadataBytes = 1024;
 struct RoutedMetadataArguments {
   const int32_t* rows;
-  uint8_t* fast_lo;
-  uint8_t* fast_hi;
-  uint8_t* old_lo;
-  uint8_t* old_hi;
-  int max_extra_rows;
-};
-struct RoutedGemmArguments {
-  const void* a;
-  const uint8_t* b;
-  const uint8_t* scale;
-  void* d;
-  const float* a_scale;
-  int num_token;
-  const int32_t* sorted_token_ids;
-  const uint8_t* fast_metadata;
-  const uint8_t* old_metadata;
+  uint8_t* lower;
+  uint8_t* upper;
 };
 } // namespace deep_gemm::w4fa8

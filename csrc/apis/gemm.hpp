@@ -1691,11 +1691,10 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_nopad(const std::pair<torch::Tensor, 
             return;
         const int tile_n = deep_gemm::w4fa8::streamed_tile_n(n,k,num_groups);
         const int minimum_rows = deep_gemm::w4fa8::streamed_min_rows(n,k,num_groups,m,c.num_sms);
-        if (tile_n && int64_t(m) >= int64_t(num_groups)*minimum_rows) {
+        if (tile_n && int64_t(m) >= int64_t(num_groups) * minimum_rows &&
             deep_gemm::w4fa8::streamed::run_streamed(
-                a.first,a.second,b.first,b.second,out,counts,tile_n,c.num_sms,rows.has_value());
+                a.first, a.second, b.first, b.second, out, counts, tile_n, c.num_sms, rows.has_value()))
             return;
-        }
     }
     deep_gemm::w4fa8::run(a.first, a.second, b.first, b.second, out, counts, GemmType::MGroupedNoPad, em, c, inv_scale);
 }

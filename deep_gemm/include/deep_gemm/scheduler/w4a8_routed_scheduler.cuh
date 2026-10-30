@@ -61,86 +61,58 @@ template <int N, int K, int BM, int BN> struct W4A8RoutedScheduler {
   CUTLASS_DEVICE int64_t curr_offset_a() { return int64_t(group_base) * K; }
   CUTLASS_DEVICE int64_t curr_offset_c() { return int64_t(group_base) * N; }
 };
-template <int Groups, int SmallM, int LargeM, int TokenBlockM, bool Bounded>
-CUTLASS_DEVICE void build_w4a8_routed_metadata(const int32_t* rows, uint8_t* fast_lo, uint8_t* fast_hi, uint8_t* old_lo,
-                                               uint8_t* old_hi, int max_extra_rows) {
+template <int Groups, int SmallM, int LargeM, int TokenBlockM>
+CUTLASS_DEVICE void build_w4a8_routed_metadata(const int32_t* rows, uint8_t* lower, uint8_t* upper) {
   const int tid = threadIdx.x;
   constexpr int Items = (Groups + 255) / 256;
-  int rv[Items];
-  using Score = cute::conditional_t<Bounded, Triple, int>;
-  Score vscore{};
-#pragma unroll
-  for (int j = 0; j < Items; ++j) {
-    const int e = tid * Items + j, r = e < Groups ? __ldg(rows + e) : 0;
-    rv[j] = r;
-    const int extra = (r + SmallM - 1) / SmallM - (r + LargeM - 1) / LargeM;
-    if constexpr (Bounded) {
-      const int a = (r % SmallM + 15) / 16, b = (r % LargeM + 15) / 16;
-      vscore.r += extra;
-      if (a > 0 && a < 8)
-        vscore.p += (8 - a) * 16;
-      if (b > 0 && b < 8)
-        vscore.b += (8 - b) * 16;
-    } else
-      vscore += extra;
-  }
-  using Reduce = cub::BlockReduce<Score, 256>;
-  __shared__ typename Reduce::TempStorage t0;
-  __shared__ int small, fast;
-  if constexpr (Bounded) {
-    const auto total = Reduce(t0).Reduce(vscore, Add{});
-    if (tid == 0) {
-      small = total.r == 0;
-      fast = (small ? total.p : total.b) <= max_extra_rows;
-    }
-  } else {
-    const auto total = Reduce(t0).Sum(vscore);
-    if (tid == 0) {
-      small = total == 0;
-      fast = 0;
-    }
-  }
-  __syncthreads();
-  const int choice = Bounded ? (small ? (fast ? 0 : 2) : (fast ? 1 : 3)) : (small ? 0 : 1);
-  uint8_t* buffers[4] = {fast_lo, fast_hi, old_lo, old_hi};
-  if constexpr (Bounded) {
-    if (tid < 4 && tid != choice) {
-      auto* r = reinterpret_cast<int*>(buffers[tid]);
-      r[0] = r[1] = 0;
-    }
-  } else if (tid == 0) {
-    auto* other = reinterpret_cast<int*>(buffers[small ? 1 : 0]);
-    other[0] = other[1] = 0;
-  }
-  Triple v[Items], sum{0, 0, 0};
-#pragma unroll
-  for (int j = 0; j < Items; ++j) {
-    int r = rv[j];
-    v[j] = {r, (r + TokenBlockM - 1) / TokenBlockM * TokenBlockM,
-            small ? (r + SmallM - 1) / SmallM : (r + LargeM - 1) / LargeM};
-    sum = Add{}(sum, v[j]);
-  }
-  using Scan = cub::BlockScan<Triple, 256>;
-  __shared__ typename Scan::TempStorage ts;
-  Triple prefix;
-  Scan(ts).ExclusiveScan(sum, prefix, Triple{0, 0, 0}, Add{});
-  auto* range = reinterpret_cast<int32_t*>(buffers[choice]);
-  auto* records = reinterpret_cast<uint4*>(buffers[choice] + kRoutedMetadataBytes);
+  int row_count[Items], extra = 0;
 #pragma unroll
   for (int j = 0; j < Items; ++j) {
     const int e = tid * Items + j;
-    auto x = v[j];
+    const int r = e < Groups ? __ldg(rows + e) : 0;
+    row_count[j] = r;
+    extra += (r + SmallM - 1) / SmallM - (r + LargeM - 1) / LargeM;
+  }
+  using Reduce = cub::BlockReduce<int, 256>;
+  __shared__ typename Reduce::TempStorage reduction;
+  __shared__ int small;
+  const int total = Reduce(reduction).Sum(extra);
+  if (tid == 0)
+    small = total == 0;
+  __syncthreads();
+  if (tid == 0) {
+    auto* inactive = reinterpret_cast<int32_t*>(small ? upper : lower);
+    inactive[0] = inactive[1] = 0;
+  }
+  Triple counts[Items], sum{0, 0, 0};
+#pragma unroll
+  for (int j = 0; j < Items; ++j) {
+    const int r = row_count[j];
+    counts[j] = {r, (r + TokenBlockM - 1) / TokenBlockM * TokenBlockM,
+                 small ? (r + SmallM - 1) / SmallM : (r + LargeM - 1) / LargeM};
+    sum = Add{}(sum, counts[j]);
+  }
+  using Scan = cub::BlockScan<Triple, 256>;
+  __shared__ typename Scan::TempStorage scan;
+  Triple prefix;
+  Scan(scan).ExclusiveScan(sum, prefix, Triple{0, 0, 0}, Add{});
+  auto* range = reinterpret_cast<int32_t*>(small ? lower : upper);
+  auto* records = reinterpret_cast<uint4*>((small ? lower : upper) + kRoutedMetadataBytes);
+#pragma unroll
+  for (int j = 0; j < Items; ++j) {
+    const int e = tid * Items + j;
+    const auto count = counts[j];
     if (e < Groups) {
       if (e == 0)
         range[0] = prefix.b;
       if (e == Groups - 1)
-        range[1] = prefix.b + x.b;
-      for (int k = 0; k < x.b; ++k) {
-        records[2 * (prefix.b + k)] = make_uint4(e, x.r, prefix.b, prefix.r);
-        records[2 * (prefix.b + k) + 1] = make_uint4(prefix.p, 0, 0, 0);
+        range[1] = prefix.b + count.b;
+      for (int tile = 0; tile < count.b; ++tile) {
+        records[2 * (prefix.b + tile)] = make_uint4(e, count.r, prefix.b, prefix.r);
+        records[2 * (prefix.b + tile) + 1] = make_uint4(prefix.p, 0, 0, 0);
       }
     }
-    prefix = Add{}(prefix, x);
+    prefix = Add{}(prefix, count);
   }
 }
 } // namespace deep_gemm::w4fa8
