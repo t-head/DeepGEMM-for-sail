@@ -41,20 +41,25 @@ __device__ __forceinline__ void decode_tile_body(const uint8_t* __restrict__ pac
                                                  uint8_t* __restrict__ output, int n_begin,
                                                  const int32_t* __restrict__ all_rows, int group_start) {
   constexpr int VectorsPerRow = K / 16;
-  for (int64_t vector = int64_t(blockIdx.x) * 256 + threadIdx.x; vector < int64_t(Groups) * TileN * VectorsPerRow;
-       vector += int64_t(gridDim.x) * 256) {
-    int64_t row = vector / VectorsPerRow;
-    int kr = int(vector % VectorsPerRow) * 16;
-    int expert = row / TileN;
-    int nr = int(row % TileN) + n_begin;
-    int64_t scale_offset = int64_t(expert) * (N * K / 32) + int64_t(nr / 64) * (K * 2) + (kr / 64) * 128 +
-                           16 * (nr % 8) + 2 * ((nr % 64) / 8) + (kr / 32 % 2);
-    uint32_t bias = (uint32_t(__ldg(scales + scale_offset)) - 114u) * 0x04040404u;
-    uint32_t low = (0x0a080400u + bias) & 0xffffff00u, high = 0x12100e0cu + bias;
-    uint2 p = __ldg(reinterpret_cast<const uint2*>(packed + (int64_t(expert) * N + nr) * (K / 2) + kr / 2));
-    uint4 decoded = {fp4_four_to_e5(p.x, low, high), fp4_four_to_e5(p.x >> 16, low, high),
-                     fp4_four_to_e5(p.y, low, high), fp4_four_to_e5(p.y >> 16, low, high)};
-    *reinterpret_cast<uint4*>(output + vector * 16) = decoded;
+  const int expert_step = min(Groups, int(gridDim.x));
+  const int first_expert = blockIdx.x % expert_step, local_block = blockIdx.x / expert_step;
+  const int expert_blocks = (int(gridDim.x) + expert_step - 1 - first_expert) / expert_step;
+  for (int expert = first_expert; expert < Groups; expert += expert_step) {
+    // Prune the complete expert before its K/N vector loop, including replay.
+    if (__ldg(all_rows + group_start + expert) == 0)
+      continue;
+    for (int64_t vector = int64_t(local_block) * 256 + threadIdx.x; vector < int64_t(TileN) * VectorsPerRow;
+         vector += int64_t(expert_blocks) * 256) {
+      const int nr = int(vector / VectorsPerRow) + n_begin, kr = int(vector % VectorsPerRow) * 16;
+      const int64_t scale_offset = int64_t(expert) * N * K / 32 + int64_t(nr / 64) * (K * 2) +
+                                   (kr / 64) * 128 + 16 * (nr % 8) + 2 * ((nr % 64) / 8) + (kr / 32 % 2);
+      const uint32_t bias = (uint32_t(__ldg(scales + scale_offset)) - 114u) * 0x04040404u;
+      const uint32_t low = (0x0a080400u + bias) & 0xffffff00u, high = 0x12100e0cu + bias;
+      const uint2 p = __ldg(reinterpret_cast<const uint2*>(packed + (int64_t(expert) * N + nr) * (K / 2) + kr / 2));
+      const uint4 decoded = {fp4_four_to_e5(p.x, low, high), fp4_four_to_e5(p.x >> 16, low, high),
+                             fp4_four_to_e5(p.y, low, high), fp4_four_to_e5(p.y >> 16, low, high)};
+      *reinterpret_cast<uint4*>(output + (int64_t(expert) * TileN * VectorsPerRow + vector) * 16) = decoded;
+    }
   }
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     int prefix = 0, count = 0;

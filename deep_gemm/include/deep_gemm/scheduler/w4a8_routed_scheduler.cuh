@@ -120,4 +120,60 @@ CUTLASS_DEVICE void build_w4a8_routed_metadata(const int32_t* rows, uint8_t* low
     prefix = Add{}(prefix, count);
   }
 }
+// Evaluate live padding/reuse, then build only the bounded wide work records.
+// Rates are calibrated kernel time per M tile; no input or routing values persist.
+template <int Groups, int NativeM, int WideM, int TokenBlockM>
+CUTLASS_DEVICE void build_w4a8_adaptive_metadata(AdaptiveMetadataArguments p) {
+  static_assert(NativeM == TokenBlockM, "adaptive native/public row tiles must match");
+  constexpr int Items = (Groups + 255) / 256;
+  const int tid = threadIdx.x;
+  Triple counts[Items], sum{0, 0, 0};
+#pragma unroll
+  for (int j = 0; j < Items; ++j) {
+    const int e = tid * Items + j;
+    const int r = e < Groups ? __ldg(p.rows + e) : 0;
+    counts[j] = {r, (r + TokenBlockM - 1) / TokenBlockM * TokenBlockM,
+                 (r + WideM - 1) / WideM};
+    sum = Add{}(sum, counts[j]);
+  }
+  using Scan = cub::BlockScan<Triple, 256>;
+  __shared__ typename Scan::TempStorage scan;
+  Triple prefix;
+  Scan(scan).ExclusiveScan(sum, prefix, Triple{0, 0, 0}, Add{});
+  auto* range = reinterpret_cast<int32_t*>(p.work);
+  auto* records = reinterpret_cast<uint4*>(p.work + kRoutedMetadataBytes);
+  if (tid == 0)
+    range[0] = 0;
+#pragma unroll
+  for (int j = 0; j < Items; ++j) {
+    const int e = tid * Items + j;
+    const auto count = counts[j];
+    if (e < Groups) {
+      if (e == Groups - 1) {
+        const int native_tiles = (prefix.p + count.p) / NativeM, wide_tiles = prefix.b + count.b;
+        const bool native = float(native_tiles) * p.native_rate <= float(wide_tiles) * p.wide_rate;
+        range[1] = native ? 0 : wide_tiles;
+        p.control[0] = int(native);
+        p.control[1] = native_tiles;
+        p.control[2] = wide_tiles;
+        if (p.native_layout)
+          p.native_layout[0] = native_tiles;
+      }
+      // Reuse the row prefix for the stock NoPad scheduler table, preserving
+      // the native ABI without a second preprocessing pass.
+      if (p.native_layout) {
+        auto* native_records = reinterpret_cast<uint4*>(p.native_layout) + 1;
+        const int native_prefix = prefix.p / NativeM;
+        for (int tile = 0; tile < count.p / NativeM; ++tile)
+          native_records[native_prefix + tile] = make_uint4(e, count.r, native_prefix, prefix.r);
+      }
+      for (int tile = 0; tile < count.b; ++tile) {
+        records[2 * (prefix.b + tile)] = make_uint4(e, count.r, prefix.b, prefix.r);
+        records[2 * (prefix.b + tile) + 1] = make_uint4(prefix.p, 0, 0, 0);
+      }
+    }
+    prefix = Add{}(prefix, count);
+  }
+}
+
 } // namespace deep_gemm::w4fa8

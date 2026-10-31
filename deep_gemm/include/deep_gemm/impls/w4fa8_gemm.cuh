@@ -37,7 +37,7 @@ public:
   static constexpr bool Routed = Strategy == deep_gemm::w4fa8::NativeStrategy::Routed;
   static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   static constexpr bool Small = Strategy == deep_gemm::w4fa8::NativeStrategy::Compact;
-  static constexpr bool Prefix = Small && !Fused;
+  static constexpr bool Prefix = Small && !Fused && kNumGroups <= 64;
   static constexpr bool SharedPrefix = Prefix && BlockM == 32;
   static constexpr bool Compact = Routed || (Small && (Fused || BlockM != 16));
   static constexpr int DecodeN = Routed ? 1 : SharedPrefix ? 2 : WarpN / 16;
@@ -450,7 +450,7 @@ public:
           }
           deep_gemm::clear_invalid_A_to_tsm<ElementA, TilerA, BlockM, BlockK, K, kNumStages>(
               tAsA, params.ptr_a, token_offsets, params.num_token, thread_idx, Int<MaxThreadsPerBlock>{});
-          Tensor mD_mn = make_tensor(make_gmem_ptr(params.ptr_d + deep_scheduler.curr_block_m_offset * N),
+          Tensor mD_mn = make_tensor(make_gmem_ptr(params.ptr_d + int64_t(deep_scheduler.curr_block_m_offset) * N),
                                      make_shape(Int<BlockM>{}, Int<N>{}), strideD); // (m,n)
           Tensor gD =
               local_tile(mD_mn, TileShape{}, make_coord(_0{}, n_block_idx, _), Step<_1, _1, X>{}); // (BLK_M,BLK_N)
@@ -949,7 +949,7 @@ public:
           epilogue_cta_reduce();
           epilogue_no_tsm(active_m);
         };
-        if constexpr (Routed) {
+        if constexpr (Routed || (Small && WarpM >= 64)) {
           // Mutually exclusive branches keep each tail's accumulators local.
           // Independent predicates can merge their live ranges and spill.
           dispatch_tail((residual_m + WarpsOnM - 1) / WarpsOnM, process_active_rows);

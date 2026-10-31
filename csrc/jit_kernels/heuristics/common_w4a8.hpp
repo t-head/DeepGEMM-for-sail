@@ -140,8 +140,8 @@ static bool fits_compiled_strategy(int local_bytes) {
 }
 
 static bool small_m_eligible(int groups, int m, int n, int k, GemmType kind = GemmType::MGroupedNoPad) {
-    const bool prefix = kind != GemmType::MGroupedFused;
-    if (groups < 1 || groups > (prefix ? 64 : 1024) || ceil_div(m, groups) > 64 || n < 128 || n % 64 || k < 512 ||
+    const bool prefix = kind != GemmType::MGroupedFused && groups <= 64;
+    if (groups < 1 || groups > 1024 || ceil_div(m, groups) >= 512 || n < 128 || n % 64 || k < 512 ||
         k % 128)
         return false;
     return fits_strategy(small_m_config(ceil_div(m, groups), n, kind, groups), k, false, prefix);
@@ -180,12 +180,36 @@ static bool routed_eligible(int groups, int m, int n, int k, GemmType kind, cons
            (kind == GemmType::MGroupedFused || fits_strategy(routed_config(false), k, true));
 }
 
-// Larger width removes repeated core segmentation when the bounded buffer fits.
-static bool full_width_streamed(int n, int k, int groups) {
-    constexpr int64_t budget = 384LL * 1024 * 1024;
+// Limit the per-call selection tax relative to the calibrated native kernel.
+inline constexpr float kMaxAdaptiveSelectionOverhead = 0.05f;
+
+static bool adaptive_rows_eligible(int groups, int m, int n, int k) {
+    if (!supports_native_strategy() || groups < 1 || groups > 1024 || n < 256 || n % 256 || k < 512 || k % 128)
+        return false;
+    const int rows = ceil_div(m, groups);
+    if (rows <= 256 || rows >= 512)
+        return false;
+    const auto c = routed_config(true);
+    const int64_t work = int64_t(groups) * ceil_div(rows, c.block_m) * (n / c.block_n);
+    return work >= int64_t(get_num_sms()) * (groups <= 64 ? 4 : 1) && fits_strategy(c, k, true);
+}
+
+inline constexpr int64_t kStreamedWeightBudget = 384LL * 1024 * 1024;
+
+// Keep at least one complete N256 core tile in each partial buffer. Expert
+// chunks can shrink before N is split; a single oversized expert uses N slices.
+static int streamed_tile_n(int n, int k, int groups) {
     const auto prop = device_runtime->get_prop();
-    return prop->maxThreadsPerBlock >= 512 && prop->sharedMemPerBlockOptin >= 256 * 1024 && groups >= 8 &&
-           groups <= 1024 && n >= 1024 && n % 512 == 0 && k >= 1024 && int64_t(n) * k <= (budget - 8) / 14;
+    if (prop->maxThreadsPerBlock < 512 || prop->sharedMemPerBlockOptin < 256 * 1024 || groups < 8 || groups > 1024 ||
+        n < 1024 || n % 64 || k < 1024 || k % 128)
+        return 0;
+    const int64_t capacity = (kStreamedWeightBudget - 8) / k / 256 * 256;
+    return capacity >= 256 ? int(std::min(int64_t(n), capacity)) : 0;
+}
+static int streamed_chunk_limit(int tile_n, int k, int groups) {
+    // One warp of expert counts stays below the stock scheduler's 128-expert
+    // preprocessing boundary, and bounds decoder specialization/code size.
+    return std::min({groups / 2, 32, int((kStreamedWeightBudget - 8) / (int64_t(tile_n) * k))});
 }
 
 // Estimate complete waves for a bounded expert chunk, including its tail.
@@ -203,20 +227,20 @@ static int64_t streamed_waves(int m, int n, int groups, int num_sms, int chunk) 
 // launches. Use tile counts rather than a list of projection dimensions.
 static bool short_streamed_eligible(int m, int n, int k, int groups, int num_sms) {
     const int64_t nk_tiles = int64_t(ceil_div(n, 256)) * (k / 128);
-    if (!full_width_streamed(n, k, groups) || nk_tiles < 128 || k / 128 < 16 || int64_t(m) < int64_t(groups) * 512 ||
+    const int tile_n = streamed_tile_n(n, k, groups);
+    if (!tile_n || nk_tiles < 128 || k / 128 < 16 || int64_t(m) < int64_t(groups) * 512 ||
         int64_t(m) >= int64_t(groups) * 1024)
         return false;
-    return streamed_waves(m, n, groups, num_sms, 4) <= streamed_waves(m, n, groups, num_sms, 14);
+    const int maximum = streamed_chunk_limit(tile_n, k, groups);
+    return streamed_waves(m, tile_n, groups, num_sms, std::min(4, maximum)) <=
+           streamed_waves(m, tile_n, groups, num_sms, maximum);
 }
 
 static int streamed_min_rows(int n, int k, int groups, int m, int num_sms) {
-    if (!full_width_streamed(n, k, groups))
+    if (!streamed_tile_n(n, k, groups))
         return 2048;
     return short_streamed_eligible(m, n, k, groups, num_sms) ? 512 : 1024;
 }
-
-// Each call overwrites a bounded, partial FP8 tile; no decoded values survive as a weight cache.
-static int streamed_tile_n(int n, int k, int groups) { return full_width_streamed(n, k, groups) ? n : 0; }
 
 static bool default_fused_config(const W4A8Config& c, int m, int n, int k, int groups) {
     return pack_config(c) == pack_config(get_best_configs(ceil_div(m, groups), n, k, groups, GemmType::MGroupedFused));
@@ -225,7 +249,7 @@ static bool default_fused_config(const W4A8Config& c, int m, int n, int k, int g
 static bool streamed_fused_eligible(int m, int n, int k, int groups, int num_sms) {
     // Bound the additional activation workspace independently of weight chunks.
     constexpr int64_t activation_budget = 1024LL * 1024 * 1024;
-    return supports_native_strategy() && full_width_streamed(n, k, groups) &&
+    return supports_native_strategy() && streamed_tile_n(n, k, groups) &&
            int64_t(m) * (k + int(sizeof(float))) <= activation_budget &&
            int64_t(m) >= int64_t(groups) * streamed_min_rows(n, k, groups, m, num_sms);
 }
@@ -236,27 +260,38 @@ struct StreamedPlan {
     bool ramp, short_call;
 };
 static StreamedPlan make_streamed_plan(int m, int n, int k, int groups, int num_sms, bool fused = false) {
-    // Small chunks repay their extra kernel/event startup only when the
-    // full-width weight slice is large and the call has a short compute tail.
+    const int tile_n = streamed_tile_n(n, k, groups);
+    const int maximum = streamed_chunk_limit(tile_n, k, groups);
     const bool short_call = short_streamed_eligible(m, n, k, groups, num_sms);
-    const bool smaller_chunk =
-        short_call || (int64_t(m) >= int64_t(groups) * 1024 && int64_t(m) < int64_t(groups) * 2048 &&
-                       int64_t(14) * n * k > 256LL * 1024 * 1024 &&
-                       streamed_waves(m, n, groups, num_sms, 4) <= streamed_waves(m, n, groups, num_sms, 14));
-    // Ramp only when decode traffic is large enough to amortize extra
-    // launches. Long reuse prefers fewer full-sized chunks.
-    const bool ramp = int64_t(n) * k >= 8LL * 1024 * 1024 && int64_t(m) >= int64_t(groups) * 1024 &&
+    int selected = maximum;
+    int64_t best = INT64_MAX;
+    for (int candidate = 1; candidate <= maximum; ++candidate) {
+        const int64_t waves = streamed_waves(m, tile_n, groups, num_sms, candidate);
+        if (short_call) {
+            // Minimize decode startup without increasing complete compute waves.
+            if (waves <= streamed_waves(m, tile_n, groups, num_sms, maximum)) {
+                selected = candidate;
+                break;
+            }
+        } else {
+            const int64_t score = waves + ceil_div(groups, candidate);
+            if (score <= best) {
+                best = score;
+                selected = candidate;
+            }
+        }
+    }
+    const bool ramp = int64_t(tile_n) * k >= 8LL * 1024 * 1024 && int64_t(m) >= int64_t(groups) * 1024 &&
                       (fused || int64_t(m) < int64_t(groups) * 4096);
     std::vector<std::pair<int, int>> plan;
-    const int max_chunk = std::min(14, groups / 2);
     int chunk = 0;
-    for (int start = 0, target = ramp ? 2 : std::min(max_chunk, smaller_chunk ? 4 : max_chunk); start < groups;) {
-        const int count = std::min({target, max_chunk, groups - start});
+    for (int start = 0, target = ramp ? std::min(2, selected) : selected; start < groups;) {
+        const int count = std::min({target, selected, groups - start});
         plan.emplace_back(start, count);
         chunk = std::max(chunk, count);
         start += count;
         if (ramp)
-            target = std::min(max_chunk, target * 2);
+            target = std::min(selected, target * 2);
     }
     return {std::move(plan), chunk, ramp, short_call};
 }

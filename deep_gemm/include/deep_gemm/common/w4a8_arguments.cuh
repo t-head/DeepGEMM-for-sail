@@ -42,4 +42,12 @@ struct RoutedMetadataArguments {
   uint8_t* lower;
   uint8_t* upper;
 };
+struct AdaptiveMetadataArguments {
+  const int32_t* rows;
+  uint8_t* work;
+  int32_t* control;
+  float native_rate = 1, wide_rate = 1;
+  int32_t* native_layout = nullptr;
+};
+
 } // namespace deep_gemm::w4fa8

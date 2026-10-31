@@ -1686,6 +1686,7 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_nopad(const std::pair<torch::Tensor, 
     auto c = configs.has_value() ? deep_gemm::w4fa8::unpack_config(*configs)
                                  : deep_gemm::w4fa8::get_best_configs(em, n, k, num_groups, GemmType::MGroupedNoPad);
     if (inv_scale == 1.0f && !configs.has_value() && !is_compile_only() && is_ppu1v5_device()) {
+        deep_gemm::w4fa8::prepare_native_fallback(c, n, k, num_groups, GemmType::MGroupedNoPad);
         if (rows.has_value() && deep_gemm::w4fa8::try_run_specialized(
                 a.first,a.second,b.first,b.second,out,counts,GemmType::MGroupedNoPad,c))
             return;
@@ -1730,6 +1731,9 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_fused(const std::pair<torch::Tensor, 
     if (!m)
         return;
     auto c = deep_gemm::w4fa8::unpack_config(configs);
+    if (inv_scale == 1.0f && !is_compile_only())
+        deep_gemm::w4fa8::prepare_native_fallback(c, b.first.size(1), a.first.size(1), num_groups,
+                                                GemmType::MGroupedFused);
     if (inv_scale == 1.0f &&
         deep_gemm::w4fa8::try_run_specialized(a.first, a.second, b.first, b.second, out, rows, GemmType::MGroupedFused,
                                               c, tokens, experts, aligned))
@@ -1738,8 +1742,8 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_fused(const std::pair<torch::Tensor, 
     if (inv_scale == 1.0f && !is_compile_only() && tokens.dim() == 2 && tokens.size(1) == c.block_m &&
         deep_gemm::w4fa8::default_fused_config(c, output_m, n, k, num_groups) &&
         deep_gemm::w4fa8::streamed_fused_eligible(output_m, n, k, num_groups, c.num_sms) &&
-        deep_gemm::w4fa8::streamed::run_streamed(a.first, a.second, b.first, b.second, out, rows, n, c.num_sms, true,
-                                                 {experts, tokens, aligned, c.block_m}))
+        deep_gemm::w4fa8::streamed::run_streamed(a.first, a.second, b.first, b.second, out, rows,
+                                                 deep_gemm::w4fa8::streamed_tile_n(n, k, num_groups), c.num_sms, true, {experts, tokens, aligned, c.block_m}))
         return;
     deep_gemm::w4fa8::run(a.first, a.second, b.first, b.second, out, rows, GemmType::MGroupedFused,
                           ceil_div(output_m, num_groups), c, inv_scale, experts, tokens, aligned);
