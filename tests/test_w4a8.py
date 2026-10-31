@@ -589,6 +589,136 @@ def _w4a8_nopad_problem(counts, n, k):
     return lhs, rhs, output, call, reference, packed, scales
 
 
+def test_compact_fused():
+    for groups, tokens, topk, n, k in ((13, 29, 3, 320, 768), (31, 191, 4, 512, 1024),
+                                      (64, 769, 4, 1024, 512), (97, 769, 4, 512, 768),
+                                      (129, 1021, 4, 768, 1024)):
+        packed = torch.randint(256, (groups, n, k // 2), device='cuda', dtype=torch.uint8)
+        raw = torch.randint(119, 133, (groups, n, k // 32), device='cuda', dtype=torch.uint8)
+        rhs = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+        quantized = quant_activation(torch.randn(tokens, k, device='cuda', dtype=torch.bfloat16))
+        lhs = quantized[0], quantized[1] * rhs[2]
+        routes = ((torch.arange(tokens, device='cuda')[:, None] * 7 +
+                   torch.arange(topk, device='cuda')[None, :]) % (groups - 1)).int()
+        order = routes.flatten().argsort(stable=True)
+        source = order // topk
+        counts = torch.bincount(routes.flatten().long(), minlength=groups).cpu().tolist()
+        output = torch.empty(tokens * topk, n, device='cuda', dtype=torch.bfloat16)
+        reference = torch.empty_like(output)
+        begin = 0
+        for expert, count in enumerate(counts):
+            if count:
+                ids = source[begin:begin + count]
+                a = lhs[0].float()[ids] * quantized[1][ids]
+                reference[begin:begin + count] = (a @ decode_weight(packed[expert], raw[expert]).T).bfloat16()
+            begin += count
+        config, rows, experts, sorted_tokens, aligned, _, _ = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routes)
+        def call():
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+                lhs, rhs[:2], output, rows, experts, sorted_tokens, aligned, config)
+        call()
+        assert calc_diff(output, reference) < .003
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+        lhs[1].neg_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert calc_diff(output, -reference) < .003
+
+
+def _streamed_fused_problem(groups, tokens, topk, n, k):
+    packed = torch.randint(256, (groups, n, k // 2), device='cuda', dtype=torch.uint8)
+    raw = torch.randint(119, 133, (groups, n, k // 32), device='cuda', dtype=torch.uint8)
+    rhs = deep_gemm.preprocess_weights_and_scales(
+        deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+    assert rhs[2] == 1.
+    lhs = quant_activation(torch.randn(tokens, k, device='cuda', dtype=torch.bfloat16))
+    routes = torch.rand(tokens, groups - 1, device='cuda').topk(topk, dim=1, sorted=False).indices.int()
+    config, rows, experts, sorted_tokens, aligned, _, _ = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routes)
+    output = torch.empty(tokens * topk, n, device='cuda', dtype=torch.bfloat16)
+    def call():
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+            lhs, rhs[:2], output, rows, experts, sorted_tokens, aligned, config)
+    def reference(weights=packed, scales=raw, routing=routes):
+        source = routing.flatten().argsort(stable=True) // topk
+        counts = torch.bincount(routing.flatten().long(), minlength=groups).cpu().tolist()
+        expected = torch.empty_like(output)
+        begin = 0
+        for expert, count in enumerate(counts):
+            if count:
+                ids = source[begin:begin + count]
+                a = lhs[0].float()[ids] * lhs[1][ids]
+                expected[begin:begin + count] = (a @ decode_weight(weights[expert], scales[expert]).T).bfloat16()
+            begin += count
+        return expected
+    def reroute(routing):
+        new = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routing)
+        assert new[0] == config
+        for target, value in zip((rows, experts, sorted_tokens, aligned), new[1:5]):
+            assert target.shape == value.shape
+            target.copy_(value)
+    return lhs, rhs, output, call, reference, packed, raw, routes, reroute
+
+
+def test_streamed_fused_replay_updates():
+    for groups, n, k, mean_rows in ((10, 2048, 3584, 512), (10, 2048, 2048, 1024),
+                                   (17, 1536, 1024, 1024)):
+        lhs, rhs, output, call, reference, packed, raw, routes, reroute = _streamed_fused_problem(
+            groups, groups * mean_rows // 4, 4, n, k)
+        call()
+        assert calc_diff(output, reference()) < .003
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            call()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            call()
+        lhs[0].copy_(lhs[0].float().roll(1, 0).to(lhs[0].dtype))
+        lhs[1].neg_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert calc_diff(output, reference()) < .003
+        weights, scales = packed.bitwise_xor(0x88), raw.flip(-1).contiguous()
+        updated = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, weights, scales)
+        rhs[0].copy_(updated[0])
+        rhs[1].copy_(updated[1])
+        routing = (routes + 1) % groups
+        reroute(routing)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = reference(weights, scales, routing)
+        assert calc_diff(output, expected) < .003
+        with torch.cuda.stream(stream):
+            call()
+            consumed = output.clone()
+        stream.synchronize()
+        assert calc_diff(consumed, expected) < .003
+
+
+def test_streamed_fused_compile_only_capture_fallback():
+    _, _, output, call, reference, _, _, _, _ = _streamed_fused_problem(11, 5632, 4, 1536, 1024)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        deep_gemm.set_compile_mode(1)
+        try:
+            call()
+        finally:
+            deep_gemm.set_compile_mode(0)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        call()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert calc_diff(output, reference()) < .003
+
+
 def test_native_strategy_domains():
     # Original profiles used E28/E56 and two projection shapes. These cases
     # exercise scheduler bounds, N tails, and a reduced configured CU count.
@@ -678,8 +808,7 @@ def test_streamed_compile_only_capture_fallback():
     assert calc_diff(output, expected) < .003
 
 
-def _check_routed_fused_metadata_layout(n, k, tokens):
-    groups, topk = 97, 8
+def _check_routed_fused_metadata_layout(n, k, tokens, groups=97, topk=8):
     packed = torch.randint(256, (groups, n, k // 2), device='cuda', dtype=torch.uint8)
     raw = torch.randint(119, 133, (groups, n, k // 32), device='cuda', dtype=torch.uint8)
     rhs = deep_gemm.preprocess_weights_and_scales(
@@ -725,9 +854,15 @@ def _check_routed_fused_metadata_layout(n, k, tokens):
 
 def test_routed_fused_metadata_layout():
     _check_routed_fused_metadata_layout(512, 768, 1733)
-    # Exercise the N48/K256 warp layout with random packed values and scales
-    # that vary across K32 groups, independently of the constant-K K3 oracle.
+    # Exercise large K with random packed values and scales that vary across
+    # K32 groups, independently of the constant-K K3 oracle.
     _check_routed_fused_metadata_layout(768, 3584, 2048)
+
+
+def test_routed_fused_small_expert_set():
+    _check_routed_fused_metadata_layout(6144, 3584, 448, groups=28)
+    # Two internal M blocks per expert exercise interleaving of full/tail pairs.
+    _check_routed_fused_metadata_layout(2048, 768, 896, groups=28)
 
 
 if __name__ == '__main__':
@@ -744,9 +879,13 @@ if __name__ == '__main__':
         test_tuned_nopad_dispatch()
         test_tuned_fused_dispatch()
         test_native_strategy_domains()
+        test_compact_fused()
+        test_streamed_fused_replay_updates()
+        test_streamed_fused_compile_only_capture_fallback()
         test_streamed_nopad_replay_updates()
         test_streamed_compile_only_capture_fallback()
         test_routed_fused_metadata_layout()
+        test_routed_fused_small_expert_set()
         test_nopad_expert_limit()
         test_nopad_n_expand()
         test_nopad_resident_a_and_scales()

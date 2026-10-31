@@ -75,7 +75,8 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
             : a.strategy == NativeStrategy::Compact ? "Compact"
                                                     : "Default",
             a.strategy == NativeStrategy::Routed
-                ? fmt::format("deep_gemm::w4fa8::W4A8RoutedScheduler<{}, {}, {}, {}>", a.n, a.k, c.block_m, c.block_n)
+                ? fmt::format("deep_gemm::w4fa8::W4A8RoutedScheduler<{}, {}, {}, {}{}>", a.n, a.k, c.block_m, c.block_n,
+                              a.kind == GemmType::MGroupedFused ? ", true" : "")
                 : "void",
             a.launch_args.smem_size, get_num_threads(c), sizeof(Arguments<Scheduler>));
     }
@@ -213,7 +214,6 @@ static std::optional<SpecializedKernel> prepare_specialized(const typename R::Ar
 struct RoutedSchedulerArguments {
     const uint8_t* meta;
 };
-using SmallMRuntime = Runtime<TileSchedulerArguments>;
 using RoutedRuntime = Runtime<RoutedSchedulerArguments>;
 
 class RoutedMetadataRuntime final : public LaunchRuntime<RoutedMetadataRuntime> {
@@ -223,10 +223,12 @@ class RoutedMetadataRuntime final : public LaunchRuntime<RoutedMetadataRuntime> 
         int n, k, groups, device, variant, token_block_m;
         LaunchArgs launch_args;
         RoutedMetadataArguments params;
-        std::pair<int, int> cache_variant() const { return {variant, token_block_m}; }
+        bool force_small = false;
+        std::pair<int, int> cache_variant() const { return {variant + 2 * int(force_small), token_block_m}; }
     };
     static const char* name() { return "w4a8_routed_metadata"; }
     static std::string generate_impl(const Args& a) {
+        const auto lo = routed_config(true), hi = routed_config(false);
         return fmt::format(R"(
 #include <deep_gemm/scheduler/w4a8_routed_scheduler.cuh>
 extern "C" __global__ __launch_bounds__(256)
@@ -236,37 +238,33 @@ void w4a8_routed_metadata(deep_gemm::w4fa8::RoutedMetadataArguments p) {{
 }}
 // device={}
 )",
-                           a.groups, routed_config(true, GemmType::MGroupedNoPad, a.n, a.k).block_m,
-                           routed_config(false, GemmType::MGroupedNoPad, a.n, a.k).block_m, a.token_block_m, a.device);
+                           a.groups, lo.block_m, a.force_small ? lo.block_m : hi.block_m, a.token_block_m, a.device);
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
     }
 };
 
-static bool run_small_m(const torch::Tensor& a, const torch::Tensor& a_scale, const torch::Tensor& b,
-                        const torch::Tensor& scale, const torch::Tensor& d, const torch::Tensor& rows, bool capturing) {
-    const int m = a.size(0), n = b.size(1), k = a.size(1), groups = b.size(0);
-    const auto c = small_m_config(ceil_div(m, groups), n);
-    const int threads = get_num_threads(c), smem = specialized_smem_size(c, k, false);
-    SmallMRuntime::Args args{c,
-                             n,
-                             k,
-                             groups,
-                             GemmType::MGroupedNoPad,
-                             {dim3(c.num_sms), dim3(threads), smem},
-                             {a.data_ptr(), b.data_ptr(), scale.data_ptr(), d.data_ptr(), a_scale.data_ptr<float>(), 0,
-                              1.0f, nullptr, TileSchedulerArguments(uint32_t(m), rows.data_ptr<int32_t>())},
-                             NativeStrategy::Compact,
-                             a.get_device()};
-    const auto prepared = prepare_specialized<SmallMRuntime>(args, capturing);
+template <class Scheduler>
+static bool run_compact(const W4A8Config& c, int m, int n, int k, int groups, GemmType kind,
+                        const Arguments<Scheduler>& params, const torch::Tensor& rows, int device, bool capturing) {
+    using R = Runtime<Scheduler>;
+    const bool fused = kind == GemmType::MGroupedFused;
+    typename R::Args args{
+        c,      n,
+        k,      groups,
+        kind,   {dim3(c.num_sms), dim3(get_num_threads(c)), specialized_smem_size(c, k, false, !fused)},
+        params, small_m_strategy(c, kind),
+        device};
+    const auto prepared = prepare_specialized<R>(args, capturing);
     if (!prepared)
         return false;
-    args.launch_args.grid_dim = dim3(c.num_sms * std::min(8, prepared->active_blocks));
-    auto prof =
-        make_profile(GemmType::MGroupedNoPad, groups, m, n, k, ceil_div(m, groups), 0, rows.data_ptr<int32_t>());
+    args.launch_args.grid_dim =
+        dim3(c.num_sms * (fused ? prepared->active_blocks : std::min(8, prepared->active_blocks)));
+    auto prof = make_profile(kind, groups, fused ? params.num_token : m, n, k, ceil_div(m, groups),
+                             fused ? m / params.num_token : 0, rows.data_ptr<int32_t>());
     ProfilingInterface::Instance().instrument(true, prof);
-    SmallMRuntime::launch(prepared->runtime, args);
+    R::launch(prepared->runtime, args);
     ProfilingInterface::Instance().instrument(false, prof);
     return true;
 }
@@ -276,7 +274,7 @@ static bool run_routed(const torch::Tensor& a, const torch::Tensor& a_scale, con
                        const torch::Tensor& tokens, GemmType kind, const W4A8Config& original, bool capturing) {
     const int n = b.size(1), k = a.size(-1), groups = b.size(0), m = d.size(0), device = a.get_device();
     const bool fused = kind == GemmType::MGroupedFused;
-    const auto lo = routed_config(true, kind, n, k), hi = routed_config(false, kind, n, k);
+    const auto lo = routed_config(true), hi = routed_config(false);
     RoutedMetadataRuntime::Args meta{lo, n, k, groups, device, int(!fused), original.block_m, {dim3(1), dim3(256), 0},
                                      {}};
     RoutedRuntime::Args low{lo,    n,
@@ -289,10 +287,15 @@ static bool run_routed(const torch::Tensor& a, const torch::Tensor& a_scale, con
                              kind,  {dim3(hi.num_sms), dim3(get_num_threads(hi)), specialized_smem_size(hi, k, true)},
                              {},    NativeStrategy::Routed,
                              device};
-    const auto metadata = prepare_specialized<RoutedMetadataRuntime>(meta, capturing);
     const auto low_kernel = prepare_specialized<RoutedRuntime>(low, capturing);
-    const auto high_kernel = prepare_specialized<RoutedRuntime>(high, capturing);
-    if (!metadata || !low_kernel || !high_kernel)
+    // Fused bounds live operand state with M160; NoPad can also use M192.
+    const auto high_kernel =
+        fused ? std::optional<SpecializedKernel>{} : prepare_specialized<RoutedRuntime>(high, capturing);
+    if (!low_kernel)
+        return false;
+    meta.force_small = !high_kernel;
+    const auto metadata = prepare_specialized<RoutedMetadataRuntime>(meta, capturing);
+    if (!metadata)
         return false;
     auto buffer = [&](int bm) {
         return at::empty({int64_t(kRoutedMetadataBytes) + int64_t(32) * (ceil_div(m, bm) + groups)}, b.options());
@@ -317,18 +320,22 @@ static bool run_routed(const torch::Tensor& a, const torch::Tensor& a_scale, con
         RoutedRuntime::launch(prepared.runtime, args);
     };
     invoke(low, *low_kernel, lower);
-    invoke(high, *high_kernel, upper);
+    if (high_kernel)
+        invoke(high, *high_kernel, upper);
     ProfilingInterface::Instance().instrument(false, prof);
     return true;
 }
 
 static bool try_run_specialized(const torch::Tensor& a, const torch::Tensor& a_scale, const torch::Tensor& b,
                                 const torch::Tensor& scale, const torch::Tensor& d, const torch::Tensor& rows,
-                                GemmType kind, const W4A8Config& c, const torch::Tensor& tokens = {}) {
+                                GemmType kind, const W4A8Config& c, const torch::Tensor& tokens = {},
+                                const torch::Tensor& experts = {}, const torch::Tensor& aligned = {}) {
     if (is_compile_only() || !supports_native_strategy())
         return false;
     const int m = a.size(0), n = b.size(1), k = a.size(-1), groups = b.size(0);
-    const bool small = kind == GemmType::MGroupedNoPad && small_m_eligible(groups, m, n, k);
+    const bool fused_layout = kind != GemmType::MGroupedFused || (tokens.dim() == 2 && tokens.size(1) == c.block_m &&
+                                                                  default_fused_config(c, d.size(0), n, k, groups));
+    const bool small = fused_layout && small_m_eligible(groups, d.size(0), n, k, kind);
     const bool routed = routed_eligible(groups, d.size(0), n, k, kind, c) &&
                         (kind != GemmType::MGroupedFused || (tokens.dim() == 2 && tokens.size(1) == c.block_m));
     if (!small && !routed)
@@ -336,8 +343,20 @@ static bool try_run_specialized(const torch::Tensor& a, const torch::Tensor& a_s
     hggcStreamCaptureStatus status = hggcStreamCaptureStatusNone;
     DG_HGGC_RUNTIME_CHECK(hggcStreamIsCapturing(current_stream(), &status));
     const bool capturing = status != hggcStreamCaptureStatusNone;
-    if (small)
-        return run_small_m(a, a_scale, b, scale, d, rows, capturing);
+    if (small) {
+        const int output_m = d.size(0);
+        const auto compact = small_m_config(ceil_div(output_m, groups), n, kind, groups);
+        if (kind == GemmType::MGroupedFused) {
+            const Arguments<W4A8FusedSchedulerArguments> params{
+                a.data_ptr(), b.data_ptr(), scale.data_ptr(), d.data_ptr(), a_scale.data_ptr<float>(), m,
+                1.0f, tokens.data_ptr<int32_t>(), {aligned.data_ptr<int32_t>(), experts.data_ptr<int32_t>()}};
+            return run_compact(compact, output_m, n, k, groups, kind, params, rows, a.get_device(), capturing);
+        }
+        const Arguments<TileSchedulerArguments> params{
+            a.data_ptr(), b.data_ptr(), scale.data_ptr(), d.data_ptr(), a_scale.data_ptr<float>(), 0,
+            1.0f, nullptr, TileSchedulerArguments(uint32_t(m), rows.data_ptr<int32_t>())};
+        return run_compact(compact, m, n, k, groups, kind, params, rows, a.get_device(), capturing);
+    }
     return run_routed(a, a_scale, b, scale, d, rows, tokens, kind, c, capturing);
 }
 

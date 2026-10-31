@@ -11,7 +11,7 @@ struct Triple {
 struct Add {
   CUTLASS_DEVICE Triple operator()(Triple a, Triple b) const { return {a.r + b.r, a.p + b.p, a.b + b.b}; }
 };
-template <int N, int BM, int BN> struct RoutedWorkScheduler {
+template <int N, int BM, int BN, bool InterleaveM = false> struct RoutedWorkScheduler {
   const uint4* records;
   int next = 0, begin, end, start;
   int expert, rows, out_row, token_base, valid;
@@ -32,6 +32,11 @@ template <int N, int BM, int BN> struct RoutedWorkScheduler {
     int first = (local / (NC * 2)) * 2, in = local % (NC * 2), width = min(2, count - first);
     mb = first + in % width;
     nb = in / width;
+    // Keep a persistent worker from repeatedly receiving only full tiles or
+    // only tiny tails when the grid stride preserves the M-pair parity.
+    if constexpr (InterleaveM)
+      if (width == 2)
+        mb ^= (nb + int(d.x)) & 1;
     expert = int(d.x) - start;
     rows = d.y;
     out_row = d.w + mb * BM;
@@ -40,11 +45,11 @@ template <int N, int BM, int BN> struct RoutedWorkScheduler {
     return true;
   }
 };
-template <int N, int K, int BM, int BN> struct W4A8RoutedScheduler {
+template <int N, int K, int BM, int BN, bool InterleaveM = false> struct W4A8RoutedScheduler {
   struct Params {
     const uint8_t* meta;
   };
-  RoutedWorkScheduler<N, BM, BN> inner;
+  RoutedWorkScheduler<N, BM, BN, InterleaveM> inner;
   int curr_group_idx, curr_group_m, curr_block_m_offset, valid_m_in_block, token_base, group_base;
   CUTLASS_DEVICE explicit W4A8RoutedScheduler(Params p) : inner(p.meta, 0, 0) {}
   CUTLASS_DEVICE bool fetch_next_work(uint32_t& m, uint32_t& n) {

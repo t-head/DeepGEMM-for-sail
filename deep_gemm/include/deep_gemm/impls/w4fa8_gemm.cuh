@@ -35,12 +35,14 @@ template <int ShapeN, int ShapeK, int BlockM, int BlockN, int BlockK, int WarpM,
 class W4A8GEMM_MMA {
 public:
   static constexpr bool Routed = Strategy == deep_gemm::w4fa8::NativeStrategy::Routed;
-  static constexpr bool Prefix = Strategy == deep_gemm::w4fa8::NativeStrategy::Compact;
+  static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
+  static constexpr bool Small = Strategy == deep_gemm::w4fa8::NativeStrategy::Compact;
+  static constexpr bool Prefix = Small && !Fused;
   static constexpr bool SharedPrefix = Prefix && BlockM == 32;
-  static constexpr bool Compact = Routed || (Prefix && BlockM != 16);
+  static constexpr bool Compact = Routed || (Small && (Fused || BlockM != 16));
   static constexpr int DecodeN = Routed ? 1 : SharedPrefix ? 2 : WarpN / 16;
-  // A narrow ring bounds live A operands for wide NoPad tiles.
-  static constexpr int ADistance = Routed && kGemmType == GemmType::MGroupedNoPad ? 1 : -1;
+  // A narrow ring bounds live A operands for wide routed tiles.
+  static constexpr int ADistance = Routed ? 1 : -1;
   static_assert(!Compact || (N_EXPAND == 1 && BlockK == WarpK));
   static_assert(WarpN == 16 || WarpN == 32 || WarpN == 48 || WarpN == 64);
   static_assert(N_EXPAND >= 1 && N_EXPAND <= 4);
@@ -57,7 +59,6 @@ public:
   static constexpr int ASlots = ResidentA && ShapeK / BlockK > kNumStages ? ShapeK / BlockK : kNumStages;
   static constexpr bool CacheRowScale = N_EXPAND > 1 && WarpM >= 32 && ShapeK <= 512;
   // basic
-  static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   // A packed K64 slice feeds two K32 MMA steps for every M tile and grouped kind.
   static constexpr bool BatchDequant = Routed || WarpK == 128;
   static constexpr bool E8M0_scale = true;
@@ -446,9 +447,9 @@ public:
           } else {
             deep_gemm::prefetch_A_token_offsets<ElementA, TilerA, BlockM, BlockK, MaxThreadsPerBlock>(
                 token_offsets, blk_token_base, params.num_token, thread_idx);
-            deep_gemm::clear_invalid_A_to_tsm<ElementA, TilerA, BlockM, BlockK, K, kNumStages>(
-                tAsA, params.ptr_a, token_offsets, params.num_token, thread_idx, Int<MaxThreadsPerBlock>{});
           }
+          deep_gemm::clear_invalid_A_to_tsm<ElementA, TilerA, BlockM, BlockK, K, kNumStages>(
+              tAsA, params.ptr_a, token_offsets, params.num_token, thread_idx, Int<MaxThreadsPerBlock>{});
           Tensor mD_mn = make_tensor(make_gmem_ptr(params.ptr_d + deep_scheduler.curr_block_m_offset * N),
                                      make_shape(Int<BlockM>{}, Int<N>{}), strideD); // (m,n)
           Tensor gD =
@@ -497,10 +498,7 @@ public:
                     params.ptr_a + uint64_t(token) * K + ki * CopyAConfig::TILER_N + tk * CopyAConfig::KPerThread +
                     BlockK * k_tile_iter);
                 auto* dst = reinterpret_cast<cutlass::uint128_t*>(raw_pointer_cast(tAsA(_, mi, ki, k_pipe).data()));
-                if constexpr (Routed)
-                  ACopyInst::copy(*src, *dst, token < uint32_t(params.num_token));
-                else
-                  deep_gemm::FusedACopyInst::copy(*src, *dst, token < uint32_t(params.num_token));
+                deep_gemm::FusedACopyInst::copy(*src, *dst, token < uint32_t(params.num_token));
               }
             }
           }

@@ -1730,11 +1730,19 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_fused(const std::pair<torch::Tensor, 
     if (!m)
         return;
     auto c = deep_gemm::w4fa8::unpack_config(configs);
-    if (inv_scale == 1.0f && deep_gemm::w4fa8::try_run_specialized(
-            a.first,a.second,b.first,b.second,out,rows,GemmType::MGroupedFused,c,tokens))
+    if (inv_scale == 1.0f &&
+        deep_gemm::w4fa8::try_run_specialized(a.first, a.second, b.first, b.second, out, rows, GemmType::MGroupedFused,
+                                              c, tokens, experts, aligned))
+        return;
+    const int n = b.first.size(1), k = a.first.size(1), output_m = out.size(0);
+    if (inv_scale == 1.0f && !is_compile_only() && tokens.dim() == 2 && tokens.size(1) == c.block_m &&
+        deep_gemm::w4fa8::default_fused_config(c, output_m, n, k, num_groups) &&
+        deep_gemm::w4fa8::streamed_fused_eligible(output_m, n, k, num_groups, c.num_sms) &&
+        deep_gemm::w4fa8::streamed::run_streamed(a.first, a.second, b.first, b.second, out, rows, n, c.num_sms, true,
+                                                 {experts, tokens, aligned, c.block_m}))
         return;
     deep_gemm::w4fa8::run(a.first, a.second, b.first, b.second, out, rows, GemmType::MGroupedFused,
-                         ceil_div(int(out.size(0)), num_groups), c, inv_scale, experts, tokens, aligned);
+                          ceil_div(output_m, num_groups), c, inv_scale, experts, tokens, aligned);
 }
 
 static void acblaslt_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,

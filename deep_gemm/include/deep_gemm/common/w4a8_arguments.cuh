@@ -14,6 +14,16 @@ struct GroupedRowRangeArguments {
   int32_t* grouped_layout;
   const int32_t* row_range;
 };
+struct GatherParams {
+  const uint8_t *a;
+  const float *a_scale;
+  uint8_t *grouped_a;
+  float *grouped_scale;
+  const int32_t *experts;
+  const int32_t *tokens;
+  const int32_t *aligned;
+  int num_tokens;
+};
 struct DecodeParams {
   const uint8_t* packed;
   const uint8_t* scales;

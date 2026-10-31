@@ -2,6 +2,33 @@
 #include <hggc_runtime.h>
 #include <deep_gemm/common/w4a8_arguments.cuh>
 namespace deep_gemm::w4fa8_streamed {
+// Convert the public padded token layout to contiguous expert rows. Both
+// activations and row scales are regenerated on every invocation/Graph replay.
+template <int K, int BlockM, int Groups> __device__ __forceinline__ void gather_body(GatherParams p, int group_start) {
+  constexpr int VectorsPerRow = K / 16;
+  const int blocks = __ldg(p.aligned);
+  for (int block = blockIdx.x; block < blocks; block += gridDim.x) {
+    const uint4 expert = __ldg(reinterpret_cast<const uint4 *>(p.experts) + block);
+    if (expert.x < uint32_t(group_start) || expert.x >= uint32_t(group_start + Groups))
+      continue;
+    const int row = (block - int(expert.z)) * BlockM;
+    const int valid = min(BlockM, int(expert.y) - row);
+    const int out_row = int(expert.w) + row;
+    for (int vector = threadIdx.x; vector < valid * VectorsPerRow; vector += blockDim.x) {
+      const int local_row = vector / VectorsPerRow, column = vector % VectorsPerRow;
+      const int token = __ldg(p.tokens + int64_t(block) * BlockM + local_row);
+      if (uint32_t(token) < uint32_t(p.num_tokens))
+        reinterpret_cast<uint4 *>(p.grouped_a)[int64_t(out_row + local_row) * VectorsPerRow + column] =
+            __ldg(reinterpret_cast<const uint4 *>(p.a) + int64_t(token) * VectorsPerRow + column);
+    }
+    for (int local_row = threadIdx.x; local_row < valid; local_row += blockDim.x) {
+      const int token = __ldg(p.tokens + int64_t(block) * BlockM + local_row);
+      if (uint32_t(token) < uint32_t(p.num_tokens))
+        p.grouped_scale[out_row + local_row] = __ldg(p.a_scale + token);
+    }
+  }
+}
+
 // W4A8 preprocess confines adjusted UE8M0 to [114,140], which maps every
 // finite E2M1 magnitude exactly to a normal finite E5M2 value.
 __device__ __forceinline__ uint32_t fp4_four_to_e5(uint32_t codes, uint32_t low, uint32_t high) {

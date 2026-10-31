@@ -111,23 +111,27 @@ static const char* get_gemm_type_name(GemmType kind) {
 // needed to amortize prefix/metadata construction. They contain no model shapes.
 static bool supports_native_strategy() { return is_ppu1v5_device() && get_num_sms() > 0; }
 
-static W4A8Config small_m_config(int expected_m, int n = 256) {
+static W4A8Config small_m_config(int expected_m, int n = 256, GemmType kind = GemmType::MGroupedNoPad, int groups = 1) {
     const int bm = expected_m <= 16 ? 16 : expected_m <= 32 ? 32 : 64;
-    const int bn = n >= 256 ? 256 : 128;
-    return {get_num_sms(), bm, bn, 128, bm, bm == 32 ? 32 : 64, 128, 2, 1};
+    const bool fused = kind == GemmType::MGroupedFused;
+    const int base_n = n >= 256 ? 256 : 128;
+    const bool underfilled = int64_t(groups) * ceil_div(n, base_n) < get_num_sms();
+    const int bn = fused && bm == 32 ? 128 : base_n;
+    const int wn = bm == 32 || (fused && bm == 16 && underfilled) ? 32 : 64;
+    return {get_num_sms(), bm, bn, 128, bm, wn, 128, 2, 1};
 }
 
-static int specialized_smem_size(const W4A8Config& c, int k, bool routed) {
+static int specialized_smem_size(const W4A8Config& c, int k, bool routed, bool prefix = true) {
     const int base = get_smem_size(c, k);
     if (routed)
         return base + ((2 * c.block_m * int(sizeof(float)) + 127) / 128) * 128;
-    return base + (c.block_m == 32 ? 2 * 64 * int(sizeof(uint32_t)) : 0);
+    return base + (prefix && c.block_m == 32 ? 2 * 64 * int(sizeof(uint32_t)) : 0);
 }
 
-static bool fits_strategy(const W4A8Config& c, int k, bool routed) {
+static bool fits_strategy(const W4A8Config& c, int k, bool routed, bool prefix = true) {
     const auto prop = device_runtime->get_prop();
     return get_num_threads(c) <= prop->maxThreadsPerBlock &&
-           specialized_smem_size(c, k, routed) <= int(prop->sharedMemPerBlockOptin);
+           specialized_smem_size(c, k, routed, prefix) <= int(prop->sharedMemPerBlockOptin);
 }
 
 static bool fits_compiled_strategy(int local_bytes) {
@@ -135,33 +139,45 @@ static bool fits_compiled_strategy(int local_bytes) {
     return local_bytes <= 64;
 }
 
-static bool small_m_eligible(int groups, int m, int n, int k) {
-    if (groups < 1 || groups > 64 || ceil_div(m, groups) > 64 || n < 128 || n % 64 || k < 512 || k % 128)
+static bool small_m_eligible(int groups, int m, int n, int k, GemmType kind = GemmType::MGroupedNoPad) {
+    const bool prefix = kind != GemmType::MGroupedFused;
+    if (groups < 1 || groups > (prefix ? 64 : 1024) || ceil_div(m, groups) > 64 || n < 128 || n % 64 || k < 512 ||
+        k % 128)
         return false;
-    return fits_strategy(small_m_config(ceil_div(m, groups), n), k, false);
+    return fits_strategy(small_m_config(ceil_div(m, groups), n, kind, groups), k, false, prefix);
 }
 
-static W4A8Config routed_config(bool small, GemmType kind, int n, int k) {
-    // Larger N/K tiles trade shared memory for reuse when both dimensions align.
-    if (kind == GemmType::MGroupedFused && !small && n % 384 == 0 && k % 256 == 0)
-        return {get_num_sms(), 192, 384, 256, 96, 48, 256, 2, 1};
+static NativeStrategy small_m_strategy(const W4A8Config& c, GemmType kind) {
+    return kind == GemmType::MGroupedFused && c.block_m == 16 && c.warp_n == 64 ? NativeStrategy::Default
+                                                                                : NativeStrategy::Compact;
+}
+
+static W4A8Config routed_config(bool small) {
     const int bm = small ? 160 : 192;
     return {get_num_sms(), bm, 256, 128, bm, 32, 128, small ? 2 : 3, 1};
 }
 
 static bool routed_eligible(int groups, int m, int n, int k, GemmType kind, const W4A8Config& original) {
-    if (groups <= 64 || groups > 1024 || n < 256 || n % 256 || k < 512 || k % 128)
+    if (groups < 1 || groups > 1024 || (groups <= 64 && kind != GemmType::MGroupedFused) || n < 256 || n % 256 ||
+        k < 512 || k % 128)
         return false;
     const int expected_m = ceil_div(m, groups);
     if (expected_m < 96 || expected_m > 256 || int64_t(ceil_div(m, 192)) * (n / 256) < get_num_sms())
+        return false;
+    // Small expert sets need several waves to repay the device metadata pass.
+    if (groups <= 64 && int64_t(ceil_div(m, 192)) * (n / 256) < int64_t(get_num_sms()) * 4)
+        return false;
+    // Avoid wide tiles when extra padding outweighs their decode reuse.
+    if (kind == GemmType::MGroupedFused &&
+        ceil_div(expected_m, 160) * 160 * 4 > ceil_div(expected_m, original.block_m) * original.block_m * 5)
         return false;
     // The token layout belongs to this public config, not to the internal tile.
     // Metadata records preserve its padded expert offsets explicitly.
     if (kind == GemmType::MGroupedFused &&
         pack_config(original) != pack_config(get_best_configs(expected_m, n, k, groups, kind)))
         return false;
-    return fits_strategy(routed_config(true, kind, n, k), k, true) &&
-           fits_strategy(routed_config(false, kind, n, k), k, true);
+    return fits_strategy(routed_config(true), k, true) &&
+           (kind == GemmType::MGroupedFused || fits_strategy(routed_config(false), k, true));
 }
 
 // Larger width removes repeated core segmentation when the bounded buffer fits.
@@ -202,12 +218,24 @@ static int streamed_min_rows(int n, int k, int groups, int m, int num_sms) {
 // Each call overwrites a bounded, partial FP8 tile; no decoded values survive as a weight cache.
 static int streamed_tile_n(int n, int k, int groups) { return full_width_streamed(n, k, groups) ? n : 0; }
 
+static bool default_fused_config(const W4A8Config& c, int m, int n, int k, int groups) {
+    return pack_config(c) == pack_config(get_best_configs(ceil_div(m, groups), n, k, groups, GemmType::MGroupedFused));
+}
+
+static bool streamed_fused_eligible(int m, int n, int k, int groups, int num_sms) {
+    // Bound the additional activation workspace independently of weight chunks.
+    constexpr int64_t activation_budget = 1024LL * 1024 * 1024;
+    return supports_native_strategy() && full_width_streamed(n, k, groups) &&
+           int64_t(m) * (k + int(sizeof(float))) <= activation_budget &&
+           int64_t(m) >= int64_t(groups) * streamed_min_rows(n, k, groups, m, num_sms);
+}
+
 struct StreamedPlan {
     std::vector<std::pair<int, int>> groups;
     int max_groups;
     bool ramp, short_call;
 };
-static StreamedPlan make_streamed_plan(int m, int n, int k, int groups, int num_sms) {
+static StreamedPlan make_streamed_plan(int m, int n, int k, int groups, int num_sms, bool fused = false) {
     // Small chunks repay their extra kernel/event startup only when the
     // full-width weight slice is large and the call has a short compute tail.
     const bool short_call = short_streamed_eligible(m, n, k, groups, num_sms);
@@ -218,7 +246,7 @@ static StreamedPlan make_streamed_plan(int m, int n, int k, int groups, int num_
     // Ramp only when decode traffic is large enough to amortize extra
     // launches. Long reuse prefers fewer full-sized chunks.
     const bool ramp = int64_t(n) * k >= 8LL * 1024 * 1024 && int64_t(m) >= int64_t(groups) * 1024 &&
-                      int64_t(m) < int64_t(groups) * 4096;
+                      (fused || int64_t(m) < int64_t(groups) * 4096);
     std::vector<std::pair<int, int>> plan;
     const int max_chunk = std::min(14, groups / 2);
     int chunk = 0;
