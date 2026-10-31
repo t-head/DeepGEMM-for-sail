@@ -49,6 +49,8 @@ from .deep_gemm_cpp import (
     bf16_gemm_nn,
     bf16_gemm_tn,
     bf16_gemm_tt,
+    bf16_gemm_strided_batched_nt,
+    gemm_fp32_fp32_fp32_nt,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
     m_grouped_bf16_gemm_nt_nopad,

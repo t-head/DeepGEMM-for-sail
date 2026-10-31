@@ -20,6 +20,8 @@ def device_version_supported(one_case):
     caselist can run on both PPU1.0 and PPU1.5.
     """
     data_type = one_case.get('data_type')
+    if one_case.get('device') == '810e' and 'ZW810E' not in torch.cuda.get_device_name():
+        return False, 'This regression case requires ZW810E'
     if one_case.get('gemm_type') == 'Activation' or data_type in ('w4fa16_mma', 'w4fa8_mma'):
         if get_arch_version() < 89:
             return False, 'Activation and W4 MMA require PPU1.5 (sm_89) or later'

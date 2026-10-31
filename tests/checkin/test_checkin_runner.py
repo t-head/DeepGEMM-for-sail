@@ -63,8 +63,12 @@ class ParserTests(unittest.TestCase):
                     if case['gemm_type'] == 'BatchGemm':
                         captured = []
                         namespace['test_einsum'] = captured.append
+                        namespace['test_native_batch_gemm'] = captured.append
                         namespace['test_batch_gemm'](case)
                         mapped = captured[0]
+                        if case['data_type'] == namespace['torch'].bfloat16:
+                            self.assertEqual(mapped, case)
+                            continue
                         self.assertIn(mapped['expr'], ('bhr,hdr->bhd', 'bhr,hdr->hbd'))
                         self.assertEqual((mapped['h'], mapped['b'], mapped['d'], mapped['r']),
                                          (case['groups'], case['m'], case['n'], case['k']))

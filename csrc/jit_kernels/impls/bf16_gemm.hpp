@@ -2,6 +2,7 @@
 
 #include <torch/python.h>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 #include <hggc_fp8.h>
 #include "cute/tensor.hpp"
@@ -1207,4 +1208,519 @@ static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const 
     else
         bf16_gemm_impl<cutlass::bfloat16_t>(lhs, rhs, out, m, n, k, configs);
 }
+
+// 810E direct, native batch, split-K and TSM launchers.
+// Rows are contiguous intervals. Test the nearest row in the other dimension
+// for each batch difference (or vice versa), preserving legal interleaved views.
+static bool model_810e_batch_output_overlaps(const torch::Tensor& d) {
+    const int64_t batch = d.size(0), m = d.size(1), n = d.size(2);
+    const int64_t bs = d.stride(0), ld = d.stride(1);
+    if (batch <= 1) return false; // Row overlap was checked by the caller.
+    if (bs < n) return true;
+    if (m <= 1 || bs >= (m - 1) * ld + n || ld >= (batch - 1) * bs + n) return false;
+    const bool batch_first = batch <= m;
+    const int64_t count = batch_first ? batch : m, step = batch_first ? bs : ld;
+    const int64_t other_count = batch_first ? m : batch, other_step = batch_first ? ld : bs;
+    for (int64_t i = 1; i < count; ++i) {
+        const int64_t offset = i * step;
+        const int64_t j = std::min(offset / other_step, other_count - 1);
+        if (offset - j * other_step < n ||
+            (j + 1 < other_count && (j + 1) * other_step - offset < n)) return true;
+    }
+    return false;
+}
+
+// Validate native strided batches. Read-only inputs may
+// broadcast batches; output batches must never race on the same address.
+static bool model_810e_check_batch(const torch::Tensor& a, const torch::Tensor& b,
+                                  const torch::Tensor& d) {
+    TORCH_CHECK(a.dim() == 3 && b.dim() == 3 && d.dim() == 3, "810E batch requires rank-3 tensors");
+    TORCH_CHECK(a.scalar_type() == torch::kBFloat16 && b.scalar_type() == torch::kBFloat16 &&
+                d.scalar_type() == torch::kBFloat16, "810E batch requires BF16 inputs and output");
+    TORCH_CHECK(a.is_cuda() && b.device() == a.device() && d.device() == a.device(),
+                "810E batch tensors must be on the same accelerator");
+    TORCH_CHECK(!is_ppu1v5_device(), "810E batch targets PPU 1.0");
+    TORCH_CHECK(a.size(0) == b.size(0) && a.size(0) == d.size(0) && a.size(1) == d.size(1) &&
+                b.size(1) == d.size(2) && a.size(2) == b.size(2),
+                "810E batch expects A[B,M,K], B[B,N,K], D[B,M,N]");
+    if (a.size(0) == 0 || a.size(1) == 0 || b.size(1) == 0) return true;
+    for (auto size : {a.size(0), a.size(1), a.size(2), b.size(1)})
+        TORCH_CHECK(size <= std::numeric_limits<int>::max(), "810E batch dimensions exceed int32");
+    TORCH_CHECK(a.size(0) <= device_runtime->get_prop()->maxGridSize[2], "810E batch exceeds grid.z limit");
+    TORCH_CHECK(a.stride(2) == 1 && b.stride(2) == 1 && d.stride(2) == 1,
+                "810E batch requires contiguous K in inputs and contiguous N in output");
+    TORCH_CHECK(a.stride(0) >= 0 && b.stride(0) >= 0 && d.stride(0) > 0 &&
+                a.stride(1) >= a.size(2) && b.stride(1) >= b.size(2) && d.stride(1) >= d.size(2),
+                "810E batch requires nonnegative batch strides and nonoverlapping rows");
+    TORCH_CHECK(!model_810e_batch_output_overlaps(d), "810E batch output batches overlap");
+    if (a.size(2) == 0) { d.zero_(); return true; }
+    // Every supported tile has BK >= 32 and at least two complete K stages.
+    TORCH_CHECK(a.size(2) >= 64 && a.size(2) % 32 == 0,
+                "810E batch requires K >= 64 and divisible by 32");
+    TORCH_CHECK(a.stride(0) % 8 == 0 && b.stride(0) % 8 == 0 &&
+                a.stride(1) % 8 == 0 && b.stride(1) % 8 == 0 &&
+                (reinterpret_cast<uintptr_t>(a.data_ptr()) & 15) == 0 &&
+                (reinterpret_cast<uintptr_t>(b.data_ptr()) & 15) == 0,
+                "810E batch requires 16-byte-aligned input rows and batches");
+    return false;
+}
+
+// N=1 is the transpose of a one-row GEMV, and the output has the same physical
+// order. Swapping pointers is sufficient; no input/output transpose is launched.
+static bool model_810e_bf16_n1(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
+    if (is_ppu1v5_device() || b.size(0) != 1) return false;
+    const int m = a.size(0), k = a.size(1);
+    TORCH_CHECK(k % 8 == 0 && (reinterpret_cast<uintptr_t>(a.data_ptr()) & 15) == 0 &&
+                (reinterpret_cast<uintptr_t>(b.data_ptr()) & 15) == 0,
+                "810E N=1 BF16 GEMV requires K divisible by 8 and 16-byte-aligned inputs");
+    constexpr int bx = 128, unroll = 2;
+    const int by = 128 / bx;
+    const bool fp32 = d.scalar_type() == torch::kFloat;
+    const std::string name = fp32 ? "model_810e_bf16_n1_fp32" : "model_810e_bf16_n1";
+    DenseGemvRuntime::Args args{
+        {bx, by, unroll, 1, 1, name, fp32},
+        {dim3(ceil_div(m, by)), dim3(bx, by), 0},
+        {m, k, b.data_ptr(), a.data_ptr(), d.data_ptr(), k}};
+    auto code = DenseGemvRuntime::generate(args);
+    auto runtime = compiler->build(name, code);
+    DenseGemvRuntime::launch(runtime, args);
+    return true;
+}
+
+class Model810eBatchedRuntime final : public LaunchRuntime<Model810eBatchedRuntime> {
+public:
+    using Base = BF16GemmCutlass3Runtime;
+    using Args = Base::Args;
+    static void replace_once(std::string& code, const std::string& before, const std::string& after) {
+        const auto pos = code.find(before);
+        TORCH_CHECK(pos != std::string::npos, "810E batched JIT template is incompatible with BF16 runtime");
+        code.replace(pos, before.size(), after);
+    }
+    static std::string generate_impl(const Args& args) {
+        // Reuse the exact architecture/mainloop/Params declarations. Keeping one
+        // generator prevents host/device ABI drift as the dense runtime evolves.
+        // Only the custom entry below runs. It reads M/N/K and all strides from
+        // Params, and never instantiates the standard scheduler or epilogue's
+        // operator(). These dummy dimensions affect unused type declarations
+        // only; canonicalizing them lets different N/K cases share one binary.
+        // Keep the actual launch arguments untouched, including batch count.
+        auto codegen_args = args;
+        cute::get<1>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
+        cute::get<2>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
+        auto code = Base::generate_impl(codegen_args);
+        replace_once(code, "GemmKernel::SharedStorageSize,", "sizeof(typename CollectiveMainloop::SharedStorage),");
+        replace_once(code, "GemmKernel op;\n  op(params, smem);",
+            "Model810eBatchedKernel<CollectiveMainloop> op;\n  op(params, smem);");
+        return code;
+    }
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    }
+};
+
+template <typename Output>
+class Model810eDenseRuntime final : public LaunchRuntime<Model810eDenseRuntime<Output>> {
+public:
+    using Base = BF16GemmCutlass3RuntimeT<Output>;
+    using Args = typename Base::Args;
+    static std::string generate_impl(const Args& args) {
+        // The replacement kernel uses runtime dimensions. SHAPE_N/K belong to
+        // the unused standard scheduler/epilogue declarations, so normalize
+        // only this codegen copy to share JIT kernels across problem shapes.
+        auto codegen_args = args;
+        cute::get<1>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
+        cute::get<2>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
+        auto code = Base::generate_impl(codegen_args);
+        const int splits = cute::get<3>(args.kernel_params.with_tsm.problem_shape);
+        Model810eBatchedRuntime::replace_once(code, "GemmKernel::SharedStorageSize,",
+            "sizeof(typename CollectiveMainloop::SharedStorage),");
+        Model810eBatchedRuntime::replace_once(code, "GemmKernel op;\n  op(params, smem);",
+            fmt::format("Model810eDenseKernel<CollectiveMainloop, ElementC, {}> op;\n  op(params, smem);", splits));
+        return code;
+    }
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    }
+};
+
+template <typename Output>
+class Model810eReduceRuntime final : public LaunchRuntime<Model810eReduceRuntime<Output>> {
+public:
+    struct Params { const float* partial; void* d; int64_t count; };
+    struct Args { LaunchArgs launch_args; Params params; int splits; };
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#define BF16_HGRTC
+#include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
+extern "C" __global__ void model_810e_splitk_reduce(deep_gemm::Model810eReduceParams p) {{
+    deep_gemm::model_810e_reduce<{}, {}>(p);
+}}
+)", std::is_same_v<Output, float> ? "float" : "__ppu_bfloat16", args.splits);
+    }
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
+    }
+};
+
+template <typename Output>
+static void model_810e_bf16_dense(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                                 int bm, int bn, int bk, int wm, int wn, int stages, int splits) {
+    const int m = a.size(0), n = b.size(0), k = a.size(1);
+    const auto pow2 = [](int x) { return x > 0 && (x & (x - 1)) == 0; };
+    TORCH_CHECK(bm >= 16 && bn >= 16 && bk >= 32 && pow2(bm) && pow2(bn) && pow2(bk) &&
+                wm >= 16 && wn >= 16 && bm % wm == 0 && bn % wn == 0 &&
+                stages >= 2 && stages <= 8, "invalid 810E BF16 tile (requires BK>=32)");
+    TORCH_CHECK(splits >= 1 && splits <= 64 && k % bk == 0 && (k / bk) / splits >= stages,
+                "810E BF16 requires 1<=splits<=64, K%BK=0, and at least stages BK tiles per split");
+    const int threads = (bm / wm) * (bn / wn) * 32;
+    const int smem = (bm + bn) * bk * 2 * stages;
+    TORCH_CHECK(threads <= device_runtime->get_prop()->maxThreadsPerBlock &&
+                smem <= device_runtime->get_prop()->sharedMemPerMultiprocessor,
+                "810E BF16 tile exceeds device resources");
+    using Runtime = Model810eDenseRuntime<Output>;
+    using Base = typename Runtime::Base;
+    using Stride = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+    const Stride sa{k, cute::Int<1>{}, int64_t(m) * k};
+    const Stride sb{k, cute::Int<1>{}, int64_t(n) * k};
+    const Stride sd{n, cute::Int<1>{}, int64_t(m) * n};
+    auto* output = static_cast<Output*>(d.data_ptr());
+    torch::Tensor workspace;
+    if (splits > 1)
+        workspace = torch::empty({int64_t(splits) * m * n}, a.options().dtype(torch::kFloat));
+    cutlass::KernelHardwareInfo hw{};
+    hw.device_id = a.get_device(); hw.cu_count = get_num_sms();
+    typename Base::GemmArguments gemm_args{
+        .mode = cutlass::gemm::GemmUniversalMode::kGemm,
+        .problem_shape = {m, n, k, splits},
+        .mainloopargs = {reinterpret_cast<const cutlass::bfloat16_t*>(a.data_ptr<at::BFloat16>()), sa,
+                         reinterpret_cast<const cutlass::bfloat16_t*>(b.data_ptr<at::BFloat16>()), sb},
+        .epilogueargs = {{1, 0}, output, sd, output, sd},
+        .hw_info = hw, .scheduler = {(uint32_t)m, nullptr}, .signal = nullptr};
+    typename Runtime::Args args{
+        .launch_info = {bm, bn, bk, wm, wn, 1, stages, "Normal", "Default", "model_810e_bf16_dense", false},
+        .launch_args = {dim3(ceil_div(n, bn), ceil_div(m, bm), splits), dim3(threads), smem},
+        .kernel_params = Base::to_underlying_arguments_rtc(gemm_args, splits > 1 ? workspace.data_ptr<float>() : nullptr)};
+    auto code = Runtime::generate(args);
+    auto runtime = compiler->build("model_810e_bf16_dense", code);
+    Runtime::launch(runtime, args);
+    if (splits > 1) {
+        using Reduce = Model810eReduceRuntime<Output>;
+        const int64_t count = int64_t(m) * n;
+        typename Reduce::Args reduce_args{
+            {dim3((count + 255) / 256), dim3(256), 0},
+            {workspace.data_ptr<float>(), output, count}, splits};
+        auto reduce_code = Reduce::generate(reduce_args);
+        auto reduce_runtime = compiler->build("model_810e_splitk_reduce", reduce_code);
+        Reduce::launch(reduce_runtime, reduce_args);
+    }
+}
+
+static std::pair<int, int> model_810e_batch_k_config(const int k) {
+    const int bk = k >= 128 && k % 64 == 0 ? 64 : 32;
+    return {bk, std::min(3, k / bk)};
+}
+
+static void model_810e_bf16_strided_batched(const torch::Tensor& a, const torch::Tensor& b,
+    const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt) {
+    const int batch = a.size(0), m = a.size(1), n = b.size(1), k = a.size(2);
+    auto [bk, stages] = model_810e_batch_k_config(k);
+    int bm = m <= 64 ? 32 : 128, bn = m <= 64 ? 64 : 128;
+    int wm = m <= 64 ? 16 : 32, wn = m <= 64 ? 32 : 64;
+    int sms = get_num_sms();
+    if (configs) {
+        auto [ns, cbm, cbn, cbk, cwm, cwn, cstages, unused] = *configs;
+        sms = ns; bm = cbm; bn = cbn; bk = cbk; wm = cwm; wn = cwn; stages = cstages;
+    }
+    const auto pow2 = [](int x) { return x > 0 && (x & (x - 1)) == 0; };
+    TORCH_CHECK(bm >= 16 && bn >= 16 && bk >= 32 && pow2(bm) && pow2(bn) && pow2(bk) &&
+                wm >= 16 && wn >= 16 && bm % wm == 0 && bn % wn == 0 &&
+                stages >= 2 && stages <= 8, "invalid 810E BF16 batched tile (requires BK>=32)");
+    TORCH_CHECK(k % bk == 0 && k / bk >= stages,
+                "810E BF16 batched tile requires K%BK=0 and at least stages BK tiles");
+    const int threads = (bm / wm) * (bn / wn) * 32;
+    const int smem = (bm + bn) * bk * 2 * stages;
+    TORCH_CHECK(threads <= device_runtime->get_prop()->maxThreadsPerBlock &&
+                smem <= device_runtime->get_prop()->sharedMemPerMultiprocessor,
+                "810E BF16 batched tile exceeds device resources");
+    using Runtime = Model810eBatchedRuntime;
+    using Base = Runtime::Base;
+    using Stride = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+    const Stride sa{a.stride(1), cute::Int<1>{}, a.stride(0)};
+    const Stride sb{b.stride(1), cute::Int<1>{}, b.stride(0)};
+    const Stride sd{d.stride(1), cute::Int<1>{}, d.stride(0)};
+    auto* output = reinterpret_cast<cutlass::bfloat16_t*>(d.data_ptr<at::BFloat16>());
+    cutlass::KernelHardwareInfo hw{};
+    hw.device_id = a.get_device(); hw.cu_count = sms;
+    Base::GemmArguments gemm_args{
+        .mode = cutlass::gemm::GemmUniversalMode::kGemm,
+        .problem_shape = {m, n, k, batch},
+        .mainloopargs = {reinterpret_cast<const cutlass::bfloat16_t*>(a.data_ptr<at::BFloat16>()), sa,
+                         reinterpret_cast<const cutlass::bfloat16_t*>(b.data_ptr<at::BFloat16>()), sb},
+        .epilogueargs = {{1, 0}, output, sd, output, sd},
+        .hw_info = hw, .scheduler = {(uint32_t)m, nullptr}, .signal = nullptr};
+    Runtime::Args args{
+        .launch_info = {bm, bn, bk, wm, wn, batch, stages, "Normal", "Default", "model_810e_bf16_batch", false},
+        .launch_args = {dim3(ceil_div(n, bn), ceil_div(m, bm), batch), dim3(threads), smem},
+        .kernel_params = Base::to_underlying_arguments_rtc(gemm_args, nullptr)};
+    auto code = Runtime::generate(args);
+    auto runtime = compiler->build("model_810e_bf16_batch", code);
+    Runtime::launch(runtime, args);
+}
+
+template <typename Output, bool SplitK>
+class Model810eTsmRuntime final : public LaunchRuntime<Model810eTsmRuntime<Output, SplitK>> {
+public:
+    using Base = BF16GemmCutlass3RuntimeT<Output>;
+    // Host-only scheduling options stay outside device Params. Code generation
+    // and launch dimensions consume the same values selected by the tile table.
+    struct Args : Base::Args {
+        bool grid_m_first = false;
+        bool peel_first_k = false;
+        bool static_m36 = false;
+        bool static_k256 = false;
+    };
+    static std::string generate_impl(const Args& args) {
+        auto codegen_args = static_cast<const typename Base::Args&>(args);
+        // The custom kernel and EVT epilogue use real dimensions from Params
+        // (or the validated M36 specialization). The unused standard scheduler
+        // remains a fixed dummy type.
+        cute::get<1>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
+        cute::get<2>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
+        auto code = Base::generate_impl(codegen_args);
+        const int splits = SplitK ? cute::get<3>(args.kernel_params.with_tsm.problem_shape) : 1;
+        Model810eBatchedRuntime::replace_once(code, "GemmKernel op;\n  op(params, smem);",
+            fmt::format("static_assert(GemmKernel::SharedStorageSize <= {}, \"810E TSM launch storage is too small\");\n"
+                        "  Model810eTsmKernel<{}, CollectiveEpilogue, {}, {}, {}, {}> op;\n  op(params, smem);",
+                        args.launch_args.smem_size,
+                        args.peel_first_k ? fmt::format("deep_gemm::Model810eFirstKPeel<CollectiveMainloop, {}>",
+                                                       args.static_k256 ? "true" : "false") : "CollectiveMainloop",
+                        SplitK ? "true" : "false", splits,
+                        args.grid_m_first ? "true" : "false", args.static_m36 ? "true" : "false"));
+        return code;
+    }
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    }
+};
+
+// Rank-3 views: dense uses a singleton input batch; split-K D has `splits`
+// batches of FLOAT partials. No packing or copies are performed by this helper.
+template <typename Output, bool SplitK>
+static void model_810e_tsm_launch(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+    int bm, int bn, int bk, int wm, int wn, int stages, int splits, int sms,
+    bool grid_m_first = false,
+    bool peel_first_k = false,
+    bool static_m36 = false,
+    bool static_k256 = false) {
+    const int m = a.size(1), n = b.size(1), k = a.size(2);
+    const int groups = SplitK ? splits : a.size(0);
+    TORCH_CHECK(!static_m36 || (!SplitK && groups == 64 && m == 36 && n == 512 && k == 256 &&
+                !is_ppu1v5_device() &&
+                std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos),
+                "Static M36 specialization requires native batch=64, M=36, N=512, K=256");
+    TORCH_CHECK(!static_k256 || (!SplitK && groups == 64 && m == 36 && n == 512 && k == 256 &&
+                bk == 64 && (stages == 2 || stages == 3) && static_m36 && peel_first_k &&
+                !is_ppu1v5_device() &&
+                std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos),
+                "Static K256 specialization requires native 810E batch=64/M36/N512/K256, BK64, stages 2 or 3, "
+                "static_m36=true and peel_first_k=true");
+    const auto pow2 = [](int x) { return x > 0 && (x & (x - 1)) == 0; };
+    // This mainloop advances its pipeline at K_BLOCK_MAX-2. BK16 has only
+    // one register K block on 810E and cannot advance that state machine.
+    TORCH_CHECK(bm >= 16 && bn >= 16 && bk >= 32 && pow2(bm) && pow2(bn) && pow2(bk) &&
+                wm >= 16 && wn >= 16 && bm % wm == 0 && bn % wn == 0 &&
+                stages >= 2 && stages <= 8, "invalid 810E TSM tile (requires BK>=32)");
+    TORCH_CHECK(splits >= 1 && splits <= 64 && k % bk == 0 && (k / bk) / splits >= stages,
+                "810E TSM requires K%BK=0 and at least stages BK tiles per split");
+    const int threads = (bm / wm) * (bn / wn) * 32;
+    const int main_smem = (bm + bn) * bk * 2 * stages;
+    // The EVT stages WarpOnM*16 rows at a time, in FP32. Reserve one alignment
+    // unit for its empty callback storage/padding; a generated static_assert
+    // checks this bound against the actual CUTLASS SharedStorage type.
+    const int epi_smem = (bm / wm) * 16 * bn * 4 + 128;
+    const int smem = std::max(main_smem, epi_smem);
+    TORCH_CHECK(threads <= device_runtime->get_prop()->maxThreadsPerBlock &&
+                smem <= device_runtime->get_prop()->sharedMemPerMultiprocessor,
+                "810E TSM tile exceeds device resources");
+    using Runtime = Model810eTsmRuntime<Output, SplitK>;
+    using Base = typename Runtime::Base;
+    using Stride = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+    const Stride sa{a.stride(1), cute::Int<1>{}, a.stride(0)};
+    const Stride sb{b.stride(1), cute::Int<1>{}, b.stride(0)};
+    const Stride sd{d.stride(1), cute::Int<1>{}, d.stride(0)};
+    auto* output = static_cast<Output*>(d.data_ptr());
+    cutlass::KernelHardwareInfo hw{};
+    hw.device_id = a.get_device(); hw.cu_count = sms;
+    typename Base::GemmArguments gemm_args{
+        .mode = cutlass::gemm::GemmUniversalMode::kGemm,
+        .problem_shape = {m, n, k, groups},
+        .mainloopargs = {reinterpret_cast<const cutlass::bfloat16_t*>(a.data_ptr<at::BFloat16>()), sa,
+                         reinterpret_cast<const cutlass::bfloat16_t*>(b.data_ptr<at::BFloat16>()), sb},
+        .epilogueargs = {{1, 0}, output, sd, output, sd},
+        .hw_info = hw, .scheduler = {(uint32_t)m, nullptr}, .signal = nullptr};
+    const std::string name = SplitK ? "model_810e_tsm_dense" : "model_810e_tsm_batch";
+    typename Base::Args base_args{
+        .launch_info = {bm, bn, bk, wm, wn, 1, stages, "Normal", "Default", name, false},
+        .launch_args = {grid_m_first ? dim3(ceil_div(m, bm), ceil_div(n, bn), groups) :
+                                      dim3(ceil_div(n, bn), ceil_div(m, bm), groups), dim3(threads), smem},
+        .kernel_params = Base::to_underlying_arguments_rtc(gemm_args, nullptr)};
+    typename Runtime::Args args{base_args, grid_m_first, peel_first_k,
+                               static_m36, static_k256};
+    auto code = Runtime::generate(args);
+    auto runtime = compiler->build(name, code);
+    Runtime::launch(runtime, args);
+}
+
+template <typename Output>
+static void model_810e_bf16_dense_tsm(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+    int bm, int bn, int bk, int wm, int wn, int stages, int splits,
+    bool grid_m_first = false,
+    bool peel_first_k = false,
+    bool static_m36 = false,
+    bool static_k256 = false) {
+    TORCH_CHECK(!static_m36 && !static_k256,
+                "Static M36/K256 specialization requires native strided batches");
+    const int m = a.size(0), n = b.size(0);
+    const int alignment = 16 / sizeof(Output);
+    // Standard EVT predicates only the vector's first element. Keep narrow or
+    // unaligned output rows on the audited per-element path, including N=4.
+    if (n < 8 || n % alignment != 0 || (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) != 0) {
+        model_810e_bf16_dense<Output>(a, b, d, bm, bn, bk, wm, wn, stages, splits);
+        return;
+    }
+    TORCH_CHECK(splits >= 1 && splits <= 64, "810E TSM requires 1<=splits<=64");
+    const auto av = a.unsqueeze(0), bv = b.unsqueeze(0);
+    if (splits == 1) {
+        model_810e_tsm_launch<Output, true>(av, bv, d.unsqueeze(0), bm, bn, bk, wm, wn, stages, 1, get_num_sms(),
+                                          grid_m_first, peel_first_k);
+        return;
+    }
+    auto partial = torch::empty({int64_t(splits), int64_t(m), int64_t(n)}, a.options().dtype(torch::kFloat));
+    model_810e_tsm_launch<float, true>(av, bv, partial, bm, bn, bk, wm, wn, stages, splits, get_num_sms(),
+                                     grid_m_first, peel_first_k);
+    using Reduce = Model810eReduceRuntime<Output>;
+    const int64_t count = int64_t(m) * n;
+    typename Reduce::Args args{{dim3((count + 255) / 256), dim3(256), 0},
+                              {partial.data_ptr<float>(), d.data_ptr(), count}, splits};
+    auto code = Reduce::generate(args);
+    auto runtime = compiler->build("model_810e_splitk_reduce", code);
+    Reduce::launch(runtime, args);
+}
+
+static void model_810e_bf16_strided_batched_tsm(const torch::Tensor& a, const torch::Tensor& b,
+    const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt,
+    bool grid_m_first = false,
+    bool peel_first_k = false,
+    bool static_m36 = false,
+    bool static_k256 = false) {
+    const int m = a.size(1), n = b.size(1);
+    if (n < 8 || n % 8 != 0 || d.stride(1) % 8 != 0 || d.stride(0) % 8 != 0 ||
+        (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) != 0) {
+        TORCH_CHECK(!static_m36 && !static_k256,
+                    "Static M36/K256 specialization requires an aligned TSM epilogue");
+        model_810e_bf16_strided_batched(a, b, d, configs);
+        return;
+    }
+    auto [bk, stages] = model_810e_batch_k_config(int(a.size(2)));
+    int bm = m <= 64 ? 32 : 128, bn = m <= 64 ? 64 : 128;
+    int wm = m <= 64 ? 16 : 32, wn = m <= 64 ? 32 : 64;
+    int sms = get_num_sms();
+    if (configs) {
+        auto [ns, cbm, cbn, cbk, cwm, cwn, cstages, unused] = *configs;
+        sms = ns; bm = cbm; bn = cbn; bk = cbk; wm = cwm; wn = cwn; stages = cstages;
+    }
+    model_810e_tsm_launch<cutlass::bfloat16_t, false>(a, b, d, bm, bn, bk, wm, wn, stages, 1, sms,
+                                                  grid_m_first, peel_first_k, static_m36, static_k256);
+}
+
+static bool model_810e_dispatch_device() {
+    return std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
+}
+
+static ConfigTuple model_810e_dispatch_config(const Model810eDispatchTile& tile) {
+    // The standard launcher recomputes shared storage from the first seven
+    // fields; native batch launchers do likewise. No cached smem estimate leaks
+    // across output dtypes or implementations.
+    return {get_num_sms(), tile.bm, tile.bn, tile.bk, tile.wm, tile.wn, tile.stages, {0, 0, 0}};
+}
+
+template <typename Output>
+static void model_810e_dispatch_dense_entry(const Model810eDenseDispatchEntry& entry,
+    const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
+    const auto& t = entry.tile;
+    switch (entry.kind) {
+        case Model810eDispatchKind::Direct:
+            model_810e_bf16_dense<Output>(a, b, d, t.bm, t.bn, t.bk, t.wm, t.wn, t.stages, t.splits);
+            return;
+        case Model810eDispatchKind::TSM:
+            model_810e_bf16_dense_tsm<Output>(a, b, d, t.bm, t.bn, t.bk, t.wm, t.wn, t.stages, t.splits,
+                                             t.grid_m_first != 0, t.peel_first_k != 0,
+                                             t.static_m36 != 0, t.static_k256 != 0);
+            return;
+        case Model810eDispatchKind::Hybrid: {
+            const auto& tail = entry.tail_tile;
+            DG_HOST_ASSERT(entry.split_m > 0 && entry.split_m < entry.m);
+            DG_HOST_ASSERT(t.splits == 1 && tail.splits == 1);
+            model_810e_bf16_dense_tsm<Output>(a.narrow(0, 0, entry.split_m), b,
+                d.narrow(0, 0, entry.split_m), t.bm, t.bn, t.bk, t.wm, t.wn, t.stages, 1,
+                t.grid_m_first != 0, t.peel_first_k != 0,
+                t.static_m36 != 0, t.static_k256 != 0);
+            model_810e_bf16_dense_tsm<Output>(a.narrow(0, entry.split_m, entry.m - entry.split_m), b,
+                d.narrow(0, entry.split_m, entry.m - entry.split_m),
+                tail.bm, tail.bn, tail.bk, tail.wm, tail.wn, tail.stages, 1,
+                tail.grid_m_first != 0, tail.peel_first_k != 0,
+                tail.static_m36 != 0, tail.static_k256 != 0);
+            return;
+        }
+        case Model810eDispatchKind::Standard:
+            // Call the lower-level launcher with an explicit tuple. Calling
+            // the public bf16_gemm_nt entry here would re-enter this table.
+            bf16_gemm(a, b, d, int(entry.m), int(entry.n), int(entry.k), model_810e_dispatch_config(t));
+            return;
+    }
+}
+
+static bool model_810e_dispatch_dense(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
+    if constexpr (kModel810eDenseDispatch.size() == 0) return false;
+    if (!model_810e_dispatch_device()) return false;
+    if (get_num_sms() < device_runtime->get_prop()->multiProcessorCount) return false;
+    // Native input descriptors require aligned bases; preserve the
+    // original fallback for unusual contiguous views with a storage offset.
+    if ((reinterpret_cast<uintptr_t>(a.data_ptr()) & 15) != 0 ||
+        (reinterpret_cast<uintptr_t>(b.data_ptr()) & 15) != 0) return false;
+    const auto output = d.scalar_type() == torch::kFloat ? Model810eOutputType::FP32 : Model810eOutputType::BF16;
+    for (const auto& entry : kModel810eDenseDispatch) {
+        if (entry.m != a.size(0) || entry.n != b.size(0) || entry.k != a.size(1) || entry.output != output) continue;
+        if (output == Model810eOutputType::FP32)
+            model_810e_dispatch_dense_entry<float>(entry, a, b, d);
+        else
+            model_810e_dispatch_dense_entry<cutlass::bfloat16_t>(entry, a, b, d);
+        return true;
+    }
+    return false;
+}
+
+static bool model_810e_dispatch_batch(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
+    if constexpr (kModel810eBatchDispatch.size() == 0) return false;
+    if (!model_810e_dispatch_device()) return false;
+    const auto output = d.scalar_type() == torch::kFloat ? Model810eOutputType::FP32 : Model810eOutputType::BF16;
+    for (const auto& entry : kModel810eBatchDispatch) {
+        if (entry.batch != a.size(0) || entry.m != a.size(1) || entry.n != b.size(1) || entry.k != a.size(2) ||
+            entry.lhs_ld != a.stride(1) || entry.rhs_ld != b.stride(1) || entry.out_ld != d.stride(1) ||
+            entry.lhs_batch_stride != a.stride(0) || entry.rhs_batch_stride != b.stride(0) ||
+            entry.out_batch_stride != d.stride(0) || entry.output != output) continue;
+        const auto configs = model_810e_dispatch_config(entry.tile);
+        if (entry.kind == Model810eDispatchKind::Direct)
+            model_810e_bf16_strided_batched(a, b, d, configs);
+        else if (entry.kind == Model810eDispatchKind::TSM)
+            model_810e_bf16_strided_batched_tsm(a, b, d, configs,
+                entry.tile.grid_m_first != 0, entry.tile.peel_first_k != 0,
+                entry.tile.static_m36 != 0, entry.tile.static_k256 != 0);
+        else
+            return false; // No standard native strided-batch launcher exists.
+        return true;
+    }
+    return false;
+}
+
 } // namespace deep_gemm

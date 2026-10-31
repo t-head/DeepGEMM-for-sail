@@ -1251,6 +1251,7 @@ def parse_deepgemm_string_re(s):
                     pass
     if "quant_type" not in result:
         quant_type_defaults = {
+            torch.float32: 'non_quantized',
             torch.bfloat16: 'non_quantized',
             torch.int8 : 'channel',
             torch.float8_e4m3fn: 'block',
@@ -1352,13 +1353,185 @@ def test_hc_prenorm_gemm(args) -> None:
                              suppress_kineto_output=True)
         print(f' > HcPrenormGemm (m={m}, n={n}, k={k}): {sum(times) * 1e6:.3f} us')
 
+def gemm_reference(a, b):
+    lhs, rhs = a.float(), b.float()
+    if get_ref_backend() == 'host':
+        lhs, rhs = lhs.cpu(), rhs.cpu()
+    # Workers normally enable TF32. Restore their settings after the reference.
+    backends = (torch.backends.cuda.matmul, torch.backends.cudnn)
+    previous = [backend.allow_tf32 for backend in backends]
+    try:
+        for backend in backends:
+            backend.allow_tf32 = False
+        return (lhs @ rhs.transpose(-1, -2)).to(a.device)
+    finally:
+        for backend, value in zip(backends, previous):
+            backend.allow_tf32 = value
+
+
+def gemm_exact_values(shape, generator):
+    # BF16-representable operands whose products and partial sums fit exactly
+    # in FP32 for these regression shapes. Compare all outputs, including ties.
+    return torch.randint(-16, 17, shape, generator=generator).float() / 16
+
+
+def gemm_assert_exact(actual, expected):
+    torch.testing.assert_close(actual, expected.to(actual.dtype), rtol=0, atol=0)
+
+
+def test_dense_gemm_api(args):
+    """One caselist case for BF16 accumulation or the native FP32 API."""
+    m, n, k, dtype = args['m'], args['n'], args['k'], args['data_type']
+    accumulation = args.get('accumulate', 'none')
+    pattern = args.get('pattern', 'random')
+    fp32 = dtype == torch.float32
+    if min(m, n, k) <= 0:
+        raise ValueError('Dense API regression cases require positive M/N/K')
+    if accumulation not in ('none', 'separate', 'alias'):
+        raise ValueError(f'Unsupported accumulate mode: {accumulation}')
+    if args.get('with_bias') or get_benchmark():
+        raise ValueError('Dense API regression cases require accuracy mode without bias or benchmarking')
+    if fp32:
+        if accumulation != 'none' or pattern != 'random':
+            raise ValueError('FP32 regression supports random inputs without C')
+    elif dtype not in (torch.bfloat16, 'bf16_bf16_fp32') or accumulation == 'none' or pattern not in ('random', 'cancellation'):
+        raise ValueError('Accumulation regression requires BF16 inputs, C, and random/cancellation pattern')
+
+    compiling = bool(os.environ.get('HGGC_WARM_UP')) or deep_gemm.get_compile_mode() == 1
+    check = get_acc_check() and not compiling
+    generator = torch.Generator().manual_seed(810)
+    output_dtype = torch.float32 if fp32 or dtype == 'bf16_bf16_fp32' else torch.bfloat16
+    if fp32:
+        operands = []
+        for rows, offset in ((m, args.get('offset_a', 0)), (n, args.get('offset_b', 0))):
+            if offset not in (0, 1):
+                raise ValueError('FP32 regression storage offsets must be 0 or 1 float')
+            tensor = torch.empty(rows * k + offset, device='cuda', dtype=torch.float32)[offset:].view(rows, k)
+            assert tensor.is_contiguous() and tensor.data_ptr() % 16 == offset * 4
+            tensor.copy_(torch.randn((rows, k), generator=generator) / k ** 0.25)
+            operands.append(tensor)
+        a, b = operands
+        if m >= 2 and n >= 2 and k >= 2:
+            # Keep random full-output coverage and plant independent A/B precision
+            # checks. TF32/BF16 would lose 2^-12 and incorrectly produce zero.
+            a[:2].zero_()
+            b[:2].zero_()
+            a[:2, 0], a[:2, -1] = 1, -1
+            b[:2, 0], b[:2, -1] = 1, 1
+            a[0, 0], b[1, 0] = 1 + 2 ** -12, 1 + 2 ** -12
+    else:
+        a = gemm_exact_values((m, k), generator).to(device='cuda', dtype=torch.bfloat16)
+        b = gemm_exact_values((n, k), generator).to(device='cuda', dtype=torch.bfloat16)
+        if pattern == 'cancellation':
+            if k < 2:
+                raise ValueError('BF16 cancellation requires K >= 2')
+            a.zero_()
+            b.zero_()
+            # The final contribution also exercises the last split-K partition.
+            a[:, 0], a[:, -1] = 1, 1 / 256
+            b[:, 0], b[:, -1] = 1, 1
+
+    out = torch.full((m, n), 8., device='cuda', dtype=output_dtype)
+    c = initial_c = None
+    if not fp32:
+        initial_c = (torch.full((m, n), -1.) if pattern == 'cancellation'
+                     else gemm_exact_values((m, n), generator)).to(device='cuda', dtype=output_dtype)
+        c = out if accumulation == 'alias' else torch.empty_like(out)
+        c.copy_(initial_c)
+    reference = gemm_reference(a, b) if check else None
+    if check and c is not None:
+        reference = reference + initial_c.float()
+        if pattern == 'cancellation':
+            gemm_assert_exact(reference, torch.full_like(reference, 1 / 256))
+
+    # Preserve the scheduler's compile phase and never inspect unwritten products.
+    if fp32:
+        deep_gemm.gemm_fp32_fp32_fp32_nt(a, b, out)
+    else:
+        deep_gemm.bf16_gemm_nt(a, b, out, c=c)
+    if check:
+        if fp32:
+            torch.testing.assert_close(out, reference, rtol=2e-5, atol=2e-6)
+            if m >= 2 and n >= 2 and k >= 2:
+                for row, col in ((0, 0), (1, 1)):
+                    gemm_assert_exact(reference[row, col], torch.full_like(reference[row, col], 2 ** -12))
+                    gemm_assert_exact(out[row, col], reference[row, col])
+        else:
+            gemm_assert_exact(out, reference)
+            if accumulation == 'separate':
+                gemm_assert_exact(c, initial_c)
+    print('Passed with acc_check' if check else 'Passed without acc_check')
+
+
+def gemm_batch_view(batch, rows, cols, layout, padding):
+    padded = 'padded' in layout
+    pitch = cols + (padding if padded else 0)
+    storage_rows = rows + int(padded)
+    interleaved = 'interleaved' in layout
+    shape = (storage_rows, batch, pitch) if interleaved else (batch, storage_rows, pitch)
+    storage = torch.full(shape, -123., device='cuda', dtype=torch.bfloat16)
+    view = storage.transpose(0, 1) if interleaved else storage
+    return view[:, :rows, :cols], storage
+
+
+def test_native_batch_gemm(args):
+    batch, m, n, k = args['groups'], args['m'], args['n'], args['k']
+    layout, broadcast = args.get('layout', 'contiguous'), args.get('broadcast', 'none')
+    expected_error = args.get('expect_error')
+    if layout not in ('contiguous', 'padded', 'interleaved', 'interleaved_padded'):
+        raise ValueError(f'Unsupported native batch layout: {layout}')
+    if broadcast not in ('none', 'a', 'b', 'both'):
+        raise ValueError('Unsupported native batch broadcast')
+    if expected_error not in (None, 'overlap') or args.get('expr') or get_benchmark():
+        raise ValueError('Native batch regression requires accuracy mode and native [B,M,K]/[B,N,K] layouts')
+    check = get_acc_check() and not os.environ.get('HGGC_WARM_UP') and deep_gemm.get_compile_mode() != 1
+    generator = torch.Generator().manual_seed(810)
+    a, _ = gemm_batch_view(batch, m, k, layout, 8)
+    b, _ = gemm_batch_view(batch, n, k, layout, 16)
+    out, storage = gemm_batch_view(batch, m, n, layout, 24)
+    a.copy_(gemm_exact_values(a.shape, generator))
+    b.copy_(gemm_exact_values(b.shape, generator))
+    if broadcast in ('a', 'both'):
+        a = a[:1].expand(batch, -1, -1)
+    if broadcast in ('b', 'both'):
+        b = b[:1].expand(batch, -1, -1)
+    if 'out_stride' in args:
+        strides = tuple(args['out_stride'])
+        if len(strides) != 3 or any(s < 0 for s in strides):
+            raise ValueError('out_stride must contain three nonnegative element strides')
+        size = 1 + sum((dim - 1) * stride for dim, stride in zip((batch, m, n), strides))
+        storage = torch.full((size,), -123., device='cuda', dtype=torch.bfloat16)
+        out = storage.as_strided((batch, m, n), strides)
+    expected_storage = storage.clone() if check else None
+    if check and not expected_error:
+        reference = gemm_reference(a, b)
+        expected_storage.as_strided(out.shape, out.stride()).copy_(reference)
+    try:
+        deep_gemm.bf16_gemm_strided_batched_nt(a, b, out)
+    except RuntimeError as error:
+        # Expected metadata rejection must pass in both compile and accuracy phases.
+        if expected_error != 'overlap' or not any(message in str(error) for message in (
+                'output batches overlap', 'nonoverlapping rows')):
+            raise
+        if check:
+            gemm_assert_exact(storage, expected_storage)
+        print('Passed expected output-overlap rejection')
+        return
+    if expected_error:
+        raise AssertionError('Native batch accepted overlapping outputs')
+    if check:
+        gemm_assert_exact(out, reference)
+        gemm_assert_exact(storage, expected_storage)  # Includes every padding guard.
+    print('Passed with acc_check' if check else 'Passed without acc_check')
+
+
 def test_gemm(args) -> None:
     print('Testing GEMM:')
     m, n, k, d = args['m'], args['n'], args['k'], args["data_type"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     print(f"test_gemm->test_func: DenseGemm,m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")
-    if d == torch.float32:
-        raise ValueError("DenseGemm does not implement FP32 GEMM; use HcPrenormGemm,data_type:tf32 for prenorm")
+    if d == torch.float32 or args.get('accumulate', 'none') != 'none':
+        return test_dense_gemm_api(args)
     bias = None
     if args.get('with_bias', False):
         if d != torch.uint8:
@@ -2862,6 +3035,8 @@ def test_sparse_mqa_logits(args) -> None:
     return
 
 def test_batch_gemm(args) -> None:
+    if args['data_type'] == torch.bfloat16:
+        return test_native_batch_gemm(args)
     # BatchGemm describes [groups, m, k] @ [groups, n, k].T using einsum.
     normalized = dict(args)
     for axis, field in (("b", "m"), ("h", "groups"), ("r", "k"), ("d", "n")):

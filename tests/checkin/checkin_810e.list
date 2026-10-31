@@ -15,6 +15,10 @@ DenseGemm,data_type:bf16,m:2048,n:4096,k:7168
 DenseGemm,data_type:bf16,m:2048,n:512,k:7168
 DenseGemm,data_type:bf16,m:256,n:4096,k:7168
 DenseGemm,data_type:bf16,m:256,n:512,k:7168
+# C aliasing and cancellation before BF16 rounding; N=1 GEMV product.
+DenseGemm,data_type:bf16,m:8,n:1,k:128,device:810e,accumulate:alias,pattern:cancellation
+# TSM split-K product with BF16 output and aliased C/D.
+DenseGemm,data_type:bf16,m:36,n:288,k:4096,device:810e,accumulate:alias
 
 # --- DenseGemm / int8 ---
 # Small M with N/K tails, retained from the legacy shape sweep.
@@ -26,6 +30,14 @@ DenseGemm,data_type:int8,m:2048,n:512,k:7168
 DenseGemm,data_type:bf16_bf16_fp32,m:2048,n:4096,k:7168
 DenseGemm,data_type:bf16_bf16_fp32,m:132,n:3072,k:1536
 DenseGemm,data_type:bf16_bf16_fp32,m:2,n:8192,k:7168
+# Direct split-K product with FP32 output and separate C/D.
+DenseGemm,data_type:bf16_bf16_fp32,m:32,n:128,k:6144,device:810e,accumulate:separate
+
+# --- DenseGemm / fp32 (full FP32 operands, TF32-disabled reference) ---
+# Vector load tail, scalar load via misalignment, and static specialization.
+DenseGemm,data_type:fp32,m:7,n:9,k:516,device:810e
+DenseGemm,data_type:fp32,m:7,n:9,k:512,device:810e,offset_a:1
+DenseGemm,data_type:fp32,m:36,n:32,k:4096,device:810e
 
 # ============ HcPrenormGemm ============
 
@@ -45,6 +57,14 @@ HcPrenormGemm,data_type:tf32,m:64,n:16,k:128
 HcPrenormGemm,data_type:tf32,m:1024,n:32,k:64
 
 # ============ BatchGemm ============
+
+# --- BatchGemm / bf16 (native strided API, not quantized einsum) ---
+# Default Direct BK32/stages=2, padded row/batch pitches, broadcast A.
+BatchGemm,data_type:bf16,groups:3,m:37,n:40,k:64,device:810e,layout:padded,broadcast:a
+# Default TSM, interleaved padded output and broadcast B.
+BatchGemm,data_type:bf16,groups:3,m:37,n:40,k:128,device:810e,layout:interleaved_padded,broadcast:b
+# Reject intersecting rows across batches before any output write.
+BatchGemm,data_type:bf16,groups:2,m:3,n:16,k:128,device:810e,out_stride:[24,32,1],expect_error:overlap
 
 # --- BatchGemm / int8 ---
 BatchGemm,data_type:int8,groups:128,m:64,n:128,k:512,quant_type:channel,expr:bhr,hdr->bhd
