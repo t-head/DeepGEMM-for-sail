@@ -1,0 +1,53 @@
+#pragma once
+#include <cstdint>
+namespace deep_gemm::w4fa8 {
+enum class NativeStrategy { Default, Compact, Routed };
+template <class Storage, int Rows> struct RowScaleStorage : Storage {
+  alignas(128) float row_scales[2][Rows];
+};
+template <class Storage> struct RowScaleStorage<Storage, 0> : Storage {};
+} // namespace deep_gemm::w4fa8
+
+namespace deep_gemm::w4fa8_streamed {
+struct GroupedRowRangeArguments {
+  uint32_t shape_m;
+  int32_t* grouped_layout;
+  const int32_t* row_range;
+};
+struct GatherParams {
+  const uint8_t *a;
+  const float *a_scale;
+  uint8_t *grouped_a;
+  float *grouped_scale;
+  const int32_t *experts;
+  const int32_t *tokens;
+  const int32_t *aligned;
+  int num_tokens;
+};
+struct DecodeParams {
+  const uint8_t* packed;
+  const uint8_t* scales;
+  uint8_t* output;
+  int n_begin;
+  const int32_t* all_rows;
+  int group_start;
+};
+} // namespace deep_gemm::w4fa8_streamed
+
+namespace deep_gemm::w4fa8 {
+// Task records retain the measured alignment/layout used by routed kernels.
+inline constexpr int kRoutedMetadataBytes = 1024;
+struct RoutedMetadataArguments {
+  const int32_t* rows;
+  uint8_t* lower;
+  uint8_t* upper;
+};
+struct AdaptiveMetadataArguments {
+  const int32_t* rows;
+  uint8_t* work;
+  int32_t* control;
+  float native_rate = 1, wide_rate = 1;
+  int32_t* native_layout = nullptr;
+};
+
+} // namespace deep_gemm::w4fa8

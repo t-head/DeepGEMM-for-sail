@@ -130,13 +130,15 @@ public:
         fsync_path(path);
     }
 
-    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
+    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code, bool allow_loading = true) const {
         const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache
-        if (const auto& runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
+        if (const auto& runtime = kernel_runtime_cache->get(dir_path, allow_loading); runtime != nullptr)
             return runtime;
+
+        DG_HOST_ASSERT(allow_loading && "JIT kernel must be warmed outside graph capture");
 
         // Compile into a temporary directory, then atomically rename the whole directory
         // NOTES: renaming a directory is atomic on both local and distributed filesystems,
