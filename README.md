@@ -527,8 +527,8 @@ loads. Other routing distributions are supported but may have different optimal
 configurations. Launch occupancy is checked against the compiled kernel.
 
 See the [test guide](tests/README.MD#routed-moe-correctness-and-performance-tests)
-for correctness thresholds, model benchmarks, optional DeepEP comparisons and
-manual single-device and multi-device tests. These APIs are additive in release
+for correctness thresholds, model benchmarks, optional DeepEP comparisons,
+single-device check-in and manual multi-device tests. These APIs are additive in release
 2.1.0; existing GEMM callers need no migration.
 
 #### Interfaces exposed but not yet implemented

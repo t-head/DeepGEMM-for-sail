@@ -134,6 +134,10 @@ For single-node containers whose hostname is not resolvable, replace
 The multi-rank stateful test requires at least two ranks and is skipped in
 single-device runs. Use the two-device regression command above to run it.
 
+Single-device smoke regression is also available through
+`python tests/checkin/run_checkin.py --suite ZW-M890P-MegaMoE` and runs in the
+M890P CI job. Multi-device tests remain manual; see the [check-in guide](checkin/README.md#megamoe).
+
 Smoke SwiGLU, Step and SiTU cases use 1, 0, 33, 129 and 8 tokens. The 129-token
 case crosses a 128-row tile boundary. Every smoke token is checked against an
 independent quantize/dequantize and expert-matmul reference. References apply

@@ -1,6 +1,6 @@
 # Functional check-in
 
-Check-in keeps representative cases for supported operators and independent execution paths. Full shape/distribution/tile sweeps belong in daily functional lists; performance measurements belong in perf lists. Check-in runs only the board functional caselist. The test scripts and tile scans in `tests/daily/daily_810e.list` / `tests/daily/daily_890p.list` run through the explicit daily entry in `tests/daily/run_daily.py`; they are not appended to default check-in. The retired `DG_USE_CUTE=0` fallback is excluded.
+Check-in keeps representative cases for supported operators and independent execution paths. Full shape/distribution/tile sweeps belong in daily functional lists; performance measurements belong in perf lists. Board suites run their functional caselist; the separate single-device MegaMoE suite is described below. The test scripts and tile scans in `tests/daily/daily_810e.list` / `tests/daily/daily_890p.list` run through the explicit daily entry in `tests/daily/run_daily.py`; they are not appended to default check-in. The retired `DG_USE_CUTE=0` fallback is excluded.
 
 ```bash
 python tests/checkin/run_checkin.py --suite ZW-810E
@@ -51,6 +51,27 @@ python tests/run_deep_gemm.py --caselist tests/checkin/checkin_890p.list --case_
 `--case_idx` counts executable cases, excluding comments and blank lines. Warm-up is recognized by this entry point as well.
 
 For masked GEMM, the `test_m_grouped_gemm_masked->test_func:` log line contains a replayable `--format` specification with the generated expert counts, padding, scheduler hint, epilogue, clipping limit and bias setting. Pass that specification to `tests/run_deep_gemm.py --format` to repeat the same case configuration.
+
+## MegaMoE
+
+The single-device suite runs the public-entry smoke tests, including all three
+activations, separate replica weights, invalid inputs and workspace reuse:
+
+```bash
+python tests/checkin/run_checkin.py --suite ZW-M890P-MegaMoE
+```
+
+It compiles and executes the pipeline together, without `HGGC_WARM_UP` or the
+legacy `testcase.json`. `--phase compile` is not supported for this suite.
+Output and failures are retained in `checkin-logs/script-0001.log` and the usual
+JUnit report. Multi-card tests are disabled in automatic check-in because a
+runner may have only one device. On a host with two free PPU1.5 devices, run:
+
+```bash
+NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1 \
+torchrun --standalone --nproc-per-node=2 --max-restarts=0 \
+  -m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py
+```
 
 ## Additional functional specifications
 
