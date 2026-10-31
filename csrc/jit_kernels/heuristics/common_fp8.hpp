@@ -62,7 +62,7 @@ static int get_swizzle_mode(const int& block_size, const size_type_t& elem_size)
     DG_HOST_UNREACHABLE("Unreachable");
 }
 
-std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, int block_n, int block_k = 128) {
+std::tuple<int, int, int> get_smem_config_scaled_n(int num_stages, int k, int block_m, int block_n, int block_k, int scale_n) {
     // Try swizzle first, as it does not waste shared memory
     int swizzle_mode = 128;
     int block_n_padding = 0;
@@ -73,7 +73,7 @@ std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, in
     int smem_size_a = num_stages * smem_a_per_stage;
     int smem_size_b = num_stages * smem_b_per_stage;
     int smem_scales_a_per_stage = block_m * ceil_div(block_k, 128) * 4;
-    int smem_scales_b_per_stage = ceil_div(block_n, 128) * std::max(ceil_div(block_k, 128), 8) * 4;
+    int smem_scales_b_per_stage = ceil_div(block_n, scale_n) * std::max(ceil_div(block_k, 128), 8) * 4;
     // int smem_scales_a_per_stage = block_m * 4;
     // int smem_scales_b = ceil_div(k, block_k) * 4;
     int smem_size = std::max(smem_size_d, smem_size_a + smem_size_b);
@@ -82,6 +82,10 @@ std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, in
     // Swizzle and padding are not compatible
     assert((swizzle_mode > 0) + (block_n_padding > 0) <= 1);
     return std::make_tuple(smem_size, swizzle_mode, block_n_padding);
+}
+
+std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, int block_n, int block_k = 128) {
+    return get_smem_config_scaled_n(num_stages, k, block_m, block_n, block_k, 128);
 }
 
 int get_smem_occ(int block_m, int block_n, int block_k, int num_stages) {

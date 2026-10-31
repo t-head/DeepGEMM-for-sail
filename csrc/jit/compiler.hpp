@@ -256,6 +256,7 @@ public:
                                " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
             const bool use_warp_interleaving = (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
                                                (name.find("fp8_deep_gemm") != std::string::npos) ||
+                                               (name == "fp8_blockwise_gemm_rs") ||
                                                (name.find("mqa_logits") != std::string::npos &&
                                                 name.find("paged") == std::string::npos);
             if (!use_warp_interleaving) {
@@ -369,6 +370,7 @@ public:
                 const bool use_warp_interleaving =
                     (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
                     (name.find("fp8_deep_gemm")         != std::string::npos) ||
+                    (name == "fp8_blockwise_gemm_rs") ||
                     (name.find("mqa_logits")            != std::string::npos &&
                      name.find("paged")                 == std::string::npos);
                 if (!use_warp_interleaving) {
