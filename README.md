@@ -570,11 +570,12 @@ The library also provides some environment variables, which may be useful:
   - `DG_JIT_USE_HGRTC`: `0` or `1`, use HGRTC instead of HGCC, faster compilation but maybe have lower performance for some cases, `0` by default
   - `DG_JIT_HGCC_COMPILER`: string, specified compiler path; will find in `PPU_SDK` or `PPU_HOME` env by default
 - **Compiler options**
-  - `DG_CPP_STANDARD`: integer, C++ standard version, `17` by default
+  - `DG_JIT_CPP_STANDARD`: integer, native HGCC/HGRTC C++ standard version, `17` by default (replaces `DG_CPP_STANDARD`)
   - `DG_JIT_DISABLE_PCH`: `0` or `1`, disable precompiled headers during JIT compilation, `0` by default
   - `DG_JIT_PTXAS_VERBOSE`: `0` or `1`, show detailed PTXAS compiler output, `0` by default
   - `DG_JIT_WITH_LINEINFO`: `0` or `1`, embed source line info for profiling tools, `0` by default
   - `DG_JIT_PRINT_LOAD_TIME`: `0` or `1`, print the kernel load time, `0` by default
+  - `DG_JIT_DUMP_ASM` / `DG_JIT_DUMP_SASS`: `0` or `1`, save `kernel.sass` after a fresh compilation; cache hits skip export, `0` by default
 - **Runtime**
   - `DG_USE_PYTORCH_ACBLASLT_HANDLE`: `0` or `1`, use the PyTorch-managed acBLASLt handle instead of the built-in one, `0` by default
   - `SAIL_DEEPGEMM_LUT_PATH`: directory containing external GEMM tuning tables; unset by default. See [External GEMM tuning tables](#external-gemm-tuning-tables).

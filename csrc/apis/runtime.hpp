@@ -55,17 +55,4 @@ static void register_apis(pybind11::module_& m) {
     });
 }
 
-extern "C"
-{
-    void deep_gemm_runtime_init(void* library_root_path_ptr, void * sdk_home_path_ptr)
-    {
-        using namespace deep_gemm::runtime;
-        DG_HOST_ASSERT(library_root_path_ptr);
-        DG_HOST_ASSERT(sdk_home_path_ptr);
-        auto library_root_path = *reinterpret_cast<std::string*>(library_root_path_ptr);
-        auto sdk_home_path = *reinterpret_cast<std::string*>(sdk_home_path_ptr);
-        Compiler::prepare_init(library_root_path, sdk_home_path);
-        KernelRuntime::prepare_init(sdk_home_path);
-    }
-}
 } // namespace deep_gemm::runtime

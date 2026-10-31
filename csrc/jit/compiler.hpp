@@ -29,12 +29,13 @@ public:
     static std::filesystem::path library_root_path;
     static std::filesystem::path library_include_path;
     static std::filesystem::path sdk_home;
+    static std::filesystem::path hgobjdump_path;
 
-    // Single source of truth for the actlize include search paths, shared by the offline (HGCC)
-    // and runtime (HGRTC) compilers.
-    static std::vector<std::string> actlize_include_paths() {
-        const std::string inc = library_include_path.string();
-        return {inc + "/actlize_v1.0.0", inc};
+    // Single source of truth for the dependency include search paths, shared by
+    // the offline (HGCC) and runtime (HGRTC) compilers.
+    static std::vector<std::string> dependency_include_paths() {
+        const auto root = library_include_path / "actlize_v1.0.0";
+        return {root.string(), library_include_path.string()};
     }
 
     static std::vector<std::string> sdk_include_paths() {
@@ -68,6 +69,7 @@ public:
         Compiler::library_root_path = library_root_path;
         Compiler::library_include_path = Compiler::library_root_path / "include";
         Compiler::sdk_home = sdk_home_path;
+        Compiler::hgobjdump_path = Compiler::sdk_home / "bin" / "hgobjdump";
     }
 
     std::string signature, flags;
@@ -78,20 +80,21 @@ public:
         DG_HOST_ASSERT(not library_root_path.empty());
         DG_HOST_ASSERT(not library_include_path.empty());
         DG_HOST_ASSERT(not sdk_home.empty());
+        DG_HOST_ASSERT(not hgobjdump_path.empty());
 
         // Cache settings
         cache_dir_path = std::filesystem::path(get_env<std::string>("HOME")) / ".deep_gemm";
-        if (const auto& env_cache_dir_path = get_env<std::string>("DG_JIT_CACHE_DIR"); not env_cache_dir_path.empty())
+        if (const auto env_cache_dir_path = get_env<std::string>("DG_JIT_CACHE_DIR"); not env_cache_dir_path.empty())
             cache_dir_path = env_cache_dir_path;
 
         // The compiler flags applied to all derived compilers.
         // Offline diagnostics are selected by the debug options below.
         signature = "unknown-compiler";
-        flags = fmt::format("-std=c++{} ",
-                            //"--ptxas-options=--register-usage-level=10",
-                            get_env<int>("DG_CPP_STANDARD", 17));
+        flags = fmt::format("-std=c++{} -DUSE_HGGC -DUSE_CLANG -DUSE_ACWRAPPER",
+                            get_env<int>("DG_JIT_CPP_STANDARD", 17));
         if (get_env("DG_JIT_WITH_LINEINFO", 0))
             flags += " -Xcompiler -rdynamic -lineinfo";
+        flags += " -DNDEBUG";
     }
 
     virtual ~Compiler() = default;
@@ -125,7 +128,7 @@ public:
         DG_HOST_ASSERT(out.write(data.data(), data.size()));
         out.close();
 
-        // NOTES: fsync to ensure the data is visible to other processes (e.g., NVCC)
+        // NOTES: fsync to ensure the data is visible to other processes (e.g., HGCC)
         // on distributed filesystems, where `close()` alone does not guarantee persistence
         fsync_path(path);
     }
@@ -135,7 +138,7 @@ public:
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache
-        if (const auto& runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
+        if (const auto runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
             return runtime;
 
         // Compile into a temporary directory, then atomically rename the whole directory
@@ -147,6 +150,12 @@ public:
         // Compile into a temporary HGBIN
         const auto tmp_hgbin_path = tmp_dir_path / "kernel.hgbin";
         compile(code, tmp_dir_path, tmp_hgbin_path, name);
+
+        // Disassemble if needed
+        if (get_env<int>("DG_JIT_DUMP_ASM") or get_env<int>("DG_JIT_DUMP_SASS")) {
+            const auto tmp_sass_path = tmp_dir_path / "kernel.sass";
+            disassemble(tmp_hgbin_path, tmp_sass_path);
+        }
 
         // Fsync before rename to ensure visibility on distributed filesystems
         fsync_dir(tmp_dir_path);
@@ -170,12 +179,24 @@ public:
         return runtime;
     }
 
+    static void disassemble(const std::filesystem::path& hgbin_path, const std::filesystem::path& sass_path) {
+        const auto command = fmt::format("{} --dump-isa {} > {}", hgobjdump_path.c_str(), hgbin_path.c_str(), sass_path.c_str());
+        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
+            printf("Running hgobjdump command: %s\n", command.c_str());
+        const auto [return_code, output] = call_external_command(command);
+        if (return_code != 0) {
+            printf("hgobjdump failed: %s\n", output.c_str());
+            DG_HOST_ASSERT(false and "hgobjdump failed");
+        }
+    }
+
     virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const = 0;
 };
 
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_root_path);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_include_path);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, sdk_home);
+DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, hgobjdump_path);
 
 class HGCCCompiler final: public Compiler {
     std::filesystem::path hgcc_path;
@@ -199,48 +220,30 @@ public:
     HGCCCompiler() {
         // Locate the offline compiler binary
         hgcc_path = sdk_home / "bin" / "hgcc";
-        if (const auto& env_hgcc_path = get_env<std::string>("DG_JIT_HGCC_COMPILER"); not env_hgcc_path.empty())
+        if (const auto env_hgcc_path = get_env<std::string>("DG_JIT_HGCC_COMPILER"); not env_hgcc_path.empty())
             hgcc_path = env_hgcc_path;
-        else if (const auto& env_hgcc_path = get_env<std::string>("DG_HGCC_COMPILER"); not env_hgcc_path.empty())
+        else if (const auto env_hgcc_path = get_env<std::string>("DG_HGCC_COMPILER"); not env_hgcc_path.empty())
             hgcc_path = env_hgcc_path;
         signature = fmt::format("HGCC{}", get_hgcc_version());
 
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0) or get_env("DG_JIT_PTXAS_CHECK", 0))
             flags += " --resource-usage -Xllvm -ppu-warn-lmem-usage";
 
-        // Flags are APPENDED to the ones seeded by the base Compiler ctor (-std=c++NN plus
-        // the opt-in -lineinfo addition), so those are preserved here too.
-        // All configurable paths come from environment variables or SDK detection.
-
-        // --- Language & defines ---
-        // NOTE: leading space is required -- the base flags do not always end with one
-        // (the optional debug/lineinfo appends have no trailing space).
-        flags += " -DUSE_HGGC -DUSE_CLANG -DUSE_ACWRAPPER ";
-
         // --- Architecture ---
         const auto arch = get_ppu_arch();
         if (arch == AC_PPU0015) {
-            flags += "-arch=ppu_15 ";
+            flags += " -arch=ppu_15";
         } else if (arch == AC_PPU0010) {
-            flags += "-arch=ppu_10 ";
+            flags += " -arch=ppu_10";
         } else {
             DG_HOST_UNREACHABLE("Unknown PPU architecture");
         }
 
-        // --- Include paths ---
-        // Resolved in `compile` for both offline and runtime compilers.
+        // --- Optimization & host compiler flags ---
+        flags += " -O3 --compiler-options=-fPIC,-Wno-deprecated-declarations,-Wno-abi";
+        flags += " -ftemplate-depth=8192 --expt-relaxed-constexpr --expt-extended-lambda";
 
-        // --- Output format & optimization ---
-        flags += "-hgbin -ftemplate-depth=8192 -O3 -DNDEBUG --expt-relaxed-constexpr --expt-extended-lambda ";
-
-        // --- Host compiler flags (passed via -Xcompiler) ---
-        flags += "-Xcompiler -fPIC ";
-        flags += "-Xcompiler -Wno-deprecated-declarations -Xcompiler -Wno-abi ";
-
-        // NOTE: --ptxas-options=--register-usage-level=10 is intentionally not passed here
-
-        // --- Source language ---
-        flags += " -x hg ";
+        flags += " -x hg";
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const override {
@@ -252,7 +255,7 @@ public:
         // others only need -ppu-simt-branch=false (aligned with compiler.py logic)
         std::string per_kernel_flags;
         if (get_ppu_arch() == AC_PPU0015) {
-            per_kernel_flags = " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
+            per_kernel_flags = "-Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
                                " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
             const bool use_warp_interleaving = (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
                                                (name.find("fp8_deep_gemm") != std::string::npos) ||
@@ -280,15 +283,15 @@ public:
             per_kernel_flags += " -Xllvm -ppu-reassign-subregs=true"
                                 " -Xllvm -ppu-pref-fma-reuse=true"
                                 " -Xllvm -ppu-pref-mma-reuse=true";
-        // Include paths for actlize and DeepGEMM headers
+        // Include paths for the selected dependency and DeepGEMM headers
         std::string include_flags;
-        for (const auto& path: actlize_include_paths())
-            include_flags += fmt::format("-I{} ", path);
+        for (const auto& path: dependency_include_paths())
+            include_flags += fmt::format(" -I{}", path);
 
         // Compile
         // Avoid cwd files shadowing C++ standard library headers
         const auto compile_dir = make_tmp_dir();
-        const auto command = fmt::format("cd {} && {} {} -o {} {}{}{}",
+        const auto command = fmt::format("cd {} && {} {} -hgbin -o {}{} {} {}",
             compile_dir.c_str(), hgcc_path.c_str(), code_path.c_str(), hgbin_path.c_str(),
             include_flags, flags, per_kernel_flags);
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
@@ -330,11 +333,10 @@ public:
             }
             };
             includes_insert(Compiler::sdk_include_paths());
-            // Include paths for actlize and DeepGEMM headers
-            includes_insert(Compiler::actlize_include_paths());
-        // #else
+            // Include paths for the selected dependency and DeepGEMM headers
+            includes_insert(Compiler::dependency_include_paths());
+            opts.emplace_back("-DNDEBUG");
             opts_insert({
-                "-DNDEBUG",
                 "-DUSE_CLANG",
                 "-no-cache",
                 "--diag-suppress=39,174,177,940",
@@ -391,14 +393,13 @@ public:
                     });
                 }
             }
-        // #endif
             if (get_env<int>("DG_JIT_DEBUG", 0) || get_env<int>("DG_JIT_PTXAS_VERBOSE", 0) || get_env<int>("DG_JIT_PTXAS_CHECK", 0)) {
                 opts_insert({"--ptxas-options=--verbose,--warn-on-local-memory-usage"});
             }
             if (get_env<int>("DG_JIT_WITH_LINEINFO", 0)) {
                 opts_insert({"--generate-line-info"});
             }
-            std::string standard = "--std=c++17";
+            const auto standard = fmt::format("-std=c++{}", get_env<int>("DG_JIT_CPP_STANDARD", 17));
             opts.emplace_back(standard);
 
             opts_char.resize(opts.size());
@@ -422,16 +423,15 @@ public:
         int major, minor;
         DG_HGRTC_CHECK(hgrtcVersion(&major, &minor));
         signature = fmt::format("RTC{}.{}", major, minor);
-
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const override {
         // Write the code into the cache directory
-        const auto& code_path = dir_path / "kernel.cu";
+        const auto code_path = dir_path / "kernel.cu";
         put(code_path, code);
         acArch_t arch = get_ppu_arch();
         RtcOptions opts(arch, name);
-        // Print HGRTC compile options when DG_JIT_DEBUG is enabled
+        // Print HGRTC compile options
         if (get_env<int>("DG_JIT_DEBUG", 0)) {
             printf("HGRTC compile options (%zu):\n", opts.size());
             for (size_t i = 0; i < opts.size(); ++i) {
@@ -441,7 +441,7 @@ public:
         // Create HGRTC program and compile
         hgrtcProgram program;
         DG_HGRTC_CHECK(hgrtcCreateProgram(&program, code.c_str(), "kernel.cu", 0, nullptr, nullptr));
-        const auto& compile_result = hgrtcCompileProgram(program, opts.size(), opts.data());
+        const auto compile_result = hgrtcCompileProgram(program, opts.size(), opts.data());
 
         // Get and print compiler log
         size_t log_size;
