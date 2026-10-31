@@ -328,7 +328,9 @@ static bool run_streamed_async(const torch::Tensor& a, const torch::Tensor& a_sc
     // every invocation. Largest historical case: 2 * 294 MiB, plus metadata.
     std::array<torch::Tensor, 2> scratch{at::empty({int64_t(chunk) * tile_n * k + 8}, b.options()),
                                          at::empty({int64_t(chunk) * tile_n * k + 8}, b.options())};
-    auto ones = at::ones({chunk, tile_n, 1}, a_scale.options());
+    // The inherited collective ABI carries a B-scale pointer, but the streamed
+    // mainloop reads only A scales: decoded E5M2 weights include their scales.
+    auto b_scale_storage = at::empty({chunk, tile_n, 1}, a_scale.options());
     torch::Tensor core_a = a, core_scale = a_scale;
     w4fa8_streamed::GatherParams gather{};
     if (fused.block_m) {
@@ -380,7 +382,7 @@ static bool run_streamed_async(const torch::Tensor& a, const torch::Tensor& a_sc
         args.params = {StreamedInt8::GemmUniversalMode::kGemm,
                        {m, work.n_count, k, 1},
                        {core_a.data_ptr(), stride_input, buffer.data_ptr(), stride_input, core_scale.data_ptr<float>(),
-                        ones.data_ptr<float>()},
+                        b_scale_storage.data_ptr<float>()},
                        {{}, output + work.n_begin, stride_output, output + work.n_begin, stride_output},
                        {a.get_device(), num_sms},
                        {uint32_t(m), rows.data_ptr<int32_t>() + group_start, range},
@@ -390,7 +392,7 @@ static bool run_streamed_async(const torch::Tensor& a, const torch::Tensor& a_sc
     };
 
     try {
-        // Input preparation and ones fill precede the fork on the caller stream.
+        // Input preparation precedes the fork on the caller stream.
         DG_HGGC_RUNTIME_CHECK(hggcEventRecord(context->fork, caller));
         DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->compute, context->fork, 0));
         DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->decode, context->fork, 0));

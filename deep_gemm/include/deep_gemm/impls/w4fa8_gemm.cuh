@@ -459,6 +459,18 @@ public:
         }
       }();
 
+      // Routed tokens are fixed for this work item. Form their row addresses
+      // once, rather than repeating the wide multiply in each K-stage copy.
+      const ElementA* token_rows[CopyAConfig::M_ITER];
+      bool valid_tokens[CopyAConfig::M_ITER];
+      if constexpr (Fused && Routed) {
+#pragma unroll
+        for (int mi = 0; mi < CopyAConfig::M_ITER; ++mi) {
+          valid_tokens[mi] = token_offsets[mi] < uint32_t(params.num_token);
+          token_rows[mi] = params.ptr_a + uint64_t(valid_tokens[mi] ? token_offsets[mi] : 0) * K;
+        }
+      }
+
       // The prologue commit/wait covers these 4-byte asynchronous copies too.
       // A buffer is reused only after every warp has crossed the intervening
       // work item's prologue CTA barrier, completing its old epilogue reads.
@@ -491,14 +503,22 @@ public:
             for (int mi = 0; mi < CopyAConfig::M_ITER; ++mi) {
               if (mi * CopyAConfig::TILER_M + tm >= BlockM)
                 continue;
-              const uint32_t token = token_offsets[mi];
+              const ElementA* row;
+              bool valid;
+              if constexpr (Routed) {
+                row = token_rows[mi];
+                valid = valid_tokens[mi];
+              } else {
+                row = params.ptr_a + uint64_t(token_offsets[mi]) * K;
+                valid = token_offsets[mi] < uint32_t(params.num_token);
+              }
 #pragma unroll
               for (int ki = cohort; ki < CopyAConfig::K_ITER; ki += CopyAConfig::KCohorts) {
                 const auto* src = reinterpret_cast<const cutlass::uint128_t*>(
-                    params.ptr_a + uint64_t(token) * K + ki * CopyAConfig::TILER_N + tk * CopyAConfig::KPerThread +
+                    row + ki * CopyAConfig::TILER_N + tk * CopyAConfig::KPerThread +
                     BlockK * k_tile_iter);
                 auto* dst = reinterpret_cast<cutlass::uint128_t*>(raw_pointer_cast(tAsA(_, mi, ki, k_pipe).data()));
-                deep_gemm::FusedACopyInst::copy(*src, *dst, token < uint32_t(params.num_token));
+                deep_gemm::FusedACopyInst::copy(*src, *dst, valid);
               }
             }
           }
@@ -815,7 +835,7 @@ public:
             if constexpr (Compact) {
               for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto ki) {
                 constexpr int kb = decltype(ki)::value;
-                if constexpr ((Routed && Fused && BlockK == 128) || kb % 2 == 0)
+                if constexpr (kb % 2 == 0)
                   s2r_copy_B_and_scale_slice(stage_idx, kb / 2);
                 if constexpr (ADistance > 0 && BlockM == 160) {
 #pragma unroll

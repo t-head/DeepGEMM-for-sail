@@ -14,17 +14,20 @@ template <int K, int BlockM, int Groups> __device__ __forceinline__ void gather_
     const int row = (block - int(expert.z)) * BlockM;
     const int valid = min(BlockM, int(expert.y) - row);
     const int out_row = int(expert.w) + row;
-    for (int vector = threadIdx.x; vector < valid * VectorsPerRow; vector += blockDim.x) {
-      const int local_row = vector / VectorsPerRow, column = vector % VectorsPerRow;
-      const int token = __ldg(p.tokens + int64_t(block) * BlockM + local_row);
-      if (uint32_t(token) < uint32_t(p.num_tokens))
-        reinterpret_cast<uint4 *>(p.grouped_a)[int64_t(out_row + local_row) * VectorsPerRow + column] =
-            __ldg(reinterpret_cast<const uint4 *>(p.a) + int64_t(token) * VectorsPerRow + column);
-    }
-    for (int local_row = threadIdx.x; local_row < valid; local_row += blockDim.x) {
-      const int token = __ldg(p.tokens + int64_t(block) * BlockM + local_row);
-      if (uint32_t(token) < uint32_t(p.num_tokens))
-        p.grouped_scale[out_row + local_row] = __ldg(p.a_scale + token);
+    // A warp owns a row: share its routing lookup and keep both vector streams
+    // contiguous, without a row/column division for every 16-byte copy.
+    const int lane = threadIdx.x & 31;
+    for (int local_row = threadIdx.x / 32; local_row < valid; local_row += blockDim.x / 32) {
+      int token = lane == 0 ? __ldg(p.tokens + int64_t(block) * BlockM + local_row) : 0;
+      token = __shfl_sync(0xffffffffu, token, 0);
+      if (uint32_t(token) < uint32_t(p.num_tokens)) {
+        const auto src = reinterpret_cast<const uint4 *>(p.a) + int64_t(token) * VectorsPerRow;
+        auto dst = reinterpret_cast<uint4 *>(p.grouped_a) + int64_t(out_row + local_row) * VectorsPerRow;
+        for (int column = lane; column < VectorsPerRow; column += 32)
+          dst[column] = __ldg(src + column);
+        if (lane == 0)
+          p.grouped_scale[out_row + local_row] = __ldg(p.a_scale + token);
+      }
     }
   }
 }
