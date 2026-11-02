@@ -87,12 +87,6 @@ The unified entry point calls `test_activation.py` and `test_fp4_core.py` direct
 
 The added representatives also preserve INT8 contiguous, masked overlap/signal checks, FP8 channel contiguous/fused, BF16 paged attention, FP4 dense, and 890P BF16 dense M=2/grouped small-M GEMV. Existing colleague-authored cases are retained. FP4 masked overlap is currently unimplemented (the device template only specializes overlap=false); it is excluded rather than treated as a supported positive case.
 
-CPU checks for parsing, scheduling, process environment, timeout/reporting and failure exit status:
-
-```bash
-python -m unittest discover -s tests/checkin -p test_checkin_runner.py -v
-```
-
 Actual HGCC compilation, device accuracy, cache reuse and timing must be validated on both PPU boards.
 
 Device checks comparing W4 warm-up shapes, types and strides with real quantization, and ensuring `--disable_acc` alone keeps real inputs:

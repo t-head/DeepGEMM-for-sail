@@ -137,23 +137,40 @@ class CustomBuildPy(build_py):
                     shutil.rmtree(dst_dir)
                 shutil.copytree(src_dir, dst_dir)
 
-def custom_local_scheme(version):
-    return 'dev%03d.%s' % (version.distance, version.short_node)
+DEEPGEMM_VERSION = '1.1.0'  # DeepGEMM version
+RELEASE_VERSION = 'v1.0.0'  # Release version
 
-def custom_version_scheme(version):
-    return '2.1.0'
+
+def get_package_version(ppu_sdk_version):
+    try:
+        from setuptools_scm import Configuration
+        from setuptools_scm.git import parse
+    except ImportError as error:
+        raise RuntimeError('Missing build dependency: install setuptools-scm first') from error
+
+    release_tag = f'{DEEPGEMM_VERSION}+{RELEASE_VERSION}'
+    # Match only this release tag; ignore uncommitted changes.
+    scm = parse(current_dir, Configuration(), describe_command=[
+        'git', 'describe', '--tags', '--long', '--match', release_tag,
+    ])
+    if scm is None or scm.node is None:
+        raise RuntimeError('Git commit information unavailable; build from a Git repository with commit history')
+    if ppu_sdk_version == (0, 0, 0):
+        raise RuntimeError('PPU SDK version unavailable; check hgcc --version for the selected SDK')
+
+    ppu_version = '.'.join(map(str, ppu_sdk_version))
+    local_version = f'{RELEASE_VERSION}.ppu{ppu_version}'
+    if scm.distance in (None, 0):
+        return f'{DEEPGEMM_VERSION}+{local_version}'
+    return f'{DEEPGEMM_VERSION}.dev{scm.distance}+{local_version}.{scm.node[:9]}'
+
 
 if __name__ == '__main__':
-    # noinspection PyBroadException
-    try:
-        cmd = ['git', 'rev-parse', '--short', 'HEAD']
-        revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
-    except:
-        revision = ''
     extra_cxx_args = ["-O3", "-std=c++17", "-DUSE_HGGC"]
     extra_hgcc_args = ["-O3", "-std=c++17", "--use_fast_math", "-DUSE_HGGC"]
 
     ppu_sdk_version = get_ppu_sdk_version()
+    package_version = get_package_version(ppu_sdk_version)
     if ppu_sdk_version >= (2, 0, 0):
         extra_cxx_args.append("-DDG_HGGC_SUPPORT_PCH=1")
         extra_hgcc_args.append("-DDG_HGGC_SUPPORT_PCH=1")
@@ -171,10 +188,8 @@ if __name__ == '__main__':
         }))
     setuptools.setup(
         name='deep_gemm',
-        use_scm_version={
-            "local_scheme": custom_local_scheme,
-            "version_scheme": custom_version_scheme,
-        },
+        version=package_version,
+        setup_requires=['setuptools-scm'],
         packages=find_packages('.'), # old version: packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels', 'deep_gemm/deep_gemm_tuner'],,
         package_data={
             'deep_gemm': [

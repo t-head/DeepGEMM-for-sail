@@ -1,0 +1,191 @@
+name: DeepGEMM temporary wheel upload
+
+# Build a wheel, run the check-in suite, then publish it to a temporary directory.
+# Publishing is gated on the suite; a failure keeps the wheel as an artifact only.
+# Requires RELEASE_USERNAME / RELEASE_TOKEN secrets (TEMPLATE_TOKEN for private templates).
+on:
+  schedule:
+    - cron: '30 11 * * *'
+  workflow_dispatch:
+    inputs:
+      matrix:
+        description: "JSON array of PPU runner board types"
+        required: false
+        type: string
+        default: '["ZW-M890P"]'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deepgemm-ut-upload-tmp-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 480
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Build and Test on PPU
+        id: ppu-test
+        uses: t-head/ci-infra/cluster-run@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          container_options: |
+            cpus: "40"
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=${{ matrix.runner }}"
+          namespace: ppu-sched
+          timeout_minutes: 420
+          command: |
+            set -ex
+            unset PIP_INDEX_URL
+            git config --global --unset-all url.https://ai-gerrit.eng.t-head.cn/Public/Github/.insteadOf 2>/dev/null || true
+            git config --global --add safe.directory '*'
+            cd /workspace/source
+
+            source /usr/local/PPU_SDK/envsetup.sh || true
+            which hgcc || true
+            echo $PPU_SDK
+            pip install ray[adag]==2.40.0 --no-deps
+            pip install setuptools==69.5.1 setuptools-scm==9.2.2
+            pip install numpy==1.26.4 junit-xml rich wheel ninja
+            pip install --upgrade pytest
+            export MAX_JOBS=20
+            export PYTORCH_SAIL_ARCH="ppu_10;ppu_15"
+
+            echo "START TO BUILD WHEEL"
+            LOG_FILE="build.log"
+            ERROR_LOG="error.log"
+            set +e
+            python ./setup.py bdist_wheel > "$LOG_FILE" 2> "$ERROR_LOG"
+            BUILD_EXIT_CODE=$?
+            set -e
+            if [ "$BUILD_EXIT_CODE" -ne 0 ]; then
+                echo "Build failed with exit code $BUILD_EXIT_CODE"
+                cat "$ERROR_LOG"
+                echo "----- last 1000 lines of $LOG_FILE -----"
+                tail -n 1000 "$LOG_FILE"
+                exit 1
+            fi
+            echo "✅ Build succeeded!"
+            tail -n 200 "$LOG_FILE"
+
+            # Stage on NAS before testing so a failed suite still has a wheel to upload.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            mkdir -p "$NAS_RESULT_DIR/wheels"
+            cp dist/*.whl "$NAS_RESULT_DIR/wheels/"
+
+            echo "START TO INSTALL WHEEL"
+            pip install ./dist/*.whl --force-reinstall
+            echo "START TO TEST CASES"
+            set +e
+            python tests/checkin/run_checkin.py \
+              --suite '${{ matrix.runner }}' \
+              --compile-workers 16
+            TEST_EXIT_CODE=$?
+            python3 .github/workflows/scripts/generate-env-info.py \
+            --docker-image "${{ env.SAIL_IMAGE }}" \
+            --output env_info.json
+            cp test-results.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
+            cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
+            cp -r checkin-logs "$NAS_RESULT_DIR/" 2>/dev/null || true
+            # A failed suite must fail the job so publishing is skipped.
+            exit "$TEST_EXIT_CODE"
+          cleanup_policy: on_success
+
+      - name: Upload wheel (${{ matrix.runner }})
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepgemm-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}
+          path: /wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/wheels/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+      - name: Test summary (${{ matrix.runner }})
+        if: always()
+        shell: bash
+        run: |
+          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+          XML_FILE="$NAS_RESULT_DIR/test-results.xml"
+          ENV_FILE="$NAS_RESULT_DIR/env_info.json"
+          echo "## Suite: ${{ matrix.runner }}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ! -f "$XML_FILE" ]]; then
+            echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          python3 .github/workflows/scripts/display-test-summary.py \
+            "$XML_FILE" --env-info "$ENV_FILE"
+
+  merge:
+    name: Merge board wheel artifacts
+    # Every board must pass its check-in suite.
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      artifact_name: ${{ steps.artifact-name.outputs.artifact_name }}
+    steps:
+      - name: Set merged artifact name
+        id: artifact-name
+        shell: bash
+        run: |
+          echo "artifact_name=deepgemm-wheels-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - name: Merge wheel artifacts
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.artifact_name }}
+          pattern: deepgemm-wheel-${{ github.run_id }}-${{ github.run_attempt }}-*
+          compression-level: 0
+          delete-merged: false
+
+  push:
+    name: Call temporary wheel upload template
+    needs: merge
+    uses: t-head/ci-infra/.github/workflows/push-tmp-wheel.yml@main
+    with:
+      # run_attempt moves when only the publishing job is rerun.
+      artifact_name: ${{ needs.merge.outputs.artifact_name }}
+      template_repository: t-head/ci-infra
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show batch directory URL
+    needs: push
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write to logs and job summary
+        shell: bash
+        env:
+          UPLOAD_URL: ${{ needs.push.outputs.upload_url }}
+        run: |
+          set -euo pipefail
+          printf 'Batch directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"

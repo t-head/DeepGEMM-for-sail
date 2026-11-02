@@ -247,6 +247,8 @@ def write_report(results, path):
                 log.seek(0, 2)
                 log.seek(max(0, log.tell() - 12000))
                 failure.text = log.read().decode('utf-8', errors='replace')
+            error_log = failure.text if failure.text.strip() else result.error
+            ET.SubElement(case, 'system-err').text = error_log
         ET.SubElement(case, 'system-out').text = f'Full log: {result.log}'
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

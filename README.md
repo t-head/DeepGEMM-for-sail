@@ -24,11 +24,11 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 
 ## Release Notes
 
-### 2.1.0 — Unreleased
+### 1.1.0+v1.0.0 — Unreleased
 
 Adds W4A4 MegaMoE with reusable workspaces and load-time weight preparation.
 See the [MegaMoE calling contract](#megamoe) and
-[release notes](CHANGELOG.md#210--unreleased).
+[release notes](CHANGELOG.md#110v100--unreleased).
 
 ### 1.1.0+v0.1.0 — Initial Public Release
 
@@ -42,6 +42,13 @@ Highlights:
 - Support for Zhenwu 610 / 610E / 810 / 810E / M890 platforms.
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
+
+### Package versioning
+
+- Release: `1.1.0+v1.0.0.ppu2.2.0` combines DeepGEMM's own version `1.1.0`,
+  its release version `v1.0.0`, and the PPU SDK version `2.2.0`.
+- Development: `1.1.0.devN+v1.0.0.ppu2.2.0.g<sha>` additionally includes
+  the commit count and Git commit hash.
 
 ## Quick Start
 
@@ -58,6 +65,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 ```bash
 # Submodule must be cloned recursively
 git clone --recursive git@github.com:t-head/DeepGEMM-for-sail.git
+python -m pip install setuptools setuptools-scm
 # Make symbolic links for third-party (ACTLIZE) include directories and build
 bash develop.sh
 
@@ -68,6 +76,7 @@ python tests/test_core.py
 ### Installation
 
 ```bash
+python -m pip install setuptools setuptools-scm
 bash install.sh
 ```
 
@@ -529,7 +538,7 @@ configurations. Launch occupancy is checked against the compiled kernel.
 See the [test guide](tests/README.MD#routed-moe-correctness-and-performance-tests)
 for correctness thresholds, model benchmarks, optional DeepEP comparisons,
 single-device check-in and manual multi-device tests. These APIs are additive in release
-2.1.0; existing GEMM callers need no migration.
+1.1.0+v1.0.0; existing GEMM callers need no migration.
 
 #### Interfaces exposed but not yet implemented
 
