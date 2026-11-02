@@ -69,7 +69,6 @@ inline SourceFields source_fields(const DispatchConfig& config) {
              {"LAYOUT_OFF_ISF", offsets.input_scales},
              {"LAYOUT_OFF_ITI", offsets.topk_idx},
              {"LAYOUT_OFF_PT", offsets.dispatched_tokens},
-             {"LAYOUT_OFF_PSF", offsets.dispatched_scales},
              {"LAYOUT_OFF_W4_GEMM2_META", offsets.gemm2_metadata}})
         values.emplace_back(key, std::to_string(value));
     return values;
@@ -177,7 +176,7 @@ extern "C" __global__ __launch_bounds__(NUM_THREADS, 1)
 void PPU_KERNEL_ENTRY(layout::SymBuffer<{NUM_RANKS}> sb, int rank, int num_tokens, uint8_t* gemm1_weight, uint16_t* gemm1_weight_sf_u16, uint8_t* gemm1_weight_replicas, uint16_t* gemm1_weight_sf_u16_replicas, int num_master_experts, uint16_t* sfa_scratch, uint8_t* fp4_output, uint16_t* scale_output, int32_t* cumulative_local_expert_recv_stats) {
 constexpr uint64_t off_ws = 0, off_it = {LAYOUT_OFF_IT}, off_isf = {LAYOUT_OFF_ISF};
 constexpr uint64_t off_iti = {LAYOUT_OFF_ITI};
-constexpr uint64_t off_pt = {LAYOUT_OFF_PT}, off_psf = {LAYOUT_OFF_PSF};
+constexpr uint64_t off_pt = {LAYOUT_OFF_PT};
 
 
 const int64_t local_base = sb.base;
@@ -187,7 +186,6 @@ const int64_t* itopk   = (const int64_t*)P(off_iti);
 const uint8_t* itok    = (const uint8_t*)P(off_it);
 const uint8_t* isf     = (const uint8_t*)P(off_isf);
 uint8_t* ptok          = (uint8_t*)P(off_pt);
-uint8_t* psf           = (uint8_t*)P(off_psf);
 void* gemm2_metadata  = P({LAYOUT_OFF_W4_GEMM2_META});
 
 const uint8_t*  gw     = gemm1_weight;
@@ -222,7 +220,7 @@ deep_gemm::mega_moe::fp4::dispatch_gemm1_device<
     GEMM1_WARP_M, GEMM1_WARP_N, kGemm1Stages,
     {FUSED_SITU},
     {SILU_THEN_CLAMP}, {GEMM2_BLOCK_M}, {GEMM1_DYNAMIC_QUEUE}, {FAST_MATH}>(
-    ws_base, sb, itopk, itok, isf, ptok, psf, gemm2_metadata, cumulative_local_expert_recv_stats,
+    ws_base, sb, itopk, itok, isf, ptok, gemm2_metadata, cumulative_local_expert_recv_stats,
     (uint32_t)num_tokens, NMTPR, TOKEN_BYTES, SF_BYTES,
     gw, gwsf16,
     gwr, gwsf16r, (uint32_t)num_master_experts, sfa_scratch,

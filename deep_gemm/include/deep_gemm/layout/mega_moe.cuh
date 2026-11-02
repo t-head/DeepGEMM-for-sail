@@ -202,7 +202,7 @@ struct Workspace {
 struct MegaMoEBuffer {
     Workspace dispatch;
     uint64_t input_tokens, input_scales, topk_idx, topk_weights;
-    uint64_t dispatched_tokens, dispatched_scales, gemm2_metadata, packed_routes;
+    uint64_t dispatched_tokens, gemm2_metadata, packed_routes;
     uint64_t l2_acts, l2_scales, sfa_scratch, block_info, block_info_elements;
     uint64_t combine, barrier_flag, barrier_done, num_bytes;
 
@@ -219,8 +219,7 @@ struct MegaMoEBuffer {
         topk_idx = align16(input_scales + uint64_t(capacity) * hidden / 32);
         topk_weights = align16(topk_idx + uint64_t(capacity) * topk * sizeof(int64_t));
         dispatched_tokens = align128(topk_weights + uint64_t(capacity) * topk * sizeof(float));
-        dispatched_scales = align16(dispatched_tokens + pool * hidden / 2);
-        gemm2_metadata = align16(dispatched_scales + pool * hidden / 32);
+        gemm2_metadata = align16(dispatched_tokens + pool * hidden / 2);
         packed_routes = gemm2_metadata + Gemm2Metadata::rows_bytes(groups);
         l2_acts = align128(packed_routes + pool * sizeof(int64_t));
         l2_scales = align128(l2_acts + pool * intermediate / 2);

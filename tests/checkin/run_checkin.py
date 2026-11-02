@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -20,6 +21,9 @@ import xml.etree.ElementTree as ET
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUITES = {'ZW-810E': 'checkin_810e.list', 'ZW-M890P': 'checkin_890p.list'}
+SCRIPT_SUITES = {
+    'ZW-M890P-MegaMoE': ['-m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py'],
+}
 _worker_context = threading.local()
 
 
@@ -149,7 +153,7 @@ def load_cases(path, stack=()):
 
 def run_case(index, spec, phase, log_dir, timeout, base_env=None):
     worker = getattr(_worker_context, 'worker', None)
-    if worker is not None and base_env is None:
+    if worker is not None and base_env is None and phase != 'script':
         return worker.run(index, spec, phase, log_dir, timeout)
     env = dict(os.environ if base_env is None else base_env)
     env.setdefault('OMP_NUM_THREADS', '1')
@@ -158,8 +162,9 @@ def run_case(index, spec, phase, log_dir, timeout, base_env=None):
     else:
         # A nonempty string, including "0", enables warm-up in both runtimes.
         env.pop('HGGC_WARM_UP', None)
-    command = [sys.executable, str(REPO_ROOT / 'tests/run_deep_gemm.py'),
-               '--format', spec, '--require_supported']
+    command = ([sys.executable, *shlex.split(spec)] if phase == 'script' else
+               [sys.executable, str(REPO_ROOT / 'tests/run_deep_gemm.py'),
+                '--format', spec, '--require_supported'])
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     log = log_dir / f'{phase}-{index:04d}.log'
@@ -261,7 +266,7 @@ def positive_int(value):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument('--suite', choices=SUITES)
+    source.add_argument('--suite', choices=(*SUITES, *SCRIPT_SUITES))
     source.add_argument('--caselist', type=Path)
     parser.add_argument('--compile-workers', type=positive_int, default=16)
     parser.add_argument('--timeout', type=positive_int, default=1200, help='Per-case, per-phase timeout in seconds')
@@ -270,6 +275,22 @@ def main(argv=None):
     parser.add_argument('--log-dir', type=Path, default=Path('checkin-logs'))
     parser.add_argument('--list', action='store_true', help='Print the selected cases without importing Torch')
     args = parser.parse_args(argv)
+    if args.suite in SCRIPT_SUITES:
+        if args.phase == 'compile':
+            parser.error('MegaMoE runs compilation and correctness together; use --phase all or run')
+        cases = SCRIPT_SUITES[args.suite]
+        if args.list:
+            print('\n'.join(f'{i}: {sys.executable} {spec}' for i, spec in enumerate(cases, 1)))
+            return 0
+        results = []
+        for i, spec in enumerate(cases, 1):
+            result = run_case(i, spec, 'script', args.log_dir.resolve(), args.timeout)
+            results.append(result)
+            print(f'Script [{i}/{len(cases)}]: {result.error or "OK"}', flush=True)
+            if result.error:
+                print(result.log.read_text(errors='replace')[-12000:], flush=True)
+        write_report(results, args.output_xml)
+        return int(any(result.error for result in results))
     path = REPO_ROOT / 'tests/checkin' / SUITES[args.suite] if args.suite else args.caselist
     try:
         cases = load_cases(path)
