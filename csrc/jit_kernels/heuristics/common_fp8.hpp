@@ -247,21 +247,33 @@ inline std::optional<DenseWaveConfig> get_dense_wave_config(int m, int n, int k,
 
     struct Tile { int m, n, wm, wn, stages; };
     constexpr int block_k = 128;
-    // Tile/warp/stage combinations profiled on PPU1.5 without spills.
-    // Keep the order stable: equal scores retain the earlier candidate.
-    constexpr std::array<Tile, 4> base_tiles{{
+    // Retain the existing heuristic unless a candidate has a meaningful margin.
+    // In particular, do not introduce BM=256: its Scale-A AIU copy/synchronization
+    // cost is not represented by the geometry score. Existing BM=256 choices
+    // remain valid fallback configurations.
+    const auto baseline = get_best_configs_dense(m, n, k, 1, num_sms);
+    const auto& [baseline_sms, baseline_m, baseline_n, baseline_k,
+                 baseline_wm, baseline_wn, baseline_stages, baseline_smem] = baseline;
+    constexpr std::array<Tile, 3> base_tiles{{
         {128, 256, 32, 64, 4},
         {192, 256, 48, 64, 4},
         {128, 384, 32, 96, 3},
-        {256, 128, 64, 32, 4},
     }};
     // Empirical weight, not a cycle estimate: scale-copy policy and instruction
     // costs are not represented, so a lower score does not guarantee a speedup.
     constexpr int64_t transfer_weight = 64;
     auto div_up = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
     using Score = std::tuple<int64_t, int64_t, int64_t, int64_t>;
-    std::optional<Score> best;
-    DenseWaveConfig result{};
+    const int64_t baseline_blocks = div_up(m, baseline_m) * div_up(n, baseline_n);
+    const int64_t baseline_rounds = div_up(baseline_blocks, num_sms);
+    const int64_t baseline_critical = baseline_rounds * baseline_m * baseline_n;
+    const int64_t baseline_operand = baseline_rounds * (baseline_m + baseline_n);
+    const int64_t baseline_score = baseline_critical + transfer_weight * baseline_operand;
+    Score best{baseline_score, baseline_critical,
+               baseline_operand, baseline_blocks * baseline_m * baseline_n};
+    DenseWaveConfig result{baseline_sms, baseline_m, baseline_n, baseline_k,
+                           baseline_wm, baseline_wn, baseline_stages};
+    bool selected_single_cta = false;
     auto consider = [&](const Tile& tile, int64_t blocks, int64_t rounds) {
         // Compare the busiest CU's work per K block, then break ties using
         // compute, operand traffic and total padded output, in that order.
@@ -270,49 +282,43 @@ inline std::optional<DenseWaveConfig> get_dense_wave_config(int m, int n, int k,
         const int64_t padded_output = blocks * tile.m * tile.n;
         const Score score{critical_work + transfer_weight * operand_work,
                           critical_work, operand_work, padded_output};
-        if (!best || score < *best) {
+        // Four percent is an admission margin, not a predicted speedup. Keep the
+        // legacy configuration when an apparent win only comes from tie-breaks.
+        if (std::get<0>(score) <= baseline_score - div_up(baseline_score, 25) && score < best) {
             best = score;
+            selected_single_cta = true;
             // Smallest scheduler CU count that preserves this round count.
             result = {static_cast<int>(div_up(blocks, rounds)),
                       tile.m, tile.n, block_k, tile.wm, tile.wn, tile.stages};
         }
     };
 
-    int64_t minimum_critical = 0;
     for (const auto& tile : base_tiles) {
         const int64_t blocks = div_up(m, tile.m) * div_up(n, tile.n);
-        const int64_t rounds = div_up(blocks, num_sms);
-        const int64_t critical_work = rounds * tile.m * tile.n;
-        if (!minimum_critical || critical_work < minimum_critical)
-            minimum_critical = critical_work;
-        consider(tile, blocks, rounds);
+        consider(tile, blocks, div_up(blocks, num_sms));
     }
 
-    {
-        constexpr Tile tile{192, 128, 48, 32, 4};
-        const int64_t blocks = div_up(m, tile.m) * div_up(n, tile.n);
-        const int64_t rounds = div_up(blocks, num_sms);
-        const int64_t critical_work = rounds * tile.m * tile.n;
-        // Require at least 12.5% less critical work than every base candidate
-        // before admitting this smaller tile, then apply the same ranking.
-        // Equivalent to 8*critical <= 7*minimum without overflowing int64_t.
-        if (critical_work <= minimum_critical - div_up(minimum_critical, 8)) {
-            consider(tile, blocks, rounds);
-        }
-    }
-
-    if (k <= 2048 && n >= 8192) {
+    if (!selected_single_cta && k <= 1536 && n >= 8192) {
         // This tile with three stages permits two resident CTAs per CU.
-        // Require enough rounds to amortize its extra tile/scheduling overhead.
+        // Keep an admitted single-CTA improvement. The small tile needs both a
+        // short reduction and enough rounds to amortize extra scale/copy work;
+        // residency alone did not prevent regressions near N=8192, K=2048.
         constexpr Tile tile{128, 128, 32, 64, 3};
         constexpr int resident_ctas = 2;
         const int64_t blocks = div_up(m, tile.m) * div_up(n, tile.n);
         const int64_t rounds = div_up(blocks, int64_t(num_sms) * resident_ctas);
         const int64_t critical_work = rounds * resident_ctas * tile.m * tile.n;
-        if (rounds >= 4 && critical_work <= std::get<1>(*best)) {
+        if (rounds >= 8 && critical_work <= baseline_critical) {
             result = {static_cast<int>(div_up(blocks, rounds * resident_ctas)),
                       tile.m, tile.n, block_k, tile.wm, tile.wn, tile.stages};
         }
+    }
+    // Profiled full tiles with at least 12 M tiles, 16 N tiles and 32 K blocks use
+    // three stages. Stage selection is validated separately from the geometry
+    // score, which does not model pipeline startup or masked-copy costs.
+    if (result.block_m == 192 && result.block_n == 256 &&
+        m % 192 == 0 && n % 256 == 0 && m / 192 >= 12 && n / 256 >= 16 && k / block_k >= 32) {
+        result.stages = 3;
     }
     return result;
 }
