@@ -4,7 +4,7 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
-## 2.1.0 — Unreleased
+## 1.1.0+v1.0.0 — Unreleased
 
 ### Added
 
@@ -73,6 +73,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Changed
 
+- **Package versioning**: combines DeepGEMM's own version, its release version,
+  and the PPU SDK version, e.g. `1.1.0+v1.0.0.ppu2.2.0`.
 - **Paged MQA page sizes**: extends regular paged MQA from page size 64
   to 32, 64, and 128.
 - **Canonical GEMM bindings**: promotes existing short GEMM names to the

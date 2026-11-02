@@ -29,7 +29,6 @@ permissions:
   contents: read
 
 env:
-  PPU_BASE_IMAGE: ${{ secrets.PPU_BASE_IMAGE }}
   SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
 
 jobs:
@@ -134,6 +133,10 @@ jobs:
                 echo "----- last 200 lines of $LOG_FILE -----"
                 tail -n 200 "$LOG_FILE"
             fi
+            # Keep board check-in and MegaMoE reports in separate directories.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}"
+            mkdir -p "$NAS_RESULT_DIR/dist"
+            cp dist/*.whl "$NAS_RESULT_DIR/dist/"
             echo "START TO INSTALL WHEEL"
             pip install ./dist/*.whl --force-reinstall
             if [ '${{ matrix.suite }}' = 'ZW-M890P-MegaMoE' ]; then
@@ -151,14 +154,21 @@ jobs:
             python3 .github/workflows/scripts/generate-env-info.py \
             --docker-image "${{ env.SAIL_IMAGE }}" \
             --output env_info.json
-            # Keep board check-in and MegaMoE reports in separate directories.
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}"
-            mkdir -p "$NAS_RESULT_DIR"
             cp test-results.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp -r checkin-logs "$NAS_RESULT_DIR/" 2>/dev/null || true
             exit "$TEST_EXIT_CODE"
           cleanup_policy: on_success
+
+      - name: Upload wheel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepgemm-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}
+          path: /wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}/dist/*.whl
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 14
 
       - name: Test summary (${{ matrix.suite == 'board' && matrix.runner || matrix.suite }})
         if: always()
