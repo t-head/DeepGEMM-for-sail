@@ -15,6 +15,7 @@ communication, expert computation, combine and required state recycling. Setup,
 weight transforms, JIT and numerical references are outside timing. DeepEP and
 Triton are imported only for a requested baseline; missing dependencies skip
 that comparison on every rank. Installed but broken backends fail explicitly.
+MegaMoE reports total latency and separate input-preparation timing.
 """
 
 import argparse
@@ -341,7 +342,10 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
                          generator=rng) * .5
     w1_raw = _make_weights(case.experts // world, 2 * case.intermediate, case.hidden, .5, rng)
     w2_raw = _make_weights(case.experts // world, case.hidden, case.intermediate, .125, rng)
-    w1, w2, replica_options = _transform_weights(w1_raw, w2_raw, case.activation, args.replicas)
+    w1, w2, replica_options = _transform_weights(
+        w1_raw, w2_raw, case.activation, args.replicas, getattr(args, "master_experts", None))
+    stats = (torch.zeros(case.experts // world, dtype=torch.int32, device="cuda")
+             if getattr(args, "recv_stats", False) else None)
     baseline = None
     workspace = deep_gemm.SymmBuffer(
         group, case.experts, case.capacity, case.topk, case.hidden, case.intermediate,
@@ -361,11 +365,16 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
             x, routed_ids, routed_weights = source[:tokens], ids[:tokens], weights[:tokens]
             y = torch.empty_like(x)
 
-            def run_mega():
+            def run_pre_dispatch():
                 deep_gemm.mega_moe_pre_dispatch(x, routed_ids, routed_weights, workspace)
+
+            def run_mega():
+                run_pre_dispatch()
                 deep_gemm.fp4_fp4_mega_moe(
                     y, w1, w2, workspace, activation=case.activation,
-                    activation_clamp=case.clamp, fast_math=bool(args.fast_math), **replica_options)
+                    activation_clamp=case.clamp, fast_math=bool(args.fast_math),
+                    cumulative_local_expert_recv_stats=stats,
+                    situ_beta=case.situ_beta, situ_linear_beta=case.situ_linear_beta, **replica_options)
                 return y
 
             def reference(checked):
@@ -405,6 +414,9 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
             timing["scope"] = "bf16_input_to_bf16_output"
             timing["tokens_per_second"] = sum(report["tokens_per_rank"]) * 1e6 / timing["max_rank_us"]["median"]
             report.update(benchmark=timing, seed=args.seed, fast_math=bool(args.fast_math))
+            pre_dispatch_timing = _benchmark_pipeline(run_pre_dispatch, **timing_options)
+            pre_dispatch_timing["scope"] = "bf16_input_to_staged_mxfp4"
+            report["pre_dispatch_benchmark"] = pre_dispatch_timing
             if baseline is not None:
                 def run_baseline():
                     return baseline(x, routed_ids, routed_weights)

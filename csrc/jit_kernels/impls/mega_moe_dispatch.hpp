@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <mutex>
 #include <unordered_map>
+#include <deep_gemm/common/profiling_interface.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
@@ -312,6 +313,12 @@ inline void fp4_mega_moe_pre_dispatch_impl(const torch::Tensor& hidden_states, c
                                            const torch::Tensor& staged_topk_weights, int num_tokens,
                                            int hidden, int num_topk) {
     const auto config = mega_moe_config::fp4_pre_dispatch_config(hidden, num_topk, num_tokens);
+    DgProfParam dg_prof_params;
+    const bool profiling_enabled = ProfilingInterface::Instance().get_op_info();
+    if (profiling_enabled)
+        dg_prof_params.set_mega_moe_pre_dispatch_params(
+            num_tokens, x.size(0), hidden, num_topk, current_stream());
+    const ScopedProfilingRange profile(profiling_enabled ? &dg_prof_params : nullptr);
     if (num_tokens == 0)
         return;
     fp4_mega_moe_pre_dispatch_kernel(config, hidden_states, topk_idx, topk_weights,

@@ -248,3 +248,51 @@ use the default heuristic. Tile selection is internal; workspace constructors
 do not expose GEMM1/GEMM2 tile overrides. `MEGA_MOE_PULL_SMS` remains available for
 pull CTA experiments; normal benchmark commands require no tuning overrides.
 The public calling example and workspace reuse contract are in the main README.
+
+## MegaMoE UT format and HGTX
+
+`MegaMoe` represents one W4A4 call, covering dispatch/GEMM1, activation
+quantization, GEMM2/scatter, combine and state recycling. UT `--benchmark` measures
+the full BF16-input-to-BF16-output pipeline, including `mega_moe_pre_dispatch`.
+The `MegaMoe` HGTX range follows the library API boundary: it starts from
+prepared MXFP4 input (`input_format:mxfp4`) and excludes the separate pre-dispatch call.
+
+```bash
+# Run a GLM-shaped UT with synthetic random routes.
+torchrun --nnodes=1 --node-rank=0 --nproc-per-node=8 \
+  --master-addr=127.0.0.1 --master-port=29500 tests/run_deep_gemm.py \
+  --format='MegaMoe,data_type:fp4,ep:8,tokens:1024,capacity:4096,hidden:6144,intermediate_hidden:2048,experts:256,topk:8,activation:swiglu,routing:random'
+```
+
+Set `PPU_LIB_PERF_INSTRUMENT=1` to enable separate `MegaMoe` and
+`MegaMoePreDispatch` HGTX ranges in the `deepgemm` domain for Asight collection,
+or `PPU_LIB_SHOW_PARAMS=1` to print their `--format` descriptions.
+Both are disabled by default.
+
+`tokens` is the token count per rank, `capacity` is workspace capacity per rank,
+`experts` is the global physical expert count, and `intermediate_hidden` is
+activated I. Optional fields include `activation_clamp`, `fast_math`, local
+`master_experts`, `recv_stats`, `situ_beta` and `situ_linear_beta`.
+
+- Append `--benchmark` for full-pipeline timing; eager execution is the default.
+  Add `mode:graph,warmup:10,iterations:100,repeats:7` to the format for graph timing.
+  JSON `benchmark` reports total latency; `pre_dispatch_benchmark` reports a
+  separate measurement of input preparation. The two measurements are not additive.
+- Accuracy checks default to 8 tokens per rank. Add `reference_tokens:0` to check
+  all tokens, or append `--disable_acc` to skip reference checks.
+- Launch one process per EP rank. A recorded `rank` identifies the source rank;
+  replay uses the specified `tokens` count on every rank.
+
+Runtime tags use `routing:unknown`, which replays as seeded random routes.
+Use `routing:random/round_robin/skewed` and `seed` to select synthetic inputs;
+the format does not capture original tensors, routing imbalance or tuning overrides.
+HGTX ranges annotate host submission; use warmed-up device timings for latency.
+Host push/pop calls do not repeat during graph replay.
+
+Input preparation has its own `MegaMoePreDispatch` HGTX range and UT. It can be
+tested without expert weights or a symmetric communication workspace:
+
+```bash
+python tests/run_deep_gemm.py --benchmark \
+  --format='MegaMoePreDispatch,data_type:bf16,tokens:1024,capacity:4096,hidden:6144,topk:8'
+```
