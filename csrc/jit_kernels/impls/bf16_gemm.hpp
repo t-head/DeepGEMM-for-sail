@@ -16,6 +16,7 @@
 #include "../../utils/layout_type_name.hpp"
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_bf16.hpp"
+#include "../heuristics/bf16_memory_tuning.hpp"
 // #include "../heuristics/gemm_search_space.hpp"
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
@@ -643,6 +644,8 @@ public:
         std::string gemm_type, kernel_strategy, kernel_name;
         bool enable_sbo_overlap;
         bool overlap_prologue;
+        bool nonpersistent = false;
+        int b_cache_policy = 1;
     };
 
     struct GemmArguments {
@@ -710,7 +713,7 @@ namespace deep_gemm {{
 
 using GemmTypeTag = std::integral_constant<GemmType, GemmType::{0}>;
 
-using Kernel = BF16GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {11}, {9}, GemmTypeTag{12}>;
+using Kernel = BF16GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {11}, {9}, GemmTypeTag, {12}, {13}, {14}>;
 
 }} // namespace deep_gemm
 
@@ -730,7 +733,8 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             is_aligned_n ? "true" : "false",
             info.kernel_name,
             info.overlap_prologue ? "true" : "false",
-            std::is_same_v<ElementOutput, float> ? ", float" : "");
+            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t",
+            info.b_cache_policy, info.nonpersistent ? "true" : "false");
     }
 
 };
@@ -869,6 +873,7 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
     using Config = std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 
     Config cfg;
+    std::optional<MemoryTuningConfig> memory_tuning;
     if (configs.has_value()) {
         // Explicit config path: unpack the 8-element public tuple; force warp_k = block_k
         // (mirrors deep_gemm/jit_kernels/gemm.py lines 406-408/422;
@@ -885,6 +890,25 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
         if (!from_runtime_lut && is_ppu1v5_device() &&
             deep_gemm_adaptive::bf16_adaptive_enabled(m, n, k)) {
             warp_k = std::get<6>(deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms));
+            // Preserve runtime LUTs, explicit configs, FP32 output and alternate kernels.
+            if constexpr (std::is_same_v<ElementOutput, cutlass::bfloat16_t>) {
+                if (get_env<std::string>("DG_USE_CUTE", "1") != "0") {
+                    memory_tuning = get_memory_tuning(m, n, k);
+                    if (memory_tuning) {
+                        const auto prop = device_runtime->get_prop();
+                        if (!is_memory_tuning_device(prop->name, prop->major, prop->minor,
+                                                     prop->multiProcessorCount, num_sms) ||
+                            !memory_tuning_enabled()) memory_tuning.reset();
+                    }
+                    if (memory_tuning) {
+                        const auto& t = *memory_tuning;
+                        ns = num_sms;
+                        bm = t.bm; bn = t.bn; bk = t.bk;
+                        wm = t.wm; wn = t.wn; warp_k = t.wk; nst = t.stages;
+                        sc = deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2);
+                    }
+                }
+            }
         }
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, warp_k, nst, sc);
     }
@@ -984,7 +1008,10 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             CuteRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
         dim3 grid_cute_free;
-        grid_cute_free.x = blocks_per_cu * num_sms_new;
+        const bool nonpersistent = memory_tuning && memory_tuning->nonpersistent;
+        DG_HOST_ASSERT(!nonpersistent || !overlap_on);
+        grid_cute_free = nonpersistent ? dim3(tiles_n, tiles_m, 1)
+                                     : dim3(blocks_per_cu * num_sms_new, 1, 1);
 
         // Step 3: build the kernel name for the matching variant (explicit '='
         // assignment avoids _ovlp_ovlp on re-entry) and compile ONLY that one
@@ -993,7 +1020,8 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             overlap_on ? "bf16_deep_gemm_cute_free_ovlp" : "bf16_deep_gemm_cute_free";
         auto args = typename CuteRuntime::Args{
             .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, /*dense_s2_opt=*/true, num_stages,
-                            "Normal", "Default", cute_free_kernel_name, enable_sbo_overlap, overlap_on},
+                            "Normal", "Default", cute_free_kernel_name, enable_sbo_overlap, overlap_on,
+                            nonpersistent, memory_tuning ? memory_tuning->b_cache_policy : 1},
             .launch_args = {grid, block_cute_free, smem_cute_free},
             .kernel_params = params,
         };

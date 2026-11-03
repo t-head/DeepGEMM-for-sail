@@ -55,7 +55,7 @@ template <typename Element_,
           int BLOCK_M, int BLOCK_N, int BLOCK_K,
           int WARP_M, int WARP_N, int WARP_K, int STAGES,
           bool DenseS2Opt, bool OverlapPrologue,
-          typename GemmTypeTag>
+          typename GemmTypeTag, bool NonPersistent = false>
 struct GemmKernel {
   // ---- Injected atoms / types ----
   using Element  = Element_;
@@ -149,7 +149,19 @@ struct GemmKernel {
         params.ptr_A, params.ptr_B, params.M, params.N, params.K,
         params.lda, params.ldb};
 
-    if constexpr (OverlapPrologue) {
+    if constexpr (NonPersistent) {
+      static_assert(!OverlapPrologue, "One-tile CTAs do not overlap the next tile");
+      const int m_offset = int(blockIdx.y) * BLOCK_M;
+      const int n_offset = int(blockIdx.x) * BLOCK_N;
+      float accum[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread] = {};
+      Mainloop::run(ml_params, smem, warp_id, warp_row, warp_col, warp_k,
+                    m_offset, n_offset, accum);
+      WarpKReduce::run(accum, reinterpret_cast<float*>(smem), warp_mn, warp_k, lane);
+      if (warp_k == 0) {
+        Epilogue::store(m_offset, n_offset, warp_row, warp_col, lane,
+                        params.ptr_D, params.ldd, params.M, params.N, accum);
+      }
+    } else if constexpr (OverlapPrologue) {
       // --- Overlap path: hoist first tile's stage-0 G2S, then interleave
       //     next-tile prologue with current-tile epilogue. ---
       uint32_t m_block = 0, n_block = 0;
