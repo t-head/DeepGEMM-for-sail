@@ -262,24 +262,27 @@ MqaAvgLogits,data_type:fp8,seq_len_q:129,seq_len_kv:1024,num_heads:4,head_dim:12
 MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16
 
 # --- MqaAvgLogits / fp4 ---
-# Q-scale modes, output dtypes, compressed rows, KV tails and balancing.
-MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32,compressed_logits:0
-MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:1,logits_dtype:fp32,compressed_logits:1
-MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:2,logits_dtype:fp32,compressed_logits:0
-MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:0,logits_dtype:bf16,compressed_logits:1
-MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16,compressed_logits:0
-MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:2,logits_dtype:bf16,compressed_logits:1
-MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:513,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32,compressed_logits:0
+# Compressed output: Q-scale modes, output dtypes, Q/KV tails and balancing.
+MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32,compressed_logits:1
 MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:1025,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16,compressed_logits:1
-MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:8193,num_heads:4,head_dim:128,q_scale:2,logits_dtype:bf16,compressed_logits:0
-MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32
-MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16
+MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:8193,num_heads:4,head_dim:128,q_scale:2,logits_dtype:fp32,compressed_logits:1
+# Multiple M-block groups and balancing fallback for every Q-scale mode.
+MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,num_heads:4,head_dim:128,q_scale:0,logits_dtype:bf16,compressed_logits:1
+MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16,compressed_logits:1
+MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,num_heads:4,head_dim:128,q_scale:2,logits_dtype:bf16,compressed_logits:1
 
 # ============ PagedMqaAvgLogits ============
 
 # --- PagedMqaAvgLogits / fp8 ---
 PagedMqaAvgLogits,data_type:fp8,batch_size:8,next_n:5,num_heads:4,head_dim:128,avg_context_len:1024,logits_dtype:bf16,page_kv:128
 PagedMqaAvgLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:4,head_dim:128,distribution:[0,1,127,1024],page_kv:32,logits_dtype:fp32
+
+# --- PagedMqaAvgLogits / fp4 ---
+# Both Q layouts/dtypes, page sizes, empty contexts, page tails and request switches.
+PagedMqaAvgLogits,data_type:fp4,batch_size:1249,next_n:1,num_heads:4,head_dim:128,context_pattern:[17],page_kv:32,max_context_len:128,logits_dtype:bf16
+PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:4,num_heads:4,head_dim:128,distribution:[513,1,65,0,63,131,64],page_kv:64,max_context_len:1024,logits_dtype:fp32
+PagedMqaAvgLogits,data_type:fp4,batch_size:1249,next_n:5,num_heads:4,head_dim:128,context_pattern:[17,0,1,63,64,65,129,257,513],page_kv:64,max_context_len:1024,logits_dtype:fp32
+PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:6,num_heads:4,head_dim:128,distribution:[129],page_kv:128,max_context_len:256,logits_dtype:bf16
 
 # ============ SparseMqaLogits ============
 

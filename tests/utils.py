@@ -2086,9 +2086,9 @@ def ref_fp8_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
     cost = mask.sum()
     return logits, cost
 
-def ref_fp8_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
+def ref_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
                              weights: torch.Tensor, context_lens: torch.Tensor, block_tables: torch.Tensor,
-                             max_model_len: int, avg: bool = False):
+                             max_model_len: int, avg: bool = False, *, avg_bf16_rounding: bool = False):
     batch_size, next_n, heads, dim = q.size()
     num_block, block_size, _, dim = kv_cache.size()
     logits = torch.full([batch_size * next_n, max_model_len], float('-inf'), device=q.device, dtype=torch.float32)
@@ -2109,11 +2109,24 @@ def ref_fp8_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
             s = torch.where(mask[None, :, :], (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(logits.dtype), float('-inf'))
             if avg:
                 # Avg variant: unweighted head sum scaled by 1/sqrt(head_dim), weights unused
-                s = torch.relu(s).sum(dim=0) * (dim ** -0.5)
+                if avg_bf16_rounding:
+                    assert heads == 4
+                    heads_bf16 = torch.relu(s).to(torch.bfloat16).float()
+                    pair0 = (heads_bf16[0] + heads_bf16[1]).to(torch.bfloat16).float()
+                    pair1 = (heads_bf16[2] + heads_bf16[3]).to(torch.bfloat16).float()
+                    total = (pair0 + pair1).to(torch.bfloat16).float()
+                    scale = total.new_tensor(dim ** -0.5).to(torch.bfloat16).float()
+                    s = (total * scale).to(torch.bfloat16)
+                else:
+                    s = torch.relu(s).sum(dim=0) * (dim ** -0.5)
             else:
                 s = torch.relu(s) * weight_slice[..., None]
                 s = s.sum(dim=0)
-            logits[i * next_n:(i + 1) * next_n, block_rk * block_size: (block_rk + 1) * block_size] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float('-inf'))
+            col_start = block_rk * block_size
+            col_end = min(col_start + block_size, max_model_len)
+            if col_start < col_end:
+                logits[i * next_n:(i + 1) * next_n, col_start:col_end] = torch.where(
+                    k_offsets[None, :] < q_offsets[:, None], s, float('-inf'))[:, :col_end - col_start]
     return logits
 
 def test_mqa_logits(args) -> None:
@@ -2269,10 +2282,10 @@ def test_paged_mqa_logits(args) -> None:
     print("test_paged_mqa_logits->test_func: {},data_type:{},batch_size:{},next_n:{},avg_context_len:{},num_heads:{},head_dim:{},logits_dtype:{},weights_dtype:{}".format(args.get('gemm_type', 'PagedMqaLogits'), data_type, batch_size, next_n, avg_context_len, num_heads, head_dim, logits_dtype, weights_dtype))
 
     if is_avg:
-        assert data_type == torch.float8_e4m3fn, "Paged MQA Avg Logits supports fp8 only"
+        assert data_type in (torch.float8_e4m3fn, torch.uint8), "Paged MQA Avg Logits supports fp8 or fp4 only"
         assert logits_dtype in (torch.float32, torch.bfloat16), "Paged MQA Avg Logits supports float32 or bf16 logits"
 
-    max_model_len = 262144
+    max_model_len = args.get('max_context_len', 262144)
     pagesize = args.get('page_kv', 64)
     assert pagesize in (32, 64, 128)
 
@@ -2280,7 +2293,12 @@ def test_paged_mqa_logits(args) -> None:
     weights = torch.randn((batch_size * next_n, num_heads), device='cuda', dtype=weights_dtype)
 
     # Generate context_lens (2D [batch_size, next_n] for DeepGEMM 2D context_lens support)
-    if distribution and isinstance(distribution, list):
+    context_pattern = args.get('context_pattern')
+    if context_pattern is not None:
+        assert isinstance(context_pattern, list) and len(context_pattern) > 0
+        context_lens = torch.tensor([context_pattern[i % len(context_pattern)] for i in range(batch_size)],
+                                    device='cuda', dtype=torch.int32)
+    elif distribution and isinstance(distribution, list):
         assert(len(distribution) == batch_size)
         context_lens = torch.tensor(distribution[:batch_size], device='cuda', dtype=torch.int32)
     else:
@@ -2355,22 +2373,40 @@ def test_paged_mqa_logits(args) -> None:
         kv_cache_fp4, kv_cache_dequant = kv_cache_cast_to_fp4(kv_cache)
         q, kv_cache = q_dequant, kv_cache_dequant
         metadata_extra = (next_n, num_heads, head_dim // 2, q_fp4[0].element_size())
-        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
-        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
-            q=q_in, fused_kv_cache=kv_cache_fp4, weights=weights,
-            context_lens=context_lens, block_table=block_tables,
-            schedule_meta=schedule_metadata, max_context_len=max_model_len,
-            clean_logits=False, logits_dtype=logits_dtype,
-        )
+        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(),
+                                                metadata_extra=metadata_extra)
+        if is_avg:
+            logits = deep_gemm.fp8_fp4_paged_mqa_avg_logits(
+                q=q_in, fused_kv_cache=kv_cache_fp4,
+                context_lens=context_lens, block_table=block_tables,
+                schedule_meta=schedule_metadata, max_context_len=max_model_len,
+                logits_dtype=logits_dtype,
+            )
+        else:
+            logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+                q=q_in, fused_kv_cache=kv_cache_fp4, weights=weights,
+                context_lens=context_lens, block_table=block_tables,
+                schedule_meta=schedule_metadata, max_context_len=max_model_len,
+                clean_logits=False, logits_dtype=logits_dtype,
+            )
     else:
         print("ERROR: Unsupported dtype for Paged MQA Logits, please check!")
         exit(1)
 
+    assert logits.dtype == logits_dtype
+    assert logits.shape == (batch_size * next_n, max_model_len)
     # Compute reference
     ref_logits = None
     if get_acc_check():
         assert get_ref_backend() == "device", "ref_backend only supports 'device' for Paged MQA Logits"
-        ref_logits = ref_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len, avg=is_avg)
+        # FP4 AVG uses represented Q/K values and FP32 dot products. Its BF16
+        # output rounds each head, both reduction stages, and the final scale.
+        ref_q = q.float() if is_avg and data_type == torch.uint8 else q
+        ref_kv = kv_cache.float() if is_avg and data_type == torch.uint8 else kv_cache
+        ref_logits = ref_paged_mqa_logits(
+            ref_q, ref_kv, weights, context_lens, block_tables, max_model_len, avg=is_avg,
+            avg_bf16_rounding=is_avg and data_type == torch.uint8 and logits_dtype == torch.bfloat16,
+        )
 
     # Accuracy check
     if get_acc_check() and ref_logits is not None:
@@ -2384,6 +2420,15 @@ def test_paged_mqa_logits(args) -> None:
         logits_masked = logits.masked_fill(ref_neginf_mask, 0)
         ref_logits_masked = ref_logits.masked_fill(ref_neginf_mask, 0)
 
+        if is_avg and data_type == torch.uint8:
+            # Check each valid token/K pair: an aggregate error can hide a bad
+            # request switch or a missing token in the next_n=5/6 tail.
+            is_bf16 = logits_dtype == torch.bfloat16
+            torch.testing.assert_close(
+                logits_masked.float(), ref_logits_masked.to(logits_dtype).float(),
+                rtol=8e-3 if is_bf16 else 1e-4,
+                atol=2e-3 if is_bf16 else 1e-4,
+            )
         diff = calc_diff(logits_masked, ref_logits_masked)
         threshold = 1.5e-3 if logits_dtype == torch.bfloat16 else 1e-3
         if torch.isnan(diff) or diff >= threshold:

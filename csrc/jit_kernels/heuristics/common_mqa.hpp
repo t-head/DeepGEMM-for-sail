@@ -92,9 +92,9 @@ static int get_paged_num_threads(const PagedTile& tile, int next_n) {
     return next_n * (tile.split_kv / tile.warp_kv) * 32;
 }
 
-// Faithful port of `get_paged_mqa_logits_tile`: a lookup table with a search fallback.
+// Paged tile lookup with resource-based search for unlisted shapes.
 // NOTES: `weights_size` / `logits_size` are hardcoded to 4 upstream even when the tensors are
-// BF16; kept as-is so the tile choice matches the Python path exactly.
+// BF16; preserve that accounting for the existing weighted paths.
 static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_heads, int head_dim, int datasize) {
     DG_HOST_ASSERT(page_kv == 32 or page_kv == 64 or page_kv == 128);
     const bool is_fp4 = datasize == 1 and head_dim == 64;
@@ -189,14 +189,14 @@ static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_head
         {{1, 6, 32, 64}, {1, 3, 64, 64, true, 8}},
         {{1, 2, 64, 64}, {1, 3, 256, 64, true, 4}},
         {{1, 3, 64, 64}, {1, 3, 128, 64, true, 5}},
-        // 4-head avg tiles: the kernel pads 4 heads to 16, so lookup with 16 heads
-        // and ceil(next_n / 4) "tokens" (next_n 1-4 -> 1, 5-8 -> 2)
+        // AVG tiles use 16 MMA columns and ceil(next_n / 4) query groups.
+        // FP4 D128 is packed into 64 bytes; FP8 D128 uses 128 bytes.
+        {{1, 1, 16, 64}, {2, 3, 256, 64, false, 4}},
+        {{1, 2, 16, 64}, {2, 3, 256, 64, false, 4}},
         {{1, 1, 16, 128}, {1, 3, 128, 32, false, 4}},
         {{1, 2, 16, 128}, {1, 3, 128, 32, false, 4}},
     };
-    // 4 heads are padded to 16 in the paged kernel: look up with 16 heads and
-    // ceil(next_n / 4) warp-tile "tokens" (fp4 keeps its own kernel layout)
-    if (num_heads == 4 and not is_fp4) {
+    if (num_heads == 4) {
         num_heads = 16;
         next_n = (next_n + 3) / 4;
     }
