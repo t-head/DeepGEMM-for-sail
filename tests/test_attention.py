@@ -156,34 +156,35 @@ def test_mqa_avg_logits_loop():
         'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16',
         'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:2,logits_dtype:fp32',
     ]
-    # FP4 prefill: cross both output dtypes with all three Q-scale modes.
-    # Q=129 leaves a partial Q tile. KV=258 covers short KV, including
-    # the third KV128 block, for both dense and compressed output.
-    # KV=1025 exercises compressed output;
-    # KV=8193 enables default KV balancing, with every window > 3/4 of KV.
+    # FP4 AVG requires compressed output. Keep Q/K tails, packed SFA
+    # groups, and active/fallback balancing. On 39 CUs, Q4096/KV4096 uses
+    # G=2 with multiple groups, covering their handoff for every Q-scale mode.
     prefill_cases += [
-        f'MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:{seq_len_kv},'
-        f'num_heads:4,head_dim:128,q_scale:{q_scale},logits_dtype:{logits_dtype},'
-        f'compressed_logits:{compressed_logits}'
-        for logits_dtype in ('fp32', 'bf16')
-        for q_scale in (0, 1, 2)
-        for seq_len_kv, compressed_logits in ((258, 0), (258, 1), (513, 0), (1025, 1), (8193, 0))
+        f'MqaAvgLogits,data_type:fp4,seq_len_q:{seq_len_q},seq_len_kv:{seq_len_kv},'
+        f'num_heads:4,head_dim:128,q_scale:{q_scale},logits_dtype:bf16,compressed_logits:1'
+        for seq_len_q, seq_len_kv, q_scale in (
+            (129, 258, 0), (129, 1025, 1), (129, 1025, 2), (1025, 2048, 0),
+            (4096, 4096, 0), (4096, 4096, 1), (4096, 4096, 2),
+        )
     ]
-    # On 39 CUs, Q4096/KV4096 selects four MMA M blocks with G=2 for
-    # both output dtypes. BF16 also enables warp interleaving, exercising
-    # the synchronization between groups rather than just a single group.
-    prefill_cases += [
-        f'MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,'
-        f'num_heads:4,head_dim:128,q_scale:{q_scale},logits_dtype:{logits_dtype}'
-        for logits_dtype in ('fp32', 'bf16')
-        for q_scale in (0, 1, 2)
-    ]
+    # Explicit FP32 output remains supported alongside the BF16 default.
+    prefill_cases.append('MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32,compressed_logits:1')
     # Paged decode covers the four-head tile, empty contexts, and multiple next tokens.
     paged_cases = [
         'PagedMqaAvgLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:4,head_dim:128,distribution:[0,1,127,1024],logits_dtype:bf16,page_kv:32',
         'PagedMqaAvgLogits,data_type:fp8,batch_size:8,next_n:2,num_heads:4,head_dim:128,avg_context_len:1024,logits_dtype:fp32',
         'PagedMqaAvgLogits,data_type:fp8,batch_size:8,next_n:5,num_heads:4,head_dim:128,avg_context_len:1024,logits_dtype:bf16,page_kv:128',
     ]
+    # FP4 BF16 cases cover both padded Q layouts, all page sizes, request
+    # switches, and the last request's partial Q/KV tiles.
+    request_switch_batch = 32 * deep_gemm.get_num_sms() + 1
+    paged_cases += [
+        f'PagedMqaAvgLogits,data_type:fp4,batch_size:{request_switch_batch},next_n:1,num_heads:4,head_dim:128,context_pattern:[17],page_kv:32,max_context_len:128,logits_dtype:bf16',
+        'PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:4,num_heads:4,head_dim:128,distribution:[513,1,65,0,63,131,64],page_kv:64,max_context_len:1024,logits_dtype:bf16',
+        f'PagedMqaAvgLogits,data_type:fp4,batch_size:{request_switch_batch},next_n:5,num_heads:4,head_dim:128,context_pattern:[17,0,1,63,64,65,129,257,513],page_kv:64,max_context_len:1024,logits_dtype:bf16',
+        'PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:6,num_heads:4,head_dim:128,distribution:[129],page_kv:128,max_context_len:256,logits_dtype:bf16',
+    ]
+    paged_cases.append('PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:1,num_heads:4,head_dim:128,distribution:[17],page_kv:32,max_context_len:128,logits_dtype:fp32')
     set_acc_check(True)
     for case in prefill_cases:
         print(case)
@@ -191,6 +192,14 @@ def test_mqa_avg_logits_loop():
     for case in paged_cases:
         print(case)
         test_paged_mqa_logits(parse_deepgemm_string_re(case))
+    # Non-paged FP4 AVG still requires compressed output.
+    case = 'MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:0,logits_dtype:bf16'
+    try:
+        test_mqa_logits(parse_deepgemm_string_re(case))
+    except RuntimeError as exc:
+        assert 'FP4 AVG requires compressed logits' in str(exc), str(exc)
+    else:
+        raise AssertionError(f'Expected compressed-output API rejection: {case}')
     print("Passed\n")
 
 
