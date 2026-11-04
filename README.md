@@ -587,6 +587,7 @@ The library also provides some environment variables, which may be useful:
   - `DG_JIT_DEBUG`: `0` or `1`, print more JIT debugging information, `0` by default
 - **JIT cache related**
   - `DG_JIT_CACHE_DIR`: string, the cache directory to store compiled kernels, `$HOME/.deep_gemm` by default
+  - `DG_JIT_DISABLE_SHORTCUT_CACHE`: `0` or `1`, bypass the native PPU1.5 dense BF16 (including FP32 output and GEMV), FP8, INT8 and FP4 compiled-variant lookup and regenerate the JIT source on every call, `0` by default. `DG_JIT_DEBUG=1` also bypasses this lookup. Tensor pointers and launch arguments are always refreshed.
   - `DG_JIT_DISABLE_CACHE`: `0` or `1`, disable the use of cache directory, `0` by default
 - **HGCC/HGRTC selections**
   - `DG_JIT_USE_HGRTC`: `0` or `1`, use HGRTC instead of HGCC, faster compilation but maybe have lower performance for some cases, `0` by default

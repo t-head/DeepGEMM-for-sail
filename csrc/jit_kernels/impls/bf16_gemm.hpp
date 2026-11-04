@@ -20,6 +20,7 @@
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
+#include <deep_gemm/common/profiling_interface.cuh>
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 
@@ -462,6 +463,16 @@ public:
                 hw_info,   args.scheduler, workspace};
     }
 
+    // ElementOutput is part of the runtime type; hardware constants are process-stable.
+    // Shape N only changes the generated code through the epilogue alignment flag.
+    static auto compile_key(const Args& args) {
+        const auto& info = args.launch_info;
+        const bool is_aligned_n = cute::get<1>(args.kernel_params.problem_shape) % info.block_n == 0;
+        return std::make_tuple(info.block_m, info.block_n, info.block_k,
+                               info.warp_m, info.warp_n, info.warp_k, info.num_stages,
+                               info.dense_s2_opt, is_aligned_n, info.kernel_name, info.overlap_prologue);
+    }
+
     static std::string generate_impl(const Args& args) {
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
@@ -696,6 +707,16 @@ public:
                 hw_info,   args.scheduler, workspace};
     }
 
+    // ElementOutput specializes this runtime and its cache. Keep every codegen
+    // field here, including alignment and next-tile prologue overlap.
+    static auto compile_key(const Args& args) {
+        const auto& info = args.launch_info;
+        const bool is_aligned_n = cute::get<1>(args.kernel_params.problem_shape) % info.block_n == 0;
+        return std::make_tuple(info.gemm_type, info.block_m, info.block_n, info.block_k,
+                               info.warp_m, info.warp_n, info.warp_k, info.num_stages,
+                               info.dense_s2_opt, is_aligned_n, info.kernel_name, info.overlap_prologue);
+    }
+
     static std::string generate_impl(const Args& args) {
         const auto& info = args.launch_info;
         const int shape_n = cute::get<1>(args.kernel_params.problem_shape);
@@ -764,6 +785,12 @@ public:
         GemvDenseArgs kernel_params;
     };
 
+    static auto compile_key(const Args& args) {
+        const auto& info = args.launch_info;
+        return std::make_tuple(info.block_x, info.block_y, info.k_per_thread,
+                               info.m == 2, info.npt, info.kernel_name, info.output_fp32);
+    }
+
     static std::string generate_impl(const Args& args) {
         const bool is_m2 = args.launch_info.m == 2;
         const char* entry = is_m2 ? "gemv_dense_m2_kernel_impl" : "gemv_dense_kernel_impl";
@@ -829,8 +856,7 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
         .launch_args = {grid, block, 0},
         .kernel_params = params,
     };
-    const auto& code = DenseGemvRuntime::generate(args);
-    const auto& runtime = compiler->build(kernel_name, code);
+    const auto& runtime = compiler->build_cached<DenseGemvRuntime>(kernel_name, args);
     const auto& kernel = runtime->kernel;
 
     static constexpr GemmType kGemmType = GemmType::Normal;
@@ -877,15 +903,11 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, /*warp_k=*/bk, nst,
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
     } else {
-        bool from_runtime_lut = false;
+        int selected_warp_k = 0;
         auto best = deep_gemm_bf16_common::get_best_configs(
-            m, n, k, 1, num_sms, kGemmType, 256, &from_runtime_lut);
+            m, n, k, 1, num_sms, kGemmType, 256, nullptr, &selected_warp_k);
         auto [ns, bm, bn, bk, wm, wn, nst, sc] = best;
-        int warp_k = bk;
-        if (!from_runtime_lut && is_ppu1v5_device() &&
-            deep_gemm_adaptive::bf16_adaptive_enabled(m, n, k)) {
-            warp_k = std::get<6>(deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms));
-        }
+        const int warp_k = selected_warp_k > 0 ? selected_warp_k : bk;
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, warp_k, nst, sc);
     }
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages, smem_config] = cfg;
@@ -998,8 +1020,7 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             .kernel_params = params,
         };
 
-        auto code = CuteRuntime::generate(args);
-        auto runtime = compiler->build(cute_free_kernel_name, code);
+        auto runtime = compiler->build_cached<CuteRuntime>(cute_free_kernel_name, args);
         if (is_compile_only())
             return;
         auto kernel = runtime->kernel;
@@ -1093,8 +1114,7 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
                 .launch_args = {grid, block_cutlass3, SMSIZE},
                 .kernel_params = params,
             };
-            auto code = CutlassRuntime::generate(args);
-            auto runtime = compiler->build("bf16_dense_gemm", code);
+            auto runtime = compiler->build_cached<CutlassRuntime>("bf16_dense_gemm", args);
             auto kernel = runtime->kernel;
 
             args.launch_args.grid_dim.x *= blocks_per_cu;

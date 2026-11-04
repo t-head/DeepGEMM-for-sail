@@ -51,6 +51,23 @@ python ./run_deep_gemm_perf.py --format=GroupedMasked,data_type:int8,groups:16,m
 python ./run_deep_gemm_perf.py --caselist=./deepgemm.caselist
 
 # Checkin Test
+
+## Native JIT compile-key regression (PPU)
+
+From a source checkout with initialized submodules, PPU PyTorch and the PPU SDK:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 MAX_JOBS=1 python tests/test_jit_compile_keys.py -v
+```
+
+This uses `load_inline` to build the host C++ checks embedded in the Python test
+against the checkout's actual code generators.
+It checks that changing each codegen input changes both source and cache key,
+and that runtime-only arguments preserve both. Coverage includes BF16 CuteFree
+and CUTLASS with BF16/FP32 output, GEMV M1/M2, FP8 block/channel, INT8 and FP4.
+The helper queries hardware constants but never compiles or launches generated
+GEMMs. Public API accuracy and launch behavior remain covered by the GEMM UTs.
+
 ## Test fp8
 python ./test_fp8_core.py
 

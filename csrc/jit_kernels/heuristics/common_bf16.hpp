@@ -224,20 +224,21 @@ using ConfigResult = std::tuple<int, int, int, int, int, int, int, std::tuple<in
 std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms);
 
-// Adaptive tile selection for DenseGemm (BF16). warp_k/dense_s2_opt are injected in the dense
-// impl; here we only apply the adaptive tile choice and return the 8-tuple.
-ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms) {
+// Preserve the 8-tuple contract while returning the adaptive warp_k to dense
+// callers, so they can use the same selection without running it a second time.
+ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms, int* selected_warp_k = nullptr) {
     auto [sms, bm, bn, bk, wm, wn, wk, stages] =
         deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms);
-    (void)wk;
+    if (selected_warp_k) *selected_warp_k = wk;
     auto smem = get_smem_config(stages, k, bm, bn, bk);
     return std::make_tuple(sms, bm, bn, bk, wm, wn, stages, smem);
 }
 
 ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
                               GemmType gemm_type = GemmType::Normal, int max_block_n = 256,
-                              bool* from_runtime_lut = nullptr) {
+                              bool* from_runtime_lut = nullptr, int* selected_warp_k = nullptr) {
     if (from_runtime_lut) *from_runtime_lut = false;
+    if (selected_warp_k) *selected_warp_k = 0; // Non-adaptive callers use block_k.
     if (auto tile = deep_gemm_lut::get_runtime_config(
             m, n, k, num_groups, gemm_type, deep_gemm_lut::RuntimeLutKind::BF16)) {
         auto [bm, bn, bk, wm, wn, stages] = *tile;
@@ -255,11 +256,11 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
             return ConfigResult{ns, bm, bn, bk, wm, wn, stages, smem};
         }
     }
-    // Adaptive tile selection for DenseGemm (BF16). warp_k/dense_s2_opt are injected in the dense
-    // impl; here we only apply the adaptive tile choice and return the 8-tuple.
+    // Keep the 8-tuple result and return adaptive warp_k through the optional output.
+    // The dense implementation still derives dense_s2_opt when preparing the launch.
     if (gemm_type == GemmType::Normal && is_ppu1v5_device() &&
         deep_gemm_adaptive::bf16_adaptive_enabled(m, n, k)) {
-        return get_adaptive_configs_bf16(m, n, k, num_sms);
+        return get_adaptive_configs_bf16(m, n, k, num_sms, selected_warp_k);
     }
     // Generate block_ms
     std::vector<int> block_ms;

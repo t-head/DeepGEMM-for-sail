@@ -235,6 +235,18 @@ public:
                 hw_info,   args.scheduler, workspace,         args.signal};
     }
 
+    // Keep this key in sync with the arguments formatted by generate_impl below.
+    // PpuHwParams is an immutable process singleton, as is the generated include hash.
+    static auto compile_key(const Args& args) {
+        const auto& info = args.launch_info;
+        return std::make_tuple(cute::get<1>(args.kernel_params.problem_shape),
+                               cute::get<2>(args.kernel_params.problem_shape),
+                               info.block_m, info.block_n, info.block_k, info.num_groups,
+                               info.warp_m, info.warp_n, info.num_stages, info.gemm_type,
+                               info.kernel_strategy, info.enable_sbo_overlap,
+                               info.transposed_batch_output, info.kernel_name);
+    }
+
     static std::string generate_impl(const Args& args) {
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
@@ -488,8 +500,7 @@ static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, 
                                      .launch_args = {grid, block, SMSIZE},
                                      .kernel_params = params};
 
-    const auto& code = FP8GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp8_deep_gemm", code);
+    const auto& runtime = compiler->build_cached<FP8GemmRuntime>("fp8_deep_gemm", args);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
     HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);

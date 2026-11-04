@@ -127,6 +127,17 @@ public:
                 hw_info,   args.scheduler, workspace};
     }
 
+    // Keep this key in sync with the arguments formatted by generate_impl below.
+    // Raw N only affects code through its tile alignment; M, K and all pointers are
+    // runtime arguments. PpuHwParams and the generated include hash are immutable.
+    static auto compile_key(const Args& args) {
+        const auto& info = args.launch_info;
+        const bool is_aligned_n = cute::get<1>(args.kernel_params.problem_shape) % info.block_n == 0;
+        return std::make_tuple(args.type_info, info.block_m, info.block_n, info.block_k,
+                               info.warp_m, info.warp_n, info.warp_k, info.num_stages,
+                               info.dense_s2_opt, is_aligned_n, info.kernel_name);
+    }
+
     static std::string generate_impl(const Args& args) {
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
@@ -780,8 +791,7 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
             .kernel_params = params,
             .type_info = type_info,
         };
-        const auto& code = DenseINT8GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build(dense_kernel_name, code);
+        const auto& runtime = compiler->build_cached<DenseINT8GemmCutlass3Runtime>(dense_kernel_name, args);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
