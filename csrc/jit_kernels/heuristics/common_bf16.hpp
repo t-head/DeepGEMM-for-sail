@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include "../../utils/math.hpp"
@@ -640,3 +641,201 @@ inline constexpr std::array<Model810eBatchDispatchEntry, 4> kModel810eBatchDispa
 }};
 
 } // namespace deep_gemm_bf16_common
+
+// 810E M32 dense dispatch policies. Callers gate these policies by device and input domain.
+namespace deep_gemm_810e {
+// reported_cus is the driver's compatibility count (64 on the qualified 810E),
+// not the physical CU count. It is retained in the established tile-selection
+// thresholds. Resident-wave policies instead use the scheduling budget (20).
+// A single full M tile is the validated domain. Other M values and explicit
+// configurations keep their original dispatch. No shape-indexed tuning table.
+inline bool use_narrow_or_streaming_pipeline(int m, int n, int k, int legacy_bm, int legacy_bn, int reported_cus,
+                                             int cache_bytes, int shared_bytes_per_cu, int legacy_sms,
+                                             int legacy_smem) {
+    constexpr int bm = 32, bn = 64, bk = 128;
+    if (m != bm || n % 16 || k % bk || reported_cus <= 0 || cache_bytes <= 0)
+        return false;
+    const int tiles = deep_gemm::ceil_div(m, bm) * deep_gemm::ceil_div(n, bn);
+    const int legacy_tiles = deep_gemm::ceil_div(m, legacy_bm) * deep_gemm::ceil_div(n, legacy_bn);
+    // Hot-cache measurements require useful legacy tiles below one quarter
+    // of the reported CU count; a looser gate improved cold calls but regressed
+    // warm calls. Retain enough K work to amortize the FP32 reduction.
+    const bool underfilled = legacy_tiles * 4 < reported_cus && tiles < reported_cus && k / bk >= 32;
+    // Enough output tiles to fill the SMEM-limited residency and a long K
+    // loop identify the streaming regime. Short loops and partial waves
+    // showed regressions in the full sweep and keep the existing path.
+    constexpr int stages = 3;
+    const int resident_ctas = shared_bytes_per_cu / ((bm + bn) * bk * 2 * stages);
+    const int legacy_resident = legacy_smem > 0 ? shared_bytes_per_cu / legacy_smem : 0;
+    const int legacy_grid = legacy_sms * legacy_resident;
+    const int legacy_waves = legacy_grid > 0 ? deep_gemm::ceil_div(legacy_tiles, legacy_grid) : 0;
+    // A nearly complete short legacy schedule already amortizes its prologue.
+    // Keep it when at most two scheduler rounds are at least 95% occupied.
+    const bool packed_legacy =
+        legacy_waves > 0 && legacy_waves <= 2 && int64_t(legacy_tiles) * 20 >= int64_t(legacy_waves) * legacy_grid * 19;
+    const bool streaming = !packed_legacy && resident_ctas > 0 && tiles >= reported_cus * resident_ctas &&
+                           k / bk >= 64 && int64_t(2) * n * k >= cache_bytes;
+    return underfilled || streaming;
+}
+
+inline int split_count(int tiles, int k, int bk, int reported_cus) {
+    int splits = 1;
+    while (splits < 16 && tiles * splits < reported_cus && k / (2 * splits) >= 8 * bk)
+        splits *= 2;
+    while (splits > 1 && k % (splits * bk))
+        splits /= 2;
+    return splits;
+}
+// Base resource policy: 1 = shorter K tile, 2/3 = wider N tile.
+// Protect short partitions and sparsely populated final CU waves on both cache regimes.
+inline int select_base_pipeline(int m, int n, int k, int legacy_bm, int legacy_bn, int reported_cus, int cache_bytes,
+                                int shared_bytes_per_cu, int legacy_sms, int legacy_smem) {
+    if (m != 32 || n % 16 || k % 128 || reported_cus <= 0 || cache_bytes <= 0 || shared_bytes_per_cu <= 0)
+        return 0;
+    const int tiles = deep_gemm::ceil_div(n, 64);
+    const int old_tiles = deep_gemm::ceil_div(m, legacy_bm) * deep_gemm::ceil_div(n, legacy_bn);
+    const int old_split = split_count(tiles, k, 128, reported_cus);
+    const int new_split = split_count(tiles, k, 64, reported_cus);
+    const int parallel = tiles * new_split;
+    const bool too_short_partial_wave = parallel > reported_cus && k / new_split <= 8 * 64;
+    if (k / 64 >= 64 && tiles < reported_cus && old_tiles * 2 < reported_cus && parallel * 2 <= reported_cus * 3 &&
+        (parallel >= reported_cus || new_split > old_split) && !too_short_partial_wave)
+        return 1;
+    const int wide_tiles = deep_gemm::ceil_div(n, 128);
+    const int resident = shared_bytes_per_cu / ((32 + 128) * 128 * 2 * 3);
+    if (resident <= 0)
+        return 0;
+    const int tail = wide_tiles % reported_cus;
+    const bool sparse_tail = wide_tiles >= reported_cus * resident && tail > 0 && tail * 4 <= reported_cus;
+    const int previous_resident = shared_bytes_per_cu / ((32 + 64) * 128 * 2 * 3);
+    const int previous_grid = reported_cus * previous_resident;
+    const int next_grid = reported_cus * resident;
+    const int previous_tail = previous_grid > 0 ? ((tiles - 1) % previous_grid + 1) : 0;
+    const int next_tail = (wide_tiles - 1) % next_grid + 1;
+    const bool previously_selected = use_narrow_or_streaming_pipeline(
+        m, n, k, legacy_bm, legacy_bn, reported_cus, cache_bytes, shared_bytes_per_cu, legacy_sms, legacy_smem);
+    // Preserve the accepted pipeline when the new last resident wave has less
+    // than half its previous fill. This also protects small marginal gains.
+    const bool poor_relative_tail =
+        previously_selected && int64_t(next_tail) * previous_resident * 2 < int64_t(previous_tail) * resident;
+    if (k / 128 >= 32 && wide_tiles * 4 >= reported_cus * 5 && int64_t(2) * n * k >= cache_bytes)
+        return sparse_tail || poor_relative_tail ||
+                       (previously_selected && wide_tiles >= reported_cus * resident && tail > 0 &&
+                        tail * 2 <= reported_cus)
+                   ? 0
+                   : 3;
+    const int old_grid = legacy_smem > 0 ? legacy_sms * (shared_bytes_per_cu / legacy_smem) : 0;
+    const bool previous_narrow = old_tiles * 4 < reported_cus && tiles < reported_cus && k / 128 >= 32;
+    // A wider kernel without extra output coverage or K partitions only changes
+    // the pipeline. An odd number of BK tiles can remove all prospective splits;
+    // keep the accepted path unless there is a structural source of useful work.
+    const bool more_useful_work =
+        legacy_bm > 32 || legacy_bn > 128 || split_count(wide_tiles, k, 128, reported_cus) > 1;
+    if (!previous_narrow && more_useful_work && legacy_bn >= 128 && k / 128 >= 64 && old_tiles < reported_cus &&
+        old_grid > 0 && old_tiles * 4 < old_grid * 3)
+        return 2;
+    return 0;
+}
+
+// Extend the base selector to additional BN128 streaming regions.
+// 4: at least one complete CU wave, 5: sparse tail of the original scheduler,
+// 6: enough body work / tail fill to amortize the wider tile's final wave.
+inline int select_dense_pipeline(int m, int n, int k, int legacy_bm, int legacy_bn, int reported_cus, int cache_bytes,
+                                 int shared_bytes_per_cu, int legacy_sms, int legacy_smem) {
+    const int prior = select_base_pipeline(m, n, k, legacy_bm, legacy_bn, reported_cus, cache_bytes,
+                                           shared_bytes_per_cu, legacy_sms, legacy_smem);
+    if (prior != 0)
+        return prior;
+    if (m != 32 || n % 16 || k % 128 || reported_cus <= 0 || cache_bytes <= 0 ||
+        shared_bytes_per_cu < (32 + 128) * 128 * 2 * 3 || int64_t(2) * n * k < cache_bytes)
+        return 0;
+    const int wide = deep_gemm::ceil_div(n, 128);
+    // Partial first waves regressed on independent N/K boundary examples.
+    if (k / 128 >= 64 && wide >= reported_cus && wide * 4 < reported_cus * 5)
+        return 4;
+    const bool previous_dense = use_narrow_or_streaming_pipeline(
+        m, n, k, legacy_bm, legacy_bn, reported_cus, cache_bytes, shared_bytes_per_cu, legacy_sms, legacy_smem);
+    if (!previous_dense && wide >= reported_cus * 2 && k / 128 >= 32)
+        return 5;
+    if (!previous_dense || k / 128 < 64)
+        return 0;
+    if (wide >= reported_cus * 4)
+        return 6;
+    const int tail = wide % reported_cus;
+    const int narrow = deep_gemm::ceil_div(n, 64);
+    const int old_resident = shared_bytes_per_cu / ((32 + 64) * 128 * 2 * 3);
+    const int new_resident = shared_bytes_per_cu / ((32 + 128) * 128 * 2 * 3);
+    if (old_resident <= 0 || new_resident <= 0)
+        return 0;
+    const int old_tail = (narrow - 1) % (reported_cus * old_resident) + 1;
+    const int new_tail = (wide - 1) % (reported_cus * new_resident) + 1;
+    const bool retains_tail_fill = int64_t(new_tail) * old_resident * 2 >= int64_t(old_tail) * new_resident;
+    if (wide >= reported_cus * 2 && tail * 2 >= reported_cus && retains_tail_fill)
+        return 6;
+    return 0;
+}
+
+// Use the platform scheduling budget returned by get_num_sms(). On 810E,
+// runtime multiProcessorCount is a compatibility value (64); the established
+// default scheduling budget (20) agrees with the observed active CU IDs.
+// Full resident waves keep their original kernel. Tail partitions fill at
+// most one resident wave and retain >=8 BK iterations to amortize prologue.
+inline int tail_split_count(int m, int n, int k, int bm, int bn, int bk, int uniform_splits, int scheduling_cus,
+                            int shared_bytes, int smem, int& wave) {
+    wave = 0;
+    if (m != 32 || bm != 32 || bn != 128 || bk != 128 || n % 16 || k % bk || uniform_splits != 1 || k / bk < 32 ||
+        scheduling_cus <= 0 || smem <= 0)
+        return 0;
+    const int resident = shared_bytes / smem;
+    if (resident <= 0)
+        return 0;
+    wave = scheduling_cus * resident;
+    const int tiles = deep_gemm::ceil_div(n, bn);
+    const int tail = tiles % wave;
+    if (tiles < wave || tail == 0 || tail * 2 > wave)
+        return 0;
+    // Integer counts avoid leaving capacity unused between powers of two.
+    // Every partition keeps at least eight BK iterations.
+    const int by_wave = wave / tail;
+    const int by_work = (k / bk) / 8;
+    const int splits = std::min(16, std::min(by_wave, by_work));
+    return splits > 1 ? splits : 0;
+}
+
+// 1: medium K, at least half a CU wave and at most two CTAs/CU.
+// 2: widen an existing BN64 streaming path only when the new resident
+// wave has a splittable tail. Keep the existing min-eight-BK partition rule.
+inline int select_dense_refinement(int m, int n, int k, bool was_dense, int bm, int bn, int bk, int scheduling_cus,
+                                   int shared_bytes) {
+    if (m != 32 || n % 16 || k % 128 || scheduling_cus <= 0 || shared_bytes <= 0)
+        return 0;
+    const int narrow = deep_gemm::ceil_div(n, 64), wide = deep_gemm::ceil_div(n, 128);
+    if (!was_dense && bk == 64 && k / 128 >= 16 && k / 128 < 32 && (n / 64) * 2 >= scheduling_cus &&
+        narrow <= 2 * scheduling_cus)
+        return 1;
+    const int resident = shared_bytes / ((32 + 128) * 128 * 2 * 3);
+    const int wave = scheduling_cus * resident;
+    if (was_dense && bm == 32 && bn == 64 && bk == 128 && k / 128 >= 64 && wave > 0 && wide >= wave) {
+        const int tail = wide % wave;
+        if (tail > 0 && tail * 2 <= wave)
+            return 2;
+    }
+    return 0;
+}
+
+// A uniform two-way K split is unnecessary when the original output tiles
+// already cover the scheduling budget and fit the unsplit kernel's residency.
+// This applies only to the existing long-K dense configuration; short-K legacy
+// and narrow-N paths retain their previous choices.
+inline bool use_legacy_unsplit(int m, int n, int k, bool dense, int bm, int bn, int bk, int wm, int wn, int stages,
+                               int reported_cus, int scheduling_cus, int shared_bytes) {
+    if (m != 32 || n <= 0 || n % 16 || k <= 0 || k % 128 || !dense || bm != 32 || bn != 128 || bk != 128 || wm != 16 ||
+        wn != 32 || stages != 3 || k / 128 < 64 || scheduling_cus <= 0 || reported_cus <= 0)
+        return false;
+    const int tiles = deep_gemm::ceil_div(n, 128);
+    const int resident = shared_bytes / ((32 + 128) * 128 * 2 * 3);
+    if (resident <= 0 || tiles < scheduling_cus || int64_t(tiles) > int64_t(scheduling_cus) * resident)
+        return false;
+    return split_count(tiles, k, bk, reported_cus) == 2;
+}
+} // namespace deep_gemm_810e
