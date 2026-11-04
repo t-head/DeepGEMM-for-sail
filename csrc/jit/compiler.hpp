@@ -8,8 +8,10 @@
 #include <filesystem>
 #include <fstream>
 #include <hgrtc.h>
+#include <map>
 #include <regex>
 #include <string>
+#include <tuple>
 
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
@@ -128,6 +130,27 @@ public:
         // NOTES: fsync to ensure the data is visible to other processes (e.g., NVCC)
         // on distributed filesystems, where `close()` alone does not guarantee persistence
         fsync_path(path);
+    }
+
+    // Runtime::compile_key must describe every input read by generate_impl. Cache only
+    // the loaded kernel: tensor addresses, launch arguments and streams remain per-call.
+    // Compiler instances, their flags and each runtime's include hash are process-stable.
+    template <typename Runtime, typename Args>
+    std::shared_ptr<KernelRuntime> build_cached(const std::string& name, const Args& args) const {
+        if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_JIT_DISABLE_SHORTCUT_CACHE"))
+            return build(name, Runtime::generate(args));
+
+        using Key = std::tuple<const Compiler*, std::string, decltype(Runtime::compile_key(args))>;
+        // Each calling thread owns its lookup table; hits need no shared-map mutation.
+        // The underlying runtime cache already retains every loaded kernel for its lifetime.
+        static thread_local std::map<Key, std::shared_ptr<KernelRuntime>> cache;
+        const auto key = std::make_tuple(this, name, Runtime::compile_key(args));
+        if (const auto it = cache.find(key); it != cache.end())
+            return it->second;
+
+        const auto runtime = build(name, Runtime::generate(args));
+        cache.emplace(key, runtime);
+        return runtime;
     }
 
     std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {

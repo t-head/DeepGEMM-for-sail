@@ -202,6 +202,18 @@ public:
         KernelParams kernel_params;
     };
 
+    // Keep this key in sync with generate_impl -> generate_code's default arguments.
+    // Shared memory is part of the generated static_assert; bias and epilogue
+    // select distinct device parameter layouts. Tensor addresses remain per-call.
+    static auto compile_key(const Args& args) {
+        const auto& info = args.launch_info;
+        return std::make_tuple(info.n, info.k, info.block_m, info.block_n, info.block_k,
+                               info.num_groups, info.warp_m, info.warp_n, info.num_stages,
+                               info.gemm_type, info.enable_sbo_overlap, info.hasBias, info.n_expand,
+                               info.epilogue_type, info.apply_swiglu_limit, info.kernel_name,
+                               args.launch_args.smem_size);
+    }
+
     static std::string generate_impl(const Args& args) {
         return generate_code(args);
     }
@@ -661,8 +673,7 @@ static void fp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
         params.signal = nullptr;
     }
 
-    const auto& code = FP4GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp4_deep_gemm", code);
+    const auto& runtime = compiler->build_cached<FP4GemmRuntime>("fp4_deep_gemm", args);
     const auto& kernel = runtime->kernel;
 
     int blocks_per_cu = 0;
