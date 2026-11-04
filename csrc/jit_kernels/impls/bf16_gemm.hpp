@@ -2,6 +2,7 @@
 
 #include <torch/python.h>
 #include <cstdint>
+#include <cstddef>
 #include <limits>
 #include <type_traits>
 #include <hggc_fp8.h>
@@ -73,6 +74,10 @@ public:
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         std::string gemm_type, kernel_strategy, kernel_name;
         bool enable_sbo_overlap;
+        bool with_c = false;
+        bool allow_tsm_epilogue = true;
+        bool vectorized_c = false;
+        bool stage_c = false;
     };
 
     struct GemmArguments {
@@ -121,7 +126,8 @@ public:
         GemmKernelParams kernel_params;
     };
 
-    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace) {
+    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace,
+                                                       bool with_c = false, bool allow_tsm_epilogue = true) {
         auto problem_shape = args.problem_shape;
         auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
         // Get SM count if needed, otherwise use user supplied SM count
@@ -137,13 +143,16 @@ public:
 
         cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
 
-        // Both epilogues only convert the accumulator; enforce the {alpha=1, beta=0} contract.
+        // The epilogue is specialized for either Acc or Acc + C. Other callers
+        // retain the original overwrite contract by default.
         DG_HOST_ASSERT(args.epilogueargs.callback.alpha == 1.0f && args.epilogueargs.callback.alpha_ptr == nullptr &&
-                       args.epilogueargs.callback.beta == 0.0f && args.epilogueargs.callback.beta_ptr == nullptr);
+                       args.epilogueargs.callback.beta == (with_c ? 1.0f : 0.0f) &&
+                       args.epilogueargs.callback.beta_ptr == nullptr);
+        DG_HOST_ASSERT(!with_c || args.epilogueargs.ptr_C != nullptr);
 
         // Same decision source as the injected kWithTsmEpilogue; must match the device compile.
         // Initialize the selected union member directly to start its lifetime.
-        if (is_ppu1v5_device()) {
+        if (is_ppu1v5_device() || !allow_tsm_epilogue) {
             return KernelParams{.no_tsm = GemmKernelParamsT<EpilogueParamNoTsm>{
                 args.mode, problem_shape, args.mainloopargs, args.epilogueargs,
                 hw_info, args.scheduler, workspace, args.signal}};
@@ -162,20 +171,22 @@ public:
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
         // One snapshot drives both the union member read and the injected epilogue flag.
-        const bool is_ppu1v5 = is_ppu1v5_device();
+        const bool with_tsm_epilogue = !is_ppu1v5_device() && args.launch_info.allow_tsm_epilogue;
         // Read the common head (mode/problem_shape/mainloop) through the matching member.
-        const GemmProblemSize problem_shape = is_ppu1v5 ? args.kernel_params.no_tsm.problem_shape
-                                                        : args.kernel_params.with_tsm.problem_shape;
-        // Injected into the generated source; same source as to_underlying_arguments_rtc.
-        const bool with_tsm_epilogue = not is_ppu1v5;
+        const GemmProblemSize problem_shape = with_tsm_epilogue ? args.kernel_params.with_tsm.problem_shape
+                                                               : args.kernel_params.no_tsm.problem_shape;
         // sizeof of what the driver copies; the device asserts it equals its own Params size.
         const auto host_params_size = with_tsm_epilogue ? sizeof(args.kernel_params.with_tsm)
                                                         : sizeof(args.kernel_params.no_tsm);
+        const auto epilogue_size = with_tsm_epilogue ? sizeof(EpilogueParamWithTsm) : sizeof(EpilogueParamNoTsm);
+        const auto epilogue_align = with_tsm_epilogue ? alignof(EpilogueParamWithTsm) : alignof(EpilogueParamNoTsm);
         return fmt::format(
             R"(
 #define BF16_HGRTC
 #include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
+#include <deep_gemm/epilogue/bf16_add_c.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
+#include <cstddef>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
@@ -199,10 +210,12 @@ constexpr int STAGES = {8};
 static constexpr GemmType kGemmType = GemmType::{9};
 static constexpr KernelStrategy kKernelStrategy = KernelStrategy::{10}; //Default;
 static constexpr bool kEnableSboOverlap = {11};// false;
+static constexpr bool kWithC = {19};
+static constexpr bool kStageC = {28};
 
 using ElementA    = cutlass::bfloat16_t;
 using ElementB    = cutlass::bfloat16_t;
-using ElementC    = {19};
+using ElementC    = {30};
 using LayoutA     = cutlass::layout::RowMajor;
 using LayoutB     = cutlass::layout::ColumnMajor;
 using LayoutC     = cutlass::layout::RowMajor;
@@ -241,13 +254,41 @@ using KernelSchedule = cute::conditional_t<
         kKernelStrategy == KernelStrategy::MultistageOnN,
         KernelAiuMultistageOnN,
         cutlass::gemm::KernelAiuMultistage>>>;
+// Mainloop scheduling depends on tile geometry and pipeline depth. Require
+// enough complete K tiles for the prologue; all other reductions keep the
+// original schedule. This choice is independent of C staging and group count.
+static constexpr bool kOptimizeAddC =
+    kWithC && cute::is_same_v<ArchTag, cutlass::arch::PPU0015> &&
+    kGemmType == GemmType::MGroupedContiguous &&
+    kKernelStrategy == KernelStrategy::Default &&
+    BLOCK_M == 256 && BLOCK_N == 256 &&
+    ((BLOCK_K == 64 && STAGES >= 2 && STAGES <= 4) || (BLOCK_K == 128 && STAGES == 2)) &&
+    SHAPE_K % BLOCK_K == 0 && SHAPE_K / BLOCK_K >= STAGES &&
+    WARP_M == 64 && WARP_N == 64 &&
+    cute::is_same_v<LayoutA, cutlass::layout::RowMajor> &&
+    cute::is_same_v<LayoutB, cutlass::layout::ColumnMajor>;
+
+// For BM128, keep the original split A/B copy warps and only move the S2
+// wait after the successor issue. This avoids draining both pipeline stages
+// before every copy. Require a successor beyond the prologue: with only
+// two K tiles there is nothing to overlap, and the extra barrier loses time.
+static constexpr bool kOptimizeMainloop = kOptimizeAddC ||
+    (cute::is_same_v<ArchTag, cutlass::arch::PPU0015> &&
+     kGemmType == GemmType::MGroupedContiguous &&
+     kKernelStrategy == KernelStrategy::Default &&
+     BLOCK_M == 128 && (BLOCK_N == 128 || BLOCK_N == 256) &&
+     BLOCK_K == 64 && STAGES == 2 &&
+     SHAPE_K % BLOCK_K == 0 && SHAPE_K / BLOCK_K > STAGES &&
+     cute::is_same_v<LayoutA, cutlass::layout::RowMajor> &&
+     cute::is_same_v<LayoutB, cutlass::layout::ColumnMajor>);
+
 using DispatchPolicy = cute::conditional_t<
     kKernelStrategy == KernelStrategy::OverlapMainloop,
     cutlass::gemm::MainloopPPUOverlapMainloop<STAGES, KernelSchedule>,
     cute::conditional_t<
       kKernelStrategy == KernelStrategy::OverlapPrologue,
       cutlass::gemm::MainloopPPUOverlapPrologue<STAGES, KernelSchedule>,
-      cutlass::gemm::MainloopPPUAiuOpt<STAGES, KernelSchedule>>>;
+      cutlass::gemm::MainloopPPUAiuOpt<STAGES, KernelSchedule, kOptimizeMainloop>>>;
 
 static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
 static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
@@ -280,19 +321,35 @@ using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
 
 // Epilogue
 static constexpr bool IsAlignedN = SHAPE_N % BLOCK_N == 0 ? true : false;
-using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
+static constexpr bool kVectorizedC = {27};
+using OverwriteEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
     cutlass::detail::TagToStrideA_t<LayoutC>,
     cutlass::detail::TagToStrideA_t<LayoutC>,
     cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
     cutlass::gemm::EpilogueDefault,
     IsAlignedN>;
+// Preserve global-C schedules; staged tiles read eight shared pairs per batch.
+using AddCEpilogue_noTsm = deep_gemm::Bf16AddCEpilogueNoTsm<
+    cutlass::detail::TagToStrideA_t<LayoutC>,
+    cutlass::detail::TagToStrideA_t<LayoutC>,
+    cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
+    cutlass::gemm::EpilogueDefault,
+    IsAlignedN, kVectorizedC, (kStageC || kOptimizeAddC || (SHAPE_K > 0 && SHAPE_K <= 256)),
+    (kOptimizeAddC && !kStageC ? 32 : 8), kStageC, BLOCK_M, BLOCK_N>;
+using CollectiveEpilogue_noTsm = cute::conditional_t<kWithC, AddCEpilogue_noTsm, OverwriteEpilogue_noTsm>;
 
 // TSM epilogue for alpha=1, beta=0;
 static constexpr int AlignmentC = 16 / sizeof(ElementC);
-using DefaultOperation = cutlass::epilogue::fusion::PPUEVT<
+using OverwriteOperation = cutlass::epilogue::fusion::PPUEVT<
     cutlass::epilogue::fusion::PPUCompute<cutlass::epilogue::thread::Identity, ElementD, ElementCompute,
                                        cutlass::FloatRoundStyle::round_to_nearest>,
     cutlass::epilogue::fusion::PPUAccFetch>;
+using AddCOperation = cutlass::epilogue::fusion::PPUEVT<
+    cutlass::epilogue::fusion::PPUCompute<cutlass::plus, ElementD, ElementCompute,
+                                       cutlass::FloatRoundStyle::round_to_nearest>,
+    cutlass::epilogue::fusion::PPUAccFetch,
+    cutlass::epilogue::fusion::PPUSrcFetch<ElementC>>;
+using DefaultOperation = cute::conditional_t<kWithC, AddCOperation, OverwriteOperation>;
 using EpilogueSchedule = typename cutlass::epilogue::EpilogueSimtVectorized;
 using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, cutlass::arch::OpClassTensorOp,
@@ -313,7 +370,11 @@ using CollectiveEpilogue = typename cutlass::platform::conditional<
     CollectiveEpilogue_noTsm
 >::type;
 
-using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS>;
+// Group neighboring M tiles to reuse B in L2, without specializing every M.
+static constexpr uint32_t kSchedulerMGroup = {29};
+using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M,
+    BLOCK_N * N_EXPAND, NUM_GROUPS,
+    math::ceil_div(SHAPE_N, BLOCK_N * N_EXPAND), kSchedulerMGroup>;
 using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
     Shape<int,int,int,int>,
     CollectiveMainloop,
@@ -321,8 +382,37 @@ using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
     TileScheduler,
     kEnableSboOverlap>;
 
+// C reuses the completed mainloop's storage; no additional dynamic shared memory.
+static_assert(!kStageC || sizeof(typename CollectiveEpilogue::SharedStorage) <=
+    sizeof(typename CollectiveMainloop::SharedStorage), "C staging must fit in mainloop shared storage");
+static_assert(!kStageC || GemmKernel::SharedStorageSize ==
+    sizeof(typename CollectiveMainloop::SharedStorage), "C staging must not increase shared allocation");
+// Staging capability is independent of the optional mainloop schedule.
+static_assert(!kStageC || (kWithC && !kWithTsmEpilogue &&
+    cute::is_same_v<ArchTag, cutlass::arch::PPU0015> &&
+    kGemmType == GemmType::MGroupedContiguous && kKernelStrategy == KernelStrategy::Default &&
+    (BLOCK_N == 128 || BLOCK_N == 256 ||
+     (BLOCK_N == 512 && BLOCK_M == 128 && BLOCK_K == 64 &&
+      (WARP_M == 32 || WARP_M == 64) && (STAGES == 2 || STAGES == 3))) && WARP_N == 64 &&
+    ((BLOCK_M == 256 && WARP_M == 64) ||
+     (BLOCK_M == 128 && (WARP_M == 32 || WARP_M == 64))) &&
+    ((BLOCK_M == 128 && BLOCK_N == 128 && BLOCK_K == 32 && STAGES == 2) ||
+     (BLOCK_K == 64 && (STAGES >= 2 && STAGES <= 4)) || (BLOCK_K == 128 && STAGES == 2)) &&
+    SHAPE_K % BLOCK_K == 0 && SHAPE_K / BLOCK_K >= STAGES && SHAPE_N % 8 == 0 && kVectorizedC),
+    "invalid staged C tile configuration");
+static_assert(!kStageC || (GemmKernel::MaxThreadsPerBlock == BLOCK_N ||
+    GemmKernel::MaxThreadsPerBlock == 2 * BLOCK_N), "staged C loader requires 8 or 16 rows per CTA copy");
+static_assert(!kStageC || GemmKernel::SharedStorageSize <= kHwTsmPerCu,
+    "staged C pipeline exceeds the device shared memory capacity");
 // Host/device Params ABI check (the driver copies sizeof(device Params) bytes from the host struct).
 static_assert(sizeof(GemmKernel::Params) == {18}, "host/device kernel Params size mismatch");
+// Both fixed EVT trees have no scalar state. Check the pointer/stride ABI as
+// well as the total size; sizeof alone cannot detect misplaced members.
+using EpiParams = typename CollectiveEpilogue::Params;
+static_assert(sizeof(EpiParams) == {20} && alignof(EpiParams) == {21}, "epilogue Params layout mismatch");
+static_assert(offsetof(EpiParams, ptr_C) == {22} && offsetof(EpiParams, dC) == {23}, "epilogue C offset mismatch");
+static_assert(offsetof(EpiParams, ptr_D) == {24} && offsetof(EpiParams, dD) == {25}, "epilogue D offset mismatch");
+static_assert(offsetof(GemmKernel::Params, epilogue) == {26}, "kernel epilogue offset mismatch");
 
 // Derive MinBlocksPerMultiprocessor from GemmOccModel with device hardware
 // constants injected by the host-side query (see kHw* above).
@@ -347,7 +437,17 @@ __global__ void {12}(
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
-            with_tsm_epilogue, host_params_size,
+            with_tsm_epilogue, host_params_size, args.launch_info.with_c, epilogue_size, epilogue_align,
+            with_tsm_epilogue ? offsetof(EpilogueParamWithTsm, ptr_C) : offsetof(EpilogueParamNoTsm, ptr_C),
+            with_tsm_epilogue ? offsetof(EpilogueParamWithTsm, stride_C) : offsetof(EpilogueParamNoTsm, stride_C),
+            with_tsm_epilogue ? offsetof(EpilogueParamWithTsm, ptr_D) : offsetof(EpilogueParamNoTsm, ptr_D),
+            with_tsm_epilogue ? offsetof(EpilogueParamWithTsm, stride_D) : offsetof(EpilogueParamNoTsm, stride_D),
+            with_tsm_epilogue ? offsetof(GemmKernelParamsT<EpilogueParamWithTsm>, collective_epilogue_params)
+                              : offsetof(GemmKernelParamsT<EpilogueParamNoTsm>, collective_epilogue_params),
+            args.launch_info.vectorized_c, args.launch_info.stage_c,
+            is_ppu1v5_device() && args.launch_info.gemm_type == "MGroupedContiguous" &&
+                args.launch_info.block_m == 128 && cute::get<0>(problem_shape) >= 4096
+                ? (cute::get<0>(problem_shape) >= 16384 ? 16 : 8) : 2,
             std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t");
     }
 

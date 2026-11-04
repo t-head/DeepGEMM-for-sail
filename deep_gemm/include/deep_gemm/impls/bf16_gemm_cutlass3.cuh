@@ -33,8 +33,15 @@
 #include <deep_gemm/common/utils_cutlass3.cuh>
 
 #include <ppu_include.hpp>
+#include <type_traits>
 
 using namespace cute;
+
+namespace deep_gemm {
+template<class E, class = void> struct PreloadsSharedC : std::false_type {};
+template<class E> struct PreloadsSharedC<E, std::void_t<decltype(E::kPreloadC)>>
+    : std::bool_constant<E::kPreloadC> {};
+}
 
 namespace cutlass::gemm {
 template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapPrologue>
@@ -61,8 +68,9 @@ struct MainloopPPUOverlapMainloop {
   using ClusterShape = Shape<_1,_1,_1>;
 };
 
-template<int Stages_, typename Schedule_ = KernelAiuMultistage>
+template<int Stages_, typename Schedule_ = KernelAiuMultistage, bool OptimizeAddC_ = false>
 struct MainloopPPUAiuOpt {
+  static constexpr bool OptimizeAddC = OptimizeAddC_;
   constexpr static int Stages = Stages_;
 #if __HGGC_ARCH__ == 100
   using ArchTag = arch::PPU0010;
@@ -624,6 +632,7 @@ template <
   typename Arch_,
   int Stages,
   class KernelSchedule,
+  bool OptimizeAddC,
   class TileShape_,
   class ElementA_,
   class StrideA_,
@@ -640,7 +649,7 @@ template <
   class TransformB_>
 struct CollectiveMma<
     Arch_,
-    MainloopPPUAiuOpt<Stages, KernelSchedule>,
+    MainloopPPUAiuOpt<Stages, KernelSchedule, OptimizeAddC>,
     TileShape_,
     ElementA_,
     StrideA_,
@@ -658,7 +667,7 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopPPUAiuOpt<Stages, KernelSchedule>;
+  using DispatchPolicy = MainloopPPUAiuOpt<Stages, KernelSchedule, OptimizeAddC>;
   using TileShape = TileShape_;
   using ElementA = ElementA_;
   using StrideA = StrideA_;
@@ -690,6 +699,25 @@ struct CollectiveMma<
   using SmemLayoutB = decltype(tile_to_shape(
       SmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+
+  // The generated kernel enables this for compatible WithC tile configurations.
+  // Keep a local geometry/layout guard for direct template callers.
+  static constexpr bool kUseSameWarp = DispatchPolicy::OptimizeAddC &&
+      ((size<2>(TileShape{}) == 64 && DispatchPolicy::Stages >= 2 && DispatchPolicy::Stages <= 4) ||
+       (size<2>(TileShape{}) == 128 && DispatchPolicy::Stages == 2)) &&
+      is_same_v<ArchTag, arch::PPU0015> &&
+      size<0>(TileShape{}) == 256 && size<1>(TileShape{}) == 256 &&
+      is_same_v<StrideA, cutlass::detail::TagToStrideA_t<layout::RowMajor>> &&
+      is_same_v<StrideB, cutlass::detail::TagToStrideB_t<layout::ColumnMajor>>;
+  // BM128 preserves the split copy warps. Waiting for one pending group
+  // after issuing the successor is independent of same-warp A/B loading.
+  static constexpr bool kUseS2Wait = DispatchPolicy::OptimizeAddC && DispatchPolicy::Stages == 2 &&
+      (kUseSameWarp || (is_same_v<ArchTag, arch::PPU0015> &&
+       size<0>(TileShape{}) == 128 &&
+       (size<1>(TileShape{}) == 128 || size<1>(TileShape{}) == 256) &&
+       size<2>(TileShape{}) == 64 &&
+       is_same_v<StrideA, cutlass::detail::TagToStrideA_t<layout::RowMajor>> &&
+       is_same_v<StrideB, cutlass::detail::TagToStrideB_t<layout::ColumnMajor>>));
 
   static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
 
@@ -830,7 +858,7 @@ struct CollectiveMma<
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
-      copy_aiu(
+      copy_aiu<!kUseSameWarp>(
         gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
         gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
         warp_idx
@@ -912,6 +940,10 @@ struct CollectiveMma<
       // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
       for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
         if (k_block == K_BLOCK_MAX - 1) {
+          if constexpr (kUseS2Wait) {
+            cp_async_wait<1>();
+            __syncthreads();
+          }
           // Slice the smem_pipe_read smem
           tCsA_p = tCsA(_,_,_,smem_pipe_read);
           tCsB_p = tCsB(_,_,_,smem_pipe_read);
@@ -941,13 +973,14 @@ struct CollectiveMma<
         // Copy gmem to smem after computing gemm on each k-pipe
         if (k_block == K_BLOCK_MAX - 2) {
 
-          // Commit the smem for smem_pipe_read
-          cp_async_wait<DispatchPolicy::Stages-2>();
-
+          // For the selected S2 pipeline, wait after issuing the successor.
+          if constexpr (!kUseS2Wait) {
+            cp_async_wait<DispatchPolicy::Stages-2>();
+          }
           __syncthreads();
 
           if (k_tile_count > 0) {
-            copy_aiu(
+            copy_aiu<!kUseSameWarp>(
               gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
               gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
               warp_idx
@@ -1057,7 +1090,7 @@ public:
 
   // Kernel level shared memory storage
   struct SharedStorage {
-    // Mainloop and epilogue don't use smem concurrently since kernel is non-persistent, so we can use a union
+    // Mainloop and epilogue use shared memory in separate phases within each tile.
     union SharedTensorStorage {
       using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
       using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
@@ -1219,6 +1252,10 @@ public:
     constexpr uint32_t L = 1;
 
     while (deep_scheduler.fetch_next_work(m_coord, n_coord)) {
+      if constexpr (deep_gemm::PreloadsSharedC<CollectiveEpilogue>::value) {
+        // A fast warp must not overwrite C shared while another still reads it.
+        __syncthreads();
+      }
 
       uint32_t M = deep_scheduler.curr_problem_m();
 
@@ -1270,6 +1307,16 @@ public:
         warp_idx,
         smem_buf
       );
+
+      if constexpr (deep_gemm::PreloadsSharedC<CollectiveEpilogue>::value) {
+        static_assert(TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous);
+        static_assert((get<0>(TileShape{}) == 128 || get<0>(TileShape{}) == 256) &&
+                      (get<1>(TileShape{}) == 128 || get<1>(TileShape{}) == 256 ||
+                       (get<0>(TileShape{}) == 128 && get<1>(TileShape{}) == 512)));
+        // MMA's final wait<0> and CTA barrier have released the AB/C union.
+        CollectiveEpilogue::template preload<MaxThreadsPerBlock>(params.epilogue,
+            m_coord, n_coord, N, thread_idx, reinterpret_cast<char*>(&shared_storage.tensors.epilogue));
+      }
 
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
