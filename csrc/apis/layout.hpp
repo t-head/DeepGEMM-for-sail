@@ -8,6 +8,7 @@
 #include "../jit_kernels/heuristics/common_fp4.hpp"
 #include "../jit_kernels/heuristics/common_preprocess.hpp"
 #include "../jit_kernels/heuristics/runtime.hpp"
+#include "../jit_kernels/impls/ppuxx_layout.hpp"
 #include "../utils/layout.hpp"
 #include "../utils/utils.hpp"
 
