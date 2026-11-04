@@ -171,6 +171,44 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages, smem_config] = cfg;
     (void)smem_config;  // single-B footprint; the dual-B kernel sizes its own SMEM
 
+    // Dual-B register guard. The tile config above came from single-B
+    // heuristics, whose register models budget ONE FP32 accumulator
+    // (adaptive tile_spill_ok: (wm*wn)/32 acc term). The dual-B kernel carries
+    // acc_high + acc_low, doubling that pressure: the m>512 legacy pin
+    // (256x256x64 / warp 64x64) is spill-free for the plain kernel but measured
+    // 872 B/thread of stack spill here (vreg pinned at 256, 13-15x slowdown on
+    // ZW-M890P). Reject such configs on the heuristic path and fall back to
+    // measured spill-free tiles instead; explicit `configs` are honored as-is
+    // (same contract as the plain BF16 dense path).
+    auto dual_vreg_ok = [](int bm, int bn, int wm, int wn, int warps_k) {
+        constexpr int kMiscRegs = 20;  // mirrors adaptive_tile_selector::tile_spill_ok
+        const int min_regs = 2 * (wm * wn) / 32  // dual FP32 accumulators
+                           + (wm + wn) / 2 + kMiscRegs;  // operand fragments + misc
+        const int total_warps = (bm / wm) * (bn / wn) * warps_k;
+        const int warps_per_we = (total_warps + 7) / 8;
+        int limit = (warps_per_we == 0) ? 256 : std::min(512 / warps_per_we, 256);
+        if (warps_per_we == 3) limit = 168;
+        return min_regs <= limit;
+    };
+    if (!configs.has_value() && !dual_vreg_ok(block_m, block_n, warp_m, warp_n, block_k / warp_k)) {
+        struct SpillFreeTile { int bm, bn, bk, wm, wn; };
+        // Measured on ZW-M890P (m >= 1024, k = 4096/7168): 192x128x128/w48x32
+        // 136-150 TF, 256x128x64/w64x32 131-132 TF (spilled default: 10-11 TF).
+        static constexpr SpillFreeTile kSpillFreeTiles[] = {
+            {192, 128, 128, 48, 32},
+            {256, 128, 64, 64, 32},
+        };
+        for (const auto& t : kSpillFreeTiles) {
+            if (!dual_vreg_ok(t.bm, t.bn, t.wm, t.wn, 1))
+                continue;
+            block_m = t.bm; block_n = t.bn; block_k = t.bk;
+            warp_m = t.wm; warp_n = t.wn; warp_k = t.bk;
+            num_stages = 4;  // pruned against the dual-B SMEM budget below
+            num_sms_new = std::min(ceil_div(m, t.bm) * ceil_div(n, t.bn), num_sms);
+            break;
+        }
+    }
+
     // Dual-B shared memory: STAGES * (BLOCK_M + 2*BLOCK_N) * BLOCK_K elements,
     // rounded up to the SharedStorage 128-byte alignment. The tile config came
     // from single-B heuristics, so prune stages until the dual-B footprint fits
