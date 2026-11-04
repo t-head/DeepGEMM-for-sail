@@ -7,18 +7,23 @@ from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
 from setuptools import find_packages
 from torch.utils.cpp_extension import CppExtension, BuildExtension
-import re
 
 
 def get_ppu_sdk_version():
-    # PCH follows the native SDK release, not the API version advertised by a
-    # compatible compiler. Query the compiler belonging to the selected SDK.
+    # Query version macros using the compiler belonging to the selected SDK.
     try:
         compiler = os.path.join(ppu_sdk, 'bin', 'hgcc')
-        output = subprocess.check_output([compiler, '--version'], stderr=subprocess.STDOUT).decode('utf-8')
-        match = re.search(r'Release version (\d+)\.(\d+)\.(\d+)', output)
-        if match:
-            return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        output = subprocess.check_output(
+            [compiler, '-E', '-x', 'cu', '/dev/stdin', '-o', '/dev/stdout'],
+            input=(
+                'PPU_VERSION __HGGCCC_VER_MAJOR__ '
+                '__HGGCCC_VER_MINOR__ __HGGCCC_VER_BUILD__\n'
+            ),
+            text=True,
+            timeout=10,
+        )
+        major, minor, build = map(int, output.rsplit('PPU_VERSION', 1)[1].split())
+        return (major, minor, build)
     except Exception:
         pass
     return (0, 0, 0)
