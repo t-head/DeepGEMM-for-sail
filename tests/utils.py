@@ -1525,8 +1525,127 @@ def test_native_batch_gemm(args):
     print('Passed with acc_check' if check else 'Passed without acc_check')
 
 
+def test_dense_810e_m32_schedules(args):
+    """Check M=32 schedules, graph replay and public dispatch controls on 810E."""
+    import ctypes
+    from pathlib import Path
+    import sys
+    import tempfile
+
+    assert 'ZW810E' in torch.cuda.get_device_name()
+    assert args['m'] == 32 and args['data_type'] == torch.bfloat16
+    compiling = bool(os.environ.get('HGGC_WARM_UP')) or deep_gemm.get_compile_mode() == 1
+    check = get_acc_check() and not compiling
+    m, n, k = args['m'], args['n'], args['k']
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
+    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    reference = gemm_reference(a, b) if check else None
+    saved_sms = deep_gemm.get_num_sms()
+    saved_env = {name: os.environ.get(name) for name in ('show_log', 'DG_810E_DENSE_OPT')}
+    libc = ctypes.CDLL(None)
+
+    def check_output():
+        assert torch.isfinite(out).all(), 'Output contains unwritten or nonfinite elements'
+        relative_l2 = (torch.linalg.vector_norm(out.float() - reference) /
+                       torch.linalg.vector_norm(reference).clamp_min(1e-20)).item()
+        assert relative_l2 < 0.005, f'{m=}, {n=}, {k=}, {relative_l2=}'
+
+    def run(expected, configs=None, tile=None):
+        fn = lambda: deep_gemm.bf16_gemm_nt(a, b, out, configs=configs)
+        # Capture native dispatch diagnostics as well as Python output. Restore the
+        # worker's descriptor even on failure; check-in reuses this process.
+        sys.stdout.flush()
+        libc.fflush(None)
+        saved_stdout = os.dup(1)
+        try:
+            with tempfile.TemporaryFile(mode='w+b') as log:
+                os.dup2(log.fileno(), 1)
+                try:
+                    out.fill_(float('nan'))
+                    fn()
+                    torch.cuda.synchronize()
+                finally:
+                    libc.fflush(None)
+                    os.dup2(saved_stdout, 1)
+                log.seek(0)
+                dispatch = log.read().decode(errors='replace')
+        finally:
+            os.close(saved_stdout)
+        print(dispatch, end='')
+        if expected in ('split', 'tail'):
+            match = re.search(rf'{"split_k" if expected == "split" else "tail_split_k"}:(\d+)', dispatch)
+            assert match and int(match[1]) > 1, dispatch
+            assert 'dense_810e:1' in dispatch, dispatch
+        elif expected == 'mixed':
+            assert 'mixed_range:1' in dispatch, dispatch
+        elif expected == 'single':
+            assert 'single_cycle_unroll:1' in dispatch, dispatch
+        elif expected == 'direct':
+            assert re.search(r'dense_810e:1, split_k:1(?:\n|$)', dispatch), dispatch
+            assert 'tail_split_k:0' in dispatch, dispatch
+        elif expected == 'fallback':
+            assert '[DenseGemm_BF16' in dispatch, dispatch
+            assert all(token not in dispatch for token in (
+                'dense_810e:1', 'mixed_range:1', 'single_cycle_unroll:1')), dispatch
+        else:
+            raise ValueError(f'Unknown expected schedule: {expected}')
+        if tile:
+            assert f'ThreadblockShape[{tile[0]}, {tile[1]}, {tile[2]}]' in dispatch, dispatch
+        if check:
+            check_output()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                fn()
+            for _ in range(2):
+                # Poison after capture so capture-time output cannot pass replay checks.
+                out.fill_(float('nan'))
+                graph.replay()
+                torch.cuda.synchronize()
+                check_output()
+
+    try:
+        os.environ.update(show_log='1', DG_810E_DENSE_OPT='1')
+        deep_gemm.set_num_sms(args.get('num_sms', 20))
+        run(args['expect'], tile=(32, 128, 128) if args.get('lut_child') else None)
+        if args.get('overrides'):
+            for budget in (1, 8, 19):
+                deep_gemm.set_num_sms(budget)
+                run('fallback')
+            deep_gemm.set_num_sms(20)
+            os.environ['DG_810E_DENSE_OPT'] = '0'
+            run('fallback')
+            os.environ['DG_810E_DENSE_OPT'] = '1'
+            run('fallback', configs=(20, 32, 64, 128, 16, 32, 3, SMEM_CONFIG_UNUSED), tile=(32, 64, 128))
+            # Runtime LUTs are loaded once per process. A fresh child isolates the
+            # override and prevents it from affecting subsequent check-in cases.
+            with tempfile.TemporaryDirectory(prefix='deepgemm-810e-lut-') as directory:
+                name = torch.cuda.get_device_name() + '_bf16_densegemm.lut'
+                (Path(directory) / name).write_text(f'{m} {n} {k} 32 128 128 16 32 3\n')
+                env = dict(os.environ, SAIL_DEEPGEMM_LUT_PATH=directory)
+                if compiling:
+                    env['HGGC_WARM_UP'] = '1'
+                spec = (f'DenseGemm,data_type:bf16,m:{m},n:{n},k:{k},device:810e,'
+                        'schedule_check:m32_810e,expect:fallback,lut_child:1')
+                command = [sys.executable, str(Path(__file__).with_name('run_deep_gemm.py')),
+                           '--format', spec, '--require_supported', '--ref_backend', get_ref_backend()]
+                if not check:
+                    command.append('--disable_acc')
+                subprocess.run(command, env=env, check=True, timeout=600)
+    finally:
+        deep_gemm.set_num_sms(saved_sms)
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print('Passed M=32 schedule checks' + (' with eager/graph accuracy' if check else ' without accuracy'))
+
+
 def test_gemm(args) -> None:
     print('Testing GEMM:')
+    if args.get('schedule_check') == 'm32_810e':
+        return test_dense_810e_m32_schedules(args)
     m, n, k, d = args['m'], args['n'], args['k'], args["data_type"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     print(f"test_gemm->test_func: DenseGemm,m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")

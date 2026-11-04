@@ -3,6 +3,8 @@
 #include <torch/python.h>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <type_traits>
 #include <hggc_fp8.h>
 #include "cute/tensor.hpp"
@@ -976,46 +978,82 @@ static bool try_dense810e_mixed_ranges(const BF16GemmCutlass3Runtime::GemmArgume
         device_runtime->get_prop()->sharedMemPerMultiprocessor < WideSmem)
         return false;
 
+    // Use the same geometry predicate for conservative prechecks and exact occupancy.
+    const int64_t wide_tiles = (int64_t(n) + WideN - 1) / WideN;
+    auto select_ranges = [&](int wide_resident, int narrow_resident) -> std::pair<int, int> {
+        if (wide_resident <= 0 || narrow_resident <= wide_resident)
+            return {0, 0};
+        const int64_t wave = int64_t(scheduling_cus) * wide_resident;
+        const int64_t tail = wide_tiles % wave;
+        // Complement the <=W/2 split-tail rule with W/2 < tail <= 3W/4.
+        if (wide_tiles < wave || 2 * tail <= wave || 4 * tail > 3 * wave)
+            return {0, 0};
+        const int body = int(wide_tiles - tail);
+        const int tail_tiles = (n - body * WideN + NarrowN - 1) / NarrowN;
+        return body > 0 && tail_tiles > 0 && tail_tiles <= int64_t(scheduling_cus) * narrow_resident
+                   ? std::make_pair(body, tail_tiles) : std::make_pair(0, 0);
+    };
+    // Shared memory gives upper bounds, not actual residency. Reject only if no
+    // possible wide residency can satisfy the predicate, even at maximum narrow residency.
+    const auto smem_per_cu = device_runtime->get_prop()->sharedMemPerMultiprocessor;
+    const int max_wide = smem_per_cu / WideSmem, max_narrow = smem_per_cu / NarrowSmem;
+    bool possible = false;
+    for (int resident = 1; resident <= max_wide && !possible; ++resident)
+        possible = select_ranges(resident, max_narrow).first > 0;
+    if (!possible)
+        return false;
+
+    // The two fixed tile variants use runtime N/K. Cache only immutable kernels
+    // and measured residency, never tensor pointers or per-call launch arguments.
+    struct Ranges {
+        std::shared_ptr<KernelRuntime> wide, narrow;
+        int wide_resident, narrow_resident;
+    };
+    static std::mutex cache_mutex;
+    static std::map<std::pair<int, uintptr_t>, Ranges> cache;
+    int device;
+    HGcontext context;
+    DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device));
+    DG_HGGC_DRIVER_CHECK(hgCtxGetCurrent(&context));
+    const auto key = std::make_pair(device, reinterpret_cast<uintptr_t>(context));
+
     // No extra K-warps are used: each JIT TiledMma is WM16/WN32/WK128.
     // Convert the original GemmKernel ABI before repurposing the unused field,
     // avoiding to_underlying_arguments_rtc's cu_count==0 hardware-query branch.
     const auto params = BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
-    auto prepare_range = [&](int bn, int threads, int smem, const std::string& name) {
+    auto make_args = [&](int bn, int threads, int smem, const std::string& name) {
         auto args = BF16GemmCutlass3Runtime::Args{
             .launch_info = {32, bn, BlockK, 16, 32, 1, Stages, "Normal", "Default", name, false, true},
             .launch_args = {dim3(1, 1, 1), dim3(threads, 1, 1), smem},
             .kernel_params = params};
         args.launch_info.dense_810e_static_splits = 1;
         args.launch_info.dense_810e_range = true;
-        // Reuse the established mainloop and its parameter ABI.
-        const auto code = BF16GemmCutlass3Runtime::generate(args);
-        auto runtime = compiler->build(name, code);
-        int resident = 0;
-        DG_HGGC_DRIVER_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&resident, runtime->kernel, threads, smem));
-        return std::make_tuple(args, runtime, resident);
+        return args;
     };
-    auto [wide, wide_runtime, wide_resident] =
-        prepare_range(WideN, WideThreads, WideSmem, "bf16_dense_810e_range_wide");
-    auto [narrow, narrow_runtime, narrow_resident] =
-        prepare_range(NarrowN, NarrowThreads, NarrowSmem, "bf16_dense_810e_range_narrow");
-    if (wide_resident <= 0 || narrow_resident <= wide_resident)
+    const auto ranges = [&] {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        if (const auto it = cache.find(key); it != cache.end())
+            return it->second;
+        auto prepare = [&](int bn, int threads, int smem, const std::string& name, int& resident) {
+            const auto args = make_args(bn, threads, smem, name);
+            auto runtime = compiler->build(name, BF16GemmCutlass3Runtime::generate(args));
+            DG_HGGC_DRIVER_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&resident, runtime->kernel, threads, smem));
+            return runtime;
+        };
+        Ranges value{};
+        value.wide = prepare(WideN, WideThreads, WideSmem, "bf16_dense_810e_range_wide", value.wide_resident);
+        value.narrow = prepare(NarrowN, NarrowThreads, NarrowSmem, "bf16_dense_810e_range_narrow", value.narrow_resident);
+        cache.emplace(key, value);
+        return value;
+    }();
+    const auto [body, tail_tiles] = select_ranges(ranges.wide_resident, ranges.narrow_resident);
+    if (body == 0)
         return false;
+    const auto& [wide_runtime, narrow_runtime, wide_resident, narrow_resident] = ranges;
     const int64_t wide_wave = int64_t(scheduling_cus) * wide_resident;
     const int64_t narrow_wave = int64_t(scheduling_cus) * narrow_resident;
-    const int64_t wide_tiles = (int64_t(n) + WideN - 1) / WideN;
-    if (wide_tiles < wide_wave)
-        return false;
-    const int64_t tail = wide_tiles % wide_wave;
-    // Target the middle-size incomplete wave: W/2 < tail <= 3W/4.
-    // This complements the <=W/2 split-tail rule without replacing it.
-    if (2 * tail <= wide_wave || 4 * tail > 3 * wide_wave)
-        return false;
-    const int body = int(wide_tiles - tail);
-    const int tail_cols = n - body * WideN;
-    const int tail_tiles = (tail_cols + NarrowN - 1) / NarrowN;
-    if (body <= 0 || tail_tiles <= 0 || tail_tiles > narrow_wave)
-        return false;
-
+    auto wide = make_args(WideN, WideThreads, WideSmem, "bf16_dense_810e_range_wide");
+    auto narrow = make_args(NarrowN, NarrowThreads, NarrowSmem, "bf16_dense_810e_range_narrow");
     wide.launch_args.grid_dim = dim3(body, 1, 1);
     narrow.launch_args.grid_dim = dim3(tail_tiles, 1, 1);
     // Exclusive contract of Dense810eRangeKernel: this existing ABI field is an
@@ -1097,7 +1135,8 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
     // the underfilled grid or one resident tail wave; large outputs stay on
     // the existing path rather than overflowing the direct-store index.
     const bool specialized_domain =
-        enable810e && !configs.has_value() && !from_runtime_lut && m == 32 && n > 0 && n % 16 == 0 && k > 0 &&
+        // Preserve reduced CU budgets with the existing persistent scheduler.
+        enable810e && num_sms >= 20 && !configs.has_value() && !from_runtime_lut && m == 32 && n > 0 && n % 16 == 0 && k > 0 &&
         k % 128 == 0 && int64_t(m) * n <= std::numeric_limits<int>::max() &&
         reinterpret_cast<uintptr_t>(lhs.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(rhs.data_ptr()) % 16 == 0;
     const int pipeline810e =
