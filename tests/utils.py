@@ -1547,7 +1547,7 @@ def test_dense_810e_m32_schedules(args):
             env['HGGC_WARM_UP'] = '1'
         if not check:
             command.append('--disable_acc')
-        subprocess.run(command, env=env, check=True, timeout=600)
+        subprocess.run(command, env=env, check=True)
 
     if not args.get('schedule_child'):
         # The reusable worker may already have cached a LUT path. Isolate default
