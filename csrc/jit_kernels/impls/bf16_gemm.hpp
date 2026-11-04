@@ -2,6 +2,7 @@
 
 #include <torch/python.h>
 #include <cstdint>
+#include <cstddef>
 #include <limits>
 #include <type_traits>
 #include <hggc_fp8.h>
@@ -73,6 +74,10 @@ public:
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         std::string gemm_type, kernel_strategy, kernel_name;
         bool enable_sbo_overlap;
+        bool with_c = false;
+        bool allow_tsm_epilogue = true;
+        bool vectorized_c = false;
+        bool register_c = false;
     };
 
     struct GemmArguments {
@@ -121,7 +126,8 @@ public:
         GemmKernelParams kernel_params;
     };
 
-    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace) {
+    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace,
+                                                       bool with_c = false, bool allow_tsm_epilogue = true) {
         auto problem_shape = args.problem_shape;
         auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
         // Get SM count if needed, otherwise use user supplied SM count
@@ -137,13 +143,16 @@ public:
 
         cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
 
-        // Both epilogues only convert the accumulator; enforce the {alpha=1, beta=0} contract.
+        // The epilogue is specialized for either Acc or Acc + C. Other callers
+        // retain the original overwrite contract by default.
         DG_HOST_ASSERT(args.epilogueargs.callback.alpha == 1.0f && args.epilogueargs.callback.alpha_ptr == nullptr &&
-                       args.epilogueargs.callback.beta == 0.0f && args.epilogueargs.callback.beta_ptr == nullptr);
+                       args.epilogueargs.callback.beta == (with_c ? 1.0f : 0.0f) &&
+                       args.epilogueargs.callback.beta_ptr == nullptr);
+        DG_HOST_ASSERT(!with_c || args.epilogueargs.ptr_C != nullptr);
 
         // Same decision source as the injected kWithTsmEpilogue; must match the device compile.
         // Initialize the selected union member directly to start its lifetime.
-        if (is_ppu1v5_device()) {
+        if (is_ppu1v5_device() || !allow_tsm_epilogue) {
             return KernelParams{.no_tsm = GemmKernelParamsT<EpilogueParamNoTsm>{
                 args.mode, problem_shape, args.mainloopargs, args.epilogueargs,
                 hw_info, args.scheduler, workspace, args.signal}};
@@ -162,20 +171,22 @@ public:
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
         // One snapshot drives both the union member read and the injected epilogue flag.
-        const bool is_ppu1v5 = is_ppu1v5_device();
+        const bool with_tsm_epilogue = !is_ppu1v5_device() && args.launch_info.allow_tsm_epilogue;
         // Read the common head (mode/problem_shape/mainloop) through the matching member.
-        const GemmProblemSize problem_shape = is_ppu1v5 ? args.kernel_params.no_tsm.problem_shape
-                                                        : args.kernel_params.with_tsm.problem_shape;
-        // Injected into the generated source; same source as to_underlying_arguments_rtc.
-        const bool with_tsm_epilogue = not is_ppu1v5;
+        const GemmProblemSize problem_shape = with_tsm_epilogue ? args.kernel_params.with_tsm.problem_shape
+                                                               : args.kernel_params.no_tsm.problem_shape;
         // sizeof of what the driver copies; the device asserts it equals its own Params size.
         const auto host_params_size = with_tsm_epilogue ? sizeof(args.kernel_params.with_tsm)
                                                         : sizeof(args.kernel_params.no_tsm);
+        const auto epilogue_size = with_tsm_epilogue ? sizeof(EpilogueParamWithTsm) : sizeof(EpilogueParamNoTsm);
+        const auto epilogue_align = with_tsm_epilogue ? alignof(EpilogueParamWithTsm) : alignof(EpilogueParamNoTsm);
         return fmt::format(
             R"(
 #define BF16_HGRTC
 #include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
+#include <deep_gemm/epilogue/bf16_add_c.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
+#include <cstddef>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
@@ -199,10 +210,12 @@ constexpr int STAGES = {8};
 static constexpr GemmType kGemmType = GemmType::{9};
 static constexpr KernelStrategy kKernelStrategy = KernelStrategy::{10}; //Default;
 static constexpr bool kEnableSboOverlap = {11};// false;
+static constexpr bool kWithC = {19};
+static constexpr bool kRegisterC = {29};
 
 using ElementA    = cutlass::bfloat16_t;
 using ElementB    = cutlass::bfloat16_t;
-using ElementC    = {19};
+using ElementC    = {28};
 using LayoutA     = cutlass::layout::RowMajor;
 using LayoutB     = cutlass::layout::ColumnMajor;
 using LayoutC     = cutlass::layout::RowMajor;
@@ -280,19 +293,33 @@ using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
 
 // Epilogue
 static constexpr bool IsAlignedN = SHAPE_N % BLOCK_N == 0 ? true : false;
-using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
+static constexpr bool kVectorizedC = {27};
+using OverwriteEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
     cutlass::detail::TagToStrideA_t<LayoutC>,
     cutlass::detail::TagToStrideA_t<LayoutC>,
     cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
     cutlass::gemm::EpilogueDefault,
     IsAlignedN>;
+using AddCEpilogue_noTsm = deep_gemm::Bf16AddCEpilogueNoTsm<
+    cutlass::detail::TagToStrideA_t<LayoutC>,
+    cutlass::detail::TagToStrideA_t<LayoutC>,
+    cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
+    cutlass::gemm::EpilogueDefault,
+    IsAlignedN, kVectorizedC, kRegisterC>;
+using CollectiveEpilogue_noTsm = cute::conditional_t<kWithC, AddCEpilogue_noTsm, OverwriteEpilogue_noTsm>;
 
 // TSM epilogue for alpha=1, beta=0;
 static constexpr int AlignmentC = 16 / sizeof(ElementC);
-using DefaultOperation = cutlass::epilogue::fusion::PPUEVT<
+using OverwriteOperation = cutlass::epilogue::fusion::PPUEVT<
     cutlass::epilogue::fusion::PPUCompute<cutlass::epilogue::thread::Identity, ElementD, ElementCompute,
                                        cutlass::FloatRoundStyle::round_to_nearest>,
     cutlass::epilogue::fusion::PPUAccFetch>;
+using AddCOperation = cutlass::epilogue::fusion::PPUEVT<
+    cutlass::epilogue::fusion::PPUCompute<cutlass::plus, ElementD, ElementCompute,
+                                       cutlass::FloatRoundStyle::round_to_nearest>,
+    cutlass::epilogue::fusion::PPUAccFetch,
+    cutlass::epilogue::fusion::PPUSrcFetch<ElementC>>;
+using DefaultOperation = cute::conditional_t<kWithC, AddCOperation, OverwriteOperation>;
 using EpilogueSchedule = typename cutlass::epilogue::EpilogueSimtVectorized;
 using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, cutlass::arch::OpClassTensorOp,
@@ -321,8 +348,23 @@ using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
     TileScheduler,
     kEnableSboOverlap>;
 
+static_assert(!kRegisterC || (kWithC && kVectorizedC && !kWithTsmEpilogue &&
+    cute::is_same_v<ArchTag, cutlass::arch::PPU0015> && kGemmType == GemmType::MGroupedContiguous &&
+    kKernelStrategy == KernelStrategy::Default &&
+    STAGES >= 2 && SHAPE_K % BLOCK_K == 0 && SHAPE_K / BLOCK_K >= STAGES),
+    "invalid register C prefetch or mainloop pipeline");
+static_assert(!kRegisterC || GemmKernel::SharedStorageSize == {30},
+    "register C kernel storage must match the A/B pipeline allocation");
+
 // Host/device Params ABI check (the driver copies sizeof(device Params) bytes from the host struct).
 static_assert(sizeof(GemmKernel::Params) == {18}, "host/device kernel Params size mismatch");
+// Both fixed EVT trees have no scalar state. Check the pointer/stride ABI as
+// well as the total size; sizeof alone cannot detect misplaced members.
+using EpiParams = typename CollectiveEpilogue::Params;
+static_assert(sizeof(EpiParams) == {20} && alignof(EpiParams) == {21}, "epilogue Params layout mismatch");
+static_assert(offsetof(EpiParams, ptr_C) == {22} && offsetof(EpiParams, dC) == {23}, "epilogue C offset mismatch");
+static_assert(offsetof(EpiParams, ptr_D) == {24} && offsetof(EpiParams, dD) == {25}, "epilogue D offset mismatch");
+static_assert(offsetof(GemmKernel::Params, epilogue) == {26}, "kernel epilogue offset mismatch");
 
 // Derive MinBlocksPerMultiprocessor from GemmOccModel with device hardware
 // constants injected by the host-side query (see kHw* above).
@@ -347,8 +389,16 @@ __global__ void {12}(
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
-            with_tsm_epilogue, host_params_size,
-            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t");
+            with_tsm_epilogue, host_params_size, args.launch_info.with_c, epilogue_size, epilogue_align,
+            with_tsm_epilogue ? offsetof(EpilogueParamWithTsm, ptr_C) : offsetof(EpilogueParamNoTsm, ptr_C),
+            with_tsm_epilogue ? offsetof(EpilogueParamWithTsm, stride_C) : offsetof(EpilogueParamNoTsm, stride_C),
+            with_tsm_epilogue ? offsetof(EpilogueParamWithTsm, ptr_D) : offsetof(EpilogueParamNoTsm, ptr_D),
+            with_tsm_epilogue ? offsetof(EpilogueParamWithTsm, stride_D) : offsetof(EpilogueParamNoTsm, stride_D),
+            with_tsm_epilogue ? offsetof(GemmKernelParamsT<EpilogueParamWithTsm>, collective_epilogue_params)
+                              : offsetof(GemmKernelParamsT<EpilogueParamNoTsm>, collective_epilogue_params),
+            args.launch_info.vectorized_c,
+            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t",
+            args.launch_info.register_c, args.launch_info.register_c ? args.launch_args.smem_size : 0);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

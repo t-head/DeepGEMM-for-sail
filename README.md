@@ -127,6 +127,8 @@ For training forward passes or inference prefilling, where each expert may proce
 
 For more information, please refer to the `m_grouped_gemm_fp8_fp8_bf16_nt_contiguous` function documentation.
 
+For BF16 contiguous grouped GEMM, `deep_gemm.m_grouped_bf16_gemm_nt_contiguous` optionally accepts a `c` tensor to compute `D_g = A_g @ B_g.T + C_g` for each group. The default `c=None` preserves the original overwrite behavior; pass `c=d` to accumulate into the existing output in place. `c` must be a contiguous BF16 tensor with the same shape and device as `d`. Exact aliasing with `d` is supported, while partial overlap is rejected. The addition is fused into the epilogue and performed in FP32 before a single BF16 output conversion.
+
 #### Grouped GEMMs (nopad layout)
 
 We provide a new Grouped GEMM mode, namely the nopad layout. When the number of tokens processed by each expert varies, by providing an index tensor that stores the token count for different experts, there is no need to align to the GEMM M block size, reducing unnecessary data movement.
