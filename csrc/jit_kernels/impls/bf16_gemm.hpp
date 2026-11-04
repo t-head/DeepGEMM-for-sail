@@ -72,6 +72,12 @@ public:
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         std::string gemm_type, kernel_strategy, kernel_name;
         bool enable_sbo_overlap;
+        bool dense_810e = false;
+        int dense_810e_static_splits = 0;
+        int dense_810e_tail_splits = 0;
+        int dense_810e_tail_wave = 0;
+        bool dense_810e_range = false;
+        bool single_cycle_unroll = false;
     };
 
     struct GemmArguments {
@@ -170,10 +176,26 @@ public:
         // sizeof of what the driver copies; the device asserts it equals its own Params size.
         const auto host_params_size = with_tsm_epilogue ? sizeof(args.kernel_params.with_tsm)
                                                         : sizeof(args.kernel_params.no_tsm);
+        // Every variant uses the same headers, as required by the shared
+        // LaunchRuntime include-hash cache.
+        std::string kernel_body = "  GemmKernel op;\n  op(params, smem);";
+        if (args.launch_info.dense_810e_range) {
+            kernel_body = "  Dense810eRangeKernel<CollectiveMainloop> op;\n  op(params, smem);";
+        } else if (args.launch_info.dense_810e) {
+            if (args.launch_info.dense_810e_tail_splits > 0) {
+                kernel_body = fmt::format(
+                    "  Dense810eTailKernel<CollectiveMainloop, {}, {}> op;\n  op(params, smem);",
+                    args.launch_info.dense_810e_tail_splits, args.launch_info.dense_810e_tail_wave);
+            } else {
+                kernel_body = fmt::format(
+                    "  Dense810eKernel<CollectiveMainloop, {}> op;\n  op(params, smem);",
+                    args.launch_info.dense_810e_static_splits);
+            }
+        }
         return fmt::format(
             R"(
 #define BF16_HGRTC
-#include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
+{21}#include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
@@ -336,18 +358,19 @@ __global__ void {12}(
   typename GemmKernel::Params params
 ) {{
   extern __shared__ char smem[];
-  GemmKernel op;
-  op(params, smem);
+{20}
 }}
 }}
 )",
-            cute::get<1>(problem_shape), cute::get<2>(problem_shape),
+            args.launch_info.dense_810e ? 128 : cute::get<1>(problem_shape),
+            args.launch_info.dense_810e ? 128 : cute::get<2>(problem_shape),
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
             with_tsm_epilogue, host_params_size,
-            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t");
+            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t", kernel_body,
+            args.launch_info.single_cycle_unroll ? "#define DG_BF16_SINGLE_CYCLE_UNROLL\n" : "");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -858,17 +881,199 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
     return true;
 }
 
+class Dense810eReduceRuntime final : public LaunchRuntime<Dense810eReduceRuntime> {
+  public:
+    struct Params {
+        const float* partial;
+        void* output;
+        int count;
+        int splits;
+    };
+    struct Args {
+        LaunchArgs launch_args;
+        Params kernel_params;
+    };
+    static std::string generate_impl(const Args&) {
+        return R"(
+#include <cutlass/bfloat16.h>
+struct Dense810eReduceParams { const float* partial; void* output; int count; int splits; };
+extern "C" __global__ void bf16_dense_810e_reduce(Dense810eReduceParams p) {
+    const int i = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
+    if (i < p.count) {
+        float value = 0.0f;
+        for (int s = 0; s < p.splits; ++s) value += p.partial[s * p.count + i];
+        static_cast<cutlass::bfloat16_t*>(p.output)[i] = cutlass::bfloat16_t(value);
+    }
+}
+)";
+    }
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    }
+};
+
+static void reduce_dense810e(const torch::Tensor& workspace, const torch::Tensor& out, int count, int splits) {
+    Dense810eReduceRuntime::Args args{{dim3(ceil_div(count, 256)), dim3(256), 0},
+                                      {workspace.data_ptr<float>(), out.data_ptr(), count, splits}};
+    auto code = Dense810eReduceRuntime::generate(args);
+    auto runtime = compiler->build("bf16_dense_810e_reduce", code);
+    Dense810eReduceRuntime::launch(runtime, args);
+}
+
+class Dense810eTailReduceRuntime final : public LaunchRuntime<Dense810eTailReduceRuntime> {
+  public:
+    struct Params {
+        const float* partial;
+        void* output;
+        int count;
+        int splits;
+        int tail_n;
+        int n;
+    };
+    struct Args {
+        LaunchArgs launch_args;
+        Params kernel_params;
+    };
+    static std::string generate_impl(const Args&) {
+        return R"(
+#include <cutlass/bfloat16.h>
+struct Dense810eTailReduceParams { const float* partial; void* output; int count; int splits; int tail_n; int n; };
+extern "C" __global__ void bf16_dense_810e_tail_reduce(Dense810eTailReduceParams p) {
+    const int i = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
+    if (i < p.count) {
+        float value = 0.0f;
+        for (int s = 0; s < p.splits; ++s) value += p.partial[s * p.count + i];
+        static_cast<cutlass::bfloat16_t*>(p.output)[(i/p.tail_n)*p.n+(p.n-p.tail_n)+(i%p.tail_n)] = cutlass::bfloat16_t(value);
+    }
+}
+)";
+    }
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    }
+};
+
+static void reduce_dense810e_tail(const torch::Tensor& workspace, const torch::Tensor& out, int count, int splits,
+                                  int tail_n, int n) {
+    Dense810eTailReduceRuntime::Args args{{dim3(ceil_div(count, 256)), dim3(256), 0},
+                                          {workspace.data_ptr<float>(), out.data_ptr(), count, splits, tail_n, n}};
+    auto code = Dense810eTailReduceRuntime::generate(args);
+    auto runtime = compiler->build("bf16_dense_810e_tail_reduce", code);
+    Dense810eTailReduceRuntime::launch(runtime, args);
+}
+
+// Resource-based mixed output ranges. Every guard and occupancy check finishes before
+// the first launch. A false return means the caller executes the prior path unchanged.
+static bool try_dense810e_mixed_ranges(const BF16GemmCutlass3Runtime::GemmArguments& gemm_args, int m, int n, int k,
+                                       int scheduling_cus) {
+    constexpr int WideN = 128, NarrowN = 64, BlockK = 128, Stages = 3;
+    constexpr int WideThreads = 256, NarrowThreads = 128;
+    constexpr int WideSmem = (32 + WideN) * BlockK * 2 * Stages;
+    constexpr int NarrowSmem = (32 + NarrowN) * BlockK * 2 * Stages;
+    static_assert(WideSmem == 120 * 1024 && NarrowSmem == 72 * 1024);
+    if (m != 32 || n <= 0 || n % 16 || k <= 0 || k % BlockK || k / BlockK < 64 || scheduling_cus <= 0 ||
+        scheduling_cus > device_runtime->get_prop()->multiProcessorCount ||
+        device_runtime->get_prop()->sharedMemPerMultiprocessor < WideSmem)
+        return false;
+
+    // No extra K-warps are used: each JIT TiledMma is WM16/WN32/WK128.
+    // Convert the original GemmKernel ABI before repurposing the unused field,
+    // avoiding to_underlying_arguments_rtc's cu_count==0 hardware-query branch.
+    const auto params = BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+    auto prepare_range = [&](int bn, int threads, int smem, const std::string& name) {
+        auto args = BF16GemmCutlass3Runtime::Args{
+            .launch_info = {32, bn, BlockK, 16, 32, 1, Stages, "Normal", "Default", name, false, true},
+            .launch_args = {dim3(1, 1, 1), dim3(threads, 1, 1), smem},
+            .kernel_params = params};
+        args.launch_info.dense_810e_static_splits = 1;
+        args.launch_info.dense_810e_range = true;
+        // Reuse the established mainloop and its parameter ABI.
+        const auto code = BF16GemmCutlass3Runtime::generate(args);
+        auto runtime = compiler->build(name, code);
+        int resident = 0;
+        DG_HGGC_DRIVER_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&resident, runtime->kernel, threads, smem));
+        return std::make_tuple(args, runtime, resident);
+    };
+    auto [wide, wide_runtime, wide_resident] =
+        prepare_range(WideN, WideThreads, WideSmem, "bf16_dense_810e_range_wide");
+    auto [narrow, narrow_runtime, narrow_resident] =
+        prepare_range(NarrowN, NarrowThreads, NarrowSmem, "bf16_dense_810e_range_narrow");
+    if (wide_resident <= 0 || narrow_resident <= wide_resident)
+        return false;
+    const int64_t wide_wave = int64_t(scheduling_cus) * wide_resident;
+    const int64_t narrow_wave = int64_t(scheduling_cus) * narrow_resident;
+    const int64_t wide_tiles = (int64_t(n) + WideN - 1) / WideN;
+    if (wide_tiles < wide_wave)
+        return false;
+    const int64_t tail = wide_tiles % wide_wave;
+    // Target the middle-size incomplete wave: W/2 < tail <= 3W/4.
+    // This complements the <=W/2 split-tail rule without replacing it.
+    if (2 * tail <= wide_wave || 4 * tail > 3 * wide_wave)
+        return false;
+    const int body = int(wide_tiles - tail);
+    const int tail_cols = n - body * WideN;
+    const int tail_tiles = (tail_cols + NarrowN - 1) / NarrowN;
+    if (body <= 0 || tail_tiles <= 0 || tail_tiles > narrow_wave)
+        return false;
+
+    wide.launch_args.grid_dim = dim3(body, 1, 1);
+    narrow.launch_args.grid_dim = dim3(tail_tiles, 1, 1);
+    // Exclusive contract of Dense810eRangeKernel: this existing ABI field is an
+    // N tile origin, NOT a CU count. p.mainloop, p.epilogue and shape are intact.
+    // Match to_underlying_arguments_rtc's active union member, including
+    // architecture aliases; do not infer the member from the platform name.
+    if (is_ppu1v5_device()) {
+        wide.kernel_params.no_tsm.hw_info.cu_count = 0;
+        narrow.kernel_params.no_tsm.hw_info.cu_count = 2 * body;
+    } else {
+        wide.kernel_params.with_tsm.hw_info.cu_count = 0;
+        narrow.kernel_params.with_tsm.hw_info.cu_count = 2 * body;
+    }
+
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_params(GemmType::Normal, false, std::string("bf16"), 1, m, n, k, 0, nullptr,
+                                  current_stream());
+    }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    // Both launches are ordered on current_stream(); no allocation, cross-CTA
+    // synchronization or reduction. Neither launch is omitted from profiling.
+    BF16GemmCutlass3Runtime::launch(wide_runtime, wide);
+    BF16GemmCutlass3Runtime::launch(narrow_runtime, narrow);
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+    const char* show = std::getenv("show_log");
+    if (show && isdigit(*show)) {
+        printf("[DenseGemm_BF16_MixedRange:]\n");
+        printf("group:1, problem:[%d, %d, %d]\n", m, n, k);
+        printf("mixed_range:1, body_wide_tiles:%d, tail_narrow_tiles:%d, first_narrow_tile:%d\n", body, tail_tiles,
+               2 * body);
+        printf("wide_wave:%lld, narrow_wave:%lld, wide_resident:%d, narrow_resident:%d\n",
+               static_cast<long long>(wide_wave), static_cast<long long>(narrow_wave), wide_resident, narrow_resident);
+        printf("wide_shape:[32,128,128], warp:[16,32,128], stages:3, threads:%d, smem:%d\n", WideThreads, WideSmem);
+        printf("narrow_shape:[32,64,128], warp:[16,32,128], stages:3, threads:%d, smem:%d\n", NarrowThreads,
+               NarrowSmem);
+    }
+    return true;
+}
+
 // 8-element public boundary ConfigTuple (matches Python/vLLM stable contract).
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 template <typename ElementOutput>
 static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out, const int& m,
                            const int& n, const int& k, std::optional<ConfigTuple> configs = std::nullopt) {
     int num_sms = get_num_sms();
+    const bool is_810e = std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
+    // The production switch has only on/off semantics. Explicit configurations
+    // and runtime LUT hits retain the selected implementation.
+    const bool enable810e = is_810e && std::is_same_v<ElementOutput, cutlass::bfloat16_t> &&
+                            get_env<int>("DG_810E_DENSE_OPT", 1) != 0;
     static constexpr GemmType kGemmType = GemmType::Normal;
 
     using Config = std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 
     Config cfg;
+    bool from_runtime_lut = false;
     if (configs.has_value()) {
         // Explicit config path: unpack the 8-element public tuple; force warp_k = block_k
         // (mirrors deep_gemm/jit_kernels/gemm.py lines 406-408/422;
@@ -877,7 +1082,6 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, /*warp_k=*/bk, nst,
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
     } else {
-        bool from_runtime_lut = false;
         auto best = deep_gemm_bf16_common::get_best_configs(
             m, n, k, 1, num_sms, kGemmType, 256, &from_runtime_lut);
         auto [ns, bm, bn, bk, wm, wn, nst, sc] = best;
@@ -889,6 +1093,76 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, warp_k, nst, sc);
     }
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages, smem_config] = cfg;
+    // Dense kernels use 32-bit output indices. Split workspaces are bounded by
+    // the underfilled grid or one resident tail wave; large outputs stay on
+    // the existing path rather than overflowing the direct-store index.
+    const bool specialized_domain =
+        enable810e && !configs.has_value() && !from_runtime_lut && m == 32 && n > 0 && n % 16 == 0 && k > 0 &&
+        k % 128 == 0 && int64_t(m) * n <= std::numeric_limits<int>::max() &&
+        reinterpret_cast<uintptr_t>(lhs.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(rhs.data_ptr()) % 16 == 0;
+    const int pipeline810e =
+        specialized_domain
+            ? deep_gemm_810e::select_dense_pipeline(
+                  m, n, k, block_m, block_n, device_runtime->get_prop()->multiProcessorCount,
+                  device_runtime->get_l2_cache_size(), device_runtime->get_prop()->sharedMemPerMultiprocessor,
+                  num_sms_new, std::get<0>(smem_config))
+            : 0;
+    bool dense810e = specialized_domain &&
+                     (pipeline810e != 0 ||
+                      deep_gemm_810e::use_narrow_or_streaming_pipeline(
+                          m, n, k, block_m, block_n, device_runtime->get_prop()->multiProcessorCount,
+                          device_runtime->get_l2_cache_size(), device_runtime->get_prop()->sharedMemPerMultiprocessor,
+                          num_sms_new, std::get<0>(smem_config)));
+    if (dense810e) {
+        block_m = 32;
+        block_n = 64;
+        block_k = 128;
+        warp_m = 16;
+        warp_n = 32;
+        num_stages = 3;
+        if (pipeline810e == 1) {
+            block_k = 64;
+            num_stages = 4;
+        } else if (pipeline810e != 0) {
+            block_n = 128;
+        }
+        num_sms_new =
+            std::min<int>(device_runtime->get_prop()->multiProcessorCount, ceil_div(m, block_m) * ceil_div(n, block_n));
+        smem_config = deep_gemm_bf16_common::get_smem_config(num_stages, k, block_m, block_n, block_k);
+    }
+    const int refinement810e =
+        specialized_domain
+            ? deep_gemm_810e::select_dense_refinement(m, n, k, dense810e, block_m, block_n, block_k, num_sms,
+                                                      int(device_runtime->get_prop()->sharedMemPerMultiprocessor))
+            : 0;
+    if (refinement810e > 0) {
+        dense810e = true;
+        block_m = 32;
+        block_n = refinement810e == 1 ? 64 : 128;
+        block_k = 128;
+        warp_m = 16;
+        warp_n = 32;
+        num_stages = 3;
+        num_sms_new = std::min<int>(device_runtime->get_prop()->multiProcessorCount, ceil_div(n, block_n));
+        smem_config = deep_gemm_bf16_common::get_smem_config(num_stages, k, block_m, block_n, block_k);
+    }
+    const bool legacy_unsplit =
+        specialized_domain &&
+        deep_gemm_810e::use_legacy_unsplit(m, n, k, dense810e, block_m, block_n, block_k, warp_m, warp_n, num_stages,
+                                           device_runtime->get_prop()->multiProcessorCount, num_sms,
+                                           int(device_runtime->get_prop()->sharedMemPerMultiprocessor));
+    if (legacy_unsplit) {
+        dense810e = false;
+        warp_m = 32;
+        warp_n = 32;
+        warp_k = 128;
+        num_sms_new = num_sms;
+        smem_config = deep_gemm_bf16_common::get_smem_config(num_stages, k, block_m, block_n, block_k);
+    }
+    // Preserve the legacy tile, warp, grid and epilogue choices. Only one
+    // complete two-stage fill/drain cycle has validated unrolling gains.
+    const bool single_cycle_unroll = specialized_domain && num_sms == 20 && !dense810e && block_m == 32 &&
+                                     block_k > 0 && num_stages == 2 && k % block_k == 0 && k / block_k == num_stages;
     auto SMSIZE = std::get<0>(smem_config);
 
     int kNumGroups = 1;
@@ -1129,6 +1403,25 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             }
         }
     } else {
+        int splits = 1;
+        const int tiles = ceil_div(m, block_m) * ceil_div(n, block_n);
+        if (dense810e)
+            splits = deep_gemm_810e::split_count(tiles, k, block_k, device_runtime->get_prop()->multiProcessorCount);
+        if (refinement810e == 1)
+            splits = 1;
+        int tail_wave = 0;
+        const int tail_splits =
+            dense810e ? deep_gemm_810e::tail_split_count(m, n, k, block_m, block_n, block_k, splits, num_sms,
+                                                         int(device_runtime->get_prop()->sharedMemPerMultiprocessor),
+                                                         int(SMSIZE), tail_wave)
+                      : 0;
+        const int full_tiles = tail_splits > 0 ? (tiles / tail_wave) * tail_wave : tiles;
+        const int tail_n = tail_splits > 0 ? n - full_tiles * block_n : 0;
+        torch::Tensor workspace;
+        if (tail_splits > 0)
+            workspace = torch::empty({int64_t(tail_splits) * m * tail_n}, lhs.options().dtype(torch::kFloat32));
+        if (dense810e && splits > 1)
+            workspace = torch::empty({int64_t(splits) * m * n}, lhs.options().dtype(torch::kFloat32));
         // Keep input/mainloop configuration unchanged and specialize only the epilogue.
         auto launch = [&](auto* output) {
             using OutputType = std::remove_pointer_t<decltype(output)>;
@@ -1138,7 +1431,7 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             const int smem_size = std::max(SMSIZE, int(block_m * block_n * sizeof(OutputType)));
             const auto gemm_args = typename Runtime::GemmArguments{
                 .mode = cutlass::gemm::GemmUniversalMode::kGemm,
-                .problem_shape = {m, n, k, 1},
+                .problem_shape = {m, n, k, splits},
                 .mainloopargs = {input_a, stride_A, input_b, stride_B},
                 .epilogueargs =
                     {
@@ -1152,20 +1445,39 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
                 .scheduler = {(uint32_t)m, layout_info},
                 .signal = nullptr};
 
-            auto params = Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+            if constexpr (std::is_same_v<OutputType, cutlass::bfloat16_t>) {
+                // Restrict mixed ranges to the existing BN64 long-K path.
+                if (specialized_domain && dense810e && block_n == 64 && block_k == 128 && splits == 1 &&
+                    tail_splits == 0 && try_dense810e_mixed_ranges(gemm_args, m, n, k, num_sms))
+                    return;
+            }
+            auto params = Runtime::to_underlying_arguments_rtc(
+                gemm_args, (splits > 1 || tail_splits > 0) ? workspace.data_ptr<float>() : nullptr);
 
             auto args = typename Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
                                                                num_stages, "Normal", "Default", "bf16_deep_gemm",
-                                                               enable_sbo_overlap},
+                                                               enable_sbo_overlap, dense810e},
                                                .launch_args = {grid, block, smem_size},
                                                .kernel_params = params};
 
+            // Specialize the legal split count while keeping N/K as runtime dimensions.
+            const bool static_underfill = dense810e && tiles < device_runtime->get_prop()->multiProcessorCount;
+            if (dense810e && (pipeline810e != 0 || static_underfill || refinement810e > 0))
+                args.launch_info.dense_810e_static_splits = splits;
+            args.launch_info.dense_810e_tail_splits = tail_splits;
+            args.launch_info.dense_810e_tail_wave = tail_wave;
+            args.launch_info.single_cycle_unroll = single_cycle_unroll;
             const auto& code = Runtime::generate(args);
             const auto& runtime = compiler->build("bf16_deep_gemm", code);
             const auto& kernel = runtime->kernel;
             int blocks_per_cu = 0;
-            HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, smem_size);
+            DG_HGGC_DRIVER_CHECK(
+                hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, smem_size));
             args.launch_args.grid_dim.x *= blocks_per_cu;
+            if (dense810e)
+                args.launch_args.grid_dim = dim3(tiles, splits, 1);
+            if (tail_splits > 0)
+                args.launch_args.grid_dim = dim3(full_tiles + (tiles - full_tiles) * tail_splits, 1, 1);
             DgProfParam dg_prof_params;
             if (ProfilingInterface::Instance().get_op_info()) {
                 dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, grouped_layout,
@@ -1174,6 +1486,10 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
             Runtime::launch(runtime, args);
+            if (dense810e && splits > 1)
+                reduce_dense810e(workspace, out, m * n, splits);
+            if (tail_splits > 0)
+                reduce_dense810e_tail(workspace, out, m * tail_n, tail_splits, tail_n, n);
 
             ProfilingInterface::Instance().instrument(false, dg_prof_params);
 
@@ -1190,6 +1506,13 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
                 printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n, block_k,
                        warp_m, warp_n, block_k, num_stages);
                 printf("SMSIZE:%d, vreg:%d, stack:%d\n",smem_size, int(numRegs), int(localSize));
+                printf("dense_810e:%d, split_k:%d\n", int(dense810e), splits);
+                printf("pipeline_810e:%d\n", dense810e ? pipeline810e : 0);
+                printf("static_split_k:%d\n", args.launch_info.dense_810e_static_splits);
+                printf("tail_split_k:%d, tail_wave:%d, tail_tiles:%d\n", tail_splits, tail_wave, tiles - full_tiles);
+                printf("refinement810e:%d\n", refinement810e);
+                printf("legacy_unsplit:%d\n", int(legacy_unsplit));
+                printf("single_cycle_unroll:%d\n", int(single_cycle_unroll));
             }
         };
         if (out.scalar_type() == torch::kFloat) {

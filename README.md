@@ -586,6 +586,7 @@ The library also provides some environment variables, which may be useful:
   - `DG_JIT_PRINT_LOAD_TIME`: `0` or `1`, print the kernel load time, `0` by default
 - **Runtime**
   - `DG_USE_PYTORCH_ACBLASLT_HANDLE`: `0` or `1`, use the PyTorch-managed acBLASLt handle instead of the built-in one, `0` by default
+  - `DG_810E_DENSE_OPT`: `0` or `1`, enable the 810E BF16 dense GEMM specialization, `1` by default. The specialization uses resource-based tile selection, Split-K and tail-wave scheduling for aligned `M=32` inputs. Set to `0` to use the existing selector and kernels. Explicit `configs`, external LUT hits, and other devices keep their selected paths; historical experiment mode numbers are not supported.
   - `SAIL_DEEPGEMM_LUT_PATH`: directory containing external GEMM tuning tables; unset by default. See [External GEMM tuning tables](#external-gemm-tuning-tables).
 - **Testing**
   - `DG_USE_PPU_TOOLS`: `0` or `1`, skip the built-in Kineto profiling to stay compatible with external tools (Asight Systems / Asight Compute / Compute Sanitizer), `0` by default
