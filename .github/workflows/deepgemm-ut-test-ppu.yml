@@ -106,7 +106,6 @@ jobs:
             source /usr/local/PPU_SDK/envsetup.sh || true
             which hgcc || true
             echo $PPU_SDK
-            pip install ray[adag]==2.40.0 --no-deps
             pip install setuptools==69.5.1
             # Preinstall the SCM version plugin used by setup.py.
             pip install setuptools-scm==9.2.2
