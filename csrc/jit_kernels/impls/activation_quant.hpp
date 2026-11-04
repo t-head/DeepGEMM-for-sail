@@ -3,7 +3,7 @@
 #include <limits>
 #include <type_traits>
 #include <torch/extension.h>
-#include <deep_gemm/activation/arguments.hpp>
+#include <deep_gemm/impls/activation_arguments.hpp>
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
 #include "../../jit/kernel_runtime.hpp"
@@ -33,33 +33,38 @@ struct ActivationLaunchArgs {
     ActivationParams params;
     QuantMode mode = QuantMode::BF16;
 };
+static const char* activation_kernel_name(const ActivationLaunchArgs& args) {
+    return args.mode == QuantMode::BF16
+        ? ((args.softcap.mode == ActivationMode::SITU) ? "situ_and_mul" : "silu_and_mul")
+        : args.mode == QuantMode::FP8_CHANNEL
+            ? ((args.softcap.mode == ActivationMode::SITU) ? "situ_and_mul_quant_fp8" : "silu_and_mul_quant_fp8")
+            : args.mode == QuantMode::FP8_BLOCK
+                ? ((args.softcap.mode == ActivationMode::SITU) ? "situ_and_mul_quant_fp8_block" : "silu_and_mul_quant_fp8_block")
+                : ((args.softcap.mode == ActivationMode::SITU) ? "situ_and_mul_quant_mx" : "silu_and_mul_quant_mx");
+}
+
+static const char* activation_mode_name(QuantMode mode) {
+    return mode == QuantMode::BF16 ? "BF16"
+         : mode == QuantMode::FP8_CHANNEL ? "FP8_CHANNEL"
+         : mode == QuantMode::MXFP4 ? "MXFP4"
+         : mode == QuantMode::MXFP8 ? "MXFP8" : "FP8_BLOCK";
+}
+
 class PPUActivationQuantRuntime final : public LaunchRuntime<PPUActivationQuantRuntime> {
 public:
     using Args = ActivationLaunchArgs;
-    static const char* get_kernel_name(const Args& args) {
-        return args.mode == QuantMode::BF16
-            ? ((args.softcap.mode == ActivationMode::SITU) ? "situ_and_mul" : "silu_and_mul")
-            : args.mode == QuantMode::FP8_CHANNEL
-                ? ((args.softcap.mode == ActivationMode::SITU) ? "situ_and_mul_quant_fp8" : "silu_and_mul_quant_fp8")
-                : args.mode == QuantMode::FP8_BLOCK
-                    ? ((args.softcap.mode == ActivationMode::SITU) ? "situ_and_mul_quant_fp8_block" : "silu_and_mul_quant_fp8_block")
-                    : ((args.softcap.mode == ActivationMode::SITU) ? "situ_and_mul_quant_mx" : "silu_and_mul_quant_mx");
-    }
     static std::string generate_impl(const Args& args) {
-        const char* mode = args.mode == QuantMode::BF16 ? "BF16"
-                         : args.mode == QuantMode::FP8_CHANNEL ? "FP8_CHANNEL"
-                         : args.mode == QuantMode::MXFP4 ? "MXFP4"
-                         : args.mode == QuantMode::MXFP8 ? "MXFP8" : "FP8_BLOCK";
+        const char* mode = activation_mode_name(args.mode);
         const bool vector_loads = args.n % 256 == 0 && reinterpret_cast<uintptr_t>(args.params.input) % 16 == 0;
         return fmt::format(R"(
-#include <deep_gemm/activation/activation_quant.cuh>
+#include <deep_gemm/impls/activation_quant.cuh>
 static_assert(sizeof(deep_gemm::ActivationParams) == {}, "activation argument size mismatch");
 extern "C" __global__ __launch_bounds__({})
 void {}(const void* input, void* output, void* scales, const int32_t* masked_m, int rows_per_batch, int row_slots, float limit, float weight_inv_scale, float beta, float linear_beta) {{
     deep_gemm::ActivationParams params{{input, output, scales, masked_m, rows_per_batch, row_slots, limit, weight_inv_scale, beta, linear_beta}};
     deep_gemm::activation_quant<{}, deep_gemm::QuantMode::{}, {}, {}, {}, {}, {}, {}, {}>(params);
 }}
-)", sizeof(ActivationParams), args.mode == QuantMode::FP8_CHANNEL ? activation_fp8_channel_threads(args.n) : 32, get_kernel_name(args),
+)", sizeof(ActivationParams), args.mode == QuantMode::FP8_CHANNEL ? activation_fp8_channel_threads(args.n) : 32, activation_kernel_name(args),
             args.n, mode, (args.softcap.mode == ActivationMode::SITU) ? "true" : "false", args.mask.masked() ? "true" : "false",
             args.reordered ? "true" : "false", args.params.limit > 0 ? "true" : "false",
             vector_loads ? "true" : "false", args.mask.route_masked ? "true" : "false",
@@ -119,11 +124,14 @@ static std::pair<torch::Tensor, torch::Tensor> run_activation_tiled(
         }
     }
     if (rows) {
+        LaunchArgs launch_args;
+        launch_args = LaunchArgs{dim3(blocks, slots), dim3(32), 0};
         auto args = make_activation_args(n, input, output, FP8Block ? scales.data_ptr() : nullptr,
-            limit, mask, softcap, {dim3(blocks, slots), dim3(32), 0}, rows_per_batch);
+            limit, mask, softcap, launch_args, rows_per_batch);
         args.mode = FP8Block ? QuantMode::FP8_BLOCK : QuantMode::BF16;
         args.params.row_slots = slots;
-        const auto& runtime = compiler->build(PPUActivationQuantRuntime::get_kernel_name(args), PPUActivationQuantRuntime::generate(args));
+        const auto& runtime = compiler->build(activation_kernel_name(args),
+            PPUActivationQuantRuntime::generate(args));
         PPUActivationQuantRuntime::launch(runtime, args);
     }
     return {output, scales};
@@ -144,10 +152,13 @@ static std::pair<torch::Tensor, torch::Tensor> run_activation_fp8_channel(
     shape.back() = 1;
     auto scales = at::empty(shape, input.options().dtype(torch::kFloat32));
     if (rows) {
+        LaunchArgs launch_args;
+        launch_args = LaunchArgs{dim3(launch_rows(input, rows, mask)), dim3(activation_fp8_channel_threads(n)), 0};
         auto args = make_activation_args(n, input, output, scales.data_ptr(), limit, mask, softcap,
-            {dim3(launch_rows(input, rows, mask)), dim3(activation_fp8_channel_threads(n)), 0}, 0, weight_inv_scale);
+            launch_args, 0, weight_inv_scale);
         args.mode = QuantMode::FP8_CHANNEL;
-        const auto& runtime = compiler->build(PPUActivationQuantRuntime::get_kernel_name(args), PPUActivationQuantRuntime::generate(args));
+        const auto& runtime = compiler->build(activation_kernel_name(args),
+            PPUActivationQuantRuntime::generate(args));
         PPUActivationQuantRuntime::launch(runtime, args);
     }
     return {output, scales};
@@ -181,12 +192,15 @@ static std::pair<torch::Tensor, torch::Tensor> run_activation_mx(
         scales = at::empty(shape, input.options().dtype(torch::kUInt8));
     }
     if (rows) {
+        LaunchArgs launch_args;
+        launch_args = LaunchArgs{dim3(blocks, slots), dim3(32), 0};
         auto args = make_activation_args(n, input, output, scales.data_ptr(), limit, mask, softcap,
-            {dim3(blocks, slots), dim3(32), 0}, rows_per_batch);
+            launch_args, rows_per_batch);
         args.mode = FP4 ? QuantMode::MXFP4 : QuantMode::MXFP8;
         args.reordered = Reordered;
         args.params.row_slots = slots;
-        const auto& runtime = compiler->build(PPUActivationQuantRuntime::get_kernel_name(args), PPUActivationQuantRuntime::generate(args));
+        const auto& runtime = compiler->build(activation_kernel_name(args),
+            PPUActivationQuantRuntime::generate(args));
         PPUActivationQuantRuntime::launch(runtime, args);
     }
     return {output, scales};

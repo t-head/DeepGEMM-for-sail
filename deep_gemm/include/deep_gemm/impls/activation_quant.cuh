@@ -4,7 +4,7 @@
 #include <cutlass/bfloat16.h>
 #include <cutlass/float8.h>
 #include <math.h>
-#include <deep_gemm/activation/arguments.hpp>
+#include <deep_gemm/impls/activation_arguments.hpp>
 #include <deep_gemm/tix/cp_async.cuh>
 
 namespace deep_gemm {
@@ -84,7 +84,9 @@ __device__ void activation_tiled(const ActivationParams& p) {
     }
     for (int local_row = blockIdx.y; local_row < valid; local_row += gridDim.y) {
         const int64_t row = int64_t(expert) * p.rows_per_batch + local_row;
-        if constexpr (RouteMasked) if (p.masked_m[row] < 0) continue;
+        if constexpr (RouteMasked) {
+            if (p.masked_m[row] < 0) continue;
+        }
         alignas(16) cutlass::bfloat16_t gate[8], up[8];
         activation_load_eight<N, VectorLoads>(static_cast<const cutlass::bfloat16_t*>(p.input), row, col, gate, up);
         if constexpr (Clamp && !Situ) {
@@ -374,7 +376,9 @@ __device__ void activation_quant(const ActivationParams& p) {
                 if constexpr (Mode == QuantMode::FP8_CHANNEL) __syncthreads();
             }
         } else {
-            if constexpr (RouteMasked) if (p.masked_m[work] < 0) return;
+            if constexpr (RouteMasked) {
+                if (p.masked_m[work] < 0) return;
+            }
             activation_quant_row<N, Mode, Situ, Clamp, Step>(p, work);
         }
     }
