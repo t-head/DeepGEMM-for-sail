@@ -64,7 +64,6 @@ jobs:
             source /usr/local/PPU_SDK/envsetup.sh || true
             which hgcc || true
             echo $PPU_SDK
-            pip install ray[adag]==2.40.0 --no-deps
             pip install setuptools==69.5.1 setuptools-scm==9.2.2
             pip install numpy==1.26.4 junit-xml rich wheel ninja
             pip install --upgrade pytest
