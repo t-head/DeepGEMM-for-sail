@@ -1537,9 +1537,33 @@ def test_dense_810e_m32_schedules(args):
     compiling = bool(os.environ.get('HGGC_WARM_UP')) or deep_gemm.get_compile_mode() == 1
     check = get_acc_check() and not compiling
     m, n, k = args['m'], args['n'], args['k']
-    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
-    b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
-    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+
+    def run_child(child_args, env):
+        fields = dict(child_args, data_type='bf16', schedule_child=1)
+        spec = 'DenseGemm,' + ','.join(f'{key}:{value}' for key, value in fields.items() if key != 'gemm_type')
+        command = [sys.executable, str(Path(__file__).with_name('run_deep_gemm.py')),
+                   '--format', spec, '--require_supported', '--ref_backend', get_ref_backend()]
+        if compiling:
+            env['HGGC_WARM_UP'] = '1'
+        if not check:
+            command.append('--disable_acc')
+        subprocess.run(command, env=env, check=True, timeout=600)
+
+    if not args.get('schedule_child'):
+        # The reusable worker may already have cached a LUT path. Isolate default
+        # dispatch in a fresh interpreter with the variable absent from startup.
+        env = dict(os.environ)
+        env.pop('SAIL_DEEPGEMM_LUT_PATH', None)
+        run_child(args, env)
+        return
+
+    generator = torch.Generator(device='cpu').manual_seed(0)
+    a = gemm_exact_values((m, k), generator).to(device='cuda', dtype=torch.bfloat16)
+    b = gemm_exact_values((n, k), generator).to(device='cuda', dtype=torch.bfloat16)
+    # Keep the output contiguous and aligned, with guards around its storage.
+    guard = 128
+    storage = torch.full((m * n + 2 * guard,), -123., device='cuda', dtype=torch.bfloat16)
+    out = storage[guard:-guard].view(m, n)
     reference = gemm_reference(a, b) if check else None
     saved_sms = deep_gemm.get_num_sms()
     saved_env = {name: os.environ.get(name) for name in ('show_log', 'DG_810E_DENSE_OPT')}
@@ -1547,9 +1571,8 @@ def test_dense_810e_m32_schedules(args):
 
     def check_output():
         assert torch.isfinite(out).all(), 'Output contains unwritten or nonfinite elements'
-        relative_l2 = (torch.linalg.vector_norm(out.float() - reference) /
-                       torch.linalg.vector_norm(reference).clamp_min(1e-20)).item()
-        assert relative_l2 < 0.005, f'{m=}, {n=}, {k=}, {relative_l2=}'
+        gemm_assert_exact(out, reference)
+        assert (storage[:guard] == -123).all() and (storage[-guard:] == -123).all(), 'Output guard overwritten'
 
     def run(expected, configs=None, tile=None):
         fn = lambda: deep_gemm.bf16_gemm_nt(a, b, out, configs=configs)
@@ -1577,6 +1600,9 @@ def test_dense_810e_m32_schedules(args):
             match = re.search(rf'{"split_k" if expected == "split" else "tail_split_k"}:(\d+)', dispatch)
             assert match and int(match[1]) > 1, dispatch
             assert 'dense_810e:1' in dispatch, dispatch
+            if args.get('unequal_k'):
+                shape = re.search(r'ThreadblockShape\[(\d+), (\d+), (\d+)\]', dispatch)
+                assert expected == 'tail' and shape and (k // int(shape[3])) % int(match[1]), dispatch
         elif expected == 'mixed':
             assert 'mixed_range:1' in dispatch, dispatch
         elif expected == 'single':
@@ -1623,15 +1649,7 @@ def test_dense_810e_m32_schedules(args):
                 name = torch.cuda.get_device_name() + '_bf16_densegemm.lut'
                 (Path(directory) / name).write_text(f'{m} {n} {k} 32 128 128 16 32 3\n')
                 env = dict(os.environ, SAIL_DEEPGEMM_LUT_PATH=directory)
-                if compiling:
-                    env['HGGC_WARM_UP'] = '1'
-                spec = (f'DenseGemm,data_type:bf16,m:{m},n:{n},k:{k},device:810e,'
-                        'schedule_check:m32_810e,expect:fallback,lut_child:1')
-                command = [sys.executable, str(Path(__file__).with_name('run_deep_gemm.py')),
-                           '--format', spec, '--require_supported', '--ref_backend', get_ref_backend()]
-                if not check:
-                    command.append('--disable_acc')
-                subprocess.run(command, env=env, check=True, timeout=600)
+                run_child(dict(args, expect='fallback', lut_child=1, overrides=0), env)
     finally:
         deep_gemm.set_num_sms(saved_sms)
         for name, value in saved_env.items():

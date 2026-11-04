@@ -1037,6 +1037,9 @@ static bool try_dense810e_mixed_ranges(const BF16GemmCutlass3Runtime::GemmArgume
         auto prepare = [&](int bn, int threads, int smem, const std::string& name, int& resident) {
             const auto args = make_args(bn, threads, smem, name);
             auto runtime = compiler->build(name, BF16GemmCutlass3Runtime::generate(args));
+            // Opt in before measuring residency, including compile-only calls.
+            construct_launch_config(runtime->kernel, current_stream(), smem, args.launch_args.grid_dim,
+                                    args.launch_args.block_dim);
             DG_HGGC_DRIVER_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&resident, runtime->kernel, threads, smem));
             return runtime;
         };
