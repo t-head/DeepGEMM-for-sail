@@ -24,11 +24,17 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 
 ## Release Notes
 
-### 1.1.0+v1.0.0 — Unreleased
+### 1.1.0+v1.0.0
 
-Adds W4A4 MegaMoE with reusable workspaces and load-time weight preparation.
-See the [MegaMoE calling contract](#megamoe) and
-[release notes](CHANGELOG.md#110v100--unreleased).
+Highlights:
+
+- **W4A4 MegaMoE** on PPU1.5: a complete MXFP4 routed MoE pipeline with BF16 output, reusable workspaces, and load-time weight preparation. See the [calling contract](#megamoe).
+- **More low-precision MoE kernels**: W4A8 on M890 and INT8 A8W4 on Zhenwu 610 / 610E / 810 / 810E, with unified weight preprocessing.
+- **Activation and quantization** on M890: standalone SiLU, SiTU, and SiLU STEP with BF16, FP8, MXFP4, or MXFP8 output, plus STEP activation in fused FP4 epilogues.
+- **Mega-mHC and sparse MQA** on M890P: fused shifted mHC for DeepSeek V4.1 Flash and MXFP4 sparse attention-indexer logits for prefill and paged decode. Regular paged MQA now supports page sizes 32, 64, and 128.
+- **External GEMM tuning tables**: device- and precision-specific configurations through `SAIL_DEEPGEMM_LUT_PATH`, with fallback to built-in selection.
+
+See [CHANGELOG.md](CHANGELOG.md#110v100) for complete release notes and API migration details.
 
 ### 1.1.0+v0.1.0 — Initial Public Release
 
@@ -45,8 +51,15 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 
 ### Package versioning
 
-- Release: `1.1.0+v1.0.0.ppu2.2.0` combines DeepGEMM's own version `1.1.0`,
-  its release version `v1.0.0`, and the PPU SDK version `2.2.0`.
+- Release: `1.1.0+v1.0.0.ppu2.2.0` combines the placeholder version `1.1.0`,
+  the release version `v1.0.0`, and the PPU SDK version `2.2.0`.
+  In [setup.py](setup.py), these first two components correspond to
+  `DEEPGEMM_VERSION` and `RELEASE_VERSION`, respectively.
+- `1.1.0` is expected to remain unchanged. Future releases and API changes
+  are tracked by the `v1.0.0` component in `RELEASE_VERSION`.
+  The middle number in `v1.0.0` is incremented for API changes or additions
+  when they are formally integrated into downstream frameworks, rather than
+  for each individual API change or addition.
 - Development: `1.1.0.devN+v1.0.0.ppu2.2.0.g<sha>` additionally includes
   the commit count and Git commit hash.
 
