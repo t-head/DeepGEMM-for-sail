@@ -30,6 +30,14 @@ namespace deep_gemm {
 // MXFP4 only.
 namespace sparse_mqa_logits {
 
+inline uint32_t get_kv_blocks_per_split(const uint32_t sparse_block_kv) {
+    return kPPU0015SplitKV / sparse_block_kv;
+}
+
+inline uint32_t get_num_sparse_kv_split_bytes(const uint32_t sparse_block_kv) {
+    return sizeof(KVSplitHeader) + get_kv_blocks_per_split(sparse_block_kv) * sizeof(KVBlockInfo);
+}
+
 // Schedule table columns: one slot per resident CTA of the sparse main kernel.
 inline int get_num_sparse_slots() {
     return get_num_sms() * kNumTbPerCu;
@@ -38,7 +46,7 @@ inline int get_num_sparse_slots() {
 static uint32_t get_sparse_split_kv(const at::ScalarType& qk_dtype) {
     // MXFP4 only.
     DG_HOST_ASSERT(qk_dtype == torch::kInt8);
-    return kSplitKV;
+    return kPPU0015SplitKV;
 }
 
 // Worst-case metadata buffer size. Each Q block (kBlockQ = 2 tokens) merges at most
@@ -50,12 +58,13 @@ static int64_t get_num_sparse_metadata_bytes(const int num_q_tokens, const int n
                                              const bool is_paged = false) {
     DG_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096);
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
-    const int64_t num_kv_blocks_per_split = kSplitKV / sparse_block_kv;
+    const int64_t num_kv_blocks_per_split = get_kv_blocks_per_split(sparse_block_kv);
     const int64_t num_kv_split_bytes = sizeof(KVSplitHeader) + num_kv_blocks_per_split * sizeof(KVBlockInfo);
-    const int64_t num_max_kv_splits = is_paged ?
-        static_cast<int64_t>(num_q_tokens) * ceil_div<int64_t>(num_max_sparse_blocks, num_kv_blocks_per_split) :
-        ceil_div<int64_t>(num_q_tokens, kBlockQ) *
-            ceil_div<int64_t>(kBlockQ * static_cast<int64_t>(num_max_sparse_blocks), num_kv_blocks_per_split);
+    const int64_t num_max_kv_splits =
+        is_paged
+            ? static_cast<int64_t>(num_q_tokens) * ceil_div<int64_t>(num_max_sparse_blocks, num_kv_blocks_per_split)
+            : ceil_div<int64_t>(num_q_tokens, kBlockQ) *
+                  ceil_div<int64_t>(kBlockQ * static_cast<int64_t>(num_max_sparse_blocks), num_kv_blocks_per_split);
     DG_HOST_ASSERT(num_max_kv_splits <= std::numeric_limits<uint32_t>::max());
     const int64_t num_max_schedule_entries = align<int64_t>(num_max_kv_splits, num_slots);
     return static_cast<int64_t>(sizeof(MetadataHeader)) + num_max_kv_splits * num_kv_split_bytes +
@@ -65,7 +74,7 @@ static int64_t get_num_sparse_metadata_bytes(const int num_q_tokens, const int n
 // ---------------------------------------------------------------- metadata kernel
 
 class SparseMqaLogitsMetadataRuntime final : public LaunchRuntime<SparseMqaLogitsMetadataRuntime> {
-public:
+  public:
     struct KernelArguments {
         uint32_t num_q_tokens, num_kv_tokens;
         const uint32_t* cu_seq_len_k_start;
@@ -124,25 +133,24 @@ __global__ void {}(
 )",
             args.launch_info.num_threads, args.launch_info.num_max_blocks_cap, args.launch_info.num_slots,
             args.launch_info.sparse_block_kv, args.launch_info.use_unaligned_ks ? "true" : "false",
-            args.launch_info.is_paged ? "true" : "false", args.launch_info.page_kv,
-            args.launch_info.kernel_name);
+            args.launch_info.is_paged ? "true" : "false", args.launch_info.page_kv, args.launch_info.kernel_name);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.kernel_args.num_q_tokens, args.kernel_args.num_kv_tokens,
-            args.kernel_args.cu_seq_len_k_start, args.kernel_args.cu_seq_len_k_end,
-            args.kernel_args.context_lens, args.kernel_args.block_table, args.kernel_args.block_table_stride,
-            args.kernel_args.indices,
-            args.kernel_args.sparse_kv_block_indices, args.kernel_args.num_max_sparse_blocks,
-            args.kernel_args.metadata, args.kernel_args.workspace));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(
+            kernel, config, args.kernel_args.num_q_tokens, args.kernel_args.num_kv_tokens,
+            args.kernel_args.cu_seq_len_k_start, args.kernel_args.cu_seq_len_k_end, args.kernel_args.context_lens,
+            args.kernel_args.block_table, args.kernel_args.block_table_stride, args.kernel_args.indices,
+            args.kernel_args.sparse_kv_block_indices, args.kernel_args.num_max_sparse_blocks, args.kernel_args.metadata,
+            args.kernel_args.workspace));
     }
 };
 
 // Captured kernels retain the workspace address. Match upstream's fixed-capacity, per-stream
 // cache so a larger eager call cannot free storage still referenced by a graph. Counters are
 // reset by the metadata kernel; one-time zeroing must happen during warmup, outside capture.
-static torch::Tensor& get_sparse_workspace(const torch::TensorOptions& options, const int num_q_tokens) {
+static const torch::Tensor& get_sparse_mqa_logits_workspace(const torch::TensorOptions& options,
+                                                           const int num_q_tokens) {
     constexpr int kNumMaxQTokens = 1 << 20;
     constexpr int64_t kNumWorkspaceBytes = sizeof(WorkspaceState) +
         static_cast<int64_t>(kNumMaxQTokens) * sizeof(QBlockInfo);
@@ -159,18 +167,14 @@ static torch::Tensor& get_sparse_workspace(const torch::TensorOptions& options, 
     return workspace;
 }
 
-static void launch_sparse_mqa_logits_metadata(const torch::Tensor& metadata, torch::Tensor& workspace,
-                                              const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
-                                              const uint32_t num_max_sparse_blocks, const uint32_t sparse_block_kv,
-                                              const uint32_t* cu_seq_len_k_start_ptr,
-                                              const uint32_t* cu_seq_len_k_end_ptr,
-                                              const uint32_t* sparse_kv_block_indices_ptr,
-                                              const bool use_unaligned_ks,
-                                              const bool is_paged = false, const uint32_t page_kv = 0,
-                                              const uint32_t* context_lens_ptr = nullptr,
-                                              const uint32_t* block_table_ptr = nullptr,
-                                              const uint32_t block_table_stride = 0,
-                                              const uint32_t* indices_ptr = nullptr) {
+static void
+launch_sparse_mqa_logits_metadata(const torch::Tensor& metadata, const torch::Tensor& workspace, const uint32_t num_q_tokens,
+                                  const uint32_t num_kv_tokens, const uint32_t num_max_sparse_blocks,
+                                  const uint32_t sparse_block_kv, const uint32_t* cu_seq_len_k_start_ptr,
+                                  const uint32_t* cu_seq_len_k_end_ptr, const uint32_t* sparse_kv_block_indices_ptr,
+                                  const bool use_unaligned_ks, const bool is_paged = false, const uint32_t page_kv = 0,
+                                  const uint32_t* context_lens_ptr = nullptr, const uint32_t* block_table_ptr = nullptr,
+                                  const uint32_t block_table_stride = 0, const uint32_t* indices_ptr = nullptr) {
     constexpr uint32_t kNumThreads = 256;
     const int num_slots = get_num_sparse_slots();
     const uint32_t num_max_blocks_cap = get_num_sparse_blocks_bucket(num_max_sparse_blocks);
@@ -181,16 +185,12 @@ static void launch_sparse_mqa_logits_metadata(const torch::Tensor& metadata, tor
     auto args = SparseMqaLogitsMetadataRuntime::Args{
         .launch_info = {static_cast<int>(num_max_blocks_cap), num_slots, static_cast<int>(sparse_block_kv),
                         static_cast<int>(kNumThreads), smem_size, use_unaligned_ks, is_paged, page_kv, kernel_name},
-        .launch_args = {dim3(is_paged ? static_cast<int>(std::min(num_q_tokens, static_cast<uint32_t>(num_slots)))
-                                      : ceil_div<int>(static_cast<int>(num_q_tokens), static_cast<int>(kBlockQ)),
-                                1, 1),
-                        dim3(static_cast<int>(kNumThreads), 1, 1), smem_size},
-        .kernel_args = {num_q_tokens, num_kv_tokens,
-                        cu_seq_len_k_start_ptr, cu_seq_len_k_end_ptr,
-                        context_lens_ptr, block_table_ptr, block_table_stride, indices_ptr,
-                        sparse_kv_block_indices_ptr,
-                        num_max_sparse_blocks,
-                        reinterpret_cast<uint8_t*>(metadata.data_ptr()),
+        .launch_args = {dim3(is_paged ? std::min(num_q_tokens, static_cast<uint32_t>(num_slots))
+                                      : ceil_div<int>(num_q_tokens, kBlockQ)),
+                        dim3(kNumThreads), smem_size},
+        .kernel_args = {num_q_tokens, num_kv_tokens, cu_seq_len_k_start_ptr, cu_seq_len_k_end_ptr, context_lens_ptr,
+                        block_table_ptr, block_table_stride, indices_ptr, sparse_kv_block_indices_ptr,
+                        num_max_sparse_blocks, reinterpret_cast<uint8_t*>(metadata.data_ptr()),
                         reinterpret_cast<uint8_t*>(workspace.data_ptr())},
     };
     const auto& code = SparseMqaLogitsMetadataRuntime::generate(args);
@@ -241,7 +241,7 @@ namespace deep_gemm {{
 
 using AttnKernel = cutlass::gemm::kernel::PPUSparseMqaLogitsFP4<
   uint8_t, float, __ppu_bfloat16, __ppu_bfloat16,
-  64, deep_gemm::sparse_mqa_logits::kSplitKV, 32, 16, 1, 3, {}, {}, {}, {}>;
+  64, deep_gemm::sparse_mqa_logits::kPPU0015SplitKV, 32, 16, 1, 3, {}, {}, {}, {}>;
 
 // The host computes these instead of reading them off the kernel type, so pin them down here
 static_assert(AttnKernel::SharedStorageSize == {}, "host/device shared memory size mismatch");

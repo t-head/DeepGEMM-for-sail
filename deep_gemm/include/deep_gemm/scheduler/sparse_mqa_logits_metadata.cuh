@@ -245,7 +245,7 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
     const uint32_t* indices,
     const uint32_t* sparse_kv_block_indices, const uint32_t num_max_sparse_blocks,
     uint8_t* metadata, uint8_t* workspace) {
-    constexpr uint32_t kNumKVBlocksPerSplit = kSplitKV / SPARSE_BLOCK_KV;
+    constexpr uint32_t kNumKVBlocksPerSplit = kPPU0015SplitKV / SPARSE_BLOCK_KV;
     constexpr uint32_t kNumKVSplitsPerEntry = 8;  // upstream host constant (bounded paged entries)
     constexpr uint32_t kNumMergedBlocksCap = kBlockQ * kNumMaxBlocksCap;
     constexpr uint32_t kNumKVBlocksPerThread = (kNumMergedBlocksCap + kNumThreads - 1) / kNumThreads;
