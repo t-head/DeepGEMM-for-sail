@@ -23,16 +23,14 @@ try:
 except ImportError:
     AutoConfig = None
 
-from deep_gemm.deep_gemm_tuner.deepgemm_tools import get_supported_configs, get_pre_assert_configs, exec_tuning_iter
+from deep_gemm.deep_gemm_tuner.deepgemm_tools import get_pre_assert_configs, exec_tuning_iter
 from deep_gemm.deep_gemm_tuner.deepgemm_tools import count_expert_num_tokens, fused_topk_torch_native, grouped_masked_m_sample, deepgemm_moe_permute
 from deep_gemm.deep_gemm_tuner.deepgemm_tools import per_token_quant_int8, gemm_nt_i8i8bf16, grouped_gemm_nt_i8i8bf16_masked, grouped_gemm_nt_i8i8bf16_nopad
 from deep_gemm.deep_gemm_tuner.deepgemm_tools import grouped_gemm_nt_bf16bf16bf16_nopad
 from deep_gemm.deep_gemm_tuner.utils import CANDIDATE_Ms, get_deep_gemm_luts, get_device_name
 
 # Try to import deep_gemm functions
-from deep_gemm import calc_diff
-from deep_gemm.jit_kernels import m_grouped_gemm_int8_int8_bf16_nt_masked, gemm_int8_int8_bf16_nt, get_num_sms
-from deep_gemm.jit_kernels.gemm_int8 import get_smem_config
+from deep_gemm import calc_diff, get_num_sms
 DEEP_GEMM_AVAILABLE = True
 
 ENABLE_GAMMA_SAMPLE = os.environ.get("ENABLE_GAMMA_SAMPLE", None)
