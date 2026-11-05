@@ -237,6 +237,7 @@ ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms, int* se
 ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
                               GemmType gemm_type = GemmType::Normal, int max_block_n = 256,
                               bool* from_runtime_lut = nullptr, int* selected_warp_k = nullptr) {
+    const bool is_k_grouped = gemm_type == GemmType::KGroupedContiguous;
     if (from_runtime_lut) *from_runtime_lut = false;
     if (selected_warp_k) *selected_warp_k = 0; // Non-adaptive callers use block_k.
     if (auto tile = deep_gemm_lut::get_runtime_config(
@@ -264,7 +265,10 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     }
     // Generate block_ms
     std::vector<int> block_ms;
-    if (gemm_type != GemmType::MGroupedContiguous) {
+    if (is_k_grouped) {
+        // TN AIU loads require at least 64 contiguous bytes (32 BF16 elements).
+        block_ms = k >= 384 ? std::vector{256, 128, 64, 32} : std::vector{64, 32};
+    } else if (gemm_type != GemmType::MGroupedContiguous) {
         if (k >= 384) {
             block_ms = {256, 128, 64, 32, 16};
         } else {
@@ -325,7 +329,10 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         std::vector<int> block_ns_after_filter;
         for (int block_n : block_ns) {
             bool condition;
-            if (is_ppu1v5_device() && ((m >= 128 && k > 2048) || m >= 256)) {
+            if (is_k_grouped) {
+                // All candidates meet the TN alignment; FP32 output uses no TSM.
+                condition = true;
+            } else if (is_ppu1v5_device() && ((m >= 128 && k > 2048) || m >= 256)) {
                 condition = (block_n != n && min_n_threshold) && !(block_m == 16 && block_n <= 32);
             } else {
                 condition = (block_m <= 128 || block_n <= 128) && (block_n != n && min_n_threshold) &&
@@ -393,7 +400,7 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
 
     // small m hbm bound or latency bound, wave is not useful, for better occ for 810e hbm bound, use smallest blockN
     // for m16
-    if (m < 20 && n < 512) {
+    if (not is_k_grouped && m < 20 && n < 512) {
         best_block_m = 16;
         best_block_n = 64;
     }
