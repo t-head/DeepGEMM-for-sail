@@ -4,6 +4,7 @@
 #include "apis/attention.hpp"
 #include "apis/activation.hpp"
 #include "apis/einsum.hpp"
+#include "apis/epilogue_class.hpp"
 #include "apis/hyperconnection.hpp"
 #include "apis/mega_mhc.hpp"
 #include "apis/gemm.hpp"
@@ -19,6 +20,7 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "DeepGEMM C++ library";
 
+    deep_gemm::epilogue_class::register_apis(m);
     deep_gemm::attention::register_apis(m);
     deep_gemm::activation::register_apis(m);
     deep_gemm::einsum::register_apis(m);

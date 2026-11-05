@@ -166,6 +166,23 @@ void set_hc_prenorm_params(int m, int n, int k, hggcStream_t stream = 0) {
     op_name_ = "HcPrenormGemm";
 }
 
+void set_k_grouped_params(int m, int n, int sum_k, const std::vector<int>& ks,
+                          bool separate_c = false, hggcStream_t stream = 0) {
+    set_params(GemmType::KGroupedContiguous, false, "bf16", static_cast<int>(ks.size()),
+               m, n, sum_k, 0, nullptr, stream);
+    // Validated host lengths keep dumps replayable even during graph capture.
+    std::ostringstream lengths;
+    lengths << '[';
+    for (size_t i = 0; i < ks.size(); ++i) {
+        if (i) lengths << ',';
+        lengths << ks[i];
+    }
+    lengths << ']';
+    add_params("distribution", lengths.str());
+    if (separate_c)
+        add_params("separate_c", separate_c);
+}
+
 void set_mega_mhc_params(int m, int hidden, int sinkhorn_iters, hggcStream_t stream = 0) {
     op_name_ = "MegaMhc";
     add_argument("data_type");
@@ -315,6 +332,9 @@ void distribution() {
 }
 
 bool check_support_dump(){
+    if (gemm_type_ == GemmType::KGroupedContiguous) {
+        return false;  // Host K lengths were supplied by set_k_grouped_params.
+    }
     char *pEnv_dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
     static int target_device_id = pEnv_dump_device != nullptr ? std::stoi(pEnv_dump_device) : 0;
     // export PPU_LIB_DUMP_DEVICE=-1 to dump all devices
