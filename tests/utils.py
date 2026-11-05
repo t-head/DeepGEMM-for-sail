@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from typing import Tuple, Callable
 from enum import Enum
 import ast
+from deep_gemm.utils import SMEM_CONFIG_UNUSED
 from deep_gemm.utils.math import (
     ceil_div, align as round_up, per_token_cast_to_fp8, per_block_cast_to_fp8,
     per_custom_dims_cast_to_fp8, per_token_cast_to_int8, per_token_cast_to_fp4,
@@ -68,12 +69,6 @@ def get_arch_version() -> int:
 
 def is_ppu1v5_device() -> bool:
     return get_arch_version() == 89
-
-# The 8th element of a `configs=` tile tuple is never read: every explicit-config branch in
-# csrc/jit_kernels/impls/*.hpp unpacks it as `_sc` and recomputes the shared-memory size from the
-# dtype-specific formula. The public ConfigTuple shape is fixed, so tile builders only need a
-# placeholder of the right shape.
-SMEM_CONFIG_UNUSED = (0, 0, 0)
 
 def get_kernel_types(dtype: torch.dtype) -> KernelType:
     if dtype == torch.bfloat16:
