@@ -146,6 +146,14 @@ Use `m_grouped_gemm_fp8_fp8_bf16_nt_masked` for this purpose and consult the rel
 
 For the FP4 masked GEMM, the `silu_and_mul` activation and the MXFP4 quantization that follows it can optionally be fused into the epilogue, so that MoE gemm1 writes the packed FP4 values and their E8M0 scales directly instead of a BF16 tensor that a standalone kernel has to read back. The fusion is **disabled by default**; pass an `out_scale` tensor to `deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked` to enable it, and interleave the gemm1 weight once with `deep_gemm.preprocess_weights_and_scales(mode=deep_gemm.PreprocessMode.MXFP4, fuse_activation=True)` beforehand. Refer to the `m_grouped_gemm_fp4_fp4_bf16_nt_masked` documentation for the tensor layouts, the `swiglu_limit` argument and the current limitations. The fused epilogue is also available on `m_grouped_gemm_fp4_fp4_bf16_nt_nopad` and `m_grouped_gemm_fp4_fp4_bf16_nt_fused`; use `activation_type="silu_and_mul_step"` for STEP-series models, which clamp `silu(gate)` from above instead of clamping the gate before silu.
 
+#### K-grouped GEMMs (contiguous layout)
+
+The grouped GEMMs above group tokens along the M axis while N and K stay fixed. MoE training backward weight gradients instead reduce over each expert's own token count, so the groups vary along the K axis: every group's `a_g [K_g, M]` and `b_g [K_g, N]` slices are concatenated into `a [sumK, M]` and `b [sumK, N]`, and the kernel computes `d[g] = c[g] + a_g^T @ b_g` per group.
+
+`deep_gemm.k_grouped_bf16_gemm_tn_contiguous` (M890) implements the BF16 wgrad path with FP32 output. The LHS is the physically contiguous `[sumK, M]` tensor (typically a `.t()` view that is itself contiguous), and `d` is the `[G, M, N]` FP32 `main_grad` accumulator. `c` is required and normally the same tensor as `d`, giving in-place beta=1 accumulation for consecutive micro-batches; a separate FP32 `c` is copied into `d` first. Each group's length must be a non-negative multiple of 128 (per-group physical K alignment, with padded rows zeroed), passed as a host-side `ks_cpu` list together with the equivalent int32 `grouped_layout` tensor on device. Groups with `K_g = 0` keep the existing output, and zero total K returns without computation. `use_psum_layout` must be `False`, custom epilogues are not supported, and `compiled_dims` only accepts `"mn"`. 
+
+For more information, please refer to the `k_grouped_bf16_gemm_tn_contiguous` function documentation.
+
 #### Fused MoE (with implicit permute)
 
 Unlike the standalone grouped GEMM layouts above (which expect tokens to already be routed and grouped per expert), the fused MoE path takes raw MoE routing results (`topk_ids`) and fuses the token permutation, per-expert block alignment, and grouped GEMM into a single flow. The "with implicit permute" naming distinguishes it from a plain grouped MoE GEMM: the permutation from token order to expert-grouped order is computed and applied inside these kernels, so no separate gather/scatter step is required.
@@ -503,7 +511,7 @@ For more information, please refer to the `fp8_einsum` and `int8_einsum` functio
 
 For API compatibility with the upstream DeepGEMM, some symbols are exported by `deep_gemm` but are **not yet ported to the PPU build**. Calling them raises `NotImplementedError`:
 
-- K-axis grouped GEMMs: `k_grouped_fp8_gemm_nt_contiguous`, `k_grouped_fp8_gemm_tn_contiguous`, `k_grouped_bf16_gemm_tn_contiguous`
+- K-axis grouped GEMMs: `k_grouped_fp8_gemm_nt_contiguous`, `k_grouped_fp8_gemm_tn_contiguous`
 - M-grouped NN contiguous: `m_grouped_fp8_gemm_nn_contiguous`
 - FP8xFP4 dense GEMMs: `fp8_fp4_gemm_nt`, `fp8_fp4_gemm_nn`, `fp8_fp4_gemm_tn`, `fp8_fp4_gemm_tt`
 - FP8xFP4 M-grouped GEMMs: `m_grouped_fp8_fp4_gemm_nt_contiguous`, `m_grouped_fp8_fp4_gemm_nn_contiguous`, `m_grouped_fp8_fp4_gemm_nt_masked`

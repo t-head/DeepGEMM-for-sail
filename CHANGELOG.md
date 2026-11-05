@@ -18,6 +18,18 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 - **M890 W4FA8 dense NT GEMM**: implements `fp8_fp4_gemm_nt` and its
   `gemm_fp8_fp4_bf16_nt` alias with two-dimensional packed weights and
   scale preprocessing, BF16 output, and optional scalar `inv_scale`.
+- **M890 K-grouped BF16 wgrad GEMM**: implements `k_grouped_bf16_gemm_tn_contiguous`
+  on PPU1.5 (ZW-M890P), replacing the `NotImplementedError` placeholder. Computes
+  `d[g] = c[g] + a_g^T @ b_g` over contiguous K segments with BF16 inputs
+  (`a [sumK, M]`, `b [sumK, N]`) and an FP32 `[G, M, N]` accumulator, with in-place
+  `c = d` beta=1 accumulation for consecutive micro-batches (a separate `c` is
+  copied into `d` first). Group lengths are supplied as a host-side `ks_cpu` list
+  mirrored by an int32 `grouped_layout` tensor on device; empty groups (`K_g = 0`)
+  keep the existing output, and zero total K returns without computation. Requires
+  each group's K to be a non-negative multiple of 128 with zeroed padding,
+  contiguous tensors, `use_psum_layout=False`, no custom epilogue, and
+  `compiled_dims="mn"`. Registers the upstream-compatible `epilogue.Epilogue`
+  interface type, which has no PPU implementations yet.
 
 ### Changed
 

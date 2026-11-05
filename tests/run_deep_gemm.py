@@ -6,6 +6,7 @@ import random
 import deep_gemm
 from utils import parse_deepgemm_string_re, read_cmds_from_file, get_arch_version
 from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad, test_m_grouped_gemm_fused
+from utils import test_k_grouped_gemm_contiguous
 from utils import test_hc_prenorm_gemm, test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, test_mega_mhc
 from utils import test_batch_gemm
 from utils import get_acc_check, set_acc_check, set_benchmark
@@ -25,6 +26,9 @@ def device_version_supported(one_case):
     if one_case.get('gemm_type') == 'Activation' or data_type in ('w4fa16_mma', 'w4fa8_mma', 'w4a8_nvfp4'):
         if get_arch_version() < 89:
             return False, 'Activation and W4 MMA require PPU1.5 (sm_89) or later'
+    if one_case.get('gemm_type') == 'KGroupedContiguous':
+        if get_arch_version() != 89 or 'M890' not in torch.cuda.get_device_name():
+            return False, 'KGroupedContiguous currently requires Zhenwu M890P (sm_89)'
     if one_case.get('gemm_type') == 'MegaMhc':
         if get_arch_version() != 89 or 'M890' not in torch.cuda.get_device_name():
             return False, 'Mega-mHC requires Zhenwu M890P (sm_89)'
@@ -61,6 +65,7 @@ def run_activation_regression(args):
 
 def call_test_func(gemm_type, func_args):
     supported_call_funcs = {
+        "KGroupedContiguous": test_k_grouped_gemm_contiguous,
         "GroupedContiguous": test_m_grouped_gemm_contiguous,
         "GroupedNoPad": test_m_grouped_gemm_nopad,
         "GroupedFused" : test_m_grouped_gemm_fused,

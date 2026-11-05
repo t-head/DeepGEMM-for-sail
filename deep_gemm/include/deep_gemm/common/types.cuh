@@ -36,6 +36,13 @@ constexpr CUTLASS_HOST_DEVICE bool is_k_grouped_contiguous(const GemmType& gemm_
     }
 }
 
+struct KGroupedGemmArgs {
+    const void* a_ptr;
+    const void* b_ptr;
+    void* c_ptr;
+    const int32_t* grouped_layout;
+};
+
 inline constexpr const char* GemmTypeS[] = {
     "DenseGemm", "GroupedContiguous", "GroupedMasked", "KGroupedContiguous", "BatchGemm",
     "GroupedContiguous", "KGroupedContiguous", "GroupedNoPad", "GroupedFused", "MegaMoE"
