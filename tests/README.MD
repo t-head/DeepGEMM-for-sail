@@ -67,6 +67,97 @@ and that runtime-only arguments preserve both. Coverage includes BF16 CuteFree
 and CUTLASS with BF16/FP32 output, GEMV M1/M2, FP8 block/channel, INT8 and FP4.
 The helper queries hardware constants but never compiles or launches generated
 GEMMs. Public API accuracy and launch behavior remain covered by the GEMM UTs.
+## 810E INT8 and 890 FP4 sparse MQA network workloads
+
+[workloads/sparse_mqa_operatorsforge.json](workloads/sparse_mqa_operatorsforge.json)
+selects 10 original DeepSeek-V4.1-Flash cases from OperatorsForge: seven prefill
+cases and three paged decode sources. The manifest records the source revision,
+file hashes, physical line numbers, unchanged case strings, and derived shapes.
+[workloads/sparse_mqa_operatorsforge_810e.list](workloads/sparse_mqa_operatorsforge_810e.list)
+contains 10 executable INT8 nonpaged test cases derived from these sources.
+[workloads/sparse_mqa_operatorsforge_890p.list](workloads/sparse_mqa_operatorsforge_890p.list)
+contains the matching FP4 cases for 890, with the same request arrays, prefix
+candidates, causal windows, capacity and random seed.
+The three decode cases are explicitly labelled `decode_nonpaged_equivalent`:
+they preserve request lengths and causal windows but use a flat, block-aligned
+KV pool. They do not test paged cache lookup or establish native paged support.
+These are generated model workloads, not production traces. All 10 adapted
+INT8 cases passed on 810E and all 10 FP4 cases passed on 890 on 2026-11-04.
+Each run checked all 1,340,366,609 valid outputs against its dtype's reference
+with zero tolerance and no skips. The existing 810E 11-case check-in also passed
+all 22 compile/accuracy results. See the [INT8 validation report](../profile/sparse-int8-network/REPORT.md)
+and [810E/890 comparison report](../profile/sparse-mqa-comparison/REPORT.md).
+
+All selected cases use H32/D128, block8, capacity2048, compress_ratio=1 and CP1.
+The prefill focus set is:
+
+| Case ID suffix | Total Q | Aligned KV pool | Focus |
+| --- | ---: | ---: | --- |
+| `small_prefix` | 24 | 194 | Short-Q latency and KV tail |
+| `odd_causal` | 969 | 969 | Causal windows, odd Q and KV tail |
+| `many_short_requests` | 32768 | 33575 | 218 requests and alignment gaps |
+| `causal_capacity_boundary` | 31801 | 31801 | Causal windows crossing the 16384-token selection limit |
+| `long_prefix_small_q` | 200 | 639314 | Full selected capacity with short Q |
+| `long_prefix_large_q` | 32768 | 671882 | Full-capacity throughput |
+| `mixed_requests` | 32768 | 671889 | Long-prefix and pure-causal requests |
+
+Custom cases use `request_q_lens:[...]`, `request_kv_lens:[...]`, and
+`index_pattern:prefix`; the supplied cases use `compress_ratio:1`. The two
+arrays have one entry per request, with `0 < Q <= K`. Each request's compressed
+KV segment starts at a `sparse_block_kv` boundary. Query `j` sees
+`floor((K-Q+1+j)/compress_ratio)` tokens, and selects the contiguous block prefix
+up to the configured capacity. `seq_len_q` must equal the sum of Q lengths;
+`seq_len_kv` must equal the complete flat KV pool, including alignment gaps.
+Both scalar fields may be omitted and are then derived automatically.
+
+Run from the repository root:
+
+```bash
+# Custom short-Q case with a long prefix; scalar lengths are inferred.
+python tests/run_deep_gemm.py --require_supported \
+  --format 'SparseMqaLogits,data_type:int8,request_q_lens:[200],request_kv_lens:[639314],num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:2048,compress_ratio:1,index_pattern:prefix'
+
+# All 10 cases: accuracy plus metadata, compute, and combined timings.
+python tests/run_deep_gemm.py \
+  --caselist tests/workloads/sparse_mqa_operatorsforge_810e.list \
+  --benchmark --require_supported
+
+# Matching FP4 cases on 890.
+python tests/run_deep_gemm.py \
+  --caselist tests/workloads/sparse_mqa_operatorsforge_890p.list \
+  --benchmark --require_supported
+```
+
+For a custom FP4 case on 890, change `data_type:int8` to `data_type:fp4` in the
+same `--format` command; the array input and logical shape rules are unchanged.
+FP4 here means packed MXFP4, as accepted by `fp8_fp4_sparse_mqa_logits`.
+
+The INT8 array path generates INT8 Q/K, FP32 per-token K scales, and BF16
+weights with Q scales folded in once. It checks every valid output against an
+independent reference with the kernel's BF16 rounding, using `rtol=0, atol=0`.
+The reference preserves single-round BF16 FMA at midpoint cases; simply using
+FP32 multiply-add followed by BF16 conversion can introduce double rounding.
+
+The FP4 array path retains packed per-32-element Q/K scales and BF16 weights
+without folding Q scales into weights. It compares every valid slot to the
+dense FP4 kernel with identical quantized inputs and BF16 output, also with
+`rtol=0, atol=0`. Each request's reference uses only its selected KV prefix
+(at most 16384 tokens for these cases). The FP4 allocation appends zero tokens
+to complete the final sparse block because gather loads whole blocks; logical
+KV lengths, metadata windows and valid output positions remain unchanged.
+
+Both reference paths split work into query chunks;
+`reference_chunk_q` defaults to 16 and can be set in `--format`. This avoids
+allocating a full dense Q-by-KV reference, whose output alone would reach about
+41 GiB for the largest case; the sparse output still reaches 1 GiB. The default
+FP4 reference output uses at most 512 KiB per chunk for the supplied cases.
+
+The source JSON remains an inventory, not a runnable caselist. The original
+OperatorsForge sparse runner hardcodes FP4, including when passed
+`--indexer-dtype int8`; these tests select the INT8 or FP4 API directly.
+Continuous-prefix candidates reuse a small part of a long KV pool; long context
+alone does not demonstrate scattered-access bandwidth. Retain the existing
+random/disjoint-index, B16, empty-window and numerical-extreme regressions.
 
 ## Test fp8
 python ./test_fp8_core.py

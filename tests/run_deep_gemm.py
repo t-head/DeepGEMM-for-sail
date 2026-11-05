@@ -20,6 +20,12 @@ def device_version_supported(one_case):
     caselist can run on both PPU1.0 and PPU1.5.
     """
     data_type = one_case.get('data_type')
+    sparse_int8 = (one_case.get('gemm_type') in ('SparseMqaLogits', 'PagedSparseMqaLogits')
+                   and data_type == torch.int8)
+    if sparse_int8 and one_case.get('gemm_type') == 'PagedSparseMqaLogits':
+        return False, 'Paged sparse INT8 MQA logits is not implemented'
+    if (sparse_int8 or one_case.get('case') == 'sparse_int8') and get_arch_version() != 80:
+        return False, 'INT8 sparse MQA logits requires PPU1.0 (ZW810E, sm_80)'
     if one_case.get('device') == '810e' and 'ZW810E' not in torch.cuda.get_device_name():
         return False, 'This regression case requires ZW810E'
     if one_case.get('gemm_type') == 'Activation' or data_type in ('w4fa16_mma', 'w4fa8_mma'):
@@ -44,6 +50,9 @@ atexit.register(device_sync_at_exit)
 
 
 def run_attention_regression(args):
+    if args['case'] == 'sparse_int8':
+        from test_attention import test_int8_sparse_edges
+        return test_int8_sparse_edges(check_accuracy=get_acc_check())
     from test_attention import test_ks_ke, test_per_layer_cache_view
     functions = {'ks_ke': test_ks_ke, 'cache_view': test_per_layer_cache_view}
     return functions[args['case']](check_accuracy=get_acc_check())

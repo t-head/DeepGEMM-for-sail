@@ -27,7 +27,7 @@ namespace deep_gemm {
 // Layout structs/constants live in the shared device+host header
 // `deep_gemm/impls/sparse_mqa_logits_layout.cuh`.
 //
-// MXFP4 only.
+// MXFP4 and non-paged INT8.
 namespace sparse_mqa_logits {
 
 // Schedule table columns: one slot per resident CTA of the sparse main kernel.
@@ -36,7 +36,7 @@ inline int get_num_sparse_slots() {
 }
 
 static uint32_t get_sparse_split_kv(const at::ScalarType& qk_dtype) {
-    // MXFP4 only.
+    // Packed MXFP4 and INT8 both use int8 storage and the same 128-token split.
     DG_HOST_ASSERT(qk_dtype == torch::kInt8);
     return kSplitKV;
 }
@@ -365,6 +365,122 @@ static void launch_fp4_paged_sparse_mqa_logits(
     launch_fp4_sparse_mqa_logits_impl(q, q_sf, empty, empty, kv_cache, weights, metadata, logits,
                                       logits_stride, sparse_block_kv, seq_len_q, seq_len_kv,
                                       num_max_sparse_blocks, /*use_unaligned_ks=*/false, /*is_paged=*/true);
+}
+
+// Host-side mirror of PPUSparseMqaLogitsINT8::Arguments. Q scales are folded into weights.
+struct SparseMqaLogitsINT8Arguments {
+    const int8_t* ptr_q;
+    const int8_t* ptr_k;
+    const float* k_scales;
+    const void* weights;
+    const uint8_t* metadata;
+    void* logits;
+    uint32_t logits_stride;
+    uint32_t num_q_tokens;
+    uint32_t num_kv_tokens;
+};
+
+class SparseMqaLogitsINT8Runtime final : public LaunchRuntime<SparseMqaLogitsINT8Runtime> {
+public:
+    struct LaunchInfo {
+        std::string kernel_name;
+        uint32_t num_slots, sparse_block_kv;
+        int num_threads, smem_size;
+    };
+
+    struct Args {
+        LaunchInfo launch_info;
+        LaunchArgs launch_args;
+        SparseMqaLogitsINT8Arguments kernel_params;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(
+            R"(
+#include <deep_gemm/impls/int8_sparse_mqa_logits.cuh>
+namespace deep_gemm {{
+
+using AttnKernel = cutlass::gemm::kernel::PPUSparseMqaLogitsINT8<
+  int8_t, int32_t, __ppu_bfloat16, __ppu_bfloat16,
+  64, deep_gemm::sparse_mqa_logits::kSplitKV, 32, 32, 1, 3, {}, {}>;
+
+static_assert(AttnKernel::SharedStorageSize == {}, "host/device shared memory size mismatch");
+static_assert(AttnKernel::MaxThreadsPerBlock == {}, "host/device thread count mismatch");
+static_assert(sizeof(AttnKernel::Params) == {}, "host/device parameter size mismatch");
+
+extern "C"
+__global__ __launch_bounds__(AttnKernel::MaxThreadsPerBlock, AttnKernel::MinBlocksPerMultiprocessor)
+void {}(typename AttnKernel::Params params) {{
+  extern __shared__ char smem[];
+  AttnKernel op;
+  op(params, smem);
+}}
+}}
+)",
+            args.launch_info.sparse_block_kv, args.launch_info.num_slots,
+            args.launch_info.smem_size, args.launch_info.num_threads,
+            sizeof(SparseMqaLogitsINT8Arguments), args.launch_info.kernel_name);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    }
+};
+
+static void launch_int8_sparse_mqa_logits(
+    const torch::Tensor& q, const torch::Tensor& kv, const torch::Tensor& k_scales,
+    const torch::Tensor& weights, const torch::Tensor& metadata, torch::Tensor& logits,
+    const uint32_t logits_stride, const uint32_t sparse_block_kv,
+    const uint32_t seq_len_q, const uint32_t seq_len_kv, const uint32_t num_max_sparse_blocks,
+    const bool use_unaligned_ks) {
+    // Preserve the metadata Q-pair / split / slot contract while using the dense INT8 warp tile.
+    const deep_gemm_mqa_common::MqaLogitsConfig config{
+        .block_q = 2, .block_qh = 64, .block_kv = 128, .warp_qh = 32, .warp_kv = 32,
+        .num_q_stages = 1, .num_kv_stages = 3};
+    constexpr int kNumThreads = 256;
+    const uint32_t num_slots = get_num_sparse_slots();
+    const int smem_size = deep_gemm_mqa_common::get_smem_config(config, 128, 1, 2, false) +
+                          4 * get_num_sparse_kv_split_bytes(sparse_block_kv);
+    const auto kernel_name = "attention_sparse_mqa_logits_int8";
+    auto args = SparseMqaLogitsINT8Runtime::Args{
+        .launch_info = {kernel_name, num_slots, sparse_block_kv, kNumThreads, smem_size},
+        .launch_args = {dim3(static_cast<int>(num_slots), 1, 1), dim3(kNumThreads, 1, 1), smem_size},
+        .kernel_params = {q.data_ptr<int8_t>(), kv.data_ptr<int8_t>(), k_scales.data_ptr<float>(),
+                          weights.data_ptr(), metadata.data_ptr<uint8_t>(), logits.data_ptr(),
+                          logits_stride, seq_len_q, seq_len_kv},
+    };
+    const auto& code = SparseMqaLogitsINT8Runtime::generate(args);
+    const auto& runtime = compiler->build(kernel_name, code);
+
+    char* pEnv_params = std::getenv("show_log");
+    if (pEnv_params && isdigit(*pEnv_params)) {
+        int num_regs = 0, local_size = 0, max_blocks_per_cu = 0;
+        hgFuncGetAttribute(&num_regs, HG_FUNC_ATTRIBUTE_NUM_REGS, runtime->kernel);
+        hgFuncGetAttribute(&local_size, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, runtime->kernel);
+        hgOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_cu, runtime->kernel, kNumThreads, smem_size);
+        printf("[sparse_mqa_logits_int8:]\n");
+        printf("kNumHeads:32, kHeadDim:128, BLOCK_QH:%d, SPARSE_BLOCK_KV:%u\n",
+               config.block_qh, sparse_block_kv);
+        printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n",
+               config.block_kv, config.block_qh, config.warp_kv, config.warp_qh,
+               config.num_q_stages, config.num_kv_stages);
+        printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%u, num_threads:%d\n",
+               get_num_sms(), max_blocks_per_cu, num_slots, kNumThreads);
+        printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, num_regs, local_size);
+        printf("weights_bf16:true\n");
+    }
+
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_sparse_mqa_logits_params(
+            "int8", static_cast<int>(seq_len_q), static_cast<int>(seq_len_kv),
+            static_cast<int>(kNumHeads), static_cast<int>(kHeadDim),
+            static_cast<int>(sparse_block_kv), static_cast<int>(num_max_sparse_blocks), use_unaligned_ks,
+            /*is_paged=*/false, current_stream());
+    }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    SparseMqaLogitsINT8Runtime::launch(runtime, args);
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
 }
 
 } // namespace sparse_mqa_logits

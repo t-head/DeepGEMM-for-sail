@@ -2506,6 +2506,53 @@ def ref_sparse_mqa_logits(q: torch.Tensor, kv_gathered: torch.Tensor, weights: t
     logits = (score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)).sum(dim=0)
     return logits * valid_mask  # zero out non-valid slots
 
+
+def bf16_fma_reference(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """Single-round BF16 FMA for finite test inputs with an exact FP32 product.
+
+    BF16 operands have an exact FP32 product, but rounding their sum to FP32
+    can discard a tiny addend at a BF16 midpoint. TwoSum recovers that residual;
+    nudging a midpoint one FP32 ULP toward it preserves the native BF16 FMA's
+    single-round result. A plain `(a.float()*b.float()+c.float()).bfloat16()`
+    incorrectly rounds 3*174 + 2**-16 to 520 instead of 524.
+    """
+    product, addend = a.float() * b.float(), c.float()
+    total = product + addend
+    virtual_addend = total - product
+    residual = (product - (total - virtual_addend)) + (addend - virtual_addend)
+    bits = total.contiguous().view(torch.int32)
+    midpoint = ((bits & 0xffff) == 0x8000) & (residual != 0)
+    direction = torch.where((total > 0) == (residual > 0), 1, -1).to(torch.int32)
+    corrected = bits + torch.where(midpoint, direction, 0)
+    return corrected.view(torch.float32).to(torch.bfloat16)
+
+
+def ref_int8_sparse_mqa_logits(q: torch.Tensor, kv_gathered: torch.Tensor,
+                               kv_scales: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Independent INT8 dot and BF16 weighted epilogue, using the actual API inputs.
+
+    INT8 products and the D128 integer sum are exact in FP32. The dense BF16
+    epilogue rounds ReLU scores, each paired FMA, the local sum, KV scale and
+    both cross-lane additions; rounding only the final FP32 sum is not equivalent.
+    Q scales have already been folded into the BF16 weights by the caller.
+    """
+    scores = torch.einsum('qhd,qwd->qwh', q.float(), kv_gathered.float()).relu().to(torch.bfloat16)
+    rows, width, heads = scores.shape
+    assert heads == 32
+    if get_arch_version() >= 89:
+        scores = scores.reshape(rows, width, 4, 4, 2).transpose(-1, -2)
+        paired_weights = weights.reshape(rows, 4, 4, 2).transpose(-1, -2)
+    else:
+        scores = scores.reshape(rows, width, 4, 2, 4)
+        paired_weights = weights.reshape(rows, 4, 2, 4)
+    accum = torch.zeros((rows, width, 2, 4), device=q.device, dtype=torch.bfloat16)
+    for group in range(4):
+        accum = bf16_fma_reference(scores[:, :, group], paired_weights[:, None, group], accum)
+    lanes = (accum[:, :, 0].float() + accum[:, :, 1].float()).to(torch.bfloat16)
+    lanes = (lanes.float() * kv_scales.to(torch.bfloat16).float().unsqueeze(-1)).to(torch.bfloat16)
+    pairs = (lanes[:, :, 0::2].float() + lanes[:, :, 1::2].float()).to(torch.bfloat16)
+    return (pairs[:, :, 0].float() + pairs[:, :, 1].float()).to(torch.bfloat16)
+
 # ------------------------------------------------------------ sparse metadata reference checks
 
 # Layout mirrors deep_gemm/include/deep_gemm/impls/sparse_mqa_logits_layout.cuh
@@ -2824,27 +2871,124 @@ def verify_paged_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int,
             actual = tuple(decoded['schedule'][wave * num_slots + slot])
             assert actual == entry, f"Paged wave ordering mismatch at wave {wave}, slot {slot}: {actual} vs {entry}"
 
+def check_int8_sparse_reference_chunks(q, kv, weights, logits, sparse_indices,
+                                       num_blocks_per_q, context_starts, context_ends,
+                                       sparse_block_kv, chunk_size=16):
+    """Check every valid output with a bounded, independent BF16 epilogue reference."""
+    assert isinstance(chunk_size, int) and chunk_size > 0
+    checked_positions = 0
+    for begin in range(0, q.size(0), chunk_size):
+        end = min(begin + chunk_size, q.size(0))
+        blocks = max(num_blocks_per_q[begin:end])
+        if blocks == 0:
+            continue
+        ids = sparse_indices[begin:end, :blocks].long()
+        tokens = (ids.unsqueeze(-1) * sparse_block_kv
+                  + (context_starts[begin:end] % sparse_block_kv)[:, None, None]
+                  + torch.arange(sparse_block_kv, device=q.device)).flatten(1)
+        counts = torch.tensor(num_blocks_per_q[begin:end], device=q.device)
+        valid = torch.arange(tokens.size(1), device=q.device)[None, :] < counts[:, None] * sparse_block_kv
+        valid &= tokens >= context_starts[begin:end, None]
+        valid &= tokens < context_ends[begin:end, None]
+        selected = tokens.clamp(min=0, max=kv[0].size(0) - 1)
+        expected = ref_int8_sparse_mqa_logits(
+            q[begin:end], kv[0][selected], kv[1][selected], weights[begin:end])
+        actual = logits[begin:end, :tokens.size(1)]
+        torch.testing.assert_close(actual[valid], expected[valid], rtol=0, atol=0,
+                                   msg=lambda message: f"INT8 sparse reference at Q rows [{begin}, {end}):\n{message}")
+        checked_positions += int(valid.sum().item())
+    print(f"Independent chunked reference passed: rows={q.size(0)}, valid_positions={checked_positions}, "
+          f"chunk_size={chunk_size}")
+    return checked_positions
+
+
+def check_fp4_sparse_prefix_reference_chunks(q, kv, weights, logits, request_sizes,
+                                             context_starts_list, lengths,
+                                             num_max_sparse_tokens, chunk_size=16):
+    """Compare every valid prefix slot to dense FP4 with bounded per-request Q/K views.
+
+    The dense kernel preserves the packed FP4 MMA and BF16 epilogue rounding.
+    Local KV contains only the selected prefix, so neither a full Q-by-poolK
+    output nor a Q-by-selectedK-by-D gather is materialized.
+    """
+    assert isinstance(chunk_size, int) and chunk_size > 0
+    assert sum(request_sizes) == q[0].size(0) == len(lengths) == len(context_starts_list)
+    checked_positions, request_begin = 0, 0
+    for request_size in request_sizes:
+        request_end = request_begin + request_size
+        start = context_starts_list[request_begin]
+        prefix_length = min(lengths[request_end - 1], num_max_sparse_tokens)
+        if prefix_length > 0:
+            assert start + prefix_length <= kv[0].size(0)
+            request_kv = (kv[0][start:start + prefix_length], kv[1][start:start + prefix_length])
+            columns = torch.arange(prefix_length, device=q[0].device)
+            for begin in range(request_begin, request_end, chunk_size):
+                end = min(begin + chunk_size, request_end)
+                local_lengths = [min(length, prefix_length) for length in lengths[begin:end]]
+                local_ends = torch.tensor(local_lengths, device=q[0].device, dtype=torch.int32)
+                expected = deep_gemm.fp8_fp4_mqa_logits(
+                    (q[0][begin:end], q[1][begin:end]), request_kv, weights[begin:end],
+                    torch.zeros_like(local_ends), local_ends, clean_logits=False,
+                    max_seqlen_k=prefix_length, logits_dtype=torch.bfloat16)
+                valid = columns[None, :] < local_ends[:, None]
+                actual = logits[begin:end, :prefix_length]
+                torch.testing.assert_close(actual[valid], expected[:, :prefix_length][valid], rtol=0, atol=0,
+                                           msg=lambda message: f"FP4 sparse prefix reference at Q rows [{begin}, {end}):\n{message}")
+                checked_positions += sum(local_lengths)
+        request_begin = request_end
+    print(f"Dense FP4 chunked reference passed: rows={q[0].size(0)}, valid_positions={checked_positions}, "
+          f"chunk_size={chunk_size}")
+    return checked_positions
+
+
 def test_sparse_mqa_logits(args) -> None:
     print('Testing Sparse MQA Logits:')
     data_type = args['data_type']
-    seq_len_q = args['seq_len_q']
-    seq_len_kv = args['seq_len_kv']
     num_heads = args.get('num_heads', 32)
     head_dim = args.get('head_dim', 128)
     sparse_block_kv = args.get('sparse_block_kv', 16)
     num_max_sparse_blocks = args.get('num_max_sparse_blocks', 128)
     use_unaligned_ks = bool(args.get('use_unaligned_ks', 0))
+    explicit_requests = 'request_q_lens' in args or 'request_kv_lens' in args
+    if explicit_requests:
+        assert args.get('gemm_type', 'SparseMqaLogits') == 'SparseMqaLogits'
+        assert data_type in (torch.int8, torch.uint8), "Explicit request workloads support INT8 or MXFP4"
+        assert not use_unaligned_ks, "Explicit request KV segments are block-aligned"
+        assert args.get('index_pattern', 'prefix') == 'prefix'
+        request_sizes, request_kv_lens = args['request_q_lens'], args['request_kv_lens']
+        assert isinstance(request_sizes, list) and isinstance(request_kv_lens, list)
+        assert len(request_sizes) == len(request_kv_lens) > 0
+        assert all(isinstance(q, int) and isinstance(k, int) and 0 < q <= k
+                   for q, k in zip(request_sizes, request_kv_lens))
+        compress_ratio = args.get('compress_ratio', 1)
+        assert isinstance(compress_ratio, int) and compress_ratio > 0
+        context_starts_list, lengths, pool_end = [], [], 0
+        for size, kv_len in zip(request_sizes, request_kv_lens):
+            start = ceil_div(pool_end, sparse_block_kv) * sparse_block_kv
+            context_starts_list.extend([start] * size)
+            lengths.extend((kv_len - size + 1 + j) // compress_ratio for j in range(size))
+            pool_end = start + kv_len // compress_ratio
+        seq_len_q, seq_len_kv = sum(request_sizes), max(1, pool_end)
+        assert args.get('seq_len_q', seq_len_q) == seq_len_q, "seq_len_q must equal sum(request_q_lens)"
+        assert args.get('seq_len_kv', seq_len_kv) == seq_len_kv, "seq_len_kv must equal the aligned flat KV pool"
+        print(f"Explicit workload: case_id={args.get('case_id', 'custom')}, "
+              f"source_phase={args.get('source_phase', 'custom_nonpaged')}, "
+              f"requests={len(request_sizes)}, index_pattern=prefix, compress_ratio={compress_ratio}")
+        torch.manual_seed(args.get('seed', 0))
+    else:
+        seq_len_q, seq_len_kv = args['seq_len_q'], args['seq_len_kv']
     print("test_sparse_mqa_logits->test_func: {},data_type:{},seq_len_q:{},seq_len_kv:{},num_heads:{},head_dim:{},"
           "sparse_block_kv:{},num_max_sparse_blocks:{},use_unaligned_ks:{}".format(
               args.get('gemm_type', 'SparseMqaLogits'), data_type, seq_len_q, seq_len_kv, num_heads, head_dim,
               sparse_block_kv, num_max_sparse_blocks, use_unaligned_ks))
 
-    assert data_type == torch.uint8, "Sparse MQA Logits supports MXFP4 only"
+    assert data_type in (torch.uint8, torch.int8), "Sparse MQA Logits supports MXFP4 or INT8"
     assert num_heads == 32 and head_dim == 128, "num_heads/head_dim are sparse layout constants (32/128)"
     assert num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096
     assert sparse_block_kv in (8, 16)
 
     if args.get('gemm_type', 'SparseMqaLogits') == 'PagedSparseMqaLogits':
+        assert data_type == torch.uint8, "Paged Sparse MQA Logits supports MXFP4 only"
         # Paged KV: ks = 0 per token, ke = context_lens[q]; the fused fp4
         # cache interleaves a trailing 4B SF per token row; block_table resolves logical pages.
         page_kv = args.get('page_kv', 64)
@@ -2966,25 +3110,28 @@ def test_sparse_mqa_logits(args) -> None:
     # sliding ke = seq_len_kv + token offset (deterministic, so edge values like 0 / split_kv±1 are
     # expressible via the case string). ks is grid-aligned unless use_unaligned_ks; the KV pool
     # stacks requests back to back.
-    rng = random.Random(seq_len_q * 1000003 + seq_len_kv + sparse_block_kv)
-    num_requests = min(rng.randint(2, 4), seq_len_q)
-    request_ends = sorted(rng.sample(range(1, seq_len_q), num_requests - 1)) + [seq_len_q]
-    request_sizes = [end - begin for begin, end in zip([0] + request_ends, request_ends)]
-    request_indices = [req for req, size in enumerate(request_sizes) for _ in range(size)]
-    aligned_starts, unaligned_starts, lengths = [], [], []
-    aligned_end = unaligned_end = 0
-    for size in request_sizes:
-        aligned_start = ceil_div(aligned_end, sparse_block_kv) * sparse_block_kv
-        unaligned_start = ceil_div(unaligned_end, sparse_block_kv) * sparse_block_kv + rng.randrange(1, sparse_block_kv)
-        aligned_starts.extend([aligned_start] * size)
-        unaligned_starts.extend([unaligned_start] * size)
-        lengths.extend([seq_len_kv + offset for offset in range(size)])
-        aligned_end = aligned_start + lengths[-1]
-        unaligned_end = unaligned_start + lengths[-1]
-    assert all(s % sparse_block_kv == 0 for s in aligned_starts)
-    assert all(s % sparse_block_kv != 0 for s in unaligned_starts)
-    num_kv_tokens = max(1, unaligned_end if use_unaligned_ks else aligned_end)
-    context_starts_list = unaligned_starts if use_unaligned_ks else aligned_starts
+    if explicit_requests:
+        num_kv_tokens = seq_len_kv
+    else:
+        rng = random.Random(seq_len_q * 1000003 + seq_len_kv + sparse_block_kv)
+        num_requests = min(rng.randint(2, 4), seq_len_q)
+        request_ends = sorted(rng.sample(range(1, seq_len_q), num_requests - 1)) + [seq_len_q]
+        request_sizes = [end - begin for begin, end in zip([0] + request_ends, request_ends)]
+        request_indices = [req for req, size in enumerate(request_sizes) for _ in range(size)]
+        aligned_starts, unaligned_starts, lengths = [], [], []
+        aligned_end = unaligned_end = 0
+        for size in request_sizes:
+            aligned_start = ceil_div(aligned_end, sparse_block_kv) * sparse_block_kv
+            unaligned_start = ceil_div(unaligned_end, sparse_block_kv) * sparse_block_kv + rng.randrange(1, sparse_block_kv)
+            aligned_starts.extend([aligned_start] * size)
+            unaligned_starts.extend([unaligned_start] * size)
+            lengths.extend([seq_len_kv + offset for offset in range(size)])
+            aligned_end = aligned_start + lengths[-1]
+            unaligned_end = unaligned_start + lengths[-1]
+        assert all(s % sparse_block_kv == 0 for s in aligned_starts)
+        assert all(s % sparse_block_kv != 0 for s in unaligned_starts)
+        num_kv_tokens = max(1, unaligned_end if use_unaligned_ks else aligned_end)
+        context_starts_list = unaligned_starts if use_unaligned_ks else aligned_starts
     context_starts = torch.tensor(context_starts_list, device='cuda', dtype=torch.int32)
     context_ends = torch.tensor([s + l for s, l in zip(context_starts_list, lengths)],
                                 device='cuda', dtype=torch.int32)
@@ -2992,28 +3139,49 @@ def test_sparse_mqa_logits(args) -> None:
     q = torch.randn(seq_len_q, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
     kv = torch.randn(num_kv_tokens, head_dim, device='cuda', dtype=torch.bfloat16)
     weights = torch.randn(seq_len_q, num_heads, device='cuda', dtype=torch.bfloat16)
-    q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-    q_in = (q_fp4[0].view(seq_len_q, num_heads, head_dim // 2), q_fp4[1].view(seq_len_q, num_heads))
-    q_dequant = cast_back_from_fp4(q_fp4[0], q_fp4[1], gran_k=32, use_packed_ue8m0=True).view(
-        seq_len_q, num_heads, head_dim).to(torch.bfloat16)
-    kv_fp4 = per_token_cast_to_fp4(kv, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-    kv_in = (kv_fp4[0], kv_fp4[1].squeeze(-1))
-    kv_dequant = cast_back_from_fp4(kv_fp4[0], kv_fp4[1], gran_k=32, use_packed_ue8m0=True).view(
-        num_kv_tokens, head_dim).to(torch.bfloat16)
+    if explicit_requests and data_type == torch.uint8:
+        # FP4 sparse gather loads complete blocks without a physical token bound.
+        # Pad only the allocation; metadata and causal windows retain the logical
+        # pool length. Append after random input generation to preserve its seed.
+        padding = round_up(num_kv_tokens, sparse_block_kv) - num_kv_tokens
+        if padding:
+            kv = torch.cat((kv, kv.new_zeros((padding, head_dim))))
+        print(f"FP4 KV allocation: logical_tokens={num_kv_tokens}, allocated_tokens={kv.size(0)}")
+    if data_type == torch.int8:
+        q_int8, q_scale = per_token_cast_to_int8(q.view(-1, head_dim))
+        q_in = q_int8.view(seq_len_q, num_heads, head_dim)
+        weights = weights * q_scale.view(seq_len_q, num_heads).to(weights.dtype)
+        kv_int8, kv_scale = per_token_cast_to_int8(kv)
+        kv_in = (kv_int8, kv_scale.flatten())
+    else:
+        q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        q_in = (q_fp4[0].view(seq_len_q, num_heads, head_dim // 2), q_fp4[1].view(seq_len_q, num_heads))
+        kv_fp4 = per_token_cast_to_fp4(kv, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        kv_in = (kv_fp4[0], kv_fp4[1].squeeze(-1))
+        if not explicit_requests:
+            q_dequant = cast_back_from_fp4(q_fp4[0], q_fp4[1], gran_k=32, use_packed_ue8m0=True).view(
+                seq_len_q, num_heads, head_dim).to(torch.bfloat16)
+            kv_dequant = cast_back_from_fp4(kv_fp4[0], kv_fp4[1], gran_k=32, use_packed_ue8m0=True).view(
+                num_kv_tokens, head_dim).to(torch.bfloat16)
 
-    sparse_indices, num_blocks_per_q = make_sparse_kv_block_indices(
-        context_ends, context_starts, sparse_block_kv, num_max_sparse_blocks,
-        seed=seq_len_q + num_kv_tokens + sparse_block_kv, request_indices=request_indices)
+    if explicit_requests:
+        num_blocks_per_q = [min(num_max_sparse_blocks, ceil_div(length, sparse_block_kv)) for length in lengths]
+        counts = torch.tensor(num_blocks_per_q, device='cuda', dtype=torch.int32)
+        slots = torch.arange(num_max_sparse_blocks, device='cuda', dtype=torch.int32)
+        sparse_indices = (context_starts[:, None] // sparse_block_kv
+                          + torch.minimum(slots[None, :], (counts[:, None] - 1).clamp_min(0)))
+    else:
+        sparse_indices, num_blocks_per_q = make_sparse_kv_block_indices(
+            context_ends, context_starts, sparse_block_kv, num_max_sparse_blocks,
+            seed=seq_len_q + num_kv_tokens + sparse_block_kv, request_indices=request_indices)
 
-    # Ground truth (acc mode only — perf mode must not launch the dense kernel into the cycle
-    # CSV): dense MXFP4 kernel with bf16 logits (compressed relative columns), gathered at the
-    # selected positions. The sparse kernel must match this bitwise (same block-scale MMA
-    # grouping and same ReLU+weighted-sum epilogue).
+    # Compare identical quantized inputs and BF16 epilogues, at the selected slots.
     gathered_ref, valid_mask = None, None
     # Precompile the dense JIT reference without inspecting its outputs.
-    if get_acc_check() or os.environ.get('HGGC_WARM_UP'):
-        full_logits = deep_gemm.fp8_fp4_mqa_logits(
-            q=q_in, kv=kv_in, weights=weights, cu_seq_len_k_start=context_starts, cu_seq_len_k_end=context_ends,
+    if not explicit_requests and (get_acc_check() or os.environ.get('HGGC_WARM_UP')):
+        dense_kernel = deep_gemm.int8_mqa_logits if data_type == torch.int8 else deep_gemm.fp8_fp4_mqa_logits
+        full_logits = dense_kernel(
+            q_in, kv_in, weights, context_starts, context_ends,
             clean_logits=False, max_seqlen_k=int(num_kv_tokens), logits_dtype=torch.bfloat16)
         if get_acc_check():
             gathered_ref, valid_mask = gather_sparse_reference(
@@ -3035,20 +3203,31 @@ def test_sparse_mqa_logits(args) -> None:
                 block_offsets = (context_starts % sparse_block_kv).to(torch.int64)
                 token_indices = (sparse_indices.long().unsqueeze(-1) * sparse_block_kv
                                  + block_offsets[:, None, None] + kv_offsets).flatten(1)
-                kv_gathered = kv_dequant[token_indices.clamp(min=0, max=num_kv_tokens - 1)]
-                ref_logits = ref_sparse_mqa_logits(q_dequant, kv_gathered, weights, valid_mask)
-                diff = calc_diff(gathered_ref.masked_fill(~valid_mask, 0).float(), ref_logits.float())
-                threshold = 1.5e-3
-                if torch.isnan(diff) or diff >= threshold:
-                    print(f"ERROR: Sparse reference harness check failed, diff={diff}")
-                    exit(1)
+                safe_indices = token_indices.clamp(min=0, max=num_kv_tokens - 1)
+                if data_type == torch.int8:
+                    # Bound the gathered QxWxD temporary without dropping the independent check.
+                    for begin in range(0, seq_len_q, 16):
+                        end = min(begin + 16, seq_len_q)
+                        selected = safe_indices[begin:end]
+                        ref_logits = ref_int8_sparse_mqa_logits(
+                            q_in[begin:end], kv_in[0][selected], kv_in[1][selected], weights[begin:end])
+                        mask = valid_mask[begin:end]
+                        torch.testing.assert_close(gathered_ref[begin:end][mask], ref_logits[mask], rtol=0, atol=0)
                 else:
-                    print("Sparse reference harness check passed")
+                    kv_gathered = kv_dequant[safe_indices]
+                    ref_logits = ref_sparse_mqa_logits(q_dequant, kv_gathered, weights, valid_mask)
+                    diff = calc_diff(gathered_ref.masked_fill(~valid_mask, 0).float(), ref_logits.float())
+                    if torch.isnan(diff) or diff >= 1.5e-3:
+                        raise AssertionError(f"Sparse reference harness check failed, diff={diff}")
+                print("Sparse reference harness check passed")
 
-    metadata = deep_gemm.get_sparse_mqa_logits_metadata(
-        cu_seq_len_k_start=context_starts, cu_seq_len_k_end=context_ends, num_kv_tokens=int(num_kv_tokens),
-        sparse_kv_block_indices=sparse_indices, qk_dtype=q_in[0].dtype,
-        sparse_block_kv=sparse_block_kv, use_unaligned_ks=use_unaligned_ks)
+    def make_metadata():
+        return deep_gemm.get_sparse_mqa_logits_metadata(
+            cu_seq_len_k_start=context_starts, cu_seq_len_k_end=context_ends, num_kv_tokens=int(num_kv_tokens),
+            sparse_kv_block_indices=sparse_indices, qk_dtype=torch.int8,
+            sparse_block_kv=sparse_block_kv, use_unaligned_ks=use_unaligned_ks)
+
+    metadata = make_metadata()
     if args.get('check_metadata', 0) and get_acc_check():
         # Decode the kernel's metadata and verify against the Python reference
         decoded = decode_sparse_metadata(metadata, sparse_block_kv)
@@ -3059,19 +3238,61 @@ def test_sparse_mqa_logits(args) -> None:
         num_contiguous = sum(s["is_contiguous"] for s in decoded["splits"])
         print(f"Contiguous splits: {num_contiguous}/{decoded['num_kv_splits']}")
         print("Metadata check passed")
-    sparse_logits = deep_gemm.fp8_fp4_sparse_mqa_logits(
-        q=q_in, kv=kv_in, weights=weights, metadata=metadata,
-        num_max_sparse_blocks=num_max_sparse_blocks, sparse_block_kv=sparse_block_kv,
-        use_unaligned_ks=use_unaligned_ks)
+    sparse_kernel = deep_gemm.int8_sparse_mqa_logits if data_type == torch.int8 else deep_gemm.fp8_fp4_sparse_mqa_logits
 
-    # Bitwise comparison against the gathered dense output (single kernel call per UT convention)
+    def compute(meta):
+        return sparse_kernel(q_in, kv_in, weights, meta, num_max_sparse_blocks, sparse_block_kv,
+                             use_unaligned_ks=use_unaligned_ks)
+
+    sparse_logits = compute(metadata)
+
+    # Compare every valid slot; explicit workloads use bounded reference chunks.
     if get_acc_check():
+        assert sparse_logits.shape == (seq_len_q, round_up(num_max_sparse_blocks * sparse_block_kv, 512))
+        assert sparse_logits.dtype == torch.bfloat16
         # The API pads each output row to 512 elements; padding is not a sparse slot.
         logical_logits = sparse_logits[:, :num_max_sparse_blocks * sparse_block_kv]
-        if not torch.equal(logical_logits[valid_mask], gathered_ref[valid_mask]):
-            print("ERROR: sparse MQA logits mismatch against gathered dense reference")
-            exit(1)
+        if explicit_requests:
+            if data_type == torch.int8:
+                checked_positions = check_int8_sparse_reference_chunks(
+                    q_in, kv_in, weights, logical_logits, sparse_indices, num_blocks_per_q,
+                    context_starts, context_ends, sparse_block_kv, args.get('reference_chunk_q', 16))
+            else:
+                checked_positions = check_fp4_sparse_prefix_reference_chunks(
+                    q_in, kv_in, weights, logical_logits, request_sizes, context_starts_list, lengths,
+                    num_max_sparse_blocks * sparse_block_kv, args.get('reference_chunk_q', 16))
+            assert checked_positions == sum(min(length, num_max_sparse_blocks * sparse_block_kv)
+                                            for length in lengths), "Reference mask did not cover all valid positions"
+        elif not torch.equal(logical_logits[valid_mask], gathered_ref[valid_mask]):
+            raise AssertionError("sparse MQA logits mismatch against gathered dense reference")
         print("Accuracy check passed\n")
+    if get_benchmark():
+        # Capture each stage after warmup, so timings exclude JIT, input preparation
+        # and Python dispatch. The end-to-end graph recomputes metadata every replay.
+        for name, fn in (('metadata', make_metadata), ('compute', lambda: compute(metadata)),
+                         ('metadata+compute', lambda: compute(make_metadata()))):
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    fn()
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                captured_output = fn()
+            samples = []
+            for _ in range(5):
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                with torch.cuda.stream(stream):
+                    start.record()
+                    for _ in range(30):
+                        graph.replay()
+                    end.record()
+                end.synchronize()
+                samples.append(start.elapsed_time(end) * 1000 / 30)
+            samples.sort()
+            print(f"Sparse MQA {name}: median={samples[2]:.3f} us, min={samples[0]:.3f} us, max={samples[-1]:.3f} us")
+            del captured_output, graph
     return
 
 def test_batch_gemm(args) -> None:

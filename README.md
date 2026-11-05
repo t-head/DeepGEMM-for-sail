@@ -358,28 +358,44 @@ Paged logits require external masking of positions outside each context;
 
 For more information, please refer to the corresponding `*_mqa_logits` and `*_paged_mqa_logits` function documentation.
 
-#### Sparse MQA logits (Zhenwu M890P)
+#### Sparse MQA logits (Zhenwu M890P / 810E)
 
 Sparse MQA computes indexer logits only for selected KV blocks, for both
-prefill and paged decode. The current implementation supports **MXFP4
-only**, despite the `fp8_fp4` API prefix, with **32 heads** and
-**head dimension 128**. Build metadata with the matching helper before
-calling the logits kernel:
+prefill and paged decode. **MXFP4** supports both layouts on M890P;
+**INT8** supports the non-paged layout on 810E. Both use **32 heads** and
+**head dimension 128**. The `fp8_fp4` sparse APIs currently accept MXFP4
+only. Build metadata with the matching helper before calling the logits kernel:
 
-| Layout | Metadata API | Logits API | Packed Q / Q scale shapes |
+| Format / layout | Metadata API | Logits API | Q / Q scale shapes |
 | :--- | :--- | :--- | :--- |
-| Non-paged | `get_sparse_mqa_logits_metadata` | `fp8_fp4_sparse_mqa_logits` | `[T,32,64]` / `[T,32]` |
-| Paged | `get_paged_sparse_mqa_logits_metadata` | `fp8_fp4_paged_sparse_mqa_logits` | `[T,1,32,64]` / `[T,1,32]` |
+| MXFP4 non-paged | `get_sparse_mqa_logits_metadata` | `fp8_fp4_sparse_mqa_logits` | `[T,32,64]` / `[T,32]` |
+| MXFP4 paged | `get_paged_sparse_mqa_logits_metadata` | `fp8_fp4_paged_sparse_mqa_logits` | `[T,1,32,64]` / `[T,1,32]` |
+| INT8 non-paged | `get_sparse_mqa_logits_metadata` | `int8_sparse_mqa_logits` | `[T,32,128]` / folded into weights |
 
-Here `T` is the number of query tokens. Q stores packed MXFP4 codes in
+Here `T` is the number of query tokens. For MXFP4, Q stores packed codes in
 contiguous int8 tensors, and Q scales pack the E8M0 bytes into contiguous
 int32 tensors. Paged decode requires `next_n=1`. Per-token head weights
 are contiguous BF16 `[T,32]`.
 
+For INT8, pass `q` as int8 `[T,32,128]` and `kv_s=(k,k_scale)` as
+int8 `[K,128]` plus positive FP32 `[K]` scales. Fold the positive per-head
+Q scales into BF16 `weights[T,32]` exactly once before calling the API.
+All inputs and metadata must be contiguous on the same device. The operation is
+`k_scale[k] * sum_h(weights[q,h] * relu(dot(q[q,h],k[k])))`, with INT32 dot
+products and the same BF16 epilogue rounding as `int8_mqa_logits`: convert
+dot products to BF16 with ReLU, accumulate weighted heads in BF16, then
+apply BF16-rounded K scales before the cross-lane BF16 head reduction.
+
 `sparse_block_kv` is **8 or 16**, and `num_max_sparse_blocks` must be a
 positive multiple of 4, at most 4096. The selected KV block indices are
 contiguous int32 `[T,num_max_sparse_blocks]`, with a strictly increasing
-valid prefix in each row. Paged sparse MQA requires a positive `page_kv`
+valid prefix in each row. For non-paged inputs, the valid count is
+`min(num_max_sparse_blocks,ceil_div(ke-ks,sparse_block_kv))`, using the
+nonnegative int32 `[T]` context bounds with `ks=min(start,K)` and
+`ke=max(ks,min(end,K))`. Block IDs use the global
+KV grid; set `use_unaligned_ks=True` in both calls when `ks` is unaligned
+(the token offset then includes `ks % sparse_block_kv`). Paged sparse MQA
+requires a positive `page_kv`
 that is a multiple of `sparse_block_kv`; its fused uint8 KV cache has shape
 `[num_pages,page_kv,1,68]` and a 512-byte-aligned page stride.
 
@@ -387,7 +403,28 @@ The output is BF16 with shape
 `[T,round_up(num_max_sparse_blocks*sparse_block_kv,512)]`.
 Logical columns are compacted by selected block slot:
 `column = slot*sparse_block_kv + token_in_block`, rather than absolute KV
-token position. Padding columns are not additional KV positions.
+token position. Unused slots, positions outside the context and padding
+columns are unspecified; consumers must mask them. Odd `T` and partial KV
+blocks do not require padded INT8 input tensors.
+
+```python
+import torch
+import deep_gemm as dg
+
+# q_int8: [T,32,128], k_int8: [K,128], k_scale: FP32 [K].
+# head_weights: BF16 [T,32], q_scale: positive FP32 [T,32].
+weights = (head_weights * q_scale.to(torch.bfloat16)).contiguous()
+capacity = selected_blocks.size(1)
+metadata = dg.get_sparse_mqa_logits_metadata(
+    ks, ke, k_int8.size(0), selected_blocks, torch.int8, 16,
+    use_unaligned_ks=False)
+logits = dg.int8_sparse_mqa_logits(
+    q_int8, (k_int8, k_scale), weights, metadata, capacity, 16,
+    use_unaligned_ks=False)
+```
+
+Generate and consume metadata with the same device and `get_num_sms()`
+configuration. Warm up metadata on each stream before graph capture.
 See the [attention API](csrc/apis/attention.hpp) for metadata and layout
 requirements and [attention tests](tests/test_attention.py) for supported
 cases.

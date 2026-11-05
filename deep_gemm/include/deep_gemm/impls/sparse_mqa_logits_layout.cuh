@@ -6,7 +6,7 @@
 // DeepGEMM 26/09 `layout/sparse_mqa_logits.cuh`. Pure POD + constexpr so that both the host
 // translation unit (via csrc includes) and the hggc JIT device code can include it.
 //
-// MXFP4 only.
+// Shared by MXFP4 and non-paged INT8.
 namespace deep_gemm {
 namespace sparse_mqa_logits {
 

@@ -3,7 +3,7 @@ import torch
 
 import deep_gemm
 from utils import test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, set_acc_check, parse_deepgemm_string_re
-from utils import is_ppu1v5_device
+from utils import is_ppu1v5_device, get_arch_version
 
 def test_ks_ke(check_accuracy=True):
     # Single INT8 case: seq_len_q=1 with ks != 0, manually constructed (not via test_mqa_logits).
@@ -204,8 +204,20 @@ def test_mqa_avg_logits_loop():
 
 
 def test_sparse_mqa_logits_loop():
+    if get_arch_version() == 80:
+        cases = [
+            # Full blocks, true sparse selections, unaligned starts and the odd final Q.
+            'SparseMqaLogits,data_type:int8,seq_len_q:32,seq_len_kv:1024,sparse_block_kv:8,num_max_sparse_blocks:256,check_metadata:1',
+            'SparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:8191,sparse_block_kv:16,num_max_sparse_blocks:128,use_unaligned_ks:1,check_metadata:1',
+            'SparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:8191,sparse_block_kv:8,num_max_sparse_blocks:128,use_unaligned_ks:1,check_metadata:1',
+            'SparseMqaLogits,data_type:int8,seq_len_q:1,seq_len_kv:1,sparse_block_kv:16,num_max_sparse_blocks:4,check_metadata:1',
+            'SparseMqaLogits,data_type:int8,seq_len_q:2,seq_len_kv:0,sparse_block_kv:16,num_max_sparse_blocks:4,check_metadata:1',
+        ]
+        set_acc_check(True)
+        for case in cases:
+            test_sparse_mqa_logits(parse_deepgemm_string_re(case))
     if not is_ppu1v5_device():
-        print('Skipping sparse MQA logits: requires PPU1.5')
+        print('Skipping FP4 sparse MQA logits: requires PPU1.5')
         return
     print('Testing Sparse MQA Logits:')
     cases = [
@@ -229,6 +241,236 @@ def test_sparse_mqa_logits_loop():
         print(case)
         test_sparse_mqa_logits(parse_deepgemm_string_re(case))
     print("Passed\n")
+
+
+def test_int8_sparse_edges(check_accuracy=True):
+    """Explicit merge/slot cases plus workspace replay on two independent streams."""
+    if get_arch_version() != 80:
+        print('Skipping INT8 sparse edges: requires PPU1.0')
+        return
+    from utils import decode_sparse_metadata, ref_sparse_metadata, verify_sparse_metadata
+    from utils import ref_int8_sparse_mqa_logits, bf16_fma_reference
+
+    if check_accuracy:
+        # Single-round BF16 FMA differs from FP32-then-BF16 at these midpoints.
+        a = torch.tensor([3, 3, -3, -3, 3, -3, 3], device='cuda', dtype=torch.bfloat16)
+        b = torch.tensor([174, 174, 174, 174, 174, 174, 176], device='cuda', dtype=torch.bfloat16)
+        c = torch.tensor([2**-16, -2**-16, 2**-16, -2**-16, 0, 0, -528],
+                         device='cuda', dtype=torch.bfloat16)
+        expected = torch.tensor([524, 520, -520, -524, 520, -520, 0],
+                                device='cuda', dtype=torch.bfloat16)
+        torch.testing.assert_close(bf16_fma_reference(a, b, c), expected, rtol=0, atol=0)
+        torch.testing.assert_close(bf16_fma_reference(a, b / 16384, c / 16384),
+                                   expected / 16384, rtol=0, atol=0)
+        print('BF16 single-round FMA reference regression passed')
+
+    class SparseCase:
+        def __init__(self, block, unaligned, repeats=1):
+            self.block, self.unaligned, self.repeats = block, unaligned, repeats
+            self.rows, self.capacity = 9 * repeats, 16
+            self.num_kv = 34 * block
+            head_values = torch.tensor([-128, -3, 0, 2, 127] * 7, device='cuda', dtype=torch.int8)[:32]
+            self.q = head_values[None, :, None].expand(self.rows, 32, 128).contiguous()
+            self.q[0].zero_()
+            self.kv = (torch.empty((self.num_kv, 128), dtype=torch.int8, device='cuda'),
+                       torch.empty(self.num_kv, dtype=torch.float32, device='cuda'))
+            self.weights = torch.tensor([1 / 32, -1 / 64, 0, 1 / 128] * 8,
+                                        dtype=torch.bfloat16, device='cuda').expand(self.rows, 32).contiguous()
+            self.weights[1].fill_(-1 / 32)  # Valid logits must retain a negative weighted sum.
+            self.ks = torch.empty(self.rows, dtype=torch.int32, device='cuda')
+            self.ke = torch.empty_like(self.ks)
+            self.indices = torch.empty((self.rows, self.capacity), dtype=torch.int32, device='cuda')
+            self.update(0)
+
+        def update(self, phase):
+            start = (phase % (self.block - 1) + 1) if self.unaligned else 0
+            length = 32 * self.block + 1
+            # Partial overlap, disjoint pairs, an identical contiguous pair, an
+            # empty/short pair, and a final singleton Q selecting the last token.
+            even, odd = list(range(0, 32, 2)), list(range(1, 32, 2))
+            partial = sorted(([1] + even[1:]) if phase % 2 == 0 else (even[:-1] + [31]))
+            short = self.block + 1 if phase % 2 else 0
+            lengths = ([length] * 6 + [short, 0 if short else 1, length]) * self.repeats
+            blocks = [even, partial, even, odd, list(range(16)), list(range(16)),
+                      list(range((short + self.block - 1) // self.block)),
+                      [] if short else [0], list(range(15)) + [32]] * self.repeats
+            self.counts = [min(self.capacity, (n + self.block - 1) // self.block) for n in lengths]
+            padded = [row + [0] * (self.capacity - len(row)) for row in blocks]
+            self.ks.fill_(start)
+            self.ke.copy_(torch.tensor([start + n for n in lengths], dtype=torch.int32))
+            self.indices.copy_(torch.tensor(padded, dtype=torch.int32))
+            values = ((torch.arange(self.num_kv, device='cuda') + phase) % 7 - 3) * 40
+            values[0], values[1] = 127, -128
+            self.kv[0].copy_(values.to(torch.int8)[:, None].expand(-1, 128))
+            self.kv[1].copy_(torch.tensor([1 / 128, 1 / 64, 1 / 32, 1 / 16], device='cuda')
+                             .repeat((self.num_kv + 3) // 4)[:self.num_kv])
+
+        def run(self):
+            metadata = deep_gemm.get_sparse_mqa_logits_metadata(
+                self.ks, self.ke, self.num_kv, self.indices, torch.int8,
+                self.block, use_unaligned_ks=self.unaligned)
+            return metadata, deep_gemm.int8_sparse_mqa_logits(
+                self.q, self.kv, self.weights, metadata, self.capacity,
+                self.block, use_unaligned_ks=self.unaligned)
+
+        def check(self, outputs):
+            metadata, logits = outputs
+            verify_sparse_metadata(decode_sparse_metadata(metadata, self.block),
+                                   ref_sparse_metadata(self.indices, self.counts, self.ks, self.ke,
+                                                       self.num_kv, self.block, self.capacity, self.unaligned),
+                                   self.rows)
+            tokens = (self.indices.long()[:, :, None] * self.block
+                      + (self.ks % self.block)[:, None, None]
+                      + torch.arange(self.block, device='cuda')).flatten(1)
+            valid = (torch.arange(self.capacity * self.block, device='cuda')[None, :]
+                     < torch.tensor(self.counts, device='cuda')[:, None] * self.block)
+            valid &= tokens >= self.ks[:, None]
+            valid &= tokens < self.ke[:, None]
+            safe_tokens = tokens.clamp(max=self.num_kv - 1)
+            expected = ref_int8_sparse_mqa_logits(self.q, self.kv[0][safe_tokens], self.kv[1][safe_tokens], self.weights)
+            assert logits.shape == (self.rows, 512) and logits.dtype == torch.bfloat16
+            torch.testing.assert_close(logits[:, :self.capacity * self.block][valid], expected[valid], rtol=0, atol=0)
+            assert (logits[1, :self.capacity * self.block][valid[1]] < 0).any()
+
+    cases = [SparseCase(8, False), SparseCase(16, True)]
+    for case in [*cases, SparseCase(16, False)]:
+        outputs = case.run()
+        if check_accuracy:
+            case.check(outputs)
+    if not check_accuracy:
+        return
+
+    # The final selected block straddles the actual K allocation, not just a
+    # request boundary inside a larger pool. Only its first token is valid.
+    tail_case = SparseCase(16, True)
+    tail_case.num_kv = int(tail_case.ke.max().item())
+    tail_case.kv = tuple(tensor[:tail_case.num_kv].clone() for tensor in tail_case.kv)
+    tail_case.check(tail_case.run())
+
+    def check_partial_layout(block, starts, ends, selections, unaligned=False):
+        from utils import gather_sparse_reference
+
+        rows, num_kv = len(starts), max(ends)
+        capacity = (max(map(len, selections)) + 3) // 4 * 4
+        counts = [len(selected) for selected in selections]
+        assert counts == [min(capacity, (end - start + block - 1) // block)
+                          for start, end in zip(starts, ends)]
+        ks = torch.tensor(starts, device='cuda', dtype=torch.int32)
+        ke = torch.tensor(ends, device='cuda', dtype=torch.int32)
+        indices = torch.tensor([selected + [0] * (capacity - len(selected))
+                                for selected in selections], device='cuda', dtype=torch.int32)
+        # Vary every channel as well as token/head indices: constant-channel K
+        # would miss a wrong AIU swizzle/plane stride in a padded 128-row stage.
+        channel = torch.arange(128, device='cuda')
+        head = torch.arange(32, device='cuda')
+        q = ((torch.arange(rows, device='cuda')[:, None, None] * 11
+              + head[None, :, None] * 7 + channel[None, None, :] * 5) % 255 - 127).to(torch.int8)
+        q[0, 0, 0], q[-1, -1, -1] = -128, 127
+        k = ((torch.arange(num_kv, device='cuda')[:, None] * 13
+              + channel[None, :] * 17) % 255 - 127).to(torch.int8)
+        k[-1, 0] = -128
+        scales = ((torch.arange(num_kv, device='cuda') % 7 + 1) / 128).float()
+        weights = ((head % 5 - 2) / 64).to(torch.bfloat16).expand(rows, 32).contiguous()
+        metadata = deep_gemm.get_sparse_mqa_logits_metadata(
+            ks, ke, num_kv, indices, torch.int8, block, use_unaligned_ks=unaligned)
+        logits = deep_gemm.int8_sparse_mqa_logits(
+            q, (k, scales), weights, metadata, capacity, block, use_unaligned_ks=unaligned)
+        decoded = decode_sparse_metadata(metadata, block)
+        verify_sparse_metadata(decoded, ref_sparse_metadata(
+            indices, counts, ks, ke, num_kv, block, capacity, unaligned), rows)
+        dense = deep_gemm.int8_mqa_logits(
+            q, (k, scales), weights, ks, ke, clean_logits=False,
+            max_seqlen_k=num_kv, logits_dtype=torch.bfloat16)
+        gathered, valid = gather_sparse_reference(dense, indices, counts, ks, ke, block)
+        tokens = (indices.long()[:, :, None] * block + (ks % block)[:, None, None]
+                  + torch.arange(block, device='cuda')).flatten(1).clamp(max=num_kv - 1)
+        expected = ref_int8_sparse_mqa_logits(q, k[tokens], scales[tokens], weights)
+        assert valid.any() and logits.dtype == torch.bfloat16
+        torch.testing.assert_close(gathered[valid], expected[valid], rtol=0, atol=0)
+        torch.testing.assert_close(logits[:, :capacity * block][valid], expected[valid], rtol=0, atol=0)
+        return decoded
+
+    # Unaligned unions can satisfy the first/last span test without being
+    # contiguous. An INT8 partial-AIU fast path must keep this on the fallback.
+    false_contiguous = check_partial_layout(
+        8, [1, 2], [65, 66], [[0, 1, 2, 7], [0, 1, 2, 3]], unaligned=True)
+    assert false_contiguous['num_kv_splits'] == 1
+    merged = false_contiguous['splits'][0]
+    offsets = [entry[0] for entry in merged['blocks'][:merged['num_kv_blocks']]]
+    assert offsets == [1, 2, 9, 10, 17, 18, 26, 57]
+    assert offsets[-1] - offsets[0] == (len(offsets) - 1) * 8
+    assert not merged['is_contiguous']
+
+    # Real, unpadded aligned K allocations with 1- and 15-token tails. Each
+    # long/short Q pair has 65 union blocks (5/9 splits). Repeat B8 per schedule
+    # slot so at least one entry retains 5 splits and crosses both stage rings.
+    # The odd singleton and last partial split leave whole KV/Q warps inactive;
+    # the short paired Q still needs its original per-block slot masks.
+    for block, tail in ((8, 1), (16, 15)):
+        end = 67 * block + tail
+        repeats = 4 * deep_gemm.get_num_sms() if block == 8 else 1
+        starts = [3 * block, 66 * block] * repeats + [67 * block]
+        selections = [list(range(3, 68)), [66, 67]] * repeats + [[67]]
+        decoded = check_partial_layout(block, starts, [end] * len(starts), selections)
+        if block == 8:
+            assert any(entry[1] - entry[0] >= 5 for entry in decoded['schedule'])
+
+    # Invalid host contracts must fail before a device kernel can read a bad
+    # pointer/header. Keep these calls on the already-warmed, valid fixture.
+    base = cases[0]
+    metadata = base.run()[0]
+    valid_args = dict(q=base.q, kv_s=base.kv, weights=base.weights, metadata=metadata,
+                      num_max_sparse_blocks=base.capacity, sparse_block_kv=base.block)
+    invalid_args = [
+        ({'q': base.q.to(torch.bfloat16)}, 'q must be'),
+        ({'q': base.q[0]}, 'q must have shape'),
+        ({'q': base.q.cpu()}, 'q must be'),
+        ({'kv_s': (base.kv[0][:, :127].contiguous(), base.kv[1])}, 'kv_s[0]'),
+        ({'kv_s': (base.kv[0], base.kv[1].to(torch.bfloat16))}, 'kv_s[1]'),
+        ({'kv_s': (base.kv[0], base.kv[1][:-1])}, 'kv_s[1]'),
+        ({'weights': base.weights.float()}, 'weights must be'),
+        ({'metadata': metadata.view(torch.int32)}, 'metadata must be'),
+        ({'metadata': metadata.cpu()}, 'same device'),
+        ({'metadata': metadata[:-1]}, 'metadata is smaller'),
+        ({'num_max_sparse_blocks': 3}, 'num_max_sparse_blocks'),
+        ({'sparse_block_kv': 4}, 'sparse_block_kv'),
+    ]
+    for changes, message in invalid_args:
+        try:
+            deep_gemm.int8_sparse_mqa_logits(**{**valid_args, **changes})
+        except RuntimeError as error:
+            assert message in str(error), str(error)
+        else:
+            raise AssertionError(f'INT8 sparse accepted invalid {next(iter(changes))}')
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    captured = []
+    for case, stream in zip(cases, streams):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            case.run()  # Warm up this stream's metadata workspace before capture.
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = case.run()
+        captured.append((graph, outputs))
+    # Grow the same stream's eager workspace while the smaller graph remains alive.
+    with torch.cuda.stream(streams[0]):
+        larger = SparseCase(8, False, repeats=33)
+        larger_outputs = larger.run()
+    streams[0].synchronize()
+    larger.check(larger_outputs)
+    del larger, larger_outputs
+    for phase in range(1, 4):
+        for case, stream, (graph, _) in zip(cases, streams, captured):
+            with torch.cuda.stream(stream):
+                case.update(phase)
+                graph.replay()
+        for stream in streams:
+            stream.synchronize()
+        for case, (_, outputs) in zip(cases, captured):
+            case.check(outputs)
+    print('Passed INT8 sparse contracts, merge/slot boundaries, two-stream graph replay and workspace growth')
 
 
 def test_sparse_workspace():
@@ -421,4 +663,5 @@ if __name__ == '__main__':
     test_paged_mqa_logits_loop()
     test_mqa_avg_logits_loop()
     test_sparse_mqa_logits_loop()
+    test_int8_sparse_edges()
     test_sparse_workspace()
