@@ -1,6 +1,7 @@
 #pragma once
 #include <cub/block/block_scan.cuh>
 #include <deep_gemm/common/math.cuh>
+#include <deep_gemm/common/epilogue_utils.cuh>
 #include <deep_gemm/tix/cvt.cuh>
 
 #include <cute/ppu_tensor_mix.hpp>
@@ -240,62 +241,6 @@ __forceinline__ __device__ void clear_invalid_A_to_tsm(
         tAsA(_,_,_,stage), src_ptr, token_offsets, 0, shape_m, thread_idx, threads);
   }
 }
-
-template <typename AccT, typename DstT,
-         uint32_t SHAPE_N, uint32_t BLOCK_N, uint32_t STRIDE_CM,
-         class TAcc, class TCcC, class... Ts>
-__forceinline__ __device__ void epilogue_no_tsm(TAcc& accum, const TCcC& tCcC, void* c_ptr,
-                                                uint32_t c_row_base, uint32_t num_valid_rows, uint32_t blk_n_offset) {
-  using namespace cute;
-#if __HGGC_ARCH__ == 150
-  CUTLASS_PRAGMA_UNROLL
-  for (int warp_m = 0; warp_m < size<1>(tCcC); ++warp_m) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int mma_m = 0; mma_m < size<0,1>(tCcC); ++mma_m) {
-      uint32_t local_row = get<0>(tCcC(make_coord(_0{}, mma_m, _0{}), warp_m, _0{}));
-      bool cond = local_row < num_valid_rows;
-      uint32_t row = c_row_base + local_row;
-      if (cond) {
-        DstT* cur_c_ptr = reinterpret_cast<DstT*>(c_ptr) + row * STRIDE_CM + blk_n_offset;
-        CUTLASS_PRAGMA_UNROLL
-        for (int warp_n = 0; warp_n < size<2>(tCcC); ++warp_n) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int mma_n = 0; mma_n < size<0,2>(tCcC); ++mma_n) {
-            AccT* acc_ptr = cute::raw_pointer_cast(accum(make_coord(_, mma_m, mma_n), warp_m, warp_n).data());
-            uint32_t d;
-            d = tix::cvt_rte_bf16x2_f32(acc_ptr[1], acc_ptr[0]);
-
-            size_t n_idx = get<1>(tCcC(make_coord(_0{}, mma_m, mma_n), warp_m, warp_n));
-            uint32_t* dst_ptr = reinterpret_cast<uint32_t*>(cur_c_ptr + n_idx);
-            if constexpr (SHAPE_N % BLOCK_N) {
-              if (cond && n_idx < (SHAPE_N - blk_n_offset)) {
-                *dst_ptr = d;
-              }
-            } else {
-              *dst_ptr = d;
-            }
-          }
-        }
-      }
-    }
-  }
-#else
-  CUTLASS_PRAGMA_UNROLL
-  for (int i = 0; i < size(tCcC); ++i) {
-    size_t local_row = cute::get<0>(tCcC(i));
-    bool cond = local_row < num_valid_rows;
-    size_t row = c_row_base + local_row;
-    if constexpr (SHAPE_N % BLOCK_N) {
-      cond = cond && cute::get<1>(tCcC(i)) < (SHAPE_N - blk_n_offset);
-    }
-    if (cond) {
-      AccT* acc_ptr = cute::raw_pointer_cast(accum.data()) + accum.layout()(i);
-      DstT* dst_ptr = reinterpret_cast<DstT*>(c_ptr) + row * STRIDE_CM + blk_n_offset + cute::get<1>(tCcC(i));
-      *dst_ptr = DstT(*acc_ptr);
-    }
-  }
-#endif
-};
 
 template <typename AccT, typename DstT,
           uint32_t SHAPE_N, uint32_t BLOCK_N, uint32_t STRIDE_CM,

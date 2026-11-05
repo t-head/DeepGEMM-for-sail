@@ -3,6 +3,7 @@
 #include "../utils/compatibility.hpp"
 #include "../utils/layout.hpp"
 #include <torch/extension.h>
+#include "../jit_kernels/impls/epilogue_class.hpp"
 #include "../jit_kernels/impls/fp8_gemm.hpp"
 #include "../jit_kernels/impls/ppuxx_layout.hpp"
 
@@ -16,6 +17,7 @@
 #include "../jit_kernels/impls/fp4_gemm.hpp"
 #include "../jit_kernels/impls/m_grouped_fp4_gemm.hpp"
 #include "../jit_kernels/impls/fused_moe_gemm.hpp"
+#include "../jit_kernels/impls/k_grouped_bf16_gemm.hpp"
 #include "../jit_kernels/impls/moe_align.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a16_gemm.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a8_gemm.hpp"
@@ -56,6 +58,30 @@ static bool early_return(const int& m, const int &n, const int& k,
     if (c.has_value() and not is_cd_same)
         d.copy_(c.value());
     return false;
+}
+
+static int check_k_grouped_args(const std::optional<std::vector<int>>& ks_cpu,
+                                const torch::Tensor& grouped_layout,
+                                const int& num_groups,
+                                const bool& use_psum_layout,
+                                const int& k_alignment,
+                                const int& sum_k_if_ks_cpu_missing = 0) {
+    DG_HOST_ASSERT(grouped_layout.is_cuda() and grouped_layout.dim() == 1);
+    DG_HOST_ASSERT(grouped_layout.is_contiguous());
+    DG_HOST_ASSERT(grouped_layout.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(grouped_layout.numel() == num_groups);
+
+    if (ks_cpu.has_value() and not ks_cpu.value().empty()) {
+        DG_HOST_ASSERT(ks_cpu.value().size() == static_cast<size_t>(num_groups));
+        int sum_k = 0;
+        for (const auto k: ks_cpu.value()) {
+            DG_HOST_ASSERT(k >= 0 and k % k_alignment == 0);
+            sum_k += k;
+        }
+        return sum_k;
+    }
+    DG_HOST_ASSERT(use_psum_layout);
+    return sum_k_if_ks_cpu_missing;
 }
 
 void bf16_gemm_nt(const torch::Tensor& a,
@@ -878,6 +904,60 @@ void m_grouped_fp8_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& 
     if (arch_major == 8) {
         m_grouped_gemm_fp8_fp8_bf16_nt_nopad_impl(lhs, lhs_scales, rhs, rhs_scales, d, m_indices, m, n, k, num_groups,
                                                   m_rows, configs);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+}
+
+static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
+                                              const torch::Tensor& b,
+                                              const torch::Tensor& d,
+                                              const std::optional<std::vector<int>>& ks_cpu,
+                                              const torch::Tensor& grouped_layout,
+                                              const std::optional<torch::Tensor>& c,
+                                              const std::string& compiled_dims,
+                                              const bool& use_psum_layout,
+                                              const std::shared_ptr<EpilogueClass>& epilogue_class) {
+    // Validate before reading dimensions or allowing early_return to write d.
+    DG_HOST_ASSERT(a.is_cuda() and a.dim() == 2);
+    DG_HOST_ASSERT(b.is_cuda() and b.dim() == 2);
+    DG_HOST_ASSERT(d.is_cuda() and d.dim() == 3);
+    DG_HOST_ASSERT(a.device() == b.device() and a.device() == d.device());
+    DG_HOST_ASSERT(grouped_layout.device() == a.device());
+    DG_HOST_ASSERT(not c.has_value() or
+                   (c->is_cuda() and c->dim() == 3 and c->device() == a.device()));
+
+    // Shape checks
+    const auto [num_groups, m, n] = get_shape<3>(d);
+    const auto [sum_k_a, m_] = get_shape<2>(a);
+    const auto [sum_k_b, n_] = get_shape<2>(b);
+    const int sum_k = check_k_grouped_args(ks_cpu, grouped_layout, num_groups,
+                                           use_psum_layout, 128, sum_k_a);
+    DG_HOST_ASSERT(m == m_ and n == n_ and sum_k == sum_k_a and sum_k == sum_k_b);
+    DG_HOST_ASSERT(not c.has_value() or c->sizes() == d.sizes());
+
+    // Contiguity checks
+    DG_HOST_ASSERT(a.is_contiguous());
+    DG_HOST_ASSERT(b.is_contiguous());
+    DG_HOST_ASSERT(d.is_contiguous());
+    DG_HOST_ASSERT(not c.has_value() or c->is_contiguous());
+
+    // PPU kernels have fixed input/output types.
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16 and b.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+
+    // Dispatch implementation
+    if (get_ppu_arch() == AC_PPU0015) {
+        // Reject unsupported options before early_return can copy or zero d.
+        DG_HOST_ASSERT(c.has_value());
+        DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues are not supported on PPU1.5");
+        DG_HOST_ASSERT(compiled_dims == "mn" and "This implementation specializes both M and N");
+        DG_HOST_ASSERT(c->scalar_type() == torch::kFloat);
+
+        if (early_return(m, n, sum_k, d, c))
+            return;
+        k_grouped_bf16_gemm_tn_contiguous_impl(a, b, c, d, m, n, sum_k, ks_cpu.value(), grouped_layout);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -1847,6 +1927,10 @@ static void register_apis(pybind11::module_& m) {
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
     m.def("bf16_gemm_tt", &bf16_gemm_tt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
+    m.def("k_grouped_bf16_gemm_tn_contiguous", &k_grouped_bf16_gemm_tn_contiguous,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("ks_cpu"), py::arg("grouped_layout"),
+          py::arg("c") = std::nullopt, py::arg("compiled_dims") = "mn", py::arg("use_psum_layout") = false,
+          py::arg("epilogue") = nullptr);
     m.def("m_grouped_bf16_gemm_nt_contiguous", &m_grouped_bf16_gemm_nt_contiguous, py::arg("lhs"),
           py::arg("rhs"), py::arg("out"), py::arg("m_indices"), py::arg("compiled_dims") = "nk",
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,
