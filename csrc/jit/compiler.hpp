@@ -257,7 +257,7 @@ public:
         // --- Architecture ---
         const auto arch = get_ppu_arch();
         if (arch == AC_PPU0015) {
-            flags += " -arch=ppu_15";
+            flags += " -arch=ppu_15 -dopt 3";
         } else if (arch == AC_PPU0010) {
             flags += " -arch=ppu_10";
         } else {

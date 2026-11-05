@@ -213,8 +213,17 @@ rows must already be grouped by expert. Masked accepts device-side
 `masked_m` counts and an `expected_m` scheduling hint. Computation is
 restricted to the valid rows specified by `masked_m`. Nopad/masked select configurations internally unless
 an explicit config tuple is supplied. The fused config comes from
-`moe_align_block_size`. Configuration selection remains internal to the
-C++ runtime.
+`moe_align_block_size`. The existing nine-element config format is unchanged:
+`(num_sms, block_m, block_n, block_k, warp_m, warp_n, warp_k, stages, n_expand)`.
+Native tile selection and streamed execution policies are handled internally
+by the C++ runtime. For explicit streamed NoPad/Fused execution, use
+`(dg.get_num_sms(), 256, 256, 128, 64, 64, 128, 4, 1)`.
+Subject to device, layout and workspace limits, automatic streamed execution
+requires at least 512 rows per expert on average when `K >= 2048` and
+`ceil(N / 256) * (K / 128) >= 128`, or 1024 rows otherwise.
+Set `show_log=1` to print the selected tile, resources and streamed execution plan.
+Before graph capture, warm up the selected configuration and unit/non-unit
+`inv_scale` variant on the capture stream.
 Run `python tests/test_w4a8.py` for correctness coverage.
 
 For standard MXFP4 GEMM weights, use

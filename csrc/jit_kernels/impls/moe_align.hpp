@@ -266,15 +266,12 @@ __global__ void moe_align_p4(
 // =============================================================================
 // Host impl fn — mirrors Python moe_align_block_size in a_fused_m_grouped_gemm.py
 // =============================================================================
-// The config slot is dtype-dependent, exactly as in Python (`return_config = config if w4a16_type is
-// not None else config[:7]`): the W4A16 flavours hand back the full 9-tuple their fused GEMM unpacks,
-// while every other dtype drops the trailing `smem_config` and forwards only the first 7 tuning params.
-// W4A16 and W4A8 share the wire format, but own their configuration policies.
+// Dtypes share the existing seven- or nine-element tile formats.
 using FusedMmaConfigTuple = std::tuple<int, int, int, int, int, int, int, int, int>;
 using FusedConfigTuple = std::variant<FusedCommonConfigTuple, FusedMmaConfigTuple>;
 
 using MoeAlignReturn = std::tuple<
-    FusedConfigTuple,        // config (7-tuple, or the MMA 9-tuple)
+    FusedConfigTuple,        // dtype-dependent seven- or nine-element tile tuple
     torch::Tensor,         // m_rows
     torch::Tensor,         // expert_ids_and_cumsum
     torch::Tensor,         // sorted_token_ids
@@ -324,7 +321,6 @@ static MoeAlignReturn moe_align_block_size_impl(
         };
         if (lhs.scalar_type() == torch::kFloat8_e4m3fn && rhs.scalar_type() == torch::kUInt8) {
             const auto c = deep_gemm::w4fa8::get_best_configs(expected_m, n, k, num_groups, GemmType::MGroupedFused);
-            deep_gemm::w4fa8::check_config(c, n, k, GemmType::MGroupedFused);
             config = deep_gemm::w4fa8::pack_config(c);
         } else if (w4a16_type.has_value()) {
             // Forwarded whole: the W4A16 fused GEMM unpacks all 9 params, `warp_k` and `n_expand`
