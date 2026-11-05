@@ -131,21 +131,14 @@ void bf16_gemm_tt(const torch::Tensor& a,
 // Accumulation: every MMA product accumulates in FP32; the high/low parts are
 // combined with an FP32 FMA before the (optional) BF16 rounding of the final
 // store. Layout support: NT only, contiguous tensors (same contract as
-// bf16_gemm_nt).
-//
-// use_splitk / split_flag: accepted for API compatibility with the reference
-// implementation (Tencent/hpc-ops). The PPU persistent tile scheduler
-// already load-balances tiles across SMs, so no K-split is performed and the
-// split_flag workspace is neither read nor written (it stays zero, which is
-// exactly the contract the reference test asserts).
+// bf16_gemm_nt). This implementation does not perform K-splitting, so the
+// native API intentionally exposes no Split-K controls.
 // -----------------------------------------------------------------------------
 torch::Tensor bf16xfp32_gemm_nt(const torch::Tensor& x,
                                 const torch::Tensor& w_high,
                                 const torch::Tensor& w_low,
                                 const double& scale,
                                 const bool& use_fp32_output,
-                                const bool& use_splitk,
-                                const std::optional<torch::Tensor>& split_flag,
                                 std::optional<ConfigTuple> configs = std::nullopt) {
     TORCH_CHECK(scale > 0.0, "scale must be positive, got ", scale);
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be BF16");
@@ -155,10 +148,6 @@ torch::Tensor bf16xfp32_gemm_nt(const torch::Tensor& x,
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(w_high.is_contiguous(), "w_high must be contiguous");
     TORCH_CHECK(w_low.is_contiguous(), "w_low must be contiguous");
-    if (split_flag.has_value()) {
-        TORCH_CHECK(split_flag->scalar_type() == torch::kInt32, "split_flag must be int32");
-        TORCH_CHECK(split_flag->is_contiguous(), "split_flag must be contiguous");
-    }
 
     const auto& [m, k] = get_shape<2>(x);
     const auto& [n, k_] = get_shape<2>(w_high);
@@ -1845,10 +1834,9 @@ static void register_apis(pybind11::module_& m) {
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
     m.def("bf16_gemm_tt", &bf16_gemm_tt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
-    // BF16 x FP32 dense GEMM (hpc-ops compatible API)
+    // BF16 x FP32 dense GEMM (native API; no Split-K controls)
     m.def("bf16xfp32_gemm_nt", &bf16xfp32_gemm_nt, py::arg("x"), py::arg("w_high"),
           py::arg("w_low"), py::arg("scale"), py::arg("use_fp32_output") = false,
-          py::arg("use_splitk") = true, py::arg("split_flag") = std::nullopt,
           py::arg("configs") = std::nullopt);
     m.def("get_gemm_bf16xfp32_workspace", &get_gemm_bf16xfp32_workspace,
           py::arg("max_weight_hidden_size"), py::arg("max_tokens") = 131072);

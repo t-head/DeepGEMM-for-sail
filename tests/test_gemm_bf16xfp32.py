@@ -8,16 +8,17 @@ and the result must match the FP32 reference within the reference tolerances
 
 API under test:
     deep_gemm.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output,
-                             use_splitk, split_flag)          # hpc-ops alias
-    deep_gemm.bf16xfp32_gemm_nt(...)                          # native name
-    deep_gemm.get_gemm_bf16xfp32_workspace(n)                 # split-flag workspace
+                             use_splitk, split_flag)          # hpc-ops wrapper
+    deep_gemm.bf16xfp32_gemm_nt(x, w_high, w_low, scale,
+                                use_fp32_output, configs=None) # native API
+    deep_gemm.get_gemm_bf16xfp32_workspace(n)                 # legacy workspace
 
 Documented contract (see csrc/apis/gemm.hpp):
     x          : BF16, row-major [m, k]
     w_high/low : BF16, row-major [n, k]   (NT layout)
     output     : FP32 (use_fp32_output=True) or BF16, row-major [m, n]
-    split_flag : accepted for hpc-ops API compatibility; this build performs no
-                 K-split, so the workspace must stay all-zero after the call.
+    split_flag : accepted only by the hpc-ops compatibility wrapper; this build
+                 performs no K-split, so the workspace stays untouched.
 """
 import pytest
 import torch
@@ -57,7 +58,7 @@ def test_gemm_bf16xfp32(m, n, k, use_fp32_output, use_split_flag):
         split_flag = deep_gemm.get_gemm_bf16xfp32_workspace(n)
 
     my = deep_gemm.gemm_bf16xfp32(x, w_high, w_low, scale,
-                                  use_fp32_output, True, split_flag)
+                                  use_fp32_output, use_split_flag, split_flag)
     assert my.shape == (m, n)
     assert my.dtype == (torch.float32 if use_fp32_output else torch.bfloat16)
 
