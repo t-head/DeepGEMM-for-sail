@@ -35,6 +35,13 @@ from ._C import (
     get_mk_alignment_for_contiguous_layout,
 )
 
+# Fused GEMM and communication
+from .gemm_comm import (
+    GemmReduceScatterWorkspace,
+    get_workspace_for_gemm_reduce_scatter,
+    fp8_gemm_nt_reduce_scatter,
+)
+
 # acblasLt GEMMs
 from ._C import (
     acblaslt_gemm_nt, acblaslt_gemm_nn,

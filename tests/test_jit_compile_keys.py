@@ -18,6 +18,8 @@ CPP_SOURCE = r'''
 #include "jit_kernels/impls/bf16_gemm.hpp"
 #include "jit_kernels/impls/fp4_gemm.hpp"
 #include "jit_kernels/impls/fp8_gemm.hpp"
+#include "jit_kernels/impls/fp8_blockwise_gemm_comm.hpp"
+#include "jit_kernels/impls/fp8_channelwise_gemm_comm.hpp"
 
 #include <stdexcept>
 
@@ -150,6 +152,79 @@ int fp8_checks() {
     return count;
 }
 
+template <typename Runtime>
+int rs_checks(typename Runtime::Args args) {
+    args.m = 64; args.rank = 0; args.world = 2;
+    int count = tile_checks<Runtime>(args);
+#define CHECK_RS(field, value) \
+    count += check_change<Runtime>(args, [](auto& a) { a.field = value; }, #field)
+    CHECK_RS(m, 96);
+    CHECK_RS(rank, 1);
+    CHECK_RS(world, 4);
+#undef CHECK_RS
+#define CHECK_RS_TILE(field, value) \
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_info.field = value; }, #field)
+    CHECK_RS_TILE(num_groups, 2);
+    CHECK_RS_TILE(kernel_strategy, "OtherStrategy");
+    CHECK_RS_TILE(enable_sbo_overlap, true);
+#undef CHECK_RS_TILE
+    return count;
+}
+
+int fp8_block_rs_checks() {
+    using Runtime = gemm_comm::Fp8BlockwiseGemmRSRuntime;
+    auto args = dense_args<Runtime>();
+    args.launch_info.num_groups = 1;
+    args.launch_info.kernel_strategy = "Default";
+    int count = rs_checks<Runtime>(args) + dynamic_checks<Runtime>(args);
+    count += check_change<Runtime>(args, [](auto& a) { a.direct_sfb = true; }, "direct SFB");
+    count += check_change<Runtime>(args, [](auto& a) { a.specialize = true; }, "unused channel specialization", false);
+    count += check_change<Runtime>(args, [](auto& a) { cute::get<1>(a.kernel_params.problem_shape) = 768; }, "literal N");
+    count += check_change<Runtime>(args, [](auto& a) { cute::get<2>(a.kernel_params.problem_shape) = 1024; }, "literal K");
+    return count;
+}
+
+int fp8_channel_rs_checks() {
+    using Runtime = gemm_comm::Fp8ChannelwiseGemmRSRuntime;
+    Runtime::Args args{};
+    args.launch_info.block_m = 128; args.launch_info.block_n = 128; args.launch_info.block_k = 64;
+    args.launch_info.warp_m = 32; args.launch_info.warp_n = 64; args.launch_info.num_stages = 4;
+    args.launch_info.num_groups = 1; args.launch_info.gemm_type = "Normal";
+    args.launch_info.kernel_strategy = "Default"; args.launch_info.kernel_name = "test_gemm_rs";
+    if (is_ppu1v5_device()) {
+        args.kernel_params.no_tsm = {};
+        args.kernel_params.no_tsm.problem_shape = cute::make_tuple(64, 512, 512, 1);
+    } else {
+        args.kernel_params.with_tsm = {};
+        args.kernel_params.with_tsm.problem_shape = cute::make_tuple(64, 512, 512, 1);
+    }
+    int count = rs_checks<Runtime>(args);
+    count += check_change<Runtime>(args, [](auto& a) { a.specialize = true; }, "channel specialization");
+    count += check_change<Runtime>(args, [](auto& a) { a.direct_sfb = true; }, "unused direct SFB", false);
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_info.a8w4_int8 = true; }, "element format");
+    count += check_change<Runtime>(args, [](auto& a) {
+        auto change = [](auto& p) { cute::get<1>(p.problem_shape) = 768; };
+        if (is_ppu1v5_device()) change(a.kernel_params.no_tsm); else change(a.kernel_params.with_tsm);
+    }, "literal N");
+    count += check_change<Runtime>(args, [](auto& a) {
+        auto change = [](auto& p) { cute::get<2>(p.problem_shape) = 1024; };
+        if (is_ppu1v5_device()) change(a.kernel_params.no_tsm); else change(a.kernel_params.with_tsm);
+    }, "literal K");
+    count += check_change<Runtime>(args, [](auto& a) {
+        a.launch_args.grid_dim = dim3(19, 2, 1);
+        a.launch_args.block_dim = dim3(256, 1, 1);
+        auto change = [](auto& p) {
+            cute::get<0>(p.problem_shape) = 96;
+            p.hw_info.cu_count = 19;
+            p.collective_mainloop_params.ptr_A = reinterpret_cast<void*>(uintptr_t(0x1000));
+            p.collective_epilogue_params.ptr_D = reinterpret_cast<cutlass::bfloat16_t*>(uintptr_t(0x2000));
+            p.workspace = reinterpret_cast<void*>(uintptr_t(0x3000));
+        };
+        if (is_ppu1v5_device()) change(a.kernel_params.no_tsm); else change(a.kernel_params.with_tsm);
+    }, "runtime launch, M/CU and addresses", false);
+    return count;
+}
+
 int fp4_checks() {
     using Runtime = FP4GemmRuntime;
     Runtime::Args args{};
@@ -216,6 +291,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                     + bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<float>, true>(); });
     m.def("int8_and_fp8_channel", int8_checks);
     m.def("fp8_block", fp8_checks);
+    m.def("fp8_block_rs", fp8_block_rs_checks);
+    m.def("fp8_channel_rs", fp8_channel_rs_checks);
     m.def("fp4", fp4_checks);
     m.def("gemv", gemv_checks);
 }
@@ -258,6 +335,12 @@ class CompileKeyTests(unittest.TestCase):
 
     def test_fp8_block(self):
         self.assertGreater(self.native.fp8_block(), 0)
+
+    def test_fp8_block_reduce_scatter(self):
+        self.assertGreater(self.native.fp8_block_rs(), 0)
+
+    def test_fp8_channel_reduce_scatter(self):
+        self.assertGreater(self.native.fp8_channel_rs(), 0)
 
     def test_fp4(self):
         self.assertGreater(self.native.fp4(), 0)

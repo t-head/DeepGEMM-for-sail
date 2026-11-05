@@ -81,8 +81,9 @@ struct DeepGemmScheduler {
     uint32_t num_blocks;
     uint32_t num_n_blocks = kNumNBlocks;
 
-    // Only used for masked layout
-    uint32_t curr_group_idx, curr_cumsum, curr_cumsum_blocks, curr_group_m, curr_cumsum_m;
+    // Group state; Normal GEMM stays in group 0.
+    uint32_t curr_group_idx = 0;
+    uint32_t curr_cumsum, curr_cumsum_blocks, curr_group_m, curr_cumsum_m;
     // Host-callable methods and type definitions
     using Arguments = TileSchedulerArguments;
     using Params = TileSchedulerParams;
