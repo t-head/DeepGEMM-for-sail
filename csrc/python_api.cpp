@@ -12,7 +12,7 @@
 #include "apis/mega_moe.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
-#define TORCH_EXTENSION_NAME deep_gemm_cpp
+#define TORCH_EXTENSION_NAME _C
 #endif
 
 // ReSharper disable once CppParameterMayBeConstPtrOrRef

@@ -4,6 +4,7 @@
 #include "../utils/layout.hpp"
 #include <torch/extension.h>
 #include "../jit_kernels/impls/fp8_gemm.hpp"
+#include "../jit_kernels/impls/ppuxx_layout.hpp"
 
 #include "../jit_kernels/impls/bf16_gemm.hpp"
 #include "../jit_kernels/impls/fp32_gemm.hpp"
@@ -18,7 +19,7 @@
 #include "../jit_kernels/impls/moe_align.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a16_gemm.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a8_gemm.hpp"
-#include "../jit_kernels/impls/smxx_acblaslt.hpp"
+#include "../jit_kernels/impls/ppuxx_acblaslt.hpp"
 
 namespace deep_gemm::gemm {
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;

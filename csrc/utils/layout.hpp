@@ -37,6 +37,8 @@ static bool fp8_requires_k_major() {
 // Tensor utils
 template <int N>
 static auto get_shape(const torch::Tensor& t) {
+    DG_HOST_ASSERT(t.is_cuda());
+    DG_HOST_ASSERT(t.dim() == N);
     return [&t] <size_t... Is> (std::index_sequence<Is...>) {
         return std::make_tuple(static_cast<int>(t.sizes()[Is])...);
     }(std::make_index_sequence<N>());
@@ -97,44 +99,6 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
     return sf;
 }
 
-torch::Tensor get_mn_major_tma_aligned_tensor(const torch::Tensor& x) {
-    assert(x.dim() == 2 || x.dim() == 3);
-
-    bool remove_dim = false;
-    int64_t m = x.size(-2);
-    int64_t n = x.size(-1);
-    auto dtype = x.dtype();
-    auto device = x.device();
-
-    int64_t element_size = x.element_size();
-    // int64_t aligned_m = get_tma_aligned_size(m, element_size);
-    int64_t aligned_m = m;
-    torch::Tensor x_view = x;
-
-    if (x.dim() == 2) {
-        if (x.stride(0) == 1 && x.stride(1) == aligned_m) {
-            return x;
-        }
-        x_view = x.unsqueeze(0);
-        remove_dim = true;
-    }
-
-    int64_t b = x_view.size(0);
-
-    if (x_view.stride(0) == aligned_m * n && x_view.stride(1) == 1 && x_view.stride(2) == aligned_m) {
-        return remove_dim ? x_view.squeeze(0) : x_view;
-    }
-
-    auto options = torch::TensorOptions().dtype(dtype).device(device);
-    torch::Tensor aligned_x = torch::transpose(torch::empty({b, n, aligned_m}, options), 1, 2);
-
-    aligned_x.slice(1, 0, m).copy_(x_view);
-
-    aligned_x = aligned_x.slice(1, 0, m);
-
-    return remove_dim ? aligned_x.squeeze(0) : aligned_x;
-}
-
 torch::Tensor get_col_major_tensor(const torch::Tensor& x) {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "Only 2-D or 3-D tensors supported");
 
@@ -157,15 +121,5 @@ torch::Tensor get_col_major_tensor(const torch::Tensor& x) {
     return squeeze_dim ? col_major.squeeze(0) : col_major;
 }
 
-int get_mk_alignment_for_contiguous_layout() {
-    /*
-    When we do a grouped GEMM in contiguous format, LHS are grouped into several batches along the M axis.
-    Since we deal with exactly one sub-matrix of RHS for each GEMM block, batch sizes above should align well
-        with GEMM block shape.
-    Returns:
-        Group-level alignment requirement for grouped contiguous layout, which is always 128.
-    */
-    return 128;
-}
 
 } // namespace deep_gemm

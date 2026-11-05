@@ -12,6 +12,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
 #include "../../utils/layout.hpp"
+#include "ppuxx_layout.hpp"
 #include "../../utils/layout_type_name.hpp"
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_fp8.hpp"
