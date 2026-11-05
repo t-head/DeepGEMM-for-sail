@@ -51,9 +51,6 @@ using TileSchedulerParams = TileSchedulerArguments;
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
-// `kTransposedBatchOutput` only affects `GemmType::Batched`. It defaults to `true` because
-// the original BatchGemm user is `einsum("bhr,hdr->bhd")`, whose output `[M, B, N]` keeps the
-// batch dim in the middle. Pass `false` for a plain `[B, M, N]` batched output.
 template <GemmType kGemmType,
           uint32_t SHAPE_N_, uint32_t SHAPE_K_,
           uint32_t BLOCK_M_, uint32_t BLOCK_N_,
@@ -61,7 +58,6 @@ template <GemmType kGemmType,
           uint32_t kNumNBlocks = math::ceil_div(SHAPE_N_, BLOCK_N_),
           uint32_t kNum1DBlocksPerGroup = 2,
           EpilogueType kEpilogueType = EpilogueType::Default,
-          bool kTransposedBatchOutput = true,
           bool kInterleaveM = false>
 struct DeepGemmScheduler {
     constexpr static uint32_t SHAPE_N = SHAPE_N_;
@@ -345,9 +341,13 @@ struct DeepGemmScheduler {
     }
 
     // Gets the pointer offset of matrix A
-    __device__ __forceinline__ int64_t curr_offset_a() const
+    __device__ __forceinline__ int64_t curr_offset_a(int64_t batch_stride = -1) const
     {
-        if constexpr (kGemmType == GemmType::MGroupedMasked || kGemmType == GemmType::Batched) {
+        if constexpr (kGemmType == GemmType::Batched) {
+            // A's packed batch stride depends on runtime M; zero is a valid broadcast stride.
+            return int64_t(curr_group_idx) *
+                   (batch_stride < 0 ? int64_t(params.shape_m) * SHAPE_K : batch_stride);
+        } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
             return int64_t(curr_group_idx) * params.shape_m * SHAPE_K;
         } else if constexpr (kGemmType == GemmType::MGroupedNoPad) {
             return int64_t(curr_cumsum_m) * SHAPE_K;
@@ -395,11 +395,14 @@ struct DeepGemmScheduler {
     }
 
     // Gets the pointer offset of matrix B
-    __device__ __forceinline__ int64_t curr_offset_b(const int m_block_idx = 0) const
+    __device__ __forceinline__ int64_t curr_offset_b(
+        const int m_block_idx = 0, const int64_t batch_stride = int64_t(SHAPE_N) * SHAPE_K) const
     {
         if constexpr (kGemmType == GemmType::MGroupedContiguous) {
             int64_t offset = __ldg(params.grouped_layout + m_block_idx * BLOCK_M);
             return offset * SHAPE_N * SHAPE_K;
+        } else if constexpr (kGemmType == GemmType::Batched) {
+            return int64_t(curr_group_idx) * batch_stride;
         } else {
             return int64_t(curr_group_idx) * SHAPE_N * SHAPE_K;
         }
@@ -424,21 +427,14 @@ struct DeepGemmScheduler {
         }
     }
 
-    __device__ __forceinline__ int64_t curr_offset_c() const
+    __device__ __forceinline__ int64_t curr_offset_c(int64_t output_batch_stride = 0) const
     {
         if constexpr (kGemmType == GemmType::MGroupedMasked || kGemmType == GemmType::MGroupedContiguous) {
             return int64_t(curr_group_idx) * params.shape_m * SHAPE_N_OUT;
         } else if constexpr (kGemmType == GemmType::MGroupedNoPad) {
             return int64_t(curr_cumsum_m) * SHAPE_N_OUT;
         } else if constexpr(kGemmType == GemmType::Batched) {
-            // Transposed `[M, B, N]`: a batch only advances by one row segment, and the row
-            // stride carried by `stride_D` spans all batches. Plain `[B, M, N]`: a batch
-            // advances by a whole `M x N` matrix.
-            if constexpr (kTransposedBatchOutput) {
-                return int64_t(curr_group_idx) * SHAPE_N_OUT;
-            } else {
-                return int64_t(curr_group_idx) * params.shape_m * SHAPE_N_OUT;
-            }
+            return int64_t(curr_group_idx) * output_batch_stride;
         } else {
             return 0;
         }

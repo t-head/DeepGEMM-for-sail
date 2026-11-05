@@ -628,7 +628,7 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
 
     auto args = INT8GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
                                                               num_stages, "MGroupedMasked", "Default", kernel_name,
-                                                              enable_sbo_overlap, /*transposed_batch_output=*/true,
+                                                              enable_sbo_overlap,
                                                               is_a8w4},
                                               .launch_args = {grid, block, SMSIZE},
                                               .kernel_params = params,
@@ -1022,7 +1022,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     auto args =
         INT8GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
                                                       num_stages, "MGroupedNoPad", kernel_strategy, kernel_name,
-                                                      /*enable_sbo_overlap=*/false, /*transposed_batch_output=*/true,
+                                                      /*enable_sbo_overlap=*/false,
                                                       is_a8w4},
                                       .launch_args = {grid, block, SMSIZE},
                                       .kernel_params = params,

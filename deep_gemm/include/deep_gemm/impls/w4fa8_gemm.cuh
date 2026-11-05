@@ -75,7 +75,7 @@ public:
                           deep_gemm::FusedGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND,
                                                         kNumGroups, N_Blocks, scheduler_swizzle, WideM>,
                           deep_gemm::DeepGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND, kNumGroups,
-                                                       N_Blocks, scheduler_swizzle, deep_gemm::EpilogueType::Default, true, WideM && kNumGroups >= 128>>;
+                                                       N_Blocks, scheduler_swizzle, deep_gemm::EpilogueType::Default, WideM && kNumGroups >= 128>>;
   using ArchTag = cutlass::arch::PPU0015;
   static constexpr int WarpsOnM = BlockM / WarpM;
   static constexpr int WarpsOnN = BlockN / WarpN; // WarpN = 64
