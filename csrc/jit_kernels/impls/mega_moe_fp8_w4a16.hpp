@@ -68,12 +68,19 @@ inline void PPUFP8MegaMoERuntime::compile_and_launch(const std::string& tag, con
     const auto& [l1_weights_replicas, l1_weights_replicas_sf] = args.l1_weights_replicas;
     const auto& [l2_weights_replicas, l2_weights_replicas_sf] = args.l2_weights_replicas;
     if (args.kernel_phase == KernelPhase::Linear1) {
-        fp8_channelwise_mega_moe_dispatch_gemm1_kernel(
-            config, buffer.sym_buffer, args.rank_idx, args.num_tokens, l1_weights, l1_weights_sf,
-            l1_weights_replicas, l1_weights_replicas_sf, l1_weights.size(0), buffer.bf16_scratch,
-            config.activation_clamp, buffer.block_info, tag);
-        fp8_channelwise_mega_moe_quantize_local_pool_kernel(
-            config, buffer.sym_buffer, args.rank_idx, buffer.bf16_scratch, buffer.l2_acts, buffer.l2_acts_sf);
+        if (args.precision == Precision::FP8Blockwise) {
+            fp8_blockwise_mega_moe_dispatch_gemm1_kernel(
+                config, buffer.sym_buffer, buffer.dispatched_tokens, args.rank_idx, args.num_tokens,
+                l1_weights, l1_weights_sf, buffer.l2_acts, buffer.l2_acts_sf,
+                config.activation_clamp, config.swiglu_alpha, l1_weights_replicas, l1_weights_replicas_sf, tag);
+        } else {
+            fp8_channelwise_mega_moe_dispatch_gemm1_kernel(
+                config, buffer.sym_buffer, args.rank_idx, args.num_tokens, l1_weights, l1_weights_sf,
+                l1_weights_replicas, l1_weights_replicas_sf, l1_weights.size(0), buffer.bf16_scratch,
+                config.activation_clamp, buffer.block_info, tag);
+            fp8_channelwise_mega_moe_quantize_local_pool_kernel(
+                config, buffer.sym_buffer, args.rank_idx, buffer.bf16_scratch, buffer.l2_acts, buffer.l2_acts_sf);
+        }
         update_recv_stats(buffer, args.cumulative_local_expert_recv_stats);
         return;
     }
@@ -81,12 +88,20 @@ inline void PPUFP8MegaMoERuntime::compile_and_launch(const std::string& tag, con
     TORCH_CHECK(args.kernel_phase == KernelPhase::Linear2, "Invalid MegaMoE kernel phase");
     const int hidden = args.y.size(1);
     const auto output = buffer.combine.narrow(0, 0, hidden).view({1, hidden});
-    fp8_channelwise_mega_moe_scatter_kernel(
-        args.l2_config, buffer.l2_acts, buffer.l2_acts_sf, l2_weights, l2_weights_sf,
-        l2_weights_replicas, l2_weights_replicas_sf, output, buffer.l2_acts.size(0), buffer.m_rows,
-        buffer.block_info, config.num_sms, buffer.token_meta, buffer.combine, hidden * 2, config.nmtpr,
-        config.num_topk, buffer.peer_offsets, args.rank_idx, config.num_ranks, buffer.valid_m_rows,
-        buffer.src_m_offsets, buffer.valid_m_rows, config.num_experts_per_rank, tag);
+    if (args.precision == Precision::FP8Blockwise) {
+        fp8_blockwise_mega_moe_scatter_kernel(
+            args.l2_config, buffer.l2_acts, buffer.l2_acts_sf, l2_weights, l2_weights_sf, output,
+            buffer.m_rows, buffer.valid_m_rows, buffer.src_m_offsets, buffer.token_meta, buffer.combine,
+            buffer.peer_offsets, buffer.block_info, buffer.l2_acts.size(0), config.nmtpr, config.num_topk,
+            args.rank_idx, config.num_ranks, config.num_sms, l2_weights_replicas, l2_weights_replicas_sf, tag);
+    } else {
+        fp8_channelwise_mega_moe_scatter_kernel(
+            args.l2_config, buffer.l2_acts, buffer.l2_acts_sf, l2_weights, l2_weights_sf,
+            l2_weights_replicas, l2_weights_replicas_sf, output, buffer.l2_acts.size(0), buffer.m_rows,
+            buffer.block_info, config.num_sms, buffer.token_meta, buffer.combine, hidden * 2, config.nmtpr,
+            config.num_topk, buffer.peer_offsets, args.rank_idx, config.num_ranks, buffer.valid_m_rows,
+            buffer.src_m_offsets, buffer.valid_m_rows, config.num_experts_per_rank, tag);
+    }
     combine_mega_moe(buffer, config, args.y, args.rank_idx, args.num_tokens);
 }
 
@@ -114,9 +129,12 @@ inline void fp8_fp8_mega_moe_impl(
         PPUFP8MegaMoERuntime::compile_and_launch(kernel_name, split_args);
     };
     launch_with_phase(PPUFP8MegaMoERuntime::KernelPhase::Linear1,
-                      "fp8_channelwise_mega_moe_dispatch_gemm1");
+                      precision == Precision::FP8Blockwise ? "fp8_blockwise_mega_moe_dispatch_gemm1"
+                                                         : "fp8_channelwise_mega_moe_dispatch_gemm1");
     launch_with_phase(PPUFP8MegaMoERuntime::KernelPhase::Linear2,
-                      "m_grouped_gemm_fp8_channelwise_moe_scatter");
+                      precision == Precision::FP8Blockwise
+                          ? "fp8_blockwise_mega_moe_scatter"
+                          : "m_grouped_gemm_fp8_channelwise_moe_scatter");
 }
 
 } // namespace deep_gemm::mega_moe_fp8_w4a16

@@ -402,8 +402,8 @@ class FP8SymmBuffer(_RoutedSymmBuffer):
         activation: str = "swiglu",
         base: Optional["FP8SymmBuffer"] = None,
     ) -> None:
-        if quantization not in ("channelwise",):
-            raise ValueError("FP8 quantization must be 'channelwise'")
+        if quantization not in ("channelwise", "blockwise"):
+            raise ValueError("FP8 quantization must be 'channelwise' or 'blockwise'")
         self.quantization = quantization
         super().__init__(
             group,
@@ -483,8 +483,8 @@ def transform_weights_for_fp8_mega_moe(
         quantization: str = "channelwise",
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
     """Reorder gate/up rows without requantizing E4M3 weights or FP32 scales."""
-    if quantization not in ("channelwise",):
-        raise ValueError("FP8 quantization must be 'channelwise'")
+    if quantization not in ("channelwise", "blockwise"):
+        raise ValueError("FP8 quantization must be 'channelwise' or 'blockwise'")
     blockwise = quantization == "blockwise"
     e, h, i = _check_routed_weights(l1_weights, l2_weights, torch.float8_e4m3fn, blockwise)
     w, s = l1_weights

@@ -290,6 +290,8 @@ static mega_moe_config::fp8_w4a16::Precision routed_precision(const std::string&
     using P = mega_moe_config::fp8_w4a16::Precision;
     if (precision == "fp8_channelwise")
         return P::FP8Channelwise;
+    if (precision == "fp8_blockwise")
+        return P::FP8Blockwise;
     TORCH_CHECK(false, "Unsupported MegaMoE precision: ", precision);
 }
 
@@ -378,8 +380,8 @@ static auto get_mega_moe_buffer_slices_for_precision(
 }
 
 static std::string fp8_mega_moe_precision(const std::string& quantization) {
-    TORCH_CHECK(quantization == "channelwise",
-                "FP8 quantization must be 'channelwise'");
+    TORCH_CHECK(quantization == "channelwise" || quantization == "blockwise",
+                "FP8 quantization must be 'channelwise' or 'blockwise'");
     return "fp8_" + quantization;
 }
 
@@ -424,7 +426,11 @@ static void fp8_w4a16_mega_moe_pre_dispatch_checked(const Tensor& hidden_states,
     check_tensor(x, torch::kFloat8_e4m3fn);
     const bool blockwise = x_sf.size(1) != 1;
     check_shape(x_sf, {num_max_tokens_per_rank, blockwise ? hidden / 128 : 1});
-    mega_moe_fp8_w4a16::fp8_channelwise_mega_moe_pre_dispatch_impl(
+    if (blockwise)
+        mega_moe_fp8_w4a16::fp8_blockwise_mega_moe_pre_dispatch_impl(
+            hidden, num_topk, hidden_states, topk_idx, topk_weights, x, x_sf, staged_topk_idx, staged_topk_weights, num_tokens);
+    else
+        mega_moe_fp8_w4a16::fp8_channelwise_mega_moe_pre_dispatch_impl(
             hidden, num_topk, hidden_states, topk_idx, topk_weights, x,
             x_sf, staged_topk_idx, staged_topk_weights, num_tokens);
 }

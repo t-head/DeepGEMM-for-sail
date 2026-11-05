@@ -42,6 +42,11 @@ struct ChannelScatter {
     uint32_t num_groups = 0;
 };
 
+struct BlockScatter {
+    ChannelScatter base;
+    const int32_t* src_m_offsets = nullptr;
+};
+
 template <typename Epilogue, typename Scatter> struct ScatterEpilogue {
     Epilogue base;
     Scatter scatter;
@@ -71,6 +76,23 @@ struct ChannelOverlapParams {
     ScatterEpilogue<DenseINT8GemmCutlass3Runtime::EpilogueArgs, ChannelScatter> epilogue;
     cutlass::KernelHardwareInfo hw_info;
     ScatterScheduler scheduler;
+    void* workspace = nullptr;
+    int32_t* signal = nullptr;
+    const void* rhs_replicas = nullptr;
+    const float* rhs_replica_scales = nullptr;
+    uint32_t num_master_groups = 0;
+};
+
+struct BlockScatterParams {
+    Mode mode = Mode::kGemm;
+    Problem problem_shape;
+    FP8GemmRuntime::MainLoopArguments mainloop;
+    ScatterEpilogue<FP8GemmRuntime::EpilogueArgs, BlockScatter> epilogue;
+    cutlass::KernelHardwareInfo hw_info;
+    struct Scheduler {
+        ScatterScheduler base;
+        const int32_t* pool_row_offsets = nullptr;
+    } scheduler;
     void* workspace = nullptr;
     int32_t* signal = nullptr;
     const void* rhs_replicas = nullptr;
@@ -237,6 +259,52 @@ inline void fp8_channelwise_mega_moe_scatter_kernel(const ScatterConfig& config,
         scatter_launch<Fp8ChannelwiseDefaultScatterTag>(entry,
                                                  channel_scatter_family(), config, params, num_ctas, threads);
     }
+}
+
+struct Fp8BlockwiseScatterTag {};
+inline void fp8_blockwise_mega_moe_scatter_kernel(const ScatterConfig& config, const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
+                     const torch::Tensor& rhs, const torch::Tensor& rhs_scales, const torch::Tensor& output,
+                     const torch::Tensor& m_rows, const torch::Tensor& valid_m_rows, const torch::Tensor& src_m_offsets,
+                     const torch::Tensor& token_meta, const torch::Tensor& combine, const torch::Tensor& peer_offsets,
+                     const torch::Tensor& block_info, int num_rows, int num_max_tokens_per_rank, int num_topk, int rank_idx, int num_ranks,
+                     int num_ctas, const torch::Tensor& rhs_replicas, const torch::Tensor& rhs_replica_scales,
+                     const std::string& entry) {
+    const int m = num_rows, n = config.n, k = config.k, groups = config.num_groups;
+    if (m == 0)
+        return;
+    const auto layout = prepare_scatter_layout(groups, config.block_m, valid_m_rows, block_info);
+    const auto sa = packed_stride(m, k), sb = packed_stride(n, k), sd = packed_stride(m, n);
+    const auto problem = cute::make_shape(m, n, k, 1);
+    BlockScatterParams params{};
+    params.problem_shape = {m, n, k, 1};
+    params.mainloop = {device_pointer<cutlass::float_e4m3_t>(lhs),
+                       sa,
+                       device_pointer<cutlass::float_e4m3_t>(rhs),
+                       sb,
+                       4,
+                       device_pointer<float>(lhs_scales),
+                       FP8GemmRuntime::ScaleConfig::tile_atom_to_shape_SFA(problem),
+                       device_pointer<float>(rhs_scales),
+                       FP8GemmRuntime::ScaleConfig::tile_atom_to_shape_SFB(problem)};
+    params.epilogue.base = {{1, 0}, nullptr, sd, device_pointer<cutlass::bfloat16_t>(output), sd};
+    params.epilogue.scatter = {{device_pointer(combine), uint32_t(n * 2), uint32_t(num_max_tokens_per_rank), uint32_t(num_topk),
+                                device_pointer<int64_t>(token_meta), device_pointer<int32_t>(valid_m_rows),
+                                device_pointer<int64_t>(peer_offsets), uint32_t(rank_idx), uint32_t(num_ranks), nullptr,
+                                uint32_t(groups)},
+                               device_pointer<int32_t>(src_m_offsets)};
+    params.epilogue.base_ptr_D = device_pointer(output);
+    params.scheduler = {{uint32_t(m), layout}, device_pointer<int32_t>(src_m_offsets)};
+    params.rhs_replicas = device_pointer(rhs_replicas);
+    params.rhs_replica_scales = device_pointer<float>(rhs_replica_scales);
+    params.num_master_groups = config.num_master_groups;
+    scatter_launch<Fp8BlockwiseScatterTag>(entry, R"DGSOURCE(
+#include <deep_gemm/impls/fp8_gemm_blockwise_scatter.cuh>
+using Family = deep_gemm::mega_moe::fp8_blockwise::Gemm2Scatter<{N},{K},{GROUPS},{MASTER_GROUPS},{NUM_STAGES},{BLOCK_M},{SCRATCH_ROWS}>;
+using Kernel = typename Family::Kernel;
+static_assert(Family::kNumThreads == {NUM_THREADS}, "blockwise scatter launch must match its MMA tile");
+static_assert(Kernel::SharedStorageSize == {SMEM_SIZE}, "blockwise scatter shared-memory estimate must match its arena");
+)DGSOURCE",
+                                       config, params, num_ctas, config.num_threads);
 }
 
 } // namespace deep_gemm::mega_moe_fp8_w4a16

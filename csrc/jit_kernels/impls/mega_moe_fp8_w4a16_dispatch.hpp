@@ -311,6 +311,61 @@ void PPU_KERNEL_ENTRY(int64_t sb_base,
         dim3(config.num_sms * 4), quant_config.num_threads);
 }
 
+struct Fp8BlockwiseMegaMoeDispatchGemm1Tag {
+    using Runtime = PPUFP8MegaMoERuntime;
+};
+inline void fp8_blockwise_mega_moe_dispatch_gemm1_kernel(
+    const DispatchConfig& config, const layout::SymBuffer<>& sym_buffer, const torch::Tensor& local_pool, int rank_idx,
+    int num_tokens, const torch::Tensor& weight, const torch::Tensor& weight_scales, const torch::Tensor& output,
+    const torch::Tensor& output_scales, float activation_clamp, float swiglu_alpha, const torch::Tensor& weight_replicas,
+    const torch::Tensor& scale_replicas, const std::string& entry) {
+    launch<Fp8BlockwiseMegaMoeDispatchGemm1Tag>(
+        entry, R"DGMEGA(#include <deep_gemm/impls/fp8_blockwise_mega_moe_dispatch_gemm1.cuh>
+using namespace deep_gemm;
+static_assert(sizeof(layout::SymBuffer<>) == 528, "MegaMoE symmetric buffer ABI changed");
+constexpr uint32_t NUM_RANKS = {NUM_RANKS};
+constexpr uint32_t NUM_CTAS = {NUM_CTAS};
+constexpr uint32_t NUM_THREADS = {NUM_THREADS};
+constexpr uint32_t NUM_EXPERTS = {NUM_EXPERTS};
+constexpr uint32_t NUM_TOPK = {NUM_TOPK};
+constexpr uint32_t NMTPR = {NMTPR};
+constexpr uint32_t TOKEN_BYTES = {TOKEN_BYTES};
+using G = mega_moe::fp8_blockwise::Gemm1<{GEMM1_N}, TOKEN_BYTES, {GEMM1_COMPUTE_M}>;
+static_assert(G::kNumThreads == NUM_THREADS, "blockwise GEMM1 launch must match its MMA tile");
+constexpr uint32_t ppu_smem_compute() {
+    return G::shared_memory_bytes<NUM_EXPERTS>();
+}
+extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes = ppu_smem_compute();
+extern "C" __global__ __launch_bounds__(NUM_THREADS, 1)
+void PPU_KERNEL_ENTRY(layout::SymBuffer<> sb, uint8_t* local_pool, int rank_idx, int num_tokens, __hg_fp8_e4m3* weight, float* weight_scales, uint8_t* output, float* output_scales, float activation_clamp, float swiglu_alpha, __hg_fp8_e4m3* weight_replicas, float* scale_replicas) {
+
+constexpr uint64_t off_ws = 0, off_it = {LAYOUT_OFF_IT}, off_isf = {LAYOUT_OFF_ISF};
+constexpr uint64_t off_iti = {LAYOUT_OFF_ITI};
+constexpr uint64_t off_pt = {LAYOUT_OFF_PT}, off_psf = {LAYOUT_OFF_PSF}, off_meta = {LAYOUT_OFF_GEMM2_META};
+
+const int64_t local_base = sb.base;
+auto P = [&](uint64_t off) -> void* {
+    return off >= off_pt ? local_pool + (off - off_pt) : (void*)(local_base + off);
+};
+mega_moe::fp8_blockwise::dispatch_gemm1_kernel_device<
+    NUM_RANKS, NUM_CTAS, NUM_EXPERTS, NUM_TOPK, TOKEN_BYTES, {GEMM1_N}, {PULL_CTAS}, {CLAMP}, {MASTER_EXPERTS}, {SWIGLU_OAI}, {GEMM1_COMPUTE_M}>(
+    P(off_ws), sb, (const int64_t*)P(off_iti),
+    (const uint8_t*)P(off_it), (const float*)P(off_isf),
+    (uint8_t*)P(off_pt), (float*)P(off_psf), (int32_t*)P(off_meta),
+    (const uint8_t*)weight, weight_scales, output,
+    output_scales,
+    (uint32_t)num_tokens, NMTPR, activation_clamp, swiglu_alpha,
+    (const uint8_t*)weight_replicas, scale_replicas);
+}
+)DGMEGA",
+        config,
+        std::make_tuple(sym_buffer, device_pointer(local_pool), int32_t(rank_idx), int32_t(num_tokens),
+                        device_pointer(weight), device_pointer(weight_scales), device_pointer(output),
+                        device_pointer(output_scales), activation_clamp, swiglu_alpha, device_pointer(weight_replicas),
+                        device_pointer(scale_replicas)),
+        dim3(config.num_ctas), config.num_threads, false, /*cooperative=*/true);
+}
+
 struct Fp8ChannelwiseMegaMoePreDispatchTag {
     using Runtime = PPUFP8MegaMoERuntime;
 };
@@ -332,6 +387,35 @@ extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes = 0;
 extern "C" __global__ __launch_bounds__(256, 1)
 void PPU_KERNEL_ENTRY(__ppu_bfloat16* hidden_states, int64_t* topk_ids, float* topk_weights, uint8_t* input_token, float* input_scale, int64_t* input_topk_idx, float* input_topk_weights, int num_tokens) {
 mega_moe::fp8_channelwise::fp8_mega_moe_pre_dispatch_kernel_device<{HIDDEN}, {TOP_K}, 256>(hidden_states,topk_ids,topk_weights,input_token,input_scale,input_topk_idx,input_topk_weights,(uint32_t)num_tokens);
+}
+)DGMEGA",
+        config,
+        std::make_tuple(device_pointer(hidden_states), device_pointer(topk_ids), device_pointer(topk_weights),
+                        device_pointer(input_token), device_pointer(input_scale), device_pointer(input_topk_idx),
+                        device_pointer(input_topk_weights), int32_t(num_tokens)),
+        dim3(num_tokens), 256);
+}
+
+struct Fp8BlockwiseMegaMoePreDispatchTag {
+    using Runtime = PPUFP8MegaMoERuntime;
+};
+inline void fp8_blockwise_mega_moe_pre_dispatch_impl(
+    int hidden, int num_topk, const torch::Tensor& hidden_states, const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights, const torch::Tensor& input_token, const torch::Tensor& input_scale,
+    const torch::Tensor& input_topk_idx, const torch::Tensor& input_topk_weights, int num_tokens,
+    const std::string& entry = "fp8_blockwise_mega_moe_pre_dispatch") {
+    PreDispatchConfig config;
+    config.hidden = hidden;
+    config.num_topk = num_topk;
+    if (num_tokens == 0)
+        return;
+    launch<Fp8BlockwiseMegaMoePreDispatchTag>(
+        entry, R"DGMEGA(#include <deep_gemm/impls/fp8_blockwise_mega_moe_pre_dispatch.cuh>
+using namespace deep_gemm;
+extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes = 0;
+extern "C" __global__ __launch_bounds__(256, 1)
+void PPU_KERNEL_ENTRY(__ppu_bfloat16* hidden_states, int64_t* topk_ids, float* topk_weights, __hg_fp8_e4m3* input_token, float* input_scale, int64_t* input_topk_idx, float* input_topk_weights, int num_tokens) {
+mega_moe::fp8_blockwise::pre_dispatch_kernel_device<{HIDDEN}, {TOPK}>(hidden_states,topk_ids,topk_weights,input_token,input_scale,input_topk_idx,input_topk_weights,(uint32_t)num_tokens);
 }
 )DGMEGA",
         config,

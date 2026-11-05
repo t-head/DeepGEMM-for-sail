@@ -468,6 +468,7 @@ Shared experts remain outside the routed pipeline.
 | Backend | Compute | Workspace / factory | Activation | EP limit |
 |---|---|---|---|---|
 | FP8 channelwise | `fp8_fp8_mega_moe` | `FP8SymmBuffer` / `get_symm_buffer_for_fp8_mega_moe` | SwiGLU, SwiGLU-OAI | 8 |
+| FP8 blockwise | `fp8_fp8_mega_moe` | same, `quantization="blockwise"` | SwiGLU, SwiGLU-OAI | 64 |
 
 H is divisible by 256 and I by 128. FP8 supports at most 128 physical experts
 per rank. Other capacity, top-k, distinct-route,
@@ -491,11 +492,13 @@ dg.fp8_fp8_mega_moe(y, l1, l2, workspace, activation="swiglu")
 ```
 
 FP8 weights are contiguous E4M3 `[E,N,K]`. Channelwise FP32 scales are
-`[E,N,1]`. The transform interleaves GEMM1 gate/up rows in groups of eight, including their
+`[E,N,1]`; blockwise scales are `[E,N/128,K/128]`. The transform interleaves
+GEMM1 gate/up rows in groups of eight or 128 respectively, including their
 scales, without requantization.
 Transformed weights are specific to their backend and must not be interchanged.
 
-FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]`. `mega_moe_pre_dispatch` fills these
+FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]` for channelwise
+or `[capacity,H/128]` for blockwise. `mega_moe_pre_dispatch` fills these
 inputs and routes. FP8 also quantizes activated GEMM1 output to E4M3. These backends use BF16 GEMM2 scatter and
 the existing generation barrier/reduce for completion and counter recycling.
 

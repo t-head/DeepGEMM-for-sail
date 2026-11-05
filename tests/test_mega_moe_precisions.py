@@ -28,6 +28,8 @@ from test_mega_moe import (
 CASES = (
     MegaMoECase("smoke_channelwise", 512, 256, 8, 2, 129, tokens=(1, 0, 33, 129, 8),
                precision="fp8_channelwise", routing="random", reference_tokens=129),
+    MegaMoECase("smoke_blockwise", 512, 256, 8, 2, 129, tokens=(1, 0, 33, 129, 8),
+               precision="fp8_blockwise", routing="random", reference_tokens=129),
     MegaMoECase(
         "minimax_m3",
         6144,
@@ -53,6 +55,20 @@ CASES = (
     MegaMoECase(
         "qwen38_flash", 2560, 640, 512, 10, 4096, tokens=MODEL_TOKENS, worlds=(4,),
         precision="fp8_channelwise", routing="random",
+    ),
+    MegaMoECase(
+        "minimax_m3_blockwise",
+        7168,
+        5120,
+        384,
+        4,
+        4096,
+        tokens=(64, *MODEL_TOKENS),
+        activation="swiglu_oai",
+        clamp=7.0,
+        worlds=(8, 16, 32, 64),
+        precision="fp8_blockwise",
+        routing="random",
     ),
 )
 

@@ -133,7 +133,12 @@ inline DispatchConfig dispatch_config(int ranks, int experts, int topk, int capa
 
 inline int fp8_dispatch_block_m(std::optional<int> requested, bool blockwise) {
     const int bm = requested.value_or(blockwise ? 128 : 256);
-    TORCH_CHECK(bm == 128 || bm == 256, "FP8 channelwise dispatch/GEMM1 requires block_m=128 or 256");
+    if (blockwise) {
+        TORCH_CHECK(bm == 128, "FP8 blockwise dispatch requires block_m=128; "
+                               "the GEMM1 compute tile is selected separately");
+    } else {
+        TORCH_CHECK(bm == 128 || bm == 256, "FP8 channelwise dispatch/GEMM1 requires block_m=128 or 256");
+    }
     return bm;
 }
 
@@ -208,6 +213,80 @@ inline void fp8_gemm1_config(DispatchConfig& c, int tokens, const Gemm1Tuning& t
                 "FP8 channelwise pull CTAs must be a positive multiple of 3 below num_sms");
 }
 
+inline int blockwise_compute_m(std::optional<int> expected_m, int groups, int n, int sms) {
+    TORCH_CHECK(groups > 0 && n > 0 && sms > 0 && (!expected_m || *expected_m >= 0));
+    if (!expected_m || *expected_m <= 128)
+        return 128;
+    const int m128 = ceil_div(*expected_m, 128), m192 = ceil_div(*expected_m, 192);
+    if (groups * m192 * ceil_div(n, 256) < sms && m128 > m192)
+        return 128;
+    // Empirical fallback: BM192 may trade up to 12.5% more padded rows for
+    // lower per-row overhead. This is a tuning budget, not a kernel constraint.
+    constexpr int padding_budget_numerator = 9, padding_budget_denominator = 8;
+    return int64_t(m192) * 192 * padding_budget_denominator <= int64_t(m128) * 128 * padding_budget_numerator ? 192
+                                                                                                              : 128;
+}
+
+inline void fp8_blockwise_gemm1_config(DispatchConfig& c, int tokens, int n, const Gemm1Tuning& tuning) {
+    c.block_m = fp8_dispatch_block_m(c.block_m, true);
+    const int groups = c.num_experts_per_rank;
+    const int em = ceil_div(int64_t(tokens) * c.num_topk, int64_t(groups));
+    c.gemm1_compute_m = tuning.block_m.value_or(blockwise_compute_m(em, groups, n, c.num_sms));
+    TORCH_CHECK(c.gemm1_compute_m == 128 || c.gemm1_compute_m == 32 || c.gemm1_compute_m == 192,
+                "FP8 blockwise GEMM1 requires compute block_m=32, 128 or 192");
+    TORCH_CHECK(!tuning.tile, "blockwise GEMM1 accepts block_m, not a full tile override");
+    c.gemm1_block_n = 256;
+    c.gemm1_block_k = 128;
+    c.gemm1_warp_m = std::max(16, c.gemm1_compute_m / 4);
+    c.gemm1_warp_n = c.gemm1_block_n / 4;
+    c.gemm1_stages = 4;
+    c.num_threads = threads(c.gemm1_compute_m, c.gemm1_block_n, c.gemm1_warp_m, c.gemm1_warp_n);
+    // Bound dedicated pull CTAs to a quarter of the grid. Wider GEMMs leave
+    // more computation per pulled row, so they need a smaller pull fraction.
+    constexpr int pull_grid_divisor = 4, pull_balance_columns = 512;
+    const int limit = std::max(1, c.num_sms / pull_grid_divisor);
+    int pulls = std::min(limit, std::max(1, ceil_div(c.num_sms * pull_balance_columns, n + pull_balance_columns)));
+    pulls = std::min(limit, pulls * std::max(ceil_div(c.num_ranks, 32), 2));
+    c.pull_ctas = tuning.pull_ctas.value_or(pulls);
+    TORCH_CHECK(c.pull_ctas > 0 && c.pull_ctas < c.num_sms);
+}
+
+inline ScatterConfig fp8_blockwise_scatter_config(int n, int k, int groups, int masters, std::optional<int> expected,
+                                                  const Gemm2Tuning& tuning) {
+    ScatterConfig c;
+    c.n = n;
+    c.k = k;
+    c.num_groups = groups;
+    c.num_master_groups = masters;
+    c.block_m = blockwise_compute_m(expected, groups, n, get_num_sms());
+    c.num_stages = std::min(4, std::max(2, k / 128));
+    if (tuning.tile) {
+        const auto& t = *tuning.tile;
+        TORCH_CHECK(t[1] == 256 && t[2] == 128 && t[3] == std::max(16, t[0] / 4) && t[4] == 64,
+                    "unsupported blockwise GEMM2 tile");
+        c.block_m = t[0];
+        c.num_stages = t[5];
+    }
+    TORCH_CHECK((c.block_m == 32 || c.block_m == 128 || c.block_m == 192) && c.num_stages >= 2 && c.num_stages <= 4);
+    c.block_n = 256;
+    c.block_k = 128;
+    c.warp_m = std::max(16, c.block_m / 4);
+    c.warp_n = 64;
+    c.num_threads = threads(c.block_m, c.block_n, c.warp_m, c.warp_n);
+    // Mainloop and native epilogue share a prefix; scatter adds a disjoint,
+    // 128-byte-aligned BF16 tile. Prefer a full tile when the arena fits.
+    const int prefix = std::get<0>(deep_gemm_fp8_common::get_smem_config(
+        c.num_stages, k, c.block_m, c.block_n, c.block_k));
+    const auto smem_size = [&](int rows) {
+        return ceil_div(prefix, 128) * 128 + ceil_div(rows * c.block_n * 2, 128) * 128;
+    };
+    constexpr int smem_capacity = 256 * 1024;
+    c.scratch_rows = smem_size(c.block_m) <= smem_capacity ? 0 : 32;
+    c.smem_size = smem_size(c.scratch_rows ? c.scratch_rows : c.block_m);
+    TORCH_CHECK(c.smem_size <= smem_capacity, "FP8 blockwise scatter exceeds shared-memory capacity");
+    return c;
+}
+
 inline std::pair<Config, ScatterConfig>
 channel_scatter_policy(int expected_m, int n, int k, int groups, int masters, int capacity, bool padded,
                        std::optional<Config> requested, std::optional<std::string> kernel_override,
@@ -275,19 +354,26 @@ inline const RoutedMoEConfigs& get_routed_moe_configs(Precision precision, int r
     const int groups = experts / ranks;
     const int expected = std::max(1, int(ceil_div(int64_t(tokens) * topk, int64_t(groups))));
     RoutedMoEConfigs result;
-    const bool blockwise = false;
+    const bool blockwise = precision == Precision::FP8Blockwise;
     auto c = fp8_dispatch_config(ranks, experts, topk, hidden, capacity, std::nullopt, blockwise);
     c.gemm1_n = 2 * intermediate;
     c.master_experts = masters;
-    fp8_gemm1_config(c, tokens, tuning.gemm1);
-    result.scatter = channel_scatter_policy(expected, hidden, intermediate, groups,
-                                            masters, capacity, true, std::nullopt, std::nullopt,
-                                            std::nullopt, tuning.gemm2)
-                         .second;
+    if (blockwise) {
+        fp8_blockwise_gemm1_config(c, tokens, 2 * intermediate, tuning.gemm1);
+        result.scatter =
+            fp8_blockwise_scatter_config(hidden, intermediate, groups, masters, expected, tuning.gemm2);
+    } else {
+        fp8_gemm1_config(c, tokens, tuning.gemm1);
+        result.scatter = channel_scatter_policy(expected, hidden, intermediate, groups,
+                                                masters, capacity, true, std::nullopt, std::nullopt,
+                                                std::nullopt, tuning.gemm2)
+                             .second;
+    }
     c.num_ctas = fp8_gemm1_ctas(c, tokens, c.pull_ctas);
     result.dispatch = c;
-    result.dispatch.pull_group_size = channel_pull_group_size(result.dispatch, expected);
-    if (channel_scatter_uses_worklist(result.scatter))
+    if (precision == Precision::FP8Channelwise)
+        result.dispatch.pull_group_size = channel_pull_group_size(result.dispatch, expected);
+    if (precision == Precision::FP8Channelwise && channel_scatter_uses_worklist(result.scatter))
         result.dispatch.gemm2_block_m = result.scatter.block_m;
     return cache.emplace(key, std::move(result)).first->second;
 }

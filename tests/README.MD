@@ -87,9 +87,10 @@ helpers. Both use the public complete call.
 Other architecture pytest runs skip these tests; CLI use reports an
 unsupported-device error.
 
-`test_mega_moe_precisions.py` exercises FP8 channelwise
+`test_mega_moe_precisions.py` exercises FP8 channelwise/blockwise
 through their public complete calls. Its case table includes GLM52,
-GLM53 Flash, Qwen3.8 Flash and MiniMax M3 channelwise.
+GLM53 Flash, Qwen3.8 Flash, MiniMax M3 channelwise, next-generation MiniMax
+blockwise.
 Small distributed cases cover separate replicas, both math modes, OAI/clamp,
 empty ranks, consecutive changing routes, statistics and graph replay.
 The API cases also check malformed weights, odd GEMM1 widths, and explicit
