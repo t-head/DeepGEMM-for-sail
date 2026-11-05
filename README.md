@@ -469,9 +469,10 @@ Shared experts remain outside the routed pipeline.
 |---|---|---|---|---|
 | FP8 channelwise | `fp8_fp8_mega_moe` | `FP8SymmBuffer` / `get_symm_buffer_for_fp8_mega_moe` | SwiGLU, SwiGLU-OAI | 8 |
 | FP8 blockwise | `fp8_fp8_mega_moe` | same, `quantization="blockwise"` | SwiGLU, SwiGLU-OAI | 64 |
+| E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `W4A8SymmBuffer` / `get_symm_buffer_for_w4a8_mega_moe` | SwiGLU, SwiGLU-OAI, SiTU | 32 |
 | BF16 x MXFP4 | `bf16_fp4_mega_moe` | `W4A16SymmBuffer` / `get_symm_buffer_for_w4a16_mega_moe` | SiTU | 32 |
 
-H is divisible by 256 and I by 128. FP8 supports at most 128 physical experts
+H is divisible by 256 and I by 128. FP8 and W4A8 support at most 128 physical experts
 per rank; W4A16 supports at most 127. Capacity is positive and below 2^24;
 top-k is 1–16 and no larger than the expert count. Valid expert IDs are distinct
 within each token; masked IDs may repeat. All ranks, including empty ranks,
@@ -509,6 +510,15 @@ FP8 weights are contiguous E4M3 `[E,N,K]`. Channelwise FP32 scales are
 GEMM1 gate/up rows in groups of eight or 128 respectively, including their
 scales, without requantization. W4A16 raw weights/scales have the canonical
 MXFP4 shapes described above; its transform packs the W4A16 scale layout.
+W4A8 uses the same canonical raw MXFP4 inputs, transformed with
+`transform_weights_for_w4a8_mega_moe`. Each returned bank is
+`(packed_weight, packed_scale, weight_inv_scale)`: the scalar compensates
+load-time exponent rebasing and is independent of routing weights and input
+scales. Prepare separately allocated master/replica banks independently; their
+inverse scales may differ. Its workspace and compute calls follow the examples
+above using `get_symm_buffer_for_w4a8_mega_moe` and `fp8_fp4_mega_moe`.
+W4A8 input and activated output use rowwise E4M3 quantization, as for FP8
+channelwise, with the chosen activation fused into GEMM1.
 Transformed weights are specific to their backend and must not be interchanged.
 
 FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]` for channelwise

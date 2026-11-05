@@ -99,19 +99,22 @@ static bool fits_strategy(const W4A8Config& c, int k) {
 }
 
 // Bound M before rounding so even a large tuning hint cannot overflow.
-static W4A8Config get_default_tile(int expected_m, int n, int k, int groups, GemmType kind) {
+static W4A8Config get_default_tile(int expected_m, int n, int k, int groups, GemmType kind,
+                                  int min_block_n = 64, bool allow_n_expansion = true) {
     DG_HOST_ASSERT(expected_m >= 0 && groups > 0 && n > 0 && n % 64 == 0 && k > 0);
     DG_HOST_ASSERT(kind == GemmType::MGroupedFused || kind == GemmType::MGroupedNoPad ||
                    kind == GemmType::MGroupedMasked);
     int bm = 16;
     while (bm < expected_m && bm < 64)
         bm *= 2;
+    DG_HOST_ASSERT(min_block_n == 64 || min_block_n == 128 || min_block_n == 256);
+    DG_HOST_ASSERT(n >= min_block_n);
     const int bn = n >= 256 ? 256 : n >= 128 ? 128 : 64;
     // M32/N256 has enough shared memory for three stages at four CTAs/SM
     // (64,512 bytes per CTA). M16 and M64 lose residency with a third stage.
     const int stages = kind == GemmType::MGroupedMasked && bm == 32 && bn == 256 ? 3 : 2;
     W4A8Config c{get_num_sms(), bm, bn, 128, bm, 64, 128, stages, 1};
-    if (kind == GemmType::MGroupedNoPad and k <= 512 and k % c.block_k == 0 and c.num_stages == 2 and
+    if (allow_n_expansion && kind == GemmType::MGroupedNoPad and k <= 512 and k % c.block_k == 0 and c.num_stages == 2 and
         c.block_k == c.warp_k) {
         for (const int candidate : {4, 3, 2}) {
             if (n % (bn * candidate) == 0) {
@@ -126,7 +129,7 @@ static W4A8Config get_default_tile(int expected_m, int n, int k, int groups, Gem
         n >= 128 && k >= 512 && k % 128 == 0) {
         auto candidate = c;
         const bool underfilled = int64_t(groups) * ceil_div(n, bn) < c.num_sms;
-        candidate.block_n = bm == 32 ? 128 : bn;
+        candidate.block_n = bm == 32 ? std::max(128, min_block_n) : bn;
         candidate.warp_n = bm == 32 || (bm == 16 && underfilled) ? 32 : 64;
         candidate.num_stages = 2;
         candidate.n_expand = 1;

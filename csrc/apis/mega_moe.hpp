@@ -8,6 +8,7 @@
 
 #include "../jit_kernels/impls/sm89_fp4_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/mega_moe_fp8_w4a16.hpp"
+#include "../jit_kernels/impls/mega_moe_w4a8.hpp"
 #include "../jit_kernels/heuristics/mega_moe.hpp"
 
 namespace deep_gemm::mega {
@@ -288,13 +289,14 @@ using WeightPair = std::tuple<Tensor, Tensor>;
 
 static mega_moe_config::fp8_w4a16::Precision routed_precision(const std::string& precision) {
     using P = mega_moe_config::fp8_w4a16::Precision;
-    if (precision == "fp8_channelwise")
-        return P::FP8Channelwise;
-    if (precision == "fp8_blockwise")
-        return P::FP8Blockwise;
     if (precision == "w4a16")
         return P::W4A16;
-    TORCH_CHECK(false, "Unsupported MegaMoE precision: ", precision);
+    if (precision == "w4a8")
+        return P::W4A8;
+    if (precision == "fp8_channelwise")
+        return P::FP8Channelwise;
+    TORCH_CHECK(precision == "fp8_blockwise", "Unsupported MegaMoE precision: ", precision);
+    return P::FP8Blockwise;
 }
 
 static layout::RoutedMoEBuffer checked_routed_layout(
@@ -400,6 +402,13 @@ static auto get_symm_buffer_size_for_w4a16_mega_moe(
     const int& hidden, const int& intermediate_hidden) {
     return get_mega_moe_buffer_slices_for_precision(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, "w4a16");
+}
+
+static auto get_symm_buffer_size_for_w4a8_mega_moe(
+    const int& num_ranks, const int& num_experts, const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden) {
+    return get_mega_moe_buffer_slices_for_precision(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, "w4a8");
 }
 
 static void fp8_w4a16_mega_moe_pre_dispatch_checked(const Tensor& hidden_states, const Tensor& topk_idx,
@@ -576,7 +585,75 @@ void bf16_fp4_mega_moe(
         1.702f, situ_beta, situ_linear_beta);
 }
 
+using W4A8Weights = mega_moe_w4a8::W4A8Weights;
+
+void fp8_fp4_mega_moe(
+    const Tensor& y, const W4A8Weights& l1_weights_tuple, const W4A8Weights& l2_weights_tuple,
+    const OptTensor& cumulative_local_expert_recv_stats, const Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx, const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
+    const std::optional<W4A8Weights>& l1_weights_replicas, const std::optional<W4A8Weights>& l2_weights_replicas,
+    const float& swiglu_alpha, const float& situ_beta, const float& situ_linear_beta) {
+    check_device();
+    TORCH_CHECK(activation == "swiglu" || activation == "swiglu_oai" || activation == "situ",
+                "W4A8 supports swiglu, swiglu_oai and situ");
+    TORCH_CHECK(!activation_clamp_opt || (!std::isnan(*activation_clamp_opt) && *activation_clamp_opt >= 0),
+                "activation_clamp must be nonnegative or None");
+    TORCH_CHECK(activation != "situ" || !activation_clamp_opt, "SiTU does not support activation_clamp");
+    TORCH_CHECK(std::isfinite(swiglu_alpha) && swiglu_alpha > 0 && std::isfinite(situ_beta) && situ_beta > 0 &&
+                    std::isfinite(situ_linear_beta) && situ_linear_beta > 0, "Invalid activation coefficients");
+    check_tensor(y, torch::kBFloat16);
+    TORCH_CHECK(y.dim() == 2 && std::get<0>(l1_weights_tuple).dim() == 3, "Invalid output or GEMM1 weight rank");
+    const int hidden = y.size(1), intermediate = std::get<0>(l1_weights_tuple).size(1) / 2;
+    const int tokens = y.size(0), ranks = sym_buffer_ptrs.size();
+    const auto l = checked_routed_layout(ranks, num_experts, num_max_tokens_per_rank, num_topk,
+                                         hidden, intermediate, "w4a8");
+    TORCH_CHECK(tokens <= num_max_tokens_per_rank, "output token count exceeds workspace capacity");
+    TORCH_CHECK(y.device() == sym_buffer.device(), "output and workspace must share a device");
+    const auto transport = make_sym_buffer(sym_buffer_ptrs, rank_idx, ranks);
+    TORCH_CHECK(transport.base == reinterpret_cast<int64_t>(sym_buffer.data_ptr()), "Invalid local workspace pointer");
+    TORCH_CHECK(l1_weights_replicas.has_value() == l2_weights_replicas.has_value(),
+                "Both replica banks must be provided together");
+    const int groups = num_experts / ranks, masters = std::get<0>(l1_weights_tuple).size(0);
+    TORCH_CHECK(masters > 0 && masters <= groups, "Invalid master expert count");
+    const auto check = [&](const W4A8Weights& weights, int n, int k, int experts) {
+        const auto& [w, s, inv] = weights;
+        check_tensor(w, torch::kUInt8); check_tensor(s, torch::kUInt8);
+        TORCH_CHECK(w.device() == y.device() && s.device() == y.device(), "Weights must share the workspace device");
+        check_shape(w, {experts, n, k / 2});
+        check_shape(s, {experts, n / 64, int64_t(k) * 2});
+        TORCH_CHECK(std::isfinite(inv) && inv > 0, "weight_inv_scale must be finite and positive");
+    };
+    check(l1_weights_tuple, 2 * intermediate, hidden, masters);
+    check(l2_weights_tuple, hidden, intermediate, masters);
+    if (l1_weights_replicas) {
+        TORCH_CHECK(masters < groups, "Replica banks need replica slots");
+        check(*l1_weights_replicas, 2 * intermediate, hidden, groups - masters);
+        check(*l2_weights_replicas, hidden, intermediate, groups - masters);
+    } else
+        TORCH_CHECK(masters == groups, "Weights must contain all local physical experts");
+    if (cumulative_local_expert_recv_stats) {
+        check_tensor(*cumulative_local_expert_recv_stats, torch::kInt32);
+        TORCH_CHECK(cumulative_local_expert_recv_stats->device() == y.device() &&
+                    cumulative_local_expert_recv_stats->numel() == groups,
+                    "Receive statistics must contain one INT32 per local physical expert on the output device");
+    }
+    auto [x, sf, workspace] = slice_routed_buffer(sym_buffer, l, num_experts, ranks,
+        num_max_tokens_per_rank, num_topk, hidden, intermediate, "w4a8");
+    workspace.sym_buffer = transport;
+    const auto& configs = mega_moe_config::fp8_w4a16::get_routed_moe_configs(
+        mega_moe_config::fp8_w4a16::Precision::W4A8, ranks, num_experts, num_topk, hidden, intermediate,
+        num_max_tokens_per_rank, tokens, masters, activation, y.device().index());
+    mega_moe_w4a8::fp8_fp4_mega_moe_impl(y, l1_weights_tuple, l2_weights_tuple,
+        l1_weights_replicas ? *l1_weights_replicas : l1_weights_tuple,
+        l2_weights_replicas ? *l2_weights_replicas : l2_weights_tuple, workspace, rank_idx, tokens, activation,
+        activation_clamp_opt && std::isfinite(*activation_clamp_opt) ? *activation_clamp_opt : -1.0f,
+        fast_math, swiglu_alpha, situ_beta, situ_linear_beta, configs, cumulative_local_expert_recv_stats);
+}
+
 static void register_apis(pybind11::module_& m) {
+    m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_fp4_mega_moe", &bf16_fp4_mega_moe);
     m.def("get_symm_buffer_size_for_w4a16_mega_moe", &get_symm_buffer_size_for_w4a16_mega_moe);
     m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe);
@@ -592,6 +669,7 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("mma_type"), pybind11::arg("activation"),
           pybind11::arg("num_shared_experts") = 0,
           pybind11::arg("staging_config") = std::array<int, 3>{});
+    m.def("get_symm_buffer_size_for_w4a8_mega_moe", &get_symm_buffer_size_for_w4a8_mega_moe);
 }
 
 }  // namespace deep_gemm::mega

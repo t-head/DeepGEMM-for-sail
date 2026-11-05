@@ -184,7 +184,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                   "GEMM1 N must be tiled by complete interleave groups");
     static_assert(kTokenBytes % kBlockK == 0,
                   "GEMM1 K must be divisible by BLOCK_K");
-    static_assert(kNumThreads == Cfg::ThreadNum,
+    static_assert(kNumThreads == (kBlockM / kWarpM) * (kBlockN / kWarpN) * 32,
                   "CTA threads must match the GEMM TiledMMA");
     static_assert(kNumPullCTAs > 0 && kNumPullCTAs < kNumCTAs,
                   "overlap requires separate pull and GEMM CTAs");

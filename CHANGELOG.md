@@ -33,9 +33,11 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
-- **FP8 channelwise/blockwise and W4A16 MegaMoE**: complete routed pipelines, precision-specific workspaces,
-  weight transforms, separate replica banks and library-owned communication state.
-
+- **FP8, W4A8 and W4A16 MegaMoE**: adds complete FP8 channelwise/blockwise,
+  E4M3 x MXFP4 and BF16 x MXFP4 routed pipelines, precision-specific workspaces
+  and weight transforms in `deep_gemm.mega`. Supports FP8 SwiGLU/SwiGLU-OAI,
+  W4A8 SwiGLU/SwiGLU-OAI/SiTU, W4A16 SiTU, separate replica banks and reusable
+  library-owned communication state.
 - **W4A4 MegaMoE**: adds the complete MXFP4 routed MoE pipeline with BF16
   output on PPU1.5, validated on ZW-M890P. Exports workspace allocation,
   weight transformation, input preparation and `fp4_fp4_mega_moe` through

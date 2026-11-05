@@ -5,10 +5,12 @@
 #include "common_fp8.hpp"
 #include "common_int8.hpp"
 #include "common_w4a16.hpp"
+#include "common_w4a8.hpp"
 #include "mega_moe_fp8_w4a16_tuning.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <optional>
 
@@ -404,10 +406,35 @@ inline int fp8_gemm1_ctas(const DispatchConfig& c, int tokens, int pulls) {
     return c.num_sms * std::clamp(std::min(512 / c.num_threads, work), 1, 4);
 }
 
+inline w4fa8::NativeKernelConfig w4a8_gemm_config(int expected, int n, int k, int groups,
+                                                 const std::optional<Tile>& tile) {
+    // Direct activation/scatter epilogues consume complete N256 tiles.
+    // Keep these constraints inside selection, including shared-memory fitting.
+    auto c = w4fa8::get_default_tile(expected, n, k, groups, GemmType::MGroupedNoPad, 256, false);
+    if (!tile && expected <= std::numeric_limits<int>::max() / groups && w4fa8::supports_native_strategy() &&
+        w4fa8::wide_tile_eligible(groups, expected * groups, n, k, GemmType::MGroupedNoPad))
+        c = w4fa8::default_wide_config(expected, k, GemmType::MGroupedNoPad);
+    if (tile) {
+        const auto& [bm, bn, bk, wm, wn, stages] = *tile;
+        c.block_m = bm; c.block_n = bn; c.block_k = bk;
+        c.warp_m = wm; c.warp_n = wn; c.warp_k = bk; c.num_stages = stages;
+    }
+    c.n_expand = 1;
+    const auto spec = w4fa8::resolve_native_config(c, n, k);
+    w4fa8::check_native_kernel(spec, n, k, groups, GemmType::MGroupedNoPad);
+    TORCH_CHECK(c.block_n % 256 == 0 && n % c.block_n == 0 && c.warp_k == c.block_k,
+                "W4A8 MegaMoE requires complete 256-column tiles and one K warp");
+    const int64_t scatter = int64_t(c.block_m) * (c.block_n / 2 + 4) * sizeof(uint32_t);
+    TORCH_CHECK(std::max<int64_t>(w4fa8::get_smem_size(c, k), scatter) <= 256 * 1024,
+                "W4A8 MegaMoE tile exceeds shared memory capacity");
+    return spec;
+}
+
 struct RoutedMoEConfigs {
     DispatchConfig dispatch;
     ScatterConfig scatter;
     deep_gemm_w4a16_common::W4A16Config w4_scatter{};
+    w4fa8::NativeKernelConfig w4a8_gemm1{}, w4a8_scatter{};
 };
 
 inline const RoutedMoEConfigs& get_routed_moe_configs(Precision precision, int ranks, int experts, int topk,
@@ -431,6 +458,30 @@ inline const RoutedMoEConfigs& get_routed_moe_configs(Precision precision, int r
         // direction must never depend on a rank-local token count.
         result.dispatch = w4a16_gemm1_config(c, 2 * intermediate, expected, tuning.gemm1);
         result.w4_scatter = w4a16_scatter_config(expected, hidden, intermediate, std::nullopt, tuning.gemm2);
+    } else if (precision == Precision::W4A8) {
+        result.w4a8_gemm1 = w4a8_gemm_config(expected, 2 * intermediate, hidden, groups, tuning.gemm1.tile);
+        const auto& g1 = result.w4a8_gemm1.tile;
+        auto c = dispatch_config(ranks, experts, topk, capacity, hidden, sizeof(float));
+        c.block_m = c.gemm1_compute_m = g1.block_m;
+        c.gemm1_n = 2 * intermediate;
+        c.gemm1_block_n = g1.block_n; c.gemm1_block_k = g1.block_k;
+        c.gemm1_warp_m = g1.warp_m; c.gemm1_warp_n = g1.warp_n;
+        c.gemm1_stages = g1.num_stages;
+        c.num_threads = w4fa8::get_num_threads(g1);
+        const int64_t pull_smem = int64_t(c.num_threads / 32) * hidden +
+                                  ((int64_t(experts) * 4 + 15) / 16 * 16);
+        TORCH_CHECK(pull_smem <= 256 * 1024,
+                    "W4A8 pull staging exceeds shared memory capacity");
+        c.pull_ctas = tuning.gemm1.pull_ctas.value_or(6);
+        TORCH_CHECK(c.pull_ctas > 0 && c.pull_ctas < c.num_sms && c.pull_ctas % 3 == 0,
+                    "W4A8 pull CTAs must be a positive multiple of 3 below num_sms");
+        // Bound the initial specialization by known shared memory, avoiding
+        // an oversized compilation before the final driver occupancy check.
+        const auto smem = std::max<int64_t>(w4fa8::get_smem_size(g1, hidden), pull_smem);
+        const int resident = int(device_runtime->get_prop()->sharedMemPerMultiprocessor / smem);
+        c.num_ctas = c.num_sms * std::clamp(resident, 1, 8);
+        result.dispatch = c;
+        result.w4a8_scatter = w4a8_gemm_config(expected, hidden, intermediate, groups, tuning.gemm2.tile);
     } else {
         const bool blockwise = precision == Precision::FP8Blockwise;
         auto c = fp8_dispatch_config(ranks, experts, topk, hidden, capacity, std::nullopt, blockwise);
@@ -450,7 +501,7 @@ inline const RoutedMoEConfigs& get_routed_moe_configs(Precision precision, int r
         c.num_ctas = fp8_gemm1_ctas(c, tokens, c.pull_ctas);
         result.dispatch = c;
     }
-    if (precision == Precision::FP8Channelwise)
+    if (precision == Precision::FP8Channelwise || precision == Precision::W4A8)
         result.dispatch.pull_group_size = channel_pull_group_size(result.dispatch, expected);
     if (precision == Precision::FP8Channelwise && channel_scatter_uses_worklist(result.scatter))
         result.dispatch.gemm2_block_m = result.scatter.block_m;

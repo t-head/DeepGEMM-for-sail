@@ -19,19 +19,14 @@ from .. import _C
 from ..utils.math import align, ceil_div
 
 __all__ = [
-    "SymmBuffer",
-    "get_symm_buffer_for_mega_moe",
-    "transform_weights_for_mega_moe",
-    "fp4_fp4_mega_moe",
-    "mega_moe_pre_dispatch",
-    "FP8SymmBuffer",
-    "W4A16SymmBuffer",
-    "get_symm_buffer_for_fp8_mega_moe",
-    "get_symm_buffer_for_w4a16_mega_moe",
-    "transform_weights_for_fp8_mega_moe",
-    "transform_weights_for_w4a16_mega_moe",
-    "fp8_fp8_mega_moe",
-    "bf16_fp4_mega_moe",
+    "SymmBuffer", "get_symm_buffer_for_mega_moe", "transform_weights_for_mega_moe",
+    "fp4_fp4_mega_moe", "mega_moe_pre_dispatch",
+    "FP8SymmBuffer", "W4A16SymmBuffer",
+    "get_symm_buffer_for_fp8_mega_moe", "get_symm_buffer_for_w4a16_mega_moe",
+    "transform_weights_for_fp8_mega_moe", "transform_weights_for_w4a16_mega_moe",
+    "fp8_fp8_mega_moe", "bf16_fp4_mega_moe",
+    "W4A8SymmBuffer", "get_symm_buffer_for_w4a8_mega_moe",
+    "transform_weights_for_w4a8_mega_moe", "fp8_fp4_mega_moe",
 ]
 
 def _normalize_activation(activation: str) -> str:
@@ -341,11 +336,15 @@ class _RoutedSymmBuffer:
         allowed = ("swiglu", "swiglu_oai")
         if precision == "w4a16":
             allowed = ("situ",)
+        elif precision == "w4a8":
+            allowed += ("situ",)
         if activation not in allowed:
             raise ValueError(f"unsupported activation for {precision}: {activation}")
         size_args = (group.size(), num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden)
         if precision == "w4a16":
             total, slices = _C.get_symm_buffer_size_for_w4a16_mega_moe(*size_args)
+        elif precision == "w4a8":
+            total, slices = _C.get_symm_buffer_size_for_w4a8_mega_moe(*size_args)
         else:
             total, slices = _C.get_symm_buffer_size_for_fp8_mega_moe(
                 *size_args, precision.removeprefix("fp8_")
@@ -662,3 +661,74 @@ def bf16_fp4_mega_moe(
         activation, activation_clamp, fast_math, l1_weights_replicas, l2_weights_replicas,
         situ_beta, situ_linear_beta,
     )
+
+
+class W4A8SymmBuffer(_RoutedSymmBuffer):
+    """Rowwise E4M3 activations, group-32 MXFP4 weights and BF16 combine.
+
+    intermediate_hidden is the activated width I. Owns scratch and counters;
+    direct input views, base reuse and empty-rank behavior match FP8SymmBuffer.
+    """
+
+    def __init__(
+        self, group: dist.ProcessGroup, num_experts: int, num_max_tokens_per_rank: int,
+        num_topk: int, hidden: int, intermediate_hidden: int, activation: str = "swiglu",
+        base: Optional["W4A8SymmBuffer"] = None,
+    ) -> None:
+        super().__init__(group, num_experts, num_max_tokens_per_rank, num_topk, hidden,
+                         intermediate_hidden, "w4a8", activation, base)
+
+
+def get_symm_buffer_for_w4a8_mega_moe(
+    group: dist.ProcessGroup, num_experts: int, num_max_tokens_per_rank: int,
+    num_topk: int, hidden: int, intermediate_hidden: int, activation: str = "swiglu",
+) -> W4A8SymmBuffer:
+    return W4A8SymmBuffer(group, num_experts, num_max_tokens_per_rank, num_topk, hidden,
+                         intermediate_hidden, activation)
+
+
+def transform_weights_for_w4a8_mega_moe(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor], l2_weights: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor, float], Tuple[torch.Tensor, torch.Tensor, float]]:
+    """Pack MXFP4 weights and UE8M0 scales, returning each bank's inverse scale.
+
+    The inverse scale compensates weight exponent rebasing; it is independent
+    of row activation scales and routing weights. Replica banks can be prepared
+    separately and may have different inverse scales.
+    """
+    _check_routed_weights(l1_weights, l2_weights, torch.uint8)
+    w1, s1 = l1_weights
+    first = _C.preprocess_weights_and_scales(
+        _C.PreprocessMode.W4A8_MXFP4_MMA, False,
+        _interleave_weights(w1), _interleave_weights(s1))
+    second = _C.preprocess_weights_and_scales(
+        _C.PreprocessMode.W4A8_MXFP4_MMA, False, *l2_weights)
+    return first, second
+
+
+def fp8_fp4_mega_moe(
+    y: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor, float],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor, float],
+    sym_buffer: W4A8SymmBuffer,
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+    activation: str = "swiglu",
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+    *,
+    l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None,
+    l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None,
+    swiglu_alpha: float = 1.702,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
+) -> None:
+    """Complete E4M3 x MXFP4 MoE, applying routing weights once in combine."""
+    if not isinstance(sym_buffer, W4A8SymmBuffer):
+        raise TypeError("fp8_fp4_mega_moe requires a W4A8SymmBuffer")
+    _check_routed_buffer(y, l1_weights, sym_buffer, activation, weight_components=3)
+    _C.fp8_fp4_mega_moe(
+        y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
+        sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
+        activation, activation_clamp, fast_math, l1_weights_replicas, l2_weights_replicas,
+        swiglu_alpha, situ_beta, situ_linear_beta)

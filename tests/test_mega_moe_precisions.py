@@ -98,6 +98,15 @@ CASES = (
         precision="w4a16",
         routing="random",
     ),
+    MegaMoECase("smoke_w4a8", 512, 256, 16, 2, 129, tokens=(1, 0, 33, 129, 8),
+               precision="w4a8", routing="random", reference_tokens=129),
+    MegaMoECase("smoke_w4a8_situ", 512, 512, 16, 2, 129, tokens=(1, 0, 33, 129, 8),
+               activation="situ", precision="w4a8", routing="random", reference_tokens=129),
+    MegaMoECase("deepseek_v4_pro_w4a8", 7168, 3072, 384, 6, 4096, tokens=(32, *MODEL_TOKENS),
+               worlds=(8,), precision="w4a8", routing="random", reference_tokens=8),
+    MegaMoECase("kimi_k3_w4a8", 3584, 3072, 896, 16, 4096,
+               tokens=(32, 64, 128, *MODEL_TOKENS), activation="situ", worlds=(8, 16, 32),
+               precision="w4a8", routing="random", reference_tokens=8),
 )
 
 
@@ -185,7 +194,12 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
     e = c.experts // world
     raw1, ref1 = make_weights(e, 2 * c.intermediate, c.hidden, c.precision, rng)
     raw2, ref2 = make_weights(e, c.hidden, c.intermediate, c.precision, rng)
-    if c.precision == "w4a16":
+    if c.precision == "w4a8":
+        w1, w2 = dg.transform_weights_for_w4a8_mega_moe(raw1, raw2)
+        buffer = dg.W4A8SymmBuffer(group, c.experts, c.capacity, c.topk, c.hidden, c.intermediate,
+                                  activation=c.activation)
+        entry = dg.fp8_fp4_mega_moe
+    elif c.precision == "w4a16":
         w1, w2 = dg.transform_weights_for_w4a16_mega_moe(raw1, raw2)
         buffer = dg.W4A16SymmBuffer(group, c.experts, c.capacity, c.topk, c.hidden, c.intermediate)
         entry = dg.bf16_fp4_mega_moe
@@ -206,10 +220,23 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
     options = dict(activation=c.activation, activation_clamp=c.clamp, fast_math=fast_math)
     if replicas:
         assert e >= 2
-        replica1 = tuple(t[-1:].contiguous() for t in w1)
-        replica2 = tuple(t[-1:].contiguous() for t in w2)
-        w1 = tuple(t[:-1].contiguous() for t in w1)
-        w2 = tuple(t[:-1].contiguous() for t in w2)
+        if c.precision == "w4a8":
+            # Separate allocations may need different exponent rebasing.
+            # Shift replica raw scales before independently preparing each bank.
+            for raw, ref, shift in ((raw1, ref1, -16), (raw2, ref2, 16)):
+                raw[1][-1:] = (raw[1][-1:].int() + shift).to(torch.uint8)
+                ref[-1:] *= 2.0 ** shift
+            master1, master2 = dg.transform_weights_for_w4a8_mega_moe(
+                tuple(t[:-1].contiguous() for t in raw1), tuple(t[:-1].contiguous() for t in raw2))
+            replica1, replica2 = dg.transform_weights_for_w4a8_mega_moe(
+                tuple(t[-1:].contiguous() for t in raw1), tuple(t[-1:].contiguous() for t in raw2))
+            assert master1[2] != replica1[2] or master2[2] != replica2[2]
+            w1, w2 = master1, master2
+        else:
+            replica1 = tuple(t[-1:].contiguous() for t in w1)
+            replica2 = tuple(t[-1:].contiguous() for t in w2)
+            w1 = tuple(t[:-1].contiguous() for t in w1)
+            w2 = tuple(t[:-1].contiguous() for t in w2)
         options.update(l1_weights_replicas=replica1, l2_weights_replicas=replica2)
 
     def forward(source, ids, weights, y, stats=None):
@@ -316,14 +343,6 @@ def test_mega_moe_channelwise_quantization_reuse(mega_moe_group):
                      tokens=(4096, 33, 0, 129, 8), reference_tokens=32), mega_moe_group)
 
 
-def test_mega_moe_w4a16_complete_tiles(mega_moe_group):
-    # H=768 cannot use a 512-column scatter tile. The narrow GEMM1 must also
-    # select complete gate/up tiles rather than inherit ordinary GEMM tails.
-    run_case(replace(CASES[2], hidden=768, tokens=(96, 33, 0, 8)), mega_moe_group)
-
-
-
-
 def test_mega_moe_channelwise_worklist_reuse(mega_moe_group):
     # Reuse G1's valid-tile list across token counts that select different G2
     # tiles without changing the G1 tile. I=640 also covers quantization tails.
@@ -331,6 +350,22 @@ def test_mega_moe_channelwise_worklist_reuse(mega_moe_group):
                    intermediate=640, tokens=(1, 33, 0, 129, 8), worlds=(mega_moe_group.size(),))
     for replicas in (False, True):
         run_case(case, mega_moe_group, replicas=replicas)
+
+
+def test_mega_moe_w4a16_complete_tiles(mega_moe_group):
+    # H=768 cannot use a 512-column scatter tile. The narrow GEMM1 must also
+    # select complete gate/up tiles rather than inherit ordinary GEMM tails.
+    run_case(replace(CASES[2], hidden=768, tokens=(96, 33, 0, 8)), mega_moe_group)
+
+
+def test_mega_moe_w4a8_complete_tiles(mega_moe_group):
+    # Widths of one and three full scatter vectors, plus the block-info
+    # scheduler at its 128-local-expert transition. Reuse the public workspace.
+    base = next(c for c in SMOKE_CASES if c.name == "smoke_w4a8")
+    for hidden, intermediate in ((256, 128), (768, 384)):
+        run_case(replace(base, hidden=hidden, intermediate=intermediate,
+                         experts=128 * mega_moe_group.size(), worlds=(mega_moe_group.size(),),
+                         tokens=(1, 33, 0, 129, 8)), mega_moe_group)
 
 
 @pytest.mark.parametrize("case", tuple(c for c in SMOKE_CASES if c.precision != "w4a16"), ids=lambda c: c.name)

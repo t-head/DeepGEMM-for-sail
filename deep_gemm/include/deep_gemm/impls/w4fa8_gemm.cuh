@@ -220,8 +220,17 @@ public:
       dispatch_tail<Atoms + 1>(rows, process);
   }
 
-  CUTLASS_DEVICE
-  void operator()(Params const& params, char* smem_buf) {
+  struct DefaultEpilogue {};
+
+  CUTLASS_DEVICE void operator()(Params const& params, char* smem_buf) {
+    TileScheduler scheduler{params.scheduler};
+    run(params, smem_buf, scheduler, DefaultEpilogue{});
+  }
+
+  // MegaMoE shares the native mainloop and supplies activation or scatter.
+  template <class Scheduler, class Epilogue>
+  CUTLASS_DEVICE void run(Params const& params, char* smem_buf,
+                         Scheduler& deep_scheduler, const Epilogue& epilogue) {
     int thread_idx = threadIdx.x;
     int warp_idx = canonical_warp_idx_sync();
     int warpm_idx = warp_idx % WarpsOnM;
@@ -229,7 +238,6 @@ public:
     int lane_idx = thread_idx % NumThreadsPerWarp;
     Tensor tCrID = init_identity(lane_idx);
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-    TileScheduler deep_scheduler{params.scheduler};
     Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{});             // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{});             // (BLK_N,BLK_K2,PIPE)
     Tensor sScale = make_tensor(make_smem_ptr(storage.smem_scale.data()), SmemLayoutScale{}); // (BLN/64,BLK*2,PIPE)
@@ -348,17 +356,33 @@ public:
 
       const int scale_buffer = work_serial++ & 1;
       int coord_l = deep_scheduler.curr_group_idx;
+      if constexpr (!cute::is_same_v<Epilogue, DefaultEpilogue>)
+        if (epilogue.valid_rows(coord_l, deep_scheduler.curr_group_m) <= int(m_block_idx) * BlockM)
+          continue;
       n_block_idx *= N_EXPAND;
 
-      const uint8_t* ptr_b_l = params.ptr_b + int64_t(coord_l) * N * K2;
+      const uint8_t* ptr_b_l;
+      if constexpr (cute::is_same_v<Epilogue, DefaultEpilogue>)
+        ptr_b_l = params.ptr_b + int64_t(coord_l) * N * K2;
+      else
+        ptr_b_l = epilogue.weight(params.ptr_b, coord_l, int64_t(N) * K2);
       Tensor mB_nk = make_tensor(make_gmem_ptr(ptr_b_l), make_shape(Int<N>{}, Int<K2>{}), make_stride(Int<K2>{}, _1{}));
       Tensor mB_nk_mix = make_mix_tensor_like(mB_nk);
       Tensor gB = local_tile(mB_nk_mix, TilerB{}, make_coord(n_block_idx, _));
       Tensor tBgB = gmem_thr_copy_B.partition_S(gB);
 
-      Tensor mScale_nkl =
-          make_tensor(make_gmem_ptr(params.ptr_scale), make_shape(Int<N / 64>{}, Int<K * 2>{}, Int<L>{}), strideScale);
-      Tensor mScale_nk = make_mix_tensor_like(mScale_nkl(_, _, coord_l));
+      Tensor mScale_nk = [&]() {
+        if constexpr (cute::is_same_v<Epilogue, DefaultEpilogue>) {
+          Tensor mScale_nkl = make_tensor(make_gmem_ptr(params.ptr_scale),
+              make_shape(Int<N / 64>{}, Int<K * 2>{}, Int<L>{}), strideScale);
+          return make_mix_tensor_like(mScale_nkl(_, _, coord_l));
+        } else {
+          const auto* ptr_scale_l = epilogue.scale(params.ptr_scale, coord_l, int64_t(N) * K / 32);
+          Tensor mScale_nkl = make_tensor(make_gmem_ptr(ptr_scale_l),
+              make_shape(Int<N / 64>{}, Int<K * 2>{}, Int<1>{}), strideScale);
+          return make_mix_tensor_like(mScale_nkl(_, _, 0));
+        }
+      }();
       Tensor gScale = local_tile(mScale_nk, TilerScale{}, make_coord(n_block_idx, _));
       Tensor tSgS = gmem_thr_copy_scale.partition_S(gScale);
 
@@ -367,6 +391,8 @@ public:
       auto [tAgA, residual_m, gD] = [&]() {
         if constexpr (!Fused) {
           int M = deep_scheduler.curr_group_m;
+          if constexpr (!cute::is_same_v<Epilogue, DefaultEpilogue>)
+            M = epilogue.valid_rows(coord_l, M);
           gmem_tiled_copy_A.desc_.template init<ElementA, false, BlockM, BlockK>(nullptr, M, K, strideA);
           Tensor mA_mkl = make_tensor(make_gmem_ptr(params.ptr_a + deep_scheduler.curr_offset_a()),
                                       make_shape(M, Int<K>{}), strideA); // (m,k)
@@ -613,6 +639,11 @@ public:
 
       auto epilogue_no_tsm = [&](auto active_m) {
         constexpr int UsedM = decltype(active_m)::value;
+        if constexpr (!cute::is_same_v<Epilogue, DefaultEpilogue>) {
+          epilogue.store(accum, thr_mma.partition_C(cD), deep_scheduler,
+                         m_block_idx, n_block_idx, residual_m);
+          return;
+        }
 
         Tensor tDcD = thr_mma.partition_C(cD);
         auto tDgD = thr_mma.partition_C(gD);
