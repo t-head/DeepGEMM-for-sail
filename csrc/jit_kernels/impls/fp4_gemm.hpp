@@ -2,7 +2,6 @@
 
 #include <torch/python.h>
 #include <cstdint>
-#include <cstddef>
 #include <cstring>
 #include <string>
 #include "cute/tensor.hpp"
@@ -143,14 +142,15 @@ public:
                       sizeof(EpilogueArgsNoTsm) + sizeof(uint16_t*) + sizeof(uint32_t) + sizeof(float),
                   "fused epilogue params must be the NoTsm layout plus ptr_SFD/shape_m/swiglu_limit");
 
-    template <typename EpilogueArgsT>
+    template <typename EpilogueArgsT, typename MainloopArgsT = MainLoopArguments,
+              typename SchedulerArgsT = TileSchedulerArguments>
     struct GemmKernelParamsT {
         GemmUniversalMode mode;
         GemmProblemSize problem_shape;
-        MainLoopArguments collective_mainloop_params;
+        MainloopArgsT collective_mainloop_params;
         EpilogueArgsT collective_epilogue_params;
         cutlass::KernelHardwareInfo hw_info;
-        TileSchedulerArguments scheduler;
+        SchedulerArgsT scheduler;
         void* workspace{nullptr};
         int32_t* signal{nullptr};
         // actlize_v1.0.0 sets SAIL_SYNC_IN_CE=1 (accutlass.hpp), which appends this field to the
@@ -203,15 +203,6 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        return generate_code(args);
-    }
-
-    // MegaMoE scatter reuses the ordinary collectives with its own epilogue.
-    // The optional include and entry switch keep the generated source shared.
-    static std::string generate_code(const Args& args, bool replicas = false,
-                                     const std::string& policy = "",
-                                     const std::string& extra_include = "", bool emit_entry = true,
-                                     int m_tiles_per_group = 2) {
         // Mirrors the guard in Fp4Gemm::run: the fused epilogue reuses the mainloop's shared storage,
         // so its activation tile must fit in what the kernel already reserves.
         // Emitted only for the fused variant instead of using `if constexpr` in the generated kernel:
@@ -224,19 +215,9 @@ public:
                   "                  <= GemmKernel::SharedStorageSize,\n"
                   "              \"fused epilogue act tile exceeds the kernel shared storage\");\n"
                 : "";
-        const auto entry = emit_entry ? fmt::format(R"(extern "C"
-__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
-__global__ void {}(
-    typename GemmKernel::Params params
-) {{
-    extern __shared__ char smem[];
-    GemmKernel op;
-    op(params, smem);
-}})",
-            args.launch_info.kernel_name) : "";
         return fmt::format(
             R"(
-#include <deep_gemm/impls/fp4_gemm_cutlass3.cuh>{}
+#include <deep_gemm/impls/fp4_gemm_cutlass3.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo; 
@@ -257,7 +238,6 @@ static constexpr bool hasBias = {};
 constexpr int N_EXPAND = {};
 static constexpr EpilogueType kEpilogueType = EpilogueType::{};
 static constexpr bool kApplySwigluLimit = {};
-static constexpr bool kUseReplicaWeights = {};
 
 // A matrix configuration
 using         ElementA    = cutlass::float4_t;
@@ -348,7 +328,7 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaScal
     ElementSFB, cutlass::detail::TagToStrideB_t<LayoutSFB>, typename GemmOperandSFB::GmemTiledCopy, typename GemmOperandSFB::SmemLayoutAtom>;
 
 using EpilogueOutputOp = typename cutlass::platform::conditional<
-    hasBias || ((SHAPE_N % 2 != 0) && !kUseReplicaWeights),
+    hasBias || (SHAPE_N % 2 != 0),
     cutlass::epilogue::thread::LinearCombinationBiasElementwise<ElementD, ElementAccumulator, ElementCompute, ElementD, ElementD, AlignmentD, cutlass::epilogue::thread::Identity<float>, cutlass::plus<ElementCompute>, false, ElementBias>,
     cutlass::epilogue::thread::LinearCombination<ElementD, 2, ElementAccumulator, ElementCompute, cutlass::epilogue::thread::ScaleType::Nothing, cutlass::FloatRoundStyle::round_to_nearest, ElementC>
   >::type;
@@ -401,7 +381,7 @@ using CollectiveEpilogue = typename cutlass::platform::conditional<
 // fused epilogue's SFD addressing.
 using TileScheduler = DeepGemmScheduler<
     kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS,
-    ceil_div(SHAPE_N, BLOCK_N * N_EXPAND), {}, kEpilogueType>;
+    ceil_div(SHAPE_N, BLOCK_N * N_EXPAND), 2, kEpilogueType>;
 
 using GemmKernel = typename deep_gemm::DeepGemmUniversal<
     Shape<int,int,int,int>,
@@ -411,8 +391,7 @@ using GemmKernel = typename deep_gemm::DeepGemmUniversal<
     hasBias,
     N_EXPAND,
     kEnableSboOverlap,
-    kEpilogueType,
-    kUseReplicaWeights{}
+    kEpilogueType
 >;
 
 // This kernel declares `extern __shared__`, so its dynamic smem size comes from the launch, and the
@@ -420,7 +399,9 @@ using GemmKernel = typename deep_gemm::DeepGemmUniversal<
 // Assert the two agree: an under-estimate corrupts memory, an over-estimate silently costs
 // occupancy. The Python path is immune because Fp4Gemm::run launches with SharedStorageSize
 // directly, so a drift here would show up as "Python correct, C++ JIT wrong".
-{}
+static_assert(GemmKernel::SharedStorageSize == {},
+              "host get_smem_config_fp4() disagrees with the kernel's SharedStorageSize -- "
+              "update csrc/jit_kernels/heuristics/common_fp4.hpp");
 
 // Fused-epilogue guard, emitted below only when kEpilogueType is SiluAndMulPostQuantFp4: that
 // epilogue reuses the mainloop's shared storage, so its activation tile has to fit inside
@@ -428,21 +409,25 @@ using GemmKernel = typename deep_gemm::DeepGemmUniversal<
 // CollectiveEpilogueSiluAndMulPostQuant here would instantiate it for every variant (see
 // `fused_smem_guard` in generate_impl for why `if constexpr` cannot be used instead).
 {}
-{}
+extern "C"
+__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
+__global__ void {}(
+    typename GemmKernel::Params params
+) {{
+    extern __shared__ char smem[];
+    GemmKernel op;
+    op(params, smem);
+}}
 }}
 )",
-            extra_include.empty() ? "" : "\n" + extra_include,
             args.launch_info.n, args.launch_info.k,
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.enable_sbo_overlap, args.launch_info.hasBias, args.launch_info.n_expand,
-            args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit, replicas, m_tiles_per_group,
-            policy.empty() ? "" : ", " + policy,
-            replicas ? "" : fmt::format(
-                "static_assert(GemmKernel::SharedStorageSize == {}, \"host/device FP4 shared memory mismatch\");",
-                args.launch_args.smem_size),
+            args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit,
+            args.launch_args.smem_size,
             fused_smem_guard,
-            entry);
+            args.launch_info.kernel_name);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {

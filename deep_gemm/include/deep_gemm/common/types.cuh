@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cutlass/detail/helper_macros.hpp>
 
 namespace deep_gemm {
@@ -16,6 +17,7 @@ enum class GemmType {
     KGroupedContiguousWithPsumLayout    = 6,
     MGroupedNoPad                       = 7,
     MGroupedFused                       = 8,
+    MegaMoE                             = 9,
 };
 
 constexpr CUTLASS_HOST_DEVICE bool is_m_grouped_contiguous(const GemmType& gemm_type) {
@@ -36,8 +38,24 @@ constexpr CUTLASS_HOST_DEVICE bool is_k_grouped_contiguous(const GemmType& gemm_
 
 inline constexpr const char* GemmTypeS[] = {
     "DenseGemm", "GroupedContiguous", "GroupedMasked", "KGroupedContiguous", "BatchGemm",
-    "GroupedContiguous", "KGroupedContiguous", "GroupedNoPad", "GroupedFused"
+    "GroupedContiguous", "KGroupedContiguous", "GroupedNoPad", "GroupedFused", "MegaMoE"
 };
+
+enum class MegaMoEPhaseKind { Linear1, Linear2 };
+
+namespace scatter_pipeline {
+inline constexpr int kComputeThreads = 256;
+inline constexpr int kScatterThreads = 256;
+inline constexpr int kCtaThreads = kComputeThreads + kScatterThreads;
+}  // namespace scatter_pipeline
+
+struct MegaMoEReduceParams {
+    const std::int64_t* ids;
+    const float* weights;
+    void* output;
+    int tokens;
+};
+static_assert(sizeof(MegaMoEReduceParams) == 32);
 
 enum class FP4DynamicTileId : int {
     Disabled  = -1,

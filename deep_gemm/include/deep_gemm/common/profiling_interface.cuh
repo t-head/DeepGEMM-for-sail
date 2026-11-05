@@ -315,6 +315,9 @@ void distribution() {
 }
 
 bool check_support_dump(){
+    // MegaMoE counts are produced inside the collective; do not read or synchronize here.
+    if (gemm_type_ == GemmType::MegaMoE)
+        return false;
     char *pEnv_dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
     static int target_device_id = pEnv_dump_device != nullptr ? std::stoi(pEnv_dump_device) : 0;
     // export PPU_LIB_DUMP_DEVICE=-1 to dump all devices
