@@ -7,6 +7,7 @@
 #include <deep_gemm/layout/mega_moe.cuh>
 
 #include "../jit_kernels/impls/sm89_fp4_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/mega_moe_fp8_w4a16.hpp"
 #include "../jit_kernels/heuristics/mega_moe.hpp"
 
 namespace deep_gemm::mega {
@@ -258,7 +259,283 @@ static void fp4_fp4_mega_moe(
         situ_beta, situ_linear_beta, activation_alpha, fast_math);
 }
 
+// Shared API helpers.
+namespace py = pybind11;
+using Tensor = torch::Tensor;
+using OptTensor = std::optional<Tensor>;
+
+static void check_device() {
+    TORCH_CHECK(is_ppu1v5_device(), "MegaMoE requires PPU1.5");
+}
+
+static void check_tensor(const Tensor& tensor, const torch::ScalarType& dtype, const bool& contiguous = true) {
+    TORCH_CHECK(tensor.is_cuda() && tensor.scalar_type() == dtype && (!contiguous || tensor.is_contiguous()),
+                "Invalid MegaMoE tensor device, dtype or layout");
+}
+static void check_shape(const Tensor& tensor, c10::IntArrayRef shape) {
+    TORCH_CHECK(tensor.sizes() == shape, "Invalid MegaMoE tensor shape: ", tensor.sizes());
+}
+static Tensor mega_moe_slice(const Tensor& buffer, uint64_t offset,
+                             const std::vector<int64_t>& shape, torch::ScalarType dtype) {
+    int64_t elements = 1;
+    for (const auto size : shape) elements *= size;
+    return buffer.narrow(0, offset, elements * c10::elementSize(dtype)).view(dtype).view(shape);
+}
+
+using RoutedMoEWorkspace = mega_moe_fp8_w4a16::RoutedMoEWorkspace;
+using RoutedMoEViews = std::tuple<Tensor, Tensor, RoutedMoEWorkspace>;
+using WeightPair = std::tuple<Tensor, Tensor>;
+
+static mega_moe_config::fp8_w4a16::Precision routed_precision(const std::string& precision) {
+    using P = mega_moe_config::fp8_w4a16::Precision;
+    if (precision == "fp8_channelwise")
+        return P::FP8Channelwise;
+    TORCH_CHECK(false, "Unsupported MegaMoE precision: ", precision);
+}
+
+static layout::RoutedMoEBuffer checked_routed_layout(
+    int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden,
+    int intermediate_hidden, const std::string& precision) {
+    using P = mega_moe_config::fp8_w4a16::Precision;
+    const auto p = routed_precision(precision);
+    const int max_ranks = p == P::FP8Channelwise ? 8 : (p == P::W4A16 || p == P::W4A8) ? 32 : 64;
+    TORCH_CHECK(num_ranks > 0 && num_ranks <= max_ranks && num_experts > 0 && num_experts % num_ranks == 0 &&
+                    num_topk > 0 && num_topk <= 16 && num_topk <= num_experts && num_max_tokens_per_rank > 0 && num_max_tokens_per_rank < (1 << 24),
+                "Invalid MegaMoE ranks, experts, top-k or token capacity for ", precision);
+    TORCH_CHECK(num_experts / num_ranks <= (p == P::W4A16 ? 127 : 128), "Unsupported local expert count for ", precision);
+    TORCH_CHECK(hidden > 0 && hidden % 256 == 0 && intermediate_hidden > 0 && intermediate_hidden % 128 == 0 &&
+                    intermediate_hidden <= std::numeric_limits<int>::max() / 2,
+                "MegaMoE requires hidden divisible by 256 and intermediate_hidden=I divisible by 128");
+    const auto pool = layout::get_num_max_pool_tokens<uint64_t>(
+        num_ranks, num_max_tokens_per_rank, num_topk, num_experts / num_ranks);
+    TORCH_CHECK(pool <= std::numeric_limits<int32_t>::max(), "MegaMoE pool exceeds signed 32-bit rows");
+    return {uint32_t(num_ranks), uint32_t(num_experts), uint32_t(num_max_tokens_per_rank), uint32_t(num_topk),
+            uint32_t(hidden), uint32_t(intermediate_hidden), p != P::W4A16, p == P::FP8Blockwise};
+}
+
+static RoutedMoEViews slice_routed_buffer(
+    const Tensor& buffer, const layout::RoutedMoEBuffer& l, int num_experts, int num_ranks,
+    int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, const std::string& precision) {
+    check_tensor(buffer, torch::kUInt8);
+    TORCH_CHECK(buffer.dim() == 1 && buffer.nbytes() >= l.get_num_bytes(), "MegaMoE buffer is too small");
+    const bool fp8 = precision != "w4a16", blockwise = precision == "fp8_blockwise";
+    const int64_t pool = l.dispatch.num_max_pool_tokens, groups = num_experts / num_ranks;
+    auto view = [&](uint64_t off, std::vector<int64_t> shape, torch::ScalarType dtype) {
+        return mega_moe_slice(buffer, off, shape, dtype);
+    };
+    const auto rows = view(l.gemm2_metadata, {5, groups}, torch::kInt32);
+    auto scales =
+        fp8 ? view(l.l2_scales,
+                   blockwise ? std::vector<int64_t>{intermediate_hidden / 128, pool} : std::vector<int64_t>{pool, 1},
+                   torch::kFloat32)
+            : view(l.l2_scales, {0}, torch::kFloat32);
+    if (blockwise)
+        scales = scales.t();
+    RoutedMoEWorkspace w{
+        view(l.dispatched_tokens, {pool, int64_t(hidden) * (fp8 ? 1 : 2)}, torch::kUInt8),
+        view(l.l2_acts, {pool, intermediate_hidden}, fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16),
+        scales,
+        view(l.bf16_scratch, fp8 && !blockwise ? std::vector<int64_t>{pool, intermediate_hidden} : std::vector<int64_t>{0},
+             torch::kBFloat16),
+        view(l.block_info, {int64_t(l.block_info_elements)}, torch::kInt32),
+        rows[0],
+        rows[1],
+        rows[2],
+        view(l.packed_routes, {pool}, torch::kInt64),
+        view(l.combine, {int64_t(num_topk) * num_max_tokens_per_rank * hidden}, torch::kBFloat16),
+        view(l.peer_offsets, {num_ranks}, torch::kInt64),
+        buffer.narrow(0, layout::Workspace::kNumBarrierSignalBytes, (2LL * num_experts + groups) * sizeof(uint64_t)),
+        view(l.topk_idx, {num_max_tokens_per_rank, num_topk}, torch::kInt64),
+        view(l.topk_weights, {num_max_tokens_per_rank, num_topk}, torch::kFloat32),
+        view(l.barrier_flag, {1}, torch::kInt32),
+        view(l.barrier_done, {1}, torch::kInt32)};
+    return {view(l.input_tokens, {num_max_tokens_per_rank, hidden}, fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16),
+            view(l.input_scales, {num_max_tokens_per_rank, fp8 ? (blockwise ? hidden / 128 : 1) : 0}, torch::kFloat32),
+            std::move(w)};
+}
+
+static auto get_mega_moe_buffer_slices_for_precision(
+    const int& num_ranks, const int& num_experts, const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden, const std::string& precision) {
+    check_device();
+    const auto l = checked_routed_layout(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, precision);
+    std::function<py::tuple(const Tensor&, const std::vector<int64_t>&, const int&)> slices =
+        [=](const Tensor& buffer, const std::vector<int64_t>& pointers, const int& rank_idx) {
+            const auto transport = make_sym_buffer(pointers, rank_idx, num_ranks);
+            TORCH_CHECK(transport.base == reinterpret_cast<int64_t>(buffer.data_ptr()),
+                        "Invalid local symmetric pointer");
+            auto [x, sf, w] =
+                slice_routed_buffer(buffer, l, num_experts, num_ranks, num_max_tokens_per_rank,
+                                    num_topk, hidden, intermediate_hidden, precision);
+            std::vector<int64_t> offsets(num_ranks);
+            for (int r = 0; r < num_ranks; ++r)
+                offsets[r] = pointers[r] - pointers[rank_idx];
+            w.peer_offsets.copy_(torch::tensor(offsets, torch::TensorOptions().dtype(torch::kInt64)));
+            return py::make_tuple(x, sf, w.topk_idx, w.topk_weights);
+        };
+    return std::make_tuple(int64_t(l.get_num_bytes()), slices);
+}
+
+static std::string fp8_mega_moe_precision(const std::string& quantization) {
+    TORCH_CHECK(quantization == "channelwise",
+                "FP8 quantization must be 'channelwise'");
+    return "fp8_" + quantization;
+}
+
+static auto get_symm_buffer_size_for_fp8_mega_moe(
+    const int& num_ranks, const int& num_experts, const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden, const std::string& quantization) {
+    return get_mega_moe_buffer_slices_for_precision(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
+        fp8_mega_moe_precision(quantization));
+}
+
+static void fp8_w4a16_mega_moe_pre_dispatch_checked(const Tensor& hidden_states, const Tensor& topk_idx,
+                                         const Tensor& topk_weights, const Tensor& x, const Tensor& x_sf,
+                                         const Tensor& staged_topk_idx, const Tensor& staged_topk_weights,
+                                         const std::optional<int>& requested_num_tokens) {
+    check_device();
+    check_tensor(hidden_states, torch::kBFloat16);
+    check_tensor(topk_idx, torch::kInt64);
+    check_tensor(topk_weights, torch::kFloat32);
+    TORCH_CHECK(hidden_states.dim() == 2 && x.dim() == 2 && topk_idx.dim() == 2 && x_sf.dim() == 2 &&
+                    staged_topk_idx.dim() == 2 && staged_topk_weights.dim() == 2,
+                "pre-dispatch inputs and views must be matrices");
+    const int num_tokens = requested_num_tokens.value_or(hidden_states.size(0));
+    const int hidden = x.size(1), num_topk = staged_topk_idx.size(1);
+    const int num_max_tokens_per_rank = x.size(0);
+    TORCH_CHECK(num_tokens >= 0 && num_tokens <= num_max_tokens_per_rank,
+                "pre-dispatch token count must be within workspace capacity");
+    TORCH_CHECK(hidden > 0 && hidden % 256 == 0, "pre-dispatch hidden must be divisible by 256");
+    check_shape(hidden_states, {hidden_states.size(0), hidden});
+    TORCH_CHECK(hidden_states.size(0) >= num_tokens && topk_idx.size(0) >= num_tokens,
+                "pre-dispatch inputs must contain num_tokens rows");
+    check_shape(topk_idx, {topk_idx.size(0), num_topk});
+    check_shape(topk_weights, topk_idx.sizes());
+    check_shape(staged_topk_idx, {num_max_tokens_per_rank, num_topk});
+    check_shape(staged_topk_weights, staged_topk_idx.sizes());
+    check_tensor(staged_topk_idx, torch::kInt64);
+    check_tensor(staged_topk_weights, torch::kFloat32);
+    check_tensor(x_sf, torch::kFloat32);
+    const auto device = x.device();
+    for (const auto& t : {hidden_states, topk_idx, topk_weights, x_sf, staged_topk_idx, staged_topk_weights})
+        TORCH_CHECK(t.device() == device, "pre-dispatch tensors must share the workspace device");
+    check_tensor(x, torch::kFloat8_e4m3fn);
+    const bool blockwise = x_sf.size(1) != 1;
+    check_shape(x_sf, {num_max_tokens_per_rank, blockwise ? hidden / 128 : 1});
+    mega_moe_fp8_w4a16::fp8_channelwise_mega_moe_pre_dispatch_impl(
+            hidden, num_topk, hidden_states, topk_idx, topk_weights, x,
+            x_sf, staged_topk_idx, staged_topk_weights, num_tokens);
+}
+
+static void routed_mega_moe_pre_dispatch(
+    const Tensor& hidden_states, const Tensor& topk_idx, const Tensor& topk_weights,
+    const Tensor& x, const Tensor& x_sf, const Tensor& staged_topk_idx, const Tensor& staged_topk_weights,
+    const std::optional<int>& num_tokens) {
+    fp8_w4a16_mega_moe_pre_dispatch_checked(hidden_states, topk_idx, topk_weights, x, x_sf,
+                                           staged_topk_idx, staged_topk_weights, num_tokens);
+}
+
+template <bool kFp8>
+static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, const WeightPair& l2_weights,
+                            const OptTensor& cumulative_local_expert_recv_stats, const Tensor& sym_buffer,
+                            const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx, const int& num_max_tokens_per_rank,
+                            const int& num_experts, const int& num_topk, const std::string& precision,
+                            const std::string& activation, const std::optional<float>& activation_clamp_opt,
+                            const bool& fast_math, const std::optional<WeightPair>& l1_weights_replicas,
+                            const std::optional<WeightPair>& l2_weights_replicas, const float& swiglu_alpha,
+                            const float& situ_beta, const float& situ_linear_beta) {
+    check_device();
+    const auto kind = routed_precision(precision);
+    const bool fp8 = precision != "w4a16", blockwise = precision == "fp8_blockwise";
+    TORCH_CHECK(fp8 == kFp8, "Compute entry does not match workspace precision");
+    TORCH_CHECK(fp8 ? (activation == "swiglu" || activation == "swiglu_oai") : activation == "situ",
+                "Unsupported activation for ", precision);
+    TORCH_CHECK(!activation_clamp_opt || (!std::isnan(*activation_clamp_opt) && *activation_clamp_opt >= 0),
+                "activation_clamp must be nonnegative or None");
+    TORCH_CHECK(fp8 || !activation_clamp_opt, "W4A16 SiTU does not support activation_clamp");
+    TORCH_CHECK(std::isfinite(swiglu_alpha) && swiglu_alpha > 0 && std::isfinite(situ_beta) && situ_beta > 0 &&
+                    std::isfinite(situ_linear_beta) && situ_linear_beta > 0,
+                "Invalid activation coefficients");
+    check_tensor(y, torch::kBFloat16);
+    TORCH_CHECK(y.dim() == 2, "output must be [num_tokens, hidden]");
+    const auto& [w1, s1] = l1_weights;
+    const auto& [w2, s2] = l2_weights;
+    TORCH_CHECK(w1.dim() == 3 && w2.dim() == 3, "weights must be rank-3 tensors");
+    const int hidden = y.size(1), intermediate_hidden = w1.size(1) / 2;
+    const int num_tokens = y.size(0), num_ranks = sym_buffer_ptrs.size();
+    const auto l = checked_routed_layout(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, precision);
+    if (cumulative_local_expert_recv_stats) {
+        check_tensor(*cumulative_local_expert_recv_stats, torch::kInt32);
+        TORCH_CHECK(cumulative_local_expert_recv_stats->device() == y.device() &&
+                        cumulative_local_expert_recv_stats->numel() == num_experts / num_ranks,
+                    "Receive statistics must contain one INT32 per local physical expert on the output device");
+    }
+    TORCH_CHECK(num_tokens <= num_max_tokens_per_rank, "output token count exceeds workspace capacity");
+    TORCH_CHECK(y.device() == sym_buffer.device(), "output and workspace must share a device");
+    const auto transport = make_sym_buffer(sym_buffer_ptrs, rank_idx, num_ranks);
+    TORCH_CHECK(transport.base == reinterpret_cast<int64_t>(sym_buffer.data_ptr()),
+                "Invalid local workspace pointer");
+    TORCH_CHECK(l1_weights_replicas.has_value() == l2_weights_replicas.has_value(),
+                "Both replica banks must be provided together");
+    const auto check = [&](const WeightPair& w, int n, int k, int groups) {
+        const auto& [values, scales] = w;
+        check_tensor(values, fp8 ? torch::kFloat8_e4m3fn : torch::kUInt8);
+        check_tensor(scales, fp8 ? torch::kFloat32 : torch::kUInt8);
+        TORCH_CHECK(values.device() == y.device() && scales.device() == y.device(),
+                    "Weights must share the workspace device");
+        check_shape(values, {groups, n, fp8 ? k : k / 2});
+        if (fp8)
+            check_shape(scales, {groups, blockwise ? n / 128 : n, blockwise ? k / 128 : 1});
+        else
+            check_shape(scales, {groups, n / 64, int64_t(k) * 2});
+    };
+    const int masters = w1.size(0), groups = num_experts / num_ranks;
+    TORCH_CHECK(masters > 0 && masters <= groups, "Invalid master expert count");
+    check(l1_weights, 2 * intermediate_hidden, hidden, masters);
+    check(l2_weights, hidden, intermediate_hidden, masters);
+    if (l1_weights_replicas) {
+        TORCH_CHECK(masters < groups, "Replica banks need replica slots");
+        check(*l1_weights_replicas, 2 * intermediate_hidden, hidden, groups - masters);
+        check(*l2_weights_replicas, hidden, intermediate_hidden, groups - masters);
+    } else
+        TORCH_CHECK(masters == groups, "Weights must contain all local physical experts");
+    auto [x, sf, workspace] =
+        slice_routed_buffer(sym_buffer, l, num_experts, num_ranks, num_max_tokens_per_rank,
+                            num_topk, hidden, intermediate_hidden, precision);
+    const auto& configs = mega_moe_config::fp8_w4a16::get_routed_moe_configs(
+        kind, num_ranks, num_experts, num_topk, hidden, intermediate_hidden, num_max_tokens_per_rank,
+        num_tokens, masters, activation, y.device().index());
+    workspace.sym_buffer = transport;
+    const auto& l1_replicas = l1_weights_replicas ? *l1_weights_replicas : l1_weights;
+    const auto& l2_replicas = l2_weights_replicas ? *l2_weights_replicas : l2_weights;
+    mega_moe_fp8_w4a16::fp8_fp8_mega_moe_impl(
+        y, l1_weights, l2_weights, l1_replicas, l2_replicas, workspace, rank_idx, num_tokens,
+        activation, activation_clamp_opt && std::isfinite(*activation_clamp_opt) ? *activation_clamp_opt : -1.0f,
+        fast_math, swiglu_alpha, configs, kind, cumulative_local_expert_recv_stats);
+}
+
+void fp8_fp8_mega_moe(
+    const Tensor& y, const WeightPair& l1_weights_tuple, const WeightPair& l2_weights_tuple,
+    const OptTensor& cumulative_local_expert_recv_stats, const Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx, const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk, const std::string& quantization,
+    const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
+    const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas,
+    const float& swiglu_alpha) {
+    checked_mega_moe<true>(
+        y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats, sym_buffer,
+        sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank, num_experts, num_topk,
+        fp8_mega_moe_precision(quantization), activation, activation_clamp_opt, fast_math,
+        l1_weights_replicas, l2_weights_replicas, swiglu_alpha, 4.0f, 25.0f);
+}
+
 static void register_apis(pybind11::module_& m) {
+    m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe);
+    m.def("routed_mega_moe_pre_dispatch", &routed_mega_moe_pre_dispatch);
+    m.def("get_symm_buffer_size_for_fp8_mega_moe", &get_symm_buffer_size_for_fp8_mega_moe);
     m.def("fp4_fp4_mega_moe", &fp4_fp4_mega_moe);
     m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch);
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);

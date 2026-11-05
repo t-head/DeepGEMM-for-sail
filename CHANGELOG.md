@@ -33,6 +33,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **FP8 channelwise MegaMoE**: complete routed pipelines, precision-specific workspaces,
+  weight transforms, separate replica banks and library-owned communication state.
+
 - **W4A4 MegaMoE**: adds the complete MXFP4 routed MoE pipeline with BF16
   output on PPU1.5, validated on ZW-M890P. Exports workspace allocation,
   weight transformation, input preparation and `fp4_fp4_mega_moe` through

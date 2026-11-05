@@ -191,4 +191,46 @@ struct Workspace {
 };
 
 
+// FP8 and BF16 dispatch share the communication prefix. Scale storage is
+// precision-specific; all scratch and completion state belongs to this buffer.
+struct RoutedMoEBuffer {
+    Workspace dispatch;
+    uint64_t input_tokens, input_scales, topk_idx, topk_weights;
+    uint64_t dispatched_tokens, dispatched_scales;
+    uint64_t gemm2_metadata, packed_routes, l2_acts, l2_scales, bf16_scratch;
+    uint64_t block_info, block_info_elements, peer_offsets;
+    uint64_t combine, barrier_flag, barrier_done, num_bytes;
+
+    CUTLASS_HOST_DEVICE
+    RoutedMoEBuffer(uint32_t ranks, uint32_t experts, uint32_t capacity, uint32_t topk,
+                    uint32_t hidden, uint32_t intermediate, bool fp8, bool blockwise):
+        dispatch(nullptr, ranks, experts, capacity, topk) {
+        const uint64_t pool = dispatch.num_max_pool_tokens, groups = experts / ranks;
+        const uint64_t token_bytes = uint64_t(hidden) * (fp8 ? 1 : 2);
+        const uint64_t scale_bytes = fp8 ? (blockwise ? hidden / 128 : 1) * sizeof(float) : 0;
+        const auto align16 = [](uint64_t n) { return math::align<uint64_t>(n, 16); };
+        const auto align128 = [](uint64_t n) { return math::align<uint64_t>(n, 128); };
+        input_tokens = align128(dispatch.get_num_bytes());
+        input_scales = align16(input_tokens + capacity * token_bytes);
+        topk_idx = align16(input_scales + capacity * scale_bytes);
+        topk_weights = align16(topk_idx + uint64_t(capacity) * topk * sizeof(int64_t));
+        dispatched_tokens = align128(topk_weights + uint64_t(capacity) * topk * sizeof(float));
+        dispatched_scales = align16(dispatched_tokens + pool * token_bytes);
+        gemm2_metadata = align16(dispatched_scales + pool * scale_bytes);
+        packed_routes = gemm2_metadata + Gemm2Metadata::rows_bytes(groups);
+        l2_acts = align128(packed_routes + pool * sizeof(int64_t));
+        l2_scales = align128(l2_acts + pool * intermediate * (fp8 ? 1 : 2));
+        bf16_scratch = align128(l2_scales + (fp8 ? pool * (blockwise ? intermediate / 128 : 1) * sizeof(float) : 0));
+        block_info = align128(bf16_scratch + (fp8 && !blockwise ? pool * intermediate * 2 : 0));
+        block_info_elements = groups >= 128 ? 4 * (1 + groups + pool / kMinCandidateBlockM) : 0;
+        peer_offsets = align128(block_info + block_info_elements * sizeof(int32_t));
+        combine = align128(peer_offsets + uint64_t(ranks) * sizeof(int64_t));
+        barrier_flag = align128(combine + uint64_t(topk) * capacity * hidden * 2);
+        barrier_done = align128(barrier_flag + sizeof(int32_t));
+        num_bytes = align128(barrier_done + sizeof(int32_t));
+    }
+
+    CUTLASS_HOST_DEVICE uint64_t get_num_bytes() const { return num_bytes; }
+};
+
 } // namespace deep_gemm::layout
