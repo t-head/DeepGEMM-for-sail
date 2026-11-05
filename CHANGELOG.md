@@ -4,6 +4,15 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
+## Unreleased
+
+### Changed
+
+- **M890 W4FA8 execution**: expands native tile coverage, unifies automatic
+  tile selection, and overlaps streamed weight decoding with FP8 GEMM for
+  NoPad/Fused. Adds tile and resource diagnostics through `show_log=1`.
+  Existing GEMM APIs and the nine-element config format remain unchanged.
+
 ## 1.1.0+v1.0.0
 
 ### Added

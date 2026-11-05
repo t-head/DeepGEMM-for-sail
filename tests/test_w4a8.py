@@ -14,6 +14,8 @@ def test_grouped_gemm():
         'GroupedNoPad,data_type:w4fa8_mma,groups:4,m:35,n:64,k:128,quant_type:group,group_size:32',
         'GroupedNoPad,data_type:w4fa8_mma,groups:128,m:7,n:192,k:256,quant_type:group,group_size:32',
         'GroupedMasked,data_type:w4fa8_mma,groups:4,m:67,n:192,k:256,distribution:[0,1,33,67],quant_type:group,group_size:32',
+        'GroupedMasked,data_type:w4fa8_mma,groups:4,m:9,n:192,k:512,em:8,distribution:[0,1,8,9],quant_type:group,group_size:32',
+        'GroupedMasked,data_type:w4fa8_mma,groups:128,m:35,n:128,k:512,em:32,quant_type:group,group_size:32',
         'GroupedFused,data_type:w4fa8_mma,groups:8,num_token:17,topk:3,n:192,k:256,quant_type:group,group_size:32',
         'GroupedFused,data_type:w4fa8_mma,groups:128,num_token:4,topk:2,n:64,k:2048,quant_type:group,group_size:32',
     ]
@@ -53,10 +55,10 @@ def test_inv_scale():
     rows = torch.tensor(counts, device='cuda', dtype=torch.int32)
     indices = torch.repeat_interleave(torch.arange(4, device='cuda', dtype=torch.int32), rows.long())
     sms = deep_gemm.get_num_sms()
-    # Cover uncached scales, resident A with cached scales, and K-warp reduction.
+    # Cover uncached scales, resident A with cached scales, and non-expanded tiles.
     for k, config in [(128, (sms, 16, 256, 128, 16, 64, 128, 2, 1)),
                       (384, (sms, 64, 256, 128, 64, 64, 128, 2, 3)),
-                      (256, (sms, 32, 128, 128, 32, 64, 64, 2, 1))]:
+                      (256, (sms, 32, 128, 128, 32, 64, 128, 2, 1))]:
         n = 768
         packed = torch.randint(256, (4, n, k//2), device='cuda', dtype=torch.uint8)
         raw = torch.randint(109, 125, (4, n, k//32), device='cuda', dtype=torch.uint8)
@@ -86,7 +88,7 @@ def test_inv_scale():
             a, rhs, output, counts, experts, tokens, aligned, config, **kwargs)
     compare(fused, lhs, tuple(out.shape), 'fused gather and repeated token use')
 
-    k, n, capacity = 256, 192, 67
+    k, n, capacity = 512, 192, 67
     packed = torch.randint(256, (4, n, k//2), device='cuda', dtype=torch.uint8)
     raw = torch.full((4, n, k//32), 127, device='cuda', dtype=torch.uint8)
     rhs = deep_gemm.preprocess_weights_and_scales(
@@ -94,7 +96,8 @@ def test_inv_scale():
     lhs = quant_activation(torch.randn(4, capacity, k, device='cuda', dtype=torch.bfloat16))
     rows = torch.tensor([0, 1, 33, 67], device='cuda', dtype=torch.int32)
     def masked(a, output, **kwargs):
-        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(a, rhs[:2], output, rows, 25, **kwargs)
+        config = (sms, 32, 128, 128, 32, 32, 128, 2, 1)
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(a, rhs[:2], output, rows, 25, config, **kwargs)
     valid = torch.arange(capacity, device='cuda')[None, :] < rows[:, None]
     compare(masked, lhs, (4, capacity, n), 'masked valid rows and untouched padding', valid)
 
@@ -169,16 +172,14 @@ def test_nopad_n_expand():
         if k == 768:
             deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(gemm_lhs, rhs[:2], out, indices, rows, config[:-1] + (4,))
             assert torch.equal(out, baseline)
-        invalid = [config[:-1] + (5,), config[:7] + (3, 2), config[:6] + (64, 2, 2)]
         if n == 320:
-            invalid.append(config[:-1] + (2,))
-        for bad in invalid:
             try:
-                deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(gemm_lhs, rhs[:2], out, indices, rows, bad)
+                deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+                    gemm_lhs, rhs[:2], out, indices, rows, config[:-1] + (2,))
             except RuntimeError:
                 pass
             else:
-                raise AssertionError(f'accepted invalid N_EXPAND config {bad}')
+                raise AssertionError('accepted N_EXPAND with unaligned N')
         print(f'PASS N_EXPAND {groups=} {n=} {k=} {expand=}')
 
 
@@ -206,7 +207,7 @@ def test_nopad_resident_a_and_scales():
         gemm_lhs = (lhs[0], lhs[1] * rhs[2])
         configs = [None]
         if k == 256:
-            configs.append((deep_gemm.get_num_sms(), 128, 256, 128, 64, 64, 128, 2, 3))
+            configs.append((deep_gemm.get_num_sms(), 64, 256, 128, 64, 64, 128, 2, 3))
         for config in configs:
             out = torch.full((m, n), float('nan'), device='cuda', dtype=torch.bfloat16)
             deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(gemm_lhs, rhs[:2], out, indices, rows, config)
@@ -420,7 +421,7 @@ def test_basis():
 
 
 def test_fused_k32_basis():
-    # Exercise both K64 weight slices, N tail, and multiple compact M64 blocks.
+    # Exercise both K64 weight slices, N tail, and multiple M64 blocks.
     # Vary scales along N as well as K so a misplaced scale tile cannot pass.
     n, k = 320, 256
     codes = ((torch.arange(n, device='cuda')[:, None]*3 +
@@ -436,7 +437,7 @@ def test_fused_k32_basis():
         scales = torch.linspace(.5, 1.5, m, device='cuda').reshape(m, 1)
         routes = torch.zeros(m, 1, device='cuda', dtype=torch.int32)
         _, rows, experts, tokens, aligned, _, _ = deep_gemm.moe_align_block_size(
-            aq, rhs[0], routes, config=config[:7])
+            aq, rhs[0], routes, config=config)
         out = torch.empty(m, n, device='cuda', dtype=torch.bfloat16)
         deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
             (aq, scales * rhs[2]), rhs[:2], out, rows, experts, tokens, aligned, config)
@@ -463,6 +464,313 @@ def test_masked_shifted_scale():
     print('PASS masked shifted scale and per-expert rows')
 
 
+def _w4a8_nopad_problem(counts, n, k, with_layout=False):
+    groups = len(counts)
+    packed = torch.randint(256, (groups, n, k // 2), device='cuda', dtype=torch.uint8)
+    scales = torch.randint(119, 133, (groups, n, k // 32), device='cuda', dtype=torch.uint8)
+    rhs = deep_gemm.preprocess_weights_and_scales(
+        deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, scales)
+    quantized = quant_activation(torch.randn(sum(counts), k, device='cuda', dtype=torch.bfloat16))
+    lhs = quantized[0], quantized[1] * rhs[2]
+    rows = torch.tensor(counts, device='cuda', dtype=torch.int32)
+    indices = torch.repeat_interleave(torch.arange(groups, device='cuda', dtype=torch.int32), rows.long())
+    output = torch.full((sum(counts), n), float('nan'), device='cuda', dtype=torch.bfloat16)
+
+    def reference(weight=packed, weight_scales=scales):
+        result = torch.empty_like(output)
+        begin = 0
+        for expert, count in enumerate(counts):
+            if count:
+                a = lhs[0][begin:begin + count].float() * (lhs[1][begin:begin + count] / rhs[2])
+                result[begin:begin + count] = (a @ decode_weight(weight[expert], weight_scales[expert]).T).bfloat16()
+            begin += count
+        return result
+
+    def call():
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(lhs, rhs[:2], output, indices, rows)
+
+    result = lhs, rhs, output, call, reference, packed, scales
+    return result + (rows, indices) if with_layout else result
+
+
+def _streamed_fused_problem(groups, tokens, topk, n, k):
+    packed = torch.randint(256, (groups, n, k // 2), device='cuda', dtype=torch.uint8)
+    raw = torch.randint(119, 133, (groups, n, k // 32), device='cuda', dtype=torch.uint8)
+    rhs = deep_gemm.preprocess_weights_and_scales(
+        deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+    assert rhs[2] == 1.
+    lhs = quant_activation(torch.randn(tokens, k, device='cuda', dtype=torch.bfloat16))
+    routes = torch.rand(tokens, groups - 1, device='cuda').topk(topk, dim=1, sorted=False).indices.int()
+    config, rows, experts, sorted_tokens, aligned, _, _ = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routes)
+    assert len(config) == 9
+    output = torch.empty(tokens * topk, n, device='cuda', dtype=torch.bfloat16)
+    def call():
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+            lhs, rhs[:2], output, rows, experts, sorted_tokens, aligned, config)
+    def reference(weights=packed, scales=raw, routing=routes):
+        source = routing.flatten().argsort(stable=True) // topk
+        counts = torch.bincount(routing.flatten().long(), minlength=groups).cpu().tolist()
+        expected = torch.empty_like(output)
+        begin = 0
+        for expert, count in enumerate(counts):
+            if count:
+                ids = source[begin:begin + count]
+                a = lhs[0].float()[ids] * lhs[1][ids]
+                expected[begin:begin + count] = (a @ decode_weight(weights[expert], scales[expert]).T).bfloat16()
+            begin += count
+        return expected
+    def reroute(routing):
+        new = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routing)
+        assert new[0] == config
+        for target, value in zip((rows, experts, sorted_tokens, aligned), new[1:5]):
+            assert target.shape == value.shape
+            target.copy_(value)
+    return lhs, rhs, output, call, reference, packed, raw, routes, reroute
+
+
+def test_routing_layout_block_m():
+    # Cover both align algorithms and non-power-of-two routing blocks.
+    for tokens in (1733, 2049):
+        groups, topk = 97, 8
+        a = torch.empty(tokens, 1024, device='cuda', dtype=torch.float8_e4m3fn)
+        b = torch.empty(groups, 1024, 512, device='cuda', dtype=torch.uint8)
+        routes = (torch.arange(tokens * topk, device='cuda').reshape(tokens, topk) % groups).int()
+        source = routes.flatten().argsort(stable=True) // topk
+        for bm in (64, 96, 144, 256):
+            config = ((deep_gemm.get_num_sms(), 256, 256, 128, 64, 64, 128, 4, 1) if bm == 256 else
+                      (deep_gemm.get_num_sms(), bm, 256, 128, bm, 32 if bm > 64 else 64, 128, 2, 1))
+            selected, rows, _, sorted_tokens, _, _, _ = deep_gemm.moe_align_block_size(a, b, routes, config=config)
+            assert selected == config and sorted_tokens.size(1) == bm
+            table = sorted_tokens.flatten()
+            begin = offset = 0
+            for count in rows.cpu().tolist():
+                assert torch.equal(table[offset:offset + count], source[begin:begin + count].int())
+                padded = (count + bm - 1) // bm * bm
+                assert (table[offset + count:offset + padded] == tokens).all()
+                begin += count
+                offset += padded
+    print('PASS routing padding blocks, expert token offsets and tail sentinels')
+
+
+def test_native_tiles():
+    # Cover every wide M tile; Graph and scale-variant checks live in test_execution_paths.
+    sms = deep_gemm.get_num_sms()
+    for bm, stages in [(m, 2) for m in range(80, 193, 16)] + [(96, 4)]:
+        groups = 128 if bm == 192 else 9
+        counts = [0, 1, bm - 1, bm, bm + 1, 2 * bm - 1, 2 * bm, 2 * bm + 1, 3 * bm + 1]
+        counts += [0] * (groups - len(counts))
+        k = 512 if stages == 4 else 768
+        lhs, rhs, _, _, reference, _, _, rows, indices = _w4a8_nopad_problem(counts, 512, k, True)
+        expected = reference()
+        backing = torch.full((sum(counts) + 16, 512), -123., device='cuda', dtype=torch.bfloat16)
+        config = (sms, bm, 256, 128, bm, 32, 128, stages, 1)
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+            lhs, rhs[:2], backing[:-16], indices, rows, config, inv_scale=.5)
+        assert calc_diff(backing[:-16], expected * .5) < .003, config
+        assert bool((backing[-16:] == -123.).all())
+        if bm <= 176:
+            lhs, rhs, _, _, reference, _, _, routes, _ = _streamed_fused_problem(8, 417, 4, 512, k)
+            expected = reference()
+            backing = torch.full((417 * 4 + 16, 512), -123., device='cuda', dtype=torch.bfloat16)
+            fused_stages = 3 if stages == 2 and bm <= 144 else stages
+            config = config[:7] + (fused_stages, 1)
+            selected, rows, experts, tokens, aligned, _, _ = deep_gemm.moe_align_block_size(
+                lhs[0], rhs[0], routes, config=config)
+            assert selected == config and tokens.size(1) == bm
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+                lhs, rhs[:2], backing[:-16], rows, experts, tokens, aligned, config, inv_scale=.5)
+            assert calc_diff(backing[:-16], expected * .5) < .003, config
+            assert bool((backing[-16:] == -123.).all())
+        print(f'PASS native tile {bm=} {stages=}')
+
+
+def test_default_configs():
+    # Representative headroom, multi-block, long-K and streamed selection boundaries.
+    sms = deep_gemm.get_num_sms()
+    for groups, em, n, k, bm in ((8, 128, 1024, 1024, 144), (17, 128, 1024, 1024, 144),
+                                  (128, 72, 256, 768, 80), (128, 73, 256, 768, 96),
+                                  (128, 145, 256, 3584, 160), (128, 158, 256, 768, 176),
+                                  (128, 159, 256, 768, 96), (128, 320, 256, 768, 128),
+                                  (128, 1023, 1024, 1024, 144), (128, 1024, 1024, 1024, 256),
+                                  (32, 511, 2048, 2048, 144), (32, 512, 2048, 2048, 256),
+                                  (32, 512, 4096, 1920, 144), (32, 512, 4096, 2048, 256),
+                                  (32, 512, 1024, 3968, 144), (32, 512, 1024, 4096, 256)):
+        topk, tokens = 4, groups * em // 4
+        a = torch.empty((tokens, k), dtype=torch.float8_e4m3fn, device='cuda')
+        b = torch.empty((groups, n, k // 2), dtype=torch.uint8, device='cuda')
+        routes = (torch.arange(tokens * topk, device='cuda').reshape(tokens, topk) % groups).int()
+        config, rows, _, sorted_tokens, _, _, _ = deep_gemm.moe_align_block_size(a, b, routes)
+        if bm != 256 and ((groups * em + bm - 1) // bm) * (n // 256) < sms:
+            bm = 64
+        stages = 4 if bm == 256 else 3 if 80 <= bm <= 144 else 2
+        assert config == (sms, bm, 256, 128, 64 if bm == 256 else bm,
+                          64 if bm in (64, 256) else 32, 128, stages, 1), (groups, em, k, config)
+        assert sorted_tokens.size(1) == bm and bool((rows == em).all())
+    # NoPad checks both sides of task-wave admission, small expert sets and large-M fallback.
+    for groups, em, n, k, bm in ((17, 128, 512, 1024, 144), (17, 128, 768, 1024, 144),
+                                  (64, 176, 512, 1024, 192), (17, 320, 1024, 768, 128),
+                                  (32, 512, 2048, 2048, 256)):
+        counts = [0, 2 * em] + [em] * (groups - 2)
+        lhs, rhs, _, _, reference, _, _, rows, indices = _w4a8_nopad_problem(counts, n, k, True)
+        expected = reference()
+        backing = torch.full((groups * em + 16, n), -123., device='cuda', dtype=torch.bfloat16)
+        explicit = torch.empty_like(expected)
+        if ((groups * em + bm - 1) // bm) * (n // 256) < sms:
+            bm = 64
+        config = (sms, bm, 256, 128, 64 if bm == 256 else bm,
+                  64 if bm in (64, 256) else 32, 128, 4 if bm == 256 else 2, 1)
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(lhs, rhs[:2], backing[:-16], indices, rows)
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(lhs, rhs[:2], explicit, indices, rows, configs=config)
+        assert torch.equal(backing[:-16], explicit) and calc_diff(explicit, expected) < .003
+        assert bool((backing[-16:] == -123.).all())
+    print('PASS automatic tile admission and streamed priority')
+
+
+def _capture_prepared(call, output, rows=None, inverse=.3):
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    output.fill_(float('nan'))
+    with torch.cuda.stream(stream):
+        deep_gemm.set_compile_mode(1)
+        try:
+            call(inverse)
+        finally:
+            deep_gemm.set_compile_mode(0)
+    stream.synchronize()
+    assert torch.isnan(output).all()
+    try:
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+            call(inverse)
+    except RuntimeError as error:
+        assert 'must be warmed outside graph capture' in str(error)
+    else:
+        raise AssertionError('compile-only admitted an unprepared caller')
+    live_rows = rows.clone() if rows is not None else None
+    if rows is not None:
+        rows.zero_()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        call(inverse)
+    stream.synchronize()
+    if rows is not None:
+        assert torch.isnan(output).all()
+        rows.copy_(live_rows)
+    stream.wait_stream(torch.cuda.current_stream())
+    try:
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+            call(1. if inverse != 1. else .3)
+    except RuntimeError as error:
+        assert 'must be warmed outside graph capture' in str(error)
+    else:
+        raise AssertionError('capture admitted an unwarmed inverse-scale variant')
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        call(inverse)
+    graph.replay()
+    torch.cuda.synchronize()
+    return graph, stream
+
+
+def test_execution_paths():
+    # FullK, rolling and streamed kernels prepare only the requested scale variant.
+    for mode in ('full', 'rolling', 'streamed', 'streamed_short'):
+        streamed = mode.startswith('streamed')
+        short = mode == 'streamed_short'
+        for fused in (False, True):
+            groups, n, k = 8, 1344 if streamed else 512, 1024 if streamed else 768
+            if short:
+                n, k = 2048, 2176
+            config = ((deep_gemm.get_num_sms(), 256, 256, 128, 64, 64, 128, 4, 1) if streamed else
+                      (deep_gemm.get_num_sms(), 64, 256, 128, 64, 64, 128, 2, 1) if mode == 'full' else
+                      (deep_gemm.get_num_sms(), 160, 256, 128, 160, 32, 128, 3, 1))
+            if fused:
+                lhs, rhs, output, _, reference, packed, raw, routes, _ = _streamed_fused_problem(
+                    groups, 1024 if short else 193 if streamed else 417, 4, n, k)
+                selected, rows, experts, tokens, aligned, _, _ = deep_gemm.moe_align_block_size(
+                    lhs[0], rhs[0], routes, config=config)
+                assert selected == config and tokens.size(1) == config[1]
+                def call(inverse):
+                    deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+                        lhs, rhs[:2], output, rows, experts, tokens, aligned, config, inv_scale=inverse)
+            else:
+                counts = [0, 1, 17, 65, 256, 257, 128, 0] if streamed else [0, 1, 31, 32, 65, 160, 161, 257]
+                if short:
+                    counts[-1] = groups * 512 - sum(counts)
+                lhs, rhs, output, _, reference, packed, raw, rows, indices = _w4a8_nopad_problem(
+                    counts, n, k, True)
+                def call(inverse):
+                    deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+                        lhs, rhs[:2], output, indices, rows, config, inv_scale=inverse)
+            expected = reference()
+            graph, stream = _capture_prepared(call, output, None if fused else rows)
+            assert calc_diff(output, expected * .3) < .003
+            packed.bitwise_xor_(0x88)
+            raw.copy_(raw.flip(-1))
+            changed = deep_gemm.preprocess_weights_and_scales(
+                deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+            assert changed[2] == rhs[2]
+            rhs[0].copy_(changed[0])
+            rhs[1].copy_(changed[1])
+            lhs[1].mul_(-.5)
+            if fused:
+                routes.add_(1).remainder_(groups)
+                updated = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routes, config=config)
+                assert updated[0] == config
+                for target, value in zip((rows, experts, tokens, aligned), updated[1:5]):
+                    assert target.shape == value.shape
+                    target.copy_(value)
+            else:
+                counts[:] = counts[1:] + counts[:1]
+                rows.copy_(torch.tensor(counts, device='cuda', dtype=torch.int32))
+                indices.copy_(torch.repeat_interleave(
+                    torch.arange(groups, device='cuda', dtype=torch.int32), rows.long()))
+            expected = reference()
+            output.fill_(float('nan'))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.isfinite(output).all()
+            assert calc_diff(output, expected * .3) < .003
+            with torch.cuda.stream(stream):
+                call(.3)
+                consumed = output.clone()
+            stream.synchronize()
+            assert torch.equal(consumed, output)
+            unit_graph, _ = _capture_prepared(call, output, None if fused else rows, inverse=1.)
+            # A different non-unit scalar reuses the warmed non-unit variant.
+            nonunit_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(nonunit_graph, stream=stream):
+                call(.7)
+            for replay, inverse in ((unit_graph, 1.), (graph, .3), (nonunit_graph, .7), (unit_graph, 1.)):
+                replay.replay()
+                torch.cuda.synchronize()
+                assert calc_diff(output, expected * inverse) < .003
+            print(f'PASS execution {mode=} {fused=}: variant-specific warmup, capture and live inputs')
+
+
+def test_explicit_execution_configs():
+    # Explicit tiles determine execution without hidden default overrides.
+    sms = deep_gemm.get_num_sms()
+    lhs, rhs, out, call, reference, _, _, rows, indices = _w4a8_nopad_problem([0, 1, 17, 65], 256, 768, True)
+    expected = reference()
+    tile = (sms, 32, 256, 128, 32, 64, 128, 2, 1)
+    narrow_warp_tile = tile[:5] + (32,) + tile[6:]
+    for config in (tile, narrow_warp_tile):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(lhs, rhs[:2], out, indices, rows, config, inv_scale=.3)
+        assert calc_diff(out, expected * .3) < .003, (config, calc_diff(out, expected * .3))
+    oversized = (sms, 64, 1 << 30, 128, 64, 64, 128, 2, 4)
+    multi_m_warp = (sms, 128, 256, 128, 64, 64, 128, 2, 1)
+    split_k_tile = (sms, 16, 256, 128, 16, 64, 64, 2, 1)
+    legacy_m128 = (sms, 128, 128, 128, 128, 32, 128, 2, 1)
+    for bad in (oversized, multi_m_warp, split_k_tile, legacy_m128):
+        try:
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(lhs, rhs[:2], out, indices, rows, bad)
+        except (RuntimeError, TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(f'accepted invalid tile config {bad}')
+    print('PASS explicit native tiles and invalid configurations')
+
+
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -472,6 +780,11 @@ if __name__ == '__main__':
     utils.set_benchmark(False)
 
     if is_ppu1v5_device():
+        test_execution_paths()
+        test_explicit_execution_configs()
+        test_routing_layout_block_m()
+        test_native_tiles()
+        test_default_configs()
         test_grouped_gemm()
         test_inv_scale()
         test_nopad_expert_limit()
