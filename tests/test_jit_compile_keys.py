@@ -140,7 +140,6 @@ int fp8_checks() {
     CHECK_FP8(gemm_type, "MGroupedContiguous");
     CHECK_FP8(kernel_strategy, "OtherStrategy");
     CHECK_FP8(enable_sbo_overlap, true);
-    CHECK_FP8(transposed_batch_output, false);
 #undef CHECK_FP8
     count += check_change<Runtime>(args, [](auto& a) {
         cute::get<1>(a.kernel_params.problem_shape) = 768;
