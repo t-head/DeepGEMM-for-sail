@@ -483,8 +483,13 @@ public:
                     const uint32_t slot_offsets_0 = __ldg(&kv_splits[kv_split_idx].kv_block_infos[row0 / SPARSE_BLOCK_KV].packed_slot_offsets);
                     const uint32_t slot_offsets_1 = __ldg(&kv_splits[kv_split_idx].kv_block_infos[row1 / SPARSE_BLOCK_KV].packed_slot_offsets);
                     for_each(make_int_sequence<K_BLOCK>{}, [&](auto k_block) {
-                        copy(smem_tiled_copy_A, tCsA(_, _, k_block, kv_stage_idx), tCrA_copy_view(_, _, k_block));
-                        copy(smem_tiled_copy_SFA, tCsSFA(_, _, k_block, kv_stage_idx), tCrSFA_copy_view(_, _, k_block));
+                        copy(smem_tiled_copy_A, tCsA(_, m_block, k_block, kv_stage_idx),
+                             tCrA_copy_view(_, m_block, k_block));
+                        // Each packed SFA entry serves m_group MMA M blocks.
+                        if constexpr (m_block % m_group == 0) {
+                            copy(smem_tiled_copy_SFA, tCsSFA(_, m_block / m_group, k_block, kv_stage_idx),
+                                 tCrSFA_copy_view(_, m_block / m_group, k_block));
+                        }
                         for_each(make_int_sequence<N_BLOCK>{}, [&](auto n_block) {
                             Tensor s = make_tensor<uint32_t>(Int<4>{});
                             MMA_Atom<MmaInst> mma_atom;
