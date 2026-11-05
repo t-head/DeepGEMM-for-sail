@@ -2515,6 +2515,7 @@ def ref_sparse_mqa_logits(q: torch.Tensor, kv_gathered: torch.Tensor, weights: t
 
 # Layout mirrors deep_gemm/include/deep_gemm/impls/sparse_mqa_logits_layout.cuh
 SPARSE_SPLIT_KV = 128
+SPARSE_CTAS_PER_CU = 7
 SPARSE_INVALID_SLOT = 0xFFFF
 SPARSE_CONTIGUOUS_FLAG = 0x80000000
 # KVBlockInfo slot fields are raw 16-bit offsets (no present bit; the present bit only exists in
@@ -2524,8 +2525,7 @@ SPARSE_SLOT_MASK = 0xFFFF
 def decode_sparse_metadata(metadata: torch.Tensor, sparse_block_kv: int) -> dict:
     """Decode the metadata buffer produced by the sparse metadata kernel (contiguous layout)."""
     # Schedule table columns = resident CTAs of the sparse main kernel = num_cu x tb_per_cu
-    # (tb_per_cu = 4 for the BLOCK_Q=2/BLOCK_KV=128 tile)
-    num_slots = 4 * deep_gemm.get_num_sms()
+    num_slots = SPARSE_CTAS_PER_CU * deep_gemm.get_num_sms()
     words = metadata.view(torch.int32).cpu().numpy()
     num_kv_splits, num_waves, use_unaligned_ks = int(words[0]), int(words[1]), int(words[2])
     blocks_per_split = SPARSE_SPLIT_KV // sparse_block_kv
@@ -2618,7 +2618,7 @@ def verify_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int) -> Non
     """Compare the kernel's decoded metadata against the Python reference. Split reservation order
     is nondeterministic, so split lists are canonically sorted by (q_token_base, q0_slot_base,
     q1_slot_base); the schedule is validated structurally (exact tiling, slot evenness, Q-block cuts)."""
-    num_slots = 4 * deep_gemm.get_num_sms()
+    num_slots = SPARSE_CTAS_PER_CU * deep_gemm.get_num_sms()
     if decoded['num_kv_splits'] != ref['num_kv_splits']:
         print(f"ERROR: metadata num_kv_splits mismatch: {decoded['num_kv_splits']} vs {ref['num_kv_splits']}")
         exit(1)
@@ -2745,7 +2745,7 @@ def verify_paged_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int,
                                  request_ids: torch.Tensor) -> None:
     """Paged schedule check: entries tile [0, num_kv_splits) exactly; each entry stays inside its
     Q block's split range with a pairing count matching the request-aligned pairs."""
-    num_slots = 4 * deep_gemm.get_num_sms()
+    num_slots = SPARSE_CTAS_PER_CU * deep_gemm.get_num_sms()
     if decoded['num_kv_splits'] != ref['num_kv_splits']:
         print(f"ERROR: metadata num_kv_splits mismatch: {decoded['num_kv_splits']} vs {ref['num_kv_splits']}")
         exit(1)

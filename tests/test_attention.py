@@ -220,6 +220,9 @@ def test_sparse_mqa_logits_loop():
         'PagedSparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:65536,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:128,check_metadata:1',
         'PagedSparseMqaLogits,data_type:fp4,seq_len_q:1,seq_len_kv:1025,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:256,check_metadata:1',
         'PagedSparseMqaLogits,data_type:fp4,seq_len_q:2,seq_len_kv:0,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:4,check_metadata:1',
+        # Largest merge bucket with more schedule slots than metadata threads.
+        'SparseMqaLogits,data_type:fp4,seq_len_q:9,seq_len_kv:65535,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:4096,use_unaligned_ks:1,check_metadata:1',
+        'PagedSparseMqaLogits,data_type:fp4,seq_len_q:9,seq_len_kv:65535,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:4096,page_kv:128,check_metadata:1',
     ]
     set_acc_check(True)
     for case in cases:
