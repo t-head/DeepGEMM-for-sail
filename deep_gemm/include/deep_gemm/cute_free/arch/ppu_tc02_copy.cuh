@@ -10,7 +10,7 @@ namespace arch {
 // =============================================================================
 // PPU 1.5 (tc02) low-level copy primitives.
 //
-// These are thin wrappers over the raw PTX instructions. They are templated on
+// These are thin wrappers over the raw device instructions. They are templated on
 // the tile shape constants so that the swizzle mode / strides are resolved at
 // compile time, but they remain bf16-specific at the instruction level. Higher
 // level, element-generic abstractions live in deep_gemm/cute_free/copy/*.cuh.

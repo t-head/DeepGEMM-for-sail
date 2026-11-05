@@ -13,7 +13,7 @@ namespace copy {
 //
 // Templated on the element type and the tile (cube) shape so that the same
 // mainloop code can be reused across data types / tile configs by instantiating
-// a different atom. The actual PTX is provided by deep_gemm::arch.
+// a different atom. The actual assembly is provided by deep_gemm::arch.
 //
 //   Element : data type (currently cutlass::bfloat16_t)
 //   CubeH   : tile height (BLOCK_M for A, BLOCK_N for B)

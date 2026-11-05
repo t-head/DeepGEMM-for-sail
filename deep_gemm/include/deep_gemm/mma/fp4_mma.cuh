@@ -206,7 +206,7 @@ struct CollectiveMmaScaleFp4
   // avoid modify kernel file for fp4
   Params params_;
 
-  // sm90 realization put TMA_A into params directly
+  // Copy descriptors are initialized on device rather than passed through Params.
   // put gmem_tiled_copy here and copy desc in kernel to simplify rtc usage
   GmemTiledCopyA gmem_tiled_copy_A;
   GmemTiledCopyB gmem_tiled_copy_B;

@@ -12,7 +12,7 @@
 // Layering (cutlass3-style, all under deep_gemm/cute_free/):
 //   kernel/gemm.cuh          : generic orchestrator (prologue/mainloop/epilogue)
 //   copy/*, mma/*, epilogue/*: atoms (data type / platform specific)
-//   arch/*                   : low-level PTX wrappers
+//   arch/*                   : low-level instruction wrappers
 // =============================================================================
 
 #include <cstdint>
