@@ -53,7 +53,7 @@ from .deep_gemm_cpp import (
     m_grouped_bf16_gemm_nt_masked,
     m_grouped_bf16_gemm_nt_nopad,
     m_grouped_bf16_gemm_nt_fused,
-    # BF16 x FP32 GEMM (hpc-ops compatible API)
+    # BF16 x FP32 GEMM (native API and legacy workspace helper)
     bf16xfp32_gemm_nt,
     get_gemm_bf16xfp32_workspace,
     # INT8 GEMMs
@@ -176,7 +176,15 @@ gemm_bf16_bf16_bf16_tn = bf16_gemm_tn
 gemm_bf16_bf16_bf16_tt = bf16_gemm_tt
 
 # --- BF16 x FP32 dense GEMM (FP32 weight split into two BF16 parts) ---
-gemm_bf16xfp32 = bf16xfp32_gemm_nt
+def gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output=False,
+                    use_splitk=True, split_flag=None):
+    """hpc-ops-compatible wrapper; Split-K controls are ignored on PPU."""
+    if split_flag is not None:
+        if split_flag.dtype != torch.int32:
+            raise RuntimeError("split_flag must be int32")
+        if not split_flag.is_contiguous():
+            raise RuntimeError("split_flag must be contiguous")
+    return bf16xfp32_gemm_nt(x, w_high, w_low, scale, use_fp32_output)
 
 # --- BF16 M-grouped GEMM ---
 m_grouped_gemm_bf16_bf16_bf16_nt_contiguous = m_grouped_bf16_gemm_nt_contiguous
