@@ -108,7 +108,8 @@ struct MegaMoEFp4Kernel {
             typename Epilogue::SharedStorage epilogue;
         };
         using SharedStorage = std::conditional_t<WarpPipeline, PipelineStorage, OverlaidStorage>;
-        static constexpr int SharedStorageSize = sizeof(SharedStorage);
+        static constexpr int SharedStorageSize = cute::max(static_cast<int>(sizeof(SharedStorage)),
+            kIsLinear1 ? Groups * (Ranks + 4) * static_cast<int>(sizeof(uint32_t)) : 0);
 
         // Field order is shared with the host JIT launcher.
         struct ParamsBase {

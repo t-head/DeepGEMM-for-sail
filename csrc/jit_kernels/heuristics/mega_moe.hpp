@@ -118,6 +118,9 @@ static MegaMoEL1Config get_l1_config(
     auto config = make_phase_config(deep_gemm_fp4_common::get_best_configs(
         shape_m, expected_m, n, k, num_experts_per_rank, num_sms, false, false,
         GemmType::MegaMoE, 256, 32));
+    // Metadata preprocessing reuses the GEMM shared allocation before compute.
+    config.smem_size = std::max(config.smem_size,
+        num_experts_per_rank * (num_ranks + 4) * static_cast<int>(sizeof(uint32_t)));
     DG_HOST_ASSERT(fused_tile_fits(config, num_ranks, num_experts_per_rank));
 
     const auto record = select_copy_tile(n, k, num_experts_per_rank, num_ranks, expected_m, config);

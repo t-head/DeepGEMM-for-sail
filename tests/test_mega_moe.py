@@ -974,6 +974,14 @@ def test_mega_moe_smoke_grouped_workspace(mega_moe_group):
     _run_mega_moe(case, mega_moe_group, verbose=False)
 
 
+def test_mega_moe_smoke_metadata_workspace(mega_moe_group):
+    """Many experts need more metadata scratch than the small-token GEMM tile."""
+    if dist.get_world_size() != 1:
+        pytest.skip("metadata allocation boundary is covered by EP1")
+    case = replace(CASES[0], hidden=1024, experts=2048, capacity=16, tokens=(1,))
+    _run_mega_moe(case, mega_moe_group, verbose=False)
+
+
 # Standalone torchrun entry; pytest uses the same driver and case table.
 
 
