@@ -134,6 +134,23 @@ public:
     }
 };
 
+class PPUW4A16MegaMoERuntime final : public LaunchRuntime<PPUW4A16MegaMoERuntime> {
+public:
+    enum class KernelPhase { Linear1, Linear2 };
+    struct Args;
+    static void compile_and_launch(const std::string& tag, const Args& args);
+    template <typename Tag, typename Params>
+    static std::string generate_impl(const PrecisionLaunchArgs<Tag, Params>& args) {
+        return args.source;
+    }
+    template <typename Tag, typename Params>
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config,
+                            const PrecisionLaunchArgs<Tag, Params>& args) {
+        std::apply([&](const auto&... p) { DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, p...)); },
+                   args.kernel_params);
+    }
+};
+
 template <typename Tag, typename Config, typename... Params>
 inline void launch(const std::string& name, const std::string& source, const Config& config,
                    const std::tuple<Params...>& params, dim3 grid, int threads,
@@ -167,6 +184,147 @@ inline void launch(const std::string& name, const std::string& source, const Con
         Runtime::launch(runtime, args);
         return;
     }
+}
+
+struct W4A16MegaMoePreDispatchTag {
+    using Runtime = PPUW4A16MegaMoERuntime;
+};
+inline void w4a16_mega_moe_pre_dispatch_impl(
+    const torch::Tensor& hidden_states, const torch::Tensor& topk_idx,
+    const torch::Tensor& topk_weights, const torch::Tensor& staged_tokens,
+    const torch::Tensor& staged_topk_idx, const torch::Tensor& staged_topk_weights,
+    int num_tokens, int hidden, int num_topk) {
+    const bool copy_tokens = hidden_states.data_ptr() != staged_tokens.data_ptr();
+    // Even inputs already in the workspace need invalid routing topk_weights masked.
+    if (!num_tokens)
+        return;
+    const auto c = mega_moe_config::fp8_w4a16::w4a16_pre_dispatch_config(hidden, num_topk);
+    const int vector =
+        (hidden % 8 == 0 &&
+         ((reinterpret_cast<uintptr_t>(hidden_states.data_ptr()) | reinterpret_cast<uintptr_t>(staged_tokens.data_ptr())) &
+          15) == 0)
+            ? 8
+            : 1;
+    const int token_blocks = copy_tokens ? ceil_div(int64_t(num_tokens) * hidden / vector, int64_t(c.block_threads)) : 0;
+    const int route_blocks = ceil_div(int64_t(num_tokens) * num_topk, int64_t(c.block_threads));
+    launch<W4A16MegaMoePreDispatchTag>("w4a16_mega_moe_pre_dispatch", R"DGMEGA(
+#include <deep_gemm/impls/w4a16_mega_moe_pre_dispatch.cuh>
+extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes = 0;
+extern "C" __global__ __launch_bounds__({BLOCK_THREADS})
+void PPU_KERNEL_ENTRY(const __ppu_bfloat16* hidden_states, const int64_t* topk_ids, const float* topk_weights,
+                     __ppu_bfloat16* staged_tokens, int64_t* staged_topk_idx, float* staged_topk_weights,
+                     int num_tokens, int token_blocks, int vector_size) {
+    deep_gemm::mega_moe::w4a16::pre_dispatch_kernel_device<{HIDDEN}, {TOP_K}>(
+        hidden_states, topk_ids, topk_weights, staged_tokens, staged_topk_idx, staged_topk_weights,
+        num_tokens, token_blocks, vector_size);
+}
+)DGMEGA",
+                                      c,
+                                      std::make_tuple(hidden_states.data_ptr(), topk_idx.data_ptr(), topk_weights.data_ptr(),
+                                                      staged_tokens.data_ptr(), staged_topk_idx.data_ptr(),
+                                                      staged_topk_weights.data_ptr(), int32_t(num_tokens),
+                                                      int32_t(token_blocks), int32_t(vector)),
+                                      dim3(token_blocks + route_blocks), c.block_threads);
+}
+
+struct W4A16DispatchGemm1Tag {
+    using Runtime = PPUW4A16MegaMoERuntime;
+};
+inline void w4a16_mega_moe_dispatch_gemm1_kernel(const DispatchConfig& config, const layout::SymBuffer<>& sym_buffer,
+                                        int rank_idx, int num_tokens, const torch::Tensor& rhs,
+                                        const torch::Tensor& rhs_scales, const torch::Tensor& rhs_replicas,
+                                        const torch::Tensor& rhs_replica_scales, int num_master_experts,
+                                        const torch::Tensor& activated, float situ_beta, float situ_linear_beta,
+                                        const std::string& entry) {
+    std::string source = R"DGMEGA(#include <deep_gemm/impls/w4a16_mega_moe_dispatch_gemm1.cuh>
+using namespace deep_gemm;
+static_assert(sizeof(layout::SymBuffer<>) == 528, "MegaMoE symmetric buffer ABI changed");
+constexpr uint32_t NUM_RANKS = {NUM_RANKS};
+constexpr uint32_t NUM_CTAS = {NUM_CTAS};
+constexpr uint32_t NUM_THREADS = {NUM_THREADS};
+constexpr uint32_t NUM_EXPERTS = {NUM_EXPERTS};
+constexpr uint32_t NUM_EXPERTS_PER_RANK = {NUM_EXPERTS_PER_RANK};
+constexpr uint32_t NUM_TOPK = {NUM_TOPK};
+constexpr uint32_t BLOCK_M = {BLOCK_M};
+constexpr uint32_t NMTPR = {NMTPR};
+constexpr uint32_t TOKEN_BYTES = {TOKEN_BYTES};
+constexpr uint32_t SF_BYTES = {SF_BYTES};
+constexpr uint32_t GEMM1_N = {GEMM1_N};
+constexpr uint32_t PULL_SLOTS = {PULL_SLOTS};
+constexpr uint32_t ppu_smem_compute() {
+using Kernel = cutlass::gemm::kernel::W4A16GEMM_MMA<
+    GEMM1_N, TOKEN_BYTES / 2,
+    {W4_BLOCK_M}, {W4_BLOCK_N}, {W4_BLOCK_K}, {W4_WARP_M}, {W4_WARP_N}, {W4_WARP_K},
+    NUM_EXPERTS_PER_RANK, {W4_STAGES}, GemmType::MGroupedNoPad, 1, false, true>;
+uint32_t pull = PULL_SLOTS * (TOKEN_BYTES + SF_BYTES);
+uint32_t counts = NUM_EXPERTS * 4;
+uint32_t w4 = sizeof(typename Kernel::SharedStorage);
+return pull > counts ? (pull > w4 ? pull : w4) : (counts > w4 ? counts : w4);
+}
+extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes = ppu_smem_compute();
+extern "C" __global__ __launch_bounds__(NUM_THREADS, 1)
+void PPU_KERNEL_ENTRY(layout::SymBuffer<> sb, int rank_idx, int num_tokens, uint8_t* rhs, uint8_t* rhs_scales, uint8_t* rhs_replicas, uint8_t* rhs_replica_scales, int num_master_experts, __ppu_bfloat16* activated, float situ_beta, float situ_linear_beta) {
+
+using namespace deep_gemm;
+
+constexpr uint32_t NUM_RANKS = {NUM_RANKS};
+constexpr uint32_t NUM_CTAS = {NUM_CTAS};
+constexpr uint32_t NUM_THREADS = {NUM_THREADS};
+constexpr uint32_t NUM_EXPERTS = {NUM_EXPERTS};
+constexpr uint32_t NUM_EXPERTS_PER_RANK = {NUM_EXPERTS_PER_RANK};
+constexpr uint32_t NUM_TOPK = {NUM_TOPK};
+constexpr uint32_t BLOCK_M = {BLOCK_M};
+constexpr uint32_t NMTPR = {NMTPR};
+constexpr uint32_t TOKEN_BYTES = {TOKEN_BYTES};
+constexpr uint32_t SF_BYTES = {SF_BYTES};
+constexpr uint32_t GEMM1_N = {GEMM1_N};
+
+constexpr uint64_t num_pool = {LAYOUT_NUM_POOL};
+constexpr uint64_t off_ws = 0, off_it = {LAYOUT_OFF_IT};
+constexpr uint64_t off_iti = {LAYOUT_OFF_ITI};
+constexpr uint64_t off_pt = {LAYOUT_OFF_PT};
+
+const int64_t local_base = sb.base;
+auto P = [&](uint64_t off) -> void* {{
+    return (void*)(local_base + (int64_t)off);
+}};
+void* ws_base          = P(off_ws);
+const int64_t* itopk   = (const int64_t*)P(off_iti);
+const uint8_t* itok    = (const uint8_t*)P(off_it);
+uint8_t* ptok          = (uint8_t*)P(off_pt);
+void* gemm2_metadata  = P({LAYOUT_OFF_GEMM2_META});
+
+constexpr int W4_BLOCK_M = {W4_BLOCK_M};
+constexpr int W4_BLOCK_N = {W4_BLOCK_N};
+constexpr int W4_BLOCK_K = {W4_BLOCK_K};
+constexpr int W4_WARP_M = {W4_WARP_M};
+constexpr int W4_WARP_N = {W4_WARP_N};
+constexpr int W4_WARP_K = {W4_WARP_K};
+constexpr int W4_STAGES = {W4_STAGES};
+constexpr uint32_t PULL_SLOTS = {PULL_SLOTS};
+
+mega_moe::w4a16::dispatch_gemm1_device<
+    NUM_RANKS, NUM_CTAS, NUM_THREADS, NUM_EXPERTS,
+    NUM_EXPERTS_PER_RANK, NUM_TOPK, BLOCK_M,
+    PULL_SLOTS, NMTPR,
+    GEMM1_N, TOKEN_BYTES / 2,
+    W4_BLOCK_M, W4_BLOCK_N, W4_BLOCK_K,
+    W4_WARP_M, W4_WARP_N, W4_WARP_K, W4_STAGES,
+    {PULL_CTAS}, {PULL_GROUP_SIZE}>(
+    ws_base, sb, itopk, itok, ptok, gemm2_metadata,
+    (uint32_t)num_tokens, rhs, rhs_scales, rhs_replicas, rhs_replica_scales,
+    (uint32_t)num_master_experts, activated,
+    situ_beta, situ_linear_beta, (uint32_t)num_pool, (int)rank_idx);
+
+}
+)DGMEGA";
+    launch<W4A16DispatchGemm1Tag>(entry, source, config,
+                                  std::make_tuple(sym_buffer, int32_t(rank_idx), int32_t(num_tokens),
+                                                  device_pointer(rhs), device_pointer(rhs_scales),
+                                                  device_pointer(rhs_replicas),
+                                                  device_pointer(rhs_replica_scales), int32_t(num_master_experts),
+                                                  device_pointer(activated), situ_beta, situ_linear_beta),
+                                  dim3(config.num_ctas), config.num_threads, false, /*cooperative=*/true);
 }
 
 struct Fp8ChannelwiseMegaMoeDispatchGemm1Tag {

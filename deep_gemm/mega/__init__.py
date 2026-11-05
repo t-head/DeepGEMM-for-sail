@@ -18,6 +18,21 @@ except Exception as exception:
 from .. import _C
 from ..utils.math import align, ceil_div
 
+__all__ = [
+    "SymmBuffer",
+    "get_symm_buffer_for_mega_moe",
+    "transform_weights_for_mega_moe",
+    "fp4_fp4_mega_moe",
+    "mega_moe_pre_dispatch",
+    "FP8SymmBuffer",
+    "W4A16SymmBuffer",
+    "get_symm_buffer_for_fp8_mega_moe",
+    "get_symm_buffer_for_w4a16_mega_moe",
+    "transform_weights_for_fp8_mega_moe",
+    "transform_weights_for_w4a16_mega_moe",
+    "fp8_fp8_mega_moe",
+    "bf16_fp4_mega_moe",
+]
 
 def _normalize_activation(activation: str) -> str:
     if activation not in ('swiglu', 'swiglu_step', 'situ', 'swiglu_oai'):
@@ -324,12 +339,17 @@ class _RoutedSymmBuffer:
         if torch.cuda.get_device_capability() != (8, 9):
             raise RuntimeError("MegaMoE requires PPU1.5")
         allowed = ("swiglu", "swiglu_oai")
+        if precision == "w4a16":
+            allowed = ("situ",)
         if activation not in allowed:
             raise ValueError(f"unsupported activation for {precision}: {activation}")
         size_args = (group.size(), num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden)
-        total, slices = _C.get_symm_buffer_size_for_fp8_mega_moe(
-            *size_args, precision.removeprefix("fp8_")
-        )
+        if precision == "w4a16":
+            total, slices = _C.get_symm_buffer_size_for_w4a16_mega_moe(*size_args)
+        else:
+            total, slices = _C.get_symm_buffer_size_for_fp8_mega_moe(
+                *size_args, precision.removeprefix("fp8_")
+            )
         self.group, self.num_ranks = group, group.size()
         self.num_experts, self.num_topk = num_experts, num_topk
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -418,6 +438,36 @@ class FP8SymmBuffer(_RoutedSymmBuffer):
         )
 
 
+class W4A16SymmBuffer(_RoutedSymmBuffer):
+    """BF16 dispatch, group-32 MXFP4 weights, fused SiTU and BF16 combine.
+
+    x is BF16 [capacity,H]. x_sf is an empty [capacity,0] view because input
+    activations are not quantized. All ranks participate, including empty ranks.
+    Workspace aliases execute sequentially on one stream, as for SymmBuffer.
+    """
+
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        num_experts: int,
+        num_max_tokens_per_rank: int,
+        num_topk: int,
+        hidden: int,
+        intermediate_hidden: int,
+        activation: str = "situ",
+        base: Optional["W4A16SymmBuffer"] = None,
+    ) -> None:
+        super().__init__(
+            group,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+            "w4a16",
+            activation,
+            base,
+        )
 
 
 def get_symm_buffer_for_fp8_mega_moe(
@@ -435,6 +485,18 @@ def get_symm_buffer_for_fp8_mega_moe(
     )
 
 
+def get_symm_buffer_for_w4a16_mega_moe(
+    group: dist.ProcessGroup,
+    num_experts: int,
+    num_max_tokens_per_rank: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+    activation: str = "situ",
+) -> W4A16SymmBuffer:
+    return W4A16SymmBuffer(
+        group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, activation
+    )
 
 
 def _check_routed_weights(l1_weights, l2_weights, dtype, blockwise=False):
@@ -497,6 +559,27 @@ def transform_weights_for_fp8_mega_moe(
     return (w, s), l2_weights
 
 
+def transform_weights_for_w4a16_mega_moe(
+        l1_weights: Tuple[torch.Tensor, torch.Tensor], l2_weights: Tuple[torch.Tensor, torch.Tensor],
+        activation: str = "situ",
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """Pack canonical MXFP4 weights and UE8M0 scales for BF16 x FP4 SiTU."""
+    if activation != "situ":
+        raise ValueError("W4A16 MegaMoE supports activation='situ' only")
+    _check_routed_weights(l1_weights, l2_weights, torch.uint8)
+
+    def pack_scales(scales):
+        e, n, groups = scales.shape
+        return (
+            scales.reshape(e, n // 64, 8, 8, groups // 2, 2)
+            .permute(0, 1, 4, 3, 2, 5)
+            .contiguous()
+            .reshape(e, n // 64, groups // 2 * 128)
+        )
+
+    w1, s1 = l1_weights
+    w2, s2 = l2_weights
+    return (_interleave_weights(w1), pack_scales(_interleave_weights(s1))), (w2, pack_scales(s2))
 
 
 def _check_routed_buffer(
@@ -550,4 +633,32 @@ def fp8_fp8_mega_moe(
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         sym_buffer.quantization, activation, activation_clamp, fast_math,
         l1_weights_replicas, l2_weights_replicas, swiglu_alpha,
+    )
+
+
+def bf16_fp4_mega_moe(
+    y: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    sym_buffer: W4A16SymmBuffer,
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+    activation: str = "situ",
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+    *,
+    l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
+) -> None:
+    """Complete BF16 x MXFP4 SiTU MoE with BF16 output in original token order."""
+    if not isinstance(sym_buffer, W4A16SymmBuffer):
+        raise TypeError("bf16_fp4_mega_moe requires a W4A16SymmBuffer")
+    _check_routed_buffer(y, l1_weights, sym_buffer, activation)
+    _C.bf16_fp4_mega_moe(
+        y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
+        sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
+        activation, activation_clamp, fast_math, l1_weights_replicas, l2_weights_replicas,
+        situ_beta, situ_linear_beta,
     )

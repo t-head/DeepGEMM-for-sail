@@ -30,6 +30,8 @@ CASES = (
                precision="fp8_channelwise", routing="random", reference_tokens=129),
     MegaMoECase("smoke_blockwise", 512, 256, 8, 2, 129, tokens=(1, 0, 33, 129, 8),
                precision="fp8_blockwise", routing="random", reference_tokens=129),
+    MegaMoECase("smoke_w4a16", 256, 128, 8, 2, 129, tokens=(1, 0, 33, 129, 8),
+               activation="situ", precision="w4a16", routing="random", reference_tokens=129),
     MegaMoECase(
         "minimax_m3",
         6144,
@@ -70,6 +72,32 @@ CASES = (
         precision="fp8_blockwise",
         routing="random",
     ),
+    MegaMoECase(
+        "kimi_k3",
+        3584,
+        3072,
+        896,
+        16,
+        4096,
+        tokens=MODEL_TOKENS,
+        activation="situ",
+        worlds=(8, 16),
+        precision="w4a16",
+        routing="random",
+    ),
+    MegaMoECase(
+        "kimi_k3_decode",
+        3584,
+        3072,
+        896,
+        16,
+        128,
+        tokens=(4, 8, 16, 32, 64, 128),
+        activation="situ",
+        worlds=(32,),
+        precision="w4a16",
+        routing="random",
+    ),
 )
 
 
@@ -106,6 +134,10 @@ def dequantize(q, s, blockwise=False):
 
 
 def make_weights(e, n, k, precision, rng):
+    if precision in ("w4a16", "w4a8"):
+        source = torch.randn((e, n, k), device="cuda", dtype=torch.bfloat16, generator=rng) * 0.05
+        ref, w, s = quant_w4(source, d="w4fa16_mma")
+        return (w, s), ref
     # Quantized weights are fixed before transforming their storage layout.
     w = torch.randint(-8, 9, (e, n, k), device="cuda", generator=rng).to(torch.float8_e4m3fn)
     shape = (e, n // 128, k // 128) if precision == "fp8_blockwise" else (e, n, 1)
@@ -115,8 +147,9 @@ def make_weights(e, n, k, precision, rng):
 
 def reference(c, source, ids, weights, w1, w2, rank, tokens):
     blockwise = c.precision == "fp8_blockwise"
-    q, s = quantize_rows(source, blockwise)
-    source = dequantize(q, s, blockwise)
+    if c.precision != "w4a16":
+        q, s = quantize_rows(source, blockwise)
+        source = dequantize(q, s, blockwise)
     result = torch.zeros((source.size(0), source.size(1), c.hidden), device="cuda", dtype=torch.float32)
     local_experts = c.experts // dist.get_world_size()
     for local_expert in range(local_experts):
@@ -135,8 +168,9 @@ def reference(c, source, ids, weights, w1, w2, rank, tokens):
                 (gate * torch.sigmoid(1.702 * gate)) * (up + 1) if c.activation == "swiglu_oai" else F.silu(gate) * up
             )
         activated = activated.bfloat16()
-        q, s = quantize_rows(activated, blockwise)
-        activated = dequantize(q, s, blockwise)
+        if c.precision != "w4a16":
+            q, s = quantize_rows(activated, blockwise)
+            activated = dequantize(q, s, blockwise)
         output = (activated.float() @ w2[local_expert].float().T).bfloat16().float() * weights[src, row, slot, None]
         result.view(-1, c.hidden).index_add_(0, src * source.size(1) + row, output)
     dist.all_reduce(result)
@@ -151,19 +185,24 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
     e = c.experts // world
     raw1, ref1 = make_weights(e, 2 * c.intermediate, c.hidden, c.precision, rng)
     raw2, ref2 = make_weights(e, c.hidden, c.intermediate, c.precision, rng)
-    quantization = c.precision.removeprefix("fp8_")
-    w1, w2 = dg.transform_weights_for_fp8_mega_moe(raw1, raw2, quantization)
-    buffer = dg.FP8SymmBuffer(
-        group,
-        c.experts,
-        c.capacity,
-        c.topk,
-        c.hidden,
-        c.intermediate,
-        quantization=quantization,
-        activation=c.activation,
-    )
-    entry = dg.fp8_fp8_mega_moe
+    if c.precision == "w4a16":
+        w1, w2 = dg.transform_weights_for_w4a16_mega_moe(raw1, raw2)
+        buffer = dg.W4A16SymmBuffer(group, c.experts, c.capacity, c.topk, c.hidden, c.intermediate)
+        entry = dg.bf16_fp4_mega_moe
+    else:
+        quantization = c.precision.removeprefix("fp8_")
+        w1, w2 = dg.transform_weights_for_fp8_mega_moe(raw1, raw2, quantization)
+        buffer = dg.FP8SymmBuffer(
+            group,
+            c.experts,
+            c.capacity,
+            c.topk,
+            c.hidden,
+            c.intermediate,
+            quantization=quantization,
+            activation=c.activation,
+        )
+        entry = dg.fp8_fp8_mega_moe
     options = dict(activation=c.activation, activation_clamp=c.clamp, fast_math=fast_math)
     if replicas:
         assert e >= 2
@@ -277,6 +316,10 @@ def test_mega_moe_channelwise_quantization_reuse(mega_moe_group):
                      tokens=(4096, 33, 0, 129, 8), reference_tokens=32), mega_moe_group)
 
 
+def test_mega_moe_w4a16_complete_tiles(mega_moe_group):
+    # H=768 cannot use a 512-column scatter tile. The narrow GEMM1 must also
+    # select complete gate/up tiles rather than inherit ordinary GEMM tails.
+    run_case(replace(CASES[2], hidden=768, tokens=(96, 33, 0, 8)), mega_moe_group)
 
 
 

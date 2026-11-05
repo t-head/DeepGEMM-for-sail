@@ -4,6 +4,7 @@
 #include "common_fp4.hpp"
 #include "common_fp8.hpp"
 #include "common_int8.hpp"
+#include "common_w4a16.hpp"
 #include "mega_moe_fp8_w4a16_tuning.hpp"
 #include <algorithm>
 #include <cmath>
@@ -16,6 +17,18 @@ inline int combine_num_threads(int tokens, int hidden) {
     if (tokens >= 512) return 256;
     if (tokens <= 64 && hidden > 4096) return 1024;
     return 512;
+}
+
+using PPUW4ConfigTuple = std::tuple<int, int, int, int, int, int, int, int>;
+inline deep_gemm_w4a16_common::W4A16Config ppu_w4_config(int em, int n, int k,
+                                                         std::optional<PPUW4ConfigTuple> requested) {
+    using namespace deep_gemm_w4a16_common;
+    if (requested) {
+        const auto& [ns, bm, bn, bk, wm, wn, wk, s] = *requested;
+        return {ns, bm, bn, bk, wm, wn, wk, s, 1};
+    }
+    return get_best_configs(em, n, k, 1, get_num_sms(), GemmType::MGroupedNoPad,
+                           W4A16Type::mxfp4_e8m0_mma, /*single_k_warp=*/true, /*full_n_tiles=*/true);
 }
 
 struct DispatchConfig {
@@ -104,6 +117,9 @@ inline TuningConfig tuning_config(const TuningWorkload& workload) {
 inline int threads(int bm, int bn, int wm, int wn) {
     TORCH_CHECK(wm > 0 && wn > 0 && bm % wm == 0 && bn % wn == 0, "Invalid MegaMoE warp tile");
     return bm / wm * (bn / wn) * 32;
+}
+inline PreDispatchConfig w4a16_pre_dispatch_config(int hidden, int topk) {
+    return {256, hidden, get_num_sms(), topk};
 }
 inline int dispatch_pull_slots(int num_launch_threads, int token_bytes, int scale_bytes) {
     // Match the device pull-staging limit; pull and GEMM reuse this storage.
@@ -287,6 +303,43 @@ inline ScatterConfig fp8_blockwise_scatter_config(int n, int k, int groups, int 
     return c;
 }
 
+inline DispatchConfig w4a16_gemm1_config(DispatchConfig c, int n, int expected,
+                                        const Gemm1Tuning& tuning) {
+    c.gemm1_n = n;
+    // Transport padding and the MMA tile have independent purposes. Preserve
+    // the selected compute tile when configuring transport.
+    const auto generic = ppu_w4_config(expected, n, c.token_bytes / 2, std::nullopt);
+    const auto t = tuning.tile.value_or(Tile{generic.block_m, generic.block_n, generic.block_k,
+                                             generic.warp_m, generic.warp_n, generic.num_stages});
+    c.w4_block_m = t[0];
+    c.w4_block_n = t[1];
+    c.w4_block_k = t[2];
+    c.w4_warp_m = t[3];
+    c.w4_warp_n = t[4];
+    c.w4_warp_k = t[2];
+    c.w4_stages = t[5];
+    c.num_threads = threads(c.w4_block_m, c.w4_block_n, c.w4_warp_m, c.w4_warp_n);
+    c.pull_slots = dispatch_pull_slots(c.num_threads, c.token_bytes, c.sf_bytes);
+    const deep_gemm_w4a16_common::W4A16Config mma{
+        c.num_sms, t[0], t[1], t[2], t[3], t[4], t[2], t[5], 1};
+    const int smem = std::max(deep_gemm_w4a16_common::get_smem_config(mma, true, 1, 32),
+                              c.pull_slots * (c.token_bytes + c.sf_bytes));
+    const auto prop = device_runtime->get_prop();
+    // Match ordinary GEMM's eight-CTA occupancy cap. These resource bounds
+    // avoid under-launching small tiles; compiled register use is checked later.
+    const int resident = std::min({8, prop->maxThreadsPerMultiProcessor / c.num_threads,
+                                   int(prop->sharedMemPerMultiprocessor / smem)});
+    TORCH_CHECK(resident > 0, "W4A16 GEMM1 cannot keep a CTA resident");
+    c.num_ctas = c.num_sms * resident;
+    TORCH_CHECK(c.num_ctas > 1, "W4A16 GEMM1 requires pull and compute CTAs");
+    const int pull_groups = std::max(1, c.num_sms / 4);
+    c.pull_ctas = std::clamp(tuning.pull_ctas.value_or(pull_groups), 1, c.num_ctas - 1);
+    // A larger measured pull budget cooperates on each block rather than
+    // increasing the number of independent transport streams.
+    c.pull_group_size = int(ceil_div(c.pull_ctas, pull_groups));
+    return c;
+}
+
 inline std::pair<Config, ScatterConfig>
 channel_scatter_policy(int expected_m, int n, int k, int groups, int masters, int capacity, bool padded,
                        std::optional<Config> requested, std::optional<std::string> kernel_override,
@@ -325,6 +378,22 @@ channel_scatter_policy(int expected_m, int n, int k, int groups, int masters, in
     return {*requested, c};
 }
 
+inline auto w4a16_scatter_config(int em, int n, int k, std::optional<PPUW4ConfigTuple> configs,
+                                 const Gemm2Tuning& tuning = {}) {
+    TORCH_CHECK(n > 0 && n % 256 == 0, "W4A16 scatter requires N divisible by 256");
+    if (!configs && tuning.tile) {
+        const auto& t = *tuning.tile;
+        configs = PPUW4ConfigTuple{get_num_sms(), t[0], t[1], t[2], t[3], t[4], t[2], t[5]};
+    }
+    auto c = ppu_w4_config(em, n, k, configs);
+    TORCH_CHECK(c.block_n > 0 && c.block_n % 256 == 0 && n % c.block_n == 0,
+                "W4A16 scatter requires complete 256-column tiles");
+    const int64_t scratch = int64_t(c.block_m) * (c.block_n / 2 + 4) * sizeof(uint32_t);
+    TORCH_CHECK(std::max<int64_t>(deep_gemm_w4a16_common::get_smem_config(c, true, 1, 32), scratch) <= 256 * 1024,
+                "W4A16 scatter tile exceeds shared memory capacity");
+    return c;
+}
+
 inline int fp8_gemm1_ctas(const DispatchConfig& c, int tokens, int pulls) {
     const int expected = std::max(1, int(ceil_div(int64_t(tokens) * c.num_topk, int64_t(c.num_experts_per_rank))));
     const int64_t jobs = int64_t(c.num_experts_per_rank) * ceil_div(expected, c.gemm1_compute_m) *
@@ -338,6 +407,7 @@ inline int fp8_gemm1_ctas(const DispatchConfig& c, int tokens, int pulls) {
 struct RoutedMoEConfigs {
     DispatchConfig dispatch;
     ScatterConfig scatter;
+    deep_gemm_w4a16_common::W4A16Config w4_scatter{};
 };
 
 inline const RoutedMoEConfigs& get_routed_moe_configs(Precision precision, int ranks, int experts, int topk,
@@ -354,23 +424,32 @@ inline const RoutedMoEConfigs& get_routed_moe_configs(Precision precision, int r
     const int groups = experts / ranks;
     const int expected = std::max(1, int(ceil_div(int64_t(tokens) * topk, int64_t(groups))));
     RoutedMoEConfigs result;
-    const bool blockwise = precision == Precision::FP8Blockwise;
-    auto c = fp8_dispatch_config(ranks, experts, topk, hidden, capacity, std::nullopt, blockwise);
-    c.gemm1_n = 2 * intermediate;
-    c.master_experts = masters;
-    if (blockwise) {
-        fp8_blockwise_gemm1_config(c, tokens, 2 * intermediate, tuning.gemm1);
-        result.scatter =
-            fp8_blockwise_scatter_config(hidden, intermediate, groups, masters, expected, tuning.gemm2);
+    if (precision == Precision::W4A16) {
+        auto c = dispatch_config(ranks, experts, topk, capacity, hidden * 2, 0);
+        c.block_m = tuning.buffer.block_m.value_or(64);
+        // Keep one pull protocol across ranks and workspace reuse. Transport
+        // direction must never depend on a rank-local token count.
+        result.dispatch = w4a16_gemm1_config(c, 2 * intermediate, expected, tuning.gemm1);
+        result.w4_scatter = w4a16_scatter_config(expected, hidden, intermediate, std::nullopt, tuning.gemm2);
     } else {
-        fp8_gemm1_config(c, tokens, tuning.gemm1);
-        result.scatter = channel_scatter_policy(expected, hidden, intermediate, groups,
-                                                masters, capacity, true, std::nullopt, std::nullopt,
-                                                std::nullopt, tuning.gemm2)
-                             .second;
+        const bool blockwise = precision == Precision::FP8Blockwise;
+        auto c = fp8_dispatch_config(ranks, experts, topk, hidden, capacity, std::nullopt, blockwise);
+        c.gemm1_n = 2 * intermediate;
+        c.master_experts = masters;
+        if (blockwise) {
+            fp8_blockwise_gemm1_config(c, tokens, 2 * intermediate, tuning.gemm1);
+            result.scatter =
+                fp8_blockwise_scatter_config(hidden, intermediate, groups, masters, expected, tuning.gemm2);
+        } else {
+            fp8_gemm1_config(c, tokens, tuning.gemm1);
+            result.scatter = channel_scatter_policy(expected, hidden, intermediate, groups,
+                                                    masters, capacity, true, std::nullopt, std::nullopt,
+                                                    std::nullopt, tuning.gemm2)
+                                 .second;
+        }
+        c.num_ctas = fp8_gemm1_ctas(c, tokens, c.pull_ctas);
+        result.dispatch = c;
     }
-    c.num_ctas = fp8_gemm1_ctas(c, tokens, c.pull_ctas);
-    result.dispatch = c;
     if (precision == Precision::FP8Channelwise)
         result.dispatch.pull_group_size = channel_pull_group_size(result.dispatch, expected);
     if (precision == Precision::FP8Channelwise && channel_scatter_uses_worklist(result.scatter))

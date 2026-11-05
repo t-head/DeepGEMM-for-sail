@@ -87,10 +87,11 @@ helpers. Both use the public complete call.
 Other architecture pytest runs skip these tests; CLI use reports an
 unsupported-device error.
 
-`test_mega_moe_precisions.py` exercises FP8 channelwise/blockwise
+`test_mega_moe_precisions.py` exercises FP8 channelwise/blockwise and W4A16
 through their public complete calls. Its case table includes GLM52,
 GLM53 Flash, Qwen3.8 Flash, MiniMax M3 channelwise, next-generation MiniMax
-blockwise.
+blockwise, and Kimi K3 W4A16. Kimi EP8/16 uses prefill tokens
+1024/2048/4096; EP32 uses decode tokens 4/8/16/32/64/128.
 Small distributed cases cover separate replicas, both math modes, OAI/clamp,
 empty ranks, consecutive changing routes, statistics and graph replay.
 The API cases also check malformed weights, odd GEMM1 widths, and explicit
@@ -105,11 +106,11 @@ python -m pytest -q -s --disable-warnings -x tests/test_mega_moe_precisions.py -
 torchrun --standalone --nproc-per-node=2 -m pytest -q -s --disable-warnings -x \
   tests/test_mega_moe_precisions.py -k smoke
 torchrun --standalone --nproc-per-node=8 tests/test_mega_moe_precisions.py \
-  --case glm52 --tokens 1024 2048 4096 --routing random --reference-tokens 8 \
+  --case kimi_k3 --tokens 1024 2048 4096 --routing random --reference-tokens 8 \
   --benchmark --warmup 10 --iterations 100 --repeats 5
 # The same benchmark can be invoked directly; --precision selects its case table.
 torchrun --standalone --nproc-per-node=8 tests/bench_mega_moe.py \
-  --precision w4a16 --case glm52 --tokens 1024 2048 4096 --routing random \
+  --precision w4a16 --case kimi_k3 --tokens 1024 2048 4096 --routing random \
   --reference-tokens 8 --warmup 10 --iterations 100 --repeats 5
 ```
 

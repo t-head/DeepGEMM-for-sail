@@ -479,7 +479,7 @@ def _benchmark_precision_case(case, group, args):
 
 def main(argv=None, *, cases=None):
     precision_parser = argparse.ArgumentParser(add_help=False)
-    precision_parser.add_argument("--precision", choices=('w4a4', 'fp8_channelwise', 'fp8_blockwise'))
+    precision_parser.add_argument("--precision", choices=('w4a4', 'fp8_channelwise', 'fp8_blockwise', 'w4a16'))
     selection, _ = precision_parser.parse_known_args(argv)
     if cases is None:
         if selection.precision and selection.precision != "w4a4":

@@ -469,10 +469,16 @@ Shared experts remain outside the routed pipeline.
 |---|---|---|---|---|
 | FP8 channelwise | `fp8_fp8_mega_moe` | `FP8SymmBuffer` / `get_symm_buffer_for_fp8_mega_moe` | SwiGLU, SwiGLU-OAI | 8 |
 | FP8 blockwise | `fp8_fp8_mega_moe` | same, `quantization="blockwise"` | SwiGLU, SwiGLU-OAI | 64 |
+| BF16 x MXFP4 | `bf16_fp4_mega_moe` | `W4A16SymmBuffer` / `get_symm_buffer_for_w4a16_mega_moe` | SiTU | 32 |
 
 H is divisible by 256 and I by 128. FP8 supports at most 128 physical experts
-per rank. Other capacity, top-k, distinct-route,
-empty-rank, stream-reuse and graph-replay requirements are as above. EP limits
+per rank; W4A16 supports at most 127. Capacity is positive and below 2^24;
+top-k is 1–16 and no larger than the expert count. Valid expert IDs are distinct
+within each token; masked IDs may repeat. All ranks, including empty ranks,
+call in the same order. Reuse each workspace serially on one stream; graph
+replay may update inputs and routes in place without changing shapes. The
+library recycles dispatch counts and applies routing weights exactly once,
+skipping zero-weight or invalid slots before reading combine storage. EP limits
 describe implementation bounds; see the tests for model-specific EP coverage.
 Separate master/replica pairs use the same keyword arguments and physical slot
 ordering as W4A4. Transform each bank separately before use.
@@ -489,24 +495,36 @@ workspace = dg.get_symm_buffer_for_fp8_mega_moe(
 dg.mega_moe_pre_dispatch(x, topk_ids, topk_weights, workspace)
 dg.fp8_fp8_mega_moe(y, l1, l2, workspace, activation="swiglu")
 
+# Raw W4A16 weights are packed MXFP4 with raw group-32 UE8M0 scales.
+l1, l2 = dg.transform_weights_for_w4a16_mega_moe(raw_l1_w4, raw_l2_w4)
+workspace = dg.get_symm_buffer_for_w4a16_mega_moe(
+    group, num_experts=896, num_max_tokens_per_rank=4096,
+    num_topk=16, hidden=3584, intermediate_hidden=3072)
+dg.mega_moe_pre_dispatch(x, topk_ids, topk_weights, workspace)
+dg.bf16_fp4_mega_moe(y, l1, l2, workspace, activation="situ")
 ```
 
 FP8 weights are contiguous E4M3 `[E,N,K]`. Channelwise FP32 scales are
 `[E,N,1]`; blockwise scales are `[E,N/128,K/128]`. The transform interleaves
 GEMM1 gate/up rows in groups of eight or 128 respectively, including their
-scales, without requantization.
+scales, without requantization. W4A16 raw weights/scales have the canonical
+MXFP4 shapes described above; its transform packs the W4A16 scale layout.
 Transformed weights are specific to their backend and must not be interchanged.
 
 FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]` for channelwise
-or `[capacity,H/128]` for blockwise. `mega_moe_pre_dispatch` fills these
-inputs and routes. FP8 also quantizes activated GEMM1 output to E4M3. These backends use BF16 GEMM2 scatter and
+or `[capacity,H/128]` for blockwise. W4A16 `x` is BF16 `[capacity,H]`, and
+`x_sf` is an empty `[capacity,0]` view. `mega_moe_pre_dispatch` fills these
+inputs and routes. FP8 also quantizes activated GEMM1 output to E4M3; W4A16
+keeps BF16 activated output. SiTU is fused into GEMM1 in both fused-dispatch
+and separate-dispatch execution. These backends use BF16 GEMM2 scatter and
 the existing generation barrier/reduce for completion and counter recycling.
 
 The common compute arguments retain their names and meaning. Precision-specific
 entry points omit the MXFP4 `recipe`, since FP8 granularities are selected by
-the workspace. SwiGLU-OAI adds
-keyword-only `swiglu_alpha=1.702`. FP8 clamps match SwiGLU above, including zero and
-`+inf`. `fast_math` selects activation math only.
+the workspace and W4A16 does not quantize activations. SwiGLU-OAI adds
+keyword-only `swiglu_alpha=1.702`; W4A16 retains `situ_beta=4` and
+`situ_linear_beta=25`. FP8 clamps match SwiGLU above, including zero and
+`+inf`; W4A16 SiTU requires no clamp. `fast_math` selects activation math only.
 
 #### Interfaces exposed but not yet implemented
 
