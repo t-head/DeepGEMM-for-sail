@@ -17,7 +17,7 @@ inline constexpr uint32_t kBlockQ = 2;
 inline constexpr uint32_t kNumSparseSlotBits = 16;
 inline constexpr uint32_t kInvalidSparseSlot = (1u << kNumSparseSlotBits) - 1;
 // One KV split is one 128-token KV tile of the sparse main kernel (BLOCK_KV = 128).
-inline constexpr uint32_t kSplitKV = 128;
+inline constexpr uint32_t kPPU0015SplitKV = 128;
 // Eight-warp CTAs leave room for seven resident blocks per CU, including
 // the shared-memory footprint of the three-stage KV pipeline.
 inline constexpr uint32_t kNumWarpsPerCTA = 8;
@@ -128,13 +128,6 @@ constexpr uint32_t get_num_sparse_blocks_bucket(const uint32_t num_max_sparse_bl
     return kNumMaxSparseBlocksBuckets[10];
 }
 
-constexpr uint32_t get_kv_blocks_per_split(const uint32_t sparse_block_kv) {
-    return kSplitKV / sparse_block_kv;
-}
-
-constexpr uint32_t get_num_sparse_kv_split_bytes(const uint32_t sparse_block_kv) {
-    return sizeof(KVSplitHeader) + get_kv_blocks_per_split(sparse_block_kv) * sizeof(KVBlockInfo);
-}
 
 } // namespace sparse_mqa_logits
 } // namespace deep_gemm
