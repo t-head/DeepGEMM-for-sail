@@ -26,6 +26,7 @@
 #include <ppu_include.hpp>
 #include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/batch_gemm_args.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/scheduler/block_info.cuh>
 #include <deep_gemm/tix/utils.cuh>
@@ -875,10 +876,11 @@ struct CollectiveMma<
                     Layout<Shape < Int<ScaleNsPerThread>,_1>>{});
   };
 
-  template <class ProblemShape_MNKL, class BlockCoord_MNKL>
+  template <bool kBatchGemm = false, class ProblemShape_MNKL, class BlockCoord_MNKL, class MainloopParams>
   CUTLASS_DEVICE auto
-  load_init(ProblemShape_MNKL const& problem_shape_MNKL, BlockCoord_MNKL const& blk_coord_mnkl, Params const& params,
-            int M, int offset_m, int64_t offset_b, ElementA const* ptr_A, ElementB const* ptr_B) {
+  load_init(ProblemShape_MNKL const& problem_shape_MNKL, BlockCoord_MNKL const& blk_coord_mnkl, MainloopParams const& params,
+            int M, int offset_m, int64_t offset_b, ElementA const* ptr_A, ElementB const* ptr_B,
+            int batch_idx = 0) {
     auto [_M,N,K,L] = problem_shape_MNKL;
     auto [m_coord, n_coord, _, l_coord] = blk_coord_mnkl;
     // load init A
@@ -892,13 +894,27 @@ struct CollectiveMma<
     Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
 
     // // load init scale A/B
-    Tensor mSFA_mk = make_tensor(make_gmem_ptr(params.ptr_scale_A + offset_m), make_shape(M,1));      // (n,scale_k,l)
+    auto mSFA_mk = [&] {
+      if constexpr (kBatchGemm) {
+        return make_tensor(make_gmem_ptr(params.ptr_scale_A + int64_t(batch_idx) * get<1>(params.stride_scale_A)),
+                           make_shape(M, 1), make_stride(get<0>(params.stride_scale_A), Int<1>{}));
+      } else {
+        return make_tensor(make_gmem_ptr(params.ptr_scale_A + offset_m), make_shape(M, 1));
+      }
+    }();
     auto sfa_shape = make_shape(Int<CTA_M>{}, Int<1>{});
     Tensor gSFA = local_tile(mSFA_mk, sfa_shape, make_coord(m_coord, _));    // (BLK_N, 1, scale_k)
     Tensor iSFA_mk = make_identity_tensor(sfa_shape);
     Tensor cSFA = local_tile(iSFA_mk, sfa_shape, make_coord(m_coord, _));
 
-    Tensor mSFB_nk = make_tensor(make_gmem_ptr(params.ptr_scale_B + offset_b / K), make_shape(N,1));           // (n,scale_k,l)
+    auto mSFB_nk = [&] {
+      if constexpr (kBatchGemm) {
+        return make_tensor(make_gmem_ptr(params.ptr_scale_B + int64_t(batch_idx) * get<1>(params.stride_scale_B)),
+                           make_shape(N, 1), make_stride(get<0>(params.stride_scale_B), Int<1>{}));
+      } else {
+        return make_tensor(make_gmem_ptr(params.ptr_scale_B + offset_b / K), make_shape(N, 1));
+      }
+    }();
     auto sfb_shape = make_shape(Int<CTA_N>{}, Int<1>{});
     Tensor gSFB = local_tile(mSFB_nk, sfb_shape, make_coord(n_coord, _));    // (BLK_N, 1, scale_k)
     Tensor iSFB_nk = make_identity_tensor(sfb_shape);
@@ -1267,7 +1283,9 @@ public:
   using ElementAccumulator = typename CollectiveMainloop::ElementAccumulator;
   using ClusterShape = typename DispatchPolicy::ClusterShape;
   using MainloopArguments = typename CollectiveMainloop::Arguments;
-  using MainloopParams = typename CollectiveMainloop::Params;
+  using MainloopParams = cute::conditional_t<TileScheduler_::GEMM_TYPE == GemmType::Batched,
+      deep_gemm::BatchGemmMainloopArguments<typename CollectiveMainloop::Params>,
+      typename CollectiveMainloop::Params>;
 
   // Epilogue derived types
   using CollectiveEpilogue = CollectiveEpilogue_;
@@ -1465,8 +1483,9 @@ public:
 
       auto offset_m = deep_scheduler.curr_offset_m();
       auto expert_id = deep_scheduler.problem_index();
-      auto offset_a = deep_scheduler.curr_offset_a();
-      auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
+      const auto scale_offset_b = deep_scheduler.curr_offset_b(m_block_idx);
+      const auto offset_a = deep_scheduler.curr_offset_a(get<2>(params.mainloop.dA));
+      const auto offset_b = deep_scheduler.curr_offset_b(m_block_idx, get<2>(params.mainloop.dB));
 
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(
@@ -1481,8 +1500,17 @@ public:
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
 
-      auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
-                                                  M, offset_m, offset_b, ptr_A, ptr_B);
+      auto load_inputs = [&] {
+        if constexpr (TileScheduler::GEMM_TYPE == GemmType::Batched) {
+          return collective_mma.template load_init<true>(
+              problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
+              M, offset_m, scale_offset_b, ptr_A, ptr_B, deep_scheduler.problem_index());
+        } else {
+          return collective_mma.load_init(
+              problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
+              M, offset_m, scale_offset_b, ptr_A, ptr_B);
+        }
+      }();
       // Extract out partitioned A and B.
       Tensor gA = get<0>(load_inputs);
       Tensor gB = get<1>(load_inputs);
@@ -1521,8 +1549,8 @@ public:
 
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
-      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
-      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
+      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dC));
+      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dD));
 
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};

@@ -1,6 +1,7 @@
 import os
 import csv
 import subprocess
+import shlex
 import re
 import traceback
 import functools
@@ -1087,9 +1088,10 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         os.makedirs("./logs")
     total = len(cases)
     for idx, case in enumerate(cases):
+        case_arg = shlex.quote(case)
         print(f'Profiling {idx + 1}/{total} on device{gpu_id}')
         print(f'case name:{case}')
-        log_file = f"./logs/gpu{gpu_id}_{case.replace(' ','').replace(',', '_').replace(':', '_').replace('/','_').replace('.','_')[:100]}.log"
+        log_file = f"./logs/gpu{gpu_id}_{clean_casename(case)[:100]}.log"
         cmd = "rm -f "+ log_file
         run_cmd(cmd)
         # gpu
@@ -1108,7 +1110,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
                 2>&1 | tee {}".format("ncu" if dev == "gpu" else "acu",
                                       "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*'"
                                       if dev == "gpu" else ppu_kernel_name,
-                                      output_name, script, case, log_file)
+                                      output_name, script, case_arg, log_file)
             ret = run_cmd(cmd)
             continue
         else:
@@ -1128,8 +1130,8 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
 
             _acc = "--disable_acc"
             cmd = '{} --clock-control none {} --metrics="{}"  \
-                --page=details python {} --format "{}" {} \
-                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", '--kernel-name regex:gemm*' if dev == "gpu" else ppu_kernel_name, metrics_string, script, case, _acc, log_file)
+                --page=details python {} --format {} {} \
+                2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", '--kernel-name regex:gemm*' if dev == "gpu" else ppu_kernel_name, metrics_string, script, case_arg, _acc, log_file)
 
         ret = run_cmd(cmd)
         result = "Fail"
@@ -1143,7 +1145,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
 
         if _acc_check:
             # check accuracy
-            cmd = "python {} --format {}".format(script, case)
+            cmd = "python {} --format {}".format(script, case_arg)
             ret = run_cmd(cmd)
             if ret.returncode == 0:
                 result = "Pass"
@@ -3090,7 +3092,7 @@ def test_einsum(args) -> None:
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     if expr in ('bhr,hdr->bhd', 'bhr,hdr->hbd'):
         # The two expressions take the same inputs and the same quantization; they differ only in
-        # the output layout, which the C++ side picks via `transposed_out`. `bhd` gets the strided
+        # the output layout, represented by the output view and its strides. `bhd` gets the strided
         # [b, h, d] view, `hbd` the plain packed [h, b, d].
         tensor_device = 'cuda' if get_ref_backend() == "device" else 'cpu'
         x = torch.randn((b, h, r), device=tensor_device, dtype=torch.bfloat16)
