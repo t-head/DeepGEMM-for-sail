@@ -477,7 +477,7 @@ torch::Tensor get_sparse_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_s
         num_q_tokens, num_max_sparse_blocks, sparse_block_kv, sparse_mqa_logits::get_num_sparse_slots());
     auto metadata = torch::empty({num_metadata_bytes},
                                  sparse_kv_block_indices.options().dtype(torch::kUInt8));
-    auto& workspace = sparse_mqa_logits::get_sparse_workspace(metadata.options(), num_q_tokens);
+    const auto& workspace = sparse_mqa_logits::get_sparse_mqa_logits_workspace(metadata.options(), num_q_tokens);
     sparse_mqa_logits::launch_sparse_mqa_logits_metadata(
         metadata, workspace, static_cast<uint32_t>(num_q_tokens), static_cast<uint32_t>(num_kv_tokens),
         static_cast<uint32_t>(num_max_sparse_blocks), static_cast<uint32_t>(sparse_block_kv),
@@ -514,7 +514,7 @@ torch::Tensor get_paged_sparse_mqa_logits_metadata(const torch::Tensor& context_
         /*is_paged=*/true);
     auto metadata = torch::empty({num_metadata_bytes},
                                  sparse_kv_block_indices.options().dtype(torch::kUInt8));
-    auto& workspace = sparse_mqa_logits::get_sparse_workspace(metadata.options(), num_q_tokens);
+    const auto& workspace = sparse_mqa_logits::get_sparse_mqa_logits_workspace(metadata.options(), num_q_tokens);
     sparse_mqa_logits::launch_sparse_mqa_logits_metadata(
         metadata, workspace, static_cast<uint32_t>(num_q_tokens), /*num_kv_tokens=*/1,
         static_cast<uint32_t>(num_max_sparse_blocks), static_cast<uint32_t>(sparse_block_kv),

@@ -35,12 +35,12 @@ class PPUSparseMqaLogitsFP4 {
 public:
     static_assert(cute::is_same_v<ElementQK, uint8_t>, "FP4 sparse MQA logits requires uint8_t ElementQK");
     static_assert(SPARSE_BLOCK_KV == 8 or SPARSE_BLOCK_KV == 16, "Invalid sparse block size");
-    static_assert(BLOCK_KV == deep_gemm::sparse_mqa_logits::kSplitKV, "BLOCK_KV must equal one split");
+    static_assert(BLOCK_KV == deep_gemm::sparse_mqa_logits::kPPU0015SplitKV, "BLOCK_KV must equal one split");
     static_assert(not kIsPaged or (PAGE_KV > 0 and PAGE_KV % SPARSE_BLOCK_KV == 0), "Invalid page shape");
 
     static constexpr int kNumHeads = SML::kNumHeads;            // 32
     static constexpr int kHeadDim = 64;                          // packed (128 / 2)
-    static constexpr int kNumKVBlocksPerSplit = SML::kSplitKV / SPARSE_BLOCK_KV;
+    static constexpr int kNumKVBlocksPerSplit = SML::kPPU0015SplitKV / SPARSE_BLOCK_KV;
 
     static constexpr int BLOCK_M = BLOCK_KV;
     static constexpr int BLOCK_N = BLOCK_QH;
