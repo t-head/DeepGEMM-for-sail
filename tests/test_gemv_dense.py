@@ -13,8 +13,7 @@ Covers:
      env kill switch, and the large-n x large-k tile gate).
   8. m == 2 dual-accumulator variant (two W rows per thread share the x
      loads) across ladder branches, k tails, even-n tails, determinism.
-  9. Odd-N rejection at the API level (bf16_gemm_nt requires even N for
-     float2 packed stores; odd N never reaches the kernel).
+  9. Odd-N GEMV correctness and tile output alignment.
  10. Optional performance comparison GEMV vs tile (--benchmark).
 """
 import argparse
@@ -118,7 +117,7 @@ def run_accuracy(m, n, k, mode='normal') -> float:
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref = x @ w.t()
 
-    deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+    deep_gemm.bf16_gemm_nt(x, w, out)
     torch.cuda.synchronize()
 
     diff = calc_diff(out, ref)
@@ -131,7 +130,7 @@ def run_dispatch_case(m, n, k, expect_gemv):
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref = x @ w.t()
 
-    deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+    deep_gemm.bf16_gemm_nt(x, w, out)
     torch.cuda.synchronize()
 
     diff = calc_diff(out, ref)
@@ -145,7 +144,7 @@ def run_dispatch_case(m, n, k, expect_gemv):
     # that mis-routes shapes would still pass on accuracy alone.
     from torch.profiler import profile, ProfilerActivity
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+        deep_gemm.bf16_gemm_nt(x, w, out)
         torch.cuda.synchronize()
     saw_gemv = any('gemv_dense' in ev.key for ev in prof.key_averages())
     assert saw_gemv == expect_gemv, \
@@ -182,7 +181,6 @@ def test_random_loop() -> None:
     random.seed(0)
     worst = 0.0
     for _ in range(RANDOM_CASES):
-        # bf16_gemm_nt requires even N (float2 packed stores), so sweep even n only.
         n = 2 * random.randint(32, 4096)
         k = 8 * random.randint(1, 1024)
         worst = max(worst, run_accuracy(1, n, k))
@@ -204,7 +202,7 @@ def test_m2_loop() -> None:
     out = torch.empty((2, 512), device='cuda', dtype=torch.bfloat16)
     ref = None
     for i in range(3):
-        deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+        deep_gemm.bf16_gemm_nt(x, w, out)
         torch.cuda.synchronize()
         if ref is None:
             ref = out.clone()
@@ -220,7 +218,7 @@ def test_data_loop() -> None:
     for mode in ('zero_x', 'zero_w'):
         x, w = make_inputs(1, 896, 7168, mode)
         out = torch.empty((1, 896), device='cuda', dtype=torch.bfloat16)
-        deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+        deep_gemm.bf16_gemm_nt(x, w, out)
         torch.cuda.synchronize()
         assert (out == 0).all(), f"zero-input case '{mode}' produced non-zero output"
     print('  zero_x / zero_w: exact zeros  Passed')
@@ -239,7 +237,7 @@ def test_repeat_loop() -> None:
     out = torch.empty((1, 896), device='cuda', dtype=torch.bfloat16)
     ref = None
     for i in range(3):
-        deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+        deep_gemm.bf16_gemm_nt(x, w, out)
         torch.cuda.synchronize()
         if ref is None:
             ref = out.clone()
@@ -249,22 +247,11 @@ def test_repeat_loop() -> None:
     print('Passed\n')
 
 
-def test_odd_n_rejection_loop() -> None:
-    print('Testing odd-N rejection at the API level (even-N contract):')
-    # bf16_gemm_nt rejects odd N with TORCH_CHECK before any kernel launch
-    # (float2 packed stores). These must raise, not silently compute.
+def test_odd_n_loop() -> None:
+    print('Testing odd N GEMV:')
     for m, n, k in [(1, 897, 7168), (1, 101, 7168), (1, 511, 7168),
-                    (2, 897, 7168), (2, 1537, 7168), (1, 2048 + 1, 7168)]:
-        x, w = make_inputs(m, n, k)
-        out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
-        try:
-            deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
-            torch.cuda.synchronize()
-        except RuntimeError as e:
-            assert 'even N' in str(e), f'expected even-N rejection, got: {e}'
-            print(f'  {m}x{n}x{k}: rejected  Passed')
-        else:
-            raise AssertionError(f'odd N={n} was not rejected (m={m}, k={k})')
+                    (2, 897, 7168), (2, 1537, 7168), (1, 2049, 7168)]:
+        run_accuracy(m, n, k)
     print('Passed\n')
 
 
@@ -282,13 +269,45 @@ def run_bypass_cases() -> None:
     print('Passed\n')
 
 
+def test_tile_output_alignment() -> None:
+    print('Testing odd N and output alignment:')
+    configs = (39, 16, 64, 64, 16, 32, 2, (24576, 128, 0))
+    for m, n, k, offset, cfg in [
+        (3, 1, 256, 0, configs), (17, 3, 128, 0, None),
+        (3, 65, 256, 0, None), (17, 127, 256, 0, configs),
+        (3, 66, 256, 1, None), (17, 65, 256, 1, configs),
+        (129, 129, 512, 0, None),
+        (3, 66, 256, 0, None),
+    ]:
+        x, w = make_inputs(m, n, k)
+        sentinel = 12352.0
+        storage = torch.full((m * n + 33,), sentinel, device='cuda', dtype=torch.bfloat16)
+        start = 16 + offset
+        out = storage[start:start + m * n].view(m, n)
+        deep_gemm.bf16_gemm_nt(x, w, out, configs=cfg)
+        torch.cuda.synchronize()
+        assert calc_diff(out, x @ w.t()) < 0.001, (m, n, k, offset)
+        assert (storage[:start] == sentinel).all() and (storage[start + m * n:] == sentinel).all()
+        storage_fp32 = torch.full((m * n + 33,), sentinel, device='cuda', dtype=torch.float32)
+        out_fp32 = storage_fp32[start:start + m * n].view(m, n)
+        deep_gemm.bf16_gemm_nt(x, w, out_fp32, configs=cfg)
+        torch.cuda.synchronize()
+        assert torch.allclose(out_fp32, x.float() @ w.float().t(), atol=0.01, rtol=0.001)
+        assert (storage_fp32[:start] == sentinel).all() and (storage_fp32[start + m * n:] == sentinel).all()
+    for m, k in [(1, 128), (17, 128), (128, 512), (4096, 4096)]:
+        run_accuracy(m, 1, k)
+    run_dispatch_case(17, 1, 128, True)
+    run_dispatch_case(3, 1, 256, False)
+    print('Passed\n')
+
+
 def run_explicit_config_case():
     """Explicit tile configs must bypass the GEMV fast path (tuning escape hatch)."""
     x, w = make_inputs(1, 896, 7168)
     out = torch.empty((1, 896), device='cuda', dtype=torch.bfloat16)
     ref = x @ w.t()
     configs = (39, 16, 64, 64, 16, 32, 2, (24576, 128, 0))
-    deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out, configs=configs)
+    deep_gemm.bf16_gemm_nt(x, w, out, configs=configs)
     torch.cuda.synchronize()
     diff = calc_diff(out, ref)
     assert diff < 0.001, f"explicit-config tile path failed: calc_diff={diff:.6f}"
@@ -301,7 +320,7 @@ def run_env_kill_case():
     ref = x @ w.t()
     os.environ['DG_DISABLE_DENSE_GEMV'] = '1'
     try:
-        deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+        deep_gemm.bf16_gemm_nt(x, w, out)
         torch.cuda.synchronize()
     finally:
         del os.environ['DG_DISABLE_DENSE_GEMV']
@@ -320,13 +339,13 @@ def run_m2_gate_env_case():
     ref = x @ w.t()
     os.environ['DG_DENSE_GEMV_M2_MAX_N'] = '4096'
     try:
-        deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+        deep_gemm.bf16_gemm_nt(x, w, out)
         torch.cuda.synchronize()
         diff = calc_diff(out, ref)
         assert diff < 0.001, f"m=2 gate-override accuracy failed: calc_diff={diff:.6f}"
         from torch.profiler import profile, ProfilerActivity
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+            deep_gemm.bf16_gemm_nt(x, w, out)
             torch.cuda.synchronize()
         saw_gemv = any('gemv_dense' in ev.key for ev in prof.key_averages())
         assert saw_gemv, "DG_DENSE_GEMV_M2_MAX_N failed to lift the m=2 gate"
@@ -342,7 +361,7 @@ def run_benchmark():
         out = torch.empty((1, n), device='cuda', dtype=torch.bfloat16)
 
         def gemv_call():
-            deep_gemm.gemm_bf16_bf16_bf16_nt(x, w, out)
+            deep_gemm.bf16_gemm_nt(x, w, out)
 
         t_gemv = bench_kineto(gemv_call, 'gemv_dense_bf16', suppress_kineto_output=True)
 
@@ -365,7 +384,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Dense GEMV (m == 1 / m == 2) fast-path tests.')
     parser.add_argument('--func', default=None, nargs='*',
-                        choices=['Dispatch', 'Ladder', 'KTail', 'Random', 'M2', 'Data', 'Repeat', 'OddN', 'Bypass'],
+                        choices=['Dispatch', 'Ladder', 'KTail', 'Random', 'M2', 'Data', 'Repeat', 'OddN', 'Bypass', 'TileAlignment'],
                         help='target test funcs (default: all)')
     parser.add_argument('--benchmark', default=False, action='store_true')
     parser.add_argument('--verbose', default=False, action='store_true')
@@ -382,8 +401,9 @@ if __name__ == '__main__':
         'M2': test_m2_loop,
         'Data': test_data_loop,
         'Repeat': test_repeat_loop,
-        'OddN': test_odd_n_rejection_loop,
+        'OddN': test_odd_n_loop,
         'Bypass': run_bypass_cases,
+        'TileAlignment': test_tile_output_alignment,
     }
     for name in (args.func if args.func is not None else funcs):
         funcs[name]()

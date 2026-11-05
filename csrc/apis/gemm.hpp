@@ -104,7 +104,7 @@ void bf16_gemm_nt(const torch::Tensor& a,
     if (early_return(m, n, k, d, c)) return;
     if (n == 1 && !configs.has_value() && model_810e_bf16_n1(a, b, d)) return;
     if (!configs.has_value() && model_810e_dispatch_dense(a, b, d)) return;
-    TORCH_CHECK(n % 2 == 0, "BF16 dense GEMM requires even N, got ", n);
+    TORCH_CHECK(is_ppu1v5_device() || n % 2 == 0, "BF16 dense GEMM on PPU1.0 requires even N, got ", n);
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
         bf16_gemm(a, b, d, m, n, k, configs);
