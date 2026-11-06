@@ -47,6 +47,8 @@ static void register_apis(pybind11::module_& m) {
         .value("W4A16_MXFP4", deep_gemm_preprocess_common::PreprocessMode::W4A16_MXFP4)
         .value("W4A16_MXFP4_MMA", deep_gemm_preprocess_common::PreprocessMode::W4A16_MXFP4_MMA)
         .value("W4A8_MXFP4_MMA", deep_gemm_preprocess_common::PreprocessMode::W4A8_MXFP4_MMA)
+        .value("W4A8_NVFP4", deep_gemm_preprocess_common::PreprocessMode::W4A8_NVFP4)
+        .value("W4A8_NVFP4_FP8", deep_gemm_preprocess_common::PreprocessMode::W4A8_NVFP4_FP8)
         .value("W4A16_INT4", deep_gemm_preprocess_common::PreprocessMode::W4A16_INT4)
         .value("FP8_CHANNEL", deep_gemm_preprocess_common::PreprocessMode::FP8_CHANNEL)
         .value("FP8_BLOCK", deep_gemm_preprocess_common::PreprocessMode::FP8_BLOCK)
