@@ -54,8 +54,8 @@ For masked GEMM, the `test_m_grouped_gemm_masked->test_func:` log line contains 
 
 ## MegaMoE
 
-The single-device suite runs the public-entry smoke tests, including all three
-activations, separate replica weights, invalid inputs and workspace reuse:
+The single-device suite runs the public smoke tests for SwiGLU, SwiGLU-Step
+and SiTU, including invalid inputs and workspace reuse.
 
 ```bash
 python tests/checkin/run_checkin.py --suite ZW-M890P-MegaMoE

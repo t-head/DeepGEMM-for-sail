@@ -224,6 +224,15 @@ m_grouped_fp8_fp4_gemm_nt_contiguous = unimplemented
 m_grouped_fp8_fp4_gemm_nn_contiguous = unimplemented
 m_grouped_fp8_fp4_gemm_nt_masked = unimplemented
 
+# Mega kernels
+from .mega import (
+    SymmBuffer,
+    get_symm_buffer_for_mega_moe,
+    transform_weights_for_mega_moe,
+    fp4_fp4_mega_moe,
+    mega_moe_pre_dispatch,
+)
+
 # Some utils
 from . import testing
 from . import utils
@@ -235,13 +244,3 @@ try:
     from . import legacy
 except Exception as e:
     print(f'Failed to load legacy DeepGEMM Triton kernels: {e}')
-
-
-# Mega kernels
-from .mega import (
-    SymmBuffer,
-    get_symm_buffer_for_mega_moe,
-    transform_weights_for_mega_moe,
-    fp4_fp4_mega_moe,
-    mega_moe_pre_dispatch,
-)

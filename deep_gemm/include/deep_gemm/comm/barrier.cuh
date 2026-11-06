@@ -1,84 +1,119 @@
 #pragma once
 
-// Cross-rank and grid synchronization for MegaMoE using PPU TIX atomics.
-// The `sync_scope` functor performs a block-wide barrier (`__syncthreads()`).
-#include <deep_gemm/tix/sys_atomics.cuh>
-#include <deep_gemm/layout/sym_buffer.cuh>
+#ifndef DG_MEGAMOE_OWNER_MODE
+#define DG_MEGAMOE_OWNER_MODE 0
+#endif
+
+#include <cstdint>
 #include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/sym_buffer.cuh>
+#include <deep_gemm/tix/ld_st.cuh>
 
 namespace deep_gemm::comm {
 
-// Grid-wide barrier across all SMs of one rank, driven by a global counter.
-template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0,
-          uint32_t kPollBackoffCycles = 0, typename sync_scope_t>
-CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
-                              const uint32_t& sm_idx, const uint32_t& thread_idx,
-                              const sync_scope_t& sync_scope) {
-    static constexpr uint32_t kFinishSumTag = 0x80000000u;
-    sync_scope();
+__device__ __forceinline__ void grid_sync(
+        layout::ScatterSignals& workspace,
+        uint32_t num_blocks, uint32_t block_idx, uint32_t thread_idx) {
+    constexpr uint32_t kFinishTag = 0x80000000u;
+    __syncthreads();
     if (thread_idx == 0) {
-        const auto count_ptr = workspace.get_grid_sync_count_ptr<kGridSyncIndex>();
-        const auto old_value = tix::atomic_add_rel(
-            count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
+        auto* counter = reinterpret_cast<uint32_t*>(&workspace.grid_counter);
+        const uint32_t old_value = tix::atomic_add_rel(
+            counter, block_idx == 0 ? kFinishTag - (num_blocks - 1) : 1);
         uint32_t new_value;
-        const uint32_t poll_backoff_cycles =
-            kPollBackoffCycles + ((sm_idx * 37u) & 255u);
         do {
-            new_value = tix::ld_acq(count_ptr);
-            if constexpr (kPollBackoffCycles > 0)
-                __nanosleep(poll_backoff_cycles);
-        } while (((new_value ^ old_value) & kFinishSumTag) == 0);
+            new_value = tix::ld_acq(counter);
+        } while (((new_value ^ old_value) & kFinishTag) == 0);
     }
-    sync_scope();
+    __syncthreads();
 }
 
-// Cross-rank barrier. Only SM 0 participates: every rank signals all
-// remote ranks (release), then spins until its own signal reaches the target
-// (acquire). Wrapped by grid syncs on both sides.
-template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
-CUTLASS_DEVICE void cross_rank_barrier(const layout::Workspace& workspace,
-                                   const layout::SymBuffer<kNumRanks>& sym_buffer,
-                                   const uint32_t& sm_idx, const uint32_t& thread_idx,
-                                   const sync_scope_t& sync_scope,
-                                   const bool& sync_prologue = true,
-                                   const bool& sync_epilogue = true) {
-    DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
+// Acquire every bank before exposing the combined writer mask to the reader.
+// The upper unused bits stay set, so all-bulk remains a single UINT64_MAX test.
+template <uint32_t kWorldSize>
+__device__ __forceinline__ uint64_t fp4_scatter_acquire(
+        const layout::ScatterSignals& workspace, uint32_t status) {
+    static_assert(kWorldSize >= 1 && kWorldSize <= layout::kNumMaxRanks &&
+                  (kWorldSize & (kWorldSize - 1)) == 0, "power-of-two EP through 64 required");
+    const uint32_t phase = status & 1u;
+    const bool negative = (status & 2u) != 0;
+#if DG_MEGAMOE_OWNER_MODE
+    constexpr uint32_t kBanks = (kWorldSize + layout::kScatterRanksPerBank - 1) / layout::kScatterRanksPerBank;
+    constexpr uint32_t kWriters = kWorldSize < layout::kScatterRanksPerBank ? kWorldSize : layout::kScatterRanksPerBank;
+    uint64_t writer_mask = UINT64_MAX;
+    #pragma unroll
+    for (uint32_t bank = 0; bank < kBanks; ++bank) {
+        int32_t observed;
+        do {
+            observed = tix::ld_acq_sys(&workspace.phase_signal[phase][bank]);
+        } while ((observed & 15) != (negative ? 0 : kWriters));
+        constexpr uint32_t kMask = (1u << kWriters) - 1u;
+        const uint64_t disabled = (~(uint32_t(observed) >> 4)) & kMask;
+        writer_mask &= ~(disabled << (bank * layout::kScatterRanksPerBank));
+    }
+    return writer_mask;
+#else
+    while (tix::ld_acq_sys(&workspace.phase_signal[phase][0]) !=
+           (negative ? 0 : static_cast<int32_t>(kWorldSize))) { }
+    return UINT64_MAX;
+#endif
+}
 
-    // Grid sync before cross-rank signaling
-    if (sync_prologue)
-        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+// Release all local P2P stores, then acquire peer completion before reduce.
+template <uint32_t kWorldSize>
+__device__ __forceinline__ void fp4_scatter_release(
+        layout::ScatterSignals& workspace,
+        const layout::SymBuffer<kWorldSize>& sym_buffer,
+        uint32_t num_blocks, uint32_t block_idx, uint32_t thread_idx,
+        bool bulk_writer) {
+    // PPU fences drain only the calling warp; each warp leader releases its stores.
+    // The following grid sync joins these releases before peer notification.
+    __syncwarp();
+    if ((thread_idx & 31u) == 0) {
+        __ppu_threadfence_system_uncache();
+    }
 
-    // Cross-rank barrier, only SM 0 participates
-    if (sm_idx == 0) {
-        auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
-        const auto status = (*counter_ptr) & 3;
-        const auto signal_phase = status & 1, signal_sign = status >> 1;
-        auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
+    grid_sync(
+        workspace, num_blocks, block_idx, thread_idx);
 
-        // Send signals to remote ranks
-        if (thread_idx < kNumRanks)
-            tix::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
-        sync_scope();
+    if (block_idx == 0) {
+        const int32_t status = workspace.phase_counter & 3;
+        const uint32_t phase = status & 1;
+        const bool negative = (status >> 1) != 0;
+#if DG_MEGAMOE_OWNER_MODE
+        static_assert(kWorldSize <= layout::kNumMaxRanks);
+        const uint32_t rank_idx = sym_buffer.rank_idx;
+        const uint32_t bank = rank_idx / layout::kScatterRanksPerBank;
+        const int32_t old_bulk = __ldcg(workspace.writer_previous + phase);
+        const int32_t notification = (negative ? -1 : 1) +
+            (int32_t(bulk_writer) - old_bulk) * (1 << (rank_idx % layout::kScatterRanksPerBank + 4));
+#else
+        constexpr uint32_t bank = 0;
+        const int32_t notification = negative ? -1 : 1;
+#endif
 
-        // Update status and wait arrival (with 180s timeout, at 2 GHz)
-        constexpr int64_t kNumTimeoutCycles = 180ll * 2000000000ll;
+
+        if (thread_idx < kWorldSize) {
+            auto* remote_workspace = sym_buffer.map(&workspace, thread_idx);
+            tix::red_add_rel_sys(
+                &remote_workspace->phase_signal[phase][bank], notification);
+        }
+        __syncthreads();
+
         if (thread_idx == 0) {
-            tix::red_add(counter_ptr, 1u);
-            const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
-            const auto start_clock = clock64();
-            while (tix::ld_acq_sys(signal_ptr) != target) {
-                if (clock64() - start_clock >= kNumTimeoutCycles) {
-                    printf("DeepGEMM cross-rank barrier timeout (180s): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
-                           sym_buffer.rank_idx, *counter_ptr, tix::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
-                    DG_DEVICE_ASSERT(false and "cross-rank barrier timeout");
-                }
-            }
+#if DG_MEGAMOE_OWNER_MODE
+            workspace.writer_previous[phase] = bulk_writer ? 1 : 0;
+#endif
+            tix::red_add(&workspace.phase_counter, 1);
+            fp4_scatter_acquire<kWorldSize>(workspace, status);
         }
     }
 
-    // Grid sync after cross-rank completion
-    if (sync_epilogue)
-        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+    // Multi-node ranks join all CTA leaders after the peer acquire.
+    if constexpr (kWorldSize != 8) {
+        grid_sync(
+            workspace, num_blocks, block_idx, thread_idx);
+    }
 }
 
-} // namespace deep_gemm::comm
+}  // namespace deep_gemm::comm
