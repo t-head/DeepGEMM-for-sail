@@ -75,6 +75,8 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 
 ### Development
 
+Before contributing, read the [DeepGEMM development guidelines](docs/development.md).
+
 ```bash
 # Submodule must be cloned recursively
 git clone --recursive git@github.com:t-head/DeepGEMM-for-sail.git
