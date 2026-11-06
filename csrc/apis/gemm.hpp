@@ -1714,6 +1714,25 @@ static void check_w4fa8_indices(const torch::Tensor& t, const torch::Tensor& a) 
                 "W4FA8 scheduler tensors must be contiguous int32 on the input device");
 }
 
+static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                           const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& out,
+                           std::optional<W4A8ConfigTuple> configs = std::nullopt, float inv_scale = 1.0f) {
+    TORCH_CHECK(b.first.dim() == 2 && b.second.dim() == 2,
+                "dense W4FA8 requires 2D weights and preprocessed scales");
+    const auto grouped_b = std::make_pair(b.first.unsqueeze(0), b.second.unsqueeze(0));
+    check_w4fa8_operands(a, grouped_b, out, GemmType::MGroupedNoPad);
+    TORCH_CHECK(std::isfinite(inv_scale) && inv_scale > 0.f, "inv_scale must be finite and positive");
+    const int m = a.first.size(0), n = b.first.size(0), k = a.first.size(1);
+    if (!m)
+        return;
+    const auto tile = configs ? deep_gemm::w4fa8::unpack_config(*configs)
+                              : deep_gemm::w4fa8::get_best_configs(m, n, k, 1, GemmType::MGroupedNoPad);
+    const auto plan = deep_gemm::w4fa8::resolve_config(tile, m, n, k, 1, GemmType::MGroupedNoPad);
+    const auto rows = at::full({1}, m, a.first.options().dtype(torch::kInt32));
+    deep_gemm::w4fa8::execute_plan(plan, a.first, a.second, grouped_b.first, grouped_b.second, out, rows,
+                                 GemmType::MGroupedNoPad, m, inv_scale);
+}
+
 static void m_grouped_gemm_fp8_fp4_bf16_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& a,
                                       const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& out,
                                       const torch::Tensor& indices, std::optional<torch::Tensor> rows = std::nullopt,
@@ -1967,6 +1986,8 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
           py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt,
           py::arg("out_scale") = std::nullopt, py::arg("swiglu_limit") = std::nullopt, py::arg("configs") = std::nullopt,
           py::arg("activation_type") = std::nullopt);
+    m.def("fp8_fp4_gemm_nt", &fp8_fp4_gemm_nt, py::arg("lhs"), py::arg("rhs"), py::arg("out"),
+          py::arg("configs") = std::nullopt, py::arg("inv_scale") = 1.0f);
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_nopad",&m_grouped_gemm_fp8_fp4_bf16_nt_nopad,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_indices"),py::arg("m_rows")=std::nullopt,py::arg("configs")=std::nullopt,py::arg("inv_scale")=1.0f);
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_masked",&m_grouped_gemm_fp8_fp4_bf16_nt_masked,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("masked_m"),py::arg("expected_m"),py::arg("configs")=std::nullopt,py::arg("inv_scale")=1.0f);
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_fused",&m_grouped_gemm_fp8_fp4_bf16_nt_fused,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_rows"),py::arg("expert_ids_and_cumsum"),py::arg("sorted_token_ids"),py::arg("aligned_num_m_blocks"),py::arg("configs"),py::arg("inv_scale")=1.0f);

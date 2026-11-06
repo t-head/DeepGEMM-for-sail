@@ -275,7 +275,7 @@ def test_boundaries():
     else:
         raise AssertionError('accepted invalid activation scale shape')
     # Scale-only preparation derives alignment from [E,N,K/32] before reducing exponents.
-    for bad in (None, scale.float(), scale[0], scale[:, :63], scale[..., :3],
+    for bad in (None, scale.float(), scale[0, 0], scale[:, :63], scale[..., :3],
                 scale[:0], scale[:, :0], scale[..., :0]):
         try:
             deep_gemm.preprocess_weights_and_scales(
@@ -771,6 +771,124 @@ def test_explicit_execution_configs():
     print('PASS explicit native tiles and invalid configurations')
 
 
+def test_dense_gemm():
+    sms = deep_gemm.get_num_sms()
+    for m, n, k in ((0, 64, 128), (17, 192, 512), (1031, 4160, 1024)):
+        packed = torch.randint(256, (n, k // 2), device='cuda', dtype=torch.uint8)
+        raw = torch.randint(109, 125, (n, k // 32), device='cuda', dtype=torch.uint8)
+        raw[0, 0] = 109
+        rhs = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+        grouped = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed[None], raw[None])
+        scale_only = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, weight_scale=raw)
+        assert torch.equal(rhs[0], grouped[0][0]) and torch.equal(rhs[1], grouped[1][0])
+        assert rhs[2] == grouped[2] == scale_only[2] == .03125
+        assert scale_only[0] is None and torch.equal(scale_only[1], rhs[1])
+        lhs = quant_activation(torch.randn(m, k, device='cuda', dtype=torch.bfloat16))
+        backing = torch.full((m + 16, n), -123., device='cuda', dtype=torch.bfloat16)
+        output = backing[:m]
+        def call(inverse):
+            deep_gemm.fp8_fp4_gemm_nt(lhs, rhs[:2], output, inv_scale=inverse)
+        call(rhs[2])
+        if not m:
+            assert bool((backing == -123.).all())
+            continue
+        def reference():
+            a = lhs[0].float() * lhs[1]
+            return (a @ decode_weight(packed, raw).T).bfloat16()
+        expected = reference()
+        assert calc_diff(output, expected) < .0015
+        assert bool((backing[m:] == -123.).all())
+        bn = 256 if n >= 256 else 128 if n >= 128 else 64
+        explicit = torch.empty_like(output)
+        config = (sms, 64, bn, 128, 64, 64, 128, 2, 1)
+        deep_gemm.gemm_fp8_fp4_bf16_nt(lhs, rhs[:2], explicit, config, inv_scale=rhs[2])
+        assert calc_diff(explicit, expected) < .0015
+        for inverse in (0., -1., float('inf'), float('nan')):
+            try:
+                call(inverse)
+            except RuntimeError as error:
+                assert 'inv_scale must be finite and positive' in str(error)
+            else:
+                raise AssertionError(f'accepted dense {inverse=}')
+        if m == 1031:
+            graph, _ = _capture_prepared(call, output, inverse=rhs[2])
+            assert calc_diff(output, expected) < .0015
+            packed.bitwise_xor_(0x88)
+            changed = deep_gemm.preprocess_weights_and_scales(
+                deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+            rhs[0].copy_(changed[0])
+            rhs[1].copy_(changed[1])
+            lhs[1].mul_(-.5)
+            output.fill_(float('nan'))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert calc_diff(output, reference()) < .0015
+        try:
+            deep_gemm.fp8_fp4_gemm_nt(lhs, grouped[:2], output)
+        except RuntimeError as error:
+            assert '2D weights' in str(error)
+        else:
+            raise AssertionError('dense API accepted grouped weights')
+    print('PASS dense W4FA8: preprocessing, fallback, streamed execution and live graph inputs')
+
+
+def test_small_group_streamed():
+    sms, n, k = deep_gemm.get_num_sms(), 4096, 1024
+    for groups in range(1, 8):
+        counts = [1024] if groups == 1 else [0, 2049] + [1024] * (groups - 2)
+        lhs, rhs, output, call, reference, packed, raw, rows, indices = _w4a8_nopad_problem(
+            counts, n, k, True)
+        expected = reference()
+        call()
+        assert calc_diff(output, expected) < .003
+        native = torch.empty_like(output)
+        config = (sms, 64, 256, 128, 64, 64, 128, 2, 1)
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(lhs, rhs[:2], native, indices, rows, config)
+        assert calc_diff(native, expected) < .003
+        # The public aligner exposes the same automatic configuration used by
+        # NoPad. Sorted, top-1 routes also make its fused result directly comparable.
+        routes = indices.reshape(-1, 1)
+        selected, fused_rows, experts, tokens, aligned, _, _ = deep_gemm.moe_align_block_size(
+            lhs[0], rhs[0], routes)
+        assert selected == (sms, 256, 256, 128, 64, 64, 128, 4, 1), (groups, selected)
+        fused = torch.empty_like(output)
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+            lhs, rhs[:2], fused, fused_rows, experts, tokens, aligned, selected)
+        assert calc_diff(fused, expected) < .003
+        if groups in (1, 3, 7):
+            def scaled(inverse):
+                deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+                    lhs, rhs[:2], output, indices, rows, inv_scale=inverse)
+            graph, _ = _capture_prepared(scaled, output, rows)
+            assert calc_diff(output, expected * .3) < .003
+            counts[:] = counts[1:] + counts[:1]
+            rows.copy_(torch.tensor(counts, device='cuda', dtype=torch.int32))
+            indices.copy_(torch.repeat_interleave(torch.arange(groups, device='cuda', dtype=torch.int32), rows.long()))
+            packed.bitwise_xor_(0x88)
+            changed = deep_gemm.preprocess_weights_and_scales(
+                deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+            rhs[0].copy_(changed[0])
+            rhs[1].copy_(changed[1])
+            lhs[1].mul_(-.5)
+            output.fill_(float('nan'))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert calc_diff(output, reference() * .3) < .003
+        print(f'PASS automatic streamed {groups=}: empty experts, native reference and fused routing')
+    admission = [(513, 25600, 16384, False), (1024, 25600, 16384, True)]
+    if sms > 16:
+        admission.append((1024, 1024, 1024, False))
+    for m, n, k, streamed in admission:
+        a = torch.empty(m, k, device='cuda', dtype=torch.float8_e4m3fn)
+        b = torch.empty(1, n, k // 2, device='cuda', dtype=torch.uint8)
+        routes = torch.zeros(m, 1, device='cuda', dtype=torch.int32)
+        selected, *_ = deep_gemm.moe_align_block_size(a, b, routes)
+        assert (selected[1] == 256) == streamed, (m, n, k, selected)
+
+
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -780,6 +898,8 @@ if __name__ == '__main__':
     utils.set_benchmark(False)
 
     if is_ppu1v5_device():
+        test_dense_gemm()
+        test_small_group_streamed()
         test_execution_paths()
         test_explicit_execution_configs()
         test_routing_layout_block_m()
