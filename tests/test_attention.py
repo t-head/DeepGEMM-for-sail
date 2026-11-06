@@ -6,6 +6,9 @@ from utils import test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits
 from utils import is_ppu1v5_device
 
 def test_ks_ke(check_accuracy=True):
+    if is_ppu1v5_device():
+        print('Skipping INT8 numeric test: M890 does not support INT8 indexer')
+        return
     # Single INT8 case: seq_len_q=1 with ks != 0, manually constructed (not via test_mqa_logits).
     # Verifies the kernel correctly offsets into KV when the valid window does not start at 0.
     # Only q[0, 0, 0]=1 and k[4, 0]=5 are non-zero, so logits[0, 4] = relu(1*5) * 1 * 1 = 5.
@@ -34,6 +37,9 @@ def test_ks_ke(check_accuracy=True):
 
 
 def test_per_layer_cache_view(check_accuracy=True):
+    if is_ppu1v5_device():
+        print('Skipping INT8 cache-view test: M890 does not support INT8 indexer')
+        return
     num_kv_blocks, block_kv, num_heads, head_dim = 8, 64, 32, 128
     num_layers = 4
     max_context_len = num_kv_blocks * block_kv
@@ -52,12 +58,12 @@ def test_per_layer_cache_view(check_accuracy=True):
     context_lens = torch.full((1, 1), max_context_len, dtype=torch.int32, device='cuda')
     schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
         context_lens, block_kv, deep_gemm.get_num_sms(),
-        metadata_extra=(1, num_heads, head_dim, 1))
+        metadata_extra=(1, num_heads, head_dim, torch.int8))
 
     def check(fused_kv_cache):
         logits = deep_gemm.int8_paged_mqa_logits(
             q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
-            max_context_len, clean_logits=False, logits_dtype=torch.float32)
+            max_context_len, clean_logits=False)
         if check_accuracy:
             valid = int((((logits.float().cpu()[0] / (head_dim * v * s)) - 1).abs() < 0.005).sum())
             assert valid == max_context_len
@@ -77,11 +83,10 @@ def test_per_layer_cache_view(check_accuracy=True):
 
 
 
+
 def test_mqa_logits_loop():
     print('Testing MQA Logits:')
-    data_types = ['int8']
-    if is_ppu1v5_device():
-        data_types.extend(['fp8', 'fp4'])
+    data_types = ['fp8', 'fp4'] if is_ppu1v5_device() else ['int8']
     for data_type in data_types:
         for seq_len in (2048, 4096):
             for num_heads, head_dim in [(32, 128), (64, 128)]:
@@ -92,15 +97,16 @@ def test_mqa_logits_loop():
                     case = f'MqaLogits,data_type:{data_type},seq_len_q:{seq_len},seq_len_kv:{seq_len_kv},num_heads:{num_heads},head_dim:{head_dim}'
                     set_acc_check(do_check)
                     test_mqa_logits(parse_deepgemm_string_re(case))
-                    if do_check:
-                        test_mqa_logits(parse_deepgemm_string_re(case + ',logits_dtype:bf16'))
+                    if do_check and data_type == 'int8':
+                        test_mqa_logits(parse_deepgemm_string_re(case + ',weights_dtype:bf16'))
     cases = [
-        # BF16, compressed logits, and BF16 weights/logits.
-        'MqaLogits,data_type:bf16,seq_len_q:8191,seq_len_kv:8191,num_heads:64,head_dim:128',
+        # Compressed logits and optional BF16 INT8 output.
         'MqaLogits,data_type:int8,seq_len_q:4096,seq_len_kv:8192,num_heads:64,head_dim:128,compressed_logits:1',
-        'MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,logits_dtype:bf16,weights_dtype:bf16',
+        'MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,weights_dtype:bf16',
     ]
     for case in cases:
+        if is_ppu1v5_device() and 'data_type:int8' in case:
+            continue
         set_acc_check(True)
         test_mqa_logits(parse_deepgemm_string_re(case))
     print("Passed\n")
@@ -108,14 +114,10 @@ def test_mqa_logits_loop():
 
 def test_paged_mqa_logits_loop():
     print('Testing Paged MQA Logits:')
-    data_types = ['int8']
-    if is_ppu1v5_device():
-        data_types.extend(['fp8', 'fp4'])
+    data_types = ['fp8', 'fp4'] if is_ppu1v5_device() else ['int8']
     for data_type in data_types:
-        for batch_size, next_n in [(1, 1), (64, 1), (64, 2), (128, 1)]:
+        for batch_size, next_n in [(1, 1), (64, 1), (128, 1)]:
             for num_heads, head_dim in [(32, 128), (64, 128)]:
-                if next_n == 2 and num_heads == 32:
-                    continue
                 if data_type == 'fp4' and num_heads != 64:
                     continue
                 for avg_kv in (8192, 32768):
@@ -123,25 +125,27 @@ def test_paged_mqa_logits_loop():
                     case = f'PagedMqaLogits,data_type:{data_type},batch_size:{batch_size},next_n:{next_n},avg_context_len:{avg_kv},num_heads:{num_heads},head_dim:{head_dim}'
                     set_acc_check(do_check)
                     test_paged_mqa_logits(parse_deepgemm_string_re(case))
-                    if do_check:
-                        test_paged_mqa_logits(parse_deepgemm_string_re(case + ',logits_dtype:bf16'))
+                    if do_check and data_type == 'int8':
+                        test_paged_mqa_logits(parse_deepgemm_string_re(case + ',weights_dtype:bf16'))
     cases = [
-        # Empty contexts, a large batch, BF16 weights/logits, and multiple next tokens.
+        # Empty contexts and optional BF16 INT8 logits.
         'PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:32',
         'PagedMqaLogits,data_type:int8,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1]',
-        'PagedMqaLogits,data_type:bf16,batch_size:1119,next_n:1,num_heads:64,head_dim:128,avg_context_len:1087,page_kv:128',
-        'PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,logits_dtype:bf16,weights_dtype:bf16',
-        'PagedMqaLogits,data_type:int8,batch_size:64,next_n:4,num_heads:64,head_dim:128,avg_context_len:8192',
+        'PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,weights_dtype:bf16',
+        'PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192',
     ]
     if is_ppu1v5_device():
-        cases.append('PagedMqaLogits,data_type:fp4,batch_size:64,next_n:6,num_heads:64,head_dim:128,avg_context_len:8192,logits_dtype:bf16')
+        cases.append('PagedMqaLogits,data_type:fp4,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192')
     for case in cases:
+        if is_ppu1v5_device() and 'data_type:int8' in case:
+            continue
         set_acc_check(True)
         test_paged_mqa_logits(parse_deepgemm_string_re(case))
-    # CUDA graph replay with changing context lengths.
-    case = 'PagedMqaLogits,data_type:int8,batch_size:8,next_n:1,num_heads:32,head_dim:128,pre_distribution:[4090,0,1,0,1],distribution:[4090,0,1,0,1,100,200,300]'
-    set_acc_check(False)
-    test_paged_mqa_logits(parse_deepgemm_string_re(case))
+    if not is_ppu1v5_device():
+        # CUDA graph replay with changing context lengths.
+        case = 'PagedMqaLogits,data_type:int8,batch_size:8,next_n:1,num_heads:32,head_dim:128,pre_distribution:[4090,0,1,0,1],distribution:[4090,0,1,0,1,100,200,300]'
+        set_acc_check(False)
+        test_paged_mqa_logits(parse_deepgemm_string_re(case))
     print("Passed\n")
 
 
@@ -152,9 +156,9 @@ def test_mqa_avg_logits_loop():
     print('Testing Avg MQA Logits:')
     # Prefill covers all q_scale modes, both output dtypes, and an odd Q tail.
     prefill_cases = [
-        'MqaAvgLogits,data_type:fp8,seq_len_q:129,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32',
-        'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16',
-        'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:2,logits_dtype:fp32',
+        'MqaAvgLogits,data_type:fp8,seq_len_q:129,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32,compressed_logits:1',
+        'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16,compressed_logits:1',
+        'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:2,logits_dtype:fp32,compressed_logits:1',
     ]
     # FP4 AVG requires compressed output. Keep Q/K tails, packed SFA
     # groups, and active/fallback balancing. On 39 CUs, Q4096/KV4096 uses
@@ -192,14 +196,19 @@ def test_mqa_avg_logits_loop():
     for case in paged_cases:
         print(case)
         test_paged_mqa_logits(parse_deepgemm_string_re(case))
-    # Non-paged FP4 AVG still requires compressed output.
-    case = 'MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:0,logits_dtype:bf16'
+    # Call directly: the shared AVG helper always enables compressed output.
+    q = (torch.zeros((1, 4, 64), device='cuda', dtype=torch.int8),
+         torch.zeros((1, 4), device='cuda', dtype=torch.int32))
+    kv = (torch.zeros((1, 64), device='cuda', dtype=torch.int8),
+          torch.zeros((1,), device='cuda', dtype=torch.int32))
+    ks = torch.zeros((1,), device='cuda', dtype=torch.int32)
+    ke = torch.ones((1,), device='cuda', dtype=torch.int32)
     try:
-        test_mqa_logits(parse_deepgemm_string_re(case))
+        deep_gemm.fp8_fp4_mqa_avg_logits(q, kv, ks, ke, max_seqlen_k=0)
     except RuntimeError as exc:
-        assert 'FP4 AVG requires compressed logits' in str(exc), str(exc)
+        assert 'AVG requires max_seqlen_k > 0' in str(exc), str(exc)
     else:
-        raise AssertionError(f'Expected compressed-output API rejection: {case}')
+        raise AssertionError('AVG must reject max_seqlen_k=0')
     print("Passed\n")
 
 
@@ -393,14 +402,14 @@ def test_sparse_workspace():
     print("PASS: cold capture rejected; warmup then capture/replay succeeds", flush=True)
 
 
-
 def test_nvtx():
     print('Testing nvtx dump:')
     import torch.cuda.nvtx as nvtx
+    data_type = 'fp8' if is_ppu1v5_device() else 'int8'
     nvtx.range_push("paged_mqa_logits")
     for batch_size in (1, 64):
         for num_heads in (32, 64):
-            case = f'PagedMqaLogits,data_type:int8,batch_size:{batch_size},next_n:1,avg_context_len:8192,num_heads:{num_heads},head_dim:128'
+            case = f'PagedMqaLogits,data_type:{data_type},batch_size:{batch_size},next_n:1,avg_context_len:8192,num_heads:{num_heads},head_dim:128'
             set_acc_check(False)
             test_paged_mqa_logits(parse_deepgemm_string_re(case))
     nvtx.range_pop()

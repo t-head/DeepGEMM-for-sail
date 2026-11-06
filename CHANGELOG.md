@@ -54,6 +54,33 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
     and forwards it automatically; public Python callers need no additional
     argument.
   - Extends the supported top-k range from 1–16 to 1–32.
+- **Indexer API contracts**: separates legacy FP8/INT8 from MXFP4 weighted
+  entry points and removes BF16 Q/K APIs. Legacy FP8 fixes weights/logits to
+  FP32; INT8 infers BF16 or FP32 logits from weights dtype and no longer
+  accepts `logits_dtype`. New weighted MXFP4 APIs fix weights/logits to BF16,
+  omit `clean_logits` / `logits_dtype`, and require compressed non-paged
+  output. Weighted paged APIs require `next_n=1`; legacy FP8/INT8 reject
+  non-None request indices, while MXFP4 requires them.
+- **AVG indexer API**: removes `clean_logits`, makes non-paged
+  `max_seqlen_k` mandatory and positive, and defaults all AVG logits to BF16
+  with optional FP32 output. Paged AVG retains `next_n=1–6` and places
+  `logits_dtype` after `indices`. `fp8_fp4_paged_mqa_avg_logits` accepts only
+  MXFP4; ordinary FP8 uses `fp8_paged_mqa_avg_logits`.
+- **Paged indexer metadata dtype**: changes `metadata_extra` to
+  `(next_n, num_heads, logical_head_dim, qk_dtype)`. `torch.int8` denotes
+  MXFP4 on M890 and INT8 on 810E; M890 rejects true INT8 indexer APIs.
+  MXFP4 callers now pass logical D128 instead of packed D64.
+- **Indexer shape contracts**: rejects unsupported dimensions and head counts
+  before dispatch. FP8/INT8 require logical D64/D128; MXFP4 requires D128.
+  DSA requires H32/H64, AVG H4, and sparse H32. Adds D64 check-in coverage.
+- **Indexer metadata and output layout**: provides a compatibility
+  `get_mqa_logits_metadata` stub returning None; dense MXFP4 ignores
+  `schedule_meta`. Sparse logits expose only logical candidate columns,
+  retaining aligned physical row strides. Legacy `clean_logits` defaults
+  to False and rejects True; invalid output positions remain unspecified.
+  See the [indexer API guide](docs/api/indexer.md) for complete signatures,
+  migration requirements, paged `metadata_extra` settings and recommended
+  810E INT8/BF16 and M890 MXFP4/BF16 integration.
 
 - **M890 W4FA8 execution**: expands native tile coverage, unifies automatic
   tile selection, and overlaps streamed weight decoding with FP8 GEMM for
