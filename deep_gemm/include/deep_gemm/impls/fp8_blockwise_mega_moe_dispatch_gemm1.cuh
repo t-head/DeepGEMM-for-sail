@@ -94,11 +94,10 @@ __device__ __forceinline__ void swiglu_quant_epilogue(
                 }
                 if constexpr (kSwigluOai) {
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 150
-                    // Use the native PPU reciprocal for the sigmoid denominator.
-                    // Gate/up and activation retain their BF16 rounding boundaries.
+                    // Honor fast_math without changing the BF16 rounding boundaries.
                     activated = make_float2(
-                        (g.x * __ppu_rcpf(1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-swiglu_alpha * g.x))) * (u.x + 1.0f),
-                        (g.y * __ppu_rcpf(1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-swiglu_alpha * g.y))) * (u.y + 1.0f));
+                        (g.x * deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-swiglu_alpha * g.x))) * (u.x + 1.0f),
+                        (g.y * deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-swiglu_alpha * g.y))) * (u.y + 1.0f));
 #else
                     activated = make_float2(
                         (g.x / (1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-swiglu_alpha * g.x))) * (u.x + 1.0f),

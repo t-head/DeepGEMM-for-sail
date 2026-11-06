@@ -154,7 +154,7 @@ def make_weights(e, n, k, precision, rng):
     return (w, s), dequantize(w, s, precision == "fp8_blockwise")
 
 
-def reference(c, source, ids, weights, w1, w2, rank, tokens):
+def reference(c, source, ids, weights, w1, w2, rank, tokens, *, situ_beta=4.0, situ_linear_beta=25.0):
     blockwise = c.precision == "fp8_blockwise"
     if c.precision != "w4a16":
         q, s = quantize_rows(source, blockwise)
@@ -168,7 +168,8 @@ def reference(c, source, ids, weights, w1, w2, rank, tokens):
             continue
         gate, up = (source[src, row].float() @ w1[local_expert].float().T).bfloat16().float().chunk(2, -1)
         if c.activation == "situ":
-            activated = 4 * torch.tanh(gate / 4) * torch.sigmoid(gate) * 25 * torch.tanh(up / 25)
+            activated = (situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+                         * situ_linear_beta * torch.tanh(up / situ_linear_beta))
         else:
             if c.clamp is not None:
                 gate = gate.clamp(max=c.clamp)
@@ -368,10 +369,53 @@ def test_mega_moe_w4a8_complete_tiles(mega_moe_group):
                          tokens=(1, 33, 0, 129, 8)), mega_moe_group)
 
 
+def test_mega_moe_w4a8_activation_reuse(mega_moe_group):
+    # Keep geometry and weights fixed so only source-specialized activation
+    # parameters distinguish the generated kernels within this process.
+    case = next(c for c in SMOKE_CASES if c.name == "smoke_w4a8_situ")
+    rng = torch.Generator(device="cuda").manual_seed(20261106 + mega_moe_group.rank())
+    pipeline = make_pipeline(case, mega_moe_group, rng, fast_math=False)
+    swiglu_buffer = dg.W4A8SymmBuffer(mega_moe_group, case.experts, case.capacity, case.topk,
+                                     case.hidden, case.intermediate, activation="swiglu")
+    source = torch.randn(33, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .5
+    ids = _make_routes(case, source.size(0), rng)
+    weights = torch.rand(33, case.topk, device="cuda", generator=rng).softmax(-1)
+    y = torch.empty_like(source)
+    try:
+        all_source, all_ids, all_weights = _all_gather(source), _all_gather(ids), _all_gather(weights)
+        for activation, beta, linear_beta in (("situ", 4., 25.), ("situ", .25, 25.),
+                                               ("situ", .25, .25), ("swiglu", 4., 25.),
+                                               ("situ", 4., 25.)):
+            buffer = swiglu_buffer if activation == "swiglu" else pipeline.buffer
+
+            def forward():
+                dg.mega_moe_pre_dispatch(source, ids, weights, buffer)
+                pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, buffer,
+                               activation=activation, fast_math=False,
+                               situ_beta=beta, situ_linear_beta=linear_beta)
+
+            forward()
+            expected = reference(replace(case, activation=activation), all_source, all_ids, all_weights,
+                                 pipeline.ref1, pipeline.ref2, mega_moe_group.rank(), source.size(0),
+                                 situ_beta=beta, situ_linear_beta=linear_beta)
+            check_output(y, expected, .0015)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                forward()
+            graph.replay()
+            torch.cuda.synchronize()
+            check_output(y, expected, .0015)
+    finally:
+        swiglu_buffer.destroy()
+        pipeline.buffer.destroy()
+
+
 @pytest.mark.parametrize("case", tuple(c for c in SMOKE_CASES if c.precision != "w4a16"), ids=lambda c: c.name)
 @pytest.mark.parametrize("clamp", (0.0, 0.125))
-def test_mega_moe_fp8_oai(case, clamp, mega_moe_group):
-    run_case(replace(case, tokens=(1, 33), activation="swiglu_oai", clamp=clamp), mega_moe_group)
+@pytest.mark.parametrize("fast_math", (True, False))
+def test_mega_moe_fp8_oai(case, clamp, fast_math, mega_moe_group):
+    run_case(replace(case, tokens=(1, 33), activation="swiglu_oai", clamp=clamp),
+             mega_moe_group, fast_math=fast_math)
 
 
 @pytest.mark.parametrize("case", SMOKE_CASES, ids=lambda c: c.name)

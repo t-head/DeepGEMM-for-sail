@@ -118,6 +118,11 @@ void PPU_KERNEL_ENTRY(const cutlass::float_e4m3_t* a, const float* a_scale,
     const Epilogue epilogue{
         output, a_scale, valid, routes, offsets, rw, rs, masters, capacity, inv, rinv, smem, self_rank};
     Kernel{}.run(params, smem, scheduler, epilogue);
+#if __HGGC_ARCH__ == 150
+    // Complete every producer's stores before combine publishes this rank.
+    __ppu_wait_remote_vstcnt(0);
+    __ppu_wait_vstcnt(0);
+#endif
 }
 )");
     w4a8_source_policy(source, kernel);

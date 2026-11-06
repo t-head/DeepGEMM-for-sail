@@ -29,7 +29,8 @@ inline void replace_source_field(std::string& code, const std::string& key, cons
 
 template <typename Runtime>
 inline std::string rendered_source(const std::string& name, std::string source, const SourceFields& fields) {
-    std::string key = name;
+    // Callers may specialize the source before substituting these fields.
+    std::string key = name + '\0' + source;
     for (const auto& [field, value] : fields)
         key += ":" + field + "=" + value;
     static std::mutex mutex;
