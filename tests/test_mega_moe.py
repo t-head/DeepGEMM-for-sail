@@ -40,7 +40,7 @@ if __name__ == "__main__":
 
 import deep_gemm
 from deep_gemm.testing import calc_diff
-from deep_gemm.jit_kernels.utils import is_ppu1v5_device
+from utils import is_ppu1v5_device
 from test_activation import situ_reference
 
 

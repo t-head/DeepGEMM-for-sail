@@ -5,7 +5,7 @@
 namespace deep_gemm::tix {
 
 // HGGC cp.async (async global -> shared copy) primitives, lifted verbatim from
-// impls/gemvt.cuh. Shared by gemvt.cuh and blockwise_gemvt.cuh.
+// impls/gemvt.cuh.
 
 __device__ __forceinline__
 uint32_t SmemU32Addr(const void *smemptr) {

@@ -33,7 +33,7 @@ static int get_logits_stride_alignment(torch::ScalarType logits_dtype) {
 }
 
 // `stride_k` is `uint32_t` when `q_idx * stride_k` still fits in 32 bits, otherwise `uint64_t`.
-// Chosen on the host and forwarded as a JIT template key, mirroring `_select_stride_k_type`.
+// Chosen on the host and forwarded as a JIT template key.
 static std::string select_stride_k_type(int aligned_seq_len, int aligned_seq_len_kv) {
     DG_HOST_ASSERT(aligned_seq_len_kv < (1LL << 31));
     const auto& product = static_cast<int64_t>(aligned_seq_len) * aligned_seq_len_kv;
@@ -45,9 +45,8 @@ static std::string select_stride_k_type(int aligned_seq_len, int aligned_seq_len
 //   smem_k / smem_q (values) + smem_k_scales + [smem_q_sf, FP4 only] + smem_weight
 // Both flavours store 4 bytes per KV row scale (`float` vs packed `uint32_t` e8m0); FP4 adds a
 // per-Q-row scale on top.
-// NOTES: the Python path never needed this because the kernel used `AttnKernel::SharedStorageSize`
-// directly; the C++ JIT must supply it at launch time. The generated code carries a `static_assert`
-// against `SharedStorageSize`, so a mismatch here fails at compile time rather than silently.
+// The host supplies this size at launch time. The generated code carries a `static_assert`
+// against `SharedStorageSize`, so a mismatch fails at compile time.
 static int get_smem_config(const MqaLogitsConfig& config, int head_dim, int qk_element_size,
                            int weights_element_size, bool is_fp4) {
     const int smem_k = config.block_kv * head_dim * config.num_kv_stages * qk_element_size;
@@ -65,7 +64,7 @@ static int get_num_threads(const MqaLogitsConfig& config) {
 
 // ============================ Paged =============================
 
-// Mirrors the 6-tuple returned by `get_paged_mqa_logits_tile` in `deep_gemm/jit_kernels/utils.py`
+// Pipeline stages, KV splitting, warp shape and occupancy selected for paged MQA.
 struct PagedTile {
     int stage_q, stage_k, split_kv, warp_kv;
     bool split_mblock;
@@ -159,8 +158,8 @@ static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_head
             }
         }
         DG_HOST_ASSERT(not tile_list.empty());
-        // `max(tile_list, key=lambda x: (tb_per_cu, stage_q, 1 - split_mblock))`; both Python's `max`
-        // and `std::max_element` return the first maximum, so ties break identically
+        // Prefer more blocks per CU, then more Q stages, then unsplit M blocks.
+        // std::max_element retains the first candidate when the keys tie.
         const auto& key = [](const PagedTile& t) {
             return std::make_tuple(t.tb_per_cu, t.stage_q, 1 - static_cast<int>(t.split_mblock));
         };

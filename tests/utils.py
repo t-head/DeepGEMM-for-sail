@@ -1047,11 +1047,9 @@ def read_cycle_from_nculog(filename):
         op = kernel_list[i]
         cycle = cycles_list[i]
         op_cycles[op] = cycle
-        # NOTES: the C++ JIT names its kernels by dtype tag (e.g. `attention_mqa_logits_int8`), so
-        # unlike the Python JIT -- whose symbol carries `cutlass::gemm::kernel::...` -- "gemm" alone
-        # no longer identifies the kernel of interest. `metadata` is excluded so the tiny scheduling
-        # kernel is reported in `op_cycles` but not summed, keeping the totals comparable with the
-        # Python path (whose `smxx_*_metadata` matches neither term).
+        # The C++ JIT names its kernels by dtype tag (e.g. `attention_mqa_logits_int8`), so
+        # include attention and MHC kernels in the totals. Metadata scheduling kernels are
+        # reported in `op_cycles` but excluded from the totals.
         if ("gemm" in op.lower() or "attention" in op.lower() or "mhc" in op.lower()) and "metadata" not in op.lower():
             fwd_cycle_sum += cycle
             fwd_tc_sum = tc_list[i]
@@ -1077,8 +1075,8 @@ def clean_casename(name):
 
 def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0"):
     # Kernel filter for the PPU profiler. `attention_` is needed because the C++ JIT emits
-    # `attention_mqa_logits_*` / `attention_paged_mqa_logits_*`, which match none of the other terms
-    # (the Python JIT is covered by `device_kernel`). Without it the profiler silently reports 0.
+    # `attention_mqa_logits_*` / `attention_paged_mqa_logits_*`, which match none of the other terms.
+    # Without it the profiler silently reports 0 for these attention kernels.
     ppu_kernel_name = "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*|attention_|mhc'"
     output_lines = list()
     headers = ["casename","time(us)","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
@@ -2024,35 +2022,6 @@ def generate_cp_test_data(seq_len, seq_len_kv):
         ke[i + chunk_size] = (cp_size * 2 - 1 - cp_id) * chunk_size + i
     return ks, ke
 
-def ref_get_metadata(context_lens: torch.Tensor, block_kv: int, num_sms: int, metadata_extra: tuple = None):
-    split_kv = block_kv * 4  # fallback: assume max num_math_warpgroups=4 to avoid crash
-    tb_per_cu = 1
-    if metadata_extra is not None:
-        from deep_gemm.jit_kernels.utils import get_paged_mqa_logits_tile
-        next_n, num_heads, head_dim, element_size = metadata_extra
-        _, _, split_kv, _, _, tb_per_cu = get_paged_mqa_logits_tile(next_n, block_kv, num_heads, head_dim, element_size)
-    num_splits = num_sms * tb_per_cu
-
-    context_lens = context_lens[:, -1] # convert to 1D context lens, use last token's context_len
-    batch_size = context_lens.size(0)
-    blocksize = split_kv
-    block_len = (context_lens + blocksize - 1) // blocksize
-    block_start = torch.cumsum(block_len, dim=0)
-    total_blocks = block_start[-1].item()
-    block_count = total_blocks // num_splits
-    extra_blocks = total_blocks - block_count * num_splits
-
-    schedule_meta_data = torch.zeros((num_splits + 1, 2), dtype=torch.int32, device=context_lens.device)
-    for i in range(num_splits + 1):
-        seg_starts = i * block_count + min(i, extra_blocks)
-        q_idx = 0
-        while q_idx < batch_size and block_start[q_idx] <= seg_starts:
-            q_idx += 1
-        kv_idx = seg_starts if q_idx == 0 else seg_starts - block_start[q_idx - 1]
-        schedule_meta_data[i, 0] = q_idx
-        schedule_meta_data[i, 1] = kv_idx
-    return schedule_meta_data
-
 def ref_fp8_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
                        cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor, cost_only: bool = False,
                        avg: bool = False):
@@ -2339,7 +2308,6 @@ def test_paged_mqa_logits(args) -> None:
         pre_context_lens = context_lens
 
     get_metadata_kernel = deep_gemm.get_paged_mqa_logits_metadata
-    # get_metadata_kernel = ref_get_metadata
 
     if data_type == torch.bfloat16:
         metadata_extra = (next_n, num_heads, head_dim, q.element_size())

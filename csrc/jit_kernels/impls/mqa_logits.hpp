@@ -202,7 +202,7 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
             std::min(capacity, std::max(uint64_t{1}, num_output_tasks)));
     }
 
-    // Reported before the launch, as `Attention::run` does, so the configuration is on screen even
+    // Report the configuration before launch so it remains visible even
     // when the launch itself fails
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
@@ -310,7 +310,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
 
     // NOTES: `dtype_tag` (rather than `element_qk`) names the kernel, because the C++ JIT uses this
     // string as the `extern "C"` symbol name -- the `cutlass::` qualifier in `element_qk` is not a
-    // valid identifier. The Python path only used it as a cache directory name, so it got away with it.
+    // valid identifier.
     std::string element_qk, element_acc, dtype_tag;
     if (is_fp4) {
         element_qk = "uint8_t", element_acc = "float", dtype_tag = "fp4";

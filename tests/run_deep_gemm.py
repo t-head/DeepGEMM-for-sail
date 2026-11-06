@@ -29,7 +29,7 @@ def device_version_supported(one_case):
         if get_arch_version() != 89 or 'M890' not in torch.cuda.get_device_name():
             return False, 'Mega-mHC requires Zhenwu M890P (sm_89)'
     # fp4 (mxfp4, ue8m0 scale) GEMM/attention kernels require PPU1.5 (sm_89) or later,
-    # see the device assert in deep_gemm/jit_kernels/gemm_fp4.py
+    # see the PPU0015 ArchTag in csrc/jit_kernels/impls/fp4_gemm.hpp
     if data_type == torch.uint8 and get_arch_version() < 89:
         return False, "fp4(mxfp4) requires PPU1.5 (ZW890, sm_89) or later"
     # fp8 GEMM kernels hang on PPU1.0 (ZW810E), require PPU1.5 (sm_89) or later

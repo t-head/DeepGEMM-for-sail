@@ -111,7 +111,7 @@ public:
 
 DG_DECLARE_STATIC_VAR_IN_CLASS(KernelRuntime, sdk_home);
 
-// Compile/launch mode switch, mirroring Python `jit/runtime.py` (CompileMode + set/get_compile_mode).
+// Compile/launch mode switch shared by the public bindings and kernel runtimes.
 //   COMPILE_AND_RUN: normal -- Compiler::build compiles (+ caches) the kernel, then launch runs it.
 //   ONLY_COMPILE:    still compile + cache the kernel, but skip the actual launch. Used for warm-up /
 //                    ahead-of-time precompilation so that later serving hits the JIT cache.
@@ -121,13 +121,13 @@ enum class CompileMode : int {
 };
 
 // Single source of truth for the current mode. A function-local static behind inline accessors keeps
-// it ODR-safe in a header (exactly one instance per process), matching Python's module-global semantics.
+// it ODR-safe in a header (exactly one instance per process).
 inline CompileMode& compile_mode_ref() {
     static CompileMode mode = CompileMode::COMPILE_AND_RUN;
     return mode;
 }
 
-// NOTE: `mode` is an int to match the Python calling convention `set_compile_mode(CompileMode.ONLY_COMPILE.value)`.
+// The public bindings accept and return the integer values of CompileMode.
 inline void set_compile_mode(int mode) {
     compile_mode_ref() = static_cast<CompileMode>(mode);
 }
@@ -163,7 +163,7 @@ public:
     template <typename Args>
     static void launch(const std::shared_ptr<KernelRuntime>& kernel_runtime, const Args& args) {
         // Compile-only / warm-up mode: Compiler::build already compiled + cached the kernel above, so
-        // skip the actual launch. Mirrors Python `Runtime.__call__` ONLY_COMPILE / HGGC_WARM_UP check.
+        // skip the actual launch.
         if (is_compile_only())
             return;
 

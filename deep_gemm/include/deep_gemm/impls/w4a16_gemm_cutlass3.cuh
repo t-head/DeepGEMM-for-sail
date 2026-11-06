@@ -3,13 +3,9 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #pragma clang diagnostic ignored "-Wswitch"
 
-#ifndef W4A16_HGRTC
-    #include <deep_gemm/common/profiling_interface.cuh>
-#endif
 
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/math.cuh>
-#include <deep_gemm/scheduler/block_info.cuh>
 
 #include <deep_gemm/tix/cvt.cuh>
 #include <cute/ppu_tensor_mix.hpp>
@@ -765,98 +761,3 @@ public:
 };
 
 } // namespace cutlass::gemm::kernel
-
-namespace deep_gemm {
-using cutlass::KernelHardwareInfo;
-
-template <typename ElementB, typename ElementScale,
-          int ShapeN, int ShapeK,
-          int BlockM, int BlockN, int BlockK,
-          int WarpM, int WarpN, int WarpK,
-          int kNumGroups, int kNumStages, GemmType kGemmType,
-          int kGroupSize = 32, int N_EXPAND = 1>
-class W4A16Gemm {
-  static constexpr bool UseMmaKernel = cute::is_same_v<ElementB, uint8_t>;
-  static_assert(!UseMmaKernel || cute::is_same_v<ElementScale, uint8_t>, "W4A16GEMM_MMA requires uint8_t E8M0 scales");
-  using Kernel = cute::conditional_t<
-      UseMmaKernel,
-      cutlass::gemm::kernel::W4A16GEMM_MMA<ShapeN, ShapeK, BlockM, BlockN, BlockK, WarpM, WarpN, WarpK, kNumGroups, kNumStages, kGemmType, N_EXPAND>,
-      cutlass::gemm::kernel::W4A16GEMM<ElementB, ElementScale, ShapeN, ShapeK, BlockM, BlockN, BlockK, WarpM, WarpN, WarpK, kNumGroups, kNumStages, kGemmType, kGroupSize, N_EXPAND>>;
-  using ElementBPacked = cute::conditional_t<UseMmaKernel, const uint8_t*, const int*>;
-public:
-    W4A16Gemm() = default;
-
-    static void run(const cutlass::bfloat16_t *a_ptr, ElementBPacked b_ptr, const ElementScale *scale_b_ptr, cutlass::bfloat16_t *d_ptr,
-                    int shape_m, int expected_m, hggcStream_t stream, int num_sms,
-                    int *m_rows, typename Kernel::Arguments args) {
-      int num_threads = Kernel::MaxThreadsPerBlock;
-      int tb_per_sm = min(8, compute_occupancy_for_kernel<Kernel>());
-      int threadblock_count = num_sms < 20 ? num_sms : num_sms * tb_per_sm;
-
-      dim3 block(num_threads, 1, 1);
-      dim3 grid(threadblock_count, 1, 1);
-      int smem_size = sizeof(typename Kernel::SharedStorage);
-
-      typename Kernel::Params params{a_ptr, b_ptr, scale_b_ptr, d_ptr};
-      bool NoPadPreprocessLayout = false;
-      if constexpr(kGemmType == GemmType::MGroupedFused) {
-        params.num_token = shape_m;
-        params.sorted_token_ids = args.sorted_token_ids;
-        params.scheduler = {args.aligned_num_m_blocks, args.expert_ids_and_cumsum};
-      } else {
-        int* layout_info = m_rows;
-        if constexpr(Kernel::TileScheduler::kIsNoPadPreprocessLayout) {
-          uint32_t block_size = max(32, math::next_power_of_two(kNumGroups));
-          computeBlockInfoKernel<BlockM><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(m_rows), kNumGroups, reinterpret_cast<uint32_t*>(args.block_m_info));
-          layout_info = args.block_m_info;
-          NoPadPreprocessLayout = true;
-        }
-        params.scheduler = {shape_m, layout_info};
-      }
-
-      DgProfParam dg_prof_params;
-      if (ProfilingInterface::Instance().get_op_info()) {
-        std::string dtype_name = UseMmaKernel ? std::string("w4fa16_mma") :
-            (cute::is_same_v<ElementB, cutlass::int4b_t> ? std::string("w4a16") :
-             std::string("w4fa16"));
-        if constexpr(kGemmType == GemmType::MGroupedFused) {
-            dg_prof_params.set_fused_moe_params(
-                dtype_name, std::string("group"), kNumGroups, shape_m, args.topk,
-                ShapeN, ShapeK, m_rows, stream);
-        } else {
-            dg_prof_params.set_params(
-                kGemmType, false,
-                dtype_name,
-                kNumGroups, shape_m, ShapeN, ShapeK, expected_m,
-                m_rows, stream
-            );
-            dg_prof_params.add_params(std::string("quant_type"), std::string("group"));
-        }
-        dg_prof_params.add_params(std::string("group_size"), kGroupSize);
-      }
-
-      char *pEnv_params = std::getenv("show_log");
-      if (pEnv_params && isdigit(*pEnv_params)) {
-        hggcFuncAttributes attr;
-        hggcFuncGetAttributes(&attr, cutlass::device_kernel<Kernel>);
-
-        printf("[GemmGrouped-W4A16:] quant_type:%s, scale_type:%s\n",
-            cute::is_same_v<ElementB, cutlass::int4b_t> ? "int4" : "fp4", Kernel::E8M0_scale ? "e8m0" : "bf16");
-        printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, NoPadPreprocessLayout: %d, N_EXPAND: %d\n",
-            kNumGroups, shape_m, ShapeN, ShapeK, expected_m, GemmTypeS[static_cast<int>(kGemmType)], NoPadPreprocessLayout, N_EXPAND);
-
-        printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
-            BlockM, BlockN, BlockK, WarpM, WarpN, WarpK, kNumStages);
-
-        printf("num_sms:%d, tb_per_sm:%d, threadblock_count:%d, num_threads: %d\n", num_sms, tb_per_sm, threadblock_count, num_threads);
-
-        printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, int(attr.numRegs), int(attr.localSizeBytes));
-      }
-
-      ProfilingInterface::Instance().instrument(true, dg_prof_params);
-      cutlass::device_kernel<Kernel><<<grid, block, smem_size, stream>>>(params);
-      ProfilingInterface::Instance().instrument(false, dg_prof_params);
-    }
-  };
-
-};  // namespace deep_gemm

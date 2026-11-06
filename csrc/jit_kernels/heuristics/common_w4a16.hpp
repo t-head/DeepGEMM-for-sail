@@ -15,8 +15,7 @@
 using namespace deep_gemm;
 namespace deep_gemm_w4a16_common {
 
-// Mirrors `W4A16Type` in `deep_gemm/jit_kernels/m_grouped_gemm_w4a16.py`: the quantization layout
-// and dequant path selector
+// Quantization layout and dequantization path selected from the weight and scale dtypes.
 enum class W4A16Type {
     int4,
     mxfp4_e8m0,
@@ -38,14 +37,12 @@ static W4A16Type get_w4a16_type(torch::ScalarType rhs_dtype, torch::ScalarType r
     return W4A16Type::int4;
 }
 
-// `W4A16Gemm` routes `uint8_t` weights to `W4A16GEMM_MMA` and everything else to `W4A16GEMM`
+// Packed uint8 weights select the FP4 MMA kernel.
 static bool uses_mma_kernel(W4A16Type w4a16_type) {
     return w4a16_type == W4A16Type::mxfp4_e8m0_mma;
 }
 
-// `ElementB` / `ElementScale` spelled out for the generated code. Kept as the exact strings the
-// Python template used: `W4A16Gemm::run` branches on `is_same_v<ElementB, cutlass::int4b_t>`, so
-// renaming these would change which dequant path the kernel picks.
+// ElementB and ElementScale type names emitted into the generated kernel.
 static std::string get_element_b(W4A16Type w4a16_type) {
     if (w4a16_type == W4A16Type::int4)
         return "int4_t";
@@ -56,7 +53,7 @@ static std::string get_element_scale(W4A16Type w4a16_type) {
     return w4a16_type == W4A16Type::mxfp4_e8m0 or w4a16_type == W4A16Type::mxfp4_e8m0_mma ? "uint8_t" : "bfloat16_t";
 }
 
-// `data_type` reported to the profiler, mirroring the `dtype_name` ladder in `W4A16Gemm::run`
+// Precision label reported to the profiler.
 static std::string get_profiling_dtype_name(W4A16Type w4a16_type) {
     switch (w4a16_type) {
         case W4A16Type::mxfp4_e8m0_mma: return "w4fa16_mma";
@@ -66,7 +63,7 @@ static std::string get_profiling_dtype_name(W4A16Type w4a16_type) {
     }
 }
 
-// `GemmType::{}` as spelled in the generated code, mirroring the Python `gemm_type.name`
+// GemmType enumerator name emitted into the generated code.
 static std::string get_gemm_type_name(GemmType gemm_type) {
     switch (gemm_type) {
         case GemmType::MGroupedNoPad:  return "MGroupedNoPad";
@@ -97,8 +94,7 @@ static W4A16Config unpack_w4a16_config(const W4A16ConfigTuple& configs) {
     return W4A16Config{num_sms, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages, n_expand};
 }
 
-// Faithful port of `w4a16_get_best_configs`
-// NOTES: `num_groups` is unused upstream too -- kept so the signature still reads like the Python one
+// Select a W4A16 configuration. num_groups is retained for the grouped-config interface.
 static W4A16Config get_best_configs(int expected_m, int n, int k, int num_groups, int num_sms, GemmType gemm_type,
                                     W4A16Type w4a16_type) {
     const bool is_ppu1v5 = is_ppu1v5_device();
@@ -171,9 +167,8 @@ static int get_num_threads(const W4A16Config& config, bool is_mma) {
 //   mainloop            : smem_a + smem_b + smem_scale
 //   epilogue cta reduce : smem_reduce
 //   epilogue            : smem_c -- the MMA kernel stores straight out, so it has no such arm
-// NOTES: `W4A16Gemm::run` just took `sizeof(Kernel::SharedStorage)`; the C++ JIT has to know the size
-// before the kernel is compiled, hence the replica here. The generated code carries a `static_assert`
-// against the real `sizeof`, so any drift fails at compile time rather than silently.
+// The host needs the size before the kernel is compiled. The generated code carries a
+// static_assert against sizeof(Kernel::SharedStorage), so any drift fails at compile time.
 static int get_smem_config(const W4A16Config& config, bool is_mma, int scale_element_size, int group_size) {
     constexpr int kElementASize = 2;   // cutlass::bfloat16_t
     constexpr int kElementAccSize = 4; // float

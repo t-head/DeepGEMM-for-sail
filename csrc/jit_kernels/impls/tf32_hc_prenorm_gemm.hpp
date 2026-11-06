@@ -55,7 +55,6 @@ public:
     static std::string generate_impl(const Args& args) {
         return fmt::format(
             R"(
-#define TF32_HC_PRENORM_HGRTC
 #include <deep_gemm/impls/tf32_hc_prenorm_gemm.cuh>
 namespace deep_gemm {{
 
@@ -115,7 +114,6 @@ public:
     struct Args { LaunchArgs launch_args; float* src; float* dst; uint32_t count; };
     static std::string generate_impl(const Args&) {
         return R"(
-#define TF32_HC_PRENORM_HGRTC
 #include <deep_gemm/impls/tf32_hc_prenorm_gemm.cuh>
 extern "C" __global__ void tf32_hc_round_b(const float* src, float* dst, uint32_t count) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;

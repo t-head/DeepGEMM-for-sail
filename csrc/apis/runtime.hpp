@@ -44,7 +44,7 @@ static void register_apis(pybind11::module_& m) {
         }
     });
 
-    // COMPILE MODE (mirrors Python jit/runtime.py set/get_compile_mode; ONLY_COMPILE = 1 compiles but skips launch)
+    // Compile mode: ONLY_COMPILE = 1 compiles and caches kernels but skips launch.
     m.def("set_compile_mode", [](const int& mode) {
         set_compile_mode(mode);
     });

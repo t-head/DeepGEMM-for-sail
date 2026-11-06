@@ -13,8 +13,7 @@
 
 namespace deep_gemm::attention {
 
-// Prints each distinct message only once, in yellow -- mirrors `print_once` in
-// `deep_gemm/jit_kernels/attention.py` (which uses `@lru_cache` for the same effect)
+// Prints each distinct message only once, in yellow.
 static void print_once(const std::string& msg) {
     static std::mutex mutex;
     static std::set<std::string> printed;
@@ -23,8 +22,7 @@ static void print_once(const std::string& msg) {
         printf("\033[33m%s\033[0m\n", msg.c_str());
 }
 
-// MQA logits (non-paged) for FP8/BF16/INT8/FP4. Equivalent of `mqa_logits_common` in
-// `deep_gemm/jit_kernels/attention.py`.
+// MQA logits (non-paged) for FP8/BF16/INT8/FP4.
 //
 // Allocates the logits tensor (its row stride must be 1024-byte aligned), launches the kernel and
 // optionally masks out-of-range entries. Returns the (sliced) logits.
@@ -63,7 +61,7 @@ static torch::Tensor mqa_logits_common(const torch::Tensor& q, const torch::Tens
     const auto& [seq_len_q, num_heads, head_dim] = get_shape<3>(q);
     const auto& [seq_len_k, head_dim_] = get_shape<2>(k);
 
-    // Avg variant: an empty weights tensor selects it (mirrors the Python entry);
+    // Avg variant: an empty weights tensor selects it;
     // the optional q_scale rides in the kernel's weights slot
     const bool is_avg = weights.numel() == 0;
     if (is_avg) {
@@ -139,8 +137,7 @@ static torch::Tensor mqa_logits_common(const torch::Tensor& q, const torch::Tens
                       head_dim, clean_logits, max_seqlen_k, logits_dtype, q_sf, k_sf, q_scale);
 }
 
-// Paged MQA logits for FP8/BF16/INT8/FP4. Equivalent of `paged_mqa_logits_common` in
-// `deep_gemm/jit_kernels/attention.py`.
+// Paged MQA logits for FP8/BF16/INT8/FP4.
 //
 // Args:
 //   q:              Q tensor.
@@ -375,9 +372,8 @@ torch::Tensor fp8_paged_mqa_avg_logits(const torch::Tensor& q, const torch::Tens
 // scheduling policy with FP8 D64.
 // Older callers may omit metadata_extra to use the compatibility tile.
 //
-// NOTES: the Python version also asserts that `indices` is not a tuple, to catch `metadata_extra`
-// being passed positionally. That check is unnecessary here -- pybind rejects a tuple for
-// `std::optional<torch::Tensor>` with a TypeError before the body runs.
+// Passing `metadata_extra` positionally in the `indices` slot is rejected by pybind:
+// a tuple cannot convert to `std::optional<torch::Tensor>`.
 torch::Tensor get_paged_mqa_logits_metadata(
     const torch::Tensor& context_lens, int page_kv, int num_sms, std::optional<torch::Tensor> indices = std::nullopt,
     std::optional<std::tuple<int, int, int, int>> metadata_extra = std::nullopt) {
