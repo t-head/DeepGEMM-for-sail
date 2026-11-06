@@ -104,7 +104,9 @@ uses the explicitly supplied `cu_seq_len_k_start` / `cu_seq_len_k_end`.
 
 Q values have shape `[Q,1,H,D_storage]`, context lengths are contiguous
 int32 `[Q,1]`, and block tables have one int32 row per query with unit column
-stride. Supported page sizes are 32/64/128. Logits have logical shape
+stride. M890 supports page sizes 32/64/128; 810E supports only 64/128.
+810E page32 is rejected by metadata generation and compute due to an
+actlize TSM cross-cube addressing issue. Logits have logical shape
 `[Q,max_context_len]`. INT8 and legacy FP8 take Q values directly; MXFP4
 takes `(packed_values, int32_scales[Q,1,H])`.
 
@@ -219,8 +221,8 @@ with the actual model on the target device.
 
 | Device / workload | Recommended API | Q/K | Weights | Logits |
 | --- | --- | --- | --- | --- |
-| 810E / PPU1.0 non-paged DSA | `int8_mqa_logits` | INT8 + FP32 KV scales | BF16 | BF16, inferred from weights dtype |
-| 810E / PPU1.0 paged DSA | `int8_paged_mqa_logits` | INT8 + FP32 scales in the fused KV cache | BF16 | BF16, inferred from weights dtype |
+| 810E non-paged DSA | `int8_mqa_logits` | INT8 + FP32 KV scales | BF16 | BF16, inferred from weights dtype |
+| 810E paged DSA | `int8_paged_mqa_logits` | INT8 + FP32 scales in the fused KV cache | BF16 | BF16, inferred from weights dtype |
 | M890 / PPU1.5 non-paged DSA | `fp8_fp4_mqa_logits` | MXFP4 + packed int32 MX scales | BF16 | Fixed BF16 |
 | M890 / PPU1.5 paged DSA | `fp8_fp4_paged_mqa_logits` | MXFP4 + int32 MX scales in the fused KV cache | BF16 | Fixed BF16 |
 | M890 / PPU1.5 sparse | `fp8_fp4_sparse_mqa_logits` / `fp8_fp4_paged_sparse_mqa_logits` | MXFP4 | BF16 | Fixed BF16 |

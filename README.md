@@ -406,7 +406,8 @@ Legacy FP8 uses FP32 weights/logits;
 INT8 accepts BF16 or FP32 weights and returns the same logits dtype. New
 `fp8_fp4_*mqa_logits` weighted entry points support MXFP4 only, with BF16
 weights/logits. Weighted paged calls require `next_n=1` and support page
-sizes 32, 64 and 128.
+sizes 32, 64 and 128 on M890. 810E rejects page32 due to an actlize
+TSM addressing issue; use page64 or page128.
 
 AVG indexers use no weights, default to BF16 output and retain paged
 `next_n=1–6`. Non-paged AVG requires a positive `max_seqlen_k`. The paged

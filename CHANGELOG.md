@@ -54,6 +54,10 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
     and forwards it automatically; public Python callers need no additional
     argument.
   - Extends the supported top-k range from 1–16 to 1–32.
+- **810E paged indexer**: rejects page32 in metadata generation and compute
+  until the actlize TSM cross-cube addressing issue is resolved. Use page64
+  or page128; M890 retains page32 support.
+
 - **Indexer API contracts**: separates legacy FP8/INT8 from MXFP4 weighted
   entry points and removes BF16 Q/K APIs. Legacy FP8 fixes weights/logits to
   FP32; INT8 infers BF16 or FP32 logits from weights dtype and no longer

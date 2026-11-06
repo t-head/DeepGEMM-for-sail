@@ -11,6 +11,14 @@
 
 namespace deep_gemm::attention {
 
+// actlize 810E TSM loads do not normalize whole-tile row coordinates
+// across the 32-row cubes assembled from page32. Reject this layout until
+// actlize provides a validated cross-cube copy implementation.
+static void check_paged_mqa_page_size(int page_kv) {
+    TORCH_CHECK(page_kv != 32 or get_ppu_arch() != AC_PPU0010,
+                "page_kv=32 is unsupported on 810E due to an actlize TSM cross-cube addressing issue; use 64 or 128");
+}
+
 // Format support is device-specific: an int8 container may hold INT8 or MXFP4.
 static void check_indexer_arch(torch::ScalarType qk_dtype, bool is_fp4) {
     const auto arch = get_ppu_arch();
@@ -217,6 +225,7 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
                 is_avg ? "AVG indexer requires num_heads=4" : "DSA indexer requires num_heads=32 or 64");
     check_indexer_head_dim(head_dim, is_fp4);
     const auto& [num_kv_blocks, page_kv, num_heads_kv, kv_last_dim] = get_shape<4>(fused_kv_cache);
+    check_paged_mqa_page_size(page_kv);
     const auto& [schedule_meta_size, meta_info_size] = get_shape<2>(schedule_meta);
 
     // Shared request/page geometry and scheduler metadata.
@@ -394,6 +403,7 @@ torch::Tensor fp8_paged_mqa_avg_logits(const torch::Tensor& q, const torch::Tens
 torch::Tensor get_paged_mqa_logits_metadata(
     const torch::Tensor& context_lens, int page_kv, int num_sms, std::optional<torch::Tensor> indices = std::nullopt,
     std::optional<std::tuple<int, int, int, torch::ScalarType>> metadata_extra = std::nullopt) {
+    check_paged_mqa_page_size(page_kv);
     check_row_indices(indices, context_lens);
     TORCH_CHECK(metadata_extra.has_value(),
                 "metadata_extra=(next_n, num_heads, logical_head_dim, qk_dtype) is required on PPU0010/PPU0015; "
