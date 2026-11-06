@@ -106,13 +106,12 @@ from ._C import (
     fp8_einsum,
     int8_einsum,
     # Attention kernels (MQA logits)
-    bf16_mqa_logits,
+    get_mqa_logits_metadata,
     int8_mqa_logits,
     fp8_mqa_logits,
     fp8_fp4_mqa_logits,
     # Attention kernels (paged MQA logits)
     get_paged_mqa_logits_metadata,
-    bf16_paged_mqa_logits,
     int8_paged_mqa_logits,
     fp8_paged_mqa_logits,
     fp8_fp4_paged_mqa_logits,

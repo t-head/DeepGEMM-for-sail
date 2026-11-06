@@ -353,19 +353,29 @@ share a single-warp double-buffered load pipeline; FP8-channel retains a
 whole-row amax reduction. Run `python tests/test_activation.py` for the
 standalone correctness suite.
 
-#### MQA logits
+#### DSA and AVG indexer logits
 
-We provide Multi-Query Attention (MQA) logits kernels that compute the query-key logits used by the LLM attention indexer. Both a non-paged variant (for contiguous KV) and a paged variant (for a paged KV cache with a block table) are supported, across BF16, INT8, FP8, and FP4 precisions.
+Non-paged and paged DSA indexers support legacy INT8/FP8 and MXFP4 inputs.
+BF16 Q/K entry points have been removed. Legacy FP8 uses FP32 weights/logits;
+INT8 accepts BF16 or FP32 weights and returns the same logits dtype. New
+`fp8_fp4_*mqa_logits` weighted entry points support MXFP4 only, with BF16
+weights/logits. Weighted paged calls require `next_n=1` and support page
+sizes 32, 64 and 128.
 
-- Non-paged: `deep_gemm.bf16_mqa_logits`, `deep_gemm.int8_mqa_logits`, `deep_gemm.fp8_mqa_logits`, and the unified `deep_gemm.fp8_fp4_mqa_logits`. These take the query, key-value pair (with scales for the quantized variants), per-token weights, and the `cu_seq_len_k_start` / `cu_seq_len_k_end` range tensors, and return the masked logits.
-- Paged: `deep_gemm.bf16_paged_mqa_logits`, `deep_gemm.int8_paged_mqa_logits`, `deep_gemm.fp8_paged_mqa_logits`, and the unified `deep_gemm.fp8_fp4_paged_mqa_logits`. These operate on a fused KV cache with a `block_table` and schedule metadata for variable-length sequences. Call `deep_gemm.get_paged_mqa_logits_metadata` first to compute the scheduling metadata.
+AVG indexers use no weights, default to BF16 output and retain paged
+`next_n=1–6`. Non-paged AVG requires a positive `max_seqlen_k`. The paged
+`fp8_fp4` AVG entry point accepts MXFP4 only; ordinary FP8 uses the separate
+FP8 entry point. All AVG entry points omit `clean_logits`.
 
-Regular paged MQA supports `page_kv` values of **32, 64, and 128**.
-Paged logits require external masking of positions outside each context;
-`clean_logits=True` is unsupported. `fp8_paged_mqa_logits` now defaults to
-`clean_logits=False`, matching this requirement.
+Logits outside valid windows are unspecified and require caller-side masking
+or valid candidate bounds for top-k. For paged scheduling, explicitly pass
+`metadata_extra` describing the quantized Q storage shape. For non-paged
+calls, positive `max_seqlen_k` selects compressed relative columns and can
+reduce memory usage.
 
-For more information, please refer to the corresponding `*_mqa_logits` and `*_paged_mqa_logits` function documentation.
+See the [indexer API guide](docs/indexer_api.md) for all signatures, dtype
+and layout contracts, metadata generation, top-k coordinate mapping and
+recommended 810E/M890 integration settings.
 
 #### Sparse MQA logits (Zhenwu M890P)
 
@@ -393,11 +403,11 @@ that is a multiple of `sparse_block_kv`; its fused uint8 KV cache has shape
 `[num_pages,page_kv,1,68]` and a 512-byte-aligned page stride.
 
 The output is BF16 with shape
-`[T,round_up(num_max_sparse_blocks*sparse_block_kv,512)]`.
+`[T,num_max_sparse_blocks*sparse_block_kv]`, with an aligned physical row stride.
 Logical columns are compacted by selected block slot:
 `column = slot*sparse_block_kv + token_in_block`, rather than absolute KV
-token position. Padding columns are not additional KV positions.
-See the [attention API](csrc/apis/attention.hpp) for metadata and layout
+token position. Allocation padding is not exposed as logical columns.
+See the [indexer API guide](docs/indexer_api.md) for metadata and layout
 requirements and [attention tests](tests/test_attention.py) for supported
 cases.
 

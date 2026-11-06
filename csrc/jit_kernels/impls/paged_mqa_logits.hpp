@@ -324,23 +324,19 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     const int64_t block_table_stride = block_table.stride(0);
 
     // Each quantized page stores all K values first, then its per-token scales.
-    // BF16 pages contain only K values; their strides are in BF16 elements.
     auto k = fused_kv_cache.as_strided({num_kv_blocks, page_kv, head_dim}, {kv_cache_stride_bytes, head_dim, 1});
     if (not is_fp4)
         k = k.view(qk_dtype);
-    torch::Tensor k_scales;
-    if (is_fp4 or qk_dtype != torch::kBFloat16) {
-        k_scales = fused_kv_cache
-                       .as_strided({num_kv_blocks, page_kv * 4}, {kv_cache_stride_bytes, 1},
-                                   fused_kv_cache.storage_offset() + page_kv * head_dim)
-                       .view(is_fp4 ? torch::kInt32 : torch::kFloat32);
-    }
+    auto k_scales = fused_kv_cache
+                   .as_strided({num_kv_blocks, page_kv * 4}, {kv_cache_stride_bytes, 1},
+                               fused_kv_cache.storage_offset() + page_kv * head_dim)
+                   .view(is_fp4 ? torch::kInt32 : torch::kFloat32);
 
     const auto& tile = deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim,
                                                                       static_cast<int>(q.element_size()));
-    if (is_fp4 and is_avg)
+    if (is_fp4)
         TORCH_CHECK(schedule_meta_size - 1 == get_num_sms() * tile.tb_per_cu,
-                    "FP4 paged AVG requires metadata built with metadata_extra=(next_n, 4, 64, 1) "
+                    "FP4 paged logits require matching metadata_extra=(next_n, H, 64, 1) "
                     "and the current num_sms");
     if (not is_fp4)
         TORCH_CHECK(not tile.split_mblock, "SPLIT_MBLOCK is only supported for FP4 paged kernel");
@@ -370,8 +366,6 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     std::string element_qk, element_acc, dtype_tag;
     if (is_fp4) {
         element_qk = "uint8_t", element_acc = "float", dtype_tag = "fp4";
-    } else if (qk_dtype == torch::kBFloat16) {
-        element_qk = "cutlass::bfloat16_t", element_acc = "float", dtype_tag = "bf16";
     } else if (qk_dtype == torch::kFloat8_e4m3fn) {
         element_qk = "cutlass::float_e4m3_t", element_acc = "float", dtype_tag = "fp8";
     } else {

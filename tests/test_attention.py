@@ -57,7 +57,7 @@ def test_per_layer_cache_view(check_accuracy=True):
     def check(fused_kv_cache):
         logits = deep_gemm.int8_paged_mqa_logits(
             q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
-            max_context_len, clean_logits=False, logits_dtype=torch.float32)
+            max_context_len, clean_logits=False)
         if check_accuracy:
             valid = int((((logits.float().cpu()[0] / (head_dim * v * s)) - 1).abs() < 0.005).sum())
             assert valid == max_context_len
@@ -95,10 +95,9 @@ def test_mqa_logits_loop():
                     if do_check:
                         test_mqa_logits(parse_deepgemm_string_re(case + ',logits_dtype:bf16'))
     cases = [
-        # BF16, compressed logits, and BF16 weights/logits.
-        'MqaLogits,data_type:bf16,seq_len_q:8191,seq_len_kv:8191,num_heads:64,head_dim:128',
+        # Compressed logits and optional BF16 INT8 output.
         'MqaLogits,data_type:int8,seq_len_q:4096,seq_len_kv:8192,num_heads:64,head_dim:128,compressed_logits:1',
-        'MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,logits_dtype:bf16,weights_dtype:bf16',
+        'MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,weights_dtype:bf16',
     ]
     for case in cases:
         set_acc_check(True)
@@ -112,10 +111,8 @@ def test_paged_mqa_logits_loop():
     if is_ppu1v5_device():
         data_types.extend(['fp8', 'fp4'])
     for data_type in data_types:
-        for batch_size, next_n in [(1, 1), (64, 1), (64, 2), (128, 1)]:
+        for batch_size, next_n in [(1, 1), (64, 1), (128, 1)]:
             for num_heads, head_dim in [(32, 128), (64, 128)]:
-                if next_n == 2 and num_heads == 32:
-                    continue
                 if data_type == 'fp4' and num_heads != 64:
                     continue
                 for avg_kv in (8192, 32768):
@@ -126,15 +123,14 @@ def test_paged_mqa_logits_loop():
                     if do_check:
                         test_paged_mqa_logits(parse_deepgemm_string_re(case + ',logits_dtype:bf16'))
     cases = [
-        # Empty contexts, a large batch, BF16 weights/logits, and multiple next tokens.
+        # Empty contexts and optional BF16 INT8 logits.
         'PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:32',
         'PagedMqaLogits,data_type:int8,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1]',
-        'PagedMqaLogits,data_type:bf16,batch_size:1119,next_n:1,num_heads:64,head_dim:128,avg_context_len:1087,page_kv:128',
-        'PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,logits_dtype:bf16,weights_dtype:bf16',
-        'PagedMqaLogits,data_type:int8,batch_size:64,next_n:4,num_heads:64,head_dim:128,avg_context_len:8192',
+        'PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,weights_dtype:bf16',
+        'PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192',
     ]
     if is_ppu1v5_device():
-        cases.append('PagedMqaLogits,data_type:fp4,batch_size:64,next_n:6,num_heads:64,head_dim:128,avg_context_len:8192,logits_dtype:bf16')
+        cases.append('PagedMqaLogits,data_type:fp4,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,logits_dtype:bf16')
     for case in cases:
         set_acc_check(True)
         test_paged_mqa_logits(parse_deepgemm_string_re(case))
@@ -152,9 +148,9 @@ def test_mqa_avg_logits_loop():
     print('Testing Avg MQA Logits:')
     # Prefill covers all q_scale modes, both output dtypes, and an odd Q tail.
     prefill_cases = [
-        'MqaAvgLogits,data_type:fp8,seq_len_q:129,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32',
-        'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16',
-        'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:2,logits_dtype:fp32',
+        'MqaAvgLogits,data_type:fp8,seq_len_q:129,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32,compressed_logits:1',
+        'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16,compressed_logits:1',
+        'MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:2,logits_dtype:fp32,compressed_logits:1',
     ]
     # FP4 AVG requires compressed output. Keep Q/K tails, packed SFA
     # groups, and active/fallback balancing. On 39 CUs, Q4096/KV4096 uses
