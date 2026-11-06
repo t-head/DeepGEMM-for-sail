@@ -290,7 +290,7 @@ static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens
     const std::string kernel_name = "attention_paged_mqa_logits_metadata";
     const int num_threads = std::min(batch_size, 1024);
     const int smem_size = batch_size * 4;
-    // NOTES: `kNumSMs` is the total block count, not `num_sms` -- matching the Python template key
+    // kNumSMs is the total block count, rather than the number of physical CUs.
     const auto& args = PagedMqaLogitsMetadataRuntime::Args{
         .launch_info = {split_kv, num_blocks, kernel_name},
         .launch_args = {dim3(1, 1, 1), dim3(num_threads, 1, 1), smem_size},

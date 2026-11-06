@@ -493,7 +493,6 @@ The library also provides some environment variables, which may be useful:
 - **JIT cache related**
   - `DG_JIT_CACHE_DIR`: string, the cache directory to store compiled kernels, `$HOME/.deep_gemm` by default
   - `DG_JIT_DISABLE_SHORTCUT_CACHE`: `0` or `1`, bypass the native PPU1.5 dense BF16 (including FP32 output and GEMV), FP8, INT8 and FP4 compiled-variant lookup and regenerate the JIT source on every call, `0` by default. `DG_JIT_DEBUG=1` also bypasses this lookup. Tensor pointers and launch arguments are always refreshed.
-  - `DG_JIT_DISABLE_CACHE`: `0` or `1`, disable the use of cache directory, `0` by default
 - **HGCC/HGRTC selections**
   - `DG_JIT_USE_HGRTC`: `0` or `1`, use HGRTC instead of HGCC, faster compilation but maybe have lower performance for some cases, `0` by default
   - `DG_JIT_HGCC_COMPILER`: string, specified compiler path; will find in `PPU_SDK` or `PPU_HOME` env by default
@@ -558,7 +557,7 @@ Following the ACTLIZE design, the kernels in DeepGEMM for PPU adopt warp interle
 
 #### Fully JIT design 🐳
 
-DeepGEMM employs a fully [Just-In-Time](deep_gemm/jit) (JIT) design, with no compilation required at installation. All kernels are compiled at runtime using a lightweight JIT implementation. This approach offers several advantages:
+DeepGEMM uses a C++ [Just-In-Time](csrc/jit) (JIT) implementation. Installation builds the C++ extension; kernels are compiled at runtime. This approach offers several advantages:
 
 - GEMM shapes, block sizes, and the number of pipeline stages are treated as compile-time constants
   - Saving registers

@@ -45,7 +45,7 @@ inline bool int8_adaptive_enabled(int m, int n, int k) {
 }
 
 // ============================================================
-// Constants (Python lines 28-43)
+// Constants
 // ============================================================
 static constexpr int SMEM_SIZE           = 256 * 1024;
 static constexpr int BASE_BLOCK_K        = 64;
@@ -74,7 +74,7 @@ inline bool use_hardcoded_tile_candidates() {
 }
 
 // ============================================================
-// LUT: measured WarpOnN caps (Python lines 396-427)
+// LUT: measured WarpOnN caps
 // ============================================================
 // Each entry caps WarpOnN (number of warps laid out along the block-N
 // direction, in warps) for one (BM, WM, WN) warp-grid combo, as measured on
@@ -232,7 +232,7 @@ inline int get_warp_k(int block_m, int block_n, int block_k, int cutlass_k,
 }
 
 // ============================================================
-// Memory-bound path (Python lines 158-512)
+// Memory-bound path
 // ============================================================
 struct MemBoundResult {
     int block_m;
@@ -330,7 +330,7 @@ inline MemBoundResult select_tile_memory_bound(int cutlass_n, int cutlass_m, int
 }
 
 // ============================================================
-// Compute-bound path (Python lines 290-663)
+// Compute-bound path
 // ============================================================
 
 // Cost model: block makespan ~ K * max(compute, memory) / throughput.
@@ -723,7 +723,7 @@ inline std::optional<Mgt512Tile> select_tile_m_gt_512(int m, int n, int /*k*/,
 }
 
 // ============================================================
-// Main entry (Python lines 666-744)
+// Main entry
 // ============================================================
 
 using AdaptiveResult = std::tuple<int, int, int, int, int, int, int, int>;

@@ -82,7 +82,6 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-#define INT8_HGRTC
 #include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
 namespace deep_gemm {{
 using namespace cute;
@@ -189,7 +188,6 @@ public:
     static std::string generate_impl(const Args& args) {
         if (!args.launch_info.SmallK) {
             return fmt::format(R"(
-#define INT8_HGRTC
 #include <deep_gemm/impls/gemvt.cuh>
 namespace deep_gemm {{
 constexpr int BlockSize = {};
@@ -217,7 +215,6 @@ void {}(const GemvtArgs args) {{
                                args.launch_info.src_type, args.launch_info.acc_type);
         } else {
             return fmt::format(R"(
-#define INT8_HGRTC
 #include <deep_gemm/impls/gemvt.cuh>
 namespace deep_gemm {{
 constexpr int BlockSize = {};

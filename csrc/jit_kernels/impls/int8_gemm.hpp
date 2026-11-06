@@ -149,7 +149,6 @@ public:
         const int shape_n = cute::get<1>(args.kernel_params.problem_shape);
         const bool is_aligned_n = (shape_n % args.launch_info.block_n == 0);
         return fmt::format(R"(
-#define INT8_HGRTC
 #include <deep_gemm/impls/int8_densegemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
@@ -433,7 +432,6 @@ public:
         const auto host_params_size = with_tsm_epilogue ? sizeof(args.kernel_params.with_tsm)
                                                         : sizeof(args.kernel_params.no_tsm);
         return fmt::format(R"(
-#define INT8_HGRTC
 #include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
 #include <deep_gemm/impls/a8w4_int8_gemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
@@ -695,14 +693,14 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
 
     WorkConfigTuple selected_config;
     if (configs.has_value()) {
-        // Explicit config path: unpack the 8-element public tuple; force warp_k = block_k, dense_s2_opt = false
-        // (mirrors deep_gemm/jit_kernels/gemm.py lines 406-408/422; adaptive is NOT re-evaluated here).
+        // Explicit config path: unpack the 8-element public tuple; force warp_k = block_k and
+        // dense_s2_opt = false without re-evaluating adaptive selection.
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
         selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, /*warp_k=*/bk, nst, /*dense_s2_opt=*/false,
             deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
     } else {
-        // Heuristic path: get_best_configs now returns the baseline 8-tuple; adaptive warp_k/dense_s2_opt
-        // injection is done here (dense-only), mirroring deep_gemm/jit_kernels/gemm.py.
+        // Heuristic path: get_best_configs returns the baseline 8-tuple; dense-only adaptive
+        // warp_k/dense_s2_opt selection is applied here.
         const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         bool from_runtime_lut = false;
         auto [ns, bm, bn, bk, wm, wn, nst, sc] = deep_gemm_int8::get_best_configs(

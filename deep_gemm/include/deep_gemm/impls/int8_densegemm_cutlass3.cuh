@@ -11,9 +11,6 @@
 // and its CollectiveMma specialization are copied verbatim below (from
 // int8_gemm_cutlass3.cuh) so this header no longer depends on the group-GEMM
 // header. The direct underlying includes below mirror int8_gemm_cutlass3.cuh.
-#ifndef INT8_HGRTC
-    #include <deep_gemm/common/profiling_interface.cuh>
-#endif
 #include <cutlass/cutlass.h>
 #include <cutlass/arch/arch.h>
 #include <cutlass/arch/mma.h>
@@ -29,7 +26,6 @@
 #include <cutlass/detail/layout.hpp>
 
 #include <cute/ppu_util.hpp>
-#include <tools/util/include/cutlass/util/packed_stride.hpp>
 
 #include <ppu_include.hpp>
 #include <deep_gemm/common/utils_cutlass3.cuh>
@@ -869,165 +865,5 @@ public:
 };
 
 } // namespace cutlass::gemm::kernel
-
-////////////////////////////////////////////////////////////////////////////////
-// DenseGemm host-side wrapper class
-////////////////////////////////////////////////////////////////////////////////
-
-namespace deep_gemm {
-
-template <typename ElementAB, typename ElementAcc,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t WARP_M, uint32_t WARP_N, uint32_t WARP_K,
-          uint32_t kNumStages,
-          bool kDenseS2Opt = false,
-          KernelStrategy kKernelStrategy = KernelStrategy::Default,
-          bool IsAlignedN_ = true>
-class DenseGemm {
-public:
-    static_assert(kKernelStrategy == KernelStrategy::Default, "int8 DenseGemm only supports the Default kernel strategy");
-
-    DenseGemm() = default;
-
-    static void run(__ppu_bfloat16* gmem_d,
-                    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                    ElementAB* gmem_a, float* scales_a,
-                    ElementAB* gmem_b, float* scales_b,
-                    hggcStream_t stream, int num_sms, uint32_t smem_size) {
-        using ElementA    = ElementAB;
-        using ElementB    = ElementAB;
-        using ElementC    = cutlass::bfloat16_t;
-        using LayoutA     = cutlass::layout::RowMajor;
-        using LayoutB     = cutlass::layout::ColumnMajor;
-        using LayoutC     = cutlass::layout::RowMajor;
-        using ElementD    = ElementC;
-        using LayoutD     = cutlass::layout::RowMajor;
-        using ElementCompute      = float;
-        using ElementScalar       = ElementCompute;
-        using LinearCombOutType   = ElementD;
-        using OperatorClass = cutlass::arch::OpClassTensorOp;
-        using ArchTag = cutlass::arch::PPU0015;
-
-        using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
-        using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<WARP_K>>;
-        static constexpr int WarpOnM = BLOCK_M / WARP_M;
-        static constexpr int WarpOnN = BLOCK_N / WARP_N;
-        static constexpr int WarpOnK = BLOCK_K / WARP_K;
-
-        using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementAB, ElementAB, ElementAcc>::type;
-        using TiledMma = TiledMMA<
-            MMA_Atom<MmaInst>,
-            Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, Int<WarpOnK>>>,
-            Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, Int<WarpOnK * 32>>>;
-
-        using KernelSchedule = cutlass::gemm::KernelAiuMultistage;
-
-        using DispatchPolicy = cutlass::gemm::MainloopPPUAiuA8W8<kNumStages, KernelSchedule, kDenseS2Opt>;
-
-        static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
-        static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
-
-        static constexpr int SmemLayoutStageStrideA = BLOCK_M * BLOCK_K;
-        static constexpr int SmemLayoutStageStrideB = BLOCK_N * BLOCK_K;
-        using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
-        using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
-        // A
-        using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom;
-        using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
-        using GmemTiledCopyA = typename DefaultOperandA::GmemTiledCopy;
-        // B
-        using SmemLayoutAtomB = typename DefaultOperandB::SmemLayoutAtom;
-        using SmemCopyAtomB = typename DefaultOperandB::SmemCopyAtom;
-        using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
-
-        // Mainloop
-        using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-            ArchTag,
-            DispatchPolicy, TileShape,
-            ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
-            ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
-            TiledMma,
-            GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,  // A
-            GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity   // B
-        >;
-
-        // Epilogue — IsAlignedN driven by template param (Python JIT passes n % block_n == 0)
-        static constexpr bool IsAlignedN = IsAlignedN_;
-        using CollectiveEpilogue = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
-            cutlass::detail::TagToStrideA_t<LayoutC>,
-            cutlass::detail::TagToStrideA_t<LayoutC>,
-            cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
-            cutlass::gemm::EpilogueDefault,
-            IsAlignedN>;
-
-        // DenseGemm scheduler — no SHAPE_N/K template params
-        using TileScheduler = DenseGemmScheduler<BLOCK_M, BLOCK_N>;
-        using GemmKernel = cutlass::gemm::kernel::DenseGemmKernel<
-            Shape<int,int,int,int>,
-            CollectiveMainloop,
-            CollectiveEpilogue,
-            TileScheduler>;
-
-        using StrideA = typename GemmKernel::StrideA;
-        using StrideB = typename GemmKernel::StrideB;
-        using StrideC = typename GemmKernel::StrideC;
-        using StrideD = typename GemmKernel::StrideD;
-
-        StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)shape_m, (int)shape_k, 1));
-        StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape((int)shape_n, (int)shape_k, 1));
-        StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape((int)shape_m, (int)shape_n, 1));
-        auto stride_C = stride_D;
-
-        int max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
-
-        cutlass::KernelHardwareInfo hw_info;
-        hw_info.device_id = 0;
-        hw_info.cu_count = num_sms * max_blocks_per_cu;
-
-        typename GemmKernel::Arguments arguments{
-            cutlass::gemm::GemmUniversalMode::kGemm,
-            {(int)shape_m, (int)shape_n, (int)shape_k, 1},
-            {(ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B, scales_a, scales_b},
-            {{1.0f, 0.0f}, (ElementC*)gmem_d, stride_C, (ElementD*)gmem_d, stride_D},
-            hw_info,
-            {shape_m, shape_n, shape_k, nullptr}
-        };
-
-        arguments.epilogue.thread.alpha = 1;
-        arguments.epilogue.thread.beta = 0;
-        auto params = GemmKernel::to_underlying_arguments(arguments, nullptr);
-
-        dim3 const block = GemmKernel::get_block_shape();
-        dim3 const grid = GemmKernel::get_grid_shape(params);
-        int smem_size_kernel = GemmKernel::SharedStorageSize;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(
-                GemmType::Normal, false, std::string("int8"), 1, shape_m, shape_n, shape_k, shape_m,
-                nullptr, stream
-            );
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-        cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-        hggcFuncAttributes attr;
-        hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
-
-        const int threadblock_count = num_sms * max_blocks_per_cu;
-        char *pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            printf("[DenseGemm-A8W8-Standalone:]\n");
-            printf("problem:[%d, %d, %d]\n", shape_m, shape_n, shape_k);
-            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
-                BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, kNumStages);
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_blocks_per_cu, threadblock_count);
-            printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
-        }
-    }
-};
-
-}  // namespace deep_gemm
 
 #pragma clang diagnostic pop

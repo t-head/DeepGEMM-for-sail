@@ -109,9 +109,8 @@ private:
     int _bpp;
     int reg_db;
     std::vector<std::vector<int>> _config_tile;
-    // Must preserve insertion order: this is the metric priority used by _multi_phase_topk,
-    // matching the dict literal in gemm_search_space.py. An unordered container would let the
-    // hash bucket layout decide the priority and silently reverse it.
+    // Preserve insertion order for the metric priority used by _multi_phase_topk.
+    // An unordered container would let the hash bucket layout change that priority.
     std::vector<std::pair<int, bool>> _filter_metric;
     HWMetric _hw_metric;
 

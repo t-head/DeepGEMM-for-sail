@@ -40,7 +40,7 @@ The shared CI workflow uses the functional check-in with sixteen compiler worker
 
 Case logs include peak Torch allocated and reserved device memory, reset before each case and measured before releasing its cached allocations.
 
-For manual debugging, `--phase compile` only precompiles, and `--phase run` runs correctness serially. A custom `--caselist` does not select daily script checks. Compilation-only results are not accuracy results. Keep the wheel, device and compilation-related environment identical between the phases. If overriding cache roots, use the same `DG_JIT_CACHE_DIR` (C++) and `DG_CACHE_DIR` (Python) in both phases and all workers.
+For manual debugging, `--phase compile` only precompiles, and `--phase run` runs correctness serially. A custom `--caselist` does not select daily script checks. Compilation-only results are not accuracy results. Keep the wheel, device and compilation-related environment identical between the phases. If overriding the cache root, use the same `DG_JIT_CACHE_DIR` in both phases and all workers.
 
 A single case can also be replayed directly:
 

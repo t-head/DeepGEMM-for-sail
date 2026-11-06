@@ -3,10 +3,6 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #pragma clang diagnostic ignored "-Wswitch"
 
-#ifndef W4A16_HGRTC
-    #include <deep_gemm/common/profiling_interface.cuh>
-#endif
-
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/math.cuh>
 
@@ -19,7 +15,6 @@
 #include <cute/atom/copy_traits_ppu0015_aiu.hpp>
 #include <cute/algorithm/ppu_copy.hpp>
 #include <deep_gemm/impls/dequant_w4a16.cuh>
-#include <deep_gemm/common/profiling_interface.cuh>
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/scheduler/fused_scheduler.cuh>
 #include <deep_gemm/impls/fused_gemm_util.cuh>

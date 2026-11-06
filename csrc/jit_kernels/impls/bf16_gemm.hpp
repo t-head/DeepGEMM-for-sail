@@ -173,7 +173,6 @@ public:
                                                         : sizeof(args.kernel_params.no_tsm);
         return fmt::format(
             R"(
-#define BF16_HGRTC
 #include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
@@ -482,7 +481,6 @@ public:
         const bool is_aligned_n = (shape_n % args.launch_info.block_n == 0);
         return fmt::format(
             R"(
-#define BF16_HGRTC
 #include <deep_gemm/impls/bf16_densegemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
@@ -724,7 +722,6 @@ public:
 
         return fmt::format(
             R"(
-#define BF16_HGRTC
 #include <deep_gemm/impls/bf16_gemm_cute_free.cuh>
 
 namespace deep_gemm {{
@@ -896,9 +893,8 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
 
     Config cfg;
     if (configs.has_value()) {
-        // Explicit config path: unpack the 8-element public tuple; force warp_k = block_k
-        // (mirrors deep_gemm/jit_kernels/gemm.py lines 406-408/422;
-        // adaptive is NOT re-evaluated here).
+        // Explicit config path: unpack the 8-element public tuple and force warp_k = block_k;
+        // adaptive selection is not re-evaluated here.
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, /*warp_k=*/bk, nst,
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
@@ -1370,7 +1366,6 @@ public:
     struct Args { LaunchArgs launch_args; Params params; int splits; };
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-#define BF16_HGRTC
 #include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
 extern "C" __global__ void model_810e_splitk_reduce(deep_gemm::Model810eReduceParams p) {{
     deep_gemm::model_810e_reduce<{}, {}>(p);
