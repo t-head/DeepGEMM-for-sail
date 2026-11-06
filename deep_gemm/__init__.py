@@ -101,6 +101,8 @@ from ._C import (
     # Hyperconnection kernels
     tf32_hc_prenorm_gemm,
     mega_mhc,
+    bf16_mega_gate,
+    use_deterministic_algorithms,
     # Einsum kernels
     fp8_einsum,
     int8_einsum,
