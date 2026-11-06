@@ -133,12 +133,12 @@ class _DeepEPBaseline:
     def __init__(self, buffer_type, case, group, l1_weights, l2_weights, kind):
         if kind not in ("normal", "low_latency"):
             raise ValueError(f"unsupported DeepEP baseline: {kind}")
-        if case.activation not in ("swiglu", "step", "situ"):
+        if case.activation not in ("swiglu", "swiglu_step", "situ"):
             raise ValueError(f"unsupported DeepEP activation: {case.activation}")
         self.case, self.kind = case, kind
         self.world, self.local_experts = group.size(), case.experts // group.size()
         self.warming_up = False
-        self.fused_activation = case.activation in ("swiglu", "step")
+        self.fused_activation = case.activation in ("swiglu", "swiglu_step")
         mode = deep_gemm.PreprocessMode.MXFP4
         self.l1_weights = deep_gemm.preprocess_weights_and_scales(
             mode, self.fused_activation, weight=l1_weights[0], weight_scale=l1_weights[1])
@@ -197,7 +197,7 @@ class _DeepEPBaseline:
         if self.fused_activation:
             gemm(lhs, self.l1_weights, None, activated, *args, out_scale=scales,
                  swiglu_limit=self.case.clamp or None,
-                 activation_type="silu_and_mul_step" if self.case.activation == "step" else "silu_and_mul")
+                 activation_type="silu_and_mul_step" if self.case.activation == "swiglu_step" else "silu_and_mul")
             return activated, scales
         # Ordinary grouped FP4 GEMM has no fused SiTU epilogue. Include the
         # standalone SiTU + MXFP4 quantization kernel in the complete baseline.
@@ -205,10 +205,10 @@ class _DeepEPBaseline:
         if self.kind == "low_latency":
             return deep_gemm.activation_and_mul_masked(
                 deep_gemm.ActivationMode.SITU, deep_gemm.QuantMode.MXFP4,
-                raw, counts, expected_m=expected_m, beta=4., linear_beta=25.)
+                raw, counts, expected_m=expected_m, beta=self.case.situ_beta, linear_beta=self.case.situ_linear_beta)
         return deep_gemm.activation_and_mul(
             deep_gemm.ActivationMode.SITU, deep_gemm.QuantMode.MXFP4,
-            raw, beta=4., linear_beta=25.)
+            raw, beta=self.case.situ_beta, linear_beta=self.case.situ_linear_beta)
 
     def _normal(self, x, ids, weights):
         c = self.case
@@ -365,12 +365,14 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
                 deep_gemm.mega_moe_pre_dispatch(x, routed_ids, routed_weights, workspace)
                 deep_gemm.fp4_fp4_mega_moe(
                     y, w1, w2, workspace, activation=case.activation,
-                    activation_clamp=case.clamp, fast_math=bool(args.fast_math), **replica_options)
+                    activation_clamp=case.clamp, fast_math=bool(args.fast_math),
+                    situ_beta=case.situ_beta, situ_linear_beta=case.situ_linear_beta,
+                    activation_alpha=case.activation_alpha, **replica_options)
                 return y
 
-            def reference(checked):
+            def reference(checked, *, projection_dtype=torch.float32):
                 return _reference_mega_moe(case, source, ids, weights, w1_raw, w2_raw,
-                                          tokens, checked)
+                                          tokens, checked, projection_dtype=projection_dtype)
 
             report = _check_mega_moe(
                 case, x, requested, run_mega, reference,
@@ -397,7 +399,9 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
                     baseline_report["num_max_tokens_per_rank"] = baseline.capacity
                 if not args.no_check:
                     checked = min(requested, args.reference_tokens) if args.reference_tokens else requested
-                    baseline_report["correctness"] = _check_baseline(baseline_expected, reference(checked))
+                    projection_dtype = torch.float32 if baseline.fused_activation else torch.bfloat16
+                    baseline_report["correctness"] = _check_baseline(
+                        baseline_expected, reference(checked, projection_dtype=projection_dtype))
 
             timing_options = dict(warmup=args.warmup, iterations=args.iterations,
                                   repeats=args.repeats, mode=args.mode)
@@ -429,6 +433,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--case", choices=[c.name for c in CASES], default=CASES[0].name)
+    parser.add_argument("--hidden", type=int)
+    parser.add_argument("--intermediate-hidden", type=int)
+    parser.add_argument("--num-experts", type=int)
+    parser.add_argument("--num-topk", type=int)
+    parser.add_argument("--ep", type=int, help="expected process-group size")
     parser.add_argument("--num-tokens", "--tokens", dest="tokens", type=int, nargs="+")
     parser.add_argument("--num-max-tokens-per-rank", "--capacity", dest="capacity", type=int)
     parser.add_argument("--routing", choices=("round_robin", "random", "skewed"), default="round_robin")
@@ -443,13 +452,19 @@ def main(argv=None):
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261016)
-    parser.add_argument("--replicas", action="store_true", help="test separately allocated replica weights")
+    parser.add_argument("--replicas", action="store_true", help="test duplicated physical expert slots")
     parser.add_argument("--edge-cases", action="store_true",
                         help="also check empty ranks and masked routes before timing")
     args = parser.parse_args(argv)
     case = next(c for c in CASES if c.name == args.case)
     case = replace(case, tokens=tuple(args.tokens) if args.tokens is not None else case.tokens,
-                   capacity=args.capacity if args.capacity is not None else case.capacity, routing=args.routing)
+                   capacity=args.capacity if args.capacity is not None else case.capacity, routing=args.routing,
+                   hidden=args.hidden if args.hidden is not None else case.hidden,
+                   intermediate=args.intermediate_hidden if args.intermediate_hidden is not None else case.intermediate,
+                   experts=args.num_experts if args.num_experts is not None else case.experts,
+                   topk=args.num_topk if args.num_topk is not None else case.topk)
+    if not 1 <= case.topk <= case.experts:
+        parser.error("num-topk must be between 1 and num-experts")
     if case.capacity < 1 or any(n < 0 or n > case.capacity for n in case.tokens):
         parser.error("tokens must be nonnegative and no larger than a positive capacity")
     if args.reference_tokens < 0 or args.warmup < 0 or args.iterations < 1 or args.repeats < 1:
@@ -460,8 +475,10 @@ def main(argv=None):
                      "both paths must use the same timing mode")
     with _process_group() as group:
         world = dist.get_world_size()
-        if world not in case.worlds or case.experts % world:
-            raise ValueError(f"{case.name} requires EP{case.worlds}; launched EP{world}")
+        if args.ep is not None and world != args.ep:
+            raise ValueError(f"--ep={args.ep} requires {args.ep} launched ranks; got {world}")
+        if case.experts % world:
+            raise ValueError(f"E={case.experts} must be divisible by EP{world}")
         if args.replicas and case.experts // world < 2:
             raise ValueError("--replicas requires at least two local experts")
         buffer_type, skip_reason = _import_baseline() if args.baseline != "none" else (None, None)
