@@ -21,7 +21,7 @@ class PPUMqaLogits {
 public:
   // Avg variants (kScaleMode != kScaleModeWeights): no per-head weights,
   // logits = sum_h(relu(qk)) * scale_q * k_scale / sqrt(kHeadDim)
-  // (float logits / float weights slot enforced by the Python entry, see jit_kernels/attention.py)
+  // The host passes FP32 q_scale through the weights slot; logits may be FP32 or BF16.
   static constexpr float kInvSqrtHeadDim = kHeadDim == 32 ? 0x1.6a09e6p-3f : (kHeadDim == 64 ? 0x1p-3f : 0x1.6a09e6p-4f);
   static constexpr int BLOCK_M = BLOCK_KV;
   static constexpr int BLOCK_N = BLOCK_QH;
@@ -46,7 +46,7 @@ public:
 #endif
 
   using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementQK,ElementQK,ElementAcc>::type;
-  using MmaK_type = typename cutlass::platform::conditional<sizeof(ElementQK) == 2, _16, _32 >::type;
+  static_assert(sizeof(ElementQK) == 1, "MQA Q/K must use FP8 or INT8 storage");
 
   static constexpr int InstM = 16;
   static constexpr int InstN = 16;
@@ -57,7 +57,7 @@ public:
   using PermutationMNK = Tile<
       Layout<Shape<Int<InstM>, WarpIterM, MmaIterM>, Stride<_1, Int<WARP_M>, Int<InstM>> >,
       Layout<Shape<Int<InstN>, WarpIterN, MmaIterN>, Stride<_1, Int<WARP_N>, Int<InstN>> >,
-      MmaK_type
+      _32
     >;
   using TiledMma = TiledMMA<MMA_Atom<MmaInst>, Layout<Shape<WarpIterM, WarpIterN, _1>>, PermutationMNK>;
 
@@ -312,9 +312,7 @@ public:
             printf("    kv_block_idx = %d, dim_h = %d\n", kv_block_idx, residual_m);
         }
         copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_stage), warp_idx);
-        if constexpr(sizeof(ElementQK) == 1) {
-            copy_aiu(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_stage), warp_idx);
-        }
+        copy_aiu(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_stage), warp_idx);
         tAgA.data() = tAgA.data() + BLOCK_KV * kHeadDim;
         tSFAgSFA.data() = tSFAgSFA.data() + BLOCK_KV;
     };
@@ -342,13 +340,13 @@ public:
             if constexpr (kWq4) {
                 // Each lane stores only its own parity's kv row in the WARP_Q==4
                 // epilogue, so it only loads that row's scale
-                scale_kv_array[m] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
+                scale_kv_array[m] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
                     scale_kv_array[m] *= kInvSqrtHeadDim;
                 }
             } else {
-                scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
-                scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
+                scale_kv_array[m * 2    ] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
+                scale_kv_array[m * 2 + 1] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
                     scale_kv_array[m * 2    ] *= kInvSqrtHeadDim;
                     scale_kv_array[m * 2 + 1] *= kInvSqrtHeadDim;
@@ -403,10 +401,11 @@ public:
                     const uint32_t q_idx = q_base + local_q_warp;
                     if constexpr (kIsCompressedLogits) {
                         const uint32_t lq = warp_q_idx * WARP_Q + local_q_warp;
-                        const uint32_t rel_kv = kv_offset + mma_offset - seq_k_start[lq];
+                        // Finish the uint32 relative column before adding the row base.
+                        const uint32_t rel_kv = kv_offset + mma_offset + v_offset_mine - seq_k_start[lq];
                         const uint32_t len = seq_k_end[lq] - seq_k_start[lq];
-                        if (rel_kv + v_offset_mine < len)
-                            params.logits[q_idx * params.stride_k + rel_kv + v_offset_mine] = total * scale_kv_r * scale_q_t;
+                        if (rel_kv < len)
+                            params.logits[q_idx * params.stride_k + rel_kv] = total * scale_kv_r * scale_q_t;
                     } else {
                         params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_offset_mine] = total * scale_kv_r * scale_q_t;
                     }
@@ -426,12 +425,14 @@ public:
                 // Store into the global memory
                 const uint32_t& q_idx = block_q_idx * BLOCK_Q + warp_q_idx;
                 if constexpr (kIsCompressedLogits) {
-                    const uint32_t rel_kv = kv_offset + mma_offset - seq_k_start[warp_q_idx];
+                    // Finish each uint32 relative column before adding the row base.
+                    const uint32_t rel_lo = kv_offset + mma_offset + v_0_offset - seq_k_start[warp_q_idx];
+                    const uint32_t rel_hi = kv_offset + mma_offset + v_1_offset - seq_k_start[warp_q_idx];
                     const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
-                    if (rel_kv + v_0_offset < len)
-                        params.logits[q_idx * params.stride_k + rel_kv + v_0_offset] = v_0 * scale_kv_0;
-                    if (rel_kv + v_1_offset < len)
-                        params.logits[q_idx * params.stride_k + rel_kv + v_1_offset] = v_1 * scale_kv_1;
+                    if (rel_lo < len)
+                        params.logits[q_idx * params.stride_k + rel_lo] = v_0 * scale_kv_0;
+                    if (rel_hi < len)
+                        params.logits[q_idx * params.stride_k + rel_hi] = v_1 * scale_kv_1;
                 } else {
                     params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_0_offset] = v_0 * scale_kv_0;
                     params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_1_offset] = v_1 * scale_kv_1;
@@ -476,12 +477,13 @@ public:
                 if constexpr (kIsCompressedLogits) {
                     const uint32_t lq_lo = warp_q_idx * WARP_Q + lane_in_quad / 2;
                     const uint32_t lq_hi = warp_q_idx * WARP_Q + 2 + lane_in_quad / 2;
-                    const uint32_t rel_lo = kv_offset + mma_offset - seq_k_start[lq_lo];
-                    const uint32_t rel_hi = kv_offset + mma_offset - seq_k_start[lq_hi];
-                    if (rel_lo + v_offset_mine < seq_k_end[lq_lo] - seq_k_start[lq_lo])
-                        params.logits[q_idx_lo * params.stride_k + rel_lo + v_offset_mine] = __low2bfloat16(out2);
-                    if (rel_hi + v_offset_mine < seq_k_end[lq_hi] - seq_k_start[lq_hi])
-                        params.logits[q_idx_hi * params.stride_k + rel_hi + v_offset_mine] = __high2bfloat16(out2);
+                    // Finish each uint32 relative column before adding the row base.
+                    const uint32_t rel_lo = kv_offset + mma_offset + v_offset_mine - seq_k_start[lq_lo];
+                    const uint32_t rel_hi = kv_offset + mma_offset + v_offset_mine - seq_k_start[lq_hi];
+                    if (rel_lo < seq_k_end[lq_lo] - seq_k_start[lq_lo])
+                        params.logits[q_idx_lo * params.stride_k + rel_lo] = __low2bfloat16(out2);
+                    if (rel_hi < seq_k_end[lq_hi] - seq_k_start[lq_hi])
+                        params.logits[q_idx_hi * params.stride_k + rel_hi] = __high2bfloat16(out2);
                 } else {
                     params.logits[q_idx_lo * params.stride_k + kv_offset + mma_offset + v_offset_mine] = __low2bfloat16(out2);
                     params.logits[q_idx_hi * params.stride_k + kv_offset + mma_offset + v_offset_mine] = __high2bfloat16(out2);
@@ -512,12 +514,14 @@ public:
                 // Store
                 const uint32_t& q_idx = block_q_idx * BLOCK_Q + warp_q_idx;
                 if constexpr (kIsCompressedLogits) {
-                    const uint32_t rel_kv = kv_offset + mma_offset - seq_k_start[warp_q_idx];
+                    // Finish each uint32 relative column before adding the row base.
+                    const uint32_t rel_lo = kv_offset + mma_offset + v_0_offset - seq_k_start[warp_q_idx];
+                    const uint32_t rel_hi = kv_offset + mma_offset + v_1_offset - seq_k_start[warp_q_idx];
                     const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
-                    if (rel_kv + v_0_offset < len)
-                        params.logits[q_idx * params.stride_k + rel_kv + v_0_offset] = __low2bfloat16(packed);
-                    if (rel_kv + v_1_offset < len)
-                        params.logits[q_idx * params.stride_k + rel_kv + v_1_offset] = __high2bfloat16(packed);
+                    if (rel_lo < len)
+                        params.logits[q_idx * params.stride_k + rel_lo] = __low2bfloat16(packed);
+                    if (rel_hi < len)
+                        params.logits[q_idx * params.stride_k + rel_hi] = __high2bfloat16(packed);
                 } else {
                     params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_0_offset] = __low2bfloat16(packed);
                     params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_1_offset] = __high2bfloat16(packed);

@@ -121,7 +121,7 @@ public:
     using SmemLayoutSFA =
         decltype(tile_to_shape(SmemLayoutAtomSFA{}, make_shape(_1{}, Int<BLOCK_M>{}, Int<kNumKVStages>{})));
 
-    // SFB (q_sf / weights): one uint32_t/float32 per Q head
+    // SFB (q_sf): one packed uint32_t scale per Q head
     using DefaultOperandSFB =
         cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, uint32_t, false, _1, Int<BLOCK_N>, false, 0, false>;
     using SmemLayoutAtomSFB = typename DefaultOperandSFB::SmemLayoutAtom;
@@ -481,12 +481,14 @@ public:
                         deep_gemm::float_epilogue_reduce_tCrW(accum, m, tCrW, v_0, v_1);
                         deep_gemm::shfl_xor_reduce_2(v_0, v_1);
                         if constexpr (kIsCompressedLogits) {
-                            const uint32_t rel_kv = static_cast<uint32_t>(logits_kv_offset) - seq_k_start[warp_q_idx];
+                            // Finish each uint32 relative column before adding the row base.
+                            const uint32_t rel_lo = static_cast<uint32_t>(logits_kv_offset) + v_0_offset - seq_k_start[warp_q_idx];
+                            const uint32_t rel_hi = static_cast<uint32_t>(logits_kv_offset) + v_1_offset - seq_k_start[warp_q_idx];
                             const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
-                            if (rel_kv + v_0_offset < len)
-                                params.logits[logits_q_offset + rel_kv + v_0_offset] = v_0;
-                            if (rel_kv + v_1_offset < len)
-                                params.logits[logits_q_offset + rel_kv + v_1_offset] = v_1;
+                            if (rel_lo < len)
+                                params.logits[logits_q_offset + rel_lo] = v_0;
+                            if (rel_hi < len)
+                                params.logits[logits_q_offset + rel_hi] = v_1;
                         } else {
                             params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = v_0;
                             params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = v_1;
@@ -581,12 +583,14 @@ public:
                         __ppu_bfloat16 v_1_bf = __hadd(__low2bfloat16(sum_1), __high2bfloat16(sum_1));
                         __ppu_bfloat162 packed = deep_gemm::shfl_xor_reduce_bf16x2({v_0_bf, v_1_bf});
                         if constexpr (kIsCompressedLogits) {
-                            const uint32_t rel_kv = static_cast<uint32_t>(logits_kv_offset) - seq_k_start[warp_q_idx];
+                            // Finish each uint32 relative column before adding the row base.
+                            const uint32_t rel_lo = static_cast<uint32_t>(logits_kv_offset) + v_0_offset - seq_k_start[warp_q_idx];
+                            const uint32_t rel_hi = static_cast<uint32_t>(logits_kv_offset) + v_1_offset - seq_k_start[warp_q_idx];
                             const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
-                            if (rel_kv + v_0_offset < len)
-                                params.logits[logits_q_offset + rel_kv + v_0_offset] = __low2bfloat16(packed);
-                            if (rel_kv + v_1_offset < len)
-                                params.logits[logits_q_offset + rel_kv + v_1_offset] = __high2bfloat16(packed);
+                            if (rel_lo < len)
+                                params.logits[logits_q_offset + rel_lo] = __low2bfloat16(packed);
+                            if (rel_hi < len)
+                                params.logits[logits_q_offset + rel_hi] = __high2bfloat16(packed);
                         } else {
                             params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = __low2bfloat16(packed);
                             params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = __high2bfloat16(packed);

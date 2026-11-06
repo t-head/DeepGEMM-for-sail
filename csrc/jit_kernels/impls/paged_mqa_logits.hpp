@@ -264,24 +264,19 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
     ProfilingInterface::Instance().instrument(false, dg_prof_params);
 }
 
-// Host entry for the `schedule_metadata` table. `metadata_extra` = (next_n, num_heads, head_dim,
-// element_size); when absent we fall back to the compatibility tile. Use the
-// same stored-shape tile selection as the compute entry below.
+// metadata_extra = (next_n, num_heads, logical_head_dim, qk_dtype).
+// M890 torch::kInt8 denotes MXFP4; 810E torch::kInt8 denotes true INT8.
 static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens, int batch_size, int page_kv,
                                               int num_sms,
-                                              const std::optional<std::tuple<int, int, int, int>>& metadata_extra) {
+                                              const std::tuple<int, int, int, torch::ScalarType>& metadata_extra) {
     DG_HOST_ASSERT(page_kv == 32 or page_kv == 64 or page_kv == 128);
-    int next_n = context_lens.size(1);
-    int tb_per_cu = 1;
-    // fallback: assume max num_math_warpgroups=4 to avoid crash
-    int split_kv = kPagedMqaBlockKV * 4;
-    if (metadata_extra.has_value()) {
-        const auto& [extra_next_n, num_heads, head_dim, element_size] = *metadata_extra;
-        next_n = extra_next_n;
-        const auto& tile =
-            deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
-        split_kv = tile.split_kv, tb_per_cu = tile.tb_per_cu;
-    }
+    const auto& [next_n, num_heads, logical_head_dim, qk_dtype] = metadata_extra;
+    const bool is_fp4 = get_ppu_arch() == AC_PPU0015 and qk_dtype == torch::kInt8;
+    const int head_dim = is_fp4 ? logical_head_dim / 2 : logical_head_dim;
+    const int element_size = static_cast<int>(c10::elementSize(qk_dtype));
+    const auto& tile =
+        deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
+    const int split_kv = tile.split_kv, tb_per_cu = tile.tb_per_cu;
 
     const int num_blocks = num_sms * tb_per_cu;
     auto schedule_metadata = torch::empty(
@@ -324,23 +319,19 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     const int64_t block_table_stride = block_table.stride(0);
 
     // Each quantized page stores all K values first, then its per-token scales.
-    // BF16 pages contain only K values; their strides are in BF16 elements.
     auto k = fused_kv_cache.as_strided({num_kv_blocks, page_kv, head_dim}, {kv_cache_stride_bytes, head_dim, 1});
     if (not is_fp4)
         k = k.view(qk_dtype);
-    torch::Tensor k_scales;
-    if (is_fp4 or qk_dtype != torch::kBFloat16) {
-        k_scales = fused_kv_cache
-                       .as_strided({num_kv_blocks, page_kv * 4}, {kv_cache_stride_bytes, 1},
-                                   fused_kv_cache.storage_offset() + page_kv * head_dim)
-                       .view(is_fp4 ? torch::kInt32 : torch::kFloat32);
-    }
+    auto k_scales = fused_kv_cache
+                   .as_strided({num_kv_blocks, page_kv * 4}, {kv_cache_stride_bytes, 1},
+                               fused_kv_cache.storage_offset() + page_kv * head_dim)
+                   .view(is_fp4 ? torch::kInt32 : torch::kFloat32);
 
     const auto& tile = deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim,
                                                                       static_cast<int>(q.element_size()));
-    if (is_fp4 and is_avg)
+    if (is_fp4)
         TORCH_CHECK(schedule_meta_size - 1 == get_num_sms() * tile.tb_per_cu,
-                    "FP4 paged AVG requires metadata built with metadata_extra=(next_n, 4, 64, 1) "
+                    "FP4 paged logits require matching metadata_extra=(next_n, H, 128, torch.int8) on M890 "
                     "and the current num_sms");
     if (not is_fp4)
         TORCH_CHECK(not tile.split_mblock, "SPLIT_MBLOCK is only supported for FP4 paged kernel");
@@ -370,8 +361,6 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     std::string element_qk, element_acc, dtype_tag;
     if (is_fp4) {
         element_qk = "uint8_t", element_acc = "float", dtype_tag = "fp4";
-    } else if (qk_dtype == torch::kBFloat16) {
-        element_qk = "cutlass::bfloat16_t", element_acc = "float", dtype_tag = "bf16";
     } else if (qk_dtype == torch::kFloat8_e4m3fn) {
         element_qk = "cutlass::float_e4m3_t", element_acc = "float", dtype_tag = "fp8";
     } else {
