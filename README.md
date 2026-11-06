@@ -16,6 +16,7 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 - **Supported precision modes**: The PPU version supports INT8, FP4, FP8, and BF16 across non-grouped GEMM and grouped GEMM layouts, covering both dense GEMM and MoE grouped GEMM scenarios.
 - **Standalone activation on M890**: SiLU and SiTU with BF16, per-row/per-block FP8, MXFP4, or MXFP8 output, including masked expert batches and explicit output-mode selection.
 - **W4A8 MoE on M890**: E4M3 per-row activations and group-32 MXFP4 weights, with FP32 accumulation and BF16 output for nopad, masked, and fused routing layouts.
+- **NVFP4 W4A8 on M890**: E4M3 activations and group-16 NVFP4 weights for dense, nopad, masked, and fused routing GEMMs, with fused decoding or per-call decode-to-FP8 execution.
 - **A8W4 INT8 MoE**: INT8 per-token activations and portable packed signed-INT4 per-channel weights, with INT32 accumulation and BF16 output for nopad and masked grouped layouts on Zhenwu 610 / 610E / 810 / 810E (PPU001).
 - **Additional nopad grouped GEMM layout**: In addition to contiguous and masked grouped GEMM layouts, this fork introduces a nopad layout. It uses an index tensor to describe per-expert token counts, avoiding mandatory M-block padding for variable-token MoE workloads and reducing unnecessary data movement.
 - **AIU-oriented alignment requirements**: The PPU version replaces the original alignment assumptions with AIU-aligned scaling factors and AIU-aligned utility tensors, matching the data movement requirements described by this fork.
@@ -31,7 +32,7 @@ Highlights:
 - **W4A4 MegaMoE** on PPU1.5: a complete MXFP4 routed MoE pipeline with BF16 output, reusable workspaces, and load-time weight preparation. See the [calling contract](#mega-moe).
 - **More low-precision MoE kernels**: W4A8 on M890 and INT8 A8W4 on Zhenwu 610 / 610E / 810 / 810E, with unified weight preprocessing.
 - **Activation and quantization** on M890: standalone SiLU, SiTU, and SiLU STEP with BF16, FP8, MXFP4, or MXFP8 output, plus STEP activation in fused FP4 epilogues.
-- **Mega-mHC and sparse MQA** on M890P: fused shifted mHC for DeepSeek V4.1 Flash and MXFP4 sparse attention-indexer logits for prefill and paged decode. Regular paged MQA now supports page sizes 32, 64, and 128.
+- **Mega-mHC and sparse MQA** on M890: fused shifted mHC for DeepSeek V4.1 Flash and MXFP4 sparse attention-indexer logits for prefill and paged decode. Regular paged MQA now supports page sizes 32, 64, and 128.
 - **External GEMM tuning tables**: device- and precision-specific configurations through `SAIL_DEEPGEMM_LUT_PATH`, with fallback to built-in selection.
 
 See [CHANGELOG.md](CHANGELOG.md#110v100) for complete release notes and API migration details.
@@ -105,13 +106,13 @@ This library focuses on high-performance tensor cell kernels and related LLM com
 
 #### Data Precisions
 
-| Algorithm | INT8 | FP4 | FP8 | BF16 | W4A16 | W4A8 (M890) | A8W4 INT8 (PPU001) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Non-grouped** | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
-| **Contiguous** | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| **No-pad** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Masked** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Fused** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Algorithm | INT8 | FP4 | FP8 | BF16 | W4A16 | MXFP4 W4A8 (M890) | NVFP4 W4A8 (M890) | A8W4 INT8 (PPU001) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Non-grouped** | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
+| **Contiguous** | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **No-pad** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Masked** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Fused** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 
 #### Normal dense GEMMs (non-grouped)
 
@@ -274,6 +275,140 @@ removing the keyword alone is insufficient. See the
 [preprocessing implementation](csrc/jit_kernels/heuristics/common_preprocess.hpp)
 for the required weight and scale layouts.
 
+#### NVFP4 W4A8 GEMMs (M890)
+
+NVFP4 W4A8 accepts `(activation, activation_scale)` and
+`(prepared_weight, native_scale)` operand pairs and writes BF16 output on
+PPU1.5. It supports the following NT layouts:
+
+| API | Activation shape | Output shape |
+| :--- | :--- | :--- |
+| `gemm_fp8_nvfp4_bf16_nt` | `[M,K]` | `[M,N]` |
+| `m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad` | `[M,K]`, grouped by expert | `[M,N]` |
+| `m_grouped_gemm_fp8_nvfp4_bf16_nt_masked` | `[E,T,K]` | `[E,T,N]`, valid rows only |
+| `m_grouped_gemm_fp8_nvfp4_bf16_nt_fused` | `[num_token,K]`, original token order | `[num_token*topk,N]`, grouped by expert |
+
+Checkpoint weights are packed E2M1 uint8 `[E,N,K/2]`, with even K values
+in the low nibble and native E4M3FN scales `[E,N,K/16]`. Prepare both through
+`preprocess_weights_and_scales(mode, False, packed_weight, native_scale)`;
+the returned pair contains int32 weights and uint8 E4M3 scale bytes.
+`N % 64 == 0` and `K % 32 == 0` are required. GEMM operands and routing
+metadata must be contiguous on the same device, except that the
+decode-to-FP8 path also accepts strided activation scales. Dense calls
+accept prepared buffers with the E=1 dimension removed. Routing/count
+metadata uses int32 and follows the MXFP4 W4A8 calling convention above.
+
+Activations are E4M3FN. FP32 activation scales are `[M,1]` with
+`lhs_scale_group_size=0` (the default), or `[M,ceil(K/G)]` with
+`lhs_scale_group_size=G`, where G is 16 or a positive multiple of 32.
+Masked inputs add E as the first dimension. `(activation, None)` selects
+unit per-token scales in fused execution.
+
+NVFP4's two scale levels represent
+`weight = E2M1 * native_k16_scale * global_scale`.
+Pass the original FP32 global scale as `weight_global_scale`, a scalar
+or `[E]`; the default `None` means unit scaling. The additional FP32 `rhs_scales` restores
+the kernel's FP8 weight representation and is separate from `rhs[1]`:
+
+| `rhs_scale_block_size` | `rhs_scales` shape, dense / grouped | Behavior |
+| :--- | :--- | :--- |
+| `0` (default) | `[N]` / `[E,N]`, also with a trailing singleton dimension; optional | Per-channel scaling; fused execution retains native K16 scaling without FP8 weight rounding |
+| `128` | `[ceil(N/128),ceil(K/128)]` / `[E,ceil(N/128),ceil(K/128)]`; required | Round native NVFP4 values to E4M3 before MMA, then apply outer 128x128 scales to FP32 partial sums |
+
+All scales are multiplicative and apply before BF16 output. The caller
+selects execution explicitly; token count does not select the path:
+
+- `execution='fused'` (default): prepare weights with
+  `PreprocessMode.W4A8_NVFP4` and decode inside GEMM, without a full FP8 workspace.
+- `execution='dequantize'`: prepare weights with
+  `PreprocessMode.W4A8_NVFP4_FP8`, decode all weights on each call, then run
+  the existing FP8 GEMM. Pass a caller-owned contiguous E4M3FN `fp8_workspace`
+  `[E,N,K]` (`[N,K]` for dense), explicit activation scales (per-token or
+  K128), and `rhs_scale_block_size=128` with explicit `rhs_scales`.
+
+Weight preparation runs once at model load time. This nopad example uses
+K128 activation scales and 128x128 outer weight scales. Activation rows
+are already grouped by expert; `m_indices` gives each row's expert and
+`m_rows` gives per-expert counts:
+
+```python
+import torch
+import deep_gemm as dg
+
+# packed_weight: uint8 [E,N,K/2]; native_scale: E4M3FN [E,N,K/16].
+# a: E4M3FN [M,K]; a_scale: FP32 [M,ceil(K/128)]; out: BF16 [M,N].
+# block_scale: FP32 [E,ceil(N/128),ceil(K/128)]; global_scale: FP32 scalar or [E].
+rhs = dg.preprocess_weights_and_scales(
+    dg.PreprocessMode.W4A8_NVFP4, False, packed_weight, native_scale)
+dg.m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad(
+    (a, a_scale), rhs, out, m_indices, m_rows=m_rows,
+    lhs_scale_group_size=128, rhs_scales=block_scale,
+    rhs_scale_block_size=128, weight_global_scale=global_scale)
+
+# Prepare this layout once if the caller also uses decode-to-FP8 execution.
+rhs_fp8 = dg.preprocess_weights_and_scales(
+    dg.PreprocessMode.W4A8_NVFP4_FP8, False, packed_weight, native_scale)
+e, n, packed_k = packed_weight.shape
+workspace = torch.empty((e, n, packed_k * 2), device=a.device, dtype=torch.float8_e4m3fn)
+dg.m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad(
+    (a, a_scale), rhs_fp8, out, m_indices, m_rows=m_rows,
+    lhs_scale_group_size=128, rhs_scales=block_scale,
+    rhs_scale_block_size=128, weight_global_scale=global_scale,
+    execution='dequantize', fp8_workspace=workspace)
+```
+
+Allocate the FP8 workspace outside the timed region, separate from operands
+and routing metadata. It occupies `E*N*K` bytes and is refreshed on every
+call on the current stream. The two prepared weight layouts are not
+interchangeable. The GEMM entry handles decoding internally and applies
+`rhs_scales` and the global scale during the subsequent FP8 GEMM.
+
+Dense/nopad/masked select configurations internally unless `configs` is supplied.
+For fused routing with `execution='fused'`, `moe_align_block_size` selects
+the configuration and produces matching routing metadata. Pass it the
+prepared weights and the same scale granularity options as GEMM:
+
+```python
+# a and a_scale are in original token order; topk_ids is int32 [num_token, topk].
+routed_out = torch.empty((a.size(0) * topk_ids.size(1), packed_weight.size(1)),
+                         device=a.device, dtype=torch.bfloat16)
+configs, rows, experts, tokens, blocks, _, _ = dg.moe_align_block_size(
+    a, rhs[0], topk_ids,
+    lhs_scale_group_size=128, rhs_scale_block_size=128)
+dg.m_grouped_gemm_fp8_nvfp4_bf16_nt_fused(
+    (a, a_scale), rhs, routed_out, rows, experts, tokens, blocks, configs,
+    lhs_scale_group_size=128, rhs_scales=block_scale,
+    rhs_scale_block_size=128, weight_global_scale=global_scale)
+```
+
+The optional `config` argument to `moe_align_block_size` overrides tile
+selection, as for other dtypes. For `execution='dequantize'`, pass the FP8
+workspace to `moe_align_block_size` without the NVFP4 scale granularity
+options, and use its returned FP8 config. This routing path requires N/K
+divisible by 128 and `block_k=128`.
+The `_fused` API suffix denotes routing gather, independently of `execution`.
+
+For blockwise execution, decoding rounds `E2M1 * native_k16_scale` to FP8
+using nearest-even rounding and finite saturation; it does not divide by
+`rhs_scales`. To normalize checkpoint weights to FP8 range, absorb the
+division into the native K16 scales offline:
+
+```text
+normalized_k16_scale = E4M3(native_k16_scale / fp8_block_scale)
+decoded_fp8 = E4M3(E2M1 * normalized_k16_scale)
+restored_weight = decoded_fp8 * fp8_block_scale * global_scale
+```
+
+Prepare `normalized_k16_scale` as the native scales, pass `fp8_block_scale`
+as `rhs_scales`, and keep the original `weight_global_scale`. Both execution
+modes use this convention. The `_absorb_fp8_scale` example in
+[tests/test_w4a8_nvfp4.py](tests/test_w4a8_nvfp4.py) chooses power-of-two scales per
+128x128 block to keep normalized scales and decoded values within E4M3
+range; small K16 scales can still underflow, so conversion is not lossless.
+
+See [W4A8 tests](tests/README.MD#w4a8-correctness-and-performance-tests)
+for correctness checks, accuracy references and performance reproduction.
+
 #### A8W4 INT8 MoE GEMMs
 
 The A8W4 INT8 path accepts INT8 activations with FP32 per-token scales and portable packed signed-INT4 weights with FP32 per-channel scales, and writes BF16. It runs on Zhenwu 610 / 610E / 810 / 810E (PPU001) and supports the grouped nopad and masked expert layouts:
@@ -387,7 +522,7 @@ Paged logits require external masking of positions outside each context;
 
 For more information, please refer to the corresponding `*_mqa_logits` and `*_paged_mqa_logits` function documentation.
 
-#### Sparse MQA logits (Zhenwu M890P)
+#### Sparse MQA logits (Zhenwu M890)
 
 Sparse MQA computes indexer logits only for selected KV blocks, for both
 prefill and paged decode. The current implementation supports **MXFP4
@@ -456,10 +591,10 @@ We provide a HyperConnection (HC) prenorm GEMM that fuses the prenorm square-sum
 
 For more information, please refer to the `tf32_hc_prenorm_gemm` function documentation.
 
-#### Mega-mHC for DeepSeek V4.1 Flash (M890P)
+#### Mega-mHC for DeepSeek V4.1 Flash (M890)
 
 `deep_gemm.mega_mhc` implements the fused shifted mHC computation used by
-**DeepSeek V4.1 Flash** on **Zhenwu M890P**. The current interface
+**DeepSeek V4.1 Flash** on **Zhenwu M890**. The current interface
 supports `hc_mult=4`, hidden size `5120`, and BF16 output. It computes the
 updated residual, mix coefficients, and RMSNorm output into caller-provided
 output buffers.
