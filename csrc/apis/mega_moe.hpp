@@ -25,24 +25,57 @@ static GatedActivation parse_gated_activation(const std::string& activation) {
     TORCH_CHECK(false, "Unsupported MegaMoE activation: ", activation);
 }
 
-static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-                                                    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
+using SymmBufferSlices = std::function<pybind11::tuple(
+    const torch::Tensor&, const std::vector<int64_t>&, const int&)>;
+
+static std::tuple<int64_t, SymmBufferSlices> get_mega_moe_buffer_slices_for_precision(
+    const int& num_ranks, const int& num_experts, const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden, const std::string& precision);
+
+static std::string fp8_mega_moe_precision(const std::string& quantization) {
+    TORCH_CHECK(quantization == "channelwise" || quantization == "blockwise",
+                "FP8 quantization must be 'channelwise' or 'blockwise'");
+    return "fp8_" + quantization;
+}
+
+static std::tuple<int64_t, SymmBufferSlices>
 get_symm_buffer_size_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const std::string& mma_type, const std::string& activation,
     const int& num_shared_experts = 0,
-    const std::array<int, 3>& staging_config = {}) {
-    const auto mma_kind = parse_mma_kind(mma_type);
-    DG_HOST_ASSERT(mma_kind == MmaKind::MXFP4);
-    parse_gated_activation(activation);
+    const std::array<int, 3>& staging_config = {},
+    const std::optional<std::string>& quantization = std::nullopt) {
     TORCH_CHECK(num_shared_experts == 0, "MegaMoE shared experts are not supported yet");
+    TORCH_CHECK(mma_type == "fp8xfp8" || !quantization,
+                "quantization applies only to fp8xfp8 workspaces");
+    if (mma_type != "mxf4xmxf4") {
+        std::string precision;
+        if (mma_type == "fp8xfp8")
+            precision = fp8_mega_moe_precision(quantization.value_or("channelwise"));
+        else if (mma_type == "fp8xmxfp4")
+            precision = "w4a8";
+        else {
+            TORCH_CHECK(mma_type == "bf16xmxfp4", "Unsupported MegaMoE mma_type: ", mma_type);
+            precision = "w4a16";
+        }
+        const bool supported_activation = precision == "w4a16" ? activation == "situ" :
+            activation == "swiglu" || activation == "swiglu_oai" ||
+            (precision == "w4a8" && activation == "situ");
+        TORCH_CHECK(supported_activation, "unsupported activation for ", precision, ": ", activation);
+        TORCH_CHECK((staging_config == std::array<int, 3>{} ||
+                     staging_config == std::array<int, 3>{num_experts, num_max_tokens_per_rank, hidden}),
+                    "MegaMoE base must have the same workspace dimensions for ", precision);
+        return get_mega_moe_buffer_slices_for_precision(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, precision);
+    }
+    parse_gated_activation(activation);
     const auto staging = get_staging_capacity(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
     const auto mega_buffer = layout::MegaMoEBuffer(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging);
-    auto slice_input_buffers = [=](const torch::Tensor& buffer) {
+    auto slice_input_buffers = [=](const torch::Tensor& buffer, const std::vector<int64_t>&, const int&) {
         check_mega_moe_buffer(buffer, mega_buffer);
         auto* base = buffer.data_ptr<uint8_t>();
         auto make_tensor = [&](torch::ScalarType dtype, const layout::Buffer& region, torch::IntArrayRef shape,
@@ -65,7 +98,7 @@ get_symm_buffer_size_for_mega_moe(
         auto l2_acts = make_tensor(torch::kUInt8, mega_buffer.l2_acts, {mega_buffer.compact, intermediate_hidden / 2});
         auto l2_acts_sf = make_tensor(torch::kUInt16, mega_buffer.l2_acts_sf,
             {mega_buffer.compact, intermediate_hidden / 64}, {1, mega_buffer.compact});
-        return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
+        return pybind11::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
     };
     return {mega_buffer.get_num_bytes(), slice_input_buffers};
 }
@@ -360,13 +393,13 @@ static RoutedMoEViews slice_routed_buffer(
             std::move(w)};
 }
 
-static auto get_mega_moe_buffer_slices_for_precision(
+static std::tuple<int64_t, SymmBufferSlices> get_mega_moe_buffer_slices_for_precision(
     const int& num_ranks, const int& num_experts, const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden, const std::string& precision) {
     check_device();
     const auto l = checked_routed_layout(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, precision);
-    std::function<py::tuple(const Tensor&, const std::vector<int64_t>&, const int&)> slices =
+    SymmBufferSlices slices =
         [=](const Tensor& buffer, const std::vector<int64_t>& pointers, const int& rank_idx) {
             const auto transport = make_sym_buffer(pointers, rank_idx, num_ranks);
             TORCH_CHECK(transport.base == reinterpret_cast<int64_t>(buffer.data_ptr()),
@@ -381,34 +414,6 @@ static auto get_mega_moe_buffer_slices_for_precision(
             return py::make_tuple(x, sf, w.topk_idx, w.topk_weights);
         };
     return std::make_tuple(int64_t(l.get_num_bytes()), slices);
-}
-
-static std::string fp8_mega_moe_precision(const std::string& quantization) {
-    TORCH_CHECK(quantization == "channelwise" || quantization == "blockwise",
-                "FP8 quantization must be 'channelwise' or 'blockwise'");
-    return "fp8_" + quantization;
-}
-
-static auto get_symm_buffer_size_for_fp8_mega_moe(
-    const int& num_ranks, const int& num_experts, const int& num_max_tokens_per_rank, const int& num_topk,
-    const int& hidden, const int& intermediate_hidden, const std::string& quantization) {
-    return get_mega_moe_buffer_slices_for_precision(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
-        fp8_mega_moe_precision(quantization));
-}
-
-static auto get_symm_buffer_size_for_w4a16_mega_moe(
-    const int& num_ranks, const int& num_experts, const int& num_max_tokens_per_rank, const int& num_topk,
-    const int& hidden, const int& intermediate_hidden) {
-    return get_mega_moe_buffer_slices_for_precision(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, "w4a16");
-}
-
-static auto get_symm_buffer_size_for_w4a8_mega_moe(
-    const int& num_ranks, const int& num_experts, const int& num_max_tokens_per_rank, const int& num_topk,
-    const int& hidden, const int& intermediate_hidden) {
-    return get_mega_moe_buffer_slices_for_precision(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, "w4a8");
 }
 
 static void fp8_w4a16_mega_moe_pre_dispatch_checked(const Tensor& hidden_states, const Tensor& topk_idx,
@@ -655,10 +660,8 @@ void fp8_fp4_mega_moe(
 static void register_apis(pybind11::module_& m) {
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_fp4_mega_moe", &bf16_fp4_mega_moe);
-    m.def("get_symm_buffer_size_for_w4a16_mega_moe", &get_symm_buffer_size_for_w4a16_mega_moe);
     m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe);
     m.def("routed_mega_moe_pre_dispatch", &routed_mega_moe_pre_dispatch);
-    m.def("get_symm_buffer_size_for_fp8_mega_moe", &get_symm_buffer_size_for_fp8_mega_moe);
     m.def("fp4_fp4_mega_moe", &fp4_fp4_mega_moe);
     m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch);
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
@@ -668,8 +671,8 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("hidden"), pybind11::arg("intermediate_hidden"),
           pybind11::arg("mma_type"), pybind11::arg("activation"),
           pybind11::arg("num_shared_experts") = 0,
-          pybind11::arg("staging_config") = std::array<int, 3>{});
-    m.def("get_symm_buffer_size_for_w4a8_mega_moe", &get_symm_buffer_size_for_w4a8_mega_moe);
+          pybind11::arg("staging_config") = std::array<int, 3>{},
+          pybind11::arg("quantization") = pybind11::none());
 }
 
 }  // namespace deep_gemm::mega

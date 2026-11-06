@@ -465,12 +465,16 @@ These backends follow the same complete-call and workspace ownership contract.
 supplied once through `topk_weights` and applied once in the final BF16 combine.
 Shared experts remain outside the routed pipeline.
 
-| Backend | Compute | Workspace / factory | Activation | EP limit |
+All precisions use `SymmBuffer` or `get_symm_buffer_for_mega_moe` for workspace
+allocation. Select the mode below; FP8 additionally distinguishes scale granularity
+with `quantization` (channelwise by default).
+
+| Backend | Compute | Workspace mode | Activation | EP limit |
 |---|---|---|---|---|
-| FP8 channelwise | `fp8_fp8_mega_moe` | `FP8SymmBuffer` / `get_symm_buffer_for_fp8_mega_moe` | SwiGLU, SwiGLU-OAI | 8 |
-| FP8 blockwise | `fp8_fp8_mega_moe` | same, `quantization="blockwise"` | SwiGLU, SwiGLU-OAI | 64 |
-| E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `W4A8SymmBuffer` / `get_symm_buffer_for_w4a8_mega_moe` | SwiGLU, SwiGLU-OAI, SiTU | 32 |
-| BF16 x MXFP4 | `bf16_fp4_mega_moe` | `W4A16SymmBuffer` / `get_symm_buffer_for_w4a16_mega_moe` | SiTU | 32 |
+| FP8 channelwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="channelwise"` | SwiGLU, SwiGLU-OAI | 8 |
+| FP8 blockwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, SwiGLU-OAI | 64 |
+| E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `mma_type="fp8xmxfp4"` | SwiGLU, SwiGLU-OAI, SiTU | 32 |
+| BF16 x MXFP4 | `bf16_fp4_mega_moe` | `mma_type="bf16xmxfp4", activation="situ"` | SiTU | 32 |
 
 H is divisible by 256 and I by 128. FP8 and W4A8 support at most 128 physical experts
 per rank; W4A16 supports at most 127. Capacity is positive and below 2^24;
@@ -489,20 +493,30 @@ import deep_gemm as dg
 
 # Raw FP8 weights: [E,2I,H] and [E,H,I], with the scales described below.
 l1, l2 = dg.transform_weights_for_fp8_mega_moe(raw_l1, raw_l2, quantization="channelwise")
-workspace = dg.get_symm_buffer_for_fp8_mega_moe(
+workspace = dg.get_symm_buffer_for_mega_moe(
     group, num_experts=256, num_max_tokens_per_rank=4096,
     num_topk=8, hidden=6144, intermediate_hidden=2048,
-    quantization="channelwise", activation="swiglu")
+    mma_type="fp8xfp8", quantization="channelwise", activation="swiglu")
 dg.mega_moe_pre_dispatch(x, topk_ids, topk_weights, workspace)
 dg.fp8_fp8_mega_moe(y, l1, l2, workspace, activation="swiglu")
 
 # Raw W4A16 weights are packed MXFP4 with raw group-32 UE8M0 scales.
 l1, l2 = dg.transform_weights_for_w4a16_mega_moe(raw_l1_w4, raw_l2_w4)
-workspace = dg.get_symm_buffer_for_w4a16_mega_moe(
+workspace = dg.get_symm_buffer_for_mega_moe(
     group, num_experts=896, num_max_tokens_per_rank=4096,
-    num_topk=16, hidden=3584, intermediate_hidden=3072)
+    num_topk=16, hidden=3584, intermediate_hidden=3072,
+    mma_type="bf16xmxfp4", activation="situ")
 dg.mega_moe_pre_dispatch(x, topk_ids, topk_weights, workspace)
 dg.bf16_fp4_mega_moe(y, l1, l2, workspace, activation="situ")
+
+# W4A8 uses the common workspace entry point; I remains the activated width.
+l1, l2 = dg.transform_weights_for_w4a8_mega_moe(raw_l1_w4, raw_l2_w4)
+workspace = dg.SymmBuffer(
+    group, num_experts=896, num_max_tokens_per_rank=4096,
+    num_topk=16, hidden=3584, intermediate_hidden=3072,
+    mma_type="fp8xmxfp4", activation="situ")
+dg.mega_moe_pre_dispatch(x, topk_ids, topk_weights, workspace)
+dg.fp8_fp4_mega_moe(y, l1, l2, workspace, activation="situ")
 ```
 
 FP8 weights are contiguous E4M3 `[E,N,K]`. Channelwise FP32 scales are
@@ -515,8 +529,12 @@ W4A8 uses the same canonical raw MXFP4 inputs, transformed with
 `(packed_weight, packed_scale, weight_inv_scale)`: the scalar compensates
 load-time exponent rebasing and is independent of routing weights and input
 scales. Prepare separately allocated master/replica banks independently; their
-inverse scales may differ. Its workspace and compute calls follow the examples
-above using `get_symm_buffer_for_w4a8_mega_moe` and `fp8_fp4_mega_moe`.
+inverse scales may differ. Allocate its workspace using `SymmBuffer` or
+`get_symm_buffer_for_mega_moe` with `mma_type="fp8xmxfp4"`, then call
+`fp8_fp4_mega_moe`. This mode denotes E4M3 activations and group-32 MXFP4
+weights with UE8M0 scales. The W4A4 mode remains `mma_type="mxf4xmxf4"`.
+FP8, W4A8 and W4A16 `base` aliases require the same mode, quantization, group,
+device and workspace dimensions; aliases execute serially on the same stream.
 W4A8 input and activated output use rowwise E4M3 quantization, as for FP8
 channelwise, with the chosen activation fused into GEMM1.
 Transformed weights are specific to their backend and must not be interchanged.

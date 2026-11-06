@@ -98,6 +98,8 @@ Small distributed cases cover separate replicas, both math modes, OAI/clamp,
 empty ranks, consecutive changing routes, statistics and graph replay.
 The API cases also check malformed weights, odd GEMM1 widths, and explicit
 pre-dispatch token prefixes with differently sized input and routing tensors.
+All precisions use the common workspace entry point for complete-pipeline checks,
+including compatible `SymmBuffer` base aliases.
 Accuracy uses `deep_gemm.testing.calc_diff < 0.001`, matching grouped FP8
 GEMM; W4A8 retains its existing 0.0015 threshold. Relative L2 is reported on
 failure. Large references sample eight tokens per rank, outside timing.

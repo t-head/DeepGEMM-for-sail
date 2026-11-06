@@ -197,27 +197,20 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
     raw2, ref2 = make_weights(e, c.hidden, c.intermediate, c.precision, rng)
     if c.precision == "w4a8":
         w1, w2 = dg.transform_weights_for_w4a8_mega_moe(raw1, raw2)
-        buffer = dg.W4A8SymmBuffer(group, c.experts, c.capacity, c.topk, c.hidden, c.intermediate,
-                                  activation=c.activation)
+        mma_type, quantization = "fp8xmxfp4", None
         entry = dg.fp8_fp4_mega_moe
     elif c.precision == "w4a16":
         w1, w2 = dg.transform_weights_for_w4a16_mega_moe(raw1, raw2)
-        buffer = dg.W4A16SymmBuffer(group, c.experts, c.capacity, c.topk, c.hidden, c.intermediate)
+        mma_type, quantization = "bf16xmxfp4", None
         entry = dg.bf16_fp4_mega_moe
     else:
+        mma_type = "fp8xfp8"
         quantization = c.precision.removeprefix("fp8_")
         w1, w2 = dg.transform_weights_for_fp8_mega_moe(raw1, raw2, quantization)
-        buffer = dg.FP8SymmBuffer(
-            group,
-            c.experts,
-            c.capacity,
-            c.topk,
-            c.hidden,
-            c.intermediate,
-            quantization=quantization,
-            activation=c.activation,
-        )
         entry = dg.fp8_fp8_mega_moe
+    buffer = dg.get_symm_buffer_for_mega_moe(
+        group, c.experts, c.capacity, c.topk, c.hidden, c.intermediate,
+        mma_type=mma_type, quantization=quantization, activation=c.activation)
     options = dict(activation=c.activation, activation_clamp=c.clamp, fast_math=fast_math)
     if replicas:
         assert e >= 2
@@ -375,8 +368,9 @@ def test_mega_moe_w4a8_activation_reuse(mega_moe_group):
     case = next(c for c in SMOKE_CASES if c.name == "smoke_w4a8_situ")
     rng = torch.Generator(device="cuda").manual_seed(20261106 + mega_moe_group.rank())
     pipeline = make_pipeline(case, mega_moe_group, rng, fast_math=False)
-    swiglu_buffer = dg.W4A8SymmBuffer(mega_moe_group, case.experts, case.capacity, case.topk,
-                                     case.hidden, case.intermediate, activation="swiglu")
+    swiglu_buffer = dg.SymmBuffer(
+        mega_moe_group, case.experts, case.capacity, case.topk, case.hidden, case.intermediate,
+        mma_type="fp8xmxfp4", activation="swiglu")
     source = torch.randn(33, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .5
     ids = _make_routes(case, source.size(0), rng)
     weights = torch.rand(33, case.topk, device="cuda", generator=rng).softmax(-1)
@@ -420,10 +414,11 @@ def test_mega_moe_fp8_oai(case, clamp, fast_math, mega_moe_group):
 
 @pytest.mark.parametrize("case", SMOKE_CASES, ids=lambda c: c.name)
 def test_mega_moe_precision_options(case, mega_moe_group):
-    factory = (dg.W4A16SymmBuffer if case.precision == "w4a16" else
-               dg.W4A8SymmBuffer if case.precision == "w4a8" else dg.FP8SymmBuffer)
-    with pytest.raises(ValueError, match="unsupported activation"):
-        factory(
+    options = (dict(mma_type="bf16xmxfp4") if case.precision == "w4a16" else
+               dict(mma_type="fp8xmxfp4") if case.precision == "w4a8" else
+               dict(mma_type="fp8xfp8", quantization=case.precision.removeprefix("fp8_")))
+    with pytest.raises((ValueError, RuntimeError), match="[Uu]nsupported.*activation"):
+        dg.SymmBuffer(
             mega_moe_group,
             case.experts,
             case.capacity,
@@ -431,9 +426,11 @@ def test_mega_moe_precision_options(case, mega_moe_group):
             case.hidden,
             case.intermediate,
             activation="swiglu" if case.precision == "w4a16" else "step",
+            **options,
         )
     with pytest.raises(RuntimeError, match="local expert count"):
-        factory(mega_moe_group, 256 * mega_moe_group.size(), case.capacity, case.topk, case.hidden, case.intermediate)
+        dg.SymmBuffer(mega_moe_group, 256 * mega_moe_group.size(), case.capacity, case.topk,
+                      case.hidden, case.intermediate, activation=case.activation, **options)
 
 
 @pytest.mark.parametrize("case", SMOKE_CASES, ids=lambda c: c.name)
@@ -446,6 +443,16 @@ def test_mega_moe_precision_api(case, mega_moe_group):
     y = torch.empty_like(source[:1])
     try:
         expected = pipeline.forward(source[:1], ids, weights, y).clone()
+        alias = dg.SymmBuffer(
+            mega_moe_group, case.experts, case.capacity, case.topk, case.hidden, case.intermediate,
+            mma_type=pipeline.buffer.mma_type, quantization=pipeline.buffer.quantization,
+            activation=case.activation, base=pipeline.buffer)
+        try:
+            dg.mega_moe_pre_dispatch(source[:1], ids, weights, alias)
+            pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, alias, **pipeline.options)
+            torch.testing.assert_close(y, expected, rtol=0, atol=0)
+        finally:
+            alias.destroy()
         for invalid in ((), (None, None), (pipeline.l1_weights[0].flatten(), pipeline.l1_weights[1])):
             with pytest.raises(ValueError, match="l1_weights must match"):
                 pipeline.entry(y, invalid, pipeline.l2_weights, pipeline.buffer, **pipeline.options)
