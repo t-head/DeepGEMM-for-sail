@@ -419,7 +419,10 @@ l1_weights, l2_weights = deep_gemm.transform_weights_for_mega_moe(
 
 # Pass BF16 inputs, int32 or int64 routing IDs, and float32 routing weights.
 output = torch.empty_like(hidden_states)
-deep_gemm.mega_moe_pre_dispatch(hidden_states, topk_ids, topk_weights, buffer)
+deep_gemm.mega_moe_pre_dispatch(
+    hidden_states, topk_ids, topk_weights,
+    buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
+    num_tokens=hidden_states.shape[0], group_size=32, mma_type="mxf4xmxf4")
 deep_gemm.fp4_fp4_mega_moe(output, l1_weights, l2_weights, buffer)
 ```
 
