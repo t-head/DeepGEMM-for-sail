@@ -196,7 +196,7 @@ inline constexpr int64_t kStreamedWeightBudget = 384LL * 1024 * 1024;
 // chunks can shrink before N is split; a single oversized expert uses N slices.
 static int streamed_tile_n(int n, int k, int groups) {
     const auto prop = device_runtime->get_prop();
-    if (prop->maxThreadsPerBlock < 512 || prop->sharedMemPerBlockOptin < 256 * 1024 || groups < 8 || groups > 1024 ||
+    if (prop->maxThreadsPerBlock < 512 || prop->sharedMemPerBlockOptin < 256 * 1024 || groups < 1 || groups > 1024 ||
         n < 1024 || n % 64 || k < 1024 || k % 128)
         return 0;
     const int64_t capacity = (kStreamedWeightBudget - 8) / k / 256 * 256;
@@ -205,7 +205,8 @@ static int streamed_tile_n(int n, int k, int groups) {
 static int streamed_chunk_limit(int tile_n, int k, int groups) {
     // One warp of expert counts stays below the stock scheduler's 128-expert
     // preprocessing boundary, and bounds decoder specialization/code size.
-    return std::min({groups / 2, 32, int((kStreamedWeightBudget - 8) / (int64_t(tile_n) * k))});
+    return std::min({std::max(1, groups / 2), 32,
+                     int((kStreamedWeightBudget - 8) / (int64_t(tile_n) * k))});
 }
 
 // Estimate complete waves for a bounded expert chunk, including its tail.
@@ -236,6 +237,22 @@ static int streamed_min_rows(int n, int k) {
     // Admission depends on workload; short-call chunk scheduling stays independent.
     const int64_t nk_tiles = int64_t(ceil_div(n, 256)) * (k / 128);
     return k >= 2048 && nk_tiles >= 128 ? 512 : 1024;
+}
+
+static bool streamed_workload_eligible(int expected_m, int n, int k, int groups) {
+    const int tile_n = streamed_tile_n(n, k, groups);
+    if (!tile_n || expected_m < streamed_min_rows(n, k))
+        return false;
+    // A lone expert cannot overlap full-weight decode across expert chunks.
+    // N slices need four M256 tiles to repay their decode/launch overhead.
+    if (groups == 1 && tile_n < n && expected_m < 4 * w4fa8_streamed::kBlockM)
+        return false;
+    // Expert count alone does not determine parallelism. Require a full
+    // device wave in the largest permitted chunk, including a dense G=1.
+    const int64_t tiles = ceil_div(int64_t(expected_m), int64_t(w4fa8_streamed::kBlockM)) *
+                          ceil_div(int64_t(tile_n), int64_t(256)) *
+                          streamed_chunk_limit(tile_n, k, groups);
+    return tiles >= get_num_sms();
 }
 
 static bool streamed_fused_eligible(int m, int n, int k, int groups) {
@@ -303,13 +320,13 @@ static int select_streamed_chunk(int m, int tile_n, int k, int groups, int num_s
 static void check_streamed_config(const StreamedConfig& c, int m, int n, int k, int groups, GemmType kind) {
     const auto& t = c.core;
     DG_HOST_ASSERT(kind == GemmType::MGroupedNoPad || kind == GemmType::MGroupedFused);
-    DG_HOST_ASSERT(groups >= 8 && groups <= 1024 && n >= 1024 && n % 64 == 0 && k >= 1024 && k % 128 == 0);
+    DG_HOST_ASSERT(groups >= 1 && groups <= 1024 && n >= 1024 && n % 64 == 0 && k >= 1024 && k % 128 == 0);
     DG_HOST_ASSERT(t.num_sms > 0 && t.num_sms <= get_num_sms());
     DG_HOST_ASSERT(pack_config(t) == W4A8ConfigTuple(t.num_sms, w4fa8_streamed::kBlockM, 256, 128, 64, 64, 128, 4, 1));
     const auto prop = device_runtime->get_prop();
     DG_HOST_ASSERT(prop->maxThreadsPerBlock >= 512 && prop->sharedMemPerBlockOptin >= 256 * 1024);
     DG_HOST_ASSERT(c.decode_n > 0 && c.decode_n <= n && (c.decode_n == n || c.decode_n % 256 == 0));
-    DG_HOST_ASSERT(c.expert_chunk >= 1 && c.expert_chunk <= std::min(32, groups / 2));
+    DG_HOST_ASSERT(c.expert_chunk >= 1 && c.expert_chunk <= std::min(32, std::max(1, groups / 2)));
     DG_HOST_ASSERT(!c.group_chunks.empty());
     DG_HOST_ASSERT(int64_t(c.expert_chunk) * c.decode_n * k + 8 <= kStreamedWeightBudget);
     DG_HOST_ASSERT(c.empty_experts != EmptyExpertPolicy::Nonempty || c.decode_n == n);
@@ -393,7 +410,7 @@ static W4A8Config get_best_configs(int expected_m, int n, int k, int groups, Gem
     const auto base = get_default_tile(em, n, k, groups, kind);
     if (kind != GemmType::MGroupedMasked && supports_native_strategy()) {
         const bool fused = kind == GemmType::MGroupedFused;
-        if (streamed_tile_n(n, k, groups) && int64_t(m) >= int64_t(groups) * streamed_min_rows(n, k) &&
+        if (streamed_workload_eligible(em, n, k, groups) &&
             (!fused || streamed_fused_eligible(m, n, k, groups)))
             return streamed_core_config(base.num_sms);
         if (wide_tile_eligible(groups, m, n, k, kind))
