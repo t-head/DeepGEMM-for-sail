@@ -1,4 +1,5 @@
 #pragma once
+#include <limits>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #pragma clang diagnostic ignored "-Wcuda-compat"
@@ -146,6 +147,12 @@ public:
   static_assert(WarpK >= kGroupSize && WarpK % kGroupSize == 0);
   static constexpr int GroupsPerBlock = BlockK / kGroupSize;
   static constexpr int GroupsPerWarp = WarpK / kGroupSize;
+  // Expert bases remain 64 bit. Compact offsets inside one expert are safe
+  // only when the full padded pipeline lookahead also fits the index type.
+  static constexpr int64_t MaxScaleOffset =
+      (int64_t(K) / kGroupSize + int64_t(kNumStages) * GroupsPerBlock) * N + BlockN;
+  using ScaleOffset = cute::conditional_t<
+      MaxScaleOffset <= std::numeric_limits<int32_t>::max(), int32_t, int64_t>;
   static_assert(kGroupSize == 16, "Invalid FP4 scale group size.");
   static_assert(kAScaleGroup == 0 || kAScaleGroup == 16 || kAScaleGroup % 32 == 0);
   static_assert(kAScaleGroup == 0 || kHasAScale, "Blockwise activation scales are required.");
@@ -443,6 +450,7 @@ public:
 
       int coord_l = kGemmType == GemmType::Normal ? 0 : deep_scheduler.curr_group_idx;
       const int64_t scale_offset_l = int64_t(coord_l) * (K / kGroupSize) * N;
+      const auto* native_scale_base = params.ptr_scale + scale_offset_l;
       n_block_idx *= N_EXPAND;
 
       Tensor mB_nkl = make_tensor(make_gmem_ptr(params.ptr_b), make_shape(Int<K / 32>{}, Int<N * 4>{}, Int<L>{}), strideB); // (k/32,n*4,l)
@@ -530,13 +538,12 @@ public:
                  vector_idx < ScaleVectorsPerStage; vector_idx += 32) {
               const int group = vector_idx / VectorsPerScaleRow;
               const int vector_n = vector_idx % VectorsPerScaleRow;
-              const int64_t src_offset =
-                  scale_offset_l +
-                  int64_t(k_tile_iter * GroupsPerBlock + group) * N +
+              const ScaleOffset src_offset =
+                  ScaleOffset(k_tile_iter * GroupsPerBlock + group) * N +
                   n_block_idx * BlockN + vector_n * 16;
               const cutlass::uint128_t& src =
                   *reinterpret_cast<const cutlass::uint128_t*>(
-                      params.ptr_scale + src_offset);
+                      native_scale_base + src_offset);
               cutlass::uint128_t& dst =
                   *reinterpret_cast<cutlass::uint128_t*>(
                       storage.smem_scale.data() +
@@ -853,12 +860,12 @@ public:
               scale_n_block_idx * BlockN + local_scale_n;
           if (scale_n_base < N) {
             packed_scales = __ldg(reinterpret_cast<const PackedScales*>(
-                params.ptr_scale + scale_offset_l +
-                int64_t(scale_group) * N + scale_n_base));
+                native_scale_base +
+                ScaleOffset(scale_group) * N + scale_n_base));
             if constexpr (Nvfp8Decode) {
               packed_scales_hi = __ldg(reinterpret_cast<const PackedScales*>(
-                  params.ptr_scale + scale_offset_l +
-                  int64_t(scale_group + 1) * N + scale_n_base));
+                  native_scale_base +
+                  ScaleOffset(scale_group + 1) * N + scale_n_base));
             }
           }
         }
@@ -983,8 +990,8 @@ public:
                         }
                       } else {
                         const int gn = scale_n_block_idx * BlockN + swizzled_col;
-                        bits = gn < N ? params.ptr_scale[scale_offset_l
-                           + int64_t(compute_k_tile * GroupsPerBlock + group) * N + gn] : 0;
+                        bits = gn < N ? native_scale_base[
+                            ScaleOffset(compute_k_tile * GroupsPerBlock + group) * N + gn] : 0;
                       }
                       cutlass::float_e4m3_t s;
                       reinterpret_cast<uint8_t&>(s) = bits;
