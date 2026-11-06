@@ -246,7 +246,7 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
     }
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_paged_mqa_logits_params(
             dtype_tag, static_cast<int>(kernel_params.batch_size), next_n, num_heads,
             is_fp4 ? head_dim * 2 : head_dim,
@@ -257,11 +257,10 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
         if (element_weights == "__ppu_bfloat16")
             dg_prof_params.add_params("weights_dtype", std::string("bf16"));
     }
-    ProfilingInterface::instance().instrument(true, dg_prof_params);
-
-    Runtime::launch(runtime, args);
-
-    ProfilingInterface::instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        Runtime::launch(runtime, args);
+    }
 }
 
 // Host entry for the `schedule_metadata` table. `metadata_extra` = (next_n, num_heads, head_dim,

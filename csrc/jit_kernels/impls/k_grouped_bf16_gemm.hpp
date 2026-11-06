@@ -127,15 +127,14 @@ static void k_grouped_bf16_gemm_tn_contiguous_impl(
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_k_grouped_params(m, n, sum_k, ks_cpu,
                                            c->data_ptr() != d.data_ptr(), current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-    Bf16KGroupedRuntime::launch(runtime, args);
-
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        Bf16KGroupedRuntime::launch(runtime, args);
+    }
 
     const char* p_env_params = std::getenv("show_log");
     if (p_env_params && std::isdigit(static_cast<unsigned char>(*p_env_params))) {

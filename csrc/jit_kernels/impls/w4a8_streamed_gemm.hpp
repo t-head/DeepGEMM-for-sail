@@ -362,7 +362,7 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
     log_streamed_config(execution, int(a.size(0)), n, k, groups, m, chunk, parts, prepared->second);
 
     DgProfParam prof;
-    if (ProfilingInterface::instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         if (is_fused)
             prof.set_fused_moe_params("w4fa8_mma", "group", groups, a.size(0), m / a.size(0), n, k,
                                       rows.data_ptr<int32_t>(), caller);
@@ -373,16 +373,19 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
         }
         prof.add_params(std::string("group_size"), 32);
     }
-    ProfilingInterface::instance().instrument(true, prof);
+    std::array<torch::Tensor, 2> scratch;
+    torch::Tensor b_scale_storage, core_a, core_scale;
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(prof);
     // Decode anew on every invocation; each buffer obeys the weight budget.
     // A dense full-N plan has one part and needs only one buffer.
-    std::array<torch::Tensor, 2> scratch;
     for (int slot = 0; slot < std::min(parts, 2); ++slot)
         scratch[slot] = at::empty({int64_t(chunk) * tile_n * k + 8}, b.options());
     // The inherited collective ABI carries a B-scale pointer, but the streamed
     // mainloop reads only A scales: decoded E5M2 weights include their scales.
-    auto b_scale_storage = at::empty({chunk, tile_n, 1}, a_scale.options());
-    torch::Tensor core_a = a, core_scale = a_scale;
+    b_scale_storage = at::empty({chunk, tile_n, 1}, a_scale.options());
+    core_a = a;
+    core_scale = a_scale;
     w4fa8_streamed::GatherParams gather{};
     if (is_fused) {
         core_a = at::empty({m, k}, a.options());
@@ -476,7 +479,7 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
         }
         throw;
     }
-    ProfilingInterface::instance().instrument(false, prof);
+    }
     if (!capturing)
         prepared->second.warmed = true;
     return true;

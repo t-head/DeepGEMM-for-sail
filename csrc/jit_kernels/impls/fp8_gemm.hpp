@@ -501,15 +501,14 @@ static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, 
     HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
     args.launch_args.grid_dim.x *= blocks_per_cu;
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, 0, grouped_layout,
                                   current_stream());
     }
-    ProfilingInterface::instance().instrument(true, dg_prof_params);
-
-    FP8GemmRuntime::launch(runtime, args);
-
-    ProfilingInterface::instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        FP8GemmRuntime::launch(runtime, args);
+    }
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
