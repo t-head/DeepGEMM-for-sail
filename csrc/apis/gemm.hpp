@@ -19,6 +19,7 @@
 #include "../jit_kernels/impls/moe_align.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a16_gemm.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a8_gemm.hpp"
+#include "../jit_kernels/impls/nvfp4_w4a8_gemm.hpp"
 #include "../jit_kernels/impls/ppuxx_acblaslt.hpp"
 
 namespace deep_gemm::gemm {
@@ -27,6 +28,9 @@ using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int
 // (num_sms, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages, n_expand)
 using W4A16ConfigTuple = deep_gemm_w4a16_common::W4A16ConfigTuple;
 using W4A8ConfigTuple = deep_gemm::w4fa8::W4A8ConfigTuple;
+using NVFP4Activation = nvfp4::Activation;
+using NVFP4Weight = nvfp4::Weight;
+using NVFP4ExecutionConfig = nvfp4::ExecutionConfig;
 
 extern "C" {
 static bool early_return(const int& m, const int &n, const int& k,
@@ -1524,19 +1528,35 @@ static std::pair<int, int> m_grouped_fp4_gemm_nt_masked(const std::pair<torch::T
 // validation; the impls layer (jit_kernels/impls/moe_align.hpp) only
 // orchestrates config resolution + kernel dispatch.
 //
-// Configs preserve the dtype-specific seven- or nine-element tile format.
+// Configs preserve the dtype-specific seven-, eight-, or nine-element tile format.
 MoeAlignReturn moe_align_block_size(
     const torch::Tensor& lhs,
     const torch::Tensor& rhs,
     const torch::Tensor& topk_ids,
     bool perchannel_quant = false,
     std::optional<FusedConfigTuple> config = std::nullopt,
-    bool enable_act_and_quant_fusing = false) {
+    bool enable_act_and_quant_fusing = false,
+    int lhs_scale_group_size = 0, int rhs_scale_block_size = 0) {
     DG_HOST_ASSERT(topk_ids.dtype() == torch::kInt32);
     DG_HOST_ASSERT(topk_ids.dim() == 2);
 
+    const bool nvfp4 = lhs.scalar_type() == torch::kFloat8_e4m3fn && rhs.scalar_type() == torch::kInt32;
+    TORCH_CHECK(lhs_scale_group_size == 0 || lhs_scale_group_size == 16 ||
+                    (lhs_scale_group_size > 0 && lhs_scale_group_size % 32 == 0),
+                "Activation scale group must be 0 (per row), 16, or a positive multiple of 32");
+    TORCH_CHECK(rhs_scale_block_size == 0 || rhs_scale_block_size == 128,
+                "rhs_scale_block_size must be 0 (per channel) or 128 (128x128 blocks)");
+    TORCH_CHECK(nvfp4 || (lhs_scale_group_size == 0 && rhs_scale_block_size == 0),
+                "Scale granularity options require NVFP4 prepared weights");
+    if (nvfp4) {
+        TORCH_CHECK(lhs.dim() == 2 && lhs.size(1) > 0 && lhs.size(1) % 32 == 0 &&
+                        rhs.dim() == 3 && rhs.size(0) > 0 && rhs.size(1) == lhs.size(1) / 32 &&
+                        rhs.size(2) > 0 && rhs.size(2) % 256 == 0,
+                    "NVFP4 routing requires prepared int32 weights [E,K/32,4*N], N%64=0 and K%32=0");
+    }
+
     return moe_align_block_size_impl(lhs, rhs, topk_ids, perchannel_quant, config,
-                                     enable_act_and_quant_fusing);
+                                     enable_act_and_quant_fusing, lhs_scale_group_size, rhs_scale_block_size);
 }
 // The problem sizes the W4A16 implementations need, derived from the operands here so the API layer
 // owns the shape contract.
@@ -1798,6 +1818,56 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_fused(const std::pair<torch::Tensor, 
                                  GemmType::MGroupedFused, ceil_div(int(out.size(0)), num_groups), inv_scale, experts, tokens, aligned);
 }
 
+// NVFP4 W4A8: share the public calling convention across both execution modes.
+static void gemm_fp8_nvfp4_bf16_nt(
+        const NVFP4Activation& lhs, const NVFP4Weight& rhs, const torch::Tensor& out,
+        std::optional<NVFP4ExecutionConfig> configs = std::nullopt,
+        int lhs_scale_group_size = 0, std::optional<torch::Tensor> weight_global_scale = std::nullopt,
+        std::optional<torch::Tensor> rhs_scales = std::nullopt, int rhs_scale_block_size = 0,
+        const std::string& execution = "fused", std::optional<torch::Tensor> fp8_workspace = std::nullopt) {
+    nvfp4::gemm_fp8_nvfp4_bf16_nt_impl(
+        lhs, rhs, out, configs, lhs_scale_group_size, weight_global_scale,
+        rhs_scales, rhs_scale_block_size, execution, fp8_workspace);
+}
+
+static void m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad(
+        const NVFP4Activation& lhs, const NVFP4Weight& rhs, const torch::Tensor& out,
+        const torch::Tensor& m_indices, std::optional<torch::Tensor> m_rows = std::nullopt,
+        std::optional<NVFP4ExecutionConfig> configs = std::nullopt,
+        int lhs_scale_group_size = 0, std::optional<torch::Tensor> weight_global_scale = std::nullopt,
+        std::optional<torch::Tensor> rhs_scales = std::nullopt, int rhs_scale_block_size = 0,
+        const std::string& execution = "fused", std::optional<torch::Tensor> fp8_workspace = std::nullopt) {
+    nvfp4::m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad_impl(
+        lhs, rhs, out, m_indices, m_rows, configs,
+        lhs_scale_group_size, weight_global_scale, rhs_scales, rhs_scale_block_size, execution, fp8_workspace);
+}
+
+static void m_grouped_gemm_fp8_nvfp4_bf16_nt_masked(
+        const NVFP4Activation& lhs, const NVFP4Weight& rhs, const torch::Tensor& out,
+        const torch::Tensor& masked_m, int expected_m,
+        std::optional<NVFP4ExecutionConfig> configs = std::nullopt,
+        int lhs_scale_group_size = 0, std::optional<torch::Tensor> weight_global_scale = std::nullopt,
+        std::optional<torch::Tensor> rhs_scales = std::nullopt, int rhs_scale_block_size = 0,
+        const std::string& execution = "fused", std::optional<torch::Tensor> fp8_workspace = std::nullopt) {
+    nvfp4::m_grouped_gemm_fp8_nvfp4_bf16_nt_masked_impl(
+        lhs, rhs, out, masked_m, expected_m, configs,
+        lhs_scale_group_size, weight_global_scale, rhs_scales, rhs_scale_block_size, execution, fp8_workspace);
+}
+
+static void m_grouped_gemm_fp8_nvfp4_bf16_nt_fused(
+        const NVFP4Activation& lhs, const NVFP4Weight& rhs, const torch::Tensor& out,
+        const torch::Tensor& m_rows, const torch::Tensor& expert_ids_and_cumsum,
+        const torch::Tensor& sorted_token_ids, const torch::Tensor& aligned_num_m_blocks,
+        std::optional<NVFP4ExecutionConfig> configs, int lhs_scale_group_size = 0,
+        std::optional<torch::Tensor> weight_global_scale = std::nullopt,
+        std::optional<torch::Tensor> rhs_scales = std::nullopt, int rhs_scale_block_size = 0,
+        const std::string& execution = "fused", std::optional<torch::Tensor> fp8_workspace = std::nullopt) {
+    nvfp4::m_grouped_gemm_fp8_nvfp4_bf16_nt_fused_impl(
+        lhs, rhs, out, m_rows, expert_ids_and_cumsum,
+        sorted_token_ids, aligned_num_m_blocks, configs, lhs_scale_group_size, weight_global_scale, rhs_scales,
+        rhs_scale_block_size, execution, fp8_workspace);
+}
+
 static void acblaslt_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,
                              const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
     const auto major_a = get_major_type_ab(a);
@@ -1991,6 +2061,59 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_nopad",&m_grouped_gemm_fp8_fp4_bf16_nt_nopad,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_indices"),py::arg("m_rows")=std::nullopt,py::arg("configs")=std::nullopt,py::arg("inv_scale")=1.0f);
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_masked",&m_grouped_gemm_fp8_fp4_bf16_nt_masked,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("masked_m"),py::arg("expected_m"),py::arg("configs")=std::nullopt,py::arg("inv_scale")=1.0f);
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_fused",&m_grouped_gemm_fp8_fp4_bf16_nt_fused,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_rows"),py::arg("expert_ids_and_cumsum"),py::arg("sorted_token_ids"),py::arg("aligned_num_m_blocks"),py::arg("configs"),py::arg("inv_scale")=1.0f);
+    // NVFP4 W4A8 GEMMs
+    const char* nvfp4_doc = R"doc(E4M3 activation x NVFP4 weight GEMM with BF16 output on PPU1.5.
+
+lhs is (E4M3FN values, FP32 scales). lhs_scale_group_size=0 selects per-token
+scales [...,M,1]; 16 or a positive multiple of 32 selects [...,M,ceil(K/G)].
+Scales may be None for unit per-token scaling only with execution='fused'.
+rhs is (prepared int32 weights, native K16 E4M3 scale bytes), produced by
+preprocess_weights_and_scales with W4A8_NVFP4 for execution='fused' (default),
+or W4A8_NVFP4_FP8 for execution='dequantize'. N % 64 == 0 and K % 32 == 0.
+
+rhs_scale_block_size=0 selects optional per-channel FP32 rhs_scales [E,N]
+(also [E,N,1]); 128 requires FP32 128x128 scales [E,ceil(N/128),ceil(K/128)].
+Dense calls may omit E=1. weight_global_scale is an optional FP32 scalar
+or [E] multiplier. All scales are multiplicative, before BF16 output.
+With outer block scales, native NVFP4 values are rounded to saturated E4M3
+before MMA; decoding does not divide by rhs_scales. Without outer block
+scales, fused execution retains native K16 scaling without FP8 weight rounding.
+
+execution='dequantize' requires explicit activation scales (per-token or K128),
+rhs_scale_block_size=128, and a contiguous E4M3FN fp8_workspace [E,N,K]
+([N,K] for dense). Every call refreshes it on the current stream. The workspace
+must not overlap GEMM operands or metadata. Fused execution needs no workspace.
+configs defaults to internal selection except for fused routing, which uses
+the config returned by moe_align_block_size: pass the prepared weights and the
+same scale granularity options for fused NVFP4 execution, or the FP8 workspace
+for dequantize routing. The _fused suffix denotes routing gather and is
+independent of execution. See the NVFP4 W4A8 section in README.md for examples.
+)doc";
+    m.def("gemm_fp8_nvfp4_bf16_nt", &gemm_fp8_nvfp4_bf16_nt, nvfp4_doc,
+          py::arg("lhs"), py::arg("rhs"), py::arg("out"),
+          py::arg("configs") = std::nullopt, py::kw_only(), py::arg("lhs_scale_group_size") = 0,
+          py::arg("weight_global_scale") = std::nullopt, py::arg("rhs_scales") = std::nullopt,
+          py::arg("rhs_scale_block_size") = 0, py::arg("execution") = "fused",
+          py::arg("fp8_workspace") = std::nullopt);
+    m.def("m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad", &m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad, nvfp4_doc,
+          py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt,
+          py::arg("configs") = std::nullopt, py::kw_only(), py::arg("lhs_scale_group_size") = 0,
+          py::arg("weight_global_scale") = std::nullopt, py::arg("rhs_scales") = std::nullopt,
+          py::arg("rhs_scale_block_size") = 0, py::arg("execution") = "fused",
+          py::arg("fp8_workspace") = std::nullopt);
+    m.def("m_grouped_gemm_fp8_nvfp4_bf16_nt_masked", &m_grouped_gemm_fp8_nvfp4_bf16_nt_masked, nvfp4_doc,
+          py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("masked_m"), py::arg("expected_m"),
+          py::arg("configs") = std::nullopt, py::kw_only(), py::arg("lhs_scale_group_size") = 0,
+          py::arg("weight_global_scale") = std::nullopt, py::arg("rhs_scales") = std::nullopt,
+          py::arg("rhs_scale_block_size") = 0, py::arg("execution") = "fused",
+          py::arg("fp8_workspace") = std::nullopt);
+    m.def("m_grouped_gemm_fp8_nvfp4_bf16_nt_fused", &m_grouped_gemm_fp8_nvfp4_bf16_nt_fused, nvfp4_doc,
+          py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"), py::arg("expert_ids_and_cumsum"),
+          py::arg("sorted_token_ids"), py::arg("aligned_num_m_blocks"), py::arg("configs"),
+          py::kw_only(), py::arg("lhs_scale_group_size") = 0, py::arg("weight_global_scale") = std::nullopt,
+          py::arg("rhs_scales") = std::nullopt, py::arg("rhs_scale_block_size") = 0,
+          py::arg("execution") = "fused", py::arg("fp8_workspace") = std::nullopt);
+
     // W4A16 / W4FA16 GEMMs
     m.def("m_grouped_gemm_w4a16_nopad", &m_grouped_gemm_w4a16_nopad, py::arg("lhs"), py::arg("rhs_"),
           py::arg("out"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt,
@@ -2023,9 +2146,13 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
           py::arg("activation_type") = std::nullopt);
     // moe_align preprocessing (C++ JIT)
     m.def("moe_align_block_size", &moe_align_block_size,
+          "Prepare fused routing metadata and return the matching GEMM config. "
+          "For NVFP4 prepared weights, pass the same scale granularity options as GEMM. "
+          "An explicit config overrides internal tile selection.",
           py::arg("lhs"), py::arg("rhs"), py::arg("topk_ids"),
           py::arg("perchannel_quant") = false, py::arg("config") = std::nullopt,
-          py::arg("enable_act_and_quant_fusing") = false);
+          py::arg("enable_act_and_quant_fusing") = false, py::kw_only(),
+          py::arg("lhs_scale_group_size") = 0, py::arg("rhs_scale_block_size") = 0);
     // acBLASLt GEMMs
     m.def("acblaslt_gemm_nt", &acblaslt_gemm_nt,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
