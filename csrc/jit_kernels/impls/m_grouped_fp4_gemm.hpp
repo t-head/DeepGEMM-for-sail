@@ -231,17 +231,16 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k*2, expected_m, m_rows_tensor.data_ptr<int32_t>(),
                                   current_stream());
         dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
         dg_prof_params.add_params("swiglu_limit", swiglu_limit);
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-    FP4GemmRuntime::launch(runtime, args);
-
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        FP4GemmRuntime::launch(runtime, args);
+    }
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
@@ -448,15 +447,16 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         dyn_args.launch_args.grid_dim.x *= blocks_per_cu;
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
+        if (deep_gemm::profiling_enabled()) {
             dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k*2, expected_m,
                                       grouped_layout, current_stream());
             dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
             dg_prof_params.add_params("swiglu_limit", swiglu_limit);
         }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-        FP4DynamicTileRuntime::launch(runtime, dyn_args);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        {
+            auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+            FP4DynamicTileRuntime::launch(runtime, dyn_args);
+        }
 
         return {block_m, ceil_div(n, block_n)};
     }
@@ -545,17 +545,16 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k*2, expected_m, grouped_layout,
                                   current_stream());
         dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
         dg_prof_params.add_params("swiglu_limit", swiglu_limit);
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-    FP4GemmRuntime::launch(runtime, args);
-
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        FP4GemmRuntime::launch(runtime, args);
+    }
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {

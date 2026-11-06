@@ -333,16 +333,17 @@ static void launch_fp4_sparse_mqa_logits_impl(
         printf("weights_bf16:true\n");
     }
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_sparse_mqa_logits_params(
             "fp4", static_cast<int>(seq_len_q), static_cast<int>(seq_len_kv),
             static_cast<int>(sparse_mqa_logits::kNumHeads), static_cast<int>(sparse_mqa_logits::kHeadDim),
             static_cast<int>(sparse_block_kv), static_cast<int>(num_max_sparse_blocks), use_unaligned_ks,
             is_paged, current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-    SparseMqaLogitsFP4Runtime::launch(runtime, args);
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        SparseMqaLogitsFP4Runtime::launch(runtime, args);
+    }
 }
 
 static void launch_fp4_sparse_mqa_logits(

@@ -1667,15 +1667,16 @@ public:
             smem_size_kernel = GemmKernel::SharedStorageSize;
 
             DgProfParam dg_prof_params;
-            if (ProfilingInterface::Instance().get_op_info()){
+            if (deep_gemm::profiling_enabled()){
                 dg_prof_params.set_params(
                     kGemmType, false, std::string("int8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
                     grouped_layout, stream
                 );
             }
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
-            cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(arguments);
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
+            {
+                auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+                cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(arguments);
+            }
 
             hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
           };
@@ -1843,15 +1844,16 @@ public:
           smem_size_kernel = GemmKernel::SharedStorageSize;
 
           DgProfParam dg_prof_params;
-          if (ProfilingInterface::Instance().get_op_info()){
+          if (deep_gemm::profiling_enabled()){
               dg_prof_params.set_params(
                   kGemmType, false, std::string("int8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
                   grouped_layout, stream
               );
           }
-          ProfilingInterface::Instance().instrument(true, dg_prof_params);
-          cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-          ProfilingInterface::Instance().instrument(false, dg_prof_params);
+          {
+              auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+              cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
+          }
 
           hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
         }

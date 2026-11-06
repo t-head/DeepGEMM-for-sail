@@ -861,13 +861,14 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
 
     static constexpr GemmType kGemmType = GemmType::Normal;
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_params(kGemmType, false, std::string("bf16"), 1, m, n, k, 0, nullptr,
                                   current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-    DenseGemvRuntime::launch(runtime, args);
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        DenseGemvRuntime::launch(runtime, args);
+    }
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
@@ -1051,14 +1052,13 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
         auto config = construct_launch_config(kernel, stream, smem_cute_free, grid_cute_free, block_cute_free);
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
+        if (deep_gemm::profiling_enabled()) {
             dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, nullptr, stream);
         }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, hparams));
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        {
+            auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, hparams));
+        }
 
         char* pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
@@ -1122,15 +1122,14 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             args.kernel_params.hw_info.cu_count = args.launch_args.grid_dim.x;
 
             DgProfParam dg_prof_params;
-            if (ProfilingInterface::Instance().get_op_info()) {
+            if (deep_gemm::profiling_enabled()) {
                 dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, nullptr,
                                           current_stream());
             }
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-            CutlassRuntime::launch(runtime, args);
-
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
+            {
+                auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+                CutlassRuntime::launch(runtime, args);
+            }
 
             char* pEnv_params = std::getenv("show_log");
             if (pEnv_params && isdigit(*pEnv_params)) {
@@ -1187,15 +1186,14 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, smem_size);
             args.launch_args.grid_dim.x *= blocks_per_cu;
             DgProfParam dg_prof_params;
-            if (ProfilingInterface::Instance().get_op_info()) {
+            if (deep_gemm::profiling_enabled()) {
                 dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, grouped_layout,
                                           current_stream());
             }
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-            Runtime::launch(runtime, args);
-
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
+            {
+                auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+                Runtime::launch(runtime, args);
+            }
 
             char* pEnv_params = std::getenv("show_log");
             if (pEnv_params && isdigit(*pEnv_params)) {

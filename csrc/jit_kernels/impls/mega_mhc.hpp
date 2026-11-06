@@ -86,15 +86,16 @@ static void launch_mega_mhc(MegaMhcRuntime::Args args, int num_sms, int physical
         runtime = mhc_compiler->build(name, MegaMhcRuntime::generate(args));
     }
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_mega_mhc_params(
             args.kernel_args.tokens, args.config.hidden, args.config.iterations, current_stream());
         dg_prof_params.add_params("num_splits", args.config.splits);
         dg_prof_params.add_params("num_sms", num_sms);
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-    MegaMhcRuntime::launch(runtime, args);
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        MegaMhcRuntime::launch(runtime, args);
+    }
 }
 
 } // namespace deep_gemm

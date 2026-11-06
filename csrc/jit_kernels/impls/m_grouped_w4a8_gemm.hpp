@@ -99,7 +99,7 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
 static DgProfParam make_profile(GemmType kind, int groups, int m, int n, int k, int expected_m, int topk,
                                 int32_t* rows) {
     DgProfParam prof;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         if (kind == GemmType::MGroupedFused)
             prof.set_fused_moe_params("w4fa8_mma", "group", groups, m, topk, n, k, rows, current_stream());
         else {
@@ -177,9 +177,10 @@ static void launch(const W4A8Config& c, int m, int n, int k, int groups, GemmTyp
     args.launch_args.grid_dim = dim3(c.num_sms < 20 ? c.num_sms : c.num_sms * std::min(8, blocks));
     auto prof = make_profile(kind, groups, m, n, k, expected_m, topk, m_rows);
     log_native_config(c, m, n, k, groups, *prepared);
-    ProfilingInterface::Instance().instrument(true, prof);
-    R::launch(runtime, args);
-    ProfilingInterface::Instance().instrument(false, prof);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(prof);
+        R::launch(runtime, args);
+    }
 }
 
 static torch::Tensor prepare_nopad_layout(const torch::Tensor& rows, int groups, int m, const W4A8Config& c) {
@@ -276,9 +277,10 @@ static bool run_compact(const NativeKernelConfig& spec, int m, int n, int k, int
     auto prof = make_profile(kind, groups, fused ? params.num_token : m, n, k, ceil_div(m, groups),
                              fused ? m / params.num_token : 0, rows.data_ptr<int32_t>());
     log_native_config(c, fused ? params.num_token : m, n, k, groups, *prepared);
-    ProfilingInterface::Instance().instrument(true, prof);
-    R::launch(prepared->runtime, args);
-    ProfilingInterface::Instance().instrument(false, prof);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(prof);
+        R::launch(prepared->runtime, args);
+    }
     return true;
 }
 
