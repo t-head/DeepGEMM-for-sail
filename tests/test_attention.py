@@ -77,6 +77,39 @@ def test_per_layer_cache_view(check_accuracy=True):
 
 
 
+def test_paged_int8_page_boundaries():
+    # Token-distinct, exactly representable scores expose the second page32
+    # cube without conflating addressing errors with BF16 reduction rounding.
+    context_lens = torch.tensor([31, 32, 33, 64, 65, 127], device='cuda', dtype=torch.int32)[:, None]
+    batch_size, head_dim, max_context_len = context_lens.size(0), 128, 128
+    values = (torch.arange(max_context_len, device='cuda', dtype=torch.int32) % 17 + 1).to(torch.int8)
+    k = values[:, None].expand(max_context_len, head_dim).contiguous()
+    scales = torch.ones(max_context_len, device='cuda', dtype=torch.float32)
+    valid = torch.arange(max_context_len, device='cuda')[None, :] < context_lens
+    for num_heads in (32, 64):
+        q = torch.ones(batch_size, 1, num_heads, head_dim, device='cuda', dtype=torch.int8)
+        reference = values.float()[None, :].expand(batch_size, -1) * (num_heads * head_dim)
+        for page_kv in (32, 64, 128):
+            pages = max_context_len // page_kv
+            permutation = torch.arange(pages - 1, -1, -1, device='cuda', dtype=torch.int64)
+            page_bytes = torch.cat((k.view(torch.uint8).view(pages, page_kv * head_dim),
+                                    scales.view(torch.uint8).view(pages, page_kv * 4)), dim=1)
+            cache = page_bytes[permutation].view(pages, page_kv, 1, head_dim + 4)
+            block_table = permutation.to(torch.int32)[None, :].expand(batch_size, -1).contiguous()
+            metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                context_lens, page_kv, deep_gemm.get_num_sms(),
+                metadata_extra=(1, num_heads, head_dim, 1))
+            for dtype in (torch.float32, torch.bfloat16):
+                weights = torch.ones(batch_size, num_heads, device='cuda', dtype=dtype)
+                logits = deep_gemm.int8_paged_mqa_logits(
+                    q, cache, weights, context_lens, block_table, metadata,
+                    max_context_len)
+                assert logits.dtype == dtype
+                torch.testing.assert_close(logits[valid].float(), reference[valid], rtol=0, atol=0)
+    torch.cuda.synchronize()
+    print('PASS: INT8 paged boundaries, permuted pages, H32/H64, FP32/BF16')
+
+
 def test_mqa_logits_loop():
     print('Testing MQA Logits:')
     data_types = ['int8']
@@ -413,6 +446,7 @@ if __name__ == '__main__':
 
     test_ks_ke()
     test_per_layer_cache_view()
+    test_paged_int8_page_boundaries()
     test_mqa_logits_loop()
     test_paged_mqa_logits_loop()
     test_mqa_avg_logits_loop()

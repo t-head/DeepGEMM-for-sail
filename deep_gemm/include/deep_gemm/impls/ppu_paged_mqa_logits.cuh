@@ -7,6 +7,34 @@
 #include <deep_gemm/scheduler/paged_mqa_logits_scheduler.cuh>
 
 
+// PPU1.0's TSM load takes a cube-local row coordinate. Page-local AIU
+// copies create multiple cubes along M; the generic copy keeps their rows
+// relative to the whole tile, so advance the base before loading later pages.
+namespace cute {
+
+template <typename Element, int CubeH, int CubeW, bool Swap, int InstNum>
+struct PagedKVTSMLoad : PPU0010_TSM_LD_SWZL<Element, CubeH, CubeW, Swap, false, InstNum> {};
+
+template <typename Element, int CubeH, int CubeW, bool Swap, int InstNum>
+struct Copy_Traits<PagedKVTSMLoad<Element, CubeH, CubeW, Swap, InstNum>>
+    : Copy_Traits<PPU0010_TSM_LD_SWZL<Element, CubeH, CubeW, Swap, false, InstNum>> {
+    template <class TS, class SLayout, class TD, class DLayout>
+    CUTE_HOST_DEVICE friend void copy_unpack(Copy_Traits const& traits,
+                                             Tensor<TS, SLayout> const& src,
+                                             Tensor<TD, DLayout>& dst) {
+        static_assert(is_mix_iterator<typename TS::iterator>::value,
+                      "Paged KV TSM loads require cube coordinates");
+        const auto coord = src.data().coord_;
+        auto* base = reinterpret_cast<Element*>(src.data().ptr_.get());
+        const int row = get<1>(coord);
+        base += (row / CubeH) * CubeH * CubeW * InstNum;
+        PPU0010_TSM_LD_SWZL<Element, CubeH, CubeW, Swap, false, InstNum>::copy(
+            raw_pointer_cast(dst.data()), base, get<0>(coord), row % CubeH, get<2>(coord));
+    }
+};
+
+} // namespace cute
+
 namespace cutlass::gemm::kernel {
 
 template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights,
@@ -79,7 +107,11 @@ public:
 
   // A
   using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
-  using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
+  using SmemCopyAtomA = cute::conditional_t<
+      cute::is_same_v<ArchTag, cutlass::arch::PPU0010> && PAGE_KV < BLOCK_KV && sizeof(ElementQK) == 1,
+      Copy_Atom<PagedKVTSMLoad<ElementQK, DefaultOperandA::CUBE_H, DefaultOperandA::CUBE_W,
+                               false, DefaultOperandA::inst_num>, ElementQK>,
+      typename DefaultOperandA::SmemCopyAtom>;
   using GmemTiledCopyA = typename DefaultOperandA::GmemTiledCopy;
   // B
   using SmemLayoutAtomB = typename DefaultOperandB::SmemLayoutAtom; // N, K
