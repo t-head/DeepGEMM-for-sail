@@ -8,6 +8,27 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Changed
 
+- **Indexer API contracts**: separates legacy FP8/INT8 from MXFP4 weighted
+  entry points and removes BF16 Q/K APIs. Legacy FP8 fixes weights/logits to
+  FP32; INT8 infers BF16 or FP32 logits from weights dtype and no longer
+  accepts `logits_dtype`. New weighted MXFP4 APIs fix weights/logits to BF16,
+  omit `clean_logits` / `logits_dtype`, and require compressed non-paged
+  output. Weighted paged APIs require `next_n=1`; legacy FP8/INT8 reject
+  non-None request indices, while MXFP4 requires them.
+- **AVG indexer API**: removes `clean_logits`, makes non-paged
+  `max_seqlen_k` mandatory and positive, and defaults all AVG logits to BF16
+  with optional FP32 output. Paged AVG retains `next_n=1–6` and places
+  `logits_dtype` after `indices`. `fp8_fp4_paged_mqa_avg_logits` accepts only
+  MXFP4; ordinary FP8 uses `fp8_paged_mqa_avg_logits`.
+- **Indexer metadata and output layout**: provides a compatibility
+  `get_mqa_logits_metadata` stub returning None; dense MXFP4 ignores
+  `schedule_meta`. Sparse logits expose only logical candidate columns,
+  retaining aligned physical row strides. Legacy `clean_logits` defaults
+  to False and rejects True; invalid output positions remain unspecified.
+  See the [indexer API guide](docs/api/indexer.md) for complete signatures,
+  migration requirements, paged `metadata_extra` settings and recommended
+  810E INT8/BF16 and M890 MXFP4/BF16 integration.
+
 - **M890 W4FA8 execution**: expands native tile coverage, unifies automatic
   tile selection, and overlaps streamed weight decoding with FP8 GEMM for
   NoPad/Fused. Adds tile and resource diagnostics through `show_log=1`.
