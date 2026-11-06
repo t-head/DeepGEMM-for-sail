@@ -54,8 +54,7 @@ public:
         cute::Stride<cute::Int<1>, int64_t, int64_t> stride_SFB;
     };
 
-    // One host mirror per device-side CollectiveEpilogue, matching the three types selected in
-    // Fp4Gemm::run (fp4_gemm_cutlass3.cuh).
+    // One host parameter layout per device-side CollectiveEpilogue selected by generate_impl.
     //
     //   device type                             condition                    Epilogue::Params
     //   CollectiveEpilogueWithTsm               hasBias || SHAPE_N % 2 != 0         96 B
@@ -215,7 +214,7 @@ public:
     }
 
     static std::string generate_impl(const Args& args) {
-        // Mirrors the guard in Fp4Gemm::run: the fused epilogue reuses the mainloop's shared storage,
+        // The fused epilogue reuses the mainloop's shared storage,
         // so its activation tile must fit in what the kernel already reserves.
         // Emitted only for the fused variant instead of using `if constexpr` in the generated kernel:
         // everything there is concrete, so naming ::get_shared_storage_size() in a discarded branch
@@ -377,7 +376,7 @@ using CollectiveEpilogueSiluAndMulPostQuant = typename cutlass::epilogue::collec
     kEpilogueType
 >;
 
-// Keep the selection identical to Fp4Gemm::run in fp4_gemm_cutlass3.cuh
+// Bias or odd N requires TSM; otherwise select fused post-quantization or the plain epilogue.
 using CollectiveEpilogue = typename cutlass::platform::conditional<
     hasBias || (SHAPE_N % 2 != 0),
     CollectiveEpilogueWithTsm,
@@ -409,8 +408,7 @@ using GemmKernel = typename deep_gemm::DeepGemmUniversal<
 // This kernel declares `extern __shared__`, so its dynamic smem size comes from the launch, and the
 // host can only supply an estimate (get_smem_config_fp4) -- it cannot see SharedStorageSize.
 // Assert the two agree: an under-estimate corrupts memory, an over-estimate silently costs
-// occupancy. The Python path is immune because Fp4Gemm::run launches with SharedStorageSize
-// directly, so a drift here would show up as "Python correct, C++ JIT wrong".
+// occupancy.
 static_assert(GemmKernel::SharedStorageSize == {},
               "host get_smem_config_fp4() disagrees with the kernel's SharedStorageSize -- "
               "update csrc/jit_kernels/heuristics/common_fp4.hpp");
@@ -456,8 +454,8 @@ __global__ void {}(
 // CollectiveEpilogue / TileScheduler aliases. Emitting one combined template would instantiate
 // types the dynamic-tile kernel never uses and make the placeholder list far harder to keep in sync.
 //
-// Mirrors the `if constexpr (kEnableMoeDynamicTile)` branch of Fp4Gemm::run. DynamicTile supports
-// both the Default epilogue and fused activation + post-quant variants, so its host params union
+// DynamicTile supports both the Default epilogue and fused activation + post-quant variants,
+// so its host params union
 // carries both the NoTsm and fused layouts.
 class FP4DynamicTileRuntime final : public LaunchRuntime<FP4DynamicTileRuntime> {
 public:

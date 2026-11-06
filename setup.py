@@ -195,7 +195,7 @@ if __name__ == '__main__':
         name='deep_gemm',
         version=package_version,
         setup_requires=['setuptools-scm'],
-        packages=find_packages('.'), # old version: packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels', 'deep_gemm/deep_gemm_tuner'],,
+        packages=find_packages('.'),
         package_data={
             'deep_gemm': [
                 'include/deep_gemm/**/*',

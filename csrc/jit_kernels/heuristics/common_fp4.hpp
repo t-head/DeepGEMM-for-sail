@@ -23,7 +23,6 @@ namespace deep_gemm_fp4_common {
 // ============================================================================
 
 /// Check whether the MXFP4 scale tensor has the correct layout (uint16, M/N-major)
-// keep in sync with deep_gemm/jit_kernels/gemm_fp4.py
 // NOTE: Only the canonical packed layouts are accepted: an M/N-major scale as produced by
 // `preprocess_mxfp4_scales`, or its degenerate form when a dim has extent 1. Tensors
 // whose strides carry padding (for example a row slice of a larger buffer) are
@@ -380,7 +379,7 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     min_block_n = (enable_act_and_quant_fusing && min_block_n < 64) ? 64 : min_block_n;
     int bit_length = 32 - __builtin_clz(static_cast<unsigned>(max_block_n));
     int bit_length_min = 32 - __builtin_clz(static_cast<unsigned>(min_block_n)) - 1; // exponent of min_block_n
-    // `exp > bit_length_min - 1` mirrors python's right-open range stop, so min_block_n is included
+    // Include min_block_n in the descending power-of-two candidates.
     std::vector<int> block_ns;
     if (k >= 384) {
         for (int exp = bit_length - 1; exp > (bit_length_min - 1); --exp) {
@@ -603,8 +602,7 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     int num_min_sms = num_sms;
     DG_HOST_ASSERT(num_min_sms <= num_sms);
 
-    // NOTE: Python rebinds best_block_m/best_block_n from get_warp_mn_grouped() before deciding
-    // stage_candidates, so the conditions below must use the post-call values (bm_out/bn_out).
+    // Use the adjusted block dimensions from get_warp_mn_grouped() when choosing pipeline stages.
     auto [bm_out, bn_out, warp_m, warp_n] = get_warp_mn_grouped(best_block_m, best_block_n);
 
     std::vector<int> stage_candidates;
@@ -654,7 +652,7 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
 /// Decide whether to enable the MoE dynamic-tile kernel and which variant to use.
 /// Returns (enable_moe_dynamic_tile, dynamic_tile_id), where dynamic_tile_id is the
 /// FP4DynamicTileId enumerator name -- "LargeEM", "LargeK", "LargeK_G2", "SmallEM", or
-/// "Disabled" when not enabled. Mirrors select_moe_dynamic_tile() in m_grouped_gemm_fp4.py.
+/// "Disabled" when not enabled.
 ///
 /// NOTE: the shape lists compare against `k * 2` because `k` here counts fp4 elements while the
 /// model shapes are quoted in bf16 elements.

@@ -44,7 +44,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     static constexpr GemmType kGemmType = GemmType::MGroupedNoPad;
     const EpilogueType kEpilogueType = enable_act_and_quant_fusing ? get_epilogue_type(activation_type) : EpilogueType::Default;
 
-    // N_EXPAND logic, keep in sync with m_grouped_gemm_fp4.py (nopad).
+    // Select N expansion for the no-pad kernel.
     // The fused epilogue requires n_expand == 1 (EpilogueTraits::is_valid_config).
     int n_expand = 1;
     if (k <= 512 && n % (block_n * 4) == 0 && !hasBias && !enable_act_and_quant_fusing) {
@@ -259,7 +259,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     }
 }
 
-// Returns (block_m, ceil_div(n, block_n)), matching the Python interface: the SBO-overlap
+// Returns (block_m, ceil_div(n, block_n)): the SBO-overlap
 // signal protocol check consumes both values.
 static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
@@ -297,7 +297,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     static constexpr GemmType kGemmType = GemmType::MGroupedMasked;
     const EpilogueType kEpilogueType = enable_act_and_quant_fusing ? get_epilogue_type(activation_type) : EpilogueType::Default;
 
-    // N_EXPAND logic for masked, keep in sync with m_grouped_gemm_fp4.py (masked).
+    // Select N expansion for the masked kernel.
     // The fused epilogue requires n_expand == 1 (EpilogueTraits::is_valid_config).
     int n_expand = 1;
     if (k <= 512 && expected_m > 2 && n % (block_n * 4) == 0 && !hasBias && !enable_act_and_quant_fusing) {
@@ -315,9 +315,8 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         DG_HOST_ASSERT(n % 64 == 0);
     }
 
-    // MoE dynamic tile, mirroring Fp4Gemm::run's `if constexpr (kEnableMoeDynamicTile)` branch.
-    // The kernel picks its own tile shape, so Python fixes the block config here purely to avoid
-    // spawning extra JIT variants; we do the same so the smem estimate below matches.
+    // The dynamic-tile kernel chooses its own tile shape. Fix the host block configuration
+    // to avoid generating redundant JIT variants.
     const auto [enable_moe_dynamic_tile, dynamic_tile_id] =
         deep_gemm_fp4_common::select_moe_dynamic_tile(n, k, expected_m, hasBias);
     deep_gemm_fp4_common::DynamicTileLaunchConst dyn_launch{};

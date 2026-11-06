@@ -1,9 +1,7 @@
 #pragma once
-// C++ JIT for moe_align_block_size — completes the fused MoE
-// zero-Python-JIT path. Mirrors deep_gemm/jit_kernels/a_fused_m_grouped_gemm.py
-// tensor allocation + the fused_gemm_util.cuh moe_align_block_size_kernel_launcher
-// branch (numel <= 16384 uses single warp-ordered kernel; otherwise the
-// deterministic K1->K2->K3->K4 phases are built and launched one by one).
+// C++ JIT for moe_align_block_size: allocate routing tensors, then launch one
+// warp-ordered kernel for numel <= 16384 or the deterministic K1->K2->K3->K4
+// phases for larger inputs.
 
 #include <cstdint>
 #include <optional>
@@ -264,7 +262,7 @@ __global__ void moe_align_p4(
 };
 
 // =============================================================================
-// Host impl fn — mirrors Python moe_align_block_size in a_fused_m_grouped_gemm.py
+// Host implementation: resolve the config, allocate routing tensors and dispatch kernels.
 // =============================================================================
 // Dtypes share the existing seven- or nine-element tile formats.
 using FusedMmaConfigTuple = std::tuple<int, int, int, int, int, int, int, int, int>;
@@ -307,7 +305,7 @@ static MoeAlignReturn moe_align_block_size_impl(
 
     int numel = static_cast<int>(topk_ids.numel());
     int topk  = static_cast<int>(topk_ids.size(1));
-    // Resolve config (mirrors Python dtype/perchannel dispatch)
+    // Resolve the config from the operand dtypes and per-channel quantization mode.
     FusedConfigTuple config;
     if (config_in.has_value()) {
         config = *config_in;
@@ -356,16 +354,14 @@ static MoeAlignReturn moe_align_block_size_impl(
     DG_HOST_ASSERT(num_groups > 0);
     DG_HOST_ASSERT(block_m > 0);
 
-    // Sizes (mirror Python)
-    // Python spells this `ceil_div(numel + 1 - num_groups, block_m)`, but its `ceil_div` floors the
-    // division while ours truncates, and the dividend is negative whenever numel < num_groups.
-    // Inline the ceil_div expansion over floor_div to keep the buffer shapes identical.
+    // Buffer sizes. Use floor_div in the ceil-div expansion because the dividend can be
+    // negative when numel < num_groups.
     int max_num_m_blocks = num_groups - 1 + floor_div(numel + 1 - num_groups + block_m - 1, block_m);
     int block_size_pow2  = static_cast<int>(next_power_of_two(static_cast<uint32_t>(num_groups)));
     int s_total_ub       = max_num_m_blocks * block_m;
     int num_blocks_pad   = ceil_div(s_total_ub, block_size_pow2);
 
-    // Allocate output tensors (mirror Python)
+    // Allocate output routing tensors.
     auto opt_i32 = at::TensorOptions().dtype(at::kInt).device(topk_ids.device());
     auto expert_ids_and_cumsum = at::empty({max_num_m_blocks, 4},        opt_i32);
     auto sorted_token_ids      = at::empty({max_num_m_blocks, block_m},  opt_i32);
@@ -374,7 +370,7 @@ static MoeAlignReturn moe_align_block_size_impl(
     auto m_rows                = at::empty({num_groups},                 opt_i32);
     auto m_indices             = at::empty({numel},                      opt_i32);
 
-    // Intermediate buffer for fallback path (K1..K4). Alloc always: matches Python.
+    // Allocate the intermediate buffer for the K1..K4 fallback path.
     auto intermediate_buffer = at::empty({2 * num_blocks_pad + 2, num_groups}, opt_i32);
 
     // Branch: warp-ordered (numel <= 16384) OR 4-kernel fallback

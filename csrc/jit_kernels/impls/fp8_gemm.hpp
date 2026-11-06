@@ -250,7 +250,6 @@ public:
         const PpuHwParams& hw = PpuHwParams::instance();
         return fmt::format(
             R"(
-#define FP8_HGRTC
 #include <deep_gemm/impls/fp8_gemm.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{

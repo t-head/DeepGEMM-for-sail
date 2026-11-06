@@ -277,7 +277,7 @@ public:
         put(code_path, code);
 
         // Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use -Xllvm flags,
-        // others only need -ppu-simt-branch=false (aligned with compiler.py logic)
+        // others only need -ppu-simt-branch=false.
         std::string per_kernel_flags;
         if (get_ppu_arch() == AC_PPU0015) {
             per_kernel_flags = " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"

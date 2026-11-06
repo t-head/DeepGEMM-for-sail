@@ -468,7 +468,7 @@ std::pair<int, int> m_grouped_int8_gemm_nt_masked(const std::pair<torch::Tensor,
     const auto& [num_groups__, m_, n_] = get_shape<3>(d);
     int num_groups___ = masked_m.numel();
 
-    // Type and shape checks (matching Python implementation)
+    // Type and shape checks
     DG_HOST_ASSERT(num_groups == num_groups_ && num_groups_ == num_groups__ && num_groups__ == num_groups___);
     DG_HOST_ASSERT(m == m_ && n == n_ && k == k_);
     DG_HOST_ASSERT(expected_m > 0 && m > 0 && n > 0 && k > 0 && num_groups > 0);
@@ -529,7 +529,7 @@ void m_grouped_int8_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>&
     const auto& [m_, n_] = get_shape<2>(d);
     int m__ = m_indices.numel();
 
-    // Type and shape checks (matching Python implementation)
+    // Type and shape checks
     DG_HOST_ASSERT(m == m_ && m_ == m__ && k == k_ && n == n_);
     DG_HOST_ASSERT((lhs_scales.sizes() == std::vector<int64_t>{m, 1}));
     DG_HOST_ASSERT((rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1}));
@@ -692,7 +692,7 @@ void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tens
         }
     }
 
-    // Type and shape checks (matching Python implementation)
+    // Type and shape checks
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
     if (use_psum_layout) {
@@ -779,7 +779,7 @@ std::pair<int, int> m_grouped_fp8_gemm_nt_masked(const std::pair<torch::Tensor, 
         }
     }
 
-    // Type and shape checks (matching Python implementation)
+    // Type and shape checks
     DG_HOST_ASSERT(num_groups == num_groups_ && num_groups_ == num_groups__ && num_groups__ == num_groups___);
     DG_HOST_ASSERT(m == m_ && n == n_ && k == k_);
     DG_HOST_ASSERT(expected_m > 0 && m > 0 && n > 0 && k > 0 && num_groups > 0);
@@ -852,7 +852,7 @@ void m_grouped_fp8_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& 
         }
     }
 
-    // Type and shape checks (matching Python implementation)
+    // Type and shape checks
     DG_HOST_ASSERT(m == m_ && m_ == m__ && k == k_ && n == n_);
     DG_HOST_ASSERT((lhs_scales.sizes() == std::vector<int64_t>{m, (k + 127) / 128}));
     DG_HOST_ASSERT((rhs_scales.sizes() == std::vector<int64_t>{num_groups, (n + 127) / 128, (k + 127) / 128}));
@@ -1123,7 +1123,7 @@ static void m_grouped_fp4_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Te
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 
-    // Mirror the Python path: re-stride `out_scale` in place to the N-major layout (1, sfm) that
+    // Re-stride out_scale in place to the N-major layout (1, sfm) that
     // the Gemm2 SFA reader expects. NOTE: this is 2-D here, unlike the masked variant's 3-D layout.
     // `out_scale_tensor` shares the TensorImpl with the caller's tensor, so this is visible in Python.
     if (enable_act_and_quant_fusing) {
@@ -1201,8 +1201,7 @@ void m_grouped_fp8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& 
 
     const auto arch_major = device_runtime->get_arch_major();
 
-    // per-channel quant — branch condition mirrors the Python entry:
-    //   `if lhs_scales.shape == (num_token, 1) and rhs_scales.shape == (num_groups, n, 1)`
+    // Select per-channel quantization when each token and each expert output channel has one scale.
     if (lhs_scales.sizes() == std::vector<int64_t>{num_token, 1}
             && rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1}) {
         if (arch_major == 8) {
@@ -1222,7 +1221,7 @@ void m_grouped_fp8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& 
     DG_HOST_ASSERT(k % 128 == 0);
     DG_HOST_ASSERT(std::get<3>(configs) == 128);  // block_k
 
-    // Column-major (TMA-aligned) lhs scales — same transform as the Python entry
+    // Convert lhs scales to the column-major, TMA-aligned layout.
     torch::Tensor lhs_scales_col_major = get_mn_major_tma_aligned_tensor(lhs_scales);
 
     if (arch_major == 8) {
@@ -1252,8 +1251,7 @@ void m_grouped_int8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>&
     const auto& [num_groups, n, k_] = get_shape<3>(rhs);
     const auto& [m_sum, n_] = get_shape<2>(out);
 
-    // Mirrors the Python forward to the per-channel path; validates the
-    // per-channel inputs (the impl does not re-check them).
+    // Validate per-channel inputs before dispatch; the implementation does not re-check them.
     DG_HOST_ASSERT(k == k_ && n == n_);
     DG_HOST_ASSERT(lhs.scalar_type() == torch::kInt8);
     DG_HOST_ASSERT(rhs.scalar_type() == torch::kInt8);
@@ -1367,7 +1365,7 @@ void m_grouped_fp4_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& 
         TORCH_CHECK(n % 2 == 0, "n (", n, ") must be divisible by 2.");
     }
 
-    // Python returns before Runtime.__call__, so arg_defs does not check scheduler dtypes for empty output.
+    // Empty output returns before validating scheduler tensor dtypes.
     if (m_sum == 0) return;
 
     DG_HOST_ASSERT(m_rows.scalar_type() == torch::kInt32);
@@ -1512,7 +1510,7 @@ static std::pair<int, int> m_grouped_fp4_gemm_nt_masked(const std::pair<torch::T
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 
-    // Mirror the Python path: re-stride `out_scale` in place to the N-major layout
+    // Re-stride out_scale in place to the N-major layout
     // (sfm * sfn, 1, sfm) that the Gemm2 SFA reader expects. `out_scale_tensor` shares the
     // TensorImpl with the caller's tensor, so the re-stride is visible on the Python side.
     if (enable_act_and_quant_fusing) {
