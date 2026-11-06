@@ -1,6 +1,7 @@
 #pragma once
 #include <deep_gemm/impls/mega_moe_io.cuh>
 #include <deep_gemm/scheduler/mega_moe_work_queue.cuh>
+#include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #pragma clang diagnostic ignored "-Wswitch"
@@ -33,7 +34,7 @@ template <int ShapeN, int ShapeK,
           int WarpM, int WarpN, int WarpK,
           int kNumGroups, int kNumStages, GemmType kGemmType,
           int N_EXPAND = 1, bool kMoeScatter = false, bool kFusedSitu = false,
-          bool kUseReplicaWeights = false, bool kDynamicWork = false>
+          bool kUseReplicaWeights = false, bool kDynamicWork = false, int kNumRanks = 1>
 class W4A16GEMM_MMA {
 public:
   using ElementA = cutlass::bfloat16_t;
@@ -67,11 +68,19 @@ public:
   using TileShape = Shape<Int<BlockM>, Int<BlockN>, Int<BlockK>>;
   static constexpr int N_Blocks = ceil_div(ShapeN, BlockN * N_EXPAND);
   static constexpr int scheduler_swizzle = (BlockM == 16) ? 1: 2;
-  using TileScheduler = cute::conditional_t<
+  using NativeTileScheduler = cute::conditional_t<
     Fused,
     deep_gemm::FusedGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND, kNumGroups, N_Blocks, scheduler_swizzle>,
     deep_gemm::DeepGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND, kNumGroups, N_Blocks, scheduler_swizzle>
   >;
+  using ScatterTileScheduler = cute::conditional_t<kMoeScatter,
+    deep_gemm::sched::RoutedMegaMoEScheduler<ShapeN, ShapeK, BlockM, BlockN * N_EXPAND,
+                                          kNumGroups, kNumRanks, scheduler_swizzle>,
+    NativeTileScheduler>;
+  using TileScheduler = cute::conditional_t<kDynamicWork,
+    deep_gemm::sched::RoutedMegaMoEGemm1Scheduler<ShapeN, ShapeK, BlockM, BlockN,
+                                               kNumGroups, scheduler_swizzle>,
+    ScatterTileScheduler>;
   using ArchTag = cutlass::arch::PPU0015;
   static constexpr int WarpsOnM = BlockM / WarpM;
   static constexpr int WarpsOnN = BlockN / WarpN;
@@ -381,26 +390,16 @@ public:
         const deep_gemm::mega_moe::WorkQueue queue{params.queue_counter, &queue_ticket};
         queue.prime(thread_idx);
         const uint32_t work = queue.current();
-        while (deep_scheduler.curr_group_idx < L) {
-          deep_scheduler.curr_group_m = __ldg(params.scheduler.grouped_layout + deep_scheduler.curr_group_idx);
-          const uint32_t mb = deep_gemm::math::ceil_div(deep_scheduler.curr_group_m, uint32_t(BlockM));
-          if (work < (deep_scheduler.curr_cumsum + mb) * N_Blocks) {
-            deep_scheduler.get_swizzled_block_idx(mb, work - deep_scheduler.curr_cumsum * N_Blocks, m_block_idx, n_block_idx);
-            const uint32_t row = m_block_idx * BlockM;
-            const uint32_t valid = __ldg(params.valid_m_rows + deep_scheduler.curr_group_idx);
-            if (row < valid) {
-              const uint32_t first = (deep_scheduler.curr_cumsum_m + row) / params.dispatch_block_m;
-              const uint32_t last = (deep_scheduler.curr_cumsum_m + cute::min(row + uint32_t(BlockM), valid) - 1) / params.dispatch_block_m;
-              ready.wait(params.arrival_counts, first, last,
-                         deep_gemm::math::ceil_div(params.scheduler.shape_m, params.dispatch_block_m), params.dispatch_arrivals);
-            }
-            return true;
-          }
-          deep_scheduler.curr_cumsum += mb;
-          deep_scheduler.curr_cumsum_m += deep_scheduler.curr_group_m;
-          ++deep_scheduler.curr_group_idx;
+        if (!deep_scheduler.select_work(work, m_block_idx, n_block_idx)) return false;
+        const uint32_t row = m_block_idx * BlockM;
+        const uint32_t valid = __ldg(params.valid_m_rows + deep_scheduler.curr_group_idx);
+        if (row < valid) {
+          const uint32_t first = (deep_scheduler.curr_cumsum_m + row) / params.dispatch_block_m;
+          const uint32_t last = (deep_scheduler.curr_cumsum_m + cute::min(row + uint32_t(BlockM), valid) - 1) / params.dispatch_block_m;
+          ready.wait(params.arrival_counts, first, last,
+                     deep_gemm::math::ceil_div(params.scheduler.shape_m, params.dispatch_block_m), params.dispatch_arrivals);
         }
-        return false;
+        return true;
       }
     };
     #pragma clang loop licm(disable)

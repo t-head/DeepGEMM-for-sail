@@ -90,6 +90,7 @@ inline SourceFields source_fields(const PreDispatchConfig& c) {
 
 inline SourceFields source_fields(const ScatterConfig& c) {
     SourceFields values{
+        {"NUM_RANKS", std::to_string(c.num_ranks)},
         {"BLOCK_K", std::to_string(c.block_k)},
         {"BLOCK_M", std::to_string(c.block_m)},
         {"BLOCK_N", std::to_string(c.block_n)},

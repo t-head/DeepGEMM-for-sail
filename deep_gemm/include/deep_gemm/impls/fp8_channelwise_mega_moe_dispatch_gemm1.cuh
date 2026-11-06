@@ -3,6 +3,7 @@
 // Channelwise FP8 fused MegaMoE; shared routing is independent of GEMM dtype/layout.
 #include <deep_gemm/impls/mega_moe_transport.cuh>
 #include <deep_gemm/scheduler/mega_moe_work_queue.cuh>
+#include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 #include <deep_gemm/impls/fp8_channelwise_mega_moe_gemm1_mma.cuh>
 
 namespace deep_gemm::mega_moe::fp8_channelwise {
@@ -215,36 +216,12 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         workspace, sym_buffer, input_topk_idx, smem_expert_count, num_tokens,
         cta_idx, thread_idx);
 
-    // Every warp holds the same distributed expert histogram. Each lane owns
-    // one expert in every 32-expert chunk, retaining the register-only
-    // scheduler for replica slots and Qwen's 128 experts/rank (four chunks).
     constexpr uint32_t kExpertChunks = (kNumExpertsPerRank + 31) / 32;
-    uint32_t expert_m[kExpertChunks];
-    uint32_t block_begin[kExpertChunks];
-    uint32_t block_end[kExpertChunks];
-    uint32_t chunk_base = 0;
-    #pragma unroll
-    for (uint32_t chunk = 0; chunk < kExpertChunks; ++chunk) {
-        const uint32_t expert = chunk * 32 + lane_idx;
-        expert_m[chunk] = expert < kNumExpertsPerRank
-            ? static_cast<uint32_t>(
-                  *workspace.get_expert_recv_count_sum_ptr(expert))
-            : 0;
-        const uint32_t expert_blocks =
-            math::ceil_div(expert_m[chunk], kBlockM);
-        uint32_t chunk_end = expert_blocks;
-        #pragma unroll
-        for (uint32_t offset = 1; offset < 32; offset <<= 1) {
-            const uint32_t value =
-                __shfl_up_sync(0xffffffffu, chunk_end, offset);
-            if (lane_idx >= offset)
-                chunk_end += value;
-        }
-        block_begin[chunk] =
-            chunk_base + chunk_end - expert_blocks;
-        block_end[chunk] = chunk_base + chunk_end;
-        chunk_base += __shfl_sync(0xffffffffu, chunk_end, 31);
-    }
+    const sched::DistributedMegaMoEBlocks<kNumExpertsPerRank, kBlockM> blocks(
+        workspace.get_expert_recv_count_sum_ptr(), lane_idx);
+    const auto& expert_m = blocks.rows;
+    const auto& block_begin = blocks.begin;
+    const auto& block_end = blocks.end;
     const layout::Gemm2Metadata gemm2_meta(
         gemm2_metadata, kNumExpertsPerRank);
     if (cta_idx == 0 && warp_idx == 0) {
@@ -281,26 +258,8 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
             if (lane_idx == 0) gemm2_block_info[0] = make_uint4(base, 0, 0, 0);
         }
     }
-    const uint32_t total_m_blocks = chunk_base;
+    const uint32_t total_m_blocks = blocks.total_blocks;
     constexpr uint32_t kNumNBlocks = kGemm1N / kBlockN;
-    const uint32_t total_work = total_m_blocks * kNumNBlocks;
-
-    const auto dget_m = [&](uint32_t e) {
-        uint32_t local_m = 0;
-        #pragma unroll
-        for (uint32_t chunk = 0; chunk < kExpertChunks; ++chunk)
-            if (chunk == e / 32)
-                local_m = expert_m[chunk];
-        return __shfl_sync(0xffffffffu, local_m, e % 32);
-    };
-    const auto dget_block_begin = [&](uint32_t e) {
-        uint32_t local_begin = 0;
-        #pragma unroll
-        for (uint32_t chunk = 0; chunk < kExpertChunks; ++chunk)
-            if (chunk == e / 32)
-                local_begin = block_begin[chunk];
-        return __shfl_sync(0xffffffffu, local_begin, e % 32);
-    };
 
     auto* queue_counter = workspace.get_gemm1_work_count_ptr();
     // Mainloop returns after its final CTA barrier; its storage is free
@@ -322,21 +281,9 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     };
 
     const auto resolve_m_block = [&](uint32_t g) {
-        uint32_t expert = kNumExpertsPerRank;
-        #pragma unroll
-        for (uint32_t chunk = 0; chunk < kExpertChunks; ++chunk) {
-            const uint32_t lane_expert = chunk * 32 + lane_idx;
-            const bool local_hit =
-                lane_expert < kNumExpertsPerRank &&
-                g >= block_begin[chunk] && g < block_end[chunk];
-            const uint32_t hit_mask =
-                __ballot_sync(0xffffffffu, local_hit);
-            if (expert == kNumExpertsPerRank && hit_mask != 0)
-                expert = chunk * 32
-                    + static_cast<uint32_t>(__ffs(hit_mask) - 1);
-        }
-        const uint32_t group_m = dget_m(expert);
-        const uint32_t group_block_begin = dget_block_begin(expert);
+        uint4 info;
+        blocks.get_block(g, info);
+        const uint32_t expert = info.x, group_m = info.y, group_block_begin = info.z;
         const uint32_t m_block = g - group_block_begin;
         return BlockInfo{
             expert,
@@ -456,27 +403,15 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         // Consumer CTAs schedule the complete grouped-GEMM work list while
         // waiting only for the M block they need, overlapping data transport
         // with GEMM execution.
-        uint32_t current_expert = 0;
-        uint32_t current_expert_m = 0;
-        uint32_t current_block_begin = 0;
-        uint32_t current_work_end = 0;
-        while (true) {
-            const uint32_t work_idx = prefetched_work;
-            if (work_idx >= total_work)
-                break;
-            const uint32_t global_m_block = work_idx / kNumNBlocks;
-            if (work_idx >= current_work_end) {
-                const BlockInfo bi = resolve_m_block(global_m_block);
-                current_expert = bi.expert;
-                current_expert_m = bi.expert_m;
-                current_block_begin = bi.expert_block_begin;
-                current_work_end = (current_block_begin + math::ceil_div(current_expert_m, kBlockM))
-                    * kNumNBlocks;
-            }
-            const uint32_t n_block = work_idx % kNumNBlocks;
-            const uint32_t pool_base = global_m_block * kBlockM;
+        sched::MegaMoEGemm1Scheduler scheduler;
+        uint32_t m_block, n_block;
+        while (scheduler.select_work<kBlockM, kNumNBlocks>(
+                prefetched_work, m_block, n_block, blocks)) {
+            const uint32_t current_expert = scheduler.curr_group_idx;
+            const uint32_t pool_base = scheduler.curr_global_block_m_idx * kBlockM;
             const uint32_t valid_m = mega_moe::detail::umin(
-                kBlockM, current_expert_m - (global_m_block - current_block_begin) * kBlockM);
+                kBlockM, scheduler.curr_group_m - m_block * kBlockM);
+            const uint32_t global_m_block = scheduler.curr_global_block_m_idx;
 
             ready.wait(workspace.get_l1_arrival_count_ptr(0), global_m_block, global_m_block,
                        total_m_blocks, kPullGroupSize);

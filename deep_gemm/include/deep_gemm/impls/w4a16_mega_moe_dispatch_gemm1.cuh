@@ -24,26 +24,17 @@ CUTLASS_DEVICE void dispatch_tokens(void* workspace_base, const layout::SymBuffe
     mega_moe::detail::dispatch_handshake<Ranks, CTAs, Threads, Experts, ExpertsPerRank, TopK, true>(
         ws, buffer, input_ids, reinterpret_cast<uint32_t*>(smem_buf), tokens, cta, thread);
     constexpr uint32_t Chunks = (ExpertsPerRank + 31) / 32;
-    uint32_t rows[Chunks], begins[Chunks], ends[Chunks];
-    uint32_t total = 0;
-#pragma unroll
-    for (uint32_t chunk = 0; chunk < Chunks; ++chunk) {
-        const uint32_t expert = chunk * 32 + lane;
-        rows[chunk] = expert < ExpertsPerRank ? uint32_t(*ws.get_expert_recv_count_sum_ptr(expert)) : 0;
-        const uint32_t blocks = math::ceil_div(rows[chunk], BlockM);
-        uint32_t prefix = blocks;
-#pragma unroll
-        for (uint32_t offset = 1; offset < 32; offset *= 2) {
-            const uint32_t value = __shfl_up_sync(0xffffffffu, prefix, offset);
-            if (lane >= offset)
-                prefix += value;
-        }
-        begins[chunk] = total + prefix - blocks;
-        ends[chunk] = total + prefix;
-        total += __shfl_sync(0xffffffffu, prefix, 31);
-        if (cta == 0 && warp == 0 && expert < ExpertsPerRank) {
-            const uint32_t padded = blocks * BlockM, base = begins[chunk] * BlockM;
-            meta.store_rows(expert, rows[chunk], padded, base, padded, base);
+    const sched::DistributedMegaMoEBlocks<ExpertsPerRank, BlockM> blocks(ws.get_expert_recv_count_sum_ptr(), lane);
+    const uint32_t total = blocks.total_blocks;
+    if (cta == 0 && warp == 0) {
+        #pragma unroll
+        for (uint32_t chunk = 0; chunk < Chunks; ++chunk) {
+            const uint32_t expert = chunk * 32 + lane;
+            if (expert < ExpertsPerRank) {
+                const uint32_t padded = (blocks.end[chunk] - blocks.begin[chunk]) * BlockM;
+                const uint32_t base = blocks.begin[chunk] * BlockM;
+                meta.store_rows(expert, blocks.rows[chunk], padded, base, padded, base);
+            }
         }
     }
     comm::grid_sync<CTAs, 1>(ws, cta, thread, block_sync);
@@ -53,18 +44,9 @@ CUTLASS_DEVICE void dispatch_tokens(void* workspace_base, const layout::SymBuffe
         const uint32_t team = cta / PullGroupSize, member = cta % PullGroupSize;
         const uint32_t members = cute::min(PullGroupSize, PullCTAs - team * PullGroupSize);
         for (uint32_t g = team; g < total; g += Teams) {
-            uint32_t expert = 0, begin = 0, valid = 0;
-#pragma unroll
-            for (uint32_t chunk = 0; chunk < Chunks; ++chunk) {
-                const bool owns = g >= begins[chunk] && g < ends[chunk];
-                const uint32_t mask = __ballot_sync(0xffffffffu, owns);
-                if (mask) {
-                    const uint32_t owner = uint32_t(__ffs(mask) - 1);
-                    expert = chunk * 32 + owner;
-                    begin = __shfl_sync(0xffffffffu, begins[chunk], owner);
-                    valid = __shfl_sync(0xffffffffu, rows[chunk], owner);
-                }
-            }
+            uint4 info;
+            blocks.get_block(g, info);
+            const uint32_t expert = info.x, valid = info.y, begin = info.z;
             const uint32_t row_start = (g - begin) * BlockM;
             const uint32_t count = mega_moe::detail::umin(BlockM, valid - row_start);
             const mega_moe::detail::WarpSourceRanges<Ranks> ranges(ws, expert, lane);

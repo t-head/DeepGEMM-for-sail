@@ -2,6 +2,7 @@
 #include <tools/util/include/cutlass/util/packed_stride.hpp>
 #include <deep_gemm/impls/mega_moe_io.cuh>
 #include <deep_gemm/scheduler/mega_moe_work_queue.cuh>
+#include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 
 // Native block-FP8 fused dispatch/GEMM1.
 #include <deep_gemm/impls/mega_moe_transport.cuh>
@@ -206,24 +207,11 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
     mega_moe::detail::dispatch_handshake<kRanks, kCTAs, kThreads, kExperts, kEpr, kTopk, true>(
         ws, sym_buffer, ids, reinterpret_cast<uint32_t*>(smem), num_tokens, sm, thread);
 
-    // Four warp-distributed expert chunks cover Qwen's full EP4 EPR=128.
-    uint32_t expert_rows[kChunks], block_begin[kChunks], block_end[kChunks];
-    uint32_t total_blocks = 0;
-    #pragma unroll
-    for (uint32_t chunk = 0; chunk < kChunks; ++chunk) {
-        const uint32_t e = chunk * 32 + lane;
-        expert_rows[chunk] = e < kEpr ? uint32_t(*ws.get_expert_recv_count_sum_ptr(e)) : 0;
-        const uint32_t blocks = math::ceil_div(expert_rows[chunk], kBlockM);
-        uint32_t prefix = blocks;
-        #pragma unroll
-        for (uint32_t offset = 1; offset < 32; offset <<= 1) {
-            const uint32_t v = __shfl_up_sync(0xffffffffu, prefix, offset);
-            if (lane >= offset) prefix += v;
-        }
-        block_begin[chunk] = total_blocks + prefix - blocks;
-        block_end[chunk] = total_blocks + prefix;
-        total_blocks += __shfl_sync(0xffffffffu, prefix, 31);
-    }
+    const sched::DistributedMegaMoEBlocks<kEpr, kBlockM> blocks(ws.get_expert_recv_count_sum_ptr(), lane);
+    const auto& expert_rows = blocks.rows;
+    const auto& block_begin = blocks.begin;
+    const auto& block_end = blocks.end;
+    const uint32_t total_blocks = blocks.total_blocks;
     const layout::Gemm2Metadata gemm2_meta(gemm2_metadata, kEpr);
     if (sm == 0 && warp == 0) {
         #pragma unroll
@@ -245,18 +233,9 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
 
     struct TileInfo { uint32_t expert, begin, valid, local_begin; };
     const auto resolve = [&](uint32_t g) {
-        uint32_t expert = kEpr, rows = 0, begin = 0;
-        #pragma unroll
-        for (uint32_t chunk = 0; chunk < kChunks; ++chunk) {
-            const uint32_t mask = __ballot_sync(0xffffffffu,
-                chunk * 32 + lane < kEpr && g >= block_begin[chunk] && g < block_end[chunk]);
-            if (mask) {
-                const uint32_t owner = uint32_t(__ffs(mask) - 1);
-                expert = chunk * 32 + owner;
-                rows = __shfl_sync(0xffffffffu, expert_rows[chunk], owner);
-                begin = __shfl_sync(0xffffffffu, block_begin[chunk], owner);
-            }
-        }
+        uint4 info;
+        blocks.get_block(g, info);
+        const uint32_t expert = info.x, rows = info.y, begin = info.z;
         const uint32_t local_begin = (g - begin) * kBlockM;
         return TileInfo{expert, g * kBlockM, mega_moe::detail::umin(kBlockM, rows - local_begin), local_begin};
     };
@@ -307,54 +286,45 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
             work = queue.current();
         }
         uint32_t batch_end = work + kWorkBatch;
-        uint32_t first_work = 0, pool_base = 0;
-        // Queue tickets are monotonic. Keep an expert cursor instead of
-        // scanning all preceding experts for every tile.
-        #pragma unroll 1
-        for (uint32_t expert = 0; expert < kEpr; ++expert) {
-            const uint32_t rows = uint32_t(__ldg(ws.get_expert_recv_count_sum_ptr(expert)));
+        sched::MegaMoEGemm1Scheduler scheduler;
+        sched::RowCountMegaMoEBlocks<kEpr, kComputeM, kBlockM, uint64_t> metadata{
+            ws.get_expert_recv_count_sum_ptr()};
+        uint32_t m, n;
+        #pragma clang loop licm(disable)
+        while (scheduler.select_work<kComputeM, kNBlocks>(work, m, n, metadata)) {
+            const uint32_t expert = scheduler.curr_group_idx, rows = scheduler.curr_group_m;
             const uint32_t dispatch_blocks = math::ceil_div(rows, kBlockM);
-            const uint32_t jobs = math::ceil_div(rows, kComputeM) * kNBlocks;
-            // Keep mainloop descriptors inside the tile loop to bound register
-            // lifetimes in BM192 specializations.
-            #pragma clang loop licm(disable)
-            while (work < first_work + jobs) {
-                const uint32_t local_work = work - first_work;
-                const uint32_t local_begin = (local_work / kNBlocks) * kComputeM;
-                const uint32_t n = local_work % kNBlocks;
-                const uint32_t valid = mega_moe::detail::umin(kComputeM, rows - local_begin);
-                const uint32_t base = pool_base + local_begin;
-                const uint32_t first = base / kBlockM, last = (base + valid - 1) / kBlockM;
-                ready.wait(ws.get_l1_arrival_count_ptr(0), first, last, total_blocks);
-                asm volatile("" ::: "memory");
-                uint32_t weight_expert = expert;
-                const uint8_t* weight_base = w1;
-                const float* scale_base = s1;
-                if constexpr (kMasterExperts < kEpr) {
-                    if (weight_expert >= kMasterExperts) {
-                        weight_expert -= kMasterExperts;
-                        weight_base = w1_replicas;
-                        scale_base = s1_replicas;
-                    }
-                }
-                const uint32_t writable = local_begin + kComputeM >= rows
-                    ? dispatch_blocks * kBlockM - local_begin : kComputeM;
-                auto* tile_output = output + uint64_t(base) * (kN / 2);
-                gemm1_block<kN, kHidden, kClamp, kSwigluOai, kComputeM>(
-                    pool + uint64_t(base) * kHidden, pool_scales + base,
-                    weight_base + uint64_t(weight_expert) * kN * kHidden,
-                    scale_base + uint64_t(weight_expert) * (kN / 128) * kScales,
-                    tile_output, output_scales + base,
-                    ws.num_max_pool_tokens, valid, n, thread, reinterpret_cast<char*>(smem),
-                    swiglu_limit, swiglu_alpha, writable);
-                if (++work == batch_end) {
-                    queue.prime(thread, kWorkBatch);
-                    work = queue.current();
-                    batch_end = work + kWorkBatch;
+            const uint32_t local_begin = m * kComputeM;
+            const uint32_t valid = mega_moe::detail::umin(kComputeM, rows - local_begin);
+            const uint32_t base = scheduler.curr_cumsum_m + local_begin;
+            const uint32_t first = base / kBlockM, last = (base + valid - 1) / kBlockM;
+            ready.wait(ws.get_l1_arrival_count_ptr(0), first, last, total_blocks);
+            asm volatile("" ::: "memory");
+            uint32_t weight_expert = expert;
+            const uint8_t* weight_base = w1;
+            const float* scale_base = s1;
+            if constexpr (kMasterExperts < kEpr) {
+                if (weight_expert >= kMasterExperts) {
+                    weight_expert -= kMasterExperts;
+                    weight_base = w1_replicas;
+                    scale_base = s1_replicas;
                 }
             }
-            first_work += jobs;
-            pool_base += dispatch_blocks * kBlockM;
+            const uint32_t writable = local_begin + kComputeM >= rows
+                ? dispatch_blocks * kBlockM - local_begin : kComputeM;
+            auto* tile_output = output + uint64_t(base) * (kN / 2);
+            gemm1_block<kN, kHidden, kClamp, kSwigluOai, kComputeM>(
+                pool + uint64_t(base) * kHidden, pool_scales + base,
+                weight_base + uint64_t(weight_expert) * kN * kHidden,
+                scale_base + uint64_t(weight_expert) * (kN / 128) * kScales,
+                tile_output, output_scales + base,
+                ws.num_max_pool_tokens, valid, n, thread, reinterpret_cast<char*>(smem),
+                swiglu_limit, swiglu_alpha, writable);
+            if (++work == batch_end) {
+                queue.prime(thread, kWorkBatch);
+                work = queue.current();
+                batch_end = work + kWorkBatch;
+            }
         }
     }
 }

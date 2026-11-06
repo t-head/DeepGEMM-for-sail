@@ -83,18 +83,20 @@ void PPU_KERNEL_ENTRY(layout::SymBuffer<> sb, int tokens,
 
 inline void w4a8_scatter_impl(const w4fa8::NativeKernelConfig& kernel, const RoutedMoEWorkspace& buffer,
                               const W4A8Weights& weights, const W4A8Weights& replicas,
-                              int groups, int capacity, int rank_idx, const std::string& name) {
+                              int groups, int capacity, int rank_idx, int num_ranks, const std::string& name) {
     const auto& tile = kernel.tile;
     const auto& [w, s, inv] = weights;
     const auto& [rw, rs, rinv] = replicas;
     auto* rows = prepare_scatter_layout(groups, tile.block_m, buffer.m_rows, buffer.block_info);
     ScatterConfig c;
+    c.num_ranks = num_ranks;
     c.n = w.size(1); c.k = buffer.l2_acts.size(1); c.num_groups = groups;
     c.block_m = tile.block_m; c.block_n = tile.block_n; c.block_k = tile.block_k;
     c.warp_m = tile.warp_m; c.warp_n = tile.warp_n; c.num_stages = tile.num_stages;
     c.num_threads = w4fa8::get_num_threads(tile);
     auto source = std::string(R"(
 #include <deep_gemm/impls/w4a8_mega_moe.cuh>
+#include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 using namespace deep_gemm;
 using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<
     {N}, {K}, {BLOCK_M}, {BLOCK_N}, 128, {WARP_M}, {WARP_N}, 128,
@@ -114,7 +116,8 @@ void PPU_KERNEL_ENTRY(const cutlass::float_e4m3_t* a, const float* a_scale,
     params.ptr_d = reinterpret_cast<cutlass::bfloat16_t*>(output);
     params.ptr_a_scale = a_scale;
     params.scheduler = TileSchedulerArguments(pool, rows);
-    Kernel::TileScheduler scheduler(params.scheduler);
+    sched::RoutedMegaMoEScheduler<{N}, {K}, {BLOCK_M}, {BLOCK_N}, {NUM_GROUPS},
+        {NUM_RANKS}, ({BLOCK_M} == 16 ? 1 : 2)> scheduler(params.scheduler);
     const Epilogue epilogue{
         output, a_scale, valid, routes, offsets, rw, rs, masters, capacity, inv, rinv, smem, self_rank};
     Kernel{}.run(params, smem, scheduler, epilogue);
@@ -162,7 +165,7 @@ inline void PPUW4A8MegaMoERuntime::compile_and_launch(const std::string& name, c
     }
     TORCH_CHECK(args.kernel_phase == KernelPhase::Linear2, "Invalid MegaMoE kernel phase");
     w4a8_scatter_impl(args.scatter, args.buffer, args.l2_weights, args.l2_weights_replicas,
-                     args.config.num_experts_per_rank, args.config.nmtpr, args.rank_idx, name);
+                     args.config.num_experts_per_rank, args.config.nmtpr, args.rank_idx, args.config.num_ranks, name);
     combine_mega_moe(args.buffer, args.config, args.y, args.rank_idx, args.num_tokens);
 }
 

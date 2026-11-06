@@ -1,5 +1,6 @@
 #pragma once
 #include <deep_gemm/impls/fp8_gemm.cuh>
+#include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 #include <deep_gemm/impls/moe_gemm_scatter.cuh>
 
 namespace deep_gemm::mega_moe::fp8_blockwise {
@@ -180,12 +181,10 @@ private:
 // Schedule actual expert rows, independently of the 128-row landing-pool
 // padding. Reuse native tile ordering, including its large-group metadata
 // preprocessing, and restore the physical pool offset for each selected tile.
-template <int N, int K, int BlockM, int Groups>
+template <int N, int K, int BlockM, int Groups, int Ranks>
 struct ValidRowsPoolScheduler
-    : DeepGemmScheduler<GemmType::MGroupedNoPad, N, K, BlockM, 256, Groups,
-        math::ceil_div(N, 256), 2, EpilogueType::Default> {
-    using Base = DeepGemmScheduler<GemmType::MGroupedNoPad, N, K, BlockM, 256, Groups,
-        math::ceil_div(N, 256), 2, EpilogueType::Default>;
+    : sched::RoutedMegaMoEScheduler<N, K, BlockM, 256, Groups, Ranks> {
+    using Base = sched::RoutedMegaMoEScheduler<N, K, BlockM, 256, Groups, Ranks>;
     struct Params : Base::Params {
         const int32_t* pool_row_offsets{nullptr};
         CUTLASS_HOST_DEVICE Params() : Base::Params() {}
@@ -201,7 +200,7 @@ struct ValidRowsPoolScheduler
     }
 };
 
-template <int N, int K, int Groups, int MasterGroups, int Stages, int BlockM, int ScratchRows>
+template <int N, int K, int Groups, int MasterGroups, int Stages, int BlockM, int ScratchRows, int Ranks = 1>
 struct Gemm2Scatter {
     // Native blockwise mainloop and GroupedNoPad scheduler, with the existing
     // shared MoE epilogue adapter. The checkpoint scales remain 128x128.
@@ -230,7 +229,7 @@ struct Gemm2Scatter {
         (ScratchRows > 0 ? ScratchRows : BlockM), N>;
     static_assert(Epilogue::kUsesDisjointBf16Scratch,
                   "blockwise fused scatter must not materialize global D");
-    using Scheduler = ValidRowsPoolScheduler<N, K, BlockM, Groups>;
+    using Scheduler = ValidRowsPoolScheduler<N, K, BlockM, Groups, Ranks>;
     using Kernel = CompletedScatterKernel<DeepGemmUniversal<
         Shape<int, int, int, int>, Mainloop, Epilogue, Scheduler, false, false, true>>;
 

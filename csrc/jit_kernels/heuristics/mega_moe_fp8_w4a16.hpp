@@ -6,6 +6,7 @@
 #include "common_int8.hpp"
 #include "common_w4a16.hpp"
 #include "common_w4a8.hpp"
+#include "mega_moe.hpp"
 #include "mega_moe_fp8_w4a16_tuning.hpp"
 #include <algorithm>
 #include <cmath>
@@ -79,6 +80,7 @@ struct PreDispatchConfig {
 };
 
 struct ScatterConfig {
+    int num_ranks = 1;
     int block_k = 0;
     int block_m = 0;
     int block_n = 0;
@@ -179,11 +181,11 @@ inline void fp8_gemm1_config(DispatchConfig& c, int tokens, const Gemm1Tuning& t
     // of BM, so the same allocation supports per-call and per-rank selection.
     const auto requested = block_m ? block_m : tuning.block_m;
     const std::vector<int> allowed = requested ? std::vector<int>{fp8_dispatch_block_m(requested, false)}
-                                              : std::vector<int>{256, 128};
-    const int expected = std::max(1, int(ceil_div(int64_t(tokens) * c.num_topk, int64_t(c.num_experts_per_rank))));
+                                              : std::vector<int>{256, 128, 64, 32, 16};
+    const int expected = mega::expected_expert_rows(tokens, c.num_topk, c.num_experts_per_rank, c.num_ranks, c.nmtpr);
     const auto supported = [&](const Tile& tile) {
         const auto [bm, bn, bk, wm, wn, stages] = tile;
-        return (bm == 16 || bm == 32 || bm == 128 || bm == 256) && (bn == 128 || bn == 256) &&
+        return (bm == 16 || bm == 32 || bm == 64 || bm == 128 || bm == 256) && (bn == 128 || bn == 256) &&
                c.gemm1_n % bn == 0 && (bk == 64 || bk == 128 || bk == 256) &&
                c.token_bytes % bk == 0 && wm >= 16 && wm <= 64 && wm % 16 == 0 && bm % wm == 0 &&
                (wn == 32 || wn == 64) && stages >= 2 && stages <= 8 && threads(bm, bn, wm, wn) <= 1024 &&
@@ -248,7 +250,7 @@ inline int blockwise_compute_m(std::optional<int> expected_m, int groups, int n,
 inline void fp8_blockwise_gemm1_config(DispatchConfig& c, int tokens, int n, const Gemm1Tuning& tuning) {
     c.block_m = fp8_dispatch_block_m(c.block_m, true);
     const int groups = c.num_experts_per_rank;
-    const int em = ceil_div(int64_t(tokens) * c.num_topk, int64_t(groups));
+    const int em = mega::expected_expert_rows(tokens, c.num_topk, groups, c.num_ranks, c.nmtpr);
     c.gemm1_compute_m = tuning.block_m.value_or(blockwise_compute_m(em, groups, n, c.num_sms));
     TORCH_CHECK(c.gemm1_compute_m == 128 || c.gemm1_compute_m == 32 || c.gemm1_compute_m == 192,
                 "FP8 blockwise GEMM1 requires compute block_m=32, 128 or 192");
@@ -397,7 +399,7 @@ inline auto w4a16_scatter_config(int em, int n, int k, std::optional<PPUW4Config
 }
 
 inline int fp8_gemm1_ctas(const DispatchConfig& c, int tokens, int pulls) {
-    const int expected = std::max(1, int(ceil_div(int64_t(tokens) * c.num_topk, int64_t(c.num_experts_per_rank))));
+    const int expected = mega::expected_expert_rows(tokens, c.num_topk, c.num_experts_per_rank, c.num_ranks, c.nmtpr);
     const int64_t jobs = int64_t(c.num_experts_per_rank) * ceil_div(expected, c.gemm1_compute_m) *
                          ceil_div(c.gemm1_n, c.gemm1_block_n);
     const int work = std::min<int64_t>(4, ceil_div(jobs + pulls, int64_t(c.num_sms)));
@@ -449,7 +451,7 @@ inline const RoutedMoEConfigs& get_routed_moe_configs(Precision precision, int r
         return found->second;
     const auto tuning = tuning_config({precision, ranks, experts, topk, hidden, intermediate, tokens, activation});
     const int groups = experts / ranks;
-    const int expected = std::max(1, int(ceil_div(int64_t(tokens) * topk, int64_t(groups))));
+    const int expected = mega::expected_expert_rows(tokens, topk, groups, ranks, capacity);
     RoutedMoEConfigs result;
     if (precision == Precision::W4A16) {
         auto c = dispatch_config(ranks, experts, topk, capacity, hidden * 2, 0);
@@ -501,6 +503,7 @@ inline const RoutedMoEConfigs& get_routed_moe_configs(Precision precision, int r
         c.num_ctas = fp8_gemm1_ctas(c, tokens, c.pull_ctas);
         result.dispatch = c;
     }
+    result.scatter.num_ranks = ranks;
     if (precision == Precision::FP8Channelwise || precision == Precision::W4A8)
         result.dispatch.pull_group_size = channel_pull_group_size(result.dispatch, expected);
     if (precision == Precision::FP8Channelwise && channel_scatter_uses_worklist(result.scatter))

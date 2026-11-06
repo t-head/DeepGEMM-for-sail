@@ -59,7 +59,7 @@ extern "C" __global__ void PPU_KERNEL_ENTRY(const int* valid,int* cumulative,int
 inline void w4a16_scatter_impl(const RoutedMoEWorkspace& buffer, const torch::Tensor& weights, const torch::Tensor& scales,
                                const torch::Tensor& replicas, const torch::Tensor& replica_scales,
                                const deep_gemm_w4a16_common::W4A16Config& config, int groups, int hidden,
-                               int intermediate_hidden, int rank_idx, int num_max_tokens_per_rank, int num_topk,
+                               int intermediate_hidden, int rank_idx, int num_max_tokens_per_rank, int num_topk, int num_ranks,
                                const std::string& kernel_name) {
     const int m = buffer.l2_acts.size(0);
     auto* layout = prepare_scatter_layout(groups, config.block_m, buffer.m_rows, buffer.block_info);
@@ -82,6 +82,7 @@ inline void w4a16_scatter_impl(const RoutedMoEWorkspace& buffer, const torch::Te
                               0,
                               {uint32_t(m), layout}};
     ScatterConfig c;
+    c.num_ranks = num_ranks;
     c.n = hidden;
     c.k = intermediate_hidden;
     c.block_m = config.block_m;
@@ -95,7 +96,7 @@ inline void w4a16_scatter_impl(const RoutedMoEWorkspace& buffer, const torch::Te
 #include <deep_gemm/impls/w4a16_gemm_cutlass3.cuh>
 using Kernel = cutlass::gemm::kernel::W4A16GEMM_MMA<
     {N},{K},{BLOCK_M},{BLOCK_N},{BLOCK_K},{WARP_M},{WARP_N},{BLOCK_K},
-    {NUM_GROUPS},{NUM_STAGES},deep_gemm::GemmType::MGroupedNoPad,1,true,false,true>;
+    {NUM_GROUPS},{NUM_STAGES},deep_gemm::GemmType::MGroupedNoPad,1,true,false,true,false,{NUM_RANKS}>;
 extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes = sizeof(Kernel::SharedStorage);
 static_assert(sizeof(Kernel::Params) == {ABI_SIZE}, "W4A16 scatter parameter ABI mismatch");
 extern "C" __global__ __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
@@ -216,7 +217,7 @@ inline void PPUW4A16MegaMoERuntime::compile_and_launch(const std::string& tag, c
     w4a16_scatter_impl(
         buffer, l2_weights, l2_weights_sf, l2_weights_replicas, l2_weights_replicas_sf, args.l2_config,
         config.num_experts_per_rank, args.y.size(1), l1_weights.size(1) / 2, args.rank_idx,
-        config.nmtpr, config.num_topk, tag);
+        config.nmtpr, config.num_topk, config.num_ranks, tag);
     combine_mega_moe(buffer, config, args.y, args.rank_idx, args.num_tokens);
 }
 

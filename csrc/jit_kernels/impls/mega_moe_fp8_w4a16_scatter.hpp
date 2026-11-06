@@ -179,7 +179,7 @@ using namespace deep_gemm;
 using Scatter = mega_moe::detail::Bf16MoeScatter<{USE_PADDED_VALID_ROWS}, {CHECK_PACKED_ROUTES}>;
 using Family = ChannelwiseFp8GemmWithScatter<cutlass::float_e4m3_t,float,
     {N},{K},{BLOCK_M},{BLOCK_N},{BLOCK_K},{WARP_M},{WARP_N},{NUM_GROUPS},{NUM_STAGES},
-    GemmType::MGroupedNoPad,false,KernelStrategy::{KERNEL_TYPE},Scatter>;
+    GemmType::MGroupedNoPad,false,KernelStrategy::{KERNEL_TYPE},Scatter,{NUM_RANKS}>;
 using Kernel = typename Family::GemmKernel;
 )DGSOURCE";
 }
@@ -299,7 +299,7 @@ inline void fp8_blockwise_mega_moe_scatter_kernel(const ScatterConfig& config, c
     params.num_master_groups = config.num_master_groups;
     scatter_launch<Fp8BlockwiseScatterTag>(entry, R"DGSOURCE(
 #include <deep_gemm/impls/fp8_gemm_blockwise_scatter.cuh>
-using Family = deep_gemm::mega_moe::fp8_blockwise::Gemm2Scatter<{N},{K},{GROUPS},{MASTER_GROUPS},{NUM_STAGES},{BLOCK_M},{SCRATCH_ROWS}>;
+using Family = deep_gemm::mega_moe::fp8_blockwise::Gemm2Scatter<{N},{K},{GROUPS},{MASTER_GROUPS},{NUM_STAGES},{BLOCK_M},{SCRATCH_ROWS},{NUM_RANKS}>;
 using Kernel = typename Family::Kernel;
 static_assert(Family::kNumThreads == {NUM_THREADS}, "blockwise scatter launch must match its MMA tile");
 static_assert(Kernel::SharedStorageSize == {SMEM_SIZE}, "blockwise scatter shared-memory estimate must match its arena");

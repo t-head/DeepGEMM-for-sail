@@ -1,4 +1,5 @@
 #pragma once
+#include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 #include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
 #include <deep_gemm/impls/moe_gemm_scatter.cuh>
 
@@ -536,7 +537,7 @@ template <
     GemmType GemmTypeValue,
     bool EnableSboOverlap = false,
     KernelStrategy KernelStrategyValue = KernelStrategy::Default,
-    class GemmScatter = NoopChannelwiseGemmScatter>
+    class GemmScatter = NoopChannelwiseGemmScatter, uint32_t NumRanks = 1>
 class ChannelwiseFp8GemmWithScatter {
 public:
   using ScatterArguments = typename GemmScatter::Arguments;
@@ -642,10 +643,9 @@ public:
             cutlass::gemm::EpilogueDefault,
             IsAlignedN>;
 
-    using TileScheduler = DeepGemmScheduler<
-        GemmTypeValue, ShapeN, ShapeK,
-        BlockM, BlockN, NumGroups, math::ceil_div(ShapeN, BlockN), 2,
-        EpilogueType::Default>;
+    using TileScheduler = cute::conditional_t<GemmTypeValue == GemmType::MGroupedNoPad,
+        sched::RoutedMegaMoEScheduler<ShapeN, ShapeK, BlockM, BlockN, NumGroups, NumRanks>,
+        DeepGemmScheduler<GemmTypeValue, ShapeN, ShapeK, BlockM, BlockN, NumGroups>>;
     static constexpr bool UseAccumulatorPairStaging =
         KernelStrategyValue == KernelStrategy::Default &&
         BlockN == 256 && WarpN == 64 && ShapeN % BlockN == 0;

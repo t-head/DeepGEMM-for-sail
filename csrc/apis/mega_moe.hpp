@@ -274,10 +274,8 @@ static void fp4_fp4_mega_moe(
     const auto mega_buffer = layout::MegaMoEBuffer(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging);
     check_mega_moe_buffer(sym_buffer, mega_buffer);
-    const int64_t tokens = num_tokens, groups = num_experts_per_rank_with_replicas;
-    const int64_t owner_capacity = static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank;
-    const int em = std::max<int64_t>(1, std::min(owner_capacity,
-        tokens * num_topk / groups + 1));
+    const int em = expected_expert_rows(num_tokens, num_topk, num_experts_per_rank_with_replicas,
+                                        num_ranks, num_max_tokens_per_rank);
 
     const auto [arch_major, arch_minor] = device_runtime->get_arch_pair();
     if (arch_major != 8 || arch_minor != 9)
