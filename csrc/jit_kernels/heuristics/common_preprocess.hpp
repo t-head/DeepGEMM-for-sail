@@ -125,10 +125,12 @@ inline PreprocessedWeights preprocess_weights_and_scales(
         const bool w4a8 = mode == PreprocessMode::W4A8_MXFP4_MMA;
         const char* name = w4a8 ? "W4FA8" : "W4FA16 MMA";
         TORCH_CHECK(weight_scale.has_value(), name, " requires weight scales");
-        const auto& packed = weight;
-        const auto& scales = *weight_scale;
+        const bool dense = w4a8 && weight_scale->dim() == 2;
+        const auto packed = dense && weight.defined() ? weight.unsqueeze(0) : weight;
+        const auto scales = dense ? weight_scale->unsqueeze(0) : *weight_scale;
         TORCH_CHECK(scales.dim() == 3 && scales.scalar_type() == torch::kUInt8,
-                    name, " raw E8M0 scales must be uint8 [E,N,K/32]");
+                    name, " raw E8M0 scales must be uint8 [E,N,K/32]",
+                    w4a8 ? " or dense [N,K/32]" : "");
         const int64_t e = scales.size(0), n = scales.size(1), k = scales.size(2) * 32;
         TORCH_CHECK(e>0 && n>0 && n%64==0 && k>0 && k%(w4a8 ? 128 : 64)==0,
                     name, " requires E>0, N a multiple of 64 and K a multiple of ", w4a8 ? 128 : 64);
@@ -161,7 +163,8 @@ inline PreprocessedWeights preprocess_weights_and_scales(
         const auto indices=at::tensor(perm,at::TensorOptions().dtype(at::kLong)).to(scales.device());
         auto rearranged=adjusted_scales.reshape({e,n/64,64,k/64,2}).permute({0,1,3,2,4}).contiguous();
         rearranged=rearranged.reshape({-1,128}).index_select(1,indices).reshape({e,n/64,k*2}).contiguous();
-        return {packed.defined() ? packed.contiguous() : packed, rearranged, std::ldexp(1.0f, -exponent_shift)};
+        return {weight.defined() ? weight.contiguous() : weight,
+                dense ? rearranged.squeeze(0) : rearranged, std::ldexp(1.0f, -exponent_shift)};
     }
     if (mode == PreprocessMode::MXFP4) {
         TORCH_CHECK(weight_scale.has_value(), "MXFP4 requires scales");

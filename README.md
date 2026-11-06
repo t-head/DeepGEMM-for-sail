@@ -105,7 +105,7 @@ This library focuses on high-performance tensor cell kernels and related LLM com
 
 | Algorithm | INT8 | FP4 | FP8 | BF16 | W4A16 | W4A8 (M890) | A8W4 INT8 (PPU001) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Non-grouped** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| **Non-grouped** | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
 | **Contiguous** | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | **No-pad** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Masked** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -156,20 +156,22 @@ First call `deep_gemm.moe_align_block_size` with the LHS/RHS inputs and `topk_id
 
 For more information, please refer to the `moe_align_block_size` and `m_grouped_gemm_*_nt_fused` function documentation.
 
-#### W4A8 MoE GEMMs (M890)
+#### W4A8 dense and MoE GEMMs (M890)
 
 The W4A8 implementation accepts per-row E4M3 activations and group-32
 MXFP4 E2M1 weights.
 The kernel dequantizes weights to E5M2 using FP4 MMA, performs E4M3 x E5M2
-MMA, accumulates in FP32, and writes BF16. It supports these expert layouts:
+MMA, accumulates in FP32, and writes BF16. It supports these layouts:
 
 | API | Activation / row-scale shape | Output shape |
 | :--- | :--- | :--- |
+| `fp8_fp4_gemm_nt` (alias `gemm_fp8_fp4_bf16_nt`) | `[M,K]` / `[M,1]`, dense | `[M,N]` |
 | `m_grouped_gemm_fp8_fp4_bf16_nt_nopad` | `[M,K]` / `[M,1]`, grouped by expert | `[M,N]` |
 | `m_grouped_gemm_fp8_fp4_bf16_nt_masked` | `[E,T,K]` / `[E,T,1]` | `[E,T,N]`, valid rows only |
 | `m_grouped_gemm_fp8_fp4_bf16_nt_fused` | `[num_token,K]` / `[num_token,1]`, original token order | `[num_token*topk,N]`, grouped by expert |
 
-Activation scales are FP32. Weights are naturally packed uint8 `[E,N,K/2]`
+Activation scales are FP32. Dense weights are naturally packed uint8 `[N,K/2]`
+with raw uint8 E8M0 scales `[N,K/32]`. Grouped weights use `[E,N,K/2]`
 (even K elements in the low nibble), with raw uint8 E8M0 scales
 `[E,N,K/32]`. `N % 64 == 0` and `K % 128 == 0` are required; arbitrary
 N/K padding is not performed. GEMM operands and metadata must be contiguous
@@ -182,7 +184,7 @@ It applies a common power-of-two shift to bring weight-scale exponents into
 `[114,140]` when necessary. Exponent codes 0 and 255, and exponent ranges
 spanning more than 26, are rejected. The returned inverse must be applied
 exactly once per GEMM. Either fold it into the activation row scales or pass
-it as the optional scalar `inv_scale` to any of the three W4FA8 GEMM APIs.
+it as the optional scalar `inv_scale` to any W4FA8 GEMM API.
 `inv_scale` must be finite and positive; its default value of `1.0` skips
 the extra multiplication. The E4M3 codes remain unchanged:
 
@@ -201,6 +203,14 @@ dg.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
     inv_scale=weight_inv_scale)
 ```
 
+For dense NT GEMM, preprocessing preserves the two-dimensional weight layout:
+
+```python
+rhs = dg.preprocess_weights_and_scales(
+    dg.PreprocessMode.W4A8_MXFP4_MMA, False, packed_weight, raw_weight_scale)
+dg.fp8_fp4_gemm_nt((a_e4m3, row_scale), rhs[:2], out, inv_scale=rhs[2])
+```
+
 The fused path gathers activations and their scales with the same token
 index. Its output already uses the grouped, unpadded row order consumed by
 nopad. The fused interface integrates routing gather with GEMM execution. Weight
@@ -211,16 +221,22 @@ and top-k combine remain separate operations.
 Nopad accepts per-row expert `m_indices` and optional per-expert `m_rows`;
 rows must already be grouped by expert. Masked accepts device-side
 `masked_m` counts and an `expected_m` scheduling hint. Computation is
-restricted to the valid rows specified by `masked_m`. Nopad/masked select configurations internally unless
+restricted to the valid rows specified by `masked_m`. Dense/nopad/masked select configurations internally unless
 an explicit config tuple is supplied. The fused config comes from
 `moe_align_block_size`. The existing nine-element config format is unchanged:
 `(num_sms, block_m, block_n, block_k, warp_m, warp_n, warp_k, stages, n_expand)`.
 Native tile selection and streamed execution policies are handled internally
-by the C++ runtime. For explicit streamed NoPad/Fused execution, use
+by the C++ runtime. For explicit streamed Dense/NoPad/Fused execution, use
 `(dg.get_num_sms(), 256, 256, 128, 64, 64, 128, 4, 1)`.
+Streamed execution supports one or more experts, including dense GEMM, on PPU1.5.
 Subject to device, layout and workspace limits, automatic streamed execution
 requires at least 512 rows per expert on average when `K >= 2048` and
 `ceil(N / 256) * (K / 128) >= 128`, or 1024 rows otherwise.
+It also requires enough M/N tiles in an expert chunk to fill one device wave;
+smaller workloads retain native execution. Each decoded-weight buffer is bounded
+by 384 MiB; a single-part plan allocates one buffer, and multi-part plans use two.
+When a single expert requires N slices to fit that budget, automatic streamed
+execution requires at least 1024 rows to amortize the additional decoding launches.
 Set `show_log=1` to print the selected tile, resources and streamed execution plan.
 Before graph capture, warm up the selected configuration and unit/non-unit
 `inv_scale` variant on the capture stream.
@@ -238,7 +254,7 @@ input scales retain their separate K-major layout requirement.
 For `MXFP4` and `W4A8_MXFP4_MMA` with `fuse_activation=False`,
 `weight` defaults to `None`. Pass `weight_scale=...` to prepare scales alone;
 the first result is then `None`. W4A8 also returns `weight_inv_scale` and derives
-E/N/K alignment from the raw `[E,N,K/32]` scales. Supplying a weight tensor
+E/N/K alignment from the raw `[E,N,K/32]` scales, or `[N,K/32]` for dense GEMM. Supplying a weight tensor
 preserves the existing return format; W4A8 also checks its shape against the scales. Fusion and other
 weight modes still require weights; all supported modes require scales.
 
