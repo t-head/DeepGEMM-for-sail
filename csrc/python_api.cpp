@@ -9,6 +9,7 @@
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/mega_moe.hpp"
+#include "apis/int8_mega_moe.hpp"
 #include "apis/runtime.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
@@ -27,5 +28,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::gemm::register_apis(m);
     deep_gemm::layout::register_apis(m);
     deep_gemm::mega::register_apis(m);
+    deep_gemm::mega_int8::register_apis(m);
     deep_gemm::runtime::register_apis(m);
 }

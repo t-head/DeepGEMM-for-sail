@@ -430,6 +430,38 @@ For UltraEP, pass `l1_weights_replicas` and `l2_weights_replicas` together.
 
 See [test_mega_moe.py](tests/test_mega_moe.py) for a complete example.
 
+The SM80 / ZW-810E INT8 path uses the same two-call structure, with per-token
+activation scales and per-output-channel weight scales:
+
+```python
+buffer = deep_gemm.get_symm_buffer_for_int8_mega_moe(
+    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden)
+# Raw local weights: INT8 [E, 2*I, H] and [E, H, I]. FP32 scales: [E, 2*I] and [E, H].
+# GEMM1 rows are [gate...][up...] before this one-time transformation.
+l1_weights, l2_weights = deep_gemm.transform_weights_for_int8_mega_moe(
+    (w13_int8, w13_scales), (w2_int8, w2_scales))
+deep_gemm.int8_mega_moe_pre_dispatch(
+    hidden_states, topk_ids.int(), topk_weights,
+    buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
+    num_tokens=hidden_states.shape[0], group_size=0)
+deep_gemm.int8_int8_mega_moe(output, l1_weights, l2_weights, buffer)
+```
+
+INT8 requires H >= 2048 divisible by 512, I divisible by 256, uniformly sharded
+experts, and power-of-two EP sizes up to 64. Capacity is rounded to 32 tokens.
+Routing IDs must be distinct within each token; negative or out-of-range IDs
+are masked. Supported activations are `swiglu`, `swiglu_step`, `situ` and
+`swiglu_oai`, with `recipe=(1, 1, 0)` and `fast_math=True`. The optional expert
+statistics tensor is reserved and is not updated. Shared experts and UltraEP
+weight replicas are not supported by this entry.
+
+Keep the buffer and its original views alive through all asynchronous work.
+Before Graph capture, warm up the complete call on that capture stream and set
+`HGGC_DEVICE_GRAPH=0` for split-copy launch events. Run pre-dispatch and compute
+on the same stream and in the same order on all ranks. See
+[test_mega_moe_int8.py](tests/test_mega_moe_int8.py) for a numerical reference,
+workspace-alias checks and Graph replay coverage.
+
 #### HyperConnection (HC) prenorm GEMM
 
 We provide a HyperConnection (HC) prenorm GEMM that fuses the prenorm square-sum reduction into a TF32 GEMM. Call `deep_gemm.tf32_hc_prenorm_gemm` with a BF16 input `a`, a TF32 weight `b`, and it produces the TF32 output `d` together with the per-row square sum `sqr_sum` used by the subsequent normalization. The K-split configuration is selected automatically based on the K dimension.

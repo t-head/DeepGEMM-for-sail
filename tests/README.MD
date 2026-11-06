@@ -79,6 +79,22 @@ test_core.py options:
   --func {DenseGemm,GroupedContiguous,GroupedMasked,DenseGemm}  target test func
 # Routed MoE correctness and performance tests
 
+For the SM80 / ZW-810E INT8 public API, run on idle devices:
+
+```bash
+env -u DG_USE_MOE_DYNAMIC_TILE HGGC_DEVICE_GRAPH=0 \
+  torchrun --standalone --nproc_per_node=8 tests/test_mega_moe_int8.py --activations --graph
+```
+
+Replace `8` with the selected power-of-two EP size. The default cases cover
+0/1/31/32/33/65 tokens, random/hot/invalid/empty routes, an empty source rank,
+workspace aliases and invalid API arguments. `--activations` checks all four
+activations and changing clamp values; `--graph` replays two distinct clamp
+specializations with changing inputs. For a larger shape add
+`--hidden 4096 --intermediate 2048 --experts 16 --topk 6`.
+These are correctness tests against a separate Torch reference, without the
+legacy Python JIT or a private test extension.
+
 MegaMoE supports W4A4 on PPU1.5, validated on ZW-M890P.
 `test_mega_moe.py` contains public-entry correctness and regression tests;
 `bench_mega_moe.py` contains full-pipeline timing and optional DeepEP comparisons.

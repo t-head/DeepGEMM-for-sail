@@ -284,3 +284,12 @@ def fp4_fp4_mega_moe(
         situ_beta, situ_linear_beta, activation_alpha,
         l1_weights_replicas, l2_weights_replicas,
         sym_buffer.staging_config)
+
+
+from .int8 import (
+    Int8SymmBuffer,
+    get_symm_buffer_for_int8_mega_moe,
+    transform_weights_for_int8_mega_moe,
+    int8_mega_moe_pre_dispatch,
+    int8_int8_mega_moe,
+)
