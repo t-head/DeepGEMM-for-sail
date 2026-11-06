@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import warnings
 import types
+import weakref
 from typing import Optional, Tuple, Union
 
 import torch
@@ -101,6 +102,7 @@ class SymmBuffer:
          self.topk_idx, self.topk_weights,
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+        self.x._mega_moe_buffer = weakref.ref(self)
 
     def destroy(self):
         self.handle = None
@@ -192,39 +194,30 @@ def transform_weights_for_mega_moe(
 
 
 def mega_moe_pre_dispatch(
-    hidden_states: torch.Tensor,
+    x: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
-    sym_buffer: SymmBuffer,
-    num_tokens: Optional[int] = None,
+    buf_x: torch.Tensor,
+    buf_x_sf: torch.Tensor,
+    buf_topk_idx: torch.Tensor,
+    buf_topk_weights: torch.Tensor,
+    num_tokens: int,
+    group_size: int = 32,
+    mma_type: str = "mxf4xmxf4",
 ) -> None:
     """Quantize BF16 inputs and publish routed data with the fused PPU kernel.
 
+    Pass the four original views of one live SymmBuffer, as in SGLang.
+    num_tokens must match x.shape[0]. Only group-32 MXFP4 is supported.
     Input expert IDs can be int32 or int64. The workspace stores them as int64.
     Valid physical expert IDs must be distinct within each token.
     SFA is produced and pushed directly into internal owner staging; x_sf is not
     a public source-scale input, and callers must use this helper to prepare it.
     """
-    if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.buffer is None:
-        raise ValueError('a live MegaMoE SymmBuffer is required')
-    if not isinstance(hidden_states, torch.Tensor) or hidden_states.ndim != 2:
-        raise ValueError('hidden_states must be a 2D tensor')
-    if num_tokens is None:
-        num_tokens = hidden_states.shape[0]
-    if (not isinstance(num_tokens, int) or isinstance(num_tokens, bool)
-            or not 0 <= num_tokens <= hidden_states.shape[0]):
-        raise ValueError('num_tokens is outside the input tensor')
-    if not all(isinstance(t, torch.Tensor) and t.ndim == 2 for t in (topk_idx, topk_weights)):
-        raise ValueError('topk_idx and topk_weights must be 2D tensors')
-    if hidden_states.shape[1] != sym_buffer.hidden:
-        raise ValueError(f'hidden_states must be contiguous BF16 with shape [tokens, {sym_buffer.hidden}]')
-    if topk_idx.shape[1] != sym_buffer.num_topk:
-        raise ValueError(f'topk_idx must be contiguous int32 or int64 with shape ({num_tokens}, {sym_buffer.num_topk})')
     _C.mega_moe_pre_dispatch(
-        hidden_states[:num_tokens], topk_idx[:num_tokens], topk_weights[:num_tokens],
-        sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.num_ranks, sym_buffer.num_experts,
-        sym_buffer.num_max_tokens_per_rank, sym_buffer.group.rank(),
-        sym_buffer.intermediate_hidden, sym_buffer.mma_type, sym_buffer.staging_config)
+        x, topk_idx, topk_weights,
+        buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
+        num_tokens, group_size, mma_type)
 
 
 def fp4_fp4_mega_moe(

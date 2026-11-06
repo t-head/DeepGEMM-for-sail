@@ -355,7 +355,10 @@ def _check_workspace_options(case, group):
 def _check_public_entry(entry, y, l1_weights, l2_weights, sym_buffer, source, ids, weights, **options):
     """Reject malformed calls before advancing the collective compute protocol."""
 
-    deep_gemm.mega_moe_pre_dispatch(source, ids, weights, sym_buffer)
+    deep_gemm.mega_moe_pre_dispatch(
+        source, ids, weights,
+        sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
+        num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
     with pytest.raises((ValueError, RuntimeError), match="Unsupported MegaMoE activation"):
         entry(y, l1_weights, l2_weights, sym_buffer, **{**options, "activation": "unsupported"})
     for changed, message in (
@@ -397,28 +400,47 @@ def _check_public_entry(entry, y, l1_weights, l2_weights, sym_buffer, source, id
 
 
 def _check_input_views(entry, y, l1_weights, l2_weights, sym_buffer, source, ids, weights, **options):
-    """Public input preparation and positional calls match BF16 input preparation."""
-    deep_gemm.mega_moe_pre_dispatch(source, ids, weights, sym_buffer)
+    """Exercise SGLang input views and positional compute calls."""
+    ids = ids.to(torch.int32)
+    deep_gemm.mega_moe_pre_dispatch(
+        source, ids, weights,
+        sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
+        num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
     entry(y, l1_weights, l2_weights, sym_buffer, **options)
     expected = y.clone()
     # The common argument order matches SM90; PPU extensions remain keyword-only.
-    deep_gemm.mega_moe_pre_dispatch(source, ids, weights, sym_buffer)
+    deep_gemm.mega_moe_pre_dispatch(
+        source, ids, weights,
+        sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
+        num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
     entry(y, l1_weights, l2_weights, sym_buffer, None, (1, 1, 32),
           options["activation"], options["activation_clamp"], options["fast_math"])
     torch.testing.assert_close(y, expected, rtol=0, atol=0)
     if options.get("fast_math", True):
         default_options = {name: value for name, value in options.items() if name != "fast_math"}
-        deep_gemm.mega_moe_pre_dispatch(source, ids, weights, sym_buffer)
+        deep_gemm.mega_moe_pre_dispatch(
+            source, ids, weights,
+            sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
+            num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
         entry(y, l1_weights, l2_weights, sym_buffer, **default_options)
         torch.testing.assert_close(y, expected, rtol=0, atol=0)
-    deep_gemm.mega_moe_pre_dispatch(source[:0], ids[:0], weights[:0], sym_buffer)
+    deep_gemm.mega_moe_pre_dispatch(
+        source[:0], ids[:0], weights[:0],
+        sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
+        num_tokens=0, group_size=32, mma_type="mxf4xmxf4")
     entry(y[:0], l1_weights, l2_weights, sym_buffer, **options)
-    deep_gemm.mega_moe_pre_dispatch(source, ids, weights, sym_buffer)
+    deep_gemm.mega_moe_pre_dispatch(
+        source, ids, weights,
+        sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
+        num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
     entry(y, l1_weights, l2_weights, sym_buffer, **options)
     torch.testing.assert_close(y, expected, rtol=0, atol=0)
     _check_offset_views(entry, l1_weights, l2_weights, sym_buffer, source, ids, weights, **options)
     def direct():
-        deep_gemm.mega_moe_pre_dispatch(source, ids, weights, sym_buffer)
+        deep_gemm.mega_moe_pre_dispatch(
+            source, ids, weights,
+            sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
+            num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
         entry(y, l1_weights, l2_weights, sym_buffer, **options)
         return y
 
@@ -484,7 +506,10 @@ def _check_offset_views(entry, l1_weights, l2_weights, sym_buffer, source, ids, 
     """Offset views must match aligned complete calls without touching their guards."""
 
     def forward(input_tensor, y):
-        deep_gemm.mega_moe_pre_dispatch(input_tensor, ids, weights, sym_buffer)
+        deep_gemm.mega_moe_pre_dispatch(
+            input_tensor, ids, weights,
+            sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
+            num_tokens=input_tensor.shape[0], group_size=32, mma_type="mxf4xmxf4")
         entry(y, l1_weights, l2_weights, sym_buffer, **options)
         return y
 
@@ -725,7 +750,10 @@ def mega_moe_smoke(mega_moe_group, request):
     options = dict(activation=case.activation, activation_clamp=case.clamp, fast_math=True)
 
     def pipeline(stats=None):
-        deep_gemm.mega_moe_pre_dispatch(x, routed_ids, routed_weights, buffer)
+        deep_gemm.mega_moe_pre_dispatch(
+            x, routed_ids, routed_weights,
+            buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
+            num_tokens=x.shape[0], group_size=32, mma_type="mxf4xmxf4")
         deep_gemm.fp4_fp4_mega_moe(y, w1, w2, buffer, stats, **options)
         return y
 
@@ -817,7 +845,10 @@ def test_mega_moe_smoke_workspace(mega_moe_smoke, mega_moe_group):
         deep_gemm.get_symm_buffer_for_mega_moe(*arguments, use_fp8_dispatch=True)
     # Destroying one Python owner must not invalidate another live alias.
     base.destroy()
-    deep_gemm.mega_moe_pre_dispatch(sample.x, sample.ids, sample.weights, alias)
+    deep_gemm.mega_moe_pre_dispatch(
+        sample.x, sample.ids, sample.weights,
+        alias.x, alias.x_sf, alias.topk_idx, alias.topk_weights,
+        num_tokens=sample.x.shape[0], group_size=32, mma_type="mxf4xmxf4")
     deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, alias, **sample.options)
     torch.testing.assert_close(sample.y, expected, rtol=0, atol=0)
     alias.destroy()
@@ -839,7 +870,10 @@ def test_mega_moe_smoke_workspace_dimensions(mega_moe_smoke, mega_moe_group):
         native.assert_not_called()
 
     def alias_pipeline():
-        deep_gemm.mega_moe_pre_dispatch(sample.x, sample.ids, sample.weights, alias)
+        deep_gemm.mega_moe_pre_dispatch(
+            sample.x, sample.ids, sample.weights,
+            alias.x, alias.x_sf, alias.topk_idx, alias.topk_weights,
+            num_tokens=sample.x.shape[0], group_size=32, mma_type="mxf4xmxf4")
         deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, alias, **sample.options)
         return sample.y
 
@@ -856,7 +890,10 @@ def test_mega_moe_smoke_clamp(mega_moe_smoke):
     for limit in (None, float("inf"), 0.0, 2.0):
         options = {**sample.options, "activation_clamp": limit}
         def pipeline():
-            deep_gemm.mega_moe_pre_dispatch(sample.x, sample.ids, sample.weights, sample.buffer)
+            deep_gemm.mega_moe_pre_dispatch(
+                sample.x, sample.ids, sample.weights,
+                sample.buffer.x, sample.buffer.x_sf, sample.buffer.topk_idx, sample.buffer.topk_weights,
+                num_tokens=sample.x.shape[0], group_size=32, mma_type="mxf4xmxf4")
             deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, sample.buffer, **options)
             return sample.y
         _compile_kernels(pipeline)
@@ -935,7 +972,10 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
             y = torch.empty_like(x)
 
             def run_fused(cumulative_local_expert_recv_stats=None):
-                deep_gemm.mega_moe_pre_dispatch(x, routed_idx, routed_weights, sym_buffer)
+                deep_gemm.mega_moe_pre_dispatch(
+                    x, routed_idx, routed_weights,
+                    sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
+                    num_tokens=x.shape[0], group_size=32, mma_type="mxf4xmxf4")
                 deep_gemm.fp4_fp4_mega_moe(
                     y, l1_weights, l2_weights, sym_buffer,
                     cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,

@@ -362,7 +362,10 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
             y = torch.empty_like(x)
 
             def run_mega():
-                deep_gemm.mega_moe_pre_dispatch(x, routed_ids, routed_weights, workspace)
+                deep_gemm.mega_moe_pre_dispatch(
+                    x, routed_ids, routed_weights,
+                    workspace.x, workspace.x_sf, workspace.topk_idx, workspace.topk_weights,
+                    num_tokens=x.shape[0], group_size=32, mma_type="mxf4xmxf4")
                 deep_gemm.fp4_fp4_mega_moe(
                     y, w1, w2, workspace, activation=case.activation,
                     activation_clamp=case.clamp, fast_math=bool(args.fast_math),

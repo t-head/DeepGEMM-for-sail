@@ -69,42 +69,86 @@ get_symm_buffer_size_for_mega_moe(
 }
 
 static void mega_moe_pre_dispatch(
-    const torch::Tensor& hidden_states, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
-    const torch::Tensor& sym_buffer, const std::vector<int64_t>& sym_buffer_ptrs,
-    int num_ranks, int num_experts, int num_max_tokens_per_rank, int rank_idx,
-    int intermediate_hidden, const std::string& mma_type,
-    const std::array<int, 3>& staging_config) {
+    const torch::Tensor& x,
+    const torch::Tensor& topk_idx,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& buf_x,
+    const torch::Tensor& buf_x_sf,
+    const torch::Tensor& buf_topk_idx,
+    const torch::Tensor& buf_topk_weights,
+    const int& num_tokens,
+    const int& group_size,
+    const std::string& mma_type) {
     const auto mma_kind = parse_mma_kind(mma_type);
     DG_HOST_ASSERT(mma_kind == MmaKind::MXFP4);
+    DG_HOST_ASSERT(group_size == 32);
+    DG_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(x.is_contiguous());
+    DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32 || topk_idx.scalar_type() == torch::kInt64);
+    DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(topk_idx.is_contiguous() && topk_weights.is_contiguous());
+    DG_HOST_ASSERT(x.dim() == 2 && topk_idx.dim() == 2 && topk_weights.dim() == 2);
+    DG_HOST_ASSERT(buf_x.dim() == 2 && buf_x_sf.dim() == 4);
+    DG_HOST_ASSERT(buf_topk_idx.dim() == 2 && buf_topk_weights.dim() == 2);
+    DG_HOST_ASSERT(buf_topk_idx.scalar_type() == torch::kInt64);
+    DG_HOST_ASSERT(buf_topk_weights.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(buf_x_sf.scalar_type() == torch::kUInt16);
+
+    const auto m = static_cast<int>(x.size(0));
+    const auto hidden = static_cast<int>(x.size(1));
+    const auto top_k = static_cast<int>(topk_idx.size(1));
+    const auto padded_max = static_cast<int>(buf_x.size(0));
+
+    DG_HOST_ASSERT(num_tokens == m);
+    DG_HOST_ASSERT(num_tokens <= padded_max);
+    DG_HOST_ASSERT(static_cast<int>(topk_idx.size(0)) == m);
+    DG_HOST_ASSERT(static_cast<int>(topk_weights.size(0)) == m);
+    DG_HOST_ASSERT(static_cast<int>(topk_weights.size(1)) == top_k);
+    DG_HOST_ASSERT(static_cast<int>(buf_topk_idx.size(0)) == padded_max);
+    DG_HOST_ASSERT(static_cast<int>(buf_topk_idx.size(1)) == top_k);
+    DG_HOST_ASSERT(static_cast<int>(buf_topk_weights.size(0)) == padded_max);
+    DG_HOST_ASSERT(static_cast<int>(buf_topk_weights.size(1)) == top_k);
+    DG_HOST_ASSERT(static_cast<int>(buf_x.size(1)) == hidden / 2);
+    DG_HOST_ASSERT(buf_x.element_size() == 1);
+
+    // Fused peer publication needs the workspace metadata behind the output views.
+    const auto owner_ref = pybind11::getattr(pybind11::cast(buf_x), "_mega_moe_buffer", pybind11::none());
+    if (!pybind11::isinstance<pybind11::weakref>(owner_ref))
+        throw pybind11::value_error("a live MegaMoE SymmBuffer is required");
+    const auto owner = owner_ref();
+    if (owner.is_none() || owner.attr("buffer").is_none())
+        throw pybind11::value_error("a live MegaMoE SymmBuffer is required");
+    const auto same_view = [&owner](const char* name, const torch::Tensor& view) {
+        return owner.attr(name).cast<torch::Tensor>().is_same(view);
+    };
+    if (!same_view("x", buf_x) || !same_view("x_sf", buf_x_sf) ||
+        !same_view("topk_idx", buf_topk_idx) || !same_view("topk_weights", buf_topk_weights))
+        throw pybind11::value_error("output views must belong to the same live MegaMoE SymmBuffer");
+    const auto sym_buffer = owner.attr("buffer").cast<torch::Tensor>();
+    const auto sym_buffer_ptrs = owner.attr("handle").attr("buffer_ptrs").cast<std::vector<int64_t>>();
+    const int num_ranks = owner.attr("num_ranks").cast<int>();
+    const int num_experts = owner.attr("num_experts").cast<int>();
+    const int num_max_tokens_per_rank = owner.attr("num_max_tokens_per_rank").cast<int>();
+    const int rank_idx = owner.attr("group").attr("rank")().cast<int>();
+    const int intermediate_hidden = owner.attr("intermediate_hidden").cast<int>();
+    const auto staging_config = owner.attr("staging_config").cast<std::array<int, 3>>();
     DG_HOST_ASSERT(sym_buffer.is_cuda());
-    if (hidden_states.dim() != 2 || topk_idx.dim() != 2)
-        throw pybind11::value_error("hidden_states and topk_idx must be 2D tensors");
-    const int hidden = hidden_states.size(1), num_topk = topk_idx.size(1);
-    const auto num_tokens = hidden_states.size(0);
-    if (hidden_states.scalar_type() != torch::kBFloat16 || !hidden_states.is_contiguous())
-        throw pybind11::value_error(c10::str("hidden_states must be contiguous BF16 with shape [tokens, ", hidden, "]"));
-    if (num_tokens > num_max_tokens_per_rank)
-        throw pybind11::value_error(c10::str("token count must be in [0, ", num_max_tokens_per_rank, "], got ", num_tokens));
-    if (topk_idx.size(0) != num_tokens || !topk_idx.is_contiguous() ||
-        (topk_idx.scalar_type() != torch::kInt32 && topk_idx.scalar_type() != torch::kInt64))
-        throw pybind11::value_error(c10::str("topk_idx must be contiguous int32 or int64 with shape (", num_tokens, ", ", num_topk, ")"));
-    if (topk_weights.sizes() != topk_idx.sizes() || topk_weights.scalar_type() != torch::kFloat32 ||
-        !topk_weights.is_contiguous())
-        throw pybind11::value_error("topk_weights must be contiguous float32 and match topk_idx");
-    if (hidden_states.device() != sym_buffer.device() || topk_idx.device() != sym_buffer.device() ||
-        topk_weights.device() != sym_buffer.device())
-        throw pybind11::value_error("activations and routing must be on the buffer device");
+    DG_HOST_ASSERT(hidden == owner.attr("hidden").cast<int>());
+    DG_HOST_ASSERT(top_k == owner.attr("num_topk").cast<int>());
+    DG_HOST_ASSERT(padded_max == num_max_tokens_per_rank);
+    DG_HOST_ASSERT(x.device() == sym_buffer.device());
+    DG_HOST_ASSERT(topk_idx.device() == sym_buffer.device() && topk_weights.device() == sym_buffer.device());
     const auto staging = get_staging_capacity(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
+        num_ranks, num_experts, num_max_tokens_per_rank, top_k, hidden, intermediate_hidden, staging_config);
     const auto mega_buffer = layout::MegaMoEBuffer(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging);
+        num_ranks, num_experts, num_max_tokens_per_rank, top_k, hidden, intermediate_hidden, staging);
     DG_HOST_ASSERT(rank_idx >= 0 && rank_idx < num_ranks);
     DG_HOST_ASSERT(sym_buffer_ptrs.size() == num_ranks);
     check_mega_moe_buffer(sym_buffer, mega_buffer);
     fp4_mega_moe_pre_dispatch_impl(
-        hidden_states, topk_idx, topk_weights, sym_buffer_ptrs,
+        x, topk_idx, topk_weights, sym_buffer_ptrs,
         num_ranks, num_experts, num_max_tokens_per_rank, rank_idx,
-        hidden, intermediate_hidden, num_topk, mega_buffer.staging);
+        hidden, intermediate_hidden, top_k, mega_buffer.staging);
 }
 
 // Python owns one symmetric allocation; C++ slices it and submits computation.
