@@ -22,6 +22,10 @@
 #include <ppu_include.hpp>
 #include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/comm/int8_dispatch.cuh>
+#include <deep_gemm/epilogue/epilogue_traits.cuh>
+#include <deep_gemm/epilogue/fp4_scatter_epilogue.cuh>
+#include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/common/batch_gemm_args.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/tix/utils.cuh>
@@ -30,9 +34,10 @@ using namespace cute;
 
 namespace cutlass::gemm {
 
-template<int Stages_, typename Schedule_ = KernelAiuMultistage>
+template<int Stages_, typename Schedule_ = KernelAiuMultistage, int CopyKTilesPerFlag_ = 0>
 struct MainloopPPUAiuA8W8 {
   constexpr static int Stages = Stages_;
+  constexpr static int CopyKTilesPerFlag = CopyKTilesPerFlag_;
 #if __HGGC_ARCH__ == 100
   using ArchTag = arch::PPU0010;
 #else
@@ -704,6 +709,7 @@ template <
   typename Arch_,
   int Stages,
   class KernelSchedule,
+  int CopyKTilesPerFlag,
   class TileShape_,
   class ElementA_,
   class StrideA_,
@@ -720,7 +726,7 @@ template <
   class TransformB_>
 struct CollectiveMma<
     Arch_,
-    MainloopPPUAiuA8W8<Stages, KernelSchedule>,
+    MainloopPPUAiuA8W8<Stages, KernelSchedule, CopyKTilesPerFlag>,
     TileShape_,
     ElementA_,
     StrideA_,
@@ -738,7 +744,7 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopPPUAiuA8W8<Stages, KernelSchedule>;
+  using DispatchPolicy = MainloopPPUAiuA8W8<Stages, KernelSchedule, CopyKTilesPerFlag>;
   using TileShape = TileShape_;
   using ElementA = ElementA_;
   using StrideA = StrideA_;
@@ -842,6 +848,15 @@ struct CollectiveMma<
 
   GmemTiledCopyScaleA gmem_tiled_copy_scaleA;
   GmemTiledCopyScaleB gmem_tiled_copy_scaleB;
+  // Used only by the fused INT8 entry; ordinary A8W8 instantiations have KTPF=0.
+  const volatile uint32_t* copy_ready_flags = nullptr;
+  uint32_t copy_ready_generation = 0;
+
+  CUTLASS_DEVICE void set_copy_ready(const volatile uint32_t* flags, uint32_t generation) {
+    static_assert(CopyKTilesPerFlag > 0);
+    copy_ready_flags = flags;
+    copy_ready_generation = generation;
+  }
   //
   // Methods
   //
@@ -948,7 +963,7 @@ struct CollectiveMma<
     class FrgTensorD,
     class FrgTensorC,
     class KTileIterator,
-    class ResidueMNK
+    class ResidueMNK, class PairTransform = std::false_type
   >
   CUTLASS_DEVICE void
   operator() (
@@ -959,7 +974,7 @@ struct CollectiveMma<
       ResidueMNK residue_mnk,
       int thread_idx,
       int warp_idx,
-      char *smem_buf) {
+      char *smem_buf, PairTransform pair_transform = {}) {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorD>::value, "D tensor must be rmem resident.");
@@ -1010,8 +1025,13 @@ struct CollectiveMma<
     Tensor sSA = make_tensor(make_smem_ptr(scale_a_smem_ptr), SmemLayoutScaleA{});
     Tensor sSB = make_tensor(make_smem_ptr(scale_b_smem_ptr), SmemLayoutScaleB{});
 
-    auto gmem_thr_copy_scaleA = gmem_tiled_copy_scaleA.get_slice(thread_idx);
-    auto gmem_thr_copy_scaleB = gmem_tiled_copy_scaleB.get_slice(thread_idx);
+    constexpr bool CopyScalesLate = [] {
+      if constexpr (std::is_same_v<PairTransform, std::false_type>) return false;
+      else return PairTransform::kCopyScalesLate;
+    }();
+    auto make_scale_copy = [&](int scale_thread_idx) {
+    auto gmem_thr_copy_scaleA = gmem_tiled_copy_scaleA.get_slice(scale_thread_idx);
+    auto gmem_thr_copy_scaleB = gmem_tiled_copy_scaleB.get_slice(scale_thread_idx);
 
     Tensor tSgSA = gmem_thr_copy_scaleA.partition_S(gSFA);
     Tensor tSsSA = gmem_thr_copy_scaleA.partition_D(sSA);
@@ -1029,12 +1049,46 @@ struct CollectiveMma<
     for (int i = 0; i < size(tSpSB); ++i) {
       tSpSB(i) = get<0>(tSFBcSFB(i)) < get<1>(residue_mnk);
     }
+      return make_tuple(tSpSA, tSpSB, tSgSA(_,_,_,0), tSsSA(_,_,_,0), tSgSB(_,_,_,0), tSsSB(_,_,_,0));
+    };
+    auto early_scale_copy = [&] {
+      if constexpr (CopyScalesLate) return std::false_type{};
+      else return make_scale_copy(thread_idx);
+    }();
+    auto issue_scale_copy = [&](auto& state) {
+      copy_if(gmem_tiled_copy_scaleA, get<0>(state), get<2>(state), get<3>(state));
+      copy_if(gmem_tiled_copy_scaleB, get<1>(state), get<4>(state), get<5>(state));
+    };
+    auto copy_scales = [&] {
+      if constexpr (CopyScalesLate) {
+        uint32_t scale_thread_idx;
+#if defined(USE_HGGC)
+        asm volatile("ppu.mov.u32 %0, %%tid.x;" : "=r"(scale_thread_idx));
+#else
+        scale_thread_idx = threadIdx.x;
+#endif
+        auto state = make_scale_copy(scale_thread_idx);
+        issue_scale_copy(state);
+      } else issue_scale_copy(early_scale_copy);
+    };
     bool scaleCopySendDone = false;
+
+    // Only warp 0 issues A's AIU loads on both supported architectures. Join
+    // producers at the existing cp_async wait/barrier before MMA consumes smem.
+    auto wait_for_copy = [&] {
+      if constexpr (CopyKTilesPerFlag > 0) {
+        const int k_tile = *k_tile_iter;
+        if (warp_idx == 0 && k_tile % CopyKTilesPerFlag == 0)
+          deep_gemm::wait_copy_stripe(copy_ready_flags, copy_ready_generation,
+                                     k_tile / CopyKTilesPerFlag + 1);
+      }
+    };
 
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
       if (k_tile_count > 0) {
+        wait_for_copy();
         copy_aiu<SplitAIU>(
           gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
           gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
@@ -1162,14 +1216,14 @@ CUTLASS_PRAGMA_UNROLL
         __syncthreads();
 
         if (k_tile_count > 0) {
+          wait_for_copy();
           copy_aiu<SplitAIU>(
             gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
             gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
             warp_idx
           );
         } else if (scaleCopySendDone == false) {
-          copy_if(gmem_tiled_copy_scaleA, tSpSA, tSgSA(_,_,_,0), tSsSA(_,_,_,0));
-          copy_if(gmem_tiled_copy_scaleB, tSpSB, tSgSB(_,_,_,0), tSsSB(_,_,_,0));
+          copy_scales();
           scaleCopySendDone = true;
         }
         cp_async_fence();
@@ -1211,6 +1265,23 @@ CUTLASS_PRAGMA_UNROLL
     copy(smem_tiled_copy_ScaleA, tCsSA_p(_,_,Int<0>{}), tCrSA_copy_view(_,_,Int<0>{}));
     copy(smem_tiled_copy_ScaleB, tCsSB_p(_,Int<0>{},_), tCrSB_copy_view(_,Int<0>{},_));
 
+    // Consume each dequantized gate/up pair immediately, preserving BF16
+    // boundaries while avoiding a second full FP32 fragment through activation.
+    if constexpr (!std::is_same_v<PairTransform, std::false_type>) {
+      CUTE_STATIC_ASSERT_V(cute::size<0>(accum) % Int<2>{} == Int<0>{});
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < cute::size<2>(accum); ++n) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int m = 0; m < cute::size<1>(accum); ++m) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < cute::size<0>(accum); i += 2) {
+            const float gate = mma_acc(i,m,n) * tCrSA(i,m,Int<0>{}) * tCrSB(i,Int<0>{},n);
+            const float up = mma_acc(i+1,m,n) * tCrSA(i+1,m,Int<0>{}) * tCrSB(i+1,Int<0>{},n);
+            accum(i,m,n) = pair_transform(gate, up);
+          }
+        }
+      }
+    } else {
     // dequantize
     CUTLASS_PRAGMA_UNROLL
     for (int n = 0; n < cute::size<2>(accum); ++n) {
@@ -1222,6 +1293,8 @@ CUTLASS_PRAGMA_UNROLL
           // accum(i,m,n) += mma_acc(i,m,n);
         }
       }
+    }
+
     }
 
     __syncthreads();
@@ -1258,7 +1331,14 @@ class DeepGemmUniversal<
   kEnableSboOverlap,
   cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistage, typename CollectiveMainloop_::DispatchPolicy::Schedule>>> {
 public:
-public:
+  using ScatterTraits = deep_gemm::epilogue::Fp4ScatterTraits<CollectiveEpilogue_>;
+  static constexpr bool kEnableScatter = ScatterTraits::enabled;
+  static constexpr int kWorldSize = ScatterTraits::world_size;
+  static_assert(!kEnableScatter ||
+                (TileScheduler_::GEMM_TYPE == GemmType::MegaMoE &&
+                 !deep_gemm::MegaMoEDispatchTraits<TileScheduler_>::Type::kEnabled),
+                "scatter requires the MegaMoE second-stage scheduler");
+  static_assert(!ScatterTraits::warp_pipeline, "INT8 scatter uses the existing CTA epilogue");
   //
   // Type Aliases
   //
@@ -1326,10 +1406,12 @@ public:
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
     int32_t* signal{nullptr};
+    deep_gemm::layout::SymBuffer<kWorldSize> scatter_buffer{};
+    deep_gemm::layout::ScatterSignals* scatter_barrier{nullptr};
   };
 
-  // Kernel entry point API
-  struct Params {
+  // Keep ordinary INT8 Params ABI unchanged for its C++ launcher.
+  struct ParamsBase {
     GemmUniversalMode mode{};
     ProblemShape problem_shape{};
     MainloopParams mainloop{};
@@ -1339,6 +1421,11 @@ public:
     void* workspace{nullptr};
     int32_t* signal{nullptr};
   };
+  struct ScatterParams : ParamsBase {
+    deep_gemm::layout::SymBuffer<kWorldSize> scatter_buffer{};
+    deep_gemm::layout::ScatterSignals* scatter_barrier{nullptr};
+  };
+  using Params = cute::conditional_t<kEnableScatter, ScatterParams, ParamsBase>;
 
   //
   // Methods
@@ -1384,7 +1471,7 @@ public:
     // subtile will not be used, therefore separate reduction will not be enabled.
     constexpr uint32_t NumEpilogueSubTiles = 1; //CollectiveEpilogue::get_store_pipe_increment(TileShape{});
 
-    return {
+    ParamsBase base{
       args.mode,
       problem_shape,
       CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, mainloop_workspace),
@@ -1394,6 +1481,10 @@ public:
       workspace,
       args.signal
     };
+    if constexpr (kEnableScatter)
+      return {base, args.scatter_buffer, args.scatter_barrier};
+    else
+      return base;
   }
 
   static bool
@@ -1462,12 +1553,17 @@ public:
     int thread_idx = int(threadIdx.x);
     auto blk_shape = TileShape{}; // (BLK_M,BLK_N,BLK_K)
 
+    using Dispatch = typename deep_gemm::MegaMoEDispatchTraits<TileScheduler>::Type;
+    if constexpr (Dispatch::kEnabled) {
+      static_assert(SharedStorageSize >= Dispatch::template shared_bytes<TileScheduler>());
+      if (!Dispatch::template prepare<TileScheduler, MaxThreadsPerBlock>(params.scheduler, smem_buf))
+        return;
+    }
     TileScheduler deep_scheduler(params.scheduler);
 
     uint32_t m_block_idx, n_block_idx;
     constexpr uint32_t L = 1;
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
-
       auto m_coord = m_block_idx;
       auto n_coord = n_block_idx;
       auto l_coord = 0;
@@ -1494,6 +1590,13 @@ public:
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
+      if constexpr (Dispatch::kEnabled) {
+        static_assert(DispatchPolicy::CopyKTilesPerFlag == TileScheduler::kKTilesPerFlag);
+        static_assert(deep_gemm::math::ceil_div(K, uint32_t(cute::size<2>(TileShape{})) *
+            TileScheduler::kKTilesPerFlag) <= 7);
+        collective_mma.set_copy_ready(params.scheduler.copy_ready_flags +
+            deep_scheduler.curr_global_block_m_idx, deep_scheduler.round_generation);
+      }
 
       auto load_inputs = [&] {
         if constexpr (TileScheduler::GEMM_TYPE == GemmType::Batched) {
@@ -1524,41 +1627,53 @@ public:
 
       // Allocate the tiled_mma and the accumulators for the (M,N) blk_shape
       TiledMma tiled_mma;
-      Tensor accumulators = make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape))); // (MMA,MMA_M,MMA_N)
+      auto accumulators = [&] {
+        if constexpr (Dispatch::kEnabled && deep_gemm::EpilogueOutputDivisor<CollectiveEpilogue>::value == 2)
+          return make_fragment_like<typename CollectiveEpilogue::AccumulatorStorage>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
+        else return make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
+      }();
       clear(accumulators);
 
       auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
       int  k_tile_count = size<2>(gA);
 
+      auto pair_transform = [&] {
+        if constexpr (Dispatch::kEnabled && deep_gemm::EpilogueOutputDivisor<CollectiveEpilogue>::value == 2) {
+          if constexpr (CollectiveEpilogue::kHasPairTransform)
+            return CollectiveEpilogue::make_pair_transform(params.epilogue.activation_limit);
+          else return std::false_type{};
+        } else return std::false_type{};
+      }();
       // Perform the collective scoped MMA
-      collective_mma(
-        accumulators,
-        load_inputs,
-        accumulators,
-        k_tile_iter, k_tile_count,
-        residue_mnk,
-        thread_idx,
-        warp_idx,
-        smem_buf
-      );
+      if constexpr (std::is_same_v<decltype(pair_transform), std::false_type>) {
+        // Ordinary A8W8/A8W4 collectives keep their existing call signature.
+        collective_mma(accumulators, load_inputs, accumulators, k_tile_iter, k_tile_count,
+                       residue_mnk, thread_idx, warp_idx, smem_buf);
+      } else {
+        collective_mma(accumulators, load_inputs, accumulators, k_tile_iter, k_tile_count,
+                       residue_mnk, thread_idx, warp_idx, smem_buf, pair_transform);
+      }
 
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
-      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dC));
-      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dD));
+      if constexpr (!kEnableScatter) {
+        constexpr int output_divisor = deep_gemm::EpilogueOutputDivisor<CollectiveEpilogue>::value;
+        params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dC)) / output_divisor;
+        params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dD)) / output_divisor;
+      }
 
-      // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
-      epilogue(
-        problem_shape_MNKL,
-        blk_shape,
-        blk_coord_mnkl,
-        accumulators,
-        tiled_mma,
-        residue_mnk,
-        thread_idx,
-        (char*)&shared_storage.tensors.epilogue
-      );
+      if constexpr (kEnableScatter) {
+        epilogue(problem_shape_MNKL, blk_shape, blk_coord_mnkl, accumulators,
+                 tiled_mma, residue_mnk, thread_idx,
+                 reinterpret_cast<char*>(&shared_storage.tensors.epilogue),
+                 static_cast<uint32_t>(expert_id), static_cast<uint32_t>(offset_m),
+                 params.scatter_buffer);
+      } else {
+        epilogue(problem_shape_MNKL, blk_shape, blk_coord_mnkl, accumulators,
+                 tiled_mma, residue_mnk, thread_idx,
+                 reinterpret_cast<char*>(&shared_storage.tensors.epilogue));
+      }
 
       if constexpr(kEnableSboOverlap && TileScheduler::GEMM_TYPE == GemmType::MGroupedMasked) {
         cp_async_wait<0>();
@@ -1570,6 +1685,12 @@ public:
         }
       }
     } // Scheduler work fetch loop
+    if constexpr (kEnableScatter) {
+      deep_gemm::comm::fp4_scatter_release<kWorldSize>(
+          *params.scatter_barrier, params.scatter_buffer,
+          gridDim.x, blockIdx.x, threadIdx.x,
+          cute::size<1>(TileShape{}) == 256);
+    }
   }
 
 };

@@ -226,6 +226,11 @@ m_grouped_fp8_fp4_gemm_nt_masked = unimplemented
 # Mega kernels
 from .mega import (
     SymmBuffer,
+    Int8SymmBuffer,
+    get_symm_buffer_for_int8_mega_moe,
+    transform_weights_for_int8_mega_moe,
+    int8_mega_moe_pre_dispatch,
+    int8_int8_mega_moe,
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
     fp4_fp4_mega_moe,

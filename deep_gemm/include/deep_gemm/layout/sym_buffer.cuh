@@ -16,6 +16,14 @@ struct SymBuffer {
 
     CUTLASS_HOST_DEVICE SymBuffer() = default;
 
+    template <uint32_t OtherRanks>
+    CUTLASS_HOST_DEVICE explicit SymBuffer(const SymBuffer<OtherRanks>& other)
+        : base(other.base), rank_idx(other.rank_idx) {
+        static_assert(OtherRanks >= kNumRanks, "cannot invent peer offsets");
+        for (uint32_t peer = 0; peer < kNumRanks; ++peer)
+            offsets[peer] = other.offsets[peer];
+    }
+
     template <typename Container>
     explicit SymBuffer(const Container& c, uint32_t rank_idx) : base(c[rank_idx]), rank_idx(rank_idx) {
         for (uint32_t i = 0; i < kNumRanks; ++i)

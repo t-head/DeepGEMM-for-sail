@@ -1,12 +1,32 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
 #include <cutlass/numeric_types.h>
 
 #include <deep_gemm/common/math.cuh>
 
 namespace deep_gemm {
+
+struct NoMegaMoEDispatch { static constexpr bool kEnabled = false; };
+
+template <class Scheduler, class = void>
+struct MegaMoEDispatchTraits { using Type = NoMegaMoEDispatch; };
+
+template <class Scheduler>
+struct MegaMoEDispatchTraits<Scheduler, std::void_t<typename Scheduler::Dispatch>> {
+    using Type = typename Scheduler::Dispatch;
+};
+
+// Output column contraction is independent of the MMA input format.
+template <class Epilogue, class = void>
+struct EpilogueOutputDivisor { static constexpr int value = 1; };
+
+template <class Epilogue>
+struct EpilogueOutputDivisor<Epilogue, std::void_t<decltype(Epilogue::kOutputColumnDivisor)>> {
+    static constexpr int value = Epilogue::kOutputColumnDivisor;
+};
 
 enum class EpilogueType {
     Default,

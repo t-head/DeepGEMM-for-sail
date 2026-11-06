@@ -68,6 +68,24 @@ get_symm_buffer_size_for_mega_moe(
     return {mega_buffer.get_num_bytes(), slice_input_buffers};
 }
 
+static pybind11::object get_mega_moe_buffer_owner(
+        const torch::Tensor& buf_x, const torch::Tensor& buf_x_sf,
+        const torch::Tensor& buf_topk_idx, const torch::Tensor& buf_topk_weights) {
+    const auto owner_ref = pybind11::getattr(pybind11::cast(buf_x), "_mega_moe_buffer", pybind11::none());
+    if (!pybind11::isinstance<pybind11::weakref>(owner_ref))
+        throw pybind11::value_error("a live MegaMoE SymmBuffer is required");
+    const auto owner = owner_ref();
+    if (owner.is_none() || owner.attr("buffer").is_none())
+        throw pybind11::value_error("a live MegaMoE SymmBuffer is required");
+    const auto same_view = [&owner](const char* name, const torch::Tensor& view) {
+        return owner.attr(name).cast<torch::Tensor>().is_same(view);
+    };
+    if (!same_view("x", buf_x) || !same_view("x_sf", buf_x_sf) ||
+        !same_view("topk_idx", buf_topk_idx) || !same_view("topk_weights", buf_topk_weights))
+        throw pybind11::value_error("output views must belong to the same live MegaMoE SymmBuffer");
+    return owner;
+}
+
 static void mega_moe_pre_dispatch(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
@@ -112,18 +130,7 @@ static void mega_moe_pre_dispatch(
     DG_HOST_ASSERT(buf_x.element_size() == 1);
 
     // Fused peer publication needs the workspace metadata behind the output views.
-    const auto owner_ref = pybind11::getattr(pybind11::cast(buf_x), "_mega_moe_buffer", pybind11::none());
-    if (!pybind11::isinstance<pybind11::weakref>(owner_ref))
-        throw pybind11::value_error("a live MegaMoE SymmBuffer is required");
-    const auto owner = owner_ref();
-    if (owner.is_none() || owner.attr("buffer").is_none())
-        throw pybind11::value_error("a live MegaMoE SymmBuffer is required");
-    const auto same_view = [&owner](const char* name, const torch::Tensor& view) {
-        return owner.attr(name).cast<torch::Tensor>().is_same(view);
-    };
-    if (!same_view("x", buf_x) || !same_view("x_sf", buf_x_sf) ||
-        !same_view("topk_idx", buf_topk_idx) || !same_view("topk_weights", buf_topk_weights))
-        throw pybind11::value_error("output views must belong to the same live MegaMoE SymmBuffer");
+    const auto owner = get_mega_moe_buffer_owner(buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights);
     const auto sym_buffer = owner.attr("buffer").cast<torch::Tensor>();
     const auto sym_buffer_ptrs = owner.attr("handle").attr("buffer_ptrs").cast<std::vector<int64_t>>();
     const int num_ranks = owner.attr("num_ranks").cast<int>();
