@@ -87,6 +87,7 @@ from ._C import (
     preprocess_mxfp4_weight_for_act_and_quant_fusing,
     PreprocessMode,
     # W4FA8 (mxfp4 weights, per-row FP8 activation)
+    fp8_fp4_gemm_nt,
     m_grouped_gemm_fp8_fp4_bf16_nt_nopad,
     m_grouped_gemm_fp8_fp4_bf16_nt_masked,
     m_grouped_gemm_fp8_fp4_bf16_nt_fused,
@@ -213,7 +214,7 @@ m_grouped_gemm_fp4_fp4_bf16_nt_nopad = m_grouped_fp4_gemm_nt_nopad
 m_grouped_gemm_fp4_fp4_bf16_nt_fused = m_grouped_fp4_gemm_nt_fused
 
 # --- FP8 FP4 dense GEMM ---
-fp8_fp4_gemm_nt = unimplemented
+gemm_fp8_fp4_bf16_nt = fp8_fp4_gemm_nt
 fp8_fp4_gemm_nn = unimplemented
 fp8_fp4_gemm_tn = unimplemented
 fp8_fp4_gemm_tt = unimplemented
