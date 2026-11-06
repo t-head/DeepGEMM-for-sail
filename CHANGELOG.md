@@ -6,6 +6,13 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ## Unreleased
 
+### Added
+
+- **MegaMoE profiling and UTs**: adds `MegaMoe` and `MegaMoePreDispatch` UT
+  formats and HGTX ranges. Benchmarks report full-pipeline latency including
+  input preparation, together with separate pre-dispatch timing.
+  See the [usage guide](tests/README.MD#megamoe-ut-format-and-hgtx).
+
 ### Changed
 
 - **M890 W4FA8 execution**: expands native tile coverage, unifies automatic

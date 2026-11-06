@@ -189,6 +189,63 @@ void set_mega_mhc_params(int m, int hidden, int sinkhorn_iters, hggcStream_t str
     device_id_ = -1;
 }
 
+void set_mega_moe_pre_dispatch_params(int tokens, int capacity, int hidden, int topk,
+                                     hggcStream_t stream = 0) {
+    op_name_ = "MegaMoePreDispatch";
+    add_params("data_type", "bf16");
+    add_params("tokens", tokens);
+    add_params("capacity", capacity);
+    add_params("hidden", hidden);
+    add_params("topk", topk);
+    stream_ = stream;
+    m_ = tokens;
+    group_ = 1;
+    grouped_layout_ = nullptr;
+    gemm_type_ = GemmType::Normal;
+    is_gemv_ = false;
+    device_id_ = -1;
+}
+
+void set_mega_moe_params(int ep, int rank, int tokens, int capacity,
+                         int hidden, int intermediate_hidden, int experts, int topk,
+                         const std::string& activation, float activation_clamp,
+                         bool fast_math, int master_experts, bool recv_stats,
+                         float situ_beta, float situ_linear_beta, hggcStream_t stream = 0) {
+    op_name_ = "MegaMoe";
+    // Shape metadata only: do not copy routes or synchronize the device here.
+    add_params("data_type", "fp4");
+    add_params("ep", ep);
+    add_params("rank", rank);
+    add_params("tokens", tokens);
+    add_params("capacity", capacity);
+    add_params("hidden", hidden);
+    add_params("intermediate_hidden", intermediate_hidden);
+    add_params("experts", experts);
+    add_params("topk", topk);
+    add_params("activation", activation);
+    const auto float_text = [](float value) {
+        std::ostringstream text;
+        text << std::setprecision(9) << value;
+        return text.str();
+    };
+    add_params("activation_clamp", activation_clamp >= 0 ? float_text(activation_clamp) : "none");
+    add_params("fast_math", int(fast_math));
+    add_params("master_experts", master_experts);
+    add_params("recv_stats", int(recv_stats));
+    add_params("situ_beta", float_text(situ_beta));
+    add_params("situ_linear_beta", float_text(situ_linear_beta));
+    add_params("input_format", "mxfp4");
+    // A captured call does not describe the distribution or the input seed.
+    add_params("routing", "unknown");
+    stream_ = stream;
+    m_ = tokens;
+    group_ = experts / ep;
+    grouped_layout_ = nullptr;
+    gemm_type_ = GemmType::Normal;
+    is_gemv_ = false;
+    device_id_ = -1;
+}
+
 void set_fused_moe_params(const std::string& data_type, const std::string& quant_type,
                           int groups, int num_token, int topk,
                           int n, int k, int* grouped_layout, hggcStream_t stream = 0) {
@@ -315,6 +372,10 @@ void distribution() {
 }
 
 bool check_support_dump(){
+    if (op_name_ == "MegaMoePreDispatch") return false;
+    // Expert row counts are produced by G1; the pre-launch distribution dump
+    // cannot read this call's counts.
+    if (op_name_ == "MegaMoe") return false;
     char *pEnv_dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
     static int target_device_id = pEnv_dump_device != nullptr ? std::stoi(pEnv_dump_device) : 0;
     // export PPU_LIB_DUMP_DEVICE=-1 to dump all devices
@@ -469,4 +530,19 @@ private:
     bool show_params_;
     hgtxDomainHandle_t domain_;
 
+};
+
+// Keep the range balanced if argument assembly or JIT compilation throws.
+class ScopedProfilingRange {
+public:
+    explicit ScopedProfilingRange(DgProfParam* params) : params_(params) {
+        if (params_) ProfilingInterface::Instance().instrument(true, *params_);
+    }
+    ~ScopedProfilingRange() {
+        if (params_) ProfilingInterface::Instance().instrument(false, *params_);
+    }
+    ScopedProfilingRange(const ScopedProfilingRange&) = delete;
+    ScopedProfilingRange& operator=(const ScopedProfilingRange&) = delete;
+private:
+    DgProfParam* params_;
 };

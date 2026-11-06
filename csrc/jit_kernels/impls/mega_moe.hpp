@@ -1,5 +1,6 @@
 #pragma once
 
+#include <deep_gemm/common/profiling_interface.cuh>
 #include "mega_moe_dispatch.hpp"
 #include "mega_moe_scatter.hpp"
 #include "mega_moe_combine.hpp"
@@ -172,6 +173,20 @@ inline void fp4_fp4_mega_moe_impl(
         split_args.kernel_phase = kernel_phase;
         PPUFP4MegaMoERuntime::compile_and_launch(kernel_name, split_args);
     };
+    DgProfParam dg_prof_params;
+    const bool profiling_enabled = ProfilingInterface::Instance().get_op_info();
+    if (profiling_enabled) {
+        const char* public_activation = dispatch_config.fused_situ ? "situ" :
+            dispatch_config.silu_then_clamp ? "step" : "swiglu";
+        dg_prof_params.set_mega_moe_params(
+            dispatch_config.num_ranks, rank_idx, num_tokens, dispatch_config.nmtpr,
+            y.size(1), dispatch_config.gemm1_n / 2, dispatch_config.num_experts,
+            dispatch_config.num_topk, public_activation, activation_clamp,
+            fast_math, std::get<0>(l1_weights).size(0), cumulative_local_expert_recv_stats.has_value(),
+            situ_beta, situ_linear_beta, current_stream());
+    }
+    // One UT covers both phases, including combine and state recycling.
+    const ScopedProfilingRange profile(profiling_enabled ? &dg_prof_params : nullptr);
     launch_with_phase(PPUFP4MegaMoERuntime::KernelPhase::Linear1, "fp4_mega_moe_dispatch_gemm1");
     launch_with_phase(PPUFP4MegaMoERuntime::KernelPhase::Linear2, "m_grouped_gemm_fp4_moe_scatter");
 }

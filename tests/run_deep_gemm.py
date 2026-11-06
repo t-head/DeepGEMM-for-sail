@@ -20,6 +20,8 @@ def device_version_supported(one_case):
     caselist can run on both PPU1.0 and PPU1.5.
     """
     data_type = one_case.get('data_type')
+    if one_case.get('gemm_type') in ('MegaMoe', 'MegaMoePreDispatch') and get_arch_version() != 89:
+        return False, 'MegaMoE requires PPU1.5 (ZW-M890P)'
     if one_case.get('device') == '810e' and 'ZW810E' not in torch.cuda.get_device_name():
         return False, 'This regression case requires ZW810E'
     if one_case.get('gemm_type') == 'Activation' or data_type in ('w4fa16_mma', 'w4fa8_mma'):
@@ -59,6 +61,16 @@ def run_activation_regression(args):
     return test_checkin_activation(args, check_accuracy=get_acc_check())
 
 
+def run_mega_moe_regression(args):
+    from mega_moe_format import run_mega_moe_format
+    return run_mega_moe_format(args)
+
+
+def run_mega_moe_pre_dispatch_regression(args):
+    from mega_moe_format import run_mega_moe_pre_dispatch_format
+    return run_mega_moe_pre_dispatch_format(args)
+
+
 def call_test_func(gemm_type, func_args):
     supported_call_funcs = {
         "GroupedContiguous": test_m_grouped_gemm_contiguous,
@@ -77,6 +89,8 @@ def call_test_func(gemm_type, func_args):
         "SparseMqaLogits": test_sparse_mqa_logits,
         "PagedSparseMqaLogits": test_sparse_mqa_logits,
         "MegaMhc": test_mega_mhc,
+        "MegaMoe": run_mega_moe_regression,
+        "MegaMoePreDispatch": run_mega_moe_pre_dispatch_regression,
         "BatchGemm": test_batch_gemm,
         "AttentionRegression": run_attention_regression,
         "Preprocess": run_preprocessing_regression,

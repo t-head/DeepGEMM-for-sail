@@ -63,6 +63,8 @@ class MegaMoECase:
     reference_tokens: int = 8
     precision: str = "w4a4"
     routing: str = "round_robin"
+    situ_beta: float = 4.0
+    situ_linear_beta: float = 25.0
 
     def require_world(self):
         world = dist.get_world_size()
@@ -155,18 +157,19 @@ def _replicate_physical_expert(weights):
         tensor[-1].copy_(tensor[0])
 
 
-def _transform_weights(l1_raw, l2_raw, activation, replicas=False):
+def _transform_weights(l1_raw, l2_raw, activation, replicas=False, master_experts=None):
     if not replicas:
         l1, l2 = deep_gemm.transform_weights_for_mega_moe(l1_raw, l2_raw, activation=activation)
         return l1, l2, {}
     _replicate_physical_expert(l1_raw)
     _replicate_physical_expert(l2_raw)
+    split = l1_raw[0].shape[0] - 1 if master_experts is None else master_experts
     # Allocate master and replica banks independently, retaining the full raw
     # bank for the reference. Forward must not concatenate or copy these weights.
     l1, l2 = deep_gemm.transform_weights_for_mega_moe(
-        tuple(t[:-1].clone() for t in l1_raw), tuple(t[:-1].clone() for t in l2_raw), activation=activation)
+        tuple(t[:split].clone() for t in l1_raw), tuple(t[:split].clone() for t in l2_raw), activation=activation)
     r1, r2 = deep_gemm.transform_weights_for_mega_moe(
-        tuple(t[-1:].clone() for t in l1_raw), tuple(t[-1:].clone() for t in l2_raw), activation=activation)
+        tuple(t[split:].clone() for t in l1_raw), tuple(t[split:].clone() for t in l2_raw), activation=activation)
     return l1, l2, dict(l1_weights_replicas=r1, l2_weights_replicas=r2)
 
 
@@ -176,13 +179,14 @@ def _all_gather(tensor):
     return torch.stack(tensors)
 
 
-def _reference_activation(projection, kind="swiglu", clamp=None, *, round_bf16=True):
+def _reference_activation(projection, kind="swiglu", clamp=None, *, round_bf16=True,
+                          situ_beta=4.0, situ_linear_beta=25.0):
     """Use the kernel's BF16 boundaries, or retain FP32 for accuracy diagnostics."""
     projection = projection.bfloat16() if round_bf16 else projection.float()
     if kind == "situ":
         gate, up = projection.float().chunk(2, -1)
-        output = (4 * torch.tanh(gate / 4) * torch.sigmoid(gate)
-                  * 25 * torch.tanh(up / 25))
+        output = (situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+                  * situ_linear_beta * torch.tanh(up / situ_linear_beta))
         return output.bfloat16() if round_bf16 else output
     gate, up = projection.chunk(2, -1)
     if clamp is not None:
@@ -220,7 +224,8 @@ def _reference_mega_moe(case, source, ids, weights, l1_weights_raw, l2_weights_r
             continue
         projection = x[src, tok] @ _dequantize_mxfp4(l1_weights[expert], l1_weights_sf[expert]).t()
         activated = _reference_activation(projection, c.activation, c.clamp,
-                                          round_bf16=quantization_aware)
+                                          round_bf16=quantization_aware,
+                                          situ_beta=c.situ_beta, situ_linear_beta=c.situ_linear_beta)
         route_weights = all_weights[src, tok, slot, None]
         if quantization_aware:
             q, scales = _quantize_mxfp4(activated)
@@ -906,19 +911,21 @@ def test_mega_moe_smoke_nan_slots(mega_moe_smoke):
 
 @torch.inference_mode()
 def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=False,
-                  replicas=False, verbose=True, fast_math=True):
+                  replicas=False, verbose=True, fast_math=True, master_experts=None,
+                  recv_stats=False, seed=20261016):
     """Run the public complete operator against an independent mathematical reference."""
     rank_idx, num_ranks = dist.get_rank(), dist.get_world_size()
     num_experts_per_rank = case.experts // num_ranks
-    rng = torch.Generator(device="cuda").manual_seed(20261016 + rank_idx)
+    rng = torch.Generator(device="cuda").manual_seed(seed + rank_idx)
     x_bf16 = torch.randn(case.capacity, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .5
     l1_weights_raw = _make_weights(num_experts_per_rank, 2 * case.intermediate, case.hidden, .5, rng)
     l2_weights_raw = _make_weights(num_experts_per_rank, case.hidden, case.intermediate, .125, rng)
     l1_weights, l2_weights, replica_options = _transform_weights(
-        l1_weights_raw, l2_weights_raw, case.activation, replicas)
+        l1_weights_raw, l2_weights_raw, case.activation, replicas, master_experts)
     sym_buffer = deep_gemm.SymmBuffer(group, case.experts, case.capacity, case.topk,
                                      case.hidden, case.intermediate, activation=case.activation)
     reports = []
+    stats = torch.zeros(num_experts_per_rank, dtype=torch.int32, device="cuda") if recv_stats else None
     try:
         for requested in case.tokens:
             empty_rank = edge_cases and num_ranks > 1 and requested == 1 and rank_idx == num_ranks - 1
@@ -937,8 +944,10 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
                 deep_gemm.mega_moe_pre_dispatch(x, routed_idx, routed_weights, sym_buffer)
                 deep_gemm.fp4_fp4_mega_moe(
                     y, l1_weights, l2_weights, sym_buffer,
-                    cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+                    cumulative_local_expert_recv_stats=(cumulative_local_expert_recv_stats
+                        if cumulative_local_expert_recv_stats is not None else stats),
                     activation=case.activation, activation_clamp=case.clamp, fast_math=fast_math,
+                    situ_beta=case.situ_beta, situ_linear_beta=case.situ_linear_beta,
                     **replica_options)
                 return y
 
@@ -988,6 +997,37 @@ def test_mega_moe_smoke_grouped_workspace(mega_moe_group):
         pytest.skip("grouped scratch boundary is covered by EP1/EP2")
     case = replace(CASES[0], experts=256, tokens=(1, 33))
     _run_mega_moe(case, mega_moe_group, verbose=False)
+
+
+def test_smoke_mega_moe_ut_format(mega_moe_group):
+    from mega_moe_format import MegaMoEFormat, MegaMoEPreDispatchFormat, run_mega_moe_format
+    world = dist.get_world_size()
+    if world not in (1, 2, 4, 8):
+        pytest.skip("format smoke requires EP1/2/4/8")
+    from utils import parse_deepgemm_string_re
+    params = parse_deepgemm_string_re(
+        f"[DeepGemm] --format=MegaMoe,data_type:fp4,ep:{world},tokens:33,capacity:129,"
+        "hidden:512,intermediate_hidden:256,experts:8,topk:2,"
+        "activation:swiglu,activation_clamp:2,routing:random,seed:17,reference_tokens:0,"
+        f"master_experts:{max(1, 8 // world - 1)},recv_stats:1")
+    for invalid in ({"experts": 1025 * world}, {"hidden": 1 << 31},
+                    {"intermediate_hidden": 1 << 30}):
+        with pytest.raises(ValueError):
+            MegaMoEFormat.from_params(dict(params, **invalid))
+    with pytest.raises(ValueError):
+        MegaMoEPreDispatchFormat.from_params(
+            dict(tokens=33, capacity=129, hidden=1 << 31, topk=2))
+    run_mega_moe_format(params)
+
+
+@pytest.mark.parametrize("tokens", (0, 1, 33))
+def test_smoke_mega_moe_pre_dispatch_ut_format(mega_moe_group, tokens):
+    from mega_moe_format import run_mega_moe_pre_dispatch_format
+    from utils import parse_deepgemm_string_re
+    params = parse_deepgemm_string_re(
+        f"MegaMoePreDispatch,data_type:bf16,tokens:{tokens},capacity:129,"
+        "hidden:512,topk:2,reference_tokens:0")
+    run_mega_moe_pre_dispatch_format(params)
 
 
 # Standalone torchrun entry; pytest uses the same driver and case table.
