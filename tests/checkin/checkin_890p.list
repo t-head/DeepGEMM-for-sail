@@ -234,22 +234,15 @@ MqaLogits,data_type:fp4,seq_len_q:8192,seq_len_kv:8192,num_heads:64,head_dim:128
 MqaLogits,data_type:fp4,seq_len_q:2048,seq_len_kv:4096,num_heads:32,head_dim:128,logits_dtype:bf16
 MqaLogits,data_type:fp4,seq_len_q:1024,seq_len_kv:8192,num_heads:64,head_dim:128,logits_dtype:fp32
 
-# --- MqaLogits / bf16 ---
-MqaLogits,data_type:bf16,seq_len_q:512,seq_len_kv:3072,num_heads:64,head_dim:128
-
 # ============ PagedMqaLogits ============
-
-# --- PagedMqaLogits / bf16 ---
-# Empty and partial pages.
-PagedMqaLogits,data_type:bf16,batch_size:4,next_n:1,num_heads:32,head_dim:128,distribution:[0,1,63,128],page_kv:64,logits_dtype:fp32
 
 # --- PagedMqaLogits / fp8 ---
 PagedMqaLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:32,logits_dtype:fp32
-PagedMqaLogits,data_type:fp8,batch_size:64,next_n:2,num_heads:64,head_dim:128,avg_context_len:8192,page_kv:128,logits_dtype:fp32
+PagedMqaLogits,data_type:fp8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,page_kv:128,logits_dtype:fp32
 
 # --- PagedMqaLogits / fp4 ---
 PagedMqaLogits,data_type:fp4,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1],page_kv:64,logits_dtype:bf16
-PagedMqaLogits,data_type:fp4,batch_size:64,next_n:6,num_heads:64,head_dim:128,avg_context_len:8192,page_kv:64,logits_dtype:bf16
+PagedMqaLogits,data_type:fp4,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,page_kv:64,logits_dtype:bf16
 
 # --- PagedMqaLogits / int8 ---
 PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,avg_context_len:2048
@@ -257,9 +250,9 @@ PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,avg_context_len:2048
 # ============ MqaAvgLogits ============
 
 # --- MqaAvgLogits / fp8 ---
-MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:2,logits_dtype:fp32
-MqaAvgLogits,data_type:fp8,seq_len_q:129,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32
-MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16
+MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:2,logits_dtype:fp32,compressed_logits:1
+MqaAvgLogits,data_type:fp8,seq_len_q:129,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32,compressed_logits:1
+MqaAvgLogits,data_type:fp8,seq_len_q:256,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16,compressed_logits:1
 
 # --- MqaAvgLogits / fp4 ---
 # Compressed output: Q-scale modes, output dtypes, Q/KV tails and balancing.

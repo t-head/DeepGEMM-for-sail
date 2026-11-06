@@ -174,21 +174,6 @@ static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_head
         {{1, 1, 64, 64}, {2, 3, 256, 64, false, 4}},
         {{1, 1, 32, 128}, {1, 3, 64, 16, false, 8}},
         {{1, 1, 64, 128}, {2, 3, 64, 16, false, 6}},
-        // int8 next_n > 1 tiles
-        {{1, 2, 32, 128}, {2, 3, 256, 32, false, 2}},
-        {{1, 4, 32, 128}, {2, 3, 128, 32, false, 2}},
-        {{1, 2, 64, 128}, {2, 3, 256, 32, false, 1}},
-        {{1, 4, 64, 128}, {2, 3, 128, 32, false, 1}},
-        {{1, 5, 64, 128}, {2, 3, 64, 32, false, 1}},
-        {{1, 6, 64, 128}, {2, 3, 64, 32, false, 1}},
-        // fp4 next_n > 1 tiles, some using split_mblock
-        {{1, 2, 32, 64}, {2, 3, 256, 64, true, 4}},
-        {{1, 3, 32, 64}, {1, 3, 256, 64, true, 4}},
-        {{1, 4, 32, 64}, {2, 3, 256, 64, true, 3}},
-        {{1, 5, 32, 64}, {1, 3, 64, 64, true, 9}},
-        {{1, 6, 32, 64}, {1, 3, 64, 64, true, 8}},
-        {{1, 2, 64, 64}, {1, 3, 256, 64, true, 4}},
-        {{1, 3, 64, 64}, {1, 3, 128, 64, true, 5}},
         // AVG tiles use 16 MMA columns and ceil(next_n / 4) query groups.
         // FP4 D128 is packed into 64 bytes; FP8 D128 uses 128 bytes.
         {{1, 1, 16, 64}, {2, 3, 256, 64, false, 4}},
@@ -403,13 +388,9 @@ static MqaLogitsConfig get_best_configs(torch::ScalarType qk_dtype, int seq_len_
     } else {
         config.num_q_stages = 1;
         config.num_kv_stages = 3;
-        if (qk_dtype == torch::kBFloat16) {
-            config.block_kv = 128, config.warp_kv = 32;
-        } else {
-            // FP8 / INT8 share the same tiling
-            config.warp_kv = num_heads == 32 ? 32 : 64;
-            config.block_kv = config.warp_kv * 4;
-        }
+        // FP8 / INT8 share the same tiling.
+        config.warp_kv = num_heads == 32 ? 32 : 64;
+        config.block_kv = config.warp_kv * 4;
     }
 
     return config;
