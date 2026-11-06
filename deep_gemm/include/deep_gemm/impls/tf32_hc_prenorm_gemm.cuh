@@ -1351,17 +1351,16 @@ public:
         dim3 block(kNumThreads);
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::instance().get_op_info()) {
+        if (deep_gemm::profiling_enabled()) {
             dg_prof_params.set_hc_prenorm_params(m, SHAPE_N, SHAPE_K, stream);
             dg_prof_params.add_params("num_splits", int(kNumSplits));
         }
 
-        ProfilingInterface::instance().instrument(true, dg_prof_params);
-
-        kernel<<<grid, block, kSmemSize, stream>>>(
-            rhs, out, sqr_sum, lhs, m, ws, ws_s, counter);
-
-        ProfilingInterface::instance().instrument(false, dg_prof_params);
+        {
+            auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+            kernel<<<grid, block, kSmemSize, stream>>>(
+                rhs, out, sqr_sum, lhs, m, ws, ws_s, counter);
+        }
     }
 };
 

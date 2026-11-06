@@ -1490,15 +1490,16 @@ public:
         // std::cout << "max_blocks_per_cu = " << max_blocks_per_cu << std::endl;
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::instance().get_op_info()){
+        if (deep_gemm::profiling_enabled()){
             dg_prof_params.set_params(
                 kGemmType, false, std::string("bf16"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
                 grouped_layout, stream
             );
         }
-        ProfilingInterface::instance().instrument(true, dg_prof_params);
-        cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-        ProfilingInterface::instance().instrument(false, dg_prof_params);
+        {
+            auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+            cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
+        }
 
         int max_active_tb_num = max_blocks_per_cu;
         const int threadblock_count = num_sms < 20 ? num_sms : num_sms * max_active_tb_num;

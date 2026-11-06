@@ -15,6 +15,97 @@
 #include <deep_gemm/common/types.cuh>
 
 
+class ProfilingInterface {
+public:
+    ProfilingInterface(ProfilingInterface const&) = delete;
+    void operator=(ProfilingInterface const&) = delete;
+
+    static ProfilingInterface& instance() {
+        static ProfilingInterface instance;
+        return instance;
+    }
+
+    // `PPU_LIB_SHOW_PARAMS=1`: echo the UT of every instrumented launch
+    bool show_params() const { return show_params_; }
+
+    // `PPU_LIB_PERF_INSTRUMENT=1`: push/pop HGTX ranges around every instrumented launch
+    bool use_hgtx() const { return use_hgtx_; }
+
+    // `PPU_LIB_DUMP_DEVICE=<id>`: which device may pay for a distribution read-back (`-1` for all)
+    bool support_dump(const int& device_id) const {
+        return dump_device_id_ == -1 or dump_device_id_ == device_id;
+    }
+
+    // Push an HGTX domained range with `message` as the annotation. No-op when PERF_INSTRUMENT
+    // is unset.
+    void hgtx_range_push(const std::string& message) {
+        if (not use_hgtx_)
+            return;
+        hgtxEventAttributes_t event_attrib = {0};
+        event_attrib.version = HGTX_VERSION;
+        event_attrib.size = HGTX_EVENT_ATTRIB_STRUCT_SIZE;
+        event_attrib.messageType = HGTX_MESSAGE_TYPE_ASCII;
+        event_attrib.message.ascii = message.c_str();
+        hgtxDomainRangePushEx(domain_, &event_attrib);
+    }
+
+    // Pop the most recent HGTX domained range. No-op when PERF_INSTRUMENT is unset.
+    void hgtx_range_pop() {
+        if (not use_hgtx_)
+            return;
+        hgtxDomainRangePop(domain_);
+    }
+
+
+
+private:
+    ProfilingInterface() {
+        // TODO: add print log
+        domain_ = hgtxDomainCreateA("deepgemm");
+        const auto dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
+        dump_device_id_ = dump_device == nullptr ? 0 : std::stoi(dump_device);
+        use_hgtx_ = false;
+        show_params_ = false;
+
+        char *pEnv_perf = std::getenv("PPU_LIB_PERF_INSTRUMENT");
+        if (pEnv_perf && isdigit(*pEnv_perf)) {
+            int value = std::stoi(std::string(pEnv_perf));
+            if (value == 0) {
+                use_hgtx_ = false;
+            } else if (value == 1) {
+                use_hgtx_ = true;
+            } else {
+                printf("Invalid value for PPU_LIB_PERF_INSTRUMENT : %d\n", value);
+            }
+        }
+
+        char *pEnv_params = std::getenv("PPU_LIB_SHOW_PARAMS");
+        if (pEnv_params && isdigit(*pEnv_params)) {
+            int value = std::stoi(std::string(pEnv_params));
+            if (value == 0) {
+                show_params_ = false;
+            } else if (value == 1) {
+                show_params_ = true;
+            } else {
+                printf("Invalid value for PPU_LIB_SHOW_PARAMS : %d\n", value);
+            }
+        }
+    }
+
+
+    ~ProfilingInterface() {
+        hgtxDomainDestroy(domain_);
+    }
+
+    bool use_hgtx_;
+    bool show_params_;
+    hgtxDomainHandle_t domain_;
+    int dump_device_id_;
+
+};
+
+
+
 class DgProfParam {
 public:
     using GemmType = deep_gemm::GemmType;
@@ -346,11 +437,8 @@ void distribution() {
     add_params("distribution", outDist.str());
 }
 
-bool check_support_dump(){
-    char *pEnv_dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
-    static int target_device_id = pEnv_dump_device != nullptr ? std::stoi(pEnv_dump_device) : 0;
-    // export PPU_LIB_DUMP_DEVICE=-1 to dump all devices
-    if (target_device_id != -1 && target_device_id != device_id_ && !is_paged_mqa_logits()) {
+bool check_support_dump() {
+    if (!ProfilingInterface::instance().support_dump(device_id_) && !is_paged_mqa_logits()) {
         return false;
     }
     if (gemm_type_ == GemmType::Normal || gemm_type_ == GemmType::Batched) {
@@ -359,7 +447,7 @@ bool check_support_dump(){
     }
     // check if device graph captured
     hggcStreamCaptureStatus captureStatus;
-    hggcStreamIsCapturing(stream_, &captureStatus);
+    CHECK_HGGC(hggcStreamIsCapturing(stream_, &captureStatus));
     // add device graph mode later
     if (captureStatus != hggcStreamCaptureStatusNone) {
         printf("\ndump_group_m not supported in device graph mode.\n");
@@ -380,7 +468,7 @@ static std::string render(const std::vector<int>& values) {
     }
 
 template <typename T>
-std::string val_to_string(const T& value) {
+auto val_to_string(const T& value) -> decltype(std::to_string(value)) {
     return std::to_string(value);
 }
 
@@ -420,132 +508,17 @@ protected:
     std::string op_name_;
     std::unordered_map<std::string, std::string> args_;
     std::vector<std::string> insertionOrder;
-    int m_;
-    int group_;
-    int* grouped_layout_;
+    int m_ = 0;
+    int group_ = 0;
+    int* grouped_layout_ = nullptr;
     int next_n_ = 1;
-    int device_id_;
-    GemmType gemm_type_;
-    bool is_gemv_;
-    hggcStream_t stream_;
+    int device_id_ = -1;
+    GemmType gemm_type_ = GemmType::Normal;
+    bool is_gemv_ = false;
+    hggcStream_t stream_ = 0;
 };
 
 
-class ProfilingInterface {
-public:
-    ProfilingInterface(ProfilingInterface const&) = delete;
-    void operator=(ProfilingInterface const&) = delete;
-
-    static ProfilingInterface& instance() {
-        static ProfilingInterface instance;
-        return instance;
-  }
-
-    // `PPU_LIB_SHOW_PARAMS=1`: echo the UT of every instrumented launch
-    bool show_params() const { return show_params_; }
-
-    // `PPU_LIB_PERF_INSTRUMENT=1`: push/pop HGTX ranges around every instrumented launch
-    bool use_hgtx() const { return use_hgtx_; }
-
-    // `PPU_LIB_DUMP_DEVICE=<id>`: which device may pay for a distribution read-back (`-1` for all)
-    bool support_dump(const int& device_id) const {
-        return dump_device_id_ == -1 or dump_device_id_ == device_id;
-    }
-
-    // Push an HGTX domained range with `message` as the annotation. No-op when PERF_INSTRUMENT
-    // is unset.
-    void hgtx_range_push(const std::string& message) {
-        if (not use_hgtx_)
-            return;
-        hgtxEventAttributes_t event_attrib = {0};
-        event_attrib.version = HGTX_VERSION;
-        event_attrib.size = HGTX_EVENT_ATTRIB_STRUCT_SIZE;
-        event_attrib.messageType = HGTX_MESSAGE_TYPE_ASCII;
-        event_attrib.message.ascii = message.c_str();
-        hgtxDomainRangePushEx(domain_, &event_attrib);
-    }
-
-    // Pop the most recent HGTX domained range. No-op when PERF_INSTRUMENT is unset.
-    void hgtx_range_pop() {
-        if (not use_hgtx_)
-            return;
-        hgtxDomainRangePop(domain_);
-    }
-
-
-    bool get_op_info() {
-        return show_params_ || use_hgtx_;
-    }
-
-    void instrument(bool start, DgProfParam &params) {
-        if (!get_op_info()){
-            return;
-        }
-
-        if (start) {
-            if ((show_params_ || (params.is_paged_mqa_logits() && use_hgtx_)) && params.check_support_dump()) {
-                params.distribution();
-            }
-            std::string op_name = params.format();
-            if (show_params_) {
-                std::cout << op_name << std::endl;
-            }
-            if (use_hgtx_) {
-                hgtx_range_push(op_name);
-            }
-        } else {
-            if (use_hgtx_) {
-                hgtx_range_pop();
-            }
-        } // if start
-
-  }
-
-private:
-    ProfilingInterface() {
-        // TODO: add print log
-        domain_ = hgtxDomainCreateA("deepgemm");
-        const auto dump_device = std::getenv("PPU_LIB_DUMP_DEVICE");
-        dump_device_id_ = dump_device == nullptr ? 0 : std::stoi(dump_device);
-        use_hgtx_ = false;
-        show_params_ = false;
-
-        char *pEnv_perf = std::getenv("PPU_LIB_PERF_INSTRUMENT");
-        if (pEnv_perf && isdigit(*pEnv_perf)) {
-        int value = std::stoi(std::string(pEnv_perf));
-        if (value == 0) {
-            use_hgtx_ = false;
-        } else if (value == 1) {
-            use_hgtx_ = true;
-        } else {
-            printf("Invalid value for PPU_LIB_PERF_INSTRUMENT : %d\n", value);
-        }
-        }
-
-        char *pEnv_params = std::getenv("PPU_LIB_SHOW_PARAMS");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-        int value = std::stoi(std::string(pEnv_params));
-        if (value == 0) {
-            show_params_ = false;
-        } else if (value == 1) {
-            show_params_ = true;
-        } else {
-            printf("Invalid value for PPU_LIB_SHOW_PARAMS : %d\n", value);
-        }
-        }
-  }
-
-
-    ~ProfilingInterface() {
-        hgtxDomainDestroy(domain_);
-    }
-
-    bool use_hgtx_;
-    bool show_params_;
-    hgtxDomainHandle_t domain_;
-    int dump_device_id_;
-
-};
 
 namespace deep_gemm {
 
@@ -567,17 +540,26 @@ public:
     }
     HgtxRangeGuard(const HgtxRangeGuard&) = delete;
     HgtxRangeGuard& operator=(const HgtxRangeGuard&) = delete;
-    HgtxRangeGuard(HgtxRangeGuard&& other) noexcept : active_(other.active_) { other.active_ = false; }
-    HgtxRangeGuard& operator=(HgtxRangeGuard&& other) noexcept {
-        if (this != &other) {
-            if (active_) ProfilingInterface::instance().hgtx_range_pop();
-            active_ = other.active_;
-            other.active_ = false;
-        }
-        return *this;
-    }
+    // Stack ranges must keep their original nesting and destruction order.
+    HgtxRangeGuard(HgtxRangeGuard&&) = delete;
+    HgtxRangeGuard& operator=(HgtxRangeGuard&&) = delete;
 private:
     bool active_ = false;
 };
+
+// Preserve the launch annotation and distribution-read-back policy.
+[[nodiscard]] inline HgtxRangeGuard show_gemm_ut(DgProfParam& params) {
+    auto& profiler = ProfilingInterface::instance();
+    if (!profiling_enabled())
+        return HgtxRangeGuard();
+    if ((profiler.show_params() || (params.is_paged_mqa_logits() && profiler.use_hgtx())) &&
+        params.check_support_dump()) {
+        params.distribution();
+    }
+    const auto message = params.format();
+    if (profiler.show_params())
+        std::cout << message << std::endl;
+    return HgtxRangeGuard(message);
+}
 
 } // namespace deep_gemm

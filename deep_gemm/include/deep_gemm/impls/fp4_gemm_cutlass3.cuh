@@ -1270,7 +1270,7 @@ public:
 
 
                 DgProfParam dg_prof_params;
-                if (ProfilingInterface::instance().get_op_info()){
+                if (deep_gemm::profiling_enabled()){
                     dg_prof_params.set_params(
                         kGemmType, false, std::string("fp4"), kNumGroups, shape_m, ShapeN, ShapeK*2, expected_m,
                         grouped_layout, stream
@@ -1278,9 +1278,10 @@ public:
                     dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
                     dg_prof_params.add_params("swiglu_limit", swiglu_limit);
                 }
-                ProfilingInterface::instance().instrument(true, dg_prof_params);
-                cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-                ProfilingInterface::instance().instrument(false, dg_prof_params);
+                {
+                    auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+                    cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
+                }
             };
 
             using GemmKernelDynamic = cutlass::gemm::kernel::Fp4DeepGemmDynamicTile<
@@ -1504,7 +1505,7 @@ public:
           }
 
           DgProfParam dg_prof_params;
-          if (ProfilingInterface::instance().get_op_info()) {
+          if (deep_gemm::profiling_enabled()) {
               dg_prof_params.set_params(
                   kGemmType, false, std::string("fp4"), kNumGroups, shape_m, ShapeN, ShapeK*2, expected_m,
                   grouped_layout, stream
@@ -1513,9 +1514,10 @@ public:
               dg_prof_params.add_params("swiglu_limit", swiglu_limit);
           }
 
-          ProfilingInterface::instance().instrument(true, dg_prof_params);
-          cutlass::device_kernel<GemmKernel><<<grid, block, sharemem_size, stream>>>(params);
-          ProfilingInterface::instance().instrument(false, dg_prof_params);
+          {
+              auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+              cutlass::device_kernel<GemmKernel><<<grid, block, sharemem_size, stream>>>(params);
+          }
       }
     }
   };

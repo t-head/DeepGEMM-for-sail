@@ -815,7 +815,7 @@ public:
       }
 
       DgProfParam dg_prof_params;
-      if (ProfilingInterface::instance().get_op_info()) {
+      if (deep_gemm::profiling_enabled()) {
         std::string dtype_name = UseMmaKernel ? std::string("w4fa16_mma") :
             (cute::is_same_v<ElementB, cutlass::int4b_t> ? std::string("w4a16") :
              std::string("w4fa16"));
@@ -853,9 +853,10 @@ public:
         printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, int(attr.numRegs), int(attr.localSizeBytes));
       }
 
-      ProfilingInterface::instance().instrument(true, dg_prof_params);
-      cutlass::device_kernel<Kernel><<<grid, block, smem_size, stream>>>(params);
-      ProfilingInterface::instance().instrument(false, dg_prof_params);
+      {
+          auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+          cutlass::device_kernel<Kernel><<<grid, block, smem_size, stream>>>(params);
+      }
     }
   };
 

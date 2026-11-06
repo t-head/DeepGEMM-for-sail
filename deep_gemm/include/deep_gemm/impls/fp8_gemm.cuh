@@ -1211,16 +1211,16 @@ public:
         }
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::instance().get_op_info()){
+        if (deep_gemm::profiling_enabled()){
             dg_prof_params.set_params(
                 kGemmType, false, std::string("fp8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
                 grouped_layout, stream
             );
         }
-        ProfilingInterface::instance().instrument(true, dg_prof_params);
-
-        cutlass::device_kernel<GemmKernel><<<grid, block, sharemem_size, stream>>>(params);
-        ProfilingInterface::instance().instrument(false, dg_prof_params);
+        {
+            auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+            cutlass::device_kernel<GemmKernel><<<grid, block, sharemem_size, stream>>>(params);
+        }
 
   }
 };
