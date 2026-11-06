@@ -34,8 +34,18 @@
 #include <tools/util/include/cutlass/util/packed_stride.hpp>
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
+#include <deep_gemm/layout/dispatch_layout.cuh>
 #include <math.h>
 
+namespace deep_gemm {
+
+__device__ __forceinline__ uint32_t ld_copy_ready_uncached(
+        const volatile uint32_t* ptr) {
+  asm volatile("" ::: "memory");
+  return __ldbl(const_cast<const uint32_t*>(ptr));
+}
+
+} // namespace deep_gemm
 
 namespace cutlass::gemm::collective {
 using namespace cute;
@@ -66,7 +76,8 @@ template <
   class GmemTiledCopySFB_,
   class SmemLayoutAtomSFB_,
   deep_gemm::FP4DynamicTileId kDynamicTileId = deep_gemm::FP4DynamicTileId::Disabled,
-  int SFBBlockN_ = -1>
+  uint32_t SfaScaleBlocks_ = 0,
+  bool WarpSpecialized_ = false>
 struct CollectiveMmaScaleFp4
 {
   //
@@ -80,6 +91,16 @@ struct CollectiveMmaScaleFp4
   using StrideB = StrideB_;
   using TiledMma = TiledMma_;
   using ElementAccumulator = typename TiledMma::ValTypeC;
+
+  CUTLASS_DEVICE static void sync_compute_group() {
+    if constexpr (WarpSpecialized_) {
+      static_assert(CUTE_STATIC_V(size(TiledMma{})) == 256,
+                    "scatter pipeline needs eight compute warps");
+      __ppu_barrier_sync(3, 256);
+    } else {
+      __syncthreads();
+    }
+  }
   using GmemTiledCopyA = GmemTiledCopyA_;
   using GmemTiledCopyB = GmemTiledCopyB_;
   using SmemLayoutAtomA = SmemLayoutAtomA_;
@@ -115,15 +136,39 @@ struct CollectiveMmaScaleFp4
       SmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
   static constexpr int BlockKSF = size<2>(TileShape{}) / 32;  // must ensure BlockK is divisible by 32
-  static constexpr bool UseWideSFB = SFBBlockN_ > 0;
-  static constexpr int SFBBlockN = UseWideSFB ? SFBBlockN_ : size<1>(TileShape{});
-  static_assert(SFBBlockN >= size<1>(TileShape{}), "SFB tile must cover the GEMM N tile");
+  static_assert(SfaScaleBlocks_ == 0 ||
+                size<2>(TileShape{}) % 32 == 0,
+                "SFA tiles require BLOCK_K divisible by 32");
+  static constexpr uint32_t SfaScaleBlocks = SfaScaleBlocks_;
+  static_assert(SfaScaleBlocks == 0 ||
+                SfaScaleBlocks %
+                    deep_gemm::FusedSfaPartitionLayout::
+                        kScaleBlocksPerVector == 0,
+                "fused SFA readiness requires whole packed scale vectors");
+  static constexpr int SfaPartition0KTile = 0;
+  static constexpr int SfaPartition1KTile =
+      SfaScaleBlocks == 0 ? 0 : static_cast<int>(
+          deep_gemm::FusedSfaPartitionLayout::first_k_tile(
+              SfaScaleBlocks, size<2>(TileShape{}), 1));
+  static constexpr int SfaPartition2KTile =
+      SfaScaleBlocks == 0 ? 0 : static_cast<int>(
+          deep_gemm::FusedSfaPartitionLayout::first_k_tile(
+              SfaScaleBlocks, size<2>(TileShape{}), 2));
+  static constexpr int SfaTotalKTiles =
+      SfaScaleBlocks == 0 ? 0 :
+          (SfaScaleBlocks + BlockKSF - 1) / BlockKSF;
+  // An empty trailing partition starts just past the last K tile.
+  static_assert(SfaScaleBlocks == 0 ||
+                (SfaPartition0KTile <= SfaPartition1KTile &&
+                 SfaPartition1KTile <= SfaPartition2KTile &&
+                 SfaPartition2KTile <= SfaTotalKTiles),
+                 "fused SFA ready flags require ordered in-range K partitions");
   using SmemLayoutSFA_ = decltype(tile_to_shape(
       SmemLayoutAtomSFA{},
       make_shape(shape<0>(TileShape{}), Int<BlockKSF>{}, Int<DispatchPolicy::Stages>{})));
   using SmemLayoutSFB_ = decltype(tile_to_shape(
       SmemLayoutAtomSFB{},
-      make_shape(Int<SFBBlockN>{}, Int<BlockKSF>{}, Int<DispatchPolicy::Stages>{})));
+      make_shape(shape<1>(TileShape{}), Int<BlockKSF>{}, Int<DispatchPolicy::Stages>{})));
 
   template<int block_mn_sf>
   static constexpr int deduce_smem_swizzle_padding_sf(cute::Int<block_mn_sf>) {
@@ -167,15 +212,19 @@ struct CollectiveMmaScaleFp4
   static constexpr auto smem_layout_sfa = deduce_smem_layout_sf(SmemLayoutSFA_{}, Int<SwizzlePaddingSFA>{});
   using SmemLayoutSFA = decltype(smem_layout_sfa);
 
-  static constexpr int SwizzlePaddingSFB = deduce_smem_swizzle_padding_sf(Int<SFBBlockN>{});
+  static constexpr int SwizzlePaddingSFB = deduce_smem_swizzle_padding_sf(shape<1>(TileShape{}));
   static constexpr auto smem_layout_sfb = deduce_smem_layout_sf(SmemLayoutSFB_{}, Int<SwizzlePaddingSFB>{});
   using SmemLayoutSFB = decltype(smem_layout_sfb);
 
   static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
 
-  // warp_num == 1, use sigle warp to issue AIU LOAD
-  static constexpr bool SplitAIU = (warp_on_m * warp_on_n) > 1 &&
-      (size<0>(TileShape{}) != 256 || size<1>(TileShape{}) != 256);
+  // Fused dispatch waits for remotely produced A/SFA. Keep independent B/SFB
+  // loads on their existing producer warps even for a 256x256 tile.
+  // Ordinary GEMMs retain their original single-producer 256x256 policy.
+  static constexpr bool SplitAIU =
+      (warp_on_m * warp_on_n) > 1 &&
+      (SfaScaleBlocks > 0 || size<0>(TileShape{}) != 256 ||
+       size<1>(TileShape{}) != 256);
   static constexpr int AIU_SFA_WARP = (SplitAIU && (warp_on_m * warp_on_n) > 2) ? 2 : 0;
   static constexpr int AIU_SFB_WARP = (SplitAIU && (warp_on_m * warp_on_n) > 3) ? 3 : 0;
 
@@ -188,7 +237,7 @@ struct CollectiveMmaScaleFp4
   };
 
   // Host side kernel arguments
-  struct Arguments {
+  struct ArgumentsBase {
     Shape<int,int,int> problem_shape;
     ElementA const* ptr_A;
     StrideA dA;
@@ -199,6 +248,17 @@ struct CollectiveMmaScaleFp4
     ElementSFB const* ptr_scale_B;
     StrideSFB dSFB;
   };
+
+  struct FusedDispatchArguments : ArgumentsBase {
+    volatile uint32_t* copy_ready_flags = nullptr;
+    uint32_t copy_ready_generation = 0;
+    uint32_t copy_k_tiles_per_flag = 0;
+    volatile uint32_t* sfa_ready_flags = nullptr;
+    uint32_t sfa_ready_generation = 0;
+  };
+
+  using Arguments = std::conditional_t<(SfaScaleBlocks > 0),
+                                       FusedDispatchArguments, ArgumentsBase>;
 
   // Device side kernel params
   using Params = Arguments;
@@ -243,11 +303,7 @@ struct CollectiveMmaScaleFp4
 
     using TilerSFB = typename GmemTiledCopySFB::Tiler_MN;
     constexpr bool TransSFB = true;
-    if constexpr (UseWideSFB) {
-      gmem_tiled_copy_SFB.desc_.template init<ElementSFB, TransSFB, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(nullptr, SFBBlockN, SFK, params.dSFB);
-    } else {
     gmem_tiled_copy_SFB.desc_.template init<ElementSFB, TransSFB, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(nullptr, N, SFK, params.dSFB);
-    }
   };
 
   template <class ProblemShape_MNKL, class BlockCoord_MNKL>
@@ -269,21 +325,21 @@ struct CollectiveMmaScaleFp4
     Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
 
     // load init scale A/B
-    auto mSFA_layout = make_layout(make_shape(M, cute::ceil_div(K, 16 * 2)), LayoutLeft{}); // uint16_t
+    auto mSFA_layout = [&] {
+      const auto shape = make_shape(M, cute::ceil_div(K, 16 * 2)); // uint16_t
+      if constexpr (SfaScaleBlocks > 0)
+        return make_layout(shape, make_stride(_1{}, get<1>(params.dSFA)));
+      else
+        return make_layout(shape, LayoutLeft{});
+    }();
     Tensor mSFA_mk = make_tensor(make_gmem_ptr(params_.ptr_scale_A), mSFA_layout);
     Tensor gSFA = local_tile(make_mix_tensor_like(mSFA_mk), make_shape(shape<0>(TileShape{}), Int<BlockKSF>{}), make_coord(m_coord, _)); // (BLK_M,BLK_K,k)
 
-    if constexpr (UseWideSFB) {
-      auto mSFB_layout = make_layout(make_shape(Int<SFBBlockN>{}, cute::ceil_div(K, 16 * 2)), LayoutLeft{}); // uint16_t
-      Tensor mSFB_nk = make_tensor(make_gmem_ptr(params_.ptr_scale_B), mSFB_layout);
-      Tensor gSFB = local_tile(make_mix_tensor_like(mSFB_nk), make_shape(Int<SFBBlockN>{}, Int<BlockKSF>{}), make_coord(0, _)); // (SFB_BLK_N,BLK_K,k)
-      return cute::make_tuple(gA, gB, gSFA, gSFB);
-    } else {
-      auto mSFB_layout = make_layout(make_shape(N, cute::ceil_div(K, 16 * 2)), LayoutLeft{}); // uint16_t
-      Tensor mSFB_nk = make_tensor(make_gmem_ptr(params_.ptr_scale_B), mSFB_layout);
-      Tensor gSFB = local_tile(make_mix_tensor_like(mSFB_nk), make_shape(shape<1>(TileShape{}), Int<BlockKSF>{}), make_coord(n_coord, _)); // (BLK_N,BLK_K,k)
-      return cute::make_tuple(gA, gB, gSFA, gSFB);
-    }
+    auto mSFB_layout = make_layout(make_shape(N, cute::ceil_div(K, 16 * 2)), LayoutLeft{}); // uint16_t
+    Tensor mSFB_nk = make_tensor(make_gmem_ptr(params_.ptr_scale_B), mSFB_layout);
+    Tensor gSFB = local_tile(make_mix_tensor_like(mSFB_nk), make_shape(shape<1>(TileShape{}), Int<BlockKSF>{}), make_coord(n_coord, _)); // (BLK_N,BLK_K,k)
+
+    return cute::make_tuple(gA, gB, gSFA, gSFB);
   }
 
   template <class ProblemShape>
@@ -309,7 +365,7 @@ struct CollectiveMmaScaleFp4
   }
 
   template <typename SmemLayoutSF, int warp_iter_num, int warp_iter_stride>
-  static CUTLASS_DEVICE void cal_ldmat_offset(int& base_offset, SmemLayoutSF& smem_layout_sf, const int lane_idx, const int warp_mn_idx, cute::Int<warp_iter_num>, cute::Int<warp_iter_stride>, const int mn_offset = 0) {
+  static CUTLASS_DEVICE void cal_ldmat_offset(int& base_offset, SmemLayoutSF& smem_layout_sf, const int lane_idx, const int warp_mn_idx, cute::Int<warp_iter_num>, cute::Int<warp_iter_stride>) {
     constexpr int inner_shape = size<0, 0>(cute::shape(SmemLayoutSF{}));
     constexpr int inner_stride = size<0, 1>(cute::stride(SmemLayoutSF{}));
 
@@ -321,7 +377,7 @@ struct CollectiveMmaScaleFp4
       int warp_offset = warp_mn_idx * 16;
       int group_offset = group_idx * warp_iter_stride;
       int down_offset = is_down * 8;
-      int offset_ = mn_offset + warp_offset + group_offset + down_offset;
+      int offset_ = warp_offset + group_offset + down_offset;
       base_offset = (offset_ % inner_shape) + (offset_ / inner_shape) * inner_stride;
     }
   }
@@ -340,6 +396,24 @@ struct CollectiveMmaScaleFp4
     ld_mat_m8n8_x1_b16(*reinterpret_cast<uint128_t const*>(smem_ptr_lane_sf), vreg);
   }
 
+  // Compute one scheduled FP4 tile. The caller owns traversal and the epilogue.
+  template <class ProblemShape, class BlockCoord, class Fragment>
+  static CUTLASS_DEVICE auto compute_tile(Params const& params, ProblemShape const& problem,
+      BlockCoord const& coord, Fragment& accumulators, int thread_idx, char* smem) {
+    CollectiveMmaScaleFp4 mma(params, problem);
+    auto inputs = mma.load_init(problem, coord, params);
+    auto const& a = get<0>(inputs);
+    auto const& b = get<1>(inputs);
+    auto residue = make_tuple(
+        static_cast<uint32_t>(get<0>(problem)) - size<0>(a) * get<0>(coord),
+        get<1>(problem) - size<0>(b) * get<1>(coord),
+        get<2>(problem) - size<1>(a) * size<2>(a));
+    clear(accumulators);
+    mma(accumulators, inputs, accumulators, cute::make_coord_iterator(shape<2>(a)),
+        size<2>(a), residue, thread_idx, smem);
+    return residue;
+  }
+
   /// Perform a collective-scoped matrix multiply-accumulate
   template <
     class... Ts,
@@ -356,7 +430,7 @@ struct CollectiveMmaScaleFp4
       KTileIterator k_tile_iter, int k_tile_count,
       ResidueMNK residue_mnk,
       int thread_idx,
-      char *smem_buf, int sfb_n_offset = 0)
+      char *smem_buf)
   {
     using namespace cute;
 
@@ -432,12 +506,88 @@ struct CollectiveMmaScaleFp4
       }
     };
 
+    // Before issuing the async load of K tile t, wait until the copy CTA has
+    // published stripe floor(t / KTilesPerFlag) into the local buffer.
+    int ks_loaded_k = 0;
+    int ks_next_bnd = 0;
+    uint32_t ks_cur_stripe = 0;
+    int sfa_next_bnd = SfaPartition0KTile;
+    uint32_t sfa_cur_partition = 0;
+    auto wait_stripe = [&]() {
+      if constexpr (SfaScaleBlocks > 0) {
+        volatile uint32_t* ks_flags = params_.copy_ready_flags;
+        const int ks_ktpf = static_cast<int>(params_.copy_k_tiles_per_flag);
+        const uint32_t ks_generation = params_.copy_ready_generation;
+        // Only the A producer warp consumes the block-copy buffer. Let the
+        // independent B/SFA/SFB producer warps enqueue their first async group
+        // while warp 0 is polling the A-stripe ready flag; the later CTA-wide
+        // cp_async wait + barrier still joins all four operand producers before
+        // the first MMA reads shared memory.
+        if (warp_idx == 0 && ks_flags != nullptr &&
+            ks_loaded_k >= ks_next_bnd) {
+          const uint32_t stripe_ready = ks_cur_stripe + 1;
+          // Generation is an independent full-width field.  The pointer already
+          // names this tile's global M-block flag, so no M-block bits are packed
+          // into the value consumed here.  Three low bits are reserved for the
+          // monotonically increasing stripe number. The accepted window contains
+          // only this generation's completed stripes; reused tags are cleared
+          // before metadata-ready is published.
+          const uint32_t tagged_ready =
+              (ks_generation << 3) | stripe_ready;
+          constexpr uint32_t kTagWindowEnd = 7u;
+          while (deep_gemm::ld_copy_ready_uncached(ks_flags) - tagged_ready >
+                 kTagWindowEnd - stripe_ready) { }
+          ++ks_cur_stripe;
+          ks_next_bnd += ks_ktpf;
+        }
+        // The independent SFA producer warp waits at the first K tile that can
+        // touch each reshape partition.  These boundaries come from the shared
+        // producer/consumer layout contract and BLOCK_K; K_TILES_PER_FLAG only
+        // describes the separate FP4-copy stream and must not affect them.
+        if (warp_idx == AIU_SFA_WARP &&
+            params_.sfa_ready_flags != nullptr &&
+            sfa_cur_partition <
+                deep_gemm::FusedSfaPartitionLayout::kNumPartitions &&
+            ks_loaded_k >= sfa_next_bnd) {
+          // A future large BLOCK_K may make adjacent producer partitions
+          // begin in the same K tile.  Once the hot-path comparison fires,
+          // drain every flag required by this tile before issuing its load.
+          do {
+            if (lane_idx == 0) {
+              while (deep_gemm::ld_copy_ready_uncached(
+                         params_.sfa_ready_flags + sfa_cur_partition) !=
+                     params_.sfa_ready_generation) { }
+            }
+            __syncwarp();
+            ++sfa_cur_partition;
+            if (sfa_cur_partition == 1) {
+              sfa_next_bnd = SfaPartition1KTile;
+            } else if (sfa_cur_partition == 2) {
+              sfa_next_bnd = SfaPartition2KTile;
+            } else {
+              sfa_next_bnd = SfaTotalKTiles;
+            }
+          } while (sfa_cur_partition <
+                       deep_gemm::FusedSfaPartitionLayout::kNumPartitions &&
+                   ks_loaded_k >= sfa_next_bnd);
+        }
+      }
+    };
+
+    auto advance_k_tile = [&]() {
+      ++k_tile_iter;
+      if constexpr (SfaScaleBlocks > 0) {
+        ++ks_loaded_k;
+      }
+    };
+
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
       if (k_tile_count > 0){
+        wait_stripe();
         copy_to_tsm(k_pipe, *k_tile_iter, warp_idx);
-        ++k_tile_iter;
+        advance_k_tile();
       }
       cp_async_fence();
       --k_tile_count;
@@ -527,17 +677,12 @@ struct CollectiveMmaScaleFp4
     int base_offset_sfa = 0;
     int base_offset_sfb = 0;
     cal_ldmat_offset(base_offset_sfa, SmemLayoutSFA{}, lane_idx, warp_m_idx, Int<warp_iter_num_sfa>{}, Int<warp_iter_stride_sfa>{});
-    if constexpr (UseWideSFB) {
-      cal_ldmat_offset(base_offset_sfb, SmemLayoutSFB{}, lane_idx, warp_n_idx,
-                       Int<warp_iter_num_sfb>{}, Int<warp_iter_stride_sfb>{}, sfb_n_offset);
-    } else {
     cal_ldmat_offset(base_offset_sfb, SmemLayoutSFB{}, lane_idx, warp_n_idx, Int<warp_iter_num_sfb>{}, Int<warp_iter_stride_sfb>{});
-    }
     // PREFETCH register pipeline
     if (K_BLOCK_MAX > 1) {
       // Wait until our first prefetched tile is loaded in
       cp_async_wait<DispatchPolicy::Stages-1>();
-      __syncthreads();
+      sync_compute_group();
 
       // Prefetch the first rmem from the first k-tile
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
@@ -570,11 +715,12 @@ struct CollectiveMmaScaleFp4
       if constexpr (k_block == K_BLOCK_MAX - 2) {
         // Commit the smem for smem_pipe_read
         cp_async_wait<DispatchPolicy::Stages-2>();
-        __syncthreads();
+        sync_compute_group();
 
         if (k_tile_count > 0){
+          wait_stripe();
           copy_to_tsm(smem_pipe_write, *k_tile_iter, warp_idx);
-          ++k_tile_iter;
+          advance_k_tile();
         }
         cp_async_fence();
 
@@ -605,7 +751,7 @@ struct CollectiveMmaScaleFp4
 
     // TODO: original cutlass3 miss this sync
     cp_async_wait<0>();
-    __syncthreads();
+    sync_compute_group();
   }
 };
 /////////////////////////////////////////////////////////////////////////////////////////////////

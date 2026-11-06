@@ -8,6 +8,22 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Changed
 
+- **M890 W4A4 MegaMoE**: optimizes dispatch, GEMM scheduling, and
+  scatter/reduce to improve computation and communication overlap.
+  - Renames `mma_type="fp4xfp4"` to `"mxf4xmxf4"` and
+    `activation="step"` to `"swiglu_step"`.
+  - Adds `activation="swiglu_oai"` with optional `activation_alpha`
+    (default: `1.702`). Allows `situ_linear_beta=None` to disable SiTU
+    up softcap.
+  - Updates the preprocessed weight layout. Regenerate transformed weights
+    from raw weights using `transform_weights_for_mega_moe()`.
+  - Requires `mega_moe_pre_dispatch()` to prepare inputs; `x_sf` is now
+    internal staging storage and must not be populated using the old layout.
+  - Adds `staging_config` to the native C++ interfaces. `SymmBuffer` manages
+    and forwards it automatically; public Python callers need no additional
+    argument.
+  - Extends the supported top-k range from 1–16 to 1–32.
+
 - **M890 W4FA8 execution**: expands native tile coverage, unifies automatic
   tile selection, and overlaps streamed weight decoding with FP8 GEMM for
   NoPad/Fused. Adds tile and resource diagnostics through `show_log=1`.
@@ -25,7 +41,7 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   once in combine. Reusable workspaces manage communication and scratch state,
   including empty ranks and graph replay. Includes correctness tests and optional
   DeepEP benchmarks.
-  See the [calling contract](README.md#megamoe) and
+  See the [calling contract](README.md#mega-moe) and
   [test guide](tests/README.MD#routed-moe-correctness-and-performance-tests).
 - **Mega-mHC for DeepSeek V4.1 Flash**: adds `mega_mhc` for fused shifted
   mHC computation on Zhenwu M890P, with `hc_mult=4`, hidden size

@@ -13,6 +13,16 @@ CUTLASS_HOST_DEVICE constexpr T ceil_div(T a, T b) {
 }
 
 template <typename T>
+CUTLASS_HOST_DEVICE constexpr T constexpr_ceil_div(T a, T b) {
+    return (a + b - 1) / b;
+}
+
+template <typename T>
+CUTLASS_HOST_DEVICE constexpr T constexpr_align(T a, T b) {
+    return constexpr_ceil_div(a, b) * b;
+}
+
+template <typename T>
 CUTLASS_HOST_DEVICE constexpr T constexpr_gcd(T a, T b) {
     return b == 0 ? a : constexpr_gcd(b, a % b);
 }
