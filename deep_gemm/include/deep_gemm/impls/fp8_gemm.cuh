@@ -712,35 +712,12 @@ public:
 
       using SmemLayoutSFA = typename CollectiveMainloop::SmemLayoutSFA;
       using RealSmemLayoutSFA = typename CollectiveMainloop::RealSmemLayoutSFA;
-      using CopyAtomSFA = typename CollectiveMainloop::CopyAtomSFA;   // use async copy
-      auto SFA_shape = shape(layout_SFA);
 
-      constexpr int IsAiuLoadSFA = CollectiveMainloop::IsAiuLoadSFA;
-      Tensor gSFA = get<2, 0>(load_inputs);
+      Tensor gSFA = get<2>(load_inputs);
       auto sSFA = make_tensor(cute::make_smem_ptr(storage.smem_SFA.data()), RealSmemLayoutSFA{});
-
-      auto SFA_load_tuple = [&]() {
-        if constexpr (IsAiuLoadSFA) {
-          auto gmem_thr_copy_SFA = gmem_tiled_copy_SFA.get_slice(thread_idx);
-          Tensor tSFAgSFA = gmem_thr_copy_SFA.partition_S(gSFA);
-          Tensor tSFAsSFA = gmem_thr_copy_SFA.partition_D(sSFA);
-          return cute::make_tuple(0, tSFAgSFA, tSFAsSFA, 0, 0);
-        } else {
-          Tensor cSFA = get<2, 1>(load_inputs);
-          TiledCopy scale_copy_a = make_tiled_copy(CopyAtomSFA{}, Layout<Shape<Int<ScaleMsPerTile>>>{}, Layout<Shape<_1>>{});
-          ThrCopy thr_scale_copy_a = scale_copy_a.get_slice(thread_idx - 64);   // use warp 2 - warp n
-          Tensor tSFAgSFA = thr_scale_copy_a.partition_S(gSFA);
-          Tensor tSFAsSFA = thr_scale_copy_a.partition_D(sSFA);
-          Tensor tSFAcSFA = thr_scale_copy_a.partition_S(cSFA);
-          Tensor tSFApSFA = make_tensor<bool>(shape(filter_zeros(tSFAsSFA(_,_,_,_0{}))));
-          return cute::make_tuple(scale_copy_a, tSFAgSFA, tSFAsSFA, tSFApSFA, tSFAcSFA);
-        }
-      }();
-      auto scale_copy_a = get<0>(SFA_load_tuple);
-      auto tSFAgSFA = get<1>(SFA_load_tuple);
-      auto tSFAsSFA = get<2>(SFA_load_tuple);
-      auto tSFApSFA = get<3>(SFA_load_tuple);
-      auto tSFAcSFA = get<4>(SFA_load_tuple);
+      auto gmem_thr_copy_SFA = gmem_tiled_copy_SFA.get_slice(thread_idx);
+      Tensor tSFAgSFA = gmem_thr_copy_SFA.partition_S(gSFA);
+      Tensor tSFAsSFA = gmem_thr_copy_SFA.partition_D(sSFA);
 
       Tensor mSFB_nkl = make_tensor(make_gmem_ptr(update_params.ptr_scale_B), update_params.layout_SFB);          // (scale_n,k,l)
       Tensor gSFB_nkl = local_tile(mSFB_nkl, TileShape{}, make_coord(_,_,_), Step< X,_1,_1>{});     // (BLK_N,BLK_K,n,k,l)
@@ -749,26 +726,13 @@ public:
       constexpr int K_TILE_COUNT = (K + BlockK - 1) / BlockK;
       auto k_tile_iter_reset = k_tile_iter;
 
-      constexpr int warp_sfa = cute::ceil_div(Int<ScaleMsPerTile>{}, _32{});
       auto copy_to_tsm = [&](int k_pipe_write, int k_idx, int warp_idx) {
         if (warp_idx == 0) {
           copy(gmem_tiled_copy_A, tAgA(_,_,_,k_idx), tAsA(_,_,_,k_pipe_write));
         } else if (warp_idx == 1) {
           copy(gmem_tiled_copy_B, tBgB(_,_,_,k_idx), tBsB(_,_,_,k_pipe_write));
-        }
-        if constexpr (IsAiuLoadSFA) {
-          if (warp_idx == 2) {
-            copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
-          }
-        } else {
-          Tensor tSFAcSFA_compact = filter_zeros(tSFAcSFA(_,_,_,k_idx));
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(tSFApSFA); ++i) {
-            tSFApSFA(i) = elem_less(get<0>(tSFAcSFA_compact(i)), get<0>(SFA_shape));
-          }
-          if (warp_idx > 1 && warp_idx <= 1 + warp_sfa) {
-            copy_if(scale_copy_a, tSFApSFA, filter_zeros(tSFAgSFA(_,_,_,k_idx)), filter_zeros(tSFAsSFA(_,_,_,k_pipe_write)));
-          }
+        } else if (warp_idx == 2) {
+          copy(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,k_idx), tSFAsSFA(_,_,_,k_pipe_write));
         }
       };
 
@@ -785,43 +749,22 @@ public:
       auto k_tile_count_reset = k_tile_count;
 
     // Block scaling layout
-    auto layout_sSFA_copy = [&]() {
-      if constexpr(IsAiuLoadSFA) {
-        return make_layout(
-          make_shape(
-            make_shape(_1{}, shape<0>(RealSmemLayoutSFA{})),
-            get<1>(TileShape{}),
-            make_shape(
-              shape<1>(SmemLayoutSFA{}),
-              shape<2>(SmemLayoutSFA{}))
-          ),
-          make_stride(
-            make_stride(_0{}, stride<0>(RealSmemLayoutSFA{})),
-            _0{},
-            make_stride(
-              make_stride(_0{}, stride<1>(RealSmemLayoutSFA{})),
-              stride<2>(RealSmemLayoutSFA{}))
-          )
-        );
-      } else {
-        return make_layout(
-          make_shape(
-            shape<0>(SmemLayoutSFA{}),
-            get<1>(TileShape{}),
-            make_shape(
-              shape<1>(SmemLayoutSFA{}),
-              shape<2>(SmemLayoutSFA{}))
-          ),
-          make_stride(
-            stride<0>(SmemLayoutSFA{}),
-            _0{},
-            make_stride(
-              stride<1>(SmemLayoutSFA{}),
-              stride<2>(SmemLayoutSFA{}))
-          )
-        );
-      }
-    }();
+    auto layout_sSFA_copy = make_layout(
+      make_shape(
+        shape<0>(SmemLayoutSFA{}),
+        get<1>(TileShape{}),
+        make_shape(
+          shape<1>(SmemLayoutSFA{}),
+          shape<2>(SmemLayoutSFA{}))
+      ),
+      make_stride(
+        stride<0>(SmemLayoutSFA{}),
+        _0{},
+        make_stride(
+          stride<1>(SmemLayoutSFA{}),
+          stride<2>(SmemLayoutSFA{}))
+      )
+    );
 
       auto layout_gSFB_copy = make_layout(
         make_shape(get<0>(TileShape{}), shape<0>(gSFB), make_shape(shape<1>(gSFB), shape<2>(gSFB))),
