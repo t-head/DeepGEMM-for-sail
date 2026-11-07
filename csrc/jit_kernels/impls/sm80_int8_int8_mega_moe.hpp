@@ -357,6 +357,7 @@ public:
     struct Args {
         int intermediate;
         bool normal_quantization;
+        int64_t expected_rows;
         LaunchArgs launch_args;
         const void* input;
         int8_t* output;
@@ -364,14 +365,22 @@ public:
         const uint32_t* rows;
     };
     static std::string generate_impl(const Args& a) {
+        // Short batches need a CTA per row to keep the launch grid populated.
+        const bool warp_rows = device_runtime->get_arch_pair() == std::make_pair(8, 0) &&
+            a.expected_rows >= int64_t(a.launch_args.grid_dim.x) * (a.launch_args.block_dim.x / 32);
+        const auto quantize = warp_rows
+            ? fmt::format("deep_gemm::int8_quant_activated_warp<{},256,{}>(input, output, scale, rows);",
+                          a.intermediate, a.normal_quantization)
+            : fmt::format("deep_gemm::int8_silu_mul_quant_impl<{},256,false,{},true>(input, output, scale, rows, 0.0f);",
+                          a.intermediate, a.normal_quantization);
         return fmt::format(R"(
 #include <deep_gemm/impls/int8_mega_moe_activation.cuh>
 extern "C" __global__ __launch_bounds__(256) void megamoe_int8_quant(
         const __ppu_bfloat16* input, int8_t* output, float* scale,
         const uint32_t* rows) {{
-    deep_gemm::int8_silu_mul_quant_impl<{},256,false,{},true>(input, output, scale, rows, 0.0f);
+    {}
 }}
-)", a.intermediate, a.normal_quantization);
+)", quantize);
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.input, a.output, a.scale, a.rows));
@@ -570,7 +579,8 @@ static void int8_mega_moe_impl(
     launch_int8_split_stage1<Up>(up, sms);
 
     Int8MegaMoEQuantRuntime::Args quantization{
-        intermediate, normal_quantization, {dim3(sms * 4), dim3(256), 0}, activated.data_ptr(),
+        intermediate, normal_quantization, y.size(0) * topk,
+        {dim3(sms * 4), dim3(256), 0}, activated.data_ptr(),
         buffers.stage1_data.data<int8_t>(base), buffers.stage1_scale_storage.data<float>(base),
         buffers.expert_base.data<uint32_t>(base) + groups};
     auto quantization_kernel = compiler->build("megamoe_int8_quant",

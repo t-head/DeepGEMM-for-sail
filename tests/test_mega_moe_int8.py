@@ -211,7 +211,7 @@ def run(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tokens', type=int, nargs='+', default=[0, 1, 31, 32, 33, 65])
+    parser.add_argument('--tokens', type=int, nargs='+', default=[0, 1, 31, 32, 33, 65, 129])
     parser.add_argument('--hidden', type=int, default=2048)
     parser.add_argument('--intermediate', type=int, default=256)
     parser.add_argument('--experts', type=int)
