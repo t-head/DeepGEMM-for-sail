@@ -50,7 +50,6 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
     using AccT = float;
     using ElementScale = float;
     using TileShape = cute::Shape<cute::Int<BLOCK_M>, cute::Int<BLOCK_N>, cute::Int<BLOCK_K>>;
-    using WarpShape = cute::Shape<cute::Int<WARP_M>, cute::Int<WARP_N>, cute::Int<BLOCK_K>>;
 #if __HGGC_ARCH__ == 100
     using ArchTag = cutlass::arch::PPU0010;
 #else
@@ -128,16 +127,10 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
       }
     };
 
-    // load scaleB from hbm to tsm: use aiu load.
-    constexpr uint32_t MaxAiuContElemSize = 128 / (sizeof_bits<ElementScale>::value / 8);     // 32
-    constexpr uint32_t MinAiuContElemSize = 32 / (sizeof_bits<ElementScale>::value / 8);      // 8
-    constexpr bool TransSFB = false;  // k-major is false
-    static constexpr uint32_t SFBTileN = TransSFB ? cute::max(ScaleNsPerTile, MinAiuContElemSize) : ScaleNsPerTile;
-    static constexpr uint32_t SFBTileK = TransSFB ? ScaleKsPerTile : cute::max(ScaleKsPerTile, MinAiuContElemSize);
-    using GemmOperandSFB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementScale, TransSFB, Int<SFBTileN>, Int<SFBTileK>, true, 1, false>;
-    using RealSmemLayoutAtomSFB = Layout<Shape<Int<SFBTileN>, Int<SFBTileK>>, Stride<Int<SFBTileK>, _1>>;
-    using RealSmemLayoutSFB = decltype(tile_to_shape(RealSmemLayoutAtomSFB{},
-            Shape<cute::Int<SFBTileN>, cute::Int<SFBTileK>, cute::Int<kNumStages>>{}));
+    // load scaleB from hbm to tsm with the compact linear operand.
+    using GemmOperandSFB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementScale, false, Int<ScaleNsPerTile>, Int<ScaleKsPerTile>, true, 1, false>;
+    using RealSmemLayoutSFB = decltype(tile_to_shape(typename GemmOperandSFB::SmemLayoutAtom{},
+            Shape<cute::Int<ScaleNsPerTile>, cute::Int<ScaleKsPerTile>, cute::Int<kNumStages>>{}));
 
     // init aiu desc
     typename GemmOperandSFB::GmemTiledCopy gmem_tiled_copy_SFB;
@@ -146,7 +139,7 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
     constexpr uint32_t SCALE_K = cute::ceil_div(Int<SHAPE_K>{}, Int<GROUP_K>{});
     auto shape_SFB = cute::make_shape(Int<SCALE_N>{}, Int<SCALE_K>{});
     auto stride_SFB = cute::make_shape((int)SCALE_K, _1{});
-    gmem_tiled_copy_SFB.desc_.template init<ElementScale, TransSFB, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(nullptr, SCALE_N, SCALE_K, stride_SFB);
+    gmem_tiled_copy_SFB.desc_.template init<ElementScale, false, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(nullptr, SCALE_N, SCALE_K, stride_SFB);
     auto gmem_thr_copy_SFB = gmem_tiled_copy_SFB.get_slice(thread_idx);
     Tensor sSFB = cute::make_tensor(cute::make_smem_ptr(smem_scale_b), RealSmemLayoutSFB{});
     Tensor tSFBsSFB = gmem_thr_copy_SFB.partition_D(sSFB);
@@ -193,7 +186,7 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
     CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
 
     // ---------------- scale ------------------- //
-    using ScaleConfig = ::cutlass::detail::PPUBlockwiseScaleConfig<GROUP_M, GROUP_N, GROUP_K>;
+    using ScaleConfig = ::cutlass::detail::PPUBlockwiseScaleConfig<GROUP_M, GROUP_N, GROUP_K, false, true>;
     using SmemLayoutAtomSFA = decltype(ScaleConfig::smem_atom_layoutSFA(TileShape{}));
     using SmemLayoutAtomSFB = decltype(ScaleConfig::smem_atom_layoutSFB(TileShape{}));
 
@@ -234,10 +227,10 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
       ),
       make_stride(
         _0{},
-        make_stride(_0{}, get<0>(stride(RealSmemLayoutSFB{}))),
+        stride<0>(SmemLayoutSFB{}),
         make_stride(
-          get<1>(stride(SmemLayoutSFB{})),
-          get<2>(stride(RealSmemLayoutSFB{})))
+          stride<1>(SmemLayoutSFB{}),
+          stride<2>(SmemLayoutSFB{}))
       )
     );
 
@@ -323,7 +316,6 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
       const auto base_tSFBgSFB_data = tSFBgSFB.data();  // valu copy iterator
       for (int n_iter = 0; n_iter < N_EXPAND; ++n_iter) {
         clear(accum);
-        int k_iter = 0;
         uint32_t blk_n_offset = (n_coord + n_iter) * BLOCK_N;
         k_tile_count = k_tile_count_reset;
         // PREFETCH register pipeline
