@@ -93,7 +93,7 @@ __device__ __forceinline__ void gemm1_swiglu_mma_block(
         __ppu_bfloat16* __restrict__ d_ptr,
         int ld_d, int valid_m, int M, int N, int K,
         int thread_idx, char* smem_buf, float swiglu_limit,
-        float swiglu_alpha, uint32_t* queue_counter = nullptr,
+        float activation_alpha, uint32_t* queue_counter = nullptr,
         uint32_t* next_ticket = nullptr, uint32_t* prefetched_work = nullptr) {
     using namespace cute;
     using CollectiveMainloop = typename Cfg::CollectiveMainloop;
@@ -202,9 +202,9 @@ __device__ __forceinline__ void gemm1_swiglu_mma_block(
                         // SwiGLU uses an FP32 gate/sigmoid product. M3 applies
                         // FP32 alpha and up bias after BF16 projection/clamp.
                         const float lhs0 = gf.x * deep_gemm::mega_moe::detail::moe_sigmoid<DG_MOE_FAST_MATH>(
-                            kSwiGLUOAI ? swiglu_alpha * gf.x : gf.x);
+                            kSwiGLUOAI ? activation_alpha * gf.x : gf.x);
                         const float lhs1 = gf.y * deep_gemm::mega_moe::detail::moe_sigmoid<DG_MOE_FAST_MATH>(
-                            kSwiGLUOAI ? swiglu_alpha * gf.y : gf.y);
+                            kSwiGLUOAI ? activation_alpha * gf.y : gf.y);
                         __ppu_bfloat16* out =
                             d_ptr + static_cast<uint64_t>(m_row) * ld_d
                             + compact_n;

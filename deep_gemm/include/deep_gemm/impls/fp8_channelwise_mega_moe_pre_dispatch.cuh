@@ -14,10 +14,10 @@ namespace deep_gemm::mega_moe::fp8_channelwise {
 // MegaMoE path. Quantization uses per-token absmax / 448.f followed by
 // the SDK's saturating round-to-nearest E4M3 conversion. The same CTA writes
 // quantized tokens, scales and router metadata directly to the staging buffer.
-template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t BLOCK_THREADS = 256>
+template <uint32_t HIDDEN, uint32_t TOP_K, uint32_t BLOCK_THREADS = 256, typename Index = int64_t>
 CUTLASS_DEVICE void fp8_mega_moe_pre_dispatch_kernel_device(
         const __ppu_bfloat16* __restrict__ hidden_states,
-        const int64_t* __restrict__ topk_ids,
+        const Index* __restrict__ topk_ids,
         const float* __restrict__ topk_weights,
         uint8_t* __restrict__ staged_tokens,
         float* __restrict__ staged_scales,

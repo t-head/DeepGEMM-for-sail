@@ -60,7 +60,7 @@ struct DispatchConfig {
     int num_topk = 0;
     int pull_slots = 0;
     int sf_bytes = 0;
-    float swiglu_alpha = 0;
+    float activation_alpha = 0;
     bool swiglu_oai = false;
     int token_bytes = 0;
     int w4_block_k = 0;
@@ -77,6 +77,7 @@ struct PreDispatchConfig {
     int hidden = 0;
     int num_ctas = 0;
     int num_topk = 0;
+    bool int32_indices = false;
 };
 
 struct ScatterConfig {

@@ -543,15 +543,19 @@ FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]` for channelwise
 or `[capacity,H/128]` for blockwise. W4A16 `x` is BF16 `[capacity,H]`, and
 `x_sf` is an empty `[capacity,0]` view. `mega_moe_pre_dispatch` fills these
 inputs and routes. FP8 also quantizes activated GEMM1 output to E4M3; W4A16
-keeps BF16 activated output. SiTU is fused into GEMM1 in both fused-dispatch
-and separate-dispatch execution. These backends use BF16 GEMM2 scatter and
+keeps BF16 activated output. SiTU is fused into GEMM1.
+These backends use BF16 GEMM2 scatter and
 the existing generation barrier/reduce for completion and counter recycling.
 
 The common compute arguments retain their names and meaning. Precision-specific
 entry points omit the MXFP4 `recipe`, since FP8 granularities are selected by
-the workspace and W4A16 does not quantize activations. SwiGLU-OAI adds
-keyword-only `swiglu_alpha=1.702`; W4A16 retains `situ_beta=4` and
-`situ_linear_beta=25`. FP8 clamps match SwiGLU above, including zero and
+the workspace and W4A16 does not quantize activations. SwiGLU-OAI uses
+keyword-only `activation_alpha=None` (effective default `1.702`); an explicit
+alpha is accepted only for OAI. W4A16 and W4A8 SiTU retain `situ_beta=4` and
+`situ_linear_beta=25`; `situ_linear_beta=None` disables the up softcap, while
+`situ_beta` must be positive and finite. All pre-dispatch paths accept int32
+or int64 routing IDs and store int64 IDs in the workspace.
+FP8 clamps match SwiGLU above, including zero and
 `+inf`; W4A16 SiTU requires no clamp. `fast_math` selects activation math only.
 
 #### Interfaces exposed but not yet implemented

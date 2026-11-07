@@ -619,7 +619,8 @@ public:
                         "SiTU accumulator groups must contain gate/up pairs.");
           const float inv_beta = deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(params.situ_beta);
           const float inv_linear_beta =
-              deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(params.situ_linear_beta);
+              params.situ_linear_beta > 0
+                  ? deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(params.situ_linear_beta) : 0.0f;
           CUTLASS_PRAGMA_UNROLL
           for (int group = 0; group < size(tDcD); group += 8) {
             CUTLASS_PRAGMA_UNROLL
@@ -648,10 +649,11 @@ public:
               const float gate_out1 = params.situ_beta
                   * deep_gemm::mega_moe::detail::moe_tanh<DG_MOE_FAST_MATH>(gate.y * inv_beta)
                   * deep_gemm::mega_moe::detail::moe_sigmoid<DG_MOE_FAST_MATH>(gate.y);
-              const float up_out0 = params.situ_linear_beta
-                  * deep_gemm::mega_moe::detail::moe_tanh<DG_MOE_FAST_MATH>(up.x * inv_linear_beta);
-              const float up_out1 = params.situ_linear_beta
-                  * deep_gemm::mega_moe::detail::moe_tanh<DG_MOE_FAST_MATH>(up.y * inv_linear_beta);
+              // Zero denotes an absent linear_beta, matching MegaMoE's optional up softcap.
+              const float up_out0 = params.situ_linear_beta > 0 ? params.situ_linear_beta
+                  * deep_gemm::mega_moe::detail::moe_tanh<DG_MOE_FAST_MATH>(up.x * inv_linear_beta) : up.x;
+              const float up_out1 = params.situ_linear_beta > 0 ? params.situ_linear_beta
+                  * deep_gemm::mega_moe::detail::moe_tanh<DG_MOE_FAST_MATH>(up.y * inv_linear_beta) : up.y;
 
               const uint32_t out_bits = deep_gemm::tix::cvt_rte_bf16x2_f32(gate_out1 * up_out1, gate_out0 * up_out0);
               const int64_t global_m =

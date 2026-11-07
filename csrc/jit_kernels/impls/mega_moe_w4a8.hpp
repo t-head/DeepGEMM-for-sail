@@ -65,7 +65,7 @@ void PPU_KERNEL_ENTRY(layout::SymBuffer<> sb, int tokens,
         reinterpret_cast<float*>(p({LAYOUT_OFF_PSF})), reinterpret_cast<int32_t*>(p({LAYOUT_OFF_GEMM2_META})), nullptr,
         reinterpret_cast<const cutlass::float_e4m3_t*>(w), reinterpret_cast<const float*>(s),
         reinterpret_cast<const cutlass::float_e4m3_t*>(rw), reinterpret_cast<const float*>(rs),
-        masters, out, limit, {SWIGLU_ALPHA}, tokens, {NMTPR}, inv, rinv, {SITU_BETA}, {SITU_LINEAR_BETA});
+        masters, out, limit, {ACTIVATION_ALPHA}, tokens, {NMTPR}, inv, rinv, {SITU_BETA}, {SITU_LINEAR_BETA});
 }
 )");
     w4a8_source_policy(source, kernel);
@@ -173,11 +173,11 @@ inline void fp8_fp4_mega_moe_impl(
     const torch::Tensor& y, const W4A8Weights& l1_weights, const W4A8Weights& l2_weights,
     const W4A8Weights& l1_weights_replicas, const W4A8Weights& l2_weights_replicas,
     const RoutedMoEWorkspace& buffer, int rank_idx, int num_tokens, const std::string& activation,
-    float activation_clamp, bool fast_math, float swiglu_alpha, float situ_beta, float situ_linear_beta,
+    float activation_clamp, bool fast_math, float activation_alpha, float situ_beta, float situ_linear_beta,
     const RoutedMoEConfigs& configs, const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats) {
     auto c = configs.dispatch;
     c.fast_math = fast_math; c.swiglu_oai = activation == "swiglu_oai";
-    c.swiglu_alpha = swiglu_alpha; c.activation_clamp = activation_clamp;
+    c.activation_alpha = activation_alpha; c.activation_clamp = activation_clamp;
     auto args = PPUW4A8MegaMoERuntime::Args{PPUW4A8MegaMoERuntime::KernelPhase::Linear1,
         buffer, y, c, configs.w4a8_gemm1, configs.w4a8_scatter,
         l1_weights, l2_weights, l1_weights_replicas, l2_weights_replicas,

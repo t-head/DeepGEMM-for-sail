@@ -249,8 +249,7 @@ def mega_moe_pre_dispatch(
 ) -> None:
     """Prepare BF16 inputs and routes for the selected precision workspace.
 
-    W4A4 expert IDs can be int32 or int64; the other precisions require int64.
-    The workspace stores IDs as int64.
+    Expert IDs can be int32 or int64. The workspace stores IDs as int64.
     Valid physical expert IDs must be distinct within each token.
     W4A4 SFA is produced and pushed directly into internal owner staging; x_sf is not
     a public source-scale input, and callers must use this helper to prepare it.
@@ -472,13 +471,14 @@ def fp8_fp8_mega_moe(
     *,
     l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    swiglu_alpha: float = 1.702,
+    activation_alpha: Optional[float] = None,
 ) -> None:
     """Complete FP8 MoE; scales follow sym_buffer.quantization, output is BF16.
 
     Original routing weights are applied exactly once in combine. The C++
     implementation runs dispatch, GEMM1/activation/quantization, GEMM2/scatter,
     and completion. Master and replica tensors may be separate allocations.
+    activation_alpha follows fp4_fp4_mega_moe: OAI-only, with None using 1.702.
     """
     if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'fp8xfp8':
         raise TypeError("fp8_fp8_mega_moe requires SymmBuffer(mma_type='fp8xfp8')")
@@ -487,8 +487,8 @@ def fp8_fp8_mega_moe(
         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
-        sym_buffer.quantization, activation, activation_clamp, fast_math,
-        l1_weights_replicas, l2_weights_replicas, swiglu_alpha,
+        activation, activation_clamp, fast_math, activation_alpha,
+        l1_weights_replicas, l2_weights_replicas, sym_buffer.quantization,
     )
 
 
@@ -504,10 +504,14 @@ def bf16_fp4_mega_moe(
     *,
     l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    situ_beta: float = 4.0,
-    situ_linear_beta: float = 25.0,
+    situ_beta: Optional[float] = 4.0,
+    situ_linear_beta: Optional[float] = 25.0,
 ) -> None:
-    """Complete BF16 x MXFP4 SiTU MoE with BF16 output in original token order."""
+    """Complete BF16 x MXFP4 SiTU MoE with BF16 output in original token order.
+
+    SiTU parameters follow fp4_fp4_mega_moe; situ_linear_beta=None disables
+    the up-branch softcap. situ_beta must be positive and finite.
+    """
     if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'bf16xmxfp4':
         raise TypeError("bf16_fp4_mega_moe requires SymmBuffer(mma_type='bf16xmxfp4')")
     _check_routed_buffer(y, l1_weights, sym_buffer, activation)
@@ -515,8 +519,8 @@ def bf16_fp4_mega_moe(
         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
-        activation, activation_clamp, fast_math, l1_weights_replicas, l2_weights_replicas,
-        situ_beta, situ_linear_beta,
+        activation, activation_clamp, fast_math, situ_beta, situ_linear_beta,
+        l1_weights_replicas, l2_weights_replicas,
     )
 
 
@@ -551,17 +555,24 @@ def fp8_fp4_mega_moe(
     *,
     l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None,
     l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None,
-    swiglu_alpha: float = 1.702,
-    situ_beta: float = 4.0,
-    situ_linear_beta: float = 25.0,
+    situ_beta: Optional[float] = 4.0,
+    situ_linear_beta: Optional[float] = 25.0,
+    activation_alpha: Optional[float] = None,
 ) -> None:
-    """Complete E4M3 x MXFP4 MoE, applying routing weights once in combine."""
+    """Complete E4M3 x MXFP4 MoE, applying routing weights once in combine.
+
+    SiTU and OAI parameters follow fp4_fp4_mega_moe. situ_linear_beta=None
+    disables the up softcap; activation_alpha applies only to OAI.
+    """
     if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'fp8xmxfp4':
         raise TypeError("fp8_fp4_mega_moe requires SymmBuffer(mma_type='fp8xmxfp4')")
     _check_routed_buffer(y, l1_weights, sym_buffer, activation, weight_components=3)
+    if activation != 'situ':
+        situ_beta = None if situ_beta == 4.0 else situ_beta
+        situ_linear_beta = None if situ_linear_beta == 25.0 else situ_linear_beta
     _C.fp8_fp4_mega_moe(
         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
-        activation, activation_clamp, fast_math, l1_weights_replicas, l2_weights_replicas,
-        swiglu_alpha, situ_beta, situ_linear_beta)
+        activation, activation_clamp, fast_math, situ_beta, situ_linear_beta, activation_alpha,
+        l1_weights_replicas, l2_weights_replicas)

@@ -164,7 +164,7 @@ inline void PPUFP8MegaMoERuntime::compile_and_launch(const std::string& tag, con
             fp8_blockwise_mega_moe_dispatch_gemm1_kernel(
                 config, buffer.sym_buffer, buffer.dispatched_tokens, args.rank_idx, args.num_tokens,
                 l1_weights, l1_weights_sf, buffer.l2_acts, buffer.l2_acts_sf,
-                config.activation_clamp, config.swiglu_alpha, l1_weights_replicas, l1_weights_replicas_sf, tag);
+                config.activation_clamp, config.activation_alpha, l1_weights_replicas, l1_weights_replicas_sf, tag);
         } else {
             fp8_channelwise_mega_moe_dispatch_gemm1_kernel(
                 config, buffer.sym_buffer, args.rank_idx, args.num_tokens, l1_weights, l1_weights_sf,
@@ -227,12 +227,12 @@ inline void fp8_fp8_mega_moe_impl(
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_replicas,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_replicas,
     const RoutedMoEWorkspace& sym_buffer, int rank_idx, int num_tokens,
-    const std::string& activation, float activation_clamp, bool fast_math, float swiglu_alpha,
+    const std::string& activation, float activation_clamp, bool fast_math, float activation_alpha,
     const RoutedMoEConfigs& configs, Precision precision,
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats) {
     auto config = configs.dispatch;
     config.swiglu_oai = activation == "swiglu_oai";
-    config.swiglu_alpha = swiglu_alpha;
+    config.activation_alpha = activation_alpha;
     config.activation_clamp = activation_clamp;
     config.fast_math = fast_math;
     const auto args = PPUFP8MegaMoERuntime::Args{

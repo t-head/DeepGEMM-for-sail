@@ -5,9 +5,9 @@
 
 namespace deep_gemm::mega_moe::fp8_blockwise {
 
-template <int kHidden, int kTopk>
+template <int kHidden, int kTopk, typename Index = int64_t>
 CUTLASS_DEVICE void pre_dispatch_kernel_device(
-        const __ppu_bfloat16* input, const int64_t* ids, const float* weights,
+        const __ppu_bfloat16* input, const Index* ids, const float* weights,
         __hg_fp8_e4m3* output, float* scales,
         int64_t* output_ids, float* output_weights, int num_tokens) {
     static_assert(kHidden % kGroupK == 0);

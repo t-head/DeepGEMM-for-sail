@@ -66,8 +66,8 @@ struct Gemm1 {
                             if constexpr (SiTU) {
                                 const float soft_gate = situ_beta *
                                     detail::moe_tanh<DG_MOE_FAST_MATH>(gate * detail::moe_reciprocal<DG_MOE_FAST_MATH>(situ_beta));
-                                const float soft_up = situ_linear_beta *
-                                    detail::moe_tanh<DG_MOE_FAST_MATH>(up * detail::moe_reciprocal<DG_MOE_FAST_MATH>(situ_linear_beta));
+                                const float soft_up = situ_linear_beta > 0 ? situ_linear_beta *
+                                    detail::moe_tanh<DG_MOE_FAST_MATH>(up * detail::moe_reciprocal<DG_MOE_FAST_MATH>(situ_linear_beta)) : up;
                                 value = soft_gate * detail::moe_sigmoid<DG_MOE_FAST_MATH>(gate) * soft_up;
                             } else {
                                 if (limit >= 0) {

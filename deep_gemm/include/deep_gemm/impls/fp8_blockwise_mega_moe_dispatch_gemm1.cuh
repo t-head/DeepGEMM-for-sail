@@ -46,7 +46,7 @@ template <int kN, int kNumThreads, bool kClamp, bool kSwigluOai, class Accum, cl
 __device__ __forceinline__ void swiglu_quant_epilogue(
         Accum& accum, const Coordinates& coords, uint8_t* output, float* scales,
         int pool_rows, int valid_rows, int n_block, int thread, char* smem,
-        float swiglu_limit, float swiglu_alpha, int writable_rows) {
+        float swiglu_limit, float activation_alpha, int writable_rows) {
     using namespace cute;
     // One FP32 word of padding avoids subwarp shared-memory bank aliasing.
     constexpr int kStride = 258;
@@ -97,12 +97,12 @@ __device__ __forceinline__ void swiglu_quant_epilogue(
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 150
                     // Honor fast_math without changing the BF16 rounding boundaries.
                     activated = make_float2(
-                        (g.x * deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-swiglu_alpha * g.x))) * (u.x + 1.0f),
-                        (g.y * deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-swiglu_alpha * g.y))) * (u.y + 1.0f));
+                        (g.x * deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-activation_alpha * g.x))) * (u.x + 1.0f),
+                        (g.y * deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-activation_alpha * g.y))) * (u.y + 1.0f));
 #else
                     activated = make_float2(
-                        (g.x / (1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-swiglu_alpha * g.x))) * (u.x + 1.0f),
-                        (g.y / (1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-swiglu_alpha * g.y))) * (u.y + 1.0f));
+                        (g.x / (1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-activation_alpha * g.x))) * (u.x + 1.0f),
+                        (g.y / (1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-activation_alpha * g.y))) * (u.y + 1.0f));
 #endif
                 } else {
                     activated = make_float2(
@@ -136,7 +136,7 @@ template <int kN, int kK, bool kClamp, bool kSwigluOai = false, int kComputeM = 
 __device__ __forceinline__ void gemm1_block(
         const uint8_t* a, const float* sa, const uint8_t* b, const float* sb,
         uint8_t* output, float* output_scales, int pool_rows, int valid_rows, int n_block,
-        int thread, char* smem, float swiglu_limit, float swiglu_alpha, int writable_rows) {
+        int thread, char* smem, float swiglu_limit, float activation_alpha, int writable_rows) {
     using namespace cute;
     using G = Gemm1<kN, kK, kComputeM>;
     using Mainloop = typename G::CollectiveMainloop;
@@ -167,7 +167,7 @@ __device__ __forceinline__ void gemm1_block(
     auto t_coord = mma.get_thread_slice(thread).partition_C(c_tile);
     static_assert(kComputeM * 258 * sizeof(__ppu_bfloat16) <= sizeof(typename Mainloop::SharedStorage));
     swiglu_quant_epilogue<kN, G::kNumThreads, kClamp, kSwigluOai>(accum, t_coord, output,
-        output_scales, pool_rows, valid_rows, n_block, thread, smem, swiglu_limit, swiglu_alpha, writable_rows);
+        output_scales, pool_rows, valid_rows, n_block, thread, smem, swiglu_limit, activation_alpha, writable_rows);
 }
 
 template <uint32_t kRanks, uint32_t kCTAs, uint32_t kExperts,
@@ -181,7 +181,7 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
         const float* scales, uint8_t* pool, float* pool_scales,
         int32_t* gemm2_metadata, const uint8_t* w1, const float* s1,
         uint8_t* output, float* output_scales,
-        uint32_t num_tokens, uint32_t cap, float swiglu_limit = 0.0f, float swiglu_alpha = 1.0f,
+        uint32_t num_tokens, uint32_t cap, float swiglu_limit = 0.0f, float activation_alpha = 1.0f,
         const uint8_t* w1_replicas = nullptr, const float* s1_replicas = nullptr) {
     static_assert(kRanks > 0 && kRanks <= 64 && kExperts % kRanks == 0);
     constexpr uint32_t kEpr = kExperts / kRanks;
@@ -319,7 +319,7 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
                 scale_base + uint64_t(weight_expert) * (kN / 128) * kScales,
                 tile_output, output_scales + base,
                 ws.num_max_pool_tokens, valid, n, thread, reinterpret_cast<char*>(smem),
-                swiglu_limit, swiglu_alpha, writable);
+                swiglu_limit, activation_alpha, writable);
             if (++work == batch_end) {
                 queue.prime(thread, kWorkBatch);
                 work = queue.current();

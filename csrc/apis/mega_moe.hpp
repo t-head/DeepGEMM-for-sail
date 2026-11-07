@@ -420,7 +420,9 @@ static void fp8_w4a16_mega_moe_pre_dispatch_checked(const Tensor& hidden_states,
                                          const std::optional<int>& requested_num_tokens) {
     check_device();
     check_tensor(hidden_states, torch::kBFloat16);
-    check_tensor(topk_idx, torch::kInt64);
+    TORCH_CHECK(topk_idx.scalar_type() == torch::kInt32 || topk_idx.scalar_type() == torch::kInt64,
+                "topk_idx must be contiguous int32 or int64");
+    check_tensor(topk_idx, topk_idx.scalar_type());
     check_tensor(topk_weights, torch::kFloat32);
     TORCH_CHECK(hidden_states.dim() == 2 && x.dim() == 2 && topk_idx.dim() == 2 && x_sf.dim() == 2 &&
                     staged_topk_idx.dim() == 2 && staged_topk_weights.dim() == 2,
@@ -472,27 +474,54 @@ static void routed_mega_moe_pre_dispatch(
                                            staged_topk_idx, staged_topk_weights, num_tokens);
 }
 
+struct RoutedActivationParams {
+    float alpha, beta, linear_beta;
+};
+
+static RoutedActivationParams check_routed_activation(
+    const std::string& activation, const std::optional<float>& activation_clamp_opt,
+    const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
+    const std::optional<float>& activation_alpha_opt) {
+    TORCH_CHECK(!activation_clamp_opt || (!std::isnan(*activation_clamp_opt) && *activation_clamp_opt >= 0),
+                "activation_clamp must be nonnegative or None");
+    const float alpha = activation_alpha_opt.value_or(1.702f);
+    if (activation == "swiglu_oai") {
+        TORCH_CHECK(std::isfinite(alpha) && alpha > 0, "activation_alpha must be positive and finite");
+    } else {
+        TORCH_CHECK(!activation_alpha_opt, "activation_alpha applies only to swiglu_oai");
+    }
+    const float beta = situ_beta_opt.value_or(0.0f);
+    const float linear_beta = situ_linear_beta_opt.value_or(0.0f);
+    if (activation == "situ") {
+        TORCH_CHECK(!activation_clamp_opt, "SiTU does not support activation_clamp");
+        TORCH_CHECK(std::isfinite(beta) && beta > 0, "situ_beta must be positive and finite");
+        TORCH_CHECK(!situ_linear_beta_opt || (std::isfinite(linear_beta) && linear_beta > 0),
+                    "situ_linear_beta must be positive and finite or None");
+    } else {
+        TORCH_CHECK(!situ_beta_opt && !situ_linear_beta_opt, "SiTU parameters apply only to situ");
+    }
+    return {alpha, beta, linear_beta};
+}
+
 template <bool kFp8>
 static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, const WeightPair& l2_weights,
                             const OptTensor& cumulative_local_expert_recv_stats, const Tensor& sym_buffer,
                             const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx, const int& num_max_tokens_per_rank,
                             const int& num_experts, const int& num_topk, const std::string& precision,
                             const std::string& activation, const std::optional<float>& activation_clamp_opt,
-                            const bool& fast_math, const std::optional<WeightPair>& l1_weights_replicas,
-                            const std::optional<WeightPair>& l2_weights_replicas, const float& swiglu_alpha,
-                            const float& situ_beta, const float& situ_linear_beta) {
+                            const bool& fast_math, const std::optional<float>& situ_beta_opt,
+                            const std::optional<float>& situ_linear_beta_opt,
+                            const std::optional<float>& activation_alpha_opt,
+                            const std::optional<WeightPair>& l1_weights_replicas,
+                            const std::optional<WeightPair>& l2_weights_replicas) {
     check_device();
     const auto kind = routed_precision(precision);
     const bool fp8 = precision != "w4a16", blockwise = precision == "fp8_blockwise";
     TORCH_CHECK(fp8 == kFp8, "Compute entry does not match workspace precision");
     TORCH_CHECK(fp8 ? (activation == "swiglu" || activation == "swiglu_oai") : activation == "situ",
                 "Unsupported activation for ", precision);
-    TORCH_CHECK(!activation_clamp_opt || (!std::isnan(*activation_clamp_opt) && *activation_clamp_opt >= 0),
-                "activation_clamp must be nonnegative or None");
-    TORCH_CHECK(fp8 || !activation_clamp_opt, "W4A16 SiTU does not support activation_clamp");
-    TORCH_CHECK(std::isfinite(swiglu_alpha) && swiglu_alpha > 0 && std::isfinite(situ_beta) && situ_beta > 0 &&
-                    std::isfinite(situ_linear_beta) && situ_linear_beta > 0,
-                "Invalid activation coefficients");
+    const auto activation_params = check_routed_activation(
+        activation, activation_clamp_opt, situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt);
     check_tensor(y, torch::kBFloat16);
     TORCH_CHECK(y.dim() == 2, "output must be [num_tokens, hidden]");
     const auto& [w1, s1] = l1_weights;
@@ -550,11 +579,11 @@ static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, cons
         mega_moe_fp8_w4a16::fp8_fp8_mega_moe_impl(
             y, l1_weights, l2_weights, l1_replicas, l2_replicas, workspace, rank_idx, num_tokens,
             activation, activation_clamp_opt && std::isfinite(*activation_clamp_opt) ? *activation_clamp_opt : -1.0f,
-            fast_math, swiglu_alpha, configs, kind, cumulative_local_expert_recv_stats);
+            fast_math, activation_params.alpha, configs, kind, cumulative_local_expert_recv_stats);
     } else {
         mega_moe_fp8_w4a16::bf16_fp4_mega_moe_impl(
             y, l1_weights, l2_weights, l1_replicas, l2_replicas, workspace, rank_idx, num_tokens,
-            fast_math, situ_beta, situ_linear_beta, configs, cumulative_local_expert_recv_stats);
+            fast_math, activation_params.beta, activation_params.linear_beta, configs, cumulative_local_expert_recv_stats);
     }
 }
 
@@ -562,15 +591,16 @@ void fp8_fp8_mega_moe(
     const Tensor& y, const WeightPair& l1_weights_tuple, const WeightPair& l2_weights_tuple,
     const OptTensor& cumulative_local_expert_recv_stats, const Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx, const int& num_max_tokens_per_rank,
-    const int& num_experts, const int& num_topk, const std::string& quantization,
+    const int& num_experts, const int& num_topk,
     const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
+    const std::optional<float>& activation_alpha_opt,
     const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas,
-    const float& swiglu_alpha) {
+    const std::string& quantization) {
     checked_mega_moe<true>(
         y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats, sym_buffer,
         sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank, num_experts, num_topk,
         fp8_mega_moe_precision(quantization), activation, activation_clamp_opt, fast_math,
-        l1_weights_replicas, l2_weights_replicas, swiglu_alpha, 4.0f, 25.0f);
+        std::nullopt, std::nullopt, activation_alpha_opt, l1_weights_replicas, l2_weights_replicas);
 }
 
 void bf16_fp4_mega_moe(
@@ -579,13 +609,13 @@ void bf16_fp4_mega_moe(
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk,
     const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
-    const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas,
-    const float& situ_beta, const float& situ_linear_beta) {
+    const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
+    const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas) {
     checked_mega_moe<false>(
         y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats, sym_buffer,
         sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank, num_experts, num_topk, "w4a16",
-        activation, activation_clamp_opt, fast_math, l1_weights_replicas, l2_weights_replicas,
-        1.702f, situ_beta, situ_linear_beta);
+        activation, activation_clamp_opt, fast_math, situ_beta_opt, situ_linear_beta_opt, std::nullopt,
+        l1_weights_replicas, l2_weights_replicas);
 }
 
 using W4A8Weights = mega_moe_w4a8::W4A8Weights;
@@ -596,16 +626,14 @@ void fp8_fp4_mega_moe(
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk,
     const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
-    const std::optional<W4A8Weights>& l1_weights_replicas, const std::optional<W4A8Weights>& l2_weights_replicas,
-    const float& swiglu_alpha, const float& situ_beta, const float& situ_linear_beta) {
+    const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
+    const std::optional<float>& activation_alpha_opt,
+    const std::optional<W4A8Weights>& l1_weights_replicas, const std::optional<W4A8Weights>& l2_weights_replicas) {
     check_device();
     TORCH_CHECK(activation == "swiglu" || activation == "swiglu_oai" || activation == "situ",
                 "W4A8 supports swiglu, swiglu_oai and situ");
-    TORCH_CHECK(!activation_clamp_opt || (!std::isnan(*activation_clamp_opt) && *activation_clamp_opt >= 0),
-                "activation_clamp must be nonnegative or None");
-    TORCH_CHECK(activation != "situ" || !activation_clamp_opt, "SiTU does not support activation_clamp");
-    TORCH_CHECK(std::isfinite(swiglu_alpha) && swiglu_alpha > 0 && std::isfinite(situ_beta) && situ_beta > 0 &&
-                    std::isfinite(situ_linear_beta) && situ_linear_beta > 0, "Invalid activation coefficients");
+    const auto activation_params = check_routed_activation(
+        activation, activation_clamp_opt, situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt);
     check_tensor(y, torch::kBFloat16);
     TORCH_CHECK(y.dim() == 2 && std::get<0>(l1_weights_tuple).dim() == 3, "Invalid output or GEMM1 weight rank");
     const int hidden = y.size(1), intermediate = std::get<0>(l1_weights_tuple).size(1) / 2;
@@ -652,7 +680,8 @@ void fp8_fp4_mega_moe(
         l1_weights_replicas ? *l1_weights_replicas : l1_weights_tuple,
         l2_weights_replicas ? *l2_weights_replicas : l2_weights_tuple, workspace, rank_idx, tokens, activation,
         activation_clamp_opt && std::isfinite(*activation_clamp_opt) ? *activation_clamp_opt : -1.0f,
-        fast_math, swiglu_alpha, situ_beta, situ_linear_beta, configs, cumulative_local_expert_recv_stats);
+        fast_math, activation_params.alpha, activation_params.beta, activation_params.linear_beta,
+        configs, cumulative_local_expert_recv_stats);
 }
 
 static void register_apis(pybind11::module_& m) {

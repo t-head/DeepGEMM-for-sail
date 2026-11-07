@@ -171,7 +171,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         const uint32_t num_master_experts,
         __ppu_bfloat16* __restrict__ swiglu_output,
         const float swiglu_limit,
-        const float swiglu_alpha,
+        const float activation_alpha,
         const uint32_t num_tokens,
         const uint32_t num_max_tokens_per_rank,
         const float weight_inv_scale = 1.0f, const float replica_inv_scale = 1.0f,
@@ -434,7 +434,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                         + (uint64_t(weight_expert) * kGemm1N + n_block * kBlockN) * (kTokenBytes / 32),
                     swiglu_output + uint64_t(pool_base) * (kGemm1N / 2) + n_block * (kBlockN / 2),
                     kGemm1N / 2, valid_m, reinterpret_cast<char*>(smem_buf),
-                    swiglu_limit, swiglu_alpha, use_replica ? replica_inv_scale : weight_inv_scale,
+                    swiglu_limit, activation_alpha, use_replica ? replica_inv_scale : weight_inv_scale,
                     situ_beta, situ_linear_beta,
                     queue_counter, &queue_ticket);
                 prefetched_work = queue.current();
@@ -461,7 +461,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                     static_cast<int>(kTokenBytes),
                     static_cast<int>(thread_idx),
                     reinterpret_cast<char*>(smem_buf),
-                    swiglu_limit, swiglu_alpha,
+                    swiglu_limit, activation_alpha,
                     queue_counter, &queue_ticket, &prefetched_work);
             }
         }

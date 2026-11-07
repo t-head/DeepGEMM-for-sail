@@ -168,15 +168,14 @@ def reference(c, source, ids, weights, w1, w2, rank, tokens, *, situ_beta=4.0, s
             continue
         gate, up = (source[src, row].float() @ w1[local_expert].float().T).bfloat16().float().chunk(2, -1)
         if c.activation == "situ":
-            activated = (situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
-                         * situ_linear_beta * torch.tanh(up / situ_linear_beta))
+            soft_up = up if situ_linear_beta is None else situ_linear_beta * torch.tanh(up / situ_linear_beta)
+            activated = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate) * soft_up
         else:
             if c.clamp is not None:
                 gate = gate.clamp(max=c.clamp)
                 up = up.clamp(-c.clamp, c.clamp)
-            activated = (
-                (gate * torch.sigmoid(1.702 * gate)) * (up + 1) if c.activation == "swiglu_oai" else F.silu(gate) * up
-            )
+            alpha = 1.702 if c.activation_alpha is None else c.activation_alpha
+            activated = (gate * torch.sigmoid(alpha * gate)) * (up + 1) if c.activation == "swiglu_oai" else F.silu(gate) * up
         activated = activated.bfloat16()
         if c.precision != "w4a16":
             q, s = quantize_rows(activated, blockwise)
@@ -212,6 +211,8 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
         group, c.experts, c.capacity, c.topk, c.hidden, c.intermediate,
         mma_type=mma_type, quantization=quantization, activation=c.activation)
     options = dict(activation=c.activation, activation_clamp=c.clamp, fast_math=fast_math)
+    if c.activation == "swiglu_oai":
+        options["activation_alpha"] = c.activation_alpha
     if replicas:
         assert e >= 2
         if c.precision == "w4a8":
@@ -254,7 +255,8 @@ def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None)
     try:
         for iteration, requested in enumerate(c.tokens):
             tokens = 0 if world > 1 and rank == world - 1 and iteration == 1 else requested
-            ids = torch.full((c.capacity, c.topk), -1, device="cuda", dtype=torch.int64)
+            ids = torch.full((c.capacity, c.topk), -1, device="cuda",
+                             dtype=torch.int32 if iteration % 2 else torch.int64)
             routes = _make_routes(c, tokens, rng)
             ids[:tokens] = routes
             weights = torch.rand((c.capacity, c.topk), device="cuda", generator=rng)
@@ -362,45 +364,50 @@ def test_mega_moe_w4a8_complete_tiles(mega_moe_group):
                          tokens=(1, 33, 0, 129, 8)), mega_moe_group)
 
 
-def test_mega_moe_w4a8_activation_reuse(mega_moe_group):
+@pytest.mark.parametrize("case", tuple(c for c in SMOKE_CASES if c.activation == "situ"), ids=lambda c: c.name)
+@pytest.mark.parametrize("fast_math", (True, False))
+def test_mega_moe_situ_reuse(case, fast_math, mega_moe_group):
     # Keep geometry and weights fixed so only source-specialized activation
     # parameters distinguish the generated kernels within this process.
-    case = next(c for c in SMOKE_CASES if c.name == "smoke_w4a8_situ")
     rng = torch.Generator(device="cuda").manual_seed(20261106 + mega_moe_group.rank())
-    pipeline = make_pipeline(case, mega_moe_group, rng, fast_math=False)
+    max_diff = .0015 if case.precision == "w4a8" else .001
+    pipeline = make_pipeline(case, mega_moe_group, rng, fast_math=fast_math)
     swiglu_buffer = dg.SymmBuffer(
         mega_moe_group, case.experts, case.capacity, case.topk, case.hidden, case.intermediate,
-        mma_type="fp8xmxfp4", activation="swiglu")
+        mma_type="fp8xmxfp4", activation="swiglu") if case.precision == "w4a8" else None
     source = torch.randn(33, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .5
     ids = _make_routes(case, source.size(0), rng)
     weights = torch.rand(33, case.topk, device="cuda", generator=rng).softmax(-1)
     y = torch.empty_like(source)
     try:
         all_source, all_ids, all_weights = _all_gather(source), _all_gather(ids), _all_gather(weights)
-        for activation, beta, linear_beta in (("situ", 4., 25.), ("situ", .25, 25.),
-                                               ("situ", .25, .25), ("swiglu", 4., 25.),
-                                               ("situ", 4., 25.)):
+        configurations = [("situ", 4., 25.), ("situ", .25, 25.), ("situ", .25, .25),
+                          ("situ", .25, None), ("situ", 4., 25.)]
+        if swiglu_buffer is not None:
+            configurations.insert(-1, ("swiglu", 4., 25.))
+        for activation, beta, linear_beta in configurations:
             buffer = swiglu_buffer if activation == "swiglu" else pipeline.buffer
 
             def forward():
                 dg.mega_moe_pre_dispatch(source, ids, weights, buffer)
                 pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, buffer,
-                               activation=activation, fast_math=False,
+                               activation=activation, fast_math=fast_math,
                                situ_beta=beta, situ_linear_beta=linear_beta)
 
             forward()
             expected = reference(replace(case, activation=activation), all_source, all_ids, all_weights,
                                  pipeline.ref1, pipeline.ref2, mega_moe_group.rank(), source.size(0),
                                  situ_beta=beta, situ_linear_beta=linear_beta)
-            check_output(y, expected, .0015)
+            check_output(y, expected, max_diff)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 forward()
             graph.replay()
             torch.cuda.synchronize()
-            check_output(y, expected, .0015)
+            check_output(y, expected, max_diff)
     finally:
-        swiglu_buffer.destroy()
+        if swiglu_buffer is not None:
+            swiglu_buffer.destroy()
         pipeline.buffer.destroy()
 
 
@@ -408,7 +415,7 @@ def test_mega_moe_w4a8_activation_reuse(mega_moe_group):
 @pytest.mark.parametrize("clamp", (0.0, 0.125))
 @pytest.mark.parametrize("fast_math", (True, False))
 def test_mega_moe_fp8_oai(case, clamp, fast_math, mega_moe_group):
-    run_case(replace(case, tokens=(1, 33), activation="swiglu_oai", clamp=clamp),
+    run_case(replace(case, tokens=(1, 33), activation="swiglu_oai", clamp=clamp, activation_alpha=.25),
              mega_moe_group, fast_math=fast_math)
 
 
@@ -440,9 +447,38 @@ def test_mega_moe_precision_api(case, mega_moe_group):
     source = torch.randn(33, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .1
     ids = _make_routes(case, 1, rng)
     weights = torch.ones(1, case.topk, device="cuda")
+    ids[0, 0], weights[0, 0] = -1, float("nan")
     y = torch.empty_like(source[:1])
     try:
         expected = pipeline.forward(source[:1], ids, weights, y).clone()
+        for dtype in (torch.int32, torch.int64):
+            typed_ids = ids.to(dtype)
+            dg.mega_moe_pre_dispatch(source[:1], typed_ids, weights, pipeline.buffer)
+            assert pipeline.buffer.topk_idx.dtype == torch.int64
+            torch.testing.assert_close(pipeline.buffer.topk_idx[:1], ids, rtol=0, atol=0)
+            pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, pipeline.buffer, **pipeline.options)
+            torch.testing.assert_close(y, expected, rtol=0, atol=0)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                pipeline.forward(source[:1], typed_ids, weights, y)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(y, expected, rtol=0, atol=0)
+        with pytest.raises(RuntimeError, match="int32 or int64"):
+            dg.mega_moe_pre_dispatch(source[:1], ids.float(), weights, pipeline.buffer)
+        if case.activation == "situ":
+            for invalid in (None, 0., -1., float("nan"), float("inf")):
+                with pytest.raises(RuntimeError, match="situ_beta"):
+                    pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, pipeline.buffer,
+                                   **pipeline.options, situ_beta=invalid)
+            for invalid in (0., -1., float("nan"), float("inf")):
+                with pytest.raises(RuntimeError, match="situ_linear_beta"):
+                    pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, pipeline.buffer,
+                                   **pipeline.options, situ_linear_beta=invalid)
+        if case.precision != "w4a16":
+            with pytest.raises(RuntimeError, match="activation_alpha"):
+                pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, pipeline.buffer,
+                               **pipeline.options, activation_alpha=.25)
         alias = dg.SymmBuffer(
             mega_moe_group, case.experts, case.capacity, case.topk, case.hidden, case.intermediate,
             mma_type=pipeline.buffer.mma_type, quantization=pipeline.buffer.quantization,
