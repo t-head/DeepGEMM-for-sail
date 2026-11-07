@@ -52,17 +52,17 @@ extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes =
 extern "C" __global__ __launch_bounds__({NUM_THREADS}, 1)
 void PPU_KERNEL_ENTRY(layout::SymBuffer<> sb, int tokens,
     const uint8_t* w, const uint8_t* s, float inv, const uint8_t* rw, const uint8_t* rs, float rinv,
-    int masters, __ppu_bfloat16* out, float limit) {
+    int masters, __ppu_bfloat16* out, float limit, uint4* gemm2_block_info) {
     auto p = [&](int64_t off) { return reinterpret_cast<uint8_t*>(sb.base + off); };
     mega_moe::fp8_channelwise::dispatch_gemm1_device<
         {NUM_RANKS}, {NUM_CTAS}, {NUM_THREADS}, {NUM_EXPERTS}, {NUM_EXPERTS_PER_RANK},
         {NUM_TOPK}, {BLOCK_M}, {TOKEN_BYTES}, {GEMM1_N}, {GEMM1_BLOCK_N},
         128, {GEMM1_WARP_M}, {GEMM1_WARP_N}, {GEMM1_STAGES}, {PULL_CTAS}, {SWIGLU_OAI}, Backend,
-        {PULL_GROUP_SIZE}>(
+        {PULL_GROUP_SIZE}, {GEMM2_BLOCK_M}, {GEMM2_VALID_ROWS}>(
         p(0), sb, reinterpret_cast<int64_t*>(p({LAYOUT_OFF_ITI})),
         p({LAYOUT_OFF_IT}),
         reinterpret_cast<float*>(p({LAYOUT_OFF_ISF})), p({LAYOUT_OFF_PT}),
-        reinterpret_cast<float*>(p({LAYOUT_OFF_PSF})), reinterpret_cast<int32_t*>(p({LAYOUT_OFF_GEMM2_META})), nullptr,
+        reinterpret_cast<float*>(p({LAYOUT_OFF_PSF})), reinterpret_cast<int32_t*>(p({LAYOUT_OFF_GEMM2_META})), gemm2_block_info,
         reinterpret_cast<const cutlass::float_e4m3_t*>(w), reinterpret_cast<const float*>(s),
         reinterpret_cast<const cutlass::float_e4m3_t*>(rw), reinterpret_cast<const float*>(rs),
         masters, out, limit, {ACTIVATION_ALPHA}, tokens, {NMTPR}, inv, rinv, {SITU_BETA}, {SITU_LINEAR_BETA});
@@ -77,7 +77,7 @@ void PPU_KERNEL_ENTRY(layout::SymBuffer<> sb, int tokens,
     launch<W4A8DispatchTag>(name, source, c,
         std::make_tuple(buffer.sym_buffer, int32_t(num_tokens), w.data_ptr(), s.data_ptr(), inv,
                         rw.data_ptr(), rs.data_ptr(), rinv, int32_t(w.size(0)),
-                        buffer.bf16_scratch.data_ptr(), c.activation_clamp),
+                        buffer.bf16_scratch.data_ptr(), c.activation_clamp, device_pointer(buffer.block_info)),
         dim3(c.num_ctas), c.num_threads, false, true);
 }
 
@@ -87,7 +87,7 @@ inline void w4a8_scatter_impl(const w4fa8::NativeKernelConfig& kernel, const Rou
     const auto& tile = kernel.tile;
     const auto& [w, s, inv] = weights;
     const auto& [rw, rs, rinv] = replicas;
-    auto* rows = prepare_scatter_layout(groups, tile.block_m, buffer.m_rows, buffer.block_info);
+    auto* rows = scatter_layout(groups, buffer.m_rows, buffer.block_info);
     ScatterConfig c;
     c.num_ranks = num_ranks;
     c.n = w.size(1); c.k = buffer.l2_acts.size(1); c.num_groups = groups;

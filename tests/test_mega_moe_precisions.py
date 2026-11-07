@@ -354,13 +354,16 @@ def test_mega_moe_w4a16_complete_tiles(mega_moe_group):
     run_case(replace(CASES[2], hidden=768, tokens=(96, 33, 0, 8)), mega_moe_group)
 
 
-def test_mega_moe_w4a8_complete_tiles(mega_moe_group):
+@pytest.mark.parametrize("case", tuple(c for c in SMOKE_CASES if c.activation == "swiglu"), ids=lambda c: c.name)
+def test_mega_moe_precision_complete_tiles(case, mega_moe_group):
     # Widths of one and three full scatter vectors, plus the block-info
     # scheduler at its 128-local-expert transition. Reuse the public workspace.
-    base = next(c for c in SMOKE_CASES if c.name == "smoke_w4a8")
     for hidden, intermediate in ((256, 128), (768, 384)):
-        run_case(replace(base, hidden=hidden, intermediate=intermediate,
+        # The concentrated routes create multiple tiles for hot experts and
+        # leave others empty; both layouts must be regenerated on graph replay.
+        run_case(replace(case, hidden=hidden, intermediate=intermediate,
                          experts=128 * mega_moe_group.size(), worlds=(mega_moe_group.size(),),
+                         routing="skewed" if hidden == 256 else "random",
                          tokens=(1, 33, 0, 129, 8)), mega_moe_group)
 
 

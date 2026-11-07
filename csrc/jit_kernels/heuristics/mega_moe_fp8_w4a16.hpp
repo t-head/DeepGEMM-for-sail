@@ -46,7 +46,8 @@ struct DispatchConfig {
     int gemm1_stages = 0;
     int gemm1_warp_m = 0;
     int gemm1_warp_n = 0;
-    int gemm2_block_m = 0; // Nonzero when GEMM1 publishes GEMM2's valid-tile list.
+    int gemm2_block_m = 0; // Nonzero when GEMM1 publishes GEMM2's task list.
+    bool gemm2_valid_rows = true;
     int master_experts = 0;
     int nmtpr = 0;
     int num_experts = 0;
@@ -99,10 +100,6 @@ struct ScatterConfig {
     int warp_m = 0;
     int warp_n = 0;
 };
-
-inline bool channel_scatter_uses_worklist(const ScatterConfig& c) {
-    return c.num_groups >= 128 && c.use_padded_valid_rows && c.kernel_type == "Default";
-}
 
 inline int channel_pull_group_size(const DispatchConfig& c, int expected_rows) {
     constexpr int default_teams = 3;
@@ -507,8 +504,14 @@ inline const RoutedMoEConfigs& get_routed_moe_configs(Precision precision, int r
     result.scatter.num_ranks = ranks;
     if (precision == Precision::FP8Channelwise || precision == Precision::W4A8)
         result.dispatch.pull_group_size = channel_pull_group_size(result.dispatch, expected);
-    if (precision == Precision::FP8Channelwise && channel_scatter_uses_worklist(result.scatter))
-        result.dispatch.gemm2_block_m = result.scatter.block_m;
+    if (groups >= 128) {
+        result.dispatch.gemm2_block_m = precision == Precision::W4A8 ? result.w4a8_scatter.tile.block_m
+                                      : precision == Precision::W4A16 ? result.w4_scatter.block_m
+                                                                     : result.scatter.block_m;
+        result.dispatch.gemm2_valid_rows = precision == Precision::FP8Blockwise ||
+            (precision == Precision::FP8Channelwise && result.scatter.use_padded_valid_rows &&
+             result.scatter.kernel_type == "Default");
+    }
     return cache.emplace(key, std::move(result)).first->second;
 }
 

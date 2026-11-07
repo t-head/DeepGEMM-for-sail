@@ -23,20 +23,10 @@ CUTLASS_DEVICE void dispatch_tokens(void* workspace_base, const layout::SymBuffe
         *ws.get_l1_arrival_count_ptr(g) = 0;
     mega_moe::detail::dispatch_handshake<Ranks, CTAs, Threads, Experts, ExpertsPerRank, TopK, true>(
         ws, buffer, input_ids, reinterpret_cast<uint32_t*>(smem_buf), tokens, cta, thread);
-    constexpr uint32_t Chunks = (ExpertsPerRank + 31) / 32;
     const sched::DistributedMegaMoEBlocks<ExpertsPerRank, BlockM> blocks(ws.get_expert_recv_count_sum_ptr(), lane);
     const uint32_t total = blocks.total_blocks;
-    if (cta == 0 && warp == 0) {
-        #pragma unroll
-        for (uint32_t chunk = 0; chunk < Chunks; ++chunk) {
-            const uint32_t expert = chunk * 32 + lane;
-            if (expert < ExpertsPerRank) {
-                const uint32_t padded = (blocks.end[chunk] - blocks.begin[chunk]) * BlockM;
-                const uint32_t base = blocks.begin[chunk] * BlockM;
-                meta.store_rows(expert, blocks.rows[chunk], padded, base, padded, base);
-            }
-        }
-    }
+    if (cta == 0 && warp == 0)
+        meta.store_expert_layout<ExpertsPerRank, BlockM>(blocks, lane);
     comm::grid_sync<CTAs, 1>(ws, cta, thread, block_sync);
     if (cta < PullCTAs) {
         static_assert(PullGroupSize > 0);

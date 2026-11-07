@@ -153,7 +153,7 @@ template <
     uint32_t kBlockN, uint32_t kBlockK, uint32_t kWarpM,
     uint32_t kWarpN, uint32_t kStages, uint32_t kNumPullCTAs,
     bool kSwiGLUOAI = false, class Gemm1Backend = void,
-    uint32_t kPullGroupSize = kNumPullCTAs / 3, uint32_t kGemm2BlockM = 0>
+    uint32_t kPullGroupSize = kNumPullCTAs / 3, uint32_t kGemm2BlockM = 0, bool kGemm2ValidRows = true>
 CUTLASS_DEVICE void dispatch_gemm1_device(
         void* workspace_base,
         const layout::SymBuffer<>& sym_buffer,
@@ -216,48 +216,13 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         workspace, sym_buffer, input_topk_idx, smem_expert_count, num_tokens,
         cta_idx, thread_idx);
 
-    constexpr uint32_t kExpertChunks = (kNumExpertsPerRank + 31) / 32;
     const sched::DistributedMegaMoEBlocks<kNumExpertsPerRank, kBlockM> blocks(
         workspace.get_expert_recv_count_sum_ptr(), lane_idx);
-    const auto& expert_m = blocks.rows;
-    const auto& block_begin = blocks.begin;
-    const auto& block_end = blocks.end;
     const layout::Gemm2Metadata gemm2_meta(
         gemm2_metadata, kNumExpertsPerRank);
-    if (cta_idx == 0 && warp_idx == 0) {
-        #pragma unroll
-        for (uint32_t chunk = 0; chunk < kExpertChunks; ++chunk) {
-            const uint32_t expert = chunk * 32 + lane_idx;
-            if (expert < kNumExpertsPerRank) {
-                const uint32_t padded = (block_end[chunk] - block_begin[chunk]) * kBlockM;
-                const uint32_t offset = block_begin[chunk] * kBlockM;
-                gemm2_meta.store_rows(expert, expert_m[chunk], padded, offset, padded, offset);
-            }
-        }
-        if constexpr (kGemm2BlockM > 0) {
-            // Reuse the histogram and physical pool offsets for GEMM2's valid
-            // tile list. The following kernels consume it on the same stream.
-            uint32_t base = 0;
-            #pragma unroll
-            for (uint32_t chunk = 0; chunk < kExpertChunks; ++chunk) {
-                const uint32_t expert = chunk * 32 + lane_idx;
-                const uint32_t rows = expert_m[chunk];
-                const uint32_t blocks = math::ceil_div(rows, kGemm2BlockM);
-                uint32_t end = blocks;
-                #pragma unroll
-                for (uint32_t off = 1; off < 32; off <<= 1) {
-                    const uint32_t value = __shfl_up_sync(0xffffffffu, end, off);
-                    if (lane_idx >= off) end += value;
-                }
-                const uint32_t begin = base + end - blocks;
-                const uint32_t source = block_begin[chunk] * kBlockM;
-                for (uint32_t i = 0; i < blocks; ++i)
-                    gemm2_block_info[1 + begin + i] = make_uint4(expert, rows, begin, source);
-                base += __shfl_sync(0xffffffffu, end, 31);
-            }
-            if (lane_idx == 0) gemm2_block_info[0] = make_uint4(base, 0, 0, 0);
-        }
-    }
+    if (cta_idx == 0 && warp_idx == 0)
+        gemm2_meta.store_expert_layout<kNumExpertsPerRank, kBlockM, kGemm2BlockM, kGemm2ValidRows>(
+            blocks, lane_idx, gemm2_block_info);
     const uint32_t total_m_blocks = blocks.total_blocks;
     constexpr uint32_t kNumNBlocks = kGemm1N / kBlockN;
 

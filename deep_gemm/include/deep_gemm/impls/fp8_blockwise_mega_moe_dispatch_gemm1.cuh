@@ -174,12 +174,12 @@ template <uint32_t kRanks, uint32_t kCTAs, uint32_t kExperts,
           uint32_t kTopk, uint32_t kHidden, uint32_t kN, uint32_t kPullCTAs,
           bool kClamp = false,
           uint32_t kMasterExperts = kExperts / kRanks, bool kSwigluOai = false,
-          uint32_t kComputeM = 128>
+          uint32_t kComputeM = 128, uint32_t kGemm2BlockM = 0>
 CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
         void* workspace_base, const layout::SymBuffer<>& sym_buffer,
         const int64_t* ids, const uint8_t* input,
         const float* scales, uint8_t* pool, float* pool_scales,
-        int32_t* gemm2_metadata, const uint8_t* w1, const float* s1,
+        int32_t* gemm2_metadata, uint4* gemm2_block_info, const uint8_t* w1, const float* s1,
         uint8_t* output, float* output_scales,
         uint32_t num_tokens, uint32_t cap, float swiglu_limit = 0.0f, float activation_alpha = 1.0f,
         const uint8_t* w1_replicas = nullptr, const float* s1_replicas = nullptr) {
@@ -188,7 +188,6 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
     constexpr uint32_t kBlockM = 128, kBlockN = 256;
     constexpr uint32_t kThreads = Gemm1<kN, kHidden, kComputeM>::kNumThreads;
     constexpr uint32_t kWarps = kThreads / 32, kScales = kHidden / 128;
-    constexpr uint32_t kChunks = (kEpr + 31) / 32;
     constexpr uint32_t kNBlocks = kN / kBlockN;
     static_assert(kHidden % 128 == 0 && kN % kBlockN == 0);
     static_assert(kEpr > 0 && kEpr <= 128);
@@ -208,22 +207,10 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
         ws, sym_buffer, ids, reinterpret_cast<uint32_t*>(smem), num_tokens, sm, thread);
 
     const sched::DistributedMegaMoEBlocks<kEpr, kBlockM> blocks(ws.get_expert_recv_count_sum_ptr(), lane);
-    const auto& expert_rows = blocks.rows;
-    const auto& block_begin = blocks.begin;
-    const auto& block_end = blocks.end;
     const uint32_t total_blocks = blocks.total_blocks;
     const layout::Gemm2Metadata gemm2_meta(gemm2_metadata, kEpr);
-    if (sm == 0 && warp == 0) {
-        #pragma unroll
-        for (uint32_t chunk = 0; chunk < kChunks; ++chunk) {
-            const uint32_t expert = chunk * 32 + lane;
-            if (expert < kEpr) {
-                const uint32_t padded = (block_end[chunk] - block_begin[chunk]) * kBlockM;
-                const uint32_t offset = block_begin[chunk] * kBlockM;
-                gemm2_meta.store_rows(expert, expert_rows[chunk], padded, offset, padded, offset);
-            }
-        }
-    }
+    if (sm == 0 && warp == 0)
+        gemm2_meta.store_expert_layout<kEpr, kBlockM, kGemm2BlockM>(blocks, lane, gemm2_block_info);
     static_assert(kComputeM == 128 ||
         (kComputeM == 32 || kComputeM == 192));
     auto* work_counter = ws.get_gemm1_work_count_ptr();

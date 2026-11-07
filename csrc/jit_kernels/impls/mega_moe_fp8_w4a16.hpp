@@ -62,7 +62,7 @@ inline void w4a16_scatter_impl(const RoutedMoEWorkspace& buffer, const torch::Te
                                int intermediate_hidden, int rank_idx, int num_max_tokens_per_rank, int num_topk, int num_ranks,
                                const std::string& kernel_name) {
     const int m = buffer.l2_acts.size(0);
-    auto* layout = prepare_scatter_layout(groups, config.block_m, buffer.m_rows, buffer.block_info);
+    auto* layout = scatter_layout(groups, buffer.m_rows, buffer.block_info);
     W4A16ScatterParams params{buffer.l2_acts.data_ptr(),
                               weights.data_ptr(),
                               scales.data_ptr(),
@@ -164,7 +164,8 @@ inline void PPUFP8MegaMoERuntime::compile_and_launch(const std::string& tag, con
             fp8_blockwise_mega_moe_dispatch_gemm1_kernel(
                 config, buffer.sym_buffer, buffer.dispatched_tokens, args.rank_idx, args.num_tokens,
                 l1_weights, l1_weights_sf, buffer.l2_acts, buffer.l2_acts_sf,
-                config.activation_clamp, config.activation_alpha, l1_weights_replicas, l1_weights_replicas_sf, tag);
+                config.activation_clamp, config.activation_alpha, l1_weights_replicas, l1_weights_replicas_sf,
+                buffer.block_info, tag);
         } else {
             fp8_channelwise_mega_moe_dispatch_gemm1_kernel(
                 config, buffer.sym_buffer, args.rank_idx, args.num_tokens, l1_weights, l1_weights_sf,

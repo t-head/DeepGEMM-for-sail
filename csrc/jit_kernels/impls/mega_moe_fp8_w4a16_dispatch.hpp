@@ -26,6 +26,7 @@ inline SourceFields source_fields(const DispatchConfig& c) {
         {"GEMM1_WARP_M", std::to_string(c.gemm1_warp_m)},
         {"GEMM1_WARP_N", std::to_string(c.gemm1_warp_n)},
         {"GEMM2_BLOCK_M", std::to_string(c.gemm2_block_m)},
+        {"GEMM2_VALID_ROWS", c.gemm2_valid_rows ? "true" : "false"},
         {"MASTER_EXPERTS", std::to_string(c.master_experts)},
         {"NMTPR", std::to_string(c.nmtpr)},
         {"NUM_EXPERTS", std::to_string(c.num_experts)},
@@ -420,7 +421,7 @@ deep_gemm::mega_moe::fp8_channelwise::dispatch_gemm1_device<
     NUM_RANKS, NUM_CTAS, NUM_THREADS, NUM_EXPERTS, NUM_EXPERTS_PER_RANK,
     NUM_TOPK, BLOCK_M, TOKEN_BYTES, GEMM1_N, GEMM1_BLOCK_N,
     GEMM1_BLOCK_K, GEMM1_WARP_M, GEMM1_WARP_N, GEMM1_STAGES,
-    PULL_CTAS, {SWIGLU_OAI}, void, {PULL_GROUP_SIZE}, {GEMM2_BLOCK_M}>(
+    PULL_CTAS, {SWIGLU_OAI}, void, {PULL_GROUP_SIZE}, {GEMM2_BLOCK_M}, {GEMM2_VALID_ROWS}>(
     P(off_ws), sb,
     (const int64_t*)P(off_iti),
     (const uint8_t*)P(off_it), (const float*)P(off_isf),
@@ -479,7 +480,7 @@ inline void fp8_blockwise_mega_moe_dispatch_gemm1_kernel(
     const DispatchConfig& config, const layout::SymBuffer<>& sym_buffer, const torch::Tensor& local_pool, int rank_idx,
     int num_tokens, const torch::Tensor& weight, const torch::Tensor& weight_scales, const torch::Tensor& output,
     const torch::Tensor& output_scales, float activation_clamp, float activation_alpha, const torch::Tensor& weight_replicas,
-    const torch::Tensor& scale_replicas, const std::string& entry) {
+    const torch::Tensor& scale_replicas, const torch::Tensor& block_info, const std::string& entry) {
     launch<Fp8BlockwiseMegaMoeDispatchGemm1Tag>(
         entry, R"DGMEGA(#include <deep_gemm/impls/fp8_blockwise_mega_moe_dispatch_gemm1.cuh>
 using namespace deep_gemm;
@@ -498,7 +499,7 @@ constexpr uint32_t ppu_smem_compute() {
 }
 extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes = ppu_smem_compute();
 extern "C" __global__ __launch_bounds__(NUM_THREADS, 1)
-void PPU_KERNEL_ENTRY(layout::SymBuffer<> sb, uint8_t* local_pool, int rank_idx, int num_tokens, __hg_fp8_e4m3* weight, float* weight_scales, uint8_t* output, float* output_scales, float activation_clamp, float activation_alpha, __hg_fp8_e4m3* weight_replicas, float* scale_replicas) {
+void PPU_KERNEL_ENTRY(layout::SymBuffer<> sb, uint8_t* local_pool, int rank_idx, int num_tokens, __hg_fp8_e4m3* weight, float* weight_scales, uint8_t* output, float* output_scales, float activation_clamp, float activation_alpha, __hg_fp8_e4m3* weight_replicas, float* scale_replicas, uint4* gemm2_block_info) {
 
 constexpr uint64_t off_ws = 0, off_it = {LAYOUT_OFF_IT}, off_isf = {LAYOUT_OFF_ISF};
 constexpr uint64_t off_iti = {LAYOUT_OFF_ITI};
@@ -509,10 +510,10 @@ auto P = [&](uint64_t off) -> void* {
     return off >= off_pt ? local_pool + (off - off_pt) : (void*)(local_base + off);
 };
 mega_moe::fp8_blockwise::dispatch_gemm1_kernel_device<
-    NUM_RANKS, NUM_CTAS, NUM_EXPERTS, NUM_TOPK, TOKEN_BYTES, {GEMM1_N}, {PULL_CTAS}, {CLAMP}, {MASTER_EXPERTS}, {SWIGLU_OAI}, {GEMM1_COMPUTE_M}>(
+    NUM_RANKS, NUM_CTAS, NUM_EXPERTS, NUM_TOPK, TOKEN_BYTES, {GEMM1_N}, {PULL_CTAS}, {CLAMP}, {MASTER_EXPERTS}, {SWIGLU_OAI}, {GEMM1_COMPUTE_M}, {GEMM2_BLOCK_M}>(
     P(off_ws), sb, (const int64_t*)P(off_iti),
     (const uint8_t*)P(off_it), (const float*)P(off_isf),
-    (uint8_t*)P(off_pt), (float*)P(off_psf), (int32_t*)P(off_meta),
+    (uint8_t*)P(off_pt), (float*)P(off_psf), (int32_t*)P(off_meta), gemm2_block_info,
     (const uint8_t*)weight, weight_scales, output,
     output_scales,
     (uint32_t)num_tokens, NMTPR, activation_clamp, activation_alpha,
@@ -523,7 +524,7 @@ mega_moe::fp8_blockwise::dispatch_gemm1_kernel_device<
         std::make_tuple(sym_buffer, device_pointer(local_pool), int32_t(rank_idx), int32_t(num_tokens),
                         device_pointer(weight), device_pointer(weight_scales), device_pointer(output),
                         device_pointer(output_scales), activation_clamp, activation_alpha, device_pointer(weight_replicas),
-                        device_pointer(scale_replicas)),
+                        device_pointer(scale_replicas), device_pointer(block_info)),
         dim3(config.num_ctas), config.num_threads, false, /*cooperative=*/true);
 }
 

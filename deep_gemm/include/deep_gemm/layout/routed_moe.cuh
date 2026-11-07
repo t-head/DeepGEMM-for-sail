@@ -55,6 +55,42 @@ struct Gemm2Metadata {
         src_offsets[expert] = src_offset;
     }
 
+#if defined(__HGGC__)
+    // Called by one complete warp after the dispatch histogram is available.
+    // GEMM2 consumes this metadata after GEMM1 on the same stream. Its task
+    // list carries physical pool offsets even when it schedules only valid rows.
+    template <uint32_t Experts, uint32_t BlockM, uint32_t Gemm2BlockM = 0,
+              bool UseValidRows = true, typename Blocks>
+    CUTLASS_DEVICE void store_expert_layout(const Blocks& blocks, uint32_t lane,
+                                           uint4* block_info = nullptr) const {
+        uint32_t base = 0;
+        #pragma unroll
+        for (uint32_t chunk = 0; chunk < math::ceil_div(Experts, 32u); ++chunk) {
+            const uint32_t expert = chunk * 32 + lane;
+            const uint32_t padded = (blocks.end[chunk] - blocks.begin[chunk]) * BlockM;
+            const uint32_t offset = blocks.begin[chunk] * BlockM;
+            if (expert < Experts)
+                store_rows(expert, blocks.rows[chunk], padded, offset, padded, offset);
+            if constexpr (Gemm2BlockM > 0) {
+                const uint32_t rows = UseValidRows ? blocks.rows[chunk] : padded;
+                const uint32_t count = math::ceil_div(rows, Gemm2BlockM);
+                uint32_t end = count;
+                #pragma unroll
+                for (uint32_t step = 1; step < 32; step <<= 1) {
+                    const uint32_t value = __shfl_up_sync(0xffffffffu, end, step);
+                    if (lane >= step) end += value;
+                }
+                const uint32_t begin = base + end - count;
+                for (uint32_t i = 0; i < count; ++i)
+                    block_info[1 + begin + i] = make_uint4(expert, rows, begin, offset);
+                base += __shfl_sync(0xffffffffu, end, 31);
+            }
+        }
+        if constexpr (Gemm2BlockM > 0)
+            if (lane == 0) block_info[0] = make_uint4(base, 0, 0, 0);
+    }
+#endif
+
     CUTLASS_DEVICE void store_route(uint32_t row, uint32_t rank, uint32_t token, uint32_t slot) const {
         packed_routes[row] = (uint64_t(rank) << 32) | (uint64_t(slot) << 24) | token;
     }

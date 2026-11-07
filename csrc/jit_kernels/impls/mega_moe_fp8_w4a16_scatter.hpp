@@ -12,22 +12,13 @@ using Mode = FP4GemmRuntime::GemmUniversalMode;
 
 using ScatterScheduler = TileSchedulerArguments;
 
-inline int32_t* prepare_scatter_layout(int groups, int block_m, const torch::Tensor& rows,
-                                      const torch::Tensor& block_info) {
-    TORCH_CHECK(groups > 0 && groups <= 1024, "scatter preprocessing supports 1 to 1024 local experts");
-    auto* layout = rows.data_ptr<int32_t>();
+// Large expert groups consume the task list published by GEMM1; smaller
+// groups let the same scheduler traverse per-expert row counts directly.
+inline int32_t* scatter_layout(int groups, const torch::Tensor& rows, const torch::Tensor& block_info) {
     if (groups < 128)
-        return layout;
+        return rows.data_ptr<int32_t>();
     TORCH_CHECK(block_info.defined() && block_info.scalar_type() == torch::kInt32,
                 "Grouped no-pad scheduler needs an int32 block-info workspace");
-    const auto args = ComputeBlockInfoKernelRuntime::Args{
-        .launch_attr_args = {reinterpret_cast<const uint32_t*>(layout), static_cast<uint32_t>(groups),
-                            reinterpret_cast<uint32_t*>(block_info.data_ptr<int32_t>())},
-        .launch_args = {dim3(1), dim3(std::max(32, next_power_of_two(groups))), 0},
-    };
-    const auto code = ComputeBlockInfoKernelRuntime::generate(block_m);
-    const auto runtime = compiler->build("computeBlockInfoKernel", code);
-    ComputeBlockInfoKernelRuntime::launch(runtime, args);
     return block_info.data_ptr<int32_t>();
 }
 
@@ -187,17 +178,6 @@ using Kernel = typename Family::GemmKernel;
 struct Fp8ChannelwiseDefaultScatterTag {};
 struct Fp8ChannelwiseOverlapScatterTag {};
 
-inline int32_t* prepare_channelwise_scatter_layout(const ScatterConfig& config,
-                                                  const torch::Tensor& rows,
-                                                  const torch::Tensor& valid_rows,
-                                                  const torch::Tensor& block_info) {
-    if (channel_scatter_uses_worklist(config))
-        return block_info.data_ptr<int32_t>();
-    if (config.num_groups < 128 && config.use_padded_valid_rows && config.kernel_type == "Default")
-        return valid_rows.data_ptr<int32_t>();
-    return prepare_scatter_layout(config.num_groups, config.block_m, rows, block_info);
-}
-
 inline void fp8_channelwise_mega_moe_scatter_kernel(const ScatterConfig& config, const torch::Tensor& lhs,
                                    const torch::Tensor& lhs_scales, const torch::Tensor& rhs,
                                    const torch::Tensor& rhs_scales, const torch::Tensor& rhs_replicas,
@@ -212,7 +192,8 @@ inline void fp8_channelwise_mega_moe_scatter_kernel(const ScatterConfig& config,
     const int groups = config.num_groups, masters = config.num_master_groups;
     if (m == 0)
         return;
-    const auto layout = prepare_channelwise_scatter_layout(config, m_rows, valid_m_rows, block_info);
+    const auto layout = scatter_layout(groups, config.use_padded_valid_rows && config.kernel_type == "Default"
+                                               ? valid_m_rows : m_rows, block_info);
     const auto sa = packed_stride(m, k), sb = packed_stride(n, k), sd = packed_stride(m, n);
     DenseINT8GemmCutlass3Runtime::MainLoopArguments mainloop{device_pointer(lhs),
                                                              sa,
@@ -272,7 +253,7 @@ inline void fp8_blockwise_mega_moe_scatter_kernel(const ScatterConfig& config, c
     const int m = num_rows, n = config.n, k = config.k, groups = config.num_groups;
     if (m == 0)
         return;
-    const auto layout = prepare_scatter_layout(groups, config.block_m, valid_m_rows, block_info);
+    const auto layout = scatter_layout(groups, valid_m_rows, block_info);
     const auto sa = packed_stride(m, k), sb = packed_stride(n, k), sd = packed_stride(m, n);
     const auto problem = cute::make_shape(m, n, k, 1);
     BlockScatterParams params{};
