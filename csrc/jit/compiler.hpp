@@ -276,16 +276,19 @@ public:
         const auto code_path = dir_path / "kernel.cu";
         put(code_path, code);
 
-        // Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use -Xllvm flags,
-        // others only need -ppu-simt-branch=false.
+        // Per-kernel scheduling options for PPU1.5.
         std::string per_kernel_flags;
         if (get_ppu_arch() == AC_PPU0015) {
             per_kernel_flags = " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
                                " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
-            const bool use_warp_interleaving = (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
-                                               (name.find("fp8_deep_gemm") != std::string::npos) ||
-                                               (name.find("mqa_logits") != std::string::npos &&
-                                                name.find("paged") == std::string::npos);
+            const bool is_blockwise_scatter = name.find("fp8_blockwise_mega_moe_scatter") != std::string::npos;
+            const bool use_warp_interleaving =
+                (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
+                (name.find("fp8_deep_gemm") != std::string::npos) ||
+                (name.find("fp8_blockwise_mega_moe_dispatch_gemm1") != std::string::npos) ||
+                is_blockwise_scatter ||
+                (name.find("mqa_logits") != std::string::npos &&
+                 name.find("paged") == std::string::npos);
             if (!use_warp_interleaving) {
                 per_kernel_flags += " -Xllvm -ppu-simt-branch=false";
                 const bool is_bf16_cute_free = name.find("bf16_deep_gemm_cute_free") != std::string::npos;
@@ -295,9 +298,10 @@ public:
             } else {
                 per_kernel_flags += " -Xllvm -ppu-blksync-nb-schedule-boundary=true"
                                     " -Xllvm -ppu-simt-branch=false"
-                                    " -Xllvm -ppu-adjust-tsm-valu-war=13"
-                                    " -Xllvm -ppu-reassign-subregs=true"
-                                    " -Xllvm -ppu-pref-fma-reuse=true"
+                                    " -Xllvm -ppu-adjust-tsm-valu-war=13";
+                if (!is_blockwise_scatter)
+                    per_kernel_flags += " -Xllvm -ppu-reassign-subregs=true";
+                per_kernel_flags += " -Xllvm -ppu-pref-fma-reuse=true"
                                     " -Xllvm -ppu-pref-mma-reuse=true";
             }
             if (name.find("w4a16") != std::string::npos) {
@@ -393,11 +397,14 @@ public:
                     "--ppu-tuning-options=-ppu-fix-uninit=true",
                 });
 
+                const bool is_blockwise_scatter = name.find("fp8_blockwise_mega_moe_scatter") != std::string::npos;
                 const bool use_warp_interleaving =
                     (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
-                    (name.find("fp8_deep_gemm")         != std::string::npos) ||
-                    (name.find("mqa_logits")            != std::string::npos &&
-                     name.find("paged")                 == std::string::npos);
+                    (name.find("fp8_deep_gemm") != std::string::npos) ||
+                    (name.find("fp8_blockwise_mega_moe_dispatch_gemm1") != std::string::npos) ||
+                    is_blockwise_scatter ||
+                    (name.find("mqa_logits") != std::string::npos &&
+                     name.find("paged") == std::string::npos);
                 if (!use_warp_interleaving) {
                     opts_insert({
                         "--ppu-tuning-options=-ppu-simt-branch=false",
@@ -407,7 +414,10 @@ public:
                         "--ppu-tuning-options=-ppu-blksync-nb-schedule-boundary=true",
                         "--ppu-tuning-options=-ppu-simt-branch=false",
                         "--ppu-tuning-options=-ppu-adjust-tsm-valu-war=13",
-                        "--ppu-tuning-options=-ppu-reassign-subregs=true",
+                    });
+                    if (!is_blockwise_scatter)
+                        opts_insert({"--ppu-tuning-options=-ppu-reassign-subregs=true"});
+                    opts_insert({
                         "--ppu-tuning-options=-ppu-pref-fma-reuse=true",
                         "--ppu-tuning-options=-ppu-pref-mma-reuse=true",
                     });

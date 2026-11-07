@@ -87,6 +87,45 @@ helpers. Both use the public complete call.
 Other architecture pytest runs skip these tests; CLI use reports an
 unsupported-device error.
 
+`test_mega_moe_precisions.py` exercises FP8 channelwise/blockwise, W4A8 and W4A16
+through their public complete calls. Its case table includes GLM52,
+GLM53 Flash, Qwen3.8 Flash, MiniMax M3 channelwise, next-generation MiniMax
+blockwise, and Kimi K3 W4A16. Kimi EP8/16 uses prefill tokens
+1024/2048/4096; EP32 uses decode tokens 4/8/16/32/64/128.
+W4A8 adds `deepseek_v4_pro_w4a8` (EP8) and `kimi_k3_w4a8` (EP8/16/32),
+with decode and prefill tokens in the same case table.
+Small distributed cases cover separate replicas, both math modes, OAI/clamp,
+empty ranks, consecutive changing routes, statistics and graph replay.
+The API cases also check malformed weights, odd GEMM1 widths, and explicit
+pre-dispatch token prefixes with differently sized input and routing tensors.
+All precisions use the common workspace entry point for complete-pipeline checks,
+including compatible `SymmBuffer` base aliases.
+Accuracy uses `deep_gemm.testing.calc_diff < 0.001`, matching grouped FP8
+GEMM; W4A8 retains its existing 0.0015 threshold. Relative L2 is reported on
+failure. Large references sample eight tokens per rank, outside timing.
+
+```bash
+# No private C++ bindings or test-side counter resets are needed.
+python -m pytest -q -s --disable-warnings -x tests/test_mega_moe_precisions.py -k smoke
+torchrun --standalone --nproc-per-node=2 -m pytest -q -s --disable-warnings -x \
+  tests/test_mega_moe_precisions.py -k smoke
+torchrun --standalone --nproc-per-node=8 tests/test_mega_moe_precisions.py \
+  --case kimi_k3 --tokens 1024 2048 4096 --routing random --reference-tokens 8 \
+  --benchmark --warmup 10 --iterations 100 --repeats 5
+# The same benchmark can be invoked directly; --precision selects its case table.
+torchrun --standalone --nproc-per-node=8 tests/bench_mega_moe.py \
+  --precision w4a16 --case kimi_k3 --tokens 1024 2048 4096 --routing random \
+  --reference-tokens 8 --warmup 10 --iterations 100 --repeats 5
+```
+
+The precision CLI forwards `--benchmark` to the same benchmark driver as W4A4.
+All precisions accept the same token/capacity, routing, math, reference and timing
+options. `--mode graph` (the default) times the complete graph, including BF16 input preparation,
+communication, both GEMMs, activation/quantization, scatter, combine and recycling.
+`--mode eager` times the same complete call without graph capture. Both report
+the slowest rank and median/min/max over repeats. DeepEP comparisons currently
+cover W4A4 only; requesting that baseline for another precision is rejected.
+
 | Case | EP | H | I | Experts | Top-k | Activation | Capacity |
 |---|---|---:|---:|---:|---:|---|---:|
 | `deepseek_v4_pro` | 8 | 7168 | 3072 | 384 | 6 | SwiGLU, limit 10 | 8192 |

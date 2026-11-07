@@ -11,6 +11,14 @@
 
 namespace deep_gemm::mega {
 
+// Rank-local token counts describe a uniform-routing estimate, not measured
+// expert loads. Cap it by the owning workspace's per-expert row capacity.
+inline int expected_expert_rows(int tokens, int topk, int groups, int ranks, int capacity) {
+    DG_HOST_ASSERT(tokens >= 0 && topk > 0 && groups > 0 && ranks > 0 && capacity >= 0);
+    const int64_t owner_capacity = int64_t(ranks) * capacity;
+    return std::max<int64_t>(1, std::min(owner_capacity, int64_t(tokens) * topk / groups + 1));
+}
+
 enum class MmaKind { BF16, MXFP8FP4, MXFP4 };
 
 static MmaKind parse_mma_kind(const std::string& mma_type_str) {
