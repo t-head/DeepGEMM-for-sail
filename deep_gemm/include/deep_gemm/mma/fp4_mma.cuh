@@ -35,17 +35,8 @@
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/layout/dispatch_layout.cuh>
+#include <deep_gemm/tix/ld_st.cuh>
 #include <math.h>
-
-namespace deep_gemm {
-
-__device__ __forceinline__ uint32_t ld_copy_ready_uncached(
-        const volatile uint32_t* ptr) {
-  asm volatile("" ::: "memory");
-  return __ldbl(const_cast<const uint32_t*>(ptr));
-}
-
-} // namespace deep_gemm
 
 namespace cutlass::gemm::collective {
 using namespace cute;
@@ -251,10 +242,9 @@ struct CollectiveMmaScaleFp4
 
   struct FusedDispatchArguments : ArgumentsBase {
     volatile uint32_t* copy_ready_flags = nullptr;
-    uint32_t copy_ready_generation = 0;
+    uint32_t generation = 0;
     uint32_t copy_k_tiles_per_flag = 0;
     volatile uint32_t* sfa_ready_flags = nullptr;
-    uint32_t sfa_ready_generation = 0;
   };
 
   using Arguments = std::conditional_t<(SfaScaleBlocks > 0),
@@ -517,7 +507,7 @@ struct CollectiveMmaScaleFp4
       if constexpr (SfaScaleBlocks > 0) {
         volatile uint32_t* ks_flags = params_.copy_ready_flags;
         const int ks_ktpf = static_cast<int>(params_.copy_k_tiles_per_flag);
-        const uint32_t ks_generation = params_.copy_ready_generation;
+        const uint32_t ks_generation = params_.generation;
         // Only the A producer warp consumes the block-copy buffer. Let the
         // independent B/SFA/SFB producer warps enqueue their first async group
         // while warp 0 is polling the A-stripe ready flag; the later CTA-wide
@@ -535,7 +525,7 @@ struct CollectiveMmaScaleFp4
           const uint32_t tagged_ready =
               (ks_generation << 3) | stripe_ready;
           constexpr uint32_t kTagWindowEnd = 7u;
-          while (deep_gemm::ld_copy_ready_uncached(ks_flags) - tagged_ready >
+          while (deep_gemm::tix::ld_ready_flag_uncached(ks_flags) - tagged_ready >
                  kTagWindowEnd - stripe_ready) { }
           ++ks_cur_stripe;
           ks_next_bnd += ks_ktpf;
@@ -554,9 +544,9 @@ struct CollectiveMmaScaleFp4
           // drain every flag required by this tile before issuing its load.
           do {
             if (lane_idx == 0) {
-              while (deep_gemm::ld_copy_ready_uncached(
+              while (deep_gemm::tix::ld_ready_flag_uncached(
                          params_.sfa_ready_flags + sfa_cur_partition) !=
-                     params_.sfa_ready_generation) { }
+                     params_.generation) { }
             }
             __syncwarp();
             ++sfa_cur_partition;

@@ -95,7 +95,9 @@ struct MegaMoEMxfp4Kernel {
     struct Kernel {
         using ProblemShape = Shape<int, int, int, int>;
         using TileShape = typename Mainloop::TileShape;
-        using MainloopParams = typename Mainloop::Params;
+        using MainloopArguments = typename Mainloop::ArgumentsBase;
+        using EpilogueParams = typename Epilogue::Params;
+        using SchedulerParams = typename Scheduler::Params;
         static constexpr uint32_t MaxThreadsPerBlock =
             WarpPipeline ? scatter_pipeline::kCtaThreads : CUTE_STATIC_V(size(Mma{}));
         static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
@@ -112,56 +114,35 @@ struct MegaMoEMxfp4Kernel {
         static constexpr int SharedStorageSize = cute::max(static_cast<int>(sizeof(SharedStorage)),
             kIsLinear1 ? Groups * (Ranks + kExpertMetadataAuxFields) * static_cast<int>(sizeof(uint32_t)) : 0);
 
-        // Field order is shared with the host JIT launcher.
-        struct ParamsBase {
-            cutlass::gemm::GemmUniversalMode mode{};
-            ProblemShape problem_shape{};
-            MainloopParams mainloop{};
-            typename Epilogue::Params epilogue{};
-            cutlass::KernelHardwareInfo hw_info{};
-            typename Scheduler::Params scheduler{};
-            void* workspace{nullptr};
-            int32_t* signal{nullptr};
-#if SAIL_SYNC_IN_CE
-            int* ptr_sync_ce = nullptr;
-#endif
-        };
-        struct ScatterParams : ParamsBase {
-            layout::SymBuffer<Ranks> scatter_buffer{};
-            layout::ScatterSignals* scatter_barrier{nullptr};
-        };
-        using Params = std::conditional_t<kIsLinear1, ParamsBase, ScatterParams>;
-
-        CUTLASS_DEVICE void operator()(Params const& params, char* smem_buf,
-                                      MegaMoEReplicaWeights const& replicas) {
-            uint32_t generation = 0;
+        CUTLASS_DEVICE void operator()(MainloopArguments mainloop, const EpilogueParams& epilogue_params,
+                                      const SchedulerParams& scheduler_params, layout::MegaMoESignals* signals,
+                                      char* smem_buf, const MegaMoEReplicaWeights& replicas, uint32_t generation,
+                                      const layout::SymBuffer<Ranks>* scatter_buffer = nullptr) {
             if constexpr (kIsLinear1) {
                 static_assert(Groups * (Ranks + kExpertMetadataAuxFields) * sizeof(uint32_t) <= SharedStorageSize,
                               "dispatch preprocess must fit the GEMM shared allocation");
                 static_assert(sizeof(CopyRankMetadataShared<BM, Ranks>) <= SharedStorageSize,
                               "copy rank metadata must fit the GEMM shared allocation");
-                generation = resolve_fused_round_generation(params.scheduler);
                 prepare_expert_layout_and_reshape_sfa<Scheduler, BM, MaxThreadsPerBlock>(
-                    params.scheduler, smem_buf, generation);
+                    scheduler_params, signals, smem_buf, generation);
 
                 // Copy CTAs join the GEMM1 queue after finishing their own blocks.
                 if (blockIdx.x < CopyBlocks) {
                     run_copy_block<BM, Ranks, BK, KTilesPerFlag, K, MaxThreadsPerBlock, SourceCapacity, TopK>(
-                        params.scheduler, params.scheduler.copy_grouped_layout[0], smem_buf, generation);
+                        scheduler_params, scheduler_params.copy_grouped_layout[0], smem_buf, generation);
                 }
-                __ppu_prefetch_KSD((void*)params.scheduler.copy_grouped_layout);
+                __ppu_prefetch_KSD((void*)scheduler_params.copy_grouped_layout);
             } else {
                 int warp = cutlass::canonical_warp_idx_sync();
                 if (warp < cute::ceil_div(Groups, 32))
-                    __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp << 5)));
+                    __ppu_prefetch_KSD((void*)(scheduler_params.grouped_layout + (warp << 5)));
             }
 
             auto& shared = *reinterpret_cast<SharedStorage*>(smem_buf);
             auto* epilogue_smem = reinterpret_cast<char*>(&shared.epilogue);
-            const int n = kIsLinear1 ? get<1>(params.problem_shape) : N;
-            const int k = kIsLinear1 ? get<2>(params.problem_shape) : K;
-            const int batches = get<3>(params.problem_shape);
-            Scheduler scheduler{params.scheduler};
+            const int n = kIsLinear1 ? get<1>(mainloop.problem_shape) : N;
+            const int k = kIsLinear1 ? get<2>(mainloop.problem_shape) : K;
+            Scheduler scheduler{scheduler_params};
             const int tid = threadIdx.x;
             uint32_t sequence = 0, m_block, n_block;
 
@@ -170,11 +151,10 @@ struct MegaMoEMxfp4Kernel {
             const uint16_t* sfa = nullptr;
             volatile uint32_t* ready = nullptr;
             if constexpr (kIsLinear1) {
-                fp4 = params.scheduler.local_fp4_buf;
-                sfa = params.scheduler.local_sfa_buf;
-                ready = params.scheduler.copy_ready_flags;
+                fp4 = scheduler_params.local_fp4_buf;
+                sfa = scheduler_params.local_sfa_buf;
+                ready = scheduler_params.copy_ready_flags;
             }
-            auto mainloop = params.mainloop;
             if constexpr (!kIsLinear1) {
                 get<0>(mainloop.dA) = K;
                 get<0>(mainloop.dB) = K;
@@ -188,12 +168,12 @@ struct MegaMoEMxfp4Kernel {
                     for (int slot = 0; slot < Epilogue::kPipelineSlots; ++slot)
                         __ppu_barrier_arrive(Epilogue::kFreeBarrier + slot, scatter_pipeline::kCtaThreads, 0);
 
-                    Epilogue consumer{params.epilogue, shared.epilogue};
+                    Epilogue consumer{epilogue_params, shared.epilogue};
                     while (scheduler.fetch_next_work(m_block, n_block)) {
-                        auto shape = ProblemShape{scheduler.curr_problem_m(), n, k, batches};
+                        auto shape = ProblemShape{scheduler.curr_problem_m(), n, k, 1};
                         consumer.consume(shape, TileShape{}, make_coord(m_block, n_block, _, 0),
                             tid - scatter_pipeline::kComputeThreads, epilogue_smem,
-                            static_cast<uint32_t>(scheduler.curr_offset_m()), params.scatter_buffer, sequence);
+                            static_cast<uint32_t>(scheduler.curr_offset_m()), *scatter_buffer, sequence);
                     }
                 }
             } else {
@@ -206,9 +186,9 @@ struct MegaMoEMxfp4Kernel {
                         break;
                     }
                     const uint32_t m = scheduler.curr_problem_m();
-                    const auto shape = ProblemShape{m, n, k, batches};
+                    const auto shape = ProblemShape{m, n, k, 1};
                     const auto coord = make_coord(m_block, n_block, _, 0);
-                    MainloopParams tile{};
+                    typename Mainloop::Params tile{};
                     tile.problem_shape = {m, n, k};
                     tile.dA = mainloop.dA;
                     tile.dB = mainloop.dB;
@@ -221,11 +201,10 @@ struct MegaMoEMxfp4Kernel {
                         tile.ptr_scale_A = sfa + sfa_base_m * ((K + 31u) / 32u);
                         get<1>(tile.dSFA) = FusedSfaPartitionLayout::align_rows(m);
                         tile.copy_ready_flags = ready + scheduler.curr_global_block_m_idx;
-                        tile.copy_ready_generation = generation;
+                        tile.generation = generation;
                         tile.copy_k_tiles_per_flag = KTilesPerFlag;
-                        tile.sfa_ready_flags = params.scheduler.preprocess_ready_flags + 1 +
+                        tile.sfa_ready_flags = signals->preprocess_ready + 1 +
                             static_cast<uint32_t>(scheduler.problem_index()) * FusedSfaPartitionLayout::kNumPartitions;
-                        tile.sfa_ready_generation = generation;
                     } else {
                         tile.ptr_A = mainloop.ptr_A + scheduler.curr_offset_a();
                         tile.ptr_scale_A = mainloop.ptr_scale_A + scheduler.curr_offset_mxfp4_scalea();
@@ -247,7 +226,7 @@ struct MegaMoEMxfp4Kernel {
                     Mma tiled_mma;
                     Tensor accum = partition_fragment_C(tiled_mma, take<0,2>(TileShape{}));
                     auto residue = Mainloop::compute_tile(tile, shape, coord, accum, tid, smem_buf);
-                    auto output = params.epilogue;
+                    auto output = epilogue_params;
                     if constexpr (kIsLinear1) {
                         output.ptr_D += scheduler.curr_offset_c();
                         output.ptr_SFD += scheduler.curr_offset_c_scales();
@@ -260,7 +239,7 @@ struct MegaMoEMxfp4Kernel {
                     } else {
                         epilogue(shape, TileShape{}, coord, accum, tiled_mma, residue, tid, epilogue_smem,
                             static_cast<uint32_t>(scheduler.problem_index()),
-                            static_cast<uint32_t>(scheduler.curr_offset_m()), params.scatter_buffer);
+                            static_cast<uint32_t>(scheduler.curr_offset_m()), *scatter_buffer);
                     }
                 }
 
@@ -274,8 +253,8 @@ struct MegaMoEMxfp4Kernel {
 
             if constexpr (WarpPipeline) __syncthreads();
             if constexpr (!kIsLinear1) {
-                comm::fp4_scatter_release<Ranks>(*params.scatter_barrier, params.scatter_buffer,
-                    gridDim.x, blockIdx.x, threadIdx.x, BN == 256);
+                comm::fp4_scatter_release<Ranks>(*signals, *scatter_buffer,
+                    gridDim.x, blockIdx.x, threadIdx.x, generation, BN == 256);
             }
         }
     };
@@ -294,10 +273,12 @@ struct MegaMoEMxfp4Kernel {
 
 template <typename Kernel>
 __global__ __launch_bounds__(Kernel::MaxThreadsPerBlock, Kernel::MinBlocksPerMultiprocessor)
-void sm89_fp4_fp4_mega_moe_l1(typename Kernel::Params params, MegaMoEReplicaWeights replicas) {
+void sm89_fp4_fp4_mega_moe_l1(typename Kernel::MainloopArguments mainloop, typename Kernel::EpilogueParams epilogue,
+                              typename Kernel::SchedulerParams scheduler, layout::MegaMoESignals* signals,
+                              MegaMoEReplicaWeights replicas) {
     extern __shared__ char smem[];
     Kernel op;
-    op(params, smem, replicas);
+    op(mainloop, epilogue, scheduler, signals, smem, replicas, resolve_fused_round_generation(*signals));
 }
 
 template <bool kBulkRemote>
@@ -305,11 +286,11 @@ __device__ __forceinline__ int4 moe_reduce_load(
         const __ppu_bfloat16* source, bool remote) {
     if constexpr (kBulkRemote) {
         if (remote) {
-            const uint4 bulk = __ppu_global_ldcg_bulk_b32x4(source);
+            const uint4 bulk = __ppu_global_ldbl_bulk_b32x4(source);
             return *reinterpret_cast<const int4*>(&bulk);
         }
     }
-    return __ldcg(reinterpret_cast<const int4*>(source));
+    return __ldbl(reinterpret_cast<const int4*>(source));
 }
 
 template <bool kCheckInvalid, bool kOutputAligned, int kTopK, int kHidden, bool kBulkRemote,
@@ -448,29 +429,19 @@ __device__ __forceinline__ void moe_reduce_impl(
 template <typename Kernel, int Ranks, int TopK, int Hidden, int Groups,
           int kColumnSplits, int kReduceGroupThreads, bool kOutputAligned>
 __global__ __launch_bounds__(Kernel::MaxThreadsPerBlock, Kernel::MinBlocksPerMultiprocessor)
-void sm89_fp4_fp4_mega_moe_l2(typename Kernel::Params params, MegaMoEReduceParams reduce,
-                            MegaMoEReplicaWeights replicas) {
+void sm89_fp4_fp4_mega_moe_l2(typename Kernel::MainloopArguments mainloop, typename Kernel::EpilogueParams epilogue,
+                              typename Kernel::SchedulerParams scheduler, layout::MegaMoESignals* signals,
+                              layout::SymBuffer<Ranks> scatter_buffer, MegaMoEReduceParams reduce,
+                              MegaMoEReplicaWeights replicas) {
     extern __shared__ char smem[];
-    // Snapshot before GEMM's grid barrier advances the scatter phase.
-    const int32_t reduce_phase = tix::ld_acq_sys(
-        &params.scatter_barrier->phase_counter) & 3;
+    const uint32_t generation = __ldbl(signals->preprocess_ready) & ~kPreprocessMetadataReadyBit;
     Kernel op;
-    op(params, smem, replicas);
+    op(mainloop, epilogue, scheduler, signals, smem, replicas, generation, &scatter_buffer);
 
-    if constexpr (Ranks == 8 || DG_MEGAMOE_OWNER_MODE) {
-        if (threadIdx.x == 0) {
-            const uint64_t observed = comm::fp4_scatter_acquire<Ranks>(
-                *params.scatter_barrier, reduce_phase);
-#if DG_MEGAMOE_OWNER_MODE
-            *reinterpret_cast<uint64_t*>(smem) = observed;
-#endif
-        }
-        __syncthreads();
-    }
-    uint64_t writer_mask = UINT64_MAX;
-#if DG_MEGAMOE_OWNER_MODE
-    writer_mask = *reinterpret_cast<const uint64_t*>(smem);
-#endif
+    comm::rank_barrier<Ranks, true>(
+        signals->scatter_arrivals, generation,
+        reinterpret_cast<uint32_t*>(smem));
+    const uint64_t writer_mask = *reinterpret_cast<const uint64_t*>(smem);
     constexpr int kReduceThreads = kReduceGroupThreads > 0 ? kReduceGroupThreads : Kernel::MaxThreadsPerBlock;
     constexpr int kTokenGroups = Kernel::MaxThreadsPerBlock / kReduceThreads;
     unsigned int reduce_thread = threadIdx.x;
@@ -484,10 +455,10 @@ void sm89_fp4_fp4_mega_moe_l2(typename Kernel::Params params, MegaMoEReduceParam
         for (int work = blockIdx.x * kTokenGroups + token_group;
              work < reduce.tokens * kColumnSplits; work += gridDim.x * kTokenGroups) {
             moe_reduce_impl<kOutputAligned, TopK, Hidden, true, kReduceThreads, kColumnSplits>(
-                params.scatter_buffer.template get_base_ptr<const __ppu_bfloat16*>(),
+                scatter_buffer.template get_base_ptr<const __ppu_bfloat16*>(),
                 reduce.ids, reduce.weights, static_cast<__ppu_bfloat16*>(reduce.output),
-                static_cast<int>(params.epilogue.token_capacity), Groups,
-                params.scatter_buffer.rank_idx, work / kColumnSplits, work % kColumnSplits, writer_mask, reduce_thread);
+                static_cast<int>(epilogue.token_capacity), Groups,
+                scatter_buffer.rank_idx, work / kColumnSplits, work % kColumnSplits, writer_mask, reduce_thread);
         }
     }
 }

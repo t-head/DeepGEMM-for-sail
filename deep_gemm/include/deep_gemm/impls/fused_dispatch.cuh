@@ -19,10 +19,9 @@ struct alignas(16) CopyRankMetadataShared {
     uint64_t row_addr[BlockM];
 };
 
-__device__ __forceinline__ uint32_t resolve_fused_round_generation(
-    const sched::MegaMoESchedulerArguments& sched) {
+__device__ __forceinline__ uint32_t resolve_fused_round_generation(const volatile layout::MegaMoESignals& signals) {
     // Stream order makes one cached load enough to read Quant's generation.
-    return *sched.preprocess_ready_flags & ~kPreprocessMetadataReadyBit;
+    return signals.preprocess_ready[0] & ~kPreprocessMetadataReadyBit;
 }
 
 // Turn CTA0's rank prefixes into row addresses for this M-block.
@@ -340,8 +339,8 @@ __device__ void run_copy_block(
 
 template <class TileScheduler, uint32_t BlockM, uint32_t NumThreads>
 __device__ __forceinline__ void prepare_expert_layout_and_reshape_sfa(
-    const sched::MegaMoESchedulerArguments& sched, char* smem_buf,
-    uint32_t generation) {
+    const sched::MegaMoESchedulerArguments& sched, layout::MegaMoESignals* signals,
+    char* smem_buf, uint32_t generation) {
     constexpr uint32_t kNumRanks = TileScheduler::kNumRanks;
     constexpr uint32_t kNumLocalExperts = TileScheduler::kNumGroups;
     constexpr uint32_t kNumTotalExperts =
@@ -357,14 +356,11 @@ __device__ __forceinline__ void prepare_expert_layout_and_reshape_sfa(
         kNumRanks, kNumTotalExperts, kSourceCapacity, TileScheduler::kNumTopK,
         kHidden, TileScheduler::SHAPE_N / 2, sched.staging);
 
-    volatile uint32_t* ready = sched.preprocess_ready_flags;
+    volatile uint32_t* ready = signals->preprocess_ready;
     uint32_t metadata_ready = kPreprocessMetadataReadyBit | generation;
     auto* smem = reinterpret_cast<uint32_t*>(smem_buf);
     uint32_t parity = generation & 1u;
-    auto* base = sched.sym_buffer.get_base_ptr();
-    const volatile uint32_t* arrival_slots = buffers.dispatch_arrivals[0].data<uint32_t>(base) +
-        parity * layout::kNumMaxRanks;
-    const uint32_t* local_pushed_counts = buffers.staging_counts[parity].data<uint32_t>(base);
+    const uint32_t* local_pushed_counts = buffers.staging_counts[parity].data<uint32_t>(signals);
 
     if (blockIdx.x == 0) {
         // Generation tags avoid clearing ready flags every round.
@@ -383,7 +379,7 @@ __device__ __forceinline__ void prepare_expert_layout_and_reshape_sfa(
 
         prepare_expert_metadata<
             BlockM, kNumRanks, kNumLocalExperts, NumThreads>(
-                arrival_slots, generation, sched.copy_grouped_layout,
+                signals->dispatch_arrivals, generation, sched.copy_grouped_layout,
                 const_cast<uint32_t*>(sched.expert_rank_prefix), sched.expert_base,
                 reinterpret_cast<uint32_t*>(sched.grouped_layout), smem, local_pushed_counts,
                 sched.cumulative_local_expert_recv_stats, gridDim.x - TileScheduler::kNumCopyBlocks,
@@ -400,11 +396,8 @@ __device__ __forceinline__ void prepare_expert_layout_and_reshape_sfa(
             __stbl(const_cast<uint32_t*>(ready), metadata_ready);
     } else {
         const bool is_compute_cta = blockIdx.x >= TileScheduler::kNumCopyBlocks;
-        if (is_compute_cta && threadIdx.x < kNumRanks) {
-            while (arrival_slots[threadIdx.x] != generation) { }
-        }
         if (threadIdx.x == 0) {
-            while (deep_gemm::ld_copy_ready_uncached(ready) != metadata_ready) { }
+            while (tix::ld_ready_flag_uncached(ready) != metadata_ready) { }
         }
         if (is_compute_cta) {
             __syncthreads();
@@ -418,8 +411,8 @@ __device__ __forceinline__ void prepare_expert_layout_and_reshape_sfa(
                         smem[kNumRanks] = entry.w;
                     const uint32_t row_begin = (work - entry.z) * BlockM;
                     reshape_sfa<kNumRanks, TileScheduler::kNumTopK, kSourceCapacity, kHidden, NumThreads, true>(
-                        buffers.staging_scales[parity].data<uint16_t>(base),
-                        buffers.staging_tokens[parity].data<uint32_t>(base), sched.expert_rank_prefix,
+                        buffers.staging_scales[parity].data<uint16_t>(signals),
+                        buffers.staging_tokens[parity].data<uint32_t>(signals), sched.expert_rank_prefix,
                         entry.x, 0, sched.local_sfa_buf, smem, sched.src_info, row_begin, BlockM);
                     __ppu_threadfence_uncache();
                     __syncthreads();
@@ -443,8 +436,8 @@ __device__ __forceinline__ void prepare_expert_layout_and_reshape_sfa(
                     if (threadIdx.x == 0)
                         smem[kNumRanks] = __ldbl(sched.expert_base + expert_local);
                     reshape_sfa<kNumRanks, TileScheduler::kNumTopK, kSourceCapacity, kHidden, NumThreads>(
-                        buffers.staging_scales[parity].data<uint16_t>(base),
-                        buffers.staging_tokens[parity].data<uint32_t>(base), sched.expert_rank_prefix,
+                        buffers.staging_scales[parity].data<uint16_t>(signals),
+                        buffers.staging_tokens[parity].data<uint32_t>(signals), sched.expert_rank_prefix,
                         expert_local, work % kSfaPartitions, sched.local_sfa_buf, smem, sched.src_info);
 
                     __ppu_threadfence_uncache();

@@ -97,20 +97,6 @@ struct ScatterEpilogueParams {
     uint32_t token_capacity = 0;
 };
 
-struct FusedDispatchMainloopArguments : FP4GemmRuntime::MainLoopArguments {
-    volatile uint32_t* copy_ready_flags = nullptr;
-    uint32_t copy_ready_generation = 0;
-    uint32_t copy_k_tiles_per_flag = 0;
-    volatile uint32_t* sfa_ready_flags = nullptr;
-    uint32_t sfa_ready_generation = 0;
-};
-
-template <int Ranks>
-struct ScatterParams : FP4GemmRuntime::GemmKernelParamsT<ScatterEpilogueParams> {
-    layout::SymBuffer<Ranks> buffer{};
-    int32_t* barrier = nullptr;
-};
-
 // Mirror the device epilogue ABI, with an activation-specific parameter tail.
 // SwiGLU stays byte-for-byte compatible with the grouped FP4 epilogue.
 template <GatedActivation Activation>
@@ -135,13 +121,9 @@ public:
     static_assert(Stage == MegaMoEPhaseKind::Linear1 || Stage == MegaMoEPhaseKind::Linear2,
                   "unsupported MegaMoE stage");
     static constexpr bool kIsLinear1 = Stage == MegaMoEPhaseKind::Linear1;
-    using Params = std::conditional_t<kIsLinear1,
-        FP4GemmRuntime::GemmKernelParamsT<Linear1EpilogueArguments<Activation>,
-                                        FusedDispatchMainloopArguments, sched::MegaMoESchedulerArguments>,
-        ScatterParams<Ranks>>;
 
     struct LaunchInfo {
-        int n, k, block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
+        int n, k, block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages, num_sms;
         int copy_blocks = 0, k_tiles_per_flag = 0, source_capacity = 1, topk = 1;
         bool apply_clamp = false, wide_offsets = false, warp_pipeline = false;
         bool has_linear_beta = true;
@@ -152,7 +134,11 @@ public:
         const char* kernel_name;
         LaunchInfo launch_info;
         LaunchArgs launch_args;
-        Params kernel_params{};
+        FP4GemmRuntime::MainLoopArguments mainloop{};
+        std::conditional_t<kIsLinear1, Linear1EpilogueArguments<Activation>, ScatterEpilogueParams> epilogue{};
+        std::conditional_t<kIsLinear1, sched::MegaMoESchedulerArguments, TileSchedulerArguments> scheduler{};
+        layout::MegaMoESignals* signals = nullptr;
+        layout::SymBuffer<Ranks> scatter_buffer{};
         MegaMoEReplicaWeights replica_weights{};
         const int64_t* reduce_ids = nullptr;
         const float* reduce_weights = nullptr;
@@ -172,7 +158,7 @@ public:
             const int cta_threads = static_cast<int>(a.launch_args.block_dim.x);
             // Group only when the reduce work can cover at least one CTA per SM.
             if (cta_threads > kGroupThreads && cta_threads % kGroupThreads == 0 &&
-                a.tokens * column_splits >= a.kernel_params.hw_info.cu_count * (cta_threads / kGroupThreads))
+                a.tokens * column_splits >= info.num_sms * (cta_threads / kGroupThreads))
                 reduce_group_threads = kGroupThreads;
         }
         const auto kernel_args = kIsLinear1 ? std::string{"Kernel"} :
@@ -186,10 +172,9 @@ public:
 using Builder = deep_gemm::MegaMoEMxfp4Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation::{}, {}, {}, {}>;
 using Kernel = Builder::Kernel;
 static_assert(Kernel::SharedStorageSize == {}, "MegaMoE shared storage size differs from host");
-static_assert(sizeof(Kernel::Params) == {}, "MegaMoE parameter size differs from host");
-static_assert(offsetof(Kernel::Params, mainloop) == {}, "MegaMoE mainloop offset differs from host");
-static_assert(offsetof(Kernel::Params, epilogue) == {}, "MegaMoE epilogue offset differs from host");
-static_assert(offsetof(Kernel::Params, scheduler) == {}, "MegaMoE scheduler offset differs from host");
+static_assert(sizeof(Kernel::MainloopArguments) == {}, "MegaMoE mainloop size differs from host");
+static_assert(sizeof(Kernel::EpilogueParams) == {}, "MegaMoE epilogue size differs from host");
+static_assert(sizeof(Kernel::SchedulerParams) == {}, "MegaMoE scheduler size differs from host");
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::{}<{}>);
 }}
@@ -203,17 +188,18 @@ static void __instantiate_kernel() {{
             Activation == GatedActivation::SwiGLUStep ? "SwiGLUStep" :
             Activation == GatedActivation::SwiGLUOAI ? "SwiGLUOAI" : "SwiGLU", info.has_linear_beta, info.fast_math,
             a.replica_weights.weights != nullptr,
-            a.launch_args.smem_size, sizeof(Params),
-            offsetof(Params, collective_mainloop_params), offsetof(Params, collective_epilogue_params),
-            offsetof(Params, scheduler), a.kernel_name, kernel_args);
+            a.launch_args.smem_size, sizeof(a.mainloop), sizeof(a.epilogue), sizeof(a.scheduler),
+            a.kernel_name, kernel_args);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {
         if constexpr (kIsLinear1) {
-            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.kernel_params, a.replica_weights));
+            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.mainloop, a.epilogue, a.scheduler,
+                                                a.signals, a.replica_weights));
         } else {
-            const MegaMoEReduceParams reduce{a.reduce_ids, a.reduce_weights, a.reduce_output, a.tokens};
-            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.kernel_params, reduce, a.replica_weights));
+            MegaMoEReduceParams reduce{a.reduce_ids, a.reduce_weights, a.reduce_output, a.tokens};
+            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.mainloop, a.epilogue, a.scheduler,
+                                                a.signals, a.scatter_buffer, reduce, a.replica_weights));
         }
     }
 };
@@ -248,18 +234,17 @@ static FP4GemmRuntime::MainLoopArguments make_mainloop_arguments(int m, int n, i
 }
 
 template <typename Runtime>
-static void launch_gemm(typename Runtime::Args& args, int num_sms, int expected_m) {
+static void launch_gemm(typename Runtime::Args& args, int expected_m) {
+    const auto& info = args.launch_info;
     const auto name = args.kernel_name;
     const auto runtime = compiler->build(name, Runtime::generate(args));
     const int blocks = get_kernel_occupancy(runtime, args.launch_args.block_dim.x, args.launch_args.smem_size);
-    args.kernel_params.hw_info.cu_count = num_sms * blocks;
-    args.launch_args.grid_dim.x = args.kernel_params.hw_info.cu_count;
-    const auto& info = args.launch_info;
+    args.launch_args.grid_dim.x = info.num_sms * blocks;
     DgProfParam profile;
     auto& profiling = ProfilingInterface::Instance();
     if (profiling.get_op_info()) {
         profile.set_params(GemmType::MegaMoE, false, "fp4", info.num_groups,
-            cute::get<0>(args.kernel_params.problem_shape), info.n, info.k, expected_m, nullptr, current_stream());
+            cute::get<0>(args.mainloop.problem_shape), info.n, info.k, expected_m, nullptr, current_stream());
         profile.add_params("stage", name);
     }
     profiling.instrument(true, profile);
@@ -278,8 +263,8 @@ static void launch_gemm(typename Runtime::Args& args, int num_sms, int expected_
 #endif
         printf("[%s] groups:%d problem:[%d,%d,%d] num_sms:%d blocks_per_sm:%d grid:%u\n"
                "tile:[%d,%d,%d] warp:[%d,%d] stages:%d smem:%d vreg:%d stack:%d\n",
-            name, info.num_groups, cute::get<0>(args.kernel_params.problem_shape), info.n, info.k,
-            num_sms, blocks, args.launch_args.grid_dim.x, info.block_m, info.block_n, info.block_k,
+            name, info.num_groups, cute::get<0>(args.mainloop.problem_shape), info.n, info.k,
+            info.num_sms, blocks, args.launch_args.grid_dim.x, info.block_m, info.block_n, info.block_k,
             info.warp_m, info.warp_n, info.num_stages, args.launch_args.smem_size, registers, stack_bytes);
     }
 }
@@ -289,7 +274,7 @@ static auto make_linear1_args(
     const torch::Tensor& l1_weights, const torch::Tensor& l1_weights_sf,
     const MegaMoEReplicaWeights& replicas, int num_experts_per_rank,
     uint8_t* l2_acts, uint16_t* l2_acts_sf, int compact_m, int num_topk,
-    const sched::MegaMoESchedulerArguments& scheduler,
+    const sched::MegaMoESchedulerArguments& scheduler, layout::MegaMoESignals* signals,
     const typename GatedActivationOp<Activation>::Params& activation_params,
     const MegaMoEL1Config& config, bool fast_math) {
     using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks, Activation>;
@@ -310,23 +295,20 @@ static auto make_linear1_args(
         .kernel_name = "sm89_fp4_fp4_mega_moe_l1",
         .launch_info = {.n = n, .k = k, .block_m = config.block_m, .block_n = config.block_n, .block_k = config.block_k,
                         .warp_m = config.warp_m, .warp_n = config.warp_n, .num_groups = num_experts_per_rank, .num_stages = config.num_stages,
+                        .num_sms = config.num_sms,
                         .copy_blocks = config.copy_blocks, .k_tiles_per_flag = config.k_tiles_per_flag,
                         .source_capacity = m / Ranks, .topk = num_topk,
                         .apply_clamp = apply_clamp, .has_linear_beta = has_linear_beta, .fast_math = fast_math},
         .launch_args = {dim3(1), dim3((config.block_m / config.warp_m) * (config.block_n / config.warp_n) * 32), config.smem_size},
-        .kernel_params = {
-            .mode = cutlass::gemm::GemmUniversalMode::kGemm,
-            .problem_shape = {m, n, k, 1},
-            .collective_mainloop_params = {make_mainloop_arguments(m, n, k, compact_m,
-                scheduler.local_fp4_buf, scheduler.local_sfa_buf, l1_weights, l1_weights_sf)},
-            .collective_epilogue_params = {
-                .stride_C = cutlass::make_cute_packed_stride(S{}, cute::make_shape(m, 0, 1)),
-                .ptr_D = l2_acts,
-                .stride_D = cutlass::make_cute_packed_stride(S{}, cute::make_shape(m, n, 1)),
-                .ptr_SFD = l2_acts_sf, .shape_m = static_cast<uint32_t>(compact_m),
-                .activation = activation_params},
-            .hw_info = {l1_weights.get_device(), config.num_sms},
-            .scheduler = scheduler},
+        .mainloop = make_mainloop_arguments(m, n, k, compact_m,
+            scheduler.local_fp4_buf, scheduler.local_sfa_buf, l1_weights, l1_weights_sf),
+        .epilogue = {
+            .stride_C = cutlass::make_cute_packed_stride(S{}, cute::make_shape(m, 0, 1)),
+            .ptr_D = l2_acts,
+            .stride_D = cutlass::make_cute_packed_stride(S{}, cute::make_shape(m, n, 1)),
+            .ptr_SFD = l2_acts_sf, .shape_m = static_cast<uint32_t>(compact_m),
+            .activation = activation_params},
+        .scheduler = scheduler, .signals = signals,
         .replica_weights = replicas};
 }
 
@@ -336,7 +318,8 @@ static void launch_linear1(
     const torch::Tensor& l1_weights, const torch::Tensor& l1_weights_sf,
     const MegaMoEReplicaWeights& replicas, int num_experts_per_rank,
     uint8_t* l2_acts, uint16_t* l2_acts_sf, int compact_m, int num_topk,
-    const sched::MegaMoESchedulerArguments& scheduler, const MegaMoEL1Config& config, bool fast_math, int expected_m) {
+    const sched::MegaMoESchedulerArguments& scheduler, layout::MegaMoESignals* signals,
+    const MegaMoEL1Config& config, bool fast_math, int expected_m) {
     auto launch = [&](auto activation_tag) {
         constexpr auto kind = decltype(activation_tag)::value;
         using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks, kind>;
@@ -349,8 +332,8 @@ static void launch_linear1(
             activation_params = activation_clamp;
 
         auto args = make_linear1_args<Ranks, kind>(l1_weights, l1_weights_sf, replicas, num_experts_per_rank, l2_acts, l2_acts_sf,
-                                                   compact_m, num_topk, scheduler, activation_params, config, fast_math);
-        launch_gemm<Runtime>(args, config.num_sms, expected_m);
+                                                   compact_m, num_topk, scheduler, signals, activation_params, config, fast_math);
+        launch_gemm<Runtime>(args, expected_m);
     };
 
     if (activation == GatedActivation::SiTU)
@@ -368,8 +351,8 @@ static auto make_linear2_args(
     uint8_t* l2_acts, uint16_t* l2_acts_sf, int m,
     const torch::Tensor& l2_weights, const torch::Tensor& l2_weights_sf,
     const MegaMoEReplicaWeights& replicas, int num_experts_per_rank,
-    int32_t* masked_m, const layout::TokenSrcMetadata* src_info, const layout::SymBuffer<Ranks>& scatter_buffer, int32_t* barrier,
-    int num_max_tokens_per_rank, int num_topk, MegaMoEL2Config config) {
+    int32_t* masked_m, const layout::TokenSrcMetadata* src_info, const layout::SymBuffer<Ranks>& scatter_buffer,
+    layout::MegaMoESignals* signals, int num_max_tokens_per_rank, int num_topk, MegaMoEL2Config config) {
     using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear2, Ranks>;
     const int n = l2_weights.size(1), k = l2_weights.size(2);
     const bool warp_pipeline = config.block_m == 256 && config.block_n == 256;
@@ -379,26 +362,20 @@ static auto make_linear2_args(
             config.num_stages, config.block_m, config.block_n, config.warp_m,
             config.warp_n, config.block_k, n, false, false)) + 3 * 32 * 256 * 2;
     }
-    typename Runtime::Args args{
+    return typename Runtime::Args{
         .kernel_name = "sm89_fp4_fp4_mega_moe_l2",
         .launch_info = {.n = n, .k = k, .block_m = config.block_m, .block_n = config.block_n, .block_k = config.block_k,
                         .warp_m = config.warp_m, .warp_n = config.warp_n, .num_groups = num_experts_per_rank, .num_stages = config.num_stages,
+                        .num_sms = config.num_sms,
                         .wide_offsets = static_cast<int64_t>(num_topk) * num_max_tokens_per_rank * n > UINT32_MAX,
                         .warp_pipeline = warp_pipeline},
         .launch_args = {dim3(1), dim3(warp_pipeline ? scatter_pipeline::kCtaThreads :
-            (config.block_m / config.warp_m) * (config.block_n / config.warp_n) * 32), config.smem_size}};
-    auto& params = args.kernel_params;
-    params.mode = cutlass::gemm::GemmUniversalMode::kGemm;
-    params.problem_shape = {m, n, k, 1};
-    params.collective_mainloop_params = make_mainloop_arguments(m, n, k, m, l2_acts, l2_acts_sf, l2_weights, l2_weights_sf);
-    params.collective_epilogue_params = {.src_info = src_info, .masked_m = masked_m,
-                                         .token_capacity = static_cast<uint32_t>(num_max_tokens_per_rank)};
-    params.hw_info = {l2_weights.get_device(), config.num_sms};
-    params.scheduler = TileSchedulerArguments(m, masked_m);
-    params.buffer = scatter_buffer;
-    params.barrier = barrier;
-    args.replica_weights = replicas;
-    return args;
+            (config.block_m / config.warp_m) * (config.block_n / config.warp_n) * 32), config.smem_size},
+        .mainloop = make_mainloop_arguments(m, n, k, m, l2_acts, l2_acts_sf, l2_weights, l2_weights_sf),
+        .epilogue = {.src_info = src_info, .masked_m = masked_m,
+                     .token_capacity = static_cast<uint32_t>(num_max_tokens_per_rank)},
+        .scheduler = TileSchedulerArguments(m, masked_m), .signals = signals,
+        .scatter_buffer = scatter_buffer, .replica_weights = replicas};
 }
 
 static void fp4_mega_moe_pre_dispatch_impl(
@@ -446,13 +423,13 @@ static void sm89_fp4_fp4_mega_moe(
     scheduler.copy_ready_flags = mega_buffer.copy_ready.data<uint32_t>(base);
     scheduler.dispatch_fp4 = mega_buffer.dispatch_fp4.data(base);
     scheduler.dispatch_token_topk = mega_buffer.staging_tokens[0].data<uint32_t>(base);
-    scheduler.preprocess_ready_flags = mega_buffer.preprocess_ready.data<uint32_t>(base);
     scheduler.expert_base = mega_buffer.expert_base.data<uint32_t>(base);
     scheduler.src_info = mega_buffer.src_info.data<layout::TokenSrcMetadata>(base);
     scheduler.sym_buffer = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx);
     scheduler.num_copy_blocks = l1_config.copy_blocks;
     scheduler.cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats
         ? cumulative_local_expert_recv_stats->data_ptr<int32_t>() : nullptr;
+    auto* signals = reinterpret_cast<layout::MegaMoESignals*>(base);
     auto* l2_acts = mega_buffer.l2_acts.data(base);
     auto* l2_acts_sf = mega_buffer.l2_acts_sf.data<uint16_t>(base);
     const int compact_m = static_cast<int>(mega_buffer.compact);
@@ -463,8 +440,7 @@ static void sm89_fp4_fp4_mega_moe(
         scatter_buffer.base += mega_buffer.scatter_storage.offset;
         auto l2_args = make_linear2_args<Ranks>(
             l2_acts, l2_acts_sf, compact_m, l2_weights, l2_weights_sf, l2_replicas, num_experts_per_rank,
-            masked_m, scheduler.src_info,
-            scatter_buffer, mega_buffer.barrier_storage.data<int32_t>(base), num_max_tokens_per_rank, num_topk, l2_config);
+            masked_m, scheduler.src_info, scatter_buffer, signals, num_max_tokens_per_rank, num_topk, l2_config);
         l2_args.reduce_ids = mega_buffer.topk_idx.data<int64_t>(base);
         l2_args.reduce_weights = mega_buffer.topk_weights.data<float>(base);
         l2_args.reduce_output = y.data_ptr();
@@ -473,8 +449,8 @@ static void sm89_fp4_fp4_mega_moe(
 
         launch_linear1<Ranks>(activation, activation_clamp, situ_beta, situ_linear_beta, activation_alpha,
                               l1_weights, l1_weights_sf, l1_replicas, num_experts_per_rank,
-                              l2_acts, l2_acts_sf, compact_m, num_topk, scheduler, l1_config, fast_math, expected_m);
-        launch_gemm<Linear2Runtime>(l2_args, l2_config.num_sms, expected_m);
+                              l2_acts, l2_acts_sf, compact_m, num_topk, scheduler, signals, l1_config, fast_math, expected_m);
+        launch_gemm<Linear2Runtime>(l2_args, expected_m);
     });
 }
 
