@@ -1,6 +1,7 @@
 #pragma once
 
 #include <torch/python.h>
+#include <algorithm>
 #include <cstdint>
 #include "cute/tensor.hpp"
 #include "../../jit/compiler.hpp"
@@ -28,16 +29,18 @@ using Config = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int
 static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor& lhs, const torch::Tensor& rhs,
                                                              const torch::Tensor& out, const torch::Tensor& m_indices,
                                                              const int& m, const int& n, const int& k,
-                                                             const int& num_groups, std::optional<ConfigTuple> configs) {
+                                                             const int& num_groups, std::optional<ConfigTuple> configs,
+                                                             const std::optional<torch::Tensor>& c = std::nullopt) {
     int num_sms = get_num_sms();
     Config cfg;
+    bool from_runtime_lut = false;
     if (configs.has_value()) {
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
     } else {
         cfg = deep_gemm_bf16_common::get_best_configs(
-            m, n, k, 1, num_sms, GemmType::MGroupedContiguous);
+            m, n, k, 1, num_sms, GemmType::MGroupedContiguous, 256, &from_runtime_lut);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
@@ -58,6 +61,79 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     cutlass::bfloat16_t* input_a = reinterpret_cast<cutlass::bfloat16_t*>(lhs.data_ptr<at::BFloat16>());
     cutlass::bfloat16_t* output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
 
+    const bool with_c = c.has_value();
+    auto* input_c = with_c ? reinterpret_cast<cutlass::bfloat16_t*>(c->data_ptr<at::BFloat16>()) : output;
+    const uintptr_t cd_addresses = reinterpret_cast<uintptr_t>(input_c) | reinterpret_cast<uintptr_t>(output);
+    // Preserve explicit/LUT tiles and the tuned S2/S3 selection thresholds.
+    const bool auto_wide = !configs.has_value() && !from_runtime_lut && is_ppu1v5_device() &&
+        block_m == 128 && n % 512 == 0 && k >= 1024 && k % 64 == 0;
+    const bool wide_auto_no_c = auto_wide && !with_c && m >= 16384 && (cd_addresses & 3) == 0 &&
+        PpuHwParams::instance().tsm_per_cu >= 163840 &&
+        PpuHwParams::instance().max_threads_per_cta >= 1024;
+    const bool wide_auto_c = auto_wide && with_c && m >= 65536 && m % 128 == 0 &&
+        (cd_addresses & 15) == 0 && PpuHwParams::instance().tsm_per_cu >= 163840 &&
+        PpuHwParams::instance().max_threads_per_cta >= 1024;
+    const bool wide_auto_s3 = auto_wide && m >= 65536 && m % 128 == 0 && n >= 2048 && k >= 2048 &&
+        (cd_addresses & 15) == 0 && PpuHwParams::instance().tsm_per_cu >= 245760 &&
+        PpuHwParams::instance().max_threads_per_cta >= 512;
+    if (wide_auto_no_c || wide_auto_c || wide_auto_s3) {
+        // Moderate-M overwrite GEMMs favor BN256 for narrow N or short K.
+        // Large long-K GEMMs retain the final S3/WM64 override.
+        const bool prefer_narrow = !with_c && m <= 32768 &&
+            (n <= 1024 || (k <= 1024 && int64_t(m) * n <= int64_t(64) * 1024 * 1024));
+        block_n = prefer_narrow ? 256 : 512;
+        block_k = 64;
+        warp_m = (wide_auto_s3 || prefer_narrow) ? 64 : 32;
+        warp_n = 64;
+        num_stages = wide_auto_s3 ? 3 : 2;
+        num_sms_new = num_sms;
+        smem_config = deep_gemm_bf16_common::get_smem_config(
+            num_stages, k, block_m, block_n, block_k, 2);
+        SMSIZE = std::get<0>(smem_config);
+    }
+    // PPU1.0 TSM copies 16 bytes at a time. Its C-load predicate covers
+    // vector starts only, so unaligned C/D or row tails use the scalar
+    // no-TSM AddC epilogue. The original no-C path is unchanged.
+    const bool allow_tsm_epilogue = !with_c || (n % 8 == 0 && (cd_addresses & 15) == 0);
+    const bool vectorized_c = with_c && n % 2 == 0 && (cd_addresses & 3) == 0;
+    // Smaller warp tiles expose more C-load parallelism. S3 keeps WM64;
+    // preserve the existing adjustment for other automatic/LUT C tiles.
+    if (!wide_auto_s3 && vectorized_c && !configs.has_value() && is_ppu1v5_device() &&
+        warp_m == 64 && warp_n == 64) {
+        warp_m = 32;
+    }
+
+    // C reuses the completed AB pipeline's storage. The coalesced loader
+    // depends on the output tile/warp layout, independently of K staging.
+    // Default BM128 respects the existing 128-row group-boundary contract.
+    // Larger M tiles require explicit configs and the caller's alignment;
+    // N tails use predicated vector preloads; unaligned pointers retain the
+    // predicated global-C epilogue.
+    const int64_t c_staging_bytes = int64_t(block_m) * block_n * sizeof(cutlass::bfloat16_t);
+    const int64_t ab_staging_bytes = int64_t(num_stages) * (block_m + block_n) *
+                                     block_k * sizeof(cutlass::bfloat16_t);
+    // On a narrow tile, very small grids cannot amortize the preload barrier
+    // (e.g. 256x128x128). Enable the automatic path from 32 output tiles;
+    // explicit configurations can still exercise staging on smaller grids.
+    const bool enough_c_tiles = with_c && (configs.has_value() || block_n == 256 ||
+        int64_t(ceil_div(m, block_m)) * ceil_div(n, block_n) >= std::min(num_sms, 32));
+    const bool stage_c = with_c && (configs.has_value() || block_m == 128) && is_ppu1v5_device() &&
+        enough_c_tiles &&
+        (block_n == 128 || block_n == 256 ||
+         ((configs.has_value() || wide_auto_c || wide_auto_s3) && block_n == 512 && block_m == 128 &&
+          block_k == 64 && (warp_m == 32 || warp_m == 64) &&
+          (num_stages == 2 || num_stages == 3))) && warp_n == 64 &&
+        ((block_m == 256 && warp_m == 64) ||
+         (block_m == 128 && (warp_m == 32 || warp_m == 64))) &&
+        ((block_m == 128 && block_n == 128 && block_k == 32 && num_stages == 2) ||
+         (block_k == 64 && (num_stages >= 2 && num_stages <= 4)) ||
+         (block_k == 128 && num_stages == 2)) &&
+        c_staging_bytes <= ab_staging_bytes && ab_staging_bytes <= SMSIZE &&
+        SMSIZE <= PpuHwParams::instance().tsm_per_cu &&
+        m % block_m == 0 && n % 8 == 0 &&
+        k % block_k == 0 && k / block_k >= num_stages &&
+        (cd_addresses & 15) == 0;
+
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.cu_count = num_sms_new;
@@ -70,8 +146,8 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         .mainloopargs = {input_a, stride_A, input_b, stride_B},
         .epilogueargs =
             {
-                {1, 0},
-                output,
+                {1.0f, with_c ? 1.0f : 0.0f},
+                input_c,
                 stride_D,
                 output,
                 stride_D,
@@ -81,10 +157,11 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         .signal = nullptr};
 
     BF16GemmCutlass3Runtime::GemmKernelParams params =
-        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr, with_c, allow_tsm_epilogue);
     auto args = BF16GemmCutlass3Runtime::Args{
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "MGroupedContiguous",
-                        "Default", "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap},
+                        "Default", "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap, with_c, allow_tsm_epilogue,
+                        vectorized_c, stage_c},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = params};
     const auto& code = BF16GemmCutlass3Runtime::generate(args);
@@ -118,6 +195,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
                block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
         printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
+        printf("WithC:%d, StageC:%d\n", int(with_c), int(stage_c));
     }
 
 }
