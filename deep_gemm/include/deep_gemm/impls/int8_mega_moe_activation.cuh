@@ -51,6 +51,54 @@ __device__ __forceinline__ float int8_gated_value(
     return __bfloat162float(__float2bfloat16(value));
 }
 
+// Each warp owns a complete activated row, so independent rows do not wait on
+// CTA-wide reductions. Keep the existing scale and rounding expressions.
+template <int Intermediate, int Threads, bool NormalQuantization>
+__device__ __forceinline__ void int8_quant_activated_warp(
+        const __ppu_bfloat16* input, int8_t* output, float* scales,
+        const uint32_t* rows) {
+    constexpr int Vector = 8;
+    constexpr int Warps = Threads / 32;
+    static_assert(Threads % 32 == 0 && Intermediate % (32 * Vector) == 0);
+    const uint32_t lane = threadIdx.x % 32;
+    const uint32_t warp = threadIdx.x / 32;
+    const uint32_t count = *rows;
+    for (uint32_t row = blockIdx.x * Warps + warp; row < count; row += gridDim.x * Warps) {
+        float values[Intermediate / 32];
+        float amax = 1.0e-10f;
+        #pragma unroll
+        for (int i = 0; i < Intermediate / (32 * Vector); ++i) {
+            const uint64_t offset = uint64_t(row) * Intermediate + (i * 32 + lane) * Vector;
+            const int4 packed = *reinterpret_cast<const int4*>(input + offset);
+            const auto* source = reinterpret_cast<const __ppu_bfloat16*>(&packed);
+            #pragma unroll
+            for (int j = 0; j < Vector; ++j) {
+                values[i * Vector + j] = __bfloat162float(source[j]);
+                amax = fmaxf(amax, fabsf(values[i * Vector + j]));
+            }
+        }
+        #pragma unroll
+        for (int offset = 16; offset; offset >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+        const float scale = NormalQuantization ? amax * (1.0f / 127.0f) : amax / 127.0f;
+        if (lane == 0) scales[row] = scale;
+        #pragma unroll
+        for (int i = 0; i < Intermediate / (32 * Vector); ++i) {
+            uint2 packed{};
+            auto* target = reinterpret_cast<int8_t*>(&packed);
+            #pragma unroll
+            for (int j = 0; j < Vector; ++j) {
+                const float value = values[i * Vector + j];
+                const float quantized = NormalQuantization
+                    ? roundf(value * (127.0f * __ppu_rcpf(amax))) : value / scale;
+                target[j] = static_cast<int8_t>(fminf(127.0f, fmaxf(-128.0f, quantized)));
+            }
+            const uint64_t offset = uint64_t(row) * Intermediate + (i * 32 + lane) * Vector;
+            *reinterpret_cast<uint2*>(output + offset) = packed;
+        }
+    }
+}
+
 // The original masked INT8 path rounds SiLU and its product to BF16, then
 // truncates the normalized value to INT8. Input dispatch has a different
 // contract (DeepEP round-to-nearest); keep that distinction explicit.
