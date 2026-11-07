@@ -27,12 +27,14 @@ __device__ __forceinline__ void quantize_group(
     #pragma unroll
     for (int i = 0; i < 4; ++i)
         amax = fmaxf(amax, fabsf(values[i]));
-    const float sf = warp_absmax(amax) / 448.0f;
+    // Match per-token quantization's rounded scale factor and normalization.
+    const float sf = warp_absmax(amax) * (1.0f / 448.0f);
+    const float inv_sf = 1.0f / sf;
     if (lane == 0)
         *scale = sf;
     #pragma unroll
     for (int i = 0; i < 4; ++i)
-        output[lane * 4 + i] = __hg_fp8_e4m3(values[i] / sf);
+        output[lane * 4 + i] = __hg_fp8_e4m3(values[i] * inv_sf);
 }
 
 }  // namespace deep_gemm::mega_moe::fp8_blockwise

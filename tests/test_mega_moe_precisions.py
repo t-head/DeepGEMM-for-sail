@@ -365,6 +365,12 @@ def test_mega_moe_precision_complete_tiles(case, mega_moe_group):
                          experts=128 * mega_moe_group.size(), worlds=(mega_moe_group.size(),),
                          routing="skewed" if hidden == 256 else "random",
                          tokens=(1, 33, 0, 129, 8)), mega_moe_group)
+    if case.precision == "fp8_channelwise":
+        # Small K can leave the mainloop arena smaller than the BF16 scatter tile.
+        run_case(replace(case, hidden=512, intermediate=128, capacity=2048,
+                         experts=8 * mega_moe_group.size(), worlds=(mega_moe_group.size(),),
+                         tokens=(2048, 33, 0), routing="random", reference_tokens=2048),
+                 mega_moe_group)
 
 
 @pytest.mark.parametrize("case", tuple(c for c in SMOKE_CASES if c.activation == "situ"), ids=lambda c: c.name)
@@ -453,6 +459,14 @@ def test_mega_moe_precision_api(case, mega_moe_group):
     ids[0, 0], weights[0, 0] = -1, float("nan")
     y = torch.empty_like(source[:1])
     try:
+        if case.precision == "fp8_blockwise":
+            num_tokens = source.size(0)
+            q, scales = quantize_rows(source, blockwise=True)
+            dg.mega_moe_pre_dispatch(source, ids.expand(num_tokens, -1).contiguous(),
+                                     weights.expand(num_tokens, -1).contiguous(), pipeline.buffer)
+            torch.testing.assert_close(pipeline.buffer.x_sf[:num_tokens], scales, rtol=0, atol=0)
+            torch.testing.assert_close(pipeline.buffer.x[:num_tokens].view(torch.uint8), q.view(torch.uint8),
+                                       rtol=0, atol=0)
         expected = pipeline.forward(source[:1], ids, weights, y).clone()
         for dtype in (torch.int32, torch.int64):
             typed_ids = ids.to(dtype)

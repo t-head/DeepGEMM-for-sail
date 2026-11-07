@@ -87,13 +87,24 @@ public:
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
 
-  using SharedStorage = typename BaseUniversal::SharedStorage;
+  struct ScatterSharedStorage {
+    // Default has completed its mainloop before staging BF16 accumulators.
+    // Reserve the larger phase explicitly, including small-K configurations.
+    union SharedTensorStorage {
+      MainloopSharedStorage mainloop;
+      EpilogueSharedStorage epilogue;
+      cute::array_aligned<cutlass::bfloat16_t, BlockM * BlockN, 128> scatter_tile;
+    } tensors;
+  };
+  using SharedStorage = cute::conditional_t<
+      GemmScatter::kSharedFromAccumulators, ScatterSharedStorage,
+      typename BaseUniversal::SharedStorage>;
 
   static_assert(
       !GemmScatter::kSharedFromAccumulators ||
-          sizeof(MainloopSharedStorage) >= SharedBf16TileBytes,
-      "generic channelwise shared scatter requires the completed mainloop "
-      "storage to hold one exact BF16 output tile");
+          sizeof(SharedStorage) >= SharedBf16TileBytes,
+      "channelwise scatter requires its shared arena to hold one exact "
+      "BF16 output tile");
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
   struct Arguments : BaseUniversal::Arguments {
@@ -292,7 +303,7 @@ public:
                 m_block_idx * BlockM * N);
 
         if constexpr (GemmScatter::kSharedFromAccumulators) {
-          // The completed mainloop storage now holds the BF16 scatter tile.
+          // Reuse the shared arena after the mainloop has completed.
           auto* shared_tile =
               reinterpret_cast<__ppu_bfloat16*>(smem_buf);
 

@@ -352,7 +352,9 @@ channel_scatter_policy(int expected_m, int n, int k, int groups, int masters, in
     const int sms = sms_override.value_or(physical_sms);
     TORCH_CHECK(sms > 0 && sms <= physical_sms);
     std::string kernel = kernel_override.value_or("Default");
-    TORCH_CHECK(kernel == "Default" || kernel == "OverlapPrologue");
+    TORCH_CHECK(kernel == "Default",
+                "FP8 channelwise MegaMoE supports Default scatter only; "
+                "OverlapPrologue does not implement replica-aware kernel parameters");
     if (!requested && tuning.tile && (!tuning.capacity || *tuning.capacity == capacity) &&
         (!tuning.requires_no_replicas || masters == groups)) {
         const auto& t = *tuning.tile;
@@ -376,6 +378,8 @@ channel_scatter_policy(int expected_m, int n, int k, int groups, int masters, in
     c.num_master_groups = masters;
     c.num_stages = stages;
     c.kernel_type = kernel;
+    // Default scatter reuses a union of the mainloop and BF16 output tile.
+    c.smem_size = std::get<0>(smem);
     c.use_padded_valid_rows = padded;
     return {*requested, c};
 }

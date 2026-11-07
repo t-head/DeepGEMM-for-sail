@@ -172,6 +172,8 @@ using Family = ChannelwiseFp8GemmWithScatter<cutlass::float_e4m3_t,float,
     {N},{K},{BLOCK_M},{BLOCK_N},{BLOCK_K},{WARP_M},{WARP_N},{NUM_GROUPS},{NUM_STAGES},
     GemmType::MGroupedNoPad,false,KernelStrategy::{KERNEL_TYPE},Scatter,{NUM_RANKS}>;
 using Kernel = typename Family::GemmKernel;
+static_assert(Kernel::SharedStorageSize == {SMEM_SIZE},
+              "channelwise scatter shared-memory estimate must match its arena");
 )DGSOURCE";
 }
 
