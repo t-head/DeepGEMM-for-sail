@@ -105,7 +105,9 @@ using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<
 using Epilogue = mega_moe::w4a8::Scatter<{N}, {K}, {BLOCK_M}, {BLOCK_N}>;
 extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes =
     Epilogue::SharedBytes > sizeof(Kernel::SharedStorage) ? Epilogue::SharedBytes : sizeof(Kernel::SharedStorage);
-extern "C" __global__ __launch_bounds__({NUM_THREADS}, 1)
+// Keep the thread bound without a minimum-residency hint: HGGC's two-argument
+// launch bound can miscompile this shared-memory scatter epilogue.
+extern "C" __global__ __launch_bounds__({NUM_THREADS})
 void PPU_KERNEL_ENTRY(const cutlass::float_e4m3_t* a, const float* a_scale,
     const uint8_t* w, const uint8_t* s, float inv, const uint8_t* rw, const uint8_t* rs, float rinv,
     int masters, int32_t* rows, const int32_t* valid, const int64_t* routes,
