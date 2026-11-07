@@ -585,6 +585,13 @@ static void int8_mega_moe_impl(
         buffers.expert_base.data<uint32_t>(base) + groups};
     auto quantization_kernel = compiler->build("megamoe_int8_quant",
         Int8MegaMoEQuantRuntime::generate(quantization));
+    // Large row quantization can use the full vector-CU budget. Keep small
+    // launches and the generated row-quantization strategy unchanged.
+    const int vector_grid = device_runtime->get_prop()->multiProcessorCount * 4;
+    if (device_runtime->get_arch_pair() == std::make_pair(8, 0) &&
+        vector_grid > quantization.launch_args.grid_dim.x &&
+        quantization.expected_rows >= int64_t(vector_grid) * (quantization.launch_args.block_dim.x / 32))
+        quantization.launch_args.grid_dim.x = vector_grid;
     Int8MegaMoEQuantRuntime::launch(quantization_kernel, quantization);
     if (stage1_done) stage1_done();
 
