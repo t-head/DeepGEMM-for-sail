@@ -283,7 +283,11 @@ public:
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
 
       const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_scalea;
-      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + scale_offset_b / 128 / 128;
+      // Each expert owns ceil(N/128) * ceil(K/128) scale blocks.
+      const auto expert_idx = scale_offset_b / (int64_t(N) * int64_t(K));
+      const auto scale_stride_b = int64_t(cute::ceil_div(N, 128)) * cute::ceil_div(K, 128);
+      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) +
+                                        expert_idx * scale_stride_b;
       auto mk_layout = make_layout(
         make_shape(make_shape(Int<1>{}, M),
                   make_shape(Int<128>{}, cute::ceil_div(K, 128))),
@@ -619,7 +623,11 @@ public:
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
       const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_scalea;
-      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) + scale_offset_b / 128 / 128;
+      // Each expert owns ceil(N/128) * ceil(K/128) scale blocks.
+      const auto expert_idx = scale_offset_b / (int64_t(N) * int64_t(K));
+      const auto scale_stride_b = int64_t(cute::ceil_div(N, 128)) * cute::ceil_div(K, 128);
+      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) +
+                                        expert_idx * scale_stride_b;
       auto mk_layout = make_layout(
         make_shape(make_shape(Int<1>{}, M),
                   make_shape(Int<128>{}, cute::ceil_div(K, 128))),
