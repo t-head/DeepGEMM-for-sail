@@ -354,7 +354,7 @@ private:
                         }
                         if (destination_rank == scatter_buffer.rank_idx) {
                             asm volatile(
-                                "ppu.st.global.cg.v4.b32 [%0], {%1, %2, %3, %4};"
+                                "ppu.st.global.bl.v4.b32 [%0], {%1, %2, %3, %4};"
                                 :: "l"(destination), "r"(value.packed.x),
                                    "r"(value.packed.y), "r"(value.packed.z),
                                    "r"(value.packed.w) : "memory");
@@ -373,7 +373,7 @@ private:
                             *reinterpret_cast<const int32_t*>(&low),
                             *reinterpret_cast<const int32_t*>(&high)};
                         asm volatile(
-                            "ppu.st.global.cg.v2.b32 [%0], {%1, %2};"
+                            "ppu.st.global.bl.v2.b32 [%0], {%1, %2};"
                             :: "l"(destination), "r"(packed.x),
                                "r"(packed.y) : "memory");
                     }
