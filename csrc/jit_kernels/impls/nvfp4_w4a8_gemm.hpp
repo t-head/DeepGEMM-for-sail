@@ -1,6 +1,8 @@
 #pragma once
 #include <c10/core/DeviceGuard.h>
 #include <limits>
+#include <map>
+#include <tuple>
 #include <variant>
 #include "m_grouped_fp8_gemm.hpp"
 #include "fused_moe_gemm.hpp"
@@ -50,6 +52,18 @@ public:
         LaunchArgs launch_args;
         Arguments<Scheduler> kernel_params;
     };
+
+    // Keep this key in sync with the inputs formatted by generate_impl.
+    static auto compile_key(const Args& args) {
+        const auto& i = args.info;
+        const auto& c = i.tile;
+        return std::make_tuple(i.n, i.k, c.block_m, c.block_n, c.block_k,
+            c.warp_m, c.warp_n, c.warp_k, i.groups, c.num_stages, i.type,
+            i.group_size, c.n_expand, i.a_scale_group, i.has_a_scale,
+            i.has_weight_global_scale, i.has_b_scale, i.b_scale_block,
+            i.smem, i.threads, i.name);
+    }
+
     static std::string generate_impl(const Args& args) {
         const auto& i = args.info;
         const auto& c = i.tile;
@@ -86,14 +100,24 @@ template <typename Scheduler>
 static void launch(const LaunchInfo& info, const Arguments<Scheduler>& params) {
     using R = Runtime<Scheduler>;
     typename R::Args args{info, {dim3(info.tile.num_sms), dim3(info.threads), info.smem}, params};
-    const auto& code = R::generate(args);
-    const auto& compiled = compiler->build(info.name, code);
-    construct_launch_config(compiled->kernel, current_stream(), info.smem,
-                            args.launch_args.grid_dim, args.launch_args.block_dim);
-    int occupancy = 0;
-    DG_HGGC_UNIFIED_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occupancy, compiled->kernel, info.threads, info.smem));
-    TORCH_CHECK(occupancy > 0, "W4A8 tile exceeds device resources");
+    const auto compiled = compiler->build_cached<R>(info.name, args);
+    int device;
+    DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device));
+    using OccupancyKey = std::tuple<int, const KernelRuntime*, int, int>;
+    static thread_local std::map<OccupancyKey, int> occupancy_cache;
+    const auto key = std::make_tuple(device, compiled.get(), info.threads, info.smem);
+    auto it = occupancy_cache.find(key);
+    if (it == occupancy_cache.end()) {
+        // Raise the dynamic shared-memory limit before querying occupancy.
+        construct_launch_config(compiled->kernel, current_stream(), info.smem,
+                                args.launch_args.grid_dim, args.launch_args.block_dim);
+        int occupancy = 0;
+        DG_HGGC_UNIFIED_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occupancy, compiled->kernel, info.threads, info.smem));
+        TORCH_CHECK(occupancy > 0, "W4A8 tile exceeds device resources");
+        it = occupancy_cache.emplace(key, occupancy).first;
+    }
+    const int occupancy = it->second;
     args.launch_args.grid_dim = dim3(info.tile.num_sms < 20 ? info.tile.num_sms
         : info.tile.num_sms * std::min(8, occupancy));
     R::launch(compiled, args);
@@ -399,7 +423,8 @@ static void dispatch(GemmType kind, const Activation& lhs, Weight rhs, const tor
             TORCH_CHECK(indices.dim() == 1 && indices.numel() == m, "m_indices must be int32 [M]");
             expected_m = ceil_div(m, groups);
         }
-        counts = rows ? *rows : at::bincount(indices.to(at::kLong), {}, groups).to(at::kInt);
+        counts = rows ? *rows : at::zeros({groups}, indices.options()).index_add_(
+            0, indices.to(at::kLong), at::ones_like(indices));
         check_indices(counts, a);
         TORCH_CHECK(counts.dim() == 1 && counts.numel() == groups, "m_rows must be int32 [E]");
     }

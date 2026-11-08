@@ -252,13 +252,13 @@ def run_nvfp4_gemm(args, *, check_accuracy=True, benchmark=False, ref_backend='d
         if m in tiles:
             configs = (deep_gemm.get_num_sms(), *tiles[m])
 
-    def run():
+    def run(rows=m_rows):
         lhs = (a, a_scale)
         if kind == 'dense':
             deep_gemm.gemm_fp8_nvfp4_bf16_nt(lhs, tuple(x[0] for x in rhs), out, **kwargs)
         elif kind == 'nopad':
             deep_gemm.m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad(
-                lhs, rhs, out, m_indices, m_rows=m_rows, configs=configs, **kwargs)
+                lhs, rhs, out, m_indices, m_rows=rows, configs=configs, **kwargs)
         elif kind == 'masked':
             deep_gemm.m_grouped_gemm_fp8_nvfp4_bf16_nt_masked(
                 lhs, rhs, out, m_rows, args.get('em', m), configs=configs, **kwargs)
@@ -336,21 +336,28 @@ def run_nvfp4_gemm(args, *, check_accuracy=True, benchmark=False, ref_backend='d
         print(f' > Performance (NVFP4 {execution}, {kind}, groups={e}, rows={rows}, n={n}, k={k}): '
               f'{t * 1e6:.1f} us | throughput: {2 * rows * n * k / t / 1e12:.2f} TFLOPS')
     if regressions and check_accuracy and kind == 'nopad' and (m == 17 or (m == 1 and k == 192)):
-        # Replay verifies that weights and scales refresh in both execution modes.
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run()
-        codes = torch.randint(16, codes.shape, device='cuda', dtype=torch.uint8)
-        native_scale = (native_scale.float() * .75).to(native_scale.dtype)
-        updated = _prepare_nvfp4(codes, native_scale, execution)
-        for dst, src in zip(rhs, updated):
-            dst.copy_(src)
-        a_scale.mul_(.75)
-        b_scale.add_(.125)
-        global_scale.mul_(.875)
-        for _ in range(16 if k == 192 else 1):
-            graph.replay()
-            check()
+        # Replay refreshes weights/scales and exercises optional device-side counts.
+        for rows in (m_rows, None):
+            run(rows)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run(rows)
+            codes = torch.randint(16, codes.shape, device='cuda', dtype=torch.uint8)
+            native_scale = (native_scale.float() * .75).to(native_scale.dtype)
+            updated = _prepare_nvfp4(codes, native_scale, execution)
+            for dst, src in zip(rhs, updated):
+                dst.copy_(src)
+            a_scale.mul_(.75)
+            b_scale.add_(.125)
+            global_scale.mul_(.875)
+            if rows is None:
+                counts = counts[::-1]
+                m_indices.copy_(torch.repeat_interleave(
+                    torch.arange(e, device='cuda', dtype=torch.int32),
+                    torch.tensor(counts, device='cuda', dtype=torch.int32)))
+            for _ in range(16 if k == 192 else 1):
+                graph.replay()
+                check()
 
 
 def _test_nvfp4_preprocessing_memory(execution):
@@ -421,6 +428,7 @@ def _test_nvfp4_offline_scale_profile(profile):
     folded, restore = _absorb_fp8_scale(codes, native_scale)
     methods = [('direct_cast', native_scale, torch.ones_like(restore)),
                ('offline_absorb', folded, restore)]
+    direct_restored = _cast_fp8(original).float() * global_scale[:, None, None]
     weight_errors = {}
     for method, kernel_scales, rhs_scales in methods:
         pre_cast = _decode_nvfp4(codes, kernel_scales)
@@ -434,8 +442,6 @@ def _test_nvfp4_offline_scale_profile(profile):
             assert saturated == 0 and weight_errors[method] < .05, (profile, method, weight_errors[method])
             if profile == 'small':
                 torch.testing.assert_close(restored, direct_restored, rtol=0, atol=0)
-        else:
-            direct_restored = restored
         print(json.dumps({
             'profile': profile, 'method': method,
             'weight_vs_nvfp4_rel_l2': weight_errors[method],
