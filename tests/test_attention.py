@@ -108,6 +108,30 @@ def test_mqa_logits_loop():
 
 def test_paged_mqa_logits_loop():
     print('Testing Paged MQA Logits:')
+    # Packed FP4 D128 uses storage_dim=64, for both weighted H64 and AVG H4.
+    num_sms = deep_gemm.get_num_sms()
+    for next_n, num_heads in ((1, 64), (5, 4)):
+        q = torch.empty((3, next_n, num_heads, 64), device='cuda', dtype=torch.int8)
+        context_lens = torch.tensor([0, 129, 513], device='cuda', dtype=torch.int32)
+        context_lens = context_lens[:, None].expand(-1, next_n).contiguous()
+        metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, 64, num_sms, q=q)
+        legacy = deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, 64, num_sms, None, (next_n, num_heads, 64, 1))
+        torch.testing.assert_close(metadata, legacy, rtol=0, atol=0)
+
+    for kwargs, message in (
+        ({'q': q, 'metadata_extra': (next_n, num_heads, 64, 1)}, 'pass either q or metadata_extra'),
+        ({'q': q[0]}, 'q must have shape'),
+        ({'q': q[:2]}, 'q batch and next_n must match'),
+        ({'q': q[:, :1]}, 'q batch and next_n must match'),
+    ):
+        try:
+            deep_gemm.get_paged_mqa_logits_metadata(context_lens, 64, num_sms, **kwargs)
+        except RuntimeError as exc:
+            assert message in str(exc), str(exc)
+        else:
+            raise AssertionError(f'Expected metadata API rejection: {message}')
+
     data_types = ['int8']
     if is_ppu1v5_device():
         data_types.extend(['fp8', 'fp4'])

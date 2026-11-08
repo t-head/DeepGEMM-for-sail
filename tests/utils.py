@@ -2307,17 +2307,22 @@ def test_paged_mqa_logits(args) -> None:
     else:
         pre_context_lens = context_lens
 
-    get_metadata_kernel = deep_gemm.get_paged_mqa_logits_metadata
+    def get_metadata(q_input):
+        if pre_context_lens.shape != context_lens.shape:
+            # The pre_distribution case intentionally builds metadata for a different batch.
+            return deep_gemm.get_paged_mqa_logits_metadata(
+                pre_context_lens, pagesize, deep_gemm.get_num_sms(),
+                metadata_extra=(*q_input.shape[1:], q_input.element_size()))
+        return deep_gemm.get_paged_mqa_logits_metadata(
+            pre_context_lens, pagesize, deep_gemm.get_num_sms(), q=q_input)
 
     if data_type == torch.bfloat16:
-        metadata_extra = (next_n, num_heads, head_dim, q.element_size())
-        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
+        schedule_metadata = get_metadata(q)
         logits = deep_gemm.bf16_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False, logits_dtype=logits_dtype)
     elif data_type == torch.float8_e4m3fn:
         q_fp8 = q.to(torch.float8_e4m3fn)
         kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
-        metadata_extra = (next_n, num_heads, head_dim, q_fp8.element_size())
-        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
+        schedule_metadata = get_metadata(q_fp8)
         if is_avg:
             logits = deep_gemm.fp8_paged_mqa_avg_logits(q_fp8, kv_cache_fp8, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False, logits_dtype=logits_dtype)
         else:
@@ -2328,8 +2333,7 @@ def test_paged_mqa_logits(args) -> None:
         q_int8_scale = q_int8_scale.reshape(batch_size * next_n, num_heads)
         weights_int8 = weights * q_int8_scale.to(weights.dtype)
         kv_cache_int8 = kv_cache_cast_to_int8(kv_cache)
-        metadata_extra = (next_n, num_heads, head_dim, q_int8.element_size())
-        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
+        schedule_metadata = get_metadata(q_int8)
         logits = deep_gemm.int8_paged_mqa_logits(q_int8, kv_cache_int8, weights_int8, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False, logits_dtype=logits_dtype)
     elif data_type == torch.uint8:  # FP4
         q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
@@ -2337,9 +2341,7 @@ def test_paged_mqa_logits(args) -> None:
         q_dequant = cast_back_from_fp4(q_fp4[0], q_fp4[1], gran_k=32, use_packed_ue8m0=True).view(batch_size, next_n, num_heads, head_dim).to(torch.bfloat16)
         kv_cache_fp4, kv_cache_dequant = kv_cache_cast_to_fp4(kv_cache)
         q, kv_cache = q_dequant, kv_cache_dequant
-        metadata_extra = (next_n, num_heads, head_dim // 2, q_fp4[0].element_size())
-        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(),
-                                                metadata_extra=metadata_extra)
+        schedule_metadata = get_metadata(q_in[0])
         if is_avg:
             logits = deep_gemm.fp8_fp4_paged_mqa_avg_logits(
                 q=q_in, fused_kv_cache=kv_cache_fp4,
