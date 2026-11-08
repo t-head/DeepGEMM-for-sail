@@ -97,6 +97,7 @@ struct DeepGemmScheduler {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if constexpr(kGemmType == GemmType::MGroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
+            curr_group_idx = 0;
         } else if constexpr(kGemmType == GemmType::MGroupedMasked) {
             curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_blocks = curr_cumsum_m = 0;
         } else if constexpr(kGemmType == GemmType::MGroupedNoPad || kGemmType == GemmType::MGroupedFused) {
@@ -414,7 +415,12 @@ struct DeepGemmScheduler {
         // scale are organized in uint16_t
         uint32_t shape_k_scale = math::ceil_div(SHAPE_K, (uint32_t)32);
 
-        return int64_t(curr_group_idx) * SHAPE_N * shape_k_scale;
+        if constexpr (kGemmType == GemmType::MGroupedContiguous) {
+            int64_t group_idx = __ldg(params.grouped_layout + m_block_idx * BLOCK_M);
+            return group_idx * SHAPE_N * shape_k_scale;
+        } else {
+            return int64_t(curr_group_idx) * SHAPE_N * shape_k_scale;
+        }
     }
 
     // Gets the pointer offset of matrix C

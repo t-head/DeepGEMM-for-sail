@@ -210,7 +210,7 @@ struct CollectiveMma<
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
-    copy_aiu(
+    copy_aiu<false>(
       gmem_tiled_copy_A, tAgA(_,_,_,Int<0>{}), tAsA(_,_,_,Int<0>{}),
       gmem_tiled_copy_B, tBgB(_,_,_,Int<0>{}), tBsB(_,_,_,Int<0>{}),
       warp_idx
@@ -276,7 +276,7 @@ struct CollectiveMma<
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 1; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
-      copy_aiu(
+      copy_aiu<false>(
         gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
         gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
         warp_idx
@@ -386,7 +386,7 @@ struct CollectiveMma<
           __syncthreads();
 
           if (k_tile_count > 0) {
-            copy_aiu(
+            copy_aiu<false>(
               gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
               gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
               warp_idx
