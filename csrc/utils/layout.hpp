@@ -158,14 +158,8 @@ torch::Tensor get_col_major_tensor(const torch::Tensor& x) {
 }
 
 int get_mk_alignment_for_contiguous_layout() {
-    /*
-    When we do a grouped GEMM in contiguous format, LHS are grouped into several batches along the M axis.
-    Since we deal with exactly one sub-matrix of RHS for each GEMM block, batch sizes above should align well
-        with GEMM block shape.
-    Returns:
-        Group-level alignment requirement for grouped contiguous layout, which is always 128.
-    */
-    return 128;
+    // Each contiguous tile must stay within one expert's aligned storage.
+    return 256;
 }
 
 } // namespace deep_gemm

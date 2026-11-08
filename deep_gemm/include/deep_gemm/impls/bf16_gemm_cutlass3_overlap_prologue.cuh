@@ -210,7 +210,7 @@ struct CollectiveMma<
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
-    copy_aiu(
+    copy_aiu<false>(
       gmem_tiled_copy_A, tAgA(_,_,_,Int<0>{}), tAsA(_,_,_,Int<0>{}),
       gmem_tiled_copy_B, tBgB(_,_,_,Int<0>{}), tBsB(_,_,_,Int<0>{}),
       warp_idx
@@ -271,12 +271,13 @@ struct CollectiveMma<
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
     // issued 1 stage in prologue
+    const int k_tile_count_total = k_tile_count;
     --k_tile_count;
     ++k_tile_iter;
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 1; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
-      copy_aiu(
+      copy_aiu<false>(
         gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
         gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
         warp_idx
@@ -386,7 +387,7 @@ struct CollectiveMma<
           __syncthreads();
 
           if (k_tile_count > 0) {
-            copy_aiu(
+            copy_aiu<false>(
               gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
               gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
               warp_idx
@@ -405,9 +406,12 @@ struct CollectiveMma<
 
     }
 
-    // TODO: original cutlass3 miss this sync
-    cp_async_wait<0>();
-    __syncthreads();
+    // PPU1.5 NoTsm epilogue does not touch smem, so the tail drain is deferred past the epilogue.
+    // Safe only when the in-flight stages cannot alias the next tile's stage-0 prologue.
+    if (k_tile_count_total % DispatchPolicy::Stages != 0) {
+      cp_async_wait<0>();
+      __syncthreads();
+    }
   }
 };
 
@@ -722,6 +726,11 @@ public:
         thread_idx,
         (char*)&shared_storage.tensors.epilogue
       );
+
+      // The previous tile's async loads finish under the epilogue; only the new stage-0 load may remain.
+      cp_async_wait<1>();
+      __syncthreads();
+
       // if (thread0()) {
       //   printf("accumulators[0] = %.4f\n", accumulators[0]);
       // }

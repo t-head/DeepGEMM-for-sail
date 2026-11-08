@@ -1129,7 +1129,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
                     metrics_string = "gpu__time_duration.sum,sm__cycles_elapsed.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed"
             else:
                 # "ce__cycles_elapsed.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum.pct_of_peak_sustained_elapsed"
-                metrics_string = "ppu__time_duration.sum,ce__cycles_elapsed.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum.pct_of_peak_sustained_elapsed"
+                metrics_string = "ppu__time_duration.sum,ce__cycles_elapsed.max,cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum.pct_of_peak_sustained_elapsed,ppu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
 
             _acc = "--disable_acc"
             cmd = '{} --clock-control none {} --metrics="{}"  \
@@ -1604,9 +1604,9 @@ def test_gemm(args) -> None:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)
         t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
-        print(f' > Performance (dtype={str(d)}, m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
-            f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
-            f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
+        print(f' > Performance (dtype={str(d)}, m={m:5}, n={n:5}, k={k:5}): {t * 1e6:9.3f} us | '
+            f'throughput: {2 * m * n * k / t / 1e12:.3f} TFLOPS, '
+            f'{(m * k + k * n + m * n * 2) / 1e9 / t:.3f} GB/s')
     return
 
 def test_m_grouped_gemm_contiguous(args) -> None:
@@ -1614,7 +1614,7 @@ def test_m_grouped_gemm_contiguous(args) -> None:
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
-    if d == torch.uint8 or d == "w4a8_int8":
+    if d == "w4a8_int8":
         print(f"ERROR: {d} does not support GroupedContiguous, please use GroupedNoPad or GroupedMasked instead!")
         exit(1)
     if use_ppu:
@@ -1624,6 +1624,8 @@ def test_m_grouped_gemm_contiguous(args) -> None:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
         elif d == torch.int8:
             deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
+        elif d == torch.uint8:
+            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_contiguous(x, y, out, m_indices)
         else:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices)
     else:
@@ -1661,6 +1663,8 @@ def test_m_grouped_gemm_contiguous(args) -> None:
                 deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
             elif d == torch.float8_e4m3fn:
                 deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices)
+            elif d == torch.uint8:
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_contiguous(x, y, out, m_indices)
             else:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)
@@ -1886,6 +1890,27 @@ def test_m_grouped_gemm_fused(args) -> None:
     else:
         print("Passed without acc_check\n")
 
+    if get_benchmark():
+        def test_func():
+            if d == torch.bfloat16:
+                deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+            elif d == torch.int8:
+                deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+            elif d == torch.float8_e4m3fn:
+                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+            elif d == torch.uint8:
+                if is_act_and_quant_fused(epilogue_type):
+                    deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs, out_scale=out_scale, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
+                else:
+                    deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+            elif d == 'w4fa8_mma':
+                deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+            elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
+                deep_gemm.m_grouped_gemm_w4a16_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
+        t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
+        print(f' > Perf (fused dtype={str(d)}, num_groups={num_groups}, num_token={num_token}, topk={topk}, n={n}, k={k}): {t * 1e6:9.3f} us | '
+              f'throughput: {2 * num_token * topk * n * k / t / 1e12:.3f} TFLOPS')
+
 def test_m_grouped_gemm_nopad(args) -> None:
     print('Testing grouped nopad GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
@@ -1975,9 +2000,9 @@ def test_m_grouped_gemm_nopad(args) -> None:
                 exit(1)
         t = bench_kineto(test_func, 'gemm', suppress_kineto_output=True)
         valid_m = (m_indices != -1).sum().item()
-        print(f' > Perf ((contiguous dtype={str(d)}, {num_groups=:2}, {ceil_div(m, num_groups)=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
-        f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
-        f'{(valid_m * k + num_groups * k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
+        print(f' > Perf ((contiguous dtype={str(d)}, {num_groups=:2}, {ceil_div(m, num_groups)=:4}, n={n:4}, k={k:4}): {t * 1e6:9.3f} us | '
+        f'throughput: {2 * m * n * k / t / 1e12:.3f} TFLOPS, '
+        f'{(valid_m * k + num_groups * k * n + m * n * 2) / 1e9 / t:.3f} GB/s')
 
     return
 

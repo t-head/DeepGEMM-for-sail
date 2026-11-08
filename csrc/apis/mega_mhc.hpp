@@ -129,7 +129,9 @@ static void mega_mhc(
     }
     const c10::cuda::CUDAGuard guard(x.device());
     std::lock_guard<std::mutex> lock(submit_mutex);
-    const auto* prop = at::cuda::getDeviceProperties(x.get_device());
+    hggcDeviceProp device_prop;
+    DG_HGGC_RUNTIME_CHECK(hggcGetDeviceProperties(&device_prop, x.get_device()));
+    const auto* prop = &device_prop;
     if (prop->major != 8 || prop->minor != 9 || std::string(prop->name).find("M890") == std::string::npos)
         throw std::runtime_error("Mega-mHC requires Zhenwu M890P");
     const int sms = get_num_sms();

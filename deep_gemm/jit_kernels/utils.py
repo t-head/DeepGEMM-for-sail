@@ -79,15 +79,8 @@ def ceil_div(x: int, y: int) -> int:
 
 
 def get_m_alignment_for_contiguous_layout():
-    """
-    When we do a grouped GEMM in contiguous format, LHS are grouped into several batches along the M axis.
-    Since we deal with exactly one sub-matrix of RHS for each GEMM block, batch sizes above should align well
-        with GEMM block shape.
-
-    Returns:
-        Group-level alignment requirement for grouped contiguous layout, which is always 128.
-    """
-    return 128
+    from ..deep_gemm_cpp import get_mk_alignment_for_contiguous_layout
+    return get_mk_alignment_for_contiguous_layout()
 
 def get_tma_aligned_size(x: int, element_size: int) -> int:
     """

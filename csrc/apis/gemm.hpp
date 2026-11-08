@@ -1018,6 +1018,65 @@ void m_grouped_bf16_gemm_nt_nopad(const torch::Tensor& lhs, const torch::Tensor&
     }
 }
 
+static void m_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                           const std::pair<torch::Tensor, torch::Tensor>& b,
+                                           const torch::Tensor& d,
+                                           const torch::Tensor& m_indices,
+                                           const std::string& compiled_dims = "nk",
+                                           std::optional<ConfigTuple> configs = std::nullopt) {
+    const auto& lhs = a.first;
+    const auto& lhs_scales = a.second;
+    const auto& rhs = b.first;
+    const auto& rhs_scales = b.second;
+    const auto& [m, k] = get_shape<2>(lhs);
+    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
+    const auto& [m_, n_] = get_shape<2>(d);
+
+    DG_HOST_ASSERT(m == m_ && n == n_ && k == k_);
+    DG_HOST_ASSERT(num_groups > 0 && n > 0 && k > 0 && k % 16 == 0);
+    DG_HOST_ASSERT(lhs.scalar_type() == torch::kUInt8 && rhs.scalar_type() == torch::kUInt8);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(m_indices.scalar_type() == torch::kInt32 && m_indices.dim() == 1 && m_indices.numel() == m);
+    DG_HOST_ASSERT(lhs_scales.dim() == 2 && rhs_scales.dim() == 3);
+    DG_HOST_ASSERT(lhs_scales.scalar_type() == torch::kUInt8 || lhs_scales.scalar_type() == torch::kUInt16);
+    DG_HOST_ASSERT(rhs_scales.scalar_type() == torch::kUInt8 || rhs_scales.scalar_type() == torch::kUInt16);
+    TORCH_CHECK(lhs.is_cuda() && rhs.is_cuda() && d.is_cuda() && m_indices.is_cuda()
+                && lhs_scales.is_cuda() && rhs_scales.is_cuda(), "FP4 tensors must be on device");
+    TORCH_CHECK(lhs.device() == rhs.device() && lhs.device() == d.device()
+                && lhs.device() == m_indices.device() && lhs.device() == lhs_scales.device()
+                && lhs.device() == rhs_scales.device(), "FP4 tensors must be on the same device");
+    TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
+    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+    TORCH_CHECK(m_indices.is_contiguous(), "m_indices must be contiguous");
+
+    if (m == 0) return;
+
+    torch::Tensor lhs_scales_t = lhs_scales;
+    torch::Tensor rhs_scales_t = rhs_scales;
+    if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(lhs_scales_t)) {
+        lhs_scales_t = deep_gemm_fp4_common::preprocess_mxfp4_scales(lhs_scales_t);
+    }
+    if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t)) {
+        rhs_scales_t = deep_gemm_fp4_common::post_preprocess_mxfp4_scales(rhs_scales_t);
+        if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t)) {
+            rhs_scales_t = deep_gemm_fp4_common::preprocess_mxfp4_scales(rhs_scales_t);
+        }
+    }
+    DG_HOST_ASSERT(deep_gemm_fp4_common::check_mxfp4_scales_layout(lhs_scales_t));
+    DG_HOST_ASSERT(deep_gemm_fp4_common::check_mxfp4_scales_layout(rhs_scales_t));
+    TORCH_CHECK(lhs_scales_t.sizes() == std::vector<int64_t>({m, ceil_div(k, 32)}), "Invalid SFA shape");
+    TORCH_CHECK(rhs_scales_t.sizes() == std::vector<int64_t>({num_groups, n, ceil_div(k, 32)}), "Invalid SFB shape");
+
+    const auto bias = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(lhs.device()));
+    if (device_runtime->get_arch_major() == 8) {
+        m_grouped_gemm_fp4_fp4_bf16_nt_impl<GemmType::MGroupedContiguous>(
+            lhs, lhs_scales_t, rhs, rhs_scales_t, bias, d, m_indices, torch::Tensor(), m, n, k, num_groups, configs);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+}
+
 static void m_grouped_fp4_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& a,
                                         const std::pair<torch::Tensor, torch::Tensor>& b,
                                         const std::optional<torch::Tensor>& bias,
@@ -1115,7 +1174,7 @@ static void m_grouped_fp4_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Te
 
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
-        m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(lhs, lhs_scales_t, rhs, rhs_scales_t, bias_tensor, d,
+        m_grouped_gemm_fp4_fp4_bf16_nt_impl<GemmType::MGroupedNoPad>(lhs, lhs_scales_t, rhs, rhs_scales_t, bias_tensor, d,
                                                     m_indices, m_rows_tensor, m, n, k, num_groups, configs,
                                                     out_scale_tensor, swiglu_limit.value_or(0.0f), activation_type.value_or("silu_and_mul"));
     } else {
@@ -1904,6 +1963,9 @@ static void register_apis(pybind11::module_& m) {
           py::arg("d"), py::arg("c") = std::nullopt,
           py::arg("recipe") = std::nullopt, py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false, py::arg("configs") = std::nullopt);
+    m.def("m_grouped_fp4_gemm_nt_contiguous", &m_grouped_fp4_gemm_nt_contiguous,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"),
+          py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
     m.def("m_grouped_fp4_gemm_nt_nopad", &m_grouped_fp4_gemm_nt_nopad,
           R"(MoE GroupedNoPad FP4 GEMM.
 

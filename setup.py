@@ -39,6 +39,7 @@ build_include_dirs = [path for path in (
     ppu_include,
     os.path.join(ppu_sdk, 'include'),
     os.path.join(ppu_sdk, 'include', 'cccl'),
+    os.path.join(ppu_sdk, 'CUDA_SDK', 'include'),
 ) if os.path.isdir(path)] + [
     current_dir + '/deep_gemm/include',
     current_dir + '/third-party/actlize_v1.0.0/',

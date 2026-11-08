@@ -1,7 +1,6 @@
 #pragma once
 
 #include <acblasLt.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
 
 #include "../../jit/device_runtime.hpp"
@@ -106,9 +105,9 @@ static void acblaslt_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs,
     const auto trans_b = a_major == MajorType::K ? ACBLAS_OP_N : ACBLAS_OP_T;
 
     // Matrix layouts
-    const auto hggc_type_a = at::cuda::ScalarTypeToCudaDataType(rhs.scalar_type());
-    const auto hggc_type_b = at::cuda::ScalarTypeToCudaDataType(lhs.scalar_type());
-    const auto hggc_type_d = at::cuda::ScalarTypeToCudaDataType(out.scalar_type());
+    const auto hggc_type_a = static_cast<hggcDataType>(at::cuda::ScalarTypeToCudaDataType(rhs.scalar_type()));
+    const auto hggc_type_b = static_cast<hggcDataType>(at::cuda::ScalarTypeToCudaDataType(lhs.scalar_type()));
+    const auto hggc_type_d = static_cast<hggcDataType>(at::cuda::ScalarTypeToCudaDataType(out.scalar_type()));
     const auto layout_a = b_major == MajorType::K ? get_acblaslt_layout(hggc_type_a, k, n, rhs.stride(0))
                                                            : get_acblaslt_layout(hggc_type_a, n, k, rhs.stride(1));
     const auto layout_b = a_major == MajorType::K ? get_acblaslt_layout(hggc_type_b, k, m, lhs.stride(0))

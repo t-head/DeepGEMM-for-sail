@@ -10,7 +10,8 @@ namespace deep_gemm {
 // Grouped FP4 GEMM API Implementations
 // =============================================================================
 
-static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
+template <GemmType kGemmType>
+static void m_grouped_gemm_fp4_fp4_bf16_nt_impl(
     const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
     const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
     const torch::Tensor& bias, const torch::Tensor& out,
@@ -34,14 +35,19 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
             deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, n, hasBias, enable_act_and_quant_fusing));
     } else {
         selected_config = deep_gemm_fp4_common::get_best_configs(
-            m, expected_m, n, k, num_groups, num_sms, hasBias, enable_act_and_quant_fusing, GemmType::MGroupedNoPad);
+            m, expected_m, n, k, num_groups, num_sms, hasBias, enable_act_and_quant_fusing, kGemmType);
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
     auto SMSIZE = std::get<0>(smem_config);
+    if constexpr (kGemmType == GemmType::MGroupedContiguous) {
+        DG_HOST_ASSERT(block_m > 0 && get_mk_alignment_for_contiguous_layout() % block_m == 0);
+    }
 
     int kNumGroups = num_groups;
-    static constexpr GemmType kGemmType = GemmType::MGroupedNoPad;
+    const char* gemm_type = kGemmType == GemmType::MGroupedContiguous ? "MGroupedContiguous" : "MGroupedNoPad";
+    const char* kernel_name = kGemmType == GemmType::MGroupedContiguous
+                                  ? "fp4_grouped_deep_gemm_contiguous" : "fp4_grouped_deep_gemm_nopad";
     const EpilogueType kEpilogueType = enable_act_and_quant_fusing ? get_epilogue_type(activation_type) : EpilogueType::Default;
 
     // N_EXPAND logic, keep in sync with m_grouped_gemm_fp4.py (nopad).
@@ -97,46 +103,38 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     uint16_t* ptr_SFD = enable_act_and_quant_fusing ? out_scale.data_ptr<uint16_t>() : nullptr;
     float* ptr_C = nullptr;
 
-    // Compute m_rows from m_indices if not provided
     at::Tensor m_rows_tensor;
-    if (!m_rows.defined() || m_rows.numel() == 0) {
-        at::Tensor counts = at::bincount(m_indices);
-        int64_t min_n = std::min<int64_t>(counts.size(0), num_groups);
-        at::Tensor experts_for_rows =
-            at::zeros({num_groups}, at::TensorOptions().dtype(at::kInt).device(m_indices.device()));
-        if (min_n > 0) {
-            experts_for_rows.narrow(0, 0, min_n).copy_(counts.narrow(0, 0, min_n).to(at::kInt));
+    at::Tensor block_m_info;
+    int32_t* layout_info = m_indices.data_ptr<int32_t>();
+    if constexpr (kGemmType == GemmType::MGroupedNoPad) {
+        if (!m_rows.defined() || m_rows.numel() == 0) {
+            at::Tensor counts = at::bincount(m_indices);
+            int64_t min_n = std::min<int64_t>(counts.size(0), num_groups);
+            at::Tensor experts_for_rows =
+                at::zeros({num_groups}, at::TensorOptions().dtype(at::kInt).device(m_indices.device()));
+            if (min_n > 0) {
+                experts_for_rows.narrow(0, 0, min_n).copy_(counts.narrow(0, 0, min_n).to(at::kInt));
+            }
+            m_rows_tensor = experts_for_rows;
+        } else {
+            m_rows_tensor = m_rows;
         }
-        m_rows_tensor = experts_for_rows;
-    } else {
-        m_rows_tensor = m_rows;
-    }
-
-    // Compute block_m_info
-    int64_t block_m_info_size = (num_groups + ceil_div(m + 1 - num_groups, block_m)) * 4;
-    at::Tensor block_m_info =
-        at::empty({block_m_info_size}, at::TensorOptions().dtype(at::kInt).device(m_rows_tensor.device()));
-
-    // Grouped layout: start with m_rows, may be replaced by block_m_info for preprocessing
-    int32_t* layout_info = reinterpret_cast<int32_t*>(m_rows_tensor.data_ptr<int32_t>());
-
-    // ComputeBlockInfoKernel preprocessing for NoPad with large num_groups
-    // NOTE: mirrors DeepGemmScheduler::kIsNoPadPreprocessLayout in scheduler_cutlass3.cuh,
-    // which is `(kGemmType == GroupedNoPad || kGemmType == GroupedFused) && kNumGroups >= 128`.
-    // kGemmType is GroupedNoPad here, so only the group-count term is evaluated.
-    // Keep both sides in sync when that definition changes.
-    bool kIsNoPadPreprocessLayout = kNumGroups >= 128;
-    if (kIsNoPadPreprocessLayout) {
-        uint32_t block_size = std::max(32, next_power_of_two(kNumGroups));
-        auto compute_block_info_args = ComputeBlockInfoKernelRuntime::Args{
-            .launch_attr_args = {reinterpret_cast<const uint32_t*>(m_rows_tensor.data_ptr<int32_t>()), (uint32_t)kNumGroups,
-                                 reinterpret_cast<uint32_t*>(block_m_info.data_ptr<int32_t>())},
-            .launch_args = {1, block_size, 0},
-        };
-        const auto& code_blockinfo = ComputeBlockInfoKernelRuntime::generate(block_m);
-        const auto& runtime_blockinfo = compiler->build("computeBlockInfoKernel", code_blockinfo);
-        ComputeBlockInfoKernelRuntime::launch(runtime_blockinfo, compute_block_info_args);
-        layout_info = reinterpret_cast<int32_t*>(block_m_info.data_ptr<int32_t>());
+        int64_t block_m_info_size = (num_groups + ceil_div(m + 1 - num_groups, block_m)) * 4;
+        block_m_info =
+            at::empty({block_m_info_size}, at::TensorOptions().dtype(at::kInt).device(m_rows_tensor.device()));
+        layout_info = m_rows_tensor.data_ptr<int32_t>();
+        if (kNumGroups >= 128) {
+            uint32_t block_size = std::max(32, next_power_of_two(kNumGroups));
+            auto compute_block_info_args = ComputeBlockInfoKernelRuntime::Args{
+                .launch_attr_args = {reinterpret_cast<const uint32_t*>(m_rows_tensor.data_ptr<int32_t>()), (uint32_t)kNumGroups,
+                                     reinterpret_cast<uint32_t*>(block_m_info.data_ptr<int32_t>())},
+                .launch_args = {1, block_size, 0},
+            };
+            const auto& code_blockinfo = ComputeBlockInfoKernelRuntime::generate(block_m);
+            const auto& runtime_blockinfo = compiler->build("computeBlockInfoKernel", code_blockinfo);
+            ComputeBlockInfoKernelRuntime::launch(runtime_blockinfo, compute_block_info_args);
+            layout_info = block_m_info.data_ptr<int32_t>();
+        }
     }
 
     cutlass::KernelHardwareInfo hw_info;
@@ -154,10 +152,15 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
 
     FP4GemmRuntime::Args args{};
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                        n, k, "MGroupedNoPad", "fp4_grouped_deep_gemm_nopad", hasBias, n_expand, false,
+                        n, k, gemm_type, kernel_name, hasBias, n_expand, false,
                         EpilogueTypeS[static_cast<int>(kEpilogueType)],
                         enable_act_and_quant_fusing && swiglu_limit > 0.0f};
     args.launch_args = {grid, block, SMSIZE};
+    if constexpr (kGemmType == GemmType::MGroupedContiguous) {
+        if (is_ppu1v5_device() && !hasBias && n % 2 == 0 && n_expand == 1 && !enable_act_and_quant_fusing) {
+            args.launch_info.kernel_strategy = KernelStrategy::OverlapPrologue;
+        }
+    }
 
     // Branch exactly like the device-side CollectiveEpilogue conditional in generate_impl:
     //   hasBias || SHAPE_N % 2 != 0 ? WithTsm : (fused ? SiluAndMulPostQuant : NoTsm)
@@ -223,7 +226,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     }
 
     const auto& code = FP4GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp4_grouped_deep_gemm_nopad", code);
+    const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
 
     int blocks_per_cu = 0;
@@ -232,7 +235,9 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k*2, expected_m, m_rows_tensor.data_ptr<int32_t>(),
+        auto* profile_layout = kGemmType == GemmType::MGroupedContiguous
+                                   ? m_indices.data_ptr<int32_t>() : m_rows_tensor.data_ptr<int32_t>();
+        dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k*2, expected_m, profile_layout,
                                   current_stream());
         dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
         dg_prof_params.add_params("swiglu_limit", swiglu_limit);
@@ -249,13 +254,15 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
         hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
         hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
 
-        printf("[GroupedNoPad-FP4:]\n");
+        printf("[%s-FP4:]\n", kGemmType == GemmType::MGroupedContiguous ? "GroupedContiguous" : "GroupedNoPad");
         printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
         printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
                args.launch_args.grid_dim.x);
         printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n,
                block_k, expected_m, warp_m, warp_n, block_k, num_stages);
         printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+        printf("kernel_strategy:%s, SMSIZE:%d\n",
+               KernelStrategyS[static_cast<int>(args.launch_info.kernel_strategy)], int(SMSIZE));
     }
 }
 

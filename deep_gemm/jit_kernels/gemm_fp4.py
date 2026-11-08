@@ -24,7 +24,7 @@ def get_fp4_epilogue_type(activation_type: str) -> str:
 
 
 # C++ code templates
-includes = ('<deep_gemm/impls/fp4_gemm_cutlass3.cuh>', )
+includes = ('<deep_gemm/impls/fp4_gemm_cutlass3.cuh>', '<deep_gemm/impls/fp4_gemm_cutlass3_overlap_prologue.cuh>', )
 template = """
 using namespace deep_gemm;
 
@@ -40,7 +40,7 @@ constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto hasBias = {HAS_BIAS};
 
 // Make a templated grouped GEMM
-using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, false, hasBias>;
+using gemm_t = Fp4Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, false, hasBias, 1, FP4DynamicTileId::Disabled, EpilogueType::Default, false, {ENABLE_OVERLAP_PROL}>;
 gemm_t::run(lhs, lhs_scales, rhs, rhs_scales,
             bias, out, m, nullptr, nullptr, 0,
             stream, num_sms, smem_size);
@@ -689,7 +689,8 @@ def gemm_fp4_fp4_bf16_nt(lhs_: Tuple[torch.Tensor, torch.Tensor],
         name='gemm_fp4_fp4_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
               'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_GROUPS': 1,
-              'NUM_STAGES': num_stages,'GEMM_TYPE': 'Normal', 'HAS_BIAS': has_bias},
+              'NUM_STAGES': num_stages,'GEMM_TYPE': 'Normal', 'HAS_BIAS': has_bias,
+              'ENABLE_OVERLAP_PROL': 'true' if os.environ.get('DG_FP4_OVERLAP_PROL') == '1' and not has_bias and n % 2 == 0 else 'false'},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.uint8), ('lhs_scales', torch.uint16),

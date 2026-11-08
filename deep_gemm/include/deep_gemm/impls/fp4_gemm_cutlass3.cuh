@@ -369,6 +369,11 @@ class DeepGemmUniversal <
     uint32_t m_block_idx, n_block_idx;
     #pragma clang loop licm(disable)
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
+      if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
+        if (__ldg(params.scheduler.grouped_layout + m_block_idx * TileScheduler::BLOCK_M) == -1) {
+          continue;
+        }
+      }
       auto m_coord = m_block_idx;
       auto n_coord = n_block_idx * N_EXPAND;
       auto l_coord = 0;
@@ -1023,6 +1028,11 @@ public:
     uint32_t m_block_idx, n_block_idx;
     #pragma clang loop licm(disable)
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
+      if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
+        if (__ldg(params.scheduler.grouped_layout + m_block_idx * TileScheduler::BLOCK_M) == -1) {
+          continue;
+        }
+      }
       auto m_coord = m_block_idx;
       auto n_coord = n_block_idx;
       auto l_coord = 0;
@@ -1135,14 +1145,21 @@ public:
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+namespace cutlass::gemm::collective {
+template <class Base_> struct Fp4CollectiveMmaOverlapPrologue;
+}
+
 namespace deep_gemm {
+
+template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
+class Fp4OverlapPrologue;
 
 template <int32_t ShapeN, int32_t ShapeK,
           int32_t BlockM, int32_t BlockN, int32_t BlockK,
           int32_t WarpM, int32_t WarpN,
           int32_t kNumGroups, int32_t kNumStages, GemmType kGemmType,
           bool kEnableSboOverlap = false, bool hasBias = false, int NExpand = 1,
-          FP4DynamicTileId kDynamicTileId = FP4DynamicTileId::Disabled, EpilogueType kEpilogueType = EpilogueType::Default, bool kApplySwigluLimit = false>
+          FP4DynamicTileId kDynamicTileId = FP4DynamicTileId::Disabled, EpilogueType kEpilogueType = EpilogueType::Default, bool kApplySwigluLimit = false, bool kEnableOverlapPrologue = false>
 class Fp4Gemm {
   static constexpr bool kEnableMoeDynamicTile = (kDynamicTileId != FP4DynamicTileId::Disabled);
   static_assert((BlockM == 16) || (BlockM == 32) || (BlockM == 64) || (BlockM == 128) || (BlockM == 256), "BlockM should only be in [16, 32, 64, 128, 256].");
@@ -1345,7 +1362,7 @@ public:
           cute::MMA_Atom<MmaInst>,
           cute::Layout<Shape<WarpOnM, WarpOnN, _1>>>;
 
-          using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaScaleFp4<
+          using CollectiveMainloopBase = typename cutlass::gemm::collective::CollectiveMmaScaleFp4<
             DispatchPolicy, Shape<Int<BlockM>, Int<BlockN>, Int<BlockK>>,
             ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
             ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
@@ -1354,6 +1371,10 @@ public:
             typename GemmOperandB::GmemTiledCopy, typename GemmOperandB::SmemLayoutAtom, typename GemmOperandB::SmemCopyAtom, TransformB,
             ElementSFA, cutlass::detail::TagToStrideA_t<LayoutSFA>, typename GemmOperandSFA::GmemTiledCopy, typename GemmOperandSFA::SmemLayoutAtom,
             ElementSFB, cutlass::detail::TagToStrideB_t<LayoutSFB>, typename GemmOperandSFB::GmemTiledCopy, typename GemmOperandSFB::SmemLayoutAtom>;
+          using CollectiveMainloop = typename cutlass::platform::conditional<
+              kEnableOverlapPrologue,
+              cutlass::gemm::collective::Fp4CollectiveMmaOverlapPrologue<CollectiveMainloopBase>,
+              CollectiveMainloopBase>::type;
 
           using EpilogueOutputOp = typename cutlass::platform::conditional<
               hasBias || (ShapeN % 2 != 0),
@@ -1405,7 +1426,7 @@ public:
           >::type;
 
           using TileScheduler = DeepGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND, kNumGroups, math::ceil_div(ShapeN, BlockN * N_EXPAND), 2, kEpilogueType>;
-          using GemmKernel = typename deep_gemm::DeepGemmUniversal<
+          using GemmKernelDefault = typename deep_gemm::DeepGemmUniversal<
               Shape<int,int,int,int>,
               CollectiveMainloop,
               CollectiveEpilogue,
@@ -1415,6 +1436,10 @@ public:
               kEnableSboOverlap,
               kEpilogueType
           >;
+          using GemmKernel = typename cutlass::platform::conditional<
+              kEnableOverlapPrologue,
+              deep_gemm::Fp4OverlapPrologue<Shape<int,int,int,int>, CollectiveMainloop, CollectiveEpilogue, TileScheduler>,
+              GemmKernelDefault>::type;
 
           if constexpr (is_act_and_quant_fused(kEpilogueType)) {
             // Epilogue reuse the shared storage comes from mainloop.

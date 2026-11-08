@@ -3,6 +3,7 @@
 #include <torch/python.h>
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include "cute/tensor.hpp"
@@ -41,6 +42,7 @@ public:
         // apply_swiglu_limit only matters for fused activation epilogues.
         std::string epilogue_type = "Default";
         bool apply_swiglu_limit = false;
+        KernelStrategy kernel_strategy = KernelStrategy::Default;
     };
 
     struct MainLoopArguments {
@@ -236,7 +238,7 @@ __global__ void {}(
             args.launch_info.kernel_name) : "";
         return fmt::format(
             R"(
-#include <deep_gemm/impls/fp4_gemm_cutlass3.cuh>{}
+#include <deep_gemm/impls/fp4_gemm_cutlass3_overlap_prologue.cuh>{}
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo; 
@@ -258,6 +260,7 @@ constexpr int N_EXPAND = {};
 static constexpr EpilogueType kEpilogueType = EpilogueType::{};
 static constexpr bool kApplySwigluLimit = {};
 static constexpr bool kUseReplicaWeights = {};
+static constexpr KernelStrategy kKernelStrategy = KernelStrategy::{};
 
 // A matrix configuration
 using         ElementA    = cutlass::float4_t;
@@ -337,7 +340,7 @@ using TiledMma = cute::TiledMMA<
     cute::MMA_Atom<MmaInst>,
     cute::Layout<Shape<WarpOnM, WarpOnN, _1>>>;
 
-using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaScaleFp4<
+using CollectiveMainloopBase = typename cutlass::gemm::collective::CollectiveMmaScaleFp4<
     DispatchPolicy, Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>,
     ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
     ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
@@ -346,6 +349,10 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaScal
     typename GemmOperandB::GmemTiledCopy, typename GemmOperandB::SmemLayoutAtom, typename GemmOperandB::SmemCopyAtom, TransformB,
     ElementSFA, cutlass::detail::TagToStrideA_t<LayoutSFA>, typename GemmOperandSFA::GmemTiledCopy, typename GemmOperandSFA::SmemLayoutAtom,
     ElementSFB, cutlass::detail::TagToStrideB_t<LayoutSFB>, typename GemmOperandSFB::GmemTiledCopy, typename GemmOperandSFB::SmemLayoutAtom>;
+using CollectiveMainloop = cute::conditional_t<
+    kKernelStrategy == KernelStrategy::OverlapPrologue,
+    cutlass::gemm::collective::Fp4CollectiveMmaOverlapPrologue<CollectiveMainloopBase>,
+    CollectiveMainloopBase>;
 
 using EpilogueOutputOp = typename cutlass::platform::conditional<
     hasBias || ((SHAPE_N % 2 != 0) && !kUseReplicaWeights),
@@ -403,7 +410,7 @@ using TileScheduler = DeepGemmScheduler<
     kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS,
     ceil_div(SHAPE_N, BLOCK_N * N_EXPAND), {}, kEpilogueType>;
 
-using GemmKernel = typename deep_gemm::DeepGemmUniversal<
+using GemmKernelDefault = typename deep_gemm::DeepGemmUniversal<
     Shape<int,int,int,int>,
     CollectiveMainloop,
     CollectiveEpilogue,
@@ -414,6 +421,10 @@ using GemmKernel = typename deep_gemm::DeepGemmUniversal<
     kEpilogueType,
     kUseReplicaWeights{}
 >;
+using GemmKernel = cute::conditional_t<
+    kKernelStrategy == KernelStrategy::OverlapPrologue,
+    deep_gemm::Fp4OverlapPrologue<Shape<int,int,int,int>, CollectiveMainloop, CollectiveEpilogue, TileScheduler>,
+    GemmKernelDefault>;
 
 // This kernel declares `extern __shared__`, so its dynamic smem size comes from the launch, and the
 // host can only supply an estimate (get_smem_config_fp4) -- it cannot see SharedStorageSize.
@@ -436,7 +447,9 @@ using GemmKernel = typename deep_gemm::DeepGemmUniversal<
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.enable_sbo_overlap, args.launch_info.hasBias, args.launch_info.n_expand,
-            args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit, replicas, m_tiles_per_group,
+            args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit, replicas,
+            KernelStrategyS[static_cast<int>(args.launch_info.kernel_strategy)],
+            m_tiles_per_group,
             policy.empty() ? "" : ", " + policy,
             replicas ? "" : fmt::format(
                 "static_assert(GemmKernel::SharedStorageSize == {}, \"host/device FP4 shared memory mismatch\");",
@@ -614,6 +627,13 @@ static void fp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
                         n, k, "Normal", "fp4_deep_gemm", hasBias, n_expand, false,
                         "Default", false};
+    // The overlap kernel requires a shared-memory-free epilogue (DefaultEpilogueNoTsm),
+    // i.e. no bias and even N. Env-gated so overlap on/off can be A/B'd without a rebuild.
+    const char* overlap_env = std::getenv("DG_FP4_OVERLAP_PROL");
+    const bool enable_overlap_prologue =
+        (overlap_env != nullptr && std::strcmp(overlap_env, "1") == 0) && !hasBias && n % 2 == 0;
+    args.launch_info.kernel_strategy =
+        enable_overlap_prologue ? KernelStrategy::OverlapPrologue : KernelStrategy::Default;
     args.launch_args = {grid, block, SMSIZE};
 
     FP4GemmRuntime::MainLoopArguments mainloop_params{

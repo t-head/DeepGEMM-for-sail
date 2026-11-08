@@ -830,7 +830,7 @@ struct CollectiveMma<
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
-      copy_aiu(
+      copy_aiu<false>(
         gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
         gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
         warp_idx
@@ -947,7 +947,7 @@ struct CollectiveMma<
           __syncthreads();
 
           if (k_tile_count > 0) {
-            copy_aiu(
+            copy_aiu<false>(
               gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
               gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
               warp_idx
@@ -1217,6 +1217,11 @@ public:
     uint32_t m_coord, n_coord;
     uint32_t l_coord = 0;
     constexpr uint32_t L = 1;
+    // Runtime N/K (mirror dense BF16DenseGemmKernel): read from problem_shape
+    // instead of compile-time TileScheduler::SHAPE_N/SHAPE_K to isolate
+    // constexpr-vs-runtime codegen for the dense/grouped TC gap.
+    const uint32_t N = get<1>(params.problem_shape);
+    const uint32_t K = get<2>(params.problem_shape);
 
     while (deep_scheduler.fetch_next_work(m_coord, n_coord)) {
 
