@@ -82,7 +82,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
 
     BF16GemmCutlass3Runtime::GemmKernelParams params =
         BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
-    const auto kernel_strategy = "Default";
+    const auto kernel_strategy = is_ppu1v5_device() ? "OverlapPrologue" : "Default";
     auto args = BF16GemmCutlass3Runtime::Args{
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "MGroupedContiguous",
                         kernel_strategy, "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap},
