@@ -4,6 +4,10 @@
 #define DG_MEGAMOE_OWNER_MODE 0
 #endif
 
+#ifndef DG_MEGAMOE_SPLIT_SYNC
+#define DG_MEGAMOE_SPLIT_SYNC 0
+#endif
+
 #include <cstdint>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
