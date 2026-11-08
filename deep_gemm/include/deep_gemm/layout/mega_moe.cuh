@@ -26,6 +26,7 @@ struct alignas(256) MegaMoESignals {
     static constexpr uint32_t kNumMaxCopyBlocks = 1u << 23;
 
     uint32_t grid_sync_count;
+    uint64_t scatter_writer_mask;  // Passed from the standalone scatter wait to reduce.
     alignas(16) uint32_t dispatch_retire[4];
     // Each forward publishes dispatch, then scatter, before either slot is reused.
     alignas(128) uint32_t dispatch_arrivals[kNumMaxRanks];

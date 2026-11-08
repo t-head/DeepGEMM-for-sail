@@ -428,20 +428,9 @@ __device__ __forceinline__ void moe_reduce_impl(
 
 template <typename Kernel, int Ranks, int TopK, int Hidden, int Groups,
           int kColumnSplits, int kReduceGroupThreads, bool kOutputAligned>
-__global__ __launch_bounds__(Kernel::MaxThreadsPerBlock, Kernel::MinBlocksPerMultiprocessor)
-void sm89_fp4_fp4_mega_moe_l2(typename Kernel::MainloopArguments mainloop, typename Kernel::EpilogueParams epilogue,
-                              typename Kernel::SchedulerParams scheduler, layout::MegaMoESignals* signals,
-                              layout::SymBuffer<Ranks> scatter_buffer, MegaMoEReduceParams reduce,
-                              MegaMoEReplicaWeights replicas) {
-    extern __shared__ char smem[];
-    const uint32_t generation = __ldbl(signals->preprocess_ready) & ~kPreprocessMetadataReadyBit;
-    Kernel op;
-    op(mainloop, epilogue, scheduler, signals, smem, replicas, generation, &scatter_buffer);
-
-    comm::rank_barrier<Ranks, true>(
-        signals->scatter_arrivals, generation,
-        reinterpret_cast<uint32_t*>(smem));
-    const uint64_t writer_mask = *reinterpret_cast<const uint64_t*>(smem);
+__device__ __forceinline__ void mega_moe_reduce(
+        const layout::SymBuffer<Ranks>& scatter_buffer, uint32_t token_capacity,
+        const MegaMoEReduceParams& reduce, uint64_t writer_mask) {
     constexpr int kReduceThreads = kReduceGroupThreads > 0 ? kReduceGroupThreads : Kernel::MaxThreadsPerBlock;
     constexpr int kTokenGroups = Kernel::MaxThreadsPerBlock / kReduceThreads;
     unsigned int reduce_thread = threadIdx.x;
@@ -457,10 +446,38 @@ void sm89_fp4_fp4_mega_moe_l2(typename Kernel::MainloopArguments mainloop, typen
             moe_reduce_impl<kOutputAligned, TopK, Hidden, true, kReduceThreads, kColumnSplits>(
                 scatter_buffer.template get_base_ptr<const __ppu_bfloat16*>(),
                 reduce.ids, reduce.weights, static_cast<__ppu_bfloat16*>(reduce.output),
-                static_cast<int>(epilogue.token_capacity), Groups,
+                static_cast<int>(token_capacity), Groups,
                 scatter_buffer.rank_idx, work / kColumnSplits, work % kColumnSplits, writer_mask, reduce_thread);
         }
     }
+}
+
+template <typename Kernel, int Ranks, int TopK, int Hidden, int Groups,
+          int kColumnSplits, int kReduceGroupThreads, bool kOutputAligned>
+__global__ __launch_bounds__(Kernel::MaxThreadsPerBlock, Kernel::MinBlocksPerMultiprocessor)
+void sm89_fp4_fp4_mega_moe_l2(typename Kernel::MainloopArguments mainloop, typename Kernel::EpilogueParams epilogue,
+                              typename Kernel::SchedulerParams scheduler, layout::MegaMoESignals* signals,
+                              layout::SymBuffer<Ranks> scatter_buffer, MegaMoEReduceParams reduce,
+                              MegaMoEReplicaWeights replicas) {
+    extern __shared__ char smem[];
+    const uint32_t generation = __ldbl(signals->preprocess_ready) & ~kPreprocessMetadataReadyBit;
+    Kernel op;
+    op(mainloop, epilogue, scheduler, signals, smem, replicas, generation, &scatter_buffer);
+    if constexpr (!DG_MEGAMOE_SPLIT_SYNC) {
+        comm::rank_barrier<Ranks, true>(signals->scatter_arrivals, generation,
+                                        reinterpret_cast<uint32_t*>(smem));
+        mega_moe_reduce<Kernel, Ranks, TopK, Hidden, Groups, kColumnSplits, kReduceGroupThreads, kOutputAligned>(
+            scatter_buffer, epilogue.token_capacity, reduce, *reinterpret_cast<const uint64_t*>(smem));
+    }
+}
+
+template <typename Kernel, int Ranks, int TopK, int Hidden, int Groups,
+          int kColumnSplits, int kReduceGroupThreads, bool kOutputAligned>
+__global__ __launch_bounds__(Kernel::MaxThreadsPerBlock, Kernel::MinBlocksPerMultiprocessor)
+void sm89_fp4_fp4_mega_moe_reduce(layout::SymBuffer<Ranks> scatter_buffer, uint32_t token_capacity,
+                                  const layout::MegaMoESignals* signals, MegaMoEReduceParams reduce) {
+    mega_moe_reduce<Kernel, Ranks, TopK, Hidden, Groups, kColumnSplits, kReduceGroupThreads, kOutputAligned>(
+        scatter_buffer, token_capacity, reduce, signals->scatter_writer_mask);
 }
 
 }  // namespace deep_gemm

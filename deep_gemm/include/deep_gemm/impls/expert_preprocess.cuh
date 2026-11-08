@@ -33,7 +33,10 @@ __device__ __forceinline__ void prepare_expert_metadata(
     uint32_t* expert_row_offsets = expert_block_offsets + NumLocalExperts;
     uint32_t* expert_counts = expert_row_offsets + NumLocalExperts;
 
-    comm::rank_barrier<NumRanks>(arrival_slots, generation);
+    if constexpr (!DG_MEGAMOE_SPLIT_SYNC)
+        comm::rank_barrier<NumRanks>(arrival_slots, generation);
+    else
+        __syncthreads();
 
     // Keep each expert's rank counts next to each other in shared memory.
     #pragma unroll

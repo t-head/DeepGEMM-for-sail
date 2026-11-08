@@ -2,6 +2,7 @@
 
 #include <array>
 #include <limits>
+#include <string_view>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/scheduler/sm89_mega_moe.cuh>
@@ -90,6 +91,29 @@ static void __instantiate_kernel() {{
     }
 };
 
+class MegaMoESyncRuntime final : public LaunchRuntime<MegaMoESyncRuntime> {
+public:
+    struct Args {
+        const char* kernel_name;
+        int num_ranks;
+        LaunchArgs launch_args;
+        layout::MegaMoESignals* signals;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/mega_moe_sync.cuh>
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::{}<{}>);
+}}
+)", args.kernel_name, args.num_ranks);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.signals));
+    }
+};
+
 struct ScatterEpilogueParams {
     decltype(FP4GemmRuntime::EpilogueArgsNoTsm{}.thread) thread{};
     const layout::TokenSrcMetadata* src_info = nullptr;
@@ -114,6 +138,8 @@ static_assert(sizeof(Linear1EpilogueArguments<GatedActivation::SwiGLU>) ==
               sizeof(FP4GemmRuntime::EpilogueArgsSiluAndMulPostQuant));
 static_assert(offsetof(Linear1EpilogueArguments<GatedActivation::SwiGLU>, activation) ==
               offsetof(FP4GemmRuntime::EpilogueArgsSiluAndMulPostQuant, swiglu_limit));
+
+static constexpr char kReduceKernelName[] = "sm89_fp4_fp4_mega_moe_reduce";
 
 template <MegaMoEPhaseKind Stage, int Ranks, GatedActivation Activation = GatedActivation::SwiGLU>
 class GemmRuntime final : public LaunchRuntime<GemmRuntime<Stage, Ranks, Activation>> {
@@ -144,6 +170,7 @@ public:
         const float* reduce_weights = nullptr;
         void* reduce_output = nullptr;
         int tokens = 0, topk = 0;
+        bool split_sync = false;
     };
 
     static std::string generate_impl(const Args& a) {
@@ -168,6 +195,7 @@ public:
 #define DG_MEGAMOE_OWNER_MODE {}
 #define DG_MEGAMOE_OWNER_READER_OPT {}
 #define DG_MEGAMOE_SITU_USE_RCP {}
+#define DG_MEGAMOE_SPLIT_SYNC {}
 #include <deep_gemm/impls/sm89_fp4_fp4_mega_moe.cuh>
 using Builder = deep_gemm::MegaMoEMxfp4Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation::{}, {}, {}, {}>;
 using Kernel = Builder::Kernel;
@@ -180,6 +208,7 @@ static void __instantiate_kernel() {{
 }}
 )", static_cast<int>(!kIsLinear1), static_cast<int>(!kIsLinear1),
             static_cast<int>(kIsLinear1 && Activation == GatedActivation::SiTU),
+            static_cast<int>(a.split_sync),
             info.n, info.k, info.block_m, info.block_n, info.block_k, info.warp_m, info.warp_n, info.num_groups, info.num_stages,
             Ranks, kIsLinear1 ? "deep_gemm::MegaMoEPhaseKind::Linear1" : "deep_gemm::MegaMoEPhaseKind::Linear2",
             info.copy_blocks, info.k_tiles_per_flag, info.source_capacity, info.topk,
@@ -198,8 +227,13 @@ static void __instantiate_kernel() {{
                                                 a.signals, a.replica_weights));
         } else {
             MegaMoEReduceParams reduce{a.reduce_ids, a.reduce_weights, a.reduce_output, a.tokens};
-            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.mainloop, a.epilogue, a.scheduler,
-                                                a.signals, a.scatter_buffer, reduce, a.replica_weights));
+            if (a.split_sync && std::string_view(a.kernel_name) == kReduceKernelName) {
+                DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.scatter_buffer, a.epilogue.token_capacity,
+                                                    a.signals, reduce));
+            } else {
+                DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.mainloop, a.epilogue, a.scheduler,
+                                                    a.signals, a.scatter_buffer, reduce, a.replica_weights));
+            }
         }
     }
 };
@@ -319,7 +353,7 @@ static void launch_linear1(
     const MegaMoEReplicaWeights& replicas, int num_experts_per_rank,
     uint8_t* l2_acts, uint16_t* l2_acts_sf, int compact_m, int num_topk,
     const sched::MegaMoESchedulerArguments& scheduler, layout::MegaMoESignals* signals,
-    const MegaMoEL1Config& config, bool fast_math, int expected_m) {
+    const MegaMoEL1Config& config, bool fast_math, int expected_m, bool split_sync) {
     auto launch = [&](auto activation_tag) {
         constexpr auto kind = decltype(activation_tag)::value;
         using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks, kind>;
@@ -333,6 +367,7 @@ static void launch_linear1(
 
         auto args = make_linear1_args<Ranks, kind>(l1_weights, l1_weights_sf, replicas, num_experts_per_rank, l2_acts, l2_acts_sf,
                                                    compact_m, num_topk, scheduler, signals, activation_params, config, fast_math);
+        args.split_sync = split_sync;
         launch_gemm<Runtime>(args, expected_m);
     };
 
@@ -411,6 +446,7 @@ static void sm89_fp4_fp4_mega_moe(
                                             hidden, intermediate_hidden, expected_m, device_runtime->get_num_sms());
     const auto& l1_config = config.l1;
     const auto& l2_config = config.l2;
+    const bool split_sync = get_env<int>("DG_MEGAMOE_SPLIT_SYNC", 0) != 0;
 
     auto* grouped_layout = mega_buffer.grouped_layout.data<int32_t>(base);
     auto* masked_m = grouped_layout + (1 + mega_buffer.blocks) * 4;
@@ -433,6 +469,12 @@ static void sm89_fp4_fp4_mega_moe(
     auto* l2_acts = mega_buffer.l2_acts.data(base);
     auto* l2_acts_sf = mega_buffer.l2_acts_sf.data<uint16_t>(base);
     const int compact_m = static_cast<int>(mega_buffer.compact);
+    const auto launch_sync = [&](const char* name) {
+        MegaMoESyncRuntime::Args args{name, num_ranks, {dim3(1), dim3(64), 0}, signals};
+        const auto runtime = compiler->build(name, MegaMoESyncRuntime::generate(args));
+        MegaMoESyncRuntime::launch(runtime, args);
+    };
+    if (split_sync) launch_sync("mega_moe_dispatch_sync");
     for_ranks(num_ranks, [&](auto r) {
         constexpr int Ranks = decltype(r)::value;
         using Linear2Runtime = GemmRuntime<MegaMoEPhaseKind::Linear2, Ranks>;
@@ -446,10 +488,16 @@ static void sm89_fp4_fp4_mega_moe(
         l2_args.reduce_output = y.data_ptr();
         l2_args.tokens = num_tokens;
         l2_args.topk = num_topk;
+        l2_args.split_sync = split_sync;
 
         launch_linear1<Ranks>(activation, activation_clamp, situ_beta, situ_linear_beta, activation_alpha,
                               l1_weights, l1_weights_sf, l1_replicas, num_experts_per_rank,
-                              l2_acts, l2_acts_sf, compact_m, num_topk, scheduler, signals, l1_config, fast_math, expected_m);
+                              l2_acts, l2_acts_sf, compact_m, num_topk, scheduler, signals, l1_config, fast_math, expected_m, split_sync);
+        if (split_sync) {
+            launch_gemm<Linear2Runtime>(l2_args, expected_m);
+            launch_sync("mega_moe_scatter_sync");
+            l2_args.kernel_name = kReduceKernelName;
+        }
         launch_gemm<Linear2Runtime>(l2_args, expected_m);
     });
 }
