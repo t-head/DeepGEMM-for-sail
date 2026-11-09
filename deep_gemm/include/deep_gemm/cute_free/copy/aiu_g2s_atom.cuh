@@ -42,7 +42,7 @@ struct AiuG2SAtom {
   static __device__ __forceinline__ void load(
       Element* smem_dst, Element const* gmem_base,
       int rows, int ld, int row_offset, int col_offset) {
-    static_assert(std::is_same<Element, cutlass::bfloat16_t>::value,
+    static_assert(cutlass::platform::is_same<Element, cutlass::bfloat16_t>::value,
                   "AiuG2SAtom: only bf16 is supported by the arch layer today");
     #pragma unroll
     for (int j = 0; j < kInstNum; ++j) {

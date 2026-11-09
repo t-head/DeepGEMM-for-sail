@@ -193,6 +193,8 @@ int gemv_checks() {
         CHECK_GEMV(k_per_thread, 16);
         CHECK_GEMV(kernel_name, "another_entry");
         CHECK_GEMV(output_fp32, true);
+        CHECK_GEMV(static_k, true);
+        CHECK_GEMV(pair_load, true);
         if (m == 2) { CHECK_GEMV(npt, 2); }
 #undef CHECK_GEMV
         count += check_change<Runtime>(args, [m](auto& a) { a.launch_info.m = 3 - m; }, "M1/M2 entry");
@@ -204,6 +206,11 @@ int gemv_checks() {
             a.kernel_params.y_ptr = reinterpret_cast<void*>(uintptr_t(0x3000));
             a.launch_args.grid_dim = dim3(5, 1, 1);
         }, "GEMV runtime dimensions, strides and addresses", false);
+        args.launch_info.static_k = true;
+        args.kernel_params.K = 64;
+        count += check_change<Runtime>(args, [](auto& a) {
+            a.kernel_params.K = 96;
+        }, "GEMV static K and row stride");
     }
     return count;
 }

@@ -9,16 +9,39 @@
 # ============ DenseGemm ============
 
 # --- DenseGemm / bf16 ---
-# Small M with N/K tails, retained from the legacy shape sweep.
-DenseGemm,data_type:bf16,m:64,n:2112,k:576
+# External LUT precedence, explicit override, miss and invalid tile rejection.
+DenseGemm,data_type:bf16,m:128,n:256,k:1024,device:810e,runtime_lut:1
+# Small M with M/N tails and a final partial BK128 tile.
+DenseGemm,data_type:bf16,m:37,n:2056,k:1056
 DenseGemm,data_type:bf16,m:2048,n:4096,k:7168
-DenseGemm,data_type:bf16,m:2048,n:512,k:7168
-DenseGemm,data_type:bf16,m:256,n:4096,k:7168
-DenseGemm,data_type:bf16,m:256,n:512,k:7168
+DenseGemm,data_type:bf16,m:104,n:8192,k:384,device:810e,num_sms:20
+# BM96 uses a power-of-two warp grid and handles an incomplete final M tile.
+DenseGemm,data_type:bf16,m:65,n:8192,k:1536,device:810e,accumulate:separate
+# Sub-vector output with short K must use guarded scalar GEMV stores.
+DenseGemm,data_type:bf16,m:1,n:2,k:32,device:810e,num_sms:20
 # C aliasing and cancellation before BF16 rounding; N=1 GEMV product.
-DenseGemm,data_type:bf16,m:8,n:1,k:128,device:810e,accumulate:alias,pattern:cancellation
+DenseGemm,data_type:bf16,m:2,n:1,k:96,device:810e,accumulate:alias,pattern:cancellation
 # TSM split-K product with BF16 output and aliased C/D.
 DenseGemm,data_type:bf16,m:36,n:288,k:4096,device:810e,accumulate:alias
+# Generalized two-row GEMV, including accumulation before BF16 rounding.
+DenseGemm,data_type:bf16,m:2,n:40,k:160,device:810e,accumulate:alias,pattern:cancellation
+# A partial output vector needs scalar stores even with a one-CU budget.
+DenseGemm,data_type:bf16,m:129,n:4,k:128,device:810e,num_sms:1
+# Unsupported tiled K and misaligned BF16 inputs must fail before launch.
+DenseGemm,data_type:bf16,m:7,n:16,k:33,device:810e,accumulate:alias,expect_error:K%32=0
+DenseGemm,data_type:bf16,m:7,n:16,k:128,device:810e,offset_a:1,expect_error:16-byte-aligned
+# A zero warp dimension must be rejected before tile division or JIT.
+DenseGemm,data_type:bf16,m:7,n:16,k:128,device:810e,configs:[20,32,64,32,0,32,2],expect_error:invalid BF16 config
+# WN8 compiles but oversteps the 810E MMA shared tile; reject it on the host.
+DenseGemm,data_type:bf16,m:7,n:16,k:128,device:810e,configs:[20,16,32,32,16,8,2],expect_error:invalid BF16 config
+# Low-budget fallback selects a valid N warp and two complete short-K stages.
+DenseGemm,data_type:bf16,m:7,n:16,k:96,device:810e,num_sms:1
+# tc01 cute-free: M/N/K tails, aliased C and a bounded persistent grid.
+DenseGemm,data_type:bf16,m:37,n:41,k:160,device:810e,cute_free:1,warp_on_k:1,num_sms:1,accumulate:alias
+# WarpOnK=4 reduces in FP32 before the BF16 cancellation/addition conversion.
+DenseGemm,data_type:bf16,m:17,n:40,k:544,device:810e,cute_free:1,warp_on_k:4,configs:[20,32,64,256,16,32,2],accumulate:alias,pattern:cancellation
+# Unsupported K slices fail before JIT/launch.
+DenseGemm,data_type:bf16,m:17,n:40,k:512,device:810e,cute_free:1,warp_on_k:4,configs:[20,32,64,64,16,32,2],expect_error:two MMA K steps
 
 # --- DenseGemm / int8 ---
 # Small M with N/K tails, retained from the legacy shape sweep.
@@ -27,17 +50,28 @@ DenseGemm,data_type:int8,m:2048,n:4096,k:7168
 DenseGemm,data_type:int8,m:2048,n:512,k:7168
 
 # --- DenseGemm / bf16_bf16_fp32 ---
-DenseGemm,data_type:bf16_bf16_fp32,m:2048,n:4096,k:7168
-DenseGemm,data_type:bf16_bf16_fp32,m:132,n:3072,k:1536
+# The last N tile uses a 16-column mainloop in the same launch; M/K also have tails.
+DenseGemm,data_type:bf16_bf16_fp32,m:1025,n:2056,k:1056,device:810e,accumulate:alias
+# Short-K unrolling with FP32 output and a separate accumulation input.
+DenseGemm,data_type:bf16_bf16_fp32,m:96,n:8192,k:448,device:810e,accumulate:separate
 DenseGemm,data_type:bf16_bf16_fp32,m:2,n:8192,k:7168
 # Direct split-K product with FP32 output and separate C/D.
 DenseGemm,data_type:bf16_bf16_fp32,m:32,n:128,k:6144,device:810e,accumulate:separate
+# WarpOnK=2, M/K tails and separate C/D with FP32 output.
+DenseGemm,data_type:bf16_bf16_fp32,m:65,n:136,k:1056,device:810e,cute_free:1,warp_on_k:2,configs:[20,64,64,64,32,32,2],accumulate:separate
 
-# --- DenseGemm / fp32 (full FP32 operands, TF32-disabled reference) ---
+# --- DenseGemm / fp32 (full FP32 operands, CPU FP64 reference) ---
 # Vector load tail, scalar load via misalignment, and static specialization.
 DenseGemm,data_type:fp32,m:7,n:9,k:516,device:810e
 DenseGemm,data_type:fp32,m:7,n:9,k:512,device:810e,offset_a:1
 DenseGemm,data_type:fp32,m:36,n:32,k:4096,device:810e
+# Long unaligned rows: packing and the product must preserve full FP32 accuracy.
+DenseGemm,data_type:fp32,m:36,n:32,k:4097,device:810e,offset_a:1
+# Shared-memory FP32 path: vector K tail and misaligned scalar K tail.
+DenseGemm,data_type:fp32,m:160,n:512,k:4096,device:810e
+DenseGemm,data_type:fp32,m:129,n:130,k:255,device:810e,offset_a:1
+# Narrow-output split-K: scalar loads, final partial BK16, and FP32 reduction.
+DenseGemm,data_type:fp32,m:257,n:32,k:4100,device:810e,offset_a:1
 
 # ============ HcPrenormGemm ============
 
@@ -59,12 +93,23 @@ HcPrenormGemm,data_type:tf32,m:1024,n:32,k:64
 # ============ BatchGemm ============
 
 # --- BatchGemm / bf16 (native strided API, not quantized einsum) ---
-# Default Direct BK32/stages=2, padded row/batch pitches, broadcast A.
-BatchGemm,data_type:bf16,groups:3,m:37,n:40,k:64,device:810e,layout:padded,broadcast:a
+# Unaligned output selects Direct BK32/stages=2; padded pitches and broadcast A.
+BatchGemm,data_type:bf16,groups:3,m:37,n:41,k:64,device:810e,layout:padded,broadcast:a
 # Default TSM, interleaved padded output and broadcast B.
 BatchGemm,data_type:bf16,groups:3,m:37,n:40,k:128,device:810e,layout:interleaved_padded,broadcast:b
+# Wide N / five BK32 tiles, aligned padded inputs, and a one-CU persistent launch.
+BatchGemm,data_type:bf16,groups:8,m:257,n:512,k:160,device:810e,layout:padded,padding_a:32,padding_b:32,broadcast:a,num_sms:1
 # Reject intersecting rows across batches before any output write.
 BatchGemm,data_type:bf16,groups:2,m:3,n:16,k:128,device:810e,out_stride:[24,32,1],expect_error:overlap
+# Invalid K must be rejected before packing a non-native input view.
+BatchGemm,data_type:bf16,groups:2,m:3,n:16,k:32,device:810e,layout:interleaved_padded,b_stride:[2048,64,2],expect_error:k_tiles
+
+# N-contiguous B with overlapping columns and descriptor rebasing, at a reduced CU budget.
+BatchGemm,data_type:bf16,groups:3,m:33,n:96,k:128,device:810e,layout:interleaved_padded,b_stride:[8192,1,64],num_sms:1
+# Overlapping K-contiguous B rows, broadcast A, and one final BF16 conversion.
+BatchGemm,data_type:bf16,groups:3,m:31,n:80,k:256,device:810e,layout:interleaved_padded,a_stride:[0,264,1],b_stride:[16384,128,1]
+# Non-power-of-two K96 segments cover K288 with complete BK32 tiles.
+BatchGemm,data_type:bf16,groups:3,m:31,n:80,k:288,device:810e,layout:interleaved_padded,a_stride:[0,296,1],b_stride:[16384,152,1]
 
 # --- BatchGemm / int8 ---
 BatchGemm,data_type:int8,groups:128,m:64,n:128,k:512,quant_type:channel,expr:bhr,hdr->bhd
