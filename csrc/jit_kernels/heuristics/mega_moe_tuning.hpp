@@ -78,7 +78,38 @@ inline TuningConfig select_tuning(const TuningWorkload& w) {
         {1024, {reuse128}, {}, {64}}, {2048, {reuse128}, {}, {64}},
         {4096, {reuse128}, {}, {64}},
     };
+    static const Tile w4a8_g1_decode{16, 256, 128, 16, 64, 2};
+    static const Tile w4a8_g2_decode{16, 256, 128, 16, 64, 2};
+    static const Tile w4a8_g2_decode3{16, 256, 128, 16, 64, 3};
+    static const Tile w4a8_g1_small{16, 1024, 128, 16, 64, 3};
+    static const Tile w4a8_g1_medium{32, 1024, 128, 32, 64, 3};
+    static const Tile w4a8_g1_large{64, 1024, 128, 64, 64, 3};
+    static const Tile w4a8_g2_small{16, 512, 128, 16, 64, 3};
+    static const Tile w4a8_g2_medium{32, 512, 128, 32, 64, 3};
+    static const Tile w4a8_g2_large{64, 512, 128, 64, 64, 3};
+    static const Tile w4a8_native160{160, 256, 128, 160, 32, 3};
     static const TuningEntry entries[] = {
+        {"kimi_k3", P::W4A8, 8, 896, 16, 3584, 3072, "situ",
+         {{4, {w4a8_g1_decode}, {w4a8_g2_decode}},
+          {8, {w4a8_g1_decode}, {w4a8_g2_decode3}},
+          {64, {w4a8_g1_decode}, {w4a8_g2_decode}},
+          {128, {Tile{32, 512, 128, 32, 64, 3}}, {Tile{32, 256, 128, 32, 64, 3}}},
+          {1024},
+          {2048, {w4a8_native160}, {w4a8_native160}}}, true},
+        {"kimi_k3", P::W4A8, 16, 896, 16, 3584, 3072, "situ",
+         {{32, {w4a8_g1_decode}, {w4a8_g2_decode}}}},
+        {"kimi_k3", P::W4A8, 16, 896, 16, 3584, 3072, "situ",
+         {{16, {w4a8_g1_small}, {w4a8_g2_small}},
+          {64, {w4a8_g1_medium}, {w4a8_g2_medium}},
+          {4096, {w4a8_g1_large}, {w4a8_g2_large}}}, true},
+        {"kimi_k3", P::W4A8, 32, 896, 16, 3584, 3072, "situ",
+         {{8, {Tile{16, 512, 128, 16, 64, 2}, {}, 12}, {w4a8_g2_decode}},
+          {16, {Tile{16, 512, 128, 16, 64, 3}}, {w4a8_g2_decode}},
+          {32, {Tile{32, 512, 128, 32, 64, 3}, {}, 12}, {Tile{32, 256, 128, 32, 64, 3}}},
+          {64, {w4a8_g1_large, {}, 12}, {Tile{64, 256, 128, 64, 64, 2}}},
+          {128, {Tile{64, 512, 128, 64, 64, 2}, {}, 12}, {w4a8_g2_large}},
+          {4096, {w4a8_g1_large}, {w4a8_g2_large}}}, true},
+
         {"kimi_k3",
          P::W4A16,
          8,

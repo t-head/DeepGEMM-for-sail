@@ -19,7 +19,13 @@ except Exception as exception:
 from .. import _C
 from ..utils.math import align, ceil_div
 
-__all__ = ['SymmBuffer', 'get_symm_buffer_for_mega_moe', 'transform_weights_for_mega_moe', 'fp4_fp4_mega_moe', 'mega_moe_pre_dispatch', 'transform_weights_for_fp8_mega_moe', 'transform_weights_for_w4a16_mega_moe', 'fp8_fp8_mega_moe', 'bf16_fp4_mega_moe']
+__all__ = [
+    "SymmBuffer", "get_symm_buffer_for_mega_moe", "transform_weights_for_mega_moe",
+    "fp4_fp4_mega_moe", "mega_moe_pre_dispatch",
+    "transform_weights_for_fp8_mega_moe", "transform_weights_for_w4a16_mega_moe",
+    "fp8_fp8_mega_moe", "bf16_fp4_mega_moe",
+    "transform_weights_for_w4a8_mega_moe", "fp8_fp4_mega_moe",
+]
 
 def _normalize_activation(activation: str) -> str:
     if activation not in ('swiglu', 'swiglu_step', 'situ', 'swiglu_oai'):
@@ -499,3 +505,57 @@ def bf16_fp4_mega_moe(
         activation, activation_clamp, fast_math, situ_beta, situ_linear_beta,
         l1_weights_replicas, l2_weights_replicas,
     )
+
+
+def transform_weights_for_w4a8_mega_moe(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor], l2_weights: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor, float], Tuple[torch.Tensor, torch.Tensor, float]]:
+    """Pack MXFP4 weights and UE8M0 scales, returning each bank's inverse scale.
+
+    The inverse scale compensates weight exponent rebasing; it is independent
+    of row activation scales and routing weights. Replica banks can be prepared
+    separately and may have different inverse scales.
+    """
+    _check_routed_weights(l1_weights, l2_weights, torch.uint8)
+    w1, s1 = l1_weights
+    first = _C.preprocess_weights_and_scales(
+        _C.PreprocessMode.W4A8_MXFP4_MMA, False,
+        _interleave_weights(w1), _interleave_weights(s1))
+    second = _C.preprocess_weights_and_scales(
+        _C.PreprocessMode.W4A8_MXFP4_MMA, False, *l2_weights)
+    return first, second
+
+
+def fp8_fp4_mega_moe(
+    y: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor, float],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor, float],
+    sym_buffer: SymmBuffer,
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+    activation: str = "swiglu",
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+    *,
+    l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None,
+    l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None,
+    situ_beta: Optional[float] = 4.0,
+    situ_linear_beta: Optional[float] = 25.0,
+    activation_alpha: Optional[float] = None,
+) -> None:
+    """Complete E4M3 x MXFP4 MoE, applying routing weights once in combine.
+
+    SiTU and OAI parameters follow fp4_fp4_mega_moe. situ_linear_beta=None
+    disables the up softcap; activation_alpha applies only to OAI.
+    """
+    if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'fp8xmxfp4':
+        raise TypeError("fp8_fp4_mega_moe requires SymmBuffer(mma_type='fp8xmxfp4')")
+    _check_routed_buffer(y, l1_weights, sym_buffer, weight_components=3)
+    if activation != 'situ':
+        situ_beta = None if situ_beta == 4.0 else situ_beta
+        situ_linear_beta = None if situ_linear_beta == 25.0 else situ_linear_beta
+    _C.fp8_fp4_mega_moe(
+        y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
+        sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
+        activation, activation_clamp, fast_math, situ_beta, situ_linear_beta, activation_alpha,
+        l1_weights_replicas, l2_weights_replicas)

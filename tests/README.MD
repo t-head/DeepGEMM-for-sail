@@ -87,7 +87,7 @@ helpers. Both use the public complete call.
 Other architecture pytest runs skip these tests; CLI use reports an
 unsupported-device error.
 
-`test_mega_moe_precisions.py` exercises FP8 channelwise, FP8 blockwise, W4A16
+`test_mega_moe_precisions.py` exercises FP8 channelwise/blockwise, W4A8 and W4A16
 through their public complete calls. Its default model cases are listed below;
 all token counts are per rank. CLI options can select other counts within capacity.
 
@@ -100,6 +100,8 @@ all token counts are per rank. CLI options can select other counts within capaci
 | `minimax_m3_blockwise` (next-generation model) | FP8 blockwise | 8, 16, 32, 64 | 64, 1024, 2048, 4096 |
 | `kimi_k3` | W4A16 | 8, 16 | 1024, 2048, 4096 |
 | `kimi_k3_decode` | W4A16 | 32 | 4, 8, 16, 32, 64, 128 |
+| `deepseek_v4_pro_w4a8` | W4A8 | 8 | 32, 1024, 2048, 4096 |
+| `kimi_k3_w4a8` | W4A8 | 8, 16, 32 | 32, 64, 128, 1024, 2048, 4096 |
 
 Small distributed cases cover separate replicas, both math modes, OAI/clamp,
 empty ranks, consecutive changing routes, statistics and graph replay.
@@ -118,7 +120,7 @@ Activation-reuse cases switch supported activations and SiTU coefficients on
 one allocation, then replay earlier graphs to check that later calls do not
 change their behavior. Unsupported activations remain rejected.
 Accuracy uses `deep_gemm.testing.calc_diff < 0.001`, matching grouped FP8
-GEMM. Relative L2 is reported on
+GEMM; W4A8 retains its existing 0.0015 threshold. Relative L2 is reported on
 failure. References run outside timing. The CLI examples use
 `--reference-tokens 8` to sample eight tokens per rank; the CLI default of 0
 checks every token.
