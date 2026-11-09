@@ -642,13 +642,24 @@ For more information, please refer to the `tf32_hc_prenorm_gemm` function docume
 
 `deep_gemm.mega_mhc` implements the fused shifted mHC computation used by
 **DeepSeek V4.1 Flash** on **Zhenwu M890**. The current interface
-supports `hc_mult=4`, hidden size `5120`, and BF16 output. It computes the
-updated residual, mix coefficients, and RMSNorm output into caller-provided
-output buffers.
+supports `hc_mult=4`, hidden size `5120`, and BF16 and/or FP8 E4M3 output.
+It computes the updated residual, mix coefficients, and RMSNorm output into
+caller-provided output buffers.
 
-The `y_bf16` output is required. FP8 output and its scale-output parameters
-are not supported by the current implementation. See the
-[API definition](csrc/apis/mega_mhc.hpp) for argument and layout requirements,
+Provide at least one of `y_bf16` or `y_fp8`. FP8 quantization uses the
+BF16-rounded RMSNorm output and requires one of these scale formats:
+
+- **Grouped UE8M0**: one power-of-two scale per 32 values, with four UE8M0
+  scales packed into each INT32 element of a `[T, H / 128]` tensor. Use
+  `y_gemm_sf` for aligned column-major scales, or `y_routed_sf` together with
+  `y_shared_sf` for contiguous routed scales and padded, interleaved shared
+  scales. The latter also requires `shared_sf_block_m > 0`.
+- **Per-token FP32**: one FP32 scale per token in a contiguous `[T, 1]`
+  `y_token_sf` tensor. `y_token_sf` is an optional extension to the upstream
+  API and cannot be combined with the grouped scale outputs. The scale is
+  used for dequantization: `y ≈ y_fp8 * y_token_sf`.
+
+See the [API definition](csrc/apis/mega_mhc.hpp) for argument and layout requirements,
 and [the reference and correctness tests](tests/test_mega_mhc.py) for a
 complete invocation.
 

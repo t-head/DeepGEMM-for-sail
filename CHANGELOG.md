@@ -15,6 +15,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   E4M3 scales, FP32 global scales, and per-channel or 128x128 outer scales.
   See the [NVFP4 W4A8 API guide](docs/api/nvfp4_w4a8.md).
 
+- **Mega-mHC FP8 output**: `mega_mhc` can write FP8 E4M3 alongside or instead
+  of BF16. Supports grouped UE8M0 scales and per-token FP32 scales through
+  the optional `y_token_sf` API extension.
 - **M890 W4FA8 dense NT GEMM**: implements `fp8_fp4_gemm_nt` and its
   `gemm_fp8_fp4_bf16_nt` alias with two-dimensional packed weights and
   scale preprocessing, BF16 output, and optional scalar `inv_scale`.

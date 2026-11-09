@@ -2,6 +2,7 @@
 #include <type_traits>
 #include <hggc_runtime.h>
 #include <hggc_bf16.h>
+#include <hggc_fp8.h>
 #include <cstdint>
 namespace deep_gemm::mhc {
 struct Args {
@@ -12,6 +13,9 @@ struct Args {
     int *counters;
     int tokens;
     float hc_eps, pre_eps, post_scale, sink_eps, norm_eps, norm_scale;
+    uint8_t* y_fp8;
+    int32_t *primary_sf, *shared_sf;
+    int64_t sf_stride_token, sf_stride_word, shared_sf_stride_word;
 };
 }
 
@@ -56,7 +60,128 @@ namespace deep_gemm::mhc {
 // Preserve route-then-element, TF32 and Split-K accumulation order.
 constexpr int M = 64, K = 64, P = 26;
 
-template<int H, int S, int Iters, bool FullRows=false>
+template<bool StoreBF16, bool StoreFP8, int SFBlockM, int Parts=1, bool PerTokenFP8=false>
+__device__ __forceinline__ uint32_t store_norm(Args a, const uint4* values, int token, int hidden,
+                                              __ppu_bfloat16* bf16_dst, bool valid) {
+    if constexpr(StoreBF16 || PerTokenFP8) if(valid) {
+        #pragma unroll
+        for(int part=0;part<Parts;++part)
+            *reinterpret_cast<uint4*>(bf16_dst+part*128)=values[part];
+    }
+    if constexpr(PerTokenFP8) {
+        uint32_t maximum=0;
+        #pragma unroll
+        for(int part=0;part<Parts;++part) {
+            const auto* words=reinterpret_cast<const uint32_t*>(values+part);
+            maximum=__vmaxu2(maximum,__vmaxu2(__vmaxu2(words[0]&0x7fff7fffu,words[1]&0x7fff7fffu),
+                                                        __vmaxu2(words[2]&0x7fff7fffu,words[3]&0x7fff7fffu)));
+        }
+        return max(maximum&0xffffu,maximum>>16);
+    } else if constexpr(StoreFP8) {
+        // Quantize rounded BF16 values with a power-of-two scale.
+        uint32_t amax[Parts],exponent[Parts],converted[Parts][Parts==2 ? 2 : 4];
+        __ppu_bfloat162 inverse[Parts];
+        #pragma unroll
+        for(int part=0;part<Parts;++part) {
+            const auto* words=reinterpret_cast<const uint32_t*>(values+part);
+            const uint32_t maximum=__vmaxu2(__vmaxu2(words[0]&0x7fff7fffu,words[1]&0x7fff7fffu),
+                                           __vmaxu2(words[2]&0x7fff7fffu,words[3]&0x7fff7fffu));
+            amax[part]=max(maximum&0xffffu,maximum>>16);
+        }
+        #pragma unroll
+        for(int shift=1;shift<=2;shift*=2) {
+            #pragma unroll
+            for(int part=0;part<Parts;++part)
+                amax[part]=max(amax[part],__shfl_xor_sync(0xffffffff,amax[part],shift));
+        }
+        #pragma unroll
+        for(int part=0;part<Parts;++part) {
+            exponent[part]=max((amax[part]+31u)>>7,113u)-8u;
+            inverse[part]=__bfloat162bfloat162(__ushort_as_bfloat16((254u-exponent[part])<<7));
+        }
+        if constexpr(Parts==2) {
+            #pragma unroll
+            for(int i=0;i<2;++i) {
+                #pragma unroll
+                for(int part=0;part<Parts;++part) {
+                    const auto* pairs=reinterpret_cast<const __ppu_bfloat162*>(values+part);
+                    const float2 lo=__bfloat1622float2(__hmul2(pairs[i*2],inverse[part]));
+                    const float2 hi=__bfloat1622float2(__hmul2(pairs[i*2+1],inverse[part]));
+                    converted[part][i]=__hg_fp8x4_e4m3(make_float4(lo.x,lo.y,hi.x,hi.y)).__x;
+                }
+            }
+        } else {
+            #pragma unroll
+            for(int i=0;i<4;++i) {
+                #pragma unroll
+                for(int part=0;part<Parts;++part) {
+                    const auto* pairs=reinterpret_cast<const __ppu_bfloat162*>(values+part);
+                    const float2 scaled=__bfloat1622float2(__hmul2(pairs[i],inverse[part]));
+                    converted[part][i]=__hg_fp8x2_e4m3(scaled).__x;
+                }
+            }
+        }
+        #pragma unroll
+        for(int part=0;part<Parts;++part) {
+            uint2 packed;
+            if constexpr(Parts==2) packed={converted[part][0],converted[part][1]};
+            else packed={converted[part][0]|(converted[part][1]<<16),converted[part][2]|(converted[part][3]<<16)};
+            const uint32_t pair=__byte_perm(exponent[part],__shfl_xor_sync(0xffffffff,exponent[part],4),0x1140);
+            const uint32_t word=__byte_perm(pair,__shfl_xor_sync(0xffffffff,pair,8),0x5410);
+            if(valid) {
+                *reinterpret_cast<uint2*>(a.y_fp8+int64_t(token)*5120+hidden+part*128)=packed;
+                if(hidden%128==0) {
+                    a.primary_sf[int64_t(token)*a.sf_stride_token+(hidden/128+part)*a.sf_stride_word]=word;
+                    if constexpr(SFBlockM>0) {
+                        const int row=token%SFBlockM;
+                        const int64_t index=int64_t(token/SFBlockM)*((int64_t(SFBlockM)+127)&~int64_t(127))+
+                            (row&~127)+(row&31)*4+((row>>5)&3);
+                        a.shared_sf[(hidden/128+part)*a.shared_sf_stride_word+index]=word;
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+template<int H, int Lanes>
+__device__ __forceinline__ void store_token_fp8(Args a, const __ppu_bfloat16* values,
+                                               uint32_t maximum, int token, bool valid) {
+    #pragma unroll
+    for(int shift=1;shift<Lanes;shift*=2)
+        maximum=max(maximum,__shfl_xor_sync(0xffffffff,maximum,shift,Lanes));
+    const float clamped=fmaxf(__bfloat162float(__ushort_as_bfloat16(maximum)),1e-4f);
+    // Keep separate FP32 rounding for scale and inverse.
+    const float scale=clamped*(1.f/448.f);
+    const float inverse=(1.f/clamped)*448.f;
+    const int lane=threadIdx.x%Lanes;
+    if(valid) {
+        if(lane==0) reinterpret_cast<float*>(a.primary_sf)[int64_t(token)*a.sf_stride_token]=scale;
+        for(int h=lane*8;h<H;h+=Lanes*32) {
+            uint4 input[4];
+            #pragma unroll
+            for(int part=0;part<4;++part)
+                input[part]=*reinterpret_cast<const uint4*>(values+h+part*Lanes*8);
+            #pragma unroll
+            for(int part=0;part<4;++part) {
+                const auto* pairs=reinterpret_cast<const __ppu_bfloat162*>(input+part);
+                uint2 packed;
+                #pragma unroll
+                for(int i=0;i<2;++i) {
+                    const float2 lo=__bfloat1622float2(pairs[i*2]);
+                    const float2 hi=__bfloat1622float2(pairs[i*2+1]);
+                    reinterpret_cast<uint32_t*>(&packed)[i]=__hg_fp8x4_e4m3(
+                        make_float4(lo.x*inverse,lo.y*inverse,hi.x*inverse,hi.y*inverse)).__x;
+                }
+                *reinterpret_cast<uint2*>(a.y_fp8+int64_t(token)*H+h+part*Lanes*8)=packed;
+            }
+        }
+    }
+}
+
+template<int H, int S, int Iters, bool FullRows=false,
+         bool StoreBF16=true, bool StoreFP8=false, int SFBlockM=0, bool PerTokenFP8=false>
 __device__ void finish(Args a, int mb, __ppu_bfloat16* norm_tile, int first_row=0, int row_limit=M) {
     constexpr bool InterleaveNorm = Iters==20;
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -67,6 +192,7 @@ __device__ void finish(Args a, int mb, __ppu_bfloat16* norm_tile, int first_row=
     for (int row=first_row+warp; row<rows; row+=4) {
         int t=mb*M+row;
         bool valid=FullRows || t<a.tokens;
+        uint32_t token_amax=0;
         constexpr bool EarlyPartials = S==5 || S==12;
         float early[EarlyPartials ? S : 1];
         if constexpr(EarlyPartials) {
@@ -98,8 +224,18 @@ __device__ void finish(Args a, int mb, __ppu_bfloat16* norm_tile, int first_row=
             for(int split=0;split<S;++split)
                 if(lane<26) v+=early[split];
         } else {
+            if constexpr(S==80 || S==40) {
+                for(int split=0;split<S;split+=8) {
+                    float values[8];
+                    #pragma unroll
+                    for(int j=0;j<8;++j) if(lane<26) values[j]=p[(split+j)*M*P+lane];
+                    #pragma unroll
+                    for(int j=0;j<8;++j) if(lane<26) v+=values[j];
+                }
+            } else {
             for(int split=0;split<S;++split)
                 if(lane<26) v+=p[split*M*P+lane];
+            }
         }
         sq=__shfl_sync(0xffffffff,v,24);
         usq=__shfl_sync(0xffffffff,v,25);
@@ -138,20 +274,23 @@ __device__ void finish(Args a, int mb, __ppu_bfloat16* norm_tile, int first_row=
                 const auto* wv=reinterpret_cast<const __ppu_bfloat16*>(&weight);
                 #pragma unroll
                 for(int z=0;z<4;z+=2) {
-                    float u0=__bfloat162float(uv[z]),u1=__bfloat162float(uv[z+1]);
-                    float w0=__bfloat162float(wv[z])*a.norm_scale,w1=__bfloat162float(wv[z+1])*a.norm_scale;
-                    reinterpret_cast<__ppu_bfloat162*>(&output)[z/2]=__floats2bfloat162_rn((u0*interleaved_inv)*w0,(u1*interleaved_inv)*w1);
+                    const float2 u=__bfloat1622float2(reinterpret_cast<const __ppu_bfloat162*>(uv)[z/2]);
+                    const float2 w=__bfloat1622float2(reinterpret_cast<const __ppu_bfloat162*>(wv)[z/2]);
+                    const float w0=w.x*a.norm_scale,w1=w.y*a.norm_scale;
+                    reinterpret_cast<__ppu_bfloat162*>(&output)[z/2]=__floats2bfloat162_rn((u.x*interleaved_inv)*w0,(u.y*interleaved_inv)*w1);
                 }
                 sum=c+__shfl_xor_sync(0xffffffff,c,4);
                 sum+=__shfl_xor_sync(0xffffffff,sum,8);
                 c=c*__ppu_rcpf(sum+a.sink_eps);
                 #pragma unroll
                 for(int z=4;z<8;z+=2) {
-                    float u0=__bfloat162float(uv[z]),u1=__bfloat162float(uv[z+1]);
-                    float w0=__bfloat162float(wv[z])*a.norm_scale,w1=__bfloat162float(wv[z+1])*a.norm_scale;
-                    reinterpret_cast<__ppu_bfloat162*>(&output)[z/2]=__floats2bfloat162_rn((u0*interleaved_inv)*w0,(u1*interleaved_inv)*w1);
+                    const float2 u=__bfloat1622float2(reinterpret_cast<const __ppu_bfloat162*>(uv)[z/2]);
+                    const float2 w=__bfloat1622float2(reinterpret_cast<const __ppu_bfloat162*>(wv)[z/2]);
+                    const float w0=w.x*a.norm_scale,w1=w.y*a.norm_scale;
+                    reinterpret_cast<__ppu_bfloat162*>(&output)[z/2]=__floats2bfloat162_rn((u.x*interleaved_inv)*w0,(u.y*interleaved_inv)*w1);
                 }
-                if(valid) *reinterpret_cast<uint4*>(a.y+(int64_t)t*H+h)=output;
+                token_amax=max(token_amax,store_norm<StoreBF16,StoreFP8,SFBlockM,1,PerTokenFP8>(
+                    a,&output,t,h,a.y+(int64_t)t*H+h,valid));
             } else {
                 sum=c+__shfl_xor_sync(0xffffffff,c,4);
                 sum+=__shfl_xor_sync(0xffffffff,sum,8);
@@ -172,13 +311,17 @@ __device__ void finish(Args a, int mb, __ppu_bfloat16* norm_tile, int first_row=
                 const auto* wv=reinterpret_cast<const __ppu_bfloat16*>(&weight);
                 #pragma unroll
                 for(int z=0;z<8;z+=2) {
-                    float u0=__bfloat162float(uv[z]),u1=__bfloat162float(uv[z+1]);
-                    float w0=__bfloat162float(wv[z])*a.norm_scale,w1=__bfloat162float(wv[z+1])*a.norm_scale;
-                    reinterpret_cast<__ppu_bfloat162*>(&output)[z/2]=__floats2bfloat162_rn((u0*inv)*w0,(u1*inv)*w1);
+                    const float2 u=__bfloat1622float2(reinterpret_cast<const __ppu_bfloat162*>(uv)[z/2]);
+                    const float2 w=__bfloat1622float2(reinterpret_cast<const __ppu_bfloat162*>(wv)[z/2]);
+                    const float w0=w.x*a.norm_scale,w1=w.y*a.norm_scale;
+                    reinterpret_cast<__ppu_bfloat162*>(&output)[z/2]=__floats2bfloat162_rn((u.x*inv)*w0,(u.y*inv)*w1);
                 }
-                if(valid) *reinterpret_cast<uint4*>(a.y+(int64_t)t*H+h)=output;
+                token_amax=max(token_amax,store_norm<StoreBF16,StoreFP8,SFBlockM,1,PerTokenFP8>(
+                    a,&output,t,h,a.y+(int64_t)t*H+h,valid));
             }
         }
+        if constexpr(PerTokenFP8)
+            store_token_fp8<H,32>(a,a.y+(int64_t)t*H,token_amax,t,valid);
         __syncthreads();
     }
 }
@@ -338,7 +481,8 @@ __device__ __forceinline__ void manual_lifetime_drain_n24(
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
 // One token per half-warp; Sinkhorn shuffles must not cross the boundary.
 template<int S, bool LocalCompletion=false, int TileM=32, bool TailRows=false,
-         bool TailTokens=false, bool VectorCoefficients=true>
+         bool TailTokens=false, bool VectorCoefficients=true,
+         bool StoreBF16=true, bool StoreFP8=false, int SFBlockM=0, bool PerTokenFP8=false>
 __device__ __forceinline__ void single_ring_finish(Args a, void* scratch, uint32_t producer_task=0) {
     static_assert(S>=8 && S<=80 && S%2==0,"Unsupported split count");
     constexpr int H=5120, Iters=20;
@@ -466,8 +610,22 @@ __device__ __forceinline__ void single_ring_finish(Args a, void* scratch, uint32
         c=expf(c-mx);
         float sum=c+__shfl_xor_sync(0xffffffff,c,1);
         sum+=__shfl_xor_sync(0xffffffff,sum,2);
-        c=c*__ppu_rcpf(sum)+a.sink_eps;
+        // Preserve the fused Sinkhorn rounding for this specialization.
+        if constexpr(StoreFP8 && S==16 && !LocalCompletion && TileM==32) c=fmaf(c,__ppu_rcpf(sum),a.sink_eps);
+        else c=c*__ppu_rcpf(sum)+a.sink_eps;
         const float inverse=VectorCoefficients?half_output_inverse:(lane<16?inv[0]:inv[1]);
+        uint32_t token_amax=0;
+        Args output_args=a;
+        if constexpr(StoreFP8 && !PerTokenFP8) {
+            output_args.y_fp8+=int64_t(t)*H;
+            output_args.primary_sf+=int64_t(t)*a.sf_stride_token;
+            if constexpr(SFBlockM>0) {
+                const int row=t%SFBlockM;
+                const int64_t index=int64_t(t/SFBlockM)*((int64_t(SFBlockM)+127)&~int64_t(127))+
+                    (row&~127)+(row&31)*4+((row>>5)&3);
+                output_args.shared_sf+=index;
+            }
+        }
         auto consume=[&](int iter) {
             if(iter) {
                 sum=c+__shfl_xor_sync(0xffffffff,c,1);
@@ -475,8 +633,7 @@ __device__ __forceinline__ void single_ring_finish(Args a, void* scratch, uint32
                 c=c*__ppu_rcpf(sum+a.sink_eps);
             }
             const int h=iter*256+h_lane;
-            #pragma unroll
-            for(int part=0;part<2;++part) {
+            auto normalize=[&](int part) {
                 uint4 input=storage.input[iter&3][part][tid],output;
                 const auto* uv=reinterpret_cast<const __ppu_bfloat16*>(&input);
                 float scaled[8];
@@ -488,26 +645,62 @@ __device__ __forceinline__ void single_ring_finish(Args a, void* scratch, uint32
                     reinterpret_cast<__ppu_bfloat162*>(&output)[z/2]=
                         __floats2bfloat162_rn((u0*inverse)*scaled[z],(u1*inverse)*scaled[z+1]);
                 }
-                *reinterpret_cast<uint4*>(y_row+h+part*128)=output;
-                if(part==0) {
-                    sum=c+__shfl_xor_sync(0xffffffff,c,4);
-                    sum+=__shfl_xor_sync(0xffffffff,sum,8);
-                    c=c*__ppu_rcpf(sum+a.sink_eps);
+                return output;
+            };
+            if constexpr(StoreFP8) {
+                uint4 normalized[2];
+                #pragma unroll
+                for(int part=0;part<2;++part) normalized[part]=normalize(part);
+                token_amax=max(token_amax,store_norm<StoreBF16,true,SFBlockM,2,PerTokenFP8>(
+                    output_args,normalized,0,h_lane,y_row+h,!TailRows || t<tokens));
+                if constexpr(!PerTokenFP8) {
+                    output_args.y_fp8+=256;
+                    output_args.primary_sf+=2*a.sf_stride_word;
+                    if constexpr(SFBlockM>0) output_args.shared_sf+=2*a.shared_sf_stride_word;
+                }
+                sum=c+__shfl_xor_sync(0xffffffff,c,4);
+                sum+=__shfl_xor_sync(0xffffffff,sum,8);
+                c=c*__ppu_rcpf(sum+a.sink_eps);
+            } else {
+                #pragma unroll
+                for(int part=0;part<2;++part) {
+                    const uint4 output=normalize(part);
+                    store_norm<StoreBF16,false,SFBlockM>(a,&output,t,h+part*128,
+                        y_row+h+part*128,true);
+                    if(part==0) {
+                        sum=c+__shfl_xor_sync(0xffffffff,c,4);
+                        sum+=__shfl_xor_sync(0xffffffff,sum,8);
+                        c=c*__ppu_rcpf(sum+a.sink_eps);
+                    }
                 }
             }
         };
-        for(int iter=0;iter<Iters-4;++iter) {
-            cute::cp_async_wait<3>();consume(iter);
-            #pragma unroll
-            for(int part=0;part<2;++part)
-                primitives::cp_async_16(&storage.input[iter&3][part][tid],
-                    y_row+(iter+4)*256+h_lane+part*128,true);
-            cute::cp_async_fence();
+        if constexpr(StoreFP8) {
+            #pragma unroll (S>=80 ? 1 : 4)
+            for(int iter=0;iter<Iters-4;++iter) {
+                cute::cp_async_wait<3>();consume(iter);
+                #pragma unroll
+                for(int part=0;part<2;++part)
+                    primitives::cp_async_16(&storage.input[iter&3][part][tid],
+                        y_row+(iter+4)*256+h_lane+part*128,true);
+                cute::cp_async_fence();
+            }
+        } else {
+            for(int iter=0;iter<Iters-4;++iter) {
+                cute::cp_async_wait<3>();consume(iter);
+                #pragma unroll
+                for(int part=0;part<2;++part)
+                    primitives::cp_async_16(&storage.input[iter&3][part][tid],
+                        y_row+(iter+4)*256+h_lane+part*128,true);
+                cute::cp_async_fence();
+            }
         }
         cute::cp_async_wait<3>();consume(Iters-4);
         cute::cp_async_wait<2>();consume(Iters-3);
         cute::cp_async_wait<1>();consume(Iters-2);
         cute::cp_async_wait<0>();consume(Iters-1);
+        if constexpr(PerTokenFP8)
+            store_token_fp8<H,16>(a,y_row,token_amax,t,!TailRows || t<tokens);
         if(!TailTokens || t<tokens) a.new_comb[t*16+lane%16]=c;
         __syncthreads();
         if constexpr(LocalCompletion && !TailRows && S>=16) break;
@@ -540,8 +733,9 @@ __device__ __forceinline__ void manual_tf32_pair_n24(float* d, const uint32_t* a
 #endif
 
 template<int H, int S, int Iters, bool FullRows=false, bool SingleKernel=false, bool LocalCompletion=false,
-         int SingleTileM=32, int TaskSplits=2, bool TailRows=false, bool TailTokens=false, bool VectorCoefficients=true>
-__device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
+         int SingleTileM=32, int TaskSplits=2, bool TailRows=false, bool TailTokens=false, bool VectorCoefficients=true,
+         bool StoreBF16=true, bool StoreFP8=false, int SFBlockM=0, bool PerTokenFP8=false>
+__device__ __forceinline__ void ppu_mega_mhc_shifted_device(Args a) {
     static_assert(H==5120, "Mega-mHC requires hidden=5120");
     static_assert(!SingleKernel || ((S>=8 && S<=80 && S%2==0) && Iters==20 && !FullRows),
                   "Single-kernel specialization requires shifted BF16 H5120/I20");
@@ -583,6 +777,8 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
         if constexpr(LocalCompletion) {
             // Cooperative launch requires all CTAs to be resident.
             first_task=cooperative_task;
+        } else if(!SingleKernel && (S==80 || S==40) && blocks*S<=gridDim.x) {
+            first_task=blockIdx.x;
         } else {
             if(tid==0) next=atomicAdd(a.counters+blocks,SingleKernel ? TaskSplits : 1);
             __syncthreads();
@@ -829,6 +1025,7 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
                     } else {
                         int row=warp*16+part*8+lane/4, k=(lane%4)*16;
                         int t=mb*M+row, offset=row*64+(k^((row&7)*8));
+                        if(!FullRows && t>=tokens) continue;
                         uint4 packed[5][2];
                         #pragma unroll
                         for(int j=0;j<5;++j) {
@@ -846,9 +1043,9 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
                             float old[5][2];
                             #pragma unroll
                             for(int j=0;j<5;++j) {
-                                const auto* value=reinterpret_cast<const __ppu_bfloat16*>(&packed[j]);
-                                old[j][0]=__bfloat162float(value[z]);
-                                old[j][1]=__bfloat162float(value[z+1]);
+                                const float2 pair=__bfloat1622float2(reinterpret_cast<const __ppu_bfloat162*>(&packed[j])[z/2]);
+                                old[j][0]=pair.x;
+                                old[j][1]=pair.y;
                             }
                             #pragma unroll
                             for(int route=0;route<4;++route) {
@@ -1190,16 +1387,14 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
         }
         if constexpr(SingleKernel) ++produced;
         if constexpr(!SingleKernel) {
-            // Publish every thread's stores before the leader increments the counter.
-            __threadfence();
-            __syncthreads();
-            if(tid==0) atomicAdd(a.counters+mb,1);
+            cutlass::Barrier::arrive_inc(a.counters,tid,mb,1);
             if constexpr(S!=12) __syncthreads();
         } else {
             if(subtask<TaskSplits-1) __syncthreads();
         }
         }
         if constexpr(LocalCompletion) break;
+        if(!SingleKernel && (S==80 || S==40) && blocks*S<=gridDim.x) break;
     }
     // Schedule all producers before waiting; arrive_inc releases their stores.
     if constexpr(SingleKernel) {
@@ -1207,14 +1402,14 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
             cutlass::Barrier::arrive_inc(a.counters,tid,cooperative_task/S,2);
         } else if(produced) cutlass::Barrier::arrive_inc(a.counters,tid,0,produced);
         else __syncthreads();
-        single_ring_finish<S,LocalCompletion,SingleTileM,TailRows,TailTokens,LocalCompletion || VectorCoefficients>(a,&storage,cooperative_task);
+        single_ring_finish<S,LocalCompletion,SingleTileM,TailRows,TailTokens,LocalCompletion || VectorCoefficients,
+                           StoreBF16,StoreFP8,SFBlockM,PerTokenFP8>(a,&storage,cooperative_task);
     }
     if constexpr(!SingleKernel) {
         for(int task=blockIdx.x;task<(tokens+3)/4;task+=gridDim.x) {
             int mb=task/16, row=(task%16)*4;
-            if(tid==0) while(atomicAdd(a.counters+mb,0)!=S) {}
-            __syncthreads();
-            finish<H,S,Iters,FullRows>(a,mb,reinterpret_cast<__ppu_bfloat16*>(&storage),row,row+4);
+            cutlass::Barrier::wait_eq(a.counters,tid,mb,S);
+            finish<H,S,Iters,FullRows,StoreBF16,StoreFP8,SFBlockM,PerTokenFP8>(a,mb,reinterpret_cast<__ppu_bfloat16*>(&storage),row,row+4);
             // finish() already ends each four-row task with a CTA barrier.
             if constexpr(S!=12) __syncthreads();
         }
