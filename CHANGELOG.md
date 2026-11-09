@@ -14,6 +14,12 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Changed
 
+- **BF16 dense GEMM**: `bf16_gemm_nt` now supports odd N with BF16 or
+  FP32 output on 890P, including an optimized N=1 path. On 810E, N must be
+  even except for N=1 without an explicit configuration; that path requires
+  K divisible by 8 and 16-byte-aligned inputs. On 890P, the retired
+  `DG_USE_CUTE=0` fallback has been removed.
+
 - **M890 W4A4 MegaMoE**: optimizes dispatch, GEMM scheduling, and
   scatter/reduce to improve computation and communication overlap.
   - Renames `mma_type="fp4xfp4"` to `"mxf4xmxf4"` and

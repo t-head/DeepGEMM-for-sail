@@ -35,6 +35,7 @@ template <int BLOCK_M, int BLOCK_N, int BLOCK_K,
           bool DenseS2Opt,
           bool OverlapPrologue,
           bool IsAlignedN,
+          bool UsePackedStore,
           typename GemmTypeTag, typename ElementOutput = cutlass::bfloat16_t>
 using BF16GemmCuteFreeKernel = kernel::GemmKernel<
     cutlass::bfloat16_t,
@@ -44,7 +45,7 @@ using BF16GemmCuteFreeKernel = kernel::GemmKernel<
     copy::TsmS2RAtom<cutlass::bfloat16_t, BLOCK_N, BLOCK_K, /*SwapLboSbo=*/true>,   // S2R B
     mma::Bf16MmaAtom,                                          // MMA
     epilogue::Epilogue<ElementOutput, mma::Bf16MmaAtom::CLayout,
-                             WARP_M, WARP_N, IsAlignedN>,      // Epilogue
+                             WARP_M, WARP_N, IsAlignedN, UsePackedStore>,
     BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, STAGES, DenseS2Opt, OverlapPrologue,
     GemmTypeTag>;
 

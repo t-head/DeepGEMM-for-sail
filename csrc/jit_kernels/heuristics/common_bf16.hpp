@@ -153,7 +153,7 @@ std::tuple<int, int, int, int, int, bool> get_gemv_best_configs(int m, int n, in
 // Dense GEMV (m == 1 or 2) launch-config selection: BlockX keys on k/8, BlockY =
 // 128/BlockX. Returns false when uncovered or the tile path is faster (fall back).
 bool dense_gemv_select_configs(int m, int n, int k, const void* w, const void* x,
-                               int& block_x, int& block_y, int& k_per_thread, int& npt) {
+                               int& block_x, int& block_y, int& k_per_thread, int& npt, bool transposed_n1 = false) {
     if (get_env<int>("DG_DISABLE_DENSE_GEMV", 0))
         return false;
     // m == 2 tile gate: above this n the tile path wins despite ~8x wasted math
@@ -188,7 +188,7 @@ bool dense_gemv_select_configs(int m, int n, int k, const void* w, const void* x
     // (~1.81 vs 1.87 TB/s). 4900-case scans put the crossover at n>=2944 && k>=3584.
     constexpr int kGemvTileGateN = 3072;
     constexpr int kGemvTileGateK = 3584;
-    if (m == 1 && n >= kGemvTileGateN && k >= kGemvTileGateK)
+    if (!transposed_n1 && m == 1 && n >= kGemvTileGateN && k >= kGemvTileGateK)
         return false;
 
     k_per_thread = 2;

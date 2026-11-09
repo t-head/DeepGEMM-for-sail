@@ -40,31 +40,16 @@ static size_t get_bf16_tample_params_size() {
       Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
       Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _16>>;       // 1x1x1 value group
 
-  static constexpr int N_EXPAND = 1;//kKernelStrategy == KernelStrategy::MultistageOnN && (SHAPE_N % (BLOCK_N) == 0) ? KernelAiuMultistageOnN::N_EXPAND : 1;
-  using KernelSchedule = cute::conditional_t<
-      kKernelStrategy == KernelStrategy::OverlapMainloop,
-      KernelAiuMultistageOverlapMainloop,
-      cute::conditional_t<
-        kKernelStrategy == KernelStrategy::OverlapPrologue,
-        KernelAiuMultistageOverlapPrologue,
-        cute::conditional_t<
-          kKernelStrategy == KernelStrategy::MultistageOnN,
-          KernelAiuMultistageOnN,
-          cutlass::gemm::KernelAiuMultistage>>>;
-  using DispatchPolicy = cute::conditional_t<
-      kKernelStrategy == KernelStrategy::OverlapMainloop,
-      cutlass::gemm::MainloopPPUOverlapMainloop<STAGES, KernelSchedule>,
-      cute::conditional_t<
-        kKernelStrategy == KernelStrategy::OverlapPrologue,
-        cutlass::gemm::MainloopPPUOverlapPrologue<STAGES, KernelSchedule>,
-        cutlass::gemm::MainloopPPUAiuOpt<STAGES, KernelSchedule>>>;
+  static constexpr int N_EXPAND = 1;
+  using KernelSchedule = cute::conditional_t<kKernelStrategy == KernelStrategy::MultistageOnN, KernelAiuMultistageOnN, cutlass::gemm::KernelAiuMultistage>;
+  using DispatchPolicy = cutlass::gemm::MainloopPPUAiuOpt<STAGES, KernelSchedule>;
 
   static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
   static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
   static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
 
-  static constexpr int SmemLayoutStageStrideA = kKernelStrategy == KernelStrategy::OverlapMainloop || kKernelStrategy == KernelStrategy::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
-  static constexpr int SmemLayoutStageStrideB = kKernelStrategy == KernelStrategy::OverlapMainloop || kKernelStrategy == KernelStrategy::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
+  static constexpr int SmemLayoutStageStrideA = BLOCK_M * BLOCK_K;
+  static constexpr int SmemLayoutStageStrideB = BLOCK_N * BLOCK_K;
   using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
   using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
   // using t1 = DefaultOperandB::xhzhao;
