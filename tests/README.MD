@@ -249,10 +249,10 @@ The public calling example and workspace reuse contract are in the main README.
 
 # W4A8 correctness and performance tests
 
-On PPU1.5, [test_w4a8.py](test_w4a8.py) covers MXFP4 and
+On M890, [test_w4a8.py](test_w4a8.py) covers MXFP4 and
 [test_w4a8_nvfp4.py](test_w4a8_nvfp4.py) covers NVFP4. The NVFP4 calling contract,
-scale layouts and execution modes are in the main
-[README](../README.md#nvfp4-w4a8-gemms-m890).
+scale layouts and execution modes are in the
+[NVFP4 W4A8 API guide](../docs/api/nvfp4_w4a8.md).
 
 ## Correctness
 
@@ -276,7 +276,8 @@ allocates an FP8 workspace once per case and refreshes it on each call.
 `quant_type:block` (default) uses 1x128 activation scales and 128x128 outer
 weight scales; fused execution also accepts `quant_type:channel` for
 per-token activations and per-channel weights. `lhs_scale_group_size:0`
-selects per-token activation scales independently. Native NVFP4 scales are
+selects per-token activation scales independently; fused execution also accepts
+`lhs_scale_group_size:16` for K16 activation scales. Native NVFP4 scales are
 always K16 E4M3, with a separate FP32 global scale per expert.
 
 Dimensions, `distribution`, `em`, `padding_m`, `num_token` and `topk` follow
@@ -287,8 +288,8 @@ decode-to-FP8 fused routing requires N/K to be multiples of 128.
 `--ref_backend=host` computes independent references on the CPU, and
 `--disable_acc` skips reference calculation and output checks.
 
-Pytest skips NVFP4 tests without a PPU1.5 device; the standalone runner
-prints the hardware requirement. The three test entry points are:
+NVFP4 tests target M890. Pytest skips unsupported devices; the standalone
+runner prints the hardware requirement. The three test entry points are:
 
 | Test | Coverage |
 | :--- | :--- |
@@ -301,6 +302,9 @@ for small cases and 256/1024 otherwise; decode-to-FP8 fused routing uses
 256/256 to meet its alignment requirement. Additional M=1, N=1024, K=64/128
 cases cover disabled/enabled N expansion and are included in the check-in list.
 K=192 cases use distinct K64 scale ranges and repeated graph replay to cover scale-slot reuse.
+Fused execution also uses M=17, N/K=256/192 with distinct adjacent K16
+activation scales in all four layouts, with channel and block outer weight
+scales. These cases verify the two partial sums within each K32 MMA.
 Batch is the activation row count,
 or per-expert buffer capacity for masked GEMMs; fused routing uses top-k=2.
 These tests include empty experts, N/K tails, native/global/outer scales,

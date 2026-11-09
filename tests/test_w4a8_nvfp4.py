@@ -172,8 +172,10 @@ def run_nvfp4_gemm(args, *, check_accuracy=True, benchmark=False, ref_backend='d
     name = f'NVFP4 {execution}: {kind}, M={m}, N={n}, K={k}'
     a_scale_group = args.get('lhs_scale_group_size', 0 if quant_type == 'channel' else 128)
     b_scale_block = 0 if quant_type == 'channel' else 128
-    if a_scale_group not in (0, 128):
-        raise ValueError('The NVFP4 case runner supports per-token or K128 activation scales')
+    if a_scale_group not in (0, 16, 128):
+        raise ValueError('The NVFP4 case runner supports per-token, K16 or K128 activation scales')
+    if execution == 'dequantize' and a_scale_group not in (0, 128):
+        raise ValueError('NVFP4 decode-to-FP8 execution requires per-token or K128 activation scales')
     if execution == 'dequantize' and b_scale_block != 128:
         raise ValueError('NVFP4 decode-to-FP8 execution requires quant_type:block')
     if kind in ('nopad', 'masked'):
@@ -206,7 +208,12 @@ def run_nvfp4_gemm(args, *, check_accuracy=True, benchmark=False, ref_backend='d
 
     a_shape = (e, m, k) if kind == 'masked' else (m, k)
     a = torch.randn(a_shape, device='cuda').to(torch.float8_e4m3fn)
-    a_scale = torch.rand((*a_shape[:-1], (k + 127) // 128 if a_scale_group else 1), device='cuda') + .25
+    scale_columns = (k + a_scale_group - 1) // a_scale_group if a_scale_group else 1
+    a_scale = torch.rand((*a_shape[:-1], scale_columns), device='cuda') + .25
+    if a_scale_group == 16:
+        # Adjacent halves of each K32 MMA must use different activation scales.
+        a_scale[..., ::2] *= .25
+        a_scale[..., 1::2] *= 4
     b_scale_shape = (e, (n + 127) // 128, (k + 127) // 128) if b_scale_block else (e, n)
     b_scale = torch.rand(b_scale_shape, device='cuda') + .25
     if regressions:
@@ -380,21 +387,27 @@ def _test_nvfp4_preprocessing_memory(execution):
 def _test_nvfp4_gemm(execution):
     _test_nvfp4_preprocessing_memory(execution)
     for m, n, k in GEMM_CASES:
-        for kind in ('dense', 'nopad', 'masked', 'fused'):
-            if execution == 'dequantize' and kind == 'fused':
-                n_case, k_case = 256, 256  # Mainline FP8 routing requires N/K % 128 == 0.
-            else:
-                n_case, k_case = n, k
-            types = {'dense': 'DenseGemm', 'nopad': 'GroupedNoPad',
-                     'masked': 'GroupedMasked', 'fused': 'GroupedFused'}
-            counts = [0, m // 4, m // 3, m - m // 4 - m // 3]
-            if kind == 'masked':
-                counts[-1] = m
-            args = dict(gemm_type=types[kind], groups=4, m=m, num_token=m, topk=2,
-                        n=n_case, k=k_case, distribution=counts, padding_m=m,
-                        execution=execution, lhs_scale_group_size=0 if m == 1 else 128,
-                        quant_type='channel' if execution == 'fused' and m == 1 else 'block')
-            run_nvfp4_gemm(args, regressions=True)
+        scale_cases = [(0 if m == 1 else 128,
+                        'channel' if execution == 'fused' and m == 1 else 'block')]
+        if execution == 'fused' and (m, n, k) == (17, 256, 192):
+            # Split K32 MMA into two K16 sums, with and without FP8 weight rounding.
+            scale_cases.extend(((16, 'channel'), (16, 'block')))
+        for a_scale_group, quant_type in scale_cases:
+            for kind in ('dense', 'nopad', 'masked', 'fused'):
+                if execution == 'dequantize' and kind == 'fused':
+                    n_case, k_case = 256, 256  # Mainline FP8 routing requires N/K % 128 == 0.
+                else:
+                    n_case, k_case = n, k
+                types = {'dense': 'DenseGemm', 'nopad': 'GroupedNoPad',
+                         'masked': 'GroupedMasked', 'fused': 'GroupedFused'}
+                counts = [0, m // 4, m // 3, m - m // 4 - m // 3]
+                if kind == 'masked':
+                    counts[-1] = m
+                args = dict(gemm_type=types[kind], groups=4, m=m, num_token=m, topk=2,
+                            n=n_case, k=k_case, distribution=counts, padding_m=m,
+                            execution=execution, lhs_scale_group_size=a_scale_group,
+                            quant_type=quant_type)
+                run_nvfp4_gemm(args, regressions=True)
     for ep, n, k in MODEL_GEMM_CASES:
         groups = 384 // ep
         for batch in (1, 128, 4096):

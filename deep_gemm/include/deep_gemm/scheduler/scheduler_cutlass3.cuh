@@ -95,6 +95,7 @@ struct DeepGemmScheduler {
         num_aligned_m_blocks = math::ceil_div(params_.shape_m, BLOCK_M);
         if constexpr(kGemmType == GemmType::Normal || kGemmType == GemmType::Batched) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
+            curr_group_idx = 0;
         } else if constexpr(kGemmType == GemmType::MGroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if constexpr(kGemmType == GemmType::MGroupedMasked) {

@@ -60,6 +60,7 @@ DenseGemm,data_type:w4a8_nvfp4,m:1,n:1024,k:64,quant_type:block,execution:fused
 DenseGemm,data_type:w4a8_nvfp4,m:1,n:1024,k:128,quant_type:block,execution:fused
 DenseGemm,data_type:w4a8_nvfp4,m:1,n:256,k:192,quant_type:channel,execution:fused
 DenseGemm,data_type:w4a8_nvfp4,m:17,n:256,k:192,quant_type:block,execution:fused
+DenseGemm,data_type:w4a8_nvfp4,m:17,n:256,k:192,quant_type:block,lhs_scale_group_size:16,execution:fused
 DenseGemm,data_type:w4a8_nvfp4,m:1,n:192,k:160,quant_type:channel,execution:fused
 DenseGemm,data_type:w4a8_nvfp4,m:17,n:192,k:160,execution:fused
 DenseGemm,data_type:w4a8_nvfp4,m:17,n:192,k:160,execution:dequantize
@@ -198,6 +199,7 @@ GroupedNoPad,data_type:w4fa8_mma,groups:4,m:83,n:768,k:128,distribution:[0,1,17,
 GroupedNoPad,data_type:w4fa8_mma,groups:384,m:3072,n:512,k:7168,distribution:uniform,quant_type:group,group_size:32
 
 # --- GroupedNoPad / w4a8_nvfp4 ---
+GroupedNoPad,data_type:w4a8_nvfp4,groups:4,m:17,n:256,k:192,distribution:[0,4,5,8],quant_type:channel,lhs_scale_group_size:16,execution:fused
 GroupedNoPad,data_type:w4a8_nvfp4,groups:4,m:257,n:256,k:1024,distribution:[0,64,85,108],execution:fused
 GroupedNoPad,data_type:w4a8_nvfp4,groups:4,m:257,n:256,k:1024,distribution:[0,64,85,108],execution:dequantize
 

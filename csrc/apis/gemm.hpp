@@ -1818,7 +1818,8 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_fused(const std::pair<torch::Tensor, 
                                  GemmType::MGroupedFused, ceil_div(int(out.size(0)), num_groups), inv_scale, experts, tokens, aligned);
 }
 
-// NVFP4 W4A8: share the public calling convention across both execution modes.
+// NVFP4 W4A8: execution selects weight decoding for every layout.
+// GemmType::MGroupedFused independently selects routed activation gathering.
 static void gemm_fp8_nvfp4_bf16_nt(
         const NVFP4Activation& lhs, const NVFP4Weight& rhs, const torch::Tensor& out,
         std::optional<NVFP4ExecutionConfig> configs = std::nullopt,
@@ -2079,7 +2080,9 @@ With outer block scales, native NVFP4 values are rounded to saturated E4M3
 before MMA; decoding does not divide by rhs_scales. Without outer block
 scales, fused execution retains native K16 scaling without FP8 weight rounding.
 
-execution='dequantize' requires explicit activation scales (per-token or K128),
+execution='fused' (the default for every layout) decodes weights inside GEMM.
+execution='dequantize' decodes weights before FP8 GEMM, and requires explicit
+activation scales (per-token or K128),
 rhs_scale_block_size=128, and a contiguous E4M3FN fp8_workspace [E,N,K]
 ([N,K] for dense). Every call refreshes it on the current stream. The workspace
 must not overlap GEMM operands or metadata. Fused execution needs no workspace.
@@ -2087,7 +2090,7 @@ configs defaults to internal selection except for fused routing, which uses
 the config returned by moe_align_block_size: pass the prepared weights and the
 same scale granularity options for fused NVFP4 execution, or the FP8 workspace
 for dequantize routing. The _fused suffix denotes routing gather and is
-independent of execution. See the NVFP4 W4A8 section in README.md for examples.
+independent of execution. See docs/api/nvfp4_w4a8.md for examples.
 )doc";
     m.def("gemm_fp8_nvfp4_bf16_nt", &gemm_fp8_nvfp4_bf16_nt, nvfp4_doc,
           py::arg("lhs"), py::arg("rhs"), py::arg("out"),
