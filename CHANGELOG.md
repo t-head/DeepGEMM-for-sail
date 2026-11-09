@@ -8,6 +8,13 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **M890 NVFP4 W4A8 GEMMs**: adds `gemm_fp8_nvfp4_bf16_nt` and grouped
+  nopad, masked and fused-routing variants for FP8 activations and NVFP4
+  weights with BF16 output. Callers select fused decoding or per-call
+  decode-to-FP8 execution with a reusable workspace. Supports native K16
+  E4M3 scales, FP32 global scales, and per-channel or 128x128 outer scales.
+  See the [NVFP4 W4A8 API guide](docs/api/nvfp4_w4a8.md).
+
 - **M890 W4FA8 dense NT GEMM**: implements `fp8_fp4_gemm_nt` and its
   `gemm_fp8_fp4_bf16_nt` alias with two-dimensional packed weights and
   scale preprocessing, BF16 output, and optional scalar `inv_scale`.

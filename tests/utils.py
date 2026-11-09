@@ -998,7 +998,7 @@ def read_detail_from_nculog(filename):
 #     "ppu":  ["ppu__time_duration.sum","ce__cycles_elapsed.max", "cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed", "launch__waves_per_cu"],
 # }
 
-def read_cycle_from_nculog(filename):
+def read_cycle_from_nculog(filename, include_nvfp4_decode=False):
     # kernel_pattern = r"(.*)deep_gemm(.*)"
     # kernel_pattern = r"(.*)kernel(.*)Device(.*)"
     kernel_pattern = r"(.*)Device\s+\d+"
@@ -1050,11 +1050,16 @@ def read_cycle_from_nculog(filename):
         # The C++ JIT names its kernels by dtype tag (e.g. `attention_mqa_logits_int8`), so
         # include attention and MHC kernels in the totals. Metadata scheduling kernels are
         # reported in `op_cycles` but excluded from the totals.
-        if ("gemm" in op.lower() or "attention" in op.lower() or "mhc" in op.lower()) and "metadata" not in op.lower():
+        is_nvfp4_kernel = include_nvfp4_decode and any(
+            name in op.lower() for name in ('w4a8_nvfp4', 'dequantize_nvfp4_fp8'))
+        if ("gemm" in op.lower() or "attention" in op.lower() or "mhc" in op.lower() or is_nvfp4_kernel) and "metadata" not in op.lower():
             fwd_cycle_sum += cycle
-            fwd_tc_sum = tc_list[i]
-            fwd_hbm_sum = hbm_list[i]
-            fwd_time = time_list[i]
+            # Decoder contributes time/cycles; efficiency metrics describe the GEMM.
+            if not (include_nvfp4_decode and "dequantize_nvfp4_fp8" in op.lower()):
+                fwd_tc_sum = tc_list[i]
+                fwd_hbm_sum = hbm_list[i]
+            # NVFP4 prefill is a decoder followed by GEMM; report their combined time.
+            fwd_time = fwd_time + time_list[i] if include_nvfp4_decode else time_list[i]
     # calculate statistics data
     if fwd_cycle_sum != 0:
         # fwd unit case
@@ -1077,7 +1082,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
     # Kernel filter for the PPU profiler. `attention_` is needed because the C++ JIT emits
     # `attention_mqa_logits_*` / `attention_paged_mqa_logits_*`, which match none of the other terms.
     # Without it the profiler silently reports 0 for these attention kernels.
-    ppu_kernel_name = "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*|attention_|mhc'"
+    ppu_kernel_name = "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*|attention_|mhc|w4a8_nvfp4|dequantize_nvfp4_fp8'"
     output_lines = list()
     headers = ["casename","time(us)","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"]
@@ -1136,7 +1141,8 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         cycle, tc, detail, hbm, time = 0, 0, "", 0, 0
         if mode != "full" and ret != None:
             if ret.returncode == 0:
-                cycle, tc, detail, hbm, time = read_cycle_from_nculog(log_file)
+                cycle, tc, detail, hbm, time = read_cycle_from_nculog(
+                    log_file, include_nvfp4_decode=dtype == 'w4a8_nvfp4')
                 if mode == "show_log":
                     other_metrics = read_detail_from_nculog(log_file)
                     print(other_metrics)
@@ -1255,6 +1261,7 @@ def parse_deepgemm_string_re(s):
             'w4fa16': 'group',
             'w4fa16_mma': 'group',
             'w4fa8_mma': 'group',
+            'w4a8_nvfp4': 'block',
             'w4a8_int8': 'channel',
             'bf16_bf16_fp32': 'non_quantized'
         }
@@ -1312,7 +1319,7 @@ def convert_data_type_to_dtype(data_type):
         return torch.uint8
     elif data_type in ["fp8", "torch.float8_e4m3fn"]:
         return torch.float8_e4m3fn
-    elif data_type in ["w4a16", "w4fa16", "w4fa16_mma", "w4fa8_mma", "w4a8_int8"]:
+    elif data_type in ["w4a16", "w4fa16", "w4fa16_mma", "w4fa8_mma", "w4a8_int8", "w4a8_nvfp4"]:
         return data_type
     elif data_type in ["bf16_bf16_fp32"]:
         # DenseGemm only: BF16 inputs with an FP32 output (deep_gemm.gemm_bf16_bf16_fp32_nt).
@@ -1520,8 +1527,16 @@ def test_native_batch_gemm(args):
     print('Passed with acc_check' if check else 'Passed without acc_check')
 
 
+def run_nvfp4_case(args):
+    from test_w4a8_nvfp4 import run_nvfp4_gemm
+    return run_nvfp4_gemm(args, check_accuracy=get_acc_check(),
+                          benchmark=get_benchmark(), ref_backend=get_ref_backend())
+
+
 def test_gemm(args) -> None:
     """Run a dense GEMM case or its explicitly selected regression checks."""
+    if args['data_type'] == 'w4a8_nvfp4':
+        return run_nvfp4_case(args)
     print('Testing GEMM:')
     m, n, k, d = args['m'], args['n'], args['k'], args["data_type"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
@@ -1683,6 +1698,8 @@ def make_grouped_fp4_bias(args):
 
 
 def test_m_grouped_gemm_masked(args) -> None:
+    if args['data_type'] == 'w4a8_nvfp4':
+        return run_nvfp4_case(args)
     print('Testing grouped masked GEMM:')
 
     num_groups, m, n, k, d, distribution = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
@@ -1829,6 +1846,8 @@ def test_m_grouped_gemm_masked(args) -> None:
     return
 
 def test_m_grouped_gemm_fused(args) -> None:
+    if args['data_type'] == 'w4a8_nvfp4':
+        return run_nvfp4_case(args)
     print('Testing grouped fuse permute GEMM:')
     num_groups, n, k, d = args['groups'], args['n'], args['k'], args['data_type']
     num_token, topk = args['num_token'], args['topk']
@@ -1890,6 +1909,8 @@ def test_m_grouped_gemm_fused(args) -> None:
         print("Passed without acc_check\n")
 
 def test_m_grouped_gemm_nopad(args) -> None:
+    if args['data_type'] == 'w4a8_nvfp4':
+        return run_nvfp4_case(args)
     print('Testing grouped nopad GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     UT = f"test_m_grouped_gemm_nopad->test_func: GroupedNoPad,data_type:{d},groups:{num_groups},m:{m},n:{n},k:{k}"

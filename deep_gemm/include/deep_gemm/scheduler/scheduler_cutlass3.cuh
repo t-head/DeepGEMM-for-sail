@@ -95,6 +95,7 @@ struct DeepGemmScheduler {
         num_aligned_m_blocks = math::ceil_div(params_.shape_m, BLOCK_M);
         if constexpr(kGemmType == GemmType::Normal || kGemmType == GemmType::Batched) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
+            curr_group_idx = 0;
         } else if constexpr(kGemmType == GemmType::MGroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if constexpr(kGemmType == GemmType::MGroupedMasked) {
@@ -359,7 +360,7 @@ struct DeepGemmScheduler {
     __device__ __forceinline__ int64_t curr_offset_scalea() const
     {
         if constexpr (kGemmType == GemmType::MGroupedMasked || kGemmType == GemmType::Batched) {
-            return int64_t(curr_group_idx) * params.shape_m * SHAPE_K / 128;
+            return int64_t(curr_group_idx) * params.shape_m * math::ceil_div(SHAPE_K, uint32_t(128));
         } else if constexpr (kGemmType == GemmType::MGroupedNoPad) {
             return int64_t(curr_cumsum_m);
         } else {

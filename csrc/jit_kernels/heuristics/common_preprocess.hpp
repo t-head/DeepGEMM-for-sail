@@ -5,6 +5,7 @@
 #include <vector>
 #include <torch/torch.h>
 #include "../../utils/math.hpp"
+#include "common_nvfp4_w4a8_preprocess.hpp"
 #include "../../utils/utils.hpp"
 using namespace deep_gemm;
 namespace deep_gemm_preprocess_common {
@@ -22,6 +23,8 @@ enum class PreprocessMode {
     BF16,             // unquantized bf16 weight
     W4A8_MXFP4_MMA,   // E4M3 activation, FP4 MMA dequant with E8M0 scales
     W4A8_INT8,        // w4a8 int4 weight with per-channel scales
+    W4A8_NVFP4,       // Fused E4M3 weight decoder, E4M3 K16 scales
+    W4A8_NVFP4_FP8,   // Contiguous W4 layout for standalone E4M3 decoding
 };
 
 struct PreprocessedWeights {
@@ -40,6 +43,8 @@ inline const char* preprocess_mode_name(const PreprocessMode& mode) {
         case PreprocessMode::W4A16_INT4:      return "w4a16-int4";
         case PreprocessMode::FP8_CHANNEL:     return "fp8-channel";
         case PreprocessMode::FP8_BLOCK:       return "fp8-block";
+        case PreprocessMode::W4A8_NVFP4:      return "w4a8-nvfp4";
+        case PreprocessMode::W4A8_NVFP4_FP8:  return "w4a8-nvfp4-fp8";
         case PreprocessMode::INT8:            return "int8";
         case PreprocessMode::BF16:            return "bf16";
         case PreprocessMode::W4A8_INT8:       return "w4a8-int8";
@@ -52,10 +57,19 @@ inline const char* preprocess_mode_name(const PreprocessMode& mode) {
 /// `mode` selects the weight format (PreprocessMode) and `fuse_activation` requests interleaving
 /// for the activation-fused epilogue; both are mandatory with no defaults. Weights may be
 /// omitted for MXFP4/W4A8_MXFP4_MMA without fusion; scales remain required. Supported: MXFP4 with or without activation
-/// fusion, and W4A16_INT4/W4A16_MXFP4/W4A16_MXFP4_MMA/W4A8_MXFP4_MMA without it.
+/// fusion, and W4A16_INT4/W4A16_MXFP4/W4A16_MXFP4_MMA/W4A8_MXFP4_MMA/
+/// W4A8_INT8/W4A8_NVFP4/W4A8_NVFP4_FP8 without it.
 inline PreprocessedWeights preprocess_weights_and_scales(
         const PreprocessMode& mode, bool fuse_activation,
         const torch::Tensor& weight, const std::optional<const torch::Tensor>& weight_scale) {
+    if (mode == PreprocessMode::W4A8_NVFP4 || mode == PreprocessMode::W4A8_NVFP4_FP8) {
+        TORCH_CHECK(!fuse_activation && weight.defined() && weight_scale.has_value(),
+                    "NVFP4 W4A8 preprocessing requires weights/scales and fuse_activation=False");
+        const bool fp8_layout = mode == PreprocessMode::W4A8_NVFP4_FP8;
+        auto [packed, scales] = deep_gemm::nvfp4::detail::preprocess_fp4_weights_and_scales(
+            weight, *weight_scale, fp8_layout);
+        return {packed, scales};
+    }
     const bool scale_only = !fuse_activation &&
         (mode == PreprocessMode::MXFP4 || mode == PreprocessMode::W4A8_MXFP4_MMA);
     TORCH_CHECK(weight.defined() || scale_only,
