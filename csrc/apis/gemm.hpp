@@ -1053,6 +1053,11 @@ static void m_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
 
     if (m == 0) return;
 
+    TORCH_CHECK(lhs_scales.scalar_type() != torch::kUInt8 || lhs_scales.size(1) >= ceil_div(k, 16),
+                "Invalid SFA shape: insufficient raw FP4 scales");
+    TORCH_CHECK(rhs_scales.scalar_type() != torch::kUInt8 || rhs_scales.size(2) >= ceil_div(k, 16),
+                "Invalid SFB shape: insufficient raw FP4 scales");
+
     torch::Tensor lhs_scales_t = lhs_scales;
     torch::Tensor rhs_scales_t = rhs_scales;
     if (!deep_gemm_fp4_common::check_mxfp4_scales_layout(lhs_scales_t)) {

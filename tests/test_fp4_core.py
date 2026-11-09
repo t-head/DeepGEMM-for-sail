@@ -104,6 +104,27 @@ def test_gemm(args):
     print(f"Passed with acc_check. diff: {diff}\n")
 
 
+def test_contiguous_raw_scale_validation():
+    # K=128 needs four raw exponents; packing three must not hide the missing one.
+    m, n, k = 256, 128, 128
+    a = torch.zeros((m, k // 2), dtype=torch.uint8, device='cuda')
+    b = torch.zeros((1, n, k // 2), dtype=torch.uint8, device='cuda')
+    sfa = torch.full((m, k // 32), 127, dtype=torch.uint8, device='cuda')
+    sfb = torch.full((1, n, k // 32), 127, dtype=torch.uint8, device='cuda')
+    out = torch.empty((m, n), dtype=torch.bfloat16, device='cuda')
+    indices = torch.zeros(m, dtype=torch.int32, device='cuda')
+    for side in ('SFA', 'SFB'):
+        sa = sfa[:, :-1].contiguous() if side == 'SFA' else sfa
+        sb = sfb[:, :, :-1].contiguous() if side == 'SFB' else sfb
+        try:
+            deep_gemm.m_grouped_fp4_gemm_nt_contiguous((a, sa), (b, sb), out, indices)
+        except RuntimeError as error:
+            assert 'Invalid ' + side + ' shape' in str(error), str(error)
+        else:
+            raise AssertionError('Accepted truncated ' + side)
+    print('Passed contiguous raw scale validation')
+
+
 def test_mxfp4_preprocessing(check_accuracy=True):
     for device in ('cpu', 'cuda'):
         for prefix in ((5,), (2, 5)):
@@ -557,6 +578,7 @@ def test_m_grouped_gemm_nopad_silu_and_mul_post_quant_loop(num_groups: int = Non
     print("Passed\n")
 
 if __name__ == '__main__':
+    test_contiguous_raw_scale_validation()
     test_mxfp4_preprocessing()
     parser = argparse.ArgumentParser(description="Process target function api test.")
     parser.add_argument('--func', default=None, choices=["DenseGemm", "GroupedNoPad", "GroupedMasked", "GroupedFused", "GroupedMaskedSiluAndMulPostQuant", "GroupedNoPadSiluAndMulPostQuant", "GroupedFusedSiluAndMulPostQuant"], required=False, help='target test func')

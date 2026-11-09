@@ -865,6 +865,9 @@ public:
     constexpr uint32_t L = 1;
 
     bool tile_valid = deep_scheduler.fetch_next_work(m_coord, n_coord);
+    if (!tile_valid) {
+      return;
+    }
     auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, 0);
     uint32_t M = deep_scheduler.curr_problem_m();
     auto problem_shape_MNKL = ProblemShape{M, N, K, L};
@@ -910,7 +913,7 @@ public:
       auto offset_m_next = deep_scheduler.curr_offset_m();
       auto expert_id_next = deep_scheduler.problem_index();
       auto offset_a_next = deep_scheduler.curr_offset_a();
-      auto offset_b_next = deep_scheduler.curr_offset_b(m_coord);
+      auto offset_b_next = tile_valid ? deep_scheduler.curr_offset_b(m_coord) : 0;
       const ElementA* ptr_A_next = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a_next;
       const ElementB* ptr_B_next = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b_next;
 
