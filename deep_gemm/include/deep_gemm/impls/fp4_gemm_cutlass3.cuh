@@ -347,6 +347,11 @@ class DeepGemmUniversal <
     uint32_t m_block_idx, n_block_idx;
     #pragma clang loop licm(disable)
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
+      if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
+        if (__ldg(params.scheduler.grouped_layout + m_block_idx * TileScheduler::BLOCK_M) == -1) {
+          continue;
+        }
+      }
       auto m_coord = m_block_idx;
       auto n_coord = n_block_idx * N_EXPAND;
       auto l_coord = 0;
@@ -921,6 +926,11 @@ public:
     uint32_t m_block_idx, n_block_idx;
     #pragma clang loop licm(disable)
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
+      if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
+        if (__ldg(params.scheduler.grouped_layout + m_block_idx * TileScheduler::BLOCK_M) == -1) {
+          continue;
+        }
+      }
       auto m_coord = m_block_idx;
       auto n_coord = n_block_idx;
       auto l_coord = 0;

@@ -10,6 +10,143 @@ namespace deep_gemm {
 // Grouped FP4 GEMM API Implementations
 // =============================================================================
 
+static void m_grouped_gemm_fp4_fp4_bf16_nt_contiguous_impl(
+    const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
+    const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
+    const torch::Tensor& out, const torch::Tensor& m_indices,
+    const int& m, const int& n, const int& k, const int& num_groups,
+    std::optional<ConfigTuple> configs) {
+    static constexpr GemmType kGemmType = GemmType::MGroupedContiguous;
+    int num_sms = get_num_sms();
+    int expected_m = ceil_div(m, num_groups);
+
+    ConfigTuple selected_config;
+    if (configs.has_value()) {
+        auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
+        selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
+            deep_gemm_fp4_common::get_smem_config_fp4(nst, bm, bn, wm, wn, bk, n, false, false));
+    } else {
+        selected_config = deep_gemm_fp4_common::get_best_configs(
+            m, expected_m, n, k, num_groups, num_sms, false, false, kGemmType);
+    }
+
+    auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
+    auto SMSIZE = std::get<0>(smem_config);
+    DG_HOST_ASSERT(block_m > 0 && heuristics_runtime->get_mk_alignment_for_contiguous_layout() % block_m == 0);
+
+    int n_expand = 1;
+    if (k <= 512 && n % (block_n * 4) == 0) {
+        n_expand = 4;
+    }
+    if (k <= 128 && n % (block_n * 8) == 0) {
+        n_expand = 8;
+    }
+
+    using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+    using StrideB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+    using StrideSFA = cute::Stride<cute::Int<1>, int64_t, int64_t>;
+    using StrideSFB = cute::Stride<cute::Int<1>, int64_t, int64_t>;
+    using StrideC = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+    using StrideD = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+    auto stride_SFA = cutlass::make_cute_packed_stride(StrideSFA{}, cute::make_shape(m, ceil_div(k, 32), 1));
+    auto stride_SFB = cutlass::make_cute_packed_stride(StrideSFB{}, cute::make_shape(n, ceil_div(k, 32), 1));
+    auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, 0, 1));
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, 1));
+
+    auto* ptr_D = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
+    int32_t* grouped_layout = m_indices.data_ptr<int32_t>();
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = 0;
+    hw_info.cu_count = num_sms_new;
+    dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
+    dim3 grid = get_grid_shape(hw_info.cu_count);
+
+    FP4GemmRuntime::MainLoopArguments mainloop_params{
+        cute::make_shape(m, n, k), lhs.data_ptr<uint8_t>(), stride_A, rhs.data_ptr<uint8_t>(), stride_B,
+        lhs_scales.data_ptr<uint16_t>(), stride_SFA, rhs_scales.data_ptr<uint16_t>(), stride_SFB};
+    FP4GemmRuntime::Args args{};
+    args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages,
+                       n, k, "MGroupedContiguous", "fp4_grouped_deep_gemm_contiguous", false, n_expand, false};
+    args.launch_args = {grid, block, SMSIZE};
+    if (is_ppu1v5_device() && n % 2 == 0 && n_expand == 1) {
+        args.launch_info.kernel_strategy = KernelStrategy::OverlapPrologue;
+    }
+
+    // Match the epilogue selected by FP4GemmRuntime::generate_impl for odd N.
+    if (n % 2 != 0) {
+        auto& params = args.kernel_params.with_tsm;
+        params = {};
+        params.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+        params.problem_shape = {m, n, k, 1};
+        params.collective_mainloop_params = mainloop_params;
+        params.collective_epilogue_params = {
+            .thread = {1.0f, 0.0f, nullptr, nullptr, {}},
+            .ptr_C = nullptr,
+            .stride_C = stride_C,
+            .ptr_D = ptr_D,
+            .stride_D = stride_D,
+            .ptr_Bias = nullptr,
+            .stride_Bias = {},
+        };
+        params.hw_info = hw_info;
+        params.scheduler = TileSchedulerArguments((uint32_t)m, grouped_layout);
+        params.workspace = nullptr;
+        params.signal = nullptr;
+    } else {
+        auto& params = args.kernel_params.no_tsm;
+        params = {};
+        params.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+        params.problem_shape = {m, n, k, 1};
+        params.collective_mainloop_params = mainloop_params;
+        params.collective_epilogue_params = {
+            .thread = {1.0f, 0.0f, nullptr, nullptr, nullptr, nullptr,
+                       1.0f, 1.0f, 1.0f, 1.0f, nullptr, nullptr, nullptr, nullptr},
+            .ptr_C = nullptr,
+            .stride_C = stride_C,
+            .ptr_D = ptr_D,
+            .stride_D = stride_D,
+        };
+        params.hw_info = hw_info;
+        params.scheduler = TileSchedulerArguments((uint32_t)m, grouped_layout);
+        params.workspace = nullptr;
+        params.signal = nullptr;
+    }
+
+    const auto& code = FP4GemmRuntime::generate(args);
+    const auto& runtime = compiler->build("fp4_grouped_deep_gemm_contiguous", code);
+    const auto& kernel = runtime->kernel;
+    int blocks_per_cu = 0;
+    HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
+    args.launch_args.grid_dim.x *= blocks_per_cu;
+
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_params(kGemmType, false, std::string("fp4"), num_groups, m, n, k*2, expected_m,
+                                  grouped_layout, current_stream());
+    }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    FP4GemmRuntime::launch(runtime, args);
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+    char* pEnv_params = std::getenv("show_log");
+    if (pEnv_params && isdigit(*pEnv_params)) {
+        int numRegs = 0, localSize = 0;
+        hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+        hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+        printf("[GroupedContiguous:]\n");
+        printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
+        printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
+               args.launch_args.grid_dim.x);
+        printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n,
+               block_k, expected_m, warp_m, warp_n, block_k, num_stages);
+        printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
+    }
+}
+
+
 static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
     const torch::Tensor& rhs, const torch::Tensor& rhs_scales,

@@ -2,6 +2,8 @@
 
 #include <torch/python.h>
 #include <cstdint>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include "cute/tensor.hpp"
@@ -40,6 +42,7 @@ public:
         // apply_swiglu_limit only matters for fused activation epilogues.
         std::string epilogue_type = "Default";
         bool apply_swiglu_limit = false;
+        KernelStrategy kernel_strategy = KernelStrategy::Default;
     };
 
     struct MainLoopArguments {
@@ -209,7 +212,7 @@ public:
         return std::make_tuple(info.n, info.k, info.block_m, info.block_n, info.block_k,
                                info.num_groups, info.warp_m, info.warp_n, info.num_stages,
                                info.gemm_type, info.enable_sbo_overlap, info.hasBias, info.n_expand,
-                               info.epilogue_type, info.apply_swiglu_limit, info.kernel_name,
+                               info.epilogue_type, info.apply_swiglu_limit, info.kernel_strategy, info.kernel_name,
                                args.launch_args.smem_size);
     }
 
@@ -228,7 +231,7 @@ public:
                 : "";
         return fmt::format(
             R"(
-#include <deep_gemm/impls/fp4_gemm_cutlass3.cuh>
+#include <deep_gemm/impls/fp4_gemm_cutlass3_overlap_prologue.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo; 
@@ -249,6 +252,7 @@ static constexpr bool hasBias = {};
 constexpr int N_EXPAND = {};
 static constexpr EpilogueType kEpilogueType = EpilogueType::{};
 static constexpr bool kApplySwigluLimit = {};
+static constexpr KernelStrategy kKernelStrategy = KernelStrategy::{};
 
 // A matrix configuration
 using         ElementA    = cutlass::float4_t;
@@ -328,7 +332,7 @@ using TiledMma = cute::TiledMMA<
     cute::MMA_Atom<MmaInst>,
     cute::Layout<Shape<WarpOnM, WarpOnN, _1>>>;
 
-using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaScaleFp4<
+using CollectiveMainloopBase = typename cutlass::gemm::collective::CollectiveMmaScaleFp4<
     DispatchPolicy, Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>,
     ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
     ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
@@ -337,6 +341,10 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaScal
     typename GemmOperandB::GmemTiledCopy, typename GemmOperandB::SmemLayoutAtom, typename GemmOperandB::SmemCopyAtom, TransformB,
     ElementSFA, cutlass::detail::TagToStrideA_t<LayoutSFA>, typename GemmOperandSFA::GmemTiledCopy, typename GemmOperandSFA::SmemLayoutAtom,
     ElementSFB, cutlass::detail::TagToStrideB_t<LayoutSFB>, typename GemmOperandSFB::GmemTiledCopy, typename GemmOperandSFB::SmemLayoutAtom>;
+using CollectiveMainloop = cute::conditional_t<
+    kKernelStrategy == KernelStrategy::OverlapPrologue,
+    cutlass::gemm::collective::Fp4CollectiveMmaOverlapPrologue<CollectiveMainloopBase>,
+    CollectiveMainloopBase>;
 
 using EpilogueOutputOp = typename cutlass::platform::conditional<
     hasBias || (SHAPE_N % 2 != 0),
@@ -394,7 +402,7 @@ using TileScheduler = DeepGemmScheduler<
     kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS,
     ceil_div(SHAPE_N, BLOCK_N * N_EXPAND), 2, kEpilogueType>;
 
-using GemmKernel = typename deep_gemm::DeepGemmUniversal<
+using GemmKernelDefault = typename deep_gemm::DeepGemmUniversal<
     Shape<int,int,int,int>,
     CollectiveMainloop,
     CollectiveEpilogue,
@@ -404,6 +412,10 @@ using GemmKernel = typename deep_gemm::DeepGemmUniversal<
     kEnableSboOverlap,
     kEpilogueType
 >;
+using GemmKernel = cute::conditional_t<
+    kKernelStrategy == KernelStrategy::OverlapPrologue,
+    deep_gemm::Fp4OverlapPrologue<Shape<int,int,int,int>, CollectiveMainloop, CollectiveEpilogue, TileScheduler>,
+    GemmKernelDefault>;
 
 // This kernel declares `extern __shared__`, so its dynamic smem size comes from the launch, and the
 // host can only supply an estimate (get_smem_config_fp4) -- it cannot see SharedStorageSize.
@@ -435,6 +447,7 @@ __global__ void {}(
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.enable_sbo_overlap, args.launch_info.hasBias, args.launch_info.n_expand,
             args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit,
+            KernelStrategyS[static_cast<int>(args.launch_info.kernel_strategy)],
             args.launch_args.smem_size,
             fused_smem_guard,
             args.launch_info.kernel_name);

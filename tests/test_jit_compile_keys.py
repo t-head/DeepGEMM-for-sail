@@ -166,6 +166,7 @@ int fp4_checks() {
     CHECK_FP4(k, 1024);
     CHECK_FP4(num_groups, 2);
     CHECK_FP4(gemm_type, "MGroupedContiguous");
+    CHECK_FP4(kernel_strategy, KernelStrategy::OverlapPrologue);
     CHECK_FP4(enable_sbo_overlap, true);
     CHECK_FP4(hasBias, true);
     CHECK_FP4(n_expand, 2);

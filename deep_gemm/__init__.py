@@ -71,6 +71,7 @@ from ._C import (
     m_grouped_fp8_gemm_nt_fused,
     # FP4 GEMMs
     fp4_gemm_nt,
+    m_grouped_fp4_gemm_nt_contiguous,
     m_grouped_fp4_gemm_nt_masked,
     m_grouped_fp4_gemm_nt_nopad,
     m_grouped_fp4_gemm_nt_fused,
@@ -209,6 +210,7 @@ fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
 gemm_fp4_fp4_bf16_nt = fp4_gemm_nt
 
 # --- FP4 M-grouped GEMM
+m_grouped_gemm_fp4_fp4_bf16_nt_contiguous = m_grouped_fp4_gemm_nt_contiguous
 m_grouped_gemm_fp4_fp4_bf16_nt_masked = m_grouped_fp4_gemm_nt_masked
 m_grouped_gemm_fp4_fp4_bf16_nt_nopad = m_grouped_fp4_gemm_nt_nopad
 m_grouped_gemm_fp4_fp4_bf16_nt_fused = m_grouped_fp4_gemm_nt_fused

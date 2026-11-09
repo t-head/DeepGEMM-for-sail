@@ -360,8 +360,9 @@ static void m_grouped_gemm_a8w8_per_channel_nt_contiguous_impl(
     INT8GemmCutlass3Runtime::GemmKernelParams params =
         INT8GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
+    auto kernel_strategy = is_ppu1v5_device() ? "OverlapPrologue" : "Default";
     auto args = INT8GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                              num_stages, "MGroupedContiguous", "Default",
+                                                              num_stages, "MGroupedContiguous", kernel_strategy,
                                                               kernel_name, /*enable_sbo_overlap=*/false},
                                               .launch_args = {grid, block, SMSIZE},
                                               .kernel_params = params,
@@ -1011,11 +1012,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     INT8GemmCutlass3Runtime::GemmKernelParams params =
         INT8GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
-    // Default, MultistageOnN, MoeDynamicTile, OverlapPrologue, OverlapMainloop
-    auto kernel_strategy = "Default";
-    if (k < 4096 && is_ppu1v5_device()) {
-        kernel_strategy = "OverlapPrologue";
-    }
+    auto kernel_strategy = is_ppu1v5_device() ? "OverlapPrologue" : "Default";
     auto args =
         INT8GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
                                                       num_stages, "MGroupedNoPad", kernel_strategy, kernel_name,

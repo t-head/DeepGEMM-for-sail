@@ -387,7 +387,8 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         }
     }
 
-    if (!is_ppu1v5_device() && (m > 64 && n == 128 && k == 4096)) {
+    if (gemm_type != GemmType::MGroupedContiguous &&
+        !is_ppu1v5_device() && (m > 64 && n == 128 && k == 4096)) {
         best_block_m = 128;
         best_block_n = 128;
     }

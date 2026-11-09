@@ -1609,7 +1609,7 @@ def test_m_grouped_gemm_contiguous(args) -> None:
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
-    if d == torch.uint8 or d == "w4a8_int8":
+    if d == "w4a8_int8":
         print(f"ERROR: {d} does not support GroupedContiguous, please use GroupedNoPad or GroupedMasked instead!")
         exit(1)
     if use_ppu:
@@ -1619,6 +1619,8 @@ def test_m_grouped_gemm_contiguous(args) -> None:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(x, y, out, m_indices)
         elif d == torch.int8:
             deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
+        elif d == torch.uint8:
+            deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_contiguous(x, y, out, m_indices)
         else:
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices)
     else:
@@ -1656,6 +1658,8 @@ def test_m_grouped_gemm_contiguous(args) -> None:
                 deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(x, y, out, m_indices)
             elif d == torch.float8_e4m3fn:
                 deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x, y, out, m_indices)
+            elif d == torch.uint8:
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_contiguous(x, y, out, m_indices)
             else:
                 print("ERROR: Unsupported dtype, please check!")
                 exit(1)

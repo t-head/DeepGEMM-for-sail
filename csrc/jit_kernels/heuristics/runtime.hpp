@@ -9,12 +9,12 @@
 namespace deep_gemm {
 
 class HeuristicsRuntime {
-    static constexpr int kLegacyMKAlignmentForContiguousLayout = 128;
+    static constexpr int kDefaultMKAlignmentForContiguousLayout = 256;
 
     bool ignore_compile_dims = false;
     int block_m_multiple_of = 1;
     int block_n_multiple_of = 1;
-    int mk_alignment_for_contiguous_layout = kLegacyMKAlignmentForContiguousLayout;
+    int mk_alignment_for_contiguous_layout = kDefaultMKAlignmentForContiguousLayout;
 
 public:
     void set_ignore_compile_dims(const bool& new_value) {
@@ -46,7 +46,7 @@ public:
         return mk_alignment_for_contiguous_layout;
     }
     int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m) const {
-        return kLegacyMKAlignmentForContiguousLayout;
+        return kDefaultMKAlignmentForContiguousLayout;
     }
 };
 
