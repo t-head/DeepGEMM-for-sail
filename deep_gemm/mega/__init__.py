@@ -60,7 +60,7 @@ class SymmBuffer:
                  *, quantization: Optional[str] = None):
         if mma_type == 'fp8xfp8':
             quantization = 'channelwise' if quantization is None else quantization
-            if quantization not in ('channelwise',):
+            if quantization not in ('channelwise', 'blockwise'):
                 raise ValueError("FP8 quantization must be 'channelwise' or 'blockwise'")
         elif quantization is not None:
             raise ValueError('quantization applies only to fp8xfp8 workspaces')
@@ -380,7 +380,7 @@ def transform_weights_for_fp8_mega_moe(
         quantization: str = "channelwise",
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
     """Reorder gate/up rows without requantizing E4M3 weights or FP32 scales."""
-    if quantization not in ("channelwise",):
+    if quantization not in ("channelwise", "blockwise"):
         raise ValueError("FP8 quantization must be 'channelwise' or 'blockwise'")
     blockwise = quantization == "blockwise"
     e, h, i = _check_routed_weights(l1_weights, l2_weights, torch.float8_e4m3fn, blockwise)

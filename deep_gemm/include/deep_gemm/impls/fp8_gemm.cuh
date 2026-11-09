@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
@@ -38,7 +39,8 @@ template <
   class CollectiveEpilogue_,
   class TileScheduler_,
   bool kEnableSboOverlap = false,
-  bool kUseNStageKernel = false
+  bool kUseNStageKernel = false,
+  bool kUseReplicaWeights = false
 >
 class DeepGemmUniversal;
 
@@ -47,7 +49,8 @@ template <
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
   class TileScheduler_,
-  bool kEnableSboOverlap
+  bool kEnableSboOverlap,
+  bool kUseReplicaWeights
 >
 class DeepGemmUniversal<
   ProblemShape_,
@@ -55,7 +58,8 @@ class DeepGemmUniversal<
   CollectiveEpilogue_,
   TileScheduler_,
   kEnableSboOverlap,
-  false
+  false,
+  kUseReplicaWeights
 > {
 public:
   //
@@ -115,7 +119,7 @@ public:
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
   // Device side arguments
-  struct Arguments {
+  struct StandardArguments {
     GemmUniversalMode mode{};
     ProblemShape problem_shape{};
     MainloopArguments mainloop{};
@@ -125,8 +129,22 @@ public:
     int32_t* signal{nullptr};
   };
 
+  struct ExtendedArguments {
+    GemmUniversalMode mode{};
+    ProblemShape problem_shape{};
+    MainloopArguments mainloop{};
+    EpilogueArguments epilogue{};
+    KernelHardwareInfo hw_info{};
+    TileSchedulerArguments scheduler{};
+    int32_t* signal{nullptr};
+    ElementB const* rhs_replicas{nullptr};
+    ElementScale const* rhs_replica_scales{nullptr};
+    uint32_t num_master_groups{0};
+  };
+  using Arguments = std::conditional_t<kUseReplicaWeights, ExtendedArguments, StandardArguments>;
+
   // Kernel entry point API
-  struct Params {
+  struct StandardParams {
     GemmUniversalMode mode{};
     ProblemShape problem_shape{};
     MainloopParams mainloop{};
@@ -136,6 +154,21 @@ public:
     void* workspace{nullptr};
     int32_t* signal{nullptr};
   };
+
+  struct ExtendedParams {
+    GemmUniversalMode mode{};
+    ProblemShape problem_shape{};
+    MainloopParams mainloop{};
+    EpilogueParams epilogue{};
+    KernelHardwareInfo hw_info{};
+    TileSchedulerParams scheduler{};
+    void* workspace{nullptr};
+    int32_t* signal{nullptr};
+    ElementB const* rhs_replicas{nullptr};
+    ElementScale const* rhs_replica_scales{nullptr};
+    uint32_t num_master_groups{0};
+  };
+  using Params = std::conditional_t<kUseReplicaWeights, ExtendedParams, StandardParams>;
 
 
   // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -179,7 +212,7 @@ public:
     constexpr uint32_t NumEpilogueSubTiles = 1; //CollectiveEpilogue::get_store_pipe_increment(TileShape{});
     TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(grouped_layout,
       problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
-    return {
+    Params result{
       args.mode,
       problem_shape,
       CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, mainloop_workspace),
@@ -189,6 +222,12 @@ public:
       workspace,
       args.signal
     };
+    if constexpr (kUseReplicaWeights) {
+      result.rhs_replicas = args.rhs_replicas;
+      result.rhs_replica_scales = args.rhs_replica_scales;
+      result.num_master_groups = args.num_master_groups;
+    }
+    return result;
   }
 
   static bool
@@ -276,18 +315,27 @@ public:
       auto l_coord = 0;
       M = deep_scheduler.curr_problem_m();
       auto offset_scalea = deep_scheduler.curr_offset_scalea();
-      const auto scale_offset_b = deep_scheduler.curr_offset_b(m_block_idx);
+      auto scale_offset_b = deep_scheduler.curr_offset_b(m_block_idx);
       const auto offset_a = deep_scheduler.curr_offset_a(get<2>(params.mainloop.dA));
-      const auto offset_b = deep_scheduler.curr_offset_b(m_block_idx, get<2>(params.mainloop.dB));
+      auto offset_b = deep_scheduler.curr_offset_b(m_block_idx, get<2>(params.mainloop.dB));
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
-      const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
-
+      const ElementB* weight_base = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B);
+      const ElementScale* scale_base = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B);
+      if constexpr (kUseReplicaWeights) {
+        const uint32_t expert = deep_scheduler.curr_group_idx;
+        if (expert >= params.num_master_groups) {
+          offset_b = int64_t(expert - params.num_master_groups) * N * K;
+          scale_offset_b = offset_b;
+          weight_base = params.rhs_replicas;
+          scale_base = params.rhs_replica_scales;
+        }
+      }
+      const ElementB* ptr_B = weight_base + offset_b;
       const ElementScale* ptr_scale_A = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_A) + offset_scalea;
       // Each expert owns ceil(N/128) * ceil(K/128) scale blocks.
       const auto expert_idx = scale_offset_b / (int64_t(N) * int64_t(K));
       const auto scale_stride_b = int64_t(cute::ceil_div(N, 128)) * cute::ceil_div(K, 128);
-      const ElementScale* ptr_scale_B = reinterpret_cast<const ElementScale*>(params.mainloop.ptr_scale_B) +
-                                        expert_idx * scale_stride_b;
+      const ElementScale* ptr_scale_B = scale_base + expert_idx * scale_stride_b;
       auto mk_layout = make_layout(
         make_shape(make_shape(Int<1>{}, M),
                   make_shape(Int<128>{}, cute::ceil_div(K, 128))),
@@ -372,7 +420,8 @@ class DeepGemmUniversal<
   CollectiveEpilogue_,
   TileScheduler_,
   kEnableSboOverlap,
-  true
+  true,
+  false
 > {
 public:
   //

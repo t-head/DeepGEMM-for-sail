@@ -68,6 +68,64 @@ inline void fp8_channelwise_mega_moe_pre_dispatch_impl(
     launch_mega_moe_kernel<FP8ChannelwiseMegaMoEPreDispatchRuntime>(args);
 }
 
+class FP8BlockwiseMegaMoEPreDispatchRuntime final : public LaunchRuntime<FP8BlockwiseMegaMoEPreDispatchRuntime> {
+public:
+    struct Params {
+        void* hidden_states;
+        void* topk_ids;
+        void* topk_weights;
+        void* staged_tokens;
+        void* staged_scales;
+        void* staged_topk_idx;
+        void* staged_topk_weights;
+        int num_tokens, capacity;
+    };
+
+    struct Args {
+        const char* kernel_name;
+        PreDispatchConfig launch_info;
+        LaunchArgs launch_args;
+        Params kernel_params;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        const auto& c = args.launch_info;
+        return fmt::format(R"DGMEGA(#include <deep_gemm/impls/fp8_blockwise_mega_moe_pre_dispatch.cuh>
+using TopkIndex = {};
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe::fp8_blockwise::sm89_fp8_blockwise_mega_moe_pre_dispatch<{}, {}, TopkIndex>);
+}}
+)DGMEGA",
+            c.int32_indices ? "int32_t" : "int64_t", c.hidden, c.num_topk);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, const Args& args) {
+        const auto& p = args.kernel_params;
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
+            p.hidden_states, p.topk_ids, p.topk_weights, p.staged_tokens,
+            p.staged_scales, p.staged_topk_idx, p.staged_topk_weights, p.num_tokens, p.capacity));
+    }
+};
+
+inline void fp8_blockwise_mega_moe_pre_dispatch_impl(
+    int hidden, int num_topk, const torch::Tensor& hidden_states, const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights, const torch::Tensor& input_token, const torch::Tensor& input_scale,
+    const torch::Tensor& input_topk_idx, const torch::Tensor& input_topk_weights, int num_tokens,
+    const std::string& entry = "fp8_blockwise_mega_moe_pre_dispatch") {
+    PreDispatchConfig config;
+    config.hidden = hidden;
+    config.num_topk = num_topk;
+    config.int32_indices = topk_ids.scalar_type() == torch::kInt32;
+    constexpr int block_threads = 256;
+    const int capacity = input_topk_idx.size(0);
+    const int tail_blocks = pre_dispatch_tail_blocks(num_tokens, capacity, num_topk, block_threads);
+    const FP8BlockwiseMegaMoEPreDispatchRuntime::Args args{
+        entry.c_str(), config, {dim3(num_tokens + tail_blocks), dim3(block_threads), 0},
+        {device_pointer(hidden_states), device_pointer(topk_ids), device_pointer(topk_weights), device_pointer(input_token),
+         device_pointer(input_scale), device_pointer(input_topk_idx), device_pointer(input_topk_weights), num_tokens, capacity}};
+    launch_mega_moe_kernel<FP8BlockwiseMegaMoEPreDispatchRuntime>(args);
+}
+
 class FP8ChannelwiseMegaMoEQuantizeRuntime final : public LaunchRuntime<FP8ChannelwiseMegaMoEQuantizeRuntime> {
 public:
     struct LaunchInfo {
