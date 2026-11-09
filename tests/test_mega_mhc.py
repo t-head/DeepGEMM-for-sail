@@ -8,9 +8,6 @@ from deep_gemm import bench_kineto
 from deep_gemm.testing import assert_bitwise_equal, calc_diff
 
 
-# Source: third-party/tilelang_ops/ref_mhc.py
-
-
 def _sinkhorn_reference(value: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
     value = value.softmax(dim=-1) + eps
     value = value / (value.sum(dim=-2, keepdim=True) + eps)
@@ -18,6 +15,20 @@ def _sinkhorn_reference(value: torch.Tensor, repeat: int, eps: float) -> torch.T
         value = value / (value.sum(dim=-1, keepdim=True) + eps)
         value = value / (value.sum(dim=-2, keepdim=True) + eps)
     return value
+
+
+def fp8_reference(x, per_token=False):
+    values = x.view(x.size(0), -1, x.size(-1) if per_token else 32)
+    clamped = values.abs().float().amax(dim=2).clamp_min(1e-4)
+    sf = clamped / 448.0
+    if per_token:
+        fp8 = (values.float() * (448.0 / clamped).unsqueeze(2)).to(torch.float8_e4m3fn).view_as(x)
+        return fp8, sf
+    bits = sf.view(torch.int32)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7fffff) != 0).int()
+    sf = (exponent.clamp(1, 254) << 23).view(torch.float32)
+    fp8 = (values * sf.reciprocal().unsqueeze(2)).to(torch.float8_e4m3fn).view_as(x)
+    return fp8, (sf.view(torch.int32) >> 23).to(torch.uint8).view(torch.int32)
 
 
 @torch.no_grad()
@@ -39,6 +50,7 @@ def mhc_reference(
     rmsnorm_eps: float,
     rmsnorm_scale: float,
     shifted_prev_mix: torch.Tensor,
+    sf_layout: str = 'bf16',
 ) -> dict[str, torch.Tensor]:
     new_residual = x.float().unsqueeze(1) * post_mix
     new_residual += torch.einsum(
@@ -77,16 +89,22 @@ def mhc_reference(
         * torch.rsqrt(norm_input_float.square().mean(1) + rmsnorm_eps).unsqueeze(1)
         * (rmsnorm_weight.float() * rmsnorm_scale)
     ).bfloat16()
-    return {
+    result = {
         'new_residual': new_residual,
         'new_prev_mix': new_prev_mix,
         'new_post_mix': new_post_mix,
         'new_comb_res_mix': new_comb_res_mix,
         'y_bf16': y_bf16,
     }
-
-
-# Source: tests/test_mega_mhc.py
+    if sf_layout != 'bf16':
+        result['y_fp8'], sf = fp8_reference(y_bf16, per_token=sf_layout == 'token')
+        if sf_layout == 'token':
+            result['y_token_sf'] = sf
+        elif sf_layout == 'col':
+            result['y_gemm_sf'] = sf
+        else:
+            result.update(y_routed_sf=sf, y_shared_sf=sf)
+    return result
 
 
 def make_inputs(num_tokens: int, hidden: int, seed: int):
@@ -112,7 +130,6 @@ def make_inputs(num_tokens: int, hidden: int, seed: int):
         hc_pre_eps=3e-4,
         hc_post_scale=1.25,
         sinkhorn_eps=2e-6,
-        num_sinkhorn_iters=10,
         rmsnorm_eps=7e-6,
         rmsnorm_scale=1.25,
     )
@@ -125,7 +142,10 @@ def make_inputs(num_tokens: int, hidden: int, seed: int):
     return inputs, duplicates
 
 
-def make_case(tokens=64, hidden=5120, seed=2026, num_sinkhorn_iters=20):
+def make_case(tokens=64, hidden=5120, seed=2026, num_sinkhorn_iters=20,
+              sf_layout='bf16', shared_sf_block_m=224, store_bf16=True):
+    if sf_layout == 'bf16' and not store_bf16:
+        raise ValueError('MegaMhc BF16 mode requires store_bf16=1')
     inputs, duplicates = make_inputs(tokens, hidden, seed)
     inputs['num_sinkhorn_iters'] = num_sinkhorn_iters
     outputs = dict(
@@ -133,17 +153,46 @@ def make_case(tokens=64, hidden=5120, seed=2026, num_sinkhorn_iters=20):
         new_prev_mix=torch.empty_like(inputs['shifted_prev_mix']),
         new_post_mix=torch.empty_like(inputs['post_mix']),
         new_comb_res_mix=torch.empty_like(inputs['comb_res_mix']),
-        y_bf16=torch.empty_like(inputs['x']),
     )
+    if store_bf16:
+        outputs['y_bf16'] = torch.empty_like(inputs['x'])
+    if sf_layout != 'bf16':
+        outputs['y_fp8'] = torch.empty((tokens, hidden), dtype=torch.float8_e4m3fn, device='cuda')
+        if sf_layout == 'token':
+            outputs['y_token_sf'] = torch.empty((tokens, 1), dtype=torch.float32, device='cuda')
+        elif sf_layout == 'col':
+            outputs['y_gemm_sf'] = torch.empty_strided(
+                (tokens, hidden // 128), (1, (tokens + 3) // 4 * 4), dtype=torch.int32, device='cuda')
+        else:
+            rows = (tokens + shared_sf_block_m - 1) // shared_sf_block_m * ((shared_sf_block_m + 127) // 128 * 128)
+            outputs['y_routed_sf'] = torch.empty((tokens, hidden // 128), dtype=torch.int32, device='cuda')
+            outputs['y_shared_sf'] = torch.empty_strided(
+                (rows, hidden // 128), (1, rows), dtype=torch.int32, device='cuda')[:tokens]
+            inputs['shared_sf_block_m'] = shared_sf_block_m
     return inputs, outputs, duplicates
+
+
+def logical_outputs(outputs, shared_sf_block_m=0):
+    result = dict(outputs)
+    if 'y_shared_sf' in result:
+        sf = result['y_shared_sf']
+        tokens = sf.size(0)
+        token = torch.arange(tokens, device=sf.device)
+        index = token % shared_sf_block_m
+        rows = token // shared_sf_block_m * ((shared_sf_block_m + 127) // 128 * 128)
+        rows += index // 128 * 128 + index % 32 * 4 + index % 128 // 32
+        result['y_shared_sf'] = sf.as_strided((sf.stride(1), sf.size(1)), sf.stride())[rows]
+    return result
 
 
 def check_correctness(actual, pytorch_ref, case):
     result = {}
     for name, value in actual.items():
         target = pytorch_ref[name]
+        if value.dtype == torch.int32:
+            value, target = (v.contiguous().view(torch.uint8) for v in (value, target))
         diff = float(calc_diff(value, target))
-        limit = 5e-5
+        limit = 2e-4 if name == 'y_fp8' else 5e-5
         err = (value.double() - target.double()).abs()
         result[name] = dict(
             calc_diff=diff, limit=limit,
@@ -162,45 +211,65 @@ def benchmark_case(inputs, outputs):
                      'ppu_mega_mhc', suppress_kineto_output=True)
     assert t > 0, 'No Mega-mHC kernel timing found'
     tokens, hidden = inputs['x'].shape
-    print(f' > Performance (mode=shifted, output=bf16, tokens={tokens}, hidden={hidden}, '
+    output = 'fp8' if 'y_fp8' in outputs else 'bf16'
+    print(f' > Performance (mode=shifted, output={output}, tokens={tokens}, hidden={hidden}, '
+          f'store_bf16={int("y_bf16" in outputs)}, '
           f'sinkhorn={inputs["num_sinkhorn_iters"]}): '
           f'{t * 1e6:.2f} us', flush=True)
 
 
 @torch.no_grad()
 def check(tokens, hidden=5120, repeats=30, num_sinkhorn_iters=20, seed=2026,
-          benchmark=False, check_accuracy=True):
-    inputs, outputs, duplicates = make_case(tokens, hidden, seed, num_sinkhorn_iters)
-    expected = mhc_reference(**inputs) if check_accuracy else None
+          benchmark=False, check_accuracy=True, sf_layout='bf16', shared_sf_block_m=224,
+          store_bf16=True):
+    inputs, outputs, duplicates = make_case(
+        tokens, hidden, seed, num_sinkhorn_iters, sf_layout, shared_sf_block_m, store_bf16)
+    reference_inputs = {k: v for k, v in inputs.items() if k != 'shared_sf_block_m'}
+    expected = mhc_reference(**reference_inputs, sf_layout=sf_layout) if check_accuracy else None
     deep_gemm.mega_mhc(**inputs, **outputs)
     torch.cuda.synchronize()
     if not check_accuracy:
+        if os.environ.get('HGGC_WARM_UP') and sf_layout != 'bf16' and store_bf16:
+            fp8_only = {k: v for k, v in outputs.items() if k != 'y_bf16'}
+            deep_gemm.mega_mhc(**inputs, **fp8_only)
         print('Passed without acc_check', flush=True)
         if benchmark:
             benchmark_case(inputs, outputs)
         return
-    result = check_correctness(outputs, expected, ('shifted', 'bf16', tokens, hidden))
-    saved = {name: value.clone() for name, value in outputs.items()}
+    actual = logical_outputs(outputs, shared_sf_block_m)
+    result = check_correctness(actual, expected, ('shifted', sf_layout, tokens, hidden))
+    if sf_layout == 'token' and store_bf16:
+        fp8, sf = fp8_reference(outputs['y_bf16'], per_token=True)
+        assert_bitwise_equal(outputs['y_fp8'], fp8, 'Per-token FP8 rounding')
+        assert_bitwise_equal(outputs['y_token_sf'], sf, 'Per-token scale')
+    saved = {name: value.clone() for name, value in actual.items()}
     for _ in range(repeats):
         deep_gemm.mega_mhc(**inputs, **outputs)
-        for name, value in outputs.items():
+        for name, value in logical_outputs(outputs, shared_sf_block_m).items():
             assert_bitwise_equal(value, saved[name], f'Deterministic invocation: {name}')
-    for name, value in outputs.items():
+    for name, value in logical_outputs(outputs, shared_sf_block_m).items():
         for token_idx in duplicates:
             assert_bitwise_equal(value[token_idx], value[0], f'{name}, token={token_idx}')
+    if sf_layout != 'bf16' and store_bf16:
+        fp8_only = {k: v for k, v in outputs.items() if k != 'y_bf16'}
+        deep_gemm.mega_mhc(**inputs, **fp8_only)
+        for name, value in logical_outputs(fp8_only, shared_sf_block_m).items():
+            assert_bitwise_equal(value, saved[name], f'FP8-only: {name}')
     print(json.dumps(dict(
         tokens=tokens, hidden=hidden, shifted=True,
-        num_sinkhorn_iters=num_sinkhorn_iters, outputs=result,
+        num_sinkhorn_iters=num_sinkhorn_iters, sf_layout=sf_layout,
+        store_bf16=bool(store_bf16), outputs=result,
     )), flush=True)
     if benchmark:
         benchmark_case(inputs, outputs)
     return result
 
 
-def test_mega_mhc(benchmark=False):
-    for tokens in (1, 64, 65, 153, 200, 512, 520, 529, 624, 1016, 1024, 1025, 1248,
-                   3834, 4095, 4096, 5334, 8192, 8193, 9984, 10321, 32768):
-        check(tokens, benchmark=benchmark)
+def test_mega_mhc(benchmark=False, sf_layout=None, store_bf16=True):
+    for layout in ((sf_layout,) if sf_layout else ('bf16', 'col', 'extra', 'token')):
+        for tokens in (1, 64, 65, 153, 200, 512, 520, 529, 624, 1016, 1024, 1025, 1248,
+                       3834, 4095, 4096, 5334, 8192, 8193, 9984, 10321, 32768):
+            check(tokens, benchmark=benchmark, sf_layout=layout, store_bf16=store_bf16)
 
 
 if __name__ == '__main__':
@@ -208,13 +277,18 @@ if __name__ == '__main__':
     parser.add_argument('--tokens', type=int, help='Run one token count instead of the full suite')
     parser.add_argument('--hidden', type=int, choices=(5120,), default=5120)
     parser.add_argument('--sinkhorn-iters', type=int, default=20)
+    parser.add_argument('--sf-layout', choices=('bf16', 'col', 'extra', 'token'))
+    parser.add_argument('--store-bf16', type=int, choices=(0, 1), default=1)
     parser.add_argument('--benchmark', action='store_true', help='Run the shared kernel benchmark after correctness checks')
     args = parser.parse_args()
     if args.tokens is None and args.sinkhorn_iters != 20:
         parser.error('Case options require --tokens')
+    if not args.store_bf16 and args.sf_layout in (None, 'bf16'):
+        parser.error('--store-bf16=0 requires an FP8 --sf-layout')
     print('device', torch.cuda.get_device_name(), 'visible', torch.cuda.device_count(), flush=True)
     if args.tokens is None:
-        test_mega_mhc(benchmark=args.benchmark)
+        test_mega_mhc(benchmark=args.benchmark, sf_layout=args.sf_layout, store_bf16=args.store_bf16)
     else:
         check(args.tokens, args.hidden,
-              num_sinkhorn_iters=args.sinkhorn_iters, benchmark=args.benchmark)
+              num_sinkhorn_iters=args.sinkhorn_iters, benchmark=args.benchmark,
+              sf_layout=args.sf_layout or 'bf16', store_bf16=args.store_bf16)

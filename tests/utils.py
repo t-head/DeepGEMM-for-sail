@@ -962,12 +962,13 @@ def worker(gpu_id, cases, output, device, mode):
 
 def read_detail_from_nculog(filename):
     detail_info = {'m': 0, 'n': 0, 'k': 0}
-    keyword_pattern = r"(GemmGrouped-BF16|GemmGrouped-FP8|GemmGrouped-INT8|GemV-BF16|GemV-Small-BF16)"
+    keyword_pattern = r"(GemmGrouped-BF16|GemmGrouped-FP8|GemmGrouped-INT8|GemV-BF16|GemV-Small-BF16|\[MegaMhc\])"
     pattern_dict = {"group": r"group:(\d+)", "problem": r"problem:\[(\d+), (\d+), (\d+)\]", "expected_m":r"expected_m:(\d+)", "gemm_type": r"gemm_type:(\w+)",
     "ThreadblockShape": r"ThreadblockShape\[(\d+), (\d+), (\d+)\]" , "WarpShape": r"WarpShape\[(\d+), (\d+), (\d+)\]", "kNumStages":r"kNumStages:(\d+)",
     "num_sms": r"num_sms:(\d+)", "max_active_tb_num": r"max_active_tb_num:(\d+)", "threadblock_count": r"threadblock_count:(\d+)",
     "smem_size":r"smem_size:(\d+)", "vreg": r"vreg:(\d+)", "stack": r"stack:(\d+)",
     "BlockSize":r"BlockSize:(\d+)", "NPerThread":r"NPerThread:(\d+)", "ThreadPerN":r"ThreadPerN:(\d+)", "NPerBlock":r"NPerBlock:(\d+)", "SWZL_SIZE_M":r"SWZL_SIZE_M:(\d+)"}
+    detail_info.update(dict.fromkeys(pattern_dict, " "))
     with open(filename, newline='') as log_file:
         lines = log_file.readlines()
         for idx, line in enumerate(lines):
@@ -981,13 +982,9 @@ def read_detail_from_nculog(filename):
                             detail_info[_info] = _info_match.groups()[0]
                         else:
                             detail_info[_info] = _info_match.groups()
-                    else:
-                        detail_info[_info] = " "
                 break
-    detail_info['m'] = detail_info['problem'][0]
-    detail_info['n'] = detail_info['problem'][1]
-    detail_info['k'] = detail_info['problem'][2]
-    # print(detail_info)
+    if isinstance(detail_info['problem'], tuple):
+        detail_info['m'], detail_info['n'], detail_info['k'] = detail_info['problem']
     return detail_info
 
 
@@ -3355,17 +3352,24 @@ def test_mega_mhc(args):
 
     dtype = args['data_type']
     mode = args.get('mode', 'shifted')
-    if dtype != torch.bfloat16:
-        raise ValueError('MegaMhc only supports data_type:bf16')
+    if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError('MegaMhc supports data_type:bf16 or fp8')
     if mode != 'shifted':
         raise ValueError('MegaMhc only supports V4.1 Flash shifted mode')
-    if 'sf_layout' in args or 'shared_sf_block_m' in args:
+    if dtype == torch.bfloat16 and ('sf_layout' in args or 'shared_sf_block_m' in args):
         raise ValueError('MegaMhc BF16 output does not use scale layouts')
     if get_acc_check() and get_ref_backend() != 'device':
         raise ValueError("ref_backend only supports 'device' for MegaMhc")
     kwargs = dict(tokens=args['m'], hidden=args.get('hidden', 5120),
                   num_sinkhorn_iters=args.get('sinkhorn_iters', 20),
-                  benchmark=get_benchmark(), check_accuracy=get_acc_check())
+                  benchmark=get_benchmark(), check_accuracy=get_acc_check(),
+                  sf_layout=args.get('sf_layout', 'col') if dtype == torch.float8_e4m3fn else 'bf16',
+                  shared_sf_block_m=args.get('shared_sf_block_m', 224),
+                  store_bf16=args.get('store_bf16', 1))
+    if kwargs['store_bf16'] not in (0, 1):
+        raise ValueError('MegaMhc store_bf16 must be 0 or 1')
+    if dtype == torch.float8_e4m3fn and kwargs['sf_layout'] not in ('col', 'extra', 'token'):
+        raise ValueError('MegaMhc FP8 output requires sf_layout:col, extra or token')
     num_sms = args.get('num_sms')
     original_num_sms = deep_gemm.get_num_sms()
     try:
