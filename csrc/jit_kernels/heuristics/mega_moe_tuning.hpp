@@ -65,8 +65,43 @@ struct TuningEntry {
 inline TuningConfig select_tuning(const TuningWorkload& w) {
     TuningConfig result{w, {}, {}, {}, {}};
     using P = Precision;
+    static const Tile small16{16, 256, 128, 16, 64, 2};
+    static const Tile small32{32, 256, 128, 32, 64, 2};
+    static const Tile reuse128{128, 256, 128, 128, 32, 2};
+    static const Tile scatter128{128, 256, 128, 64, 64, 2};
     static const Tile channelwise_g1_decode{128, 256, 128, 32, 64, 5};
+    // Transport padding remains independent of the GEMM1 compute tile.
+    static const std::initializer_list<TuningCase> k3_ep32 = {
+        {4, {small16, {}, 36}, {small16}, {16}},    {8, {small16, {}, 36}, {small16}, {16}},
+        {16, {small16, {}, 36}, {small16}, {16}},   {32, {small32, {}, 36}, {small32}, {32}},
+        {64, {reuse128, {}, 18}, {small32}, {16}},  {128, {reuse128, {}, 18}, {scatter128}, {16}},
+        {1024, {reuse128}, {}, {64}}, {2048, {reuse128}, {}, {64}},
+        {4096, {reuse128}, {}, {64}},
+    };
     static const TuningEntry entries[] = {
+        {"kimi_k3",
+         P::W4A16,
+         8,
+         896,
+         16,
+         3584,
+         3072,
+         "situ",
+         {{1024, {reuse128}, {}, {64}},
+          {2048, {reuse128}, {}, {64}},
+          {4096, {reuse128}, {}, {64}}}},
+        {"kimi_k3",
+         P::W4A16,
+         16,
+         896,
+         16,
+         3584,
+         3072,
+         "situ",
+         {{1024, {reuse128}}, {2048, {reuse128}},
+          {4096, {reuse128}, {}, {256}}}},
+        {"kimi_k3", P::W4A16, 32, 896, 16, 3584, 3072, "situ", k3_ep32},
+        {"kimi_k3", P::W4A16, 32, 928, 16, 3584, 3072, "situ", k3_ep32},
         {"minimax_m3",
          P::FP8Channelwise,
          8,

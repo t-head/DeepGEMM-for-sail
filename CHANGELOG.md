@@ -31,9 +31,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   `compiled_dims="mn"`. Registers the upstream-compatible `epilogue.Epilogue`
   interface type, which has no PPU implementations yet.
 
-- **FP8 channelwise, FP8 blockwise MegaMoE**: adds complete routed pipelines, precision-specific
+- **FP8 channelwise, FP8 blockwise, W4A16 MegaMoE**: adds complete routed pipelines, precision-specific
   weight transforms and reusable communication state through the common
-  `SymmBuffer`. Supports FP8 SwiGLU/SwiGLU-OAI, separate replica banks
+  `SymmBuffer`. Supports FP8 SwiGLU/SwiGLU-OAI, W4A16 SiTU, separate replica banks
   and workspace reuse across supported activations.
 
 ### Changed

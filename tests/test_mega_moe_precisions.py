@@ -32,6 +32,8 @@ CASES = (
                precision="fp8_channelwise", routing="random", reference_tokens=129),
     MegaMoECase("smoke_blockwise", 512, 256, 8, 2, 129, tokens=(1, 0, 33, 129, 8),
                precision="fp8_blockwise", routing="random", reference_tokens=129),
+    MegaMoECase("smoke_w4a16", 256, 128, 8, 2, 129, tokens=(1, 0, 33, 129, 8),
+               activation="situ", precision="w4a16", routing="random", reference_tokens=129),
     MegaMoECase(
         "minimax_m3",
         6144,
@@ -70,6 +72,32 @@ CASES = (
         clamp=7.0,
         worlds=(8, 16, 32, 64),
         precision="fp8_blockwise",
+        routing="random",
+    ),
+    MegaMoECase(
+        "kimi_k3",
+        3584,
+        3072,
+        896,
+        16,
+        4096,
+        tokens=MODEL_TOKENS,
+        activation="situ",
+        worlds=(8, 16),
+        precision="w4a16",
+        routing="random",
+    ),
+    MegaMoECase(
+        "kimi_k3_decode",
+        3584,
+        3072,
+        896,
+        16,
+        128,
+        tokens=(4, 8, 16, 32, 64, 128),
+        activation="situ",
+        worlds=(32,),
+        precision="w4a16",
         routing="random",
     ),
 )
@@ -408,6 +436,10 @@ def test_mega_moe_channelwise_worklist_reuse(mega_moe_group):
         run_case(case, mega_moe_group, replicas=replicas)
 
 
+def test_mega_moe_w4a16_complete_tiles(mega_moe_group):
+    # H=768 cannot use a 512-column scatter tile. The narrow GEMM1 must also
+    # select complete gate/up tiles rather than inherit ordinary GEMM tails.
+    run_case(replace(CASES[2], hidden=768, tokens=(96, 33, 0, 8)), mega_moe_group)
 
 
 @pytest.mark.parametrize("case", tuple(c for c in SMOKE_CASES if c.activation == "swiglu"), ids=lambda c: c.name)
@@ -429,13 +461,11 @@ def test_mega_moe_precision_complete_tiles(case, mega_moe_group):
                  mega_moe_group)
 
 
-
-
 @pytest.mark.parametrize("case", SMOKE_CASES, ids=lambda c: c.name)
 @pytest.mark.parametrize("fast_math", (True, False))
 def test_mega_moe_activation_reuse(case, fast_math, mega_moe_group):
-    # Reuse one allocation and weight bank across supported activations
-    # and graph replays of previously selected activations.
+    # Reuse one allocation and weight bank across supported activations,
+    # coefficient changes and graph replays of previously selected activations.
     rng = torch.Generator(device="cuda").manual_seed(20261106 + mega_moe_group.rank())
     max_diff = .001
     pipeline = make_pipeline(case, mega_moe_group, rng, fast_math=fast_math)
@@ -446,7 +476,12 @@ def test_mega_moe_activation_reuse(case, fast_math, mega_moe_group):
     y = torch.empty_like(source)
     try:
         all_source, all_ids, all_weights = _all_gather(source), _all_gather(ids), _all_gather(weights)
-        configurations = [("swiglu", None, None), ("swiglu_oai", None, None), ("swiglu", None, None)]
+        configurations = []
+        if case.precision == "w4a16":
+            configurations += [("situ", 4., 25.), ("situ", .25, 25.), ("situ", .25, .25),
+                               ("situ", .25, None), ("situ", 4., 25.)]
+        if case.precision != "w4a16":
+            configurations += [("swiglu", None, None), ("swiglu_oai", None, None), ("swiglu", None, None)]
         replays = []
         for activation, beta, linear_beta in configurations:
             def forward():
@@ -455,6 +490,8 @@ def test_mega_moe_activation_reuse(case, fast_math, mega_moe_group):
                     buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
                     num_tokens=source.shape[0], mma_type=buffer.mma_type)
                 options = dict(activation=activation, fast_math=fast_math)
+                if activation == "situ":
+                    options.update(situ_beta=beta, situ_linear_beta=linear_beta)
                 pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, buffer, **options)
 
             forward()
@@ -473,7 +510,7 @@ def test_mega_moe_activation_reuse(case, fast_math, mega_moe_group):
             graph.replay()
             torch.cuda.synchronize()
             check_output(y, expected, max_diff)
-        unsupported = "situ"
+        unsupported = "swiglu" if case.precision == "w4a16" else "situ"
         error = "Unsupported activation"
         with pytest.raises(RuntimeError, match=error):
             pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, buffer, activation=unsupported)
