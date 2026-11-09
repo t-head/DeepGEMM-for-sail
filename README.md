@@ -489,6 +489,25 @@ For UltraEP, pass `l1_weights_replicas` and `l2_weights_replicas` together.
 
 See [test_mega_moe.py](tests/test_mega_moe.py) for a complete example.
 
+The SM80 INT8 path uses per-token activation scales and
+per-channel weight scales:
+
+```python
+buffer = deep_gemm.get_symm_buffer_for_int8_mega_moe(
+    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden)
+l1_weights, l2_weights = deep_gemm.transform_weights_for_int8_mega_moe(
+    (w13_int8, w13_scales), (w2_int8, w2_scales))
+
+deep_gemm.int8_mega_moe_pre_dispatch(
+    hidden_states, topk_ids, topk_weights,
+    buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
+    num_tokens=hidden_states.shape[0], group_size=0)
+deep_gemm.int8_int8_mega_moe(output, l1_weights, l2_weights, buffer)
+```
+
+See [INT8 APIs](deep_gemm/mega/int8.py) for parameter details and
+[test_mega_moe_int8.py](tests/test_mega_moe_int8.py) for a complete example.
+
 #### HyperConnection (HC) prenorm GEMM
 
 We provide a HyperConnection (HC) prenorm GEMM that fuses the prenorm square-sum reduction into a TF32 GEMM. Call `deep_gemm.tf32_hc_prenorm_gemm` with a BF16 input `a`, a TF32 weight `b`, and it produces the TF32 output `d` together with the per-row square sum `sqr_sum` used by the subsequent normalization. The K-split configuration is selected automatically based on the K dimension.

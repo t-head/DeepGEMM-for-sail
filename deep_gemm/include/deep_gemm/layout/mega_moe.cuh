@@ -48,6 +48,11 @@ struct Buffer {
     }
 };
 
+// Valid routes for a token name distinct experts, including within one rank.
+__host__ __device__ constexpr int64_t max_local_routed_rows(int64_t source_tokens, int topk, int64_t local_experts) {
+    return source_tokens * (topk < local_experts ? topk : local_experts);
+}
+
 // Per-bank capacities inherited from the allocation owner.
 struct MegaMoEStaging {
     int64_t scales = 0, counts = 0, tokens = 0;
@@ -74,7 +79,7 @@ struct MegaMoEBuffer {
                            MegaMoEStaging staging_capacity = {}) {
         groups = experts / ranks;
         int64_t owner = int64_t(ranks) * capacity;
-        compact = owner * (topk < groups ? topk : groups);
+        compact = max_local_routed_rows(owner, topk, groups);
         blocks = groups * ((owner + 15) / 16);
         bytes = sizeof(MegaMoESignals);
         dispatch_retire = {offsetof(MegaMoESignals, dispatch_retire), sizeof(MegaMoESignals::dispatch_retire)};

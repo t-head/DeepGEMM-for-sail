@@ -13,6 +13,21 @@
 
 namespace deep_gemm::epilogue {
 
+// The selected epilogue is the single source of scatter mode and rank count.
+template <class Epilogue, class = void>
+struct Fp4ScatterTraits {
+    static constexpr bool enabled = false;
+    static constexpr bool warp_pipeline = false;
+    static constexpr int world_size = 1;
+};
+
+template <class Epilogue>
+struct Fp4ScatterTraits<Epilogue, std::void_t<decltype(Epilogue::kWorldSize_)>> {
+    static constexpr bool enabled = true;
+    static constexpr bool warp_pipeline = Epilogue::kWarpPipeline;
+    static constexpr int world_size = Epilogue::kWorldSize_;
+};
+
 // FP4 GEMM2 epilogue used by the two-stage MegaMoE path. It converts the
 // accumulator tile to BF16 and scatters each valid row directly into the
 // source token rank's symmetric scratch buffer.
@@ -22,7 +37,8 @@ template <
     class ThreadEpilogueOp_,
     int kWorldSize = 2,
     bool kWideScatterOffset = false,
-    bool kWarpPipeline_ = false>
+    bool kWarpPipeline_ = false,
+    bool kWaitScatterPair = false>
 class Fp4ScatterEpilogue {
 public:
     using StrideC = StrideC_;
@@ -33,6 +49,8 @@ public:
     using ElementC = ElementD_;
     using ElementD = ElementD_;
     using ThreadEpilogueOp = ThreadEpilogueOp_;
+    using ElementCompute = typename ThreadEpilogueOp::ElementCompute;
+    static constexpr int kWorldSize_ = kWorldSize;
     static constexpr bool kWarpPipeline = kWarpPipeline_;
     static constexpr int kPipelineSlots = 3;
     static constexpr int kReadyBarrier = 4;
@@ -315,6 +333,7 @@ private:
                 metadata[(row_base + kRowsPerIteration) /
                          kRowsPerIteration]};
 
+            bool pending_remote = false;
             CUTLASS_PRAGMA_UNROLL
             for (int pair = 0; pair < 2; ++pair) {
                 const int row = rows[pair];
@@ -362,6 +381,8 @@ private:
                             __ppu_remote_store_bulk_volatile_b32x4(
                                 reinterpret_cast<volatile void*>(destination),
                                 *reinterpret_cast<uint4*>(&value.packed));
+                            if constexpr (kWaitScatterPair)
+                                pending_remote = true;
                         }
                     } else {
                         const float4 values = *reinterpret_cast<const float4*>(source);
@@ -379,6 +400,13 @@ private:
                     }
                 }
             }
+#if __HGGC_ARCH__ == 100
+            // Bound each issuing warp to one row pair in flight.
+            if constexpr (kWaitScatterPair && kWorldSize == 16 && kVector == 8) {
+                if (pending_remote)
+                    __ppu_wait_remote_vstcnt(0);
+            }
+#endif
         }
     }
 

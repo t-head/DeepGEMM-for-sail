@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include "../../utils/layout.hpp"
 #include <limits>
 #include <string_view>
 #include <deep_gemm/common/types.cuh>
@@ -8,9 +9,13 @@
 #include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 #include <deep_gemm/epilogue/gated_activation.cuh>
 #include "fp4_gemm.hpp"
+#include "mega_moe_common.hpp"
 #include "../heuristics/mega_moe.hpp"
 
 namespace deep_gemm::mega {
+
+using mega_moe_common::for_ranks;
+using mega_moe_common::get_kernel_occupancy;
 
 static layout::MegaMoEStaging get_staging_capacity(
     int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk,
@@ -43,23 +48,6 @@ static void check_mega_moe_buffer(const torch::Tensor& buffer, const layout::Meg
                 buffer.numel() >= mega_buffer.get_num_bytes(), "invalid MegaMoE symmetric buffer size/layout");
 }
 
-static int get_kernel_occupancy(const std::shared_ptr<KernelRuntime>& runtime, int threads, int dynamic_smem) {
-    construct_launch_config(runtime->kernel, current_stream(), dynamic_smem, dim3(1), dim3(threads));
-    int blocks = 0;
-#if HGGCRT_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
-    DG_HGGC_RUNTIME_CHECK(hggcOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, runtime->kernel, threads, dynamic_smem));
-#else
-    DG_HGGC_DRIVER_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, runtime->kernel, threads, dynamic_smem));
-#endif
-    DG_HOST_ASSERT(blocks > 0);
-    return blocks;
-}
-
-// Rows and reduce column chunks start on 16-byte boundaries relative to the tensor base.
-static bool is_bf16x8_aligned(const void* ptr) {
-    return reinterpret_cast<uintptr_t>(ptr) % 16 == 0;
-}
-
 class MXFP4MegaMoEPreDispatchRuntime final : public LaunchRuntime<MXFP4MegaMoEPreDispatchRuntime> {
 public:
     struct Args {
@@ -88,29 +76,6 @@ static void __instantiate_kernel() {{
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.hidden_states, args.topk_idx.data_ptr(),
                                             args.topk_weights, args.num_tokens, args.sym_buffer));
-    }
-};
-
-class MegaMoESyncRuntime final : public LaunchRuntime<MegaMoESyncRuntime> {
-public:
-    struct Args {
-        const char* kernel_name;
-        int num_ranks;
-        LaunchArgs launch_args;
-        layout::MegaMoESignals* signals;
-    };
-
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
-#include <deep_gemm/impls/mega_moe_sync.cuh>
-static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_gemm::{}<{}>);
-}}
-)", args.kernel_name, args.num_ranks);
-    }
-
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.signals));
     }
 };
 
@@ -238,20 +203,6 @@ static void __instantiate_kernel() {{
     }
 };
 
-template <typename F>
-static void for_ranks(int ranks, F&& f) {
-    switch (ranks) {
-        case 1: return f(std::integral_constant<int, 1>{});
-        case 2: return f(std::integral_constant<int, 2>{});
-        case 4: return f(std::integral_constant<int, 4>{});
-        case 8: return f(std::integral_constant<int, 8>{});
-        case 16: return f(std::integral_constant<int, 16>{});
-        case 32: return f(std::integral_constant<int, 32>{});
-        case 64: return f(std::integral_constant<int, 64>{});
-        default: DG_HOST_UNREACHABLE("unsupported MegaMoE rank count");
-    }
-}
-
 static FP4GemmRuntime::MainLoopArguments make_mainloop_arguments(int m, int n, int k, int sfa_m,
                         uint8_t* lhs, uint16_t* lhs_scales,
                         const torch::Tensor& rhs, const torch::Tensor& rhs_scales) {
@@ -285,16 +236,7 @@ static void launch_gemm(typename Runtime::Args& args, int expected_m) {
         Runtime::launch(runtime, args);
     }
     if (get_env<int>("show_log", 0)) {
-        int registers = 0, stack_bytes = 0;
-#if HGGCRT_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
-        hggcFuncAttributes attributes{};
-        DG_HGGC_RUNTIME_CHECK(hggcFuncGetAttributes(&attributes, runtime->kernel));
-        registers = attributes.numRegs;
-        stack_bytes = attributes.localSizeBytes;
-#else
-        DG_HGGC_DRIVER_CHECK(hgFuncGetAttribute(&registers, HG_FUNC_ATTRIBUTE_NUM_REGS, runtime->kernel));
-        DG_HGGC_DRIVER_CHECK(hgFuncGetAttribute(&stack_bytes, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, runtime->kernel));
-#endif
+        const auto [registers, stack_bytes] = mega_moe_common::get_kernel_resources(runtime);
         printf("[%s] groups:%d problem:[%d,%d,%d] num_sms:%d blocks_per_sm:%d grid:%u\n"
                "tile:[%d,%d,%d] warp:[%d,%d] stages:%d smem:%d vreg:%d stack:%d\n",
             name, info.num_groups, cute::get<0>(args.mainloop.problem_shape), info.n, info.k,
@@ -469,12 +411,7 @@ static void sm89_fp4_fp4_mega_moe(
     auto* l2_acts = mega_buffer.l2_acts.data(base);
     auto* l2_acts_sf = mega_buffer.l2_acts_sf.data<uint16_t>(base);
     const int compact_m = static_cast<int>(mega_buffer.compact);
-    const auto launch_sync = [&](const char* name) {
-        MegaMoESyncRuntime::Args args{name, num_ranks, {dim3(1), dim3(64), 0}, signals};
-        const auto runtime = compiler->build(name, MegaMoESyncRuntime::generate(args));
-        MegaMoESyncRuntime::launch(runtime, args);
-    };
-    if (split_sync) launch_sync("mega_moe_dispatch_sync");
+    if (split_sync) mega_moe_common::launch_sync("mega_moe_dispatch_sync", num_ranks, signals);
     for_ranks(num_ranks, [&](auto r) {
         constexpr int Ranks = decltype(r)::value;
         using Linear2Runtime = GemmRuntime<MegaMoEPhaseKind::Linear2, Ranks>;
@@ -495,7 +432,7 @@ static void sm89_fp4_fp4_mega_moe(
                               l2_acts, l2_acts_sf, compact_m, num_topk, scheduler, signals, l1_config, fast_math, expected_m, split_sync);
         if (split_sync) {
             launch_gemm<Linear2Runtime>(l2_args, expected_m);
-            launch_sync("mega_moe_scatter_sync");
+            mega_moe_common::launch_sync("mega_moe_scatter_sync", num_ranks, signals);
             l2_args.kernel_name = kReduceKernelName;
         }
         launch_gemm<Linear2Runtime>(l2_args, expected_m);

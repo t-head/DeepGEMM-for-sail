@@ -42,6 +42,7 @@ import deep_gemm
 from deep_gemm.testing import calc_diff
 from utils import is_ppu1v5_device
 from test_activation import situ_reference
+from mega_moe_test_utils import check_bf16_offset_views
 
 
 # Cases and input/reference helpers are shared with bench_mega_moe.py.
@@ -520,36 +521,12 @@ def _check_offset_views(entry, l1_weights, l2_weights, sym_buffer, source, ids, 
     dist.barrier()
     expected = forward(aligned_input, aligned_output).clone()
 
-    def make_view(offset):
-        storage = torch.full((source.numel() + offset + 8,), 13.0,
-                             dtype=source.dtype, device=source.device)
-        view = storage[offset:offset + source.numel()].view_as(source)
-        assert view.is_contiguous() and view.storage_offset() == offset
-        return storage, view
+    def replay(offset_input, offset_output):
+        _check_graph_replay(lambda: forward(offset_input, offset_output), expected,
+                            input_tensor=offset_input, routing_ids=ids, routing_weights=weights,
+                            num_experts=sym_buffer.num_experts)
 
-    def check_guards(storage, offset):
-        assert torch.all(storage[:offset] == 13)
-        assert torch.all(storage[offset + source.numel():] == 13)
-
-    # Exercise input-only, output-only and joint offsets, including every BF16
-    # alignment modulo 16 bytes. The empty peer still participates in compute.
-    for input_offset, output_offset in ((1, 0), (0, 1), *((i, i) for i in range(1, 8))):
-        input_storage, offset_input = make_view(input_offset)
-        output_storage, offset_output = make_view(output_offset)
-        offset_input.copy_(source)
-        actual = forward(offset_input, offset_output)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        torch.testing.assert_close(offset_input, source, rtol=0, atol=0)
-        check_guards(input_storage, input_offset)
-        check_guards(output_storage, output_offset)
-
-    # Replay from offset allocations too; changed inputs and routes must not
-    # consume data left by an eager call or by an earlier workspace generation.
-    _check_graph_replay(lambda: forward(offset_input, offset_output), expected,
-                       input_tensor=offset_input, routing_ids=ids, routing_weights=weights,
-                       num_experts=sym_buffer.num_experts)
-    check_guards(input_storage, input_offset)
-    check_guards(output_storage, output_offset)
+    check_bf16_offset_views(source, expected, forward, replay=replay)
 
 
 def _check_graph_replay(pipeline, expected, *, input_tensor=None, routing_weights=None, routing_ids=None,

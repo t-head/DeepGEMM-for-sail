@@ -79,6 +79,43 @@ test_core.py options:
   --func {DenseGemm,GroupedContiguous,GroupedMasked,DenseGemm}  target test func
 # Routed MoE correctness and performance tests
 
+For the SM80 INT8 public API, run on idle devices:
+
+```bash
+env -u DG_USE_MOE_DYNAMIC_TILE -u HGGC_DEVICE_GRAPH \
+  torchrun --standalone --nproc_per_node=8 tests/test_mega_moe_int8.py --activations --graph --sync-modes
+```
+
+Replace `8` with the selected power-of-two EP size. The default cases cover
+0/1/31/32/33/65 tokens, random/hot/invalid/empty routes, an empty source rank,
+workspace aliases and invalid API arguments. `--activations` checks all four
+activations and changing clamp values; `--graph` replays two distinct clamp
+specializations with changing inputs. For a larger shape add
+`--hidden 4096 --intermediate 2048 --experts 16 --topk 6`.
+These are correctness tests against a separate Torch reference, without the
+legacy Python JIT or a private test extension.
+
+`--sync-modes` switches fused/split rank waits on one buffer. Set
+`DG_MEGAMOE_SPLIT_SYNC=1` to run the full suite with standalone sync kernels.
+
+SM80 INT8 copy and GEMM use separate streams without launch-completion events.
+Device-ready flags guard GEMM inputs, and the caller stream joins copy before
+reusing the workspace. The command above leaves `HGGC_DEVICE_GRAPH` unset.
+
+On SM80, if continuous INT8 EP16 runs hang during GEMM2 scatter, set
+`DG_MEGAMOE_SM80_EP16_SCATTER_WAIT=1` on all ranks. Each warp then waits
+after a pair of rows if it issued a remote bulk store. Sustained traffic to
+five multi-hop peers has still timed out with this setting. With the variable
+unset or set to `0`, scatter uses the original store sequence. To exercise
+the workaround on the GLM shape, run
+
+```bash
+env -u DG_USE_MOE_DYNAMIC_TILE -u HGGC_DEVICE_GRAPH \
+  DG_MEGAMOE_SM80_EP16_SCATTER_WAIT=1 \
+  torchrun --standalone --nproc_per_node=16 tests/test_mega_moe_int8.py \
+  --tokens 8192 --hidden 6144 --intermediate 2048 --experts 256 --topk 8 --continuous-iters 2048
+```
+
 MegaMoE supports W4A4 on PPU1.5, validated on ZW-M890P.
 `test_mega_moe.py` contains public-entry correctness and regression tests;
 `bench_mega_moe.py` contains full-pipeline timing and optional DeepEP comparisons.
