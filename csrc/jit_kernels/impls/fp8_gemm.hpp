@@ -242,7 +242,7 @@ public:
                                info.block_m, info.block_n, info.block_k, info.num_groups,
                                info.warp_m, info.warp_n, info.num_stages, info.gemm_type,
                                info.kernel_strategy, info.enable_sbo_overlap,
-                               info.kernel_name);
+                               info.kernel_name, args.launch_args.smem_size);
     }
 
     static std::string generate_impl(const Args& args) {
@@ -371,6 +371,7 @@ using GemmKernel = DeepGemmUniversal<
   kEnableSboOverlap,
   kUseNStageKernel
 >;
+static_assert(GemmKernel::SharedStorageSize == {17}, "FP8 shared storage size differs from host");
 
 // scale-A cp.async address keeps a 64-bit global address and a 32-bit shared
 // address, for 3 VREGs; A/B use the AIU load path.
@@ -396,7 +397,8 @@ __global__ void {12}(
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
-            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
+            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
+            args.launch_args.smem_size);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

@@ -110,7 +110,7 @@ class FP8MegaMoEGemmRuntime final : public LaunchRuntime<FP8MegaMoEGemmRuntime<S
 public:
     static_assert(Stage == MegaMoEPhaseKind::Linear1 || Stage == MegaMoEPhaseKind::Linear2,
                   "unsupported MegaMoE stage");
-    static_assert(Quantization == Precision::FP8Channelwise,
+    static_assert(Quantization == Precision::FP8Channelwise || Quantization == Precision::FP8Blockwise,
                   "unsupported FP8 MegaMoE quantization");
     static constexpr bool kIsLinear1 = Stage == MegaMoEPhaseKind::Linear1;
     static constexpr bool kIsBlockwise = Quantization == Precision::FP8Blockwise;
@@ -135,7 +135,22 @@ public:
                         "invalid MegaMoE layout");
             const layout::RoutedMoEInputLayout inputs(dispatch.num_ranks, dispatch.num_experts, dispatch.nmtpr,
                                                      dispatch.num_topk, dispatch.token_bytes, dispatch.sf_bytes);
-            {
+            if constexpr (kIsBlockwise) {
+                return fmt::format(R"(
+#define DG_MOE_FAST_MATH {}
+#include <deep_gemm/impls/sm89_fp8_fp8_mega_moe_blockwise.cuh>
+using Builder = deep_gemm::MegaMoEFp8BlockwiseGemm1Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_blockwise_mega_moe_l1<Builder>);
+}}
+)",
+                    int(c.fast_math), c.n, tile.block_m, c.num_threads, inputs.input_tokens,
+                    inputs.input_scales, inputs.topk_idx, inputs.dispatched_tokens, inputs.dispatched_scales,
+                    inputs.gemm2_metadata, dispatch.pull_ctas, int(args.kernel_params.activation_clamp >= 0),
+                    c.master_experts, c.swiglu_oai, c.metadata.block_m, dispatch.nmtpr, c.num_ctas, dispatch.num_experts,
+                    dispatch.num_ranks, dispatch.num_topk, dispatch.token_bytes, args.launch_args.smem_size);
+            } else {
                 return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
 #include <deep_gemm/impls/sm89_fp8_fp8_mega_moe.cuh>
@@ -153,7 +168,32 @@ static void __instantiate_kernel() {{
                     dispatch.token_bytes, args.launch_args.smem_size);
             }
         } else {
-            {
+            if constexpr (kIsBlockwise) {
+                return fmt::format(R"(
+#include <deep_gemm/impls/sm89_fp8_fp8_mega_moe_blockwise.cuh>
+using Builder = deep_gemm::MegaMoEFp8BlockwiseGemm2Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+using Kernel = typename Builder::Kernel;
+static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
+static_assert(sizeof(Kernel::Params) == {}, "scatter Params ABI mismatch");
+static_assert(alignof(Kernel::Params) == {}, "scatter Params alignment mismatch");
+static_assert(sizeof(Kernel::MainloopParams) == {}, "scatter mainloop ABI mismatch");
+static_assert(sizeof(Kernel::EpilogueParams) == {}, "scatter epilogue ABI mismatch");
+static_assert(offsetof(Kernel::Params,mainloop) == {}, "scatter mainloop offset mismatch");
+static_assert(offsetof(Kernel::Params,epilogue) == {}, "scatter epilogue offset mismatch");
+static_assert(offsetof(Kernel::Params,hw_info) == {}, "scatter hardware offset mismatch");
+static_assert(offsetof(Kernel::Params,scheduler) == {}, "scatter scheduler offset mismatch");
+static_assert(offsetof(Kernel::Params,workspace) == {}, "scatter workspace offset mismatch");
+static_assert(offsetof(Kernel::Params,signal) == {}, "scatter signal offset mismatch");
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_blockwise_mega_moe_l2<Builder>);
+}}
+)",
+                    c.n, c.k, c.num_groups, c.num_master_groups, c.num_stages, c.block_m, c.scratch_rows,
+                    c.num_ranks, c.num_threads, c.smem_size, c.smem_size, sizeof(Params), alignof(Params),
+                    sizeof(Params{}.mainloop), sizeof(Params{}.epilogue), offsetof(Params, mainloop),
+                    offsetof(Params, epilogue), offsetof(Params, hw_info), offsetof(Params, scheduler),
+                    offsetof(Params, workspace), offsetof(Params, signal));
+            } else {
                 return fmt::format(R"(
 #include <deep_gemm/impls/sm89_fp8_fp8_mega_moe.cuh>
 using Builder = deep_gemm::MegaMoEFp8ChannelwiseGemm2Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
@@ -185,7 +225,11 @@ static void __instantiate_kernel() {{
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, const Args& args) {
         if constexpr (kIsLinear1) {
             const auto& p = args.kernel_params;
-            {
+            if constexpr (kIsBlockwise) {
+                DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
+                    p.sym_buffer, p.local_pool, p.rank_idx, p.num_tokens, p.weights, p.scales, p.output,
+                    p.output_scales, p.activation_clamp, p.activation_alpha, p.replicas, p.replica_scales, p.block_info));
+            } else {
                 DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
                     p.sym_buffer, p.rank_idx, p.num_tokens, p.weights, p.scales, p.replicas, p.replica_scales,
                     p.master_experts, p.output, p.activation_clamp, p.activation_alpha, p.block_info));
@@ -222,7 +266,11 @@ static auto make_fp8_fp8_linear1_args(
     p.activation_clamp = activation_clamp;
     p.activation_alpha = activation_alpha;
     p.block_info = math::advance_ptr<uint4>(base, buffer.block_info);
-    {
+    if constexpr (Runtime::kIsBlockwise) {
+        p.local_pool = base + buffer.dispatched_tokens;
+        p.output = base + buffer.l2_acts;
+        p.output_scales = math::advance_ptr<float>(base, buffer.l2_scales);
+    } else {
         p.master_experts = weight.size(0);
         p.output = math::advance_ptr<at::BFloat16>(base, buffer.bf16_scratch);
     }
@@ -261,7 +309,16 @@ static auto make_fp8_fp8_linear2_args(
         math::advance_ptr<int64_t>(base, buffer.packed_routes), meta.valid_rows,
         math::advance_ptr<int64_t>(base, buffer.peer_offsets), uint32_t(rank_idx), uint32_t(dispatch.num_ranks),
         Runtime::kIsBlockwise ? nullptr : meta.valid_rows, uint32_t(groups)};
-    {
+    if constexpr (Runtime::kIsBlockwise) {
+        p.mainloop = {math::advance_ptr<cutlass::float_e4m3_t>(base, buffer.l2_acts), sa,
+                      device_pointer<cutlass::float_e4m3_t>(weight), sb, 4,
+                      math::advance_ptr<float>(base, buffer.l2_scales), FP8GemmRuntime::ScaleConfig::tile_atom_to_shape_SFA(problem),
+                      device_pointer<float>(scale), FP8GemmRuntime::ScaleConfig::tile_atom_to_shape_SFB(problem)};
+        p.epilogue.base = {{1, 0}, nullptr, sd, output, sd};
+        p.epilogue.scatter = {scatter, meta.offsets};
+        p.epilogue.base_ptr_D = output;
+        p.scheduler = {{uint32_t(m), grouped_layout}, meta.offsets};
+    } else {
         p.mainloop = {base + buffer.l2_acts, sa, device_pointer(weight), sb,
                       math::advance_ptr<float>(base, buffer.l2_scales), device_pointer<float>(scale)};
         p.epilogue = {{1, 0}, output, sd, output, sd};
@@ -303,7 +360,10 @@ inline void fp8_fp8_mega_moe_impl(
             launch_mega_moe_kernel<Linear2Runtime, false, -1>(
                 l2_args, gemm_profile("fp8", rows, configs.expected_m, configs.l2));
     };
-    launch(std::integral_constant<Precision, Precision::FP8Channelwise>{});
+    if (precision == Precision::FP8Blockwise)
+        launch(std::integral_constant<Precision, Precision::FP8Blockwise>{});
+    else
+        launch(std::integral_constant<Precision, Precision::FP8Channelwise>{});
     combine_mega_moe(base, buffer, config.dispatch, sym_buffer, y, rank_idx, num_tokens);
 }
 

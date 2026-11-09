@@ -490,7 +490,7 @@ For UltraEP, pass `l1_weights_replicas` and `l2_weights_replicas` together.
 
 See [test_mega_moe.py](tests/test_mega_moe.py) for a complete example.
 
-##### FP8 channelwise MegaMoE
+##### FP8 channelwise, FP8 blockwise MegaMoE
 
 These backends follow the same complete-call and workspace ownership contract.
 `intermediate_hidden` always means the activated width I. Routing weights are
@@ -504,6 +504,7 @@ with `quantization` (channelwise by default). These backends require PPU1.5.
 | Backend | Compute | Workspace mode | Activation | EP limit |
 |---|---|---|---|---|
 | FP8 channelwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="channelwise"` | SwiGLU, SwiGLU-OAI | 64 |
+| FP8 blockwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, SwiGLU-OAI | 64 |
 
 H is divisible by 256 and I by 128. FP8 supports at most 128 physical experts
 per rank. Capacity is positive and below 2^24;
@@ -547,7 +548,8 @@ dg.fp8_fp8_mega_moe(y, l1, l2, workspace, activation="swiglu")
 ```
 
 FP8 weights are contiguous E4M3 `[E,N,K]`. Channelwise FP32 scales are
-`[E,N,1]`. The transform interleaves GEMM1 gate/up rows in groups of eight, including their
+`[E,N,1]`; blockwise scales are `[E,N/128,K/128]`. The transform interleaves
+GEMM1 gate/up rows in groups of eight or 128 respectively, including their
 scales, without requantization. In these weight shapes, E is the number of
 local experts in the bank, N the output width, and K the input width. All raw
 weights and scales must be contiguous and on the same device.
@@ -556,8 +558,8 @@ FP8 `base` aliases require the same mode, quantization, group,
 device and workspace dimensions; aliases execute serially on the same stream.
 Transformed weights are specific to their backend and must not be interchanged.
 
-FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]`.
-`mega_moe_pre_dispatch` fills these inputs and routes. FP8 also quantizes
+FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]` for channelwise
+or `[capacity,H/128]` for blockwise. `mega_moe_pre_dispatch` fills these inputs and routes. FP8 also quantizes
 activated GEMM1 output to E4M3.
 These backends write BF16 GEMM2 scatter results and launch a separate combine
 kernel inside the complete C++ compute call. Combine handles the generation

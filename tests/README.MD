@@ -87,7 +87,7 @@ helpers. Both use the public complete call.
 Other architecture pytest runs skip these tests; CLI use reports an
 unsupported-device error.
 
-`test_mega_moe_precisions.py` exercises FP8 channelwise
+`test_mega_moe_precisions.py` exercises FP8 channelwise, FP8 blockwise
 through their public complete calls. Its default model cases are listed below;
 all token counts are per rank. CLI options can select other counts within capacity.
 
@@ -97,6 +97,7 @@ all token counts are per rank. CLI options can select other counts within capaci
 | `glm53_flash` | FP8 channelwise | 4 | 1024, 2048, 4096 |
 | `qwen38_flash` | FP8 channelwise | 4 | 1024, 2048, 4096 |
 | `minimax_m3` (open-source model) | FP8 channelwise | 8 | 1024, 2048, 4096 |
+| `minimax_m3_blockwise` (next-generation model) | FP8 blockwise | 8, 16, 32, 64 | 64, 1024, 2048, 4096 |
 
 Small distributed cases cover separate replicas, both math modes, OAI/clamp,
 empty ranks, consecutive changing routes, statistics and graph replay.
