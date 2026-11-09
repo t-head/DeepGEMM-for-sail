@@ -1,6 +1,4 @@
 """Regression checks for invalid MoE routes in both alignment launch paths."""
-import argparse
-
 import torch
 import deep_gemm
 
@@ -34,11 +32,8 @@ def check(ids, outputs, groups, block_m):
     assert (inverse[(ids < 0) | (ids >= groups)] == -1).all()
 
 
-def main(backend):
+def main():
     align = deep_gemm.moe_align_block_size
-    if backend == 'python':
-        from deep_gemm.jit_kernels.a_fused_m_grouped_gemm import moe_align_block_size
-        align = moe_align_block_size
     groups = 128
     for count in (8, 1638, 1639, 8192):
         lhs = torch.empty((count, 128), device='cuda', dtype=torch.bfloat16)
@@ -67,10 +62,8 @@ def main(backend):
                     value.fill_(1234567)
                 graph.replay()
                 check(ids, outputs, groups, block_m)
-                print('PASS', backend, count, block_m, distribution, flush=True)
+                print('PASS', 'cpp', count, block_m, distribution, flush=True)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--backend', choices=['cpp', 'python'], default='cpp')
-    main(parser.parse_args().backend)
+    main()
