@@ -157,10 +157,11 @@ __global__ void moe_align_p1(
     const int32_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ block_counts,
+    int32_t* __restrict__ m_indices,
     int numel, int s_total_ub)
 {{
     block_count_with_fill_impl<{0}, {1}, {2}>(
-        topk_ids, sorted_token_ids, block_counts, numel, s_total_ub, blockIdx.x);
+        topk_ids, sorted_token_ids, block_counts, m_indices, numel, s_total_ub, blockIdx.x);
 }}
 
 }}  // namespace deep_gemm
@@ -242,7 +243,7 @@ __global__ void moe_align_p4(
         switch (args.phase) {
         case Phase::kCount:
             DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
-                p.topk_ids, p.sorted_token_ids, p.block_counts, p.numel, p.s_total_ub));
+                p.topk_ids, p.sorted_token_ids, p.block_counts, p.m_indices, p.numel, p.s_total_ub));
             break;
         case Phase::kScan:
             DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
