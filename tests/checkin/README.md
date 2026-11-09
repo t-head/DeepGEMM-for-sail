@@ -11,6 +11,8 @@ python tests/checkin/run_checkin.py --suite ZW-M890P --compile-workers 4
 python tests/checkin/run_checkin.py --suite ZW-M890P --list
 ```
 
+The M890P board suite also runs `tests/test_m_grouped_bf16_add_c.py` without `--bench` after the functional accuracy cases. This checks optional C and in-place accumulation, including tail and unaligned C/D accesses. The script runs for `--phase all` and `--phase run`, never for `--phase compile` or after a compile failure. Its result appears as `DeepGEMM.script` in the same JUnit report.
+
 Each non-comment line is one `run_deep_gemm.py --format` specification, not a shell command. Nested `.list` paths are relative to their containing file. `--caselist PATH` selects a custom list instead of a board suite. The defaults are sixteen compiler workers and a 1200-second timeout per case per phase; reduce workers on memory-constrained machines.
 
 The scheduler uses one independent reusable subprocess per compiler worker with `HGGC_WARM_UP=1`. Workers import Torch once per phase. It waits for every compile result before running any accuracy case, then runs accuracy cases serially in a separate reusable subprocess. A compile failure prevents the accuracy phase. Accuracy failures are collected while remaining cases continue. Both phases require each selected case to be supported on the device; unsupported cases cannot silently pass. `HGGC_WARM_UP` is removed from accuracy subprocesses, including an inherited value of `0` (any nonempty value enables warm-up).

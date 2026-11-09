@@ -28,7 +28,8 @@ using Config = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int
 static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor& lhs, const torch::Tensor& rhs,
                                                              const torch::Tensor& out, const torch::Tensor& m_indices,
                                                              const int& m, const int& n, const int& k,
-                                                             const int& num_groups, std::optional<ConfigTuple> configs) {
+                                                             const int& num_groups, std::optional<ConfigTuple> configs,
+                                                             const std::optional<torch::Tensor>& c = std::nullopt) {
     int num_sms = get_num_sms();
     Config cfg;
     if (configs.has_value()) {
@@ -58,6 +59,21 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     cutlass::bfloat16_t* input_a = reinterpret_cast<cutlass::bfloat16_t*>(lhs.data_ptr<at::BFloat16>());
     cutlass::bfloat16_t* output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
 
+    const bool with_c = c.has_value();
+    auto* input_c = with_c ? reinterpret_cast<cutlass::bfloat16_t*>(c->data_ptr<at::BFloat16>()) : output;
+    const uintptr_t cd_addresses = reinterpret_cast<uintptr_t>(input_c) | reinterpret_cast<uintptr_t>(output);
+    // PPU1.0 TSM copies 16 bytes at a time. Its C-load predicate covers
+    // vector starts only, so unaligned C/D or row tails use the scalar
+    // no-TSM AddC epilogue. The original no-C path is unchanged.
+    const bool allow_tsm_epilogue = !with_c || (n % 8 == 0 && (cd_addresses & 15) == 0);
+    const bool vectorized_c = with_c && n % 2 == 0 && (cd_addresses & 3) == 0;
+
+    // The first empty A/B refill is reached once the pipeline prologue is filled.
+    const bool register_c = vectorized_c && is_ppu1v5_device() && num_stages >= 2 &&
+                            block_k > 0 && k % block_k == 0 && k / block_k >= num_stages;
+    // This epilogue holds C in registers and only the A/B pipeline needs shared memory.
+    const int launch_smem = register_c ? num_stages * (block_m + block_n) * block_k * int(sizeof(*input_a)) : SMSIZE;
+
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.cu_count = num_sms_new;
@@ -70,8 +86,8 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         .mainloopargs = {input_a, stride_A, input_b, stride_B},
         .epilogueargs =
             {
-                {1, 0},
-                output,
+                {1.0f, with_c ? 1.0f : 0.0f},
+                input_c,
                 stride_D,
                 output,
                 stride_D,
@@ -81,17 +97,42 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         .signal = nullptr};
 
     BF16GemmCutlass3Runtime::GemmKernelParams params =
-        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr, with_c, allow_tsm_epilogue);
     auto args = BF16GemmCutlass3Runtime::Args{
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "MGroupedContiguous",
-                        "Default", "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap},
-        .launch_args = {grid, block, SMSIZE},
+                        "Default", "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap, with_c, allow_tsm_epilogue,
+                        vectorized_c, register_c},
+        .launch_args = {grid, block, launch_smem},
         .kernel_params = params};
-    const auto& code = BF16GemmCutlass3Runtime::generate(args);
-    const auto& runtime = compiler->build("bf16_grouped_deep_gemm_contiguous", code);
-    const auto& kernel = runtime->kernel;
+    auto build_kernel = [&]() {
+        return compiler->build("bf16_grouped_deep_gemm_contiguous", BF16GemmCutlass3Runtime::generate(args));
+    };
+    auto runtime = build_kernel();
     int blocks_per_cu = 0;
-    HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
+    auto query_occupancy = [&]() -> HGresult {
+        if (args.launch_info.register_c) {
+            // The query must see the same opt-in allocation as the launch.
+            auto result = lazy_hgFuncSetAttribute(runtime->kernel, HG_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                                  args.launch_args.smem_size);
+            if (result != HGGC_SUCCESS)
+                return result;
+        }
+        return hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, runtime->kernel, block.x,
+                                                           args.launch_args.smem_size);
+    };
+    auto result = query_occupancy();
+    int local_bytes = 0;
+    if (args.launch_info.register_c && result == HGGC_SUCCESS && blocks_per_cu > 0)
+        DG_HGGC_DRIVER_CHECK(hgFuncGetAttribute(&local_bytes, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, runtime->kernel));
+    // Keep the C tile on chip; high-pressure configurations can spill to local memory.
+    if (args.launch_info.register_c && (result != HGGC_SUCCESS || blocks_per_cu == 0 || local_bytes != 0)) {
+        args.launch_info.register_c = false;
+        args.launch_args.smem_size = SMSIZE;
+        runtime = build_kernel();
+        result = query_occupancy();
+    }
+    DG_HGGC_DRIVER_CHECK(result);
+    DG_HOST_ASSERT(blocks_per_cu > 0);
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
@@ -108,6 +149,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
         int numRegs = 0, localSize = 0;
+        const auto& kernel = runtime->kernel;
         hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
         hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
 
@@ -117,7 +159,8 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
                args.launch_args.grid_dim.x);
         printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
                block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-        printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
+        printf("SMSIZE:%d, vreg:%d, stack:%d\n", args.launch_args.smem_size, int(numRegs), int(localSize));
+        printf("WithC:%d, StageC:0, RegC:%d\n", int(with_c), int(args.launch_info.register_c));
     }
 
 }

@@ -21,6 +21,7 @@ import xml.etree.ElementTree as ET
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUITES = {'ZW-810E': 'checkin_810e.list', 'ZW-M890P': 'checkin_890p.list'}
+BOARD_SCRIPTS = {'ZW-M890P': ['tests/test_m_grouped_bf16_add_c.py']}
 SCRIPT_SUITES = {
     'ZW-M890P-MegaMoE': ['-m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py'],
 }
@@ -298,11 +299,21 @@ def main(argv=None):
         cases = load_cases(path)
     except (ValueError, OSError) as error:
         parser.error(str(error))
+    scripts = BOARD_SCRIPTS.get(args.suite, ()) if args.phase != 'compile' else ()
     if args.list:
         for i, spec in enumerate(cases, 1):
             print(f'{i}: {spec}')
+        for i, spec in enumerate(scripts, 1):
+            print(f'Script {i}: {sys.executable} {spec}')
         return 0
     results = execute(cases, args.compile_workers, args.log_dir.resolve(), args.timeout, args.phase)
+    if not any(result.phase == 'compile' and result.error for result in results):
+        for i, spec in enumerate(scripts, 1):
+            result = run_case(i, spec, 'script', args.log_dir.resolve(), args.timeout)
+            results.append(result)
+            print(f'Script [{i}/{len(scripts)}]: {result.error or "OK"}', flush=True)
+            if result.error:
+                print(result.log.read_text(errors='replace')[-12000:], flush=True)
     write_report(results, args.output_xml)
     failed = sum(bool(result.error) for result in results)
     print(f'Phase={args.phase}, cases={len(cases)}, phase results={len(results)}, failures={failed}')

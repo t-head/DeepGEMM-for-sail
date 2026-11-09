@@ -3,6 +3,7 @@
 #include "../utils/compatibility.hpp"
 #include "../utils/layout.hpp"
 #include <torch/extension.h>
+#include <ATen/MemoryOverlap.h>
 #include "../jit_kernels/impls/fp8_gemm.hpp"
 #include "../jit_kernels/impls/ppuxx_layout.hpp"
 
@@ -889,7 +890,17 @@ void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& lhs, const torch::Te
                                        const bool& use_psum_layout,
                                        const bool& ensure_zero_padding,
                                        const std::optional<int>& expected_m_for_psum_layout,
-                                       std::optional<ConfigTuple> configs = std::nullopt) {
+                                       std::optional<ConfigTuple> configs = std::nullopt,
+                                       const std::optional<torch::Tensor>& c = std::nullopt) {
+    if (c.has_value()) {
+        TORCH_CHECK(c->defined(), "c must be a defined tensor");
+        TORCH_CHECK(c->sizes() == out.sizes(), "c must have the same shape as out");
+        TORCH_CHECK(c->scalar_type() == torch::kBFloat16, "c must have dtype bfloat16");
+        TORCH_CHECK(c->device() == out.device(), "c must be on the same device as out");
+        TORCH_CHECK(c->is_contiguous(), "c must be contiguous");
+        // Exact aliasing (c == out) is safe; offset overlap can race across CTAs.
+        at::assert_no_partial_overlap(out, *c);
+    }
     const auto major_a = get_major_type_ab(lhs);
     const auto major_b = get_major_type_ab(rhs);
     DG_HOST_ASSERT(major_a == MajorType::K);
@@ -925,7 +936,7 @@ void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& lhs, const torch::Te
 
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
-        m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(lhs, rhs, out, m_indices, m, n, k, num_groups, configs);
+        m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(lhs, rhs, out, m_indices, m, n, k, num_groups, configs, c);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -1850,7 +1861,10 @@ static void register_apis(pybind11::module_& m) {
     m.def("m_grouped_bf16_gemm_nt_contiguous", &m_grouped_bf16_gemm_nt_contiguous, py::arg("lhs"),
           py::arg("rhs"), py::arg("out"), py::arg("m_indices"), py::arg("compiled_dims") = "nk",
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,
-          py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
+          py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt,
+          py::arg("c") = std::nullopt,
+          "Compute grouped D = A @ B.T + C with optional BF16 C; omit C to overwrite D. "
+          "C may alias D exactly. C is added in FP32 before the BF16 output conversion.");
     m.def("m_grouped_bf16_gemm_nt_masked", &m_grouped_bf16_gemm_nt_masked, py::arg("lhs"),
           py::arg("rhs"), py::arg("out"), py::arg("masked_m"), py::arg("expected_m"), py::arg("compiled_dims") = "nk",
           py::arg("max_block_n") = 256, py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt,

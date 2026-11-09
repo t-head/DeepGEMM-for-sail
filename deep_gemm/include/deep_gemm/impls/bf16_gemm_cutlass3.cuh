@@ -28,8 +28,15 @@
 #include <deep_gemm/common/utils_cutlass3.cuh>
 
 #include <ppu_include.hpp>
+#include <type_traits>
 
 using namespace cute;
+
+namespace deep_gemm {
+template <class E, class = void> struct UsesRegisterC : std::false_type {};
+template <class E> struct UsesRegisterC<E, std::void_t<decltype(E::kRegisterC)>>
+    : std::bool_constant<E::kRegisterC> {};
+}
 
 namespace cutlass::gemm {
 
@@ -754,7 +761,8 @@ struct CollectiveMma<
     class FrgTensorD,
     class FrgTensorC,
     class KTileIterator,
-    class ResidueMNK
+    class ResidueMNK,
+    class CopySourceC = decltype(nullptr)
   >
   CUTLASS_DEVICE void
   operator() (
@@ -765,7 +773,8 @@ struct CollectiveMma<
       ResidueMNK residue_mnk,
       int thread_idx,
       int warp_idx,
-      char *smem_buf) {
+      char *smem_buf,
+      CopySourceC copy_source_c = nullptr) {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorD>::value, "D tensor must be rmem resident.");
@@ -925,6 +934,10 @@ struct CollectiveMma<
               gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
               warp_idx
             );
+          } else if constexpr (!std::is_same_v<CopySourceC, decltype(nullptr)>) {
+            // The last A/B tile is in flight. Load the C register fragment
+            // once while the remaining MMA consumes the staged A/B tiles.
+            if (k_tile_count == 0) copy_source_c();
           }
           cp_async_fence();
 
@@ -1028,16 +1041,12 @@ public:
   static constexpr uint32_t K = TileScheduler::SHAPE_K;
   static constexpr uint32_t N_PREFETCH_CACHELINE = cute::ceil_div(TileScheduler::kNumGroups, 32); // numGroups * sizeof(int) / 128 Byte = cacheline
 
-  // Kernel level shared memory storage
-  struct SharedStorage {
-    // Mainloop and epilogue don't use smem concurrently since kernel is non-persistent, so we can use a union
-    union SharedTensorStorage {
-      using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
-      using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
-
-      MainloopSharedStorage mainloop;
-      EpilogueSharedStorage epilogue;
-    } tensors;
+  static constexpr bool kRegisterC = deep_gemm::UsesRegisterC<CollectiveEpilogue>::value;
+  static_assert(!kRegisterC || (std::is_same_v<ArchTag, cutlass::arch::PPU0015> &&
+                            TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous));
+  union SharedStorage {
+    typename CollectiveMainloop::SharedStorage mainloop;
+    typename CollectiveEpilogue::SharedStorage epilogue;
   };
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
@@ -1232,34 +1241,33 @@ public:
       auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
       int  k_tile_count = size<2>(gA);
 
-      // Perform the collective scoped MMA
-      collective_mma(
-        accumulators,
-        load_inputs,
-        accumulators,
-        k_tile_iter, k_tile_count,
-        residue_mnk,
-        thread_idx,
-        warp_idx,
-        smem_buf
-      );
+      auto epilogue_params = [&]() {
+        auto local = params.epilogue;
+        local.ptr_C += deep_scheduler.curr_offset_c();
+        local.ptr_D += deep_scheduler.curr_offset_c();
+        return local;
+      };
 
-      // update params.epilogue for ptrC and ptrD
-      auto params_epilogue_local = params.epilogue;
-      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
-      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
-      // Epilogue and write to gD
-      CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
-      epilogue(
-        problem_shape_MNKL,
-        blk_shape,
-        blk_coord_mnkl,
-        accumulators,
-        tiled_mma,
-        residue_mnk,
-        thread_idx,
-        (char*)&shared_storage.tensors.epilogue
-      );
+      if constexpr (kRegisterC) {
+        auto local = epilogue_params();
+        cutlass::Array<uint32_t, decltype(size(accumulators))::value / 2> packed;
+        auto load_c = [&]() {
+          CollectiveEpilogue::load_register_c(local, problem_shape_MNKL, blk_shape, blk_coord_mnkl,
+                                              tiled_mma, residue_mnk, thread_idx, packed);
+        };
+        collective_mma(accumulators, load_inputs, accumulators, k_tile_iter, k_tile_count,
+                       residue_mnk, thread_idx, warp_idx, smem_buf, load_c);
+        CollectiveEpilogue epilogue{local, shared_storage.epilogue};
+        epilogue(problem_shape_MNKL, blk_shape, blk_coord_mnkl, accumulators, tiled_mma,
+                 residue_mnk, thread_idx, (char*)&shared_storage.epilogue, packed);
+      } else {
+        collective_mma(accumulators, load_inputs, accumulators, k_tile_iter, k_tile_count,
+                       residue_mnk, thread_idx, warp_idx, smem_buf);
+        auto local = epilogue_params();
+        CollectiveEpilogue epilogue{local, shared_storage.epilogue};
+        epilogue(problem_shape_MNKL, blk_shape, blk_coord_mnkl, accumulators, tiled_mma,
+                 residue_mnk, thread_idx, (char*)&shared_storage.epilogue);
+      }
       // if (thread0()) {
       //   printf("accumulators[0] = %.4f\n", accumulators[0]);
       // }
