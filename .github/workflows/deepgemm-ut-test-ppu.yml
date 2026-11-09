@@ -65,7 +65,7 @@ jobs:
           container_options: |
             cpus: "40"
           nnodes: 0
-          nproc_per_node: 1
+          nproc_per_node: ${{ matrix.suite == 'ZW-M890P-MegaMoE' && 2 || 1 }}
           node_selector: "board-type=${{ matrix.runner }}"
           namespace: ppu-sched
           # Ceiling for environment setup, wheel build and both check-in phases.

@@ -23,6 +23,7 @@ from datetime import timedelta
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import time
@@ -369,6 +370,9 @@ def _check_public_entry(entry, y, l1_weights, l2_weights, sym_buffer, source, id
         ({"activation_clamp": float("nan")}, "activation_clamp"),
         ({"activation_clamp": -1.0}, "activation_clamp"),
         ({"activation_clamp": -float("inf")}, "activation_clamp"),
+        ({"global_num_tokens": -1}, "global_num_tokens must be between"),
+        ({"global_num_tokens": sym_buffer.num_ranks * sym_buffer.num_max_tokens_per_rank + 1},
+         "global_num_tokens must be between"),
         ({"situ_beta": float("nan")}, "SiTU parameters|situ_beta"),
         ({"situ_linear_beta": 0.0}, "SiTU parameters|situ_beta"),
     ):
@@ -965,9 +969,16 @@ def test_mega_moe_smoke_nan_slots(mega_moe_smoke):
         sample.w2[1].copy_(saved_scale)
 
 
+def _assert_gemm_estimates(log, expected, stages):
+    entries = re.findall(r"em:(\d+),gpu:\d+,stage:(\w+)", log)
+    for stage in stages:
+        observed = {int(em) for em, name in entries if name == stage}
+        assert observed == expected, (stage, observed, expected)
+
+
 @torch.inference_mode()
 def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=False,
-                  replicas=False, verbose=True, fast_math=True):
+                  replicas=False, verbose=True, fast_math=True, use_global_num_tokens=False):
     """Run the public complete operator against an independent mathematical reference."""
     rank_idx, num_ranks = dist.get_rank(), dist.get_world_size()
     num_experts_per_rank = case.experts // num_ranks
@@ -984,8 +995,12 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
         expected_rows = num_ranks * sym_buffer.num_max_tokens_per_rank * min(case.topk, num_experts_per_rank)
         assert sym_buffer.l2_acts.size(0) == expected_rows
         for requested in case.tokens:
-            empty_rank = edge_cases and num_ranks > 1 and requested == 1 and rank_idx == num_ranks - 1
-            num_tokens = 0 if empty_rank else requested
+            global_num_tokens = requested if use_global_num_tokens else None
+            if use_global_num_tokens:
+                num_tokens = requested if rank_idx == 0 else 0
+            else:
+                empty_rank = edge_cases and num_ranks > 1 and requested == 1 and rank_idx == num_ranks - 1
+                num_tokens = 0 if empty_rank else requested
             topk_idx = _make_routes(case, case.capacity, rng)
             topk_weights = torch.rand(case.capacity, case.topk, device="cuda", generator=rng).softmax(-1)
             topk_idx[num_tokens:], topk_weights[num_tokens:] = -1, 0
@@ -996,7 +1011,8 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
             routed_idx, routed_weights = topk_idx[:num_tokens], topk_weights[:num_tokens]
             y = torch.empty_like(x)
 
-            def run_fused(cumulative_local_expert_recv_stats=None):
+            def run_fused(cumulative_local_expert_recv_stats=None, *,
+                          y=y, global_num_tokens=global_num_tokens):
                 deep_gemm.mega_moe_pre_dispatch(
                     x, routed_idx, routed_weights,
                     sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
@@ -1006,7 +1022,8 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
                     cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                     activation=case.activation, activation_clamp=case.clamp, fast_math=fast_math,
                     situ_beta=case.situ_beta, situ_linear_beta=case.situ_linear_beta,
-                    activation_alpha=case.activation_alpha, **replica_options)
+                    activation_alpha=case.activation_alpha,
+                    global_num_tokens=global_num_tokens, **replica_options)
                 return y
 
             report = _check_mega_moe(
@@ -1055,6 +1072,18 @@ def test_mega_moe_physical_experts(case, mega_moe_group):
         pytest.skip("requires multiple local physical experts")
     _run_mega_moe(replace(case, routing="random"), mega_moe_group,
                   replicas=True, edge_cases=True, verbose=False)
+
+
+@pytest.mark.skipif(os.getenv("PPU_LIB_SHOW_PARAMS") != "1", reason="requires MegaMoE launch parameter logging")
+def test_mega_moe_global_num_tokens(mega_moe_group, capfd):
+    assert mega_moe_group.size() == 2, "requires two EP ranks"
+    case = replace(CASES[0], tokens=(129,))
+    capfd.readouterr()
+    [report] = _run_mega_moe(case, mega_moe_group, edge_cases=True, verbose=False, use_global_num_tokens=True)
+    assert report["tokens_per_rank"] == [129, 0]
+    # ceil(129 tokens * top-2 / 8 experts) is 33 on both ranks.
+    _assert_gemm_estimates(capfd.readouterr().out, {33},
+                           ("sm89_fp4_fp4_mega_moe_l1", "sm89_fp4_fp4_mega_moe_l2"))
 
 
 def test_mega_moe_smoke_grouped_workspace(mega_moe_group):

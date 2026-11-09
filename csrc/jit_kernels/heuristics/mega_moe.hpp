@@ -23,12 +23,16 @@
 
 namespace deep_gemm::mega {
 
-// Rank-local token counts describe a uniform-routing estimate, not measured
-// expert loads. Cap it by the owning workspace's per-expert row capacity.
-inline int expected_expert_rows(int tokens, int topk, int groups, int ranks, int capacity) {
+// Estimate incoming rows under uniform routing and cap the estimate by the
+// owning workspace's per-expert row capacity.
+inline int expected_expert_rows(int tokens, int topk, int groups, int ranks, int capacity,
+                                std::optional<int64_t> global_num_tokens = std::nullopt) {
     DG_HOST_ASSERT(tokens >= 0 && topk > 0 && groups > 0 && ranks > 0 && capacity >= 0);
     const int64_t owner_capacity = int64_t(ranks) * capacity;
-    return std::max<int64_t>(1, std::min(owner_capacity, int64_t(tokens) * topk / groups + 1));
+    const int64_t rows = global_num_tokens
+        ? ceil_div<int64_t>(*global_num_tokens * topk, int64_t(groups) * ranks)
+        : int64_t(tokens) * topk / groups + 1;
+    return std::max<int64_t>(1, std::min(owner_capacity, rows));
 }
 
 enum class MmaKind { BF16, MXFP8FP4, MXFP4 };
@@ -357,7 +361,7 @@ inline Gemm1Config make_fp8_gemm1_config(int ranks, int experts, int topk, int h
     c.dispatch.block_m = bm;
     return c;
 }
-inline void fp8_gemm1_config(Gemm1Config& c, int tokens, const Gemm1Tuning& tuning,
+inline void fp8_gemm1_config(Gemm1Config& c, int expected, const Gemm1Tuning& tuning,
                              std::optional<int> block_m = std::nullopt) {
     // Pull reads unpadded source rows; only this rank's landing pool and GEMM
     // metadata use BM. Workspace offsets and peer handshakes are independent
@@ -365,8 +369,6 @@ inline void fp8_gemm1_config(Gemm1Config& c, int tokens, const Gemm1Tuning& tuni
     const auto requested = block_m ? block_m : tuning.block_m;
     const std::vector<int> allowed = requested ? std::vector<int>{fp8_dispatch_block_m(requested, false)}
                                               : std::vector<int>{256, 128, 64, 32, 16};
-    const int expected = mega::expected_expert_rows(tokens, c.dispatch.num_topk, c.dispatch.num_experts_per_rank,
-                                                      c.dispatch.num_ranks, c.dispatch.nmtpr);
     const auto supported = [&](const Tile& tile) {
         const auto [bm, bn, bk, wm, wn, stages] = tile;
         return (bm == 16 || bm == 32 || bm == 64 || bm == 128 || bm == 256) && (bn == 128 || bn == 256) &&
@@ -431,11 +433,10 @@ inline int blockwise_compute_m(std::optional<int> expected_m, int groups, int n,
                                                                                                               : 128;
 }
 
-inline void fp8_blockwise_gemm1_config(Gemm1Config& c, int tokens, int n, const Gemm1Tuning& tuning) {
+inline void fp8_blockwise_gemm1_config(Gemm1Config& c, int expected, int n, const Gemm1Tuning& tuning) {
     c.dispatch.block_m = fp8_dispatch_block_m(c.dispatch.block_m, true);
     const int groups = c.dispatch.num_experts_per_rank;
-    const int em = mega::expected_expert_rows(tokens, c.dispatch.num_topk, groups, c.dispatch.num_ranks, c.dispatch.nmtpr);
-    c.tile.block_m = tuning.block_m.value_or(blockwise_compute_m(em, groups, n, c.tile.num_sms));
+    c.tile.block_m = tuning.block_m.value_or(blockwise_compute_m(expected, groups, n, c.tile.num_sms));
     TORCH_CHECK(c.tile.block_m == 128 || c.tile.block_m == 32 || c.tile.block_m == 192,
                 "FP8 blockwise GEMM1 requires compute block_m=32, 128 or 192");
     TORCH_CHECK(!tuning.tile, "blockwise GEMM1 accepts block_m, not a full tile override");
@@ -585,9 +586,7 @@ inline auto w4a16_scatter_config(int em, int n, int k, std::optional<PPUW4Config
     return c;
 }
 
-inline int fp8_gemm1_ctas(const Gemm1Config& c, int tokens, int pulls) {
-    const int expected = mega::expected_expert_rows(tokens, c.dispatch.num_topk, c.dispatch.num_experts_per_rank,
-                                                      c.dispatch.num_ranks, c.dispatch.nmtpr);
+inline int fp8_gemm1_ctas(const Gemm1Config& c, int expected, int pulls) {
     const int64_t jobs = int64_t(c.dispatch.num_experts_per_rank) * ceil_div(expected, c.tile.block_m) *
                          ceil_div(c.n, c.tile.block_n);
     const int work = std::min<int64_t>(4, ceil_div(jobs + pulls, int64_t(c.tile.num_sms)));
@@ -627,16 +626,21 @@ struct MegaMoEPrecisionConfigs {
 
 inline const MegaMoEPrecisionConfigs& get_mega_moe_precision_configs(
     Precision precision, int ranks, int experts, int topk, int hidden, int intermediate,
-    int capacity, int tokens, int masters, const std::string& activation, int device) {
-    using Key = std::tuple<Precision, int, int, int, int, int, int, int, int, std::string, int, int>;
+    int capacity, int tokens, int masters, const std::string& activation, int device,
+    const std::optional<int64_t>& global_num_tokens) {
+    const int groups = experts / ranks;
+    const int expected = mega::expected_expert_rows(tokens, topk, groups, ranks, capacity, global_num_tokens);
+    // Tuning table buckets represent input tokens per rank.
+    const int tuning_tokens = global_num_tokens
+        ? static_cast<int>(ceil_div<int64_t>(*global_num_tokens, ranks))
+        : tokens;
+    using Key = std::tuple<Precision, int, int, int, int, int, int, int, int, int, std::string, int, int>;
     static thread_local std::map<Key, MegaMoEPrecisionConfigs> cache;
     const Key key{precision, ranks, experts, topk, hidden, intermediate,
-                  capacity, tokens, masters, activation, device, get_num_sms()};
+                  capacity, tuning_tokens, expected, masters, activation, device, get_num_sms()};
     if (const auto found = cache.find(key); found != cache.end())
         return found->second;
-    const auto tuning = tuning_config({precision, ranks, experts, topk, hidden, intermediate, tokens, activation});
-    const int groups = experts / ranks;
-    const int expected = mega::expected_expert_rows(tokens, topk, groups, ranks, capacity);
+    const auto tuning = tuning_config({precision, ranks, experts, topk, hidden, intermediate, tuning_tokens, activation});
     MegaMoEPrecisionConfigs result;
     result.expected_m = expected;
     if (precision == Precision::W4A16) {
@@ -684,15 +688,15 @@ inline const MegaMoEPrecisionConfigs& get_mega_moe_precision_configs(
         c.n = 2 * intermediate;
         c.master_experts = masters;
         if (blockwise) {
-            fp8_blockwise_gemm1_config(c, tokens, 2 * intermediate, tuning.gemm1);
+            fp8_blockwise_gemm1_config(c, expected, 2 * intermediate, tuning.gemm1);
             result.l2 = fp8_blockwise_scatter_config(hidden, intermediate, groups, masters, expected, tuning.gemm2);
         } else {
-            fp8_gemm1_config(c, tokens, tuning.gemm1);
+            fp8_gemm1_config(c, expected, tuning.gemm1);
             result.l2 = channel_scatter_policy(expected, hidden, intermediate, groups, masters, capacity, true,
                 std::nullopt, std::nullopt, std::nullopt, tuning.gemm2).second;
         }
         c.tile.smem_size = fp8_gemm1_smem_size(c, blockwise);
-        c.num_ctas = fp8_gemm1_ctas(c, tokens, c.dispatch.pull_ctas);
+        c.num_ctas = fp8_gemm1_ctas(c, expected, c.dispatch.pull_ctas);
         result.l1 = c;
         result.l2.num_sms = c.tile.num_sms;
     }

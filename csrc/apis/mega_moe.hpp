@@ -208,6 +208,13 @@ static void mega_moe_pre_dispatch(
         hidden, intermediate_hidden, top_k, mega_buffer.staging);
 }
 
+static void check_global_num_tokens(const std::optional<int64_t>& global_num_tokens,
+                                    int num_ranks, int num_max_tokens_per_rank) {
+    const int64_t owner_capacity = int64_t(num_ranks) * num_max_tokens_per_rank;
+    TORCH_CHECK(!global_num_tokens || (*global_num_tokens >= 0 && *global_num_tokens <= owner_capacity),
+                "global_num_tokens must be between 0 and EP group token capacity");
+}
+
 // Python owns one symmetric allocation; C++ slices it and submits computation.
 static void fp4_fp4_mega_moe(
     const torch::Tensor& y,
@@ -224,7 +231,8 @@ static void fp4_fp4_mega_moe(
     const std::optional<float>& activation_alpha_opt,
     const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& l1_weights_replicas,
     const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& l2_weights_replicas,
-    const std::array<int, 3>& staging_config) {
+    const std::array<int, 3>& staging_config,
+    const std::optional<int64_t>& global_num_tokens) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
@@ -340,8 +348,9 @@ static void fp4_fp4_mega_moe(
     const auto mega_buffer = layout::MegaMoEBuffer(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging);
     check_mega_moe_buffer(sym_buffer, mega_buffer);
+    check_global_num_tokens(global_num_tokens, num_ranks, num_max_tokens_per_rank);
     const int em = expected_expert_rows(num_tokens, num_topk, num_experts_per_rank_with_replicas,
-                                        num_ranks, num_max_tokens_per_rank);
+                                        num_ranks, num_max_tokens_per_rank, global_num_tokens);
 
     const auto [arch_major, arch_minor] = device_runtime->get_arch_pair();
     if (arch_major != 8 || arch_minor != 9)
@@ -540,7 +549,8 @@ static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, cons
                             const std::optional<float>& situ_linear_beta_opt,
                             const std::optional<float>& activation_alpha_opt,
                             const std::optional<WeightPair>& l1_weights_replicas,
-                            const std::optional<WeightPair>& l2_weights_replicas) {
+                            const std::optional<WeightPair>& l2_weights_replicas,
+                            const std::optional<int64_t>& global_num_tokens) {
     check_device();
     const auto kind = routed_precision(precision);
     const bool fp8 = precision != "w4a16", blockwise = precision == "fp8_blockwise";
@@ -596,9 +606,10 @@ static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, cons
     } else
         TORCH_CHECK(masters == groups, "Weights must contain all local physical experts");
     check_routed_buffer(sym_buffer, l);
+    check_global_num_tokens(global_num_tokens, num_ranks, num_max_tokens_per_rank);
     const auto& configs = get_mega_moe_precision_configs(
         kind, num_ranks, num_experts, num_topk, hidden, intermediate_hidden, num_max_tokens_per_rank,
-        num_tokens, masters, activation, y.device().index());
+        num_tokens, masters, activation, y.device().index(), global_num_tokens);
     const auto& l1_replicas = l1_weights_replicas ? *l1_weights_replicas : l1_weights;
     const auto& l2_replicas = l2_weights_replicas ? *l2_weights_replicas : l2_weights;
     if constexpr (kFp8) {
@@ -621,12 +632,13 @@ void fp8_fp8_mega_moe(
     const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
     const std::optional<float>& activation_alpha_opt,
     const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas,
-    const std::string& quantization) {
+    const std::string& quantization, const std::optional<int64_t>& global_num_tokens) {
     checked_mega_moe<true>(
         y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats, sym_buffer,
         sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank, num_experts, num_topk,
         fp8_mega_moe_precision(quantization), activation, activation_clamp_opt, fast_math,
-        std::nullopt, std::nullopt, activation_alpha_opt, l1_weights_replicas, l2_weights_replicas);
+        std::nullopt, std::nullopt, activation_alpha_opt, l1_weights_replicas, l2_weights_replicas,
+        global_num_tokens);
 }
 
 void bf16_fp4_mega_moe(
@@ -636,12 +648,13 @@ void bf16_fp4_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
     const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
-    const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas) {
+    const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas,
+    const std::optional<int64_t>& global_num_tokens) {
     checked_mega_moe<false>(
         y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats, sym_buffer,
         sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank, num_experts, num_topk, "w4a16",
         activation, activation_clamp_opt, fast_math, situ_beta_opt, situ_linear_beta_opt, std::nullopt,
-        l1_weights_replicas, l2_weights_replicas);
+        l1_weights_replicas, l2_weights_replicas, global_num_tokens);
 }
 
 
@@ -653,7 +666,8 @@ void fp8_fp4_mega_moe(
     const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
     const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
     const std::optional<float>& activation_alpha_opt,
-    const std::optional<W4A8Weights>& l1_weights_replicas, const std::optional<W4A8Weights>& l2_weights_replicas) {
+    const std::optional<W4A8Weights>& l1_weights_replicas, const std::optional<W4A8Weights>& l2_weights_replicas,
+    const std::optional<int64_t>& global_num_tokens) {
     check_device();
     const auto activation_kind = parse_gated_activation(activation);
     TORCH_CHECK(activation_kind == GatedActivation::SwiGLU || activation_kind == GatedActivation::SwiGLUOAI ||
@@ -698,9 +712,10 @@ void fp8_fp4_mega_moe(
                     "Receive statistics must contain one INT32 per local physical expert on the output device");
     }
     check_routed_buffer(sym_buffer, l);
+    check_global_num_tokens(global_num_tokens, ranks, num_max_tokens_per_rank);
     const auto& configs = get_mega_moe_precision_configs(
         Precision::W4A8, ranks, num_experts, num_topk, hidden, intermediate,
-        num_max_tokens_per_rank, tokens, masters, activation, y.device().index());
+        num_max_tokens_per_rank, tokens, masters, activation, y.device().index(), global_num_tokens);
     fp8_fp4_mega_moe_impl(y, l1_weights_tuple, l2_weights_tuple,
         l1_weights_replicas ? *l1_weights_replicas : l1_weights_tuple,
         l2_weights_replicas ? *l2_weights_replicas : l2_weights_tuple,
