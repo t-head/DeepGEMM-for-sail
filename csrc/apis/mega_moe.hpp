@@ -6,6 +6,7 @@
 
 #include "../jit_kernels/impls/sm89_fp4_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm89_fp8_fp8_mega_moe.hpp"
+#include "../jit_kernels/impls/sm89_bf16_fp4_mega_moe.hpp"
 #include "../jit_kernels/heuristics/mega_moe.hpp"
 
 namespace deep_gemm::mega {
@@ -51,7 +52,7 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_shared_experts = 0,
     const std::array<int, 3>& staging_config = {},
     const std::optional<std::string>& quantization = std::nullopt) {
-    const bool routed = mma_type == "fp8xfp8";
+    const bool routed = mma_type == "fp8xfp8" || mma_type == "bf16xmxfp4";
     if (!routed) {
         const auto mma_kind = parse_mma_kind(mma_type);
         DG_HOST_ASSERT(mma_kind == MmaKind::MXFP4);
@@ -61,7 +62,11 @@ get_symm_buffer_size_for_mega_moe(
     TORCH_CHECK(mma_type == "fp8xfp8" || !quantization,
                 "quantization applies only to fp8xfp8 workspaces");
     if (routed) {
-        const auto precision = fp8_mega_moe_precision(quantization.value_or("channelwise"));
+        std::string precision;
+        if (mma_type == "fp8xfp8")
+            precision = fp8_mega_moe_precision(quantization.value_or("channelwise"));
+        else
+            precision = "w4a16";
         const bool supported_activation = precision == "w4a16" ? activation_kind == GatedActivation::SiTU :
             activation_kind == GatedActivation::SwiGLU || activation_kind == GatedActivation::SwiGLUOAI ||
             (precision == "w4a8" && activation_kind == GatedActivation::SiTU);
@@ -134,7 +139,7 @@ static void mega_moe_pre_dispatch(
     if (owner.attr("mma_type").cast<std::string>() != mma_type)
         throw pybind11::value_error("mma_type must match the output views' MegaMoE SymmBuffer");
     if (mma_type != "mxf4xmxf4") {
-        TORCH_CHECK(mma_type == "fp8xfp8",
+        TORCH_CHECK(mma_type == "fp8xfp8" || mma_type == "bf16xmxfp4",
                     "Unsupported MegaMoE mma_type: ", mma_type);
         routed_mega_moe_pre_dispatch(x, topk_idx, topk_weights, buf_x, buf_x_sf,
                                     buf_topk_idx, buf_topk_weights, num_tokens);
@@ -464,7 +469,13 @@ static void fp8_w4a16_mega_moe_pre_dispatch_checked(const Tensor& hidden_states,
     const auto device = x.device();
     for (const auto& t : {hidden_states, topk_idx, topk_weights, x_sf, staged_topk_idx, staged_topk_weights})
         TORCH_CHECK(t.device() == device, "pre-dispatch tensors must share the workspace device");
-    {
+    if (x.scalar_type() == torch::kBFloat16) {
+        check_tensor(x, torch::kBFloat16);
+        check_shape(x_sf, {num_max_tokens_per_rank, 0});
+        w4a16_mega_moe_pre_dispatch_impl(
+            hidden_states, topk_idx, topk_weights, x, staged_topk_idx,
+            staged_topk_weights, num_tokens, hidden, num_topk);
+    } else {
         check_tensor(x, torch::kFloat8_e4m3fn);
         const bool blockwise = x_sf.size(1) != 1;
         check_shape(x_sf, {num_max_tokens_per_rank, blockwise ? hidden / 128 : 1});
@@ -591,6 +602,10 @@ static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, cons
             y, l1_weights, l2_weights, l1_replicas, l2_replicas, sym_buffer.data_ptr<uint8_t>(), l, transport, rank_idx, num_tokens,
             activation_kind, activation_clamp_opt && std::isfinite(*activation_clamp_opt) ? *activation_clamp_opt : -1.0f,
             fast_math, activation_params.alpha, configs, kind, cumulative_local_expert_recv_stats);
+    } else {
+        bf16_fp4_mega_moe_impl(
+            y, l1_weights, l2_weights, l1_replicas, l2_replicas, sym_buffer.data_ptr<uint8_t>(), l, transport, rank_idx, num_tokens,
+            fast_math, activation_params.beta, activation_params.linear_beta, configs, cumulative_local_expert_recv_stats);
     }
 }
 
@@ -610,7 +625,24 @@ void fp8_fp8_mega_moe(
         std::nullopt, std::nullopt, activation_alpha_opt, l1_weights_replicas, l2_weights_replicas);
 }
 
+void bf16_fp4_mega_moe(
+    const Tensor& y, const WeightPair& l1_weights_tuple, const WeightPair& l2_weights_tuple,
+    const OptTensor& cumulative_local_expert_recv_stats, const Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx, const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
+    const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
+    const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas) {
+    checked_mega_moe<false>(
+        y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats, sym_buffer,
+        sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank, num_experts, num_topk, "w4a16",
+        activation, activation_clamp_opt, fast_math, situ_beta_opt, situ_linear_beta_opt, std::nullopt,
+        l1_weights_replicas, l2_weights_replicas);
+}
+
+
 static void register_apis(pybind11::module_& m) {
+    m.def("bf16_fp4_mega_moe", &bf16_fp4_mega_moe);
     m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe);
     m.def("fp4_fp4_mega_moe", &fp4_fp4_mega_moe);
     m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch);

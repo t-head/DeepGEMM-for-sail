@@ -87,7 +87,7 @@ helpers. Both use the public complete call.
 Other architecture pytest runs skip these tests; CLI use reports an
 unsupported-device error.
 
-`test_mega_moe_precisions.py` exercises FP8 channelwise, FP8 blockwise
+`test_mega_moe_precisions.py` exercises FP8 channelwise, FP8 blockwise, W4A16
 through their public complete calls. Its default model cases are listed below;
 all token counts are per rank. CLI options can select other counts within capacity.
 
@@ -98,6 +98,8 @@ all token counts are per rank. CLI options can select other counts within capaci
 | `qwen38_flash` | FP8 channelwise | 4 | 1024, 2048, 4096 |
 | `minimax_m3` (open-source model) | FP8 channelwise | 8 | 1024, 2048, 4096 |
 | `minimax_m3_blockwise` (next-generation model) | FP8 blockwise | 8, 16, 32, 64 | 64, 1024, 2048, 4096 |
+| `kimi_k3` | W4A16 | 8, 16 | 1024, 2048, 4096 |
+| `kimi_k3_decode` | W4A16 | 32 | 4, 8, 16, 32, 64, 128 |
 
 Small distributed cases cover separate replicas, both math modes, OAI/clamp,
 empty ranks, consecutive changing routes, statistics and graph replay.
@@ -112,7 +114,7 @@ routing IDs and rejected mismatched token counts. Slice input prefixes at the
 call site: `num_tokens` must equal the number of rows passed to pre-dispatch.
 All precisions use the common workspace entry point for complete-pipeline checks,
 including compatible `SymmBuffer` base aliases.
-Activation-reuse cases switch supported activations on
+Activation-reuse cases switch supported activations and SiTU coefficients on
 one allocation, then replay earlier graphs to check that later calls do not
 change their behavior. Unsupported activations remain rejected.
 Accuracy uses `deep_gemm.testing.calc_diff < 0.001`, matching grouped FP8
@@ -127,11 +129,11 @@ python -m pytest -q -s --disable-warnings -x tests/test_mega_moe_precisions.py -
 torchrun --standalone --nproc-per-node=2 -m pytest -q -s --disable-warnings -x \
   tests/test_mega_moe_precisions.py -k smoke
 torchrun --standalone --nproc-per-node=8 tests/test_mega_moe_precisions.py \
-  --case glm52 --tokens 1024 2048 4096 --routing random --reference-tokens 8 \
+  --case kimi_k3 --tokens 1024 2048 4096 --routing random --reference-tokens 8 \
   --benchmark --warmup 10 --iterations 100 --repeats 5
 # The same benchmark can be invoked directly; --precision selects its case table.
 torchrun --standalone --nproc-per-node=8 tests/bench_mega_moe.py \
-  --precision fp8_channelwise --case glm52 --tokens 1024 2048 4096 --routing random \
+  --precision w4a16 --case kimi_k3 --tokens 1024 2048 4096 --routing random \
   --reference-tokens 8 --warmup 10 --iterations 100 --repeats 5
 ```
 
@@ -197,7 +199,7 @@ torchrun --standalone --nproc-per-node=8 tests/bench_mega_moe.py \
 
 # SiTU correctness and performance with duplicated physical expert slots.
 torchrun --standalone --nproc-per-node=8 tests/bench_mega_moe.py \
-  --case glm52 --num-tokens 1024 2048 4096 --routing random --replicas \
+  --case kimi_k3 --num-tokens 1024 2048 4096 --routing random --replicas \
   --reference-tokens 8
 ```
 

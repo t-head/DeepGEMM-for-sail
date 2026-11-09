@@ -199,6 +199,17 @@ inline int combine_num_threads(int tokens, int hidden) {
 }
 
 using PPUW4ConfigTuple = std::tuple<int, int, int, int, int, int, int, int>;
+inline deep_gemm_w4a16_common::W4A16Config ppu_w4_config(int em, int n, int k,
+                                                         std::optional<PPUW4ConfigTuple> requested) {
+    using namespace deep_gemm_w4a16_common;
+    if (requested) {
+        const auto& [ns, bm, bn, bk, wm, wn, wk, s] = *requested;
+        return {ns, bm, bn, bk, wm, wn, wk, s, 1};
+    }
+    return get_best_configs(em, n, k, 1, get_num_sms(), GemmType::MGroupedNoPad,
+                           W4A16Type::mxfp4_e8m0_mma, /*single_k_warp=*/true, /*full_n_tiles=*/true);
+}
+
 // Transport geometry is independent of the GEMM1 compute tile.
 struct DispatchConfig {
     int block_m = 0;
@@ -264,6 +275,11 @@ inline int fp8_gemm1_smem_size(const Gemm1Config& c, bool blockwise) {
     return std::max(compute, dispatch);
 }
 
+inline int64_t w4a16_scatter_smem_size(const deep_gemm_w4a16_common::W4A16Config& c) {
+    const int64_t scratch = int64_t(c.block_m) * (c.block_n / 2 + 4) * sizeof(uint32_t);
+    return std::max<int64_t>(deep_gemm_w4a16_common::get_smem_config(c, true, 1, 32), scratch);
+}
+
 inline int channel_pull_group_size(const Gemm1Config& c, int expected_rows) {
     constexpr int default_teams = 3;
     const bool one_batch = std::min(expected_rows, c.tile.block_m) <= c.num_threads / 32;
@@ -282,6 +298,9 @@ inline TuningConfig tuning_config(const TuningWorkload& workload) {
 inline int threads(int bm, int bn, int wm, int wn) {
     TORCH_CHECK(wm > 0 && wn > 0 && bm % wm == 0 && bn % wn == 0, "Invalid MegaMoE warp tile");
     return bm / wm * (bn / wn) * 32;
+}
+inline PreDispatchConfig w4a16_pre_dispatch_config(int hidden, int topk) {
+    return {256, hidden, get_num_sms(), topk};
 }
 inline int dispatch_pull_slots(int num_launch_threads, int token_bytes, int scale_bytes) {
     // Match the device pull-staging limit; pull and GEMM reuse this storage.
@@ -463,6 +482,44 @@ inline ScatterConfig fp8_blockwise_scatter_config(int n, int k, int groups, int 
     return c;
 }
 
+inline Gemm1Config w4a16_gemm1_config(Gemm1Config c, int n, int expected,
+                                        const Gemm1Tuning& tuning) {
+    c.n = n;
+    // Transport padding and the MMA tile have independent purposes. Preserve
+    // the selected compute tile when configuring transport.
+    const auto generic = ppu_w4_config(expected, n, c.dispatch.token_bytes / 2, std::nullopt);
+    const auto t = tuning.tile.value_or(Tile{generic.block_m, generic.block_n, generic.block_k,
+                                             generic.warp_m, generic.warp_n, generic.num_stages});
+    c.tile.block_m = t[0];
+    c.tile.block_n = t[1];
+    c.tile.block_k = t[2];
+    c.tile.warp_m = t[3];
+    c.tile.warp_n = t[4];
+    c.warp_k = t[2];
+    c.tile.num_stages = t[5];
+    c.num_threads = threads(c.tile.block_m, c.tile.block_n, c.tile.warp_m, c.tile.warp_n);
+    c.dispatch.pull_slots = dispatch_pull_slots(c.num_threads, c.dispatch.token_bytes, c.dispatch.sf_bytes);
+    const deep_gemm_w4a16_common::W4A16Config mma{
+        c.tile.num_sms, t[0], t[1], t[2], t[3], t[4], t[2], t[5], 1};
+    const int smem = std::max(deep_gemm_w4a16_common::get_smem_config(mma, true, 1, 32),
+                              c.dispatch.pull_slots * (c.dispatch.token_bytes + c.dispatch.sf_bytes));
+    c.tile.smem_size = std::max(smem, c.dispatch.num_experts * 4);
+    const auto prop = device_runtime->get_prop();
+    // Match ordinary GEMM's eight-CTA occupancy cap. These resource bounds
+    // avoid under-launching small tiles; compiled register use is checked later.
+    const int resident = std::min({8, prop->maxThreadsPerMultiProcessor / c.num_threads,
+                                   int(prop->sharedMemPerMultiprocessor / smem)});
+    TORCH_CHECK(resident > 0, "W4A16 GEMM1 cannot keep a CTA resident");
+    c.num_ctas = c.tile.num_sms * resident;
+    TORCH_CHECK(c.num_ctas > 1, "W4A16 GEMM1 requires pull and compute CTAs");
+    const int pull_groups = std::max(1, c.tile.num_sms / 4);
+    c.dispatch.pull_ctas = std::clamp(tuning.pull_ctas.value_or(pull_groups), 1, c.num_ctas - 1);
+    // A larger measured pull budget cooperates on each block rather than
+    // increasing the number of independent transport streams.
+    c.dispatch.pull_group_size = int(ceil_div(c.dispatch.pull_ctas, pull_groups));
+    return c;
+}
+
 inline std::pair<Config, ScatterConfig>
 channel_scatter_policy(int expected_m, int n, int k, int groups, int masters, int capacity, bool padded,
                        std::optional<Config> requested, std::optional<std::string> kernel_override,
@@ -504,6 +561,21 @@ channel_scatter_policy(int expected_m, int n, int k, int groups, int masters, in
     return {*requested, c};
 }
 
+inline auto w4a16_scatter_config(int em, int n, int k, std::optional<PPUW4ConfigTuple> configs,
+                                 const Gemm2Tuning& tuning = {}) {
+    TORCH_CHECK(n > 0 && n % 256 == 0, "W4A16 scatter requires N divisible by 256");
+    if (!configs && tuning.tile) {
+        const auto& t = *tuning.tile;
+        configs = PPUW4ConfigTuple{get_num_sms(), t[0], t[1], t[2], t[3], t[4], t[2], t[5]};
+    }
+    auto c = ppu_w4_config(em, n, k, configs);
+    TORCH_CHECK(c.block_n > 0 && c.block_n % 256 == 0 && n % c.block_n == 0,
+                "W4A16 scatter requires complete 256-column tiles");
+    TORCH_CHECK(w4a16_scatter_smem_size(c) <= 256 * 1024,
+                "W4A16 scatter tile exceeds shared memory capacity");
+    return c;
+}
+
 inline int fp8_gemm1_ctas(const Gemm1Config& c, int tokens, int pulls) {
     const int expected = mega::expected_expert_rows(tokens, c.dispatch.num_topk, c.dispatch.num_experts_per_rank,
                                                       c.dispatch.num_ranks, c.dispatch.nmtpr);
@@ -535,7 +607,19 @@ inline const MegaMoEPrecisionConfigs& get_mega_moe_precision_configs(
     const int expected = mega::expected_expert_rows(tokens, topk, groups, ranks, capacity);
     MegaMoEPrecisionConfigs result;
     result.expected_m = expected;
-    {
+    if (precision == Precision::W4A16) {
+        auto c = make_gemm1_config(ranks, experts, topk, capacity, hidden * 2, 0);
+        c.dispatch.block_m = tuning.buffer.block_m.value_or(64);
+        result.l1 = w4a16_gemm1_config(c, 2 * intermediate, expected, tuning.gemm1);
+        const auto tile = w4a16_scatter_config(expected, hidden, intermediate, std::nullopt, tuning.gemm2);
+        auto& g2 = result.l2;
+        g2.num_sms = tile.num_sms;
+        g2.block_m = tile.block_m; g2.block_n = tile.block_n; g2.block_k = tile.block_k;
+        g2.warp_m = tile.warp_m; g2.warp_n = tile.warp_n; g2.warp_k = tile.warp_k;
+        g2.num_stages = tile.num_stages;
+        g2.num_threads = deep_gemm_w4a16_common::get_num_threads(tile, true);
+        g2.smem_size = w4a16_scatter_smem_size(tile);
+    } else {
         const bool blockwise = precision == Precision::FP8Blockwise;
         auto c = make_fp8_gemm1_config(ranks, experts, topk, hidden, capacity, std::nullopt, blockwise);
         c.n = 2 * intermediate;
