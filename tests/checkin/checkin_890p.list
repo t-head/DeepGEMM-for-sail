@@ -93,6 +93,7 @@ MegaMhc,data_type:bf16,m:1248,hidden:5120,mode:shifted,sinkhorn_iters:20
 MegaMhc,data_type:bf16,m:4096,hidden:5120,mode:shifted,sinkhorn_iters:20
 MegaMhc,data_type:bf16,m:8192,hidden:5120,mode:shifted,sinkhorn_iters:20
 MegaMhc,data_type:bf16,m:9984,hidden:5120,mode:shifted,sinkhorn_iters:20
+MegaMhc,data_type:fp8,m:1248,hidden:5120,mode:shifted,sinkhorn_iters:20,sf_layout:token,store_bf16:1
 
 # ============ BatchGemm ============
 

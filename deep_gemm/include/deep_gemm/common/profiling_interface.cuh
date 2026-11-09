@@ -183,7 +183,7 @@ void set_k_grouped_params(int m, int n, int sum_k, const std::vector<int>& ks,
         add_params("separate_c", separate_c);
 }
 
-void set_mega_mhc_params(int m, int hidden, int sinkhorn_iters, hggcStream_t stream = 0) {
+void set_mega_mhc_params(std::string data_type, int m, int hidden, int sinkhorn_iters, hggcStream_t stream = 0) {
     op_name_ = "MegaMhc";
     add_argument("data_type");
     add_argument("m");
@@ -191,7 +191,7 @@ void set_mega_mhc_params(int m, int hidden, int sinkhorn_iters, hggcStream_t str
     add_argument("mode");
     add_argument("sinkhorn_iters");
 
-    add_params("data_type", "bf16");
+    add_params("data_type", data_type);
     add_params("m", m);
     add_params("hidden", hidden);
     add_params("mode", "shifted");

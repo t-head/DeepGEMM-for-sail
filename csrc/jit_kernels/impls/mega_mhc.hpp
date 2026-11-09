@@ -5,7 +5,7 @@
 #include "../../utils/utils.hpp"
 #include <deep_gemm/common/profiling_interface.cuh>
 #define DG_MHC_ARGS_ONLY
-#include <deep_gemm/impls/ppu_mega_mhc_bf16.cuh>
+#include <deep_gemm/impls/ppu_mega_mhc.cuh>
 #undef DG_MHC_ARGS_ONLY
 
 namespace deep_gemm {
@@ -15,6 +15,9 @@ public:
     struct Config {
         int hidden, splits, iterations, tile_m, task_splits;
         bool full_rows, single, local, tail_rows, tail_tokens, vector_coefficients;
+        bool store_bf16, store_fp8;
+        int shared_sf_block_m;
+        bool per_token_fp8;
     };
     struct Args {
         Config config;
@@ -28,15 +31,16 @@ public:
         std::string specialization;
         if (c.single) {
             specialization = fmt::format(
-                "ppu_mega_mhc_shifted_bf16_device<{},{},{},false,true,{},{},{},{},{},{}>",
+                "ppu_mega_mhc_shifted_device<{},{},{},false,true,{},{},{},{},{},{},{},{},{},{}>",
                 c.hidden, c.splits, c.iterations, c.local, c.tile_m, c.task_splits,
-                c.tail_rows, c.tail_tokens, c.vector_coefficients);
+                c.tail_rows, c.tail_tokens, c.vector_coefficients, c.store_bf16, c.store_fp8, c.shared_sf_block_m, c.per_token_fp8);
         } else {
-            specialization = fmt::format("ppu_mega_mhc_shifted_bf16_device<{},{},{},{}>",
-                                         c.hidden, c.splits, c.iterations, c.full_rows);
+            specialization = fmt::format("ppu_mega_mhc_shifted_device<{},{},{},{},false,false,32,2,false,false,true,{},{},{},{}>",
+                                         c.hidden, c.splits, c.iterations, c.full_rows,
+                                         c.store_bf16, c.store_fp8, c.shared_sf_block_m, c.per_token_fp8);
         }
         return fmt::format(R"(
-#include <deep_gemm/impls/ppu_mega_mhc_bf16.cuh>
+#include <deep_gemm/impls/ppu_mega_mhc.cuh>
 extern "C"
 __global__ __launch_bounds__({}) void {}(deep_gemm::mhc::Args args) {{
     deep_gemm::mhc::{}(args);
@@ -85,10 +89,50 @@ static void launch_mega_mhc(MegaMhcRuntime::Args args, int num_sms, int physical
         args.config.vector_coefficients = args.kernel_args.tokens != 1248;
         runtime = mhc_compiler->build(name, MegaMhcRuntime::generate(args));
     }
+    if (get_env<int>("show_log", 0)) {
+        const auto& c = args.config;
+        const auto& launch = args.launch_args;
+        int registers = 0, stack_bytes = 0, shared_bytes = 0, resident_blocks = 0;
+#if HGGCRT_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
+        hggcFuncAttributes attributes{};
+        DG_HGGC_RUNTIME_CHECK(hggcFuncGetAttributes(&attributes, runtime->kernel));
+        registers = attributes.numRegs;
+        stack_bytes = attributes.localSizeBytes;
+        shared_bytes = attributes.sharedSizeBytes;
+        DG_HGGC_RUNTIME_CHECK(hggcOccupancyMaxActiveBlocksPerMultiprocessor(
+            &resident_blocks, runtime->kernel, launch.block_dim.x, launch.smem_size));
+#else
+        DG_HGGC_DRIVER_CHECK(hgFuncGetAttribute(&registers, HG_FUNC_ATTRIBUTE_NUM_REGS, runtime->kernel));
+        DG_HGGC_DRIVER_CHECK(hgFuncGetAttribute(&stack_bytes, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, runtime->kernel));
+        DG_HGGC_DRIVER_CHECK(hgFuncGetAttribute(&shared_bytes, HG_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, runtime->kernel));
+        DG_HGGC_DRIVER_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
+            &resident_blocks, runtime->kernel, launch.block_dim.x, launch.smem_size));
+#endif
+        printf("[MegaMhc] kernel:%s path:%s hidden:%d sinkhorn_iters:%d\n"
+               "problem:[%d, 24, %d]\n"
+               "ThreadblockShape[%d, %d, 64], num_splits:%d, task_splits:%d\n"
+               "grid:[%u,%u,%u], BlockSize:%u, num_sms:%d, cooperative:%d\n"
+               "output:%s sf_layout:%s shared_sf_block_m:%d\n"
+               "smem_size:%d, vreg:%d, stack:%d, max_active_tb_num:%d\n",
+               name, c.single ? (c.local ? "local" : "persistent") : "general",
+               c.hidden, c.iterations, args.kernel_args.tokens, 4 * c.hidden,
+               c.single ? c.tile_m : 64, c.single ? 24 : 32, c.splits, c.single ? c.task_splits : 1,
+               launch.grid_dim.x, launch.grid_dim.y, launch.grid_dim.z, launch.block_dim.x, num_sms, args.cooperative,
+               c.store_fp8 ? (c.store_bf16 ? "bf16+fp8" : "fp8") : "bf16",
+               c.store_fp8 ? (c.per_token_fp8 ? "token" : c.shared_sf_block_m > 0 ? "extra" : "col") : "none",
+               c.shared_sf_block_m, shared_bytes + launch.smem_size, registers, stack_bytes, resident_blocks);
+    }
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
+        const auto& c = args.config;
         dg_prof_params.set_mega_mhc_params(
-            args.kernel_args.tokens, args.config.hidden, args.config.iterations, current_stream());
+            c.store_fp8 ? "fp8" : "bf16", args.kernel_args.tokens, c.hidden, c.iterations, current_stream());
+        if (c.store_fp8) {
+            dg_prof_params.add_params("sf_layout", c.per_token_fp8 ? "token" : c.shared_sf_block_m > 0 ? "extra" : "col");
+            dg_prof_params.add_params("store_bf16", c.store_bf16);
+            if (c.shared_sf_block_m > 0)
+                dg_prof_params.add_params("shared_sf_block_m", c.shared_sf_block_m);
+        }
         dg_prof_params.add_params("num_splits", args.config.splits);
         dg_prof_params.add_params("num_sms", num_sms);
     }
