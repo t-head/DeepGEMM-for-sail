@@ -27,7 +27,7 @@ struct alignas(256) MegaMoESignals {
 
     uint32_t grid_sync_count;
     uint64_t scatter_writer_mask;  // Passed from the standalone scatter wait to reduce.
-    alignas(16) uint32_t dispatch_retire[4];
+    alignas(16) uint32_t dispatch_retire[4];  // Token writers, then split-prepare CTAs; two banks each.
     // Each forward publishes dispatch, then scatter, before either slot is reused.
     alignas(128) uint32_t dispatch_arrivals[kNumMaxRanks];
     alignas(128) uint32_t scatter_arrivals[kNumMaxRanks];
@@ -47,6 +47,13 @@ struct Buffer {
         return reinterpret_cast<T*>(static_cast<uint8_t*>(base) + offset);
     }
 };
+
+// Pick the offset directly so the two bank descriptors stay out of thread-local memory.
+template <typename T>
+__host__ __device__ T* bank_data(const Buffer (&banks)[2], void* base, uint32_t parity) {
+    const int64_t offset = parity ? banks[1].offset : banks[0].offset;
+    return reinterpret_cast<T*>(static_cast<uint8_t*>(base) + offset);
+}
 
 // Valid routes for a token name distinct experts, including within one rank.
 __host__ __device__ constexpr int64_t max_local_routed_rows(int64_t source_tokens, int topk, int64_t local_experts) {

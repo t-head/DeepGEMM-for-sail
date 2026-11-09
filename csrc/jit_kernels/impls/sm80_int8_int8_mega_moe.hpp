@@ -111,6 +111,7 @@ public:
         uint32_t beta_bits = 0, linear_beta_bits = 0, alpha_bits = 0;
         const char* kernel_name = kName;
         bool split_sync = false;
+        Stage1RoutePolicy routes = Stage1RoutePolicy::PerToken;
     };
 
     static std::string generate_impl(const Args& a) {
@@ -124,12 +125,12 @@ public:
             else return 0;
         }();
         const auto linear = fmt::format(
-            "deep_gemm::MegaMoEInt8Kernel<{},{},{},{},{},{},{},{},{},{},deep_gemm::MegaMoEPhaseKind::{},{},{},{},{},{},{}u,deep_gemm::GatedActivation::{},{}u,{}u,{}u,{}>",
+            "deep_gemm::MegaMoEInt8Kernel<{},{},{},{},{},{},{},{},{},{},deep_gemm::MegaMoEPhaseKind::{},{},{},{},{},{},{}u,deep_gemm::GatedActivation::{},{}u,{}u,{}u,{},static_cast<deep_gemm::Stage1RoutePolicy>({})>",
             kIsLinear1 ? a.intermediate * 2 : a.hidden, kIsLinear1 ? a.hidden : a.intermediate,
             c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, a.groups, c.num_stages, Ranks,
             kIsLinear1 ? "Linear1" : "Linear2", a.capacity, a.topk, ktpf, wait_scatter_pair,
             a.apply_clamp, a.activation_limit_bits, activation, a.beta_bits, a.linear_beta_bits,
-            a.alpha_bits, a.fast_math);
+            a.alpha_bits, a.fast_math, static_cast<int>(a.routes));
         mega::ReduceConfig reduce;
         if constexpr (!kIsLinear1) {
             reduce = mega::select_reduce_config(
@@ -215,7 +216,7 @@ public:
         int n, k, block_m, block_k, groups, ranks, k_tiles_per_flag, capacity, topk, threads;
         LaunchArgs launch_args;
         sched::Int8MegaMoESchedulerArguments scheduler;
-        bool split_sync = false;
+        bool split_sync;
     };
     static std::string generate_impl(const Args& a) {
         return fmt::format(R"(
@@ -288,7 +289,7 @@ static void launch_int8_split_stage1(typename Runtime::Args& args, int num_sms, 
                    copy_threads % 32 == 0 && copy_threads <= device_runtime->get_prop()->maxThreadsPerBlock);
     constexpr int ranks = Runtime::kRanks;
     const int row_map_bytes = ceil_div(4 * ranks + 8 * tile.block_m, 16) * 16;
-    const int smem = std::max(row_map_bytes, 4 * args.groups * (ranks + 4));
+    const int smem = std::max(row_map_bytes, expert_metadata_smem_bytes(args.groups, ranks));
     Int8MegaMoECopyRuntime::Args copy_args{
         args.intermediate * 2, args.hidden, tile.block_m, tile.block_k, args.groups, ranks,
         tile.k_tiles_per_flag, args.capacity, args.topk, copy_threads,
@@ -296,18 +297,18 @@ static void launch_int8_split_stage1(typename Runtime::Args& args, int num_sms, 
 
     // Every persistent GEMM CTA computes. Copy uses a separate grid and its
     // own intensive launch instead of taking slots from the Tensor CU budget.
-    const std::array<int64_t, 25> key{
+    const std::array<int64_t, 26> key{
         args.hidden, args.intermediate, args.groups, args.capacity, args.topk,
         tile.block_m, tile.block_n, tile.block_k, tile.warp_m, tile.warp_n, tile.num_stages,
         tile.k_tiles_per_flag, copy_ctas, num_sms, threads, copy_threads, args.launch_args.smem_size,
         args.apply_clamp, args.activation_limit_bits,
         static_cast<int>(args.activation), args.beta_bits, args.linear_beta_bits, args.alpha_bits, args.fast_math,
-        args.split_sync};
+        args.split_sync, static_cast<int>(args.routes)};
     HGcontext context = nullptr;
     DG_HGGC_DRIVER_CHECK(hgCtxGetCurrent(&context));
     const auto* active_compiler = compiler.operator->();
     struct Plan {
-        std::array<int64_t, 25> key;
+        std::array<int64_t, 26> key;
         HGcontext context;
         const Compiler* compiler;
         std::string signature, flags;
@@ -348,6 +349,10 @@ static void launch_int8_split_stage1(typename Runtime::Args& args, int num_sms, 
     if (get_env<int>("show_log", 0))
         printf("[megamoe_int8_dispatch_copy] grid:%d threads:%d smem:%d compute_grid:%u\n",
                copy_ctas, copy_threads, smem, args.launch_args.grid_dim.x);
+    if (args.split_sync)
+        mega::launch_dispatch_prepare<true>({
+            args.hidden, args.intermediate, tile.block_m, args.groups, ranks, args.capacity, args.topk,
+            args.routes, args.launch_args, args.kernel_params.scheduler, args.launch_args.grid_dim.x});
     if (is_compile_only())
         return;
 
@@ -444,9 +449,8 @@ static void launch_linear1(
         typename GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks>::Args& args,
         const layout::Int8MegaMoEBuffer& buffers,
         uint8_t* base, int num_tokens, int num_sms, CopyStreamResources& streams) {
-    if (args.split_sync)
-        mega::launch_sync("mega_moe_dispatch_sync", Ranks,
-            reinterpret_cast<layout::MegaMoESignals*>(base));
+    args.kernel_params.scheduler.num_source_tokens = num_tokens;
+    args.routes = mega::select_stage1_routes(num_tokens, Ranks, args.topk, 1, args.tile, false);
     launch_int8_split_stage1<GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks>>(args, num_sms, streams);
 
     Int8MegaMoEQuantRuntime::Args quantization{
@@ -494,7 +498,7 @@ static void launch_linear2(typename GemmRuntime<MegaMoEPhaseKind::Linear2, Ranks
     using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear2, Ranks>;
     launch_gemm<Runtime>(args, num_sms);
     if (args.split_sync) {
-        mega::launch_sync("mega_moe_scatter_sync", Ranks, args.kernel_params.signals);
+        mega::launch_scatter_sync(Ranks, args.kernel_params.signals);
         args.kernel_name = Runtime::kReduceName;
         launch_gemm<Runtime>(args, num_sms);
     }

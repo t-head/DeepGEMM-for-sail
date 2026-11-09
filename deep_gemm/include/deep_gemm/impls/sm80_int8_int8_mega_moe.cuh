@@ -17,7 +17,8 @@ template <int N, int K, int BM, int BN, int BK, int WM, int WN,
           bool WaitScatterPair = false, bool ApplyClamp = false,
           uint32_t ActivationLimitBits = 0xffffffffu,
           GatedActivation Activation = GatedActivation::SwiGLU, uint32_t BetaBits = 0,
-          uint32_t LinearBetaBits = 0, uint32_t AlphaBits = 0, bool FastMath = true>
+          uint32_t LinearBetaBits = 0, uint32_t AlphaBits = 0, bool FastMath = true,
+          Stage1RoutePolicy Routes = Stage1RoutePolicy::PerToken>
 struct MegaMoEInt8Kernel {
     static_assert(Stage == MegaMoEPhaseKind::Linear1 || Stage == MegaMoEPhaseKind::Linear2,
                   "unsupported MegaMoE stage");
@@ -60,7 +61,7 @@ struct MegaMoEInt8Kernel {
         Ranks, (int64_t(TopK) * SourceCapacity * N > UINT32_MAX), false, WaitScatterPair>;
     using Epilogue = std::conditional_t<kIsLinear1, ActivationEpilogue, ScatterEpilogue>;
     using Scheduler = sched::SM80MegaMoEScheduler<N, K, BM, BN, Groups, Stage,
-        Ranks, kIsLinear1 ? KTilesPerFlag : 0, SourceCapacity, TopK, sm80::Int8FusedDispatch<BK>>;
+        Ranks, kIsLinear1 ? KTilesPerFlag : 0, SourceCapacity, TopK, sm80::Int8FusedDispatch<BK, Stages * (BM + BN) * BK, Routes>>;
     using Kernel = cutlass::gemm::kernel::DeepGemmUniversal<cute::Shape<int, int, int, int>,
         Mainloop, Epilogue, Scheduler>;
 };

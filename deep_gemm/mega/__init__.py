@@ -48,14 +48,13 @@ class SymmBuffer:
     set; the allocation can be reused across those activations. Retain the
     workspace, weights and output until execution and Graph replays complete.
 
-    x is the FP4 dispatch view in [token, hidden/2] order. x_sf is the pushed-SFA
-    staging view in [parity, source_rank, source_token, scale_block]
-    order. It is an internal output of pre-dispatch, not a source-scale input
-    that callers may fill directly. W4A8 instead exposes E4M3 x [token, hidden]
+    x is the FP4 dispatch view in [token, hidden/2] order. Its internal x_sf
+    storage holds local source scales in bank 0 and GEMM1-pushed scales in
+    bank 1; callers must not fill it directly. W4A8 instead exposes E4M3 x [token, hidden]
     and FP32 x_sf [token, 1], as does FP8 channelwise. FP8 blockwise has one
     input scale per 128 elements. W4A16 exposes BF16 x and an empty x_sf view.
-    INT8 exposes x [token, hidden] and per-source-token FP32 scales in the
-    x_sf staging view, populated by mega_moe_pre_dispatch.
+    INT8 exposes x [token, hidden] and per-source-token FP32 scales in x_sf,
+    using the same local-source and GEMM1-pushed banks as FP4.
     INT8 copy streams/events are created with the allocation, shared by aliases,
     and released with the last allocation owner after execution and Graphs retire.
     """
@@ -275,8 +274,8 @@ def mega_moe_pre_dispatch(
     other precisions use the quantization granularity fixed by their workspace.
     Input expert IDs can be int32 or int64. The workspace stores them as int64.
     Valid physical expert IDs must be distinct within each token.
-    W4A4 SFA is produced and pushed directly into internal owner staging; x_sf is not
-    a public source-scale input, and callers must use this helper to prepare it.
+    W4A4 and INT8 scales are prepared locally here and pushed by GEMM1;
+    their x_sf views are internal staging, not public source-scale inputs.
     """
     _C.mega_moe_pre_dispatch(
         x, topk_idx, topk_weights,

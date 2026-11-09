@@ -15,10 +15,43 @@
 
 namespace deep_gemm::comm {
 
+template <uint32_t Capacity>
+struct Stage1Count {
+    static_assert(Capacity > 0 && Capacity < (1u << 30));
+    static constexpr uint32_t kCountRange = math::next_power_of_two(Capacity + 1);
+    static constexpr uint32_t kCountMask = kCountRange - 1;
+
+    __host__ __device__ static constexpr uint32_t tag(uint32_t generation) {
+        // The bank holds parity; the remaining tag bits wrap on their own.
+        return 0x80000000u | ((generation >> 1) * kCountRange);
+    }
+
+    __host__ __device__ static constexpr uint32_t encode(uint32_t count, uint32_t generation) {
+        return tag(generation) | count;
+    }
+
+    __device__ static __forceinline__ uint32_t read(uint32_t* word, uint32_t generation) {
+        const uint32_t expected = tag(generation);
+        uint32_t value;
+        do {
+            value = tix::ld_ready_flag_uncached(word);
+        } while ((value & ~kCountMask) != expected);
+        value &= kCountMask;
+        // Clear the tag so wrapped rounds and other views cannot accept an old count.
+        __stbl(word, value);
+        return value;
+    }
+};
+
 __device__ __forceinline__ uint32_t resolve_fused_round_generation(
     const volatile layout::MegaMoESignals& signals) {
     // Stream order makes one cached load enough to read Quant's generation.
     return signals.preprocess_ready[0] & ~kPreprocessMetadataReadyBit;
+}
+
+__device__ __forceinline__ void wait_expert_metadata(
+    const volatile uint32_t* ready, uint32_t generation) {
+    while (tix::ld_ready_flag_uncached(ready) != (kPreprocessMetadataReadyBit | generation)) { }
 }
 
 // Tags contain a generation and three stripe bits; accept a completed stripe
@@ -56,35 +89,6 @@ __device__ __forceinline__ void rank_arrive(
         __stbl(sym_buffer.map(arrivals, threadIdx.x) + sym_buffer.rank_idx, notification);
 }
 
-// All CTA threads participate; writer_warp identifies the warps that published
-// payload, scales or route counts. The last CTA notifies peers after every release.
-template <uint32_t kWorldSize, uint32_t kNumExperts>
-__device__ __forceinline__ void pre_dispatch_release(
-        layout::MegaMoESignals& signals, const layout::SymBuffer<>& sym_buffer,
-        uint32_t generation, bool writer_warp) {
-    __shared__ uint32_t last_cta;
-    __syncwarp();
-    if ((threadIdx.x & 31u) == 0 && writer_warp)
-        __ppu_threadfence_system_uncache();
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        const uint32_t ticket = atomicInc(signals.dispatch_retire + (generation & 1u), gridDim.x - 1);
-        last_cta = ticket == gridDim.x - 1;
-        if (last_cta)
-            __stbl(signals.preprocess_ready, generation);
-    }
-    __syncthreads();
-    if (last_cta) {
-        // Clear slot counters before reusing this parity.
-        auto* counts = signals.dispatch_counts[generation & 1u];
-        for (uint32_t expert = threadIdx.x; expert < kNumExperts; expert += blockDim.x)
-            counts[expert] = 0u;
-        if (threadIdx.x < kWorldSize)
-            __stbl(sym_buffer.map(signals.dispatch_arrivals, threadIdx.x) + sym_buffer.rank_idx, generation);
-    }
-}
-
 // Each rank owns one slot. All threads in the CTA participate in the wait.
 template <uint32_t kWorldSize, bool kWithWriterMask = false>
 __device__ __forceinline__ void rank_barrier(
@@ -118,8 +122,7 @@ __device__ __forceinline__ void scatter_release(
         const layout::SymBuffer<kWorldSize>& sym_buffer,
         uint32_t num_blocks, uint32_t block_idx, uint32_t thread_idx,
         uint32_t generation, bool bulk_writer) {
-    // PPU fences drain only the calling warp; each warp leader releases its stores.
-    // The following grid sync joins these releases before peer notification.
+    // Join every writer's release before notifying peers.
     __syncwarp();
     if ((thread_idx & 31u) == 0) {
         __ppu_threadfence_system_uncache();

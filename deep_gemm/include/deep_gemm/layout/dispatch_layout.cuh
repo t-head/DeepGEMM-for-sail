@@ -12,8 +12,19 @@ static constexpr uint32_t kPreprocessMetadataReadyBit = 1u << 31;
 // Wrap to generation 2 after clearing flags, preserving parity alternation.
 static constexpr uint32_t kFusedRoundGenerationLimit = (1u << 27) - 1u;
 
+enum class Stage1RoutePolicy { PerToken, PerPeer };
+
+// Leave one CTA per peer for counts when token writers still fit.
+__host__ __device__ constexpr uint32_t stage1_token_cta_budget(uint32_t route_ctas, uint32_t ranks) {
+    return route_ctas > ranks ? route_ctas - ranks : route_ctas;
+}
+
 // M-block count, block offset, row offset and token count per expert.
 static constexpr int kExpertMetadataAuxFields = 4;
+
+__host__ __device__ constexpr int expert_metadata_smem_bytes(int local_experts, int ranks) {
+    return local_experts * (ranks + kExpertMetadataAuxFields) * static_cast<int>(sizeof(uint32_t));
+}
 
 // Metadata owner search requires a power-of-two rank count.
 __host__ __device__
