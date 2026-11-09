@@ -64,6 +64,75 @@ struct TuningEntry {
 
 inline TuningConfig select_tuning(const TuningWorkload& w) {
     TuningConfig result{w, {}, {}, {}, {}};
+    using P = Precision;
+    static const Tile channelwise_g1_decode{128, 256, 128, 32, 64, 5};
+    static const TuningEntry entries[] = {
+        {"minimax_m3",
+         P::FP8Channelwise,
+         8,
+         128,
+         4,
+         6144,
+         3072,
+         "swiglu_oai",
+         {{32, {channelwise_g1_decode}},
+          {64, {channelwise_g1_decode}},
+          {128, {channelwise_g1_decode}},
+          {1024, {{}, {}, 3}}, {2048, {{}, {}, 3}}, {4096, {{}, {}, 3}}}},
+        {"glm52",
+         P::FP8Channelwise,
+         8,
+         256,
+         8,
+         6144,
+         2048,
+         "swiglu",
+         {{32, {{}, 128}, {Tile{128, 256, 128, 32, 64, 4}, 4096, true}},
+          {64, {channelwise_g1_decode}},
+          {128, {channelwise_g1_decode}},
+          {1024, {{}, {}, 9}},
+          {2048, {{}, {}, 9}},
+          {4096, {{}, {}, 9}}}},
+        {"glm53_flash",
+         P::FP8Channelwise,
+         4,
+         288,
+         8,
+         4096,
+         2048,
+         "swiglu",
+         {{32, {Tile{16, 128, 128, 16, 32, 4}, {}, 3}, {Tile{16, 256, 64, 16, 32, 3}}},
+          {64, {Tile{32, 256, 128, 16, 32, 5}, {}, 3}, {Tile{16, 256, 64, 16, 32, 3}}},
+          {128, {Tile{32, 256, 128, 16, 32, 5}, {}, 3}, {Tile{32, 256, 64, 32, 64, 4}}},
+          {1024, {{}, 128, 6}, {Tile{128, 256, 128, 32, 64, 3}}}, {2048}, {4096}}},
+        {"qwen38_flash",
+         P::FP8Channelwise,
+         4,
+         512,
+         10,
+         2560,
+         640,
+         "swiglu",
+         {{32, {Tile{16, 128, 128, 16, 32, 4}, {}, 6}, {Tile{16, 256, 64, 16, 64, 2}}},
+          {64, {Tile{32, 256, 128, 16, 32, 5}, {}, 6}, {Tile{16, 256, 64, 16, 64, 2}}},
+          {128, {Tile{32, 256, 128, 16, 32, 5}, {}, 6}, {Tile{16, 256, 64, 16, 64, 2}}},
+          {1024, {{}, {}, 9}, {Tile{128, 256, 128, 32, 64, 3}}}, {2048, {{}, {}, 12}}, {4096, {{}, {}, 12}}}},
+    };
+    for (const auto& entry : entries) {
+        if (w.precision == entry.precision && w.ranks == entry.ranks && w.experts == entry.experts &&
+            w.topk == entry.topk && w.hidden == entry.hidden && w.intermediate == entry.intermediate &&
+            w.activation == entry.activation) {
+            for (const auto& c : entry.cases) {
+                if (w.tokens == c.tokens || (entry.token_buckets && w.tokens <= c.tokens)) {
+                    result.profile = entry.model;
+                    result.gemm1 = c.gemm1;
+                    result.gemm2 = c.gemm2;
+                    result.buffer = c.buffer;
+                    return result;
+                }
+            }
+        }
+    }
     return result;
 }
 

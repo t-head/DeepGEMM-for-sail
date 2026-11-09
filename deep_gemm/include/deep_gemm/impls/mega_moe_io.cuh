@@ -11,6 +11,17 @@
 
 namespace deep_gemm::mega_moe::detail {
 
+template <int TopK>
+__device__ __forceinline__ void invalidate_unused_routes(
+    int64_t* ids, float* weights, int num_tokens, int capacity, int first_block) {
+    const int start = num_tokens * TopK + (int(blockIdx.x) - first_block) * blockDim.x + threadIdx.x;
+    const int stride = (int(gridDim.x) - first_block) * blockDim.x;
+    for (int slot = start; slot < capacity * TopK; slot += stride) {
+        ids[slot] = -1;
+        weights[slot] = 0.0f;
+    }
+}
+
 template <bool kFastMath>
 __device__ __forceinline__ float moe_sigmoid(float value) {
     if constexpr (kFastMath) return __ppu_sgmdf(value);
