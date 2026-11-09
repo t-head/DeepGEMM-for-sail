@@ -332,13 +332,12 @@ def _check_workspace_options(case, group):
                    num_topk=case.topk, hidden=case.hidden, activation=case.activation,
                    intermediate_hidden=case.intermediate)
     invalid = [({"mma_type": "unsupported"}, "mma_type_str"),
+               ({"mma_type": "fp8xfp4"}, "mma_kind"),
                ({"activation": "unsupported"}, "Unsupported MegaMoE activation"),
                ({"intermediate_hidden": 127}, "intermediate"),
                ({"hidden": case.hidden + 1}, "hidden"),
                ({"num_topk": 33}, "topk"),
                ({"num_max_tokens_per_rank": 0}, "num_max_tokens_per_rank > 0")]
-    for mma_type in ("fp8xfp4", "fp8xfp8", "bf16xbf16"):
-        invalid.append(({"mma_type": mma_type}, "mma_kind"))
     invalid.append(({"num_shared_experts": 1}, "shared experts"))
     for legacy in ({"gemm1_block_n": 256}, {"gemm1_block_k": 128}, {"config_override": {}},
                    {"gemm1_config": (64, 256, 128, 32, 64, 3)},

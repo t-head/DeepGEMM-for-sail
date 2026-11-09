@@ -462,9 +462,10 @@ cases.
 
 #### Mega MoE
 
-MegaMoE combines expert-parallel dispatch, two MXFP4 GEMMs, gated activation
+MegaMoE combines expert-parallel dispatch, two expert GEMMs, gated activation
 and reduction on PPU. Allocate the symmetric buffer and transform the local
-weights once, then run pre-dispatch and forward for each batch.
+weights once, then run pre-dispatch and forward for each batch. The following
+example uses MXFP4 (W4A4).
 
 ```python
 import torch
@@ -488,6 +489,95 @@ deep_gemm.fp4_fp4_mega_moe(output, l1_weights, l2_weights, buffer)
 For UltraEP, pass `l1_weights_replicas` and `l2_weights_replicas` together.
 
 See [test_mega_moe.py](tests/test_mega_moe.py) for a complete example.
+
+##### FP8 channelwise MegaMoE
+
+These backends follow the same complete-call and workspace ownership contract.
+`intermediate_hidden` always means the activated width I. Routing weights are
+supplied once through `topk_weights` and applied once in the final BF16 combine.
+Shared experts remain outside the routed pipeline; `num_shared_experts` must be 0.
+
+All precisions use `SymmBuffer` or `get_symm_buffer_for_mega_moe` for workspace
+allocation. Select the mode below; FP8 additionally distinguishes scale granularity
+with `quantization` (channelwise by default). These backends require PPU1.5.
+
+| Backend | Compute | Workspace mode | Activation | EP limit |
+|---|---|---|---|---|
+| FP8 channelwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="channelwise"` | SwiGLU, SwiGLU-OAI | 64 |
+
+H is divisible by 256 and I by 128. FP8 supports at most 128 physical experts
+per rank. Capacity is positive and below 2^24;
+top-k is 1–16 and no larger than the expert count. `num_experts` counts global
+physical expert slots, including replicas, and is divisible by EP. Valid expert
+IDs are in `[0, num_experts)` and distinct within each token; use `-1` for masked
+slots, which may repeat. All ranks, including empty ranks, call in the same
+order. Reuse each workspace serially on one stream; graph
+replay may update inputs and routes in place without changing shapes. The
+activation is selected by each complete compute call, and the same workspace
+can be reused across activations supported by its precision. The library
+recycles dispatch counts and applies routing weights exactly once,
+skipping zero-weight or invalid slots before reading combine storage. All routed
+backends share the 64-rank peer-address capacity of `SymmBuffer`; see the tests
+for model-specific EP coverage.
+Separate master/replica pairs use the same keyword arguments and physical slot
+ordering as W4A4. Transform each bank separately before use.
+
+Initialize `group` and select the local device before the example below.
+It uses contiguous BF16 `x` of shape `[T,H]`, routing IDs and
+FP32 weights of shape `[T,topk]`, and a BF16 output `y` of shape `[T,H]`.
+Pass exactly T input rows to pre-dispatch and use the same T for compute.
+Each raw L1/L2 argument is a `(weight, scale)` pair in the layouts below.
+
+```python
+import torch
+import deep_gemm as dg
+
+# Raw FP8 weights: [E,2I,H] and [E,H,I], with the scales described below.
+l1, l2 = dg.transform_weights_for_fp8_mega_moe(raw_l1, raw_l2, quantization="channelwise")
+workspace = dg.get_symm_buffer_for_mega_moe(
+    group, num_experts=256, num_max_tokens_per_rank=4096,
+    num_topk=8, hidden=6144, intermediate_hidden=2048,
+    mma_type="fp8xfp8", quantization="channelwise", activation="swiglu")
+y = torch.empty_like(x)
+dg.mega_moe_pre_dispatch(
+    x, topk_ids, topk_weights,
+    workspace.x, workspace.x_sf, workspace.topk_idx, workspace.topk_weights,
+    num_tokens=x.shape[0], mma_type=workspace.mma_type)
+dg.fp8_fp8_mega_moe(y, l1, l2, workspace, activation="swiglu")
+```
+
+FP8 weights are contiguous E4M3 `[E,N,K]`. Channelwise FP32 scales are
+`[E,N,1]`. The transform interleaves GEMM1 gate/up rows in groups of eight, including their
+scales, without requantization. In these weight shapes, E is the number of
+local experts in the bank, N the output width, and K the input width. All raw
+weights and scales must be contiguous and on the same device.
+
+FP8 `base` aliases require the same mode, quantization, group,
+device and workspace dimensions; aliases execute serially on the same stream.
+Transformed weights are specific to their backend and must not be interchanged.
+
+FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]`.
+`mega_moe_pre_dispatch` fills these inputs and routes. FP8 also quantizes
+activated GEMM1 output to E4M3.
+These backends write BF16 GEMM2 scatter results and launch a separate combine
+kernel inside the complete C++ compute call. Combine handles the generation
+barrier, weighted reduction and dispatch-counter recycling.
+
+An optional `cumulative_local_expert_recv_stats` is a contiguous device int32
+vector with one element per local physical expert, initialized by the caller.
+Compute adds valid routed assignments, including zero-weight assignments;
+it does not reset these cumulative statistics. Keep weights, output, workspace
+and statistics alive until execution and any captured graph replays finish.
+
+The common compute arguments retain their names and meaning. Precision-specific
+entry points omit the MXFP4 `recipe`: FP8 granularities are selected by
+the workspace. SwiGLU-OAI uses
+keyword-only `activation_alpha=None` (effective default `1.702`); an explicit
+alpha is accepted only for OAI. All pre-dispatch paths accept int32
+or int64 routing IDs and store int64 IDs in the workspace.
+FP8 SwiGLU/SwiGLU-OAI round clamp boundaries to BF16. For these
+MegaMoE paths, `activation_clamp=None` or `+inf` disables clipping; zero is
+an active clamp boundary. `fast_math` selects activation math only.
 
 #### HyperConnection (HC) prenorm GEMM
 
