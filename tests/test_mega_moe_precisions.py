@@ -100,6 +100,15 @@ CASES = (
         precision="w4a16",
         routing="random",
     ),
+    MegaMoECase("smoke_w4a8", 512, 256, 16, 2, 129, tokens=(1, 0, 33, 129, 8),
+               precision="w4a8", routing="random", reference_tokens=129),
+    MegaMoECase("smoke_w4a8_situ", 512, 512, 16, 2, 129, tokens=(1, 0, 33, 129, 8),
+               activation="situ", precision="w4a8", routing="random", reference_tokens=129),
+    MegaMoECase("deepseek_v4_pro_w4a8", 7168, 3072, 384, 6, 4096, tokens=(32, *MODEL_TOKENS),
+               worlds=(8,), precision="w4a8", routing="random", reference_tokens=8),
+    MegaMoECase("kimi_k3_w4a8", 3584, 3072, 896, 16, 4096,
+               tokens=(32, 64, 128, *MODEL_TOKENS), activation="situ", worlds=(8, 16, 32),
+               precision="w4a8", routing="random", reference_tokens=8),
 )
 
 
@@ -467,7 +476,7 @@ def test_mega_moe_activation_reuse(case, fast_math, mega_moe_group):
     # Reuse one allocation and weight bank across supported activations,
     # coefficient changes and graph replays of previously selected activations.
     rng = torch.Generator(device="cuda").manual_seed(20261106 + mega_moe_group.rank())
-    max_diff = .001
+    max_diff = .0015 if case.precision == "w4a8" else .001
     pipeline = make_pipeline(case, mega_moe_group, rng, fast_math=fast_math)
     buffer = pipeline.buffer
     source = torch.randn(33, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .5
@@ -477,7 +486,7 @@ def test_mega_moe_activation_reuse(case, fast_math, mega_moe_group):
     try:
         all_source, all_ids, all_weights = _all_gather(source), _all_gather(ids), _all_gather(weights)
         configurations = []
-        if case.precision == "w4a16":
+        if case.precision in ("w4a16", "w4a8"):
             configurations += [("situ", 4., 25.), ("situ", .25, 25.), ("situ", .25, .25),
                                ("situ", .25, None), ("situ", 4., 25.)]
         if case.precision != "w4a16":
@@ -512,6 +521,8 @@ def test_mega_moe_activation_reuse(case, fast_math, mega_moe_group):
             check_output(y, expected, max_diff)
         unsupported = "swiglu" if case.precision == "w4a16" else "situ"
         error = "Unsupported activation"
+        if case.precision == "w4a8":
+            unsupported, error = "swiglu_step", "W4A8 supports"
         with pytest.raises(RuntimeError, match=error):
             pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, buffer, activation=unsupported)
     finally:

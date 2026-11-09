@@ -238,7 +238,7 @@ from .mega import (
     mega_moe_pre_dispatch,
     transform_weights_for_fp8_mega_moe, transform_weights_for_w4a16_mega_moe,
     fp8_fp8_mega_moe, bf16_fp4_mega_moe,
-
+    transform_weights_for_w4a8_mega_moe, fp8_fp4_mega_moe,
 )
 
 # Some utils

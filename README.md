@@ -490,7 +490,7 @@ For UltraEP, pass `l1_weights_replicas` and `l2_weights_replicas` together.
 
 See [test_mega_moe.py](tests/test_mega_moe.py) for a complete example.
 
-##### FP8 channelwise, FP8 blockwise, W4A16 MegaMoE
+##### FP8, W4A8 and W4A16 MegaMoE
 
 These backends follow the same complete-call and workspace ownership contract.
 `intermediate_hidden` always means the activated width I. Routing weights are
@@ -505,9 +505,10 @@ with `quantization` (channelwise by default). These backends require PPU1.5.
 |---|---|---|---|---|
 | FP8 channelwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="channelwise"` | SwiGLU, SwiGLU-OAI | 64 |
 | FP8 blockwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, SwiGLU-OAI | 64 |
+| E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `mma_type="fp8xmxfp4"` | SwiGLU, SwiGLU-OAI, SiTU | 64 |
 | BF16 x MXFP4 | `bf16_fp4_mega_moe` | `mma_type="bf16xmxfp4", activation="situ"` | SiTU | 64 |
 
-H is divisible by 256 and I by 128. FP8 supports at most 128 physical experts
+H is divisible by 256 and I by 128. FP8 and W4A8 support at most 128 physical experts
 per rank; W4A16 supports at most 127. Capacity is positive and below 2^24;
 top-k is 1–16 and no larger than the expert count. `num_experts` counts global
 physical expert slots, including replicas, and is divisible by EP. Valid expert
@@ -563,6 +564,21 @@ dg.mega_moe_pre_dispatch(
 dg.bf16_fp4_mega_moe(y, l1, l2, workspace, activation="situ")
 ```
 
+```python
+# W4A8 uses the common workspace entry point; I remains the activated width.
+l1, l2 = dg.transform_weights_for_w4a8_mega_moe(raw_l1_w4, raw_l2_w4)
+workspace = dg.SymmBuffer(
+    group, num_experts=896, num_max_tokens_per_rank=4096,
+    num_topk=16, hidden=3584, intermediate_hidden=3072,
+    mma_type="fp8xmxfp4", activation="situ")
+y = torch.empty_like(x)
+dg.mega_moe_pre_dispatch(
+    x, topk_ids, topk_weights,
+    workspace.x, workspace.x_sf, workspace.topk_idx, workspace.topk_weights,
+    num_tokens=x.shape[0], mma_type=workspace.mma_type)
+dg.fp8_fp4_mega_moe(y, l1, l2, workspace, activation="situ")
+```
+
 FP8 weights are contiguous E4M3 `[E,N,K]`. Channelwise FP32 scales are
 `[E,N,1]`; blockwise scales are `[E,N/128,K/128]`. The transform interleaves
 GEMM1 gate/up rows in groups of eight or 128 respectively, including their
@@ -570,13 +586,21 @@ scales, without requantization. In these weight shapes, E is the number of
 local experts in the bank, N the output width, and K the input width. All raw
 weights and scales must be contiguous and on the same device.
 
-W4A16 takes uint8-packed MXFP4 weights `[E,2I,H/2]` and `[E,H,I/2]`,
+W4A16 and W4A8 take uint8-packed MXFP4 weights `[E,2I,H/2]` and `[E,H,I/2]`,
 with raw uint8 UE8M0 group-32 scales `[E,2I,H/32]` and `[E,H,I/32]`.
 GEMM1 raw rows contain all gate rows followed by all up rows. The W4A16
 transform interleaves gate/up rows in groups of eight and packs its scale layout.
-
-FP8 and W4A16 `base` aliases require the same mode, quantization, group,
+W4A8 uses the same raw MXFP4 inputs, transformed with
+`transform_weights_for_w4a8_mega_moe`. Each returned bank is
+`(packed_weight, packed_scale, weight_inv_scale)`: the scalar compensates
+load-time exponent rebasing and is independent of routing weights and input
+scales. Prepare separately allocated master/replica banks independently; their
+inverse scales may differ. W4A8 scale exponents follow the
+[ordinary W4A8 preprocessing requirements](#w4a8-dense-and-moe-gemms-m890).
+FP8, W4A8 and W4A16 `base` aliases require the same mode, quantization, group,
 device and workspace dimensions; aliases execute serially on the same stream.
+W4A8 input and activated output use rowwise E4M3 quantization, as for FP8
+channelwise, with the chosen activation fused into GEMM1.
 Transformed weights are specific to their backend and must not be interchanged.
 
 FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]` for channelwise
@@ -596,15 +620,16 @@ and statistics alive until execution and any captured graph replays finish.
 
 The common compute arguments retain their names and meaning. Precision-specific
 entry points omit the MXFP4 `recipe`: FP8 granularities are selected by
-the workspace, and W4A16 does not quantize activations. SwiGLU-OAI uses
+the workspace, W4A8 weight groups are fixed at 32, and W4A16 does not quantize
+activations. SwiGLU-OAI uses
 keyword-only `activation_alpha=None` (effective default `1.702`); an explicit
-alpha is accepted only for OAI. W4A16 SiTU retains `situ_beta=4` and
+alpha is accepted only for OAI. W4A16 and W4A8 SiTU retain `situ_beta=4` and
 `situ_linear_beta=25`; `situ_linear_beta=None` disables the up softcap, while
 `situ_beta` must be positive and finite. All pre-dispatch paths accept int32
 or int64 routing IDs and store int64 IDs in the workspace.
-FP8 SwiGLU/SwiGLU-OAI round clamp boundaries to BF16. For these
+FP8 and W4A8 SwiGLU/SwiGLU-OAI round clamp boundaries to BF16. For these
 MegaMoE paths, `activation_clamp=None` or `+inf` disables clipping; zero is
-an active clamp boundary. W4A16 SiTU rejects any explicit
+an active clamp boundary. SiTU (W4A16 and W4A8) rejects any explicit
 `activation_clamp`. `fast_math` selects activation math only.
 
 #### HyperConnection (HC) prenorm GEMM

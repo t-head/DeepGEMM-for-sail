@@ -280,6 +280,11 @@ inline int64_t w4a16_scatter_smem_size(const deep_gemm_w4a16_common::W4A16Config
     return std::max<int64_t>(deep_gemm_w4a16_common::get_smem_config(c, true, 1, 32), scratch);
 }
 
+inline int64_t w4a8_scatter_smem_size(const w4fa8::W4A8Config& c, int k) {
+    const int64_t scratch = int64_t(c.block_m) * (c.block_n / 2 + 4) * sizeof(uint32_t);
+    return std::max<int64_t>(w4fa8::get_smem_size(c, k), scratch);
+}
+
 inline int channel_pull_group_size(const Gemm1Config& c, int expected_rows) {
     constexpr int default_teams = 3;
     const bool one_batch = std::min(expected_rows, c.tile.block_m) <= c.num_threads / 32;
@@ -587,6 +592,29 @@ inline int fp8_gemm1_ctas(const Gemm1Config& c, int tokens, int pulls) {
     return c.tile.num_sms * std::clamp(std::min(512 / c.num_threads, work), 1, 4);
 }
 
+inline w4fa8::NativeKernelConfig w4a8_gemm_config(int expected, int n, int k, int groups,
+                                                 const std::optional<Tile>& tile) {
+    // Direct activation/scatter epilogues consume complete N256 tiles.
+    // Keep these constraints inside selection, including shared-memory fitting.
+    auto c = w4fa8::get_default_tile(expected, n, k, groups, GemmType::MGroupedNoPad, 256, false);
+    if (!tile && expected <= std::numeric_limits<int>::max() / groups && w4fa8::supports_native_strategy() &&
+        w4fa8::wide_tile_eligible(groups, expected * groups, n, k, GemmType::MGroupedNoPad))
+        c = w4fa8::default_wide_config(expected, k, GemmType::MGroupedNoPad);
+    if (tile) {
+        const auto& [bm, bn, bk, wm, wn, stages] = *tile;
+        c.block_m = bm; c.block_n = bn; c.block_k = bk;
+        c.warp_m = wm; c.warp_n = wn; c.warp_k = bk; c.num_stages = stages;
+    }
+    c.n_expand = 1;
+    const auto spec = w4fa8::resolve_native_config(c, n, k);
+    w4fa8::check_native_kernel(spec, n, k, groups, GemmType::MGroupedNoPad);
+    TORCH_CHECK(c.block_n % 256 == 0 && n % c.block_n == 0 && c.warp_k == c.block_k,
+                "W4A8 MegaMoE requires complete 256-column tiles and one K warp");
+    TORCH_CHECK(w4a8_scatter_smem_size(c, k) <= 256 * 1024,
+                "W4A8 MegaMoE tile exceeds shared memory capacity");
+    return spec;
+}
+
 struct MegaMoEPrecisionConfigs {
     Gemm1Config l1;
     ScatterConfig l2;
@@ -619,6 +647,33 @@ inline const MegaMoEPrecisionConfigs& get_mega_moe_precision_configs(
         g2.num_stages = tile.num_stages;
         g2.num_threads = deep_gemm_w4a16_common::get_num_threads(tile, true);
         g2.smem_size = w4a16_scatter_smem_size(tile);
+    } else if (precision == Precision::W4A8) {
+        const auto g1 = w4a8_gemm_config(expected, 2 * intermediate, hidden, groups, tuning.gemm1.tile);
+        auto c = make_gemm1_config(ranks, experts, topk, capacity, hidden, sizeof(float));
+        c.dispatch.block_m = g1.tile.block_m;
+        c.tile.block_m = g1.tile.block_m; c.tile.block_n = g1.tile.block_n; c.tile.block_k = g1.tile.block_k;
+        c.tile.warp_m = g1.tile.warp_m; c.tile.warp_n = g1.tile.warp_n; c.warp_k = g1.tile.warp_k;
+        c.tile.num_stages = g1.tile.num_stages;
+        c.fragment = g1.fragment;
+        c.num_threads = w4fa8::get_num_threads(g1.tile);
+        const int64_t pull_smem = int64_t(c.num_threads / 32) * hidden + ((int64_t(experts) * 4 + 15) / 16 * 16);
+        TORCH_CHECK(pull_smem <= 256 * 1024, "W4A8 pull staging exceeds shared memory capacity");
+        c.dispatch.pull_ctas = tuning.gemm1.pull_ctas.value_or(6);
+        TORCH_CHECK(c.dispatch.pull_ctas > 0 && c.dispatch.pull_ctas < c.tile.num_sms && c.dispatch.pull_ctas % 3 == 0,
+                    "W4A8 pull CTAs must be a positive multiple of 3 below num_sms");
+        c.tile.smem_size = std::max<int64_t>(w4fa8::get_smem_size(g1.tile, hidden), pull_smem);
+        const int resident = int(device_runtime->get_prop()->sharedMemPerMultiprocessor / c.tile.smem_size);
+        c.num_ctas = c.tile.num_sms * std::clamp(resident, 1, 8);
+        result.l1 = c;
+        const auto g2 = w4a8_gemm_config(expected, hidden, intermediate, groups, tuning.gemm2.tile);
+        auto& scatter = result.l2;
+        scatter.num_sms = g2.tile.num_sms;
+        scatter.block_m = g2.tile.block_m; scatter.block_n = g2.tile.block_n; scatter.block_k = g2.tile.block_k;
+        scatter.warp_m = g2.tile.warp_m; scatter.warp_n = g2.tile.warp_n; scatter.warp_k = g2.tile.warp_k;
+        scatter.num_stages = g2.tile.num_stages;
+        scatter.num_threads = w4fa8::get_num_threads(g2.tile);
+        scatter.smem_size = w4a8_scatter_smem_size(g2.tile, intermediate);
+        scatter.fragment = g2.fragment;
     } else {
         const bool blockwise = precision == Precision::FP8Blockwise;
         auto c = make_fp8_gemm1_config(ranks, experts, topk, hidden, capacity, std::nullopt, blockwise);
