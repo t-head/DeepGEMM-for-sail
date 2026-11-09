@@ -19,6 +19,12 @@ DenseGemm,data_type:bf16,m:256,n:512,k:7168
 DenseGemm,data_type:bf16,m:1,n:256,k:2048
 DenseGemm,data_type:bf16,m:1,n:4096,k:4096
 DenseGemm,data_type:bf16,m:4096,n:4096,k:1024
+# Odd N scalar epilogue and N=1 transposed GEMV.
+DenseGemm,data_type:bf16,m:17,n:65,k:256
+DenseGemm,data_type:bf16,m:128,n:1,k:512
+# Same-shape packed/scalar cache switching and constrained N=1 dispatch.
+DenseGemm,data_type:bf16,m:17,n:66,k:256,bf16_regression:alignment_cache
+DenseGemm,data_type:bf16,m:128,n:1,k:256,bf16_regression:n1_cu_limit
 # M=2 GEMV with one/two output rows per thread.
 DenseGemm,data_type:bf16,m:2,n:256,k:2048
 DenseGemm,data_type:bf16,m:2,n:1024,k:2048
@@ -44,6 +50,8 @@ DenseGemm,data_type:fp4,m:64,n:512,k:512,with_bias:1
 
 # --- DenseGemm / bf16_bf16_fp32 ---
 DenseGemm,data_type:bf16_bf16_fp32,m:2048,n:4096,k:7168
+DenseGemm,data_type:bf16_bf16_fp32,m:17,n:65,k:256
+DenseGemm,data_type:bf16_bf16_fp32,m:128,n:1,k:512
 DenseGemm,data_type:bf16_bf16_fp32,m:132,n:3072,k:1536
 DenseGemm,data_type:bf16_bf16_fp32,m:2,n:1024,k:7168
 

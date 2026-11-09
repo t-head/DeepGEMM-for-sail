@@ -1521,9 +1521,17 @@ def test_native_batch_gemm(args):
 
 
 def test_gemm(args) -> None:
+    """Run a dense GEMM case or its explicitly selected regression checks."""
     print('Testing GEMM:')
     m, n, k, d = args['m'], args['n'], args['k'], args["data_type"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
+    regression = args.get('bf16_regression')
+    if regression:
+        if d != torch.bfloat16 or regression not in ('alignment_cache', 'n1_cu_limit'):
+            raise ValueError('Invalid BF16 dense regression case')
+        from test_gemv_dense import run_tile_alignment_cache, run_n1_cu_limit
+        check = get_acc_check() and not os.environ.get('HGGC_WARM_UP') and deep_gemm.get_compile_mode() != 1
+        return (run_tile_alignment_cache if regression == 'alignment_cache' else run_n1_cu_limit)(check=check)
     print(f"test_gemm->test_func: DenseGemm,m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")
     if d == torch.float32 or args.get('accumulate', 'none') != 'none':
         return test_dense_gemm_api(args)

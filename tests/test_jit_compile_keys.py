@@ -84,7 +84,7 @@ int dynamic_checks(const typename Runtime::Args& args) {
     return count;
 }
 
-template <typename Runtime, bool CuteFree>
+template <typename Runtime>
 int bf16_checks() {
     auto args = dense_args<Runtime>();
     args.launch_info.warp_k = 64;
@@ -94,9 +94,7 @@ int bf16_checks() {
     CHECK_BF16(warp_k, 32);
     CHECK_BF16(dense_s2_opt, true);
     CHECK_BF16(overlap_prologue, true);
-    if constexpr (CuteFree) {
-        CHECK_BF16(gemm_type, "MGroupedContiguous");
-    }
+    CHECK_BF16(gemm_type, "MGroupedContiguous");
 #undef CHECK_BF16
     count += check_change<Runtime>(args, [](auto& a) {
         cute::get<1>(a.kernel_params.problem_shape) = 514;
@@ -105,6 +103,16 @@ int bf16_checks() {
         cute::get<1>(a.kernel_params.problem_shape) = 768;
         cute::get<2>(a.kernel_params.problem_shape) = 1024;
     }, "aligned N and runtime K", false);
+    auto unaligned_n = args;
+    cute::get<1>(unaligned_n.kernel_params.problem_shape) = 514;
+    count += check_change<Runtime>(unaligned_n, [](auto& a) {
+        cute::get<1>(a.kernel_params.problem_shape) = 515;
+    }, "odd N changes packed-store eligibility");
+    count += check_change<Runtime>(args, [](auto& a) {
+        auto& ptr_d = a.kernel_params.collective_epilogue_params.ptr_D;
+        using Element = std::remove_pointer_t<std::remove_reference_t<decltype(ptr_d)>>;
+        ptr_d = reinterpret_cast<std::remove_reference_t<decltype(ptr_d)>>(uintptr_t(sizeof(Element)));
+    }, "output pointer alignment changes packed-store eligibility");
     return count;
 }
 
@@ -210,10 +218,8 @@ int gemv_checks() {
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("bf16_cutlass", [] { return bf16_checks<deep_gemm::DenseBF16GemmCutlass3RuntimeT<cutlass::bfloat16_t>, false>()
-                                  + bf16_checks<deep_gemm::DenseBF16GemmCutlass3RuntimeT<float>, false>(); });
-    m.def("bf16_cute_free", [] { return bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<cutlass::bfloat16_t>, true>()
-                                    + bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<float>, true>(); });
+    m.def("bf16_cute_free", [] { return bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<cutlass::bfloat16_t>>()
+                                    + bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<float>>(); });
     m.def("int8_and_fp8_channel", int8_checks);
     m.def("fp8_block", fp8_checks);
     m.def("fp4", fp4_checks);
@@ -246,9 +252,6 @@ class CompileKeyTests(unittest.TestCase):
             extra_ldflags=[f'-L{path}' for path in library_dirs if path.is_dir()]
                           + ['-lhggc', '-lhggcrt1', '-lhgrtc', '-lacblasLt', '-lc10_cuda', '-ltorch_cuda'],
             with_cuda=False)
-
-    def test_bf16_cutlass_both_output_types(self):
-        self.assertGreater(self.native.bf16_cutlass(), 0)
 
     def test_bf16_cute_free_both_output_types(self):
         self.assertGreater(self.native.bf16_cute_free(), 0)
