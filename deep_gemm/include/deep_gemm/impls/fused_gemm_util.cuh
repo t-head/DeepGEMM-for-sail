@@ -435,12 +435,15 @@ moe_align_warp_ordered_kernel_impl(
         for (int i = threadIdx.x; i < NUM_WARPS * kNumGroups; i += BLOCK_SIZE) {
             warp_counts[i] = 0;
         }
+        for (int i = threadIdx.x; i < numel; i += BLOCK_SIZE) {
+            m_indices[i] = -1;
+        }
         __syncthreads();
 
         for (int c = 0; c * WARP_SIZE < (warp_end - warp_start); c++) {
             int idx = warp_start + c * WARP_SIZE + lane_id;
-            bool valid = (idx < warp_end);
-            int eid = valid ? topk_ids[idx] : kNumGroups;
+            int eid = (idx < warp_end) ? topk_ids[idx] : kNumGroups;
+            bool valid = (idx < warp_end) && eid >= 0 && eid < kNumGroups;
             uint32_t mask = __match_any_sync(0xFFFFFFFF, eid);
             uint32_t prefix_mask = mask & __ppu_read_lanemask_lt();
 
@@ -524,6 +527,10 @@ moe_align_warp_ordered_kernel_impl(
     {
         for (int idx = warp_start + lane_id; idx < warp_end; idx += WARP_SIZE) {
             int eid = topk_ids[idx];
+            if (eid < 0 || eid >= kNumGroups) {
+                inv_perm[idx] = -1;
+                continue;
+            }
             int c = (idx - warp_start) / WARP_SIZE;
             int offset = warp_prefix[warp_id * kNumGroups + eid] + peer_rank[c];
             int rank = shared_cumsum[eid] + offset;
@@ -556,6 +563,7 @@ block_count_with_fill_impl(
     const int32_t* __restrict__ topk_ids,        // [numel] flattened topk_ids
     int32_t* __restrict__ sorted_token_ids,      // [s_total_ub] output, stride-filled with PAD_ID
     int32_t* __restrict__ block_counts,          // [NUM_BLOCKS * kNumGroups] output
+    int32_t* __restrict__ m_indices,             // [numel] initialized for GEMM2
     int numel,                                   // total elements = M * topk
     int s_total_ub,                              // upper bound of s_total (= max_num_m_blocks * BLOCK_M)
     int bid)                                     // logical block index
@@ -583,8 +591,11 @@ block_count_with_fill_impl(
     __syncthreads();
 
     if (idx < numel) {
+        m_indices[idx] = -1;
         int eid = topk_ids[idx];
-        atomicAdd(&smem_counts[eid], 1);
+        if (eid >= 0 && eid < kNumGroups) {
+            atomicAdd(&smem_counts[eid], 1);
+        }
     }
     __syncthreads();
     int32_t* expert_count_per_block = block_counts + bid * kNumGroups;
@@ -753,6 +764,9 @@ deterministic_scatter_impl(
     // Cooperative load one tile -> SMEM (all threads must reach __syncthreads)
     __align__(16) __shared__ int32_t tile[BLOCK_SIZE];
     tile[tid] = (idx < numel) ? topk_ids[idx] : -1;
+    if (idx < numel && (tile[tid] < 0 || tile[tid] >= kNumGroups)) {
+        inv_perm[idx] = -1;
+    }
     __syncthreads();
 
     // Vectorized scan: read 4 elements per iteration via int4

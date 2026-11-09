@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 #include <cutlass/bfloat16.h>
 #include <deep_gemm/cute_free/epilogue/epilogue_traits.cuh>
 
@@ -28,7 +29,7 @@ namespace epilogue {
 //   IsAlignedN: whether N is a multiple of BLOCK_N (eliminates col checks)
 // =============================================================================
 
-template <typename Element, typename CLayoutT, int WARP_M, int WARP_N, bool IsAlignedN>
+template <typename Element, typename CLayoutT, int WARP_M, int WARP_N, bool IsAlignedN, bool UsePackedStore>
 struct Epilogue {
   using ElementOutput = Element;
   using CLayout = CLayoutT;
@@ -102,7 +103,39 @@ struct Epilogue {
     const int row_half_stride = kHalfMmaM * ldd;  // row0 -> row(kHalfMmaM) offset (elements)
     const int mma_m_stride    = kMmaM * ldd;      // mma_m inter-row stride
 
-    if constexpr (kIsAlignedN) {
+    if constexpr (!UsePackedStore) {
+      // Odd row strides or unaligned output cannot use 32-bit stores. Each
+      // lane owns two adjacent columns, which are independently bounded.
+      #pragma unroll
+      for (int mi = 0; mi < kMmasPerWarpM; ++mi) {
+        const int rows[2] = {first_row + mi * kMmaM, first_row + mi * kMmaM + kHalfMmaM};
+        #pragma unroll
+        for (int ni = 0; ni < kMmasPerWarpN; ++ni) {
+          const int col = first_col + ni * kMmaN;
+          #pragma unroll
+          for (int r = 0; r < 2; ++r) {
+            if (rows[r] < max_row) {
+              #pragma unroll
+              for (int h = 0; h < 2; ++h) {
+                const int c = col + h * kHalfMmaN;
+                const int idx = 2 * r + 4 * h;
+                if (c < max_col) {
+                  StorageType* dst = reinterpret_cast<StorageType*>(ptr_D) + int64_t(rows[r]) * ldd + c;
+                  if constexpr (std::is_same_v<Element, float>) {
+                    dst[0] = accum[mi][ni][idx];
+                    if (c + 1 < max_col) dst[1] = accum[mi][ni][idx + 1];
+                  } else {
+                    const PackedType packed = ElemTraits::cvt_pack(accum[mi][ni][idx + 1], accum[mi][ni][idx]);
+                    dst[0] = static_cast<StorageType>(packed);
+                    if (c + 1 < max_col) dst[1] = static_cast<StorageType>(packed >> 16);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } else if constexpr (kIsAlignedN) {
       StorageType* mma_m_base = base_ptr;
 
       #pragma unroll

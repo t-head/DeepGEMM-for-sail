@@ -1,6 +1,7 @@
 #pragma once
 
 #include <torch/python.h>
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
@@ -233,30 +234,15 @@ using TiledMma = TiledMMA<
 
 static constexpr int N_EXPAND = kKernelStrategy == KernelStrategy::MultistageOnN && (SHAPE_N % (BLOCK_N) == 0) ? KernelAiuMultistageOnN::N_EXPAND : 1;
 
-using KernelSchedule = cute::conditional_t<
-    kKernelStrategy == KernelStrategy::OverlapMainloop,
-    KernelAiuMultistageOverlapMainloop,
-    cute::conditional_t<
-      kKernelStrategy == KernelStrategy::OverlapPrologue,
-      KernelAiuMultistageOverlapPrologue,
-      cute::conditional_t<
-        kKernelStrategy == KernelStrategy::MultistageOnN,
-        KernelAiuMultistageOnN,
-        cutlass::gemm::KernelAiuMultistage>>>;
-using DispatchPolicy = cute::conditional_t<
-    kKernelStrategy == KernelStrategy::OverlapMainloop,
-    cutlass::gemm::MainloopPPUOverlapMainloop<STAGES, KernelSchedule>,
-    cute::conditional_t<
-      kKernelStrategy == KernelStrategy::OverlapPrologue,
-      cutlass::gemm::MainloopPPUOverlapPrologue<STAGES, KernelSchedule>,
-      cutlass::gemm::MainloopPPUAiuOpt<STAGES, KernelSchedule>>>;
+using KernelSchedule = cute::conditional_t<kKernelStrategy == KernelStrategy::MultistageOnN, KernelAiuMultistageOnN, cutlass::gemm::KernelAiuMultistage>;
+using DispatchPolicy = cutlass::gemm::MainloopPPUAiuOpt<STAGES, KernelSchedule>;
 
 static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
 static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
 static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
 
-static constexpr int SmemLayoutStageStrideA = kKernelStrategy == KernelStrategy::OverlapMainloop || kKernelStrategy == KernelStrategy::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
-static constexpr int SmemLayoutStageStrideB = kKernelStrategy == KernelStrategy::OverlapMainloop || kKernelStrategy == KernelStrategy::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
+static constexpr int SmemLayoutStageStrideA = BLOCK_M * BLOCK_K;
+static constexpr int SmemLayoutStageStrideB = BLOCK_N * BLOCK_K;
 using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
 using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
 // using t1 = DefaultOperandB::xhzhao;
@@ -361,253 +347,6 @@ __global__ void {12}(
 };
 
 using BF16GemmCutlass3Runtime = BF16GemmCutlass3RuntimeT<cutlass::bfloat16_t>;
-
-// Dedicated BF16 DenseGemm runtime (standalone kernel, no SHAPE_N/K template params).
-// Architecture-aligned with DenseINT8GemmCutlass3Runtime. The MoE grouped-path runtime
-// (BF16GemmCutlass3Runtime) is intentionally left untouched so that m_grouped_bf16_gemm.hpp
-// stays byte-identical to baseline 753f28f.
-template <typename ElementOutput>
-class DenseBF16GemmCutlass3RuntimeT final : public LaunchRuntime<DenseBF16GemmCutlass3RuntimeT<ElementOutput>> {
-public:
-    using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
-    using GemmProblemSize = cute::tuple<int32_t, int32_t, int32_t, int32_t>;
-
-    struct MainLoopArguments {
-        cutlass::bfloat16_t const* ptr_A;
-        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_A;
-        cutlass::bfloat16_t const* ptr_B;
-        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_B;
-    };
-
-    struct LinearCombinationArgs {
-        float alpha = 1.0f;               ///< scales accumulators
-        float beta = 0.0f;                ///< scales source tensor
-        float const* alpha_ptr = nullptr; ///< pointer to accumulator scalar - if not null, loads it from memory
-        float const* beta_ptr = nullptr;  ///< pointer to source scalar - if not null, loads it from memory
-        float const* const* alpha_ptr_array = nullptr; ///< array of pointers to accumulator scalar per group/batch
-        float const* const* beta_ptr_array = nullptr;  ///< array of pointers to source scalar per group/batch
-        float scale_a = float(1);
-        float scale_b = float(1);
-        float scale_c = float(1);
-        float scale_d = float(1);
-        float const* scale_a_ptr = nullptr;
-        float const* scale_b_ptr = nullptr;
-        float const* scale_c_ptr = nullptr;
-        float const* scale_d_ptr = nullptr;
-    };
-
-    // Epilogue
-    struct EpilogueArgs {
-        LinearCombinationArgs callback;
-        ElementOutput* ptr_C;
-        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C;
-
-        ElementOutput* ptr_D;
-        cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D;
-    };
-
-    struct LaunchInfo {
-        int block_m, block_n, block_k, warp_m, warp_n;
-        int warp_k;           // WARP_K tile size for K-dim split (= block_k / WarpOnK). Used in WarpShape as Int<WARP_K>.
-        bool dense_s2_opt;
-        int num_stages;
-        std::string gemm_type, kernel_strategy, kernel_name;
-        bool enable_sbo_overlap;
-        bool overlap_prologue; // next-tile prologue overlap, enabled by host when wave > 3 (acblas parity)
-    };
-
-    struct GemmArguments {
-        GemmUniversalMode mode;
-        GemmProblemSize problem_shape;
-        MainLoopArguments mainloopargs;
-        EpilogueArgs epilogueargs;
-        cutlass::KernelHardwareInfo hw_info;
-        DenseGemmTileSchedulerArguments scheduler{};
-        // Carried for API uniformity with bf16/fp8 GemmArguments and the grouped BF16 paths.
-        // The dense path leaves it null; to_underlying_arguments_rtc ignores it (GemmKernelParams has no signal field).
-        int32_t* signal{nullptr};
-    };
-
-    using CollectiveMainloopParams = MainLoopArguments;
-    using CollectiveEpilogueParams = EpilogueArgs;
-
-    struct GemmKernelParams {
-        GemmUniversalMode mode;
-        GemmProblemSize problem_shape;
-        CollectiveMainloopParams collective_mainloop_params;
-        CollectiveEpilogueParams collective_epilogue_params;
-        cutlass::KernelHardwareInfo hw_info;
-        DenseGemmTileSchedulerArguments scheduler;
-        void* workspace{nullptr}; // workspace,
-    };
-
-    struct Args {
-        LaunchInfo launch_info;
-        LaunchArgs launch_args;
-        GemmKernelParams kernel_params;
-    };
-
-    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace) {
-        auto problem_shape = args.problem_shape;
-        auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
-
-        int sm_count = args.hw_info.cu_count;
-        if (sm_count <= 0) {
-            CUTLASS_TRACE_HOST(
-                "  WARNING: Arguments do not include a valid SM count.\n"
-                "  For optimal performance, populate the arguments KernelHardwareInfo struct with the SM count.");
-            sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(args.hw_info.device_id);
-        }
-
-        CUTLASS_TRACE_HOST("to_underlying_arguments(): Setting persistent grid SM count to " << sm_count);
-
-        cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
-
-        return {args.mode, problem_shape,  args.mainloopargs, args.epilogueargs,
-                hw_info,   args.scheduler, workspace};
-    }
-
-    // ElementOutput is part of the runtime type; hardware constants are process-stable.
-    // Shape N only changes the generated code through the epilogue alignment flag.
-    static auto compile_key(const Args& args) {
-        const auto& info = args.launch_info;
-        const bool is_aligned_n = cute::get<1>(args.kernel_params.problem_shape) % info.block_n == 0;
-        return std::make_tuple(info.block_m, info.block_n, info.block_k,
-                               info.warp_m, info.warp_n, info.warp_k, info.num_stages,
-                               info.dense_s2_opt, is_aligned_n, info.kernel_name, info.overlap_prologue);
-    }
-
-    static std::string generate_impl(const Args& args) {
-        // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
-        const PpuHwParams& hw = PpuHwParams::instance();
-        // Byte-identical to the original BF16DenseGemmHelper::generate_code output:
-        // IsAlignedN is derived from the runtime problem N and block_n (n % block_n == 0).
-        const int shape_n = cute::get<1>(args.kernel_params.problem_shape);
-        const bool is_aligned_n = (shape_n % args.launch_info.block_n == 0);
-        return fmt::format(
-            R"(
-#include <deep_gemm/impls/bf16_densegemm_cutlass3.cuh>
-#include <deep_gemm/common/gemm_occ_model.cuh>
-namespace deep_gemm {{
-using namespace cute;
-using cutlass::KernelHardwareInfo;
-
-// Injected device hardware constants (host-side hggcDeviceGetAttribute query).
-constexpr int kHwTsmPerCu         = {11};
-constexpr int kHwMaxThreadsPerCta = {12};
-constexpr int kHwMaxWarpsPerCu    = {13};
-constexpr int kHwTotalVregPerCu   = {14};
-
-constexpr int BLOCK_M = {0};
-constexpr int BLOCK_N = {1};
-constexpr int BLOCK_K = {2};
-constexpr int WARP_M = {3};
-constexpr int WARP_N = {4};
-constexpr int WARP_K = {5};
-constexpr int kNumStages = {6};
-
-using ElementAB = cutlass::bfloat16_t;
-using ElementAcc = float;
-
-using LayoutA = cutlass::layout::RowMajor;
-using LayoutB = cutlass::layout::ColumnMajor;
-using LayoutC = cutlass::layout::RowMajor;
-using ElementC = {15};
-using ElementD = ElementC;
-using LayoutD = cutlass::layout::RowMajor;
-using ElementCompute = float;
-using ArchTag = cutlass::arch::PPU0015;
-
-using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
-using WarpShape_t = Shape<Int<WARP_M>, Int<WARP_N>, Int<WARP_K>>;
-static constexpr int WarpOnM = BLOCK_M / WARP_M;
-static constexpr int WarpOnN = BLOCK_N / WARP_N;
-static constexpr int WarpOnK = BLOCK_K / WARP_K;
-static_assert(BLOCK_K % WARP_K == 0, "BLOCK_K must be divisible by WARP_K");
-
-using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementAB, ElementAB, ElementAcc>::type;
-using TiledMma = TiledMMA<
-    MMA_Atom<MmaInst>,
-    Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, Int<WarpOnK>>>,
-    Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, Int<WarpOnK * 16>>>;
-
-using KernelSchedule = cutlass::gemm::KernelAiuMultistage;
-using DispatchPolicy = cutlass::gemm::MainloopPPUAiuOpt<kNumStages, KernelSchedule, {7}, {10}>;
-
-static constexpr bool TransA = false;
-static constexpr bool TransB = false;
-
-// OverlapPrologue interleaves A/B stages in one contiguous smem region, so the
-// TSM swizzle-load atom needs the combined stage stride (validated grouped-path pattern).
-static constexpr bool OverlapPrologue = {10};
-static constexpr int SmemLayoutStageStrideA = OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
-static constexpr int SmemLayoutStageStrideB = OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
-using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementAB, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
-using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementAB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
-
-using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom;
-using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
-using GmemTiledCopyA = typename DefaultOperandA::GmemTiledCopy;
-using SmemLayoutAtomB = typename DefaultOperandB::SmemLayoutAtom;
-using SmemCopyAtomB = typename DefaultOperandB::SmemCopyAtom;
-using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
-
-using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-    ArchTag,
-    DispatchPolicy, TileShape,
-    ElementAB, cutlass::detail::TagToStrideA_t<LayoutA>,
-    ElementAB, cutlass::detail::TagToStrideB_t<LayoutB>,
-    TiledMma,
-    GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,
-    GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity
->;
-
-static constexpr bool IsAlignedN = {8};
-using CollectiveEpilogue = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
-    cutlass::detail::TagToStrideA_t<LayoutC>,
-    cutlass::detail::TagToStrideA_t<LayoutC>,
-    cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
-    cutlass::gemm::EpilogueDefault,
-    IsAlignedN>;
-
-using TileScheduler = DenseGemmScheduler<BLOCK_M, BLOCK_N>;
-using GemmKernel = cutlass::gemm::kernel::BF16DenseGemmKernel<
-    Shape<int,int,int,int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    TileScheduler>;
-
-using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, GemmKernel::SharedStorageSize,
-                            cute::sizeof_bits_v<ElementAB>, cute::sizeof_bits_v<ElementAB>,
-                            cute::sizeof_bits_v<ElementCompute>,
-                            kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu>;
-
-extern "C"
-__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
-__global__ void {9}(
-  typename GemmKernel::Params params
-) {{
-  extern __shared__ char smem[];
-  GemmKernel op;
-  op(params, smem);
-}}
-}}
-)",
-            args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k,
-            args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.warp_k,
-            args.launch_info.num_stages,
-            args.launch_info.dense_s2_opt ? "true" : "false",
-            is_aligned_n ? "true" : "false",
-            args.launch_info.kernel_name,
-            args.launch_info.overlap_prologue ? "true" : "false",
-            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
-            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t");
-    }
-
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, configs, args.kernel_params));
-    }
-};
 
 template <typename ElementOutput>
 class DenseBF16GemmCuteFreeRuntimeT final : public LaunchRuntime<DenseBF16GemmCuteFreeRuntimeT<ElementOutput>> {
@@ -714,10 +453,13 @@ public:
     // field here, including alignment and next-tile prologue overlap.
     static auto compile_key(const Args& args) {
         const auto& info = args.launch_info;
-        const bool is_aligned_n = cute::get<1>(args.kernel_params.problem_shape) % info.block_n == 0;
+        const int shape_n = cute::get<1>(args.kernel_params.problem_shape);
+        const bool is_aligned_n = shape_n % info.block_n == 0;
+        const bool use_packed_store = shape_n % 2 == 0 &&
+            reinterpret_cast<uintptr_t>(args.kernel_params.collective_epilogue_params.ptr_D) % (2 * sizeof(ElementOutput)) == 0;
         return std::make_tuple(info.gemm_type, info.block_m, info.block_n, info.block_k,
                                info.warp_m, info.warp_n, info.warp_k, info.num_stages,
-                               info.dense_s2_opt, is_aligned_n, info.kernel_name, info.overlap_prologue);
+                               info.dense_s2_opt, is_aligned_n, use_packed_store, info.kernel_name, info.overlap_prologue);
     }
 
     // Byte-identical to cute_free/kernel/gemm.cuh::GemmKernel::Params.
@@ -745,6 +487,8 @@ public:
         const auto& info = args.launch_info;
         const int shape_n = cute::get<1>(args.kernel_params.problem_shape);
         const bool is_aligned_n = (shape_n % info.block_n == 0);
+        const bool use_packed_store = shape_n % 2 == 0 &&
+            reinterpret_cast<uintptr_t>(args.kernel_params.collective_epilogue_params.ptr_D) % (2 * sizeof(ElementOutput)) == 0;
 
         return fmt::format(
             R"(
@@ -754,9 +498,9 @@ namespace deep_gemm {{
 
 using GemmTypeTag = cutlass::platform::integral_constant<GemmType, GemmType::{0}>;
 
-using Kernel = BF16GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {11}, {9}, GemmTypeTag{12}>;
+using Kernel = BF16GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {11}, {9}, {13}, GemmTypeTag{12}>;
 
-static_assert(sizeof(typename Kernel::Params) == {13}, "cute-free host/device ABI mismatch");
+static_assert(sizeof(typename Kernel::Params) == {14}, "cute-free host/device ABI mismatch");
 
 }} // namespace deep_gemm
 
@@ -776,7 +520,8 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             is_aligned_n ? "true" : "false",
             info.kernel_name,
             info.overlap_prologue ? "true" : "false",
-            std::is_same_v<ElementOutput, float> ? ", float" : "", sizeof(PackedParams));
+            std::is_same_v<ElementOutput, float> ? ", float" : "",
+            use_packed_store ? "true" : "false", sizeof(PackedParams));
     }
 
 };
@@ -873,14 +618,15 @@ static bool dense_gemv_pair_load(const int rows, const int k, const bool is_810e
 // bf16 dense GEMV fast path (m == 1 or 2). Returns true when launched; false
 // means the shape is uncovered and the caller must fall back to the tile path.
 static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
-                            const torch::Tensor& out, const int& m, const int& n, const int& k) {
+                            const torch::Tensor& out, const int& m, const int& n, const int& k,
+                            bool transposed_n1 = false) {
     DG_HOST_ASSERT(m == 1 || m == 2);
     TORCH_CHECK(lhs.is_contiguous() && rhs.is_contiguous() && out.is_contiguous(),
                 "dense gemv requires contiguous tensors");
 
     int block_x = 0, block_y = 0, k_per_thread = 0, npt = 1;
     if (!deep_gemm_bf16_common::dense_gemv_select_configs(m, n, k, rhs.data_ptr(), lhs.data_ptr(),
-                                                          block_x, block_y, k_per_thread, npt))
+                                                          block_x, block_y, k_per_thread, npt, transposed_n1))
         return false;
     const bool is_810e = std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
     const bool pair_load = m == 1 && dense_gemv_pair_load(n, k, is_810e);
@@ -924,7 +670,7 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
     static constexpr GemmType kGemmType = GemmType::Normal;
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("bf16"), 1, m, n, k, 0, nullptr,
+        dg_prof_params.set_params(kGemmType, false, std::string("bf16"), 1, transposed_n1 ? n : m, transposed_n1 ? 1 : n, k, 0, nullptr,
                                   current_stream());
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
@@ -951,7 +697,14 @@ using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int
 template <typename ElementOutput>
 static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out, const int& m,
                            const int& n, const int& k, std::optional<ConfigTuple> configs = std::nullopt) {
-    int num_sms = get_num_sms();
+    const int num_sms = get_num_sms();
+    // A GEMV grid can occupy every CU, so use the persistent tile scheduler
+    // when the caller restricts the CU budget.
+    const bool limited_n1 = n == 1 && is_ppu1v5_device() &&
+                            num_sms < device_runtime->get_prop()->multiProcessorCount;
+    if (n == 1 && !configs.has_value() && is_ppu1v5_device() && !limited_n1 &&
+        gemv_dense_bf16(rhs, lhs, out, 1, m, k, true))
+        return;
     static constexpr GemmType kGemmType = GemmType::Normal;
 
     using Config = std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>;
@@ -999,21 +752,13 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
     auto* output = static_cast<ElementOutput*>(out.data_ptr());
     if (is_ppu1v5_device()) {
         using CuteRuntime = DenseBF16GemmCuteFreeRuntimeT<ElementOutput>;
-        using CutlassRuntime = DenseBF16GemmCutlass3RuntimeT<ElementOutput>;
         // Dense GEMV fast path (m == 1 or 2): SIMT avoids the tile path's BM=16
         // padding (15/16 lane waste at m==1, 14/16 at m==2). Explicit configs force tile.
-        if ((m == 1 || m == 2) && !configs.has_value() && gemv_dense_bf16(lhs, rhs, out, m, n, k)) {
+        if ((m == 1 || m == 2) && !configs.has_value() && !limited_n1 &&
+            gemv_dense_bf16(lhs, rhs, out, m, n, k)) {
             return;
         }
 
-        // Runtime path selection: DG_USE_CUTE=0 selects original CUTLASS 3 path
-        bool use_cute_free = true;
-        if (const char* env_ct = std::getenv("DG_USE_CUTE")) {
-            if (std::string(env_ct) == "0") use_cute_free = false;
-        }
-
-        // Shared occupancy/overlap heuristic (identical for both paths). Computed
-        // once here so both the CuteFree and Cutlass3 branches reuse it.
         // Step 1: compute blocks_per_cu purely from the SMEM budget so waves and
         // overlap_on can be decided BEFORE any kernel is compiled -- no probe
         // compile / occupancy query is needed.
@@ -1022,6 +767,12 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
         constexpr int kSmemPerCU = 256 * 1024;
         int blocks_per_cu = kSmemPerCU / SMSIZE;
         if (blocks_per_cu < 1) blocks_per_cu = 1;
+        if (limited_n1) {
+            // A grid with at most num_sms CTAs cannot occupy more than that
+            // many CUs, regardless of where the hardware schedules them.
+            blocks_per_cu = 1;
+            num_sms_new = std::min(num_sms_new, num_sms);
+        }
 
         // Step 2: compute waves and decide overlap. Overlap-prologue gating
         // (acblas parity): wave = ceil(tiles / (num_sms * blocks_per_cu)); enable
@@ -1037,7 +788,6 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
         const int waves = blocks_per_wave > 0 ? (num_tiles + blocks_per_wave - 1) / blocks_per_wave : 0;
         const bool overlap_on = (waves > 3) && (k <= 2048);
 
-        if (use_cute_free) {
         // --- CuteFree path (default) ---
         // warp_k comes from the adaptive tile selector (std::get<6> of
         // adaptive_cfg); WarpOnK (block_k / warp_k) is gated inside
@@ -1128,79 +878,6 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
                    block_k, warp_m, warp_n, warp_k, num_stages);
             printf("SMSIZE:%d, vreg:%d, stack:%d\n", smem_cute_free, int(numRegs), int(localSize));
             printf("waves:%d, overlap_on:%d\n", waves, int(overlap_on));
-        }
-        } else {
-            // --- Cutlass3 path (DG_USE_CUTE=0) ---
-            // warp_k is obtained exactly as in the CuteFree path (adaptive
-            // tile selector, std::get<6> of adaptive_cfg); all WarpOnK gating
-            // (memory-bound region, K-depth gate, fat-tile cap, BK whitelist)
-            // lives inside get_warp_k, so both
-            // paths see identical BM/BN/BK/S/warp_k for the same shape.
-            // The JIT-codegened TiledMMA carries Int<WarpOnK> in its thread
-            // layout, so the threadblock must launch WarpOnK extra warp rows;
-            // BF16DenseGemmKernel performs the partial-sum combine via
-            // warp_on_k_reduce when WarpOnK > 1.
-            const int warps_k = block_k / warp_k;
-            dim3 const block_cutlass3 = (block_m / warp_m) * (block_n / warp_n) * warps_k * 32;
-            const auto gemm_args = typename CutlassRuntime::GemmArguments{
-                .mode = cutlass::gemm::GemmUniversalMode::kGemm,
-                .problem_shape = {m, n, k, 1},
-                .mainloopargs = {input_a, stride_A, input_b, stride_B},
-                .epilogueargs =
-                    {
-                        {1.0f, 0.0f},
-                        output,
-                        stride_D,
-                        output,
-                        stride_D,
-                    },
-                .hw_info = hw_info,
-                .scheduler = {(uint32_t)m, (uint32_t)n, (uint32_t)k, nullptr},
-            };
-
-            typename CutlassRuntime::GemmKernelParams params =
-                CutlassRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
-
-            // Single compilation: overlap decision is baked into the generated code.
-            auto args = typename CutlassRuntime::Args{
-                .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, /*dense_s2_opt=*/true, num_stages,
-                                "Normal", "Default", "bf16_dense_gemm", false, /*overlap_prologue=*/overlap_on},
-                .launch_args = {grid, block_cutlass3, SMSIZE},
-                .kernel_params = params,
-            };
-            auto runtime = compiler->build_cached<CutlassRuntime>("bf16_dense_gemm", args);
-            auto kernel = runtime->kernel;
-
-            args.launch_args.grid_dim.x *= blocks_per_cu;
-            // Persistent DenseGemm scheduler reads final grid extent from hw_info.cu_count
-            args.kernel_params.hw_info.cu_count = args.launch_args.grid_dim.x;
-
-            DgProfParam dg_prof_params;
-            if (ProfilingInterface::Instance().get_op_info()) {
-                dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, nullptr,
-                                          current_stream());
-            }
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-            CutlassRuntime::launch(runtime, args);
-
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-            char* pEnv_params = std::getenv("show_log");
-            if (pEnv_params && isdigit(*pEnv_params)) {
-                int numRegs = 0, localSize = 0;
-                hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-                hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
-
-                printf("[DenseGemm_BF16_Cutlass3:]\n");
-                printf("group:%d, problem:[%d, %d, %d]\n", kNumGroups, m, n, k);
-                printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
-                       args.launch_args.grid_dim.x);
-                printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n",
-                       block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages);
-                printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
-                printf("waves:%d, overlap_prologue:%d\n", waves, int(overlap_on));
-            }
         }
     } else {
         // Keep input/mainloop configuration unchanged and specialize only the epilogue.

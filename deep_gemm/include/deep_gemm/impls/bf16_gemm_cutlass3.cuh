@@ -32,29 +32,7 @@
 using namespace cute;
 
 namespace cutlass::gemm {
-template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapPrologue>
-struct MainloopPPUOverlapPrologue {
-  constexpr static int Stages = Stages_;
-#if __HGGC_ARCH__ == 100
-  using ArchTag = arch::PPU0010;
-#else
-  using ArchTag = arch::PPU0015;
-#endif
-  using Schedule = Schedule_;
-  using ClusterShape = Shape<_1,_1,_1>;
-};
 
-template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapMainloop>
-struct MainloopPPUOverlapMainloop {
-  constexpr static int Stages = Stages_;
-#if __HGGC_ARCH__ == 100
-  using ArchTag = arch::PPU0010;
-#else
-  using ArchTag = arch::PPU0015;
-#endif
-  using Schedule = Schedule_;
-  using ClusterShape = Shape<_1,_1,_1>;
-};
 
 template<int Stages_, typename Schedule_ = KernelAiuMultistage>
 struct MainloopPPUAiuOpt {
@@ -1316,9 +1294,7 @@ public:
 
 } // namespace cutlass::gemm::kernel
 
-#include <deep_gemm/impls/bf16_gemm_cutlass3_overlap_prologue.cuh>
 
-#include <deep_gemm/impls/bf16_gemm_cutlass3_overlap_mainloop.cuh>
 
 #pragma clang diagnostic pop
 

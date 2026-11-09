@@ -6,7 +6,19 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ## Unreleased
 
+### Added
+
+- **M890 W4FA8 dense NT GEMM**: implements `fp8_fp4_gemm_nt` and its
+  `gemm_fp8_fp4_bf16_nt` alias with two-dimensional packed weights and
+  scale preprocessing, BF16 output, and optional scalar `inv_scale`.
+
 ### Changed
+
+- **BF16 dense GEMM**: `bf16_gemm_nt` now supports odd N with BF16 or
+  FP32 output on 890P, including an optimized N=1 path. On 810E, N must be
+  even except for N=1 without an explicit configuration; that path requires
+  K divisible by 8 and 16-byte-aligned inputs. On 890P, the retired
+  `DG_USE_CUTE=0` fallback has been removed.
 
 - **M890 W4A4 MegaMoE**: optimizes dispatch, GEMM scheduling, and
   scatter/reduce to improve computation and communication overlap.
@@ -27,7 +39,10 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 - **M890 W4FA8 execution**: expands native tile coverage, unifies automatic
   tile selection, and overlaps streamed weight decoding with FP8 GEMM for
   NoPad/Fused. Adds tile and resource diagnostics through `show_log=1`.
-  Existing GEMM APIs and the nine-element config format remain unchanged.
+  Streamed execution also admits dense and one-to-seven-expert workloads when
+  row count and tile parallelism are sufficient, with native fallback for small
+  shapes. Single-part plans allocate one decoded-weight buffer. Existing grouped
+  APIs and the nine-element config format remain unchanged.
 
 ## 1.1.0+v1.0.0
 
