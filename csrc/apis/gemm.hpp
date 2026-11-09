@@ -29,6 +29,28 @@ using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int
 using W4A16ConfigTuple = deep_gemm_w4a16_common::W4A16ConfigTuple;
 using W4A8ConfigTuple = deep_gemm::w4fa8::W4A8ConfigTuple;
 
+static bool gemm_disjoint(const torch::Tensor& a, const torch::Tensor& b) {
+    if (!a.numel() || !b.numel() || !a.is_alias_of(b) ||
+        at::get_overlap_status(a, b) == at::MemOverlapStatus::No) return true;
+    // TooHard is not proof of overlap. Bound positive-stride views in bytes
+    // relative to their shared storage; holes inside intersecting bounds remain
+    // conservatively rejected. Storage bounds also prevent arithmetic overflow.
+    const auto range = [](const torch::Tensor& t) -> std::optional<std::pair<size_t, size_t>> {
+        const size_t bytes = t.element_size(), limit = t.storage().nbytes() / bytes;
+        if (t.storage_offset() < 0 || size_t(t.storage_offset()) >= limit) return std::nullopt;
+        size_t last = t.storage_offset();
+        for (int dim = 0; dim < t.dim(); ++dim) {
+            if (t.stride(dim) < 0) return std::nullopt;
+            const size_t stride = t.stride(dim), count = t.size(dim) - 1;
+            if (stride && count > (limit - 1 - last) / stride) return std::nullopt;
+            last += count * stride;
+        }
+        return std::make_pair(size_t(t.storage_offset()) * bytes, (last + 1) * bytes);
+    };
+    const auto x = range(a), y = range(b);
+    return x && y && (x->second <= y->first || y->second <= x->first);
+}
+
 static void check_gemm_device_and_output(const torch::Tensor& a, const torch::Tensor& b,
                                          const torch::Tensor& d) {
     TORCH_CHECK(a.is_cuda() && b.device() == a.device() && d.device() == a.device(),
@@ -36,8 +58,7 @@ static void check_gemm_device_and_output(const torch::Tensor& a, const torch::Te
     int device;
     DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device));
     TORCH_CHECK(a.get_device() == device, "GEMM tensors must be on the current accelerator");
-    TORCH_CHECK((!d.is_alias_of(a) || at::get_overlap_status(d, a) == at::MemOverlapStatus::No) &&
-                (!d.is_alias_of(b) || at::get_overlap_status(d, b) == at::MemOverlapStatus::No),
+    TORCH_CHECK(gemm_disjoint(d, a) && gemm_disjoint(d, b),
                 "GEMM output must not overlap an input");
 }
 
@@ -128,8 +149,9 @@ void bf16_gemm_nt(const torch::Tensor& a,
                                       std::make_tuple(0, 0, 0));
         }
     }
-    check_bf16_gemm_config(configs, k, d.element_size());
-    if (configs && !is_ppu1v5_device() && m && n && k)
+    const bool cute_free = m && n && k && model_810e_cute_free_requested();
+    if (m && n && k && !cute_free) check_bf16_gemm_config(configs, k, d.element_size());
+    if (configs && !cute_free && !is_ppu1v5_device() && m && n && k)
         TORCH_CHECK(n % (16 / d.element_size()) == 0 && (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) == 0,
                     "BF16 dense explicit/LUT configs require vector-aligned output");
     if (c.has_value()) {
@@ -139,8 +161,7 @@ void bf16_gemm_nt(const torch::Tensor& a,
         check_major_type_cd(c.value());
         TORCH_CHECK(c->data_ptr() != d.data_ptr() || c->strides() == d.strides(),
                     "C and D sharing the same address must have the same strides");
-        TORCH_CHECK(c->data_ptr() == d.data_ptr() || !d.is_alias_of(*c) ||
-                    at::get_overlap_status(d, *c) == at::MemOverlapStatus::No,
+        TORCH_CHECK(c->data_ptr() == d.data_ptr() || gemm_disjoint(d, *c),
                     "BF16 GEMM C/D must be disjoint or exactly aliased");
         if (m != 0 && n != 0 && k != 0) {
             // BF16 product kernels (including GEMV and split-K) have beta=0.

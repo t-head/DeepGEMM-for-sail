@@ -9,6 +9,12 @@
 # ============ DenseGemm ============
 
 # --- DenseGemm / bf16 ---
+# Backend-specific tiles, empty products, and legacy automatic CU-budget selection.
+DenseGemm,data_type:bf16,m:16,n:32,k:1024,device:810e,cute_free:1,warp_on_k:4,configs:[20,16,32,512,16,32,2]
+DenseGemm,data_type:bf16,m:32,n:64,k:0,device:810e,accumulate:separate,configs:[20,32,64,64,16,32,2]
+DenseGemm,data_type:bf16,m:0,n:64,k:32,device:810e,configs:[20,32,64,64,16,32,2]
+DenseGemm,data_type:bf16,m:4096,n:4096,k:7168,device:810e,num_sms:1
+
 # External LUT precedence, explicit override, miss and invalid tile rejection.
 DenseGemm,data_type:bf16,m:128,n:256,k:1024,device:810e,runtime_lut:1
 # Small M with M/N tails and a final partial BK128 tile.
@@ -18,7 +24,7 @@ DenseGemm,data_type:bf16,m:104,n:8192,k:384,device:810e,num_sms:20
 # BM96 uses a power-of-two warp grid and handles an incomplete final M tile.
 DenseGemm,data_type:bf16,m:65,n:8192,k:1536,device:810e,accumulate:separate
 # Sub-vector output with short K must use guarded scalar GEMV stores.
-DenseGemm,data_type:bf16,m:1,n:2,k:32,device:810e,num_sms:20
+DenseGemm,data_type:bf16,m:1,n:2,k:32,device:810e,num_sms:1
 # C aliasing and cancellation before BF16 rounding; N=1 GEMV product.
 DenseGemm,data_type:bf16,m:2,n:1,k:96,device:810e,accumulate:alias,pattern:cancellation
 # TSM split-K product with BF16 output and aliased C/D.
@@ -68,7 +74,7 @@ DenseGemm,data_type:fp32,m:36,n:32,k:4096,device:810e
 # Long unaligned rows: packing and the product must preserve full FP32 accuracy.
 DenseGemm,data_type:fp32,m:36,n:32,k:4097,device:810e,offset_a:1
 # Shared-memory FP32 path: vector K tail and misaligned scalar K tail.
-DenseGemm,data_type:fp32,m:160,n:512,k:4096,device:810e
+DenseGemm,data_type:fp32,m:160,n:512,k:4096,device:810e,num_sms:1
 DenseGemm,data_type:fp32,m:129,n:130,k:255,device:810e,offset_a:1
 # Narrow-output split-K: scalar loads, final partial BK16, and FP32 reduction.
 DenseGemm,data_type:fp32,m:257,n:32,k:4100,device:810e,offset_a:1
@@ -93,6 +99,10 @@ HcPrenormGemm,data_type:tf32,m:1024,n:32,k:64
 # ============ BatchGemm ============
 
 # --- BatchGemm / bf16 (native strided API, not quantized einsum) ---
+# Shared allocation does not imply aliasing; actual input/output overlap is rejected.
+BatchGemm,data_type:bf16,groups:2,m:32,n:64,k:128,device:810e,layout:interleaved_padded,shared_storage:disjoint
+BatchGemm,data_type:bf16,groups:2,m:32,n:64,k:128,device:810e,layout:padded,shared_storage:overlap,expect_error:input_overlap
+
 # Unaligned output selects Direct BK32/stages=2; padded pitches and broadcast A.
 BatchGemm,data_type:bf16,groups:3,m:37,n:41,k:64,device:810e,layout:padded,broadcast:a
 # Default TSM, interleaved padded output and broadcast B.

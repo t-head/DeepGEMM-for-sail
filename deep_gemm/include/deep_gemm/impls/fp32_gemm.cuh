@@ -18,9 +18,9 @@ struct FP32GemmParams {
 // aligns rows to the warp kernel's 32 lanes x float4 x 4 unrolled K chunk.
 // Zero padding preserves FP32 precision and removes repeated scalar/tail loads.
 // The host restricts this to M,N<129 and 1024<=K<=8192 on 810E.
-__device__ void fp32_gemm_pack_inputs(const FP32GemmParams p) {
+__device__ void fp32_gemm_pack_inputs(const FP32GemmParams p, int64_t block_index) {
     const int padded_k=(p.k+511)/512*512;
-    const int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    const int64_t i=block_index*blockDim.x+threadIdx.x;
     if(i>=(int64_t(p.m)+p.n)*padded_k)return;
     const int row=int(i/padded_k),kk=int(i%padded_k);
     const float* input=row<p.m ? p.a+int64_t(row)*p.k : p.b+int64_t(row-p.m)*p.k;
@@ -32,8 +32,8 @@ __device__ void fp32_gemm_pack_inputs(const FP32GemmParams p) {
 // let each thread reuse its operands across a register tile. The next K tile is
 // prefetched before computing the current one. Scalar loads cover K tails and
 // misaligned storage without changing the FP32 FMA accumulation order.
-template <bool Vectorized, int BM = 32, int BN = 64, int Splits = 1>
-__device__ void fp32_gemm_tiled_nt(const FP32GemmParams p) {
+template <bool Vectorized, int BM = 32, int BN = 64, int Splits = 1, bool Persistent = false>
+__device__ void fp32_gemm_tiled_nt(const FP32GemmParams p, int64_t block_index) {
     static_assert(BM == 32 || BM == 64);
     static_assert(BN == 32 || BN == 64);
     static_assert(Splits > 0 && Splits <= 32);
@@ -41,14 +41,21 @@ __device__ void fp32_gemm_tiled_nt(const FP32GemmParams p) {
     constexpr int LA = BM * BK / (4 * Threads), LB = BN * BK / (4 * Threads);
     __shared__ float sa[BK][BM + 2], sb[BK][BN + 2];
     const int tid = int(threadIdx.x), ty = tid / 16, tx = tid % 16;
-    const int mi = int(blockIdx.y) * BM, ni = int(blockIdx.x) * BN;
+    int mi = int(blockIdx.y) * BM, ni = int(blockIdx.x) * BN, split = int(blockIdx.z);
+    if constexpr (Persistent) {
+        const int64_t tiles_m = (int64_t(p.m) + BM - 1) / BM;
+        const int64_t tiles_n = (int64_t(p.n) + BN - 1) / BN;
+        split = int(block_index / (tiles_m * tiles_n));
+        mi = int((block_index / tiles_n) % tiles_m) * BM;
+        ni = int(block_index % tiles_n) * BN;
+    }
     // Partition whole BK tiles, retaining a possibly partial last tile. Each
     // partition writes FP32 partials; no conversion precedes their reduction.
     const int64_t k_tiles = (int64_t(p.k) + BK - 1) / BK;
-    const int begin_k = int(k_tiles * blockIdx.z / Splits) * BK;
-    const int padded_end = int(k_tiles * (blockIdx.z + 1) / Splits) * BK;
+    const int begin_k = int(k_tiles * split / Splits) * BK;
+    const int padded_end = int(k_tiles * (split + 1) / Splits) * BK;
     const int end_k = padded_end < p.k ? padded_end : p.k;
-    float* output = p.d + int64_t(blockIdx.z) * p.m * p.n;
+    float* output = p.d + int64_t(split) * p.m * p.n;
     float accum[TM][TN] = {};
     float4 ra[LA], rb[LB];
     auto load = [&](int base) {
@@ -117,9 +124,9 @@ __device__ void fp32_gemm_tiled_nt(const FP32GemmParams p) {
 }
 
 template <int Splits>
-__device__ void fp32_gemm_split_reduce(const FP32GemmParams p) {
+__device__ void fp32_gemm_split_reduce(const FP32GemmParams p, int64_t block_index) {
     const int64_t count = int64_t(p.m) * p.n;
-    const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t index = block_index * blockDim.x + threadIdx.x;
     if (index < count) {
         float sum = 0.0f;
         #pragma unroll
@@ -133,13 +140,13 @@ __device__ void fp32_gemm_split_reduce(const FP32GemmParams p) {
 // Operands remain IEEE FP32 throughout; no TF32/BF16 conversion is involved.
 template <int NPerWarp, int BlockWarps, bool Vectorized,
           int StaticM = 0, int StaticN = 0, int StaticK = 0, int Unroll = 1, bool ScalarQuad = false>
-__device__ void fp32_gemm_nt(const FP32GemmParams p) {
+__device__ void fp32_gemm_nt(const FP32GemmParams p, int64_t block_index) {
     static_assert(Unroll > 0, "FP32 unroll must be positive");
     const int m = StaticM > 0 ? StaticM : p.m;
     const int n = StaticN > 0 ? StaticN : p.n;
     const int k = StaticK > 0 ? StaticK : p.k;
     const int lane = threadIdx.x & 31;
-    const int warp = int(blockIdx.x) * BlockWarps + (threadIdx.x >> 5);
+    const int warp = int(block_index) * BlockWarps + (threadIdx.x >> 5);
     const int column_groups = (n - 1) / NPerWarp + 1;
     const int row = warp / column_groups;
     const int col0 = (warp % column_groups) * NPerWarp;

@@ -1450,8 +1450,8 @@ def test_dense_gemm_api(args):
     pattern = args.get('pattern', 'random')
     expected_error = args.get('expect_error')
     fp32 = dtype == torch.float32
-    if min(m, n, k) <= 0:
-        raise ValueError('Dense API regression cases require positive M/N/K')
+    if min(m, n, k) < 0:
+        raise ValueError('Dense API regression cases require nonnegative M/N/K')
     if accumulation not in ('none', 'separate', 'alias'):
         raise ValueError(f'Unsupported accumulate mode: {accumulation}')
     if args.get('with_bias') or get_benchmark():
@@ -1507,7 +1507,7 @@ def test_dense_gemm_api(args):
             # The final contribution also exercises the last split-K partition.
             a[:, 0], a[:, -1] = 1, 1 / 256
             b[:, 0], b[:, -1] = 1, 1
-        elif output_dtype == torch.float32 and accumulation == 'none' and k >= 2:
+        elif output_dtype == torch.float32 and accumulation == 'none' and m and n and k >= 2:
             # Preserve the ordinary FP32-output case's rounding regression:
             # 1 + 1/256 is exact in FP32 but rounds to 1 in BF16.
             a[0].zero_()
@@ -1595,7 +1595,8 @@ def test_native_batch_gemm(args):
     if broadcast not in ('none', 'a', 'b', 'both'):
         raise ValueError('Unsupported native batch broadcast')
     error_messages = {'overlap': ('output batches overlap', 'nonoverlapping rows'),
-                      'k_tiles': ('requires K >= 64 and divisible by 32',)}
+                      'k_tiles': ('requires K >= 64 and divisible by 32',),
+                      'input_overlap': ('output must not overlap an input',)}
     if expected_error not in (None, *error_messages) or args.get('expr') or get_benchmark():
         raise ValueError('Native batch regression requires accuracy mode and native [B,M,K]/[B,N,K] layouts')
     compiling = bool(os.environ.get('HGGC_WARM_UP')) or deep_gemm.get_compile_mode() == 1
@@ -1632,12 +1633,22 @@ def test_native_batch_gemm(args):
         size = 1 + sum((dim - 1) * stride for dim, stride in zip((batch, m, n), strides))
         storage = torch.full((size,), -123., device='cuda', dtype=torch.bfloat16)
         out = storage.as_strided((batch, m, n), strides)
+    if args.get('shared_storage'):
+        # Keep A and padded/interleaved D in one allocation, including guards.
+        offset = 0 if args['shared_storage'] == 'overlap' else a.numel() + 64
+        backing = torch.full((max(a.numel(), offset + storage.numel()),), -123.,
+                             device='cuda', dtype=torch.bfloat16)
+        shared_a = backing[:a.numel()].view_as(a)
+        shared_a.copy_(a)
+        a = shared_a
+        out = backing.as_strided(out.shape, out.stride(), offset)
+        storage = backing
     # Compile-only and rejection checks include D and every padding element,
     # independently of the numeric accuracy flag disabled by the warm-up runner.
     expected_storage = storage.clone() if check or compiling or expected_error else None
     if check and not expected_error:
         reference = gemm_reference(a, b)
-        expected_storage.as_strided(out.shape, out.stride()).copy_(reference)
+        expected_storage.as_strided(out.shape, out.stride(), out.storage_offset()).copy_(reference)
     try:
         gemm_call_with_sms(args, lambda: deep_gemm.bf16_gemm_strided_batched_nt(a, b, out))
     except RuntimeError as error:

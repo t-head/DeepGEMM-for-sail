@@ -195,6 +195,7 @@ int gemv_checks() {
         CHECK_GEMV(output_fp32, true);
         CHECK_GEMV(static_k, true);
         CHECK_GEMV(pair_load, true);
+        CHECK_GEMV(persistent, true);
         if (m == 2) { CHECK_GEMV(npt, 2); }
 #undef CHECK_GEMV
         count += check_change<Runtime>(args, [m](auto& a) { a.launch_info.m = 3 - m; }, "M1/M2 entry");

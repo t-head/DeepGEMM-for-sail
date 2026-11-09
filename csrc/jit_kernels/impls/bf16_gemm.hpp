@@ -804,6 +804,7 @@ public:
         bool output_fp32 = false;
         bool static_k = false;
         bool pair_load = false;
+        bool persistent = false;
     };
 
     struct Args {
@@ -816,7 +817,7 @@ public:
         const auto& info = args.launch_info;
         return std::make_tuple(info.block_x, info.block_y, info.k_per_thread,
                                info.m == 2, info.npt, info.kernel_name, info.output_fp32,
-                               info.static_k, info.pair_load, info.static_k ? args.kernel_params.K : 0);
+                               info.static_k, info.pair_load, info.persistent, info.static_k ? args.kernel_params.K : 0);
     }
 
     static std::string generate_impl(const Args& args) {
@@ -833,8 +834,10 @@ namespace deep_gemm {{
 extern "C" __global__
 void {}(const GemvDenseArgs args) {{
     {}
+    {}
     {}<__ppu_bfloat16, {}, float,
-       {}, {}, {}, {}, {}{}>({});
+       {}, {}, {}, {}, {}{}>({}, block_index);
+    {}
 }}
 
 }}
@@ -843,12 +846,17 @@ void {}(const GemvDenseArgs args) {{
             args.launch_info.static_k ? fmt::format(
                 "GemvDenseArgs fixed_args = args; fixed_args.K = {}; fixed_args.stride_wn = {};",
                 args.kernel_params.K, args.kernel_params.K) : "",
+            args.launch_info.persistent ? fmt::format(
+                "for (int64_t block_index = blockIdx.x; block_index < (int64_t(args.N) + {0} - 1) / {0}; block_index += gridDim.x) {{",
+                args.launch_info.block_y * (is_m2 ? args.launch_info.npt : 1)) :
+                "const int block_index = blockIdx.x;",
             entry,
             args.launch_info.output_fp32 ? "float" : "__ppu_bfloat16",
             args.launch_info.pair_load ? "int" : "int4",
             args.launch_info.pair_load ? "int" : "int4",
             args.launch_info.block_x, args.launch_info.block_y, args.launch_info.k_per_thread,
-            npt_arg, args.launch_info.static_k ? "fixed_args" : "args");
+            npt_arg, args.launch_info.static_k ? "fixed_args" : "args",
+            args.launch_info.persistent ? "__syncthreads(); }" : "");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -892,6 +900,9 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
 
     dim3 block(block_x, block_y);
     dim3 grid(ceil_div(n, block_y * npt));
+    const bool persistent = is_810e && get_num_sms() < device_runtime->get_prop()->multiProcessorCount &&
+                            grid.x > unsigned(get_num_sms());
+    if (persistent) grid.x = get_num_sms();
 
     // m == 2 -> dual-accumulator variant; npt == 2 walks two W rows/thread sharing
     // (x0, x1), each block owning block_y * npt rows. Names split so a trace shows npt.
@@ -903,7 +914,7 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
     // and row-stride arithmetic without specializing M/N or changing the ABI.
     const bool static_k = k <= 1024 && is_810e;
     auto args = DenseGemvRuntime::Args{
-        .launch_info = {block_x, block_y, k_per_thread, m, npt, kernel_name, output_fp32, static_k, pair_load},
+        .launch_info = {block_x, block_y, k_per_thread, m, npt, kernel_name, output_fp32, static_k, pair_load, persistent},
         .launch_args = {grid, block, 0},
         .kernel_params = params,
     };
@@ -1233,6 +1244,8 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             int blocks_per_cu = 0;
             HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, smem_size);
             args.launch_args.grid_dim.x *= blocks_per_cu;
+            if (args.launch_info.dense_s2_opt && num_sms_new < kModel810eTensorCUs)
+                args.launch_args.grid_dim.x = num_sms_new;
             DgProfParam dg_prof_params;
             if (ProfilingInterface::Instance().get_op_info()) {
                 dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, 0, grouped_layout,
@@ -1354,6 +1367,11 @@ static bool model_810e_bf16_n1(const torch::Tensor& a, const torch::Tensor& b, c
         {bx, by, unroll, 1, 1, name, fp32, is_810e && k <= 1024, pair_load},
         {dim3(ceil_div(m, by)), dim3(bx, by), 0},
         {m, k, b.data_ptr(), a.data_ptr(), d.data_ptr(), k}};
+    if (is_810e && get_num_sms() < device_runtime->get_prop()->multiProcessorCount &&
+        args.launch_args.grid_dim.x > unsigned(get_num_sms())) {
+        args.launch_info.persistent = true;
+        args.launch_args.grid_dim.x = get_num_sms();
+    }
     auto code = DenseGemvRuntime::generate(args);
     auto runtime = compiler->build(name, code);
     DenseGemvRuntime::launch(runtime, args);
@@ -1842,6 +1860,13 @@ static void model_810e_cute_free_launch(const torch::Tensor& a, const torch::Ten
     Runtime::launch(runtime,args);
 }
 
+static bool model_810e_cute_free_requested() {
+    if (!model_810e_dispatch_device()) return false;
+    const char* use = std::getenv("DG_USE_CUTE");
+    if (use) TORCH_CHECK(std::string(use) == "0" || std::string(use) == "1", "DG_USE_CUTE must be 0 or 1");
+    return (!use || std::string(use) != "0") && (use || std::getenv("DG_810E_WARP_ON_K"));
+}
+
 static bool model_810e_cute_free(const torch::Tensor& a, const torch::Tensor& b,
     const torch::Tensor& d, const std::optional<ConfigTuple>& configs) {
     if (!model_810e_dispatch_device()) return false;
@@ -1941,9 +1966,9 @@ static bool model_810e_dispatch_dense(const torch::Tensor& a, const torch::Tenso
     const bool per_element_output = b.size(0) % output_alignment != 0 ||
                                    (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) != 0;
     const bool low_budget = get_num_sms() < kModel810eTensorCUs;
-    if (low_budget && !per_element_output) return false;
-    if (!low_budget && a.size(0) <= 2 && gemv_dense_bf16(a, b, d, int(a.size(0)), int(b.size(0)), int(a.size(1))))
+    if (a.size(0) <= 2 && gemv_dense_bf16(a, b, d, int(a.size(0)), int(b.size(0)), int(a.size(1))))
         return true;
+    if (low_budget && !per_element_output) return false;
     // Custom AIU mainloops require complete BK32 tiles and two prologue tiles.
     const bool supported_inputs = a.size(1) >= 64 && a.size(1) % 32 == 0 &&
         (reinterpret_cast<uintptr_t>(a.data_ptr()) & 15) == 0 &&

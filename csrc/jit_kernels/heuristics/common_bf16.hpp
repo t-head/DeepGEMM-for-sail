@@ -538,7 +538,7 @@ get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms) 
     int k = shape[2];
     std::tuple<int, int, int> best_smem_config = get_smem_config(stages, k, bm, bn, bk);
 
-    return {num_min_sms, bm, bn, bk, wm, wn, bk, stages, best_smem_config};
+    return {std::min(num_min_sms, num_sms), bm, bn, bk, wm, wn, bk, stages, best_smem_config};
 }
 // 810E dispatch plans depend on geometry, K alignment and output precision.
 // Tile fields are BM, BN, BK, WM, WN, stages, split-K, then scheduling flags.

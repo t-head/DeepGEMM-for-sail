@@ -24,38 +24,42 @@ public:
         int block_n = 64, splits = 1;
         bool reduce = false;
         bool pack = false, scalar_quad = false;
+        bool persistent = false;
     };
     static std::string generate_impl(const Args& args) {
-        if (args.pack)
-            return R"(
-#include <deep_gemm/impls/fp32_gemm.cuh>
-extern "C" __global__ void fp32_gemm(deep_gemm::FP32GemmParams p) {
-    deep_gemm::fp32_gemm_pack_inputs(p);
-}
-)";
-        if (args.reduce)
-            return fmt::format(R"(
-#include <deep_gemm/impls/fp32_gemm.cuh>
-extern "C" __global__ void fp32_gemm(deep_gemm::FP32GemmParams p) {{
-    deep_gemm::fp32_gemm_split_reduce<{}>(p);
-}}
-)", args.splits);
-        if (args.tiled)
-            return fmt::format(R"(
-#include <deep_gemm/impls/fp32_gemm.cuh>
-extern "C" __global__ void fp32_gemm(deep_gemm::FP32GemmParams p) {{
-    {}
-    deep_gemm::fp32_gemm_tiled_nt<{}, {}, {}, {}>(p);
-}}
-)", args.splits > 1 && args.static_k ? fmt::format("p.k = {};", args.static_k) : "",
-                args.vectorized ? "true" : "false", args.block_m, args.block_n, args.splits);
+        std::string call, count;
+        if (args.pack) {
+            call = "deep_gemm::fp32_gemm_pack_inputs(p, block_index);";
+            count = "((int64_t(p.m) + p.n) * ((int64_t(p.k) + 511) / 512 * 512) + 255) / 256";
+        } else if (args.reduce) {
+            call = fmt::format("deep_gemm::fp32_gemm_split_reduce<{}>(p, block_index);", args.splits);
+            count = "(int64_t(p.m) * p.n + 63) / 64";
+        } else if (args.tiled) {
+            call = fmt::format("{} deep_gemm::fp32_gemm_tiled_nt<{}, {}, {}, {}, {}>(p, block_index);",
+                args.splits > 1 && args.static_k ? fmt::format("p.k = {};", args.static_k) : "",
+                args.vectorized ? "true" : "false", args.block_m, args.block_n, args.splits,
+                args.persistent ? "true" : "false");
+            count = fmt::format("((int64_t(p.m) + {0} - 1) / {0}) * ((int64_t(p.n) + {1} - 1) / {1}) * {2}",
+                                args.block_m, args.block_n, args.splits);
+        } else {
+            call = fmt::format("deep_gemm::fp32_gemm_nt<{}, {}, {}, {}, {}, {}, {}, {}>(p, block_index);",
+                args.n_per_warp, args.block_warps, args.vectorized ? "true" : "false",
+                args.static_m, args.static_n, args.static_k, args.unroll, args.scalar_quad ? "true" : "false");
+            count = fmt::format("(int64_t(p.m) * ((int64_t(p.n) + {0} - 1) / {0}) + {1} - 1) / {1}",
+                                args.n_per_warp, args.block_warps);
+        }
+        // Every path enumerates logical CTAs independently of the bounded grid.
+        // The barrier also protects shared storage when a CTA takes another tile.
         return fmt::format(R"(
 #include <deep_gemm/impls/fp32_gemm.cuh>
 extern "C" __global__ void fp32_gemm(deep_gemm::FP32GemmParams p) {{
-    deep_gemm::fp32_gemm_nt<{}, {}, {}, {}, {}, {}, {}, {}>(p);
+    {0}
+    {1}
+    {2}
 }}
-)", args.n_per_warp, args.block_warps, args.vectorized ? "true" : "false",
-            args.static_m, args.static_n, args.static_k, args.unroll, args.scalar_quad ? "true" : "false");
+)", args.persistent ? fmt::format("for (int64_t block_index = blockIdx.x; block_index < {}; block_index += gridDim.x) {{", count) :
+                             "const int64_t block_index = blockIdx.x;",
+            call, args.persistent ? "__syncthreads(); }" : "");
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
@@ -85,6 +89,15 @@ static void fp32_gemm(const torch::Tensor& a, const torch::Tensor& b, const torc
     // Bound the number of JIT variants while removing division and tail tests
     // for whole families of narrow outputs and complete unrolled K chunks.
     const bool is_810e = std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
+    const auto bound_grid = [&](auto& args) {
+        const auto grid = args.launch_args.grid_dim;
+        const int64_t blocks = int64_t(grid.x) * grid.y * grid.z;
+        if (is_810e && get_num_sms() < device_runtime->get_prop()->multiProcessorCount &&
+            blocks > get_num_sms()) {
+            args.persistent = true;
+            args.launch_args.grid_dim = dim3(get_num_sms());
+        } else args.persistent = false;
+    };
     // Packing is worthwhile only when many narrow-output dot products reuse
     // the same long, unaligned rows. Both the copy and product are launches in
     // this invocation; compile-only/warm-up skips execution of both runtimes.
@@ -96,6 +109,7 @@ static void fp32_gemm(const torch::Tensor& a, const torch::Tensor& b, const torc
             {a.data_ptr<float>(),b.data_ptr<float>(),packed.data_ptr<float>(),m,n,k},
             npw,warps,vectorized,0,0,0,unroll};
         x.pack=true;
+        bound_grid(x);
         auto code=FP32GemmRuntime::generate(x);auto runtime=compiler->build("fp32_gemm",code);
         FP32GemmRuntime::launch(runtime,x);
         fp32_gemm(packed.narrow(0,0,m),packed.narrow(0,m,n),d);
@@ -128,6 +142,9 @@ static void fp32_gemm(const torch::Tensor& a, const torch::Tensor& b, const torc
         // four BK16 tiles per partition; at most 32 partials bound the reduction
         // overhead and workspace without an exact-shape dispatch table.
         const int64_t tiles = ceil_div(m64, int64_t(block_m)) * ceil_div(n64, int64_t(block_n));
+        // Preserve partitioning when the CU budget changes: fewer splits can
+        // lengthen the FP32 accumulation chain enough to lose accuracy. The
+        // bounded launch below limits concurrency without changing that order.
         const int target = narrow_tiled ? 256 : 384;
         while (splits < 32 && tiles * splits < target && k / 16 / (splits * 2) >= 4)
             splits *= 2;
@@ -139,6 +156,7 @@ static void fp32_gemm(const torch::Tensor& a, const torch::Tensor& b, const torc
         {a.data_ptr<float>(), b.data_ptr<float>(), workspace.data_ptr<float>(), m, n, k}, npw, warps, vectorized,
         static_m, static_n, static_k, unroll, tiled, block_m, block_n, splits};
     args.scalar_quad = is_810e;
+    bound_grid(args);
     auto code = FP32GemmRuntime::generate(args);
     auto runtime = compiler->build("fp32_gemm", code);
     FP32GemmRuntime::launch(runtime, args);
@@ -148,6 +166,7 @@ static void fp32_gemm(const torch::Tensor& a, const torch::Tensor& b, const torc
         args.launch_args.block_dim = dim3(reduce_threads);
         args.params = {workspace.data_ptr<float>(), nullptr, d.data_ptr<float>(), m, n, k};
         args.reduce = true;
+        bound_grid(args);
         auto reduce_code = FP32GemmRuntime::generate(args);
         auto reduce_runtime = compiler->build("fp32_gemm", reduce_code);
         FP32GemmRuntime::launch(reduce_runtime, args);
