@@ -1054,8 +1054,10 @@ def read_cycle_from_nculog(filename, include_nvfp4_decode=False):
             name in op.lower() for name in ('w4a8_nvfp4', 'dequantize_nvfp4_fp8'))
         if ("gemm" in op.lower() or "attention" in op.lower() or "mhc" in op.lower() or is_nvfp4_kernel) and "metadata" not in op.lower():
             fwd_cycle_sum += cycle
-            fwd_tc_sum = tc_list[i]
-            fwd_hbm_sum = hbm_list[i]
+            # Decoder contributes time/cycles; efficiency metrics describe the GEMM.
+            if not (include_nvfp4_decode and "dequantize_nvfp4_fp8" in op.lower()):
+                fwd_tc_sum = tc_list[i]
+                fwd_hbm_sum = hbm_list[i]
             # NVFP4 prefill is a decoder followed by GEMM; report their combined time.
             fwd_time = fwd_time + time_list[i] if include_nvfp4_decode else time_list[i]
     # calculate statistics data
