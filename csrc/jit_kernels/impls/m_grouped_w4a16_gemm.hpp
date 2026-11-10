@@ -170,7 +170,7 @@ static void launch_w4a16_gemm(const W4A16LaunchInfo& info, W4A16Type w4a16_type,
     args.launch_args.grid_dim = dim3(threadblock_count, 1, 1);
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         // The fused arm is reported in token/topk terms instead of the m/em ones, and
         // `set_fused_moe_params` records `quant_type` itself, so only the other arm adds it
         if (gemm_type == GemmType::MGroupedFused) {
@@ -203,9 +203,10 @@ static void launch_w4a16_gemm(const W4A16LaunchInfo& info, W4A16Type w4a16_type,
         printf("smem_size:%d, vreg:%d, stack:%d\n", info.smem_size, int(numRegs), int(localSize));
     }
 
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-    Runtime::launch(runtime, args);
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        Runtime::launch(runtime, args);
+    }
 }
 
 // Shared launch path for the three W4A16 grouped GEMM flavours, mirroring `m_grouped_gemm_w4a16_common`.

@@ -801,14 +801,13 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
         args.launch_args.grid_dim.x *= blocks_per_cu;
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
+        if (deep_gemm::profiling_enabled()) {
             dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout, current_stream());
         }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        DenseINT8GemmCutlass3Runtime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        {
+            auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+            DenseINT8GemmCutlass3Runtime::launch(runtime, args);
+        }
 
         char* pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
@@ -860,14 +859,13 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
         args.launch_args.grid_dim.x *= blocks_per_cu;
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
+        if (deep_gemm::profiling_enabled()) {
             dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout, current_stream());
         }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        INT8GemmCutlass3Runtime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        {
+            auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+            INT8GemmCutlass3Runtime::launch(runtime, args);
+        }
 
         char* pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {

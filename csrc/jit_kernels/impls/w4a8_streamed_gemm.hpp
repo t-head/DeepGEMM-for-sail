@@ -362,7 +362,7 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
     log_streamed_config(execution, int(a.size(0)), n, k, groups, m, chunk, parts, prepared->second);
 
     DgProfParam prof;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         if (is_fused)
             prof.set_fused_moe_params("w4fa8_mma", "group", groups, a.size(0), m / a.size(0), n, k,
                                       rows.data_ptr<int32_t>(), caller);
@@ -373,110 +373,113 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
         }
         prof.add_params(std::string("group_size"), 32);
     }
-    ProfilingInterface::Instance().instrument(true, prof);
-    // Decode anew on every invocation; each buffer obeys the weight budget.
-    // A dense full-N plan has one part and needs only one buffer.
     std::array<torch::Tensor, 2> scratch;
-    for (int slot = 0; slot < std::min(parts, 2); ++slot)
-        scratch[slot] = at::empty({int64_t(chunk) * tile_n * k + 8}, b.options());
-    // The inherited collective ABI carries a B-scale pointer, but the streamed
-    // mainloop reads only A scales: decoded E5M2 weights include their scales.
-    auto b_scale_storage = at::empty({chunk, tile_n, 1}, a_scale.options());
-    torch::Tensor core_a = a, core_scale = a_scale;
-    w4fa8_streamed::GatherParams gather{};
-    if (is_fused) {
-        core_a = at::empty({m, k}, a.options());
-        core_scale = at::empty({m, 1}, a_scale.options());
-        gather = {reinterpret_cast<const uint8_t*>(a.data_ptr()),
-                  a_scale.data_ptr<float>(),
-                  reinterpret_cast<uint8_t*>(core_a.data_ptr()),
-                  core_scale.data_ptr<float>(),
-                  fused.experts.data_ptr<int32_t>(),
-                  fused.tokens.data_ptr<int32_t>(),
-                  fused.aligned.data_ptr<int32_t>(),
-                  int(a.size(0))};
-        if (!chunk_gather) {
-            gather_args.params = gather;
-            launch_streamed_on<StreamedGatherRuntime>(gather_kernel, gather_args, caller);
-        }
-    }
-    auto output = reinterpret_cast<cutlass::bfloat16_t*>(d.data_ptr());
-    const auto stride_input = cute::Stride<int64_t, cute::Int<1>, int64_t>{k, cute::Int<1>{}, 0};
-    const auto stride_output = cute::Stride<int64_t, cute::Int<1>, int64_t>{n, cute::Int<1>{}, 0};
-
-    const int overlap_per_sm = int64_t(m) >= int64_t(groups) * (is_fused ? 4096 : 2048) ? 1 : 2;
-    auto decode = [&](int index) {
-        const auto& work = plan[index];
-        const int group_start = work.group_start, local_groups = work.groups;
-        const auto& pair = kernels.at({local_groups, work.n_count});
-        auto args = pair.decode;
-        const int64_t blocks = (int64_t(local_groups) * work.n_count * k / 16 + 255) / 256;
-        // Bound interference while the compute stream is active.
-        args.launch_args.grid_dim =
-            dim3(std::min<int64_t>(blocks, int64_t(num_sms) * (index == 0 ? 8 : overlap_per_sm)));
-        args.params = {b.data_ptr<uint8_t>() + int64_t(group_start) * n * k / 2,
-                       scale.data_ptr<uint8_t>() + int64_t(group_start) * n * k / 32,
-                       scratch[index & 1].data_ptr<uint8_t>(),
-                       work.n_begin,
-                       rows.data_ptr<int32_t>(),
-                       group_start};
-        args.gather = gather;
-        launch_streamed_on<StreamedDecodeRuntime>(pair.decoder, args, context->decode);
-    };
-    auto core = [&](int index) {
-        const auto& work = plan[index];
-        const int group_start = work.group_start, local_groups = work.groups;
-        const auto& pair = kernels.at({local_groups, work.n_count});
-        auto args = pair.core;
-        const auto& buffer = scratch[index & 1];
-        auto range = reinterpret_cast<const int32_t*>(buffer.data_ptr<uint8_t>() + int64_t(local_groups) * work.n_count * k);
-        args.inv_scale = inv_scale;
-        args.params = {StreamedInt8::GemmUniversalMode::kGemm,
-                       {m, work.n_count, k, 1},
-                       {core_a.data_ptr(), stride_input, buffer.data_ptr(), stride_input, core_scale.data_ptr<float>(),
-                        b_scale_storage.data_ptr<float>()},
-                       {{}, output + work.n_begin, stride_output, output + work.n_begin, stride_output},
-                       {a.get_device(), num_sms},
-                       {uint32_t(m), rows.data_ptr<int32_t>() + group_start, range},
-                       nullptr,
-                       nullptr};
-        launch_streamed_on<StreamedCoreRuntime>(pair.gemm, args, context->compute);
-    };
-
-    try {
-        // Input preparation precedes the fork on the caller stream.
-        DG_HGGC_RUNTIME_CHECK(hggcEventRecord(context->fork, caller));
-        DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->compute, context->fork, 0));
-        DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->decode, context->fork, 0));
-        decode(0);
-        DG_HGGC_RUNTIME_CHECK(hggcEventRecord(context->decoded[0], context->decode));
-        DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->compute, context->decoded[0], 0));
-        for (int index = 0; index < parts; ++index) {
-            core(index);
-            DG_HGGC_RUNTIME_CHECK(hggcEventRecord(context->consumed[index], context->compute));
-            if (index + 1 < parts) {
-                // Do not overwrite a slot until its preceding reader completes.
-                if (index >= 1)
-                    DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->decode, context->consumed[index - 1], 0));
-                decode(index + 1);
-                DG_HGGC_RUNTIME_CHECK(hggcEventRecord(context->decoded[index + 1], context->decode));
-                DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->compute, context->decoded[index + 1], 0));
+    torch::Tensor b_scale_storage, core_a, core_scale;
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(prof);
+        // Decode anew on every invocation; each buffer obeys the weight budget.
+        // A dense full-N plan has one part and needs only one buffer.
+        for (int slot = 0; slot < std::min(parts, 2); ++slot)
+            scratch[slot] = at::empty({int64_t(chunk) * tile_n * k + 8}, b.options());
+        // The inherited collective ABI carries a B-scale pointer, but the streamed
+        // mainloop reads only A scales: decoded E5M2 weights include their scales.
+        b_scale_storage = at::empty({chunk, tile_n, 1}, a_scale.options());
+        core_a = a;
+        core_scale = a_scale;
+        w4fa8_streamed::GatherParams gather{};
+        if (is_fused) {
+            core_a = at::empty({m, k}, a.options());
+            core_scale = at::empty({m, 1}, a_scale.options());
+            gather = {reinterpret_cast<const uint8_t*>(a.data_ptr()),
+                      a_scale.data_ptr<float>(),
+                      reinterpret_cast<uint8_t*>(core_a.data_ptr()),
+                      core_scale.data_ptr<float>(),
+                      fused.experts.data_ptr<int32_t>(),
+                      fused.tokens.data_ptr<int32_t>(),
+                      fused.aligned.data_ptr<int32_t>(),
+                      int(a.size(0))};
+            if (!chunk_gather) {
+                gather_args.params = gather;
+                launch_streamed_on<StreamedGatherRuntime>(gather_kernel, gather_args, caller);
             }
         }
-        // All internal readers/writers join before the allocator can reuse any
-        // caller-stream storage or subsequent caller work can modify inputs.
-        DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(caller, context->consumed[parts - 1], 0));
-    } catch (...) {
-        // Keep local tensors alive if submission fails after work has started.
-        // Every queued wait references a record already submitted above.
-        // Capture records nodes without executing them; only live submissions drain.
-        if (!capturing) {
-            hggcStreamSynchronize(context->compute);
-            hggcStreamSynchronize(context->decode);
+        auto output = reinterpret_cast<cutlass::bfloat16_t*>(d.data_ptr());
+        const auto stride_input = cute::Stride<int64_t, cute::Int<1>, int64_t>{k, cute::Int<1>{}, 0};
+        const auto stride_output = cute::Stride<int64_t, cute::Int<1>, int64_t>{n, cute::Int<1>{}, 0};
+
+        const int overlap_per_sm = int64_t(m) >= int64_t(groups) * (is_fused ? 4096 : 2048) ? 1 : 2;
+        auto decode = [&](int index) {
+            const auto& work = plan[index];
+            const int group_start = work.group_start, local_groups = work.groups;
+            const auto& pair = kernels.at({local_groups, work.n_count});
+            auto args = pair.decode;
+            const int64_t blocks = (int64_t(local_groups) * work.n_count * k / 16 + 255) / 256;
+            // Bound interference while the compute stream is active.
+            args.launch_args.grid_dim =
+                dim3(std::min<int64_t>(blocks, int64_t(num_sms) * (index == 0 ? 8 : overlap_per_sm)));
+            args.params = {b.data_ptr<uint8_t>() + int64_t(group_start) * n * k / 2,
+                           scale.data_ptr<uint8_t>() + int64_t(group_start) * n * k / 32,
+                           scratch[index & 1].data_ptr<uint8_t>(),
+                           work.n_begin,
+                           rows.data_ptr<int32_t>(),
+                           group_start};
+            args.gather = gather;
+            launch_streamed_on<StreamedDecodeRuntime>(pair.decoder, args, context->decode);
+        };
+        auto core = [&](int index) {
+            const auto& work = plan[index];
+            const int group_start = work.group_start, local_groups = work.groups;
+            const auto& pair = kernels.at({local_groups, work.n_count});
+            auto args = pair.core;
+            const auto& buffer = scratch[index & 1];
+            auto range = reinterpret_cast<const int32_t*>(buffer.data_ptr<uint8_t>() + int64_t(local_groups) * work.n_count * k);
+            args.inv_scale = inv_scale;
+            args.params = {StreamedInt8::GemmUniversalMode::kGemm,
+                           {m, work.n_count, k, 1},
+                           {core_a.data_ptr(), stride_input, buffer.data_ptr(), stride_input, core_scale.data_ptr<float>(),
+                            b_scale_storage.data_ptr<float>()},
+                           {{}, output + work.n_begin, stride_output, output + work.n_begin, stride_output},
+                           {a.get_device(), num_sms},
+                           {uint32_t(m), rows.data_ptr<int32_t>() + group_start, range},
+                           nullptr,
+                           nullptr};
+            launch_streamed_on<StreamedCoreRuntime>(pair.gemm, args, context->compute);
+        };
+
+        try {
+            // Input preparation precedes the fork on the caller stream.
+            DG_HGGC_RUNTIME_CHECK(hggcEventRecord(context->fork, caller));
+            DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->compute, context->fork, 0));
+            DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->decode, context->fork, 0));
+            decode(0);
+            DG_HGGC_RUNTIME_CHECK(hggcEventRecord(context->decoded[0], context->decode));
+            DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->compute, context->decoded[0], 0));
+            for (int index = 0; index < parts; ++index) {
+                core(index);
+                DG_HGGC_RUNTIME_CHECK(hggcEventRecord(context->consumed[index], context->compute));
+                if (index + 1 < parts) {
+                    // Do not overwrite a slot until its preceding reader completes.
+                    if (index >= 1)
+                        DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->decode, context->consumed[index - 1], 0));
+                    decode(index + 1);
+                    DG_HGGC_RUNTIME_CHECK(hggcEventRecord(context->decoded[index + 1], context->decode));
+                    DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(context->compute, context->decoded[index + 1], 0));
+                }
+            }
+            // All internal readers/writers join before the allocator can reuse any
+            // caller-stream storage or subsequent caller work can modify inputs.
+            DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(caller, context->consumed[parts - 1], 0));
+        } catch (...) {
+            // Keep local tensors alive if submission fails after work has started.
+            // Every queued wait references a record already submitted above.
+            // Capture records nodes without executing them; only live submissions drain.
+            if (!capturing) {
+                hggcStreamSynchronize(context->compute);
+                hggcStreamSynchronize(context->decode);
+            }
+            throw;
         }
-        throw;
     }
-    ProfilingInterface::Instance().instrument(false, prof);
     if (!capturing)
         prepared->second.warmed = true;
     return true;

@@ -256,15 +256,15 @@ static void launch_gemm(typename Runtime::Args& args, int num_sms, int expected_
     args.launch_args.grid_dim.x = args.kernel_params.hw_info.cu_count;
     const auto& info = args.launch_info;
     DgProfParam profile;
-    auto& profiling = ProfilingInterface::Instance();
-    if (profiling.get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         profile.set_params(GemmType::MegaMoE, false, "fp4", info.num_groups,
             cute::get<0>(args.kernel_params.problem_shape), info.n, info.k, expected_m, nullptr, current_stream());
         profile.add_params("stage", name);
     }
-    profiling.instrument(true, profile);
-    Runtime::launch(runtime, args);
-    profiling.instrument(false, profile);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(profile);
+        Runtime::launch(runtime, args);
+    }
     if (get_env<int>("show_log", 0)) {
         int registers = 0, stack_bytes = 0;
 #if HGGCRT_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
