@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <optional>
 
 #include "../../jit/device_runtime.hpp"
@@ -7,6 +8,8 @@
 #include "../../utils/lazy_init.hpp"
 
 namespace deep_gemm {
+
+inline std::atomic<bool> mega_gate_deterministic{false};
 
 class HeuristicsRuntime {
     static constexpr int kLegacyMKAlignmentForContiguousLayout = 128;
