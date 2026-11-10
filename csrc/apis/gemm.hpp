@@ -283,9 +283,8 @@ void bf16_gemm_nt(const torch::Tensor& a,
                                       std::make_tuple(0, 0, 0));
         }
     }
-    const bool cute_free = m && n && k && model_810e_cute_free_requested();
-    if (m && n && k && !cute_free) check_bf16_gemm_config(configs, k, d.element_size());
-    if (configs && !cute_free && !is_ppu1v5_device() && m && n && k)
+    if (m && n && k) check_bf16_gemm_config(configs, k, d.element_size());
+    if (configs && !is_ppu1v5_device() && m && n && k)
         TORCH_CHECK(n % (16 / d.element_size()) == 0 && (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) == 0,
                     "BF16 dense explicit/LUT configs require vector-aligned output");
     if (c.has_value()) {

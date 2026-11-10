@@ -9,8 +9,9 @@
 # ============ DenseGemm ============
 
 # --- DenseGemm / bf16 ---
-# Backend-specific tiles, empty products, and legacy automatic CU-budget selection.
-DenseGemm,data_type:bf16,m:16,n:32,k:1024,device:810e,cute_free:1,warp_on_k:4,configs:[20,16,32,512,16,32,2]
+# Automatic cute-free/WarpOnK=4 with BF16 output.
+DenseGemm,data_type:bf16,m:16,n:128,k:1024,device:810e
+# Empty products and legacy automatic CU-budget selection.
 DenseGemm,data_type:bf16,m:32,n:64,k:0,device:810e,accumulate:separate,configs:[20,32,64,64,16,32,2]
 DenseGemm,data_type:bf16,m:0,n:64,k:32,device:810e,configs:[20,32,64,64,16,32,2]
 DenseGemm,data_type:bf16,m:4096,n:4096,k:7168,device:810e,num_sms:1
@@ -44,12 +45,10 @@ DenseGemm,data_type:bf16,m:7,n:16,k:128,device:810e,configs:[20,32,64,32,0,32,2]
 DenseGemm,data_type:bf16,m:7,n:16,k:128,device:810e,configs:[20,16,32,32,16,8,2],expect_error:invalid BF16 config
 # Low-budget fallback selects a valid N warp and two complete short-K stages.
 DenseGemm,data_type:bf16,m:7,n:16,k:96,device:810e,num_sms:1
-# tc01 cute-free: M/N/K tails, aliased C and a bounded persistent grid.
-DenseGemm,data_type:bf16,m:37,n:41,k:160,device:810e,cute_free:1,warp_on_k:1,num_sms:1,accumulate:alias
-# WarpOnK=4 reduces in FP32 before the BF16 cancellation/addition conversion.
-DenseGemm,data_type:bf16,m:17,n:40,k:544,device:810e,cute_free:1,warp_on_k:4,configs:[20,32,64,256,16,32,2],accumulate:alias,pattern:cancellation
-# Unsupported K slices fail before JIT/launch.
-DenseGemm,data_type:bf16,m:17,n:40,k:512,device:810e,cute_free:1,warp_on_k:4,configs:[20,32,64,64,16,32,2],expect_error:two MMA K steps
+# Low-budget fallback: M/N/K tails and aliased C.
+DenseGemm,data_type:bf16,m:37,n:41,k:160,device:810e,num_sms:1,accumulate:alias
+# Automatic WarpOnK=4 with M/N/K tails and cancellation before BF16 rounding.
+DenseGemm,data_type:bf16,m:17,n:257,k:1056,device:810e,accumulate:alias,pattern:cancellation
 
 # --- DenseGemm / int8 ---
 # Small M with N/K tails, retained from the legacy shape sweep.
@@ -65,8 +64,8 @@ DenseGemm,data_type:bf16_bf16_fp32,m:96,n:8192,k:448,device:810e,accumulate:sepa
 DenseGemm,data_type:bf16_bf16_fp32,m:2,n:8192,k:7168
 # Direct split-K product with FP32 output and separate C/D.
 DenseGemm,data_type:bf16_bf16_fp32,m:32,n:128,k:6144,device:810e,accumulate:separate
-# WarpOnK=2, M/K tails and separate C/D with FP32 output.
-DenseGemm,data_type:bf16_bf16_fp32,m:65,n:136,k:1056,device:810e,cute_free:1,warp_on_k:2,configs:[20,64,64,64,32,32,2],accumulate:separate
+# Automatic WarpOnK=2 with M/N/K tails and separate C/D, FP32 output.
+DenseGemm,data_type:bf16_bf16_fp32,m:65,n:385,k:1056,device:810e,accumulate:separate
 
 # --- DenseGemm / fp32 (full FP32 operands, CPU FP64 reference) ---
 # Vector load tail, scalar load via misalignment, and static specialization.
@@ -220,22 +219,19 @@ GroupedFused,data_type:w4fa16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_t
 # ============ MqaLogits ============
 
 # --- MqaLogits / int8 ---
+MqaLogits,data_type:int8,seq_len_q:129,seq_len_kv:512,num_heads:64,head_dim:64,weights_dtype:bf16
+MqaLogits,data_type:int8,seq_len_q:129,seq_len_kv:512,num_heads:64,head_dim:64,weights_dtype:fp32
 MqaLogits,data_type:int8,seq_len_q:8191,seq_len_kv:8191,num_heads:64,head_dim:128
 MqaLogits,data_type:int8,seq_len_q:4096,seq_len_kv:8192,num_heads:64,head_dim:128,compressed_logits:1
-MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,logits_dtype:bf16,weights_dtype:bf16
-
-# --- MqaLogits / bf16 ---
-MqaLogits,data_type:bf16,seq_len_q:512,seq_len_kv:3072,num_heads:64,head_dim:128
+MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,weights_dtype:bf16
 
 # ============ PagedMqaLogits ============
 
-# --- PagedMqaLogits / bf16 ---
-# Empty and partial pages.
-PagedMqaLogits,data_type:bf16,batch_size:4,next_n:1,num_heads:32,head_dim:128,distribution:[0,1,63,128],page_kv:64,logits_dtype:fp32
-
 # --- PagedMqaLogits / int8 ---
+PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:64,distribution:[0,1,127,512],page_kv:64,max_context_len:1024,weights_dtype:bf16
+PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:64,distribution:[0,1,127,512],page_kv:64,max_context_len:1024,weights_dtype:fp32
 PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,avg_context_len:2048
-PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:32
+PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:64
 PagedMqaLogits,data_type:int8,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1]
-PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,logits_dtype:bf16,weights_dtype:bf16
-PagedMqaLogits,data_type:int8,batch_size:64,next_n:4,num_heads:64,head_dim:128,avg_context_len:8192
+PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,weights_dtype:bf16
+PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192

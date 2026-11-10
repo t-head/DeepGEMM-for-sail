@@ -21,6 +21,9 @@ def device_version_supported(one_case):
     caselist can run on both PPU1.0 and PPU1.5.
     """
     data_type = one_case.get('data_type')
+    if (one_case.get('gemm_type') in ('MqaLogits', 'PagedMqaLogits')
+            and data_type == torch.int8 and get_arch_version() != 80):
+        return False, 'INT8 indexer requires 810E'
     if one_case.get('device') == '810e' and 'ZW810E' not in torch.cuda.get_device_name():
         return False, 'This regression case requires ZW810E'
     if one_case.get('gemm_type') == 'Activation' or data_type in ('w4fa16_mma', 'w4fa8_mma', 'w4a8_nvfp4'):

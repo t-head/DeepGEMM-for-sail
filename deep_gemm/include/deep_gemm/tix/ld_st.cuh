@@ -9,6 +9,11 @@
 
 namespace deep_gemm::tix {
 
+__device__ __forceinline__ uint32_t ld_ready_flag_uncached(const volatile uint32_t* ptr) {
+    asm volatile("" ::: "memory");
+    return __ldbl(const_cast<const uint32_t*>(ptr));
+}
+
 // A contiguous BF16 view may start at an offset of just one element.
 template <bool kAligned>
 __device__ __forceinline__ int4 load_bf16x8(const __ppu_bfloat16* ptr) {

@@ -20,7 +20,7 @@ namespace copy {
 //   CubeW   : tile width  (BLOCK_K)
 // =============================================================================
 
-template <typename Element, int CubeH, int CubeW>
+template <typename Element, int CubeH, int CubeW, int Policy = 1>
 struct AiuG2SAtom {
   static constexpr int kCubeH = CubeH;
   static constexpr int kCubeW = CubeW;
@@ -46,7 +46,7 @@ struct AiuG2SAtom {
                   "AiuG2SAtom: only bf16 is supported by the arch layer today");
     #pragma unroll
     for (int j = 0; j < kInstNum; ++j) {
-      arch::aiu_bulk_tensor_load_bf16<CubeH, kSwzlW>(
+      arch::aiu_bulk_tensor_load_bf16<CubeH, kSwzlW, Policy>(
           smem_dst + j * CubeH * kSwzlW, gmem_base, rows, ld,
           row_offset, col_offset + j * kSwzlW);
     }

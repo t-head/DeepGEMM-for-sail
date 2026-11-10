@@ -111,7 +111,7 @@ public:
     //   We load kv_sf_dim = 4 bytes per KV row as one uint32_t
     // Q_sf (SFB): per-head-group e8m0 scale, shape [batch * next_n, num_heads, q_sf_dim]
     //   q_sf_dim = kHeadDim / 16 = 4 bytes per head, loaded as one uint32_t
-    // Weights: float32 per (batch * next_n, num_heads), same as FP8 paged MQA
+    // Weights: ElementWeights per query/head (BF16 for weighted DSA; unused for AVG)
 
     // SFA: k_sf — async copy of uint32_t (4 bytes per KV row)
     // Layout: BLOCK_M rows × 1 column of uint32_t
@@ -125,7 +125,7 @@ public:
     using SmemLayoutSFA = decltype(tile_to_shape(
         SmemLayoutAtomSFA{}, make_shape(_1{}, Int<BLOCK_M>{}, Int<kNumKVStages>{}, Int<kNumMathWarpGroups>{})));
 
-    // SFB (q_sf/weights): one uint32_t/float32 per Q head
+    // SFB (q_sf): one packed uint32_t scale per Q head
     using DefaultOperandSFB =
         cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, uint32_t, false, _1, Int<BLOCK_N>, false, 0, false>;
     using SmemLayoutAtomSFB = typename DefaultOperandSFB::SmemLayoutAtom;
@@ -249,7 +249,7 @@ public:
         Tensor mSFB_n_mix = make_mix_tensor_like(mSFB_n);
         Tensor gSFB = local_tile(mSFB_n_mix, Shape<_1, Int<BLOCK_N>>{}, make_coord(0, _));
 
-        // weights (float32, same as FP8 paged MQA)
+        // Per-head weights use ElementWeights.
         Tensor mW_n = make_tensor(make_gmem_ptr(params.weights), Shape<_1, Int<BLOCK_N>>{}, StrideSFB{});
         Tensor mW_n_mix = make_mix_tensor_like(mW_n);
         Tensor gW = local_tile(mW_n_mix, Shape<_1, Int<BLOCK_N>>{}, make_coord(0, _));

@@ -313,8 +313,6 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     std::string element_qk, element_acc, dtype_tag;
     if (is_fp4) {
         element_qk = "uint8_t", element_acc = "float", dtype_tag = "fp4";
-    } else if (qk_dtype == torch::kBFloat16) {
-        element_qk = "cutlass::bfloat16_t", element_acc = "float", dtype_tag = "bf16";
     } else if (qk_dtype == torch::kFloat8_e4m3fn) {
         element_qk = "cutlass::float_e4m3_t", element_acc = "float", dtype_tag = "fp8";
     } else {
@@ -326,8 +324,8 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     const int num_threads = deep_gemm_mqa_common::get_num_threads(config);
     const auto& kernel_name = "attention_mqa_logits_" + dtype_tag + (is_avg ? "_avg" : "");
 
-    // `k_scales` is an empty tensor for BF16 and FP4 (FP4 uses `k_sf` instead)
-    const float* k_scales_ptr = (is_fp4 or qk_dtype == torch::kBFloat16) ? nullptr : k_scales.data_ptr<float>();
+    // `k_scales` is an empty tensor for FP4 (`k_sf` is used instead)
+    const float* k_scales_ptr = is_fp4 ? nullptr : k_scales.data_ptr<float>();
 
     if (is_fp4) {
         const auto* q_sf_ptr = reinterpret_cast<const uint32_t*>(q_sf->data_ptr());
@@ -374,13 +372,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     // NOTES: the kernel writes into the padded buffer, the caller only sees the valid window
     logits = logits.slice(0, 0, seq_len_q).slice(1, 0, logits_cols);
 
-    if (clean_logits) {
-        const auto& positions =
-            torch::arange(0, seq_len_k, torch::TensorOptions().dtype(torch::kInt32).device(q.device()));
-        const auto& mask = positions.unsqueeze(0).ge(cu_seq_len_k_start.unsqueeze(1)) &
-                           positions.unsqueeze(0).lt(cu_seq_len_k_end.unsqueeze(1));
-        logits = logits.masked_fill(mask.logical_not(), -std::numeric_limits<float>::infinity());
-    }
+
     return logits;
 }
 

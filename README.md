@@ -155,8 +155,8 @@ error at the host interface before launching the affected kernel.
 Automatic 810E scheduling uses matrix geometry and the configured CU budget,
 choosing GEMV, Direct, TSM, hybrid edge handling, split-K or cute-free kernels.
 Explicit `configs` take precedence over external LUT entries, which take
-precedence over automatic selection. Forced cute-free/WarpOnK execution still
-uses the selected explicit or LUT tile and validates its resource requirements.
+precedence over automatic selection. Cute-free/WarpOnK is selected automatically
+for bounded medium-K split-K workloads, without runtime override switches.
 The stable configuration tuple is
 `(num_sms, BM, BN, BK, WM, WN, stages, (0, 0, 0))`; its last field is reserved
 and shared-memory requirements are recomputed. Explicit/LUT tiled execution
@@ -442,19 +442,32 @@ share a single-warp double-buffered load pipeline; FP8-channel retains a
 whole-row amax reduction. Run `python tests/test_activation.py` for the
 standalone correctness suite.
 
-#### MQA logits
+#### DSA and AVG indexer logits
 
-We provide Multi-Query Attention (MQA) logits kernels that compute the query-key logits used by the LLM attention indexer. Both a non-paged variant (for contiguous KV) and a paged variant (for a paged KV cache with a block table) are supported, across BF16, INT8, FP8, and FP4 precisions.
+Non-paged and paged DSA indexers support legacy INT8/FP8 and MXFP4 inputs.
+Legacy FP8 uses FP32 weights/logits;
+INT8 accepts BF16 or FP32 weights and returns the same logits dtype. New
+`fp8_fp4_*mqa_logits` weighted entry points support MXFP4 only, with BF16
+weights/logits. Weighted paged calls require `next_n=1` and support page
+sizes 32, 64 and 128 on M890. 810E rejects page32 due to an actlize
+TSM addressing issue; use page64 or page128.
 
-- Non-paged: `deep_gemm.bf16_mqa_logits`, `deep_gemm.int8_mqa_logits`, `deep_gemm.fp8_mqa_logits`, and the unified `deep_gemm.fp8_fp4_mqa_logits`. These take the query, key-value pair (with scales for the quantized variants), per-token weights, and the `cu_seq_len_k_start` / `cu_seq_len_k_end` range tensors, and return the masked logits.
-- Paged: `deep_gemm.bf16_paged_mqa_logits`, `deep_gemm.int8_paged_mqa_logits`, `deep_gemm.fp8_paged_mqa_logits`, and the unified `deep_gemm.fp8_fp4_paged_mqa_logits`. These operate on a fused KV cache with a `block_table` and schedule metadata for variable-length sequences. Call `deep_gemm.get_paged_mqa_logits_metadata` first to compute the scheduling metadata.
+AVG indexers use no weights, default to BF16 output and retain paged
+`next_n=1–6`. Non-paged AVG requires a positive `max_seqlen_k`. The paged
+`fp8_fp4` AVG entry point accepts MXFP4 only; ordinary FP8 uses the separate
+FP8 entry point. All AVG entry points omit `clean_logits`.
 
-Regular paged MQA supports `page_kv` values of **32, 64, and 128**.
-Paged logits require external masking of positions outside each context;
-`clean_logits=True` is unsupported. `fp8_paged_mqa_logits` now defaults to
-`clean_logits=False`, matching this requirement.
+Logits outside valid windows are unspecified and require caller-side masking
+or valid candidate bounds for top-k. For paged scheduling on both PPU0010/PPU0015, callers must pass
+`metadata_extra=(N,H,D,qk_dtype)` using logical D. On M890, `torch.int8`
+means MXFP4; on 810E it means INT8. True INT8 indexer APIs are 810E-only
+and reject calls on M890. For non-paged
+calls, positive `max_seqlen_k` selects compressed relative columns and can
+reduce memory usage.
 
-For more information, please refer to the corresponding `*_mqa_logits` and `*_paged_mqa_logits` function documentation.
+See the [indexer API guide](docs/api/indexer.md) for all signatures, dtype
+and layout contracts, metadata generation, top-k coordinate mapping and
+recommended 810E/M890 integration settings.
 
 #### Sparse MQA logits (Zhenwu M890)
 
@@ -482,11 +495,11 @@ that is a multiple of `sparse_block_kv`; its fused uint8 KV cache has shape
 `[num_pages,page_kv,1,68]` and a 512-byte-aligned page stride.
 
 The output is BF16 with shape
-`[T,round_up(num_max_sparse_blocks*sparse_block_kv,512)]`.
+`[T,num_max_sparse_blocks*sparse_block_kv]`, with an aligned physical row stride.
 Logical columns are compacted by selected block slot:
 `column = slot*sparse_block_kv + token_in_block`, rather than absolute KV
-token position. Padding columns are not additional KV positions.
-See the [attention API](csrc/apis/attention.hpp) for metadata and layout
+token position. Allocation padding is not exposed as logical columns.
+See the [indexer API guide](docs/api/indexer.md) for metadata and layout
 requirements and [attention tests](tests/test_attention.py) for supported
 cases.
 
@@ -595,10 +608,6 @@ The library also provides some environment variables, which may be useful:
   - `DG_JIT_WITH_LINEINFO`: `0` or `1`, embed source line info for profiling tools, `0` by default
   - `DG_JIT_PRINT_LOAD_TIME`: `0` or `1`, print the kernel load time, `0` by default
   - `DG_JIT_DUMP_ASM` / `DG_JIT_DUMP_SASS`: `0` or `1`, save `kernel.sass` after a fresh compilation; cache hits skip export, `0` by default
-- **810E BF16 dense GEMM**
-  - With no override, the dispatcher selects cute-free/WarpOnK for bounded medium-K split-K workloads. Other shapes retain the existing kernels.
-  - `DG_USE_CUTE`: `1` forces the cute-free path on 810E; `0` disables it. BF16 inputs support BF16 or FP32 output, accumulation, M/N tails, and contiguous K tails divisible by 32.
-  - `DG_810E_WARP_ON_K`: `1`, `2`, or `4` K warp groups per CTA. Setting it selects cute-free unless `DG_USE_CUTE=0`; explicit tile configs must leave at least 32 K elements per group and fit the thread/shared-memory limits. Invalid configurations raise a host error before JIT or launch.
 - **Runtime**
   - `DG_USE_PYTORCH_ACBLASLT_HANDLE`: `0` or `1`, use the PyTorch-managed acBLASLt handle instead of the built-in one, `0` by default
   - `SAIL_DEEPGEMM_LUT_PATH`: directory containing external GEMM tuning tables; unset by default. See [External GEMM tuning tables](#external-gemm-tuning-tables).

@@ -20,8 +20,6 @@ struct MegaMoESchedulerArguments {
     layout::MegaMoEStaging staging{};
     const uint8_t* dispatch_fp4 = nullptr;
     const uint32_t* dispatch_token_topk = nullptr;
-    // First flag publishes metadata; the rest cover three SFA partitions per expert.
-    volatile uint32_t* preprocess_ready_flags = nullptr;
     uint32_t* expert_base = nullptr;
     layout::TokenSrcMetadata* src_info = nullptr;
     int32_t* cumulative_local_expert_recv_stats = nullptr;

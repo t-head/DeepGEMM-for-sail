@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <hggc_bf16.h>
 
+#include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -72,13 +73,12 @@ __global__ void mega_moe_pre_dispatch(
     // Shapes are fixed by JIT, so every buffer offset is a compile-time constant.
     constexpr layout::MegaMoEBuffer buffers(NumRanks, NumExperts, SourceCapacity, TopK, Hidden, Intermediate,
                                            {StagingScales, StagingCounts, StagingTokens});
-    auto* base = sym_buffer.get_base_ptr();
+    auto* base = sym_buffer.get_base_ptr<layout::MegaMoESignals*>();
     auto* routing_topk_ids = buffers.topk_idx.data<int64_t>(base);
     auto* routing_topk_weights = buffers.topk_weights.data<float>(base);
     auto* dispatch_counts = buffers.dispatch_counts[0].data<uint32_t>(base);
     auto* dispatch_fp4 = buffers.dispatch_fp4.data(base);
     auto* dispatch_retire = buffers.dispatch_retire.data<uint32_t>(base);
-    auto* dispatch_arrivals = buffers.dispatch_arrivals[0].data<uint32_t>(base);
     auto* staging_scales = buffers.staging_scales[0].data<uint16_t>(base);
     auto* staging_counts = buffers.staging_counts[0].data<uint32_t>(base);
     auto* staging_tokens = buffers.staging_tokens[0].data<uint32_t>(base);
@@ -346,12 +346,7 @@ __global__ void mega_moe_pre_dispatch(
         for (uint32_t expert = threadIdx.x;
              expert < NumExperts; expert += blockDim.x)
             counts[expert] = 0u;
-        if (threadIdx.x < NumRanks) {
-            uint32_t* slot = sym_buffer.map(dispatch_arrivals, threadIdx.x) +
-                (generation & 1u) * layout::kNumMaxRanks + rank_idx;
-            // Bypass the cache to match the owner's polling load.
-            __stbl(slot, generation);
-        }
+        comm::rank_arrive(sym_buffer, base->dispatch_arrivals, generation);
     }
 }
 

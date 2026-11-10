@@ -23,10 +23,11 @@ namespace arch {
 ///   - rows / ld  : tensor rows and leading dimension (elements)
 ///   - row_offset : starting row in the source tensor
 ///   - col_offset : starting column (K offset) in the source tensor
-template <int CUBE_H, int CUBE_W>
+template <int CUBE_H, int CUBE_W, int Policy = 1>
 __device__ __forceinline__ void aiu_bulk_tensor_load_bf16(
     cutlass::bfloat16_t* smem_dst, cutlass::bfloat16_t const* gmem_base,
     int rows, int ld, int row_offset, int col_offset) {
+  static_assert(Policy == 1 || Policy == 3, "Unsupported BF16 AIU cache policy");
   uint32_t s = smem_ptr_to_uint(smem_dst);
 #if __HGGC_ARCH__ == 100
   asm volatile(
@@ -39,16 +40,29 @@ __device__ __forceinline__ void aiu_bulk_tensor_load_bf16(
   uint64_t tensor_stride_w = (uint64_t)ld * sizeof(cutlass::bfloat16_t);
   uint64_t tensor_stride_n = tensor_stride_w * rows;
   static constexpr int swzl_mode = CUBE_W * (int)sizeof(cutlass::bfloat16_t) == 128 ? 0 : 1;
-  asm volatile(
-    "ppu.cp.async.aiu.bulk.tensor.shared.global.2d.tile.LLC::128B.padz.swzl.b16 "
-    "[%0], [%1], {%2, %3, %4}, {%5, %6, %7}, {%8, %9}, {%10, %11, %12}, %13;\n"
-    :: "r"(s), "l"(gmem_base),
-      "r"(ld), "r"(rows), "r"(1),
-      "r"(CUBE_W), "r"(CUBE_H), "r"(1),
-      "l"(tensor_stride_w), "l"(tensor_stride_n),
-      "r"(col_offset), "r"(row_offset), "r"(0),
-      "r"(swzl_mode)
-  );
+  if constexpr (Policy == 1) {
+    asm volatile(
+      "ppu.cp.async.aiu.bulk.tensor.shared.global.2d.tile.LLC::128B.padz.swzl.b16 "
+      "[%0], [%1], {%2, %3, %4}, {%5, %6, %7}, {%8, %9}, {%10, %11, %12}, %13;\n"
+      :: "r"(s), "l"(gmem_base),
+        "r"(ld), "r"(rows), "r"(1),
+        "r"(CUBE_W), "r"(CUBE_H), "r"(1),
+        "l"(tensor_stride_w), "l"(tensor_stride_n),
+        "r"(col_offset), "r"(row_offset), "r"(0),
+        "r"(swzl_mode)
+    );
+  } else {
+    asm volatile(
+      "ppu.cp.async.aiu.bulk.tensor.shared.global.2d.tile.rt.LLC::128B.padz.swzl.b16 "
+      "[%0], [%1], {%2, %3, %4}, {%5, %6, %7}, {%8, %9}, {%10, %11, %12}, %13;\n"
+      :: "r"(s), "l"(gmem_base),
+        "r"(ld), "r"(rows), "r"(1),
+        "r"(CUBE_W), "r"(CUBE_H), "r"(1),
+        "l"(tensor_stride_w), "l"(tensor_stride_n),
+        "r"(col_offset), "r"(row_offset), "r"(0),
+        "r"(swzl_mode)
+    );
+  }
 #endif
 }
 

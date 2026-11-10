@@ -17,6 +17,7 @@
 #include "../../utils/layout_type_name.hpp"
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_bf16.hpp"
+#include "../heuristics/bf16_memory_policy.hpp"
 // #include "../heuristics/gemm_search_space.hpp"
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
@@ -396,6 +397,8 @@ public:
         std::string gemm_type, kernel_strategy, kernel_name;
         bool enable_sbo_overlap;
         bool overlap_prologue;
+        bool nonpersistent = false;
+        int b_cache_policy = 1;
     };
 
     struct GemmArguments {
@@ -459,7 +462,8 @@ public:
             reinterpret_cast<uintptr_t>(args.kernel_params.collective_epilogue_params.ptr_D) % (2 * sizeof(ElementOutput)) == 0;
         return std::make_tuple(info.gemm_type, info.block_m, info.block_n, info.block_k,
                                info.warp_m, info.warp_n, info.warp_k, info.num_stages,
-                               info.dense_s2_opt, is_aligned_n, use_packed_store, info.kernel_name, info.overlap_prologue);
+                               info.dense_s2_opt, is_aligned_n, use_packed_store, info.kernel_name, info.overlap_prologue,
+                               info.b_cache_policy, info.nonpersistent);
     }
 
     // Byte-identical to cute_free/kernel/gemm.cuh::GemmKernel::Params.
@@ -498,9 +502,9 @@ namespace deep_gemm {{
 
 using GemmTypeTag = cutlass::platform::integral_constant<GemmType, GemmType::{0}>;
 
-using Kernel = BF16GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {11}, {9}, {13}, GemmTypeTag{12}>;
+using Kernel = BF16GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {11}, {9}, {13}, GemmTypeTag, {12}, {14}, {15}>;
 
-static_assert(sizeof(typename Kernel::Params) == {14}, "cute-free host/device ABI mismatch");
+static_assert(sizeof(typename Kernel::Params) == {16}, "cute-free host/device ABI mismatch");
 
 }} // namespace deep_gemm
 
@@ -520,8 +524,9 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             is_aligned_n ? "true" : "false",
             info.kernel_name,
             info.overlap_prologue ? "true" : "false",
-            std::is_same_v<ElementOutput, float> ? ", float" : "",
-            use_packed_store ? "true" : "false", sizeof(PackedParams));
+            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t",
+            use_packed_store ? "true" : "false",
+            info.b_cache_policy, info.nonpersistent ? "true" : "false", sizeof(PackedParams));
     }
 
 };
@@ -711,6 +716,7 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
     using Config = std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 
     Config cfg;
+    bool use_memory_policies = false;
     if (configs.has_value()) {
         // Explicit config path: unpack the 8-element public tuple and force warp_k = block_k;
         // adaptive selection is not re-evaluated here.
@@ -719,10 +725,14 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
     } else {
         int selected_warp_k = 0;
+        bool from_runtime_lut = false;
         auto best = deep_gemm_bf16_common::get_best_configs(
-            m, n, k, 1, num_sms, kGemmType, 256, nullptr, &selected_warp_k);
+            m, n, k, 1, num_sms, kGemmType, 256, &from_runtime_lut, &selected_warp_k);
         auto [ns, bm, bn, bk, wm, wn, nst, sc] = best;
-        const int warp_k = selected_warp_k > 0 ? selected_warp_k : bk;
+        int warp_k = selected_warp_k > 0 ? selected_warp_k : bk;
+        if (!from_runtime_lut && selected_warp_k > 0) {
+            use_memory_policies = memory_policies_enabled();
+        }
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, warp_k, nst, sc);
     }
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages, smem_config] = cfg;
@@ -788,6 +798,12 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
         const int blocks_per_wave = num_sms_new * blocks_per_cu;
         const int waves = blocks_per_wave > 0 ? (num_tiles + blocks_per_wave - 1) / blocks_per_wave : 0;
         const bool overlap_on = (waves > 3) && (k <= 2048);
+        MemoryExecutionPolicy memory_policy;
+        if (use_memory_policies) {
+            const auto prop = device_runtime->get_prop();
+            memory_policy = get_memory_execution_policy(m, n, block_m, block_n,
+                num_sms_new, blocks_per_cu, num_sms, prop->multiProcessorCount);
+        }
 
         // --- CuteFree path (default) ---
         // warp_k comes from the adaptive tile selector (std::get<6> of
@@ -818,7 +834,10 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             CuteRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
         dim3 grid_cute_free;
-        grid_cute_free.x = blocks_per_cu * num_sms_new;
+        const bool nonpersistent = memory_policy.nonpersistent;
+        DG_HOST_ASSERT(!nonpersistent || !overlap_on);
+        grid_cute_free = nonpersistent ? dim3(num_tiles, 1, 1)
+                                     : dim3(blocks_per_cu * num_sms_new, 1, 1);
 
         // Step 3: build the kernel name for the matching variant (explicit '='
         // assignment avoids _ovlp_ovlp on re-entry) and compile ONLY that one
@@ -827,7 +846,8 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             overlap_on ? "bf16_deep_gemm_cute_free_ovlp" : "bf16_deep_gemm_cute_free";
         auto args = typename CuteRuntime::Args{
             .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, /*dense_s2_opt=*/true, num_stages,
-                            "Normal", "Default", cute_free_kernel_name, enable_sbo_overlap, overlap_on},
+                            "Normal", "Default", cute_free_kernel_name, enable_sbo_overlap, overlap_on,
+                            nonpersistent, memory_policy.b_cache_policy},
             .launch_args = {grid, block_cute_free, smem_cute_free},
             .kernel_params = params,
         };
@@ -878,6 +898,8 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
                    block_k, warp_m, warp_n, warp_k, num_stages);
             printf("SMSIZE:%d, vreg:%d, stack:%d\n", smem_cute_free, int(numRegs), int(localSize));
             printf("waves:%d, overlap_on:%d\n", waves, int(overlap_on));
+            printf("b_cache_policy:%d, nonpersistent:%d, tiles_m:%d, tiles_n:%d\n",
+                   memory_policy.b_cache_policy, int(nonpersistent), tiles_m, tiles_n);
         }
     } else {
         // Keep input/mainloop configuration unchanged and specialize only the epilogue.
@@ -1489,7 +1511,7 @@ template <typename Output>
 static void model_810e_cute_free_launch(const torch::Tensor& a, const torch::Tensor& b,
     const torch::Tensor& d, const ConfigTuple& config, int warps_k) {
     const auto [sms, bm, bn, bk, wm, wn, stages, unused] = config;
-    TORCH_CHECK(sms > 0 && sms <= get_num_sms(), "cute-free CU budget is invalid");
+    TORCH_CHECK(sms >= kModel810eTensorCUs && sms <= get_num_sms(), "cute-free CU budget is invalid");
     TORCH_CHECK(bm >= 16 && bn >= 16 && bm <= 512 && bn <= 512 &&
                 wm >= 16 && wn >= 16 && wm % 16 == 0 && wn % 16 == 0 &&
                 bm % wm == 0 && bn % wn == 0 && bk >= 32 && bk <= 512 &&
@@ -1512,8 +1534,7 @@ static void model_810e_cute_free_launch(const torch::Tensor& a, const torch::Ten
                 "810E cute-free requires K>=32, K%32=0, dimensions<2^23 and 16-byte-aligned inputs");
     const int64_t tiles = int64_t(ceil_div(m, bm)) * ceil_div(n, bn);
     TORCH_CHECK(tiles <= std::numeric_limits<int>::max(), "cute-free tile grid exceeds int32 range");
-    // A reduced CU budget is enforced by a bounded persistent grid.
-    const int grid = sms < kModel810eTensorCUs ? int(std::min<int64_t>(sms, tiles)) : int(tiles);
+    const int grid = int(tiles);
     using Runtime = DenseBF16GemmCuteFreeRuntimeT<Output>;
     using Stride = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     const Stride sa{k, {}, int64_t(m) * k}, sb{k, {}, int64_t(n) * k}, sd{n, {}, int64_t(m) * n};
@@ -1530,62 +1551,15 @@ static void model_810e_cute_free_launch(const torch::Tensor& a, const torch::Ten
     Runtime::launch(runtime,args);
 }
 
-static bool model_810e_cute_free_requested() {
-    if (!model_810e_dispatch_device()) return false;
-    const char* use = std::getenv("DG_USE_CUTE");
-    if (use) TORCH_CHECK(std::string(use) == "0" || std::string(use) == "1", "DG_USE_CUTE must be 0 or 1");
-    return (!use || std::string(use) != "0") && (use || std::getenv("DG_810E_WARP_ON_K"));
-}
-
 static bool model_810e_cute_free(const torch::Tensor& a, const torch::Tensor& b,
     const torch::Tensor& d, const std::optional<ConfigTuple>& configs) {
-    if (!model_810e_dispatch_device()) return false;
-    const char* use = std::getenv("DG_USE_CUTE");
-    const char* warp = std::getenv("DG_810E_WARP_ON_K");
-    if (use) TORCH_CHECK(std::string(use) == "0" || std::string(use) == "1", "DG_USE_CUTE must be 0 or 1");
-    if (use && std::string(use) == "0") return false;
-    const bool automatic = !use && !warp;
-    if (automatic && (configs || get_num_sms() < kModel810eTensorCUs)) return false;
-    int warps_k = 1;
-    if (warp) {
-        const std::string v(warp);
-        TORCH_CHECK(v == "1" || v == "2" || v == "4", "DG_810E_WARP_ON_K must be 1, 2 or 4");
-        warps_k = v == "4" ? 4 : v == "2" ? 2 : 1;
-    }
-    ConfigTuple tile;
-    if (automatic) {
-        Model810eDispatchTile t{};
-        const auto type = d.scalar_type() == torch::kFloat ? Model810eOutputType::FP32 : Model810eOutputType::BF16;
-        warps_k = get_model_810e_cute_free_config(a.size(0), b.size(0), a.size(1), type, t);
-        if (!warps_k) return false;
-        tile = model_810e_dispatch_config(t);
-    } else if (configs) tile = *configs;
-    else {
-        const auto type = d.scalar_type() == torch::kFloat ? Model810eOutputType::FP32 : Model810eOutputType::BF16;
-        auto t = get_model_810e_dense_dispatch(a.size(0), b.size(0), a.size(1), type).tile;
-        t.bk = std::max(t.bk, 32 * warps_k);
-        t.stages = warps_k > 1 ? 2 : std::max(2, t.stages);
-        if (warps_k > 1) {
-            // The existing tile was selected for one K warp group. Bound its
-            // operand storage and enlarge per-warp work before adding groups.
-            t.bm = std::min(t.bm, 128);
-            t.bn = std::min(t.bn, 128);
-            t.wm = std::min(t.wm, t.bm);
-            t.wn = std::min(t.wn, t.bn);
-            if (t.bm % t.wm) t.wm = 16;
-            if (t.bn % t.wn) t.wn = 16;
-            while (int64_t(warps_k - 1) * t.bm * t.bn * sizeof(float) >
-                   int64_t(t.bm + t.bn) * t.bk * 2 * t.stages && t.bk < 512)
-                t.bk *= 2;
-            const int max_threads = device_runtime->get_prop()->maxThreadsPerBlock;
-            while ((t.bm / t.wm) * (t.bn / t.wn) * warps_k * 32 > max_threads) {
-                if (t.bn % (2 * t.wn) == 0) t.wn *= 2;
-                else if (t.bm % (2 * t.wm) == 0) t.wm *= 2;
-                else break; // The launcher reports any remaining invalid configuration.
-            }
-        }
-        tile = model_810e_dispatch_config(t);
-    }
+    if (!model_810e_dispatch_device() || configs || get_num_sms() < kModel810eTensorCUs)
+        return false;
+    Model810eDispatchTile t{};
+    const auto type = d.scalar_type() == torch::kFloat ? Model810eOutputType::FP32 : Model810eOutputType::BF16;
+    const int warps_k = get_model_810e_cute_free_config(a.size(0), b.size(0), a.size(1), type, t);
+    if (!warps_k) return false;
+    const auto tile = model_810e_dispatch_config(t);
     if (d.scalar_type() == torch::kFloat) model_810e_cute_free_launch<float>(a,b,d,tile,warps_k);
     else model_810e_cute_free_launch<cutlass::bfloat16_t>(a,b,d,tile,warps_k);
     return true;

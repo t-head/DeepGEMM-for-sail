@@ -1,6 +1,6 @@
 # Functional check-in
 
-Check-in keeps representative cases for supported operators and independent execution paths. Full shape/distribution/tile sweeps belong in daily functional lists; performance measurements belong in perf lists. Board suites run their functional caselist; the separate single-device MegaMoE suite is described below. The test scripts and tile scans in `tests/daily/daily_810e.list` / `tests/daily/daily_890p.list` run through the explicit daily entry in `tests/daily/run_daily.py`; they are not appended to default check-in. The retired `DG_USE_CUTE=0` fallback is excluded.
+Check-in keeps representative cases for supported operators and independent execution paths. Full shape/distribution/tile sweeps belong in daily functional lists; performance measurements belong in perf lists. Board suites run their functional caselist; the separate single-device MegaMoE suite is described below. The test scripts and tile scans in `tests/daily/daily_810e.list` / `tests/daily/daily_890p.list` run through the explicit daily entry in `tests/daily/run_daily.py`; they are not appended to default check-in.
 
 ```bash
 python tests/checkin/run_checkin.py --suite ZW-810E

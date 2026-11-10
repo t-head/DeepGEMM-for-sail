@@ -94,6 +94,8 @@ int bf16_checks() {
     CHECK_BF16(warp_k, 32);
     CHECK_BF16(dense_s2_opt, true);
     CHECK_BF16(overlap_prologue, true);
+    CHECK_BF16(b_cache_policy, 3);
+    CHECK_BF16(nonpersistent, true);
     CHECK_BF16(gemm_type, "MGroupedContiguous");
 #undef CHECK_BF16
     count += check_change<Runtime>(args, [](auto& a) {

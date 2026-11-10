@@ -4,6 +4,10 @@
 #define DG_MEGAMOE_OWNER_MODE 0
 #endif
 
+#ifndef DG_MEGAMOE_SPLIT_SYNC
+#define DG_MEGAMOE_SPLIT_SYNC 0
+#endif
+
 #include <cstdint>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -12,12 +16,12 @@
 namespace deep_gemm::comm {
 
 __device__ __forceinline__ void grid_sync(
-        layout::ScatterSignals& workspace,
+        layout::MegaMoESignals& signals,
         uint32_t num_blocks, uint32_t block_idx, uint32_t thread_idx) {
     constexpr uint32_t kFinishTag = 0x80000000u;
     __syncthreads();
     if (thread_idx == 0) {
-        auto* counter = reinterpret_cast<uint32_t*>(&workspace.grid_counter);
+        auto* counter = &signals.grid_sync_count;
         const uint32_t old_value = tix::atomic_add_rel(
             counter, block_idx == 0 ? kFinishTag - (num_blocks - 1) : 1);
         uint32_t new_value;
@@ -28,44 +32,48 @@ __device__ __forceinline__ void grid_sync(
     __syncthreads();
 }
 
-// Acquire every bank before exposing the combined writer mask to the reader.
-// The upper unused bits stay set, so all-bulk remains a single UINT64_MAX test.
+// Call after all local writers have released their stores.
 template <uint32_t kWorldSize>
-__device__ __forceinline__ uint64_t fp4_scatter_acquire(
-        const layout::ScatterSignals& workspace, uint32_t status) {
-    static_assert(kWorldSize >= 1 && kWorldSize <= layout::kNumMaxRanks &&
-                  (kWorldSize & (kWorldSize - 1)) == 0, "power-of-two EP through 64 required");
-    const uint32_t phase = status & 1u;
-    const bool negative = (status & 2u) != 0;
-#if DG_MEGAMOE_OWNER_MODE
-    constexpr uint32_t kBanks = (kWorldSize + layout::kScatterRanksPerBank - 1) / layout::kScatterRanksPerBank;
-    constexpr uint32_t kWriters = kWorldSize < layout::kScatterRanksPerBank ? kWorldSize : layout::kScatterRanksPerBank;
-    uint64_t writer_mask = UINT64_MAX;
-    #pragma unroll
-    for (uint32_t bank = 0; bank < kBanks; ++bank) {
-        int32_t observed;
-        do {
-            observed = tix::ld_acq_sys(&workspace.phase_signal[phase][bank]);
-        } while ((observed & 15) != (negative ? 0 : kWriters));
-        constexpr uint32_t kMask = (1u << kWriters) - 1u;
-        const uint64_t disabled = (~(uint32_t(observed) >> 4)) & kMask;
-        writer_mask &= ~(disabled << (bank * layout::kScatterRanksPerBank));
-    }
-    return writer_mask;
-#else
-    while (tix::ld_acq_sys(&workspace.phase_signal[phase][0]) !=
-           (negative ? 0 : static_cast<int32_t>(kWorldSize))) { }
-    return UINT64_MAX;
-#endif
+__device__ __forceinline__ void rank_arrive(
+        const layout::SymBuffer<kWorldSize>& sym_buffer,
+        uint32_t* arrivals, uint32_t notification) {
+    if (threadIdx.x < kWorldSize)
+        __stbl(sym_buffer.map(arrivals, threadIdx.x) + sym_buffer.rank_idx, notification);
 }
 
-// Release all local P2P stores, then acquire peer completion before reduce.
+// Each rank owns one slot. All threads in the CTA participate in the wait.
+template <uint32_t kWorldSize, bool kWithWriterMask = false>
+__device__ __forceinline__ void rank_barrier(
+        const volatile uint32_t* arrivals, uint32_t generation,
+        uint32_t* writer_mask = nullptr) {
+    uint32_t observed = 0;
+    if (threadIdx.x < kWorldSize && generation != 0) {
+        do {
+            if constexpr (kWithWriterMask) {
+                observed = tix::ld_ready_flag_uncached(arrivals + threadIdx.x);
+            } else {
+                observed = arrivals[threadIdx.x];
+            }
+        } while ((kWithWriterMask ? observed >> 1 : observed) != generation);
+    }
+    if constexpr (kWithWriterMask) {
+        if (threadIdx.x < 64) {
+            const uint32_t mask = __ballot_sync(0xffffffffu,
+                threadIdx.x >= kWorldSize || (observed & 1u));
+            if ((threadIdx.x & 31u) == 0)
+                writer_mask[threadIdx.x / 32] = mask;
+        }
+    }
+    __syncthreads();
+}
+
+// Release all local P2P stores before notifying every peer.
 template <uint32_t kWorldSize>
 __device__ __forceinline__ void fp4_scatter_release(
-        layout::ScatterSignals& workspace,
+        layout::MegaMoESignals& signals,
         const layout::SymBuffer<kWorldSize>& sym_buffer,
         uint32_t num_blocks, uint32_t block_idx, uint32_t thread_idx,
-        bool bulk_writer) {
+        uint32_t generation, bool bulk_writer) {
     // PPU fences drain only the calling warp; each warp leader releases its stores.
     // The following grid sync joins these releases before peer notification.
     __syncwarp();
@@ -74,45 +82,11 @@ __device__ __forceinline__ void fp4_scatter_release(
     }
 
     grid_sync(
-        workspace, num_blocks, block_idx, thread_idx);
+        signals, num_blocks, block_idx, thread_idx);
 
     if (block_idx == 0) {
-        const int32_t status = workspace.phase_counter & 3;
-        const uint32_t phase = status & 1;
-        const bool negative = (status >> 1) != 0;
-#if DG_MEGAMOE_OWNER_MODE
-        static_assert(kWorldSize <= layout::kNumMaxRanks);
-        const uint32_t rank_idx = sym_buffer.rank_idx;
-        const uint32_t bank = rank_idx / layout::kScatterRanksPerBank;
-        const int32_t old_bulk = __ldcg(workspace.writer_previous + phase);
-        const int32_t notification = (negative ? -1 : 1) +
-            (int32_t(bulk_writer) - old_bulk) * (1 << (rank_idx % layout::kScatterRanksPerBank + 4));
-#else
-        constexpr uint32_t bank = 0;
-        const int32_t notification = negative ? -1 : 1;
-#endif
-
-
-        if (thread_idx < kWorldSize) {
-            auto* remote_workspace = sym_buffer.map(&workspace, thread_idx);
-            tix::red_add_rel_sys(
-                &remote_workspace->phase_signal[phase][bank], notification);
-        }
-        __syncthreads();
-
-        if (thread_idx == 0) {
-#if DG_MEGAMOE_OWNER_MODE
-            workspace.writer_previous[phase] = bulk_writer ? 1 : 0;
-#endif
-            tix::red_add(&workspace.phase_counter, 1);
-            fp4_scatter_acquire<kWorldSize>(workspace, status);
-        }
-    }
-
-    // Multi-node ranks join all CTA leaders after the peer acquire.
-    if constexpr (kWorldSize != 8) {
-        grid_sync(
-            workspace, num_blocks, block_idx, thread_idx);
+        const uint32_t notification = (generation << 1) | uint32_t(bulk_writer);
+        rank_arrive(sym_buffer, signals.scatter_arrivals, notification);
     }
 }
 

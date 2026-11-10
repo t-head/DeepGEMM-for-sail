@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deep_gemm/comm/barrier.cuh>
 #include <cute/algorithm/tuple_algorithms.hpp>
 #include <cute/numeric/math.hpp>
 #include <deep_gemm/layout/dispatch_layout.cuh>
@@ -32,12 +33,10 @@ __device__ __forceinline__ void prepare_expert_metadata(
     uint32_t* expert_row_offsets = expert_block_offsets + NumLocalExperts;
     uint32_t* expert_counts = expert_row_offsets + NumLocalExperts;
 
-    // Wait for this round's counts from every source rank.
-    if (generation > 0 && threadIdx.x < NumRanks) {
-        while (arrival_slots[threadIdx.x] != generation) { }
-    }
-    // All arrival waits must finish before reading counts.
-    __syncthreads();
+    if constexpr (!DG_MEGAMOE_SPLIT_SYNC)
+        comm::rank_barrier<NumRanks>(arrival_slots, generation);
+    else
+        __syncthreads();
 
     // Keep each expert's rank counts next to each other in shared memory.
     #pragma unroll
