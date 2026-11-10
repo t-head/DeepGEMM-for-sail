@@ -15,6 +15,7 @@ from . import _C
 
 # Configs
 from ._C import (
+    use_deterministic_algorithms,
     set_num_sms,
     get_num_sms,
     set_tc_util,
@@ -108,6 +109,7 @@ from ._C import (
     # Hyperconnection kernels
     tf32_hc_prenorm_gemm,
     mega_mhc,
+    bf16_mega_gate,
     # Einsum kernels
     fp8_einsum,
     int8_einsum,

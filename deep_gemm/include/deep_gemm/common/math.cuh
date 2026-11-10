@@ -38,4 +38,35 @@ CUTLASS_HOST_DEVICE constexpr uint32_t next_power_of_two(uint32_t n) {
   return n + 1;
 }
 
+template <typename T> struct ReduceSum { CUTLASS_DEVICE T operator()(T a, T b) const { return a + b; } };
+
+// Unified reduction function
+template <uint32_t kNumLanesPerGroup, bool kIntergroupReduce, typename T, typename Op>
+CUTLASS_DEVICE T warp_reduce(T value, Op op) {
+    static_assert(kNumLanesPerGroup == 32 or kNumLanesPerGroup == 16 or kNumLanesPerGroup == 8 or
+                     kNumLanesPerGroup ==  4 or kNumLanesPerGroup == 2  or kNumLanesPerGroup == 1,
+                     "Invalid number of lanes");
+    constexpr uint32_t mask = 0xffffffff;
+    if constexpr (kIntergroupReduce) {
+        if constexpr (kNumLanesPerGroup <=  1) value = op(value, __shfl_xor_sync(mask, value,  1));
+        if constexpr (kNumLanesPerGroup <=  2) value = op(value, __shfl_xor_sync(mask, value,  2));
+        if constexpr (kNumLanesPerGroup <=  4) value = op(value, __shfl_xor_sync(mask, value,  4));
+        if constexpr (kNumLanesPerGroup <=  8) value = op(value, __shfl_xor_sync(mask, value,  8));
+        if constexpr (kNumLanesPerGroup <= 16) value = op(value, __shfl_xor_sync(mask, value, 16));
+    } else {
+        if constexpr (kNumLanesPerGroup >= 32) value = op(value, __shfl_xor_sync(mask, value, 16));
+        if constexpr (kNumLanesPerGroup >= 16) value = op(value, __shfl_xor_sync(mask, value,  8));
+        if constexpr (kNumLanesPerGroup >=  8) value = op(value, __shfl_xor_sync(mask, value,  4));
+        if constexpr (kNumLanesPerGroup >=  4) value = op(value, __shfl_xor_sync(mask, value,  2));
+        if constexpr (kNumLanesPerGroup >=  2) value = op(value, __shfl_xor_sync(mask, value,  1));
+    }
+    return value;
+}
+
+// Convenience aliases
+template <uint32_t kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
+CUTLASS_DEVICE T warp_reduce_sum(T value) {
+    return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceSum<T>{});
+}
+
 } // namespace deep_gemm::math
