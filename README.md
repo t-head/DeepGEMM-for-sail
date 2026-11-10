@@ -120,9 +120,52 @@ To perform a basic non-grouped FP8 GEMM, call the `deep_gemm.gemm_fp8_fp8_bf16_n
 
 BF16 dense GEMM: `deep_gemm.bf16_gemm_nt(a, b, out)` computes `out = a @ b.T`
 with contiguous BF16 inputs. On 810E and 890P, `out` supports BF16 or FP32.
-890P supports odd and even N. On 810E, N must be even except for N=1
-without an explicit configuration, which requires K divisible by 8 and
-16-byte-aligned inputs.
+M890 supports odd and even N. The standard 810E tiled path requires even N;
+its specialized paths also support guarded narrow outputs and partial tiles.
+
+#### 810E dense and strided batched GEMM
+
+```python
+# A[M,K], B[N,K]: contiguous BF16; D[M,N]: contiguous BF16 or FP32.
+deep_gemm.bf16_gemm_nt(a, b, d, c=c)  # D = A @ B.T + C; C is optional
+# A[G,M,K], B[G,N,K], D[G,M,N]: BF16, including supported strided views.
+deep_gemm.bf16_gemm_strided_batched_nt(a_batch, b_batch, d_batch)
+# Contiguous FP32 A[M,K], B[N,K], D[M,N]; full FP32 operands, without TF32.
+deep_gemm.gemm_fp32_fp32_fp32_nt(a_fp32, b_fp32, d_fp32)
+```
+
+These functions write into the supplied output and return `None`. All tensors
+must be on the current accelerator; output must not overlap either input.
+For dense BF16 accumulation, C must match D's shape, dtype and device and be
+either disjoint from D or exactly aliased with identical strides. The product
+and C are combined in FP32 before conversion to BF16, including GEMV and split-K.
+Compile-only mode (`set_compile_mode(1)` or nonempty `HGGC_WARM_UP`) preserves C/D.
+
+810E BF16 tiled paths require `K>=64`, `K%32=0`, and 16-byte-aligned inputs.
+GEMV paths allow shorter K with their own alignment checks. Native batched GEMM
+requires equal batch counts, nonnegative input strides, unit output column
+stride and nonoverlapping output rows/batches. Zero input batch stride supports
+broadcasting; padded and interleaved batches are supported. Eligible layouts
+execute directly; other supported input views are packed before execution.
+The native batched API has BF16 output and no C argument. Empty outputs are
+no-ops, and K=0 writes C or zero as appropriate during normal execution.
+Unsupported shapes, layouts, tiles and device grid/resource limits raise an
+error at the host interface before launching the affected kernel.
+
+Automatic 810E scheduling uses matrix geometry and the configured CU budget,
+choosing GEMV, Direct, TSM, hybrid edge handling, split-K or cute-free kernels.
+Explicit `configs` take precedence over external LUT entries, which take
+precedence over automatic selection. Forced cute-free/WarpOnK execution still
+uses the selected explicit or LUT tile and validates its resource requirements.
+The stable configuration tuple is
+`(num_sms, BM, BN, BK, WM, WN, stages, (0, 0, 0))`; its last field is reserved
+and shared-memory requirements are recomputed. Explicit/LUT tiled execution
+requires a 16-byte-aligned output and N divisible by 8 (BF16) or 4 (FP32).
+See [utilities and environment variables](#utilities) for kernel controls and
+[checkin cases](tests/checkin/checkin_810e.list) for accuracy and rejection coverage.
+
+The native batched and FP32 entry points are PPU fork extensions; the existing
+dense BF16 name, argument order and compatibility aliases remain unchanged.
 
 #### Grouped GEMMs (contiguous layout)
 
@@ -552,6 +595,10 @@ The library also provides some environment variables, which may be useful:
   - `DG_JIT_WITH_LINEINFO`: `0` or `1`, embed source line info for profiling tools, `0` by default
   - `DG_JIT_PRINT_LOAD_TIME`: `0` or `1`, print the kernel load time, `0` by default
   - `DG_JIT_DUMP_ASM` / `DG_JIT_DUMP_SASS`: `0` or `1`, save `kernel.sass` after a fresh compilation; cache hits skip export, `0` by default
+- **810E BF16 dense GEMM**
+  - With no override, the dispatcher selects cute-free/WarpOnK for bounded medium-K split-K workloads. Other shapes retain the existing kernels.
+  - `DG_USE_CUTE`: `1` forces the cute-free path on 810E; `0` disables it. BF16 inputs support BF16 or FP32 output, accumulation, M/N tails, and contiguous K tails divisible by 32.
+  - `DG_810E_WARP_ON_K`: `1`, `2`, or `4` K warp groups per CTA. Setting it selects cute-free unless `DG_USE_CUTE=0`; explicit tile configs must leave at least 32 K elements per group and fit the thread/shared-memory limits. Invalid configurations raise a host error before JIT or launch.
 - **Runtime**
   - `DG_USE_PYTORCH_ACBLASLT_HANDLE`: `0` or `1`, use the PyTorch-managed acBLASLt handle instead of the built-in one, `0` by default
   - `SAIL_DEEPGEMM_LUT_PATH`: directory containing external GEMM tuning tables; unset by default. See [External GEMM tuning tables](#external-gemm-tuning-tables).
@@ -584,7 +631,10 @@ Grouped lookup matches N, K, and group count, then selects the smallest
 table M greater than or equal to the requested M. Missing or malformed
 files, or queries with no matching entry, fall back to built-in
 configuration selection. These tables supply configurations; they do not
-run an automatic tuning search. See the
+run an automatic tuning search. On 810E dense BF16, explicit `configs` override
+matching LUT entries; matching entries override automatic dispatch. A parsed
+entry that violates the device's tile, alignment or resource requirements is
+rejected before JIT/launch, just like an invalid explicit configuration. See the
 [LUT loader](csrc/jit_kernels/heuristics/runtime_lut.hpp) for validation rules.
 
 ## Optimizations

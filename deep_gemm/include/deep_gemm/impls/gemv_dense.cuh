@@ -70,7 +70,7 @@ template <typename src_type, typename acc_type, typename dst_type, typename load
           int k_slices, int batch_xy>
 __device__ void gemv_dense_op(int m, int k, acc_type alpha, const src_type* A, int lda,
                               const src_type* x, int incx, acc_type beta, const dst_type* c,
-                              dst_type* y, int incy) {
+                              dst_type* y, int incy, int block_index) {
     acc_type results[m_per_thread * batch_xy];
 
     int tid = threadIdx.y * BlockX + threadIdx.x;
@@ -89,17 +89,11 @@ __device__ void gemv_dense_op(int m, int k, acc_type alpha, const src_type* A, i
     constexpr int ksize_ept = BlockX * alignmentMax * k_slices;
 
     int tid_x = k_slices > 1 ? blockIdx.y * BlockX + threadIdx.x : threadIdx.x;
-    int id_m = BlockY > 1 ? blockIdx.x * BlockY + threadIdx.y : blockIdx.x;
+    int id_m = BlockY > 1 ? block_index * BlockY + threadIdx.y : block_index;
     int id_k = tid_x * alignmentMax;
 
-    if (BlockY > 1 && id_m >= m) {
-        if (BlockX >= WARP_SIZE) {
-            return;
-        }
-        // BlockX < WARP_SIZE: a warp spans several rows here, so exiting
-        // single lanes would leave the 0xffffffff shuffle mask below
-        // unsatisfied. Clamp the row instead and rely on the guarded store.
-    }
+    // Keep tail rows participating in both the reduction and the persistent
+    // wrapper's barriers. Loads clamp to a valid row; stores remain guarded.
     const int id_m_row = (BlockY > 1 && id_m >= m) ? m - 1 : id_m;
 
     const src_type* a = A + id_m_row * (long)lda;
@@ -176,12 +170,12 @@ __device__ void gemv_dense_op(int m, int k, acc_type alpha, const src_type* A, i
 // unit strides, no C operand) into the core above.
 template <typename src_type, typename dst_type, typename acc_type, typename load_atype,
           typename load_xtype, int BlockX, int BlockY, int k_per_thread>
-__device__ void gemv_dense_kernel_impl(const GemvDenseArgs args) {
+__device__ void gemv_dense_kernel_impl(const GemvDenseArgs args, int block_index) {
     gemv_dense_op<src_type, acc_type, dst_type, load_atype, load_xtype, BlockX, BlockY,
                   /*m_per_thread=*/1, k_per_thread, /*k_slices=*/1, /*batch_xy=*/1>(
         args.N, args.K, acc_type(1), (const src_type*)args.w_ptr, (int)args.stride_wn,
         (const src_type*)args.x_ptr, /*incx=*/1, acc_type(0), /*c=*/nullptr,
-        (dst_type*)args.y_ptr, /*incy=*/1);
+        (dst_type*)args.y_ptr, /*incy=*/1, block_index);
 }
 
 // m == 2 core loop, templated on NPT (W rows per thread). One (x0,x1) pair feeds
@@ -192,7 +186,7 @@ template <typename src_type, typename acc_type, typename dst_type, typename load
           typename load_xtype, int BlockX, int BlockY, int k_per_thread, int NPT>
 __device__ void gemv_dense_op_m2(int n, int k, const src_type* A, int64_t lda,
                                  const src_type* x0, const src_type* x1, dst_type* y,
-                                 int64_t stride_ym) {
+                                 int64_t stride_ym, int block_index) {
     acc_type results[NPT * 2];
 
     int tid = threadIdx.y * BlockX + threadIdx.x;
@@ -211,16 +205,9 @@ __device__ void gemv_dense_op_m2(int n, int k, const src_type* A, int64_t lda,
     constexpr int ksize_ept = BlockX * alignmentMax;
 
     int tid_x = threadIdx.x;
-    int id_m = BlockY > 1 ? blockIdx.x * (BlockY * NPT) + threadIdx.y * NPT : blockIdx.x * NPT;
+    int id_m = BlockY > 1 ? block_index * (BlockY * NPT) + threadIdx.y * NPT : block_index * NPT;
     int id_k = tid_x * alignmentMax;
 
-    if (BlockY > 1 && id_m >= n) {
-        if (BlockX >= WARP_SIZE) {
-            return;  // rows/thread are contiguous: row 0 OOR => all OOR => whole warps exit
-        }
-        // BlockX < WARP_SIZE: clamp the rows instead (see gemv_dense_op) so
-        // every lane stays alive for the 0xffffffff shuffles below.
-    }
     // Per-row clamped index + W pointer. Odd tail: a later row may be OOR while row
     // 0 is not -- clamp it for the loads, guard its store below.
     const int id_m_row0 = (BlockY > 1 && id_m >= n) ? n - 1 : id_m;
@@ -353,12 +340,12 @@ __device__ void gemv_dense_op_m2(int n, int k, const src_type* A, int64_t lda,
 // x/y are [2,K]/[2,N] contiguous, GemvDenseArgs matches m == 1.
 template <typename src_type, typename dst_type, typename acc_type, typename load_atype,
           typename load_xtype, int BlockX, int BlockY, int k_per_thread, int NPT>
-__device__ void gemv_dense_m2_kernel_impl(const GemvDenseArgs args) {
+__device__ void gemv_dense_m2_kernel_impl(const GemvDenseArgs args, int block_index) {
     const src_type* x = (const src_type*)args.x_ptr;
     gemv_dense_op_m2<src_type, acc_type, dst_type, load_atype, load_xtype, BlockX, BlockY,
                      k_per_thread, NPT>(args.N, args.K, (const src_type*)args.w_ptr,
                                         (int64_t)args.stride_wn, x, x + (int64_t)args.K,
-                                        (dst_type*)args.y_ptr, (int64_t)args.N);
+                                        (dst_type*)args.y_ptr, (int64_t)args.N, block_index);
 }
 
 }  // namespace deep_gemm

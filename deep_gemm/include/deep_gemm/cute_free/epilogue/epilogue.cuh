@@ -60,6 +60,24 @@ struct Epilogue {
       int m_offset, int n_offset, int warp_row, int warp_col, int lane,
       Element* ptr_D, int ldd, int max_row, int max_col,
       float const (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread]) {
+    if constexpr (CLayout::kTc01) {
+      // tc01 registers are not adjacent columns. Convert after WarpOnK has
+      // reduced FP32 partials; guard every element for arbitrary M/N tails.
+      #pragma unroll
+      for (int mm = 0; mm < kMmasPerWarpM; ++mm) {
+        #pragma unroll
+        for (int nn = 0; nn < kMmasPerWarpN; ++nn) {
+          #pragma unroll
+          for (int i = 0; i < kAccumPerThread; ++i) {
+            const int row = m_offset + warp_row * WARP_M + mm * 16 + lane / 4 + (i / 4) * 8;
+            const int col = n_offset + warp_col * WARP_N + nn * 16 + lane % 4 + (i % 4) * 4;
+            if (row < max_row && (kIsAlignedN || col < max_col))
+              ptr_D[int64_t(row) * ldd + col] = static_cast<Element>(accum[mm][nn][i]);
+          }
+        }
+      }
+      return;
+    }
     const int t_row = lane / kThreadsCol;  // 0..kThreadsRow-1
     const int t_col = lane % kThreadsCol;  // 0..kThreadsCol-1
 

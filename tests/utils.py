@@ -1382,14 +1382,85 @@ def gemm_assert_exact(actual, expected):
     torch.testing.assert_close(actual, expected.to(actual.dtype), rtol=0, atol=0)
 
 
+def gemm_call_with_sms(args, call):
+    previous = deep_gemm.get_num_sms()
+    env = {}
+    if 'cute_free' in args:
+        env['DG_USE_CUTE'] = str(args['cute_free'])
+    if 'warp_on_k' in args:
+        env['DG_810E_WARP_ON_K'] = str(args['warp_on_k'])
+    previous_env = {key: os.environ.get(key) for key in env}
+    try:
+        os.environ.update(env)
+        if 'num_sms' in args:
+            deep_gemm.set_num_sms(args['num_sms'])
+        return call()
+    finally:
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        if 'num_sms' in args:
+            deep_gemm.set_num_sms(previous)
+
+
+def test_dense_gemm_runtime_lut(args):
+    """Isolate the process-cached LUT while using the existing dense API checks."""
+    import pickle
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    case = {key: value for key, value in args.items() if key != 'runtime_lut'}
+    case['num_sms'] = 20
+    m, n, k = case['m'], case['n'], case['k']
+    valid = f'{(m + 15) // 16 * 16} {n} {k} 64 64 64 32 32 2\n'
+    invalid = valid.replace('32 32 2', '32 8 2')
+    variants = [
+        ('hit', valid, {}, 'ThreadblockShape[64, 64, 64]'),
+        ('fp32_accumulate', valid, {'data_type': 'bf16_bf16_fp32', 'accumulate': 'alias'},
+         'ThreadblockShape[64, 64, 64]'),
+        ('explicit_override', invalid, {'configs': [20, 32, 64, 64, 16, 32, 2]},
+         'ThreadblockShape[32, 64, 64]'),
+        # An incorrect match must fail validation, not silently run a valid tile.
+        ('miss', f'{(m + 15) // 16 * 16 + 16} {n} {k} 64 64 64 32 8 2\n', {}, ''),
+        ('invalid_hit', invalid, {'expect_error': 'invalid BF16 config'}, ''),
+    ]
+    with tempfile.TemporaryDirectory(prefix='deepgemm_lut_') as directory:
+        table = Path(directory) / f'{torch.cuda.get_device_name()}_bf16_densegemm.lut'
+        env = dict(os.environ, SAIL_DEEPGEMM_LUT_PATH=directory, show_log='1')
+        for key in ('DG_USE_CUTE', 'DG_810E_WARP_ON_K'):
+            env.pop(key, None)
+        env['PYTHONPATH'] = str(Path(__file__).resolve().parent) + os.pathsep + env.get('PYTHONPATH', '')
+        program = ('import pickle, sys; import utils; '
+                   'args, check, mode = pickle.load(sys.stdin.buffer); '
+                   'utils.set_acc_check(check); utils.deep_gemm.set_compile_mode(mode); '
+                   'utils.test_dense_gemm_api(args); utils.torch.cuda.synchronize()')
+        for name, row, overrides, expected_trace in variants:
+            table.write_text(row)
+            payload = pickle.dumps((dict(case, **overrides), get_acc_check(), deep_gemm.get_compile_mode()))
+            result = subprocess.run([sys.executable, '-c', program], input=payload, env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+            log = result.stdout.decode(errors='replace')
+            print(f'Runtime LUT regression: {name}\n{log}', flush=True)
+            if result.returncode:
+                raise AssertionError(f'Runtime LUT regression {name} failed: {result.returncode}')
+            if expected_trace and expected_trace not in log:
+                raise AssertionError(f'Runtime LUT regression {name} did not select {expected_trace}')
+
+
 def test_dense_gemm_api(args):
-    """One caselist case for BF16 accumulation or the native FP32 API."""
+    """One caselist case for BF16/FP32 accuracy, accumulation or CU budgets."""
+    if args.get('runtime_lut'):
+        return test_dense_gemm_runtime_lut(args)
     m, n, k, dtype = args['m'], args['n'], args['k'], args['data_type']
     accumulation = args.get('accumulate', 'none')
     pattern = args.get('pattern', 'random')
+    expected_error = args.get('expect_error')
     fp32 = dtype == torch.float32
-    if min(m, n, k) <= 0:
-        raise ValueError('Dense API regression cases require positive M/N/K')
+    if min(m, n, k) < 0:
+        raise ValueError('Dense API regression cases require nonnegative M/N/K')
     if accumulation not in ('none', 'separate', 'alias'):
         raise ValueError(f'Unsupported accumulate mode: {accumulation}')
     if args.get('with_bias') or get_benchmark():
@@ -1397,8 +1468,10 @@ def test_dense_gemm_api(args):
     if fp32:
         if accumulation != 'none' or pattern != 'random':
             raise ValueError('FP32 regression supports random inputs without C')
-    elif dtype not in (torch.bfloat16, 'bf16_bf16_fp32') or accumulation == 'none' or pattern not in ('random', 'cancellation'):
-        raise ValueError('Accumulation regression requires BF16 inputs, C, and random/cancellation pattern')
+    elif dtype not in (torch.bfloat16, 'bf16_bf16_fp32') or pattern not in ('random', 'cancellation'):
+        raise ValueError('BF16 regression requires BF16 inputs and random/cancellation pattern')
+    if pattern == 'cancellation' and accumulation == 'none':
+        raise ValueError('Cancellation regression requires C')
 
     compiling = bool(os.environ.get('HGGC_WARM_UP')) or deep_gemm.get_compile_mode() == 1
     check = get_acc_check() and not compiling
@@ -1425,6 +1498,16 @@ def test_dense_gemm_api(args):
     else:
         a = gemm_exact_values((m, k), generator).to(device='cuda', dtype=torch.bfloat16)
         b = gemm_exact_values((n, k), generator).to(device='cuda', dtype=torch.bfloat16)
+        for name in ('a', 'b'):
+            offset = args.get('offset_' + name, 0)
+            if offset not in (0, 1):
+                raise ValueError('BF16 regression storage offsets must be 0 or 1 element')
+            if offset:
+                value = a if name == 'a' else b
+                shifted = torch.empty(value.numel() + offset, device='cuda', dtype=value.dtype)[offset:].view_as(value)
+                shifted.copy_(value)
+                if name == 'a': a = shifted
+                else: b = shifted
         if pattern == 'cancellation':
             if k < 2:
                 raise ValueError('BF16 cancellation requires K >= 2')
@@ -1433,26 +1516,61 @@ def test_dense_gemm_api(args):
             # The final contribution also exercises the last split-K partition.
             a[:, 0], a[:, -1] = 1, 1 / 256
             b[:, 0], b[:, -1] = 1, 1
+        elif output_dtype == torch.float32 and accumulation == 'none' and m and n and k >= 2:
+            # Preserve the ordinary FP32-output case's rounding regression:
+            # 1 + 1/256 is exact in FP32 but rounds to 1 in BF16.
+            a[0].zero_()
+            b[0].zero_()
+            a[0, 0], b[0, 0] = 1, 1
+            a[0, -1], b[0, -1] = 1 / 16, 1 / 16
 
-    out = torch.full((m, n), 8., device='cuda', dtype=output_dtype)
+    storage = torch.full((m * n + 128,), 8., device='cuda', dtype=output_dtype)
+    out = storage[64:-64].view(m, n)
     c = initial_c = None
-    if not fp32:
+    if not fp32 and accumulation != 'none':
         initial_c = (torch.full((m, n), -1.) if pattern == 'cancellation'
                      else gemm_exact_values((m, n), generator)).to(device='cuda', dtype=output_dtype)
         c = out if accumulation == 'alias' else torch.empty_like(out)
         c.copy_(initial_c)
-    reference = gemm_reference(a, b) if check else None
-    if check and c is not None:
+    # Some PPU FP32 matmul paths lose precision even with allow_tf32=False.
+    # Use an independent CPU FP64 product rounded once to FP32 for this API's
+    # full-precision contract; keep the existing comparison tolerances below.
+    reference = ((a.cpu().double() @ b.cpu().double().t()).float().to(a.device)
+                 if fp32 else gemm_reference(a, b)) if check and not expected_error else None
+    if check and c is not None and not expected_error:
         reference = reference + initial_c.float()
         if pattern == 'cancellation':
             gemm_assert_exact(reference, torch.full_like(reference, 1 / 256))
 
-    # Preserve the scheduler's compile phase and never inspect unwritten products.
-    if fp32:
-        deep_gemm.gemm_fp32_fp32_fp32_nt(a, b, out)
-    else:
-        deep_gemm.bf16_gemm_nt(a, b, out, c=c)
+    # Compilation and rejected calls must preserve output/C even with --disable_acc.
+    unchanged = storage.clone() if compiling or expected_error else None
+    config = args.get('configs')
+    if config is not None:
+        if fp32 or len(config) != 7:
+            raise ValueError('BF16 configs must specify SMS/BM/BN/BK/WM/WN/stages')
+        config = tuple(config) + (SMEM_CONFIG_UNUSED,)
+    try:
+        if fp32:
+            gemm_call_with_sms(args, lambda: deep_gemm.gemm_fp32_fp32_fp32_nt(a, b, out))
+        else:
+            gemm_call_with_sms(args, lambda: deep_gemm.bf16_gemm_nt(a, b, out, c=c, configs=config))
+    except RuntimeError as error:
+        if not expected_error or expected_error not in str(error):
+            raise
+        gemm_assert_exact(storage, unchanged)
+        if accumulation == 'separate':
+            gemm_assert_exact(c, initial_c)
+        print('Passed expected dense API rejection')
+        return
+    if expected_error:
+        raise AssertionError('Dense GEMM accepted unsupported arguments')
+    if compiling:
+        gemm_assert_exact(storage, unchanged)
+        if accumulation == 'separate':
+            gemm_assert_exact(c, initial_c)
     if check:
+        gemm_assert_exact(storage[:64], torch.full_like(storage[:64], 8.))
+        gemm_assert_exact(storage[-64:], torch.full_like(storage[-64:], 8.))
         if fp32:
             torch.testing.assert_close(out, reference, rtol=2e-5, atol=2e-6)
             if m >= 2 and n >= 2 and k >= 2:
@@ -1463,6 +1581,25 @@ def test_dense_gemm_api(args):
             gemm_assert_exact(out, reference)
             if accumulation == 'separate':
                 gemm_assert_exact(c, initial_c)
+            if pattern == 'random' and min(m, n, k) > 0:
+                # Exact-value checks above isolate layout and rounding guards.
+                # Also retain normally distributed BF16 inputs, including low
+                # mantissa bits, with the ordinary GEMM accuracy threshold.
+                a.copy_(torch.randn(a.shape, generator=generator, dtype=torch.bfloat16))
+                b.copy_(torch.randn(b.shape, generator=generator, dtype=torch.bfloat16))
+                reference = gemm_reference(a, b)
+                if c is not None:
+                    c.copy_(torch.randn(c.shape, generator=generator, dtype=output_dtype))
+                    initial_c = c.clone()
+                    reference = reference + initial_c.float()
+                gemm_call_with_sms(args, lambda: deep_gemm.bf16_gemm_nt(a, b, out, c=c, configs=config))
+                diff = calc_diff(out, reference.to(output_dtype))
+                assert diff < 0.001, f'Normal BF16 accuracy: {m=}, {n=}, {k=}, {diff=:.10f}'
+                gemm_assert_exact(storage[:64], torch.full_like(storage[:64], 8.))
+                gemm_assert_exact(storage[-64:], torch.full_like(storage[-64:], 8.))
+                if accumulation == 'separate':
+                    gemm_assert_exact(c, initial_c)
+                print(f'Passed normal BF16 accuracy: {diff=:.10f}')
     print('Passed with acc_check' if check else 'Passed without acc_check')
 
 
@@ -1485,15 +1622,39 @@ def test_native_batch_gemm(args):
         raise ValueError(f'Unsupported native batch layout: {layout}')
     if broadcast not in ('none', 'a', 'b', 'both'):
         raise ValueError('Unsupported native batch broadcast')
-    if expected_error not in (None, 'overlap') or args.get('expr') or get_benchmark():
+    error_messages = {'overlap': ('output batches overlap', 'nonoverlapping rows'),
+                      'k_tiles': ('requires K >= 64 and divisible by 32',),
+                      'input_overlap': ('output must not overlap an input',)}
+    if expected_error not in (None, *error_messages) or args.get('expr') or get_benchmark():
         raise ValueError('Native batch regression requires accuracy mode and native [B,M,K]/[B,N,K] layouts')
-    check = get_acc_check() and not os.environ.get('HGGC_WARM_UP') and deep_gemm.get_compile_mode() != 1
+    compiling = bool(os.environ.get('HGGC_WARM_UP')) or deep_gemm.get_compile_mode() == 1
+    check = get_acc_check() and not compiling
+    config = args.get('configs')
+    if config is not None:
+        if len(config) != 7:
+            raise ValueError('BF16 configs must specify SMS/BM/BN/BK/WM/WN/stages')
+        config = tuple(config) + (SMEM_CONFIG_UNUSED,)
     generator = torch.Generator().manual_seed(810)
-    a, _ = gemm_batch_view(batch, m, k, layout, 8)
-    b, _ = gemm_batch_view(batch, n, k, layout, 16)
+    padding_a, padding_b = args.get('padding_a', 8), args.get('padding_b', 16)
+    if any(not isinstance(pad, int) or pad < 0 or pad % 8 for pad in (padding_a, padding_b)):
+        raise ValueError('Native batch input padding must be nonnegative multiples of 8')
+    a, _ = gemm_batch_view(batch, m, k, layout, padding_a)
+    b, _ = gemm_batch_view(batch, n, k, layout, padding_b)
     out, storage = gemm_batch_view(batch, m, n, layout, 24)
     a.copy_(gemm_exact_values(a.shape, generator))
     b.copy_(gemm_exact_values(b.shape, generator))
+    # Initialize backing storage once: overlapping read-only views cannot be
+    # filled independently by row without changing their shared elements.
+    def strided_input(tensor, name):
+        if name not in args:
+            return tensor
+        strides = tuple(args[name])
+        if len(strides) != 3 or any(not isinstance(s, int) or s < 0 for s in strides):
+            raise ValueError(f'{name} must contain three nonnegative element strides')
+        size = 1 + sum((dim - 1) * stride for dim, stride in zip(tensor.shape, strides))
+        backing = gemm_exact_values((size,), generator).to(device='cuda', dtype=torch.bfloat16)
+        return backing.as_strided(tensor.shape, strides)
+    a, b = strided_input(a, 'a_stride'), strided_input(b, 'b_stride')
     if broadcast in ('a', 'both'):
         a = a[:1].expand(batch, -1, -1)
     if broadcast in ('b', 'both'):
@@ -1505,25 +1666,36 @@ def test_native_batch_gemm(args):
         size = 1 + sum((dim - 1) * stride for dim, stride in zip((batch, m, n), strides))
         storage = torch.full((size,), -123., device='cuda', dtype=torch.bfloat16)
         out = storage.as_strided((batch, m, n), strides)
-    expected_storage = storage.clone() if check else None
+    if args.get('shared_storage'):
+        # Keep A and padded/interleaved D in one allocation, including guards.
+        offset = 0 if args['shared_storage'] == 'overlap' else a.numel() + 64
+        backing = torch.full((max(a.numel(), offset + storage.numel()),), -123.,
+                             device='cuda', dtype=torch.bfloat16)
+        shared_a = backing[:a.numel()].view_as(a)
+        shared_a.copy_(a)
+        a = shared_a
+        out = backing.as_strided(out.shape, out.stride(), offset)
+        storage = backing
+    # Compile-only and rejection checks include D and every padding element,
+    # independently of the numeric accuracy flag disabled by the warm-up runner.
+    expected_storage = storage.clone() if check or compiling or expected_error else None
     if check and not expected_error:
         reference = gemm_reference(a, b)
-        expected_storage.as_strided(out.shape, out.stride()).copy_(reference)
+        expected_storage.as_strided(out.shape, out.stride(), out.storage_offset()).copy_(reference)
     try:
-        deep_gemm.bf16_gemm_strided_batched_nt(a, b, out)
+        gemm_call_with_sms(args, lambda: deep_gemm.bf16_gemm_strided_batched_nt(a, b, out, configs=config))
     except RuntimeError as error:
         # Expected metadata rejection must pass in both compile and accuracy phases.
-        if expected_error != 'overlap' or not any(message in str(error) for message in (
-                'output batches overlap', 'nonoverlapping rows')):
+        if not expected_error or not any(message in str(error) for message in error_messages[expected_error]):
             raise
-        if check:
-            gemm_assert_exact(storage, expected_storage)
-        print('Passed expected output-overlap rejection')
+        gemm_assert_exact(storage, expected_storage)
+        print('Passed expected native batch API rejection')
         return
     if expected_error:
-        raise AssertionError('Native batch accepted overlapping outputs')
+        raise AssertionError('Native batch accepted unsupported arguments')
     if check:
         gemm_assert_exact(out, reference)
+    if check or compiling:
         gemm_assert_exact(storage, expected_storage)  # Includes every padding guard.
     print('Passed with acc_check' if check else 'Passed without acc_check')
 
@@ -1549,7 +1721,13 @@ def test_gemm(args) -> None:
         check = get_acc_check() and not os.environ.get('HGGC_WARM_UP') and deep_gemm.get_compile_mode() != 1
         return (run_tile_alignment_cache if regression == 'alignment_cache' else run_n1_cu_limit)(check=check)
     print(f"test_gemm->test_func: DenseGemm,m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")
-    if d == torch.float32 or args.get('accumulate', 'none') != 'none':
+    # Ordinary nonempty PPU BF16 functional cases need the same full-output,
+    # guard and compile-only checks as the cases carrying regression options.
+    bf16_functional = (use_ppu and d in (torch.bfloat16, 'bf16_bf16_fp32')
+                       and min(m, n, k) > 0 and not get_benchmark())
+    if (bf16_functional or d == torch.float32 or args.get('runtime_lut') or args.get('expect_error') or
+            'configs' in args or 'cute_free' in args or 'warp_on_k' in args or args.get('accumulate', 'none') != 'none' or
+            ('num_sms' in args and d in (torch.bfloat16, 'bf16_bf16_fp32'))):
         return test_dense_gemm_api(args)
     bias = None
     if args.get('with_bias', False):

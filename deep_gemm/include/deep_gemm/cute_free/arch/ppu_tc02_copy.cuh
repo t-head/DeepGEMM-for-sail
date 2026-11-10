@@ -8,7 +8,7 @@ namespace deep_gemm {
 namespace arch {
 
 // =============================================================================
-// PPU 1.5 (tc02) low-level copy primitives.
+// PPU 1.0 (tc01) and PPU 1.5 (tc02) low-level copy primitives.
 //
 // These are thin wrappers over the raw device instructions. They are templated on
 // the tile shape constants so that the swizzle mode / strides are resolved at
@@ -28,6 +28,14 @@ __device__ __forceinline__ void aiu_bulk_tensor_load_bf16(
     cutlass::bfloat16_t* smem_dst, cutlass::bfloat16_t const* gmem_base,
     int rows, int ld, int row_offset, int col_offset) {
   uint32_t s = smem_ptr_to_uint(smem_dst);
+#if __HGGC_ARCH__ == 100
+  asm volatile(
+    "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.2d.b16 "
+    "[%0], [%1], {%2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11};\n"
+    :: "r"(s), "l"(gmem_base), "r"(1), "r"(rows), "r"(ld),
+       "r"(0), "r"(row_offset), "r"(col_offset),
+       "r"(1), "r"(CUBE_H), "r"(CUBE_W), "r"(1));
+#else
   uint64_t tensor_stride_w = (uint64_t)ld * sizeof(cutlass::bfloat16_t);
   uint64_t tensor_stride_n = tensor_stride_w * rows;
   static constexpr int swzl_mode = CUBE_W * (int)sizeof(cutlass::bfloat16_t) == 128 ? 0 : 1;
@@ -41,6 +49,23 @@ __device__ __forceinline__ void aiu_bulk_tensor_load_bf16(
       "r"(col_offset), "r"(row_offset), "r"(0),
       "r"(swzl_mode)
   );
+#endif
+}
+
+// tc01 uses a cube base and explicit row/channel coordinates. Unlike tc02,
+// both NT operands use the same non-transposed load and fragment ordering.
+template <int CUBE_H>
+__device__ __forceinline__ void tsm_ldmatrix_tc01_bf16(
+    cutlass::bfloat16_t const* cube, int row, int channel_bytes,
+    uint32_t (&frag)[4]) {
+#if __HGGC_ARCH__ == 100
+  asm volatile(
+    "ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.swzl.shared.b16 "
+    "{%0, %1, %2, %3}, [%4], {%5, %6, %7, %8, %9, %10};"
+    : "=r"(frag[0]), "=r"(frag[1]), "=r"(frag[2]), "=r"(frag[3])
+    : "l"(cube), "r"(0), "r"(row), "r"(1), "r"(CUBE_H),
+      "r"(1), "r"(channel_bytes));
+#endif
 }
 
 /// TSM_LD: hardware fragment load from swizzled shared memory (ldmatrix.swzl).

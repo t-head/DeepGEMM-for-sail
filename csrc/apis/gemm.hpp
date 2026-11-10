@@ -3,6 +3,7 @@
 #include "../utils/compatibility.hpp"
 #include "../utils/layout.hpp"
 #include <torch/extension.h>
+#include <ATen/MemoryOverlap.h>
 #include "../jit_kernels/impls/epilogue_class.hpp"
 #include "../jit_kernels/impls/fp8_gemm.hpp"
 #include "../jit_kernels/impls/ppuxx_layout.hpp"
@@ -33,6 +34,60 @@ using W4A8ConfigTuple = deep_gemm::w4fa8::W4A8ConfigTuple;
 using NVFP4Activation = nvfp4::Activation;
 using NVFP4Weight = nvfp4::Weight;
 using NVFP4ExecutionConfig = nvfp4::ExecutionConfig;
+
+static bool gemm_disjoint(const torch::Tensor& a, const torch::Tensor& b) {
+    if (!a.numel() || !b.numel() || !a.is_alias_of(b) ||
+        at::get_overlap_status(a, b) == at::MemOverlapStatus::No) return true;
+    // TooHard is not proof of overlap. Bound positive-stride views in bytes
+    // relative to their shared storage; holes inside intersecting bounds remain
+    // conservatively rejected. Storage bounds also prevent arithmetic overflow.
+    const auto range = [](const torch::Tensor& t) -> std::optional<std::pair<size_t, size_t>> {
+        const size_t bytes = t.element_size(), limit = t.storage().nbytes() / bytes;
+        if (t.storage_offset() < 0 || size_t(t.storage_offset()) >= limit) return std::nullopt;
+        size_t last = t.storage_offset();
+        for (int dim = 0; dim < t.dim(); ++dim) {
+            if (t.stride(dim) < 0) return std::nullopt;
+            const size_t stride = t.stride(dim), count = t.size(dim) - 1;
+            if (stride && count > (limit - 1 - last) / stride) return std::nullopt;
+            last += count * stride;
+        }
+        return std::make_pair(size_t(t.storage_offset()) * bytes, (last + 1) * bytes);
+    };
+    const auto x = range(a), y = range(b);
+    return x && y && (x->second <= y->first || y->second <= x->first);
+}
+
+static void check_gemm_device_and_output(const torch::Tensor& a, const torch::Tensor& b,
+                                         const torch::Tensor& d) {
+    TORCH_CHECK(a.is_cuda() && b.device() == a.device() && d.device() == a.device(),
+                "GEMM tensors must be on the same accelerator");
+    int device;
+    DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device));
+    TORCH_CHECK(a.get_device() == device, "GEMM tensors must be on the current accelerator");
+    TORCH_CHECK(gemm_disjoint(d, a) && gemm_disjoint(d, b),
+                "GEMM output must not overlap an input");
+}
+
+// Validate user tiles before packing, accumulation or JIT. In particular, zero
+// warp dimensions must not reach divisions in the lower-level launchers.
+static void check_bf16_gemm_config(const std::optional<ConfigTuple>& configs, int64_t k,
+                                   int output_bytes, bool batched = false) {
+    if (!configs || is_ppu1v5_device()) return;
+    const auto [sms, bm, bn, bk, wm, wn, stages, unused] = *configs;
+    const auto pow2 = [](int x) { return x > 0 && (x & (x - 1)) == 0; };
+    TORCH_CHECK(sms > 0 && sms <= get_num_sms(), "BF16 config CU count exceeds the configured budget");
+    TORCH_CHECK(bm >= 16 && bm <= 512 && pow2(bm) && bn >= 16 && bn <= 512 && pow2(bn) &&
+                bk >= 32 && bk <= 256 && pow2(bk) && wm >= 16 && pow2(wm) &&
+                wn >= 16 && pow2(wn) && bm % wm == 0 && bn % wn == 0 &&
+                stages >= 2 && stages <= 8, "invalid BF16 config tile or warp dimensions");
+    TORCH_CHECK(k >= 64 && k % 32 == 0 && k / bk >= stages && (!batched || k % bk == 0),
+                "BF16 config requires complete prologue K tiles (K>=64, K%32=0)");
+    const int64_t threads = int64_t(bm / wm) * (bn / wn) * 32;
+    const int64_t smem = std::max(int64_t(bm + bn) * bk * 2 * stages, int64_t(bm) * bn * output_bytes);
+    const auto prop = device_runtime->get_prop();
+    TORCH_CHECK(threads <= prop->maxThreadsPerBlock && smem <= prop->sharedMemPerBlock,
+                "BF16 config exceeds device thread or shared-memory limits");
+}
 
 extern "C" {
 static bool early_return(const int& m, const int &n, const int& k,
@@ -94,10 +149,13 @@ void bf16_gemm_nt(const torch::Tensor& a,
                   const std::optional<torch::Tensor>& c,
                   const std::string& compiled_dims,
                   std::optional<ConfigTuple> configs = std::nullopt) {
-    const auto major_a = get_major_type_ab(a);
-    const auto major_b = get_major_type_ab(b);
-    check_major_type_cd(d);
-
+    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && d.dim() == 2, "BF16 dense GEMM requires rank-2 tensors");
+    check_gemm_device_and_output(a, b, d);
+    // Host tile/grid calculations add up to 511 before division in int32.
+    for (auto size : {a.size(0), a.size(1), b.size(0), b.size(1), d.size(0), d.size(1)})
+        TORCH_CHECK(size <= std::numeric_limits<int>::max() - 511, "BF16 dense GEMM dimensions exceed int32 tile range");
+    TORCH_CHECK(a.size(1) <= std::numeric_limits<int>::max() - 4096,
+                "BF16 dense GEMM K exceeds the int32 K-loop range");
     const auto& [m, k] = get_shape<2>(a);
     const auto& [n, k_] = get_shape<2>(b);
     const auto& [m_, n_] = get_shape<2>(d);
@@ -110,6 +168,22 @@ void bf16_gemm_nt(const torch::Tensor& a,
     TORCH_CHECK(a.is_contiguous(), "lhs must be contiguous");
     TORCH_CHECK(b.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+    // Explicit tiles override the external LUT; both take precedence over
+    // automatic GEMV, cute-free and generalized dispatch on 810E. Keep the
+    // placeholder smem tuple until the tile passes the same checks as configs.
+    if (!configs && m && n && k && model_810e_dispatch_device()) {
+        if (auto tile = deep_gemm_lut::get_runtime_config(
+                m, n, k, 1, GemmType::Normal, deep_gemm_lut::RuntimeLutKind::BF16)) {
+            auto [bm, bn, bk, wm, wn, stages] = *tile;
+            configs = std::make_tuple(get_num_sms(), bm, bn, bk, wm, wn, stages,
+                                      std::make_tuple(0, 0, 0));
+        }
+    }
+    const bool cute_free = m && n && k && model_810e_cute_free_requested();
+    if (m && n && k && !cute_free) check_bf16_gemm_config(configs, k, d.element_size());
+    if (configs && !cute_free && !is_ppu1v5_device() && m && n && k)
+        TORCH_CHECK(n % (16 / d.element_size()) == 0 && (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) == 0,
+                    "BF16 dense explicit/LUT configs require vector-aligned output");
     if (c.has_value()) {
         TORCH_CHECK(c->sizes() == d.sizes(), "C and D must have the same shape");
         TORCH_CHECK(c->scalar_type() == d.scalar_type(), "C and D must have the same dtype");
@@ -117,6 +191,8 @@ void bf16_gemm_nt(const torch::Tensor& a,
         check_major_type_cd(c.value());
         TORCH_CHECK(c->data_ptr() != d.data_ptr() || c->strides() == d.strides(),
                     "C and D sharing the same address must have the same strides");
+        TORCH_CHECK(c->data_ptr() == d.data_ptr() || gemm_disjoint(d, *c),
+                    "BF16 GEMM C/D must be disjoint or exactly aliased");
         if (m != 0 && n != 0 && k != 0) {
             // BF16 product kernels (including GEMV and split-K) have beta=0.
             // Keep C alive until the FP32 product is complete, including C == D,
@@ -131,10 +207,31 @@ void bf16_gemm_nt(const torch::Tensor& a,
             return;
         }
     }
+    if (k == 0 && is_compile_only()) return;
     if (early_return(m, n, k, d, c)) return;
+    if (model_810e_cute_free(a, b, d, configs)) return;
     if (n == 1 && !configs.has_value() && model_810e_bf16_n1(a, b, d)) return;
     if (!configs.has_value() && model_810e_dispatch_dense(a, b, d)) return;
     TORCH_CHECK(is_ppu1v5_device() || n % 2 == 0, "BF16 dense GEMM on PPU1.0 requires even N, got ", n);
+    if (!is_ppu1v5_device()) {
+        TORCH_CHECK(k >= 64 && k % 32 == 0 &&
+                    (reinterpret_cast<uintptr_t>(a.data_ptr()) & 15) == 0 &&
+                    (reinterpret_cast<uintptr_t>(b.data_ptr()) & 15) == 0,
+                    "BF16 tiled GEMM requires K>=64, K%32=0 and 16-byte-aligned inputs");
+        TORCH_CHECK(n % (16 / d.element_size()) == 0 && (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) == 0,
+                    "BF16 tiled GEMM requires vector-aligned output");
+        if (!configs) {
+            configs = deep_gemm_bf16_common::get_best_configs(m, n, k, 1, get_num_sms());
+            // PPU 1.0 MMA spans 16 N columns per warp. WN=8 oversteps the
+            // shared tile even though it compiles. Short K also needs two
+            // complete prologue tiles in the budget-aware fallback.
+            std::get<5>(*configs) = std::max(16, std::get<5>(*configs));
+            auto& bk = std::get<3>(*configs);
+            if (k / bk < 2) bk = 32;
+            std::get<6>(*configs) = std::min(std::get<6>(*configs), k / bk);
+        }
+        check_bf16_gemm_config(configs, k, d.element_size());
+    }
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
         bf16_gemm(a, b, d, m, n, k, configs);
@@ -147,20 +244,60 @@ void gemm_fp32_fp32_fp32_nt(const torch::Tensor& a, const torch::Tensor& b, cons
     TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && d.dim() == 2, "FP32 GEMM requires rank-2 tensors");
     TORCH_CHECK(a.scalar_type() == torch::kFloat && b.scalar_type() == torch::kFloat &&
                 d.scalar_type() == torch::kFloat, "FP32 GEMM requires FP32 inputs and output");
-    TORCH_CHECK(a.is_cuda() && b.device() == a.device() && d.device() == a.device(),
-                "FP32 GEMM tensors must be on the same accelerator");
+    check_gemm_device_and_output(a, b, d);
     TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && d.is_contiguous(),
                 "FP32 GEMM requires contiguous tensors");
     TORCH_CHECK(a.size(1) == b.size(1) && d.size(0) == a.size(0) && d.size(1) == b.size(0),
                 "FP32 GEMM expects A[M,K], B[N,K], D[M,N]");
     if (a.size(0) == 0 || b.size(0) == 0) return;
-    if (a.size(1) == 0) { d.zero_(); return; }
+    if (a.size(1) == 0) { if (!is_compile_only()) d.zero_(); return; }
     fp32_gemm(a, b, d);
+}
+
+// Validate native strided batches. Read-only inputs may
+// broadcast batches; output batches must never race on the same address.
+static bool model_810e_check_batch(const torch::Tensor& a, const torch::Tensor& b,
+                                  const torch::Tensor& d) {
+    TORCH_CHECK(a.dim() == 3 && b.dim() == 3 && d.dim() == 3, "810E batch requires rank-3 tensors");
+    TORCH_CHECK(a.scalar_type() == torch::kBFloat16 && b.scalar_type() == torch::kBFloat16 &&
+                d.scalar_type() == torch::kBFloat16, "810E batch requires BF16 inputs and output");
+    check_gemm_device_and_output(a, b, d);
+    TORCH_CHECK(!is_ppu1v5_device(), "810E batch targets PPU 1.0");
+    TORCH_CHECK(a.size(0) == b.size(0) && a.size(0) == d.size(0) && a.size(1) == d.size(1) &&
+                b.size(1) == d.size(2) && a.size(2) == b.size(2),
+                "810E batch expects A[B,M,K], B[B,N,K], D[B,M,N]");
+    if (a.size(0) == 0 || a.size(1) == 0 || b.size(1) == 0) return true;
+    for (auto size : {a.size(0), a.size(1), a.size(2), b.size(1)})
+        TORCH_CHECK(size <= std::numeric_limits<int>::max() - 511, "810E batch dimensions exceed int32 tile range");
+    TORCH_CHECK(a.size(2) <= std::numeric_limits<int>::max() - 4096,
+                "810E batch K exceeds the int32 K-loop range");
+    TORCH_CHECK(a.size(0) <= device_runtime->get_prop()->maxGridSize[2], "810E batch exceeds grid.z limit");
+    TORCH_CHECK(d.stride(2) == 1, "810E batch requires contiguous N in output");
+    TORCH_CHECK(a.stride(0) >= 0 && b.stride(0) >= 0 && d.stride(0) > 0 &&
+                a.stride(1) >= 0 && b.stride(1) >= 0 && a.stride(2) >= 0 && b.stride(2) >= 0 &&
+                d.stride(1) >= d.size(2),
+                "810E batch requires nonnegative batch strides and nonoverlapping rows");
+    TORCH_CHECK(!model_810e_batch_output_overlaps(d), "810E batch output batches overlap");
+    if (a.size(2) == 0) return false; // The API handles zero K after alias/device checks.
+    // Every supported tile has BK >= 32 and at least two complete K stages.
+    TORCH_CHECK(a.size(2) >= 64 && a.size(2) % 32 == 0,
+                "810E batch requires K >= 64 and divisible by 32");
+    return false;
 }
 
 void bf16_gemm_strided_batched_nt(const torch::Tensor& a, const torch::Tensor& b,
     const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt) {
     if (model_810e_check_batch(a, b, d)) return;
+    if (a.size(2) == 0) { if (!is_compile_only()) d.zero_(); return; }
+    check_bf16_gemm_config(configs, a.size(2), d.element_size(), true);
+    if (!model_810e_batch_native_input(a) || !model_810e_batch_native_input(b)) {
+        if (!configs && model_810e_dispatch_strided_batch(a, b, d)) return;
+        const int sms = configs ? std::get<0>(*configs) : get_num_sms();
+        const auto packed_a = model_810e_pack_batch_input(a, sms);
+        const auto packed_b = model_810e_pack_batch_input(b, sms);
+        bf16_gemm_strided_batched_nt(packed_a, packed_b, d, configs);
+        return;
+    }
     if (!configs.has_value() && model_810e_dispatch_batch(a, b, d)) return;
     if (!configs.has_value() && a.size(2) == 128) {
         // Short-K batches are output-bound at large M. Use the coalesced TSM

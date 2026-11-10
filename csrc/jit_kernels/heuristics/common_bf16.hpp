@@ -162,7 +162,10 @@ bool dense_gemv_select_configs(int m, int n, int k, const void* w, const void* x
         return false;
     // Below this launch overhead dominates; tile pins BN=16 and loses on tiny n
     // (n=12 k=7168: 9.60 vs GEMV 3.80 us, 2.5x). Env-tunable for A/B.
-    if (n < get_env<int>("DG_DENSE_GEMV_MIN_N", 8) || k < 8)
+    const bool is_810e = std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
+    // Scalar GEMV stores cover even sub-vector outputs. Sending short K / N<8
+    // to the vector epilogue would write beyond the logical output row.
+    if (n < get_env<int>("DG_DENSE_GEMV_MIN_N", is_810e ? 1 : 8) || k < 8)
         return false;
     // bf16 + int4 (16B) vector loads: k must be a multiple of 8 elements and both
     // base pointers 16B aligned (rhs rows then stay aligned too, stride == k).
@@ -184,19 +187,43 @@ bool dense_gemv_select_configs(int m, int n, int k, const void* w, const void* x
             npt = npt_override;
     }
 
+    // A single warp is sufficient for short reductions. Extra warps add a
+    // shared-memory reduction and do not supply useful K parallelism.
+    if (is_810e && n <= 128 && k <= 128) {
+        block_x = k <= 64 ? 8 : 16;
+        block_y = 32 / block_x;
+        k_per_thread = 1;
+        return true;
+    }
+
+    if (is_810e && m == 1 && k <= 1024) {
+        // Complete short reductions in one unrolled pass. A single warp can
+        // hold two small-N rows; larger outputs retain four rows per CTA.
+        if (n >= 64 && n <= 128 && k >= 256 && k % 128 == 0) {
+            block_x = 16; block_y = 2; k_per_thread = k / 128;
+            return true;
+        }
+        if (n >= 512 && k >= 512 && k % 256 == 0) {
+            block_x = 32; block_y = 4; k_per_thread = k / 256;
+            return true;
+        }
+    }
+
     // m == 1 tile gate: in the large-n x large-k corner SIMT FMA loses to tile
     // (~1.81 vs 1.87 TB/s). 4900-case scans put the crossover at n>=2944 && k>=3584.
     constexpr int kGemvTileGateN = 3072;
     constexpr int kGemvTileGateK = 3584;
-    if (!transposed_n1 && m == 1 && n >= kGemvTileGateN && k >= kGemvTileGateK)
+    if (!is_810e && !transposed_n1 && m == 1 && n >= kGemvTileGateN && k >= kGemvTileGateK)
         return false;
 
     k_per_thread = 2;
     const int add_times = k / kElemAlign;
     constexpr int block_size = 128;
-    if (n <= 100) {
+    if (n <= 100 || (is_810e && ((n >= kGemvTileGateN && k >= kGemvTileGateK) ||
+                               (m == 1 && k >= 4096)))) {
         // One fat block per row, full-block K reduction (BlockX == 128
-        // exercises the cross-warp SMEM reduce).
+        // exercises the cross-warp SMEM reduce). Deep single-row products
+        // also need this K parallelism when N is below the wide-output gate.
         block_x = 128;
     } else if (add_times <= 2) {
         block_x = 2;
@@ -518,21 +545,62 @@ get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms) 
     int k = shape[2];
     std::tuple<int, int, int> best_smem_config = get_smem_config(stages, k, bm, bn, bk);
 
-    return {num_min_sms, bm, bn, bk, wm, wn, bk, stages, best_smem_config};
+    return {std::min(num_min_sms, num_sms), bm, bn, bk, wm, wn, bk, stages, best_smem_config};
 }
-// Exact 810E tiles selected from cold-cache measurements. Unmatched shapes
-// continue through the general BF16 heuristics. Tile fields are
-// BM, BN, BK, WM, WN, stages, split-K, then optional scheduling flags.
+// 810E dispatch plans depend on geometry, K alignment and output precision.
+// Tile fields are BM, BN, BK, WM, WN, stages, split-K, then scheduling flags.
 enum class Model810eDispatchKind { Direct, TSM, Standard, Hybrid };
 enum class Model810eOutputType { BF16, FP32 };
 
+// ZW810E exposes 64 general CUs, of which 20 support tensor instructions.
+// This matches the default tensor budget in DeviceRuntime::get_num_sms().
+inline constexpr int kModel810eTensorCUs = 20;
+
 struct Model810eDispatchTile {
     int bm, bn, bk, wm, wn, stages, splits;
-    int grid_m_first = 0;
+    // 0: N first; 1: M first; >=2: groups of this many M tiles.
+    int tile_order = 0;
     int peel_first_k = 0;
-    int static_m36 = 0;
-    int static_k256 = 0;
+    int specialize_shape = 0;
+    int unroll_k = 0;
+    bool narrow_n_tail = false;
 };
+
+// Shared-memory residency bound for the measured 810E tile families. Register
+// allocation can impose a tighter limit; this is not a general occupancy model.
+static int64_t model_810e_smem_waves(int64_t batch, int64_t m, int64_t n,
+                                   const Model810eDispatchTile& t) {
+    const int64_t main_bytes = int64_t(t.bm + t.bn) * t.bk * 2 * t.stages;
+    const int64_t epi_bytes = int64_t(t.bm / t.wm) * 16 * t.bn * 4 + 128;
+    const int64_t resident = std::max<int64_t>(1, (256LL << 10) / std::max(main_bytes, epi_bytes));
+    const int64_t blocks = batch * ceil_div(m, int64_t(t.bm)) * ceil_div(n, int64_t(t.bn)) * t.splits;
+    return ceil_div(blocks, resident * kModel810eTensorCUs);
+}
+
+// Compact M tiles retain power-of-two warp grids while reducing padded rows.
+// Batches must still supply two tensor-CU waves; larger tiles break that bound
+// in small batches, where a pair of smaller M tiles can be preferable.
+static Model810eDispatchTile model_810e_compact_batch_tile(
+    int64_t batch, int64_t m, int64_t n, int64_t k, Model810eDispatchTile t) {
+    if (m <= 64 || m > 224 || n < 128 || n > 1024 || n % 128 != 0 ||
+        k < 128 || k > 512 || k % 64 != 0 || t.bn != 128) return t;
+    int64_t padding = ceil_div(m, int64_t(t.bm)) * t.bm;
+    int best = t.bm;
+    for (int bm : {80, 96, 112, 128, 160, 192, 224}) {
+        const int64_t padded = ceil_div(m, int64_t(bm)) * bm;
+        const int64_t blocks = batch * ceil_div(m, int64_t(bm)) * (n / 128);
+        if (blocks >= 2 * kModel810eTensorCUs &&
+            (padded < padding || (padded == padding && bm > best))) {
+            padding = padded;
+            best = bm;
+        }
+    }
+    if (best != t.bm) {
+        const int wm = best == 80 || best == 112 ? best : best / 2;
+        t = {best, 128, 64, wm, 32, 2, 1};
+    }
+    return t;
+}
 
 struct Model810eDenseDispatchEntry {
     int64_t m, n, k;
@@ -544,108 +612,614 @@ struct Model810eDenseDispatchEntry {
     Model810eDispatchTile tail_tile{};
 };
 
-struct Model810eBatchDispatchEntry {
-    int64_t batch, m, n, k;
-    int64_t lhs_ld, rhs_ld, out_ld;
-    int64_t lhs_batch_stride, rhs_batch_stride, out_batch_stride;
-    Model810eOutputType output;
-    Model810eDispatchKind kind;
-    Model810eDispatchTile tile;
-};
+// The shape is retained for the standard launcher and hybrid M split;
+// no shape-keyed table is searched.
+static Model810eDenseDispatchEntry get_model_810e_dense_dispatch(
+    int64_t m, int64_t n, int64_t k, Model810eOutputType output) {
+    Model810eDenseDispatchEntry plan{m, n, k, output, Model810eDispatchKind::TSM,
+        {128, 128, k >= 128 && k % 64 == 0 ? 64 : 32, 64, 32, 2, 1}};
+    auto& t = plan.tile;
+    t.stages = std::min<int64_t>(3, k / t.bk);
+    if (n < 64) {
+        t.bm = n >= 8 ? 128 : 64;
+        t.bn = n >= 24 ? 32 : 16;
+        t.wm = t.bm == 128 ? 32 : 16;
+        t.wn = t.bn == 16 ? 16 : 32;
+        if (n % 8 != 0) plan.kind = Model810eDispatchKind::Direct;
+    } else if (m <= 512 && n <= 2048 && k >= 768) {
+        const bool short_rows = m <= 192 && n < 1024 && k < 4096;
+        plan.kind = m >= 128 && !short_rows ? Model810eDispatchKind::TSM : Model810eDispatchKind::Direct;
+        t.bm = m <= 16 ? 16 : m < 128 || short_rows ? 32 : 64;
+        t.bn = (short_rows && m >= 128 && n >= 384 && n <= 512) ||
+               (output == Model810eOutputType::FP32 && m >= 128 &&
+                ((m <= 256 && n >= 1024) || (n >= 384 && m * n <= 131072))) ? 128 : 64;
+        t.wm = t.bm <= 32 ? 16 : 32;
+        t.wn = t.bm == 16 ? 16 : 32;
+    } else if (m <= 32) {
+        t.bm = 32; t.bn = 128; t.wm = 16; t.wn = 32;
+        if (k >= 2048 && k % 128 == 0) t.bk = 128;
+        t.stages = std::min<int64_t>(3, k / t.bk);
+    } else if (m <= 256) {
+        // At least seven eighths of a BM128 tile is useful here. More M rows
+        // per CTA reduce rereads of a large B matrix compared with BM64/BN256.
+        const bool large_b = n * k * 2 > (64LL << 20);
+        t.bm = m >= 224 || (m > 64 && m <= 128 && large_b) ? 128 : 64;
+        t.bn = n >= 12288 && t.bm == 64 && !(m <= 64 && k >= 4096) ? 256 : 128;
+        t.wm = 32; t.wn = t.bn == 256 || t.bm == 128 ? 64 : 32;
+        if (m > 64 && large_b && t.bn == 128) t.stages = 2;
+    } else if (m <= 1024 && m % 128 != 0 &&
+               (n >= 65536 || (n >= 16384 && k >= 768 && ceil_div(m, int64_t(128)) * 128 * 4 > m * 5))) {
+        // Use a large tile for the complete M rows and a smaller tile for the
+        // remainder; both launches retain the complete K reduction.
+        plan.kind = Model810eDispatchKind::Hybrid;
+        plan.split_m = int(m / 128 * 128);
+        const int remainder = int(m - plan.split_m);
+        const int tail_m = remainder <= 16 ? 16 : remainder <= 32 ? 32 : remainder <= 64 ? 64 : 128;
+        plan.tail_tile = {tail_m, 128, t.bk, tail_m <= 32 ? 16 : 32, 32, t.stages, 1};
+        if (m > 512 && tail_m <= 32 && k >= 2048 && k % 128 == 0)
+            plan.tail_tile = {tail_m, 128, 128, 16, 32, 3, 1};
+        t.bm = 128; t.bn = 128; t.wm = 32; t.wn = 64; t.stages = 2;
+    } else if (n <= 64) {
+        t.bm = 256; t.bn = 64; t.wm = 64; t.wn = 32;
+    } else if (n <= 512) {
+        t.bm = 128; t.bn = n <= 288 && n != 128 ? 64 : 128;
+        t.wm = 32; t.wn = t.bn == 64 ? 32 : 64;
+        if (k >= 10240 && n % 64 == 0) {
+            t.bm = 256; t.bn = 64; t.wm = 64; t.wn = 32; t.stages = 5;
+        }
+    } else {
+        t.stages = 2;
+        // Only transpose traversal when B exceeds the 64 MiB LLC. If the
+        // complete A does not fit either, retain an 8 MiB A panel while walking N.
+        constexpr int64_t cache_bytes = 64LL << 20;
+        if (m >= 1024 && n * k * 2 > cache_bytes) {
+            t.tile_order = 1;
+            if (m * k * 2 > cache_bytes) {
+                const int64_t panel_tiles = (8LL << 20) / (t.bm * k * 2);
+                t.tile_order = 2;
+                while (t.tile_order * 2 <= std::min<int64_t>(16, panel_tiles))
+                    t.tile_order *= 2;
+            }
+            t.peel_first_k = 1;
+        }
+    }
+    if (k <= 512) {
+        t.stages = 2;
+        if (m <= 64) { t.bn = 64; t.wn = 32; }
+    }
+    if (m > 64 && m <= 128 && n >= 4096 && k <= 128) {
+        // A nearly full BM128 tile avoids reading B for two M tiles. With
+        // shorter K, BM64/BN128 keeps enough CTAs and a smaller epilogue.
+        t.bm = m * 8 >= 128 * 7 && k >= 128 ? 128 : 64;
+        t.bn = 128; t.wm = 32; t.wn = t.bm == 128 ? 64 : 32;
+    }
+    // For medium reductions with one useful M tile, a BM128 tile reuses B
+    // across both halves. Keep the larger pipeline for deep reductions.
+    if (m > 64 && m <= 128 && n >= 4096 && k >= 768 && k <= 4096 &&
+        n * k * 2 <= (64LL << 20)) {
+        t = {128, 128, t.bk, 32, 64, 2, 1};
+    }
+    // With many N tiles and a large B working set, BM64/BN256 can schedule
+    // adjacent M tiles together while keeping enough CTAs for all tensor CUs.
+    if (plan.kind == Model810eDispatchKind::TSM && m > 64 && m <= 512 &&
+        (m <= 192 || ceil_div(m, int64_t(128)) * 128 * 4 > m * 5) && n >= 4096 && k >= 768 &&
+        n * k * 2 >= (64LL << 20) && (m > 128 || n * k * 2 <= (128LL << 20)) &&
+        ceil_div(m, int64_t(64)) * ceil_div(n, int64_t(256)) >= 32) {
+        t = {64, 256, t.bk, 32, 64, 3, 1};
+    }
+    // A short K ending in BK32 has enough work for a third stage on large
+    // outputs; small grids below retain their two-stage latency configuration.
+    if (m >= 1024 && m * n > 524288 && k <= 512 && k % 64 != 0)
+        t.stages = 3;
+    // Narrow outputs need more independent CTAs than one wave of tensor CUs.
+    if (m >= 512 && n >= 8 && n <= 32 && ceil_div(m, int64_t(64)) < 128) {
+        t.bm = 64; t.wm = 16;
+    }
+    // Persistent scheduling amortizes narrow-N tile setup on tall matrices.
+    // Three stages hide HBM latency; the larger-M tile reuses each B panel.
+    if (m >= 1024 && n > 64 && n <= 1024 &&
+        k >= 1024 && k < 8192 && k % 64 == 0) {
+        plan.kind = Model810eDispatchKind::Standard;
+        t = {128, 128, 64, 32, 64, 3, 1};
+        if (n <= 128 && k >= 4096 && ceil_div(m, int64_t(128)) >= 64 &&
+            ceil_div(m, int64_t(128)) < 128)
+            t.stages = 2;
+        if (output == Model810eOutputType::FP32 && m >= 16384)
+            t.stages = 2;
+        if (output == Model810eOutputType::BF16 && m >= 16384 && n >= 768)
+            t = {64, 128, 64, 32, 32, 2, 1};
+        // Halve BN when that removes an otherwise mostly empty final N tile.
+        if (n > 128 && n % 128 > 0 && n % 128 <= 64)
+            t = {128, 64, 64, 32, 32, 2, 1};
+    }
+    // Short reductions do not amortize a custom epilogue's setup. The standard
+    // two-stage pipeline covers these wide outputs with fewer instructions.
+    if (output == Model810eOutputType::BF16 && m > 32 && m <= 256 &&
+        n >= 4096 && k >= 256 && k <= 512 && k % 64 == 0) {
+        plan.kind = Model810eDispatchKind::Standard;
+        t = {64, m <= 64 ? 64 : 128, 64, 32, 32, 2, 1};
+    }
+    const int64_t tiles = ceil_div(m, int64_t(t.bm)) * ceil_div(n, int64_t(t.bn));
+    const bool narrow_grid = m >= 512 && n >= 8 && n <= 32 && ceil_div(m, int64_t(64)) < 128;
+    const bool underfilled = tiles < kModel810eTensorCUs || narrow_grid;
+    const bool narrow_output = m <= 512 && tiles < 128 && !(m >= 128 && n >= 1024);
+    if ((underfilled || narrow_output) && k >= 768 && n <= 2048 &&
+        plan.kind != Model810eDispatchKind::Standard) {
+        // More independent K partitions help under-filled grids. Bound the
+        // workspace and retain enough complete BK tiles for every prologue.
+        const int64_t target_tiles = m > 512 && !narrow_grid ? 64 : 128;
+        const int limit = int(std::min<int64_t>({64, target_tiles / tiles, (k / t.bk) / t.stages}));
+        while (t.splits * 2 <= limit) t.splits *= 2;
+    }
+    t.stages = std::min<int64_t>(t.stages, (k / t.bk) / t.splits);
+    if (output == Model810eOutputType::BF16 && m > 32 && m <= 64 &&
+        n >= 64 && n <= 128 && k >= 2048 && k % 128 == 0) {
+        plan.kind = Model810eDispatchKind::TSM;
+        t = {64, 32, 128, 16, 16, 3, 1};
+        t.splits = int(std::min<int64_t>({64, 128 / ceil_div(n, int64_t(32)), k / 128 / 3}));
+    }
+    if (output == Model810eOutputType::BF16 && m > 32 && m <= 64 &&
+        n >= 256 && n <= 512 && k >= 8192 && k % 64 == 0) {
+        plan.kind = Model810eDispatchKind::Direct;
+        t = {64, 128, 64, 32, 32, 3, 1};
+        const int limit = int(std::min<int64_t>(64 / ceil_div(n, int64_t(128)), k / 64 / 3));
+        while (t.splits * 2 <= limit) t.splits *= 2;
+    }
+    if (output == Model810eOutputType::BF16 && m >= 512 && m < 1024 &&
+        n >= 128 && n <= 512 && k >= 4096 && k % 64 == 0) {
+        // Two K partitions hide latency without a large partial workspace.
+        plan.kind = Model810eDispatchKind::Direct;
+        t = {128, 64, 64, 32, 32, 3, 1};
+        const int64_t blocks = ceil_div(m, int64_t(128)) * ceil_div(n, int64_t(64));
+        const int limit = int(std::min<int64_t>(64 / blocks, k / 64 / 3));
+        while (t.splits * 2 <= limit) t.splits *= 2;
+    }
+    if (output == Model810eOutputType::BF16 && m > 96 && m <= 128 &&
+        n >= 1024 && n <= 2048 && k >= 2048 && k % 64 == 0) {
+        // BM64 has the same padded M extent as BM32 here, with fewer loads.
+        plan.kind = Model810eDispatchKind::TSM;
+        t = {64, 64, 64, 32, 32, 3, 1};
+        // A fourth stage overlaps long-K loads while this narrow tile retains
+        // enough resident CTAs for a nearly full pair of M tiles.
+        if (k >= 4096 && k < 8192) t.stages = 4;
+    }
+    if (m > 64 && m <= 128 && n > 2048 && n <= 4096 &&
+        k >= 4096 && k < 8192 && k % 64 == 0) {
+        // Four stages cover long-K load latency for this medium tile grid.
+        plan.kind = Model810eDispatchKind::TSM;
+        t = {64, 128, 64, 32, 32, 4, 1};
+    }
+    if (m > 32 && m <= 64 && n >= 1280 && n <= 2048 &&
+        k >= 768 && k <= 2048 && k % 128 == 0) {
+        // Twenty or more N tiles fill the tensor CUs without split-K. BK128
+        // amortizes descriptor setup while retaining three complete stages.
+        plan.kind = Model810eDispatchKind::TSM;
+        t = {64, 64, 128, 32, 32, 3, 1};
+    }
+    if (m > 128 && m <= 512 && n >= 2048 && n <= 4096 &&
+        k >= 768 && k <= 2048 && k % 64 == 0 && plan.kind == Model810eDispatchKind::TSM) {
+        // Smaller register tiles retain parallelism. Deeper reductions in
+        // smaller grids need one more stage to hide load latency.
+        t = {64, 128, 64, 32, 32, 2, 1};
+        if (k >= 1536 && ceil_div(m, int64_t(64)) * ceil_div(n, int64_t(128)) < 64)
+            t.stages = 3;
+    }
+    if (output == Model810eOutputType::BF16 && m > 128 && m <= 256 &&
+        n >= 2048 && n <= 8192 && k > 2048 && k < 4096 && k % 64 == 0) {
+        t = {64, 256, 64, 32, 64, 3, 1};
+    }
+    if (m >= 1024 && n >= 1024 && k >= 256 && k <= 512 && k % 64 == 0 &&
+        ceil_div(m, int64_t(128)) * ceil_div(n, int64_t(128)) <= 512) {
+        t = {64, 128, 64, 32, 32, 2, 1};
+    }
+    // A narrow M and enough N tiles already fill the tensor CUs. A deeper K
+    // tile then amortizes AIU descriptors without a split-K reduction launch.
+    if (m <= 16 && n >= 1536 && n <= 2048 && k >= 2048 && k % 256 == 0) {
+        t.bk = 256;
+        t.stages = 3;
+        t.splits = 1;
+    }
+    if (m <= 32 && k >= 2048 && (m > 16 || k >= 4096) && t.splits == 1 && t.bn >= 128 &&
+        ceil_div(m, int64_t(t.bm)) * ceil_div(n, int64_t(t.bn)) < 64) {
+        // Long reductions need enough independent CTAs to hide memory latency.
+        t.bn = 64;
+        t.wn = 32;
+    }
+    if (m <= 16 && n >= 4096 && k >= 2048 && k <= 4096 && k % 128 == 0) {
+        // Two warps per CTA cover the useful rows of this bandwidth-bound
+        // product without carrying a mostly empty BM32 accumulator.
+        plan.kind = Model810eDispatchKind::TSM;
+        t = {16, 64, 128, 16, 32, 3, 1};
+    }
+    if (m <= 16 && n >= 2048 && n <= 8192 && k >= 8192 && k % 128 == 0) {
+        plan.kind = Model810eDispatchKind::TSM;
+        // Once N supplies four CTAs per tensor CU, a fourth pipeline stage
+        // sustains the complete reduction without a partial buffer/reducer.
+        if (ceil_div(n, int64_t(64)) >= 4 * kModel810eTensorCUs)
+            t = {16, 64, 128, 16, 16, 4, 1};
+        else {
+            t = {16, 64, 128, 16, 16, 3, 2};
+            t.peel_first_k = 1;
+        }
+    }
+    if (output == Model810eOutputType::BF16 && m > 32 && m <= 64 &&
+        n >= 16384 && k >= 6144 && k % 64 == 0) {
+        t = {64, 256, 64, 32, 64, 3, 1};
+        t.peel_first_k = 1;
+    }
+    if (k <= 512 && n >= 64 && n <= 2048 && m * n <= 524288) {
+        // Small outputs and short K do not amortize large register tiles.
+        // Keep enough small CTAs while avoiding an extra reduction launch.
+        plan.kind = Model810eDispatchKind::TSM;
+        const int bm = k <= 192 || m <= 32 ? 32 : 64;
+        t = {bm, 64, k >= 128 && k % 64 == 0 ? 64 : 32, bm / 2, 32, 2, 1};
+    }
+    // Larger K tiles amortize short-grid pipeline overhead. A single complete
+    // K product uses AIU padding for a final BK tail; split-K remains aligned.
+    const int alignment = output == Model810eOutputType::FP32 ? 4 : 8;
+    if (m <= 64 && n >= 2048 && n <= 8192 && n % alignment == 0 && k >= 768 && k <= 2048 &&
+        (k % 64 != 0 || (m <= 32 && k >= 1536))) {
+        plan.kind = Model810eDispatchKind::TSM;
+        t = {m <= 16 ? 16 : m <= 32 ? 32 : 64, 64,
+             128, m <= 32 ? 16 : 32, m <= 16 ? 16 : 32, 3, 1};
+        if (k % 64 == 0) t.bn = 128;
+    }
+    if (m >= 128 && n >= 2048 && n <= 8192 && n % alignment == 0 &&
+        k >= 768 && k <= 2048 && k % 64 != 0) {
+        // Retain BK64 throughput for a final BK32 remainder. The complete-K
+        // mainloop pads that remainder without shortening the reduction.
+        plan.kind = Model810eDispatchKind::TSM;
+        t = {128, 128, 64, 32, 64, 2, 1};
+        if (ceil_div(m, int64_t(128)) * 128 * 4 > m * 5)
+            t = {64, 128, 64, 32, 32, 2, 1};
+        if (ceil_div(m, int64_t(t.bm)) * ceil_div(n, int64_t(t.bn)) < kModel810eTensorCUs)
+            t = {64, 128, 64, 32, 32, 3, 1};
+    }
+    if (m >= 1024 && n >= 64 && n <= 128 && n % alignment == 0 &&
+        k >= 768 && k % 64 != 0) {
+        // The complete-K mainloop can pad one BK32 remainder. BK64 halves
+        // descriptor and pipeline overhead on these tall, narrow products.
+        plan.kind = Model810eDispatchKind::TSM;
+        t = {128, 128, 64, 32, 64, 3, 1};
+    }
+    // A small A panel fits in LLC. Visit its M tiles consecutively so wide B
+    // panels are reused before advancing N; keep narrow grids in N-first order.
+    if (plan.kind == Model810eDispatchKind::TSM && m <= 512 && m > t.bm &&
+        n >= 8192 && n * k * 2 >= (48LL << 20) &&
+        ceil_div(m, int64_t(t.bm)) * ceil_div(n, int64_t(t.bn)) >= 64) {
+        t.tile_order = 1;
+        t.peel_first_k = 1;
+    }
+    if (plan.kind == Model810eDispatchKind::TSM && m <= 512 && n >= 64 && n <= 2048 &&
+        k <= 192 && k % t.bk == 0 && t.splits == 1) {
+        t.peel_first_k = 1;
+        t.unroll_k = 1;
+    }
+    if (m >= 1024 && n >= 64 && n <= 128 && k >= 256 && k <= 512 && k % 64 == 0) {
+        t = {64, 64, 64, 32, 32, 2, 1};
+    }
+    if (n < 8 && m * k * 2 >= (64LL << 20) && k >= 2048 && k % t.bk == 0) {
+        // Tiny N cannot supply enough independent memory requests per CTA.
+        // More K partitions expose the large A stream to additional CTAs.
+        const int limit = int(std::min<int64_t>(8, k / t.bk / t.stages));
+        while (t.splits * 2 <= limit) t.splits *= 2;
+    }
+    if (plan.kind == Model810eDispatchKind::TSM && m >= 1024 && n >= 4096 &&
+        k >= 128 && k <= 512 && k % 64 == 0 && t.bm == 128 && t.bn == 128)
+        t.peel_first_k = 1;
+    if (plan.kind == Model810eDispatchKind::TSM && m >= 1024 && n >= 2048 &&
+        k >= 768 && k <= 2048 && k % 64 != 0 &&
+        t.bm == 128 && t.bn == 128 && t.bk == 64 && t.stages == 2) {
+        t.peel_first_k = 1;
+        // Walk M first to reuse each cached B panel across the many A tiles.
+        if (n * k * 2 <= (64LL << 20)) t.tile_order = 1;
+        if (n <= 4096 && n % 128 > 0 && n % 128 <= 16 && n % alignment == 0) {
+            // Keep full tiles wide while a 16-column CTA handles the narrow
+            // remainder in the same launch. N-first traversal balances work.
+            t.narrow_n_tail = true;
+            t.tile_order = 0;
+        }
+    }
+    const bool short_wide_rows = output == Model810eOutputType::BF16 ?
+        ceil_div(m, int64_t(128)) * 128 * 2 <= m * 3 :
+        (n % 128 == 0 && (m <= 128 || ceil_div(m, int64_t(128)) * 128 * 7 <= m * 8));
+    if (m > 64 && m <= 256 && n >= 8192 &&
+        k >= 256 && k <= 512 && k % 64 == 0 &&
+        short_wide_rows) {
+        // Reuse each B panel across more M rows when the larger tile is well
+        // occupied. FP32 stores favor one M tile, or at least seven eighths
+        // occupancy when two tiles are needed. Peel the first K iteration.
+        plan.kind = Model810eDispatchKind::TSM;
+        t = {128, 128, 64, 64, 32, 2, 1};
+        t.peel_first_k = 1;
+    }
+    if (plan.kind == Model810eDispatchKind::TSM && m > 32 && m <= 64 && n >= 8192 &&
+        k >= 2048 && k < 6144 && n * k * 2 < (256LL << 20) &&
+        t.bm == 64 && t.bn == 128 && t.bk == 64 && t.splits == 1) {
+        // Moderate B streams favor the occupancy of two stages. Larger streams
+        // keep the deeper pipeline needed to sustain their steady-state loads.
+        t.stages = 2;
+    }
+    if (plan.kind == Model810eDispatchKind::TSM && m > 64 && m <= 128 && k >= 4096 &&
+        n * k * 2 > (128LL << 20) &&
+        t.bm == 128 && t.bn == 128 && t.bk == 64 && t.stages == 2 &&
+        ceil_div(n, int64_t(t.bn)) <= 128 && t.splits == 1) {
+        // A modest grid cannot hide repeated loads of a B stream larger than
+        // twice LLC with occupancy alone; one more stage overlaps those loads.
+        t.stages = 3;
+        t.peel_first_k = 1;
+    }
+    if (plan.kind == Model810eDispatchKind::TSM && m > 32 && m <= 64 && n >= 16384 &&
+        k >= 6144 && k % 64 == 0 && t.bm == 64 && t.bn == 128 && t.bk == 64 && t.splits == 1) {
+        // A fourth stage hides long-K input latency when this wide grid still
+        // supplies enough CTAs despite the larger shared-memory allocation.
+        t.stages = 4;
+        t.peel_first_k = 1;
+    }
+    if (plan.kind == Model810eDispatchKind::TSM && m >= 1024 && n > 1024 &&
+        k >= 4096 && k % 64 == 0 && n * k * 2 <= (64LL << 20)) {
+        // For a cached B matrix, a half-width N remainder favors narrower
+        // CTAs; no CTA then spends half of its deep reduction on padding.
+        if (n % 128 == 64)
+            t = {128, 64, 64, 32, 32, 2, 1};
+        // Exchange M for N coverage when the last BM128 tile is mostly empty.
+        // Both operands fitting LLC lets the wider N tile reuse its A rows.
+        else if (output == Model810eOutputType::BF16 && m >= 2048 && n >= 2048 && n % 256 == 0 &&
+                 m % 128 > 0 && m % 128 <= 64 && m * k * 2 <= (64LL << 20))
+            t = {64, 256, 64, 32, 64, 3, 1};
+    }
+    if (output == Model810eOutputType::BF16 && plan.kind == Model810eDispatchKind::TSM &&
+        m > 32 && m <= 64 && n >= 3072 && n < 16384 && k >= 4096 && k % 64 == 0 &&
+        n * k * 2 <= (128LL << 20) && t.bm == 64 && t.bn == 128 && t.bk == 64 && t.splits == 1) {
+        // Four stages retain two CTAs per tensor CU, versus three with three
+        // stages. Deepen only when this does not add a resident wave. Wider
+        // grids can instead reuse A across BN256 and halve their CTA count.
+        const int64_t n_tiles = ceil_div(n, int64_t(128));
+        if (ceil_div(n, int64_t(256)) >= 32 && n * k * 2 >= (64LL << 20)) {
+            t = {64, 256, 64, 32, 64, 3, 1};
+            t.peel_first_k = 1;
+        } else if (ceil_div(n_tiles, int64_t(2 * kModel810eTensorCUs)) <=
+                   ceil_div(n_tiles, int64_t(3 * kModel810eTensorCUs))) {
+            t.stages = 4;
+            t.peel_first_k = 1;
+        }
+    }
+    if (output == Model810eOutputType::BF16 && plan.kind == Model810eDispatchKind::TSM &&
+        m > 96 && m <= 128 && n >= 3072 && n <= 8192 && k >= 4096 && k <= 8192 && k % 128 == 0 &&
+        (ceil_div(n, int64_t(128)) <= 2 * kModel810eTensorCUs || t.bn == 256)) {
+        // One BM128 tile avoids rereading B. BK128 amortizes descriptor work;
+        // keep grids needing an extra resident wave on their existing tile.
+        t = {128, 128, 128, 32, 64, 2, 1};
+        t.peel_first_k = 1;
+    }
+    if (output == Model810eOutputType::BF16 && plan.kind == Model810eDispatchKind::TSM &&
+        m > 64 && m <= 512 && n >= 2560 && n <= 8192 && k >= 768 && k % 64 == 0 &&
+        (n >= 3072 || k <= 8192) &&
+        ceil_div(m, int64_t(96)) * 96 * 4 <= ceil_div(m, int64_t(t.bm)) * t.bm * 3) {
+        // BM96 is worthwhile when it removes at least a quarter of padded M
+        // work. Three stages overlap medium and deep reductions without split-K.
+        t = {96, 128, 64, 48, 32, 3, 1};
+        t.peel_first_k = 1;
+    }
+    if (m > 64 && m <= 96 && n >= 8192 && n % alignment == 0 && k >= 768 && k % 64 == 0) {
+        // BM96 removes the padding of a second BM64 tile. WM48 retains a
+        // power-of-two warp grid and lowers both registers and shared storage.
+        // A cached B fits the two-stage pipeline; streams need a third stage.
+        plan.kind = Model810eDispatchKind::TSM;
+        plan.split_m = 0;
+        t = {96, 128, 64, 48, 32, n * k * 2 <= (64LL << 20) ? 2 : 3, 1};
+        t.peel_first_k = 1;
+    }
+    if (output == Model810eOutputType::BF16 && m > 2 && m <= 64 && n > 2048 &&
+        k >= 2048 && k % 128 == 0 && n * k * 2 <= (128LL << 20)) {
+        const int64_t tiles64 = ceil_div(n, int64_t(64));
+        const int64_t tiles128 = ceil_div(n, int64_t(128));
+        if (tiles128 < kModel810eTensorCUs) {
+            // Just beyond the split-K region, BN128 leaves tensor CUs idle.
+            // BN64 fills them; BK128/four stages hide long-reduction latency
+            // while the complete grid still fits one shared-memory wave.
+            const int bm = m <= 16 ? 16 : m <= 32 ? 32 : 64;
+            t = {bm, 64, 128, bm <= 32 ? 16 : 32, 32, 4, 1};
+            t.peel_first_k = 1;
+        } else if (m <= 32 && tiles64 > 3 * kModel810eTensorCUs &&
+                   tiles64 <= 4 * kModel810eTensorCUs) {
+            // BM32/BN64/BK128/S3 holds three CTAs per tensor CU. BM16
+            // holds four; for more rows, BN128 holds two and halves the grid.
+            // Either change removes a second wave in this interval. Outside
+            // it, the narrower tile can provide better memory parallelism.
+            t = {m <= 16 ? 16 : 32, m <= 16 ? 64 : 128, 128, 16, 32, 3, 1};
+            t.peel_first_k = 1;
+        }
+    }
+    if (output == Model810eOutputType::BF16 && m > 2 && m <= 64 && n >= 8192 &&
+        k >= 128 && k <= 512 && k % 64 == 0) {
+        Model810eDispatchTile narrow{m <= 16 ? 16 : m <= 32 ? 32 : 64,
+                                     128, 64, m <= 32 ? 16 : 32, 32, 2, 1};
+        Model810eDispatchTile wide{64, 256, 64, 32, 64, 2, 1};
+        const auto old_waves = model_810e_smem_waves(1, m, n, t);
+        const auto narrow_waves = model_810e_smem_waves(1, m, n, narrow);
+        const auto wide_waves = model_810e_smem_waves(1, m, n, wide);
+        // Small-M short reductions amortize loop/epilogue setup across BN128.
+        // For more rows, widen only when it removes a shared-memory wave.
+        const bool unroll = m <= 32 ? ceil_div(n, int64_t(64)) > 10 * kModel810eTensorCUs :
+            narrow_waves < old_waves && narrow_waves <= wide_waves;
+        if (unroll || (m > 32 && wide_waves < old_waves && wide_waves < narrow_waves)) {
+            plan.kind = Model810eDispatchKind::TSM;
+            t = unroll ? narrow : wide;
+            t.peel_first_k = 1;
+            t.unroll_k = unroll;
+        }
+    }
+    if (output == Model810eOutputType::BF16 && plan.kind == Model810eDispatchKind::TSM &&
+        m > 2 && m <= 64 && n >= 8192 && k >= 768 && k <= 2048 && k % 64 == 0 &&
+        t.bk == 64 && t.stages == 3 && t.splits == 1) {
+        Model810eDispatchTile next{m <= 16 ? 16 : m <= 32 ? 32 : 64,
+                                   128, 64, m <= 32 ? 16 : 32, 32, m <= 32 ? 4 : 3, 1};
+        if (m > 32) {
+            auto narrow = next;
+            narrow.bn = 64;
+            if (model_810e_smem_waves(1, m, n, narrow) <= model_810e_smem_waves(1, m, n, next))
+                next = narrow;
+        }
+        // Deepen a small register tile, or replace an oversized N tile with
+        // more independent CTAs, without adding a shared-memory wave.
+        if (model_810e_smem_waves(1, m, n, next) <= model_810e_smem_waves(1, m, n, t)) {
+            t = next;
+            t.peel_first_k = 1;
+        }
+    }
+    if (output == Model810eOutputType::BF16 && plan.kind == Model810eDispatchKind::TSM &&
+        m > 32 && m <= 64 && k > 2048 && k <= 8192 && k % 64 == 0 && t.splits == 1) {
+        const int64_t tiles = ceil_div(n, int64_t(256));
+        if (tiles >= 32 && tiles <= 8 * kModel810eTensorCUs) {
+            // BN256 amortizes each A panel across more output columns. BK128
+            // halves the K-loop count, but also halves shared-memory residency;
+            // use it only when fewer K iterations outweigh the extra waves.
+            const bool deep_k = k % 128 == 0 &&
+                ceil_div(tiles, int64_t(kModel810eTensorCUs)) <
+                    2 * ceil_div(tiles, int64_t(2 * kModel810eTensorCUs));
+            t = {64, 256, deep_k ? 128 : 64, 32, 64, 3, 1};
+            t.peel_first_k = 1;
+        }
+    }
+    if (output == Model810eOutputType::BF16 && plan.kind == Model810eDispatchKind::TSM &&
+        m >= 192 && m <= 256 && n >= 2048 && n <= 4096 &&
+        k >= 4096 && k <= 8192 && k % 64 == 0 && t.splits == 1) {
+        Model810eDispatchTile next{128, 128, 64, 32, 64, 3, 1};
+        if (model_810e_smem_waves(1, m, n, next) < model_810e_smem_waves(1, m, n, t)) {
+            t = next;
+            t.peel_first_k = 1;
+        }
+    }
+    if (output == Model810eOutputType::BF16 && plan.kind == Model810eDispatchKind::TSM &&
+        m > 256 && m <= 512 && n >= 2048 && n <= 4096 &&
+        k >= 2048 && k <= 8192 && k % 64 == 0 && t.splits == 1 &&
+        model_810e_smem_waves(1, m, n, t) > 1) {
+        Model810eDispatchTile best = t;
+        int64_t best_padding = ceil_div(m, int64_t(t.bm)) * t.bm;
+        bool found = false;
+        for (int bm : {64, 96}) {
+            Model810eDispatchTile next{bm, 128, 64, bm == 96 ? 48 : 32, 32, 2, 1};
+            const int64_t blocks = ceil_div(m, int64_t(bm)) * ceil_div(n, int64_t(128));
+            const int64_t padding = ceil_div(m, int64_t(bm)) * bm;
+            // A full grid supplies the overlap lost by shortening the pipeline.
+            // Keep it in one shared-memory wave without increasing padded rows.
+            if (blocks >= 3 * kModel810eTensorCUs && model_810e_smem_waves(1, m, n, next) == 1 &&
+                padding <= best_padding && (!found || padding < best_padding)) {
+                best = next; best_padding = padding; found = true;
+            }
+        }
+        if (found) { t = best; t.peel_first_k = 1; }
+    }
+    if (output == Model810eOutputType::BF16 && m > 96 && m <= 224 && n >= 2048 &&
+        k >= 768 && k % 64 == 0 && n % 128 == 0 && t.splits == 1) {
+        const int bm = m <= 112 ? 112 : m <= 128 ? 128 : m <= 160 ? 160 : m <= 192 ? 192 : 224;
+        const int wm = bm == 112 ? 112 : bm == 128 ? 64 : bm / 2;
+        const int64_t n_tiles = ceil_div(n, int64_t(128));
+        const bool compact_worthwhile = bm != 112 || t.bk == 128 || t.bn == 256 ||
+            (n_tiles <= 40 && k >= 3072) || n * k * 2 > (96LL << 20);
+        const bool narrow_reuse = bm != 160 || t.bm >= 128 || t.bn >= 256 ||
+            n_tiles <= kModel810eTensorCUs || n_tiles >= 2 * kModel810eTensorCUs;
+        if (compact_worthwhile && narrow_reuse && bm != 128 && bm != t.bm && bm <= ceil_div(m, int64_t(t.bm)) * t.bm &&
+            n_tiles >= (bm == 112 ? 32 : 16) &&
+            (bm != 224 || n_tiles <= kModel810eTensorCUs || n_tiles >= 32)) {
+            const int bk = n_tiles <= kModel810eTensorCUs && bm >= 160 && bm <= 192 && k % 128 == 0 ? 128 : 64;
+            int stages = n_tiles <= 2 * kModel810eTensorCUs ? 3 : 2;
+            if (bm == 112 && n * k * 2 > (96LL << 20)) stages = 3;
+            if (bm == 160 || bm == 192) {
+                Model810eDispatchTile two{bm, 128, bk, wm, 32, 2, 1};
+                auto three = two; three.stages = 3;
+                if (model_810e_smem_waves(1, m, n, three) <= model_810e_smem_waves(1, m, n, two)) stages = 3;
+            }
+            if (bm == 224) stages = n_tiles < 24 || (k >= 2048 && n_tiles > 40) ? 3 : 2;
+            if ((n * k * 2 > (128LL << 20) || (n_tiles > 64 && n * k * 2 > (64LL << 20))) && bm >= 160) stages = 3;
+            Model810eDispatchTile next{bm, 128, bk, wm, 32, stages, 1};
+            // An equally padded, register-heavy tile needs to remove at least
+            // two resident waves to offset its lower warp-level parallelism.
+            const auto old_waves = model_810e_smem_waves(1, m, n, t);
+            const bool preserves_single_wave = old_waves > 1 || bk > t.bk ||
+                bm * 4 <= ceil_div(m, int64_t(t.bm)) * t.bm * 3;
+            const bool less_padding = bm < ceil_div(m, int64_t(t.bm)) * t.bm;
+            const bool removes_waves = n * k * 2 <= (128LL << 20) &&
+                model_810e_smem_waves(1, m, n, next) + 1 < old_waves;
+            if (preserves_single_wave && (less_padding || removes_waves)) {
+                plan.kind = Model810eDispatchKind::TSM;
+                plan.split_m = 0;
+                t = next;
+                t.peel_first_k = 1;
+            }
+        }
+    }
+    if (output == Model810eOutputType::BF16 && m > 2 && m <= 16 && n >= 4096 &&
+        k >= 1024 && k <= 8192 && k % 128 == 0) {
+        Model810eDispatchTile next{16, 64, 128, 16, 16, 3, 1};
+        auto deep = next; deep.stages = 4;
+        if (model_810e_smem_waves(1, m, n, deep) <= model_810e_smem_waves(1, m, n, next)) next = deep;
+        plan.kind = Model810eDispatchKind::TSM;
+        t = next; t.peel_first_k = 1;
+    }
+    if (output == Model810eOutputType::BF16 && m > 16 && m <= 32 && n >= 16384 &&
+        k >= 768 && k <= 2048 && k % 128 == 0) {
+        plan.kind = Model810eDispatchKind::TSM;
+        t = {32, 128, 128, 16, 32, 3, 1}; t.peel_first_k = 1;
+    }
+    if (output == Model810eOutputType::BF16 && m > 16 && m <= 32 && n > 5120 && n <= 8192 &&
+        k >= 2048 && k <= 4096 && k % 64 == 0) {
+        plan.kind = Model810eDispatchKind::TSM;
+        t = {32, 64, 64, 16, 16, 3, 1}; t.peel_first_k = 1;
+    }
+    // Use the established peeled K loop for long reductions on short M
+    // grids. This avoids the unpeeled variant exercised by the rejected
+    // persistent experiment, without changing K coverage or accumulation.
+    if (plan.kind == Model810eDispatchKind::TSM && m > 64 && m <= 512 &&
+        k >= 4096 && k % t.bk == 0 && t.splits == 1)
+        t.peel_first_k = 1;
+    return plan;
+}
 
-inline constexpr std::array<Model810eDenseDispatchEntry, 86> kModel810eDenseDispatch{{
-    {6, 128, 8192, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 32}},
-    {16, 64, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 64, 64, 16, 32, 2, 56}},
-    {16, 384, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 16}},
-    {16, 512, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 16}},
-    {16, 1024, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 8}},
-    {16, 2048, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 256, 16, 16, 3, 1}},
-    {32, 128, 6144, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 32}},
-    {32, 768, 6144, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 8}},
-    {32, 1536, 6144, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 4}},
-    {32, 6144, 384, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 128, 64, 32, 32, 2, 1}},
-    {32, 25008, 6144, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 128, 128, 16, 32, 3, 1}},
-    {32, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 128, 128, 16, 32, 3, 1}},
-    {36, 64, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 64, 64, 32, 32, 2, 32}},
-    {36, 128, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 32, 128, 16, 16, 3, 8}},
-    {36, 288, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {64, 64, 64, 32, 32, 2, 32}},
-    {36, 4096, 1536, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
-    {36, 4096, 8192, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
-    {36, 8192, 128, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 32, 32, 32, 2, 1}},
-    {36, 24576, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 2, 1}},
-    {36, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
-    {40, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 32, 3, 1}},
-    {64, 96, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 2, 20}},
-    {64, 320, 10240, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 16}},
-    {64, 512, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 8}},
-    {64, 640, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 8}},
-    {64, 4864, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
-    {64, 7168, 3584, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
-    {64, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
-    {140, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
-    {148, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
-    {152, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
-    {160, 96, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 8}},
-    {160, 336, 10240, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 4}},
-    {160, 512, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 4}},
-    {160, 640, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 2}},
-    {160, 12800, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
-    {160, 13312, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
-    {160, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
-    {192, 512, 8192, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 2, 10}},
-    {256, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {128, 128, 64, 32, 64, 2, 1}},
-    {288, 384, 5120, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {32, 64, 64, 16, 32, 3, 2}},
-    {288, 129280, 5120, Model810eOutputType::BF16, Model810eDispatchKind::Hybrid, {128, 128, 64, 32, 64, 2, 1}, 256, {32, 128, 64, 16, 32, 3, 1}},
-    {384, 64, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 16, 64, 16, 16, 3, 4}},
-    {384, 256, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 4}},
-    {384, 512, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 2}},
-    {384, 1024, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 1}},
-    {384, 2048, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 1}},
-    {4000, 128, 6144, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 3, 1}},
-    {4000, 768, 6144, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {64, 256, 64, 32, 64, 3, 1}},
-    {4000, 1536, 6144, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 2, 1}},
-    {4000, 3072, 6144, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
-    {4000, 6144, 384, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
-    {4000, 6144, 1024, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
-    {4000, 6144, 1536, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
-    {4096, 2112, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 2, 1}},
-    {4096, 6016, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1, 1, 1}},
-    {4096, 7168, 768, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
-    {4096, 7168, 1536, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
-    {4096, 7168, 3584, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
-    {8192, 24, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 32, 64, 32, 32, 3, 1}},
-    {8192, 64, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {256, 64, 64, 64, 32, 3, 1}},
-    {8192, 256, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 2, 1}},
-    {8192, 320, 10240, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {256, 64, 64, 64, 32, 5, 1}},
-    {8192, 336, 10240, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 3, 1}},
-    {8192, 384, 7168, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 3, 1}},
-    {8192, 512, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {64, 128, 64, 32, 32, 3, 1}},
-    {8192, 512, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 3, 1}},
-    {8192, 512, 7168, Model810eOutputType::FP32, Model810eDispatchKind::Standard, {128, 128, 64, 32, 64, 3, 1}},
-    {8192, 640, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
-    {8192, 2048, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
-    {8192, 2048, 7168, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
-    {8192, 10240, 320, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
-    {8192, 10240, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
-    {8192, 12800, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
-    {16384, 8192, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
-    {16384, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1, 1, 1}},
-    {19968, 512, 5120, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
-    {32768, 4, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 16, 64, 16, 16, 3, 8}},
-    {32768, 128, 4096, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {128, 128, 64, 64, 32, 3, 1}},
-    {32768, 288, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 2, 1}},
-    {32768, 512, 128, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
-    {32768, 1536, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
-    {32768, 4096, 512, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1, 0, 1}},
-    {90112, 3072, 512, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
-    {102400, 8192, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
-    {102400, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {128, 128, 64, 32, 64, 2, 1}},
-}};
-inline constexpr std::array<Model810eBatchDispatchEntry, 4> kModel810eBatchDispatch{{
-    {64, 36, 256, 512, 32768, 512, 16384, 512, 131072, 256, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
-    {64, 36, 512, 256, 16384, 256, 512, 256, 131072, 18432, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 2, 1, 0, 1, 1, 1}},
-    {64, 2048, 256, 512, 32768, 512, 16384, 512, 131072, 256, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
-    {64, 2048, 512, 256, 16384, 256, 512, 256, 131072, 1048576, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
-}};
+// In-CTA K reduction replaces a two-launch split-K product where output
+// parallelism is modest and K is too short to amortize global partials.
+// Keep deep reductions and large output grids on the established scheduler.
+static int get_model_810e_cute_free_config(int m, int n, int k,
+    Model810eOutputType output, Model810eDispatchTile& tile) {
+    if (m < 16 || m > 256 || n < 128 || n > 2048 || k < 768 || k > 1536 ||
+        k % 32 != 0 || (k > 1024 && n < 256)) return 0;
+    if (get_model_810e_dense_dispatch(m, n, k, output).tile.splits <= 1) return 0;
+    tile = {m <= 32 ? 16 : 32, 64, 256, 16, 32, 2, 1};
+    const int tiles = ceil_div(m, tile.bm) * ceil_div(n, tile.bn);
+    // BM32/BK256 uses 96 KiB. Conservatively budget two CTAs per tensor CU
+    // for both tile sizes to avoid additional waves as the output grid grows.
+    if (tiles > 2 * kModel810eTensorCUs) return 0;
+    // Extra K warps help the smallest grids; larger grids already supply
+    // independent work and prefer fewer reduction participants per CTA.
+    return tiles < kModel810eTensorCUs ? 4 : 2;
+}
+
+static Model810eDispatchTile get_model_810e_batch_dispatch(
+    int64_t batch, int64_t m, int64_t n, int64_t k) {
+    const int bk = k >= 128 && k % 64 == 0 ? 64 : 32;
+    const int stages = int(std::min<int64_t>(k <= 256 || m > 64 ? 2 : 3, k / bk));
+    Model810eDispatchTile t = m <= 64 ?
+        Model810eDispatchTile{64, n >= 512 ? 256 : 128, bk, 32, n >= 512 ? 64 : 32, stages, 1} :
+        Model810eDispatchTile{128, 128, bk, k >= 512 ? 64 : 32, k >= 512 ? 32 : 64, stages, 1};
+    const auto blocks = [&]() { return batch * ceil_div(m, int64_t(t.bm)) * ceil_div(n, int64_t(t.bn)); };
+    if (m <= 64 && blocks() < 2 * kModel810eTensorCUs) {
+        // A batch contributes independent CTAs. Reduce the tile only when the
+        // combined grid is small, retaining larger tiles for large batches.
+        t.bm = 16; t.bn = 64; t.wm = 16; t.wn = 32;
+        if (blocks() < kModel810eTensorCUs) { t.bn = 32; t.wn = 16; }
+    } else if (m > 64 && ceil_div(m, int64_t(t.bm)) * t.bm * 4 > m * 5) {
+        // Avoid spending more than one quarter of the M work on padding.
+        while (t.bm > 32 && ceil_div(m, int64_t(t.bm)) * t.bm * 4 > m * 5) t.bm /= 2;
+        t.bn = 64; t.wm = t.bm <= 32 ? 16 : 32; t.wn = 32;
+    }
+    if (t.bm == 64 && m <= 32 && n >= 256 && n <= 1024 &&
+        k >= 128 && k <= 256 && k % 64 == 0) {
+        // Batch already supplies parallelism. Cover only the useful M rows;
+        // BN128 keeps enough resident CTAs while reducing accumulator work.
+        t = {m <= 16 ? 16 : 32, 128, 64, 16, 32, 2, 1};
+    }
+    return t;
+}
 
 } // namespace deep_gemm_bf16_common
