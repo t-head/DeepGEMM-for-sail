@@ -417,7 +417,10 @@ public:
         }
     }
 
-    static std::string generate_impl(const Args& args) {
+    static std::string generate_impl(const Args& args,
+                                     const std::string& header = "deep_gemm/impls/int8_gemm_cutlass3.cuh",
+                                     const std::string& kernel = "cutlass::gemm::kernel::DeepGemmUniversal",
+                                     const std::string& min_blocks = "GemmOcc::kMinBlocksPerMultiprocessor") {
         DG_HOST_ASSERT((args.launch_info.gemm_type == "Batched") == kIsBatchGemm);
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
@@ -432,7 +435,7 @@ public:
         const auto host_params_size = with_tsm_epilogue ? sizeof(args.kernel_params.with_tsm)
                                                         : sizeof(args.kernel_params.no_tsm);
         return fmt::format(R"(
-#include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
+#include <{21}>
 #include <deep_gemm/impls/a8w4_int8_gemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
@@ -615,7 +618,7 @@ static constexpr GemmType kGemmType = GemmType::{12};
 using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS,
                                         ceil_div((uint32_t)SHAPE_N, (uint32_t)(BLOCK_N * N_EXPAND)), 2,
                                         EpilogueType::Default>;
-using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
+using GemmKernel = {22}<
     Shape<int,int,int,int>,
     CollectiveMainloop,
     CollectiveEpilogue,
@@ -649,7 +652,7 @@ using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K,
                             false, kTotalVregOverhead>;
 
 extern "C"
-__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
+__launch_bounds__(GemmKernel::MaxThreadsPerBlock, {23})
 __global__ void {13}(
   typename GemmKernel::Params params
 ) {{
@@ -666,7 +669,8 @@ __global__ void {13}(
                            args.type_info, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_strategy,
                            args.launch_info.gemm_type, args.launch_info.kernel_name,
                            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
-                           with_tsm_epilogue, host_params_size, static_cast<int>(args.launch_info.a8w4_int8));
+                           with_tsm_epilogue, host_params_size, static_cast<int>(args.launch_info.a8w4_int8),
+                           header, kernel, min_blocks);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {

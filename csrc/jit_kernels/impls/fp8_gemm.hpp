@@ -245,12 +245,14 @@ public:
                                info.kernel_name);
     }
 
-    static std::string generate_impl(const Args& args) {
+    static std::string generate_impl(const Args& args,
+                                     const std::string& header = "deep_gemm/impls/fp8_gemm.cuh",
+                                     const std::string& kernel = "DeepGemmUniversal", int scale_n = 128) {
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
         return fmt::format(
             R"(
-#include <deep_gemm/impls/fp8_gemm.cuh>
+#include <{17}>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
@@ -276,7 +278,7 @@ static constexpr GemmType kGemmType = GemmType::{9};
 static constexpr KernelStrategy kKernelStrategy = KernelStrategy::{10}; //Default;
 static constexpr bool kEnableSboOverlap = {11};
 
-using ScaleGranularityShape = cute::Shape<cute::_1,cute::_128,cute::_128>;
+using ScaleGranularityShape = cute::Shape<cute::_1,cute::Int<{19}>,cute::_128>;
 using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(ScaleGranularityShape{{}}));
 using LayoutSFA           = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
 using LayoutSFB           = decltype(ScaleConfig::deduce_layoutSFB());
@@ -363,7 +365,7 @@ using CollectiveEpilogue = typename cutlass::platform::conditional<
     CollectiveEpilogueNoTsm
 >::type;
 
-using GemmKernel = DeepGemmUniversal<
+using GemmKernel = {18}<
   Shape<int,int,int,int>,
   CollectiveMainloop,
   CollectiveEpilogue,
@@ -396,7 +398,8 @@ __global__ void {12}(
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
-            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
+            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
+            header, kernel, scale_n);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

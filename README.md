@@ -124,6 +124,30 @@ with contiguous BF16 inputs. On 810E and 890P, `out` supports BF16 or FP32.
 without an explicit configuration, which requires K divisible by 8 and
 16-byte-aligned inputs.
 
+#### FP8 GEMM + ReduceScatter
+
+`deep_gemm.fp8_gemm_nt_reduce_scatter(lhs, rhs, out, workspace=workspace, configs=None)` fuses FP8 GEMM and ReduceScatter on PPU0015 with single-host TP1/TP2/TP4/TP8. It infers M/N/K from the inputs and writes the BF16 `[M/TP,N]` shard into the caller's output tensor. FP32 scale shapes select blockwise (A1×128/W128×128) or per-row/per-channel quantization; both share the workspace returned by `deep_gemm.get_workspace_for_gemm_reduce_scatter`.
+
+The workspace owns the symmetric allocation, communication handle, peer pointer tables and synchronization state. `num_max_rows` and `num_max_cols` specify capacity; each call can use different M/N/K within that capacity. Fixed phase offsets allow different shapes and captured graphs to reuse the workspace sequentially. TP1 runs the native dense GEMM without communication or a symmetric-memory dependency.
+
+The workspace accepts `preset="decode"` (fused profiles with native fallback) or `preset="native"`. Explicit `configs=(num_sms, BM, BN, BK, WM, WN, stages, smem)` override the preset, following the existing GEMM tuple convention; C++ recomputes SMEM for the selected tile. General shapes require positive M/N/K, M divisible by TP, N divisible by 16, and local M (`M/TP`) in `{1,2,4,8}` or a multiple of 16. Packet indices, including padded rows, must fit in int32. Blockwise K must exceed 512 and be divisible by 128; channelwise K can be any positive multiple of 32. Explicit configurations use BK128 for blockwise and BK64/128/256 for channelwise. Blockwise BN must divide 128, be a multiple of 128, or equal the specially handled 192. TP1 uses the native GEMM and rejects explicit blockwise BN192 configurations, which require the fused weight-scale refinement. Tuned decode profiles apply to TP2/TP4 on 39-CU devices; TP8 uses native configuration selection. Two BF16 packet phases reserve `4 * ceil(max(num_max_rows, 4*TP) * num_max_cols / 128) * 128` bytes per rank, plus control state and the caller output.
+
+Set the current device and initialize the default process group before obtaining workspaces collectively with the selected process group. All ranks must use matching capacities, shapes and call order; serialize calls across streams. Each call and captured graph uses its explicit output, so writing another output does not overwrite earlier results. Warm up outside Graph capture and retain workspaces, inputs and outputs until pending work and captured graphs are released. Call `workspace.reset_state()` collectively outside capture before 2**31 calls.
+
+```python
+import torch
+import deep_gemm
+
+workspace = deep_gemm.get_workspace_for_gemm_reduce_scatter(torch.distributed.group.WORLD, max_m, max_n)
+out = torch.empty((m // tp, n), dtype=torch.bfloat16, device="cuda")
+# FP8 E4M3 data: A[M,Klocal], W[N,Klocal]; FP32 scales:
+# A[M,Klocal/128], W[ceil(N/128),Klocal/128] for blockwise,
+# or A[M,1], W[N,1] for channelwise.
+deep_gemm.fp8_gemm_nt_reduce_scatter((a_fp8, a_scales), (w_fp8, w_scales), out, workspace=workspace)
+```
+
+Run the shared [correctness and benchmark entry point](tests/test_gemm_comm.py) with `torchrun --standalone --nproc-per-node=2 tests/test_gemm_comm.py --skew`; use one, four or eight processes for TP1/TP4/TP8, add `--extended` for general-shape coverage and `--benchmark` for timings. Both quantizations use the public `deep_gemm.fp8_gemm_nt` C++ JIT baseline. The default M list includes 8/16/32/64/128/256/512/1024/2048/4096 with N=7168 and K=24576/TP.
+
 #### Grouped GEMMs (contiguous layout)
 
 Unlike traditional grouped GEMMs in ACTLIZE, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape.
