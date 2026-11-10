@@ -998,7 +998,7 @@ def read_detail_from_nculog(filename):
 #     "ppu":  ["ppu__time_duration.sum","ce__cycles_elapsed.max", "cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed", "launch__waves_per_cu"],
 # }
 
-def read_cycle_from_nculog(filename):
+def read_cycle_from_nculog(filename, include_nvfp4_decode=False):
     # kernel_pattern = r"(.*)deep_gemm(.*)"
     # kernel_pattern = r"(.*)kernel(.*)Device(.*)"
     kernel_pattern = r"(.*)Device\s+\d+"
@@ -1050,11 +1050,16 @@ def read_cycle_from_nculog(filename):
         # The C++ JIT names its kernels by dtype tag (e.g. `attention_mqa_logits_int8`), so
         # include attention and MHC kernels in the totals. Metadata scheduling kernels are
         # reported in `op_cycles` but excluded from the totals.
-        if ("gemm" in op.lower() or "attention" in op.lower() or "mhc" in op.lower()) and "metadata" not in op.lower():
+        is_nvfp4_kernel = include_nvfp4_decode and any(
+            name in op.lower() for name in ('w4a8_nvfp4', 'dequantize_nvfp4_fp8'))
+        if ("gemm" in op.lower() or "attention" in op.lower() or "mhc" in op.lower() or is_nvfp4_kernel) and "metadata" not in op.lower():
             fwd_cycle_sum += cycle
-            fwd_tc_sum = tc_list[i]
-            fwd_hbm_sum = hbm_list[i]
-            fwd_time = time_list[i]
+            # Decoder contributes time/cycles; efficiency metrics describe the GEMM.
+            if not (include_nvfp4_decode and "dequantize_nvfp4_fp8" in op.lower()):
+                fwd_tc_sum = tc_list[i]
+                fwd_hbm_sum = hbm_list[i]
+            # NVFP4 prefill is a decoder followed by GEMM; report their combined time.
+            fwd_time = fwd_time + time_list[i] if include_nvfp4_decode else time_list[i]
     # calculate statistics data
     if fwd_cycle_sum != 0:
         # fwd unit case
@@ -1077,7 +1082,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
     # Kernel filter for the PPU profiler. `attention_` is needed because the C++ JIT emits
     # `attention_mqa_logits_*` / `attention_paged_mqa_logits_*`, which match none of the other terms.
     # Without it the profiler silently reports 0 for these attention kernels.
-    ppu_kernel_name = "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*|attention_|mhc'"
+    ppu_kernel_name = "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*|attention_|mhc|w4a8_nvfp4|dequantize_nvfp4_fp8'"
     output_lines = list()
     headers = ["casename","time(us)","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"]
@@ -1136,7 +1141,8 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         cycle, tc, detail, hbm, time = 0, 0, "", 0, 0
         if mode != "full" and ret != None:
             if ret.returncode == 0:
-                cycle, tc, detail, hbm, time = read_cycle_from_nculog(log_file)
+                cycle, tc, detail, hbm, time = read_cycle_from_nculog(
+                    log_file, include_nvfp4_decode=dtype == 'w4a8_nvfp4')
                 if mode == "show_log":
                     other_metrics = read_detail_from_nculog(log_file)
                     print(other_metrics)
@@ -1203,7 +1209,8 @@ def parse_deepgemm_string_re(s):
     supported_indexer_epilogue_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
-    dg_params = r"(GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation),(.+)"
+    supported_gemm_type.append("KGroupedContiguous")
+    dg_params = r"(KGroupedContiguous|GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation),(.+)"
     pattern = re.compile(dg_params)
     m = pattern.search(s.strip("."))
     if not m:
@@ -1255,6 +1262,7 @@ def parse_deepgemm_string_re(s):
             'w4fa16': 'group',
             'w4fa16_mma': 'group',
             'w4fa8_mma': 'group',
+            'w4a8_nvfp4': 'block',
             'w4a8_int8': 'channel',
             'bf16_bf16_fp32': 'non_quantized'
         }
@@ -1312,7 +1320,7 @@ def convert_data_type_to_dtype(data_type):
         return torch.uint8
     elif data_type in ["fp8", "torch.float8_e4m3fn"]:
         return torch.float8_e4m3fn
-    elif data_type in ["w4a16", "w4fa16", "w4fa16_mma", "w4fa8_mma", "w4a8_int8"]:
+    elif data_type in ["w4a16", "w4fa16", "w4fa16_mma", "w4fa8_mma", "w4a8_int8", "w4a8_nvfp4"]:
         return data_type
     elif data_type in ["bf16_bf16_fp32"]:
         # DenseGemm only: BF16 inputs with an FP32 output (deep_gemm.gemm_bf16_bf16_fp32_nt).
@@ -1692,8 +1700,16 @@ def test_native_batch_gemm(args):
     print('Passed with acc_check' if check else 'Passed without acc_check')
 
 
+def run_nvfp4_case(args):
+    from test_w4a8_nvfp4 import run_nvfp4_gemm
+    return run_nvfp4_gemm(args, check_accuracy=get_acc_check(),
+                          benchmark=get_benchmark(), ref_backend=get_ref_backend())
+
+
 def test_gemm(args) -> None:
     """Run a dense GEMM case or its explicitly selected regression checks."""
+    if args['data_type'] == 'w4a8_nvfp4':
+        return run_nvfp4_case(args)
     print('Testing GEMM:')
     m, n, k, d = args['m'], args['n'], args['k'], args["data_type"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
@@ -1790,6 +1806,201 @@ def test_gemm(args) -> None:
             f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     return
 
+def _check_k_grouped_output(actual, expected):
+    nonfinite = int((~torch.isfinite(actual)).sum().item())
+    assert nonfinite == 0, f"nonfinite output: {nonfinite}"
+    assert bool(torch.isfinite(expected).all()), "nonfinite reference"
+    # Chunk to avoid converting the entire largest output to FP64 at once.
+    xx = yy = xy = 0.0
+    xflat, yflat = actual.flatten(), expected.flatten()
+    for start in range(0, xflat.numel(), 1 << 20):
+        x = xflat[start:start + (1 << 20)].double()
+        y = yflat[start:start + (1 << 20)].double()
+        xx += (x * x).sum().item()
+        yy += (y * y).sum().item()
+        xy += (x * y).sum().item()
+    diff = 0.0 if xx + yy == 0 else 1.0 - 2.0 * xy / (xx + yy)
+    assert diff < 1e-5, f"diff={diff}"
+    return {"diff": diff, "nonfinite": nonfinite,
+            "max_abs": float((actual - expected).abs().max().item()) if actual.numel() else 0.0}
+
+
+def test_k_grouped_gemm_contiguous(args) -> None:
+    """SM90 protocol: BF16 [sum(K), M/N], FP32 D = C + A.T @ B per group."""
+    if not __debug__:
+        raise RuntimeError("Do not disable assertions in correctness tests")
+    if args["data_type"] != torch.bfloat16:
+        raise ValueError("KGroupedContiguous requires data_type:bf16")
+    groups, m, n, sum_k = (args[k] for k in ("groups", "m", "n", "k"))
+    if any(type(x) is not int for x in (groups, m, n, sum_k)):
+        raise ValueError("groups, m, n and k must be integers")
+    if groups <= 0 or min(m, n, sum_k) < 0 or max(groups, m, n, sum_k) > 2**31 - 1:
+        raise ValueError("Invalid K-grouped dimensions")
+    distribution = args.get("distribution", "uniform")
+    if isinstance(distribution, list):
+        ks = distribution
+    elif distribution == "uniform":
+        if sum_k % 128:
+            raise ValueError("k is the total physical K and must be aligned to 128")
+        quotient, remainder = divmod(sum_k // 128, groups)
+        ks = [128 * (quotient + (i < remainder)) for i in range(groups)]
+    else:
+        raise ValueError("Use distribution:[K0,K1,...] or distribution:uniform")
+    if (len(ks) != groups or any(type(k) is not int or k < 0 or k % 128 for k in ks)
+            or sum(ks) != sum_k):
+        raise ValueError("distribution must contain groups aligned K lengths summing to k")
+    logical_ks = args.get("logical_ks", ks)
+    if (not isinstance(logical_ks, list) or len(logical_ks) != groups
+            or any(type(k) is not int or not 0 <= k <= physical
+                   for k, physical in zip(logical_ks, ks))):
+        raise ValueError("logical_ks must fit each physical K segment")
+    repeats = args.get("repeats", 2)
+    separate_c = args.get("separate_c", 0)
+    if type(repeats) is not int or repeats < 1 or separate_c not in (0, 1):
+        raise ValueError("repeats must be positive; separate_c must be 0 or 1")
+    torch.manual_seed(args.get("seed", 0))
+    a = torch.randn((sum_k, m), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((sum_k, n), device="cuda", dtype=torch.bfloat16)
+    begin = 0
+    for logical, physical in zip(logical_ks, ks):
+        a[begin + logical:begin + physical].zero_()
+        b[begin + logical:begin + physical].zero_()
+        begin += physical
+    initial = torch.randn((groups, m, n), device="cuda", dtype=torch.float32)
+    layout = torch.tensor(ks, device="cuda", dtype=torch.int32)
+    out = initial.clone()
+
+    # Correctness and timing exercise the same call; only the C tensor changes.
+    def test_func():
+        deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, out, ks, layout, c)
+
+    print(f"Testing KGroupedContiguous,groups:{groups},m:{m},n:{n},k:{sum_k},"
+          f"distribution:{ks}" + (",separate_c:1" if separate_c else ""))
+    ref_device = "cpu" if get_ref_backend() == "host" else "cuda"
+    expected = initial.to(ref_device).clone() if _acc_check else None
+    # Reference GEMMs use FP32 inputs without TF32 rounding; restore the runner's
+    # setting so a following DenseGemm case keeps its existing behavior.
+    saved_tf32 = torch.backends.cuda.matmul.allow_tf32
+    differences = []
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        for _ in range(repeats if _acc_check else 1):
+            c = out.clone() if separate_c else out
+            snapshot = c.clone() if _acc_check and separate_c else None
+            if separate_c:
+                out.fill_(float("nan"))
+            test_func()
+            if _acc_check:
+                begin = 0
+                for group, k in enumerate(ks):
+                    if k:
+                        x = a[begin:begin + k].to(device=ref_device, dtype=torch.float32)
+                        y = b[begin:begin + k].to(device=ref_device, dtype=torch.float32)
+                        expected[group].add_(x.T @ y)
+                    else:
+                        assert torch.equal(out[group].view(torch.int32), initial[group].view(torch.int32)), "empty group modified"
+                    begin += k
+                differences.append(_check_k_grouped_output(out.to(ref_device), expected)["diff"])
+                if separate_c:
+                    assert torch.equal(c.view(torch.int32), snapshot.view(torch.int32)), "input C modified"
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = saved_tf32
+    if _acc_check:
+        print(f"Passed with acc_check: calls={repeats}, max_diff={max(differences):.10g}\n")
+    else:
+        print("Passed without acc_check\n")
+    if get_benchmark():
+        del expected
+        c = initial if separate_c else out
+        # Requirement protocol: 5 warmups, 20 event timings, 3 rounds, beta=1.
+        import hashlib
+        import json
+        import statistics
+        groups, m, n = initial.shape
+        if m == 0 or n == 0 or sum(ks) == 0:
+            print("Benchmark skipped: empty operation has no GEMM FLOPs")
+            return
+        inputs = {}
+        for name, tensor in (("a", a), ("b", b), ("initial_c", initial)):
+            inputs[name] = hashlib.sha256(tensor.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+        baseline_name = next((name for name in ("cublaslt_gemm_tn", "acblaslt_gemm_tn")
+                              if hasattr(deep_gemm, name)), None)
+        if baseline_name is None:
+            raise RuntimeError("No BLASLt TN reference API in the extension")
+        blas_api = getattr(deep_gemm, baseline_name)
+        blas = initial.clone()
+        delta = torch.zeros_like(initial)
+        views = []
+        begin = 0
+        saved_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            for g, k in enumerate(ks):
+                if k:
+                    ag, bg = a[begin:begin + k], b[begin:begin + k]
+                    views.append((ag, bg, blas[g], initial[g] if separate_c else blas[g]))
+                    delta[g].copy_(ag.float().T @ bg.float())
+                begin += k
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = saved_tf32
+
+        def run_blas():
+            for ag, bg, dst, src in views:
+                blas_api(ag, bg, dst, src)
+        backends = {"deepgemm": (test_func, out), "cublaslt": (run_blas, blas)}
+        for fn, dst in backends.values():
+            dst.copy_(initial)
+            for call in (1, 2):
+                fn()
+                _check_k_grouped_output(dst, initial + (1 if separate_c else call) * delta)
+        graphs = {}
+        for name, (fn, dst) in backends.items():
+            dst.copy_(initial)
+            for _ in range(5):
+                fn()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                fn()
+            graphs[name] = graph
+        rounds = {name: [] for name in backends}
+        for index in range(3):
+            order = list(backends) if index % 2 == 0 else list(reversed(backends))
+            for name in order:
+                events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(20)]
+                for start, end in events:
+                    start.record()
+                    end.record()
+                dst = backends[name][1]
+                dst.copy_(initial)
+                for _ in range(5):
+                    graphs[name].replay()
+                for start, end in events:
+                    start.record()
+                    graphs[name].replay()
+                    end.record()
+                torch.cuda.synchronize()
+                times = [start.elapsed_time(end) * 1000 for start, end in events]
+                if any(t <= 0 for t in times):
+                    raise RuntimeError("Nonpositive GPU event timing")
+                check = _check_k_grouped_output(dst, initial + (1 if separate_c else 25) * delta)
+                rounds[name].append({"round": index + 1, "times_us": times,
+                                     "median_us": statistics.median(times), "correctness": check})
+        flops = 2 * m * n * sum(ks)
+        summary = {}
+        for name, records in rounds.items():
+            us = statistics.median(r["median_us"] for r in records)
+            summary[name] = {"median_us": us, "tflops": flops / us / 1e6}
+            print(f" > Performance ({name}, groups={groups}, m={m}, n={n}, sum_k={sum(ks)}): "
+                  f"{us:.3f} us | throughput: {summary[name]['tflops']:.3f} TFLOPS")
+        print("KGroupedBenchmark " + json.dumps({
+            "m": m, "n": n, "ks": ks, "inputs_sha256": inputs, "baseline_api": baseline_name,
+            "separate_c": bool(separate_c), "rounds": rounds, "summary": summary,
+            "protocol": {"warmups": 5, "iterations": 20, "rounds": 3,
+                         "timing": "GPU event around one complete grouped CUDA Graph replay"},
+            "measurement_status": "COMPLETE"}), flush=True)
+
+
 def test_m_grouped_gemm_contiguous(args) -> None:
     print('Testing grouped contiguous GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
@@ -1861,6 +2072,8 @@ def make_grouped_fp4_bias(args):
 
 
 def test_m_grouped_gemm_masked(args) -> None:
+    if args['data_type'] == 'w4a8_nvfp4':
+        return run_nvfp4_case(args)
     print('Testing grouped masked GEMM:')
 
     num_groups, m, n, k, d, distribution = args["groups"], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
@@ -2007,6 +2220,8 @@ def test_m_grouped_gemm_masked(args) -> None:
     return
 
 def test_m_grouped_gemm_fused(args) -> None:
+    if args['data_type'] == 'w4a8_nvfp4':
+        return run_nvfp4_case(args)
     print('Testing grouped fuse permute GEMM:')
     num_groups, n, k, d = args['groups'], args['n'], args['k'], args['data_type']
     num_token, topk = args['num_token'], args['topk']
@@ -2068,6 +2283,8 @@ def test_m_grouped_gemm_fused(args) -> None:
         print("Passed without acc_check\n")
 
 def test_m_grouped_gemm_nopad(args) -> None:
+    if args['data_type'] == 'w4a8_nvfp4':
+        return run_nvfp4_case(args)
     print('Testing grouped nopad GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     UT = f"test_m_grouped_gemm_nopad->test_func: GroupedNoPad,data_type:{d},groups:{num_groups},m:{m},n:{n},k:{k}"

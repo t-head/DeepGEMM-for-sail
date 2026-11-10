@@ -23,6 +23,7 @@
 #include "../heuristics/common_int8.hpp"
 #include "../heuristics/common_w4a16.hpp"
 #include "m_grouped_w4a8_gemm.hpp"
+#include "../heuristics/common_nvfp4_w4a8.hpp"
 #include "fused_moe_gemm.hpp"  // FusedCommonConfigTuple
 
 namespace deep_gemm {
@@ -265,12 +266,13 @@ __global__ void moe_align_p4(
 // =============================================================================
 // Host implementation: resolve the config, allocate routing tensors and dispatch kernels.
 // =============================================================================
-// Dtypes share the existing seven- or nine-element tile formats.
+// Dtypes preserve seven-field common, eight-field NVFP4, or nine-field MMA configs.
 using FusedMmaConfigTuple = std::tuple<int, int, int, int, int, int, int, int, int>;
-using FusedConfigTuple = std::variant<FusedCommonConfigTuple, FusedMmaConfigTuple>;
+using FusedConfigTuple = std::variant<FusedCommonConfigTuple, FusedMmaConfigTuple,
+    deep_gemm::nvfp4::detail::ConfigTuple>;
 
 using MoeAlignReturn = std::tuple<
-    FusedConfigTuple,        // dtype-dependent seven- or nine-element tile tuple
+    FusedConfigTuple,        // dtype-dependent seven-, eight-, or nine-element tile tuple
     torch::Tensor,         // m_rows
     torch::Tensor,         // expert_ids_and_cumsum
     torch::Tensor,         // sorted_token_ids
@@ -284,7 +286,8 @@ static MoeAlignReturn moe_align_block_size_impl(
     const torch::Tensor& topk_ids,
     bool perchannel_quant = false,
     std::optional<FusedConfigTuple> config_in = std::nullopt,
-    bool enable_act_and_quant_fusing = false)
+    bool enable_act_and_quant_fusing = false,
+    int lhs_scale_group_size = 0, int rhs_scale_block_size = 0)
 {
     // Input validation (topk_ids dtype/shape) lives in the apis layer
     // (csrc/apis/gemm.hpp); this impl only orchestrates config resolution
@@ -297,7 +300,10 @@ static MoeAlignReturn moe_align_block_size_impl(
     // apart from `mxfp4_e8m0` and upstream just labels it `int4`. Harmless for config
     // selection -- `get_best_configs` only branches on `mxfp4_e8m0_mma` -- so the label is mirrored.
     std::optional<deep_gemm_w4a16_common::W4A16Type> w4a16_type;
-    if (rhs.dtype() == torch::kInt32) {
+    const bool w4a8 = lhs.dtype() == torch::kFloat8_e4m3fn && rhs.dtype() == torch::kInt32;
+    if (w4a8) {
+        n = rhs_dim2 / 4;
+    } else if (rhs.dtype() == torch::kInt32) {
         n = rhs_dim2 / 2;
         w4a16_type = deep_gemm_w4a16_common::W4A16Type::int4;
     } else if (lhs.dtype() == torch::kBFloat16 and rhs.dtype() == torch::kUInt8) {
@@ -308,7 +314,18 @@ static MoeAlignReturn moe_align_block_size_impl(
     int topk  = static_cast<int>(topk_ids.size(1));
     // Resolve the config from the operand dtypes and per-channel quantization mode.
     FusedConfigTuple config;
-    if (config_in.has_value()) {
+    if (w4a8) {
+        std::optional<deep_gemm::nvfp4::detail::ConfigTuple> requested;
+        if (config_in) {
+            const auto* c = std::get_if<deep_gemm::nvfp4::detail::ConfigTuple>(&*config_in);
+            TORCH_CHECK(c, "NVFP4 routing requires an eight-entry W4A8 config");
+            requested = *c;
+        }
+        const auto c = deep_gemm::nvfp4::detail::config(GemmType::MGroupedFused,
+            ceil_div(numel, num_groups), n, k, requested, lhs_scale_group_size, rhs_scale_block_size);
+        config = deep_gemm::nvfp4::detail::ConfigTuple{c.num_sms,c.block_m,c.block_n,c.block_k,
+            c.warp_m,c.warp_n,c.warp_k,c.num_stages};
+    } else if (config_in.has_value()) {
         config = *config_in;
     } else {
         const int num_sms = get_num_sms();

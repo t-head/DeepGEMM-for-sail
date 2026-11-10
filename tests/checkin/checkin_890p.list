@@ -55,6 +55,16 @@ DenseGemm,data_type:bf16_bf16_fp32,m:128,n:1,k:512
 DenseGemm,data_type:bf16_bf16_fp32,m:132,n:3072,k:1536
 DenseGemm,data_type:bf16_bf16_fp32,m:2,n:1024,k:7168
 
+# --- DenseGemm / w4a8_nvfp4 ---
+DenseGemm,data_type:w4a8_nvfp4,m:1,n:1024,k:64,quant_type:block,execution:fused
+DenseGemm,data_type:w4a8_nvfp4,m:1,n:1024,k:128,quant_type:block,execution:fused
+DenseGemm,data_type:w4a8_nvfp4,m:1,n:256,k:192,quant_type:channel,execution:fused
+DenseGemm,data_type:w4a8_nvfp4,m:17,n:256,k:192,quant_type:block,execution:fused
+DenseGemm,data_type:w4a8_nvfp4,m:17,n:256,k:192,quant_type:block,lhs_scale_group_size:16,execution:fused
+DenseGemm,data_type:w4a8_nvfp4,m:1,n:192,k:160,quant_type:channel,execution:fused
+DenseGemm,data_type:w4a8_nvfp4,m:17,n:192,k:160,execution:fused
+DenseGemm,data_type:w4a8_nvfp4,m:17,n:192,k:160,execution:dequantize
+
 # ============ HcPrenormGemm ============
 
 HcPrenormGemm,data_type:tf32,m:3,n:24,k:16384
@@ -146,6 +156,10 @@ GroupedMasked,data_type:w4fa16_mma,groups:96,m:3072,n:2048,k:7168,quant_type:gro
 GroupedMasked,data_type:w4fa8_mma,groups:4,m:101,n:192,k:256,em:26,distribution:[0,1,33,67],quant_type:group,group_size:32
 GroupedMasked,data_type:w4fa8_mma,groups:28,m:448,n:6144,k:4096,em:16,distribution:uniform,quant_type:group,group_size:32
 
+# --- GroupedMasked / w4a8_nvfp4 ---
+GroupedMasked,data_type:w4a8_nvfp4,groups:4,m:101,n:192,k:160,distribution:[0,1,33,67],em:32,execution:fused
+GroupedMasked,data_type:w4a8_nvfp4,groups:4,m:101,n:192,k:160,distribution:[0,1,33,67],em:32,execution:dequantize
+
 # ============ GroupedNoPad ============
 
 # --- GroupedNoPad / bf16 ---
@@ -184,6 +198,24 @@ GroupedNoPad,data_type:w4fa8_mma,groups:4,m:35,n:64,k:128,distribution:[0,1,17,1
 GroupedNoPad,data_type:w4fa8_mma,groups:4,m:83,n:768,k:128,distribution:[0,1,17,65],quant_type:group,group_size:32
 GroupedNoPad,data_type:w4fa8_mma,groups:384,m:3072,n:512,k:7168,distribution:uniform,quant_type:group,group_size:32
 
+# --- GroupedNoPad / w4a8_nvfp4 ---
+GroupedNoPad,data_type:w4a8_nvfp4,groups:4,m:17,n:256,k:192,distribution:[0,4,5,8],quant_type:channel,lhs_scale_group_size:16,execution:fused
+GroupedNoPad,data_type:w4a8_nvfp4,groups:4,m:257,n:256,k:1024,distribution:[0,64,85,108],execution:fused
+GroupedNoPad,data_type:w4a8_nvfp4,groups:4,m:257,n:256,k:1024,distribution:[0,64,85,108],execution:dequantize
+
+# NVFP4 MoE model dimensions: 384 experts, top-k=4, B=128 tokens/rank.
+# Balanced local rows M=4*B=512. EP32 has 12 experts; EP64 has 6 experts.
+# EP32 gate/up and down, with both execution paths.
+GroupedNoPad,data_type:w4a8_nvfp4,groups:12,m:512,n:10240,k:7168,distribution:[43,43,43,43,43,43,43,43,42,42,42,42],execution:fused
+GroupedNoPad,data_type:w4a8_nvfp4,groups:12,m:512,n:10240,k:7168,distribution:[43,43,43,43,43,43,43,43,42,42,42,42],execution:dequantize
+GroupedNoPad,data_type:w4a8_nvfp4,groups:12,m:512,n:7168,k:5120,distribution:[43,43,43,43,43,43,43,43,42,42,42,42],execution:fused
+GroupedNoPad,data_type:w4a8_nvfp4,groups:12,m:512,n:7168,k:5120,distribution:[43,43,43,43,43,43,43,43,42,42,42,42],execution:dequantize
+# EP64 gate/up and down, with both execution paths.
+GroupedNoPad,data_type:w4a8_nvfp4,groups:6,m:512,n:10240,k:7168,distribution:[86,86,85,85,85,85],execution:fused
+GroupedNoPad,data_type:w4a8_nvfp4,groups:6,m:512,n:10240,k:7168,distribution:[86,86,85,85,85,85],execution:dequantize
+GroupedNoPad,data_type:w4a8_nvfp4,groups:6,m:512,n:7168,k:5120,distribution:[86,86,85,85,85,85],execution:fused
+GroupedNoPad,data_type:w4a8_nvfp4,groups:6,m:512,n:7168,k:5120,distribution:[86,86,85,85,85,85],execution:dequantize
+
 # ============ GroupedContiguous ============
 
 # --- GroupedContiguous / bf16 ---
@@ -196,6 +228,18 @@ GroupedContiguous,data_type:int8,groups:4,m:128,n:512,k:1024,distribution:unifor
 # --- GroupedContiguous / fp8 ---
 GroupedContiguous,data_type:fp8,groups:16,m:4096,n:4096,k:7168,distribution:[45,200,30,18,13,21,31,3,5,17,17,16,18,15,18,13]
 GroupedContiguous,data_type:fp8,groups:4,m:128,n:512,k:1024,quant_type:channel
+
+# ============ KGroupedContiguous ============
+
+# BF16 TN, FP32 beta=1; exercise in-place and separate-C accumulation.
+KGroupedContiguous,data_type:bf16,groups:14,m:3072,n:3584,k:65536,distribution:[4736,4736,4736,4736,4736,4736,4736,4736,4608,4608,4608,4608,4608,4608]
+KGroupedContiguous,data_type:bf16,groups:14,m:3584,n:3072,k:65536,distribution:[12288,8064,6272,5376,4736,4096,3712,3584,3328,3072,2944,2816,2688,2560],separate_c:1
+
+# Empty groups (leading/interior/trailing) keep existing output; all-zero K is handled by early_return.
+KGroupedContiguous,data_type:bf16,groups:6,m:128,n:128,k:256,distribution:[0,128,0,0,128,0]
+KGroupedContiguous,data_type:bf16,groups:6,m:128,n:128,k:256,distribution:[0,128,0,0,128,0],separate_c:1
+KGroupedContiguous,data_type:bf16,groups:3,m:128,n:128,k:0,distribution:[0,0,0]
+KGroupedContiguous,data_type:bf16,groups:3,m:128,n:128,k:0,distribution:[0,0,0],separate_c:1
 
 # ============ GroupedFused ============
 
@@ -229,6 +273,10 @@ GroupedFused,data_type:w4fa16_mma,groups:384,num_token:8,topk:8,n:512,k:7168,qua
 # --- GroupedFused / w4fa8_mma (MXFP4 weights / FP8 activation) ---
 GroupedFused,data_type:w4fa8_mma,groups:8,num_token:17,topk:3,n:192,k:256,quant_type:group,group_size:32
 GroupedFused,data_type:w4fa8_mma,groups:28,num_token:256,topk:8,n:768,k:3584,quant_type:group,group_size:32
+
+# --- GroupedFused / w4a8_nvfp4 ---
+GroupedFused,data_type:w4a8_nvfp4,groups:4,num_token:17,topk:3,n:192,k:256,execution:fused
+GroupedFused,data_type:w4a8_nvfp4,groups:4,num_token:17,topk:3,n:256,k:256,execution:dequantize
 
 # ============ MqaLogits ============
 

@@ -50,6 +50,7 @@ from ._C import (
     bf16_gemm_tt,
     bf16_gemm_strided_batched_nt,
     gemm_fp32_fp32_fp32_nt,
+    k_grouped_bf16_gemm_tn_contiguous,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
     m_grouped_bf16_gemm_nt_nopad,
@@ -91,6 +92,11 @@ from ._C import (
     m_grouped_gemm_fp8_fp4_bf16_nt_nopad,
     m_grouped_gemm_fp8_fp4_bf16_nt_masked,
     m_grouped_gemm_fp8_fp4_bf16_nt_fused,
+    # W4A8 (NVFP4 weights, FP8 activation, BF16 output)
+    gemm_fp8_nvfp4_bf16_nt,
+    m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad,
+    m_grouped_gemm_fp8_nvfp4_bf16_nt_masked,
+    m_grouped_gemm_fp8_nvfp4_bf16_nt_fused,
     # A8W4 INT8 GEMMs / device weight preprocessing
     m_grouped_gemm_int8_int4_bf16_nt_masked,
     m_grouped_gemm_int8_int4_bf16_nt_nopad,
@@ -128,6 +134,8 @@ from ._C import (
     fp8_fp4_paged_sparse_mqa_logits,
 )
 
+from ._C import epilogue
+
 _C.init(
     os.path.dirname(os.path.abspath(__file__)), # Library root directory path
     PPU_HOME         # SDK root
@@ -139,7 +147,6 @@ _C.init(
 #     # K-Grouped
 #     k_grouped_fp8_gemm_nt_contiguous,
 #     k_grouped_fp8_gemm_tn_contiguous,
-#     k_grouped_bf16_gemm_tn_contiguous,
 
 #     # a8w4 M-Grouped NN
 #     m_grouped_fp8_fp4_gemm_nn_contiguous,
@@ -156,7 +163,6 @@ def unimplemented(*args, **kwargs):
 # API names for kernels not yet ported to the PPU build -> unimplemented
 k_grouped_fp8_gemm_nt_contiguous = unimplemented
 k_grouped_fp8_gemm_tn_contiguous = unimplemented
-k_grouped_bf16_gemm_tn_contiguous = unimplemented
 m_grouped_fp8_gemm_nn_contiguous = unimplemented
 fp8_gemm_nt_skip_head_mid = unimplemented
 

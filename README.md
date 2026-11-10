@@ -16,6 +16,7 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 - **Supported precision modes**: The PPU version supports INT8, FP4, FP8, and BF16 across non-grouped GEMM and grouped GEMM layouts, covering both dense GEMM and MoE grouped GEMM scenarios.
 - **Standalone activation on M890**: SiLU and SiTU with BF16, per-row/per-block FP8, MXFP4, or MXFP8 output, including masked expert batches and explicit output-mode selection.
 - **W4A8 MoE on M890**: E4M3 per-row activations and group-32 MXFP4 weights, with FP32 accumulation and BF16 output for nopad, masked, and fused routing layouts.
+- **NVFP4 W4A8 on M890**: E4M3 activations and group-16 NVFP4 weights for dense, nopad, masked, and fused routing GEMMs, with fused decoding or per-call decode-to-FP8 execution.
 - **A8W4 INT8 MoE**: INT8 per-token activations and portable packed signed-INT4 per-channel weights, with INT32 accumulation and BF16 output for nopad and masked grouped layouts on Zhenwu 610 / 610E / 810 / 810E (PPU001).
 - **Additional nopad grouped GEMM layout**: In addition to contiguous and masked grouped GEMM layouts, this fork introduces a nopad layout. It uses an index tensor to describe per-expert token counts, avoiding mandatory M-block padding for variable-token MoE workloads and reducing unnecessary data movement.
 - **AIU-oriented alignment requirements**: The PPU version replaces the original alignment assumptions with AIU-aligned scaling factors and AIU-aligned utility tensors, matching the data movement requirements described by this fork.
@@ -31,7 +32,7 @@ Highlights:
 - **W4A4 MegaMoE** on PPU1.5: a complete MXFP4 routed MoE pipeline with BF16 output, reusable workspaces, and load-time weight preparation. See the [calling contract](#mega-moe).
 - **More low-precision MoE kernels**: W4A8 on M890 and INT8 A8W4 on Zhenwu 610 / 610E / 810 / 810E, with unified weight preprocessing.
 - **Activation and quantization** on M890: standalone SiLU, SiTU, and SiLU STEP with BF16, FP8, MXFP4, or MXFP8 output, plus STEP activation in fused FP4 epilogues.
-- **Mega-mHC and sparse MQA** on M890P: fused shifted mHC for DeepSeek V4.1 Flash and MXFP4 sparse attention-indexer logits for prefill and paged decode. Regular paged MQA now supports page sizes 32, 64, and 128.
+- **Mega-mHC and sparse MQA** on M890: fused shifted mHC for DeepSeek V4.1 Flash and MXFP4 sparse attention-indexer logits for prefill and paged decode. Regular paged MQA now supports page sizes 32, 64, and 128.
 - **External GEMM tuning tables**: device- and precision-specific configurations through `SAIL_DEEPGEMM_LUT_PATH`, with fallback to built-in selection.
 
 See [CHANGELOG.md](CHANGELOG.md#110v100) for complete release notes and API migration details.
@@ -105,13 +106,13 @@ This library focuses on high-performance tensor cell kernels and related LLM com
 
 #### Data Precisions
 
-| Algorithm | INT8 | FP4 | FP8 | BF16 | W4A16 | W4A8 (M890) | A8W4 INT8 (PPU001) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Non-grouped** | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
-| **Contiguous** | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| **No-pad** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Masked** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Fused** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Algorithm | INT8 | FP4 | FP8 | BF16 | W4A16 | MXFP4 W4A8 (M890) | NVFP4 W4A8 (M890) | A8W4 INT8 (PPU001) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Non-grouped** | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
+| **Contiguous** | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **No-pad** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Masked** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Fused** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 
 #### Normal dense GEMMs (non-grouped)
 
@@ -187,6 +188,14 @@ During the inference decoding phase, when HGGC Graph is enabled and the CPU is u
 Use `m_grouped_gemm_fp8_fp8_bf16_nt_masked` for this purpose and consult the relevant documentation. An example usage is to use the output of low-latency kernels from [DeepEP](https://github.com/deepseek-ai/DeepEP) as input.
 
 For the FP4 masked GEMM, the `silu_and_mul` activation and the MXFP4 quantization that follows it can optionally be fused into the epilogue, so that MoE gemm1 writes the packed FP4 values and their E8M0 scales directly instead of a BF16 tensor that a standalone kernel has to read back. The fusion is **disabled by default**; pass an `out_scale` tensor to `deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked` to enable it, and interleave the gemm1 weight once with `deep_gemm.preprocess_weights_and_scales(mode=deep_gemm.PreprocessMode.MXFP4, fuse_activation=True)` beforehand. Refer to the `m_grouped_gemm_fp4_fp4_bf16_nt_masked` documentation for the tensor layouts, the `swiglu_limit` argument and the current limitations. The fused epilogue is also available on `m_grouped_gemm_fp4_fp4_bf16_nt_nopad` and `m_grouped_gemm_fp4_fp4_bf16_nt_fused`; use `activation_type="silu_and_mul_step"` for STEP-series models, which clamp `silu(gate)` from above instead of clamping the gate before silu.
+
+#### K-grouped GEMMs (contiguous layout)
+
+The grouped GEMMs above group tokens along the M axis while N and K stay fixed. MoE training backward weight gradients instead reduce over each expert's own token count, so the groups vary along the K axis: every group's `a_g [K_g, M]` and `b_g [K_g, N]` slices are concatenated into `a [sumK, M]` and `b [sumK, N]`, and the kernel computes `d[g] = c[g] + a_g^T @ b_g` per group.
+
+`deep_gemm.k_grouped_bf16_gemm_tn_contiguous` (M890) implements the BF16 wgrad path with FP32 output. The LHS is the physically contiguous `[sumK, M]` tensor (typically a `.t()` view that is itself contiguous), and `d` is the `[G, M, N]` FP32 `main_grad` accumulator. `c` is required and normally the same tensor as `d`, giving in-place beta=1 accumulation for consecutive micro-batches; a separate FP32 `c` is copied into `d` first. Each group's length must be a non-negative multiple of 128 (per-group physical K alignment, with padded rows zeroed), passed as a host-side `ks_cpu` list together with the equivalent int32 `grouped_layout` tensor on device. Groups with `K_g = 0` keep the existing output, and zero total K returns without computation. `use_psum_layout` must be `False`, custom epilogues are not supported, and `compiled_dims` only accepts `"mn"`. 
+
+For more information, please refer to the `k_grouped_bf16_gemm_tn_contiguous` function documentation.
 
 #### Fused MoE (with implicit permute)
 
@@ -317,6 +326,23 @@ removing the keyword alone is insufficient. See the
 [preprocessing implementation](csrc/jit_kernels/heuristics/common_preprocess.hpp)
 for the required weight and scale layouts.
 
+#### NVFP4 W4A8 GEMMs (M890)
+
+`gemm_fp8_nvfp4_bf16_nt` and
+`m_grouped_gemm_fp8_nvfp4_bf16_nt_{nopad,masked,fused}` accept E4M3
+activations and NVFP4 weights with native K16 E4M3 scales, and write BF16.
+They support optional FP32 global and per-channel or 128x128 outer weight scales.
+
+For every layout, callers explicitly select `execution='fused'` (the default,
+decode weights inside GEMM) or `execution='dequantize'` (decode each call into
+a caller-owned FP8 workspace, then run FP8 GEMM). The `_fused` API suffix
+selects routing gather independently of this choice.
+
+See the [NVFP4 W4A8 API guide](docs/api/nvfp4_w4a8.md) for operand layouts,
+scale normalization, preprocessing, execution constraints and calling examples,
+and the [W4A8 test guide](tests/README.MD#w4a8-correctness-and-performance-tests)
+for accuracy and performance reproduction.
+
 #### A8W4 INT8 MoE GEMMs
 
 The A8W4 INT8 path accepts INT8 activations with FP32 per-token scales and portable packed signed-INT4 weights with FP32 per-channel scales, and writes BF16. It runs on Zhenwu 610 / 610E / 810 / 810E (PPU001) and supports the grouped nopad and masked expert layouts:
@@ -430,7 +456,7 @@ Paged logits require external masking of positions outside each context;
 
 For more information, please refer to the corresponding `*_mqa_logits` and `*_paged_mqa_logits` function documentation.
 
-#### Sparse MQA logits (Zhenwu M890P)
+#### Sparse MQA logits (Zhenwu M890)
 
 Sparse MQA computes indexer logits only for selected KV blocks, for both
 prefill and paged decode. The current implementation supports **MXFP4
@@ -499,10 +525,10 @@ We provide a HyperConnection (HC) prenorm GEMM that fuses the prenorm square-sum
 
 For more information, please refer to the `tf32_hc_prenorm_gemm` function documentation.
 
-#### Mega-mHC for DeepSeek V4.1 Flash (M890P)
+#### Mega-mHC for DeepSeek V4.1 Flash (M890)
 
 `deep_gemm.mega_mhc` implements the fused shifted mHC computation used by
-**DeepSeek V4.1 Flash** on **Zhenwu M890P**. The current interface
+**DeepSeek V4.1 Flash** on **Zhenwu M890**. The current interface
 supports `hc_mult=4`, hidden size `5120`, and BF16 output. It computes the
 updated residual, mix coefficients, and RMSNorm output into caller-provided
 output buffers.
@@ -528,7 +554,7 @@ For more information, please refer to the `fp8_einsum` and `int8_einsum` functio
 
 For API compatibility with the upstream DeepGEMM, some symbols are exported by `deep_gemm` but are **not yet ported to the PPU build**. Calling them raises `NotImplementedError`:
 
-- K-axis grouped GEMMs: `k_grouped_fp8_gemm_nt_contiguous`, `k_grouped_fp8_gemm_tn_contiguous`, `k_grouped_bf16_gemm_tn_contiguous`
+- K-axis grouped GEMMs: `k_grouped_fp8_gemm_nt_contiguous`, `k_grouped_fp8_gemm_tn_contiguous`
 - M-grouped NN contiguous: `m_grouped_fp8_gemm_nn_contiguous`
 - FP8xFP4 dense GEMMs: `fp8_fp4_gemm_nt`, `fp8_fp4_gemm_nn`, `fp8_fp4_gemm_tn`, `fp8_fp4_gemm_tt`
 - FP8xFP4 M-grouped GEMMs: `m_grouped_fp8_fp4_gemm_nt_contiguous`, `m_grouped_fp8_fp4_gemm_nn_contiguous`, `m_grouped_fp8_fp4_gemm_nt_masked`
