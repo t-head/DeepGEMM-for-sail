@@ -166,6 +166,41 @@ def test_mqa_logits_loop():
     print("Passed\n")
 
 
+def test_fp4_mqa_compressed_boundaries():
+    if not is_ppu1v5_device():
+        return
+    # The first Q block has a full interior with partial prefix/suffix;
+    # later blocks cover empty/disjoint windows and a partial Q tail.
+    starts = [3, 7, 5, 9, 0, 63, 64, 65, 511, 512, 513, 1023, 1024]
+    ends = [1025, 1029, 1030, 1027, 0, 64, 65, 129, 512, 768, 1025, 1024, 1031]
+    nq, nk, dim = len(starts), 1031, 128
+    ks = torch.tensor(starts, device='cuda', dtype=torch.int32)
+    ke = torch.tensor(ends, device='cuda', dtype=torch.int32)
+    for heads in (32, 64):
+        q = torch.randn(nq * heads, dim, device='cuda', dtype=torch.bfloat16)
+        k = torch.randn(nk, dim, device='cuda', dtype=torch.bfloat16)
+        qp, qs = per_token_cast_to_fp4(q, use_ue8m0=True, gran_k=32,
+                                       use_packed_ue8m0=True)
+        kp, sf = per_token_cast_to_fp4(k, use_ue8m0=True, gran_k=32,
+                                       use_packed_ue8m0=True)
+        qr = cast_back_from_fp4(qp, qs, gran_k=32, use_packed_ue8m0=True)
+        kr = cast_back_from_fp4(kp, sf, gran_k=32, use_packed_ue8m0=True)
+        weights = torch.randn(nq, heads, device='cuda', dtype=torch.bfloat16)
+        logits = deep_gemm.fp8_fp4_mqa_logits(
+            (qp.view(nq, heads, dim // 2), qs.view(nq, heads)),
+            (kp, sf.view(nk)), weights, ks, ke, nk)
+        reference = (torch.einsum('qhd,kd->qhk', qr.float().view(nq, heads, dim),
+                                  kr.float()).relu() * weights.float()[:, :, None]).sum(1)
+        actual = torch.cat([logits[i, :end - start]
+                            for i, (start, end) in enumerate(zip(starts, ends))])
+        expected = torch.cat([reference[i, start:end]
+                              for i, (start, end) in enumerate(zip(starts, ends))])
+        assert torch.isfinite(actual).all()
+        diff = calc_diff(actual, expected)
+        assert diff < 1e-3, (heads, diff)
+    print('PASS: FP4 compressed MQA interior, boundaries and Q tail')
+
+
 def test_paged_mqa_logits_loop():
     print('Testing Paged MQA Logits:')
     data_types = ['fp8', 'fp4'] if is_ppu1v5_device() else ['int8']
@@ -628,6 +663,7 @@ if __name__ == '__main__':
     test_per_layer_cache_view()
     test_paged_int8_page_boundaries()
     test_mqa_logits_loop()
+    test_fp4_mqa_compressed_boundaries()
     test_paged_mqa_logits_loop()
     test_mqa_avg_logits_loop()
     test_sparse_mqa_logits_loop()

@@ -371,19 +371,11 @@ static MqaLogitsConfig get_best_configs(torch::ScalarType qk_dtype, int seq_len_
     config.warp_qh = num_heads;
 
     if (is_fp4) {
-        const bool bf16_logits = logits_dtype == torch::kBFloat16;
-        if (num_heads == 64 and bf16_logits) {
-            if (seq_len_k >= 8192)
-                config.block_kv = 256, config.warp_kv = 64, config.num_q_stages = 1, config.num_kv_stages = 4;
-            else
-                config.block_kv = 64, config.warp_kv = 16, config.num_q_stages = 1, config.num_kv_stages = 4;
-        } else if (num_heads == 64 and not bf16_logits) {
-            config.block_kv = 256, config.warp_kv = 64, config.num_q_stages = 1, config.num_kv_stages = 3;
-        } else if (num_heads == 32 and bf16_logits) {
-            config.block_kv = 64, config.warp_kv = 16, config.num_q_stages = 1, config.num_kv_stages = 3;
-        } else {
-            config.block_kv = 64, config.warp_kv = 16, config.num_q_stages = 1, config.num_kv_stages = 4;
-        }
+        // FP4 DSA is BF16-only with H32/H64; AVG returned above.
+        config.block_kv = 256;
+        config.warp_kv = 64;
+        config.num_q_stages = 1;
+        config.num_kv_stages = num_heads == 64 ? 4 : 3;
     } else {
         config.num_q_stages = 1;
         config.num_kv_stages = 3;
