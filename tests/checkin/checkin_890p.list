@@ -25,6 +25,9 @@ DenseGemm,data_type:bf16,m:128,n:1,k:512
 # Same-shape packed/scalar cache switching and constrained N=1 dispatch.
 DenseGemm,data_type:bf16,m:17,n:66,k:256,bf16_regression:alignment_cache
 DenseGemm,data_type:bf16,m:128,n:1,k:256,bf16_regression:n1_cu_limit
+# Non-persistent odd-M-tile swizzle and measured deep-pipeline tile.
+DenseGemm,data_type:bf16,m:129,n:128,k:256
+DenseGemm,data_type:bf16,m:64,n:7168,k:8192
 # M=2 GEMV with one/two output rows per thread.
 DenseGemm,data_type:bf16,m:2,n:256,k:2048
 DenseGemm,data_type:bf16,m:2,n:1024,k:2048

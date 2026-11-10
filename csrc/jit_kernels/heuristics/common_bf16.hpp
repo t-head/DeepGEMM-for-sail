@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
@@ -225,11 +226,38 @@ using ConfigResult = std::tuple<int, int, int, int, int, int, int, std::tuple<in
 std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms);
 
+// Keep measured dense BF16 tiles in the dtype-specific selector. The shared
+// adaptive selector also serves INT8, so these entries must not live there.
+inline deep_gemm_adaptive::AdaptiveResult select_dense_bf16_tile(int m, int n, int k, int num_sms) {
+    struct TileEntry {
+        int m, n, k, bm, bn, bk, wm, wn, stages;
+    };
+    static constexpr std::array<TileEntry, 4> measured_tiles{{
+        {32, 7168, 12288, 32, 192, 64, 16, 32, 6},
+        {32, 7168, 8192,  32, 192, 64, 32, 16, 6},
+        {64, 7168, 8192,  64, 192, 64, 32, 32, 7},
+        {64, 12288, 1536, 64, 320, 64, 64, 32, 4},
+    }};
+    // The measurements use this SKU with its full CU budget. Reduced budgets
+    // and other devices retain the general selector's resource-aware choices.
+    if (num_sms == 39) {
+        const auto prop = device_runtime->get_prop();
+        if (prop->major == 8 && prop->minor == 9 && prop->multiProcessorCount == 39 &&
+            std::strcmp(prop->name, "ZW-M890P") == 0) {
+            for (const auto& t : measured_tiles) {
+                if (m == t.m && n == t.n && k == t.k)
+                    return {num_sms, t.bm, t.bn, t.bk, t.wm, t.wn, t.bk, t.stages};
+            }
+        }
+    }
+    return deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms);
+}
+
 // Preserve the 8-tuple contract while returning the adaptive warp_k to dense
 // callers, so they can use the same selection without running it a second time.
 ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms, int* selected_warp_k = nullptr) {
     auto [sms, bm, bn, bk, wm, wn, wk, stages] =
-        deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms);
+        select_dense_bf16_tile(m, n, k, num_sms);
     if (selected_warp_k) *selected_warp_k = wk;
     auto smem = get_smem_config(stages, k, bm, bn, bk);
     return std::make_tuple(sms, bm, bn, bk, wm, wn, stages, smem);
