@@ -254,11 +254,40 @@ void gemm_fp32_fp32_fp32_nt(const torch::Tensor& a, const torch::Tensor& b, cons
     fp32_gemm(a, b, d);
 }
 
+// Validate native strided batches. Read-only inputs may
+// broadcast batches; output batches must never race on the same address.
+static bool model_810e_check_batch(const torch::Tensor& a, const torch::Tensor& b,
+                                  const torch::Tensor& d) {
+    TORCH_CHECK(a.dim() == 3 && b.dim() == 3 && d.dim() == 3, "810E batch requires rank-3 tensors");
+    TORCH_CHECK(a.scalar_type() == torch::kBFloat16 && b.scalar_type() == torch::kBFloat16 &&
+                d.scalar_type() == torch::kBFloat16, "810E batch requires BF16 inputs and output");
+    check_gemm_device_and_output(a, b, d);
+    TORCH_CHECK(!is_ppu1v5_device(), "810E batch targets PPU 1.0");
+    TORCH_CHECK(a.size(0) == b.size(0) && a.size(0) == d.size(0) && a.size(1) == d.size(1) &&
+                b.size(1) == d.size(2) && a.size(2) == b.size(2),
+                "810E batch expects A[B,M,K], B[B,N,K], D[B,M,N]");
+    if (a.size(0) == 0 || a.size(1) == 0 || b.size(1) == 0) return true;
+    for (auto size : {a.size(0), a.size(1), a.size(2), b.size(1)})
+        TORCH_CHECK(size <= std::numeric_limits<int>::max() - 511, "810E batch dimensions exceed int32 tile range");
+    TORCH_CHECK(a.size(2) <= std::numeric_limits<int>::max() - 4096,
+                "810E batch K exceeds the int32 K-loop range");
+    TORCH_CHECK(a.size(0) <= device_runtime->get_prop()->maxGridSize[2], "810E batch exceeds grid.z limit");
+    TORCH_CHECK(d.stride(2) == 1, "810E batch requires contiguous N in output");
+    TORCH_CHECK(a.stride(0) >= 0 && b.stride(0) >= 0 && d.stride(0) > 0 &&
+                a.stride(1) >= 0 && b.stride(1) >= 0 && a.stride(2) >= 0 && b.stride(2) >= 0 &&
+                d.stride(1) >= d.size(2),
+                "810E batch requires nonnegative batch strides and nonoverlapping rows");
+    TORCH_CHECK(!model_810e_batch_output_overlaps(d), "810E batch output batches overlap");
+    if (a.size(2) == 0) return false; // The API handles zero K after alias/device checks.
+    // Every supported tile has BK >= 32 and at least two complete K stages.
+    TORCH_CHECK(a.size(2) >= 64 && a.size(2) % 32 == 0,
+                "810E batch requires K >= 64 and divisible by 32");
+    return false;
+}
+
 void bf16_gemm_strided_batched_nt(const torch::Tensor& a, const torch::Tensor& b,
     const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt) {
-    const bool empty = model_810e_check_batch(a, b, d);
-    check_gemm_device_and_output(a, b, d);
-    if (empty) return;
+    if (model_810e_check_batch(a, b, d)) return;
     if (a.size(2) == 0) { if (!is_compile_only()) d.zero_(); return; }
     check_bf16_gemm_config(configs, a.size(2), d.element_size(), true);
     if (!model_810e_batch_native_input(a) || !model_810e_batch_native_input(b)) {

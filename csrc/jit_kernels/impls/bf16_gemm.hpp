@@ -987,38 +987,6 @@ static bool model_810e_batch_output_overlaps(const torch::Tensor& d) {
     return false;
 }
 
-// Validate native strided batches. Read-only inputs may
-// broadcast batches; output batches must never race on the same address.
-static bool model_810e_check_batch(const torch::Tensor& a, const torch::Tensor& b,
-                                  const torch::Tensor& d) {
-    TORCH_CHECK(a.dim() == 3 && b.dim() == 3 && d.dim() == 3, "810E batch requires rank-3 tensors");
-    TORCH_CHECK(a.scalar_type() == torch::kBFloat16 && b.scalar_type() == torch::kBFloat16 &&
-                d.scalar_type() == torch::kBFloat16, "810E batch requires BF16 inputs and output");
-    TORCH_CHECK(a.is_cuda() && b.device() == a.device() && d.device() == a.device(),
-                "810E batch tensors must be on the same accelerator");
-    TORCH_CHECK(!is_ppu1v5_device(), "810E batch targets PPU 1.0");
-    TORCH_CHECK(a.size(0) == b.size(0) && a.size(0) == d.size(0) && a.size(1) == d.size(1) &&
-                b.size(1) == d.size(2) && a.size(2) == b.size(2),
-                "810E batch expects A[B,M,K], B[B,N,K], D[B,M,N]");
-    if (a.size(0) == 0 || a.size(1) == 0 || b.size(1) == 0) return true;
-    for (auto size : {a.size(0), a.size(1), a.size(2), b.size(1)})
-        TORCH_CHECK(size <= std::numeric_limits<int>::max() - 511, "810E batch dimensions exceed int32 tile range");
-    TORCH_CHECK(a.size(2) <= std::numeric_limits<int>::max() - 4096,
-                "810E batch K exceeds the int32 K-loop range");
-    TORCH_CHECK(a.size(0) <= device_runtime->get_prop()->maxGridSize[2], "810E batch exceeds grid.z limit");
-    TORCH_CHECK(d.stride(2) == 1, "810E batch requires contiguous N in output");
-    TORCH_CHECK(a.stride(0) >= 0 && b.stride(0) >= 0 && d.stride(0) > 0 &&
-                a.stride(1) >= 0 && b.stride(1) >= 0 && a.stride(2) >= 0 && b.stride(2) >= 0 &&
-                d.stride(1) >= d.size(2),
-                "810E batch requires nonnegative batch strides and nonoverlapping rows");
-    TORCH_CHECK(!model_810e_batch_output_overlaps(d), "810E batch output batches overlap");
-    if (a.size(2) == 0) return false; // The API handles zero K after alias/device checks.
-    // Every supported tile has BK >= 32 and at least two complete K stages.
-    TORCH_CHECK(a.size(2) >= 64 && a.size(2) % 32 == 0,
-                "810E batch requires K >= 64 and divisible by 32");
-    return false;
-}
-
 // N=1 is the transpose of a one-row GEMV, and the output has the same physical
 // order. Swapping pointers is sufficient; no input/output transpose is launched.
 static bool model_810e_bf16_n1(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
