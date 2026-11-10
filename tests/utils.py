@@ -1415,7 +1415,8 @@ def test_dense_gemm_runtime_lut(args):
          'ThreadblockShape[64, 64, 64]'),
         ('explicit_override', invalid, {'configs': [20, 32, 64, 64, 16, 32, 2]},
          'ThreadblockShape[32, 64, 64]'),
-        ('miss', f'{(m + 15) // 16 * 16 + 16} {n} {k} 64 64 64 32 32 2\n', {}, ''),
+        # An incorrect match must fail validation, not silently run a valid tile.
+        ('miss', f'{(m + 15) // 16 * 16 + 16} {n} {k} 64 64 64 32 8 2\n', {}, ''),
         ('invalid_hit', invalid, {'expect_error': 'invalid BF16 config'}, ''),
     ]
     with tempfile.TemporaryDirectory(prefix='deepgemm_lut_') as directory:
@@ -1572,6 +1573,25 @@ def test_dense_gemm_api(args):
             gemm_assert_exact(out, reference)
             if accumulation == 'separate':
                 gemm_assert_exact(c, initial_c)
+            if pattern == 'random' and min(m, n, k) > 0:
+                # Exact-value checks above isolate layout and rounding guards.
+                # Also retain normally distributed BF16 inputs, including low
+                # mantissa bits, with the ordinary GEMM accuracy threshold.
+                a.copy_(torch.randn(a.shape, generator=generator, dtype=torch.bfloat16))
+                b.copy_(torch.randn(b.shape, generator=generator, dtype=torch.bfloat16))
+                reference = gemm_reference(a, b)
+                if c is not None:
+                    c.copy_(torch.randn(c.shape, generator=generator, dtype=output_dtype))
+                    initial_c = c.clone()
+                    reference = reference + initial_c.float()
+                gemm_call_with_sms(args, lambda: deep_gemm.bf16_gemm_nt(a, b, out, c=c, configs=config))
+                diff = calc_diff(out, reference.to(output_dtype))
+                assert diff < 0.001, f'Normal BF16 accuracy: {m=}, {n=}, {k=}, {diff=:.10f}'
+                gemm_assert_exact(storage[:64], torch.full_like(storage[:64], 8.))
+                gemm_assert_exact(storage[-64:], torch.full_like(storage[-64:], 8.))
+                if accumulation == 'separate':
+                    gemm_assert_exact(c, initial_c)
+                print(f'Passed normal BF16 accuracy: {diff=:.10f}')
     print('Passed with acc_check' if check else 'Passed without acc_check')
 
 
@@ -1601,6 +1621,11 @@ def test_native_batch_gemm(args):
         raise ValueError('Native batch regression requires accuracy mode and native [B,M,K]/[B,N,K] layouts')
     compiling = bool(os.environ.get('HGGC_WARM_UP')) or deep_gemm.get_compile_mode() == 1
     check = get_acc_check() and not compiling
+    config = args.get('configs')
+    if config is not None:
+        if len(config) != 7:
+            raise ValueError('BF16 configs must specify SMS/BM/BN/BK/WM/WN/stages')
+        config = tuple(config) + (SMEM_CONFIG_UNUSED,)
     generator = torch.Generator().manual_seed(810)
     padding_a, padding_b = args.get('padding_a', 8), args.get('padding_b', 16)
     if any(not isinstance(pad, int) or pad < 0 or pad % 8 for pad in (padding_a, padding_b)):
@@ -1650,7 +1675,7 @@ def test_native_batch_gemm(args):
         reference = gemm_reference(a, b)
         expected_storage.as_strided(out.shape, out.stride(), out.storage_offset()).copy_(reference)
     try:
-        gemm_call_with_sms(args, lambda: deep_gemm.bf16_gemm_strided_batched_nt(a, b, out))
+        gemm_call_with_sms(args, lambda: deep_gemm.bf16_gemm_strided_batched_nt(a, b, out, configs=config))
     except RuntimeError as error:
         # Expected metadata rejection must pass in both compile and accuracy phases.
         if not expected_error or not any(message in str(error) for message in error_messages[expected_error]):

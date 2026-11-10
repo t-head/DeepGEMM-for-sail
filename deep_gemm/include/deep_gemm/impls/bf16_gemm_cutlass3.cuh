@@ -1325,14 +1325,15 @@ static_assert(model_810e_split_k_offset<64, 3>(448, 2) == 256);
 
 template <typename Output, int Splits>
 __device__ void model_810e_reduce(const Model810eReduceParams p) {
-    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= p.count) return;
-    float value = 0.0f;
-    #pragma unroll
-    for (int s = 0; s < Splits; ++s)
-        value += p.partial[int64_t(s) * p.count + i];
-    // BF16 conversion occurs only after all FP32 split partials are summed.
-    static_cast<Output*>(p.d)[i] = Output(value);
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < p.count;
+         i += int64_t(gridDim.x) * blockDim.x) {
+        float value = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < Splits; ++s)
+            value += p.partial[int64_t(s) * p.count + i];
+        // BF16 conversion occurs only after all FP32 split partials are summed.
+        static_cast<Output*>(p.d)[i] = Output(value);
+    }
 }
 
 
@@ -1398,26 +1399,60 @@ struct Model810eBatchPackParams {
     int64_t batches, rows, cols, sb, sr, sc;
 };
 
-template <bool Transpose>
+template <bool Transpose, bool Persistent>
 __device__ void model_810e_batch_pack(const Model810eBatchPackParams p) {
+    constexpr int Threads = Persistent ? 1024 : 128;
     if constexpr (Transpose) {
-        __shared__ cutlass::bfloat16_t tile[32][33];
+        constexpr int Rows = Persistent ? 128 : 32;
+        __shared__ cutlass::bfloat16_t tile[32][Rows + 1];
         const int x = threadIdx.x % 32, y = threadIdx.x / 32;
-        const int64_t batch = blockIdx.z, row0 = int64_t(blockIdx.x) * 32, k0 = int64_t(blockIdx.y) * 32;
-        #pragma unroll
-        for (int j = 0; j < 32; j += 4)
-            if (row0 + x < p.rows && k0 + y + j < p.cols)
-                tile[y + j][x] = p.input[batch * p.sb + (row0 + x) * p.sr + (k0 + y + j) * p.sc];
-        __syncthreads();
-        #pragma unroll
-        for (int j = 0; j < 32; j += 4)
-            if (row0 + y + j < p.rows && k0 + x < p.cols)
-                p.output[(batch * p.rows + row0 + y + j) * p.cols + k0 + x] = tile[x][y + j];
+        const int64_t mt = (p.rows + Rows - 1) / Rows, kt = (p.cols + 31) / 32;
+        const int64_t tiles = Persistent ? p.batches * mt * kt : 1;
+        int64_t batch = Persistent ? blockIdx.x / (mt * kt) : blockIdx.z;
+        int64_t mi = Persistent ? (blockIdx.x / kt) % mt : blockIdx.x;
+        int64_t ki = Persistent ? blockIdx.x % kt : blockIdx.y;
+        const int64_t k_step = Persistent ? gridDim.x % kt : 0;
+        const int64_t m_step = Persistent ? (gridDim.x / kt) % mt : 0;
+        const int64_t batch_step = Persistent ? gridDim.x / (kt * mt) : 0;
+        for (int64_t t = Persistent ? blockIdx.x : 0; t < tiles; t += Persistent ? gridDim.x : 1) {
+            const int64_t row0 = mi * Rows, k0 = ki * 32;
+            #pragma unroll
+            for (int r = 0; r < Rows; r += 32) {
+                #pragma unroll
+                for (int j = 0; j < 32; j += Threads / 32)
+                    if (row0 + x + r < p.rows && k0 + y + j < p.cols)
+                        tile[y + j][x + r] = p.input[batch * p.sb + (row0 + x + r) * p.sr + (k0 + y + j) * p.sc];
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int j = 0; j < Rows; j += Threads / 32)
+                if (row0 + y + j < p.rows && k0 + x < p.cols)
+                    p.output[(batch * p.rows + row0 + y + j) * p.cols + k0 + x] = tile[x][y + j];
+            if constexpr (Persistent) {
+                __syncthreads(); // Finish reads before reusing the tile.
+                // The grid is bounded by the CU budget. Advance coordinates
+                // without repeating software 64-bit divisions for every tile.
+                ki += k_step;
+                mi += m_step;
+                batch += batch_step;
+                if (ki >= kt) { ki -= kt; ++mi; }
+                if (mi >= mt) { mi -= mt; ++batch; }
+            }
+        }
     } else {
-        for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < p.batches * p.rows * p.cols;
-             i += int64_t(gridDim.x) * blockDim.x) {
-            const int64_t batch = i / (p.rows * p.cols), row = (i / p.cols) % p.rows, col = i % p.cols;
-            p.output[i] = p.input[batch * p.sb + row * p.sr + col * p.sc];
+        constexpr int RowGroups = Threads / 128;
+        const int64_t first = int64_t(blockIdx.x) * RowGroups + threadIdx.x / 128;
+        const int64_t step = int64_t(gridDim.x) * RowGroups;
+        int64_t batch = first / p.rows, row = first % p.rows;
+        const int64_t batch_step = step / p.rows, row_step = step % p.rows;
+        for (int64_t t = first; t < p.batches * p.rows; t += step) {
+            const int64_t input_row = batch * p.sb + row * p.sr;
+            #pragma unroll 4
+            for (int64_t col = threadIdx.x % 128; col < p.cols; col += 128)
+                p.output[t * p.cols + col] = p.input[input_row + col * p.sc];
+            row += row_step;
+            batch += batch_step;
+            if (row >= p.rows) { row -= p.rows; ++batch; }
         }
     }
 }

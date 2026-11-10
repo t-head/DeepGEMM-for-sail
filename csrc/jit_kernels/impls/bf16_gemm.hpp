@@ -1118,6 +1118,19 @@ class Model810eReduceRuntime final : public LaunchRuntime<Model810eReduceRuntime
 public:
     struct Params { const float* partial; void* d; int64_t count; };
     struct Args { LaunchArgs launch_args; Params params; int splits; };
+    static LaunchArgs launch_args(int64_t count) {
+        const int sms = get_num_sms();
+        TORCH_CHECK(sms > 0, "810E split-K reduction requires a positive CU budget");
+        const auto prop = device_runtime->get_prop();
+        const bool bounded = sms < prop->multiProcessorCount;
+        const int threads = bounded ? std::min(1024, prop->maxThreadsPerBlock) : 256;
+        int64_t blocks = ceil_div(count, int64_t(threads));
+        if (bounded)
+            blocks = std::min<int64_t>(blocks, sms);
+        TORCH_CHECK(blocks > 0 && blocks <= prop->maxGridSize[0],
+                    "810E split-K reduction exceeds grid.x limit");
+        return {dim3(static_cast<unsigned int>(blocks)), dim3(threads), 0};
+    }
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
 #include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
@@ -1181,12 +1194,23 @@ static void model_810e_bf16_dense(const torch::Tensor& a, const torch::Tensor& b
         using Reduce = Model810eReduceRuntime<Output>;
         const int64_t count = int64_t(m) * n;
         typename Reduce::Args reduce_args{
-            {dim3((count + 255) / 256), dim3(256), 0},
+            Reduce::launch_args(count),
             {workspace.data_ptr<float>(), output, count}, splits};
         auto reduce_code = Reduce::generate(reduce_args);
         auto reduce_runtime = compiler->build("model_810e_splitk_reduce", reduce_code);
         Reduce::launch(reduce_runtime, reduce_args);
     }
+}
+
+// Validate the resolved grid, including reduced-budget persistent launches,
+// before generating or compiling a kernel.
+static void model_810e_check_grid(const dim3& grid) {
+    const auto prop = device_runtime->get_prop();
+    TORCH_CHECK(grid.x > 0 && grid.y > 0 && grid.z > 0 &&
+                grid.x <= uint64_t(prop->maxGridSize[0]) &&
+                grid.y <= uint64_t(prop->maxGridSize[1]) &&
+                grid.z <= uint64_t(prop->maxGridSize[2]),
+                "810E GEMM grid exceeds device limits: (", grid.x, ", ", grid.y, ", ", grid.z, ")");
 }
 
 static std::pair<int, int> model_810e_batch_k_config(const int k) {
@@ -1241,6 +1265,7 @@ static void model_810e_bf16_strided_batched(const torch::Tensor& a, const torch:
         const int64_t tiles = int64_t(ceil_div(n, bn)) * ceil_div(m, bm) * batch;
         args.launch_args.grid_dim = dim3(std::min<int64_t>(sms, tiles));
     }
+    model_810e_check_grid(args.launch_args.grid_dim);
     auto code = Runtime::generate(args);
     auto runtime = compiler->build("model_810e_bf16_batch", code);
     Runtime::launch(runtime, args);
@@ -1406,6 +1431,7 @@ static void model_810e_tsm_launch(const torch::Tensor& a, const torch::Tensor& b
         const int64_t tiles = int64_t(ceil_div(m, bm)) * ceil_div(n, bn) * groups;
         args.launch_args.grid_dim = dim3(std::min<int64_t>(sms, tiles));
     }
+    model_810e_check_grid(args.launch_args.grid_dim);
     auto code = Runtime::generate(args);
     auto runtime = compiler->build(name, code);
     Runtime::launch(runtime, args);
@@ -1448,7 +1474,7 @@ static void model_810e_bf16_dense_tsm(const torch::Tensor& a, const torch::Tenso
                                      tile_order, peel_first_k);
     using Reduce = Model810eReduceRuntime<Output>;
     const int64_t count = int64_t(m) * n;
-    typename Reduce::Args args{{dim3((count + 255) / 256), dim3(256), 0},
+    typename Reduce::Args args{Reduce::launch_args(count),
                               {partial.data_ptr<float>(), d.data_ptr(), count}, splits};
     auto code = Reduce::generate(args);
     auto runtime = compiler->build("model_810e_splitk_reduce", code);
@@ -1715,38 +1741,48 @@ static bool model_810e_batch_native_input(const torch::Tensor& x) {
 class Model810eBatchPackRuntime final : public LaunchRuntime<Model810eBatchPackRuntime> {
 public:
     struct Params { const void* input; void* output; int64_t batches, rows, cols, sb, sr, sc; };
-    struct Args { LaunchArgs launch_args; Params params; bool transpose; };
+    struct Args { LaunchArgs launch_args; Params params; bool transpose, persistent; };
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
 #define BF16_HGRTC
 #include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
 extern "C" __global__ void model_810e_batch_pack(deep_gemm::Model810eBatchPackParams p) {{
-    deep_gemm::model_810e_batch_pack<{}>(p);
+    deep_gemm::model_810e_batch_pack<{}, {}>(p);
 }}
-)", args.transpose ? "true" : "false");
+)", args.transpose ? "true" : "false", args.persistent ? "true" : "false");
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
     }
 };
 
-static torch::Tensor model_810e_pack_batch_input(const torch::Tensor& x) {
+static torch::Tensor model_810e_pack_batch_input(const torch::Tensor& x, const int sms) {
     if (model_810e_batch_native_input(x)) return x;
+    // Preserve broadcast storage: one packed panel is shared by every batch.
+    if (x.size(0) > 1 && x.stride(0) == 0)
+        return model_810e_pack_batch_input(x.narrow(0, 0, 1), sms).expand(x.sizes());
     auto out = torch::empty(x.sizes(), x.options());
-    const int sms = get_num_sms();
     TORCH_CHECK(sms > 0, "810E batch requires a positive CU budget");
-    const bool transpose = x.stride(1) == 1 && sms >= kModel810eTensorCUs &&
-        ceil_div(x.size(2), int64_t(32)) <= device_runtime->get_prop()->maxGridSize[1];
-    if (!transpose && sms >= kModel810eTensorCUs) {
+    // Packing runs on general CUs, not only the 20 Tensor CUs. A reduced
+    // general-CU budget must bound both strided and transpose copies.
+    const bool full_budget = sms >= device_runtime->get_prop()->multiProcessorCount;
+    const bool transpose = x.stride(1) == 1 && (!full_budget ||
+        ceil_div(x.size(2), int64_t(32)) <= device_runtime->get_prop()->maxGridSize[1]);
+    if (!transpose && full_budget) {
         // ATen already vectorizes K-contiguous copies. Compilation must not
         // execute this copy, just as it must not execute the following GEMM.
         if (!is_compile_only()) out.copy_(x);
         return out;
     }
-    const int64_t blocks = std::min<int64_t>(ceil_div(x.numel(), int64_t(128)), sms);
+    // A bounded grid needs enough warps in each CTA to hide copy latency.
+    const int threads = full_budget ? 128 : 1024;
+    TORCH_CHECK(threads <= device_runtime->get_prop()->maxThreadsPerBlock,
+                "810E packing exceeds device thread limit");
+    const int64_t blocks = std::min<int64_t>(ceil_div(x.numel(), int64_t(threads)), sms);
     Model810eBatchPackRuntime::Args args{
-        {transpose ? dim3(ceil_div(x.size(1), int64_t(32)), ceil_div(x.size(2), int64_t(32)), x.size(0)) : dim3(blocks), dim3(128), 0},
-        {x.data_ptr(), out.data_ptr(), x.size(0), x.size(1), x.size(2), x.stride(0), x.stride(1), x.stride(2)}, transpose};
+        {transpose && full_budget ? dim3(ceil_div(x.size(1), int64_t(32)), ceil_div(x.size(2), int64_t(32)), x.size(0)) : dim3(blocks), dim3(threads), 0},
+        {x.data_ptr(), out.data_ptr(), x.size(0), x.size(1), x.size(2), x.stride(0), x.stride(1), x.stride(2)}, transpose, !full_budget};
+    model_810e_check_grid(args.launch_args.grid_dim);
     auto code = Model810eBatchPackRuntime::generate(args);
     auto runtime = compiler->build("model_810e_batch_pack", code);
     Model810eBatchPackRuntime::launch(runtime, args);

@@ -232,8 +232,9 @@ void bf16_gemm_strided_batched_nt(const torch::Tensor& a, const torch::Tensor& b
     check_bf16_gemm_config(configs, a.size(2), d.element_size(), true);
     if (!model_810e_batch_native_input(a) || !model_810e_batch_native_input(b)) {
         if (!configs && model_810e_dispatch_strided_batch(a, b, d)) return;
-        const auto packed_a = model_810e_pack_batch_input(a);
-        const auto packed_b = model_810e_pack_batch_input(b);
+        const int sms = configs ? std::get<0>(*configs) : get_num_sms();
+        const auto packed_a = model_810e_pack_batch_input(a, sms);
+        const auto packed_b = model_810e_pack_batch_input(b, sms);
         bf16_gemm_strided_batched_nt(packed_a, packed_b, d, configs);
         return;
     }

@@ -223,6 +223,35 @@ int gemv_checks() {
     }
     return count;
 }
+
+int batch_grid_checks() {
+    // Current 810E drivers allow INT_MAX in all grid dimensions. Exercise a
+    // smaller advertised limit in this test module's own runtime instance.
+    const auto prop = device_runtime->get_prop();
+    struct Restore {
+        int& limit;
+        int saved;
+        ~Restore() { limit = saved; }
+    } restore{prop->maxGridSize[1], prop->maxGridSize[1]};
+    prop->maxGridSize[1] = 1;
+    const auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kBFloat16);
+    const auto a = torch::empty({1, 129, 64}, options);
+    const auto b = torch::empty({1, 8, 64}, options);
+    const auto d = torch::empty({1, 129, 8}, options);
+    const ConfigTuple config{20, 128, 128, 32, 32, 64, 2, {0, 0, 0}};
+    int rejected = 0;
+    for (bool tsm : {false, true}) {
+        try {
+            if (tsm) model_810e_bf16_strided_batched_tsm(a, b, d, config);
+            else model_810e_bf16_strided_batched(a, b, d, config);
+        } catch (const c10::Error& error) {
+            if (std::string(error.what()).find("810E GEMM grid exceeds device limits") == std::string::npos)
+                throw;
+            ++rejected;
+        }
+    }
+    return rejected;
+}
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -232,6 +261,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp8_block", fp8_checks);
     m.def("fp4", fp4_checks);
     m.def("gemv", gemv_checks);
+    m.def("batch_grid", batch_grid_checks);
 }
 '''
 
@@ -275,6 +305,11 @@ class CompileKeyTests(unittest.TestCase):
 
     def test_gemv_both_m_and_output_types(self):
         self.assertGreater(self.native.gemv(), 0)
+
+    def test_810e_batched_grid_limits(self):
+        if 'ZW810E' not in torch.cuda.get_device_name():
+            self.skipTest('requires 810E')
+        self.assertEqual(self.native.batch_grid(), 2)
 
 
 if __name__ == '__main__':
