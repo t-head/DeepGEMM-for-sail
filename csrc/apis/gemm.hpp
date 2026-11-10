@@ -256,8 +256,9 @@ void gemm_fp32_fp32_fp32_nt(const torch::Tensor& a, const torch::Tensor& b, cons
 
 void bf16_gemm_strided_batched_nt(const torch::Tensor& a, const torch::Tensor& b,
     const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt) {
-    if (model_810e_check_batch(a, b, d)) return;
+    const bool empty = model_810e_check_batch(a, b, d);
     check_gemm_device_and_output(a, b, d);
+    if (empty) return;
     if (a.size(2) == 0) { if (!is_compile_only()) d.zero_(); return; }
     check_bf16_gemm_config(configs, a.size(2), d.element_size(), true);
     if (!model_810e_batch_native_input(a) || !model_810e_batch_native_input(b)) {
