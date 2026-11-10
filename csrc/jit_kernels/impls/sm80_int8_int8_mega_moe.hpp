@@ -40,16 +40,6 @@ static layout::MegaMoEStaging get_mega_moe_staging(
     return owner;
 }
 
-static torch::Tensor make_buffer_tensor(const torch::Tensor& buffer, torch::ScalarType dtype,
-                            int64_t offset, torch::IntArrayRef shape,
-                            torch::IntArrayRef strides = {}) {
-    // Non-owning views, as upstream: keep the symmetric buffer alive while in use.
-    auto* pointer = buffer.data_ptr<uint8_t>() + offset;
-    const auto options = buffer.options().dtype(dtype);
-    return strides.empty() ? torch::from_blob(pointer, shape, options)
-                           : torch::from_blob(pointer, shape, strides, options);
-}
-
 template <typename Runtime>
 static void submit_mega_gemm(const std::shared_ptr<KernelRuntime>& runtime,
                              const typename Runtime::Args& args, const char* dtype, int groups,
@@ -499,7 +489,7 @@ static LaunchArgs make_launch_args(const MegaMoEStageConfig& config, bool scatte
 
 template <int Ranks>
 static auto make_linear1_args(
-        const torch::Tensor& activated, const std::tuple<torch::Tensor, torch::Tensor>& w1,
+        const std::tuple<torch::Tensor, torch::Tensor>& w1, int intermediate,
         const layout::Int8MegaMoEBuffer& buffers, uint8_t* base, const layout::SymBuffer<>& symmetric,
         int capacity, int topk, const MegaMoEStage1Config& config, int num_sms,
         GatedActivation activation, float limit, bool normal_quantization,
@@ -507,7 +497,7 @@ static auto make_linear1_args(
         int32_t* cumulative_local_expert_recv_stats) {
     using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks>;
     const auto& [weight, scale] = w1;
-    const int hidden = weight.size(2), intermediate = activated.size(1), groups = weight.size(0);
+    const int hidden = weight.size(2), groups = weight.size(0);
     typename Runtime::Args args{config, hidden, intermediate, groups, capacity, topk,
                                 make_launch_args(config, false)};
     args.normal_quantization = normal_quantization;
@@ -529,7 +519,7 @@ static auto make_linear1_args(
         buffers.local_data.data(base), make_packed_stride(Ranks * capacity, hidden),
         weight.data_ptr(), make_packed_stride(intermediate * 2, hidden),
         buffers.local_sfa.data<float>(base), scale.data_ptr<float>()};
-    auto* out = reinterpret_cast<cutlass::bfloat16_t*>(activated.data_ptr());
+    auto* out = buffers.activated.data<cutlass::bfloat16_t>(base);
     static_cast<INT8GemmCutlass3Runtime::EpilogueParamNoTsm&>(params.collective_epilogue_params) = {
         {}, out, make_packed_stride(Ranks * capacity, intermediate),
         out, make_packed_stride(Ranks * capacity, intermediate)};
@@ -546,7 +536,7 @@ static auto make_linear1_args(
 template <int Ranks>
 static void launch_linear1(
         typename GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks>::Args& args,
-        const torch::Tensor& activated, const layout::Int8MegaMoEBuffer& buffers,
+        const layout::Int8MegaMoEBuffer& buffers,
         uint8_t* base, int num_tokens, int num_sms) {
     if (args.split_sync)
         mega_moe_common::launch_sync("mega_moe_dispatch_sync", Ranks,
@@ -555,7 +545,7 @@ static void launch_linear1(
 
     Int8MegaMoEQuantRuntime::Args quantization{
         args.intermediate, args.normal_quantization, int64_t(num_tokens) * args.topk,
-        {dim3(num_sms * 4), dim3(256), 0}, activated.data_ptr(),
+        {dim3(num_sms * 4), dim3(256), 0}, buffers.activated.data(base),
         buffers.stage1_data.data<int8_t>(base), buffers.stage1_scale_storage.data<float>(base),
         buffers.expert_base.data<uint32_t>(base) + args.groups};
     auto kernel = compiler->build("megamoe_int8_quant", Int8MegaMoEQuantRuntime::generate(quantization));
@@ -607,28 +597,26 @@ static void launch_linear2(typename GemmRuntime<MegaMoEPhaseKind::Linear2, Ranks
 
 template <int Ranks>
 static void int8_mega_moe_impl(
-        const torch::Tensor& y, const torch::Tensor& activated,
+        const torch::Tensor& y,
         const std::tuple<torch::Tensor, torch::Tensor>& w1,
         const std::tuple<torch::Tensor, torch::Tensor>& w2,
-        const torch::Tensor& buffer, const std::vector<int64_t>& pointers,
+        uint8_t* base, const layout::Int8MegaMoEBuffer& buffers, const std::vector<int64_t>& pointers,
         int rank, int capacity, int topk, int expected_m, float limit, bool normal_quantization,
         GatedActivation activation = GatedActivation::SwiGLU,
         float beta = 0, float linear_beta = 0, float alpha = 1.702f,
-        layout::MegaMoEStaging staging = {}, int32_t* cumulative_local_expert_recv_stats = nullptr,
+        int32_t* cumulative_local_expert_recv_stats = nullptr,
         bool fast_math = true) {
     const int hidden = std::get<0>(w1).size(2), intermediate = std::get<0>(w2).size(2);
     const int groups = std::get<0>(w1).size(0), num_sms = device_runtime->get_num_sms();
     const auto config = select_int8_mega_moe({num_sms, Ranks, groups, capacity, hidden, intermediate, expected_m},
         get_env<int>("DG_MEGAMOE_COPY_THREADS", 0), normal_quantization);
-    const layout::Int8MegaMoEBuffer buffers(Ranks, groups * Ranks, capacity, topk, hidden, intermediate, staging);
-    auto* base = buffer.data_ptr<uint8_t>();
     const bool split_sync = get_env<int>("DG_MEGAMOE_SPLIT_SYNC", 0) != 0;
 
-    auto l1_args = make_linear1_args<Ranks>(activated, w1, buffers, base, layout::SymBuffer<>(pointers, rank),
+    auto l1_args = make_linear1_args<Ranks>(w1, intermediate, buffers, base, layout::SymBuffer<>(pointers, rank),
         capacity, topk, config.l1, num_sms, activation, limit, normal_quantization,
         beta, linear_beta, alpha, fast_math, cumulative_local_expert_recv_stats);
     l1_args.split_sync = split_sync;
-    launch_linear1<Ranks>(l1_args, activated, buffers, base, y.size(0), num_sms);
+    launch_linear1<Ranks>(l1_args, buffers, base, y.size(0), num_sms);
 
     auto l2_args = make_linear2_args<Ranks>(w2, buffers, base, pointers, rank, capacity, topk,
         l1_args.kernel_params.scheduler.grouped_layout, config.l2, num_sms);
@@ -640,58 +628,35 @@ static void int8_mega_moe_impl(
     launch_linear2<Ranks>(l2_args, num_sms);
 }
 
-
-// Keep the imported device layout intact. The API owns GEMM1's private BF16
-// scratch in the same allocation so neither public signature gains an argument.
-struct Buffer : layout::Int8MegaMoEBuffer {
-    layout::Buffer activated;
-    Buffer(int ranks, int experts, int capacity, int topk, int hidden, int intermediate,
-           layout::MegaMoEStaging staging = {})
-        : layout::Int8MegaMoEBuffer(ranks, experts, capacity, topk, hidden, intermediate, staging) {
-        activated = allocate(compact * intermediate * sizeof(uint16_t));
-    }
-};
-
-struct Shape {
-    int hidden, intermediate, experts, ranks, capacity, topk;
-    layout::MegaMoEStaging staging{};
-    Buffer layout() const { return {ranks, experts, capacity, topk, hidden, intermediate, staging}; }
-};
-
-static torch::Tensor view(const torch::Tensor& buffer, const layout::Buffer& region,
-        torch::ScalarType dtype, torch::IntArrayRef sizes, torch::IntArrayRef strides = {}) {
-    return mega_int8::make_buffer_tensor(buffer, dtype, region.offset, sizes, strides);
-}
-
-static void int8_mega_moe_quant_impl(const Shape& s, const torch::Tensor& x,
+static void int8_mega_moe_quant_impl(const torch::Tensor& x,
         const torch::Tensor& ids, const torch::Tensor& weights,
-        const std::vector<int64_t>& pointers, int rank) {
+        const std::vector<int64_t>& pointers, int rank, int ranks, int experts, int capacity,
+        int intermediate, layout::MegaMoEStaging staging) {
     using Runtime = mega_int8::TokenPublishRuntime;
-    Runtime::Args args{s.hidden, s.topk, s.capacity, s.ranks, s.experts, s.intermediate,
+    Runtime::Args args{int(x.size(1)), int(ids.size(1)), capacity, ranks, experts, intermediate,
         {dim3(1), dim3(256), 0}, x.data_ptr(), ids.data_ptr(), weights.data_ptr<float>(),
-        static_cast<uint32_t>(x.size(0)), layout::SymBuffer<>(pointers, rank), s.staging,
+        static_cast<uint32_t>(x.size(0)), layout::SymBuffer<>(pointers, rank), staging,
         ids.scalar_type() == torch::kInt64};
     const auto runtime = compiler->build("megamoe_quant", Runtime::generate(args));
-    const int groups = s.experts / s.ranks;
+    const int groups = experts / ranks;
     const int resident = mega_int8::get_kernel_occupancy(runtime, 256, 0) * device_runtime->get_prop()->multiProcessorCount;
     TORCH_CHECK(groups < resident, "INT8 MegaMoE publication needs a resident token CTA");
     args.launch_args.grid_dim.x = groups + std::max(1, std::min(int(args.tokens), resident - groups));
     Runtime::launch(runtime, args);
 }
 
-static void int8_int8_mega_moe_impl(const Shape& s, const torch::Tensor& buffer,
+static void int8_int8_mega_moe_impl(uint8_t* base, const layout::Int8MegaMoEBuffer& buffers,
+        int capacity, int topk,
         const std::vector<int64_t>& pointers, int rank, const torch::Tensor& y,
         const std::tuple<torch::Tensor, torch::Tensor>& w1,
         const std::tuple<torch::Tensor, torch::Tensor>& w2,
         const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
         int expected_m,
         GatedActivation activation, float limit, float beta, float linear_beta, float alpha, bool fast_math) {
-    const auto b = s.layout();
-    const auto activated = view(buffer, b.activated, torch::kBFloat16, {b.compact, s.intermediate});
-    mega_int8::for_ranks(s.ranks, [&](auto r) {
-        mega_int8::int8_mega_moe_impl<decltype(r)::value>(y, activated, w1, w2, buffer, pointers,
-            rank, s.capacity, s.topk, expected_m, limit, false,
-            activation, beta, linear_beta, alpha, s.staging,
+    mega_int8::for_ranks(pointers.size(), [&](auto r) {
+        mega_int8::int8_mega_moe_impl<decltype(r)::value>(y, w1, w2, base, buffers, pointers,
+            rank, capacity, topk, expected_m, limit, false,
+            activation, beta, linear_beta, alpha,
             cumulative_local_expert_recv_stats ? cumulative_local_expert_recv_stats->data_ptr<int32_t>() : nullptr,
             fast_math);
     });

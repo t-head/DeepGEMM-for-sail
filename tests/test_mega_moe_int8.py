@@ -143,9 +143,10 @@ def check_fast_math_policy(group):
 
 
 def run(args):
-    fp4_params = inspect.signature(dg.fp4_fp4_mega_moe).parameters
+    fp4_params = {name: param for name, param in inspect.signature(dg.fp4_fp4_mega_moe).parameters.items()
+                  if name not in ('l1_weights_replicas', 'l2_weights_replicas')}
     int8_params = inspect.signature(dg.int8_int8_mega_moe).parameters
-    assert list(int8_params) == list(fp4_params), 'public parameter names/order must match MXFP4'
+    assert list(int8_params) == list(fp4_params), 'public parameter names/order must match MXFP4 without replica banks'
     for name, param in int8_params.items():
         assert param.kind == fp4_params[name].kind, name
         if name != 'recipe':
@@ -185,8 +186,7 @@ def run(args):
         dg.int8_mega_moe_pre_dispatch(x, ids, routes, workspace.x, workspace.x_sf,
                                     workspace.topk_idx, workspace.topk_weights, len(x))
         dg.int8_int8_mega_moe(output[:workspace.num_max_tokens_per_rank], *weights, workspace,
-                            cumulative_local_expert_recv_stats=stats,
-                            l1_weights_replicas=None, l2_weights_replicas=None, **activation)
+                            cumulative_local_expert_recv_stats=stats, **activation)
 
     stats = torch.full((experts // ranks,), 7, dtype=torch.int32, device='cuda')
     expected_stats = stats.clone()
@@ -332,8 +332,6 @@ def run(args):
     expect_error(lambda: dg.get_symm_buffer_for_int8_mega_moe(
         group, experts, capacity, args.topk, 512, intermediate))
     expect_error(lambda: dg.int8_int8_mega_moe(y, *weights, buffer, expected_m=1))
-    expect_error(lambda: dg.int8_int8_mega_moe(y, *weights, buffer,
-                                             l1_weights_replicas=weights[0], l2_weights_replicas=weights[1]))
     expect_error(lambda: dg.int8_int8_mega_moe(y, *weights, buffer, activation_clamp=-1.))
     expect_error(lambda: dg.int8_int8_mega_moe(y, *weights, buffer, situ_beta=1.5))
     expect_error(lambda: dg.int8_int8_mega_moe(y, *weights, buffer, situ_linear_beta=2.))

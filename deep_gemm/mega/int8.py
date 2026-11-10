@@ -205,8 +205,6 @@ def int8_int8_mega_moe(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
     *,
-    l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     situ_beta: Optional[float] = 4.0,
     situ_linear_beta: Optional[float] = 25.0,
     activation_alpha: Optional[float] = None,
@@ -228,16 +226,15 @@ def int8_int8_mega_moe(
     SiTU defaults to situ_beta=4.0 and situ_linear_beta=25.0; explicitly pass
     situ_linear_beta=None to disable the up softcap. Both betas must otherwise
     be positive and finite, with no clamp/alpha. OAI's positive finite activation_alpha
-    defaults to 1.702. Public signatures stay aligned with FP4; the source
-    backend's quantization-mode option is not exposed. Split-copy overlaps the
-    independent copy grid with GEMM1; whole-row quantization follows GEMM1.
+    defaults to 1.702. The source backend's quantization-mode option is not exposed.
+    Split-copy overlaps the independent copy grid with GEMM1; whole-row
+    quantization follows GEMM1.
     Warm up on each capture stream before Graph capture.
     recipe must be (1, 1, 0): one scale per token/output channel, with 0
     denoting the full K dimension of each GEMM (H for L1, I for L2).
     y is contiguous BF16 [C,H], T <= C <= token capacity; unused rows produce
     zeros. Retain inputs, weights, output and buffer until asynchronous execution
-    and captured Graphs retire. Separate replica weight banks are not supported;
-    both replica arguments must be None. The expected-M estimate is internal.
+    and captured Graphs retire. The expected-M estimate is internal.
     cumulative_local_expert_recv_stats is an optional
     contiguous CUDA int32 vector of local-expert counts, incremented once per
     valid route on every call, including routes with zero weight. Initialize
@@ -246,8 +243,6 @@ def int8_int8_mega_moe(
     if not isinstance(sym_buffer, Int8SymmBuffer) or sym_buffer.buffer is None:
         raise ValueError("a live Int8SymmBuffer is required")
     activation = _normalize_activation(activation)
-    if l1_weights_replicas is not None or l2_weights_replicas is not None:
-        raise ValueError("INT8 MegaMoE does not support separate replica weight banks")
     # C++ infers dimensions from weights; reject a differently shaped buffer before entering it.
     groups = sym_buffer.num_experts // sym_buffer.group.size()
     for pair, shape in ((l1_weights, (groups, 2 * sym_buffer.intermediate_hidden, sym_buffer.hidden)),
@@ -264,5 +259,4 @@ def int8_int8_mega_moe(
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         tuple(recipe), activation, activation_clamp, fast_math,
         situ_beta, situ_linear_beta, activation_alpha,
-        l1_weights_replicas, l2_weights_replicas,
         sym_buffer.staging_config)

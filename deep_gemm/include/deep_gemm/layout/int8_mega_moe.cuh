@@ -26,17 +26,10 @@ struct Int8MegaMoEBuffer {
     Buffer copy_ready;
     Buffer dispatch_counts[2], dispatch_data, dispatch_retire;
     Buffer expert_base, expert_rank_prefix, grouped_layout, local_data, local_sfa, preprocess_ready;
-    Buffer scatter_storage, src_info, stage1_data, stage1_scale_storage;
+    Buffer scatter_storage, src_info, stage1_data, stage1_scale_storage, activated;
     Buffer staging_scales[2], staging_counts[2], staging_tokens[2], topk_idx, topk_weights;
     MegaMoEStaging staging;
     int64_t bytes = 0, groups = 0, compact = 0, blocks = 0;
-
-    __host__ __device__ constexpr Buffer allocate(int64_t size, int64_t alignment = 256) {
-        bytes = math::constexpr_align(bytes, alignment);
-        Buffer result{bytes, size};
-        bytes += size;
-        return result;
-    }
 
     __host__ __device__
     constexpr Int8MegaMoEBuffer(int ranks, int experts, int capacity, int topk, int hidden, int intermediate,
@@ -76,10 +69,20 @@ struct Int8MegaMoEBuffer {
         stage1_scale_storage = allocate(compact * Storage::scale_bytes(intermediate));
         topk_idx = allocate(int64_t(capacity) * topk * sizeof(int64_t));
         topk_weights = allocate(int64_t(capacity) * topk * sizeof(float));
+        // Preserve the original payload boundary before the private BF16 scratch.
         bytes = math::constexpr_align<int64_t>(bytes, 256);
+        activated = allocate(compact * intermediate * sizeof(uint16_t));
     }
 
     int64_t get_num_bytes() const { return bytes; }
+
+private:
+    __host__ __device__ constexpr Buffer allocate(int64_t size, int64_t alignment = 256) {
+        bytes = math::constexpr_align(bytes, alignment);
+        Buffer result{bytes, size};
+        bytes += size;
+        return result;
+    }
 };
 
 } // namespace deep_gemm::layout

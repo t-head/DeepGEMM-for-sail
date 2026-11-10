@@ -9,7 +9,7 @@
 
 namespace deep_gemm::mega_int8 {
 
-static Shape check_shape(int ranks, int experts, int capacity, int topk, int hidden, int intermediate,
+static layout::Int8MegaMoEBuffer check_shape(int ranks, int experts, int capacity, int topk, int hidden, int intermediate,
                          const std::array<int, 3>& staging_config = {}) {
     TORCH_CHECK(ranks >= 1 && ranks <= 64 && (ranks & (ranks - 1)) == 0,
                 "INT8 MegaMoE requires a power-of-two EP size in [1, 64]");
@@ -26,10 +26,10 @@ static Shape check_shape(int ranks, int experts, int capacity, int topk, int hid
                 "INT8 MegaMoE only support sm80 now");
     const auto staging = get_mega_moe_staging(
         ranks, experts, capacity, hidden, staging_config);
-    Shape shape{hidden, intermediate, experts, ranks, capacity, topk, staging};
-    TORCH_CHECK(shape.layout().blocks <= layout::MegaMoESignals::kNumMaxCopyBlocks,
+    const layout::Int8MegaMoEBuffer buffers(ranks, experts, capacity, topk, hidden, intermediate, staging);
+    TORCH_CHECK(buffers.blocks <= layout::MegaMoESignals::kNumMaxCopyBlocks,
                 "INT8 MegaMoE view exceeds the protocol's M-block limit");
-    return shape;
+    return buffers;
 }
 
 static void check_tensor(const torch::Tensor& t, torch::ScalarType dtype,
@@ -38,10 +38,10 @@ static void check_tensor(const torch::Tensor& t, torch::ScalarType dtype,
                 t.is_contiguous() && t.sizes() == shape, name, " has an invalid shape, dtype, layout or device");
 }
 
-static void check_buffer(const torch::Tensor& buffer, const Shape& s) {
+static void check_buffer(const torch::Tensor& buffer, const layout::Int8MegaMoEBuffer& buffers) {
     TORCH_CHECK(buffer.is_cuda() && buffer.scalar_type() == torch::kUInt8 && buffer.dim() == 1 &&
                 buffer.is_contiguous() && buffer.storage_offset() == 0 &&
-                buffer.numel() >= s.layout().bytes && buffer.get_device() == at::cuda::current_device(),
+                buffer.numel() >= buffers.get_num_bytes() && buffer.get_device() == at::cuda::current_device(),
                 "invalid INT8 MegaMoE symmetric buffer or current device");
 }
 
@@ -55,26 +55,32 @@ static auto get_symm_buffer_size_for_int8_mega_moe(
     TORCH_CHECK(mma_type == "int8xint8", "INT8 MegaMoE requires mma_type=int8xint8");
     mega::parse_gated_activation(activation);
     TORCH_CHECK(num_shared_experts == 0, "MegaMoE shared experts are not supported yet");
-    const auto s = check_shape(num_ranks, num_experts, num_max_tokens_per_rank,
+    const auto b = check_shape(num_ranks, num_experts, num_max_tokens_per_rank,
                                num_topk, hidden, intermediate_hidden, staging_config);
-    const auto b = s.layout();
     auto slice = [=](const torch::Tensor& buffer) {
-        check_buffer(buffer, s);
+        check_buffer(buffer, b);
+        auto make_tensor = [&](torch::ScalarType dtype, const layout::Buffer& region,
+                               torch::IntArrayRef shape, torch::IntArrayRef strides = {}) {
+            auto* ptr = region.data(buffer.data_ptr<uint8_t>());
+            const auto options = buffer.options().dtype(dtype);
+            return strides.empty() ? torch::from_blob(ptr, shape, options)
+                                   : torch::from_blob(ptr, shape, strides, options);
+        };
         return std::make_tuple(
-            view(buffer, b.dispatch_data, torch::kInt8, {num_max_tokens_per_rank, hidden}),
-            view(buffer, {b.staging_scales[0].offset, 2 * b.staging_scales[0].bytes}, torch::kFloat32,
+            make_tensor(torch::kInt8, b.dispatch_data, {num_max_tokens_per_rank, hidden}),
+            make_tensor(torch::kFloat32, {b.staging_scales[0].offset, 2 * b.staging_scales[0].bytes},
                  {2, 1, num_ranks, num_max_tokens_per_rank},
                  {b.staging.scales / int64_t(sizeof(float)),
                   int64_t(num_ranks) * num_max_tokens_per_rank, num_max_tokens_per_rank, 1}),
-            view(buffer, b.topk_idx, torch::kInt64, {num_max_tokens_per_rank, num_topk}),
-            view(buffer, b.topk_weights, torch::kFloat32, {num_max_tokens_per_rank, num_topk}),
-            view(buffer, b.local_data, torch::kInt8, {b.compact, hidden}),
-            view(buffer, b.local_sfa, torch::kFloat32, {b.compact}),
-            view(buffer, b.stage1_data, torch::kInt8, {b.compact, intermediate_hidden}),
-            view(buffer, b.stage1_scale_storage, torch::kFloat32, {b.compact}));
+            make_tensor(torch::kInt64, b.topk_idx, {num_max_tokens_per_rank, num_topk}),
+            make_tensor(torch::kFloat32, b.topk_weights, {num_max_tokens_per_rank, num_topk}),
+            make_tensor(torch::kInt8, b.local_data, {b.compact, hidden}),
+            make_tensor(torch::kFloat32, b.local_sfa, {b.compact}),
+            make_tensor(torch::kInt8, b.stage1_data, {b.compact, intermediate_hidden}),
+            make_tensor(torch::kFloat32, b.stage1_scale_storage, {b.compact}));
     };
     using Views = decltype(slice(std::declval<const torch::Tensor&>()));
-    return std::make_tuple(b.bytes, std::function<Views(const torch::Tensor&)>(slice));
+    return std::make_tuple(b.get_num_bytes(), std::function<Views(const torch::Tensor&)>(slice));
 }
 
 static void quant(const torch::Tensor& x, const torch::Tensor& ids, const torch::Tensor& weights,
@@ -85,8 +91,8 @@ static void quant(const torch::Tensor& x, const torch::Tensor& ids, const torch:
     TORCH_CHECK(mma_type == "int8xint8", "INT8 MegaMoE requires mma_type=int8xint8");
     TORCH_CHECK(x.dim() == 2 && ids.dim() == 2, "inputs and routing must be 2D");
     const int hidden = x.size(1), topk = ids.size(1);
-    const auto s = check_shape(ranks, experts, capacity, topk, hidden, intermediate, staging_config);
-    check_buffer(sym_buffer, s);
+    const auto b = check_shape(ranks, experts, capacity, topk, hidden, intermediate, staging_config);
+    check_buffer(sym_buffer, b);
     TORCH_CHECK(buffer_ptrs.size() == ranks && rank >= 0 && rank < ranks &&
                 buffer_ptrs[rank] == reinterpret_cast<int64_t>(sym_buffer.data_ptr()),
                 "invalid INT8 MegaMoE peer pointers");
@@ -96,7 +102,7 @@ static void quant(const torch::Tensor& x, const torch::Tensor& ids, const torch:
                 "topk_ids must be int32 or int64");
     check_tensor(ids, ids.scalar_type(), sym_buffer.device(), {x.size(0), topk}, "topk_ids");
     check_tensor(weights, torch::kFloat32, sym_buffer.device(), {x.size(0), topk}, "topk_weights");
-    int8_mega_moe_quant_impl(s, x, ids, weights, buffer_ptrs, rank);
+    int8_mega_moe_quant_impl(x, ids, weights, buffer_ptrs, rank, ranks, experts, capacity, intermediate, b.staging);
 }
 
 static void int8_int8_mega_moe(
@@ -112,11 +118,7 @@ static void int8_int8_mega_moe(
     const std::optional<float>& activation_clamp_opt, const bool& fast_math,
     const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
     const std::optional<float>& activation_alpha_opt,
-    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& l1_weights_replicas,
-    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& l2_weights_replicas,
     const std::array<int, 3>& staging_config) {
-    TORCH_CHECK(!l1_weights_replicas && !l2_weights_replicas,
-                "INT8 MegaMoE does not support separate replica weight banks");
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
@@ -127,16 +129,17 @@ static void int8_int8_mega_moe(
                 "INT8 MegaMoE requires recipe=(1, 1, 0), where 0 means the full K dimension");
     TORCH_CHECK(l1_weights.dim() == 3 && l2_weights.dim() == 3, "weights must be 3D");
     const int hidden = l2_weights.size(1), intermediate_hidden = l2_weights.size(2);
-    const auto s = check_shape(sym_buffer_ptrs.size(), num_experts, num_max_tokens_per_rank,
+    const auto b = check_shape(sym_buffer_ptrs.size(), num_experts, num_max_tokens_per_rank,
                                num_topk, hidden, intermediate_hidden, staging_config);
-    check_buffer(sym_buffer, s);
-    TORCH_CHECK(rank_idx >= 0 && rank_idx < s.ranks &&
+    check_buffer(sym_buffer, b);
+    const int num_ranks = sym_buffer_ptrs.size();
+    TORCH_CHECK(rank_idx >= 0 && rank_idx < num_ranks &&
                 sym_buffer_ptrs[rank_idx] == reinterpret_cast<int64_t>(sym_buffer.data_ptr()),
                 "invalid INT8 MegaMoE peer pointers");
     TORCH_CHECK(y.dim() == 2 && y.size(0) <= num_max_tokens_per_rank, "invalid output token count");
     const int num_tokens = static_cast<int>(y.size(0));
     check_tensor(y, torch::kBFloat16, sym_buffer.device(), {num_tokens, hidden}, "y");
-    const int num_experts_per_rank = num_experts / s.ranks;
+    const int num_experts_per_rank = num_experts / num_ranks;
     check_tensor(l1_weights, torch::kInt8, sym_buffer.device(),
                  {num_experts_per_rank, 2 * intermediate_hidden, hidden}, "l1_weights");
     check_tensor(l1_weights_sf, torch::kFloat32, sym_buffer.device(),
@@ -168,10 +171,11 @@ static void int8_int8_mega_moe(
             TORCH_CHECK(!activation_alpha_opt, "activation_alpha requires activation=swiglu_oai");
         }
     }
-    const int64_t owner_capacity = int64_t(s.ranks) * num_max_tokens_per_rank;
+    const int64_t owner_capacity = int64_t(num_ranks) * num_max_tokens_per_rank;
     const int em = std::max<int64_t>(1,
         std::min<int64_t>(owner_capacity, int64_t(num_tokens) * num_topk / num_experts_per_rank + 1));
-    int8_int8_mega_moe_impl(s, sym_buffer, sym_buffer_ptrs, rank_idx, y,
+    int8_int8_mega_moe_impl(sym_buffer.data_ptr<uint8_t>(), b, num_max_tokens_per_rank, num_topk,
+        sym_buffer_ptrs, rank_idx, y,
         l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats,
         em, activation_kind, activation_clamp,
         situ_beta_opt.value_or(0), situ_linear_beta_opt.value_or(0), activation_alpha_opt.value_or(1.702f), fast_math);
