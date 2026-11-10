@@ -53,8 +53,7 @@ static auto get_symm_buffer_size_for_int8_mega_moe(
     const int& num_shared_experts = 0,
     const std::array<int, 3>& staging_config = {}) {
     TORCH_CHECK(mma_type == "int8xint8", "INT8 MegaMoE requires mma_type=int8xint8");
-    TORCH_CHECK(activation == "swiglu" || activation == "swiglu_step" || activation == "situ" || activation == "swiglu_oai",
-                "unsupported INT8 MegaMoE activation");
+    mega::parse_gated_activation(activation);
     TORCH_CHECK(num_shared_experts == 0, "MegaMoE shared experts are not supported yet");
     const auto s = check_shape(num_ranks, num_experts, num_max_tokens_per_rank,
                                num_topk, hidden, intermediate_hidden, staging_config);
@@ -111,10 +110,13 @@ static void int8_int8_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::tuple<int, int, int>& recipe, const std::string& activation,
     const std::optional<float>& activation_clamp_opt, const bool& fast_math,
-    const std::optional<int>& expected_m, const std::function<void()>& stage1_done,
     const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
     const std::optional<float>& activation_alpha_opt,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& l1_weights_replicas,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& l2_weights_replicas,
     const std::array<int, 3>& staging_config) {
+    TORCH_CHECK(!l1_weights_replicas && !l2_weights_replicas,
+                "INT8 MegaMoE does not support separate replica weight banks");
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
@@ -148,7 +150,7 @@ static void int8_int8_mega_moe(
                      {num_experts_per_rank}, "cumulative_local_expert_recv_stats");
     const auto activation_clamp = activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     TORCH_CHECK(activation_clamp >= 0, "activation_clamp must be nonnegative");
-    GatedActivation activation_kind;
+    const auto activation_kind = mega::parse_gated_activation(activation);
     if (activation == "situ") {
         TORCH_CHECK(!activation_clamp_opt && situ_beta_opt &&
                     std::isfinite(*situ_beta_opt) && *situ_beta_opt > 0 && !activation_alpha_opt,
@@ -156,27 +158,22 @@ static void int8_int8_mega_moe(
         TORCH_CHECK(!situ_linear_beta_opt ||
                     (std::isfinite(*situ_linear_beta_opt) && *situ_linear_beta_opt > 0),
                     "situ_linear_beta must be positive and finite");
-        activation_kind = GatedActivation::SiTU;
     } else {
         TORCH_CHECK(!situ_beta_opt && !situ_linear_beta_opt, "SiTU parameters require activation=situ");
         if (activation == "swiglu_oai") {
             TORCH_CHECK(!activation_alpha_opt ||
                         (std::isfinite(*activation_alpha_opt) && *activation_alpha_opt > 0),
                         "activation_alpha must be positive and finite");
-            activation_kind = GatedActivation::SwiGLUOAI;
         } else {
             TORCH_CHECK(!activation_alpha_opt, "activation_alpha requires activation=swiglu_oai");
-            TORCH_CHECK(activation == "swiglu" || activation == "swiglu_step", "unsupported INT8 MegaMoE activation");
-            activation_kind = activation == "swiglu" ? GatedActivation::SwiGLU : GatedActivation::SwiGLUStep;
         }
     }
     const int64_t owner_capacity = int64_t(s.ranks) * num_max_tokens_per_rank;
-    const int em = expected_m.value_or(std::max<int64_t>(1,
-        std::min<int64_t>(owner_capacity, int64_t(num_tokens) * num_topk / num_experts_per_rank + 1)));
-    TORCH_CHECK(em >= 1 && em <= owner_capacity, "expected_m is outside the owner capacity");
+    const int em = std::max<int64_t>(1,
+        std::min<int64_t>(owner_capacity, int64_t(num_tokens) * num_topk / num_experts_per_rank + 1));
     int8_int8_mega_moe_impl(s, sym_buffer, sym_buffer_ptrs, rank_idx, y,
         l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats,
-        em, stage1_done, activation_kind, activation_clamp,
+        em, activation_kind, activation_clamp,
         situ_beta_opt.value_or(0), situ_linear_beta_opt.value_or(0), activation_alpha_opt.value_or(1.702f), fast_math);
 }
 

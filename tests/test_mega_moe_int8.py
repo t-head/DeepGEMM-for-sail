@@ -14,6 +14,7 @@ No private test extension or Python JIT is required.
 """
 
 import argparse
+import inspect
 import json
 import os
 import subprocess
@@ -142,6 +143,13 @@ def check_fast_math_policy(group):
 
 
 def run(args):
+    fp4_params = inspect.signature(dg.fp4_fp4_mega_moe).parameters
+    int8_params = inspect.signature(dg.int8_int8_mega_moe).parameters
+    assert list(int8_params) == list(fp4_params), 'public parameter names/order must match MXFP4'
+    for name, param in int8_params.items():
+        assert param.kind == fp4_params[name].kind, name
+        if name != 'recipe':
+            assert param.default == fp4_params[name].default, name
     assert 'DG_USE_MOE_DYNAMIC_TILE' not in os.environ, 'UT must remove DG_USE_MOE_DYNAMIC_TILE'
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -178,7 +186,7 @@ def run(args):
                                     workspace.topk_idx, workspace.topk_weights, len(x))
         dg.int8_int8_mega_moe(output[:workspace.num_max_tokens_per_rank], *weights, workspace,
                             cumulative_local_expert_recv_stats=stats,
-                            expected_m=args.expected_m if workspace is buffer else None, **activation)
+                            l1_weights_replicas=None, l2_weights_replicas=None, **activation)
 
     stats = torch.full((experts // ranks,), 7, dtype=torch.int32, device='cuda')
     expected_stats = stats.clone()
@@ -323,8 +331,9 @@ def run(args):
         group, experts, capacity, 33, hidden, intermediate))
     expect_error(lambda: dg.get_symm_buffer_for_int8_mega_moe(
         group, experts, capacity, args.topk, 512, intermediate))
-    expect_error(lambda: dg.int8_int8_mega_moe(y[:alias.num_max_tokens_per_rank], *weights, alias,
-                                               expected_m=ranks * alias.num_max_tokens_per_rank + 1))
+    expect_error(lambda: dg.int8_int8_mega_moe(y, *weights, buffer, expected_m=1))
+    expect_error(lambda: dg.int8_int8_mega_moe(y, *weights, buffer,
+                                             l1_weights_replicas=weights[0], l2_weights_replicas=weights[1]))
     expect_error(lambda: dg.int8_int8_mega_moe(y, *weights, buffer, activation_clamp=-1.))
     expect_error(lambda: dg.int8_int8_mega_moe(y, *weights, buffer, situ_beta=1.5))
     expect_error(lambda: dg.int8_int8_mega_moe(y, *weights, buffer, situ_linear_beta=2.))
@@ -375,7 +384,6 @@ if __name__ == '__main__':
     parser.add_argument('--experts', type=int)
     parser.add_argument('--topk', type=int, default=4)
     parser.add_argument('--index-dtype', choices=('int32', 'int64'), default='int32')
-    parser.add_argument('--expected-m', type=int, help='Override the GEMM scheduling hint for the requested buffer (aliases use their default)')
     parser.add_argument('--continuous-iters', type=int, default=0,
                         help='Enqueue this many forwards at the largest token count before checking the output')
     parser.add_argument('--activations', action='store_true')

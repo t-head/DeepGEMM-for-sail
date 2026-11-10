@@ -222,9 +222,10 @@ struct Int8ScatterParams : INT8GemmCutlass3Runtime::GemmKernelParamsT<Int8Scatte
     layout::MegaMoESignals* signals = nullptr;
 };
 
-template <bool kIsLinear1, int Ranks>
-class Int8MegaMoEGemmRuntime final : public LaunchRuntime<Int8MegaMoEGemmRuntime<kIsLinear1, Ranks>> {
+template <MegaMoEPhaseKind Stage, int Ranks>
+class GemmRuntime final : public LaunchRuntime<GemmRuntime<Stage, Ranks>> {
 public:
+    static constexpr bool kIsLinear1 = Stage == MegaMoEPhaseKind::Linear1;
     static constexpr auto kName = kIsLinear1 ? "megamoe_int8_gemm1" : "megamoe_int8_scatter";
     static constexpr auto kReduceName = "megamoe_int8_reduce";
     static constexpr int kRanks = Ranks;
@@ -232,8 +233,9 @@ public:
         INT8GemmCutlass3Runtime::GemmKernelParamsT<Int8GatedEpilogueParams,
                                                 sched::Int8MegaMoESchedulerArguments>,
         Int8ScatterParams<Ranks>>;
+    using Config = std::conditional_t<kIsLinear1, MegaMoEStage1Config, MegaMoEStageConfig>;
     struct Args {
-        MegaMoEStage1Config tile;
+        Config tile;
         int hidden, intermediate, groups, capacity, topk;
         LaunchArgs launch_args;
         Params kernel_params{};
@@ -263,14 +265,17 @@ public:
         const bool wait_scatter_pair = !kIsLinear1 && Ranks == 16 && c.block_n == 256 &&
             device_runtime->get_arch_pair() == std::make_pair(8, 0) &&
             get_env<std::string>("DG_MEGAMOE_SM80_EP16_SCATTER_WAIT") == "1";
-        const std::string linear = kIsLinear1
-            ? fmt::format("deep_gemm::MegaMoEInt8Linear1<cutlass::arch::{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},cutlass::bfloat16_t,true,{},{},{}u{}>",
+        std::string linear;
+        if constexpr (kIsLinear1) {
+            linear = fmt::format("deep_gemm::MegaMoEInt8Linear1<cutlass::arch::{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},cutlass::bfloat16_t,true,{},{},{}u{}>",
                 arch, a.intermediate * 2, a.hidden, c.block_m, c.block_n, c.block_k,
                 c.warp_m, c.warp_n, c.num_stages, a.groups, Ranks, a.capacity, a.topk,
-                c.copy_blocks, c.k_tiles_per_flag, a.normal_quantization, a.apply_clamp, a.activation_limit_bits, activation_suffix)
-            : fmt::format("deep_gemm::MegaMoEInt8Linear2<cutlass::arch::{},{},{},{},{},{},{},{},{},{},{},{},{},{}>",
+                c.copy_blocks, c.k_tiles_per_flag, a.normal_quantization, a.apply_clamp, a.activation_limit_bits, activation_suffix);
+        } else {
+            linear = fmt::format("deep_gemm::MegaMoEInt8Linear2<cutlass::arch::{},{},{},{},{},{},{},{},{},{},{},{},{},{}>",
                 arch, a.hidden, a.intermediate, c.block_m, c.block_n, c.block_k,
                 c.warp_m, c.warp_n, c.num_stages, a.groups, Ranks, a.capacity, a.topk, wait_scatter_pair);
+        }
         const bool reduce_only = a.split_sync && std::strcmp(a.kernel_name, kReduceName) == 0;
         const std::string execute = kIsLinear1 ? "Kernel{}(params, smem);" : reduce_only ? fmt::format(
             "deep_gemm::mega_moe_int8_reduce_impl<Kernel,{},{},{},{},{}>(params, ids, weights, output, tokens, params.signals->scatter_writer_mask);",
@@ -375,7 +380,7 @@ extern "C" __global__ __launch_bounds__({}) void megamoe_int8_dispatch_copy(
 };
 
 template <typename Runtime>
-static void launch_int8_mega_gemm(typename Runtime::Args& args, int num_sms) {
+static void launch_gemm(typename Runtime::Args& args, int num_sms) {
     auto runtime = compiler->build(args.kernel_name, Runtime::generate(args));
     const int blocks = get_kernel_occupancy(runtime, args.launch_args.block_dim.x, args.launch_args.smem_size);
     args.launch_args.grid_dim.x = num_sms * blocks;
@@ -479,6 +484,127 @@ static void launch_int8_split_stage1(typename Runtime::Args& args, int num_sms) 
     }
 }
 
+static auto make_packed_stride(int m, int n) {
+    using Stride = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+    return cutlass::make_cute_packed_stride(Stride{}, cute::make_shape(m, n, 1));
+}
+
+static LaunchArgs make_launch_args(const MegaMoEStageConfig& config, bool scatter) {
+    const int smem = config.num_stages * (config.block_m + config.block_n) * config.block_k;
+    const int epilogue = scatter
+        ? 2 * (config.block_m / config.warp_m) * 16 * config.block_n * int(sizeof(float)) : 0;
+    return {dim3(1), dim3((config.block_m / config.warp_m) * (config.block_n / config.warp_n) * 32),
+            std::max(smem, epilogue)};
+}
+
+template <int Ranks>
+static auto make_linear1_args(
+        const torch::Tensor& activated, const std::tuple<torch::Tensor, torch::Tensor>& w1,
+        const layout::Int8MegaMoEBuffer& buffers, uint8_t* base, const layout::SymBuffer<>& symmetric,
+        int capacity, int topk, const MegaMoEStage1Config& config, int num_sms,
+        GatedActivation activation, float limit, bool normal_quantization,
+        float beta, float linear_beta, float alpha, bool fast_math,
+        int32_t* cumulative_local_expert_recv_stats) {
+    using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks>;
+    const auto& [weight, scale] = w1;
+    const int hidden = weight.size(2), intermediate = activated.size(1), groups = weight.size(0);
+    typename Runtime::Args args{config, hidden, intermediate, groups, capacity, topk,
+                                make_launch_args(config, false)};
+    args.normal_quantization = normal_quantization;
+    args.apply_clamp = std::isfinite(limit);
+    args.activation = activation;
+    args.fast_math = fast_math;
+    if (activation != GatedActivation::SwiGLU) {
+        std::memcpy(&args.beta_bits, &beta, sizeof(beta));
+        std::memcpy(&args.linear_beta_bits, &linear_beta, sizeof(linear_beta));
+        std::memcpy(&args.alpha_bits, &alpha, sizeof(alpha));
+    }
+    // Preserve the finite-clamp specialization and its split-plan cache key.
+    if (args.apply_clamp && !is_ppu1v5_device())
+        std::memcpy(&args.activation_limit_bits, &limit, sizeof(limit));
+    auto& params = args.kernel_params;
+    params.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+    params.problem_shape = {Ranks * capacity, intermediate * 2, hidden, 1};
+    params.collective_mainloop_params = {
+        buffers.local_data.data(base), make_packed_stride(Ranks * capacity, hidden),
+        weight.data_ptr(), make_packed_stride(intermediate * 2, hidden),
+        buffers.local_sfa.data<float>(base), scale.data_ptr<float>()};
+    auto* out = reinterpret_cast<cutlass::bfloat16_t*>(activated.data_ptr());
+    static_cast<INT8GemmCutlass3Runtime::EpilogueParamNoTsm&>(params.collective_epilogue_params) = {
+        {}, out, make_packed_stride(Ranks * capacity, intermediate),
+        out, make_packed_stride(Ranks * capacity, intermediate)};
+    params.collective_epilogue_params.activation_limit = limit;
+    params.hw_info = {weight.get_device(), num_sms};
+    params.scheduler = sched::make_int8_mega_moe_scheduler(buffers, base, Ranks * capacity);
+    params.scheduler.sym_buffer = symmetric;
+    params.scheduler.local_source_rank = symmetric.rank_idx;
+    params.scheduler.cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats;
+    params.scheduler.num_copy_blocks = config.copy_blocks;
+    return args;
+}
+
+template <int Ranks>
+static void launch_linear1(
+        typename GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks>::Args& args,
+        const torch::Tensor& activated, const layout::Int8MegaMoEBuffer& buffers,
+        uint8_t* base, int num_tokens, int num_sms) {
+    if (args.split_sync)
+        mega_moe_common::launch_sync("mega_moe_dispatch_sync", Ranks,
+            reinterpret_cast<layout::MegaMoESignals*>(base));
+    launch_int8_split_stage1<GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks>>(args, num_sms);
+
+    Int8MegaMoEQuantRuntime::Args quantization{
+        args.intermediate, args.normal_quantization, int64_t(num_tokens) * args.topk,
+        {dim3(num_sms * 4), dim3(256), 0}, activated.data_ptr(),
+        buffers.stage1_data.data<int8_t>(base), buffers.stage1_scale_storage.data<float>(base),
+        buffers.expert_base.data<uint32_t>(base) + args.groups};
+    auto kernel = compiler->build("megamoe_int8_quant", Int8MegaMoEQuantRuntime::generate(quantization));
+    const int vector_grid = device_runtime->get_prop()->multiProcessorCount * 4;
+    if (device_runtime->get_arch_pair() == std::make_pair(8, 0) &&
+        vector_grid > quantization.launch_args.grid_dim.x &&
+        quantization.expected_rows >= int64_t(vector_grid) * (quantization.launch_args.block_dim.x / 32))
+        quantization.launch_args.grid_dim.x = vector_grid;
+    Int8MegaMoEQuantRuntime::launch(kernel, quantization);
+}
+
+template <int Ranks>
+static auto make_linear2_args(
+        const std::tuple<torch::Tensor, torch::Tensor>& w2, const layout::Int8MegaMoEBuffer& buffers,
+        uint8_t* base, const std::vector<int64_t>& pointers, int rank, int capacity, int topk,
+        int* masked_m, const MegaMoEStageConfig& config, int num_sms) {
+    using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear2, Ranks>;
+    const auto& [weight, scale] = w2;
+    const int hidden = weight.size(1), intermediate = weight.size(2), groups = weight.size(0);
+    typename Runtime::Args args{config, hidden, intermediate, groups, capacity, topk,
+                                make_launch_args(config, true)};
+    auto& params = args.kernel_params;
+    params.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+    params.problem_shape = {static_cast<int>(buffers.compact), hidden, intermediate, 1};
+    params.collective_mainloop_params = {
+        buffers.stage1_data.data(base), make_packed_stride(buffers.compact, intermediate),
+        weight.data_ptr(), make_packed_stride(hidden, intermediate),
+        buffers.stage1_scale_storage.data<float>(base), scale.data_ptr<float>()};
+    params.collective_epilogue_params = {
+        {}, buffers.src_info.data(base), masked_m, static_cast<uint32_t>(capacity)};
+    params.hw_info = {weight.get_device(), num_sms};
+    params.scheduler = TileSchedulerArguments(buffers.compact, masked_m);
+    params.scatter_buffer = layout::SymBuffer<Ranks>(pointers, rank);
+    params.scatter_buffer.base += buffers.scatter_storage.offset;
+    params.signals = reinterpret_cast<layout::MegaMoESignals*>(base);
+    return args;
+}
+
+template <int Ranks>
+static void launch_linear2(typename GemmRuntime<MegaMoEPhaseKind::Linear2, Ranks>::Args& args, int num_sms) {
+    using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear2, Ranks>;
+    launch_gemm<Runtime>(args, num_sms);
+    if (args.split_sync) {
+        mega_moe_common::launch_sync("mega_moe_scatter_sync", Ranks, args.kernel_params.signals);
+        args.kernel_name = Runtime::kReduceName;
+        launch_gemm<Runtime>(args, num_sms);
+    }
+}
+
 template <int Ranks>
 static void int8_mega_moe_impl(
         const torch::Tensor& y, const torch::Tensor& activated,
@@ -486,108 +612,32 @@ static void int8_mega_moe_impl(
         const std::tuple<torch::Tensor, torch::Tensor>& w2,
         const torch::Tensor& buffer, const std::vector<int64_t>& pointers,
         int rank, int capacity, int topk, int expected_m, float limit, bool normal_quantization,
-        const std::function<void()>& stage1_done, GatedActivation activation_kind = GatedActivation::SwiGLU,
+        GatedActivation activation = GatedActivation::SwiGLU,
         float beta = 0, float linear_beta = 0, float alpha = 1.702f,
         layout::MegaMoEStaging staging = {}, int32_t* cumulative_local_expert_recv_stats = nullptr,
         bool fast_math = true) {
-    const auto& [l1_weights, l1_weights_sf] = w1;
-    const auto& [l2_weights, l2_weights_sf] = w2;
-    const int hidden = l1_weights.size(2), intermediate = l2_weights.size(2), groups = l1_weights.size(0);
-    const int num_sms = device_runtime->get_num_sms();
-    const bool split_sync = get_env<int>("DG_MEGAMOE_SPLIT_SYNC", 0) != 0;
-    auto config = select_int8_mega_moe({num_sms, Ranks, groups, capacity, hidden, intermediate, expected_m},
-                                    get_env<int>("DG_MEGAMOE_COPY_THREADS", 0), normal_quantization);
+    const int hidden = std::get<0>(w1).size(2), intermediate = std::get<0>(w2).size(2);
+    const int groups = std::get<0>(w1).size(0), num_sms = device_runtime->get_num_sms();
+    const auto config = select_int8_mega_moe({num_sms, Ranks, groups, capacity, hidden, intermediate, expected_m},
+        get_env<int>("DG_MEGAMOE_COPY_THREADS", 0), normal_quantization);
     const layout::Int8MegaMoEBuffer buffers(Ranks, groups * Ranks, capacity, topk, hidden, intermediate, staging);
-    layout::SymBuffer<> symmetric(pointers, rank);
     auto* base = buffer.data_ptr<uint8_t>();
-    auto* signals = reinterpret_cast<layout::MegaMoESignals*>(base);
-    using S = cute::Stride<int64_t, cute::Int<1>, int64_t>;
-    auto stride = [](int m, int n) {
-        return cutlass::make_cute_packed_stride(S{}, cute::make_shape(m, n, 1));
-    };
-    auto launch_args = [](const MegaMoEStageConfig& c, bool scatter) {
-        const int smem = c.num_stages * (c.block_m + c.block_n) * c.block_k;
-        const int epilogue = scatter ? 2 * (c.block_m / c.warp_m) * 16 * c.block_n * int(sizeof(float)) : 0;
-        return LaunchArgs{dim3(1), dim3((c.block_m / c.warp_m) * (c.block_n / c.warp_n) * 32),
-                          std::max(smem, epilogue)};
-    };
-    using Linear1Runtime = Int8MegaMoEGemmRuntime<true, Ranks>;
-    typename Linear1Runtime::Args l1_args{config.l1, hidden, intermediate, groups, capacity, topk, launch_args(config.l1, false)};
-    l1_args.normal_quantization = normal_quantization;
-    l1_args.apply_clamp = std::isfinite(limit);
-    l1_args.activation = activation_kind;
-    l1_args.fast_math = fast_math;
+    const bool split_sync = get_env<int>("DG_MEGAMOE_SPLIT_SYNC", 0) != 0;
+
+    auto l1_args = make_linear1_args<Ranks>(activated, w1, buffers, base, layout::SymBuffer<>(pointers, rank),
+        capacity, topk, config.l1, num_sms, activation, limit, normal_quantization,
+        beta, linear_beta, alpha, fast_math, cumulative_local_expert_recv_stats);
     l1_args.split_sync = split_sync;
-    if (activation_kind != GatedActivation::SwiGLU) {
-        std::memcpy(&l1_args.beta_bits, &beta, sizeof(beta));
-        std::memcpy(&l1_args.linear_beta_bits, &linear_beta, sizeof(linear_beta));
-        std::memcpy(&l1_args.alpha_bits, &alpha, sizeof(alpha));
-    }
-    // Compile the actual finite FP32 limit, and include its bits in the plan
-    // key so changing the limit on the same buffer cannot reuse a stale kernel.
-    if (l1_args.apply_clamp && !is_ppu1v5_device())
-        std::memcpy(&l1_args.activation_limit_bits, &limit, sizeof(limit));
-    auto& l1_params = l1_args.kernel_params;
-    l1_params.mode = cutlass::gemm::GemmUniversalMode::kGemm;
-    l1_params.problem_shape = {Ranks * capacity, intermediate * 2, hidden, 1};
-    l1_params.collective_mainloop_params = {buffers.local_data.data(base), stride(Ranks * capacity, hidden),
-        l1_weights.data_ptr(), stride(intermediate * 2, hidden), buffers.local_sfa.data<float>(base), l1_weights_sf.data_ptr<float>()};
-    auto* out = reinterpret_cast<cutlass::bfloat16_t*>(activated.data_ptr());
-    static_cast<INT8GemmCutlass3Runtime::EpilogueParamNoTsm&>(l1_params.collective_epilogue_params) = {
-        {}, out, stride(Ranks * capacity, intermediate), out, stride(Ranks * capacity, intermediate)};
-    l1_params.collective_epilogue_params.activation_limit = limit;
-    l1_params.hw_info = {l1_weights.get_device(), num_sms};
-    l1_params.scheduler = sched::make_int8_mega_moe_scheduler(buffers, base, Ranks * capacity);
-    l1_params.scheduler.sym_buffer = symmetric;
-    l1_params.scheduler.local_source_rank = rank;
-    l1_params.scheduler.cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats;
-    l1_params.scheduler.num_copy_blocks = config.l1.copy_blocks;
-    if (split_sync) mega_moe_common::launch_sync("mega_moe_dispatch_sync", Ranks, signals);
-    launch_int8_split_stage1<Linear1Runtime>(l1_args, num_sms);
+    launch_linear1<Ranks>(l1_args, activated, buffers, base, y.size(0), num_sms);
 
-    Int8MegaMoEQuantRuntime::Args quantization{
-        intermediate, normal_quantization, y.size(0) * topk,
-        {dim3(num_sms * 4), dim3(256), 0}, activated.data_ptr(),
-        buffers.stage1_data.data<int8_t>(base), buffers.stage1_scale_storage.data<float>(base),
-        buffers.expert_base.data<uint32_t>(base) + groups};
-    auto quantization_kernel = compiler->build("megamoe_int8_quant",
-        Int8MegaMoEQuantRuntime::generate(quantization));
-    // Large row quantization can use the full vector-CU budget. Keep small
-    // launches and the generated row-quantization strategy unchanged.
-    const int vector_grid = device_runtime->get_prop()->multiProcessorCount * 4;
-    if (device_runtime->get_arch_pair() == std::make_pair(8, 0) &&
-        vector_grid > quantization.launch_args.grid_dim.x &&
-        quantization.expected_rows >= int64_t(vector_grid) * (quantization.launch_args.block_dim.x / 32))
-        quantization.launch_args.grid_dim.x = vector_grid;
-    Int8MegaMoEQuantRuntime::launch(quantization_kernel, quantization);
-    if (stage1_done) stage1_done();
-
-    using Linear2Runtime = Int8MegaMoEGemmRuntime<false, Ranks>;
-    MegaMoEStage1Config l2_config{config.l2, 0, 0};
-    typename Linear2Runtime::Args l2_args{l2_config, hidden, intermediate, groups, capacity, topk, launch_args(config.l2, true)};
-    auto& l2_params = l2_args.kernel_params;
-    l2_params.mode = cutlass::gemm::GemmUniversalMode::kGemm;
-    l2_params.problem_shape = {static_cast<int>(buffers.compact), hidden, intermediate, 1};
-    l2_params.collective_mainloop_params = {buffers.stage1_data.data(base), stride(buffers.compact, intermediate),
-        l2_weights.data_ptr(), stride(hidden, intermediate), buffers.stage1_scale_storage.data<float>(base), l2_weights_sf.data_ptr<float>()};
-    auto* masked_m = l1_params.scheduler.grouped_layout;
-    l2_params.collective_epilogue_params = {{}, buffers.src_info.data(base), masked_m, static_cast<uint32_t>(capacity)};
-    l2_params.hw_info = {l2_weights.get_device(), num_sms};
-    l2_params.scheduler = TileSchedulerArguments(buffers.compact, masked_m);
-    l2_params.scatter_buffer = layout::SymBuffer<Ranks>(pointers, rank);
-    l2_params.scatter_buffer.base += buffers.scatter_storage.offset;
-    l2_params.signals = signals;
+    auto l2_args = make_linear2_args<Ranks>(w2, buffers, base, pointers, rank, capacity, topk,
+        l1_args.kernel_params.scheduler.grouped_layout, config.l2, num_sms);
     l2_args.reduce_ids = buffers.topk_idx.data<int64_t>(base);
     l2_args.reduce_weights = buffers.topk_weights.data<float>(base);
     l2_args.reduce_output = y.data_ptr();
     l2_args.tokens = y.size(0);
     l2_args.split_sync = split_sync;
-    launch_int8_mega_gemm<Linear2Runtime>(l2_args, num_sms);
-    if (split_sync) {
-        mega_moe_common::launch_sync("mega_moe_scatter_sync", Ranks, signals);
-        l2_args.kernel_name = Linear2Runtime::kReduceName;
-        launch_int8_mega_gemm<Linear2Runtime>(l2_args, num_sms);
-    }
+    launch_linear2<Ranks>(l2_args, num_sms);
 }
 
 
@@ -634,13 +684,13 @@ static void int8_int8_mega_moe_impl(const Shape& s, const torch::Tensor& buffer,
         const std::tuple<torch::Tensor, torch::Tensor>& w1,
         const std::tuple<torch::Tensor, torch::Tensor>& w2,
         const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
-        int expected_m, const std::function<void()>& stage1_done,
+        int expected_m,
         GatedActivation activation, float limit, float beta, float linear_beta, float alpha, bool fast_math) {
     const auto b = s.layout();
     const auto activated = view(buffer, b.activated, torch::kBFloat16, {b.compact, s.intermediate});
     mega_int8::for_ranks(s.ranks, [&](auto r) {
         mega_int8::int8_mega_moe_impl<decltype(r)::value>(y, activated, w1, w2, buffer, pointers,
-            rank, s.capacity, s.topk, expected_m, limit, false, stage1_done,
+            rank, s.capacity, s.topk, expected_m, limit, false,
             activation, beta, linear_beta, alpha, s.staging,
             cumulative_local_expert_recv_stats ? cumulative_local_expert_recv_stats->data_ptr<int32_t>() : nullptr,
             fast_math);

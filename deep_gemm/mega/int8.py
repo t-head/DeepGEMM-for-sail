@@ -12,6 +12,7 @@ import torch.distributed as dist
 
 from .. import _C
 from ..utils.math import align
+from . import _normalize_activation
 
 
 def _get_buffer_staging(base, buffer_type, group, shape):
@@ -140,8 +141,7 @@ def transform_weights_for_int8_mega_moe(
     are interleaved in groups of four on SM80; L2 is unchanged.
     Reuse the returned pairs for compute; do not transform them twice.
     """
-    if activation not in ('swiglu', 'swiglu_step', 'situ', 'swiglu_oai'):
-        raise ValueError('unsupported INT8 MegaMoE activation')
+    _normalize_activation(activation)
     for name, pair in (('l1_weights', l1_weights), ('l2_weights', l2_weights)):
         if (not isinstance(pair, (tuple, list)) or len(pair) != 2 or
                 not all(isinstance(t, torch.Tensor) for t in pair)):
@@ -204,7 +204,9 @@ def int8_int8_mega_moe(
     activation: str = "swiglu",
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
-    expected_m: Optional[int] = None,
+    *,
+    l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     situ_beta: Optional[float] = 4.0,
     situ_linear_beta: Optional[float] = 25.0,
     activation_alpha: Optional[float] = None,
@@ -234,7 +236,8 @@ def int8_int8_mega_moe(
     denoting the full K dimension of each GEMM (H for L1, I for L2).
     y is contiguous BF16 [C,H], T <= C <= token capacity; unused rows produce
     zeros. Retain inputs, weights, output and buffer until asynchronous execution
-    and captured Graphs retire.
+    and captured Graphs retire. Separate replica weight banks are not supported;
+    both replica arguments must be None. The expected-M estimate is internal.
     cumulative_local_expert_recv_stats is an optional
     contiguous CUDA int32 vector of local-expert counts, incremented once per
     valid route on every call, including routes with zero weight. Initialize
@@ -242,6 +245,9 @@ def int8_int8_mega_moe(
     """
     if not isinstance(sym_buffer, Int8SymmBuffer) or sym_buffer.buffer is None:
         raise ValueError("a live Int8SymmBuffer is required")
+    activation = _normalize_activation(activation)
+    if l1_weights_replicas is not None or l2_weights_replicas is not None:
+        raise ValueError("INT8 MegaMoE does not support separate replica weight banks")
     # C++ infers dimensions from weights; reject a differently shaped buffer before entering it.
     groups = sym_buffer.num_experts // sym_buffer.group.size()
     for pair, shape in ((l1_weights, (groups, 2 * sym_buffer.intermediate_hidden, sym_buffer.hidden)),
@@ -257,6 +263,6 @@ def int8_int8_mega_moe(
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         tuple(recipe), activation, activation_clamp, fast_math,
-        expected_m,
-        getattr(sym_buffer, "_stage1_done", None), situ_beta, situ_linear_beta, activation_alpha,
+        situ_beta, situ_linear_beta, activation_alpha,
+        l1_weights_replicas, l2_weights_replicas,
         sym_buffer.staging_config)
