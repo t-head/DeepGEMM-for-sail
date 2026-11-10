@@ -12,7 +12,7 @@ try:
 except:
     from deep_gemm import get_mn_major_tma_aligned_tensor
     from deep_gemm.testing import bench_kineto
-from deep_gemm.testing import get_arch_major, bench
+from deep_gemm.testing import get_arch_major
 
 import deep_gemm
 import random
@@ -1394,6 +1394,25 @@ def gemm_assert_exact(actual, expected):
     torch.testing.assert_close(actual, expected.to(actual.dtype), rtol=0, atol=0)
 
 
+def gemm_bench_cold(call, num_tests=30):
+    """Time complete API calls with the ordinary benchmark's 8 GB L2 flush."""
+    call()  # Finish JIT before warm-up or measurement.
+    cache = torch.empty(int(8e9 // 4), dtype=torch.int, device='cuda')
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    for _ in range(num_tests):
+        cache.zero_()
+        call()
+    torch.cuda.synchronize()
+    for start, end in zip(starts, ends):
+        cache.zero_()  # Stream ordering keeps the flush outside the timed call.
+        start.record()
+        call()
+        end.record()
+    torch.cuda.synchronize()
+    return sum(start.elapsed_time(end) for start, end in zip(starts, ends)) / num_tests / 1e3
+
+
 def gemm_call_with_sms(args, call):
     previous = deep_gemm.get_num_sms()
     env = {}
@@ -1618,9 +1637,9 @@ def test_dense_gemm_api(args):
     if benchmarking:
         # Time the complete call, including every split-K/hybrid kernel. Keep
         # the requested budget/environment active throughout warm-up and timing.
-        seconds = gemm_call_with_sms(args, lambda: bench(invoke))
+        seconds = gemm_call_with_sms(args, lambda: gemm_bench_cold(invoke))
         print(f' > Performance (dtype={dtype}, m={m}, n={n}, k={k}): '
-              f'{seconds * 1e6:.3f} us API latency | '
+              f'{seconds * 1e6:.3f} us cold-cache API latency | '
               f'{2 * m * n * k / seconds / 1e12:.4f} TFLOPS')
     print('Passed with acc_check' if check else 'Passed without acc_check')
 
@@ -1690,7 +1709,25 @@ def test_native_batch_gemm(args):
         out = storage.as_strided((batch, m, n), strides)
     if args.get('shared_storage'):
         # Keep A and padded/interleaved D in one allocation, including guards.
-        if args['shared_storage'] in ('interleaved_disjoint', 'interleaved_overlap'):
+        if args['shared_storage'] == 'dlpack_overlap':
+            if a.shape != out.shape:
+                raise ValueError('DLPack overlap regression requires N=K')
+            backing = a
+            shared_a = torch.utils.dlpack.from_dlpack(a)
+            out = torch.utils.dlpack.from_dlpack(a)
+            assert shared_a.untyped_storage()._cdata != out.untyped_storage()._cdata
+            assert shared_a.data_ptr() == out.data_ptr()
+        elif args['shared_storage'] == 'strided':
+            offset = args.get('out_offset', 0)
+            if offset < 0:
+                raise ValueError('Shared output offset must be nonnegative')
+            a_span = 1 + sum((dim - 1) * stride for dim, stride in zip(a.shape, a.stride()))
+            d_span = 1 + sum((dim - 1) * stride for dim, stride in zip(out.shape, out.stride()))
+            backing = torch.full((max(a_span, offset + d_span) + 64,), -123.,
+                                 device='cuda', dtype=torch.bfloat16)
+            shared_a = backing.as_strided(a.shape, a.stride())
+            out = backing.as_strided(out.shape, out.stride(), offset)
+        elif args['shared_storage'] in ('interleaved_disjoint', 'interleaved_overlap'):
             pitch = k + n
             strides = (m * pitch, pitch, 1)
             offset = k - int(args['shared_storage'] == 'interleaved_overlap')

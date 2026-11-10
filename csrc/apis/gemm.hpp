@@ -3,7 +3,7 @@
 #include "../utils/compatibility.hpp"
 #include "../utils/layout.hpp"
 #include <torch/extension.h>
-#include <ATen/MemoryOverlap.h>
+#include <limits>
 #include <algorithm>
 #include <numeric>
 #include <vector>
@@ -39,8 +39,7 @@ using NVFP4Weight = nvfp4::Weight;
 using NVFP4ExecutionConfig = nvfp4::ExecutionConfig;
 
 static bool gemm_disjoint(const torch::Tensor& a, const torch::Tensor& b) {
-    if (!a.numel() || !b.numel() || !a.is_alias_of(b) ||
-        at::get_overlap_status(a, b) == at::MemOverlapStatus::No) return true;
+    if (!a.numel() || !b.numel() || a.device() != b.device()) return true;
     // Disjoint bounding ranges are cheap to prove, but intersecting ranges
     // may contain interleaved rows that share no bytes.
     const auto range = [](const torch::Tensor& t) -> std::optional<std::pair<size_t, size_t>> {
@@ -53,7 +52,12 @@ static bool gemm_disjoint(const torch::Tensor& a, const torch::Tensor& b) {
             if (stride && count > (limit - 1 - last) / stride) return std::nullopt;
             last += count * stride;
         }
-        return std::make_pair(size_t(t.storage_offset()) * bytes, (last + 1) * bytes);
+        // Independently imported DLPack tensors may have distinct Storage
+        // objects wrapping overlapping addresses. Compare absolute byte ranges.
+        const size_t base = reinterpret_cast<uintptr_t>(t.storage().data());
+        const size_t end = (last + 1) * bytes;
+        if (base > std::numeric_limits<size_t>::max() - end) return std::nullopt;
+        return std::make_pair(base + size_t(t.storage_offset()) * bytes, base + end);
     };
     const auto x = range(a), y = range(b);
     if (!x || !y) return false;
@@ -61,6 +65,7 @@ static bool gemm_disjoint(const torch::Tensor& a, const torch::Tensor& b) {
 
     struct Intervals {
         size_t base, span, count = 1, index = 0;
+        bool ordered = true;
         std::vector<std::pair<size_t, size_t>> dims; // byte stride, size
         size_t start(size_t i) const {
             size_t offset = base;
@@ -81,8 +86,8 @@ static bool gemm_disjoint(const torch::Tensor& a, const torch::Tensor& b) {
             index = lo;
         }
     };
-    const auto intervals = [](const torch::Tensor& t) -> std::optional<Intervals> {
-        Intervals result{size_t(t.storage_offset()) * t.element_size(), size_t(t.element_size())};
+    const auto intervals = [](const torch::Tensor& t, size_t base) {
+        Intervals result{base, size_t(t.element_size())};
         std::vector<std::pair<size_t, size_t>> dims;
         for (int dim = 0; dim < t.dim(); ++dim)
             if (t.size(dim) > 1 && t.stride(dim) != 0)
@@ -93,9 +98,8 @@ static bool gemm_disjoint(const torch::Tensor& a, const torch::Tensor& b) {
             if (result.dims.empty() && stride <= result.span) {
                 result.span += (size - 1) * stride;
             } else {
-                // Non-monotone, internally overlapping strided dimensions
-                // cannot be represented by this sorted interval iterator.
-                if (stride < extent) return std::nullopt;
+                // Overlapping runs are fine as long as their starts are sorted.
+                if (stride < extent - result.span) result.ordered = false;
                 result.dims.emplace_back(stride, size);
                 result.count *= size;
             }
@@ -103,22 +107,55 @@ static bool gemm_disjoint(const torch::Tensor& a, const torch::Tensor& b) {
         }
         return result;
     };
-    auto lhs = intervals(a), rhs = intervals(b);
-    if (!lhs || !rhs) return false;
-    // All interval starts have a fixed residue modulo the common stride.
-    // This also handles very large alternating-element or alternating-row views.
-    size_t period = 0;
-    for (const auto& dim : lhs->dims) period = std::gcd(period, dim.first);
-    for (const auto& dim : rhs->dims) period = std::gcd(period, dim.first);
-    if (period) {
-        const size_t l = lhs->base % period, r = rhs->base % period;
-        const size_t delta = r >= l ? r - l : period - (l - r);
-        if (delta >= lhs->span && rhs->span <= period - delta) return true;
+    auto lhs = intervals(a, x->first), rhs = intervals(b, y->first);
+    const auto separated_by_stride = [](const Intervals& l, const Intervals& r) {
+        size_t period = 0;
+        for (const auto& [stride, size] : l.dims)
+            if (size > 1) period = std::gcd(period, stride);
+        for (const auto& [stride, size] : r.dims)
+            if (size > 1) period = std::gcd(period, stride);
+        if (!period) return false;
+        const size_t a = l.base % period, b = r.base % period;
+        const size_t delta = b >= a ? b - a : period - (a - b);
+        return delta >= l.span && r.span <= period - delta;
+    };
+    if (separated_by_stride(lhs, rhs)) return true;
+    if (!lhs.ordered || !rhs.ordered) {
+        // Arbitrary positive strides need not enumerate runs in address order.
+        // Bisect index boxes, prune disjoint bounds/residues, and compare exact
+        // contiguous runs at the leaves. Memory is bounded by recursion depth,
+        // without materializing an address list proportional to tensor size.
+        const auto intersects = [&](auto&& self, const Intervals& l, const Intervals& r) -> bool {
+            size_t le = l.base + l.span, re = r.base + r.span;
+            size_t largest = 0, split_dim = 0;
+            bool split_lhs = true;
+            for (size_t i = 0; i < l.dims.size(); ++i) {
+                const size_t reach = l.dims[i].first * (l.dims[i].second - 1);
+                le += reach;
+                if (reach > largest) { largest = reach; split_dim = i; }
+            }
+            for (size_t i = 0; i < r.dims.size(); ++i) {
+                const size_t reach = r.dims[i].first * (r.dims[i].second - 1);
+                re += reach;
+                if (reach > largest) { largest = reach; split_dim = i; split_lhs = false; }
+            }
+            if (le <= r.base || re <= l.base || separated_by_stride(l, r)) return false;
+            if (!largest) return true;
+            auto part = split_lhs ? l : r;
+            const auto [stride, size] = part.dims[split_dim];
+            const size_t half = size / 2;
+            part.dims[split_dim].second = half;
+            if (split_lhs ? self(self, part, r) : self(self, l, part)) return true;
+            part.base += half * stride;
+            part.dims[split_dim].second = size - half;
+            return split_lhs ? self(self, part, r) : self(self, l, part);
+        };
+        return !intersects(intersects, lhs, rhs);
     }
-    while (lhs->index < lhs->count && rhs->index < rhs->count) {
-        const size_t l = lhs->start(lhs->index), r = rhs->start(rhs->index);
-        if (l + lhs->span <= r) lhs->skip_before(r);
-        else if (r + rhs->span <= l) rhs->skip_before(l);
+    while (lhs.index < lhs.count && rhs.index < rhs.count) {
+        const size_t l = lhs.start(lhs.index), r = rhs.start(rhs.index);
+        if (l + lhs.span <= r) lhs.skip_before(r);
+        else if (r + rhs.span <= l) rhs.skip_before(l);
         else return false;
     }
     return true;
