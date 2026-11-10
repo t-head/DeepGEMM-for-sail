@@ -4,6 +4,9 @@
 #include "../utils/layout.hpp"
 #include <torch/extension.h>
 #include <ATen/MemoryOverlap.h>
+#include <algorithm>
+#include <numeric>
+#include <vector>
 #include "../jit_kernels/impls/epilogue_class.hpp"
 #include "../jit_kernels/impls/fp8_gemm.hpp"
 #include "../jit_kernels/impls/ppuxx_layout.hpp"
@@ -38,9 +41,8 @@ using NVFP4ExecutionConfig = nvfp4::ExecutionConfig;
 static bool gemm_disjoint(const torch::Tensor& a, const torch::Tensor& b) {
     if (!a.numel() || !b.numel() || !a.is_alias_of(b) ||
         at::get_overlap_status(a, b) == at::MemOverlapStatus::No) return true;
-    // TooHard is not proof of overlap. Bound positive-stride views in bytes
-    // relative to their shared storage; holes inside intersecting bounds remain
-    // conservatively rejected. Storage bounds also prevent arithmetic overflow.
+    // Disjoint bounding ranges are cheap to prove, but intersecting ranges
+    // may contain interleaved rows that share no bytes.
     const auto range = [](const torch::Tensor& t) -> std::optional<std::pair<size_t, size_t>> {
         const size_t bytes = t.element_size(), limit = t.storage().nbytes() / bytes;
         if (t.storage_offset() < 0 || size_t(t.storage_offset()) >= limit) return std::nullopt;
@@ -54,7 +56,72 @@ static bool gemm_disjoint(const torch::Tensor& a, const torch::Tensor& b) {
         return std::make_pair(size_t(t.storage_offset()) * bytes, (last + 1) * bytes);
     };
     const auto x = range(a), y = range(b);
-    return x && y && (x->second <= y->first || y->second <= x->first);
+    if (!x || !y) return false;
+    if (x->second <= y->first || y->second <= x->first) return true;
+
+    struct Intervals {
+        size_t base, span, count = 1, index = 0;
+        std::vector<std::pair<size_t, size_t>> dims; // byte stride, size
+        size_t start(size_t i) const {
+            size_t offset = base;
+            for (const auto& [stride, size] : dims) {
+                offset += (i % size) * stride;
+                i /= size;
+            }
+            return offset;
+        }
+        void skip_before(size_t target) {
+            // Skip whole batches/rows without enumerating their elements.
+            size_t lo = index + 1, hi = count;
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo) / 2;
+                if (start(mid) + span <= target) lo = mid + 1;
+                else hi = mid;
+            }
+            index = lo;
+        }
+    };
+    const auto intervals = [](const torch::Tensor& t) -> std::optional<Intervals> {
+        Intervals result{size_t(t.storage_offset()) * t.element_size(), size_t(t.element_size())};
+        std::vector<std::pair<size_t, size_t>> dims;
+        for (int dim = 0; dim < t.dim(); ++dim)
+            if (t.size(dim) > 1 && t.stride(dim) != 0)
+                dims.emplace_back(size_t(t.stride(dim)) * t.element_size(), size_t(t.size(dim)));
+        std::sort(dims.begin(), dims.end());
+        size_t extent = result.span;
+        for (const auto& [stride, size] : dims) {
+            if (result.dims.empty() && stride <= result.span) {
+                result.span += (size - 1) * stride;
+            } else {
+                // Non-monotone, internally overlapping strided dimensions
+                // cannot be represented by this sorted interval iterator.
+                if (stride < extent) return std::nullopt;
+                result.dims.emplace_back(stride, size);
+                result.count *= size;
+            }
+            extent += (size - 1) * stride;
+        }
+        return result;
+    };
+    auto lhs = intervals(a), rhs = intervals(b);
+    if (!lhs || !rhs) return false;
+    // All interval starts have a fixed residue modulo the common stride.
+    // This also handles very large alternating-element or alternating-row views.
+    size_t period = 0;
+    for (const auto& dim : lhs->dims) period = std::gcd(period, dim.first);
+    for (const auto& dim : rhs->dims) period = std::gcd(period, dim.first);
+    if (period) {
+        const size_t l = lhs->base % period, r = rhs->base % period;
+        const size_t delta = r >= l ? r - l : period - (l - r);
+        if (delta >= lhs->span && rhs->span <= period - delta) return true;
+    }
+    while (lhs->index < lhs->count && rhs->index < rhs->count) {
+        const size_t l = lhs->start(lhs->index), r = rhs->start(rhs->index);
+        if (l + lhs->span <= r) lhs->skip_before(r);
+        else if (r + rhs->span <= l) rhs->skip_before(l);
+        else return false;
+    }
+    return true;
 }
 
 static void check_gemm_device_and_output(const torch::Tensor& a, const torch::Tensor& b,

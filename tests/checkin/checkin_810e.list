@@ -105,6 +105,8 @@ HcPrenormGemm,data_type:tf32,m:1024,n:32,k:64
 BatchGemm,data_type:bf16,groups:2,m:65,n:64,k:128,device:810e,b_stride:[16384,256,2],num_sms:20,configs:[1,32,64,32,16,32,2]
 BatchGemm,data_type:bf16,groups:2,m:4096,n:64,k:128,device:810e,b_stride:[0,1,64],num_sms:20
 # Shared allocation does not imply aliasing; actual input/output overlap is rejected.
+BatchGemm,data_type:bf16,groups:2,m:2,n:64,k:64,device:810e,shared_storage:interleaved_disjoint
+BatchGemm,data_type:bf16,groups:2,m:2,n:64,k:64,device:810e,shared_storage:interleaved_overlap,expect_error:input_overlap
 BatchGemm,data_type:bf16,groups:2,m:32,n:64,k:128,device:810e,layout:interleaved_padded,shared_storage:disjoint
 BatchGemm,data_type:bf16,groups:2,m:32,n:64,k:128,device:810e,layout:padded,shared_storage:overlap,expect_error:input_overlap
 
