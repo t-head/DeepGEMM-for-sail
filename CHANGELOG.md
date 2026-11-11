@@ -8,6 +8,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **M890 MegaGate**: `bf16_mega_gate` accepts explicit sigmoid scoring and
+  continues to use sqrtsoftplus by default.
+
 - **M890 NVFP4 W4A8 GEMMs**: adds `gemm_fp8_nvfp4_bf16_nt` and grouped
   nopad, masked and fused-routing variants for FP8 activations and NVFP4
   weights with BF16 output. Callers select fused decoding or per-call

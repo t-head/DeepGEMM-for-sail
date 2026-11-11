@@ -2,6 +2,9 @@
 #include <cstdint>
 
 namespace deep_gemm::layout::mega_gate {
+// JIT feature bits 0-5 describe routing controls. Negative Features means generic routing.
+constexpr int kSigmoidScore = 1 << 6;
+
 constexpr uint32_t BLOCK_K = 64;
 constexpr uint32_t kBlockTokens = 16;
 constexpr uint32_t kExpertAlignment = 128;

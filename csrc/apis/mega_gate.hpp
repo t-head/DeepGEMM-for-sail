@@ -21,7 +21,7 @@ namespace deep_gemm::mega_gate {
  *     num_shared_experts             int
  *     routed_scaling_factor          float
  *     ep_rank                        int
- *     scoring_func                   "sqrtsoftplus"
+ *     scoring_func                   "sqrtsoftplus" (default) or "sigmoid"
  *     mask                           [T] bool | None
  *     bias                           [E] FP32 | None
  *     image_bias                     [E] FP32 | None
@@ -84,7 +84,8 @@ bf16_mega_gate(const torch::Tensor& x,
     DG_HOST_ASSERT(num_topk > 0 and num_topk <= num_routed_experts);
     DG_HOST_ASSERT(ep_rank >= 0);
     DG_HOST_ASSERT(std::isfinite(routed_scaling_factor));
-    DG_HOST_ASSERT(scoring_func == "sqrtsoftplus");
+    const bool use_default_score = scoring_func == "sqrtsoftplus";
+    DG_HOST_ASSERT(use_default_score or scoring_func == "sigmoid");
 
     int effective_num_shared_experts = 0;
     if (use_shared_as_routed) {
@@ -158,7 +159,7 @@ bf16_mega_gate(const torch::Tensor& x,
         .routed_scaling_factor = routed_scaling_factor,
     };
     ppu_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
-                         routing_args, num_tokens, hidden, num_routed_experts, num_topk);
+                         routing_args, num_tokens, hidden, num_routed_experts, num_topk, !use_default_score);
     return {topk_idx, topk_weights};
 }
 

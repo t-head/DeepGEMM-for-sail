@@ -154,7 +154,7 @@ __device__ __forceinline__ void select_records(float (&scores)[Values], float (&
     }
 }
 
-template<int E, int S, int N, int Topk, int Threads, int M>
+template<int E, int S, int N, int Topk, int Threads, int M, bool UseSigmoid=false>
 __device__ __forceinline__ void store_group_candidates(const mega_gate_layout::KernelArgs& a,
         int token_base, int expert_base) {
     using namespace epilogue::mega_gate;
@@ -172,7 +172,7 @@ __device__ __forceinline__ void store_group_candidates(const mega_gate_layout::K
             experts[v] = expert < a.routing.num_routed_experts ? expert : -1;
         }
         device_check(finite);
-        sqrt_softplus(scores);
+        gate_score<UseSigmoid>(scores);
         #pragma unroll
         for (int v = 0; v < Values; ++v) {
             ranks[v] = experts[v] >= 0 ? scores[v] + a.bias[experts[v]] : -INFINITY;
@@ -234,9 +234,12 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
     if constexpr (!(Features & 8)) a.bias = nullptr;
     if constexpr (!(Features & 16)) a.image_token_mask = nullptr, a.image_bias = nullptr;
     if constexpr (!(Features & 32)) a.routing.num_shared_experts = 0;
-    const bool score_for_ranking = Features < 0 ? (a.bias or a.image_token_mask) : bool(Features & 24);
+    constexpr bool UseSigmoid = Features >= 0 and (Features & kSigmoidScore);
+    // Saturated sigmoid scores tie by expert ID even without a routing bias.
+    const bool score_for_ranking = UseSigmoid or (Features < 0 ? (a.bias or a.image_token_mask) : bool(Features & 24));
     const int lane = threadIdx.x % 32, warp = WarpLocal ? 0 : threadIdx.x / 32;
-    constexpr bool PruneCandidates = !PreActivated and !CompactScores and E >= 256 and ((M >= 32 and M > Warps) or (WarpLocal and Topk * 2 <= E / 32)) and Features >= 0 and (Features & 8) and !(Features & 16);
+    // This candidate bound is specific to sqrtsoftplus.
+    constexpr bool PruneCandidates = !UseSigmoid and !PreActivated and !CompactScores and E >= 256 and ((M >= 32 and M > Warps) or (WarpLocal and Topk * 2 <= E / 32)) and Features >= 0 and (Features & 8) and !(Features & 16);
     constexpr bool CacheBias = Features >= 0 and (Features & 8) and !(Features & 16) and (M > Warps or WarpLocal);
     float bias_cache[E / 32];
     if constexpr (CacheBias) {
@@ -326,7 +329,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
                 device_check(fixed >= 0 and fixed < a.routing.num_routed_experts);
                 selected = int(fixed);
                 value = mega_gate_detail::reduced_score<E,S,CompactScores,ScoreStride,ScoreBlockTokens>(a, token, selected);
-                if (!PreActivated or !score_for_ranking) value = sqrt_softplus(value);
+                if (!PreActivated or !score_for_ranking) value = gate_score<UseSigmoid>(value);
                 device_check(isfinite(value));
             }
             store_topk_token<Topk, HasUnmapped, HasPhysicalMap>(a.routing, a.routing.logical_count, token, lane, selected, value);
@@ -478,7 +481,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
                 }
             }
         }
-        if (score_for_ranking and !PreActivated) sqrt_softplus(values);
+        if (score_for_ranking and !PreActivated) gate_score<UseSigmoid>(values);
         #pragma unroll
         for (int v = 0; v < Values; ++v) {
             const int expert = (v / 4) * 128 + lane * 4 + v % 4;
@@ -510,6 +513,7 @@ template<int H, int E, int S, int Topk, bool HasPhysicalMap, bool HasUnmapped,
 __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
     using namespace mega_gate_layout;
     using namespace epilogue::mega_gate;
+    constexpr bool UseSigmoid = Features >= 0 and (Features & kSigmoidScore);
     // Specialize optional routing controls so unused RNG/control paths cannot
     // inflate the GEMM kernel's register footprint.
     if constexpr (!(Features & 1)) a.mask = nullptr;
@@ -680,8 +684,8 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
         // entry per lane. Larger candidate sets use the full-score selector.
         // Bias-only routing has no masked/fixed-row scratch to preserve.
         if constexpr (S > 1 and Groups > 1 and M >= 32 and M <= Warps and N % 32 == 0 and
-                      2 * Topk <= N and Groups * Topk <= 32 and Features == 8) {
-            mega_gate_detail::store_group_candidates<E, S, N, Topk, Threads, M>(a, token_base, expert_base);
+                      2 * Topk <= N and Groups * Topk <= 32 and (Features & ~kSigmoidScore) == 8) {
+            mega_gate_detail::store_group_candidates<E, S, N, Topk, Threads, M, UseSigmoid>(a, token_base, expert_base);
             __syncthreads();
             if (tid == 0) last = mega_gate_detail::ScoreBarrier::arrive_last(counters, Groups);
             __syncthreads();
@@ -694,7 +698,7 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
         constexpr int ValuesPerThread = M * N / Threads;
         constexpr int Batch = ValuesPerThread < 8 ? ValuesPerThread : 8;
         static_assert(ValuesPerThread > 0 and M * N % Threads == 0);
-        const bool activate = Features < 0 ? (a.bias or a.image_token_mask) : bool(Features & 24);
+        const bool activate = UseSigmoid or (Features < 0 ? (a.bias or a.image_token_mask) : bool(Features & 24));
         for (int base = 0; base < ValuesPerThread; base += Batch) {
             float values[Batch];
             bool finite = true;
@@ -709,7 +713,7 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
                 finite &= !checked or isfinite(values[v]);
             }
             device_check(finite);
-            if (activate) sqrt_softplus(values);
+            if (activate) gate_score<UseSigmoid>(values);
             #pragma unroll
             for (int v = 0; v < Batch; ++v) {
                 const int linear = tid + (base + v) * Threads;

@@ -36,6 +36,25 @@ __device__ __forceinline__ void sqrt_softplus(float (&values)[kNumValues]) {
         values[value_idx] = sqrtf(values[value_idx] > 20.0f ? values[value_idx] : softplus[value_idx]);
 }
 
+template <bool UseSigmoid>
+__device__ __forceinline__ float gate_score(float value) {
+    if constexpr (UseSigmoid)
+        return 1.0f / (1.0f + expf(-value));
+    else
+        return sqrt_softplus(value);
+}
+
+template <bool UseSigmoid, uint32_t N>
+__device__ __forceinline__ void gate_score(float (&values)[N]) {
+    if constexpr (UseSigmoid) {
+        #pragma unroll
+        for (uint32_t i = 0; i < N; ++i)
+            values[i] = gate_score<true>(values[i]);
+    } else {
+        sqrt_softplus(values);
+    }
+}
+
 __device__ __forceinline__ void warp_reduce_best(const float& score, int& expert_idx) {
     const auto best_score = tix::reduce_max_sync(score);
     // Ties resolve to the smallest expert index

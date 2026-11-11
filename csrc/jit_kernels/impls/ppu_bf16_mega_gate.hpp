@@ -76,7 +76,7 @@ static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weig
         const std::optional<torch::Tensor>& bias, const std::optional<torch::Tensor>& image_bias,
         const std::optional<torch::Tensor>& image_token_mask, const std::optional<torch::Tensor>& mask,
         const std::optional<torch::Tensor>& fix_routing_mask, const std::optional<torch::Tensor>& force_random,
-        const mega_gate_layout::RoutingArgs& routing, int tokens, int hidden, int experts, int topk) {
+        const mega_gate_layout::RoutingArgs& routing, int tokens, int hidden, int experts, int topk, bool use_sigmoid = false) {
     using namespace mega_gate_layout;
     DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16u == 0u);
     DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16u == 0u);
@@ -112,7 +112,8 @@ static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weig
     args.warp_m = wm;
     args.producer_activation = producer_activation;
     args.features = (mask ? 1 : 0) | (force_random ? 2 : 0) | (fix_routing_mask ? 4 : 0) |
-        (bias ? 8 : 0) | (image_token_mask ? 16 : 0) | (routing.num_shared_experts ? 32 : 0);
+        (bias ? 8 : 0) | (image_token_mask ? 16 : 0) | (routing.num_shared_experts ? 32 : 0) |
+        (use_sigmoid ? kSigmoidScore : 0);
     auto kernel = compiler->build("ppu_bf16_mega_gate", PPUMegaGateRuntime::generate(args));
     if (cooperative and !persistent_groups) {
         const int resident_blocks = PPUMegaGateRuntime::resident_blocks_per_cu(kernel->kernel, args.launch_args);

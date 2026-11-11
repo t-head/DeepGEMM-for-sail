@@ -447,6 +447,13 @@ See the [attention API](csrc/apis/attention.hpp) for metadata and layout
 requirements and [attention tests](tests/test_attention.py) for supported
 cases.
 
+#### BF16 MegaGate routing (M890)
+
+`bf16_mega_gate` accepts `scoring_func="sigmoid"` for routers such as GLM-5.3.
+Omitting this argument uses `"sqrtsoftplus"`. With either mode, a correction
+bias affects expert selection, and the selected unbiased scores determine the
+normalized routing weights.
+
 #### Mega MoE
 
 MegaMoE combines expert-parallel dispatch, two MXFP4 GEMMs, gated activation
