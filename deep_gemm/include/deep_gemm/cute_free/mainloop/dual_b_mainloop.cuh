@@ -7,6 +7,37 @@
 #include <deep_gemm/cute_free/arch/ppu_common.cuh>
 #include <deep_gemm/common/math.cuh>
 
+#ifndef DG_DUAL_B_FULL_K_PREFETCH
+#define DG_DUAL_B_FULL_K_PREFETCH 0
+#endif
+#ifndef DG_DUAL_B_EARLY_G2S
+#define DG_DUAL_B_EARLY_G2S 0
+#endif
+#ifndef DG_DUAL_B_MMA_S2R_OVERLAP
+#define DG_DUAL_B_MMA_S2R_OVERLAP 0
+#endif
+#ifndef DG_DUAL_B_BOUNDED_KLOOP
+#define DG_DUAL_B_BOUNDED_KLOOP 0
+#endif
+#ifndef DG_DUAL_B_KLOOP_UNROLL
+#define DG_DUAL_B_KLOOP_UNROLL 1
+#endif
+#ifndef DG_DUAL_B_KLOOP_CHUNK
+#define DG_DUAL_B_KLOOP_CHUNK 0
+#endif
+#ifndef DG_DUAL_B_STATIC_STAGES
+#define DG_DUAL_B_STATIC_STAGES 0
+#endif
+#ifndef DG_DUAL_B_STREAMED_LOW
+#define DG_DUAL_B_STREAMED_LOW 0
+#endif
+#ifndef DG_DUAL_B_STREAMED_PAIRS
+#define DG_DUAL_B_STREAMED_PAIRS 0
+#endif
+#ifndef DG_DUAL_B_PAIRS_M_FIRST
+#define DG_DUAL_B_PAIRS_M_FIRST 0
+#endif
+
 namespace deep_gemm {
 namespace mainloop {
 
@@ -94,6 +125,85 @@ struct DualBMainloop {
   };
 
   static constexpr int kKPairs = kKStepsPerWarp / 2;
+
+  // 单个非边界pair，不含stage操作；显式chunk和旧bounded复用同一双累加链。
+  static __device__ __forceinline__ void run_one_inner_k_pair(
+      int pair,
+      int const (&base_a)[kMmasPerWarpM],
+      int const (&base_bh)[kMmasPerWarpN],
+      int const (&base_bl)[kMmasPerWarpN],
+      float (&accum_high)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      float (&accum_low)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      uint32_t (&a_reg)[2][kMmasPerWarpM][4],
+      uint32_t (&bh_reg)[2][kMmasPerWarpN][4],
+      uint32_t (&bl_reg)[2][kMmasPerWarpN][4]) {
+    #pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const int current = half;
+      const int next = 1 - half;
+      const int next_step = 2 * pair + half + 1;
+      #pragma unroll
+      for (int mi = 0; mi < kMmasPerWarpM; ++mi)
+        S2RAtomA::load(base_a[mi], next_step, a_reg[next][mi]);
+      #pragma unroll
+      for (int ni = 0; ni < kMmasPerWarpN; ++ni)
+        S2RAtomB::load(base_bh[ni], next_step, bh_reg[next][ni]);
+      #pragma unroll
+      for (int ni = 0; ni < kMmasPerWarpN; ++ni)
+        S2RAtomB::load(base_bl[ni], next_step, bl_reg[next][ni]);
+      #pragma unroll
+      for (int mi = 0; mi < kMmasPerWarpM; ++mi) {
+        #pragma unroll
+        for (int ni = 0; ni < kMmasPerWarpN; ++ni) {
+          MmaAtom::mma(accum_high[mi][ni], a_reg[current][mi], bh_reg[current][ni], accum_high[mi][ni]);
+          MmaAtom::mma(accum_low[mi][ni], a_reg[current][mi], bl_reg[current][ni], accum_low[mi][ni]);
+        }
+      }
+    }
+  }
+
+  // 实验只循环非边界K pair；末尾pair仍调用原模板，stage同步位置和完整K顺序不变。
+  static __device__ __forceinline__ void run_inner_k_pairs_bounded(
+      int const (&base_a)[kMmasPerWarpM],
+      int const (&base_bh)[kMmasPerWarpN],
+      int const (&base_bl)[kMmasPerWarpN],
+      float (&accum_high)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      float (&accum_low)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      uint32_t (&a_reg)[2][kMmasPerWarpM][4],
+      uint32_t (&bh_reg)[2][kMmasPerWarpN][4],
+      uint32_t (&bl_reg)[2][kMmasPerWarpN][4]) {
+    static_assert(DG_DUAL_B_KLOOP_UNROLL == 1 || DG_DUAL_B_KLOOP_UNROLL == 2 || DG_DUAL_B_KLOOP_UNROLL == 4,
+                  "bounded K loop supports only the frozen partial unroll factors");
+    if constexpr (DG_DUAL_B_KLOOP_CHUNK) {
+      static_assert(!DG_DUAL_B_KLOOP_CHUNK || DG_DUAL_B_KLOOP_UNROLL == 2 || DG_DUAL_B_KLOOP_UNROLL == 4,
+                    "explicit chunks support only two or four inner pairs");
+      constexpr int kChunk = DG_DUAL_B_KLOOP_UNROLL;
+      constexpr int kFullPairs = ((kKPairs - 1) / kChunk) * kChunk;
+      #pragma unroll 1
+      for (int base = 0; base < kFullPairs; base += kChunk) {
+        #pragma unroll
+        for (int offset = 0; offset < kChunk; ++offset)
+          run_one_inner_k_pair(base + offset, base_a, base_bh, base_bl,
+                               accum_high, accum_low, a_reg, bh_reg, bl_reg);
+      }
+      // 编译期固定尾部，不重复最后的stage边界pair；buffer继续承接上一chunk。
+      #pragma unroll
+      for (int pair = kFullPairs; pair < kKPairs - 1; ++pair)
+        run_one_inner_k_pair(pair, base_a, base_bh, base_bl,
+                             accum_high, accum_low, a_reg, bh_reg, bl_reg);
+    } else {
+      #if DG_DUAL_B_KLOOP_UNROLL == 4
+      #pragma unroll 4
+      #elif DG_DUAL_B_KLOOP_UNROLL == 2
+      #pragma unroll 2
+      #else
+      #pragma unroll 1
+      #endif
+      for (int pair = 0; pair < kKPairs - 1; ++pair)
+        run_one_inner_k_pair(pair, base_a, base_bh, base_bl,
+                             accum_high, accum_low, a_reg, bh_reg, bl_reg);
+    }
+  }
 
   /// Issue the S2R loads for one k_step into the given fragment buffers,
   /// grouped by operand: all A fragments, then all B_high, then all B_low.
@@ -235,31 +345,70 @@ struct DualBMainloop {
     static constexpr int S1 = 2 * KPair + 1;  // second step of this pair
 
     // --- Step S0: prefetch S1's data into buf1, then two MMAs with buf0 ---
-    load_next_fragments<S0>(smem, next_stage, warp_coord_a, warp_coord_b,
-                            tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
-                            a_buf1, bh_buf1, bl_buf1);
+    if constexpr (!DG_DUAL_B_MMA_S2R_OVERLAP) {
+      load_next_fragments<S0>(smem, next_stage, warp_coord_a, warp_coord_b,
+                              tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
+                              a_buf1, bh_buf1, bl_buf1);
+    }
+    // 实验仅将下一步S2R放在当前high/low MMA之间；各累加链K顺序和所有同步点不变。
+    if constexpr (DG_DUAL_B_MMA_S2R_OVERLAP) {
+      #pragma unroll
+      for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
+        #pragma unroll
+        for (int mma_n = 0; mma_n < kMmasPerWarpN; ++mma_n) {
+          MmaAtom::mma(accum_high[mma_m][mma_n], a_buf0[mma_m], bh_buf0[mma_n], accum_high[mma_m][mma_n]);
+        }
+      }
+      load_next_fragments<S0>(smem, next_stage, warp_coord_a, warp_coord_b,
+                              tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
+                              a_buf1, bh_buf1, bl_buf1);
+    }
+    if constexpr (DG_DUAL_B_EARLY_G2S && KPair == kKPairs - 1) {
+      // 当前stage最后两个K步的三路操作数均已在寄存器中；原barrier保证所有warp
+      // 完成读取后才回收stage。仅提前复制发射，完整K累加顺序及同步次数保持不变。
+      issue_g2s_and_wait(warp_id, issue_g2s, g2s_smem_a, g2s_smem_b_high, g2s_smem_b_low,
+                         params, m_offset, n_offset, k_offset_next);
+    }
     #pragma unroll
     for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
       #pragma unroll
       for (int mma_n = 0; mma_n < kMmasPerWarpN; ++mma_n) {
-        MmaAtom::mma(accum_high[mma_m][mma_n], a_buf0[mma_m], bh_buf0[mma_n], accum_high[mma_m][mma_n]);
+        if constexpr (!DG_DUAL_B_MMA_S2R_OVERLAP) {
+          MmaAtom::mma(accum_high[mma_m][mma_n], a_buf0[mma_m], bh_buf0[mma_n], accum_high[mma_m][mma_n]);
+        }
         MmaAtom::mma(accum_low[mma_m][mma_n], a_buf0[mma_m], bl_buf0[mma_n], accum_low[mma_m][mma_n]);
       }
     }
-    if constexpr (KPair == kKPairs - 1) {
+    if constexpr (!DG_DUAL_B_EARLY_G2S && KPair == kKPairs - 1) {
       issue_g2s_and_wait(warp_id, issue_g2s, g2s_smem_a, g2s_smem_b_high, g2s_smem_b_low,
                          params, m_offset, n_offset, k_offset_next);
     }
 
     // --- Step S1: prefetch (S1+1)'s data into buf0, then two MMAs with buf1 ---
-    load_next_fragments<S1>(smem, next_stage, warp_coord_a, warp_coord_b,
-                            tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
-                            a_buf0, bh_buf0, bl_buf0);
+    if constexpr (!DG_DUAL_B_MMA_S2R_OVERLAP) {
+      load_next_fragments<S1>(smem, next_stage, warp_coord_a, warp_coord_b,
+                              tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
+                              a_buf0, bh_buf0, bl_buf0);
+    }
+    if constexpr (DG_DUAL_B_MMA_S2R_OVERLAP) {
+      #pragma unroll
+      for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
+        #pragma unroll
+        for (int mma_n = 0; mma_n < kMmasPerWarpN; ++mma_n) {
+          MmaAtom::mma(accum_high[mma_m][mma_n], a_buf1[mma_m], bh_buf1[mma_n], accum_high[mma_m][mma_n]);
+        }
+      }
+      load_next_fragments<S1>(smem, next_stage, warp_coord_a, warp_coord_b,
+                              tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
+                              a_buf0, bh_buf0, bl_buf0);
+    }
     #pragma unroll
     for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
       #pragma unroll
       for (int mma_n = 0; mma_n < kMmasPerWarpN; ++mma_n) {
-        MmaAtom::mma(accum_high[mma_m][mma_n], a_buf1[mma_m], bh_buf1[mma_n], accum_high[mma_m][mma_n]);
+        if constexpr (!DG_DUAL_B_MMA_S2R_OVERLAP) {
+          MmaAtom::mma(accum_high[mma_m][mma_n], a_buf1[mma_m], bh_buf1[mma_n], accum_high[mma_m][mma_n]);
+        }
         MmaAtom::mma(accum_low[mma_m][mma_n], a_buf1[mma_m], bl_buf1[mma_n], accum_low[mma_m][mma_n]);
       }
     }
@@ -302,6 +451,148 @@ struct DualBMainloop {
                              tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
                              accum_high, accum_low,
                              a_buf0, bh_buf0, bl_buf0, a_buf1, bh_buf1, bl_buf1);
+    }
+  }
+
+  // 融合专用实验：A/high继续双缓冲，low按当前K步与N子tile即用即载。
+  // 缩短low片段存活期，不改变任何输出元素的high/low完整K累加顺序。
+  template <int Step>
+  static __device__ __forceinline__ void load_ah(
+      int const (&base_a)[kMmasPerWarpM],
+      int const (&base_bh)[kMmasPerWarpN],
+      uint32_t (&a)[kMmasPerWarpM][4],
+      uint32_t (&bh)[kMmasPerWarpN][4]) {
+    #pragma unroll
+    for (int mi = 0; mi < kMmasPerWarpM; ++mi)
+      S2RAtomA::load(base_a[mi], Step, a[mi]);
+    #pragma unroll
+    for (int ni = 0; ni < kMmasPerWarpN; ++ni)
+      S2RAtomB::load(base_bh[ni], Step, bh[ni]);
+  }
+
+  template <int Step>
+  static __device__ __forceinline__ void run_streamed_steps(
+      int const (&base_a)[kMmasPerWarpM],
+      int const (&base_bh)[kMmasPerWarpN],
+      int const (&base_bl)[kMmasPerWarpN],
+      float (&accum_high)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      float (&accum_low)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      uint32_t (&a_reg)[2][kMmasPerWarpM][4],
+      uint32_t (&bh_reg)[2][kMmasPerWarpN][4],
+      int warp_id, bool issue_g2s, Element* g2s_a, Element* g2s_bh, Element* g2s_bl,
+      Params const& params, int m_offset, int n_offset, int k_offset_next,
+      char* smem, int next_stage, int warp_coord_a, int warp_coord_b) {
+    if constexpr (Step < kKStepsPerWarp) {
+      constexpr int current = Step % 2, next = 1 - current;
+      if constexpr (Step + 1 < kKStepsPerWarp)
+        load_ah<Step + 1>(base_a, base_bh, a_reg[next], bh_reg[next]);
+      #pragma unroll
+      for (int ni = 0; ni < kMmasPerWarpN; ++ni) {
+        uint32_t low[4];
+        S2RAtomB::load(base_bl[ni], Step, low);
+        #pragma unroll
+        for (int mi = 0; mi < kMmasPerWarpM; ++mi) {
+          MmaAtom::mma(accum_high[mi][ni], a_reg[current][mi], bh_reg[current][ni], accum_high[mi][ni]);
+          MmaAtom::mma(accum_low[mi][ni], a_reg[current][mi], low, accum_low[mi][ni]);
+        }
+      }
+      if constexpr (Step + 1 == kKStepsPerWarp) {
+        // 最后一步low也已被所有warp读取，才用原barrier回收stage。
+        // wait/fence与空group数量保持不变，仅将回收点推迟到该stage的MMA结束。
+        issue_g2s_and_wait(warp_id, issue_g2s, g2s_a, g2s_bh, g2s_bl,
+                           params, m_offset, n_offset, k_offset_next);
+        Element const* elems = reinterpret_cast<Element const*>(smem);
+        constexpr int coord_scale = kSwzlW * (int)sizeof(Element) / 16;
+        const int next_a = arch::smem_ptr_to_tsm_base(
+            elems + next_stage * BLOCK_M * BLOCK_K, warp_coord_a);
+        const int next_bh = arch::smem_ptr_to_tsm_base(
+            elems + kSmemAElements + next_stage * BLOCK_N * BLOCK_K, warp_coord_b);
+        int na[kMmasPerWarpM], nb[kMmasPerWarpN];
+        #pragma unroll
+        for (int mi = 0; mi < kMmasPerWarpM; ++mi)
+          na[mi] = next_a + mi * kMmaM * coord_scale;
+        #pragma unroll
+        for (int ni = 0; ni < kMmasPerWarpN; ++ni)
+          nb[ni] = next_bh + ni * kMmaN * coord_scale;
+        load_ah<0>(na, nb, a_reg[0], bh_reg[0]);
+      }
+      run_streamed_steps<Step + 1>(base_a, base_bh, base_bl, accum_high, accum_low,
+          a_reg, bh_reg, warp_id, issue_g2s, g2s_a, g2s_bh, g2s_bl,
+          params, m_offset, n_offset, k_offset_next, smem, next_stage, warp_coord_a, warp_coord_b);
+    }
+  }
+
+  // 每个N子tile内部按S0、S1递增累加；末尾N的两步low已在寄存器后才回收stage。
+  // 不提前覆盖其他warp尚未读取的low，保留原wait/fence及空group数量。
+  template <int Pair>
+  static __device__ __forceinline__ void run_streamed_pairs(
+      int const (&base_a)[kMmasPerWarpM],
+      int const (&base_bh)[kMmasPerWarpN],
+      int const (&base_bl)[kMmasPerWarpN],
+      float (&accum_high)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      float (&accum_low)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      uint32_t (&a_reg)[2][kMmasPerWarpM][4],
+      uint32_t (&bh_reg)[2][kMmasPerWarpN][4],
+      int warp_id, bool issue_g2s, Element* g2s_a, Element* g2s_bh, Element* g2s_bl,
+      Params const& params, int m_offset, int n_offset, int k_offset_next,
+      char* smem, int next_stage, int warp_coord_a, int warp_coord_b) {
+    if constexpr (Pair < kKPairs) {
+      constexpr int s0 = 2 * Pair, s1 = s0 + 1;
+      load_ah<s1>(base_a, base_bh, a_reg[1], bh_reg[1]);
+      #pragma unroll
+      for (int ni = 0; ni < kMmasPerWarpN; ++ni) {
+        uint32_t low0[4], low1[4];
+        S2RAtomB::load(base_bl[ni], s0, low0);
+        S2RAtomB::load(base_bl[ni], s1, low1);
+        if constexpr (Pair == kKPairs - 1) {
+          if (ni == kMmasPerWarpN - 1)
+            issue_g2s_and_wait(warp_id, issue_g2s, g2s_a, g2s_bh, g2s_bl,
+                               params, m_offset, n_offset, k_offset_next);
+        }
+        if constexpr (DG_DUAL_B_PAIRS_M_FIRST) {
+          // 同一N子tile先完成所有M子块的s0，再发出s1，增加独立累加链间距。
+          // 每个输出的K步仍为s0、s1；两套累加器、low加载与stage同步点不变。
+          #pragma unroll
+          for (int mi = 0; mi < kMmasPerWarpM; ++mi) {
+            MmaAtom::mma(accum_high[mi][ni], a_reg[0][mi], bh_reg[0][ni], accum_high[mi][ni]);
+            MmaAtom::mma(accum_low[mi][ni], a_reg[0][mi], low0, accum_low[mi][ni]);
+          }
+          #pragma unroll
+          for (int mi = 0; mi < kMmasPerWarpM; ++mi) {
+            MmaAtom::mma(accum_high[mi][ni], a_reg[1][mi], bh_reg[1][ni], accum_high[mi][ni]);
+            MmaAtom::mma(accum_low[mi][ni], a_reg[1][mi], low1, accum_low[mi][ni]);
+          }
+        } else {
+          #pragma unroll
+          for (int mi = 0; mi < kMmasPerWarpM; ++mi) {
+            MmaAtom::mma(accum_high[mi][ni], a_reg[0][mi], bh_reg[0][ni], accum_high[mi][ni]);
+            MmaAtom::mma(accum_low[mi][ni], a_reg[0][mi], low0, accum_low[mi][ni]);
+            MmaAtom::mma(accum_high[mi][ni], a_reg[1][mi], bh_reg[1][ni], accum_high[mi][ni]);
+            MmaAtom::mma(accum_low[mi][ni], a_reg[1][mi], low1, accum_low[mi][ni]);
+          }
+        }
+      }
+      if constexpr (Pair == kKPairs - 1) {
+        Element const* elems = reinterpret_cast<Element const*>(smem);
+        constexpr int coord_scale = kSwzlW * (int)sizeof(Element) / 16;
+        const int next_a = arch::smem_ptr_to_tsm_base(
+            elems + next_stage * BLOCK_M * BLOCK_K, warp_coord_a);
+        const int next_bh = arch::smem_ptr_to_tsm_base(
+            elems + kSmemAElements + next_stage * BLOCK_N * BLOCK_K, warp_coord_b);
+        int na[kMmasPerWarpM], nb[kMmasPerWarpN];
+        #pragma unroll
+        for (int mi = 0; mi < kMmasPerWarpM; ++mi)
+          na[mi] = next_a + mi * kMmaM * coord_scale;
+        #pragma unroll
+        for (int ni = 0; ni < kMmasPerWarpN; ++ni)
+          nb[ni] = next_bh + ni * kMmaN * coord_scale;
+        load_ah<0>(na, nb, a_reg[0], bh_reg[0]);
+      } else {
+        load_ah<s1 + 1>(base_a, base_bh, a_reg[0], bh_reg[0]);
+      }
+      run_streamed_pairs<Pair + 1>(base_a, base_bh, base_bl, accum_high, accum_low,
+          a_reg, bh_reg, warp_id, issue_g2s, g2s_a, g2s_bh, g2s_bl,
+          params, m_offset, n_offset, k_offset_next, smem, next_stage, warp_coord_a, warp_coord_b);
     }
   }
 
@@ -354,16 +645,82 @@ struct DualBMainloop {
     }
 
     if (!skip_preload) {
-      issue_s2r_triple<0>(tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
-                          a_reg[0], bh_reg[0], bl_reg[0]);
+      if constexpr (DG_DUAL_B_STREAMED_LOW)
+        load_ah<0>(tsm_add_base_a, tsm_add_base_bh, a_reg[0], bh_reg[0]);
+      else
+        issue_s2r_triple<0>(tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
+                            a_reg[0], bh_reg[0], bl_reg[0]);
     }
 
-    run_k_pairs<0>(warp_id, issue_g2s, g2s_smem_a, g2s_smem_b_high, g2s_smem_b_low,
-                   params, m_offset, n_offset, k_offset_next,
-                   smem, next_stage, warp_coord_a, warp_coord_b,
-                   tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
-                   accum_high, accum_low,
-                   a_reg[0], bh_reg[0], bl_reg[0], a_reg[1], bh_reg[1], bl_reg[1]);
+    if constexpr (DG_DUAL_B_STREAMED_LOW) {
+      static_assert(!DG_DUAL_B_STREAMED_LOW || (!DG_DUAL_B_FULL_K_PREFETCH
+                    && !DG_DUAL_B_EARLY_G2S && !DG_DUAL_B_MMA_S2R_OVERLAP && !DG_DUAL_B_BOUNDED_KLOOP),
+                    "streamed low uses its own stage release schedule");
+      if constexpr (DG_DUAL_B_STREAMED_PAIRS) {
+        run_streamed_pairs<0>(tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
+            accum_high, accum_low, a_reg, bh_reg, warp_id, issue_g2s,
+            g2s_smem_a, g2s_smem_b_high, g2s_smem_b_low, params, m_offset, n_offset, k_offset_next,
+            smem, next_stage, warp_coord_a, warp_coord_b);
+      } else {
+        run_streamed_steps<0>(tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
+            accum_high, accum_low, a_reg, bh_reg, warp_id, issue_g2s,
+            g2s_smem_a, g2s_smem_b_high, g2s_smem_b_low, params, m_offset, n_offset, k_offset_next,
+            smem, next_stage, warp_coord_a, warp_coord_b);
+      }
+    } else if constexpr (DG_DUAL_B_BOUNDED_KLOOP) {
+      static_assert(!DG_DUAL_B_BOUNDED_KLOOP ||
+                    (!DG_DUAL_B_FULL_K_PREFETCH && !DG_DUAL_B_EARLY_G2S && !DG_DUAL_B_MMA_S2R_OVERLAP),
+                    "bounded K loop is an isolated instruction scheduling experiment");
+      run_inner_k_pairs_bounded(tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
+                                accum_high, accum_low, a_reg, bh_reg, bl_reg);
+      do_k_pair<kKPairs - 1>(warp_id, issue_g2s, g2s_smem_a, g2s_smem_b_high, g2s_smem_b_low,
+                             params, m_offset, n_offset, k_offset_next,
+                             smem, next_stage, warp_coord_a, warp_coord_b,
+                             tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
+                             accum_high, accum_low,
+                             a_reg[0], bh_reg[0], bl_reg[0], a_reg[1], bh_reg[1], bl_reg[1]);
+    } else {
+      run_k_pairs<0>(warp_id, issue_g2s, g2s_smem_a, g2s_smem_b_high, g2s_smem_b_low,
+                     params, m_offset, n_offset, k_offset_next,
+                     smem, next_stage, warp_coord_a, warp_coord_b,
+                     tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
+                     accum_high, accum_low,
+                     a_reg[0], bh_reg[0], bl_reg[0], a_reg[1], bh_reg[1], bl_reg[1]);
+    }
+  }
+
+  // 小warp实验变体：先把当前K tile的三路片段完整放入寄存器，再复用stage发射G2S。
+  // 保留原有单warp发射、wait/fence及CTA barrier，当前tile的MMA与下一tile复制重叠。
+  static __device__ __forceinline__ void mma_tile_prefetch_all(
+      int stage, char* smem, int warp_row, int warp_col, int warp_id,
+      bool issue_g2s, Params const& params, int m_offset, int n_offset, int k_offset_next,
+      float (&accum_high)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      float (&accum_low)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread]) {
+    static_assert(WARP_M == kMmaM && WARP_N == kMmaN && WARP_K == BLOCK_K,
+                  "full register prefetch requires a single MMA tile per warp and full K");
+    Element* elems = reinterpret_cast<Element*>(smem);
+    Element* stage_a = elems + stage * BLOCK_M * BLOCK_K;
+    Element* stage_bh = elems + kSmemAElements + stage * BLOCK_N * BLOCK_K;
+    Element* stage_bl = elems + kSmemBHighElements + stage * BLOCK_N * BLOCK_K;
+    constexpr int coord_scale = kSwzlW * (int)sizeof(Element) / 16;
+    int base_a = arch::smem_ptr_to_tsm_base(stage_a, warp_row * WARP_M * coord_scale);
+    int base_bh = arch::smem_ptr_to_tsm_base(stage_bh, warp_col * WARP_N * coord_scale);
+    int base_bl = arch::smem_ptr_to_tsm_base(stage_bl, warp_col * WARP_N * coord_scale);
+    uint32_t a[kKSteps][4], bh[kKSteps][4], bl[kKSteps][4];
+    #pragma unroll
+    for (int step = 0; step < kKSteps; ++step) {
+      S2RAtomA::load(base_a, step, a[step]);
+      S2RAtomB::load(base_bh, step, bh[step]);
+      S2RAtomB::load(base_bl, step, bl[step]);
+    }
+    issue_g2s_and_wait(warp_id, issue_g2s, stage_a, stage_bh, stage_bl,
+                       params, m_offset, n_offset, k_offset_next);
+    #pragma unroll
+    for (int step = 0; step < kKSteps; ++step) {
+      // 每套累加链内部的K顺序不变，high和low始终独立累加。
+      MmaAtom::mma(accum_high[0][0], a[step], bh[step], accum_high[0][0]);
+      MmaAtom::mma(accum_low[0][0], a[step], bl[step], accum_low[0][0]);
+    }
   }
 
   /// Run the whole K-pipeline for one output tile: prologue + mainloop, for
@@ -374,7 +731,8 @@ struct DualBMainloop {
       int warp_id, int warp_row, int warp_col, int warp_k,
       int m_offset, int n_offset,
       float (&accum_high)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
-      float (&accum_low)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread]) {
+      float (&accum_low)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      bool stage0_preloaded = false) {
 
     int total_k_tiles = math::ceil_div(params.K, BLOCK_K);
 
@@ -384,9 +742,9 @@ struct DualBMainloop {
     Element* smem_b_low = smem_a + kSmemBHighElements;
 
     // Prologue: fill STAGES tiles (A + B_high + B_low per stage).
-    int k_tile_to_load = 0;
+    int k_tile_to_load = stage0_preloaded ? 1 : 0;
     #pragma unroll
-    for (int s = 0; s < STAGES && k_tile_to_load < total_k_tiles; ++s) {
+    for (int s = stage0_preloaded ? 1 : 0; s < STAGES && k_tile_to_load < total_k_tiles; ++s) {
       if (warp_id == 0) {
         G2SAtomA::load(smem_a + s * BLOCK_M * BLOCK_K, params.ptr_A,
                        params.M, params.lda, m_offset, k_tile_to_load * BLOCK_K);
@@ -405,32 +763,78 @@ struct DualBMainloop {
     }
     __syncthreads();
 
-    int read_stage = 0;
-
     uint32_t a_reg[2][kMmasPerWarpM][4];
     uint32_t bh_reg[2][kMmasPerWarpN][4];
     uint32_t bl_reg[2][kMmasPerWarpN][4];
 
-    for (int k_iter = 0; k_iter < total_k_tiles; ++k_iter) {
-      bool issue_g2s = (k_tile_to_load < total_k_tiles);
-      int next_read_stage = (read_stage + 1 >= STAGES) ? 0 : read_stage + 1;
+    if constexpr (DG_DUAL_B_STATIC_STAGES) {
+      static_assert(!DG_DUAL_B_STATIC_STAGES || !DG_DUAL_B_FULL_K_PREFETCH,
+                    "static stages uses the original double-buffered fragments");
+      // 外层只循环完整stage周期，内层索引编译期展开；保留每一步原wait/fence、
+      // CTA barrier与无条件空group。尾部仍按K递增，不额外计算或加载K tile。
+      #pragma unroll 1
+      for (int base = 0; base < total_k_tiles; base += STAGES) {
+        #pragma unroll
+        for (int stage = 0; stage < STAGES; ++stage) {
+          if (base + stage < total_k_tiles) {
+            const bool issue_g2s = k_tile_to_load < total_k_tiles;
+            mma_tile(stage, warp_row, warp_col, warp_k, smem, accum_high, accum_low,
+                     warp_id, issue_g2s,
+                     smem_a + stage * BLOCK_M * BLOCK_K,
+                     smem_b_high + stage * BLOCK_N * BLOCK_K,
+                     smem_b_low + stage * BLOCK_N * BLOCK_K,
+                     params, m_offset, n_offset, k_tile_to_load * BLOCK_K,
+                     /*skip_preload=*/ (base + stage > 0),
+                     /*next_stage=*/ (stage + 1 == STAGES ? 0 : stage + 1),
+                     a_reg, bh_reg, bl_reg);
+            if (issue_g2s) ++k_tile_to_load;
+          }
+        }
+      }
+    } else {
+      int read_stage = 0;
+      for (int k_iter = 0; k_iter < total_k_tiles; ++k_iter) {
+        bool issue_g2s = (k_tile_to_load < total_k_tiles);
+        int next_read_stage = (read_stage + 1 >= STAGES) ? 0 : read_stage + 1;
 
-      mma_tile(read_stage, warp_row, warp_col, warp_k, smem, accum_high, accum_low,
-               warp_id, issue_g2s,
-               smem_a + read_stage * BLOCK_M * BLOCK_K,
-               smem_b_high + read_stage * BLOCK_N * BLOCK_K,
-               smem_b_low + read_stage * BLOCK_N * BLOCK_K,
-               params, m_offset, n_offset, k_tile_to_load * BLOCK_K,
-               /*skip_preload=*/ (k_iter > 0),
-               /*next_stage=*/ next_read_stage,
-               a_reg, bh_reg, bl_reg);
+        if constexpr (DG_DUAL_B_FULL_K_PREFETCH && WARP_M == kMmaM && WARP_N == kMmaN
+                      && WARP_K == BLOCK_K && BLOCK_K <= 128) {
+          mma_tile_prefetch_all(read_stage, smem, warp_row, warp_col, warp_id, issue_g2s,
+                                params, m_offset, n_offset, k_tile_to_load * BLOCK_K,
+                                accum_high, accum_low);
+        } else {
+          mma_tile(read_stage, warp_row, warp_col, warp_k, smem, accum_high, accum_low,
+                   warp_id, issue_g2s,
+                   smem_a + read_stage * BLOCK_M * BLOCK_K,
+                   smem_b_high + read_stage * BLOCK_N * BLOCK_K,
+                   smem_b_low + read_stage * BLOCK_N * BLOCK_K,
+                   params, m_offset, n_offset, k_tile_to_load * BLOCK_K,
+                   /*skip_preload=*/ (k_iter > 0),
+                   /*next_stage=*/ next_read_stage,
+                   a_reg, bh_reg, bl_reg);
+        }
 
-      if (issue_g2s) ++k_tile_to_load;
-      if (++read_stage >= STAGES) read_stage = 0;
+        if (issue_g2s) ++k_tile_to_load;
+        if (++read_stage >= STAGES) read_stage = 0;
+      }
     }
 
     cutlass::arch::cp_async_wait<0>();
     __syncthreads();
+  }
+
+  // 与普通BF16一样，stage0由kernel预发射；三操作数属于同一个async group。
+  static __device__ __forceinline__ void issue_prologue_stage0(
+      char* smem, int warp_id, Params const& params, int m_offset, int n_offset) {
+    Element* elems = reinterpret_cast<Element*>(smem);
+    if (warp_id == 0) {
+      G2SAtomA::load(elems, params.ptr_A, params.M, params.lda, m_offset, 0);
+      G2SAtomB::load(elems + kSmemAElements, params.ptr_B_high,
+                     params.N, params.ldb, n_offset, 0);
+      G2SAtomB::load(elems + kSmemBHighElements, params.ptr_B_low,
+                     params.N, params.ldb, n_offset, 0);
+    }
+    cutlass::arch::cp_async_fence();
   }
 };
 
