@@ -13,6 +13,8 @@
 namespace deep_gemm::runtime {
 
 static void register_apis(pybind11::module_& m) {
+    // This PPU port currently applies the deterministic split policy to Mega Gate.
+    m.def("use_deterministic_algorithms", [](bool enabled) { heuristics_runtime->use_deterministic_algorithms(enabled); });
     m.def("set_num_sms", [&](const int& new_num_sms) {
         device_runtime->set_num_sms(new_num_sms);
     });
