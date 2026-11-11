@@ -883,9 +883,8 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
         auto launch = [&](auto* output) {
             using OutputType = std::remove_pointer_t<decltype(output)>;
             using Runtime = BF16GemmCutlass3RuntimeT<OutputType>;
-            // The TSM epilogue shares storage with the BF16 mainloop. FP32 stores
-            // can require twice the BF16 epilogue storage, including explicit configs.
-            const int smem_size = std::max(SMSIZE, int(block_m * block_n * sizeof(OutputType)));
+            // Standard and custom TSM kernels share the same FP32 EVT staging.
+            const int smem_size = get_smem_size_bf16_810e(block_m, block_n, block_k, warp_m, num_stages);
             const auto gemm_args = typename Runtime::GemmArguments{
                 .mode = cutlass::gemm::GemmUniversalMode::kGemm,
                 .problem_shape = {m, n, k, 1},
@@ -914,7 +913,9 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             // the default mainloop, including their separate overlap policies.
             args.launch_info.denseS2Opt =
                 std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
-            const auto& code = Runtime::generate(args);
+            auto code = Runtime::generate(args);
+            code += fmt::format("\nstatic_assert(deep_gemm::GemmKernel::SharedStorageSize <= {}, "
+                                "\"BF16 dense launch storage is too small\");\n", smem_size);
             const auto& runtime = compiler->build("bf16_deep_gemm", code);
             const auto& kernel = runtime->kernel;
             int blocks_per_cu = 0;
@@ -1251,12 +1252,7 @@ static void bf16_gemm_tsm_impl_810e(const torch::Tensor& a, const torch::Tensor&
                                  threads == 256 && (tileOrder == 0 || tileOrder == 1) &&
                                  n % 128 > 0 && n % 128 <= 16 && !unrollK),
                 "Invalid 810E narrow N-tail launch");
-    const int mainSmem = (bm + bn) * bk * 2 * stages;
-    // The EVT stages WarpOnM*16 rows at a time, in FP32. Reserve one alignment
-    // unit for its empty callback storage/padding; a generated static_assert
-    // checks this bound against the actual CUTLASS SharedStorage type.
-    const int epiSmem = (bm / wm) * 16 * bn * 4 + 128;
-    const int smem = std::max(mainSmem, epiSmem);
+    const int64_t smem = get_smem_size_bf16_810e(bm, bn, bk, wm, stages);
     TORCH_CHECK(threads <= device_runtime->get_prop()->maxThreadsPerBlock &&
                 smem <= device_runtime->get_prop()->sharedMemPerMultiprocessor,
                 "810E TSM tile exceeds device resources");
@@ -1280,7 +1276,7 @@ static void bf16_gemm_tsm_impl_810e(const torch::Tensor& a, const torch::Tensor&
     typename Base::Args baseArgs{
         .launch_info = {bm, bn, bk, wm, wn, 1, stages, "Normal", "Default", name, false},
         .launch_args = {tileOrder == 1 ? dim3(ceil_div(m, bm), ceil_div(n, bn), groups) :
-                                      dim3(ceil_div(n, bn), ceil_div(m, bm), groups), dim3(threads), smem},
+                                      dim3(ceil_div(n, bn), ceil_div(m, bm), groups), dim3(threads), int(smem)},
         .kernel_params = Base::to_underlying_arguments_rtc(gemmArgs, nullptr)};
     typename Runtime::Args args{baseArgs, tileOrder, peelFirstK,
                                unrollK, narrowNTail};
@@ -1445,7 +1441,7 @@ static void bf16_gemm_810e(const torch::Tensor& a, const torch::Tensor& b, const
         TORCH_CHECK(n % (16 / d.element_size()) == 0 && (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) == 0,
                     "BF16 tiled GEMM requires vector-aligned output");
         if (!configs) configs = get_best_configs_810e(m, n, k, get_num_tensor_sms_810e());
-        check_configs_810e(configs, k, d.element_size());
+        check_configs_810e(configs, k);
     }
     if (d.scalar_type() == torch::kFloat)
         bf16_gemm_impl<float>(a, b, d, m, n, k, configs);
@@ -1459,8 +1455,8 @@ static void bf16_gemm(const torch::Tensor& a, const torch::Tensor& b, const torc
                       const std::optional<torch::Tensor>& c = std::nullopt) {
     if (!is_ppu1v5_device()) {
         configs = get_runtime_configs_bf16_810e(m, n, k, configs);
-        check_configs_810e(configs, k, d.element_size());
-        if (configs)
+        check_configs_810e(configs, k);
+        if (configs && !c)
             TORCH_CHECK(n % (16 / d.element_size()) == 0 &&
                         (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) == 0,
                         "BF16 dense explicit/LUT configs require vector-aligned output");

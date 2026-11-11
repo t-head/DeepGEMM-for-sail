@@ -337,6 +337,7 @@ def run_n1_cu_limit(check=True):
     import tempfile
 
     original = deep_gemm.get_num_sms()
+    original_config = deep_gemm.get_num_sms_config()
     original_log = os.environ.get('show_log')
     x, w = make_inputs(128, 1, 256)
     try:
@@ -377,7 +378,7 @@ def run_n1_cu_limit(check=True):
                                                rtol=0.01 if dtype == torch.bfloat16 else 0.001)
         print('Passed N=1 constrained CU dispatch')
     finally:
-        deep_gemm.set_num_sms(original)
+        deep_gemm.set_num_sms(original_config)
         if original_log is None:
             os.environ.pop('show_log', None)
         else:

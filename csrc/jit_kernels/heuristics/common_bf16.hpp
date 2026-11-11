@@ -639,13 +639,20 @@ struct BF16GemmConfig810E {
     bool narrowNTail = false;
 };
 
+// PPU 1.0 EVT stages WarpOnM*16 rows in FP32, regardless of the output dtype.
+// Include callback storage/alignment; the generated kernel checks this bound.
+static int64_t get_smem_size_bf16_810e(int bm, int bn, int bk, int wm, int stages) {
+    const int64_t mainSmem = int64_t(bm + bn) * bk * 2 * stages;
+    const int64_t epiSmem = int64_t(bm / wm) * 16 * bn * sizeof(float) + 128;
+    return std::max(mainSmem, epiSmem);
+}
+
 // Shared-memory residency bound for the measured 810E tile families. Register
 // allocation can impose a tighter limit; this is not a general occupancy model.
 static int64_t get_smem_waves_810e(int64_t m, int64_t n,
                                    const BF16GemmConfig810E& t) {
-    const int64_t mainBytes = int64_t(t.bm + t.bn) * t.bk * 2 * t.stages;
-    const int64_t epiBytes = int64_t(t.bm / t.wm) * 16 * t.bn * 4 + 128;
-    const int64_t resident = std::max<int64_t>(1, (256LL << 10) / std::max(mainBytes, epiBytes));
+    const int64_t smem = get_smem_size_bf16_810e(t.bm, t.bn, t.bk, t.wm, t.stages);
+    const int64_t resident = std::max<int64_t>(1, (256LL << 10) / smem);
     const int64_t blocks = ceil_div(m, int64_t(t.bm)) * ceil_div(n, int64_t(t.bn)) * t.splits;
     return ceil_div(blocks, resident * kTensorCUs810E);
 }
@@ -1281,8 +1288,7 @@ static ConfigResult get_best_configs_810e(int m, int n, int k, int numSms) {
 
 // Validate user tiles before packing, accumulation or JIT. In particular, zero
 // warp dimensions must not reach divisions in the lower-level launchers.
-static void check_configs_810e(const std::optional<ConfigResult>& configs, int64_t k,
-                               int outputBytes) {
+static void check_configs_810e(const std::optional<ConfigResult>& configs, int64_t k) {
     if (!configs || is_ppu1v5_device()) return;
     const auto [sms, bm, bn, bk, wm, wn, stages, unused] = *configs;
     const auto pow2 = [](int x) { return x > 0 && (x & (x - 1)) == 0; };
@@ -1294,10 +1300,15 @@ static void check_configs_810e(const std::optional<ConfigResult>& configs, int64
     TORCH_CHECK(k >= 64 && k % 32 == 0 && k / bk >= stages,
                 "BF16 config requires complete prologue K tiles (K>=64, K%32=0)");
     const int64_t threads = int64_t(bm / wm) * (bn / wn) * 32;
-    const int64_t smem = std::max(int64_t(bm + bn) * bk * 2 * stages, int64_t(bm) * bn * outputBytes);
+    const int64_t smem = get_smem_size_bf16_810e(bm, bn, bk, wm, stages);
     const auto prop = device_runtime->get_prop();
     TORCH_CHECK(threads <= prop->maxThreadsPerBlock && smem <= prop->sharedMemPerBlock,
                 "BF16 config exceeds device thread or shared-memory limits");
+    // Match GemmOccModel's BF16/FP32 accumulator and double-buffered operands.
+    // One warp must fit in one of the CU's eight WEs before JIT compilation.
+    const int64_t vregPerWarp = int64_t(wm) * wn / 32 + (wm + wn) / 2;
+    TORCH_CHECK(vregPerWarp <= prop->regsPerMultiprocessor / 32 / 8,
+                "BF16 config exceeds the per-warp register budget");
 }
 
 } // namespace deep_gemm_bf16_common

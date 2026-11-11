@@ -16,6 +16,10 @@ DenseGemm,data_type:bf16,m:4096,n:4096,k:7168,device:810e,num_sms:1
 
 # External LUT precedence, explicit override, miss and invalid tile rejection.
 DenseGemm,data_type:bf16,m:128,n:256,k:1024,device:810e,runtime_lut:1
+# Explicit tiles must reserve FP32 epilogue staging even for BF16 output.
+DenseGemm,data_type:bf16,m:128,n:128,k:64,device:810e,configs:[20,128,128,32,16,64,2]
+# With C, vector alignment applies to the FP32 product, not the final BF16 D.
+DenseGemm,data_type:bf16,m:7,n:12,k:128,device:810e,accumulate:alias,offset_d:1,configs:[20,32,64,32,16,32,2]
 # Small M with M/N tails and a final partial BK128 tile.
 DenseGemm,data_type:bf16,m:37,n:2056,k:1056
 DenseGemm,data_type:bf16,m:2048,n:4096,k:7168

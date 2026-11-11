@@ -118,6 +118,11 @@ public:
         return num_sms;
     }
 
+    // Unlike the resolved count, this value can restore automatic selection.
+    int get_num_sms_config() const {
+        return numSmsExplicit ? num_sms : 0;
+    }
+
     // The legacy default is a Tensor-CU budget on 810E/610E. SIMT kernels
     // can use all general CUs unless the caller explicitly sets a limit.
     int get_num_simt_sms() {

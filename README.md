@@ -125,6 +125,9 @@ its specialized paths also support guarded narrow outputs and partial tiles.
 
 #### 810E dense GEMM
 
+The native `bf16_gemm_strided_batched_nt` API is not exported by this build;
+its implementation is maintained separately from the dense GEMM changes.
+
 ```python
 # A[M,K], B[N,K]: contiguous BF16; D[M,N]: contiguous BF16 or FP32.
 deep_gemm.bf16_gemm_nt(a, b, d, c=c)  # D = A @ B.T + C; C is optional
@@ -150,7 +153,9 @@ precedence over automatic selection.
 The stable configuration tuple is
 `(num_sms, BM, BN, BK, WM, WN, stages, (0, 0, 0))`; its last field is reserved
 and shared-memory requirements are recomputed. Explicit/LUT tiled execution
-requires a 16-byte-aligned output and N divisible by 8 (BF16) or 4 (FP32).
+requires a 16-byte-aligned product output and N divisible by 8 (BF16) or 4 (FP32).
+With C, these requirements apply to the internal FP32 product; the final D
+only needs to satisfy the contiguous output contract above.
 See [utilities and environment variables](#utilities) for kernel controls and
 [checkin cases](tests/checkin/checkin_810e.list) for accuracy and rejection coverage.
 
@@ -579,6 +584,9 @@ In addition, the dense GEMM kernels only implement the NT layout. The `nn` / `tn
 The library provides some utility functions besides the above kernels:
 
 - `deep_gemm.set_num_sms` / `get_num_sms`: set/get the maximum CU count to use
+- `deep_gemm.get_num_sms_config`: return the restorable CU setting (`0` means
+  automatic). Save this value before a temporary override and restore it with
+  `set_num_sms`; `get_num_sms` returns the resolved count instead.
 - `deep_gemm.set_tc_util` / `get_tc_util`: set/get an approximated tensor cell utilization ratio
 - `deep_gemm.set_pdl` / `get_pdl`: enable/disable Programmatic Dependent Launch (PDL)
 - `deep_gemm.set_compile_mode` / `get_compile_mode`: set/get the JIT compile mode
