@@ -16,7 +16,7 @@
 //     per output tile, each stage carrying A + W_high + W_low together (A is
 //     streamed once), two back-to-back MMAs per k_step into two FP32
 //     accumulators, combined in registers and stored once.
-//     小M也使用双BF16 MMA融合，禁止K拆分或两次GEMV组合分流。
+//     Small M also uses fused dual-BF16 MMA; no K splitting or composed two-pass GEMV.
 // PPU1.0 (810E): fallback composition of two BF16 GEMMs through an FP32
 //     intermediate (still BF16 tensor-core rate, higher precision than
 //     BF16 x BF16 because the low part recovers the residual bits).
@@ -150,7 +150,7 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
 
 // Composition fallback: out = x@w_high^T + scale * x@w_low^T via two plain BF16
 // GEMMs through an FP32 intermediate (BF16 tensor-core rate, FP32 accumulation;
-// the low part recovers the residual bits). 仅PPU1.0使用组合路径。
+// the low part recovers the residual bits). Only PPU1.0 uses the composed path.
 static void bf16xfp32_gemm_composed(const torch::Tensor& lhs, const torch::Tensor& w_high,
                                     const torch::Tensor& w_low, const torch::Tensor& out,
                                     const double& scale, const int& m, const int& n, const int& k,
@@ -166,9 +166,9 @@ static void bf16xfp32_gemm_composed(const torch::Tensor& lhs, const torch::Tenso
         out.copy_(out_f32);
 }
 
-// 双B成本树仅由隔离调优集建立；预测值不是硬件occupancy或性能保证。
-// small_m来源ff054cbc，general来源d63dc371；两模型独立训练，耗时不跨版本合并。
-// 新默认策略仍须独立验证；不读取留出shape，不修改普通BF16配置。
+// The dual-B cost tree uses only the isolated tuning set; predictions do not guarantee occupancy or performance.
+// small_m comes from ff054cbc and general from d63dc371; models are trained separately without merging cross-version timings.
+// New defaults still require independent validation; held-out shapes and standard BF16 configs remain untouched.
 struct DualBCostNode { int feature; double value; int left, right; };
 struct DualBPolicyTile { int bm, bn, bk, wm, wn, stages, resource_mask; };
 static constexpr DualBCostNode kDualBSmallTree[] = {
@@ -323,7 +323,7 @@ static DualBPolicyTile select_dual_b_tile(int m, int n, int k, int num_sms, bool
 }
 
 static DualBPolicyTile get_dual_b_policy_tile(int m, int n, int k, int num_sms, bool fp32) {
-    // 每线程只缓存最近一次纯特征选配，避免重复调用的宿主成本；不缓存输入或输出。
+    // Cache only the last feature-based tile selection per thread to reduce repeated host overhead; never cache inputs or outputs.
     struct Cache { int m = 0, n = 0, k = 0, sms = 0; bool fp32 = false; DualBPolicyTile tile{}; };
     static thread_local Cache cache;
     if (cache.m == m && cache.n == n && cache.k == k && cache.sms == num_sms && cache.fp32 == fp32)
@@ -335,8 +335,8 @@ static DualBPolicyTile get_dual_b_policy_tile(int m, int n, int k, int num_sms, 
     return tile;
 }
 
-// PPU1.5双B融合launcher：按独立双累加器及双B SMEM预算核验配置。
-// 不支持的显式配置报错，不回退组合路径。
+// The PPU1.5 dual-B fused launcher validates configs against dual accumulators and the dual-B SMEM budget.
+// Unsupported explicit configs raise an error instead of falling back to composition.
 template <typename ElementOutput>
 static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch::Tensor& w_high,
                                           const torch::Tensor& w_low, const torch::Tensor& out,
@@ -357,14 +357,14 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
         || enabled("DG_BF16XFP32_STREAMED_LOW") || enabled("DG_BF16XFP32_STANDARD_S2")
         || enabled("DG_BF16XFP32_STREAMED_PAIRS") || enabled("DG_BF16XFP32_LAUNCH_BOUNDS2")
         || enabled("DG_BF16XFP32_PAIRS_M_FIRST");
-    // 仅已验证router默认入口自动使能；显式配置不自动改内核，0关闭，1保留实验入口。
+    // Auto-enable only validated router defaults; explicit configs keep their kernel, 0 disables, and 1 opts into the experiment.
     const bool packed_dual_n = (packed_env != nullptr && *packed_env == '1')
         || (packed_env == nullptr && !other_pipeline && !configs.has_value()
             && std::is_same_v<ElementOutput, float> && (m == 8 || m == 16)
             && n == 384 && k == 7168);
 
-    // 精确router形状固化维度与stride，消除重复DMA地址计算，不改变K累加顺序。
-    // M16仅packed默认入口新增固化；显式配置未设置实验开关时保持原行为。
+    // Specialize dimensions and strides for exact router shapes to remove repeated DMA address calculations without changing K order.
+    // Add M16 specialization only to the packed default path; explicit configs retain their behavior unless the experiment is enabled.
     const char* static_env = std::getenv("DG_BF16XFP32_STATIC_ROUTER");
     DG_HOST_ASSERT(static_env == nullptr || std::string(static_env) == "0" || std::string(static_env) == "1");
     const bool static_router = (static_env == nullptr || *static_env == '1')
@@ -384,35 +384,35 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
     } else if (std::is_same_v<ElementOutput, float> && (m == 8 || m == 16)
                && n == 384 && k == 7168) {
-        // 真实router decode专项：同卡64层轮转验证；扩大BK减少stage同步，仍由单warp累加完整K。
-        // 仅FP32输出的精确shape生效；显式配置、普通BF16及PPU1.0路径保持不变。
+        // Router decode specialization validated with 64-layer rotation on the same card; larger BK reduces stage sync while one warp covers full K.
+        // Apply only to exact shapes with FP32 output; explicit configs, standard BF16, and PPU1.0 paths remain unchanged.
         cfg = packed_dual_n
             ? std::make_tuple(std::min(num_sms, 39), 16, 16, 512,
                               16, 16, 512, 4, std::make_tuple(0, 0, 0))
             : std::make_tuple(std::min(num_sms, 24), 16, 16, 1024,
                               16, 16, 1024, 2, std::make_tuple(0, 0, 0));
     } else if (std::is_same_v<ElementOutput, float> && m == 128 && n == 384 && k == 7168) {
-        // router中短prefill：增加输出tile并行度，两套FP32累加链仍覆盖完整K。
+        // Short-to-medium router prefill: increase output-tile parallelism while both FP32 accumulation chains cover full K.
         cfg = std::make_tuple(std::min(num_sms, 39), 64, 32, 128,
                               16, 16, 128, 4, std::make_tuple(0, 0, 0));
     } else if (std::is_same_v<ElementOutput, float> && m == 256 && n == 384 && k == 7168) {
-        // 精确M256使用完整M tile与深stage；交错调优中两种模式均通过，不改变K顺序。
+        // Exact M256 uses a full M tile and deeper stages; both modes passed interleaved tuning without changing K order.
         cfg = std::make_tuple(std::min(num_sms, 39), 128, 32, 128,
                               16, 16, 128, 5, std::make_tuple(0, 0, 0));
     } else if (std::is_same_v<ElementOutput, float> && m == 512 && n == 384 && k == 7168) {
-        // 精确M512扩大warp M复用；融合内保留high/low两套完整K的FP32累加链。
+        // Exact M512 increases warp-M reuse while preserving separate high/low FP32 accumulation chains over full K.
         cfg = std::make_tuple(std::min(num_sms, 39), 128, 64, 64,
                               32, 16, 64, 4, std::make_tuple(0, 0, 0));
     } else if (std::is_same_v<ElementOutput, float> && m == 4096 && n == 384 && k == 7168) {
-        // router prefill回退点专项：独立轮转调优选择较小M tile，不改通用成本树。
+        // Target the router prefill regression point with a smaller M tile chosen by independent rotation tuning; keep the general cost tree unchanged.
         cfg = std::make_tuple(std::min(num_sms, 64), 128, 192, 64,
                               32, 32, 64, 4, std::make_tuple(0, 0, 0));
     } else if (std::is_same_v<ElementOutput, float> && m == 16384 && n == 384 && k == 7168) {
-        // router长prefill专项：增大warp N tile，双累加链覆盖完整K，隔离轮转验证无spill。
+        // Long router prefill uses a larger warp-N tile; both chains cover full K, with no spills in isolated rotation validation.
         cfg = std::make_tuple(std::min(num_sms, 64), 256, 128, 64,
                               64, 32, 64, 4, std::make_tuple(0, 0, 0));
     } else if (m == 512 && n == 2048 && k == 4096) {
-        // 专项锚点的两种输出已实测无spill；还需默认入口和深验复测。
+        // Both output types were measured spill-free at this anchor; default-path and deep validation still need reruns.
         cfg = std::make_tuple(std::min(num_sms, 32), 128, 256, 64,
                               64, 32, 64, 3, std::make_tuple(0, 0, 0));
     } else {
@@ -428,7 +428,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
                    && block_m % 16 == 0 && block_n % 16 == 0 && warp_m == 16 && warp_n == 16
                    && (block_m / 16) * (block_n / 16) <= 32));
 
-    // 双B完整SMEM预算；保持已有显式配置的stage剪枝契约。
+    // Budget the full dual-B SMEM footprint while preserving stage pruning for explicit configs.
     constexpr int kSmemPerCU = 256 * 1024;
     constexpr int kElemBytes = static_cast<int>(sizeof(cutlass::bfloat16_t));
     auto dual_smem_bytes = [&](int stages) {
@@ -438,13 +438,13 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     while (num_stages > 2 && dual_smem_bytes(num_stages) > kSmemPerCU)
         --num_stages;
     if (!configs.has_value() && dual_smem_bytes(num_stages) > kSmemPerCU) {
-        // 单B配置的BK可能过大，默认入口须选合法的融合配置，而非把合法shape判成不支持。
+        // Single-B configs may use excessive BK; select a valid fused default rather than rejecting a supported shape.
         block_k = std::min(block_k, 128);
         if (dual_smem_bytes(num_stages) > kSmemPerCU) block_k = 64;
         warp_k = block_k;
     }
     const int SMSIZE = dual_smem_bytes(num_stages);
-    // 不用组合fallback伪装融合；无法容纳的显式配置作为不支持项报告。
+    // Never disguise composition as fusion; report explicit configs that exceed the budget as unsupported.
     DG_HOST_ASSERT(num_sms_new > 0 && num_stages >= 2);
     DG_HOST_ASSERT(SMSIZE <= kSmemPerCU);
     DG_HOST_ASSERT(warp_k == block_k);
@@ -478,7 +478,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     if (blocks_per_cu < 1) blocks_per_cu = 1;
 
     dim3 grid;
-    // persistent grid不得包含超过输出tile数的无工作CTA。
+    // Cap the persistent grid at the output-tile count to avoid idle CTAs.
     grid.x = std::min(blocks_per_cu * num_sms_new,
                       ceil_div(m, block_m) * ceil_div(n, packed_dual_n ? block_n / 2 : block_n));
 
@@ -487,14 +487,14 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     if (std::is_same_v<ElementOutput, float>) kernel_name += "_fp32";
     if (packed_dual_n) kernel_name += "_packed_dual_n";
     if (static_router) kernel_name += "_static_router_m" + std::to_string(m);
-    // 精确长prefill实验：只固化外层stage索引，各累加链仍按完整K递增。
+    // Exact long-prefill experiment: specialize only outer stage indices; each chain still advances through full K in order.
     const char* stages_env = std::getenv("DG_BF16XFP32_STATIC_STAGES");
     DG_HOST_ASSERT(stages_env == nullptr || std::string(stages_env) == "0" || std::string(stages_env) == "1");
     const bool static_stages = stages_env != nullptr && *stages_env == '1';
     DG_HOST_ASSERT(!static_stages || (static_router && !packed_dual_n
         && std::is_same_v<ElementOutput, float> && m == 16384 && n == 384 && k == 7168));
     if (static_stages) kernel_name += "_static_stages";
-    // low片段即用即载实验：不预转换、不预合并权重，两套FP32累加器保留完整K。
+    // Load low fragments on demand without preconverting or premerging weights; both FP32 accumulators cover full K.
     const char* low_env = std::getenv("DG_BF16XFP32_STREAMED_LOW");
     DG_HOST_ASSERT(low_env == nullptr || std::string(low_env) == "0" || std::string(low_env) == "1");
     const bool streamed_low = low_env != nullptr && *low_env == '1';
@@ -506,14 +506,14 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     const bool streamed_pairs = pairs_env != nullptr && *pairs_env == '1';
     DG_HOST_ASSERT(!streamed_pairs || streamed_low);
     if (streamed_pairs) kernel_name += "_streamed_pairs";
-    // 融合专用M子块编排实验，默认关闭；不改变每个输出的K步累加顺序。
+    // Fusion-only M-subtile scheduling experiment, disabled by default; preserve each output's K-step accumulation order.
     const char* mfirst_env = std::getenv("DG_BF16XFP32_PAIRS_M_FIRST");
     DG_HOST_ASSERT(mfirst_env == nullptr || std::string(mfirst_env) == "0" || std::string(mfirst_env) == "1");
     const bool pairs_m_first = mfirst_env != nullptr && *mfirst_env == '1';
     DG_HOST_ASSERT(!pairs_m_first || (streamed_pairs && static_router && !packed_dual_n
         && std::is_same_v<ElementOutput, float> && m == 16384 && n == 384 && k == 7168));
     if (pairs_m_first) kernel_name += "_pairs_m_first";
-    // 精确双stage实验复用原标准wait/barrier路径；三路复制仍在回收stage前完成同步。
+    // The exact two-stage experiment reuses the standard wait/barrier path; synchronize all three copies before stage reuse.
     const char* s2_env = std::getenv("DG_BF16XFP32_STANDARD_S2");
     DG_HOST_ASSERT(s2_env == nullptr || std::string(s2_env) == "0" || std::string(s2_env) == "1");
     const bool standard_s2 = s2_env != nullptr && *s2_env == '1';
@@ -521,7 +521,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
         && std::is_same_v<ElementOutput, float> && m == 16384 && n == 384 && k == 7168
         && num_stages == 2));
     if (standard_s2) kernel_name += "_standard_s2";
-    // 双CTA编译资源实验仅设置launch_bounds下限；不将静态SMEM估算宣称为实际驻留。
+    // The dual-CTA resource experiment sets only the launch_bounds minimum; static SMEM estimates do not prove actual residency.
     const char* bounds_env = std::getenv("DG_BF16XFP32_LAUNCH_BOUNDS2");
     DG_HOST_ASSERT(bounds_env == nullptr || std::string(bounds_env) == "0" || std::string(bounds_env) == "1");
     const bool launch_bounds2 = bounds_env != nullptr && *bounds_env == '1';
@@ -530,7 +530,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
         && SMSIZE <= kSmemPerCU / 2 && block.x <= 512));
     const int min_blocks = launch_bounds2 ? 2 : 1;
     if (launch_bounds2) kernel_name += "_launch_bounds2";
-    // 实验开关不改变公开配置元组；仅单MMA tile/warp可以使用完整K tile寄存器预取。
+    // The experiment preserves the public config tuple; full-K-tile register prefetch requires one MMA tile per warp.
     const char* prefetch_env = std::getenv("DG_BF16XFP32_FULL_K_PREFETCH");
     DG_HOST_ASSERT(prefetch_env == nullptr || std::string(prefetch_env) == "0"
                    || std::string(prefetch_env) == "1");
@@ -572,7 +572,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     const char* epilogue_env = std::getenv("DG_BF16XFP32_VALID_EPILOGUE");
     DG_HOST_ASSERT(prologue_env == nullptr || std::string(prologue_env) == "0" || std::string(prologue_env) == "1");
     DG_HOST_ASSERT(epilogue_env == nullptr || std::string(epilogue_env) == "0" || std::string(epilogue_env) == "1");
-    // 精确长prefill默认实验：下一tile的stage0与输出合并重叠，显式配置保持原行为。
+    // Exact long-prefill default experiment: overlap the next tile's stage0 with output merging; preserve explicit-config behavior.
     const bool router_overlap = !other_pipeline && !packed_dual_n && !configs.has_value()
         && std::is_same_v<ElementOutput, float> && m == 16384 && n == 384 && k == 7168;
     const bool overlap_prologue = (prologue_env != nullptr && *prologue_env == '1')
@@ -641,7 +641,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
 }
 
 // Public launcher: dispatches on the device generation.
-//   PPU1.5 : 所有M使用双B融合，完整K独立FP32累加，输出BF16或FP32。
+//   PPU1.5 : All M use dual-B fusion with independent full-K FP32 accumulation and BF16 or FP32 output.
 //   PPU1.0 : composed two-GEMM fallback (out = x@w_high^T, then out +=
 //            scale * x@w_low^T).
 // `configs` (optional) follows the 8-element public ConfigTuple contract of

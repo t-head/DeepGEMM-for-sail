@@ -126,7 +126,7 @@ struct DualBMainloop {
 
   static constexpr int kKPairs = kKStepsPerWarp / 2;
 
-  // 单个非边界pair，不含stage操作；显式chunk和旧bounded复用同一双累加链。
+  // A single non-boundary pair has no stage operations; explicit chunks and legacy bounded loops reuse the same dual accumulation chains.
   static __device__ __forceinline__ void run_one_inner_k_pair(
       int pair,
       int const (&base_a)[kMmasPerWarpM],
@@ -162,7 +162,7 @@ struct DualBMainloop {
     }
   }
 
-  // 实验只循环非边界K pair；末尾pair仍调用原模板，stage同步位置和完整K顺序不变。
+  // Loop only over non-boundary K pairs; the final pair uses the original template, preserving stage sync points and full-K order.
   static __device__ __forceinline__ void run_inner_k_pairs_bounded(
       int const (&base_a)[kMmasPerWarpM],
       int const (&base_bh)[kMmasPerWarpN],
@@ -186,7 +186,7 @@ struct DualBMainloop {
           run_one_inner_k_pair(base + offset, base_a, base_bh, base_bl,
                                accum_high, accum_low, a_reg, bh_reg, bl_reg);
       }
-      // 编译期固定尾部，不重复最后的stage边界pair；buffer继续承接上一chunk。
+      // Specialize the tail at compile time without repeating the final stage-boundary pair; carry buffers over from the previous chunk.
       #pragma unroll
       for (int pair = kFullPairs; pair < kKPairs - 1; ++pair)
         run_one_inner_k_pair(pair, base_a, base_bh, base_bl,
@@ -350,7 +350,7 @@ struct DualBMainloop {
                               tsm_add_base_a, tsm_add_base_bh, tsm_add_base_bl,
                               a_buf1, bh_buf1, bl_buf1);
     }
-    // 实验仅将下一步S2R放在当前high/low MMA之间；各累加链K顺序和所有同步点不变。
+    // Place the next S2R between the current high/low MMAs; preserve each chain's K order and all synchronization points.
     if constexpr (DG_DUAL_B_MMA_S2R_OVERLAP) {
       #pragma unroll
       for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
@@ -364,8 +364,8 @@ struct DualBMainloop {
                               a_buf1, bh_buf1, bl_buf1);
     }
     if constexpr (DG_DUAL_B_EARLY_G2S && KPair == kKPairs - 1) {
-      // 当前stage最后两个K步的三路操作数均已在寄存器中；原barrier保证所有warp
-      // 完成读取后才回收stage。仅提前复制发射，完整K累加顺序及同步次数保持不变。
+      // All three operands for this stage's final two K steps are in registers; the original barrier ensures all warps
+      // finish reading before stage reuse. Only issue copies earlier; preserve full-K accumulation order and the synchronization count.
       issue_g2s_and_wait(warp_id, issue_g2s, g2s_smem_a, g2s_smem_b_high, g2s_smem_b_low,
                          params, m_offset, n_offset, k_offset_next);
     }
@@ -454,8 +454,8 @@ struct DualBMainloop {
     }
   }
 
-  // 融合专用实验：A/high继续双缓冲，low按当前K步与N子tile即用即载。
-  // 缩短low片段存活期，不改变任何输出元素的high/low完整K累加顺序。
+  // Fusion-only experiment: keep A/high double-buffered and load low on demand for the current K step and N subtile.
+  // Shorten low-fragment lifetimes without changing any output element's full-K high/low accumulation order.
   template <int Step>
   static __device__ __forceinline__ void load_ah(
       int const (&base_a)[kMmasPerWarpM],
@@ -497,8 +497,8 @@ struct DualBMainloop {
         }
       }
       if constexpr (Step + 1 == kKStepsPerWarp) {
-        // 最后一步low也已被所有warp读取，才用原barrier回收stage。
-        // wait/fence与空group数量保持不变，仅将回收点推迟到该stage的MMA结束。
+        // Reuse the stage with the original barrier only after all warps have read the final low step.
+        // Preserve wait/fence operations and empty-group counts; defer stage reuse until its MMAs complete.
         issue_g2s_and_wait(warp_id, issue_g2s, g2s_a, g2s_bh, g2s_bl,
                            params, m_offset, n_offset, k_offset_next);
         Element const* elems = reinterpret_cast<Element const*>(smem);
@@ -522,8 +522,8 @@ struct DualBMainloop {
     }
   }
 
-  // 每个N子tile内部按S0、S1递增累加；末尾N的两步low已在寄存器后才回收stage。
-  // 不提前覆盖其他warp尚未读取的low，保留原wait/fence及空group数量。
+  // Accumulate each N subtile in S0, S1 order; reuse the stage only after both low steps for the final N subtile are in registers.
+  // Do not overwrite low before other warps read it; preserve the original wait/fence operations and empty-group counts.
   template <int Pair>
   static __device__ __forceinline__ void run_streamed_pairs(
       int const (&base_a)[kMmasPerWarpM],
@@ -550,8 +550,8 @@ struct DualBMainloop {
                                params, m_offset, n_offset, k_offset_next);
         }
         if constexpr (DG_DUAL_B_PAIRS_M_FIRST) {
-          // 同一N子tile先完成所有M子块的s0，再发出s1，增加独立累加链间距。
-          // 每个输出的K步仍为s0、s1；两套累加器、low加载与stage同步点不变。
+          // For each N subtile, finish s0 for all M subtiles before issuing s1 to increase spacing between independent accumulation chains.
+          // Each output retains s0, s1 K-step order; both accumulators, low loads, and stage synchronization points remain unchanged.
           #pragma unroll
           for (int mi = 0; mi < kMmasPerWarpM; ++mi) {
             MmaAtom::mma(accum_high[mi][ni], a_reg[0][mi], bh_reg[0][ni], accum_high[mi][ni]);
@@ -689,8 +689,8 @@ struct DualBMainloop {
     }
   }
 
-  // 小warp实验变体：先把当前K tile的三路片段完整放入寄存器，再复用stage发射G2S。
-  // 保留原有单warp发射、wait/fence及CTA barrier，当前tile的MMA与下一tile复制重叠。
+  // Small-warp experiment: preload all three operands of the current K tile into registers before reusing the stage for G2S.
+  // Preserve single-warp issue, wait/fence operations, and CTA barriers; overlap current-tile MMAs with next-tile copies.
   static __device__ __forceinline__ void mma_tile_prefetch_all(
       int stage, char* smem, int warp_row, int warp_col, int warp_id,
       bool issue_g2s, Params const& params, int m_offset, int n_offset, int k_offset_next,
@@ -717,7 +717,7 @@ struct DualBMainloop {
                        params, m_offset, n_offset, k_offset_next);
     #pragma unroll
     for (int step = 0; step < kKSteps; ++step) {
-      // 每套累加链内部的K顺序不变，high和low始终独立累加。
+      // Preserve K order within each chain; high and low always accumulate independently.
       MmaAtom::mma(accum_high[0][0], a[step], bh[step], accum_high[0][0]);
       MmaAtom::mma(accum_low[0][0], a[step], bl[step], accum_low[0][0]);
     }
@@ -770,8 +770,8 @@ struct DualBMainloop {
     if constexpr (DG_DUAL_B_STATIC_STAGES) {
       static_assert(!DG_DUAL_B_STATIC_STAGES || !DG_DUAL_B_FULL_K_PREFETCH,
                     "static stages uses the original double-buffered fragments");
-      // 外层只循环完整stage周期，内层索引编译期展开；保留每一步原wait/fence、
-      // CTA barrier与无条件空group。尾部仍按K递增，不额外计算或加载K tile。
+      // Loop over complete stage cycles and unroll inner indices at compile time; preserve every original wait/fence,
+      // CTA barrier, and unconditional empty group. The tail advances in K order without computing or loading extra K tiles.
       #pragma unroll 1
       for (int base = 0; base < total_k_tiles; base += STAGES) {
         #pragma unroll
@@ -823,7 +823,7 @@ struct DualBMainloop {
     __syncthreads();
   }
 
-  // 与普通BF16一样，stage0由kernel预发射；三操作数属于同一个async group。
+  // As in standard BF16, the kernel preissues stage0; all three operands belong to the same async group.
   static __device__ __forceinline__ void issue_prologue_stage0(
       char* smem, int warp_id, Params const& params, int m_offset, int n_offset) {
     Element* elems = reinterpret_cast<Element*>(smem);

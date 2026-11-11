@@ -53,8 +53,8 @@ namespace kernel {
 //   - SMEM holds an extra B operand per stage:
 //       STAGES * (BLOCK_M + 2 * BLOCK_N) * BLOCK_K elements
 //     (the host launcher must size shared memory from this formula).
-//   - 融合专用实验可将下一输出tile的三路stage0与当前输出写回重叠。
-//     跨tile预加载与有效区域合并均默认关闭，不影响普通BF16路径。
+//   - Fusion-only experiments can overlap the next output tile's three-operand stage0 with the current output store.
+//     Cross-tile prefetch and valid-region merging default to off and leave the standard BF16 path unchanged.
 //
 // Layout contract (identical to the BF16 dense NT path):
 //   A          : row-major [M, K], lda = K
@@ -102,7 +102,7 @@ struct GemmBf16xFp32Kernel {
 
   static constexpr int kWarpsM = BLOCK_M / WARP_M;
   static constexpr int kWarpsN = BLOCK_N / WARP_N;
-  // 双B融合禁止K拆分：一个warp的两套累加器各自覆盖完整K。
+  // Dual-B fusion forbids K splitting: both accumulators in a warp independently cover full K.
   static constexpr int kWarpsK  = BLOCK_K / WARP_K;
   static constexpr int kWarpsMN = kWarpsM * kWarpsN;
   static constexpr int kThreads = kWarpsMN * kWarpsK * 32;
@@ -144,7 +144,7 @@ struct GemmBf16xFp32Kernel {
   static constexpr int MaxThreadsPerBlock = kThreads;
   static constexpr int MinBlocksPerMultiprocessor = 1;
 
-  // 融合专用输出：只在有效行列合并high/low；不改共享的普通BF16 epilogue。
+  // Fusion-only output: merge high/low only at valid rows and columns; leave the shared standard BF16 epilogue unchanged.
   static __device__ __forceinline__ void store_valid_dual(
       Params const& params, int m_offset, int n_offset,
       int warp_row, int warp_col, int lane,
@@ -224,7 +224,7 @@ struct GemmBf16xFp32Kernel {
       Mainloop::run(ml_params, smem, warp_id, warp_row, warp_col, warp_k,
                     m_offset, n_offset, accum_high, accum_low, DG_DUAL_B_OVERLAP_PROLOGUE);
 
-      // 当前K已完成且SMEM已释放；下一输出tile的三路stage0与合并/写出重叠。
+      // Current K is complete and SMEM is free; overlap the next tile's three-operand stage0 with merging and storing.
       if constexpr (DG_DUAL_B_OVERLAP_PROLOGUE) {
         tile_valid = scheduler.fetch_next_work(m_block, n_block);
         if (tile_valid)
@@ -235,7 +235,7 @@ struct GemmBf16xFp32Kernel {
         store_valid_dual(params, m_offset, n_offset, warp_row, warp_col, lane,
                          accum_high, accum_low);
       } else {
-        // 两套独立FP32累加器各自累加完整K之后，只在寄存器中执行scale合并。
+        // After both independent FP32 accumulators cover full K, apply the scaled merge only in registers.
         #pragma unroll
         for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
           #pragma unroll
@@ -259,8 +259,8 @@ struct GemmBf16xFp32Kernel {
 };
 
 #if defined(DG_DUAL_B_PACKED_N) && DG_DUAL_B_PACKED_N
-// router小M实验：把8列high和8列low放进同一MMA的两个N半区。
-// 两半区各自按完整K顺序独立FP32累加；仅在写出时合并，不拆K或改精度。
+// Small-M router experiment: pack 8 high columns and 8 low columns into the two N halves of one MMA.
+// Each half independently accumulates full K in order in FP32; merge only at the store, without K splitting or precision changes.
 template <typename ElementOutput, int BLOCK_M, int BLOCK_N, int BLOCK_K, int STAGES>
 struct PackedDualNRouterKernel {
   using Element = cutlass::bfloat16_t;
@@ -294,7 +294,7 @@ struct PackedDualNRouterKernel {
     for (int j = 0; j < BLOCK_K / 64; ++j) {
       arch::aiu_bulk_tensor_load_bf16<BLOCK_M, 64>(a + j * BLOCK_M * 64,
           p.ptr_A, p.M, p.lda, mo, ko + j * 64);
-      // 每个swizzle子tile中，high占前8行，low占后8行；不在计时前预打包权重。
+      // Each swizzle subtile stores high in the first 8 rows and low in the last 8; weights are not prepacked before timing.
       #pragma unroll
       for (int q = 0; q < BLOCK_N / 16; ++q) {
         arch::aiu_bulk_tensor_load_bf16<8, 64>(b + j * BLOCK_N * 64 + q * 16 * 64,
