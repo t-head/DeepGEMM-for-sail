@@ -8,9 +8,20 @@
 #include <cutlass/arch/memory_ppu.h>
 #include <deep_gemm/cute_free/arch/ppu_common.cuh>
 #include <deep_gemm/cute_free/mainloop/dual_b_mainloop.cuh>
-#include <deep_gemm/cute_free/epilogue/warp_k_reduce.cuh>
 #include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
+
+#ifndef DG_DUAL_B_OVERLAP_PROLOGUE
+#define DG_DUAL_B_OVERLAP_PROLOGUE 0
+#endif
+#ifndef DG_DUAL_B_VALID_EPILOGUE
+#define DG_DUAL_B_VALID_EPILOGUE 0
+#endif
+#ifndef DG_DUAL_B_ROUTER_M
+#define DG_DUAL_B_ROUTER_M 0
+#define DG_DUAL_B_ROUTER_N 0
+#define DG_DUAL_B_ROUTER_K 0
+#endif
 
 namespace deep_gemm {
 namespace kernel {
@@ -42,9 +53,8 @@ namespace kernel {
 //   - SMEM holds an extra B operand per stage:
 //       STAGES * (BLOCK_M + 2 * BLOCK_N) * BLOCK_K elements
 //     (the host launcher must size shared memory from this formula).
-//   - No OverlapPrologue variant: the next-tile prologue overlap assumes a
-//     single mainloop pass per tile and does not compose with the dual-B
-//     sequence. The host therefore never sets it for this kernel.
+//   - 融合专用实验可将下一输出tile的三路stage0与当前输出写回重叠。
+//     跨tile预加载与有效区域合并均默认关闭，不影响普通BF16路径。
 //
 // Layout contract (identical to the BF16 dense NT path):
 //   A          : row-major [M, K], lda = K
@@ -92,7 +102,7 @@ struct GemmBf16xFp32Kernel {
 
   static constexpr int kWarpsM = BLOCK_M / WARP_M;
   static constexpr int kWarpsN = BLOCK_N / WARP_N;
-  // WarpOnK: kWarpsK warp groups each cover WARP_K of the CTA's BLOCK_K.
+  // 双B融合禁止K拆分：一个warp的两套累加器各自覆盖完整K。
   static constexpr int kWarpsK  = BLOCK_K / WARP_K;
   static constexpr int kWarpsMN = kWarpsM * kWarpsN;
   static constexpr int kThreads = kWarpsMN * kWarpsK * 32;
@@ -106,7 +116,7 @@ struct GemmBf16xFp32Kernel {
   static_assert(WARP_M % kMmaM == 0, "WARP_M must be a multiple of kMmaM");
   static_assert(WARP_N % kMmaN == 0, "WARP_N must be a multiple of kMmaN");
   static_assert(BLOCK_K % kMmaK == 0, "BLOCK_K must be a multiple of kMmaK");
-  static_assert(BLOCK_K % WARP_K == 0, "BLOCK_K must be a multiple of WARP_K");
+  static_assert(WARP_K == BLOCK_K, "dual-B fused kernel forbids K splitting");
   static_assert(STAGES >= 2, "STAGES must be >= 2 for the async pipeline");
 
   // Must stay byte-identical to the host-side Bf16xFp32Params in
@@ -134,14 +144,56 @@ struct GemmBf16xFp32Kernel {
   static constexpr int MaxThreadsPerBlock = kThreads;
   static constexpr int MinBlocksPerMultiprocessor = 1;
 
-  // The WarpOnK reduction reuses the mainloop's A/B SMEM as float scratch.
-  static constexpr int kSmemFloatCapacity =
-      int(sizeof(SharedStorage) / sizeof(float));
-  using WarpKReduce = epilogue::WarpKReduce<
-      kWarpsK, kWarpsMN, kMmasPerWarpM, kMmasPerWarpN, kAccumPerThread,
-      kSmemFloatCapacity>;
+  // 融合专用输出：只在有效行列合并high/low；不改共享的普通BF16 epilogue。
+  static __device__ __forceinline__ void store_valid_dual(
+      Params const& params, int m_offset, int n_offset,
+      int warp_row, int warp_col, int lane,
+      float const (&high)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      float const (&low)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread]) {
+    using Traits = typename Epilogue::ElemTraits;
+    using Storage = typename Epilogue::StorageType;
+    using Packed = typename Epilogue::PackedType;
+    const int first_row = m_offset + warp_row * WARP_M + lane / Epilogue::kThreadsCol;
+    const int first_col = n_offset + warp_col * WARP_N
+                        + (lane % Epilogue::kThreadsCol) * Epilogue::kColsPerThread;
+    #pragma unroll
+    for (int mm = 0; mm < kMmasPerWarpM; ++mm) {
+      #pragma unroll
+      for (int half_m = 0; half_m < 2; ++half_m) {
+        const int row = first_row + mm * kMmaM + half_m * Epilogue::kHalfMmaM;
+        if (row < params.M) {
+          Storage* row_ptr = reinterpret_cast<Storage*>(params.ptr_D)
+                             + int64_t(row) * params.ldd + first_col;
+          #pragma unroll
+          for (int nn = 0; nn < kMmasPerWarpN; ++nn) {
+            #pragma unroll
+            for (int half_n = 0; half_n < 2; ++half_n) {
+              const int col = first_col + nn * kMmaN + half_n * Epilogue::kHalfMmaN;
+              if (Epilogue::kIsAlignedN || col + Traits::kVecWidth - 1 < params.N) {
+                const int i = 2 * half_m + 4 * half_n;
+                const float lo = high[mm][nn][i] + params.low_scale * low[mm][nn][i];
+                const float hi = high[mm][nn][i + 1] + params.low_scale * low[mm][nn][i + 1];
+                *reinterpret_cast<Packed*>(row_ptr + nn * kMmaN + half_n * Epilogue::kHalfMmaN)
+                    = Traits::cvt_pack(hi, lo);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 
-  __device__ void operator()(Params const& params, char* smem) {
+  __device__ void operator()(Params const& runtime_params, char* smem) {
+    Params params = runtime_params;
+    if constexpr (DG_DUAL_B_ROUTER_M != 0) {
+      params.M = DG_DUAL_B_ROUTER_M;
+      params.N = DG_DUAL_B_ROUTER_N;
+      params.K = params.lda = params.ldb = DG_DUAL_B_ROUTER_K;
+      params.ldd = DG_DUAL_B_ROUTER_N;
+      params.scheduler.shape_m = DG_DUAL_B_ROUTER_M;
+      params.scheduler.shape_n = DG_DUAL_B_ROUTER_N;
+      params.scheduler.shape_k = DG_DUAL_B_ROUTER_K;
+    }
     using Scheduler = DenseGemmScheduler<BLOCK_M, BLOCK_N>;
     Scheduler scheduler(params.scheduler);
 
@@ -157,41 +209,205 @@ struct GemmBf16xFp32Kernel {
         params.M, params.N, params.K, params.lda, params.ldb};
 
     uint32_t m_block = 0, n_block = 0;
-    while (scheduler.fetch_next_work(m_block, n_block)) {
+    bool tile_valid = scheduler.fetch_next_work(m_block, n_block);
+    if constexpr (DG_DUAL_B_OVERLAP_PROLOGUE) {
+      if (tile_valid)
+        Mainloop::issue_prologue_stage0(smem, warp_id, ml_params,
+            static_cast<int>(m_block) * BLOCK_M, static_cast<int>(n_block) * BLOCK_N);
+    }
+    while (tile_valid) {
       int m_offset = static_cast<int>(m_block) * BLOCK_M;
       int n_offset = static_cast<int>(n_block) * BLOCK_N;
 
       float accum_high[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread] = {};
       float accum_low[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread] = {};
       Mainloop::run(ml_params, smem, warp_id, warp_row, warp_col, warp_k,
-                    m_offset, n_offset, accum_high, accum_low);
+                    m_offset, n_offset, accum_high, accum_low, DG_DUAL_B_OVERLAP_PROLOGUE);
 
-      // Combine the two FP32 accumulators before the (optional) WarpOnK
-      // reduction: low_scale is uniform, so this is mathematically identical
-      // to reducing first and scaling afterwards.
-      #pragma unroll
-      for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
+      // 当前K已完成且SMEM已释放；下一输出tile的三路stage0与合并/写出重叠。
+      if constexpr (DG_DUAL_B_OVERLAP_PROLOGUE) {
+        tile_valid = scheduler.fetch_next_work(m_block, n_block);
+        if (tile_valid)
+          Mainloop::issue_prologue_stage0(smem, warp_id, ml_params,
+              static_cast<int>(m_block) * BLOCK_M, static_cast<int>(n_block) * BLOCK_N);
+      }
+      if constexpr (DG_DUAL_B_VALID_EPILOGUE) {
+        store_valid_dual(params, m_offset, n_offset, warp_row, warp_col, lane,
+                         accum_high, accum_low);
+      } else {
+        // 两套独立FP32累加器各自累加完整K之后，只在寄存器中执行scale合并。
         #pragma unroll
-        for (int mma_n = 0; mma_n < kMmasPerWarpN; ++mma_n) {
+        for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
           #pragma unroll
-          for (int i = 0; i < kAccumPerThread; ++i) {
-            accum_high[mma_m][mma_n][i] +=
-                params.low_scale * accum_low[mma_m][mma_n][i];
+          for (int mma_n = 0; mma_n < kMmasPerWarpN; ++mma_n) {
+            #pragma unroll
+            for (int i = 0; i < kAccumPerThread; ++i) {
+              accum_high[mma_m][mma_n][i] +=
+                  params.low_scale * accum_low[mma_m][mma_n][i];
+            }
           }
         }
-      }
 
-      WarpKReduce::run(accum_high, reinterpret_cast<float*>(smem),
-                       warp_mn, warp_k, lane);
-
-      if (warp_k == 0) {
         Epilogue::store(m_offset, n_offset, warp_row, warp_col, lane,
                         params.ptr_D, params.ldd, params.M, params.N,
                         accum_high);
       }
+      if constexpr (!DG_DUAL_B_OVERLAP_PROLOGUE)
+        tile_valid = scheduler.fetch_next_work(m_block, n_block);
     }
   }
 };
+
+#if defined(DG_DUAL_B_PACKED_N) && DG_DUAL_B_PACKED_N
+// router小M实验：把8列high和8列low放进同一MMA的两个N半区。
+// 两半区各自按完整K顺序独立FP32累加；仅在写出时合并，不拆K或改精度。
+template <typename ElementOutput, int BLOCK_M, int BLOCK_N, int BLOCK_K, int STAGES>
+struct PackedDualNRouterKernel {
+  using Element = cutlass::bfloat16_t;
+  using Mma = mma::Bf16MmaAtom;
+  using S2RA = copy::TsmS2RAtom<Element, BLOCK_M, BLOCK_K, false>;
+  using S2RB = copy::TsmS2RAtom<Element, BLOCK_N, BLOCK_K, true>;
+  static_assert(std::is_same_v<ElementOutput, float>, "packed router requires FP32 output");
+  static_assert(BLOCK_K % 64 == 0 && STAGES >= 2, "packed router requires complete K tiles");
+  static_assert(BLOCK_M % 16 == 0 && BLOCK_N % 16 == 0, "packed router uses complete physical MMA tiles");
+  static constexpr int MaxThreadsPerBlock = (BLOCK_M / 16) * (BLOCK_N / 16) * 32;
+  static constexpr int MinBlocksPerMultiprocessor = 1;
+  static constexpr int kSteps = BLOCK_K / 16;
+  struct Params {
+    Element const* ptr_A;
+    Element const* ptr_B_high;
+    Element const* ptr_B_low;
+    ElementOutput* ptr_D;
+    float low_scale;
+    int M, N, K;
+    int lda, ldb, ldd;
+    DenseGemmTileSchedulerArguments scheduler;
+  };
+  struct SharedStorage {
+    alignas(128) Element smem[STAGES * (BLOCK_M + BLOCK_N) * BLOCK_K];
+  };
+  static constexpr int SharedStorageSize = sizeof(SharedStorage);
+
+  static __device__ __forceinline__ void load_stage(
+      Element* a, Element* b, Params const& p, int mo, int no, int ko) {
+    #pragma unroll
+    for (int j = 0; j < BLOCK_K / 64; ++j) {
+      arch::aiu_bulk_tensor_load_bf16<BLOCK_M, 64>(a + j * BLOCK_M * 64,
+          p.ptr_A, p.M, p.lda, mo, ko + j * 64);
+      // 每个swizzle子tile中，high占前8行，low占后8行；不在计时前预打包权重。
+      #pragma unroll
+      for (int q = 0; q < BLOCK_N / 16; ++q) {
+        arch::aiu_bulk_tensor_load_bf16<8, 64>(b + j * BLOCK_N * 64 + q * 16 * 64,
+            p.ptr_B_high, p.N, p.ldb, no + q * 8, ko + j * 64);
+        arch::aiu_bulk_tensor_load_bf16<8, 64>(b + j * BLOCK_N * 64 + q * 16 * 64 + 8 * 64,
+            p.ptr_B_low, p.N, p.ldb, no + q * 8, ko + j * 64);
+      }
+    }
+  }
+
+  template <int Pair>
+  static __device__ __forceinline__ void run_pairs(
+      Params const& p, Element* a, Element* b, int stage, int next,
+      int mo, int no, int next_kt, bool issue, int base_a, int base_b,
+      int warp_id, int warp_row, int warp_col,
+      float (&acc)[8], uint32_t (&ar)[2][4], uint32_t (&br)[2][4]) {
+    if constexpr (Pair < kSteps / 2) {
+      S2RA::load(base_a, 2 * Pair + 1, ar[1]);
+      S2RB::load(base_b, 2 * Pair + 1, br[1]);
+      Mma::mma(acc, ar[0], br[0], acc);
+      if constexpr (Pair == kSteps / 2 - 1) {
+        cutlass::arch::cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        if (issue && warp_id == 0)
+          load_stage(a + stage * BLOCK_M * BLOCK_K, b + stage * BLOCK_N * BLOCK_K,
+                     p, mo, no, next_kt * BLOCK_K);
+        cutlass::arch::cp_async_fence();
+        if constexpr (STAGES == 2) {
+          cutlass::arch::cp_async_wait<1>();
+          __syncthreads();
+        }
+        int na = arch::smem_ptr_to_tsm_base(a + next * BLOCK_M * BLOCK_K, warp_row * 16 * 8);
+        int nb = arch::smem_ptr_to_tsm_base(b + next * BLOCK_N * BLOCK_K, warp_col * 16 * 8);
+        S2RA::load(na, 0, ar[0]);
+        S2RB::load(nb, 0, br[0]);
+      } else {
+        S2RA::load(base_a, 2 * Pair + 2, ar[0]);
+        S2RB::load(base_b, 2 * Pair + 2, br[0]);
+      }
+      Mma::mma(acc, ar[1], br[1], acc);
+      run_pairs<Pair + 1>(p, a, b, stage, next, mo, no, next_kt, issue,
+                          base_a, base_b, warp_id, warp_row, warp_col, acc, ar, br);
+    }
+  }
+
+  __device__ void operator()(Params const& runtime_params, char* smem) {
+    Params p = runtime_params;
+    if constexpr (DG_DUAL_B_ROUTER_M != 0) {
+      p.M = DG_DUAL_B_ROUTER_M;
+      p.N = DG_DUAL_B_ROUTER_N;
+      p.K = p.lda = p.ldb = DG_DUAL_B_ROUTER_K;
+      p.ldd = DG_DUAL_B_ROUTER_N;
+      p.scheduler.shape_m = DG_DUAL_B_ROUTER_M;
+      p.scheduler.shape_n = DG_DUAL_B_ROUTER_N;
+      p.scheduler.shape_k = DG_DUAL_B_ROUTER_K;
+    }
+    DenseGemmScheduler<BLOCK_M, BLOCK_N / 2> scheduler(p.scheduler);
+    Element* a = reinterpret_cast<Element*>(smem);
+    Element* b = a + STAGES * BLOCK_M * BLOCK_K;
+    const int lane = threadIdx.x % 32;
+    const int warp_id = __shfl_sync(0xFFFFFFFFU, threadIdx.x / 32, 0);
+    const int warp_row = warp_id / (BLOCK_N / 16);
+    const int warp_col = warp_id % (BLOCK_N / 16);
+    uint32_t mb = 0, nb = 0;
+    while (scheduler.fetch_next_work(mb, nb)) {
+      const int mo = int(mb) * BLOCK_M, no = int(nb) * (BLOCK_N / 2);
+      const int tiles = math::ceil_div(p.K, BLOCK_K);
+      int loaded = 0;
+      #pragma unroll
+      for (int s = 0; s < STAGES && loaded < tiles; ++s) {
+        if (warp_id == 0)
+          load_stage(a + s * BLOCK_M * BLOCK_K, b + s * BLOCK_N * BLOCK_K,
+                     p, mo, no, loaded * BLOCK_K);
+        cutlass::arch::cp_async_fence();
+        ++loaded;
+      }
+      if (loaded >= STAGES) cutlass::arch::cp_async_wait<STAGES - 1>();
+      else cutlass::arch::cp_async_wait<0>();
+      __syncthreads();
+      float acc[8] = {};
+      uint32_t ar[2][4], br[2][4];
+      int stage = 0;
+      for (int kt = 0; kt < tiles; ++kt) {
+        int next = stage + 1 == STAGES ? 0 : stage + 1;
+        int ba = arch::smem_ptr_to_tsm_base(a + stage * BLOCK_M * BLOCK_K, warp_row * 16 * 8);
+        int bb = arch::smem_ptr_to_tsm_base(b + stage * BLOCK_N * BLOCK_K, warp_col * 16 * 8);
+        if (kt == 0) {
+          S2RA::load(ba, 0, ar[0]);
+          S2RB::load(bb, 0, br[0]);
+        }
+        bool issue = loaded < tiles;
+        run_pairs<0>(p, a, b, stage, next, mo, no, loaded, issue,
+                     ba, bb, warp_id, warp_row, warp_col, acc, ar, br);
+        if (issue) ++loaded;
+        stage = next;
+      }
+      cutlass::arch::cp_async_wait<0>();
+      __syncthreads();
+      #pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        int row = mo + warp_row * 16 + lane / 4 + half * 8;
+        int col = no + warp_col * 8 + (lane % 4) * 2;
+        if (row < p.M && col + 1 < p.N) {
+          const int i = half * 2;
+          *reinterpret_cast<float2*>(p.ptr_D + int64_t(row) * p.ldd + col) =
+              make_float2(acc[i] + p.low_scale * acc[i + 4],
+                          acc[i + 1] + p.low_scale * acc[i + 5]);
+        }
+      }
+    }
+  }
+};
+#endif
 
 } // namespace kernel
 } // namespace deep_gemm

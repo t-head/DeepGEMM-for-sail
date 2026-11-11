@@ -28,6 +28,9 @@ template <int BLOCK_M, int BLOCK_N, int BLOCK_K,
           bool DenseS2Opt,
           bool IsAlignedN,
           typename GemmTypeTag, typename ElementOutput = cutlass::bfloat16_t>
+#if defined(DG_DUAL_B_PACKED_N) && DG_DUAL_B_PACKED_N
+using BF16xFp32GemmCuteFreeKernel = kernel::PackedDualNRouterKernel<ElementOutput, BLOCK_M, BLOCK_N, BLOCK_K, STAGES>;
+#else
 using BF16xFp32GemmCuteFreeKernel = kernel::GemmBf16xFp32Kernel<
     cutlass::bfloat16_t,
     copy::AiuG2SAtom<cutlass::bfloat16_t, BLOCK_M, BLOCK_K>,   // G2S A
@@ -39,5 +42,6 @@ using BF16xFp32GemmCuteFreeKernel = kernel::GemmBf16xFp32Kernel<
                              WARP_M, WARP_N, IsAlignedN>,      // Epilogue
     BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, STAGES, DenseS2Opt,
     GemmTypeTag>;
+#endif
 
 } // namespace deep_gemm
