@@ -609,7 +609,7 @@ cumsum_expert_ids_impl(
 
 
 // -- K4: Atomic scatter -----------------------------------------------------
-// Each valid route reserves one slot from its expert cursor.
+// Warp peers targeting the same expert reserve consecutive slots with one atomicAdd.
 // Grid: num_blocks blocks. BLOCK_SIZE = next_power_of_two(kNumGroups).
 // Expert-local order is unspecified; inverse mappings preserve route identity.
 // ----------------------------------------------------------------------------
@@ -628,12 +628,21 @@ atomic_scatter_impl(
 {
     const int idx = bid * BLOCK_SIZE + threadIdx.x;
     const int eid = idx < numel ? topk_ids[idx] : -1;
+    // All active lanes participate in peer grouping and broadcast before returning.
+    const unsigned active = __activemask();
+    const unsigned peers = __match_any_sync(active, eid);
+    const int leader = __ffs(peers) - 1;
+    const bool valid = static_cast<unsigned>(eid) < static_cast<unsigned>(kNumGroups);
+    int base = 0;
+    if (valid && (threadIdx.x % 32) == leader)
+        base = atomicAdd(&expert_cursors[eid], __popc(peers));
+    base = __shfl_sync(active, base, leader);
+    const int offset = base + __popc(peers & __ppu_read_lanemask_lt());
     if (idx >= numel) return;
     if (static_cast<unsigned>(eid) >= static_cast<unsigned>(kNumGroups)) {
         inv_perm[idx] = -1;
         return;
     }
-    const int offset = atomicAdd(&expert_cursors[eid], 1);
     sorted_token_ids[cumsum[eid] + offset] = idx / kTopK;
     inv_perm[idx] = cumsum[kNumGroups + eid] + offset;
     m_indices[cumsum[kNumGroups + eid] + offset] = eid;
