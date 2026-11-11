@@ -104,7 +104,12 @@ uses the explicitly supplied `cu_seq_len_k_start` / `cu_seq_len_k_end`.
 
 Q values have shape `[Q,1,H,D_storage]`, context lengths are contiguous
 int32 `[Q,1]`, and block tables have one int32 row per query with unit column
-stride. M890 supports page sizes 32/64/128; 810E supports only 64/128.
+stride. On M890, both weighted and AVG paged MQA support page size 32 or
+any positive multiple of 64 (for example 192, 256, 512 or 1024). On 810E,
+weighted paged MQA supports positive multiples of 64. There is no fixed
+128-token page-size cap. The
+compute tile remains 64 rows, so larger pages do not increase tile resources;
+the alignment ensures each tile load stays within one physical page.
 810E page32 is rejected by metadata generation and compute due to an
 actlize TSM cross-cube addressing issue. Logits have logical shape
 `[Q,max_context_len]`. INT8 and legacy FP8 take Q values directly; MXFP4

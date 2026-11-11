@@ -95,7 +95,7 @@ static int get_paged_num_threads(const PagedTile& tile, int next_n) {
 // NOTES: `weights_size` / `logits_size` are hardcoded to 4 upstream even when the tensors are
 // BF16; preserve that accounting for the existing weighted paths.
 static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_heads, int head_dim, int datasize) {
-    DG_HOST_ASSERT(page_kv == 32 or page_kv == 64 or page_kv == 128);
+    DG_HOST_ASSERT(page_kv == 32 or (page_kv > 0 and page_kv % 64 == 0));
     const bool is_fp4 = datasize == 1 and head_dim == 64;
     constexpr int weights_size = 4, logits_size = 4;
 

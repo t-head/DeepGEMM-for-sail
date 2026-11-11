@@ -15,8 +15,11 @@ namespace deep_gemm::attention {
 // across the 32-row cubes assembled from page32. Reject this layout until
 // actlize provides a validated cross-cube copy implementation.
 static void check_paged_mqa_page_size(int page_kv) {
+    // A 64-row compute tile must fit within a page; page32 uses two copies.
+    TORCH_CHECK(page_kv == 32 or (page_kv > 0 and page_kv % 64 == 0),
+                "page_kv must be 32 or a positive multiple of 64");
     TORCH_CHECK(page_kv != 32 or get_ppu_arch() != AC_PPU0010,
-                "page_kv=32 is unsupported on 810E due to an actlize TSM cross-cube addressing issue; use 64 or 128");
+                "page_kv=32 is unsupported on 810E due to an actlize TSM cross-cube addressing issue; use a positive multiple of 64");
 }
 
 // Format support is device-specific: an int8 container may hold INT8 or MXFP4.
@@ -236,7 +239,6 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
     DG_HOST_ASSERT((schedule_meta_size - 1) % get_num_sms() == 0 and meta_info_size == 2);
     TORCH_CHECK(is_avg ? (1 <= next_n and next_n <= 6) : next_n == 1,
                 "weighted paged indexer requires next_n == 1; AVG supports next_n in [1, 6]");
-    DG_HOST_ASSERT(page_kv == 32 or page_kv == 64 or page_kv == 128);
     TORCH_CHECK(context_lens.is_contiguous(), "context_lens must be contiguous");
     DG_HOST_ASSERT(context_lens.scalar_type() == torch::kInt32);
     DG_HOST_ASSERT(block_table.stride(1) == 1);

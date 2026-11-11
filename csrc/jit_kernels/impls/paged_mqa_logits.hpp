@@ -268,7 +268,7 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
 static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens, int batch_size, int page_kv,
                                               int num_sms,
                                               const std::tuple<int, int, int, torch::ScalarType>& metadata_extra) {
-    DG_HOST_ASSERT(page_kv == 32 or page_kv == 64 or page_kv == 128);
+    DG_HOST_ASSERT(page_kv == 32 or (page_kv > 0 and page_kv % 64 == 0));
     const auto& [next_n, num_heads, logical_head_dim, qk_dtype] = metadata_extra;
     const bool is_fp4 = get_ppu_arch() == AC_PPU0015 and qk_dtype == torch::kInt8;
     const int head_dim = is_fp4 ? logical_head_dim / 2 : logical_head_dim;
@@ -322,8 +322,8 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     if (not is_fp4)
         k = k.view(qk_dtype);
     auto k_scales = fused_kv_cache
-                   .as_strided({num_kv_blocks, page_kv * 4}, {kv_cache_stride_bytes, 1},
-                               fused_kv_cache.storage_offset() + page_kv * head_dim)
+                   .as_strided({num_kv_blocks, page_kv * 4LL}, {kv_cache_stride_bytes, 1},
+                               fused_kv_cache.storage_offset() + static_cast<int64_t>(page_kv) * head_dim)
                    .view(is_fp4 ? torch::kInt32 : torch::kFloat32);
 
     const auto& tile = deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim,

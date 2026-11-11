@@ -17,7 +17,8 @@ template <typename ElementQK, typename ElementAcc, typename ElementLogits, typen
           uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
 class PPUPagedMqaLogits {
 public:
-    static_assert(PAGE_KV == 32 || PAGE_KV == 64 || PAGE_KV == 128, "Invalid KV page size");
+    static_assert(PAGE_KV == 32 || (PAGE_KV > 0 && PAGE_KV % BLOCK_KV == 0),
+                  "KV page must be 32 rows or a positive multiple of the compute tile");
   static_assert(not SPLIT_MBLOCK, "SPLIT_MBLOCK is only supported for FP4");
   // Avg variant (kScaleMode = kScaleModeUnity): no per-head weights,
   // logits = sum_h(relu(qk)) * k_scale / sqrt(kHeadDim)
@@ -337,10 +338,13 @@ public:
     };
 
     auto load_kv_g2s = [&](uint32_t q_idx, uint32_t kv_idx) {
-        if constexpr (PAGE_KV == BLOCK_KV) {
-            auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
-            tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes;
-            tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / 4;
+        // Use the copy traits for full tiles, including the 810E linear-scale descriptor.
+        if constexpr (PAGE_KV >= BLOCK_KV) {
+            const uint32_t token = kv_idx * BLOCK_KV;
+            const uint32_t row_in_page = token % PAGE_KV;
+            auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + token / PAGE_KV);
+            tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes + static_cast<uint64_t>(row_in_page) * BLOCK_K;
+            tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / 4 + row_in_page;
             // Split the value/scale AIU copies across warps 0/1 only when the group
             // has >= 2 warps; otherwise warp 0 issues both (as fp4's SPLIT_AIU)
             constexpr bool SPLIT_AIU = (WarpOnGroup >= 2);
@@ -373,7 +377,7 @@ public:
                     nullptr, kCopyRows, BLOCK_K, StrideAB{});
                 if (local_warp_idx == 0 && lane_idx == 0) {
                     auto src = reinterpret_cast<const ElementQK*>(
-                        reinterpret_cast<const uint8_t*>(params.ptr_k) + physical_page * params.kv_cache_stride_bytes * sizeof(ElementQK)) + row_in_page * BLOCK_K;
+                        reinterpret_cast<const uint8_t*>(params.ptr_k) + physical_page * params.kv_cache_stride_bytes * sizeof(ElementQK)) + static_cast<uint64_t>(row_in_page) * BLOCK_K;
                     CUTE_UNROLL
                     for (int k = 0; k < BLOCK_K; k += ChunkKV::CUBE_W) {
                         auto dst_k = shared_storage.smem_k.data() + SmemLayoutA{}(make_coord(row, k, smem_pipe_write_kv, warp_group_idx));
