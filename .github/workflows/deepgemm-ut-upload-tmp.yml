@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: '["ZW-M890P"]'
+      push:
+        description: "Whether to trigger the temporary wheel upload job"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -164,6 +169,8 @@ jobs:
   push:
     name: Call temporary wheel upload template
     needs: merge
+    # Gated on the workflow_dispatch `push` input; schedule runs leave it unset (skipped).
+    if: ${{ inputs.push }}
     uses: t-head/ci-infra/.github/workflows/push-tmp-wheel.yml@main
     with:
       # run_attempt moves when only the publishing job is rerun.
