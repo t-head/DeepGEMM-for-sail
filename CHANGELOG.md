@@ -4,7 +4,7 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
-## Unreleased
+## 1.1.0+v1.1.0
 
 ### Added
 
@@ -102,6 +102,14 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   row count and tile parallelism are sufficient, with native fallback for small
   shapes. Single-part plans allocate one decoded-weight buffer. Existing grouped
   APIs and the nine-element config format remain unchanged.
+
+### Fixed
+
+- **Paged indexer metadata synchronization**: moves the existing scan barriers
+  after shared-memory writes in both the main and tail prefix scans, preventing
+  incorrect scheduling boundaries without adding barriers. The scheduler stops
+  at the exact metadata endpoint. This fixes a race that could cause missing or
+  incorrect logits, or continued task execution past the intended endpoint.
 
 ## 1.1.0+v1.0.0
 

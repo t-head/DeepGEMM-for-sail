@@ -25,6 +25,16 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 
 ## Release Notes
 
+### 1.1.0+v1.1.0
+
+- **Breaking indexer API changes**: updates weighted and AVG entry points,
+  dtype and output contracts, and paged `metadata_extra`. Downstream callers
+  must follow the [indexer migration guide](docs/api/indexer.md).
+- **Paged metadata correctness fix**: fixes the shared-memory prefix-scan race
+  in both main and tail scans without increasing the barrier count.
+
+See [CHANGELOG.md](CHANGELOG.md#110v110) for complete release notes.
+
 ### 1.1.0+v1.0.0
 
 Highlights:
@@ -52,16 +62,16 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 
 ### Package versioning
 
-- Release: `1.1.0+v1.0.0.ppu2.2.0` combines the placeholder version `1.1.0`,
-  the release version `v1.0.0`, and the PPU SDK version `2.2.0`.
+- Release: `1.1.0+v1.1.0.ppu2.2.0` combines the placeholder version `1.1.0`,
+  the release version `v1.1.0`, and the PPU SDK version `2.2.0`.
   In [setup.py](setup.py), these first two components correspond to
   `DEEPGEMM_VERSION` and `RELEASE_VERSION`, respectively.
 - `1.1.0` is expected to remain unchanged. Future releases and API changes
-  are tracked by the `v1.0.0` component in `RELEASE_VERSION`.
-  The middle number in `v1.0.0` is incremented for API changes or additions
+  are tracked by the `v1.1.0` component in `RELEASE_VERSION`.
+  The middle number in `v1.1.0` is incremented for API changes or additions
   when they are formally integrated into downstream frameworks, rather than
   for each individual API change or addition.
-- Development: `1.1.0.devN+v1.0.0.ppu2.2.0.g<sha>` additionally includes
+- Development: `1.1.0.devN+v1.1.0.ppu2.2.0.g<sha>` additionally includes
   the commit count and Git commit hash.
 
 ## Quick Start
