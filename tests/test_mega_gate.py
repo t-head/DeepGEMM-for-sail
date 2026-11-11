@@ -10,9 +10,9 @@ from deep_gemm.testing import (
     bench_kineto,
     calc_diff,
     count_bytes,
-    get_arch_major,
     test_filter,
 )
+from utils import is_ppu1v5_device
 
 NUM_TOPK = 6
 NUM_SHARED_EXPERTS = 1
@@ -202,7 +202,7 @@ def check_case(num_tokens: int, hidden: int, num_routed_experts: int,
     check_correctness(inputs, outputs, use_shared_as_routed, num_topk, num_shared_experts)
 
 
-@test_filter(lambda: get_arch_major() == 8)
+@test_filter(is_ppu1v5_device)
 @torch.no_grad()
 def test_mega_gate() -> None:
     torch.manual_seed(0)
@@ -254,7 +254,7 @@ def check_routing_controls() -> None:
     assert torch.all(unmapped_topk_idx[active_force_random] == -1).item()
 
 
-@test_filter(lambda: get_arch_major() == 8)
+@test_filter(is_ppu1v5_device)
 @torch.no_grad()
 def test_mega_gate_api_contract() -> None:
     torch.manual_seed(2)
@@ -314,6 +314,48 @@ def test_mega_gate_api_contract() -> None:
         deep_gemm.use_deterministic_algorithms(False)
 
 
+@test_filter(is_ppu1v5_device)
+@torch.no_grad()
+def test_mega_gate_scoring_modes() -> None:
+    # Make the dot products exact. Only one hidden channel contributes.
+    for rows in (1, 129):
+        inputs = make_inputs(rows, 6144, 256, with_physical_map=False)
+        inputs['x'].zero_()
+        inputs['x'][:, 0] = 1
+        weight = inputs['weight']
+        weight.zero_()
+        weight[:4, 0] = torch.arange(4, device='cuda') - 2
+        weight[8:12, 0] = 2
+        bias = inputs['bias']
+        bias.fill_(-8)
+        bias[:4] = 4
+        bias[4:8] = 0.4
+        bias[8:12] = 0
+        logits = weight[:, 0].float()
+        # Interleave activations with identical shapes to exercise JIT cache reuse.
+        for mode in (None, 'sigmoid', 'sqrtsoftplus', 'sigmoid'):
+            outputs = make_outputs(inputs, num_topk=8)
+            kwargs = {} if mode is None else {'scoring_func': mode}
+            ids, weights = run_mega_gate(inputs, outputs, num_topk=8, **kwargs)
+            scores = logits.sigmoid() if mode == 'sigmoid' else F.softplus(logits).sqrt()
+            expected_ids = (scores + bias).topk(8).indices.sort().values
+            assert torch.equal(ids.sort(dim=1).values, expected_ids.expand(rows, -1))
+            selected = scores[ids]
+            expected_weights = selected / selected.sum(dim=1, keepdim=True) * ROUTED_SCALING_FACTOR
+            torch.testing.assert_close(weights, expected_weights, rtol=3e-4, atol=2e-5)
+
+        # All FP32 sigmoid scores round to one; the documented tie break is lowest ID.
+        inputs['bias'] = None
+        weight[:, 0] = 32
+        weight[8:, 0] = 48
+        outputs = make_outputs(inputs, num_topk=8)
+        ids, weights = run_mega_gate(inputs, outputs, num_topk=8, scoring_func='sigmoid')
+        expected_ids = torch.arange(8, device='cuda').expand(rows, -1)
+        assert torch.equal(ids, expected_ids)
+        torch.testing.assert_close(weights, torch.full_like(weights, ROUTED_SCALING_FACTOR / 8))
+
+
 if __name__ == '__main__':
+    test_mega_gate_scoring_modes()
     test_mega_gate_api_contract()
     test_mega_gate()

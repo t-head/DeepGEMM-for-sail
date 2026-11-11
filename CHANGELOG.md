@@ -40,9 +40,10 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   FP8 SwiGLU/SwiGLU-OAI, W4A8 SwiGLU/SwiGLU-OAI/SiTU, W4A16 SiTU, separate
   replica banks and reusable library-owned communication state.
 
-- **Mega Gate**: adds `bf16_mega_gate`, fusing BF16 routing GEMM,
-  sqrt-softplus scoring, bias-aware Top-k selection, weight normalization
-  and scaling, and optional logical-to-physical expert mapping.
+- **Mega Gate**: adds `bf16_mega_gate`, fusing BF16 routing GEMM, bias-aware
+  Top-k selection, weight normalization and scaling, and optional
+  logical-to-physical expert mapping. M890 supports the default
+  `sqrtsoftplus` scoring and explicit `scoring_func="sigmoid"` for GLM-5.3.
 
 ### Changed
 

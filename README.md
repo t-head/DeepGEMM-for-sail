@@ -474,10 +474,16 @@ cases.
 
 `deep_gemm.bf16_mega_gate` fuses the BF16 routing GEMM and MoE routing.
 Given BF16 tokens `x [T, H]` and expert weights `weight [E, H]`, it
-computes `x @ weight.T` with FP32 accumulation, applies `sqrt(softplus)`, and
+computes `x @ weight.T` with FP32 accumulation, applies the selected scoring function, and
 selects the top-K experts using the scores plus optional bias. The selected
 unbiased scores are normalized and scaled to produce routing weights; expert
 indices can optionally be mapped from logical to physical IDs.
+
+The default `scoring_func="sqrtsoftplus"` applies `sqrt(softplus(x))`.
+GLM-5.3 routers can select `scoring_func="sigmoid"`. If sigmoid scores round
+to the same FP32 value and their biases are equal, the smaller expert ID wins.
+The fused BF16 GEMM currently runs on M890. Running it on 810E requires a
+compatible GEMM mainloop.
 
 The outputs are INT64 indices and FP32 weights, each shaped `[T, K]`. When
 shared experts are included as routed experts, each output is `[T, K + S]`,
