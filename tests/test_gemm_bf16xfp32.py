@@ -20,6 +20,8 @@ Documented contract (see csrc/apis/gemm.hpp):
     split_flag : accepted only by the hpc-ops compatibility wrapper; this build
                  performs no K-split, so the workspace stays untouched.
 """
+import os
+
 import pytest
 import torch
 
@@ -81,6 +83,66 @@ def test_gemm_bf16xfp32_k_sweep(k, use_fp32_output):
     x, w_high, w_low, scale, gt = _make_case(m, n, k)
     my = deep_gemm.bf16xfp32_gemm_nt(x, w_high, w_low, scale, use_fp32_output)
     torch.testing.assert_close(my.float(), gt, rtol=0.08, atol=0.01)
+
+
+@pytest.fixture
+def router_ppu1v5(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("no PPU device available")
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("router fusion regression requires PPU1.5")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    # Exercise automatic defaults without inherited tuning overrides.
+    for name in tuple(os.environ):
+        if name.startswith("DG_BF16XFP32_"):
+            monkeypatch.delenv(name)
+
+
+def _check_bf16xfp32_router_case(m, use_fp32_output, api):
+    n, k = 384, 7168
+    x, w_high, w_low, scale, gt = _make_case(m, n, k)
+    workspace = None
+    if api == "default":
+        actual = deep_gemm.bf16xfp32_gemm_nt(
+            x, w_high, w_low, scale, use_fp32_output)
+    elif api == "explicit":
+        configs = (39, 64, 64, 64, 16, 16, 2, (0, 0, 0))
+        actual = deep_gemm.bf16xfp32_gemm_nt(
+            x, w_high, w_low, scale, use_fp32_output, configs)
+    elif api == "compatible":
+        workspace = deep_gemm.get_gemm_bf16xfp32_workspace(n, max_tokens=m)
+        assert workspace.dtype == torch.int32
+        assert workspace.shape == ((m + 15) // 16, (n + 63) // 64)
+        assert (workspace == 0).all()
+        actual = deep_gemm.gemm_bf16xfp32(
+            x, w_high, w_low, scale, use_fp32_output, False, workspace)
+    else:
+        raise ValueError(f"unknown router API: {api}")
+    assert actual.shape == (m, n)
+    assert actual.dtype == (torch.float32 if use_fp32_output else torch.bfloat16)
+    assert actual.is_contiguous()
+    assert torch.allclose(gt, actual.float(), rtol=0.08, atol=0.01), (m, api, use_fp32_output)
+    if workspace is not None:
+        assert (workspace == 0).all()
+
+
+@pytest.mark.usefixtures("router_ppu1v5")
+@pytest.mark.parametrize("m", [8, 16], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("use_fp32_output", [True, False], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("api", ["default", "explicit", "compatible"])
+def test_gemm_bf16xfp32_router_decode(m, use_fp32_output, api):
+    """Cover the exact small-M router shapes, including packed FP32 defaults."""
+    _check_bf16xfp32_router_case(m, use_fp32_output, api)
+
+
+@pytest.mark.usefixtures("router_ppu1v5")
+@pytest.mark.parametrize("m", [128, 256, 512, 1024, 2048, 4096, 8192, 16384],
+                         ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("use_fp32_output", [True, False], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("api", ["default", "explicit", "compatible"])
+def test_gemm_bf16xfp32_router_prefill(m, use_fp32_output, api):
+    """Cover all eight prefill shapes without turning UT into a timing test."""
+    _check_bf16xfp32_router_case(m, use_fp32_output, api)
 
 
 def test_gemm_bf16xfp32_workspace_shape():
