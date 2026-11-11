@@ -26,7 +26,8 @@ template <typename ElementQK, typename ElementAcc, typename ElementLogits, typen
           bool SPLIT_MBLOCK, uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
 class PPUPagedMqaLogitsFP4 {
 public:
-    static_assert(PAGE_KV == 32 || PAGE_KV == 64 || PAGE_KV == 128, "Invalid KV page size");
+    static_assert(PAGE_KV == 32 || (PAGE_KV > 0 && PAGE_KV % BLOCK_KV == 0),
+                  "KV page must be 32 rows or a positive multiple of the compute tile");
     static_assert(cute::is_same_v<ElementQK, uint8_t>, "FP4 paged MQA logits requires uint8_t ElementQK");
     static_assert(kHeadDim == 64, "FP4 packed head_dim must be 64 (original 128 / 2)");
     static_assert(kScaleMode == deep_gemm::kScaleModeWeights || kScaleMode == deep_gemm::kScaleModeUnity,
@@ -436,10 +437,12 @@ public:
         // Load K (packed FP4) + k_sf (e8m0) from gmem to smem
         // Each warp_group loads into its own 3D smem slice, at stage = smem_pipe_write_kv
         auto load_kv_g2s = [&](uint32_t q_idx, uint32_t kv_idx) {
-            if constexpr (PAGE_KV == BLOCK_KV) {
-                auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
-                tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes;
-                tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / sizeof(uint32_t);
+            if constexpr (PAGE_KV >= BLOCK_KV) {
+                const uint32_t token = kv_idx * BLOCK_KV;
+                const uint32_t row_in_page = token % PAGE_KV;
+                auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + token / PAGE_KV);
+                tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes + static_cast<uint64_t>(row_in_page) * BLOCK_K;
+                tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / sizeof(uint32_t) + row_in_page;
                 // Split the value/scale AIU copies across warps 0/1 only when the group
                 // has >= 2 warps; otherwise warp 0 issues both
                 constexpr bool SPLIT_AIU = (WarpOnGroup >= 2);
@@ -472,7 +475,7 @@ public:
                         nullptr, kCopyRows, BLOCK_K, StrideAB{});
                     if (local_warp_idx == 0 && lane_idx == 0) {
                         auto src = reinterpret_cast<const ElementQK*>(
-                            reinterpret_cast<const uint8_t*>(params.ptr_k) + physical_page * params.kv_cache_stride_bytes) + row_in_page * BLOCK_K;
+                            reinterpret_cast<const uint8_t*>(params.ptr_k) + physical_page * params.kv_cache_stride_bytes) + static_cast<uint64_t>(row_in_page) * BLOCK_K;
                         CUTE_UNROLL
                         for (int k = 0; k < BLOCK_K; k += ChunkKV::CUBE_W) {
                             auto dst_k = shared_storage.smem_k.data() + SmemLayoutA{}(make_coord(row, k, smem_pipe_write_kv, warp_group_idx));

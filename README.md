@@ -32,7 +32,7 @@ Highlights:
 - **W4A4 MegaMoE** on PPU1.5: a complete MXFP4 routed MoE pipeline with BF16 output, reusable workspaces, and load-time weight preparation. See the [calling contract](#mega-moe).
 - **More low-precision MoE kernels**: W4A8 on M890 and INT8 A8W4 on Zhenwu 610 / 610E / 810 / 810E, with unified weight preprocessing.
 - **Activation and quantization** on M890: standalone SiLU, SiTU, and SiLU STEP with BF16, FP8, MXFP4, or MXFP8 output, plus STEP activation in fused FP4 epilogues.
-- **Mega-mHC and sparse MQA** on M890: fused shifted mHC for DeepSeek V4.1 Flash and MXFP4 sparse attention-indexer logits for prefill and paged decode. Regular paged MQA now supports page sizes 32, 64, and 128.
+- **Mega-mHC and sparse MQA** on M890: fused shifted mHC for DeepSeek V4.1 Flash and MXFP4 sparse attention-indexer logits for prefill and paged decode. Regular and AVG paged MQA on M890 support page size 32 or any positive multiple of 64, with no fixed 128-token cap.
 - **External GEMM tuning tables**: device- and precision-specific configurations through `SAIL_DEEPGEMM_LUT_PATH`, with fallback to built-in selection.
 
 See [CHANGELOG.md](CHANGELOG.md#110v100) for complete release notes and API migration details.
@@ -406,8 +406,9 @@ Legacy FP8 uses FP32 weights/logits;
 INT8 accepts BF16 or FP32 weights and returns the same logits dtype. New
 `fp8_fp4_*mqa_logits` weighted entry points support MXFP4 only, with BF16
 weights/logits. Weighted paged calls require `next_n=1` and support page
-sizes 32, 64 and 128 on M890. 810E rejects page32 due to an actlize
-TSM addressing issue; use page64 or page128.
+size 32 or any positive multiple of 64 on M890, including 256/512/1024.
+The same page-size rule applies to M890 AVG. 810E rejects page32 due to
+an actlize TSM addressing issue; use a positive multiple of 64.
 
 AVG indexers use no weights, default to BF16 output and retain paged
 `next_n=1–6`. Non-paged AVG requires a positive `max_seqlen_k`. The paged

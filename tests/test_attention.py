@@ -195,6 +195,17 @@ def test_paged_mqa_logits_loop():
             continue
         set_acc_check(True)
         test_paged_mqa_logits(parse_deepgemm_string_re(case))
+    # Large pages and non-power-of-two pages, with permuted physical pages.
+    for data_type in data_types:
+        for page_kv, num_heads in ((192, 32), (512, 64)):
+            case = (f'PagedMqaLogits,data_type:{data_type},batch_size:7,next_n:1,'
+                    f'num_heads:{num_heads},head_dim:128,page_kv:{page_kv},'
+                    f'context_pattern:[0,1,63,{page_kv-1},{page_kv},{page_kv+1},{2*page_kv+1}],'
+                    f'max_context_len:{3*page_kv}')
+            set_acc_check(True)
+            test_paged_mqa_logits(parse_deepgemm_string_re(case))
+            if data_type == 'int8':
+                test_paged_mqa_logits(parse_deepgemm_string_re(case + ',weights_dtype:bf16'))
     if not is_ppu1v5_device():
         # CUDA graph replay with changing context lengths.
         case = 'PagedMqaLogits,data_type:int8,batch_size:8,next_n:1,num_heads:32,head_dim:128,pre_distribution:[4090,0,1,0,1],distribution:[4090,0,1,0,1,100,200,300]'
@@ -233,7 +244,7 @@ def test_mqa_avg_logits_loop():
         'PagedMqaAvgLogits,data_type:fp8,batch_size:8,next_n:2,num_heads:4,head_dim:128,avg_context_len:1024,logits_dtype:fp32',
         'PagedMqaAvgLogits,data_type:fp8,batch_size:8,next_n:5,num_heads:4,head_dim:128,avg_context_len:1024,logits_dtype:bf16,page_kv:128',
     ]
-    # FP4 BF16 cases cover both padded Q layouts, all page sizes, request
+    # FP4 BF16 cases cover both padded Q layouts, the original page sizes, request
     # switches, and the last request's partial Q/KV tiles.
     request_switch_batch = 32 * deep_gemm.get_num_sms() + 1
     paged_cases += [
@@ -243,6 +254,15 @@ def test_mqa_avg_logits_loop():
         'PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:6,num_heads:4,head_dim:128,distribution:[129],page_kv:128,max_context_len:256,logits_dtype:bf16',
     ]
     paged_cases.append('PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:1,num_heads:4,head_dim:128,distribution:[17],page_kv:32,max_context_len:128,logits_dtype:fp32')
+    # Generalized pages: both Q layouts/output types, page and compute-tile tails.
+    for data_type in ('fp4', 'fp8'):
+        for next_n, page_kv, dtype in ((1, 192, 'fp32'), (4, 256, 'bf16'),
+                                      (5, 512, 'bf16'), (6, 1024, 'fp32')):
+            paged_cases.append(
+                f'PagedMqaAvgLogits,data_type:{data_type},batch_size:7,next_n:{next_n},'
+                f'num_heads:4,head_dim:128,page_kv:{page_kv},logits_dtype:{dtype},'
+                f'context_pattern:[0,1,63,{page_kv-1},{page_kv},{page_kv+1},{2*page_kv+1}],'
+                f'max_context_len:{3*page_kv}')
     set_acc_check(True)
     for case in prefill_cases:
         print(case)

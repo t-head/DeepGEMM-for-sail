@@ -2491,7 +2491,7 @@ def test_paged_mqa_logits(args) -> None:
 
     max_model_len = args.get('max_context_len', 262144)
     pagesize = args.get('page_kv', 64)
-    assert pagesize in (32, 64, 128)
+    assert pagesize == 32 or (pagesize > 0 and pagesize % 64 == 0)
 
     q = torch.randn((batch_size, next_n, num_heads, head_dim), device='cuda', dtype=torch.bfloat16)
     weights = torch.randn((batch_size * next_n, num_heads), device='cuda', dtype=weights_dtype)
