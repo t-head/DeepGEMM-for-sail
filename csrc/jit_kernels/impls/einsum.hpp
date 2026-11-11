@@ -30,12 +30,15 @@ namespace deep_gemm {
 
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 
+template <bool kFP8Output = false>
 static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
              const torch::Tensor& b, const torch::Tensor& sfb,
              const torch::Tensor& d,
              const std::optional<torch::Tensor>& c,
              std::optional<ConfigTuple> configs = std::nullopt,
-             const std::string& expr = "") {
+             const std::string& expr = "",
+             const std::optional<torch::Tensor>& sfd = std::nullopt) {
+    using Runtime = std::conditional_t<kFP8Output, FP8OutputGemmRuntime, FP8GemmRuntime>;
     DG_HOST_ASSERT(a.stride(-1) == 1);
     DG_HOST_ASSERT(b.stride(-1) == 1);
     const auto& [groups, m, k] = get_shape<3>(a);
@@ -56,6 +59,12 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
     auto SMSIZE = std::get<0>(smem_config);
+    if constexpr (kFP8Output) {
+        const int output_smem = block_m * block_n * int(sizeof(cutlass::bfloat16_t));
+        // Small-K kernels may retain prefetches across N tiles; large-K kernels
+        // reuse mainloop storage after its outstanding copies have completed.
+        SMSIZE = k <= 512 ? SMSIZE + output_smem : std::max(SMSIZE, output_smem);
+    }
     uint32_t kNumGroups = groups;
 
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
@@ -80,8 +89,12 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
         reinterpret_cast<cutlass::float_e4m3_t*>(a.data_ptr<at::Float8_e4m3fn>());
     cutlass::float_e4m3_t* converted_input_b =
         reinterpret_cast<cutlass::float_e4m3_t*>(b.data_ptr<at::Float8_e4m3fn>());
-    cutlass::bfloat16_t* converted_output =
-        reinterpret_cast<cutlass::bfloat16_t*>(d.data_ptr<at::BFloat16>());
+    auto* converted_output = [&] {
+        if constexpr (kFP8Output)
+            return reinterpret_cast<cutlass::float_e4m3_t*>(d.data_ptr<at::Float8_e4m3fn>());
+        else
+            return reinterpret_cast<cutlass::bfloat16_t*>(d.data_ptr<at::BFloat16>());
+    }();
     float* scales_a_ptr = sfa_aligned.data_ptr<float>();
     float* scales_b_ptr = sfb.data_ptr<float>();
 
@@ -93,7 +106,7 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
 
     static constexpr GemmType kGemmType = GemmType::Batched;
 
-    const auto gemm_args = FP8GemmRuntime::GemmArguments{
+    auto gemm_args = typename Runtime::GemmArguments{
         .mode = cutlass::gemm::GemmUniversalMode::kGemm,
         .problem_shape = {m, n, k, groups},
         .mainloopargs = {converted_input_a, stride_A, converted_input_b, stride_B, 4,
@@ -110,14 +123,19 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
         .scheduler = {(uint32_t)m, nullptr},
         .signal = nullptr};
 
-    FP8GemmRuntime::GemmKernelParams params = FP8GemmRuntime::to_underlying_arguments_rtc(gemm_args, nullptr);
+    if constexpr (kFP8Output) {
+        gemm_args.epilogueargs.sfd = reinterpret_cast<uint32_t*>(sfd->data_ptr<int32_t>());
+        gemm_args.epilogueargs.sfd_stride = sfd->stride(-1);
+    }
 
-    auto args = FP8GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
+    typename Runtime::GemmKernelParams params = Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+
+    auto args = typename Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
                                                      "Batched", "Default", "batch_fp8_deep_gemm", false},
                                      .launch_args = {grid, block, SMSIZE},
                                      .kernel_params = params};
 
-    const auto& code = FP8GemmRuntime::generate(args);
+    const auto& code = Runtime::generate(args);
     const auto& runtime = compiler->build("batch_fp8_deep_gemm", code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
@@ -136,7 +154,7 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     }
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
-        FP8GemmRuntime::launch(runtime, args);
+        Runtime::launch(runtime, args);
     }
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
@@ -154,12 +172,15 @@ static void fp8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     }
 }
 
+template <bool kFP8Output = false>
 static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
               const torch::Tensor& b, const torch::Tensor& sfb,
               const torch::Tensor& d,
               const std::optional<torch::Tensor>& c,
               std::optional<ConfigTuple> configs = std::nullopt,
-              const std::string& expr = "") {
+              const std::string& expr = "",
+             const std::optional<torch::Tensor>& sfd = std::nullopt) {
+    using Runtime = std::conditional_t<kFP8Output, FP8OutputBatchGemmRuntime, INT8BatchGemmCutlass3Runtime>;
     DG_HOST_ASSERT(a.stride(-1) == 1);
     DG_HOST_ASSERT(b.stride(-1) == 1);
     const auto& [groups, m, k] = get_shape<3>(a);
@@ -183,6 +204,8 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
     auto SMSIZE = std::get<0>(smem_config);
+    if constexpr (kFP8Output)
+        SMSIZE = std::max(SMSIZE, block_m * block_n * int(sizeof(cutlass::bfloat16_t)));
     uint32_t kNumGroups = groups;
 
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
@@ -195,8 +218,12 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     torch::Dtype dtype = a.dtype().toScalarType();
     const void* converted_input_a = nullptr;
     const void* converted_input_b = nullptr;
-    cutlass::bfloat16_t* converted_output =
-        reinterpret_cast<cutlass::bfloat16_t*>(d.data_ptr<at::BFloat16>());
+    auto* converted_output = [&] {
+        if constexpr (kFP8Output)
+            return reinterpret_cast<cutlass::float_e4m3_t*>(d.data_ptr<at::Float8_e4m3fn>());
+        else
+            return reinterpret_cast<cutlass::bfloat16_t*>(d.data_ptr<at::BFloat16>());
+    }();
     std::string type_info;
     std::string kernel_name;
     std::string profile_type;
@@ -226,7 +253,7 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
 
     static constexpr GemmType kGemmType = GemmType::Batched;
 
-    const auto gemm_args = INT8BatchGemmCutlass3Runtime::GemmArguments{
+    auto gemm_args = typename Runtime::GemmArguments{
         .mode = cutlass::gemm::GemmUniversalMode::kGemm,
         .problem_shape = {m, n, k, groups},
         .mainloopargs = {{converted_input_a, stride_A, converted_input_b, stride_B,
@@ -244,17 +271,22 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
         .scheduler = {(uint32_t)m, nullptr},
         .signal = nullptr};
 
-    INT8BatchGemmCutlass3Runtime::GemmKernelParams params =
-        INT8BatchGemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+    if constexpr (kFP8Output) {
+        gemm_args.epilogueargs.sfd = reinterpret_cast<uint32_t*>(sfd->data_ptr<int32_t>());
+        gemm_args.epilogueargs.sfd_stride = sfd->stride(-1);
+    }
 
-    auto args = INT8BatchGemmCutlass3Runtime::Args{
+    typename Runtime::GemmKernelParams params =
+        Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+
+    auto args = typename Runtime::Args{
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
                         "Batched", "Default", kernel_name, false},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = params,
         .type_info = type_info};
 
-    const auto& code = INT8BatchGemmCutlass3Runtime::generate(args);
+    const auto& code = Runtime::generate(args);
     const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
@@ -270,7 +302,7 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     }
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
-        INT8BatchGemmCutlass3Runtime::launch(runtime, args);
+        Runtime::launch(runtime, args);
     }
 
     char* pEnv_params = std::getenv("show_log");

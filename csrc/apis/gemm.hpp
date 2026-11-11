@@ -36,16 +36,21 @@ using NVFP4ExecutionConfig = nvfp4::ExecutionConfig;
 
 extern "C" {
 static bool early_return(const int& m, const int &n, const int& k,
-                         const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
+                         const torch::Tensor& d, const std::optional<torch::Tensor>& c,
+                         const std::optional<torch::Tensor>& sfd = std::nullopt) {
     // Do nothing if the problem is empty
     if (m == 0 or n == 0)
         return true;
 
     // Checks
+    // Quantized D never accumulates.
+    DG_HOST_ASSERT(not sfd.has_value() or not c.has_value());
     const bool is_cd_same = c.has_value() and c->data_ptr() == d.data_ptr();
     if (is_cd_same)
         DG_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat or
+                   d.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT((d.scalar_type() == torch::kFloat8_e4m3fn) == sfd.has_value());
     if (c.has_value()) {
         check_major_type_cd(c.value());
         DG_HOST_ASSERT(d.scalar_type() == c.value().scalar_type());
@@ -55,6 +60,9 @@ static bool early_return(const int& m, const int &n, const int& k,
     if (k == 0) {
         if (not is_cd_same)
             c.has_value() ? d.copy_(c.value()) : d.zero_();
+        // Zero D dequantizes to zero regardless of the scale contents.
+        if (sfd.has_value())
+            sfd->zero_();
         return true;
     }
 

@@ -3,6 +3,7 @@
 #include "../utils/compatibility.hpp"
 #include "../utils/layout.hpp"
 #include <torch/extension.h>
+#include <variant>
 #include "../jit_kernels/impls/einsum.hpp"
 #include "gemm.hpp"
 
@@ -18,7 +19,8 @@ void int8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
               std::optional<std::tuple<int, int, int>> recipe,
               const std::string& compiled_dims = "",
               std::optional<ConfigTuple> configs = std::nullopt,
-              const std::string& expr = "") {
+              const std::string& expr = "",
+              const std::optional<torch::Tensor>& sfd = std::nullopt) {
     // Shape must be `[B, M, K] @ [B, N, K].T`
     DG_HOST_ASSERT(a.stride(-1) == 1 or a.stride(-2) == 1);
     DG_HOST_ASSERT(b.stride(-1) == 1 or b.stride(-2) == 1);
@@ -33,52 +35,72 @@ void int8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     DG_HOST_ASSERT(a.scalar_type() == torch::kInt8 || a.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(b.scalar_type() == torch::kInt8 || b.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(a.scalar_type() == b.scalar_type());
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(sfd.has_value() ? d.scalar_type() == torch::kFloat8_e4m3fn :
+                   d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
     DG_HOST_ASSERT(not c.has_value());
     // Early return for trivial cases
-    if (batch_size == 0 or gemm::early_return(m, n, k, d, c))
+    if (batch_size == 0 or gemm::early_return(m, n, k, d, c, sfd))
         return;
     // Channelwise scales cover the full K dimension.
     check_sf_layout(sfa, m, k, 1, k, batch_size, false, false, torch::kFloat32);
     check_sf_layout(sfb, n, k, 1, k, batch_size, false, false, torch::kFloat32);
 
-    int8_bmm_impl(a, sfa, b, sfb, d, c, configs, expr);
+    if (sfd.has_value())
+        int8_bmm_impl<true>(a, sfa, b, sfb, d, c, configs, expr, sfd);
+    else
+        int8_bmm_impl(a, sfa, b, sfb, d, c, configs, expr);
 }
 
 void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
              const torch::Tensor& b, const torch::Tensor& sfb,
-             const torch::Tensor& d,
+             const std::variant<torch::Tensor, std::pair<torch::Tensor, torch::Tensor>>& d,
              const std::optional<torch::Tensor>& c,
              std::optional<std::tuple<int, int, int>> recipe,
              const std::string& compiled_dims = "",
              std::optional<ConfigTuple> configs = std::nullopt,
              const std::string& expr = "") {
+    const auto d_fp8 = std::get_if<std::pair<torch::Tensor, torch::Tensor>>(&d);
+    const auto d_tensor = d_fp8 != nullptr ? d_fp8->first : std::get<torch::Tensor>(d);
+    const std::optional<torch::Tensor> sfd = d_fp8 != nullptr ? std::make_optional(d_fp8->second) : std::nullopt;
     // Shape must be `[B, M, K] @ [B, N, K].T`
     DG_HOST_ASSERT(a.stride(-1) == 1 or a.stride(-2) == 1);
     DG_HOST_ASSERT(b.stride(-1) == 1 or b.stride(-2) == 1);
-    DG_HOST_ASSERT(d.stride(-1) == 1);
+    DG_HOST_ASSERT(d_tensor.stride(-1) == 1);
     const auto& [batch_size, m, k] = get_shape<3>(a);
     const auto& [batch_size_, n, k_] = get_shape<3>(b);
     DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(b.scalar_type() == torch::kFloat8_e4m3fn);
 
+    if (sfd.has_value()) {
+        DG_HOST_ASSERT(is_ppu1v5_device());
+        DG_HOST_ASSERT(d_tensor.scalar_type() == torch::kFloat8_e4m3fn);
+        const auto [groups_d, m_d, n_d] = get_shape<3>(d_tensor);
+        DG_HOST_ASSERT(batch_size == batch_size_ and k == k_);
+        DG_HOST_ASSERT(groups_d == batch_size and m_d == m and n_d == n);
+        DG_HOST_ASSERT(d_tensor.stride(0) == n and n % 128 == 0);
+        // PPU packs four output bytes into each global store.
+        DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(d_tensor.data_ptr()) % 4 == 0 and d_tensor.stride(1) % 4 == 0);
+        DG_HOST_ASSERT(not c.has_value());
+        check_sf_layout(sfd.value(), m, batch_size * n, 1, 32, std::nullopt, true, false, torch::kInt);
+    }
+
     // Per-channel scale fallback
     if (sfa.sizes() == std::vector<int64_t>{batch_size, m, 1} &&
         sfb.sizes() == std::vector<int64_t>{batch_size_, n, 1}) {
-        return int8_bmm(a, sfa, b, sfb, d, c, recipe, compiled_dims, configs, expr);
+        return int8_bmm(a, sfa, b, sfb, d_tensor, c, recipe, compiled_dims, configs, expr, sfd);
     }
 
-    const auto& [batch_size__, m_, n_] = get_shape<3>(d);
+    const auto& [batch_size__, m_, n_] = get_shape<3>(d_tensor);
     DG_HOST_ASSERT(batch_size == batch_size_ && batch_size_ == batch_size__);
     DG_HOST_ASSERT(m == m_ && n == n_ && k == k_);
     DG_HOST_ASSERT(sfa.scalar_type() == torch::kFloat32);
     DG_HOST_ASSERT(sfb.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(sfd.has_value() or d_tensor.scalar_type() == torch::kBFloat16 or d_tensor.scalar_type() == torch::kFloat);
 
     DG_HOST_ASSERT(not c.has_value());
     // Early return for trivial cases
-    if (batch_size == 0 or gemm::early_return(m, n, k, d, c))
+    if (batch_size == 0 or gemm::early_return(m, n, k, d_tensor, c, sfd))
         return;
 
     // The PPU blockwise kernel uses a fixed (1, 128, 128) scale recipe.
@@ -86,7 +108,10 @@ void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     const auto [gran_m, gran_n, gran_k] = recipe.value();
     check_sf_layout(sfa, m, k, gran_m, gran_k, batch_size, false, false, torch::kFloat32);
     check_sf_layout(sfb, n, k, gran_n, gran_k, batch_size, false, false, torch::kFloat32);
-    fp8_bmm_impl(a, sfa, b, sfb, d, c, configs, expr);
+    if (sfd.has_value())
+        fp8_bmm_impl<true>(a, sfa, b, sfb, d_tensor, c, configs, expr, sfd);
+    else
+        fp8_bmm_impl(a, sfa, b, sfb, d_tensor, c, configs, expr);
 }
 
 void int8_einsum(const std::string& expr,
@@ -121,9 +146,11 @@ void int8_einsum(const std::string& expr,
 void fp8_einsum(const std::string& expr,
                 const std::pair<torch::Tensor, torch::Tensor>& a,
                 const std::pair<torch::Tensor, torch::Tensor>& b,
-                const torch::Tensor& d,
+                const std::variant<torch::Tensor, std::pair<torch::Tensor, torch::Tensor>>& d,
                 const std::optional<torch::Tensor>& c,
-                const std::tuple<int, int, int>& recipe) {
+                const std::tuple<int, int, int>& recipe,
+                const std::shared_ptr<EpilogueClass>& epilogue_class) {
+    DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues are not supported on PPU");
     // Some hardcoded Einstein sum kernels
     // const auto arch_major = device_runtime->get_arch_major();
     if (expr == "bhr,hdr->bhd") {
@@ -131,10 +158,16 @@ void fp8_einsum(const std::string& expr,
         // (batch_size, m, n, k): (h, b, d, r)
         const auto perm_a = a.first.permute({1, 0, 2});
         const auto perm_sfa = a.second.permute({1, 0, 2});
-        const auto perm_d = d.permute({1, 0, 2});
+        // Packed output scales flatten (H, D), and are invariant under the data permute.
+        auto perm_d = d;
+        if (auto* d_fp8 = std::get_if<std::pair<torch::Tensor, torch::Tensor>>(&perm_d))
+            d_fp8->first = d_fp8->first.permute({1, 0, 2});
+        else
+            std::get<torch::Tensor>(perm_d) = std::get<torch::Tensor>(perm_d).permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk", std::nullopt, expr);
     } else if (expr == "bhr,hdr->hbd") {
+        DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
         const auto perm_a = a.first.permute({1, 0, 2});
         const auto perm_sfa = a.second.permute({1, 0, 2});
         fp8_bmm(perm_a, perm_sfa, b.first, b.second, d, c, recipe, "nk", std::nullopt, expr);
@@ -151,7 +184,8 @@ void fp8_einsum(const std::string& expr,
 
 static void register_apis(pybind11::module_& m) {
     m.def("fp8_einsum", &fp8_einsum, py::arg("expr"), py::arg("a"), py::arg("b"),
-          py::arg("d"), py::arg("c") = std::nullopt, py::arg("recipe") = std::make_tuple(1, 128, 128));
+          py::arg("d"), py::arg("c") = std::nullopt, py::arg("recipe") = std::make_tuple(1, 128, 128),
+          py::arg("epilogue") = nullptr);
     m.def("int8_einsum", &int8_einsum, py::arg("expr"), py::arg("a"), py::arg("b"),
           py::arg("d"), py::arg("c") = std::nullopt, py::arg("recipe") = std::make_tuple(1, 1, 128));
 }

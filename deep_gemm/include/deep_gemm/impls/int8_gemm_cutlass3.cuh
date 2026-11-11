@@ -1585,6 +1585,8 @@ public:
       auto params_epilogue_local = params.epilogue;
       params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dC));
       params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dD));
+      if constexpr (cute::is_same_v<ElementD, cutlass::float_e4m3_t>)
+        params_epilogue_local.batch_idx = deep_scheduler.problem_index();
 
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};

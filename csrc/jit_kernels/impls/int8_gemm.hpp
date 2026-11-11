@@ -22,6 +22,7 @@
 #include "cutlass/detail/blockwise_scale_layout.hpp"
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/batch_gemm_args.cuh>
+#include <deep_gemm/common/fp8_output_args.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
 
 using namespace deep_gemm_int8;
@@ -280,8 +281,8 @@ __global__ void {10}(
 
 // MoE grouped-path runtime restored to baseline 753f28f form (no warp_k / dense_s2_opt).
 // Used by m_grouped_int8_gemm.hpp; generates DeepGemmUniversal + DeepGemmScheduler kernels.
-template <bool kIsBatchGemm>
-class INT8GemmCutlass3RuntimeT final : public LaunchRuntime<INT8GemmCutlass3RuntimeT<kIsBatchGemm>> {
+template <bool kIsBatchGemm, bool kFP8Output = false>
+class INT8GemmCutlass3RuntimeT final : public LaunchRuntime<INT8GemmCutlass3RuntimeT<kIsBatchGemm, kFP8Output>> {
 public:
     using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
     using GemmProblemSize = cute::tuple<int32_t, int32_t, int32_t, int32_t>;
@@ -315,7 +316,7 @@ public:
         float const* scale_d_ptr = nullptr;
     };
 
-    struct EpilogueArgs {
+    struct BF16EpilogueArgs {
         LinearCombinationArgs callback;
         cutlass::bfloat16_t* ptr_C;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C;
@@ -323,6 +324,9 @@ public:
         cutlass::bfloat16_t* ptr_D;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D;
     };
+
+    using EpilogueArgs = std::conditional_t<kFP8Output,
+        FP8OutputArguments<LinearCombinationArgs>, BF16EpilogueArgs>;
 
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
@@ -401,7 +405,13 @@ public:
 
         // Same decision source as the injected kWithTsmEpilogue; must match the device compile.
         // Initialize the selected union member directly to start its lifetime.
-        if (is_ppu1v5_device()) {
+        if constexpr (kFP8Output) {
+            static_assert(kIsBatchGemm);
+            DG_HOST_ASSERT(is_ppu1v5_device());
+            return KernelParams{.no_tsm = GemmKernelParamsT<EpilogueParamNoTsm>{
+                args.mode, problem_shape, args.mainloopargs, args.epilogueargs,
+                hw_info, args.scheduler, workspace, args.signal}};
+        } else if (is_ppu1v5_device()) {
             return KernelParams{.no_tsm = GemmKernelParamsT<EpilogueParamNoTsm>{
                 args.mode, problem_shape, args.mainloopargs, args.epilogueargs,
                 hw_info, args.scheduler, workspace, args.signal}};
@@ -435,6 +445,7 @@ public:
 #include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
 #include <deep_gemm/impls/a8w4_int8_gemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
+#include <deep_gemm/epilogue/fp8_output.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
@@ -604,11 +615,14 @@ using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::Colle
 
 // Injected epilogue choice (is_ppu1v5_device()); matches to_underlying_arguments_rtc.
 static constexpr bool kWithTsmEpilogue = {18};
-using CollectiveEpilogue = typename cutlass::platform::conditional<
+using BF16Epilogue = typename cutlass::platform::conditional<
     kWithTsmEpilogue,
     CollectiveEpilogue_withTsm,
     CollectiveEpilogue_noTsm
 >::type;
+
+using CollectiveEpilogue = cute::conditional_t<{21},
+    FP8OutputEpilogue<CollectiveEpilogue_noTsm, BLOCK_M, BLOCK_N>, BF16Epilogue>;
 
 static constexpr GemmType kGemmType = GemmType::{12};
 
@@ -666,7 +680,7 @@ __global__ void {13}(
                            args.type_info, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_strategy,
                            args.launch_info.gemm_type, args.launch_info.kernel_name,
                            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
-                           with_tsm_epilogue, host_params_size, static_cast<int>(args.launch_info.a8w4_int8));
+                           with_tsm_epilogue, host_params_size, static_cast<int>(args.launch_info.a8w4_int8), kFP8Output);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& configs, Args args) {
@@ -676,6 +690,7 @@ __global__ void {13}(
 
 using INT8GemmCutlass3Runtime = INT8GemmCutlass3RuntimeT<false>;
 using INT8BatchGemmCutlass3Runtime = INT8GemmCutlass3RuntimeT<true>;
+using FP8OutputBatchGemmRuntime = INT8GemmCutlass3RuntimeT<true, true>;
 
 // 8-element public boundary ConfigTuple (matches Python/vLLM stable contract).
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
