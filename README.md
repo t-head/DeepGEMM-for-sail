@@ -470,6 +470,20 @@ See the [indexer API guide](docs/api/indexer.md) for metadata and layout
 requirements and [attention tests](tests/test_attention.py) for supported
 cases.
 
+#### Mega Gate
+
+`deep_gemm.bf16_mega_gate` fuses the BF16 routing GEMM and MoE routing.
+Given BF16 tokens `x [T, H]` and expert weights `weight [E, H]`, it
+computes `x @ weight.T` with FP32 accumulation, applies `sqrt(softplus)`, and
+selects the top-K experts using the scores plus optional bias. The selected
+unbiased scores are normalized and scaled to produce routing weights; expert
+indices can optionally be mapped from logical to physical IDs.
+
+The outputs are INT64 indices and FP32 weights, each shaped `[T, K]`. When
+shared experts are included as routed experts, each output is `[T, K + S]`,
+where `S` is the number of shared experts. See the [API definition](csrc/apis/mega_gate.hpp)
+for arguments and constraints and [the tests](tests/test_mega_gate.py) for examples.
+
 #### Mega MoE
 
 MegaMoE combines expert-parallel dispatch, two expert GEMMs, gated activation
