@@ -77,8 +77,24 @@ def test_bf16_gemm_restores_valid_routes(check_accuracy=True):
         torch.testing.assert_close(restored, expected[:, None].expand_as(restored), atol=0, rtol=0)
 
 
+def test_single_block_expert_limit():
+    """Reject unsupported expert counts on the host before generating a kernel."""
+    lhs = torch.empty((1, 128), device='cuda', dtype=torch.bfloat16)
+    rhs = lhs.new_empty((1025, 128, 128))
+    ids = torch.zeros((1, 1), device='cuda', dtype=torch.int32)
+    config = (deep_gemm.get_num_sms(), 32, 128, 128, 2, 2, 3)
+    expected = "single-block path supports at most 1024 experts, got 1025"
+    try:
+        deep_gemm.moe_align_block_size(lhs, rhs, ids, config=config)
+    except RuntimeError as exc:
+        assert expected in str(exc), str(exc)
+    else:
+        raise AssertionError("1025 experts must be rejected by the single-block host check")
+
+
 def main(smoke=False, check_accuracy=True):
     align = deep_gemm.moe_align_block_size
+    test_single_block_expert_limit()
     if check_accuracy:
         test_permuted_rows_require_consistent_inverse()
     if not smoke:

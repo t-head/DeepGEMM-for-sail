@@ -393,6 +393,9 @@ static MoeAlignReturn moe_align_block_size_impl(
     if (numel <= SINGLE_BLOCK_MAX_NUMEL) {
         // K0 path
         constexpr int K0_BLOCK_SIZE = 1024;
+        TORCH_CHECK(num_groups <= K0_BLOCK_SIZE,
+                    "moe_align_block_size (C++ JIT): single-block path supports at most ",
+                    K0_BLOCK_SIZE, " experts, got ", num_groups);
 
         const std::string kernel_name = "moe_align_single_block";
 
