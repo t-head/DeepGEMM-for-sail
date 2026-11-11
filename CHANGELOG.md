@@ -4,6 +4,14 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
+## unreleased
+
+### Added
+
+- **M890 M-grouped BF16 NT GEMM**: supports optional BF16 C accumulation,
+  including in-place `c=d`, and compact expert end offsets through
+  `use_psum_layout=True`, including empty experts.
+
 ## 1.1.0+v1.1.0
 
 ### Fixed
