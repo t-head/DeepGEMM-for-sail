@@ -1,6 +1,6 @@
 #pragma once
 // C++ JIT for moe_align_block_size: allocate routing tensors, then launch one
-// warp-ordered kernel for numel <= 16384 or the deterministic K1->K2->K3->K4
+// single-block kernel for numel <= 16384 or the unordered K1->K2->K3->K4
 // phases for larger inputs.
 
 #include <cstdint>
@@ -29,9 +29,9 @@
 namespace deep_gemm {
 
 // =============================================================================
-// K0: single warp-ordered kernel (numel <= 16384)
+// K0: single-block kernel (numel <= 16384)
 // =============================================================================
-class MoeAlignWarpOrderedRuntime final : public LaunchRuntime<MoeAlignWarpOrderedRuntime> {
+class MoeAlignSingleBlockRuntime final : public LaunchRuntime<MoeAlignSingleBlockRuntime> {
 public:
     struct KernelParams {
         const int32_t* topk_ids;
@@ -70,7 +70,7 @@ __global__ void {}(
     int32_t* __restrict__ m_indices,
     int numel, int s_total_ub)
 {{
-    moe_align_warp_ordered_kernel_impl<{}, {}, {}, {}>(
+    moe_align_single_block_kernel_impl<{}, {}, {}, {}>(
         topk_ids, sorted_token_ids, m_rows, expert_ids_and_cumsum,
         aligned_num_m_blocks, inv_perm, m_indices, numel, s_total_ub);
 }}
@@ -99,13 +99,13 @@ __global__ void {}(
 };
 
 // =============================================================================
-// Fallback path: deterministic K1->K2->K3->K4 (numel > 16384)
+// Fallback path: unordered K1->K2->K3->K4 (numel > 16384)
 // Each phase is generated and built on its own, so every HGBIN keeps a single
 // entry symbol and every phase keeps its own launch config.
 // =============================================================================
 class MoeAlignFallbackRuntime final : public LaunchRuntime<MoeAlignFallbackRuntime> {
 public:
-    enum class Phase { kCount, kScan, kCumsum, kScatter };
+    enum class Phase { kCount, kReduce, kCumsum, kScatter };
 
     struct KernelParams {
         const int32_t* topk_ids;
@@ -116,7 +116,7 @@ public:
         int32_t*       inv_perm;
         int32_t*       m_indices;
         int32_t*       block_counts;
-        int32_t*       local_offsets;
+        int32_t*       expert_cursors;
         int32_t*       cumsum;
         int            numel;
         int            s_total_ub;
@@ -137,7 +137,7 @@ public:
     static std::string symbol_name(const Phase& phase) {
         switch (phase) {
         case Phase::kCount:   return "moe_align_p1";
-        case Phase::kScan:    return "moe_align_p2";
+        case Phase::kReduce:  return "moe_align_p2";
         case Phase::kCumsum:  return "moe_align_p3";
         case Phase::kScatter: return "moe_align_p4";
         }
@@ -169,7 +169,7 @@ __global__ void moe_align_p1(
 )",
                 info.block_size, info.num_groups, info.topk);
 
-        case Phase::kScan:
+        case Phase::kReduce:
             return fmt::format(
                 R"(
 #include <deep_gemm/impls/fused_gemm_util.cuh>
@@ -178,12 +178,12 @@ namespace deep_gemm {{
 extern "C" __launch_bounds__({0}, 1)
 __global__ void moe_align_p2(
     const int32_t* __restrict__ block_counts,
-    int32_t* __restrict__ local_offsets,
+    int32_t* __restrict__ expert_cursors,
     int32_t* __restrict__ expert_counts,
     int num_groups, int num_blocks)
 {{
-    local_scan_impl<{0}>(
-        block_counts, local_offsets, expert_counts, num_groups, num_blocks, blockIdx.x);
+    reduce_expert_counts_impl<{0}>(
+        block_counts, expert_cursors, expert_counts, num_groups, num_blocks, blockIdx.x);
 }}
 
 }}  // namespace deep_gemm
@@ -224,12 +224,12 @@ __global__ void moe_align_p4(
     int32_t* __restrict__ inv_perm,
     int32_t* __restrict__ m_indices,
     const int32_t* __restrict__ cumsum,
-    const int32_t* __restrict__ local_offsets,
+    int32_t* __restrict__ expert_cursors,
     int numel, int num_groups)
 {{
-    deterministic_scatter_impl<{0}, {1}, {2}>(
+    atomic_scatter_impl<{0}, {1}, {2}>(
         topk_ids, sorted_token_ids, inv_perm, m_indices,
-        cumsum, local_offsets, numel, num_groups, blockIdx.x);
+        cumsum, expert_cursors, numel, num_groups, blockIdx.x);
 }}
 
 }}  // namespace deep_gemm
@@ -246,9 +246,9 @@ __global__ void moe_align_p4(
             DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
                 p.topk_ids, p.sorted_token_ids, p.block_counts, p.m_indices, p.numel, p.s_total_ub));
             break;
-        case Phase::kScan:
+        case Phase::kReduce:
             DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
-                p.block_counts, p.local_offsets, p.m_rows, p.num_groups, p.num_blocks));
+                p.block_counts, p.expert_cursors, p.m_rows, p.num_groups, p.num_blocks));
             break;
         case Phase::kCumsum:
             DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
@@ -257,7 +257,7 @@ __global__ void moe_align_p4(
         case Phase::kScatter:
             DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
                 p.topk_ids, p.sorted_token_ids, p.inv_perm, p.m_indices,
-                p.cumsum, p.local_offsets, p.numel, p.num_groups));
+                p.cumsum, p.expert_cursors, p.numel, p.num_groups));
             break;
         }
     }
@@ -388,21 +388,17 @@ static MoeAlignReturn moe_align_block_size_impl(
     auto m_rows                = at::empty({num_groups},                 opt_i32);
     auto m_indices             = at::empty({numel},                      opt_i32);
 
-    // Allocate the intermediate buffer for the K1..K4 fallback path.
-    auto intermediate_buffer = at::empty({2 * num_blocks_pad + 2, num_groups}, opt_i32);
-
-    // Branch: warp-ordered (numel <= 16384) OR 4-kernel fallback
-    constexpr int WARP_ORDERED_MAX_NUMEL = 16384;
-    if (numel <= WARP_ORDERED_MAX_NUMEL) {
+    // Branch: single-block (numel <= 16384) OR 4-kernel fallback
+    constexpr int SINGLE_BLOCK_MAX_NUMEL = 16384;
+    if (numel <= SINGLE_BLOCK_MAX_NUMEL) {
         // K0 path
         constexpr int K0_BLOCK_SIZE = 1024;
-        int smem = (num_groups * (K0_BLOCK_SIZE / 32) + 2 * (num_groups + 1)) * static_cast<int>(sizeof(int32_t));
 
-        const std::string kernel_name = "moe_align_warp_ordered";
+        const std::string kernel_name = "moe_align_single_block";
 
-        MoeAlignWarpOrderedRuntime::Args args{
+        MoeAlignSingleBlockRuntime::Args args{
             .launch_info = {block_m, num_groups, topk, K0_BLOCK_SIZE, kernel_name},
-            .launch_args = {dim3(1), dim3(K0_BLOCK_SIZE), smem},
+            .launch_args = {dim3(1), dim3(K0_BLOCK_SIZE)},
             .kernel_params = {
                 .topk_ids              = topk_ids.data_ptr<int32_t>(),
                 .sorted_token_ids      = sorted_token_ids.data_ptr<int32_t>(),
@@ -416,14 +412,14 @@ static MoeAlignReturn moe_align_block_size_impl(
             },
         };
 
-        const auto& code    = MoeAlignWarpOrderedRuntime::generate(args);
+        const auto& code    = MoeAlignSingleBlockRuntime::generate(args);
         const auto& runtime = compiler->build(kernel_name, code);
-        MoeAlignWarpOrderedRuntime::launch(runtime, args);
+        MoeAlignSingleBlockRuntime::launch(runtime, args);
     } else {
         // Per-phase block widths, matching the reference launcher: BLOCK_SIZE is a template
         // constant driving index math, CUB width and static SMEM, so each phase keeps its own.
         const int bs       = block_size_pow2;  // K1, K4
-        const int k2_block = 256;              // K2 scan
+        const int k2_block = 256;              // K2 reduce
         const int k3_block = static_cast<int>(next_power_of_two(static_cast<uint32_t>(num_groups + 1)));
         TORCH_CHECK(bs <= 1024 and k3_block <= 1024,
                     "moe_align_block_size (C++ JIT): num_groups=", num_groups,
@@ -431,16 +427,15 @@ static MoeAlignReturn moe_align_block_size_impl(
 
         int num_blocks = ceil_div(numel, bs);
 
-        // Split intermediate buffer: [block_counts | local_offsets | cumsum]
-        int32_t* base          = intermediate_buffer.data_ptr<int32_t>();
-        int32_t* block_counts  = base;
-        int32_t* local_offsets = base + num_blocks_pad * num_groups;
-        int32_t* cumsum_gpu    = base + num_blocks_pad * num_groups * 2;
+        // Split intermediate buffer: [block_counts | expert cursors | cumsum]
+        auto intermediate_buffer = at::empty({num_blocks_pad + 3, num_groups}, opt_i32);
+        int32_t* base           = intermediate_buffer.data_ptr<int32_t>();
+        int32_t* block_counts   = base;
+        int32_t* expert_cursors = base + num_blocks_pad * num_groups;
+        int32_t* cumsum_gpu     = expert_cursors + num_groups;
 
         const int smem_p1 = num_groups * static_cast<int>(sizeof(int32_t));
-        const int smem_p2 = num_blocks * static_cast<int>(sizeof(int32_t));
         const int smem_p3 = 2 * (num_groups + 1) * static_cast<int>(sizeof(int32_t));
-        const int smem_p4 = bs * static_cast<int>(sizeof(int32_t));
 
         const MoeAlignFallbackRuntime::LaunchInfo info{block_m, num_groups, topk, bs, k2_block, k3_block};
         const MoeAlignFallbackRuntime::KernelParams params{
@@ -452,7 +447,7 @@ static MoeAlignReturn moe_align_block_size_impl(
             .inv_perm              = inv_perm.data_ptr<int32_t>(),
             .m_indices             = m_indices.data_ptr<int32_t>(),
             .block_counts          = block_counts,
-            .local_offsets         = local_offsets,
+            .expert_cursors        = expert_cursors,
             .cumsum                = cumsum_gpu,
             .numel                 = numel,
             .s_total_ub            = s_total_ub,
@@ -463,9 +458,9 @@ static MoeAlignReturn moe_align_block_size_impl(
         using Phase = MoeAlignFallbackRuntime::Phase;
         const MoeAlignFallbackRuntime::Args phases[] = {
             {Phase::kCount,   info, {dim3(num_blocks_pad), dim3(bs),       smem_p1}, params},
-            {Phase::kScan,    info, {dim3(num_groups),     dim3(k2_block), smem_p2}, params},
+            {Phase::kReduce,  info, {dim3(num_groups),     dim3(k2_block)}, params},
             {Phase::kCumsum,  info, {dim3(1),              dim3(k3_block), smem_p3}, params},
-            {Phase::kScatter, info, {dim3(num_blocks),     dim3(bs),       smem_p4}, params},
+            {Phase::kScatter, info, {dim3(num_blocks),     dim3(bs)}, params},
         };
 
         // One build per phase, so each HGBIN keeps a single entry symbol. Launches stay
@@ -480,7 +475,7 @@ static MoeAlignReturn moe_align_block_size_impl(
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
         printf("[C++ JIT moe_align_block_size] BLOCK_M=%d, num_groups=%d, topk=%d, numel=%d, path=%s\n",
-               block_m, num_groups, topk, numel, (numel <= WARP_ORDERED_MAX_NUMEL) ? "warp_ordered" : "4kernel");
+               block_m, num_groups, topk, numel, (numel <= SINGLE_BLOCK_MAX_NUMEL) ? "single_block" : "4kernel");
     }
 
     return std::make_tuple(

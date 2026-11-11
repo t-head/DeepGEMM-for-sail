@@ -228,7 +228,7 @@ def test_fused_nopad_equivalence():
     lhs, rhs, routes, out, _ = utils.construct_non_permute_grouped(
         args['groups'], args['num_token'], args['k'], args['n'], args['topk'],
         args['data_type'], args['quant_type'], args['group_size'])
-    config, rows, experts, tokens, aligned, _, _ = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routes)
+    config, rows, experts, tokens, aligned, inverse, _ = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routes)
     deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(lhs, rhs, out, rows, experts, tokens, aligned, config)
     flat_experts = routes.flatten()
     order = flat_experts.argsort(stable=True)
@@ -236,7 +236,7 @@ def test_fused_nopad_equivalence():
     nopad_lhs = (lhs[0].float()[source].to(lhs[0].dtype), lhs[1][source].contiguous())
     nopad_out = torch.empty_like(out)
     deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(nopad_lhs, rhs, nopad_out, flat_experts[order], rows)
-    diff = calc_diff(out, nopad_out)
+    diff = calc_diff(out.index_select(0, inverse.flatten()[order].long()), nopad_out)
     assert torch.isfinite(out).all() and diff < .0015, f'fused/nopad {diff=}'
     print('PASS fused/nopad equivalence')
 
@@ -436,13 +436,13 @@ def test_fused_k32_basis():
         aq = torch.eye(k, device='cuda')[:m].to(torch.float8_e4m3fn)
         scales = torch.linspace(.5, 1.5, m, device='cuda').reshape(m, 1)
         routes = torch.zeros(m, 1, device='cuda', dtype=torch.int32)
-        _, rows, experts, tokens, aligned, _, _ = deep_gemm.moe_align_block_size(
+        _, rows, experts, tokens, aligned, inverse, _ = deep_gemm.moe_align_block_size(
             aq, rhs[0], routes, config=config)
         out = torch.empty(m, n, device='cuda', dtype=torch.bfloat16)
         deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
             (aq, scales * rhs[2]), rhs[:2], out, rows, experts, tokens, aligned, config)
         expected = (decode_weight(packed[0], raw[0]).T[:m]*scales).bfloat16()
-        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(out.index_select(0, inverse.flatten().long()), expected, rtol=0, atol=0)
     print('PASS fused K32 basis, shifted full scale window, M64 block boundaries and N tail')
 
 
@@ -501,14 +501,15 @@ def _streamed_fused_problem(groups, tokens, topk, n, k):
     assert rhs[2] == 1.
     lhs = quant_activation(torch.randn(tokens, k, device='cuda', dtype=torch.bfloat16))
     routes = torch.rand(tokens, groups - 1, device='cuda').topk(topk, dim=1, sorted=False).indices.int()
-    config, rows, experts, sorted_tokens, aligned, _, _ = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routes)
+    config, rows, experts, sorted_tokens, aligned, inverse, _ = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routes)
     assert len(config) == 9
     output = torch.empty(tokens * topk, n, device='cuda', dtype=torch.bfloat16)
     def call():
         deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
             lhs, rhs[:2], output, rows, experts, sorted_tokens, aligned, config)
-    def reference(weights=packed, scales=raw, routing=routes):
-        source = routing.flatten().argsort(stable=True) // topk
+    def reference(weights=packed, scales=raw, routing=routes, route_inverse=inverse):
+        order = routing.flatten().argsort(stable=True)
+        source = order // topk
         counts = torch.bincount(routing.flatten().long(), minlength=groups).cpu().tolist()
         expected = torch.empty_like(output)
         begin = 0
@@ -516,13 +517,14 @@ def _streamed_fused_problem(groups, tokens, topk, n, k):
             if count:
                 ids = source[begin:begin + count]
                 a = lhs[0].float()[ids] * lhs[1][ids]
-                expected[begin:begin + count] = (a @ decode_weight(weights[expert], scales[expert]).T).bfloat16()
+                destination = route_inverse.flatten()[order[begin:begin + count]].long()
+                expected[destination] = (a @ decode_weight(weights[expert], scales[expert]).T).bfloat16()
             begin += count
         return expected
     def reroute(routing):
         new = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routing)
         assert new[0] == config
-        for target, value in zip((rows, experts, sorted_tokens, aligned), new[1:5]):
+        for target, value in zip((rows, experts, sorted_tokens, aligned, inverse), new[1:6]):
             assert target.shape == value.shape
             target.copy_(value)
     return lhs, rhs, output, call, reference, packed, raw, routes, reroute
@@ -544,7 +546,8 @@ def test_routing_layout_block_m():
             table = sorted_tokens.flatten()
             begin = offset = 0
             for count in rows.cpu().tolist():
-                assert torch.equal(table[offset:offset + count], source[begin:begin + count].int())
+                assert torch.equal(table[offset:offset + count].sort().values,
+                                   source[begin:begin + count].int().sort().values)
                 padded = (count + bm - 1) // bm * bm
                 assert (table[offset + count:offset + padded] == tokens).all()
                 begin += count
@@ -570,13 +573,13 @@ def test_native_tiles():
         assert bool((backing[-16:] == -123.).all())
         if bm <= 176:
             lhs, rhs, _, _, reference, _, _, routes, _ = _streamed_fused_problem(8, 417, 4, 512, k)
-            expected = reference()
             backing = torch.full((417 * 4 + 16, 512), -123., device='cuda', dtype=torch.bfloat16)
             fused_stages = 3 if stages == 2 and bm <= 144 else stages
             config = config[:7] + (fused_stages, 1)
-            selected, rows, experts, tokens, aligned, _, _ = deep_gemm.moe_align_block_size(
+            selected, rows, experts, tokens, aligned, route_inverse, _ = deep_gemm.moe_align_block_size(
                 lhs[0], rhs[0], routes, config=config)
             assert selected == config and tokens.size(1) == bm
+            expected = reference(route_inverse=route_inverse)
             deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
                 lhs, rhs[:2], backing[:-16], rows, experts, tokens, aligned, config, inv_scale=.5)
             assert calc_diff(backing[:-16], expected * .5) < .003, config
@@ -686,7 +689,7 @@ def test_execution_paths():
             if fused:
                 lhs, rhs, output, _, reference, packed, raw, routes, _ = _streamed_fused_problem(
                     groups, 1024 if short else 193 if streamed else 417, 4, n, k)
-                selected, rows, experts, tokens, aligned, _, _ = deep_gemm.moe_align_block_size(
+                selected, rows, experts, tokens, aligned, route_inverse, _ = deep_gemm.moe_align_block_size(
                     lhs[0], rhs[0], routes, config=config)
                 assert selected == config and tokens.size(1) == config[1]
                 def call(inverse):
@@ -701,7 +704,7 @@ def test_execution_paths():
                 def call(inverse):
                     deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
                         lhs, rhs[:2], output, indices, rows, config, inv_scale=inverse)
-            expected = reference()
+            expected = reference(route_inverse=route_inverse) if fused else reference()
             graph, stream = _capture_prepared(call, output, None if fused else rows)
             assert calc_diff(output, expected * .3) < .003
             packed.bitwise_xor_(0x88)
@@ -716,7 +719,7 @@ def test_execution_paths():
                 routes.add_(1).remainder_(groups)
                 updated = deep_gemm.moe_align_block_size(lhs[0], rhs[0], routes, config=config)
                 assert updated[0] == config
-                for target, value in zip((rows, experts, tokens, aligned), updated[1:5]):
+                for target, value in zip((rows, experts, tokens, aligned, route_inverse), updated[1:6]):
                     assert target.shape == value.shape
                     target.copy_(value)
             else:
@@ -724,7 +727,7 @@ def test_execution_paths():
                 rows.copy_(torch.tensor(counts, device='cuda', dtype=torch.int32))
                 indices.copy_(torch.repeat_interleave(
                     torch.arange(groups, device='cuda', dtype=torch.int32), rows.long()))
-            expected = reference()
+            expected = reference(route_inverse=route_inverse) if fused else reference()
             output.fill_(float('nan'))
             graph.replay()
             torch.cuda.synchronize()
@@ -849,15 +852,15 @@ def test_small_group_streamed():
         deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(lhs, rhs[:2], native, indices, rows, config)
         assert calc_diff(native, expected) < .003
         # The public aligner exposes the same automatic configuration used by
-        # NoPad. Sorted, top-1 routes also make its fused result directly comparable.
+        # NoPad. Restore the top-1 fused result through the returned inverse mapping.
         routes = indices.reshape(-1, 1)
-        selected, fused_rows, experts, tokens, aligned, _, _ = deep_gemm.moe_align_block_size(
+        selected, fused_rows, experts, tokens, aligned, inverse, _ = deep_gemm.moe_align_block_size(
             lhs[0], rhs[0], routes)
         assert selected == (sms, 256, 256, 128, 64, 64, 128, 4, 1), (groups, selected)
         fused = torch.empty_like(output)
         deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
             lhs, rhs[:2], fused, fused_rows, experts, tokens, aligned, selected)
-        assert calc_diff(fused, expected) < .003
+        assert calc_diff(fused.index_select(0, inverse.flatten().long()), expected) < .003
         if groups in (1, 3, 7):
             def scaled(inverse):
                 deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(

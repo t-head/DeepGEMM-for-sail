@@ -1,5 +1,6 @@
 #pragma once
 #include <cub/block/block_scan.cuh>
+#include <cub/block/block_reduce.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/epilogue_utils.cuh>
 #include <deep_gemm/tix/cvt.cuh>
@@ -326,13 +327,13 @@ __forceinline__ __device__ void epilogue_with_tsm(TAcc& accum, TCcC& tCcC, TCC& 
 };
 
 // =============================================================================
-// Single-kernel WarpOrdered deterministic moe_align (replaces 4-kernel for numel <= 16384)
-// 1 block x 1024 threads, 4 phases, 3 syncs, zero grid.sync()
+// Single-kernel moe_align for numel <= 16384; expert-local order is unspecified.
+// 1 block x 1024 threads.
 // =============================================================================
 
 template <int BLOCK_M, int kNumGroups, int kTopK, int BLOCK_SIZE = 1024>
 __device__ __forceinline__ void
-moe_align_warp_ordered_kernel_impl(
+moe_align_single_block_kernel_impl(
     const int32_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ m_rows,
@@ -344,155 +345,109 @@ moe_align_warp_ordered_kernel_impl(
     int s_total_ub)
 {
     constexpr int WARP_SIZE = 32;
-    constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
-    const int warp_id = __ppu_read_warpid();
-    const int lane_id = __ppu_read_laneid();
-
-    extern __shared__ int32_t smem[];
-    int32_t* warp_counts = smem;
-    int32_t* warp_prefix = smem;
-    int32_t* shared_cumsum = smem + NUM_WARPS * kNumGroups;
-    int32_t* shared_nopad  = shared_cumsum + (kNumGroups + 1);
-
-    // peer_rank[c] = local rank within warp chunk c (used by Phase 4 scatter)
-    int peer_rank[16];
-
-    int numel_per_warp = (numel + NUM_WARPS - 1) / NUM_WARPS;
-    int warp_start = warp_id * numel_per_warp;
-    int warp_end = min(warp_start + numel_per_warp, numel);
-
+    __shared__ int cursor[kNumGroups], padded[kNumGroups], compact[kNumGroups];
+    __shared__ int2 totals[(kNumGroups + WARP_SIZE - 1) / WARP_SIZE];
+    const int tid = threadIdx.x;
     // =======================================================================
-    // Phase 1: Fill PAD + Warp Count + peer_rank[]
+    // Phase 1: Initialize expert counters and fill sorted_token_ids with PAD
     // =======================================================================
-    {
-        // Fill PAD via int4 stride-write (PAD value = shape_m = numel / kTopK)
-        constexpr int shape_m_div = kTopK;  // divisor is compile-time constant
-        int shape_m = numel / shape_m_div;
-        int4 fill_val = make_int4(shape_m, shape_m, shape_m, shape_m);
-        int4* out_vec = (int4*)sorted_token_ids;
-        for (int i = threadIdx.x; i < s_total_ub / 4; i += BLOCK_SIZE) {
-            out_vec[i] = fill_val;
-        }
-        for (int i = s_total_ub / 4 * 4 + threadIdx.x; i < s_total_ub; i += BLOCK_SIZE) {
-            sorted_token_ids[i] = shape_m;
-        }
-
-        for (int i = threadIdx.x; i < NUM_WARPS * kNumGroups; i += BLOCK_SIZE) {
-            warp_counts[i] = 0;
-        }
-        for (int i = threadIdx.x; i < numel; i += BLOCK_SIZE) {
-            m_indices[i] = -1;
-        }
-        __syncthreads();
-
-        for (int c = 0; c * WARP_SIZE < (warp_end - warp_start); c++) {
-            int idx = warp_start + c * WARP_SIZE + lane_id;
-            int eid = (idx < warp_end) ? topk_ids[idx] : kNumGroups;
-            bool valid = (idx < warp_end) && eid >= 0 && eid < kNumGroups;
-            uint32_t mask = __match_any_sync(0xFFFFFFFF, eid);
-            uint32_t prefix_mask = mask & __ppu_read_lanemask_lt();
-
-            if (valid) {
-                int running_cnt = warp_counts[warp_id * kNumGroups + eid];
-                if (prefix_mask == 0) {
-                    warp_counts[warp_id * kNumGroups + eid] = running_cnt + __popc(mask);
-                }
-                peer_rank[c] = running_cnt + __popc(prefix_mask);
+    if (tid < kNumGroups) cursor[tid] = 0;
+    // Fill PAD via int4 stride-write (PAD value = shape_m = numel / kTopK)
+    constexpr int shape_m_div = kTopK;  // divisor is compile-time constant
+    int shape_m = numel / shape_m_div;
+    int4 fill_val = make_int4(shape_m, shape_m, shape_m, shape_m);
+    int4* out_vec = (int4*)sorted_token_ids;
+    for (int i = threadIdx.x; i < s_total_ub / 4; i += BLOCK_SIZE) {
+        out_vec[i] = fill_val;
+    }
+    for (int i = s_total_ub / 4 * 4 + threadIdx.x; i < s_total_ub; i += BLOCK_SIZE) {
+        sorted_token_ids[i] = shape_m;
+    }
+    __syncthreads();
+    // =======================================================================
+    // Phase 2: Initialize m_indices, count routes and reserve expert-local slots
+    // =======================================================================
+    // offsets[c] stores the slot returned by atomicAdd for this thread's route.
+    // Slots are unique within each expert; original route order is not preserved.
+    // The C++ launcher selects this single block for at most 16,384 slots.
+    static_assert(kNumGroups <= BLOCK_SIZE, "one thread per expert is required");
+    constexpr int rounds = 16384 / BLOCK_SIZE;
+    int offsets[rounds];
+    #pragma unroll
+    for (int c = 0; c < rounds; ++c) {
+        const int i = tid + c * BLOCK_SIZE;
+        if (c * BLOCK_SIZE >= numel) break;
+        if (i < numel) m_indices[i] = -1;
+        const int e = i < numel ? topk_ids[i] : -1;
+        offsets[c] = (e >= 0 && e < kNumGroups) ? atomicAdd(&cursor[e], 1) : 0;
+    }
+    __syncthreads();
+    // =======================================================================
+    // Phase 3: Compute expert starts and emit GEMM block metadata
+    // =======================================================================
+    // One thread per expert: scan padded counts (p) and valid counts (c).
+    const int count = tid < kNumGroups ? cursor[tid] : 0;
+    const int extent = cute::round_up(count, BLOCK_M);
+    int p = extent, c = count;
+    const int warp = __ppu_read_warpid();
+    const int lane = __ppu_read_laneid();
+    if (warp < (kNumGroups + WARP_SIZE - 1) / WARP_SIZE) {
+        #pragma unroll
+        for (int d = 1; d < WARP_SIZE; d *= 2) {
+            int a = __shfl_up_sync(0xFFFFFFFF, p, d);
+            int b = __shfl_up_sync(0xFFFFFFFF, c, d);
+            if (lane >= d) {
+                p += a;
+                c += b;
             }
+        }
+        if (lane == WARP_SIZE - 1) totals[warp] = make_int2(p, c);
+    }
+    __syncthreads();
+    if (tid < kNumGroups) {
+        // Add preceding warp totals to obtain block-wide inclusive sums.
+        for (int w = 0; w < warp; ++w) {
+            p += totals[w].x;
+            c += totals[w].y;
+        }
+        // Subtract this expert's count to obtain its exclusive start offset.
+        // padded indexes GEMM input slots; compact indexes valid intermediate rows.
+        padded[tid] = p - extent;
+        compact[tid] = c - count;
+        m_rows[tid] = count;
+        if (tid == kNumGroups - 1) *aligned_num_m_blocks = p / BLOCK_M;
+        // Per block: expert ID, valid row count, first block, compact row start.
+        const int4 info =
+            make_int4(tid, count, (p - extent) / BLOCK_M, c - count);
+        int4* metadata = reinterpret_cast<int4*>(expert_ids_and_cumsum);
+        for (int pos = p - extent; pos < p; pos += BLOCK_M) {
+            metadata[pos / BLOCK_M] = info;
         }
     }
     __syncthreads();
-
     // =======================================================================
-    // Phase 2: Warp Prefix (Hillis-Steele, warp_counts -> warp_prefix)
+    // Phase 4: Scatter token IDs and write inverse/compact expert mappings
     // =======================================================================
-    {
-        for (int eid = warp_id; eid < kNumGroups; eid += NUM_WARPS) {
-            int val = (lane_id < NUM_WARPS) ? warp_counts[lane_id * kNumGroups + eid] : 0;
-            int sum = val;
-            #pragma unroll
-            for (int k = 1; k < 32; k *= 2) {
-                int n = __shfl_up_sync(0xFFFFFFFF, sum, k);
-                if (lane_id >= k) sum += n;
-            }
-            if (lane_id < NUM_WARPS) {
-                warp_prefix[lane_id * kNumGroups + eid] = sum - val;
-            }
-            if (lane_id == NUM_WARPS - 1) {
-                shared_cumsum[eid] = sum;
-            }
+    // Valid routes overwrite PAD/invalid entries; unused m_indices stay -1.
+    #pragma unroll
+    for (int c = 0; c < rounds; ++c) {
+        const int i = tid + c * BLOCK_SIZE;
+        if (i >= numel) break;
+        const int e = topk_ids[i];
+        if (e < 0 || e >= kNumGroups) {
+            inv_perm[i] = -1;
+            continue;
         }
-    }
-    __syncthreads();
-
-    // =======================================================================
-    // Phase 3: CUB BlockScan cumsum + expert_ids_and_cumsum
-    // =======================================================================
-    {
-        int group_num = 0;
-        int padded = 0;
-        if (threadIdx.x < kNumGroups) {
-            group_num = shared_cumsum[threadIdx.x];
-            m_rows[threadIdx.x] = group_num;
-            padded = cute::round_up(group_num, BLOCK_M);
-        }
-        using BlockScan = cub::BlockScan<int32_t, BLOCK_SIZE>;
-        __shared__ typename BlockScan::TempStorage temp_storage;
-        int cumsum_val = 0;
-        BlockScan(temp_storage).ExclusiveSum(padded, cumsum_val);
-        if (threadIdx.x <= kNumGroups) {
-            shared_cumsum[threadIdx.x] = cumsum_val;
-        }
-        __syncthreads();
-        if (threadIdx.x == kNumGroups) {
-            *aligned_num_m_blocks = cumsum_val / BLOCK_M;
-        }
-        // Second scan: row-level compact cumsum (raw, not padded)
-        int nopad_val = 0;
-        BlockScan(temp_storage).ExclusiveSum(group_num, nopad_val);
-        if (threadIdx.x <= kNumGroups) {
-            shared_nopad[threadIdx.x] = nopad_val;
-        }
-        __syncthreads();
-        if (threadIdx.x < kNumGroups) {
-            int eid = threadIdx.x;
-            int cumsum_aligned = shared_cumsum[eid] / BLOCK_M;
-            int cumsum_compact = shared_nopad[eid];
-            for (int i = shared_cumsum[eid]; i < shared_cumsum[eid + 1]; i += BLOCK_M) {
-                int block_idx = i / BLOCK_M;
-                int4* quad = (int4*)(expert_ids_and_cumsum + block_idx * 4);
-                *quad = make_int4(eid, group_num, cumsum_aligned, cumsum_compact);
-            }
-        }
-    }
-
-    // =======================================================================
-    // Phase 4: Scatter
-    // =======================================================================
-    {
-        for (int idx = warp_start + lane_id; idx < warp_end; idx += WARP_SIZE) {
-            int eid = topk_ids[idx];
-            if (eid < 0 || eid >= kNumGroups) {
-                inv_perm[idx] = -1;
-                continue;
-            }
-            int c = (idx - warp_start) / WARP_SIZE;
-            int offset = warp_prefix[warp_id * kNumGroups + eid] + peer_rank[c];
-            int rank = shared_cumsum[eid] + offset;
-            int compact_rank = shared_nopad[eid] + offset;
-            sorted_token_ids[rank] = idx / kTopK;
-            inv_perm[idx] = compact_rank;
-            m_indices[compact_rank] = eid;
-        }
+        sorted_token_ids[padded[e] + offsets[c]] = i / kTopK;
+        inv_perm[i] = compact[e] + offsets[c];
+        m_indices[compact[e] + offsets[c]] = e;
     }
 }
 
 
 // =============================================================================
-// 4-kernel deterministic moe_align pipeline (ported from sglang final version)
-// Replaces the original single-kernel atomicAdd scatter with a fully
-// deterministic pipeline: K1 count+fill -> K2 local_scan -> K3 cumsum+ids -> K4 scatter.
-// 2 traversals of topk_ids, zero CPU round-trip, bit-identical output across runs.
+// 4-kernel moe_align pipeline: K1 count+fill -> K2 reduce -> K3 cumsum+ids -> K4 scatter.
+// Two traversals of topk_ids, no CPU round-trip; expert-local order is unspecified.
 // =============================================================================
 
 // -- K1: block_count_with_fill ----------------------------------------------
@@ -551,79 +506,49 @@ block_count_with_fill_impl(
 }
 
 
-// -- K2: local_scan ---------------------------------------------------------
-// Parallel exclusive scan across NUM_BLOCKS for each expert column.
-// Uses CUB BlockScan for O(log N) inter-thread prefix.
-//
-// Grid: kNumGroups blocks.  SMEM: NUM_BLOCKS * sizeof(int32_t).
-// Output: local_offsets[num_blocks][kNumGroups], expert_counts[kNumGroups].
+// -- K2: Reduce counts and initialize the expert cursor ----------------------
+// One block per expert. CUB BlockReduce uses static shared storage.
+// Output: expert_cursors[0:kNumGroups] cursors and expert_counts[kNumGroups].
 // ----------------------------------------------------------------------------
 template <int BLOCK_SIZE>
 __device__ __forceinline__ void
-local_scan_impl(
-    const int32_t* __restrict__ block_counts,   // [num_blocks * kNumGroups]
-    int32_t* __restrict__ local_offsets,         // [num_blocks * kNumGroups] output
-    int32_t* __restrict__ expert_counts,          // [kNumGroups] output
+reduce_expert_counts_impl(
+    const int32_t* block_counts,   // [num_blocks * kNumGroups]
+    int32_t* expert_cursors,         // first kNumGroups entries: cursor
+    int32_t* expert_counts,          // [kNumGroups] output
     int kNumGroups,                              // runtime
     int num_blocks,
     int eid)                                     // expert index handled by this block
 {
-    int tid = threadIdx.x;
-    if (eid >= kNumGroups) return;
-
-    extern __shared__ int32_t smem_vals[];
-
-    // Coalesced strided load into SMEM (same as original)
-    for (int b = tid; b < num_blocks; b += BLOCK_SIZE) {
-        smem_vals[b] = block_counts[b * kNumGroups + eid];
-    }
-    __syncthreads();
-
-    // Contiguous assignment: thread tid handles blocks [start, end)
-    int ept = (num_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    int start = tid * ept;
-    int end = min(start + ept, num_blocks);
-
-    // Partial sum over contiguous blocks
-    int my_partial = 0;
-    for (int b = start; b < end; b++) {
-        my_partial += smem_vals[b];
-    }
-
-    // Single BlockScan on partial sums (1 call, same as original)
-    using BlockScan = cub::BlockScan<int32_t, BLOCK_SIZE>;
-    __shared__ typename BlockScan::TempStorage temp_storage;
-
-    int inter_prefix = 0;
-    BlockScan(temp_storage).ExclusiveSum(my_partial, inter_prefix);
-
-    if (tid == BLOCK_SIZE - 1) {
-        expert_counts[eid] = inter_prefix + my_partial;
-    }
-
-    // Sequential scan + writeback over contiguous blocks
-    int local_total = 0;
-    for (int b = start; b < end; b++) {
-        local_offsets[b * kNumGroups + eid] = local_total + inter_prefix;
-        local_total += smem_vals[b];
+    int sum = 0;
+    for (int b = threadIdx.x; b < num_blocks; b += BLOCK_SIZE)
+        sum += block_counts[b * kNumGroups + eid];
+    using BlockReduce = cub::BlockReduce<int32_t, BLOCK_SIZE>;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    sum = BlockReduce(temp_storage).Sum(sum);
+    if (threadIdx.x == 0) {
+        expert_counts[eid] = sum;
+        expert_cursors[eid] = 0;
     }
 }
 
 
 // -- K3: cumsum_expert_ids --------------------------------------------------
-// Block-aligns expert token counts (from m_rows), computes element-level cumsum
-// via CUB BlockScan, and writes expert_ids_and_cumsum in DeepGEMM format.
-// All threads participate: each handles its own expert's M-blocks.
+// Computes padded and compact expert starts from valid route counts (m_rows)
+// via two CUB BlockScans, and writes expert_ids_and_cumsum in DeepGEMM format.
+// All threads participate in scans; expert threads write their own M-blocks.
 //
-// Grid: 1 block.  SMEM: (kNumGroups + 1) * sizeof(int32_t).
-// Output: cumsum_out[kNumGroups] + expert_ids_and_cumsum + aligned_num_m_blocks.
+// Grid: 1 block. Dynamic SMEM: 2 * (kNumGroups + 1) * sizeof(int32_t).
+// CUB BlockScan additionally uses static shared storage.
+// Output: cumsum_out[2 * kNumGroups] (padded starts, then compact starts),
+// expert_ids_and_cumsum and aligned_num_m_blocks.
 // ----------------------------------------------------------------------------
 template <int BLOCK_SIZE, int BLOCK_M, int kNumGroups>
 __device__ __forceinline__ void
 cumsum_expert_ids_impl(
     const int32_t* __restrict__ m_rows,              // [kNumGroups] expert_counts from K2
-    int32_t* __restrict__ expert_ids_and_cumsum,     // [max_num_m_blocks * 4] output (DeepGEMM format, uint4)
-    int32_t* __restrict__ cumsum_out,                // [kNumGroups] element-level padded cumsum for K4
+    int32_t* __restrict__ expert_ids_and_cumsum,     // [max_num_m_blocks * 4] output (DeepGEMM format, int4)
+    int32_t* __restrict__ cumsum_out,                // [2 * kNumGroups] padded starts, then compact starts for K4
     int32_t* __restrict__ aligned_num_m_blocks)      // [1] output
 {
     int tid = threadIdx.x;
@@ -668,7 +593,7 @@ cumsum_expert_ids_impl(
     }
     __syncthreads();
 
-    // Each thread writes cumsum_out + expert_ids_and_cumsum (uint4) for its own expert
+    // Each expert thread writes both starts and its GEMM block metadata (int4)
     if (is_valid) {
         cumsum_out[tid] = shared_cumsum[tid];
         cumsum_out[tid + kNumGroups] = shared_nopad[tid];
@@ -683,67 +608,35 @@ cumsum_expert_ids_impl(
 }
 
 
-// -- K4: deterministic_scatter ----------------------------------------------
-// Thread<->expert 1:1 binding.  SMEM tile cooperative load + scan.
-// ZERO atomicAdd in scatter phase -- fully deterministic.
-//
-// Grid: num_blocks blocks.  BLOCK_SIZE = next_power_of_two(kNumGroups).
-// Output: sorted_token_ids (filled with token_idx = idx / topk).
+// -- K4: Atomic scatter -----------------------------------------------------
+// Each valid route reserves one slot from its expert cursor.
+// Grid: num_blocks blocks. BLOCK_SIZE = next_power_of_two(kNumGroups).
+// Expert-local order is unspecified; inverse mappings preserve route identity.
 // ----------------------------------------------------------------------------
 template <int BLOCK_SIZE, int BLOCK_M, int kTopK>
 __device__ __forceinline__ void
-deterministic_scatter_impl(
+atomic_scatter_impl(
     const int32_t* __restrict__ topk_ids,            // [numel] flattened topk_ids
     int32_t* __restrict__ sorted_token_ids,           // [s_total_ub] output
     int32_t* __restrict__ inv_perm,                   // [numel] output
     int32_t* __restrict__ m_indices,                  // [numel] per-row expert ID for nopad GEMM2
-    const int32_t* __restrict__ cumsum,                // [kNumGroups] element-level padded cumsum from K3
-    const int32_t* __restrict__ local_offsets,         // [num_blocks * kNumGroups]
+    const int32_t* __restrict__ cumsum,                // [2 * kNumGroups] padded starts, then compact starts from K3
+    int32_t* __restrict__ expert_cursors,         // first kNumGroups entries: cursor
     int numel,                                         // = M * topk
     int kNumGroups,                                    // runtime
     int bid)                                           // logical block index
 {
-    int tid = threadIdx.x;
-    int idx = bid * BLOCK_SIZE + tid;
-
-    // Cooperative load one tile -> SMEM (all threads must reach __syncthreads)
-    __align__(16) __shared__ int32_t tile[BLOCK_SIZE];
-    tile[tid] = (idx < numel) ? topk_ids[idx] : -1;
-    if (idx < numel && (tile[tid] < 0 || tile[tid] >= kNumGroups)) {
+    const int idx = bid * BLOCK_SIZE + threadIdx.x;
+    const int eid = idx < numel ? topk_ids[idx] : -1;
+    if (idx >= numel) return;
+    if (static_cast<unsigned>(eid) >= static_cast<unsigned>(kNumGroups)) {
         inv_perm[idx] = -1;
+        return;
     }
-    __syncthreads();
-
-    // Vectorized scan: read 4 elements per iteration via int4
-    if (tid < kNumGroups) {
-        int eid = tid;
-        int local_off = local_offsets[bid * kNumGroups + eid];
-        int off = cumsum[eid] + local_off;
-        int compact_off = cumsum[eid + kNumGroups] + local_off;
-        int cnt = 0;
-        int block_base = bid * BLOCK_SIZE;
-        int4* tile4 = (int4*)tile;
-        for (int j = 0; j < BLOCK_SIZE / 4; j++) {
-            int4 v = tile4[j];
-            int ib = block_base + j * 4;
-            // Compute match mask: 4 independent comparisons → 4-bit mask
-            int mask = ((v.x == eid) << 0) | ((v.y == eid) << 1) |
-                       ((v.z == eid) << 2) | ((v.w == eid) << 3);
-            int n = __popc(mask);
-            if (n > 0) {
-                int idxs[4] = {ib, ib + 1, ib + 2, ib + 3};
-                #pragma unroll
-                for (int k = 0; k < 4; k++) {
-                    if (mask & (1 << k)) {
-                        sorted_token_ids[off + cnt] = idxs[k] / kTopK;
-                        inv_perm[idxs[k]] = compact_off + cnt;
-                        m_indices[compact_off + cnt] = eid;
-                        cnt++;
-                    }
-                }
-            }
-        }
-    }
+    const int offset = atomicAdd(&expert_cursors[eid], 1);
+    sorted_token_ids[cumsum[eid] + offset] = idx / kTopK;
+    inv_perm[idx] = cumsum[kNumGroups + eid] + offset;
+    m_indices[cumsum[kNumGroups + eid] + offset] = eid;
 }
 
 } // namespace deep_gemm

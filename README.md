@@ -167,6 +167,8 @@ First call `deep_gemm.moe_align_block_size` with the LHS/RHS inputs and `topk_id
 - `deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused`: fused routing gather with per-row E4M3 activations, group-32 MXFP4 weights, and BF16 output on M890.
 - `deep_gemm.m_grouped_gemm_w4a16_fused`: fused MoE grouped GEMM with 4-bit group-quantized weights and BF16 activation (W4A16), producing BF16 output.
 
+`moe_align_block_size` does not guarantee stable route ordering within an expert, even for identical inputs. Use the routing metadata from the same align invocation together, and use its `inv_perm` to map the corresponding grouped outputs back to the original route slots. Do not mix `sorted_token_ids` from one invocation with `inv_perm` or other routing metadata from another. This also applies to CUDA Graph replay: consume the metadata produced by the current execution rather than assuming the ordering matches a previous replay.
+
 For more information, please refer to the `moe_align_block_size` and `m_grouped_gemm_*_nt_fused` function documentation.
 
 #### W4A8 dense and MoE GEMMs (M890)

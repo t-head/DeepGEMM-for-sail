@@ -521,24 +521,11 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
     ref_out = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
 
     if _acc_check and not nopad:
-        # Step 1: Compute GEMM in Token order
-        output_token_order = torch.empty((num_token * topk, n), device=tensor_device, dtype=torch.bfloat16)
+        # Reference rows are indexed by original route slot.
         for token_idx in range(num_token):
-            for topk_idx in range(topk):
-                expert_id = topk_ids[token_idx, topk_idx].item()
-                flat_idx = token_idx * topk + topk_idx
-                output_token_order[flat_idx] = x[token_idx] @ y[expert_id].T
-        # Step 2: Collect (expert_id, src_idx) pairs
-        entries = []
-        for token_idx in range(num_token):
-            for topk_idx in range(topk):
-                expert_id = topk_ids[token_idx, topk_idx].item()
-                src_idx = token_idx * topk + topk_idx
-                entries.append((expert_id, src_idx))
-        # Step 3: Sort by expert_id and permute output
-        entries.sort(key=lambda e: e[0])
-        for dst_idx, (expert_id, src_idx) in enumerate(entries):
-            ref_out[dst_idx] = output_token_order[src_idx]
+            for slot in range(topk):
+                expert_id = topk_ids[token_idx, slot].item()
+                ref_out[token_idx * topk + slot] = x[token_idx] @ y[expert_id].T
 
     '''
     #  check for nopad interface
@@ -627,7 +614,7 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
 
         # Recompute ref_out from fp4-dequantized values for accurate comparison
         if _acc_check and not nopad:
-            ref_out_list = []
+            ref_out = torch.empty_like(ref_out, dtype=torch.float32)
             k_, sfk_ = x_fp4.shape[-1], x_fp4_scale.shape[-1]
             x_fp4_permuted = x_fp4.view(num_token, -1, k_).repeat(1, topk, 1).reshape(-1, k_)
             x_fp4_scale_permuted = x_fp4_scale.view(num_token, -1, sfk_).repeat(1, topk, 1).reshape(-1, sfk_).view(torch.uint8)
@@ -636,8 +623,7 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
                 mask = (topk_ids_ == i)
                 if mask.sum():
                     ref_out_group = dequantize_fp4_torch(x_fp4_permuted[mask], x_fp4_scale_permuted[mask]).to(torch.float) @ dequantize_fp4_torch(y_fp4_[i], y_fp4_scale_[i]).to(torch.float).transpose(0, 1)
-                    ref_out_list.append(ref_out_group)
-            ref_out = torch.concat(ref_out_list, dim=0)
+                    ref_out[mask] = ref_out_group
 
             if is_act_and_quant_fused(epilogue_type):
                 ### Reference
@@ -1205,12 +1191,12 @@ def read_numbers_from_file(file_path):
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
-    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", "MegaMhc", "AttentionRegression", "Preprocess", "Activation"]
+    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", "MegaMhc", "AttentionRegression", "Preprocess", "Activation", "MoeAlign"]
     supported_indexer_epilogue_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
     supported_gemm_type.append("KGroupedContiguous")
-    dg_params = r"(KGroupedContiguous|GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation),(.+)"
+    dg_params = r"(KGroupedContiguous|GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation|MoeAlign),(.+)"
     pattern = re.compile(dg_params)
     m = pattern.search(s.strip("."))
     if not m:
@@ -2057,7 +2043,7 @@ def test_m_grouped_gemm_fused(args) -> None:
         x_tensor = x[0] if isinstance(x, (tuple, list)) else x
         y_tensor = y[0] if isinstance(y, (tuple, list)) else y
         is_perchannel = quant_type == 'channel'
-        configs, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, _, _ = deep_gemm.moe_align_block_size(x_tensor, y_tensor, topk_ids, is_perchannel, enable_act_and_quant_fusing=is_act_and_quant_fused(epilogue_type))
+        configs, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, inv_perm, _ = deep_gemm.moe_align_block_size(x_tensor, y_tensor, topk_ids, is_perchannel, enable_act_and_quant_fusing=is_act_and_quant_fused(epilogue_type))
 
         if d == torch.bfloat16:
             deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_offset, sorted_token_ids, aligned_num_m_blocks, configs)
@@ -2086,6 +2072,10 @@ def test_m_grouped_gemm_fused(args) -> None:
     threshold = (0.001 if d == torch.uint8 and not is_act_and_quant_fused(epilogue_type)
                  else 0.0015)
     if _acc_check:
+        route_order = inv_perm.long()
+        out = out.index_select(0, route_order)
+        if is_act_and_quant_fused(epilogue_type):
+            out_scale = out_scale.view(torch.int16).index_select(0, route_order).view(torch.uint16)
         diff = calc_diff(out, ref_out)
         diff_scale = None
         if diff >= threshold or torch.isnan(diff) or torch.isinf(diff):
