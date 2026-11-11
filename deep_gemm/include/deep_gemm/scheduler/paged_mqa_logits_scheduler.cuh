@@ -31,8 +31,9 @@ void smxx_paged_mqa_logits_metadata_device(const uint32_t batch_size, const uint
             }
             __syncthreads();
             val += temp;
-            __syncthreads();
             temp_prefix_sum[tid] = val;
+            // Publish this round before other warps read it in the next round.
+            __syncthreads();
         }
         temp_prefix_sum[tid] += sum;
         __syncthreads();
@@ -46,10 +47,11 @@ void smxx_paged_mqa_logits_metadata_device(const uint32_t batch_size, const uint
         uint32_t temp = (tid >= offset && tid < last) ? temp_prefix_sum[tid - offset] : 0;
         __syncthreads();
         val += temp;
-        __syncthreads();
         if (tid < last) {
             temp_prefix_sum[tid] = val;
         }
+        // All threads must participate, including those outside the tail.
+        __syncthreads();
     }
     if (tid < last) {
         temp_prefix_sum[tid] += sum;
@@ -132,7 +134,7 @@ struct PagedMQALogitsScheduler {
     }
 
     __device__ __forceinline__ bool is_last_task(const uint32_t& q_idx, const uint32_t& kv_idx) const {
-        return (q_idx > end_q_idx) or (q_idx == end_q_idx and kv_idx == end_kv_idx);
+        return q_idx == end_q_idx and kv_idx == end_kv_idx;
     }
 };
 
