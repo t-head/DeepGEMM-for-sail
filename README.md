@@ -123,18 +123,14 @@ with contiguous BF16 inputs. On 810E and 890P, `out` supports BF16 or FP32.
 M890 supports odd and even N. The standard 810E tiled path requires even N;
 its specialized paths also support guarded narrow outputs and partial tiles.
 
-#### 810E dense and strided batched GEMM
+#### 810E dense GEMM
 
 ```python
 # A[M,K], B[N,K]: contiguous BF16; D[M,N]: contiguous BF16 or FP32.
 deep_gemm.bf16_gemm_nt(a, b, d, c=c)  # D = A @ B.T + C; C is optional
-# A[G,M,K], B[G,N,K], D[G,M,N]: BF16, including supported strided views.
-deep_gemm.bf16_gemm_strided_batched_nt(a_batch, b_batch, d_batch)
-# Contiguous FP32 A[M,K], B[N,K], D[M,N]; full FP32 operands, without TF32.
-deep_gemm.gemm_fp32_fp32_fp32_nt(a_fp32, b_fp32, d_fp32)
 ```
 
-These functions write into the supplied output and return `None`. All tensors
+This function writes into the supplied output and returns `None`. All tensors
 must be on the current accelerator; output must not overlap either input.
 For dense BF16 accumulation, C must match D's shape, dtype and device and be
 either disjoint from D or exactly aliased with identical strides. The product
@@ -142,21 +138,15 @@ and C are combined in FP32 before conversion to BF16, including GEMV and split-K
 Compile-only mode (`set_compile_mode(1)` or nonempty `HGGC_WARM_UP`) preserves C/D.
 
 810E BF16 tiled paths require `K>=64`, `K%32=0`, and 16-byte-aligned inputs.
-GEMV paths allow shorter K with their own alignment checks. Native batched GEMM
-requires equal batch counts, nonnegative input strides, unit output column
-stride and nonoverlapping output rows/batches. Zero input batch stride supports
-broadcasting; padded and interleaved batches are supported. Eligible layouts
-execute directly; other supported input views are packed before execution.
-The native batched API has BF16 output and no C argument. Empty outputs are
+GEMV paths allow shorter K with their own alignment checks. Empty outputs are
 no-ops, and K=0 writes C or zero as appropriate during normal execution.
 Unsupported shapes, layouts, tiles and device grid/resource limits raise an
 error at the host interface before launching the affected kernel.
 
 Automatic 810E scheduling uses matrix geometry and the configured CU budget,
-choosing GEMV, Direct, TSM, hybrid edge handling, split-K or cute-free kernels.
+choosing GEMV, Direct, TSM, hybrid edge handling, split-K kernels.
 Explicit `configs` take precedence over external LUT entries, which take
-precedence over automatic selection. Cute-free/WarpOnK is selected automatically
-for bounded medium-K split-K workloads, without runtime override switches.
+precedence over automatic selection.
 The stable configuration tuple is
 `(num_sms, BM, BN, BK, WM, WN, stages, (0, 0, 0))`; its last field is reserved
 and shared-memory requirements are recomputed. Explicit/LUT tiled execution
@@ -164,8 +154,17 @@ requires a 16-byte-aligned output and N divisible by 8 (BF16) or 4 (FP32).
 See [utilities and environment variables](#utilities) for kernel controls and
 [checkin cases](tests/checkin/checkin_810e.list) for accuracy and rejection coverage.
 
-The native batched and FP32 entry points are PPU fork extensions; the existing
-dense BF16 name, argument order and compatibility aliases remain unchanged.
+Implementation follows the existing API → heuristics → runtime → kernel layers.
+The API validates tensor contracts; `common_bf16.hpp` selects configurations;
+the runtime owns accumulation, workspace and launches.
+810E-specific counterparts use the existing names with an `_810e` suffix,
+including `bf16_gemm_810e`, `bf16_gemm_impl_810e` and
+`get_adaptive_configs_bf16_810e`. The public configuration tuple is unchanged.
+Custom 810E paths use the existing `PPU_LIB_SHOW_PARAMS`,
+`PPU_LIB_PERF_INSTRUMENT` and `show_log` controls. Dumped BF16 product cases
+preserve BF16/FP32 output dtype; accumulation and tensor aliasing are covered
+by checkin tests rather than encoded in the product dump.
+
 
 #### Grouped GEMMs (contiguous layout)
 

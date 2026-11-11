@@ -1300,7 +1300,7 @@ public:
 
 namespace deep_gemm {
 
-struct Model810eReduceParams {
+struct BF16GemmSplitKReduceParams810E {
     const float* partial;
     void* d;
     int64_t count;
@@ -1311,20 +1311,20 @@ struct Model810eReduceParams {
 // preserves the tile partition without adding 64-bit operations to short GEMMs;
 // the final offset is bounded by K before conversion back to int.
 template <int BK, int Splits>
-CUTLASS_HOST_DEVICE constexpr int model_810e_split_k_offset(int k, int split) {
+CUTLASS_HOST_DEVICE constexpr int bf16_gemm_split_k_offset_810e(int k, int split) {
     static_assert(BK >= 32 && Splits >= 1 && Splits <= 64);
     return int((uint32_t(k / BK) * uint32_t(split) / Splits) * BK);
 }
 
 // Compile-time regressions exercise the actual partition helper without a
 // multi-gigabyte allocation. Include an uneven partition and its final tile.
-static_assert(model_810e_split_k_offset<32, 64>(1073741856, 0) == 0);
-static_assert(model_810e_split_k_offset<32, 64>(1073741856, 63) == 1056964608);
-static_assert(model_810e_split_k_offset<32, 64>(1073741856, 64) == 1073741856);
-static_assert(model_810e_split_k_offset<64, 3>(448, 2) == 256);
+static_assert(bf16_gemm_split_k_offset_810e<32, 64>(1073741856, 0) == 0);
+static_assert(bf16_gemm_split_k_offset_810e<32, 64>(1073741856, 63) == 1056964608);
+static_assert(bf16_gemm_split_k_offset_810e<32, 64>(1073741856, 64) == 1073741856);
+static_assert(bf16_gemm_split_k_offset_810e<64, 3>(448, 2) == 256);
 
 template <typename Output, int Splits>
-__device__ void model_810e_reduce(const Model810eReduceParams p) {
+__device__ void bf16_gemm_split_k_reduce_impl_810e(const BF16GemmSplitKReduceParams810E p) {
     for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < p.count;
          i += int64_t(gridDim.x) * blockDim.x) {
         float value = 0.0f;
@@ -1338,7 +1338,7 @@ __device__ void model_810e_reduce(const Model810eReduceParams p) {
 
 
 template <class Mainloop, typename Output, int Splits, bool Persistent = false>
-struct Model810eDenseKernel {
+struct BF16GemmDirectKernel810E {
     template <class Params>
     CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
         using namespace cute;
@@ -1347,18 +1347,18 @@ struct Model810eDenseKernel {
         constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{}), BK = size<2>(Tile{});
         const int m = get<0>(p.problem_shape), n = get<1>(p.problem_shape);
         const int k = get<2>(p.problem_shape);
-        const int64_t tiles_m = (int64_t(m) + BM - 1) / BM;
-        const int64_t tiles_n = (int64_t(n) + BN - 1) / BN;
-        const int64_t work = Persistent ? tiles_m * tiles_n * Splits : 1;
+        const int64_t tilesM = (int64_t(m) + BM - 1) / BM;
+        const int64_t tilesN = (int64_t(n) + BN - 1) / BN;
+        const int64_t work = Persistent ? tilesM * tilesN * Splits : 1;
         for (int64_t linear = Persistent ? blockIdx.x : 0; linear < work;
              linear += Persistent ? gridDim.x : 1) {
-            const int split = Persistent ? int(linear / (tiles_m * tiles_n)) : int(blockIdx.z);
-            const int mi = Persistent ? int((linear / tiles_n) % tiles_m) : int(blockIdx.y);
-            const int ni = Persistent ? int(linear % tiles_n) : int(blockIdx.x);
+            const int split = Persistent ? int(linear / (tilesM * tilesN)) : int(blockIdx.z);
+            const int mi = Persistent ? int((linear / tilesN) % tilesM) : int(blockIdx.y);
+            const int ni = Persistent ? int(linear % tilesN) : int(blockIdx.x);
             // Partition complete BK tiles. The API enforces K%BK=0 and at least one
             // tile per split, so AIU never reads across a logical row's K boundary.
-            const int begin = model_810e_split_k_offset<BK, Splits>(k, split);
-            const int length = model_810e_split_k_offset<BK, Splits>(k, split + 1) - begin;
+            const int begin = bf16_gemm_split_k_offset_810e<BK, Splits>(k, split);
+            const int length = bf16_gemm_split_k_offset_810e<BK, Splits>(k, split + 1) - begin;
             auto problem = make_shape(m, n, length, 1);
             auto coord = make_coord(mi, ni, _, 0);
             Mainloop loop(p.mainloop, take<0, 3>(problem));
@@ -1393,123 +1393,8 @@ struct Model810eDenseKernel {
 };
 
 
-struct Model810eBatchPackParams {
-    const cutlass::bfloat16_t* input;
-    cutlass::bfloat16_t* output;
-    int64_t batches, rows, cols, sb, sr, sc;
-};
-
-template <bool Transpose, bool Persistent>
-__device__ void model_810e_batch_pack(const Model810eBatchPackParams p) {
-    constexpr int Threads = Persistent ? 1024 : 128;
-    if constexpr (Transpose) {
-        constexpr int Rows = Persistent ? 128 : 32;
-        __shared__ cutlass::bfloat16_t tile[32][Rows + 1];
-        const int x = threadIdx.x % 32, y = threadIdx.x / 32;
-        const int64_t mt = (p.rows + Rows - 1) / Rows, kt = (p.cols + 31) / 32;
-        const int64_t tiles = Persistent ? p.batches * mt * kt : 1;
-        int64_t batch = Persistent ? blockIdx.x / (mt * kt) : blockIdx.z;
-        int64_t mi = Persistent ? (blockIdx.x / kt) % mt : blockIdx.x;
-        int64_t ki = Persistent ? blockIdx.x % kt : blockIdx.y;
-        const int64_t k_step = Persistent ? gridDim.x % kt : 0;
-        const int64_t m_step = Persistent ? (gridDim.x / kt) % mt : 0;
-        const int64_t batch_step = Persistent ? gridDim.x / (kt * mt) : 0;
-        for (int64_t t = Persistent ? blockIdx.x : 0; t < tiles; t += Persistent ? gridDim.x : 1) {
-            const int64_t row0 = mi * Rows, k0 = ki * 32;
-            #pragma unroll
-            for (int r = 0; r < Rows; r += 32) {
-                #pragma unroll
-                for (int j = 0; j < 32; j += Threads / 32)
-                    if (row0 + x + r < p.rows && k0 + y + j < p.cols)
-                        tile[y + j][x + r] = p.input[batch * p.sb + (row0 + x + r) * p.sr + (k0 + y + j) * p.sc];
-            }
-            __syncthreads();
-            #pragma unroll
-            for (int j = 0; j < Rows; j += Threads / 32)
-                if (row0 + y + j < p.rows && k0 + x < p.cols)
-                    p.output[(batch * p.rows + row0 + y + j) * p.cols + k0 + x] = tile[x][y + j];
-            if constexpr (Persistent) {
-                __syncthreads(); // Finish reads before reusing the tile.
-                // The grid is bounded by the CU budget. Advance coordinates
-                // without repeating software 64-bit divisions for every tile.
-                ki += k_step;
-                mi += m_step;
-                batch += batch_step;
-                if (ki >= kt) { ki -= kt; ++mi; }
-                if (mi >= mt) { mi -= mt; ++batch; }
-            }
-        }
-    } else {
-        constexpr int RowGroups = Threads / 128;
-        const int64_t first = int64_t(blockIdx.x) * RowGroups + threadIdx.x / 128;
-        const int64_t step = int64_t(gridDim.x) * RowGroups;
-        int64_t batch = first / p.rows, row = first % p.rows;
-        const int64_t batch_step = step / p.rows, row_step = step % p.rows;
-        for (int64_t t = first; t < p.batches * p.rows; t += step) {
-            const int64_t input_row = batch * p.sb + row * p.sr;
-            #pragma unroll 4
-            for (int64_t col = threadIdx.x % 128; col < p.cols; col += 128)
-                p.output[t * p.cols + col] = p.input[input_row + col * p.sc];
-            row += row_step;
-            batch += batch_step;
-            if (row >= p.rows) { row -= p.rows; ++batch; }
-        }
-    }
-}
-
-template <class Mainloop, bool Persistent = false>
-struct Model810eBatchedKernel {
-    template <class Params>
-    CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
-        using namespace cute;
-        using Tile = typename Mainloop::TileShape;
-        using Mma = typename Mainloop::TiledMma;
-        constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{});
-        const int m = get<0>(p.problem_shape), n = get<1>(p.problem_shape);
-        const int k = get<2>(p.problem_shape);
-        const int64_t tiles_m = (int64_t(m) + BM - 1) / BM;
-        const int64_t tiles_n = (int64_t(n) + BN - 1) / BN;
-        const int64_t work = Persistent ? tiles_m * tiles_n * get<3>(p.problem_shape) : 1;
-        for (int64_t linear = Persistent ? blockIdx.x : 0; linear < work;
-             linear += Persistent ? gridDim.x : 1) {
-            const int batch = Persistent ? int(linear / (tiles_m * tiles_n)) : int(blockIdx.z);
-            const int mi = Persistent ? int((linear / tiles_n) % tiles_m) : int(blockIdx.y);
-            const int ni = Persistent ? int(linear % tiles_n) : int(blockIdx.x);
-            auto problem = make_shape(m, n, k, 1);
-            auto coord = make_coord(mi, ni, _, 0);
-            Mainloop loop(p.mainloop, take<0, 3>(problem));
-            auto inputs = loop.load_init(problem, coord, p.mainloop, 0, 0,
-                p.mainloop.ptr_A + int64_t(batch) * get<2>(p.mainloop.dA),
-                p.mainloop.ptr_B + int64_t(batch) * get<2>(p.mainloop.dB));
-            auto gA = get<0>(inputs);
-            auto residue = make_tuple(m - mi * BM, n - ni * BN,
-                                      k - size<1>(gA) * size<2>(gA));
-            Mma mma;
-            auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
-            clear(accum);
-            auto iter = make_coord_iterator(shape<2>(gA));
-            loop(accum, inputs, accum, iter, size<2>(gA), residue,
-                 int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
-            // TiledMma supplies the 810E lane mapping; CUDA/890P formulas differ.
-            auto coords = mma.get_slice(int(threadIdx.x)).partition_C(
-                make_identity_tensor(make_shape(Int<BM>{}, Int<BN>{})));
-            CUTE_UNROLL
-            for (int i = 0; i < size(accum); ++i) {
-                const int row = mi * BM + get<0>(coords(i));
-                const int col = ni * BN + get<1>(coords(i));
-                if (row < m && col < n) {
-                    const int64_t offset = int64_t(batch) * get<2>(p.epilogue.dD) +
-                                           int64_t(row) * get<0>(p.epilogue.dD) + col;
-                    p.epilogue.ptr_D[offset] = cutlass::bfloat16_t(accum(i));
-                }
-            }
-            if constexpr (Persistent) __syncthreads();
-        }
-    }
-};
-
 template <class Base, bool PeelFirstK = false, int StaticKTiles = 0>
-struct Model810eDenseMainloop : Base {
+struct BF16GemmMainloop810E : Base {
     using Base::Base;
     template <class... Args>
     CUTLASS_DEVICE void operator()(Args&&... args) {
@@ -1521,7 +1406,7 @@ struct Model810eDenseMainloop : Base {
 // launch. The host restricts this wrapper to one complete dense K product,
 // BM128/BN128, 256 threads and non-persistent grid orders 0/1.
 template <class Primary, class TailMainloop, int TileOrder>
-struct Model810eNarrowNTailKernel {
+struct BF16GemmNarrowNTailKernel810E {
     template <class Params>
     CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
         using namespace cute;
@@ -1537,10 +1422,10 @@ struct Model810eNarrowNTailKernel {
         using Mma = typename TailMainloop::TiledMma;
         static_assert(size<0>(Tile{}) == 128 && size<1>(Tile{}) == 16);
         const int mi = TileOrder == 1 ? int(blockIdx.x) : int(blockIdx.y);
-        const int first_n = n - tail;
+        const int firstN = n - tail;
         typename TailMainloop::Params mp{
             p.mainloop.ptr_A, p.mainloop.dA,
-            p.mainloop.ptr_B + int64_t(first_n) * get<0>(p.mainloop.dB), p.mainloop.dB};
+            p.mainloop.ptr_B + int64_t(firstN) * get<0>(p.mainloop.dB), p.mainloop.dB};
         const auto problem = make_shape(m, tail, k, 1);
         TailMainloop loop(mp, take<0, 3>(problem));
         auto inputs = loop.load_init(problem, make_coord(mi, 0, _, 0), mp, 0, 0, mp.ptr_A, mp.ptr_B);
@@ -1557,64 +1442,60 @@ struct Model810eNarrowNTailKernel {
         for (int i = 0; i < size(accum); ++i) {
             const int row = mi * 128 + get<0>(coords(i)), col = get<1>(coords(i));
             if (row < m && col < tail)
-                p.epilogue.ptr_D[int64_t(row) * get<0>(p.epilogue.dD) + first_n + col] =
+                p.epilogue.ptr_D[int64_t(row) * get<0>(p.epilogue.dD) + firstN + col] =
                     static_cast<std::remove_pointer_t<decltype(p.epilogue.ptr_D)>>(accum(i));
         }
     }
 };
 
-// Input descriptors retain the caller's row strides. Batch and split-K both
-// use grid.z, but only batch changes input bases; split-K changes the K interval.
-template <class Mainloop, class Epilogue, bool SplitK, int Splits, int TileOrder, int StaticM = 0, int StaticN = 0, int StaticK = 0, bool Persistent = false, int InputKChunk = 0>
-struct Model810eTsmKernel {
+// Dense inputs share one matrix pair. grid.z selects a split-K interval and
+// its FP32 output plane; a complete product uses a single plane.
+template <class Mainloop, class Epilogue, bool SplitK, int Splits, int TileOrder, int StaticK = 0, bool Persistent = false>
+struct BF16GemmTsmKernel810E {
     template <class Params>
     CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
         using namespace cute;
         using Tile = typename Mainloop::TileShape;
         using Mma = typename Mainloop::TiledMma;
         constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{}), BK = size<2>(Tile{});
-        // A static unit N stride identifies NN B. AIU 1.0 bounds the N
-        // descriptor by its K stride, so restart N at zero for each CTA.
-        constexpr bool RebaseB = is_static<decltype(get<0>(p.mainloop.dB))>::value;
-        const int m = StaticM > 0 ? StaticM : get<0>(p.problem_shape), n = StaticN > 0 ? StaticN : get<1>(p.problem_shape);
+        const int m = get<0>(p.problem_shape), n = get<1>(p.problem_shape);
         const int k = StaticK > 0 ? StaticK : get<2>(p.problem_shape), groups = get<3>(p.problem_shape);
-        const int64_t tiles_m = (int64_t(m) + BM - 1) / BM;
-        const int64_t tiles_n = (int64_t(n) + BN - 1) / BN;
-        const int64_t work = Persistent ? tiles_m * tiles_n * groups : 1;
+        const int64_t tilesM = (int64_t(m) + BM - 1) / BM;
+        const int64_t tilesN = (int64_t(n) + BN - 1) / BN;
+        const int64_t work = Persistent ? tilesM * tilesN * groups : 1;
         for (int64_t linear = Persistent ? blockIdx.x : 0; linear < work;
              linear += Persistent ? gridDim.x : 1) {
-            const int zi = Persistent ? int(linear / (tiles_m * tiles_n)) : int(blockIdx.z);
+            const int zi = Persistent ? int(linear / (tilesM * tilesN)) : int(blockIdx.z);
             int mi, ni;
             if constexpr (TileOrder >= 2) {
                 // Traverse a bounded A row panel across N before advancing M.
                 // The final group may contain fewer rows; divide by its actual
                 // height so every output tile is visited exactly once.
-                const int64_t local = Persistent ? linear % (tiles_m * tiles_n) :
+                const int64_t local = Persistent ? linear % (tilesM * tilesN) :
                     int64_t(blockIdx.y) * gridDim.x + blockIdx.x;
-                const int64_t span = TileOrder * tiles_n;
-                const int64_t first_m = (local / span) * TileOrder;
-                const int64_t active_m = tiles_m - first_m < TileOrder ? tiles_m - first_m : TileOrder;
+                const int64_t span = TileOrder * tilesN;
+                const int64_t firstM = (local / span) * TileOrder;
+                const int64_t activeM = tilesM - firstM < TileOrder ? tilesM - firstM : TileOrder;
                 const int64_t within = local % span;
-                mi = int(first_m + within % active_m);
-                ni = int(within / active_m);
+                mi = int(firstM + within % activeM);
+                ni = int(within / activeM);
             } else {
-                mi = Persistent ? int(TileOrder == 1 ? linear % tiles_m : (linear / tiles_n) % tiles_m) :
+                mi = Persistent ? int(TileOrder == 1 ? linear % tilesM : (linear / tilesN) % tilesM) :
                      (TileOrder == 1 ? int(blockIdx.x) : int(blockIdx.y));
-                ni = Persistent ? int(TileOrder == 1 ? (linear / tiles_m) % tiles_n : linear % tiles_n) :
+                ni = Persistent ? int(TileOrder == 1 ? (linear / tilesM) % tilesN : linear % tilesN) :
                      (TileOrder == 1 ? int(blockIdx.y) : int(blockIdx.x));
             }
-        const int begin = SplitK ? model_810e_split_k_offset<BK, Splits>(k, zi) : 0;
-        const int length = SplitK ? model_810e_split_k_offset<BK, Splits>(k, zi + 1) - begin : k;
-            const auto* ptr_a = p.mainloop.ptr_A + (SplitK ? int64_t(begin) : int64_t(zi) * get<2>(p.mainloop.dA));
-            const auto* ptr_b = p.mainloop.ptr_B + (SplitK ? int64_t(begin) : int64_t(zi) * get<2>(p.mainloop.dB)) +
-                                (RebaseB ? int64_t(ni) * BN : 0);
-            const auto input_problem = make_shape(m, RebaseB ? BN : n, InputKChunk > 0 ? InputKChunk : length, 1);
-            const auto input_coord = make_coord(mi, RebaseB ? 0 : ni, _, 0);
-            Mainloop loop(p.mainloop, take<0, 3>(input_problem));
-            auto inputs = loop.load_init(input_problem, input_coord, p.mainloop, 0, 0, ptr_a, ptr_b);
+            const int begin = SplitK ? bf16_gemm_split_k_offset_810e<BK, Splits>(k, zi) : 0;
+            const int length = SplitK ? bf16_gemm_split_k_offset_810e<BK, Splits>(k, zi + 1) - begin : k;
+            const auto* ptrA = p.mainloop.ptr_A + begin;
+            const auto* ptrB = p.mainloop.ptr_B + begin;
+            const auto inputProblem = make_shape(m, n, length, 1);
+            const auto inputCoord = make_coord(mi, ni, _, 0);
+            Mainloop loop(p.mainloop, take<0, 3>(inputProblem));
+            auto inputs = loop.load_init(inputProblem, inputCoord, p.mainloop, 0, 0, ptrA, ptrB);
             auto gA = get<0>(inputs);
             auto residue = make_tuple(m - mi * BM, n - ni * BN,
-                                      (InputKChunk > 0 ? InputKChunk : length) - size<1>(gA) * size<2>(gA));
+                                      length - size<1>(gA) * size<2>(gA));
             Mma mma;
             auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
             clear(accum);
@@ -1622,24 +1503,11 @@ struct Model810eTsmKernel {
             loop(accum, inputs, accum, iter, size<2>(gA), residue,
                  int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
 
-            if constexpr (InputKChunk > 0) {
-                // Restart the descriptor's K coordinate for each complete
-                // segment. Keep FP32 accumulators live until the final store.
-                for (int offset = InputKChunk; offset < length; offset += InputKChunk) {
-                    auto next = loop.load_init(input_problem, input_coord, p.mainloop, 0, 0,
-                                               ptr_a + offset, ptr_b + offset);
-                    auto next_a = get<0>(next);
-                    auto next_iter = make_coord_iterator(shape<2>(next_a));
-                    loop(accum, next, accum, next_iter, size<2>(next_a), residue,
-                         int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
-                }
-            }
-
             // The AIU mainloop ends with cp_async_wait<0>() and __syncthreads().
             // Reuse its storage for the software-swizzled epilogue only after that
             // barrier. These are fresh register writes, not reads of AIU data.
-            auto& epi_storage = *reinterpret_cast<typename Epilogue::SharedStorage*>(smem);
-            Epilogue epilogue{p.epilogue, epi_storage};
+            auto& epiStorage = *reinterpret_cast<typename Epilogue::SharedStorage*>(smem);
+            Epilogue epilogue{p.epilogue, epiStorage};
             // Output strides and z coordinate are real. For split-K the host builds
             // a FLOAT epilogue and D[splits,M,N], so no partial BF16 rounding occurs.
             epilogue(make_shape(m, n, length, groups), Tile{}, make_coord(mi, ni, _, zi),

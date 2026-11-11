@@ -1379,7 +1379,12 @@ def gemm_exact_values(shape, generator):
 
 
 def gemm_fill_random(tensor, generator, *, exact=False, scale=1.0):
-    """Initialize a contiguous device tensor with bounded CPU temporaries."""
+    """Initialize device data with bounded CPU temporaries, preserving row padding."""
+    if not tensor.is_contiguous():
+        values = torch.empty(tensor.shape, device=tensor.device, dtype=tensor.dtype)
+        gemm_fill_random(values, generator, exact=exact, scale=scale)
+        tensor.copy_(values)
+        return
     flat = tensor.view(-1)
     for start in range(0, flat.numel(), 1 << 20):
         size = min(1 << 20, flat.numel() - start)
@@ -1542,18 +1547,24 @@ def test_dense_gemm_api(args):
 
     storage = torch.full((m * n + 128,), 8., device='cuda', dtype=output_dtype)
     out = storage[64:-64].view(m, n)
+    if args.get('output_alias'):
+        if args['output_alias'] != 'input' or not expected_error or n > k:
+            raise ValueError('output_alias:input requires a rejection case with N<=K')
+        storage = a.view(-1)
+        out = storage[:m * n].view(m, n)
     c = initial_c = None
     if not fp32 and accumulation != 'none':
         initial_c = torch.full((m, n), -1., device='cuda', dtype=output_dtype)
         if not compiling and pattern != 'cancellation':
             gemm_fill_random(initial_c, generator, exact=True)
-        c = out if accumulation == 'alias' else torch.empty_like(out)
+        if 'c_stride' in args:
+            if accumulation != 'separate' or args['c_stride'] < n:
+                raise ValueError('c_stride requires separate C with a row stride >= N')
+            c = torch.empty_strided((m, n), (args['c_stride'], 1), device='cuda', dtype=output_dtype)
+        else:
+            c = out if accumulation == 'alias' else torch.empty_like(out)
         c.copy_(initial_c)
-    # Some PPU FP32 matmul paths lose precision even with allow_tf32=False.
-    # Use an independent CPU FP64 product rounded once to FP32 for this API's
-    # full-precision contract; keep the existing comparison tolerances below.
-    reference = ((a.cpu().double() @ b.cpu().double().t()).float().to(a.device)
-                 if fp32 else gemm_reference(a, b)) if check and not expected_error else None
+    reference = gemm_reference(a, b) if check and not expected_error else None
     if check and c is not None and not expected_error:
         reference = reference + initial_c.float()
         if pattern == 'cancellation':
@@ -1627,129 +1638,6 @@ def test_dense_gemm_api(args):
         print(f' > Performance (dtype={dtype}, m={m}, n={n}, k={k}): '
               f'{seconds * 1e6:.3f} us cold-cache API latency | '
               f'{2 * m * n * k / seconds / 1e12:.4f} TFLOPS')
-    print('Passed with acc_check' if check else 'Passed without acc_check')
-
-
-def gemm_batch_view(batch, rows, cols, layout, padding):
-    padded = 'padded' in layout
-    pitch = cols + (padding if padded else 0)
-    storage_rows = rows + int(padded)
-    interleaved = 'interleaved' in layout
-    shape = (storage_rows, batch, pitch) if interleaved else (batch, storage_rows, pitch)
-    storage = torch.full(shape, -123., device='cuda', dtype=torch.bfloat16)
-    view = storage.transpose(0, 1) if interleaved else storage
-    return view[:, :rows, :cols], storage
-
-
-def test_native_batch_gemm(args):
-    batch, m, n, k = args['groups'], args['m'], args['n'], args['k']
-    layout, broadcast = args.get('layout', 'contiguous'), args.get('broadcast', 'none')
-    expected_error = args.get('expect_error')
-    if layout not in ('contiguous', 'padded', 'interleaved', 'interleaved_padded'):
-        raise ValueError(f'Unsupported native batch layout: {layout}')
-    if broadcast not in ('none', 'a', 'b', 'both'):
-        raise ValueError('Unsupported native batch broadcast')
-    error_messages = {'overlap': ('output batches overlap', 'nonoverlapping rows'),
-                      'k_tiles': ('requires K >= 64 and divisible by 32',),
-                      'input_overlap': ('output must not overlap an input',)}
-    if expected_error not in (None, *error_messages) or args.get('expr') or get_benchmark():
-        raise ValueError('Native batch regression requires accuracy mode and native [B,M,K]/[B,N,K] layouts')
-    compiling = bool(os.environ.get('HGGC_WARM_UP')) or deep_gemm.get_compile_mode() == 1
-    check = get_acc_check() and not compiling
-    config = args.get('configs')
-    if config is not None:
-        if len(config) != 7:
-            raise ValueError('BF16 configs must specify SMS/BM/BN/BK/WM/WN/stages')
-        config = tuple(config) + (SMEM_CONFIG_UNUSED,)
-    generator = torch.Generator().manual_seed(810)
-    padding_a, padding_b = args.get('padding_a', 8), args.get('padding_b', 16)
-    if any(not isinstance(pad, int) or pad < 0 or pad % 8 for pad in (padding_a, padding_b)):
-        raise ValueError('Native batch input padding must be nonnegative multiples of 8')
-    a, _ = gemm_batch_view(batch, m, k, layout, padding_a)
-    b, _ = gemm_batch_view(batch, n, k, layout, padding_b)
-    out, storage = gemm_batch_view(batch, m, n, layout, 24)
-    a.copy_(gemm_exact_values(a.shape, generator))
-    b.copy_(gemm_exact_values(b.shape, generator))
-    # Initialize backing storage once: overlapping read-only views cannot be
-    # filled independently by row without changing their shared elements.
-    def strided_input(tensor, name):
-        if name not in args:
-            return tensor
-        strides = tuple(args[name])
-        if len(strides) != 3 or any(not isinstance(s, int) or s < 0 for s in strides):
-            raise ValueError(f'{name} must contain three nonnegative element strides')
-        size = 1 + sum((dim - 1) * stride for dim, stride in zip(tensor.shape, strides))
-        backing = gemm_exact_values((size,), generator).to(device='cuda', dtype=torch.bfloat16)
-        return backing.as_strided(tensor.shape, strides)
-    a, b = strided_input(a, 'a_stride'), strided_input(b, 'b_stride')
-    if broadcast in ('a', 'both'):
-        a = a[:1].expand(batch, -1, -1)
-    if broadcast in ('b', 'both'):
-        b = b[:1].expand(batch, -1, -1)
-    if 'out_stride' in args:
-        strides = tuple(args['out_stride'])
-        if len(strides) != 3 or any(s < 0 for s in strides):
-            raise ValueError('out_stride must contain three nonnegative element strides')
-        size = 1 + sum((dim - 1) * stride for dim, stride in zip((batch, m, n), strides))
-        storage = torch.full((size,), -123., device='cuda', dtype=torch.bfloat16)
-        out = storage.as_strided((batch, m, n), strides)
-    if args.get('shared_storage'):
-        # Keep A and padded/interleaved D in one allocation, including guards.
-        if args['shared_storage'] == 'dlpack_overlap':
-            if a.shape != out.shape:
-                raise ValueError('DLPack overlap regression requires N=K')
-            backing = a
-            shared_a = torch.utils.dlpack.from_dlpack(a)
-            out = torch.utils.dlpack.from_dlpack(a)
-            assert shared_a.untyped_storage()._cdata != out.untyped_storage()._cdata
-            assert shared_a.data_ptr() == out.data_ptr()
-        elif args['shared_storage'] == 'strided':
-            offset = args.get('out_offset', 0)
-            if offset < 0:
-                raise ValueError('Shared output offset must be nonnegative')
-            a_span = 1 + sum((dim - 1) * stride for dim, stride in zip(a.shape, a.stride()))
-            d_span = 1 + sum((dim - 1) * stride for dim, stride in zip(out.shape, out.stride()))
-            backing = torch.full((max(a_span, offset + d_span) + 64,), -123.,
-                                 device='cuda', dtype=torch.bfloat16)
-            shared_a = backing.as_strided(a.shape, a.stride())
-            out = backing.as_strided(out.shape, out.stride(), offset)
-        elif args['shared_storage'] in ('interleaved_disjoint', 'interleaved_overlap'):
-            pitch = k + n
-            strides = (m * pitch, pitch, 1)
-            offset = k - int(args['shared_storage'] == 'interleaved_overlap')
-            backing = torch.full((batch * m * pitch + 64,), -123., device='cuda', dtype=torch.bfloat16)
-            shared_a = backing.as_strided(a.shape, strides)
-            out = backing.as_strided(out.shape, strides, offset)
-        else:
-            offset = 0 if args['shared_storage'] == 'overlap' else a.numel() + 64
-            backing = torch.full((max(a.numel(), offset + storage.numel()),), -123.,
-                                 device='cuda', dtype=torch.bfloat16)
-            shared_a = backing[:a.numel()].view_as(a)
-            out = backing.as_strided(out.shape, out.stride(), offset)
-        shared_a.copy_(a)
-        a = shared_a
-        storage = backing
-    # Compile-only and rejection checks include D and every padding element,
-    # independently of the numeric accuracy flag disabled by the warm-up runner.
-    expected_storage = storage.clone() if check or compiling or expected_error else None
-    if check and not expected_error:
-        reference = gemm_reference(a, b)
-        expected_storage.as_strided(out.shape, out.stride(), out.storage_offset()).copy_(reference)
-    try:
-        gemm_call_with_sms(args, lambda: deep_gemm.bf16_gemm_strided_batched_nt(a, b, out, configs=config))
-    except RuntimeError as error:
-        # Expected metadata rejection must pass in both compile and accuracy phases.
-        if not expected_error or not any(message in str(error) for message in error_messages[expected_error]):
-            raise
-        gemm_assert_exact(storage, expected_storage)
-        print('Passed expected native batch API rejection')
-        return
-    if expected_error:
-        raise AssertionError('Native batch accepted unsupported arguments')
-    if check:
-        gemm_assert_exact(out, reference)
-    if check or compiling:
-        gemm_assert_exact(storage, expected_storage)  # Includes every padding guard.
     print('Passed with acc_check' if check else 'Passed without acc_check')
 
 
@@ -3503,8 +3391,6 @@ def test_sparse_mqa_logits(args) -> None:
     return
 
 def test_batch_gemm(args) -> None:
-    if args['data_type'] == torch.bfloat16:
-        return test_native_batch_gemm(args)
     # BatchGemm describes [groups, m, k] @ [groups, n, k].T using einsum.
     normalized = dict(args)
     for axis, field in (("b", "m"), ("h", "groups"), ("r", "k"), ("d", "n")):

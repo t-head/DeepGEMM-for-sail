@@ -31,14 +31,13 @@ namespace deep_gemm {
 
 // Output type is part of the generated source (and therefore the JIT cache key).
 // Grouped GEMMs retain the BF16 specialization through the alias below.
-template <typename ElementOutput, bool TransposeB = false>
-class BF16GemmCutlass3RuntimeT final : public LaunchRuntime<BF16GemmCutlass3RuntimeT<ElementOutput, TransposeB>> {
+template <typename ElementOutput>
+class BF16GemmCutlass3RuntimeT final : public LaunchRuntime<BF16GemmCutlass3RuntimeT<ElementOutput>> {
 public:
     using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
     using GemmProblemSize = cute::tuple<int32_t, int32_t, int32_t, int32_t>;
 
-    using InputStrideB = std::conditional_t<TransposeB,
-        cute::Stride<cute::Int<1>, int64_t, int64_t>, cute::Stride<int64_t, cute::Int<1>, int64_t>>;
+    using InputStrideB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     struct MainLoopArguments {
         cutlass::bfloat16_t const* ptr_A;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_A;
@@ -77,7 +76,7 @@ public:
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         std::string gemm_type, kernel_strategy, kernel_name;
         bool enable_sbo_overlap;
-        bool dense_s2_opt = false;
+        bool denseS2Opt = false;
     };
 
     struct GemmArguments {
@@ -338,8 +337,8 @@ __global__ void {12}(
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
             with_tsm_epilogue, host_params_size,
             std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t",
-            TransposeB ? "cutlass::layout::RowMajor" : "cutlass::layout::ColumnMajor",
-            args.launch_info.dense_s2_opt ? "Model810eDenseMainloop<CollectiveMainloop>" : "CollectiveMainloop");
+            "cutlass::layout::ColumnMajor",
+            args.launch_info.denseS2Opt ? "BF16GemmMainloop810E<CollectiveMainloop>" : "CollectiveMainloop");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -466,27 +465,6 @@ public:
                                info.b_cache_policy, info.nonpersistent);
     }
 
-    // Byte-identical to cute_free/kernel/gemm.cuh::GemmKernel::Params.
-    struct PackedParams {
-        cutlass::bfloat16_t const* ptr_A;
-        cutlass::bfloat16_t const* ptr_B;
-        ElementOutput* ptr_D;
-        int M, N, K;
-        int lda, ldb, ldd;
-        DenseGemmTileSchedulerArguments scheduler;
-    };
-
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        const auto& p = args.kernel_params;
-        const PackedParams packed{p.collective_mainloop_params.ptr_A, p.collective_mainloop_params.ptr_B,
-            p.collective_epilogue_params.ptr_D,
-            cute::get<0>(p.problem_shape), cute::get<1>(p.problem_shape), cute::get<2>(p.problem_shape),
-            int(cute::get<0>(p.collective_mainloop_params.stride_A)),
-            int(cute::get<0>(p.collective_mainloop_params.stride_B)),
-            int(cute::get<0>(p.collective_epilogue_params.stride_D)), p.scheduler};
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, packed));
-    }
-
     static std::string generate_impl(const Args& args) {
         const auto& info = args.launch_info;
         const int shape_n = cute::get<1>(args.kernel_params.problem_shape);
@@ -500,11 +478,9 @@ public:
 
 namespace deep_gemm {{
 
-using GemmTypeTag = cutlass::platform::integral_constant<GemmType, GemmType::{0}>;
+using GemmTypeTag = std::integral_constant<GemmType, GemmType::{0}>;
 
 using Kernel = BF16GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {11}, {9}, {13}, GemmTypeTag, {12}, {14}, {15}>;
-
-static_assert(sizeof(typename Kernel::Params) == {16}, "cute-free host/device ABI mismatch");
 
 }} // namespace deep_gemm
 
@@ -526,7 +502,7 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             info.overlap_prologue ? "true" : "false",
             std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t",
             use_packed_store ? "true" : "false",
-            info.b_cache_policy, info.nonpersistent ? "true" : "false", sizeof(PackedParams));
+            info.b_cache_policy, info.nonpersistent ? "true" : "false");
     }
 
 };
@@ -552,8 +528,8 @@ public:
         int npt; // W rows per thread (m == 2 policy: 2 shares the x load pair)
         std::string kernel_name;
         bool output_fp32 = false;
-        bool static_k = false;
-        bool pair_load = false;
+        bool staticK = false;
+        bool pairLoad = false;
         bool persistent = false;
     };
 
@@ -567,7 +543,7 @@ public:
         const auto& info = args.launch_info;
         return std::make_tuple(info.block_x, info.block_y, info.k_per_thread,
                                info.m == 2, info.npt, info.kernel_name, info.output_fp32,
-                               info.static_k, info.pair_load, info.persistent, info.static_k ? args.kernel_params.K : 0);
+                               info.staticK, info.pairLoad, info.persistent, info.staticK ? args.kernel_params.K : 0);
     }
 
     static std::string generate_impl(const Args& args) {
@@ -586,26 +562,26 @@ void {}(const GemvDenseArgs args) {{
     {}
     {}
     {}<__ppu_bfloat16, {}, float,
-       {}, {}, {}, {}, {}{}>({}, block_index);
+       {}, {}, {}, {}, {}{}>({}, blockIndex);
     {}
 }}
 
 }}
 )",
             args.launch_info.kernel_name,
-            args.launch_info.static_k ? fmt::format(
+            args.launch_info.staticK ? fmt::format(
                 "GemvDenseArgs fixed_args = args; fixed_args.K = {}; fixed_args.stride_wn = {};",
                 args.kernel_params.K, args.kernel_params.K) : "",
             args.launch_info.persistent ? fmt::format(
-                "for (int64_t block_index = blockIdx.x; block_index < (int64_t(args.N) + {0} - 1) / {0}; block_index += gridDim.x) {{",
+                "for (int64_t blockIndex = blockIdx.x; blockIndex < (int64_t(args.N) + {0} - 1) / {0}; blockIndex += gridDim.x) {{",
                 args.launch_info.block_y * (is_m2 ? args.launch_info.npt : 1)) :
-                "const int block_index = blockIdx.x;",
+                "const int blockIndex = blockIdx.x;",
             entry,
             args.launch_info.output_fp32 ? "float" : "__ppu_bfloat16",
-            args.launch_info.pair_load ? "int" : "int4",
-            args.launch_info.pair_load ? "int" : "int4",
+            args.launch_info.pairLoad ? "int" : "int4",
+            args.launch_info.pairLoad ? "int" : "int4",
             args.launch_info.block_x, args.launch_info.block_y, args.launch_info.k_per_thread,
-            npt_arg, args.launch_info.static_k ? "fixed_args" : "args",
+            npt_arg, args.launch_info.staticK ? "fixed_args" : "args",
             args.launch_info.persistent ? "__syncthreads(); }" : "");
     }
 
@@ -613,12 +589,6 @@ void {}(const GemvDenseArgs args) {{
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
-
-// For one or two short dot products, two BF16 elements per load distribute
-// the reduction across 16 lanes and reduce serial multiply/add work per lane.
-static bool dense_gemv_pair_load(const int rows, const int k, const bool is_810e) {
-    return is_810e && rows <= 2 && k >= 32 && k <= 96 && k % 32 == 0;
-}
 
 // bf16 dense GEMV fast path (m == 1 or 2). Returns true when launched; false
 // means the shape is uncovered and the caller must fall back to the tile path.
@@ -633,9 +603,9 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
     if (!deep_gemm_bf16_common::dense_gemv_select_configs(m, n, k, rhs.data_ptr(), lhs.data_ptr(),
                                                           block_x, block_y, k_per_thread, npt, transposed_n1))
         return false;
-    const bool is_810e = std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
-    const bool pair_load = m == 1 && dense_gemv_pair_load(n, k, is_810e);
-    if (pair_load) {
+    const bool is810e = std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
+    const bool pairLoad = m == 1 && dense_gemv_pair_load(n, k, is810e);
+    if (pairLoad) {
         block_x = 16;
         block_y = 2;
         k_per_thread = k / 32;
@@ -651,9 +621,9 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
 
     dim3 block(block_x, block_y);
     dim3 grid(ceil_div(n, block_y * npt));
-    const bool persistent = is_810e && get_num_sms() < device_runtime->get_prop()->multiProcessorCount &&
-                            grid.x > unsigned(get_num_sms());
-    if (persistent) grid.x = get_num_sms();
+    const bool persistent = is810e && device_runtime->get_num_simt_sms() < device_runtime->get_prop()->multiProcessorCount &&
+                            grid.x > unsigned(device_runtime->get_num_simt_sms());
+    if (persistent) grid.x = device_runtime->get_num_simt_sms();
 
     // m == 2 -> dual-accumulator variant; npt == 2 walks two W rows/thread sharing
     // (x0, x1), each block owning block_y * npt rows. Names split so a trace shows npt.
@@ -663,9 +633,9 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
     if (output_fp32) kernel_name += "_fp32";
     // Bound code growth to short reductions; constant K removes loop bounds
     // and row-stride arithmetic without specializing M/N or changing the ABI.
-    const bool static_k = k <= 1024 && is_810e;
+    const bool staticK = k <= 1024 && is810e;
     auto args = DenseGemvRuntime::Args{
-        .launch_info = {block_x, block_y, k_per_thread, m, npt, kernel_name, output_fp32, static_k, pair_load, persistent},
+        .launch_info = {block_x, block_y, k_per_thread, m, npt, kernel_name, output_fp32, staticK, pairLoad, persistent},
         .launch_args = {grid, block, 0},
         .kernel_params = params,
     };
@@ -675,7 +645,7 @@ static bool gemv_dense_bf16(const torch::Tensor& lhs, const torch::Tensor& rhs,
     static constexpr GemmType kGemmType = GemmType::Normal;
     DgProfParam dg_prof_params;
     if (deep_gemm::profiling_enabled()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("bf16"), 1, transposed_n1 ? n : m, transposed_n1 ? 1 : n, k, 0, nullptr,
+        dg_prof_params.set_params(kGemmType, false, std::string(out.scalar_type() == torch::kFloat ? "bf16_bf16_fp32" : "bf16"), 1, transposed_n1 ? n : m, transposed_n1 ? 1 : n, k, 0, nullptr,
                                   current_stream());
     }
     {
@@ -703,7 +673,7 @@ using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int
 template <typename ElementOutput>
 static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out, const int& m,
                            const int& n, const int& k, std::optional<ConfigTuple> configs = std::nullopt) {
-    const int num_sms = get_num_sms();
+    const int num_sms = get_num_tensor_sms_810e();
     // A GEMV grid can occupy every CU, so use the persistent tile scheduler
     // when the caller restricts the CU budget.
     const bool limited_n1 = n == 1 && is_ppu1v5_device() &&
@@ -858,7 +828,14 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
         auto kernel = runtime->kernel;
 
         // Must stay byte-identical to GemmKernel::Params (cute_free/kernel/gemm.cuh).
-        using CuteFreeParams = typename CuteRuntime::PackedParams;
+        struct CuteFreeParams {
+            cutlass::bfloat16_t const* ptr_A;
+            cutlass::bfloat16_t const* ptr_B;
+            ElementOutput* ptr_D;
+            int M, N, K;
+            int lda, ldb, ldd;
+            DenseGemmTileSchedulerArguments scheduler;
+        };
 
         CuteFreeParams hparams;
         hparams.ptr_A = input_a;
@@ -935,7 +912,7 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
 
             // Opt in only this dense PPU 1.0 caller; grouped runtimes keep
             // the default mainloop, including their separate overlap policies.
-            args.launch_info.dense_s2_opt =
+            args.launch_info.denseS2Opt =
                 std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
             const auto& code = Runtime::generate(args);
             const auto& runtime = compiler->build("bf16_deep_gemm", code);
@@ -943,7 +920,7 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
             int blocks_per_cu = 0;
             HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, smem_size);
             args.launch_args.grid_dim.x *= blocks_per_cu;
-            if (args.launch_info.dense_s2_opt && num_sms_new < kModel810eTensorCUs)
+            if (args.launch_info.denseS2Opt && num_sms_new < get_tensor_cu_count_810e())
                 args.launch_args.grid_dim.x = num_sms_new;
             DgProfParam dg_prof_params;
             if (deep_gemm::profiling_enabled()) {
@@ -978,106 +955,72 @@ static void bf16_gemm_impl(const torch::Tensor& lhs, const torch::Tensor& rhs, c
     }
 }
 // Public launcher: the input type remains BF16; only the output is dispatched.
-static void bf16_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out,
-                      const int& m, const int& n, const int& k,
-                      std::optional<ConfigTuple> configs = std::nullopt) {
-    if (out.scalar_type() == torch::kFloat)
-        bf16_gemm_impl<float>(lhs, rhs, out, m, n, k, configs);
-    else
-        bf16_gemm_impl<cutlass::bfloat16_t>(lhs, rhs, out, m, n, k, configs);
-}
-
-// 810E direct, native batch, split-K and TSM launchers.
-// Rows are contiguous intervals. Test the nearest row in the other dimension
-// for each batch difference (or vice versa), preserving legal interleaved views.
-static bool model_810e_batch_output_overlaps(const torch::Tensor& d) {
-    const int64_t batch = d.size(0), m = d.size(1), n = d.size(2);
-    const int64_t bs = d.stride(0), ld = d.stride(1);
-    if (batch <= 1) return false; // Row overlap was checked by the caller.
-    if (bs < n) return true;
-    if (m <= 1 || bs >= (m - 1) * ld + n || ld >= (batch - 1) * bs + n) return false;
-    const bool batch_first = batch <= m;
-    const int64_t count = batch_first ? batch : m, step = batch_first ? bs : ld;
-    const int64_t other_count = batch_first ? m : batch, other_step = batch_first ? ld : bs;
-    for (int64_t i = 1; i < count; ++i) {
-        const int64_t offset = i * step;
-        const int64_t j = std::min(offset / other_step, other_count - 1);
-        if (offset - j * other_step < n ||
-            (j + 1 < other_count && (j + 1) * other_step - offset < n)) return true;
-    }
-    return false;
+// Follow the existing show_log convention without changing the shared JIT API.
+template <typename Args>
+static void show_bf16_gemm_launch_810e(const Args& args, int m, int n, int k, int numSms) {
+    const char* show_log = std::getenv("show_log");
+    if (!show_log || !isdigit(*show_log)) return;
+    const auto& tile = args.launch_info;
+    const auto& launch = args.launch_args;
+    printf("[DenseGemm_BF16:]\n");
+    printf("group:1, problem:[%d, %d, %d], kernel:%s\n", m, n, k, tile.kernel_name.c_str());
+    printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d], num_stages:%d\n",
+           tile.block_m, tile.block_n, tile.block_k, tile.warp_m, tile.warp_n, tile.num_stages);
+    printf("num_sms:%d, grid:[%u, %u, %u], block:[%u, %u, %u], SMSIZE:%d\n",
+           numSms, launch.grid_dim.x, launch.grid_dim.y, launch.grid_dim.z,
+           launch.block_dim.x, launch.block_dim.y, launch.block_dim.z, launch.smem_size);
 }
 
 // N=1 is the transpose of a one-row GEMV, and the output has the same physical
 // order. Swapping pointers is sufficient; no input/output transpose is launched.
-static bool model_810e_bf16_n1(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
+static bool gemv_dense_bf16_810e(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
     if (is_ppu1v5_device() || b.size(0) != 1) return false;
     const int m = a.size(0), k = a.size(1);
     TORCH_CHECK(k % 8 == 0 && (reinterpret_cast<uintptr_t>(a.data_ptr()) & 15) == 0 &&
                 (reinterpret_cast<uintptr_t>(b.data_ptr()) & 15) == 0,
                 "810E N=1 BF16 GEMV requires K divisible by 8 and 16-byte-aligned inputs");
-    const bool is_810e = std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
-    const bool pair_load = dense_gemv_pair_load(m, k, is_810e);
-    const bool short_reduction = k <= 256 && is_810e;
-    const bool many_rows = is_810e && m >= 4096 && k <= 8192;
-    // One warp avoids a block-wide reduction for medium K. Deeper reductions
-    // retain more K lanes, while long streams favor smaller resident blocks.
-    const int row_lanes = many_rows ? (k > 1024 && k <= 2048 ? 32 :
-                                      k > 2048 && k <= 3072 ? 128 : 64) : 128;
-    const int bx = pair_load ? 16 : !short_reduction ? row_lanes : k <= 64 ? 8 : k <= 128 ? 16 : 32;
-    const int by = short_reduction ? 32 / bx : 1;
-    const int unroll = pair_load ? k / 32 : short_reduction ? 1 : 2;
+    const bool is810e = std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
+    int bx, by, unroll;
+    bool pairLoad;
+    dense_gemv_select_configs_810e(m, k, is810e, bx, by, unroll, pairLoad);
     const bool fp32 = d.scalar_type() == torch::kFloat;
-    const std::string name = fp32 ? "model_810e_bf16_n1_fp32" : "model_810e_bf16_n1";
+    const std::string name = fp32 ? "gemv_dense_bf16_fp32_810e" : "gemv_dense_bf16_810e";
     DenseGemvRuntime::Args args{
-        {bx, by, unroll, 1, 1, name, fp32, is_810e && k <= 1024, pair_load},
+        {bx, by, unroll, 1, 1, name, fp32, is810e && k <= 1024, pairLoad},
         {dim3(ceil_div(m, by)), dim3(bx, by), 0},
         {m, k, b.data_ptr(), a.data_ptr(), d.data_ptr(), k}};
-    if (is_810e && get_num_sms() < device_runtime->get_prop()->multiProcessorCount &&
-        args.launch_args.grid_dim.x > unsigned(get_num_sms())) {
+    if (is810e && device_runtime->get_num_simt_sms() < device_runtime->get_prop()->multiProcessorCount &&
+        args.launch_args.grid_dim.x > unsigned(device_runtime->get_num_simt_sms())) {
         args.launch_info.persistent = true;
-        args.launch_args.grid_dim.x = get_num_sms();
+        args.launch_args.grid_dim.x = device_runtime->get_num_simt_sms();
     }
     auto code = DenseGemvRuntime::generate(args);
     auto runtime = compiler->build(name, code);
+    DgProfParam params;
+    if (profiling_enabled())
+        params.set_params(GemmType::Normal, false, fp32 ? "bf16_bf16_fp32" : "bf16",
+                          1, m, 1, k, 0, nullptr, current_stream());
+    auto profilingGuard = show_gemm_ut(params);
     DenseGemvRuntime::launch(runtime, args);
+    const char* show_log = std::getenv("show_log");
+    if (show_log && isdigit(*show_log)) {
+        printf("[DenseGemm_BF16_GemV:]\n");
+        printf("group:1, problem:[%d, 1, %d], kernel:%s\n", m, k, name.c_str());
+        printf("BlockX:%d, BlockY:%d, k_per_thread:%d, num_sms:%d, threadblock_count:%u\n",
+               bx, by, unroll, device_runtime->get_num_simt_sms(), args.launch_args.grid_dim.x);
+    }
     return true;
 }
 
-class Model810eBatchedRuntime final : public LaunchRuntime<Model810eBatchedRuntime> {
-public:
-    using Base = BF16GemmCutlass3Runtime;
-    using Args = Base::Args;
-    static void replace_once(std::string& code, const std::string& before, const std::string& after) {
-        const auto pos = code.find(before);
-        TORCH_CHECK(pos != std::string::npos, "810E batched JIT template is incompatible with BF16 runtime");
-        code.replace(pos, before.size(), after);
-    }
-    static std::string generate_impl(const Args& args) {
-        // Reuse the exact architecture/mainloop/Params declarations. Keeping one
-        // generator prevents host/device ABI drift as the dense runtime evolves.
-        // Only the custom entry below runs. It reads M/N/K and all strides from
-        // Params, and never instantiates the standard scheduler or epilogue's
-        // operator(). These dummy dimensions affect unused type declarations
-        // only; canonicalizing them lets different N/K cases share one binary.
-        // Keep the actual launch arguments untouched, including batch count.
-        auto codegen_args = args;
-        cute::get<1>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
-        cute::get<2>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
-        auto code = Base::generate_impl(codegen_args);
-        replace_once(code, "GemmKernel::SharedStorageSize,", "sizeof(typename CollectiveMainloop::SharedStorage),");
-        replace_once(code, "GemmKernel op;\n  op(params, smem);",
-            fmt::format("Model810eBatchedKernel<Model810eDenseMainloop<CollectiveMainloop>, {}> op;\n  op(params, smem);",
-                args.kernel_params.with_tsm.hw_info.cu_count < kModel810eTensorCUs ? "true" : "false"));
-        return code;
-    }
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
-    }
-};
+// Share source substitutions across the dense Direct and TSM runtimes.
+static void replace_bf16_gemm_source(std::string& code, const std::string& before, const std::string& after) {
+    const auto pos = code.find(before);
+    TORCH_CHECK(pos != std::string::npos, "810E JIT template is incompatible with BF16 runtime");
+    code.replace(pos, before.size(), after);
+}
 
 template <typename Output>
-class Model810eDenseRuntime final : public LaunchRuntime<Model810eDenseRuntime<Output>> {
+class BF16GemmDirectRuntime810ET final : public LaunchRuntime<BF16GemmDirectRuntime810ET<Output>> {
 public:
     using Base = BF16GemmCutlass3RuntimeT<Output>;
     using Args = typename Base::Args;
@@ -1085,16 +1028,16 @@ public:
         // The replacement kernel uses runtime dimensions. SHAPE_N/K belong to
         // the unused standard scheduler/epilogue declarations, so normalize
         // only this codegen copy to share JIT kernels across problem shapes.
-        auto codegen_args = args;
-        cute::get<1>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
-        cute::get<2>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
-        auto code = Base::generate_impl(codegen_args);
+        auto codegenArgs = args;
+        cute::get<1>(codegenArgs.kernel_params.with_tsm.problem_shape) = 128;
+        cute::get<2>(codegenArgs.kernel_params.with_tsm.problem_shape) = 128;
+        auto code = Base::generate_impl(codegenArgs);
         const int splits = cute::get<3>(args.kernel_params.with_tsm.problem_shape);
-        Model810eBatchedRuntime::replace_once(code, "GemmKernel::SharedStorageSize,",
+        replace_bf16_gemm_source(code, "GemmKernel::SharedStorageSize,",
             "sizeof(typename CollectiveMainloop::SharedStorage),");
-        Model810eBatchedRuntime::replace_once(code, "GemmKernel op;\n  op(params, smem);",
-            fmt::format("Model810eDenseKernel<Model810eDenseMainloop<CollectiveMainloop>, ElementC, {}, {}> op;\n  op(params, smem);",
-                splits, args.kernel_params.with_tsm.hw_info.cu_count < kModel810eTensorCUs ? "true" : "false"));
+        replace_bf16_gemm_source(code, "GemmKernel op;\n  op(params, smem);",
+            fmt::format("BF16GemmDirectKernel810E<BF16GemmMainloop810E<CollectiveMainloop>, ElementC, {}, {}> op;\n  op(params, smem);",
+                splits, args.kernel_params.with_tsm.hw_info.cu_count < get_tensor_cu_count_810e() ? "true" : "false"));
         return code;
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -1103,12 +1046,12 @@ public:
 };
 
 template <typename Output>
-class Model810eReduceRuntime final : public LaunchRuntime<Model810eReduceRuntime<Output>> {
+class BF16GemmSplitKReduceRuntime810ET final : public LaunchRuntime<BF16GemmSplitKReduceRuntime810ET<Output>> {
 public:
     struct Params { const float* partial; void* d; int64_t count; };
     struct Args { LaunchArgs launch_args; Params params; int splits; };
     static LaunchArgs launch_args(int64_t count) {
-        const int sms = get_num_sms();
+        const int sms = device_runtime->get_num_simt_sms();
         TORCH_CHECK(sms > 0, "810E split-K reduction requires a positive CU budget");
         const auto prop = device_runtime->get_prop();
         const bool bounded = sms < prop->multiProcessorCount;
@@ -1123,8 +1066,8 @@ public:
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
 #include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
-extern "C" __global__ void model_810e_splitk_reduce(deep_gemm::Model810eReduceParams p) {{
-    deep_gemm::model_810e_reduce<{}, {}>(p);
+extern "C" __global__ void bf16_gemm_split_k_reduce_810e(deep_gemm::BF16GemmSplitKReduceParams810E p) {{
+    deep_gemm::bf16_gemm_split_k_reduce_impl_810e<{}, {}>(p);
 }}
 )", std::is_same_v<Output, float> ? "float" : "__ppu_bfloat16", args.splits);
     }
@@ -1134,8 +1077,8 @@ extern "C" __global__ void model_810e_splitk_reduce(deep_gemm::Model810eReducePa
 };
 
 template <typename Output>
-static void model_810e_bf16_dense(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
-                                 int bm, int bn, int bk, int wm, int wn, int stages, int splits) {
+static void bf16_gemm_direct_810e(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                                  int bm, int bn, int bk, int wm, int wn, int stages, int splits) {
     const int m = a.size(0), n = b.size(0), k = a.size(1);
     const auto pow2 = [](int x) { return x > 0 && (x & (x - 1)) == 0; };
     TORCH_CHECK(bm >= 16 && bn >= 16 && bk >= 32 && pow2(bm) && pow2(bn) && pow2(bk) &&
@@ -1148,7 +1091,7 @@ static void model_810e_bf16_dense(const torch::Tensor& a, const torch::Tensor& b
     TORCH_CHECK(threads <= device_runtime->get_prop()->maxThreadsPerBlock &&
                 smem <= device_runtime->get_prop()->sharedMemPerMultiprocessor,
                 "810E BF16 tile exceeds device resources");
-    using Runtime = Model810eDenseRuntime<Output>;
+    using Runtime = BF16GemmDirectRuntime810ET<Output>;
     using Base = typename Runtime::Base;
     using Stride = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     const Stride sa{k, cute::Int<1>{}, int64_t(m) * k};
@@ -1159,8 +1102,8 @@ static void model_810e_bf16_dense(const torch::Tensor& a, const torch::Tensor& b
     if (splits > 1)
         workspace = torch::empty({int64_t(splits) * m * n}, a.options().dtype(torch::kFloat));
     cutlass::KernelHardwareInfo hw{};
-    hw.device_id = a.get_device(); hw.cu_count = get_num_sms();
-    typename Base::GemmArguments gemm_args{
+    hw.device_id = a.get_device(); hw.cu_count = get_num_tensor_sms_810e();
+    typename Base::GemmArguments gemmArgs{
         .mode = cutlass::gemm::GemmUniversalMode::kGemm,
         .problem_shape = {m, n, k, splits},
         .mainloopargs = {reinterpret_cast<const cutlass::bfloat16_t*>(a.data_ptr<at::BFloat16>()), sa,
@@ -1168,32 +1111,33 @@ static void model_810e_bf16_dense(const torch::Tensor& a, const torch::Tensor& b
         .epilogueargs = {{1, 0}, output, sd, output, sd},
         .hw_info = hw, .scheduler = {(uint32_t)m, nullptr}, .signal = nullptr};
     typename Runtime::Args args{
-        .launch_info = {bm, bn, bk, wm, wn, 1, stages, "Normal", "Default", "model_810e_bf16_dense", false},
+        .launch_info = {bm, bn, bk, wm, wn, 1, stages, "Normal", "Default", "bf16_gemm_direct_810e", false},
         .launch_args = {dim3(ceil_div(n, bn), ceil_div(m, bm), splits), dim3(threads), smem},
-        .kernel_params = Base::to_underlying_arguments_rtc(gemm_args, splits > 1 ? workspace.data_ptr<float>() : nullptr)};
-    if (get_num_sms() < kModel810eTensorCUs) {
-        TORCH_CHECK(get_num_sms() > 0, "810E dense GEMM requires a positive CU budget");
+        .kernel_params = Base::to_underlying_arguments_rtc(gemmArgs, splits > 1 ? workspace.data_ptr<float>() : nullptr)};
+    if (get_num_tensor_sms_810e() < get_tensor_cu_count_810e()) {
+        TORCH_CHECK(get_num_tensor_sms_810e() > 0, "810E dense GEMM requires a positive CU budget");
         const int64_t tiles = int64_t(ceil_div(m, bm)) * ceil_div(n, bn) * splits;
-        args.launch_args.grid_dim = dim3(std::min<int64_t>(get_num_sms(), tiles));
+        args.launch_args.grid_dim = dim3(std::min<int64_t>(get_num_tensor_sms_810e(), tiles));
     }
     auto code = Runtime::generate(args);
-    auto runtime = compiler->build("model_810e_bf16_dense", code);
+    auto runtime = compiler->build("bf16_gemm_direct_810e", code);
     Runtime::launch(runtime, args);
+    show_bf16_gemm_launch_810e(args, m, n, k, get_num_tensor_sms_810e());
     if (splits > 1) {
-        using Reduce = Model810eReduceRuntime<Output>;
+        using Reduce = BF16GemmSplitKReduceRuntime810ET<Output>;
         const int64_t count = int64_t(m) * n;
-        typename Reduce::Args reduce_args{
+        typename Reduce::Args reduceArgs{
             Reduce::launch_args(count),
             {workspace.data_ptr<float>(), output, count}, splits};
-        auto reduce_code = Reduce::generate(reduce_args);
-        auto reduce_runtime = compiler->build("model_810e_splitk_reduce", reduce_code);
-        Reduce::launch(reduce_runtime, reduce_args);
+        auto reduceCode = Reduce::generate(reduceArgs);
+        auto reduceRuntime = compiler->build("bf16_gemm_split_k_reduce_810e", reduceCode);
+        Reduce::launch(reduceRuntime, reduceArgs);
     }
 }
 
 // Validate the resolved grid, including reduced-budget persistent launches,
 // before generating or compiling a kernel.
-static void model_810e_check_grid(const dim3& grid) {
+static void check_bf16_gemm_grid_810e(const dim3& grid) {
     const auto prop = device_runtime->get_prop();
     TORCH_CHECK(grid.x > 0 && grid.y > 0 && grid.z > 0 &&
                 grid.x <= uint64_t(prop->maxGridSize[0]) &&
@@ -1202,101 +1146,39 @@ static void model_810e_check_grid(const dim3& grid) {
                 "810E GEMM grid exceeds device limits: (", grid.x, ", ", grid.y, ", ", grid.z, ")");
 }
 
-static std::pair<int, int> model_810e_batch_k_config(const int k) {
-    const int bk = k >= 128 && k % 64 == 0 ? 64 : 32;
-    return {bk, std::min(3, k / bk)};
-}
-
-static void model_810e_bf16_strided_batched(const torch::Tensor& a, const torch::Tensor& b,
-    const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt) {
-    const int batch = a.size(0), m = a.size(1), n = b.size(1), k = a.size(2);
-    auto [bk, stages] = model_810e_batch_k_config(k);
-    int bm = m <= 64 ? 32 : 128, bn = m <= 64 ? 64 : 128;
-    int wm = m <= 64 ? 16 : 32, wn = m <= 64 ? 32 : 64;
-    int sms = get_num_sms();
-    if (configs) {
-        auto [ns, cbm, cbn, cbk, cwm, cwn, cstages, unused] = *configs;
-        sms = ns; bm = cbm; bn = cbn; bk = cbk; wm = cwm; wn = cwn; stages = cstages;
-    }
-    const auto pow2 = [](int x) { return x > 0 && (x & (x - 1)) == 0; };
-    TORCH_CHECK(bm >= 16 && bn >= 16 && bk >= 32 && pow2(bm) && pow2(bn) && pow2(bk) &&
-                wm >= 16 && wn >= 16 && bm % wm == 0 && bn % wn == 0 &&
-                stages >= 2 && stages <= 8, "invalid 810E BF16 batched tile (requires BK>=32)");
-    TORCH_CHECK(k % bk == 0 && k / bk >= stages,
-                "810E BF16 batched tile requires K%BK=0 and at least stages BK tiles");
-    const int threads = (bm / wm) * (bn / wn) * 32;
-    const int smem = (bm + bn) * bk * 2 * stages;
-    TORCH_CHECK(threads <= device_runtime->get_prop()->maxThreadsPerBlock &&
-                smem <= device_runtime->get_prop()->sharedMemPerMultiprocessor,
-                "810E BF16 batched tile exceeds device resources");
-    using Runtime = Model810eBatchedRuntime;
-    using Base = Runtime::Base;
-    using Stride = cute::Stride<int64_t, cute::Int<1>, int64_t>;
-    const Stride sa{a.stride(1), cute::Int<1>{}, a.stride(0)};
-    const Stride sb{b.stride(1), cute::Int<1>{}, b.stride(0)};
-    const Stride sd{d.stride(1), cute::Int<1>{}, d.stride(0)};
-    auto* output = reinterpret_cast<cutlass::bfloat16_t*>(d.data_ptr<at::BFloat16>());
-    cutlass::KernelHardwareInfo hw{};
-    hw.device_id = a.get_device(); hw.cu_count = sms;
-    Base::GemmArguments gemm_args{
-        .mode = cutlass::gemm::GemmUniversalMode::kGemm,
-        .problem_shape = {m, n, k, batch},
-        .mainloopargs = {reinterpret_cast<const cutlass::bfloat16_t*>(a.data_ptr<at::BFloat16>()), sa,
-                         reinterpret_cast<const cutlass::bfloat16_t*>(b.data_ptr<at::BFloat16>()), sb},
-        .epilogueargs = {{1, 0}, output, sd, output, sd},
-        .hw_info = hw, .scheduler = {(uint32_t)m, nullptr}, .signal = nullptr};
-    Runtime::Args args{
-        .launch_info = {bm, bn, bk, wm, wn, batch, stages, "Normal", "Default", "model_810e_bf16_batch", false},
-        .launch_args = {dim3(ceil_div(n, bn), ceil_div(m, bm), batch), dim3(threads), smem},
-        .kernel_params = Base::to_underlying_arguments_rtc(gemm_args, nullptr)};
-    if (sms < kModel810eTensorCUs) {
-        TORCH_CHECK(sms > 0, "810E native batch requires a positive CU budget");
-        const int64_t tiles = int64_t(ceil_div(n, bn)) * ceil_div(m, bm) * batch;
-        args.launch_args.grid_dim = dim3(std::min<int64_t>(sms, tiles));
-    }
-    model_810e_check_grid(args.launch_args.grid_dim);
-    auto code = Runtime::generate(args);
-    auto runtime = compiler->build("model_810e_bf16_batch", code);
-    Runtime::launch(runtime, args);
-}
-
-template <typename Output, bool SplitK, bool TransposeB = false>
-class Model810eTsmRuntime final : public LaunchRuntime<Model810eTsmRuntime<Output, SplitK, TransposeB>> {
+template <typename Output, bool SplitK>
+class BF16GemmTsmRuntime810ET final : public LaunchRuntime<BF16GemmTsmRuntime810ET<Output, SplitK>> {
 public:
-    using Base = BF16GemmCutlass3RuntimeT<Output, TransposeB>;
+    using Base = BF16GemmCutlass3RuntimeT<Output>;
     // Host-only scheduling options stay outside device Params. Code generation
     // and launch dimensions consume the same values selected by the dispatch heuristic.
     struct Args : Base::Args {
-        int tile_order = 0;
-        bool peel_first_k = false;
-        bool specialize_shape = false;
-        bool unroll_k = false;
-        bool narrow_n_tail = false;
-        int input_k_chunk = 0;
+        int tileOrder = 0;
+        bool peelFirstK = false;
+        bool unrollK = false;
+        bool narrowNTail = false;
     };
     static std::string generate_impl(const Args& args) {
-        auto codegen_args = static_cast<const typename Base::Args&>(args);
+        auto codegenArgs = static_cast<const typename Base::Args&>(args);
         // The custom kernel and EVT epilogue use real dimensions from Params
-        // (or validated small-batch constants). The unused standard scheduler
+        // (or a validated static K). The unused standard scheduler
         // remains a fixed dummy type.
-        cute::get<1>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
-        cute::get<2>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
-        auto code = Base::generate_impl(codegen_args);
+        cute::get<1>(codegenArgs.kernel_params.with_tsm.problem_shape) = 128;
+        cute::get<2>(codegenArgs.kernel_params.with_tsm.problem_shape) = 128;
+        auto code = Base::generate_impl(codegenArgs);
         const int splits = SplitK ? cute::get<3>(args.kernel_params.with_tsm.problem_shape) : 1;
-        auto kernel_type = fmt::format("Model810eTsmKernel<{}, CollectiveEpilogue, {}, {}, {}, {}, {}, {}, {}, {}>",
-                        fmt::format("deep_gemm::Model810eDenseMainloop<CollectiveMainloop, {}, {}>",
-                                    args.peel_first_k ? "true" : "false",
-                                    args.unroll_k ? (args.input_k_chunk ? args.input_k_chunk : cute::get<2>(args.kernel_params.with_tsm.problem_shape)) / args.launch_info.block_k : 0),
-                        SplitK ? "true" : "false", splits,
-                        args.tile_order,
-                        args.specialize_shape ? cute::get<0>(args.kernel_params.with_tsm.problem_shape) : 0,
-                        args.specialize_shape ? cute::get<1>(args.kernel_params.with_tsm.problem_shape) : 0,
-                        args.specialize_shape || args.unroll_k ? cute::get<2>(args.kernel_params.with_tsm.problem_shape) : 0,
-                        args.kernel_params.with_tsm.hw_info.cu_count < kModel810eTensorCUs ? "true" : "false", args.input_k_chunk);
-        if (args.narrow_n_tail) {
+        auto kernelType = fmt::format("BF16GemmTsmKernel810E<{}, CollectiveEpilogue, {}, {}, {}, {}, {}>",
+                                      fmt::format("deep_gemm::BF16GemmMainloop810E<CollectiveMainloop, {}, {}>",
+                                                  args.peelFirstK ? "true" : "false",
+                                                  args.unrollK ? cute::get<2>(args.kernel_params.with_tsm.problem_shape) / args.launch_info.block_k : 0),
+                                      SplitK ? "true" : "false", splits,
+                                      args.tileOrder,
+                                      args.unrollK ? cute::get<2>(args.kernel_params.with_tsm.problem_shape) : 0,
+                                      args.kernel_params.with_tsm.hw_info.cu_count < get_tensor_cu_count_810e() ? "true" : "false");
+        if (args.narrowNTail) {
             // Both alternatives use 256 threads. The smaller mainloop reuses
             // the primary allocation and writes only valid scalar outputs.
-            Model810eBatchedRuntime::replace_once(code, "extern \"C\"", R"(
+            replace_bf16_gemm_source(code, "extern \"C\"", R"(
 using TailTile = Shape<_128, _16, _64>;
 using TailMma = TiledMMA<MMA_Atom<MmaInst>, Layout<Shape<_8, _1, _1>>,
                         Tile<_128, _16, _16>>;
@@ -1311,14 +1193,14 @@ using TailCollective = cutlass::gemm::collective::CollectiveMma<
     typename TailOperandB::SmemCopyAtom, cute::identity>;
 static_assert(sizeof(typename TailCollective::SharedStorage) <= GemmKernel::SharedStorageSize);
 extern "C")");
-            kernel_type = fmt::format("Model810eNarrowNTailKernel<{}, {}, {}>", kernel_type,
-                fmt::format("deep_gemm::Model810eDenseMainloop<TailCollective, {}>",
-                            args.peel_first_k ? "true" : "false"),
-                args.tile_order);
+            kernelType = fmt::format("BF16GemmNarrowNTailKernel810E<{}, {}, {}>", kernelType,
+                fmt::format("deep_gemm::BF16GemmMainloop810E<TailCollective, {}>",
+                            args.peelFirstK ? "true" : "false"),
+                args.tileOrder);
         }
-        Model810eBatchedRuntime::replace_once(code, "GemmKernel op;\n  op(params, smem);",
+        replace_bf16_gemm_source(code, "GemmKernel op;\n  op(params, smem);",
             fmt::format("static_assert(GemmKernel::SharedStorageSize <= {}, \"810E TSM launch storage is too small\");\n"
-                        "  {} op;\n  op(params, smem);", args.launch_args.smem_size, kernel_type));
+                        "  {} op;\n  op(params, smem);", args.launch_args.smem_size, kernelType));
         return code;
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -1326,122 +1208,108 @@ extern "C")");
     }
 };
 
-// Rank-3 views: dense uses a singleton input batch; split-K D has `splits`
-// batches of FLOAT partials. No packing or copies are performed by this helper.
-template <typename Output, bool SplitK, bool TransposeB = false>
-static void model_810e_tsm_launch(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
-    int bm, int bn, int bk, int wm, int wn, int stages, int splits, int sms,
-    int tile_order = 0,
-    bool peel_first_k = false,
-    bool specialize_shape = false,
-    bool unroll_k = false,
-    bool narrow_n_tail = false, int input_k_chunk = 0) {
+// Singleton input views share the dense/split-K parameter layout. The output
+// has one plane per FP32 split-K partial. This helper performs no input copies.
+template <typename Output, bool SplitK>
+static void bf16_gemm_tsm_impl_810e(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                                    int bm, int bn, int bk, int wm, int wn, int stages, int splits, int sms,
+                                    int tileOrder = 0,
+                                    bool peelFirstK = false,
+                                    bool unrollK = false,
+                                    bool narrowNTail = false) {
     const int m = a.size(1), n = b.size(1), k = a.size(2);
-    const int groups = SplitK ? splits : a.size(0);
-    TORCH_CHECK(!specialize_shape || (!SplitK && m <= 64 && n <= 1024 && k <= 512 &&
-                !is_ppu1v5_device() &&
-                std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos),
-                "Static batch specialization requires 810E, M<=64, N<=1024, K<=512");
-    TORCH_CHECK(!unroll_k || (!SplitK && peel_first_k && k <= 512 && k % bk == 0 &&
-                k / bk >= stages && k / bk <= 16 && !is_ppu1v5_device() &&
-                std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos),
-                "Invalid static batch K-loop count");
+    TORCH_CHECK(a.size(0) == 1 && b.size(0) == 1, "810E TSM expects singleton dense input views");
+    const int groups = SplitK ? splits : 1;
+    TORCH_CHECK(!unrollK || (!SplitK && peelFirstK && k <= 512 && k % bk == 0 &&
+                             k / bk >= stages && k / bk <= 16 && !is_ppu1v5_device() &&
+                             std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos),
+                "Invalid dense K-loop count");
     const auto pow2 = [](int x) { return x > 0 && (x & (x - 1)) == 0; };
     // This mainloop advances its pipeline at K_BLOCK_MAX-2. BK16 has only
     // one register K block on 810E and cannot advance that state machine.
     // Non-power-of-two M tiles keep one or two M warps and four N warps.
     // The vector epilogue requires this power-of-two warp grid, not power-of-two BM.
-    const bool compact_m = bn == 128 && wn == 32 &&
+    const bool compactM = bn == 128 && wn == 32 &&
         (stages == 2 || stages == 3) &&
         ((bk == 64 && ((bm == 80 && wm == 80) || (bm == 96 && wm == 48) ||
                        (bm == 112 && wm == 112) || (bm == 160 && wm == 80) ||
                        (bm == 192 && wm == 96) || (bm == 224 && wm == 112))) ||
          (bk == 128 && ((bm == 160 && wm == 80) || (bm == 192 && wm == 96))));
-    TORCH_CHECK(bm >= 16 && bn >= 16 && bk >= 32 && (pow2(bm) || compact_m) && pow2(bn) && pow2(bk) &&
+    TORCH_CHECK(bm >= 16 && bn >= 16 && bk >= 32 && (pow2(bm) || compactM) && pow2(bn) && pow2(bk) &&
                 wm >= 16 && wn >= 16 && bm % wm == 0 && bn % wn == 0 &&
                 stages >= 2 && stages <= 8, "invalid 810E TSM tile (requires BK>=32)");
     // A complete K product may use AIU padding for its last tile only when
     // the descriptor width is the logical K. Padded input rows and split-K
     // partitions retain the complete-tile requirement.
-    const bool full_k_tail = !SplitK && k % 32 == 0 && a.stride(1) == k && b.stride(1) == k;
-    TORCH_CHECK(splits >= 1 && splits <= 64 && (k % bk == 0 || full_k_tail) &&
+    const bool fullKTail = !SplitK && k % 32 == 0 && a.stride(1) == k && b.stride(1) == k;
+    TORCH_CHECK(splits >= 1 && splits <= 64 && (k % bk == 0 || fullKTail) &&
                 (k / bk) / splits >= stages,
                 "810E TSM requires complete prologue tiles and aligned split-K or contiguous full-K inputs");
-    TORCH_CHECK(input_k_chunk == 0 || (!SplitK && !TransposeB && input_k_chunk % bk == 0 &&
-                k % input_k_chunk == 0 && input_k_chunk / bk >= stages &&
-                input_k_chunk <= a.stride(1) && input_k_chunk <= b.stride(1)),
-                "Invalid K segment for overlapping input rows");
-    TORCH_CHECK(!TransposeB || (!SplitK && b.stride(1) == 1 &&
-                bn <= b.stride(2) && n % bn == 0),
-                "810E transposed B requires complete N tiles within the descriptor width");
     const int threads = (bm / wm) * (bn / wn) * 32;
-    TORCH_CHECK(!narrow_n_tail || (!SplitK && groups == 1 && splits == 1 &&
-                sms >= kModel810eTensorCUs && bm == 128 && bn == 128 && bk == 64 &&
-                threads == 256 && (tile_order == 0 || tile_order == 1) &&
-                n % 128 > 0 && n % 128 <= 16 && !unroll_k && !specialize_shape),
+    TORCH_CHECK(!narrowNTail || (!SplitK && groups == 1 && splits == 1 &&
+                                 sms >= get_tensor_cu_count_810e() && bm == 128 && bn == 128 && bk == 64 &&
+                                 threads == 256 && (tileOrder == 0 || tileOrder == 1) &&
+                                 n % 128 > 0 && n % 128 <= 16 && !unrollK),
                 "Invalid 810E narrow N-tail launch");
-    const int main_smem = (bm + bn) * bk * 2 * stages;
+    const int mainSmem = (bm + bn) * bk * 2 * stages;
     // The EVT stages WarpOnM*16 rows at a time, in FP32. Reserve one alignment
     // unit for its empty callback storage/padding; a generated static_assert
     // checks this bound against the actual CUTLASS SharedStorage type.
-    const int epi_smem = (bm / wm) * 16 * bn * 4 + 128;
-    const int smem = std::max(main_smem, epi_smem);
+    const int epiSmem = (bm / wm) * 16 * bn * 4 + 128;
+    const int smem = std::max(mainSmem, epiSmem);
     TORCH_CHECK(threads <= device_runtime->get_prop()->maxThreadsPerBlock &&
                 smem <= device_runtime->get_prop()->sharedMemPerMultiprocessor,
                 "810E TSM tile exceeds device resources");
-    using Runtime = Model810eTsmRuntime<Output, SplitK, TransposeB>;
+    using Runtime = BF16GemmTsmRuntime810ET<Output, SplitK>;
     using Base = typename Runtime::Base;
     using Stride = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     const Stride sa{a.stride(1), cute::Int<1>{}, a.stride(0)};
-    typename Base::InputStrideB sb;
-    if constexpr (TransposeB) sb = {cute::Int<1>{}, b.stride(2), b.stride(0)};
-    else sb = {b.stride(1), cute::Int<1>{}, b.stride(0)};
+    const Stride sb{b.stride(1), cute::Int<1>{}, b.stride(0)};
     const Stride sd{d.stride(1), cute::Int<1>{}, d.stride(0)};
     auto* output = static_cast<Output*>(d.data_ptr());
     cutlass::KernelHardwareInfo hw{};
     hw.device_id = a.get_device(); hw.cu_count = sms;
-    typename Base::GemmArguments gemm_args{
+    typename Base::GemmArguments gemmArgs{
         .mode = cutlass::gemm::GemmUniversalMode::kGemm,
         .problem_shape = {m, n, k, groups},
         .mainloopargs = {reinterpret_cast<const cutlass::bfloat16_t*>(a.data_ptr<at::BFloat16>()), sa,
                          reinterpret_cast<const cutlass::bfloat16_t*>(b.data_ptr<at::BFloat16>()), sb},
         .epilogueargs = {{1, 0}, output, sd, output, sd},
         .hw_info = hw, .scheduler = {(uint32_t)m, nullptr}, .signal = nullptr};
-    const std::string name = SplitK ? "model_810e_tsm_dense" : "model_810e_tsm_batch";
-    typename Base::Args base_args{
+    const std::string name = SplitK ? "bf16_gemm_tsm_split_k_810e" : "bf16_gemm_tsm_810e";
+    typename Base::Args baseArgs{
         .launch_info = {bm, bn, bk, wm, wn, 1, stages, "Normal", "Default", name, false},
-        .launch_args = {tile_order == 1 ? dim3(ceil_div(m, bm), ceil_div(n, bn), groups) :
+        .launch_args = {tileOrder == 1 ? dim3(ceil_div(m, bm), ceil_div(n, bn), groups) :
                                       dim3(ceil_div(n, bn), ceil_div(m, bm), groups), dim3(threads), smem},
-        .kernel_params = Base::to_underlying_arguments_rtc(gemm_args, nullptr)};
-    typename Runtime::Args args{base_args, tile_order, peel_first_k,
-                               specialize_shape, unroll_k, narrow_n_tail, input_k_chunk};
-    if (sms < kModel810eTensorCUs) {
+        .kernel_params = Base::to_underlying_arguments_rtc(gemmArgs, nullptr)};
+    typename Runtime::Args args{baseArgs, tileOrder, peelFirstK,
+                               unrollK, narrowNTail};
+    if (sms < get_tensor_cu_count_810e()) {
         TORCH_CHECK(sms > 0, "810E TSM requires a positive CU budget");
         const int64_t tiles = int64_t(ceil_div(m, bm)) * ceil_div(n, bn) * groups;
         args.launch_args.grid_dim = dim3(std::min<int64_t>(sms, tiles));
     }
-    model_810e_check_grid(args.launch_args.grid_dim);
+    check_bf16_gemm_grid_810e(args.launch_args.grid_dim);
     auto code = Runtime::generate(args);
     auto runtime = compiler->build(name, code);
     Runtime::launch(runtime, args);
+    show_bf16_gemm_launch_810e(args, m, n, k, sms);
 }
 
 template <typename Output>
-static void model_810e_bf16_dense_tsm(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
-    int bm, int bn, int bk, int wm, int wn, int stages, int splits,
-    int tile_order = 0,
-    bool peel_first_k = false,
-    bool specialize_shape = false,
-    bool unroll_k = false,
-    bool narrow_n_tail = false) {
-    TORCH_CHECK(!specialize_shape && (!unroll_k || splits == 1),
-                "Dense K unrolling requires a complete K product; static M/N requires native batches");
+static void bf16_gemm_tsm_810e(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                               int bm, int bn, int bk, int wm, int wn, int stages, int splits,
+                               int tileOrder = 0,
+                               bool peelFirstK = false,
+                               bool unrollK = false,
+                               bool narrowNTail = false) {
+    TORCH_CHECK(!unrollK || splits == 1, "Dense K unrolling requires a complete K product");
     const int m = a.size(0), n = b.size(0), k = a.size(1);
     const int alignment = 16 / sizeof(Output);
     // Standard EVT predicates only the vector's first element. Keep narrow or
     // unaligned output rows on the audited per-element path, including N=4.
     if (n < 8 || n % alignment != 0 || (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) != 0) {
-        model_810e_bf16_dense<Output>(a, b, d, bm, bn, bk, wm, wn, stages, splits);
+        bf16_gemm_direct_810e<Output>(a, b, d, bm, bn, bk, wm, wn, stages, splits);
         return;
     }
     TORCH_CHECK(splits >= 1 && splits <= 64, "810E TSM requires 1<=splits<=64");
@@ -1450,409 +1318,170 @@ static void model_810e_bf16_dense_tsm(const torch::Tensor& a, const torch::Tenso
         // Complete BK tiles let the deep, large-M pipeline eliminate K-tail
         // bookkeeping. A single partition still writes the final output once.
         // Other tiles retain the complete-K path, including padded K tails.
-        if (bm >= 256 && stages >= 4 && k % bk == 0 && !unroll_k)
-            model_810e_tsm_launch<Output, true>(av, bv, d.unsqueeze(0), bm, bn, bk, wm, wn, stages, 1,
-                                              get_num_sms(), tile_order, peel_first_k);
+        if (bm >= 256 && stages >= 4 && k % bk == 0 && !unrollK)
+            bf16_gemm_tsm_impl_810e<Output, true>(av, bv, d.unsqueeze(0), bm, bn, bk, wm, wn, stages, 1,
+                                                  get_num_tensor_sms_810e(), tileOrder, peelFirstK);
         else
-            model_810e_tsm_launch<Output, false>(av, bv, d.unsqueeze(0), bm, bn, bk, wm, wn, stages, 1,
-                                               get_num_sms(), tile_order, peel_first_k, false, unroll_k, narrow_n_tail);
+            bf16_gemm_tsm_impl_810e<Output, false>(av, bv, d.unsqueeze(0), bm, bn, bk, wm, wn, stages, 1,
+                                                   get_num_tensor_sms_810e(), tileOrder, peelFirstK, unrollK, narrowNTail);
         return;
     }
     auto partial = torch::empty({int64_t(splits), int64_t(m), int64_t(n)}, a.options().dtype(torch::kFloat));
-    model_810e_tsm_launch<float, true>(av, bv, partial, bm, bn, bk, wm, wn, stages, splits, get_num_sms(),
-                                     tile_order, peel_first_k);
-    using Reduce = Model810eReduceRuntime<Output>;
+    bf16_gemm_tsm_impl_810e<float, true>(av, bv, partial, bm, bn, bk, wm, wn, stages, splits, get_num_tensor_sms_810e(),
+                                         tileOrder, peelFirstK);
+    using Reduce = BF16GemmSplitKReduceRuntime810ET<Output>;
     const int64_t count = int64_t(m) * n;
     typename Reduce::Args args{Reduce::launch_args(count),
                               {partial.data_ptr<float>(), d.data_ptr(), count}, splits};
     auto code = Reduce::generate(args);
-    auto runtime = compiler->build("model_810e_splitk_reduce", code);
+    auto runtime = compiler->build("bf16_gemm_split_k_reduce_810e", code);
     Reduce::launch(runtime, args);
 }
 
-static void model_810e_bf16_strided_batched_tsm(const torch::Tensor& a, const torch::Tensor& b,
-    const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt,
-    int tile_order = 0,
-    bool peel_first_k = false,
-    bool specialize_shape = false,
-    bool unroll_k = false) {
-    const int m = a.size(1), n = b.size(1);
-    if (n < 8 || n % 8 != 0 || d.stride(1) % 8 != 0 || d.stride(0) % 8 != 0 ||
-        (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) != 0) {
-        model_810e_bf16_strided_batched(a, b, d, configs);
-        return;
-    }
-    auto [bk, stages] = model_810e_batch_k_config(int(a.size(2)));
-    int bm = m <= 64 ? 32 : 128, bn = m <= 64 ? 64 : 128;
-    int wm = m <= 64 ? 16 : 32, wn = m <= 64 ? 32 : 64;
-    int sms = get_num_sms();
-    if (configs) {
-        auto [ns, cbm, cbn, cbk, cwm, cwn, cstages, unused] = *configs;
-        sms = ns; bm = cbm; bn = cbn; bk = cbk; wm = cwm; wn = cwn; stages = cstages;
-    }
-    model_810e_tsm_launch<cutlass::bfloat16_t, false>(a, b, d, bm, bn, bk, wm, wn, stages, 1, sms,
-                                                  tile_order, peel_first_k, specialize_shape, unroll_k);
-}
-
-static bool model_810e_dispatch_device() {
+static bool is_810e_device() {
     return std::string(device_runtime->get_prop()->name).find("ZW810E") != std::string::npos;
 }
 
-static ConfigTuple model_810e_dispatch_config(const Model810eDispatchTile& tile) {
-    // The standard launcher recomputes shared storage from the first seven
-    // fields; native batch launchers do likewise. No cached smem estimate leaks
-    // across output dtypes or implementations.
-    return {get_num_sms(), tile.bm, tile.bn, tile.bk, tile.wm, tile.wn, tile.stages, {0, 0, 0}};
-}
-
-// Shared cute-free launcher: validate all specialization/resource constraints
-// before JIT, including the FP32 scratch needed by the WarpOnK reduction.
 template <typename Output>
-static void model_810e_cute_free_launch(const torch::Tensor& a, const torch::Tensor& b,
-    const torch::Tensor& d, const ConfigTuple& config, int warps_k) {
-    const auto [sms, bm, bn, bk, wm, wn, stages, unused] = config;
-    TORCH_CHECK(sms >= kModel810eTensorCUs && sms <= get_num_sms(), "cute-free CU budget is invalid");
-    TORCH_CHECK(bm >= 16 && bn >= 16 && bm <= 512 && bn <= 512 &&
-                wm >= 16 && wn >= 16 && wm % 16 == 0 && wn % 16 == 0 &&
-                bm % wm == 0 && bn % wn == 0 && bk >= 32 && bk <= 512 &&
-                (bk & (bk - 1)) == 0 && stages >= 2 && stages <= 8,
-                "invalid cute-free tile/warp configuration");
-    TORCH_CHECK((warps_k == 1 || warps_k == 2 || warps_k == 4) && bk % warps_k == 0 &&
-                bk / warps_k >= 32 && (bk / warps_k) % 32 == 0,
-                "cute-free WarpOnK requires at least two MMA K steps per warp group");
-    const int64_t threads = int64_t(bm / wm) * (bn / wn) * warps_k * 32;
-    const int64_t smem = int64_t(bm + bn) * bk * 2 * stages;
-    const auto prop = device_runtime->get_prop();
-    TORCH_CHECK(threads <= prop->maxThreadsPerBlock && smem <= prop->sharedMemPerBlock &&
-                int64_t(warps_k - 1) * bm * bn * sizeof(float) <= smem,
-                "cute-free tile exceeds thread, shared-memory or WarpOnK reduction capacity");
-    const int m = a.size(0), n = b.size(0), k = a.size(1);
-    TORCH_CHECK(m > 0 && n > 0 && k >= 32 && k % 32 == 0 &&
-                m < (1 << 23) && n < (1 << 23) && k < (1 << 23) &&
-                (reinterpret_cast<uintptr_t>(a.data_ptr()) & 15) == 0 &&
-                (reinterpret_cast<uintptr_t>(b.data_ptr()) & 15) == 0,
-                "810E cute-free requires K>=32, K%32=0, dimensions<2^23 and 16-byte-aligned inputs");
-    const int64_t tiles = int64_t(ceil_div(m, bm)) * ceil_div(n, bn);
-    TORCH_CHECK(tiles <= std::numeric_limits<int>::max(), "cute-free tile grid exceeds int32 range");
-    const int grid = int(tiles);
-    using Runtime = DenseBF16GemmCuteFreeRuntimeT<Output>;
-    using Stride = cute::Stride<int64_t, cute::Int<1>, int64_t>;
-    const Stride sa{k, {}, int64_t(m) * k}, sb{k, {}, int64_t(n) * k}, sd{n, {}, int64_t(m) * n};
-    auto* out = static_cast<Output*>(d.data_ptr());
-    typename Runtime::GemmArguments g{cutlass::gemm::GemmUniversalMode::kGemm, {m,n,k,1},
-        {reinterpret_cast<const cutlass::bfloat16_t*>(a.data_ptr()), sa,
-         reinterpret_cast<const cutlass::bfloat16_t*>(b.data_ptr()), sb},
-        {{1,0},out,sd,out,sd}, {a.get_device(),sms}, {uint32_t(m),uint32_t(n),uint32_t(k),nullptr}};
-    typename Runtime::Args args{
-        {bm,bn,bk,wm,wn,bk/warps_k,true,stages,"Normal","Default","bf16_810e_cute_free",false,false},
-        {dim3(grid),dim3(threads),int(smem)}, Runtime::to_underlying_arguments_rtc(g,nullptr)};
-    const auto code = Runtime::generate(args);
-    const auto runtime = compiler->build("bf16_810e_cute_free",code);
-    Runtime::launch(runtime,args);
-}
-
-static bool model_810e_cute_free(const torch::Tensor& a, const torch::Tensor& b,
-    const torch::Tensor& d, const std::optional<ConfigTuple>& configs) {
-    if (!model_810e_dispatch_device() || configs || get_num_sms() < kModel810eTensorCUs)
-        return false;
-    Model810eDispatchTile t{};
-    const auto type = d.scalar_type() == torch::kFloat ? Model810eOutputType::FP32 : Model810eOutputType::BF16;
-    const int warps_k = get_model_810e_cute_free_config(a.size(0), b.size(0), a.size(1), type, t);
-    if (!warps_k) return false;
-    const auto tile = model_810e_dispatch_config(t);
-    if (d.scalar_type() == torch::kFloat) model_810e_cute_free_launch<float>(a,b,d,tile,warps_k);
-    else model_810e_cute_free_launch<cutlass::bfloat16_t>(a,b,d,tile,warps_k);
-    return true;
-}
-
-template <typename Output>
-static void model_810e_dispatch_dense_entry(const Model810eDenseDispatchEntry& entry,
-    const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
+static void bf16_gemm_impl_810e(const ConfigResult810E& entry,
+                                const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
     const auto& t = entry.tile;
+    if (entry.kind == BF16GemmKernelType810E::Standard) {
+        bf16_gemm_impl<Output>(a, b, d, int(entry.m), int(entry.n), int(entry.k), get_best_configs_810e(t));
+        return;
+    }
+    DgProfParam params;
+    if (profiling_enabled())
+        params.set_params(GemmType::Normal, false, d.scalar_type() == torch::kFloat ? "bf16_bf16_fp32" : "bf16",
+                          1, int(entry.m), int(entry.n), int(entry.k), 0, nullptr, current_stream());
+    auto profilingGuard = show_gemm_ut(params);
     switch (entry.kind) {
-        case Model810eDispatchKind::Direct:
-            model_810e_bf16_dense<Output>(a, b, d, t.bm, t.bn, t.bk, t.wm, t.wn, t.stages, t.splits);
+        case BF16GemmKernelType810E::Direct:
+            bf16_gemm_direct_810e<Output>(a, b, d, t.bm, t.bn, t.bk, t.wm, t.wn, t.stages, t.splits);
             return;
-        case Model810eDispatchKind::TSM:
-            model_810e_bf16_dense_tsm<Output>(a, b, d, t.bm, t.bn, t.bk, t.wm, t.wn, t.stages, t.splits,
-                                             t.tile_order, t.peel_first_k != 0,
-                                             t.specialize_shape != 0, t.unroll_k != 0, t.narrow_n_tail);
+        case BF16GemmKernelType810E::TSM:
+            bf16_gemm_tsm_810e<Output>(a, b, d, t.bm, t.bn, t.bk, t.wm, t.wn, t.stages, t.splits,
+                                       t.tileOrder, t.peelFirstK != 0,
+                                       t.unrollK != 0, t.narrowNTail);
             return;
-        case Model810eDispatchKind::Hybrid: {
-            const auto& tail = entry.tail_tile;
-            DG_HOST_ASSERT(entry.split_m > 0 && entry.split_m < entry.m);
+        case BF16GemmKernelType810E::Hybrid: {
+            const auto& tail = entry.tailTile;
+            DG_HOST_ASSERT(entry.splitM > 0 && entry.splitM < entry.m);
             DG_HOST_ASSERT(t.splits == 1 && tail.splits == 1);
-            model_810e_bf16_dense_tsm<Output>(a.narrow(0, 0, entry.split_m), b,
-                d.narrow(0, 0, entry.split_m), t.bm, t.bn, t.bk, t.wm, t.wn, t.stages, 1,
-                t.tile_order, t.peel_first_k != 0,
-                t.specialize_shape != 0, t.unroll_k != 0);
-            model_810e_bf16_dense_tsm<Output>(a.narrow(0, entry.split_m, entry.m - entry.split_m), b,
-                d.narrow(0, entry.split_m, entry.m - entry.split_m),
+            bf16_gemm_tsm_810e<Output>(a.narrow(0, 0, entry.splitM), b,
+                d.narrow(0, 0, entry.splitM), t.bm, t.bn, t.bk, t.wm, t.wn, t.stages, 1,
+                t.tileOrder, t.peelFirstK != 0,
+                t.unrollK != 0);
+            bf16_gemm_tsm_810e<Output>(a.narrow(0, entry.splitM, entry.m - entry.splitM), b,
+                d.narrow(0, entry.splitM, entry.m - entry.splitM),
                 tail.bm, tail.bn, tail.bk, tail.wm, tail.wn, tail.stages, 1,
-                tail.tile_order, tail.peel_first_k != 0,
-                tail.specialize_shape != 0, tail.unroll_k != 0);
+                tail.tileOrder, tail.peelFirstK != 0,
+                tail.unrollK != 0);
             return;
         }
-        case Model810eDispatchKind::Standard:
-            // Call the lower-level launcher with an explicit tuple. Calling
-            // the public bf16_gemm_nt entry here would re-enter this dispatcher.
-            bf16_gemm(a, b, d, int(entry.m), int(entry.n), int(entry.k), model_810e_dispatch_config(t));
-            return;
+        case BF16GemmKernelType810E::Standard:
+            DG_HOST_UNREACHABLE("Standard configuration is handled before custom dispatch");
     }
 }
 
-static bool model_810e_dispatch_dense(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
-    if (!model_810e_dispatch_device()) return false;
-    // Tensor kernels can occupy only the 20 TFU-equipped CUs. Keep ordinary
+static bool bf16_gemm_dispatch_810e(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
+    if (!is_810e_device()) return false;
+    // Compare the Tensor budget against the Tensor pool, not general CUs. Keep ordinary
     // low-budget products on the standard persistent launcher. Its vector
     // epilogue cannot cover partial vectors, so those use persistent Direct.
-    const int output_alignment = d.scalar_type() == torch::kFloat ? 4 : 8;
-    const bool per_element_output = b.size(0) % output_alignment != 0 ||
+    const int outputAlignment = d.scalar_type() == torch::kFloat ? 4 : 8;
+    const bool perElementOutput = b.size(0) % outputAlignment != 0 ||
                                    (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) != 0;
-    const bool low_budget = get_num_sms() < kModel810eTensorCUs;
+    const bool lowBudget = get_num_tensor_sms_810e() < get_tensor_cu_count_810e();
     if (a.size(0) <= 2 && gemv_dense_bf16(a, b, d, int(a.size(0)), int(b.size(0)), int(a.size(1))))
         return true;
-    if (low_budget && !per_element_output) return false;
+    if (lowBudget && !perElementOutput) return false;
     // Custom AIU mainloops require complete BK32 tiles and two prologue tiles.
-    const bool supported_inputs = a.size(1) >= 64 && a.size(1) % 32 == 0 &&
+    const bool supportedInputs = a.size(1) >= 64 && a.size(1) % 32 == 0 &&
         (reinterpret_cast<uintptr_t>(a.data_ptr()) & 15) == 0 &&
         (reinterpret_cast<uintptr_t>(b.data_ptr()) & 15) == 0;
-    TORCH_CHECK(!per_element_output || supported_inputs,
+    TORCH_CHECK(!perElementOutput || supportedInputs,
                 "810E partial-vector outputs outside the GEMV path require K>=64, K%32=0 and aligned inputs");
-    if (!supported_inputs || b.size(0) < 2) return false;
-    const auto output = d.scalar_type() == torch::kFloat ? Model810eOutputType::FP32 : Model810eOutputType::BF16;
-    auto plan = get_model_810e_dense_dispatch(a.size(0), b.size(0), a.size(1), output);
-    if (per_element_output && (plan.tile.bm & (plan.tile.bm - 1)) != 0) {
-        // The scalar Direct fallback retains its supported power-of-two tiles.
-        plan.tile.bm = plan.tile.bm < 128 ? 64 : 128;
-        plan.tile.wm = 32;
-    }
-    if (low_budget) {
-        plan.kind = Model810eDispatchKind::Direct;
-        plan.split_m = 0;
-        // One persistent product avoids a separate reduction launch outside
-        // the requested budget. Keep the scalar epilogue for partial vectors.
-        plan.tile.splits = 1;
-    }
-    const auto grid_fits = [&](const Model810eDispatchTile& t, int64_t rows) {
-        if (low_budget) return true;  // A one-dimensional grid of at most sms CTAs.
+    if (!supportedInputs || b.size(0) < 2) return false;
+    const auto output = d.scalar_type() == torch::kFloat ? torch::kFloat : torch::kBFloat16;
+    auto plan = get_adaptive_configs_bf16_810e(a.size(0), b.size(0), a.size(1), output,
+                                               perElementOutput, lowBudget);
+    const auto gridFits = [&](const BF16GemmConfig810E& t, int64_t rows) {
+        if (lowBudget) return true;  // A one-dimensional grid of at most sms CTAs.
         const int64_t mt = ceil_div(rows, int64_t(t.bm)), nt = ceil_div(b.size(0), int64_t(t.bn));
         const auto prop = device_runtime->get_prop();
-        return (t.tile_order == 1 ? mt : nt) <= prop->maxGridSize[0] &&
-               (t.tile_order == 1 ? nt : mt) <= prop->maxGridSize[1] &&
+        return (t.tileOrder == 1 ? mt : nt) <= prop->maxGridSize[0] &&
+               (t.tileOrder == 1 ? nt : mt) <= prop->maxGridSize[1] &&
                t.splits <= prop->maxGridSize[2];
     };
-    if (per_element_output) {
-        // Per-element stores also support unaligned output storage. Such rows
-        // cannot use an EVT tile or its complete-K padding specialization.
-        if (plan.kind == Model810eDispatchKind::Standard) plan.kind = Model810eDispatchKind::Direct;
-        if (a.size(1) % plan.tile.bk != 0) {
-            plan.tile.bk = 32;
-            plan.tile.stages = std::min<int64_t>(3, a.size(1) / 32 / plan.tile.splits);
-        }
-    }
     // The existing persistent launcher also covers outputs whose tile grid
     // exceeds a physical grid dimension.
-    if (plan.kind != Model810eDispatchKind::Standard &&
-        (!grid_fits(plan.tile, plan.split_m ? plan.split_m : a.size(0)) ||
-         (plan.split_m && !grid_fits(plan.tail_tile, a.size(0) - plan.split_m)))) {
-        TORCH_CHECK(b.size(0) >= 8 && b.size(0) % output_alignment == 0 &&
+    if (plan.kind != BF16GemmKernelType810E::Standard &&
+        (!gridFits(plan.tile, plan.splitM ? plan.splitM : a.size(0)) ||
+         (plan.splitM && !gridFits(plan.tailTile, a.size(0) - plan.splitM)))) {
+        TORCH_CHECK(b.size(0) >= 8 && b.size(0) % outputAlignment == 0 &&
                     (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) == 0,
                     "810E unaligned output exceeds the direct kernel grid limits");
         return false;
     }
-    if (output == Model810eOutputType::FP32)
-        model_810e_dispatch_dense_entry<float>(plan, a, b, d);
+    if (output == torch::kFloat)
+        bf16_gemm_impl_810e<float>(plan, a, b, d);
     else
-        model_810e_dispatch_dense_entry<cutlass::bfloat16_t>(plan, a, b, d);
+        bf16_gemm_impl_810e<cutlass::bfloat16_t>(plan, a, b, d);
     return true;
 }
 
 
-// AIU 1.0 couples descriptor width to its leading stride. Read-only views
-// with overlapping rows therefore need K segments; N-contiguous B needs a
-// transposed descriptor and bounded N panels. Other layouts are packed once.
-static bool model_810e_batch_native_input(const torch::Tensor& x) {
-    return x.stride(2) == 1 && x.stride(1) >= x.size(2) &&
-        x.stride(1) <= std::numeric_limits<int>::max() &&
-        x.stride(0) % 8 == 0 && x.stride(1) % 8 == 0 &&
-        (reinterpret_cast<uintptr_t>(x.data_ptr()) & 15) == 0;
+static void bf16_gemm_810e(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                           int m, int n, int k, std::optional<ConfigTuple> configs) {
+    if (n == 1 && !configs.has_value() && gemv_dense_bf16_810e(a, b, d)) return;
+    if (!configs.has_value() && bf16_gemm_dispatch_810e(a, b, d)) return;
+    TORCH_CHECK(is_ppu1v5_device() || n % 2 == 0, "BF16 dense GEMM on PPU1.0 requires even N, got ", n);
+    if (!is_ppu1v5_device()) {
+        TORCH_CHECK(k >= 64 && k % 32 == 0 &&
+                    (reinterpret_cast<uintptr_t>(a.data_ptr()) & 15) == 0 &&
+                    (reinterpret_cast<uintptr_t>(b.data_ptr()) & 15) == 0,
+                    "BF16 tiled GEMM requires K>=64, K%32=0 and 16-byte-aligned inputs");
+        TORCH_CHECK(n % (16 / d.element_size()) == 0 && (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) == 0,
+                    "BF16 tiled GEMM requires vector-aligned output");
+        if (!configs) configs = get_best_configs_810e(m, n, k, get_num_tensor_sms_810e());
+        check_configs_810e(configs, k, d.element_size());
+    }
+    if (d.scalar_type() == torch::kFloat)
+        bf16_gemm_impl<float>(a, b, d, m, n, k, configs);
+    else
+        bf16_gemm_impl<cutlass::bfloat16_t>(a, b, d, m, n, k, configs);
 }
 
-class Model810eBatchPackRuntime final : public LaunchRuntime<Model810eBatchPackRuntime> {
-public:
-    struct Params { const void* input; void* output; int64_t batches, rows, cols, sb, sr, sc; };
-    struct Args { LaunchArgs launch_args; Params params; bool transpose, persistent; };
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
-#define BF16_HGRTC
-#include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
-extern "C" __global__ void model_810e_batch_pack(deep_gemm::Model810eBatchPackParams p) {{
-    deep_gemm::model_810e_batch_pack<{}, {}>(p);
-}}
-)", args.transpose ? "true" : "false", args.persistent ? "true" : "false");
+static void bf16_gemm(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                      const int& m, const int& n, const int& k,
+                      std::optional<ConfigTuple> configs = std::nullopt,
+                      const std::optional<torch::Tensor>& c = std::nullopt) {
+    if (!is_ppu1v5_device()) {
+        configs = get_runtime_configs_bf16_810e(m, n, k, configs);
+        check_configs_810e(configs, k, d.element_size());
+        if (configs)
+            TORCH_CHECK(n % (16 / d.element_size()) == 0 &&
+                        (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) == 0,
+                        "BF16 dense explicit/LUT configs require vector-aligned output");
     }
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
-    }
-};
-
-static torch::Tensor model_810e_pack_batch_input(const torch::Tensor& x, const int sms) {
-    if (model_810e_batch_native_input(x)) return x;
-    // Preserve broadcast storage: one packed panel is shared by every batch.
-    if (x.size(0) > 1 && x.stride(0) == 0)
-        return model_810e_pack_batch_input(x.narrow(0, 0, 1), sms).expand(x.sizes());
-    auto out = torch::empty(x.sizes(), x.options());
-    TORCH_CHECK(sms > 0, "810E batch requires a positive CU budget");
-    // Packing runs on general CUs, not only the 20 Tensor CUs. A reduced
-    // general-CU budget must bound both strided and transpose copies.
-    const bool full_budget = sms >= device_runtime->get_prop()->multiProcessorCount;
-    const bool transpose = x.stride(1) == 1 && (!full_budget ||
-        ceil_div(x.size(2), int64_t(32)) <= device_runtime->get_prop()->maxGridSize[1]);
-    if (!transpose && full_budget) {
-        // ATen already vectorizes K-contiguous copies. Compilation must not
-        // execute this copy, just as it must not execute the following GEMM.
-        if (!is_compile_only()) out.copy_(x);
-        return out;
-    }
-    // A bounded grid needs enough warps in each CTA to hide copy latency.
-    const int threads = full_budget ? 128 : 1024;
-    TORCH_CHECK(threads <= device_runtime->get_prop()->maxThreadsPerBlock,
-                "810E packing exceeds device thread limit");
-    const int64_t blocks = std::min<int64_t>(ceil_div(x.numel(), int64_t(threads)), sms);
-    Model810eBatchPackRuntime::Args args{
-        {transpose && full_budget ? dim3(ceil_div(x.size(1), int64_t(32)), ceil_div(x.size(2), int64_t(32)), x.size(0)) : dim3(blocks), dim3(threads), 0},
-        {x.data_ptr(), out.data_ptr(), x.size(0), x.size(1), x.size(2), x.stride(0), x.stride(1), x.stride(2)}, transpose, !full_budget};
-    model_810e_check_grid(args.launch_args.grid_dim);
-    auto code = Model810eBatchPackRuntime::generate(args);
-    auto runtime = compiler->build("model_810e_batch_pack", code);
-    Model810eBatchPackRuntime::launch(runtime, args);
-    return out;
-}
-
-static bool model_810e_dispatch_strided_batch(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
-    if (std::string(device_runtime->get_prop()->name).find("ZW810E") == std::string::npos) return false;
-    const int m = a.size(1), n = b.size(1), k = a.size(2);
-    // Copies are amortized by larger products. Keep their established NT
-    // schedule; short products benefit from consuming the source view directly.
-    if (m > 8192 || k > 512 || n % 16 != 0 || d.stride(0) % 8 || d.stride(1) % 8 ||
-        (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15)) return false;
-    const auto aligned = [](const torch::Tensor& x) {
-        return x.stride(0) % 8 == 0 && (reinterpret_cast<uintptr_t>(x.data_ptr()) & 15) == 0;
-    };
-    const int stages = std::min(3, k / 32);
-    const bool medium_nn = k >= 128 && k % 64 == 0 &&
-        (m <= 1024 || (a.size(0) <= 8 && m <= 2048));
-    const int base_bm = m <= 32 ? 32 : m > 128 && ceil_div(m, 128) * 128 * 4 <= m * 5 ? 128 : 64;
-    // Reuse the strided B panel across BM256 rows when this does not add M
-    // padding. At least two tensor-CU waves supply parallelism; short K also
-    // needs enough batches to amortize the larger accumulator/epilogue.
-    // Keep very large M on the established packed path.
-    const bool wide_m = m >= 192 && m <= 2048 && n >= 128 && n <= 512 && n % 128 == 0 &&
-        k >= 128 && k % 64 == 0 && (m <= 1024 || k >= 256) && (k >= 256 || a.size(0) >= 16) &&
-        b.stride(2) >= 128 && ceil_div(m, 256) * 256 <= ceil_div(m, base_bm) * base_bm &&
-        a.size(0) * ceil_div(m, 256) * (n / 128) >= 2 * kModel810eTensorCUs;
-    if ((m <= 512 || medium_nn || wide_m) && model_810e_batch_native_input(a) && b.stride(1) == 1 && b.stride(2) >= 16 &&
-        b.stride(2) <= std::numeric_limits<int>::max() &&
-        b.stride(2) % 8 == 0 && aligned(b)) {
-        int bm = wide_m ? 256 : base_bm;
-        int wm = bm == 32 ? 16 : bm == 256 ? 64 : 32;
-        // Each CTA rebases its B descriptor to its N tile. Complete tiles
-        // avoid overreading overlapping columns, with one launch for all N.
-        int bn = 128;
-        while (bn > b.stride(2) || n % bn != 0) bn /= 2;
-        // Narrow panels repeat too much descriptor work at larger M; retain
-        // packing beyond M1024 unless at least 64 output columns are reused.
-        if (m > 1024 && bn < 64) return false;
-        int wn = std::min(bm >= 128 ? 64 : 32, bn);
-        // BK64 halves descriptor/loop work. Extend it into medium M only
-        // when the larger K tile does not add a shared-memory wave; a small
-        // batch near a wave boundary can otherwise lose more than it saves.
-        const Model810eDispatchTile old_tile{bm, bn, 32, wm, wn, stages, 1};
-        const Model810eDispatchTile new_tile{bm, bn, 64, wm, wn, 2, 1};
-        const bool medium_bk64 = m > 128 && m <= 512 && bn >= 64 && k >= 128 && k % 64 == 0 &&
-            model_810e_smem_waves(a.size(0), m, n, new_tile) <=
-            model_810e_smem_waves(a.size(0), m, n, old_tile);
-        const bool use_bk64 = wide_m || m > 512 || medium_bk64;
-        int bk = use_bk64 ? 64 : 32;
-        int num_stages = use_bk64 ? 2 : stages;
-        const auto compact = model_810e_compact_batch_tile(a.size(0), m, n, k,
-            {bm, bn, bk, wm, wn, num_stages, 1});
-        bm = compact.bm; wm = compact.wm; wn = compact.wn;
-        bk = compact.bk; num_stages = compact.stages;
-        model_810e_tsm_launch<cutlass::bfloat16_t, false, true>(a, b, d,
-            bm, bn, bk, wm, wn, num_stages, 1, get_num_sms(), 0, true, m <= 64 && n <= 1024, true);
-        return true;
-    }
-    if (m <= 8192 && a.stride(2) == 1 && b.stride(2) == 1 && a.stride(1) % 8 == 0 && b.stride(1) % 8 == 0 &&
-        a.stride(1) <= std::numeric_limits<int>::max() && b.stride(1) <= std::numeric_limits<int>::max() &&
-        aligned(a) && aligned(b)) {
-        // Preserve the existing power-of-two schedule: longer unrolled BK32
-        // segments can be slower even when they restart the pipeline less.
-        int chunk = 32;
-        while (chunk * 2 <= std::min<int64_t>({k, a.stride(1), b.stride(1)}) &&
-               k % (chunk * 2) == 0) chunk *= 2;
-        if (chunk < 64) {
-            // Avoid packing when a non-power-of-two divisor provides complete
-            // BK tiles. AIU 1.0 cannot independently bound a partial segment's K.
-            chunk = int(std::min<int64_t>({k - 32, a.stride(1), b.stride(1)}) / 32 * 32);
-            while (chunk >= 64 && k % chunk != 0) chunk -= 32;
+    if (c) {
+        // Preserve C until the FP32 product is complete, including C == D.
+        // The only BF16 conversion follows addition; compile-only preserves C/D.
+        auto accum = torch::empty({m, n}, d.options().dtype(torch::kFloat));
+        bf16_gemm(a, b, accum, m, n, k, configs);
+        if (!is_compile_only()) {
+            accum.add_(*c);
+            d.copy_(accum);
         }
-        if (chunk < 64) return false;
-        const int bm = m <= 64 ? 32 : m <= 512 ? 64 : 128;
-        const int bk = chunk >= 128 && chunk % 64 == 0 ? 64 : 32;
-        Model810eDispatchTile tile{bm, 128, bk, bm == 32 ? 16 : 32, bm == 128 ? 64 : 32, 2, 1};
-        if (bk == 64) tile = model_810e_compact_batch_tile(a.size(0), m, n, k, tile);
-        // Two stages leave room for restarting the pipeline at each segment.
-        // Larger M tiles amortize the repeated descriptor/prologue work.
-        model_810e_tsm_launch<cutlass::bfloat16_t, false>(a, b, d,
-            tile.bm, tile.bn, tile.bk, tile.wm, tile.wn, tile.stages,
-            1, get_num_sms(), 0, true, m <= 64 && n <= 1024, true, false, chunk);
-        return true;
+        return;
     }
-    return false;
-}
-
-static bool model_810e_dispatch_batch(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
-    if (!model_810e_dispatch_device()) return false;
-    auto tile = get_model_810e_batch_dispatch(a.size(0), a.size(1), b.size(1), a.size(2));
-    const int64_t k = a.size(2);
-    const bool padded_inputs = a.stride(1) > k && a.stride(1) < 2 * k &&
-                               b.stride(1) > k && b.stride(1) < 2 * k;
-    if (a.size(1) > 64 && a.size(1) <= 512 && b.size(1) >= 128 && k <= 256 && tile.bn == 64 && padded_inputs) {
-        // Padded rows transfer less useful data per descriptor. A wider N tile
-        // amortizes those input loads while retaining the small M tile.
-        tile.bn = 128;
-    }
-    // With 64-byte-aligned padded input rows, a wider N tile amortizes descriptor
-    // traffic for short reductions. BK32 keeps three stages resident; retain
-    // the dynamic loop to avoid the register cost of unrolling this wider tile.
-    // Four such CTAs fit per tensor CU. A partial wave loses the parallelism
-    // gained by the narrower tile, so widen only for complete resident waves.
-    const int64_t wide_tiles = a.size(0) * ceil_div(a.size(1), int64_t(64)) *
-                              ceil_div(b.size(1), int64_t(256));
-    const int64_t wide_wave = 4 * kModel810eTensorCUs;
-    const bool wide_batch = tile.bm == 64 && a.size(1) > 64 && a.size(1) <= 512 && a.size(0) >= 8 &&
-        wide_tiles >= wide_wave && wide_tiles % wide_wave == 0 &&
-        b.size(1) >= 512 && b.size(1) < 1024 && b.size(1) % 256 == 0 && k > 128 && k <= 256 &&
-        padded_inputs && a.stride(1) % 32 == 0 && b.stride(1) % 32 == 0 &&
-        a.stride(0) % 32 == 0 && b.stride(0) % 32 == 0 &&
-        (reinterpret_cast<uintptr_t>(a.data_ptr()) & 63) == 0 &&
-        (reinterpret_cast<uintptr_t>(b.data_ptr()) & 63) == 0;
-    if (wide_batch) tile = {64, 256, 32, 32, 64, 3, 1};
-    const bool vector_output = b.size(1) % 8 == 0 && d.stride(0) % 8 == 0 && d.stride(1) % 8 == 0 &&
-        (reinterpret_cast<uintptr_t>(d.data_ptr()) & 15) == 0;
-    const auto compact = vector_output ?
-        model_810e_compact_batch_tile(a.size(0), a.size(1), b.size(1), k, tile) : tile;
-    const bool compact_rows = compact.bm != tile.bm;
-    tile = compact;
-    const bool specialize = a.size(1) <= 64 && b.size(1) <= 1024 && a.size(2) <= 512;
-    // Medium batches retain runtime M/N so all such shapes share K variants.
-    // Keep larger matrices on the dynamic loop to preserve register occupancy.
-    const bool unroll = !wide_batch && (compact_rows || specialize || (a.size(1) <= 512 && b.size(1) <= 1024 && a.size(2) <= 256));
-    model_810e_bf16_strided_batched_tsm(a, b, d, model_810e_dispatch_config(tile),
-                                      0, unroll || wide_batch, specialize, unroll);
-    return true;
+    if (!is_ppu1v5_device())
+        bf16_gemm_810e(a, b, d, m, n, k, configs);
+    else if (d.scalar_type() == torch::kFloat)
+        bf16_gemm_impl<float>(a, b, d, m, n, k, configs);
+    else
+        bf16_gemm_impl<cutlass::bfloat16_t>(a, b, d, m, n, k, configs);
 }
 
 } // namespace deep_gemm

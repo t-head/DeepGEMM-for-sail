@@ -62,6 +62,7 @@ struct Mainloop {
   // Total k_steps in the CTA tile (kept for reference / smem sizing).
   static constexpr int kKSteps = BLOCK_K / kMmaK;
 
+
   // Swizzle-tile width along K (cutlass DefaultGemm_AIU_Operand: AiuContByteSize
   // capped at 128B). BLOCK_K wider than one swizzle tile is stored as
   // kInstNum = BLOCK_K/kSwzlW sub-tiles; the G2S/S2R atoms handle the split, the
@@ -73,6 +74,9 @@ struct Mainloop {
   static_assert(STAGES >= 2, "STAGES must be >= 2 for the async pipeline");
   static_assert(BLOCK_K % WARP_K == 0, "BLOCK_K must be a multiple of WARP_K");
   static_assert(WARP_K % kMmaK == 0, "WARP_K must be a multiple of kMmaK");
+  // A warp group's K slice must start on a swizzle sub-tile boundary, otherwise
+  // its base address would straddle two sub-tiles and the tsm addressing breaks.
+  static_assert(WARP_K % kSwzlW == 0, "WARP_K must be a multiple of the swizzle-tile width");
   // The G2S issue / wait are placed at kKStepsPerWarp-2, so each warp group needs
   // at least two k_steps of its own for the pipeline to interleave.
   static_assert(kKStepsPerWarp >= 2, "WARP_K / kMmaK must be >= 2 for G2S interleaving");
@@ -86,8 +90,13 @@ struct Mainloop {
                 "WARP_K / kMmaK must be EVEN: both the k_pair and the k_step unroll "
                 "rely on steps pairing up (see kUseKPairUnroll)");
 
-  // A K slice can start within a swizzle sub-tile (e.g. BK64 / WarpOnK2).
-  // Preserve both the cube and channel offset instead of truncating WARP_K/64.
+  // K offset (in 16B tsm units) that moves a base address by one warp-K slice.
+  // WARP_K/kSwzlW whole sub-tiles; A and B differ because the sub-tile stride
+  // scales with the tile height (BLOCK_M for A, BLOCK_N for B).
+  static constexpr int kWarpKSubTiles  = WARP_K / kSwzlW;
+  static constexpr int kWarpKOffsetA   = kWarpKSubTiles * S2RAtomA::kSubTileStride16B;
+  static constexpr int kWarpKOffsetB   = kWarpKSubTiles * S2RAtomB::kSubTileStride16B;
+
 
   // A/B-side parameters only (decoupled from the kernel's full Params).
   struct Params {
@@ -120,8 +129,8 @@ struct Mainloop {
   /// inside the tile.
   template <int SrcKStep>
   static __device__ __forceinline__ void issue_s2r_pair(
-      typename S2RAtomA::Address const (&tsm_add_base_a)[kMmasPerWarpM],
-      typename S2RAtomB::Address const (&tsm_add_base_b)[kMmasPerWarpN],
+      int const (&tsm_add_base_a)[kMmasPerWarpM],
+      int const (&tsm_add_base_b)[kMmasPerWarpN],
       uint32_t (&a_dst)[kMmasPerWarpM][4],
       uint32_t (&b_dst)[kMmasPerWarpN][4]) {
     #pragma unroll
@@ -182,8 +191,8 @@ struct Mainloop {
       int next_stage,
       int warp_coord_a,
       int warp_coord_b,
-      typename S2RAtomA::Address const (&tsm_add_base_a)[kMmasPerWarpM],
-      typename S2RAtomB::Address const (&tsm_add_base_b)[kMmasPerWarpN],
+      int const (&tsm_add_base_a)[kMmasPerWarpM],
+      int const (&tsm_add_base_b)[kMmasPerWarpN],
       uint32_t (&a_next)[kMmasPerWarpM][4],
       uint32_t (&b_next)[kMmasPerWarpN][4]) {
     static constexpr int kCoordScale = kSwzlW * (int)sizeof(Element) / 16;
@@ -198,13 +207,15 @@ struct Mainloop {
       Element const* next_stage_b =
           reinterpret_cast<Element const*>(smem)
           + STAGES * BLOCK_M * BLOCK_K + next_stage * BLOCK_N * BLOCK_K;
+      const int next_base_a = arch::smem_ptr_to_tsm_base(next_stage_a, warp_coord_a);
+      const int next_base_b = arch::smem_ptr_to_tsm_base(next_stage_b, warp_coord_b);
       #pragma unroll
       for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
-        S2RAtomA::load(S2RAtomA::make_base(next_stage_a, warp_coord_a + mma_m * kMmaM * kCoordScale), 0, a_next[mma_m]);
+        S2RAtomA::load(next_base_a + mma_m * kMmaM * kCoordScale, 0, a_next[mma_m]);
       }
       #pragma unroll
       for (int mma_n = 0; mma_n < kMmasPerWarpN; ++mma_n) {
-        S2RAtomB::load(S2RAtomB::make_base(next_stage_b, warp_coord_b + mma_n * kMmaN * kCoordScale), 0, b_next[mma_n]);
+        S2RAtomB::load(next_base_b + mma_n * kMmaN * kCoordScale, 0, b_next[mma_n]);
       }
     }
   }
@@ -232,8 +243,8 @@ struct Mainloop {
       int next_stage,
       int warp_coord_a,
       int warp_coord_b,
-      typename S2RAtomA::Address const (&tsm_add_base_a)[kMmasPerWarpM],
-      typename S2RAtomB::Address const (&tsm_add_base_b)[kMmasPerWarpN],
+      int const (&tsm_add_base_a)[kMmasPerWarpM],
+      int const (&tsm_add_base_b)[kMmasPerWarpN],
       float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
       uint32_t (&a_buf0)[kMmasPerWarpM][4],
       uint32_t (&b_buf0)[kMmasPerWarpN][4],
@@ -282,8 +293,8 @@ struct Mainloop {
       int next_stage,
       int warp_coord_a,
       int warp_coord_b,
-      typename S2RAtomA::Address const (&tsm_add_base_a)[kMmasPerWarpM],
-      typename S2RAtomB::Address const (&tsm_add_base_b)[kMmasPerWarpN],
+      int const (&tsm_add_base_a)[kMmasPerWarpM],
+      int const (&tsm_add_base_b)[kMmasPerWarpN],
       float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
       uint32_t (&a_buf0)[kMmasPerWarpM][4],
       uint32_t (&b_buf0)[kMmasPerWarpN][4],
@@ -315,8 +326,8 @@ struct Mainloop {
       int next_stage,
       int warp_coord_a,
       int warp_coord_b,
-      typename S2RAtomA::Address const (&tsm_add_base_a)[kMmasPerWarpM],
-      typename S2RAtomB::Address const (&tsm_add_base_b)[kMmasPerWarpN],
+      int const (&tsm_add_base_a)[kMmasPerWarpM],
+      int const (&tsm_add_base_b)[kMmasPerWarpN],
       float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
       uint32_t (&a_curr)[kMmasPerWarpM][4],
       uint32_t (&b_curr)[kMmasPerWarpN][4],
@@ -350,8 +361,8 @@ struct Mainloop {
       int next_stage,
       int warp_coord_a,
       int warp_coord_b,
-      typename S2RAtomA::Address const (&tsm_add_base_a)[kMmasPerWarpM],
-      typename S2RAtomB::Address const (&tsm_add_base_b)[kMmasPerWarpN],
+      int const (&tsm_add_base_a)[kMmasPerWarpM],
+      int const (&tsm_add_base_b)[kMmasPerWarpN],
       float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
       uint32_t (&a_buf0)[kMmasPerWarpM][4],
       uint32_t (&b_buf0)[kMmasPerWarpN][4],
@@ -415,22 +426,21 @@ struct Mainloop {
     static constexpr int kCoordScale = kSwzlW * (int)sizeof(Element) / 16;
 
     // Split the S2R base into a runtime part and a compile-time part.
-    const int warp_k_cube = (warp_k * WARP_K) / kSwzlW;
-    const int warp_k_channel = (warp_k * WARP_K) % kSwzlW * kElemBytes / 16;
-    const int warp_coord_a = warp_row * WARP_M * kCoordScale +
-        warp_k_cube * S2RAtomA::kSubTileStride16B + warp_k_channel;
-    const int warp_coord_b = warp_col * WARP_N * kCoordScale +
-        warp_k_cube * S2RAtomB::kSubTileStride16B + warp_k_channel;
+    const int warp_coord_a = warp_row * WARP_M * kCoordScale + warp_k * kWarpKOffsetA;
+    const int warp_coord_b = warp_col * WARP_N * kCoordScale + warp_k * kWarpKOffsetB;
 
-    typename S2RAtomA::Address tsm_add_base_a[kMmasPerWarpM];
+    const int warp_base_a = arch::smem_ptr_to_tsm_base(stage_a, warp_coord_a);
+    const int warp_base_b = arch::smem_ptr_to_tsm_base(stage_b, warp_coord_b);
+
+    int tsm_add_base_a[kMmasPerWarpM];
     #pragma unroll
     for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
-      tsm_add_base_a[mma_m] = S2RAtomA::make_base(stage_a, warp_coord_a + mma_m * kMmaM * kCoordScale);
+      tsm_add_base_a[mma_m] = warp_base_a + mma_m * kMmaM * kCoordScale;
     }
-    typename S2RAtomB::Address tsm_add_base_b[kMmasPerWarpN];
+    int tsm_add_base_b[kMmasPerWarpN];
     #pragma unroll
     for (int mma_n = 0; mma_n < kMmasPerWarpN; ++mma_n) {
-      tsm_add_base_b[mma_n] = S2RAtomB::make_base(stage_b, warp_coord_b + mma_n * kMmaN * kCoordScale);
+      tsm_add_base_b[mma_n] = warp_base_b + mma_n * kMmaN * kCoordScale;
     }
 
     if (!skip_preload) {

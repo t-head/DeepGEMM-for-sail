@@ -30,7 +30,6 @@ namespace mma {
 // separated by kHalfMmaM and two column halves separated by kHalfMmaN.
 // -----------------------------------------------------------------------------
 struct Tc02Mma16x16x16CLayout {
-  static constexpr bool kTc01 = false;
   static constexpr int kMmaM = 16;
   static constexpr int kMmaN = 16;
   static constexpr int kMmaK = 16;
@@ -42,23 +41,12 @@ struct Tc02Mma16x16x16CLayout {
   static constexpr int kHalfMmaN      = kMmaN / 2;  // col half-tile offset (8)
 };
 
-// PPU0010_16x16_Row: lane=(column%4)+4*(row%8),
-// register=(column/4)+4*(row/8). Columns within one lane are four apart.
-struct Tc01Mma16x16x16CLayout : Tc02Mma16x16x16CLayout {
-  static constexpr bool kTc01 = true;
-  static constexpr int kColsPerThread = 1;
-};
-
 /// 16x16x16 bf16 MMA (PPU 1.0 tc01 / PPU 1.5 tc02).
 /// 32 threads cooperate on one MMA; per thread:
 ///   A = 4 x uint32 (packed bf16 pairs), B = 4 x uint32, C/D = 8 x float.
 struct Bf16MmaAtom {
   // Accumulator layout is shared with any element type using this instruction.
-#if __HGGC_ARCH__ == 100
-  using CLayout = Tc01Mma16x16x16CLayout;
-#else
   using CLayout = Tc02Mma16x16x16CLayout;
-#endif
 
   // Re-export shape/layout constants from the CLayout for caller convenience.
   static constexpr int kMmaM = CLayout::kMmaM;

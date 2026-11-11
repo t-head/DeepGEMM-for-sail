@@ -19,6 +19,7 @@ namespace deep_gemm {
 class DeviceRuntime {
     int num_sms = 0, tc_util = 0;
     bool enable_pdl = false;
+    bool numSmsExplicit = false;
     std::shared_ptr<hggcDeviceProp> cached_prop;
 
     // acBLASLt utils
@@ -98,6 +99,7 @@ public:
     void set_num_sms(const int& new_num_sms) {
         DG_HOST_ASSERT(0 <= new_num_sms and new_num_sms <= get_prop()->multiProcessorCount);
         num_sms = new_num_sms;
+        numSmsExplicit = new_num_sms != 0;
     }
 
     int get_num_sms() {
@@ -114,6 +116,12 @@ public:
             }
         }
         return num_sms;
+    }
+
+    // The legacy default is a Tensor-CU budget on 810E/610E. SIMT kernels
+    // can use all general CUs unless the caller explicitly sets a limit.
+    int get_num_simt_sms() {
+        return numSmsExplicit ? get_num_sms() : get_prop()->multiProcessorCount;
     }
 
     int get_l2_cache_size() {
