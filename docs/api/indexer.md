@@ -132,11 +132,133 @@ compatibility fallback or automatic shape inference. Pass the same current
 SM count to metadata generation and execution.
 
 New paged weighted MXFP4 requires `indices`; legacy FP8 and INT8 reject non-None
-indices. Each query has its own context-length and block-table row. The current
-PPU scheduler visits expanded rows independently, including rows belonging to
-the same request; it does not pair query rows for cross-row KV reuse. Thus IDs
-are checked but do not index a request-level block table. A repeated request ID
-still requires an expanded per-query block table. Request IDs do not enable cross-query KV reuse in this implementation.
+indices. Each query still has its own context-length and block-table row.
+Pass the same request grouping to metadata generation and computation, as
+shown below. Metadata is opaque; do not construct or modify its internal format.
+
+### Request indices and MTP / ragged integration
+
+`indices` is a contiguous GPU int32 tensor of shape `[Q]`, on the same device
+as `context_lens`. **`indices[i]` identifies the real request that owns query
+row `i`.** It is not the query-row number, KV page number, selected Top-K
+index, context length, or number of draft tokens. IDs may be local request
+numbers or stable request-pool IDs; distinct requests in a call must have
+distinct IDs. An ID is a grouping label, not an index into `block_table`.
+
+Use real request ownership even when a backend schedules query rows
+independently. Keeping the same request-major representation lets a backend
+adopt request-aware scheduling without requiring callers to change their IDs
+or tensor layouts.
+
+**Current PPU behavior:** metadata generation and compute validate the indices
+tensor's layout, but scheduling still visits each expanded query independently.
+The current backend does not use ID values to group work or enable cross-query
+KV reuse. The integration conventions below are valid with this implementation.
+
+Flatten query tokens in request order, keeping each request's rows consecutive.
+Apply the same row order to packed Q, Q scales, weights, context lengths, block
+tables and indices. The public weighted API always uses `next_n=1`, even for
+MTP: Q is `(int8[Q,1,H,64], int32[Q,1,H])`, weights are BF16 `[Q,H]`, and
+context lengths are int32 `[Q,1]`. Do not put the MTP count in Q's second
+dimension or in `metadata_extra[0]`.
+
+Consecutive equal IDs describe a request run. Separate requests must never
+be combined just because their context lengths match. Nonconsecutive
+occurrences of the same ID form separate runs;
+the backend does not sort rows. For request-major integration, expand each
+request's KV page mapping to all of its query rows. Keep the largest context
+in the run's last query, while retaining every query's actual length; earlier
+lengths may differ and need not be monotonic. This ordering prepares inputs
+for request-aware backends; the current per-query PPU scheduler uses each
+row's own length. Each output row is limited by that query's context length.
+The block table remains **per query**, `[Q,max_pages]`, even with repeated IDs.
+
+The following examples assume `request_block_table` contains one row per real
+request and `device` is the Q/context device. Q, scales, weights and per-token
+context lengths must already follow the indicated flattened order.
+
+**No MTP: one query per request.** Here `Q=B`, so an arange is a valid real
+request grouping:
+
+```python
+B = request_block_table.shape[0]
+indices = torch.arange(B, device=device, dtype=torch.int32)
+block_table = request_block_table  # [B, max_pages]
+# Three requests: indices = [0, 1, 2].
+```
+
+If the caller already has unique request-pool IDs, use those IDs instead of
+arange. Arange is appropriate here because each real request has exactly one
+query, not merely because the public interface has `next_n=1`.
+
+**Fixed MTP: N queries per request.** For request-major flattened rows,
+`Q=B*N`; repeat each real request ID N times:
+
+```python
+B = request_block_table.shape[0]
+request_ids = torch.arange(B, device=device, dtype=torch.int32)
+indices = torch.repeat_interleave(request_ids, repeats=N).contiguous()
+block_table = torch.repeat_interleave(request_block_table, repeats=N, dim=0)
+# B=2, N=3: indices = [0, 0, 0, 1, 1, 1].
+```
+
+Flatten Q/scales/weights from `[B,N,...]` to query rows, retaining the singleton
+`next_n` dimension for Q/scales. Supply each token's actual context length;
+do not replace those lengths by a single request maximum. All context lengths
+must use the KV cache's position units, including any sequence compression.
+
+**Ragged verify: a different verify_lens for each request.** Set
+`Q=sum(verify_lens)` and repeat each request ID by its actual verify count.
+Do not use a fixed maximum draft count or reset every query to an independent
+request:
+
+```python
+# Host-known lengths from the batch plan; query rows are request-major.
+verify_lens_cpu = [3, 1, 2]
+B = len(verify_lens_cpu)
+Q = sum(verify_lens_cpu)
+request_ids = torch.arange(B, device=device, dtype=torch.int32)
+verify_lens = torch.tensor(verify_lens_cpu, device=device, dtype=torch.int32)
+indices = torch.repeat_interleave(
+    request_ids, verify_lens, output_size=Q,
+).contiguous()
+block_table = torch.repeat_interleave(
+    request_block_table, verify_lens, dim=0, output_size=Q,
+)
+# indices = [0, 0, 0, 1, 2, 2], NOT [0, 1, 2, 3, 4, 5].
+```
+
+The same formula handles uniform verify counts and ordinary decode counts of
+one. A request with zero queries contributes no rows; skip the compute call
+when the entire batch has `Q=0`. If a framework uses a fixed-size Graph buffer,
+keep real rows correctly grouped; padding rows must have zero context and
+separate dummy request IDs, with valid allocated Q/scale/weight/table rows.
+Do not label padding as an unrelated real request.
+
+**Common metadata and compute calls for all three scenarios:**
+
+```python
+metadata_extra = (1, num_heads, 128, torch.int8)  # M890 MXFP4, logical D128
+schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+    context_lens, page_kv, deep_gemm.get_num_sms(),
+    indices=indices, metadata_extra=metadata_extra,
+)
+logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+    (q_packed, q_scales), kv_cache, weights,
+    context_lens, block_table, schedule_meta, max_context_len,
+    indices=indices,
+)
+```
+
+Always pass the same current request IDs to both calls, including on backends
+that currently ignore ID values for scheduling. As a portable integration
+rule, regenerate metadata when contexts or grouping change. For CUDA Graph
+replay with mutable inputs, capture metadata generation before compute so
+replay rebuilds the schedule from the current GPU tensors. On the current
+PPU backend, context changes affect scheduling and ID changes do not. Derive
+`Q`/`output_size` from host-known batch planning information when available;
+avoid GPU `.item()` reads in the hot path. Mask invalid logits using each
+query's own context length before Top-K.
 
 ## Sparse indexer
 
