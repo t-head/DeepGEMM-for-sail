@@ -1162,8 +1162,6 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
                 2>&1 | tee {}".format("ncu" if dev == "gpu" else "acu",
                                       profile_filter,
                                       output_name, script, perf_case_arg + (' --disable_acc' if profile_dense else ''), log_file)
-            ret = run_cmd(cmd)
-            continue
         else:
             if mode == "show_log":
                 os.environ["show_log"] = "1"
@@ -1184,17 +1182,23 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
                 --page=details python {} --format {} {} \
                 2>&1 | tee {}'.format("ncu" if dev == "gpu" else "acu", profile_filter, metrics_string, script, perf_case_arg, _acc, log_file)
 
-        ret = run_cmd(cmd)
+        # A successful tee must not hide a failed profiler or profiled process.
+        ret = run_cmd('bash -o pipefail -c ' + shlex.quote(cmd))
+        if ret is None or ret.returncode != 0:
+            detail = 'Profiling command failed' if ret is None else f'Profiling command failed (exit {ret.returncode})'
+            record([f"'{case.replace(',', '_')}_{dtype}'", 'N/A', 'N/A', 'N/A', 'N/A',
+                    dtype, 'Fail', cmd, detail])
+            continue
+        if mode == 'full':
+            continue
         result = "Fail"
         cycle, tc, detail, hbm, time = 0, 0, "", 0, 0
         other_metrics = {}
-        if mode != "full" and ret != None:
-            if ret.returncode == 0:
-                cycle, tc, detail, hbm, time = read_cycle_from_nculog(
-                    log_file, include_nvfp4_decode=dtype == 'w4a8_nvfp4', include_all_kernels=profile_dense)
-                if mode == "show_log":
-                    other_metrics = read_detail_from_nculog(log_file)
-                    print(other_metrics)
+        cycle, tc, detail, hbm, time = read_cycle_from_nculog(
+            log_file, include_nvfp4_decode=dtype == 'w4a8_nvfp4', include_all_kernels=profile_dense)
+        if mode == "show_log":
+            other_metrics = read_detail_from_nculog(log_file)
+            print(other_metrics)
 
         if _acc_check:
             # check accuracy
