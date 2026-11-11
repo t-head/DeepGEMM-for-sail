@@ -754,7 +754,8 @@ struct CollectiveMma<
     class FrgTensorD,
     class FrgTensorC,
     class KTileIterator,
-    class ResidueMNK
+    class ResidueMNK,
+    class PrefetchC = decltype(nullptr)
   >
   CUTLASS_DEVICE void
   operator() (
@@ -765,7 +766,8 @@ struct CollectiveMma<
       ResidueMNK residue_mnk,
       int thread_idx,
       int warp_idx,
-      char *smem_buf) {
+      char *smem_buf,
+      PrefetchC prefetch_c = nullptr) {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorD>::value, "D tensor must be rmem resident.");
@@ -800,14 +802,19 @@ struct CollectiveMma<
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
-    // Start async loads for all pipes but the last
+    constexpr bool stage_c = !std::is_same_v<PrefetchC, decltype(nullptr)>;
+    // Commit one group per ring position, including slots unused by short K.
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
-      copy_aiu(
-        gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
-        gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
-        warp_idx
-      );
+      if (!stage_c || k_tile_count > 0) {
+        copy_aiu(
+          gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
+          gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
+          warp_idx
+        );
+      } else if constexpr (stage_c) {
+        prefetch_c(k_pipe);
+      }
       cp_async_fence();
       --k_tile_count;
       ++k_tile_iter;
@@ -879,15 +886,19 @@ struct CollectiveMma<
 
     // Keep one BK iteration implementation for normal, peeled and static-K
     // schedules. Peeling exposes the zero accumulator to the first MMA.
-    auto process_k_tile = [&]() {
+    auto process_k_tile = [&](auto final_c, auto steady_ab) {
+      const int live_stage = smem_pipe_read;
       // Pipeline the outer products with a static for loop.
       //
       // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
       for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
         if (k_block == K_BLOCK_MAX - 1) {
-          // Slice the smem_pipe_read smem
-          tCsA_p = tCsA(_,_,_,smem_pipe_read);
-          tCsB_p = tCsB(_,_,_,smem_pipe_read);
+          // On the last tile the next-stage register preload is unused. Keep
+          // that read on the live A/B stage while the retired slots receive C.
+          int next_stage = smem_pipe_read;
+          if constexpr (decltype(final_c)::value) next_stage = live_stage;
+          tCsA_p = tCsA(_,_,_,next_stage);
+          tCsB_p = tCsB(_,_,_,next_stage);
         }
 
         // Load A, B shmem->regs for k_block+1
@@ -914,17 +925,23 @@ struct CollectiveMma<
         // Copy gmem to smem after computing gemm on each k-pipe
         if (k_block == K_BLOCK_MAX - 2) {
 
-          // Commit the smem for smem_pipe_read
-          cp_async_wait<DispatchPolicy::Stages-2>();
+          // The final C tile already has its A/B operands. A wait here would
+          // stall its remaining MMA on C, which is only consumed by the epilogue.
+          if constexpr (!decltype(final_c)::value) {
+            cp_async_wait<DispatchPolicy::Stages-2>();
+            __syncthreads();
+          }
 
-          __syncthreads();
-
-          if (k_tile_count > 0) {
+          if (decltype(steady_ab)::value || k_tile_count > 0) {
             copy_aiu(
               gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
               gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
               warp_idx
             );
+          } else if constexpr (stage_c) {
+            // All warps have read this slot for the last time. Use its empty
+            // refill group for C; the next A/B slot is already ready to read.
+            if constexpr (!decltype(final_c)::value) prefetch_c(smem_pipe_write);
           }
           cp_async_fence();
 
@@ -942,14 +959,24 @@ struct CollectiveMma<
       static_assert(PeelFirstK && std::is_same_v<ArchTag, cutlass::arch::PPU0010>);
       CUTE_STATIC_ASSERT_V(size<2>(TileShape{}) == Int<64>{});
       static_assert(DispatchPolicy::Stages == 2 || DispatchPolicy::Stages == 3);
-      for_each(make_int_sequence<4>{}, [&](auto) { process_k_tile(); });
+      static_assert(!stage_c);  // C staging uses the PPU0015 collective.
+      for_each(make_int_sequence<4>{}, [&](auto) { process_k_tile(std::false_type{}, std::false_type{}); });
     } else {
+      constexpr int normal_end = int(stage_c) - DispatchPolicy::Stages;
       if constexpr (PeelFirstK) {
         CUTE_STATIC_ASSERT_V(K_BLOCK_MAX > Int<1>{});
-        if (k_tile_count > -(DispatchPolicy::Stages)) process_k_tile();
+        if (k_tile_count > normal_end) process_k_tile(std::false_type{}, std::false_type{});
+      }
+      if constexpr (stage_c && DispatchPolicy::Stages > 2) {
+        // Keep C addresses and the drain decisions out of the steady-state refill.
+        CUTLASS_PRAGMA_NO_UNROLL
+        while (k_tile_count > 0) process_k_tile(std::false_type{}, std::true_type{});
       }
       CUTLASS_PRAGMA_NO_UNROLL
-      while (k_tile_count > -(DispatchPolicy::Stages)) process_k_tile();
+      while (k_tile_count > normal_end) process_k_tile(std::false_type{}, std::false_type{});
+      if constexpr (stage_c) {
+        if (k_tile_count > -DispatchPolicy::Stages) process_k_tile(std::true_type{}, std::false_type{});
+      }
     }
 
     // TODO: original cutlass3 miss this sync
@@ -966,6 +993,20 @@ struct CollectiveMma<
 
 
 namespace cutlass::gemm::kernel {
+// The grouped C epilogues expose CStage: void for a direct read, or a
+// policy that prefetches C as A/B slots retire.
+template <class Epilogue, class = void>
+struct GroupedCPolicy {
+  static constexpr bool with_c = false;
+  using Stage = void;
+};
+
+template <class Epilogue>
+struct GroupedCPolicy<Epilogue, std::void_t<typename Epilogue::CStage>> {
+  static constexpr bool with_c = true;
+  using Stage = typename Epilogue::CStage;
+};
+
 
 using deep_gemm::GemmType;
 
@@ -1039,6 +1080,9 @@ public:
       EpilogueSharedStorage epilogue;
     } tensors;
   };
+  using CPolicy = GroupedCPolicy<CollectiveEpilogue>;
+  using CStage = typename CPolicy::Stage;
+  static constexpr bool kStageC = !std::is_void_v<CStage>;
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
   // Device side arguments
@@ -1186,6 +1230,10 @@ public:
     int thread_idx = int(threadIdx.x);
     auto blk_shape = TileShape{}; // (BLK_M,BLK_N,BLK_K)
     TileScheduler deep_scheduler(params.scheduler);
+    if constexpr (CPolicy::with_c && TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
+      // Contiguous C and D have physical row coordinates and no batch offset.
+      deep_scheduler.curr_group_idx = 0;
+    }
 
     uint32_t m_coord, n_coord;
     uint32_t l_coord = 0;
@@ -1201,6 +1249,10 @@ public:
       auto expert_id = deep_scheduler.problem_index();
       auto offset_a = deep_scheduler.curr_offset_a();
       auto offset_b = deep_scheduler.curr_offset_b(m_coord);
+      if constexpr (CPolicy::with_c && TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
+        // Skip padded tiles without an assigned expert before forming the B address.
+        if (uint64_t(offset_b) >= uint64_t(TileScheduler::kNumGroups) * N * K) continue;
+      }
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
 
@@ -1232,17 +1284,18 @@ public:
       auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
       int  k_tile_count = size<2>(gA);
 
-      // Perform the collective scoped MMA
-      collective_mma(
-        accumulators,
-        load_inputs,
-        accumulators,
-        k_tile_iter, k_tile_count,
-        residue_mnk,
-        thread_idx,
-        warp_idx,
-        smem_buf
-      );
+      if constexpr (kStageC) {
+        const auto* group_c = params.epilogue.ptr_C + deep_scheduler.curr_offset_c();
+        collective_mma(accumulators, load_inputs, accumulators, k_tile_iter, k_tile_count,
+                       residue_mnk, thread_idx, warp_idx, smem_buf, [&](int slot) {
+                         CStage::prefetch(smem_buf, group_c,
+                                          m_coord * TileScheduler::BLOCK_M,
+                                          n_coord * TileScheduler::BLOCK_N, M, N, slot);
+                       });
+      } else {
+        collective_mma(accumulators, load_inputs, accumulators, k_tile_iter, k_tile_count,
+                       residue_mnk, thread_idx, warp_idx, smem_buf);
+      }
 
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
@@ -1260,6 +1313,10 @@ public:
         thread_idx,
         (char*)&shared_storage.tensors.epilogue
       );
+      if constexpr (kStageC) {
+        // No warp may overwrite C with the next output tile's A/B before its peers finish reading.
+        __syncthreads();
+      }
       // if (thread0()) {
       //   printf("accumulators[0] = %.4f\n", accumulators[0]);
       // }

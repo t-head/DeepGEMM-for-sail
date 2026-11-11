@@ -8,6 +8,10 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **M890 M-grouped BF16 NT GEMM**: supports optional BF16 C accumulation,
+  including in-place `c=d`, and compact expert end offsets through
+  `use_psum_layout=True`, including empty experts.
+
 - **M890 NVFP4 W4A8 GEMMs**: adds `gemm_fp8_nvfp4_bf16_nt` and grouped
   nopad, masked and fused-routing variants for FP8 activations and NVFP4
   weights with BF16 output. Callers select fused decoding or per-call

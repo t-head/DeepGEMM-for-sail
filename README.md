@@ -140,6 +140,14 @@ Unlike traditional grouped GEMMs in ACTLIZE, DeepGEMM groups only the M-axis, wh
 
 For training forward passes or inference prefilling, where each expert may process a varying number of tokens, we concatenate these tokens into a single tensor, referred to as the "contiguous" layout. Note that each expert segment must be aligned to the GEMM M block size (`get_m_alignment_for_contiguous_layout()`).
 
+On M890P, `m_grouped_bf16_gemm_nt_contiguous` accepts optional BF16 `c`,
+including in-place `c=d`, with FP32 accumulation before BF16 output.
+With `use_psum_layout=True`, `m_indices` contains device int32 exclusive
+expert end offsets. Ends must be nonnegative and nondecreasing, with the last
+equal to the total row count; repeated ends represent empty experts.
+N and K must be divisible by 8. For automatic tile selection with `c` in
+the padded row-ID layout, align each expert's physical row span to 256 rows.
+
 For more information, please refer to the `m_grouped_gemm_fp8_fp8_bf16_nt_contiguous` function documentation.
 
 #### Grouped GEMMs (nopad layout)

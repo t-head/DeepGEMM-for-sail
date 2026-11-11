@@ -51,7 +51,7 @@ using TileSchedulerParams = TileSchedulerArguments;
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
-template <GemmType kGemmType,
+template <GemmType kLayout,
           uint32_t SHAPE_N_, uint32_t SHAPE_K_,
           uint32_t BLOCK_M_, uint32_t BLOCK_N_,
           uint32_t kNumGroups_,
@@ -60,6 +60,9 @@ template <GemmType kGemmType,
           EpilogueType kEpilogueType = EpilogueType::Default,
           bool kInterleaveM = false>
 struct DeepGemmScheduler {
+    // Compact prefix ends use the NoPad scheduler's group-local coordinates.
+    static constexpr bool kUsesGroupEnds = kLayout == GemmType::MGroupedContiguousWithPsumLayout;
+    static constexpr GemmType kGemmType = kUsesGroupEnds ? GemmType::MGroupedNoPad : kLayout;
     constexpr static uint32_t SHAPE_N = SHAPE_N_;
     constexpr static uint32_t SHAPE_K = SHAPE_K_;
     constexpr static uint32_t BLOCK_M = BLOCK_M_;
@@ -71,7 +74,8 @@ struct DeepGemmScheduler {
     constexpr static GemmType GEMM_TYPE = kGemmType;
     constexpr static bool kIsTMAMulticastOnA = false;
 #ifdef EnableGroupNoPadOpt
-    constexpr static bool kIsNoPadPreprocessLayout = (kGemmType == GemmType::MGroupedNoPad||kGemmType == GemmType::MGroupedFused) && kNumGroups >= 128;
+    constexpr static bool kIsNoPadPreprocessLayout = !kUsesGroupEnds &&
+        (kGemmType == GemmType::MGroupedNoPad || kGemmType == GemmType::MGroupedFused) && kNumGroups >= 128;
 #else
     constexpr static bool kIsNoPadPreprocessLayout = false;
 #endif
@@ -150,6 +154,12 @@ struct DeepGemmScheduler {
         }
     }
 
+    CUTLASS_DEVICE uint32_t get_group_rows() const {
+        const uint32_t entry = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
+        if constexpr (kUsesGroupEnds) return entry - curr_cumsum_m;
+        return entry;
+    }
+
     CUTLASS_DEVICE bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
         const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
         if constexpr(kIsNoPadPreprocessLayout) {
@@ -180,7 +190,7 @@ struct DeepGemmScheduler {
                     return false;
                 }
                 // Within the current group
-                curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
+                curr_group_m = get_group_rows();
                 num_m_blocks = math::ceil_div(curr_group_m, BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
                 if (next_block_idx < current_m_block_cumsum * kNumNBlocks)
@@ -254,7 +264,7 @@ struct DeepGemmScheduler {
                     return false;
 
                 // Within the current group
-                curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
+                curr_group_m = get_group_rows();
                 n_expand = get_n_expand<kEnableNExpand>(curr_group_m);
                 num_m_blocks = math::ceil_div(curr_group_m, BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;

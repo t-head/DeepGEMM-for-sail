@@ -25,16 +25,68 @@ namespace deep_gemm {
 
 using Config = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 
+// The caller aligns every expert's physical row span to 256 for automatic with-C tiling.
+// In the padded layout the scheduler selects B from the first row of each CTA.
+static Config get_grouped_bf16_with_c_config(int m, int n, int k, int num_sms,
+                                             bool use_psum_layout, bool aligned_cd) {
+    bool from_lut = false;
+    auto fallback = deep_gemm_bf16_common::get_best_configs(
+        m, n, k, 1, num_sms, GemmType::MGroupedContiguous, 256, &from_lut);
+    constexpr int bm = 256, wide_bn = 256, bk = 64;
+    if (from_lut || !aligned_cd || n % 8 != 0 || k % 8 != 0 || m % bm != 0)
+        return fallback;
+    const auto prop = device_runtime->get_prop();
+    if (prop->major != 8 || prop->minor != 9)
+        return fallback;
+
+    int bn = wide_bn, stages = 3;
+    const int64_t k_tiles = ceil_div(int64_t(k), int64_t(bk));
+    const int64_t wide_tiles = int64_t(m / bm) * ceil_div(int64_t(n), int64_t(bn));
+    const int64_t waves = ceil_div(wide_tiles, int64_t(num_sms));
+    // For compact groups, use a narrow full-C tile when A/B traffic per wide
+    // tile is at most twice the cost of reading C and writing D.
+    if (use_psum_layout && int64_t(k) * (bm + bn) <= 4LL * bm * bn) {
+        bn = 64;
+        stages = 2;
+    } else if (use_psum_layout) {
+        if (n % bn != 0)
+            return fallback;
+        // Prefer S4 for smaller output footprints or many output waves per K loop.
+        // Sustained wide reductions on larger grids measured faster with S3.
+        const int64_t output_bytes = 2LL * m * n;
+        if (output_bytes < 2LL * prop->l2CacheSize || waves >= k_tiles)
+            stages = 4;
+    } else if (k_tiles >= 4 && k_tiles >= 2 * waves) {
+        stages = 4;
+    }
+    const int64_t n_tiles = ceil_div(int64_t(n), int64_t(bn));
+    // A wide compact tile with a long reduction can pay off even at half a wave.
+    const int min_ctas = use_psum_layout && bn == wide_bn ? ceil_div(num_sms, 2) : num_sms;
+    if (int64_t(m / bm) * n < int64_t(min_ctas) * bn ||
+        4LL * n < 3 * n_tiles * bn || k_tiles < stages)
+        return fallback;
+    const auto smem = deep_gemm_bf16_common::get_smem_config(stages, k, bm, bn, bk, 2);
+    if (std::get<0>(smem) > prop->sharedMemPerBlockOptin)
+        return fallback;
+    return {num_sms, bm, bn, bk, 64, bn == 64 ? 32 : 64, stages, smem};
+}
+
 static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor& lhs, const torch::Tensor& rhs,
                                                              const torch::Tensor& out, const torch::Tensor& m_indices,
                                                              const int& m, const int& n, const int& k,
-                                                             const int& num_groups, std::optional<ConfigTuple> configs) {
+                                                             const int& num_groups, std::optional<ConfigTuple> configs,
+                                                             const std::optional<torch::Tensor>& c = std::nullopt,
+                                                             bool use_psum_layout = false) {
     int num_sms = get_num_sms();
     Config cfg;
     if (configs.has_value()) {
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst,
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
+    } else if (c.has_value()) {
+        const auto cd_address_bits = reinterpret_cast<uintptr_t>(c->data_ptr()) |
+                                     reinterpret_cast<uintptr_t>(out.data_ptr());
+        cfg = get_grouped_bf16_with_c_config(m, n, k, num_sms, use_psum_layout, cd_address_bits % 16 == 0);
     } else {
         cfg = deep_gemm_bf16_common::get_best_configs(
             m, n, k, 1, num_sms, GemmType::MGroupedContiguous);
@@ -45,7 +97,8 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     auto SMSIZE = std::get<0>(smem_config);
 
     int kNumGroups = num_groups;
-    static constexpr GemmType kGemmType = GemmType::MGroupedContiguous;
+    const GemmType gemm_type = use_psum_layout ? GemmType::MGroupedContiguousWithPsumLayout
+                                              : GemmType::MGroupedContiguous;
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     using StrideB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
 
@@ -58,6 +111,18 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     cutlass::bfloat16_t* input_a = reinterpret_cast<cutlass::bfloat16_t*>(lhs.data_ptr<at::BFloat16>());
     cutlass::bfloat16_t* output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
 
+    const bool with_c = c.has_value();
+    auto* source = with_c ? reinterpret_cast<cutlass::bfloat16_t*>(c->data_ptr<at::BFloat16>()) : output;
+    // Stage C only in retired A/B slots; the epilogue reads any excess from C.
+    // Both paths keep the shared-memory budget chosen by the A/B configuration.
+    const bool stage_c = with_c && is_ppu1v5_device() && num_stages >= 2 &&
+                         block_m % 16 == 0 && block_n % 16 == 0 &&
+                         reinterpret_cast<uintptr_t>(source) % 16 == 0 && n % 8 == 0 &&
+                         reinterpret_cast<uintptr_t>(output) % 16 == 0 &&
+                         SMSIZE <= device_runtime->get_prop()->sharedMemPerBlockOptin;
+    const char* kernel_name = stage_c ? "bf16_grouped_deep_gemm_contiguous_stage_c" :
+                              with_c  ? "bf16_grouped_deep_gemm_contiguous_add_c" :
+                                        "bf16_grouped_deep_gemm_contiguous";
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.cu_count = num_sms_new;
@@ -70,8 +135,8 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         .mainloopargs = {input_a, stride_A, input_b, stride_B},
         .epilogueargs =
             {
-                {1, 0},
-                output,
+                {1.0f, with_c ? 1.0f : 0.0f},
+                source,
                 stride_D,
                 output,
                 stride_D,
@@ -81,23 +146,33 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         .signal = nullptr};
 
     BF16GemmCutlass3Runtime::GemmKernelParams params =
-        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr, with_c);
     auto args = BF16GemmCutlass3Runtime::Args{
-        .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "MGroupedContiguous",
-                        "Default", "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap},
+        .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
+                        use_psum_layout ? "MGroupedContiguousWithPsumLayout" : "MGroupedContiguous",
+                        "Default", kernel_name, enable_sbo_overlap, with_c, stage_c},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = params};
     const auto& code = BF16GemmCutlass3Runtime::generate(args);
-    const auto& runtime = compiler->build("bf16_grouped_deep_gemm_contiguous", code);
+    const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
-    HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
+    if (stage_c) {
+        DG_HGGC_DRIVER_CHECK(lazy_hgFuncSetAttribute(kernel, HG_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMSIZE));
+    }
+    DG_HGGC_DRIVER_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE));
+    DG_HOST_ASSERT(blocks_per_cu > 0);
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
     if (deep_gemm::profiling_enabled()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
+        dg_prof_params.set_params(gemm_type, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
                                   grouped_layout, current_stream());
+        if (use_psum_layout) dg_prof_params.add_params("use_psum_layout", 1);
+        if (with_c) {
+            dg_prof_params.add_params("accumulate", source == output ? "alias" : "separate");
+            dg_prof_params.add_params("stage_c", int(stage_c));
+        }
     }
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
@@ -111,6 +186,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
 
         printf("[GroupedContiguous:]\n");
+        printf("WithC:%d, StageC:%d\n", int(with_c), int(stage_c));
         printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
         printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
                args.launch_args.grid_dim.x);

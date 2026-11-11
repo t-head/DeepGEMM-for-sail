@@ -75,6 +75,8 @@ public:
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         std::string gemm_type, kernel_strategy, kernel_name;
         bool enable_sbo_overlap;
+        bool with_c = false;
+        bool stage_c = false;
     };
 
     struct GemmArguments {
@@ -123,7 +125,7 @@ public:
         GemmKernelParams kernel_params;
     };
 
-    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace) {
+    static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace, bool with_c = false) {
         auto problem_shape = args.problem_shape;
         auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
         // Get SM count if needed, otherwise use user supplied SM count
@@ -139,13 +141,14 @@ public:
 
         cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
 
-        // Both epilogues only convert the accumulator; enforce the {alpha=1, beta=0} contract.
+        // The with-C specialization adds C in FP32. Other kernels overwrite D.
         DG_HOST_ASSERT(args.epilogueargs.callback.alpha == 1.0f && args.epilogueargs.callback.alpha_ptr == nullptr &&
-                       args.epilogueargs.callback.beta == 0.0f && args.epilogueargs.callback.beta_ptr == nullptr);
+                       args.epilogueargs.callback.beta == (with_c ? 1.0f : 0.0f) &&
+                       args.epilogueargs.callback.beta_ptr == nullptr);
 
         // Same decision source as the injected kWithTsmEpilogue; must match the device compile.
         // Initialize the selected union member directly to start its lifetime.
-        if (is_ppu1v5_device()) {
+        if (with_c || is_ppu1v5_device()) {
             return KernelParams{.no_tsm = GemmKernelParamsT<EpilogueParamNoTsm>{
                 args.mode, problem_shape, args.mainloopargs, args.epilogueargs,
                 hw_info, args.scheduler, workspace, args.signal}};
@@ -163,13 +166,12 @@ public:
     static std::string generate_impl(const Args& args) {
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
-        // One snapshot drives both the union member read and the injected epilogue flag.
-        const bool is_ppu1v5 = is_ppu1v5_device();
-        // Read the common head (mode/problem_shape/mainloop) through the matching member.
-        const GemmProblemSize problem_shape = is_ppu1v5 ? args.kernel_params.no_tsm.problem_shape
-                                                        : args.kernel_params.with_tsm.problem_shape;
-        // Injected into the generated source; same source as to_underlying_arguments_rtc.
-        const bool with_tsm_epilogue = not is_ppu1v5;
+        // Match the host Params union member selected by to_underlying_arguments_rtc.
+        const bool with_c = args.launch_info.with_c;
+        const bool stage_c = args.launch_info.stage_c;
+        const bool with_tsm_epilogue = !with_c && !is_ppu1v5_device();
+        const GemmProblemSize problem_shape = with_tsm_epilogue ? args.kernel_params.with_tsm.problem_shape
+                                                               : args.kernel_params.no_tsm.problem_shape;
         // sizeof of what the driver copies; the device asserts it equals its own Params size.
         const auto host_params_size = with_tsm_epilogue ? sizeof(args.kernel_params.with_tsm)
                                                         : sizeof(args.kernel_params.no_tsm);
@@ -177,6 +179,8 @@ public:
             R"(
 #include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
+#include <deep_gemm/epilogue/bf16_add_c.cuh>
+#include <deep_gemm/epilogue/grouped_bf16_stage_c.cuh>
 namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
@@ -296,7 +300,7 @@ static constexpr bool kWithTsmEpilogue = {17};
 using CollectiveEpilogue = typename cutlass::platform::conditional<
     kWithTsmEpilogue,
     CollectiveEpilogue_withTsm,
-    CollectiveEpilogue_noTsm
+    {20}
 >::type;
 
 using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS>;
@@ -334,7 +338,9 @@ __global__ void {12}(
             args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
             with_tsm_epilogue, host_params_size,
-            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t");
+            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t",
+            stage_c ? "Bf16StagedCEpilogueNoTsm<CollectiveEpilogue_noTsm, BLOCK_M, BLOCK_N, BLOCK_K, STAGES, SHAPE_K>" :
+            with_c  ? "Bf16AddCEpilogueNoTsm<CollectiveEpilogue_noTsm>" : "CollectiveEpilogue_noTsm");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

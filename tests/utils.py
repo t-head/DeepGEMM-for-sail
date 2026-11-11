@@ -1821,6 +1821,24 @@ def test_k_grouped_gemm_contiguous(args) -> None:
 
 
 def test_m_grouped_gemm_contiguous(args) -> None:
+    accumulation = args.get('accumulate', 'none')
+    regression = args.get('bf16_regression')
+    use_psum_layout = bool(args.get('use_psum_layout', False))
+    if regression or accumulation != 'none' or use_psum_layout:
+        if args['data_type'] != torch.bfloat16 or accumulation not in ('none', 'alias', 'separate'):
+            raise ValueError('Expected a grouped BF16 alias or separate accumulation case')
+        from test_m_grouped_bf16_contiguous_accumulate import exercise_grouped_accumulation, run_grouped_accumulation_regression
+        check = get_acc_check() and not os.environ.get('HGGC_WARM_UP') and deep_gemm.get_compile_mode() != 1
+        if regression:
+            if regression != 'accumulation':
+                raise ValueError(f'Unknown grouped BF16 regression {regression}')
+            return run_grouped_accumulation_regression(check=check)
+        lengths = construct_group_m_list(args['distribution'], args['groups'], args['m'])
+        return exercise_grouped_accumulation(
+            lengths, args['n'], args['k'], (accumulation,), check=check,
+            reference_device='cpu' if check and get_ref_backend() == 'host' else 'cuda',
+            benchmark=get_benchmark(), use_psum_layout=use_psum_layout)
+
     print('Testing grouped contiguous GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]

@@ -424,6 +424,10 @@ void distribution() {
         CHECK_HGGC(hggcMemcpyAsync(tmp, grouped_layout_, sizeof(int) * size, hggcMemcpyDeviceToHost, stream_));
         hggcStreamSynchronize(stream_);
 
+        if (gemm_type_ == GemmType::MGroupedContiguousWithPsumLayout) {
+            for (int g = size - 1; g > 0; --g) tmp[g] -= tmp[g - 1];
+        }
+
         if (need_bincount) {
             int* counts = new int[group_];
             for (int i = 0; i < group_; ++i) {
