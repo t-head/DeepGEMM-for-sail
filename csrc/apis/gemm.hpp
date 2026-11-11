@@ -163,8 +163,11 @@ void bf16_gemm_nt(const torch::Tensor& a,
         TORCH_CHECK(c->data_ptr() == d.data_ptr() || gemm_disjoint(d, *c),
                     "BF16 GEMM C/D must be disjoint or exactly aliased");
     }
-    if (k == 0 && is_compile_only()) return;
-    if ((m == 0 || n == 0 || k == 0) && early_return(m, n, k, d, c)) return;
+    if (m == 0 || n == 0) return;
+    if (k == 0) {
+        bf16_gemm_empty(d, c);
+        return;
+    }
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
         bf16_gemm(a, b, d, m, n, k, configs, c);

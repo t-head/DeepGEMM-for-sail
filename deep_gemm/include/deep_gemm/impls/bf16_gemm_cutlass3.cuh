@@ -1300,6 +1300,34 @@ public:
 
 namespace deep_gemm {
 
+struct BF16GemmEpilogueParams {
+    const float* product;
+    const void* c;
+    void* d;
+    int64_t count, n, cStride;
+};
+
+// A bounded grid covers the full output without exceeding the SIMT CU budget.
+// C may have padded/broadcast rows or alias D; each element is read before its store.
+template <typename Output, bool HasProduct, bool HasC>
+__device__ void bf16_gemm_epilogue_impl(const BF16GemmEpilogueParams p) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < p.count;
+         i += int64_t(gridDim.x) * blockDim.x) {
+        Output cValue = Output(0.0f);
+        if constexpr (HasC)
+            cValue = static_cast<const Output*>(p.c)[(i / p.n) * p.cStride + i % p.n];
+        if constexpr (HasProduct) {
+            float value = p.product[i];
+            if constexpr (HasC) value += float(cValue);
+            // Convert only after FP32 addition, including cancellation cases.
+            static_cast<Output*>(p.d)[i] = Output(value);
+        } else {
+            // K=0 copy preserves the input value directly, without adding zero.
+            static_cast<Output*>(p.d)[i] = cValue;
+        }
+    }
+}
+
 struct BF16GemmSplitKReduceParams810E {
     const float* partial;
     void* d;

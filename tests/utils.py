@@ -1085,13 +1085,37 @@ def clean_casename(name):
         name = name.replace("__", "_")
     return name
 
+def dense_gemm_profile_kind(args):
+    """Select complete-call profiling, correctness-only checks, or a name filter."""
+    if (args['gemm_type'] not in ('DenseGemm', 'Normal') or
+            args['data_type'] not in (torch.bfloat16, 'bf16_bf16_fp32')):
+        return 'filtered'
+    if (args.get('expect_error') or args.get('bf16_regression') or args.get('runtime_lut') or
+            args['m'] == 0 or args['n'] == 0 or
+            (args['k'] == 0 and args.get('accumulate') == 'alias')):
+        return 'check_only'
+    return 'scoped'
+
+
 def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0"):
+    """Profile executable cases and record non-launch regressions as correctness-only."""
     # Kernel filter for the PPU profiler. `attention_` is needed because the C++ JIT emits
     # `attention_mqa_logits_*` / `attention_paged_mqa_logits_*`, which match none of the other terms.
     # Without it the profiler silently reports 0 for these attention kernels.
     ppu_kernel_name = "--kernel-name 'regex:Kernel|device_kernel|gemv|gemm|attention_|mhc|w4a8_nvfp4|dequantize_nvfp4_fp8'"
     output_lines = list()
     headers = ["casename","time(us)","cycle","tc efficiency", "hbm efficiency", "dtype", "result", "cmd", "detail"]
+    def record(row):
+        """Write each result once, including N/A timing for correctness-only cases."""
+        output_lines.append(row)
+        if not os.path.exists(f"{output_file}.csv"):
+            with open(f"{output_file}.csv", "w", newline="") as f:
+                csv.writer(f).writerow(headers)
+        with open(f"{output_file}.csv", "a+", newline="") as f:
+            csv.writer(f).writerow(row)
+        if len(cases) == 1 and row[6] == 'Fail':
+            raise SystemExit(-1)
+
     # new_row=["casename"]  metrics.get("name", [])  ["detail"]
     # output_lines.append(new_row)
     if not os.path.exists("./logs"):
@@ -1113,8 +1137,18 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         pattern = r"data_type:([a-zA-Z0-9_]+)"
         dtype_match = re.search(pattern, case)
         dtype = dtype_match.groups()[0] if dtype_match else "unknown"
-        profile_dense = (dev == 'ppu' and case.startswith(('DenseGemm,', 'Normal,'))
-                         and dtype in ('bf16', 'bf16_bf16_fp32'))
+        # The parser accepts model prefixes and command-style caselist entries.
+        profile_kind = dense_gemm_profile_kind(parse_deepgemm_string_re(case)) if dev == 'ppu' else 'filtered'
+        script = f"{os.path.dirname(current_file_path)}/run_deep_gemm.py"
+        check_cmd = f"python {shlex.quote(script)} --format {case_arg} --ref_backend {get_ref_backend()}"
+        if profile_kind == 'check_only':
+            # These cases test rejection/no-op/helper behavior, even with --disable_acc.
+            ret = run_cmd(check_cmd)
+            result = 'Pass' if ret is not None and ret.returncode == 0 else 'Fail'
+            record([f"'{case.replace(',', '_')}_{dtype}'", 'N/A', 'N/A', 'N/A', 'N/A',
+                    dtype, result, check_cmd, 'Correctness only; no performance measurement'])
+            continue
+        profile_dense = profile_kind == 'scoped'
         # Capture every kernel of the dense API, including C addition/casts.
         # A name filter would miss those kernels or capture input initialization.
         profile_filter = '--profile-from-start off' if profile_dense else (
@@ -1122,7 +1156,6 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
         if dev == 'gpu' and mode == 'full':
             profile_filter = "--kernel-name 'regex:Kernel|device_kernel|batched_gemvt*|gemm*'"
         perf_case_arg = shlex.quote(case + ',profile_kernels:1') if profile_dense else case_arg
-        script = f"{os.path.dirname(current_file_path)}/run_deep_gemm.py"
         if mode == "full":
             output_name = clean_casename(case)[:50]
             cmd = "{} --set full {} -o {} python {} --format {} \
@@ -1165,7 +1198,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
 
         if _acc_check:
             # check accuracy
-            cmd = "python {} --format {}".format(script, case_arg)
+            cmd = check_cmd
             ret = run_cmd(cmd)
             if ret is not None and ret.returncode == 0 and cycle > 0:
                 result = "Pass"
@@ -1184,18 +1217,7 @@ def run_cycle_on_device(cases, output_file, dev="gpu", mode="metrics", gpu_id="0
             if "problem" not in headers:
                 headers.extend(other_metrics.keys())
             row.extend(other_metrics.values())
-        output_lines.append(row)
-        if not os.path.exists(f"{output_file}.csv"):
-            with open(f"{output_file}.csv", "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
-        with open(f"{output_file}.csv", "a+") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
-            print("write result succeed")
-
-        if len(cases) == 1 and result == "Fail":
-            exit(-1) # only one case, fail and exit
+        record(row)
 
     output_file = output_file + '.csv'
     if len(cases) == 1:
@@ -1699,10 +1721,10 @@ def test_gemm(args) -> None:
         check = get_acc_check() and not os.environ.get('HGGC_WARM_UP') and deep_gemm.get_compile_mode() != 1
         return (run_tile_alignment_cache if regression == 'alignment_cache' else run_n1_cu_limit)(check=check)
     print(f"test_gemm->test_func: DenseGemm,m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")
-    # Use full-output checks and complete-call timing for every nonempty PPU
-    # BF16 case, including GEMV, split-K reductions and hybrid launches.
+    # Use full-output checks and complete-call timing for PPU BF16 cases,
+    # including empty products, GEMV, split-K reductions and hybrid launches.
     bf16_functional = (use_ppu and d in (torch.bfloat16, 'bf16_bf16_fp32')
-                       and min(m, n, k) > 0)
+                       and min(m, n, k) >= 0)
     if (bf16_functional or d == torch.float32 or args.get('runtime_lut') or args.get('expect_error') or
             'configs' in args or args.get('accumulate', 'none') != 'none' or
             ('num_sms' in args and d in (torch.bfloat16, 'bf16_bf16_fp32'))):

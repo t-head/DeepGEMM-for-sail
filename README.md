@@ -139,6 +139,8 @@ For dense BF16 accumulation, C must match D's shape, dtype and device and be
 either disjoint from D or exactly aliased with identical strides. The product
 and C are combined in FP32 before conversion to BF16, including GEMV and split-K.
 Compile-only mode (`set_compile_mode(1)` or nonempty `HGGC_WARM_UP`) preserves C/D.
+Explicit CU limits also bound accumulation/conversion and K=0 copy/zero kernels;
+these auxiliary kernels use the SIMT budget, independently of the Tensor-CU pool.
 
 810E BF16 tiled paths require `K>=64`, `K%32=0`, and 16-byte-aligned inputs.
 GEMV paths allow shorter K with their own alignment checks. Empty outputs are

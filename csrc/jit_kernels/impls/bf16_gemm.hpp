@@ -1449,6 +1449,56 @@ static void bf16_gemm_810e(const torch::Tensor& a, const torch::Tensor& b, const
         bf16_gemm_impl<cutlass::bfloat16_t>(a, b, d, m, n, k, configs);
 }
 
+class BF16GemmEpilogueRuntime final : public LaunchRuntime<BF16GemmEpilogueRuntime> {
+public:
+    struct Params {
+        const float* product;
+        const void* c;
+        void* d;
+        int64_t count, n, cStride;
+    };
+    struct Args { LaunchArgs launch_args; Params params; bool fp32; };
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
+static_assert(sizeof(deep_gemm::BF16GemmEpilogueParams) == {});
+extern "C" __global__ void bf16_gemm_epilogue(deep_gemm::BF16GemmEpilogueParams p) {{
+    deep_gemm::bf16_gemm_epilogue_impl<{}, {}, {}>(p);
+}}
+)", sizeof(Params), args.fp32 ? "float" : "__ppu_bfloat16",
+            args.params.product != nullptr, args.params.c != nullptr);
+    }
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
+    }
+};
+
+static bool bf16_gemm_bounded_epilogue(const float* product, const std::optional<torch::Tensor>& c,
+                                       const torch::Tensor& d) {
+    const int sms = device_runtime->get_num_simt_sms();
+    const auto prop = device_runtime->get_prop();
+    if (sms >= prop->multiProcessorCount) return false;
+    const int threads = std::min(256, prop->maxThreadsPerBlock);
+    const int blocks = int(std::min<int64_t>(sms, ceil_div(d.numel(), int64_t(threads))));
+    TORCH_CHECK(blocks > 0 && blocks <= prop->maxGridSize[0], "Invalid BF16 epilogue grid");
+    BF16GemmEpilogueRuntime::Args args{
+        {dim3(blocks), dim3(threads), 0},
+        {product, c ? c->data_ptr() : nullptr, d.data_ptr(), d.numel(), d.size(1), c ? c->stride(0) : 0},
+        d.scalar_type() == torch::kFloat};
+    const auto code = BF16GemmEpilogueRuntime::generate(args);
+    const auto runtime = compiler->build("bf16_gemm_epilogue", code);
+    BF16GemmEpilogueRuntime::launch(runtime, args);
+    if (get_env<int>("show_log"))
+        printf("[DenseGemm_BF16_Epilogue:] num_sms:%d, threadblock_count:%d\n", sms, blocks);
+    return true;
+}
+
+static void bf16_gemm_empty(const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
+    if (c && c->data_ptr() == d.data_ptr()) return;
+    if (!bf16_gemm_bounded_epilogue(nullptr, c, d) && !is_compile_only())
+        c ? d.copy_(*c) : d.zero_();
+}
+
 static void bf16_gemm(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
                       const int& m, const int& n, const int& k,
                       std::optional<ConfigTuple> configs = std::nullopt,
@@ -1466,7 +1516,7 @@ static void bf16_gemm(const torch::Tensor& a, const torch::Tensor& b, const torc
         // The only BF16 conversion follows addition; compile-only preserves C/D.
         auto accum = torch::empty({m, n}, d.options().dtype(torch::kFloat));
         bf16_gemm(a, b, accum, m, n, k, configs);
-        if (!is_compile_only()) {
+        if (!bf16_gemm_bounded_epilogue(accum.data_ptr<float>(), c, d) && !is_compile_only()) {
             accum.add_(*c);
             d.copy_(accum);
         }

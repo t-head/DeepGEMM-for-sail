@@ -339,18 +339,29 @@ def run_n1_cu_limit(check=True):
     original = deep_gemm.get_num_sms()
     original_config = deep_gemm.get_num_sms_config()
     original_log = os.environ.get('show_log')
+    is_810e = 'ZW810E' in torch.cuda.get_device_name()
     x, w = make_inputs(128, 1, 256)
     try:
         for budget in (1, 2):
             if budget > torch.cuda.get_device_properties(0).multi_processor_count:
                 continue
             deep_gemm.set_num_sms(budget)
-            # A matching explicit budget and an oversized one both respect
-            # set_num_sms; explicit tiles continue to bypass GEMV.
+            # 890P clamps explicit N=1 tiles to the budget. 810E supports N=1
+            # through GEMV only and rejects oversized explicit budgets.
             for config_sms in (None, budget, original):
                 configs = None if config_sms is None else (config_sms, 16, 64, 64, 16, 32, 2, (24576, 128, 0))
                 for dtype in (torch.bfloat16, torch.float32):
-                    out = torch.empty((128, 1), device='cuda', dtype=dtype)
+                    out = torch.full((128, 1), 8., device='cuda', dtype=dtype)
+                    if is_810e and configs is not None:
+                        expected = 'configured budget' if config_sms > budget else 'vector-aligned output'
+                        try:
+                            deep_gemm.bf16_gemm_nt(x, w, out, configs=configs)
+                        except RuntimeError as error:
+                            assert expected in str(error), str(error)
+                        else:
+                            raise AssertionError('810E accepted an unsupported explicit N=1 tile')
+                        assert torch.equal(out, torch.full_like(out, 8.))
+                        continue
                     if not check:
                         deep_gemm.bf16_gemm_nt(x, w, out, configs=configs)
                         continue
@@ -370,7 +381,8 @@ def run_n1_cu_limit(check=True):
                         os.dup2(saved_stdout, 1)
                         os.close(saved_stdout)
                     match = re.search(r'threadblock_count:(\d+)', log)
-                    assert '[DenseGemm_BF16_CuteFree:]' in log and match, log
+                    marker = '[DenseGemm_BF16_GemV:]' if is_810e else '[DenseGemm_BF16_CuteFree:]'
+                    assert marker in log and match, log
                     assert 0 < int(match.group(1)) <= budget, (budget, configs, log)
                     ref = x.float() @ w.float().t()
                     torch.testing.assert_close(out.float(), ref.to(dtype).float(),
