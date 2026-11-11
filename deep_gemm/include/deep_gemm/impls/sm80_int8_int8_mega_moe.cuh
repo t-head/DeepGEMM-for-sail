@@ -96,19 +96,20 @@ struct MegaMoEInt8Linear1 {
 
 // The shared scatter epilogue consumes scaled FP32 accumulators, independently
 // of the MMA input type. Keep INT8 computation in the A8W8 implementation.
-template <class Kernel, int Hidden, int TopK, int Groups, int Ranks, bool kOutputAligned>
+template <class Kernel, int Hidden, int TopK, int Groups, int Ranks, bool kOutputAligned,
+          int kColumnSplits = 1, int kReduceGroupThreads = 0>
 __device__ __forceinline__ void mega_moe_int8_reduce_impl(
         typename Kernel::Params const& params, const int64_t* ids, const float* weights,
         __ppu_bfloat16* output, int tokens, uint64_t writer_mask) {
-    for (int token = blockIdx.x; token < tokens; token += gridDim.x) {
-        moe_reduce_impl<kOutputAligned, TopK, Hidden, true, Kernel::MaxThreadsPerBlock>(
-            reinterpret_cast<const __ppu_bfloat16*>(params.scatter_buffer.base),
-            ids, weights, output, params.epilogue.token_capacity, Groups,
-            params.scatter_buffer.rank_idx, token, 0, writer_mask, threadIdx.x);
-    }
+    moe_reduce_dispatch<kOutputAligned, TopK, Hidden, Kernel::MaxThreadsPerBlock,
+                        kColumnSplits, kReduceGroupThreads>(
+        reinterpret_cast<const __ppu_bfloat16*>(params.scatter_buffer.base),
+        ids, weights, output, params.epilogue.token_capacity, Groups,
+        params.scatter_buffer.rank_idx, tokens, writer_mask);
 }
 
-template <class Kernel, int Hidden, int TopK, int Groups, int Ranks, bool kOutputAligned>
+template <class Kernel, int Hidden, int TopK, int Groups, int Ranks, bool kOutputAligned,
+          int kColumnSplits = 1, int kReduceGroupThreads = 0>
 __device__ __forceinline__ void mega_moe_int8_scatter_impl(
         typename Kernel::Params const& params, char* smem, const int64_t* ids, const float* weights,
         __ppu_bfloat16* output, int tokens) {
@@ -117,7 +118,8 @@ __device__ __forceinline__ void mega_moe_int8_scatter_impl(
     if constexpr (!DG_MEGAMOE_SPLIT_SYNC) {
         comm::rank_barrier<Ranks, true>(params.signals->scatter_arrivals, generation,
                                         reinterpret_cast<uint32_t*>(smem));
-        mega_moe_int8_reduce_impl<Kernel, Hidden, TopK, Groups, Ranks, kOutputAligned>(
+        mega_moe_int8_reduce_impl<Kernel, Hidden, TopK, Groups, Ranks, kOutputAligned,
+                                 kColumnSplits, kReduceGroupThreads>(
             params, ids, weights, output, tokens, *reinterpret_cast<const uint64_t*>(smem));
     }
 }

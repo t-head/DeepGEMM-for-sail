@@ -10,6 +10,7 @@
 #include <deep_gemm/epilogue/gated_activation.cuh>
 #include "int8_gemm.hpp"
 #include "mega_moe_common.hpp"
+#include "../heuristics/mega_moe_common.hpp"
 #include "../heuristics/sm80_mega_moe.hpp"
 #if __has_include(<hggc_ad.h>)
 #include <hggc_ad.h>
@@ -266,12 +267,22 @@ public:
                 arch, a.hidden, a.intermediate, c.block_m, c.block_n, c.block_k,
                 c.warp_m, c.warp_n, c.num_stages, a.groups, Ranks, a.capacity, a.topk, wait_scatter_pair);
         }
+        mega_moe_common::ReduceConfig reduce;
+        if constexpr (!kIsLinear1) {
+            reduce = mega_moe_common::select_reduce_config(
+                a.tokens, a.hidden, static_cast<int>(a.launch_args.block_dim.x), c.num_sms);
+            if (get_env<int>("show_log", 0))
+                printf("[%s] reduce column_splits:%d group_threads:%d\n",
+                       a.kernel_name, reduce.column_splits, reduce.group_threads);
+        }
         const bool reduce_only = a.split_sync && std::strcmp(a.kernel_name, kReduceName) == 0;
         const std::string execute = kIsLinear1 ? "Kernel{}(params, smem);" : reduce_only ? fmt::format(
-            "deep_gemm::mega_moe_int8_reduce_impl<Kernel,{},{},{},{},{}>(params, ids, weights, output, tokens, params.signals->scatter_writer_mask);",
-            a.hidden, a.topk, a.groups, Ranks, is_bf16x8_aligned(a.reduce_output)) : fmt::format(
-            "deep_gemm::mega_moe_int8_scatter_impl<Kernel,{},{},{},{},{}>(params, smem, ids, weights, output, tokens);",
-            a.hidden, a.topk, a.groups, Ranks, is_bf16x8_aligned(a.reduce_output));
+            "deep_gemm::mega_moe_int8_reduce_impl<Kernel,{},{},{},{},{},{},{}>(params, ids, weights, output, tokens, params.signals->scatter_writer_mask);",
+            a.hidden, a.topk, a.groups, Ranks, is_bf16x8_aligned(a.reduce_output),
+            reduce.column_splits, reduce.group_threads) : fmt::format(
+            "deep_gemm::mega_moe_int8_scatter_impl<Kernel,{},{},{},{},{},{},{}>(params, smem, ids, weights, output, tokens);",
+            a.hidden, a.topk, a.groups, Ranks, is_bf16x8_aligned(a.reduce_output),
+            reduce.column_splits, reduce.group_threads);
         return fmt::format(R"(
 #define DG_MEGAMOE_OWNER_MODE 1
 #define DG_MEGAMOE_SITU_USE_RCP {}

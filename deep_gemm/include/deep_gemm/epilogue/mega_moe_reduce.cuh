@@ -159,4 +159,33 @@ __device__ __forceinline__ void moe_reduce_impl(
     }
 }
 
+// Distribute token/column tasks across warp-aligned groups for every operand type.
+template <bool kOutputAligned, int kTopK, int kHidden, int kCtaThreads,
+          int kColumnSplits = 1, int kReduceGroupThreads = 0>
+__device__ __forceinline__ void moe_reduce_dispatch(
+        const __ppu_bfloat16* input, const int64_t* ids, const float* weights,
+        __ppu_bfloat16* output, int token_capacity, int local_experts, int rank_idx,
+        int tokens, uint64_t writer_mask) {
+    constexpr int kReduceThreads = kReduceGroupThreads > 0 ? kReduceGroupThreads : kCtaThreads;
+    static_assert(kReduceThreads % 32 == 0 && kCtaThreads % kReduceThreads == 0);
+    constexpr int kTokenGroups = kCtaThreads / kReduceThreads;
+    unsigned int reduce_thread = threadIdx.x;
+    int token_group = 0;
+    if constexpr (kReduceGroupThreads > 0) {
+        reduce_thread = threadIdx.x % kReduceThreads;
+        // Group boundaries are warp-aligned; keep token metadata and owner decisions scalar.
+        token_group = __ppu_read_firstlane(threadIdx.x / kReduceThreads);
+    }
+    if (kColumnSplits == 1 || reduce_thread * 8 < kHidden / kColumnSplits) {
+        for (int work = blockIdx.x * kTokenGroups + token_group;
+             work < tokens * kColumnSplits; work += gridDim.x * kTokenGroups) {
+            moe_reduce_impl<kOutputAligned, kTopK, kHidden, true, kReduceThreads, kColumnSplits>(
+                input,
+                ids, weights, output,
+                token_capacity, local_experts,
+                rank_idx, work / kColumnSplits, work % kColumnSplits, writer_mask, reduce_thread);
+        }
+    }
+}
+
 }  // namespace deep_gemm

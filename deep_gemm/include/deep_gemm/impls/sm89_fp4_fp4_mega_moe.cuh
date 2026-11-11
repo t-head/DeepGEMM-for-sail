@@ -282,25 +282,11 @@ template <typename Kernel, int Ranks, int TopK, int Hidden, int Groups,
 __device__ __forceinline__ void mega_moe_reduce(
         const layout::SymBuffer<Ranks>& scatter_buffer, uint32_t token_capacity,
         const MegaMoEReduceParams& reduce, uint64_t writer_mask) {
-    constexpr int kReduceThreads = kReduceGroupThreads > 0 ? kReduceGroupThreads : Kernel::MaxThreadsPerBlock;
-    constexpr int kTokenGroups = Kernel::MaxThreadsPerBlock / kReduceThreads;
-    unsigned int reduce_thread = threadIdx.x;
-    int token_group = 0;
-    if constexpr (kReduceGroupThreads > 0) {
-        reduce_thread = threadIdx.x % kReduceThreads;
-        // Group boundaries are warp-aligned; keep token metadata and owner decisions scalar.
-        token_group = __ppu_read_firstlane(threadIdx.x / kReduceThreads);
-    }
-    if (kColumnSplits == 1 || reduce_thread * 8 < Hidden / kColumnSplits) {
-        for (int work = blockIdx.x * kTokenGroups + token_group;
-             work < reduce.tokens * kColumnSplits; work += gridDim.x * kTokenGroups) {
-            moe_reduce_impl<kOutputAligned, TopK, Hidden, true, kReduceThreads, kColumnSplits>(
-                scatter_buffer.template get_base_ptr<const __ppu_bfloat16*>(),
-                reduce.ids, reduce.weights, static_cast<__ppu_bfloat16*>(reduce.output),
-                static_cast<int>(token_capacity), Groups,
-                scatter_buffer.rank_idx, work / kColumnSplits, work % kColumnSplits, writer_mask, reduce_thread);
-        }
-    }
+    moe_reduce_dispatch<kOutputAligned, TopK, Hidden, Kernel::MaxThreadsPerBlock,
+                        kColumnSplits, kReduceGroupThreads>(
+        scatter_buffer.template get_base_ptr<const __ppu_bfloat16*>(),
+        reduce.ids, reduce.weights, static_cast<__ppu_bfloat16*>(reduce.output),
+        static_cast<int>(token_capacity), Groups, scatter_buffer.rank_idx, reduce.tokens, writer_mask);
 }
 
 template <typename Kernel, int Ranks, int TopK, int Hidden, int Groups,

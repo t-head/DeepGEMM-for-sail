@@ -220,7 +220,7 @@ def run(args):
     def check(label, x, ids, routes, activation, workspace=buffer, output=y):
         torch.cuda.synchronize()
         expected = reference(x, ids, routes, w1, s1, w2, s2,
-                             workspace.num_max_tokens_per_rank, activation)
+                             min(workspace.num_max_tokens_per_rank, len(output)), activation)
         error = assert_output(output[:len(expected)], expected)
         errors = torch.tensor(error, device='cuda')
         dist.all_reduce(errors, op=dist.ReduceOp.MAX)
@@ -236,6 +236,23 @@ def run(args):
             execute(x, ids, routes, {})
             check(mode, x, ids, routes, {})
 
+    # Exercise column splitting, partial token groups and the 128-row policy
+    # boundary independently of the symmetric allocation's rounded capacity.
+    for output_rows in (1, 31, 32, 33, 64, 127, 128, 129):
+        if output_rows > capacity:
+            continue
+        mode = 'invalid' if output_rows % 2 else 'empty_rank'
+        x, ids, routes = inputs(min(17, output_rows), mode)
+        visible_output = y[:output_rows]
+        execute(x, ids, routes, {}, output=visible_output)
+        check(f'reduce/output_rows={output_rows}', x, ids, routes, {}, output=visible_output)
+        if output_rows == 1:
+            # Cover offset stores at column-part boundaries, including guards.
+            def forward_reduce_offset(source, output):
+                execute(source, ids, routes, {}, output=output)
+                return output
+            check_bf16_offset_views(x, visible_output.clone(), forward_reduce_offset)
+
     if args.sync_modes:
         original = os.environ.get('DG_MEGAMOE_SPLIT_SYNC')
         try:
@@ -244,8 +261,9 @@ def run(args):
                 x, ids, routes = inputs(min(31, capacity), mode)
                 if rank == 0:
                     time.sleep(0.05)
-                execute(x, ids, routes, {}, stats=stats)
-                check(f'split_sync/{split_sync}/{mode}', x, ids, routes, {})
+                visible_output = y[:len(x)]
+                execute(x, ids, routes, {}, output=visible_output, stats=stats)
+                check(f'split_sync/{split_sync}/{mode}', x, ids, routes, {}, output=visible_output)
                 check_stats(ids)
         finally:
             if original is None:

@@ -10,6 +10,7 @@
 #include <deep_gemm/epilogue/gated_activation.cuh>
 #include "fp4_gemm.hpp"
 #include "mega_moe_common.hpp"
+#include "../heuristics/mega_moe_common.hpp"
 #include "../heuristics/mega_moe.hpp"
 
 namespace deep_gemm::mega {
@@ -140,22 +141,13 @@ public:
 
     static std::string generate_impl(const Args& a) {
         const auto& info = a.launch_info;
-        int column_splits = 1;
-        int reduce_group_threads = 0;
-        if constexpr (!kIsLinear1) {
-            const int parts = ceil_div(info.n, 8 * static_cast<int>(a.launch_args.block_dim.x));
-            if (a.tokens <= 128 && info.n % parts == 0 && (info.n / parts) % 256 == 0)
-                column_splits = parts;
-            constexpr int kGroupThreads = 128;
-            const int cta_threads = static_cast<int>(a.launch_args.block_dim.x);
-            // Group only when the reduce work can cover at least one CTA per SM.
-            if (cta_threads > kGroupThreads && cta_threads % kGroupThreads == 0 &&
-                a.tokens * column_splits >= info.num_sms * (cta_threads / kGroupThreads))
-                reduce_group_threads = kGroupThreads;
-        }
+        mega_moe_common::ReduceConfig reduce;
+        if constexpr (!kIsLinear1)
+            reduce = mega_moe_common::select_reduce_config(
+                a.tokens, info.n, static_cast<int>(a.launch_args.block_dim.x), info.num_sms);
         const auto kernel_args = kIsLinear1 ? std::string{"Kernel"} :
             fmt::format("Kernel, {}, {}, {}, {}, {}, {}, {}", Ranks, a.topk, info.n, info.num_groups,
-                        column_splits, reduce_group_threads, is_bf16x8_aligned(a.reduce_output));
+                        reduce.column_splits, reduce.group_threads, is_bf16x8_aligned(a.reduce_output));
         return fmt::format(R"(
 #define DG_MEGAMOE_OWNER_MODE {}
 #define DG_MEGAMOE_OWNER_READER_OPT {}
