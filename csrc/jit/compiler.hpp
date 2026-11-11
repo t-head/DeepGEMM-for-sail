@@ -276,7 +276,7 @@ public:
         const auto code_path = dir_path / "kernel.cu";
         put(code_path, code);
 
-        // Per-kernel scheduling options for PPU1.5.
+        // Per-kernel scheduling options.
         std::string per_kernel_flags;
         if (get_ppu_arch() == AC_PPU0015) {
             per_kernel_flags = " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
@@ -307,6 +307,9 @@ public:
             if (name.find("w4a16") != std::string::npos || name.find("w4a8_nvfp4") != std::string::npos) {
                 per_kernel_flags += " -Xllvm -sort-copy-before-coalesce";
             }
+        } else if (get_ppu_arch() == AC_PPU0010) {
+            if (name == "ppu_bf16_mega_gate")
+                per_kernel_flags += " -Xllvm -ppu-simt-branch=false";
         }
         if (name == "ppu_mega_mhc_single")
             per_kernel_flags += " -Xllvm -ppu-reassign-subregs=true"

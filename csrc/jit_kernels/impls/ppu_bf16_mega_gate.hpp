@@ -1,6 +1,7 @@
 #pragma once
 #include <torch/python.h>
 #include <deep_gemm/layout/mega_gate.cuh>
+#include <deep_gemm/common/profiling_interface.cuh>
 #include "../../jit/compiler.hpp"
 #include "../../jit/kernel_runtime.hpp"
 #include "../heuristics/mega_gate.hpp"
@@ -73,11 +74,34 @@ void ppu_bf16_mega_gate(deep_gemm::mega_gate_layout::KernelArgs args) {{
     }
 };
 
+static HgtxRangeGuard profile_mega_gate(
+        int tokens, int hidden, int experts, int topk, bool use_shared_as_routed, int num_shared_experts,
+        const std::string& scoring_func, const mega_gate_layout::RoutingArgs& routing,
+        const std::optional<torch::Tensor>& bias, const std::optional<torch::Tensor>& image_bias,
+        const std::optional<torch::Tensor>& image_token_mask, const std::optional<torch::Tensor>& mask,
+        const std::optional<torch::Tensor>& fix_routing_mask, const std::optional<torch::Tensor>& force_random) {
+    if (not profiling_enabled())
+        return HgtxRangeGuard{};
+    DgProfParam params;
+    params.set_mega_gate_params(tokens, hidden, experts, topk, use_shared_as_routed, num_shared_experts,
+                                routing.routed_scaling_factor, static_cast<int>(routing.rank_idx), current_stream());
+    params.add_params("with_bias", bias.has_value());
+    params.add_params("with_physical_map", routing.to_physical_map != nullptr);
+    params.add_params("with_image_bias", image_bias.has_value());
+    params.add_params("with_mask", mask.has_value());
+    params.add_params("with_unmapped_topk_idx", routing.unmapped_topk_idx != nullptr);
+    params.add_params("scoring_func", scoring_func);
+    params.add_params("with_fix_routing_mask", fix_routing_mask.has_value());
+    params.add_params("with_force_random", force_random.has_value());
+    return show_gemm_ut(params);
+}
+
 static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weight,
         const std::optional<torch::Tensor>& bias, const std::optional<torch::Tensor>& image_bias,
         const std::optional<torch::Tensor>& image_token_mask, const std::optional<torch::Tensor>& mask,
         const std::optional<torch::Tensor>& fix_routing_mask, const std::optional<torch::Tensor>& force_random,
-        const mega_gate_layout::RoutingArgs& routing, int tokens, int hidden, int experts, int topk, bool single_producer = false) {
+        const mega_gate_layout::RoutingArgs& routing, int tokens, int hidden, int experts, int topk,
+        bool use_shared_as_routed, int num_shared_experts, const std::string& scoring_func, bool single_producer = false) {
     using namespace mega_gate_layout;
     DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16u == 0u);
     DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16u == 0u);
@@ -109,7 +133,7 @@ static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weig
     // Devices or CU budgets that cannot hold a producer group use one CTA per token tile.
     if (producers > 1 and !cooperative) {
         ppu_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
-                          routing, tokens, hidden, experts, topk, true);
+                          routing, tokens, hidden, experts, topk, use_shared_as_routed, num_shared_experts, scoring_func, true);
         return;
     }
     auto kernel = compiler->build("ppu_bf16_mega_gate", PPUMegaGateRuntime::generate(args));
@@ -125,7 +149,7 @@ static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weig
             const int resident_groups = std::min(blocks, capacity / producers);
             if (resident_groups == 0) {
                 ppu_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
-                                  routing, tokens, hidden, experts, topk, true);
+                                  routing, tokens, hidden, experts, topk, use_shared_as_routed, num_shared_experts, scoring_func, true);
                 return;
             }
             args.launch_args.grid_dim = dim3(resident_groups * producers);
@@ -139,6 +163,8 @@ static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weig
                                  x.options().dtype(torch::kInt));
     args.kernel_args.scratch = scratch.data_ptr<float>();
     args.kernel_args.score_barriers = barriers.data_ptr<int>();
+    const auto profiling_range = profile_mega_gate(tokens, hidden, experts, topk, use_shared_as_routed,
+        num_shared_experts, scoring_func, routing, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random);
     PPUMegaGateRuntime::launch(kernel, args);
 }
 } // namespace deep_gemm

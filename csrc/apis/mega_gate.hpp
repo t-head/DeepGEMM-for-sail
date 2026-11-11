@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include "../jit_kernels/impls/ppu_bf16_mega_gate.hpp"
+#include "../jit_kernels/impls/ppu_bf16_mega_gate_810e.hpp"
 #include "../utils/layout.hpp"
 
 namespace deep_gemm::mega_gate {
@@ -157,8 +158,19 @@ bf16_mega_gate(const torch::Tensor& x,
         .rank_idx = static_cast<uint32_t>(ep_rank),
         .routed_scaling_factor = routed_scaling_factor,
     };
-    ppu_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
-                         routing_args, num_tokens, hidden, num_routed_experts, num_topk);
+    // Dispatch implementation
+    const auto arch = get_ppu_arch();
+    if (arch == AC_PPU0010) {
+        ppu_bf16_mega_gate_810e(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
+                                routing_args, num_tokens, hidden, num_routed_experts, num_topk,
+                                use_shared_as_routed, num_shared_experts, scoring_func);
+    } else if (arch == AC_PPU0015) {
+        ppu_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
+                           routing_args, num_tokens, hidden, num_routed_experts, num_topk,
+                           use_shared_as_routed, num_shared_experts, scoring_func);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture for BF16 MegaGate");
+    }
     return {topk_idx, topk_weights};
 }
 

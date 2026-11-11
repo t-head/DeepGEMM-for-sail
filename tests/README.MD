@@ -24,6 +24,21 @@ python ./run_deep_gemm.py --format=GroupedMasked,data_type:int8,groups:16,m:4096
 python ./run_deep_gemm.py --format=GroupedMasked,data_type:int8,groups:16,m:4096,n:4096,k:7168,em:12 --disable_acc
 
 
+### MegaGate replay from HGTX
+
+```bash
+python ./run_deep_gemm.py --format='MegaGate,data_type:bf16,num_tokens:128,hidden:5120,num_routed_experts:384,num_topk:6,routed_scaling_factor:1.23456788,ep_rank:7'
+python ./run_deep_gemm.py --caselist=./mega_gate.caselist --benchmark
+```
+
+The existing `--format` and `--caselist` inputs accept MegaGate range text, including
+the `[DeepGemm] --format=` or `deepgemm:[DeepGemm] --format=` prefix. Use one case per
+line in a caselist; `--case_idx` selects a single case. Boolean fields use `0/1`.
+Inputs, bias, masks and expert maps are generated with the existing MegaGate UT
+helpers; this reproduces shapes and routing options, not the original tensor data.
+`routed_scaling_factor` and `ep_rank` are passed to the operator. Accuracy checking
+uses the device reference; `--disable_acc` skips it.
+
 # UT Performance Test
 Use `run_deep_gemm_perf.py` with --format to specify input parameters and --mode to specify mode.
 ## Usage
