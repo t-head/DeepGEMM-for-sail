@@ -47,9 +47,14 @@ __device__ __forceinline__ float gate_score(float value) {
 template <bool UseSigmoid, uint32_t N>
 __device__ __forceinline__ void gate_score(float (&values)[N]) {
     if constexpr (UseSigmoid) {
+        // Match the vector sigmoid schedule in DeepGEMM 66081d4c (sm100_mega_gate.cuh).
+        float exponentials[N];
         #pragma unroll
         for (uint32_t i = 0; i < N; ++i)
-            values[i] = gate_score<true>(values[i]);
+            exponentials[i] = expf(-values[i]);
+        #pragma unroll
+        for (uint32_t i = 0; i < N; ++i)
+            values[i] = 1.0f / (1.0f + exponentials[i]);
     } else {
         sqrt_softplus(values);
     }
