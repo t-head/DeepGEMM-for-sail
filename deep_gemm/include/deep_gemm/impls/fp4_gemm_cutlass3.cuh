@@ -1117,6 +1117,11 @@ public:
         thread_idx,
         (char*)&shared_storage.tensors.epilogue
       );
+      if constexpr (deep_gemm::is_act_and_quant_fused(kEpilogueType)) {
+        // The activation tile aliases mainloop storage. Finish every warp's reads
+        // before the next persistent tile starts loading A/B into that storage.
+        __syncthreads();
+      }
       }
     }
     if constexpr (ScatterPolicy::kEnabled) {

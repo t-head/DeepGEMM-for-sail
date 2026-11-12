@@ -13,6 +13,19 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   incorrect scheduling boundaries without adding barriers. Existing indexer
   APIs and main-kernel scheduling are unchanged.
 
+- **FP4 fused epilogue shared-memory reuse**: adds a CTA barrier for the
+  `SiluAndMulPostQuantFp4` and `SiluAndMulStepPostQuantFp4` path because of
+  shared-memory reuse between the mainloop and the epilogue. The activation
+  tile must be fully read before the next tile loads A/B into the same storage.
+  Applies to both the persistent and the dynamic-tile FP4 kernels; default
+  epilogues, tile selection and dispatch are unchanged.
+
+- **W4A16 TSM epilogue shared-memory reuse**: `epilogue_with_tsm` synchronizes
+  the K0 warps after copying `sC` to registers whenever another `step_m`
+  follows, because the next step reuses the same `sC` storage. The final step
+  needs no extra round: the CTA-wide barrier after the epilogue already covers
+  it. Tile selection and dispatch are unchanged.
+
 ### Added
 
 - **W4A4 MegaMoE**: adds the complete MXFP4 routed MoE pipeline with BF16

@@ -588,6 +588,11 @@ public:
           __ppu_barrier_sync(3, MaxThreadsPerBlock / WarpsOnK);
 
           copy(smem_tiled_copy_s2r, tDsD, tDrD);
+          if (step_m + 1 < size<2>(cDt)) {
+            // Finish all reads before the next step overwrites sC. Only the K0
+            // warps participate here; the final step is covered by the CTA barrier.
+            __ppu_barrier_sync(3, MaxThreadsPerBlock / WarpsOnK);
+          }
           Tensor tDcDmn = tDcD(_,_,_,step_m,0);
           CUTLASS_PRAGMA_UNROLL
           for (int m = 0; m < size<1>(tDcDmn); ++m) {
