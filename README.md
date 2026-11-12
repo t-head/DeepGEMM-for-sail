@@ -24,6 +24,18 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 
 ## Release Notes
 
+### 1.1.0+v1.0.1
+
+- **Paged indexer metadata synchronization**: fixes the shared-memory prefix-scan
+  race in both main and tail scans without increasing the barrier count.
+- **FP4 and W4A16 epilogue synchronization**: fixes shared-memory reuse races in
+  fused FP4 persistent/dynamic epilogues and the W4A16 TSM epilogue.
+
+Existing APIs, indexer main-kernel scheduling, and GEMM tile selection and
+dispatch are unchanged.
+
+See [CHANGELOG.md](CHANGELOG.md#110v101) for complete release notes.
+
 ### 1.1.0+v1.0.0
 
 Highlights:
@@ -51,16 +63,17 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 
 ### Package versioning
 
-- Release: `1.1.0+v1.0.0.ppu2.2.0` combines the placeholder version `1.1.0`,
-  the release version `v1.0.0`, and the PPU SDK version `2.2.0`.
+- Release: `1.1.0+v1.0.1.ppu2.2.0` combines the placeholder version `1.1.0`,
+  the release version `v1.0.1`, and the PPU SDK version `2.2.0`.
   In [setup.py](setup.py), these first two components correspond to
   `DEEPGEMM_VERSION` and `RELEASE_VERSION`, respectively.
 - `1.1.0` is expected to remain unchanged. Future releases and API changes
-  are tracked by the `v1.0.0` component in `RELEASE_VERSION`.
-  The middle number in `v1.0.0` is incremented for API changes or additions
+  are tracked by the `v1.0.1` component in `RELEASE_VERSION`.
+  The middle number in `v1.0.1` is incremented for API changes or additions
   when they are formally integrated into downstream frameworks, rather than
   for each individual API change or addition.
-- Development: `1.1.0.devN+v1.0.0.ppu2.2.0.g<sha>` additionally includes
+  The final number is incremented for patch releases containing fixes.
+- Development: `1.1.0.devN+v1.0.1.ppu2.2.0.g<sha>` additionally includes
   the commit count and Git commit hash.
 
 ## Quick Start

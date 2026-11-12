@@ -143,7 +143,7 @@ class CustomBuildPy(build_py):
                 shutil.copytree(src_dir, dst_dir)
 
 DEEPGEMM_VERSION = '1.1.0'  # DeepGEMM version
-RELEASE_VERSION = 'v1.0.0'  # Release version
+RELEASE_VERSION = 'v1.0.1'  # Release version
 
 
 def get_package_version(ppu_sdk_version):

@@ -4,7 +4,7 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
-## 1.1.0+v1.0.0
+## 1.1.0+v1.0.1
 
 ### Fixed
 
@@ -25,6 +25,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   follows, because the next step reuses the same `sC` storage. The final step
   needs no extra round: the CTA-wide barrier after the epilogue already covers
   it. Tile selection and dispatch are unchanged.
+
+## 1.1.0+v1.0.0
 
 ### Added
 
