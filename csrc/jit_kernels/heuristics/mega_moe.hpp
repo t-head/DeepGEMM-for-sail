@@ -13,6 +13,7 @@
 #include <tuple>
 #include "common_fp4.hpp"
 #include <deep_gemm/layout/dispatch_layout.cuh>
+#include <deep_gemm/epilogue/gated_activation.cuh>
 
 #include <deep_gemm/layout/routed_moe.cuh>
 #include "common_fp8.hpp"
@@ -233,7 +234,8 @@ struct Gemm1Config {
     int n = 0, k = 0, warp_k = 0;
     int num_ctas = 0, num_threads = 0, master_experts = 0;
     Gemm2MetadataConfig metadata;
-    bool fast_math = true, swiglu_oai = false;
+    bool fast_math = true;
+    GatedActivation activation = GatedActivation::SwiGLU;
     w4fa8::FragmentPolicy fragment = w4fa8::FragmentPolicy::FullK;
 };
 

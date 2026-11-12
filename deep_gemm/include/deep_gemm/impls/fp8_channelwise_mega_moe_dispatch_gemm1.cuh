@@ -1,4 +1,6 @@
 #pragma once
+#include <deep_gemm/epilogue/activation_quant_ops.cuh>
+#include <deep_gemm/impls/mega_moe_io.cuh>
 
 // Channelwise FP8 fused MegaMoE; shared routing is independent of GEMM dtype/layout.
 #include <deep_gemm/impls/mega_moe_transport.cuh>
@@ -10,7 +12,7 @@ namespace deep_gemm::mega_moe::fp8_channelwise {
 
 // Cache the BF16 pairs loaded for amax and reuse them for FP8 conversion.
 // Complete 512-element warp iterations keep every cached vector in bounds.
-template <int kHidden>
+template <int kHidden, bool FastMath>
 CUTLASS_DEVICE void warp_quantize_bf16_row_cached(
         const __ppu_bfloat16* __restrict__ input,
         cutlass::float_e4m3_t* __restrict__ output,
@@ -40,15 +42,11 @@ CUTLASS_DEVICE void warp_quantize_bf16_row_cached(
                 local_amax, fmaxf(fabsf(value.x), fabsf(value.y)));
         }
     }
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        local_amax = fmaxf(
-            local_amax,
-            __shfl_xor_sync(0xffffffffu, local_amax, offset));
+    local_amax = epilogue::quant::warp_amax(local_amax);
 
     // Use the same finite-scale bound as the uncached row quantizer.
-    const float scale = fmaxf(local_amax, 1e-10f) / 448.0f;
-    const float scale_inv = 1.0f / scale;
+    const auto quant_scale = epilogue::quant::fp8_row_scale<FastMath>(local_amax);
+    const float scale = quant_scale.scale, scale_inv = quant_scale.inverse;
     if (lane_idx == 0)
         output_scale[row] = scale;
 
@@ -64,8 +62,7 @@ CUTLASS_DEVICE void warp_quantize_bf16_row_cached(
                 cached[(elem / (32 * kVec)) * (kVec / 2) + i]);
             const float value0 = value.x * scale_inv;
             const float value1 = value.y * scale_inv;
-            packed2[i] = __hg_cvt_float2_to_fp8x2(
-                make_float2(value0, value1), __HG_SATFINITE, __HG_E4M3);
+            packed2[i] = epilogue::quant::fp8_pair(value0, value1);
         }
         *reinterpret_cast<uint4*>(dst + elem) = packed;
     }
@@ -79,9 +76,9 @@ CUTLASS_DEVICE void warp_quantize_bf16_row_common(
     const __ppu_bfloat16* input, cutlass::float_e4m3_t* output,
     float* scales, uint32_t row, uint32_t lane) {
     if constexpr (kHidden % 512 == 0)
-        warp_quantize_bf16_row_cached<kHidden>(input, output, scales, row, lane);
+        warp_quantize_bf16_row_cached<kHidden, bool(DG_MOE_FAST_MATH)>(input, output, scales, row, lane);
     else
-        mega_moe::detail::warp_quantize_bf16_row<kHidden>(input, output, scales, row, lane);
+        mega_moe::detail::warp_quantize_bf16_row<kHidden, bool(DG_MOE_FAST_MATH)>(input, output, scales, row, lane);
 }
 
 // Flatten valid expert rows for quantization, then map back to pool offsets.
@@ -153,7 +150,7 @@ template <
     uint32_t kBlockM, uint32_t kTokenBytes, uint32_t kGemm1N,
     uint32_t kBlockN, uint32_t kBlockK, uint32_t kWarpM,
     uint32_t kWarpN, uint32_t kStages, uint32_t kNumPullCTAs,
-    bool kSwiGLUOAI = false, class Gemm1Backend = void,
+    GatedActivation Activation = GatedActivation::SwiGLU, class Gemm1Backend = void,
     uint32_t kPullGroupSize = kNumPullCTAs / 3, uint32_t kGemm2BlockM = 0, bool kGemm2ValidRows = true>
 CUTLASS_DEVICE void dispatch_gemm1_device(
         void* workspace_base,
@@ -384,7 +381,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                     queue_counter, &queue_ticket);
                 prefetched_work = queue.current();
             } else {
-                mega_moe::fp8_channelwise::gemm1_swiglu_mma_block<Cfg, kSwiGLUOAI>(
+                mega_moe::fp8_channelwise::gemm1_swiglu_mma_block<Cfg, Activation>(
                     reinterpret_cast<const typename Cfg::ElementA*>(
                         token_pool +
                             static_cast<uint64_t>(pool_base) * kTokenBytes),
@@ -406,7 +403,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                     static_cast<int>(kTokenBytes),
                     static_cast<int>(thread_idx),
                     reinterpret_cast<char*>(smem_buf),
-                    swiglu_limit, activation_alpha,
+                    swiglu_limit, activation_alpha, situ_beta, situ_linear_beta,
                     queue_counter, &queue_ticket, &prefetched_work);
             }
         }

@@ -68,14 +68,14 @@ public:
             return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
 #include <deep_gemm/impls/sm89_fp8_fp4_mega_moe.cuh>
-using Builder = deep_gemm::MegaMoEFp8Fp4Gemm1Kernel<{}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEFp8Fp4Gemm1Kernel<{}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
 static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_fp4_mega_moe_l1<Builder>);
 }}
 )",
                 int(c.fast_math), dispatch.block_m, tile.block_n, dispatch.token_bytes, tile.warp_m, tile.warp_n,
-                tile.num_stages, (Activation == GatedActivation::SwiGLUOAI), (Activation == GatedActivation::SiTU),
+                tile.num_stages, int(Activation),
                 c.fragment == w4fa8::FragmentPolicy::FullK ? "FullK" : "RollingK32",
                 !w4fa8::uses_ring_a(tile.warp_m) ? "Bulk" : "Ring2", dispatch.num_experts, c.num_threads,
                 dispatch.num_ranks, c.num_ctas, dispatch.num_experts_per_rank, dispatch.num_topk, c.n, dispatch.pull_ctas,
@@ -186,6 +186,8 @@ inline void fp8_fp4_mega_moe_impl(
     };
     if (activation == GatedActivation::SiTU)
         launch_linear1(std::integral_constant<GatedActivation, GatedActivation::SiTU>{});
+    else if (activation == GatedActivation::SwiGLUStep)
+        launch_linear1(std::integral_constant<GatedActivation, GatedActivation::SwiGLUStep>{});
     else if (activation == GatedActivation::SwiGLUOAI)
         launch_linear1(std::integral_constant<GatedActivation, GatedActivation::SwiGLUOAI>{});
     else

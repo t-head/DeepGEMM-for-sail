@@ -16,6 +16,10 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **MegaMoE activation parity**: all MMA types support `swiglu`, `swiglu_step`,
+  `swiglu_oai` and `situ` through shared FP32 activation formulas. Native PPU
+  sigmoid/tanh are unconditional; `fast_math` selects only the division path.
+
 - **M890 NVFP4 W4A8 GEMMs**: adds `gemm_fp8_nvfp4_bf16_nt` and grouped
   nopad, masked and fused-routing variants for FP8 activations and NVFP4
   weights with BF16 output. Callers select fused decoding or per-call
@@ -45,14 +49,21 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 - **FP8, W4A8 and W4A16 MegaMoE**: adds complete FP8 channelwise/blockwise,
   E4M3 x MXFP4 and BF16 x MXFP4 routed pipelines through the common `SymmBuffer`
   entry and precision-specific weight transforms in `deep_gemm.mega`. Supports
-  FP8 SwiGLU/SwiGLU-OAI, W4A8 SwiGLU/SwiGLU-OAI/SiTU, W4A16 SiTU, separate
-  replica banks and reusable library-owned communication state.
+  SwiGLU, STEP, SwiGLU-OAI and SiTU on every backend, separate replica banks
+  and reusable library-owned communication state.
 
 - **Mega Gate**: adds `bf16_mega_gate`, fusing BF16 routing GEMM,
   sqrt-softplus scoring, bias-aware Top-k selection, weight normalization
   and scaling, and optional logical-to-physical expert mapping.
 
 ### Changed
+
+- **MegaMoE activation precision**: all backends consume FP32 GEMM1
+  accumulators and use FP32 activation with native PPU sigmoid/tanh.
+  Separate row quantizers consume BF16 activation scratch; fused FP4 and
+  blockwise FP8 quantization retain FP32 until the final conversion.
+  `fast_math` selects fast reciprocal versus regular FP32 division for SiTU
+  and post-activation FP8 quantization, independently of native sigmoid/tanh.
 
 - **MegaMoE MMA names**: uses `mma_type="fp4xfp4"`, `"fp8xfp4"`,
   `"bf16xfp4"` and `"fp8xfp8"` consistently across workspace allocation,

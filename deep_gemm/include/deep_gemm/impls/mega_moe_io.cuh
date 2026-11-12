@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <hggc_bf16.h>
 #include <hggc_runtime.h>
-#include <cutlass/fast_math.h>
 
 #ifndef DG_MOE_FAST_MATH
 #define DG_MOE_FAST_MATH 1
@@ -20,30 +19,6 @@ __device__ __forceinline__ void invalidate_unused_routes(
         ids[slot] = -1;
         weights[slot] = 0.0f;
     }
-}
-
-template <bool kFastMath>
-__device__ __forceinline__ float moe_sigmoid(float value) {
-    if constexpr (kFastMath) return __ppu_sgmdf(value);
-    else return 1.0f / (1.0f + expf(-value));
-}
-
-template <bool kFastMath>
-__device__ __forceinline__ float moe_tanh(float value) {
-    if constexpr (kFastMath) return cutlass::fast_tanh(value);
-    else return tanhf(value);
-}
-
-template <bool kFastMath>
-__device__ __forceinline__ float moe_reciprocal(float value) {
-    if constexpr (kFastMath) return __ppu_rcpf(value);
-    else return 1.0f / value;
-}
-
-template <bool kFastMath>
-__device__ __forceinline__ float moe_exp(float value) {
-    if constexpr (kFastMath) return __expf(value);
-    else return expf(value);
 }
 
 // Contiguous BF16 views can have a storage offset that is not 16-byte aligned.

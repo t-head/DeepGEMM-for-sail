@@ -1,6 +1,9 @@
 #pragma once
-#include <tools/util/include/cutlass/util/packed_stride.hpp>
 #include <deep_gemm/impls/mega_moe_io.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/epilogue/gated_activation.cuh>
+#include <deep_gemm/epilogue/activation_quant_ops.cuh>
+#include <tools/util/include/cutlass/util/packed_stride.hpp>
 #include <deep_gemm/scheduler/mega_moe_work_queue.cuh>
 #include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 
@@ -42,18 +45,18 @@ struct Gemm1 {
     }
 };
 
-template <int kN, int kNumThreads, bool kClamp, bool kSwigluOai, class Accum, class Coordinates>
+template <int kN, int kNumThreads, bool kClamp, GatedActivation Activation, class Accum, class Coordinates>
 __device__ __forceinline__ void swiglu_quant_epilogue(
         Accum& accum, const Coordinates& coords, uint8_t* output, float* scales,
         int pool_rows, int valid_rows, int n_block, int thread, char* smem,
-        float swiglu_limit, float activation_alpha, int writable_rows) {
+        float swiglu_limit, float activation_alpha, float situ_beta, float situ_linear_beta, int writable_rows) {
     using namespace cute;
     // Match the BF16 clamp boundary used by the other FP8 activation backends.
     if constexpr (kClamp)
         swiglu_limit = __bfloat162float(__float2bfloat16(swiglu_limit));
-    // One FP32 word of padding avoids subwarp shared-memory bank aliasing.
+    // Two FP32 words of padding keep row starts aligned for float2 accesses.
     constexpr int kStride = 258;
-    auto* tile = reinterpret_cast<__ppu_bfloat16*>(smem);
+    auto* tile = reinterpret_cast<float*>(smem);
     __syncthreads();
     CUTLASS_PRAGMA_UNROLL
     for (int wm = 0; wm < size<1>(coords); ++wm) {
@@ -70,8 +73,8 @@ __device__ __forceinline__ void swiglu_quant_epilogue(
                     for (int i = 0; i < size(frag) / 2; ++i) {
                         const int row = base_m + i * 8;
                         if (row < valid_rows)
-                            *reinterpret_cast<__ppu_bfloat162*>(tile + row * kStride + col) =
-                                __floats2bfloat162_rn(frag(2 * i), frag(2 * i + 1));
+                            *reinterpret_cast<float2*>(tile + row * kStride + col) =
+                                make_float2(frag(2 * i), frag(2 * i + 1));
                     }
                 }
             }
@@ -86,60 +89,40 @@ __device__ __forceinline__ void swiglu_quant_epilogue(
         for (int i = 0; i < 8; ++i) {
             float2 activated = make_float2(0.0f, 0.0f);
             if (row < valid_rows) {
-                float2 g = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(
-                    tile + row * kStride + lane * 16 + i * 2));
-                float2 u = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(
-                    tile + row * kStride + 128 + lane * 16 + i * 2));
-                if constexpr (kClamp) {
-                    g.x = fminf(g.x, swiglu_limit);
-                    g.y = fminf(g.y, swiglu_limit);
-                    u.x = fminf(fmaxf(u.x, -swiglu_limit), swiglu_limit);
-                    u.y = fminf(fmaxf(u.y, -swiglu_limit), swiglu_limit);
-                }
-                if constexpr (kSwigluOai) {
-#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 150
-                    // Honor fast_math without changing the BF16 rounding boundaries.
-                    activated = make_float2(
-                        (g.x * deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-activation_alpha * g.x))) * (u.x + 1.0f),
-                        (g.y * deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-activation_alpha * g.y))) * (u.y + 1.0f));
-#else
-                    activated = make_float2(
-                        (g.x / (1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-activation_alpha * g.x))) * (u.x + 1.0f),
-                        (g.y / (1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-activation_alpha * g.y))) * (u.y + 1.0f));
-#endif
-                } else {
-                    activated = make_float2(
-                        (g.x / (1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-g.x))) * u.x,
-                        (g.y / (1.0f + deep_gemm::mega_moe::detail::moe_exp<DG_MOE_FAST_MATH>(-g.y))) * u.y);
-                }
-                // Round the activation to BF16 before FP8 quantization.
-                activated = __bfloat1622float2(__float22bfloat162_rn(activated));
+                float2 g = *reinterpret_cast<const float2*>(
+                    tile + row * kStride + lane * 16 + i * 2);
+                float2 u = *reinterpret_cast<const float2*>(
+                    tile + row * kStride + 128 + lane * 16 + i * 2);
+                activated = make_float2(
+                    routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
+                        g.x, u.x, kClamp ? swiglu_limit : -1.0f, activation_alpha, situ_beta, situ_linear_beta),
+                    routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
+                        g.y, u.y, kClamp ? swiglu_limit : -1.0f, activation_alpha, situ_beta, situ_linear_beta));
             }
             values[2 * i] = activated.x;
             values[2 * i + 1] = activated.y;
             amax = fmaxf(amax, fmaxf(fabsf(activated.x), fabsf(activated.y)));
         }
-        CUTLASS_PRAGMA_UNROLL
-        for (int offset = 4; offset > 0; offset >>= 1)
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset, 8));
+        amax = epilogue::quant::warp_amax<8>(amax);
+        const auto quant_scale = epilogue::quant::fp8_block_scale<bool(DG_MOE_FAST_MATH)>(amax);
         if (lane == 0)
-            scales[int64_t(n_block) * pool_rows + row] = amax * (1.0f / 448.0f);
-        const float inv = 448.0f / amax;
-        __align__(16) __hg_fp8x2_e4m3 packed[8];
+            scales[int64_t(n_block) * pool_rows + row] = quant_scale.scale;
+        __align__(16) uint16_t packed[8];
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < 8; ++i)
-            packed[i] = __hg_fp8x2_e4m3(make_float2(values[2 * i] * inv, values[2 * i + 1] * inv));
+            packed[i] = epilogue::quant::fp8_pair(values[2 * i] * quant_scale.inverse,
+                                                values[2 * i + 1] * quant_scale.inverse);
         *reinterpret_cast<uint4*>(output + int64_t(row) * (kN / 2) + n_block * 128 + lane * 16) =
             *reinterpret_cast<uint4*>(packed);
     }
     __syncthreads();
 }
 
-template <int kN, int kK, bool kClamp, bool kSwigluOai = false, int kComputeM = 128>
+template <int kN, int kK, bool kClamp, GatedActivation Activation = GatedActivation::SwiGLU, int kComputeM = 128>
 __device__ __forceinline__ void gemm1_block(
         const uint8_t* a, const float* sa, const uint8_t* b, const float* sb,
         uint8_t* output, float* output_scales, int pool_rows, int valid_rows, int n_block,
-        int thread, char* smem, float swiglu_limit, float activation_alpha, int writable_rows) {
+        int thread, char* smem, float swiglu_limit, float activation_alpha, float situ_beta, float situ_linear_beta, int writable_rows) {
     using namespace cute;
     using G = Gemm1<kN, kK, kComputeM>;
     using Mainloop = typename G::CollectiveMainloop;
@@ -168,15 +151,15 @@ __device__ __forceinline__ void gemm1_block(
     auto coordinates = make_identity_tensor(make_shape(valid_rows, kN));
     auto c_tile = local_tile(coordinates, take<0, 2>(Tile{}), make_coord(0, n_block));
     auto t_coord = mma.get_thread_slice(thread).partition_C(c_tile);
-    static_assert(kComputeM * 258 * sizeof(__ppu_bfloat16) <= sizeof(typename Mainloop::SharedStorage));
-    swiglu_quant_epilogue<kN, G::kNumThreads, kClamp, kSwigluOai>(accum, t_coord, output,
-        output_scales, pool_rows, valid_rows, n_block, thread, smem, swiglu_limit, activation_alpha, writable_rows);
+    static_assert(kComputeM * 258 * sizeof(float) <= sizeof(typename Mainloop::SharedStorage));
+    swiglu_quant_epilogue<kN, G::kNumThreads, kClamp, Activation>(accum, t_coord, output,
+        output_scales, pool_rows, valid_rows, n_block, thread, smem, swiglu_limit, activation_alpha, situ_beta, situ_linear_beta, writable_rows);
 }
 
 template <uint32_t kRanks, uint32_t kCTAs, uint32_t kExperts,
           uint32_t kTopk, uint32_t kHidden, uint32_t kN, uint32_t kPullCTAs,
           bool kClamp = false,
-          uint32_t kMasterExperts = kExperts / kRanks, bool kSwigluOai = false,
+          uint32_t kMasterExperts = kExperts / kRanks, GatedActivation Activation = GatedActivation::SwiGLU,
           uint32_t kComputeM = 128, uint32_t kGemm2BlockM = 0>
 CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
         void* workspace_base, const layout::SymBuffer<>& sym_buffer,
@@ -184,7 +167,7 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
         const float* scales, uint8_t* pool, float* pool_scales,
         int32_t* gemm2_metadata, uint4* gemm2_block_info, const uint8_t* w1, const float* s1,
         uint8_t* output, float* output_scales,
-        uint32_t num_tokens, uint32_t cap, float swiglu_limit = 0.0f, float activation_alpha = 1.0f,
+        uint32_t num_tokens, uint32_t cap, float swiglu_limit = 0.0f, float activation_alpha = 1.0f, float situ_beta = 4.0f, float situ_linear_beta = 25.0f,
         const uint8_t* w1_replicas = nullptr, const float* s1_replicas = nullptr) {
     static_assert(kRanks > 0 && kRanks <= 64 && kExperts % kRanks == 0);
     constexpr uint32_t kEpr = kExperts / kRanks;
@@ -303,13 +286,13 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
             const uint32_t writable = local_begin + kComputeM >= rows
                 ? dispatch_blocks * kBlockM - local_begin : kComputeM;
             auto* tile_output = output + uint64_t(base) * (kN / 2);
-            gemm1_block<kN, kHidden, kClamp, kSwigluOai, kComputeM>(
+            gemm1_block<kN, kHidden, kClamp, Activation, kComputeM>(
                 pool + uint64_t(base) * kHidden, pool_scales + base,
                 weight_base + uint64_t(weight_expert) * kN * kHidden,
                 scale_base + uint64_t(weight_expert) * (kN / 128) * kScales,
                 tile_output, output_scales + base,
                 ws.num_max_pool_tokens, valid, n, thread, reinterpret_cast<char*>(smem),
-                swiglu_limit, activation_alpha, writable);
+                swiglu_limit, activation_alpha, situ_beta, situ_linear_beta, writable);
             if (++work == batch_end) {
                 queue.prime(thread, kWorkBatch);
                 work = queue.current();

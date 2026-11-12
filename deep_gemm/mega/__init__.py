@@ -303,8 +303,8 @@ def fp4_fp4_mega_moe(
     OAI uses gate * sigmoid(alpha * gate) * (up + 1), after gate/up clamping.
     activation_alpha is OAI-only, defaults to 1.702, and must be positive finite.
     All activations consume FP32 accumulators before MXFP4 quantization.
-    fast_math selects approximate GEMM1 activation math; False uses
-    expf/division/tanhf without changing MMA precision or MXFP4 formats.
+    fast_math selects reciprocal-based SiTU division versus regular FP32
+    division. Sigmoid and tanh always use native PPU instructions.
     cumulative_local_expert_recv_stats is an optional HGGC int32 vector with
     one entry per local physical expert. Each call adds valid routed assignments
     from every rank, including zero-weight assignments. The caller initializes
@@ -409,9 +409,8 @@ def transform_weights_for_w4a16_mega_moe(
         l1_weights: Tuple[torch.Tensor, torch.Tensor], l2_weights: Tuple[torch.Tensor, torch.Tensor],
         activation: str = "situ",
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-    """Pack canonical MXFP4 weights and UE8M0 scales for BF16 x MXFP4 SiTU."""
-    if activation != "situ":
-        raise ValueError("W4A16 MegaMoE supports activation='situ' only")
+    """Pack canonical MXFP4 weights and UE8M0 scales for BF16 x MXFP4."""
+    _normalize_activation(activation)
     _check_routed_weights(l1_weights, l2_weights, torch.uint8)
 
     def pack_scales(scales):
@@ -460,6 +459,8 @@ def fp8_fp8_mega_moe(
     l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     activation_alpha: Optional[float] = None,
+    situ_beta: Optional[float] = 4.0,
+    situ_linear_beta: Optional[float] = 25.0,
 ) -> None:
     """Complete FP8 MoE; scales follow sym_buffer.quantization, output is BF16.
 
@@ -467,16 +468,23 @@ def fp8_fp8_mega_moe(
     implementation runs dispatch, GEMM1/activation/quantization, GEMM2/scatter,
     and completion. Master and replica tensors may be separate allocations.
     activation_alpha follows fp4_fp4_mega_moe: OAI-only, with None using 1.702.
+    All four activations are supported; SiTU softcap parameters follow
+    fp4_fp4_mega_moe, including situ_linear_beta=None for uncapped up values.
     """
     if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'fp8xfp8':
         raise TypeError("fp8_fp8_mega_moe requires SymmBuffer(mma_type='fp8xfp8')")
     _check_routed_buffer(y, l1_weights, sym_buffer)
+    activation = _normalize_activation(activation)
+    if activation != 'situ':
+        situ_beta = None if situ_beta == 4.0 else situ_beta
+        situ_linear_beta = None if situ_linear_beta == 25.0 else situ_linear_beta
     _C.fp8_fp8_mega_moe(
         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         activation, activation_clamp, fast_math, activation_alpha,
         l1_weights_replicas, l2_weights_replicas, sym_buffer.quantization,
+        situ_beta, situ_linear_beta,
     )
 
 
@@ -494,21 +502,27 @@ def bf16_fp4_mega_moe(
     l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     situ_beta: Optional[float] = 4.0,
     situ_linear_beta: Optional[float] = 25.0,
+    activation_alpha: Optional[float] = None,
 ) -> None:
-    """Complete BF16 x MXFP4 SiTU MoE with BF16 output in original token order.
+    """Complete BF16 x MXFP4 MoE with BF16 output in original token order.
 
     SiTU parameters follow fp4_fp4_mega_moe; situ_linear_beta=None disables
     the up-branch softcap. situ_beta must be positive and finite.
+    SwiGLU, STEP and OAI are also supported, with OAI-only activation_alpha.
     """
     if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'bf16xfp4':
         raise TypeError("bf16_fp4_mega_moe requires SymmBuffer(mma_type='bf16xfp4')")
     _check_routed_buffer(y, l1_weights, sym_buffer)
+    activation = _normalize_activation(activation)
+    if activation != 'situ':
+        situ_beta = None if situ_beta == 4.0 else situ_beta
+        situ_linear_beta = None if situ_linear_beta == 25.0 else situ_linear_beta
     _C.bf16_fp4_mega_moe(
         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         activation, activation_clamp, fast_math, situ_beta, situ_linear_beta,
-        l1_weights_replicas, l2_weights_replicas,
+        l1_weights_replicas, l2_weights_replicas, activation_alpha,
     )
 
 
@@ -555,6 +569,7 @@ def fp8_fp4_mega_moe(
     if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'fp8xfp4':
         raise TypeError("fp8_fp4_mega_moe requires SymmBuffer(mma_type='fp8xfp4')")
     _check_routed_buffer(y, l1_weights, sym_buffer, weight_components=3)
+    activation = _normalize_activation(activation)
     if activation != 'situ':
         situ_beta = None if situ_beta == 4.0 else situ_beta
         situ_linear_beta = None if situ_linear_beta == 25.0 else situ_linear_beta

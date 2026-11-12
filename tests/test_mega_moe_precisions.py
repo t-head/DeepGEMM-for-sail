@@ -184,17 +184,28 @@ def reference(c, source, ids, weights, w1, w2, rank, tokens, *, situ_beta=4.0, s
         src, row, slot = (ids == expert).nonzero(as_tuple=True)
         if not row.numel():
             continue
-        gate, up = (source[src, row].float() @ w1[local_expert].float().T).bfloat16().float().chunk(2, -1)
+        projected = source[src, row].float() @ w1[local_expert].float().T
+        gate, up = projected.chunk(2, -1)
         if c.activation == "situ":
             soft_up = up if situ_linear_beta is None else situ_linear_beta * torch.tanh(up / situ_linear_beta)
             activated = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate) * soft_up
         else:
             if clamp is not None:
-                gate = gate.clamp(max=clamp)
+                if c.activation != "swiglu_step":
+                    gate = gate.clamp(max=clamp)
                 up = up.clamp(-clamp, clamp)
             alpha = 1.702 if c.activation_alpha is None else c.activation_alpha
-            activated = (gate * torch.sigmoid(alpha * gate)) * (up + 1) if c.activation == "swiglu_oai" else F.silu(gate) * up
-        activated = activated.bfloat16()
+            if c.activation == "swiglu_oai":
+                activated = (gate * torch.sigmoid(alpha * gate)) * (up + 1)
+            else:
+                gated = F.silu(gate)
+                if c.activation == "swiglu_step" and clamp is not None:
+                    gated = gated.clamp(max=clamp)
+                activated = gated * up
+        # The separate row quantizer consumes BF16 scratch; fused blockwise
+        # quantization consumes FP32 activation values directly.
+        if c.precision != "fp8_blockwise":
+            activated = activated.bfloat16()
         if c.precision != "w4a16":
             q, s = quantize_rows(activated, blockwise)
             activated = dequantize(q, s, blockwise)
@@ -363,6 +374,21 @@ def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None)
         buffer.destroy()
 
 
+@pytest.mark.parametrize("precision,activation", (
+    ("w4a8", "swiglu_step"),
+    ("fp8_channelwise", "swiglu_step"), ("fp8_channelwise", "situ"),
+    ("fp8_blockwise", "swiglu_step"), ("fp8_blockwise", "situ"),
+    ("w4a16", "swiglu"), ("w4a16", "swiglu_step"), ("w4a16", "swiglu_oai"),
+))
+def test_mega_moe_activation_parity(precision, activation, mega_moe_group):
+    base = next(c for c in SMOKE_CASES if c.precision == precision)
+    case = replace(base, activation=activation, experts=4 * mega_moe_group.size(),
+                   capacity=8, tokens=(8,), clamp=None if activation == "situ" else .125,
+                   activation_alpha=.25 if activation == "swiglu_oai" else None,
+                   worlds=DISTRIBUTED_WORLDS)
+    run_case(case, mega_moe_group, fast_math=False)
+
+
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
 def test_mega_moe_precision(case, mega_moe_group):
     if case in SMOKE_CASES:
@@ -485,12 +511,9 @@ def test_mega_moe_activation_reuse(case, fast_math, mega_moe_group):
     y = torch.empty_like(source)
     try:
         all_source, all_ids, all_weights = _all_gather(source), _all_gather(ids), _all_gather(weights)
-        configurations = []
-        if case.precision in ("w4a16", "w4a8"):
-            configurations += [("situ", 4., 25.), ("situ", .25, 25.), ("situ", .25, .25),
-                               ("situ", .25, None), ("situ", 4., 25.)]
-        if case.precision != "w4a16":
-            configurations += [("swiglu", None, None), ("swiglu_oai", None, None), ("swiglu", None, None)]
+        configurations = [("situ", 4., 25.), ("situ", .25, 25.), ("situ", .25, .25),
+                          ("situ", .25, None), ("situ", 4., 25.), ("swiglu", None, None),
+                          ("swiglu_step", None, None), ("swiglu_oai", None, None), ("swiglu", None, None)]
         replays = []
         for activation, beta, linear_beta in configurations:
             def forward():
@@ -519,12 +542,8 @@ def test_mega_moe_activation_reuse(case, fast_math, mega_moe_group):
             graph.replay()
             torch.cuda.synchronize()
             check_output(y, expected, max_diff)
-        unsupported = "swiglu" if case.precision == "w4a16" else "situ"
-        error = "Unsupported activation"
-        if case.precision == "w4a8":
-            unsupported, error = "swiglu_step", "W4A8 supports"
-        with pytest.raises(RuntimeError, match=error):
-            pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, buffer, activation=unsupported)
+        with pytest.raises(ValueError, match="Unsupported MegaMoE activation"):
+            pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, buffer, activation="unsupported")
     finally:
         pipeline.buffer.destroy()
 
@@ -613,7 +632,7 @@ def test_mega_moe_precision_options(case, mega_moe_group):
             case.topk,
             case.hidden,
             case.intermediate,
-            activation="swiglu" if case.precision == "w4a16" else "step",
+            activation="unsupported",
             **options,
         )
     with pytest.raises(RuntimeError, match="local expert count"):

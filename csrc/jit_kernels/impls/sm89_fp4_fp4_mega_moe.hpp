@@ -183,7 +183,6 @@ public:
         return fmt::format(R"(
 #define DG_MEGAMOE_OWNER_MODE {}
 #define DG_MEGAMOE_OWNER_READER_OPT {}
-#define DG_MEGAMOE_SITU_USE_RCP {}
 #define DG_MEGAMOE_SPLIT_SYNC {}
 #include <deep_gemm/impls/sm89_fp4_fp4_mega_moe.cuh>
 using Builder = deep_gemm::MegaMoEMxfp4Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation::{}, {}, {}, {}>;
@@ -196,7 +195,6 @@ static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::{}<{}>);
 }}
 )", static_cast<int>(!kIsLinear1), static_cast<int>(!kIsLinear1),
-            static_cast<int>(kIsLinear1 && Activation == GatedActivation::SiTU),
             static_cast<int>(a.split_sync),
             info.n, info.k, info.block_m, info.block_n, info.block_k, info.warp_m, info.warp_n, info.num_groups, info.num_stages,
             Ranks, kIsLinear1 ? "deep_gemm::MegaMoEPhaseKind::Linear1" : "deep_gemm::MegaMoEPhaseKind::Linear2",
