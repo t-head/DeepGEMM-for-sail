@@ -13,6 +13,7 @@
 
 #include <deep_gemm/mma/fp4_mma.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
+#include <deep_gemm/mma/fp4_mma_overlap_prologue.cuh>
 #include <deep_gemm/epilogue/fp4_epilogue_silu_and_mul_post_quant.cuh>
 
 namespace cutlass::gemm {
@@ -185,7 +186,7 @@ struct Fp4TypeBuilder {
 
   using DispatchPolicy = cutlass::gemm::MainloopWithScalePPU0015Aiu<kNumStages>;
 
-  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMmaScaleFp4<
+  using CollectiveMainloopBase = typename cutlass::gemm::collective::CollectiveMmaScaleFp4<
       DispatchPolicy, TileShape,
       ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
       ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
@@ -194,6 +195,22 @@ struct Fp4TypeBuilder {
       typename GemmOperandB::GmemTiledCopy, typename GemmOperandB::SmemLayoutAtom, typename GemmOperandB::SmemCopyAtom, TransformB,
       ElementSFA, cutlass::detail::TagToStrideA_t<LayoutSFA>, typename GemmOperandSFA::GmemTiledCopy, typename GemmOperandSFA::SmemLayoutAtom,
       ElementSFB, cutlass::detail::TagToStrideB_t<LayoutSFB>, typename GemmOperandSFB::GmemTiledCopy, typename GemmOperandSFB::SmemLayoutAtom, KernelAiuFp4DynamicTile::DynamicTildId>;
+
+  // All 11 builder/family combinations that select_builder() can reach were measured with the
+  // prefetch on (FP4_TFU_HANDOFF E55: masked, 3 paired reps, 10 faster by 2.5-11.2%, 1 flat), so
+  // the dynamic path needs no performance gate here -- only the protocol conditions. Re-measure if
+  // TileConfigList changes.
+  static constexpr bool kUseOverlapPrologue =
+      kEpilogueType == deep_gemm::EpilogueType::Default && !hasBias &&
+      N_EXPAND == 1 && SHAPE_N % 2 == 0 &&
+      cutlass::gemm::collective::CollectiveMmaScaleFp4OverlapPrologue<CollectiveMainloopBase>::template use_overlap_prologue<SHAPE_K>();
+
+  // OverlapPrologue lives outside the base mainloop; disabled builders keep the
+  // untouched base collective.
+  using CollectiveMainloop = cute::conditional_t<
+      kUseOverlapPrologue,
+      cutlass::gemm::collective::CollectiveMmaScaleFp4OverlapPrologue<CollectiveMainloopBase>,
+      CollectiveMainloopBase>;
 
   // Epilogue
   using EpilogueOutputOp = typename cutlass::platform::conditional<
@@ -243,12 +260,13 @@ struct Fp4TypeBuilder {
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
-  template<
-  typename Params
-  >
+  // next_work() returns (M, m_coord, n_coord, offset_a, offset_b, offset_scalea, offset_scaleb)
+  // of the scheduler's next tile; its loads are only issued when has_next is true.
+  template<typename Params, typename NextWork>
   static CUTLASS_DEVICE void run(Params params, char* smem_buf, int M, int m_coord, int n_coord,
                           int64_t offset_a, int64_t offset_b, int64_t offset_m, int64_t offset_c,
-                          int64_t offset_scalea, int64_t offset_scaleb, int64_t offset_scalec) {
+                          int64_t offset_scalea, int64_t offset_scaleb, int64_t offset_scalec,
+                          NextWork const& next_work, int& pipe_slot, bool& preloaded, bool has_next) {
     if constexpr (is_act_and_quant_fused(kEpilogueType)) {
       // Epilogue reuse the shared storage comes from mainloop.
       // Make sure that the size of epilogue SharedStorage is less than Mainloop.
@@ -265,49 +283,45 @@ struct Fp4TypeBuilder {
     constexpr int L = 1;
     auto problem_shape_MNKL = ProblemShape{M, N, K, L};
     auto blk_shape = TileShape{};
-    
-    const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.ptr_A) + offset_a;
-    const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.ptr_B) + offset_b;
-    const typename CollectiveMainloop::ElementSFA* ptr_scale_A = reinterpret_cast<const typename CollectiveMainloop::ElementSFA*>(params.ptr_scale_A) + offset_scalea;
-    const typename CollectiveMainloop::ElementSFB* ptr_scale_B = reinterpret_cast<const typename CollectiveMainloop::ElementSFB*>(params.ptr_scale_B) + offset_scaleb;
 
-    typename CollectiveMainloop::Arguments args_mainloop{
-      {M, N, K}, ptr_A, params.stride_A, ptr_B, params.stride_B,
-      ptr_scale_A, params.stride_SFA, ptr_scale_B, params.stride_SFB //todo
+    auto mainloop_args = [&](int m, int64_t a, int64_t b, int64_t scale_a, int64_t scale_b)
+        __attribute__((always_inline)) {
+      return typename CollectiveMainloop::Arguments{
+        {m, N, K},
+        reinterpret_cast<const ElementA*>(params.ptr_A) + a, params.stride_A,
+        reinterpret_cast<const ElementB*>(params.ptr_B) + b, params.stride_B,
+        reinterpret_cast<const typename CollectiveMainloop::ElementSFA*>(params.ptr_scale_A) + scale_a, params.stride_SFA,
+        reinterpret_cast<const typename CollectiveMainloop::ElementSFB*>(params.ptr_scale_B) + scale_b, params.stride_SFB
+      };
     };
+    auto args_mainloop = mainloop_args(M, offset_a, offset_b, offset_scalea, offset_scaleb);
 
     auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, 0);
-    CollectiveMainloop collective_mma(args_mainloop, take<0, 3>(problem_shape_MNKL));
-
-    auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, args_mainloop);
-    // Extract out partitioned A and B.
-    Tensor gA = get<0>(load_inputs);
-    Tensor gB = get<1>(load_inputs);
-
-    // Compute tile residues for predication
-    auto m_max_coord = M - size<0>(gA) * get<0>(blk_coord_mnkl);                             // M - BLK_M * m_coord
-    auto n_max_coord = N - size<0>(gB) * get<1>(blk_coord_mnkl);                             // N - BLK_N * n_coord
-    auto k_residue   = K - size<1>(gA) * size<2>(gA);                                        // K - BLK_K * k_coord_max
-    auto residue_mnk = make_tuple(m_max_coord, n_max_coord, k_residue);
-
-    // Allocate the tiled_mma and the accumulators for the (M,N) blk_shape
     TiledMma tiled_mma;
-    Tensor accumulators = make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape))); // (MMA,MMA_M,MMA_N)
-    clear(accumulators);
-
-    auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
-    int  k_tile_count = size<2>(gA);
-
-    // Perform the collective scoped MMA
-    collective_mma(
-      accumulators,
-      load_inputs,
-      accumulators,
-      k_tile_iter, k_tile_count,
-      residue_mnk,
-      thread_idx,
-      smem_buf
-    );
+    Tensor accumulators = make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
+    auto residue_mnk = [&]() __attribute__((always_inline)) {
+      if constexpr (kUseOverlapPrologue) {
+        typename CollectiveMainloop::PipelineState pipeline_state{pipe_slot, preloaded};
+        auto next_fn = [&]() __attribute__((always_inline)) {
+          auto [next_m, next_m_coord, next_n_coord, next_a, next_b, next_scale_a, next_scale_b] = next_work();
+          return make_tuple(mainloop_args(next_m, next_a, next_b, next_scale_a, next_scale_b),
+                            ProblemShape{next_m, N, K, L}, make_coord(next_m_coord, next_n_coord, _, 0));
+        };
+        auto residue = CollectiveMainloop::compute_tile(
+          args_mainloop, problem_shape_MNKL, blk_coord_mnkl, accumulators, thread_idx, smem_buf,
+          &pipeline_state, next_fn, has_next
+        );
+        pipe_slot = has_next ? pipeline_state.smem_pipe_read : 0;
+        preloaded = has_next && pipeline_state.preloaded;
+        return residue;
+      } else {
+        pipe_slot = 0;
+        preloaded = false;
+        return CollectiveMainloop::compute_tile(
+          args_mainloop, problem_shape_MNKL, blk_coord_mnkl, accumulators, thread_idx, smem_buf
+        );
+      }
+    }();
 
     // update params.epilogue for ptrC and ptrD
     auto params_epilogue_local = *(reinterpret_cast<typename CollectiveEpilogue::Params*>(&(params.epi_params)));
@@ -432,13 +446,26 @@ struct Fp4DeepGemmDynamicTile {
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
-    int thread_idx = int(threadIdx.x);
     TileScheduler deep_scheduler({params.shape_m, params.grouped_layout});
 
-    uint32_t m_block_idx, n_block_idx;
-    int builder_idx;
+    uint32_t m_block_idx = 0, n_block_idx = 0;
+    int builder_idx = 4;
+    int pipe_slot = 0;
+    bool preloaded = false;
+    constexpr bool kAnyOverlapPrologue = Builder0::kUseOverlapPrologue || Builder1::kUseOverlapPrologue ||
+                                  Builder2::kUseOverlapPrologue || Builder3::kUseOverlapPrologue || Builder4::kUseOverlapPrologue;
+    bool has_work = false;
+    if constexpr (kAnyOverlapPrologue) {
+      has_work = deep_scheduler.fetch_next_work(m_block_idx, n_block_idx, builder_idx);
+    }
     #pragma clang loop licm(disable)
-    while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx, builder_idx)) {
+    while ([&]() __attribute__((always_inline)) {
+      if constexpr (kAnyOverlapPrologue) {
+        return has_work;
+      } else {
+        return deep_scheduler.fetch_next_work(m_block_idx, n_block_idx, builder_idx);
+      }
+    }()) {
       uint32_t M = deep_scheduler.curr_problem_m();
       auto offset_m = deep_scheduler.curr_offset_m();
       auto offset_a = deep_scheduler.curr_offset_a();
@@ -451,13 +478,55 @@ struct Fp4DeepGemmDynamicTile {
         offset_scalec = deep_scheduler.curr_offset_c_scales();
       }
 
+      uint32_t next_m_block_idx = 0, next_n_block_idx = 0;
+      int next_builder_idx = 4;
+      bool has_next_work = false;
+      bool same_builder = false;
+      if constexpr (kAnyOverlapPrologue) {
+        has_next_work = deep_scheduler.fetch_next_work(next_m_block_idx, next_n_block_idx, next_builder_idx);
+        same_builder = has_next_work && builder_idx == next_builder_idx;
+      }
+      // Read after the lookahead, so the scheduler already describes the next tile.
+      auto next_work = [&]() __attribute__((always_inline)) {
+        return cute::make_tuple(int(deep_scheduler.curr_problem_m()), int(next_m_block_idx), int(next_n_block_idx),
+                          deep_scheduler.curr_offset_a(), deep_scheduler.curr_offset_b(next_m_block_idx),
+                          deep_scheduler.curr_offset_mxfp4_scalea(),
+                          deep_scheduler.curr_offset_mxfp4_scaleb(next_m_block_idx));
+      };
+
       // Dispatch to the selected builder
       switch (builder_idx) {
-        case 0: Builder0::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec); break;
-        case 1: Builder1::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec); break;
-        case 2: Builder2::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec); break;
-        case 3: Builder3::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec); break;
-        default: Builder4::run(params, smem_buf, M, m_block_idx, n_block_idx, offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec); break;
+        case 0:
+          Builder0::run(params, smem_buf, M, m_block_idx, n_block_idx,
+            offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec,
+            next_work, pipe_slot, preloaded, same_builder && Builder0::kUseOverlapPrologue);
+          break;
+        case 1:
+          Builder1::run(params, smem_buf, M, m_block_idx, n_block_idx,
+            offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec,
+            next_work, pipe_slot, preloaded, same_builder && Builder1::kUseOverlapPrologue);
+          break;
+        case 2:
+          Builder2::run(params, smem_buf, M, m_block_idx, n_block_idx,
+            offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec,
+            next_work, pipe_slot, preloaded, same_builder && Builder2::kUseOverlapPrologue);
+          break;
+        case 3:
+          Builder3::run(params, smem_buf, M, m_block_idx, n_block_idx,
+            offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec,
+            next_work, pipe_slot, preloaded, same_builder && Builder3::kUseOverlapPrologue);
+          break;
+        default:
+          Builder4::run(params, smem_buf, M, m_block_idx, n_block_idx,
+            offset_a, offset_b, offset_m, offset_c, offset_scalea, offset_scaleb, offset_scalec,
+            next_work, pipe_slot, preloaded, same_builder && Builder4::kUseOverlapPrologue);
+          break;
+      }
+      if constexpr (kAnyOverlapPrologue) {
+        has_work = has_next_work;
+        m_block_idx = next_m_block_idx;
+        n_block_idx = next_n_block_idx;
+        builder_idx = next_builder_idx;
       }
     }
   }
