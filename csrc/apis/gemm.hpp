@@ -131,8 +131,8 @@ void bf16_gemm_tt(const torch::Tensor& a,
 // Accumulation: every MMA product accumulates in FP32; the high/low parts are
 // combined with an FP32 FMA before the (optional) BF16 rounding of the final
 // store. Layout support: NT only, contiguous tensors (same contract as
-// bf16_gemm_nt). This implementation does not perform K-splitting, so the
-// native API intentionally exposes no Split-K controls.
+// bf16_gemm_nt). Exact FP32 router decode may partition K internally within
+// a CTA; the native API exposes no Split-K controls or global workspace.
 // -----------------------------------------------------------------------------
 torch::Tensor bf16xfp32_gemm_nt(const torch::Tensor& x,
                                 const torch::Tensor& w_high,
@@ -172,8 +172,8 @@ torch::Tensor bf16xfp32_gemm_nt(const torch::Tensor& x,
 
 // Split-K flag workspace, kept for API compatibility with the reference
 // implementation. Shape contract: [ceil(max_tokens / 16), ceil(n / 64)] int32,
-// zero-initialized. This build performs no K-split, so the buffer is never
-// touched by the GEMM and stays zero.
+// zero-initialized. Any internal K partitioning reduces inside the CTA, so
+// this compatibility buffer is never touched by the GEMM.
 torch::Tensor get_gemm_bf16xfp32_workspace(const int64_t& max_weight_hidden_size,
                                           const int64_t& max_tokens = 131072) {
     constexpr int64_t kMinTileM = 16;

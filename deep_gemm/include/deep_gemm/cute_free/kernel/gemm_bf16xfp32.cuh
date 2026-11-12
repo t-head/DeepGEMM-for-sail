@@ -259,8 +259,11 @@ struct GemmBf16xFp32Kernel {
 };
 
 #if defined(DG_DUAL_B_PACKED_N) && DG_DUAL_B_PACKED_N
+#ifndef DG_DUAL_B_DECODE_SPLIT_K
+#define DG_DUAL_B_DECODE_SPLIT_K 1
+#endif
 // Small-M router experiment: pack 8 high columns and 8 low columns into the two N halves of one MMA.
-// Each half independently accumulates full K in order in FP32; merge only at the store, without K splitting or precision changes.
+// Each half independently accumulates its K range in FP32; optional CTA-local partitions reduce high/low separately before the store.
 template <typename ElementOutput, int BLOCK_M, int BLOCK_N, int BLOCK_K, int STAGES>
 struct PackedDualNRouterKernel {
   using Element = cutlass::bfloat16_t;
@@ -270,7 +273,10 @@ struct PackedDualNRouterKernel {
   static_assert(std::is_same_v<ElementOutput, float>, "packed router requires FP32 output");
   static_assert(BLOCK_K % 64 == 0 && STAGES >= 2, "packed router requires complete K tiles");
   static_assert(BLOCK_M % 16 == 0 && BLOCK_N % 16 == 0, "packed router uses complete physical MMA tiles");
-  static constexpr int MaxThreadsPerBlock = (BLOCK_M / 16) * (BLOCK_N / 16) * 32;
+  static constexpr int kSplitK = DG_DUAL_B_DECODE_SPLIT_K;
+  static_assert(kSplitK == 1 || kSplitK == 2 || kSplitK == 4 || kSplitK == 8,
+                "decode K partition count must be a power of two up to eight");
+  static constexpr int MaxThreadsPerBlock = (BLOCK_M / 16) * (BLOCK_N / 16) * kSplitK * 32;
   static constexpr int MinBlocksPerMultiprocessor = 1;
   static constexpr int kSteps = BLOCK_K / 16;
   struct Params {
@@ -284,7 +290,7 @@ struct PackedDualNRouterKernel {
     DenseGemmTileSchedulerArguments scheduler;
   };
   struct SharedStorage {
-    alignas(128) Element smem[STAGES * (BLOCK_M + BLOCK_N) * BLOCK_K];
+    alignas(128) Element smem[kSplitK * STAGES * (BLOCK_M + BLOCK_N) * BLOCK_K];
   };
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
@@ -352,22 +358,28 @@ struct PackedDualNRouterKernel {
       p.scheduler.shape_k = DG_DUAL_B_ROUTER_K;
     }
     DenseGemmScheduler<BLOCK_M, BLOCK_N / 2> scheduler(p.scheduler);
-    Element* a = reinterpret_cast<Element*>(smem);
-    Element* b = a + STAGES * BLOCK_M * BLOCK_K;
     const int lane = threadIdx.x % 32;
-    const int warp_id = __shfl_sync(0xFFFFFFFFU, threadIdx.x / 32, 0);
+    const int physical_warp = __shfl_sync(0xFFFFFFFFU, threadIdx.x / 32, 0);
+    const int split_id = physical_warp % kSplitK;
+    const int warp_id = physical_warp / kSplitK;
     const int warp_row = warp_id / (BLOCK_N / 16);
     const int warp_col = warp_id % (BLOCK_N / 16);
+    Element* a = reinterpret_cast<Element*>(smem)
+        + split_id * STAGES * (BLOCK_M + BLOCK_N) * BLOCK_K;
+    Element* b = a + STAGES * BLOCK_M * BLOCK_K;
     uint32_t mb = 0, nb = 0;
     while (scheduler.fetch_next_work(mb, nb)) {
       const int mo = int(mb) * BLOCK_M, no = int(nb) * (BLOCK_N / 2);
-      const int tiles = math::ceil_div(p.K, BLOCK_K);
+      // All partitions execute the same padded tile count, so CTA barriers remain convergent.
+      // Tensor loads zero-fill the final global-K tail; no valid K element is omitted or duplicated.
+      const int tiles = math::ceil_div(p.K, BLOCK_K * kSplitK);
+      const int first_tile = split_id * tiles;
       int loaded = 0;
       #pragma unroll
       for (int s = 0; s < STAGES && loaded < tiles; ++s) {
         if (warp_id == 0)
           load_stage(a + s * BLOCK_M * BLOCK_K, b + s * BLOCK_N * BLOCK_K,
-                     p, mo, no, loaded * BLOCK_K);
+                     p, mo, no, (first_tile + loaded) * BLOCK_K);
         cutlass::arch::cp_async_fence();
         ++loaded;
       }
@@ -386,24 +398,42 @@ struct PackedDualNRouterKernel {
           S2RB::load(bb, 0, br[0]);
         }
         bool issue = loaded < tiles;
-        run_pairs<0>(p, a, b, stage, next, mo, no, loaded, issue,
+        run_pairs<0>(p, a, b, stage, next, mo, no, first_tile + loaded, issue,
                      ba, bb, warp_id, warp_row, warp_col, acc, ar, br);
         if (issue) ++loaded;
         stage = next;
       }
-      cutlass::arch::cp_async_wait<0>();
-      __syncthreads();
+      if constexpr (kSplitK > 1) {
+        cutlass::arch::cp_async_wait<0>();
+        __syncthreads();
+        // Reuse drained operand SMEM for deterministic FP32 partials; no global workspace or atomics.
+        static_assert(SharedStorageSize >= MaxThreadsPerBlock * 8 * int(sizeof(float)),
+                      "operand storage must fit all partial accumulators");
+        float* partials = reinterpret_cast<float*>(smem);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) partials[threadIdx.x * 8 + i] = acc[i];
+        __syncthreads();
+        if (split_id == 0) {
+          #pragma unroll
+          for (int part = 1; part < kSplitK; ++part) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+              acc[i] += partials[((warp_id * kSplitK + part) * 32 + lane) * 8 + i];
+          }
+        }
+      }
       #pragma unroll
       for (int half = 0; half < 2; ++half) {
         int row = mo + warp_row * 16 + lane / 4 + half * 8;
         int col = no + warp_col * 8 + (lane % 4) * 2;
-        if (row < p.M && col + 1 < p.N) {
+        if (split_id == 0 && row < p.M && col + 1 < p.N) {
           const int i = half * 2;
           *reinterpret_cast<float2*>(p.ptr_D + int64_t(row) * p.ldd + col) =
               make_float2(acc[i] + p.low_scale * acc[i + 4],
                           acc[i + 1] + p.low_scale * acc[i + 5]);
         }
       }
+      if constexpr (kSplitK > 1) __syncthreads();
     }
   }
 };

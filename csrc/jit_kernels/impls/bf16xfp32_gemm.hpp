@@ -16,7 +16,8 @@
 //     per output tile, each stage carrying A + W_high + W_low together (A is
 //     streamed once), two back-to-back MMAs per k_step into two FP32
 //     accumulators, combined in registers and stored once.
-//     Small M also uses fused dual-BF16 MMA; no K splitting or composed two-pass GEMV.
+//     Exact FP32 router decode partitions K across two warps within each CTA,
+//     reduces high/low partials in FP32, and stores once without a global workspace.
 // PPU1.0 (810E): fallback composition of two BF16 GEMMs through an FP32
 //     intermediate (still BF16 tensor-core rate, higher precision than
 //     BF16 x BF16 because the low part recovers the residual bits).
@@ -73,6 +74,7 @@ public:
         bool overlap_prologue, valid_epilogue, packed_dual_n, static_router, static_stages, streamed_low, standard_s2, streamed_pairs;
         int min_blocks;
         bool pairs_m_first;
+        int decode_split_k;
     };
 
     struct Args {
@@ -105,6 +107,7 @@ public:
 #define DG_DUAL_B_STREAMED_LOW {26}
 #define DG_DUAL_B_STREAMED_PAIRS {28}
 #define DG_DUAL_B_PAIRS_M_FIRST {30}
+#define DG_DUAL_B_DECODE_SPLIT_K {31}
 #include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
 
 namespace deep_gemm {{
@@ -131,7 +134,7 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             is_aligned_n ? "true" : "false",
             std::is_same_v<ElementOutput, float> ? ", float" : "",
             info.kernel_name, sizeof(GemmKernelParams),
-            (info.num_stages * (info.block_m + (info.packed_dual_n ? 1 : 2) * info.block_n) * info.block_k * 2 + 127) & ~127,
+            (info.decode_split_k * info.num_stages * (info.block_m + (info.packed_dual_n ? 1 : 2) * info.block_n) * info.block_k * 2 + 127) & ~127,
             info.full_k_prefetch ? 1 : 0, info.early_g2s ? 1 : 0, info.mma_s2r_overlap ? 1 : 0,
             info.bounded_kloop ? 1 : 0, info.kloop_unroll, info.kloop_chunk ? 1 : 0,
             info.overlap_prologue ? 1 : 0, info.valid_epilogue ? 1 : 0, info.packed_dual_n ? 1 : 0,
@@ -140,7 +143,7 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             info.static_router ? args.kernel_params.K : 0,
             info.static_stages ? 1 : 0, info.streamed_low ? 1 : 0,
             info.standard_s2 ? "false" : "true", info.streamed_pairs ? 1 : 0, info.min_blocks,
-            info.pairs_m_first ? 1 : 0);
+            info.pairs_m_first ? 1 : 0, info.decode_split_k);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -373,6 +376,18 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
             && (!configs.has_value() || (static_env != nullptr && *static_env == '1')))
             || m == 128 || m == 256 || m == 512 || m == 4096 || m == 16384) && n == 384 && k == 7168;
 
+    // Validated exact decode default: partition K among warps and reduce high/low FP32 chains inside the CTA.
+    // Explicit configs and disabled packed/static paths retain one full-K partition unless opted in.
+    const char* split_env = std::getenv("DG_BF16XFP32_DECODE_SPLIT_K");
+    DG_HOST_ASSERT(split_env == nullptr || std::string(split_env) == "1" || std::string(split_env) == "2"
+                   || std::string(split_env) == "4" || std::string(split_env) == "8");
+    const bool split_default = !configs.has_value() && !other_pipeline && packed_dual_n && static_router
+        && std::is_same_v<ElementOutput, float> && (m == 8 || m == 16) && n == 384 && k == 7168;
+    const int decode_split_k = split_env == nullptr ? (split_default ? 2 : 1) : *split_env - '0';
+    DG_HOST_ASSERT(decode_split_k == 1 || (packed_dual_n && static_router
+                   && std::is_same_v<ElementOutput, float> && (m == 8 || m == 16)
+                   && n == 384 && k == 7168));
+
     using Config = std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 
     Config cfg;
@@ -384,11 +399,12 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
     } else if (std::is_same_v<ElementOutput, float> && (m == 8 || m == 16)
                && n == 384 && k == 7168) {
-        // Router decode specialization validated with 64-layer rotation on the same card; larger BK reduces stage sync while one warp covers full K.
-        // Apply only to exact shapes with FP32 output; explicit configs, standard BF16, and PPU1.0 paths remain unchanged.
+        // Two K partitions with BK128/stage4 reduce decode latency in both hot and 64-layer rotation.
+        // The split=1 override restores legacy packed geometry; explicit configs, BF16 output, and PPU1.0 remain unchanged.
+        const int decode_bk = decode_split_k > 1 ? 128 : 512;
         cfg = packed_dual_n
-            ? std::make_tuple(std::min(num_sms, 39), 16, 16, 512,
-                              16, 16, 512, 4, std::make_tuple(0, 0, 0))
+            ? std::make_tuple(std::min(num_sms, 39), 16, 16, decode_bk,
+                              16, 16, decode_bk, 4, std::make_tuple(0, 0, 0))
             : std::make_tuple(std::min(num_sms, 24), 16, 16, 1024,
                               16, 16, 1024, 2, std::make_tuple(0, 0, 0));
     } else if (std::is_same_v<ElementOutput, float> && m == 128 && n == 384 && k == 7168) {
@@ -396,9 +412,13 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
         cfg = std::make_tuple(std::min(num_sms, 39), 64, 32, 128,
                               16, 16, 128, 4, std::make_tuple(0, 0, 0));
     } else if (std::is_same_v<ElementOutput, float> && m == 256 && n == 384 && k == 7168) {
-        // Exact M256 uses a full M tile and deeper stages; both modes passed interleaved tuning without changing K order.
-        cfg = std::make_tuple(std::min(num_sms, 39), 128, 32, 128,
-                              16, 16, 128, 5, std::make_tuple(0, 0, 0));
+        // Exact M256 uses 36 output tiles and a smaller dual-B SMEM footprint, validated against unrestricted FP32 BLAS.
+        // Preserve the opt-in packed geometry; the default keeps both independent FP32 chains over full K.
+        cfg = packed_dual_n
+            ? std::make_tuple(std::min(num_sms, 39), 128, 32, 128,
+                              16, 16, 128, 5, std::make_tuple(0, 0, 0))
+            : std::make_tuple(std::min(num_sms, 39), 96, 32, 64,
+                              32, 16, 64, 7, std::make_tuple(0, 0, 0));
     } else if (std::is_same_v<ElementOutput, float> && m == 512 && n == 384 && k == 7168) {
         // Exact M512 increases warp-M reuse while preserving separate high/low FP32 accumulation chains over full K.
         cfg = std::make_tuple(std::min(num_sms, 39), 128, 64, 64,
@@ -426,13 +446,13 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
                    && (m == 8 || m == 16 || m == 128 || m == 256) && n == 384 && k == 7168
                    && block_m > 0 && block_n > 0 && block_k >= 64 && block_k % 64 == 0
                    && block_m % 16 == 0 && block_n % 16 == 0 && warp_m == 16 && warp_n == 16
-                   && (block_m / 16) * (block_n / 16) <= 32));
+                   && (block_m / 16) * (block_n / 16) * decode_split_k <= 32));
 
     // Budget the full dual-B SMEM footprint while preserving stage pruning for explicit configs.
     constexpr int kSmemPerCU = 256 * 1024;
     constexpr int kElemBytes = static_cast<int>(sizeof(cutlass::bfloat16_t));
     auto dual_smem_bytes = [&](int stages) {
-        int bytes = stages * (block_m + (packed_dual_n ? 1 : 2) * block_n) * block_k * kElemBytes;
+        int bytes = decode_split_k * stages * (block_m + (packed_dual_n ? 1 : 2) * block_n) * block_k * kElemBytes;
         return (bytes + 127) & ~127;
     };
     while (num_stages > 2 && dual_smem_bytes(num_stages) > kSmemPerCU)
@@ -471,7 +491,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     hparams.scheduler = DenseGemmTileSchedulerArguments{(uint32_t)m, (uint32_t)n, (uint32_t)k, nullptr};
 
     const int warps_k = block_k / warp_k;
-    dim3 const block = (block_m / warp_m) * (block_n / warp_n) * warps_k * 32;
+    dim3 const block = (block_m / warp_m) * (block_n / warp_n) * warps_k * decode_split_k * 32;
 
     // SMEM-based occupancy heuristic on the dual-B footprint.
     int blocks_per_cu = kSmemPerCU / SMSIZE;
@@ -487,6 +507,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     if (std::is_same_v<ElementOutput, float>) kernel_name += "_fp32";
     if (packed_dual_n) kernel_name += "_packed_dual_n";
     if (static_router) kernel_name += "_static_router_m" + std::to_string(m);
+    if (decode_split_k > 1) kernel_name += "_decode_sk" + std::to_string(decode_split_k);
     // Exact long-prefill experiment: specialize only outer stage indices; each chain still advances through full K in order.
     const char* stages_env = std::getenv("DG_BF16XFP32_STATIC_STAGES");
     DG_HOST_ASSERT(stages_env == nullptr || std::string(stages_env) == "0" || std::string(stages_env) == "1");
@@ -541,7 +562,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     DG_HOST_ASSERT(early_env == nullptr || std::string(early_env) == "0" || std::string(early_env) == "1");
     const bool early_g2s = (early_env != nullptr && *early_env == '1')
         || (early_env == nullptr && !other_pipeline && !packed_dual_n && !configs.has_value()
-            && std::is_same_v<ElementOutput, float> && m == 128 && n == 384 && k == 7168);
+            && std::is_same_v<ElementOutput, float> && (m == 128 || m == 256) && n == 384 && k == 7168);
     DG_HOST_ASSERT(!early_g2s || !full_k_prefetch);
     if (early_g2s) kernel_name += "_early_g2s";
     const char* overlap_env = std::getenv("DG_BF16XFP32_MMA_S2R_OVERLAP");
@@ -589,12 +610,12 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     auto args = typename Runtime::Args{
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages,
                         "Normal", kernel_name, full_k_prefetch, early_g2s, mma_s2r_overlap, bounded_kloop, kloop_unroll, kloop_chunk,
-                        overlap_prologue, valid_epilogue, packed_dual_n, static_router, static_stages, streamed_low, standard_s2, streamed_pairs, min_blocks, pairs_m_first},
+                        overlap_prologue, valid_epilogue, packed_dual_n, static_router, static_stages, streamed_low, standard_s2, streamed_pairs, min_blocks, pairs_m_first, decode_split_k},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = hparams,
     };
 
-    const auto& code = Runtime::generate(args);
+    std::string code = Runtime::generate(args);
     auto runtime = compiler->build(kernel_name, code);
     if (is_compile_only())
         return;
@@ -625,6 +646,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
         printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n",
                block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages);
         printf("SMSIZE:%d, vreg:%d, stack:%d\n", SMSIZE, int(numRegs), int(localSize));
+        printf("dual_b_decode_split_k:%d\n", decode_split_k);
         printf("dual_b_static_stages:%d, streamed_low:%d\n", int(static_stages), int(streamed_low));
         printf("dual_b_standard_s2:%d\n", int(standard_s2));
         printf("dual_b_streamed_pairs:%d\n", int(streamed_pairs));
@@ -641,7 +663,8 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
 }
 
 // Public launcher: dispatches on the device generation.
-//   PPU1.5 : All M use dual-B fusion with independent full-K FP32 accumulation and BF16 or FP32 output.
+//   PPU1.5 : All M use dual-B fusion with FP32 accumulation and BF16 or FP32 output.
+//            Exact FP32 decode may partition K and reduce both accumulation chains inside the CTA.
 //   PPU1.0 : composed two-GEMM fallback (out = x@w_high^T, then out +=
 //            scale * x@w_low^T).
 // `configs` (optional) follows the 8-element public ConfigTuple contract of
