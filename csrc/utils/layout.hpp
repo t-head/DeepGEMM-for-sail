@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <limits>
 #include <torch/python.h>
 #include <deep_gemm/common/types.cuh>
 
@@ -35,6 +37,35 @@ static bool fp8_requires_k_major() {
 }
 
 // Tensor utils
+// D must be contiguous; input must be rank-2 and either contiguous or have
+// unit column stride (padded/broadcast rows are allowed).
+// Compare absolute addresses so separately imported DLPack storage is covered.
+static bool is_contiguous_output_disjoint(const torch::Tensor& d, const torch::Tensor& input) {
+    if (!d.numel() || !input.numel() || d.device() != input.device()) return true;
+    DG_HOST_ASSERT(d.is_contiguous() && input.dim() == 2);
+    const uintptr_t db = reinterpret_cast<uintptr_t>(d.data_ptr());
+    const uintptr_t ib = reinterpret_cast<uintptr_t>(input.data_ptr());
+    const uint64_t limit = std::numeric_limits<uintptr_t>::max();
+    if (input.is_contiguous()) {
+        if (d.nbytes() > limit - db || input.nbytes() > limit - ib) return false;
+        return db + d.nbytes() <= ib || ib + input.nbytes() <= db;
+    }
+    DG_HOST_ASSERT(input.stride(1) == 1);
+    const uint64_t bytes = d.nbytes(), rowBytes = uint64_t(input.size(1)) * input.element_size();
+    if (input.stride(0) < 0 || uint64_t(input.stride(0)) > limit / input.element_size() ||
+        bytes > limit - db || rowBytes > limit - ib) return false;
+    const uint64_t pitch = uint64_t(input.stride(0)) * input.element_size();
+    const uint64_t rows = input.size(0);
+    if (pitch && rows - 1 > (limit - ib - rowBytes) / pitch) return false;
+    const uintptr_t de = db + bytes;
+    if (ib >= de) return true;
+    if (!pitch) return ib + rowBytes <= db;
+    // Skip all source rows ending before D. The next row is the only one
+    // needed to decide whether the contiguous D interval intersects a row.
+    const uint64_t first = db >= ib + rowBytes ? (db - ib - rowBytes) / pitch + 1 : 0;
+    return first >= rows || ib + first * pitch >= de;
+}
+
 template <int N>
 static auto get_shape(const torch::Tensor& t) {
     DG_HOST_ASSERT(t.is_cuda());

@@ -35,45 +35,6 @@ using NVFP4Activation = nvfp4::Activation;
 using NVFP4Weight = nvfp4::Weight;
 using NVFP4ExecutionConfig = nvfp4::ExecutionConfig;
 
-// D is contiguous; A/B are contiguous and C may have padded/broadcast rows.
-// Compare absolute addresses so separately imported DLPack storage is covered.
-static bool gemm_disjoint(const torch::Tensor& d, const torch::Tensor& input) {
-    if (!d.numel() || !input.numel() || d.device() != input.device()) return true;
-    DG_HOST_ASSERT(d.is_contiguous() && input.dim() == 2);
-    const uintptr_t db = reinterpret_cast<uintptr_t>(d.data_ptr());
-    const uintptr_t ib = reinterpret_cast<uintptr_t>(input.data_ptr());
-    const uint64_t limit = std::numeric_limits<uintptr_t>::max();
-    if (input.is_contiguous()) {
-        if (d.nbytes() > limit - db || input.nbytes() > limit - ib) return false;
-        return db + d.nbytes() <= ib || ib + input.nbytes() <= db;
-    }
-    DG_HOST_ASSERT(input.stride(1) == 1);
-    const uint64_t bytes = d.nbytes(), rowBytes = uint64_t(input.size(1)) * input.element_size();
-    if (input.stride(0) < 0 || uint64_t(input.stride(0)) > limit / input.element_size() ||
-        bytes > limit - db || rowBytes > limit - ib) return false;
-    const uint64_t pitch = uint64_t(input.stride(0)) * input.element_size();
-    const uint64_t rows = input.size(0);
-    if (pitch && rows - 1 > (limit - ib - rowBytes) / pitch) return false;
-    const uintptr_t de = db + bytes;
-    if (ib >= de) return true;
-    if (!pitch) return ib + rowBytes <= db;
-    // Skip all source rows ending before D. The next row is the only one
-    // needed to decide whether the contiguous D interval intersects a row.
-    const uint64_t first = db >= ib + rowBytes ? (db - ib - rowBytes) / pitch + 1 : 0;
-    return first >= rows || ib + first * pitch >= de;
-}
-
-static void check_gemm_device_and_output(const torch::Tensor& a, const torch::Tensor& b,
-                                         const torch::Tensor& d) {
-    TORCH_CHECK(a.is_cuda() && b.device() == a.device() && d.device() == a.device(),
-                "GEMM tensors must be on the same accelerator");
-    int device;
-    DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device));
-    TORCH_CHECK(a.get_device() == device, "GEMM tensors must be on the current accelerator");
-    TORCH_CHECK(gemm_disjoint(d, a) && gemm_disjoint(d, b),
-                "GEMM output must not overlap an input");
-}
-
 extern "C" {
 static bool early_return(const int& m, const int &n, const int& k,
                          const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
@@ -152,7 +113,13 @@ void bf16_gemm_nt(const torch::Tensor& a,
     TORCH_CHECK(a.is_contiguous(), "lhs must be contiguous");
     TORCH_CHECK(b.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
-    check_gemm_device_and_output(a, b, d);
+    TORCH_CHECK(b.device() == a.device() && d.device() == a.device(),
+                "GEMM tensors must be on the same accelerator");
+    int device;
+    DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device));
+    TORCH_CHECK(a.get_device() == device, "GEMM tensors must be on the current accelerator");
+    TORCH_CHECK(is_contiguous_output_disjoint(d, a) && is_contiguous_output_disjoint(d, b),
+                "GEMM output must not overlap an input");
     if (c.has_value()) {
         TORCH_CHECK(c->sizes() == d.sizes(), "C and D must have the same shape");
         TORCH_CHECK(c->scalar_type() == d.scalar_type(), "C and D must have the same dtype");
@@ -160,7 +127,7 @@ void bf16_gemm_nt(const torch::Tensor& a,
         check_major_type_cd(c.value());
         TORCH_CHECK(c->data_ptr() != d.data_ptr() || c->strides() == d.strides(),
                     "C and D sharing the same address must have the same strides");
-        TORCH_CHECK(c->data_ptr() == d.data_ptr() || gemm_disjoint(d, *c),
+        TORCH_CHECK(c->data_ptr() == d.data_ptr() || is_contiguous_output_disjoint(d, *c),
                     "BF16 GEMM C/D must be disjoint or exactly aliased");
     }
     if (m == 0 || n == 0) return;

@@ -1694,7 +1694,7 @@ def test_dense_gemm_api(args):
                 if accumulation == 'separate':
                     gemm_assert_exact(c, initial_c)
                 print(f'Passed normal BF16 accuracy: {diff=:.10f}')
-    if benchmarking:
+    if benchmarking and m > 0 and n > 0:
         # Time the complete call, including every split-K/hybrid kernel. Keep
         # the requested budget active throughout warm-up and timing.
         seconds = gemm_call_with_sms(args, lambda: gemm_bench_cold(invoke))
