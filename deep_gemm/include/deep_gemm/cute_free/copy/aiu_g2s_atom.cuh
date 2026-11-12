@@ -2,7 +2,11 @@
 
 #include <type_traits>
 #include <cutlass/bfloat16.h>
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+#include <deep_gemm/cute_free/arch/ppu_tc01_copy.cuh>
+#else
 #include <deep_gemm/cute_free/arch/ppu_tc02_copy.cuh>
+#endif
 #include <deep_gemm/cute_free/copy/copy_traits.cuh>
 
 namespace deep_gemm {

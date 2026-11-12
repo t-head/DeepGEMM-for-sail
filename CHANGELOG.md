@@ -54,8 +54,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 - **Mega Gate**: adds `bf16_mega_gate`, fusing BF16 routing GEMM, bias-aware
   Top-k selection, weight normalization and scaling, and optional
-  logical-to-physical expert mapping. The default is `scoring_func="sqrtsoftplus"`.
-  GLM-5.3 uses `scoring_func="sigmoid"`.
+  logical-to-physical expert mapping on Zhenwu 810E and 890P.
+  Supports `scoring_func="sqrtsoftplus"` (default) and `scoring_func="sigmoid"`.
 
 ### Changed
 
