@@ -433,9 +433,10 @@ def test_mega_gate_sigmoid_partial_scores(tmp_path) -> None:
     # Observe the production validity flag directly: trapping the full kernel would
     # invalidate the device context used by the rest of the check-in suite.
     root = Path(__file__).resolve().parents[1]
-    sdk = Path(os.environ.get('PPU_SDK', '/usr/local/PPU_SDK'))
+    hgcc = (os.environ.get('DG_JIT_HGCC_COMPILER') or os.environ.get('DG_HGCC_COMPILER')
+            or Path(deep_gemm.PPU_HOME) / 'bin/hgcc')
     binary = tmp_path / 'mega_gate_partial_scores'
-    subprocess.run([str(sdk / 'bin/hgcc'), '-std=c++17', '-arch=ppu_15',
+    subprocess.run([hgcc, '-std=c++17', '-arch=ppu_15',
                     '-I' + str(root / 'deep_gemm/include'),
                     '-I' + str(root / 'third-party/actlize_v1.0.0/include'),
                     str(root / 'tests/mega_gate_partial_scores.cu'), '-o', str(binary)], check=True)
