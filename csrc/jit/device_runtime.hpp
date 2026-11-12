@@ -1,7 +1,9 @@
 #pragma once
 
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <acblasLt.h>
 #include <hggc_runtime_api.h>
 #include <torch/version.h>
@@ -17,9 +19,28 @@
 namespace deep_gemm {
 
 class DeviceRuntime {
-    int num_sms = 0, tc_util = 0;
+    int tc_util = 0;
     bool enable_pdl = false;
-    std::shared_ptr<hggcDeviceProp> cached_prop;
+    struct DeviceState {
+        std::shared_ptr<hggcDeviceProp> prop;
+        int num_sms = 0;
+    };
+    std::mutex device_states_mutex;
+    std::unordered_map<int, DeviceState> device_states;
+
+    // Caller holds device_states_mutex. Device guards change the current device,
+    // so both hardware properties and caller-selected SM budgets must follow it.
+    DeviceState& current_device_state() {
+        int device_idx;
+        DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device_idx));
+        auto& state = device_states[device_idx];
+        if (state.prop == nullptr) {
+            hggcDeviceProp prop;
+            DG_HGGC_RUNTIME_CHECK(hggcGetDeviceProperties(&prop, device_idx));
+            state.prop = std::make_shared<hggcDeviceProp>(prop);
+        }
+        return state;
+    }
 
     // acBLASLt utils
     static constexpr size_t kAcblasLtWorkspaceSize = 32 * 1024 * 1024;
@@ -71,14 +92,8 @@ public:
     }
 
     std::shared_ptr<hggcDeviceProp> get_prop() {
-        if (cached_prop == nullptr) {
-            int device_idx;
-            hggcDeviceProp prop;
-            DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device_idx));
-            DG_HGGC_RUNTIME_CHECK(hggcGetDeviceProperties(&prop, device_idx));
-            cached_prop = std::make_shared<hggcDeviceProp>(prop);
-        }
-        return cached_prop;
+        std::lock_guard<std::mutex> lock(device_states_mutex);
+        return current_device_state().prop;
     }
 
     std::pair<int, int> get_arch_pair() {
@@ -96,13 +111,18 @@ public:
     }
 
     void set_num_sms(const int& new_num_sms) {
-        DG_HOST_ASSERT(0 <= new_num_sms and new_num_sms <= get_prop()->multiProcessorCount);
-        num_sms = new_num_sms;
+        std::lock_guard<std::mutex> lock(device_states_mutex);
+        auto& state = current_device_state();
+        DG_HOST_ASSERT(0 <= new_num_sms and new_num_sms <= state.prop->multiProcessorCount);
+        state.num_sms = new_num_sms;
     }
 
     int get_num_sms() {
+        std::lock_guard<std::mutex> lock(device_states_mutex);
+        auto& state = current_device_state();
+        auto& num_sms = state.num_sms;
         if (num_sms == 0) {
-            const auto prop = get_prop();
+            const auto& prop = state.prop;
             std::cout << "device_props.name:" << prop->name << std::endl;
             const std::string device_name(prop->name);
             // Synced from the legacy free function deep_gemm::get_num_sms() (utils/utils.hpp):

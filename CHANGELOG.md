@@ -6,6 +6,14 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ## Unreleased
 
+### Fixed
+
+- **Device properties and CU budgets**: cache architecture and `set_num_sms`
+  overrides per current device, so switching devices does not reuse the first
+  device's architecture or scheduling budget.
+- **Sparse MQA input contracts**: enforce 16-byte input base-address alignment
+  consistently for MXFP4 and INT8, in both paged and non-paged compute APIs.
+
 ### Added
 
 - **M890 NVFP4 W4A8 GEMMs**: adds `gemm_fp8_nvfp4_bf16_nt` and grouped

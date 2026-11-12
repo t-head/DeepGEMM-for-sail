@@ -24,6 +24,10 @@ def device_version_supported(one_case):
     if (one_case.get('gemm_type') in ('MqaLogits', 'PagedMqaLogits')
             and data_type == torch.int8 and get_arch_version() != 80):
         return False, 'INT8 indexer requires 810E'
+    sparse_int8 = (one_case.get('gemm_type') in ('SparseMqaLogits', 'PagedSparseMqaLogits')
+                   and data_type == torch.int8)
+    if sparse_int8 and get_arch_version() != 80:
+        return False, 'INT8 sparse MQA logits requires PPU1.0 (ZW810E, sm_80)'
     if one_case.get('device') == '810e' and 'ZW810E' not in torch.cuda.get_device_name():
         return False, 'This regression case requires ZW810E'
     if one_case.get('gemm_type') == 'Activation' or data_type in ('w4fa16_mma', 'w4fa8_mma', 'w4a8_nvfp4'):

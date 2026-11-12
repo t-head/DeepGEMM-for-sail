@@ -18,13 +18,8 @@ int get_num_sms() {
 }
 
 bool is_ppu1v5_device() {
-    hggcDeviceProp device_prop;
-    hggcGetDeviceProperties(&device_prop, 0);
-    if (device_prop.major == 8 && device_prop.minor == 9) {
-        return true;
-    } else {
-        return false;
-    }
+    const auto [major, minor] = device_runtime->get_arch_pair();
+    return major == 8 and minor == 9;
 }
 
 static acArch_t get_ppu_arch() {
@@ -39,9 +34,7 @@ static acArch_t get_ppu_arch() {
 }
 
 int get_sm_count() {
-    hggcDeviceProp device_prop;
-    hggcGetDeviceProperties(&device_prop, 0);
-    return device_prop.multiProcessorCount;
+    return device_runtime->get_prop()->multiProcessorCount;
 }
 
 std::unordered_map<std::string, int> get_extra_info(int m = 0, int n = 0, int k = 0, int dtype = 1,

@@ -129,8 +129,10 @@ from ._C import (
     # Attention kernels (sparse MQA logits)
     get_sparse_mqa_logits_metadata,
     fp8_fp4_sparse_mqa_logits,
+    int8_sparse_mqa_logits,
     get_paged_sparse_mqa_logits_metadata,
     fp8_fp4_paged_sparse_mqa_logits,
+    int8_paged_sparse_mqa_logits,
 )
 
 from ._C import epilogue

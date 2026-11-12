@@ -426,11 +426,11 @@ See the [indexer API guide](docs/api/indexer.md) for all signatures, dtype
 and layout contracts, metadata generation, top-k coordinate mapping and
 recommended 810E/M890 integration settings.
 
-#### Sparse MQA logits (Zhenwu M890)
+#### Sparse MQA logits (Zhenwu M890 / 810E)
 
 Sparse MQA computes indexer logits only for selected KV blocks, for both
-prefill and paged decode. The current implementation supports **MXFP4
-only**, despite the `fp8_fp4` API prefix, with **32 heads** and
+prefill and paged decode. On M890, the `fp8_fp4` APIs support **MXFP4
+only**, with **32 heads** and
 **head dimension 128**. Build metadata with the matching helper before
 calling the logits kernel:
 
@@ -447,15 +447,25 @@ are contiguous BF16 `[T,32]`.
 `sparse_block_kv` is **8 or 16**, and `num_max_sparse_blocks` must be a
 positive multiple of 4, at most 4096. The selected KV block indices are
 contiguous int32 `[T,num_max_sparse_blocks]`, with a strictly increasing
-valid prefix in each row. Paged sparse MQA requires a positive `page_kv`
+valid prefix in each row. Paged MXFP4 sparse MQA requires a positive `page_kv`
 that is a multiple of `sparse_block_kv`; its fused uint8 KV cache has shape
 `[num_pages,page_kv,1,68]` and a 512-byte-aligned page stride.
 
-The output is BF16 with shape
+The MXFP4 output is BF16 with shape
 `[T,num_max_sparse_blocks*sparse_block_kv]`, with an aligned physical row stride.
 Logical columns are compacted by selected block slot:
 `column = slot*sparse_block_kv + token_in_block`, rather than absolute KV
 token position. Allocation padding is not exposed as logical columns.
+
+On 810E, `int8_sparse_mqa_logits` and `int8_paged_sparse_mqa_logits` add
+INT8 support with the same metadata helpers, head count and head dimension.
+Q scales are folded into BF16 weights; K scales are per-token FP32.
+Its paged cache has shape `[num_pages,page_kv,1,132]`, with K bytes followed
+by FP32 scales within each page; see the API guide for packing and padding.
+INT8 output includes padding columns up to a multiple of 512; callers must
+mask invalid candidates and padding before top-k. Both formats require
+16-byte-aligned compute input base addresses.
+
 See the [indexer API guide](docs/api/indexer.md) for metadata and layout
 requirements and [attention tests](tests/test_attention.py) for supported
 cases.
@@ -536,7 +546,7 @@ In addition, the dense GEMM kernels only implement the NT layout. The `nn` / `tn
 
 The library provides some utility functions besides the above kernels:
 
-- `deep_gemm.set_num_sms` / `get_num_sms`: set/get the maximum CU count to use
+- `deep_gemm.set_num_sms` / `get_num_sms`: set/get the maximum CU count to use on the current device
 - `deep_gemm.set_tc_util` / `get_tc_util`: set/get an approximated tensor cell utilization ratio
 - `deep_gemm.set_pdl` / `get_pdl`: enable/disable Programmatic Dependent Launch (PDL)
 - `deep_gemm.set_compile_mode` / `get_compile_mode`: set/get the JIT compile mode
