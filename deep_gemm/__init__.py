@@ -137,9 +137,6 @@ from ._C import (
 
 from ._C import epilogue
 
-# The bundled MegaGate JIT kernel accepts NaN/inf in masked input rows.
-BF16_MEGA_GATE_SUPPORTS_MASKED_NONFINITE = True
-
 _C.init(
     os.path.dirname(os.path.abspath(__file__)), # Library root directory path
     PPU_HOME         # SDK root
