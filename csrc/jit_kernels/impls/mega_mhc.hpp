@@ -15,6 +15,9 @@ public:
     struct Config {
         int hidden, splits, iterations, tile_m, task_splits;
         bool full_rows, single, local, tail_rows, tail_tokens, vector_coefficients;
+        // Non-shifted specialization: same runtime, different template arguments.
+        // Defaults keep the shifted path unchanged.
+        bool non_shift = false;
     };
     struct Args {
         Config config;
@@ -26,14 +29,24 @@ public:
     static std::string generate_impl(const Args& args) {
         const auto& c = args.config;
         std::string specialization;
-        if (c.single) {
+        const char* kernel_name;
+        if (c.non_shift) {
+            // Same kernel as the shifted path, without the warm-up pre.
+            specialization = fmt::format(
+                "ppu_mega_mhc_shifted_bf16_device<{},{},{},false,false,false,{},{},{},{},{},true>",
+                c.hidden, c.splits, c.iterations, c.tile_m, c.task_splits,
+                c.tail_rows, c.tail_tokens, c.vector_coefficients);
+            kernel_name = "ppu_mega_mhc_nonshift";
+        } else if (c.single) {
             specialization = fmt::format(
                 "ppu_mega_mhc_shifted_bf16_device<{},{},{},false,true,{},{},{},{},{},{}>",
                 c.hidden, c.splits, c.iterations, c.local, c.tile_m, c.task_splits,
                 c.tail_rows, c.tail_tokens, c.vector_coefficients);
+            kernel_name = "ppu_mega_mhc_single";
         } else {
             specialization = fmt::format("ppu_mega_mhc_shifted_bf16_device<{},{},{},{}>",
                                          c.hidden, c.splits, c.iterations, c.full_rows);
+            kernel_name = "ppu_mega_mhc";
         }
         return fmt::format(R"(
 #include <deep_gemm/impls/ppu_mega_mhc_bf16.cuh>
@@ -41,8 +54,7 @@ extern "C"
 __global__ __launch_bounds__({}) void {}(deep_gemm::mhc::Args args) {{
     deep_gemm::mhc::{}(args);
 }}
-)", args.launch_args.block_dim.x,
-            c.single ? "ppu_mega_mhc_single" : "ppu_mega_mhc", specialization);
+)", args.launch_args.block_dim.x, kernel_name, specialization);
     }
 
     static void launch_impl(const KernelHandle& kernel, LaunchConfigHandle config, Args args) {
@@ -64,7 +76,9 @@ __global__ __launch_bounds__({}) void {}(deep_gemm::mhc::Args args) {{
 
 static void launch_mega_mhc(MegaMhcRuntime::Args args, int num_sms, int physical_num_sms, bool cooperative_supported) {
     static auto mhc_compiler = LazyInit<HGCCCompiler>([]() { return std::make_shared<HGCCCompiler>(); });
-    const auto name = args.config.single ? "ppu_mega_mhc_single" : "ppu_mega_mhc";
+    const auto name = args.config.non_shift
+        ? "ppu_mega_mhc_nonshift"
+        : (args.config.single ? "ppu_mega_mhc_single" : "ppu_mega_mhc");
     auto runtime = mhc_compiler->build(name, MegaMhcRuntime::generate(args));
     if (args.config.single && cooperative_supported) {
         int resident_blocks = 0;

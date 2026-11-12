@@ -56,9 +56,9 @@ namespace deep_gemm::mhc {
 // Preserve route-then-element, TF32 and Split-K accumulation order.
 constexpr int M = 64, K = 64, P = 26;
 
-template<int H, int S, int Iters, bool FullRows=false>
+template<int H, int S, int Iters, bool FullRows=false, bool NonShift=false>
 __device__ void finish(Args a, int mb, __ppu_bfloat16* norm_tile, int first_row=0, int row_limit=M) {
-    constexpr bool InterleaveNorm = Iters==20;
+    constexpr bool InterleaveNorm = Iters==20 && !NonShift;
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     // Padded rows must still participate in CTA barriers.
     int remaining=a.tokens-mb*M;
@@ -76,9 +76,11 @@ __device__ void finish(Args a, int mb, __ppu_bfloat16* norm_tile, int first_row=
                 if(lane<26) early[split]=source[split*M*P+lane];
         }
         {
-            for(int pos=threadIdx.x*8;pos<4*H;pos+=128*8) {
-                int token=mb*M+row-warp+pos/H;
-                primitives::cp_async_16(norm_tile+pos,a.y+(int64_t)token*H+pos%H,FullRows || token<a.tokens);
+            if constexpr(!NonShift) {
+                for(int pos=threadIdx.x*8;pos<4*H;pos+=128*8) {
+                    int token=mb*M+row-warp+pos/H;
+                    primitives::cp_async_16(norm_tile+pos,a.y+(int64_t)token*H+pos%H,FullRows || token<a.tokens);
+                }
             }
             if constexpr(S==5 || S==6 || S==12) {
                 if(mb*16+first_row/4==blockIdx.x) {
@@ -159,6 +161,42 @@ __device__ void finish(Args a, int mb, __ppu_bfloat16* norm_tile, int first_row=
             }
         }
         if(lane<16 && valid) a.new_comb[t*16+lane]=c;
+        if constexpr(NonShift) {
+            float weights[4];
+            #pragma unroll
+            for(int route=0;route<4;++route)
+                weights[route]=__shfl_sync(0xffffffff,pre,route);
+            float sum_sq=0.f;
+            for(int base=0;base<H;base+=256) {
+                int h=base+lane*8;
+                float mixed[8]={};
+                if(valid) {
+                    #pragma unroll
+                    for(int route=0;route<4;++route) {
+                        uint4 bits=*reinterpret_cast<const uint4*>(a.new_residual+(int64_t)t*4*H+route*H+h);
+                        const auto* values=reinterpret_cast<const __ppu_bfloat16*>(&bits);
+                        #pragma unroll
+                        for(int z=0;z<8;++z)
+                            mixed[z]=__fadd_rn(mixed[z],__fmul_rn(__bfloat162float(values[z]),weights[route]));
+                    }
+                }
+                uint4 rounded;
+                #pragma unroll
+                for(int z=0;z<8;z+=2) {
+                    // Reference RMSNorm normalizes the FP32 mixed vector and only
+                    // the stored operand is rounded to BF16, matching
+                    // mhc_pre_big_fuse_with_norm_tilelang.
+                    sum_sq=__fadd_rn(sum_sq,__fmul_rn(mixed[z],mixed[z]));
+                    sum_sq=__fadd_rn(sum_sq,__fmul_rn(mixed[z+1],mixed[z+1]));
+                    reinterpret_cast<__ppu_bfloat162*>(&rounded)[z/2]=__floats2bfloat162_rn(mixed[z],mixed[z+1]);
+                }
+                *reinterpret_cast<uint4*>(norm_tile+warp*H+h)=rounded;
+            }
+            #pragma unroll
+            for(int delta=16;delta>0;delta/=2)
+                sum_sq+=__shfl_xor_sync(0xffffffff,sum_sq,delta);
+            usq=sum_sq;
+        }
         if constexpr(!InterleaveNorm) {
             cute::cp_async_wait<0>(); __syncthreads();
             float inv=rsqrtf(usq/H+a.norm_eps);
@@ -540,9 +578,10 @@ __device__ __forceinline__ void manual_tf32_pair_n24(float* d, const uint32_t* a
 #endif
 
 template<int H, int S, int Iters, bool FullRows=false, bool SingleKernel=false, bool LocalCompletion=false,
-         int SingleTileM=32, int TaskSplits=2, bool TailRows=false, bool TailTokens=false, bool VectorCoefficients=true>
+         int SingleTileM=32, int TaskSplits=2, bool TailRows=false, bool TailTokens=false, bool VectorCoefficients=true,
+         bool NonShift=false>
 __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
-    static_assert(H==5120, "Mega-mHC requires hidden=5120");
+    static_assert(NonShift ? H==4096 && !SingleKernel : H==5120, "Unsupported Mega-mHC mode or hidden size");
     static_assert(!SingleKernel || ((S>=8 && S<=80 && S%2==0) && Iters==20 && !FullRows),
                   "Single-kernel specialization requires shifted BF16 H5120/I20");
     static_assert(TaskSplits==1 || TaskSplits==2, "One or two splits per producer task");
@@ -630,6 +669,7 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
         #pragma unroll
         for(int z=tid;z<M*6;z+=Threads) {
             int row=z/6,c=z%6,t=mb*M+row;
+            if constexpr(NonShift) if(c==0) continue;
             const float* source=c==0 ? a.pre+t*4 : c==1 ? a.post+t*4 : a.comb+t*16+(c-2)*4;
             primitives::cp_async_16(&storage.coeff[row][c*4],source,(FullRows || t<tokens));
         }
@@ -721,7 +761,7 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
             }
             #pragma unroll
             for(int part=0;part<2;++part) {
-                if constexpr(S==80 || S==40 || S==8 || S==12 || S==6 || S==16 || SingleKernel) {
+                if constexpr(S==80 || S==40 || S==8 || S==12 || S==6 || S==16 || SingleKernel || NonShift) {
                     if constexpr(SingleKernel) {
                         int row=warp*16+part*8+lane/4, k=(lane%4)*16;
                         int t=mb*M+row, offset=row*64+(k^((row&7)*8));
@@ -783,7 +823,7 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
                                 const auto rounded=reinterpret_cast<const __ppu_bfloat162*>(packed_r[route])[z/2];
                                 const float2 v=__bfloat1622float2(rounded);
                                 sq[part]=fmaf(v.x,v.x,sq[part]);sq[part]=fmaf(v.y,v.y,sq[part]);
-                                {u[z]=fmaf(v.x,pre,u[z]);u[z+1]=fmaf(v.y,pre,u[z+1]);}
+                                if constexpr(!NonShift) {u[z]=fmaf(v.x,pre,u[z]);u[z+1]=fmaf(v.y,pre,u[z+1]);}
                             }
                             #pragma unroll
                             for(int half=0;half<2;++half) {
@@ -853,9 +893,18 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
                             #pragma unroll
                             for(int route=0;route<4;++route) {
                                 const float post=local_coeff[4+route];
-                                float v0=old[4][0]*post,v1=old[4][1]*post;
+                                float v0,v1;
+                                if constexpr(NonShift) {
+                                    v0=__fmul_rn(old[0][0],local_coeff[8+route]);
+                                    v1=__fmul_rn(old[0][1],local_coeff[8+route]);
+                                    v0=fmaf(post,old[4][0],v0);
+                                    v1=fmaf(post,old[4][1],v1);
+                                } else {
+                                    v0=old[4][0]*post;
+                                    v1=old[4][1]*post;
+                                }
                                 #pragma unroll
-                                for(int j=0;j<4;++j) {
+                                for(int j=NonShift ? 1 : 0;j<4;++j) {
                                     const float comb=local_coeff[8+j*4+route];
                                     v0=fmaf(old[j][0],comb,v0);
                                     v1=fmaf(old[j][1],comb,v1);
@@ -873,7 +922,7 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
                                 const auto rounded=reinterpret_cast<const __ppu_bfloat162*>(packed_r[route])[z/2];
                                 const float2 v=__bfloat1622float2(rounded);
                                 sq[part]=fmaf(v.x,v.x,sq[part]);sq[part]=fmaf(v.y,v.y,sq[part]);
-                                {u[z]=fmaf(v.x,pre,u[z]);u[z+1]=fmaf(v.y,pre,u[z+1]);}
+                                if constexpr(!NonShift) {u[z]=fmaf(v.x,pre,u[z]);u[z+1]=fmaf(v.y,pre,u[z+1]);}
                             }
                             #pragma unroll
                             for(int half=0;half<2;++half) {
@@ -883,7 +932,7 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
                                 cutlass::arch::global_store<uint4,16>(packed_r[route][half], residual_out+route*H+half*8, (FullRows || t<tokens));
                             }
                         }
-                        {
+                        if constexpr(!NonShift) {
                             uint4 packed_u[2];
                             #pragma unroll
                             for(int z=0;z<16;z+=2) {
@@ -1214,7 +1263,7 @@ __device__ __forceinline__ void ppu_mega_mhc_shifted_bf16_device(Args a) {
             int mb=task/16, row=(task%16)*4;
             if(tid==0) while(atomicAdd(a.counters+mb,0)!=S) {}
             __syncthreads();
-            finish<H,S,Iters,FullRows>(a,mb,reinterpret_cast<__ppu_bfloat16*>(&storage),row,row+4);
+            finish<H,S,Iters,FullRows,NonShift>(a,mb,reinterpret_cast<__ppu_bfloat16*>(&storage),row,row+4);
             // finish() already ends each four-row task with a CTA barrier.
             if constexpr(S!=12) __syncthreads();
         }
