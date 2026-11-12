@@ -39,7 +39,7 @@ using BF16xFp32GemmCuteFreeKernel = kernel::GemmBf16xFp32Kernel<
     copy::TsmS2RAtom<cutlass::bfloat16_t, BLOCK_N, BLOCK_K, /*SwapLboSbo=*/true>,   // S2R B
     mma::Bf16MmaAtom,                                          // MMA
     epilogue::Epilogue<ElementOutput, mma::Bf16MmaAtom::CLayout,
-                             WARP_M, WARP_N, IsAlignedN>,      // Epilogue
+                             WARP_M, WARP_N, IsAlignedN, true>, // Epilogue
     BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, STAGES, DenseS2Opt,
     GemmTypeTag>;
 #endif
