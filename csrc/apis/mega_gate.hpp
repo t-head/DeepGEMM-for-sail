@@ -159,7 +159,8 @@ bf16_mega_gate(const torch::Tensor& x,
         .routed_scaling_factor = routed_scaling_factor,
     };
     ppu_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
-                         routing_args, num_tokens, hidden, num_routed_experts, num_topk, !use_default_score);
+                       routing_args, num_tokens, hidden, num_routed_experts, num_topk,
+                       use_shared_as_routed, num_shared_experts, scoring_func);
     return {topk_idx, topk_weights};
 }
 

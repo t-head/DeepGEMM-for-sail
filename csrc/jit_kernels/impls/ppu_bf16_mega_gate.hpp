@@ -1,6 +1,7 @@
 #pragma once
 #include <torch/python.h>
 #include <deep_gemm/layout/mega_gate.cuh>
+#include <deep_gemm/common/profiling_interface.cuh>
 #include "../../jit/compiler.hpp"
 #include "../../jit/kernel_runtime.hpp"
 #include "../heuristics/mega_gate.hpp"
@@ -73,18 +74,46 @@ void ppu_bf16_mega_gate(deep_gemm::mega_gate_layout::KernelArgs args) {{
     }
 };
 
+static HgtxRangeGuard profile_mega_gate(
+        int tokens, int hidden, int experts, int topk, bool use_shared_as_routed, int num_shared_experts,
+        const std::string& scoring_func, const mega_gate_layout::RoutingArgs& routing,
+        const std::optional<torch::Tensor>& bias, const std::optional<torch::Tensor>& image_bias,
+        const std::optional<torch::Tensor>& image_token_mask, const std::optional<torch::Tensor>& mask,
+        const std::optional<torch::Tensor>& fix_routing_mask, const std::optional<torch::Tensor>& force_random) {
+    if (not profiling_enabled())
+        return HgtxRangeGuard{};
+    DgProfParam params;
+    params.set_mega_gate_params(tokens, hidden, experts, topk, use_shared_as_routed, num_shared_experts,
+                                routing.routed_scaling_factor, static_cast<int>(routing.rank_idx), current_stream());
+    params.add_params("with_bias", bias.has_value());
+    params.add_params("with_physical_map", routing.to_physical_map != nullptr);
+    params.add_params("with_image_bias", image_bias.has_value());
+    params.add_params("with_mask", mask.has_value());
+    params.add_params("with_unmapped_topk_idx", routing.unmapped_topk_idx != nullptr);
+    params.add_params("scoring_func", scoring_func);
+    params.add_params("with_fix_routing_mask", fix_routing_mask.has_value());
+    params.add_params("with_force_random", force_random.has_value());
+    return show_gemm_ut(params);
+}
+
 static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weight,
         const std::optional<torch::Tensor>& bias, const std::optional<torch::Tensor>& image_bias,
         const std::optional<torch::Tensor>& image_token_mask, const std::optional<torch::Tensor>& mask,
         const std::optional<torch::Tensor>& fix_routing_mask, const std::optional<torch::Tensor>& force_random,
         const mega_gate_layout::RoutingArgs& routing, int tokens, int hidden, int experts, int topk,
-        bool use_sigmoid, bool single_producer = false) {
+        bool use_shared_as_routed, int num_shared_experts, const std::string& scoring_func, bool single_producer = false) {
     using namespace mega_gate_layout;
     DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16u == 0u);
     DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16u == 0u);
-    DG_HOST_ASSERT(get_ppu_arch() == AC_PPU0015);
-    const auto config = get_mega_gate_config(tokens, hidden, experts, device_runtime->get_num_sms(),
-                                              bias.has_value() and !image_token_mask.has_value(), topk, single_producer);
+    DG_HOST_ASSERT(get_ppu_arch() == AC_PPU0010 or get_ppu_arch() == AC_PPU0015);
+    const auto config = [&]() -> MegaGateConfig {
+        if (get_ppu_arch() == AC_PPU0010 and !single_producer) {
+            return mega_gate::get_sm80_mega_gate_config(tokens, hidden, experts,
+                device_runtime->get_num_sms(), topk, bias.has_value() and !image_token_mask.has_value());
+        }
+        return mega_gate::get_sm89_mega_gate_config(tokens, hidden, experts, device_runtime->get_num_sms(),
+                                    bias.has_value() and !image_token_mask.has_value(), topk, single_producer);
+    }();
     const auto& [num_sms, m, n, k, wm, wn, stages, smem] = config.gemm;
     const int blocks = (tokens + m - 1) / m;
     const int padded_experts = config.aligned_experts, producers = config.producers;
@@ -108,11 +137,11 @@ static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weig
     args.features = (mask ? kTokenMask : 0) | (force_random ? kForceRandom : 0) |
         (fix_routing_mask ? kFixRouting : 0) | (bias ? kExpertBias : 0) |
         (image_token_mask ? kImageTokenMask : 0) | (routing.num_shared_experts ? kSharedExperts : 0) |
-        (use_sigmoid ? kSigmoidScore : 0);
+        (scoring_func == "sigmoid" ? kSigmoidScore : 0);
     // Devices or CU budgets that cannot hold a producer group use one CTA per token tile.
     if (producers > 1 and !cooperative) {
         ppu_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
-                          routing, tokens, hidden, experts, topk, use_sigmoid, true);
+                          routing, tokens, hidden, experts, topk, use_shared_as_routed, num_shared_experts, scoring_func, true);
         return;
     }
     auto kernel = compiler->build("ppu_bf16_mega_gate", PPUMegaGateRuntime::generate(args));
@@ -128,7 +157,7 @@ static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weig
             const int resident_groups = std::min(blocks, capacity / producers);
             if (resident_groups == 0) {
                 ppu_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
-                                  routing, tokens, hidden, experts, topk, use_sigmoid, true);
+                                  routing, tokens, hidden, experts, topk, use_shared_as_routed, num_shared_experts, scoring_func, true);
                 return;
             }
             args.launch_args.grid_dim = dim3(resident_groups * producers);
@@ -142,6 +171,8 @@ static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weig
                                  x.options().dtype(torch::kInt));
     args.kernel_args.scratch = scratch.data_ptr<float>();
     args.kernel_args.score_barriers = barriers.data_ptr<int>();
+    const auto profiling_range = profile_mega_gate(tokens, hidden, experts, topk, use_shared_as_routed,
+        num_shared_experts, scoring_func, routing, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random);
     PPUMegaGateRuntime::launch(kernel, args);
 }
 } // namespace deep_gemm

@@ -6,7 +6,7 @@
 #include <deep_gemm/layout/mega_gate.cuh>
 #include <deep_gemm/tix/utils.cuh>
 #include <deep_gemm/epilogue/ppu_mega_gate.cuh>
-#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ == 100 || __HGGC_ARCH__ >= 150)
 #include <deep_gemm/cute_free/copy/aiu_g2s_atom.cuh>
 #include <deep_gemm/cute_free/copy/tsm_s2r_atom.cuh>
 #include <deep_gemm/cute_free/mma/mma_atom.cuh>
@@ -16,6 +16,18 @@
 
 namespace deep_gemm {
 namespace mega_gate_detail {
+
+// Coordinates of the first score in an MMA accumulator register pair.
+__device__ __forceinline__ void score_coords(int tile_token, int tile_expert, int lane, int r,
+                                             int& token, int& expert) {
+#if __HGGC_ARCH__ == 100
+    token = tile_token + lane / 4 + (r / 4) * 8;
+    expert = tile_expert + (lane % 4) + (r % 4) * 4;
+#else
+    token = tile_token + lane / 4 + ((r / 2) % 2) * 8;
+    expert = tile_expert + (lane % 4) * 2 + (r / 4) * 8;
+#endif
+}
 
 __device__ __forceinline__ uint32_t ordered_score_key(float value) {
     const uint32_t bits = __float_as_uint(value == 0.0f ? 0.0f : value);
@@ -424,7 +436,7 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
     for (int round = 0; round < rounds; ++round) {
     const int token_tile = first_token_tile + round * tile_stride;
     const int token_base = token_tile * M;
-#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ == 100 || __HGGC_ARCH__ >= 150)
     {
         // Reuse the library's AIU + swizzled TSM + register-buffered MMA pipeline.
         using Element = cutlass::bfloat16_t;
@@ -471,8 +483,9 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
                     hi += partial[k * Plane + base + 32];
                 }
                 const int mi = e / (8 * (WarpN / 16)), ni = (e / 8) % (WarpN / 16), r = e % 8;
-                const int token = token_base + warp_m * WarpM + mi * 16 + lane / 4 + ((r / 2) % 2) * 8;
-                const int expert = expert_base + warp_n * WarpN + ni * 16 + (lane % 4) * 2 + (r / 4) * 8;
+                int token, expert;
+                mega_gate_detail::score_coords(token_base + warp_m * WarpM + mi * 16,
+                                               expert_base + warp_n * WarpN + ni * 16, lane, r, token, expert);
                 const int64_t score_row = GroupedScores ?
                     (int64_t(token / M) * S + split) * M + token % M : int64_t(token) * S + split;
                 store_checked_scores<UseSigmoid, S>(a, token, expert, a.scratch + score_row * E + expert, lo, hi, check_activated, gate_is_valid);
@@ -491,8 +504,9 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
                 for (int ni = 0; ni < WarpN / 16; ++ni) {
                     #pragma unroll
                     for (int r = 0; r < 8; r += 2) {
-                        const int token = token_base + warp_m * WarpM + mi * 16 + lane / 4 + ((r / 2) % 2) * 8;
-                        const int expert = expert_base + warp_n * WarpN + ni * 16 + (lane % 4) * 2 + (r / 4) * 8;
+                        int token, expert;
+                        mega_gate_detail::score_coords(token_base + warp_m * WarpM + mi * 16,
+                                                       expert_base + warp_n * WarpN + ni * 16, lane, r, token, expert);
                         const int row = token - a.scratch_token_base;
                         const int64_t score_row = GroupedScores ?
                             (int64_t(row / M) * S + split) * M + row % M : int64_t(row) * S + split;

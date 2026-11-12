@@ -56,6 +56,15 @@ HcPrenormGemm,data_type:tf32,m:64,n:8,k:128
 HcPrenormGemm,data_type:tf32,m:64,n:16,k:128
 HcPrenormGemm,data_type:tf32,m:1024,n:32,k:64
 
+# ============ MegaGate ============
+
+MegaGate,data_type:bf16,num_tokens:16,hidden:5120,num_routed_experts:384,num_topk:6
+MegaGate,data_type:bf16,num_tokens:129,hidden:5120,num_routed_experts:384,num_topk:6,use_shared_as_routed:1,with_image_bias:1,with_mask:1,with_unmapped_topk_idx:1,routed_scaling_factor:1.25,ep_rank:1
+MegaGate,data_type:bf16,num_tokens:8192,hidden:5120,num_routed_experts:384,num_topk:6
+MegaGate,data_type:bf16,num_tokens:32,hidden:5120,num_routed_experts:128,num_topk:3,with_bias:0,with_physical_map:0
+MegaGate,data_type:bf16,num_tokens:8192,hidden:5120,num_routed_experts:128,num_topk:3
+MegaGate,data_type:bf16,num_tokens:128,hidden:6144,num_routed_experts:256,num_topk:8,scoring_func:sigmoid,with_mask:1,with_unmapped_topk_idx:1,with_fix_routing_mask:1,with_force_random:1
+
 # ============ BatchGemm ============
 
 # --- BatchGemm / bf16 (native strided API, not quantized einsum) ---

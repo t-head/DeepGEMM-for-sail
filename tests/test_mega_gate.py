@@ -53,10 +53,10 @@ def make_physical_map(num_logical_experts: int) -> tuple[torch.Tensor, torch.Ten
     return to_physical_map, logical_count
 
 
-def normalized_weights(selected: torch.Tensor, *, sigmoid: bool) -> torch.Tensor:
+def normalized_weights(selected: torch.Tensor, *, sigmoid: bool, scale: float = ROUTED_SCALING_FACTOR) -> torch.Tensor:
     total = selected.sum(dim=-1, keepdim=True)
     denominator = torch.where(total > 0, total, 1.0) if sigmoid else total + 1e-20
-    return selected / denominator * ROUTED_SCALING_FACTOR
+    return selected / denominator * scale
 
 
 def make_inputs(num_tokens: int, hidden: int, num_routed_experts: int,
@@ -96,11 +96,12 @@ def make_outputs(inputs: dict[str, Any], use_shared_as_routed: bool = False,
 def run_mega_gate(inputs: dict[str, Any], outputs: dict[str, torch.Tensor | None],
                   use_shared_as_routed: bool = False,
                   num_topk: int = NUM_TOPK, num_shared_experts: int = NUM_SHARED_EXPERTS,
+                  routed_scaling_factor: float = ROUTED_SCALING_FACTOR, ep_rank: int = 0,
                   **overrides: Any) -> tuple[torch.Tensor, torch.Tensor]:
     kwargs = {**inputs, **overrides}
     x, weight = kwargs.pop('x'), kwargs.pop('weight')
     return deep_gemm.bf16_mega_gate(
-        x, weight, num_topk, use_shared_as_routed, num_shared_experts, ROUTED_SCALING_FACTOR, 0,
+        x, weight, num_topk, use_shared_as_routed, num_shared_experts, routed_scaling_factor, ep_rank,
         unmapped_topk_idx=outputs['unmapped_topk_idx'],
         out=(outputs['topk_idx'], outputs['topk_weights']), **kwargs)
 
@@ -116,7 +117,8 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
                        mask: torch.Tensor | None = None,
                        force_random: torch.Tensor | None = None,
                        fix_routing_mask: torch.Tensor | None = None,
-                       num_topk: int = NUM_TOPK) -> float:
+                       num_topk: int = NUM_TOPK,
+                       routed_scaling_factor: float = ROUTED_SCALING_FACTOR, scoring_func: str = 'sqrtsoftplus') -> float:
     fused_idx, fused_weights = outputs['topk_idx'], outputs['topk_weights']
     num_tokens, num_routed_experts = logits.shape
     active = mask if mask is not None else torch.ones((num_tokens,), dtype=torch.bool, device='cuda')
@@ -124,7 +126,8 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
     weight_diff = 0.0
 
     if score_based.any():
-        scores = F.softplus(logits).sqrt()
+        use_sigmoid = scoring_func == 'sigmoid'
+        scores = logits.sigmoid() if use_sigmoid else F.softplus(logits).sqrt()
         logical_topk_idx = outputs['unmapped_topk_idx']
         if logical_topk_idx is None:
             logical_topk_idx = fused_idx[:, :num_topk]
@@ -146,7 +149,7 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
 
         def reference_weights(row_mask: torch.Tensor, topk_idx: torch.Tensor) -> torch.Tensor:
             topk_scores = scores[row_mask].gather(1, topk_idx)
-            return normalized_weights(topk_scores, sigmoid=False)
+            return normalized_weights(topk_scores, sigmoid=use_sigmoid, scale=routed_scaling_factor)
 
         weight_diff = float(calc_diff(fused_weights[score_based, :num_topk],
                                       reference_weights(score_based, selected_idx)))
@@ -165,11 +168,17 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
             assert torch.all(crossing <= tolerance).item(), \
                 f'top-k selection beyond numerical ties: {crossing.max().item()=}'
 
-            ref_weights = reference_weights(ranked, ranking[ranked].topk(num_topk, dim=1).indices)
-            ranked_diff = float(calc_diff(fused_weights[ranked, :num_topk].sort(dim=1).values,
-                                          ref_weights.sort(dim=1).values))
-            assert ranked_diff < 1e-11, f'{ranked_diff=}'
-            weight_diff = max(weight_diff, ranked_diff)
+            ref_idx = ranking[ranked].argsort(dim=1, descending=True, stable=True)[:, :num_topk]
+            same_experts = (sorted_idx == ref_idx.sort(dim=1).values).all(dim=1)
+            # Numerical ties in biased ranking may select different experts with
+            # different unbiased weights. Their selected weights and ranking
+            # bounds were checked above; compare reference weights for equal sets.
+            if same_experts.any():
+                ref_weights = reference_weights(ranked, ref_idx)
+                ranked_diff = float(calc_diff(fused_weights[ranked, :num_topk][same_experts].sort(dim=1).values,
+                                              ref_weights[same_experts].sort(dim=1).values))
+                assert ranked_diff < 1e-11, f'{ranked_diff=}'
+                weight_diff = max(weight_diff, ranked_diff)
 
         if fused_weights.shape[1] > num_topk:
             assert torch.all(fused_weights[score_based, num_topk:] == 1.0).item()
