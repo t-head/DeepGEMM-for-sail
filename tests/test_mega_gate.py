@@ -396,26 +396,29 @@ def test_mega_gate_scoring_modes() -> None:
 @test_filter(is_ppu1v5_device)
 @torch.no_grad()
 def test_mega_gate_sigmoid_infinite_logits() -> None:
-    # Finite BF16 operands produce both signs of infinity in the FP32 dot product.
-    inputs = make_inputs(2, 256, 128, with_physical_map=False)
+    # Both token rows and expert columns need physical padding; no caller mask.
+    inputs = make_inputs(2, 6144, 132, with_physical_map=False)
     magnitude = float(2**64)
     x, weight, bias = inputs['x'], inputs['weight'], inputs['bias']
     x.zero_()
-    x[0, 0], x[1, 0] = magnitude, -magnitude
     weight.zero_()
-    weight[:, 0] = -magnitude
-    weight[:4, 0] = magnitude
     bias.zero_()
     bias[:8] = 2  # Select the same eight experts, including the zero-weight ones.
 
-    deep_gemm.use_deterministic_algorithms(True)  # One K split, so the logits are complete.
     try:
-        ids, weights = run_mega_gate(inputs, make_outputs(inputs, num_topk=8),
-                                     num_topk=8, scoring_func='sigmoid')
-        expected_ids = torch.arange(8, device='cuda').expand(2, -1)
-        assert torch.equal(ids.sort(dim=1).values, expected_ids)
-        positive = torch.stack((ids[0] < 4, ids[1] >= 4))
-        torch.testing.assert_close(weights, positive.float() * (ROUTED_SCALING_FACTOR / 4), rtol=0, atol=0)
+        for deterministic in (True, False):  # Single split and heuristic split-K.
+            deep_gemm.use_deterministic_algorithms(deterministic)
+            # Finite overflow, NaN in padded token rows, NaN in padded expert columns.
+            for x0, w0 in ((magnitude, magnitude), (1.0, float('inf')), (float('inf'), 1.0)):
+                x[0, 0], x[1, 0] = x0, -x0
+                weight[:, 0] = -w0
+                weight[:4, 0] = w0
+                ids, weights = run_mega_gate(inputs, make_outputs(inputs, num_topk=8),
+                                             num_topk=8, scoring_func='sigmoid')
+                expected_ids = torch.arange(8, device='cuda').expand(2, -1)
+                assert torch.equal(ids.sort(dim=1).values, expected_ids)
+                positive = torch.stack((ids[0] < 4, ids[1] >= 4))
+                torch.testing.assert_close(weights, positive.float() * (ROUTED_SCALING_FACTOR / 4), rtol=0, atol=0)
     finally:
         deep_gemm.use_deterministic_algorithms(False)
 

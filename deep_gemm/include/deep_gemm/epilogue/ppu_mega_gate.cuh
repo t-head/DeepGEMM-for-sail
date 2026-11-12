@@ -17,13 +17,22 @@ __device__ __forceinline__ void device_check(bool condition) {
 }
 
 // Store GEMM scores and defer any invalid-score trap until synchronization completes.
-template <bool UnsplitSigmoid>
-__device__ __forceinline__ void store_checked_scores(const KernelArgs& a, int token, float* dst, float lo, float hi,
+template <bool UseSigmoid, int S>
+__device__ __forceinline__ void store_checked_scores(const KernelArgs& a, int token, int expert, float* dst, float lo, float hi,
                                                       bool check_activated, bool& gate_is_valid) {
     bool valid;
-    if constexpr (UnsplitSigmoid) {
-        // The complete logits may saturate sigmoid to 0 or 1; NaNs remain invalid.
-        valid = !isnan(lo) && !isnan(hi);
+    if constexpr (UseSigmoid) {
+        // The aligned score pair is either wholly inside the expert range or wholly padding.
+        if (token >= a.num_tokens || expert >= a.routing.num_routed_experts) {
+            valid = true;
+        } else if constexpr (S == 1) {
+            valid = !isnan(lo) && !isnan(hi);
+        } else {
+            // Learned routing checks the reduced logits. Fixed/random routes skip that loop.
+            const bool skips_reduction_check = (a.fix_routing_mask && a.fix_routing_mask[token]) ||
+                                               (a.force_random && a.force_random[token]);
+            valid = !skips_reduction_check || (isfinite(lo) && isfinite(hi));
+        }
     } else {
         valid = check_activated ? lo < INFINITY && hi < INFINITY : isfinite(lo) && isfinite(hi);
     }
