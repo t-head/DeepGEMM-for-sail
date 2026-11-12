@@ -289,11 +289,15 @@ def fp4_fp4_mega_moe(
     situ_beta: Optional[float] = 4.0,
     situ_linear_beta: Optional[float] = 25.0,
     activation_alpha: Optional[float] = None,
+    global_num_tokens: Optional[int] = None,
 ) -> None:
     """Consume published buffers through the complete C++ MegaMoE entry.
 
     y must be contiguous BF16 [num_tokens, hidden] on the buffer device.
     Unused output rows have invalid routes and produce zeros.
+    global_num_tokens is the total input token count across the EP group
+    before top-k routing. It tunes GEMM tiles using estimated incoming work,
+    including on ranks with zero local rows. None uses the local token estimate.
     activation supports 'swiglu', 'swiglu_step', 'situ' and 'swiglu_oai'.
     SwiGLU clamps gate before SiLU; SwiGLU-Step clamps SiLU(gate). Both clamp up
     symmetrically. None or +inf disables clamping; zero is a real threshold.
@@ -336,7 +340,7 @@ def fp4_fp4_mega_moe(
         tuple(recipe), activation, activation_clamp, fast_math,
         situ_beta, situ_linear_beta, activation_alpha,
         l1_weights_replicas, l2_weights_replicas,
-        sym_buffer.staging_config)
+        sym_buffer.staging_config, global_num_tokens)
 
 
 def _interleave_weights(tensor: torch.Tensor, gran: int = 8) -> torch.Tensor:
@@ -460,6 +464,7 @@ def fp8_fp8_mega_moe(
     l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     activation_alpha: Optional[float] = None,
+    global_num_tokens: Optional[int] = None,
 ) -> None:
     """Complete FP8 MoE; scales follow sym_buffer.quantization, output is BF16.
 
@@ -467,6 +472,7 @@ def fp8_fp8_mega_moe(
     implementation runs dispatch, GEMM1/activation/quantization, GEMM2/scatter,
     and completion. Master and replica tensors may be separate allocations.
     activation_alpha follows fp4_fp4_mega_moe: OAI-only, with None using 1.702.
+    global_num_tokens follows the same EP-wide tiling contract as fp4_fp4_mega_moe.
     """
     if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'fp8xfp8':
         raise TypeError("fp8_fp8_mega_moe requires SymmBuffer(mma_type='fp8xfp8')")
@@ -476,7 +482,7 @@ def fp8_fp8_mega_moe(
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         activation, activation_clamp, fast_math, activation_alpha,
-        l1_weights_replicas, l2_weights_replicas, sym_buffer.quantization,
+        l1_weights_replicas, l2_weights_replicas, sym_buffer.quantization, global_num_tokens,
     )
 
 
@@ -494,11 +500,13 @@ def bf16_fp4_mega_moe(
     l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     situ_beta: Optional[float] = 4.0,
     situ_linear_beta: Optional[float] = 25.0,
+    global_num_tokens: Optional[int] = None,
 ) -> None:
     """Complete BF16 x MXFP4 SiTU MoE with BF16 output in original token order.
 
     SiTU parameters follow fp4_fp4_mega_moe; situ_linear_beta=None disables
     the up-branch softcap. situ_beta must be positive and finite.
+    global_num_tokens follows the same EP-wide tiling contract as fp4_fp4_mega_moe.
     """
     if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'bf16xfp4':
         raise TypeError("bf16_fp4_mega_moe requires SymmBuffer(mma_type='bf16xfp4')")
@@ -508,7 +516,7 @@ def bf16_fp4_mega_moe(
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         activation, activation_clamp, fast_math, situ_beta, situ_linear_beta,
-        l1_weights_replicas, l2_weights_replicas,
+        l1_weights_replicas, l2_weights_replicas, global_num_tokens,
     )
 
 
@@ -546,11 +554,13 @@ def fp8_fp4_mega_moe(
     situ_beta: Optional[float] = 4.0,
     situ_linear_beta: Optional[float] = 25.0,
     activation_alpha: Optional[float] = None,
+    global_num_tokens: Optional[int] = None,
 ) -> None:
     """Complete E4M3 x MXFP4 MoE, applying routing weights once in combine.
 
     SiTU and OAI parameters follow fp4_fp4_mega_moe. situ_linear_beta=None
     disables the up softcap; activation_alpha applies only to OAI.
+    global_num_tokens follows the same EP-wide tiling contract as fp4_fp4_mega_moe.
     """
     if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'fp8xfp4':
         raise TypeError("fp8_fp4_mega_moe requires SymmBuffer(mma_type='fp8xfp4')")
@@ -563,4 +573,4 @@ def fp8_fp4_mega_moe(
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         activation, activation_clamp, fast_math, situ_beta, situ_linear_beta, activation_alpha,
-        l1_weights_replicas, l2_weights_replicas)
+        l1_weights_replicas, l2_weights_replicas, global_num_tokens)

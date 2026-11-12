@@ -22,7 +22,16 @@ import xml.etree.ElementTree as ET
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUITES = {'ZW-810E': 'checkin_810e.list', 'ZW-M890P': 'checkin_890p.list'}
 SCRIPT_SUITES = {
-    'ZW-M890P-MegaMoE': ['-m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py'],
+    'ZW-M890P-MegaMoE': [
+        ('-m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py', {}),
+        (
+            '-m torch.distributed.run --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 '
+            '--local-addr=127.0.0.1 '
+            '--nproc-per-node=2 --max-restarts=0 -m pytest -q --disable-warnings '
+            '-x -k global_num_tokens tests/test_mega_moe.py tests/test_mega_moe_precisions.py',
+            {'PPU_LIB_SHOW_PARAMS': '1'},
+        ),
+    ],
 }
 _worker_context = threading.local()
 
@@ -282,11 +291,14 @@ def main(argv=None):
             parser.error('MegaMoE runs compilation and correctness together; use --phase all or run')
         cases = SCRIPT_SUITES[args.suite]
         if args.list:
-            print('\n'.join(f'{i}: {sys.executable} {spec}' for i, spec in enumerate(cases, 1)))
+            for i, (spec, overrides) in enumerate(cases, 1):
+                assignments = [f'{key}={shlex.quote(value)}' for key, value in overrides.items()]
+                print(f'{i}: ' + ' '.join([*assignments, sys.executable, spec]))
             return 0
         results = []
-        for i, spec in enumerate(cases, 1):
-            result = run_case(i, spec, 'script', args.log_dir.resolve(), args.timeout)
+        for i, (spec, overrides) in enumerate(cases, 1):
+            result = run_case(i, spec, 'script', args.log_dir.resolve(), args.timeout,
+                              base_env={**os.environ, **overrides})
             results.append(result)
             print(f'Script [{i}/{len(cases)}]: {result.error or "OK"}', flush=True)
             if result.error:

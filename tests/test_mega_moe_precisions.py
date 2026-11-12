@@ -7,6 +7,7 @@ torchrun --standalone --nproc-per-node=2 -m pytest -q -s tests/test_mega_moe_pre
 from dataclasses import replace
 from pathlib import Path
 import argparse
+import os
 import sys
 from types import SimpleNamespace
 import pytest
@@ -22,7 +23,7 @@ from deep_gemm.testing import calc_diff
 from quantization import quant_w4
 from test_mega_moe import (
     MegaMoECase, MODEL_TOKENS, mega_moe_group,
-    _process_group, _all_gather, _relative_l2, _make_routes,
+    _process_group, _all_gather, _relative_l2, _make_routes, _assert_gemm_estimates,
 )
 
 DISTRIBUTED_WORLDS = tuple(range(1, 65))
@@ -253,19 +254,19 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
             w2 = tuple(t[:-1].contiguous() for t in w2)
         options.update(l1_weights_replicas=replica1, l2_weights_replicas=replica2)
 
-    def forward(source, ids, weights, y, stats=None):
+    def forward(source, ids, weights, y, stats=None, *, global_num_tokens=None):
         dg.mega_moe_pre_dispatch(
             source, ids, weights,
             buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
             num_tokens=source.shape[0], mma_type=buffer.mma_type)
-        entry(y, w1, w2, buffer, stats, **options)
+        entry(y, w1, w2, buffer, stats, global_num_tokens=global_num_tokens, **options)
         return y
 
     return SimpleNamespace(buffer=buffer, raw1=raw1, raw2=raw2, ref1=ref1, ref2=ref2,
                            l1_weights=w1, l2_weights=w2, options=options, entry=entry, forward=forward)
 
 
-def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None):
+def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None, use_global_num_tokens=False):
     rank, world = group.rank(), group.size()
     max_diff = 0.0015 if c.precision == "w4a8" else 0.001
     rng = torch.Generator(device="cuda").manual_seed(20261030 + rank)
@@ -278,7 +279,11 @@ def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None)
     replica_omission_checked = False
     try:
         for iteration, requested in enumerate(c.tokens):
-            tokens = 0 if world > 1 and rank == world - 1 and iteration == 1 else requested
+            global_num_tokens = requested if use_global_num_tokens else None
+            if use_global_num_tokens:
+                tokens = requested if rank == 0 else 0
+            else:
+                tokens = 0 if world > 1 and rank == world - 1 and iteration == 1 else requested
             ids = torch.full((c.capacity, c.topk), -1, device="cuda",
                              dtype=torch.int32 if iteration % 2 else torch.int64)
             routes = _make_routes(c, tokens, rng)
@@ -297,7 +302,9 @@ def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None)
             y = torch.empty((tokens, c.hidden), device="cuda", dtype=torch.bfloat16)
 
             def forward():
-                return pipeline.forward(source[:tokens], ids[:tokens], weights[:tokens], y, stats)
+                return pipeline.forward(
+                    source[:tokens], ids[:tokens], weights[:tokens], y, stats,
+                    global_num_tokens=global_num_tokens)
 
             before = stats.clone()
             forward()
@@ -375,6 +382,23 @@ def test_mega_moe_precision(case, mega_moe_group):
 def test_mega_moe_precision_replicas(case, mega_moe_group):
     run_case(replace(case, experts=4 * mega_moe_group.size(), worlds=DISTRIBUTED_WORLDS,
                      tokens=(1, 33)), mega_moe_group, replicas=True, fast_math=False)
+
+
+@pytest.mark.parametrize("case", SMOKE_CASES, ids=lambda c: c.name)
+@pytest.mark.skipif(os.getenv("PPU_LIB_SHOW_PARAMS") != "1", reason="requires MegaMoE launch parameter logging")
+def test_smoke_global_num_tokens(case, mega_moe_group, capfd):
+    assert mega_moe_group.size() == 2, "requires two EP ranks"
+    # The second rank stays idle across two different group totals.
+    case = replace(case, experts=8, worlds=(2,), tokens=(33, 129))
+    stages = {
+        "fp8_channelwise": ("fp8_channelwise_mega_moe_dispatch_gemm1", "m_grouped_gemm_fp8_channelwise_moe_scatter"),
+        "fp8_blockwise": ("fp8_blockwise_mega_moe_dispatch_gemm1", "fp8_blockwise_mega_moe_scatter"),
+        "w4a16": ("w4a16_mega_moe_dispatch_gemm1", "m_grouped_gemm_w4a16_moe_scatter"),
+        "w4a8": ("w4a8_mega_moe_dispatch_gemm1", "w4a8_mega_moe_scatter"),
+    }
+    capfd.readouterr()
+    run_case(case, mega_moe_group, use_global_num_tokens=True)
+    _assert_gemm_estimates(capfd.readouterr().out, {9, 33}, stages[case.precision])
 
 
 def test_mega_moe_channelwise_quantization_reuse(mega_moe_group):

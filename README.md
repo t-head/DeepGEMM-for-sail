@@ -516,6 +516,12 @@ deep_gemm.mega_moe_pre_dispatch(
 deep_gemm.fp4_fp4_mega_moe(output, l1_weights, l2_weights, buffer)
 ```
 
+All complete MegaMoE compute entry points accept an optional `global_num_tokens`
+for tile selection. Pass the total number of unpadded input tokens across the EP
+group before top-k routing, with the same value on every rank. It must be between
+zero and `ep_size * buffer.num_max_tokens_per_rank`. Omitting it uses the local
+estimate. CUDA graph replay uses the tile selected during capture.
+
 For UltraEP, pass `l1_weights_replicas` and `l2_weights_replicas` together.
 
 See [test_mega_moe.py](tests/test_mega_moe.py) for a complete example.

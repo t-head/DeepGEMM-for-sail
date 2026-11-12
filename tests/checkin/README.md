@@ -1,6 +1,6 @@
 # Functional check-in
 
-Check-in keeps representative cases for supported operators and independent execution paths. Full shape/distribution/tile sweeps belong in daily functional lists; performance measurements belong in perf lists. Board suites run their functional caselist; the separate single-device MegaMoE suite is described below. The test scripts and tile scans in `tests/daily/daily_810e.list` / `tests/daily/daily_890p.list` run through the explicit daily entry in `tests/daily/run_daily.py`; they are not appended to default check-in.
+Check-in keeps representative cases for supported operators and independent execution paths. Full shape/distribution/tile sweeps belong in daily functional lists; performance measurements belong in perf lists. Board suites run their functional caselist; the separate MegaMoE suite is described below. The test scripts and tile scans in `tests/daily/daily_810e.list` / `tests/daily/daily_890p.list` run through the explicit daily entry in `tests/daily/run_daily.py`; they are not appended to default check-in.
 
 ```bash
 python tests/checkin/run_checkin.py --suite ZW-810E
@@ -54,8 +54,11 @@ For masked GEMM, the `test_m_grouped_gemm_masked->test_func:` log line contains 
 
 ## MegaMoE
 
-The single-device suite runs the public smoke tests for SwiGLU, SwiGLU-Step
-and SiTU, including invalid inputs and workspace reuse.
+The MegaMoE suite runs single-device public smoke tests for SwiGLU,
+SwiGLU-Step and SiTU, including invalid inputs and workspace reuse. It also
+runs a two-rank regression for imbalanced EP input. The distributed tests
+check numerical output, graph replay and the row estimates passed to both
+GEMMs. The M890P MegaMoE check-in job requests two PPU devices.
 
 ```bash
 python tests/checkin/run_checkin.py --suite ZW-M890P-MegaMoE
@@ -63,9 +66,9 @@ python tests/checkin/run_checkin.py --suite ZW-M890P-MegaMoE
 
 It compiles and executes the pipeline together, without `HGGC_WARM_UP` or the
 legacy `testcase.json`. `--phase compile` is not supported for this suite.
-Output and failures are retained in `checkin-logs/script-0001.log` and the usual
-JUnit report. Multi-card tests are disabled in automatic check-in because a
-runner may have only one device. On a host with two free PPU1.5 devices, run:
+Output and failures are retained in `checkin-logs/script-0001.log`,
+`checkin-logs/script-0002.log` and the usual JUnit report. To run the broader
+smoke cases on two PPU1.5 devices, use:
 
 ```bash
 NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1 \
