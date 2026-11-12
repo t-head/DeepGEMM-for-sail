@@ -71,6 +71,38 @@ struct PagedTile {
     int tb_per_cu;
 };
 
+// Fixed M890 FP4 DSA grouped plan, resolved on the host and passed to JIT kernels.
+// Query capacity is independent of the number of valid rows in a request.
+struct FP4PagedVarlenConfig {
+    static constexpr uint32_t kQueryHeadRows = 128;
+    static constexpr uint32_t kBlockKV = 64;
+    static constexpr uint32_t kWarpKV = 64;
+    static constexpr uint32_t kMathWarps = 8;
+    static constexpr uint32_t kQStages = 2;
+    static constexpr uint32_t kKVSlots = 4;
+    static constexpr bool kSplitMBlock = true;
+
+    // Keep eight math warps per CTA for both supported head counts: H32
+    // uses split128, H64 split256. Their shared storage fits five/three
+    // resident blocks respectively; the schedule uses the same block counts.
+    static constexpr uint32_t split_kv(uint32_t num_heads) {
+        return kMathWarps * kWarpKV * num_heads / kQueryHeadRows;
+    }
+    static constexpr uint32_t blocks_per_cu(uint32_t num_heads) {
+        return num_heads == 32 ? 5 : 3;
+    }
+
+    // Work scales with valid queries. Packed singletons need a bandwidth
+    // floor because they hide less KV latency than multi-query blocks.
+    static constexpr uint32_t kSingletonCostMultiplier = 2;
+};
+
+static PagedTile get_fp4_varlen_tile(int num_heads) {
+    using Config = FP4PagedVarlenConfig;
+    return {Config::kQStages, Config::kKVSlots, static_cast<int>(Config::split_kv(num_heads)), Config::kWarpKV,
+            Config::kSplitMBlock, static_cast<int>(Config::blocks_per_cu(num_heads))};
+}
+
 // Dynamic shared memory of the paged kernel, mirroring `PPUPagedMqaLogits::SharedStorage`.
 // NOTES: the M extent is `split_kv` (all math warp groups), not `block_kv` -- verified against
 // `SharedStorageSize`, and the generated code carries a `static_assert` to keep it honest.
