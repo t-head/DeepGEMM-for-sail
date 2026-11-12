@@ -120,41 +120,20 @@ To perform a basic non-grouped FP8 GEMM, call the `deep_gemm.gemm_fp8_fp8_bf16_n
 
 BF16 dense GEMM: `deep_gemm.bf16_gemm_nt(a, b, out)` computes `out = a @ b.T`
 with contiguous BF16 inputs. On 810E and 890P, `out` supports BF16 or FP32.
-M890 supports odd and even N. The standard 810E tiled path requires even N;
-its specialized paths also support guarded narrow outputs and partial tiles.
+890P supports odd and even N. On 810E, GEMV/Direct paths also cover narrow
+and partial outputs; tiled paths require `K>=64`, `K%32=0` and aligned inputs.
+N=1 GEMV requires `K%8=0` and 16-byte-aligned inputs.
 
-#### 810E dense GEMM
+Use `deep_gemm.bf16_gemm_nt(a, b, d, c=c)` for optional accumulation.
+C must match D's shape, dtype and device; C/D must be disjoint or exactly aliased
+with identical strides. The product and C are added in FP32 before output conversion.
+All tensors must be on the current accelerator; D must not overlap A or B.
+Empty outputs are no-ops; K=0 writes C or zero. Compile-only mode preserves C/D.
 
-```python
-# A[M,K], B[N,K]: contiguous BF16; D[M,N]: contiguous BF16 or FP32.
-deep_gemm.bf16_gemm_nt(a, b, d, c=c)  # D = A @ B.T + C; C is optional
-```
-
-This function writes into the supplied output and returns `None`. All tensors
-must be on the current accelerator; output must not overlap either input.
-C must match D's shape, dtype and device and be
-either disjoint from D or exactly aliased with identical strides. The product
-and C are combined in FP32 before conversion to the output dtype.
-Compile-only mode (`set_compile_mode(1)` or nonempty `HGGC_WARM_UP`) preserves C/D.
-Explicit CU limits apply to GEMM and auxiliary kernels.
-
-810E BF16 tiled paths require `K>=64`, `K%32=0`, and 16-byte-aligned inputs.
-GEMV paths allow shorter K with their own alignment checks. Empty outputs are
-no-ops, and K=0 writes C or zero as appropriate during normal execution.
-Unsupported shapes, layouts, tiles and device grid/resource limits raise an
-error at the host interface before launching the affected kernel.
-
-Automatic scheduling selects kernels from matrix geometry and the CU budget.
-Explicit `configs` take precedence over external LUT entries, which take
-precedence over automatic selection.
-The configuration tuple is
-`(num_sms, BM, BN, BK, WM, WN, stages, (0, 0, 0))`; its last field is reserved
-for compatibility. Explicit/LUT tiled execution requires a 16-byte-aligned
-product output and N divisible by 8 (BF16) or 4 (FP32).
-With C, these requirements apply to the internal FP32 product; the final D
-only needs to satisfy the contiguous output contract above.
-See [utilities and environment variables](#utilities) for kernel controls and
-[checkin cases](tests/checkin/checkin_810e.list) for accuracy and rejection coverage.
+810E `configs` are `(num_sms, BM, BN, BK, WM, WN, stages, (0, 0, 0))`.
+Explicit/LUT tiles require a 16-byte-aligned product output and N divisible by
+8 (BF16) or 4 (FP32); with C, this applies to the internal FP32 product.
+Unsupported inputs/configurations raise host errors; see [810E checkin cases](tests/checkin/checkin_810e.list).
 
 #### Grouped GEMMs (contiguous layout)
 
@@ -569,9 +548,8 @@ In addition, the dense GEMM kernels only implement the NT layout. The `nn` / `tn
 The library provides some utility functions besides the above kernels:
 
 - `deep_gemm.set_num_sms` / `get_num_sms`: set/get the maximum CU count to use
-- `deep_gemm.get_num_sms_config`: return the restorable CU setting (`0` means
-  automatic). Save this value before a temporary override and restore it with
-  `set_num_sms`; `get_num_sms` returns the resolved count instead.
+  On 810E, this sets the Tensor budget (1–20); BF16 dense SIMT uses `64 - (20 - num_sms)`.
+  `0` restores automatic selection. Counts come from the device; settings above its Tensor CU count are rejected.
 - `deep_gemm.set_tc_util` / `get_tc_util`: set/get an approximated tensor cell utilization ratio
 - `deep_gemm.set_pdl` / `get_pdl`: enable/disable Programmatic Dependent Launch (PDL)
 - `deep_gemm.set_compile_mode` / `get_compile_mode`: set/get the JIT compile mode

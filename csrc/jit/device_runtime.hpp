@@ -3,6 +3,7 @@
 #include <iostream>
 #include <string>
 #include <acblasLt.h>
+#include <hggc_ad.h>
 #include <hggc_runtime_api.h>
 #include <torch/version.h>
 #include <torch/torch.h>
@@ -21,6 +22,7 @@ class DeviceRuntime {
     bool enable_pdl = false;
     bool numSmsExplicit = false;
     std::shared_ptr<hggcDeviceProp> cached_prop;
+    int cachedTensorCUs = 0;
 
     // acBLASLt utils
     static constexpr size_t kAcblasLtWorkspaceSize = 32 * 1024 * 1024;
@@ -96,8 +98,34 @@ public:
         return get_arch_pair().first;
     }
 
+    int get_tensor_cu_count() {
+        if (cachedTensorCUs == 0) {
+            const auto prop = get_prop();
+            const std::string name(prop->name);
+            int count = prop->multiProcessorCount;
+            if (name.find("ZW810E") != std::string::npos || name.find("ZW610E") != std::string::npos) {
+                int ordinal;
+                HGdevice device;
+                DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&ordinal));
+                DG_HOST_ASSERT(hgDeviceGet(&device, ordinal) == HGGC_SUCCESS);
+                DG_HOST_ASSERT(hgDeviceGetAttributeAD(&count, HGAD_DEVICE_ATTRIBUTE_TENSOR_MULTIPROCESSOR_COUNT,
+                                                      device) == HGGC_SUCCESS);
+            }
+            DG_HOST_ASSERT(count > 0 && count <= prop->multiProcessorCount);
+            cachedTensorCUs = count;
+        }
+        return cachedTensorCUs;
+    }
+
     void set_num_sms(const int& new_num_sms) {
-        DG_HOST_ASSERT(0 <= new_num_sms and new_num_sms <= get_prop()->multiProcessorCount);
+        const auto prop = get_prop();
+        if (std::string(prop->name).find("ZW810E") != std::string::npos) {
+            TORCH_CHECK(new_num_sms >= 0 && new_num_sms <= get_tensor_cu_count(),
+                        "810E num_sms must be 0 (automatic) or within the Tensor CU count (",
+                        get_tensor_cu_count(), ")");
+        } else {
+            DG_HOST_ASSERT(0 <= new_num_sms and new_num_sms <= prop->multiProcessorCount);
+        }
         num_sms = new_num_sms;
         numSmsExplicit = new_num_sms != 0;
     }
@@ -107,9 +135,10 @@ public:
             const auto prop = get_prop();
             std::cout << "device_props.name:" << prop->name << std::endl;
             const std::string device_name(prop->name);
-            // Synced from the legacy free function deep_gemm::get_num_sms() (utils/utils.hpp):
-            // ZW810E/ZW610E expose a reduced SM budget, other devices use the full count.
-            if (device_name.find("ZW810E") != std::string::npos or device_name.find("ZW610E") != std::string::npos) {
+            if (device_name.find("ZW810E") != std::string::npos) {
+                num_sms = get_tensor_cu_count();
+            } else if (device_name.find("ZW610E") != std::string::npos) {
+                // Preserve the legacy default on 610E.
                 num_sms = 20;
             } else {
                 num_sms = prop->multiProcessorCount;
@@ -118,15 +147,13 @@ public:
         return num_sms;
     }
 
-    // Unlike the resolved count, this value can restore automatic selection.
-    int get_num_sms_config() const {
-        return numSmsExplicit ? num_sms : 0;
-    }
-
-    // The legacy default is a Tensor-CU budget on 810E/610E. SIMT kernels
-    // can use all general CUs unless the caller explicitly sets a limit.
+    // On 810E, reducing the Tensor budget removes the same number of SIMT CUs.
+    // Other devices retain their existing explicit/automatic budget semantics.
     int get_num_simt_sms() {
-        return numSmsExplicit ? get_num_sms() : get_prop()->multiProcessorCount;
+        const auto prop = get_prop();
+        if (std::string(prop->name).find("ZW810E") != std::string::npos)
+            return prop->multiProcessorCount - get_tensor_cu_count() + get_num_sms();
+        return numSmsExplicit ? get_num_sms() : prop->multiProcessorCount;
     }
 
     int get_l2_cache_size() {

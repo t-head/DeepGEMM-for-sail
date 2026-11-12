@@ -1477,9 +1477,15 @@ static bool bf16_gemm_bounded_epilogue(const float* product, const std::optional
                                        const torch::Tensor& d) {
     const int sms = device_runtime->get_num_simt_sms();
     const auto prop = device_runtime->get_prop();
-    if (sms >= prop->multiProcessorCount) return false;
+    const bool limited = sms < prop->multiProcessorCount;
+    // Fuse small 810E outputs to avoid separate add/cast launches at full budget.
+    // Large unrestricted outputs retain ATen's vectorized memory path.
+    const int64_t fusionLimit = d.scalar_type() == torch::kBFloat16 ? 1 << 20 : 1 << 16;
+    const bool fuseSmallOutput = product && is_810e_device() && d.numel() <= fusionLimit;
+    if (!limited && !fuseSmallOutput) return false;
     const int threads = std::min(256, prop->maxThreadsPerBlock);
-    const int blocks = int(std::min<int64_t>(sms, ceil_div(d.numel(), int64_t(threads))));
+    const int blocks = int(std::min<int64_t>(limited ? sms : prop->maxGridSize[0],
+                                            ceil_div(d.numel(), int64_t(threads))));
     TORCH_CHECK(blocks > 0 && blocks <= prop->maxGridSize[0], "Invalid BF16 epilogue grid");
     BF16GemmEpilogueRuntime::Args args{
         {dim3(blocks), dim3(threads), 0},
@@ -1517,8 +1523,15 @@ static void bf16_gemm(const torch::Tensor& a, const torch::Tensor& b, const torc
         auto accum = torch::empty({m, n}, d.options().dtype(torch::kFloat));
         bf16_gemm(a, b, accum, m, n, k, configs);
         if (!bf16_gemm_bounded_epilogue(accum.data_ptr<float>(), c, d) && !is_compile_only()) {
-            accum.add_(*c);
-            d.copy_(accum);
+            if (is_810e_device()) {
+                // TensorIterator adds in FP32 and casts directly to D, avoiding
+                // a separate copy while retaining vectorized full-budget stores.
+                auto output = d;
+                at::add_out(output, accum, *c);
+            } else {
+                accum.add_(*c);
+                d.copy_(accum);
+            }
         }
         return;
     }

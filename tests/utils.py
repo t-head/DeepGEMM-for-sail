@@ -1461,14 +1461,14 @@ def gemm_bench_cold(call, num_tests=30):
 
 
 def gemm_call_with_sms(args, call):
-    previous = deep_gemm.get_num_sms_config()
+    # Caselist tests use automatic selection between explicit budget checks.
     try:
         if 'num_sms' in args:
             deep_gemm.set_num_sms(args['num_sms'])
         return call()
     finally:
         if 'num_sms' in args:
-            deep_gemm.set_num_sms(previous)
+            deep_gemm.set_num_sms(0)
 
 
 def test_dense_gemm_runtime_lut(args):
@@ -3547,14 +3547,13 @@ def test_mega_mhc(args):
                   num_sinkhorn_iters=args.get('sinkhorn_iters', 20),
                   benchmark=get_benchmark(), check_accuracy=get_acc_check())
     num_sms = args.get('num_sms')
-    original_num_sms = deep_gemm.get_num_sms_config()
     try:
         if num_sms is not None:
             deep_gemm.set_num_sms(num_sms)
         return check(**kwargs)
     finally:
         if num_sms is not None:
-            deep_gemm.set_num_sms(original_num_sms)
+            deep_gemm.set_num_sms(0)
 
 
 def read_cmds_from_file(casefile):

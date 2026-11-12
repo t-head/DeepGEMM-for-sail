@@ -1,7 +1,6 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
-#include <hggc_ad.h>
 #include <optional>
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
@@ -597,25 +596,9 @@ get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms) 
 
     return {std::min(num_min_sms, num_sms), bm, bn, bk, wm, wn, bk, stages, best_smem_config};
 }
-// Keep the 810E resource distinction local to BF16 dispatch. The public
-// CU getter and other operators retain their existing budget semantics.
+// Use the same Tensor topology as the runtime's budget validation and SIMT mapping.
 static int get_tensor_cu_count_810e() {
-    static const int tensorCUs = [] {
-        const auto prop = device_runtime->get_prop();
-        const std::string name(prop->name);
-        int count = prop->multiProcessorCount;
-        if (name.find("ZW810E") != std::string::npos || name.find("ZW610E") != std::string::npos) {
-            int ordinal;
-            HGdevice device;
-            DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&ordinal));
-            DG_HOST_ASSERT(hgDeviceGet(&device, ordinal) == HGGC_SUCCESS);
-            DG_HOST_ASSERT(hgDeviceGetAttributeAD(&count, HGAD_DEVICE_ATTRIBUTE_TENSOR_MULTIPROCESSOR_COUNT,
-                                                  device) == HGGC_SUCCESS);
-        }
-        DG_HOST_ASSERT(count > 0 && count <= prop->multiProcessorCount);
-        return count;
-    }();
-    return tensorCUs;
+    return device_runtime->get_tensor_cu_count();
 }
 
 static int get_num_tensor_sms_810e() {
