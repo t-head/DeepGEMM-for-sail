@@ -215,3 +215,10 @@ PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:128,di
 PagedMqaLogits,data_type:int8,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1]
 PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,weights_dtype:bf16
 PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192
+
+# ============ MegaMhc ============
+MegaMhc,data_type:bf16,m:769
+MegaMhc,data_type:bf16,m:7,sinkhorn_iters:10
+MegaMhc,data_type:bf16,m:37,case:interface_graph
+MegaMhc,data_type:bf16,m:65,case:layout
+MegaMhc,data_type:bf16,m:129,num_sms:1,case:layout

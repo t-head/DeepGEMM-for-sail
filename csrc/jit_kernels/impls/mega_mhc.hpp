@@ -1,7 +1,18 @@
 #pragma once
 
+#include <torch/python.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <cstdint>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
 #include "../../jit/compiler.hpp"
 #include "../../jit/kernel_runtime.hpp"
+#include "../../utils/exception.hpp"
 #include "../../utils/utils.hpp"
 #include <deep_gemm/common/profiling_interface.cuh>
 #define DG_MHC_ARGS_ONLY
@@ -9,6 +20,8 @@
 #undef DG_MHC_ARGS_ONLY
 
 namespace deep_gemm {
+
+enum class MegaMhcPhase { Main, Pre, Finish };
 
 class MegaMhcRuntime final : public LaunchRuntime<MegaMhcRuntime> {
 public:
@@ -18,6 +31,10 @@ public:
         bool store_bf16, store_fp8;
         int shared_sf_block_m;
         bool per_token_fp8;
+        bool tc01 = false;
+        MegaMhcPhase phase = MegaMhcPhase::Main;
+        bool tc01_round_b = false;
+        int tc01_pre_chunk = 1024;
     };
     struct Args {
         Config config;
@@ -28,6 +45,27 @@ public:
 
     static std::string generate_impl(const Args& args) {
         const auto& c = args.config;
+        if (c.phase == MegaMhcPhase::Pre) return fmt::format(R"(
+#include <deep_gemm/impls/ppu_mega_mhc_tc01.cuh>
+extern "C"
+__global__ __launch_bounds__(128) void ppu_mega_mhc_tc01_pre(deep_gemm::mhc::Args args) {{
+    deep_gemm::mhc::ppu_mega_mhc_tc01_prenorm_device<{},{},{},{}>(args);
+}}
+)", c.hidden, c.splits, c.tc01_round_b, c.tc01_pre_chunk);
+        if (c.phase == MegaMhcPhase::Finish) return fmt::format(R"(
+#include <deep_gemm/impls/ppu_mega_mhc_tc01.cuh>
+extern "C"
+__global__ __launch_bounds__(128) void ppu_mega_mhc_tc01_finish(deep_gemm::mhc::Args args) {{
+    deep_gemm::mhc::ppu_mega_mhc_tc01_coeff_device<{},{},{}>(args);
+}}
+)", c.hidden, c.splits, c.iterations);
+        if (c.tc01) return fmt::format(R"(
+#include <deep_gemm/impls/ppu_mega_mhc_tc01.cuh>
+extern "C"
+__global__ __launch_bounds__(128) void ppu_mega_mhc_tc01(deep_gemm::mhc::Args args) {{
+    deep_gemm::mhc::ppu_mega_mhc_tc01_device<{},{},{}>(args);
+}}
+)", c.hidden, c.splits, c.tc01_round_b);
         std::string specialization;
         if (c.single) {
             specialization = fmt::format(
@@ -40,7 +78,7 @@ public:
                                          c.store_bf16, c.store_fp8, c.shared_sf_block_m, c.per_token_fp8);
         }
         return fmt::format(R"(
-#include <deep_gemm/impls/ppu_mega_mhc.cuh>
+#include <deep_gemm/impls/ppu_mega_mhc_tc01.cuh>
 extern "C"
 __global__ __launch_bounds__({}) void {}(deep_gemm::mhc::Args args) {{
     deep_gemm::mhc::{}(args);
@@ -66,9 +104,105 @@ __global__ __launch_bounds__({}) void {}(deep_gemm::mhc::Args args) {{
     }
 };
 
-static void launch_mega_mhc(MegaMhcRuntime::Args args, int num_sms, int physical_num_sms, bool cooperative_supported) {
+struct MegaMhcPlan {
+    MegaMhcRuntime::Config config;
+    LaunchArgs launch_args;
+    int num_sms;
+    int64_t num_counters, num_partials;
+    LaunchArgs pre_launch{}, finish_launch{};
+};
+
+namespace mega_mhc {
+
+static int select_num_splits(int tokens, int sms, int iterations) {
+    if (iterations == 20 && tokens >= 128 && tokens <= 32768) {
+        const int groups = ceil_div(tokens, 32), capacity = 8 * sms;
+        if (tokens >= 1024 && tokens % 32 == 0)
+            return groups * 9 <= capacity ? 18 : 16;
+        for (int splits : {80, 40, 32, 16, 12, 10, 8})
+            if (groups * (splits / 2) <= capacity) return splits;
+        int selected = 16, best = INT_MAX;
+        for (int splits : {8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 40}) {
+            const int waves = ceil_div(groups * (splits / 2), capacity);
+            const int cost = 3 * waves * ceil_div(160, splits) + splits;
+            if (cost <= best) { best = cost; selected = splits; }
+        }
+        const int s16_waves = ceil_div(groups * 8, capacity);
+        if (groups > capacity && 30 * s16_waves + 16 <= best + 2) selected = 16;
+        return selected;
+    }
+    const int blocks = std::max(1, ceil_div(tokens, 64));
+    if (sms == 39 && blocks <= 2) return 80 / blocks;
+    if (sms == 39 && blocks == 16) return 8;
+    return std::max(1, std::min(16, 20 * sms / blocks));
+}
+
+static MegaMhcPlan select_mega_mhc_plan(int tokens, int hidden, int iterations, int sms,
+                                       bool tc01, bool bf16, bool fp8,
+                                       int shared_sf_block_m, bool per_token_fp8, int physical_sms) {
+    DG_HOST_ASSERT(tokens > 0 and sms > 0);
+    int splits = tc01 ? 0 : select_num_splits(tokens, sms, iterations);
+    if (tc01) {
+        splits = 80;
+        if (tokens >= 128) {
+            int64_t best = INT64_MAX;
+            for (int candidate : {4, 5, 6, 7, 8, 10, 12, 16, 20, 32, 40, 80}) {
+                const int64_t waves = ceil_div<int64_t>(ceil_div(tokens, 64) * int64_t(candidate), 8 * sms);
+                const int64_t cost = waves * (64 * ceil_div(80, candidate) + 20) + candidate;
+                if (cost < best) { best = cost; splits = candidate; }
+            }
+        }
+    }
+    const bool ring = !tc01 && splits >= 8 && splits <= 80 && splits % 2 == 0 &&
+                      tokens >= 128 && tokens <= 32768;
+    const int ring_m = splits == 16 && tokens < 1024 && ceil_div(tokens, 16) <= sms ? 16 : 32;
+    const bool single = iterations == 20 && ring;
+    const int groups = ceil_div(tokens, ring_m), capacity = 8 * sms;
+    const bool local = single && groups * (splits / 2) <= capacity;
+    int task_splits = 2;
+    if (single && !local && tokens % 32 != 0) {
+        const int fine_waves = ceil_div(groups * splits, capacity);
+        const int pair_waves = ceil_div(groups * (splits / 2), capacity);
+        if (100 * fine_waves * ceil_div(80, splits) <
+            98 * pair_waves * ceil_div(160, splits)) task_splits = 1;
+    }
+    MegaMhcPlan plan{
+        {hidden, splits, iterations, ring_m, task_splits, tokens % 64 == 0,
+         single, local, tokens % ring_m != 0, tokens % (ring_m / 8) != 0, local || tokens != 1248,
+         bf16, fp8, shared_sf_block_m, per_token_fp8},
+        {dim3(local ? groups : single ? std::min(groups * (splits / task_splits), capacity) :
+              std::min(4 * sms, ceil_div(tokens, 64) * splits), local ? splits / 2 : 1),
+         dim3(single ? ring_m * 2 : 128), 0}, sms,
+        tc01 ? 0 : ceil_div<int64_t>(tokens, ring ? ring_m : 64) + 2,
+        ceil_div<int64_t>(tokens, 64) * splits * 64 * 26 +
+            (ring ? (align<int64_t>(tokens, ring_m) - tokens) * 5 * hidden / 2 : 0)};
+    auto& c = plan.config;
+    c.tc01 = tc01;
+    if (tc01) {
+        // Pre-rounding amortizes a weight conversion over at least three M tiles.
+        c.tc01_round_b = ceil_div(tokens, 64) >= 3;
+        if (c.tc01_round_b) plan.num_partials += 24 * 4 * hidden;
+        // Favor higher occupancy once the wider BF16 tile fills a resident wave.
+        c.tc01_pre_chunk = tokens > 8 * physical_sms ? 512 : 1024;
+        plan.pre_launch = {dim3(tokens), dim3(128), 0};
+        plan.finish_launch = {dim3(ceil_div(tokens, splits < 32 ? 8 : 4)), dim3(128), 0};
+        plan.launch_args = {dim3(ceil_div(tokens, 64), splits), dim3(128), 0};
+    }
+    return plan;
+}
+
+} // namespace mega_mhc
+
+struct PreparedMegaMhc {
+    std::shared_ptr<KernelRuntime> runtime;
+    MegaMhcRuntime::Args args;
+};
+
+static PreparedMegaMhc prepare_mega_mhc(MegaMhcRuntime::Args args, int num_sms,
+                                       int physical_num_sms, bool cooperative_supported) {
     static auto mhc_compiler = LazyInit<HGCCCompiler>([]() { return std::make_shared<HGCCCompiler>(); });
-    const auto name = args.config.single ? "ppu_mega_mhc_single" : "ppu_mega_mhc";
+    // Every specialization uses the same include closure for LaunchRuntime hashing.
+    const auto name = args.config.phase == MegaMhcPhase::Pre ? "ppu_mega_mhc_tc01_pre" : args.config.phase == MegaMhcPhase::Finish ? "ppu_mega_mhc_tc01_finish" : args.config.tc01 ? "ppu_mega_mhc_tc01" : args.config.single ? "ppu_mega_mhc_single" : "ppu_mega_mhc";
     auto runtime = mhc_compiler->build(name, MegaMhcRuntime::generate(args));
     if (args.config.single && cooperative_supported) {
         int resident_blocks = 0;
@@ -108,19 +242,76 @@ static void launch_mega_mhc(MegaMhcRuntime::Args args, int num_sms, int physical
         DG_HGGC_DRIVER_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
             &resident_blocks, runtime->kernel, launch.block_dim.x, launch.smem_size));
 #endif
+        const char* path = c.phase == MegaMhcPhase::Pre ? "prenorm" :
+            c.phase == MegaMhcPhase::Finish ? "coefficient" :
+            c.tc01 ? "projection" : c.single ? (c.local ? "local" : "persistent") : "general";
+        const auto tile = c.phase == MegaMhcPhase::Pre ?
+            fmt::format("tokens_per_cta:1, hidden_chunk:{}", c.tc01_pre_chunk) :
+            c.phase == MegaMhcPhase::Finish ?
+            fmt::format("tokens_per_cta:{}, coefficients:24", launch.block_dim.x / (c.splits < 32 ? 16 : 32)) :
+            fmt::format("ThreadblockShape[{}, {}, 64]", c.single ? c.tile_m : 64, c.single ? 24 : 32);
         printf("[MegaMhc] kernel:%s path:%s hidden:%d sinkhorn_iters:%d\n"
                "problem:[%d, 24, %d]\n"
-               "ThreadblockShape[%d, %d, 64], num_splits:%d, task_splits:%d\n"
+               "%s, num_splits:%d, task_splits:%d\n"
                "grid:[%u,%u,%u], BlockSize:%u, num_sms:%d, cooperative:%d\n"
                "output:%s sf_layout:%s shared_sf_block_m:%d\n"
                "smem_size:%d, vreg:%d, stack:%d, max_active_tb_num:%d\n",
-               name, c.single ? (c.local ? "local" : "persistent") : "general",
+               name, path,
                c.hidden, c.iterations, args.kernel_args.tokens, 4 * c.hidden,
-               c.single ? c.tile_m : 64, c.single ? 24 : 32, c.splits, c.single ? c.task_splits : 1,
+               tile.c_str(), c.splits, c.single ? c.task_splits : 1,
                launch.grid_dim.x, launch.grid_dim.y, launch.grid_dim.z, launch.block_dim.x, num_sms, args.cooperative,
                c.store_fp8 ? (c.store_bf16 ? "bf16+fp8" : "fp8") : "bf16",
                c.store_fp8 ? (c.per_token_fp8 ? "token" : c.shared_sf_block_m > 0 ? "extra" : "col") : "none",
                c.shared_sf_block_m, shared_bytes + launch.smem_size, registers, stack_bytes, resident_blocks);
+    }
+    return {runtime, args};
+}
+
+static std::mutex mega_mhc_submit_mutex;
+
+// A captured graph retains the allocation used during capture. Calls and graph
+// replays sharing a capture stream must remain serialized on that stream.
+static int* mega_mhc_counters(int64_t count, const torch::TensorOptions& options) {
+    if (!count) return nullptr;
+    static std::unordered_map<c10::cuda::CUDAStream, std::vector<torch::Tensor>> counters;
+    auto& buffers = counters[at::cuda::getCurrentCUDAStream()];
+    if (buffers.empty() || buffers.back().numel() < count) {
+        DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None and
+                       "Warm up Mega-mHC on the capture stream with sufficient workspace capacity before capture");
+        const int64_t capacity = buffers.empty() ? count : std::max(count, 2 * buffers.back().numel());
+        buffers.push_back(torch::zeros({capacity}, options.dtype(torch::kInt)));
+    }
+    return buffers.back().data_ptr<int>();
+}
+
+static void run_mega_mhc(const MegaMhcPlan& plan, mhc::Args kernel_args,
+                         const torch::TensorOptions& options) {
+    std::lock_guard<std::mutex> lock(mega_mhc_submit_mutex);
+    const int64_t partial_bytes = plan.num_partials * sizeof(float);
+    const int64_t output_bytes = kernel_args.y ? 0 : int64_t(kernel_args.tokens) * plan.config.hidden * sizeof(__ppu_bfloat16);
+    const auto scratch = torch::empty({partial_bytes + output_bytes}, options.dtype(torch::kByte));
+    kernel_args.partials = static_cast<float*>(scratch.data_ptr());
+    kernel_args.counters = mega_mhc_counters(plan.num_counters, options);
+    if (!kernel_args.y)
+        kernel_args.y = reinterpret_cast<__ppu_bfloat16*>(static_cast<uint8_t*>(scratch.data_ptr()) + partial_bytes);
+    MegaMhcRuntime::Args args{plan.config, plan.launch_args, kernel_args};
+    const int num_sms = plan.num_sms;
+    const auto* prop = at::cuda::getCurrentDeviceProperties();
+    std::array<PreparedMegaMhc, 3> kernels;
+    int num_kernels = 0;
+    if (!args.config.tc01) {
+        kernels[num_kernels++] = prepare_mega_mhc(args, num_sms, prop->multiProcessorCount,
+                                         prop->cooperativeLaunch);
+    } else {
+        args.config.phase = MegaMhcPhase::Pre;
+        args.launch_args = plan.pre_launch;
+        kernels[num_kernels++] = prepare_mega_mhc(args, num_sms, prop->multiProcessorCount, false);
+        args.config.phase = MegaMhcPhase::Main;
+        args.launch_args = plan.launch_args;
+        kernels[num_kernels++] = prepare_mega_mhc(args, num_sms, prop->multiProcessorCount, false);
+        args.config.phase = MegaMhcPhase::Finish;
+        args.launch_args = plan.finish_launch;
+        kernels[num_kernels++] = prepare_mega_mhc(args, num_sms, prop->multiProcessorCount, false);
     }
     DgProfParam dg_prof_params;
     if (deep_gemm::profiling_enabled()) {
@@ -136,10 +327,9 @@ static void launch_mega_mhc(MegaMhcRuntime::Args args, int num_sms, int physical
         dg_prof_params.add_params("num_splits", args.config.splits);
         dg_prof_params.add_params("num_sms", num_sms);
     }
-    {
-        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
-        MegaMhcRuntime::launch(runtime, args);
-    }
+    auto profiling_guard = show_gemm_ut(dg_prof_params);
+    for (int i = 0; i < num_kernels; ++i)
+        MegaMhcRuntime::launch(kernels[i].runtime, kernels[i].args);
 }
 
 } // namespace deep_gemm
