@@ -50,6 +50,12 @@ def make_physical_map(num_logical_experts: int) -> tuple[torch.Tensor, torch.Ten
     return to_physical_map, logical_count
 
 
+def normalized_weights(selected: torch.Tensor, *, sigmoid: bool) -> torch.Tensor:
+    total = selected.sum(dim=-1, keepdim=True)
+    denominator = torch.where(total > 0, total, 1.0) if sigmoid else total + 1e-20
+    return selected / denominator * ROUTED_SCALING_FACTOR
+
+
 def make_inputs(num_tokens: int, hidden: int, num_routed_experts: int,
                 use_shared_as_routed: bool = False, with_bias: bool = True,
                 with_image_bias: bool = False, with_mask: bool = False,
@@ -137,7 +143,7 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
 
         def reference_weights(row_mask: torch.Tensor, topk_idx: torch.Tensor) -> torch.Tensor:
             topk_scores = scores[row_mask].gather(1, topk_idx)
-            return topk_scores / (topk_scores.sum(dim=1, keepdim=True) + 1e-20) * ROUTED_SCALING_FACTOR
+            return normalized_weights(topk_scores, sigmoid=False)
 
         weight_diff = float(calc_diff(fused_weights[score_based, :num_topk],
                                       reference_weights(score_based, selected_idx)))
@@ -341,8 +347,23 @@ def test_mega_gate_scoring_modes() -> None:
             expected_ids = (scores + bias).topk(8).indices.sort().values
             assert torch.equal(ids.sort(dim=1).values, expected_ids.expand(rows, -1))
             selected = scores[ids]
-            expected_weights = selected / selected.sum(dim=1, keepdim=True) * ROUTED_SCALING_FACTOR
+            expected_weights = normalized_weights(selected, sigmoid=mode == 'sigmoid')
             torch.testing.assert_close(weights, expected_weights, rtol=3e-4, atol=2e-5)
+
+        # Bias fixes the winning set while all eight unbiased scores are tiny or zero.
+        bias.zero_()
+        bias[:8] = 1
+        expected_ids = torch.arange(8, device='cuda').expand(rows, -1)
+        for logit in (-50, -128):
+            weight[:, 0] = logit
+            for mode in ('sigmoid', 'sqrtsoftplus'):
+                outputs = make_outputs(inputs, num_topk=8)
+                ids, weights = run_mega_gate(inputs, outputs, num_topk=8, scoring_func=mode)
+                assert torch.equal(ids.sort(dim=1).values, expected_ids)
+                selected_logits = weight[:, 0].float()[ids]
+                scores = selected_logits.sigmoid() if mode == 'sigmoid' else F.softplus(selected_logits).sqrt()
+                expected = normalized_weights(scores, sigmoid=mode == 'sigmoid')
+                torch.testing.assert_close(weights, expected, rtol=3e-4, atol=0)
 
         # All FP32 sigmoid scores round to one; the documented tie break is lowest ID.
         inputs['bias'] = None

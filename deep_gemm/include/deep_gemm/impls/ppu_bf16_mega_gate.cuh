@@ -212,7 +212,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
                 value = mega_gate_detail::reduced_score<E,S,CompactScores,ScoreStride,ScoreBlockTokens>(a, token, selected);
                 if (!PreActivated or !score_for_ranking) value = gate_score<UseSigmoid>(value);
             }
-            gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap>(a.routing, a.routing.logical_count, token, lane, selected, value);
+            gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, value);
             continue;
         }
         const float* bias = a.image_token_mask and a.image_token_mask[token] ? a.image_bias : a.bias;
@@ -307,7 +307,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
                             }
                             const float chosen_score = __shfl_sync(0xffffffff, score, selected_lane);
                             const float selected_score = lane < Topk ? chosen_score : 0.0f;
-                            gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
+                            gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
                             continue;
                         }
                     }
@@ -338,7 +338,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
                             rank_keys[1]=0x007fffffu;experts[1]=-1;scores[1]=0.0f;
                         }
                     }
-                    gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
+                    gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
                     continue;
                 }
             }
@@ -362,7 +362,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
             value = select_warp_expert_value<Waves>(values, selected);
         }
         if (!score_for_ranking and lane < Topk) value = sqrt_softplus(value);
-        gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap>(a.routing, a.routing.logical_count, token, lane, selected, value);
+        gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, value);
     }
 }
 

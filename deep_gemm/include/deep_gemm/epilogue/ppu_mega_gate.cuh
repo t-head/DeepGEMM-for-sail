@@ -175,7 +175,7 @@ __device__ __forceinline__ void store_token_outputs(const RoutingArgs& args, con
     }
 }
 
-template <uint32_t kNumTopk, bool kHasUnmappedTopkIdx, bool kHasPhysicalMap>
+template <uint32_t kNumTopk, bool kHasUnmappedTopkIdx, bool kHasPhysicalMap, bool UseSigmoid>
 __device__ __forceinline__ bool store_topk_token(const RoutingArgs& args, const int* routed_logical_count,
                                      const uint32_t& global_token_idx, const uint32_t& lane_idx,
                                      int selected_expert_idx, const float& selected_unbiased_score) {
@@ -209,7 +209,9 @@ __device__ __forceinline__ bool store_topk_token(const RoutingArgs& args, const 
 
     // The smallest shuffle width covering the routed lanes, the other lanes hold zero
     constexpr uint32_t kSumWidth = kNumTopk <= 8 ? 8 : (kNumTopk <= 16 ? 16 : 32);
-    const auto topk_sum = math::warp_reduce_sum<kSumWidth>(selected_unbiased_score) + 1e-20f;
+    const float sum = math::warp_reduce_sum<kSumWidth>(selected_unbiased_score);
+    // GLM normalizes every positive sigmoid sum; DeepSeek V4.1 uses an additive epsilon.
+    const float topk_sum = UseSigmoid ? (sum > 0.0f ? sum : 1.0f) : sum + 1e-20f;
     const auto selected_weight = lane_idx < kNumTopk ? selected_unbiased_score / topk_sum * args.routed_scaling_factor : 1.0f;
     store_token_outputs<kNumTopk, kHasUnmappedTopkIdx>(args, global_token_idx, lane_idx,
                                                        physical_expert_idx, selected_weight, selected_expert_idx);
