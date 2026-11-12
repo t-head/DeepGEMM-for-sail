@@ -82,7 +82,7 @@ template <uint32_t kNumRanks, uint32_t kNumCTAs, uint32_t kNumThreads, uint32_t 
           uint32_t kNumExpertsPerRank, uint32_t kNumTopk, uint32_t kDispatchBlockM,
           uint32_t kPullSlots, uint32_t kNumMaxTokensPerRank, uint32_t kShapeN, uint32_t kShapeK,
           int kW4BlockM, int kW4BlockN, int kW4BlockK, int kW4WarpM, int kW4WarpN,
-          int kW4WarpK, int kW4Stages, uint32_t kNumPullCTAs, uint32_t kPullGroupSize>
+          int kW4WarpK, int kW4Stages, uint32_t kNumPullCTAs, uint32_t kPullGroupSize, GatedActivation Activation>
 CUTLASS_DEVICE void dispatch_gemm1_device(
     void* workspace_base, const layout::SymBuffer<>& sym_buffer, int64_t* __restrict__ input_topk_idx,
     const uint8_t* __restrict__ input_token, uint8_t* __restrict__ dispatched_token_pool,
@@ -111,7 +111,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                                                           /*N_EXPAND=*/1,
                                                           /*kMoeScatter=*/false,
                                                           /*kFusedSitu=*/true, /*kUseReplicaWeights=*/false,
-                                                          /*kDynamicWork=*/true>;
+                                                          /*kDynamicWork=*/true, 1, Activation>;
     static_assert(W4Kernel::MaxThreadsPerBlock == kNumThreads, "W4A16 GEMM phase requires the MMA CTA size");
 
     typename W4Kernel::Params params{reinterpret_cast<const cutlass::bfloat16_t*>(dispatched_token_pool),
@@ -140,8 +140,9 @@ namespace deep_gemm {
 template <int N_, int K_, int BlockM_, int BlockN_, int BlockK_, int WarpM_, int WarpN_, int WarpK_, int Groups_,
           int Stages_, int Ranks_, int CTAs_, int Threads_, int DispatchBlockM_, int TopK_, int Capacity_,
           int PullCTAs_, int PullGroupSize_, int PullSlots_, uint64_t PoolTokens_, uint64_t InputTokens_,
-          uint64_t TopkIdx_, uint64_t DispatchedTokens_, uint64_t Gemm2Metadata_>
+          uint64_t TopkIdx_, uint64_t DispatchedTokens_, uint64_t Gemm2Metadata_, GatedActivation Activation_>
 struct MegaMoEBf16Fp4Gemm1Kernel {
+    static constexpr GatedActivation Activation = Activation_;
     static constexpr int N = N_;
     static constexpr int K = K_;
     static constexpr int BlockM = BlockM_;
@@ -170,7 +171,7 @@ struct MegaMoEBf16Fp4Gemm1Kernel {
     static_assert(sizeof(layout::SymBuffer<>) == 528, "MegaMoE symmetric buffer ABI changed");
     using Kernel = cutlass::gemm::kernel::W4A16GEMM_MMA<
         N, K, BlockM, BlockN, BlockK, WarpM, WarpN, WarpK, Groups, Stages,
-        GemmType::MGroupedNoPad, 1, false, true, false, true>;
+        GemmType::MGroupedNoPad, 1, false, true, false, true, 1, Activation>;
     static constexpr uint32_t shared_memory_bytes() {
         uint32_t pull = PullSlots * K * sizeof(__ppu_bfloat16);
         uint32_t counts = Ranks * Groups * sizeof(uint32_t);
@@ -193,7 +194,7 @@ __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm8
         Builder::Ranks, Builder::CTAs, Builder::Threads, Builder::Ranks * Builder::Groups, Builder::Groups, Builder::TopK,
             Builder::DispatchBlockM, Builder::PullSlots, Builder::Capacity,
         Builder::N, Builder::K, Builder::BlockM, Builder::BlockN, Builder::BlockK, Builder::WarpM, Builder::WarpN,
-            Builder::WarpK, Builder::Stages, Builder::PullCTAs, Builder::PullGroupSize>(
+            Builder::WarpK, Builder::Stages, Builder::PullCTAs, Builder::PullGroupSize, Builder::Activation>(
         pointer(0), sb, reinterpret_cast<int64_t*>(pointer(Builder::TopkIdx)), pointer(Builder::InputTokens),
         pointer(Builder::DispatchedTokens), pointer(Builder::Gemm2Metadata), static_cast<uint32_t>(num_tokens), rhs, rhs_scales,
         rhs_replicas, rhs_replica_scales, static_cast<uint32_t>(num_master_experts), activated,

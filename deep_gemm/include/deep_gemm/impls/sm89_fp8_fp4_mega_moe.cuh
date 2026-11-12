@@ -1,8 +1,10 @@
 #pragma once
 
 #include <deep_gemm/impls/w4fa8_gemm.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/epilogue/gated_activation.cuh>
+#include <deep_gemm/epilogue/activation_quant_ops.cuh>
 #include <deep_gemm/impls/mega_moe_io.cuh>
+#include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/impls/fp8_channelwise_mega_moe_dispatch_gemm1.cuh>
 #include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 
@@ -22,7 +24,7 @@ struct SingleTile {
     }
 };
 
-template <int BlockM, int BlockN, int K, int WarpM, int WarpN, int Stages, bool OAI, bool SiTU,
+template <int BlockM, int BlockN, int K, int WarpM, int WarpN, int Stages, GatedActivation Activation,
           w4fa8::FragmentPolicy Fragment, w4fa8::ALoadPolicy ALoad>
 struct Gemm1 {
     using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<
@@ -62,25 +64,11 @@ struct Gemm1 {
                         const int dst = (col / 16) * 8 + col % 8;
                         CUTE_UNROLL
                         for (int v = 0; v < 2; ++v) {
-                            float gate = __bfloat162float(__float2bfloat16(acc(2*r+v, m, n) * sf));
-                            float up = __bfloat162float(__float2bfloat16(acc(2*r+v+4, m, n) * sf));
-                            float value;
-                            if constexpr (SiTU) {
-                                const float soft_gate = situ_beta *
-                                    detail::moe_tanh<DG_MOE_FAST_MATH>(gate * detail::moe_reciprocal<DG_MOE_FAST_MATH>(situ_beta));
-                                const float soft_up = situ_linear_beta > 0 ? situ_linear_beta *
-                                    detail::moe_tanh<DG_MOE_FAST_MATH>(up * detail::moe_reciprocal<DG_MOE_FAST_MATH>(situ_linear_beta)) : up;
-                                value = soft_gate * detail::moe_sigmoid<DG_MOE_FAST_MATH>(gate) * soft_up;
-                            } else {
-                                if (limit >= 0) {
-                                    const float bound = __bfloat162float(__float2bfloat16(limit));
-                                    gate = fminf(gate, bound);
-                                    up = fminf(fmaxf(up, -bound), bound);
-                                }
-                                value = gate * detail::moe_sigmoid<DG_MOE_FAST_MATH>(OAI ? alpha * gate : gate)
-                                            * (OAI ? up + 1.0f : up);
-                            }
-                            output[int64_t(row) * stride + dst + v] = __float2bfloat16(value);
+                            float gate = acc(2*r+v, m, n) * sf;
+                            float up = acc(2*r+v+4, m, n) * sf;
+                            const float value = routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
+                                gate, up, limit, alpha, situ_beta, situ_linear_beta);
+                            output[int64_t(row) * stride + dst + v] = epilogue::quant::bf16(value);
                         }
                     }
                 }
@@ -186,7 +174,7 @@ struct Scatter {
 namespace deep_gemm {
 
 template <int BLOCK_M_, int GEMM1_BLOCK_N_, int TOKEN_BYTES_, int GEMM1_WARP_M_, int GEMM1_WARP_N_,
-          int GEMM1_STAGES_, bool SWIGLU_OAI_, bool SITU_, w4fa8::FragmentPolicy FRAGMENT_POLICY_,
+          int GEMM1_STAGES_, GatedActivation ACTIVATION_, w4fa8::FragmentPolicy FRAGMENT_POLICY_,
           w4fa8::ALoadPolicy A_LOAD_POLICY_, int NUM_EXPERTS_, int NUM_THREADS_, int NUM_RANKS_, int NUM_CTAS_,
           int NUM_EXPERTS_PER_RANK_, int NUM_TOPK_, int GEMM1_N_, int PULL_CTAS_, int PULL_GROUP_SIZE_,
           int GEMM2_BLOCK_M_, bool GEMM2_VALID_ROWS_, uint64_t LAYOUT_OFF_ITI_, uint64_t LAYOUT_OFF_IT_,
@@ -195,7 +183,7 @@ template <int BLOCK_M_, int GEMM1_BLOCK_N_, int TOKEN_BYTES_, int GEMM1_WARP_M_,
 struct MegaMoEFp8Fp4Gemm1Kernel {
     static constexpr int BLOCK_M = BLOCK_M_, GEMM1_BLOCK_N = GEMM1_BLOCK_N_, TOKEN_BYTES = TOKEN_BYTES_;
     static constexpr int GEMM1_WARP_M = GEMM1_WARP_M_, GEMM1_WARP_N = GEMM1_WARP_N_, GEMM1_STAGES = GEMM1_STAGES_;
-    static constexpr bool SWIGLU_OAI = SWIGLU_OAI_, SITU = SITU_;
+    static constexpr GatedActivation ACTIVATION = ACTIVATION_;
     static constexpr w4fa8::FragmentPolicy FRAGMENT_POLICY = FRAGMENT_POLICY_;
     static constexpr w4fa8::ALoadPolicy A_LOAD_POLICY = A_LOAD_POLICY_;
     static constexpr int NUM_EXPERTS = NUM_EXPERTS_, NUM_THREADS = NUM_THREADS_, NUM_RANKS = NUM_RANKS_;
@@ -210,7 +198,7 @@ struct MegaMoEFp8Fp4Gemm1Kernel {
 
     using Backend =
         mega_moe::w4a8::Gemm1<BLOCK_M, GEMM1_BLOCK_N, TOKEN_BYTES, GEMM1_WARP_M, GEMM1_WARP_N,
-                              GEMM1_STAGES, SWIGLU_OAI, SITU, FRAGMENT_POLICY, A_LOAD_POLICY>;
+                              GEMM1_STAGES, ACTIVATION, FRAGMENT_POLICY, A_LOAD_POLICY>;
     static constexpr uint32_t compute_bytes = sizeof(typename Backend::Kernel::SharedStorage);
     static constexpr uint32_t dispatch_bytes =
         ((NUM_EXPERTS * 4 + 15) & ~15u) + NUM_THREADS / 32 * TOKEN_BYTES;
@@ -233,7 +221,7 @@ __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm8
             Builder::NUM_TOPK, Builder::BLOCK_M,
         Builder::TOKEN_BYTES, Builder::GEMM1_N, Builder::GEMM1_BLOCK_N, 128, Builder::GEMM1_WARP_M, Builder::GEMM1_WARP_N,
             Builder::GEMM1_STAGES,
-        Builder::PULL_CTAS, Builder::SWIGLU_OAI, Backend, Builder::PULL_GROUP_SIZE, Builder::GEMM2_BLOCK_M,
+        Builder::PULL_CTAS, Builder::ACTIVATION, Backend, Builder::PULL_GROUP_SIZE, Builder::GEMM2_BLOCK_M,
             Builder::GEMM2_VALID_ROWS>(
         p(0), sb, reinterpret_cast<int64_t*>(p(Builder::LAYOUT_OFF_ITI)), p(Builder::LAYOUT_OFF_IT),
         reinterpret_cast<float*>(p(Builder::LAYOUT_OFF_ISF)), p(Builder::LAYOUT_OFF_PT),

@@ -1,4 +1,5 @@
 #pragma once
+#include <deep_gemm/epilogue/activation_quant_ops.cuh>
 
 // PPU MegaMoE routing and symmetric-memory transport shared by FP8 and BF16.
 #include <cstdint>
@@ -8,6 +9,7 @@
 #include <cutlass/numeric_types.h>
 #include <cute/arch/copy_ppu.hpp>
 #include <deep_gemm/layout/routed_moe.cuh>
+#include <deep_gemm/common/math.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/comm/routed_moe_barrier.cuh>
 
@@ -47,7 +49,7 @@ CUTLASS_DEVICE uint32_t umin(const uint32_t a, const uint32_t b) {
     return a < b ? a : b;
 }
 
-template <int kHidden>
+template <int kHidden, bool FastMath = false>
 CUTLASS_DEVICE void warp_quantize_bf16_row(
         const __ppu_bfloat16* __restrict__ input,
         cutlass::float_e4m3_t* __restrict__ output,
@@ -73,15 +75,11 @@ CUTLASS_DEVICE void warp_quantize_bf16_row(
                 local_amax, fmaxf(fabsf(value.x), fabsf(value.y)));
         }
     }
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        local_amax = fmaxf(
-            local_amax,
-            __shfl_xor_sync(0xffffffffu, local_amax, offset));
+    local_amax = epilogue::quant::warp_amax(local_amax);
 
     // Match the row-quantization reference and avoid reciprocal overflow.
-    const float scale = fmaxf(local_amax, 1e-10f) / 448.0f;
-    const float scale_inv = 1.0f / scale;
+    const auto quant_scale = epilogue::quant::fp8_row_scale<FastMath>(local_amax);
+    const float scale = quant_scale.scale, scale_inv = quant_scale.inverse;
     if (lane_idx == 0)
         output_scale[row] = scale;
 
@@ -97,8 +95,7 @@ CUTLASS_DEVICE void warp_quantize_bf16_row(
             const float2 value = __bfloat1622float2(src2[i]);
             const float value0 = value.x * scale_inv;
             const float value1 = value.y * scale_inv;
-            packed2[i] = __hg_cvt_float2_to_fp8x2(
-                make_float2(value0, value1), __HG_SATFINITE, __HG_E4M3);
+            packed2[i] = epilogue::quant::fp8_pair(value0, value1);
         }
         *reinterpret_cast<uint4*>(dst + elem) = packed;
     }

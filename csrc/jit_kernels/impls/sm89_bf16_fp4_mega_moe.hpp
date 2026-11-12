@@ -83,7 +83,7 @@ struct BF16FP4Linear1Params {
     const uint8_t *weights, *scales, *replicas, *replica_scales;
     int master_experts;
     at::BFloat16* activated;
-    GatedActivationOp<GatedActivation::SiTU>::Params activation;
+    std::array<float, 2> activation;
 };
 
 // Mirror the ordinary W4A16 extended parameter layout used by scatter.
@@ -129,7 +129,7 @@ public:
             return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
 #include <deep_gemm/impls/sm89_bf16_fp4_mega_moe.cuh>
-using Builder = deep_gemm::MegaMoEBf16Fp4Gemm1Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEBf16Fp4Gemm1Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({})>;
 static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_bf16_fp4_mega_moe_l1<Builder>);
@@ -139,7 +139,7 @@ static void __instantiate_kernel() {{
                 dispatch.num_experts_per_rank, tile.num_stages, dispatch.num_ranks, info.num_ctas, info.num_threads,
                 dispatch.block_m, dispatch.num_topk, dispatch.nmtpr, dispatch.pull_ctas, dispatch.pull_group_size, dispatch.pull_slots,
                 inputs.dispatch.num_max_pool_tokens, inputs.input_tokens, inputs.topk_idx,
-                inputs.dispatched_tokens, inputs.gemm2_metadata, args.launch_args.smem_size);
+                inputs.dispatched_tokens, inputs.gemm2_metadata, int(info.activation), args.launch_args.smem_size);
         } else {
             return fmt::format(R"(
 #include <deep_gemm/impls/sm89_bf16_fp4_mega_moe.cuh>
@@ -172,7 +172,7 @@ static void __instantiate_kernel() {{
         if constexpr (kIsLinear1) {
             DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
                 p.sym_buffer, p.rank_idx, p.num_tokens, p.weights, p.scales, p.replicas, p.replica_scales,
-                p.master_experts, p.activated, p.activation.beta, p.activation.linear_beta));
+                p.master_experts, p.activated, p.activation[0], p.activation[1]));
         } else {
             DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, p));
         }
@@ -183,7 +183,7 @@ static auto make_bf16_fp4_linear1_args(
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights,
     const std::tuple<torch::Tensor, torch::Tensor>& replicas,
     uint8_t* base, const layout::RoutedMoEBuffer& buffer, const layout::SymBuffer<>& sym_buffer,
-    int rank_idx, int num_tokens, const GatedActivationOp<GatedActivation::SiTU>::Params& activation_params,
+    int rank_idx, int num_tokens, const std::array<float, 2>& activation_params,
     const Gemm1Config& config) {
     using Runtime = BF16FP4MegaMoEGemmRuntime<MegaMoEPhaseKind::Linear1>;
     const auto& [weight, scale] = l1_weights;
@@ -233,16 +233,19 @@ inline void bf16_fp4_mega_moe_impl(
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_replicas,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_replicas,
     uint8_t* base, const layout::RoutedMoEBuffer& buffer, const layout::SymBuffer<>& sym_buffer,
-    int rank_idx, int num_tokens, bool fast_math, float situ_beta, float situ_linear_beta,
+    int rank_idx, int num_tokens, GatedActivation activation, float activation_clamp, bool fast_math,
+    float activation_alpha, float situ_beta, float situ_linear_beta,
     const MegaMoEPrecisionConfigs& configs,
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats) {
     using Linear1Runtime = BF16FP4MegaMoEGemmRuntime<MegaMoEPhaseKind::Linear1>;
     using Linear2Runtime = BF16FP4MegaMoEGemmRuntime<MegaMoEPhaseKind::Linear2>;
     auto config = configs.l1;
     config.fast_math = fast_math;
+    config.activation = activation;
     const auto l1_args = make_bf16_fp4_linear1_args(
         l1_weights, l1_weights_replicas, base, buffer, sym_buffer, rank_idx, num_tokens,
-        {situ_beta, situ_linear_beta}, config);
+        activation == GatedActivation::SiTU ? std::array<float, 2>{situ_beta, situ_linear_beta}
+                                          : std::array<float, 2>{activation_clamp, activation_alpha}, config);
     const auto l2_args = make_bf16_fp4_linear2_args(
         l2_weights, l2_weights_replicas, base, buffer, rank_idx, config.dispatch, configs.l2);
     const int rows = buffer.dispatch.num_max_pool_tokens;

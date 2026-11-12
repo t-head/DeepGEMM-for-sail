@@ -1,6 +1,8 @@
 #pragma once
 #include <tools/util/include/cutlass/util/packed_stride.hpp>
 #include <deep_gemm/impls/mega_moe_io.cuh>
+#include <deep_gemm/epilogue/gated_activation.cuh>
+#include <deep_gemm/epilogue/activation_quant_ops.cuh>
 
 // Device-side channel-FP8 GEMM1 block used by the cooperative MegaMoE kernel.
 // The CUTLASS A8W8 collective performs E4M3xE4M3 MMA and applies the per-row
@@ -84,7 +86,7 @@ struct Gemm1MmaConfig {
         cute::identity>;
 };
 
-template <class Cfg, bool kSwiGLUOAI = false>
+template <class Cfg, GatedActivation Activation = GatedActivation::SwiGLU>
 __device__ __forceinline__ void gemm1_swiglu_mma_block(
         const typename Cfg::ElementA* __restrict__ a_ptr,
         const float* __restrict__ scale_a,
@@ -93,7 +95,7 @@ __device__ __forceinline__ void gemm1_swiglu_mma_block(
         __ppu_bfloat16* __restrict__ d_ptr,
         int ld_d, int valid_m, int M, int N, int K,
         int thread_idx, char* smem_buf, float swiglu_limit,
-        float activation_alpha, uint32_t* queue_counter = nullptr,
+        float activation_alpha, float situ_beta, float situ_linear_beta, uint32_t* queue_counter = nullptr,
         uint32_t* next_ticket = nullptr, uint32_t* prefetched_work = nullptr) {
     using namespace cute;
     using CollectiveMainloop = typename Cfg::CollectiveMainloop;
@@ -134,8 +136,8 @@ __device__ __forceinline__ void gemm1_swiglu_mma_block(
     if (prefetched_work != nullptr) *prefetched_work = *next_ticket;
     // G=8 preprocessing stores [gate8, up8, gate8, up8, ...]. The physical
     // C-fragment therefore pairs consecutive mma_n slices. Match the production
-    // numerical order: FP32 accum -> BF16 -> optional BF16 clamp -> SwiGLU ->
-    // BF16 compact output.
+    // numerical order: FP32 accum -> FP32 activation -> BF16 compact output.
+    // Only the clamp boundary is rounded to BF16 before comparison.
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
     Tensor mD = make_tensor(
         make_gmem_ptr(d_ptr), make_shape(M, N),
@@ -181,37 +183,13 @@ __device__ __forceinline__ void gemm1_swiglu_mma_block(
                         const int m_row = base_m + i * 8;
                         if (m_row >= valid_m)
                             continue;
-                        __ppu_bfloat162 bg =
-                            __float22bfloat162_rn(
-                                make_float2(gate[2 * i], gate[2 * i + 1]));
-                        __ppu_bfloat162 bu =
-                            __float22bfloat162_rn(
-                                make_float2(up[2 * i], up[2 * i + 1]));
-                        if (swiglu_limit >= 0.0f) {
-                            const __ppu_bfloat16 limit =
-                                __float2bfloat16(swiglu_limit);
-                            const __ppu_bfloat162 hi = {limit, limit};
-                            const __ppu_bfloat162 lo = {
-                                __float2bfloat16(-swiglu_limit),
-                                __float2bfloat16(-swiglu_limit)};
-                            bg = __hmin2(bg, hi);
-                            bu = __hmin2(__hmax2(bu, lo), hi);
-                        }
-                        const float2 gf = __bfloat1622float2(bg);
-                        const float2 uf = __bfloat1622float2(bu);
-                        // SwiGLU uses an FP32 gate/sigmoid product. M3 applies
-                        // FP32 alpha and up bias after BF16 projection/clamp.
-                        const float lhs0 = gf.x * deep_gemm::mega_moe::detail::moe_sigmoid<DG_MOE_FAST_MATH>(
-                            kSwiGLUOAI ? activation_alpha * gf.x : gf.x);
-                        const float lhs1 = gf.y * deep_gemm::mega_moe::detail::moe_sigmoid<DG_MOE_FAST_MATH>(
-                            kSwiGLUOAI ? activation_alpha * gf.y : gf.y);
-                        __ppu_bfloat16* out =
-                            d_ptr + static_cast<uint64_t>(m_row) * ld_d
-                            + compact_n;
-                        out[0] = __float2bfloat16(
-                            lhs0 * (kSwiGLUOAI ? uf.x + 1.0f : uf.x));
-                        out[1] = __float2bfloat16(
-                            lhs1 * (kSwiGLUOAI ? uf.y + 1.0f : uf.y));
+                        const float2 gf = make_float2(gate[2 * i], gate[2 * i + 1]);
+                        const float2 uf = make_float2(up[2 * i], up[2 * i + 1]);
+                        __ppu_bfloat16* out = d_ptr + static_cast<uint64_t>(m_row) * ld_d + compact_n;
+                        out[0] = epilogue::quant::bf16(routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
+                            gf.x, uf.x, swiglu_limit, activation_alpha, situ_beta, situ_linear_beta));
+                        out[1] = epilogue::quant::bf16(routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
+                            gf.y, uf.y, swiglu_limit, activation_alpha, situ_beta, situ_linear_beta));
                     }
                 }
             }

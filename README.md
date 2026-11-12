@@ -533,10 +533,19 @@ with `quantization` (channelwise by default). These backends require PPU1.5.
 
 | Backend | Compute | Workspace mode | Activation | EP limit |
 |---|---|---|---|---|
-| FP8 channelwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="channelwise"` | SwiGLU, SwiGLU-OAI | 64 |
-| FP8 blockwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, SwiGLU-OAI | 64 |
-| E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `mma_type="fp8xfp4"` | SwiGLU, SwiGLU-OAI, SiTU | 64 |
-| BF16 x MXFP4 | `bf16_fp4_mega_moe` | `mma_type="bf16xfp4", activation="situ"` | SiTU | 64 |
+| FP8 channelwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="channelwise"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+| FP8 blockwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+| E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `mma_type="fp8xfp4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+| BF16 x MXFP4 | `bf16_fp4_mega_moe` | `mma_type="bf16xfp4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+
+All MegaMoE backends pass FP32 GEMM1 accumulators to FP32 gated activation.
+Sigmoid and tanh always use the native PPU instructions, including when
+`fast_math=False`. W4A8 and channelwise FP8 round the activation result to BF16
+scratch before a separate FP32 row quantizer emits E4M3 values and one FP32
+scale per row. FP4 and blockwise FP8 keep FP32 values through fused activation
+quantization, producing group32 E8M0 and group128 FP32 scales respectively.
+W4A16 converts only the final activation result to BF16 for GEMM2. Existing clamp
+boundary conventions and quantization granularities are preserved.
 
 H is divisible by 256 and I by 128. FP8 and W4A8 support at most 128 physical experts
 per rank; W4A16 supports at most 127. Capacity is positive and below 2^24;
@@ -637,7 +646,7 @@ FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]` for channelwise
 or `[capacity,H/128]` for blockwise. W4A16 `x` is BF16 `[capacity,H]`, and
 `x_sf` is an empty `[capacity,0]` view. `mega_moe_pre_dispatch` fills these
 inputs and routes. FP8 also quantizes activated GEMM1 output to E4M3; W4A16
-keeps BF16 activated output. SiTU is fused into GEMM1.
+keeps BF16 activated output. All four activations are fused into GEMM1.
 These backends write BF16 GEMM2 scatter results and launch a separate combine
 kernel inside the complete C++ compute call. Combine handles the generation
 barrier, weighted reduction and dispatch-counter recycling.
@@ -653,14 +662,18 @@ entry points omit the MXFP4 `recipe`: FP8 granularities are selected by
 the workspace, W4A8 weight groups are fixed at 32, and W4A16 does not quantize
 activations. SwiGLU-OAI uses
 keyword-only `activation_alpha=None` (effective default `1.702`); an explicit
-alpha is accepted only for OAI. W4A16 and W4A8 SiTU retain `situ_beta=4` and
+alpha is accepted only for OAI. SiTU uses `situ_beta=4` and
 `situ_linear_beta=25`; `situ_linear_beta=None` disables the up softcap, while
 `situ_beta` must be positive and finite. All pre-dispatch paths accept int32
 or int64 routing IDs and store int64 IDs in the workspace.
-FP8 and W4A8 SwiGLU/SwiGLU-OAI round clamp boundaries to BF16. For these
+Routed SwiGLU/STEP/SwiGLU-OAI backends round clamp boundaries to BF16. For these
 MegaMoE paths, `activation_clamp=None` or `+inf` disables clipping; zero is
-an active clamp boundary. SiTU (W4A16 and W4A8) rejects any explicit
-`activation_clamp`. `fast_math` selects activation math only.
+an active clamp boundary. STEP clips SiLU(gate), while SwiGLU clips gate
+before sigmoid. SiTU rejects any explicit
+`activation_clamp`. `fast_math=True` selects native-reciprocal multiplication
+for SiTU divisions and post-activation FP8 quantization; `False` uses regular
+FP32 division. Both modes always use native PPU sigmoid and tanh. Input
+pre-dispatch quantization has no `fast_math` argument and is unchanged.
 
 #### HyperConnection (HC) prenorm GEMM
 

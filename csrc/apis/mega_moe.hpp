@@ -70,10 +70,6 @@ get_symm_buffer_size_for_mega_moe(
             precision = "w4a8";
         else
             precision = "w4a16";
-        const bool supported_activation = precision == "w4a16" ? activation_kind == GatedActivation::SiTU :
-            activation_kind == GatedActivation::SwiGLU || activation_kind == GatedActivation::SwiGLUOAI ||
-            (precision == "w4a8" && activation_kind == GatedActivation::SiTU);
-        TORCH_CHECK(supported_activation, "unsupported activation for ", precision, ": ", activation);
         TORCH_CHECK((staging_config == std::array<int, 3>{} ||
                      staging_config == std::array<int, 3>{num_experts, num_max_tokens_per_rank, hidden}),
                     "MegaMoE base must have the same workspace dimensions for ", precision);
@@ -546,9 +542,6 @@ static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, cons
     const bool fp8 = precision != "w4a16", blockwise = precision == "fp8_blockwise";
     TORCH_CHECK(fp8 == kFp8, "Compute entry does not match workspace precision");
     const auto activation_kind = parse_gated_activation(activation);
-    TORCH_CHECK(fp8 ? (activation_kind == GatedActivation::SwiGLU || activation_kind == GatedActivation::SwiGLUOAI)
-                   : activation_kind == GatedActivation::SiTU,
-                "Unsupported activation for ", precision);
     const auto activation_params = check_routed_activation(
         activation_kind, activation_clamp_opt, situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt);
     check_tensor(y, torch::kBFloat16);
@@ -605,11 +598,14 @@ static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, cons
         fp8_fp8_mega_moe_impl(
             y, l1_weights, l2_weights, l1_replicas, l2_replicas, sym_buffer.data_ptr<uint8_t>(), l, transport, rank_idx, num_tokens,
             activation_kind, activation_clamp_opt && std::isfinite(*activation_clamp_opt) ? *activation_clamp_opt : -1.0f,
-            fast_math, activation_params.alpha, configs, kind, cumulative_local_expert_recv_stats);
+            fast_math, activation_params.alpha, activation_params.beta, activation_params.linear_beta,
+            configs, kind, cumulative_local_expert_recv_stats);
     } else {
         bf16_fp4_mega_moe_impl(
             y, l1_weights, l2_weights, l1_replicas, l2_replicas, sym_buffer.data_ptr<uint8_t>(), l, transport, rank_idx, num_tokens,
-            fast_math, activation_params.beta, activation_params.linear_beta, configs, cumulative_local_expert_recv_stats);
+            activation_kind, activation_clamp_opt && std::isfinite(*activation_clamp_opt) ? *activation_clamp_opt : -1.0f,
+            fast_math, activation_params.alpha, activation_params.beta, activation_params.linear_beta,
+            configs, cumulative_local_expert_recv_stats);
     }
 }
 
@@ -621,12 +617,13 @@ void fp8_fp8_mega_moe(
     const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
     const std::optional<float>& activation_alpha_opt,
     const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas,
-    const std::string& quantization) {
+    const std::string& quantization, const std::optional<float>& situ_beta_opt,
+    const std::optional<float>& situ_linear_beta_opt) {
     checked_mega_moe<true>(
         y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats, sym_buffer,
         sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank, num_experts, num_topk,
         fp8_mega_moe_precision(quantization), activation, activation_clamp_opt, fast_math,
-        std::nullopt, std::nullopt, activation_alpha_opt, l1_weights_replicas, l2_weights_replicas);
+        situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt, l1_weights_replicas, l2_weights_replicas);
 }
 
 void bf16_fp4_mega_moe(
@@ -636,11 +633,12 @@ void bf16_fp4_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
     const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
-    const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas) {
+    const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas,
+    const std::optional<float>& activation_alpha_opt) {
     checked_mega_moe<false>(
         y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats, sym_buffer,
         sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank, num_experts, num_topk, "w4a16",
-        activation, activation_clamp_opt, fast_math, situ_beta_opt, situ_linear_beta_opt, std::nullopt,
+        activation, activation_clamp_opt, fast_math, situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt,
         l1_weights_replicas, l2_weights_replicas);
 }
 
@@ -656,9 +654,6 @@ void fp8_fp4_mega_moe(
     const std::optional<W4A8Weights>& l1_weights_replicas, const std::optional<W4A8Weights>& l2_weights_replicas) {
     check_device();
     const auto activation_kind = parse_gated_activation(activation);
-    TORCH_CHECK(activation_kind == GatedActivation::SwiGLU || activation_kind == GatedActivation::SwiGLUOAI ||
-                    activation_kind == GatedActivation::SiTU,
-                "W4A8 supports swiglu, swiglu_oai and situ");
     const auto activation_params = check_routed_activation(
         activation_kind, activation_clamp_opt, situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt);
     check_tensor(y, torch::kBFloat16);

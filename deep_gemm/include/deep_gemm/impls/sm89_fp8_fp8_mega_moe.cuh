@@ -6,7 +6,7 @@
 namespace deep_gemm {
 
 template <int NUM_THREADS_, uint64_t LAYOUT_OFF_IT_, uint64_t LAYOUT_OFF_ISF_, uint64_t LAYOUT_OFF_ITI_,
-          uint64_t LAYOUT_OFF_PT_, uint64_t LAYOUT_OFF_PSF_, uint64_t LAYOUT_OFF_GEMM2_META_, bool SWIGLU_OAI_,
+          uint64_t LAYOUT_OFF_PT_, uint64_t LAYOUT_OFF_PSF_, uint64_t LAYOUT_OFF_GEMM2_META_, GatedActivation ACTIVATION_,
           int PULL_GROUP_SIZE_, int GEMM2_BLOCK_M_, bool GEMM2_VALID_ROWS_, int BLOCK_M_, int GEMM1_BLOCK_K_,
           int GEMM1_BLOCK_N_, int GEMM1_N_, int GEMM1_STAGES_, int GEMM1_WARP_M_, int GEMM1_WARP_N_, int NMTPR_,
           int NUM_CTAS_, int NUM_EXPERTS_, int NUM_EXPERTS_PER_RANK_, int NUM_RANKS_, int NUM_TOPK_,
@@ -16,7 +16,7 @@ struct MegaMoEFp8ChannelwiseGemm1Kernel {
     static constexpr uint64_t LAYOUT_OFF_IT = LAYOUT_OFF_IT_, LAYOUT_OFF_ISF = LAYOUT_OFF_ISF_;
     static constexpr uint64_t LAYOUT_OFF_ITI = LAYOUT_OFF_ITI_, LAYOUT_OFF_PT = LAYOUT_OFF_PT_;
     static constexpr uint64_t LAYOUT_OFF_PSF = LAYOUT_OFF_PSF_, LAYOUT_OFF_GEMM2_META = LAYOUT_OFF_GEMM2_META_;
-    static constexpr bool SWIGLU_OAI = SWIGLU_OAI_;
+    static constexpr GatedActivation ACTIVATION = ACTIVATION_;
     static constexpr int PULL_GROUP_SIZE = PULL_GROUP_SIZE_, GEMM2_BLOCK_M = GEMM2_BLOCK_M_;
     static constexpr bool GEMM2_VALID_ROWS = GEMM2_VALID_ROWS_;
     static constexpr int BLOCK_M = BLOCK_M_, GEMM1_BLOCK_K = GEMM1_BLOCK_K_, GEMM1_BLOCK_N = GEMM1_BLOCK_N_;
@@ -45,7 +45,7 @@ template <typename Builder>
 __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm89_fp8_channelwise_mega_moe_l1(
     layout::SymBuffer<> sb, int rank_idx, int num_tokens, __hg_fp8_e4m3* gemm1_weight, float* gemm1_weight_scale,
     __hg_fp8_e4m3* gemm1_weight_replicas, float* gemm1_weight_scale_replicas, int num_master_experts,
-    __ppu_bfloat16* swiglu_output, float activation_clamp, float activation_alpha, uint4* gemm2_block_info) {
+    __ppu_bfloat16* swiglu_output, float activation_clamp, float activation_alpha, float situ_beta, float situ_linear_beta, uint4* gemm2_block_info) {
     using namespace deep_gemm;
     constexpr uint64_t off_ws = 0, off_it = Builder::LAYOUT_OFF_IT, off_isf = Builder::LAYOUT_OFF_ISF;
     constexpr uint64_t off_iti = Builder::LAYOUT_OFF_ITI;
@@ -59,13 +59,13 @@ __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm8
         Builder::NUM_RANKS, Builder::NUM_CTAS, Builder::NUM_THREADS, Builder::NUM_EXPERTS, Builder::NUM_EXPERTS_PER_RANK,
             Builder::NUM_TOPK, Builder::BLOCK_M, Builder::TOKEN_BYTES, Builder::GEMM1_N,
         Builder::GEMM1_BLOCK_N, Builder::GEMM1_BLOCK_K, Builder::GEMM1_WARP_M, Builder::GEMM1_WARP_N, Builder::GEMM1_STAGES,
-            Builder::PULL_CTAS, Builder::SWIGLU_OAI, void,
+            Builder::PULL_CTAS, Builder::ACTIVATION, void,
         Builder::PULL_GROUP_SIZE, Builder::GEMM2_BLOCK_M, Builder::GEMM2_VALID_ROWS>(
         P(off_ws), sb, (int64_t*)P(off_iti), (const uint8_t*)P(off_it), (const float*)P(off_isf),
         (uint8_t*)P(off_pt), (float*)P(off_psf), (int32_t*)P(off_meta), gemm2_block_info,
         (const cutlass::float_e4m3_t*)gemm1_weight, gemm1_weight_scale,
         (const cutlass::float_e4m3_t*)gemm1_weight_replicas, gemm1_weight_scale_replicas, (uint32_t)num_master_experts,
-        swiglu_output, activation_clamp, activation_alpha, (uint32_t)num_tokens, Builder::NMTPR);
+        swiglu_output, activation_clamp, activation_alpha, (uint32_t)num_tokens, Builder::NMTPR, 1.0f, 1.0f, situ_beta, situ_linear_beta);
 }
 
 template <bool USE_PADDED_VALID_ROWS, bool CHECK_PACKED_ROUTES, int N, int K, int BLOCK_M, int BLOCK_N,
