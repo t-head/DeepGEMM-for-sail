@@ -12,6 +12,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
 #include "../../utils/layout.hpp"
+#include "ppuxx_layout.hpp"
 #include "../../utils/layout_type_name.hpp"
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_fp8.hpp"
@@ -177,9 +178,6 @@ public:
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         std::string gemm_type, kernel_strategy, kernel_name;
         bool enable_sbo_overlap;
-        // Only meaningful for `GemmType::Batched`. `true` keeps the transposed `[M, B, N]`
-        // output used by `einsum("bhr,hdr->bhd")`; `false` emits a plain `[B, M, N]` output.
-        bool transposed_batch_output = true;
     };
 
     // Main Arguments
@@ -235,12 +233,23 @@ public:
                 hw_info,   args.scheduler, workspace,         args.signal};
     }
 
+    // Keep this key in sync with the arguments formatted by generate_impl below.
+    // PpuHwParams is an immutable process singleton, as is the generated include hash.
+    static auto compile_key(const Args& args) {
+        const auto& info = args.launch_info;
+        return std::make_tuple(cute::get<1>(args.kernel_params.problem_shape),
+                               cute::get<2>(args.kernel_params.problem_shape),
+                               info.block_m, info.block_n, info.block_k, info.num_groups,
+                               info.warp_m, info.warp_n, info.num_stages, info.gemm_type,
+                               info.kernel_strategy, info.enable_sbo_overlap,
+                               info.kernel_name, args.launch_args.smem_size);
+    }
+
     static std::string generate_impl(const Args& args) {
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
         return fmt::format(
             R"(
-#define FP8_HGRTC
 #include <deep_gemm/impls/fp8_gemm.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
@@ -248,10 +257,10 @@ using namespace cute;
 using cutlass::KernelHardwareInfo;
 
 // Injected device hardware constants (host-side hggcDeviceGetAttribute query).
-constexpr int kHwTsmPerCu         = {14};
-constexpr int kHwMaxThreadsPerCta = {15};
-constexpr int kHwMaxWarpsPerCu    = {16};
-constexpr int kHwTotalVregPerCu   = {17};
+constexpr int kHwTsmPerCu         = {13};
+constexpr int kHwMaxThreadsPerCta = {14};
+constexpr int kHwMaxWarpsPerCu    = {15};
+constexpr int kHwTotalVregPerCu   = {16};
 
 constexpr int SHAPE_N = {0};
 constexpr int SHAPE_K = {1};
@@ -266,7 +275,6 @@ constexpr int STAGES = {8};
 static constexpr GemmType kGemmType = GemmType::{9};
 static constexpr KernelStrategy kKernelStrategy = KernelStrategy::{10}; //Default;
 static constexpr bool kEnableSboOverlap = {11};
-static constexpr bool kTransposedBatchOutput = {12};
 
 using ScaleGranularityShape = cute::Shape<cute::_1,cute::_128,cute::_128>;
 using ScaleConfig         = decltype(cutlass::detail::ppu_trivial_blockwise_scale_config<ScaleGranularityShape, false, true>(ScaleGranularityShape{{}}));
@@ -285,8 +293,7 @@ using TileScheduler = DeepGemmScheduler<
   NUM_GROUPS,
   ceil_div((uint32_t)SHAPE_N, (uint32_t)(BLOCK_N * N_EXPAND)),
   2,
-  EpilogueType::Default,
-  kTransposedBatchOutput
+  EpilogueType::Default
 >;
 
 static constexpr bool UseAIU = true;
@@ -364,6 +371,7 @@ using GemmKernel = DeepGemmUniversal<
   kEnableSboOverlap,
   kUseNStageKernel
 >;
+static_assert(GemmKernel::SharedStorageSize == {17}, "FP8 shared storage size differs from host");
 
 // scale-A cp.async address keeps a 64-bit global address and a 32-bit shared
 // address, for 3 VREGs; A/B use the AIU load path.
@@ -376,7 +384,7 @@ using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K,
 
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
-__global__ void {13}(
+__global__ void {12}(
   typename GemmKernel::Params params
 ) {{
   extern __shared__ char smem[];
@@ -388,8 +396,9 @@ __global__ void {13}(
             cute::get<1>(args.kernel_params.problem_shape), cute::get<2>(args.kernel_params.problem_shape),
             args.launch_info.block_m, args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
-            args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.transposed_batch_output, args.launch_info.kernel_name,
-            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu);
+            args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
+            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
+            args.launch_args.smem_size);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -488,22 +497,20 @@ static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, 
                                      .launch_args = {grid, block, SMSIZE},
                                      .kernel_params = params};
 
-    const auto& code = FP8GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp8_deep_gemm", code);
+    const auto& runtime = compiler->build_cached<FP8GemmRuntime>("fp8_deep_gemm", args);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
     HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
     args.launch_args.grid_dim.x *= blocks_per_cu;
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp8"), kNumGroups, m, n, k, 0, grouped_layout,
                                   current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-    FP8GemmRuntime::launch(runtime, args);
-
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        FP8GemmRuntime::launch(runtime, args);
+    }
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {

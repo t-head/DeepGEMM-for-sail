@@ -3,7 +3,7 @@
 //
 // Generates a named __global__ wrapper that calls bf16_gemm_fused_moe_kernel_impl<...>
 // via the __device__ trampoline in fused_moe_gemm.cuh.
-// Registered in gemm.hpp and routed via __init__.py USE_CPP_JIT_FOR_PYTHON=1.
+// Registered in gemm.hpp and exported by the public Python package.
 
 #include <cstdint>
 #include <string>
@@ -160,17 +160,16 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
     // Profiling instrumentation
     int topk = m_sum / num_token;
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_fused_moe_params(
             std::string("bf16"), std::string("non_quantized"),
             (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-    // Launch
-    Bf16FusedMoeRuntime::launch(runtime, args);
-
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        // Launch
+        Bf16FusedMoeRuntime::launch(runtime, args);
+    }
 
     // Optional debug logging
     char* pEnv_params = std::getenv("show_log");
@@ -337,8 +336,7 @@ __global__ void {}(const QuantGemmArgs args) {{
     }
 };
 
-// FP4 fused MoE GEMM runtime. The generated named entry calls the same device implementation as
-// Fp4FusedMoeGemm::run, keeping the Python-JIT and C++-JIT kernels identical.
+// FP4 fused MoE GEMM runtime. The generated entry calls fp4_gemm_fused_moe_kernel_impl.
 class Fp4FusedMoeRuntime final : public LaunchRuntime<Fp4FusedMoeRuntime> {
 public:
     struct LaunchInfo {
@@ -492,17 +490,16 @@ static void m_grouped_gemm_perchannel_nt_fused_impl(
     // Profiling instrumentation
     int topk = m_sum / num_token;
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_fused_moe_params(
             std::string(type_tag), std::string("channel"),
             (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-    // Launch
-    A8W8PerchannelFusedMoeRuntime::launch(runtime, args);
-
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        // Launch
+        A8W8PerchannelFusedMoeRuntime::launch(runtime, args);
+    }
 
     // Optional debug logging
     char* pEnv_params = std::getenv("show_log");
@@ -538,7 +535,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
     const auto& [num_groups, n, k_] = get_shape<3>(rhs);
     const int64_t m_sum = out.size(0);
 
-    // Python returns before JIT compilation for an empty sorted output.
+    // Return before JIT compilation for an empty sorted output.
     if (m_sum == 0) return;
 
     const auto [num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages] = configs;
@@ -550,7 +547,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
     const int block_size = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(num_sms);
 
-    // Smem: get_fused_smem_size_fp4(stages, BM, BN, BK, fusing) — mirrors GemmSmemConfigFp4.
+    // Shared memory accounts for the pipeline and optional fused epilogue.
     const int smem_size = deep_gemm_fp4_common::get_fused_smem_size_fp4(
         num_stages, block_m, block_n, block_k, enable_act_and_quant_fusing);
 
@@ -588,7 +585,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_fused_moe_params(
             std::string("fp4"), std::string("group"), static_cast<int>(num_groups),
             static_cast<int>(num_token), topk, static_cast<int>(n), static_cast<int>(k)*2,
@@ -596,9 +593,10 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_fused_impl(
         dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
         dg_prof_params.add_params("swiglu_limit", swiglu_limit);
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-    Fp4FusedMoeRuntime::launch(runtime, args);
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        Fp4FusedMoeRuntime::launch(runtime, args);
+    }
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
@@ -704,17 +702,16 @@ static void m_grouped_gemm_blkwise_nt_fused_impl(
 
     // Profiling instrumentation
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_fused_moe_params(
             std::string("fp8"), std::string("block"),
             (int)num_groups, (int)num_token, topk, (int)n, (int)k, m_rows.data_ptr<int32_t>(), current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-    // Launch
-    Fp8BlkwiseFusedMoeRuntime::launch(runtime, args);
-
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        // Launch
+        Fp8BlkwiseFusedMoeRuntime::launch(runtime, args);
+    }
 
     // Optional debug logging
     char* pEnv_params = std::getenv("show_log");

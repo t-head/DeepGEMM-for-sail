@@ -6,24 +6,34 @@ on:
       matrix:
         required: false
         type: string
-        default: '["ZW-M890P", "OAM-810E"]'
+        default: '["ZW-M890P", "ZW-810E"]'
       source_mode:
         description: "Source layout mode. Supported values: deepgemm, actlize1.0.0."
         required: false
         type: string
         default: deepgemm
   workflow_dispatch:
+    inputs:
+      matrix:
+        description: "JSON array of PPU runner board types"
+        required: false
+        type: string
+        default: '["ZW-M890P", "ZW-810E"]'
+      source_mode:
+        description: "Source layout mode. Supported values: deepgemm, actlize1.0.0."
+        required: false
+        type: string
+        default: deepgemm
 
 permissions:
   contents: read
 
 env:
-  PPU_BASE_IMAGE: ${{ secrets.PPU_BASE_IMAGE }}
   SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
 
 jobs:
   build-test:
-    name: Build & Test (${{ matrix.runner }})
+    name: Build & Test (${{ matrix.suite == 'board' && matrix.runner || matrix.suite }})
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -34,9 +44,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each board selects a functional caselist via run_checkin.py --suite.
-        # Compile in isolated processes, then execute accuracy checks serially.
-        runner: [ZW-M890P, OAM-810E]
+        # Respect the selected boards; MegaMoE check-in runs only on M890P.
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "ZW-810E"]') }}
+        suite: [board, ZW-M890P-MegaMoE]
+        exclude:
+          - runner: ZW-810E
+            suite: ZW-M890P-MegaMoE
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,7 +59,7 @@ jobs:
           persist-credentials: false
       - name: Build and Test on PPU
         id: ppu-test
-        uses: t-head/ppu-scheduler-action@main
+        uses: t-head/ci-infra/cluster-run@main
         with:
           image: ${{ env.SAIL_IMAGE }}
           container_options: |
@@ -93,9 +106,8 @@ jobs:
             source /usr/local/PPU_SDK/envsetup.sh || true
             which hgcc || true
             echo $PPU_SDK
-            pip install ray[adag]==2.40.0 --no-deps
             pip install setuptools==69.5.1
-            # Match setup.py setup_requires exactly so the build never re-fetches it from the (unreachable) internal index.
+            # Preinstall the SCM version plugin used by setup.py.
             pip install setuptools-scm==9.2.2
             pip install numpy==1.26.4 junit-xml rich
             pip install --upgrade pytest
@@ -120,34 +132,51 @@ jobs:
                 echo "----- last 200 lines of $LOG_FILE -----"
                 tail -n 200 "$LOG_FILE"
             fi
+            # Keep board check-in and MegaMoE reports in separate directories.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}"
+            mkdir -p "$NAS_RESULT_DIR/dist"
+            cp dist/*.whl "$NAS_RESULT_DIR/dist/"
             echo "START TO INSTALL WHEEL"
             pip install ./dist/*.whl --force-reinstall
+            if [ '${{ matrix.suite }}' = 'ZW-M890P-MegaMoE' ]; then
+              # MegaMoE tests import this checkout. Populate its extension
+              # and third-party JIT includes through the existing develop hook.
+              python ./setup.py develop --no-deps
+              python -c 'from pathlib import Path; import deep_gemm; assert Path(deep_gemm.__file__).resolve().parent == Path("deep_gemm").resolve(); print("Testing checkout:", deep_gemm.__file__)'
+            fi
             echo "START TO TEST CASES"
             set +e
             python tests/checkin/run_checkin.py \
-              --suite ${{ matrix.runner }} \
+              --suite ${{ matrix.suite == 'board' && matrix.runner || matrix.suite }} \
               --compile-workers 16
             TEST_EXIT_CODE=$?
             python3 .github/workflows/scripts/generate-env-info.py \
             --docker-image "${{ env.SAIL_IMAGE }}" \
             --output env_info.json
-            # Keep results per runner so the parallel matrix jobs do not collide.
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
-            mkdir -p "$NAS_RESULT_DIR"
             cp test-results.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp -r checkin-logs "$NAS_RESULT_DIR/" 2>/dev/null || true
             exit "$TEST_EXIT_CODE"
           cleanup_policy: on_success
 
-      - name: Test summary (${{ matrix.runner }})
+      - name: Upload wheel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepgemm-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}
+          path: /wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}/dist/*.whl
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 14
+
+      - name: Test summary (${{ matrix.suite == 'board' && matrix.runner || matrix.suite }})
         if: always()
         shell: bash
         run: |
-          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}"
           XML_FILE="$NAS_RESULT_DIR/test-results.xml"
           ENV_FILE="$NAS_RESULT_DIR/env_info.json"
-          echo "## Runner: ${{ matrix.runner }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Suite: ${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}" >> "$GITHUB_STEP_SUMMARY"
 
           if [[ ! -f "$XML_FILE" ]]; then
             echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"

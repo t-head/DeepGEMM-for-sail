@@ -6,6 +6,7 @@
 #include <string>
 
 #include <hggc_runtime_api.h>
+#include <hggc/std/cstdint>
 
 class AssertionException : public std::exception {
 private:
@@ -18,35 +19,43 @@ public:
 };
 
 #ifndef DG_HOST_ASSERT
-#define DG_HOST_ASSERT(cond)                                        \
-do {                                                                \
-    if (not (cond)) {                                               \
-        printf("Assertion failed: %s:%d, condition: %s\n",          \
-               __FILE__, __LINE__, #cond);                          \
-        throw AssertionException("Assertion failed: " #cond);       \
-    }                                                               \
+#define DG_HOST_ASSERT(cond)                                                               \
+do {                                                                                       \
+    if (not (cond)) {                                                                      \
+        printf("Assertion failed: %s:%d, condition: %s\n",                                 \
+               __FILE__, __LINE__, #cond);                                                 \
+        throw AssertionException("Assertion failed: " #cond);                              \
+    }                                                                                      \
 } while (0)
 #endif
 
 #ifndef DG_DEVICE_ASSERT
-#define DG_DEVICE_ASSERT(cond)                                                          \
-do {                                                                                    \
-    if (not (cond)) {                                                                   \
-        printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond);  \
-        asm("ppu.trap;");                                                                   \
-    }                                                                                   \
+#define DG_DEVICE_ASSERT(cond)                                                             \
+do {                                                                                       \
+    if (not (cond)) {                                                                      \
+        printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond);     \
+        asm("ppu.trap;");                                                                  \
+    }                                                                                      \
+} while (0)
+#endif
+
+#ifndef DG_TRAP_ONLY_DEVICE_ASSERT
+#define DG_TRAP_ONLY_DEVICE_ASSERT(cond)                                                   \
+do {                                                                                       \
+    if (not (cond))                                                                        \
+        asm("ppu.trap;");                                                                  \
 } while (0)
 #endif
 
 #ifndef DG_STATIC_ASSERT
-#define DG_STATIC_ASSERT(cond, reason) static_assert(cond, reason)
+#define DG_STATIC_ASSERT(cond, ...) static_assert(cond, __VA_ARGS__)
 #endif
 
-#define CHECK_HGGC(call) \
-{ \
-    hggcError_t err = call; \
-    if (err != hggcSuccess) { \
+#define CHECK_HGGC(call)                                                                   \
+{                                                                                          \
+    hggcError_t err = call;                                                                \
+    if (err != hggcSuccess) {                                                              \
         printf("%s:%d HGGC API error: %s\n", __FILE__, __LINE__, hggcGetErrorString(err)); \
-        exit(EXIT_FAILURE); \
-    } \
+        exit(EXIT_FAILURE);                                                                \
+    }                                                                                      \
 }

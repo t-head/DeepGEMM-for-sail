@@ -1,8 +1,12 @@
 #pragma once
+#include <array>
+#include <cstdint>
+#include <cstring>
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
+#include "runtime.hpp"
 #include "gemm_search_space.hpp"
 #include "adaptive_tile_selector.hpp"
 #include "runtime_lut.hpp"
@@ -150,7 +154,7 @@ std::tuple<int, int, int, int, int, bool> get_gemv_best_configs(int m, int n, in
 // Dense GEMV (m == 1 or 2) launch-config selection: BlockX keys on k/8, BlockY =
 // 128/BlockX. Returns false when uncovered or the tile path is faster (fall back).
 bool dense_gemv_select_configs(int m, int n, int k, const void* w, const void* x,
-                               int& block_x, int& block_y, int& k_per_thread, int& npt) {
+                               int& block_x, int& block_y, int& k_per_thread, int& npt, bool transposed_n1 = false) {
     if (get_env<int>("DG_DISABLE_DENSE_GEMV", 0))
         return false;
     // m == 2 tile gate: above this n the tile path wins despite ~8x wasted math
@@ -185,7 +189,7 @@ bool dense_gemv_select_configs(int m, int n, int k, const void* w, const void* x
     // (~1.81 vs 1.87 TB/s). 4900-case scans put the crossover at n>=2944 && k>=3584.
     constexpr int kGemvTileGateN = 3072;
     constexpr int kGemvTileGateK = 3584;
-    if (m == 1 && n >= kGemvTileGateN && k >= kGemvTileGateK)
+    if (!transposed_n1 && m == 1 && n >= kGemvTileGateN && k >= kGemvTileGateK)
         return false;
 
     k_per_thread = 2;
@@ -222,20 +226,49 @@ using ConfigResult = std::tuple<int, int, int, int, int, int, int, std::tuple<in
 std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms);
 
-// Adaptive tile selection for DenseGemm (BF16). warp_k/dense_s2_opt are injected in the dense
-// impl; here we only apply the adaptive tile choice and return the 8-tuple.
-ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms) {
+// Keep measured dense BF16 tiles in the dtype-specific selector. The shared
+// adaptive selector also serves INT8, so these entries must not live there.
+inline deep_gemm_adaptive::AdaptiveResult select_dense_bf16_tile(int m, int n, int k, int num_sms) {
+    struct TileEntry {
+        int m, n, k, bm, bn, bk, wm, wn, stages;
+    };
+    static constexpr std::array<TileEntry, 4> measured_tiles{{
+        {32, 7168, 12288, 32, 192, 64, 16, 32, 6},
+        {32, 7168, 8192,  32, 192, 64, 32, 16, 6},
+        {64, 7168, 8192,  64, 192, 64, 32, 32, 7},
+        {64, 12288, 1536, 64, 320, 64, 64, 32, 4},
+    }};
+    // The measurements use this SKU with its full CU budget. Reduced budgets
+    // and other devices retain the general selector's resource-aware choices.
+    if (num_sms == 39) {
+        const auto prop = device_runtime->get_prop();
+        if (prop->major == 8 && prop->minor == 9 && prop->multiProcessorCount == 39 &&
+            std::strcmp(prop->name, "ZW-M890P") == 0) {
+            for (const auto& t : measured_tiles) {
+                if (m == t.m && n == t.n && k == t.k)
+                    return {num_sms, t.bm, t.bn, t.bk, t.wm, t.wn, t.bk, t.stages};
+            }
+        }
+    }
+    return deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms);
+}
+
+// Preserve the 8-tuple contract while returning the adaptive warp_k to dense
+// callers, so they can use the same selection without running it a second time.
+ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms, int* selected_warp_k = nullptr) {
     auto [sms, bm, bn, bk, wm, wn, wk, stages] =
-        deep_gemm_adaptive::get_adaptive_configs(m, n, k, num_sms);
-    (void)wk;
+        select_dense_bf16_tile(m, n, k, num_sms);
+    if (selected_warp_k) *selected_warp_k = wk;
     auto smem = get_smem_config(stages, k, bm, bn, bk);
     return std::make_tuple(sms, bm, bn, bk, wm, wn, stages, smem);
 }
 
 ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
                               GemmType gemm_type = GemmType::Normal, int max_block_n = 256,
-                              bool* from_runtime_lut = nullptr) {
+                              bool* from_runtime_lut = nullptr, int* selected_warp_k = nullptr) {
+    const bool is_k_grouped = gemm_type == GemmType::KGroupedContiguous;
     if (from_runtime_lut) *from_runtime_lut = false;
+    if (selected_warp_k) *selected_warp_k = 0; // Non-adaptive callers use block_k.
     if (auto tile = deep_gemm_lut::get_runtime_config(
             m, n, k, num_groups, gemm_type, deep_gemm_lut::RuntimeLutKind::BF16)) {
         auto [bm, bn, bk, wm, wn, stages] = *tile;
@@ -253,22 +286,25 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
             return ConfigResult{ns, bm, bn, bk, wm, wn, stages, smem};
         }
     }
-    // Adaptive tile selection for DenseGemm (BF16). warp_k/dense_s2_opt are injected in the dense
-    // impl; here we only apply the adaptive tile choice and return the 8-tuple.
+    // Keep the 8-tuple result and return adaptive warp_k through the optional output.
+    // The dense implementation still derives dense_s2_opt when preparing the launch.
     if (gemm_type == GemmType::Normal && is_ppu1v5_device() &&
         deep_gemm_adaptive::bf16_adaptive_enabled(m, n, k)) {
-        return get_adaptive_configs_bf16(m, n, k, num_sms);
+        return get_adaptive_configs_bf16(m, n, k, num_sms, selected_warp_k);
     }
     // Generate block_ms
     std::vector<int> block_ms;
-    if (gemm_type != GemmType::MGroupedContiguous) {
+    if (is_k_grouped) {
+        // TN AIU loads require at least 64 contiguous bytes (32 BF16 elements).
+        block_ms = k >= 384 ? std::vector{256, 128, 64, 32} : std::vector{64, 32};
+    } else if (gemm_type != GemmType::MGroupedContiguous) {
         if (k >= 384) {
             block_ms = {256, 128, 64, 32, 16};
         } else {
             block_ms = {64, 32, 16};
         }
     } else {
-        block_ms = {get_mk_alignment_for_contiguous_layout()};
+        block_ms = {heuristics_runtime->get_mk_alignment_for_contiguous_layout()};
     }
 
     // Assert max_block_n is power of 2
@@ -322,7 +358,10 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         std::vector<int> block_ns_after_filter;
         for (int block_n : block_ns) {
             bool condition;
-            if (is_ppu1v5_device() && ((m >= 128 && k > 2048) || m >= 256)) {
+            if (is_k_grouped) {
+                // All candidates meet the TN alignment; FP32 output uses no TSM.
+                condition = true;
+            } else if (is_ppu1v5_device() && ((m >= 128 && k > 2048) || m >= 256)) {
                 condition = (block_n != n && min_n_threshold) && !(block_m == 16 && block_n <= 32);
             } else {
                 condition = (block_m <= 128 || block_n <= 128) && (block_n != n && min_n_threshold) &&
@@ -390,7 +429,7 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
 
     // small m hbm bound or latency bound, wave is not useful, for better occ for 810e hbm bound, use smallest blockN
     // for m16
-    if (m < 20 && n < 512) {
+    if (not is_k_grouped && m < 20 && n < 512) {
         best_block_m = 16;
         best_block_n = 64;
     }
@@ -509,4 +548,132 @@ get_gemm_best_configs_v2(const std::vector<int>& shape, int dtype, int num_sms) 
 
     return {num_min_sms, bm, bn, bk, wm, wn, bk, stages, best_smem_config};
 }
+// Exact 810E tiles selected from cold-cache measurements. Unmatched shapes
+// continue through the general BF16 heuristics. Tile fields are
+// BM, BN, BK, WM, WN, stages, split-K, then optional scheduling flags.
+enum class Model810eDispatchKind { Direct, TSM, Standard, Hybrid };
+enum class Model810eOutputType { BF16, FP32 };
+
+struct Model810eDispatchTile {
+    int bm, bn, bk, wm, wn, stages, splits;
+    int grid_m_first = 0;
+    int peel_first_k = 0;
+    int static_m36 = 0;
+    int static_k256 = 0;
+};
+
+struct Model810eDenseDispatchEntry {
+    int64_t m, n, k;
+    Model810eOutputType output;
+    Model810eDispatchKind kind;
+    Model810eDispatchTile tile;
+    // Hybrid divides only the M dimension; both halves cover the complete K.
+    int split_m = 0;
+    Model810eDispatchTile tail_tile{};
+};
+
+struct Model810eBatchDispatchEntry {
+    int64_t batch, m, n, k;
+    int64_t lhs_ld, rhs_ld, out_ld;
+    int64_t lhs_batch_stride, rhs_batch_stride, out_batch_stride;
+    Model810eOutputType output;
+    Model810eDispatchKind kind;
+    Model810eDispatchTile tile;
+};
+
+inline constexpr std::array<Model810eDenseDispatchEntry, 86> kModel810eDenseDispatch{{
+    {6, 128, 8192, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 32}},
+    {16, 64, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 64, 64, 16, 32, 2, 56}},
+    {16, 384, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 16}},
+    {16, 512, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 16}},
+    {16, 1024, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 64, 16, 16, 3, 8}},
+    {16, 2048, 7168, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {16, 64, 256, 16, 16, 3, 1}},
+    {32, 128, 6144, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 32}},
+    {32, 768, 6144, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 8}},
+    {32, 1536, 6144, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 4}},
+    {32, 6144, 384, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 128, 64, 32, 32, 2, 1}},
+    {32, 25008, 6144, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 128, 128, 16, 32, 3, 1}},
+    {32, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {32, 128, 128, 16, 32, 3, 1}},
+    {36, 64, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 64, 64, 32, 32, 2, 32}},
+    {36, 128, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 32, 128, 16, 16, 3, 8}},
+    {36, 288, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {64, 64, 64, 32, 32, 2, 32}},
+    {36, 4096, 1536, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {36, 4096, 8192, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {36, 8192, 128, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 32, 32, 32, 2, 1}},
+    {36, 24576, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 2, 1}},
+    {36, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {40, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 32, 3, 1}},
+    {64, 96, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 2, 20}},
+    {64, 320, 10240, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 16}},
+    {64, 512, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 8}},
+    {64, 640, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 8}},
+    {64, 4864, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {64, 7168, 3584, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {64, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {140, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {148, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {152, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {160, 96, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 8}},
+    {160, 336, 10240, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 4}},
+    {160, 512, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 128, 64, 16, 32, 3, 4}},
+    {160, 640, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Direct, {32, 64, 64, 16, 32, 3, 2}},
+    {160, 12800, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {160, 13312, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {160, 248320, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {192, 512, 8192, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 2, 10}},
+    {256, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {128, 128, 64, 32, 64, 2, 1}},
+    {288, 384, 5120, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {32, 64, 64, 16, 32, 3, 2}},
+    {288, 129280, 5120, Model810eOutputType::BF16, Model810eDispatchKind::Hybrid, {128, 128, 64, 32, 64, 2, 1}, 256, {32, 128, 64, 16, 32, 3, 1}},
+    {384, 64, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 16, 64, 16, 16, 3, 4}},
+    {384, 256, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 4}},
+    {384, 512, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 2}},
+    {384, 1024, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 1}},
+    {384, 2048, 4096, Model810eOutputType::FP32, Model810eDispatchKind::Direct, {64, 64, 64, 32, 32, 3, 1}},
+    {4000, 128, 6144, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 3, 1}},
+    {4000, 768, 6144, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {64, 256, 64, 32, 64, 3, 1}},
+    {4000, 1536, 6144, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 2, 1}},
+    {4000, 3072, 6144, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 3, 1}},
+    {4000, 6144, 384, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {4000, 6144, 1024, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {4000, 6144, 1536, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {4096, 2112, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 2, 1}},
+    {4096, 6016, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1, 1, 1}},
+    {4096, 7168, 768, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {4096, 7168, 1536, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {4096, 7168, 3584, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {8192, 24, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 32, 64, 32, 32, 3, 1}},
+    {8192, 64, 7168, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {256, 64, 64, 64, 32, 3, 1}},
+    {8192, 256, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 2, 1}},
+    {8192, 320, 10240, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {256, 64, 64, 64, 32, 5, 1}},
+    {8192, 336, 10240, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 3, 1}},
+    {8192, 384, 7168, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 3, 1}},
+    {8192, 512, 2560, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {64, 128, 64, 32, 32, 3, 1}},
+    {8192, 512, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 3, 1}},
+    {8192, 512, 7168, Model810eOutputType::FP32, Model810eDispatchKind::Standard, {128, 128, 64, 32, 64, 3, 1}},
+    {8192, 640, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {8192, 2048, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {8192, 2048, 7168, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {8192, 10240, 320, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {8192, 10240, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {8192, 12800, 2560, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {16384, 8192, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {16384, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1, 1, 1}},
+    {19968, 512, 5120, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {32768, 4, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 16, 64, 16, 16, 3, 8}},
+    {32768, 128, 4096, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {128, 128, 64, 64, 32, 3, 1}},
+    {32768, 288, 4096, Model810eOutputType::FP32, Model810eDispatchKind::TSM, {128, 64, 64, 32, 32, 2, 1}},
+    {32768, 512, 128, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+    {32768, 1536, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {32768, 4096, 512, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1, 0, 1}},
+    {90112, 3072, 512, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {102400, 8192, 4096, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {102400, 154880, 4096, Model810eOutputType::BF16, Model810eDispatchKind::Standard, {128, 128, 64, 32, 64, 2, 1}},
+}};
+inline constexpr std::array<Model810eBatchDispatchEntry, 4> kModel810eBatchDispatch{{
+    {64, 36, 256, 512, 32768, 512, 16384, 512, 131072, 256, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 128, 64, 32, 32, 3, 1}},
+    {64, 36, 512, 256, 16384, 256, 512, 256, 131072, 18432, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {64, 256, 64, 32, 64, 2, 1, 0, 1, 1, 1}},
+    {64, 2048, 256, 512, 32768, 512, 16384, 512, 131072, 256, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 64, 32, 2, 1}},
+    {64, 2048, 512, 256, 16384, 256, 512, 256, 131072, 1048576, Model810eOutputType::BF16, Model810eDispatchKind::TSM, {128, 128, 64, 32, 64, 2, 1}},
+}};
+
 } // namespace deep_gemm_bf16_common

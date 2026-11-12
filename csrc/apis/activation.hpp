@@ -3,7 +3,7 @@
 #include <limits>
 #include <torch/extension.h>
 #include "../utils/utils.hpp"
-#include "../jit_kernels/impls/activation.hpp"
+#include "../jit_kernels/impls/activation_quant.hpp"
 
 namespace deep_gemm::activation {
 static std::pair<int64_t, int64_t> check_input(const torch::Tensor& input, float swiglu_limit) {

@@ -25,8 +25,8 @@ namespace deep_gemm {
 // Host-side mirror of `FusedGemmScheduler<...>::Params`.
 //
 // NOTES: `fused_scheduler.cuh` cannot be included from host code -- its constructors are plain
-// `__device__ __forceinline__` -- so the two-pointer POD is replicated here. Field order matches, and
-// the kernel is initialised the same way `W4A16Gemm::run` does it:
+// `__device__ __forceinline__` -- so the two-pointer POD is replicated here. Field order matches
+// the device scheduler initialization:
 // `params.scheduler = {args.aligned_num_m_blocks, args.expert_ids_and_cumsum}`.
 struct FusedSchedulerArguments {
     const int32_t* aligned_num_m_blocks;
@@ -93,7 +93,6 @@ public:
                               info.gemm_type_name);
         return fmt::format(
             R"(
-#define W4A16_HGRTC
 #include <deep_gemm/impls/w4a16_gemm_cutlass3.cuh>
 namespace deep_gemm {{
 using namespace cute;
@@ -140,8 +139,7 @@ __global__ void {}(
     }
 };
 
-// Dispatch helper: builds, launches and reports, for one concrete scheduler arm. Mirrors the launch
-// tail of `W4A16Gemm::run`.
+// Dispatch helper: build, launch and report for one concrete scheduler arm.
 template <typename SchedulerArgsT>
 static void launch_w4a16_gemm(const W4A16LaunchInfo& info, W4A16Type w4a16_type, GemmType gemm_type, int num_sms, int m,
                               int expected_m, int topk, int32_t* m_rows_ptr, bool no_pad_preprocess_layout,
@@ -158,10 +156,10 @@ static void launch_w4a16_gemm(const W4A16LaunchInfo& info, W4A16Type w4a16_type,
     const auto& runtime = compiler->build(info.kernel_name, code);
     const auto& kernel = runtime->kernel;
 
-    // Persistent kernel, replicating `W4A16Gemm::run`: occupancy is capped at 8 blocks per CU, and the
+    // Persistent kernel: occupancy is capped at 8 blocks per CU, and the
     // grid is only widened on devices with at least 20 CUs.
     // NOTES: the occupancy query reports 0 once the dynamic shared memory passes the default 48 KiB cap,
-    // so raise the cap first -- `compute_occupancy_for_kernel`, which `run` used, did the same. The
+    // so raise the cap before querying occupancy. The
     // config built here is only wanted for that side effect; `Runtime::launch` builds its own.
     construct_launch_config(kernel, current_stream(), info.smem_size, args.launch_args.grid_dim,
                             args.launch_args.block_dim);
@@ -172,7 +170,7 @@ static void launch_w4a16_gemm(const W4A16LaunchInfo& info, W4A16Type w4a16_type,
     args.launch_args.grid_dim = dim3(threadblock_count, 1, 1);
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         // The fused arm is reported in token/topk terms instead of the m/em ones, and
         // `set_fused_moe_params` records `quant_type` itself, so only the other arm adds it
         if (gemm_type == GemmType::MGroupedFused) {
@@ -205,9 +203,10 @@ static void launch_w4a16_gemm(const W4A16LaunchInfo& info, W4A16Type w4a16_type,
         printf("smem_size:%d, vreg:%d, stack:%d\n", info.smem_size, int(numRegs), int(localSize));
     }
 
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-    Runtime::launch(runtime, args);
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        Runtime::launch(runtime, args);
+    }
 }
 
 // Shared launch path for the three W4A16 grouped GEMM flavours, mirroring `m_grouped_gemm_w4a16_common`.
@@ -316,8 +315,7 @@ static void m_grouped_gemm_w4a16_common(W4A16Type w4a16_type, GemmType gemm_type
         layout_info = block_m_info.data_ptr<int32_t>();
     }
 
-    // NOTES: `num_token` / `sorted_token_ids` are only read by the fused scheduler, so they are zeroed
-    // here -- the Python path left them uninitialised for the same reason
+    // num_token and sorted_token_ids are only read by the fused scheduler; zero them here.
     const W4A16GemmArguments<TileSchedulerArguments> kernel_params{
         ptr_a,
         ptr_b,

@@ -361,7 +361,6 @@ def construct_grouped_fused(num_groups: int, m: int, k: int, n: int, topk: int, 
         out_scale = torch.empty((m * topk, ceil_div((n // 4), 32)), device='cuda', dtype=torch.uint16)
     else:
         out = torch.empty((m * topk, n), device='cuda', dtype=torch.bfloat16)
-    ref_out = []
 
     ### 1. do quantization
     x_fp4_tupple = quantize_fp4_torch(x)
@@ -389,13 +388,13 @@ def construct_grouped_fused(num_groups: int, m: int, k: int, n: int, topk: int, 
     sfk_ = x_fp4_tupple[1].shape[-1]
     x_fp4_ = x_fp4.view(m, -1, k_).repeat(1, topk, 1).reshape(-1, k_)
     x_scale_fp4_ = x_fp4_tupple[1].view(m, -1, sfk_).repeat(1, topk, 1).reshape(-1, sfk_)
+    ref_out = torch.empty((m * topk, n), dtype=ref_dtype, device=x.device)
     topk_ids_ = topk_ids.view(-1)
     for i in range(y_fp4.shape[0]):
         mask = (topk_ids_ == i)
         if mask.sum():
             ref_out_group = dequantize_fp4_torch(x_fp4_[mask], x_scale_fp4_[mask]).to(ref_dtype) @ dequantize_fp4_torch(y_fp4[i], y_scale_fp4_[i]).to(ref_dtype).transpose(0, 1)
-            ref_out.append(ref_out_group)
-    ref_out = torch.concat(ref_out, dim=0)
+            ref_out[mask] = ref_out_group
 
     ### 3. return
     if enable_act_and_quant_fusing:
@@ -411,6 +410,7 @@ def test_m_grouped_gemm_fused(args) -> None:
     )
     deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(x, y, out, m_rows, expert_ids_and_cumsum, sorted_token_ids, aligned_num_m_blocks, config)
 
+    out = out.index_select(0, inv_perm.long())
     diff = calc_diff(out, ref_out)
     if diff >= 0.001:
         print("ref_out:", ref_out)
@@ -460,6 +460,9 @@ def test_m_grouped_gemm_fused_silu_and_mul_post_quant(args) -> None:
         deep_gemm.PreprocessMode.MXFP4, False, weight_scale=ref_quant_scale_torch_)
 
     ### Check
+    route_order = inv_perm.long()
+    out = out.index_select(0, route_order)
+    out_scale = out_scale.view(torch.int16).index_select(0, route_order).view(torch.uint16)
     diff = calc_diff(out, ref_quant_torch).item()
     diff_scale = calc_diff(out_scale, ref_quant_scale_torch).item()
     if diff >= 0.00001 or diff_scale >= 0.00001:

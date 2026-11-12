@@ -2,9 +2,6 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-#ifndef INT8_HGRTC
-    #include <deep_gemm/common/profiling_interface.cuh>
-#endif
 #include <cutlass/cutlass.h>
 #include <cutlass/arch/arch.h>
 #include <cutlass/arch/mma.h>
@@ -20,14 +17,13 @@
 #include <cutlass/detail/layout.hpp>
 
 #include <cute/ppu_util.hpp>
-#include <tools/util/include/cutlass/util/packed_stride.hpp>
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 
 #include <ppu_include.hpp>
 #include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/batch_gemm_args.cuh>
 #include <deep_gemm/common/math.cuh>
-#include <deep_gemm/scheduler/block_info.cuh>
 #include <deep_gemm/tix/utils.cuh>
 
 using namespace cute;
@@ -62,6 +58,41 @@ struct MainloopPPUAiuA8W8OverlapPrologue {
 
 #include <deep_gemm/impls/int8_gemm_cutlass3_dynamic.cuh>
 
+
+namespace deep_gemm {
+// Shared channelwise tile computation. Scatter policies retain their own
+// transport/scheduling, while standard GEMM and fused scatter use one SF/MMA path.
+template <typename CollectiveMainloop, int ShapeN, bool kCanonicalNResidue = true,
+          typename ProblemShape, typename BlockCoord, typename Params,
+          typename ElementA, typename ElementB, typename Accumulators>
+CUTLASS_DEVICE __forceinline__ auto compute_channelwise_tile(
+    ProblemShape const& problem_shape, BlockCoord const& block_coord, Params const& params,
+    uint32_t m, int offset_m, int64_t offset_b, ElementA const* a, ElementB const* b,
+    Accumulators& accumulators, int thread_idx, int warp_idx, char* smem_buf) {
+  using namespace cute;
+  using TileShape = typename CollectiveMainloop::TileShape;
+  CollectiveMainloop collective_mma(params, take<0, 3>(problem_shape));
+  auto load_inputs = collective_mma.load_init(problem_shape, block_coord, params,
+                                               m, offset_m, offset_b, a, b);
+  auto g_a = get<0>(load_inputs);
+  auto g_b = get<1>(load_inputs);
+  const auto m_residue = m - size<0>(g_a) * get<0>(block_coord);
+  const auto n_residue = [&] {
+    if constexpr (kCanonicalNResidue && ShapeN % size<1>(TileShape{}) == 0)
+      return size<1>(TileShape{});
+    else
+      return ShapeN - size<0>(g_b) * get<1>(block_coord);
+  }();
+  const auto k_residue = get<2>(problem_shape) - size<1>(g_a) * size<2>(g_a);
+  auto residue = make_tuple(m_residue, n_residue, k_residue);
+  auto k_tile_iter = make_coord_iterator(shape<2>(g_a));
+  const int k_tile_count = size<2>(g_a);
+  collective_mma(accumulators, load_inputs, accumulators, k_tile_iter,
+                 k_tile_count, residue, thread_idx, warp_idx, smem_buf);
+  return residue;
+}
+} // namespace deep_gemm
+
 namespace cutlass::gemm::kernel {
 
 using deep_gemm::GemmType;
@@ -73,7 +104,8 @@ template <
   class CollectiveEpilogueOrThreadblockSwizzle_,
   class TileScheduler_ = void,
   bool kEnableSboOverlap = false,
-  class Enable = void
+  class Enable = void,
+  bool kUseReplicaWeights = false
 >
 class DeepGemmUniversal;
 
@@ -90,7 +122,7 @@ class DeepGemmUniversal<
   CollectiveEpilogue_,
   TileScheduler_,
   kEnableSboOverlap,
-  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistageOnN, typename CollectiveMainloop_::DispatchPolicy::Schedule>>> {
+  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistageOnN, typename CollectiveMainloop_::DispatchPolicy::Schedule>>, false> {
 public:
   //
   // Type Aliases
@@ -839,7 +871,7 @@ struct CollectiveMma<
   // Device side kernel params
   using Params = Arguments;
 
-  // sm90 realization put TMA_A into params directly
+  // Copy descriptors are initialized on device rather than passed through Params.
   // put gmem_tiled_copy here and copy desc in kernel to simplify rtc usage
   GmemTiledCopyA gmem_tiled_copy_A;
   GmemTiledCopyB gmem_tiled_copy_B;
@@ -875,10 +907,11 @@ struct CollectiveMma<
                     Layout<Shape < Int<ScaleNsPerThread>,_1>>{});
   };
 
-  template <class ProblemShape_MNKL, class BlockCoord_MNKL>
+  template <bool kBatchGemm = false, class ProblemShape_MNKL, class BlockCoord_MNKL, class MainloopParams>
   CUTLASS_DEVICE auto
-  load_init(ProblemShape_MNKL const& problem_shape_MNKL, BlockCoord_MNKL const& blk_coord_mnkl, Params const& params,
-            int M, int offset_m, int64_t offset_b, ElementA const* ptr_A, ElementB const* ptr_B) {
+  load_init(ProblemShape_MNKL const& problem_shape_MNKL, BlockCoord_MNKL const& blk_coord_mnkl, MainloopParams const& params,
+            int M, int offset_m, int64_t offset_b, ElementA const* ptr_A, ElementB const* ptr_B,
+            int batch_idx = 0) {
     auto [_M,N,K,L] = problem_shape_MNKL;
     auto [m_coord, n_coord, _, l_coord] = blk_coord_mnkl;
     // load init A
@@ -892,13 +925,27 @@ struct CollectiveMma<
     Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
 
     // // load init scale A/B
-    Tensor mSFA_mk = make_tensor(make_gmem_ptr(params.ptr_scale_A + offset_m), make_shape(M,1));      // (n,scale_k,l)
+    auto mSFA_mk = [&] {
+      if constexpr (kBatchGemm) {
+        return make_tensor(make_gmem_ptr(params.ptr_scale_A + int64_t(batch_idx) * get<1>(params.stride_scale_A)),
+                           make_shape(M, 1), make_stride(get<0>(params.stride_scale_A), Int<1>{}));
+      } else {
+        return make_tensor(make_gmem_ptr(params.ptr_scale_A + offset_m), make_shape(M, 1));
+      }
+    }();
     auto sfa_shape = make_shape(Int<CTA_M>{}, Int<1>{});
     Tensor gSFA = local_tile(mSFA_mk, sfa_shape, make_coord(m_coord, _));    // (BLK_N, 1, scale_k)
     Tensor iSFA_mk = make_identity_tensor(sfa_shape);
     Tensor cSFA = local_tile(iSFA_mk, sfa_shape, make_coord(m_coord, _));
 
-    Tensor mSFB_nk = make_tensor(make_gmem_ptr(params.ptr_scale_B + offset_b / K), make_shape(N,1));           // (n,scale_k,l)
+    auto mSFB_nk = [&] {
+      if constexpr (kBatchGemm) {
+        return make_tensor(make_gmem_ptr(params.ptr_scale_B + int64_t(batch_idx) * get<1>(params.stride_scale_B)),
+                           make_shape(N, 1), make_stride(get<0>(params.stride_scale_B), Int<1>{}));
+      } else {
+        return make_tensor(make_gmem_ptr(params.ptr_scale_B + offset_b / K), make_shape(N, 1));
+      }
+    }();
     auto sfb_shape = make_shape(Int<CTA_N>{}, Int<1>{});
     Tensor gSFB = local_tile(mSFB_nk, sfb_shape, make_coord(n_coord, _));    // (BLK_N, 1, scale_k)
     Tensor iSFB_nk = make_identity_tensor(sfb_shape);
@@ -948,7 +995,8 @@ struct CollectiveMma<
       ResidueMNK residue_mnk,
       int thread_idx,
       int warp_idx,
-      char *smem_buf) {
+      char *smem_buf,
+      uint32_t* queue_counter = nullptr, uint32_t* queue_ticket = nullptr) {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorD>::value, "D tensor must be rmem resident.");
@@ -1213,6 +1261,8 @@ CUTLASS_PRAGMA_UNROLL
       }
     }
 
+    if (queue_counter != nullptr && thread_idx == 0)
+      *queue_ticket = atomicAdd(queue_counter, 1u);
     __syncthreads();
     // if(thread0()) {
     //   printf("    mainloop with a8w8, mma_acc[0] = %.4f, tCrSA[0] = %.8f, accum[0] = %.8f\n",
@@ -1245,7 +1295,7 @@ class DeepGemmUniversal<
   CollectiveEpilogue_,
   TileScheduler_,
   kEnableSboOverlap,
-  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistage, typename CollectiveMainloop_::DispatchPolicy::Schedule>>> {
+  cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistage, typename CollectiveMainloop_::DispatchPolicy::Schedule>>, false> {
 public:
 public:
   //
@@ -1267,7 +1317,9 @@ public:
   using ElementAccumulator = typename CollectiveMainloop::ElementAccumulator;
   using ClusterShape = typename DispatchPolicy::ClusterShape;
   using MainloopArguments = typename CollectiveMainloop::Arguments;
-  using MainloopParams = typename CollectiveMainloop::Params;
+  using MainloopParams = cute::conditional_t<TileScheduler_::GEMM_TYPE == GemmType::Batched,
+      deep_gemm::BatchGemmMainloopArguments<typename CollectiveMainloop::Params>,
+      typename CollectiveMainloop::Params>;
 
   // Epilogue derived types
   using CollectiveEpilogue = CollectiveEpilogue_;
@@ -1465,8 +1517,9 @@ public:
 
       auto offset_m = deep_scheduler.curr_offset_m();
       auto expert_id = deep_scheduler.problem_index();
-      auto offset_a = deep_scheduler.curr_offset_a();
-      auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
+      const auto scale_offset_b = deep_scheduler.curr_offset_b(m_block_idx);
+      const auto offset_a = deep_scheduler.curr_offset_a(get<2>(params.mainloop.dA));
+      const auto offset_b = deep_scheduler.curr_offset_b(m_block_idx, get<2>(params.mainloop.dB));
 
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(
@@ -1481,8 +1534,17 @@ public:
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
 
-      auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
-                                                  M, offset_m, offset_b, ptr_A, ptr_B);
+      auto load_inputs = [&] {
+        if constexpr (TileScheduler::GEMM_TYPE == GemmType::Batched) {
+          return collective_mma.template load_init<true>(
+              problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
+              M, offset_m, scale_offset_b, ptr_A, ptr_B, deep_scheduler.problem_index());
+        } else {
+          return collective_mma.load_init(
+              problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
+              M, offset_m, scale_offset_b, ptr_A, ptr_B);
+        }
+      }();
       // Extract out partitioned A and B.
       Tensor gA = get<0>(load_inputs);
       Tensor gB = get<1>(load_inputs);
@@ -1501,9 +1563,9 @@ public:
 
       // Allocate the tiled_mma and the accumulators for the (M,N) blk_shape
       TiledMma tiled_mma;
-      Tensor accumulators = make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape))); // (MMA,MMA_M,MMA_N)
+      Tensor accumulators = make_fragment_like<ElementCompute>(
+          partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
       clear(accumulators);
-
       auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
       int  k_tile_count = size<2>(gA);
 
@@ -1521,8 +1583,8 @@ public:
 
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
-      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
-      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
+      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dC));
+      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dD));
 
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
@@ -1554,300 +1616,5 @@ public:
 } // namespace cutlass::gemm::kernel
 
 #include <deep_gemm/impls/int8_gemm_cutlass3_overlap_prologue.cuh>
-
-namespace deep_gemm {
-
-template <typename ElementAB, typename ElementAcc,
-          uint32_t SHAPE_N, uint32_t SHAPE_K,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t WARP_M, uint32_t WARP_N,
-          uint32_t kNumGroups, uint32_t kNumStages,
-          GemmType kGemmType,
-          bool kEnableSboOverlap = false,
-          KernelStrategy kKernelStrategy = KernelStrategy::Default>
-class Gemm {
-
-public:
-    Gemm() = default;
-
-    static void run(__ppu_bfloat16* gmem_d, int* grouped_layout, int* block_m_info,
-                    uint32_t shape_m, uint32_t expected_m, ElementAB* gmem_a, float* scales_a,
-                    ElementAB * gmem_b, float* scales_b,
-                    hggcStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
-        using ElementA    = ElementAB;
-        using ElementB    = ElementAB;
-        using ElementC    = cutlass::bfloat16_t;
-        using LayoutA     = cutlass::layout::RowMajor;
-        using LayoutB     = cutlass::layout::ColumnMajor;
-        using LayoutC     = cutlass::layout::RowMajor;
-        using ElementD    = ElementC;
-        using LayoutD     = cutlass::layout::RowMajor;
-        using ElementCompute      = float;
-        using ElementScalar       = ElementCompute;
-        using LinearCombOutType   = ElementD;
-        using OperatorClass = cutlass::arch::OpClassTensorOp;
-#if __HGGC_ARCH__ == 100
-        using ArchTag = cutlass::arch::PPU0010;
-#else
-        using ArchTag = cutlass::arch::PPU0015;
-#endif
-
-        int max_blocks_per_cu = 0;
-        int smem_size_kernel = 0;
-        bool kIsNoPadPreprocessLayout = false;
-        hggcFuncAttributes attr;
-        int DynamicTildId = 0;
-
-        if constexpr (kKernelStrategy == KernelStrategy::MoeDynamicTile) {
-          auto launch_dynamic_tile_kernel = [&](auto gemm_kernel_) {
-            using GemmKernel = decltype(gemm_kernel_);
-            using TileScheduler = typename GemmKernel::TileScheduler;
-            kIsNoPadPreprocessLayout = TileScheduler::kIsNoPadPreprocessLayout;
-            DynamicTildId = GemmKernel::KernelAiuDynamicTile::DynamicTildId;
-
-            using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
-            using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
-            using StrideD = cutlass::detail::TagToStrideC_t<LayoutD>;
-
-            StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)shape_m, (int)SHAPE_K, 1));
-            StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape((int)SHAPE_N, (int)SHAPE_K, 1));
-            StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape((int)shape_m, (int)SHAPE_N, 1));
-
-            using Epilogue = typename GemmKernel::CollectiveEpilogue;
-            using ProblemShape = Shape<int,int,int,int>;
-            auto problem_shape_MNKL = ProblemShape{32, SHAPE_N, SHAPE_K, 1};
-            typename Epilogue::Arguments arg_epilogue = {{1.0f, 0.0f}, (ElementD*)gmem_d, stride_D, (ElementD*)gmem_d, stride_D};
-            auto params_epilogue = Epilogue::to_underlying_arguments(problem_shape_MNKL, arg_epilogue, nullptr);
-
-            int* layout_info = grouped_layout;
-            // compute block_m_info
-            if (TileScheduler::kIsNoPadPreprocessLayout) {
-                uint32_t block_size = max(32, math::next_power_of_two(kNumGroups));
-                computeBlockInfoKernel<TileScheduler::BLOCK_M><<<1, block_size, 0, stream>>>(
-                  reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
-                layout_info = block_m_info;
-            }
-
-            typename GemmKernel::Arguments arguments {
-                (ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B, scales_a, scales_b,
-                params_epilogue, shape_m, layout_info
-            };
-
-            max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
-            dim3 const block = GemmKernel::get_block_shape();
-            dim3 const grid(num_sms * max_blocks_per_cu, 1, 1);
-            smem_size_kernel = GemmKernel::SharedStorageSize;
-
-            DgProfParam dg_prof_params;
-            if (ProfilingInterface::Instance().get_op_info()){
-                dg_prof_params.set_params(
-                    kGemmType, false, std::string("int8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
-                    grouped_layout, stream
-                );
-            }
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
-            cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(arguments);
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-            hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
-          };
-          if (expected_m > 73) {
-            constexpr bool kLargeEM = true;
-            using GemmKernel = cutlass::gemm::kernel::DeepGemmDynamicTile<
-                kGemmType, ElementA, ElementB, ElementD, ElementAcc, ElementCompute,
-                SHAPE_N, SHAPE_K, kNumGroups, kLargeEM>;
-            launch_dynamic_tile_kernel(GemmKernel{});
-          } else {
-            constexpr bool kLargeEM = false;
-            using GemmKernel = cutlass::gemm::kernel::DeepGemmDynamicTile<
-                kGemmType, ElementA, ElementB, ElementD, ElementAcc, ElementCompute,
-                SHAPE_N, SHAPE_K, kNumGroups, kLargeEM>;
-            launch_dynamic_tile_kernel(GemmKernel{});
-          }
-        } else {
-          using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
-          using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>;
-          static constexpr int WarpOnM = BLOCK_M / WARP_M;
-          static constexpr int WarpOnN = BLOCK_N / WARP_N;
-
-          using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementAB,ElementAB,ElementAcc>::type;
-          using TiledMma = TiledMMA<
-              MMA_Atom<MmaInst>,
-              Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
-              Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _32>>;       // 1x1x1 value group
-
-          constexpr int EnableMultistageOnN = kKernelStrategy == KernelStrategy::MultistageOnN
-                                              && (SHAPE_N % (BLOCK_N) == 0)
-                                              && (SHAPE_K > (BLOCK_K * kNumStages));
-          static constexpr int N_EXPAND = EnableMultistageOnN ? KernelAiuMultistageOnN::N_EXPAND : 1;
-          constexpr int EnableOverlapPrologue = kKernelStrategy == KernelStrategy::OverlapPrologue;
-                                          // && (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(int8_t) >= WarpOnM * 16 * BLOCK_N * sizeof(int32_t); // to impl
-
-          using KernelSchedule = cute::conditional_t<
-              EnableOverlapPrologue,
-              KernelAiuMultistageOverlapPrologue,
-              cute::conditional_t<
-                EnableMultistageOnN,
-                KernelAiuMultistageOnN,
-                cutlass::gemm::KernelAiuMultistage>>;
-
-          using DispatchPolicy = cute::conditional_t<
-              EnableOverlapPrologue,
-              cutlass::gemm::MainloopPPUAiuA8W8OverlapPrologue<kNumStages, KernelSchedule>,
-              cutlass::gemm::MainloopPPUAiuA8W8<kNumStages, KernelSchedule>>;
-
-          static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
-          static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
-          static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
-
-          static constexpr int SmemLayoutStageStrideA = EnableOverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
-          static constexpr int SmemLayoutStageStrideB = EnableOverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
-          using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
-          using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
-          // A
-          using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
-          using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
-          using GmemTiledCopyA = typename DefaultOperandA::GmemTiledCopy;
-          // B
-          using SmemLayoutAtomB = typename DefaultOperandB::SmemLayoutAtom; // N, K
-          using SmemCopyAtomB = typename DefaultOperandB::SmemCopyAtom;
-          using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
-
-          // Mainloop
-          using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-              ArchTag,
-              DispatchPolicy, TileShape,
-              ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
-              ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
-              TiledMma,
-              GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,  // A
-              GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity   // B
-          >;
-
-          // Epilogue
-          static constexpr bool IsAligedN = SHAPE_N % BLOCK_N == 0 ? true : false;
-          // reduce vreg to use ScaleType::Nothing for alpha=1 & beta=0
-          using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
-              cutlass::detail::TagToStrideA_t<LayoutC>,
-              cutlass::detail::TagToStrideA_t<LayoutC>,
-              cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
-              cutlass::gemm::EpilogueDefault,
-              IsAligedN>;
-
-          static constexpr int AlignmentC = 16 / sizeof(ElementC);
-          using DefaultOperation = cutlass::epilogue::fusion::LinearCombination<ElementD, ElementCompute>;
-          using EpilogueSchedule = typename cutlass::epilogue::EpilogueSimtVectorized;
-          using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
-              ArchTag, cutlass::arch::OpClassTensorOp,
-              TileShape, WarpShape,
-              cutlass::epilogue::collective::EpilogueTileAuto,
-              float, float,
-              ElementC, LayoutC, AlignmentC,
-              ElementC, LayoutC, AlignmentC,
-              EpilogueSchedule,
-              DefaultOperation
-          >::CollectiveOp;
-
-          static constexpr bool EpilogueWithTsm = false;
-          using CollectiveEpilogue = typename cutlass::platform::conditional<
-              EpilogueWithTsm,
-              CollectiveEpilogue_withTsm,
-              CollectiveEpilogue_noTsm
-          >::type;
-
-          using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, kNumGroups>;
-          using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
-              Shape<int,int,int,int>,
-              CollectiveMainloop,
-              CollectiveEpilogue,
-              TileScheduler,
-              kEnableSboOverlap>;
-
-          using StrideA = typename GemmKernel::StrideA;
-          using StrideB = typename GemmKernel::StrideB;
-          using StrideC = typename GemmKernel::StrideC;
-          using StrideD = typename GemmKernel::StrideD;
-
-          kIsNoPadPreprocessLayout = TileScheduler::kIsNoPadPreprocessLayout;
-
-          int* layout_info = grouped_layout;
-          // compute block_m_info
-          if (TileScheduler::kIsNoPadPreprocessLayout) {
-              uint32_t block_size = max(32, math::next_power_of_two(kNumGroups));
-              computeBlockInfoKernel<BLOCK_M><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
-              layout_info = block_m_info;
-          }
-
-          StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)shape_m, (int)SHAPE_K, 1));
-          StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape((int)SHAPE_N, (int)SHAPE_K, 1));
-          StrideD stride_D;
-          if constexpr (kGemmType == GemmType::Batched) {
-            // BHD output: D[b,h,d] has offset b*H*D + h*D + d
-            // In the kernel's (batch=h, M=b, N=d) model:
-            // row stride = H*D = kNumGroups * SHAPE_N
-            // col stride = 1
-            // batch stride = D = SHAPE_N
-            stride_D = StrideD{int64_t(kNumGroups) * SHAPE_N, cute::Int<1>{}, int64_t(SHAPE_N)};
-          } else {
-            stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape((int)shape_m, (int)SHAPE_N, 1));
-          }
-          auto stride_C = stride_D;
-          max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
-
-          cutlass::KernelHardwareInfo hw_info;
-          hw_info.device_id = 0;
-          hw_info.cu_count = num_sms * max_blocks_per_cu;
-
-          typename GemmKernel::Arguments arguments{
-              cutlass::gemm::GemmUniversalMode::kGemm,
-              {shape_m, SHAPE_N, SHAPE_K, 1},
-              {(ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B, scales_a, scales_b},
-              {{1.0f, 0.0f}, (ElementC*)gmem_d, stride_C, (ElementD*)gmem_d, stride_D},
-              hw_info, {shape_m, layout_info}, signal
-          };
-
-          arguments.epilogue.thread.alpha = 1;
-          arguments.epilogue.thread.beta = 0;
-          auto params = GemmKernel::to_underlying_arguments(arguments, nullptr);
-
-          dim3 const block = GemmKernel::get_block_shape();
-          dim3 const grid = GemmKernel::get_grid_shape(params);
-          smem_size_kernel = GemmKernel::SharedStorageSize;
-
-          DgProfParam dg_prof_params;
-          if (ProfilingInterface::Instance().get_op_info()){
-              dg_prof_params.set_params(
-                  kGemmType, false, std::string("int8"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
-                  grouped_layout, stream
-              );
-          }
-          ProfilingInterface::Instance().instrument(true, dg_prof_params);
-          cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-          ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-          hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
-        }
-
-        const int threadblock_count = num_sms * max_blocks_per_cu;
-        char *pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-          static const bool kEnableMoeDynamicTile = kKernelStrategy == KernelStrategy::MoeDynamicTile;
-          printf("[GemmGrouped-A8W8:]\n");
-          printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kIsNoPadPreprocessLayout:%d, kernel_strategy:%s\n",
-              kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)],
-              kIsNoPadPreprocessLayout, KernelStrategyS[static_cast<int>(kKernelStrategy)]);
-          if constexpr (!kEnableMoeDynamicTile) {
-            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
-                BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);
-          } else {
-            printf("DynamicTildId:%d\n", DynamicTildId);
-          }
-          printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_blocks_per_cu, threadblock_count);
-          printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
-        }
-
-    }
-};
-};  // namespace deep_gemm
 
 #pragma clang diagnostic pop

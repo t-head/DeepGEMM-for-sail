@@ -15,6 +15,10 @@ DenseGemm,data_type:bf16,m:2048,n:4096,k:7168
 DenseGemm,data_type:bf16,m:2048,n:512,k:7168
 DenseGemm,data_type:bf16,m:256,n:4096,k:7168
 DenseGemm,data_type:bf16,m:256,n:512,k:7168
+# C aliasing and cancellation before BF16 rounding; N=1 GEMV product.
+DenseGemm,data_type:bf16,m:8,n:1,k:128,device:810e,accumulate:alias,pattern:cancellation
+# TSM split-K product with BF16 output and aliased C/D.
+DenseGemm,data_type:bf16,m:36,n:288,k:4096,device:810e,accumulate:alias
 
 # --- DenseGemm / int8 ---
 # Small M with N/K tails, retained from the legacy shape sweep.
@@ -26,6 +30,14 @@ DenseGemm,data_type:int8,m:2048,n:512,k:7168
 DenseGemm,data_type:bf16_bf16_fp32,m:2048,n:4096,k:7168
 DenseGemm,data_type:bf16_bf16_fp32,m:132,n:3072,k:1536
 DenseGemm,data_type:bf16_bf16_fp32,m:2,n:8192,k:7168
+# Direct split-K product with FP32 output and separate C/D.
+DenseGemm,data_type:bf16_bf16_fp32,m:32,n:128,k:6144,device:810e,accumulate:separate
+
+# --- DenseGemm / fp32 (full FP32 operands, TF32-disabled reference) ---
+# Vector load tail, scalar load via misalignment, and static specialization.
+DenseGemm,data_type:fp32,m:7,n:9,k:516,device:810e
+DenseGemm,data_type:fp32,m:7,n:9,k:512,device:810e,offset_a:1
+DenseGemm,data_type:fp32,m:36,n:32,k:4096,device:810e
 
 # ============ HcPrenormGemm ============
 
@@ -45,6 +57,14 @@ HcPrenormGemm,data_type:tf32,m:64,n:16,k:128
 HcPrenormGemm,data_type:tf32,m:1024,n:32,k:64
 
 # ============ BatchGemm ============
+
+# --- BatchGemm / bf16 (native strided API, not quantized einsum) ---
+# Default Direct BK32/stages=2, padded row/batch pitches, broadcast A.
+BatchGemm,data_type:bf16,groups:3,m:37,n:40,k:64,device:810e,layout:padded,broadcast:a
+# Default TSM, interleaved padded output and broadcast B.
+BatchGemm,data_type:bf16,groups:3,m:37,n:40,k:128,device:810e,layout:interleaved_padded,broadcast:b
+# Reject intersecting rows across batches before any output write.
+BatchGemm,data_type:bf16,groups:2,m:3,n:16,k:128,device:810e,out_stride:[24,32,1],expect_error:overlap
 
 # --- BatchGemm / int8 ---
 BatchGemm,data_type:int8,groups:128,m:64,n:128,k:512,quant_type:channel,expr:bhr,hdr->bhd
@@ -136,22 +156,19 @@ GroupedFused,data_type:w4fa16,groups:384,num_token:8,topk:8,n:512,k:7168,quant_t
 # ============ MqaLogits ============
 
 # --- MqaLogits / int8 ---
+MqaLogits,data_type:int8,seq_len_q:129,seq_len_kv:512,num_heads:64,head_dim:64,weights_dtype:bf16
+MqaLogits,data_type:int8,seq_len_q:129,seq_len_kv:512,num_heads:64,head_dim:64,weights_dtype:fp32
 MqaLogits,data_type:int8,seq_len_q:8191,seq_len_kv:8191,num_heads:64,head_dim:128
 MqaLogits,data_type:int8,seq_len_q:4096,seq_len_kv:8192,num_heads:64,head_dim:128,compressed_logits:1
-MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,logits_dtype:bf16,weights_dtype:bf16
-
-# --- MqaLogits / bf16 ---
-MqaLogits,data_type:bf16,seq_len_q:512,seq_len_kv:3072,num_heads:64,head_dim:128
+MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,weights_dtype:bf16
 
 # ============ PagedMqaLogits ============
 
-# --- PagedMqaLogits / bf16 ---
-# Empty and partial pages.
-PagedMqaLogits,data_type:bf16,batch_size:4,next_n:1,num_heads:32,head_dim:128,distribution:[0,1,63,128],page_kv:64,logits_dtype:fp32
-
 # --- PagedMqaLogits / int8 ---
+PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:64,distribution:[0,1,127,512],page_kv:64,max_context_len:1024,weights_dtype:bf16
+PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:64,distribution:[0,1,127,512],page_kv:64,max_context_len:1024,weights_dtype:fp32
 PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,avg_context_len:2048
-PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:32
+PagedMqaLogits,data_type:int8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:64
 PagedMqaLogits,data_type:int8,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1]
-PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,logits_dtype:bf16,weights_dtype:bf16
-PagedMqaLogits,data_type:int8,batch_size:64,next_n:4,num_heads:64,head_dim:128,avg_context_len:8192
+PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,weights_dtype:bf16
+PagedMqaLogits,data_type:int8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192

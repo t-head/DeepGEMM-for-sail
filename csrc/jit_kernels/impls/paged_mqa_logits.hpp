@@ -117,7 +117,7 @@ struct PagedMqaLogitsFP4Arguments {
 };
 
 // One runtime for both paged flavours; they share the full template parameter list
-// (SPLIT_MBLOCK is always false for non-FP4, kScaleMode is Weights for FP4).
+// (SPLIT_MBLOCK is always false for non-FP4).
 template <typename ArgumentsT>
 class PagedMqaLogitsRuntime final : public LaunchRuntime<PagedMqaLogitsRuntime<ArgumentsT>> {
 public:
@@ -246,7 +246,7 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
     }
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_paged_mqa_logits_params(
             dtype_tag, static_cast<int>(kernel_params.batch_size), next_n, num_heads,
             is_fp4 ? head_dim * 2 : head_dim,
@@ -257,30 +257,25 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
         if (element_weights == "__ppu_bfloat16")
             dg_prof_params.add_params("weights_dtype", std::string("bf16"));
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-    Runtime::launch(runtime, args);
-
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        Runtime::launch(runtime, args);
+    }
 }
 
-// Host entry for the `schedule_metadata` table. `metadata_extra` = (next_n, num_heads, head_dim,
-// element_size); when absent we fall back to the compatibility tile.
+// metadata_extra = (next_n, num_heads, logical_head_dim, qk_dtype).
+// M890 torch::kInt8 denotes MXFP4; 810E torch::kInt8 denotes true INT8.
 static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens, int batch_size, int page_kv,
                                               int num_sms,
-                                              const std::optional<std::tuple<int, int, int, int>>& metadata_extra) {
-    DG_HOST_ASSERT(page_kv == 32 or page_kv == 64 or page_kv == 128);
-    int next_n = context_lens.size(1);
-    int tb_per_cu = 1;
-    // fallback: assume max num_math_warpgroups=4 to avoid crash
-    int split_kv = kPagedMqaBlockKV * 4;
-    if (metadata_extra.has_value()) {
-        const auto& [extra_next_n, num_heads, head_dim, element_size] = *metadata_extra;
-        next_n = extra_next_n;
-        const auto& tile =
-            deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
-        split_kv = tile.split_kv, tb_per_cu = tile.tb_per_cu;
-    }
+                                              const std::tuple<int, int, int, torch::ScalarType>& metadata_extra) {
+    DG_HOST_ASSERT(page_kv == 32 or (page_kv > 0 and page_kv % 64 == 0));
+    const auto& [next_n, num_heads, logical_head_dim, qk_dtype] = metadata_extra;
+    const bool is_fp4 = get_ppu_arch() == AC_PPU0015 and qk_dtype == torch::kInt8;
+    const int head_dim = is_fp4 ? logical_head_dim / 2 : logical_head_dim;
+    const int element_size = static_cast<int>(c10::elementSize(qk_dtype));
+    const auto& tile =
+        deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
+    const int split_kv = tile.split_kv, tb_per_cu = tile.tb_per_cu;
 
     const int num_blocks = num_sms * tb_per_cu;
     auto schedule_metadata = torch::empty(
@@ -289,7 +284,7 @@ static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens
     const std::string kernel_name = "attention_paged_mqa_logits_metadata";
     const int num_threads = std::min(batch_size, 1024);
     const int smem_size = batch_size * 4;
-    // NOTES: `kNumSMs` is the total block count, not `num_sms` -- matching the Python template key
+    // kNumSMs is the total block count, rather than the number of physical CUs.
     const auto& args = PagedMqaLogitsMetadataRuntime::Args{
         .launch_info = {split_kv, num_blocks, kernel_name},
         .launch_args = {dim3(1, 1, 1), dim3(num_threads, 1, 1), smem_size},
@@ -316,25 +311,27 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
                                       int page_kv, int schedule_meta_size, int max_context_len,
                                       torch::ScalarType logits_dtype, const std::optional<torch::Tensor>& q_sf) {
     const bool is_fp4 = q_sf.has_value();
+    // An empty weights tensor selects AVG (unity mode, no q_scale on paged).
+    const bool is_avg = weights.numel() == 0;
     const auto& qk_dtype = q.scalar_type();
     const int64_t kv_cache_stride_bytes = fused_kv_cache.stride(0);
     const int64_t block_table_stride = block_table.stride(0);
 
-    // Derive the value and scale-factor views out of the fused KV cache: each row stores the values
-    // first, immediately followed by the scale bytes
+    // Each quantized page stores all K values first, then its per-token scales.
     auto k = fused_kv_cache.as_strided({num_kv_blocks, page_kv, head_dim}, {kv_cache_stride_bytes, head_dim, 1});
     if (not is_fp4)
         k = k.view(qk_dtype);
-    torch::Tensor k_scales;
-    if (is_fp4 or qk_dtype != torch::kBFloat16) {
-        k_scales = fused_kv_cache
-                       .as_strided({num_kv_blocks, page_kv * 4}, {kv_cache_stride_bytes, 1},
-                                   fused_kv_cache.storage_offset() + page_kv * head_dim)
-                       .view(is_fp4 ? torch::kInt32 : torch::kFloat32);
-    }
+    auto k_scales = fused_kv_cache
+                   .as_strided({num_kv_blocks, page_kv * 4LL}, {kv_cache_stride_bytes, 1},
+                               fused_kv_cache.storage_offset() + static_cast<int64_t>(page_kv) * head_dim)
+                   .view(is_fp4 ? torch::kInt32 : torch::kFloat32);
 
     const auto& tile = deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim,
                                                                       static_cast<int>(q.element_size()));
+    if (is_fp4)
+        TORCH_CHECK(schedule_meta_size - 1 == get_num_sms() * tile.tb_per_cu,
+                    "FP4 paged logits require matching metadata_extra=(next_n, H, 128, torch.int8) on M890 "
+                    "and the current num_sms");
     if (not is_fp4)
         TORCH_CHECK(not tile.split_mblock, "SPLIT_MBLOCK is only supported for FP4 paged kernel");
 
@@ -344,13 +341,11 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     auto logits = torch::empty({batch_size * next_n, aligned_max_context_len},
                                torch::TensorOptions().dtype(logits_dtype).device(q.device()));
 
-    // Avg variant: an empty weights tensor selects it (unity mode, no q_scale on paged)
-    const bool is_avg = weights.numel() == 0;
     const void* weights_ptr = is_avg ? nullptr : weights.data_ptr();
     // The kernel pads 4 heads to 16 per warp N tile (BLOCK_N = ceil(next_n/4)*16), so the
-    // host-side smem/thread computations use the padded geometry (fp4 keeps its own layout)
+    // host-side smem/thread computations use the same padded geometry.
     int tile_next_n = next_n, tile_num_heads = num_heads;
-    if (num_heads == 4 and not is_fp4) {
+    if (num_heads == 4) {
         tile_num_heads = 16;
         tile_next_n = (next_n + 3) / 4;
     }
@@ -365,8 +360,6 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     std::string element_qk, element_acc, dtype_tag;
     if (is_fp4) {
         element_qk = "uint8_t", element_acc = "float", dtype_tag = "fp4";
-    } else if (qk_dtype == torch::kBFloat16) {
-        element_qk = "cutlass::bfloat16_t", element_acc = "float", dtype_tag = "bf16";
     } else if (qk_dtype == torch::kFloat8_e4m3fn) {
         element_qk = "cutlass::float_e4m3_t", element_acc = "float", dtype_tag = "fp8";
     } else {
@@ -386,12 +379,12 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
 
     if (is_fp4) {
         launch_paged_mqa_logits(
-            "deep_gemm/impls/fp4_paged_mqa_logits.cuh", "PPUPagedMqaLogitsFP4", tile.split_mblock, "deep_gemm::kScaleModeWeights", tile,
+            "deep_gemm/impls/fp4_paged_mqa_logits.cuh", "PPUPagedMqaLogitsFP4", tile.split_mblock, scale_mode, tile,
             element_qk, element_acc, element_logits, element_weights, dtype_tag, next_n, num_heads, head_dim, page_kv, kPagedMqaBlockKV,
-            smem_size, num_threads, num_blocks, kernel_name, false,
+            smem_size, num_threads, num_blocks, kernel_name, is_avg,
             PagedMqaLogitsFP4Arguments{q.data_ptr(), reinterpret_cast<const uint32_t*>(q_sf->data_ptr()),
                                        k.data_ptr(), reinterpret_cast<const uint32_t*>(k_scales.data_ptr()),
-                                       weights.data_ptr(), static_cast<uint32_t>(batch_size),
+                                       weights_ptr, static_cast<uint32_t>(batch_size),
                                        static_cast<uint64_t>(aligned_max_context_len),
                                        static_cast<uint64_t>(kv_cache_stride_bytes),
                                        static_cast<uint32_t>(block_table_stride), context_lens_ptr, logits.data_ptr(),

@@ -33,7 +33,7 @@ static int get_logits_stride_alignment(torch::ScalarType logits_dtype) {
 }
 
 // `stride_k` is `uint32_t` when `q_idx * stride_k` still fits in 32 bits, otherwise `uint64_t`.
-// Chosen on the host and forwarded as a JIT template key, mirroring `_select_stride_k_type`.
+// Chosen on the host and forwarded as a JIT template key.
 static std::string select_stride_k_type(int aligned_seq_len, int aligned_seq_len_kv) {
     DG_HOST_ASSERT(aligned_seq_len_kv < (1LL << 31));
     const auto& product = static_cast<int64_t>(aligned_seq_len) * aligned_seq_len_kv;
@@ -45,9 +45,8 @@ static std::string select_stride_k_type(int aligned_seq_len, int aligned_seq_len
 //   smem_k / smem_q (values) + smem_k_scales + [smem_q_sf, FP4 only] + smem_weight
 // Both flavours store 4 bytes per KV row scale (`float` vs packed `uint32_t` e8m0); FP4 adds a
 // per-Q-row scale on top.
-// NOTES: the Python path never needed this because the kernel used `AttnKernel::SharedStorageSize`
-// directly; the C++ JIT must supply it at launch time. The generated code carries a `static_assert`
-// against `SharedStorageSize`, so a mismatch here fails at compile time rather than silently.
+// The host supplies this size at launch time. The generated code carries a `static_assert`
+// against `SharedStorageSize`, so a mismatch fails at compile time.
 static int get_smem_config(const MqaLogitsConfig& config, int head_dim, int qk_element_size,
                            int weights_element_size, bool is_fp4) {
     const int smem_k = config.block_kv * head_dim * config.num_kv_stages * qk_element_size;
@@ -65,7 +64,7 @@ static int get_num_threads(const MqaLogitsConfig& config) {
 
 // ============================ Paged =============================
 
-// Mirrors the 6-tuple returned by `get_paged_mqa_logits_tile` in `deep_gemm/jit_kernels/utils.py`
+// Pipeline stages, KV splitting, warp shape and occupancy selected for paged MQA.
 struct PagedTile {
     int stage_q, stage_k, split_kv, warp_kv;
     bool split_mblock;
@@ -92,11 +91,11 @@ static int get_paged_num_threads(const PagedTile& tile, int next_n) {
     return next_n * (tile.split_kv / tile.warp_kv) * 32;
 }
 
-// Faithful port of `get_paged_mqa_logits_tile`: a lookup table with a search fallback.
+// Paged tile lookup with resource-based search for unlisted shapes.
 // NOTES: `weights_size` / `logits_size` are hardcoded to 4 upstream even when the tensors are
-// BF16; kept as-is so the tile choice matches the Python path exactly.
+// BF16; preserve that accounting for the existing weighted paths.
 static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_heads, int head_dim, int datasize) {
-    DG_HOST_ASSERT(page_kv == 32 or page_kv == 64 or page_kv == 128);
+    DG_HOST_ASSERT(page_kv == 32 or (page_kv > 0 and page_kv % 64 == 0));
     const bool is_fp4 = datasize == 1 and head_dim == 64;
     constexpr int weights_size = 4, logits_size = 4;
 
@@ -159,8 +158,8 @@ static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_head
             }
         }
         DG_HOST_ASSERT(not tile_list.empty());
-        // `max(tile_list, key=lambda x: (tb_per_cu, stage_q, 1 - split_mblock))`; both Python's `max`
-        // and `std::max_element` return the first maximum, so ties break identically
+        // Prefer more blocks per CU, then more Q stages, then unsplit M blocks.
+        // std::max_element retains the first candidate when the keys tie.
         const auto& key = [](const PagedTile& t) {
             return std::make_tuple(t.tb_per_cu, t.stage_q, 1 - static_cast<int>(t.split_mblock));
         };
@@ -174,29 +173,14 @@ static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_head
         {{1, 1, 64, 64}, {2, 3, 256, 64, false, 4}},
         {{1, 1, 32, 128}, {1, 3, 64, 16, false, 8}},
         {{1, 1, 64, 128}, {2, 3, 64, 16, false, 6}},
-        // int8 next_n > 1 tiles
-        {{1, 2, 32, 128}, {2, 3, 256, 32, false, 2}},
-        {{1, 4, 32, 128}, {2, 3, 128, 32, false, 2}},
-        {{1, 2, 64, 128}, {2, 3, 256, 32, false, 1}},
-        {{1, 4, 64, 128}, {2, 3, 128, 32, false, 1}},
-        {{1, 5, 64, 128}, {2, 3, 64, 32, false, 1}},
-        {{1, 6, 64, 128}, {2, 3, 64, 32, false, 1}},
-        // fp4 next_n > 1 tiles, some using split_mblock
-        {{1, 2, 32, 64}, {2, 3, 256, 64, true, 4}},
-        {{1, 3, 32, 64}, {1, 3, 256, 64, true, 4}},
-        {{1, 4, 32, 64}, {2, 3, 256, 64, true, 3}},
-        {{1, 5, 32, 64}, {1, 3, 64, 64, true, 9}},
-        {{1, 6, 32, 64}, {1, 3, 64, 64, true, 8}},
-        {{1, 2, 64, 64}, {1, 3, 256, 64, true, 4}},
-        {{1, 3, 64, 64}, {1, 3, 128, 64, true, 5}},
-        // 4-head avg tiles: the kernel pads 4 heads to 16, so lookup with 16 heads
-        // and ceil(next_n / 4) "tokens" (next_n 1-4 -> 1, 5-8 -> 2)
+        // AVG tiles use 16 MMA columns and ceil(next_n / 4) query groups.
+        // FP4 D128 is packed into 64 bytes; FP8 D128 uses 128 bytes.
+        {{1, 1, 16, 64}, {2, 3, 256, 64, false, 4}},
+        {{1, 2, 16, 64}, {2, 3, 256, 64, false, 4}},
         {{1, 1, 16, 128}, {1, 3, 128, 32, false, 4}},
         {{1, 2, 16, 128}, {1, 3, 128, 32, false, 4}},
     };
-    // 4 heads are padded to 16 in the paged kernel: look up with 16 heads and
-    // ceil(next_n / 4) warp-tile "tokens" (fp4 keeps its own kernel layout)
-    if (num_heads == 4 and not is_fp4) {
+    if (num_heads == 4) {
         num_heads = 16;
         next_n = (next_n + 3) / 4;
     }
@@ -403,13 +387,9 @@ static MqaLogitsConfig get_best_configs(torch::ScalarType qk_dtype, int seq_len_
     } else {
         config.num_q_stages = 1;
         config.num_kv_stages = 3;
-        if (qk_dtype == torch::kBFloat16) {
-            config.block_kv = 128, config.warp_kv = 32;
-        } else {
-            // FP8 / INT8 share the same tiling
-            config.warp_kv = num_heads == 32 ? 32 : 64;
-            config.block_kv = config.warp_kv * 4;
-        }
+        // FP8 / INT8 share the same tiling.
+        config.warp_kv = num_heads == 32 ? 32 : 64;
+        config.block_kv = config.warp_kv * 4;
     }
 
     return config;

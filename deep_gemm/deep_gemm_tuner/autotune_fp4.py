@@ -19,6 +19,9 @@ import deep_gemm
 import traceback
 import concurrent.futures
 
+from deep_gemm.utils.math import ceil_div
+from deep_gemm.utils import SMEM_CONFIG_UNUSED
+
 CANDIDATE_Ms = sorted(set(
     list(range(1, 16))
     + [int(x) for x in np.logspace(np.log2(8), np.log2(32768), base=2, num=36)]
@@ -69,7 +72,7 @@ def construct_fp4_dense(
     N: int,
     K: int,
 ):
-    from deep_gemm.jit_kernels.gemm_fp4 import preprocess_mxfp4_scales
+    from deep_gemm import preprocess_mxfp4_scales
     A = torch.randn(M, K, dtype=torch.bfloat16, device='cuda').contiguous()
     B = torch.randn(N, K, dtype=torch.bfloat16, device='cuda').contiguous()
     x = quantize_fp4_torch(A).cuda()
@@ -163,7 +166,7 @@ def construct_fp4_nopad(
     num_experts: int,
     device: str = "cuda",
 ):
-    from deep_gemm.jit_kernels.gemm_fp4 import preprocess_mxfp4_scales
+    from deep_gemm import preprocess_mxfp4_scales
     total_tokens = int(m_rows.sum().item())
     dtype = torch.bfloat16
     x = torch.randn(total_tokens, K, dtype=dtype, device=device)
@@ -191,7 +194,7 @@ def construct_fp4_nopad(
 
 def construct_fp4_masked(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, distribution: str,
                              enable_sbo_overlap: bool = False, with_bias: bool = True):
-    from deep_gemm.jit_kernels.gemm_fp4 import preprocess_mxfp4_scales
+    from deep_gemm import preprocess_mxfp4_scales
     tensor_device = 'cuda'
     def find_next_power_of_2(m_list):
         if isinstance(m_list, torch.Tensor):
@@ -450,7 +453,6 @@ def get_search_space(d: torch.dtype, gemm_type: str) -> list:
     return tile_list_rtn
 
 def get_full_search_space(k, n) -> list:
-    from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
     block_ms = [256, 128, 64, 32, 16]
     block_ns = [256, 128, 64, 32, 16]
     block_ks = [256, 128, 64]
@@ -470,10 +472,7 @@ def get_full_search_space(k, n) -> list:
                             ### for those cases with super small k.
                         if not stage_candidates: stage_candidates = (2, )
                         for num_stages in stage_candidates:
-                            best_smem_config = get_smem_config_fp4(num_stages, BLOCK_M, BLOCK_N, WARP_M, WARP_N, BLOCK_K, n, False, False)
-                            ppu_capacity = 262144
-                            if best_smem_config[0] <= ppu_capacity:
-                                configs.append([BLOCK_M, BLOCK_N, WARP_M, WARP_N, BLOCK_K, num_stages])
+                            configs.append([BLOCK_M, BLOCK_N, WARP_M, WARP_N, BLOCK_K, num_stages])
     return configs
 
 def save_lut(lut: dict, filepath: str):
@@ -503,13 +502,11 @@ def precompile_kernels(search_space, M, N, K, num_experts, topk_experts, gemm_ty
         return 1 - sim
 
     def compile_and_validate(config, gemm_type):
-        from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4, get_num_sms
+        from deep_gemm import get_num_sms
         num_sms = get_num_sms()
-        smem_config = get_smem_config_fp4(2, 256, 256, 64, 64, 128, N, False, False)
-        ref_config = (num_sms, 256, 256, 128, 64, 64, 2, smem_config)
+        ref_config = (num_sms, 256, 256, 128, 64, 64, 2, SMEM_CONFIG_UNUSED)
         block_m, block_n, block_k, warp_m, warp_n, num_stages = config
-        smem_config = get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k, N, False, False)
-        config = (num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config)
+        config = (num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, SMEM_CONFIG_UNUSED)
         if gemm_type == "GroupedNoPad":
             group_ms = construct_uniform_m_list("uniform", num_experts, M*topk_experts)
             m_rows = torch.tensor(group_ms).to('cuda').to(torch.int32)
@@ -568,9 +565,9 @@ def precompile_kernels(search_space, M, N, K, num_experts, topk_experts, gemm_ty
                 M, N, K)
             try:
                 deep_gemm.gemm_fp4_fp4_bf16_nt(
-                    x_fp4, y_fp4, bias, out, config)
+                    x_fp4, y_fp4, bias, out, configs=config)
                 deep_gemm.gemm_fp4_fp4_bf16_nt(
-                    x_fp4, y_fp4, bias, ref_out, ref_config)
+                    x_fp4, y_fp4, bias, ref_out, configs=ref_config)
                 torch.cuda.synchronize()
 
                 diff = calc_diff(out, ref_out)
@@ -719,9 +716,6 @@ def benchmark_kernel(
 
         times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
         return float(np.median(times))
-
-def ceil_div(x: int, y: int) -> int:
-    return (x + y - 1) // y
 
 def construct_uniform_m_list(distribution, num_groups = int, m = int, is_mask=False, seed=0, em=0):
     import random

@@ -241,7 +241,7 @@ namespace deep_gemm {{
 
 using AttnKernel = cutlass::gemm::kernel::PPUSparseMqaLogitsFP4<
   uint8_t, float, __ppu_bfloat16, __ppu_bfloat16,
-  64, deep_gemm::sparse_mqa_logits::kSplitKV, 32, 16, 1, 3, {}, {}, {}, {}>;
+  64, deep_gemm::sparse_mqa_logits::kSplitKV, 32, {}, 1, 3, {}, {}, {}, {}>;
 
 // The host computes these instead of reading them off the kernel type, so pin them down here
 static_assert(AttnKernel::SharedStorageSize == {}, "host/device shared memory size mismatch");
@@ -257,6 +257,7 @@ __global__ void {}(
 }}
 }}
 )",
+            kSplitKV * kBlockQ / kNumWarpsPerCTA,
             args.launch_info.sparse_block_kv, args.launch_info.num_slots,
             args.launch_info.is_paged ? "true" : "false", args.launch_info.page_kv,
             args.launch_info.smem_size, args.launch_info.num_threads, args.launch_info.kernel_name);
@@ -276,13 +277,14 @@ static void launch_fp4_sparse_mqa_logits_impl(
     torch::Tensor& logits, const uint32_t logits_stride, const uint32_t sparse_block_kv,
     const uint32_t seq_len_q, const uint32_t seq_len_kv, const uint32_t num_max_sparse_blocks,
     const bool use_unaligned_ks, const bool is_paged) {
-    constexpr int kNumThreads = 512;
+    constexpr int kNumThreads = kNumWarpsPerCTA * 32;
     constexpr uint32_t kQStages = 1, kKVStages = 3;
     const uint32_t num_slots = get_num_sparse_slots();
     // Mirrors `deep_gemm_mqa_common::get_smem_config` for the frozen sparse tile
-    // (block_qh=64, block_kv=128, warp_qh=32, warp_kv=16); pinned by static_assert
+    // (block_qh=64, block_kv=128, warp_qh=32); pinned by static_assert
     const deep_gemm_mqa_common::MqaLogitsConfig config{
-        .block_q = 2, .block_qh = 64, .block_kv = 128, .warp_qh = 32, .warp_kv = 16,
+        .block_q = 2, .block_qh = 64, .block_kv = 128, .warp_qh = 32,
+        .warp_kv = kSplitKV * kBlockQ / kNumWarpsPerCTA,
         .num_q_stages = kQStages, .num_kv_stages = kKVStages};
     const int smem_size = deep_gemm_mqa_common::get_smem_config(config, 64, 1, 2, true);
     const auto kernel_name = "attention_sparse_mqa_logits_fp4";
@@ -331,16 +333,17 @@ static void launch_fp4_sparse_mqa_logits_impl(
         printf("weights_bf16:true\n");
     }
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_sparse_mqa_logits_params(
             "fp4", static_cast<int>(seq_len_q), static_cast<int>(seq_len_kv),
             static_cast<int>(sparse_mqa_logits::kNumHeads), static_cast<int>(sparse_mqa_logits::kHeadDim),
             static_cast<int>(sparse_block_kv), static_cast<int>(num_max_sparse_blocks), use_unaligned_ks,
             is_paged, current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-    SparseMqaLogitsFP4Runtime::launch(runtime, args);
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        SparseMqaLogitsFP4Runtime::launch(runtime, args);
+    }
 }
 
 static void launch_fp4_sparse_mqa_logits(

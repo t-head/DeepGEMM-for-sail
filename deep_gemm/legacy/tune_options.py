@@ -1,5 +1,5 @@
 from triton import Config
-from ..deep_gemm_cpp import get_mk_alignment_for_contiguous_layout
+from .._C import get_mk_alignment_for_contiguous_layout
 
 
 def get_config_smem_size(config: Config, elem_bytes: int = 2):

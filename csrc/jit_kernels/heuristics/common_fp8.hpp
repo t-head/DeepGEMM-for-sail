@@ -1,8 +1,14 @@
 #pragma once
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <tuple>
+
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
 #include "../../utils/system.hpp"
 #include "../../utils/utils.hpp"
+#include "runtime.hpp"
 #include "gemm_fp8_lut.hpp"
 #include "runtime_lut.hpp"
 
@@ -66,19 +72,16 @@ std::tuple<int, int, int> get_smem_config(int num_stages, int k, int block_m, in
     // Try swizzle first, as it does not waste shared memory
     int swizzle_mode = 128;
     int block_n_padding = 0;
-    int smem_d = block_m * (block_n + block_n_padding);
-    int smem_a_per_stage = block_m * block_k;
-    int smem_b_per_stage = block_n * block_k;
-    int smem_size_d = smem_d * 2;
-    int smem_size_a = num_stages * smem_a_per_stage;
-    int smem_size_b = num_stages * smem_b_per_stage;
-    int smem_scales_a_per_stage = block_m * ceil_div(block_k, 128) * 4;
-    int smem_scales_b_per_stage = ceil_div(block_n, 128) * std::max(ceil_div(block_k, 128), 8) * 4;
-    // int smem_scales_a_per_stage = block_m * 4;
-    // int smem_scales_b = ceil_div(k, block_k) * 4;
-    int smem_size = std::max(smem_size_d, smem_size_a + smem_size_b);
-    smem_size += ceil_div(num_stages * smem_scales_a_per_stage, 128) * 128;
-    smem_size += ceil_div(num_stages * smem_scales_b_per_stage, 128) * 128;
+    const int smem_operands = num_stages * (block_m + block_n) * block_k;
+    const int scale_k = ceil_div(block_k, 128);
+    const int smem_scales_a = num_stages * block_m * scale_k * sizeof(float);
+    const int smem_scales_b = num_stages * ceil_div(block_n, 128) * scale_k * sizeof(float);
+    // Match ACTLIZE's compact physical scale layouts. SFA and SFB each
+    // start on a 128-byte boundary, as does the end of SharedStorage.
+    // DefaultEpilogueNoTsm does not need a separate BF16 output tile.
+    const int smem_size = ceil_div(smem_operands, 128) * 128 +
+                          ceil_div(smem_scales_a, 128) * 128 +
+                          ceil_div(smem_scales_b, 128) * 128;
     // Swizzle and padding are not compatible
     assert((swizzle_mode > 0) + (block_n_padding > 0) <= 1);
     return std::make_tuple(smem_size, swizzle_mode, block_n_padding);
@@ -226,6 +229,98 @@ ConfigResult get_best_configs_dense(int m, int n, int k, int num_groups, int num
     return result;
 }
 
+struct DenseWaveConfig {
+    int num_sms;
+    int block_m, block_n, block_k;
+    int warp_m, warp_n;
+    int stages;
+};
+
+// Geometry-based fallback for PPU1.5 dense blockwise FP8 GEMM. The caller checks
+// the architecture and gives explicit configs and LUT entries higher priority.
+// Shapes outside this domain continue through the existing dense heuristic.
+inline std::optional<DenseWaveConfig> get_dense_wave_config(int m, int n, int k, int num_sms) {
+    if (m < 512 || n < 1024 || k < 1024 || n % 128 || k % 128 || num_sms <= 0)
+        return std::nullopt;
+
+    struct Tile { int m, n, wm, wn, stages; };
+    constexpr int block_k = 128;
+    // Retain the existing heuristic unless a candidate has a meaningful margin.
+    // In particular, do not introduce BM=256: its Scale-A AIU copy/synchronization
+    // cost is not represented by the geometry score. Existing BM=256 choices
+    // remain valid fallback configurations.
+    const auto baseline = get_best_configs_dense(m, n, k, 1, num_sms);
+    const auto& [baseline_sms, baseline_m, baseline_n, baseline_k,
+                 baseline_wm, baseline_wn, baseline_stages, baseline_smem] = baseline;
+    constexpr std::array<Tile, 3> base_tiles{{
+        {128, 256, 32, 64, 4},
+        {192, 256, 48, 64, 4},
+        {128, 384, 32, 96, 3},
+    }};
+    // Empirical weight, not a cycle estimate: scale-copy policy and instruction
+    // costs are not represented, so a lower score does not guarantee a speedup.
+    constexpr int64_t transfer_weight = 64;
+    auto div_up = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
+    using Score = std::tuple<int64_t, int64_t, int64_t, int64_t>;
+    const int64_t baseline_blocks = div_up(m, baseline_m) * div_up(n, baseline_n);
+    const int64_t baseline_rounds = div_up(baseline_blocks, num_sms);
+    const int64_t baseline_critical = baseline_rounds * baseline_m * baseline_n;
+    const int64_t baseline_operand = baseline_rounds * (baseline_m + baseline_n);
+    const int64_t baseline_score = baseline_critical + transfer_weight * baseline_operand;
+    Score best{baseline_score, baseline_critical,
+               baseline_operand, baseline_blocks * baseline_m * baseline_n};
+    DenseWaveConfig result{baseline_sms, baseline_m, baseline_n, baseline_k,
+                           baseline_wm, baseline_wn, baseline_stages};
+    bool selected_single_cta = false;
+    auto consider = [&](const Tile& tile, int64_t blocks, int64_t rounds) {
+        // Compare the busiest CU's work per K block, then break ties using
+        // compute, operand traffic and total padded output, in that order.
+        const int64_t critical_work = rounds * tile.m * tile.n;
+        const int64_t operand_work = rounds * (tile.m + tile.n);
+        const int64_t padded_output = blocks * tile.m * tile.n;
+        const Score score{critical_work + transfer_weight * operand_work,
+                          critical_work, operand_work, padded_output};
+        // Four percent is an admission margin, not a predicted speedup. Keep the
+        // legacy configuration when an apparent win only comes from tie-breaks.
+        if (std::get<0>(score) <= baseline_score - div_up(baseline_score, 25) && score < best) {
+            best = score;
+            selected_single_cta = true;
+            // Smallest scheduler CU count that preserves this round count.
+            result = {static_cast<int>(div_up(blocks, rounds)),
+                      tile.m, tile.n, block_k, tile.wm, tile.wn, tile.stages};
+        }
+    };
+
+    for (const auto& tile : base_tiles) {
+        const int64_t blocks = div_up(m, tile.m) * div_up(n, tile.n);
+        consider(tile, blocks, div_up(blocks, num_sms));
+    }
+
+    if (!selected_single_cta && k <= 1536 && n >= 8192) {
+        // This tile with three stages permits two resident CTAs per CU.
+        // Keep an admitted single-CTA improvement. The small tile needs both a
+        // short reduction and enough rounds to amortize extra scale/copy work;
+        // residency alone did not prevent regressions near N=8192, K=2048.
+        constexpr Tile tile{128, 128, 32, 64, 3};
+        constexpr int resident_ctas = 2;
+        const int64_t blocks = div_up(m, tile.m) * div_up(n, tile.n);
+        const int64_t rounds = div_up(blocks, int64_t(num_sms) * resident_ctas);
+        const int64_t critical_work = rounds * resident_ctas * tile.m * tile.n;
+        if (rounds >= 8 && critical_work <= baseline_critical) {
+            result = {static_cast<int>(div_up(blocks, rounds * resident_ctas)),
+                      tile.m, tile.n, block_k, tile.wm, tile.wn, tile.stages};
+        }
+    }
+    // Profiled full tiles with at least 12 M tiles, 16 N tiles and 32 K blocks use
+    // three stages. Stage selection is validated separately from the geometry
+    // score, which does not model pipeline startup or masked-copy costs.
+    if (result.block_m == 192 && result.block_n == 256 &&
+        m % 192 == 0 && n % 256 == 0 && m / 192 >= 12 && n / 256 >= 16 && k / block_k >= 32) {
+        result.stages = 3;
+    }
+    return result;
+}
+
 static ConfigResult make_config_result(int num_sms, int k, int block_m, int block_n, int block_k,
                                        int warp_m, int warp_n, int stages) {
     auto smem_config = get_smem_config(stages, k, block_m, block_n, block_k);
@@ -246,6 +341,14 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
                                   best_warp_m, best_warp_n, best_stages);
     }
 
+    if (gemm_type == GemmType::Normal && num_groups == 1 && is_ppu1v5_device()) {
+        if (const auto selected = get_dense_wave_config(m, n, k, num_sms)) {
+            const auto& c = *selected;
+            return make_config_result(c.num_sms, k, c.block_m, c.block_n, c.block_k,
+                                      c.warp_m, c.warp_n, c.stages);
+        }
+    }
+
     if (gemm_type == GemmType::Normal || gemm_type == GemmType::Batched) {
         auto result = get_best_configs_dense(m, n, k, num_groups, num_sms);
         return result;
@@ -254,7 +357,7 @@ static ConfigResult get_best_configs(int m, int n, int k, int num_groups, int nu
     if (gemm_type != GemmType::MGroupedContiguous) {
         block_ms = (k > 384) ? std::vector<int>{256, 192, 128, 64, 32, 16} : std::vector<int>{64, 32, 16};
     } else {
-        block_ms = {get_mk_alignment_for_contiguous_layout()};
+        block_ms = {heuristics_runtime->get_mk_alignment_for_contiguous_layout()};
     }
     assert(max_block_n > 0 && (max_block_n & (max_block_n - 1)) == 0);
     int bit_length = 32 - __builtin_clz(static_cast<unsigned>(max_block_n));

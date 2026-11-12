@@ -202,7 +202,7 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
             std::min(capacity, std::max(uint64_t{1}, num_output_tasks)));
     }
 
-    // Reported before the launch, as `Attention::run` does, so the configuration is on screen even
+    // Report the configuration before launch so it remains visible even
     // when the launch itself fails
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
@@ -239,7 +239,7 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
     }
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_mqa_logits_params(dtype_tag, static_cast<int>(kernel_params.seq_len_q),
                                              static_cast<int>(kernel_params.seq_len_k), num_heads,
                                              is_fp4 ? head_dim * 2 : head_dim, current_stream(), is_avg);
@@ -248,11 +248,10 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
         if (element_weights == "__ppu_bfloat16")
             dg_prof_params.add_params("weights_dtype", std::string("bf16"));
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-    Runtime::launch(runtime, args);
-
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        Runtime::launch(runtime, args);
+    }
 }
 
 // Host entry for the non-paged MQA logits kernels. Picks the tile config, allocates the padded
@@ -310,12 +309,10 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
 
     // NOTES: `dtype_tag` (rather than `element_qk`) names the kernel, because the C++ JIT uses this
     // string as the `extern "C"` symbol name -- the `cutlass::` qualifier in `element_qk` is not a
-    // valid identifier. The Python path only used it as a cache directory name, so it got away with it.
+    // valid identifier.
     std::string element_qk, element_acc, dtype_tag;
     if (is_fp4) {
         element_qk = "uint8_t", element_acc = "float", dtype_tag = "fp4";
-    } else if (qk_dtype == torch::kBFloat16) {
-        element_qk = "cutlass::bfloat16_t", element_acc = "float", dtype_tag = "bf16";
     } else if (qk_dtype == torch::kFloat8_e4m3fn) {
         element_qk = "cutlass::float_e4m3_t", element_acc = "float", dtype_tag = "fp8";
     } else {
@@ -327,8 +324,8 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     const int num_threads = deep_gemm_mqa_common::get_num_threads(config);
     const auto& kernel_name = "attention_mqa_logits_" + dtype_tag + (is_avg ? "_avg" : "");
 
-    // `k_scales` is an empty tensor for BF16 and FP4 (FP4 uses `k_sf` instead)
-    const float* k_scales_ptr = (is_fp4 or qk_dtype == torch::kBFloat16) ? nullptr : k_scales.data_ptr<float>();
+    // `k_scales` is an empty tensor for FP4 (`k_sf` is used instead)
+    const float* k_scales_ptr = is_fp4 ? nullptr : k_scales.data_ptr<float>();
 
     if (is_fp4) {
         const auto* q_sf_ptr = reinterpret_cast<const uint32_t*>(q_sf->data_ptr());
@@ -375,13 +372,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     // NOTES: the kernel writes into the padded buffer, the caller only sees the valid window
     logits = logits.slice(0, 0, seq_len_q).slice(1, 0, logits_cols);
 
-    if (clean_logits) {
-        const auto& positions =
-            torch::arange(0, seq_len_k, torch::TensorOptions().dtype(torch::kInt32).device(q.device()));
-        const auto& mask = positions.unsqueeze(0).ge(cu_seq_len_k_start.unsqueeze(1)) &
-                           positions.unsqueeze(0).lt(cu_seq_len_k_end.unsqueeze(1));
-        logits = logits.masked_fill(mask.logical_not(), -std::numeric_limits<float>::infinity());
-    }
+
     return logits;
 }
 

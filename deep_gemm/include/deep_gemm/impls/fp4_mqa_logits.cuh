@@ -1,5 +1,6 @@
 #pragma once
 #include <deep_gemm/tix/ld_st.cuh>
+#include <deep_gemm/tix/utils.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 
@@ -120,7 +121,7 @@ public:
     using SmemLayoutSFA =
         decltype(tile_to_shape(SmemLayoutAtomSFA{}, make_shape(_1{}, Int<BLOCK_M>{}, Int<kNumKVStages>{})));
 
-    // SFB (q_sf / weights): one uint32_t/float32 per Q head
+    // SFB (q_sf): one packed uint32_t scale per Q head
     using DefaultOperandSFB =
         cutlass::gemm::config::DefaultGemm_AIU_Operand<cutlass::arch::PPU0015, uint32_t, false, _1, Int<BLOCK_N>, false, 0, false>;
     using SmemLayoutAtomSFB = typename DefaultOperandSFB::SmemLayoutAtom;
@@ -480,12 +481,14 @@ public:
                         deep_gemm::float_epilogue_reduce_tCrW(accum, m, tCrW, v_0, v_1);
                         deep_gemm::shfl_xor_reduce_2(v_0, v_1);
                         if constexpr (kIsCompressedLogits) {
-                            const uint32_t rel_kv = static_cast<uint32_t>(logits_kv_offset) - seq_k_start[warp_q_idx];
+                            // Finish each uint32 relative column before adding the row base.
+                            const uint32_t rel_lo = static_cast<uint32_t>(logits_kv_offset) + v_0_offset - seq_k_start[warp_q_idx];
+                            const uint32_t rel_hi = static_cast<uint32_t>(logits_kv_offset) + v_1_offset - seq_k_start[warp_q_idx];
                             const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
-                            if (rel_kv + v_0_offset < len)
-                                params.logits[logits_q_offset + rel_kv + v_0_offset] = v_0;
-                            if (rel_kv + v_1_offset < len)
-                                params.logits[logits_q_offset + rel_kv + v_1_offset] = v_1;
+                            if (rel_lo < len)
+                                params.logits[logits_q_offset + rel_lo] = v_0;
+                            if (rel_hi < len)
+                                params.logits[logits_q_offset + rel_hi] = v_1;
                         } else {
                             params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = v_0;
                             params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = v_1;
@@ -580,12 +583,14 @@ public:
                         __ppu_bfloat16 v_1_bf = __hadd(__low2bfloat16(sum_1), __high2bfloat16(sum_1));
                         __ppu_bfloat162 packed = deep_gemm::shfl_xor_reduce_bf16x2({v_0_bf, v_1_bf});
                         if constexpr (kIsCompressedLogits) {
-                            const uint32_t rel_kv = static_cast<uint32_t>(logits_kv_offset) - seq_k_start[warp_q_idx];
+                            // Finish each uint32 relative column before adding the row base.
+                            const uint32_t rel_lo = static_cast<uint32_t>(logits_kv_offset) + v_0_offset - seq_k_start[warp_q_idx];
+                            const uint32_t rel_hi = static_cast<uint32_t>(logits_kv_offset) + v_1_offset - seq_k_start[warp_q_idx];
                             const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
-                            if (rel_kv + v_0_offset < len)
-                                params.logits[logits_q_offset + rel_kv + v_0_offset] = __low2bfloat16(packed);
-                            if (rel_kv + v_1_offset < len)
-                                params.logits[logits_q_offset + rel_kv + v_1_offset] = __high2bfloat16(packed);
+                            if (rel_lo < len)
+                                params.logits[logits_q_offset + rel_lo] = __low2bfloat16(packed);
+                            if (rel_hi < len)
+                                params.logits[logits_q_offset + rel_hi] = __high2bfloat16(packed);
                         } else {
                             params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = __low2bfloat16(packed);
                             params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = __high2bfloat16(packed);
@@ -888,74 +893,3 @@ public:
 };
 
 } // namespace cutlass::gemm::kernel
-
-namespace deep_gemm {
-
-template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights,
-          int kNumHeads, int kHeadDim, int BLOCK_QH,
-          int BLOCK_KV, int WARP_QH, int WARP_KV, int kNumQStages, int kNumKVStages,
-          typename StrideKType = uint32_t,
-          bool kIsCompressedLogits = false,
-          uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
-class AttentionFP4 {
-public:
-    static void run(const ElementQK* ptr_q, const uint32_t* q_sf, const ElementQK* ptr_k, const uint32_t* k_sf,
-                    const ElementWeights* weights, int* cu_seq_len_k_start, int* cu_seq_len_k_end, ElementLogits* logits,
-                    const int seq_len_q, const int seq_len_k, const StrideKType stride_k, hggcStream_t stream,
-                    int num_sms) {
-        using AttnKernel =
-            cutlass::gemm::kernel::PPUMqaLogitsFP4<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNumHeads, kHeadDim, BLOCK_QH,
-                                                    BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits, kScaleMode>;
-
-        static constexpr int BLOCK_M = AttnKernel::BLOCK_M;
-        static constexpr int BLOCK_N = AttnKernel::BLOCK_N;
-        static constexpr int BLOCK_K = AttnKernel::BLOCK_K;
-        static constexpr int WARP_M = AttnKernel::WARP_M;
-        static constexpr int WARP_N = AttnKernel::WARP_N;
-        static constexpr int MaxThreadsPerBlock = AttnKernel::MaxThreadsPerBlock;
-
-        int max_blocks_per_cu = compute_occupancy_for_kernel<AttnKernel>();
-        int threadblock_count = num_sms * max_blocks_per_cu;
-
-        typename AttnKernel::Arguments arguments{
-            ptr_q,  q_sf,      ptr_k,     k_sf,    weights, cu_seq_len_k_start, cu_seq_len_k_end,
-            logits, seq_len_q, seq_len_k, stride_k};
-        auto params = arguments;
-        dim3 const block(MaxThreadsPerBlock, 1, 1);
-        dim3 const grid(threadblock_count, 1, 1);
-        int smem_size_kernel = AttnKernel::SharedStorageSize;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_mqa_logits_params("fp4", seq_len_q, seq_len_k, kNumHeads, kHeadDim * 2, stream);
-            if constexpr (cute::is_same_v<ElementLogits, __ppu_bfloat16>) {
-                dg_prof_params.add_params("logits_dtype", std::string("bf16"));
-            }
-            if constexpr (cute::is_same_v<ElementWeights, __ppu_bfloat16>) {
-                dg_prof_params.add_params("weights_dtype", std::string("bf16"));
-            }
-        }
-
-        char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            hggcFuncAttributes attr;
-            hggcFuncGetAttributes(&attr, cutlass::device_kernel<AttnKernel>);
-            printf("[mqa_logits_fp4:]\n");
-            printf("kNumHeads:%d, kHeadDim:%d(packed), BLOCK_QH:%d, BLOCK_KV:%d\n", kNumHeads, kHeadDim, BLOCK_QH,
-                   BLOCK_KV);
-            printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", BLOCK_M, BLOCK_N,
-                   WARP_M, WARP_N, kNumQStages, kNumKVStages);
-            printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d, num_threads:%d\n", num_sms, max_blocks_per_cu,
-                   threadblock_count, MaxThreadsPerBlock);
-            printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
-            printf("compressed_logits:%s, ", kIsCompressedLogits ? "true" : "false");
-            printf("weights_bf16:%s\n", cute::is_same_v<ElementWeights, __ppu_bfloat16> ? "true" : "false");
-        }
-
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-        cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-    }
-};
-
-}; // namespace deep_gemm

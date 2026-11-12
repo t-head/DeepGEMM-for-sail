@@ -5,7 +5,6 @@
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/math.cuh>
-#include <deep_gemm/common/profiling_interface.cuh>
 
 #include <cute/ppu_tensor_mix.hpp>
 #include <cutlass/gemm/config/gemm_operands.hpp>
@@ -51,7 +50,6 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
     using AccT = float;
     using ElementScale = float;
     using TileShape = cute::Shape<cute::Int<BLOCK_M>, cute::Int<BLOCK_N>, cute::Int<BLOCK_K>>;
-    using WarpShape = cute::Shape<cute::Int<WARP_M>, cute::Int<WARP_N>, cute::Int<BLOCK_K>>;
 #if __HGGC_ARCH__ == 100
     using ArchTag = cutlass::arch::PPU0010;
 #else
@@ -129,16 +127,10 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
       }
     };
 
-    // load scaleB from hbm to tsm: use aiu load.
-    constexpr uint32_t MaxAiuContElemSize = 128 / (sizeof_bits<ElementScale>::value / 8);     // 32
-    constexpr uint32_t MinAiuContElemSize = 32 / (sizeof_bits<ElementScale>::value / 8);      // 8
-    constexpr bool TransSFB = false;  // k-major is false
-    static constexpr uint32_t SFBTileN = TransSFB ? cute::max(ScaleNsPerTile, MinAiuContElemSize) : ScaleNsPerTile;
-    static constexpr uint32_t SFBTileK = TransSFB ? ScaleKsPerTile : cute::max(ScaleKsPerTile, MinAiuContElemSize);
-    using GemmOperandSFB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementScale, TransSFB, Int<SFBTileN>, Int<SFBTileK>, true, 1, false>;
-    using RealSmemLayoutAtomSFB = Layout<Shape<Int<SFBTileN>, Int<SFBTileK>>, Stride<Int<SFBTileK>, _1>>;
-    using RealSmemLayoutSFB = decltype(tile_to_shape(RealSmemLayoutAtomSFB{},
-            Shape<cute::Int<SFBTileN>, cute::Int<SFBTileK>, cute::Int<kNumStages>>{}));
+    // load scaleB from hbm to tsm with the compact linear operand.
+    using GemmOperandSFB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementScale, false, Int<ScaleNsPerTile>, Int<ScaleKsPerTile>, true, 1, false>;
+    using RealSmemLayoutSFB = decltype(tile_to_shape(typename GemmOperandSFB::SmemLayoutAtom{},
+            Shape<cute::Int<ScaleNsPerTile>, cute::Int<ScaleKsPerTile>, cute::Int<kNumStages>>{}));
 
     // init aiu desc
     typename GemmOperandSFB::GmemTiledCopy gmem_tiled_copy_SFB;
@@ -147,7 +139,7 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
     constexpr uint32_t SCALE_K = cute::ceil_div(Int<SHAPE_K>{}, Int<GROUP_K>{});
     auto shape_SFB = cute::make_shape(Int<SCALE_N>{}, Int<SCALE_K>{});
     auto stride_SFB = cute::make_shape((int)SCALE_K, _1{});
-    gmem_tiled_copy_SFB.desc_.template init<ElementScale, TransSFB, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(nullptr, SCALE_N, SCALE_K, stride_SFB);
+    gmem_tiled_copy_SFB.desc_.template init<ElementScale, false, get<0>(TilerSFB{}), get<1>(TilerSFB{})>(nullptr, SCALE_N, SCALE_K, stride_SFB);
     auto gmem_thr_copy_SFB = gmem_tiled_copy_SFB.get_slice(thread_idx);
     Tensor sSFB = cute::make_tensor(cute::make_smem_ptr(smem_scale_b), RealSmemLayoutSFB{});
     Tensor tSFBsSFB = gmem_thr_copy_SFB.partition_D(sSFB);
@@ -194,7 +186,7 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
     CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
 
     // ---------------- scale ------------------- //
-    using ScaleConfig = ::cutlass::detail::PPUBlockwiseScaleConfig<GROUP_M, GROUP_N, GROUP_K>;
+    using ScaleConfig = ::cutlass::detail::PPUBlockwiseScaleConfig<GROUP_M, GROUP_N, GROUP_K, false, true>;
     using SmemLayoutAtomSFA = decltype(ScaleConfig::smem_atom_layoutSFA(TileShape{}));
     using SmemLayoutAtomSFB = decltype(ScaleConfig::smem_atom_layoutSFB(TileShape{}));
 
@@ -235,10 +227,10 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
       ),
       make_stride(
         _0{},
-        make_stride(_0{}, get<0>(stride(RealSmemLayoutSFB{}))),
+        stride<0>(SmemLayoutSFB{}),
         make_stride(
-          get<1>(stride(SmemLayoutSFB{})),
-          get<2>(stride(RealSmemLayoutSFB{})))
+          stride<1>(SmemLayoutSFB{}),
+          stride<2>(SmemLayoutSFB{}))
       )
     );
 
@@ -324,7 +316,6 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
       const auto base_tSFBgSFB_data = tSFBgSFB.data();  // valu copy iterator
       for (int n_iter = 0; n_iter < N_EXPAND; ++n_iter) {
         clear(accum);
-        int k_iter = 0;
         uint32_t blk_n_offset = (n_coord + n_iter) * BLOCK_N;
         k_tile_count = k_tile_count_reset;
         // PREFETCH register pipeline
@@ -443,117 +434,6 @@ fp8_blockwise_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
     }
 }
 
-// Forwarding __global__ kernel — delegates to __device__ _impl (trampoline)
-template <class _SrcT, GemmType kGemmType,
-          uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t WARP_M, uint32_t WARP_N,
-          uint32_t BLOCK_SIZE, int kNumStages, int N_EXPAND>
-__global__ __launch_bounds__(BLOCK_SIZE, 1) void
-fp8_blockwise_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
-    fp8_blockwise_quant_gemm_fused_moe_kernel_impl<
-        _SrcT, kGemmType,
-        SHAPE_N, SHAPE_K, kNumGroups,
-        BLOCK_M, BLOCK_N, BLOCK_K,
-        WARP_M, WARP_N, BLOCK_SIZE, kNumStages, N_EXPAND
-    >(args);
-}
-
-template <uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t WARP_M, uint32_t WARP_N, int32_t kNumStages,
-          GemmType kGemmType, bool kEnableSboOverlap = false,
-          KernelStrategy kKernelStrategy = KernelStrategy::Default>
-class FusedMoeGemmWithBlkwiseQuant {
-    using SrcT = __hg_fp8_e4m3;
-    using DstT = __ppu_bfloat16;
-
-public:
-    FusedMoeGemmWithBlkwiseQuant() = default;
-
-    static void run(DstT* gmem_d, SrcT* gmem_a, SrcT* gmem_b, float* gmem_sa, float* gmem_sb,
-                    int* m_rows, int* expert_ids_and_cumsum, int* sorted_token_ids,
-                    int* aligned_num_m_blocks, uint32_t shape_m, uint32_t topk,
-                    hggcStream_t stream, int num_sms) {
-
-        QuantGemmArgs args;
-
-        args.a_ptr = (void *)gmem_a;
-        args.b_ptr = (void *)gmem_b;
-        args.c_ptr = (void *)gmem_d;
-        args.scale_a_ptr = (void *)gmem_sa;
-        args.scale_b_ptr = (void *)gmem_sb;
-
-        args.expert_ids_and_cumsum = expert_ids_and_cumsum;
-        args.sorted_token_ids = sorted_token_ids;
-        args.aligned_num_m_blocks = aligned_num_m_blocks;
-        args.shape_m = shape_m;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()){
-            dg_prof_params.set_fused_moe_params(
-                std::string("fp8"), std::string("block"), kNumGroups, shape_m, topk, SHAPE_N, SHAPE_K, m_rows, stream
-            );
-        }
-        static constexpr int Stages = SHAPE_K < BLOCK_K * kNumStages ? SHAPE_K / BLOCK_K : kNumStages;
-        // dispatch and launch kernel
-        constexpr int BlockSize = BLOCK_M / WARP_M * BLOCK_N / WARP_N * 32;
-        auto launch_kernel = [&](auto n_expand_) {
-          using N_EXPAND_T = decltype(n_expand_);
-          static constexpr bool kUseNStageKernel = n_expand_ > 1 && (SHAPE_N % (BLOCK_N * n_expand_) == 0);
-          static constexpr int N_EXPAND = kUseNStageKernel ? n_expand_ : 1;
-
-          auto device_func = fp8_blockwise_quant_gemm_fused_moe_kernel<
-                SrcT, kGemmType, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BlockSize, Stages, N_EXPAND>;
-          constexpr int smem_size = blkwise_smem_total_size(sizeof(SrcT), Stages, BLOCK_M, BLOCK_N, BLOCK_K);
-          CHECK_HGGC(hggcFuncSetAttribute(device_func, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-          int max_blocks_per_cu = -1;
-          CHECK_HGGC(hggcOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_cu, device_func, BlockSize, smem_size));
-
-          int sm_count = num_sms * max_blocks_per_cu;
-          dim3 grid(sm_count, 1, 1);
-
-          const char* pEnv_params = std::getenv("show_log");
-          if (pEnv_params && std::atoi(pEnv_params) == 1) {
-              hggcFuncAttributes attr;
-              hggcFuncGetAttributes(&attr, device_func);
-
-              printf("[FusedMoeGemmWithBlkwiseQuant-FP8:]\n");
-              printf("group:%d, problem:[%d, %d, %d], gemm_type:%s, kernel_strategy:%s\n",
-                  kNumGroups, shape_m, SHAPE_N, SHAPE_K, GemmTypeS[static_cast<int>(kGemmType)], KernelStrategyS[static_cast<int>(kKernelStrategy)]);
-
-              printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], Stages:%d, N_EXPAND:%d\n",
-                  BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, Stages, N_EXPAND);
-
-              printf("grid:%d, vreg:%d, smem_size: %d, tb_per_cu:%d, stack:%d\n",
-                  sm_count, int(attr.numRegs), smem_size, max_blocks_per_cu, int(attr.localSizeBytes));
-          }
-          ProfilingInterface::Instance().instrument(true, dg_prof_params);
-          device_func<<<grid, BlockSize, smem_size, stream>>>(args);
-          ProfilingInterface::Instance().instrument(false, dg_prof_params);
-        };
-        if constexpr(SHAPE_K <= 512 && (BLOCK_K == 128) && (SHAPE_K % BLOCK_K == 0)) {
-          int expected_m = math::ceil_div(shape_m * topk, kNumGroups);
-          int wave = math::ceil_div(math::ceil_div(expected_m, BLOCK_M) * math::ceil_div(SHAPE_N, BLOCK_N), num_sms);
-          switch (wave) {
-          case 1:
-            launch_kernel(_1{});
-            break;
-          case 2:
-            launch_kernel(_2{});
-            break;
-          default:
-            launch_kernel(_4{});
-            break;
-          }
-        } else {
-          launch_kernel(_1{});
-        }
-    }
-};
-
-
 } // namespace deep_gemm
-
 
 #pragma clang diagnostic pop

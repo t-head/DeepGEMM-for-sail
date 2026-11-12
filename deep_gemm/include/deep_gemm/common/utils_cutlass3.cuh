@@ -3,7 +3,6 @@
 
 #include <hggc_fp8.h>
 #include <cutlass/cutlass.h>
-#include <cutlass/device_kernel.h>
 
 struct KernelAiuMultistageOnN {
   constexpr static int N_EXPAND = 4;
@@ -12,31 +11,6 @@ struct KernelAiuMultistageOnN {
 struct KernelAiuMultistageOverlapPrologue {};
 struct KernelAiuMultistageOverlapMainloop {};
 
-template <typename GemmKernel>
-inline int compute_occupancy_for_kernel() {
-  hggcError_t result;
-  int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
-  if (smem_size >= (48 << 10)) {
-    result = hggcFuncSetAttribute(cutlass::device_kernel<GemmKernel>,
-                                  hggcFuncAttributeMaxDynamicSharedMemorySize,
-                                  smem_size);
-    if (hggcSuccess != result) {
-      result = hggcGetLastError(); // to clear the error bit
-      std::cout << "  hggcFuncSetAttribute() returned error: " << hggcGetErrorString(result) << std::endl;
-    }
-  }
-
-  int max_active_blocks = -1;
-  result = hggcOccupancyMaxActiveBlocksPerMultiprocessor(
-      &max_active_blocks, cutlass::device_kernel<GemmKernel>, GemmKernel::MaxThreadsPerBlock, smem_size);
-
-  if (hggcSuccess != result) {
-    result = hggcGetLastError(); // to clear the error bit
-    std::cout << "  hggcOccupancyMaxActiveBlocksPerMultiprocessor() returned error: " << hggcGetErrorString(result) << std::endl;
-  }
-
-  return max_active_blocks;
-}
 
 template <typename Element> class ToCutlassType {
 public:

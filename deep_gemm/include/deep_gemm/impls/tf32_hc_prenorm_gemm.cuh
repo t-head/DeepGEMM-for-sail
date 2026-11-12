@@ -2,11 +2,6 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-// NOTES: host-only helpers, skipped when the header is pulled in by the C++ JIT
-#ifndef TF32_HC_PRENORM_HGRTC
-    #include <deep_gemm/common/types.cuh>
-    #include <deep_gemm/common/profiling_interface.cuh>
-#endif
 
 #include <hggc_runtime.h>
 #include <hggc/std/cstdint>
@@ -28,9 +23,6 @@
 #include <cute/ppu_util.hpp>
 #include <cute/arch/copy_ppu.hpp>
 
-#ifndef TF32_HC_PRENORM_HGRTC
-    #include <tools/util/include/cutlass/util/packed_stride.hpp>
-#endif
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/common/exception.cuh>
@@ -1279,91 +1271,6 @@ tf32_hc_prenorm_gemm_device(
         DG_DEVICE_ASSERT(false and "This kernel only supports PPU or newer");
 #endif
 }
-
-// Kernel entry used by the Python JIT (`HcPrenormGemm::run`)
-template <uint32_t SHAPE_N, uint32_t SHAPE_K,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t kNumSplits,
-          bool kFastBF16ToTF32,
-          uint32_t kNumThreads = BLOCK_M * 2, uint32_t kNumStages = 2, uint32_t kKernelVariant = 0>
-CUTLASS_GLOBAL void
-#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
-__launch_bounds__(kNumThreads, 1)
-#else
-__launch_bounds__(kNumThreads, 2)
-#endif
-tf32_hc_prenorm_gemm_impl(
-    const float* __restrict__ fn,
-    float* __restrict__ out,
-    float* __restrict__ sqrsum,
-    const __ppu_bfloat16* __restrict__ x,
-    const uint32_t num_tokens,
-    float* __restrict__ ws,
-    float* __restrict__ ws_s,
-    int* __restrict__ counter) {
-    tf32_hc_prenorm_gemm_device<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
-                                kNumSplits, kFastBF16ToTF32, kNumThreads, kNumStages, kKernelVariant>(
-        fn, out, sqrsum, x, num_tokens, ws, ws_s, counter);
-}
-
-template <uint32_t SHAPE_N, uint32_t SHAPE_K,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t kNumSplits,
-          bool kFastBF16ToTF32,
-          uint32_t kNumThreads = BLOCK_M * 2, uint32_t kNumStages = 2, uint32_t kKernelVariant = 0>
-class HcPrenormGemm {
-public:
-    static void run(float* out,
-                    float* sqr_sum,
-                    uint32_t m,
-                    const __ppu_bfloat16* lhs,
-                    const float* rhs,
-                    hggcStream_t stream,
-                    int /*num_sms*/ = 0,
-                    uint32_t /*smem_size_from_python*/ = 0,
-                    float* ws = nullptr,
-                    float* ws_s = nullptr,
-                    int* counter = nullptr) {
-        static_assert(BLOCK_N >= SHAPE_N, "BLOCK_N must >= SHAPE_N");
-        static_assert(BLOCK_N <= 32, "BLOCK_N must <= 32 for PPU TF32 MMA");
-        static_assert(BLOCK_K == 64 || BLOCK_K == 128, "BLOCK_K must be 64 or 128");
-
-        constexpr uint32_t kSmemCuTe =
-            kNumStages * (BLOCK_M * (BLOCK_K + 8) * sizeof(uint16_t) +
-                          BLOCK_N * (BLOCK_K + 4) * sizeof(float));
-        constexpr uint32_t kSmemFused = 2 * ((kKernelVariant & 1 ? BLOCK_M * 64 * 2 : 8192) + 8192) * (BLOCK_K / 64);
-        constexpr uint32_t kSmemSize = kSmemCuTe > kSmemFused ? kSmemCuTe : kSmemFused;
-
-        auto* kernel = tf32_hc_prenorm_gemm_impl<
-            SHAPE_N, SHAPE_K,
-            BLOCK_M, BLOCK_N, BLOCK_K,
-            kNumSplits,
-            kFastBF16ToTF32,
-            kNumThreads, kNumStages, kKernelVariant>;
-
-        hggcFuncSetAttribute(
-            kernel,
-            hggcFuncAttributeMaxDynamicSharedMemorySize,
-            kSmemSize);
-
-        const uint32_t grid_m = hc_detail::ceil_div(m, BLOCK_M);
-        dim3 grid(grid_m, kNumSplits, 1);
-        dim3 block(kNumThreads);
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_hc_prenorm_params(m, SHAPE_N, SHAPE_K, stream);
-            dg_prof_params.add_params("num_splits", int(kNumSplits));
-        }
-
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        kernel<<<grid, block, kSmemSize, stream>>>(
-            rhs, out, sqr_sum, lhs, m, ws, ws_s, counter);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-    }
-};
 
 } // namespace deep_gemm
 

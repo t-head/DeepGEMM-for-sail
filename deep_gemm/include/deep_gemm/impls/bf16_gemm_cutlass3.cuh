@@ -2,13 +2,9 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-#ifndef BF16_HGRTC
-    #include <deep_gemm/common/profiling_interface.cuh>
-#endif
 
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/math.cuh>
-#include <deep_gemm/scheduler/block_info.cuh>
 #include <deep_gemm/tix/utils.cuh>
 
 // #include <iostream>
@@ -28,7 +24,6 @@
 #include <cutlass/detail/layout.hpp>
 
 #include <cute/ppu_util.hpp>
-#include <tools/util/include/cutlass/util/packed_stride.hpp>
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
 
@@ -37,29 +32,7 @@
 using namespace cute;
 
 namespace cutlass::gemm {
-template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapPrologue>
-struct MainloopPPUOverlapPrologue {
-  constexpr static int Stages = Stages_;
-#if __HGGC_ARCH__ == 100
-  using ArchTag = arch::PPU0010;
-#else
-  using ArchTag = arch::PPU0015;
-#endif
-  using Schedule = Schedule_;
-  using ClusterShape = Shape<_1,_1,_1>;
-};
 
-template<int Stages_, typename Schedule_ = KernelAiuMultistageOverlapMainloop>
-struct MainloopPPUOverlapMainloop {
-  constexpr static int Stages = Stages_;
-#if __HGGC_ARCH__ == 100
-  using ArchTag = arch::PPU0010;
-#else
-  using ArchTag = arch::PPU0015;
-#endif
-  using Schedule = Schedule_;
-  using ClusterShape = Shape<_1,_1,_1>;
-};
 
 template<int Stages_, typename Schedule_ = KernelAiuMultistage>
 struct MainloopPPUAiuOpt {
@@ -709,7 +682,7 @@ struct CollectiveMma<
   // Device side kernel params
   using Params = Arguments;
 
-  // sm90 realization put TMA_A into params directly
+  // Copy descriptors are initialized on device rather than passed through Params.
   // put gmem_tiled_copy here and copy desc in kernel to simplify rtc usage
   GmemTiledCopyA gmem_tiled_copy_A;
   GmemTiledCopyB gmem_tiled_copy_B;
@@ -775,6 +748,8 @@ struct CollectiveMma<
 
   /// Perform a collective-scoped matrix multiply-accumulate
   template <
+    bool PeelFirstK = false,
+    bool StaticK256 = false,
     class... Ts,
     class FrgTensorD,
     class FrgTensorC,
@@ -902,8 +877,9 @@ struct CollectiveMma<
       copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
     }
 
-    CUTLASS_PRAGMA_NO_UNROLL
-    while (k_tile_count > -(DispatchPolicy::Stages)) {
+    // Keep one BK iteration implementation for normal, peeled and static-K
+    // schedules. Peeling exposes the zero accumulator to the first MMA.
+    auto process_k_tile = [&]() {
       // Pipeline the outer products with a static for loop.
       //
       // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
@@ -961,6 +937,19 @@ struct CollectiveMma<
         }
       }); // for_each
 
+    };
+    if constexpr (StaticK256) {
+      static_assert(PeelFirstK && std::is_same_v<ArchTag, cutlass::arch::PPU0010>);
+      CUTE_STATIC_ASSERT_V(size<2>(TileShape{}) == Int<64>{});
+      static_assert(DispatchPolicy::Stages == 2 || DispatchPolicy::Stages == 3);
+      for_each(make_int_sequence<4>{}, [&](auto) { process_k_tile(); });
+    } else {
+      if constexpr (PeelFirstK) {
+        CUTE_STATIC_ASSERT_V(K_BLOCK_MAX > Int<1>{});
+        if (k_tile_count > -(DispatchPolicy::Stages)) process_k_tile();
+      }
+      CUTLASS_PRAGMA_NO_UNROLL
+      while (k_tile_count > -(DispatchPolicy::Stages)) process_k_tile();
     }
 
     // TODO: original cutlass3 miss this sync
@@ -1291,220 +1280,171 @@ public:
 
 } // namespace cutlass::gemm::kernel
 
-#include <deep_gemm/impls/bf16_gemm_cutlass3_overlap_prologue.cuh>
 
-#include <deep_gemm/impls/bf16_gemm_cutlass3_overlap_mainloop.cuh>
+
+#pragma clang diagnostic pop
 
 namespace deep_gemm {
 
-template <uint32_t SHAPE_N, uint32_t SHAPE_K,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t WARP_M, uint32_t WARP_N,
-          uint32_t kNumGroups, uint32_t kNumStages,
-          GemmType kGemmType, bool kEnableSboOverlap = false,
-          KernelStrategy kKernelStrategy = KernelStrategy::Default>
-class Gemm {
+struct Model810eReduceParams {
+    const float* partial;
+    void* d;
+    int64_t count;
+};
 
-public:
-    Gemm() = default;
-
-    static void run(__ppu_bfloat16* gmem_d, int* grouped_layout, int* block_m_info,
-                    uint32_t shape_m, uint32_t expected_m, __ppu_bfloat16* gmem_a, __ppu_bfloat16* gmem_b,
-                    hggcStream_t stream, int num_sms, uint32_t smem_size, int32_t* signal = nullptr) {
-        using ElementA    = cutlass::bfloat16_t;
-        using ElementB    = cutlass::bfloat16_t;
-        using ElementC    = cutlass::bfloat16_t;
-        using LayoutA     = cutlass::layout::RowMajor;
-        using LayoutB     = cutlass::layout::ColumnMajor;
-        using LayoutC     = cutlass::layout::RowMajor;
-        using ElementD    = ElementC;
-        using LayoutD     = cutlass::layout::RowMajor;
-        using ElementCompute      = float;
-        using ElementScalar       = ElementCompute;
-        using LinearCombOutType   = ElementD;
-        using OperatorClass = cutlass::arch::OpClassTensorOp;
-#if __HGGC_ARCH__ == 100
-        using ArchTag = cutlass::arch::PPU0010;
-#else
-        using ArchTag = cutlass::arch::PPU0015;
-#endif
-
-        using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
-        using WarpShape = Shape<Int<WARP_M>, Int<WARP_N>, Int<BLOCK_K>>;
-        static constexpr int WarpOnM = BLOCK_M / WARP_M;
-        static constexpr int WarpOnN = BLOCK_N / WARP_N;
-
-        using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, cutlass::bfloat16_t, cutlass::bfloat16_t, float>::type;
-        using TiledMma = TiledMMA<
-            MMA_Atom<MmaInst>,
-            Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
-            Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _16>>;       // 1x1x1 value group
-
-        static constexpr int N_EXPAND = kKernelStrategy == KernelStrategy::MultistageOnN && (SHAPE_N % (BLOCK_N) == 0) ? KernelAiuMultistageOnN::N_EXPAND : 1;
-        using KernelSchedule = cute::conditional_t<
-            kKernelStrategy == KernelStrategy::OverlapMainloop,
-            KernelAiuMultistageOverlapMainloop,
-            cute::conditional_t<
-              kKernelStrategy == KernelStrategy::OverlapPrologue,
-              KernelAiuMultistageOverlapPrologue,
-              cute::conditional_t<
-                kKernelStrategy == KernelStrategy::MultistageOnN,
-                KernelAiuMultistageOnN,
-                cutlass::gemm::KernelAiuMultistage>>>;
-        using DispatchPolicy = cute::conditional_t<
-            kKernelStrategy == KernelStrategy::OverlapMainloop,
-            cutlass::gemm::MainloopPPUOverlapMainloop<kNumStages, KernelSchedule>,
-            cute::conditional_t<
-              kKernelStrategy == KernelStrategy::OverlapPrologue,
-              cutlass::gemm::MainloopPPUOverlapPrologue<kNumStages, KernelSchedule>,
-              cutlass::gemm::MainloopPPUAiuOpt<kNumStages, KernelSchedule>>>;
-
-        static constexpr bool TransA = cutlass::platform::is_same<LayoutA, cutlass::layout::RowMajor>::value ? false : true;
-        static constexpr bool TransB = cutlass::platform::is_same<LayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
-        static constexpr int TSM_LD_NUM = BLOCK_M == 8 ? 2 : 4;
-
-        static constexpr int SmemLayoutStageStrideA = kKernelStrategy == KernelStrategy::OverlapMainloop || kKernelStrategy == KernelStrategy::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_M * BLOCK_K;
-        static constexpr int SmemLayoutStageStrideB = kKernelStrategy == KernelStrategy::OverlapMainloop || kKernelStrategy == KernelStrategy::OverlapPrologue ? (BLOCK_M + BLOCK_N) * BLOCK_K : BLOCK_N * BLOCK_K;
-        using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false, SmemLayoutStageStrideA>;
-        using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true, SmemLayoutStageStrideB>;
-        // using t1 = DefaultOperandB::xhzhao;
-        // A
-        using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
-        using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
-        using GmemTiledCopyA = typename DefaultOperandA::GmemTiledCopy;
-        // B
-        using SmemLayoutAtomB = typename DefaultOperandB::SmemLayoutAtom; // N, K
-        using SmemCopyAtomB = typename DefaultOperandB::SmemCopyAtom;
-        using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
-
-        // Mainloop
-        using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-            ArchTag,
-            DispatchPolicy, TileShape,
-            ElementA, cutlass::detail::TagToStrideA_t<LayoutA>,
-            ElementB, cutlass::detail::TagToStrideB_t<LayoutB>,
-            TiledMma,
-            GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,  // A
-            GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity   // B
-        >;
-
-        // Epilogue
-        static constexpr bool IsAligedN = SHAPE_N % BLOCK_N == 0 ? true : false;
-        using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
-            cutlass::detail::TagToStrideA_t<LayoutC>,
-            cutlass::detail::TagToStrideA_t<LayoutC>,
-            cutlass::epilogue::thread::LinearCombination<ElementC, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,
-            cutlass::gemm::EpilogueDefault,
-            IsAligedN>;
-
-        static constexpr int AlignmentC = 16 / sizeof(ElementC);
-        using DefaultOperation = cutlass::epilogue::fusion::LinearCombination<ElementD, ElementCompute>;
-        using EpilogueSchedule = typename cutlass::epilogue::EpilogueSimtVectorized;
-        using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
-            ArchTag, cutlass::arch::OpClassTensorOp,
-            TileShape, WarpShape,
-            cutlass::epilogue::collective::EpilogueTileAuto,
-            float, float,
-            ElementC, LayoutC, AlignmentC,
-            ElementC, LayoutC, AlignmentC,
-            EpilogueSchedule,
-            DefaultOperation
-        >::CollectiveOp;
-
-        static constexpr bool EpilogueWithTsm = false;
-        using CollectiveEpilogue = typename cutlass::platform::conditional<
-            EpilogueWithTsm,
-            CollectiveEpilogue_withTsm,
-            CollectiveEpilogue_noTsm
-        >::type;
+template <typename Output, int Splits>
+__device__ void model_810e_reduce(const Model810eReduceParams p) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= p.count) return;
+    float value = 0.0f;
+    #pragma unroll
+    for (int s = 0; s < Splits; ++s)
+        value += p.partial[int64_t(s) * p.count + i];
+    // BF16 conversion occurs only after all FP32 split partials are summed.
+    static_cast<Output*>(p.d)[i] = Output(value);
+}
 
 
-        using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, kNumGroups>;
-        using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
-            Shape<int,int,int,int>,
-            CollectiveMainloop,
-            CollectiveEpilogue,
-            TileScheduler,
-            kEnableSboOverlap>;
-
-        using StrideA = typename GemmKernel::StrideA;
-        using StrideB = typename GemmKernel::StrideB;
-        using StrideC = typename GemmKernel::StrideC;
-        using StrideD = typename GemmKernel::StrideD;
-
-        StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)shape_m, (int)SHAPE_K, 1));
-        StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape((int)SHAPE_N, (int)SHAPE_K, 1));
-        StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape((int)shape_m, (int)SHAPE_N, 1));
-
-        int* layout_info = grouped_layout;
-        // compute block_m_info
-        if (TileScheduler::kIsNoPadPreprocessLayout) {
-            uint32_t block_size = max(32, math::next_power_of_two(kNumGroups));
-            computeBlockInfoKernel<BLOCK_M><<<1, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(grouped_layout), kNumGroups, reinterpret_cast<uint32_t*>(block_m_info));
-            layout_info = block_m_info;
-        }
-
-        auto stride_C = stride_D;
-
-        int max_blocks_per_cu = compute_occupancy_for_kernel<GemmKernel>();
-
-        cutlass::KernelHardwareInfo hw_info;
-        hw_info.device_id = 0;
-        hw_info.cu_count = num_sms * max_blocks_per_cu;
-
-        typename GemmKernel::Arguments arguments{
-            cutlass::gemm::GemmUniversalMode::kGemm,
-            {shape_m, SHAPE_N, SHAPE_K, 1},
-            {(ElementA*)gmem_a, stride_A, (ElementB*)gmem_b, stride_B},
-            {{1.0f, 0.0f}, (ElementC*)gmem_d, stride_C, (ElementD*)gmem_d, stride_D},
-            hw_info, {shape_m, layout_info}, signal
-        };
-
-        arguments.epilogue.thread.alpha = 1;
-        arguments.epilogue.thread.beta = 0;
-        auto params = GemmKernel::to_underlying_arguments(arguments, nullptr);
-
-        dim3 const block = GemmKernel::get_block_shape();
-        dim3 const grid = GemmKernel::get_grid_shape(params);
-        int smem_size_kernel = GemmKernel::SharedStorageSize;
-
-        // std::cout << "block = " << block << std::endl;
-        // std::cout << "grid = " << grid << std::endl;
-        // std::cout << "smem_size_kernel = " << smem_size_kernel << std::endl;
-        // std::cout << "max_blocks_per_cu = " << max_blocks_per_cu << std::endl;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()){
-            dg_prof_params.set_params(
-                kGemmType, false, std::string("bf16"), kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m,
-                grouped_layout, stream
-            );
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-        cutlass::device_kernel<GemmKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-        int max_active_tb_num = max_blocks_per_cu;
-        const int threadblock_count = num_sms < 20 ? num_sms : num_sms * max_active_tb_num;
-        char *pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            hggcFuncAttributes attr;
-            hggcFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
-
-            printf("[GemmGrouped-BF16: bf16_gemm_cutlass3.cuh]\n");
-            printf("group:%d, problem:[%d, %d, %d], expected_m:%d, gemm_type:%s, kernel_strategy:%s, kIsNoPadPreprocessLayout: %d\n",
-                kNumGroups, shape_m, SHAPE_N, SHAPE_K, expected_m, GemmTypeS[static_cast<int>(kGemmType)], KernelStrategyS[static_cast<int>(kKernelStrategy)], TileScheduler::kIsNoPadPreprocessLayout);
-
-            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
-                BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);
-
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms, max_active_tb_num, threadblock_count);
-
-            printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
+template <class Mainloop, typename Output, int Splits>
+struct Model810eDenseKernel {
+    template <class Params>
+    CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
+        using namespace cute;
+        using Tile = typename Mainloop::TileShape;
+        using Mma = typename Mainloop::TiledMma;
+        constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{}), BK = size<2>(Tile{});
+        const int m = get<0>(p.problem_shape), n = get<1>(p.problem_shape);
+        const int k = get<2>(p.problem_shape);
+        const int mi = int(blockIdx.y), ni = int(blockIdx.x), split = int(blockIdx.z);
+        // Partition complete BK tiles. The API enforces K%BK=0 and at least one
+        // tile per split, so AIU never reads across a logical row's K boundary.
+        const int begin = ((k / BK) * split / Splits) * BK;
+        const int length = ((k / BK) * (split + 1) / Splits) * BK - begin;
+        auto problem = make_shape(m, n, length, 1);
+        auto coord = make_coord(mi, ni, _, 0);
+        Mainloop loop(p.mainloop, take<0, 3>(problem));
+        auto inputs = loop.load_init(problem, coord, p.mainloop, 0, 0,
+                                     p.mainloop.ptr_A + begin, p.mainloop.ptr_B + begin);
+        auto gA = get<0>(inputs);
+        auto residue = make_tuple(m - mi * BM, n - ni * BN,
+                                  length - size<1>(gA) * size<2>(gA));
+        Mma mma;
+        auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
+        clear(accum);
+        auto iter = make_coord_iterator(shape<2>(gA));
+        loop(accum, inputs, accum, iter, size<2>(gA), residue,
+             int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
+        auto coords = mma.get_slice(int(threadIdx.x)).partition_C(
+            make_identity_tensor(make_shape(Int<BM>{}, Int<BN>{})));
+        CUTE_UNROLL
+        for (int i = 0; i < size(accum); ++i) {
+            const int row = mi * BM + get<0>(coords(i));
+            const int col = ni * BN + get<1>(coords(i));
+            if (row < m && col < n) {
+                const int64_t offset = int64_t(row) * n + col;
+                if constexpr (Splits == 1)
+                    p.epilogue.ptr_D[offset] = Output(accum(i));
+                else
+                    static_cast<float*>(p.workspace)[int64_t(split) * m * n + offset] = accum(i);
+            }
         }
     }
 };
 
-};  // namespace deep_gemm
+template <class Mainloop>
+struct Model810eBatchedKernel {
+    template <class Params>
+    CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
+        using namespace cute;
+        using Tile = typename Mainloop::TileShape;
+        using Mma = typename Mainloop::TiledMma;
+        constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{});
+        const int m = get<0>(p.problem_shape), n = get<1>(p.problem_shape);
+        const int k = get<2>(p.problem_shape);
+        const int batch = int(blockIdx.z), mi = int(blockIdx.y), ni = int(blockIdx.x);
+        auto problem = make_shape(m, n, k, 1);
+        auto coord = make_coord(mi, ni, _, 0);
+        Mainloop loop(p.mainloop, take<0, 3>(problem));
+        auto inputs = loop.load_init(problem, coord, p.mainloop, 0, 0,
+            p.mainloop.ptr_A + int64_t(batch) * get<2>(p.mainloop.dA),
+            p.mainloop.ptr_B + int64_t(batch) * get<2>(p.mainloop.dB));
+        auto gA = get<0>(inputs);
+        auto residue = make_tuple(m - mi * BM, n - ni * BN,
+                                  k - size<1>(gA) * size<2>(gA));
+        Mma mma;
+        auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
+        clear(accum);
+        auto iter = make_coord_iterator(shape<2>(gA));
+        loop(accum, inputs, accum, iter, size<2>(gA), residue,
+             int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
+        // TiledMma supplies the 810E lane mapping; CUDA/890P formulas differ.
+        auto coords = mma.get_slice(int(threadIdx.x)).partition_C(
+            make_identity_tensor(make_shape(Int<BM>{}, Int<BN>{})));
+        CUTE_UNROLL
+        for (int i = 0; i < size(accum); ++i) {
+            const int row = mi * BM + get<0>(coords(i));
+            const int col = ni * BN + get<1>(coords(i));
+            if (row < m && col < n) {
+                const int64_t offset = int64_t(batch) * get<2>(p.epilogue.dD) +
+                                       int64_t(row) * get<0>(p.epilogue.dD) + col;
+                p.epilogue.ptr_D[offset] = cutlass::bfloat16_t(accum(i));
+            }
+        }
+    }
+};
 
-#pragma clang diagnostic pop
+template <class Base, bool StaticK256 = false>
+struct Model810eFirstKPeel : Base {
+    using Base::Base;
+    template <class... Args>
+    CUTLASS_DEVICE void operator()(Args&&... args) {
+        Base::template operator()<true, StaticK256>(static_cast<Args&&>(args)...);
+    }
+};
+
+// Input descriptors retain the caller's row strides. Batch and split-K both
+// use grid.z, but only batch changes input bases; split-K changes the K interval.
+template <class Mainloop, class Epilogue, bool SplitK, int Splits, bool GridMFirst, bool StaticM36 = false>
+struct Model810eTsmKernel {
+    template <class Params>
+    CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
+        using namespace cute;
+        using Tile = typename Mainloop::TileShape;
+        using Mma = typename Mainloop::TiledMma;
+        constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{}), BK = size<2>(Tile{});
+        const int m = StaticM36 ? 36 : get<0>(p.problem_shape), n = StaticM36 ? 512 : get<1>(p.problem_shape);
+        const int k = StaticM36 ? 256 : get<2>(p.problem_shape), groups = get<3>(p.problem_shape);
+        const int mi = GridMFirst ? int(blockIdx.x) : int(blockIdx.y);
+        const int ni = GridMFirst ? int(blockIdx.y) : int(blockIdx.x);
+        const int zi = int(blockIdx.z);
+        const int begin = SplitK ? ((k / BK) * zi / Splits) * BK : 0;
+        const int length = SplitK ? ((k / BK) * (zi + 1) / Splits) * BK - begin : k;
+        const auto* ptr_a = p.mainloop.ptr_A + (SplitK ? int64_t(begin) : int64_t(zi) * get<2>(p.mainloop.dA));
+        const auto* ptr_b = p.mainloop.ptr_B + (SplitK ? int64_t(begin) : int64_t(zi) * get<2>(p.mainloop.dB));
+        const auto input_problem = make_shape(m, n, length, 1);
+        const auto input_coord = make_coord(mi, ni, _, 0);
+        Mainloop loop(p.mainloop, take<0, 3>(input_problem));
+        auto inputs = loop.load_init(input_problem, input_coord, p.mainloop, 0, 0, ptr_a, ptr_b);
+        auto gA = get<0>(inputs);
+        auto residue = make_tuple(m - mi * BM, n - ni * BN,
+                                  length - size<1>(gA) * size<2>(gA));
+        Mma mma;
+        auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
+        clear(accum);
+        auto iter = make_coord_iterator(shape<2>(gA));
+        loop(accum, inputs, accum, iter, size<2>(gA), residue,
+             int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
+
+        // The AIU mainloop ends with cp_async_wait<0>() and __syncthreads().
+        // Reuse its storage for the software-swizzled epilogue only after that
+        // barrier. These are fresh register writes, not reads of AIU data.
+        auto& epi_storage = *reinterpret_cast<typename Epilogue::SharedStorage*>(smem);
+        Epilogue epilogue{p.epilogue, epi_storage};
+        // Output strides and z coordinate are real. For split-K the host builds
+        // a FLOAT epilogue and D[splits,M,N], so no partial BF16 rounding occurs.
+        epilogue(make_shape(m, n, length, groups), Tile{}, make_coord(mi, ni, _, zi),
+                 accum, mma, residue, int(threadIdx.x), smem);
+    }
+};
+
+} // namespace deep_gemm

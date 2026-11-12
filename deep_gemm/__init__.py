@@ -10,12 +10,12 @@ if not os.path.isfile(os.path.join(PPU_HOME, 'bin', 'hgcc')):
     if compiler:
         PPU_HOME = os.path.dirname(os.path.dirname(os.path.realpath(compiler)))
 
-from . import jit
 from . import deep_gemm_tuner
-from . import deep_gemm_cpp
+from . import _C
 
 # Configs
-from .deep_gemm_cpp import (
+from ._C import (
+    use_deterministic_algorithms,
     set_num_sms,
     get_num_sms,
     set_tc_util,
@@ -29,7 +29,7 @@ from .deep_gemm_cpp import (
 )
 
 # Layout utilities
-from .deep_gemm_cpp import (
+from ._C import (
     transform_sf_into_required_layout,
     get_mn_major_tma_aligned_tensor,
     get_col_major_tensor,
@@ -37,18 +37,21 @@ from .deep_gemm_cpp import (
 )
 
 # acblasLt GEMMs
-from .deep_gemm_cpp import (
+from ._C import (
     acblaslt_gemm_nt, acblaslt_gemm_nn,
     acblaslt_gemm_tn, acblaslt_gemm_tt,
 )
 
 # DeepGEMM Kernels
-from .deep_gemm_cpp import (
+from ._C import (
     # BF16 GEMMs
     bf16_gemm_nt,
     bf16_gemm_nn,
     bf16_gemm_tn,
     bf16_gemm_tt,
+    bf16_gemm_strided_batched_nt,
+    gemm_fp32_fp32_fp32_nt,
+    k_grouped_bf16_gemm_tn_contiguous,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
     m_grouped_bf16_gemm_nt_nopad,
@@ -89,9 +92,15 @@ from .deep_gemm_cpp import (
     preprocess_mxfp4_weight_for_act_and_quant_fusing,
     PreprocessMode,
     # W4FA8 (mxfp4 weights, per-row FP8 activation)
+    fp8_fp4_gemm_nt,
     m_grouped_gemm_fp8_fp4_bf16_nt_nopad,
     m_grouped_gemm_fp8_fp4_bf16_nt_masked,
     m_grouped_gemm_fp8_fp4_bf16_nt_fused,
+    # W4A8 (NVFP4 weights, FP8 activation, BF16 output)
+    gemm_fp8_nvfp4_bf16_nt,
+    m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad,
+    m_grouped_gemm_fp8_nvfp4_bf16_nt_masked,
+    m_grouped_gemm_fp8_nvfp4_bf16_nt_fused,
     # A8W4 INT8 GEMMs / device weight preprocessing
     m_grouped_gemm_int8_int4_bf16_nt_masked,
     m_grouped_gemm_int8_int4_bf16_nt_nopad,
@@ -103,17 +112,17 @@ from .deep_gemm_cpp import (
     # Hyperconnection kernels
     tf32_hc_prenorm_gemm,
     mega_mhc,
+    bf16_mega_gate,
     # Einsum kernels
     fp8_einsum,
     int8_einsum,
     # Attention kernels (MQA logits)
-    bf16_mqa_logits,
+    get_mqa_logits_metadata,
     int8_mqa_logits,
     fp8_mqa_logits,
     fp8_fp4_mqa_logits,
     # Attention kernels (paged MQA logits)
     get_paged_mqa_logits_metadata,
-    bf16_paged_mqa_logits,
     int8_paged_mqa_logits,
     fp8_paged_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -121,6 +130,7 @@ from .deep_gemm_cpp import (
     fp8_fp4_mqa_avg_logits,
     fp8_mqa_avg_logits,
     fp8_paged_mqa_avg_logits,
+    fp8_fp4_paged_mqa_avg_logits,
     # Attention kernels (sparse MQA logits)
     get_sparse_mqa_logits_metadata,
     fp8_fp4_sparse_mqa_logits,
@@ -128,18 +138,19 @@ from .deep_gemm_cpp import (
     fp8_fp4_paged_sparse_mqa_logits,
 )
 
-deep_gemm_cpp.init(
+from ._C import epilogue
+
+_C.init(
     os.path.dirname(os.path.abspath(__file__)), # Library root directory path
     PPU_HOME         # SDK root
 )
 
 
 # Unimplemented kernels are instead routed to a unified `unimplemented` function below.
-# from .deep_gemm_cpp import (
+# from ._C import (
 #     # K-Grouped
 #     k_grouped_fp8_gemm_nt_contiguous,
 #     k_grouped_fp8_gemm_tn_contiguous,
-#     k_grouped_bf16_gemm_tn_contiguous,
 
 #     # a8w4 M-Grouped NN
 #     m_grouped_fp8_fp4_gemm_nn_contiguous,
@@ -156,7 +167,6 @@ def unimplemented(*args, **kwargs):
 # API names for kernels not yet ported to the PPU build -> unimplemented
 k_grouped_fp8_gemm_nt_contiguous = unimplemented
 k_grouped_fp8_gemm_tn_contiguous = unimplemented
-k_grouped_bf16_gemm_tn_contiguous = unimplemented
 m_grouped_fp8_gemm_nn_contiguous = unimplemented
 fp8_gemm_nt_skip_head_mid = unimplemented
 
@@ -225,7 +235,7 @@ m_grouped_gemm_fp4_fp4_bf16_nt_nopad = m_grouped_fp4_gemm_nt_nopad
 m_grouped_gemm_fp4_fp4_bf16_nt_fused = m_grouped_fp4_gemm_nt_fused
 
 # --- FP8 FP4 dense GEMM ---
-fp8_fp4_gemm_nt = unimplemented
+gemm_fp8_fp4_bf16_nt = fp8_fp4_gemm_nt
 fp8_fp4_gemm_nn = unimplemented
 fp8_fp4_gemm_tn = unimplemented
 fp8_fp4_gemm_tt = unimplemented
@@ -234,6 +244,18 @@ fp8_fp4_gemm_tt = unimplemented
 m_grouped_fp8_fp4_gemm_nt_contiguous = unimplemented
 m_grouped_fp8_fp4_gemm_nn_contiguous = unimplemented
 m_grouped_fp8_fp4_gemm_nt_masked = unimplemented
+
+# Mega kernels
+from .mega import (
+    SymmBuffer,
+    get_symm_buffer_for_mega_moe,
+    transform_weights_for_mega_moe,
+    fp4_fp4_mega_moe,
+    mega_moe_pre_dispatch,
+    transform_weights_for_fp8_mega_moe, transform_weights_for_w4a16_mega_moe,
+    fp8_fp8_mega_moe, bf16_fp4_mega_moe,
+    transform_weights_for_w4a8_mega_moe, fp8_fp4_mega_moe,
+)
 
 # Some utils
 from . import testing
