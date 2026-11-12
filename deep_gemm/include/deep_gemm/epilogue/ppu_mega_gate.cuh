@@ -17,10 +17,16 @@ __device__ __forceinline__ void device_check(bool condition) {
 }
 
 // Store GEMM scores and defer any invalid-score trap until synchronization completes.
+template <bool UnsplitSigmoid>
 __device__ __forceinline__ void store_checked_scores(float* dst, float lo, float hi,
                                                       bool check_activated, bool& gate_is_valid) {
-    gate_is_valid &= check_activated ? lo < INFINITY : isfinite(lo);
-    gate_is_valid &= check_activated ? hi < INFINITY : isfinite(hi);
+    if constexpr (UnsplitSigmoid) {
+        // The complete logits may saturate sigmoid to 0 or 1; NaNs remain invalid.
+        gate_is_valid &= !isnan(lo) && !isnan(hi);
+    } else {
+        gate_is_valid &= check_activated ? lo < INFINITY : isfinite(lo);
+        gate_is_valid &= check_activated ? hi < INFINITY : isfinite(hi);
+    }
     *reinterpret_cast<float2*>(dst) = make_float2(lo, hi);
 }
 

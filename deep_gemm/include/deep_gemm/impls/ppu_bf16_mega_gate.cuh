@@ -473,7 +473,7 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
                 const int expert = expert_base + warp_n * WarpN + ni * 16 + (lane % 4) * 2 + (r / 4) * 8;
                 const int64_t score_row = GroupedScores ?
                     (int64_t(token / M) * S + split) * M + token % M : int64_t(token) * S + split;
-                store_checked_scores(a.scratch + score_row * E + expert, lo, hi, check_activated, gate_is_valid);
+                store_checked_scores<UseSigmoid && S == 1>(a.scratch + score_row * E + expert, lo, hi, check_activated, gate_is_valid);
             }
         } else {
         epilogue::WarpKReduce<WarpK, WarpsMN, WarpM / 16, WarpN / 16, 8, Stages * (M + N) * K / 2>::run(
@@ -494,7 +494,7 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
                         const int row = token - a.scratch_token_base;
                         const int64_t score_row = GroupedScores ?
                             (int64_t(row / M) * S + split) * M + row % M : int64_t(row) * S + split;
-                        store_checked_scores(a.scratch + score_row * E + expert, acc[mi][ni][r],
+                        store_checked_scores<UseSigmoid && S == 1>(a.scratch + score_row * E + expert, acc[mi][ni][r],
                                              acc[mi][ni][r + 1], check_activated, gate_is_valid);
                     }
                 }
