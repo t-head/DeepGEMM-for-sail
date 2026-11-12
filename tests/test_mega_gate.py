@@ -276,6 +276,14 @@ def test_mega_gate_api_contract() -> None:
     check_case(16, 4096, 128, with_bias=False, with_physical_map=False)
     check_case(129, 4352, 260, with_image_bias=True, with_mask=True, with_unmapped_topk_idx=True)
 
+    # Masked rows may hold non-finite values (e.g. CUDA graph padding)
+    for num_tokens, num_routed_experts in ((16, 256), (129, 384), (1024, 384)):
+        inputs = make_inputs(num_tokens, 4096, num_routed_experts, with_image_bias=True, with_mask=True)
+        masked_idx = (~inputs['mask']).nonzero().flatten()
+        inputs['x'][masked_idx[0::2]] = float('nan')
+        inputs['x'][masked_idx[1::2]] = float('inf')
+        check_correctness(inputs, make_outputs(inputs, with_unmapped_topk_idx=True))
+
     inputs = make_inputs(128, 4096, 384, with_image_bias=True)
     inputs['bias'].fill_(1e8)
     inputs['image_bias'].fill_(-1e8)
@@ -374,6 +382,15 @@ def test_mega_gate_scoring_modes() -> None:
         expected_ids = torch.arange(8, device='cuda').expand(rows, -1)
         assert torch.equal(ids, expected_ids)
         torch.testing.assert_close(weights, torch.full_like(weights, ROUTED_SCALING_FACTOR / 8))
+
+        # Exercise the GLM sigmoid specialization with non-finite graph padding.
+        mask = torch.arange(rows, device='cuda') % 3 == 0
+        inputs['x'][1::3] = float('nan')
+        inputs['x'][2::3] = float('inf')
+        ids, weights = run_mega_gate(inputs, outputs, num_topk=8, scoring_func='sigmoid', mask=mask)
+        assert torch.equal(ids[mask], expected_ids[mask])
+        torch.testing.assert_close(weights[mask], torch.full_like(weights[mask], ROUTED_SCALING_FACTOR / 8))
+        assert (ids[~mask] == -1).all().item() and (weights[~mask] == 0).all().item()
 
 
 @test_filter(is_ppu1v5_device)

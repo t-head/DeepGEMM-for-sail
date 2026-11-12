@@ -18,15 +18,17 @@ __device__ __forceinline__ void device_check(bool condition) {
 
 // Store GEMM scores and defer any invalid-score trap until synchronization completes.
 template <bool UnsplitSigmoid>
-__device__ __forceinline__ void store_checked_scores(float* dst, float lo, float hi,
+__device__ __forceinline__ void store_checked_scores(const KernelArgs& a, int token, float* dst, float lo, float hi,
                                                       bool check_activated, bool& gate_is_valid) {
+    bool valid;
     if constexpr (UnsplitSigmoid) {
         // The complete logits may saturate sigmoid to 0 or 1; NaNs remain invalid.
-        gate_is_valid &= !isnan(lo) && !isnan(hi);
+        valid = !isnan(lo) && !isnan(hi);
     } else {
-        gate_is_valid &= check_activated ? lo < INFINITY : isfinite(lo);
-        gate_is_valid &= check_activated ? hi < INFINITY : isfinite(hi);
+        valid = check_activated ? lo < INFINITY && hi < INFINITY : isfinite(lo) && isfinite(hi);
     }
+    // Masked input may contain NaN/inf. The final MMA tile can extend past the mask allocation.
+    gate_is_valid &= valid || (a.mask && (token >= a.num_tokens || !a.mask[token]));
     *reinterpret_cast<float2*>(dst) = make_float2(lo, hi);
 }
 
