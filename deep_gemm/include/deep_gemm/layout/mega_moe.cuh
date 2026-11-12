@@ -130,7 +130,7 @@ struct MegaMoEBufferLayout {
         topk_idx = allocate(int64_t(capacity) * topk * sizeof(int64_t));
         topk_weights = allocate(int64_t(capacity) * topk * sizeof(float));
         bytes = math::constexpr_align<int64_t>(bytes, 256);
-        // INT8 quantizes the BF16 activation rows after GEMM1.
+        // INT8 computes activations in FP32, then stores BF16 rows for quantization.
         if constexpr (Int8)
             activated = allocate(compact * intermediate * sizeof(uint16_t));
     }

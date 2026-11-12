@@ -47,12 +47,9 @@ struct MegaMoEInt8Kernel {
         typename OperandA::SmemCopyAtom, cute::identity,
         typename OperandB::GmemTiledCopy, typename OperandB::SmemLayoutAtom,
         typename OperandB::SmemCopyAtom, cute::identity>;
-    // Packed BF16 gate/up fragments bound register pressure on wide tiles.
-    static constexpr auto kGatedFragment = WM * WN / 32 >= 128
-        ? epilogue::Int8GatedFragment::GateUpPackedBf16 : epilogue::Int8GatedFragment::GateUpFloat;
     using ActivationEpilogue = epilogue::Int8GatedEpilogue<StrideCD, StrideCD,
         cutlass::epilogue::thread::LinearCombination<cutlass::bfloat16_t, 2, float, float,
-            cutlass::epilogue::thread::ScaleType::Nothing>, ApplyClamp, 4, ActivationLimitBits, kGatedFragment,
+            cutlass::epilogue::thread::ScaleType::Nothing>, ApplyClamp, 4, ActivationLimitBits,
             Activation, BetaBits, LinearBetaBits, AlphaBits, FastMath>;
     using ScatterEpilogue = epilogue::MegaMoEScatterEpilogue<StrideCD, StrideCD,
         cute::Layout<cute::Shape<cute::Int<(BM / WM) * 16>, cute::Int<BN>>,
