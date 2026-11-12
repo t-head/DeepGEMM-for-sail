@@ -1,4 +1,7 @@
 # Ported from DeepGEMM 5081f851 (MIT); backend and architecture gate adapted for PPU.
+import os
+import subprocess
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -395,6 +398,52 @@ def test_mega_gate_scoring_modes() -> None:
 
 @test_filter(is_ppu1v5_device)
 @torch.no_grad()
+def test_mega_gate_sigmoid_routing_controls() -> None:
+    inputs = make_inputs(2, 6144, 132, with_physical_map=False)
+    x, weight = inputs['x'], inputs['weight']
+    x.zero_()
+    x[:, 0] = 1
+    weight.zero_()
+    weight[:8, 0] = torch.arange(-4, 4, device='cuda')
+    inputs['bias'].zero_()
+    inputs['bias'][8:] = 4  # Learned ranking would choose different experts.
+    fixed_ids = torch.tensor([7, 2, 4, 0, 5, 1, 6, 3], device='cuda')
+    fixed = torch.tensor([True, False], device='cuda')
+    expected = normalized_weights(weight[fixed_ids, 0].float().sigmoid(), sigmoid=True)
+    try:
+        for deterministic in (True, False):  # One K split, then multiple splits on M890.
+            deep_gemm.use_deterministic_algorithms(deterministic)
+            outputs = make_outputs(inputs, with_unmapped_topk_idx=True, num_topk=8)
+            logical = outputs['unmapped_topk_idx']
+            logical.copy_(fixed_ids.expand_as(logical))
+            ids, weights = run_mega_gate(inputs, outputs, num_topk=8, scoring_func='sigmoid',
+                                         fix_routing_mask=fixed, force_random=~fixed)
+            assert torch.equal(ids[0], fixed_ids) and torch.equal(logical[0], fixed_ids)
+            torch.testing.assert_close(weights[0], expected, rtol=3e-4, atol=0)
+            assert logical[1].eq(-1).all().item()
+            assert ((ids[1] >= 0) & (ids[1] < weight.size(0))).all().item()
+            assert ids[1].unique().numel() == 8
+            assert ((weights[1] > 0) & (weights[1] <= 1)).all().item()
+    finally:
+        deep_gemm.use_deterministic_algorithms(False)
+
+
+@test_filter(is_ppu1v5_device)
+def test_mega_gate_sigmoid_partial_scores(tmp_path) -> None:
+    # Observe the production validity flag directly: trapping the full kernel would
+    # invalidate the device context used by the rest of the check-in suite.
+    root = Path(__file__).resolve().parents[1]
+    sdk = Path(os.environ.get('PPU_SDK', '/usr/local/PPU_SDK'))
+    binary = tmp_path / 'mega_gate_partial_scores'
+    subprocess.run([str(sdk / 'bin/hgcc'), '-std=c++17', '-arch=ppu_15',
+                    '-I' + str(root / 'deep_gemm/include'),
+                    '-I' + str(root / 'third-party/actlize_v1.0.0/include'),
+                    str(root / 'tests/mega_gate_partial_scores.cu'), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
+
+@test_filter(is_ppu1v5_device)
+@torch.no_grad()
 def test_mega_gate_sigmoid_infinite_logits() -> None:
     # Both token rows and expert columns need physical padding; no caller mask.
     inputs = make_inputs(2, 6144, 132, with_physical_map=False)
@@ -424,6 +473,7 @@ def test_mega_gate_sigmoid_infinite_logits() -> None:
 
 
 if __name__ == '__main__':
+    test_mega_gate_sigmoid_routing_controls()
     test_mega_gate_sigmoid_infinite_logits()
     test_mega_gate_scoring_modes()
     test_mega_gate_api_contract()
