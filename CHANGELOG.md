@@ -9,8 +9,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 ### Added
 
 - **BF16 x FP32 dense GEMM**: adds `bf16xfp32_gemm_nt` (alias `gemm_bf16xfp32`)
-  and `get_gemm_bf16xfp32_workspace`, compatible with the Tencent/hpc-ops
-  `gemm_bf16xfp32` API. Computes `D = x @ (w_high + w_low * scale)^T` on the
+  and `get_gemm_bf16xfp32_workspace`. Computes
+  `D = x @ (w_high + w_low * scale)^T` on the
   BF16 tensor cores with FP32 accumulation, where the FP32 weight is supplied
   as two BF16 matrices (typically `scale = 1/256`, i.e. the BF16 high part plus
   a scaled residual). Inputs are BF16 row-major `[m, k]` activations and
