@@ -186,14 +186,8 @@ gemm_bf16_bf16_bf16_tn = bf16_gemm_tn
 gemm_bf16_bf16_bf16_tt = bf16_gemm_tt
 
 # --- BF16 x FP32 dense GEMM (FP32 weight split into two BF16 parts) ---
-def gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output=False,
-                    use_splitk=True, split_flag=None):
-    """Compatibility wrapper; Split-K controls are ignored on PPU."""
-    if split_flag is not None:
-        if split_flag.dtype != torch.int32:
-            raise RuntimeError("split_flag must be int32")
-        if not split_flag.is_contiguous():
-            raise RuntimeError("split_flag must be contiguous")
+def gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output=False):
+    """BF16 x FP32 GEMM convenience wrapper for the native NT API."""
     return bf16xfp32_gemm_nt(x, w_high, w_low, scale, use_fp32_output)
 
 # --- BF16 M-grouped GEMM ---

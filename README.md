@@ -134,6 +134,13 @@ with contiguous BF16 inputs. On 810E and 890P, `out` supports BF16 or FP32.
 without an explicit configuration, which requires K divisible by 8 and
 16-byte-aligned inputs.
 
+BF16 x FP32 dense GEMM: `deep_gemm.gemm_bf16xfp32(x, w_high, w_low,
+scale, use_fp32_output=False)` computes `x @ (w_high + scale * w_low).T`
+from contiguous BF16 tensors in NT layout, with FP32 accumulation and even N.
+The wrapper accepts only these five arguments and returns BF16 by default
+or FP32 when requested. No external workspace is accepted. The native
+`deep_gemm.bf16xfp32_gemm_nt` additionally accepts optional `configs`.
+
 #### Grouped GEMMs (contiguous layout)
 
 Unlike traditional grouped GEMMs in ACTLIZE, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape.
