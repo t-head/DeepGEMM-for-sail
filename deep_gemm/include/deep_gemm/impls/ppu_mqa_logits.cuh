@@ -1,6 +1,7 @@
 #pragma once
 #include <deep_gemm/tix/cvt.cuh>
 #include <deep_gemm/tix/ld_st.cuh>
+#include <deep_gemm/tix/utils.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 
@@ -20,7 +21,7 @@ class PPUMqaLogits {
 public:
   // Avg variants (kScaleMode != kScaleModeWeights): no per-head weights,
   // logits = sum_h(relu(qk)) * scale_q * k_scale / sqrt(kHeadDim)
-  // (float logits / float weights slot enforced by the Python entry, see jit_kernels/attention.py)
+  // The host passes FP32 q_scale through the weights slot; logits may be FP32 or BF16.
   static constexpr float kInvSqrtHeadDim = kHeadDim == 32 ? 0x1.6a09e6p-3f : (kHeadDim == 64 ? 0x1p-3f : 0x1.6a09e6p-4f);
   static constexpr int BLOCK_M = BLOCK_KV;
   static constexpr int BLOCK_N = BLOCK_QH;
@@ -45,7 +46,7 @@ public:
 #endif
 
   using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementQK,ElementQK,ElementAcc>::type;
-  using MmaK_type = typename cutlass::platform::conditional<sizeof(ElementQK) == 2, _16, _32 >::type;
+  static_assert(sizeof(ElementQK) == 1, "MQA Q/K must use FP8 or INT8 storage");
 
   static constexpr int InstM = 16;
   static constexpr int InstN = 16;
@@ -56,7 +57,7 @@ public:
   using PermutationMNK = Tile<
       Layout<Shape<Int<InstM>, WarpIterM, MmaIterM>, Stride<_1, Int<WARP_M>, Int<InstM>> >,
       Layout<Shape<Int<InstN>, WarpIterN, MmaIterN>, Stride<_1, Int<WARP_N>, Int<InstN>> >,
-      MmaK_type
+      _32
     >;
   using TiledMma = TiledMMA<MMA_Atom<MmaInst>, Layout<Shape<WarpIterM, WarpIterN, _1>>, PermutationMNK>;
 
@@ -311,9 +312,7 @@ public:
             printf("    kv_block_idx = %d, dim_h = %d\n", kv_block_idx, residual_m);
         }
         copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_stage), warp_idx);
-        if constexpr(sizeof(ElementQK) == 1) {
-            copy_aiu(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_stage), warp_idx);
-        }
+        copy_aiu(gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_stage), warp_idx);
         tAgA.data() = tAgA.data() + BLOCK_KV * kHeadDim;
         tSFAgSFA.data() = tSFAgSFA.data() + BLOCK_KV;
     };
@@ -341,13 +340,13 @@ public:
             if constexpr (kWq4) {
                 // Each lane stores only its own parity's kv row in the WARP_Q==4
                 // epilogue, so it only loads that row's scale
-                scale_kv_array[m] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
+                scale_kv_array[m] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
                     scale_kv_array[m] *= kInvSqrtHeadDim;
                 }
             } else {
-                scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
-                scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
+                scale_kv_array[m * 2    ] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
+                scale_kv_array[m * 2 + 1] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
                     scale_kv_array[m * 2    ] *= kInvSqrtHeadDim;
                     scale_kv_array[m * 2 + 1] *= kInvSqrtHeadDim;
@@ -402,10 +401,11 @@ public:
                     const uint32_t q_idx = q_base + local_q_warp;
                     if constexpr (kIsCompressedLogits) {
                         const uint32_t lq = warp_q_idx * WARP_Q + local_q_warp;
-                        const uint32_t rel_kv = kv_offset + mma_offset - seq_k_start[lq];
+                        // Finish the uint32 relative column before adding the row base.
+                        const uint32_t rel_kv = kv_offset + mma_offset + v_offset_mine - seq_k_start[lq];
                         const uint32_t len = seq_k_end[lq] - seq_k_start[lq];
-                        if (rel_kv + v_offset_mine < len)
-                            params.logits[q_idx * params.stride_k + rel_kv + v_offset_mine] = total * scale_kv_r * scale_q_t;
+                        if (rel_kv < len)
+                            params.logits[q_idx * params.stride_k + rel_kv] = total * scale_kv_r * scale_q_t;
                     } else {
                         params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_offset_mine] = total * scale_kv_r * scale_q_t;
                     }
@@ -425,12 +425,14 @@ public:
                 // Store into the global memory
                 const uint32_t& q_idx = block_q_idx * BLOCK_Q + warp_q_idx;
                 if constexpr (kIsCompressedLogits) {
-                    const uint32_t rel_kv = kv_offset + mma_offset - seq_k_start[warp_q_idx];
+                    // Finish each uint32 relative column before adding the row base.
+                    const uint32_t rel_lo = kv_offset + mma_offset + v_0_offset - seq_k_start[warp_q_idx];
+                    const uint32_t rel_hi = kv_offset + mma_offset + v_1_offset - seq_k_start[warp_q_idx];
                     const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
-                    if (rel_kv + v_0_offset < len)
-                        params.logits[q_idx * params.stride_k + rel_kv + v_0_offset] = v_0 * scale_kv_0;
-                    if (rel_kv + v_1_offset < len)
-                        params.logits[q_idx * params.stride_k + rel_kv + v_1_offset] = v_1 * scale_kv_1;
+                    if (rel_lo < len)
+                        params.logits[q_idx * params.stride_k + rel_lo] = v_0 * scale_kv_0;
+                    if (rel_hi < len)
+                        params.logits[q_idx * params.stride_k + rel_hi] = v_1 * scale_kv_1;
                 } else {
                     params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_0_offset] = v_0 * scale_kv_0;
                     params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_1_offset] = v_1 * scale_kv_1;
@@ -475,12 +477,13 @@ public:
                 if constexpr (kIsCompressedLogits) {
                     const uint32_t lq_lo = warp_q_idx * WARP_Q + lane_in_quad / 2;
                     const uint32_t lq_hi = warp_q_idx * WARP_Q + 2 + lane_in_quad / 2;
-                    const uint32_t rel_lo = kv_offset + mma_offset - seq_k_start[lq_lo];
-                    const uint32_t rel_hi = kv_offset + mma_offset - seq_k_start[lq_hi];
-                    if (rel_lo + v_offset_mine < seq_k_end[lq_lo] - seq_k_start[lq_lo])
-                        params.logits[q_idx_lo * params.stride_k + rel_lo + v_offset_mine] = __low2bfloat16(out2);
-                    if (rel_hi + v_offset_mine < seq_k_end[lq_hi] - seq_k_start[lq_hi])
-                        params.logits[q_idx_hi * params.stride_k + rel_hi + v_offset_mine] = __high2bfloat16(out2);
+                    // Finish each uint32 relative column before adding the row base.
+                    const uint32_t rel_lo = kv_offset + mma_offset + v_offset_mine - seq_k_start[lq_lo];
+                    const uint32_t rel_hi = kv_offset + mma_offset + v_offset_mine - seq_k_start[lq_hi];
+                    if (rel_lo < seq_k_end[lq_lo] - seq_k_start[lq_lo])
+                        params.logits[q_idx_lo * params.stride_k + rel_lo] = __low2bfloat16(out2);
+                    if (rel_hi < seq_k_end[lq_hi] - seq_k_start[lq_hi])
+                        params.logits[q_idx_hi * params.stride_k + rel_hi] = __high2bfloat16(out2);
                 } else {
                     params.logits[q_idx_lo * params.stride_k + kv_offset + mma_offset + v_offset_mine] = __low2bfloat16(out2);
                     params.logits[q_idx_hi * params.stride_k + kv_offset + mma_offset + v_offset_mine] = __high2bfloat16(out2);
@@ -511,12 +514,14 @@ public:
                 // Store
                 const uint32_t& q_idx = block_q_idx * BLOCK_Q + warp_q_idx;
                 if constexpr (kIsCompressedLogits) {
-                    const uint32_t rel_kv = kv_offset + mma_offset - seq_k_start[warp_q_idx];
+                    // Finish each uint32 relative column before adding the row base.
+                    const uint32_t rel_lo = kv_offset + mma_offset + v_0_offset - seq_k_start[warp_q_idx];
+                    const uint32_t rel_hi = kv_offset + mma_offset + v_1_offset - seq_k_start[warp_q_idx];
                     const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
-                    if (rel_kv + v_0_offset < len)
-                        params.logits[q_idx * params.stride_k + rel_kv + v_0_offset] = __low2bfloat16(packed);
-                    if (rel_kv + v_1_offset < len)
-                        params.logits[q_idx * params.stride_k + rel_kv + v_1_offset] = __high2bfloat16(packed);
+                    if (rel_lo < len)
+                        params.logits[q_idx * params.stride_k + rel_lo] = __low2bfloat16(packed);
+                    if (rel_hi < len)
+                        params.logits[q_idx * params.stride_k + rel_hi] = __high2bfloat16(packed);
                 } else {
                     params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_0_offset] = __low2bfloat16(packed);
                     params.logits[q_idx * params.stride_k + kv_offset + mma_offset + v_1_offset] = __high2bfloat16(packed);
@@ -626,97 +631,3 @@ public:
 };
 
 } // namespace cutlass::gemm::kernel
-
-
-namespace deep_gemm {
-
-template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights,
-          uint32_t kNumHeads, uint32_t kHeadDim,
-          uint32_t BLOCK_QH, uint32_t BLOCK_KV,
-          uint32_t WARP_QH, uint32_t WARP_KV,
-          uint32_t kNumQStages, uint32_t kNumKVStages,
-          typename StrideKType = uint32_t,
-          bool kIsCompressedLogits = false,
-          uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
-class Attention {
-
-public:
-    Attention() = default;
-
-    static uint32_t generate_id() {
-        static uint32_t id = 0;
-        return ++id;
-    }
-
-    static void run(const ElementQK * ptr_q,
-                    const ElementQK * ptr_k,
-                    const float * k_scales,
-                    // kScaleModeWeights: per-(q, head) weights; kScaleModeQRow: per-Q-row float scale; else unused
-                    const ElementWeights * weights,
-                    uint32_t* cu_seq_len_k_start,
-                    uint32_t* cu_seq_len_k_end,
-                    ElementLogits* logits,
-                    const uint32_t seq_len_q, const uint32_t seq_len_k, const StrideKType stride_k,
-                    hggcStream_t stream, int num_sms) {
-
-        using AttnKernel = cutlass::gemm::kernel::PPUMqaLogits<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNumHeads, kHeadDim, BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages, StrideKType, kIsCompressedLogits, kScaleMode>;
-
-        static constexpr int MaxThreadsPerBlock = AttnKernel::MaxThreadsPerBlock;
-
-        int max_blocks_per_cu = compute_occupancy_for_kernel<AttnKernel>();
-
-        typename AttnKernel::Arguments arguments{ptr_q, ptr_k, k_scales, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
-                                                 seq_len_q, seq_len_k, stride_k};
-        auto params = arguments;
-        dim3 const block(MaxThreadsPerBlock, 1, 1);
-        dim3 const grid(num_sms * max_blocks_per_cu, 1, 1);
-        int smem_size_kernel = AttnKernel::SharedStorageSize;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()){
-            std::string data_type_str = "unknown";
-            if (cute::is_same_v<ElementQK, cutlass::bfloat16_t>) {
-                data_type_str = "bf16";
-            } else if (cute::is_same_v<ElementQK, cutlass::float_e4m3_t>) {
-                data_type_str = "fp8";
-            } else if (cute::is_same_v<ElementQK, int8_t>) {
-                data_type_str = "int8";
-            }
-
-            dg_prof_params.set_mqa_logits_params(data_type_str, seq_len_q, seq_len_k, kNumHeads, kHeadDim, stream,
-                                                  kScaleMode != deep_gemm::kScaleModeWeights);
-            if constexpr (cute::is_same_v<ElementLogits, __ppu_bfloat16>) {
-                dg_prof_params.add_params("logits_dtype", std::string("bf16"));
-            }
-            if constexpr (cute::is_same_v<ElementWeights, __ppu_bfloat16>) {
-                dg_prof_params.add_params("weights_dtype", std::string("bf16"));
-            }
-        }
-
-        int max_active_tb_num = max_blocks_per_cu;
-        const int threadblock_count = num_sms * max_active_tb_num;
-        char *pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            hggcFuncAttributes attr;
-            hggcFuncGetAttributes(&attr, cutlass::device_kernel<AttnKernel>);
-
-            printf("[mqa_logits:]\n");
-            printf("kNumHeads:%u, kHeadDim:%u, seq_len_q:%u, seq_len_k:%u, stride_k:%llu\n",
-                kNumHeads, kHeadDim, seq_len_q, seq_len_k, static_cast<unsigned long long>(stride_k));
-
-            printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n",
-                BLOCK_QH, BLOCK_KV, WARP_QH, WARP_KV, kNumQStages, kNumKVStages);
-
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d, num_threads:%d\n", num_sms, max_active_tb_num, threadblock_count, block.x);
-            printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
-            printf("compressed_logits:%s, ", kIsCompressedLogits ? "true" : "false");
-            printf("weights_bf16:%s\n", cute::is_same_v<ElementWeights, __ppu_bfloat16> ? "true" : "false");
-        }
-
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-        cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-    }
-};
-
-};  // namespace deep_gemm

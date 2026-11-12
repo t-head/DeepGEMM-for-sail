@@ -4,7 +4,6 @@ from typing import Tuple
 import os
 import argparse
 import torch.multiprocessing as mp
-import copy
 
 import deep_gemm
 from deep_gemm import bench_kineto, get_m_alignment_for_contiguous_layout, get_col_major_tensor
@@ -12,6 +11,7 @@ from deep_gemm import bench_kineto, get_m_alignment_for_contiguous_layout, get_c
 from deep_gemm.utils.math import ceil_div
 from deep_gemm.testing.numeric import calc_diff
 from deep_gemm import get_num_sms
+from deep_gemm.deep_gemm_tuner.search_space import get_search_space
 from utils import read_numbers_from_file, parse_dump_file, parse_deepgemm_string_re, judge_device_type
 from utils import construct, construct_contiguous_grouped, construct_grouped_masked, split_list_into_groups
 from utils import SMEM_CONFIG_UNUSED
@@ -258,183 +258,6 @@ def test_m_grouped_gemm_nopad(d: torch.dtype, args = None) -> None:
     else:
         test_func_nopad(cycle, 0, m, n, k, d, tile_list, x, y, out, m_indices, distribute, ref_out)
     return
-
-def get_search_space(d: torch.dtype, gemm_type : str, m:int=0, n:int=0, k:int=0) -> list:
-
-    assert gemm_type in ('nopad', 'masked', 'dense','contiguous')
-
-    block_k = 64 if d == torch.bfloat16 else 128
-    tile_list = [
-        # blockM = 16
-        [16, 64, 16, 16, block_k, 2],
-        [16, 64, 16, 16, block_k, 3],
-        [16, 64, 16, 16, block_k, 4],
-        [16, 64, 16, 16, block_k, 5],
-        [16, 64, 16, 16, block_k * 2, 2],
-        [16, 64, 16, 16, block_k * 2, 3],
-        [16, 64, 16, 16, block_k * 2, 4],
-        [16, 64, 16, 16, block_k * 2, 5],
-
-        [16, 128, 16, 32, block_k, 2],
-        [16, 128, 16, 32, block_k, 3],
-        [16, 128, 16, 32, block_k, 4],
-        [16, 128, 16, 32, block_k * 2, 2],
-        [16, 128, 16, 32, block_k * 2, 3],
-        [16, 128, 16, 32, block_k * 2, 4],
-        [16, 128, 16, 16, block_k, 2],
-        [16, 128, 16, 16, block_k, 3],
-        [16, 128, 16, 16, block_k, 4],
-        [16, 128, 16, 16, block_k * 2, 2],
-        [16, 128, 16, 16, block_k * 2, 3],
-        [16, 128, 16, 16, block_k * 2, 4],
-
-        [16, 256, 16, 64, block_k, 2],
-        [16, 256, 16, 64, block_k, 3],
-        [16, 256, 16, 64, block_k * 2, 2],
-        [16, 256, 16, 64, block_k * 2, 3],
-
-
-        # blockM = 32
-        [32, 64, 16, 32, block_k, 2],
-        [32, 64, 16, 32, block_k, 3],
-        [32, 64, 16, 32, block_k, 4],
-        [32, 64, 16, 32, block_k, 5],
-        [32, 64, 16, 32, block_k * 2, 2],
-        [32, 64, 16, 32, block_k * 2, 3],
-        [32, 64, 16, 32, block_k * 2, 4],
-        [32, 64, 16, 16, block_k, 2],
-        [32, 64, 16, 16, block_k, 3],
-        [32, 64, 16, 16, block_k * 2, 2],
-        [32, 64, 16, 16, block_k * 2, 3],
-
-        [32, 128, 16, 64, block_k, 2],
-        [32, 128, 16, 64, block_k, 3],
-        [32, 128, 16, 64, block_k, 4],
-        [32, 128, 16, 64, block_k * 2, 2],
-        [32, 128, 16, 64, block_k * 2, 3],
-        [32, 128, 16, 32, block_k, 2],
-        [32, 128, 16, 32, block_k, 3],
-        [32, 128, 16, 32, block_k * 2, 2],
-        [32, 128, 16, 32, block_k * 2, 3],
-
-        [32, 256, 16, 64, block_k, 2],
-        [32, 256, 16, 64, block_k, 3],
-        [32, 256, 16, 64, block_k * 2, 2],
-        [32, 256, 16, 64, block_k * 2, 3],
-
-
-        # blockM = 48
-        [48, 64, 16, 16, block_k, 2],
-        [48, 64, 16, 16, block_k * 2, 2],
-        [48, 64, 16, 16, block_k, 3],
-        [48, 64, 16, 16, block_k * 2, 3],
-        [48, 64, 16, 32, block_k, 2],
-        [48, 64, 16, 32, block_k * 2, 2],
-        [48, 64, 16, 32, block_k, 3],
-        [48, 64, 16, 32, block_k * 2, 3],
-
-        [48, 128, 48, 32, block_k, 2],
-        [48, 128, 48, 32, block_k * 2, 2],
-        [48, 128, 48, 32, block_k, 3],
-        [48, 128, 48, 32, block_k * 2, 3],
-
-
-        # blockM = 64
-        [64, 64, 32, 32, block_k, 2],
-        [64, 64, 32, 32, block_k, 3],
-        [64, 64, 32, 32, block_k, 4],
-        [64, 64, 32, 32, block_k * 2, 2],
-        [64, 64, 32, 32, block_k * 2, 3],
-        [64, 64, 32, 32, block_k * 2, 4],
-
-        [64, 128, 32, 64, block_k, 2],
-        [64, 128, 32, 64, block_k, 3],
-        [64, 128, 32, 32, block_k, 2],
-        [64, 128, 32, 32, block_k, 3],
-        [64, 128, 32, 64, block_k * 2, 2],
-        [64, 128, 32, 64, block_k * 2, 3],
-        [64, 128, 32, 32, block_k * 2, 2],
-        [64, 128, 32, 32, block_k * 2, 3],
-
-        [64, 256, 32, 64, block_k, 2],
-        [64, 256, 32, 64, block_k, 3],
-        [64, 256, 32, 64, block_k * 2, 2],
-        [64, 256, 32, 64, block_k * 2, 3]
-    ]
-
-    if 'dense' in gemm_type:
-        tile_list.extend([
-            # blockM = 128
-            [128, 128, 64, 64, block_k    , 2],
-            [128, 128, 64, 64, block_k    , 3],
-            [128, 128, 64, 64, block_k    , 4],
-            [128, 128, 64, 64, block_k * 2, 3],
-            [128, 256, 64, 64, block_k    , 2],
-            [128, 256, 64, 64, block_k    , 3],
-
-            # blockM = 160
-            [160, 128, 80, 64, block_k    , 2],
-            [160, 128, 80, 64, block_k    , 3],
-            [160, 128, 80, 64, block_k    , 4],
-            [160, 128, 80, 64, block_k * 2, 3],
-            [160, 256, 80, 64, block_k    , 2],
-            [160, 256, 80, 64, block_k    , 4],
-
-            # blockM = 192
-            [192, 128, 48, 64, block_k    , 2],
-            [192, 128, 48, 64, block_k    , 3],
-            [192, 128, 48, 64, block_k    , 4],
-            [192, 128, 48, 64, block_k * 2, 3],
-            [192, 256, 48, 64, block_k    , 2],
-            [192, 256, 48, 64, block_k    , 4],
-
-            # blockM = 256
-            [256, 64, 32, 64, block_k,      2],
-            [256, 64, 32, 64, block_k,      3],
-            [256, 64, 32, 64, block_k * 2,  2],
-            [256, 64, 32, 64, block_k * 2,  3],
-            [256, 128, 64, 64, block_k    , 2],
-            [256, 128, 64, 64, block_k    , 3],
-            [256, 128, 64, 64, block_k    , 4],
-            [256, 256, 64, 64, block_k,     4],
-
-            # blockM = 320
-            [320, 128, 80, 64, block_k    , 2],
-            [320, 128, 80, 64, block_k    , 3],
-            [320, 128, 80, 64, block_k    , 4],
-            [320, 256, 80, 64, block_k    , 2],
-            [320, 256, 80, 64, block_k    , 3],
-
-            # blockK = 64B
-            [128, 128, 64, 64, int(block_k / 2), 2],
-            [128, 256, 64, 64, int(block_k / 2), 2],
-            [256, 128, 64, 64, int(block_k / 2), 2],
-        ])
-
-    tile_list_rtn = []
-    if d == torch.float8_e4m3fn:
-        for tile in tile_list:
-            if tile[0] in (16, 32, 64, 128, 192) and tile[4] == block_k:
-                tile_list_rtn.append(tile)
-                # if tile[4] == block_k and tile[0] != 192:
-                #     tile_copy = copy.deepcopy(tile)
-                #     tile_copy[4] = int(block_k / 2)
-                #     tile_list_rtn.append(tile_copy)
-        return tile_list_rtn
-
-    # add block_k / 2 tile for k <256
-    if k != 0 and k <= 512:
-        for tile in tile_list:
-            tile_list_rtn.append(tile)
-            if tile[4] == block_k:
-                tile_copy = copy.deepcopy(tile)
-                tile_copy[4] = int(block_k / 2)
-                tile_list_rtn.append(tile_copy)
-    else:
-        tile_list_rtn = tile_list
-
-    return tile_list_rtn
-
 
 def get_tile_list(d: torch.dtype, m: int, n: int, k: int, num_groups: int, gemm_type: str=None):
     """

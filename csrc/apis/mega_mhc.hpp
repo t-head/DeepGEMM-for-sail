@@ -7,7 +7,6 @@
 #include <cmath>
 #include <climits>
 #include <cstdint>
-#include <list>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -15,38 +14,34 @@
 #include <utility>
 #include <vector>
 #include "../jit_kernels/impls/mega_mhc.hpp"
+#include "../utils/math.hpp"
 
 namespace deep_gemm::mega_mhc {
 
 static int select_num_splits(int tokens, int sms, int iterations) {
     if (iterations == 20 && tokens >= 128 && tokens <= 32768) {
-        const int groups = (tokens + 31) / 32, capacity = 8 * sms;
+        const int groups = ceil_div(tokens, 32), capacity = 8 * sms;
         if (tokens >= 1024 && tokens % 32 == 0)
             return groups * 9 <= capacity ? 18 : 16;
         for (int splits : {80, 40, 32, 16, 12, 10, 8})
             if (groups * (splits / 2) <= capacity) return splits;
         int selected = 16, best = INT_MAX;
         for (int splits : {8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 40}) {
-            const int waves = (groups * (splits / 2) + capacity - 1) / capacity;
-            const int cost = 3 * waves * ((160 + splits - 1) / splits) + splits;
+            const int waves = ceil_div(groups * (splits / 2), capacity);
+            const int cost = 3 * waves * ceil_div(160, splits) + splits;
             if (cost <= best) { best = cost; selected = splits; }
         }
-        const int s16_waves = (groups * 8 + capacity - 1) / capacity;
+        const int s16_waves = ceil_div(groups * 8, capacity);
         if (groups > capacity && 30 * s16_waves + 16 <= best + 2) selected = 16;
         return selected;
     }
-    const int blocks = std::max(1, (tokens + 63) / 64);
+    const int blocks = std::max(1, ceil_div(tokens, 64));
     if (sms == 39 && blocks <= 2) return 80 / blocks;
     if (sms == 39 && blocks == 16) return 8;
     return std::max(1, std::min(16, 20 * sms / blocks));
 }
 
-struct Workspace {
-    torch::Tensor partials, counters;
-};
-using WorkspaceCache = std::list<std::pair<uintptr_t, Workspace>>;
-static constexpr size_t kWorkspaceStreams = 16;
-static std::unordered_map<int, WorkspaceCache> workspaces;
+static std::unordered_map<c10::cuda::CUDAStream, std::vector<torch::Tensor>> counters_by_stream;
 static std::mutex submit_mutex;
 
 static void mega_mhc(
@@ -61,65 +56,103 @@ static void mega_mhc(
     const torch::Tensor& new_comb_res_mix, const std::optional<torch::Tensor>& y_bf16,
     const std::optional<torch::Tensor>& y_fp8, const std::optional<torch::Tensor>& y_gemm_sf,
     const std::optional<torch::Tensor>& y_routed_sf, const std::optional<torch::Tensor>& y_shared_sf,
-    int shared_sf_block_m) {
-    if (y_fp8 || y_gemm_sf || y_routed_sf || y_shared_sf || shared_sf_block_m != 0)
-        throw py::value_error("Mega-mHC only supports shifted BF16 output; FP8 output is not supported");
-    if (!y_bf16) throw py::value_error("Mega-mHC requires y_bf16 output");
-    if (hc_mult != 4 || x.dim() != 2 || !x.is_cuda())
-        throw py::value_error("Mega-mHC requires device x[T,H] and hc_mult=4");
+    int shared_sf_block_m, const std::optional<torch::Tensor>& y_token_sf) {
+    DG_HOST_ASSERT(y_routed_sf.has_value() == y_shared_sf.has_value());
+    DG_HOST_ASSERT(y_bf16.has_value() or y_fp8.has_value());
+    const int num_sf = y_gemm_sf.has_value() + y_routed_sf.has_value() + y_token_sf.has_value();
+    DG_HOST_ASSERT(num_sf == static_cast<int>(y_fp8.has_value()));
+    DG_HOST_ASSERT(y_shared_sf.has_value() ? shared_sf_block_m > 0 : shared_sf_block_m == 0);
+    DG_HOST_ASSERT(hc_mult == 4);
+    DG_HOST_ASSERT(x.dim() == 2 and x.is_cuda());
     const int64_t t64 = x.size(0), h64 = x.size(1);
-    if (h64 != 5120)
-        throw py::value_error("Mega-mHC requires V4.1 Flash hidden=5120");
-    if (t64 > INT_MAX) throw py::value_error("Too many tokens");
+    DG_HOST_ASSERT(h64 == 5120);
+    DG_HOST_ASSERT(t64 <= INT_MAX);
     const int t = t64, h = h64;
-    if (num_sinkhorn_iters < 1 || !std::isfinite(hc_norm_eps) || !std::isfinite(hc_pre_eps) ||
-        !std::isfinite(hc_post_scale) || !std::isfinite(sinkhorn_eps) ||
-        !std::isfinite(rmsnorm_eps) || !std::isfinite(rmsnorm_scale))
-        throw py::value_error("Invalid iteration count or scalar");
-    if (hc_norm_eps <= 0 || sinkhorn_eps <= 0 || rmsnorm_eps <= 0)
-        throw py::value_error("RMS and Sinkhorn epsilons must be positive");
-    const auto dense = [&](const torch::Tensor& v, at::IntArrayRef shape, torch::ScalarType dtype) {
-        if (v.sizes() != shape || v.scalar_type() != dtype || !v.is_contiguous() || v.device() != x.device())
-            throw py::value_error("Invalid Mega-mHC tensor shape, dtype, strides or device");
+    DG_HOST_ASSERT(num_sinkhorn_iters >= 1);
+    DG_HOST_ASSERT(std::isfinite(hc_norm_eps) and std::isfinite(hc_pre_eps) and
+                   std::isfinite(hc_post_scale) and std::isfinite(sinkhorn_eps) and
+                   std::isfinite(rmsnorm_eps) and std::isfinite(rmsnorm_scale));
+    DG_HOST_ASSERT(hc_norm_eps > 0 and sinkhorn_eps > 0 and rmsnorm_eps > 0);
+    const auto check_dense = [&](const torch::Tensor& v, at::IntArrayRef shape, torch::ScalarType dtype) {
+        DG_HOST_ASSERT(v.sizes() == shape);
+        DG_HOST_ASSERT(v.scalar_type() == dtype);
+        DG_HOST_ASSERT(v.is_contiguous());
+        DG_HOST_ASSERT(v.device() == x.device());
     };
-    dense(x, {t, h}, torch::kBFloat16);
-    dense(residual, {t, 4, h}, torch::kBFloat16);
-    dense(post_mix, {t, 4, 1}, torch::kFloat);
-    dense(comb_res_mix, {t, 4, 4}, torch::kFloat);
-    dense(fn, {24, 4 * h}, torch::kFloat);
-    dense(mix_scales, {3}, torch::kFloat);
-    dense(mix_bases, {24}, torch::kFloat);
-    dense(rmsnorm_weight, {h}, torch::kBFloat16);
-    dense(new_residual, {t, 4, h}, torch::kBFloat16);
-    dense(new_post_mix, {t, 4, 1}, torch::kFloat);
-    dense(new_comb_res_mix, {t, 4, 4}, torch::kFloat);
-    dense(shifted_prev_mix, {t, 4, 1}, torch::kFloat);
-    dense(new_prev_mix, {t, 4, 1}, torch::kFloat);
-    dense(*y_bf16, {t, h}, torch::kBFloat16);
+    check_dense(x, {t, h}, torch::kBFloat16);
+    check_dense(residual, {t, 4, h}, torch::kBFloat16);
+    check_dense(post_mix, {t, 4, 1}, torch::kFloat);
+    check_dense(comb_res_mix, {t, 4, 4}, torch::kFloat);
+    check_dense(fn, {24, 4 * h}, torch::kFloat);
+    check_dense(mix_scales, {3}, torch::kFloat);
+    check_dense(mix_bases, {24}, torch::kFloat);
+    check_dense(rmsnorm_weight, {h}, torch::kBFloat16);
+    check_dense(new_residual, {t, 4, h}, torch::kBFloat16);
+    check_dense(new_post_mix, {t, 4, 1}, torch::kFloat);
+    check_dense(new_comb_res_mix, {t, 4, 4}, torch::kFloat);
+    check_dense(shifted_prev_mix, {t, 4, 1}, torch::kFloat);
+    check_dense(new_prev_mix, {t, 4, 1}, torch::kFloat);
+    if (y_bf16.has_value()) check_dense(*y_bf16, {t, h}, torch::kBFloat16);
+    if (y_fp8.has_value()) check_dense(*y_fp8, {t, h}, torch::kFloat8_e4m3fn);
+    if (y_token_sf.has_value()) check_dense(*y_token_sf, {t, 1}, torch::kFloat);
+    const int64_t shared_rows = y_shared_sf.has_value() ?
+        ceil_div<int64_t>(t64, shared_sf_block_m) * align<int64_t>(shared_sf_block_m, 128) : 0;
+    for (const auto& sf : {y_gemm_sf, y_routed_sf, y_shared_sf}) {
+        if (sf.has_value()) {
+            DG_HOST_ASSERT(sf->sizes() == at::IntArrayRef({t, h / 128}));
+            DG_HOST_ASSERT(sf->scalar_type() == torch::kInt);
+            DG_HOST_ASSERT(sf->device() == x.device());
+        }
+    }
+    if (y_gemm_sf.has_value()) {
+        DG_HOST_ASSERT(y_gemm_sf->stride(0) == 1);
+        DG_HOST_ASSERT(y_gemm_sf->stride(1) >= t);
+        DG_HOST_ASSERT(y_gemm_sf->stride(1) % get_tma_aligned_size(1, sizeof(uint32_t)) == 0);
+    }
+    if (y_routed_sf.has_value())
+        DG_HOST_ASSERT(y_routed_sf->is_contiguous());
+    if (y_shared_sf.has_value()) {
+        DG_HOST_ASSERT(y_shared_sf->stride(0) == 1);
+        DG_HOST_ASSERT(y_shared_sf->stride(1) >= shared_rows);
+        const auto required_elements = y_shared_sf->storage_offset() + shared_rows +
+                                       (h / 128 - 1) * y_shared_sf->stride(1);
+        const auto required_bytes = static_cast<uint64_t>(required_elements) * y_shared_sf->element_size();
+        DG_HOST_ASSERT(required_bytes <= y_shared_sf->storage().nbytes());
+    }
     if (!t) return;
     const auto aligned = [](const torch::Tensor& v, uintptr_t bytes) {
         return reinterpret_cast<uintptr_t>(v.data_ptr()) % bytes == 0;
     };
     for (const auto& v : {x, residual, fn, rmsnorm_weight, new_residual,
-                          shifted_prev_mix, post_mix, comb_res_mix, *y_bf16}) {
-        if (!aligned(v, 16))
-            throw py::value_error("Mega-mHC vector inputs and outputs must be 16-byte aligned");
+                          shifted_prev_mix, post_mix, comb_res_mix}) {
+        DG_HOST_ASSERT(aligned(v, 16));
     }
+    if (y_bf16.has_value()) DG_HOST_ASSERT(aligned(*y_bf16, 16));
+    if (y_fp8.has_value()) DG_HOST_ASSERT(aligned(*y_fp8, 8));
 
     using ByteRange = std::pair<uintptr_t, uintptr_t>;
     const auto byte_range = [](const torch::Tensor& v) -> ByteRange {
         const auto begin = reinterpret_cast<uintptr_t>(v.data_ptr());
-        return {begin, begin + v.numel() * v.element_size()};
+        int64_t span = 1;
+        for (int i = 0; i < v.dim(); ++i) span += (v.size(i) - 1) * v.stride(i);
+        return {begin, begin + span * v.element_size()};
     };
     std::vector<ByteRange> output_ranges;
     const auto check_overlap = [&](const ByteRange& range) {
         for (const auto& output : output_ranges) {
-            if (range.first < output.second && output.first < range.second)
-                throw py::value_error("Mega-mHC outputs must not overlap inputs or other outputs");
+            DG_HOST_ASSERT(range.first >= output.second or output.first >= range.second);
         }
     };
-    for (const auto& v : {new_residual, new_post_mix, new_comb_res_mix, *y_bf16, new_prev_mix}) {
+    for (const auto& v : {new_residual, new_post_mix, new_comb_res_mix, new_prev_mix}) {
         const auto range = byte_range(v);
+        check_overlap(range);
+        output_ranges.push_back(range);
+    }
+    for (const auto& v : {y_bf16, y_fp8, y_gemm_sf, y_routed_sf, y_shared_sf, y_token_sf}) {
+        if (!v) continue;
+        auto range = byte_range(*v);
+        if (y_shared_sf && v->data_ptr() == y_shared_sf->data_ptr())
+            range.second = range.first + (shared_rows + (h / 128 - 1) * v->stride(1)) * sizeof(int32_t);
         check_overlap(range);
         output_ranges.push_back(range);
     }
@@ -130,65 +163,61 @@ static void mega_mhc(
     const c10::cuda::CUDAGuard guard(x.device());
     std::lock_guard<std::mutex> lock(submit_mutex);
     const auto* prop = at::cuda::getDeviceProperties(x.get_device());
-    if (prop->major != 8 || prop->minor != 9 || std::string(prop->name).find("M890") == std::string::npos)
-        throw std::runtime_error("Mega-mHC requires Zhenwu M890P");
+    DG_HOST_ASSERT(prop->major == 8 and prop->minor == 9 and std::string(prop->name).find("M890") != std::string::npos);
     const int sms = get_num_sms();
     const int splits = select_num_splits(t, sms, num_sinkhorn_iters);
-    // Graph captures need private buffers to avoid concurrent replay races.
-    Workspace graph_workspace;
-    auto* selected = &graph_workspace;
-    if (c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None) {
-        auto& cache = workspaces[x.get_device()];
-        const auto stream = reinterpret_cast<uintptr_t>(current_stream());
-        const auto it = std::find_if(cache.begin(), cache.end(),
-                                     [&](const auto& entry) { return entry.first == stream; });
-        if (it == cache.end()) {
-            cache.emplace_front(stream, Workspace{});
-            if (cache.size() > kWorkspaceStreams) cache.pop_back();
-        } else {
-            cache.splice(cache.begin(), cache, it);
-        }
-        selected = &cache.front().second;
-    }
-    auto& ws = *selected;
-    const auto ensure_capacity = [&](torch::Tensor& buffer, int64_t count, torch::ScalarType dtype,
-                                     bool zero = false) {
-        if (!buffer.defined() || buffer.numel() < count) {
-            const auto options = x.options().dtype(dtype);
-            buffer = zero ? torch::zeros({count}, options) : torch::empty({count}, options);
-        }
-    };
+    const bool capturing = c10::cuda::currentStreamCaptureStatusMayInitCtx() != c10::cuda::CaptureStatus::None;
+    // Calls sharing a capture stream must execute serially, including graph replays.
+    auto& buffers = counters_by_stream[at::cuda::getCurrentCUDAStream()];
     const bool ring = (splits >= 8 && splits <= 80 && splits % 2 == 0) && t >= 128 && t <= 32768;
-    const int ring_m = splits == 16 && t < 1024 && (t + 15) / 16 <= sms ? 16 : 32;
-    ensure_capacity(ws.partials, ((t64 + 63) / 64) * splits * 64 * 26 +
-        (ring ? (ring_m - t % ring_m) % ring_m * 5 * h / 2 : 0), torch::kFloat);
-    ensure_capacity(ws.counters, (ring ? (t64 + ring_m - 1) / ring_m : (t64 + 63) / 64) + 2, torch::kInt, true);
-    const auto& pre = shifted_prev_mix;
-    const auto& npre = new_prev_mix;
-    const auto& y = *y_bf16;
+    const int ring_m = splits == 16 && t < 1024 && ceil_div(t, 16) <= sms ? 16 : 32;
+    const int64_t num_counters = ceil_div<int64_t>(t64, ring ? ring_m : 64) + 2;
+    if (buffers.empty() || buffers.back().numel() < num_counters) {
+        DG_HOST_ASSERT(not capturing and "Warm up Mega-mHC on the capture stream with sufficient workspace capacity before capture");
+        const int64_t capacity = buffers.empty() ? num_counters :
+            std::max(num_counters, 2 * buffers.back().numel());
+        // Keep previous allocations alive for graphs captured before growth.
+        buffers.push_back(torch::zeros({capacity}, x.options().dtype(torch::kInt)));
+    }
+    const auto& counters = buffers.back();
+    const int64_t num_partials = ceil_div<int64_t>(t64, 64) * splits * 64 * 26 +
+        (ring ? (align<int64_t>(t64, ring_m) - t64) * 5 * h / 2 : 0);
+    const int64_t num_partials_bytes = num_partials * sizeof(float);
+    const int64_t num_bf16_scratch_bytes = y_bf16 ? 0 : t64 * h64 * x.element_size();
+    const auto scratch = torch::empty({num_partials_bytes + num_bf16_scratch_bytes}, x.options().dtype(torch::kByte));
+    const auto y_bf16_storage = y_bf16.has_value() ? *y_bf16 :
+        scratch.narrow(0, num_partials_bytes, num_bf16_scratch_bytes).view(torch::kBFloat16).view({t64, h64});
+    const auto& y_primary_sf = y_token_sf.has_value() ? y_token_sf :
+                               y_routed_sf.has_value() ? y_routed_sf : y_gemm_sf;
     const bool single = num_sinkhorn_iters == 20 && ring;
-    const int groups = (t + ring_m - 1) / ring_m, capacity = 8 * sms;
+    const int groups = ceil_div(t, ring_m), capacity = 8 * sms;
     const bool local = single && groups * (splits / 2) <= capacity;
     int task_splits = 2;
     if (single && !local && t % 32 != 0) {
-        const int fine_waves = (groups * splits + capacity - 1) / capacity;
-        const int pair_waves = (groups * (splits / 2) + capacity - 1) / capacity;
-        if (100 * fine_waves * ((80 + splits - 1) / splits) <
-            98 * pair_waves * ((160 + splits - 1) / splits)) task_splits = 1;
+        const int fine_waves = ceil_div(groups * splits, capacity);
+        const int pair_waves = ceil_div(groups * (splits / 2), capacity);
+        if (100 * fine_waves * ceil_div(80, splits) <
+            98 * pair_waves * ceil_div(160, splits)) task_splits = 1;
     }
     MegaMhcRuntime::Args args{
         {h, splits, num_sinkhorn_iters, ring_m, task_splits, t % 64 == 0,
-         single, local, t % ring_m != 0, t % (ring_m / 8) != 0, local || t != 1248},
-        {dim3(local ? groups : single ? std::min(groups * (splits / task_splits), capacity) : std::min(4 * sms, (t + 63) / 64 * splits),
+         single, local, t % ring_m != 0, t % (ring_m / 8) != 0, local || t != 1248,
+         y_bf16.has_value(), y_fp8.has_value(), shared_sf_block_m, y_token_sf.has_value()},
+        {dim3(local ? groups : single ? std::min(groups * (splits / task_splits), capacity) : std::min(4 * sms, ceil_div(t, 64) * splits),
               local ? splits / 2 : 1),
          dim3(single ? ring_m * 2 : 128), 0},
         {static_cast<const __ppu_bfloat16*>(x.data_ptr()), static_cast<const __ppu_bfloat16*>(residual.data_ptr()),
-         static_cast<const __ppu_bfloat16*>(rmsnorm_weight.data_ptr()), pre.data_ptr<float>(), post_mix.data_ptr<float>(),
+         static_cast<const __ppu_bfloat16*>(rmsnorm_weight.data_ptr()), shifted_prev_mix.data_ptr<float>(), post_mix.data_ptr<float>(),
          comb_res_mix.data_ptr<float>(), fn.data_ptr<float>(), mix_scales.data_ptr<float>(), mix_bases.data_ptr<float>(),
-         static_cast<__ppu_bfloat16*>(new_residual.data_ptr()), static_cast<__ppu_bfloat16*>(y.data_ptr()),
-         npre.data_ptr<float>(), new_post_mix.data_ptr<float>(), new_comb_res_mix.data_ptr<float>(),
-         ws.partials.data_ptr<float>(), ws.counters.data_ptr<int>(), t,
-         hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps, rmsnorm_eps, rmsnorm_scale}};
+         static_cast<__ppu_bfloat16*>(new_residual.data_ptr()), static_cast<__ppu_bfloat16*>(y_bf16_storage.data_ptr()),
+         new_prev_mix.data_ptr<float>(), new_post_mix.data_ptr<float>(), new_comb_res_mix.data_ptr<float>(),
+         static_cast<float*>(scratch.data_ptr()), counters.data_ptr<int>(), t,
+         hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps, rmsnorm_eps, rmsnorm_scale,
+         y_fp8 ? static_cast<uint8_t*>(y_fp8->data_ptr()) : nullptr,
+         y_primary_sf ? static_cast<int32_t*>(y_primary_sf->data_ptr()) : nullptr,
+         y_shared_sf ? y_shared_sf->data_ptr<int32_t>() : nullptr,
+         y_primary_sf ? y_primary_sf->stride(0) : 0, y_primary_sf ? y_primary_sf->stride(1) : 0,
+         y_shared_sf ? y_shared_sf->stride(1) : 0}};
     launch_mega_mhc(args, sms, prop->multiProcessorCount, prop->cooperativeLaunch);
 }
 
@@ -202,7 +231,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("new_post_mix"), py::arg("new_comb_res_mix"), py::arg("y_bf16") = std::nullopt,
           py::arg("y_fp8") = std::nullopt, py::arg("y_gemm_sf") = std::nullopt,
           py::arg("y_routed_sf") = std::nullopt, py::arg("y_shared_sf") = std::nullopt,
-          py::arg("shared_sf_block_m") = 0);
+          py::arg("shared_sf_block_m") = 0, py::arg("y_token_sf") = std::nullopt);
 }
 
 } // namespace deep_gemm::mega_mhc

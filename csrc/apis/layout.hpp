@@ -7,6 +7,8 @@
 #include "../jit_kernels/heuristics/common_a8w4_int8.hpp"
 #include "../jit_kernels/heuristics/common_fp4.hpp"
 #include "../jit_kernels/heuristics/common_preprocess.hpp"
+#include "../jit_kernels/heuristics/runtime.hpp"
+#include "../jit_kernels/impls/ppuxx_layout.hpp"
 #include "../utils/layout.hpp"
 #include "../utils/utils.hpp"
 
@@ -45,6 +47,8 @@ static void register_apis(pybind11::module_& m) {
         .value("W4A16_MXFP4", deep_gemm_preprocess_common::PreprocessMode::W4A16_MXFP4)
         .value("W4A16_MXFP4_MMA", deep_gemm_preprocess_common::PreprocessMode::W4A16_MXFP4_MMA)
         .value("W4A8_MXFP4_MMA", deep_gemm_preprocess_common::PreprocessMode::W4A8_MXFP4_MMA)
+        .value("W4A8_NVFP4", deep_gemm_preprocess_common::PreprocessMode::W4A8_NVFP4)
+        .value("W4A8_NVFP4_FP8", deep_gemm_preprocess_common::PreprocessMode::W4A8_NVFP4_FP8)
         .value("W4A16_INT4", deep_gemm_preprocess_common::PreprocessMode::W4A16_INT4)
         .value("FP8_CHANNEL", deep_gemm_preprocess_common::PreprocessMode::FP8_CHANNEL)
         .value("FP8_BLOCK", deep_gemm_preprocess_common::PreprocessMode::FP8_BLOCK)
@@ -71,15 +75,17 @@ static void register_apis(pybind11::module_& m) {
           &deep_gemm_preprocess_common::preprocess_a8w4_weight,
           py::arg("weight"));
     m.def("get_tma_aligned_size", &get_tma_aligned_size);
-    m.def("get_mk_alignment_for_contiguous_layout", &get_mk_alignment_for_contiguous_layout);
+    m.def("get_mk_alignment_for_contiguous_layout", [&]() {
+        return heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+    });
     m.def("get_mn_major_tma_aligned_tensor", &get_mn_major_tma_aligned_tensor, py::arg("x"));
     m.def("get_col_major_tensor", &get_col_major_tensor, py::arg("x"));
     m.def("set_mk_alignment_for_contiguous_layout", [](const int& new_value) {
-        if (new_value != get_mk_alignment_for_contiguous_layout())
+        if (new_value != heuristics_runtime->get_mk_alignment_for_contiguous_layout())
             DG_HOST_UNREACHABLE("PPU 1.0/1.5 only supports the default contiguous-layout alignment");
     });
-    m.def("get_theoretical_mk_alignment_for_contiguous_layout", [](const std::optional<int>&) {
-        return get_mk_alignment_for_contiguous_layout();
+    m.def("get_theoretical_mk_alignment_for_contiguous_layout", [&](const std::optional<int>& expected_m) {
+        return heuristics_runtime->get_theoretical_mk_alignment_for_contiguous_layout(expected_m);
     }, py::arg("expected_m") = std::nullopt);
 
     // Unsupported UE8M0

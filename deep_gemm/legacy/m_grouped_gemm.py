@@ -4,7 +4,7 @@ import triton.language as tl
 from typing import Tuple
 
 from .tune_options import *
-from ..deep_gemm_cpp import get_mk_alignment_for_contiguous_layout
+from .._C import get_mk_alignment_for_contiguous_layout
 
 
 @triton.autotune(configs=get_m_grouped_gemm_configs(), key=[])

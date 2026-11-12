@@ -6,7 +6,6 @@
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/epilogue/epilogue_traits.cuh>
-#include <deep_gemm/common/profiling_interface.cuh>
 
 #include <cute/ppu_tensor_mix.hpp>
 #include <cutlass/gemm/config/gemm_operands.hpp>
@@ -541,115 +540,6 @@ fp4_gemm_fused_moe_kernel_impl(const Fp4QuantGemmArgs args) {
       }
     }
 }
-
-// Forwarding __global__ kernel — delegates to the shared __device__ implementation so both the
-// regular Python-JIT launcher below and the C++ JIT generated named entry point use identical code.
-template <GemmType kGemmType,
-          uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t WARP_M, uint32_t WARP_N,
-          uint32_t BLOCK_SIZE, int kNumStages, typename MockMainloopFp4,
-          EpilogueType kEpilogueType = EpilogueType::Default,
-          bool kApplySwigluLimit = false>
-__global__ __launch_bounds__(BLOCK_SIZE, 1) void
-fp4_gemm_fused_moe_kernel(const Fp4QuantGemmArgs args) {
-    fp4_gemm_fused_moe_kernel_impl<
-        kGemmType, SHAPE_N, SHAPE_K, kNumGroups,
-        BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N,
-        BLOCK_SIZE, kNumStages, MockMainloopFp4,
-        kEpilogueType, kApplySwigluLimit>(args);
-}
-
-template <uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t WARP_M, uint32_t WARP_N, int32_t kNumStages,
-          GemmType kGemmType, bool kEnableSboOverlap = false,
-          KernelStrategy kKernelStrategy = KernelStrategy::Default,
-          EpilogueType kEpilogueType = EpilogueType::Default,
-          bool kApplySwigluLimit = false>
-class Fp4FusedMoeGemm {
-    static_assert((SHAPE_K % 16 == 0), "SHAPE_K must be divisible by 16.");
-    static_assert((BLOCK_K % 32 == 0), "BlockK must be divisible by 32.");
-    static_assert((WARP_M <= 64) && (WARP_M % 16 == 0), "WarpM must be divisible by 16 and less than 64.");
-    static_assert((WARP_N <= 64) && (WARP_N % 16 == 0), "WarpN must be divisible by 16 and less than 64.");
-    // `NExpand` and bias are not supported by this kernel, so pass the neutral values.
-    static_assert(EpilogueTraits<kEpilogueType>::is_valid_config(SHAPE_N, BLOCK_N, 1, false),
-      "SiluAndMulPostQuantFp4 Epilogue only support BlockN >= 64 and ShapeN % 64 == 0. ShapeN % 64 means ShapeN // 4(act_func&quant) / 16(scale_group).");
-
-    using SrcT = uint8_t;
-    using DstT = typename EpilogueTraits<kEpilogueType>::ElementDPtr;
-    using SrcSFT = uint16_t;
-    using MockMainloopFp4 = typename MockCollectiveMmaScaleFp4<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumStages>::CollectiveMainloop;
-    using FusedEpilogueCfg = Fp4FusedMoeEpilogue<BLOCK_M, BLOCK_N, SHAPE_N, kEpilogueType, kApplySwigluLimit>;
-    using TsmCfg = GemmSmemConfigFp4<kNumStages, BLOCK_M, BLOCK_N, BLOCK_K, MockMainloopFp4, FusedEpilogueCfg::kSmemSize>;
-public:
-    Fp4FusedMoeGemm() = default;
-
-    static void run(DstT* gmem_d, SrcT* gmem_a, SrcT* gmem_b, SrcSFT* gmem_sfa, SrcSFT* gmem_sfb,
-                    int* m_rows, int* expert_ids_and_cumsum, int* sorted_token_ids,
-                    int* aligned_num_m_blocks, uint32_t shape_m, uint32_t topk,
-                    hggcStream_t stream, int num_cus,
-                    SrcSFT* gmem_sfd = nullptr, float swiglu_limit = 0.0f) {
-
-        Fp4QuantGemmArgs args;
-
-        args.a_ptr = (void *)gmem_a;
-        args.b_ptr = (void *)gmem_b;
-        args.c_ptr = (void *)gmem_d;
-        args.scale_a_ptr = (void *)gmem_sfa;
-        args.scale_b_ptr = (void *)gmem_sfb;
-        args.sfd_ptr = (void *)gmem_sfd;
-        args.shape_m_out = shape_m * topk;
-        args.swiglu_limit = swiglu_limit;
-
-        args.expert_ids_and_cumsum = expert_ids_and_cumsum;
-        args.sorted_token_ids = sorted_token_ids;
-        args.aligned_num_m_blocks = aligned_num_m_blocks;
-        args.shape_m = shape_m;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()){
-            // check src type
-            std::string data_type = "fp4";
-            dg_prof_params.set_fused_moe_params(
-                data_type, std::string("group"), kNumGroups, shape_m, topk, SHAPE_N, SHAPE_K*2,
-                m_rows, stream
-            );
-            dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
-            dg_prof_params.add_params("swiglu_limit", swiglu_limit);
-        }
-        // dispatch and launch kernel
-        constexpr int BlockSize = BLOCK_M / WARP_M * BLOCK_N / WARP_N * 32;
-
-        auto device_func = fp4_gemm_fused_moe_kernel<kGemmType, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BlockSize, kNumStages, MockMainloopFp4, kEpilogueType, kApplySwigluLimit>;
-        constexpr uint32_t smem_size = TsmCfg::kTotalSize;
-        CHECK_HGGC(hggcFuncSetAttribute(device_func, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        int max_blocks_per_cu = -1;
-        CHECK_HGGC(hggcOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_cu, device_func, BlockSize, smem_size));
-
-        int cu_count = num_cus * max_blocks_per_cu;
-        dim3 grid(cu_count, 1, 1);
-
-        const char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && std::atoi(pEnv_params) == 1) {
-            hggcFuncAttributes attr;
-            hggcFuncGetAttributes(&attr, device_func);
-
-            printf("[FusedMoeGemm-FP4:]\n");
-            printf("group:%d, problem:[%d, %d, %d], gemm_type:%s, kernel_strategy:%s\n",
-                kNumGroups, shape_m, SHAPE_N, SHAPE_K, GemmTypeS[static_cast<int>(kGemmType)], KernelStrategyS[static_cast<int>(kKernelStrategy)]);
-
-            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
-                BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);
-
-            printf("grid:%d, vreg:%d, smem_size: %d, tb_per_cu:%d, stack:%d\n",
-                cu_count, int(attr.numRegs), smem_size, max_blocks_per_cu, int(attr.localSizeBytes));
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-        device_func<<<grid, BlockSize, smem_size, stream>>>(args);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-    }
-};
 
 } // namespace deep_gemm
 

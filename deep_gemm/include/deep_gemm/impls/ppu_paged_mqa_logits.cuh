@@ -1,6 +1,7 @@
 #pragma once
 #include <deep_gemm/tix/cvt.cuh>
 #include <deep_gemm/tix/ld_st.cuh>
+#include <deep_gemm/tix/utils.cuh>
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 #include <deep_gemm/scheduler/paged_mqa_logits_scheduler.cuh>
@@ -16,7 +17,8 @@ template <typename ElementQK, typename ElementAcc, typename ElementLogits, typen
           uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
 class PPUPagedMqaLogits {
 public:
-    static_assert(PAGE_KV == 32 || PAGE_KV == 64 || PAGE_KV == 128, "Invalid KV page size");
+    static_assert(PAGE_KV == 32 || (PAGE_KV > 0 && PAGE_KV % BLOCK_KV == 0),
+                  "KV page must be 32 rows or a positive multiple of the compute tile");
   static_assert(not SPLIT_MBLOCK, "SPLIT_MBLOCK is only supported for FP4");
   // Avg variant (kScaleMode = kScaleModeUnity): no per-head weights,
   // logits = sum_h(relu(qk)) * k_scale / sqrt(kHeadDim)
@@ -49,7 +51,7 @@ public:
 #endif
 
   using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, ElementQK,ElementQK,ElementAcc>::type;
-  using MmaK_type = typename cutlass::platform::conditional<sizeof(ElementQK) == 2, _16, _32 >::type;
+  static_assert(sizeof(ElementQK) == 1, "MQA Q/K must use FP8 or INT8 storage");
 
   static constexpr int InstM = 16;
   static constexpr int InstN = 16;
@@ -60,7 +62,7 @@ public:
   using PermutationMNK = Tile<
       Layout<Shape<Int<InstM>, WarpIterM, MmaIterM>, Stride<_1, Int<WARP_M>, Int<InstM>> >,
       Layout<Shape<Int<InstN>, WarpIterN, MmaIterN>, Stride<_1, Int<WARP_N>, Int<InstN>> >,
-      MmaK_type
+      _32
     >;
   using TiledMma = TiledMMA<MMA_Atom<MmaInst>, Layout<Shape<WarpIterM, WarpIterN, _1>>, PermutationMNK>;
 
@@ -71,8 +73,8 @@ public:
   static constexpr bool WarpInterleaving = (MaxThreadsPerBlock == 512);
   static_assert(!(WarpInterleaving && kNumQStages == 1), "warp-interleave does not support stage_q = 1");
 
-  // Match each page32 transfer's swizzle; BF16 keeps its split-K layout.
-  static constexpr int kKVSmemRows = sizeof(ElementQK) == 2 ? BLOCK_M : (PAGE_KV < BLOCK_KV ? PAGE_KV : BLOCK_KV);
+  // Match each page32 transfer's swizzle.
+  static constexpr int kKVSmemRows = PAGE_KV < BLOCK_KV ? PAGE_KV : BLOCK_KV;
   using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementQK, false, Int<kKVSmemRows>, Int<BLOCK_K>, false>;
   using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementQK, false, Int<BLOCK_N>, Int<BLOCK_K>, true>;
 
@@ -302,7 +304,6 @@ public:
     auto tQgQ = tBgB;
     auto tSFQgSFQ = tSFBgSFB;
 
-    constexpr bool load_kv_scale = sizeof(ElementQK) == 1;
     const auto& lane_idx = deep_gemm::tix::get_lane_idx();
     int warp_m_idx = local_warp_idx % WarpOnM;
     int warp_n_idx = local_warp_idx / WarpOnM;
@@ -337,19 +338,18 @@ public:
     };
 
     auto load_kv_g2s = [&](uint32_t q_idx, uint32_t kv_idx) {
-        if constexpr (PAGE_KV == BLOCK_KV) {
-            auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + kv_idx);
-            tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes;
-            if constexpr(load_kv_scale) {
-                tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / 4;
-                // Split the value/scale AIU copies across warps 0/1 only when the group
-                // has >= 2 warps; otherwise warp 0 issues both (as fp4's SPLIT_AIU)
-                constexpr bool SPLIT_AIU = (WarpOnGroup >= 2);
-                copy_aiu<SPLIT_AIU>(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv),
-                    gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv), local_warp_idx);
-            } else {
-                copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), local_warp_idx);
-            }
+        // Use the copy traits for full tiles, including the 810E linear-scale descriptor.
+        if constexpr (PAGE_KV >= BLOCK_KV) {
+            const uint32_t token = kv_idx * BLOCK_KV;
+            const uint32_t row_in_page = token % PAGE_KV;
+            auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + token / PAGE_KV);
+            tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes + static_cast<uint64_t>(row_in_page) * BLOCK_K;
+            tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / 4 + row_in_page;
+            // Split the value/scale AIU copies across warps 0/1 only when the group
+            // has >= 2 warps; otherwise warp 0 issues both (as fp4's SPLIT_AIU)
+            constexpr bool SPLIT_AIU = (WarpOnGroup >= 2);
+            copy_aiu<SPLIT_AIU>(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv),
+                gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv), local_warp_idx);
             if (thread_print) {
                 printf("  copy_k q_idx = %d, kv_idx = %d, kv_offset = %d, wg = %d, stage = %d\n", q_idx, kv_idx, kv_offset, warp_group_idx, smem_pipe_write_kv);
             }
@@ -377,26 +377,24 @@ public:
                     nullptr, kCopyRows, BLOCK_K, StrideAB{});
                 if (local_warp_idx == 0 && lane_idx == 0) {
                     auto src = reinterpret_cast<const ElementQK*>(
-                        reinterpret_cast<const uint8_t*>(params.ptr_k) + physical_page * params.kv_cache_stride_bytes * sizeof(ElementQK)) + row_in_page * BLOCK_K;
+                        reinterpret_cast<const uint8_t*>(params.ptr_k) + physical_page * params.kv_cache_stride_bytes * sizeof(ElementQK)) + static_cast<uint64_t>(row_in_page) * BLOCK_K;
                     CUTE_UNROLL
                     for (int k = 0; k < BLOCK_K; k += ChunkKV::CUBE_W) {
                         auto dst_k = shared_storage.smem_k.data() + SmemLayoutA{}(make_coord(row, k, smem_pipe_write_kv, warp_group_idx));
                         ChunkKVCopy::copy(dst_k, src, kv_desc, k, 0, 0);
                     }
                 }
-                if constexpr (load_kv_scale) {
-                    cute::AiuDesc sf_desc;
-                    sf_desc.template init<float, false, 1, kCopyRows>(
-                        nullptr, 1, kCopyRows, Stride<Int<kCopyRows>, _1>{});
-                    constexpr uint32_t kScaleWarp = WarpOnGroup >= 2 ? 1 : 0;
-                    if (local_warp_idx == kScaleWarp && lane_idx == 0) {
-                        auto dst = shared_storage.smem_k_scales.data() + SmemLayoutSFA{}(make_coord(0, row, smem_pipe_write_kv, warp_group_idx));
-                        auto src = reinterpret_cast<const float*>(
-                            reinterpret_cast<const uint8_t*>(params.k_scales) + physical_page * params.kv_cache_stride_bytes) + row_in_page;
-                        CUTE_UNROLL
-                        for (int k = 0; k < kCopyRows; k += ChunkSF::CUBE_W)
-                            ChunkSFCopy::copy(dst + k, src, sf_desc, k, 0, 0);
-                    }
+                cute::AiuDesc sf_desc;
+                sf_desc.template init<float, false, 1, kCopyRows>(
+                    nullptr, 1, kCopyRows, Stride<Int<kCopyRows>, _1>{});
+                constexpr uint32_t kScaleWarp = WarpOnGroup >= 2 ? 1 : 0;
+                if (local_warp_idx == kScaleWarp && lane_idx == 0) {
+                    auto dst = shared_storage.smem_k_scales.data() + SmemLayoutSFA{}(make_coord(0, row, smem_pipe_write_kv, warp_group_idx));
+                    auto src = reinterpret_cast<const float*>(
+                        reinterpret_cast<const uint8_t*>(params.k_scales) + physical_page * params.kv_cache_stride_bytes) + row_in_page;
+                    CUTE_UNROLL
+                    for (int k = 0; k < kCopyRows; k += ChunkSF::CUBE_W)
+                        ChunkSFCopy::copy(dst + k, src, sf_desc, k, 0, 0);
                 }
             }
         }
@@ -440,13 +438,13 @@ public:
             if constexpr (kWq4) {
                 // Each lane stores only its own parity's kv row in the kWq4 epilogue,
                 // so it only loads that row's scale
-                scale_kv_array[m] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
+                scale_kv_array[m] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
                     scale_kv_array[m] *= kInvSqrtHeadDim;
                 }
             } else {
-                scale_kv_array[m * 2    ] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
-                scale_kv_array[m * 2 + 1] = (sizeof(ElementQK) == 2) ? 1 : deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
+                scale_kv_array[m * 2    ] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_0_offset);
+                scale_kv_array[m * 2 + 1] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_1_offset);
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
                     scale_kv_array[m * 2    ] *= kInvSqrtHeadDim;
                     scale_kv_array[m * 2 + 1] *= kInvSqrtHeadDim;
@@ -646,100 +644,3 @@ public:
 };
 
 } // namespace cutlass::gemm::kernel
-
-
-namespace deep_gemm {
-
-template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights,
-          uint32_t kNextN, uint32_t kNumHeads,
-          uint32_t kHeadDim, uint32_t PAGE_KV, uint32_t SPLIT_KV, uint32_t BLOCK_KV, uint32_t WARP_KV,
-          uint32_t kNumQStages, uint32_t kNumKVStages,
-          bool SPLIT_MBLOCK = false,
-          uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
-class PagedAttention {
-
-public:
-    PagedAttention() = default;
-
-    static uint32_t generate_id() {
-        static uint32_t id = 0;
-        return ++id;
-    }
-
-    static void run(const ElementQK * ptr_q,
-                    const ElementQK * ptr_k,
-                    const float * k_scales,
-                    // kScaleModeWeights: per-(q, head) weights; kScaleModeUnity: unused
-                    const ElementWeights * weights,
-                    const uint32_t batch_size,
-                    const uint64_t logits_stride, const uint64_t kv_cache_stride_bytes, const uint32_t block_table_stride,
-                    const uint32_t* context_lens, ElementLogits* logits,
-                    const uint32_t* block_table, const uint32_t* schedule_meta,
-                    hggcStream_t stream, int num_sms, int num_blocks) {
-
-        using AttnKernel = cutlass::gemm::kernel::PPUPagedMqaLogits<ElementQK, ElementAcc, ElementLogits, ElementWeights, kNextN, kNumHeads, kHeadDim, PAGE_KV, SPLIT_KV, BLOCK_KV, WARP_KV, kNumQStages, kNumKVStages, SPLIT_MBLOCK, kScaleMode>;
-
-        static constexpr int BLOCK_M = AttnKernel::BLOCK_M;
-        static constexpr int BLOCK_N = AttnKernel::BLOCK_N;
-        static constexpr int BLOCK_K = AttnKernel::BLOCK_K;
-        static constexpr int WARP_M  = AttnKernel::WARP_M ;
-        static constexpr int WARP_N  = AttnKernel::WARP_N ;
-        static constexpr int MaxThreadsPerBlock = AttnKernel::MaxThreadsPerBlock;
-
-        int max_blocks_per_cu = compute_occupancy_for_kernel<AttnKernel>();
-
-        typename AttnKernel::Arguments arguments{ptr_q, ptr_k, k_scales, weights, batch_size, logits_stride, kv_cache_stride_bytes, block_table_stride,
-                                                 context_lens, logits, block_table, schedule_meta};
-        auto params = arguments;
-        dim3 const block(MaxThreadsPerBlock, 1, 1);
-        dim3 const grid(num_blocks, 1, 1);
-        int smem_size_kernel = AttnKernel::SharedStorageSize;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()){
-            std::string data_type_str = "unknown";
-            if (cute::is_same_v<ElementQK, cutlass::bfloat16_t>) {
-                data_type_str = "bf16";
-            } else if (cute::is_same_v<ElementQK, cutlass::float_e4m3_t>) {
-                data_type_str = "fp8";
-            } else if (cute::is_same_v<ElementQK, int8_t>) {
-                data_type_str = "int8";
-            }
-
-            dg_prof_params.set_paged_mqa_logits_params(data_type_str, batch_size, kNextN, kNumHeads, kHeadDim, reinterpret_cast<int*>(const_cast<uint32_t*>(context_lens)), stream,
-                                                       kScaleMode != deep_gemm::kScaleModeWeights);
-            if constexpr (cute::is_same_v<ElementLogits, __ppu_bfloat16>) {
-                dg_prof_params.add_params("logits_dtype", std::string("bf16"));
-            }
-            if constexpr (cute::is_same_v<ElementWeights, __ppu_bfloat16>) {
-                dg_prof_params.add_params("weights_dtype", std::string("bf16"));
-            }
-        }
-
-        char *pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            hggcFuncAttributes attr;
-            hggcFuncGetAttributes(&attr, cutlass::device_kernel<AttnKernel>);
-
-            printf("[paged_mqa_logits:]\n");
-            printf("kNumHeads:%d, kHeadDim:%d, kNextN:%d, BLOCK_KV:%d, SPLIT_KV:%d\n",
-                kNumHeads, kHeadDim, kNextN, BLOCK_KV, SPLIT_KV);
-
-            printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n",
-                BLOCK_M, BLOCK_N, WARP_M, WARP_N, kNumQStages, kNumKVStages);
-
-            printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d, num_threads:%d\n", num_sms, max_blocks_per_cu, num_blocks, block.x);
-            printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size_kernel, int(attr.numRegs), int(attr.localSizeBytes));
-            printf("weights_bf16:%s\n", cute::is_same_v<ElementWeights, __ppu_bfloat16> ? "true" : "false");
-            if (num_sms * max_blocks_per_cu  != num_blocks) {
-                printf("Warning: num_blocks(%d) should equal to num_sms(%d) * max_blocks_per_cu(%d) = %d\n", num_blocks, num_sms, max_blocks_per_cu, num_sms * max_blocks_per_cu);
-            }
-        }
-
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-        cutlass::device_kernel<AttnKernel><<<grid, block, smem_size_kernel, stream>>>(params);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-    }
-};
-
-};  // namespace deep_gemm

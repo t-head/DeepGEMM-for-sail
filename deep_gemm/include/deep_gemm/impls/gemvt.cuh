@@ -6,12 +6,10 @@
 #define HGGC_PRAGMA_UNROLL _Pragma("unroll")
 #define HGGC_DEVICE_ONLY __forceinline__ __device__
 
-#include <iostream>
 #include <hggc_bf16.h>
 #include <hggc_fp16.h>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/math.cuh>
-#include <deep_gemm/common/profiling_interface.cuh>
 #include <deep_gemm/tix/cp_async.cuh>
 
 namespace deep_gemm {
@@ -211,14 +209,6 @@ __device__ void batched_gemvt_kernel_small_k_impl(const GemvtArgs args) {
   }
 }
 
-template <typename src_type, typename dst_type, typename acc_type,
-          typename load_atype, typename load_btype,
-          int BlockSize, int ThreadPerN = 32, int NPerThread = 1, int NUM_UNROLL=1,
-          int GROUP_SIZE_M = 1, int Stages = 2>
-__global__ void batched_gemvt_kernel_small_k(const GemvtArgs args) {
-    batched_gemvt_kernel_small_k_impl<src_type, dst_type, acc_type, load_atype, load_btype,
-        BlockSize, ThreadPerN, NPerThread, NUM_UNROLL, GROUP_SIZE_M, Stages>(args);
-}
 
 template <typename src_type, typename dst_type, typename acc_type,
           typename load_atype, typename load_btype,
@@ -351,150 +341,5 @@ __device__ void batched_gemvt_kernel_impl(const GemvtArgs args) {
         }
     }
 }
-
-template <typename src_type, typename dst_type, typename acc_type,
-          typename load_atype, typename load_btype,
-          int BlockSize, int ThreadPerN = 32, int NPerThread = 1, int NUM_UNROLL=1,
-          int GROUP_SIZE_M = 1>
-__global__ void batched_gemvt_kernel(const GemvtArgs args) {
-    batched_gemvt_kernel_impl<src_type, dst_type, acc_type, load_atype, load_btype,
-        BlockSize, ThreadPerN, NPerThread, NUM_UNROLL, GROUP_SIZE_M>(args);
-}
-
-template <typename src_type, typename dst_type, typename acc_type,
-          uint32_t SHAPE_N, uint32_t SHAPE_K, int32_t kNumGroups,
-          int ThreadPerN, int NPerThread, int NUM_UNROLL,
-          int SWZL_SIZE_M, int BlockSize = 256, bool SMALL_K = false>
-class Gemvt {
-    using load_atype = int4;
-    using load_btype = int4;
-
-public:
-    Gemvt() = default;
-
-    static void run(dst_type* gmem_d, int* grouped_layout,
-                    uint32_t shape_m, src_type* gmem_a, src_type* gmem_b,
-                    hggcStream_t stream, const float* lhs_scale = nullptr, const float* rhs_scale = nullptr) {
-
-        GemvtArgs args;
-        args.N = SHAPE_N;
-        args.K = SHAPE_K;
-        args.a_ptr = (void *)gmem_a;
-        args.b_ptr = (void *)gmem_b;
-        args.c_ptr = (void *)gmem_d;
-
-        args.alphaCol = rhs_scale;
-        args.alphaRow = lhs_scale;
-        args.expert_ids_ptr = grouped_layout;
-        args.num_tokens = shape_m;
-        args.num_experts = kNumGroups;
-        args.stride_am = SHAPE_K;
-        args.stride_ak = 1;
-        args.stride_be = SHAPE_N * SHAPE_K;
-        args.stride_bk = 1;
-        args.stride_bn = SHAPE_K;
-        args.stride_cm = SHAPE_N;
-        args.stride_cn = 1;
-
-        DgProfParam dg_prof_params;
-        // check src type
-        std::string data_type = "";
-        if constexpr (std::is_same_v<src_type, int8_t>) {
-            data_type = "int8";
-        }
-        else if constexpr (std::is_same_v<src_type, __ppu_bfloat16>) {
-            data_type = "bf16";
-        }
-        else {
-            data_type = "unsupported";
-        }
-        if (ProfilingInterface::Instance().get_op_info()){
-            dg_prof_params.set_params(
-                GemmType::MGroupedNoPad, true, data_type, kNumGroups, shape_m, SHAPE_N, SHAPE_K, 1,
-                grouped_layout, stream
-            );
-        }
-
-        if (SMALL_K == false) {
-            size_t grid_x = shape_m;
-            constexpr uint32_t NPerBlock = NPerThread * BlockSize / ThreadPerN;
-            size_t grid_y = math::ceil_div(SHAPE_N, NPerBlock);
-            args.total_blocks = grid_x * grid_y;
-            // check GEMM_K alignment
-            if(args.K % (NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type)) != 0) {
-                 printf("K alignment mismatch, K = %d, NUM_UNROLL = %d, ThreadPerN = %d, sizeof(load_atype) = %d, sizeof(src_type) = %d",
-                   args.K, NUM_UNROLL, ThreadPerN, sizeof(load_atype), sizeof(src_type));
-                 return;
-            }
-
-            auto device_func = batched_gemvt_kernel<src_type, dst_type, acc_type, load_atype, load_btype,
-                                BlockSize, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M>;
-            dim3 grid = grid_x * grid_y;
-
-            char *pEnv_params = std::getenv("show_log");
-            if (pEnv_params && isdigit(*pEnv_params)) {
-                hggcFuncAttributes attr;
-                hggcFuncGetAttributes(&attr, device_func);
-
-                printf("[GemV-BF16:]\n");
-                printf("group:%d, problem:[%d, %d, %d]\n",
-                    kNumGroups, shape_m, SHAPE_N, SHAPE_K);
-                printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, NUM_UNROLL:%d, SWZL_SIZE_M:%d\n",
-                    BlockSize, NPerThread, ThreadPerN, NPerBlock, NUM_UNROLL, SWZL_SIZE_M);
-                printf("threadblock_count:%d, vreg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
-
-            }
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
-            device_func<<<grid, BlockSize, 0, stream>>>(args);
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
-        } else {
-            // launch small_k gemm_v
-            size_t grid_x = args.num_tokens;
-            constexpr int NPerBlock = NPerThread * BlockSize / ThreadPerN;
-            size_t grid_y = math::ceil_div(args.N, NPerBlock);
-            args.total_blocks = grid_x * grid_y;
-            constexpr int MAX_K = NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type);
-            constexpr int MIN_ALIGNMENT = 16 / sizeof(src_type); // for int4 copy
-
-            if(args.K > MAX_K) {
-                printf("unsupported K, K = %d, MAX_K = %d, NUM_UNROLL = %d, ThreadPerN = %d, sizeof(load_atype) = %d, sizeof(src_type) = %d",
-                args.K, MAX_K, NUM_UNROLL, ThreadPerN, sizeof(load_atype), sizeof(src_type));
-                return;
-            }
-
-            if (args.stride_am % MIN_ALIGNMENT != 0 || args.stride_bn % MIN_ALIGNMENT !=0) {
-                printf("unsupported stride, stride_am = %d, stride_bn = %d\n", args.stride_am, args.stride_bn);
-                return;
-            }
-
-            auto device_func = batched_gemvt_kernel_small_k<src_type, dst_type, acc_type, load_atype, load_btype,
-                                                            BlockSize, ThreadPerN, NPerThread, 1, SWZL_SIZE_M, 5>;
-            // printf("num_tokens = %d, N = %d, K = %d, top_k = %d, A = %p, B = %p, grid_x = %d, grid_y = %d",
-            //     args.num_tokens, args.N, args.K, args.top_k, args.a_ptr, args.b_ptr, grid_x, grid_y);
-
-            char *pEnv_params = std::getenv("show_log");
-            if (pEnv_params && isdigit(*pEnv_params)) {
-                hggcFuncAttributes attr;
-                hggcFuncGetAttributes(&attr, device_func);
-
-                printf("[GemV-Small-BF16:]\n");
-                printf("group:%d, problem:[%d, %d, %d]\n",
-                    kNumGroups, args.num_tokens, args.N, args.K);
-                printf("BlockSize:%d, NPerThread:%d, ThreadPerN:%d, NPerBlock:%d, SWZL_SIZE_M:%d\n",
-                    BlockSize, NPerThread, ThreadPerN, NPerBlock, SWZL_SIZE_M);
-
-                printf("threadblock_count:%d, vreg:%d, stack:%d\n", args.total_blocks, int(attr.numRegs), int(attr.localSizeBytes));
-
-            }
-
-            ProfilingInterface::Instance().instrument(true, dg_prof_params);
-            // batched_gemvt_kernel_small_k<src_type, dst_type, float, load_atype, load_btype,
-            //     BlockSize, ThreadPerN, NPerThread, 1, SWZL_SIZE_M, Stages><<<grid_x * grid_y, BlockSize, 0, stream>>>(args);
-            device_func<<<grid_x * grid_y, BlockSize, 0, stream>>>(args);
-            ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-        }
-    }
-};
 
 }  // namespace deepgemm

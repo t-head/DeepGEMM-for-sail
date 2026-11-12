@@ -1,5 +1,6 @@
 #pragma once
 #include <deep_gemm/tix/ld_st.cuh>
+#include <deep_gemm/tix/utils.cuh>
 #include <deep_gemm/impls/sparse_mqa_logits_layout.cuh>
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 
@@ -72,7 +73,7 @@ public:
     // Three-stage pipeline with dense-style warp interleaving.
     static_assert(kNumKVStages == 3, "KV pipeline requires exactly three stages");
     static constexpr bool WarpInterleaving = NumThreadsPerCTA == 512;
-    static_assert(NumThreadsPerCTA == 512 && 32 + BLOCK_M <= 256,
+    static_assert((NumThreadsPerCTA == 256 || NumThreadsPerCTA == 512) && 32 + BLOCK_M <= 256,
                   "KV/SF pipeline producers must fit in warp group 0");
 
     // AIU operands for Q (B operand; KV uses per-block AIU gather)
@@ -265,7 +266,7 @@ public:
         const auto schedule_entries = reinterpret_cast<const SML::ScheduleEntry*>(
             kv_splits + header->num_kv_splits);
 
-        // Warp 0 issues KV AIU copies; SF producers copy one u32 per token.
+        // KV/SF producers stay in warp group 0; SF copies remain one u32 per token.
 
         cute::AiuDesc gather_desc;
         gather_desc.template init<ElementQK, false, SPARSE_BLOCK_KV, BLOCK_K>(
@@ -323,28 +324,36 @@ public:
         auto load_kv_gather = [&](uint32_t kv_split_idx, uint32_t kv_stage_idx,
                                   bool prefetched = false, uint32_t prefetched_physical = 0) {
             const auto& split = kv_splits[kv_split_idx];
-            if (thread_idx == 0) {
-                bool is_contiguous = false;
-                if constexpr (not kIsPaged)
-                    is_contiguous = SML::KVSplitHeader::is_contiguous(__ldg(&split.header.packed_num_kv_blocks));
-                if (is_contiguous) {
-                    // Copy full contiguous splits with one swizzled AIU transfer.
+            // Distribute gathers across the producer warp group for either block
+            // size. In the 16-warp variant consumers in group 1 must never issue
+            // copies after group 0 has handed off the current stage.
+            constexpr int kNumGatherWarps = 8;
+            constexpr int kBlocksPerGatherWarp = kNumKVBlocksPerSplit / kNumGatherWarps;
+            static_assert(kNumKVBlocksPerSplit % kNumGatherWarps == 0);
+            // Test the warp-uniform flag before lane masking, keeping the
+            // contiguous copy out of the multi-warp gather control path.
+            bool is_contiguous = false;
+            if constexpr (not kIsPaged)
+                is_contiguous = SML::KVSplitHeader::is_contiguous(__ldg(&split.header.packed_num_kv_blocks));
+            if (is_contiguous) {
+                if (thread_idx == 0) {
                     const uint32_t physical = __ldg(&split.kv_block_infos[0].physical_kv_block_idx);
                     ContiguousAiuCopy::copy(shared_storage.smem_k.data() + kv_stage_idx * kStageBytes,
                                            params.ptr_k + static_cast<uint64_t>(physical) * BLOCK_K,
                                            contiguous_desc, 0, 0, 0);
-                } else {
-                    CUTE_UNROLL
-                    for (int b = 0; b < kNumKVBlocksPerSplit; ++b) {
-                        // Resolve the block address for the selected KV layout.
-                        const uint32_t physical = __ldg(&split.kv_block_infos[b].physical_kv_block_idx);
-                        const ElementQK* src_kv;
-                        uint32_t src_sf;
-                        resolve_block(physical, 0, &src_kv, &src_sf);
-                        ElementQK* dst_kv = shared_storage.smem_k.data() +
-                                            kv_stage_idx * kStageBytes + b * kGatherChunkBytes;
-                        GatherAiuCopy::copy(dst_kv, src_kv, gather_desc, 0, 0, 0);
-                    }
+                }
+            } else if ((NumThreadsPerCTA == 256 || warp_idx < kNumGatherWarps) && lane_idx == 0) {
+                CUTE_UNROLL
+                for (int j = 0; j < kBlocksPerGatherWarp; ++j) {
+                    const int b = warp_idx * kBlocksPerGatherWarp + j;
+                    // Resolve the block address for the selected KV layout.
+                    const uint32_t physical = __ldg(&split.kv_block_infos[b].physical_kv_block_idx);
+                    const ElementQK* src_kv;
+                    uint32_t src_sf;
+                    resolve_block(physical, 0, &src_kv, &src_sf);
+                    ElementQK* dst_kv = shared_storage.smem_k.data() +
+                                        kv_stage_idx * kStageBytes + b * kGatherChunkBytes;
+                    GatherAiuCopy::copy(dst_kv, src_kv, gather_desc, 0, 0, 0);
                 }
             }
             // Keep KV/SF producers in warp group 0 to avoid stale-stage writes.
@@ -475,8 +484,13 @@ public:
                     const uint32_t slot_offsets_0 = __ldg(&kv_splits[kv_split_idx].kv_block_infos[row0 / SPARSE_BLOCK_KV].packed_slot_offsets);
                     const uint32_t slot_offsets_1 = __ldg(&kv_splits[kv_split_idx].kv_block_infos[row1 / SPARSE_BLOCK_KV].packed_slot_offsets);
                     for_each(make_int_sequence<K_BLOCK>{}, [&](auto k_block) {
-                        copy(smem_tiled_copy_A, tCsA(_, _, k_block, kv_stage_idx), tCrA_copy_view(_, _, k_block));
-                        copy(smem_tiled_copy_SFA, tCsSFA(_, _, k_block, kv_stage_idx), tCrSFA_copy_view(_, _, k_block));
+                        copy(smem_tiled_copy_A, tCsA(_, m_block, k_block, kv_stage_idx),
+                             tCrA_copy_view(_, m_block, k_block));
+                        // Each packed SFA entry serves m_group MMA M blocks.
+                        if constexpr (m_block % m_group == 0) {
+                            copy(smem_tiled_copy_SFA, tCsSFA(_, m_block / m_group, k_block, kv_stage_idx),
+                                 tCrSFA_copy_view(_, m_block / m_group, k_block));
+                        }
                         for_each(make_int_sequence<N_BLOCK>{}, [&](auto n_block) {
                             Tensor s = make_tensor<uint32_t>(Int<4>{});
                             MMA_Atom<MmaInst> mma_atom;

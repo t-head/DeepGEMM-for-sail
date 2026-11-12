@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <optional>
 
 #include "../../jit/device_runtime.hpp"
@@ -11,12 +12,21 @@ namespace deep_gemm {
 class HeuristicsRuntime {
     static constexpr int kLegacyMKAlignmentForContiguousLayout = 128;
 
+    std::atomic<bool> deterministic_algorithms{false};
     bool ignore_compile_dims = false;
     int block_m_multiple_of = 1;
     int block_n_multiple_of = 1;
     int mk_alignment_for_contiguous_layout = kLegacyMKAlignmentForContiguousLayout;
 
 public:
+    void use_deterministic_algorithms(bool enabled) {
+        deterministic_algorithms.store(enabled);
+    }
+
+    bool get_deterministic_algorithms() const {
+        return deterministic_algorithms.load();
+    }
+
     void set_ignore_compile_dims(const bool& new_value) {
         ignore_compile_dims = new_value;
     }
@@ -46,7 +56,7 @@ public:
         return mk_alignment_for_contiguous_layout;
     }
     int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m) const {
-        return get_mk_alignment_for_contiguous_layout();
+        return kLegacyMKAlignmentForContiguousLayout;
     }
 };
 

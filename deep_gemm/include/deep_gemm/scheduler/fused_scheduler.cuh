@@ -8,7 +8,8 @@ template <GemmType kGemmType,
     uint32_t BLOCK_M_, uint32_t BLOCK_N_,
     uint32_t kNumGroups_,
     uint32_t kNumNBlocks = math::ceil_div(SHAPE_N_, BLOCK_N_),
-    uint32_t kNum1DBlocksPerGroup = 2>
+    uint32_t kNum1DBlocksPerGroup = 2,
+    bool kInterleaveM = false>
 struct FusedGemmScheduler {
 public:
   struct Params {
@@ -37,8 +38,15 @@ public:
     uint32_t in_group_idx = block_idx % num_blocks_per_group;
     uint32_t num_blocks_in_group = min(kNum1DBlocksPerGroup, primary_num_blocks - first_block_idx);
 
-    m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
-    n_block_idx = in_group_idx / num_blocks_in_group;
+    if constexpr (kNum1DBlocksPerGroup == 2) {
+      // Valid work items have one or two M blocks in the swizzle group.
+      const uint32_t shift = num_blocks_in_group - 1;
+      m_block_idx = first_block_idx + (in_group_idx & shift);
+      n_block_idx = in_group_idx >> shift;
+    } else {
+      m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
+      n_block_idx = in_group_idx / num_blocks_in_group;
+    }
   }
 
   __device__ __forceinline__ bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
@@ -55,6 +63,10 @@ public:
     uint32_t num_m_blocks = math::ceil_div(curr_group_m, BLOCK_M);
     uint32_t block_idx_in_m = next_block_idx - data.z * kNumNBlocks;
     get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);
+    if constexpr (kInterleaveM && kNum1DBlocksPerGroup == 2) {
+      if (num_m_blocks - (m_block_idx / 2) * 2 >= 2)
+        m_block_idx ^= (n_block_idx + curr_group_idx) & 1;
+    }
     cumsum_m_block_idx = m_block_idx + data.z;
     curr_block_m_offset = data.w + m_block_idx * BLOCK_M;
     valid_m_in_block = min(BLOCK_M, curr_group_m - m_block_idx * BLOCK_M);

@@ -54,8 +54,7 @@ public:
         cute::Stride<cute::Int<1>, int64_t, int64_t> stride_SFB;
     };
 
-    // One host mirror per device-side CollectiveEpilogue, matching the three types selected in
-    // Fp4Gemm::run (fp4_gemm_cutlass3.cuh).
+    // One host parameter layout per device-side CollectiveEpilogue selected by generate_impl.
     //
     //   device type                             condition                    Epilogue::Params
     //   CollectiveEpilogueWithTsm               hasBias || SHAPE_N % 2 != 0         96 B
@@ -142,14 +141,15 @@ public:
                       sizeof(EpilogueArgsNoTsm) + sizeof(uint16_t*) + sizeof(uint32_t) + sizeof(float),
                   "fused epilogue params must be the NoTsm layout plus ptr_SFD/shape_m/swiglu_limit");
 
-    template <typename EpilogueArgsT>
+    template <typename EpilogueArgsT, typename MainloopArgsT = MainLoopArguments,
+              typename SchedulerArgsT = TileSchedulerArguments>
     struct GemmKernelParamsT {
         GemmUniversalMode mode;
         GemmProblemSize problem_shape;
-        MainLoopArguments collective_mainloop_params;
+        MainloopArgsT collective_mainloop_params;
         EpilogueArgsT collective_epilogue_params;
         cutlass::KernelHardwareInfo hw_info;
-        TileSchedulerArguments scheduler;
+        SchedulerArgsT scheduler;
         void* workspace{nullptr};
         int32_t* signal{nullptr};
         // actlize_v1.0.0 sets SAIL_SYNC_IN_CE=1 (accutlass.hpp), which appends this field to the
@@ -201,8 +201,20 @@ public:
         KernelParams kernel_params;
     };
 
+    // Keep this key in sync with generate_impl -> generate_code's default arguments.
+    // Shared memory is part of the generated static_assert; bias and epilogue
+    // select distinct device parameter layouts. Tensor addresses remain per-call.
+    static auto compile_key(const Args& args) {
+        const auto& info = args.launch_info;
+        return std::make_tuple(info.n, info.k, info.block_m, info.block_n, info.block_k,
+                               info.num_groups, info.warp_m, info.warp_n, info.num_stages,
+                               info.gemm_type, info.enable_sbo_overlap, info.hasBias, info.n_expand,
+                               info.epilogue_type, info.apply_swiglu_limit, info.kernel_name,
+                               args.launch_args.smem_size);
+    }
+
     static std::string generate_impl(const Args& args) {
-        // Mirrors the guard in Fp4Gemm::run: the fused epilogue reuses the mainloop's shared storage,
+        // The fused epilogue reuses the mainloop's shared storage,
         // so its activation tile must fit in what the kernel already reserves.
         // Emitted only for the fused variant instead of using `if constexpr` in the generated kernel:
         // everything there is concrete, so naming ::get_shared_storage_size() in a discarded branch
@@ -364,7 +376,7 @@ using CollectiveEpilogueSiluAndMulPostQuant = typename cutlass::epilogue::collec
     kEpilogueType
 >;
 
-// Keep the selection identical to Fp4Gemm::run in fp4_gemm_cutlass3.cuh
+// Bias or odd N requires TSM; otherwise select fused post-quantization or the plain epilogue.
 using CollectiveEpilogue = typename cutlass::platform::conditional<
     hasBias || (SHAPE_N % 2 != 0),
     CollectiveEpilogueWithTsm,
@@ -396,8 +408,7 @@ using GemmKernel = typename deep_gemm::DeepGemmUniversal<
 // This kernel declares `extern __shared__`, so its dynamic smem size comes from the launch, and the
 // host can only supply an estimate (get_smem_config_fp4) -- it cannot see SharedStorageSize.
 // Assert the two agree: an under-estimate corrupts memory, an over-estimate silently costs
-// occupancy. The Python path is immune because Fp4Gemm::run launches with SharedStorageSize
-// directly, so a drift here would show up as "Python correct, C++ JIT wrong".
+// occupancy.
 static_assert(GemmKernel::SharedStorageSize == {},
               "host get_smem_config_fp4() disagrees with the kernel's SharedStorageSize -- "
               "update csrc/jit_kernels/heuristics/common_fp4.hpp");
@@ -443,8 +454,8 @@ __global__ void {}(
 // CollectiveEpilogue / TileScheduler aliases. Emitting one combined template would instantiate
 // types the dynamic-tile kernel never uses and make the placeholder list far harder to keep in sync.
 //
-// Mirrors the `if constexpr (kEnableMoeDynamicTile)` branch of Fp4Gemm::run. DynamicTile supports
-// both the Default epilogue and fused activation + post-quant variants, so its host params union
+// DynamicTile supports both the Default epilogue and fused activation + post-quant variants,
+// so its host params union
 // carries both the NoTsm and fused layouts.
 class FP4DynamicTileRuntime final : public LaunchRuntime<FP4DynamicTileRuntime> {
 public:
@@ -645,8 +656,7 @@ static void fp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
         params.signal = nullptr;
     }
 
-    const auto& code = FP4GemmRuntime::generate(args);
-    const auto& runtime = compiler->build("fp4_deep_gemm", code);
+    const auto& runtime = compiler->build_cached<FP4GemmRuntime>("fp4_deep_gemm", args);
     const auto& kernel = runtime->kernel;
 
     int blocks_per_cu = 0;
@@ -654,15 +664,14 @@ static void fp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_params(kGemmType, false, std::string("fp4"), kNumGroups, m, n, k, 0, grouped_layout,
                                   current_stream());
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-    FP4GemmRuntime::launch(runtime, args);
-
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        FP4GemmRuntime::launch(runtime, args);
+    }
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {

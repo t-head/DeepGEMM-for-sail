@@ -328,6 +328,11 @@ struct Fp4TypeBuilder {
       thread_idx,
       (char*)&shared_storage.tensors.epilogue
     );
+    if constexpr (deep_gemm::is_act_and_quant_fused(kEpilogueType)) {
+      // The next builder reuses this storage for A/B, including when its tile
+      // shape differs. All warps must finish reading the activation tile first.
+      __syncthreads();
+    }
   }
 
 };

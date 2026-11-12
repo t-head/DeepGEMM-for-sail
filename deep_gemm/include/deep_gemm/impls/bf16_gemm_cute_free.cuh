@@ -12,7 +12,7 @@
 // Layering (cutlass3-style, all under deep_gemm/cute_free/):
 //   kernel/gemm.cuh          : generic orchestrator (prologue/mainloop/epilogue)
 //   copy/*, mma/*, epilogue/*: atoms (data type / platform specific)
-//   arch/*                   : low-level PTX wrappers
+//   arch/*                   : low-level instruction wrappers
 // =============================================================================
 
 #include <cstdint>
@@ -35,17 +35,19 @@ template <int BLOCK_M, int BLOCK_N, int BLOCK_K,
           bool DenseS2Opt,
           bool OverlapPrologue,
           bool IsAlignedN,
-          typename GemmTypeTag, typename ElementOutput = cutlass::bfloat16_t>
+          bool UsePackedStore,
+          typename GemmTypeTag, typename ElementOutput = cutlass::bfloat16_t,
+          int BCachePolicy = 1, bool NonPersistent = false>
 using BF16GemmCuteFreeKernel = kernel::GemmKernel<
     cutlass::bfloat16_t,
     copy::AiuG2SAtom<cutlass::bfloat16_t, BLOCK_M, BLOCK_K>,   // G2S A
-    copy::AiuG2SAtom<cutlass::bfloat16_t, BLOCK_N, BLOCK_K>,   // G2S B
+    copy::AiuG2SAtom<cutlass::bfloat16_t, BLOCK_N, BLOCK_K, BCachePolicy>,   // G2S B
     copy::TsmS2RAtom<cutlass::bfloat16_t, BLOCK_M, BLOCK_K, /*SwapLboSbo=*/false>,  // S2R A
     copy::TsmS2RAtom<cutlass::bfloat16_t, BLOCK_N, BLOCK_K, /*SwapLboSbo=*/true>,   // S2R B
     mma::Bf16MmaAtom,                                          // MMA
     epilogue::Epilogue<ElementOutput, mma::Bf16MmaAtom::CLayout,
-                             WARP_M, WARP_N, IsAlignedN>,      // Epilogue
+                             WARP_M, WARP_N, IsAlignedN, UsePackedStore>,
     BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, STAGES, DenseS2Opt, OverlapPrologue,
-    GemmTypeTag>;
+    GemmTypeTag, NonPersistent>;
 
 } // namespace deep_gemm

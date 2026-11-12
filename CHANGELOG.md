@@ -15,17 +15,160 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   as two BF16 matrices (typically `scale = 1/256`, i.e. the BF16 high part plus
   a scaled residual). Inputs are BF16 row-major `[m, k]` activations and
   `[n, k]` weights (NT layout); output is BF16 or FP32 row-major `[m, n]`.
-  Zhenwu M890P (PPU1.5) uses a fused dual-B cute-free kernel: a single
-  interleaved K pipeline per output tile carries A + W_high + W_low in every
-  stage (A is streamed once), two back-to-back MMAs per k-step feed two FP32
-  accumulators that are combined in registers and stored once (mirroring the
-  hpc-ops SMEM layout); stage counts are pruned to the per-CU SMEM budget and
-  m = 1/2 dispatch to the dedicated GEMV kernel as two passes composed in
-  FP32. Other PPU devices fall back to two BF16 GEMMs composed through an
-  FP32 intermediate. The `use_splitk` and
-  `split_flag` arguments are accepted for API compatibility: this build
-  performs no K-split, so the int32 workspace `[ceil(max_tokens/16),
-  ceil(n/64)]` is never written and stays zero. Requires `N % 2 == 0`.
+  Zhenwu M890P (PPU1.5) uses a fused dual-B cute-free kernel, including
+  m = 1/2: A is streamed once per K partition, high/low products accumulate
+  separately in FP32, and the final result is combined and stored once.
+  Stage counts are pruned to the per-CU shared-memory budget. Exact FP32
+  router decode (M = 8/16, N = 384, K = 7168) partitions K across two warps
+  within each CTA and reduces partials locally, without a global partial
+  workspace or a separate reduction kernel. Other PPU devices fall back to
+  two BF16 GEMMs composed through an FP32 intermediate. The `use_splitk`
+  and `split_flag` arguments are accepted for API compatibility; the int32
+  workspace `[ceil(max_tokens/16), ceil(n/64)]` is never written and stays
+  zero. Requires `N % 2 == 0`.
+
+## 1.1.0+v1.1.0
+
+### Added
+
+- **M890 NVFP4 W4A8 GEMMs**: adds `gemm_fp8_nvfp4_bf16_nt` and grouped
+  nopad, masked and fused-routing variants for FP8 activations and NVFP4
+  weights with BF16 output. Callers select fused decoding or per-call
+  decode-to-FP8 execution with a reusable workspace. Supports native K16
+  E4M3 scales, FP32 global scales, and per-channel or 128x128 outer scales.
+  See the [NVFP4 W4A8 API guide](docs/api/nvfp4_w4a8.md).
+
+- **Mega-mHC FP8 output**: `mega_mhc` can write FP8 E4M3 alongside or instead
+  of BF16. Supports grouped UE8M0 scales and per-token FP32 scales through
+  the optional `y_token_sf` API extension.
+- **M890 W4FA8 dense NT GEMM**: implements `fp8_fp4_gemm_nt` and its
+  `gemm_fp8_fp4_bf16_nt` alias with two-dimensional packed weights and
+  scale preprocessing, BF16 output, and optional scalar `inv_scale`.
+- **M890 K-grouped BF16 wgrad GEMM**: implements `k_grouped_bf16_gemm_tn_contiguous`
+  on PPU1.5 (ZW-M890P), replacing the `NotImplementedError` placeholder. Computes
+  `d[g] = c[g] + a_g^T @ b_g` over contiguous K segments with BF16 inputs
+  (`a [sumK, M]`, `b [sumK, N]`) and an FP32 `[G, M, N]` accumulator, with in-place
+  `c = d` beta=1 accumulation for consecutive micro-batches (a separate `c` is
+  copied into `d` first). Group lengths are supplied as a host-side `ks_cpu` list
+  mirrored by an int32 `grouped_layout` tensor on device; empty groups (`K_g = 0`)
+  keep the existing output, and zero total K returns without computation. Requires
+  each group's K to be a non-negative multiple of 128 with zeroed padding,
+  contiguous tensors, `use_psum_layout=False`, no custom epilogue, and
+  `compiled_dims="mn"`. Registers the upstream-compatible `epilogue.Epilogue`
+  interface type, which has no PPU implementations yet.
+
+- **FP8, W4A8 and W4A16 MegaMoE**: adds complete FP8 channelwise/blockwise,
+  E4M3 x MXFP4 and BF16 x MXFP4 routed pipelines through the common `SymmBuffer`
+  entry and precision-specific weight transforms in `deep_gemm.mega`. Supports
+  FP8 SwiGLU/SwiGLU-OAI, W4A8 SwiGLU/SwiGLU-OAI/SiTU, W4A16 SiTU, separate
+  replica banks and reusable library-owned communication state.
+
+- **Mega Gate**: adds `bf16_mega_gate`, fusing BF16 routing GEMM,
+  sqrt-softplus scoring, bias-aware Top-k selection, weight normalization
+  and scaling, and optional logical-to-physical expert mapping.
+
+### Changed
+
+- **MegaMoE MMA names**: uses `mma_type="fp4xfp4"`, `"fp8xfp4"`,
+  `"bf16xfp4"` and `"fp8xfp8"` consistently across workspace allocation,
+  pre-dispatch and precision-specific compute entries. W4A4 also accepts
+  `"mxfp4xmxfp4"` as an alias of `"fp4xfp4"`.
+
+- **BF16 dense GEMM**: `bf16_gemm_nt` now supports odd N with BF16 or
+  FP32 output on 890P, including an optimized N=1 path. On 810E, N must be
+  even except for N=1 without an explicit configuration; that path requires
+  K divisible by 8 and 16-byte-aligned inputs. On 890P, the retired
+  CUTLASS 3 dense fallback has been removed.
+
+- **M890 W4A4 MegaMoE**: optimizes dispatch, GEMM scheduling, and
+  scatter/reduce to improve computation and communication overlap.
+  - Renames `activation="step"` to `"swiglu_step"`.
+  - Adds `activation="swiglu_oai"` with optional `activation_alpha`
+    (default: `1.702`). Allows `situ_linear_beta=None` to disable SiTU
+    up softcap.
+  - Updates the preprocessed weight layout. Regenerate transformed weights
+    from raw weights using `transform_weights_for_mega_moe()`.
+  - Requires `mega_moe_pre_dispatch()` to prepare inputs; `x_sf` is now
+    internal staging storage and must not be populated using the old layout.
+  - Adds `staging_config` to the native C++ interfaces. `SymmBuffer` manages
+    and forwards it automatically; public Python callers need no additional
+    argument.
+  - Extends the supported top-k range from 1–16 to 1–32.
+- **810E paged indexer**: rejects page32 in metadata generation and compute
+  until the actlize TSM cross-cube addressing issue is resolved. Use page64
+  or page128; M890 retains page32 support.
+
+- **Indexer API contracts**: separates legacy FP8/INT8 from MXFP4 weighted
+  entry points and removes BF16 Q/K APIs. Legacy FP8 fixes weights/logits to
+  FP32; INT8 infers BF16 or FP32 logits from weights dtype and no longer
+  accepts `logits_dtype`. New weighted MXFP4 APIs fix weights/logits to BF16,
+  omit `clean_logits` / `logits_dtype`, and require compressed non-paged
+  output. Weighted paged APIs require `next_n=1`; legacy FP8/INT8 reject
+  non-None request indices, while MXFP4 requires them.
+- **AVG indexer API**: removes `clean_logits`, makes non-paged
+  `max_seqlen_k` mandatory and positive, and defaults all AVG logits to BF16
+  with optional FP32 output. Paged AVG retains `next_n=1–6` and places
+  `logits_dtype` after `indices`. `fp8_fp4_paged_mqa_avg_logits` accepts only
+  MXFP4; ordinary FP8 uses `fp8_paged_mqa_avg_logits`.
+- **Paged indexer metadata dtype**: changes `metadata_extra` to
+  `(next_n, num_heads, logical_head_dim, qk_dtype)`. `torch.int8` denotes
+  MXFP4 on M890 and INT8 on 810E; M890 rejects true INT8 indexer APIs.
+  MXFP4 callers now pass logical D128 instead of packed D64.
+- **Indexer shape contracts**: rejects unsupported dimensions and head counts
+  before dispatch. FP8/INT8 require logical D64/D128; MXFP4 requires D128.
+  DSA requires H32/H64, AVG H4, and sparse H32. Adds D64 check-in coverage.
+- **Indexer metadata and output layout**: provides a compatibility
+  `get_mqa_logits_metadata` stub returning None; dense MXFP4 ignores
+  `schedule_meta`. Sparse logits expose only logical candidate columns,
+  retaining aligned physical row strides. Legacy `clean_logits` defaults
+  to False and rejects True; invalid output positions remain unspecified.
+  See the [indexer API guide](docs/api/indexer.md) for complete signatures,
+  migration requirements, paged `metadata_extra` settings and recommended
+  810E INT8/BF16 and M890 MXFP4/BF16 integration.
+
+- **M890 W4FA8 execution**: expands native tile coverage, unifies automatic
+  tile selection, and overlaps streamed weight decoding with FP8 GEMM for
+  NoPad/Fused. Adds tile and resource diagnostics through `show_log=1`.
+  Streamed execution also admits dense and one-to-seven-expert workloads when
+  row count and tile parallelism are sufficient, with native fallback for small
+  shapes. Single-part plans allocate one decoded-weight buffer. Existing grouped
+  APIs and the nine-element config format remain unchanged.
+
+### Fixed
+
+- **Paged indexer metadata synchronization**: moves the existing scan barriers
+  after shared-memory writes in both the main and tail prefix scans, preventing
+  incorrect scheduling boundaries without adding barriers. The scheduler stops
+  at the exact metadata endpoint. This fixes a race that could cause missing or
+  incorrect logits, or continued task execution past the intended endpoint.
+
+- **FP4 fused epilogue shared-memory reuse**: adds a CTA barrier for the
+  `SiluAndMulPostQuantFp4` and `SiluAndMulStepPostQuantFp4` path because of
+  shared-memory reuse between the mainloop and the epilogue. The activation
+  tile must be fully read before the next tile loads A/B into the same storage.
+  Applies to both the persistent and the dynamic-tile FP4 kernels; default
+  epilogues, tile selection and dispatch are unchanged.
+
+- **W4A16 TSM epilogue shared-memory reuse**: `epilogue_with_tsm` synchronizes
+  the K0 warps after copying `sC` to registers whenever another `step_m`
+  follows, because the next step reuses the same `sC` storage. The final step
+  needs no extra round: the CTA-wide barrier after the epilogue already covers
+  it. Tile selection and dispatch are unchanged.
+
+## 1.1.0+v1.0.0
+
+### Added
+
+- **W4A4 MegaMoE**: adds the complete MXFP4 routed MoE pipeline with BF16
+  output on PPU1.5, validated on ZW-M890P. Exports workspace allocation,
+  weight transformation, input preparation and `fp4_fp4_mega_moe` through
+  `deep_gemm.mega` and the package root. Supports SwiGLU, Step, SiTU and
+  separate UltraEP replica weight banks; original routing weights are applied
+  once in combine. Reusable workspaces manage communication and scratch state,
+  including empty ranks and graph replay. Includes correctness tests and optional
+  DeepEP benchmarks.
+  See the [calling contract](README.md#mega-moe) and
+  [test guide](tests/README.MD#routed-moe-correctness-and-performance-tests).
 - **Mega-mHC for DeepSeek V4.1 Flash**: adds `mega_mhc` for fused shifted
   mHC computation on Zhenwu M890P, with `hc_mult=4`, hidden size
   `5120`, and BF16 output. Writes the updated residual, mix coefficients,
@@ -81,6 +224,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Changed
 
+- **Package versioning**: combines DeepGEMM's own version, its release version,
+  and the PPU SDK version, e.g. `1.1.0+v1.0.0.ppu2.2.0`.
 - **Paged MQA page sizes**: extends regular paged MQA from page size 64
   to 32, 64, and 128.
 - **Canonical GEMM bindings**: promotes existing short GEMM names to the

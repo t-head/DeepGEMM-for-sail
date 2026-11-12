@@ -37,11 +37,18 @@ def parse_test_results(xml_path):
         is_skipped = tc.find("skipped") is not None
         is_failure = tc.find("failure") is not None
         is_error = tc.find("error") is not None
+        issues = tc.findall("failure") + tc.findall("error")
+        messages = [node.get("message", "").strip() for node in issues if node.get("message", "").strip()]
+        details = [node.text.strip("\n") for node in tc.findall("system-err") if node.text and node.text.strip()]
+        if not details:
+            details = [node.text.strip("\n") for node in issues if node.text and node.text.strip()]
+        error_log = "\n\n".join(messages + details) if issues else ""
         testcases.append({
             "name": name,
             "time": t,
             "passed": not is_failure and not is_error and not is_skipped,
             "skipped": is_skipped,
+            "error_log": error_log,
         })
 
     return {
@@ -84,7 +91,7 @@ def generate_markdown_summary(stats, env_info=None):
     repo_prefix = f"{repo} " if repo else ""
     lines.append(f"## {repo_prefix}Test Results{suffix}\n")
     # ---- Summary overview ----
-    lines.append('<h3>概览</h3>')
+    lines.append('<h3>Overview</h3>')
     lines.append('<table>')
     lines.append('<tr>'
                  '<th>Total Cases</th>'
@@ -116,15 +123,26 @@ def generate_markdown_summary(stats, env_info=None):
     lines.append('<details>')
     lines.append(f"<summary><b>Test Details ({len(stats['testcases'])})</b></summary>")
     lines.append('<table>')
-    lines.append('<tr><th>Test Case</th><th>Time</th><th>Status</th></tr>')
+    lines.append('<tr><th>Test Case</th><th>Time</th><th>Status</th><th>Error Log</th></tr>')
+    failed_count = sum(not tc["passed"] and not tc.get("skipped") for tc in stats["testcases"])
+    # Escaping can expand each character to six bytes; reserve space below GitHub's 1 MiB limit.
+    log_char_limit = min(12000, 512 * 1024 // (6 * max(1, failed_count)))
     for tc in stats["testcases"]:
+        error_log = ""
         if tc.get("skipped"):
             status = "⏭ Skipped"
         elif tc["passed"]:
             status = "✅ Passed"
         else:
             status = "❌ Failed"
-        lines.append(f"<tr><td>{tc['name']}</td><td>{tc['time']:.1f}s</td><td>{status}</td></tr>")
+            text = tc.get("error_log") or "No error details in JUnit report."
+            if len(text) > log_char_limit:
+                text = "[Truncated; showing log tail]\n" + (text[-log_char_limit:] if log_char_limit else "")
+            # Keep table rows on one Markdown line, including logs containing blank lines.
+            log_html = html.escape(text).replace("\r", "").replace("\n", "<br>")
+            error_log = f"<details><summary>show</summary><pre>{log_html}</pre></details>"
+        lines.append(f"<tr><td>{html.escape(tc['name'])}</td><td>{tc['time']:.1f}s</td>"
+                     f"<td>{status}</td><td>{error_log}</td></tr>")
     lines.append('</table>')
     lines.append('</details>')
     return "\n".join(lines) + "\n"

@@ -18,8 +18,10 @@ inline constexpr uint32_t kNumSparseSlotBits = 16;
 inline constexpr uint32_t kInvalidSparseSlot = (1u << kNumSparseSlotBits) - 1;
 // One KV split is one 128-token KV tile of the sparse main kernel (BLOCK_KV = 128).
 inline constexpr uint32_t kSplitKV = 128;
-// Persistent CTAs per CU: 64 warp-engine slots / 16 warps per CTA = 4.
-inline constexpr uint32_t kNumTbPerCu = 4;
+// Eight-warp CTAs leave room for seven resident blocks per CU, including
+// the shared-memory footprint of the three-stage KV pipeline.
+inline constexpr uint32_t kNumWarpsPerCTA = 8;
+inline constexpr uint32_t kNumTbPerCu = 7;
 inline constexpr uint32_t kContiguousFlag = 0x80000000u;
 
 // Metadata buffer layout (all little-endian u32 words), produced by the metadata kernel:

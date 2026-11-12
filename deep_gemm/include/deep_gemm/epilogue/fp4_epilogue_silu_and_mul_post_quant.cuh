@@ -10,6 +10,7 @@
 #include <cutlass/epilogue/thread/activation.h>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/epilogue/epilogue_traits.cuh>
+#include <deep_gemm/epilogue/gated_activation.cuh>
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -28,7 +29,11 @@ template <
   class EpilogueSchedule_,
   bool IsAlignedN = false, // ProblemN % blockN == 0, used for deepgemm
   bool kApplySwigluLimit = false,
-  deep_gemm::EpilogueType kEpilogueVariant = deep_gemm::EpilogueType::SiluAndMulPostQuantFp4
+  deep_gemm::EpilogueType kEpilogueVariant = deep_gemm::EpilogueType::SiluAndMulPostQuantFp4,
+  class ActivationOp = deep_gemm::GatedActivationOp<
+      kEpilogueVariant == deep_gemm::EpilogueType::SiluAndMulStepPostQuantFp4
+          ? deep_gemm::GatedActivation::SwiGLUStep : deep_gemm::GatedActivation::SwiGLU,
+      kApplySwigluLimit>
 >
 class EpilogueSiluAndMulPostQuant: public DefaultEpilogueNoTsm<StrideC_, StrideD_, ThreadEpilogueOp_, EpilogueSchedule_, IsAlignedN>{
 public:
@@ -41,15 +46,6 @@ public:
   using typename Base::FragmentAccumulator;
   using Base::kIsAlignedN;
 
-  // STEP models clamp silu(gate) AFTER the activation instead of clamping the gate before it.
-  static constexpr bool kSiluThenClamp = (kEpilogueVariant == deep_gemm::EpilogueType::SiluAndMulStepPostQuantFp4);
-
-  // Clamp only happens when swiglu_limit is enabled. The standard swiglu clamps the gate BEFORE
-  // silu (used in two loops below, hence the alias); the STEP variant clamps silu(gate) AFTER it
-  // (a single use, spelled out inline as `kApplySwigluLimit && kSiluThenClamp`). With the limit
-  // disabled both collapse to plain silu(gate) * up.
-  static constexpr bool kClampBeforeSilu = kApplySwigluLimit && !kSiluThenClamp;
-
   using VectorTypeOutputScale = Array<uint8_t, 2>;
   static constexpr int TSM_PADDING = 4; // padding 1 float for bankconflict
 
@@ -60,7 +56,7 @@ public:
   struct Arguments : Base::Arguments {
     uint16_t* ptr_SFD = nullptr;
     uint32_t shape_m = 0;
-    float swiglu_limit = 0.f;
+    typename ActivationOp::Params activation{};
   };
   using Params = Arguments;
 
@@ -248,63 +244,51 @@ public:
 
     static constexpr int MMA_M = decltype(size<1>(shape<0>(accumulators)))::value;
     static constexpr int MMA_N = decltype(size<2>(shape<0>(accumulators)))::value;
+    // Each activation step covers 16 M rows per warp.
+    constexpr int act_rows_per_warp_m = act_layout_stride_warp_m / act_layout_stride_thread_m;
+    constexpr int act_rows_per_warp_iter_m = act_layout_stride_warp_iter_m / act_layout_stride_thread_m;
     int warp_base_offset = warp_m_idx * act_layout_stride_warp_m + (lane_idx / 4) * act_layout_stride_thread_m + warp_n_idx * act_layout_stride_warp_n + (lane_idx % 4); // * act_layout_stride_thread_n=1
     auto smem_act_tensor_ptr_per_lane = smem_act_tensor_ptr + warp_base_offset;
-    cutlass::epilogue::thread::Sigmoid<ElementAccumulator> sigmoid_accumulator;
-    multiplies<ElementAccumulator> mul_accumulator;
+    const int act_rows_left = get<0>(residue_mnk) - warp_m_idx * act_rows_per_warp_m;
     cute::for_each(make_int_sequence<WARP_ITER_M_NUM>{}, [&](auto warp_iter_m) {
+      // Skip 16-row groups wholly beyond M.
+      if (warp_iter_m * act_rows_per_warp_iter_m >= act_rows_left) return;
       cute::for_each(make_int_sequence<MMA_M>{}, [&](auto mma_m) {
-        // unroll inner loops manually to mitigate compute deps
-        ElementAccumulator sigmoid_accums[WARP_ITER_N_NUM][MMA_N];
-        ElementAccumulator mul_accums[WARP_ITER_N_NUM][MMA_N];
-        cute::for_each(make_int_sequence<WARP_ITER_N_NUM>{}, [&](auto warp_iter_n) {
-          cute::for_each(make_int_sequence<MMA_N>{}, [&](auto mma_n) {
-            FragmentAccumulator input_array = *reinterpret_cast<const FragmentAccumulator*>(accumulators(make_coord(_, mma_m, mma_n), warp_iter_m, warp_iter_n).data());
-
-            // 0. sigmoid only for better compute deps
-            if constexpr (kClampBeforeSilu) {
-              // standard swiglu: clamp the gate from above, then sigmoid the clamped gate.
-              // using mul_accums[warp_iter_n][mma_n] to store gate_clamped
-              mul_accums[warp_iter_n][mma_n] = min(input_array[0], params.swiglu_limit);
-              sigmoid_accums[warp_iter_n][mma_n] = sigmoid_accumulator(mul_accums[warp_iter_n][mma_n]);
-            } else {
-              sigmoid_accums[warp_iter_n][mma_n] = sigmoid_accumulator(input_array[0]);
-            }
+        auto for_each_fragment = [&](auto visit) {
+          cute::for_each(make_int_sequence<WARP_ITER_N_NUM>{}, [&](auto warp_iter_n) {
+            cute::for_each(make_int_sequence<MMA_N>{}, [&](auto mma_n) {
+              const auto* input = reinterpret_cast<const FragmentAccumulator*>(
+                  accumulators(make_coord(_, mma_m, mma_n), warp_iter_m, warp_iter_n).data());
+              constexpr int act_offset = warp_iter_m * act_layout_stride_warp_iter_m + mma_m * act_layout_stride_mma_m
+                                       + warp_iter_n * act_layout_stride_warp_iter_n + mma_n * act_layout_stride_mma_n;
+              visit(warp_iter_n, mma_n, *input, smem_act_tensor_ptr_per_lane[act_offset]);
+            });
           });
-        });
+        };
 
-        cute::for_each(make_int_sequence<WARP_ITER_N_NUM>{}, [&](auto warp_iter_n) {
-          cute::for_each(make_int_sequence<MMA_N>{}, [&](auto mma_n) {
-            if constexpr (kClampBeforeSilu) {
-              // silu(gate_clamped) = gate_clamped * sigmoid(gate_clamped)
-              mul_accums[warp_iter_n][mma_n] = mul_accumulator(mul_accums[warp_iter_n][mma_n], sigmoid_accums[warp_iter_n][mma_n]);
-            } else {
-              // silu(gate) = gate * sigmoid(gate)
-              FragmentAccumulator input_array = *reinterpret_cast<const FragmentAccumulator*>(accumulators(make_coord(_, mma_m, mma_n), warp_iter_m, warp_iter_n).data());
-              mul_accums[warp_iter_n][mma_n] = mul_accumulator(input_array[0], sigmoid_accums[warp_iter_n][mma_n]);
-              if constexpr (kApplySwigluLimit && kSiluThenClamp) {
-                // STEP models: clamp silu(gate) from above AFTER the activation.
-                mul_accums[warp_iter_n][mma_n] = min(mul_accums[warp_iter_n][mma_n], params.swiglu_limit);
-              }
-            }
+        if constexpr (ActivationOp::kKind == deep_gemm::GatedActivation::SiTU) {
+          for_each_fragment([&](auto, auto, const auto& input, auto& output) {
+            output = ActivationOp::apply(input[0], input[1], params.activation);
           });
-        });
-
-        cute::for_each(make_int_sequence<WARP_ITER_N_NUM>{}, [&](auto warp_iter_n) {
-          cute::for_each(make_int_sequence<MMA_N>{}, [&](auto mma_n) {
-            FragmentAccumulator input_array = *reinterpret_cast<const FragmentAccumulator*>(accumulators(make_coord(_, mma_m, mma_n), warp_iter_m, warp_iter_n).data());
-            if constexpr (kApplySwigluLimit) {
-              auto up_clamped = max(min(input_array[1], params.swiglu_limit), -params.swiglu_limit);
-              sigmoid_accums[warp_iter_n][mma_n] = mul_accumulator(mul_accums[warp_iter_n][mma_n], up_clamped);
-            } else {
-              sigmoid_accums[warp_iter_n][mma_n] = mul_accumulator(mul_accums[warp_iter_n][mma_n], input_array[1]);
-            }
-
-            // dump vals after silu_and_mul
-            constexpr int act_offset = warp_iter_m * act_layout_stride_warp_iter_m + mma_m * act_layout_stride_mma_m + warp_iter_n * act_layout_stride_warp_iter_n + mma_n * act_layout_stride_mma_n;
-            smem_act_tensor_ptr_per_lane[act_offset] = sigmoid_accums[warp_iter_n][mma_n];
+        } else {
+          // Issue all sigmoids before the dependent multiplies.
+          ElementAccumulator sigmoid_accums[WARP_ITER_N_NUM][MMA_N];
+          ElementAccumulator mul_accums[WARP_ITER_N_NUM][MMA_N];
+          for_each_fragment([&](auto warp_iter_n, auto mma_n, const auto& input, auto&) {
+            const auto gate = ActivationOp::prepare_gate(input[0], params.activation);
+            if constexpr (kApplySwigluLimit)
+              mul_accums[warp_iter_n][mma_n] = gate;
+            sigmoid_accums[warp_iter_n][mma_n] = ActivationOp::sigmoid(gate, params.activation);
           });
-        });
+          for_each_fragment([&](auto warp_iter_n, auto mma_n, const auto& input, auto&) {
+            const auto gate = kApplySwigluLimit ? mul_accums[warp_iter_n][mma_n] : input[0];
+            mul_accums[warp_iter_n][mma_n] = ActivationOp::gate_times_sigmoid(
+                gate, sigmoid_accums[warp_iter_n][mma_n], params.activation);
+          });
+          for_each_fragment([&](auto warp_iter_n, auto mma_n, const auto& input, auto& output) {
+            output = ActivationOp::multiply_up(mul_accums[warp_iter_n][mma_n], input[1], params.activation);
+          });
+        }
       });
     });
 
@@ -345,7 +329,7 @@ public:
 
     // copy thread layout is (WARP, 32):(32, 1)
     // each warp traverse in rows T0V0, T1V0, ..., T31V0
-    constexpr int SCALE_WARP_ITER_NUM_N = ceil_div(WARP_ITER_NUM_N, 2);
+    constexpr int SCALE_WARP_ITER_NUM_N = deep_gemm::math::ceil_div(WARP_ITER_NUM_N, 2);
     int warp_offset_base = warp_idx * quant_layout_stride_warp_m + lane_idx;
     auto smem_act_tensor_ptr_read_per_lane = smem_act_tensor_ptr + warp_offset_base;
     int out_warp_offset_base = warp_idx * out_quant_layout_stride_warp_m + (lane_idx / 2);

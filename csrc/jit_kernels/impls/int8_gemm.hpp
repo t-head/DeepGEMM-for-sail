@@ -21,6 +21,7 @@
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/batch_gemm_args.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
 
 using namespace deep_gemm_int8;
@@ -127,6 +128,17 @@ public:
                 hw_info,   args.scheduler, workspace};
     }
 
+    // Keep this key in sync with the arguments formatted by generate_impl below.
+    // Raw N only affects code through its tile alignment; M, K and all pointers are
+    // runtime arguments. PpuHwParams and the generated include hash are immutable.
+    static auto compile_key(const Args& args) {
+        const auto& info = args.launch_info;
+        const bool is_aligned_n = cute::get<1>(args.kernel_params.problem_shape) % info.block_n == 0;
+        return std::make_tuple(args.type_info, info.block_m, info.block_n, info.block_k,
+                               info.warp_m, info.warp_n, info.warp_k, info.num_stages,
+                               info.dense_s2_opt, is_aligned_n, info.kernel_name);
+    }
+
     static std::string generate_impl(const Args& args) {
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
@@ -137,7 +149,6 @@ public:
         const int shape_n = cute::get<1>(args.kernel_params.problem_shape);
         const bool is_aligned_n = (shape_n % args.launch_info.block_n == 0);
         return fmt::format(R"(
-#define INT8_HGRTC
 #include <deep_gemm/impls/int8_densegemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
@@ -269,7 +280,8 @@ __global__ void {10}(
 
 // MoE grouped-path runtime restored to baseline 753f28f form (no warp_k / dense_s2_opt).
 // Used by m_grouped_int8_gemm.hpp; generates DeepGemmUniversal + DeepGemmScheduler kernels.
-class INT8GemmCutlass3Runtime final : public LaunchRuntime<INT8GemmCutlass3Runtime> {
+template <bool kIsBatchGemm>
+class INT8GemmCutlass3RuntimeT final : public LaunchRuntime<INT8GemmCutlass3RuntimeT<kIsBatchGemm>> {
 public:
     using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
     using GemmProblemSize = cute::tuple<int32_t, int32_t, int32_t, int32_t>;
@@ -282,6 +294,9 @@ public:
         float const* ptr_scale_A;
         float const* ptr_scale_B;
     };
+
+    using SelectedMainLoopArguments = std::conditional_t<kIsBatchGemm,
+        BatchGemmMainloopArguments<MainLoopArguments>, MainLoopArguments>;
 
     struct LinearCombinationArgs {
         float alpha = 1.0f;
@@ -313,24 +328,21 @@ public:
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         std::string gemm_type, kernel_strategy, kernel_name;
         bool enable_sbo_overlap;
-        // Only meaningful for `GemmType::Batched`. `true` keeps the transposed `[M, B, N]`
-        // output used by `einsum("bhr,hdr->bhd")`; `false` emits a plain `[B, M, N]` output.
-        bool transposed_batch_output = true;
-        // `true` selects the PPU0010 A8W4 INT8 mainloop (packed signed INT4 weights).
+        // Select the PPU0010 A8W4 INT8 mainloop.
         bool a8w4_int8 = false;
     };
 
     struct GemmArguments {
         GemmUniversalMode mode;
         GemmProblemSize problem_shape;
-        MainLoopArguments mainloopargs;
+        SelectedMainLoopArguments mainloopargs;
         EpilogueArgs epilogueargs;
         cutlass::KernelHardwareInfo hw_info;
         TileSchedulerArguments scheduler{};
         int32_t* signal{nullptr};
     };
 
-    using CollectiveMainloopParams = MainLoopArguments;
+    using CollectiveMainloopParams = SelectedMainLoopArguments;
 
     // One epilogue-params layout per device generation (must match the device Params bytes).
     using EpilogueParamNoTsm = EpilogueArgs;  // PPU1.5: the args are the params, as-is
@@ -406,6 +418,7 @@ public:
     }
 
     static std::string generate_impl(const Args& args) {
+        DG_HOST_ASSERT((args.launch_info.gemm_type == "Batched") == kIsBatchGemm);
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
         // One snapshot drives both the union member read and the injected epilogue flag.
@@ -419,7 +432,6 @@ public:
         const auto host_params_size = with_tsm_epilogue ? sizeof(args.kernel_params.with_tsm)
                                                         : sizeof(args.kernel_params.no_tsm);
         return fmt::format(R"(
-#define INT8_HGRTC
 #include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
 #include <deep_gemm/impls/a8w4_int8_gemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
@@ -428,10 +440,10 @@ using namespace cute;
 using cutlass::KernelHardwareInfo;
 
 // Injected device hardware constants (host-side hggcDeviceGetAttribute query).
-constexpr int kHwTsmPerCu         = {15};
-constexpr int kHwMaxThreadsPerCta = {16};
-constexpr int kHwMaxWarpsPerCu    = {17};
-constexpr int kHwTotalVregPerCu   = {18};
+constexpr int kHwTsmPerCu         = {14};
+constexpr int kHwMaxThreadsPerCta = {15};
+constexpr int kHwMaxWarpsPerCu    = {16};
+constexpr int kHwTotalVregPerCu   = {17};
 
 constexpr int SHAPE_N = {0};
 constexpr int SHAPE_K = {1};
@@ -442,7 +454,7 @@ constexpr int NUM_GROUPS = {5};
 constexpr int WARP_M = {6};
 constexpr int WARP_N = {7};
 constexpr int STAGES = {8};
-#define DG_A8W4_INT8 {21}
+#define DG_A8W4_INT8 {20}
 constexpr bool kA8W4Int8 = DG_A8W4_INT8;
 
 #if __HGGC_ARCH__ == 100
@@ -591,7 +603,7 @@ using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::Colle
 
 
 // Injected epilogue choice (is_ppu1v5_device()); matches to_underlying_arguments_rtc.
-static constexpr bool kWithTsmEpilogue = {19};
+static constexpr bool kWithTsmEpilogue = {18};
 using CollectiveEpilogue = typename cutlass::platform::conditional<
     kWithTsmEpilogue,
     CollectiveEpilogue_withTsm,
@@ -599,11 +611,10 @@ using CollectiveEpilogue = typename cutlass::platform::conditional<
 >::type;
 
 static constexpr GemmType kGemmType = GemmType::{12};
-constexpr bool kTransposedBatchOutput = {13};
 
 using TileScheduler = DeepGemmScheduler<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS,
                                         ceil_div((uint32_t)SHAPE_N, (uint32_t)(BLOCK_N * N_EXPAND)), 2,
-                                        EpilogueType::Default, kTransposedBatchOutput>;
+                                        EpilogueType::Default>;
 using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
     Shape<int,int,int,int>,
     CollectiveMainloop,
@@ -612,7 +623,7 @@ using GemmKernel = cutlass::gemm::kernel::DeepGemmUniversal<
     kEnableSboOverlap>;
 
 // Host/device Params ABI check (the driver copies sizeof(device Params) bytes from the host struct).
-static_assert(sizeof(GemmKernel::Params) == {20}, "host/device kernel Params size mismatch");
+static_assert(sizeof(GemmKernel::Params) == {19}, "host/device kernel Params size mismatch");
 
 // scale-A/B cp.async addresses: each stream keeps a 64-bit global address and a
 // 32-bit shared address, for 2 * 3 = 6 VREGs; A/B use the AIU load path.
@@ -639,7 +650,7 @@ using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K,
 
 extern "C"
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
-__global__ void {14}(
+__global__ void {13}(
   typename GemmKernel::Params params
 ) {{
   extern __shared__ char smem[];
@@ -653,7 +664,7 @@ __global__ void {14}(
                            args.launch_info.block_n, args.launch_info.block_k, args.launch_info.num_groups,
                            args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages,
                            args.type_info, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_strategy,
-                           args.launch_info.gemm_type, args.launch_info.transposed_batch_output, args.launch_info.kernel_name,
+                           args.launch_info.gemm_type, args.launch_info.kernel_name,
                            hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
                            with_tsm_epilogue, host_params_size, static_cast<int>(args.launch_info.a8w4_int8));
     }
@@ -662,6 +673,9 @@ __global__ void {14}(
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, configs, args.kernel_params));
     }
 };
+
+using INT8GemmCutlass3Runtime = INT8GemmCutlass3RuntimeT<false>;
+using INT8BatchGemmCutlass3Runtime = INT8GemmCutlass3RuntimeT<true>;
 
 // 8-element public boundary ConfigTuple (matches Python/vLLM stable contract).
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
@@ -679,14 +693,14 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
 
     WorkConfigTuple selected_config;
     if (configs.has_value()) {
-        // Explicit config path: unpack the 8-element public tuple; force warp_k = block_k, dense_s2_opt = false
-        // (mirrors deep_gemm/jit_kernels/gemm.py lines 406-408/422; adaptive is NOT re-evaluated here).
+        // Explicit config path: unpack the 8-element public tuple; force warp_k = block_k and
+        // dense_s2_opt = false without re-evaluating adaptive selection.
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
         selected_config = std::make_tuple(ns, bm, bn, bk, wm, wn, /*warp_k=*/bk, nst, /*dense_s2_opt=*/false,
             deep_gemm_int8::get_smem_config(nst, k, bm, bn, bk, 1));
     } else {
-        // Heuristic path: get_best_configs now returns the baseline 8-tuple; adaptive warp_k/dense_s2_opt
-        // injection is done here (dense-only), mirroring deep_gemm/jit_kernels/gemm.py.
+        // Heuristic path: get_best_configs returns the baseline 8-tuple; dense-only adaptive
+        // warp_k/dense_s2_opt selection is applied here.
         const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
         bool from_runtime_lut = false;
         auto [ns, bm, bn, bk, wm, wn, nst, sc] = deep_gemm_int8::get_best_configs(
@@ -780,22 +794,20 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
             .kernel_params = params,
             .type_info = type_info,
         };
-        const auto& code = DenseINT8GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build(dense_kernel_name, code);
+        const auto& runtime = compiler->build_cached<DenseINT8GemmCutlass3Runtime>(dense_kernel_name, args);
         const auto& kernel = runtime->kernel;
         int blocks_per_cu = 0;
         HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
         args.launch_args.grid_dim.x *= blocks_per_cu;
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
+        if (deep_gemm::profiling_enabled()) {
             dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout, current_stream());
         }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        DenseINT8GemmCutlass3Runtime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        {
+            auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+            DenseINT8GemmCutlass3Runtime::launch(runtime, args);
+        }
 
         char* pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {
@@ -847,14 +859,13 @@ static void gemm_a8w8_per_channel_nt(const torch::Tensor& lhs, const torch::Tens
         args.launch_args.grid_dim.x *= blocks_per_cu;
 
         DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
+        if (deep_gemm::profiling_enabled()) {
             dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, grouped_layout, current_stream());
         }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        INT8GemmCutlass3Runtime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
+        {
+            auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+            INT8GemmCutlass3Runtime::launch(runtime, args);
+        }
 
         char* pEnv_params = std::getenv("show_log");
         if (pEnv_params && isdigit(*pEnv_params)) {

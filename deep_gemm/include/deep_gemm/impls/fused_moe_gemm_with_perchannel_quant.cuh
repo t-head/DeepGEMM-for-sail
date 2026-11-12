@@ -5,7 +5,6 @@
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/math.cuh>
-#include <deep_gemm/common/profiling_interface.cuh>
 
 #include <cute/ppu_tensor_mix.hpp>
 #include <cutlass/gemm/config/gemm_operands.hpp>
@@ -358,111 +357,6 @@ a8w8_perchannel_quant_gemm_fused_moe_kernel_impl(const QuantGemmArgs args) {
     }
 }
 
-// Forwarding __global__ kernel — delegates to __device__ _impl (trampoline)
-template <class _SrcT, GemmType kGemmType,
-          uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t WARP_M, uint32_t WARP_N,
-          uint32_t BLOCK_SIZE, int kNumStages>
-__global__ __launch_bounds__(BLOCK_SIZE, 1) void
-a8w8_perchannel_quant_gemm_fused_moe_kernel(const QuantGemmArgs args) {
-    a8w8_perchannel_quant_gemm_fused_moe_kernel_impl<
-        _SrcT, kGemmType,
-        SHAPE_N, SHAPE_K, kNumGroups,
-        BLOCK_M, BLOCK_N, BLOCK_K,
-        WARP_M, WARP_N, BLOCK_SIZE, kNumStages
-    >(args);
-}
-
-template <typename SrcT>
-struct TypeToString {
-    static constexpr const char* value = "unsupported";
-};
-
-template <>
-struct TypeToString<int8_t> {
-    static constexpr const char* value = "int8";
-};
-
-template <>
-struct TypeToString<__hg_fp8_e4m3> {
-    static constexpr const char* value = "fp8";
-};
-
-template <class SrcT, uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t kNumGroups,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t WARP_M, uint32_t WARP_N, int32_t kNumStages,
-          GemmType kGemmType, bool kEnableSboOverlap = false,
-          KernelStrategy kKernelStrategy = KernelStrategy::Default>
-class FusedMoeGemmWithPerChannelQuant {
-    using DstT = __ppu_bfloat16;
-    static_assert(sizeof_bits_v<SrcT> == 8, "SrcT must be an 8-bit type");
-
-public:
-    FusedMoeGemmWithPerChannelQuant() = default;
-
-    static void run(DstT* gmem_d, SrcT* gmem_a, SrcT* gmem_b, float* gmem_sa, float* gmem_sb,
-                    int* m_rows, int* expert_ids_and_cumsum, int* sorted_token_ids,
-                    int* aligned_num_m_blocks, uint32_t shape_m, uint32_t topk,
-                    hggcStream_t stream, int num_sms) {
-
-        QuantGemmArgs args;
-
-        args.a_ptr = (void *)gmem_a;
-        args.b_ptr = (void *)gmem_b;
-        args.c_ptr = (void *)gmem_d;
-        args.scale_a_ptr = (void *)gmem_sa;
-        args.scale_b_ptr = (void *)gmem_sb;
-
-        args.expert_ids_and_cumsum = expert_ids_and_cumsum;
-        args.sorted_token_ids = sorted_token_ids;
-        args.aligned_num_m_blocks = aligned_num_m_blocks;
-        args.shape_m = shape_m;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()){
-            dg_prof_params.set_fused_moe_params(
-                std::string(TypeToString<SrcT>::value), std::string("channel"), kNumGroups, shape_m, topk, SHAPE_N, SHAPE_K, m_rows, stream
-            );
-        }
-
-        // dispatch and launch kernel
-        constexpr int BlockSize = BLOCK_M / WARP_M * BLOCK_N / WARP_N * 32;
-
-        auto device_func = a8w8_perchannel_quant_gemm_fused_moe_kernel<
-                              SrcT, kGemmType, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BlockSize, kNumStages>;
-        constexpr int smem_size = gemm_smem_total_size(sizeof(SrcT), kNumStages, BLOCK_M, BLOCK_N, BLOCK_K);
-        CHECK_HGGC(hggcFuncSetAttribute(device_func, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        int max_blocks_per_cu = -1;
-        CHECK_HGGC(hggcOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_cu, device_func, BlockSize, smem_size));
-
-        int sm_count = num_sms * max_blocks_per_cu;
-        dim3 grid(sm_count, 1, 1);
-
-        const char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && std::atoi(pEnv_params) == 1) {
-            hggcFuncAttributes attr;
-            hggcFuncGetAttributes(&attr, device_func);
-            std::string data_type = TypeToString<SrcT>::value;
-            std::transform(data_type.begin(), data_type.end(), data_type.begin(), ::toupper);
-            printf("[FusedMoeGemmWithPerchannelQuant-%s:]\n", data_type.c_str());
-            printf("group:%d, problem:[%d, %d, %d], gemm_type:%s, kernel_strategy:%s\n",
-                kNumGroups, shape_m, SHAPE_N, SHAPE_K, GemmTypeS[static_cast<int>(kGemmType)], KernelStrategyS[static_cast<int>(kKernelStrategy)]);
-
-            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], kNumStages:%d\n",
-                BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K, kNumStages);
-
-            printf("grid:%d, vreg:%d, smem_size: %d, tb_per_cu:%d, stack:%d\n",
-                sm_count, int(attr.numRegs), smem_size, max_blocks_per_cu, int(attr.localSizeBytes));
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-        device_func<<<grid, BlockSize, smem_size, stream>>>(args);
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-    }
-};
-
-
 } // namespace deep_gemm
-
 
 #pragma clang diagnostic pop

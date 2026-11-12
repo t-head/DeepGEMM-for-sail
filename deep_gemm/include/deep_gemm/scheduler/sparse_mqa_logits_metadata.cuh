@@ -91,35 +91,35 @@ __device__ __forceinline__ uint32_t cta_exclusive_sum_u32(const uint32_t value, 
 
 // Divide `total` KV splits evenly across SMs, then cut each SM range at Q-block boundaries.
 // `smem_max_entries[kNumSlots]` is per-thread scratch for the wave-count reduction.
-template <uint32_t kNumKVBlocksPerSplit, uint32_t kNumSlots>
+template <uint32_t kNumKVBlocksPerSplit, uint32_t kNumSlots, uint32_t kNumThreads>
 __device__ __forceinline__ uint32_t build_contiguous_schedule(
     ScheduleEntry* schedule_entries, const KVSplit<kNumKVBlocksPerSplit>* kv_splits,
     const QBlockInfo* q_block_infos, const uint32_t num_q_tokens, const uint32_t total_kv_splits,
     uint32_t* smem_num_waves, uint32_t* smem_max_entries) {
-    constexpr uint32_t kNumThreads = 256;
     const uint32_t tid = threadIdx.x;
 
     if (tid == 0)
         *smem_num_waves = 1;
     __syncthreads();
 
-    uint32_t num_slot_entries = 0;
-    if (tid < kNumSlots) {
+    // Schedule slots need not fit in one CTA: each thread can own multiple
+    // independent columns without increasing the metadata merge CTA size.
+    for (uint32_t slot = tid; slot < kNumSlots; slot += kNumThreads) {
+        uint32_t num_slot_entries = 0;
         uint32_t kv_split_idx = static_cast<uint32_t>(
-            (static_cast<uint64_t>(total_kv_splits) * tid + kNumSlots - 1) / kNumSlots);
+            (static_cast<uint64_t>(total_kv_splits) * slot + kNumSlots - 1) / kNumSlots);
         const uint32_t kv_split_end = static_cast<uint32_t>(
-            (static_cast<uint64_t>(total_kv_splits) * (tid + 1) + kNumSlots - 1) / kNumSlots);
+            (static_cast<uint64_t>(total_kv_splits) * (slot + 1) + kNumSlots - 1) / kNumSlots);
         while (kv_split_idx < kv_split_end) {
             const uint32_t q_token_base = kv_splits[kv_split_idx].header.q_token_base;
             const QBlockInfo q_block_info = q_block_infos[q_token_base];
             const uint32_t entry_kv_split_end = min(kv_split_end, q_block_info.kv_split_base + q_block_info.num_kv_splits);
-            schedule_entries[num_slot_entries * kNumSlots + tid] = ScheduleEntry(
+            schedule_entries[num_slot_entries * kNumSlots + slot] = ScheduleEntry(
                 kv_split_idx, entry_kv_split_end, q_token_base, min(kBlockQ, num_q_tokens - q_token_base));
             kv_split_idx = entry_kv_split_end;
             ++num_slot_entries;
         }
-        // Reduce per-thread maxima to obtain the wave count.
-        smem_max_entries[tid] = num_slot_entries;
+        smem_max_entries[slot] = num_slot_entries;
     }
     __syncthreads();
     if (tid == 0) {
@@ -131,9 +131,9 @@ __device__ __forceinline__ uint32_t build_contiguous_schedule(
     __syncthreads();
 
     const uint32_t num_waves = *smem_num_waves;
-    if (tid < kNumSlots) {
-        for (uint32_t wave_idx = num_slot_entries; wave_idx < num_waves; ++wave_idx)
-            schedule_entries[wave_idx * kNumSlots + tid] = ScheduleEntry(0, 0, 0, 0);
+    for (uint32_t slot = tid; slot < kNumSlots; slot += kNumThreads) {
+        for (uint32_t wave_idx = smem_max_entries[slot]; wave_idx < num_waves; ++wave_idx)
+            schedule_entries[wave_idx * kNumSlots + slot] = ScheduleEntry(0, 0, 0, 0);
     }
     return num_waves;
 }
@@ -265,7 +265,6 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
     __shared__ uint32_t smem_num_waves;
     __shared__ uint32_t smem_max_entries[kNumSlots];
     __shared__ uint32_t smem_histogram[(kNumKVSplitsPerEntry + 1) * (kNumThreads / 32)];
-    DG_STATIC_ASSERT(kNumSlots <= kNumThreads, "Metadata kernel needs one scratch slot per schedule slot");
     __shared__ struct {
         uint32_t q_token_base;
         uint32_t num_q_tokens;
@@ -515,7 +514,7 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
         num_waves = build_paged_schedule<kNumSlots, kNumKVSplitsPerEntry, kNumThreads>(
             schedule_entries, q_block_infos, num_q_tokens, indices, warp_sums, smem_histogram);
     } else {
-        num_waves = build_contiguous_schedule<kNumKVBlocksPerSplit, kNumSlots>(
+        num_waves = build_contiguous_schedule<kNumKVBlocksPerSplit, kNumSlots, kNumThreads>(
             schedule_entries, kv_splits, q_block_infos, num_q_tokens, total_kv_splits, &smem_num_waves,
             smem_max_entries);
     }

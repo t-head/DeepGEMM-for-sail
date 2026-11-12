@@ -9,12 +9,16 @@ import os
 import triton
 import triton.language as tl
 import numpy as np
+import traceback
 from functools import lru_cache
 from typing import Tuple, List, Optional, Any
 
-from deep_gemm import calc_diff
-from deep_gemm.jit_kernels import m_grouped_gemm_int8_int8_bf16_nt_masked, m_grouped_gemm_int8_int8_bf16_nt_nopad, gemm_int8_int8_bf16_nt, m_grouped_gemm_bf16_bf16_bf16_nt_nopad, get_num_sms
-from deep_gemm.jit_kernels.gemm_int8 import get_smem_config
+from deep_gemm import calc_diff, gemm_int8_int8_bf16_nt
+from deep_gemm import m_grouped_gemm_int8_int8_bf16_nt_masked, m_grouped_gemm_int8_int8_bf16_nt_nopad
+from deep_gemm import m_grouped_gemm_bf16_bf16_bf16_nt_nopad
+from deep_gemm.utils import SMEM_CONFIG_UNUSED
+from deep_gemm.utils.math import ceil_div
+from .search_space import get_search_space
 from .utils import get_deep_gemm_luts
 DEEP_GEMM_AVAILABLE = True
 
@@ -76,19 +80,16 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
-    best_num_stages, best_smem_config, ppu_capacity = None, None, 262144
+    best_num_stages = None
 
     stage_candidates = tuple(filter(lambda s: s <= k // block_k, (8, 7, 6, 5, 4, 3, 2)))
     if not stage_candidates or (128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4) or best_block_m == 16:
         # Unrolling both stages and `num_former_iters` will cause large code size
         stage_candidates = (4, 3, 2)
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1)
-        if best_smem_config[0] < ppu_capacity:
-            best_num_stages = num_stages
-            break
+        best_num_stages = num_stages
+        break
 
-    assert best_smem_config is not None
     assert best_num_stages is not None
     # Recompute the minimal number of SMs required
     # NOTES: less L2 cache usage and less GPU frequency drop
@@ -123,7 +124,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 128, 64, 16, 32, 2)
         else:
             (best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages) = (16, 128, 128, 16, 32, 4)
-    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config
+    return num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, SMEM_CONFIG_UNUSED
 def get_supported_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                           is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> List[Tuple]:
     """
@@ -159,14 +160,13 @@ def get_supported_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                     if best_block_n == 256 and warp_n == 64:
                         warp_n = 32
                         best_num_stages = 3
-                        best_smem_config = get_smem_config(best_num_stages, k, best_block_m, best_block_n, block_k, 1)
-                        rst.append((num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, best_smem_config))
+                        rst.append((num_min_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, SMEM_CONFIG_UNUSED))
                 except Exception as e:
                     print(f"Failed to find a valid config for {bm}x{bn}x{bk}")
 
     return rst
 
-from deep_gemm.jit_kernels.utils import get_search_space
+
 def get_pre_assert_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                           is_grouped_contiguous: bool = False, is_grouped_masked: bool = False, gemm_type: str = "dense", dtype=torch.int8) -> List[Tuple]:
     """
@@ -188,8 +188,7 @@ def get_pre_assert_configs(m: int, n: int, k: int, num_groups: int, num_sms: int
     for config in assert_config:
         best_block_m, best_block_n, warp_m, warp_n,  block_k, best_num_stages = config
         # best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages = config['BLOCK_M'],  config['BLOCK_N'],  config['BLOCK_K'],  config['WARP_M'], config['WARP_N'], config['NUM_STAGES']
-        smem_config = get_smem_config(best_num_stages, k, best_block_m, best_block_n, block_k, 1)
-        rst.append((num_sms,  best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, smem_config))
+        rst.append((num_sms, best_block_m, best_block_n, block_k, warp_m, warp_n, best_num_stages, SMEM_CONFIG_UNUSED))
 
     return rst
 
@@ -406,7 +405,7 @@ def gemm_nt_i8i8bf16(
         if configs is not None
         else get_deep_gemm_luts(m, n, k, num_groups=num_groups)
     )
-    gemm_int8_int8_bf16_nt(lhs, rhs, out, best_config)
+    gemm_int8_int8_bf16_nt(lhs, rhs, out, configs=best_config)
 
 def grouped_gemm_nt_i8i8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -432,7 +431,7 @@ def grouped_gemm_nt_i8i8bf16_masked(
         out,
         masked_m,
         expected_m,
-        best_config,
+        configs=best_config,
         **(
             dict(
                 enable_sbo_overlap=True,
@@ -461,7 +460,7 @@ def grouped_gemm_nt_i8i8bf16_nopad(
     )
 
     m_grouped_gemm_int8_int8_bf16_nt_nopad(
-        lhs, rhs, out, m_indices, m_rows, best_config
+        lhs, rhs, out, m_indices, m_rows=m_rows, configs=best_config
     )
 
 def grouped_gemm_nt_bf16bf16bf16_nopad(
@@ -481,7 +480,7 @@ def grouped_gemm_nt_bf16bf16bf16_nopad(
     )
 
     m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
-        lhs, rhs, out, m_indices, m_rows, best_config
+        lhs, rhs, out, m_indices, m_rows=m_rows, configs=best_config
     )
 
 
@@ -521,14 +520,12 @@ def grouped_gemm_nt_bf16bf16bf16_masked(
     )
 
 def exec_tuning_iter(func, func_name, debug_mode=False):
-    if debug_mode:
+    try:
         return func()
-    else:
-        try:
-            return func()
-        except Exception as e:
-            print(f"Error in {func_name}: {e}")
-            return None
+    except Exception:
+        print(f"Tuning candidate failed in {func_name}:")
+        traceback.print_exc()
+        return None
 
 @triton.jit
 def round_up_triton(x: int, y: int) -> int:

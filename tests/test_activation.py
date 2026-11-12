@@ -519,7 +519,7 @@ def test_unified_api_contract():
     assert torch.equal(actual, deep_gemm.activation_and_mul(silu, bf16, x))
     for old in ('ActivationQuantMode', 'silu_and_mul', 'situ_and_mul'):
         assert not hasattr(deep_gemm, old)
-        assert not hasattr(deep_gemm.deep_gemm_cpp, old)
+        assert not hasattr(deep_gemm._C, old)
     print('PASS unified activation API validation and removed bindings')
 
 
