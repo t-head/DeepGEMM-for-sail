@@ -10,20 +10,34 @@
 
 namespace deep_gemm {
 
-// Build rank prefixes and expert layouts before the copy CTAs start.
+// CTA0 builds and publishes rank prefixes and expert layouts for copy and compute.
 template <uint32_t BlockM, uint32_t NumRanks, uint32_t NumLocalExperts,
-          uint32_t NumThreads>
+          uint32_t NumThreads, bool ReshapeSfa = true, class SchedulerArguments>
 __device__ __forceinline__ void prepare_expert_metadata(
-    const volatile uint32_t* __restrict__ arrival_slots,
-    uint32_t generation,
-    int* __restrict__ copy_grouped_layout,
-    uint32_t* __restrict__ expert_rank_prefix,
-    uint32_t* __restrict__ expert_base,
-    uint32_t* __restrict__ masked_m,
-    uint32_t* smem_workspace,
+    const SchedulerArguments& sched, layout::MegaMoESignals* signals,
+    uint32_t generation, uint32_t* smem_workspace,
     const uint32_t* __restrict__ local_pushed_counts,
-    int32_t* cumulative_local_expert_recv_stats,
-    uint32_t num_compute_ctas, uint32_t* sfa_ready_flags) {
+    uint32_t num_compute_ctas = 0) {
+
+    const auto* arrival_slots = signals->dispatch_arrivals;
+    auto* __restrict__ copy_grouped_layout = sched.copy_grouped_layout;
+    auto* __restrict__ expert_rank_prefix = const_cast<uint32_t*>(sched.expert_rank_prefix);
+    auto* __restrict__ expert_base = sched.expert_base;
+    auto* __restrict__ masked_m = reinterpret_cast<uint32_t*>(sched.grouped_layout);
+    auto* cumulative_local_expert_recv_stats = sched.cumulative_local_expert_recv_stats;
+    auto* sfa_ready_flags = signals->preprocess_ready + 1;
+
+    // Generation tags avoid clearing every round. Reset all allocation aliases
+    // before the first metadata publication, including FP4's K-partition flags.
+    if (generation == 2u) {
+        const uint32_t num_copy_ready_flags = sched.staging.tokens / (16 * sizeof(uint32_t));
+        for (uint32_t i = threadIdx.x; i < num_copy_ready_flags; i += NumThreads)
+            __stbl(const_cast<uint32_t*>(sched.copy_ready_flags + i), 0u);
+        constexpr uint32_t kNumPreprocessReadyFlags =
+            layout::MegaMoESignals::kNumMaxExperts * FusedSfaPartitionLayout::kNumPartitions;
+        for (uint32_t i = threadIdx.x; i < kNumPreprocessReadyFlags; i += NumThreads)
+            __stbl(sfa_ready_flags + i, 0u);
+    }
 
     constexpr uint32_t total_pairs = NumLocalExperts * NumRanks;
     constexpr uint32_t kSfaPartitions = FusedSfaPartitionLayout::kNumPartitions;
@@ -96,6 +110,8 @@ __device__ __forceinline__ void prepare_expert_metadata(
     for (uint32_t pair = threadIdx.x; pair < total_pairs; pair += NumThreads)
         expert_rank_prefix[pair] = pair_counts[pair];
 
+    // All warps must finish reading prefixes before lane 0 reuses this slot.
+    __syncthreads();
     uint32_t& share_rows = smem_workspace[0];
     // Scan experts a warp at a time, keeping both block and row offsets.
     if (threadIdx.x < 32) {
@@ -109,7 +125,7 @@ __device__ __forceinline__ void prepare_expert_metadata(
                 ? expert_m_blocks[e] : 0u;
             uint32_t rows = (e < NumLocalExperts)
                 ? expert_counts[e] : 0u;
-            max_rows = max(max_rows, rows);
+            if constexpr (ReshapeSfa) max_rows = max(max_rows, rows);
             uint32_t block_scan = blocks;
             uint32_t row_scan = rows;
             #pragma unroll
@@ -129,22 +145,22 @@ __device__ __forceinline__ void prepare_expert_metadata(
             row_prefix += __shfl_sync(0xffffffff, row_scan, 31);
         }
         const bool multiple_m_blocks = block_prefix > NumLocalExperts;
-        if (multiple_m_blocks) {
+        if (ReshapeSfa && multiple_m_blocks) {
             #pragma unroll
             for (uint32_t delta = 16; delta > 0; delta >>= 1)
                 max_rows = max(max_rows, __shfl_down_sync(0xffffffffu, max_rows, delta));
         }
         if (lane == 0) {
             // Share rows only when a K partition exceeds twice the ideal work per CTA.
-            share_rows = multiple_m_blocks &&
+            share_rows = ReshapeSfa && multiple_m_blocks &&
                 uint64_t(max_rows) * num_compute_ctas > uint64_t(2) * kSfaPartitions * row_prefix;
             copy_grouped_layout[0] = block_prefix;
-            copy_grouped_layout[2] = share_rows;
+            if constexpr (ReshapeSfa) copy_grouped_layout[2] = share_rows;
         }
     }
     __syncthreads();
 
-    if (share_rows) {
+    if (ReshapeSfa && share_rows) {
         // The last completed row chunk brings the first partition tag to generation.
         for (uint32_t work = threadIdx.x; work < NumLocalExperts * kSfaPartitions; work += NumThreads)
             __stbl(sfa_ready_flags + work, generation - expert_m_blocks[work / kSfaPartitions]);
@@ -160,6 +176,14 @@ __device__ __forceinline__ void prepare_expert_metadata(
         for (uint32_t mb = 0; mb < expert_m_blocks[e]; ++mb)
             reinterpret_cast<uint4*>(copy_grouped_layout + 4)[entry.z + mb] = entry;
     }
+
+    // FP4 compute CTAs consume a shared tile queue; INT8 traverses expert rows.
+    if constexpr (ReshapeSfa)
+        if (threadIdx.x == 0) copy_grouped_layout[1] = 0;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0)
+        __stbl(signals->preprocess_ready, kPreprocessMetadataReadyBit | generation);
 }
 
 // Put each expert's scales in GEMM order after metadata is ready.

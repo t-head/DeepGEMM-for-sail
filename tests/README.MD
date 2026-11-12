@@ -98,9 +98,9 @@ test_core.py options:
   --func {DenseGemm,GroupedContiguous,GroupedMasked,DenseGemm}  target test func
 # Routed MoE correctness and performance tests
 
-MegaMoE supports W4A4 on PPU1.5, validated on ZW-M890P.
+MegaMoE supports INT8 on SM80 (ZW810E) and W4A4 on SM89 (ZW-M890P).
 `test_mega_moe.py` contains public-entry correctness and regression tests;
-`bench_mega_moe.py` contains full-pipeline timing and optional DeepEP comparisons.
+`bench_mega_moe.py` contains full-pipeline timing and optional W4A4 DeepEP comparisons.
 The benchmark reuses the correctness runner's case table and input/reference
 helpers. Both use the public complete call.
 Other architecture pytest runs skip these tests; CLI use reports an

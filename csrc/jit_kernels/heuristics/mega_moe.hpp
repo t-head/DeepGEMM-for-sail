@@ -63,7 +63,26 @@ struct MegaMoEConfig {
     MegaMoEL2Config l2;
 };
 
-static MegaMoEPhaseConfig make_phase_config(const deep_gemm_fp4_common::ConfigResult& config) {
+struct ReduceConfig {
+    int column_splits = 1;
+    int group_threads = 0;
+};
+
+static constexpr ReduceConfig select_reduce_config(int tokens, int hidden, int cta_threads, int num_sms) {
+    ReduceConfig config;
+    const int parts = (hidden - 1) / (8 * cta_threads) + 1;
+    if (tokens <= 128 && hidden % parts == 0 && (hidden / parts) % 256 == 0)
+        config.column_splits = parts;
+    constexpr int kGroupThreads = 128;
+    // Keep at least one CTA's worth of token groups per configured CU.
+    if (cta_threads > kGroupThreads && cta_threads % kGroupThreads == 0 &&
+        int64_t(tokens) * config.column_splits >= int64_t(num_sms) * (cta_threads / kGroupThreads))
+        config.group_threads = kGroupThreads;
+    return config;
+}
+
+template <class Config>
+static MegaMoEPhaseConfig make_phase_config(const Config& config) {
     const auto [num_sms, bm, bn, bk, wm, wn, stages, smem] = config;
     return {num_sms, bm, bn, bk, wm, wn, stages, std::get<0>(smem)};
 }
@@ -72,12 +91,12 @@ struct CopyTile {
     int bm, bn, bk, wm, wn, stages;
 };
 
-// K and BK count packed FP4 bytes. Select a physical stripe before converting
-// to K tiles; the launch contract also limits one M block to seven publications.
-static int aligned_copy_ktpf(int k, int bk) {
+// K and BK count physical payload bytes. FP4 keeps its 16-tile minimum;
+// INT8 selects stripes by byte size. Both allow at most seven publications.
+static int aligned_copy_ktpf(int k, int bk, int min_k_tiles = 16) {
     DG_HOST_ASSERT(k > 0 && bk > 0 && k % bk == 0 && k % 256 == 0);
     const int initial_stripe = 512 * next_power_of_two(ceil_div(k, 1024));
-    const int stripe_bytes = std::max({16 * bk, initial_stripe, std::min(k, 2048)});
+    const int stripe_bytes = std::max({min_k_tiles * bk, initial_stripe, std::min(k, 2048)});
     const int alignment = 512 / std::gcd(bk, 512);
     const int minimum = std::max(ceil_div(stripe_bytes, bk), ceil_div(k / bk, 7));
     return ceil_div(minimum, alignment) * alignment;
@@ -107,9 +126,12 @@ static std::optional<CopyTile> select_copy_tile(
 }
 
 static int select_l1_copy_blocks(
-    int expected_m, int n, int k, int num_experts_per_rank, const MegaMoEPhaseConfig& config, int k_tiles_per_flag) {
-    const int warps = (config.block_m / config.warp_m) * (config.block_n / config.warp_n);
-    const int cta_slots = config.num_sms * std::min(4, 16 / warps);
+    int expected_m, int n, int k, int num_experts_per_rank, const MegaMoEPhaseConfig& config,
+    int k_tiles_per_flag, std::optional<int> split_copy_warps = std::nullopt) {
+    const int compute_warps = (config.block_m / config.warp_m) * (config.block_n / config.warp_n);
+    const int warps = split_copy_warps.value_or(compute_warps);
+    DG_HOST_ASSERT(warps > 0 && compute_warps > 0);
+    const int cta_slots = config.num_sms * std::min(4, 16 / compute_warps);
     const int m_tiles = ceil_div(expected_m, config.block_m), warp_rows = m_tiles * config.warp_m;
     const int64_t copy_tasks = int64_t(num_experts_per_rank) * m_tiles;
     const int64_t stripe_cost = int64_t(8) * (config.block_m / warps)
@@ -117,6 +139,16 @@ static int select_l1_copy_blocks(
     const int64_t copy_cost = ceil_div<int64_t>(int64_t(expected_m - 1) * ceil_div(k, 512), m_tiles * warps)
         + stripe_cost * ceil_div(k, config.block_k * k_tiles_per_flag);
     const int64_t gemm_cost = int64_t(config.warp_m) * config.warp_n * k / (16 * 1024);
+
+    if (split_copy_warps) {
+        // A separate copy grid does not consume the GEMM grid's CTA slots.
+        const auto score = [&](int ncb) -> int64_t {
+            if (cta_slots <= 0) return std::numeric_limits<int64_t>::max();
+            return std::max(ceil_div<int64_t>(copy_tasks, ncb) * copy_cost,
+                ceil_div<int64_t>(copy_tasks * ceil_div(n, config.block_n), cta_slots) * gemm_cost);
+        };
+        return std::min({2, 3, 4, 6}, [&](int a, int b) { return score(a) < score(b); });
+    }
 
     int best_ncb = 3;
     int64_t best_cost = INT64_MAX;
@@ -195,6 +227,38 @@ static MegaMoEConfig get_mega_moe_config(
             hidden, intermediate_hidden / 2, num_experts_per_rank,
             num_sms)
     };
+}
+
+// Split-copy uses eight vector-CU warps independently of the MMA tile width.
+static int get_int8_mega_moe_copy_threads(int requested = 0) {
+    return requested != 0 ? requested : 256;
+}
+
+static MegaMoEConfig select_int8_mega_moe(
+    int expected_m, int hidden, int intermediate_hidden, int groups, int num_sms, int copy_threads = 0) {
+    const auto select = [&](int n, int k, int min_bn = 0) {
+        return make_phase_config(deep_gemm_int8::get_best_configs(
+            expected_m, n, k, groups, num_sms, GemmType::MegaMoE, 256,
+            std::nullopt, nullptr, std::nullopt, nullptr, min_bn));
+    };
+    const auto up = select(intermediate_hidden * 2, hidden);
+    auto down = select(hidden, intermediate_hidden, 128);
+    const int threads = (up.block_m / up.warp_m) * (up.block_n / up.warp_n) * 32;
+    DG_HOST_ASSERT(up.num_stages >= 2 && threads >= 64 && hidden % up.block_k == 0);
+    copy_threads = get_int8_mega_moe_copy_threads(copy_threads);
+    DG_HOST_ASSERT(copy_threads >= 64 && copy_threads % 32 == 0);
+    DG_HOST_ASSERT(down.num_stages >= 2 && (down.block_n == 128 || down.block_n == 256));
+    const int scatter_rows = (down.block_m / down.warp_m) * 16;
+    const int scatter_warps = (down.block_m / down.warp_m) * (down.block_n / down.warp_n);
+    DG_HOST_ASSERT(scatter_rows % scatter_warps == 0 && (scatter_rows / scatter_warps) % 2 == 0);
+    down.smem_size = std::max(down.num_stages * (down.block_m + down.block_n) * down.block_k,
+        2 * scatter_rows * down.block_n * int(sizeof(float)));
+    DG_HOST_ASSERT(down.smem_size <= 256 * 1024);
+    const int ktpf = aligned_copy_ktpf(hidden, up.block_k, 0);
+    DG_HOST_ASSERT(ktpf > 0 && int64_t(ktpf) * up.block_k % 512 == 0 &&
+                   ceil_div(hidden / up.block_k, ktpf) <= 7);
+    return {{up, select_l1_copy_blocks(expected_m, intermediate_hidden * 2,
+                hidden, groups, up, ktpf, copy_threads / 32), ktpf}, {down}};
 }
 
 inline int combine_num_threads(int tokens, int hidden) {

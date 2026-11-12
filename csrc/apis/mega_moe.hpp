@@ -1,9 +1,11 @@
 #pragma once
 
 #include <array>
+#include <limits>
 #include <pybind11/stl.h>
 #include <deep_gemm/layout/mega_moe.cuh>
 
+#include "../jit_kernels/impls/sm80_int8_int8_mega_moe.hpp"
 #include "../jit_kernels/impls/sm89_fp4_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm89_fp8_fp8_mega_moe.hpp"
 #include "../jit_kernels/impls/sm89_bf16_fp4_mega_moe.hpp"
@@ -11,6 +13,56 @@
 #include "../jit_kernels/heuristics/mega_moe.hpp"
 
 namespace deep_gemm::mega {
+
+// Shared API helpers.
+namespace py = pybind11;
+using Tensor = torch::Tensor;
+using OptTensor = std::optional<Tensor>;
+
+static void check_tensor(const Tensor& tensor, const torch::ScalarType& dtype, const bool& contiguous = true) {
+    TORCH_CHECK(tensor.is_cuda() && tensor.scalar_type() == dtype && (!contiguous || tensor.is_contiguous()),
+                "Invalid MegaMoE tensor device, dtype or layout");
+}
+static void check_shape(const Tensor& tensor, c10::IntArrayRef shape) {
+    TORCH_CHECK(tensor.sizes() == shape, "Invalid MegaMoE tensor shape: ", tensor.sizes());
+}
+using WeightPair = std::tuple<Tensor, Tensor>;
+
+static void check_tensor(const Tensor& tensor, torch::ScalarType dtype,
+                         const torch::Device& device, torch::IntArrayRef shape, const char* name) {
+    check_tensor(tensor, dtype);
+    check_shape(tensor, shape);
+    TORCH_CHECK(tensor.device() == device, name, " must share the workspace device");
+}
+
+struct MegaMoEActivationParams {
+    float alpha, beta, linear_beta;
+};
+
+static MegaMoEActivationParams check_mega_moe_activation(
+    GatedActivation activation, const std::optional<float>& activation_clamp_opt,
+    const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
+    const std::optional<float>& activation_alpha_opt) {
+    TORCH_CHECK(!activation_clamp_opt || (!std::isnan(*activation_clamp_opt) && *activation_clamp_opt >= 0),
+                "activation_clamp must be nonnegative or None");
+    const float alpha = activation_alpha_opt.value_or(1.702f);
+    if (activation == GatedActivation::SwiGLUOAI) {
+        TORCH_CHECK(std::isfinite(alpha) && alpha > 0, "activation_alpha must be positive and finite");
+    } else {
+        TORCH_CHECK(!activation_alpha_opt, "activation_alpha applies only to swiglu_oai");
+    }
+    const float beta = situ_beta_opt.value_or(0.0f);
+    const float linear_beta = situ_linear_beta_opt.value_or(0.0f);
+    if (activation == GatedActivation::SiTU) {
+        TORCH_CHECK(!activation_clamp_opt, "SiTU does not support activation_clamp");
+        TORCH_CHECK(std::isfinite(beta) && beta > 0, "situ_beta must be positive and finite");
+        TORCH_CHECK(!situ_linear_beta_opt || (std::isfinite(linear_beta) && linear_beta > 0),
+                    "situ_linear_beta must be positive and finite or None");
+    } else {
+        TORCH_CHECK(!situ_beta_opt && !situ_linear_beta_opt, "SiTU parameters apply only to situ");
+    }
+    return {alpha, beta, linear_beta};
+}
 
 static int get_token_alignment_for_mega_moe() {
     return layout::kTokenAlignment;
@@ -44,6 +96,96 @@ static std::string fp8_mega_moe_precision(const std::string& quantization) {
     return "fp8_" + quantization;
 }
 
+template <class BufferLayout = layout::MegaMoEBuffer>
+static BufferLayout get_mega_moe_layout(
+    int num_ranks, int num_experts, int capacity, int topk,
+    int hidden, int intermediate, const std::array<int, 3>& staging_config) {
+    constexpr bool int8 = std::is_same_v<BufferLayout, layout::Int8MegaMoEBuffer>;
+    TORCH_CHECK(is_supported_megamoe_rank_count(num_ranks), "MegaMoE requires a power-of-two EP size in [1, 64]");
+    TORCH_CHECK(num_experts > 0 && num_experts <= layout::MegaMoESignals::kNumMaxExperts &&
+                num_experts % num_ranks == 0, "experts must be uniformly sharded within the protocol capacity");
+    TORCH_CHECK(capacity > 0 && capacity % layout::kTokenAlignment == 0 && topk >= 1 && topk <= 32,
+                "capacity must be positive and aligned to 16; topk must be in [1, 32]");
+    TORCH_CHECK(hidden >= (int8 ? 2048 : 1024) && hidden % 512 == 0 &&
+                intermediate > 0 && intermediate % (int8 ? 256 : 64) == 0,
+                "unsupported MegaMoE hidden or intermediate dimension");
+    TORCH_CHECK(int64_t(num_experts) * (capacity / 16) <= layout::MegaMoESignals::kNumMaxCopyBlocks &&
+                int64_t(num_ranks) * capacity * topk <= INT32_MAX,
+                "MegaMoE dimensions exceed the protocol's indexing limits");
+    if constexpr (int8) {
+        TORCH_CHECK(device_runtime->get_arch_pair() == std::make_pair(8, 0), "INT8 MegaMoE requires SM80");
+    }
+    if (staging_config == std::array<int, 3>{} ||
+        staging_config == std::array<int, 3>{num_experts, capacity, hidden})
+        return {num_ranks, num_experts, capacity, topk, hidden, intermediate};
+    // Aliases inherit the allocation owner's bank strides for peer writes.
+    const auto [owner_experts, owner_capacity, owner_hidden] = staging_config;
+    TORCH_CHECK(owner_experts > 0 && owner_experts % num_ranks == 0 &&
+                owner_experts <= layout::MegaMoESignals::kNumMaxExperts &&
+                owner_capacity > 0 && owner_capacity % layout::kTokenAlignment == 0 &&
+                owner_hidden >= (int8 ? 2048 : 1024) && owner_hidden % 512 == 0,
+                "invalid MegaMoE allocation staging configuration");
+    const auto owner = layout::MegaMoEStaging::for_shape<int8>(num_ranks, owner_experts, owner_capacity, owner_hidden);
+    const auto required = layout::MegaMoEStaging::for_shape<int8>(num_ranks, num_experts, capacity, hidden);
+    TORCH_CHECK(required.scales <= owner.scales && required.counts <= owner.counts && required.tokens <= owner.tokens,
+                "MegaMoE view exceeds allocation staging capacity");
+    return {num_ranks, num_experts, capacity, topk, hidden, intermediate, owner};
+}
+
+template <class BufferLayout>
+static void check_mega_moe_buffer(const torch::Tensor& buffer, const BufferLayout& layout) {
+    TORCH_CHECK(buffer.is_cuda() && buffer.scalar_type() == torch::kUInt8 && buffer.dim() == 1 &&
+                buffer.is_contiguous() && buffer.storage_offset() == 0 &&
+                buffer.numel() >= layout.get_num_bytes() && buffer.get_device() == at::cuda::current_device(),
+                "invalid MegaMoE symmetric buffer size, layout or current device");
+}
+
+template <class BufferLayout>
+static std::tuple<int64_t, pybind11::function> get_mega_moe_buffer_slices(
+    int num_ranks, int num_experts, int capacity, int topk,
+    int hidden, int intermediate, const std::array<int, 3>& staging_config) {
+    const auto b = get_mega_moe_layout<BufferLayout>(
+        num_ranks, num_experts, capacity, topk, hidden, intermediate, staging_config);
+    auto slice_input_buffers = [=](const Tensor& buffer) {
+        check_mega_moe_buffer(buffer, b);
+        auto make_tensor = [&](torch::ScalarType dtype, const layout::Buffer& region, torch::IntArrayRef shape,
+                               torch::IntArrayRef strides = {}) {
+            return mega_moe_slice(buffer, region.offset, shape, dtype, strides);
+        };
+        const auto [x, x_sf, l1, l1_sf, l2, l2_sf] = [&] {
+            if constexpr (std::is_same_v<BufferLayout, layout::Int8MegaMoEBuffer>) {
+                const auto owner = py::cast(buffer);
+                if (!py::hasattr(owner, "_mega_moe_copy_stream")) {
+                    owner.attr("_mega_moe_copy_stream") = py::capsule(
+                        new mega_int8::CopyStreamResources(buffer.get_device()),
+                        [](void* p) { delete static_cast<mega_int8::CopyStreamResources*>(p); });
+                }
+                return std::make_tuple(
+                    make_tensor(torch::kInt8, b.dispatch_data, {capacity, hidden}),
+                    make_tensor(torch::kFloat32, b.staging_scales[0], {2, 1, num_ranks, capacity},
+                        {b.staging.scales / int64_t(sizeof(float)), int64_t(num_ranks) * capacity, capacity, 1}),
+                    make_tensor(torch::kInt8, b.local_data, {b.compact, hidden}),
+                    make_tensor(torch::kFloat32, b.local_sfa, {b.compact}),
+                    make_tensor(torch::kInt8, b.l2_acts, {b.compact, intermediate}),
+                    make_tensor(torch::kFloat32, b.l2_acts_sf, {b.compact}));
+            } else {
+                return std::make_tuple(
+                    make_tensor(torch::kUInt8, b.dispatch_data, {capacity, hidden / 2}),
+                    make_tensor(torch::kUInt16, b.staging_scales[0], {2, num_ranks, capacity, hidden / 64},
+                        {b.staging.scales / int64_t(sizeof(uint16_t)), int64_t(capacity) * (hidden / 64), hidden / 64, 1}),
+                    make_tensor(torch::kUInt8, b.local_data, {b.compact * (hidden / 2)}),
+                    make_tensor(torch::kUInt16, b.local_sfa, {b.local_sfa.bytes / int64_t(sizeof(uint16_t))}),
+                    make_tensor(torch::kUInt8, b.l2_acts, {b.compact, intermediate / 2}),
+                    make_tensor(torch::kUInt16, b.l2_acts_sf, {b.compact, intermediate / 64}, {1, b.compact}));
+            }
+        }();
+        return std::make_tuple(x, x_sf,
+            make_tensor(torch::kInt64, b.topk_idx, {capacity, topk}),
+            make_tensor(torch::kFloat32, b.topk_weights, {capacity, topk}), l1, l1_sf, l2, l2_sf);
+    };
+    return {b.get_num_bytes(), pybind11::cpp_function(slice_input_buffers)};
+}
+
 static std::tuple<int64_t, pybind11::function>
 get_symm_buffer_size_for_mega_moe(
     const int& num_ranks, const int& num_experts,
@@ -53,16 +195,17 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_shared_experts = 0,
     const std::array<int, 3>& staging_config = {},
     const std::optional<std::string>& quantization = std::nullopt) {
-    const bool routed = mma_type == "fp8xfp8" || mma_type == "fp8xfp4" || mma_type == "bf16xfp4";
-    if (!routed) {
-        const auto mma_kind = parse_mma_kind(mma_type);
-        DG_HOST_ASSERT(mma_kind == MmaKind::MXFP4);
-    }
     const auto activation_kind = parse_gated_activation(activation);
     TORCH_CHECK(num_shared_experts == 0, "MegaMoE shared experts are not supported yet");
     TORCH_CHECK(mma_type == "fp8xfp8" || !quantization,
                 "quantization applies only to fp8xfp8 workspaces");
-    if (routed) {
+    if (is_fp4_mma_type(mma_type))
+        return get_mega_moe_buffer_slices<layout::MegaMoEBuffer>(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
+    if (mma_type == "int8xint8")
+        return get_mega_moe_buffer_slices<layout::Int8MegaMoEBuffer>(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
+    if (mma_type == "fp8xfp8" || mma_type == "fp8xfp4" || mma_type == "bf16xfp4") {
         std::string precision;
         if (mma_type == "fp8xfp8")
             precision = fp8_mega_moe_precision(quantization.value_or("channelwise"));
@@ -76,32 +219,7 @@ get_symm_buffer_size_for_mega_moe(
         return get_mega_moe_buffer_slices_for_precision(
             num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, precision);
     }
-    const auto staging = get_staging_capacity(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
-    const auto mega_buffer = layout::MegaMoEBuffer(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging);
-    auto slice_input_buffers = [=](const torch::Tensor& buffer) {
-        check_mega_moe_buffer(buffer, mega_buffer);
-        auto make_tensor = [&](torch::ScalarType dtype, const layout::Buffer& region, torch::IntArrayRef shape,
-                               torch::IntArrayRef strides = {}) {
-            return mega_moe_slice(buffer, region.offset, shape, dtype, strides);
-        };
-        auto x = make_tensor(torch::kUInt8, mega_buffer.dispatch_fp4, {num_max_tokens_per_rank, hidden / 2});
-        auto x_sf = make_tensor(torch::kUInt16, mega_buffer.staging_scales[0],
-            {2, num_ranks, num_max_tokens_per_rank, hidden / 64},
-            {mega_buffer.staging.scales / int64_t(sizeof(uint16_t)),
-             int64_t(num_max_tokens_per_rank) * (hidden / 64), hidden / 64, 1});
-        auto topk_idx = make_tensor(torch::kInt64, mega_buffer.topk_idx, {num_max_tokens_per_rank, num_topk});
-        auto topk_weights = make_tensor(torch::kFloat32, mega_buffer.topk_weights, {num_max_tokens_per_rank, num_topk});
-        auto l1_acts = make_tensor(torch::kUInt8, mega_buffer.local_fp4, {mega_buffer.compact * (hidden / 2)});
-        auto l1_acts_sf = make_tensor(torch::kUInt16, mega_buffer.local_sfa,
-            {mega_buffer.local_sfa.bytes / int64_t(sizeof(uint16_t))});
-        auto l2_acts = make_tensor(torch::kUInt8, mega_buffer.l2_acts, {mega_buffer.compact, intermediate_hidden / 2});
-        auto l2_acts_sf = make_tensor(torch::kUInt16, mega_buffer.l2_acts_sf,
-            {mega_buffer.compact, intermediate_hidden / 64}, {1, mega_buffer.compact});
-        return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
-    };
-    return {mega_buffer.get_num_bytes(), pybind11::cpp_function(slice_input_buffers)};
+    TORCH_CHECK(false, "Unsupported MegaMoE mma_type: ", mma_type);
 }
 
 static void routed_mega_moe_pre_dispatch(
@@ -138,70 +256,50 @@ static void mega_moe_pre_dispatch(
     const auto owner_mma_type = owner.attr("mma_type").cast<std::string>();
     if (owner_mma_type != mma_type && !(is_fp4_mma_type(owner_mma_type) && is_fp4_mma_type(mma_type)))
         throw pybind11::value_error("mma_type must match the output views' MegaMoE SymmBuffer");
-    if (!is_fp4_mma_type(mma_type)) {
+    if (!is_fp4_mma_type(mma_type) && mma_type != "int8xint8") {
         TORCH_CHECK(mma_type == "fp8xfp8" || mma_type == "fp8xfp4" || mma_type == "bf16xfp4",
                     "Unsupported MegaMoE mma_type: ", mma_type);
         routed_mega_moe_pre_dispatch(x, topk_idx, topk_weights, buf_x, buf_x_sf,
                                     buf_topk_idx, buf_topk_weights, num_tokens);
         return;
     }
-    const auto mma_kind = parse_mma_kind(mma_type);
-    DG_HOST_ASSERT(mma_kind == MmaKind::MXFP4);
-    DG_HOST_ASSERT(group_size == 32);
-    DG_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(x.is_contiguous());
-    DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32 || topk_idx.scalar_type() == torch::kInt64);
-    DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat);
-    DG_HOST_ASSERT(topk_idx.is_contiguous() && topk_weights.is_contiguous());
-    DG_HOST_ASSERT(x.dim() == 2 && topk_idx.dim() == 2 && topk_weights.dim() == 2);
-    DG_HOST_ASSERT(buf_x.dim() == 2 && buf_x_sf.dim() == 4);
-    DG_HOST_ASSERT(buf_topk_idx.dim() == 2 && buf_topk_weights.dim() == 2);
-    DG_HOST_ASSERT(buf_topk_idx.scalar_type() == torch::kInt64);
-    DG_HOST_ASSERT(buf_topk_weights.scalar_type() == torch::kFloat);
-    DG_HOST_ASSERT(buf_x_sf.scalar_type() == torch::kUInt16);
-
-    const auto m = static_cast<int>(x.size(0));
-    const auto hidden = static_cast<int>(x.size(1));
-    const auto top_k = static_cast<int>(topk_idx.size(1));
-    const auto padded_max = static_cast<int>(buf_x.size(0));
-
-    DG_HOST_ASSERT(num_tokens == m);
-    DG_HOST_ASSERT(num_tokens <= padded_max);
-    DG_HOST_ASSERT(static_cast<int>(topk_idx.size(0)) == m);
-    DG_HOST_ASSERT(static_cast<int>(topk_weights.size(0)) == m);
-    DG_HOST_ASSERT(static_cast<int>(topk_weights.size(1)) == top_k);
-    DG_HOST_ASSERT(static_cast<int>(buf_topk_idx.size(0)) == padded_max);
-    DG_HOST_ASSERT(static_cast<int>(buf_topk_idx.size(1)) == top_k);
-    DG_HOST_ASSERT(static_cast<int>(buf_topk_weights.size(0)) == padded_max);
-    DG_HOST_ASSERT(static_cast<int>(buf_topk_weights.size(1)) == top_k);
-    DG_HOST_ASSERT(static_cast<int>(buf_x.size(1)) == hidden / 2);
-    DG_HOST_ASSERT(buf_x.element_size() == 1);
-
-    const auto sym_buffer = owner.attr("buffer").cast<torch::Tensor>();
-    const auto sym_buffer_ptrs = owner.attr("handle").attr("buffer_ptrs").cast<std::vector<int64_t>>();
-    const int num_ranks = owner.attr("num_ranks").cast<int>();
-    const int num_experts = owner.attr("num_experts").cast<int>();
-    const int num_max_tokens_per_rank = owner.attr("num_max_tokens_per_rank").cast<int>();
-    const int rank_idx = owner.attr("group").attr("rank")().cast<int>();
-    const int intermediate_hidden = owner.attr("intermediate_hidden").cast<int>();
+    const bool int8 = mma_type == "int8xint8";
+    TORCH_CHECK(group_size == (int8 ? 0 : 32), "invalid MegaMoE quantization group size");
+    const auto buffer = owner.attr("buffer").cast<Tensor>();
+    const auto pointers = owner.attr("handle").attr("buffer_ptrs").cast<std::vector<int64_t>>();
+    const auto group = owner.attr("group");
+    const int ranks = group.attr("size")().cast<int>(), rank = group.attr("rank")().cast<int>();
+    const int experts = owner.attr("num_experts").cast<int>();
+    const int capacity = owner.attr("num_max_tokens_per_rank").cast<int>();
+    const int hidden = owner.attr("hidden").cast<int>();
+    const int intermediate = owner.attr("intermediate_hidden").cast<int>();
+    const int topk = owner.attr("num_topk").cast<int>();
     const auto staging_config = owner.attr("staging_config").cast<std::array<int, 3>>();
-    DG_HOST_ASSERT(sym_buffer.is_cuda());
-    DG_HOST_ASSERT(hidden == owner.attr("hidden").cast<int>());
-    DG_HOST_ASSERT(top_k == owner.attr("num_topk").cast<int>());
-    DG_HOST_ASSERT(padded_max == num_max_tokens_per_rank);
-    DG_HOST_ASSERT(x.device() == sym_buffer.device());
-    DG_HOST_ASSERT(topk_idx.device() == sym_buffer.device() && topk_weights.device() == sym_buffer.device());
-    const auto staging = get_staging_capacity(
-        num_ranks, num_experts, num_max_tokens_per_rank, top_k, hidden, intermediate_hidden, staging_config);
-    const auto mega_buffer = layout::MegaMoEBuffer(
-        num_ranks, num_experts, num_max_tokens_per_rank, top_k, hidden, intermediate_hidden, staging);
-    DG_HOST_ASSERT(rank_idx >= 0 && rank_idx < num_ranks);
-    DG_HOST_ASSERT(sym_buffer_ptrs.size() == num_ranks);
-    check_mega_moe_buffer(sym_buffer, mega_buffer);
-    fp4_mega_moe_pre_dispatch_impl(
-        x, topk_idx, topk_weights, sym_buffer_ptrs,
-        num_ranks, num_experts, num_max_tokens_per_rank, rank_idx,
-        hidden, intermediate_hidden, top_k, mega_buffer.staging);
+    TORCH_CHECK(num_tokens <= capacity, "input token count exceeds capacity");
+    check_tensor(x, torch::kBFloat16, buffer.device(), {num_tokens, hidden}, "hidden_states");
+    TORCH_CHECK(topk_idx.scalar_type() == torch::kInt32 || topk_idx.scalar_type() == torch::kInt64,
+                "topk_ids must be int32 or int64");
+    check_tensor(topk_idx, topk_idx.scalar_type(), buffer.device(), {num_tokens, topk}, "topk_ids");
+    check_tensor(topk_weights, torch::kFloat32, buffer.device(), {num_tokens, topk}, "topk_weights");
+    check_tensor(buf_x, int8 ? torch::kInt8 : torch::kUInt8,
+                 buffer.device(), {capacity, int8 ? hidden : hidden / 2}, "dispatch data");
+    check_tensor(buf_x_sf, int8 ? torch::kFloat32 : torch::kUInt16, false);
+    TORCH_CHECK(buf_x_sf.dim() == 4, "invalid MegaMoE scale view");
+    check_tensor(buf_topk_idx, torch::kInt64, buffer.device(), {capacity, topk}, "staged topk_ids");
+    check_tensor(buf_topk_weights, torch::kFloat32, buffer.device(), {capacity, topk}, "staged topk_weights");
+    make_sym_buffer(buffer, pointers, rank);
+    if (int8) {
+        const auto b = get_mega_moe_layout<layout::Int8MegaMoEBuffer>(
+            ranks, experts, capacity, topk, hidden, intermediate, staging_config);
+        check_mega_moe_buffer(buffer, b);
+        mega_moe_pre_dispatch_impl<true>(x, topk_idx, topk_weights, pointers,
+            ranks, experts, capacity, rank, hidden, intermediate, topk, b.staging);
+    } else {
+        const auto b = get_mega_moe_layout(ranks, experts, capacity, topk, hidden, intermediate, staging_config);
+        check_mega_moe_buffer(buffer, b);
+        mega_moe_pre_dispatch_impl<false>(x, topk_idx, topk_weights, pointers,
+            ranks, experts, capacity, rank, hidden, intermediate, topk, b.staging);
+    }
 }
 
 // Python owns one symmetric allocation; C++ slices it and submits computation.
@@ -231,26 +329,10 @@ static void fp4_fp4_mega_moe(
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
     const auto activation_kind = parse_gated_activation(activation);
 
-    // Activation checks
-    const auto activation_clamp =
-        activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
-    DG_HOST_ASSERT(activation_clamp >= 0);
-    const auto activation_alpha = activation_alpha_opt.value_or(1.702f);
-    if (activation_kind == GatedActivation::SwiGLUOAI) {
-        DG_HOST_ASSERT(std::isfinite(activation_alpha) && activation_alpha > 0);
-    } else {
-        DG_HOST_ASSERT(!activation_alpha_opt.has_value());
-    }
-    const auto situ_beta = situ_beta_opt.value_or(0.0f);
-    const auto situ_linear_beta = situ_linear_beta_opt.value_or(0.0f);
-    if (activation_kind == GatedActivation::SiTU) {
-        DG_HOST_ASSERT(!activation_clamp_opt.has_value());
-        DG_HOST_ASSERT(std::isfinite(situ_beta) && situ_beta > 0);
-        DG_HOST_ASSERT(!situ_linear_beta_opt.has_value() ||
-                       (std::isfinite(situ_linear_beta) && situ_linear_beta > 0));
-    } else {
-        DG_HOST_ASSERT(!situ_beta_opt.has_value() && !situ_linear_beta_opt.has_value());
-    }
+    const auto activation_params = check_mega_moe_activation(
+        activation_kind, activation_clamp_opt, situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt);
+    const auto activation_clamp = activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
+    const auto [activation_alpha, situ_beta, situ_linear_beta] = activation_params;
 
     // Tensor checks
     DG_HOST_ASSERT(sym_buffer.is_cuda());
@@ -329,12 +411,10 @@ static void fp4_fp4_mega_moe(
 
     // Check buffer bytes
     const auto num_experts_ = num_experts_per_rank_with_replicas * num_ranks;
-    DG_HOST_ASSERT(rank_idx >= 0 && rank_idx < num_ranks);
+    make_sym_buffer(sym_buffer, sym_buffer_ptrs, rank_idx);
     DG_HOST_ASSERT(num_experts == num_experts_);
-    const auto staging = get_staging_capacity(
+    const auto mega_buffer = get_mega_moe_layout(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
-    const auto mega_buffer = layout::MegaMoEBuffer(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging);
     check_mega_moe_buffer(sym_buffer, mega_buffer);
     const int em = expected_expert_rows(num_tokens, num_topk, num_experts_per_rank_with_replicas,
                                         num_ranks, num_max_tokens_per_rank);
@@ -353,23 +433,9 @@ static void fp4_fp4_mega_moe(
         situ_beta, situ_linear_beta, activation_alpha, fast_math);
 }
 
-// Shared API helpers.
-namespace py = pybind11;
-using Tensor = torch::Tensor;
-using OptTensor = std::optional<Tensor>;
-
 static void check_device() {
     TORCH_CHECK(is_ppu1v5_device(), "MegaMoE requires PPU1.5");
 }
-
-static void check_tensor(const Tensor& tensor, const torch::ScalarType& dtype, const bool& contiguous = true) {
-    TORCH_CHECK(tensor.is_cuda() && tensor.scalar_type() == dtype && (!contiguous || tensor.is_contiguous()),
-                "Invalid MegaMoE tensor device, dtype or layout");
-}
-static void check_shape(const Tensor& tensor, c10::IntArrayRef shape) {
-    TORCH_CHECK(tensor.sizes() == shape, "Invalid MegaMoE tensor shape: ", tensor.sizes());
-}
-using WeightPair = std::tuple<Tensor, Tensor>;
 
 static Precision routed_precision(const std::string& precision) {
     using P = Precision;
@@ -497,35 +563,6 @@ static void routed_mega_moe_pre_dispatch(
                                            staged_topk_idx, staged_topk_weights, num_tokens);
 }
 
-struct RoutedActivationParams {
-    float alpha, beta, linear_beta;
-};
-
-static RoutedActivationParams check_routed_activation(
-    GatedActivation activation, const std::optional<float>& activation_clamp_opt,
-    const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
-    const std::optional<float>& activation_alpha_opt) {
-    TORCH_CHECK(!activation_clamp_opt || (!std::isnan(*activation_clamp_opt) && *activation_clamp_opt >= 0),
-                "activation_clamp must be nonnegative or None");
-    const float alpha = activation_alpha_opt.value_or(1.702f);
-    if (activation == GatedActivation::SwiGLUOAI) {
-        TORCH_CHECK(std::isfinite(alpha) && alpha > 0, "activation_alpha must be positive and finite");
-    } else {
-        TORCH_CHECK(!activation_alpha_opt, "activation_alpha applies only to swiglu_oai");
-    }
-    const float beta = situ_beta_opt.value_or(0.0f);
-    const float linear_beta = situ_linear_beta_opt.value_or(0.0f);
-    if (activation == GatedActivation::SiTU) {
-        TORCH_CHECK(!activation_clamp_opt, "SiTU does not support activation_clamp");
-        TORCH_CHECK(std::isfinite(beta) && beta > 0, "situ_beta must be positive and finite");
-        TORCH_CHECK(!situ_linear_beta_opt || (std::isfinite(linear_beta) && linear_beta > 0),
-                    "situ_linear_beta must be positive and finite or None");
-    } else {
-        TORCH_CHECK(!situ_beta_opt && !situ_linear_beta_opt, "SiTU parameters apply only to situ");
-    }
-    return {alpha, beta, linear_beta};
-}
-
 template <bool kFp8>
 static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, const WeightPair& l2_weights,
                             const OptTensor& cumulative_local_expert_recv_stats, const Tensor& sym_buffer,
@@ -542,7 +579,7 @@ static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, cons
     const bool fp8 = precision != "w4a16", blockwise = precision == "fp8_blockwise";
     TORCH_CHECK(fp8 == kFp8, "Compute entry does not match workspace precision");
     const auto activation_kind = parse_gated_activation(activation);
-    const auto activation_params = check_routed_activation(
+    const auto activation_params = check_mega_moe_activation(
         activation_kind, activation_clamp_opt, situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt);
     check_tensor(y, torch::kBFloat16);
     TORCH_CHECK(y.dim() == 2, "output must be [num_tokens, hidden]");
@@ -654,7 +691,7 @@ void fp8_fp4_mega_moe(
     const std::optional<W4A8Weights>& l1_weights_replicas, const std::optional<W4A8Weights>& l2_weights_replicas) {
     check_device();
     const auto activation_kind = parse_gated_activation(activation);
-    const auto activation_params = check_routed_activation(
+    const auto activation_params = check_mega_moe_activation(
         activation_kind, activation_clamp_opt, situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt);
     check_tensor(y, torch::kBFloat16);
     TORCH_CHECK(y.dim() == 2 && std::get<0>(l1_weights_tuple).dim() == 3, "Invalid output or GEMM1 weight rank");
@@ -705,11 +742,62 @@ void fp8_fp4_mega_moe(
         configs, cumulative_local_expert_recv_stats);
 }
 
+static void int8_int8_mega_moe(
+    const Tensor& y, const WeightPair& l1_weights_tuple, const WeightPair& l2_weights_tuple,
+    const OptTensor& cumulative_local_expert_recv_stats,
+    const Tensor& sym_buffer, const std::vector<int64_t>& sym_buffer_ptrs,
+    const int& rank_idx, const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk, const std::tuple<int, int, int>& recipe,
+    const std::string& activation, const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math, const std::optional<float>& situ_beta_opt,
+    const std::optional<float>& situ_linear_beta_opt, const std::optional<float>& activation_alpha_opt,
+    const std::array<int, 3>& staging_config) {
+    const auto& [l1_weights, l1_weights_sf] = l1_weights_tuple;
+    const auto& [l2_weights, l2_weights_sf] = l2_weights_tuple;
+
+    // INT8 uses one scale per activation row and weight output channel.
+    // rk=0 denotes the full K dimension of each GEMM (H for L1, I for L2).
+    const auto [rm, rn, rk] = recipe;
+    TORCH_CHECK(rm == 1 && rn == 1 && rk == 0,
+                "INT8 MegaMoE requires recipe=(1, 1, 0), where 0 means the full K dimension");
+    TORCH_CHECK(l1_weights.dim() == 3 && l2_weights.dim() == 3, "weights must be 3D");
+    const int hidden = l2_weights.size(1), intermediate = l2_weights.size(2);
+    const int num_ranks = sym_buffer_ptrs.size();
+    const auto b = get_mega_moe_layout<layout::Int8MegaMoEBuffer>(num_ranks, num_experts, num_max_tokens_per_rank,
+                                       num_topk, hidden, intermediate, staging_config);
+    check_mega_moe_buffer(sym_buffer, b);
+    make_sym_buffer(sym_buffer, sym_buffer_ptrs, rank_idx);
+    TORCH_CHECK(y.dim() == 2 && y.size(0) <= num_max_tokens_per_rank, "invalid output token count");
+    const int num_tokens = y.size(0), groups = num_experts / num_ranks;
+    const auto device = sym_buffer.device();
+    check_tensor(y, torch::kBFloat16, device, {num_tokens, hidden}, "y");
+    check_tensor(l1_weights, torch::kInt8, device, {groups, 2 * intermediate, hidden}, "l1_weights");
+    check_tensor(l1_weights_sf, torch::kFloat32, device, {groups, 2 * intermediate}, "l1_weights_sf");
+    check_tensor(l2_weights, torch::kInt8, device, {groups, hidden, intermediate}, "l2_weights");
+    check_tensor(l2_weights_sf, torch::kFloat32, device, {groups, hidden}, "l2_weights_sf");
+    if (cumulative_local_expert_recv_stats)
+        check_tensor(*cumulative_local_expert_recv_stats, torch::kInt32, device,
+                          {groups}, "cumulative_local_expert_recv_stats");
+
+    const auto activation_kind = parse_gated_activation(activation);
+    const auto activation_params = check_mega_moe_activation(
+        activation_kind, activation_clamp_opt, situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt);
+    const auto activation_clamp = activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
+    const auto expected_m = expected_expert_rows(num_tokens, num_topk, groups, num_ranks, num_max_tokens_per_rank);
+    auto& streams = *py::cast(sym_buffer).attr("_mega_moe_copy_stream").cast<py::capsule>()
+                        .get_pointer<mega_int8::CopyStreamResources>();
+    mega_int8::int8_int8_mega_moe_impl(sym_buffer.data_ptr<uint8_t>(), b, num_max_tokens_per_rank, num_topk, streams,
+        sym_buffer_ptrs, rank_idx, y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats,
+        expected_m, activation_kind, activation_clamp,
+        activation_params.beta, activation_params.linear_beta, activation_params.alpha, fast_math);
+}
+
 static void register_apis(pybind11::module_& m) {
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_fp4_mega_moe", &bf16_fp4_mega_moe);
     m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe);
     m.def("fp4_fp4_mega_moe", &fp4_fp4_mega_moe);
+    m.def("int8_int8_mega_moe", &int8_int8_mega_moe);
     m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch);
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe,
