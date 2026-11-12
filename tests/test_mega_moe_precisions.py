@@ -214,11 +214,11 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
     raw2, ref2 = make_weights(e, c.hidden, c.intermediate, c.precision, rng)
     if c.precision == "w4a8":
         w1, w2 = dg.transform_weights_for_w4a8_mega_moe(raw1, raw2)
-        mma_type, quantization = "fp8xmxfp4", None
+        mma_type, quantization = "fp8xfp4", None
         entry = dg.fp8_fp4_mega_moe
     elif c.precision == "w4a16":
         w1, w2 = dg.transform_weights_for_w4a16_mega_moe(raw1, raw2)
-        mma_type, quantization = "bf16xmxfp4", None
+        mma_type, quantization = "bf16xfp4", None
         entry = dg.bf16_fp4_mega_moe
     else:
         mma_type = "fp8xfp8"
@@ -564,7 +564,7 @@ def test_mega_moe_fp8_clamp_boundary(case, activation, mega_moe_group):
             raw.append((weight.to(torch.float8_e4m3fn), torch.ones(shape, device="cuda")))
     if case.precision == "w4a8":
         l1, l2 = dg.transform_weights_for_w4a8_mega_moe(*raw)
-        options = dict(mma_type="fp8xmxfp4")
+        options = dict(mma_type="fp8xfp4")
         entry = dg.fp8_fp4_mega_moe
     else:
         quantization = case.precision.removeprefix("fp8_")
@@ -602,8 +602,8 @@ def test_mega_moe_fp8_clamp_boundary(case, activation, mega_moe_group):
 @pytest.mark.parametrize("case", SMOKE_CASES, ids=lambda c: c.name)
 def test_mega_moe_precision_options(case, mega_moe_group):
     case.require_world()
-    options = (dict(mma_type="bf16xmxfp4") if case.precision == "w4a16" else
-               dict(mma_type="fp8xmxfp4") if case.precision == "w4a8" else
+    options = (dict(mma_type="bf16xfp4") if case.precision == "w4a16" else
+               dict(mma_type="fp8xfp4") if case.precision == "w4a8" else
                dict(mma_type="fp8xfp8", quantization=case.precision.removeprefix("fp8_")))
     with pytest.raises((ValueError, RuntimeError), match="[Uu]nsupported.*activation"):
         dg.SymmBuffer(

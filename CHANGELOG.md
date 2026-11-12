@@ -46,6 +46,11 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Changed
 
+- **MegaMoE MMA names**: uses `mma_type="fp4xfp4"`, `"fp8xfp4"`,
+  `"bf16xfp4"` and `"fp8xfp8"` consistently across workspace allocation,
+  pre-dispatch and precision-specific compute entries. W4A4 also accepts
+  `"mxfp4xmxfp4"` as an alias of `"fp4xfp4"`.
+
 - **BF16 dense GEMM**: `bf16_gemm_nt` now supports odd N with BF16 or
   FP32 output on 890P, including an optimized N=1 path. On 810E, N must be
   even except for N=1 without an explicit configuration; that path requires
@@ -54,8 +59,7 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 - **M890 W4A4 MegaMoE**: optimizes dispatch, GEMM scheduling, and
   scatter/reduce to improve computation and communication overlap.
-  - Renames `mma_type="fp4xfp4"` to `"mxf4xmxf4"` and
-    `activation="step"` to `"swiglu_step"`.
+  - Renames `activation="step"` to `"swiglu_step"`.
   - Adds `activation="swiglu_oai"` with optional `activation_alpha`
     (default: `1.702`). Allows `situ_linear_beta=None` to disable SiTU
     up softcap.

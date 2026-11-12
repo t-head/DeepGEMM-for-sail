@@ -33,12 +33,16 @@ inline int expected_expert_rows(int tokens, int topk, int groups, int ranks, int
 
 enum class MmaKind { BF16, MXFP8FP4, MXFP4 };
 
+static bool is_fp4_mma_type(const std::string& mma_type_str) {
+    return mma_type_str == "fp4xfp4" || mma_type_str == "mxfp4xmxfp4";
+}
+
 static MmaKind parse_mma_kind(const std::string& mma_type_str) {
     if (mma_type_str == "bf16xbf16")
         return MmaKind::BF16;
     if (mma_type_str == "fp8xfp4" or mma_type_str == "fp8xfp8")
         return MmaKind::MXFP8FP4;
-    DG_HOST_ASSERT(mma_type_str == "mxf4xmxf4");
+    DG_HOST_ASSERT(is_fp4_mma_type(mma_type_str));
     return MmaKind::MXFP4;
 }
 

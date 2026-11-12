@@ -489,7 +489,10 @@ for arguments and constraints and [the tests](tests/test_mega_gate.py) for examp
 MegaMoE combines expert-parallel dispatch, two expert GEMMs, gated activation
 and reduction on PPU. Allocate the symmetric buffer and transform the local
 weights once, then run pre-dispatch and forward for each batch. The following
-example uses MXFP4 (W4A4).
+example uses MXFP4 (W4A4). Both `mma_type="fp4xfp4"` and
+`mma_type="mxfp4xmxfp4"` select this backend. Workspaces store the canonical
+name `fp4xfp4`; either spelling can be used for pre-dispatch, including with
+a workspace created using the other spelling.
 
 ```python
 import torch
@@ -497,7 +500,7 @@ import deep_gemm
 
 buffer = deep_gemm.get_symm_buffer_for_mega_moe(
     group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
-    mma_type="mxf4xmxf4")
+    mma_type="fp4xfp4")
 l1_weights, l2_weights = deep_gemm.transform_weights_for_mega_moe(
     (w13_fp4, w13_scales), (w2_fp4, w2_scales))
 
@@ -506,7 +509,7 @@ output = torch.empty_like(hidden_states)
 deep_gemm.mega_moe_pre_dispatch(
     hidden_states, topk_ids, topk_weights,
     buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
-    num_tokens=hidden_states.shape[0], group_size=32, mma_type="mxf4xmxf4")
+    num_tokens=hidden_states.shape[0], group_size=32, mma_type="fp4xfp4")
 deep_gemm.fp4_fp4_mega_moe(output, l1_weights, l2_weights, buffer)
 ```
 
@@ -529,8 +532,8 @@ with `quantization` (channelwise by default). These backends require PPU1.5.
 |---|---|---|---|---|
 | FP8 channelwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="channelwise"` | SwiGLU, SwiGLU-OAI | 64 |
 | FP8 blockwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, SwiGLU-OAI | 64 |
-| E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `mma_type="fp8xmxfp4"` | SwiGLU, SwiGLU-OAI, SiTU | 64 |
-| BF16 x MXFP4 | `bf16_fp4_mega_moe` | `mma_type="bf16xmxfp4", activation="situ"` | SiTU | 64 |
+| E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `mma_type="fp8xfp4"` | SwiGLU, SwiGLU-OAI, SiTU | 64 |
+| BF16 x MXFP4 | `bf16_fp4_mega_moe` | `mma_type="bf16xfp4", activation="situ"` | SiTU | 64 |
 
 H is divisible by 256 and I by 128. FP8 and W4A8 support at most 128 physical experts
 per rank; W4A16 supports at most 127. Capacity is positive and below 2^24;
@@ -579,7 +582,7 @@ l1, l2 = dg.transform_weights_for_w4a16_mega_moe(raw_l1_w4, raw_l2_w4)
 workspace = dg.get_symm_buffer_for_mega_moe(
     group, num_experts=896, num_max_tokens_per_rank=4096,
     num_topk=16, hidden=3584, intermediate_hidden=3072,
-    mma_type="bf16xmxfp4", activation="situ")
+    mma_type="bf16xfp4", activation="situ")
 y = torch.empty_like(x)
 dg.mega_moe_pre_dispatch(
     x, topk_ids, topk_weights,
@@ -594,7 +597,7 @@ l1, l2 = dg.transform_weights_for_w4a8_mega_moe(raw_l1_w4, raw_l2_w4)
 workspace = dg.SymmBuffer(
     group, num_experts=896, num_max_tokens_per_rank=4096,
     num_topk=16, hidden=3584, intermediate_hidden=3072,
-    mma_type="fp8xmxfp4", activation="situ")
+    mma_type="fp8xfp4", activation="situ")
 y = torch.empty_like(x)
 dg.mega_moe_pre_dispatch(
     x, topk_ids, topk_weights,

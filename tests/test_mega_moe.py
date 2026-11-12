@@ -332,7 +332,10 @@ def _check_workspace_options(case, group):
                    num_topk=case.topk, hidden=case.hidden, activation=case.activation,
                    intermediate_hidden=case.intermediate)
     invalid = [({"mma_type": "unsupported"}, "mma_type_str"),
-               ({"mma_type": "fp8xfp4"}, "mma_kind"),
+               ({"mma_type": "bf16xbf16"}, "mma_kind"),
+               ({"mma_type": "mxf4xmxf4"}, "mma_type_str"),
+               ({"mma_type": "fp8xmxfp4"}, "mma_type_str"),
+               ({"mma_type": "bf16xmxfp4"}, "mma_type_str"),
                ({"activation": "unsupported"}, "Unsupported MegaMoE activation"),
                ({"intermediate_hidden": 127}, "intermediate"),
                ({"hidden": case.hidden + 1}, "hidden"),
@@ -357,7 +360,7 @@ def _check_public_entry(entry, y, l1_weights, l2_weights, sym_buffer, source, id
     deep_gemm.mega_moe_pre_dispatch(
         source, ids, weights,
         sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-        num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
+        num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
     with pytest.raises((ValueError, RuntimeError), match="Unsupported MegaMoE activation"):
         entry(y, l1_weights, l2_weights, sym_buffer, **{**options, "activation": "unsupported"})
     for changed, message in (
@@ -404,14 +407,14 @@ def _check_input_views(entry, y, l1_weights, l2_weights, sym_buffer, source, ids
     deep_gemm.mega_moe_pre_dispatch(
         source, ids, weights,
         sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-        num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
+        num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
     entry(y, l1_weights, l2_weights, sym_buffer, **options)
     expected = y.clone()
     # The common argument order matches SM90; PPU extensions remain keyword-only.
     deep_gemm.mega_moe_pre_dispatch(
         source, ids, weights,
         sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-        num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
+        num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
     entry(y, l1_weights, l2_weights, sym_buffer, None, (1, 1, 32),
           options["activation"], options["activation_clamp"], options["fast_math"])
     torch.testing.assert_close(y, expected, rtol=0, atol=0)
@@ -420,18 +423,18 @@ def _check_input_views(entry, y, l1_weights, l2_weights, sym_buffer, source, ids
         deep_gemm.mega_moe_pre_dispatch(
             source, ids, weights,
             sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-            num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
+            num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
         entry(y, l1_weights, l2_weights, sym_buffer, **default_options)
         torch.testing.assert_close(y, expected, rtol=0, atol=0)
     deep_gemm.mega_moe_pre_dispatch(
         source[:0], ids[:0], weights[:0],
         sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-        num_tokens=0, group_size=32, mma_type="mxf4xmxf4")
+        num_tokens=0, group_size=32, mma_type="fp4xfp4")
     entry(y[:0], l1_weights, l2_weights, sym_buffer, **options)
     deep_gemm.mega_moe_pre_dispatch(
         source, ids, weights,
         sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-        num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
+        num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
     entry(y, l1_weights, l2_weights, sym_buffer, **options)
     torch.testing.assert_close(y, expected, rtol=0, atol=0)
     _check_offset_views(entry, l1_weights, l2_weights, sym_buffer, source, ids, weights, **options)
@@ -439,7 +442,7 @@ def _check_input_views(entry, y, l1_weights, l2_weights, sym_buffer, source, ids
         deep_gemm.mega_moe_pre_dispatch(
             source, ids, weights,
             sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-            num_tokens=source.shape[0], group_size=32, mma_type="mxf4xmxf4")
+            num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
         entry(y, l1_weights, l2_weights, sym_buffer, **options)
         return y
 
@@ -508,7 +511,7 @@ def _check_offset_views(entry, l1_weights, l2_weights, sym_buffer, source, ids, 
         deep_gemm.mega_moe_pre_dispatch(
             input_tensor, ids, weights,
             sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-            num_tokens=input_tensor.shape[0], group_size=32, mma_type="mxf4xmxf4")
+            num_tokens=input_tensor.shape[0], group_size=32, mma_type="fp4xfp4")
         entry(y, l1_weights, l2_weights, sym_buffer, **options)
         return y
 
@@ -752,7 +755,7 @@ def mega_moe_smoke(mega_moe_group, request):
         deep_gemm.mega_moe_pre_dispatch(
             x, routed_ids, routed_weights,
             buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
-            num_tokens=x.shape[0], group_size=32, mma_type="mxf4xmxf4")
+            num_tokens=x.shape[0], group_size=32, mma_type="fp4xfp4")
         deep_gemm.fp4_fp4_mega_moe(y, w1, w2, buffer, stats, **options)
         return y
 
@@ -785,6 +788,29 @@ def test_mega_moe_smoke_api(mega_moe_smoke, mega_moe_group):
                     workspace=sample.buffer, verbose=False)
 
 
+@pytest.mark.parametrize("mma_type", ("fp4xfp4", "mxfp4xmxfp4"))
+@pytest.mark.parametrize("factory", (deep_gemm.SymmBuffer, deep_gemm.get_symm_buffer_for_mega_moe),
+                         ids=("constructor", "factory"))
+def test_mega_moe_fp4_mma_aliases(mega_moe_smoke, mega_moe_group, mma_type, factory):
+    sample = mega_moe_smoke
+    expected = sample.pipeline().clone()
+    options = dict(mma_type=mma_type, activation=sample.case.activation)
+    if factory is deep_gemm.SymmBuffer:
+        options["base"] = sample.buffer
+    buffer = factory(mega_moe_group, sample.case.experts, sample.case.capacity,
+                     sample.case.topk, sample.case.hidden, sample.case.intermediate, **options)
+    try:
+        assert buffer.mma_type == "fp4xfp4"
+        for prepare in (deep_gemm.mega_moe_pre_dispatch, deep_gemm._C.mega_moe_pre_dispatch):
+            prepare(sample.x, sample.ids, sample.weights,
+                    buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
+                    sample.x.shape[0], 32, mma_type)
+            deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, buffer, **sample.options)
+            torch.testing.assert_close(sample.y, expected, rtol=0, atol=0)
+    finally:
+        buffer.destroy()
+
+
 def test_mega_moe_smoke_stateful(mega_moe_smoke):
     sample = mega_moe_smoke
     if dist.get_world_size() < 2:
@@ -810,7 +836,7 @@ def test_mega_moe_smoke_workspace(mega_moe_smoke, mega_moe_group):
     with patch.object(symm_mem, "empty", side_effect=AssertionError("base allocated storage")), \
          patch.object(symm_mem, "rendezvous", side_effect=AssertionError("base registered again")), \
          patch.object(torch, "empty", side_effect=AssertionError("base allocated storage")):
-        alias = deep_gemm.SymmBuffer(*arguments, 0, "mxf4xmxf4", "swiglu", base)
+        alias = deep_gemm.SymmBuffer(*arguments, 0, "fp4xfp4", "swiglu", base)
     assert alias.buffer is base.buffer and alias.handle is base.handle
     torch.testing.assert_close(alias.buffer, saved, rtol=0, atol=0)
     for view in (alias.x, alias.x_sf, alias.topk_idx, alias.topk_weights):
@@ -829,13 +855,13 @@ def test_mega_moe_smoke_workspace(mega_moe_smoke, mega_moe_group):
              patch.object(symm_mem, "rendezvous", side_effect=AssertionError("EP1 rendezvous")), \
              patch.object(torch, "empty", wraps=torch.empty) as allocate:
             with pytest.warns(DeprecationWarning, match="use_fp8_dispatch"):
-                fresh = deep_gemm.get_symm_buffer_for_mega_moe(*arguments, 0, False, "mxf4xmxf4", "swiglu")
+                fresh = deep_gemm.get_symm_buffer_for_mega_moe(*arguments, 0, False, "fp4xfp4", "swiglu")
         assert allocate.call_count == 1
     else:
         with patch.object(symm_mem, "empty", wraps=symm_mem.empty) as allocate, \
              patch.object(symm_mem, "rendezvous", wraps=symm_mem.rendezvous) as register:
             with pytest.warns(DeprecationWarning, match="use_fp8_dispatch"):
-                fresh = deep_gemm.get_symm_buffer_for_mega_moe(*arguments, 0, False, "mxf4xmxf4", "swiglu")
+                fresh = deep_gemm.get_symm_buffer_for_mega_moe(*arguments, 0, False, "fp4xfp4", "swiglu")
         assert allocate.call_count == register.call_count == 1
     fresh.destroy()
     with pytest.raises(AssertionError, match="invalid symmetric buffer"):
@@ -847,7 +873,7 @@ def test_mega_moe_smoke_workspace(mega_moe_smoke, mega_moe_group):
     deep_gemm.mega_moe_pre_dispatch(
         sample.x, sample.ids, sample.weights,
         alias.x, alias.x_sf, alias.topk_idx, alias.topk_weights,
-        num_tokens=sample.x.shape[0], group_size=32, mma_type="mxf4xmxf4")
+        num_tokens=sample.x.shape[0], group_size=32, mma_type="fp4xfp4")
     deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, alias, **sample.options)
     torch.testing.assert_close(sample.y, expected, rtol=0, atol=0)
     alias.destroy()
@@ -872,7 +898,7 @@ def test_mega_moe_smoke_workspace_dimensions(mega_moe_smoke, mega_moe_group):
         deep_gemm.mega_moe_pre_dispatch(
             sample.x, sample.ids, sample.weights,
             alias.x, alias.x_sf, alias.topk_idx, alias.topk_weights,
-            num_tokens=sample.x.shape[0], group_size=32, mma_type="mxf4xmxf4")
+            num_tokens=sample.x.shape[0], group_size=32, mma_type="fp4xfp4")
         deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, alias, **sample.options)
         return sample.y
 
@@ -892,7 +918,7 @@ def test_mega_moe_smoke_clamp(mega_moe_smoke):
             deep_gemm.mega_moe_pre_dispatch(
                 sample.x, sample.ids, sample.weights,
                 sample.buffer.x, sample.buffer.x_sf, sample.buffer.topk_idx, sample.buffer.topk_weights,
-                num_tokens=sample.x.shape[0], group_size=32, mma_type="mxf4xmxf4")
+                num_tokens=sample.x.shape[0], group_size=32, mma_type="fp4xfp4")
             deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, sample.buffer, **options)
             return sample.y
         _compile_kernels(pipeline)
@@ -974,7 +1000,7 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
                 deep_gemm.mega_moe_pre_dispatch(
                     x, routed_idx, routed_weights,
                     sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-                    num_tokens=x.shape[0], group_size=32, mma_type="mxf4xmxf4")
+                    num_tokens=x.shape[0], group_size=32, mma_type="fp4xfp4")
                 deep_gemm.fp4_fp4_mega_moe(
                     y, l1_weights, l2_weights, sym_buffer,
                     cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
