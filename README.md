@@ -482,8 +482,7 @@ indices can optionally be mapped from logical to physical IDs.
 The default `scoring_func="sqrtsoftplus"` applies `sqrt(softplus(x))`.
 GLM-5.3 routers can select `scoring_func="sigmoid"`. If sigmoid scores round
 to the same FP32 value and their biases are equal, the smaller expert ID wins.
-The fused BF16 GEMM currently runs on M890. Running it on 810E requires a
-compatible GEMM mainloop.
+Both scoring modes use the same BF16 GEMM backend.
 
 The outputs are INT64 indices and FP32 weights, each shaped `[T, K]`. When
 shared experts are included as routed experts, each output is `[T, K + S]`,

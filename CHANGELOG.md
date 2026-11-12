@@ -42,8 +42,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 - **Mega Gate**: adds `bf16_mega_gate`, fusing BF16 routing GEMM, bias-aware
   Top-k selection, weight normalization and scaling, and optional
-  logical-to-physical expert mapping. M890 supports the default
-  `sqrtsoftplus` scoring and explicit `scoring_func="sigmoid"` for GLM-5.3.
+  logical-to-physical expert mapping. The default is `scoring_func="sqrtsoftplus"`.
+  GLM-5.3 uses `scoring_func="sigmoid"`.
 
 ### Changed
 
