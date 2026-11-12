@@ -241,7 +241,7 @@ def run_nvfp4_gemm(args, *, check_accuracy=True, benchmark=False, ref_backend='d
         routing_weight = workspace if workspace is not None else rhs[0]
         routing_options = (dict(lhs_scale_group_size=a_scale_group, rhs_scale_block_size=b_scale_block)
                            if execution == 'fused' else {})
-        configs, aligned_rows, experts, tokens, blocks, _, _ = deep_gemm.moe_align_block_size(
+        configs, aligned_rows, experts, tokens, blocks, inverse, _ = deep_gemm.moe_align_block_size(
             a, routing_weight, routes, False, **routing_options)
         if regressions and m == 17:
             # Explicit overrides use the same public entry as automatic selection.
@@ -249,7 +249,7 @@ def run_nvfp4_gemm(args, *, check_accuracy=True, benchmark=False, ref_backend='d
             selected = deep_gemm.moe_align_block_size(
                 a, routing_weight, routes, False, config=override, **routing_options)
             assert selected[0] == override
-            configs, aligned_rows, experts, tokens, blocks, _, _ = selected
+            configs, aligned_rows, experts, tokens, blocks, inverse, _ = selected
     if regressions and execution == 'fused' and kind in ('nopad', 'masked'):
         # Exercise rolling operands and both shared-decode M tiles, including
         # partial M fragments and persistent CTAs moving between experts.
@@ -298,6 +298,11 @@ def run_nvfp4_gemm(args, *, check_accuracy=True, benchmark=False, ref_backend='d
             route_ids = routes.to(device).flatten()
             ref = torch.cat([a_ref[token_ids[route_ids == expert]] @ b_ref[expert].t()
                              for expert in range(e)])
+            # Use the inverse from the same align call as the GEMM metadata;
+            # compact output rows need not preserve route order within an expert.
+            inverse_ids = inverse.to(device).long().flatten()
+            result = torch.cat([result[inverse_ids[route_ids == expert]]
+                                for expert in range(e)])
             _check_nvfp4(result, ref, name)
         if workspace is not None:
             expected = _cast_fp8(_decode_nvfp4(codes, native_scale))

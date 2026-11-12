@@ -66,6 +66,13 @@ def run_activation_regression(args):
     return test_checkin_activation(args, check_accuracy=get_acc_check())
 
 
+def run_moe_align(args):
+    if args.get('case') != 'invalid_routes':
+        raise ValueError(f"Unsupported MoE align regression: {args.get('case')}")
+    from test_moe_align_invalid_routes import main
+    return main(check_accuracy=get_acc_check())
+
+
 def call_test_func(gemm_type, func_args):
     supported_call_funcs = {
         "KGroupedContiguous": test_k_grouped_gemm_contiguous,
@@ -89,6 +96,7 @@ def call_test_func(gemm_type, func_args):
         "AttentionRegression": run_attention_regression,
         "Preprocess": run_preprocessing_regression,
         "Activation": run_activation_regression,
+        "MoeAlign": run_moe_align,
     }
 
     if gemm_type in supported_call_funcs.keys():
