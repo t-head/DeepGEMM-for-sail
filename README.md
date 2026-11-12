@@ -125,9 +125,6 @@ its specialized paths also support guarded narrow outputs and partial tiles.
 
 #### 810E dense GEMM
 
-The native `bf16_gemm_strided_batched_nt` API is not exported by this build;
-its implementation is maintained separately from the dense GEMM changes.
-
 ```python
 # A[M,K], B[N,K]: contiguous BF16; D[M,N]: contiguous BF16 or FP32.
 deep_gemm.bf16_gemm_nt(a, b, d, c=c)  # D = A @ B.T + C; C is optional
@@ -135,12 +132,11 @@ deep_gemm.bf16_gemm_nt(a, b, d, c=c)  # D = A @ B.T + C; C is optional
 
 This function writes into the supplied output and returns `None`. All tensors
 must be on the current accelerator; output must not overlap either input.
-For dense BF16 accumulation, C must match D's shape, dtype and device and be
+C must match D's shape, dtype and device and be
 either disjoint from D or exactly aliased with identical strides. The product
-and C are combined in FP32 before conversion to BF16, including GEMV and split-K.
+and C are combined in FP32 before conversion to the output dtype.
 Compile-only mode (`set_compile_mode(1)` or nonempty `HGGC_WARM_UP`) preserves C/D.
-Explicit CU limits also bound accumulation/conversion and K=0 copy/zero kernels;
-these auxiliary kernels use the SIMT budget, independently of the Tensor-CU pool.
+Explicit CU limits apply to GEMM and auxiliary kernels.
 
 810E BF16 tiled paths require `K>=64`, `K%32=0`, and 16-byte-aligned inputs.
 GEMV paths allow shorter K with their own alignment checks. Empty outputs are
@@ -148,30 +144,17 @@ no-ops, and K=0 writes C or zero as appropriate during normal execution.
 Unsupported shapes, layouts, tiles and device grid/resource limits raise an
 error at the host interface before launching the affected kernel.
 
-Automatic 810E scheduling uses matrix geometry and the configured CU budget,
-choosing GEMV, Direct, TSM, hybrid edge handling, split-K kernels.
+Automatic scheduling selects kernels from matrix geometry and the CU budget.
 Explicit `configs` take precedence over external LUT entries, which take
 precedence over automatic selection.
-The stable configuration tuple is
+The configuration tuple is
 `(num_sms, BM, BN, BK, WM, WN, stages, (0, 0, 0))`; its last field is reserved
-and shared-memory requirements are recomputed. Explicit/LUT tiled execution
-requires a 16-byte-aligned product output and N divisible by 8 (BF16) or 4 (FP32).
+for compatibility. Explicit/LUT tiled execution requires a 16-byte-aligned
+product output and N divisible by 8 (BF16) or 4 (FP32).
 With C, these requirements apply to the internal FP32 product; the final D
 only needs to satisfy the contiguous output contract above.
 See [utilities and environment variables](#utilities) for kernel controls and
 [checkin cases](tests/checkin/checkin_810e.list) for accuracy and rejection coverage.
-
-Implementation follows the existing API → heuristics → runtime → kernel layers.
-The API validates tensor contracts; `common_bf16.hpp` selects configurations;
-the runtime owns accumulation, workspace and launches.
-810E-specific counterparts use the existing names with an `_810e` suffix,
-including `bf16_gemm_810e`, `bf16_gemm_impl_810e` and
-`get_adaptive_configs_bf16_810e`. The public configuration tuple is unchanged.
-Custom 810E paths use the existing `PPU_LIB_SHOW_PARAMS`,
-`PPU_LIB_PERF_INSTRUMENT` and `show_log` controls. Dumped BF16 product cases
-preserve BF16/FP32 output dtype; accumulation and tensor aliasing are covered
-by checkin tests rather than encoded in the product dump.
-
 
 #### Grouped GEMMs (contiguous layout)
 
