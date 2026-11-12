@@ -33,11 +33,15 @@ def _normalize_activation(activation: str) -> str:
     return activation
 
 
+def _normalize_mma_type(mma_type: str) -> str:
+    return 'fp4xfp4' if mma_type == 'mxfp4xmxfp4' else mma_type
+
+
 class SymmBuffer:
     """Symmetric workspace for the supported PPU MegaMoE precisions.
 
-    mma_type='mxf4xmxf4' selects W4A4; 'fp8xmxfp4' selects W4A8.
-    'bf16xmxfp4' selects W4A16; 'fp8xfp8' selects W8A8, with
+    mma_type='fp4xfp4' (also 'mxfp4xmxfp4') selects W4A4; 'fp8xfp4' selects W4A8.
+    'bf16xfp4' selects W4A16; 'fp8xfp8' selects W8A8, with
     quantization='channelwise' (default) or 'blockwise'. intermediate_hidden is I.
 
     Select the HGGC device before construction. base shares storage and
@@ -60,10 +64,11 @@ class SymmBuffer:
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int,
                  num_shared_experts: int = 0,
-                 mma_type: str = 'mxf4xmxf4',
+                 mma_type: str = 'fp4xfp4',
                  activation: str = 'swiglu',
                  base: Optional['SymmBuffer'] = None,
                  *, quantization: Optional[str] = None):
+        mma_type = _normalize_mma_type(mma_type)
         if mma_type == 'fp8xfp8':
             quantization = 'channelwise' if quantization is None else quantization
             if quantization not in ('channelwise', 'blockwise'):
@@ -76,7 +81,7 @@ class SymmBuffer:
             if (not isinstance(base, SymmBuffer) or base.mma_type != mma_type
                     or base.quantization != quantization):
                 raise ValueError('base must use the same MegaMoE mma_type and quantization')
-            if mma_type != 'mxf4xmxf4':
+            if mma_type != 'fp4xfp4':
                 base._check_live()
                 if (base.group is not group or base.buffer.device.index != torch.cuda.current_device()
                         or (num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden) !=
@@ -133,7 +138,7 @@ class SymmBuffer:
             self.handle = base.handle
 
         # Create input buffer views
-        if mma_type == 'mxf4xmxf4':
+        if mma_type == 'fp4xfp4':
             (self.x, self.x_sf,
              self.topk_idx, self.topk_weights,
              self.l1_acts, self.l1_acts_sf,
@@ -164,7 +169,7 @@ def get_symm_buffer_for_mega_moe(
     intermediate_hidden: int,
     num_shared_experts: int = 0,
     use_fp8_dispatch: Union[bool, None] = None,
-    mma_type: str = "mxf4xmxf4",
+    mma_type: str = "fp4xfp4",
     activation: str = "swiglu",
     *,
     quantization: Optional[str] = None,
@@ -172,8 +177,8 @@ def get_symm_buffer_for_mega_moe(
     """Create the PPU workspace with native MegaMoE dimensions.
 
     The workspace is filled by mega_moe_pre_dispatch and consumed by
-    the corresponding complete compute entry. MMA modes are 'mxf4xmxf4',
-    'fp8xmxfp4', 'bf16xmxfp4' and 'fp8xfp8'. Only fp8xfp8 accepts quantization,
+    the corresponding complete compute entry. MMA modes are 'fp4xfp4' (alias 'mxfp4xmxfp4'),
+    'fp8xfp4', 'bf16xfp4' and 'fp8xfp8'. Only fp8xfp8 accepts quantization,
     selecting channelwise (default) or blockwise scales.
     """
     if use_fp8_dispatch is not None:
@@ -250,7 +255,7 @@ def mega_moe_pre_dispatch(
     buf_topk_weights: torch.Tensor,
     num_tokens: int,
     group_size: int = 32,
-    mma_type: str = "mxf4xmxf4",
+    mma_type: str = "fp4xfp4",
 ) -> None:
     """Prepare BF16 inputs and routes for the selected precision workspace.
 
@@ -265,7 +270,7 @@ def mega_moe_pre_dispatch(
     _C.mega_moe_pre_dispatch(
         x, topk_idx, topk_weights,
         buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
-        num_tokens, group_size, mma_type)
+        num_tokens, group_size, _normalize_mma_type(mma_type))
 
 
 def fp4_fp4_mega_moe(
@@ -311,8 +316,8 @@ def fp4_fp4_mega_moe(
     Callers must retain all weight banks and the optional statistics tensor until HGGC
     execution completes, including every replay of a captured Graph.
     """
-    if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'mxf4xmxf4':
-        raise ValueError("fp4_fp4_mega_moe requires SymmBuffer(mma_type='mxf4xmxf4')")
+    if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'fp4xfp4':
+        raise ValueError("fp4_fp4_mega_moe requires SymmBuffer(mma_type='fp4xfp4')")
     activation = _normalize_activation(activation)
     if not isinstance(y, torch.Tensor) or y.ndim != 2 or y.shape[1] != sym_buffer.hidden:
         raise ValueError(f'output must have shape [tokens, workspace hidden={sym_buffer.hidden}]')
@@ -495,8 +500,8 @@ def bf16_fp4_mega_moe(
     SiTU parameters follow fp4_fp4_mega_moe; situ_linear_beta=None disables
     the up-branch softcap. situ_beta must be positive and finite.
     """
-    if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'bf16xmxfp4':
-        raise TypeError("bf16_fp4_mega_moe requires SymmBuffer(mma_type='bf16xmxfp4')")
+    if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'bf16xfp4':
+        raise TypeError("bf16_fp4_mega_moe requires SymmBuffer(mma_type='bf16xfp4')")
     _check_routed_buffer(y, l1_weights, sym_buffer)
     _C.bf16_fp4_mega_moe(
         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
@@ -547,8 +552,8 @@ def fp8_fp4_mega_moe(
     SiTU and OAI parameters follow fp4_fp4_mega_moe. situ_linear_beta=None
     disables the up softcap; activation_alpha applies only to OAI.
     """
-    if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'fp8xmxfp4':
-        raise TypeError("fp8_fp4_mega_moe requires SymmBuffer(mma_type='fp8xmxfp4')")
+    if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'fp8xfp4':
+        raise TypeError("fp8_fp4_mega_moe requires SymmBuffer(mma_type='fp8xfp4')")
     _check_routed_buffer(y, l1_weights, sym_buffer, weight_components=3)
     if activation != 'situ':
         situ_beta = None if situ_beta == 4.0 else situ_beta

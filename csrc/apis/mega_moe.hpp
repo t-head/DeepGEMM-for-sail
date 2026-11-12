@@ -53,7 +53,7 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_shared_experts = 0,
     const std::array<int, 3>& staging_config = {},
     const std::optional<std::string>& quantization = std::nullopt) {
-    const bool routed = mma_type == "fp8xfp8" || mma_type == "fp8xmxfp4" || mma_type == "bf16xmxfp4";
+    const bool routed = mma_type == "fp8xfp8" || mma_type == "fp8xfp4" || mma_type == "bf16xfp4";
     if (!routed) {
         const auto mma_kind = parse_mma_kind(mma_type);
         DG_HOST_ASSERT(mma_kind == MmaKind::MXFP4);
@@ -66,7 +66,7 @@ get_symm_buffer_size_for_mega_moe(
         std::string precision;
         if (mma_type == "fp8xfp8")
             precision = fp8_mega_moe_precision(quantization.value_or("channelwise"));
-        else if (mma_type == "fp8xmxfp4")
+        else if (mma_type == "fp8xfp4")
             precision = "w4a8";
         else
             precision = "w4a16";
@@ -139,10 +139,11 @@ static void mega_moe_pre_dispatch(
     if (!same_view("x", buf_x) || !same_view("x_sf", buf_x_sf) ||
         !same_view("topk_idx", buf_topk_idx) || !same_view("topk_weights", buf_topk_weights))
         throw pybind11::value_error("output views must belong to the same live MegaMoE SymmBuffer");
-    if (owner.attr("mma_type").cast<std::string>() != mma_type)
+    const auto owner_mma_type = owner.attr("mma_type").cast<std::string>();
+    if (owner_mma_type != mma_type && !(is_fp4_mma_type(owner_mma_type) && is_fp4_mma_type(mma_type)))
         throw pybind11::value_error("mma_type must match the output views' MegaMoE SymmBuffer");
-    if (mma_type != "mxf4xmxf4") {
-        TORCH_CHECK(mma_type == "fp8xfp8" || mma_type == "fp8xmxfp4" || mma_type == "bf16xmxfp4",
+    if (!is_fp4_mma_type(mma_type)) {
+        TORCH_CHECK(mma_type == "fp8xfp8" || mma_type == "fp8xfp4" || mma_type == "bf16xfp4",
                     "Unsupported MegaMoE mma_type: ", mma_type);
         routed_mega_moe_pre_dispatch(x, topk_idx, topk_weights, buf_x, buf_x_sf,
                                     buf_topk_idx, buf_topk_weights, num_tokens);
