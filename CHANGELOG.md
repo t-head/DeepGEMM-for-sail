@@ -6,6 +6,13 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ## 1.1.0+v1.0.0
 
+### Fixed
+
+- **Paged indexer metadata synchronization**: moves the existing scan barriers
+  after shared-memory writes in both the main and tail prefix scans, preventing
+  incorrect scheduling boundaries without adding barriers. Existing indexer
+  APIs and main-kernel scheduling are unchanged.
+
 ### Added
 
 - **W4A4 MegaMoE**: adds the complete MXFP4 routed MoE pipeline with BF16
