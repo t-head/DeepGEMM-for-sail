@@ -141,7 +141,7 @@ __device__ void activation_tiled(const ActivationParams& p) {
 } // namespace deep_gemm
 
 namespace deep_gemm {
-// Activated values already include the Legacy BF16 rounding boundaries.
+// FP32 activations are rounded once when stored to the BF16 scratch.
 // Quantize each complete row with truncation; input dispatch uses nearest-even.
 template <int Intermediate, int Threads = 256, bool WarpRows = false>
 __device__ __forceinline__ void int8_quant_activated(

@@ -217,8 +217,6 @@ def _reference_activation(projection, case):
     gate = torch.nn.functional.silu(gate)
     if case.activation == "swiglu_step" and case.clamp is not None:
         gate = gate.clamp(max=case.clamp)
-    if case.precision == "w8a8" and case.activation == "swiglu":
-        gate = gate.bfloat16().float()
     return gate * up
 
 
@@ -226,7 +224,7 @@ def _reference_mega_moe(case, source, ids, weights, l1_weights_raw, l2_weights_r
                         num_tokens, checked, *, quantization_aware=True, projection_dtype=torch.float32):
     """Independent distributed MoE reference with format-specific quantization.
 
-    INT8 preserves BF16 projection/activation boundaries and truncates the
+    INT8 retains FP32 projection/activation arithmetic, stores BF16 results and truncates the
     post-activation values; input dispatch uses nearest-even quantization.
     The optional FP4 diagnostic omits activation quantization.
     """
@@ -254,7 +252,7 @@ def _reference_mega_moe(case, source, ids, weights, l1_weights_raw, l2_weights_r
         route_weights = all_weights[src, tok, slot, None]
         if int8:
             projection = ((x[src, tok] @ l1_weights[expert].float().t())
-                          * input_scales[src, tok, None] * l1_weights_sf[expert]).bfloat16()
+                          * input_scales[src, tok, None] * l1_weights_sf[expert])
             activated = _reference_activation(projection, c).bfloat16().float()
             scales = activated.abs().amax(-1).clamp_min(1e-10) / 127
             q = (activated / scales[:, None]).clamp(-128, 127).to(torch.int8)
@@ -1051,6 +1049,54 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
     return reports
 
 
+@pytest.mark.parametrize("activation", ("swiglu", "swiglu_step", "situ", "swiglu_oai"))
+def test_mega_moe_smoke_int8_fp32_activation_bf16_scratch(activation, mega_moe_group):
+    """Keep FP32 activation inputs/math and round only the final scratch."""
+    case = replace(INT8_CASES[0], activation=activation, capacity=16,
+                   clamp=1.111 if activation == "swiglu_step" else None,
+                   situ_beta=4.0, situ_linear_beta=25.0)
+    case.require_world()
+    rank, world = dist.get_rank(), dist.get_world_size()
+    e, h, i = case.experts // world, case.hidden, case.intermediate
+    gate = torch.linspace(-3.127, 2.053, i, device="cuda")
+    up = torch.linspace(1.123, 3.077, i, device="cuda")
+    projection = torch.cat((gate, up)).unsqueeze(0)
+    w1 = torch.zeros((e, 2 * i, h), dtype=torch.int8, device="cuda")
+    w1[:, :, 0] = projection.sign().to(torch.int8)
+    s1 = projection.abs().expand(e, -1).contiguous()
+    w2 = torch.zeros((e, h, i), dtype=torch.int8, device="cuda")
+    w2[:, :, 0] = 1
+    s2 = torch.ones((e, h), device="cuda")
+    weights = deep_gemm.transform_weights_for_mega_moe((w1, s1), (w2, s2))
+    source = torch.zeros((1, h), dtype=torch.bfloat16, device="cuda")
+    source[0, 0] = 1
+    ids = torch.tensor([[rank * e, -1]], dtype=torch.int64, device="cuda")
+    routes = torch.tensor([[1.0, 0.0]], device="cuda")
+    output = torch.empty_like(source)
+    buffer = deep_gemm.SymmBuffer(mega_moe_group, case.experts, 16, 2, h, i, mma_type="int8xint8")
+    try:
+        deep_gemm.mega_moe_pre_dispatch(source, ids, routes, buffer.x, buffer.x_sf,
+            buffer.topk_idx, buffer.topk_weights, 1, group_size=0, mma_type="int8xint8")
+        deep_gemm.int8_int8_mega_moe(output, *weights, buffer, activation=activation,
+                                   activation_clamp=case.clamp, fast_math=False)
+        values = _reference_activation(projection, case).bfloat16().float()
+        scale = values.abs().amax() / 127
+        legacy = _reference_activation(projection.bfloat16().float(), case)
+        if activation == "swiglu":
+            legacy = F.silu(gate.bfloat16().float()).bfloat16().float() * up.bfloat16().float()
+        legacy_scale = legacy.bfloat16().float().abs().amax() / 127
+        torch.testing.assert_close(buffer.l2_acts_sf[0], scale, rtol=3e-6, atol=1e-10)
+        normalized = (values / scale)[0]
+        expected = normalized.clamp(-128, 127).to(torch.int8)
+        stable = (normalized.abs() - normalized.abs().round()).abs() > .03
+        legacy_q = (legacy.bfloat16().float().reshape(1, -1) / legacy_scale).clamp(-128, 127).to(torch.int8)[0]
+        assert ((expected != legacy_q) & stable).any(), "test must distinguish input rounding"
+        torch.testing.assert_close(buffer.l2_acts[0, stable], expected[stable], rtol=0, atol=0)
+        assert torch.isfinite(output).all()
+    finally:
+        buffer.destroy()
+
+
 @pytest.mark.parametrize("case,fast_math", [
     pytest.param(case, fast_math, id=case.name + ("" if fast_math else "_precise"))
     for case in (*CASES, *INT8_CASES)
@@ -1113,7 +1159,8 @@ def main():
                         help="workspace token capacity")
     parser.add_argument("--routing", choices=("round_robin", "random", "skewed"), default="round_robin")
     parser.add_argument("--fast-math", type=int, choices=(0, 1), default=1,
-                        help="approximate GEMM1 activation math (default: 1); 0 uses expf/division/tanhf")
+                        help="SiTU division: 1 uses reciprocal multiplication (default), 0 uses FP32 division; "
+                             "both use native PPU sigmoid/tanh")
     parser.add_argument("--reference-tokens", type=int, default=0, help="check first N tokens/rank; 0 checks all")
     parser.add_argument("--replicas", action="store_true", help="test duplicated physical expert slots")
     parser.add_argument("--edge-cases", action="store_true",

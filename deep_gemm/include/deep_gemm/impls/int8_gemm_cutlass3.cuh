@@ -998,7 +998,7 @@ struct CollectiveMma<
     class FrgTensorD,
     class FrgTensorC,
     class KTileIterator,
-    class ResidueMNK, class PairTransform = std::false_type
+    class ResidueMNK
   >
   CUTLASS_DEVICE void
   operator() (
@@ -1010,8 +1010,7 @@ struct CollectiveMma<
       int thread_idx,
       int warp_idx,
       char *smem_buf,
-      uint32_t* queue_counter = nullptr, uint32_t* queue_ticket = nullptr,
-      PairTransform pair_transform = {}) {
+      uint32_t* queue_counter = nullptr, uint32_t* queue_ticket = nullptr) {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorD>::value, "D tensor must be rmem resident.");
@@ -1276,32 +1275,14 @@ CUTLASS_PRAGMA_UNROLL
     copy(smem_tiled_copy_ScaleA, tCsSA_p(_,_,Int<0>{}), tCrSA_copy_view(_,_,Int<0>{}));
     copy(smem_tiled_copy_ScaleB, tCsSB_p(_,Int<0>{},_), tCrSB_copy_view(_,Int<0>{},_));
 
-    // Pack dequantized gate/up pairs at the BF16 boundary to limit register use.
-    if constexpr (!std::is_same_v<PairTransform, std::false_type>) {
-      CUTE_STATIC_ASSERT_V(cute::size<0>(accum) % Int<2>{} == Int<0>{});
+    // Dequantize without an intermediate BF16 conversion.
+    CUTLASS_PRAGMA_UNROLL
+    for (int n = 0; n < cute::size<2>(accum); ++n) {
       CUTLASS_PRAGMA_UNROLL
-      for (int n = 0; n < cute::size<2>(accum); ++n) {
+      for (int m = 0; m < cute::size<1>(accum); ++m) {
         CUTLASS_PRAGMA_UNROLL
-        for (int m = 0; m < cute::size<1>(accum); ++m) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < cute::size<0>(accum); i += 2) {
-            const float gate = mma_acc(i,m,n) * tCrSA(i,m,Int<0>{}) * tCrSB(i,Int<0>{},n);
-            const float up = mma_acc(i+1,m,n) * tCrSA(i+1,m,Int<0>{}) * tCrSB(i+1,Int<0>{},n);
-            accum(i,m,n) = pair_transform(gate, up);
-          }
-        }
-      }
-    } else {
-      // dequantize
-      CUTLASS_PRAGMA_UNROLL
-      for (int n = 0; n < cute::size<2>(accum); ++n) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int m = 0; m < cute::size<1>(accum); ++m) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < cute::size<0>(accum); ++i) {
-            accum(i,m,n) = mma_acc(i,m,n) * tCrSA(i,m,Int<0>{}) * tCrSB(i,Int<0>{},n);
-          }
-        }
+        for (int i = 0; i < cute::size<0>(accum); ++i)
+          accum(i,m,n) = mma_acc(i,m,n) * tCrSA(i,m,Int<0>{}) * tCrSB(i,Int<0>{},n);
       }
     }
 
@@ -1637,31 +1618,14 @@ public:
 
       // Allocate the tiled_mma and the accumulators for the (M,N) blk_shape
       TiledMma tiled_mma;
-      auto accumulators = [&] {
-        if constexpr (kIsLinear1)
-          return make_fragment_like<typename CollectiveEpilogue::AccumulatorStorage>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
-        else return make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
-      }();
+      auto accumulators = make_fragment_like<ElementCompute>(
+          partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
       clear(accumulators);
       auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
       int  k_tile_count = size<2>(gA);
 
-      auto pair_transform = [&] {
-        if constexpr (kIsLinear1) {
-          if constexpr (CollectiveEpilogue::kHasPairTransform)
-            return typename CollectiveEpilogue::PairTransform{};
-          else return std::false_type{};
-        } else return std::false_type{};
-      }();
-      // Perform the collective scoped MMA
-      if constexpr (std::is_same_v<decltype(pair_transform), std::false_type>) {
-        // Ordinary A8W8/A8W4 collectives keep their existing call signature.
-        collective_mma(accumulators, load_inputs, accumulators, k_tile_iter, k_tile_count,
-                       residue_mnk, thread_idx, warp_idx, smem_buf);
-      } else {
-        collective_mma(accumulators, load_inputs, accumulators, k_tile_iter, k_tile_count,
-                       residue_mnk, thread_idx, warp_idx, smem_buf, nullptr, nullptr, pair_transform);
-      }
+      collective_mma(accumulators, load_inputs, accumulators, k_tile_iter, k_tile_count,
+                     residue_mnk, thread_idx, warp_idx, smem_buf);
 
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;

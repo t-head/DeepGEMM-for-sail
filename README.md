@@ -688,7 +688,13 @@ pre-dispatch quantization has no `fast_math` argument and is unchanged.
 ##### SM80 INT8 MegaMoE
 
 The SM80 INT8 path uses per-token activation scales and
-per-channel weight scales:
+per-channel weight scales. GEMM1 dequantization and all supported activations
+use FP32 without gate/up or SiLU intermediate BF16 rounding. The final activation
+is rounded once to BF16 scratch before GEMM2 input quantization.
+Post-activation INT8 quantization still truncates; GEMM2 retains BF16 scatter
+and weighted combine. The activation workspace stores BF16 values.
+This intentionally differs from Legacy's intermediate BF16 rounding; correctness
+is checked against the arithmetic described above.
 
 ```python
 import deep_gemm

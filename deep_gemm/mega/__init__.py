@@ -376,14 +376,15 @@ def int8_int8_mega_moe(
     with FP32 per-output-channel scales [local_experts, 2*I] / [local_experts, H].
     Prepare raw [gate...][up...] L1 rows once with
     transform_weights_for_mega_moe; compute consumes its interleaved pairs.
-    The fused GEMM1 epilogue rounds GEMM1, SiLU and the product to BF16, then
-    truncates per-row INT8 quantization (Legacy masked semantics). GEMM2 fuses
-    BF16 scatter and weighted combine. Supports swiglu, swiglu_step, situ and
-    swiglu_oai using FP4's activation formulas. fast_math=True uses PPU
-    sigmoid/tanh instructions; False uses expf/division/tanhf for GEMM1 activation
-    without changing MMA precision, BF16 rounding or INT8 quantization.
-    STEP/SiTU/OAI evaluate their formula in FP32 and round the product to BF16
-    before row quantization. STEP clamps after SiLU; SwiGLU/OAI clamp the gate.
+    GEMM1 accumulates INT32 and dequantizes to FP32. Gate/up inputs and
+    activation arithmetic remain FP32. The final activation is rounded once
+    to BF16 scratch, then converted to FP32 for whole-row INT8 quantization.
+    There is no gate/up or SiLU intermediate BF16 rounding. Quantization truncates
+    as before; GEMM2 keeps its BF16 scatter and weighted combine semantics.
+    Supports swiglu, swiglu_step, situ and swiglu_oai using FP4's activation formulas.
+    Both modes use native PPU sigmoid/tanh instructions. For SiTU divisions,
+    fast_math=True uses reciprocal multiplication; False uses regular FP32 division.
+    STEP clamps after SiLU; SwiGLU/OAI clamp the gate.
     SiTU defaults to situ_beta=4.0 and situ_linear_beta=25.0; explicitly pass
     situ_linear_beta=None to disable the up softcap. Both betas must otherwise
     be positive and finite, with no clamp/alpha. OAI's positive finite activation_alpha
