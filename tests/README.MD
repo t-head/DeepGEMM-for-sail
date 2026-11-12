@@ -67,6 +67,25 @@ and that runtime-only arguments preserve both. Coverage includes BF16 CuteFree
 and CUTLASS with BF16/FP32 output, GEMV M1/M2, FP8 block/channel, INT8 and FP4.
 The helper queries hardware constants but never compiles or launches generated
 GEMMs. Public API accuracy and launch behavior remain covered by the GEMM UTs.
+## Sparse MQA (810E INT8 / M890 MXFP4)
+
+Run these existing check-in cases from the repository root with the matching
+PPU build installed. Shapes are explicit; request-array arguments are not
+supported by this runner.
+
+```bash
+# 810E: non-paged and paged INT8.
+python tests/run_deep_gemm.py --require_supported --format 'SparseMqaLogits,data_type:int8,seq_len_q:32,seq_len_kv:1024,sparse_block_kv:8,num_max_sparse_blocks:256,check_metadata:1'
+python tests/run_deep_gemm.py --require_supported --format 'PagedSparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:129,sparse_block_kv:8,num_max_sparse_blocks:16,page_kv:32,check_metadata:1'
+
+# M890: non-paged and paged MXFP4.
+python tests/run_deep_gemm.py --require_supported --format 'SparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:1024,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:256,use_unaligned_ks:0,check_metadata:1'
+python tests/run_deep_gemm.py --require_supported --format 'PagedSparseMqaLogits,data_type:fp4,seq_len_q:313,seq_len_kv:1023,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,check_metadata:1'
+```
+
+See [810E check-in cases](checkin/checkin_810e.list),
+[M890 check-in cases](checkin/checkin_890p.list), and the
+[sparse API guide](../docs/api/indexer.md#sparse-indexer) for layouts and constraints.
 
 ## Test fp8
 python ./test_fp8_core.py
@@ -452,3 +471,26 @@ reference. Kernel timing follows the same method as other GEMM dtypes.
 Use EP32/groups=12 or EP64/groups=6, and up N/K=10240/7168 or down
 N/K=7168/5120. For another pre-routing batch B, set M=4*B and distribute
 those rows across the local experts.
+
+## Native INT8 paged sparse MQA (810E)
+
+INT8 and FP4 use the existing `test_sparse_mqa_logits_loop` and
+`utils.test_sparse_mqa_logits` entry points, with the same 11 case shapes.
+Coverage includes paged/nonpaged, B8/B16, unaligned nonpaged starts, odd Q,
+tail/zero-length contexts and capacity4096. The existing FP4 workspace test
+remains separate.
+
+```bash
+python tests/run_deep_gemm.py --format 'PagedSparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:129,sparse_block_kv:8,num_max_sparse_blocks:16,page_kv:64,check_metadata:1' --require_supported
+```
+
+The INT8 cache is uint8 `[pages,page_kv,1,132]`: each page stores all K bytes,
+then all FP32 scale words, with a 512-byte-aligned page stride. Q scales are
+folded into BF16 weights. Correctness uses the corresponding dense INT8
+kernel and gathers selected logits for bitwise comparison; paged inputs are
+resolved through the page table first. `check_metadata:1` also validates
+split contents, request pairing and schedule coverage.
+
+Development-only request-array workloads, independent INT8 epilogue references
+and three-stage Graph timing helpers have been removed from `utils.py`.
+Use standard shape cases here; historical profiling artifacts are unchanged.

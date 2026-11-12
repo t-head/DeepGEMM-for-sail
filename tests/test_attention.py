@@ -3,7 +3,7 @@ import torch
 
 import deep_gemm
 from utils import test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, set_acc_check, parse_deepgemm_string_re
-from utils import is_ppu1v5_device
+from utils import is_ppu1v5_device, get_arch_version
 
 def test_ks_ke(check_accuracy=True):
     if is_ppu1v5_device():
@@ -287,31 +287,157 @@ def test_mqa_avg_logits_loop():
 
 
 def test_sparse_mqa_logits_loop():
-    if not is_ppu1v5_device():
-        print('Skipping sparse MQA logits: requires PPU1.5')
+    # Use the existing FP4 coverage for both sparse implementations.
+    if get_arch_version() == 80:
+        data_type = 'int8'
+    elif is_ppu1v5_device():
+        data_type = 'fp4'
+    else:
+        print('Skipping sparse MQA logits: requires PPU1.0 or PPU1.5')
         return
-    print('Testing Sparse MQA Logits:')
+    print(f'Testing Sparse MQA Logits ({data_type}):')
     cases = [
         # Prefill: both block sizes, aligned/unaligned starts, odd Q tails, and empty selections.
-        'SparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:1024,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:256,use_unaligned_ks:0,check_metadata:1',
-        'SparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:1024,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:256,use_unaligned_ks:0,check_metadata:1',
-        'SparseMqaLogits,data_type:fp4,seq_len_q:9,seq_len_kv:639,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,use_unaligned_ks:1,check_metadata:1',
-        'SparseMqaLogits,data_type:fp4,seq_len_q:9,seq_len_kv:639,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:128,use_unaligned_ks:1,check_metadata:1',
-        'SparseMqaLogits,data_type:fp4,seq_len_q:2,seq_len_kv:0,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:4,use_unaligned_ks:0,check_metadata:1',
+        f'SparseMqaLogits,data_type:{data_type},seq_len_q:512,seq_len_kv:1024,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:256,use_unaligned_ks:0,check_metadata:1',
+        f'SparseMqaLogits,data_type:{data_type},seq_len_q:512,seq_len_kv:1024,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:256,use_unaligned_ks:0,check_metadata:1',
+        f'SparseMqaLogits,data_type:{data_type},seq_len_q:9,seq_len_kv:639,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,use_unaligned_ks:1,check_metadata:1',
+        f'SparseMqaLogits,data_type:{data_type},seq_len_q:9,seq_len_kv:639,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:128,use_unaligned_ks:1,check_metadata:1',
+        f'SparseMqaLogits,data_type:{data_type},seq_len_q:2,seq_len_kv:0,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:4,use_unaligned_ks:0,check_metadata:1',
         # Paged decode: request boundaries, multi-entry schedules, and partial splits.
-        'PagedSparseMqaLogits,data_type:fp4,seq_len_q:313,seq_len_kv:1023,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,check_metadata:1',
-        'PagedSparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:65536,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:128,check_metadata:1',
-        'PagedSparseMqaLogits,data_type:fp4,seq_len_q:1,seq_len_kv:1025,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:256,check_metadata:1',
-        'PagedSparseMqaLogits,data_type:fp4,seq_len_q:2,seq_len_kv:0,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:4,check_metadata:1',
+        f'PagedSparseMqaLogits,data_type:{data_type},seq_len_q:313,seq_len_kv:1023,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,check_metadata:1',
+        f'PagedSparseMqaLogits,data_type:{data_type},seq_len_q:512,seq_len_kv:65536,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:128,check_metadata:1',
+        f'PagedSparseMqaLogits,data_type:{data_type},seq_len_q:1,seq_len_kv:1025,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:256,check_metadata:1',
+        f'PagedSparseMqaLogits,data_type:{data_type},seq_len_q:2,seq_len_kv:0,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:4,check_metadata:1',
         # Largest merge bucket with more schedule slots than metadata threads.
-        'SparseMqaLogits,data_type:fp4,seq_len_q:9,seq_len_kv:65535,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:4096,use_unaligned_ks:1,check_metadata:1',
-        'PagedSparseMqaLogits,data_type:fp4,seq_len_q:9,seq_len_kv:65535,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:4096,page_kv:128,check_metadata:1',
+        f'SparseMqaLogits,data_type:{data_type},seq_len_q:9,seq_len_kv:65535,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:4096,use_unaligned_ks:1,check_metadata:1',
+        f'PagedSparseMqaLogits,data_type:{data_type},seq_len_q:9,seq_len_kv:65535,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:4096,page_kv:128,check_metadata:1',
     ]
     set_acc_check(True)
     for case in cases:
         print(case)
         test_sparse_mqa_logits(parse_deepgemm_string_re(case))
     print("Passed\n")
+
+
+def test_sparse_input_contracts(check_accuracy=True):
+    """Page-table capacity and storage-offset alignment on both sparse layouts."""
+    from utils import decode_sparse_metadata
+    arch = get_arch_version()
+    if arch not in (80, 89):
+        print('Skipping sparse input contracts: requires PPU1.0 or PPU1.5')
+        return
+    is_int8 = arch == 80
+    rows, page_kv, capacity, block_kv = 3, 128, 4, 8
+    device = 'cuda'
+    requests = torch.tensor([0, 0, 1], dtype=torch.int32, device=device)
+    empty_lens = torch.zeros(rows, dtype=torch.int32, device=device)
+    # No selected-block or page-table entry may be read for these empty windows.
+    poison = torch.full((rows, capacity), 0x7fffffff, dtype=torch.int32, device=device)
+    # Match the upstream sparse API: table capacity must be positive even for
+    # all-empty contexts. Empty windows themselves remain supported.
+    try:
+        deep_gemm.get_paged_sparse_mqa_logits_metadata(
+            empty_lens, torch.empty((rows, 0), dtype=torch.int32, device=device),
+            requests, page_kv, poison, torch.int8, block_kv)
+    except RuntimeError as error:
+        assert 'max_pages > 0' in str(error), str(error)
+    else:
+        raise AssertionError('Zero-width sparse page table accepted')
+    metadata = deep_gemm.get_paged_sparse_mqa_logits_metadata(
+        empty_lens, torch.full((rows, 1), 0x7fffffff, dtype=torch.int32, device=device),
+        requests, page_kv, poison, torch.int8, block_kv)
+    if check_accuracy:
+        decoded = decode_sparse_metadata(metadata, block_kv)
+        assert decoded['num_kv_splits'] == 0 and decoded['splits'] == []
+        # The scheduler retains one sentinel wave with no work.
+        assert decoded['num_waves'] == 1
+        assert all(entry == (0, 0, 0, 0) for entry in decoded['schedule'])
+
+    def offset_view(tensor, byte_offset):
+        assert byte_offset % tensor.element_size() == 0
+        offset = byte_offset // tensor.element_size()
+        storage = torch.empty(tensor.numel() + offset, dtype=tensor.dtype, device=device)
+        view = storage[offset:].view(tensor.shape)
+        view.copy_(tensor)
+        assert view.is_contiguous() and view.storage_offset() == offset
+        return view
+
+    for paged in (False, True):
+        width = 128 if is_int8 else 64
+        qshape = (rows, 1, 32, width) if paged else (rows, 32, width)
+        tensors = {
+            'q': torch.full(qshape, 1 if is_int8 else 0x22, dtype=torch.int8, device=device),
+            'weights': torch.full((rows, 32), 1 / 32, dtype=torch.bfloat16, device=device),
+        }
+        if not is_int8:
+            tensors['q_scale'] = torch.full(qshape[:-1], 0x7f7f7f7f, dtype=torch.int32, device=device)
+        k = torch.full((page_kv, width), 1 if is_int8 else 0x22, dtype=torch.int8, device=device)
+        scales = torch.full((page_kv,), 1 if is_int8 else 0x7f7f7f7f,
+                            dtype=torch.float32 if is_int8 else torch.int32, device=device)
+        selected = torch.zeros((rows, capacity), dtype=torch.int32, device=device)
+        lens = torch.full((rows,), block_kv, dtype=torch.int32, device=device)
+        if paged:
+            tensors['kv_cache'] = torch.cat((k.view(torch.uint8).flatten(),
+                                             scales.view(torch.uint8).flatten())).view(1, page_kv, 1, width + 4)
+            tensors['metadata'] = deep_gemm.get_paged_sparse_mqa_logits_metadata(
+                lens, torch.zeros((rows, 1), dtype=torch.int32, device=device), requests,
+                page_kv, selected, torch.int8, block_kv)
+        else:
+            tensors.update(k=k, k_scale=scales)
+            tensors['metadata'] = deep_gemm.get_sparse_mqa_logits_metadata(
+                empty_lens, lens, page_kv, selected, torch.int8, block_kv)
+
+        def run(inputs):
+            q = inputs['q'] if is_int8 else (inputs['q'], inputs['q_scale'])
+            if paged:
+                fn = deep_gemm.int8_paged_sparse_mqa_logits if is_int8 else deep_gemm.fp8_fp4_paged_sparse_mqa_logits
+                kv = inputs['kv_cache']
+            else:
+                fn = deep_gemm.int8_sparse_mqa_logits if is_int8 else deep_gemm.fp8_fp4_sparse_mqa_logits
+                kv = (inputs['k'], inputs['k_scale'])
+            return fn(q, kv, inputs['weights'], inputs['metadata'], capacity, block_kv)
+
+        # Nonzero offsets are legal when the resulting base address is aligned.
+        aligned = {name: offset_view(tensor, 16) for name, tensor in tensors.items()}
+        actual = run(aligned)
+        if check_accuracy:
+            torch.testing.assert_close(actual[:, :block_kv], torch.full_like(actual[:, :block_kv], 128), rtol=0, atol=0)
+        names = {'q': 'q' if is_int8 else 'q[0]', 'q_scale': 'q[1]',
+                 'k': 'kv_s[0]' if is_int8 else 'kv[0]',
+                 'k_scale': 'kv_s[1]' if is_int8 else 'kv[1]'}
+        for name, tensor in tensors.items():
+            bad = offset_view(tensor, tensor.element_size())
+            assert bad.data_ptr() % 16 != 0
+            # A contiguous view retains its misaligned address after contiguous().
+            assert bad.contiguous().data_ptr() == bad.data_ptr()
+            try:
+                run(dict(tensors, **{name: bad}))
+            except RuntimeError as error:
+                assert f'{names.get(name, name)} base address must be 16-byte aligned' in str(error), str(error)
+            else:
+                raise AssertionError(f'{name}: unaligned input accepted (paged={paged})')
+        if not is_int8:
+            # C4096/B16 gives S=65536; row 65536 would wrap to row zero.
+            # The API must reject before allocating the >8 GiB output or
+            # consuming metadata (the small fixture is deliberately reused).
+            overflow_rows = 65537
+            overflow_shape = (overflow_rows, 1, 32, 64) if paged else (overflow_rows, 32, 64)
+            overflow_q = (
+                torch.empty(overflow_shape, dtype=torch.int8, device=device),
+                torch.empty(overflow_shape[:-1], dtype=torch.int32, device=device),
+            )
+            overflow_weights = torch.empty((overflow_rows, 32), dtype=torch.bfloat16, device=device)
+            fn = deep_gemm.fp8_fp4_paged_sparse_mqa_logits if paged else deep_gemm.fp8_fp4_sparse_mqa_logits
+            kv = tensors['kv_cache'] if paged else (tensors['k'], tensors['k_scale'])
+            try:
+                fn(overflow_q, kv, overflow_weights, tensors['metadata'], 4096, 16)
+            except RuntimeError as error:
+                assert 'Q * logits_stride <= 2^32' in str(error), str(error)
+            else:
+                raise AssertionError(f'FP4 overflowing output shape accepted (paged={paged})')
+            del overflow_q, overflow_weights
+    torch.cuda.synchronize()
+    print('PASS: page-table capacity; empty windows; aligned offsets; unaligned inputs and FP4 overflow rejected')
 
 
 def test_sparse_workspace():
@@ -505,4 +631,5 @@ if __name__ == '__main__':
     test_paged_mqa_logits_loop()
     test_mqa_avg_logits_loop()
     test_sparse_mqa_logits_loop()
+    test_sparse_input_contracts()
     test_sparse_workspace()
