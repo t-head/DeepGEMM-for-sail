@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <torch/python.h>
 #include <deep_gemm/common/types.cuh>
 
@@ -9,7 +10,10 @@
 
 namespace deep_gemm {
 
-
+// Rows and reduce column chunks start on 16-byte boundaries relative to the tensor base.
+static bool is_bf16x8_aligned(const void* ptr) {
+    return reinterpret_cast<uintptr_t>(ptr) % 16 == 0;
+}
 
 static void major_check(const torch::Tensor& t) {
     const auto dim = t.dim();
