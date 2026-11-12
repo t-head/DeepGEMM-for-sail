@@ -976,3 +976,5 @@ public:
 ///////////////////////////////////////////////////////////////////////////////
 
 } // namespace cutlass::gemm::kernel
+
+#include <deep_gemm/impls/fp4_gemm_cutlass3_overlap_prologue.cuh>

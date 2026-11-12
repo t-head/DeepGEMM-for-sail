@@ -156,18 +156,88 @@ int get_fused_smem_size_fp4(int num_stages, int block_m, int block_n, int block_
     return std::max(smem_a_size + smem_b_size, epilogue_smem_size) + smem_sfa_size + smem_sfb_size;
 }
 
+// Shared memory a single CU exposes; the occupancy model below divides by it.
+inline constexpr int kPpuSmemCapacity = 262144;
+
 int get_smem_occ(int block_m, int block_n, int block_k, int num_stages, int warp_m, int warp_n, int shape_n, bool has_bias, bool enable_act_and_quant_fusing) {
     if (block_m == 0) {
         return 0;
     }
 
     // use static suppose.
-    const int ppu_capacity = 262144;
     int smem_size = std::get<0>(get_smem_config_fp4(num_stages, block_m, block_n, warp_m, warp_n, block_k, shape_n, has_bias, enable_act_and_quant_fusing));
-    return ppu_capacity / smem_size;
+    return kPpuSmemCapacity / smem_size;
 }
 
 using ConfigResult = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
+
+// Launch shapes that use the overlap-prologue prefetch; anything else keeps the base kernel.
+// Key = the six kernel-identity fields of ConfigResult (num_sms is launch geometry, the smem config
+// is derived), so the host is the only authority: the device predicate just asserts the structural
+// contract and adding a row needs no device change.
+// Rows were A/B'd on case 1 (G=4, m/group=8192, N=6144, packed K=3584), 3 paired kineto reps; the
+// comments give the delta, vreg and CTAs/CU.
+// Measured slower -- do not add (warp = warp_m x warp_n):
+//   256x128x128/s3 warp 64x64 (+8.3%, spills)   128x256x128/s4 warp 64x64 (+8.2%, spills)
+//   32x256x128/s3  warp 32x64 (+6.7%)           64x256x128/s3  warp 32x64 (+1.3%)
+//   256x128x128/s3 warp 64x32 (+1.1%)           128x64x128/s3  warp 64x32 (+0.6%)
+//   128x128x64/s4  warp 64x64 (+0.4%)           and every shape at or below 4096 outputs (worst +1.2%)
+inline constexpr std::tuple<int, int, int, int, int, int> kOverlapPrologueMeasured[] = {
+    {256, 256, 128, 64, 64, 3},  // case 1: -4.22%, 232 regs / 0 stack, 1 CTA/CU
+    {256, 256, 128, 64, 64, 2},  // case 1: -2.01%, 232/0, 1 CTA/CU
+    {256, 256,  64, 64, 64, 3},  // case 1: -1.80%, 200/0, 1 CTA/CU
+    {128, 256, 128, 64, 64, 3},  // case 1: -2.01%, 256/0, 1 CTA/CU
+    {128, 256, 128, 64, 32, 3},  // case 1: -3.65%, 184/0, 1 CTA/CU
+    {128, 256,  64, 64, 64, 3},  // case 1: -2.00%, 200/0, 2 CTA/CU
+    {128, 128, 128, 32, 64, 2},  // case 1: -3.38%, 152/0, 3 CTA/CU
+    {128, 128,  64, 64, 64, 3},  // case 1: -1.40%, 200/0, 3 CTA/CU
+};
+
+inline bool overlap_prologue_measured(const ConfigResult& config) {
+    const auto& [num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem] = config;
+    (void)num_sms;
+    (void)smem;
+    for (const auto& row : kOverlapPrologueMeasured) {
+        const auto& [rbm, rbn, rbk, rwm, rwn, rnst] = row;
+        if (block_m == rbm && block_n == rbn && block_k == rbk && warp_m == rwm &&
+            warp_n == rwn && num_stages == rnst) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Host mirror of the overlap kernel's contract; the device side (CollectiveMmaScaleFp4OverlapPrologue::
+// use_overlap_prologue plus the kernel's static_asserts) stays the authority for what the kernel code
+// needs and this must remain a subset of it, otherwise the JIT fails to compile. `k` and `block_k` are
+// both packed, `smem_size` is the shared memory the launch will request for this configuration.
+inline bool use_overlap_prologue(const ConfigResult& config, int m, int n, int k, int n_expand,
+                                 bool has_bias, bool enable_sbo_overlap,
+                                 bool enable_act_and_quant_fusing) {
+    const auto& [num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_cfg] = config;
+    const int smem_size = std::get<0>(smem_cfg);
+    // The epilogue must not need shared memory: the overlap-prologue prefetch fills the mainloop's stage
+    // slots. bias / odd N select the TSM epilogue, fused act+quant reuses the mainloop storage.
+    const bool smem_free_epilogue = !has_bias && n % 2 == 0 && !enable_act_and_quant_fusing;
+    // Only the N_EXPAND=1, sbo=false kernel is instantiated, and the tail must be able to issue a
+    // full set of successor K-blocks.
+    const bool kernel_contract = n_expand == 1 && !enable_sbo_overlap &&
+                                 ceil_div(k, block_k) > num_stages;
+    // Only the launch shapes measured faster with the prefetch; every other shape keeps the base
+    // kernel (FP4_TFU_HANDOFF E54).
+    const bool measured_config = overlap_prologue_measured(config);
+    // One CTA per CU: a single wave has no successor tile, so the prefetch would only cost.
+    // `tiles` is a lower bound (per-group rounding only adds tiles). The occupancy divides the smem
+    // limit only, which bounds the real occupancy from above (registers and threads can only lower
+    // it): the CTA count comes out high and the wave count low, so this check is biased towards
+    // keeping the base kernel -- it can skip a profitable two-wave shape, but never enables the
+    // prefetch on a single-wave one.
+    const int tiles = ceil_div(m, block_m) * ceil_div(n, block_n);
+    const int ctas = num_sms * std::max(1, kPpuSmemCapacity / smem_size);
+    const bool enough_waves = ceil_div(tiles, ctas) > 1;
+    return smem_free_epilogue && kernel_contract && measured_config && enough_waves;
+}
+
 
 ConfigResult get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms, bool has_bias, bool enable_act_and_quant_fusing) {
     std::vector<int> block_ms = {256, 128, 64, 32, 16};

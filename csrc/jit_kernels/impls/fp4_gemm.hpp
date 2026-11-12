@@ -32,7 +32,7 @@ public:
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         int n, k;
-        std::string gemm_type, kernel_name;
+        std::string gemm_type, kernel_strategy, kernel_name;
         bool hasBias;
         int n_expand;
         bool enable_sbo_overlap;
@@ -209,8 +209,8 @@ public:
         return std::make_tuple(info.n, info.k, info.block_m, info.block_n, info.block_k,
                                info.num_groups, info.warp_m, info.warp_n, info.num_stages,
                                info.gemm_type, info.enable_sbo_overlap, info.hasBias, info.n_expand,
-                               info.epilogue_type, info.apply_swiglu_limit, info.kernel_name,
-                               args.launch_args.smem_size);
+                               info.epilogue_type, info.apply_swiglu_limit, info.kernel_strategy,
+                               info.kernel_name, args.launch_args.smem_size);
     }
 
     static std::string generate_impl(const Args& args) {
@@ -249,6 +249,7 @@ static constexpr bool hasBias = {};
 constexpr int N_EXPAND = {};
 static constexpr EpilogueType kEpilogueType = EpilogueType::{};
 static constexpr bool kApplySwigluLimit = {};
+static constexpr KernelStrategy kKernelStrategy = KernelStrategy::{};
 
 // A matrix configuration
 using         ElementA    = cutlass::float4_t;
@@ -283,7 +284,10 @@ static constexpr bool TransA = false;
 static constexpr bool TransB = false;
 using ArchTag = cutlass::arch::PPU0015;
 
-using DispatchPolicy = cutlass::gemm::MainloopWithScalePPU0015Aiu<STAGES>;
+using DispatchPolicy = cute::conditional_t<
+    kKernelStrategy == KernelStrategy::OverlapPrologue,
+    cutlass::gemm::MainloopWithScalePPU0015AiuOverlapPrologue<STAGES>,
+    cutlass::gemm::MainloopWithScalePPU0015Aiu<STAGES>>;
 using GemmOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementA, TransA, Int<BLOCK_M>, Int<BLOCK_K>, false>;
 using GemmOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementB, TransB, Int<BLOCK_N>, Int<BLOCK_K>, true>;
 
@@ -394,16 +398,19 @@ using TileScheduler = DeepGemmScheduler<
     kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N * N_EXPAND, NUM_GROUPS,
     ceil_div(SHAPE_N, BLOCK_N * N_EXPAND), 2, kEpilogueType>;
 
-using GemmKernel = typename deep_gemm::DeepGemmUniversal<
-    Shape<int,int,int,int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    TileScheduler,
-    hasBias,
-    N_EXPAND,
-    kEnableSboOverlap,
-    kEpilogueType
->;
+// Both the collective and the kernel are chosen on the device from DispatchPolicy::Schedule
+// (same contract as the INT8/BF16 overlap-prologue kernels); the host only picks the policy.
+using GemmKernel = deep_gemm::Fp4GemmKernelSelector<
+    Shape<int,int,int,int>, CollectiveMainloop, CollectiveEpilogue, TileScheduler,
+    hasBias, N_EXPAND, kEnableSboOverlap, kEpilogueType>::type;
+
+// The overlap kernel is the fixed N_EXPAND=1, no-SBO variant; those two are hardcoded in its
+// type, so the device side cannot see the host's values and would silently drop them (a wrong
+// N_EXPAND computes only part of the tile). Bias and fused epilogues are already rejected by the
+// device-side shared-storage assert.
+static_assert(kKernelStrategy != KernelStrategy::OverlapPrologue ||
+              (N_EXPAND == 1 && !kEnableSboOverlap),
+              "OverlapPrologue requires N_EXPAND == 1 and no SBO overlap");
 
 // This kernel declares `extern __shared__`, so its dynamic smem size comes from the launch, and the
 // host can only supply an estimate (get_smem_config_fp4) -- it cannot see SharedStorageSize.
@@ -435,6 +442,7 @@ __global__ void {}(
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.enable_sbo_overlap, args.launch_info.hasBias, args.launch_info.n_expand,
             args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit,
+            args.launch_info.kernel_strategy,
             args.launch_args.smem_size,
             fused_smem_guard,
             args.launch_info.kernel_name);
@@ -607,7 +615,7 @@ static void fp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
 
     FP4GemmRuntime::Args args{};
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                        n, k, "Normal", "fp4_deep_gemm", hasBias, n_expand, false,
+                        n, k, "Normal", "Default", "fp4_deep_gemm", hasBias, n_expand, false,
                         "Default", false};
     args.launch_args = {grid, block, SMSIZE};
 

@@ -168,6 +168,7 @@ int fp4_checks() {
     info.warp_m = 32; info.warp_n = 64; info.num_stages = 4;
     info.num_groups = 1; info.n = 512; info.k = 512; info.n_expand = 1;
     info.gemm_type = "Normal"; info.kernel_name = "test_fp4";
+    info.kernel_strategy = "Default";
     args.launch_args.smem_size = 32768;
     int count = tile_checks<Runtime>(args);
 #define CHECK_FP4(field, value) \
@@ -176,6 +177,7 @@ int fp4_checks() {
     CHECK_FP4(k, 1024);
     CHECK_FP4(num_groups, 2);
     CHECK_FP4(gemm_type, "MGroupedContiguous");
+    CHECK_FP4(kernel_strategy, "OverlapPrologue");
     CHECK_FP4(enable_sbo_overlap, true);
     CHECK_FP4(hasBias, true);
     CHECK_FP4(n_expand, 2);

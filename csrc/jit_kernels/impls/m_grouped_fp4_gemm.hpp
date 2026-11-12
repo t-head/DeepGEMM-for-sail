@@ -152,9 +152,16 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
         cute::make_shape(m, n, k), ptr_A, stride_A, ptr_B, stride_B,
         ptr_scale_A, stride_SFA, ptr_scale_B, stride_SFB};
 
+    // OverlapPrologue: continue the successor tile's loads from the current mainloop's tail.
+    auto kernel_strategy = "Default";
+    if (use_overlap_prologue(selected_config, m, n, k, n_expand, hasBias,
+                             /*enable_sbo_overlap=*/false, enable_act_and_quant_fusing)) {
+        kernel_strategy = "OverlapPrologue";
+    }
     FP4GemmRuntime::Args args{};
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                        n, k, "MGroupedNoPad", "fp4_grouped_deep_gemm_nopad", hasBias, n_expand, false,
+                        n, k, "MGroupedNoPad", kernel_strategy, "fp4_grouped_deep_gemm_nopad",
+                        hasBias, n_expand, false,
                         EpilogueTypeS[static_cast<int>(kEpilogueType)],
                         enable_act_and_quant_fusing && swiglu_limit > 0.0f};
     args.launch_args = {grid, block, SMSIZE};
@@ -255,6 +262,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
         printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n,
                block_k, expected_m, warp_m, warp_n, block_k, num_stages);
         printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+        printf("kernel_strategy:%s\n", args.launch_info.kernel_strategy.c_str());
     }
 }
 
@@ -465,9 +473,16 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         cute::make_shape(m, n, k), ptr_A, stride_A, ptr_B, stride_B,
         ptr_scale_A, stride_SFA, ptr_scale_B, stride_SFB};
 
+    // OverlapPrologue: continue the successor tile's loads from the current mainloop's tail.
+    auto kernel_strategy = "Default";
+    if (use_overlap_prologue(selected_config, m, n, k, n_expand, hasBias,
+                             enable_sbo_overlap, enable_act_and_quant_fusing)) {
+        kernel_strategy = "OverlapPrologue";
+    }
     FP4GemmRuntime::Args args{};
     args.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                        n, k, "MGroupedMasked", "fp4_grouped_deep_gemm_masked", hasBias, n_expand, enable_sbo_overlap,
+                        n, k, "MGroupedMasked", kernel_strategy, "fp4_grouped_deep_gemm_masked",
+                        hasBias, n_expand, enable_sbo_overlap,
                         EpilogueTypeS[static_cast<int>(kEpilogueType)],
                         enable_act_and_quant_fusing && swiglu_limit > 0.0f};
     args.launch_args = {grid, block, SMSIZE};
@@ -568,6 +583,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d, hasBias:%d\n", block_m, block_n,
                block_k, expected_m, warp_m, warp_n, block_k, num_stages, hasBias);
         printf("vreg:%d, stack:%d\n", int(numRegs), int(localSize));
+        printf("kernel_strategy:%s\n", args.launch_info.kernel_strategy.c_str());
     }
 
     return {block_m, ceil_div(n, block_n)};
