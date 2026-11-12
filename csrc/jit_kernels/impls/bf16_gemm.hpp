@@ -121,7 +121,46 @@ public:
         LaunchInfo launch_info;
         LaunchArgs launch_args;
         GemmKernelParams kernel_params;
+        // Custom schedulers substitute dummy N/K; retain the real epilogue extent.
+        int epilogue_shape_m = 0, epilogue_shape_n = 0;
+        bool has_full_epilogue_grid = false;
     };
+
+    struct NoTsmEpilogueConfig810E {
+        bool enabled = false;
+        bool use_packed_tail_stores = false;
+        bool full_tile_m = false;
+        bool full_tile_n = false;
+        bool aligned_output = false;
+    };
+
+    // Keep epilogue specialization separate from GEMM tile selection. Every
+    // returned flag is injected into the source and therefore the JIT key.
+    static NoTsmEpilogueConfig810E get_notsm_epilogue_config_810e(
+        const Args& args, const GemmProblemSize& problem_shape, bool is_ppu1v5) {
+        NoTsmEpilogueConfig810E config;
+        const auto prop = device_runtime->get_prop();
+        config.enabled = !is_ppu1v5 && args.launch_info.gemm_type == "Normal" &&
+                         std::string(prop->name).find("ZW810E") != std::string::npos;
+        if (!config.enabled) return config;
+
+        const int m = args.epilogue_shape_m ? args.epilogue_shape_m : cute::get<0>(problem_shape);
+        const int n = args.epilogue_shape_n ? args.epilogue_shape_n : cute::get<1>(problem_shape);
+        const int block_m = args.launch_info.block_m, block_n = args.launch_info.block_n;
+        config.full_tile_n = n % block_n == 0;
+        // Packed stores on an M tail help when enough independent CTAs cover
+        // the device. Sparse grids retain scalar edge stores.
+        config.use_packed_tail_stores = m % block_m != 0 && config.full_tile_n &&
+            (args.has_full_epilogue_grid || (m <= block_m && n / block_n >= prop->multiProcessorCount));
+        // HGCC can spill a fully specialized short-K epilogue under the high
+        // occupancy register cap. Keep the uniform CTA M guard in that case.
+        config.full_tile_m = m % block_m == 0 &&
+                            !(!config.use_packed_tail_stores && cute::get<2>(problem_shape) <= 64);
+        const auto& output = args.kernel_params.with_tsm.collective_epilogue_params;
+        config.aligned_output = reinterpret_cast<uintptr_t>(output.ptr_D) % (2 * sizeof(ElementOutput)) == 0 &&
+                                cute::get<0>(output.stride_D) % 2 == 0 && cute::get<2>(output.stride_D) % 2 == 0;
+        return config;
+    }
 
     static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace) {
         auto problem_shape = args.problem_shape;
@@ -143,7 +182,7 @@ public:
         DG_HOST_ASSERT(args.epilogueargs.callback.alpha == 1.0f && args.epilogueargs.callback.alpha_ptr == nullptr &&
                        args.epilogueargs.callback.beta == 0.0f && args.epilogueargs.callback.beta_ptr == nullptr);
 
-        // Same decision source as the injected kWithTsmEpilogue; must match the device compile.
+        // Same decision source as the injected kUseTsmEpilogueParams; must match the device compile.
         // Initialize the selected union member directly to start its lifetime.
         if (is_ppu1v5_device()) {
             return KernelParams{.no_tsm = GemmKernelParamsT<EpilogueParamNoTsm>{
@@ -169,13 +208,15 @@ public:
         const GemmProblemSize problem_shape = is_ppu1v5 ? args.kernel_params.no_tsm.problem_shape
                                                         : args.kernel_params.with_tsm.problem_shape;
         // Injected into the generated source; same source as to_underlying_arguments_rtc.
-        const bool with_tsm_epilogue = not is_ppu1v5;
+        const bool use_tsm_epilogue_params = not is_ppu1v5;
         // sizeof of what the driver copies; the device asserts it equals its own Params size.
-        const auto host_params_size = with_tsm_epilogue ? sizeof(args.kernel_params.with_tsm)
+        const auto host_params_size = use_tsm_epilogue_params ? sizeof(args.kernel_params.with_tsm)
                                                         : sizeof(args.kernel_params.no_tsm);
+        const auto epilogue = get_notsm_epilogue_config_810e(args, problem_shape, is_ppu1v5);
         return fmt::format(
             R"(
 #include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
+#include <deep_gemm/epilogue/bf16_gemm_notsm_810e.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
@@ -291,11 +332,13 @@ using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::Colle
     DefaultOperation
 >::CollectiveOp;
 
-// Injected epilogue choice (is_ppu1v5_device()); matches to_underlying_arguments_rtc.
-static constexpr bool kWithTsmEpilogue = {17};
+// Params ABI choice matches to_underlying_arguments_rtc; NoTSM on 810E retains the EVT ABI.
+static constexpr bool kUseTsmEpilogueParams = {17};
 using CollectiveEpilogue = typename cutlass::platform::conditional<
-    kWithTsmEpilogue,
-    CollectiveEpilogue_withTsm,
+    kUseTsmEpilogueParams,
+    cute::conditional_t<{20},
+        BF16GemmNoTsmEpilogue810E<CollectiveEpilogue_withTsm, {21}, {22}, {23}, {24}>,
+        CollectiveEpilogue_withTsm>,
     CollectiveEpilogue_noTsm
 >::type;
 
@@ -333,8 +376,10 @@ __global__ void {12}(
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
-            with_tsm_epilogue, host_params_size,
-            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t");
+            use_tsm_epilogue_params, host_params_size,
+            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t",
+            epilogue.enabled, epilogue.use_packed_tail_stores, epilogue.full_tile_m,
+            epilogue.full_tile_n, epilogue.aligned_output);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -1194,6 +1239,13 @@ public:
     };
     static std::string generate_impl(const Args& args) {
         auto codegen_args = static_cast<const typename Base::Args&>(args);
+        codegen_args.epilogue_shape_m = cute::get<0>(args.kernel_params.with_tsm.problem_shape);
+        codegen_args.epilogue_shape_n = cute::get<1>(args.kernel_params.with_tsm.problem_shape);
+        if constexpr (!SplitK) {
+            const auto grid = args.launch_args.grid_dim;
+            codegen_args.has_full_epilogue_grid =
+                uint64_t(grid.x) * grid.y * grid.z >= device_runtime->get_prop()->multiProcessorCount;
+        }
         // The custom kernel and EVT epilogue use real dimensions from Params
         // (or the validated M36 specialization). The unused standard scheduler
         // remains a fixed dummy type.
