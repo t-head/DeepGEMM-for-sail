@@ -33,8 +33,12 @@ def device_version_supported(one_case):
         if get_arch_version() != 89 or 'M890' not in torch.cuda.get_device_name():
             return False, 'KGroupedContiguous currently requires Zhenwu M890P (sm_89)'
     if one_case.get('gemm_type') == 'MegaMhc':
-        if get_arch_version() != 89 or 'M890' not in torch.cuda.get_device_name():
-            return False, 'Mega-mHC requires Zhenwu M890P (sm_89)'
+        arch = get_arch_version()
+        if arch not in (80, 89):
+            return False, 'Mega-mHC requires PPU1.0 or PPU1.5'
+        if data_type == torch.float8_e4m3fn and arch != 89:
+            return False, 'Mega-mHC FP8 output requires PPU1.5'
+        return True, ''
     # fp4 (mxfp4, ue8m0 scale) GEMM/attention kernels require PPU1.5 (sm_89) or later,
     # see the PPU0015 ArchTag in csrc/jit_kernels/impls/fp4_gemm.hpp
     if data_type == torch.uint8 and get_arch_version() < 89:
