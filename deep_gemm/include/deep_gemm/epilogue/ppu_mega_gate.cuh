@@ -218,7 +218,10 @@ __device__ __forceinline__ bool store_topk_token(const RoutingArgs& args, const 
     // The smallest shuffle width covering the routed lanes, the other lanes hold zero
     constexpr uint32_t kSumWidth = kNumTopk <= 8 ? 8 : (kNumTopk <= 16 ? 16 : 32);
     const float sum = math::warp_reduce_sum<kSumWidth>(selected_unbiased_score);
-    // GLM normalizes every positive sigmoid sum; DeepSeek V4.1 uses an additive epsilon.
+    // For any K split count, GLM divides by the sum of the selected, unbiased sigmoid scores.
+    // Even a tiny positive sum gives routed weights that sum to 1 before scaling.
+    // When all scores are zero, a denominator of 1 keeps all weights zero.
+    // DeepSeek V4.1 sqrtsoftplus uses sum + 1e-20.
     const float topk_sum = UseSigmoid ? (sum > 0.0f ? sum : 1.0f) : sum + 1e-20f;
     const auto selected_weight = lane_idx < kNumTopk ? selected_unbiased_score / topk_sum * args.routed_scaling_factor : 1.0f;
     store_token_outputs<kNumTopk, kHasUnmappedTopkIdx>(args, global_token_idx, lane_idx,
