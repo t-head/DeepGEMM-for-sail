@@ -507,22 +507,24 @@ cases.
 
 #### Mega Gate
 
-`deep_gemm.bf16_mega_gate` fuses the BF16 routing GEMM and MoE routing.
+`deep_gemm.bf16_mega_gate` fuses the BF16 routing GEMM and MoE routing
+on Zhenwu 810E and 890P.
 Given BF16 tokens `x [T, H]` and expert weights `weight [E, H]`, it
 computes `x @ weight.T` with FP32 accumulation, applies the selected scoring function, and
 selects the top-K experts using the scores plus optional bias. The selected
 unbiased scores are normalized and scaled to produce routing weights; expert
 indices can optionally be mapped from logical to physical IDs.
 
-The default `scoring_func="sqrtsoftplus"` applies `sqrt(softplus(x))`.
-GLM-5.3 routers can select `scoring_func="sigmoid"`. If sigmoid scores round
+Two scoring functions are supported: `scoring_func="sqrtsoftplus"` (default),
+which applies `sqrt(softplus(x))`, and `scoring_func="sigmoid"`. If sigmoid scores round
 to the same FP32 value and their biases are equal, the smaller expert ID wins.
 Both scoring modes use the same BF16 GEMM backend.
 
 The outputs are INT64 indices and FP32 weights, each shaped `[T, K]`. When
 shared experts are included as routed experts, each output is `[T, K + S]`,
-where `S` is the number of shared experts. See the [API definition](csrc/apis/mega_gate.hpp)
-for arguments and constraints and [the tests](tests/test_mega_gate.py) for examples.
+where `S` is the number of shared experts. See the [API guide](docs/api/mega_gate.md)
+for arguments and constraints, the [API definition](csrc/apis/mega_gate.hpp),
+and [the tests](tests/test_mega_gate.py) for examples.
 
 #### Mega MoE
 

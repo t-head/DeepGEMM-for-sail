@@ -308,7 +308,7 @@ public:
                 per_kernel_flags += " -Xllvm -sort-copy-before-coalesce";
             }
         } else if (get_ppu_arch() == AC_PPU0010) {
-            if (name.rfind("megamoe_int8_", 0) == 0)
+            if (name.rfind("megamoe_int8_", 0) == 0 or name == "ppu_bf16_mega_gate")
                 per_kernel_flags += " -Xllvm -ppu-simt-branch=false";
         }
         if (name == "ppu_mega_mhc_single")
@@ -385,7 +385,7 @@ public:
                 opts_insert({
                     "--ppu-arch=ppu001",
                 });
-                if (name.find("megamoe_int8_") == 0)
+                if (name.find("megamoe_int8_") == 0 or name == "ppu_bf16_mega_gate")
                     opts_insert({"--ppu-tuning-options=-ppu-simt-branch=false"});
             } else if (arch == AC_PPU0015) {
                 opts_insert({

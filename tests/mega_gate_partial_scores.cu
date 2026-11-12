@@ -8,10 +8,10 @@ template <int Splits>
 __device__ bool accepts(bool fixed, bool random, float lo, float hi) {
     KernelArgs args{};
     args.num_tokens = 1;
-    args.routing.num_routed_experts = 2;
+    args.routing.num_routed_experts = 8;
     args.fix_routing_mask = &fixed;
     args.force_random = &random;
-    alignas(8) float scratch[2];
+    alignas(8) float scratch[5];
     bool valid = true;
     store_checked_scores<true, Splits>(args, 0, 0, scratch, lo, hi, false, valid);
     return valid;
