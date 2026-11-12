@@ -253,10 +253,9 @@ torch::Tensor bf16xfp32_gemm_nt(const torch::Tensor& x,
     return out;
 }
 
-// Split-K flag workspace, kept for API compatibility with the reference
-// implementation. Shape contract: [ceil(max_tokens / 16), ceil(n / 64)] int32,
-// zero-initialized. Any internal K partitioning reduces inside the CTA, so
-// this compatibility buffer is never touched by the GEMM.
+// Legacy zero-initialized int32 workspace allocator, independent of GEMM.
+// Shape contract: [ceil(max_tokens / 16), ceil(n / 64)]. Internal K
+// partitioning reduces inside the CTA; GEMM accepts no external workspace.
 torch::Tensor get_gemm_bf16xfp32_workspace(const int64_t& max_weight_hidden_size,
                                           const int64_t& max_tokens = 131072) {
     constexpr int64_t kMinTileM = 16;

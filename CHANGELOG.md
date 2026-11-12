@@ -22,10 +22,11 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   router decode (M = 8/16, N = 384, K = 7168) partitions K across two warps
   within each CTA and reduces partials locally, without a global partial
   workspace or a separate reduction kernel. Other PPU devices fall back to
-  two BF16 GEMMs composed through an FP32 intermediate. The `use_splitk`
-  and `split_flag` arguments are accepted for API compatibility; the int32
-  workspace `[ceil(max_tokens/16), ceil(n/64)]` is never written and stays
-  zero. Requires `N % 2 == 0`.
+  two BF16 GEMMs composed through an FP32 intermediate. The convenience
+  wrapper accepts only `x`, `w_high`, `w_low`, `scale`, and
+  `use_fp32_output=False`; GEMM requires no external workspace. The legacy
+  helper independently allocates zero-filled int32
+  `[ceil(max_tokens/16), ceil(n/64)]` tensors. Requires `N % 2 == 0`.
 
 ## 1.1.0+v1.1.0
 
