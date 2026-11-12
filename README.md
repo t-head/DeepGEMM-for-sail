@@ -666,15 +666,16 @@ We provide a HyperConnection (HC) prenorm GEMM that fuses the prenorm square-sum
 
 For more information, please refer to the `tf32_hc_prenorm_gemm` function documentation.
 
-#### Mega-mHC for DeepSeek V4.1 Flash (M890)
+#### Mega-mHC for DeepSeek V4.1 Flash (810E and M890)
 
 `deep_gemm.mega_mhc` implements the fused shifted mHC computation used by
-**DeepSeek V4.1 Flash** on **Zhenwu M890**. The current interface
-supports `hc_mult=4`, hidden size `5120`, and BF16 and/or FP8 E4M3 output.
+**DeepSeek V4.1 Flash** on **Zhenwu 810E and M890**. The current interface
+supports `hc_mult=4`, hidden size `5120`, and BF16 output.
+M890 additionally supports FP8 E4M3 output.
 It computes the updated residual, mix coefficients, and RMSNorm output into
 caller-provided output buffers.
 
-Provide at least one of `y_bf16` or `y_fp8`. FP8 quantization uses the
+On M890, provide at least one of `y_bf16` or `y_fp8`. FP8 quantization uses the
 BF16-rounded RMSNorm output and requires one of these scale formats:
 
 - **Grouped UE8M0**: one power-of-two scale per 32 values, with four UE8M0
@@ -682,10 +683,12 @@ BF16-rounded RMSNorm output and requires one of these scale formats:
   `y_gemm_sf` for aligned column-major scales, or `y_routed_sf` together with
   `y_shared_sf` for contiguous routed scales and padded, interleaved shared
   scales. The latter also requires `shared_sf_block_m > 0`.
-- **Per-token FP32**: one FP32 scale per token in a contiguous `[T, 1]`
+- **Per-token FP32 (M890 only)**: one FP32 scale per token in a contiguous `[T, 1]`
   `y_token_sf` tensor. `y_token_sf` is an optional extension to the upstream
   API and cannot be combined with the grouped scale outputs. The scale is
   used for dequantization: `y ≈ y_fp8 * y_token_sf`.
+
+810E uses three kernels for residual/RMSNorm, projection, and coefficients.
 
 See the [API definition](csrc/apis/mega_mhc.hpp) for argument and layout requirements,
 and [the reference and correctness tests](tests/test_mega_mhc.py) for a

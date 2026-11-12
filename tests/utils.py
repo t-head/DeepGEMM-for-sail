@@ -3375,6 +3375,13 @@ def test_mega_mhc(args):
     try:
         if num_sms is not None:
             deep_gemm.set_num_sms(num_sms)
+        if args.get('case') == 'layout' and get_acc_check():
+            from test_mega_mhc import check_layout
+            return check_layout(kwargs['tokens'])
+        if args.get('case') == 'interface_graph' and get_acc_check():
+            from test_mega_mhc import check_interface, check_graph
+            check_interface()
+            return check_graph()
         return check(**kwargs)
     finally:
         if num_sms is not None:
