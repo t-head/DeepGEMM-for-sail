@@ -625,14 +625,13 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     auto config = construct_launch_config(kernel, stream, SMSIZE, grid, block);
 
     DgProfParam dg_prof_params;
-    if (ProfilingInterface::Instance().get_op_info()) {
+    if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_params(kGemmType, false, std::string("bf16xfp32"), 1, m, n, k, 0, nullptr, stream);
     }
-    ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-    DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, hparams));
-
-    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, hparams));
+    }
 
     char* pEnv_params = std::getenv("show_log");
     if (pEnv_params && isdigit(*pEnv_params)) {
