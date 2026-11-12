@@ -1,5 +1,4 @@
-"""BF16 x FP32 dense GEMM tests (hpc-ops reference: Tencent/hpc-ops
-tests/test_gemm_bf16xfp32.py).
+"""BF16 x FP32 dense GEMM correctness and API contract tests.
 
 The FP32 weight is decomposed into two BF16 matrices (high + low * scale,
 scale = 1/256), the GEMM runs on the BF16 tensor cores with FP32 accumulation
@@ -8,7 +7,7 @@ and the result must match the FP32 reference within the reference tolerances
 
 API under test:
     deep_gemm.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output,
-                             use_splitk, split_flag)          # hpc-ops wrapper
+                             use_splitk, split_flag)          # compatibility wrapper
     deep_gemm.bf16xfp32_gemm_nt(x, w_high, w_low, scale,
                                 use_fp32_output, configs=None) # native API
     deep_gemm.get_gemm_bf16xfp32_workspace(n)                 # legacy workspace
@@ -17,8 +16,8 @@ Documented contract (see csrc/apis/gemm.hpp):
     x          : BF16, row-major [m, k]
     w_high/low : BF16, row-major [n, k]   (NT layout)
     output     : FP32 (use_fp32_output=True) or BF16, row-major [m, n]
-    split_flag : accepted only by the hpc-ops compatibility wrapper; this build
-                 performs no K-split, so the workspace stays untouched.
+    split_flag : accepted only by the compatibility wrapper; the workspace
+                 stays untouched and is not used for partial results.
 """
 import os
 

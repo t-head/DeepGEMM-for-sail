@@ -188,7 +188,7 @@ gemm_bf16_bf16_bf16_tt = bf16_gemm_tt
 # --- BF16 x FP32 dense GEMM (FP32 weight split into two BF16 parts) ---
 def gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output=False,
                     use_splitk=True, split_flag=None):
-    """hpc-ops-compatible wrapper; Split-K controls are ignored on PPU."""
+    """Compatibility wrapper; Split-K controls are ignored on PPU."""
     if split_flag is not None:
         if split_flag.dtype != torch.int32:
             raise RuntimeError("split_flag must be int32")

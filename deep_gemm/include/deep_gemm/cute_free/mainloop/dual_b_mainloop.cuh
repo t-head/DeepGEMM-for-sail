@@ -48,8 +48,8 @@ namespace mainloop {
 // (kernel::GemmBf16xFp32Kernel). Instead of running the single-B pipeline twice
 // per output tile -- which streams A twice from global memory and pays the
 // stage warm-up / drain bubbles twice -- every pipeline stage holds
-// A + B_high + B_low together (mirroring hpc-ops' SMEM layout that keeps the
-// high/low pair resident per stage):
+// A + B_high + B_low together, keeping the high/low pair resident in shared
+// memory per stage:
 //
 //   - G2S loads all three tiles per stage: A is read from gmem ONCE per tile
 //   - each k_step S2R-loads one A fragment, reused by two back-to-back MMAs

@@ -37,8 +37,8 @@ namespace kernel {
 //
 // All MMA products accumulate in FP32. For every output tile the kernel runs
 // the shared cute-free K-pipeline ONCE, with each pipeline stage holding
-// A + B_high + B_low together (mainloop::DualBMainloop, mirroring hpc-ops'
-// SMEM layout that keeps the high/low pair resident per stage): A is
+// A + B_high + B_low together (mainloop::DualBMainloop keeps the high/low
+// pair resident in shared memory per stage): A is
 // streamed from gmem once per tile, each k_step's A fragment feeds two
 // back-to-back MMAs into two independent FP32 accumulators, and the result
 // is written once through the standard epilogue after an in-register combine.
