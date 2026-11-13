@@ -4,9 +4,21 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
-## Unreleased
+## 1.1.0+v1.1.0
+
+### Fixed
+
+- **Device properties and CU budgets**: cache architecture and `set_num_sms`
+  overrides per current device, so switching devices does not reuse the first
+  device's architecture or scheduling budget.
+- **Sparse MQA input contracts**: enforce 16-byte input base-address alignment
+  consistently for MXFP4 and INT8, in both paged and non-paged compute APIs.
 
 ### Added
+
+- **MegaMoE activation parity**: all MMA types support `swiglu`, `swiglu_step`,
+  `swiglu_oai` and `situ` through shared FP32 activation formulas. Native PPU
+  sigmoid/tanh are unconditional; `fast_math` selects only the division path.
 
 - **M890 NVFP4 W4A8 GEMMs**: adds `gemm_fp8_nvfp4_bf16_nt` and grouped
   nopad, masked and fused-routing variants for FP8 activations and NVFP4
@@ -15,6 +27,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   E4M3 scales, FP32 global scales, and per-channel or 128x128 outer scales.
   See the [NVFP4 W4A8 API guide](docs/api/nvfp4_w4a8.md).
 
+- **Mega-mHC FP8 output**: `mega_mhc` can write FP8 E4M3 alongside or instead
+  of BF16. Supports grouped UE8M0 scales and per-token FP32 scales through
+  the optional `y_token_sf` API extension.
 - **M890 W4FA8 dense NT GEMM**: implements `fp8_fp4_gemm_nt` and its
   `gemm_fp8_fp4_bf16_nt` alias with two-dimensional packed weights and
   scale preprocessing, BF16 output, and optional scalar `inv_scale`.
@@ -31,7 +46,29 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   `compiled_dims="mn"`. Registers the upstream-compatible `epilogue.Epilogue`
   interface type, which has no PPU implementations yet.
 
+- **FP8, W4A8 and W4A16 MegaMoE**: adds complete FP8 channelwise/blockwise,
+  E4M3 x MXFP4 and BF16 x MXFP4 routed pipelines through the common `SymmBuffer`
+  entry and precision-specific weight transforms in `deep_gemm.mega`. Supports
+  SwiGLU, STEP, SwiGLU-OAI and SiTU on every backend, separate replica banks
+  and reusable library-owned communication state.
+
+- **Mega Gate**: adds `bf16_mega_gate`, fusing BF16 routing GEMM,
+  sqrt-softplus scoring, bias-aware Top-k selection, weight normalization
+  and scaling, and optional logical-to-physical expert mapping.
+
 ### Changed
+
+- **MegaMoE activation precision**: all backends consume FP32 GEMM1
+  accumulators and use FP32 activation with native PPU sigmoid/tanh.
+  Separate row quantizers consume BF16 activation scratch; fused FP4 and
+  blockwise FP8 quantization retain FP32 until the final conversion.
+  `fast_math` selects fast reciprocal versus regular FP32 division for SiTU
+  and post-activation FP8 quantization, independently of native sigmoid/tanh.
+
+- **MegaMoE MMA names**: uses `mma_type="fp4xfp4"`, `"fp8xfp4"`,
+  `"bf16xfp4"` and `"fp8xfp8"` consistently across workspace allocation,
+  pre-dispatch and precision-specific compute entries. W4A4 also accepts
+  `"mxfp4xmxfp4"` as an alias of `"fp4xfp4"`.
 
 - **BF16 dense GEMM**: `bf16_gemm_nt` now supports odd N with BF16 or
   FP32 output on 890P, including an optimized N=1 path. On 810E, N must be
@@ -41,8 +78,7 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 - **M890 W4A4 MegaMoE**: optimizes dispatch, GEMM scheduling, and
   scatter/reduce to improve computation and communication overlap.
-  - Renames `mma_type="fp4xfp4"` to `"mxf4xmxf4"` and
-    `activation="step"` to `"swiglu_step"`.
+  - Renames `activation="step"` to `"swiglu_step"`.
   - Adds `activation="swiglu_oai"` with optional `activation_alpha`
     (default: `1.702`). Allows `situ_linear_beta=None` to disable SiTU
     up softcap.
@@ -93,6 +129,27 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   row count and tile parallelism are sufficient, with native fallback for small
   shapes. Single-part plans allocate one decoded-weight buffer. Existing grouped
   APIs and the nine-element config format remain unchanged.
+
+### Fixed
+
+- **Paged indexer metadata synchronization**: moves the existing scan barriers
+  after shared-memory writes in both the main and tail prefix scans, preventing
+  incorrect scheduling boundaries without adding barriers. The scheduler stops
+  at the exact metadata endpoint. This fixes a race that could cause missing or
+  incorrect logits, or continued task execution past the intended endpoint.
+
+- **FP4 fused epilogue shared-memory reuse**: adds a CTA barrier for the
+  `SiluAndMulPostQuantFp4` and `SiluAndMulStepPostQuantFp4` path because of
+  shared-memory reuse between the mainloop and the epilogue. The activation
+  tile must be fully read before the next tile loads A/B into the same storage.
+  Applies to both the persistent and the dynamic-tile FP4 kernels; default
+  epilogues, tile selection and dispatch are unchanged.
+
+- **W4A16 TSM epilogue shared-memory reuse**: `epilogue_with_tsm` synchronizes
+  the K0 warps after copying `sC` to registers whenever another `step_m`
+  follows, because the next step reuses the same `sC` storage. The final step
+  needs no extra round: the CTA-wide barrier after the epilogue already covers
+  it. Tile selection and dispatch are unchanged.
 
 ## 1.1.0+v1.0.0
 

@@ -96,6 +96,9 @@ MegaMhc,data_type:bf16,m:1248,hidden:5120,mode:shifted,sinkhorn_iters:20
 MegaMhc,data_type:bf16,m:4096,hidden:5120,mode:shifted,sinkhorn_iters:20
 MegaMhc,data_type:bf16,m:8192,hidden:5120,mode:shifted,sinkhorn_iters:20
 MegaMhc,data_type:bf16,m:9984,hidden:5120,mode:shifted,sinkhorn_iters:20
+MegaMhc,data_type:fp8,m:1248,hidden:5120,mode:shifted,sinkhorn_iters:20,sf_layout:token,store_bf16:1
+MegaMhc,data_type:fp8,m:1248,hidden:5120,mode:shifted,sinkhorn_iters:20,sf_layout:col,store_bf16:1
+MegaMhc,data_type:fp8,m:1248,hidden:5120,mode:shifted,sinkhorn_iters:20,sf_layout:extra,shared_sf_block_m:224,store_bf16:1
 
 # ============ BatchGemm ============
 
@@ -349,6 +352,7 @@ SparseMqaLogits,data_type:fp4,seq_len_q:2,seq_len_kv:0,num_heads:32,head_dim:128
 # ============ PagedSparseMqaLogits ============
 
 # --- PagedSparseMqaLogits / fp4 ---
+PagedSparseMqaLogits,data_type:fp4,seq_len_q:1,seq_len_kv:0,sparse_block_kv:8,num_max_sparse_blocks:4,check_metadata:1
 PagedSparseMqaLogits,data_type:fp4,seq_len_q:313,seq_len_kv:1023,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,check_metadata:1
 PagedSparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:65536,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:128,check_metadata:1
 
@@ -376,3 +380,6 @@ Activation,data_type:bf16,activation:situ,quant_mode:MXFP4,reorder_scale:0
 Activation,data_type:bf16,activation:silu_step,quant_mode:BF16
 Activation,data_type:bf16,activation:silu_step,quant_mode:FP8_CHANNEL
 Activation,data_type:bf16,activation:silu_step,quant_mode:MXFP4
+
+# ============ MoE align routing regression ============
+MoeAlign,data_type:bf16,case:invalid_routes

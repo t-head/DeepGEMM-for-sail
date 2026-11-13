@@ -1,4 +1,4 @@
-r"""PPU W4A4 MegaMoE complete-call benchmark and optional DeepEP baselines.
+r"""PPU MegaMoE complete-call benchmark and optional W4A4 DeepEP baselines.
 
 Prefill, including a DeepEP normal comparison (eager timing):
     torchrun --standalone --nproc-per-node=8 tests/bench_mega_moe.py \
@@ -319,15 +319,16 @@ def _benchmark_pipeline(pipeline, *, warmup=10, iterations=100, repeats=5,
                 samples_max_rank_us=samples)
 
 
-def _check_baseline(actual, expected):
+def _check_pipeline_output(actual, expected, *, max_diff=MAX_DIFF, label="DeepEP baseline"):
     sample = actual[:expected.shape[0]]
-    metrics = torch.tensor([float(calc_diff(sample, expected)), _relative_l2(sample, expected)],
+    metrics = torch.tensor([float(calc_diff(sample, expected)) if sample.numel() else 0.0,
+                            _relative_l2(sample, expected) if sample.numel() else 0.0],
                            device=actual.device)
     finite = torch.tensor(int(actual.isfinite().all()), device=actual.device)
     dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
     dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-    assert finite.item(), "nonfinite DeepEP baseline output"
-    assert metrics[0].item() < MAX_DIFF, ("DeepEP baseline diff", metrics.tolist())
+    assert finite.item(), f"nonfinite {label} output"
+    assert metrics[0].item() < max_diff, (f"{label} diff", metrics.tolist())
     return dict(status="passed", max_pipeline_diff=metrics[0].item(),
                 max_relative_l2=metrics[1].item())
 
@@ -365,7 +366,7 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
                 deep_gemm.mega_moe_pre_dispatch(
                     x, routed_ids, routed_weights,
                     workspace.x, workspace.x_sf, workspace.topk_idx, workspace.topk_weights,
-                    num_tokens=x.shape[0], group_size=32, mma_type="mxf4xmxf4")
+                    num_tokens=x.shape[0], group_size=32, mma_type="fp4xfp4")
                 deep_gemm.fp4_fp4_mega_moe(
                     y, w1, w2, workspace, activation=case.activation,
                     activation_clamp=case.clamp, fast_math=bool(args.fast_math),
@@ -403,7 +404,7 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
                 if not args.no_check:
                     checked = min(requested, args.reference_tokens) if args.reference_tokens else requested
                     projection_dtype = torch.float32 if baseline.fused_activation else torch.bfloat16
-                    baseline_report["correctness"] = _check_baseline(
+                    baseline_report["correctness"] = _check_pipeline_output(
                         baseline_expected, reference(checked, projection_dtype=projection_dtype))
 
             timing_options = dict(warmup=args.warmup, iterations=args.iterations,
@@ -432,10 +433,75 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
         workspace.destroy()
 
 
-def main(argv=None):
+@torch.inference_mode()
+def _benchmark_precision_case(case, group, args):
+    from test_mega_moe_precisions import make_pipeline, reference
+    from test_mega_moe import _all_gather
+
+    rank, world = group.rank(), group.size()
+    rng = torch.Generator(device="cuda").manual_seed(args.seed + rank)
+    pipeline = make_pipeline(case, group, rng, replicas=args.replicas, fast_math=bool(args.fast_math))
+    source = torch.randn(case.capacity, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .1
+    try:
+        for requested in case.tokens:
+            tokens = 0 if args.edge_cases and world > 1 and requested == 1 and rank == world - 1 else requested
+            ids = _make_routes(case, case.capacity, rng)
+            weights = torch.rand(case.capacity, case.topk, device="cuda", generator=rng).softmax(-1)
+            ids[tokens:], weights[tokens:] = -1, 0
+            if args.edge_cases and tokens > 1:
+                ids[0, 0] = -1
+                weights[1, 0] = 0
+            y = torch.empty_like(source[:tokens])
+
+            def forward():
+                return pipeline.forward(source[:tokens], ids[:tokens], weights[:tokens], y)
+
+            actual = forward()
+            correctness = dict(status="not_checked")
+            if not args.no_check:
+                # Use the same gather shape on all ranks, including empty ranks.
+                checked = min(requested, args.reference_tokens) if args.reference_tokens else requested
+                if checked:
+                    expected = reference(case, _all_gather(source[:checked]), _all_gather(ids[:checked]),
+                                         _all_gather(weights[:checked]), pipeline.ref1, pipeline.ref2,
+                                         rank, min(tokens, checked))
+                else:
+                    expected = torch.empty_like(y)
+                correctness = _check_pipeline_output(actual, expected, max_diff=0.0015 if case.precision == "w4a8" else 0.001, label="MegaMoE")
+            replay_expected = actual.clone() if not args.no_check else None
+            timing = _benchmark_pipeline(forward, warmup=args.warmup, iterations=args.iterations,
+                                         repeats=args.repeats, mode=args.mode, expected=replay_expected)
+            timing["scope"] = "bf16_input_to_bf16_output"
+            token_counts = [None] * world
+            dist.all_gather_object(token_counts, tokens)
+            timing["tokens_per_second"] = sum(token_counts) * 1e6 / timing["max_rank_us"]["median"]
+            if rank == 0:
+                print(json.dumps(dict(case=case.name, precision=case.precision, world_size=world,
+                                      tokens_per_rank=token_counts, capacity=case.capacity, routing=case.routing,
+                                      seed=args.seed, fast_math=bool(args.fast_math), correctness=correctness,
+                                      benchmark=timing, baseline=dict(kind="none", status="not_requested"))), flush=True)
+    finally:
+        pipeline.buffer.destroy()
+
+
+def main(argv=None, *, cases=None):
+    precision_parser = argparse.ArgumentParser(add_help=False)
+    precision_parser.add_argument("--precision", choices=("w4a4", "fp8_channelwise", "fp8_blockwise", "w4a16", "w4a8"))
+    selection, _ = precision_parser.parse_known_args(argv)
+    if cases is None:
+        if selection.precision and selection.precision != "w4a4":
+            from test_mega_moe_precisions import CASES as precision_cases
+            cases = precision_cases
+        else:
+            cases = CASES
+    if selection.precision:
+        cases = tuple(c for c in cases if c.precision == selection.precision)
+
+    if not cases:
+        precision_parser.error("no cases are available for the selected precision")
     parser = argparse.ArgumentParser(description=__doc__,
-                                    formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--case", choices=[c.name for c in CASES], default=CASES[0].name)
+                                    formatter_class=argparse.RawDescriptionHelpFormatter, parents=[precision_parser])
+    parser.add_argument("--case", choices=[c.name for c in cases], default=cases[0].name)
     parser.add_argument("--hidden", type=int)
     parser.add_argument("--intermediate-hidden", type=int)
     parser.add_argument("--num-experts", type=int)
@@ -459,7 +525,7 @@ def main(argv=None):
     parser.add_argument("--edge-cases", action="store_true",
                         help="also check empty ranks and masked routes before timing")
     args = parser.parse_args(argv)
-    case = next(c for c in CASES if c.name == args.case)
+    case = next(c for c in cases if c.name == args.case)
     case = replace(case, tokens=tuple(args.tokens) if args.tokens is not None else case.tokens,
                    capacity=args.capacity if args.capacity is not None else case.capacity, routing=args.routing,
                    hidden=args.hidden if args.hidden is not None else case.hidden,
@@ -472,6 +538,8 @@ def main(argv=None):
         parser.error("tokens must be nonnegative and no larger than a positive capacity")
     if args.reference_tokens < 0 or args.warmup < 0 or args.iterations < 1 or args.repeats < 1:
         parser.error("reference-tokens/warmup must be nonnegative; iterations/repeats must be positive")
+    if args.baseline != "none" and case.precision != "w4a4":
+        parser.error("the DeepEP baseline adapter supports W4A4 only; use --baseline none for this precision")
     args.mode = args.mode or ("eager" if args.baseline == "normal" else "graph")
     if args.baseline == "normal" and args.mode != "eager":
         parser.error("DeepEP normal requires eager timing because dispatch returns CPU expert counts; "
@@ -487,7 +555,10 @@ def main(argv=None):
         buffer_type, skip_reason = _import_baseline() if args.baseline != "none" else (None, None)
         if skip_reason is not None and dist.get_rank() == 0:
             print("DeepEP baseline skipped: " + skip_reason, file=sys.stderr, flush=True)
-        _benchmark_case(case, group, args, buffer_type, skip_reason)
+        if case.precision == "w4a4":
+            _benchmark_case(case, group, args, buffer_type, skip_reason)
+        else:
+            _benchmark_precision_case(case, group, args)
 
 
 if __name__ == "__main__":

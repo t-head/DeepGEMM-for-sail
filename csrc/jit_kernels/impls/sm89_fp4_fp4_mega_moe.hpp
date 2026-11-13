@@ -8,6 +8,7 @@
 #include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 #include <deep_gemm/epilogue/gated_activation.cuh>
 #include "fp4_gemm.hpp"
+#include "mega_moe_runtime.hpp"
 #include "../heuristics/mega_moe.hpp"
 
 namespace deep_gemm::mega {
@@ -41,18 +42,6 @@ static void check_mega_moe_buffer(const torch::Tensor& buffer, const layout::Meg
     TORCH_CHECK(buffer.scalar_type() == torch::kUInt8 && buffer.dim() == 1 &&
                 buffer.is_contiguous() && buffer.storage_offset() == 0 &&
                 buffer.numel() >= mega_buffer.get_num_bytes(), "invalid MegaMoE symmetric buffer size/layout");
-}
-
-static int get_kernel_occupancy(const std::shared_ptr<KernelRuntime>& runtime, int threads, int dynamic_smem) {
-    construct_launch_config(runtime->kernel, current_stream(), dynamic_smem, dim3(1), dim3(threads));
-    int blocks = 0;
-#if HGGCRT_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
-    DG_HGGC_RUNTIME_CHECK(hggcOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, runtime->kernel, threads, dynamic_smem));
-#else
-    DG_HGGC_DRIVER_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, runtime->kernel, threads, dynamic_smem));
-#endif
-    DG_HOST_ASSERT(blocks > 0);
-    return blocks;
 }
 
 // Rows and reduce column chunks start on 16-byte boundaries relative to the tensor base.
@@ -194,7 +183,6 @@ public:
         return fmt::format(R"(
 #define DG_MEGAMOE_OWNER_MODE {}
 #define DG_MEGAMOE_OWNER_READER_OPT {}
-#define DG_MEGAMOE_SITU_USE_RCP {}
 #define DG_MEGAMOE_SPLIT_SYNC {}
 #include <deep_gemm/impls/sm89_fp4_fp4_mega_moe.cuh>
 using Builder = deep_gemm::MegaMoEMxfp4Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation::{}, {}, {}, {}>;
@@ -207,7 +195,6 @@ static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::{}<{}>);
 }}
 )", static_cast<int>(!kIsLinear1), static_cast<int>(!kIsLinear1),
-            static_cast<int>(kIsLinear1 && Activation == GatedActivation::SiTU),
             static_cast<int>(a.split_sync),
             info.n, info.k, info.block_m, info.block_n, info.block_k, info.warp_m, info.warp_n, info.num_groups, info.num_stages,
             Ranks, kIsLinear1 ? "deep_gemm::MegaMoEPhaseKind::Linear1" : "deep_gemm::MegaMoEPhaseKind::Linear2",
@@ -273,6 +260,7 @@ static void launch_gemm(typename Runtime::Args& args, int expected_m) {
     const auto name = args.kernel_name;
     const auto runtime = compiler->build(name, Runtime::generate(args));
     const int blocks = get_kernel_occupancy(runtime, args.launch_args.block_dim.x, args.launch_args.smem_size);
+    DG_HOST_ASSERT(blocks > 0);
     args.launch_args.grid_dim.x = info.num_sms * blocks;
     DgProfParam profile;
     if (deep_gemm::profiling_enabled()) {

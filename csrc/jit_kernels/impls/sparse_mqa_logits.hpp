@@ -27,16 +27,20 @@ namespace deep_gemm {
 // Layout structs/constants live in the shared device+host header
 // `deep_gemm/impls/sparse_mqa_logits_layout.cuh`.
 //
-// MXFP4 only.
+// MXFP4 and INT8, each with contiguous and paged KV storage.
 namespace sparse_mqa_logits {
 
-// Schedule table columns: one slot per resident CTA of the sparse main kernel.
+// Schedule table columns: one slot per CTA in the sparse main-kernel grid.
+// Select by architecture because packed FP4 and true INT8 both use torch.int8.
 inline int get_num_sparse_slots() {
-    return get_num_sms() * kNumTbPerCu;
+    const auto [arch_major, arch_minor] = device_runtime->get_arch_pair();
+    const uint32_t slots_per_cu = arch_major == 8 and arch_minor == 0
+        ? kNumTbPerCuPPU0010 : kNumTbPerCuPPU0015;
+    return get_num_sms() * slots_per_cu;
 }
 
 static uint32_t get_sparse_split_kv(const at::ScalarType& qk_dtype) {
-    // MXFP4 only.
+    // Packed MXFP4 and INT8 both use int8 storage and the same 128-token split.
     DG_HOST_ASSERT(qk_dtype == torch::kInt8);
     return kSplitKV;
 }
@@ -177,13 +181,19 @@ static void launch_sparse_mqa_logits_metadata(const torch::Tensor& metadata, tor
     // Dynamic smem: the packed merge output (2 × Cap words)
     const int smem_size = static_cast<int>(2 * num_max_blocks_cap * sizeof(uint32_t));
     const auto kernel_name = "sparse_mqa_logits_metadata";
+    // Metadata producers are independent of the compute CTAs. Populate more
+    // producers for paged request discovery without changing the schedule's
+    // num_slots columns or the compute launch geometry on either architecture.
+    constexpr uint32_t kProducerMultiplier = 4;
+    const int num_metadata_ctas = is_paged
+        ? static_cast<int>(std::min<uint64_t>(num_q_tokens,
+              static_cast<uint64_t>(num_slots) * kProducerMultiplier))
+        : ceil_div<int>(static_cast<int>(num_q_tokens), static_cast<int>(kBlockQ));
 
     auto args = SparseMqaLogitsMetadataRuntime::Args{
         .launch_info = {static_cast<int>(num_max_blocks_cap), num_slots, static_cast<int>(sparse_block_kv),
                         static_cast<int>(kNumThreads), smem_size, use_unaligned_ks, is_paged, page_kv, kernel_name},
-        .launch_args = {dim3(is_paged ? static_cast<int>(std::min(num_q_tokens, static_cast<uint32_t>(num_slots)))
-                                      : ceil_div<int>(static_cast<int>(num_q_tokens), static_cast<int>(kBlockQ)),
-                                1, 1),
+        .launch_args = {dim3(num_metadata_ctas, 1, 1),
                         dim3(static_cast<int>(kNumThreads), 1, 1), smem_size},
         .kernel_args = {num_q_tokens, num_kv_tokens,
                         cu_seq_len_k_start_ptr, cu_seq_len_k_end_ptr,
@@ -257,7 +267,7 @@ __global__ void {}(
 }}
 }}
 )",
-            kSplitKV * kBlockQ / kNumWarpsPerCTA,
+            kSplitKV * kBlockQ / kNumWarpsPerCTAPPU0015,
             args.launch_info.sparse_block_kv, args.launch_info.num_slots,
             args.launch_info.is_paged ? "true" : "false", args.launch_info.page_kv,
             args.launch_info.smem_size, args.launch_info.num_threads, args.launch_info.kernel_name);
@@ -277,14 +287,14 @@ static void launch_fp4_sparse_mqa_logits_impl(
     torch::Tensor& logits, const uint32_t logits_stride, const uint32_t sparse_block_kv,
     const uint32_t seq_len_q, const uint32_t seq_len_kv, const uint32_t num_max_sparse_blocks,
     const bool use_unaligned_ks, const bool is_paged) {
-    constexpr int kNumThreads = kNumWarpsPerCTA * 32;
+    constexpr int kNumThreads = kNumWarpsPerCTAPPU0015 * 32;
     constexpr uint32_t kQStages = 1, kKVStages = 3;
     const uint32_t num_slots = get_num_sparse_slots();
     // Mirrors `deep_gemm_mqa_common::get_smem_config` for the frozen sparse tile
     // (block_qh=64, block_kv=128, warp_qh=32); pinned by static_assert
     const deep_gemm_mqa_common::MqaLogitsConfig config{
         .block_q = 2, .block_qh = 64, .block_kv = 128, .warp_qh = 32,
-        .warp_kv = kSplitKV * kBlockQ / kNumWarpsPerCTA,
+        .warp_kv = kSplitKV * kBlockQ / kNumWarpsPerCTAPPU0015,
         .num_q_stages = kQStages, .num_kv_stages = kKVStages};
     const int smem_size = deep_gemm_mqa_common::get_smem_config(config, 64, 1, 2, true);
     const auto kernel_name = "attention_sparse_mqa_logits_fp4";
@@ -339,6 +349,8 @@ static void launch_fp4_sparse_mqa_logits_impl(
             static_cast<int>(sparse_mqa_logits::kNumHeads), static_cast<int>(sparse_mqa_logits::kHeadDim),
             static_cast<int>(sparse_block_kv), static_cast<int>(num_max_sparse_blocks), use_unaligned_ks,
             is_paged, current_stream());
+        if (is_paged)
+            dg_prof_params.add_params("page_kv", page_kv);
     }
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
@@ -366,6 +378,158 @@ static void launch_fp4_paged_sparse_mqa_logits(
     launch_fp4_sparse_mqa_logits_impl(q, q_sf, empty, empty, kv_cache, weights, metadata, logits,
                                       logits_stride, sparse_block_kv, seq_len_q, seq_len_kv,
                                       num_max_sparse_blocks, /*use_unaligned_ks=*/false, /*is_paged=*/true);
+}
+
+// Host-side mirror of PPUSparseMqaLogitsINT8::Arguments. Q scales are folded into weights.
+struct SparseMqaLogitsINT8Arguments {
+    const int8_t* ptr_q;
+    const int8_t* ptr_k;
+    const float* k_scales;
+    const void* weights;
+    const uint8_t* metadata;
+    void* logits;
+    uint32_t logits_stride;
+    uint32_t num_q_tokens;
+    uint32_t num_kv_tokens;
+    const uint8_t* kv_cache;
+    uint32_t kv_page_stride_bytes;
+};
+
+class SparseMqaLogitsINT8Runtime final : public LaunchRuntime<SparseMqaLogitsINT8Runtime> {
+public:
+    struct LaunchInfo {
+        std::string kernel_name;
+        uint32_t num_slots, sparse_block_kv;
+        bool is_paged;
+        uint32_t page_kv;
+        int num_threads, smem_size;
+    };
+
+    struct Args {
+        LaunchInfo launch_info;
+        LaunchArgs launch_args;
+        SparseMqaLogitsINT8Arguments kernel_params;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(
+            R"(
+#include <deep_gemm/impls/int8_sparse_mqa_logits.cuh>
+namespace deep_gemm {{
+
+using AttnKernel = cutlass::gemm::kernel::PPUSparseMqaLogitsINT8<
+  int8_t, int32_t, __ppu_bfloat16, __ppu_bfloat16,
+  64, deep_gemm::sparse_mqa_logits::kSplitKV, 32, 32, 1, 3, {}, {}, {}, {}>;
+
+static_assert(AttnKernel::SharedStorageSize == {}, "host/device shared memory size mismatch");
+static_assert(AttnKernel::MaxThreadsPerBlock == {}, "host/device thread count mismatch");
+static_assert(sizeof(AttnKernel::Params) == {}, "host/device parameter size mismatch");
+
+extern "C"
+__global__ __launch_bounds__(AttnKernel::MaxThreadsPerBlock, AttnKernel::MinBlocksPerMultiprocessor)
+void {}(typename AttnKernel::Params params) {{
+  extern __shared__ char smem[];
+  AttnKernel op;
+  op(params, smem);
+}}
+}}
+)",
+            args.launch_info.sparse_block_kv, args.launch_info.num_slots,
+            args.launch_info.is_paged ? "true" : "false", args.launch_info.page_kv,
+            args.launch_info.smem_size, args.launch_info.num_threads,
+            sizeof(SparseMqaLogitsINT8Arguments), args.launch_info.kernel_name);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
+    }
+};
+
+static void launch_int8_sparse_mqa_logits_impl(
+    const torch::Tensor& q, const torch::Tensor& kv, const torch::Tensor& k_scales,
+    const torch::Tensor& kv_cache, const torch::Tensor& weights, const torch::Tensor& metadata, torch::Tensor& logits,
+    const uint32_t logits_stride, const uint32_t sparse_block_kv,
+    const uint32_t seq_len_q, const uint32_t seq_len_kv, const uint32_t num_max_sparse_blocks,
+    const bool use_unaligned_ks, const bool is_paged) {
+    // Preserve the metadata Q-pair / split / slot contract while using the dense INT8 warp tile.
+    const deep_gemm_mqa_common::MqaLogitsConfig config{
+        .block_q = 2, .block_qh = 64, .block_kv = 128, .warp_qh = 32, .warp_kv = 32,
+        .num_q_stages = 1, .num_kv_stages = 3};
+    constexpr int kNumThreads = 256;
+    const uint32_t num_slots = get_num_sparse_slots();
+    const int smem_size = deep_gemm_mqa_common::get_smem_config(config, 128, 1, 2, false) +
+                          8 * get_num_sparse_kv_split_bytes(sparse_block_kv);
+    const auto kernel_name = "attention_sparse_mqa_logits_int8";
+    const uint32_t page_kv = is_paged ? static_cast<uint32_t>(kv_cache.size(1)) : 0;
+    const uint32_t page_stride = is_paged ? static_cast<uint32_t>(kv_cache.stride(0)) : 0;
+    auto args = SparseMqaLogitsINT8Runtime::Args{
+        .launch_info = {kernel_name, num_slots, sparse_block_kv, is_paged, page_kv, kNumThreads, smem_size},
+        .launch_args = {dim3(static_cast<int>(num_slots), 1, 1), dim3(kNumThreads, 1, 1), smem_size},
+        .kernel_params = {q.data_ptr<int8_t>(), is_paged ? nullptr : kv.data_ptr<int8_t>(),
+                          is_paged ? nullptr : k_scales.data_ptr<float>(),
+                          weights.data_ptr(), metadata.data_ptr<uint8_t>(), logits.data_ptr(),
+                          logits_stride, seq_len_q, seq_len_kv,
+                          is_paged ? kv_cache.data_ptr<uint8_t>() : nullptr, page_stride},
+    };
+    const auto& code = SparseMqaLogitsINT8Runtime::generate(args);
+    const auto& runtime = compiler->build(kernel_name, code);
+
+    char* pEnv_params = std::getenv("show_log");
+    if (pEnv_params && isdigit(*pEnv_params)) {
+        int num_regs = 0, local_size = 0, max_blocks_per_cu = 0;
+        hgFuncGetAttribute(&num_regs, HG_FUNC_ATTRIBUTE_NUM_REGS, runtime->kernel);
+        hgFuncGetAttribute(&local_size, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, runtime->kernel);
+        hgOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_cu, runtime->kernel, kNumThreads, smem_size);
+        printf("[sparse_mqa_logits_int8:]\n");
+        printf("kNumHeads:32, kHeadDim:128, BLOCK_QH:%d", config.block_qh);
+        if (is_paged)
+            printf(", PAGE_KV:%u", page_kv);
+        printf(", SPARSE_BLOCK_KV:%u\n", sparse_block_kv);
+        printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n",
+               config.block_kv, config.block_qh, config.warp_kv, config.warp_qh,
+               config.num_q_stages, config.num_kv_stages);
+        printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%u, num_threads:%d\n",
+               get_num_sms(), max_blocks_per_cu, num_slots, kNumThreads);
+        printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, num_regs, local_size);
+        printf("weights_bf16:true\n");
+    }
+
+    DgProfParam dg_prof_params;
+    if (deep_gemm::profiling_enabled()) {
+        dg_prof_params.set_sparse_mqa_logits_params(
+            "int8", static_cast<int>(seq_len_q), static_cast<int>(seq_len_kv),
+            static_cast<int>(kNumHeads), static_cast<int>(kHeadDim),
+            static_cast<int>(sparse_block_kv), static_cast<int>(num_max_sparse_blocks), use_unaligned_ks,
+            is_paged, current_stream());
+        if (is_paged)
+            dg_prof_params.add_params("page_kv", page_kv);
+    }
+    {
+        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        SparseMqaLogitsINT8Runtime::launch(runtime, args);
+    }
+}
+
+static void launch_int8_sparse_mqa_logits(
+    const torch::Tensor& q, const torch::Tensor& kv, const torch::Tensor& k_scales,
+    const torch::Tensor& weights, const torch::Tensor& metadata, torch::Tensor& logits,
+    const uint32_t logits_stride, const uint32_t sparse_block_kv,
+    const uint32_t seq_len_q, const uint32_t seq_len_kv, const uint32_t num_max_sparse_blocks,
+    const bool use_unaligned_ks) {
+    launch_int8_sparse_mqa_logits_impl(q, kv, k_scales, /*kv_cache=*/kv, weights, metadata, logits,
+        logits_stride, sparse_block_kv, seq_len_q, seq_len_kv, num_max_sparse_blocks,
+        use_unaligned_ks, /*is_paged=*/false);
+}
+
+static void launch_int8_paged_sparse_mqa_logits(
+    const torch::Tensor& q, const torch::Tensor& kv_cache,
+    const torch::Tensor& weights, const torch::Tensor& metadata, torch::Tensor& logits,
+    const uint32_t logits_stride, const uint32_t sparse_block_kv,
+    const uint32_t seq_len_q, const uint32_t seq_len_kv, const uint32_t num_max_sparse_blocks) {
+    const auto empty = torch::Tensor{};
+    launch_int8_sparse_mqa_logits_impl(q, empty, empty, kv_cache, weights, metadata, logits,
+        logits_stride, sparse_block_kv, seq_len_q, seq_len_kv, num_max_sparse_blocks,
+        /*use_unaligned_ks=*/false, /*is_paged=*/true);
 }
 
 } // namespace sparse_mqa_logits

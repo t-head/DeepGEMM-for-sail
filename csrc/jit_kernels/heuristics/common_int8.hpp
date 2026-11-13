@@ -321,7 +321,9 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
 
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
-                        GemmType gemm_type, int max_block_n = 256) {
+                        GemmType gemm_type, int max_block_n = 256,
+                        std::optional<int> fixed_block_n = std::nullopt,
+                        const std::vector<int>* allowed_block_ms = nullptr) {
     if (gemm_type == GemmType::Normal || gemm_type == GemmType::Batched) {
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms);
     }
@@ -338,6 +340,14 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
         block_ms = {heuristics_runtime->get_mk_alignment_for_contiguous_layout()};
     }
 
+    if (allowed_block_ms) {
+        TORCH_CHECK(!allowed_block_ms->empty(), "Grouped GEMM needs an allowed M tile");
+        block_ms = *allowed_block_ms;
+    }
+    const auto allowed_m = [&](int bm) {
+        return !allowed_block_ms || std::find(block_ms.begin(), block_ms.end(), bm) != block_ms.end();
+    };
+
     // block_ns = (256, 128, 64, 32)
     assert(max_block_n > 0 && (max_block_n & (max_block_n - 1)) == 0);
 
@@ -353,6 +363,11 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
     for (int x = start_bit; x > 4; x--) {
         block_ns.push_back(1 << x);
     }
+    // A fixed N tile is a caller constraint, including when small K would
+    // normally restrict the search to narrower tiles. Derive the rest of the
+    // configuration from this candidate rather than patching a selected tile.
+    if (fixed_block_n)
+        block_ns = {*fixed_block_n};
 
     auto fix_wave_saturate = [num_sms](int x) -> int {
         return (x == 0) ? num_sms : x;
@@ -396,7 +411,7 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
             // block_ns_after_filter = filter(lambda bn: (bn != n and n >= 32) and not (block_m == 16 and bn <= 32),
             // block_ns)
             for (int bn : block_ns) {
-                if ((bn != n && n >= 32) && !(block_m == 16 && bn <= 32)) {
+                if (((fixed_block_n || bn != n) && n >= 32) && !(block_m == 16 && bn <= 32)) {
                     block_ns_after_filter.push_back(bn);
                 }
             }
@@ -404,7 +419,7 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
             // block_ns_after_filter = filter(lambda bn: ((block_m <= 128 or bn <= 128) and (bn != n and n >= 32) and
             // not (block_m == 16 and bn <= 32)), block_ns)
             for (int bn : block_ns) {
-                if ((block_m <= 128 || bn <= 128) && (bn != n && n >= 32) && !(block_m == 16 && bn <= 32)) {
+                if ((fixed_block_n || block_m <= 128 || bn <= 128) && ((fixed_block_n || bn != n) && n >= 32) && !(block_m == 16 && bn <= 32)) {
                     block_ns_after_filter.push_back(bn);
                 }
             }
@@ -464,23 +479,26 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
         }
     }
 
-    if (is_ppu1v5_device() && (m >= 96 && m < 128 && n > 2048 && k > 2048 && num_groups >= 8)) {
+    if (allowed_m(192) &&
+        (!fixed_block_n || *fixed_block_n == 256) &&
+        is_ppu1v5_device() && (m >= 96 && m < 128 && n > 2048 && k > 2048 && num_groups >= 8)) {
         best_block_m = 192;
         best_block_n = 256;
     }
 
-    if ((best_block_m - 10 <= m && m <= best_block_m) && best_block_m == 16) {
+    if ((best_block_m - 10 <= m && m <= best_block_m) && best_block_m == 16 && allowed_m(best_block_m * 2)) {
         best_block_m = best_block_m * 2;
     }
 
     // qwen3-next & deepseek gemm2 need to fix some issues
-    if ((best_block_m - 10 <= m && m <= best_block_m) && (best_block_m == 32 || best_block_m == 64) && k > 256) {
+    if ((best_block_m - 10 <= m && m <= best_block_m) && (best_block_m == 32 || best_block_m == 64) &&
+        k > 256 && allowed_m(best_block_m * 2)) {
         best_block_m = best_block_m * 2;
     }
 
     // small m hbm bound or latency bound, wave is not useful, for better occ for 810e hbm bound, use smallest blockN
     // for m16
-    if (m < 10 && n < 512) {
+    if (!fixed_block_n && allowed_m(16) && m < 10 && n < 512) {
         best_block_m = 16;
         best_block_n = 64;
     }
@@ -520,7 +538,7 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
 
     // if not stage_candidates or (128 % best_block_n != 0 and 128 // gcd(128, best_block_n) <= 4) or best_block_m == 16
     // or best_block_m == 32:
-    if (stage_candidates.empty() || (128 % best_block_n != 0 && 128 / gcd(128, best_block_n) <= 4) ||
+    if (stage_candidates.empty() || (!fixed_block_n && 128 % best_block_n != 0 && 128 / gcd(128, best_block_n) <= 4) ||
         best_block_m == 16 || best_block_m == 32) {
         stage_candidates = {3, 2};
     }
@@ -544,7 +562,9 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
     int warp_m = best_block_m / 2;
     int warp_n = best_block_n / 2;
 
-    if (best_block_m > 128 && best_block_n == 256) {
+    // Fixed wide tiles use four M warps once M is large enough, keeping
+    // each thread's accumulator footprint bounded as the CTA tile grows.
+    if ((best_block_m > 128 || (fixed_block_n && best_block_m >= 128)) && best_block_n == 256) {
         warp_m = best_block_m / 4;
         warp_n = best_block_n / 4;
     } else if (best_block_m == 64 && best_block_n >= 128) {
@@ -561,7 +581,7 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
         warp_n = (best_block_n <= 128) ? best_block_n / 2 : best_block_n / 4;
     } else if (best_block_m == 16) {
         warp_m = 16;
-        best_block_n = (n < 512) ? 64 : best_block_n;
+        best_block_n = (!fixed_block_n && n < 512) ? 64 : best_block_n;
         warp_n = (best_block_n < 128) ? best_block_n / 2 : best_block_n / 4;
     } else if (best_block_n == 128 || best_block_n == 256) {
         warp_m = (best_block_m != 32) ? best_block_m / 2 : best_block_m;
@@ -573,6 +593,17 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
         const auto smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, block_k, 1);
         const int smem_size = std::get<0>(smem_config);
         if (smem_size <= ppu_capacity) {
+            if (fixed_block_n) {
+                // For a fixed wide N tile, register pressure can cap residency
+                // before shared memory. Keep the deepest pipeline at the best
+                // achievable occupancy instead of shortening it on a tie.
+                const int occ = std::get<0>(get_num_occ(best_block_m, best_block_n, block_k, num_stages));
+                if (occ > best_occ) {
+                    best_occ = occ;
+                    best_num_stages = num_stages;
+                }
+                continue;
+            }
             const int occ = ppu_capacity / smem_size;
             best_smem_config = smem_config;
             if (k < 512 || (best_block_m > 32 && best_block_n >= 64) && occ >= best_occ) {
@@ -587,6 +618,8 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
     }
 
     assert(best_num_stages != 0);
+    if (fixed_block_n)
+        best_smem_config = get_smem_config(best_num_stages, k, best_block_m, best_block_n, block_k, 1);
 
     return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n,
                            best_num_stages, best_smem_config);
@@ -612,15 +645,32 @@ std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_best_configs(int m, int n, int k, int num_groups, int num_sms,
                  GemmType gemm_type = GemmType::Normal, int max_block_n = 256,
                  std::optional<deep_gemm_lut::RuntimeLutKind> runtime_lut_kind = std::nullopt,
-                 bool* from_runtime_lut = nullptr) {
+                 bool* from_runtime_lut = nullptr, std::optional<int> fixed_block_n = std::nullopt,
+                        const std::vector<int>* allowed_block_ms = nullptr) {
+    TORCH_CHECK(!fixed_block_n ||
+        (is_ppu1v5_device() && gemm_type == GemmType::MGroupedNoPad &&
+         *fixed_block_n >= 32 && *fixed_block_n <= max_block_n &&
+         (*fixed_block_n & (*fixed_block_n - 1)) == 0 && n % *fixed_block_n == 0),
+        "fixed_block_n requires PPU1.5 GroupedNoPad, a power-of-two tile in [32, max_block_n] dividing N");
+    TORCH_CHECK(!allowed_block_ms || (is_ppu1v5_device() && gemm_type == GemmType::MGroupedNoPad &&
+                    !allowed_block_ms->empty()), "M tile constraints require PPU1.5 GroupedNoPad");
+    const auto allowed = [&](int bm) {
+        return !allowed_block_ms || std::find(allowed_block_ms->begin(), allowed_block_ms->end(), bm) != allowed_block_ms->end();
+    };
     if (from_runtime_lut) *from_runtime_lut = false;
     std::optional<deep_gemm_int8_lut::Tile> lut_result;
     if (runtime_lut_kind.has_value()) {
         lut_result = deep_gemm_lut::get_runtime_config(m, n, k, num_groups, gemm_type, *runtime_lut_kind);
+        if (lut_result && (!allowed(std::get<0>(*lut_result)) ||
+                           (fixed_block_n && std::get<1>(*lut_result) != *fixed_block_n)))
+            lut_result.reset();
         if (from_runtime_lut) *from_runtime_lut = lut_result.has_value();
     }
     if (!lut_result.has_value()) {
         lut_result = deep_gemm_int8_lut::get_best_configs_from_lut(m, n, k, gemm_type);
+        if (lut_result && (!allowed(std::get<0>(*lut_result)) ||
+                           (fixed_block_n && std::get<1>(*lut_result) != *fixed_block_n)))
+            lut_result.reset();
     }
     if (lut_result.has_value()) {
         int best_block_m, best_block_n, best_block_k, best_warp_m, best_warp_n, best_stages;
@@ -639,7 +689,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         return get_adaptive_configs_int8(m, n, k, num_sms);
     }
     if (is_ppu1v5_device()) {
-        return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, gemm_type, max_block_n);
+        return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, gemm_type, max_block_n, fixed_block_n, allowed_block_ms);
     }
     // FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
     std::vector<int> block_ms;

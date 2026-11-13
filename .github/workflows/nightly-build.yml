@@ -1,0 +1,109 @@
+name: Nightly Build DeepGemm
+
+on:
+  schedule:
+    # Daily at 11:30 UTC (19:30 Beijing time)
+    - cron: '30 11 * * *'
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Name of the package to build and upload'
+        required: true
+        type: string
+        default: deep_gemm
+      framework:
+        description: 'Name of the dependent framework, e.g. torch'
+        required: true
+        type: string
+        default: torch
+      python_versions:
+        description: 'JSON array; allowed values: 38, 310, 312'
+        required: true
+        type: string
+        default: '["312"]'
+      os_versions:
+        description: 'JSON array; allowed values: ubuntu2004, ubuntu2204, ubuntu2404, alios7u2'
+        required: true
+        type: string
+        default: '["ubuntu2404"]'
+      runtime_versions:
+        description: 'JSON array; allowed HGGCRT versions: 2, 3'
+        required: true
+        type: string
+        default: '["3"]'
+      torch_versions:
+        description: 'JSON array; allowed values: 2.10.0, 2.13.0; [""] skips Torch installation'
+        required: true
+        type: string
+        default: '["2.10.0"]'
+      sdk_versions:
+        description: 'JSON array; allowed values: 2.1.1, 2.2.0'
+        required: true
+        type: string
+        default: '["2.2.0"]'
+      branch:
+        description: 'Source branch, tag, or full commit SHA; leave empty to use the commit that triggered the workflow'
+        required: false
+        type: string
+      package_version:
+        description: 'Artifactory package version and automatic upload directory prefix; does not override the wheel version'
+        required: true
+        type: string
+        default: '1.1.0'
+      package_edition:
+        description: 'Artifactory package edition; defaults to oe, matching the release workflow'
+        required: true
+        type: string
+        default: oe
+      package_type:
+        description: 'Artifactory package type; defaults to pypi'
+        required: false
+        type: string
+        default: pypi
+      build_command:
+        description: 'Custom Bash build command; leave empty to use the default; only trusted configuration is accepted'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: nightly-build-${{ inputs.branch || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: t-head/ci-infra/.github/workflows/nightly-build.yml@main
+    secrets:
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+    with:
+      # Scheduled and push runs have no inputs; use the same defaults as manual runs.
+      package_name: ${{ inputs.package_name || 'deep_gemm' }}
+      framework: ${{ inputs.framework || 'torch' }}
+      template_repository: t-head/ci-infra
+      template_ref: main
+      python_versions: ${{ inputs.python_versions || '["312"]' }}
+      os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
+      runtime_versions: ${{ inputs.runtime_versions || '["3"]' }}
+      torch_versions: ${{ inputs.torch_versions || '["2.10.0"]' }}
+      sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
+      branch: ${{ inputs.branch || '' }}
+      package_version: ${{ inputs.package_version || '1.1.0' }}
+      package_edition: ${{ inputs.package_edition || 'oe' }}
+      package_type: ${{ inputs.package_type || 'pypi' }}
+      build_command: |
+        ${{ inputs.build_command || 'unset PIP_INDEX_URL
+        source /usr/local/PPU_SDK/envsetup.sh || true
+        which hgcc || true
+        echo $PPU_SDK
+        pip install setuptools==69.5.1
+        pip install setuptools-scm==9.2.2
+        pip install numpy==1.26.4 junit-xml rich
+        python3 -m pip install wheel ninja
+        python3 -m pip show setuptools setuptools-scm packaging
+        export PYTORCH_SAIL_ARCH="ppu_10;ppu_15"
+        python3 setup.py bdist_wheel' }}

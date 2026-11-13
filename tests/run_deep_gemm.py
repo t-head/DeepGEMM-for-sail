@@ -24,6 +24,10 @@ def device_version_supported(one_case):
     if (one_case.get('gemm_type') in ('MqaLogits', 'PagedMqaLogits')
             and data_type == torch.int8 and get_arch_version() != 80):
         return False, 'INT8 indexer requires 810E'
+    sparse_int8 = (one_case.get('gemm_type') in ('SparseMqaLogits', 'PagedSparseMqaLogits')
+                   and data_type == torch.int8)
+    if sparse_int8 and get_arch_version() != 80:
+        return False, 'INT8 sparse MQA logits requires PPU1.0 (ZW810E, sm_80)'
     if one_case.get('device') == '810e' and 'ZW810E' not in torch.cuda.get_device_name():
         return False, 'This regression case requires ZW810E'
     if one_case.get('gemm_type') == 'Activation' or data_type in ('w4fa16_mma', 'w4fa8_mma', 'w4a8_nvfp4'):
@@ -66,6 +70,13 @@ def run_activation_regression(args):
     return test_checkin_activation(args, check_accuracy=get_acc_check())
 
 
+def run_moe_align(args):
+    if args.get('case') != 'invalid_routes':
+        raise ValueError(f"Unsupported MoE align regression: {args.get('case')}")
+    from test_moe_align_invalid_routes import main
+    return main(check_accuracy=get_acc_check())
+
+
 def call_test_func(gemm_type, func_args):
     supported_call_funcs = {
         "KGroupedContiguous": test_k_grouped_gemm_contiguous,
@@ -89,6 +100,7 @@ def call_test_func(gemm_type, func_args):
         "AttentionRegression": run_attention_regression,
         "Preprocess": run_preprocessing_regression,
         "Activation": run_activation_regression,
+        "MoeAlign": run_moe_align,
     }
 
     if gemm_type in supported_call_funcs.keys():

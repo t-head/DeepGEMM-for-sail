@@ -15,6 +15,7 @@ from . import _C
 
 # Configs
 from ._C import (
+    use_deterministic_algorithms,
     set_num_sms,
     get_num_sms,
     set_tc_util,
@@ -107,6 +108,7 @@ from ._C import (
     # Hyperconnection kernels
     tf32_hc_prenorm_gemm,
     mega_mhc,
+    bf16_mega_gate,
     # Einsum kernels
     fp8_einsum,
     int8_einsum,
@@ -128,8 +130,10 @@ from ._C import (
     # Attention kernels (sparse MQA logits)
     get_sparse_mqa_logits_metadata,
     fp8_fp4_sparse_mqa_logits,
+    int8_sparse_mqa_logits,
     get_paged_sparse_mqa_logits_metadata,
     fp8_fp4_paged_sparse_mqa_logits,
+    int8_paged_sparse_mqa_logits,
 )
 
 from ._C import epilogue
@@ -235,6 +239,9 @@ from .mega import (
     transform_weights_for_mega_moe,
     fp4_fp4_mega_moe,
     mega_moe_pre_dispatch,
+    transform_weights_for_fp8_mega_moe, transform_weights_for_w4a16_mega_moe,
+    fp8_fp8_mega_moe, bf16_fp4_mega_moe,
+    transform_weights_for_w4a8_mega_moe, fp8_fp4_mega_moe,
 )
 
 # Some utils

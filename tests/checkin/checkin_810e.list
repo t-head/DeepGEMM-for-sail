@@ -192,6 +192,21 @@ MqaLogits,data_type:int8,seq_len_q:8191,seq_len_kv:8191,num_heads:64,head_dim:12
 MqaLogits,data_type:int8,seq_len_q:4096,seq_len_kv:8192,num_heads:64,head_dim:128,compressed_logits:1
 MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,weights_dtype:bf16
 
+# --- SparseMqaLogits / int8 ---
+# Full blocks, true sparse selections with odd Q/unaligned starts, and empty/minimal windows.
+SparseMqaLogits,data_type:int8,seq_len_q:32,seq_len_kv:1024,sparse_block_kv:8,num_max_sparse_blocks:256,check_metadata:1
+SparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:8191,sparse_block_kv:16,num_max_sparse_blocks:128,use_unaligned_ks:1,check_metadata:1
+SparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:8191,sparse_block_kv:8,num_max_sparse_blocks:128,use_unaligned_ks:1,check_metadata:1
+SparseMqaLogits,data_type:int8,seq_len_q:1,seq_len_kv:1,sparse_block_kv:16,num_max_sparse_blocks:4,check_metadata:1
+SparseMqaLogits,data_type:int8,seq_len_q:2,seq_len_kv:0,sparse_block_kv:16,num_max_sparse_blocks:4,check_metadata:1
+SparseMqaLogits,data_type:int8,seq_len_q:1,seq_len_kv:65535,sparse_block_kv:16,num_max_sparse_blocks:4096,check_metadata:1
+
+# --- Native PagedSparseMqaLogits / int8 ---
+PagedSparseMqaLogits,data_type:int8,seq_len_q:1,seq_len_kv:0,sparse_block_kv:8,num_max_sparse_blocks:4,check_metadata:1
+# SoA pages, request-local pairing and exact selected-slot references.
+PagedSparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:129,sparse_block_kv:8,num_max_sparse_blocks:16,page_kv:32,check_metadata:1
+PagedSparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:513,sparse_block_kv:16,num_max_sparse_blocks:32,page_kv:128,check_metadata:1
+
 # ============ PagedMqaLogits ============
 
 # --- PagedMqaLogits / int8 ---

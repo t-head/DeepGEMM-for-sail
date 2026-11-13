@@ -67,6 +67,25 @@ and that runtime-only arguments preserve both. Coverage includes BF16 CuteFree
 and CUTLASS with BF16/FP32 output, GEMV M1/M2, FP8 block/channel, INT8 and FP4.
 The helper queries hardware constants but never compiles or launches generated
 GEMMs. Public API accuracy and launch behavior remain covered by the GEMM UTs.
+## Sparse MQA (810E INT8 / M890 MXFP4)
+
+Run these existing check-in cases from the repository root with the matching
+PPU build installed. Shapes are explicit; request-array arguments are not
+supported by this runner.
+
+```bash
+# 810E: non-paged and paged INT8.
+python tests/run_deep_gemm.py --require_supported --format 'SparseMqaLogits,data_type:int8,seq_len_q:32,seq_len_kv:1024,sparse_block_kv:8,num_max_sparse_blocks:256,check_metadata:1'
+python tests/run_deep_gemm.py --require_supported --format 'PagedSparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:129,sparse_block_kv:8,num_max_sparse_blocks:16,page_kv:32,check_metadata:1'
+
+# M890: non-paged and paged MXFP4.
+python tests/run_deep_gemm.py --require_supported --format 'SparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:1024,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:256,use_unaligned_ks:0,check_metadata:1'
+python tests/run_deep_gemm.py --require_supported --format 'PagedSparseMqaLogits,data_type:fp4,seq_len_q:313,seq_len_kv:1023,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,check_metadata:1'
+```
+
+See [810E check-in cases](checkin/checkin_810e.list),
+[M890 check-in cases](checkin/checkin_890p.list), and the
+[sparse API guide](../docs/api/indexer.md#sparse-indexer) for layouts and constraints.
 
 ## Test fp8
 python ./test_fp8_core.py
@@ -86,6 +105,68 @@ The benchmark reuses the correctness runner's case table and input/reference
 helpers. Both use the public complete call.
 Other architecture pytest runs skip these tests; CLI use reports an
 unsupported-device error.
+
+`test_mega_moe_precisions.py` exercises FP8 channelwise/blockwise, W4A8 and W4A16
+through their public complete calls. Its default model cases are listed below;
+all token counts are per rank. CLI options can select other counts within capacity.
+
+| Case | Precision | EP | Default tokens/rank |
+|---|---|---|---|
+| `glm52` | FP8 channelwise | 8 | 32, 1024, 2048, 4096 |
+| `glm53_flash` | FP8 channelwise | 4 | 1024, 2048, 4096 |
+| `qwen38_flash` | FP8 channelwise | 4 | 1024, 2048, 4096 |
+| `minimax_m3` (open-source model) | FP8 channelwise | 8 | 1024, 2048, 4096 |
+| `minimax_m3_blockwise` (next-generation model) | FP8 blockwise | 8, 16, 32, 64 | 64, 1024, 2048, 4096 |
+| `kimi_k3` | W4A16 | 8, 16 | 1024, 2048, 4096 |
+| `kimi_k3_decode` | W4A16 | 32 | 4, 8, 16, 32, 64, 128 |
+| `deepseek_v4_pro_w4a8` | W4A8 | 8 | 32, 1024, 2048, 4096 |
+| `kimi_k3_w4a8` | W4A8 | 8, 16, 32 | 32, 64, 128, 1024, 2048, 4096 |
+
+Small distributed cases cover separate replicas, both math modes, OAI/clamp,
+empty ranks, consecutive changing routes, statistics and graph replay.
+Distributed worklist and tile regressions use the common workspace's 64-rank
+capacity rather than precision-specific EP limits.
+The complete-call and replica pytest smoke cases use four experts per rank
+and accept EP1 through EP64. Other smoke cases keep their fixed global expert
+counts and run at EP1/2/4/8. The model EP sizes above describe deployment
+workloads, not precision-specific API limits.
+The API cases also check malformed weights, odd GEMM1 widths, int32/int64
+routing IDs and rejected mismatched token counts. Slice input prefixes at the
+call site: `num_tokens` must equal the number of rows passed to pre-dispatch.
+All precisions use the common workspace entry point for complete-pipeline checks,
+including compatible `SymmBuffer` base aliases.
+Activation-reuse cases switch supported activations and SiTU coefficients on
+one allocation, then replay earlier graphs to check that later calls do not
+change their behavior. Unsupported activations remain rejected.
+Accuracy uses `deep_gemm.testing.calc_diff < 0.001`, matching grouped FP8
+GEMM; W4A8 retains its existing 0.0015 threshold. Relative L2 is reported on
+failure. References run outside timing. The CLI examples use
+`--reference-tokens 8` to sample eight tokens per rank; the CLI default of 0
+checks every token.
+
+```bash
+# No private C++ bindings or test-side counter resets are needed.
+python -m pytest -q -s --disable-warnings -x tests/test_mega_moe_precisions.py -k smoke
+torchrun --standalone --nproc-per-node=2 -m pytest -q -s --disable-warnings -x \
+  tests/test_mega_moe_precisions.py -k smoke
+torchrun --standalone --nproc-per-node=8 tests/test_mega_moe_precisions.py \
+  --case kimi_k3 --tokens 1024 2048 4096 --routing random --reference-tokens 8 \
+  --benchmark --warmup 10 --iterations 100 --repeats 5
+# The same benchmark can be invoked directly; --precision selects its case table.
+torchrun --standalone --nproc-per-node=8 tests/bench_mega_moe.py \
+  --precision w4a16 --case kimi_k3 --tokens 1024 2048 4096 --routing random \
+  --reference-tokens 8 --warmup 10 --iterations 100 --repeats 5
+```
+
+The precision CLI forwards `--benchmark` to the same benchmark driver as W4A4.
+All precisions accept the same token/capacity, routing, math, reference and timing
+options. `--mode graph` (the default) times the complete graph, including BF16 input preparation,
+communication, both GEMMs, activation/quantization, scatter, combine and recycling.
+`--mode eager` times the same complete call without graph capture. Both report
+the slowest rank and median/min/max over repeats. DeepEP comparisons currently
+cover W4A4 only; requesting that baseline for another precision is rejected.
+
+### W4A4 cases
 
 | Case | EP | H | I | Experts | Top-k | Activation | Capacity |
 |---|---|---:|---:|---:|---:|---|---:|
@@ -390,3 +471,26 @@ reference. Kernel timing follows the same method as other GEMM dtypes.
 Use EP32/groups=12 or EP64/groups=6, and up N/K=10240/7168 or down
 N/K=7168/5120. For another pre-routing batch B, set M=4*B and distribute
 those rows across the local experts.
+
+## Native INT8 paged sparse MQA (810E)
+
+INT8 and FP4 use the existing `test_sparse_mqa_logits_loop` and
+`utils.test_sparse_mqa_logits` entry points, with the same 11 case shapes.
+Coverage includes paged/nonpaged, B8/B16, unaligned nonpaged starts, odd Q,
+tail/zero-length contexts and capacity4096. The existing FP4 workspace test
+remains separate.
+
+```bash
+python tests/run_deep_gemm.py --format 'PagedSparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:129,sparse_block_kv:8,num_max_sparse_blocks:16,page_kv:64,check_metadata:1' --require_supported
+```
+
+The INT8 cache is uint8 `[pages,page_kv,1,132]`: each page stores all K bytes,
+then all FP32 scale words, with a 512-byte-aligned page stride. Q scales are
+folded into BF16 weights. Correctness uses the corresponding dense INT8
+kernel and gathers selected logits for bitwise comparison; paged inputs are
+resolved through the page table first. `check_metadata:1` also validates
+split contents, request pairing and schedule coverage.
+
+Development-only request-array workloads, independent INT8 epilogue references
+and three-stage Graph timing helpers have been removed from `utils.py`.
+Use standard shape cases here; historical profiling artifacts are unchanged.
