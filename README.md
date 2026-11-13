@@ -548,8 +548,8 @@ In addition, the dense GEMM kernels only implement the NT layout. The `nn` / `tn
 The library provides some utility functions besides the above kernels:
 
 - `deep_gemm.set_num_sms` / `get_num_sms`: set/get the maximum CU count to use
-  On 810E, this sets the Tensor budget (1–20); BF16 dense SIMT uses `64 - (20 - num_sms)`.
-  `0` restores automatic selection. Counts come from the device; settings above its Tensor CU count are rejected.
+  On 810E, BF16 dense Tensor uses `min(num_sms, 20)`; SIMT uses `64 - (20 - num_sms)` for 1–20, and `num_sms` for 21–64.
+  `0` restores automatic selection (20 Tensor / 64 SIMT). Counts come from the device; settings above its total CU count are rejected.
 - `deep_gemm.set_tc_util` / `get_tc_util`: set/get an approximated tensor cell utilization ratio
 - `deep_gemm.set_pdl` / `get_pdl`: enable/disable Programmatic Dependent Launch (PDL)
 - `deep_gemm.set_compile_mode` / `get_compile_mode`: set/get the JIT compile mode

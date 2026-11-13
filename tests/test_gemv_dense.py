@@ -348,22 +348,24 @@ def run_n1_cu_limit(check=True):
     try:
         if is_810e:
             deep_gemm.set_num_sms(1)
-            for invalid in (-1, original + 1, total_cus + 1):
+            for invalid in (-1, total_cus + 1):
                 try:
                     deep_gemm.set_num_sms(invalid)
-                except RuntimeError as error:
-                    assert '810E num_sms' in str(error), str(error)
+                except RuntimeError:
+                    pass
                 else:
-                    raise AssertionError('810E accepted an invalid Tensor CU budget')
+                    raise AssertionError('810E accepted an invalid CU budget')
                 assert deep_gemm.get_num_sms() == 1
-        budgets = (1, 2, original - 1, original, 0) if is_810e else (1, 2)
+        budgets = (1, 2, original - 1, original, original + 1,
+                   total_cus // 2, total_cus - 1, total_cus, 0) if is_810e else (1, 2)
         for setting in budgets:
             budget = setting or original
             if budget > total_cus:
                 continue
             deep_gemm.set_num_sms(setting)
             assert deep_gemm.get_num_sms() == budget
-            simt_budget = total_cus - original + budget if is_810e else budget
+            tensor_budget = min(budget, original) if is_810e else budget
+            simt_budget = total_cus - original + budget if is_810e and budget <= original else budget
             # 890P clamps explicit N=1 tiles to the budget. 810E supports N=1
             # through GEMV only and rejects oversized explicit budgets.
             for config_sms in dict.fromkeys((None, budget, original)):
@@ -371,7 +373,7 @@ def run_n1_cu_limit(check=True):
                 for dtype in (torch.bfloat16, torch.float32):
                     out = torch.full((m, 1), 8., device='cuda', dtype=dtype)
                     if is_810e and configs is not None:
-                        expected = 'configured budget' if config_sms > budget else 'vector-aligned output'
+                        expected = 'configured budget' if config_sms > tensor_budget else 'vector-aligned output'
                         try:
                             deep_gemm.bf16_gemm_nt(x, w, out, configs=configs)
                         except RuntimeError as error:
@@ -405,7 +407,7 @@ def run_n1_cu_limit(check=True):
                     if is_810e:
                         effective = re.search(r'num_sms:(\d+)', log)
                         assert effective and int(effective.group(1)) == simt_budget, log
-                        if budget < original:
+                        if simt_budget < total_cus:
                             assert grid == simt_budget, (budget, log)
                         else:
                             assert grid > total_cus, log  # Full-budget GEMV needs no cap.

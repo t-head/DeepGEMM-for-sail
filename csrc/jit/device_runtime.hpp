@@ -119,13 +119,7 @@ public:
 
     void set_num_sms(const int& new_num_sms) {
         const auto prop = get_prop();
-        if (std::string(prop->name).find("ZW810E") != std::string::npos) {
-            TORCH_CHECK(new_num_sms >= 0 && new_num_sms <= get_tensor_cu_count(),
-                        "810E num_sms must be 0 (automatic) or within the Tensor CU count (",
-                        get_tensor_cu_count(), ")");
-        } else {
-            DG_HOST_ASSERT(0 <= new_num_sms and new_num_sms <= prop->multiProcessorCount);
-        }
+        DG_HOST_ASSERT(0 <= new_num_sms and new_num_sms <= prop->multiProcessorCount);
         num_sms = new_num_sms;
         numSmsExplicit = new_num_sms != 0;
     }
@@ -147,12 +141,15 @@ public:
         return num_sms;
     }
 
-    // On 810E, reducing the Tensor budget removes the same number of SIMT CUs.
+    // On 810E, settings up to the Tensor count remove the same number of SIMT CUs.
+    // Larger settings directly specify the SIMT budget; Tensor paths clamp separately.
     // Other devices retain their existing explicit/automatic budget semantics.
     int get_num_simt_sms() {
         const auto prop = get_prop();
-        if (std::string(prop->name).find("ZW810E") != std::string::npos)
-            return prop->multiProcessorCount - get_tensor_cu_count() + get_num_sms();
+        if (std::string(prop->name).find("ZW810E") != std::string::npos) {
+            const int sms = get_num_sms(), tensorCUs = get_tensor_cu_count();
+            return sms <= tensorCUs ? prop->multiProcessorCount - tensorCUs + sms : sms;
+        }
         return numSmsExplicit ? get_num_sms() : prop->multiProcessorCount;
     }
 
