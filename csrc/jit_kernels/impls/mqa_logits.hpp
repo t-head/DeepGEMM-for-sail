@@ -90,6 +90,7 @@ public:
         int fp4_m_block_group = 0;
         bool fp4_q_owner_epilogue = false;
         bool fp4_balance_output_tiles = false;
+        int kv_partitions = 1;
     };
 
     struct Args {
@@ -104,6 +105,8 @@ public:
         if (info.kernel_class == "PPUMqaLogitsFP4") {
             schedule_suffix = fmt::format(", {}, {}, {}", info.fp4_m_block_group,
                                           info.fp4_q_owner_epilogue, info.fp4_balance_output_tiles);
+        } else {
+            schedule_suffix = fmt::format(", {}", info.kv_partitions);
         }
         return fmt::format(
             R"(
@@ -179,7 +182,7 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
                         num_heads, head_dim, config.block_qh, config.block_kv, config.warp_qh, config.warp_kv,
                         config.num_q_stages, config.num_kv_stages, StrideKTypeName<StrideKType>::value,
                         is_compressed, scale_mode, smem_size, num_threads, kernel_name,
-                        config.m_block_group, config.q_owner_epilogue, config.balance_output_tiles},
+                        config.m_block_group, config.q_owner_epilogue, config.balance_output_tiles, config.kv_partitions},
         .launch_args = {grid, block, smem_size},
         .kernel_params = kernel_params,
     };
@@ -191,23 +194,9 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
     int blocks_per_cu = 0;
     hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, runtime->kernel, num_threads, smem_size);
     const uint64_t capacity = static_cast<uint64_t>(num_sms) * blocks_per_cu;
-    args.launch_args.grid_dim.x = static_cast<unsigned>(capacity);
-    if (is_fp4 and is_avg) {
-        const uint64_t seq_len_q = kernel_params.seq_len_q;
-        const uint64_t block_q = config.block_q;
-        const uint64_t num_q_blocks = seq_len_q / block_q + (seq_len_q % block_q != 0);
-        uint64_t num_output_tasks = num_q_blocks * (config.balance_output_tiles ? 2 : 1);
-        if (num_heads == 8 && config.balance_output_tiles) {
-            // H8 can distribute all output tiles; short-window fallback remains Q-strided.
-            const uint64_t seq_len_k = kernel_params.seq_len_k;
-            const uint64_t block_kv = config.block_kv;
-            const uint64_t num_kv_blocks = seq_len_k / block_kv + (seq_len_k % block_kv != 0);
-            num_output_tasks = num_q_blocks * num_kv_blocks;
-        }
-        // Preserve a valid launch for the existing empty-Q AVG path.
-        args.launch_args.grid_dim.x = static_cast<unsigned>(
-            std::min(capacity, std::max(uint64_t{1}, num_output_tasks)));
-    }
+    const auto [grid_x, grid_y] = deep_gemm_mqa_common::get_mqa_logits_grid(
+        config, kernel_params.seq_len_q, kernel_params.seq_len_k, capacity);
+    args.launch_args.grid_dim = dim3(grid_x, grid_y, 1);
 
     // Report the configuration before launch so it remains visible even
     // when the launch itself fails
@@ -235,10 +224,12 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
             printf("kNumHeads:%d, kHeadDim:%d, seq_len_q:%u, seq_len_k:%u, stride_k:%llu\n", num_heads, head_dim,
                    static_cast<unsigned>(kernel_params.seq_len_q), static_cast<unsigned>(kernel_params.seq_len_k),
                    static_cast<unsigned long long>(kernel_params.stride_k));
-            printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", config.block_qh,
-                   config.block_kv, config.warp_qh, config.warp_kv, config.num_q_stages, config.num_kv_stages);
+            printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", config.block_kv,
+                   config.block_qh, config.warp_kv, config.warp_qh, config.num_q_stages, config.num_kv_stages);
             printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d, num_threads:%d\n", num_sms, blocks_per_cu,
-                   static_cast<int>(args.launch_args.grid_dim.x), num_threads);
+                   static_cast<int>(args.launch_args.grid_dim.x * args.launch_args.grid_dim.y), num_threads);
+            printf("grid:[%u, %u, 1], task_kv_partitions:%d\n",
+                   args.launch_args.grid_dim.x, args.launch_args.grid_dim.y, config.kv_partitions);
         }
         printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, num_regs, local_size);
         printf("compressed_logits:%s, ", is_compressed ? "true" : "false");
@@ -250,6 +241,8 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
         dg_prof_params.set_mqa_logits_params(dtype_tag, static_cast<int>(kernel_params.seq_len_q),
                                              static_cast<int>(kernel_params.seq_len_k), num_heads,
                                              is_fp4 ? head_dim * 2 : head_dim, current_stream(), is_avg);
+        if (is_compressed)
+            dg_prof_params.add_params("compressed_logits", 1);
         if (element_logits == "__ppu_bfloat16")
             dg_prof_params.add_params("logits_dtype", std::string("bf16"));
         if (element_weights == "__ppu_bfloat16")
@@ -297,7 +290,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
 
     const auto config = deep_gemm_mqa_common::get_best_configs(
         q.scalar_type(), seq_len_q, seq_len_k, num_heads, logits_dtype,
-        is_fp4, get_num_sms(), is_compressed, scale_mode);
+        is_fp4, get_num_sms(), is_compressed, scale_mode, max_seqlen_k);
 
     const int aligned_seq_len = align(seq_len_q, config.block_q);
     const int logits_stride_alignment = deep_gemm_mqa_common::get_logits_stride_alignment(logits_dtype);

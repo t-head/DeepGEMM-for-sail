@@ -23,7 +23,7 @@ namespace cutlass::gemm::kernel {
 //   - MMA atom: F32F4F4F32 (16x16x64)
 // ============================================================================
 
-template <typename ElementQK, typename ElementLogits, typename ElementWeights>
+template <typename ElementQK, typename ElementLogits, typename ElementWeights, typename TableOffset>
 struct FP4PagedArguments {
     const ElementQK* ptr_q;
     const uint32_t* q_sf; // Q scale factor (packed e8m0, 4×uint8 per int32)
@@ -33,7 +33,7 @@ struct FP4PagedArguments {
     const uint32_t batch_size;
     const uint64_t logits_stride;
     const uint64_t kv_cache_stride_bytes;
-    const uint32_t block_table_stride;
+    const TableOffset block_table_stride;
     const uint32_t* context_lens;
     ElementLogits* logits;
     const uint32_t* block_table;
@@ -44,7 +44,7 @@ struct FP4PagedArguments {
 template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights, uint32_t kNextN, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t PAGE_KV, uint32_t SPLIT_KV, uint32_t BLOCK_KV, uint32_t WARP_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
-          bool SPLIT_MBLOCK, uint32_t kScaleMode = deep_gemm::kScaleModeWeights, bool kGrouped = false>
+          bool SPLIT_MBLOCK, uint32_t kScaleMode = deep_gemm::kScaleModeWeights, bool kGrouped = false, typename TableOffset = uint32_t>
 class PPUPagedMqaLogitsFP4 {
 public:
     static_assert(PAGE_KV == 32 || (PAGE_KV > 0 && PAGE_KV % BLOCK_KV == 0),
@@ -202,7 +202,7 @@ public:
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
     // Device side arguments
-    using Arguments = FP4PagedArguments<ElementQK, ElementLogits, ElementWeights>;
+    using Arguments = FP4PagedArguments<ElementQK, ElementLogits, ElementWeights, TableOffset>;
 
     // Kernel entry point API
     using Params = Arguments;
@@ -1232,10 +1232,10 @@ public:
 template <typename Q, typename Acc, typename Out, typename W, uint32_t BQ, uint32_t H,
           uint32_t D, uint32_t Page, uint32_t Split, uint32_t BK, uint32_t WK,
           uint32_t SQ, uint32_t SK, bool SplitM, uint32_t Scale,
-          uint32_t WorkersPerCU>
+          uint32_t WorkersPerCU, typename TableOffset = uint32_t>
 class PPUGroupedPagedMqaLogitsFP4 {
     using Kernel = PPUPagedMqaLogitsFP4<Q, Acc, Out, W, BQ, H, D,
-        Page, Split, BK, WK, SQ, SK, SplitM, Scale, true>;
+        Page, Split, BK, WK, SQ, SK, SplitM, Scale, true, TableOffset>;
 public:
     using Params = typename Kernel::Params;
     static constexpr int SharedStorageSize = Kernel::SharedStorageSize;
