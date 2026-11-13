@@ -5,6 +5,7 @@ import deep_gemm
 from utils import test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, set_acc_check, parse_deepgemm_string_re
 from utils import is_ppu1v5_device, get_arch_version
 from utils import per_token_cast_to_fp4, cast_back_from_fp4, kv_cache_cast_to_fp4, ref_paged_mqa_logits, calc_diff
+from utils import kv_cache_cast_to_fp8
 
 def test_ks_ke(check_accuracy=True):
     if is_ppu1v5_device():
@@ -159,6 +160,11 @@ def test_mqa_logits_loop():
         'MqaLogits,data_type:int8,seq_len_q:4096,seq_len_kv:8192,num_heads:64,head_dim:128,compressed_logits:1',
         'MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,weights_dtype:bf16',
     ]
+    if is_ppu1v5_device():
+        cases.extend([
+            'MqaLogits,data_type:fp8,seq_len_q:1,seq_len_kv:389,num_heads:8,head_dim:64',
+            'MqaLogits,data_type:fp8,seq_len_q:5,seq_len_kv:389,num_heads:8,head_dim:128,compressed_logits:1',
+        ])
     for case in cases:
         if is_ppu1v5_device() and 'data_type:int8' in case:
             continue
@@ -189,7 +195,7 @@ def test_mqa_compressed_boundaries():
         fn, qk_dtype = deep_gemm.int8_mqa_logits, torch.int8
         output_dtypes = (torch.float32, torch.bfloat16)
 
-    for heads in (32, 64):
+    for heads in ((8, 32, 64) if is_ppu1v5_device() else (32, 64)):
         q = torch.randint(-8, 9, (nq, heads, dim), device='cuda').to(torch.float32).to(qk_dtype)
         k = torch.randint(-8, 9, (nk, dim), device='cuda').to(torch.float32).to(qk_dtype)
         scales = torch.rand(nk, device='cuda') / 64 + 1 / 128
@@ -363,6 +369,20 @@ def test_paged_mqa_logits_loop():
     ]
     if is_ppu1v5_device():
         cases.append('PagedMqaLogits,data_type:fp4,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192')
+        # Seven queries in one request cross the H8 six-query group boundary.
+        cases.append('PagedMqaLogits,data_type:fp8,batch_size:8,next_n:1,num_heads:8,head_dim:64,'
+                     'page_kv:128,is_varlen:1,varlen_indices:[0,0,0,0,0,0,0,1],'
+                     'context_lens:[257,0,1,63,129,128,65,0],max_context_len:257')
+        # Large-batch dumps replay an average rather than exact lengths.
+        cases.append('PagedMqaLogits,data_type:fp8,batch_size:65,next_n:1,num_heads:8,head_dim:128,'
+                     'page_kv:64,avg_context_len:4096,max_context_len:4096')
+        for heads, head_dim in ((32, 64), (64, 128)):
+            cases.append(f'PagedMqaLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:{heads},'
+                         f'head_dim:{head_dim},page_kv:32,context_pattern:[0,1,65,2049],max_context_len:2049')
+    dtype = 'fp8' if is_ppu1v5_device() else 'int8'
+    for heads in (32, 64):
+        cases.append(f'PagedMqaLogits,data_type:{dtype},batch_size:4,next_n:1,num_heads:{heads},'
+                     'head_dim:128,page_kv:64,varlen_indices:[0,0,1,1],context_lens:[129,1,0,65],max_context_len:129')
     for case in cases:
         if is_ppu1v5_device() and 'data_type:int8' in case:
             continue
@@ -384,7 +404,42 @@ def test_paged_mqa_logits_loop():
         case = 'PagedMqaLogits,data_type:int8,batch_size:8,next_n:1,num_heads:32,head_dim:128,pre_distribution:[4090,0,1,0,1],distribution:[4090,0,1,0,1,100,200,300]'
         set_acc_check(False)
         test_paged_mqa_logits(parse_deepgemm_string_re(case))
+    test_fp8_paged_mqa_logits_h8_graph_replay()
     print("Passed\n")
+
+
+def test_fp8_paged_mqa_logits_h8_graph_replay():
+    if not is_ppu1v5_device():
+        return
+    page_size, max_context_len = 64, 65
+    q = torch.ones((3, 1, 8, 128), device='cuda').to(torch.float8_e4m3fn)
+    weights = torch.arange(1, 25, device='cuda', dtype=torch.float32).view(3, 8)
+    keys = torch.zeros((4, page_size, 1, 128), device='cuda')
+    keys[..., 0] = torch.tensor([448, 896, 1792, 3584], device='cuda').view(4, 1, 1)
+    cache = kv_cache_cast_to_fp8(keys)
+    indices = torch.tensor([0, 0, 1], device='cuda', dtype=torch.int32)
+    lengths = torch.ones((3, 1), device='cuda', dtype=torch.int32)
+    table = torch.tensor([[0, 1], [0, 1], [2, 3]], device='cuda', dtype=torch.int32)
+
+    def run():
+        meta = deep_gemm.get_paged_mqa_logits_metadata(
+            lengths, page_size, deep_gemm.get_num_sms(), indices=indices, metadata_extra=(1, 8, 128, q.dtype))
+        return deep_gemm.fp8_paged_mqa_logits(q, cache, weights, lengths, table, meta, max_context_len, indices=indices)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        logits = run()
+    # Move the middle query to the other request and extend the last query across a page boundary.
+    indices[1] = 1
+    table[1].copy_(table[2])
+    lengths.copy_(lengths.new_tensor([[0], [33], [65]]))
+    logits.fill_(float('nan'))
+    graph.replay()
+    expected = ref_paged_mqa_logits(q.float(), keys, weights, lengths, table, max_context_len)
+    valid = torch.arange(max_context_len, device='cuda') < lengths
+    torch.testing.assert_close(logits[valid], expected[valid], rtol=0, atol=0)
+    assert torch.isnan(logits[0]).all()
 
 
 def _run_mqa_avg_cases(prefill_cases, paged_cases):

@@ -5,60 +5,144 @@
 
 namespace deep_gemm {
 
+// Grouped FP8 uses contiguous query rows within a request. Workers start on
+// group boundaries, so a bounded forward scan also handles the final tail.
+template <uint32_t GroupQ>
+__device__ __forceinline__ uint32_t paged_mqa_group_size(
+        const uint32_t* indices, uint32_t row, uint32_t nq) {
+    static_assert(GroupQ > 0 && GroupQ < 32);
+    const uint32_t id = __ldg(indices + row);
+    const uint32_t available = min(GroupQ, nq - row);
+    // Read the small window independently. The sentinel ends a tail with no ID change.
+    uint32_t boundaries = 1u << available;
+    #pragma unroll
+    for (uint32_t i = 1; i < GroupQ; ++i) {
+        const uint32_t next_id = __ldg(indices + row + min(i, available - 1));
+        boundaries |= static_cast<uint32_t>(next_id != id) << i;
+    }
+    return __ffs(boundaries) - 1;
+}
+
+__device__ __forceinline__ uint32_t paged_mqa_group_context(
+        const uint32_t* lengths, uint32_t row, uint32_t count) {
+    uint32_t length = 0;
+    for (uint32_t i = 0; i < count; ++i)
+        length = max(length, __ldg(lengths + row + i));
+    return length;
+}
+
 // The C++ JIT emits its own `extern "C" __global__` entry that forwards here.
-template <uint32_t SPLIT_KV, uint32_t kNumSMs>
+template <uint32_t SPLIT_KV, uint32_t kNumSMs, uint32_t GroupQ = 0>
 __device__ __forceinline__
 void smxx_paged_mqa_logits_metadata_device(const uint32_t batch_size, const uint32_t next_n,
-                                          const uint32_t* context_lens, uint32_t* schedule_metadata) {
+                                          const uint32_t* context_lens, uint32_t* schedule_metadata,
+                                          const uint32_t* indices = nullptr) {
     extern __shared__ uint32_t prefix_sum[];
     const uint32_t tid = threadIdx.x;
 
-    // load context lens (2D indexing: take last token's context_len per request)
-    for (uint32_t k = tid; k < batch_size; k += blockDim.x) {
-        prefix_sum[k] = math::ceil_div(__ldg(context_lens + k * next_n + next_n - 1), SPLIT_KV);
+    if constexpr (GroupQ != 0) {
+        for (uint32_t q = tid; q < batch_size; q += blockDim.x)
+            prefix_sum[q] = 0;
+        __syncthreads();
+        // A run head owns its group's task counts. Interior rows contribute
+        // zero so the same prefix scan emits flattened group starts.
+        for (uint32_t q = tid; q < batch_size; q += blockDim.x) {
+            const uint32_t id = __ldg(indices + q);
+            if (q > 0 && __ldg(indices + q - 1) == id)
+                continue;
+            for (uint32_t row = q; row < batch_size && __ldg(indices + row) == id; row += GroupQ) {
+                const uint32_t count = paged_mqa_group_size<GroupQ>(indices, row, batch_size);
+                prefix_sum[row] = math::ceil_div(paged_mqa_group_context(context_lens, row, count), SPLIT_KV);
+                if (count < GroupQ)
+                    break;
+            }
+        }
+    } else {
+        for (uint32_t q = tid; q < batch_size; q += blockDim.x)
+            prefix_sum[q] = math::ceil_div(__ldg(context_lens + q * next_n + next_n - 1), SPLIT_KV);
     }
     __syncthreads();
 
-    // calculate prefix sum
+    // Grouped launches use whole warps. Scan within each warp, then
+    // carry its total to the following warps and chunks.
     uint32_t sum = 0;
-    uint32_t* temp_prefix_sum = prefix_sum;
-    uint32_t loop_num = batch_size / blockDim.x;
-    for (uint32_t k = 0; k < loop_num; k++) {
-        uint32_t val = temp_prefix_sum[tid];
-        for (uint32_t offset = 1; offset < blockDim.x; offset <<= 1) {
-            uint32_t temp = 0;
-            if (tid >= offset) {
-                temp = temp_prefix_sum[tid - offset];
+    if constexpr (GroupQ != 0) {
+        const uint32_t lane = tid % 32, warp = tid / 32;
+        const uint32_t warps = blockDim.x / 32;
+        const auto warp_prefix_sum = [lane](uint32_t value) {
+            #pragma unroll
+            for (int offset = 1; offset < 32; offset <<= 1) {
+                const uint32_t previous = __shfl_up_sync(0xffffffffu, value, offset);
+                if (lane >= offset)
+                    value += previous;
+            }
+            return value;
+        };
+        for (uint32_t base = 0; base < batch_size; base += blockDim.x) {
+            const uint32_t row = base + tid;
+            const uint32_t val = warp_prefix_sum(row < batch_size ? prefix_sum[row] : 0);
+            // Reuse the first entries of this chunk for warp totals after
+            // every lane has loaded its input. Only live warps need a slot.
+            const uint32_t live_warps = min(warps, math::ceil_div(batch_size - base, 32u));
+            __syncthreads();
+            if (lane == 31 && warp < live_warps)
+                prefix_sum[base + warp] = val;
+            __syncthreads();
+            if (warp == 0) {
+                const uint32_t total = warp_prefix_sum(lane < live_warps ? prefix_sum[base + lane] : 0);
+                if (lane < live_warps)
+                    prefix_sum[base + lane] = total;
             }
             __syncthreads();
+            const uint32_t before = warp && warp < live_warps ? prefix_sum[base + warp - 1] : 0;
+            const uint32_t chunk = prefix_sum[base + live_warps - 1];
+            __syncthreads();
+            if (row < batch_size)
+                prefix_sum[row] = sum + before + val;
+            sum += chunk;
+        }
+        __syncthreads();
+    } else {
+        // calculate prefix sum
+        uint32_t* temp_prefix_sum = prefix_sum;
+        uint32_t loop_num = batch_size / blockDim.x;
+        for (uint32_t k = 0; k < loop_num; k++) {
+            uint32_t val = temp_prefix_sum[tid];
+            for (uint32_t offset = 1; offset < blockDim.x; offset <<= 1) {
+                uint32_t temp = 0;
+                if (tid >= offset) {
+                    temp = temp_prefix_sum[tid - offset];
+                }
+                __syncthreads();
+                val += temp;
+                temp_prefix_sum[tid] = val;
+                // Publish this round before other warps read it in the next round.
+                __syncthreads();
+            }
+            temp_prefix_sum[tid] += sum;
+            __syncthreads();
+            sum = temp_prefix_sum[blockDim.x - 1];
+            temp_prefix_sum += blockDim.x;
+        }
+        // blockDim.x < 1024: only last loop
+        uint32_t last = batch_size - loop_num * blockDim.x;
+        uint32_t val = (tid < last) ? temp_prefix_sum[tid] : 0;
+        for (uint32_t offset = 1; offset < last; offset <<= 1) {
+            uint32_t temp = (tid >= offset && tid < last) ? temp_prefix_sum[tid - offset] : 0;
+            __syncthreads();
             val += temp;
-            temp_prefix_sum[tid] = val;
-            // Publish this round before other warps read it in the next round.
+            if (tid < last) {
+                temp_prefix_sum[tid] = val;
+            }
+            // All threads must participate, including those outside the tail.
             __syncthreads();
         }
-        temp_prefix_sum[tid] += sum;
-        __syncthreads();
-        sum = temp_prefix_sum[blockDim.x - 1];
-        temp_prefix_sum += blockDim.x;
-    }
-    // blockDim.x < 1024: only last loop
-    uint32_t last = batch_size - loop_num * blockDim.x;
-    uint32_t val = (tid < last) ? temp_prefix_sum[tid] : 0;
-    for (uint32_t offset = 1; offset < last; offset <<= 1) {
-        uint32_t temp = (tid >= offset && tid < last) ? temp_prefix_sum[tid - offset] : 0;
-        __syncthreads();
-        val += temp;
         if (tid < last) {
-            temp_prefix_sum[tid] = val;
+            temp_prefix_sum[tid] += sum;
         }
-        // All threads must participate, including those outside the tail.
         __syncthreads();
+        sum = prefix_sum[batch_size - 1];
     }
-    if (tid < last) {
-        temp_prefix_sum[tid] += sum;
-    }
-    __syncthreads();
-    sum = prefix_sum[batch_size - 1];
 
     // binary search
     const uint32_t& q = sum / kNumSMs, r = sum % kNumSMs;
@@ -88,27 +172,29 @@ void smxx_paged_mqa_logits_metadata_device(const uint32_t batch_size, const uint
 }
 
 
-template <uint32_t BLOCK_KV, uint32_t kNumMathWarpGroups, uint32_t kNextN>
+template <uint32_t BLOCK_KV, uint32_t kNumMathWarpGroups, uint32_t kNextN,
+          bool kSkipEmpty = false, uint32_t GroupQ = 0>
 struct PagedMQALogitsScheduler {
     uint32_t batch_size;
     const uint32_t* context_lens;
+    const uint32_t* indices;
 
     uint32_t current_q_idx, current_kv_idx;
     uint32_t end_q_idx, end_kv_idx;
     uint32_t current_num_kv;
 
     __device__ __forceinline__ explicit PagedMQALogitsScheduler(const uint32_t& batch_size, const uint32_t& sm_idx,
-                                                                const uint32_t* context_lens, const uint32_t* schedule_meta) {
-        this->batch_size = batch_size;
-        this->context_lens = context_lens;
+                                                                const uint32_t* context_lens, const uint32_t* schedule_meta,
+                                                                const uint32_t* indices = nullptr)
+        : batch_size(batch_size), context_lens(context_lens), indices(indices) {
 
         const auto& current_pack = __ldg(reinterpret_cast<const uint2*>(schedule_meta) + sm_idx);
         const auto& end_pack = __ldg(reinterpret_cast<const uint2*>(schedule_meta) + sm_idx + 1);
         current_q_idx = current_pack.x, current_kv_idx = current_pack.y * kNumMathWarpGroups;
         end_q_idx = end_pack.x, end_kv_idx = end_pack.y * kNumMathWarpGroups;
 
-        uint32_t idx = current_q_idx * kNextN + kNextN - 1;
-        current_num_kv = current_q_idx < batch_size ? math::ceil_div(__ldg(this->context_lens + idx), BLOCK_KV) : 0;
+        current_num_kv = current_q_idx < batch_size ? math::ceil_div(
+            context_len(current_q_idx), BLOCK_KV) : 0;
     }
 
     __device__ __forceinline__ bool fetch_next_task(uint32_t &q_idx, uint32_t &kv_idx, uint32_t &num_kv) {
@@ -120,14 +206,59 @@ struct PagedMQALogitsScheduler {
             return false;
 
         current_kv_idx += kNumMathWarpGroups;
-        if (current_kv_idx >= current_num_kv) {
-            ++ current_q_idx;
+        const bool advance_q = current_kv_idx >= current_num_kv;
+        if (GroupQ != 0 ? __builtin_expect(advance_q, false) : advance_q) {
+            current_q_idx = next_q_idx(current_q_idx);
             current_kv_idx = 0;
-            uint32_t idx = current_q_idx * kNextN + kNextN - 1;
-            current_num_kv = current_q_idx < batch_size ? math::ceil_div(__ldg(this->context_lens + idx), BLOCK_KV) : 0;
+            current_num_kv = current_q_idx < batch_size ? math::ceil_div(
+                context_len(current_q_idx), BLOCK_KV) : 0;
         }
 
         return true;
+    }
+
+    __device__ __forceinline__ uint32_t group_size(uint32_t row) const {
+        if constexpr (GroupQ != 0)
+            return paged_mqa_group_size<GroupQ>(indices, row, batch_size);
+        return 1;
+    }
+
+    __device__ __forceinline__ uint32_t context_len(uint32_t row) const {
+        if constexpr (GroupQ != 0)
+            return paged_mqa_group_context(context_lens, row, group_size(row));
+        const uint32_t idx = row * kNextN + kNextN - 1;
+        return __ldg(context_lens + idx);
+    }
+
+    __device__ __forceinline__ uint32_t next_q_idx(uint32_t q_idx) const {
+        q_idx += group_size(q_idx);
+        if constexpr (GroupQ != 0) {
+            while (q_idx < end_q_idx) {
+                const uint32_t count = group_size(q_idx);
+                if (paged_mqa_group_context(context_lens, q_idx, count) != 0)
+                    break;
+                q_idx += count;
+            }
+        } else if constexpr (kSkipEmpty) {
+            // H8 metadata assigns no KV tasks to empty requests. Keep the
+            // scheduler and Q lookahead on the same next nonempty request.
+            if (__builtin_expect(q_idx < end_q_idx &&
+                    context_len(q_idx) == 0, false)) {
+                // All lanes enter together. Scan long empty runs a warp at a
+                // time; the usual adjacent nonempty request stays scalar.
+                const uint32_t lane = threadIdx.x % 32;
+                while (q_idx < end_q_idx) {
+                    const uint32_t candidate = q_idx + lane;
+                    const bool live = candidate < end_q_idx &&
+                        context_len(candidate) != 0;
+                    const uint32_t mask = __ballot_sync(0xffffffffu, live);
+                    if (mask != 0)
+                        return q_idx + __ffs(mask) - 1;
+                    q_idx = min(q_idx + 32, end_q_idx);
+                }
+            }
+        }
+        return q_idx;
     }
 
     __device__ __forceinline__ bool exist_q_idx(const uint32_t& q_idx) const {

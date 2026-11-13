@@ -52,7 +52,9 @@ static void check_indexer_head_dim(int storage_head_dim, bool is_fp4) {
 // Shared head-count policy for nonpaged and paged compute entry points.
 static void check_indexer_num_heads(int num_heads, torch::ScalarType qk_dtype, bool is_avg) {
     if (not is_avg) {
-        TORCH_CHECK(num_heads == 32 or num_heads == 64, "DSA requires num_heads=32 or 64");
+        TORCH_CHECK(num_heads == 32 or num_heads == 64 or
+                    (num_heads == 8 and qk_dtype == torch::kFloat8_e4m3fn),
+                    "DSA indexer requires num_heads=32/64, or FP8 num_heads=8");
     } else if (qk_dtype == torch::kFloat8_e4m3fn) {
         TORCH_CHECK(num_heads == 4, "FP8 AVG requires num_heads=4");
     } else {
@@ -83,10 +85,8 @@ static void check_row_indices(const std::optional<torch::Tensor>& indices,
                 indices->scalar_type() == torch::kInt32 and indices->is_contiguous() and
                 indices->device() == context_lens.device(),
                 "indices must be contiguous int32 [Q] on context_lens.device");
-    // Consecutive equal request IDs permit FP4 DSA Q-block/KV reuse. Their
-    // per-query block-table rows must name the same KV mapping. Legacy
-    // two-column metadata continues to schedule each expanded Q independently.
-    // The caller guarantees that the last row of each run has its largest context.
+    // Consecutive equal IDs share a logical-to-physical page mapping.
+    // Weighted MXFP4 also requires the run's maximum length in its last row.
 }
 
 // Compatibility stub: dense PPU logits do not use scheduling metadata.
@@ -241,7 +241,8 @@ static torch::Tensor mqa_logits_common(const torch::Tensor& q, const torch::Tens
 //   block_table:    int32 [batch_size, max_block_len]
 //   schedule_meta:  opaque int32 metadata from `get_paged_mqa_logits_metadata`;
 //                   two columns, one row per CTA plus an end sentinel.
-//   max_context_len: maximum context length
+//   max_context_len: output capacity; caller guarantees every context_lens entry
+//                    is in [0, max_context_len]
 //   clean_logits:   whether to mask out-of-range logits with -inf (unsupported here, see below)
 //   logits_dtype:   output logits dtype, float32 or bfloat16
 //   q_sf:           UE8M0 scale for Q (FP4 only), int32 [batch, next_n, num_heads].
@@ -256,6 +257,7 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
     TORCH_CHECK(not clean_logits, "clean_logits=True is not supported on PPU");
     const bool is_fp4 = q_sf.has_value();
     check_indexer_arch(q.scalar_type(), is_fp4);
+    TORCH_CHECK(max_context_len >= 0, "max_context_len must be nonnegative");
     const auto qk_dtype = q.scalar_type();
     const auto& [batch_size, next_n, num_heads, head_dim] = get_shape<4>(q);
     const bool is_int8_avg = is_avg and not is_fp4 and q.scalar_type() == torch::kInt8;
@@ -306,7 +308,6 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
         DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::kUInt8);
     }
 
-    // Output and reduction mode. H4/H8 tiles are reserved for AVG.
     DG_HOST_ASSERT(logits_dtype == torch::kFloat32 or logits_dtype == torch::kBFloat16);
     if (is_avg) {
         if (is_int8_avg) {
@@ -480,18 +481,14 @@ torch::Tensor get_paged_mqa_logits_metadata(
     const auto& [n, h, d, qk_dtype] = *metadata_extra;
     TORCH_CHECK(n == context_lens.size(1), "metadata_extra next_n must match context_lens");
     TORCH_CHECK(h == 4 or h == 8 or h == 32 or h == 64,
-                "metadata_extra num_heads must be 4/8 (AVG) or 32/64 (DSA)");
-    const bool is_avg = h == 4 or h == 8;
+                "metadata_extra num_heads must be 4, 8, 32 or 64");
     const auto arch = get_ppu_arch();
-    if (is_avg) {
-        if (arch == AC_PPU0010) {
-            TORCH_CHECK(d == 128, "INT8 AVG metadata requires head_dim=128");
-            TORCH_CHECK(not indices.has_value(), "INT8 AVG metadata does not support indices");
-        }
-        if (h == 8)
-            TORCH_CHECK(qk_dtype == torch::kInt8, "H8 AVG metadata requires MXFP4 on M890 or INT8 on 810E");
-    } else {
-        TORCH_CHECK(n == 1, "DSA metadata requires next_n == 1");
+    const bool is_avg = h == 4 or (h == 8 and qk_dtype == torch::kInt8);
+    TORCH_CHECK(is_avg or n == 1, "weighted paged metadata requires next_n == 1");
+    const bool is_fp4_weighted = arch == AC_PPU0015 and qk_dtype == torch::kInt8 and not is_avg;
+    if (is_avg and arch == AC_PPU0010) {
+        TORCH_CHECK(d == 128, "INT8 AVG metadata requires head_dim=128");
+        TORCH_CHECK(not indices.has_value(), "INT8 AVG metadata does not support indices");
     }
     TORCH_CHECK((arch == AC_PPU0010 and qk_dtype == torch::kInt8) or
                 (arch == AC_PPU0015 and (qk_dtype == torch::kInt8 or qk_dtype == torch::kFloat8_e4m3fn)),
@@ -501,7 +498,7 @@ torch::Tensor get_paged_mqa_logits_metadata(
                 "metadata_extra requires logical head_dim=64 or 128");
     TORCH_CHECK(not (arch == AC_PPU0015 and qk_dtype == torch::kInt8) or d == 128,
                 "M890 MXFP4 metadata_extra requires logical head_dim=128, not packed head_dim=64");
-    TORCH_CHECK(arch != AC_PPU0015 or qk_dtype != torch::kInt8 or is_avg or indices.has_value(),
+    TORCH_CHECK(not is_fp4_weighted or indices.has_value(),
                 "MXFP4 paged metadata requires per-query request indices for weighted logits");
     // shared memory limit
     TORCH_CHECK(batch_size > 0 and batch_size <= 65536, "batch_size must be in [1, 65536]");
@@ -515,10 +512,11 @@ torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q, const torch::Tensor& 
                                    int max_context_len, bool clean_logits = false,
                                    const std::optional<torch::Tensor>& indices = std::nullopt) {
     TORCH_CHECK(not clean_logits, "clean_logits=True is not supported on PPU");
-    TORCH_CHECK(not indices.has_value(), "legacy FP8 does not support request indices");
     TORCH_CHECK(q.scalar_type() == torch::kFloat8_e4m3fn, "legacy FP8 requires e4m3 Q");
+    check_row_indices(indices, context_lens);
     return paged_mqa_logits_common(q, kv_cache, checked_weights(weights, q, torch::kFloat32),
-                                   context_lens, block_table, schedule_meta, max_context_len, false, torch::kFloat32);
+                                   context_lens, block_table, schedule_meta, max_context_len, false,
+                                   torch::kFloat32, /*is_avg=*/false, std::nullopt, indices);
 }
 
 torch::Tensor int8_paged_mqa_logits(const torch::Tensor& q, const torch::Tensor& kv_cache,
@@ -527,13 +525,13 @@ torch::Tensor int8_paged_mqa_logits(const torch::Tensor& q, const torch::Tensor&
                                     int max_context_len, bool clean_logits = false,
                                     const std::optional<torch::Tensor>& indices = std::nullopt) {
     TORCH_CHECK(not clean_logits, "clean_logits=True is not supported on PPU");
-    TORCH_CHECK(not indices.has_value(), "legacy INT8 does not support request indices");
+    check_row_indices(indices, context_lens);
     TORCH_CHECK(q.scalar_type() == torch::kInt8, "legacy INT8 requires int8 Q");
     const auto logits_dtype = weights.scalar_type();
     TORCH_CHECK(logits_dtype == torch::kFloat32 or logits_dtype == torch::kBFloat16,
                 "INT8 weights must be float32 or bfloat16");
     return paged_mqa_logits_common(q, kv_cache, checked_weights(weights, q, logits_dtype),
-                                   context_lens, block_table, schedule_meta, max_context_len, false, logits_dtype);
+                                   context_lens, block_table, schedule_meta, max_context_len, false, logits_dtype, /*is_avg=*/false, std::nullopt, indices);
 }
 
 torch::Tensor fp8_fp4_paged_mqa_logits(const std::pair<torch::Tensor, std::optional<torch::Tensor>>& q,
