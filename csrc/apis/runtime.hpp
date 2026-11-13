@@ -19,7 +19,7 @@ static void register_apis(pybind11::module_& m) {
         device_runtime->set_num_sms(new_num_sms);
     });
     m.def("get_num_sms", [&]() {
-        return device_runtime->get_num_sms();
+       return device_runtime->get_num_sms();
     });
     m.def("set_tc_util", [&](const int& new_tc_util) {
         device_runtime->set_tc_util(new_tc_util);

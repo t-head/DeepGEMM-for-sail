@@ -106,13 +106,7 @@ def call_test_func(gemm_type, func_args):
     if gemm_type in supported_call_funcs.keys():
         test_func = supported_call_funcs[gemm_type]
         judge_device_type()
-        # Each caselist case starts from the same automatic CU selection as a
-        # fresh process, including when checkin reuses a worker after a failure.
-        deep_gemm.set_num_sms(0)
-        try:
-            return test_func(func_args)
-        finally:
-            deep_gemm.set_num_sms(0)
+        return test_func(func_args)
     else:
         raise ValueError(f"Unsupported test function: {gemm_type}")
 
