@@ -1486,7 +1486,11 @@ def test_dense_gemm_runtime_lut(args):
     with tempfile.TemporaryDirectory(prefix='deepgemm_lut_') as directory:
         table = Path(directory) / f'{torch.cuda.get_device_name()}_bf16_densegemm.lut'
         env = dict(os.environ, SAIL_DEEPGEMM_LUT_PATH=directory, show_log='1')
-        env['PYTHONPATH'] = str(Path(__file__).resolve().parent) + os.pathsep + env.get('PYTHONPATH', '')
+        # Reuse the parent's installed/editable package. Running `python -c`
+        # from the checkout would otherwise prefer source files without _C.
+        env['PYTHONPATH'] = os.pathsep.join((str(Path(__file__).resolve().parent),
+                                             str(Path(deep_gemm.__file__).resolve().parent.parent),
+                                             env.get('PYTHONPATH', '')))
         program = ('import pickle, sys; import utils; '
                    'args, check, mode, backend = pickle.load(sys.stdin.buffer); '
                    'utils.set_ref_backend(backend); '
@@ -1496,7 +1500,7 @@ def test_dense_gemm_runtime_lut(args):
             table.write_text(row)
             payload = pickle.dumps((dict(case, **overrides), get_acc_check(),
                                     deep_gemm.get_compile_mode(), get_ref_backend()))
-            result = subprocess.run([sys.executable, '-c', program], input=payload, env=env,
+            result = subprocess.run([sys.executable, '-c', program], input=payload, env=env, cwd=directory,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
             log = result.stdout.decode(errors='replace')
             print(f'Runtime LUT regression: {name}\n{log}', flush=True)
