@@ -722,6 +722,11 @@ Weight preparation selects the format from the raw weight dtype.
 See [MegaMoE APIs](deep_gemm/mega/__init__.py) for parameter details and
 [test_mega_moe.py](tests/test_mega_moe.py) for a complete example.
 
+SM80 INT8 uses copy launch-completion events (LCE) outside Graph capture by
+default (`DG_MEGAMOE_USE_LCE=1`). Set `0` to disable LCE or `2` to enable it
+during capture as well. For `2`, warm up the workspace with LCE enabled before
+capture. Graph replays retain the LCE setting used during capture.
+
 #### HyperConnection (HC) prenorm GEMM
 
 We provide a HyperConnection (HC) prenorm GEMM that fuses the prenorm square-sum reduction into a TF32 GEMM. Call `deep_gemm.tf32_hc_prenorm_gemm` with a BF16 input `a`, a TF32 weight `b`, and it produces the TF32 output `d` together with the per-row square sum `sqr_sum` used by the subsequent normalization. The K-split configuration is selected automatically based on the K dimension.

@@ -34,7 +34,7 @@ DECL_LAZY_HGGC_DRIVER_FUNCTION(hgStreamSetAttributeAD);
 struct CopyStreamResources {
     int device;
     hggcStream_t copy = nullptr;
-    hggcEvent_t fork = nullptr, done = nullptr;
+    hggcEvent_t fork = nullptr, done = nullptr, launched = nullptr;
 
     explicit CopyStreamResources(int device_) : device(device_) {
         try {
@@ -59,6 +59,7 @@ struct CopyStreamResources {
         int previous = device;
         if (hggcGetDevice(&previous) != hggcSuccess || hggcSetDevice(device) != hggcSuccess)
             return;
+        if (launched) hggcEventDestroy(launched);
         hggcEventDestroy(done);
         hggcEventDestroy(fork);
         hggcStreamDestroy(copy);
@@ -237,12 +238,24 @@ extern "C" __global__ __launch_bounds__({}) void megamoe_int8_dispatch_copy(
     }
 
     static void launch_on_stream(const std::shared_ptr<KernelRuntime>& runtime, const Args& args,
-                                 hggcStream_t stream) {
+                                 hggcStream_t stream, hggcEvent_t launch_event = nullptr) {
         if (is_compile_only())
             return;
         const auto& launch = args.launch_args;
         auto config = construct_launch_config(runtime->kernel, stream, launch.smem_size,
                                               launch.grid_dim, launch.block_dim);
+        LaunchAttrHandle attr{};
+        if (launch_event) {
+#if HGGCRT_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
+            attr.id = hggcLaunchAttributeLaunchCompletionEvent;
+            attr.val.launchCompletionEvent.event = launch_event;
+#else
+            attr.id = HG_LAUNCH_ATTRIBUTE_LAUNCH_COMPLETION_EVENT;
+            attr.value.launchCompletionEvent.event = reinterpret_cast<HGevent>(launch_event);
+#endif
+            config.attrs = &attr;
+            config.numAttrs = 1;
+        }
         if (get_env<int>("DG_JIT_DEBUG"))
             printf("Launch kernel with {%d, %d} x %d  %d, shared memory: %d bytes, stream: %ld\n",
                    launch.grid_dim.x, launch.grid_dim.y, launch.block_dim.x, launch.block_dim.y,
@@ -339,12 +352,26 @@ static void launch_int8_split_stage1(typename Runtime::Args& args, int num_sms, 
         return;
 
     const auto caller = current_stream();
+    const int lce_mode = get_env<int>("DG_MEGAMOE_USE_LCE", 1);
+    hggcStreamCaptureStatus capture = hggcStreamCaptureStatusNone;
+    if (lce_mode != 0)
+        DG_HGGC_RUNTIME_CHECK(hggcStreamIsCapturing(caller, &capture));
+    const bool use_lce = lce_mode != 0 && (lce_mode == 2 || capture == hggcStreamCaptureStatusNone);
+    if (use_lce && !streams.launched) {
+        TORCH_CHECK(capture == hggcStreamCaptureStatusNone,
+                    "Warm up this MegaMoE workspace with LCE enabled before forcing LCE during Graph capture");
+        DG_HGGC_RUNTIME_CHECK(hggcEventCreateWithFlags(&streams.launched, hggcEventDisableTiming));
+    }
+    const auto launch_event = use_lce ? streams.launched : nullptr;
     // Both streams wait for the caller's inputs. GEMM consumes copy stripes
     // through device-ready flags; join copy before reusing the workspace.
     DG_HGGC_RUNTIME_CHECK(hggcEventRecord(streams.fork, caller));
     DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(streams.copy, streams.fork, 0));
     try {
-        Int8MegaMoECopyRuntime::launch_on_stream(copy, copy_args, streams.copy);
+        Int8MegaMoECopyRuntime::launch_on_stream(copy, copy_args, streams.copy, launch_event);
+        // LCE gates GEMM admission; device-ready flags still guard copied data.
+        if (launch_event)
+            DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(caller, launch_event, 0));
         mega::launch_profiled<Runtime>(compute, args, info);
         DG_HGGC_RUNTIME_CHECK(hggcEventRecord(streams.done, streams.copy));
         DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(caller, streams.done, 0));
