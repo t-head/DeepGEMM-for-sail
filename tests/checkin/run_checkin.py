@@ -22,7 +22,15 @@ import xml.etree.ElementTree as ET
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUITES = {'ZW-810E': 'checkin_810e.list', 'ZW-M890P': 'checkin_890p.list'}
 SCRIPT_SUITES = {
-    'ZW-M890P-MegaMoE': ['-m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py'],
+    'ZW-M890P-MegaMoE': [
+        '-m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py',
+        '-m pytest -q -s --disable-warnings -x '
+        'tests/test_mega_gate.py::test_mega_gate_scoring_modes '
+        'tests/test_mega_gate.py::test_mega_gate_sigmoid_infinite_logits '
+        'tests/test_mega_gate.py::test_mega_gate_sigmoid_routing_controls '
+        'tests/test_mega_gate.py::test_mega_gate_sigmoid_partial_scores '
+        'tests/test_mega_gate.py::test_mega_gate_api_contract',
+    ],
 }
 _worker_context = threading.local()
 
@@ -279,7 +287,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.suite in SCRIPT_SUITES:
         if args.phase == 'compile':
-            parser.error('MegaMoE runs compilation and correctness together; use --phase all or run')
+            parser.error('Script suites run compilation and correctness together; use --phase all or run')
         cases = SCRIPT_SUITES[args.suite]
         if args.list:
             print('\n'.join(f'{i}: {sys.executable} {spec}' for i, spec in enumerate(cases, 1)))

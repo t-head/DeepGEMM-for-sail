@@ -52,9 +52,10 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   SwiGLU, STEP, SwiGLU-OAI and SiTU on every backend, separate replica banks
   and reusable library-owned communication state.
 
-- **Mega Gate**: adds `bf16_mega_gate`, fusing BF16 routing GEMM,
-  sqrt-softplus scoring, bias-aware Top-k selection, weight normalization
-  and scaling, and optional logical-to-physical expert mapping.
+- **Mega Gate**: adds `bf16_mega_gate`, fusing BF16 routing GEMM, bias-aware
+  Top-k selection, weight normalization and scaling, and optional
+  logical-to-physical expert mapping. The default is `scoring_func="sqrtsoftplus"`.
+  GLM-5.3 uses `scoring_func="sigmoid"`.
 
 ### Changed
 

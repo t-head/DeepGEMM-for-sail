@@ -6,6 +6,7 @@
 #include <math.h>
 #include <deep_gemm/impls/activation_arguments.hpp>
 #include <deep_gemm/tix/cp_async.cuh>
+#include <deep_gemm/tix/utils.cuh>
 
 namespace deep_gemm {
 template<bool Clamp, bool Step = false>
@@ -137,6 +138,63 @@ __device__ void activation_tiled(const ActivationParams& p) {
         }
     }
 }
+} // namespace deep_gemm
+
+namespace deep_gemm {
+// FP32 activations are rounded once when stored to the BF16 scratch.
+// Quantize each complete row with truncation; input dispatch uses nearest-even.
+template <int Intermediate, int Threads = 256, bool WarpRows = false>
+__device__ __forceinline__ void int8_quant_activated(
+        const __ppu_bfloat16* input, int8_t* output, float* scales, const uint32_t* rows) {
+    constexpr int RowThreads = WarpRows ? 32 : Threads;
+    constexpr int Vector = WarpRows ? 8 : 1;
+    constexpr int RowGroups = Threads / RowThreads;
+    static_assert(Threads % 32 == 0 && Intermediate % (RowThreads * Vector) == 0);
+    __shared__ float warp_max[Threads / 32];
+    const uint32_t lane = threadIdx.x % RowThreads;
+    const uint32_t group = threadIdx.x / RowThreads;
+    const uint32_t count = *rows;
+    for (uint32_t row = blockIdx.x * RowGroups + group; row < count; row += gridDim.x * RowGroups) {
+        float values[Intermediate / RowThreads];
+        float amax = 1.0e-10f;
+        #pragma unroll
+        for (int i = 0; i < Intermediate / (RowThreads * Vector); ++i) {
+            const uint64_t offset = uint64_t(row) * Intermediate + (i * RowThreads + lane) * Vector;
+            int4 packed;
+            if constexpr (WarpRows) packed = *reinterpret_cast<const int4*>(input + offset);
+            const auto* source = WarpRows ? reinterpret_cast<const __ppu_bfloat16*>(&packed) : input + offset;
+            #pragma unroll
+            for (int j = 0; j < Vector; ++j) {
+                values[i * Vector + j] = __bfloat162float(source[j]);
+                amax = fmaxf(amax, fabsf(values[i * Vector + j]));
+            }
+        }
+        if constexpr (WarpRows) {
+            #pragma unroll
+            for (int offset = 16; offset; offset >>= 1)
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+        } else {
+            amax = tix::block_reduce_max<Threads>(amax, warp_max, 1.0e-10f);
+        }
+        const float scale = amax / 127.0f;
+        if (lane == 0) scales[row] = scale;
+        #pragma unroll
+        for (int i = 0; i < Intermediate / (RowThreads * Vector); ++i) {
+            const uint64_t offset = uint64_t(row) * Intermediate + (i * RowThreads + lane) * Vector;
+            uint2 packed{};
+            auto* target = WarpRows ? reinterpret_cast<int8_t*>(&packed) : output + offset;
+            #pragma unroll
+            for (int j = 0; j < Vector; ++j) {
+                const float quantized = values[i * Vector + j] / scale;
+                target[j] = static_cast<int8_t>(fminf(127.0f, fmaxf(-128.0f, quantized)));
+            }
+            if constexpr (WarpRows) *reinterpret_cast<uint2*>(output + offset) = packed;
+        }
+        // A later CTA-wide row may reuse warp_max only after all warps consumed it.
+        if constexpr (!WarpRows) __syncthreads();
+    }
+}
+
 } // namespace deep_gemm
 
 namespace deep_gemm {

@@ -77,7 +77,8 @@ static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weig
         const std::optional<torch::Tensor>& bias, const std::optional<torch::Tensor>& image_bias,
         const std::optional<torch::Tensor>& image_token_mask, const std::optional<torch::Tensor>& mask,
         const std::optional<torch::Tensor>& fix_routing_mask, const std::optional<torch::Tensor>& force_random,
-        const mega_gate_layout::RoutingArgs& routing, int tokens, int hidden, int experts, int topk, bool single_producer = false) {
+        const mega_gate_layout::RoutingArgs& routing, int tokens, int hidden, int experts, int topk,
+        bool use_sigmoid, bool single_producer = false) {
     using namespace mega_gate_layout;
     DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16u == 0u);
     DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16u == 0u);
@@ -104,12 +105,14 @@ static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weig
     args.block_tokens = m;
     args.warp_n = wn;
     args.warp_m = wm;
-    args.features = (mask ? 1 : 0) | (force_random ? 2 : 0) | (fix_routing_mask ? 4 : 0) |
-        (bias ? 8 : 0) | (image_token_mask ? 16 : 0) | (routing.num_shared_experts ? 32 : 0);
+    args.features = (mask ? kTokenMask : 0) | (force_random ? kForceRandom : 0) |
+        (fix_routing_mask ? kFixRouting : 0) | (bias ? kExpertBias : 0) |
+        (image_token_mask ? kImageTokenMask : 0) | (routing.num_shared_experts ? kSharedExperts : 0) |
+        (use_sigmoid ? kSigmoidScore : 0);
     // Devices or CU budgets that cannot hold a producer group use one CTA per token tile.
     if (producers > 1 and !cooperative) {
         ppu_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
-                          routing, tokens, hidden, experts, topk, true);
+                          routing, tokens, hidden, experts, topk, use_sigmoid, true);
         return;
     }
     auto kernel = compiler->build("ppu_bf16_mega_gate", PPUMegaGateRuntime::generate(args));
@@ -125,7 +128,7 @@ static void ppu_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& weig
             const int resident_groups = std::min(blocks, capacity / producers);
             if (resident_groups == 0) {
                 ppu_bf16_mega_gate(x, weight, bias, image_bias, image_token_mask, mask, fix_routing_mask, force_random,
-                                  routing, tokens, hidden, experts, topk, true);
+                                  routing, tokens, hidden, experts, topk, use_sigmoid, true);
                 return;
             }
             args.launch_args.grid_dim = dim3(resident_groups * producers);

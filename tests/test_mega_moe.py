@@ -1,4 +1,4 @@
-r"""PPU MXFP4 MegaMoE public-entry correctness and regression tests.
+r"""PPU INT8/MXFP4 MegaMoE public-entry correctness and regression tests.
 
 Single rank:
     python tests/test_mega_moe.py --case smoke_swiglu --num-tokens 33
@@ -40,7 +40,6 @@ if __name__ == "__main__":
 
 import deep_gemm
 from deep_gemm.testing import calc_diff
-from utils import is_ppu1v5_device
 from test_activation import situ_reference
 
 
@@ -68,7 +67,15 @@ class MegaMoECase:
     situ_linear_beta: float | None = None
     activation_alpha: float | None = None
 
+    @property
+    def mma_type(self):
+        return "int8xint8" if self.precision == "int8_channelwise" else "fp4xfp4"
+
     def require_world(self):
+        arch = torch.cuda.get_device_capability()
+        expected = (8, 0) if self.precision == "int8_channelwise" else (8, 9)
+        if arch != expected:
+            pytest.skip(f"{self.precision} MegaMoE requires SM{expected[0]}{expected[1]}")
         world = dist.get_world_size()
         if world not in self.worlds:
             pytest.skip(f"{self.name} requires EP{self.worlds}; launched EP{world}")
@@ -97,6 +104,15 @@ CASES = (
     MegaMoECase("qwen38_2_4t", 8192, 2048, 512, 10, 4096, tokens=MODEL_TOKENS, worlds=(8, 16)),
     MegaMoECase("mimo_v26_pro", 6144, 2048, 384, 8, 8192, tokens=(*MODEL_TOKENS, 8192), worlds=(8,)),
 )
+
+
+# Both formats use the same public pipeline, distributed checks and Graph replay.
+INT8_CASES = tuple(replace(case, name=case.name + "_int8", precision="int8_channelwise")
+                   for case in CASES if case.name.startswith("smoke"))
+
+
+def _mega_moe_entry(case):
+    return deep_gemm.int8_int8_mega_moe if case.precision == "int8_channelwise" else deep_gemm.fp4_fp4_mega_moe
 
 
 # Input generation and independent mathematical references.
@@ -138,7 +154,11 @@ def _dequantize_mxfp4(quant_tensor, scale, target_dtype=torch.float32):
     return out_padded[..., :k].to(target_dtype)
 
 
-def _make_weights(experts, n, k, amplitude, rng):
+def _make_weights(experts, n, k, amplitude, rng, precision="w4a4"):
+    if precision == "int8_channelwise":
+        weights = torch.randint(-8, 9, (experts, n, k), dtype=torch.int8, device="cuda", generator=rng)
+        scales = (torch.rand(experts, n, device="cuda", generator=rng) + 1) * (amplitude / 16)
+        return weights, scales
     # Bound temporary quantization memory for model-sized expert matrices.
     packed, scales = [], []
     for _ in range(experts):
@@ -202,15 +222,22 @@ def _reference_activation(projection, case):
 
 def _reference_mega_moe(case, source, ids, weights, l1_weights_raw, l2_weights_raw,
                         num_tokens, checked, *, quantization_aware=True, projection_dtype=torch.float32):
-    """Independent MoE with MXFP4 weights and optional activation quantization.
+    """Independent distributed MoE reference with format-specific quantization.
 
-    The FP32 diagnostic retains the supplied MXFP4 weights: it measures activation
-    quantization/rounding error, not accuracy against an unquantized model.
+    INT8 retains FP32 projection/activation arithmetic, stores BF16 results and truncates the
+    post-activation values; input dispatch uses nearest-even quantization.
+    The optional FP4 diagnostic omits activation quantization.
     """
     c = case
     rank_idx, num_ranks = dist.get_rank(), dist.get_world_size()
     num_experts_per_rank = case.experts // num_ranks
-    if quantization_aware:
+    int8 = case.precision == "int8_channelwise"
+    if int8:
+        inputs = source[:checked].float()
+        amax = inputs.abs().amax(-1).clamp_min(1e-6)
+        x = _all_gather((inputs * (127.0 / amax[:, None])).round().clamp(-127, 127))
+        input_scales = _all_gather(amax * (1.0 / 127.0))
+    elif quantization_aware:
         q, scales = _quantize_mxfp4(source[:checked])
         x = _all_gather(_dequantize_mxfp4(q, scales))
     else:
@@ -222,13 +249,21 @@ def _reference_mega_moe(case, source, ids, weights, l1_weights_raw, l2_weights_r
         src, tok, slot = torch.where(all_ids == rank_idx * num_experts_per_rank + expert)
         if not src.numel():
             continue
-        projection = x[src, tok] @ _dequantize_mxfp4(l1_weights[expert], l1_weights_sf[expert]).t()
-        activated = _reference_activation(projection.to(projection_dtype), c)
         route_weights = all_weights[src, tok, slot, None]
-        if quantization_aware:
-            q, scales = _quantize_mxfp4(activated)
-            activated = _dequantize_mxfp4(q, scales)
-        y = activated @ _dequantize_mxfp4(l2_weights[expert], l2_weights_sf[expert]).t()
+        if int8:
+            projection = ((x[src, tok] @ l1_weights[expert].float().t())
+                          * input_scales[src, tok, None] * l1_weights_sf[expert])
+            activated = _reference_activation(projection, c).bfloat16().float()
+            scales = activated.abs().amax(-1).clamp_min(1e-10) / 127
+            q = (activated / scales[:, None]).clamp(-128, 127).to(torch.int8)
+            y = (q.float() @ l2_weights[expert].float().t()) * scales[:, None] * l2_weights_sf[expert]
+        else:
+            projection = x[src, tok] @ _dequantize_mxfp4(l1_weights[expert], l1_weights_sf[expert]).t()
+            activated = _reference_activation(projection.to(projection_dtype), c)
+            if quantization_aware:
+                q, scales = _quantize_mxfp4(activated)
+                activated = _dequantize_mxfp4(q, scales)
+            y = activated @ _dequantize_mxfp4(l2_weights[expert], l2_weights_sf[expert]).t()
         if quantization_aware:
             y = y.bfloat16()
         y = y.float() * route_weights
@@ -252,8 +287,8 @@ def _process_group(request=None):
     if not torch.cuda.is_available():
         raise RuntimeError("requires a PPU runtime")
     torch.cuda.set_device(int(os.getenv("LOCAL_RANK", "0")))
-    if not is_ppu1v5_device():
-        message = "MegaMoE requires PPU1.5"
+    if torch.cuda.get_device_capability() not in ((8, 0), (8, 9)):
+        message = "MegaMoE requires PPU SM80 or SM89"
         if request is not None:
             pytest.skip(message)
         raise RuntimeError(message)
@@ -306,6 +341,13 @@ def _compile_kernels(*calls):
         deep_gemm.set_compile_mode(previous)
 
 
+def _pre_dispatch(source, ids, weights, buffer):
+    deep_gemm.mega_moe_pre_dispatch(
+        source, ids, weights, buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
+        num_tokens=source.shape[0], group_size=0 if buffer.mma_type == "int8xint8" else 32,
+        mma_type=buffer.mma_type)
+
+
 def _check_workspace_options(case, group):
     """All failures must occur before collective symmetric allocation."""
 
@@ -315,32 +357,34 @@ def _check_workspace_options(case, group):
     with patch("torch.distributed._symmetric_memory.empty",
                side_effect=AssertionError("overflow must fail before allocation")) as allocate:
         for factory in (deep_gemm.get_symm_buffer_for_mega_moe, deep_gemm.SymmBuffer):
-            with pytest.raises(RuntimeError, match="kNumMaxCopyBlocks"):
-                factory(oversized_group, num_experts=1024, num_max_tokens_per_rank=1 << 23,
-                        num_topk=16, hidden=case.hidden, intermediate_hidden=case.intermediate)
+            with pytest.raises(RuntimeError, match="protocol's indexing limits"):
+                factory(oversized_group, num_experts=1024, num_max_tokens_per_rank=(1 << 17) + 16,
+                        num_topk=1, hidden=case.hidden, intermediate_hidden=case.intermediate,
+                        mma_type=case.mma_type)
         allocate.assert_not_called()
 
     with patch("torch.distributed._symmetric_memory.empty",
                side_effect=AssertionError("expert limit must fail before allocation")) as allocate:
         for factory in (deep_gemm.get_symm_buffer_for_mega_moe, deep_gemm.SymmBuffer):
-            with pytest.raises(RuntimeError, match="experts <="):
+            with pytest.raises(RuntimeError, match="experts.*protocol capacity"):
                 factory(SimpleNamespace(size=lambda: 1), num_experts=2049,
-                        num_max_tokens_per_rank=1, num_topk=2, hidden=case.hidden, intermediate_hidden=case.intermediate)
+                        num_max_tokens_per_rank=1, num_topk=2, hidden=case.hidden,
+                        intermediate_hidden=case.intermediate, mma_type=case.mma_type)
         allocate.assert_not_called()
 
     options = dict(num_experts=case.experts, num_max_tokens_per_rank=case.capacity,
                    num_topk=case.topk, hidden=case.hidden, activation=case.activation,
-                   intermediate_hidden=case.intermediate)
-    invalid = [({"mma_type": "unsupported"}, "mma_type_str"),
-               ({"mma_type": "bf16xbf16"}, "mma_kind"),
-               ({"mma_type": "mxf4xmxf4"}, "mma_type_str"),
-               ({"mma_type": "fp8xmxfp4"}, "mma_type_str"),
-               ({"mma_type": "bf16xmxfp4"}, "mma_type_str"),
+                   intermediate_hidden=case.intermediate, mma_type=case.mma_type)
+    invalid = [({"mma_type": "unsupported"}, "Unsupported MegaMoE mma_type"),
+               ({"mma_type": "bf16xbf16"}, "Unsupported MegaMoE mma_type"),
+               ({"mma_type": "mxf4xmxf4"}, "Unsupported MegaMoE mma_type"),
+               ({"mma_type": "fp8xmxfp4"}, "Unsupported MegaMoE mma_type"),
+               ({"mma_type": "bf16xmxfp4"}, "Unsupported MegaMoE mma_type"),
                ({"activation": "unsupported"}, "Unsupported MegaMoE activation"),
                ({"intermediate_hidden": 127}, "intermediate"),
                ({"hidden": case.hidden + 1}, "hidden"),
                ({"num_topk": 33}, "topk"),
-               ({"num_max_tokens_per_rank": 0}, "num_max_tokens_per_rank > 0")]
+               ({"num_max_tokens_per_rank": 0}, "capacity must be positive")]
     invalid.append(({"num_shared_experts": 1}, "shared experts"))
     for legacy in ({"gemm1_block_n": 256}, {"gemm1_block_k": 128}, {"config_override": {}},
                    {"gemm1_config": (64, 256, 128, 32, 64, 3)},
@@ -357,15 +401,14 @@ def _check_workspace_options(case, group):
 def _check_public_entry(entry, y, l1_weights, l2_weights, sym_buffer, source, ids, weights, **options):
     """Reject malformed calls before advancing the collective compute protocol."""
 
-    deep_gemm.mega_moe_pre_dispatch(
-        source, ids, weights,
-        sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-        num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
+    int8 = sym_buffer.mma_type == "int8xint8"
+    _pre_dispatch(source, ids, weights, sym_buffer)
     with pytest.raises((ValueError, RuntimeError), match="Unsupported MegaMoE activation"):
         entry(y, l1_weights, l2_weights, sym_buffer, **{**options, "activation": "unsupported"})
     for changed, message in (
-        ({"recipe": (128, 128, 128)}, "rk == 32"),
-        ({"recipe": (1, 1, 16)}, "rk == 32"),
+        ({"recipe": (128, 128, 128)}, "recipe=" if int8 else "rk == 32"),
+        ({"recipe": (1, 1, 32 if int8 else 0)}, "recipe=" if int8 else "rk == 32"),
+        ({"recipe": (1, 1, 16)}, "recipe=" if int8 else "rk == 32"),
         ({"activation_clamp": float("nan")}, "activation_clamp"),
         ({"activation_clamp": -1.0}, "activation_clamp"),
         ({"activation_clamp": -float("inf")}, "activation_clamp"),
@@ -380,69 +423,55 @@ def _check_public_entry(entry, y, l1_weights, l2_weights, sym_buffer, source, id
     if num_experts_per_rank > 1:
         invalid_stats.append(torch.zeros(2 * num_experts_per_rank, device=y.device, dtype=torch.int32)[::2])
     for stats in invalid_stats:
-        with pytest.raises(RuntimeError, match="cumulative_local_expert_recv_stats"):
+        with pytest.raises(RuntimeError, match="Invalid MegaMoE tensor" if int8 else "cumulative_local_expert_recv_stats"):
             entry(y, l1_weights, l2_weights, sym_buffer,
                   **{**options, "cumulative_local_expert_recv_stats": stats})
-    with pytest.raises(RuntimeError, match="numel"):
+    with pytest.raises(RuntimeError, match="Invalid MegaMoE tensor shape" if int8 else "numel"):
         entry(y, l1_weights, l2_weights, sym_buffer,
               **{**options, "cumulative_local_expert_recv_stats": torch.zeros(
                   num_experts_per_rank + 1, device=y.device, dtype=torch.int32)})
-    with pytest.raises(RuntimeError, match="y.scalar_type"):
+    with pytest.raises(RuntimeError, match="Invalid MegaMoE tensor" if int8 else "y.scalar_type"):
         entry(y.float(), l1_weights, l2_weights, sym_buffer, **options)
     bad_w2 = (l2_weights[0][:, :-1].contiguous(), l2_weights[1])
-    with pytest.raises(RuntimeError, match="y.size"):
+    with pytest.raises(ValueError if int8 else RuntimeError, match="weight shape" if int8 else "y.size"):
         entry(y, l1_weights, bad_w2, sym_buffer, **options)
-    for scale, message in ((l2_weights[1].float(), "sf.scalar_type"),
-                           (l2_weights[1][:, :, :-1].contiguous(), "sf.size")):
+    for scale, message in (
+        (l2_weights[1].to(torch.float64 if int8 else torch.float32),
+         "Invalid MegaMoE tensor" if int8 else "sf.scalar_type"),
+        (l2_weights[1][..., :-1].contiguous(), "Invalid MegaMoE tensor shape" if int8 else "sf.size"),
+    ):
         with pytest.raises(RuntimeError, match=message):
             entry(y, l1_weights, (l2_weights[0], scale), sym_buffer, **options)
     for name in ("l1_weights_replicas", "l2_weights_replicas"):
-        with pytest.raises(RuntimeError, match="must be provided together"):
+        with pytest.raises(TypeError if int8 else RuntimeError, match=name if int8 else "must be provided together"):
             entry(y, l1_weights, l2_weights, sym_buffer, **options, **{name: l1_weights})
 
 
 def _check_input_views(entry, y, l1_weights, l2_weights, sym_buffer, source, ids, weights, **options):
     """Exercise SGLang input views and positional compute calls."""
     ids = ids.to(torch.int32)
-    deep_gemm.mega_moe_pre_dispatch(
-        source, ids, weights,
-        sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-        num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
+    _pre_dispatch(source, ids, weights, sym_buffer)
     entry(y, l1_weights, l2_weights, sym_buffer, **options)
     expected = y.clone()
     # The common argument order matches SM90; PPU extensions remain keyword-only.
-    deep_gemm.mega_moe_pre_dispatch(
-        source, ids, weights,
-        sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-        num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
-    entry(y, l1_weights, l2_weights, sym_buffer, None, (1, 1, 32),
+    _pre_dispatch(source, ids, weights, sym_buffer)
+    recipe = (1, 1, 0 if sym_buffer.mma_type == "int8xint8" else 32)
+    entry(y, l1_weights, l2_weights, sym_buffer, None, recipe,
           options["activation"], options["activation_clamp"], options["fast_math"])
     torch.testing.assert_close(y, expected, rtol=0, atol=0)
     if options.get("fast_math", True):
         default_options = {name: value for name, value in options.items() if name != "fast_math"}
-        deep_gemm.mega_moe_pre_dispatch(
-            source, ids, weights,
-            sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-            num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
+        _pre_dispatch(source, ids, weights, sym_buffer)
         entry(y, l1_weights, l2_weights, sym_buffer, **default_options)
         torch.testing.assert_close(y, expected, rtol=0, atol=0)
-    deep_gemm.mega_moe_pre_dispatch(
-        source[:0], ids[:0], weights[:0],
-        sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-        num_tokens=0, group_size=32, mma_type="fp4xfp4")
+    _pre_dispatch(source[:0], ids[:0], weights[:0], sym_buffer)
     entry(y[:0], l1_weights, l2_weights, sym_buffer, **options)
-    deep_gemm.mega_moe_pre_dispatch(
-        source, ids, weights,
-        sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-        num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
+    _pre_dispatch(source, ids, weights, sym_buffer)
     entry(y, l1_weights, l2_weights, sym_buffer, **options)
     torch.testing.assert_close(y, expected, rtol=0, atol=0)
     _check_offset_views(entry, l1_weights, l2_weights, sym_buffer, source, ids, weights, **options)
     def direct():
-        deep_gemm.mega_moe_pre_dispatch(
-            source, ids, weights,
-            sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-            num_tokens=source.shape[0], group_size=32, mma_type="fp4xfp4")
+        _pre_dispatch(source, ids, weights, sym_buffer)
         entry(y, l1_weights, l2_weights, sym_buffer, **options)
         return y
 
@@ -479,9 +508,7 @@ def _check_recv_stats(pipeline, y, routing_ids, routing_weights, num_experts):
             torch.testing.assert_close(y, baseline, rtol=0, atol=0)
         torch.cuda.synchronize()
         dist.barrier()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            pipeline(stats)
+        graph, _ = _capture_pipeline(lambda: pipeline(stats), warmup=pipeline)
         # Capture records work; only actual launches may increment the counters.
         torch.testing.assert_close(stats, expected_stats, rtol=0, atol=0)
         hot = (torch.arange(routing_ids.size(1), device=y.device) +
@@ -508,10 +535,7 @@ def _check_offset_views(entry, l1_weights, l2_weights, sym_buffer, source, ids, 
     """Offset views must match aligned complete calls without touching their guards."""
 
     def forward(input_tensor, y):
-        deep_gemm.mega_moe_pre_dispatch(
-            input_tensor, ids, weights,
-            sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-            num_tokens=input_tensor.shape[0], group_size=32, mma_type="fp4xfp4")
+        _pre_dispatch(input_tensor, ids, weights, sym_buffer)
         entry(y, l1_weights, l2_weights, sym_buffer, **options)
         return y
 
@@ -554,16 +578,25 @@ def _check_offset_views(entry, l1_weights, l2_weights, sym_buffer, source, ids, 
     check_guards(output_storage, output_offset)
 
 
+def _capture_pipeline(pipeline, *, warmup=None):
+    """Warm stream-local launch resources before capturing the complete call."""
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            (pipeline if warmup is None else warmup)()
+    capture_stream.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        result = pipeline()
+    return graph, result
+
+
 def _check_graph_replay(pipeline, expected, *, input_tensor=None, routing_weights=None, routing_ids=None,
                        check_reference=None, num_experts=None):
     """Recycle state through public calls with changing inputs and routes."""
-    for _ in range(3):
-        pipeline()
-    torch.cuda.synchronize()
-    dist.barrier()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        result = pipeline()
+    graph, result = _capture_pipeline(pipeline)
 
     rank, world = dist.get_rank(), dist.get_world_size()
     check_peers = num_experts is not None and world > 1
@@ -703,9 +736,7 @@ def _check_mega_moe(case, source, requested, pipeline, reference, *, check=True,
             if routing_weights is not None:
                 report["correctness"]["routing_weight_replay_checked"] = True
         else:
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                replayed = pipeline()
+            graph, replayed = _capture_pipeline(pipeline)
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(replayed, actual, rtol=0, atol=0)
@@ -724,10 +755,10 @@ def _check_mega_moe(case, source, requested, pipeline, reference, *, check=True,
 # End-to-end correctness driver: setup -> public complete call -> reference.
 
 
-@pytest.fixture
+@pytest.fixture(params=[CASES[0], INT8_CASES[0]], ids=lambda case: case.precision)
 def mega_moe_smoke(mega_moe_group, request):
     """One small public pipeline shared by API and state-reuse regressions."""
-    case = replace(getattr(request, "param", CASES[0]), tokens=(33,))
+    case = replace(request.param, tokens=(33,))
     case.require_world()
     rank, world = dist.get_rank(), dist.get_world_size()
     rng = torch.Generator(device="cuda").manual_seed(20261016 + rank)
@@ -738,25 +769,22 @@ def mega_moe_smoke(mega_moe_group, request):
     ids[count:], weights[count:] = -1, 0
     if count:
         ids[0, 0] = -1
-    w1_raw = _make_weights(case.experts // world, 2 * case.intermediate, case.hidden, .5, rng)
-    w2_raw = _make_weights(case.experts // world, case.hidden, case.intermediate, .125, rng)
+    w1_raw = _make_weights(case.experts // world, 2 * case.intermediate, case.hidden, .5, rng, case.precision)
+    w2_raw = _make_weights(case.experts // world, case.hidden, case.intermediate, .125, rng, case.precision)
     if case.experts // world > 1:
         # Include externally replicated slots in the public state/statistics tests.
         _replicate_physical_expert(w1_raw)
         _replicate_physical_expert(w2_raw)
     w1, w2 = deep_gemm.transform_weights_for_mega_moe(w1_raw, w2_raw)
     buffer = deep_gemm.SymmBuffer(mega_moe_group, case.experts, case.capacity, case.topk,
-                                 case.hidden, case.intermediate)
+                                 case.hidden, case.intermediate, mma_type=case.mma_type)
     x, routed_ids, routed_weights = source[:count], ids[:count], weights[:count]
     y = torch.empty_like(x)
     options = dict(activation=case.activation, activation_clamp=case.clamp, fast_math=True)
 
-    def pipeline(stats=None):
-        deep_gemm.mega_moe_pre_dispatch(
-            x, routed_ids, routed_weights,
-            buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
-            num_tokens=x.shape[0], group_size=32, mma_type="fp4xfp4")
-        deep_gemm.fp4_fp4_mega_moe(y, w1, w2, buffer, stats, **options)
+    def pipeline(stats=None, *, workspace=buffer, **overrides):
+        _pre_dispatch(x, routed_ids, routed_weights, workspace)
+        _mega_moe_entry(case)(y, w1, w2, workspace, stats, **{**options, **overrides})
         return y
 
     def reference(checked, clamp=case.clamp):
@@ -775,19 +803,21 @@ def test_mega_moe_smoke_api(mega_moe_smoke, mega_moe_group):
     sample = mega_moe_smoke
     _check_workspace_options(sample.case, mega_moe_group)
     transform = deep_gemm.transform_weights_for_mega_moe
-    with pytest.raises(TypeError, match="weight, raw UE8M0 scale"):
+    with pytest.raises(TypeError, match="weight, scale"):
         transform(sample.w1_raw[0], sample.w2_raw)
-    with pytest.raises(ValueError, match="rank-3"):
+    with pytest.raises(ValueError, match="weight or scale rank"):
         transform((sample.w1_raw[0][0], sample.w1_raw[1]), sample.w2_raw)
-    with pytest.raises(TypeError, match="raw uint8 scales"):
-        transform((sample.w1_raw[0], sample.w1_raw[1].float()), sample.w2_raw)
-    _check_public_entry(deep_gemm.fp4_fp4_mega_moe, sample.y, sample.w1, sample.w2, sample.buffer,
+    scale_dtype = torch.float64 if sample.case.precision == "int8_channelwise" else torch.float32
+    with pytest.raises(TypeError, match="FP32 channel scales|raw uint8 scales"):
+        transform((sample.w1_raw[0], sample.w1_raw[1].to(scale_dtype)), sample.w2_raw)
+    _check_public_entry(_mega_moe_entry(sample.case), sample.y, sample.w1, sample.w2, sample.buffer,
                         sample.x, sample.ids, sample.weights, **sample.options)
     # A valid call must still work after rejected arguments.
     _check_mega_moe(sample.case, sample.x, 33, sample.pipeline, sample.reference,
                     workspace=sample.buffer, verbose=False)
 
 
+@pytest.mark.parametrize("mega_moe_smoke", [CASES[0]], indirect=True, ids=["w4a4"])
 @pytest.mark.parametrize("mma_type", ("fp4xfp4", "mxfp4xmxfp4"))
 @pytest.mark.parametrize("factory", (deep_gemm.SymmBuffer, deep_gemm.get_symm_buffer_for_mega_moe),
                          ids=("constructor", "factory"))
@@ -816,7 +846,7 @@ def test_mega_moe_smoke_stateful(mega_moe_smoke):
     if dist.get_world_size() < 2:
         pytest.skip("state-reuse regression requires at least two ranks")
     _compile_kernels(sample.pipeline)
-    _check_input_views(deep_gemm.fp4_fp4_mega_moe, sample.y, sample.w1, sample.w2, sample.buffer,
+    _check_input_views(_mega_moe_entry(sample.case), sample.y, sample.w1, sample.w2, sample.buffer,
                        sample.x, sample.ids, sample.weights, **sample.options)
     _check_recv_stats(sample.pipeline, sample.y, sample.ids, sample.weights, sample.case.experts)
     _check_mega_moe(sample.case, sample.x, 33, sample.pipeline, sample.reference,
@@ -836,18 +866,18 @@ def test_mega_moe_smoke_workspace(mega_moe_smoke, mega_moe_group):
     with patch.object(symm_mem, "empty", side_effect=AssertionError("base allocated storage")), \
          patch.object(symm_mem, "rendezvous", side_effect=AssertionError("base registered again")), \
          patch.object(torch, "empty", side_effect=AssertionError("base allocated storage")):
-        alias = deep_gemm.SymmBuffer(*arguments, 0, "fp4xfp4", "swiglu", base)
+        alias = deep_gemm.SymmBuffer(*arguments, 0, case.mma_type, "swiglu", base)
     assert alias.buffer is base.buffer and alias.handle is base.handle
     torch.testing.assert_close(alias.buffer, saved, rtol=0, atol=0)
     for view in (alias.x, alias.x_sf, alias.topk_idx, alias.topk_weights):
         span = 1 + sum((size - 1) * stride for size, stride in zip(view.shape, view.stride()))
         assert base.buffer.data_ptr() <= view.data_ptr()
         assert view.data_ptr() + span * view.element_size() <= base.buffer.data_ptr() + base.buffer.nbytes
-    with pytest.raises(RuntimeError, match=r"required\.tokens <= owner\.tokens"):
+    with pytest.raises(RuntimeError, match="view exceeds allocation staging capacity"):
         deep_gemm.SymmBuffer(group, case.experts, base.num_max_tokens_per_rank * 2, case.topk,
-                            case.hidden, case.intermediate, base=base)
-    with pytest.raises(AssertionError, match="invalid symmetric buffer"):
-        deep_gemm.SymmBuffer(SimpleNamespace(size=group.size), *arguments[1:], base=base)
+                            case.hidden, case.intermediate, mma_type=case.mma_type, base=base)
+    with pytest.raises(ValueError, match="same group and device"):
+        deep_gemm.SymmBuffer(SimpleNamespace(size=group.size), *arguments[1:], mma_type=case.mma_type, base=base)
     # The positional constructor/factory order follows upstream. EP1 must not
     # enter the symmetric allocator; EP>1 registers exactly this one allocation.
     if group.size() == 1:
@@ -855,57 +885,56 @@ def test_mega_moe_smoke_workspace(mega_moe_smoke, mega_moe_group):
              patch.object(symm_mem, "rendezvous", side_effect=AssertionError("EP1 rendezvous")), \
              patch.object(torch, "empty", wraps=torch.empty) as allocate:
             with pytest.warns(DeprecationWarning, match="use_fp8_dispatch"):
-                fresh = deep_gemm.get_symm_buffer_for_mega_moe(*arguments, 0, False, "fp4xfp4", "swiglu")
+                fresh = deep_gemm.get_symm_buffer_for_mega_moe(*arguments, 0, False, case.mma_type, "swiglu")
         assert allocate.call_count == 1
     else:
         with patch.object(symm_mem, "empty", wraps=symm_mem.empty) as allocate, \
              patch.object(symm_mem, "rendezvous", wraps=symm_mem.rendezvous) as register:
             with pytest.warns(DeprecationWarning, match="use_fp8_dispatch"):
-                fresh = deep_gemm.get_symm_buffer_for_mega_moe(*arguments, 0, False, "fp4xfp4", "swiglu")
+                fresh = deep_gemm.get_symm_buffer_for_mega_moe(*arguments, 0, False, case.mma_type, "swiglu")
         assert allocate.call_count == register.call_count == 1
     fresh.destroy()
-    with pytest.raises(AssertionError, match="invalid symmetric buffer"):
-        deep_gemm.SymmBuffer(*arguments, base=fresh)
+    with pytest.raises(ValueError, match="workspace has been destroyed"):
+        deep_gemm.SymmBuffer(*arguments, mma_type=case.mma_type, base=fresh)
     with pytest.raises(AssertionError):
-        deep_gemm.get_symm_buffer_for_mega_moe(*arguments, use_fp8_dispatch=True)
+        deep_gemm.get_symm_buffer_for_mega_moe(*arguments, mma_type=case.mma_type, use_fp8_dispatch=True)
     # Destroying one Python owner must not invalidate another live alias.
     base.destroy()
-    deep_gemm.mega_moe_pre_dispatch(
-        sample.x, sample.ids, sample.weights,
-        alias.x, alias.x_sf, alias.topk_idx, alias.topk_weights,
-        num_tokens=sample.x.shape[0], group_size=32, mma_type="fp4xfp4")
-    deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, alias, **sample.options)
+    sample.pipeline(workspace=alias)
     torch.testing.assert_close(sample.y, expected, rtol=0, atol=0)
     alias.destroy()
 
 
-@pytest.mark.parametrize("mega_moe_smoke", [replace(CASES[0], intermediate=1024)], indirect=True, ids=["I1024"])
+@pytest.mark.parametrize("mega_moe_smoke", [replace(case, intermediate=1024) for case in (CASES[0], INT8_CASES[0])],
+                         indirect=True, ids=lambda case: case.precision + "_I1024")
 def test_mega_moe_smoke_workspace_dimensions(mega_moe_smoke, mega_moe_group):
     sample = mega_moe_smoke
     case = sample.case
     args = (mega_moe_group, case.experts, case.capacity, case.topk, case.hidden)
-    base = deep_gemm.SymmBuffer(*args, 2048)
-    alias = deep_gemm.SymmBuffer(*args, case.intermediate, base=base)
-    assert alias.buffer is base.buffer
-    with patch.object(deep_gemm._C, "fp4_fp4_mega_moe") as native:
-        with pytest.raises(ValueError, match="workspace intermediate_hidden=2048"):
-            deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, base, **sample.options)
-        with pytest.raises(ValueError, match="workspace hidden"):
-            deep_gemm.fp4_fp4_mega_moe(sample.y[:, :case.hidden // 2], sample.w1, sample.w2, alias, **sample.options)
-        native.assert_not_called()
+    base = deep_gemm.SymmBuffer(*args, 2048, mma_type=case.mma_type)
+    alias = deep_gemm.SymmBuffer(*args, case.intermediate, mma_type=case.mma_type, base=base)
+    try:
+        assert alias.buffer is base.buffer
+        entry = _mega_moe_entry(case)
+        int8 = case.precision == "int8_channelwise"
+        with patch.object(deep_gemm._C, entry.__name__) as native:
+            with pytest.raises(ValueError, match="weight shape" if int8 else "workspace intermediate_hidden=2048"):
+                entry(sample.y, sample.w1, sample.w2, base, **sample.options)
+            native.assert_not_called()
+        with pytest.raises(RuntimeError if int8 else ValueError,
+                           match="Invalid MegaMoE tensor" if int8 else "workspace hidden"):
+            entry(sample.y[:, :case.hidden // 2].contiguous(), sample.w1, sample.w2, alias, **sample.options)
 
-    def alias_pipeline():
-        deep_gemm.mega_moe_pre_dispatch(
-            sample.x, sample.ids, sample.weights,
-            alias.x, alias.x_sf, alias.topk_idx, alias.topk_weights,
-            num_tokens=sample.x.shape[0], group_size=32, mma_type="fp4xfp4")
-        deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, alias, **sample.options)
-        return sample.y
+        def alias_pipeline():
+            return sample.pipeline(workspace=alias)
 
-    _compile_kernels(sample.pipeline, alias_pipeline)
-    expected = sample.pipeline().clone()
-    torch.testing.assert_close(alias_pipeline(), expected, rtol=0, atol=0)
-    _check_mega_moe(case, sample.x, 33, alias_pipeline, sample.reference, workspace=alias)
+        _compile_kernels(sample.pipeline, alias_pipeline)
+        expected = sample.pipeline().clone()
+        torch.testing.assert_close(alias_pipeline(), expected, rtol=0, atol=0)
+        _check_mega_moe(case, sample.x, 33, alias_pipeline, sample.reference, workspace=alias)
+    finally:
+        alias.destroy()
+        base.destroy()
 
 
 def test_mega_moe_smoke_clamp(mega_moe_smoke):
@@ -913,23 +942,15 @@ def test_mega_moe_smoke_clamp(mega_moe_smoke):
     sample = mega_moe_smoke
     outputs = {}
     for limit in (None, float("inf"), 0.0, 2.0):
-        options = {**sample.options, "activation_clamp": limit}
         def pipeline():
-            deep_gemm.mega_moe_pre_dispatch(
-                sample.x, sample.ids, sample.weights,
-                sample.buffer.x, sample.buffer.x_sf, sample.buffer.topk_idx, sample.buffer.topk_weights,
-                num_tokens=sample.x.shape[0], group_size=32, mma_type="fp4xfp4")
-            deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, sample.buffer, **options)
-            return sample.y
+            return sample.pipeline(activation_clamp=limit)
         _compile_kernels(pipeline)
         actual = pipeline().clone()
         expected = sample.reference(33, clamp=limit)
         assert actual.isfinite().all()
         assert float(calc_diff(actual, expected)) < MAX_DIFF
         outputs[limit] = actual
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            pipeline()
+        graph, _ = _capture_pipeline(pipeline)
         graph.replay()
         torch.testing.assert_close(sample.y, actual, rtol=0, atol=0)
     torch.testing.assert_close(outputs[None], outputs[float("inf")], rtol=0, atol=0)
@@ -941,11 +962,12 @@ def test_mega_moe_smoke_nan_slots(mega_moe_smoke):
     sample = mega_moe_smoke
     saved_ids, saved_weights = sample.ids.clone(), sample.weights.clone()
     saved_scale = sample.w2[1].clone()
-    # UE8M0 code 255 is NaN. This fault injection uses valid-shaped weights;
+    # MXFP4 uses UE8M0 code 255; INT8 uses FP32 NaN channel scales.
+    # This fault injection uses valid-shaped weights;
     # no private workspace offsets or test-only library entry points are needed.
     try:
         for invalid_ids in (True, False):
-            sample.w2[1].fill_(0xffff)
+            sample.w2[1].fill_(float("nan") if sample.case.precision == "int8_channelwise" else 0xffff)
             sample.ids.copy_(torch.arange(sample.case.topk, device="cuda").expand_as(sample.ids))
             sample.weights.fill_(1)
             assert sample.pipeline().isnan().all()
@@ -954,9 +976,7 @@ def test_mega_moe_smoke_nan_slots(mega_moe_smoke):
             sample.weights.zero_()
             result = sample.pipeline()
             assert torch.count_nonzero(result) == 0
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                sample.pipeline()
+            graph, _ = _capture_pipeline(sample.pipeline)
             graph.replay()
             assert torch.count_nonzero(result) == 0
     finally:
@@ -973,12 +993,12 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
     num_experts_per_rank = case.experts // num_ranks
     rng = torch.Generator(device="cuda").manual_seed(20261016 + rank_idx)
     x_bf16 = torch.randn(case.capacity, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .5
-    l1_weights_raw = _make_weights(num_experts_per_rank, 2 * case.intermediate, case.hidden, .5, rng)
-    l2_weights_raw = _make_weights(num_experts_per_rank, case.hidden, case.intermediate, .125, rng)
+    l1_weights_raw = _make_weights(num_experts_per_rank, 2 * case.intermediate, case.hidden, .5, rng, case.precision)
+    l2_weights_raw = _make_weights(num_experts_per_rank, case.hidden, case.intermediate, .125, rng, case.precision)
     l1_weights, l2_weights, replica_options = _transform_weights(
         l1_weights_raw, l2_weights_raw, case.activation, replicas)
     sym_buffer = deep_gemm.SymmBuffer(group, case.experts, case.capacity, case.topk,
-                                     case.hidden, case.intermediate, activation=case.activation)
+                                     case.hidden, case.intermediate, activation=case.activation, mma_type=case.mma_type)
     reports = []
     try:
         expected_rows = num_ranks * sym_buffer.num_max_tokens_per_rank * min(case.topk, num_experts_per_rank)
@@ -1000,8 +1020,8 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
                 deep_gemm.mega_moe_pre_dispatch(
                     x, routed_idx, routed_weights,
                     sym_buffer.x, sym_buffer.x_sf, sym_buffer.topk_idx, sym_buffer.topk_weights,
-                    num_tokens=x.shape[0], group_size=32, mma_type="fp4xfp4")
-                deep_gemm.fp4_fp4_mega_moe(
+                    num_tokens=x.shape[0], group_size=0 if case.precision == "int8_channelwise" else 32, mma_type=case.mma_type)
+                _mega_moe_entry(case)(
                     y, l1_weights, l2_weights, sym_buffer,
                     cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                     activation=case.activation, activation_clamp=case.clamp, fast_math=fast_math,
@@ -1016,7 +1036,8 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
                 workspace=sym_buffer, check=check, reference_tokens=reference_tokens,
                 replicas=replicas, edge_cases=edge_cases, verbose=False,
                 routing_weights=routed_weights, routing_ids=routed_idx,
-                high_precision_reference=lambda checked: _reference_mega_moe(
+                max_relative_l2=0.015 if case.precision == "int8_channelwise" else None,
+                high_precision_reference=None if case.precision == "int8_channelwise" else lambda checked: _reference_mega_moe(
                     case, x_bf16, topk_idx, topk_weights, l1_weights_raw, l2_weights_raw,
                     num_tokens, checked, quantization_aware=False))
             report["fast_math"] = fast_math
@@ -1028,9 +1049,57 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
     return reports
 
 
+@pytest.mark.parametrize("activation", ("swiglu", "swiglu_step", "situ", "swiglu_oai"))
+def test_mega_moe_smoke_int8_fp32_activation_bf16_scratch(activation, mega_moe_group):
+    """Keep FP32 activation inputs/math and round only the final scratch."""
+    case = replace(INT8_CASES[0], activation=activation, capacity=16,
+                   clamp=1.111 if activation == "swiglu_step" else None,
+                   situ_beta=4.0, situ_linear_beta=25.0)
+    case.require_world()
+    rank, world = dist.get_rank(), dist.get_world_size()
+    e, h, i = case.experts // world, case.hidden, case.intermediate
+    gate = torch.linspace(-3.127, 2.053, i, device="cuda")
+    up = torch.linspace(1.123, 3.077, i, device="cuda")
+    projection = torch.cat((gate, up)).unsqueeze(0)
+    w1 = torch.zeros((e, 2 * i, h), dtype=torch.int8, device="cuda")
+    w1[:, :, 0] = projection.sign().to(torch.int8)
+    s1 = projection.abs().expand(e, -1).contiguous()
+    w2 = torch.zeros((e, h, i), dtype=torch.int8, device="cuda")
+    w2[:, :, 0] = 1
+    s2 = torch.ones((e, h), device="cuda")
+    weights = deep_gemm.transform_weights_for_mega_moe((w1, s1), (w2, s2))
+    source = torch.zeros((1, h), dtype=torch.bfloat16, device="cuda")
+    source[0, 0] = 1
+    ids = torch.tensor([[rank * e, -1]], dtype=torch.int64, device="cuda")
+    routes = torch.tensor([[1.0, 0.0]], device="cuda")
+    output = torch.empty_like(source)
+    buffer = deep_gemm.SymmBuffer(mega_moe_group, case.experts, 16, 2, h, i, mma_type="int8xint8")
+    try:
+        deep_gemm.mega_moe_pre_dispatch(source, ids, routes, buffer.x, buffer.x_sf,
+            buffer.topk_idx, buffer.topk_weights, 1, group_size=0, mma_type="int8xint8")
+        deep_gemm.int8_int8_mega_moe(output, *weights, buffer, activation=activation,
+                                   activation_clamp=case.clamp, fast_math=False)
+        values = _reference_activation(projection, case).bfloat16().float()
+        scale = values.abs().amax() / 127
+        legacy = _reference_activation(projection.bfloat16().float(), case)
+        if activation == "swiglu":
+            legacy = F.silu(gate.bfloat16().float()).bfloat16().float() * up.bfloat16().float()
+        legacy_scale = legacy.bfloat16().float().abs().amax() / 127
+        torch.testing.assert_close(buffer.l2_acts_sf[0], scale, rtol=3e-6, atol=1e-10)
+        normalized = (values / scale)[0]
+        expected = normalized.clamp(-128, 127).to(torch.int8)
+        stable = (normalized.abs() - normalized.abs().round()).abs() > .03
+        legacy_q = (legacy.bfloat16().float().reshape(1, -1) / legacy_scale).clamp(-128, 127).to(torch.int8)[0]
+        assert ((expected != legacy_q) & stable).any(), "test must distinguish input rounding"
+        torch.testing.assert_close(buffer.l2_acts[0, stable], expected[stable], rtol=0, atol=0)
+        assert torch.isfinite(output).all()
+    finally:
+        buffer.destroy()
+
+
 @pytest.mark.parametrize("case,fast_math", [
     pytest.param(case, fast_math, id=case.name + ("" if fast_math else "_precise"))
-    for case in CASES
+    for case in (*CASES, *INT8_CASES)
     for fast_math in ((True, False) if case.name.startswith("smoke") else (True,))
 ])
 def test_mega_moe(case, fast_math, mega_moe_group):
@@ -1062,6 +1131,7 @@ def test_mega_moe_smoke_grouped_workspace(mega_moe_group):
     if dist.get_world_size() > 2:
         pytest.skip("grouped scratch boundary is covered by EP1/EP2")
     case = replace(CASES[0], experts=256, tokens=(1, 33))
+    case.require_world()
     _run_mega_moe(case, mega_moe_group, verbose=False)
 
 
@@ -1073,10 +1143,11 @@ def main():
         from bench_mega_moe import main as benchmark_main
         benchmark_main([arg for arg in sys.argv[1:] if arg != "--benchmark"])
         return
-    cases = CASES
+    cases = (*CASES, *INT8_CASES)
     parser = argparse.ArgumentParser(description=__doc__,
                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--case", choices=[c.name for c in cases], default=cases[0].name)
+    parser.add_argument("--precision", choices=("w4a4", "int8_channelwise"), help="override the case format")
     parser.add_argument("--hidden", type=int)
     parser.add_argument("--intermediate-hidden", type=int)
     parser.add_argument("--num-experts", type=int)
@@ -1088,14 +1159,15 @@ def main():
                         help="workspace token capacity")
     parser.add_argument("--routing", choices=("round_robin", "random", "skewed"), default="round_robin")
     parser.add_argument("--fast-math", type=int, choices=(0, 1), default=1,
-                        help="approximate GEMM1 activation math (default: 1); 0 uses expf/division/tanhf")
+                        help="SiTU division: 1 uses reciprocal multiplication (default), 0 uses FP32 division; "
+                             "both use native PPU sigmoid/tanh")
     parser.add_argument("--reference-tokens", type=int, default=0, help="check first N tokens/rank; 0 checks all")
     parser.add_argument("--replicas", action="store_true", help="test duplicated physical expert slots")
     parser.add_argument("--edge-cases", action="store_true",
                         help="include empty ranks, masked routes and staggered cross-rank replay")
     args = parser.parse_args()
     case = next(c for c in cases if c.name == args.case)
-    case = replace(case, tokens=tuple(args.tokens) if args.tokens is not None else case.tokens,
+    case = replace(case, precision=args.precision or case.precision, tokens=tuple(args.tokens) if args.tokens is not None else case.tokens,
                    capacity=args.capacity if args.capacity is not None else case.capacity, routing=args.routing,
                    hidden=args.hidden if args.hidden is not None else case.hidden,
                    intermediate=args.intermediate_hidden if args.intermediate_hidden is not None else case.intermediate,
@@ -1108,6 +1180,9 @@ def main():
     if args.reference_tokens < 0:
         parser.error("reference-tokens must be nonnegative")
     with _process_group() as group:
+        arch = (8, 0) if case.precision == "int8_channelwise" else (8, 9)
+        if torch.cuda.get_device_capability() != arch:
+            raise ValueError(f"{case.precision} MegaMoE requires SM{arch[0]}{arch[1]}")
         world = dist.get_world_size()
         if args.ep is not None and world != args.ep:
             raise ValueError(f"--ep={args.ep} requires {args.ep} launched ranks; got {world}")

@@ -498,10 +498,15 @@ cases.
 
 `deep_gemm.bf16_mega_gate` fuses the BF16 routing GEMM and MoE routing.
 Given BF16 tokens `x [T, H]` and expert weights `weight [E, H]`, it
-computes `x @ weight.T` with FP32 accumulation, applies `sqrt(softplus)`, and
+computes `x @ weight.T` with FP32 accumulation, applies the selected scoring function, and
 selects the top-K experts using the scores plus optional bias. The selected
 unbiased scores are normalized and scaled to produce routing weights; expert
 indices can optionally be mapped from logical to physical IDs.
+
+The default `scoring_func="sqrtsoftplus"` applies `sqrt(softplus(x))`.
+GLM-5.3 routers can select `scoring_func="sigmoid"`. If sigmoid scores round
+to the same FP32 value and their biases are equal, the smaller expert ID wins.
+Both scoring modes use the same BF16 GEMM backend.
 
 The outputs are INT64 indices and FP32 weights, each shaped `[T, K]`. When
 shared experts are included as routed experts, each output is `[T, K + S]`,
@@ -695,6 +700,38 @@ before sigmoid. SiTU rejects any explicit
 for SiTU divisions and post-activation FP8 quantization; `False` uses regular
 FP32 division. Both modes always use native PPU sigmoid and tanh. Input
 pre-dispatch quantization has no `fast_math` argument and is unchanged.
+
+##### SM80 INT8 MegaMoE
+
+The SM80 INT8 path uses per-token activation scales and
+per-channel weight scales. GEMM1 dequantization and all supported activations
+use FP32 without gate/up or SiLU intermediate BF16 rounding. The final activation
+is rounded once to BF16 scratch before GEMM2 input quantization.
+Post-activation INT8 quantization still truncates; GEMM2 retains BF16 scatter
+and weighted combine. The activation workspace stores BF16 values.
+This intentionally differs from Legacy's intermediate BF16 rounding; correctness
+is checked against the arithmetic described above.
+
+```python
+import deep_gemm
+
+buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
+    mma_type="int8xint8")
+l1_weights, l2_weights = deep_gemm.transform_weights_for_mega_moe(
+    (w13_int8, w13_scales), (w2_int8, w2_scales))
+
+deep_gemm.mega_moe_pre_dispatch(
+    hidden_states, topk_ids, topk_weights,
+    buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
+    num_tokens=hidden_states.shape[0], group_size=0, mma_type="int8xint8")
+deep_gemm.int8_int8_mega_moe(output, l1_weights, l2_weights, buffer)
+```
+
+Workspace allocation, weight preparation and pre-dispatch share the MXFP4 APIs.
+Weight preparation selects the format from the raw weight dtype.
+See [MegaMoE APIs](deep_gemm/mega/__init__.py) for parameter details and
+[test_mega_moe.py](tests/test_mega_moe.py) for a complete example.
 
 #### HyperConnection (HC) prenorm GEMM
 

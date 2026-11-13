@@ -52,10 +52,11 @@ python tests/run_deep_gemm.py --caselist tests/checkin/checkin_890p.list --case_
 
 For masked GEMM, the `test_m_grouped_gemm_masked->test_func:` log line contains a replayable `--format` specification with the generated expert counts, padding, scheduler hint, epilogue, clipping limit and bias setting. Pass that specification to `tests/run_deep_gemm.py --format` to repeat the same case configuration.
 
-## MegaMoE
+## MegaMoE and MegaGate
 
 The single-device suite runs the public smoke tests for SwiGLU, SwiGLU-Step
-and SiTU, including invalid inputs and workspace reuse.
+and SiTU, including invalid inputs and workspace reuse. It also runs the MegaGate
+scoring-mode, infinite-logit, and API-contract tests on the same M890P runner.
 
 ```bash
 python tests/checkin/run_checkin.py --suite ZW-M890P-MegaMoE
@@ -63,7 +64,7 @@ python tests/checkin/run_checkin.py --suite ZW-M890P-MegaMoE
 
 It compiles and executes the pipeline together, without `HGGC_WARM_UP` or the
 legacy `testcase.json`. `--phase compile` is not supported for this suite.
-Output and failures are retained in `checkin-logs/script-0001.log` and the usual
+Each command writes its own `checkin-logs/script-NNNN.log` and contributes to the usual
 JUnit report. Multi-card tests are disabled in automatic check-in because a
 runner may have only one device. On a host with two free PPU1.5 devices, run:
 

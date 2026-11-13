@@ -1,37 +1,10 @@
 #pragma once
 
 #include <type_traits>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/scheduler/mega_moe_common.cuh>
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 
 namespace deep_gemm::sched {
-
-// Tile ordering is independent of operand type and the expert-row layout.
-template <uint32_t NumNBlocks, uint32_t NumRanks, uint32_t GroupSpan = 2>
-struct MegaMoETileOrder {
-#if defined(__HGGC__)
-    CUTLASS_DEVICE static void get_block_idx(
-        uint32_t num_m_blocks, uint32_t block_idx,
-        uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        const uint32_t blocks_per_group = NumNBlocks * GroupSpan;
-        const uint32_t first = block_idx / blocks_per_group * GroupSpan;
-        const uint32_t in_group = block_idx % blocks_per_group;
-        const uint32_t rows = min(GroupSpan, num_m_blocks - first);
-        m_block_idx = first + in_group % rows;
-        n_block_idx = in_group / rows;
-        if constexpr (NumRanks == 8) {
-            if (num_m_blocks >= 16) {
-                const uint32_t bits = 32u - __clz(num_m_blocks - 1u);
-                const uint32_t input = bits >= 2 && num_m_blocks == (3u << (bits - 2))
-                    ? m_block_idx + m_block_idx / 3u : m_block_idx;
-                const uint32_t permuted = __brev(input) >> (32u - bits);
-                if (permuted < num_m_blocks)
-                    m_block_idx = permuted;
-            }
-        }
-    }
-#endif
-};
 
 // The caller owns ticket publication and retirement: ordinary fetch retires
 // operand storage first, while fused epilogues may prefetch the next ticket.
@@ -211,29 +184,6 @@ struct RoutedMegaMoEGemm1Scheduler : MegaMoEGemm1Scheduler {
 #endif
 };
 
-struct MegaMoESchedulerArguments {
-    int* grouped_layout = nullptr;
-    // Copy and compute CTAs share the same M-block metadata.
-    int* copy_grouped_layout = nullptr;
-    uint32_t shape_m = 0;
-    const uint32_t* expert_rank_prefix = nullptr;
-    uint8_t* local_fp4_buf = nullptr;
-    uint16_t* local_sfa_buf = nullptr;
-    volatile uint32_t* copy_ready_flags = nullptr;
-    uint32_t num_copy_blocks = 0;
-    layout::SymBuffer<> sym_buffer{};
-    layout::MegaMoEStaging staging{};
-    const uint8_t* dispatch_fp4 = nullptr;
-    const uint32_t* dispatch_token_topk = nullptr;
-    uint32_t* expert_base = nullptr;
-    layout::TokenSrcMetadata* src_info = nullptr;
-    int32_t* cumulative_local_expert_recv_stats = nullptr;
-
-    CUTLASS_HOST_DEVICE
-    MegaMoESchedulerArguments(uint32_t shape_m = 0, int* grouped_layout_ptr = nullptr)
-        : grouped_layout(grouped_layout_ptr), shape_m(shape_m) {}
-};
-
 // Two-stage PPU scheduler. Keep the GEMM1 tile queue and scatter traversal
 // separate from the ordinary grouped GEMM scheduler.
 template <uint32_t SHAPE_N_, uint32_t SHAPE_K_,
@@ -263,7 +213,6 @@ struct SM89MegaMoEScheduler : MegaMoEGemm1Scheduler {
     static constexpr uint32_t SHAPE_N_OUT = EpilogueTraits<
         kIsFusedDispatch ? EpilogueType::SiluAndMulPostQuantFp4 : EpilogueType::Default
     >::get_shape_n_out(SHAPE_N);
-    static constexpr uint32_t kNum1DBlocksPerGroup = !kIsFusedDispatch && kNumRanks == 8 ? 16 : 2;
 
     using Arguments = std::conditional_t<kIsFusedDispatch,
                                          MegaMoESchedulerArguments, TileSchedulerArguments>;
@@ -335,23 +284,7 @@ struct SM89MegaMoEScheduler : MegaMoEGemm1Scheduler {
                 return false;
             }
         } else {
-            uint32_t num_m_blocks;
-            while (true) {
-                if (curr_group_idx == kNumGroups) {
-                    m_block_idx = num_aligned_m_blocks;
-                    n_block_idx = kNumNBlocks;
-                    return false;
-                }
-                curr_group_m = static_cast<uint32_t>(__ldg(params.grouped_layout + curr_group_idx));
-                num_m_blocks = math::ceil_div(curr_group_m, BLOCK_M);
-                const auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
-                if (next_block_idx < current_m_block_cumsum * kNumNBlocks)
-                    break;
-                curr_group_idx ++, curr_cumsum = current_m_block_cumsum;
-                curr_cumsum_m += curr_group_m;
-            }
-            get_swizzled_block_idx(num_m_blocks, next_block_idx - curr_cumsum * kNumNBlocks,
-                                  m_block_idx, n_block_idx);
+            return fetch_scatter_work<kGroupSpan>(*this, next_block_idx, m_block_idx, n_block_idx);
         }
         return true;
     }

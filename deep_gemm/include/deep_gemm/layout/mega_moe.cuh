@@ -48,33 +48,53 @@ struct Buffer {
     }
 };
 
+// Valid routes for a token name distinct experts, including within one rank.
+__host__ __device__ constexpr int64_t max_local_routed_rows(int64_t source_tokens, int topk, int64_t local_experts) {
+    return source_tokens * (topk < local_experts ? topk : local_experts);
+}
+
+template <bool Int8>
+struct MegaMoEStorage {
+    __host__ __device__ static constexpr int64_t row_bytes(int64_t width) {
+        return Int8 ? width : width / 2;
+    }
+    __host__ __device__ static constexpr int64_t scale_bytes(int64_t width) {
+        return Int8 ? sizeof(float) : (width / 64) * sizeof(uint16_t);
+    }
+};
+
+using Int8Storage = MegaMoEStorage<true>;
+
 // Per-bank capacities inherited from the allocation owner.
 struct MegaMoEStaging {
     int64_t scales = 0, counts = 0, tokens = 0;
 
+    template <bool Int8 = false>
     __host__ __device__
     static constexpr MegaMoEStaging for_shape(int ranks, int experts, int capacity, int hidden) {
-        return {math::constexpr_align<int64_t>(int64_t(ranks) * capacity * (hidden / 64) * sizeof(uint16_t), 256),
+        return {math::constexpr_align<int64_t>(int64_t(ranks) * capacity * MegaMoEStorage<Int8>::scale_bytes(hidden), 256),
                 math::constexpr_align<int64_t>(int64_t(experts) * sizeof(uint32_t), 256),
                 math::constexpr_align<int64_t>(int64_t(experts) * capacity * sizeof(uint32_t), 256)};
     }
 };
 
-struct MegaMoEBuffer {
+template <bool Int8>
+struct MegaMoEBufferLayout {
+    using Storage = MegaMoEStorage<Int8>;
     Buffer copy_ready;
-    Buffer dispatch_counts[2], dispatch_fp4, dispatch_retire;
-    Buffer expert_base, expert_rank_prefix, grouped_layout, local_fp4, local_sfa, preprocess_ready;
-    Buffer scatter_storage, src_info, l2_acts, l2_acts_sf;
+    Buffer dispatch_counts[2], dispatch_data, dispatch_retire;
+    Buffer expert_base, expert_rank_prefix, grouped_layout, local_data, local_sfa, preprocess_ready;
+    Buffer scatter_storage, src_info, l2_acts, l2_acts_sf, activated;
     Buffer staging_scales[2], staging_counts[2], staging_tokens[2], topk_idx, topk_weights;
     MegaMoEStaging staging;
     int64_t bytes = 0, groups = 0, compact = 0, blocks = 0;
 
     __host__ __device__
-    constexpr MegaMoEBuffer(int ranks, int experts, int capacity, int topk, int hidden, int intermediate,
-                           MegaMoEStaging staging_capacity = {}) {
+    constexpr MegaMoEBufferLayout(int ranks, int experts, int capacity, int topk, int hidden, int intermediate,
+                                 MegaMoEStaging staging_capacity = {}) {
         groups = experts / ranks;
         int64_t owner = int64_t(ranks) * capacity;
-        compact = owner * (topk < groups ? topk : groups);
+        compact = max_local_routed_rows(owner, topk, groups);
         blocks = groups * ((owner + 15) / 16);
         bytes = sizeof(MegaMoESignals);
         dispatch_retire = {offsetof(MegaMoESignals, dispatch_retire), sizeof(MegaMoESignals::dispatch_retire)};
@@ -83,7 +103,7 @@ struct MegaMoEBuffer {
             dispatch_counts[p] = {static_cast<int64_t>(offsetof(MegaMoESignals, dispatch_counts) +
                 p * sizeof(MegaMoESignals::dispatch_counts[0])), sizeof(MegaMoESignals::dispatch_counts[0])};
 
-        staging = staging_capacity.scales ? staging_capacity : MegaMoEStaging::for_shape(ranks, experts, capacity, hidden);
+        staging = staging_capacity.scales ? staging_capacity : MegaMoEStaging::for_shape<Int8>(ranks, experts, capacity, hidden);
         // Token capacity bounds the full-pool BM16 flags for every alias.
         const int64_t max_copy_blocks = staging.tokens / (16 * sizeof(uint32_t));
         copy_ready = allocate(max_copy_blocks * sizeof(uint32_t));
@@ -96,20 +116,23 @@ struct MegaMoEBuffer {
         for (auto& tokens : staging_tokens)
             tokens = allocate(staging.tokens);
 
-        dispatch_fp4 = allocate(int64_t(capacity) * (hidden / 2), 16);
+        dispatch_data = allocate(int64_t(capacity) * Storage::row_bytes(hidden), 16);
         expert_base = allocate((groups + 1) * sizeof(int32_t));
         expert_rank_prefix = allocate(groups * ranks * sizeof(int32_t));
         grouped_layout = allocate(((1 + blocks) * 4 + groups) * sizeof(int32_t));
-        local_fp4 = allocate(compact * (hidden / 2));
-        const auto sfa_rows = FusedSfaPartitionLayout::row_offset(compact, groups);
-        local_sfa = allocate(sfa_rows * (hidden / 64) * sizeof(uint16_t));
+        local_data = allocate(compact * Storage::row_bytes(hidden));
+        const auto sfa_rows = Int8 ? compact : FusedSfaPartitionLayout::row_offset(compact, groups);
+        local_sfa = allocate(sfa_rows * Storage::scale_bytes(hidden));
         scatter_storage = allocate(int64_t(topk) * capacity * hidden * sizeof(uint16_t));
         src_info = allocate(compact * sizeof(TokenSrcMetadata));
-        l2_acts = allocate(compact * (intermediate / 2));
-        l2_acts_sf = allocate((intermediate / 64) * compact * sizeof(uint16_t));
+        l2_acts = allocate(compact * Storage::row_bytes(intermediate));
+        l2_acts_sf = allocate(compact * Storage::scale_bytes(intermediate));
         topk_idx = allocate(int64_t(capacity) * topk * sizeof(int64_t));
         topk_weights = allocate(int64_t(capacity) * topk * sizeof(float));
         bytes = math::constexpr_align<int64_t>(bytes, 256);
+        // INT8 computes activations in FP32, then stores BF16 rows for quantization.
+        if constexpr (Int8)
+            activated = allocate(compact * intermediate * sizeof(uint16_t));
     }
 
     int64_t get_num_bytes() const { return bytes; }
@@ -122,5 +145,8 @@ private:
         return result;
     }
 };
+
+using MegaMoEBuffer = MegaMoEBufferLayout<false>;
+using Int8MegaMoEBuffer = MegaMoEBufferLayout<true>;
 
 }  // namespace deep_gemm::layout
