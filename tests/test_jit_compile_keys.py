@@ -217,6 +217,63 @@ int gemv_checks() {
     }
     return count;
 }
+
+// NoTSM bounds/alignment specializations must participate in the actual JIT key.
+int bf16_notsm_810e_checks() {
+    using Runtime = BF16GemmCutlass3RuntimeT<cutlass::bfloat16_t>;
+    Runtime::Args args{};
+    args.launch_info = {64, 128, 64, 32, 32, 1, 3, "Normal", "Default", "test_notsm_810e", false};
+    auto& params = args.kernel_params.with_tsm;
+    params.problem_shape = cute::make_tuple(64, 512, 128, 1);
+    params.collective_epilogue_params.ptr_D = reinterpret_cast<cutlass::bfloat16_t*>(uintptr_t(0x1000));
+    params.collective_epilogue_params.stride_D = {512, cute::Int<1>{}, 32768};
+    auto config = Runtime::get_notsm_epilogue_config_810e(args, params.problem_shape, false);
+    if (!config.enabled || !config.full_tile_m || !config.full_tile_n || !config.aligned_output)
+        throw std::runtime_error("810E NoTSM complete aligned tile");
+    // This runtime uses Compiler::build's source hash, without a shortcut key.
+    const auto check_source_change = [&](auto change, const char* field, bool changes_source = true) {
+        auto other = args;
+        change(other);
+        const auto source = Runtime::generate_impl(args);
+        const auto other_source = Runtime::generate_impl(other);
+        if ((source == other_source) == changes_source ||
+            (get_hex_digest(source) == get_hex_digest(other_source)) == changes_source)
+            throw std::runtime_error(std::string(field) + ": unexpected source cache identity");
+        return 1;
+    };
+    int count = 0;
+    count += check_source_change([](auto& a) {
+        cute::get<0>(a.kernel_params.with_tsm.problem_shape) = 63;
+    }, "NoTSM M tail");
+    count += check_source_change([](auto& a) {
+        cute::get<1>(a.kernel_params.with_tsm.problem_shape) = 514;
+    }, "NoTSM N tail");
+    count += check_source_change([](auto& a) {
+        a.kernel_params.with_tsm.collective_epilogue_params.ptr_D += 1;
+    }, "NoTSM output alignment");
+    count += check_source_change([](auto& a) {
+        ++cute::get<2>(a.kernel_params.with_tsm.collective_epilogue_params.stride_D);
+    }, "NoTSM batch stride alignment");
+    count += check_source_change([](auto& a) {
+        a.kernel_params.with_tsm.collective_epilogue_params.ptr_D += 2;
+    }, "NoTSM aligned output address", false);
+    // Custom schedulers may replace the scheduler dimensions with dummy values.
+    args.epilogue_shape_m = 63;
+    args.epilogue_shape_n = 512;
+    config = Runtime::get_notsm_epilogue_config_810e(args, params.problem_shape, false);
+    if (config.full_tile_m || config.use_packed_tail_stores)
+        throw std::runtime_error("NoTSM real epilogue extent must override scheduler extent");
+    count += check_source_change([](auto& a) {
+        a.has_full_epilogue_grid = true;
+    }, "NoTSM packed M-tail stores");
+    args.launch_info.gemm_type = "MGroupedContiguous";
+    if (Runtime::get_notsm_epilogue_config_810e(args, params.problem_shape, false).enabled)
+        throw std::runtime_error("NoTSM must preserve the grouped epilogue");
+    args.launch_info.gemm_type = "Normal";
+    if (Runtime::get_notsm_epilogue_config_810e(args, params.problem_shape, true).enabled)
+        throw std::runtime_error("810E NoTSM must preserve the PPU1.5 epilogue");
+    return count;
+}
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -226,6 +283,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp8_block", fp8_checks);
     m.def("fp4", fp4_checks);
     m.def("gemv", gemv_checks);
+    m.def("bf16_notsm_810e", bf16_notsm_810e_checks);
 }
 '''
 
@@ -269,6 +327,11 @@ class CompileKeyTests(unittest.TestCase):
 
     def test_gemv_both_m_and_output_types(self):
         self.assertGreater(self.native.gemv(), 0)
+
+    def test_bf16_notsm_810e_specializations(self):
+        if 'ZW810E' not in torch.cuda.get_device_name():
+            self.skipTest('requires an 810E device')
+        self.assertGreater(self.native.bf16_notsm_810e(), 0)
 
 
 if __name__ == '__main__':
