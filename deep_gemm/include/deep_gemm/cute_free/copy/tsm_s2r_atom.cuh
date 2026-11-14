@@ -3,7 +3,11 @@
 #include <cstdint>
 #include <type_traits>
 #include <cutlass/bfloat16.h>
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+#include <deep_gemm/cute_free/arch/ppu_tc01_copy.cuh>
+#else
 #include <deep_gemm/cute_free/arch/ppu_tc02_copy.cuh>
+#endif
 #include <deep_gemm/cute_free/copy/copy_traits.cuh>
 
 namespace deep_gemm {
@@ -46,6 +50,22 @@ struct TsmS2RAtom {
   /// Load one fragment for the given K-step into `frag`.
   /// `tsm_add_base` addresses row coord_h inside sub-tile 0 of the stage
   /// (16B units); this atom adds the sub-tile and within-tile K offsets.
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+  static __device__ __forceinline__ void load(
+      arch::TsmBase base, int k_step, uint32_t (&frag)[4]) {
+    constexpr int scale = kSwzlW * kElemBytes / 16;
+    const int row_total = base.coord / scale;
+    const int k_global = k_step * kMmaK;
+    const int cube = base.k_cube + k_global / kSwzlW;
+    const int row = row_total;
+    const int bytes = (k_global % kSwzlW) * kElemBytes;
+    const uintptr_t stage = base.ptr + cube * CUBE_H * kSwzlW * kElemBytes;
+    asm volatile(
+      "ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.swzl.shared.b16 {%0, %1, %2, %3}, [%4], {%5, %6, %7, %8, %9, %10};"
+      : "=r"(frag[0]), "=r"(frag[1]), "=r"(frag[2]), "=r"(frag[3])
+      : "l"(stage), "r"(0), "r"(row), "r"(1), "r"(CUBE_H), "r"(1), "r"(bytes));
+  }
+#else
   static __device__ __forceinline__ void load(
       int tsm_add_base, int k_step, uint32_t (&frag)[4]) {
     static_assert(std::is_same<Element, cutlass::bfloat16_t>::value,
@@ -58,6 +78,7 @@ struct TsmS2RAtom {
                 + within * kElemBytes / 16;
     arch::tsm_ldmatrix_swzl_bf16<kSwzlW, SwapLboSbo>(tsm_add, frag);
   }
+#endif
 };
 
 } // namespace copy

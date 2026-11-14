@@ -1188,12 +1188,12 @@ def read_numbers_from_file(file_path):
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
-    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", "MegaMhc", "AttentionRegression", "Preprocess", "Activation", "MoeAlign"]
+    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", "MegaMhc", "AttentionRegression", "Preprocess", "Activation", "MoeAlign", "MegaGate"]
     supported_indexer_epilogue_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
     supported_gemm_type.append("KGroupedContiguous")
-    dg_params = r"(KGroupedContiguous|GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation|MoeAlign),(.+)"
+    dg_params = r"(KGroupedContiguous|GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation|MoeAlign|MegaGate),(.+)"
     pattern = re.compile(dg_params)
     m = pattern.search(s.strip("."))
     if not m:
@@ -3431,6 +3431,77 @@ def test_mega_mhc(args):
     finally:
         if num_sms is not None:
             deep_gemm.set_num_sms(original_num_sms)
+
+
+@torch.no_grad()
+def test_mega_gate(args):
+    from test_mega_gate import make_inputs, make_outputs, run_mega_gate, run_reference_gemm, check_topk_weights
+
+    if args['data_type'] != torch.bfloat16:
+        raise ValueError('MegaGate only supports data_type:bf16')
+    scoring_func = args.get('scoring_func', 'sqrtsoftplus')
+    if scoring_func not in ('sqrtsoftplus', 'sigmoid'):
+        raise ValueError(f'Unsupported MegaGate scoring_func: {scoring_func}')
+    if get_acc_check() and get_ref_backend() != 'device':
+        raise ValueError("MegaGate accuracy checks require --ref_backend=device")
+
+    def flag(name, default=False):
+        value = args.get(name, int(default))
+        if value not in (0, 1):
+            raise ValueError(f'{name} requires 0 or 1')
+        return bool(value)
+
+    t, h, e = args['num_tokens'], args['hidden'], args['num_routed_experts']
+    topk, shared = args.get('num_topk', 6), args.get('num_shared_experts', 1)
+    use_shared = flag('use_shared_as_routed')
+    with_unmapped = flag('with_unmapped_topk_idx')
+    with_fixed, with_random = flag('with_fix_routing_mask'), flag('with_force_random')
+    if with_fixed and not with_unmapped:
+        raise ValueError('with_fix_routing_mask requires with_unmapped_topk_idx:1')
+    scale, rank = args.get('routed_scaling_factor', 1.5), args.get('ep_rank', 0)
+    inputs = make_inputs(t, h, e, use_shared, with_bias=flag('with_bias', True),
+                         with_image_bias=flag('with_image_bias'), with_mask=flag('with_mask'),
+                         with_physical_map=flag('with_physical_map', True), num_shared_experts=shared)
+    outputs = make_outputs(inputs, use_shared, with_unmapped, topk, shared)
+    token = torch.arange(t, device='cuda')
+    fixed = token % 3 == 0 if with_fixed else None
+    random_mask = token % 5 == 0 if with_random else None
+    if with_fixed:
+        fixed_indices = torch.randint(0, e, (t, topk), dtype=torch.int64, device='cuda')
+        outputs['unmapped_topk_idx'].copy_(fixed_indices)
+
+    def test_func():
+        return run_mega_gate(inputs, outputs, use_shared, num_topk=topk, num_shared_experts=shared,
+                             routed_scaling_factor=scale, ep_rank=rank,
+                             fix_routing_mask=fixed, force_random=random_mask, scoring_func=scoring_func)
+
+    test_func()
+    if get_acc_check():
+        logits = run_reference_gemm(inputs)
+        diff = check_topk_weights(inputs, outputs, logits, inputs['mask'], random_mask, fixed,
+                                  num_topk=topk, routed_scaling_factor=scale, scoring_func=scoring_func)
+        active = inputs['mask'] if inputs['mask'] is not None else torch.ones_like(token, dtype=torch.bool)
+        if with_fixed:
+            kept = active & fixed
+            if with_random:
+                kept &= ~random_mask
+            assert torch.equal(outputs['unmapped_topk_idx'][kept], fixed_indices[kept])
+        if with_random:
+            sampled = active & random_mask
+            ids, weights = outputs['topk_idx'][sampled], outputs['topk_weights'][sampled]
+            count = inputs['logical_count'].sum() if inputs['logical_count'] is not None else e + (shared if use_shared else 0)
+            assert torch.all((ids >= 0) & (ids < count)).item()
+            assert torch.all(weights > 0).item()
+            ordered = ids.sort(dim=1).values
+            assert torch.all(ordered[:, 1:] != ordered[:, :-1]).item()
+            if with_unmapped:
+                assert torch.all(outputs['unmapped_topk_idx'][sampled] == -1).item()
+        print(f'Passed with acc_check, diff={diff:.3g}\n')
+    else:
+        print('Passed without acc_check\n')
+    if get_benchmark():
+        elapsed = bench_kineto(test_func, 'mega_gate', suppress_kineto_output=True)
+        print(f' > MegaGate (T={t}, H={h}, E={e}, topk={topk}): {elapsed * 1e6:.3f} us')
 
 
 def read_cmds_from_file(casefile):

@@ -97,7 +97,6 @@ struct Mainloop {
   static constexpr int kWarpKOffsetA   = kWarpKSubTiles * S2RAtomA::kSubTileStride16B;
   static constexpr int kWarpKOffsetB   = kWarpKSubTiles * S2RAtomB::kSubTileStride16B;
 
-
   // A/B-side parameters only (decoupled from the kernel's full Params).
   struct Params {
     Element const* ptr_A;
@@ -129,8 +128,8 @@ struct Mainloop {
   /// inside the tile.
   template <int SrcKStep>
   static __device__ __forceinline__ void issue_s2r_pair(
-      int const (&tsm_add_base_a)[kMmasPerWarpM],
-      int const (&tsm_add_base_b)[kMmasPerWarpN],
+      arch::TsmBase const (&tsm_add_base_a)[kMmasPerWarpM],
+      arch::TsmBase const (&tsm_add_base_b)[kMmasPerWarpN],
       uint32_t (&a_dst)[kMmasPerWarpM][4],
       uint32_t (&b_dst)[kMmasPerWarpN][4]) {
     #pragma unroll
@@ -189,10 +188,10 @@ struct Mainloop {
   static __device__ __forceinline__ void load_next_fragments(
       char* smem,
       int next_stage,
-      int warp_coord_a,
-      int warp_coord_b,
-      int const (&tsm_add_base_a)[kMmasPerWarpM],
-      int const (&tsm_add_base_b)[kMmasPerWarpN],
+      arch::TsmCoord warp_coord_a,
+      arch::TsmCoord warp_coord_b,
+      arch::TsmBase const (&tsm_add_base_a)[kMmasPerWarpM],
+      arch::TsmBase const (&tsm_add_base_b)[kMmasPerWarpN],
       uint32_t (&a_next)[kMmasPerWarpM][4],
       uint32_t (&b_next)[kMmasPerWarpN][4]) {
     static constexpr int kCoordScale = kSwzlW * (int)sizeof(Element) / 16;
@@ -207,8 +206,8 @@ struct Mainloop {
       Element const* next_stage_b =
           reinterpret_cast<Element const*>(smem)
           + STAGES * BLOCK_M * BLOCK_K + next_stage * BLOCK_N * BLOCK_K;
-      const int next_base_a = arch::smem_ptr_to_tsm_base(next_stage_a, warp_coord_a);
-      const int next_base_b = arch::smem_ptr_to_tsm_base(next_stage_b, warp_coord_b);
+      const arch::TsmBase next_base_a = arch::make_tsm_base(next_stage_a, warp_coord_a);
+      const arch::TsmBase next_base_b = arch::make_tsm_base(next_stage_b, warp_coord_b);
       #pragma unroll
       for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
         S2RAtomA::load(next_base_a + mma_m * kMmaM * kCoordScale, 0, a_next[mma_m]);
@@ -241,10 +240,10 @@ struct Mainloop {
       int m_offset, int n_offset, int k_offset_next,
       char* smem,
       int next_stage,
-      int warp_coord_a,
-      int warp_coord_b,
-      int const (&tsm_add_base_a)[kMmasPerWarpM],
-      int const (&tsm_add_base_b)[kMmasPerWarpN],
+      arch::TsmCoord warp_coord_a,
+      arch::TsmCoord warp_coord_b,
+      arch::TsmBase const (&tsm_add_base_a)[kMmasPerWarpM],
+      arch::TsmBase const (&tsm_add_base_b)[kMmasPerWarpN],
       float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
       uint32_t (&a_buf0)[kMmasPerWarpM][4],
       uint32_t (&b_buf0)[kMmasPerWarpN][4],
@@ -291,10 +290,10 @@ struct Mainloop {
       int m_offset, int n_offset, int k_offset_next,
       char* smem,
       int next_stage,
-      int warp_coord_a,
-      int warp_coord_b,
-      int const (&tsm_add_base_a)[kMmasPerWarpM],
-      int const (&tsm_add_base_b)[kMmasPerWarpN],
+      arch::TsmCoord warp_coord_a,
+      arch::TsmCoord warp_coord_b,
+      arch::TsmBase const (&tsm_add_base_a)[kMmasPerWarpM],
+      arch::TsmBase const (&tsm_add_base_b)[kMmasPerWarpN],
       float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
       uint32_t (&a_buf0)[kMmasPerWarpM][4],
       uint32_t (&b_buf0)[kMmasPerWarpN][4],
@@ -324,10 +323,10 @@ struct Mainloop {
       int m_offset, int n_offset, int k_offset_next,
       char* smem,
       int next_stage,
-      int warp_coord_a,
-      int warp_coord_b,
-      int const (&tsm_add_base_a)[kMmasPerWarpM],
-      int const (&tsm_add_base_b)[kMmasPerWarpN],
+      arch::TsmCoord warp_coord_a,
+      arch::TsmCoord warp_coord_b,
+      arch::TsmBase const (&tsm_add_base_a)[kMmasPerWarpM],
+      arch::TsmBase const (&tsm_add_base_b)[kMmasPerWarpN],
       float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
       uint32_t (&a_curr)[kMmasPerWarpM][4],
       uint32_t (&b_curr)[kMmasPerWarpN][4],
@@ -359,10 +358,10 @@ struct Mainloop {
       int m_offset, int n_offset, int k_offset_next,
       char* smem,
       int next_stage,
-      int warp_coord_a,
-      int warp_coord_b,
-      int const (&tsm_add_base_a)[kMmasPerWarpM],
-      int const (&tsm_add_base_b)[kMmasPerWarpN],
+      arch::TsmCoord warp_coord_a,
+      arch::TsmCoord warp_coord_b,
+      arch::TsmBase const (&tsm_add_base_a)[kMmasPerWarpM],
+      arch::TsmBase const (&tsm_add_base_b)[kMmasPerWarpN],
       float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
       uint32_t (&a_buf0)[kMmasPerWarpM][4],
       uint32_t (&b_buf0)[kMmasPerWarpN][4],
@@ -426,18 +425,24 @@ struct Mainloop {
     static constexpr int kCoordScale = kSwzlW * (int)sizeof(Element) / 16;
 
     // Split the S2R base into a runtime part and a compile-time part.
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+    const int k_cube = warp_k * kWarpKSubTiles;
+    const arch::TsmCoord warp_coord_a{warp_row * WARP_M * kCoordScale, k_cube};
+    const arch::TsmCoord warp_coord_b{warp_col * WARP_N * kCoordScale, k_cube};
+#else
     const int warp_coord_a = warp_row * WARP_M * kCoordScale + warp_k * kWarpKOffsetA;
     const int warp_coord_b = warp_col * WARP_N * kCoordScale + warp_k * kWarpKOffsetB;
+#endif
 
-    const int warp_base_a = arch::smem_ptr_to_tsm_base(stage_a, warp_coord_a);
-    const int warp_base_b = arch::smem_ptr_to_tsm_base(stage_b, warp_coord_b);
+    const arch::TsmBase warp_base_a = arch::make_tsm_base(stage_a, warp_coord_a);
+    const arch::TsmBase warp_base_b = arch::make_tsm_base(stage_b, warp_coord_b);
 
-    int tsm_add_base_a[kMmasPerWarpM];
+    arch::TsmBase tsm_add_base_a[kMmasPerWarpM];
     #pragma unroll
     for (int mma_m = 0; mma_m < kMmasPerWarpM; ++mma_m) {
       tsm_add_base_a[mma_m] = warp_base_a + mma_m * kMmaM * kCoordScale;
     }
-    int tsm_add_base_b[kMmasPerWarpN];
+    arch::TsmBase tsm_add_base_b[kMmasPerWarpN];
     #pragma unroll
     for (int mma_n = 0; mma_n < kMmasPerWarpN; ++mma_n) {
       tsm_add_base_b[mma_n] = warp_base_b + mma_n * kMmaN * kCoordScale;

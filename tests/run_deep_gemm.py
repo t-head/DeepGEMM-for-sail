@@ -7,7 +7,7 @@ import deep_gemm
 from utils import parse_deepgemm_string_re, read_cmds_from_file, get_arch_version
 from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad, test_m_grouped_gemm_fused
 from utils import test_k_grouped_gemm_contiguous
-from utils import test_hc_prenorm_gemm, test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, test_mega_mhc
+from utils import test_hc_prenorm_gemm, test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, test_mega_mhc, test_mega_gate
 from utils import test_batch_gemm
 from utils import get_acc_check, set_acc_check, set_benchmark
 from utils import judge_device_type, set_ref_backend
@@ -101,6 +101,7 @@ def call_test_func(gemm_type, func_args):
         "Preprocess": run_preprocessing_regression,
         "Activation": run_activation_regression,
         "MoeAlign": run_moe_align,
+        "MegaGate": test_mega_gate,
     }
 
     if gemm_type in supported_call_funcs.keys():

@@ -38,7 +38,13 @@ __device__ __forceinline__ void store_checked_scores(const KernelArgs& a, int to
     }
     // Masked input may contain NaN/inf. The final MMA tile can extend past the mask allocation.
     gate_is_valid &= valid || (a.mask && (token >= a.num_tokens || !a.mask[token]));
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+    // Adjacent tc01 accumulator registers hold scores four experts apart.
+    dst[0] = lo;
+    dst[4] = hi;
+#else
     *reinterpret_cast<float2*>(dst) = make_float2(lo, hi);
+#endif
 }
 
 __device__ __forceinline__ float sqrt_softplus(const float& value) {
@@ -64,7 +70,8 @@ __device__ __forceinline__ void sqrt_softplus(float (&values)[kNumValues]) {
 template <bool UseSigmoid>
 __device__ __forceinline__ float gate_score(float value) {
     if constexpr (UseSigmoid)
-        return 1.0f / (1.0f + expf(-value));
+        // Equivalent to: 1.0f / (1.0f + expf(-value)).
+        return __ppu_sgmdf(value);
     else
         return sqrt_softplus(value);
 }
@@ -72,14 +79,10 @@ __device__ __forceinline__ float gate_score(float value) {
 template <bool UseSigmoid, uint32_t N>
 __device__ __forceinline__ void gate_score(float (&values)[N]) {
     if constexpr (UseSigmoid) {
-        // Match the vector sigmoid schedule in DeepGEMM 66081d4c (sm100_mega_gate.cuh).
-        float exponentials[N];
         #pragma unroll
         for (uint32_t i = 0; i < N; ++i)
-            exponentials[i] = expf(-values[i]);
-        #pragma unroll
-        for (uint32_t i = 0; i < N; ++i)
-            values[i] = 1.0f / (1.0f + exponentials[i]);
+            // Equivalent to: 1.0f / (1.0f + expf(-values[i])).
+            values[i] = __ppu_sgmdf(values[i]);
     } else {
         sqrt_softplus(values);
     }
