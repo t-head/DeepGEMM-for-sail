@@ -138,7 +138,8 @@ def make_inputs(num_tokens: int, hidden: int, seed: int):
         inputs['comb_res_mix'] /= inputs['comb_res_mix'].sum(-2, keepdim=True)
     duplicates = tuple(i for i in (63, 64, 511, 512, num_tokens - 1) if 0 < i < num_tokens)
     for name in ('x', 'residual', 'post_mix', 'comb_res_mix', 'shifted_prev_mix'):
-        inputs[name][list(set(duplicates))] = inputs[name][0].clone()
+        if duplicates:
+            inputs[name][list(set(duplicates))] = inputs[name][0].clone()
     return inputs, duplicates
 
 
@@ -207,8 +208,16 @@ def benchmark_case(inputs, outputs):
     if int(os.environ.get('DG_USE_PPU_TOOLS', 0)):
         print(' > Benchmark skipped (DG_USE_PPU_TOOLS=1)', flush=True)
         return
+    kernel_names = 'ppu_mega_mhc'
+    if torch.cuda.get_device_capability() == (8, 0):
+        # Match the column separator so the main phase excludes pre/finish.
+        kernel_names = ('ppu_mega_mhc_tc01_pre ', 'ppu_mega_mhc_tc01 ',
+                        'ppu_mega_mhc_tc01_finish ')
     t = bench_kineto(lambda: deep_gemm.mega_mhc(**inputs, **outputs),
-                     'ppu_mega_mhc', suppress_kineto_output=True)
+                     kernel_names, suppress_kineto_output=True)
+    if isinstance(t, tuple):
+        assert all(phase_t > 0 for phase_t in t), f'Missing Mega-mHC phase timing: {t}'
+        t = sum(t)
     assert t > 0, 'No Mega-mHC kernel timing found'
     tokens, hidden = inputs['x'].shape
     output = 'fp8' if 'y_fp8' in outputs else 'bf16'
@@ -216,6 +225,108 @@ def benchmark_case(inputs, outputs):
           f'store_bf16={int("y_bf16" in outputs)}, '
           f'sinkhorn={inputs["num_sinkhorn_iters"]}): '
           f'{t * 1e6:.2f} us', flush=True)
+
+
+def check_interface():
+    inputs, outputs, _ = make_case()
+    checks = []
+
+    def rejects(name, supplied, exception=RuntimeError):
+        try:
+            deep_gemm.mega_mhc(**supplied)
+        except exception:
+            checks.append(name)
+        else:
+            raise AssertionError(name + ' was accepted')
+
+    arguments = dict(inputs, **outputs)
+    rejects('required_output', {k: v for k, v in arguments.items() if k != 'y_bf16'})
+    rejects('output_dtype', dict(arguments, y_bf16=outputs['y_bf16'].float()))
+    rejects('output_alias', dict(arguments, y_bf16=inputs['x']))
+    rejects('overlapping_outputs', dict(arguments, new_prev_mix=outputs['new_post_mix']))
+    rejects('noncontiguous_output', dict(arguments, y_bf16=torch.empty(
+        (5120, 64), dtype=torch.bfloat16, device='cuda').t()))
+    rejects('invalid_iterations', dict(arguments, num_sinkhorn_iters=0))
+    rejects('invalid_epsilon', dict(arguments, rmsnorm_eps=0.0))
+    rejects('nonfinite_scale', dict(arguments, rmsnorm_scale=float('nan')))
+    if torch.cuda.get_device_capability() == (8, 0):
+        for store_bf16 in (False, True):
+            fp8_inputs, fp8_outputs, _ = make_case(sf_layout='col', store_bf16=store_bf16)
+            rejects(f'fp8_output_store_bf16_{store_bf16}', dict(fp8_inputs, **fp8_outputs))
+    empty_inputs, empty_outputs, _ = make_case(0)
+    deep_gemm.mega_mhc(**empty_inputs, **empty_outputs)
+    checks.append('empty_input')
+    return checks
+
+
+@torch.no_grad()
+def check_graph():
+    cases = []
+    for tokens in (7, 37):
+        inputs, outputs, _ = make_case(tokens)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            deep_gemm.mega_mhc(**inputs, **outputs)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            deep_gemm.mega_mhc(**inputs, **outputs)
+        # Grow eager workspace after capture; the graph must retain its addresses.
+        larger_inputs, larger_outputs, _ = make_case(257)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            deep_gemm.mega_mhc(**larger_inputs, **larger_outputs)
+        stream.synchronize()
+        cases.append((tokens, inputs, outputs, stream, graph))
+    for seed in (2027, 2028):
+        expected = []
+        for tokens, inputs, outputs, stream, graph in cases:
+            updated, _, _ = make_case(tokens, seed=seed)
+            for name, value in inputs.items():
+                if isinstance(value, torch.Tensor):
+                    value.copy_(updated[name])
+            expected.append(mhc_reference(**inputs))
+            for value in outputs.values():
+                value.zero_()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                graph.replay()
+        torch.cuda.synchronize()
+        for (_, _, outputs, _, _), reference in zip(cases, expected):
+            for name, value in outputs.items():
+                assert torch.isfinite(value).all(), name
+                assert calc_diff(value, reference[name]) < 5e-5, (seed, name)
+
+
+@torch.no_grad()
+def check_layout(tokens):
+    inputs, outputs, _ = make_case(tokens)
+    hidden = inputs['x'].size(1)
+    token = torch.arange(tokens, device='cuda')
+    route = torch.arange(4, device='cuda')
+    inputs['x'].zero_()
+    inputs['x'][token, (token * 131 + 31) % hidden] = 0.5
+    inputs['residual'].zero_()
+    inputs['residual'][token[:, None], route, (token[:, None] * 67 + route * 129) % hidden] = (
+        (route + 1).bfloat16() / 4)
+    inputs['post_mix'].copy_(((route + 1).float() / 8).view(1, 4, 1))
+    inputs['shifted_prev_mix'].copy_(((4 - route).float() / 8).view(1, 4, 1))
+    inputs['comb_res_mix'].copy_(torch.arange(16, device='cuda').view(1, 4, 4).float() / 16)
+    n = torch.arange(24, device='cuda')[:, None]
+    k = torch.arange(4 * hidden, device='cuda')[None, :]
+    # Exact TF32 weights isolate row, route and K-lane mapping from conversion error.
+    inputs['fn'].copy_((((n + 1) * (k % 17 + 1) + k // 64 % 13) % 31 - 15).float() / 256)
+    inputs['mix_scales'].fill_(0.125)
+    inputs['mix_bases'].zero_()
+    inputs['rmsnorm_weight'].fill_(1)
+    expected = mhc_reference(**inputs)
+    deep_gemm.mega_mhc(**inputs, **outputs)
+    metrics = check_correctness(outputs, expected, ('layout', tokens))
+    assert_bitwise_equal(outputs['new_residual'], expected['new_residual'], 'structured residual')
+    for name in ('new_prev_mix', 'new_post_mix', 'new_comb_res_mix'):
+        torch.testing.assert_close(outputs[name], expected[name], rtol=2e-5, atol=2e-6)
+    return metrics
 
 
 @torch.no_grad()
@@ -266,7 +377,12 @@ def check(tokens, hidden=5120, repeats=30, num_sinkhorn_iters=20, seed=2026,
 
 
 def test_mega_mhc(benchmark=False, sf_layout=None, store_bf16=True):
-    for layout in ((sf_layout,) if sf_layout else ('bf16', 'col', 'extra', 'token')):
+    if sf_layout in (None, 'bf16'):
+        check_interface()
+        check_graph()
+        check_layout(65)
+    layouts = ('bf16',) if torch.cuda.get_device_capability() == (8, 0) else ('bf16', 'col', 'extra', 'token')
+    for layout in ((sf_layout,) if sf_layout else layouts):
         for tokens in (1, 64, 65, 153, 200, 512, 520, 529, 624, 1016, 1024, 1025, 1248,
                        3834, 4095, 4096, 5334, 8192, 8193, 9984, 10321, 32768):
             check(tokens, benchmark=benchmark, sf_layout=layout, store_bf16=store_bf16)
