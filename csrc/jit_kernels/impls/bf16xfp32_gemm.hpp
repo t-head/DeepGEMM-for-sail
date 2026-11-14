@@ -424,9 +424,11 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
         cfg = std::make_tuple(std::min(num_sms, 39), 128, 64, 64,
                               32, 16, 64, 4, std::make_tuple(0, 0, 0));
     } else if (std::is_same_v<ElementOutput, float> && m == 4096 && n == 384 && k == 7168) {
-        // Target the router prefill regression point with a smaller M tile chosen by independent rotation tuning; keep the general cost tree unchanged.
-        cfg = std::make_tuple(std::min(num_sms, 64), 128, 192, 64,
-                              32, 32, 64, 4, std::make_tuple(0, 0, 0));
+        cfg = std::make_tuple(std::min(num_sms, 39), 320, 128, 64,
+                              80, 32, 64, 2, std::make_tuple(0, 0, 0));
+    } else if (std::is_same_v<ElementOutput, float> && m == 8192 && n == 384 && k == 7168) {
+        cfg = std::make_tuple(std::min(num_sms, 39), 320, 128, 64,
+                              80, 32, 64, 3, std::make_tuple(0, 0, 0));
     } else if (std::is_same_v<ElementOutput, float> && m == 16384 && n == 384 && k == 7168) {
         // Long router prefill uses a larger warp-N tile; both chains cover full K, with no spills in isolated rotation validation.
         cfg = std::make_tuple(std::min(num_sms, 64), 256, 128, 64,
@@ -598,8 +600,10 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
         && std::is_same_v<ElementOutput, float> && m == 16384 && n == 384 && k == 7168;
     const bool overlap_prologue = (prologue_env != nullptr && *prologue_env == '1')
         || (prologue_env == nullptr && router_overlap);
+    const bool router_valid_epilogue = !other_pipeline && !packed_dual_n && !configs.has_value()
+        && std::is_same_v<ElementOutput, float> && m == 4096 && n == 384 && k == 7168;
     const bool valid_epilogue = (epilogue_env != nullptr && *epilogue_env == '1')
-        || (epilogue_env == nullptr && router_overlap);
+        || (epilogue_env == nullptr && (router_overlap || router_valid_epilogue));
     DG_HOST_ASSERT(!(overlap_prologue || valid_epilogue)
                    || (!full_k_prefetch && !early_g2s && !mma_s2r_overlap && !bounded_kloop));
     if (overlap_prologue) kernel_name += "_overlap_prologue";
