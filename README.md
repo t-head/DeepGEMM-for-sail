@@ -130,9 +130,20 @@ To perform a basic non-grouped FP8 GEMM, call the `deep_gemm.gemm_fp8_fp8_bf16_n
 
 BF16 dense GEMM: `deep_gemm.bf16_gemm_nt(a, b, out)` computes `out = a @ b.T`
 with contiguous BF16 inputs. On 810E and 890P, `out` supports BF16 or FP32.
-890P supports odd and even N. On 810E, N must be even except for N=1
-without an explicit configuration, which requires K divisible by 8 and
-16-byte-aligned inputs.
+890P supports odd and even N. On 810E, GEMV/Direct paths also cover narrow
+and partial outputs; tiled paths require `K>=64`, `K%32=0` and aligned inputs.
+N=1 GEMV requires `K%8=0` and 16-byte-aligned inputs.
+
+Use `deep_gemm.bf16_gemm_nt(a, b, d, c=c)` for optional accumulation.
+C must match D's shape, dtype and device; C/D must be disjoint or exactly aliased
+with identical strides. The product and C are added in FP32 before output conversion.
+All tensors must be on the current accelerator; D must not overlap A or B.
+Empty outputs are no-ops; K=0 writes C or zero. Compile-only mode preserves C/D.
+
+810E `configs` are `(num_sms, BM, BN, BK, WM, WN, stages, (0, 0, 0))`.
+Explicit/LUT tiles require a 16-byte-aligned product output and N divisible by
+8 (BF16) or 4 (FP32); with C, this applies to the internal FP32 product.
+Unsupported inputs/configurations raise host errors; see [810E checkin cases](tests/checkin/checkin_810e.list).
 
 #### Grouped GEMMs (contiguous layout)
 
@@ -781,6 +792,8 @@ In addition, the dense GEMM kernels only implement the NT layout. The `nn` / `tn
 The library provides some utility functions besides the above kernels:
 
 - `deep_gemm.set_num_sms` / `get_num_sms`: set/get the maximum CU count to use on the current device
+  On 810E, BF16 dense Tensor uses `min(num_sms, 20)`; SIMT uses `64 - (20 - num_sms)` for 1–20, and `num_sms` for 21–64.
+  `0` restores automatic selection (20 Tensor / 64 SIMT). Counts come from the device; settings above its total CU count are rejected.
 - `deep_gemm.set_tc_util` / `get_tc_util`: set/get an approximated tensor cell utilization ratio
 - `deep_gemm.set_pdl` / `get_pdl`: enable/disable Programmatic Dependent Launch (PDL)
 - `deep_gemm.set_compile_mode` / `get_compile_mode`: set/get the JIT compile mode
@@ -841,7 +854,10 @@ Grouped lookup matches N, K, and group count, then selects the smallest
 table M greater than or equal to the requested M. Missing or malformed
 files, or queries with no matching entry, fall back to built-in
 configuration selection. These tables supply configurations; they do not
-run an automatic tuning search. See the
+run an automatic tuning search. On 810E dense BF16, explicit `configs` override
+matching LUT entries; matching entries override automatic dispatch. A parsed
+entry that violates the device's tile, alignment or resource requirements is
+rejected before JIT/launch, just like an invalid explicit configuration. See the
 [LUT loader](csrc/jit_kernels/heuristics/runtime_lut.hpp) for validation rules.
 
 ## Optimizations

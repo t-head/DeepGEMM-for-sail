@@ -331,25 +331,57 @@ def run_tile_alignment_cache(check=True):
 
 
 def run_n1_cu_limit(check=True):
-    """Constrained N=1 must select a persistent grid no larger than the CU budget."""
+    """Check N=1 launch budgets, including the 810E Tensor-to-SIMT mapping."""
     import ctypes
     import re
     import tempfile
 
+    # This regression owns its budget and leaves automatic selection enabled.
+    deep_gemm.set_num_sms(0)
     original = deep_gemm.get_num_sms()
     original_log = os.environ.get('show_log')
-    x, w = make_inputs(128, 1, 256)
+    is_810e = 'ZW810E' in torch.cuda.get_device_name()
+    total_cus = torch.cuda.get_device_properties(0).multi_processor_count
+    # Exceed the full SIMT pool so a limited 810E GEMV must loop over its tiles.
+    m = 4096 if is_810e else 128
+    x, w = make_inputs(m, 1, 256)
     try:
-        for budget in (1, 2):
-            if budget > torch.cuda.get_device_properties(0).multi_processor_count:
+        if is_810e:
+            deep_gemm.set_num_sms(1)
+            for invalid in (-1, total_cus + 1):
+                try:
+                    deep_gemm.set_num_sms(invalid)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError('810E accepted an invalid CU budget')
+                assert deep_gemm.get_num_sms() == 1
+        budgets = (1, 2, original - 1, original, original + 1,
+                   total_cus // 2, total_cus - 1, total_cus, 0) if is_810e else (1, 2)
+        for setting in budgets:
+            budget = setting or original
+            if budget > total_cus:
                 continue
-            deep_gemm.set_num_sms(budget)
-            # A matching explicit budget and an oversized one both respect
-            # set_num_sms; explicit tiles continue to bypass GEMV.
-            for config_sms in (None, budget, original):
+            deep_gemm.set_num_sms(setting)
+            assert deep_gemm.get_num_sms() == budget
+            tensor_budget = min(budget, original) if is_810e else budget
+            simt_budget = total_cus - original + budget if is_810e and budget <= original else budget
+            # 890P clamps explicit N=1 tiles to the budget. 810E supports N=1
+            # through GEMV only and rejects oversized explicit budgets.
+            for config_sms in dict.fromkeys((None, budget, original)):
                 configs = None if config_sms is None else (config_sms, 16, 64, 64, 16, 32, 2, (24576, 128, 0))
                 for dtype in (torch.bfloat16, torch.float32):
-                    out = torch.empty((128, 1), device='cuda', dtype=dtype)
+                    out = torch.full((m, 1), 8., device='cuda', dtype=dtype)
+                    if is_810e and configs is not None:
+                        expected = 'configured budget' if config_sms > tensor_budget else 'vector-aligned output'
+                        try:
+                            deep_gemm.bf16_gemm_nt(x, w, out, configs=configs)
+                        except RuntimeError as error:
+                            assert expected in str(error), str(error)
+                        else:
+                            raise AssertionError('810E accepted an unsupported explicit N=1 tile')
+                        assert torch.equal(out, torch.full_like(out, 8.))
+                        continue
                     if not check:
                         deep_gemm.bf16_gemm_nt(x, w, out, configs=configs)
                         continue
@@ -369,15 +401,25 @@ def run_n1_cu_limit(check=True):
                         os.dup2(saved_stdout, 1)
                         os.close(saved_stdout)
                     match = re.search(r'threadblock_count:(\d+)', log)
-                    assert '[DenseGemm_BF16_CuteFree:]' in log and match, log
-                    assert 0 < int(match.group(1)) <= budget, (budget, configs, log)
+                    marker = '[DenseGemm_BF16_GemV:]' if is_810e else '[DenseGemm_BF16_CuteFree:]'
+                    assert marker in log and match, log
+                    grid = int(match.group(1))
+                    if is_810e:
+                        effective = re.search(r'num_sms:(\d+)', log)
+                        assert effective and int(effective.group(1)) == simt_budget, log
+                        if simt_budget < total_cus:
+                            assert grid == simt_budget, (budget, log)
+                        else:
+                            assert grid > total_cus, log  # Full-budget GEMV needs no cap.
+                    else:
+                        assert 0 < grid <= budget, (budget, configs, log)
                     ref = x.float() @ w.float().t()
                     torch.testing.assert_close(out.float(), ref.to(dtype).float(),
                                                atol=0.02 if dtype == torch.bfloat16 else 0.01,
                                                rtol=0.01 if dtype == torch.bfloat16 else 0.001)
         print('Passed N=1 constrained CU dispatch')
     finally:
-        deep_gemm.set_num_sms(original)
+        deep_gemm.set_num_sms(0)
         if original_log is None:
             os.environ.pop('show_log', None)
         else:

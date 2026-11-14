@@ -5,6 +5,7 @@
 #include <string>
 #include <unordered_map>
 #include <acblasLt.h>
+#include <hggc_ad.h>
 #include <hggc_runtime_api.h>
 #include <torch/version.h>
 #include <torch/torch.h>
@@ -24,6 +25,8 @@ class DeviceRuntime {
     struct DeviceState {
         std::shared_ptr<hggcDeviceProp> prop;
         int num_sms = 0;
+        bool numSmsExplicit = false;
+        int cachedTensorCUs = 0;
     };
     std::mutex device_states_mutex;
     std::unordered_map<int, DeviceState> device_states;
@@ -40,6 +43,44 @@ class DeviceRuntime {
             state.prop = std::make_shared<hggcDeviceProp>(prop);
         }
         return state;
+    }
+
+    // These helpers also require device_states_mutex; do not call the locking
+    // public getters while accessing a device state.
+    int get_tensor_cu_count(DeviceState& state) {
+        if (state.cachedTensorCUs == 0) {
+            const auto& prop = state.prop;
+            const std::string name(prop->name);
+            int count = prop->multiProcessorCount;
+            if (name.find("ZW810E") != std::string::npos || name.find("ZW610E") != std::string::npos) {
+                int ordinal;
+                HGdevice device;
+                DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&ordinal));
+                DG_HOST_ASSERT(hgDeviceGet(&device, ordinal) == HGGC_SUCCESS);
+                DG_HOST_ASSERT(hgDeviceGetAttributeAD(&count, HGAD_DEVICE_ATTRIBUTE_TENSOR_MULTIPROCESSOR_COUNT,
+                                                      device) == HGGC_SUCCESS);
+            }
+            DG_HOST_ASSERT(count > 0 && count <= prop->multiProcessorCount);
+            state.cachedTensorCUs = count;
+        }
+        return state.cachedTensorCUs;
+    }
+
+    int get_num_sms(DeviceState& state) {
+        if (state.num_sms == 0) {
+            const auto& prop = state.prop;
+            std::cout << "device_props.name:" << prop->name << std::endl;
+            const std::string device_name(prop->name);
+            if (device_name.find("ZW810E") != std::string::npos) {
+                state.num_sms = get_tensor_cu_count(state);
+            } else if (device_name.find("ZW610E") != std::string::npos) {
+                // Preserve the legacy default on 610E.
+                state.num_sms = 20;
+            } else {
+                state.num_sms = prop->multiProcessorCount;
+            }
+        }
+        return state.num_sms;
     }
 
     // acBLASLt utils
@@ -110,30 +151,36 @@ public:
         return get_arch_pair().first;
     }
 
+    int get_tensor_cu_count() {
+        std::lock_guard<std::mutex> lock(device_states_mutex);
+        return get_tensor_cu_count(current_device_state());
+    }
+
     void set_num_sms(const int& new_num_sms) {
         std::lock_guard<std::mutex> lock(device_states_mutex);
         auto& state = current_device_state();
         DG_HOST_ASSERT(0 <= new_num_sms and new_num_sms <= state.prop->multiProcessorCount);
         state.num_sms = new_num_sms;
+        state.numSmsExplicit = new_num_sms != 0;
     }
 
     int get_num_sms() {
         std::lock_guard<std::mutex> lock(device_states_mutex);
+        return get_num_sms(current_device_state());
+    }
+
+    // On 810E, settings up to the Tensor count remove the same number of SIMT CUs.
+    // Larger settings directly specify the SIMT budget; Tensor paths clamp separately.
+    // Other devices retain their existing explicit/automatic budget semantics.
+    int get_num_simt_sms() {
+        std::lock_guard<std::mutex> lock(device_states_mutex);
         auto& state = current_device_state();
-        auto& num_sms = state.num_sms;
-        if (num_sms == 0) {
-            const auto& prop = state.prop;
-            std::cout << "device_props.name:" << prop->name << std::endl;
-            const std::string device_name(prop->name);
-            // Synced from the legacy free function deep_gemm::get_num_sms() (utils/utils.hpp):
-            // ZW810E/ZW610E expose a reduced SM budget, other devices use the full count.
-            if (device_name.find("ZW810E") != std::string::npos or device_name.find("ZW610E") != std::string::npos) {
-                num_sms = 20;
-            } else {
-                num_sms = prop->multiProcessorCount;
-            }
+        const auto& prop = state.prop;
+        if (std::string(prop->name).find("ZW810E") != std::string::npos) {
+            const int sms = get_num_sms(state), tensorCUs = get_tensor_cu_count(state);
+            return sms <= tensorCUs ? prop->multiProcessorCount - tensorCUs + sms : sms;
         }
-        return num_sms;
+        return state.numSmsExplicit ? get_num_sms(state) : prop->multiProcessorCount;
     }
 
     int get_l2_cache_size() {

@@ -49,7 +49,6 @@ from ._C import (
     bf16_gemm_nn,
     bf16_gemm_tn,
     bf16_gemm_tt,
-    bf16_gemm_strided_batched_nt,
     gemm_fp32_fp32_fp32_nt,
     k_grouped_bf16_gemm_tn_contiguous,
     m_grouped_bf16_gemm_nt_contiguous,

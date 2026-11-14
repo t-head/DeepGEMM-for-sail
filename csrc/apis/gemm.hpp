@@ -3,6 +3,7 @@
 #include "../utils/compatibility.hpp"
 #include "../utils/layout.hpp"
 #include <torch/extension.h>
+#include <limits>
 #include "../jit_kernels/impls/epilogue_class.hpp"
 #include "../jit_kernels/impls/fp8_gemm.hpp"
 #include "../jit_kernels/impls/ppuxx_layout.hpp"
@@ -94,10 +95,12 @@ void bf16_gemm_nt(const torch::Tensor& a,
                   const std::optional<torch::Tensor>& c,
                   const std::string& compiled_dims,
                   std::optional<ConfigTuple> configs = std::nullopt) {
-    const auto major_a = get_major_type_ab(a);
-    const auto major_b = get_major_type_ab(b);
-    check_major_type_cd(d);
-
+    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && d.dim() == 2, "BF16 dense GEMM requires rank-2 tensors");
+    // Host tile/grid calculations add up to 511 before division in int32.
+    for (auto size : {a.size(0), a.size(1), b.size(0), b.size(1), d.size(0), d.size(1)})
+        TORCH_CHECK(size <= std::numeric_limits<int>::max() - 511, "BF16 dense GEMM dimensions exceed int32 tile range");
+    TORCH_CHECK(a.size(1) <= std::numeric_limits<int>::max() - 4096,
+                "BF16 dense GEMM K exceeds the int32 K-loop range");
     const auto& [m, k] = get_shape<2>(a);
     const auto& [n, k_] = get_shape<2>(b);
     const auto& [m_, n_] = get_shape<2>(d);
@@ -110,6 +113,13 @@ void bf16_gemm_nt(const torch::Tensor& a,
     TORCH_CHECK(a.is_contiguous(), "lhs must be contiguous");
     TORCH_CHECK(b.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+    TORCH_CHECK(b.device() == a.device() && d.device() == a.device(),
+                "GEMM tensors must be on the same accelerator");
+    int device;
+    DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device));
+    TORCH_CHECK(a.get_device() == device, "GEMM tensors must be on the current accelerator");
+    TORCH_CHECK(is_contiguous_output_disjoint(d, a) && is_contiguous_output_disjoint(d, b),
+                "GEMM output must not overlap an input");
     if (c.has_value()) {
         TORCH_CHECK(c->sizes() == d.sizes(), "C and D must have the same shape");
         TORCH_CHECK(c->scalar_type() == d.scalar_type(), "C and D must have the same dtype");
@@ -117,27 +127,17 @@ void bf16_gemm_nt(const torch::Tensor& a,
         check_major_type_cd(c.value());
         TORCH_CHECK(c->data_ptr() != d.data_ptr() || c->strides() == d.strides(),
                     "C and D sharing the same address must have the same strides");
-        if (m != 0 && n != 0 && k != 0) {
-            // BF16 product kernels (including GEMV and split-K) have beta=0.
-            // Keep C alive until the FP32 product is complete, including C == D,
-            // and add it before the only conversion to the requested output dtype.
-            // Calls without C retain their existing dispatch and allocations.
-            auto accum = torch::empty({m, n}, d.options().dtype(torch::kFloat));
-            bf16_gemm_nt(a, b, accum, std::nullopt, compiled_dims, configs);
-            // The product kernel is cached but leaves accum unwritten in these modes.
-            if (is_compile_only()) return;
-            accum.add_(c.value());
-            d.copy_(accum);
-            return;
-        }
+        TORCH_CHECK(c->data_ptr() == d.data_ptr() || is_contiguous_output_disjoint(d, *c),
+                    "BF16 GEMM C/D must be disjoint or exactly aliased");
     }
-    if (early_return(m, n, k, d, c)) return;
-    if (n == 1 && !configs.has_value() && model_810e_bf16_n1(a, b, d)) return;
-    if (!configs.has_value() && model_810e_dispatch_dense(a, b, d)) return;
-    TORCH_CHECK(is_ppu1v5_device() || n % 2 == 0, "BF16 dense GEMM on PPU1.0 requires even N, got ", n);
+    if (m == 0 || n == 0) return;
+    if (k == 0) {
+        bf16_gemm_empty(d, c);
+        return;
+    }
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
-        bf16_gemm(a, b, d, m, n, k, configs);
+        bf16_gemm(a, b, d, m, n, k, configs, c);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -156,19 +156,6 @@ void gemm_fp32_fp32_fp32_nt(const torch::Tensor& a, const torch::Tensor& b, cons
     if (a.size(0) == 0 || b.size(0) == 0) return;
     if (a.size(1) == 0) { d.zero_(); return; }
     fp32_gemm(a, b, d);
-}
-
-void bf16_gemm_strided_batched_nt(const torch::Tensor& a, const torch::Tensor& b,
-    const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt) {
-    if (model_810e_check_batch(a, b, d)) return;
-    if (!configs.has_value() && model_810e_dispatch_batch(a, b, d)) return;
-    if (!configs.has_value() && a.size(2) == 128) {
-        // Short-K batches are output-bound at large M. Use the coalesced TSM
-        // epilogue; its existing alignment gate retains guarded direct stores.
-        model_810e_bf16_strided_batched_tsm(a, b, d, configs);
-        return;
-    }
-    model_810e_bf16_strided_batched(a, b, d, configs);
 }
 
 void bf16_gemm_nn(const torch::Tensor& a,
@@ -1988,8 +1975,6 @@ static void register_apis(pybind11::module_& m) {
     // BF16 GEMMs
     m.def("gemm_fp32_fp32_fp32_nt", &gemm_fp32_fp32_fp32_nt,
           py::arg("a"), py::arg("b"), py::arg("d"));
-    m.def("bf16_gemm_strided_batched_nt", &bf16_gemm_strided_batched_nt,
-          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("configs") = std::nullopt);
     m.def("bf16_gemm_nt", &bf16_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
     m.def("bf16_gemm_nn", &bf16_gemm_nn, py::arg("a"), py::arg("b"), py::arg("d"),
