@@ -88,7 +88,8 @@ static torch::Tensor mega_moe_slice(const torch::Tensor& buffer, uint64_t offset
 
 static std::tuple<int64_t, pybind11::function> get_mega_moe_buffer_slices_for_precision(
     const int& num_ranks, const int& num_experts, const int& num_max_tokens_per_rank, const int& num_topk,
-    const int& hidden, const int& intermediate_hidden, const std::string& precision);
+    const int& hidden, const int& intermediate_hidden, const std::string& precision,
+    const std::array<int, 3>& staging_config);
 
 static std::string fp8_mega_moe_precision(const std::string& quantization) {
     TORCH_CHECK(quantization == "channelwise" || quantization == "blockwise",
@@ -213,11 +214,8 @@ get_symm_buffer_size_for_mega_moe(
             precision = "w4a8";
         else
             precision = "w4a16";
-        TORCH_CHECK((staging_config == std::array<int, 3>{} ||
-                     staging_config == std::array<int, 3>{num_experts, num_max_tokens_per_rank, hidden}),
-                    "MegaMoE base must have the same workspace dimensions for ", precision);
         return get_mega_moe_buffer_slices_for_precision(
-            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, precision);
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, precision, staging_config);
     }
     TORCH_CHECK(false, "Unsupported MegaMoE mma_type: ", mma_type);
 }
@@ -451,7 +449,7 @@ static Precision routed_precision(const std::string& precision) {
 
 static layout::RoutedMoEBuffer checked_routed_layout(
     int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden,
-    int intermediate_hidden, const std::string& precision) {
+    int intermediate_hidden, const std::string& precision, const std::array<int, 3>& staging_config) {
     using P = Precision;
     const auto p = routed_precision(precision);
     TORCH_CHECK(num_ranks > 0 && num_ranks <= layout::kNumMaxRanks &&
@@ -465,8 +463,20 @@ static layout::RoutedMoEBuffer checked_routed_layout(
     const auto pool = layout::get_num_max_pool_tokens<uint64_t>(
         num_ranks, num_max_tokens_per_rank, num_topk, num_experts / num_ranks);
     TORCH_CHECK(pool <= std::numeric_limits<int32_t>::max(), "MegaMoE pool exceeds signed 32-bit rows");
+    auto staging = layout::RoutedMoEStaging::for_shape(num_ranks, num_experts, num_max_tokens_per_rank);
+    if (staging_config != std::array<int, 3>{}) {
+        const int owner_experts = staging_config[0], owner_capacity = staging_config[1];
+        TORCH_CHECK(owner_experts > 0 && owner_experts % num_ranks == 0 &&
+                        owner_experts / num_ranks <= (p == P::W4A16 ? 127 : 128) &&
+                        owner_capacity > 0 && owner_capacity < (1 << 24),
+                    "Invalid MegaMoE allocation staging configuration");
+        const auto owner = layout::RoutedMoEStaging::for_shape(num_ranks, owner_experts, owner_capacity);
+        TORCH_CHECK(staging.counts <= owner.counts && staging.tokens <= owner.tokens,
+                    "MegaMoE view exceeds allocation staging capacity");
+        staging = owner;
+    }
     return {uint32_t(num_ranks), uint32_t(num_experts), uint32_t(num_max_tokens_per_rank), uint32_t(num_topk),
-            uint32_t(hidden), uint32_t(intermediate_hidden), p != P::W4A16, p == P::FP8Blockwise};
+            uint32_t(hidden), uint32_t(intermediate_hidden), p != P::W4A16, p == P::FP8Blockwise, staging};
 }
 
 static void check_routed_buffer(const Tensor& buffer, const layout::RoutedMoEBuffer& layout) {
@@ -476,10 +486,11 @@ static void check_routed_buffer(const Tensor& buffer, const layout::RoutedMoEBuf
 
 static std::tuple<int64_t, pybind11::function> get_mega_moe_buffer_slices_for_precision(
     const int& num_ranks, const int& num_experts, const int& num_max_tokens_per_rank, const int& num_topk,
-    const int& hidden, const int& intermediate_hidden, const std::string& precision) {
+    const int& hidden, const int& intermediate_hidden, const std::string& precision,
+    const std::array<int, 3>& staging_config) {
     check_device();
     const auto layout = checked_routed_layout(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, precision);
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, precision, staging_config);
     auto slice_input_buffers =
         [=](const Tensor& buffer, const std::vector<int64_t>& pointers, const int& rank_idx) {
             check_routed_buffer(buffer, layout);
@@ -573,7 +584,8 @@ static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, cons
                             const std::optional<float>& situ_linear_beta_opt,
                             const std::optional<float>& activation_alpha_opt,
                             const std::optional<WeightPair>& l1_weights_replicas,
-                            const std::optional<WeightPair>& l2_weights_replicas) {
+                            const std::optional<WeightPair>& l2_weights_replicas,
+                            const std::array<int, 3>& staging_config) {
     check_device();
     const auto kind = routed_precision(precision);
     const bool fp8 = precision != "w4a16", blockwise = precision == "fp8_blockwise";
@@ -589,7 +601,7 @@ static void checked_mega_moe(const Tensor& y, const WeightPair& l1_weights, cons
     const int hidden = y.size(1), intermediate_hidden = w1.size(1) / 2;
     const int num_tokens = y.size(0), num_ranks = sym_buffer_ptrs.size();
     const auto l = checked_routed_layout(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, precision);
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, precision, staging_config);
     if (cumulative_local_expert_recv_stats) {
         check_tensor(*cumulative_local_expert_recv_stats, torch::kInt32);
         TORCH_CHECK(cumulative_local_expert_recv_stats->device() == y.device() &&
@@ -655,12 +667,12 @@ void fp8_fp8_mega_moe(
     const std::optional<float>& activation_alpha_opt,
     const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas,
     const std::string& quantization, const std::optional<float>& situ_beta_opt,
-    const std::optional<float>& situ_linear_beta_opt) {
+    const std::optional<float>& situ_linear_beta_opt, const std::array<int, 3>& staging_config) {
     checked_mega_moe<true>(
         y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats, sym_buffer,
         sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank, num_experts, num_topk,
         fp8_mega_moe_precision(quantization), activation, activation_clamp_opt, fast_math,
-        situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt, l1_weights_replicas, l2_weights_replicas);
+        situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt, l1_weights_replicas, l2_weights_replicas, staging_config);
 }
 
 void bf16_fp4_mega_moe(
@@ -671,12 +683,12 @@ void bf16_fp4_mega_moe(
     const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
     const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
     const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas,
-    const std::optional<float>& activation_alpha_opt) {
+    const std::optional<float>& activation_alpha_opt, const std::array<int, 3>& staging_config) {
     checked_mega_moe<false>(
         y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats, sym_buffer,
         sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank, num_experts, num_topk, "w4a16",
         activation, activation_clamp_opt, fast_math, situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt,
-        l1_weights_replicas, l2_weights_replicas);
+        l1_weights_replicas, l2_weights_replicas, staging_config);
 }
 
 
@@ -688,7 +700,8 @@ void fp8_fp4_mega_moe(
     const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
     const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
     const std::optional<float>& activation_alpha_opt,
-    const std::optional<W4A8Weights>& l1_weights_replicas, const std::optional<W4A8Weights>& l2_weights_replicas) {
+    const std::optional<W4A8Weights>& l1_weights_replicas, const std::optional<W4A8Weights>& l2_weights_replicas,
+    const std::array<int, 3>& staging_config) {
     check_device();
     const auto activation_kind = parse_gated_activation(activation);
     const auto activation_params = check_mega_moe_activation(
@@ -698,7 +711,7 @@ void fp8_fp4_mega_moe(
     const int hidden = y.size(1), intermediate = std::get<0>(l1_weights_tuple).size(1) / 2;
     const int tokens = y.size(0), ranks = sym_buffer_ptrs.size();
     const auto l = checked_routed_layout(ranks, num_experts, num_max_tokens_per_rank, num_topk,
-                                         hidden, intermediate, "w4a8");
+                                         hidden, intermediate, "w4a8", staging_config);
     TORCH_CHECK(tokens <= num_max_tokens_per_rank, "output token count exceeds workspace capacity");
     TORCH_CHECK(y.device() == sym_buffer.device(), "output and workspace must share a device");
     const auto transport = make_sym_buffer(sym_buffer_ptrs, rank_idx, ranks);

@@ -662,8 +662,10 @@ load-time exponent rebasing and is independent of routing weights and input
 scales. Prepare separately allocated master/replica banks independently; their
 inverse scales may differ. W4A8 scale exponents follow the
 [ordinary W4A8 preprocessing requirements](#w4a8-dense-and-moe-gemms-m890).
-FP8, W4A8 and W4A16 `base` aliases require the same mode, quantization, group,
-device and workspace dimensions; aliases execute serially on the same stream.
+All `base` aliases require the same mode, quantization, group and device.
+Shapes may differ when each view fits the allocation and its communication
+staging capacities. Create views before execution or capture, then use them
+serially on the same stream and in the same order on all ranks, including Graph replays.
 W4A8 input and activated output use rowwise E4M3 quantization, as for FP8
 channelwise, with the chosen activation fused into GEMM1.
 Transformed weights are specific to their backend and must not be interchanged.

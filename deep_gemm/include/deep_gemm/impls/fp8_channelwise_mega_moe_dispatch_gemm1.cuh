@@ -173,7 +173,8 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         const uint32_t num_tokens,
         const uint32_t num_max_tokens_per_rank,
         const float weight_inv_scale = 1.0f, const float replica_inv_scale = 1.0f,
-        const float situ_beta = 4.0f, const float situ_linear_beta = 25.0f) {
+        const float situ_beta = 4.0f, const float situ_linear_beta = 25.0f,
+        layout::RoutedMoEStaging staging = {}) {
     using Cfg = mega_moe::fp8_channelwise::Gemm1MmaConfig<
         kBlockM, kBlockN, kBlockK, kWarpM, kWarpN, kStages>;
     static_assert(kNumExpertsPerRank > 0 && kNumExpertsPerRank <= 128,
@@ -198,7 +199,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     constexpr uint32_t kNumWarps = kNumThreads / 32;
     const layout::Workspace workspace(
         workspace_base, kNumRanks, kNumExperts, num_max_tokens_per_rank,
-        kNumTopk);
+        kNumTopk, staging);
     const auto block_sync = [=]() { __syncthreads(); };
     auto* smem_expert_count = reinterpret_cast<uint32_t*>(smem_buf);
 

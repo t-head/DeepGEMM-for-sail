@@ -2,6 +2,8 @@
 
 // Symmetric MegaMoE workspace layout. Byte offsets describe counters,
 // arrival counters, source-token metadata, dispatch pools and GEMM outputs.
+#include <cstddef>
+
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/mega_moe_common.cuh>
 
@@ -96,8 +98,27 @@ struct Gemm2Metadata {
     }
 };
 
+// Allocation-owned state stays at the same addresses for every shape alias.
+struct RoutedMoESignals {
+    uint32_t grid[4], rank_counter;
+    int rank_signals[2];
+    alignas(16) int64_t peer_offsets[kNumMaxRanks];
+    alignas(128) int32_t combine_flag;
+    alignas(128) int32_t combine_done;
+};
+
+struct RoutedMoEStaging {
+    uint64_t counts = 0, tokens = 0;
+
+    CUTLASS_HOST_DEVICE static RoutedMoEStaging for_shape(uint32_t ranks, uint32_t experts, uint32_t capacity) {
+        return {math::align<uint64_t>((uint64_t(2) * experts + experts / ranks) * sizeof(uint64_t), 256),
+                math::align<uint64_t>(uint64_t(experts) * capacity * sizeof(uint32_t), 256)};
+    }
+};
+
 struct Workspace {
     void* base;
+    RoutedMoEStaging staging;
     uint32_t num_ranks, num_experts;
     uint32_t num_experts_per_rank;
     uint32_t num_max_tokens_per_rank;
@@ -106,16 +127,16 @@ struct Workspace {
     uint32_t num_max_pool_tokens;
     uint32_t num_max_pool_blocks;
 
-    // For grid and cross-rank generation barriers
-    static constexpr uint64_t kNumBarrierSignalBytes = 32;
+    static constexpr uint64_t kNumSignalBytes = sizeof(RoutedMoESignals);
 
     CUTLASS_HOST_DEVICE
     Workspace(void* base,
               const uint32_t& num_ranks,
               const uint32_t& num_experts,
               const uint32_t& num_max_tokens_per_rank,
-              const uint32_t& num_topk):
+              const uint32_t& num_topk, RoutedMoEStaging staging = {}):
         base(base),
+        staging(staging.counts ? staging : RoutedMoEStaging::for_shape(num_ranks, num_experts, num_max_tokens_per_rank)),
         num_ranks(num_ranks), num_experts(num_experts),
         num_max_tokens_per_rank(num_max_tokens_per_rank) {
         num_experts_per_rank = num_experts / num_ranks;
@@ -127,20 +148,13 @@ struct Workspace {
     uint64_t get_num_bytes() const {
         uint64_t num_bytes = 0;
 
-        // Barrier
-        num_bytes += kNumBarrierSignalBytes;
+        num_bytes += kNumSignalBytes;
 
-        // Expert send/recv count
-        num_bytes += num_experts * sizeof(uint64_t) * 2;
+        // Keep remote writes outside every alias's local compute/combine data.
+        num_bytes += staging.counts + staging.tokens;
 
-        // Expert recv count sum
-        num_bytes += num_experts_per_rank * sizeof(uint64_t);
-
-        // Per-block arrival counters; keep the following routing table 8-byte aligned.
+        // Per-block arrival counters; keep the following metadata 8-byte aligned.
         num_bytes += math::align(num_max_pool_blocks, 2u) * sizeof(uint32_t);
-
-        // Each (expert, source rank) list contains at most one entry per source token.
-        num_bytes += uint64_t(num_experts_per_rank) * num_ranks * num_max_tokens_per_rank * sizeof(uint32_t);
 
         // Source rank/token/top-k slots for scatter.
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
@@ -158,33 +172,29 @@ struct Workspace {
         return math::advance_ptr(base, get_num_bytes());
     }
 
-    // Grid sync counters: `kNumBarrierSignalBytes` layout
-    // [ 0..15]: 4 x `uint32_t` grid sync counters
-    // [16..19]: `uint32_t` cross-rank barrier counter
-    // [20..27]: 2 x `int` cross-rank barrier signals (phase 0 and 1)
     static constexpr uint32_t kNumMaxGridSyncCounters = 4;
 
     template <uint32_t kIndex = 0>
     CUTLASS_HOST_DEVICE
     uint32_t* get_grid_sync_count_ptr() const {
         DG_STATIC_ASSERT(kIndex < kNumMaxGridSyncCounters, "Grid sync index out of bounds");
-        return static_cast<uint32_t*>(base) + kIndex;
+        return static_cast<RoutedMoESignals*>(base)->grid + kIndex;
     }
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_nvl_barrier_counter_ptr() const {
-        return static_cast<uint32_t*>(base) + kNumMaxGridSyncCounters;
+        return &static_cast<RoutedMoESignals*>(base)->rank_counter;
     }
 
     CUTLASS_HOST_DEVICE
     int* get_nvl_barrier_signal_ptr(const uint32_t& phase) const {
         // NOTES: the signal is signed, as we may minus
-        return math::advance_ptr<int>(base, (kNumMaxGridSyncCounters + 1) * sizeof(uint32_t) + phase * sizeof(int));
+        return static_cast<RoutedMoESignals*>(base)->rank_signals + phase;
     }
 
     CUTLASS_HOST_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
-        return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes) + expert_idx;
+        return math::advance_ptr<uint64_t>(base, kNumSignalBytes) + expert_idx;
     }
 
     CUTLASS_HOST_DEVICE
@@ -200,16 +210,14 @@ struct Workspace {
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_l1_arrival_count_ptr(const uint32_t& pool_block_idx = 0) const {
-        const auto base = get_expert_recv_count_sum_ptr(num_experts_per_rank);
-        return reinterpret_cast<uint32_t*>(base) + pool_block_idx;
+        return math::advance_ptr<uint32_t>(base, kNumSignalBytes + staging.counts + staging.tokens) + pool_block_idx;
     }
 
     // For dispatch pulling
     CUTLASS_HOST_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
-        const auto base = get_l1_arrival_count_ptr(math::align(num_max_pool_blocks, 2u));
-        return reinterpret_cast<uint32_t*>(base) +
+        return math::advance_ptr<uint32_t>(base, kNumSignalBytes + staging.counts) +
             (uint64_t(expert_idx) * num_ranks + rank_idx) * num_max_tokens_per_rank + token_idx;
     }
 
@@ -221,7 +229,7 @@ struct Workspace {
     // For combine usages
     CUTLASS_HOST_DEVICE
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
-        const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
+        const auto base = reinterpret_cast<TokenSrcMetadata*>(get_l1_arrival_count_ptr(math::align(num_max_pool_blocks, 2u)));
         return base + pool_token_idx;
     }
 };
@@ -236,8 +244,8 @@ struct RoutedMoEInputLayout {
 
     CUTLASS_HOST_DEVICE
     RoutedMoEInputLayout(uint32_t ranks, uint32_t experts, uint32_t capacity, uint32_t topk,
-                        uint64_t token_bytes, uint64_t scale_bytes):
-        dispatch(nullptr, ranks, experts, capacity, topk) {
+                        uint64_t token_bytes, uint64_t scale_bytes, RoutedMoEStaging staging = {}):
+        dispatch(nullptr, ranks, experts, capacity, topk, staging) {
         const uint64_t pool = dispatch.num_max_pool_tokens;
         const auto align16 = [](uint64_t n) { return math::align<uint64_t>(n, 16); };
         const auto align128 = [](uint64_t n) { return math::align<uint64_t>(n, 128); };
@@ -260,9 +268,9 @@ struct RoutedMoEBuffer : RoutedMoEInputLayout {
 
     CUTLASS_HOST_DEVICE
     RoutedMoEBuffer(uint32_t ranks, uint32_t experts, uint32_t capacity, uint32_t topk,
-                    uint32_t hidden, uint32_t intermediate, bool fp8, bool blockwise):
+                    uint32_t hidden, uint32_t intermediate, bool fp8, bool blockwise, RoutedMoEStaging staging = {}):
         RoutedMoEInputLayout(ranks, experts, capacity, topk, uint64_t(hidden) * (fp8 ? 1 : 2),
-                            fp8 ? (blockwise ? hidden / 128 : 1) * sizeof(float) : 0) {
+                            fp8 ? (blockwise ? hidden / 128 : 1) * sizeof(float) : 0, staging) {
         const uint64_t pool = dispatch.num_max_pool_tokens, groups = experts / ranks;
         const auto align128 = [](uint64_t n) { return math::align<uint64_t>(n, 128); };
         packed_routes = gemm2_metadata + Gemm2Metadata::rows_bytes(groups);
@@ -271,11 +279,11 @@ struct RoutedMoEBuffer : RoutedMoEInputLayout {
         bf16_scratch = align128(l2_scales + (fp8 ? pool * (blockwise ? intermediate / 128 : 1) * sizeof(float) : 0));
         block_info = align128(bf16_scratch + (fp8 && !blockwise ? pool * intermediate * 2 : 0));
         block_info_elements = groups >= 128 ? 4 * (1 + groups + pool / kMinCandidateBlockM) : 0;
-        peer_offsets = align128(block_info + block_info_elements * sizeof(int32_t));
-        combine = align128(peer_offsets + uint64_t(ranks) * sizeof(int64_t));
-        barrier_flag = align128(combine + uint64_t(topk) * capacity * hidden * 2);
-        barrier_done = align128(barrier_flag + sizeof(int32_t));
-        num_bytes = align128(barrier_done + sizeof(int32_t));
+        peer_offsets = offsetof(RoutedMoESignals, peer_offsets);
+        barrier_flag = offsetof(RoutedMoESignals, combine_flag);
+        barrier_done = offsetof(RoutedMoESignals, combine_done);
+        combine = align128(block_info + block_info_elements * sizeof(int32_t));
+        num_bytes = align128(combine + uint64_t(topk) * capacity * hidden * 2);
     }
 
     CUTLASS_HOST_DEVICE uint64_t get_num_bytes() const { return num_bytes; }

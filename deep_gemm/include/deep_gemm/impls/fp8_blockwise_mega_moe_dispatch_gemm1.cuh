@@ -168,7 +168,8 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
         int32_t* gemm2_metadata, uint4* gemm2_block_info, const uint8_t* w1, const float* s1,
         uint8_t* output, float* output_scales,
         uint32_t num_tokens, uint32_t cap, float swiglu_limit = 0.0f, float activation_alpha = 1.0f, float situ_beta = 4.0f, float situ_linear_beta = 25.0f,
-        const uint8_t* w1_replicas = nullptr, const float* s1_replicas = nullptr) {
+        const uint8_t* w1_replicas = nullptr, const float* s1_replicas = nullptr,
+        layout::RoutedMoEStaging staging = {}) {
     static_assert(kRanks > 0 && kRanks <= 64 && kExperts % kRanks == 0);
     constexpr uint32_t kEpr = kExperts / kRanks;
     constexpr uint32_t kBlockM = 128, kBlockN = 256;
@@ -182,7 +183,7 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
     extern __shared__ __align__(128) unsigned char smem[];
     const uint32_t sm = blockIdx.x, thread = threadIdx.x;
     const uint32_t warp = thread / 32, lane = thread % 32;
-    const layout::Workspace ws(workspace_base, kRanks, kExperts, cap, kTopk);
+    const layout::Workspace ws(workspace_base, kRanks, kExperts, cap, kTopk, staging);
     constexpr uint32_t kWorkBatch = 2;
     if (sm == 0 && thread == 0)
         *ws.get_gemm1_work_count_ptr() = (kCTAs - kPullCTAs) * kWorkBatch;

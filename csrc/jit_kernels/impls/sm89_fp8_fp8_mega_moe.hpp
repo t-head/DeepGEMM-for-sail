@@ -124,6 +124,7 @@ public:
         LaunchInfo launch_info;
         LaunchArgs launch_args;
         Params kernel_params{};
+        layout::RoutedMoEStaging staging;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -134,12 +135,12 @@ public:
             TORCH_CHECK(dispatch.num_ranks > 0 && dispatch.num_experts % dispatch.num_ranks == 0,
                         "invalid MegaMoE layout");
             const layout::RoutedMoEInputLayout inputs(dispatch.num_ranks, dispatch.num_experts, dispatch.nmtpr,
-                                                     dispatch.num_topk, dispatch.token_bytes, dispatch.sf_bytes);
+                                                     dispatch.num_topk, dispatch.token_bytes, dispatch.sf_bytes, args.staging);
             if constexpr (kIsBlockwise) {
                 return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
 #include <deep_gemm/impls/sm89_fp8_fp8_mega_moe_blockwise.cuh>
-using Builder = deep_gemm::MegaMoEFp8BlockwiseGemm1Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), {}, {}, {}, {}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEFp8BlockwiseGemm1Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), {}, {}, {}, {}, {}, {}, {}, {}, {}>;
 static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_blockwise_mega_moe_l1<Builder>);
@@ -149,12 +150,13 @@ static void __instantiate_kernel() {{
                     inputs.input_scales, inputs.topk_idx, inputs.dispatched_tokens, inputs.dispatched_scales,
                     inputs.gemm2_metadata, dispatch.pull_ctas, int(args.kernel_params.activation_clamp >= 0),
                     c.master_experts, int(c.activation), c.metadata.block_m, dispatch.nmtpr, c.num_ctas, dispatch.num_experts,
-                    dispatch.num_ranks, dispatch.num_topk, dispatch.token_bytes, args.launch_args.smem_size);
+                    dispatch.num_ranks, dispatch.num_topk, dispatch.token_bytes,
+                    args.staging.counts, args.staging.tokens, args.launch_args.smem_size);
             } else {
                 return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
 #include <deep_gemm/impls/sm89_fp8_fp8_mega_moe.cuh>
-using Builder = deep_gemm::MegaMoEFp8ChannelwiseGemm1Kernel<{}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEFp8ChannelwiseGemm1Kernel<{}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
 static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_channelwise_mega_moe_l1<Builder>);
@@ -165,7 +167,7 @@ static void __instantiate_kernel() {{
                     dispatch.pull_group_size, c.metadata.block_m, c.metadata.valid_rows, dispatch.block_m, tile.block_k,
                     tile.block_n, c.n, tile.num_stages, tile.warp_m, tile.warp_n, dispatch.nmtpr,
                     c.num_ctas, dispatch.num_experts, dispatch.num_experts_per_rank, dispatch.num_ranks, dispatch.num_topk, dispatch.pull_ctas,
-                    dispatch.token_bytes, args.launch_args.smem_size);
+                    dispatch.token_bytes, args.staging.counts, args.staging.tokens, args.launch_args.smem_size);
             }
         } else {
             if constexpr (kIsBlockwise) {
@@ -255,6 +257,7 @@ static auto make_fp8_fp8_linear1_args(
         .kernel_name = Runtime::kIsBlockwise ? "fp8_blockwise_mega_moe_dispatch_gemm1" : "fp8_channelwise_mega_moe_dispatch_gemm1",
         .launch_info = config,
         .launch_args = {dim3(config.num_ctas), dim3(config.num_threads), config.tile.smem_size}};
+    args.staging = buffer.dispatch.staging;
     auto& p = args.kernel_params;
     p.sym_buffer = sym_buffer;
     p.rank_idx = rank_idx;

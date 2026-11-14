@@ -179,8 +179,9 @@ template <int BLOCK_M_, int GEMM1_BLOCK_N_, int TOKEN_BYTES_, int GEMM1_WARP_M_,
           int NUM_EXPERTS_PER_RANK_, int NUM_TOPK_, int GEMM1_N_, int PULL_CTAS_, int PULL_GROUP_SIZE_,
           int GEMM2_BLOCK_M_, bool GEMM2_VALID_ROWS_, uint64_t LAYOUT_OFF_ITI_, uint64_t LAYOUT_OFF_IT_,
           uint64_t LAYOUT_OFF_ISF_, uint64_t LAYOUT_OFF_PT_, uint64_t LAYOUT_OFF_PSF_,
-          uint64_t LAYOUT_OFF_GEMM2_META_, int NMTPR_>
+          uint64_t LAYOUT_OFF_GEMM2_META_, int NMTPR_, uint64_t StagingCounts_, uint64_t StagingTokens_>
 struct MegaMoEFp8Fp4Gemm1Kernel {
+    static constexpr layout::RoutedMoEStaging staging{StagingCounts_, StagingTokens_};
     static constexpr int BLOCK_M = BLOCK_M_, GEMM1_BLOCK_N = GEMM1_BLOCK_N_, TOKEN_BYTES = TOKEN_BYTES_;
     static constexpr int GEMM1_WARP_M = GEMM1_WARP_M_, GEMM1_WARP_N = GEMM1_WARP_N_, GEMM1_STAGES = GEMM1_STAGES_;
     static constexpr GatedActivation ACTIVATION = ACTIVATION_;
@@ -228,7 +229,7 @@ __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm8
         reinterpret_cast<float*>(p(Builder::LAYOUT_OFF_PSF)), reinterpret_cast<int32_t*>(p(Builder::LAYOUT_OFF_GEMM2_META)),
         gemm2_block_info, reinterpret_cast<const cutlass::float_e4m3_t*>(w), reinterpret_cast<const float*>(s),
         reinterpret_cast<const cutlass::float_e4m3_t*>(rw), reinterpret_cast<const float*>(rs), masters, out, limit,
-        alpha, tokens, Builder::NMTPR, inv, rinv, situ_beta, situ_linear_beta);
+        alpha, tokens, Builder::NMTPR, inv, rinv, situ_beta, situ_linear_beta, Builder::staging);
 }
 
 template <int N_, int K_, int BLOCK_M_, int BLOCK_N_, int WARP_M_, int WARP_N_, int NUM_GROUPS_, int NUM_STAGES_,

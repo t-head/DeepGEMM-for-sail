@@ -85,11 +85,6 @@ class SymmBuffer:
             base._check_live()
             if base.group is not group or base.buffer.device.index != torch.cuda.current_device():
                 raise ValueError('base must be a live MegaMoE workspace on the same group and device')
-            if mma_type not in ('fp4xfp4', 'int8xint8') and (
-                    num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden) != (
-                    base.num_experts, base.num_max_tokens_per_rank, base.num_topk,
-                    base.hidden, base.intermediate_hidden):
-                raise ValueError('base must have the same MegaMoE workspace dimensions')
 
         # Init
         activation = _normalize_activation(activation)
@@ -570,7 +565,7 @@ def fp8_fp8_mega_moe(
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         activation, activation_clamp, fast_math, activation_alpha,
         l1_weights_replicas, l2_weights_replicas, sym_buffer.quantization,
-        situ_beta, situ_linear_beta,
+        situ_beta, situ_linear_beta, sym_buffer.staging_config,
     )
 
 
@@ -608,7 +603,7 @@ def bf16_fp4_mega_moe(
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         activation, activation_clamp, fast_math, situ_beta, situ_linear_beta,
-        l1_weights_replicas, l2_weights_replicas, activation_alpha,
+        l1_weights_replicas, l2_weights_replicas, activation_alpha, sym_buffer.staging_config,
     )
 
 
@@ -664,4 +659,4 @@ def fp8_fp4_mega_moe(
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         activation, activation_clamp, fast_math, situ_beta, situ_linear_beta, activation_alpha,
-        l1_weights_replicas, l2_weights_replicas)
+        l1_weights_replicas, l2_weights_replicas, sym_buffer.staging_config)

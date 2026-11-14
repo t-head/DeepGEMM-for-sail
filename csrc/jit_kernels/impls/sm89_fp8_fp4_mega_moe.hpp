@@ -54,6 +54,7 @@ public:
         LaunchInfo launch_info;
         LaunchArgs launch_args;
         Params kernel_params{};
+        layout::RoutedMoEStaging staging;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -64,11 +65,11 @@ public:
             TORCH_CHECK(dispatch.num_ranks > 0 && dispatch.num_experts % dispatch.num_ranks == 0,
                         "invalid MegaMoE layout");
             const layout::RoutedMoEInputLayout inputs(dispatch.num_ranks, dispatch.num_experts, dispatch.nmtpr,
-                                                     dispatch.num_topk, dispatch.token_bytes, dispatch.sf_bytes);
+                                                     dispatch.num_topk, dispatch.token_bytes, dispatch.sf_bytes, args.staging);
             return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
 #include <deep_gemm/impls/sm89_fp8_fp4_mega_moe.cuh>
-using Builder = deep_gemm::MegaMoEFp8Fp4Gemm1Kernel<{}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEFp8Fp4Gemm1Kernel<{}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
 static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_fp4_mega_moe_l1<Builder>);
@@ -81,7 +82,7 @@ static void __instantiate_kernel() {{
                 dispatch.num_ranks, c.num_ctas, dispatch.num_experts_per_rank, dispatch.num_topk, c.n, dispatch.pull_ctas,
                 dispatch.pull_group_size, c.metadata.block_m, c.metadata.valid_rows, inputs.topk_idx, inputs.input_tokens,
                 inputs.input_scales, inputs.dispatched_tokens, inputs.dispatched_scales, inputs.gemm2_metadata,
-                dispatch.nmtpr, args.launch_args.smem_size);
+                dispatch.nmtpr, args.staging.counts, args.staging.tokens, args.launch_args.smem_size);
         } else {
             return fmt::format(R"(
 #include <deep_gemm/impls/sm89_fp8_fp4_mega_moe.cuh>
@@ -135,7 +136,8 @@ static auto make_fp8_fp4_linear1_args(
             .output = math::advance_ptr<at::BFloat16>(base, buffer.bf16_scratch),
             .activation_clamp = activation_clamp, .activation_alpha = activation_alpha,
             .situ_beta = situ_beta, .situ_linear_beta = situ_linear_beta,
-            .block_info = math::advance_ptr<uint4>(base, buffer.block_info)}};
+            .block_info = math::advance_ptr<uint4>(base, buffer.block_info)},
+        .staging = buffer.dispatch.staging};
 }
 
 static auto make_fp8_fp4_linear2_args(

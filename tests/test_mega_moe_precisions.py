@@ -9,6 +9,7 @@ from pathlib import Path
 import argparse
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 import pytest
 import torch
 import torch.distributed as dist
@@ -264,12 +265,13 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
             w2 = tuple(t[:-1].contiguous() for t in w2)
         options.update(l1_weights_replicas=replica1, l2_weights_replicas=replica2)
 
-    def forward(source, ids, weights, y, stats=None):
+    def forward(source, ids, weights, y, stats=None, *, workspace=None):
+        workspace = buffer if workspace is None else workspace
         dg.mega_moe_pre_dispatch(
             source, ids, weights,
-            buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
-            num_tokens=source.shape[0], mma_type=buffer.mma_type)
-        entry(y, w1, w2, buffer, stats, **options)
+            workspace.x, workspace.x_sf, workspace.topk_idx, workspace.topk_weights,
+            num_tokens=source.shape[0], mma_type=workspace.mma_type)
+        entry(y, w1, w2, workspace, stats, **options)
         return y
 
     return SimpleNamespace(buffer=buffer, raw1=raw1, raw2=raw2, ref1=ref1, ref2=ref2,
@@ -752,6 +754,105 @@ def test_mega_moe_precision_api(case, mega_moe_group):
             transform((odd_weight, odd_scale), pipeline.raw2, **options)
     finally:
         pipeline.buffer.destroy()
+
+
+@pytest.mark.parametrize("precision", ("fp8_channelwise", "fp8_blockwise", "w4a8", "w4a16"))
+def test_mega_moe_precision_workspace(precision, mega_moe_group):
+    """Different layer shapes share one allocation in eager and independent Graphs."""
+    import torch.distributed._symmetric_memory as symm_mem
+    group = mega_moe_group
+    rank, world = group.rank(), group.size()
+    template = next(c for c in SMOKE_CASES if c.precision == precision)
+    cases = [replace(template, hidden=h, intermediate=i, experts=e * world, topk=k, capacity=c,
+                     worlds=DISTRIBUTED_WORLDS)
+             for h, i, e, k, c in ((1024, 512, 8, 2, 272), (512, 256, 4, 4, 144), (256, 128, 2, 1, 544))]
+    rng = torch.Generator(device="cuda").manual_seed(20261114 + rank)
+    pipelines, aliases, inputs, expected, graphs = [], [], [], [], []
+    try:
+        for index, case in enumerate(cases):
+            pipeline = make_pipeline(case, group, rng)
+            pipelines.append(pipeline)
+            tokens = (129, 33, 17)[index]
+            if world > 1 and rank == world - 1 and index == 1:
+                tokens = 0
+            source = torch.randn(case.capacity, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .1
+            ids = torch.full((case.capacity, case.topk), -1, device="cuda", dtype=torch.int64)
+            ids[:tokens] = _make_routes(case, tokens, rng)
+            weights = torch.rand(case.capacity, case.topk, device="cuda", generator=rng)
+            y = torch.empty_like(source[:tokens])
+            args = (source[:tokens], ids[:tokens], weights[:tokens], y)
+            inputs.append(args)
+            result = pipeline.forward(*args).clone()
+            ref = reference(case, _all_gather(source), _all_gather(ids), _all_gather(weights),
+                            pipeline.ref1, pipeline.ref2, rank, tokens)
+            check_output(result, ref, .0015 if precision == "w4a8" else .001)
+            expected.append(result)
+
+        base = pipelines[0].buffer
+        saved = base.buffer.clone()
+        for case in cases:
+            with patch.object(symm_mem, "empty", side_effect=AssertionError("alias allocated storage")), \
+                 patch.object(symm_mem, "rendezvous", side_effect=AssertionError("alias registered again")):
+                alias = dg.SymmBuffer(group, case.experts, case.capacity, case.topk, case.hidden, case.intermediate,
+                                      mma_type=base.mma_type, quantization=base.quantization,
+                                      activation=case.activation, base=aliases[-1] if aliases else base)
+            aliases.append(alias)
+            assert alias.buffer is base.buffer and alias.handle is base.handle
+            assert alias.staging_config == base.staging_config
+            for view in (alias.x, alias.x_sf, alias.topk_idx, alias.topk_weights):
+                if view.numel():
+                    assert base.buffer.data_ptr() <= view.data_ptr()
+                    assert view.data_ptr() + view.nbytes <= base.buffer.data_ptr() + base.buffer.nbytes
+        torch.testing.assert_close(base.buffer, saved, rtol=0, atol=0)
+        case = cases[0]
+        with pytest.raises(RuntimeError, match="staging capacity"):
+            dg.SymmBuffer(group, case.experts, case.capacity * 2, case.topk, case.hidden, case.intermediate,
+                          mma_type=base.mma_type, quantization=base.quantization, base=base)
+        with pytest.raises(ValueError, match="view needs"):
+            dg.SymmBuffer(group, case.experts, case.capacity, case.topk, case.hidden, case.intermediate * 16,
+                          mma_type=base.mma_type, quantization=base.quantization, base=base)
+
+        # Finish construction checks on every rank before dispatch can write to peers.
+        dist.barrier()
+        for pipeline, args, alias in zip(pipelines, inputs, aliases):
+            pipeline.forward(*args, workspace=alias)
+        torch.cuda.synchronize()
+        for pipeline, args, alias in zip(pipelines, inputs, aliases):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                pipeline.forward(*args, workspace=alias)
+            graphs.append(graph)
+
+        # Queue switches without host synchronization, including empty ranks and
+        # a view whose token capacity is larger than its allocation owner's.
+        order = (0, 1, 2, 1, 0, 2)
+        for replay in (False, True):
+            results = []
+            for index in order * 2:
+                if replay:
+                    graphs[index].replay()
+                else:
+                    pipelines[index].forward(*inputs[index], workspace=aliases[index])
+                results.append((index, inputs[index][-1].clone()))
+            torch.cuda.synchronize()
+            for index, result in results:
+                torch.testing.assert_close(result, expected[index], rtol=0, atol=0)
+
+        # Releasing the original Python owner does not invalidate live views or Graphs.
+        base.destroy()
+        for index in order:
+            graphs[index].replay()
+        torch.cuda.synchronize()
+        for args, result in zip(inputs, expected):
+            torch.testing.assert_close(args[-1], result, rtol=0, atol=0)
+        dist.barrier()
+    finally:
+        for graph in graphs:
+            graph.reset()
+        for alias in aliases:
+            alias.destroy()
+        for pipeline in pipelines:
+            pipeline.buffer.destroy()
 
 
 def main(argv=None):

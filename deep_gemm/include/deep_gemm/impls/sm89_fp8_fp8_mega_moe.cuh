@@ -10,8 +10,9 @@ template <int NUM_THREADS_, uint64_t LAYOUT_OFF_IT_, uint64_t LAYOUT_OFF_ISF_, u
           int PULL_GROUP_SIZE_, int GEMM2_BLOCK_M_, bool GEMM2_VALID_ROWS_, int BLOCK_M_, int GEMM1_BLOCK_K_,
           int GEMM1_BLOCK_N_, int GEMM1_N_, int GEMM1_STAGES_, int GEMM1_WARP_M_, int GEMM1_WARP_N_, int NMTPR_,
           int NUM_CTAS_, int NUM_EXPERTS_, int NUM_EXPERTS_PER_RANK_, int NUM_RANKS_, int NUM_TOPK_,
-          int PULL_CTAS_, int TOKEN_BYTES_>
+          int PULL_CTAS_, int TOKEN_BYTES_, uint64_t StagingCounts_, uint64_t StagingTokens_>
 struct MegaMoEFp8ChannelwiseGemm1Kernel {
+    static constexpr layout::RoutedMoEStaging staging{StagingCounts_, StagingTokens_};
     static constexpr int NUM_THREADS = NUM_THREADS_;
     static constexpr uint64_t LAYOUT_OFF_IT = LAYOUT_OFF_IT_, LAYOUT_OFF_ISF = LAYOUT_OFF_ISF_;
     static constexpr uint64_t LAYOUT_OFF_ITI = LAYOUT_OFF_ITI_, LAYOUT_OFF_PT = LAYOUT_OFF_PT_;
@@ -65,7 +66,7 @@ __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm8
         (uint8_t*)P(off_pt), (float*)P(off_psf), (int32_t*)P(off_meta), gemm2_block_info,
         (const cutlass::float_e4m3_t*)gemm1_weight, gemm1_weight_scale,
         (const cutlass::float_e4m3_t*)gemm1_weight_replicas, gemm1_weight_scale_replicas, (uint32_t)num_master_experts,
-        swiglu_output, activation_clamp, activation_alpha, (uint32_t)num_tokens, Builder::NMTPR, 1.0f, 1.0f, situ_beta, situ_linear_beta);
+        swiglu_output, activation_clamp, activation_alpha, (uint32_t)num_tokens, Builder::NMTPR, 1.0f, 1.0f, situ_beta, situ_linear_beta, Builder::staging);
 }
 
 template <bool USE_PADDED_VALID_ROWS, bool CHECK_PACKED_ROUTES, int N, int K, int BLOCK_M, int BLOCK_N,

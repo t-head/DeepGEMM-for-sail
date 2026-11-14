@@ -11,9 +11,9 @@ template <uint32_t Ranks, uint32_t CTAs, uint32_t Threads, uint32_t Experts, uin
           uint32_t BlockM, uint32_t PullSlots, uint32_t TokenBytes, uint32_t PullCTAs, uint32_t PullGroupSize>
 CUTLASS_DEVICE void dispatch_tokens(void* workspace_base, const layout::SymBuffer<>& buffer,
                                     int64_t* input_ids, const uint8_t* input_tokens, uint8_t* dispatched_tokens,
-                                    void* metadata, uint32_t tokens, uint32_t capacity) {
+                                    void* metadata, uint32_t tokens, uint32_t capacity, layout::RoutedMoEStaging staging) {
     const uint32_t cta = blockIdx.x, thread = threadIdx.x, warp = thread / 32, lane = thread % 32;
-    const layout::Workspace ws(workspace_base, Ranks, Experts, capacity, TopK);
+    const layout::Workspace ws(workspace_base, Ranks, Experts, capacity, TopK, staging);
     const layout::Gemm2Metadata meta(metadata, ExpertsPerRank);
     const auto block_sync = []() { __syncthreads(); };
     extern __shared__ __align__(16) unsigned char smem_buf[];
@@ -90,7 +90,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     const uint8_t* __restrict__ gemm1_weight_scale, const uint8_t* __restrict__ gemm1_weight_replicas,
     const uint8_t* __restrict__ gemm1_weight_scale_replicas, const uint32_t num_master_experts,
     __ppu_bfloat16* __restrict__ activated, const float situ_beta, const float situ_linear_beta,
-    const uint32_t num_pool, const int rank) {
+    const uint32_t num_pool, const int rank, layout::RoutedMoEStaging staging) {
     extern __shared__ __align__(16) unsigned char smem_buf[];
 
     static_assert(kNumExpertsPerRank < 128, "fused W4A16 dispatch currently uses the direct no-pad scheduler");
@@ -101,7 +101,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     dispatch_tokens<kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank, kNumTopk, kDispatchBlockM,
                     kPullSlots, kShapeK * sizeof(__ppu_bfloat16), kNumPullCTAs, kPullGroupSize>(
         workspace_base, sym_buffer, input_topk_idx, input_token, dispatched_token_pool, gemm2_metadata,
-        num_tokens, kNumMaxTokensPerRank);
+        num_tokens, kNumMaxTokensPerRank, staging);
 
     const layout::Gemm2Metadata gemm2_meta(gemm2_metadata, kNumExpertsPerRank);
 
@@ -125,7 +125,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     params.valid_m_rows = gemm2_meta.valid_rows;
     params.situ_beta = situ_beta;
     params.situ_linear_beta = situ_linear_beta;
-    const layout::Workspace ws(workspace_base, kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
+    const layout::Workspace ws(workspace_base, kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, staging);
     params.queue_counter = ws.get_gemm1_work_count_ptr();
     params.arrival_counts = ws.get_l1_arrival_count_ptr(0);
     params.dispatch_block_m = kDispatchBlockM;
@@ -140,8 +140,9 @@ namespace deep_gemm {
 template <int N_, int K_, int BlockM_, int BlockN_, int BlockK_, int WarpM_, int WarpN_, int WarpK_, int Groups_,
           int Stages_, int Ranks_, int CTAs_, int Threads_, int DispatchBlockM_, int TopK_, int Capacity_,
           int PullCTAs_, int PullGroupSize_, int PullSlots_, uint64_t PoolTokens_, uint64_t InputTokens_,
-          uint64_t TopkIdx_, uint64_t DispatchedTokens_, uint64_t Gemm2Metadata_, GatedActivation Activation_>
+          uint64_t TopkIdx_, uint64_t DispatchedTokens_, uint64_t Gemm2Metadata_, GatedActivation Activation_, uint64_t StagingCounts_, uint64_t StagingTokens_>
 struct MegaMoEBf16Fp4Gemm1Kernel {
+    static constexpr layout::RoutedMoEStaging staging{StagingCounts_, StagingTokens_};
     static constexpr GatedActivation Activation = Activation_;
     static constexpr int N = N_;
     static constexpr int K = K_;
@@ -198,7 +199,7 @@ __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm8
         pointer(0), sb, reinterpret_cast<int64_t*>(pointer(Builder::TopkIdx)), pointer(Builder::InputTokens),
         pointer(Builder::DispatchedTokens), pointer(Builder::Gemm2Metadata), static_cast<uint32_t>(num_tokens), rhs, rhs_scales,
         rhs_replicas, rhs_replica_scales, static_cast<uint32_t>(num_master_experts), activated,
-        situ_beta, situ_linear_beta, static_cast<uint32_t>(Builder::PoolTokens), rank_idx);
+        situ_beta, situ_linear_beta, static_cast<uint32_t>(Builder::PoolTokens), rank_idx, Builder::staging);
 }
 
 template <int N, int K, int BlockM, int BlockN, int BlockK, int WarpM, int WarpN,

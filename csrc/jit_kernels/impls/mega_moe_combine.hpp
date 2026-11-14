@@ -73,7 +73,7 @@ inline MegaMoECombineRuntime::Args make_mega_moe_combine_args(
          num_tokens, hidden, config.nmtpr, config.num_experts, 0, 0, 0,
          sym_buffer, math::advance_ptr<int32_t>(base, buffer.barrier_flag), rank_idx, config.num_ranks,
          math::advance_ptr<int32_t>(base, buffer.barrier_done),
-         math::advance_ptr<uint64_t>(base, layout::Workspace::kNumBarrierSignalBytes), count_words}};
+         math::advance_ptr<uint64_t>(base, layout::Workspace::kNumSignalBytes), count_words}};
 }
 
 inline void combine_mega_moe(
