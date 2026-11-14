@@ -9,6 +9,7 @@
 #include "../jit_kernels/impls/ppuxx_layout.hpp"
 
 #include "../jit_kernels/impls/bf16_gemm.hpp"
+#include "../jit_kernels/impls/bf16xfp32_gemm.hpp"
 #include "../jit_kernels/impls/fp32_gemm.hpp"
 #include "../jit_kernels/impls/int8_gemm.hpp"
 #include "../jit_kernels/impls/m_grouped_bf16_gemm.hpp"
@@ -183,6 +184,73 @@ void bf16_gemm_tt(const torch::Tensor& a,
                   const std::string& compiled_dims,
                   std::optional<ConfigTuple> configs = std::nullopt) {
     DG_HOST_UNREACHABLE("BF16 TT layout is not supported: kernel does not support non-NT layouts due to performance concerns");
+}
+
+// -----------------------------------------------------------------------------
+// BF16 x FP32 dense GEMM (NT layout).
+//
+// Computes D = x @ (W_high + W_low * scale)^T where the FP32 weight is given
+// as two BF16 matrices (high part + residual part, typically scale = 1/256):
+//     W_high = W_fp32.to(torch.bfloat16)
+//     W_low  = ((W_fp32 - W_high.float()) / scale).to(torch.bfloat16)
+//
+// Inputs / outputs:
+//     x               : BF16, row-major [m, k]
+//     w_high / w_low  : BF16, row-major [n, k]  (NT: rhs.T is column-major)
+//     return          : FP32 if use_fp32_output else BF16, row-major [m, n]
+// Accumulation: every MMA product accumulates in FP32; the high/low parts are
+// combined with an FP32 FMA before the (optional) BF16 rounding of the final
+// store. Layout support: NT only, contiguous tensors (same contract as
+// bf16_gemm_nt). Exact FP32 router decode may partition K internally within
+// a CTA; the native API exposes no Split-K controls or global workspace.
+// -----------------------------------------------------------------------------
+torch::Tensor bf16xfp32_gemm_nt(const torch::Tensor& x,
+                                const torch::Tensor& w_high,
+                                const torch::Tensor& w_low,
+                                const double& scale,
+                                const bool& use_fp32_output,
+                                std::optional<ConfigTuple> configs = std::nullopt) {
+    TORCH_CHECK(scale > 0.0, "scale must be positive, got ", scale);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be BF16");
+    TORCH_CHECK(w_high.scalar_type() == torch::kBFloat16, "w_high must be BF16");
+    TORCH_CHECK(w_low.scalar_type() == torch::kBFloat16, "w_low must be BF16");
+    TORCH_CHECK(w_high.sizes() == w_low.sizes(), "w_high and w_low must have the same shape");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(w_high.is_contiguous(), "w_high must be contiguous");
+    TORCH_CHECK(w_low.is_contiguous(), "w_low must be contiguous");
+
+    const auto& [m, k] = get_shape<2>(x);
+    const auto& [n, k_] = get_shape<2>(w_high);
+    TORCH_CHECK(k == k_, "x and weights must share the same K, got ", k, " vs ", k_);
+    TORCH_CHECK(n % 2 == 0, "BF16xFP32 dense GEMM requires even N, got ", n);
+
+    // Empty problem: return a correctly shaped (zero-initialized) output.
+    if (m == 0 or n == 0)
+        return torch::zeros({m, n}, x.options().dtype(use_fp32_output ? torch::kFloat : torch::kBFloat16));
+    if (k == 0)
+        return torch::zeros({m, n}, x.options().dtype(use_fp32_output ? torch::kFloat : torch::kBFloat16));
+
+    const auto arch_major = device_runtime->get_arch_major();
+    if (arch_major != 8) {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+
+    auto out = torch::empty({m, n}, x.options().dtype(use_fp32_output ? torch::kFloat : torch::kBFloat16));
+    bf16xfp32_gemm(x, w_high, w_low, out, scale, m, n, k, configs);
+    return out;
+}
+
+// Legacy zero-initialized int32 workspace allocator, independent of GEMM.
+// Shape contract: [ceil(max_tokens / 16), ceil(n / 64)]. Internal K
+// partitioning reduces inside the CTA; GEMM accepts no external workspace.
+torch::Tensor get_gemm_bf16xfp32_workspace(const int64_t& max_weight_hidden_size,
+                                          const int64_t& max_tokens = 131072) {
+    constexpr int64_t kMinTileM = 16;
+    constexpr int64_t kMinTileN = 64;
+    const int64_t nm_max = (max_tokens + kMinTileM - 1) / kMinTileM;
+    const int64_t nn_max = (max_weight_hidden_size + kMinTileN - 1) / kMinTileN;
+    return torch::zeros({nm_max, nn_max},
+                        torch::TensorOptions().dtype(torch::kInt32).device(at::kCUDA));
 }
 
 void int8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -1983,6 +2051,12 @@ static void register_apis(pybind11::module_& m) {
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
     m.def("bf16_gemm_tt", &bf16_gemm_tt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
+    // BF16 x FP32 dense GEMM (native API; no Split-K controls)
+    m.def("bf16xfp32_gemm_nt", &bf16xfp32_gemm_nt, py::arg("x"), py::arg("w_high"),
+          py::arg("w_low"), py::arg("scale"), py::arg("use_fp32_output") = false,
+          py::arg("configs") = std::nullopt);
+    m.def("get_gemm_bf16xfp32_workspace", &get_gemm_bf16xfp32_workspace,
+          py::arg("max_weight_hidden_size"), py::arg("max_tokens") = 131072);
     m.def("k_grouped_bf16_gemm_tn_contiguous", &k_grouped_bf16_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("ks_cpu"), py::arg("grouped_layout"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "mn", py::arg("use_psum_layout") = false,

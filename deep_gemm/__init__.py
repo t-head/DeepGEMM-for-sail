@@ -55,6 +55,9 @@ from ._C import (
     m_grouped_bf16_gemm_nt_masked,
     m_grouped_bf16_gemm_nt_nopad,
     m_grouped_bf16_gemm_nt_fused,
+    # BF16 x FP32 GEMM (native API and legacy workspace helper)
+    bf16xfp32_gemm_nt,
+    get_gemm_bf16xfp32_workspace,
     # INT8 GEMMs
     int8_gemm_nt,
     m_grouped_int8_gemm_nt_contiguous,
@@ -182,6 +185,11 @@ gemm_bf16_bf16_fp32_nt = bf16_gemm_nt
 gemm_bf16_bf16_bf16_nn = bf16_gemm_nn
 gemm_bf16_bf16_bf16_tn = bf16_gemm_tn
 gemm_bf16_bf16_bf16_tt = bf16_gemm_tt
+
+# --- BF16 x FP32 dense GEMM (FP32 weight split into two BF16 parts) ---
+def gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output=False):
+    """BF16 x FP32 GEMM convenience wrapper for the native NT API."""
+    return bf16xfp32_gemm_nt(x, w_high, w_low, scale, use_fp32_output)
 
 # --- BF16 M-grouped GEMM ---
 m_grouped_gemm_bf16_bf16_bf16_nt_contiguous = m_grouped_bf16_gemm_nt_contiguous

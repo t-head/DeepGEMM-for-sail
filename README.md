@@ -145,6 +145,13 @@ Explicit/LUT tiles require a 16-byte-aligned product output and N divisible by
 8 (BF16) or 4 (FP32); with C, this applies to the internal FP32 product.
 Unsupported inputs/configurations raise host errors; see [810E checkin cases](tests/checkin/checkin_810e.list).
 
+BF16 x FP32 dense GEMM: `deep_gemm.gemm_bf16xfp32(x, w_high, w_low,
+scale, use_fp32_output=False)` computes `x @ (w_high + scale * w_low).T`
+from contiguous BF16 tensors in NT layout, with FP32 accumulation and even N.
+The wrapper accepts only these five arguments and returns BF16 by default
+or FP32 when requested. No external workspace is accepted. The native
+`deep_gemm.bf16xfp32_gemm_nt` additionally accepts optional `configs`.
+
 #### Grouped GEMMs (contiguous layout)
 
 Unlike traditional grouped GEMMs in ACTLIZE, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape.
