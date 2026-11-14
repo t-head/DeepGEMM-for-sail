@@ -89,11 +89,9 @@ static void k_grouped_bf16_gemm_tn_contiguous_impl(
     const int& m, const int& n, const int& sum_k,
     const std::vector<int>& ks_cpu, const torch::Tensor& grouped_layout) {
     const auto num_groups = static_cast<int>(ks_cpu.size());
-    // Follow upstream: choose the config using the largest group's K.
     const auto max_k = *std::max_element(ks_cpu.begin(), ks_cpu.end());
     const auto [num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, _smem_config] =
-        deep_gemm_bf16_common::get_best_configs(m, n, max_k, num_groups, get_num_sms(),
-                                               GemmType::KGroupedContiguous);
+        deep_gemm_bf16_common::get_k_grouped_configs(m, n, sum_k, max_k, ks_cpu, get_num_sms());
     const int block_size = 32 * (block_m / warp_m) * (block_n / warp_n);
     const int smem_size = static_cast<int>(gemm_smem_total_size(
         2, num_stages, block_m, block_n, block_k));
