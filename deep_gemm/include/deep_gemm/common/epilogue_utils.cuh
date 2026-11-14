@@ -129,41 +129,85 @@ __device__ __forceinline__ void epilogue_no_tsm(TAcc& accum, const TCcC& tCcC, v
 #endif
 }
 
+// Full-CTA bounds and float4 alignment are checked by the caller.
+// Adjacent N fragments permit pairing two MMA rows for contiguous C requests.
 template <uint32_t STRIDE_CM, class TAcc, class TCcC>
 __device__ __forceinline__ void epilogue_no_tsm_float4(
         TAcc& accum, const TCcC& tCcC, float* c_ptr, uint32_t row_base,
         uint32_t n_offset) {
     using namespace cute;
+    constexpr int kVectors = size<2>(TCcC{});
+    constexpr bool kPairRows =
+#if __HGGC_ARCH__ == 150
+        is_same_v<decltype(stride<2>(TCcC{})), ScaledBasis<_16, 1>> && kVectors % 2 == 0;
+#else
+        false;
+#endif
+    constexpr int kRows = kPairRows ? 2 : 1;
     const bool odd_lane = (threadIdx.x & 1) != 0;
+    const int lane_column = (threadIdx.x >> 2) & (kRows - 1);
     CUTLASS_PRAGMA_UNROLL
     for (int wm = 0; wm < size<1>(tCcC); ++wm) {
         CUTLASS_PRAGMA_UNROLL
         for (int mm = 0; mm < size<0,1>(tCcC); ++mm) {
             const uint32_t row = get<0>(tCcC(make_coord(_0{}, mm, _0{}), wm, _0{}));
-            constexpr int kVectors = size<2>(TCcC{});
-            float4 old[kVectors];
+            const uint32_t first_row = row_base + (row & ~(kRows - 1));
+            auto address = [&](int wn, int r) {
+                const auto col = get<1>(tCcC(make_coord(_0{}, mm, _0{}), wm, wn + lane_column)) +
+                    (odd_lane ? 6 : 0);
+                return c_ptr + static_cast<size_t>(first_row + r) * STRIDE_CM + n_offset + col;
+            };
+            // Load the complete batch of old C before packing and storing.
+            float4 previous[kVectors];
             CUTLASS_PRAGMA_UNROLL
-            for (int wn = 0; wn < kVectors; ++wn) {
-                const uint32_t col = get<1>(tCcC(make_coord(_0{}, mm, _0{}), wm, wn)) + (odd_lane ? 6 : 0);
-                const float* dst = c_ptr + static_cast<size_t>(row_base + row) * STRIDE_CM + n_offset + col;
-                cutlass::arch::global_load<float4, sizeof(float4)>(old[wn], dst, true);
+            for (int wn = 0; wn < kVectors; wn += kRows) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int r = 0; r < kRows; ++r) {
+                    if constexpr (kPairRows) {
+                        uint4 raw;
+                        asm volatile("ppu.ld.global.bl.v4.u32 {%0, %1, %2, %3}, [%4];"
+                                     : "=r"(raw.x), "=r"(raw.y), "=r"(raw.z), "=r"(raw.w) : "l"(address(wn, r)));
+                        previous[wn + r] = {__uint_as_float(raw.x), __uint_as_float(raw.y),
+                                            __uint_as_float(raw.z), __uint_as_float(raw.w)};
+                    } else {
+                        cutlass::arch::global_load<float4, sizeof(float4)>(previous[wn + r], address(wn, r), true);
+                    }
+                }
             }
             CUTLASS_PRAGMA_UNROLL
-            for (int wn = 0; wn < kVectors; ++wn) {
-                const float* p0 = raw_pointer_cast(accum(make_coord(_, mm, _0{}), wm, wn).data());
-                const float* p1 = raw_pointer_cast(accum(make_coord(_, mm, _1{}), wm, wn).data());
-                const float peer00 = __shfl_xor_sync(0xffffffffu, p0[0], 1);
-                const float peer01 = __shfl_xor_sync(0xffffffffu, p0[1], 1);
-                const float peer10 = __shfl_xor_sync(0xffffffffu, p1[0], 1);
-                const float peer11 = __shfl_xor_sync(0xffffffffu, p1[1], 1);
-                const float4 packed = odd_lane
-                    ? float4{peer10, peer11, p1[0], p1[1]}
-                    : float4{p0[0], p0[1], peer00, peer01};
-                const float4 value = {packed.x + old[wn].x, packed.y + old[wn].y,
-                                      packed.z + old[wn].z, packed.w + old[wn].w};
-                const uint32_t col = get<1>(tCcC(make_coord(_0{}, mm, _0{}), wm, wn)) + (odd_lane ? 6 : 0);
-                float* dst = c_ptr + static_cast<size_t>(row_base + row) * STRIDE_CM + n_offset + col;
-                cutlass::arch::global_store<float4, sizeof(float4)>(value, dst, true);
+            for (int wn = 0; wn < kVectors; wn += kRows) {
+                float4 fragment[kRows];
+                for_each(make_int_sequence<kRows>{}, [&](auto i) {
+                    const auto* a = raw_pointer_cast(accum(make_coord(_, mm, _0{}), wm, wn + i).data());
+                    const auto* b = raw_pointer_cast(accum(make_coord(_, mm, _1{}), wm, wn + i).data());
+                    const float x = __shfl_xor_sync(0xffffffffu, odd_lane ? a[0] : b[0], 1);
+                    const float y = __shfl_xor_sync(0xffffffffu, odd_lane ? a[1] : b[1], 1);
+                    fragment[i] = odd_lane ? float4{x, y, b[0], b[1]} : float4{a[0], a[1], x, y};
+                });
+                if constexpr (kPairRows) {
+                    // Lane bit 2 owns the adjacent row; exchange one float4.
+                    const bool upper = (threadIdx.x & 4) != 0;
+                    const auto send = upper ? fragment[0] : fragment[1];
+                    const float4 peer{__shfl_xor_sync(0xffffffffu, send.x, 4),
+                                      __shfl_xor_sync(0xffffffffu, send.y, 4),
+                                      __shfl_xor_sync(0xffffffffu, send.z, 4),
+                                      __shfl_xor_sync(0xffffffffu, send.w, 4)};
+                    if (upper) fragment[0] = peer;
+                    else fragment[1] = peer;
+                }
+                CUTLASS_PRAGMA_UNROLL
+                for (int r = 0; r < kRows; ++r) {
+                    const auto old = previous[wn + r];
+                    const auto data = fragment[r];
+                    const float4 value{old.x + data.x, old.y + data.y, old.z + data.z, old.w + data.w};
+                    if constexpr (kPairRows) {
+                        asm volatile("ppu.st.global.cg.v4.u32 [%0], {%1, %2, %3, %4};"
+                                     :: "l"(address(wn, r)), "r"(__float_as_uint(value.x)), "r"(__float_as_uint(value.y)),
+                                        "r"(__float_as_uint(value.z)), "r"(__float_as_uint(value.w)));
+                    } else {
+                        cutlass::arch::global_store<float4, sizeof(float4)>(value, address(wn, r), true);
+                    }
+                }
             }
         }
     }

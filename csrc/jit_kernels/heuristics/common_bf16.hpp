@@ -1,6 +1,9 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <optional>
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
@@ -10,6 +13,8 @@
 #include "gemm_search_space.hpp"
 #include "adaptive_tile_selector.hpp"
 #include "runtime_lut.hpp"
+#include <deep_gemm/common/fused_gemm_common.cuh>
+#include <deep_gemm/common/gemm_occ_model.cuh>
 #include <deep_gemm/common/types.cuh>
 
 using namespace deep_gemm;
@@ -565,6 +570,118 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
 
     return ConfigResult{std::min(num_min_sms, num_sms), best_block_m, best_block_n,
                         block_k, warp_m, warp_n, best_num_stages, best_smem_config};
+}
+
+// Compare persistent CTA work while keeping the baseline K pipeline.
+inline ConfigResult select_k_grouped_tiles(
+        int m, int n, int sum_k, const std::vector<int>& ks, int num_sms, ConfigResult best) {
+    const auto prop = device_runtime->get_prop();
+    const int groups = static_cast<int>(std::count_if(ks.begin(), ks.end(), [](int k) { return k > 0; }));
+    constexpr int warp_size = 32;
+    constexpr int max_registers_per_thread = 256;
+    const int max_warps = std::min(prop->maxThreadsPerMultiProcessor / warp_size,
+        prop->regsPerMultiprocessor / (warp_size * max_registers_per_thread));
+    const auto [old_sms, old_m, old_n, bk, old_wm, old_wn, stages, old_smem] = best;
+
+    struct TileCost {
+        double mma_work_per_warp;
+        double bytes_per_cta;
+    };
+    auto cost = [&](int sms, int bm, int bn, int wm, int wn) {
+        const auto smem = gemm_smem_total_size(2, stages, bm, bn, bk);
+        const int warps = (bm / wm) * (bn / wn);
+        if (smem > prop->sharedMemPerBlockOptin || smem > prop->sharedMemPerMultiprocessor ||
+            warps * warp_size > prop->maxThreadsPerBlock || warps > max_warps) {
+            const auto invalid = std::numeric_limits<double>::infinity();
+            return TileCost{invalid, invalid};
+        }
+
+        const int64_t tiles_per_group = ceil_div<int64_t>(m, bm) * ceil_div<int64_t>(n, bn);
+        const int64_t full_rounds = tiles_per_group / sms;
+        const int tail_ctas = static_cast<int>(tiles_per_group % sms);
+        std::vector<int64_t> k_iters(sms, full_rounds * (sum_k / bk));
+        std::vector<int64_t> output_tiles(sms, full_rounds * groups);
+        // KGroupedScheduler assigns linear tile indices modulo gridDim.x.
+        // Empty groups still advance those indices, but contribute no work.
+        int first_cta = 0;
+        for (int k : ks) {
+            for (int i = 0; i < tail_ctas; ++i) {
+                const int cta = (first_cta + i) % sms;
+                k_iters[cta] += k / bk;
+                output_tiles[cta] += (k > 0);
+            }
+            first_cta = (first_cta + tail_ctas) % sms;
+        }
+
+        // The persistent grid launches sms CTAs. Score the busiest CTA,
+        // including complete-tile MMA work and replicated A/B requests.
+        TileCost result{0, 0};
+        for (int cta = 0; cta < sms; ++cta) {
+            const double mma_work = 2.0 * bm * bn * bk * k_iters[cta] / warps;
+            const double bytes = 2.0 * bk * (bm + bn) * k_iters[cta] +
+                                 8.0 * bm * bn * output_tiles[cta];
+            result.mma_work_per_warp = std::max(result.mma_work_per_warp, mma_work);
+            result.bytes_per_cta = std::max(result.bytes_per_cta, bytes);
+        }
+        return result;
+    };
+
+    auto best_cost = cost(old_sms, old_m, old_n, old_wm, old_wn);
+    constexpr int warp_tile = 64;
+    for (int bm : {128, 256}) {
+        for (int bn : {128, 256}) {
+            // Full tiles retain the vector epilogue used by this candidate family.
+            if (m % bm != 0 || n % bn != 0)
+                continue;
+            const int64_t ctas = ceil_div<int64_t>(m, bm) * ceil_div<int64_t>(n, bn) * groups;
+            const int sms = static_cast<int>(std::min<int64_t>(num_sms, ctas));
+            const auto candidate_cost = cost(sms, bm, bn, warp_tile, warp_tile);
+            if (candidate_cost.mma_work_per_warp <= best_cost.mma_work_per_warp &&
+                candidate_cost.bytes_per_cta < best_cost.bytes_per_cta) {
+                const auto smem = gemm_smem_total_size(2, stages, bm, bn, bk);
+                best_cost = candidate_cost;
+                best = ConfigResult{sms, bm, bn, bk, warp_tile, warp_tile, stages,
+                                    {static_cast<int>(smem), 128, 0}};
+            }
+        }
+    }
+    return best;
+}
+
+// The API handles empty inputs and validates nonnegative, 128-aligned group sizes.
+inline ConfigResult get_k_grouped_configs(int m, int n, int sum_k, int max_k,
+                                          const std::vector<int>& ks, int num_sms) {
+    bool from_runtime_lut = false;
+    const auto baseline = get_best_configs(m, n, max_k, static_cast<int>(ks.size()), num_sms,
+                                          GemmType::KGroupedContiguous, 256, &from_runtime_lut);
+    // Preserve explicit LUT choices; the candidate family uses BK=64.
+    if (from_runtime_lut || std::get<3>(baseline) != 64)
+        return baseline;
+    auto config = select_k_grouped_tiles(m, n, sum_k, ks, num_sms, baseline);
+    if (!is_ppu1v5_device())
+        return config;
+
+    const auto prop = device_runtime->get_prop();
+    auto& [sms, bm, bn, bk, wm, wn, stages, smem_config] = config;
+    auto resident_ctas = [&](int candidate_stages) {
+        const auto smem = gemm_smem_total_size(2, candidate_stages, bm, bn, bk);
+        if (smem > prop->sharedMemPerBlockOptin)
+            return 0;
+        return estimate_gemm_occupancy(
+            bm, bn, bk, wm, wn, bk, smem, 16, 16, 32,
+            prop->sharedMemPerMultiprocessor, prop->maxThreadsPerBlock,
+            prop->maxThreadsPerMultiProcessor / prop->warpSize,
+            prop->regsPerMultiprocessor / prop->warpSize).occ;
+    };
+
+    // S=2 waits for all committed copy groups; S=3 may leave one pending.
+    // The current sweep supports S2/S3 candidates, not a universal upper bound.
+    const int base_ctas = resident_ctas(2);
+    if (base_ctas == 0)
+        return config;
+    stages = max_k > bk && resident_ctas(3) == base_ctas ? 3 : 2;
+    smem_config = {static_cast<int>(gemm_smem_total_size(2, stages, bm, bn, bk)), 128, 0};
+    return config;
 }
 
 // Pre-configured optimal tiling greater than or equal to 4096

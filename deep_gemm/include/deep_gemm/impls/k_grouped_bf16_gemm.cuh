@@ -1,5 +1,8 @@
 #pragma once
 
+#include <type_traits>
+#include <cute/arch/copy.hpp>
+
 #include <deep_gemm/common/fused_gemm_common.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/epilogue_utils.cuh>
@@ -43,9 +46,19 @@ __device__ __forceinline__ void bf16_k_grouped_gemm_impl(const KGroupedGemmArgs 
     using ArchTag = cutlass::arch::PPU0015;
 #endif
     using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<ArchTag, SrcT, SrcT, AccT>::type;
-    using TiledMma = cute::TiledMMA<
-        cute::MMA_Atom<MmaInst>,
-        cute::Layout<Shape<Int<BLOCK_M / WARP_M>, Int<BLOCK_N / WARP_N>, _1>>>;
+    using MmaShape = typename MMA_Traits<MmaInst>::Shape_MNK;
+    constexpr int kInstM = get<0>(MmaShape{});
+    constexpr int kInstN = get<1>(MmaShape{});
+    using WarpLayout = Layout<Shape<Int<BLOCK_M / WARP_M>, Int<BLOCK_N / WARP_N>, _1>>;
+    using WarpTileM = Layout<Shape<Int<kInstM>, Int<BLOCK_M / WARP_M>, Int<WARP_M / kInstM>>,
+                             Stride<_1, Int<WARP_M>, Int<kInstM>>>;
+    using WarpTileN = Layout<Shape<Int<kInstN>, Int<BLOCK_N / WARP_N>, Int<WARP_N / kInstN>>,
+                             Stride<_1, Int<WARP_N>, Int<kInstN>>>;
+    using PermutationMNK = cute::conditional_t<
+        std::is_same_v<ArchTag, cutlass::arch::PPU0015> &&
+        WARP_M % kInstM == 0 && WARP_N % kInstN == 0,
+        Tile<WarpTileM, WarpTileN, Underscore>, Tile<Underscore, Underscore, Underscore>>;
+    using TiledMma = TiledMMA<MMA_Atom<MmaInst>, WarpLayout, PermutationMNK>;
     static_assert(BLOCK_SIZE == 32 * (BLOCK_M / WARP_M) * (BLOCK_N / WARP_N));
     static_assert(BLOCK_SIZE >= 64, "Split A/B AIU copy requires at least two warps");
     using TileScheduler = KGroupedScheduler<kGemmType, SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups>;
@@ -203,6 +216,19 @@ __device__ __forceinline__ void bf16_k_grouped_gemm_impl(const KGroupedGemmArgs 
                             gmem_tiled_copy_B, tBgB(_,_,_,k_tile_iter), tBsB(_,_,_,smem_pipe_write), warp_idx);
                     }
                     cp_async_fence();
+                    // Prefetch old C while the remaining K tiles are computed.
+                    constexpr uint32_t kPrefetchElements = 128 / sizeof(DstT);
+                    constexpr uint32_t kPrefetchColumns = (BLOCK_N + kPrefetchElements - 1) / kPrefetchElements;
+                    if (k_tile_count == 0) {
+                        for (uint32_t index = thread_idx; index < BLOCK_M * kPrefetchColumns; index += BLOCK_SIZE) {
+                            const uint32_t row = index / kPrefetchColumns;
+                            const uint32_t col = (index % kPrefetchColumns) * kPrefetchElements;
+                            if (row < num_valid_rows && col < SHAPE_N - blk_n_offset) {
+                                const auto offset = static_cast<size_t>(c_row_base + row) * STRIDE_CM + blk_n_offset + col;
+                                cute::prefetch(c_group + offset);
+                            }
+                        }
+                    }
                     --k_tile_count;
                     ++k_tile_iter;
                     smem_pipe_write = smem_pipe_read;
@@ -233,9 +259,12 @@ __device__ __forceinline__ void bf16_k_grouped_gemm_impl(const KGroupedGemmArgs 
         // Epilogue: reuse fused MoE's no-TSM store with FP32 beta=1.
         using TCcC = decltype(tCcC);
         if constexpr (cute::is_same_v<AccT, float> && cute::is_same_v<DstT, float> &&
-                      SHAPE_M % BLOCK_M == 0 && SHAPE_N % BLOCK_N == 0 &&
                       SHAPE_N % 4 == 0 && size<0,2>(TCcC{}) == 2) {
-            if ((reinterpret_cast<uintptr_t>(c_group) & 15) == 0) {
+            // A partial output shape can still contain complete vectorizable CTAs.
+            // Compile-time divisibility keeps the existing full-shape path unchanged.
+            if ((SHAPE_M % BLOCK_M == 0 || num_valid_rows == BLOCK_M) &&
+                (SHAPE_N % BLOCK_N == 0 || SHAPE_N - blk_n_offset >= BLOCK_N) &&
+                (reinterpret_cast<uintptr_t>(c_group) & 15) == 0) {
                 epilogue_no_tsm_float4<SHAPE_N>(
                     accum, tCcC, c_group, c_row_base, blk_n_offset);
             } else {
