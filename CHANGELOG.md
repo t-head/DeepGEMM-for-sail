@@ -16,6 +16,11 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **MegaMoE workspace reuse**: allows FP8 channelwise/blockwise, W4A8 and
+  W4A16 layers of the same precision to share a symmetric allocation across
+  shapes through `SymmBuffer(base=...)`, including eager execution and
+  CUDA Graph replay.
+
 - **MegaMoE activation parity**: all MMA types support `swiglu`, `swiglu_step`,
   `swiglu_oai` and `situ` through shared FP32 activation formulas. Native PPU
   sigmoid/tanh are unconditional; `fast_math` selects only the division path.
