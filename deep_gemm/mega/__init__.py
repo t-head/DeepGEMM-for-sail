@@ -134,7 +134,12 @@ class SymmBuffer:
             self.handle = base.handle
 
         # Create input buffer views
-        if mma_type in ('fp4xfp4', 'int8xint8'):
+        if mma_type == 'fp4xfp4':
+            (self.x, self.x_sf, self.topk_idx, self.topk_weights,
+             self.l1_acts, self.l1_acts_sf, self.l2_acts, self.l2_acts_sf,
+             self.shared_l1_acts, self.shared_l1_acts_sf,
+             self.shared_l2_acts, self.shared_l2_acts_sf) = slice_input_buffers(self.buffer)
+        elif mma_type == 'int8xint8':
             (self.x, self.x_sf,
              self.topk_idx, self.topk_weights,
              self.l1_acts, self.l1_acts_sf,
@@ -154,6 +159,8 @@ class SymmBuffer:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("SymmBuffer cannot be destroyed during graph capture")
+        self.shared_l1_acts = self.shared_l1_acts_sf = None
+        self.shared_l2_acts = self.shared_l2_acts_sf = None
         self.handle = self.buffer = self.group = None
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         if self.mma_type in ('fp4xfp4', 'int8xint8'):
@@ -236,6 +243,16 @@ def transform_weights_for_mega_moe(
             raise ValueError(f'{name} scale shape must be {expected_sf_shape}, got {tuple(sf.shape)}')
         return weight, sf
 
+    if isinstance(l1_weights, (tuple, list)) and len(l1_weights) == 2 and getattr(l1_weights[0], 'ndim', None) == 2:
+        if not all(isinstance(pair, (tuple, list)) and len(pair) == 2 and
+                   all(isinstance(t, torch.Tensor) and t.ndim == 2 for t in pair) for pair in (l1_weights, l2_weights)):
+            raise ValueError('weights and scales must be all rank-2 (shared) or all rank-3 (routed)')
+        if l1_weights[0].dtype != torch.uint8 or l2_weights[0].dtype != torch.uint8:
+            raise TypeError('shared weights require packed uint8 FP4')
+        first, second = transform_weights_for_mega_moe(
+            tuple(t.unsqueeze(0) for t in l1_weights), tuple(t.unsqueeze(0) for t in l2_weights), activation)
+        return tuple(t.squeeze(0) for t in first), tuple(t.squeeze(0) for t in second)
+
     w1, s1 = validate_pair('l1_weights', l1_weights)
     w2, s2 = validate_pair('l2_weights', l2_weights)
     if w1.dtype != w2.dtype or w1.device != w2.device:
@@ -267,6 +284,7 @@ def mega_moe_pre_dispatch(
     num_tokens: int,
     group_size: int = 32,
     mma_type: str = "fp4xfp4",
+    *, shared_x_sf: Optional[torch.Tensor] = None,
 ) -> None:
     """Prepare BF16 inputs and routes for the selected precision workspace.
 
@@ -281,7 +299,7 @@ def mega_moe_pre_dispatch(
     _C.mega_moe_pre_dispatch(
         x, topk_idx, topk_weights,
         buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
-        num_tokens, group_size, _normalize_mma_type(mma_type))
+        num_tokens, group_size, _normalize_mma_type(mma_type), shared_x_sf)
 
 
 def fp4_fp4_mega_moe(
@@ -289,6 +307,8 @@ def fp4_fp4_mega_moe(
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor],
     sym_buffer: SymmBuffer,
+    shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
     recipe: Tuple[int, int, int] = (1, 1, 32),
     activation: str = "swiglu",
@@ -340,6 +360,9 @@ def fp4_fp4_mega_moe(
     if activation != 'situ':
         situ_beta = None if situ_beta == 4.0 else situ_beta
         situ_linear_beta = None if situ_linear_beta == 25.0 else situ_linear_beta
+    if ((shared_l1_weights is not None) != bool(sym_buffer.num_shared_experts) or
+            (shared_l2_weights is not None) != bool(sym_buffer.num_shared_experts)):
+        raise ValueError('provide both shared weight pairs when shared experts are enabled')
     _C.fp4_fp4_mega_moe(
         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats, sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
@@ -347,7 +370,8 @@ def fp4_fp4_mega_moe(
         tuple(recipe), activation, activation_clamp, fast_math,
         situ_beta, situ_linear_beta, activation_alpha,
         l1_weights_replicas, l2_weights_replicas,
-        sym_buffer.staging_config)
+        sym_buffer.staging_config, sym_buffer.num_shared_experts,
+        shared_l1_weights, shared_l2_weights)
 
 
 def int8_int8_mega_moe(

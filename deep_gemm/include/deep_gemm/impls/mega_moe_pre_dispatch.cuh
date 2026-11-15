@@ -112,7 +112,11 @@ __global__ void mega_moe_pre_dispatch(
     const __ppu_bfloat16* __restrict__ input,    // [num_tokens, Hidden]
     const TopkIdx* __restrict__ topk_ids,       // [num_tokens, topk]
     const float* __restrict__ topk_weights,
-    uint32_t num_tokens, layout::SymBuffer<> sym_buffer) {
+    uint32_t num_tokens, layout::SymBuffer<> sym_buffer
+#ifdef DG_MEGAMOE_WRITE_SHARED_SFA
+    , uint16_t* __restrict__ shared_scales, int32_t* __restrict__ shared_control
+#endif
+    ) {
 
     static_assert(Hidden >= 1024 && Hidden % 512 == 0,
                   "MegaMoE hidden must be a multiple of 512 and at least 1024");
@@ -143,6 +147,13 @@ __global__ void mega_moe_pre_dispatch(
     constexpr BufferLayout buffers(NumRanks, NumExperts, SourceCapacity, TopK, Hidden, Intermediate,
                                            {StagingScales, StagingCounts, StagingTokens});
     auto* base = sym_buffer.get_base_ptr<layout::MegaMoESignals*>();
+#ifdef DG_MEGAMOE_WRITE_SHARED_SFA
+    static_assert(!Int8);
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        shared_control[0] = num_tokens;
+        shared_control[1] = 0;
+    }
+#endif
     auto* routing_topk_ids = buffers.topk_idx.template data<int64_t>(base);
     auto* routing_topk_weights = buffers.topk_weights.template data<float>(base);
     auto* dispatch_counts = buffers.dispatch_counts[0].template data<uint32_t>(base);
@@ -342,6 +353,10 @@ __global__ void mega_moe_pre_dispatch(
         // Make slot claims, payload data and scales available to all warps.
         __syncthreads();
         generation = s_generation;
+#ifdef DG_MEGAMOE_WRITE_SHARED_SFA
+        for (uint32_t k = threadIdx.x; k < kScales; k += blockDim.x)
+            shared_scales[uint64_t(k) * SourceCapacity + token_idx] = s_scales[k];
+#endif
 
         if constexpr (Int8) {
             const uint32_t batch_begin = uint32_t(token_idx) / kScaleBatchTokens * kScaleBatchTokens;

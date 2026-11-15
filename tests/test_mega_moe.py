@@ -385,7 +385,7 @@ def _check_workspace_options(case, group):
                ({"hidden": case.hidden + 1}, "hidden"),
                ({"num_topk": 33}, "topk"),
                ({"num_max_tokens_per_rank": 0}, "capacity must be positive")]
-    invalid.append(({"num_shared_experts": 1}, "shared experts"))
+    invalid.append(({"num_shared_experts": -1 if case.precision == "w4a4" else 1}, "shared experts"))
     for legacy in ({"gemm1_block_n": 256}, {"gemm1_block_k": 128}, {"config_override": {}},
                    {"gemm1_config": (64, 256, 128, 32, 64, 3)},
                    {"gemm2_config": (64, 256, 128, 32, 64, 3)}):
@@ -784,7 +784,7 @@ def mega_moe_smoke(mega_moe_group, request):
 
     def pipeline(stats=None, *, workspace=buffer, **overrides):
         _pre_dispatch(x, routed_ids, routed_weights, workspace)
-        _mega_moe_entry(case)(y, w1, w2, workspace, stats, **{**options, **overrides})
+        _mega_moe_entry(case)(y, w1, w2, workspace, cumulative_local_expert_recv_stats=stats, **{**options, **overrides})
         return y
 
     def reference(checked, clamp=case.clamp):
@@ -805,7 +805,7 @@ def test_mega_moe_smoke_api(mega_moe_smoke, mega_moe_group):
     transform = deep_gemm.transform_weights_for_mega_moe
     with pytest.raises(TypeError, match="weight, scale"):
         transform(sample.w1_raw[0], sample.w2_raw)
-    with pytest.raises(ValueError, match="weight or scale rank"):
+    with pytest.raises(ValueError, match="weight or scale rank|rank-2"):
         transform((sample.w1_raw[0][0], sample.w1_raw[1]), sample.w2_raw)
     scale_dtype = torch.float64 if sample.case.precision == "int8_channelwise" else torch.float32
     with pytest.raises(TypeError, match="FP32 channel scales|raw uint8 scales"):
@@ -837,6 +837,42 @@ def test_mega_moe_fp4_mma_aliases(mega_moe_smoke, mega_moe_group, mma_type, fact
                     sample.x.shape[0], 32, mma_type)
             deep_gemm.fp4_fp4_mega_moe(sample.y, sample.w1, sample.w2, buffer, **sample.options)
             torch.testing.assert_close(sample.y, expected, rtol=0, atol=0)
+    finally:
+        buffer.destroy()
+
+
+@pytest.mark.parametrize("mega_moe_smoke", [CASES[0]], indirect=True, ids=["w4a4"])
+@pytest.mark.parametrize("split_sync", (0, 1))
+def test_mega_moe_smoke_shared(mega_moe_smoke, mega_moe_group, monkeypatch, split_sync):
+    """Local valid rows receive shared output even when all routed IDs are masked."""
+    monkeypatch.setenv("DG_MEGAMOE_SPLIT_SYNC", str(split_sync))
+    sample, case = mega_moe_smoke, mega_moe_smoke.case
+    width = 2 * case.intermediate
+    rng = torch.Generator(device="cuda").manual_seed(7)
+    raw1, raw2 = (tuple(t[0] for t in pair) for pair in (
+        _make_weights(1, 2 * width, case.hidden, .5, rng),
+        _make_weights(1, case.hidden, width, .125, rng)))
+    shared1, shared2 = deep_gemm.transform_weights_for_mega_moe(raw1, raw2)
+    buffer = deep_gemm.SymmBuffer(mega_moe_group, case.experts, case.capacity, case.topk,
+                                 case.hidden, case.intermediate, num_shared_experts=2)
+    ids = torch.full_like(sample.ids, -1)
+    y = torch.empty((33, case.hidden), device="cuda", dtype=torch.bfloat16)
+    try:
+        for count in (len(sample.x), min(3, len(sample.x)), 0):
+            y.fill_(float("nan"))
+            deep_gemm.mega_moe_pre_dispatch(
+                sample.x[:count], ids[:count], sample.weights[:count],
+                buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
+                num_tokens=count, group_size=32, mma_type="fp4xfp4",
+                shared_x_sf=buffer.shared_l1_acts_sf)
+            deep_gemm.fp4_fp4_mega_moe(y, sample.w1, sample.w2, buffer, shared_l1_weights=shared1,
+                                       shared_l2_weights=shared2, **sample.options)
+            if count:
+                x = _dequantize_mxfp4(*_quantize_mxfp4(sample.x[:count]))
+                act = _reference_activation(x @ _dequantize_mxfp4(*raw1).T, case)
+                expected = _dequantize_mxfp4(*_quantize_mxfp4(act)) @ _dequantize_mxfp4(*raw2).T
+                assert float(calc_diff(y[:count], expected.bfloat16())) < MAX_DIFF
+            assert torch.count_nonzero(y[count:]) == 0
     finally:
         buffer.destroy()
 

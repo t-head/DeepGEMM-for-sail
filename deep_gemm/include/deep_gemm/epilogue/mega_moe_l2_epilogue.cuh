@@ -439,12 +439,12 @@ __device__ __forceinline__ int4 moe_reduce_load(
 }
 
 template <bool kCheckInvalid, bool kOutputAligned, int kTopK, int kHidden, bool kBulkRemote,
-          int kThreads, int kColumnSplits = 1>
+          int kThreads, int kColumnSplits = 1, bool init_shared = false>
 __device__ __forceinline__ void moe_reduce_token(
         const __ppu_bfloat16* __restrict__ input,
         __ppu_bfloat16* __restrict__ output,
         const int64_t (&slots)[kTopK], const float (&weights)[kTopK],
-        const bool (&remote_slots)[kTopK], int token, int column_part, unsigned int reduce_thread) {
+        const bool (&remote_slots)[kTopK], int token, int column_part, unsigned int reduce_thread, const __ppu_bfloat16* shared_row = nullptr) {
     constexpr int kVector = sizeof(int4) / sizeof(__ppu_bfloat16);
     constexpr int kStride = kThreads * kVector;
     constexpr int kColumns = kHidden / kColumnSplits;
@@ -462,6 +462,12 @@ __device__ __forceinline__ void moe_reduce_token(
                 input + slots[index] * kHidden + column, remote_slots[index]);
         }
         float accumulator[kVector] = {0.0f};
+        if constexpr (init_shared) {
+            const int4 packed = __ldg(reinterpret_cast<const int4*>(shared_row + column));
+            const auto* values = reinterpret_cast<const __ppu_bfloat16*>(&packed);
+            #pragma unroll
+            for (int lane = 0; lane < kVector; ++lane) accumulator[lane] = __bfloat162float(values[lane]);
+        }
         #pragma unroll
         for (int index = 0; index < kTopK; ++index) {
             if constexpr (kCheckInvalid) {
@@ -486,13 +492,13 @@ __device__ __forceinline__ void moe_reduce_token(
 }
 
 // GEMM2 scatter completes peer synchronization before this weighted reduction.
-template <bool kOutputAligned, int kTopK, int kHidden, bool kBulkRemote, int kThreads, int kColumnSplits = 1>
+template <bool kOutputAligned, int kTopK, int kHidden, bool kBulkRemote, int kThreads, int kColumnSplits = 1, bool init_shared = false>
 __device__ __forceinline__ void moe_reduce_impl(
         const __ppu_bfloat16* __restrict__ input,
         const int64_t* __restrict__ topk_indices,
         const float* __restrict__ topk_weights,
         __ppu_bfloat16* __restrict__ output,
-        int max_m, int local_experts, int rank_idx, int token, int column_part, uint64_t writer_mask, unsigned int reduce_thread) {
+        int max_m, int local_experts, int rank_idx, int token, int column_part, uint64_t writer_mask, unsigned int reduce_thread, const __ppu_bfloat16* shared_row = nullptr) {
     static_assert(kThreads % 32 == 0);
     static_assert(kHidden % kColumnSplits == 0 && (kHidden / kColumnSplits) % 256 == 0,
                   "each column split must contain complete 256-element warp rows");
@@ -529,8 +535,8 @@ __device__ __forceinline__ void moe_reduce_impl(
                 remote_slots[index] &= ((writer_mask >> (expert_ids[index] / local_experts)) & 1) != 0;
 #endif
         }
-        moe_reduce_token<false, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits>(
-            input, output, slots, weights, remote_slots, token, column_part, reduce_thread);
+        moe_reduce_token<false, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits, init_shared>(
+            input, output, slots, weights, remote_slots, token, column_part, reduce_thread, shared_row);
         return;
     }
     #pragma unroll
@@ -563,21 +569,21 @@ __device__ __forceinline__ void moe_reduce_impl(
 
     // Skip invalid slots before loading scatter data, even when their weight is zero.
     if (all_valid) {
-        moe_reduce_token<false, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits>(
-            input, output, slots, weights, remote_slots, token, column_part, reduce_thread);
+        moe_reduce_token<false, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits, init_shared>(
+            input, output, slots, weights, remote_slots, token, column_part, reduce_thread, shared_row);
     } else {
-        moe_reduce_token<true, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits>(
-            input, output, slots, weights, remote_slots, token, column_part, reduce_thread);
+        moe_reduce_token<true, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits, init_shared>(
+            input, output, slots, weights, remote_slots, token, column_part, reduce_thread, shared_row);
     }
 }
 
 // Distribute token/column tasks across warp-aligned groups for every operand type.
 template <bool kOutputAligned, int kTopK, int kHidden, int kCtaThreads,
-          int kColumnSplits = 1, int kReduceGroupThreads = 0>
+          int kColumnSplits = 1, int kReduceGroupThreads = 0, bool kHasShared = false>
 __device__ __forceinline__ void moe_reduce_dispatch(
         const __ppu_bfloat16* input, const int64_t* ids, const float* weights,
         __ppu_bfloat16* output, int token_capacity, int local_experts, int rank_idx,
-        int tokens, uint64_t writer_mask) {
+        int tokens, uint64_t writer_mask, const __ppu_bfloat16* shared_output = nullptr, uint32_t shared_rows = 0) {
     constexpr int kReduceThreads = kReduceGroupThreads > 0 ? kReduceGroupThreads : kCtaThreads;
     static_assert(kReduceThreads % 32 == 0 && kCtaThreads % kReduceThreads == 0);
     constexpr int kTokenGroups = kCtaThreads / kReduceThreads;
@@ -589,13 +595,29 @@ __device__ __forceinline__ void moe_reduce_dispatch(
         token_group = __ppu_read_firstlane(threadIdx.x / kReduceThreads);
     }
     if (kColumnSplits == 1 || reduce_thread * 8 < kHidden / kColumnSplits) {
-        for (int work = blockIdx.x * kTokenGroups + token_group;
-             work < tokens * kColumnSplits; work += gridDim.x * kTokenGroups) {
-            moe_reduce_impl<kOutputAligned, kTopK, kHidden, true, kReduceThreads, kColumnSplits>(
-                input,
-                ids, weights, output,
-                token_capacity, local_experts,
-                rank_idx, work / kColumnSplits, work % kColumnSplits, writer_mask, reduce_thread);
+        if constexpr (kHasShared) {
+            int work = blockIdx.x * kTokenGroups + token_group;
+            const auto consume = [&](auto tag, int limit) {
+                constexpr bool init_shared = decltype(tag)::value;
+                for (; work < limit * kColumnSplits; work += gridDim.x * kTokenGroups) {
+                    const __ppu_bfloat16* row = nullptr;
+                    if constexpr (init_shared) row = shared_output + int64_t(work / kColumnSplits) * kHidden;
+                    moe_reduce_impl<kOutputAligned, kTopK, kHidden, true, kReduceThreads, kColumnSplits, init_shared>(
+                        input, ids, weights, output, token_capacity, local_experts, rank_idx,
+                        work / kColumnSplits, work % kColumnSplits, writer_mask, reduce_thread, row);
+                }
+            };
+            consume(std::true_type{}, min(static_cast<int>(shared_rows), tokens));
+            consume(std::false_type{}, tokens);
+        } else {
+            for (int work = blockIdx.x * kTokenGroups + token_group;
+                 work < tokens * kColumnSplits; work += gridDim.x * kTokenGroups) {
+                moe_reduce_impl<kOutputAligned, kTopK, kHidden, true, kReduceThreads, kColumnSplits>(
+                    input,
+                    ids, weights, output,
+                    token_capacity, local_experts,
+                    rank_idx, work / kColumnSplits, work % kColumnSplits, writer_mask, reduce_thread);
+            }
         }
     }
 }

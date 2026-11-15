@@ -139,10 +139,12 @@ public:
         uint32_t num_tokens;
         layout::SymBuffer<> sym_buffer;
         layout::MegaMoEStaging staging;
+        uint16_t* shared_scales = nullptr;
+        int32_t* shared_control = nullptr;
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        return std::string(args.shared_scales ? "#define DG_MEGAMOE_WRITE_SHARED_SFA 1\n" : "") + fmt::format(R"(
 #include <deep_gemm/impls/mega_moe_pre_dispatch.cuh>
 using TopkIdx = {};
 static void __instantiate_kernel() {{
@@ -154,8 +156,13 @@ static void __instantiate_kernel() {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.hidden_states, args.topk_idx.data_ptr(),
-                                            args.topk_weights, args.num_tokens, args.sym_buffer));
+        if (args.shared_scales) {
+            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.hidden_states, args.topk_idx.data_ptr(),
+                args.topk_weights, args.num_tokens, args.sym_buffer, args.shared_scales, args.shared_control));
+        } else {
+            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.hidden_states, args.topk_idx.data_ptr(),
+                                                args.topk_weights, args.num_tokens, args.sym_buffer));
+        }
     }
 };
 
@@ -164,11 +171,12 @@ static void mega_moe_pre_dispatch_impl(
     const torch::Tensor& hidden_states, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
     const std::vector<int64_t>& sym_buffer_ptrs,
     int num_ranks, int num_experts, int num_max_tokens_per_rank, int rank_idx,
-    int hidden, int intermediate_hidden, int num_topk, const layout::MegaMoEStaging& staging) {
+    int hidden, int intermediate_hidden, int num_topk, const layout::MegaMoEStaging& staging,
+    uint16_t* shared_scales = nullptr, int32_t* shared_control = nullptr) {
     using Runtime = MegaMoEPreDispatchRuntime<Int8>;
     typename Runtime::Args args{hidden, num_topk, num_max_tokens_per_rank, num_ranks, num_experts, intermediate_hidden,
         {dim3(1), dim3(256), 0}, hidden_states.data_ptr(), topk_idx, topk_weights.data_ptr<float>(),
-        static_cast<uint32_t>(hidden_states.size(0)), layout::SymBuffer<>(sym_buffer_ptrs, rank_idx), staging};
+        static_cast<uint32_t>(hidden_states.size(0)), layout::SymBuffer<>(sym_buffer_ptrs, rank_idx), staging, shared_scales, shared_control};
     const auto runtime = compiler->build(Runtime::kName, Runtime::generate(args));
     const int count_blocks = num_experts / num_ranks;
     const int resident = get_kernel_occupancy(runtime, 256, 0) * device_runtime->get_prop()->multiProcessorCount;

@@ -86,12 +86,13 @@ struct MegaMoEBufferLayout {
     Buffer expert_base, expert_rank_prefix, grouped_layout, local_data, local_sfa, preprocess_ready;
     Buffer scatter_storage, src_info, l2_acts, l2_acts_sf, activated;
     Buffer staging_scales[2], staging_counts[2], staging_tokens[2], topk_idx, topk_weights;
+    Buffer shared_l1_sf, shared_l2_acts, shared_l2_sf, shared_output, shared_control;
     MegaMoEStaging staging;
     int64_t bytes = 0, groups = 0, compact = 0, blocks = 0;
 
     __host__ __device__
     constexpr MegaMoEBufferLayout(int ranks, int experts, int capacity, int topk, int hidden, int intermediate,
-                                 MegaMoEStaging staging_capacity = {}) {
+                                 MegaMoEStaging staging_capacity = {}, int shared = 0) {
         groups = experts / ranks;
         int64_t owner = int64_t(ranks) * capacity;
         compact = max_local_routed_rows(owner, topk, groups);
@@ -129,6 +130,14 @@ struct MegaMoEBufferLayout {
         l2_acts_sf = allocate(compact * Storage::scale_bytes(intermediate));
         topk_idx = allocate(int64_t(capacity) * topk * sizeof(int64_t));
         topk_weights = allocate(int64_t(capacity) * topk * sizeof(float));
+        if (shared > 0) {
+            // dispatch_data already contains every source row in dense token order.
+            shared_l1_sf = allocate(int64_t(capacity) * (hidden / 64) * sizeof(uint16_t));
+            shared_l2_acts = allocate(int64_t(capacity) * shared * (intermediate / 2));
+            shared_l2_sf = allocate(int64_t(capacity) * shared * (intermediate / 64) * sizeof(uint16_t));
+            shared_output = allocate(int64_t(capacity) * hidden * sizeof(uint16_t));
+            shared_control = allocate(2 * sizeof(int32_t));  // Published token count and GEMM2 work counter.
+        }
         bytes = math::constexpr_align<int64_t>(bytes, 256);
         // INT8 computes activations in FP32, then stores BF16 rows for quantization.
         if constexpr (Int8)

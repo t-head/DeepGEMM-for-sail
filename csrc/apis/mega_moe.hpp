@@ -100,7 +100,8 @@ static std::string fp8_mega_moe_precision(const std::string& quantization) {
 template <class BufferLayout = layout::MegaMoEBuffer>
 static BufferLayout get_mega_moe_layout(
     int num_ranks, int num_experts, int capacity, int topk,
-    int hidden, int intermediate, const std::array<int, 3>& staging_config) {
+    int hidden, int intermediate, const std::array<int, 3>& staging_config, int num_shared_experts = 0) {
+    TORCH_CHECK(num_shared_experts >= 0 && int64_t(num_shared_experts) * intermediate <= INT_MAX / 2, "invalid shared experts width");
     constexpr bool int8 = std::is_same_v<BufferLayout, layout::Int8MegaMoEBuffer>;
     TORCH_CHECK(is_supported_megamoe_rank_count(num_ranks), "MegaMoE requires a power-of-two EP size in [1, 64]");
     TORCH_CHECK(num_experts > 0 && num_experts <= layout::MegaMoESignals::kNumMaxExperts &&
@@ -118,7 +119,7 @@ static BufferLayout get_mega_moe_layout(
     }
     if (staging_config == std::array<int, 3>{} ||
         staging_config == std::array<int, 3>{num_experts, capacity, hidden})
-        return {num_ranks, num_experts, capacity, topk, hidden, intermediate};
+        return {num_ranks, num_experts, capacity, topk, hidden, intermediate, {}, num_shared_experts};
     // Aliases inherit the allocation owner's bank strides for peer writes.
     const auto [owner_experts, owner_capacity, owner_hidden] = staging_config;
     TORCH_CHECK(owner_experts > 0 && owner_experts % num_ranks == 0 &&
@@ -130,7 +131,7 @@ static BufferLayout get_mega_moe_layout(
     const auto required = layout::MegaMoEStaging::for_shape<int8>(num_ranks, num_experts, capacity, hidden);
     TORCH_CHECK(required.scales <= owner.scales && required.counts <= owner.counts && required.tokens <= owner.tokens,
                 "MegaMoE view exceeds allocation staging capacity");
-    return {num_ranks, num_experts, capacity, topk, hidden, intermediate, owner};
+    return {num_ranks, num_experts, capacity, topk, hidden, intermediate, owner, num_shared_experts};
 }
 
 template <class BufferLayout>
@@ -144,9 +145,9 @@ static void check_mega_moe_buffer(const torch::Tensor& buffer, const BufferLayou
 template <class BufferLayout>
 static std::tuple<int64_t, pybind11::function> get_mega_moe_buffer_slices(
     int num_ranks, int num_experts, int capacity, int topk,
-    int hidden, int intermediate, const std::array<int, 3>& staging_config) {
+    int hidden, int intermediate, const std::array<int, 3>& staging_config, int num_shared_experts = 0) {
     const auto b = get_mega_moe_layout<BufferLayout>(
-        num_ranks, num_experts, capacity, topk, hidden, intermediate, staging_config);
+        num_ranks, num_experts, capacity, topk, hidden, intermediate, staging_config, num_shared_experts);
     auto slice_input_buffers = [=](const Tensor& buffer) {
         check_mega_moe_buffer(buffer, b);
         auto make_tensor = [&](torch::ScalarType dtype, const layout::Buffer& region, torch::IntArrayRef shape,
@@ -180,9 +181,19 @@ static std::tuple<int64_t, pybind11::function> get_mega_moe_buffer_slices(
                     make_tensor(torch::kUInt16, b.l2_acts_sf, {b.compact, intermediate / 64}, {1, b.compact}));
             }
         }();
-        return std::make_tuple(x, x_sf,
+        auto views = std::make_tuple(x, x_sf,
             make_tensor(torch::kInt64, b.topk_idx, {capacity, topk}),
             make_tensor(torch::kFloat32, b.topk_weights, {capacity, topk}), l1, l1_sf, l2, l2_sf);
+        if constexpr (std::is_same_v<BufferLayout, layout::MegaMoEBuffer>) {
+            const int rows = num_shared_experts ? capacity : 0;
+            const int width = num_shared_experts * intermediate;
+            return std::tuple_cat(views, std::make_tuple(x.narrow(0, 0, rows),
+                make_tensor(torch::kUInt16, b.shared_l1_sf, {rows, hidden / 64}, {1, capacity}),
+                make_tensor(torch::kUInt8, b.shared_l2_acts, {rows, width / 2}),
+                make_tensor(torch::kUInt16, b.shared_l2_sf, {rows, width / 64}, {1, capacity})));
+        } else {
+            return views;
+        }
     };
     return {b.get_num_bytes(), pybind11::cpp_function(slice_input_buffers)};
 }
@@ -197,12 +208,12 @@ get_symm_buffer_size_for_mega_moe(
     const std::array<int, 3>& staging_config = {},
     const std::optional<std::string>& quantization = std::nullopt) {
     const auto activation_kind = parse_gated_activation(activation);
-    TORCH_CHECK(num_shared_experts == 0, "MegaMoE shared experts are not supported yet");
+    TORCH_CHECK(num_shared_experts == 0 || is_fp4_mma_type(mma_type), "shared experts require FP4 x FP4");
     TORCH_CHECK(mma_type == "fp8xfp8" || !quantization,
                 "quantization applies only to fp8xfp8 workspaces");
     if (is_fp4_mma_type(mma_type))
         return get_mega_moe_buffer_slices<layout::MegaMoEBuffer>(
-            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config, num_shared_experts);
     if (mma_type == "int8xint8")
         return get_mega_moe_buffer_slices<layout::Int8MegaMoEBuffer>(
             num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
@@ -235,7 +246,8 @@ static void mega_moe_pre_dispatch(
     const torch::Tensor& buf_topk_weights,
     const int& num_tokens,
     const int& group_size,
-    const std::string& mma_type) {
+    const std::string& mma_type,
+    const std::optional<torch::Tensor>& shared_x_sf) {
     TORCH_CHECK(x.dim() == 2, "x must be a 2D tensor");
     TORCH_CHECK(num_tokens >= 0 && num_tokens == x.size(0), "num_tokens must match x.shape[0]");
     // Fused peer publication needs the workspace metadata behind the output views.
@@ -252,6 +264,10 @@ static void mega_moe_pre_dispatch(
         !same_view("topk_idx", buf_topk_idx) || !same_view("topk_weights", buf_topk_weights))
         throw pybind11::value_error("output views must belong to the same live MegaMoE SymmBuffer");
     const auto owner_mma_type = owner.attr("mma_type").cast<std::string>();
+    const int num_shared_experts = owner.attr("num_shared_experts").cast<int>();
+    TORCH_CHECK(shared_x_sf.has_value() == (num_shared_experts > 0),
+                "provide shared_x_sf for a shared expert workspace only");
+    TORCH_CHECK(!shared_x_sf || is_fp4_mma_type(mma_type), "shared experts require FP4 x FP4");
     if (owner_mma_type != mma_type && !(is_fp4_mma_type(owner_mma_type) && is_fp4_mma_type(mma_type)))
         throw pybind11::value_error("mma_type must match the output views' MegaMoE SymmBuffer");
     if (!is_fp4_mma_type(mma_type) && mma_type != "int8xint8") {
@@ -293,10 +309,23 @@ static void mega_moe_pre_dispatch(
         mega_moe_pre_dispatch_impl<true>(x, topk_idx, topk_weights, pointers,
             ranks, experts, capacity, rank, hidden, intermediate, topk, b.staging);
     } else {
-        const auto b = get_mega_moe_layout(ranks, experts, capacity, topk, hidden, intermediate, staging_config);
+        const auto b = get_mega_moe_layout(ranks, experts, capacity, topk, hidden, intermediate, staging_config, num_shared_experts);
         check_mega_moe_buffer(buffer, b);
+        uint16_t* shared_scales = nullptr;
+        int32_t* shared_control = nullptr;
+        if (shared_x_sf) {
+            auto* base = buffer.data_ptr<uint8_t>();
+            TORCH_CHECK(shared_x_sf->device() == x.device() && shared_x_sf->scalar_type() == torch::kUInt16 &&
+                        shared_x_sf->dim() == 2 && shared_x_sf->size(0) == capacity &&
+                        shared_x_sf->size(1) == hidden / 64 && shared_x_sf->stride(0) == 1 &&
+                        shared_x_sf->stride(1) == capacity &&
+                        shared_x_sf->data_ptr() == b.shared_l1_sf.data<uint16_t>(base),
+                        "shared_x_sf must be the local shared_l1_acts_sf view of this workspace");
+            shared_scales = shared_x_sf->data_ptr<uint16_t>();
+            shared_control = b.shared_control.data<int32_t>(base);
+        }
         mega_moe_pre_dispatch_impl<false>(x, topk_idx, topk_weights, pointers,
-            ranks, experts, capacity, rank, hidden, intermediate, topk, b.staging);
+            ranks, experts, capacity, rank, hidden, intermediate, topk, b.staging, shared_scales, shared_control);
     }
 }
 
@@ -316,7 +345,8 @@ static void fp4_fp4_mega_moe(
     const std::optional<float>& activation_alpha_opt,
     const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& l1_weights_replicas,
     const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& l2_weights_replicas,
-    const std::array<int, 3>& staging_config) {
+    const std::array<int, 3>& staging_config, int num_shared_experts,
+    const std::optional<WeightPair>& shared_l1, const std::optional<WeightPair>& shared_l2) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
@@ -399,6 +429,20 @@ static void fp4_fp4_mega_moe(
                     "weights must contain all local physical experts when replicas are not provided");
     }
 
+    DG_HOST_ASSERT(num_shared_experts >= 0 && int64_t(num_shared_experts) * intermediate_hidden <= INT_MAX / 2);
+    DG_HOST_ASSERT(shared_l1.has_value() == (num_shared_experts > 0) && shared_l2.has_value() == shared_l1.has_value());
+    if (shared_l1) {
+        auto check = [&](const auto& pair, int64_t n, int64_t packed_k) {
+            const auto& [w, sf] = pair;
+            DG_HOST_ASSERT(w.device() == y.device() && w.scalar_type() == torch::kUInt8 && w.is_contiguous());
+            DG_HOST_ASSERT(w.dim() == 2 && w.size(0) == n && w.size(1) == packed_k);
+            DG_HOST_ASSERT(sf.device() == y.device() && sf.dim() == 2 && sf.size(0) == n && sf.size(1) == ceil_div<int64_t>(packed_k, 32));
+            DG_HOST_ASSERT(deep_gemm_fp4_common::check_mxfp4_scales_layout(sf));
+        };
+        check(*shared_l1, num_shared_experts * intermediate_hidden_2, hidden_packed);
+        check(*shared_l2, hidden, num_shared_experts * intermediate_hidden_packed);
+    }
+
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->device() == sym_buffer.device());
@@ -412,7 +456,7 @@ static void fp4_fp4_mega_moe(
     make_sym_buffer(sym_buffer, sym_buffer_ptrs, rank_idx);
     DG_HOST_ASSERT(num_experts == num_experts_);
     const auto mega_buffer = get_mega_moe_layout(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config, num_shared_experts);
     check_mega_moe_buffer(sym_buffer, mega_buffer);
     const int em = expected_expert_rows(num_tokens, num_topk, num_experts_per_rank_with_replicas,
                                         num_ranks, num_max_tokens_per_rank);
@@ -428,7 +472,7 @@ static void fp4_fp4_mega_moe(
         sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank,
         num_experts_per_rank_with_replicas, num_tokens, num_topk, hidden, intermediate_hidden,
         activation_clamp, em, activation_kind,
-        situ_beta, situ_linear_beta, activation_alpha, fast_math);
+        situ_beta, situ_linear_beta, activation_alpha, fast_math, shared_l1, shared_l2);
 }
 
 static void check_device() {
@@ -810,7 +854,11 @@ static void register_apis(pybind11::module_& m) {
     m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe);
     m.def("fp4_fp4_mega_moe", &fp4_fp4_mega_moe);
     m.def("int8_int8_mega_moe", &int8_int8_mega_moe);
-    m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch);
+    m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch,
+          pybind11::arg("x"), pybind11::arg("topk_idx"), pybind11::arg("topk_weights"),
+          pybind11::arg("buf_x"), pybind11::arg("buf_x_sf"), pybind11::arg("buf_topk_idx"),
+          pybind11::arg("buf_topk_weights"), pybind11::arg("num_tokens"), pybind11::arg("group_size"),
+          pybind11::arg("mma_type"), pybind11::arg("shared_x_sf") = std::nullopt);
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe,
           pybind11::arg("num_ranks"), pybind11::arg("num_experts"),

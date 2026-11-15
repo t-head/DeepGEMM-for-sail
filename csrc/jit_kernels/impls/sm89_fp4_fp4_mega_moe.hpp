@@ -48,6 +48,9 @@ public:
                   "unsupported MegaMoE stage");
     static constexpr bool kIsLinear1 = Stage == MegaMoEPhaseKind::Linear1;
 
+    using SharedParams = FP4GemmRuntime::GemmKernelParamsT<
+        std::conditional_t<kIsLinear1, Linear1EpilogueArguments<Activation>, FP4GemmRuntime::EpilogueArgsNoTsm>>;
+
     struct LaunchInfo {
         int n, k, block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages, num_sms;
         int copy_blocks = 0, k_tiles_per_flag = 0, source_capacity = 1, topk = 1;
@@ -71,6 +74,9 @@ public:
         void* reduce_output = nullptr;
         int tokens = 0, topk = 0;
         bool split_sync = false;
+        int shared_n = 0, shared_k = 0;
+        int32_t* shared_control = nullptr;
+        SharedParams shared_params{};
     };
 
     static std::string generate_impl(const Args& a) {
@@ -79,49 +85,80 @@ public:
         if constexpr (!kIsLinear1)
             reduce = mega::select_reduce_config(
                 a.tokens, info.n, static_cast<int>(a.launch_args.block_dim.x), info.num_sms);
+        const char* stage = kIsLinear1 ? "deep_gemm::MegaMoEPhaseKind::Linear1" : "deep_gemm::MegaMoEPhaseKind::Linear2";
+        const char* activation = Activation == GatedActivation::SiTU ? "SiTU" :
+                Activation == GatedActivation::SwiGLUStep ? "SwiGLUStep" :
+                Activation == GatedActivation::SwiGLUOAI ? "SwiGLUOAI" : "SwiGLU";
+        std::string shared_type;
+        if (a.shared_n) {
+            shared_type = fmt::format(R"(
+using SharedKernel = deep_gemm::MegaMoEMxfp4Kernel<{}, {}, {}, {}, {}, {}, {}, 1, {}, 1, {},
+    {}, 0, 1, 1, {}, false, false, deep_gemm::GatedActivation::{}, {}, {}, false, true>::Kernel;
+static_assert(sizeof(SharedKernel::Params) == {});
+static_assert(SharedKernel::MaxThreadsPerBlock == Kernel::MaxThreadsPerBlock);
+static_assert(SharedKernel::SharedStorageSize <= {});
+)", a.shared_n, a.shared_k, info.warp_pipeline ? 256 : info.block_m, info.block_n, info.block_k,
+                info.warp_m, info.warp_n, info.num_stages, stage, kIsLinear1 ? info.copy_blocks : 0,
+                info.apply_clamp, activation, info.has_linear_beta, info.fast_math, sizeof(SharedParams), a.launch_args.smem_size);
+        }
         const auto kernel_args = kIsLinear1 ? std::string{"Kernel"} :
             fmt::format("Kernel, {}, {}, {}, {}, {}, {}, {}", Ranks, a.topk, info.n, info.num_groups,
                         reduce.column_splits, reduce.group_threads, is_bf16x8_aligned(a.reduce_output));
         return fmt::format(R"(
+#define DG_MEGAMOE_HAS_SHARED {}
 #define DG_MEGAMOE_OWNER_MODE {}
 #define DG_MEGAMOE_OWNER_READER_OPT {}
 #define DG_MEGAMOE_SPLIT_SYNC {}
 #include <deep_gemm/impls/sm89_fp4_fp4_mega_moe.cuh>
 using Builder = deep_gemm::MegaMoEMxfp4Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation::{}, {}, {}, {}>;
 using Kernel = Builder::Kernel;
-static_assert(Kernel::SharedStorageSize == {}, "MegaMoE shared storage size differs from host");
+{}
+static_assert(Kernel::SharedStorageSize <= {}, "MegaMoE shared storage size differs from host");
 static_assert(sizeof(Kernel::MainloopArguments) == {}, "MegaMoE mainloop size differs from host");
 static_assert(sizeof(Kernel::EpilogueParams) == {}, "MegaMoE epilogue size differs from host");
 static_assert(sizeof(Kernel::SchedulerParams) == {}, "MegaMoE scheduler size differs from host");
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_gemm::{}<{}>);
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::{}<{}{}>);
 }}
-)", static_cast<int>(!kIsLinear1), static_cast<int>(!kIsLinear1),
+)", static_cast<int>(a.shared_n > 0), static_cast<int>(!kIsLinear1), static_cast<int>(!kIsLinear1),
             static_cast<int>(a.split_sync),
             info.n, info.k, info.block_m, info.block_n, info.block_k, info.warp_m, info.warp_n, info.num_groups, info.num_stages,
             Ranks, kIsLinear1 ? "deep_gemm::MegaMoEPhaseKind::Linear1" : "deep_gemm::MegaMoEPhaseKind::Linear2",
             info.copy_blocks, info.k_tiles_per_flag, info.source_capacity, info.topk,
             info.apply_clamp, info.wide_offsets, info.warp_pipeline,
-            Activation == GatedActivation::SiTU ? "SiTU" :
-            Activation == GatedActivation::SwiGLUStep ? "SwiGLUStep" :
-            Activation == GatedActivation::SwiGLUOAI ? "SwiGLUOAI" : "SwiGLU", info.has_linear_beta, info.fast_math,
-            a.replica_weights.weights != nullptr,
+            activation, info.has_linear_beta, info.fast_math,
+            a.replica_weights.weights != nullptr, shared_type,
             a.launch_args.smem_size, sizeof(a.mainloop), sizeof(a.epilogue), sizeof(a.scheduler),
-            a.kernel_name, kernel_args);
+            a.kernel_name, kernel_args, a.shared_n ? ", SharedKernel" : "");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {
         if constexpr (kIsLinear1) {
-            DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.mainloop, a.epilogue, a.scheduler,
-                                                a.signals, a.replica_weights));
+            if (a.shared_n) {
+                DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.mainloop, a.epilogue, a.scheduler,
+                                                a.signals, a.replica_weights, a.shared_params, a.shared_control));
+            } else {
+                DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.mainloop, a.epilogue, a.scheduler,
+                                                    a.signals, a.replica_weights));
+            }
         } else {
             MegaMoEReduceParams reduce{a.reduce_ids, a.reduce_weights, a.reduce_output, a.tokens};
             if (a.split_sync && std::string_view(a.kernel_name) == kReduceKernelName) {
-                DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.scatter_buffer, a.epilogue.token_capacity,
-                                                    a.signals, reduce));
+                if (a.shared_n) {
+                    DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.scatter_buffer, a.epilogue.token_capacity,
+                                                    a.signals, reduce, a.shared_params, a.shared_control));
+                } else {
+                    DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.scatter_buffer, a.epilogue.token_capacity,
+                                                        a.signals, reduce));
+                }
             } else {
-                DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.mainloop, a.epilogue, a.scheduler,
-                                                    a.signals, a.scatter_buffer, reduce, a.replica_weights));
+                if (a.shared_n) {
+                    DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.mainloop, a.epilogue, a.scheduler,
+                                                    a.signals, a.scatter_buffer, reduce, a.replica_weights, a.shared_params, a.shared_control));
+                } else {
+                    DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.mainloop, a.epilogue, a.scheduler,
+                                                        a.signals, a.scatter_buffer, reduce, a.replica_weights));
+                }
             }
         }
     }
@@ -207,7 +244,9 @@ static void launch_linear1(
     const MegaMoEReplicaWeights& replicas, int num_experts_per_rank,
     uint8_t* l2_acts, uint16_t* l2_acts_sf, int compact_m, int num_topk,
     const sched::MegaMoESchedulerArguments& scheduler, layout::MegaMoESignals* signals,
-    const MegaMoEL1Config& config, bool fast_math, int expected_m, bool split_sync) {
+    const MegaMoEL1Config& config, bool fast_math, int expected_m, bool split_sync,
+    int num_tokens, int capacity, uint8_t* base, const layout::MegaMoEBuffer& buffers,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l1) {
     auto launch = [&](auto activation_tag) {
         constexpr auto kind = decltype(activation_tag)::value;
         using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks, kind>;
@@ -221,6 +260,25 @@ static void launch_linear1(
 
         auto args = make_linear1_args<Ranks, kind>(l1_weights, l1_weights_sf, replicas, num_experts_per_rank, l2_acts, l2_acts_sf,
                                                    compact_m, num_topk, scheduler, signals, activation_params, config, fast_math);
+        if (shared_l1) {
+            const auto& [weights, scales] = *shared_l1;
+            args.shared_n = weights.size(0);
+            args.shared_k = weights.size(1);
+            args.shared_control = buffers.shared_control.data<int32_t>(base);
+            auto& p = args.shared_params;
+            p.problem_shape = {num_tokens, args.shared_n, args.shared_k, 1};
+            p.collective_mainloop_params = make_mainloop_arguments(num_tokens, args.shared_n,
+                args.shared_k, capacity, buffers.dispatch_data.data(base),
+                buffers.shared_l1_sf.data<uint16_t>(base), weights, scales);
+            using S = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+            p.collective_epilogue_params = {
+                .stride_C = cutlass::make_cute_packed_stride(S{}, cute::make_shape(num_tokens, 0, 1)),
+                .ptr_D = buffers.shared_l2_acts.data(base),
+                .stride_D = cutlass::make_cute_packed_stride(S{}, cute::make_shape(num_tokens, args.shared_n, 1)),
+                .ptr_SFD = buffers.shared_l2_sf.data<uint16_t>(base),
+                .shape_m = static_cast<uint32_t>(capacity), .activation = activation_params};
+            p.scheduler = TileSchedulerArguments(num_tokens);
+        }
         args.split_sync = split_sync;
         launch_gemm<Runtime>(args, expected_m);
     };
@@ -278,7 +336,9 @@ static void sm89_fp4_fp4_mega_moe(
     int rank_idx, int num_max_tokens_per_rank,
     int num_experts_per_rank, int num_tokens, int num_topk, int hidden, int intermediate_hidden,
     float activation_clamp, int expected_m, GatedActivation activation,
-    float situ_beta, float situ_linear_beta, float activation_alpha, bool fast_math) {
+    float situ_beta, float situ_linear_beta, float activation_alpha, bool fast_math,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l1,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l2) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto config = get_mega_moe_config(num_ranks, num_experts_per_rank, num_max_tokens_per_rank,
                                             hidden, intermediate_hidden, expected_m, device_runtime->get_num_sms());
@@ -305,6 +365,29 @@ static void sm89_fp4_fp4_mega_moe(
         auto l2_args = make_linear2_args<Ranks>(
             l2_acts, l2_acts_sf, compact_m, l2_weights, l2_weights_sf, l2_replicas, num_experts_per_rank,
             masked_m, scheduler.src_info, scatter_buffer, signals, num_max_tokens_per_rank, num_topk, l2_config);
+        if (shared_l1) {
+            const auto& [w2, sf2] = *shared_l2;
+            auto* control = mega_buffer.shared_control.data<int32_t>(base);
+            l2_args.shared_control = control;
+            using S = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+            l2_args.shared_n = w2.size(0);
+            l2_args.shared_k = w2.size(1);
+            auto& p2 = l2_args.shared_params;
+            p2.problem_shape = {num_tokens, l2_args.shared_n, l2_args.shared_k, 1};
+            p2.collective_mainloop_params = make_mainloop_arguments(num_tokens, l2_args.shared_n,
+                l2_args.shared_k, num_max_tokens_per_rank, mega_buffer.shared_l2_acts.data(base), mega_buffer.shared_l2_sf.data<uint16_t>(base), w2, sf2);
+            p2.collective_epilogue_params.ptr_D = mega_buffer.shared_output.data<cutlass::bfloat16_t>(base);
+            p2.collective_epilogue_params.stride_C = cutlass::make_cute_packed_stride(S{}, cute::make_shape(num_tokens, hidden, 1));
+            p2.collective_epilogue_params.stride_D = p2.collective_epilogue_params.stride_C;
+            p2.scheduler = TileSchedulerArguments(num_tokens);
+            // Shared GEMM2 is dense: use all 16 warps on BM256, while routed
+            // GEMM2 keeps its BM128 compute/scatter pipeline. Storage is reused.
+            if (l2_args.launch_info.warp_pipeline)
+                l2_args.launch_args.smem_size = std::max(l2_args.launch_args.smem_size,
+                    std::get<0>(deep_gemm_fp4_common::get_smem_config_fp4(
+                        l2_config.num_stages, 256, l2_config.block_n, l2_config.warp_m,
+                        l2_config.warp_n, l2_config.block_k, hidden, false, false)));
+        }
         l2_args.reduce_ids = mega_buffer.topk_idx.data<int64_t>(base);
         l2_args.reduce_weights = mega_buffer.topk_weights.data<float>(base);
         l2_args.reduce_output = y.data_ptr();
@@ -314,7 +397,8 @@ static void sm89_fp4_fp4_mega_moe(
 
         launch_linear1<Ranks>(activation, activation_clamp, situ_beta, situ_linear_beta, activation_alpha,
                               l1_weights, l1_weights_sf, l1_replicas, num_experts_per_rank,
-                              l2_acts, l2_acts_sf, compact_m, num_topk, scheduler, signals, l1_config, fast_math, expected_m, split_sync);
+                              l2_acts, l2_acts_sf, compact_m, num_topk, scheduler, signals, l1_config, fast_math, expected_m, split_sync,
+                              num_tokens, num_max_tokens_per_rank, base, mega_buffer, shared_l1);
         if (split_sync) {
             launch_gemm<Linear2Runtime>(l2_args, expected_m);
             launch_sync("mega_moe_scatter_sync", num_ranks, signals);
