@@ -1,9 +1,12 @@
 #pragma once
 
 #include <torch/python.h>
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <string>
+#include <type_traits>
+#include <vector>
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
@@ -73,6 +76,34 @@ __global__ void {}(
     }
 };
 
+class FP4VarlenMetadataRuntime final : public LaunchRuntime<FP4VarlenMetadataRuntime> {
+public:
+    struct Args {
+        LaunchArgs launch_args;
+        int block_q, split_kv, workers, singleton_cost_multiplier;
+        uint32_t nq;
+        const uint32_t* lengths;
+        const uint32_t* indices;
+        uint32_t* metadata;
+        uint64_t* prefix;
+    };
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/scheduler/paged_mqa_logits_scheduler.cuh>
+extern "C" __global__ void attention_paged_mqa_logits_metadata_varlen(
+    uint32_t nq, const uint32_t* lengths, const uint32_t* indices,
+    uint32_t* metadata, uint64_t* prefix) {{
+    deep_gemm::fp4_varlen_metadata<{}, {}, {}, {}>(nq, lengths, indices,
+        reinterpret_cast<deep_gemm::FP4VarlenCTAStart*>(metadata), prefix);
+}}
+)", args.block_q, args.split_kv, args.workers, args.singleton_cost_multiplier);
+    }
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.nq, args.lengths,
+                                            args.indices, args.metadata, args.prefix));
+    }
+};
+
 // ---------------------------------------------------------------- paged logits
 
 // Host-side mirror of `cutlass::gemm::kernel::PPUPagedMqaLogits<...>::Arguments`.
@@ -114,6 +145,7 @@ struct PagedMqaLogitsFP4Arguments {
     void* logits;
     const uint32_t* block_table;
     const uint32_t* schedule_meta;
+    const uint32_t* grouped_meta;
 };
 
 // One runtime for both paged flavours; they share the full template parameter list
@@ -130,6 +162,7 @@ public:
         std::string scale_mode;
         int smem_size, num_threads;
         std::string kernel_name;
+        std::string grouped_template_args;
     };
 
     struct Args {
@@ -165,7 +198,7 @@ constexpr uint32_t kScaleMode = {};
 using AttnKernel = cutlass::gemm::kernel::{}<
   ElementQK, ElementAcc, ElementLogits, ElementWeights,
   kNextN, kNumHeads, kHeadDim, PAGE_KV, SPLIT_KV, BLOCK_KV, WARP_KV,
-  kNumQStages, kNumKVStages, SPLIT_MBLOCK, kScaleMode
+  kNumQStages, kNumKVStages, SPLIT_MBLOCK, kScaleMode{}
 >;
 
 // The host computes these instead of reading them off the kernel type, so pin them down here
@@ -185,7 +218,7 @@ __global__ void {}(
 )",
             info.include_header, info.element_qk, info.element_acc, info.element_logits, info.element_weights,
             info.next_n, info.num_heads, info.head_dim, info.page_kv, info.split_kv, info.block_kv, info.warp_kv,
-            info.num_q_stages, info.num_kv_stages, info.split_mblock, info.scale_mode, info.kernel_class,
+            info.num_q_stages, info.num_kv_stages, info.split_mblock, info.scale_mode, info.kernel_class, info.grouped_template_args,
             info.smem_size, info.num_threads, info.kernel_name);
     }
 
@@ -193,6 +226,59 @@ __global__ void {}(
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
+
+// Debug-only readback of normalized request runs. Production dispatch and Graph
+// replay consume the GPU metadata directly and never inspect its contents here.
+static void add_fp4_varlen_dump_params(DgProfParam& params, const uint32_t* descriptors,
+                                       const uint32_t* context_lens, uint32_t nq) {
+    // Compile-only launches do not populate scheduling metadata.
+    if (is_compile_only())
+        return;
+    hggcStreamCaptureStatus capture = hggcStreamCaptureStatusNone;
+    DG_HGGC_RUNTIME_CHECK(hggcStreamIsCapturing(current_stream(), &capture));
+    if (capture != hggcStreamCaptureStatusNone)
+        return;
+    std::vector<FP4VarlenQBlock> rows(nq);
+    std::vector<uint32_t> lengths(nq), ids(nq), bases;
+    DG_HGGC_RUNTIME_CHECK(hggcMemcpyAsync(rows.data(), descriptors, rows.size() * sizeof(FP4VarlenQBlock),
+                                          hggcMemcpyDeviceToHost, current_stream()));
+    DG_HGGC_RUNTIME_CHECK(hggcMemcpyAsync(lengths.data(), context_lens, nq * sizeof(uint32_t),
+                                          hggcMemcpyDeviceToHost, current_stream()));
+    DG_HGGC_RUNTIME_CHECK(hggcStreamSynchronize(current_stream()));
+    uint32_t consumed = 0, previous_run = ~0u;
+    for (uint32_t i = 0; consumed < nq; ++i) {
+        DG_HOST_ASSERT(i < nq and rows[i].source_q == consumed and rows[i].valid_q > 0);
+        const uint32_t count = rows[i].valid_q, run = rows[i].table_row;
+        DG_HOST_ASSERT(count <= nq - consumed);
+        if (run != previous_run) bases.push_back(lengths[consumed]);
+        std::fill_n(ids.begin() + consumed, count, static_cast<uint32_t>(bases.size() - 1));
+        previous_run = run;
+        consumed += count;
+    }
+    DG_HOST_ASSERT(consumed == nq);
+    auto render = [](const std::vector<uint32_t>& values) {
+        std::string out = "[";
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (i) out += ',';
+            out += std::to_string(values[i]);
+        }
+        return out + "]";
+    };
+    params.add_params("varlen_indices", render(ids));
+    params.add_params("context_lens", render(lengths));
+    params.add_params("distribution", render(bases));
+}
+
+// Grouped dumps already carry per-request bases and exact per-query lengths.
+// The shared legacy helper would overwrite distribution with per-query values.
+static HgtxRangeGuard show_fp4_varlen_ut(DgProfParam& params) {
+    if (not profiling_enabled())
+        return HgtxRangeGuard();
+    const auto message = params.format();
+    if (ProfilingInterface::instance().show_params())
+        std::cout << message << std::endl;
+    return HgtxRangeGuard(message);
+}
 
 // Dispatch helper. Unlike the non-paged kernel the grid is not derived from occupancy: it is
 // `num_blocks`, which the caller took from the `schedule_meta` table built earlier.
@@ -204,7 +290,7 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
                                     const std::string& element_weights, const std::string& dtype_tag, int next_n,
                                     int num_heads, int head_dim, int page_kv, int block_kv, int smem_size, int num_threads,
                                     int num_blocks, const std::string& kernel_name, bool is_avg,
-                                    const ArgumentsT& kernel_params) {
+                                    const ArgumentsT& kernel_params, bool grouped = false, int max_context_len = 0) {
     using Runtime = PagedMqaLogitsRuntime<ArgumentsT>;
     const bool is_fp4 = dtype_tag == "fp4";
     const dim3 block(num_threads, 1, 1);
@@ -213,7 +299,8 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
     const auto& args = typename Runtime::Args{
         .launch_info = {include_header, kernel_class, element_qk, element_acc, element_logits, element_weights,
                         next_n, num_heads, head_dim, page_kv, tile.split_kv, block_kv, tile.warp_kv,
-                        tile.stage_q, tile.stage_k, split_mblock, scale_mode, smem_size, num_threads, kernel_name},
+                        tile.stage_q, tile.stage_k, split_mblock, scale_mode, smem_size, num_threads, kernel_name,
+                        grouped ? fmt::format(", {}", tile.tb_per_cu) : ""},
         .launch_args = {grid, block, smem_size},
         .kernel_params = kernel_params,
     };
@@ -239,6 +326,8 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
                num_blocks, num_threads);
         printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, num_regs, local_size);
         printf("weights_bf16:%s\n", element_weights == "__ppu_bfloat16" ? "true" : "false");
+        if (grouped)
+            printf("schedule:request_grouped, block_q:%d\n", next_n);
         if (num_sms * blocks_per_cu != num_blocks) {
             printf("Warning: num_blocks(%d) should equal to num_sms(%d) * max_blocks_per_cu(%d) = %d\n", num_blocks,
                    num_sms, blocks_per_cu, num_sms * blocks_per_cu);
@@ -248,7 +337,7 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
     DgProfParam dg_prof_params;
     if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_paged_mqa_logits_params(
-            dtype_tag, static_cast<int>(kernel_params.batch_size), next_n, num_heads,
+            dtype_tag, static_cast<int>(kernel_params.batch_size), grouped ? 1 : next_n, num_heads,
             is_fp4 ? head_dim * 2 : head_dim,
             reinterpret_cast<int*>(const_cast<uint32_t*>(kernel_params.context_lens)), current_stream(), is_avg);
         dg_prof_params.add_params("page_kv", page_kv);
@@ -256,9 +345,17 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
             dg_prof_params.add_params("logits_dtype", std::string("bf16"));
         if (element_weights == "__ppu_bfloat16")
             dg_prof_params.add_params("weights_dtype", std::string("bf16"));
+        if constexpr (std::is_same_v<ArgumentsT, PagedMqaLogitsFP4Arguments>) {
+            if (grouped) {
+                dg_prof_params.add_params("max_context_len", max_context_len);
+                dg_prof_params.add_params("is_varlen", true);
+                add_fp4_varlen_dump_params(dg_prof_params, kernel_params.grouped_meta,
+                                           kernel_params.context_lens, kernel_params.batch_size);
+            }
+        }
     }
     {
-        auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
+        auto profiling_guard = grouped ? show_fp4_varlen_ut(dg_prof_params) : deep_gemm::show_gemm_ut(dg_prof_params);
         Runtime::launch(runtime, args);
     }
 }
@@ -266,18 +363,41 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
 // metadata_extra = (next_n, num_heads, logical_head_dim, qk_dtype).
 // M890 torch::kInt8 denotes MXFP4; 810E torch::kInt8 denotes true INT8.
 static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens, int batch_size, int page_kv,
-                                              int num_sms,
-                                              const std::tuple<int, int, int, torch::ScalarType>& metadata_extra) {
+                                               int num_sms,
+                                               const std::tuple<int, int, int, torch::ScalarType>& metadata_extra,
+                                               const std::optional<torch::Tensor>& indices = std::nullopt) {
     DG_HOST_ASSERT(page_kv == 32 or (page_kv > 0 and page_kv % 64 == 0));
     const auto& [next_n, num_heads, logical_head_dim, qk_dtype] = metadata_extra;
     const bool is_fp4 = get_ppu_arch() == AC_PPU0015 and qk_dtype == torch::kInt8;
     const int head_dim = is_fp4 ? logical_head_dim / 2 : logical_head_dim;
     const int element_size = static_cast<int>(c10::elementSize(qk_dtype));
-    const auto& tile =
-        deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
+    const auto tile = is_fp4 and num_heads != 4 and indices.has_value()
+        ? deep_gemm_mqa_common::get_fp4_varlen_tile(num_heads)
+        : deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
     const int split_kv = tile.split_kv, tb_per_cu = tile.tb_per_cu;
 
     const int num_blocks = num_sms * tb_per_cu;
+    if (is_fp4 and num_heads != 4 and indices.has_value()) {
+        const int rows = num_blocks + 1 + batch_size;
+        // Keep the prefix workspace alive with its opaque metadata owner.
+        // A temporary tensor can alias the logits allocation in Graph replay.
+        auto storage = torch::empty({rows * 4 + batch_size * 2}, context_lens.options());
+        auto metadata = storage.slice(0, 0, rows * 4).view({rows, 4});
+        const auto& args = FP4VarlenMetadataRuntime::Args{
+            .launch_args = {dim3(1, 1, 1), dim3(256, 1, 1), 0},
+            .block_q = deep_gemm_mqa_common::FP4PagedVarlenConfig::kQueryHeadRows / num_heads, .split_kv = split_kv, .workers = num_blocks,
+            .singleton_cost_multiplier = deep_gemm_mqa_common::FP4PagedVarlenConfig::kSingletonCostMultiplier,
+            .nq = static_cast<uint32_t>(batch_size),
+            .lengths = reinterpret_cast<const uint32_t*>(context_lens.data_ptr()),
+            .indices = reinterpret_cast<const uint32_t*>(indices->data_ptr()),
+            .metadata = reinterpret_cast<uint32_t*>(metadata.data_ptr()),
+            .prefix = reinterpret_cast<uint64_t*>(static_cast<int32_t*>(storage.data_ptr()) + rows * 4),
+        };
+        const auto& runtime = compiler->build("attention_paged_mqa_logits_metadata_varlen",
+                                              FP4VarlenMetadataRuntime::generate(args));
+        FP4VarlenMetadataRuntime::launch(runtime, args);
+        return metadata;
+    }
     auto schedule_metadata = torch::empty(
         {num_blocks + 1, 2}, torch::TensorOptions().dtype(context_lens.scalar_type()).device(context_lens.device()));
 
@@ -326,10 +446,13 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
                                fused_kv_cache.storage_offset() + static_cast<int64_t>(page_kv) * head_dim)
                    .view(is_fp4 ? torch::kInt32 : torch::kFloat32);
 
-    const auto& tile = deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim,
-                                                                      static_cast<int>(q.element_size()));
+    const bool grouped = is_fp4 and not is_avg and schedule_meta.size(1) == 4;
+    const auto tile = grouped ? deep_gemm_mqa_common::get_fp4_varlen_tile(num_heads)
+        : deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim,
+                                                          static_cast<int>(q.element_size()));
     if (is_fp4)
-        TORCH_CHECK(schedule_meta_size - 1 == get_num_sms() * tile.tb_per_cu,
+        TORCH_CHECK((schedule_meta_size - (grouped ? batch_size : 0)) ==
+                     get_num_sms() * tile.tb_per_cu + 1,
                     "FP4 paged logits require matching metadata_extra=(next_n, H, 128, torch.int8) on M890 "
                     "and the current num_sms");
     if (not is_fp4)
@@ -345,6 +468,7 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     // The kernel pads 4 heads to 16 per warp N tile (BLOCK_N = ceil(next_n/4)*16), so the
     // host-side smem/thread computations use the same padded geometry.
     int tile_next_n = next_n, tile_num_heads = num_heads;
+    if (grouped) tile_next_n = deep_gemm_mqa_common::FP4PagedVarlenConfig::kQueryHeadRows / num_heads;
     if (num_heads == 4) {
         tile_num_heads = 16;
         tile_next_n = (next_n + 3) / 4;
@@ -366,11 +490,15 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
         element_qk = "int8_t", element_acc = "int32_t", dtype_tag = "int8";
     }
 
+    // The grouped implementation caches only Q stage 0 scales; JIT asserts
+    // this host storage accounting against the instantiated kernel type.
     const int smem_size = deep_gemm_mqa_common::get_paged_smem_config(
         tile, tile_next_n, tile_num_heads, head_dim, static_cast<int>(q.element_size()),
-        static_cast<int>(weights.element_size()), is_fp4);
+        static_cast<int>(weights.element_size()), is_fp4)
+        - (grouped ? tile_next_n * tile_num_heads *
+            (tile.stage_q - 1) * 4 : 0);
     const int num_threads = deep_gemm_mqa_common::get_paged_num_threads(tile, tile_next_n);
-    const int num_blocks = schedule_meta_size - 1;
+    const int num_blocks = schedule_meta_size - (grouped ? batch_size : 0) - 1;
     const auto& kernel_name = "attention_paged_mqa_logits_" + dtype_tag + (is_avg ? "_avg" : "");
 
     const auto* context_lens_ptr = reinterpret_cast<const uint32_t*>(context_lens.data_ptr());
@@ -378,17 +506,25 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     const auto* schedule_meta_ptr = reinterpret_cast<const uint32_t*>(schedule_meta.data_ptr());
 
     if (is_fp4) {
-        launch_paged_mqa_logits(
-            "deep_gemm/impls/fp4_paged_mqa_logits.cuh", "PPUPagedMqaLogitsFP4", tile.split_mblock, scale_mode, tile,
-            element_qk, element_acc, element_logits, element_weights, dtype_tag, next_n, num_heads, head_dim, page_kv, kPagedMqaBlockKV,
-            smem_size, num_threads, num_blocks, kernel_name, is_avg,
-            PagedMqaLogitsFP4Arguments{q.data_ptr(), reinterpret_cast<const uint32_t*>(q_sf->data_ptr()),
-                                       k.data_ptr(), reinterpret_cast<const uint32_t*>(k_scales.data_ptr()),
-                                       weights_ptr, static_cast<uint32_t>(batch_size),
-                                       static_cast<uint64_t>(aligned_max_context_len),
-                                       static_cast<uint64_t>(kv_cache_stride_bytes),
-                                       static_cast<uint32_t>(block_table_stride), context_lens_ptr, logits.data_ptr(),
-                                       block_table_ptr, schedule_meta_ptr});
+        auto args = PagedMqaLogitsFP4Arguments{q.data_ptr(), reinterpret_cast<const uint32_t*>(q_sf->data_ptr()),
+            k.data_ptr(), reinterpret_cast<const uint32_t*>(k_scales.data_ptr()), weights_ptr,
+            static_cast<uint32_t>(batch_size), static_cast<uint64_t>(aligned_max_context_len),
+            static_cast<uint64_t>(kv_cache_stride_bytes), static_cast<uint32_t>(block_table_stride),
+            context_lens_ptr, logits.data_ptr(), block_table_ptr, schedule_meta_ptr,
+            grouped ? schedule_meta_ptr + (num_blocks + 1) * 4 : nullptr};
+        if (grouped) {
+            launch_paged_mqa_logits("deep_gemm/impls/fp4_paged_mqa_logits.cuh",
+                "PPUGroupedPagedMqaLogitsFP4", tile.split_mblock, scale_mode, tile,
+                element_qk, element_acc, element_logits, element_weights, dtype_tag, tile_next_n,
+                num_heads, head_dim, page_kv, deep_gemm_mqa_common::FP4PagedVarlenConfig::kBlockKV,
+                smem_size, num_threads, num_blocks,
+                kernel_name + "_grouped", false, args, true, max_context_len);
+        } else {
+            launch_paged_mqa_logits(
+                "deep_gemm/impls/fp4_paged_mqa_logits.cuh", "PPUPagedMqaLogitsFP4", tile.split_mblock, scale_mode, tile,
+                element_qk, element_acc, element_logits, element_weights, dtype_tag, next_n, num_heads, head_dim, page_kv, kPagedMqaBlockKV,
+                smem_size, num_threads, num_blocks, kernel_name, is_avg, args);
+        }
     } else {
         launch_paged_mqa_logits(
             "deep_gemm/impls/ppu_paged_mqa_logits.cuh", "PPUPagedMqaLogits", false, scale_mode, tile, element_qk, element_acc, element_logits,

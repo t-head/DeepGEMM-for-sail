@@ -86,6 +86,14 @@ The unified entry point calls `test_activation.py` and `test_fp4_core.py` direct
 - `GroupedMasked` / `GroupedNoPad,data_type:w4a8_int8`: 810E packed INT4 weights with INT8 activations. Cases from main retain large shapes, K=32/K=160 tails, and both small-M GEMV shapes; weight packing/preprocessing is exercised by the original generators.
 - `MqaAvgLogits,data_type:fp4`: six 890P cases cover the required compressed output, all three Q-scale modes, both output dtypes, Q/KV tails, active/fallback KV balancing, and multi-MMA-group execution for every Q-scale mode. Broader coverage remains in the attention script.
 - `PagedMqaAvgLogits,data_type:fp4`: four 890P cases cover next_n=1/4/5/6, page32/64/128, both output dtypes across both Q layouts, empty/mixed contexts, page tails and in-CTA request switches.
+- `PagedMqaLogits,data_type:fp4,is_varlen:1,varlen_indices:[...]`: grouped
+  replay uses flattened query rows with explicit request indices and `next_n=1`.
+  Dense consecutive request IDs identify the runs; `context_lens` retains
+  exact per-query lengths, with each request's maximum in its last query.
+  Without it, `distribution` gives per-request bases
+  expanded as base+j. Check-in covers ragged tails, shared page mappings,
+  nonmonotonic contexts, both head counts and multi-cluster KV reuse. Cases
+  without varlen fields retain the legacy independent-query metadata path.
 - `with_bias:1`: FP4 Dense/GroupedNoPad/GroupedMasked Default epilogues; bias and fused activation epilogues are tested separately.
 
 The added representatives also preserve INT8 contiguous, masked overlap/signal checks, FP8 channel contiguous/fused, BF16 paged attention, FP4 dense, and 890P BF16 dense M=2/grouped small-M GEMV. Existing colleague-authored cases are retained. FP4 masked overlap is currently unimplemented (the device template only specializes overlap=false); it is excluded rather than treated as a supported positive case.

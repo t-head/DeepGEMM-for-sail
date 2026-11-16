@@ -436,6 +436,14 @@ size 32 or any positive multiple of 64 on M890, including 256/512/1024.
 The same page-size rule applies to M890 AVG. 810E rejects page32 due to
 an actlize TSM addressing issue; use a positive multiple of 64.
 
+On M890, passing request `indices` to MXFP4 DSA metadata generation enables
+grouped scheduling for fixed MTP and ragged query counts. Consecutive equal
+IDs reuse KV pages; all block-table rows in that run must name the same KV
+mapping. Query rows retain their own context masks and public `next_n=1`.
+The last query in each request run must have that run's maximum context length.
+Regenerate metadata with the current indices and contexts, including inside
+CUDA Graph capture when those inputs change on replay.
+
 AVG indexers use no weights, default to BF16 output and retain paged
 `next_n=1–6`. Non-paged AVG requires a positive `max_seqlen_k`. The paged
 `fp8_fp4` AVG entry point accepts MXFP4 only; ordinary FP8 uses the separate

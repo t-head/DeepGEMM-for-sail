@@ -146,6 +146,13 @@ indices. Each query still has its own context-length and block-table row.
 Pass the same request grouping to metadata generation and computation, as
 shown below. Metadata is opaque; do not construct or modify its internal format.
 
+On M890, metadata generated with MXFP4 DSA indices schedules consecutive
+request runs together. The implementation uses a fixed capacity of 128
+query/head rows (four queries for H32, two for H64), masks incomplete blocks,
+and reuses KV data across query blocks of a run. Metadata generated without
+indices retains the independent per-query compatibility path. AVG, legacy
+FP8 and INT8 do not use this grouped scheduler.
+
 ### Request indices and MTP / ragged integration
 
 `indices` is a contiguous GPU int32 tensor of shape `[Q]`, on the same device
@@ -155,16 +162,6 @@ index, context length, or number of draft tokens. IDs may be local request
 numbers or stable request-pool IDs; distinct requests in a call must have
 distinct IDs. An ID is a grouping label, not an index into `block_table`.
 
-Use real request ownership even when a backend schedules query rows
-independently. Keeping the same request-major representation lets a backend
-adopt request-aware scheduling without requiring callers to change their IDs
-or tensor layouts.
-
-**Current PPU behavior:** metadata generation and compute validate the indices
-tensor's layout, but scheduling still visits each expanded query independently.
-The current backend does not use ID values to group work or enable cross-query
-KV reuse. The integration conventions below are valid with this implementation.
-
 Flatten query tokens in request order, keeping each request's rows consecutive.
 Apply the same row order to packed Q, Q scales, weights, context lengths, block
 tables and indices. The public weighted API always uses `next_n=1`, even for
@@ -172,15 +169,15 @@ MTP: Q is `(int8[Q,1,H,64], int32[Q,1,H])`, weights are BF16 `[Q,H]`, and
 context lengths are int32 `[Q,1]`. Do not put the MTP count in Q's second
 dimension or in `metadata_extra[0]`.
 
-Consecutive equal IDs describe a request run. Separate requests must never
-be combined just because their context lengths match. Nonconsecutive
-occurrences of the same ID form separate runs;
-the backend does not sort rows. For request-major integration, expand each
-request's KV page mapping to all of its query rows. Keep the largest context
-in the run's last query, while retaining every query's actual length; earlier
-lengths may differ and need not be monotonic. This ordering prepares inputs
-for request-aware backends; the current per-query PPU scheduler uses each
-row's own length. Each output row is limited by that query's context length.
+Consecutive equal IDs identify a request run for grouped scheduling and KV
+reuse. Separate requests must never be combined just because their context
+lengths match. Nonconsecutive occurrences of the same ID form separate runs;
+the scheduler does not sort rows. Every block-table row in a request run must
+refer to the same KV page mapping. The caller must ensure the last query in
+each run has the largest context length: `context_lens[end-1]` must equal the
+maximum over that run. Earlier lengths may differ and need not be monotonic;
+each output row is limited by its own context length. Scheduling may use the
+last row as the run's KV bound without validating GPU tensor values on the CPU.
 The block table remains **per query**, `[Q,max_pages]`, even with repeated IDs.
 
 The following examples assume `request_block_table` contains one row per real
@@ -260,15 +257,15 @@ logits = deep_gemm.fp8_fp4_paged_mqa_logits(
 )
 ```
 
-Always pass the same current request IDs to both calls, including on backends
-that currently ignore ID values for scheduling. As a portable integration
-rule, regenerate metadata when contexts or grouping change. For CUDA Graph
-replay with mutable inputs, capture metadata generation before compute so
-replay rebuilds the schedule from the current GPU tensors. On the current
-PPU backend, context changes affect scheduling and ID changes do not. Derive
-`Q`/`output_size` from host-known batch planning information when available;
-avoid GPU `.item()` reads in the hot path. Mask invalid logits using each
-query's own context length before Top-K.
+Always pass the same current grouping to both calls. Supplying real IDs only
+to compute does not upgrade a legacy schedule: metadata generated without
+indices retains independent per-query scheduling. Regenerate metadata when
+contexts or grouping change. For CUDA Graph replay with mutable contexts or
+IDs, capture metadata generation before compute so replay rebuilds the
+schedule from the current GPU tensors. Derive `Q`/`output_size` from host-known
+batch planning information when available; avoid GPU `.item()` reads in the
+hot path. Mask invalid logits using each query's own context length before
+Top-K.
 
 ## Sparse indexer
 
@@ -704,3 +701,41 @@ followed by `.item()` on every call. PPU1.5 `get_mqa_logits_metadata`
 currently returns None and provides no scheduling speedup. Paged metadata
 must still be generated correctly for the current contexts and scheduling
 configuration.
+
+## Grouped paged DSA dump and replay
+
+Outside CUDA Graph capture, `PPU_LIB_SHOW_PARAMS=1` emits a replayable
+`PagedMqaLogits` case using the public `next_n=1` and flattened query count.
+The UT fields describe flattened query rows and their request grouping:
+
+- `is_varlen:1` selects grouped replay with `batch_size=Q`.
+- `varlen_indices` contains one request ID per query. Dump normalizes
+  consecutive request runs to dense IDs starting at zero, preserving run
+  boundaries without preserving the original numeric labels. Replay shares
+  the page mapping within each run.
+- `context_lens` records the exact length of every query, including zero and
+  nonmonotonic earlier lengths. Each request's last query must have the maximum
+  length for that request. Grouped dumps retain the complete list for Q>64 too.
+- `distribution` contains one base context per request, using the first
+  query's length. A UT without `context_lens` expands base+j for query j of
+  that request. When both fields exist, `context_lens` takes precedence.
+
+Replay accepts dense consecutive request runs.
+The compute API also supports arbitrary labels and nonconsecutive occurrences;
+dump represents those occurrences as separate normalized runs. Parameter
+readback is a debugging operation and is skipped during Graph capture and
+compile-only warm-up; annotations from those modes contain only shape fields.
+
+For example, this case includes ragged runs and nonmonotonic per-row contexts:
+
+```bash
+PPU_LIB_SHOW_PARAMS=1 python tests/run_deep_gemm.py --format \
+  'PagedMqaLogits,data_type:fp4,batch_size:6,next_n:1,num_heads:32,head_dim:128,page_kv:64,max_context_len:1024,is_varlen:1,varlen_indices:[0,0,0,1,2,2],context_lens:[512,257,513,0,128,129]'
+```
+
+Pass the emitted `--format` value back to `tests/run_deep_gemm.py` for replay.
+These are UT/replay fields; the compute API continues to take GPU `indices`
+and `context_lens` tensors. UTs without varlen fields retain legacy metadata.
+The focused Graph, nonconsecutive-ID, masking and metadata-boundary tests are
+also included in `tests/test_attention.py` as `test_paged_fp4_varlen` and
+`test_paged_fp4_varlen_replay`.

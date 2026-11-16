@@ -4,6 +4,7 @@ import torch
 import deep_gemm
 from utils import test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, set_acc_check, parse_deepgemm_string_re
 from utils import is_ppu1v5_device, get_arch_version
+from utils import per_token_cast_to_fp4, cast_back_from_fp4, kv_cache_cast_to_fp4, ref_paged_mqa_logits, calc_diff
 
 def test_ks_ke(check_accuracy=True):
     if is_ppu1v5_device():
@@ -164,6 +165,126 @@ def test_mqa_logits_loop():
         set_acc_check(True)
         test_mqa_logits(parse_deepgemm_string_re(case))
     print("Passed\n")
+
+
+def test_fp4_mqa_compressed_boundaries():
+    if not is_ppu1v5_device():
+        return
+    # The first Q block has a full interior with partial prefix/suffix;
+    # later blocks cover empty/disjoint windows and a partial Q tail.
+    starts = [3, 7, 5, 9, 0, 63, 64, 65, 511, 512, 513, 1023, 1024]
+    ends = [1025, 1029, 1030, 1027, 0, 64, 65, 129, 512, 768, 1025, 1024, 1031]
+    nq, nk, dim = len(starts), 1031, 128
+    ks = torch.tensor(starts, device='cuda', dtype=torch.int32)
+    ke = torch.tensor(ends, device='cuda', dtype=torch.int32)
+    for heads in (32, 64):
+        q = torch.randn(nq * heads, dim, device='cuda', dtype=torch.bfloat16)
+        k = torch.randn(nk, dim, device='cuda', dtype=torch.bfloat16)
+        qp, qs = per_token_cast_to_fp4(q, use_ue8m0=True, gran_k=32,
+                                       use_packed_ue8m0=True)
+        kp, sf = per_token_cast_to_fp4(k, use_ue8m0=True, gran_k=32,
+                                       use_packed_ue8m0=True)
+        qr = cast_back_from_fp4(qp, qs, gran_k=32, use_packed_ue8m0=True)
+        kr = cast_back_from_fp4(kp, sf, gran_k=32, use_packed_ue8m0=True)
+        weights = torch.randn(nq, heads, device='cuda', dtype=torch.bfloat16)
+        logits = deep_gemm.fp8_fp4_mqa_logits(
+            (qp.view(nq, heads, dim // 2), qs.view(nq, heads)),
+            (kp, sf.view(nk)), weights, ks, ke, nk)
+        reference = (torch.einsum('qhd,kd->qhk', qr.float().view(nq, heads, dim),
+                                  kr.float()).relu() * weights.float()[:, :, None]).sum(1)
+        actual = torch.cat([logits[i, :end - start]
+                            for i, (start, end) in enumerate(zip(starts, ends))])
+        expected = torch.cat([reference[i, start:end]
+                              for i, (start, end) in enumerate(zip(starts, ends))])
+        assert torch.isfinite(actual).all()
+        diff = calc_diff(actual, expected)
+        assert diff < 1e-3, (heads, diff)
+    print('PASS: FP4 compressed MQA interior, boundaries and Q tail')
+
+
+def _check_paged_metadata_scan():
+    # Exercise the legacy two-column scan, not the request-grouped FP4 path.
+    # These fixed configurations use split64 (FP8/INT8 DSA) and split256 (FP4 AVG).
+    configs = [(1, 64, torch.float8_e4m3fn if is_ppu1v5_device() else torch.int8, 64)]
+    if is_ppu1v5_device():
+        configs.append((3, 4, torch.int8, 256))
+    for next_n, heads, dtype, split in configs:
+        # Partial warp, full scan, full scan + cross-warp tail, and carried sum.
+        for batch in (33, 1024, 1057, 2081):
+            row = torch.arange(batch, dtype=torch.int64)
+            lengths = torch.empty((batch, next_n), dtype=torch.int32, device='cuda')
+            for phase in range(6):
+                last = ((row * 37 + phase * 13) % 129) * split + (row + phase) % 3 - 1
+                last.clamp_(min=0)
+                last[row % 11 == 0] = 0
+                if phase >= 4:
+                    last.zero_()
+                    if phase == 4:
+                        last[1:4] = 1  # Fewer tasks than workers; repeated endpoints.
+                host = torch.stack([(last - next_n + 1 + n).clamp_min(0)
+                                    for n in range(next_n)], dim=1).to(torch.int32)
+                lengths.copy_(host)
+                metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    lengths, 64, deep_gemm.get_num_sms(),
+                    metadata_extra=(next_n, heads, 128, dtype))
+                assert metadata.ndim == 2 and metadata.shape[1] == 2
+                workers = metadata.shape[0] - 1
+                prefix = ((host[:, -1].long() + split - 1) // split).cumsum(0)
+                quotient, remainder = divmod(int(prefix[-1]), workers)
+                worker = torch.arange(workers + 1)
+                cuts = worker * quotient + worker.clamp_max(remainder)
+                # Strict upper bound skips zero-work rows, including the final sentinel.
+                query = torch.searchsorted(prefix, cuts, right=True)
+                previous = torch.cat((torch.zeros(1, dtype=torch.int64), prefix))[query]
+                expected = torch.stack((query, cuts - previous), dim=1).to(torch.int32)
+                assert torch.equal(metadata.cpu(), expected), (batch, next_n, dtype, phase)
+    print('PASS: paged metadata full/tail scans, carried sums and zero-work endpoints', flush=True)
+
+
+def test_paged_mqa_metadata_scan():
+    import os
+    from pathlib import Path
+    import shlex
+    import subprocess
+    import sys
+    import tempfile
+
+    _check_paged_metadata_scan()
+    # A timing-only perturbation makes the missing write-side barrier observable.
+    # Isolate the compiler wrapper/cache so other tests keep the production JIT.
+    with tempfile.TemporaryDirectory(prefix='deepgemm-metadata-scan-') as directory:
+        root = Path(directory)
+        header = root / 'delayed_sync.cuh'
+        header.write_text(r'''
+#include <ppu_include.hpp>
+__device__ __forceinline__ void metadata_scan_test_sync() {
+    __syncthreads();
+    if ((threadIdx.x / 32) % 2 == 0) {
+        const auto start = clock64();
+        while (clock64() - start < 4096) {}
+    }
+}
+#define __syncthreads metadata_scan_test_sync
+''')
+        wrapper = root / 'hgcc'
+        compiler = shlex.quote(str(Path(deep_gemm.PPU_HOME) / 'bin/hgcc'))
+        wrapper.write_text('#!/bin/sh\n'
+                           f'if [ "$1" = "--version" ]; then exec {compiler} "$@"; fi\n'
+                           f'exec {compiler} -include {shlex.quote(str(header))} "$@"\n')
+        wrapper.chmod(0o700)
+        env = os.environ.copy()
+        env.update(DG_JIT_HGCC_COMPILER=str(wrapper), DG_JIT_USE_HGRTC='0',
+                   DG_JIT_CACHE_DIR=str(root / 'cache'),
+                   PYTHONPATH=os.pathsep.join((str(Path(__file__).parent),
+                                               str(Path(deep_gemm.__file__).parent.parent),
+                                               env.get('PYTHONPATH', ''))))
+        env.pop('HGGC_WARM_UP', None)
+        result = subprocess.run(
+            [sys.executable, '-c',
+             'from test_attention import _check_paged_metadata_scan; _check_paged_metadata_scan()'],
+            env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+        assert result.returncode == 0, result.stdout
+        print(result.stdout, end='')
 
 
 def test_paged_mqa_logits_loop():
@@ -602,6 +723,173 @@ def test_sparse_workspace():
     print("PASS: cold capture rejected; warmup then capture/replay succeeds", flush=True)
 
 
+# Request-grouped FP4 regressions: keep broad shape/performance sweeps offline.
+class _PagedFP4VarlenCase:
+    def __init__(self, heads, page, context=4097):
+        self.heads, self.page, self.context = heads, page, context
+        self.runs = [1, 2, 3, 4, 5, 6, 9]
+        self.nq = sum(self.runs)
+        self.pages = (context + page - 1) // page
+        self.ids = torch.empty(self.nq, device='cuda', dtype=torch.int32)
+        self.lengths = torch.empty(self.nq, 1, device='cuda', dtype=torch.int32)
+        self.table = torch.empty(self.nq, self.pages, device='cuda', dtype=torch.int32)
+        q = torch.randn(self.nq, 1, heads, 128, device='cuda', dtype=torch.bfloat16)
+        packed, sf = per_token_cast_to_fp4(q.view(-1, 128), use_ue8m0=True,
+                                           gran_k=32, use_packed_ue8m0=True)
+        self.q = (packed.view(self.nq, 1, heads, 64), sf.view(self.nq, 1, heads))
+        self.q_ref = cast_back_from_fp4(packed, sf, gran_k=32,
+                                        use_packed_ue8m0=True).view_as(q).to(torch.bfloat16)
+        cache = torch.randn(len(self.runs) * self.pages, page, 1, 128,
+                            device='cuda', dtype=torch.bfloat16)
+        self.cache, self.cache_ref = kv_cache_cast_to_fp4(cache)
+        self.weights = torch.randn(self.nq, heads, device='cuda', dtype=torch.bfloat16)
+        self.update(0)
+
+    def update(self, phase):
+        runs = self.runs if phase % 2 == 0 else self.runs[::-1]
+        ids, lengths, tables = [], [], []
+        boundaries = [0, 1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, self.context]
+        for r, count in enumerate(runs):
+            ids.extend([7 if r % 2 == 0 else r + 20] * count)
+            # Deliberately nonmonotonic, including zero-length rows.
+            lengths.extend(min(self.context, boundaries[(r * 3 + t + phase) % len(boundaries)])
+                           for t in range(count))
+            lengths[-1] = max(lengths[-count:])
+            row = [((r + phase) % len(runs)) * self.pages + p for p in range(self.pages)]
+            tables.extend([row] * count)
+        self.ids.copy_(torch.tensor(ids, device='cuda', dtype=torch.int32))
+        self.lengths.copy_(torch.tensor(lengths, device='cuda', dtype=torch.int32)[:, None])
+        self.table.copy_(torch.tensor(tables, device='cuda', dtype=torch.int32))
+
+    def metadata(self, grouped=True):
+        return deep_gemm.get_paged_mqa_logits_metadata(
+            self.lengths, self.page, deep_gemm.get_num_sms(),
+            indices=self.ids if grouped else None,
+            metadata_extra=(1, self.heads, 128, torch.int8))
+
+    def run(self, grouped=True):
+        meta = self.metadata(grouped)
+        output = deep_gemm.fp8_fp4_paged_mqa_logits(
+            self.q, self.cache, self.weights, self.lengths, self.table, meta,
+            self.context, indices=self.ids)
+        return meta, output
+
+    def check(self, output):
+        _, baseline = self.run(False)
+        valid = torch.arange(self.context, device='cuda')[None, :] < self.lengths
+        assert torch.equal(output[valid].view(torch.int16), baseline[valid].view(torch.int16))
+        expected = ref_paged_mqa_logits(self.q_ref, self.cache_ref, self.weights,
+                                        self.lengths, self.table, self.context)
+        diff = calc_diff(output.masked_fill(~valid, 0), expected.masked_fill(~valid, 0))
+        assert not torch.isnan(diff) and diff < 1.5e-3, diff
+
+
+def test_paged_fp4_varlen():
+    if not is_ppu1v5_device():
+        return
+    torch.manual_seed(34)
+    for heads in (32, 64):
+        for page in (32, 64, 128):
+            case = _PagedFP4VarlenCase(heads, page)
+            meta, output = case.run()
+            case.check(output)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                meta, output = case.run()
+            # Changing run boundaries, lengths and page mappings must affect replay.
+            for phase in (0, 1):
+                case.update(phase)
+                output.fill_(float('nan'))
+                graph.replay()
+                case.check(output)
+                valid = torch.arange(case.context, device='cuda')[None, :] < case.lengths
+                assert torch.isnan(output[~valid]).all(), 'write beyond per-query context'
+            if heads == 32 and page == 64:
+                # One run, all singletons and the zero-work schedule are distinct boundaries.
+                for single in (True, False):
+                    if single:
+                        case.ids.fill_(7)
+                        case.table.copy_(case.table[:1].expand_as(case.table).clone())
+                        case.lengths[-1] = case.lengths.max()
+                    else:
+                        case.ids.copy_(torch.arange(case.nq, device='cuda', dtype=torch.int32))
+                    graph.replay()
+                    case.check(output)
+                case.lengths.zero_()
+                output.fill_(float('nan'))
+                graph.replay()
+                assert torch.isnan(output).all(), 'zero context must not write logits'
+            print('PASS grouped FP4', heads, page, flush=True)
+    # A large legal Q count with huge contexts must not overflow metadata cost.
+    for heads in (32, 64):
+        nq = 65536
+        ids = torch.zeros(nq, device='cuda', dtype=torch.int32)
+        lengths = torch.full((nq, 1), 1 << 30, device='cuda', dtype=torch.int32)
+        meta = deep_gemm.get_paged_mqa_logits_metadata(
+            lengths, 64, deep_gemm.get_num_sms(), indices=ids,
+            metadata_extra=(1, heads, 128, torch.int8))
+        workers = meta.size(0) - nq - 1
+        starts = meta[:workers + 1].cpu()
+        assert torch.all(starts[:-1, 0] == 0) and starts[-1, 0] == nq // (128 // heads)
+        assert starts[0, 1] == 0 and torch.all(starts[1:workers, 1] > starts[:workers - 1, 1])
+        print('PASS grouped FP4 metadata capacity', heads, flush=True)
+
+
+def test_paged_fp4_varlen_replay():
+    if not is_ppu1v5_device():
+        return
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    from unittest.mock import patch
+    import utils
+    set_acc_check(True)
+    utils.set_benchmark(False)
+    # One case covers exact nonmonotonic lengths, an empty request, Q>64 and tails.
+    ids = [0] * 33 + [1] + [2] * 31
+    lengths = [(q * 17) % 129 for q in range(65)]
+    lengths[32] = max(lengths[:33])
+    lengths[33] = 0
+    lengths[-1] = max(lengths[34:])
+    spec = (
+        'PagedMqaLogits,data_type:fp4,batch_size:65,next_n:1,num_heads:32,'
+        'head_dim:128,page_kv:64,max_context_len:256,is_varlen:1,'
+        f'varlen_indices:{ids},context_lens:{lengths}')
+    cast = utils.kv_cache_cast_to_fp4
+    seen = []
+    def checked_cast(cache):
+        # Two pages per nonempty request; never allocate one copy per query.
+        assert cache.shape == (4, 64, 1, 128), cache.shape
+        seen.append(True)
+        return cast(cache)
+    with patch.object(utils, 'kv_cache_cast_to_fp4', checked_cast):
+        utils.test_paged_mqa_logits(parse_deepgemm_string_re(spec))
+    assert seen
+    env = os.environ.copy()
+    env.pop('HGGC_WARM_UP', None)
+    env['PPU_LIB_SHOW_PARAMS'] = '1'
+    command = [sys.executable, str(Path(__file__).with_name('run_deep_gemm.py')),
+               '--format', spec, '--require_supported']
+    dumped = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, timeout=180)
+    assert dumped.returncode == 0 and 'Accuracy check passed' in dumped.stdout, dumped.stdout
+    cases = [line.split('--format=', 1)[1] for line in dumped.stdout.splitlines()
+             if line.startswith('[DeepGemm] --format=PagedMqaLogits,')]
+    assert len(cases) == 1, dumped.stdout
+    parsed = parse_deepgemm_string_re(cases[0])
+    assert parsed['batch_size'] == 65 and parsed['next_n'] == 1 and parsed['is_varlen'] == 1
+    assert parsed['varlen_indices'] == ids and parsed['context_lens'] == lengths
+    assert parsed['distribution'] == [lengths[0], 0, lengths[34]]
+    assert parsed['max_context_len'] == 256
+    env.pop('PPU_LIB_SHOW_PARAMS')
+    command[3] = cases[0]
+    replayed = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=180)
+    assert replayed.returncode == 0 and 'Accuracy check passed' in replayed.stdout, replayed.stdout
+    print('PASS grouped FP4 allocation and dump/replay', flush=True)
+
+
 def test_nvtx():
     print('Testing nvtx dump:')
     import torch.cuda.nvtx as nvtx
@@ -628,8 +916,12 @@ if __name__ == '__main__':
     test_per_layer_cache_view()
     test_paged_int8_page_boundaries()
     test_mqa_logits_loop()
+    test_fp4_mqa_compressed_boundaries()
+    test_paged_mqa_metadata_scan()
     test_paged_mqa_logits_loop()
     test_mqa_avg_logits_loop()
     test_sparse_mqa_logits_loop()
     test_sparse_input_contracts()
     test_sparse_workspace()
+    test_paged_fp4_varlen()
+    test_paged_fp4_varlen_replay()

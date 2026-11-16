@@ -2480,7 +2480,7 @@ def test_paged_mqa_logits(args) -> None:
     print('Testing Paged MQA Logits:')
     data_type = args['data_type']
     batch_size = args['batch_size']
-    next_n = args['next_n']
+    next_n = args.get('next_n', 1)
     avg_context_len = args.get('avg_context_len', 8192)
     distribution = args.get('distribution', [])
     pre_distribution = args.get('pre_distribution', [])
@@ -2491,6 +2491,32 @@ def test_paged_mqa_logits(args) -> None:
     # Avg variant (gemm_type 'PagedMqaAvgLogits'): no weights input, /sqrt(head_dim) inside kernel
     # (aligned with PAI: the paged avg kernel takes no q_scale)
     is_avg = args.get('gemm_type') == 'PagedMqaAvgLogits'
+    varlen_indices = args.get('varlen_indices')
+    query_contexts = args.get('context_lens')
+    is_varlen = args.get('is_varlen', varlen_indices is not None or query_contexts is not None)
+    tokens_per_request = []
+    if is_varlen:
+        assert not is_avg and data_type == torch.uint8 and next_n == 1, \
+            "varlen replay is supported only by paged MXFP4 DSA with next_n=1"
+        assert not args.get('implicit_indices', False), "MXFP4 varlen requires explicit indices"
+        assert not pre_distribution, "varlen replay requires current metadata contexts"
+        assert args.get('context_pattern') is None, "use context_lens for exact varlen lengths"
+        if not varlen_indices:
+            varlen_indices = list(range(batch_size))
+            if query_contexts is None and (not isinstance(distribution, list) or not distribution):
+                distribution = [avg_context_len] * batch_size
+        assert isinstance(varlen_indices, list) and len(varlen_indices) == batch_size
+        assert all(isinstance(idx, int) and idx >= 0 for idx in varlen_indices)
+        run_ids = []
+        for idx in varlen_indices:
+            if run_ids and idx == run_ids[-1]:
+                tokens_per_request[-1] += 1
+            else:
+                run_ids.append(idx)
+                tokens_per_request.append(1)
+        assert run_ids == list(range(len(run_ids))), "UT request IDs must be dense consecutive runs"
+    else:
+        assert varlen_indices is None and query_contexts is None, "varlen fields require is_varlen=1"
     if not is_avg:
         assert next_n == 1, "weighted next_n must be 1"
         if data_type == torch.uint8:
@@ -2518,7 +2544,18 @@ def test_paged_mqa_logits(args) -> None:
 
     # Generate context_lens (2D [batch_size, next_n] for DeepGEMM 2D context_lens support)
     context_pattern = args.get('context_pattern')
-    if context_pattern is not None:
+    if query_contexts is not None:
+        assert isinstance(query_contexts, list) and len(query_contexts) == batch_size
+        assert all(isinstance(v, int) and 0 <= v <= max_model_len for v in query_contexts)
+        context_lens = torch.tensor(query_contexts, device='cuda', dtype=torch.int32)
+    elif is_varlen:
+        # Distribution contains one base per request; token j
+        # sees base+j unless exact per-query context_lens were supplied.
+        assert isinstance(distribution, list) and len(distribution) == len(tokens_per_request)
+        lengths = [base + j for base, count in zip(distribution, tokens_per_request) for j in range(count)]
+        assert all(isinstance(v, int) and 0 <= v <= max_model_len for v in lengths)
+        context_lens = torch.tensor(lengths, device='cuda', dtype=torch.int32)
+    elif context_pattern is not None:
         assert isinstance(context_pattern, list) and len(context_pattern) > 0
         context_lens = torch.tensor([context_pattern[i % len(context_pattern)] for i in range(batch_size)],
                                     device='cuda', dtype=torch.int32)
@@ -2528,17 +2565,39 @@ def test_paged_mqa_logits(args) -> None:
     else:
         context_lens = torch.randint(int(0.7 * avg_context_len), int(1.3 * avg_context_len), (batch_size, )).cuda().to(torch.int32)
 
-    max_block_len = (context_lens.max().item() + pagesize - 1) // pagesize
-    num_blocks = int(((context_lens + pagesize - 1) // pagesize).sum().item() * 1.3)  # 30% slack
+    max_block_len = max(1, (context_lens.max().item() + pagesize - 1) // pagesize)
+    request_indices = None
+    if is_varlen:
+        # Allocate each run's physical KV pages once, then expand its table row.
+        # Earlier query lengths may be nonmonotonic; the last one is the maximum.
+        row_lengths = query_contexts if query_contexts is not None else lengths
+        request_pages = []
+        start = 0
+        for count in tokens_per_request:
+            end = start + count
+            assert row_lengths[end - 1] == max(row_lengths[start:end]), \
+                "each request's last query must have its maximum context length"
+            request_pages.append(ceil_div(row_lengths[end - 1], pagesize))
+            start = end
+        num_blocks = max(1, sum(request_pages))
+        request_indices = torch.tensor(varlen_indices, device=q.device, dtype=torch.int32)
+    else:
+        num_blocks = max(1, int(((context_lens + pagesize - 1) // pagesize).sum().item() * 1.3))
     kv_cache = torch.randn((num_blocks, pagesize, 1, head_dim), device='cuda', dtype=torch.bfloat16)
-
     block_tables = torch.full((batch_size, max_block_len), fill_value=0, device='cuda', dtype=torch.int32)
     block_idx_pool = torch.randperm(num_blocks, device='cuda', dtype=torch.int32)
     counter = 0
-    for i in range(batch_size):
-        nblk = ceil_div(context_lens[i].item(), pagesize)
-        block_tables[i, :nblk] = block_idx_pool[counter:counter+nblk]
-        counter += nblk
+    if is_varlen:
+        start = 0
+        for count, nblk in zip(tokens_per_request, request_pages):
+            block_tables[start:start + count, :nblk] = block_idx_pool[counter:counter + nblk]
+            counter += nblk
+            start += count
+    else:
+        for i in range(batch_size):
+            nblk = ceil_div(context_lens[i].item(), pagesize)
+            block_tables[i, :nblk] = block_idx_pool[counter:counter+nblk]
+            counter += nblk
 
     # Generate 2D context_lens for main kernel
     if next_n == 1:
@@ -2585,7 +2644,7 @@ def test_paged_mqa_logits(args) -> None:
         q, kv_cache = q_dequant, kv_cache_dequant
         metadata_extra = (next_n, num_heads, head_dim, torch.int8)
         schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(),
-                                                metadata_extra=metadata_extra)
+                                                indices=request_indices, metadata_extra=metadata_extra)
         if is_avg:
             logits = deep_gemm.fp8_fp4_paged_mqa_avg_logits(
                 q=q_in, fused_kv_cache=kv_cache_fp4,
@@ -2598,7 +2657,8 @@ def test_paged_mqa_logits(args) -> None:
                 q=q_in, kv_cache=kv_cache_fp4, weights=weights,
                 context_lens=context_lens, block_table=block_tables,
                 schedule_meta=schedule_metadata, max_context_len=max_model_len,
-                indices=torch.arange(batch_size, device=q.device, dtype=torch.int32),
+                indices=request_indices if request_indices is not None else torch.arange(
+                    batch_size, device=q.device, dtype=torch.int32),
             )
     else:
         print("ERROR: Unsupported dtype for Paged MQA Logits, please check!")
@@ -2640,7 +2700,7 @@ def test_paged_mqa_logits(args) -> None:
                 rtol=8e-3 if is_bf16 else 1e-4,
                 atol=2e-3 if is_bf16 else 1e-4,
             )
-        diff = calc_diff(logits_masked, ref_logits_masked)
+        diff = torch.as_tensor(calc_diff(logits_masked, ref_logits_masked))
         threshold = 1.5e-3 if logits_dtype == torch.bfloat16 else 1e-3
         if torch.isnan(diff) or diff >= threshold:
             print(f"ERROR: Accuracy check failed, diff={diff}")

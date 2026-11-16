@@ -72,9 +72,10 @@ static void check_row_indices(const std::optional<torch::Tensor>& indices,
                 indices->scalar_type() == torch::kInt32 and indices->is_contiguous() and
                 indices->device() == context_lens.device(),
                 "indices must be contiguous int32 [Q] on context_lens.device");
-    // PPU schedules each expanded query row independently. Request ids do not
-    // alter addressing: block_table and context_lens are already per-query.
-    // Unlike the SM100 scheduler, this backend does not pair rows for KV reuse.
+    // Consecutive equal request IDs permit FP4 DSA Q-block/KV reuse. Their
+    // per-query block-table rows must name the same KV mapping. Legacy
+    // two-column metadata continues to schedule each expanded Q independently.
+    // The caller guarantees that the last row of each run has its largest context.
 }
 
 // Compatibility stub: dense PPU logits do not use scheduling metadata.
@@ -210,7 +211,8 @@ static torch::Tensor mqa_logits_common(const torch::Tensor& q, const torch::Tens
 //   weights:        [batch * next_n, num_heads], float32 or bfloat16; empty selects avg
 //   context_lens:   int32 [batch_size, next_n]
 //   block_table:    int32 [batch_size, max_block_len]
-//   schedule_meta:  int32 [num_blocks+1, 2], produced by `get_paged_mqa_logits_metadata`
+//   schedule_meta:  opaque int32 metadata from `get_paged_mqa_logits_metadata`;
+//                   legacy uses two columns, request-grouped FP4 DSA uses four.
 //   max_context_len: maximum context length
 //   clean_logits:   whether to mask out-of-range logits with -inf (unsupported here, see below)
 //   logits_dtype:   output logits dtype, float32 or bfloat16
@@ -239,7 +241,8 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
     DG_HOST_ASSERT(context_lens.size(1) == next_n);
     DG_HOST_ASSERT(batch_size == context_lens.size(0) and batch_size == block_table.size(0));
     DG_HOST_ASSERT(num_heads_kv == 1);
-    DG_HOST_ASSERT((schedule_meta_size - 1) % get_num_sms() == 0 and meta_info_size == 2);
+    const bool grouped = is_fp4 and not is_avg and meta_info_size == 4;
+    DG_HOST_ASSERT(grouped or ((schedule_meta_size - 1) % get_num_sms() == 0 and meta_info_size == 2));
     TORCH_CHECK(is_avg ? (1 <= next_n and next_n <= 6) : next_n == 1,
                 "weighted paged indexer requires next_n == 1; AVG supports next_n in [1, 6]");
     TORCH_CHECK(context_lens.is_contiguous(), "context_lens must be contiguous");
@@ -437,7 +440,7 @@ torch::Tensor get_paged_mqa_logits_metadata(
     // shared memory limit
     TORCH_CHECK(batch_size > 0 and batch_size <= 65536, "batch_size must be in [1, 65536]");
 
-    return paged_mqa_logits_metadata(context_lens, batch_size, page_kv, num_sms, *metadata_extra);
+    return paged_mqa_logits_metadata(context_lens, batch_size, page_kv, num_sms, *metadata_extra, indices);
 }
 
 torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q, const torch::Tensor& kv_cache,

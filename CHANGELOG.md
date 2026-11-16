@@ -20,6 +20,14 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   `swiglu_oai` and `situ` through shared FP32 activation formulas. Native PPU
   sigmoid/tanh are unconditional; `fast_math` selects only the division path.
 
+- **M890 paged MXFP4 DSA request scheduling**: uses consecutive request
+  `indices` to reuse KV data across fixed MTP and ragged query rows. Supports
+  H32/H64, logical D128, page32/64/128 and BF16 weights/output with public
+  `next_n=1`. Context masks remain per query, and metadata generation can be
+  captured for replay with changing contexts, request groups and page tables.
+  Callers provide the maximum context in each request run's last query.
+  Metadata generated without indices retains independent per-query scheduling.
+
 - **M890 NVFP4 W4A8 GEMMs**: adds `gemm_fp8_nvfp4_bf16_nt` and grouped
   nopad, masked and fused-routing variants for FP8 activations and NVFP4
   weights with BF16 output. Callers select fused decoding or per-call

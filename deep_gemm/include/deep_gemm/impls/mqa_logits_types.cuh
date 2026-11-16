@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-// MQA scale modes shared by host configuration and device kernels.
+// MQA types shared by host configuration, dump/replay and device kernels.
 namespace deep_gemm {
 
 // ============================================================
@@ -22,5 +22,14 @@ enum QScaleMode : uint32_t {
     kScaleModeQScalar = 2,
     kScaleModeUnity = 3,
 };
+
+// Four int32 columns per entry; keep the opaque metadata ABI unchanged.
+struct alignas(16) FP4VarlenCTAStart {
+    uint32_t group, kv_split, num_groups, split_kv;
+};
+struct alignas(16) FP4VarlenQBlock {
+    uint32_t source_q, valid_q, context_len, table_row;
+};
+static_assert(sizeof(FP4VarlenCTAStart) == 16 && sizeof(FP4VarlenQBlock) == 16);
 
 } // namespace deep_gemm
