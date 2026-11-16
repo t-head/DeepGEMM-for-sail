@@ -52,6 +52,25 @@ python ./run_deep_gemm_perf.py --caselist=./deepgemm.caselist
 
 # Checkin Test
 
+## GEMM + ReduceScatter (M890)
+
+`python tests/checkin/run_checkin.py --suite ZW-M890P-GemmRS` runs the small
+distributed set sequentially at TP2/4/8. It reuses `test_gemm_comm.py --smoke`
+for BF16 and both FP8 scale layouts, local_M=1/2, owner/N tails, staged sends,
+changing-input Graph replay and one workspace shared across shapes and dtypes.
+The full correctness/performance sweep remains opt-in through that script.
+This multi-card suite is manual-only and is not selected by the shared PR CI.
+Smoke and replay share the existing source-exact, elementwise reduction and
+cancellation checks; see [checkin integration](checkin/README.md#gemm--reducescatter).
+
+Fused TP2/4/8 calls support `show_log=1`, `PPU_LIB_SHOW_PARAMS=1` and
+`PPU_LIB_PERF_INSTRUMENT=1`. Replay dumped `GemmReduceScatter` formats using
+`torchrun --standalone --nproc-per-node=<tp> tests/run_deep_gemm.py --format='<format>'`.
+M is global and K is local; rank is informational. The format includes the selected
+tile/SM budget and BF16 warp K. Replay creates fresh inputs and symmetric storage;
+it does not restore original data, peer pointers, epochs or external stream/Graph
+dependencies. Warm-up/compile-only mode compiles without checking unwritten output.
+
 ## Native JIT compile-key regression (PPU)
 
 From a source checkout with initialized submodules, PPU PyTorch and the PPU SDK:

@@ -156,8 +156,15 @@ public:
         return runtime;
     }
 
+    static std::string bf16_gemm_rs_mma_reuse_flag(const std::string& name) {
+        return get_ppu_arch() == AC_PPU0015 && name == "bf16_gemm_rs" ? "-ppu-pref-mma-reuse=true" : "";
+    }
+
     std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
-        const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
+        auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
+        // Include the applied fused BF16 policy so older cubins cannot bypass it.
+        if (const auto option = bf16_gemm_rs_mma_reuse_flag(name); !option.empty())
+            kernel_signature += "$$" + option;
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache
@@ -285,6 +292,7 @@ public:
             const bool use_warp_interleaving =
                 (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
                 (name.find("fp8_deep_gemm") != std::string::npos) ||
+                (name == "fp8_blockwise_gemm_rs") ||
                 (name.find("fp8_blockwise_mega_moe_dispatch_gemm1") != std::string::npos) ||
                 is_blockwise_scatter ||
                 (name.find("mqa_logits") != std::string::npos &&
@@ -294,6 +302,8 @@ public:
                 const bool is_bf16_cute_free = name.find("bf16_deep_gemm_cute_free") != std::string::npos;
                 if (is_bf16_cute_free) {
                     per_kernel_flags += " -Xllvm -ppu-pref-mma-reuse=true";
+                } else if (const auto option = bf16_gemm_rs_mma_reuse_flag(name); !option.empty()) {
+                    per_kernel_flags += " -Xllvm " + option;
                 }
             } else {
                 per_kernel_flags += " -Xllvm -ppu-blksync-nb-schedule-boundary=true"
@@ -406,6 +416,7 @@ public:
                 const bool use_warp_interleaving =
                     (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
                     (name.find("fp8_deep_gemm") != std::string::npos) ||
+                    (name == "fp8_blockwise_gemm_rs") ||
                     (name.find("fp8_blockwise_mega_moe_dispatch_gemm1") != std::string::npos) ||
                     is_blockwise_scatter ||
                     (name.find("mqa_logits") != std::string::npos &&
@@ -414,6 +425,8 @@ public:
                     opts_insert({
                         "--ppu-tuning-options=-ppu-simt-branch=false",
                     });
+                    if (const auto option = bf16_gemm_rs_mma_reuse_flag(name); !option.empty())
+                        opts_insert({"--ppu-tuning-options=" + option});
                 } else {
                     opts_insert({
                         "--ppu-tuning-options=-ppu-blksync-nb-schedule-boundary=true",
