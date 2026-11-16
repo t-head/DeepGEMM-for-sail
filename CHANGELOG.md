@@ -12,6 +12,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   including in-place `c=d`, and compact expert end offsets through
   `use_psum_layout=True`, including empty experts.
 
+- **DeepSeek V4 normal Mega-mHC**: `mega_mhc` supports hidden sizes 4096 and
+  7168 on Zhenwu M890 when both `shifted_prev_mix` and `new_prev_mix` are `None`.
+
 ## 1.1.0+v1.1.0
 
 ### Fixed

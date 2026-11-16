@@ -3485,18 +3485,18 @@ def test_mega_mhc(args):
     mode = args.get('mode', 'shifted')
     if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError('MegaMhc supports data_type:bf16 or fp8')
-    if mode != 'shifted':
-        raise ValueError('MegaMhc only supports V4.1 Flash shifted mode')
+    if mode not in ('shifted', 'normal'):
+        raise ValueError('MegaMhc supports mode:shifted or normal')
     if dtype == torch.bfloat16 and ('sf_layout' in args or 'shared_sf_block_m' in args):
         raise ValueError('MegaMhc BF16 output does not use scale layouts')
     if get_acc_check() and get_ref_backend() != 'device':
         raise ValueError("ref_backend only supports 'device' for MegaMhc")
-    kwargs = dict(tokens=args['m'], hidden=args.get('hidden', 5120),
+    kwargs = dict(tokens=args['m'], hidden=args.get('hidden', 4096 if mode == 'normal' else 5120),
                   num_sinkhorn_iters=args.get('sinkhorn_iters', 20),
                   benchmark=get_benchmark(), check_accuracy=get_acc_check(),
                   sf_layout=args.get('sf_layout', 'col') if dtype == torch.float8_e4m3fn else 'bf16',
                   shared_sf_block_m=args.get('shared_sf_block_m', 224),
-                  store_bf16=args.get('store_bf16', 1))
+                  store_bf16=args.get('store_bf16', 1), mode=mode)
     if kwargs['store_bf16'] not in (0, 1):
         raise ValueError('MegaMhc store_bf16 must be 0 or 1')
     if dtype == torch.float8_e4m3fn and kwargs['sf_layout'] not in ('col', 'extra', 'token'):
@@ -3512,11 +3512,11 @@ def test_mega_mhc(args):
         if args.get('case') == 'interface_graph':
             from test_mega_mhc import check_graph
             if os.environ.get('HGGC_WARM_UP') or deep_gemm.get_compile_mode() == 1:
-                return check_graph(warmup=True)
+                return check_graph(warmup=True, mode=mode)
             if get_acc_check():
                 from test_mega_mhc import check_interface
                 check_interface()
-                return check_graph()
+                return check_graph(mode=mode)
         return check(**kwargs)
     finally:
         if num_sms is not None:
