@@ -84,6 +84,9 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 - PyTorch 2.1 or above
 - ACTLIZE for PPU: v1.0.0
 
+Keep the PPU SDK's `hgobjdump` executable on `PATH`. Module loading uses it to
+inspect kernel symbols, including disk-cache loads; ISA export uses it as well.
+
 ### Development
 
 Before contributing, read the [DeepGEMM development guidelines](docs/development.md).

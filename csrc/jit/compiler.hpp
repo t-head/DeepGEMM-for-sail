@@ -71,7 +71,7 @@ public:
         Compiler::library_root_path = library_root_path;
         Compiler::library_include_path = Compiler::library_root_path / "include";
         Compiler::sdk_home = sdk_home_path;
-        Compiler::hgobjdump_path = Compiler::sdk_home / "bin" / "hgobjdump";
+        Compiler::hgobjdump_path = "hgobjdump";
     }
 
     std::string signature, flags;
