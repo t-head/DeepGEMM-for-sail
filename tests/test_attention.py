@@ -202,6 +202,91 @@ def test_fp4_mqa_compressed_boundaries():
     print('PASS: FP4 compressed MQA interior, boundaries and Q tail')
 
 
+def _check_paged_metadata_scan():
+    # Exercise the legacy two-column scan, not the request-grouped FP4 path.
+    # These fixed configurations use split64 (FP8/INT8 DSA) and split256 (FP4 AVG).
+    configs = [(1, 64, torch.float8_e4m3fn if is_ppu1v5_device() else torch.int8, 64)]
+    if is_ppu1v5_device():
+        configs.append((3, 4, torch.int8, 256))
+    for next_n, heads, dtype, split in configs:
+        # Partial warp, full scan, full scan + cross-warp tail, and carried sum.
+        for batch in (33, 1024, 1057, 2081):
+            row = torch.arange(batch, dtype=torch.int64)
+            lengths = torch.empty((batch, next_n), dtype=torch.int32, device='cuda')
+            for phase in range(6):
+                last = ((row * 37 + phase * 13) % 129) * split + (row + phase) % 3 - 1
+                last.clamp_(min=0)
+                last[row % 11 == 0] = 0
+                if phase >= 4:
+                    last.zero_()
+                    if phase == 4:
+                        last[1:4] = 1  # Fewer tasks than workers; repeated endpoints.
+                host = torch.stack([(last - next_n + 1 + n).clamp_min(0)
+                                    for n in range(next_n)], dim=1).to(torch.int32)
+                lengths.copy_(host)
+                metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    lengths, 64, deep_gemm.get_num_sms(),
+                    metadata_extra=(next_n, heads, 128, dtype))
+                assert metadata.ndim == 2 and metadata.shape[1] == 2
+                workers = metadata.shape[0] - 1
+                prefix = ((host[:, -1].long() + split - 1) // split).cumsum(0)
+                quotient, remainder = divmod(int(prefix[-1]), workers)
+                worker = torch.arange(workers + 1)
+                cuts = worker * quotient + worker.clamp_max(remainder)
+                # Strict upper bound skips zero-work rows, including the final sentinel.
+                query = torch.searchsorted(prefix, cuts, right=True)
+                previous = torch.cat((torch.zeros(1, dtype=torch.int64), prefix))[query]
+                expected = torch.stack((query, cuts - previous), dim=1).to(torch.int32)
+                assert torch.equal(metadata.cpu(), expected), (batch, next_n, dtype, phase)
+    print('PASS: paged metadata full/tail scans, carried sums and zero-work endpoints', flush=True)
+
+
+def test_paged_mqa_metadata_scan():
+    import os
+    from pathlib import Path
+    import shlex
+    import subprocess
+    import sys
+    import tempfile
+
+    _check_paged_metadata_scan()
+    # A timing-only perturbation makes the missing write-side barrier observable.
+    # Isolate the compiler wrapper/cache so other tests keep the production JIT.
+    with tempfile.TemporaryDirectory(prefix='deepgemm-metadata-scan-') as directory:
+        root = Path(directory)
+        header = root / 'delayed_sync.cuh'
+        header.write_text(r'''
+#include <ppu_include.hpp>
+__device__ __forceinline__ void metadata_scan_test_sync() {
+    __syncthreads();
+    if ((threadIdx.x / 32) % 2 == 0) {
+        const auto start = clock64();
+        while (clock64() - start < 4096) {}
+    }
+}
+#define __syncthreads metadata_scan_test_sync
+''')
+        wrapper = root / 'hgcc'
+        compiler = shlex.quote(str(Path(deep_gemm.PPU_HOME) / 'bin/hgcc'))
+        wrapper.write_text('#!/bin/sh\n'
+                           f'if [ "$1" = "--version" ]; then exec {compiler} "$@"; fi\n'
+                           f'exec {compiler} -include {shlex.quote(str(header))} "$@"\n')
+        wrapper.chmod(0o700)
+        env = os.environ.copy()
+        env.update(DG_JIT_HGCC_COMPILER=str(wrapper), DG_JIT_USE_HGRTC='0',
+                   DG_JIT_CACHE_DIR=str(root / 'cache'),
+                   PYTHONPATH=os.pathsep.join((str(Path(__file__).parent),
+                                               str(Path(deep_gemm.__file__).parent.parent),
+                                               env.get('PYTHONPATH', ''))))
+        env.pop('HGGC_WARM_UP', None)
+        result = subprocess.run(
+            [sys.executable, '-c',
+             'from test_attention import _check_paged_metadata_scan; _check_paged_metadata_scan()'],
+            env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+        assert result.returncode == 0, result.stdout
+        print(result.stdout, end='')
+
+
 def test_paged_mqa_logits_loop():
     print('Testing Paged MQA Logits:')
     data_types = ['fp8', 'fp4'] if is_ppu1v5_device() else ['int8']
@@ -832,6 +917,7 @@ if __name__ == '__main__':
     test_paged_int8_page_boundaries()
     test_mqa_logits_loop()
     test_fp4_mqa_compressed_boundaries()
+    test_paged_mqa_metadata_scan()
     test_paged_mqa_logits_loop()
     test_mqa_avg_logits_loop()
     test_sparse_mqa_logits_loop()
