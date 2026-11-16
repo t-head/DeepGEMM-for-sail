@@ -45,18 +45,23 @@ public:
         // Load from the library
         kernel = load_kernel(hgbin_path, {}, &library);
 #else
-        const auto hgobjdump_path = sdk_home / "bin" / "hgobjdump";
+        const auto hgobjdump_path = std::filesystem::path("hgobjdump");
         // Find the only symbol
         // TODO: use kernel enumeration for newer drivers
         const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
-        const auto [exit_code, symbols] = call_external_command(fmt::format("{} --dump-elf-symbols=0 {}", hgobjdump_path.c_str(), hgbin_path.c_str()));
-        DG_HOST_ASSERT(exit_code == 0);
+        const auto [exit_code, symbols] = call_external_command(fmt::format(
+            "{} --dump-elf-symbols=0 {}", hgobjdump_path.c_str(), hgbin_path.c_str()));
+        if (exit_code != 0)
+            DG_HOST_UNREACHABLE(fmt::format("Failed to inspect {} with {} (exit {}): {}. "
+                                            "Module loading requires hgobjdump on PATH.",
+                                            hgbin_path.c_str(), hgobjdump_path.c_str(), exit_code, symbols));
         std::istringstream iss(symbols);
         std::vector<std::string> symbol_names;
         for (std::string line; std::getline(iss, line); ) {
             std::istringstream line_stream(line);
             std::string address, binding, type, section, token, symbol_name;
-            if (not (line_stream >> address >> binding >> type >> section) or binding != "g" or type != "F")
+            if (not (line_stream >> address >> binding >> type >> section) or
+                (binding != "g" and binding != "w") or type != "F")
                 continue;
             while (line_stream >> token)
                 symbol_name = token;
