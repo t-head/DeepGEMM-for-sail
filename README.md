@@ -763,14 +763,19 @@ We provide a HyperConnection (HC) prenorm GEMM that fuses the prenorm square-sum
 
 For more information, please refer to the `tf32_hc_prenorm_gemm` function documentation.
 
-#### Mega-mHC for DeepSeek V4.1 Flash (810E and M890)
+#### Mega-mHC for DeepSeek V4 and V4.1 (810E and M890)
 
-`deep_gemm.mega_mhc` implements the fused shifted mHC computation used by
-**DeepSeek V4.1 Flash** on **Zhenwu 810E and M890**. The current interface
-supports `hc_mult=4`, hidden size `5120`, and BF16 output.
-M890 additionally supports FP8 E4M3 output.
-It computes the updated residual, mix coefficients, and RMSNorm output into
-caller-provided output buffers.
+`deep_gemm.mega_mhc` fuses residual update, coefficient prediction, input
+mixing, and RMSNorm with `hc_mult=4` into caller-provided output buffers.
+
+- **DeepSeek V4 normal on Zhenwu M890** (`H=4096` or `7168`): pass `None`
+  for both `shifted_prev_mix` and `new_prev_mix`. Input mixing uses the newly
+  predicted pre-mix coefficients internally.
+- **DeepSeek V4.1 Flash shifted on Zhenwu 810E and M890** (`H=5120`): pass
+  both pre-mix tensors. Input mixing uses `shifted_prev_mix`, and
+  `new_prev_mix` receives the coefficients for the next call.
+
+810E supports BF16 output. M890 supports BF16 and/or FP8 E4M3 output.
 
 On M890, provide at least one of `y_bf16` or `y_fp8`. FP8 quantization uses the
 BF16-rounded RMSNorm output and requires one of these scale formats:

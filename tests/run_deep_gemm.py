@@ -40,6 +40,8 @@ def device_version_supported(one_case):
         arch = get_arch_version()
         if arch not in (80, 89):
             return False, 'Mega-mHC requires PPU1.0 or PPU1.5'
+        if one_case.get('mode', 'shifted') == 'normal' and arch != 89:
+            return False, 'Normal Mega-mHC requires Zhenwu M890 (sm_89)'
         if data_type == torch.float8_e4m3fn and arch != 89:
             return False, 'Mega-mHC FP8 output requires PPU1.5'
         return True, ''
