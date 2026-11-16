@@ -100,6 +100,22 @@ The added representatives also preserve INT8 contiguous, masked overlap/signal c
 
 Actual HGCC compilation, device accuracy, cache reuse and timing must be validated on both PPU boards.
 
+## Cold graph capture
+
+Board check-in runs `tests/test_cold_graph_capture.py` after successful accuracy
+checks, including in CI. M890P covers BF16 and FP8 channel/block; 810E covers BF16.
+Each case uses fresh processes and a private cache, warms a different specialization,
+then captures the target's first call with either an empty or pre-existing disk cache.
+Three random inputs check replay accuracy and exact agreement with eager execution.
+The script result and complete subprocess output are included in the check-in report.
+`--phase compile` and custom caselists do not run this regression.
+The runner's `--timeout` covers the whole capture script and terminates its
+process group, including compiler descendants. Direct pytest runs have no timeout.
+
+```bash
+python -m pytest -q -s tests/test_cold_graph_capture.py
+```
+
 Device checks comparing W4 warm-up shapes, types and strides with real quantization, and ensuring `--disable_acc` alone keeps real inputs:
 
 ```bash
