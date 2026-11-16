@@ -22,6 +22,12 @@ import xml.etree.ElementTree as ET
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUITES = {'ZW-810E': 'checkin_810e.list', 'ZW-M890P': 'checkin_890p.list'}
 SCRIPT_SUITES = {
+    'ZW-810E': [
+        '-m pytest -q -s --disable-warnings -x tests/test_cold_graph_capture.py -k bf16',
+    ],
+    'ZW-M890P': [
+        '-m pytest -q -s --disable-warnings -x tests/test_cold_graph_capture.py',
+    ],
     'ZW-M890P-MegaMoE': [
         '-m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py',
         '-m pytest -q -s --disable-warnings -x '
@@ -240,6 +246,17 @@ def execute(cases, workers, log_dir, timeout, phase='all', runner=run_case):
     return results
 
 
+def execute_scripts(specs, log_dir, timeout):
+    results = []
+    for i, spec in enumerate(specs, 1):
+        result = run_case(i, spec, 'script', log_dir, timeout)
+        results.append(result)
+        print(f'Script [{i}/{len(specs)}]: {result.error or "OK"}', flush=True)
+        if result.error:
+            print(result.log.read_text(errors='replace')[-12000:], flush=True)
+    return results
+
+
 def write_report(results, path):
     failed = sum(bool(result.error) for result in results)
     suite = ET.Element('testsuite', name='DeepGEMM checkin', tests=str(len(results)),
@@ -276,7 +293,7 @@ def positive_int(value):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument('--suite', choices=(*SUITES, *SCRIPT_SUITES))
+    source.add_argument('--suite', choices=sorted(SUITES.keys() | SCRIPT_SUITES.keys()))
     source.add_argument('--caselist', type=Path)
     parser.add_argument('--compile-workers', type=positive_int, default=16)
     parser.add_argument('--timeout', type=positive_int, default=1200, help='Per-case, per-phase timeout in seconds')
@@ -285,20 +302,14 @@ def main(argv=None):
     parser.add_argument('--log-dir', type=Path, default=Path('checkin-logs'))
     parser.add_argument('--list', action='store_true', help='Print the selected cases without importing Torch')
     args = parser.parse_args(argv)
-    if args.suite in SCRIPT_SUITES:
+    if args.suite in SCRIPT_SUITES and args.suite not in SUITES:
         if args.phase == 'compile':
             parser.error('Script suites run compilation and correctness together; use --phase all or run')
         cases = SCRIPT_SUITES[args.suite]
         if args.list:
             print('\n'.join(f'{i}: {sys.executable} {spec}' for i, spec in enumerate(cases, 1)))
             return 0
-        results = []
-        for i, spec in enumerate(cases, 1):
-            result = run_case(i, spec, 'script', args.log_dir.resolve(), args.timeout)
-            results.append(result)
-            print(f'Script [{i}/{len(cases)}]: {result.error or "OK"}', flush=True)
-            if result.error:
-                print(result.log.read_text(errors='replace')[-12000:], flush=True)
+        results = execute_scripts(cases, args.log_dir.resolve(), args.timeout)
         write_report(results, args.output_xml)
         return int(any(result.error for result in results))
     path = REPO_ROOT / 'tests/checkin' / SUITES[args.suite] if args.suite else args.caselist
@@ -311,6 +322,9 @@ def main(argv=None):
             print(f'{i}: {spec}')
         return 0
     results = execute(cases, args.compile_workers, args.log_dir.resolve(), args.timeout, args.phase)
+    if args.phase != 'compile' and not any(result.error for result in results):
+        results.extend(execute_scripts(SCRIPT_SUITES.get(args.suite, ()),
+                                       args.log_dir.resolve(), args.timeout))
     write_report(results, args.output_xml)
     failed = sum(bool(result.error) for result in results)
     print(f'Phase={args.phase}, cases={len(cases)}, phase results={len(results)}, failures={failed}')
