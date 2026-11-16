@@ -5,6 +5,17 @@
 
 namespace deep_gemm {
 
+// Runtime state shared by the host epilogue class and device operator.
+struct EpilogueOperatorArgs {
+    uint32_t* sfd = nullptr;
+    int64_t sfd_stride = 0;
+    uint32_t shape_m = 0;
+    uint32_t shape_n = 0;
+    float clamp_value = 0.0f;
+    uint32_t* clamped_count = nullptr;
+    float* row_scales = nullptr;
+};
+
 enum class MajorType { K = 0, MN = 1 };
 
 enum class GemmType {

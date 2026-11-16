@@ -114,7 +114,15 @@ public:
 
       MainloopSharedStorage mainloop;
       EpilogueSharedStorage epilogue;
-    } tensors;
+    };
+    // The N-stage mainloop may retain prefetched operands across epilogues.
+    // Quantized output needs its own BF16 tile instead of aliasing those operands.
+    struct FP8SharedTensorStorage {
+      typename CollectiveMainloop::SharedStorage mainloop;
+      typename CollectiveEpilogue::SharedStorage epilogue;
+    };
+    cute::conditional_t<cute::is_same_v<ElementD, cutlass::float_e4m3_t> && TileScheduler::SHAPE_K <= 512,
+                        FP8SharedTensorStorage, SharedTensorStorage> tensors;
   };
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
@@ -382,6 +390,8 @@ public:
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
       params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dD));
+      if constexpr (cute::is_same_v<ElementD, cutlass::float_e4m3_t>)
+        params_epilogue_local.batch_idx = deep_scheduler.problem_index();
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
       epilogue(
@@ -489,7 +499,15 @@ public:
       using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
       MainloopSharedStorage mainloop;
       EpilogueSharedStorage epilogue;
-    } tensors;
+    };
+    // The N-stage mainloop may retain prefetched operands across epilogues.
+    // Quantized output needs its own BF16 tile instead of aliasing those operands.
+    struct FP8SharedTensorStorage {
+      typename CollectiveMainloop::SharedStorage mainloop;
+      typename CollectiveEpilogue::SharedStorage epilogue;
+    };
+    cute::conditional_t<cute::is_same_v<ElementD, cutlass::float_e4m3_t> && TileScheduler::SHAPE_K <= 512,
+                        FP8SharedTensorStorage, SharedTensorStorage> tensors;
   };
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
@@ -966,6 +984,8 @@ public:
         auto params_epilogue_local = params.epilogue;
         params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dC));
         params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c(cute::get<2>(params_epilogue_local.dD));
+        if constexpr (cute::is_same_v<ElementD, cutlass::float_e4m3_t>)
+          params_epilogue_local.batch_idx = deep_scheduler.problem_index();
         // Epilogue and write to gD
         CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
         epilogue(

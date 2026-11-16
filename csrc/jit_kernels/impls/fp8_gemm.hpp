@@ -24,6 +24,8 @@
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
 #include "int8_gemm.hpp"
+#include "epilogue_class.hpp"
+#include <deep_gemm/common/epilogue_args.cuh>
 
 using namespace deep_gemm_fp8_common;
 namespace deep_gemm {
@@ -123,7 +125,8 @@ __global__ void computeBlockInfoKernel(
     }
 };
 
-class FP8GemmRuntime final : public LaunchRuntime<FP8GemmRuntime> {
+template <bool kFP8Output = false>
+class FP8GemmRuntimeT final : public LaunchRuntime<FP8GemmRuntimeT<kFP8Output>> {
 public:
     using ScaleGranularityShape = cute::Shape<cute::_1, cute::_128, cute::_128>;
     using ScaleConfig =
@@ -165,7 +168,7 @@ public:
     };
 
     // Epilogue
-    struct EpilogueArgs {
+    struct BF16EpilogueArgs {
         LinearCombinationArgs callback;
         cutlass::bfloat16_t* ptr_C;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_C;
@@ -173,6 +176,9 @@ public:
         cutlass::bfloat16_t* ptr_D;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D;
     };
+
+    using EpilogueArgs = std::conditional_t<kFP8Output,
+        PPUStoreCDArguments<LinearCombinationArgs>, BF16EpilogueArgs>;
 
     struct LaunchInfo {
         int block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
@@ -209,6 +215,7 @@ public:
         LaunchInfo launch_info;
         LaunchArgs launch_args;
         GemmKernelParams kernel_params;
+        std::shared_ptr<EpilogueClass> epilogue_class = nullptr;
     };
 
     static GemmKernelParams to_underlying_arguments_rtc(GemmArguments args, void* workspace) {
@@ -242,7 +249,8 @@ public:
                                info.block_m, info.block_n, info.block_k, info.num_groups,
                                info.warp_m, info.warp_n, info.num_stages, info.gemm_type,
                                info.kernel_strategy, info.enable_sbo_overlap,
-                               info.kernel_name, args.launch_args.smem_size);
+                               info.kernel_name, args.launch_args.smem_size, kFP8Output,
+                               kFP8Output ? args.epilogue_class->get_epilogue_operator_type() : "");
     }
 
     static std::string generate_impl(const Args& args) {
@@ -251,6 +259,7 @@ public:
         return fmt::format(
             R"(
 #include <deep_gemm/impls/fp8_gemm.cuh>
+#include <deep_gemm/epilogue/ppu_store_cd.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
 namespace deep_gemm {{
 using namespace cute;
@@ -357,11 +366,14 @@ using CollectiveEpilogueNoTsm = typename cutlass::epilogue::collective::DefaultE
     cutlass::gemm::EpilogueDefault,
     IsAligedN>;
 static constexpr bool EpilogueWithTsm = false;
-using CollectiveEpilogue = typename cutlass::platform::conditional<
+using BF16Epilogue = typename cutlass::platform::conditional<
     EpilogueWithTsm,
     CollectiveEpilogueWithTsm,
     CollectiveEpilogueNoTsm
 >::type;
+
+using CollectiveEpilogue = cute::conditional_t<{18},
+    PPUStoreCD<CollectiveEpilogueNoTsm, BLOCK_M, BLOCK_N, {19}>, BF16Epilogue>;
 
 using GemmKernel = DeepGemmUniversal<
   Shape<int,int,int,int>,
@@ -398,13 +410,23 @@ __global__ void {12}(
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
-            args.launch_args.smem_size);
+            args.launch_args.smem_size, kFP8Output,
+            kFP8Output ? args.epilogue_class->get_epilogue_operator_type() : "epilogue::operators::CastToFP8WithClamp<>");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        if constexpr (kFP8Output) {
+            // Stream-ordered reset is captured with the GEMM during graph capture.
+            // No cross-CTA initialization barrier or extra readiness buffer is needed.
+            if (auto* count = args.kernel_params.collective_epilogue_params.epilogue_args.clamped_count)
+                DG_HGGC_RUNTIME_CHECK(hggcMemsetAsync(count, 0, sizeof(uint32_t), current_stream()));
+        }
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.kernel_params));
     }
 };
+
+using FP8GemmRuntime = FP8GemmRuntimeT<false>;
+using FP8OutputGemmRuntime = FP8GemmRuntimeT<true>;
 
 using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 static void fp8_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_scales, const torch::Tensor& rhs,

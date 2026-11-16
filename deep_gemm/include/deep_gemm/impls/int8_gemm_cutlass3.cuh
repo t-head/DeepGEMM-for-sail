@@ -23,6 +23,7 @@
 #include <ppu_include.hpp>
 #include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/epilogue_args.cuh>
 #include <deep_gemm/epilogue/mega_moe_l2_epilogue.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/common/batch_gemm_args.cuh>
@@ -64,6 +65,8 @@ struct MainloopPPUAiuA8W8OverlapPrologue {
 
 
 namespace deep_gemm {
+
+
 // Shared channelwise tile computation. Scatter policies retain their own
 // transport/scheduling, while standard GEMM and fused scatter use one SF/MMA path.
 template <typename CollectiveMainloop, int ShapeN, bool kCanonicalNResidue = true,
@@ -1635,6 +1638,8 @@ public:
       }
 
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
+      if constexpr (deep_gemm::UsesOutputCounter<CollectiveEpilogue>::value)
+        epilogue.output_base = reinterpret_cast<uint32_t*>(params.epilogue.ptr_D);
       if constexpr (kEnableScatter) {
         epilogue(problem_shape_MNKL, blk_shape, blk_coord_mnkl, accumulators,
                  tiled_mma, residue_mnk, thread_idx,

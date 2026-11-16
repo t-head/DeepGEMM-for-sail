@@ -12,7 +12,7 @@ def test_fp8_bhr_hdr_bhd(quant_type: str = "block"):
     for h, r, d in [(8, 4096, 1024)]:
         for b in (4, 32, 128, 4096, 8192):
             args = {"h":h,"b":b, "r":r, "d":d, "data_type":torch.float8_e4m3fn, "quant_type": quant_type, "expr": 'bhr,hdr->bhd'}
-            test_einsum(args)
+            test_einsum(args, check_fp8_output=True)
     print()
 
 def test_int8_bhr_hdr_bhd(quant_type: str = "channel"):

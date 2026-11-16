@@ -3391,7 +3391,7 @@ def test_batch_gemm(args) -> None:
     test_einsum(normalized)
 
 
-def test_einsum(args) -> None:
+def test_einsum(args, check_fp8_output: bool = False) -> None:
     b, h, r, d, data_type, expr = args['b'], args['h'], args['r'], args['d'], args["data_type"], args["expr"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'
     if expr in ('bhr,hdr->bhd', 'bhr,hdr->hbd'):
@@ -3447,6 +3447,43 @@ def test_einsum(args) -> None:
         print("Passed with acc_check\n")
     else:
         print("Passed without acc_check\n")
+
+    if _acc_check and check_fp8_output:
+        output = torch.empty_like(out, dtype=torch.float8_e4m3fn)
+        rows = out.flatten(1)
+        if quant_type == 'channel':
+            ref_sf = rows.float().abs().amax(1, keepdim=True).clamp_min(1e-10) / 448
+            ref_fp8 = (rows.float() * ref_sf.reciprocal()).to(torch.float8_e4m3fn)
+            sfd = torch.empty_like(ref_sf)
+            for epilogue in (None, deep_gemm.epilogue.FP8PerTokenCast(sfd)):
+                if epilogue is None:
+                    deep_gemm.fp8_einsum(expr, x_fp8, y_fp8, (output, sfd))
+                else:
+                    deep_gemm.fp8_einsum(expr, x_fp8, y_fp8, output, epilogue=epilogue)
+                torch.testing.assert_close(sfd, ref_sf, rtol=1e-6, atol=0)
+                assert torch.equal(output.flatten(1).float(), ref_fp8.float())
+        else:
+            sfd = torch.empty_strided((b, h * d // 128),
+                (1, deep_gemm.get_tma_aligned_size(b, 4)), device='cuda', dtype=torch.int32)
+            count = torch.empty(1, device='cuda', dtype=torch.uint32)
+            for clamp_value in (None, 2.576 * r ** 0.5):
+                expected = rows if clamp_value is None else rows.clamp(-clamp_value, clamp_value)
+                ref_fp8, ref_sf = per_token_cast_to_fp8(
+                    expected, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+                ref_count = 0 if clamp_value is None else (rows.abs() > clamp_value).sum().item()
+                for clamped_count in (None, count):
+                    if clamped_count is not None:
+                        clamped_count.fill_(0xffffffff)
+                    if clamp_value is None and clamped_count is None:
+                        deep_gemm.fp8_einsum(expr, x_fp8, y_fp8, (output, sfd))
+                    else:
+                        epilogue = deep_gemm.epilogue.FP8CastWithClamp(sfd, clamp_value, clamped_count)
+                        deep_gemm.fp8_einsum(expr, x_fp8, y_fp8, output, epilogue=epilogue)
+                    if clamped_count is not None:
+                        assert clamped_count.item() == ref_count
+                    assert torch.equal(output.flatten(1).float(), ref_fp8.float())
+                    assert torch.equal(sfd, ref_sf)
+        print(f'Passed FP8 output with acc_check: {quant_type}, {b=}, {h=}, {d=}, {r=}\n')
 
     if get_benchmark():
         einsum = deep_gemm.int8_einsum if data_type == torch.int8 else deep_gemm.fp8_einsum

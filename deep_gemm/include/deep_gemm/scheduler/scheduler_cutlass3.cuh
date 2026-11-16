@@ -459,6 +459,25 @@ struct DeepGemmScheduler {
 
 };
 
+#if defined(__HGGC__)
+// Completing a row's tiles requires no more CTAs than the cooperative grid.
+// Contiguous row order ensures every pending contributor can be scheduled.
+template <class Base>
+struct EinsumRowScheduler : Base {
+    using Base::Base;
+    CUTLASS_DEVICE bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
+        constexpr uint32_t n_tiles = math::ceil_div(Base::SHAPE_N, Base::BLOCK_N);
+        constexpr uint32_t row_tiles = Base::kNumGroups * n_tiles;
+        const uint32_t tile = this->current_iter++ * gridDim.x + blockIdx.x;
+        if (tile >= this->num_blocks * Base::kNumGroups) return false;
+        m_block_idx = tile / row_tiles;
+        this->curr_group_idx = tile % row_tiles / n_tiles;
+        n_block_idx = tile % n_tiles;
+        return true;
+    }
+};
+#endif  // defined(__HGGC__)
+
 // ==================== Dynamic Tile Builder Config & Scheduler ====================
 
 /// Configuration for dynamic tile builder selection.
