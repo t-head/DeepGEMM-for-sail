@@ -18,6 +18,7 @@ Bug numbers refer to the DeepGEMM correctness review in ppu-kernel-quirks.
 | 18 | INT8/FP8 grouped contiguous requires use_psum_layout=False and per-row expert IDs. BF16 supports compact exclusive expert end offsets. | The quantized scheduler does not interpret prefix-sum endpoints. |
 | 19 | FP4 masked requires enable_sbo_overlap=False. | Completion signaling is not implemented in either its standard or dynamic path. |
 | 20 | Blockwise FP8 masked rejects SBO when its selected short-K kernel expands N fourfold. | Its completion count does not match the advertised threshold. |
+| 21 | Sparse MQA metadata now allocates workspace in each capture's graph pool; eager calls retain their per-stream cache. | Independent graph pools can replay concurrently without sharing metadata counters. Intentionally shared pools retain PyTorch's serial-replay requirement. |
 | 22 | Dynamic A8W8 masked requires N divisible by 256 when K>2048. | Its expanded scheduling drops a partial N tile. Disable dynamic tiling to use the static path for such shapes. |
 | 23 | MXFP4 scales must have an even byte storage offset when reinterpreted as uint16. | Clone an odd-offset contiguous view. Padding an odd scale width already produces aligned storage. |
 | 24 | Dense/nopad/masked FP4 bias must be contiguous. | The epilogue uses a fixed unit column stride. |

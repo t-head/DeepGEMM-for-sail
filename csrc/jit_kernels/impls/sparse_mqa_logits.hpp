@@ -143,21 +143,23 @@ __global__ void {}(
     }
 };
 
-// Captured kernels retain the workspace address. Match upstream's fixed-capacity, per-stream
-// cache so a larger eager call cannot free storage still referenced by a graph. Counters are
-// reset by the metadata kernel; one-time zeroing must happen during warmup, outside capture.
-static torch::Tensor& get_sparse_workspace(const torch::TensorOptions& options, const int num_q_tokens) {
+// Eager calls reuse a per-stream buffer. Captures allocate scratch in the current
+// graph's allocator pool, so independent graphs never retain the same eager buffer.
+static torch::Tensor get_sparse_workspace(const torch::TensorOptions& options, const int num_q_tokens) {
     constexpr int kNumMaxQTokens = 1 << 20;
     constexpr int64_t kNumWorkspaceBytes = sizeof(WorkspaceState) +
         static_cast<int64_t>(kNumMaxQTokens) * sizeof(QBlockInfo);
     DG_HOST_ASSERT(num_q_tokens > 0 and num_q_tokens <= kNumMaxQTokens);
     const auto stream = at::cuda::getCurrentCUDAStream();
     DG_HOST_ASSERT(options.device() == stream.device());
+    if (c10::cuda::currentStreamCaptureStatusMayInitCtx() != c10::cuda::CaptureStatus::None) {
+        const int64_t bytes = sizeof(WorkspaceState) + static_cast<int64_t>(num_q_tokens) * sizeof(QBlockInfo);
+        // Initialization is captured too; every replay starts with private zeroed counters.
+        return torch::zeros({bytes}, options.dtype(torch::kUInt8));
+    }
     static std::unordered_map<c10::cuda::CUDAStream, torch::Tensor> workspaces;
     auto& workspace = workspaces[stream];
     if (not workspace.defined()) {
-        DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None and
-                       "Warm up sparse MQA metadata on this device/stream before graph capture");
         workspace = torch::zeros({kNumWorkspaceBytes}, options.dtype(torch::kUInt8));
     }
     return workspace;

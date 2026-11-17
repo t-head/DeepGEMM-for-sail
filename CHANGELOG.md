@@ -26,6 +26,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Sparse MQA graph workspace**: captured metadata calls allocate private
+  scratch in the graph allocator pool, so graphs captured on one stream can
+  replay concurrently using independent pools without sharing counters.
 - **Grouped contiguous padding**: implement ensure_zero_padding for BF16,
   INT8 and FP8 with a device mask after GEMM, and forward the flag through
   per-channel FP8 fallback. Compile-only mode does not modify the output.
