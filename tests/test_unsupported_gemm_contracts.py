@@ -22,6 +22,19 @@ def reject(call, message, out):
     torch.testing.assert_close(out, before, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize('code', [0, 255, 127])
+def test_bug04_w4fa16_e8m0_codes(code):
+    weight = torch.full((1, 64, 32), 0x22, dtype=torch.uint8, device='cuda')
+    scales = torch.full((1, 64, 2), code, dtype=torch.uint8, device='cuda')
+    call = lambda: dg.preprocess_weights_and_scales(dg.PreprocessMode.W4A16_MXFP4, False, weight, scales)
+    if code in (0, 255):
+        with pytest.raises(RuntimeError, match='E8M0 codes 0 and 255 are unsupported'):
+            call()
+    else:
+        prepared, sf = call()
+        assert prepared.dtype == torch.int32 and sf.dtype == torch.uint8
+
+
 def test_bug07_grouped_bf16_gemv_stride():
     a = torch.ones((1, 70), dtype=torch.bfloat16, device='cuda')
     b = torch.ones((8, 128, 70), dtype=torch.bfloat16, device='cuda')

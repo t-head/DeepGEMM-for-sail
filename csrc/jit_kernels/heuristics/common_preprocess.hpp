@@ -127,6 +127,13 @@ inline PreprocessedWeights preprocess_weights_and_scales(
         TORCH_CHECK(weight.device() == scales.device(), "weights and scales must share a device");
 
         // Reproduce the 16x16 weight tiles and the MMA register ordering.
+        if (!int4) {
+            // Static weight preprocessing may inspect values; GEMM never scans weights.
+            const int min_scale = scales.min().item<int>();
+            const int max_scale = scales.max().item<int>();
+            TORCH_CHECK(min_scale > 0 && max_scale < 255,
+                        "W4FA16 E8M0 codes 0 and 255 are unsupported by the BF16 dequantizer; use codes in [1,254]");
+        }
         std::vector<int64_t> weight_perm;
         for (int i = 0; i < 32; ++i) {
             for (int j = 0; j < 4; ++j) {

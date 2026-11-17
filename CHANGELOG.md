@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **W4FA16 E8M0 special codes**: reject unsupported 0/255 scale codes during
+  static weight preprocessing, without adding weight scans to GEMM dispatch.
 - **Quantized einsum output dtype**: explicitly require BF16 output at the
   API boundary instead of accepting FP32 and failing later in the launcher.
 - **Fused MoE A alignment**: reject continuous views whose base address is
