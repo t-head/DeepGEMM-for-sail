@@ -462,13 +462,19 @@ struct Mainloop {
     }
   }
 
+  struct NoProgress {
+    __device__ __forceinline__ void progress() const {}
+  };
+
   /// Run the whole K-pipeline for one output tile: prologue + mainloop.
+  template <class Progress = NoProgress>
   static __device__ __forceinline__ void run(
       Params const& params,
       char* smem,
       int warp_id, int warp_row, int warp_col, int warp_k,
       int m_offset, int n_offset,
-      float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread]) {
+      float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      Progress const& progress = Progress{}) {
 
     int total_k_tiles = math::ceil_div(params.K, BLOCK_K);
 
@@ -514,6 +520,7 @@ struct Mainloop {
                /*skip_preload=*/ (k_iter > 0),
                /*next_stage=*/ next_read_stage,
                a_reg, b_reg);
+      progress.progress();
 
       if (issue_g2s) ++k_tile_to_load;
       if (++read_stage >= STAGES) read_stage = 0;
