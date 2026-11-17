@@ -774,3 +774,10 @@ self_design,[DeepGemm] --format=PagedMqaAvgLogits,data_type:fp4,batch_size:1249,
 self_design,[DeepGemm] --format=PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:6,num_heads:4,head_dim:128,distribution:[129],page_kv:128,max_context_len:256,logits_dtype:bf16
 self_design,[DeepGemm] --format=PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:1,num_heads:4,head_dim:128,distribution:[17],page_kv:32,max_context_len:128,logits_dtype:fp32
 self_design,[DeepGemm] --format=PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:5,num_heads:4,head_dim:128,page_kv:512,logits_dtype:bf16,context_pattern:[0,1,63,511,512,513,1025],max_context_len:1536
+# FP4 H8 AVG: BF16, all Q scales; one case per next_n pair, page boundaries and request switches.
+self_design,[DeepGemm] --format=MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:8,head_dim:128,q_scale:0,logits_dtype:bf16,compressed_logits:1
+self_design,[DeepGemm] --format=MqaAvgLogits,data_type:fp4,seq_len_q:257,seq_len_kv:1025,num_heads:8,head_dim:128,q_scale:1,logits_dtype:bf16,compressed_logits:1
+self_design,[DeepGemm] --format=MqaAvgLogits,data_type:fp4,seq_len_q:1025,seq_len_kv:2049,num_heads:8,head_dim:128,q_scale:2,logits_dtype:bf16,compressed_logits:1
+self_design,[DeepGemm] --format=PagedMqaAvgLogits,data_type:fp4,batch_size:1249,next_n:1,num_heads:8,head_dim:128,page_kv:32,logits_dtype:bf16,context_pattern:[0,1,63,31,32,33,65],max_context_len:96
+self_design,[DeepGemm] --format=PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:3,num_heads:8,head_dim:128,page_kv:192,logits_dtype:bf16,context_pattern:[0,1,63,191,192,193,385],max_context_len:576
+self_design,[DeepGemm] --format=PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:5,num_heads:8,head_dim:128,page_kv:512,logits_dtype:bf16,context_pattern:[0,1,63,511,512,513,1025],max_context_len:1536

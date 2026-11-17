@@ -359,6 +359,15 @@ def test_mqa_avg_logits_loop():
     ]
     # Explicit FP32 output remains supported alongside the BF16 default.
     prefill_cases.append('MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32,compressed_logits:1')
+    # Eight heads: BF16, each scale mode, with partial Q and KV tiles.
+    prefill_cases += [
+        f'MqaAvgLogits,data_type:fp4,seq_len_q:{seq_len_q},seq_len_kv:{seq_len_kv},'
+        f'num_heads:8,head_dim:128,q_scale:{q_scale},logits_dtype:{dtype},compressed_logits:1'
+        for seq_len_q, seq_len_kv, q_scale, dtype in (
+            (129, 258, 0, 'bf16'), (129, 1025, 1, 'bf16'), (129, 1025, 2, 'bf16'),
+            (65, 1031, 0, 'bf16'), (257, 1025, 1, 'bf16'), (1025, 2049, 2, 'bf16'),
+        )
+    ]
     # Paged decode covers the four-head tile, empty contexts, and multiple next tokens.
     paged_cases = [
         'PagedMqaAvgLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:4,head_dim:128,distribution:[0,1,127,1024],logits_dtype:bf16,page_kv:32',
@@ -384,6 +393,21 @@ def test_mqa_avg_logits_loop():
                 f'num_heads:4,head_dim:128,page_kv:{page_kv},logits_dtype:{dtype},'
                 f'context_pattern:[0,1,63,{page_kv-1},{page_kv},{page_kv+1},{2*page_kv+1}],'
                 f'max_context_len:{3*page_kv}')
+    # H8 decode spans all next_n values and page32/64/512/non-power-of-two192.
+    # Distinct request lengths exercise page boundaries and partial KV tiles.
+    for next_n, page_kv, dtype in ((1, 32, 'bf16'), (2, 192, 'bf16'),
+                                  (3, 512, 'bf16'), (4, 64, 'bf16'),
+                                  (5, 512, 'bf16'), (6, 192, 'bf16')):
+        paged_cases.append(
+            f'PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:{next_n},'
+            f'num_heads:8,head_dim:128,page_kv:{page_kv},logits_dtype:{dtype},'
+            f'context_pattern:[0,1,63,{page_kv-1},{page_kv},{page_kv+1},{2*page_kv+1}],'
+            f'max_context_len:{3*page_kv}')
+    for next_n, page_kv in ((1, 64), (6, 192)):
+        paged_cases.append(
+            f'PagedMqaAvgLogits,data_type:fp4,batch_size:{request_switch_batch},next_n:{next_n},'
+            f'num_heads:8,head_dim:128,page_kv:{page_kv},logits_dtype:bf16,'
+            f'context_pattern:[17,0,1,63,64,65,129,257,513],max_context_len:768')
     set_acc_check(True)
     for case in prefill_cases:
         print(case)

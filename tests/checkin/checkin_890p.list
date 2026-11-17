@@ -344,6 +344,12 @@ MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,num_heads:4,head_dim:1
 MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16,compressed_logits:1
 MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,num_heads:4,head_dim:128,q_scale:2,logits_dtype:bf16,compressed_logits:1
 
+# --- MqaAvgLogits / fp4 H8 ---
+# BF16 compressed output: three Q-scale modes and Q/KV tails.
+MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:8,head_dim:128,q_scale:0,logits_dtype:bf16,compressed_logits:1
+MqaAvgLogits,data_type:fp4,seq_len_q:257,seq_len_kv:1025,num_heads:8,head_dim:128,q_scale:1,logits_dtype:bf16,compressed_logits:1
+MqaAvgLogits,data_type:fp4,seq_len_q:1025,seq_len_kv:2049,num_heads:8,head_dim:128,q_scale:2,logits_dtype:bf16,compressed_logits:1
+
 # ============ PagedMqaAvgLogits ============
 
 # --- PagedMqaAvgLogits / fp8 ---
@@ -357,6 +363,12 @@ PagedMqaAvgLogits,data_type:fp4,batch_size:1249,next_n:1,num_heads:4,head_dim:12
 PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:4,num_heads:4,head_dim:128,distribution:[513,1,65,0,63,131,64],page_kv:64,max_context_len:1024,logits_dtype:fp32
 PagedMqaAvgLogits,data_type:fp4,batch_size:1249,next_n:5,num_heads:4,head_dim:128,context_pattern:[17,0,1,63,64,65,129,257,513],page_kv:64,max_context_len:1024,logits_dtype:fp32
 PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:6,num_heads:4,head_dim:128,distribution:[129],page_kv:128,max_context_len:256,logits_dtype:bf16
+
+# --- PagedMqaAvgLogits / fp4 H8 ---
+# next_n 1/3/5 cover each pair, partial Q tiles, page boundaries and request switches.
+PagedMqaAvgLogits,data_type:fp4,batch_size:1249,next_n:1,num_heads:8,head_dim:128,page_kv:32,logits_dtype:bf16,context_pattern:[0,1,63,31,32,33,65],max_context_len:96
+PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:3,num_heads:8,head_dim:128,page_kv:192,logits_dtype:bf16,context_pattern:[0,1,63,191,192,193,385],max_context_len:576
+PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:5,num_heads:8,head_dim:128,page_kv:512,logits_dtype:bf16,context_pattern:[0,1,63,511,512,513,1025],max_context_len:1536
 
 # ============ SparseMqaLogits ============
 

@@ -196,7 +196,14 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
         const uint64_t seq_len_q = kernel_params.seq_len_q;
         const uint64_t block_q = config.block_q;
         const uint64_t num_q_blocks = seq_len_q / block_q + (seq_len_q % block_q != 0);
-        const uint64_t num_output_tasks = num_q_blocks * (config.balance_output_tiles ? 2 : 1);
+        uint64_t num_output_tasks = num_q_blocks * (config.balance_output_tiles ? 2 : 1);
+        if (num_heads == 8 && config.balance_output_tiles) {
+            // H8 can distribute all output tiles; short-window fallback remains Q-strided.
+            const uint64_t seq_len_k = kernel_params.seq_len_k;
+            const uint64_t block_kv = config.block_kv;
+            const uint64_t num_kv_blocks = seq_len_k / block_kv + (seq_len_k % block_kv != 0);
+            num_output_tasks = num_q_blocks * num_kv_blocks;
+        }
         // Preserve a valid launch for the existing empty-Q AVG path.
         args.launch_args.grid_dim.x = static_cast<unsigned>(
             std::min(capacity, std::max(uint64_t{1}, num_output_tasks)));

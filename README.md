@@ -453,7 +453,8 @@ Regenerate metadata with the current indices and contexts, including inside
 CUDA Graph capture when those inputs change on replay.
 
 AVG indexers use no weights, default to BF16 output and retain paged
-`next_n=1–6`. Non-paged AVG requires a positive `max_seqlen_k`. The paged
+`next_n=1–6`. MXFP4 AVG supports 4 or 8 Q heads; FP8 AVG supports 4. H4 retains optional FP32 output; MXFP4 H8 requires BF16 output.
+Non-paged AVG requires a positive `max_seqlen_k`. The paged
 `fp8_fp4` AVG entry point accepts MXFP4 only; ordinary FP8 uses the separate
 FP8 entry point. All AVG entry points omit `clean_logits`.
 

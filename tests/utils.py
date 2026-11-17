@@ -2336,13 +2336,14 @@ def ref_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
             if avg:
                 # Avg variant: unweighted head sum scaled by 1/sqrt(head_dim), weights unused
                 if avg_bf16_rounding:
-                    assert heads == 4
-                    heads_bf16 = torch.relu(s).to(torch.bfloat16).float()
-                    pair0 = (heads_bf16[0] + heads_bf16[1]).to(torch.bfloat16).float()
-                    pair1 = (heads_bf16[2] + heads_bf16[3]).to(torch.bfloat16).float()
-                    total = (pair0 + pair1).to(torch.bfloat16).float()
+                    assert heads in (4, 8)
+                    total = torch.relu(s).to(torch.bfloat16).float()
+                    # Adjacent head pairs, then a balanced tree, rounding every
+                    # stage to match the packed BF16 kernel reduction.
+                    while total.size(0) > 1:
+                        total = (total[0::2] + total[1::2]).to(torch.bfloat16).float()
                     scale = total.new_tensor(dim ** -0.5).to(torch.bfloat16).float()
-                    s = (total * scale).to(torch.bfloat16)
+                    s = (total[0] * scale).to(torch.bfloat16)
                 else:
                     s = torch.relu(s).sum(dim=0) * (dim ** -0.5)
             else:
@@ -2689,7 +2690,7 @@ def test_paged_mqa_logits(args) -> None:
     if get_acc_check():
         assert get_ref_backend() == "device", "ref_backend only supports 'device' for Paged MQA Logits"
         # FP4 AVG uses represented Q/K values and FP32 dot products. Its BF16
-        # output rounds each head, both reduction stages, and the final scale.
+        # output rounds each head, every reduction stage, and the final scale.
         ref_q = q.float() if is_avg and data_type == torch.uint8 else q
         ref_kv = kv_cache.float() if is_avg and data_type == torch.uint8 else kv_cache
         ref_logits = ref_paged_mqa_logits(
