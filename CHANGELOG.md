@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Grouped BF16 GEMV precision**: convert operands to FP32 before multiplying,
+  preserving products that were previously rounded to BF16 before accumulation.
 - **Device properties and CU budgets**: cache architecture and `set_num_sms`
   overrides per current device, so switching devices does not reuse the first
   device's architecture or scheduling budget.

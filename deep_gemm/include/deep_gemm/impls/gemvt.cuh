@@ -59,7 +59,7 @@ template <typename src_type, typename acc_type, int ept>
 HGGC_DEVICE_ONLY void dot_op(src_type *src_a, src_type *src_x, acc_type &val) {
     HGGC_PRAGMA_UNROLL
     for (int i = 0; i < ept; i++) {
-    val = val + acc_type(src_a[i] * src_x[i]);
+        val = val + acc_type(src_a[i]) * acc_type(src_x[i]);
     }
     return;
 }
