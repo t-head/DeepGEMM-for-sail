@@ -1331,6 +1331,8 @@ void m_grouped_fp8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& 
     // Select per-channel quantization when each token and each expert output channel has one scale.
     if (lhs_scales.sizes() == std::vector<int64_t>{num_token, 1}
             && rhs_scales.sizes() == std::vector<int64_t>{num_groups, n, 1}) {
+        TORCH_CHECK(std::get<3>(configs) > 0 && k % std::get<3>(configs) == 0,
+                    "per-channel fused MoE requires K divisible by block_k: scale staging does not support K tails");
         if (arch_major == 8) {
             m_grouped_gemm_perchannel_nt_fused_impl(
                 lhs, lhs_scales, rhs, rhs_scales, out, m_rows,
@@ -1399,6 +1401,8 @@ void m_grouped_int8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>&
 
     check_fused_moe_weight_offsets(rhs, "m_grouped_int8_gemm_nt_fused");
     TORCH_CHECK(n % 2 == 0, "fused BF16 epilogue requires even N");
+    TORCH_CHECK(std::get<3>(configs) > 0 && k % std::get<3>(configs) == 0,
+                "per-channel fused MoE requires K divisible by block_k: scale staging does not support K tails");
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
         m_grouped_gemm_perchannel_nt_fused_impl(

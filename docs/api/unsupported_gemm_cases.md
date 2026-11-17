@@ -11,3 +11,4 @@ Bug numbers refer to the DeepGEMM correctness review in ppu-kernel-quirks.
 | 11 | A8W8 nopad requires contiguous A scales; blockwise FP8 einsum requires contiguous B scales. | These kernels use implicit contiguous scale layouts. |
 | 12 | W4FA16 MMA with N expansion requires two pipeline stages. | Expanded short-K pipelines with other stage counts are unsupported. |
 | 14 | moe_align_block_size requires contiguous topk_ids. | Both routing kernels index the route tensor as a flat contiguous array. |
+| 15 | INT8/per-channel FP8 fused MoE requires K divisible by block_k. | A partial K tile can race with scale staging. |

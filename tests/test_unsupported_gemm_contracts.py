@@ -106,3 +106,23 @@ def test_bug14_route_view(m):
         dg.moe_align_block_size(a, b, ids)
     _, rows, *_ = dg.moe_align_block_size(a, b, ids.contiguous())
     torch.testing.assert_close(rows, torch.tensor([m, 0, m, 0], dtype=torch.int32, device='cuda'))
+
+
+def fused_quantized(kind, k=256):
+    dtype = torch.int8 if kind == 'int8' else torch.float8_e4m3fn
+    a = torch.ones((1, k), device='cuda').to(dtype)
+    b = torch.ones((2, 128, k), device='cuda').to(dtype)
+    block = kind == 'fp8-block'
+    sa = torch.ones((1, k // 128 if block else 1), device='cuda')
+    sb = torch.ones((2, 1, k // 128) if block else (2, 128, 1), device='cuda')
+    out = torch.full((1, 128), -123, dtype=torch.bfloat16, device='cuda')
+    meta = torch.zeros(4, dtype=torch.int32, device='cuda')
+    api = dg.m_grouped_int8_gemm_nt_fused if kind == 'int8' else dg.m_grouped_fp8_gemm_nt_fused
+    return lambda cfg: api((a, sa), (b, sb), out, meta, meta, meta, meta, cfg), out
+
+
+@pytest.mark.parametrize('kind', ['int8', 'fp8-channel'])
+@pytest.mark.parametrize('k', [192, 272])
+def test_bug15_fused_scale_k_tail(kind, k):
+    call, out = fused_quantized(kind, k)
+    reject(lambda: call((1, 16, 64, 128, 16, 32, 2)), 'scale staging does not support K tails', out)

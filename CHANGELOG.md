@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Per-channel fused K tails**: reject INT8/FP8 partial K tiles before the
+  kernel can overwrite an active pipeline stage with scales.
 - **MoE routing layout**: reject noncontiguous topk_ids before metadata generation.
 - **W4FA16 MMA pipeline validation**: reject N expansion with a stage count
   other than two before launching an unsupported pipeline.
