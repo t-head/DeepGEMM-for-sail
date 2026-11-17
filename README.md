@@ -131,6 +131,10 @@ This library focuses on high-performance tensor cell kernels and related LLM com
 
 To perform a basic non-grouped FP8 GEMM, call the `deep_gemm.gemm_fp8_fp8_bf16_nt` function. For more details, please refer to the function documentation.
 
+INT8 and FP8 dense NT GEMMs (`int8_gemm_nt`, `fp8_gemm_nt` and their aliases)
+require `c=None`. C accumulation is unsupported: passing C, including `c=d`
+or an empty tensor, raises an error before modifying D.
+
 BF16 dense GEMM: `deep_gemm.bf16_gemm_nt(a, b, out)` computes `out = a @ b.T`
 with contiguous BF16 inputs. On 810E and 890P, `out` supports BF16 or FP32.
 890P supports odd and even N. On 810E, GEMV/Direct paths also cover narrow

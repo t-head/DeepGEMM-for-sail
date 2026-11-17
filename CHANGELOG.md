@@ -26,6 +26,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Quantized dense C contract**: INT8 and FP8 dense NT GEMMs now reject
+  unsupported C accumulation before modifying the output, including aliased
+  and empty C tensors. BF16 dense C accumulation remains supported.
 - **Grouped BF16 GEMV precision**: convert operands to FP32 before multiplying,
   preserving products that were previously rounded to BF16 before accumulation.
 - **Device properties and CU budgets**: cache architecture and `set_num_sms`

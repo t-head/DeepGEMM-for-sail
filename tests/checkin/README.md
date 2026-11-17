@@ -80,6 +80,9 @@ The unified entry point calls `test_activation.py` and `test_fp4_core.py` direct
 
 - `test_grouped_bf16_gemv_precision.py`: exact BF16 grouped GEMV cancellation
   for small and regular K with a GEMM control, on both boards.
+- `test_quantized_dense_accumulation.py`: quantized dense C rejection before
+  output writes (separate/aliased C and empty outputs) and `c=None` controls.
+  Both boards run INT8 cases; M890 also runs FP8 channel/block cases.
 - `BatchGemm`: `groups=h`, `m=b`, `n=d`, `k=r`; supports complete `expr:bhr,hdr->bhd` and `expr:bhr,hdr->hbd` expressions. INT8 uses channel quantization; FP8 has block/channel cases on 890P.
 - `Preprocess,data_type:fp4`: preserves the independent MXFP4 preprocessing contract checks, including packed scales, scale-only calls, odd group counts, strides and aliases.
 - `Activation,data_type:bf16,activation:silu,quant_mode:BF16`: 890P standalone SiLU/SiTU smoke tests cover BF16, FP8 channel/block, MXFP8 and both MXFP4 scale layouts. Each case checks dense and masked output, including an empty expert and an undersized scheduling hint. `data_type:bf16` describes the input, while `quant_mode` selects the output.

@@ -192,6 +192,7 @@ void int8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                   const std::optional<torch::Tensor>& c,
                   const std::string& compiled_dims,
                   std::optional<ConfigTuple> configs = std::nullopt) {
+    TORCH_CHECK(!c.has_value(), "int8_gemm_nt does not support C accumulation; pass c=None");
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
     check_major_type_cd(d);
@@ -230,6 +231,7 @@ void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                  const std::string& compiled_dims,
                  const bool disable_ue8m0_cast,
                  std::optional<ConfigTuple> configs = std::nullopt) {
+    TORCH_CHECK(!c.has_value(), "fp8_gemm_nt does not support C accumulation; pass c=None");
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
     if (fp8_requires_k_major()) {
