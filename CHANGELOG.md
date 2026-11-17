@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **FP8 masked SBO validation**: reject N-expanded overlap configurations
+  whose kernel notification count cannot satisfy the returned wait threshold.
 - **FP4 masked SBO**: reject unsupported overlap requests with an explicit
   missing-completion-signal error instead of compilation failure or no notification.
 - **Quantized grouped contiguous psum validation**: reject unsupported prefix-sum layouts

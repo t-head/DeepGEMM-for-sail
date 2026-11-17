@@ -164,3 +164,18 @@ def test_bug19_fp4_sbo():
     reject(lambda: dg.m_grouped_fp4_gemm_nt_masked((a, sa), (b, sb), None, out, rows, 16,
                                                   enable_sbo_overlap=True),
            'FP4 masked SBO overlap is unsupported', out)
+
+
+def test_bug20_fp8_expanded_sbo():
+    a = torch.ones((2, 16, 256), device='cuda').to(torch.float8_e4m3fn)
+    b = torch.ones((2, 4096, 256), device='cuda').to(torch.float8_e4m3fn)
+    sa = torch.ones((2, 16, 2), device='cuda')
+    sb = torch.ones((2, 32, 2), device='cuda')
+    out = torch.full((2, 16, 4096), -123, dtype=torch.bfloat16, device='cuda')
+    rows = torch.full((2,), 16, dtype=torch.int32, device='cuda')
+    signal = torch.zeros(2, dtype=torch.int32, device='cuda')
+    reject(lambda: dg.m_grouped_fp8_gemm_nt_masked((a, sa), (b, sb), out, rows, 16,
+                    enable_sbo_overlap=True, signal=signal,
+                    configs=(1, 16, 128, 128, 16, 32, 2, (0, 0, 0))),
+           'FP8 masked SBO with N expansion is unsupported', out)
+    assert torch.count_nonzero(signal).item() == 0

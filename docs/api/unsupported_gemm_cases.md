@@ -15,3 +15,4 @@ Bug numbers refer to the DeepGEMM correctness review in ppu-kernel-quirks.
 | 16 | W4FA16 MMA N expansion requires N divisible by block_n*n_expand. | Expanded full tiles outside N do not have column predicates. |
 | 18 | INT8/FP8 grouped contiguous requires use_psum_layout=False and per-row expert IDs. BF16 supports compact exclusive expert end offsets. | The quantized scheduler does not interpret prefix-sum endpoints. |
 | 19 | FP4 masked requires enable_sbo_overlap=False. | Completion signaling is not implemented in either its standard or dynamic path. |
+| 20 | Blockwise FP8 masked rejects SBO when its selected short-K kernel expands N fourfold. | Its completion count does not match the advertised threshold. |

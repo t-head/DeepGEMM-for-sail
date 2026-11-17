@@ -174,6 +174,10 @@ static std::pair<int, int> m_grouped_gemm_fp8_fp8_bf16_nt_masked_impl(
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selected_config;
+    const bool expands_n = k <= 512 && block_n > 0 && n % (static_cast<int64_t>(block_n) * 4) == 0 &&
+                           block_k == 128 && k % block_k == 0 && num_stages == 2;
+    TORCH_CHECK(!enable_sbo_overlap || !expands_n,
+                "FP8 masked SBO with N expansion is unsupported: kernel completion counts differ from the wait threshold");
     auto SMSIZE = std::get<0>(smem_config);
     // std::cout << "num_sms_new is " << num_sms_new << " block_m is " << block_m << " block_n is " << block_n << "
     // block_k is " << block_k << std::endl; std::cout << " warp_m is " << warp_m << " warp_n is " << warp_n << "
