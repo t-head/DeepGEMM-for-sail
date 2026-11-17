@@ -35,6 +35,7 @@ static void* get_driver_handle() {
 
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgGetErrorName);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgGetErrorString);
+DECL_LAZY_HGGC_DRIVER_FUNCTION(hgCtxGetCurrent);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgFuncGetAttribute);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgFuncSetAttribute);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgModuleLoad);
