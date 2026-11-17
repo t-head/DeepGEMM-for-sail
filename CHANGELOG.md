@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Fused blockwise FP8 warp count**: reject single-warp configurations
+  that have no B-scale producer.
 - **FP4 bias layout**: reject noncontiguous bias views before the fixed-stride
   dense or grouped epilogue can read unrelated values.
 - **MXFP4 scale offset diagnostics**: explicitly reject an odd byte offset

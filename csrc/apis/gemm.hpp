@@ -1350,6 +1350,10 @@ void m_grouped_fp8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& 
     }
 
     // blockwise quant
+    TORCH_CHECK(std::get<4>(configs) > 0 && std::get<5>(configs) > 0 &&
+                (static_cast<int64_t>(std::get<1>(configs)) / std::get<4>(configs)) *
+                    (std::get<2>(configs) / std::get<5>(configs)) >= 2,
+                "blockwise FP8 fused MoE requires at least two warps: warp 1 loads B scales");
     if (m_sum == 0) return;
     int topk = m_sum / num_token;
     DG_HOST_ASSERT(n % 128 == 0);

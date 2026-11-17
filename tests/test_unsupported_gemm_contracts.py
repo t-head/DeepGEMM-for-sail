@@ -214,3 +214,8 @@ def test_bug24_fp4_bias_view():
     bias = torch.ones((128, 2), dtype=torch.float32, device='cuda')[:, 0]
     out = torch.full((16, 128), -123, dtype=torch.bfloat16, device='cuda')
     reject(lambda: dg.fp4_gemm_nt((a, sa), (b, sb), bias, out), 'FP4 bias must be contiguous', out)
+
+
+def test_bug26_fused_fp8_single_warp():
+    call, out = fused_quantized('fp8-block')
+    reject(lambda: call((1, 16, 32, 128, 16, 32, 2)), 'requires at least two warps', out)
