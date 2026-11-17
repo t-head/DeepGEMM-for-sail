@@ -509,6 +509,8 @@ static std::pair<int, int> m_grouped_gemm_a8w8_per_channel_nt_masked_impl(
     }
 
     if (enable_moe_dynamic_tile) {
+        TORCH_CHECK(k <= 2048 || n % 256 == 0,
+                    "dynamic A8W8 masked requires N divisible by 256 for K>2048; disable DG_USE_MOE_DYNAMIC_TILE for N tails");
         kernel_name += "_dynamic_tile";
         auto gemm_args = DynamicTileRuntime::GemmArguments{
             .ptr_A = converted_input_a,

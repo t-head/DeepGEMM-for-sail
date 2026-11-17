@@ -179,3 +179,16 @@ def test_bug20_fp8_expanded_sbo():
                     configs=(1, 16, 128, 128, 16, 32, 2, (0, 0, 0))),
            'FP8 masked SBO with N expansion is unsupported', out)
     assert torch.count_nonzero(signal).item() == 0
+
+
+@pytest.mark.parametrize('dtype', [torch.int8, torch.float8_e4m3fn])
+def test_bug22_dynamic_masked_n_tail(monkeypatch, dtype):
+    monkeypatch.setenv('DG_USE_MOE_DYNAMIC_TILE', '1')
+    a = torch.ones((2, 64, 4096), device='cuda').to(dtype)
+    b = torch.ones((2, 384, 4096), device='cuda').to(dtype)
+    sa = torch.ones((2, 64, 1), device='cuda')
+    sb = torch.ones((2, 384, 1), device='cuda')
+    rows = torch.tensor([48, 64], dtype=torch.int32, device='cuda')
+    out = torch.full((2, 64, 384), -123, dtype=torch.bfloat16, device='cuda')
+    api = dg.m_grouped_int8_gemm_nt_masked if dtype == torch.int8 else dg.m_grouped_fp8_gemm_nt_masked
+    reject(lambda: api((a, sa), (b, sb), out, rows, 32), 'dynamic A8W8 masked requires N divisible', out)

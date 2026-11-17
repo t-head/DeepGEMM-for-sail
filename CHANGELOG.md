@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Dynamic masked N tails**: reject unsupported A8W8 K>2048, N%256!=0
+  combinations instead of returning output with unscheduled columns.
 - **FP8 masked SBO validation**: reject N-expanded overlap configurations
   whose kernel notification count cannot satisfy the returned wait threshold.
 - **FP4 masked SBO**: reject unsupported overlap requests with an explicit
