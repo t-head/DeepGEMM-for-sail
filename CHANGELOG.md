@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **FP4 masked SBO**: reject unsupported overlap requests with an explicit
+  missing-completion-signal error instead of compilation failure or no notification.
 - **Quantized grouped contiguous psum validation**: reject unsupported prefix-sum layouts
   before they can be interpreted as expert IDs, including FP8 channel fallback.
 - **W4FA16 expanded N tails**: reject configurations that would execute a

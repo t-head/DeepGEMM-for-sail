@@ -152,3 +152,15 @@ def test_bug18_contiguous_psum(kind):
         torch.testing.assert_close(out, torch.full_like(out, 256), rtol=0, atol=0)
     else:
         reject(lambda: api(a, b, out, ids, use_psum_layout=True), 'psum layout is unsupported', out)
+
+
+def test_bug19_fp4_sbo():
+    a = torch.full((2, 16, 64), 0x22, dtype=torch.uint8, device='cuda')
+    b = torch.full((2, 128, 64), 0x22, dtype=torch.uint8, device='cuda')
+    sa = torch.full((2, 16, 4), 127, dtype=torch.uint8, device='cuda')
+    sb = torch.full((2, 128, 4), 127, dtype=torch.uint8, device='cuda')
+    out = torch.full((2, 16, 128), -123, dtype=torch.bfloat16, device='cuda')
+    rows = torch.full((2,), 16, dtype=torch.int32, device='cuda')
+    reject(lambda: dg.m_grouped_fp4_gemm_nt_masked((a, sa), (b, sb), None, out, rows, 16,
+                                                  enable_sbo_overlap=True),
+           'FP4 masked SBO overlap is unsupported', out)

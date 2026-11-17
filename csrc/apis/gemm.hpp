@@ -1538,6 +1538,8 @@ static std::pair<int, int> m_grouped_fp4_gemm_nt_masked(const std::pair<torch::T
                                                         std::optional<ConfigTuple> configs = std::nullopt,
                                                         std::optional<std::string> activation_type = std::nullopt) {
 
+    TORCH_CHECK(!enable_sbo_overlap.value_or(false),
+                "FP4 masked SBO overlap is unsupported: the kernel does not publish completion signals");
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
