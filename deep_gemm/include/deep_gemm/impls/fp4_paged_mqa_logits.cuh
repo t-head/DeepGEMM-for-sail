@@ -1074,6 +1074,10 @@ public:
                     handle_q_change();
                     for_each_index(steps, [&](auto step_index) {
                         const uint32_t step = uint32_t(step_index);
+                        // All warps skip empty KV steps together, including their
+                        // waits and MMA. A partial cluster is the final cluster.
+                        if (cluster + step * pack * kNumMathWarpGroups >= kv_end)
+                            return;
                         if (uint32_t(qi) == 0) {
                             if (!steal && pack >= 4) cp_async_wait<0>();
                             else if (!steal && pack == 2) {
