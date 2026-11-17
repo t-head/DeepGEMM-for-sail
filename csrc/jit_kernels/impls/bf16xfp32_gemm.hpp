@@ -155,14 +155,14 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
 // Exact BF16-output defaults contain only independently accepted frozen candidates.
 // No shared input/output/workspace cache is used; allocations belong to the current PyTorch stream.
 struct BFOutFrozenSpec {
-    int m, splits, grid, block, smem;
+    int m, grid, block, smem;
     bool mma_reuse;
     const char* code;
 };
 static const BFOutFrozenSpec* bfout_frozen_spec(int m) {
     switch (m) {
         case 8: {
-            static const BFOutFrozenSpec spec{8, 1, 48, 64, 65536,
+            static const BFOutFrozenSpec spec{8, 48, 64, 65536,
                 true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
@@ -178,29 +178,26 @@ static const BFOutFrozenSpec* bfout_frozen_spec(int m) {
 #define DG_DUAL_B_VALID_EPILOGUE 0
 #define DG_DUAL_B_BOUNDED_KLOOP 0
 #include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
-using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<16,16,128,16,16,128,4,
- true,true,Tag,cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params)==88);
-static_assert(offsetof(Kernel::Params,scheduler)==64);
-static_assert(Kernel::SharedStorageSize==65536);
-extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
-__global__ void bfout_candidate(Kernel::Params p) {
- extern __shared__ char smem[];
- if constexpr (1>1) {
-   const int tiles=p.K/128;
-   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
-   p.ptr_A+=begin*128;p.ptr_B_high+=begin*128;p.ptr_B_low+=begin*128;
-   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
-   p.K=(end-begin)*128;p.scheduler.shape_k=p.K;
- }
- Kernel kernel;kernel(p,smem);
+
+using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
+using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
+    16, 16, 128, 16, 16, 128, 4, true, true, Tag, cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params) == 88);
+static_assert(offsetof(Kernel::Params, scheduler) == 64);
+static_assert(Kernel::SharedStorageSize == 65536);
+
+extern "C"
+__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
+__global__ void bfout_candidate(Kernel::Params params) {
+    extern __shared__ char smem[];
+    Kernel kernel;
+    kernel(params, smem);
 }
 )BFOUT"};
             return &spec;
         }
         case 16: {
-            static const BFOutFrozenSpec spec{16, 1, 48, 64, 65536,
+            static const BFOutFrozenSpec spec{16, 48, 64, 65536,
                 false, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
@@ -216,29 +213,26 @@ __global__ void bfout_candidate(Kernel::Params p) {
 #define DG_DUAL_B_VALID_EPILOGUE 0
 #define DG_DUAL_B_BOUNDED_KLOOP 0
 #include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
-using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<16,16,128,16,16,128,4,
- true,true,Tag,cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params)==88);
-static_assert(offsetof(Kernel::Params,scheduler)==64);
-static_assert(Kernel::SharedStorageSize==65536);
-extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
-__global__ void bfout_candidate(Kernel::Params p) {
- extern __shared__ char smem[];
- if constexpr (1>1) {
-   const int tiles=p.K/128;
-   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
-   p.ptr_A+=begin*128;p.ptr_B_high+=begin*128;p.ptr_B_low+=begin*128;
-   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
-   p.K=(end-begin)*128;p.scheduler.shape_k=p.K;
- }
- Kernel kernel;kernel(p,smem);
+
+using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
+using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
+    16, 16, 128, 16, 16, 128, 4, true, true, Tag, cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params) == 88);
+static_assert(offsetof(Kernel::Params, scheduler) == 64);
+static_assert(Kernel::SharedStorageSize == 65536);
+
+extern "C"
+__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
+__global__ void bfout_candidate(Kernel::Params params) {
+    extern __shared__ char smem[];
+    Kernel kernel;
+    kernel(params, smem);
 }
 )BFOUT"};
             return &spec;
         }
         case 128: {
-            static const BFOutFrozenSpec spec{128, 1, 36, 192, 143360,
+            static const BFOutFrozenSpec spec{128, 36, 192, 143360,
                 true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
@@ -254,29 +248,26 @@ __global__ void bfout_candidate(Kernel::Params p) {
 #define DG_DUAL_B_VALID_EPILOGUE 0
 #define DG_DUAL_B_BOUNDED_KLOOP 0
 #include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
-using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<48,32,128,16,16,128,5,
- true,true,Tag,cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params)==88);
-static_assert(offsetof(Kernel::Params,scheduler)==64);
-static_assert(Kernel::SharedStorageSize==143360);
-extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
-__global__ void bfout_candidate(Kernel::Params p) {
- extern __shared__ char smem[];
- if constexpr (1>1) {
-   const int tiles=p.K/128;
-   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
-   p.ptr_A+=begin*128;p.ptr_B_high+=begin*128;p.ptr_B_low+=begin*128;
-   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
-   p.K=(end-begin)*128;p.scheduler.shape_k=p.K;
- }
- Kernel kernel;kernel(p,smem);
+
+using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
+using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
+    48, 32, 128, 16, 16, 128, 5, true, true, Tag, cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params) == 88);
+static_assert(offsetof(Kernel::Params, scheduler) == 64);
+static_assert(Kernel::SharedStorageSize == 143360);
+
+extern "C"
+__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
+__global__ void bfout_candidate(Kernel::Params params) {
+    extern __shared__ char smem[];
+    Kernel kernel;
+    kernel(params, smem);
 }
 )BFOUT"};
             return &spec;
         }
         case 256: {
-            static const BFOutFrozenSpec spec{256, 1, 36, 256, 245760,
+            static const BFOutFrozenSpec spec{256, 36, 256, 245760,
                 false, R"BFOUT(#define DG_BFOUT_CTA_K 1
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
@@ -292,29 +283,26 @@ __global__ void bfout_candidate(Kernel::Params p) {
 #define DG_DUAL_B_VALID_EPILOGUE 0
 #define DG_DUAL_B_BOUNDED_KLOOP 0
 #include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
-using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<96,32,128,48,16,64,6,
- true,true,Tag,cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params)==88);
-static_assert(offsetof(Kernel::Params,scheduler)==64);
-static_assert(Kernel::SharedStorageSize==245760);
-extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
-__global__ void bfout_candidate(Kernel::Params p) {
- extern __shared__ char smem[];
- if constexpr (1>1) {
-   const int tiles=p.K/128;
-   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
-   p.ptr_A+=begin*128;p.ptr_B_high+=begin*128;p.ptr_B_low+=begin*128;
-   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
-   p.K=(end-begin)*128;p.scheduler.shape_k=p.K;
- }
- Kernel kernel;kernel(p,smem);
+
+using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
+using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
+    96, 32, 128, 48, 16, 64, 6, true, true, Tag, cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params) == 88);
+static_assert(offsetof(Kernel::Params, scheduler) == 64);
+static_assert(Kernel::SharedStorageSize == 245760);
+
+extern "C"
+__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
+__global__ void bfout_candidate(Kernel::Params params) {
+    extern __shared__ char smem[];
+    Kernel kernel;
+    kernel(params, smem);
 }
 )BFOUT"};
             return &spec;
         }
         case 512: {
-            static const BFOutFrozenSpec spec{512, 1, 36, 256, 143360,
+            static const BFOutFrozenSpec spec{512, 36, 256, 143360,
                 true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
@@ -330,29 +318,26 @@ __global__ void bfout_candidate(Kernel::Params p) {
 #define DG_DUAL_B_VALID_EPILOGUE 0
 #define DG_DUAL_B_BOUNDED_KLOOP 0
 #include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
-using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<96,64,64,48,16,64,5,
- true,true,Tag,cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params)==88);
-static_assert(offsetof(Kernel::Params,scheduler)==64);
-static_assert(Kernel::SharedStorageSize==143360);
-extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
-__global__ void bfout_candidate(Kernel::Params p) {
- extern __shared__ char smem[];
- if constexpr (1>1) {
-   const int tiles=p.K/64;
-   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
-   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
-   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
-   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
- }
- Kernel kernel;kernel(p,smem);
+
+using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
+using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
+    96, 64, 64, 48, 16, 64, 5, true, true, Tag, cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params) == 88);
+static_assert(offsetof(Kernel::Params, scheduler) == 64);
+static_assert(Kernel::SharedStorageSize == 143360);
+
+extern "C"
+__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
+__global__ void bfout_candidate(Kernel::Params params) {
+    extern __shared__ char smem[];
+    Kernel kernel;
+    kernel(params, smem);
 }
 )BFOUT"};
             return &spec;
         }
         case 1024: {
-            static const BFOutFrozenSpec spec{1024, 1, 36, 256, 163840,
+            static const BFOutFrozenSpec spec{1024, 36, 256, 163840,
                 true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
@@ -368,29 +353,26 @@ __global__ void bfout_candidate(Kernel::Params p) {
 #define DG_DUAL_B_VALID_EPILOGUE 0
 #define DG_DUAL_B_BOUNDED_KLOOP 0
 #include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
-using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<192,64,64,48,32,64,4,
- true,true,Tag,cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params)==88);
-static_assert(offsetof(Kernel::Params,scheduler)==64);
-static_assert(Kernel::SharedStorageSize==163840);
-extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
-__global__ void bfout_candidate(Kernel::Params p) {
- extern __shared__ char smem[];
- if constexpr (1>1) {
-   const int tiles=p.K/64;
-   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
-   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
-   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
-   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
- }
- Kernel kernel;kernel(p,smem);
+
+using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
+using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
+    192, 64, 64, 48, 32, 64, 4, true, true, Tag, cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params) == 88);
+static_assert(offsetof(Kernel::Params, scheduler) == 64);
+static_assert(Kernel::SharedStorageSize == 163840);
+
+extern "C"
+__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
+__global__ void bfout_candidate(Kernel::Params params) {
+    extern __shared__ char smem[];
+    Kernel kernel;
+    kernel(params, smem);
 }
 )BFOUT"};
             return &spec;
         }
         case 2048: {
-            static const BFOutFrozenSpec spec{2048, 1, 32, 512, 229376,
+            static const BFOutFrozenSpec spec{2048, 32, 512, 229376,
                 true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
@@ -406,29 +388,26 @@ __global__ void bfout_candidate(Kernel::Params p) {
 #define DG_DUAL_B_VALID_EPILOGUE 0
 #define DG_DUAL_B_BOUNDED_KLOOP 0
 #include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
-using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<256,96,64,32,48,64,4,
- true,true,Tag,cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params)==88);
-static_assert(offsetof(Kernel::Params,scheduler)==64);
-static_assert(Kernel::SharedStorageSize==229376);
-extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
-__global__ void bfout_candidate(Kernel::Params p) {
- extern __shared__ char smem[];
- if constexpr (1>1) {
-   const int tiles=p.K/64;
-   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
-   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
-   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
-   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
- }
- Kernel kernel;kernel(p,smem);
+
+using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
+using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
+    256, 96, 64, 32, 48, 64, 4, true, true, Tag, cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params) == 88);
+static_assert(offsetof(Kernel::Params, scheduler) == 64);
+static_assert(Kernel::SharedStorageSize == 229376);
+
+extern "C"
+__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
+__global__ void bfout_candidate(Kernel::Params params) {
+    extern __shared__ char smem[];
+    Kernel kernel;
+    kernel(params, smem);
 }
 )BFOUT"};
             return &spec;
         }
         case 4096: {
-            static const BFOutFrozenSpec spec{4096, 1, 39, 512, 221184,
+            static const BFOutFrozenSpec spec{4096, 39, 512, 221184,
                 true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
@@ -444,29 +423,26 @@ __global__ void bfout_candidate(Kernel::Params p) {
 #define DG_DUAL_B_VALID_EPILOGUE 0
 #define DG_DUAL_B_BOUNDED_KLOOP 0
 #include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
-using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<320,128,64,80,32,64,3,
- true,true,Tag,cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params)==88);
-static_assert(offsetof(Kernel::Params,scheduler)==64);
-static_assert(Kernel::SharedStorageSize==221184);
-extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
-__global__ void bfout_candidate(Kernel::Params p) {
- extern __shared__ char smem[];
- if constexpr (1>1) {
-   const int tiles=p.K/64;
-   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
-   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
-   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
-   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
- }
- Kernel kernel;kernel(p,smem);
+
+using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
+using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
+    320, 128, 64, 80, 32, 64, 3, true, true, Tag, cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params) == 88);
+static_assert(offsetof(Kernel::Params, scheduler) == 64);
+static_assert(Kernel::SharedStorageSize == 221184);
+
+extern "C"
+__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
+__global__ void bfout_candidate(Kernel::Params params) {
+    extern __shared__ char smem[];
+    Kernel kernel;
+    kernel(params, smem);
 }
 )BFOUT"};
             return &spec;
         }
         case 8192: {
-            static const BFOutFrozenSpec spec{8192, 1, 39, 512, 221184,
+            static const BFOutFrozenSpec spec{8192, 39, 512, 221184,
                 true, R"BFOUT(#define DG_DUAL_B_K_ORDER 1
 #define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
@@ -483,29 +459,26 @@ __global__ void bfout_candidate(Kernel::Params p) {
 #define DG_DUAL_B_VALID_EPILOGUE 1
 #define DG_DUAL_B_BOUNDED_KLOOP 0
 #include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
-using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<320,128,64,80,32,64,3,
- true,true,Tag,cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params)==88);
-static_assert(offsetof(Kernel::Params,scheduler)==64);
-static_assert(Kernel::SharedStorageSize==221184);
-extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
-__global__ void bfout_candidate(Kernel::Params p) {
- extern __shared__ char smem[];
- if constexpr (1>1) {
-   const int tiles=p.K/64;
-   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
-   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
-   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
-   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
- }
- Kernel kernel;kernel(p,smem);
+
+using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
+using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
+    320, 128, 64, 80, 32, 64, 3, true, true, Tag, cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params) == 88);
+static_assert(offsetof(Kernel::Params, scheduler) == 64);
+static_assert(Kernel::SharedStorageSize == 221184);
+
+extern "C"
+__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
+__global__ void bfout_candidate(Kernel::Params params) {
+    extern __shared__ char smem[];
+    Kernel kernel;
+    kernel(params, smem);
 }
 )BFOUT"};
             return &spec;
         }
         case 16384: {
-            static const BFOutFrozenSpec spec{16384, 1, 39, 512, 262144,
+            static const BFOutFrozenSpec spec{16384, 39, 512, 262144,
                 true, R"BFOUT(#define DG_DUAL_B_STATIC_STAGES 1
 #define DG_DUAL_B_K_ORDER 6
 #define DG_BFOUT_CTA_K 0
@@ -523,23 +496,20 @@ __global__ void bfout_candidate(Kernel::Params p) {
 #define DG_DUAL_B_VALID_EPILOGUE 1
 #define DG_DUAL_B_BOUNDED_KLOOP 0
 #include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
-using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<256,128,64,64,32,64,4,
- true,true,Tag,cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params)==88);
-static_assert(offsetof(Kernel::Params,scheduler)==64);
-static_assert(Kernel::SharedStorageSize==262144);
-extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
-__global__ void bfout_candidate(Kernel::Params p) {
- extern __shared__ char smem[];
- if constexpr (1>1) {
-   const int tiles=p.K/64;
-   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
-   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
-   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
-   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
- }
- Kernel kernel;kernel(p,smem);
+
+using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
+using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
+    256, 128, 64, 64, 32, 64, 4, true, true, Tag, cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params) == 88);
+static_assert(offsetof(Kernel::Params, scheduler) == 64);
+static_assert(Kernel::SharedStorageSize == 262144);
+
+extern "C"
+__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
+__global__ void bfout_candidate(Kernel::Params params) {
+    extern __shared__ char smem[];
+    Kernel kernel;
+    kernel(params, smem);
 }
 )BFOUT"};
             return &spec;
@@ -570,15 +540,6 @@ static std::shared_ptr<KernelRuntime> bfout_frozen_runtime(const BFOutFrozenSpec
     cache.emplace(spec.m, runtime);
     return runtime;
 }
-static std::shared_ptr<KernelRuntime> bfout_frozen_reducer() {
-    static thread_local std::shared_ptr<KernelRuntime> runtime;
-    if (!runtime) {
-        const std::string raw = R"BFOUT()BFOUT";
-        const auto code = fmt::format("// Includes' hash value: {}\n{}", include_parser->get_hash_value(raw), raw);
-        runtime = compiler->build("bfout_reduce", code);
-    }
-    return runtime;
-}
 static bool bfout_no_experimental_overrides() {
     for (const char* name : {
         "DG_BF16XFP32_PACKED_DUAL_N", "DG_BF16XFP32_STATIC_ROUTER", "DG_BF16XFP32_DECODE_SPLIT_K",
@@ -593,40 +554,32 @@ static bool bfout_no_experimental_overrides() {
 }
 static void bfout_launch_frozen(const BFOutFrozenSpec& spec, const torch::Tensor& lhs,
     const torch::Tensor& high, const torch::Tensor& low, const torch::Tensor& out, float scale, int m, int n, int k) {
-    auto main = bfout_frozen_runtime(spec);
-    std::shared_ptr<KernelRuntime> reduction;
-    if (spec.splits > 1) reduction = bfout_frozen_reducer();
+    const auto runtime = bfout_frozen_runtime(spec);
     if (is_compile_only()) return;
-    // Each split writes both FP32 chains completely before the fixed-order FP32 reduction.
-    torch::Tensor partial;
-    if (spec.splits > 1) partial = torch::empty({spec.splits, 2, m, n}, out.options().dtype(torch::kFloat));
+
     using Params = DenseBf16xFp32GemmCuteFreeRuntimeT<cutlass::bfloat16_t>::GemmKernelParams;
     static_assert(sizeof(Params) == 88 && offsetof(Params, scheduler) == 64);
-    Params p{reinterpret_cast<const cutlass::bfloat16_t*>(lhs.data_ptr()),
+    Params params{
+        reinterpret_cast<const cutlass::bfloat16_t*>(lhs.data_ptr()),
         reinterpret_cast<const cutlass::bfloat16_t*>(high.data_ptr()),
         reinterpret_cast<const cutlass::bfloat16_t*>(low.data_ptr()),
-        reinterpret_cast<cutlass::bfloat16_t*>(spec.splits > 1 ? partial.data_ptr() : out.data_ptr()),
-        scale, m, n, k, k, k, n, DenseGemmTileSchedulerArguments{uint32_t(m), uint32_t(n), uint32_t(k), nullptr}};
+        reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr()),
+        scale, m, n, k, k, k, n,
+        DenseGemmTileSchedulerArguments{uint32_t(m), uint32_t(n), uint32_t(k), nullptr}};
     const auto& stream = current_stream();
-    const auto config = construct_launch_config(main->kernel, stream, spec.smem,
-        dim3(spec.grid, 1, spec.splits), dim3(spec.block));
+    const auto config = construct_launch_config(runtime->kernel, stream, spec.smem,
+        dim3(spec.grid), dim3(spec.block));
     DgProfParam prof;
-    if (profiling_enabled()) prof.set_params(GemmType::Normal, false, std::string("bf16xfp32"), 1, m, n, k, 0, nullptr, stream);
+    if (profiling_enabled()) {
+        prof.set_params(GemmType::Normal, false, std::string("bf16xfp32"), 1, m, n, k, 0, nullptr, stream);
+    }
     {
         auto guard = show_gemm_ut(prof);
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(main->kernel, config, p));
-        if (spec.splits > 1) {
-            const int count = m * n;
-            const auto reduce_config = construct_launch_config(reduction->kernel, stream, 0,
-                dim3((count + 255) / 256), dim3(256));
-            DG_HGGC_UNIFIED_CHECK(launch_kernel(reduction->kernel, reduce_config,
-                partial.data_ptr<float>(), reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr()), count, spec.splits, scale));
-        }
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(runtime->kernel, config, params));
     }
     if (const char* log = std::getenv("show_log"); log && isdigit(*log)) {
-        printf("bfout_frozen:M=%d,N=%d,K=%d,grid=%d,block=%d,smem=%d,splits=%d,mma_reuse=%d,workspace=%lld\n",
-            m, n, k, spec.grid, spec.block, spec.smem, spec.splits, int(spec.mma_reuse),
-            spec.splits > 1 ? int64_t(spec.splits) * 8 * m * n : int64_t(0));
+        printf("bfout_frozen:M=%d,N=%d,K=%d,grid=%d,block=%d,smem=%d,splits=1,mma_reuse=%d,workspace=0\n",
+            m, n, k, spec.grid, spec.block, spec.smem, int(spec.mma_reuse));
     }
 }
 
