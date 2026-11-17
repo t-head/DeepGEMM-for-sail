@@ -33,7 +33,7 @@ void int8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     DG_HOST_ASSERT(a.scalar_type() == torch::kInt8 || a.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(b.scalar_type() == torch::kInt8 || b.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(a.scalar_type() == b.scalar_type());
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    TORCH_CHECK(d.scalar_type() == torch::kBFloat16, "quantized einsum supports BF16 output only");
 
     DG_HOST_ASSERT(not c.has_value());
     // Early return for trivial cases
@@ -74,7 +74,7 @@ void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     DG_HOST_ASSERT(m == m_ && n == n_ && k == k_);
     DG_HOST_ASSERT(sfa.scalar_type() == torch::kFloat32);
     DG_HOST_ASSERT(sfb.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    TORCH_CHECK(d.scalar_type() == torch::kBFloat16, "quantized einsum supports BF16 output only");
 
     DG_HOST_ASSERT(not c.has_value());
     // Early return for trivial cases

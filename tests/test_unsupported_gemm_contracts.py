@@ -235,3 +235,19 @@ def test_bug27_fused_bf16_base_alignment(offset):
     else:
         call()
         torch.testing.assert_close(out, torch.full_like(out, 128), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('kind', ['int8', 'fp8-channel', 'fp8-block'])
+def test_bug28_einsum_output_dtype(kind):
+    dtype = torch.int8 if kind == 'int8' else torch.float8_e4m3fn
+    a = torch.ones((16, 2, 256), device='cuda').to(dtype)
+    b = torch.ones((2, 128, 256), device='cuda').to(dtype)
+    block = kind == 'fp8-block'
+    sa = torch.ones((16, 2, 2 if block else 1), device='cuda')
+    sb = torch.ones((2, 1, 2) if block else (2, 128, 1), device='cuda')
+    api = dg.int8_einsum if kind == 'int8' else dg.fp8_einsum
+    out = torch.full((16, 2, 128), -123, dtype=torch.float32, device='cuda')
+    reject(lambda: api('bhr,hdr->bhd', (a, sa), (b, sb), out), 'supports BF16 output only', out)
+    out_bf16 = out.bfloat16()
+    api('bhr,hdr->bhd', (a, sa), (b, sb), out_bf16)
+    torch.testing.assert_close(out_bf16, torch.full_like(out_bf16, 256), rtol=0, atol=0)

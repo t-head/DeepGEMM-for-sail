@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Quantized einsum output dtype**: explicitly require BF16 output at the
+  API boundary instead of accepting FP32 and failing later in the launcher.
 - **Fused MoE A alignment**: reject continuous views whose base address is
   not aligned to the vector copy's 16-byte requirement.
 - **Fused blockwise FP8 warp count**: reject single-warp configurations

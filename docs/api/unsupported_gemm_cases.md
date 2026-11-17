@@ -21,3 +21,4 @@ Bug numbers refer to the DeepGEMM correctness review in ppu-kernel-quirks.
 | 24 | Dense/nopad/masked FP4 bias must be contiguous. | The epilogue uses a fixed unit column stride. |
 | 26 | Blockwise FP8 fused MoE requires at least two warps per CTA. | Warp 1 is the B-scale producer. |
 | 27 | BF16/INT8/FP8/MXFP4 fused MoE requires a 16-byte-aligned A base address. | Logical contiguity alone does not guarantee aligned vector loads. |
+| 28 | INT8/per-channel FP8/blockwise FP8 einsum requires BF16 output. | Its launcher and epilogue do not implement FP32 output. |
