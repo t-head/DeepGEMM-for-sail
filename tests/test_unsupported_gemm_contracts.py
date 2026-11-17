@@ -95,3 +95,14 @@ def w4fa16_call(n, stages, expand):
 def test_bug12_w4fa16_expanded_pipeline():
     call, out = w4fa16_call(256, 3, 2)
     reject(call, 'N expansion requires num_stages=2', out)
+
+
+@pytest.mark.parametrize('m', [8, 8193])
+def test_bug14_route_view(m):
+    a = torch.empty((m, 128), dtype=torch.bfloat16, device='cuda')
+    b = torch.empty((4, 128, 128), dtype=torch.bfloat16, device='cuda')
+    ids = torch.arange(4, dtype=torch.int32, device='cuda').repeat(m, 1)[:, ::2]
+    with pytest.raises(RuntimeError, match='contiguous topk_ids'):
+        dg.moe_align_block_size(a, b, ids)
+    _, rows, *_ = dg.moe_align_block_size(a, b, ids.contiguous())
+    torch.testing.assert_close(rows, torch.tensor([m, 0, m, 0], dtype=torch.int32, device='cuda'))

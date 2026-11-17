@@ -1665,6 +1665,7 @@ MoeAlignReturn moe_align_block_size(
     int lhs_scale_group_size = 0, int rhs_scale_block_size = 0) {
     DG_HOST_ASSERT(topk_ids.dtype() == torch::kInt32);
     DG_HOST_ASSERT(topk_ids.dim() == 2);
+    TORCH_CHECK(topk_ids.is_contiguous(), "moe_align_block_size requires contiguous topk_ids");
 
     const bool nvfp4 = lhs.scalar_type() == torch::kFloat8_e4m3fn && rhs.scalar_type() == torch::kInt32;
     TORCH_CHECK(lhs_scale_group_size == 0 || lhs_scale_group_size == 16 ||
