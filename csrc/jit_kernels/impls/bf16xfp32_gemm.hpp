@@ -151,6 +151,486 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
     }
 };
 
+
+// Exact BF16-output defaults contain only independently accepted frozen candidates.
+// No shared input/output/workspace cache is used; allocations belong to the current PyTorch stream.
+struct BFOutFrozenSpec {
+    int m, splits, grid, block, smem;
+    bool mma_reuse;
+    const char* id;
+    const char* code;
+};
+static const BFOutFrozenSpec* bfout_frozen_spec(int m) {
+    switch (m) {
+        case 8: {
+            static const BFOutFrozenSpec spec{8, 1, 48, 64, 65536,
+                true, "3f47a47de103fa4e37f0", R"BFOUT(#define DG_BFOUT_CTA_K 0
+#define DG_BFOUT_PARTIAL 0
+#define DG_BFOUT_PACKED_STORE 1
+#define DG_BFOUT_ONE_TILE 0
+#define DG_DUAL_B_PACKED_N 1
+#define DG_DUAL_B_DECODE_SPLIT_K 2
+#define DG_DUAL_B_ROUTER_M 8
+#define DG_DUAL_B_ROUTER_N 384
+#define DG_DUAL_B_ROUTER_K 7168
+#define DG_DUAL_B_EARLY_G2S 0
+#define DG_DUAL_B_MMA_S2R_OVERLAP 0
+#define DG_DUAL_B_OVERLAP_PROLOGUE 0
+#define DG_DUAL_B_VALID_EPILOGUE 0
+#define DG_DUAL_B_BOUNDED_KLOOP 0
+#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
+using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<16,16,128,16,16,128,4,
+ true,true,Tag,cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params)==88);
+static_assert(offsetof(Kernel::Params,scheduler)==64);
+static_assert(Kernel::SharedStorageSize==65536);
+extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
+__global__ void bfout_candidate(Kernel::Params p) {
+ extern __shared__ char smem[];
+ if constexpr (1>1) {
+   const int tiles=p.K/128;
+   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
+   p.ptr_A+=begin*128;p.ptr_B_high+=begin*128;p.ptr_B_low+=begin*128;
+   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
+   p.K=(end-begin)*128;p.scheduler.shape_k=p.K;
+ }
+ Kernel kernel;kernel(p,smem);
+}
+)BFOUT"};
+            return &spec;
+        }
+        case 16: {
+            static const BFOutFrozenSpec spec{16, 1, 48, 64, 65536,
+                false, "27d5c202de64d79a8674", R"BFOUT(#define DG_BFOUT_CTA_K 0
+#define DG_BFOUT_PARTIAL 0
+#define DG_BFOUT_PACKED_STORE 1
+#define DG_BFOUT_ONE_TILE 0
+#define DG_DUAL_B_PACKED_N 1
+#define DG_DUAL_B_DECODE_SPLIT_K 2
+#define DG_DUAL_B_ROUTER_M 16
+#define DG_DUAL_B_ROUTER_N 384
+#define DG_DUAL_B_ROUTER_K 7168
+#define DG_DUAL_B_EARLY_G2S 0
+#define DG_DUAL_B_MMA_S2R_OVERLAP 0
+#define DG_DUAL_B_OVERLAP_PROLOGUE 0
+#define DG_DUAL_B_VALID_EPILOGUE 0
+#define DG_DUAL_B_BOUNDED_KLOOP 0
+#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
+using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<16,16,128,16,16,128,4,
+ true,true,Tag,cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params)==88);
+static_assert(offsetof(Kernel::Params,scheduler)==64);
+static_assert(Kernel::SharedStorageSize==65536);
+extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
+__global__ void bfout_candidate(Kernel::Params p) {
+ extern __shared__ char smem[];
+ if constexpr (1>1) {
+   const int tiles=p.K/128;
+   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
+   p.ptr_A+=begin*128;p.ptr_B_high+=begin*128;p.ptr_B_low+=begin*128;
+   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
+   p.K=(end-begin)*128;p.scheduler.shape_k=p.K;
+ }
+ Kernel kernel;kernel(p,smem);
+}
+)BFOUT"};
+            return &spec;
+        }
+        case 128: {
+            static const BFOutFrozenSpec spec{128, 1, 36, 192, 143360,
+                true, "3161c920ed3c2eda7f28", R"BFOUT(#define DG_BFOUT_CTA_K 0
+#define DG_BFOUT_PARTIAL 0
+#define DG_BFOUT_PACKED_STORE 1
+#define DG_BFOUT_ONE_TILE 1
+#define DG_DUAL_B_PACKED_N 0
+#define DG_DUAL_B_DECODE_SPLIT_K 1
+#define DG_DUAL_B_ROUTER_M 128
+#define DG_DUAL_B_ROUTER_N 384
+#define DG_DUAL_B_ROUTER_K 7168
+#define DG_DUAL_B_EARLY_G2S 0
+#define DG_DUAL_B_MMA_S2R_OVERLAP 0
+#define DG_DUAL_B_OVERLAP_PROLOGUE 0
+#define DG_DUAL_B_VALID_EPILOGUE 0
+#define DG_DUAL_B_BOUNDED_KLOOP 0
+#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
+using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<48,32,128,16,16,128,5,
+ true,true,Tag,cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params)==88);
+static_assert(offsetof(Kernel::Params,scheduler)==64);
+static_assert(Kernel::SharedStorageSize==143360);
+extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
+__global__ void bfout_candidate(Kernel::Params p) {
+ extern __shared__ char smem[];
+ if constexpr (1>1) {
+   const int tiles=p.K/128;
+   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
+   p.ptr_A+=begin*128;p.ptr_B_high+=begin*128;p.ptr_B_low+=begin*128;
+   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
+   p.K=(end-begin)*128;p.scheduler.shape_k=p.K;
+ }
+ Kernel kernel;kernel(p,smem);
+}
+)BFOUT"};
+            return &spec;
+        }
+        case 256: {
+            static const BFOutFrozenSpec spec{256, 1, 36, 256, 245760,
+                false, "b5940ae48e2daaa600f3", R"BFOUT(#define DG_BFOUT_CTA_K 1
+#define DG_BFOUT_PARTIAL 0
+#define DG_BFOUT_PACKED_STORE 1
+#define DG_BFOUT_ONE_TILE 1
+#define DG_DUAL_B_PACKED_N 0
+#define DG_DUAL_B_DECODE_SPLIT_K 1
+#define DG_DUAL_B_ROUTER_M 256
+#define DG_DUAL_B_ROUTER_N 384
+#define DG_DUAL_B_ROUTER_K 7168
+#define DG_DUAL_B_EARLY_G2S 0
+#define DG_DUAL_B_MMA_S2R_OVERLAP 0
+#define DG_DUAL_B_OVERLAP_PROLOGUE 0
+#define DG_DUAL_B_VALID_EPILOGUE 0
+#define DG_DUAL_B_BOUNDED_KLOOP 0
+#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
+using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<96,32,128,48,16,64,6,
+ true,true,Tag,cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params)==88);
+static_assert(offsetof(Kernel::Params,scheduler)==64);
+static_assert(Kernel::SharedStorageSize==245760);
+extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
+__global__ void bfout_candidate(Kernel::Params p) {
+ extern __shared__ char smem[];
+ if constexpr (1>1) {
+   const int tiles=p.K/128;
+   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
+   p.ptr_A+=begin*128;p.ptr_B_high+=begin*128;p.ptr_B_low+=begin*128;
+   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
+   p.K=(end-begin)*128;p.scheduler.shape_k=p.K;
+ }
+ Kernel kernel;kernel(p,smem);
+}
+)BFOUT"};
+            return &spec;
+        }
+        case 512: {
+            static const BFOutFrozenSpec spec{512, 1, 36, 256, 143360,
+                true, "87c8870423f9e446677d", R"BFOUT(#define DG_BFOUT_CTA_K 0
+#define DG_BFOUT_PARTIAL 0
+#define DG_BFOUT_PACKED_STORE 1
+#define DG_BFOUT_ONE_TILE 1
+#define DG_DUAL_B_PACKED_N 0
+#define DG_DUAL_B_DECODE_SPLIT_K 1
+#define DG_DUAL_B_ROUTER_M 512
+#define DG_DUAL_B_ROUTER_N 384
+#define DG_DUAL_B_ROUTER_K 7168
+#define DG_DUAL_B_EARLY_G2S 0
+#define DG_DUAL_B_MMA_S2R_OVERLAP 1
+#define DG_DUAL_B_OVERLAP_PROLOGUE 0
+#define DG_DUAL_B_VALID_EPILOGUE 0
+#define DG_DUAL_B_BOUNDED_KLOOP 0
+#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
+using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<96,64,64,48,16,64,5,
+ true,true,Tag,cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params)==88);
+static_assert(offsetof(Kernel::Params,scheduler)==64);
+static_assert(Kernel::SharedStorageSize==143360);
+extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
+__global__ void bfout_candidate(Kernel::Params p) {
+ extern __shared__ char smem[];
+ if constexpr (1>1) {
+   const int tiles=p.K/64;
+   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
+   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
+   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
+   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
+ }
+ Kernel kernel;kernel(p,smem);
+}
+)BFOUT"};
+            return &spec;
+        }
+        case 1024: {
+            static const BFOutFrozenSpec spec{1024, 1, 36, 256, 163840,
+                true, "c7b620bb4991314a22fd", R"BFOUT(#define DG_BFOUT_CTA_K 0
+#define DG_BFOUT_PARTIAL 0
+#define DG_BFOUT_PACKED_STORE 1
+#define DG_BFOUT_ONE_TILE 1
+#define DG_DUAL_B_PACKED_N 0
+#define DG_DUAL_B_DECODE_SPLIT_K 1
+#define DG_DUAL_B_ROUTER_M 1024
+#define DG_DUAL_B_ROUTER_N 384
+#define DG_DUAL_B_ROUTER_K 7168
+#define DG_DUAL_B_EARLY_G2S 0
+#define DG_DUAL_B_MMA_S2R_OVERLAP 1
+#define DG_DUAL_B_OVERLAP_PROLOGUE 0
+#define DG_DUAL_B_VALID_EPILOGUE 0
+#define DG_DUAL_B_BOUNDED_KLOOP 0
+#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
+using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<192,64,64,48,32,64,4,
+ true,true,Tag,cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params)==88);
+static_assert(offsetof(Kernel::Params,scheduler)==64);
+static_assert(Kernel::SharedStorageSize==163840);
+extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
+__global__ void bfout_candidate(Kernel::Params p) {
+ extern __shared__ char smem[];
+ if constexpr (1>1) {
+   const int tiles=p.K/64;
+   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
+   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
+   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
+   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
+ }
+ Kernel kernel;kernel(p,smem);
+}
+)BFOUT"};
+            return &spec;
+        }
+        case 2048: {
+            static const BFOutFrozenSpec spec{2048, 1, 32, 512, 229376,
+                true, "073f040b4e5b3027f3d6", R"BFOUT(#define DG_BFOUT_CTA_K 0
+#define DG_BFOUT_PARTIAL 0
+#define DG_BFOUT_PACKED_STORE 1
+#define DG_BFOUT_ONE_TILE 0
+#define DG_DUAL_B_PACKED_N 0
+#define DG_DUAL_B_DECODE_SPLIT_K 1
+#define DG_DUAL_B_ROUTER_M 2048
+#define DG_DUAL_B_ROUTER_N 384
+#define DG_DUAL_B_ROUTER_K 7168
+#define DG_DUAL_B_EARLY_G2S 0
+#define DG_DUAL_B_MMA_S2R_OVERLAP 0
+#define DG_DUAL_B_OVERLAP_PROLOGUE 1
+#define DG_DUAL_B_VALID_EPILOGUE 0
+#define DG_DUAL_B_BOUNDED_KLOOP 0
+#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
+using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<256,96,64,32,48,64,4,
+ true,true,Tag,cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params)==88);
+static_assert(offsetof(Kernel::Params,scheduler)==64);
+static_assert(Kernel::SharedStorageSize==229376);
+extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
+__global__ void bfout_candidate(Kernel::Params p) {
+ extern __shared__ char smem[];
+ if constexpr (1>1) {
+   const int tiles=p.K/64;
+   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
+   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
+   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
+   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
+ }
+ Kernel kernel;kernel(p,smem);
+}
+)BFOUT"};
+            return &spec;
+        }
+        case 4096: {
+            static const BFOutFrozenSpec spec{4096, 1, 39, 512, 221184,
+                true, "eee79e7ddf8385f874a7", R"BFOUT(#define DG_BFOUT_CTA_K 0
+#define DG_BFOUT_PARTIAL 0
+#define DG_BFOUT_PACKED_STORE 1
+#define DG_BFOUT_ONE_TILE 0
+#define DG_DUAL_B_PACKED_N 0
+#define DG_DUAL_B_DECODE_SPLIT_K 1
+#define DG_DUAL_B_ROUTER_M 0
+#define DG_DUAL_B_ROUTER_N 0
+#define DG_DUAL_B_ROUTER_K 0
+#define DG_DUAL_B_EARLY_G2S 0
+#define DG_DUAL_B_MMA_S2R_OVERLAP 0
+#define DG_DUAL_B_OVERLAP_PROLOGUE 0
+#define DG_DUAL_B_VALID_EPILOGUE 0
+#define DG_DUAL_B_BOUNDED_KLOOP 0
+#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
+using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<320,128,64,80,32,64,3,
+ true,true,Tag,cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params)==88);
+static_assert(offsetof(Kernel::Params,scheduler)==64);
+static_assert(Kernel::SharedStorageSize==221184);
+extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
+__global__ void bfout_candidate(Kernel::Params p) {
+ extern __shared__ char smem[];
+ if constexpr (1>1) {
+   const int tiles=p.K/64;
+   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
+   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
+   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
+   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
+ }
+ Kernel kernel;kernel(p,smem);
+}
+)BFOUT"};
+            return &spec;
+        }
+        case 8192: {
+            static const BFOutFrozenSpec spec{8192, 1, 39, 512, 221184,
+                true, "7a6dffa5862ce7f3b12d", R"BFOUT(#define DG_DUAL_B_K_ORDER 1
+#define DG_BFOUT_CTA_K 0
+#define DG_BFOUT_PARTIAL 0
+#define DG_BFOUT_PACKED_STORE 1
+#define DG_BFOUT_ONE_TILE 0
+#define DG_DUAL_B_PACKED_N 0
+#define DG_DUAL_B_DECODE_SPLIT_K 1
+#define DG_DUAL_B_ROUTER_M 8192
+#define DG_DUAL_B_ROUTER_N 384
+#define DG_DUAL_B_ROUTER_K 7168
+#define DG_DUAL_B_EARLY_G2S 0
+#define DG_DUAL_B_MMA_S2R_OVERLAP 0
+#define DG_DUAL_B_OVERLAP_PROLOGUE 1
+#define DG_DUAL_B_VALID_EPILOGUE 1
+#define DG_DUAL_B_BOUNDED_KLOOP 0
+#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
+using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<320,128,64,80,32,64,3,
+ true,true,Tag,cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params)==88);
+static_assert(offsetof(Kernel::Params,scheduler)==64);
+static_assert(Kernel::SharedStorageSize==221184);
+extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
+__global__ void bfout_candidate(Kernel::Params p) {
+ extern __shared__ char smem[];
+ if constexpr (1>1) {
+   const int tiles=p.K/64;
+   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
+   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
+   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
+   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
+ }
+ Kernel kernel;kernel(p,smem);
+}
+)BFOUT"};
+            return &spec;
+        }
+        case 16384: {
+            static const BFOutFrozenSpec spec{16384, 1, 39, 512, 262144,
+                true, "c558a75f4634c5f00cd1", R"BFOUT(#define DG_DUAL_B_STATIC_STAGES 1
+#define DG_DUAL_B_K_ORDER 6
+#define DG_BFOUT_CTA_K 0
+#define DG_BFOUT_PARTIAL 0
+#define DG_BFOUT_PACKED_STORE 1
+#define DG_BFOUT_ONE_TILE 0
+#define DG_DUAL_B_PACKED_N 0
+#define DG_DUAL_B_DECODE_SPLIT_K 1
+#define DG_DUAL_B_ROUTER_M 16384
+#define DG_DUAL_B_ROUTER_N 384
+#define DG_DUAL_B_ROUTER_K 7168
+#define DG_DUAL_B_EARLY_G2S 0
+#define DG_DUAL_B_MMA_S2R_OVERLAP 0
+#define DG_DUAL_B_OVERLAP_PROLOGUE 1
+#define DG_DUAL_B_VALID_EPILOGUE 1
+#define DG_DUAL_B_BOUNDED_KLOOP 0
+#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+using Tag=std::integral_constant<deep_gemm::GemmType,deep_gemm::GemmType::Normal>;
+using Kernel=deep_gemm::BF16xFp32GemmCuteFreeKernel<256,128,64,64,32,64,4,
+ true,true,Tag,cutlass::bfloat16_t>;
+static_assert(sizeof(Kernel::Params)==88);
+static_assert(offsetof(Kernel::Params,scheduler)==64);
+static_assert(Kernel::SharedStorageSize==262144);
+extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock,1)
+__global__ void bfout_candidate(Kernel::Params p) {
+ extern __shared__ char smem[];
+ if constexpr (1>1) {
+   const int tiles=p.K/64;
+   const int begin=tiles*blockIdx.z/1,end=tiles*(blockIdx.z+1)/1;
+   p.ptr_A+=begin*64;p.ptr_B_high+=begin*64;p.ptr_B_low+=begin*64;
+   p.ptr_D+=int64_t(blockIdx.z)*2*p.M*p.N;
+   p.K=(end-begin)*64;p.scheduler.shape_k=p.K;
+ }
+ Kernel kernel;kernel(p,smem);
+}
+)BFOUT"};
+            return &spec;
+        }
+        default: return nullptr;
+    }
+}
+static std::shared_ptr<const Compiler> bfout_frozen_compiler(bool reuse) {
+    // Construct each private compiler once; never mutate the shared compiler singleton.
+    static const auto on = []() -> std::shared_ptr<const Compiler> {
+        auto c = std::make_shared<HGCCCompiler>();
+        c->flags += " -Xllvm -ppu-pref-mma-reuse=true";
+        return c;
+    }();
+    static const auto off = []() -> std::shared_ptr<const Compiler> {
+        auto c = std::make_shared<HGCCCompiler>();
+        c->flags += " -Xllvm -ppu-pref-mma-reuse=false";
+        return c;
+    }();
+    return reuse ? on : off;
+}
+static std::shared_ptr<KernelRuntime> bfout_frozen_runtime(const BFOutFrozenSpec& spec) {
+    static thread_local std::map<int, std::shared_ptr<KernelRuntime>> cache;
+    if (const auto it = cache.find(spec.m); it != cache.end()) return it->second;
+    const std::string raw = spec.code;
+    const auto code = fmt::format("// Includes' hash value: {}\n{}", include_parser->get_hash_value(raw), raw);
+    const auto runtime = bfout_frozen_compiler(spec.mma_reuse)->build("bfout_candidate", code);
+    cache.emplace(spec.m, runtime);
+    return runtime;
+}
+static std::shared_ptr<KernelRuntime> bfout_frozen_reducer() {
+    static thread_local std::shared_ptr<KernelRuntime> runtime;
+    if (!runtime) {
+        const std::string raw = R"BFOUT()BFOUT";
+        const auto code = fmt::format("// Includes' hash value: {}\n{}", include_parser->get_hash_value(raw), raw);
+        runtime = compiler->build("bfout_reduce", code);
+    }
+    return runtime;
+}
+static bool bfout_no_experimental_overrides() {
+    for (const char* name : {
+        "DG_BF16XFP32_PACKED_DUAL_N", "DG_BF16XFP32_STATIC_ROUTER", "DG_BF16XFP32_DECODE_SPLIT_K",
+        "DG_BF16XFP32_FULL_K_PREFETCH", "DG_BF16XFP32_EARLY_G2S", "DG_BF16XFP32_MMA_S2R_OVERLAP",
+        "DG_BF16XFP32_BOUNDED_KLOOP", "DG_BF16XFP32_OVERLAP_PROLOGUE", "DG_BF16XFP32_VALID_EPILOGUE",
+        "DG_BF16XFP32_STATIC_STAGES", "DG_BF16XFP32_STREAMED_LOW", "DG_BF16XFP32_STANDARD_S2",
+        "DG_BF16XFP32_STREAMED_PAIRS", "DG_BF16XFP32_LAUNCH_BOUNDS2", "DG_BF16XFP32_PAIRS_M_FIRST",
+        "DG_BF16XFP32_KLOOP_UNROLL", "DG_BF16XFP32_KLOOP_CHUNK"}) {
+        if (std::getenv(name) != nullptr) return false;
+    }
+    return true;
+}
+static void bfout_launch_frozen(const BFOutFrozenSpec& spec, const torch::Tensor& lhs,
+    const torch::Tensor& high, const torch::Tensor& low, const torch::Tensor& out, float scale, int m, int n, int k) {
+    auto main = bfout_frozen_runtime(spec);
+    std::shared_ptr<KernelRuntime> reduction;
+    if (spec.splits > 1) reduction = bfout_frozen_reducer();
+    if (is_compile_only()) return;
+    // Each split writes both FP32 chains completely before the fixed-order FP32 reduction.
+    torch::Tensor partial;
+    if (spec.splits > 1) partial = torch::empty({spec.splits, 2, m, n}, out.options().dtype(torch::kFloat));
+    using Params = DenseBf16xFp32GemmCuteFreeRuntimeT<cutlass::bfloat16_t>::GemmKernelParams;
+    static_assert(sizeof(Params) == 88 && offsetof(Params, scheduler) == 64);
+    Params p{reinterpret_cast<const cutlass::bfloat16_t*>(lhs.data_ptr()),
+        reinterpret_cast<const cutlass::bfloat16_t*>(high.data_ptr()),
+        reinterpret_cast<const cutlass::bfloat16_t*>(low.data_ptr()),
+        reinterpret_cast<cutlass::bfloat16_t*>(spec.splits > 1 ? partial.data_ptr() : out.data_ptr()),
+        scale, m, n, k, k, k, n, DenseGemmTileSchedulerArguments{uint32_t(m), uint32_t(n), uint32_t(k), nullptr}};
+    const auto& stream = current_stream();
+    const auto config = construct_launch_config(main->kernel, stream, spec.smem,
+        dim3(spec.grid, 1, spec.splits), dim3(spec.block));
+    DgProfParam prof;
+    if (profiling_enabled()) prof.set_params(GemmType::Normal, false, std::string("bf16xfp32"), 1, m, n, k, 0, nullptr, stream);
+    {
+        auto guard = show_gemm_ut(prof);
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(main->kernel, config, p));
+        if (spec.splits > 1) {
+            const int count = m * n;
+            const auto reduce_config = construct_launch_config(reduction->kernel, stream, 0,
+                dim3((count + 255) / 256), dim3(256));
+            DG_HGGC_UNIFIED_CHECK(launch_kernel(reduction->kernel, reduce_config,
+                partial.data_ptr<float>(), reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr()), count, spec.splits, scale));
+        }
+    }
+    if (const char* log = std::getenv("show_log"); log && isdigit(*log)) {
+        printf("bfout_frozen:id=%s,M=%d,N=%d,K=%d,grid=%d,block=%d,smem=%d,splits=%d,mma_reuse=%d,workspace=%lld\n",
+            spec.id, m, n, k, spec.grid, spec.block, spec.smem, spec.splits, int(spec.mma_reuse),
+            spec.splits > 1 ? int64_t(spec.splits) * 8 * m * n : int64_t(0));
+    }
+}
+
 // Composition fallback: out = x@w_high^T + scale * x@w_low^T via two plain BF16
 // GEMMs through an FP32 intermediate (BF16 tensor-core rate, FP32 accumulation;
 // the low part recovers the residual bits). Only PPU1.0 uses the composed path.
@@ -680,9 +1160,15 @@ static void bf16xfp32_gemm(const torch::Tensor& lhs, const torch::Tensor& w_high
         if (out.scalar_type() == torch::kFloat)
             bf16xfp32_gemm_cute_free_impl<float>(lhs, w_high, w_low, out, static_cast<float>(scale),
                                                  m, n, k, configs);
-        else
-            bf16xfp32_gemm_cute_free_impl<cutlass::bfloat16_t>(lhs, w_high, w_low, out, static_cast<float>(scale),
-                                                              m, n, k, configs);
+        else {
+            const auto* spec = bfout_frozen_spec(m);
+            if (spec && n == 384 && k == 7168 && scale == 1.0 / 256.0 && get_num_sms() == 39
+                && !configs.has_value() && !get_env<int>("DG_JIT_USE_HGRTC", 0) && bfout_no_experimental_overrides())
+                bfout_launch_frozen(*spec, lhs, w_high, w_low, out, static_cast<float>(scale), m, n, k);
+            else
+                bf16xfp32_gemm_cute_free_impl<cutlass::bfloat16_t>(lhs, w_high, w_low, out, static_cast<float>(scale),
+                                                                  m, n, k, configs);
+        }
         return;
     }
 
