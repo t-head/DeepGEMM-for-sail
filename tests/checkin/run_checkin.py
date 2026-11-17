@@ -26,11 +26,13 @@ SCRIPT_SUITES = {
         '-m pytest -q -s --disable-warnings -x tests/test_cold_graph_capture.py -k bf16',
         '-m pytest -q -s --disable-warnings -x tests/test_grouped_bf16_gemv_precision.py',
         '-m pytest -q -s --disable-warnings -x tests/test_quantized_dense_accumulation.py -k int8',
+        '-m pytest -q -s --disable-warnings -x tests/test_fused_moe_weight_offsets.py -k "bf16 or int8"',
     ],
     'ZW-M890P': [
         '-m pytest -q -s --disable-warnings -x tests/test_cold_graph_capture.py',
         '-m pytest -q -s --disable-warnings -x tests/test_grouped_bf16_gemv_precision.py',
         '-m pytest -q -s --disable-warnings -x tests/test_quantized_dense_accumulation.py',
+        '-m pytest -q -s --disable-warnings -x tests/test_fused_moe_weight_offsets.py',
     ],
     'ZW-M890P-MegaMoE': [
         '-m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py',

@@ -1232,6 +1232,23 @@ static void m_grouped_fp4_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Te
     }
 }
 
+// These fused kernels form both N*K and expert_id*(N*K) in uint32 before
+// pointer addition. Validate shape metadata without reading routing tensors.
+static void check_fused_moe_weight_offsets(const torch::Tensor& rhs, const char* api) {
+    const auto num_groups = rhs.size(0);
+    if (num_groups == 0) return;
+    // numel is int64 and bounds both products, including packed FP4 storage.
+    const auto stride_be = rhs.numel() / num_groups;
+    const auto max_expert_offset = (num_groups - 1) * stride_be;
+    constexpr auto max_offset = std::numeric_limits<uint32_t>::max();
+    TORCH_CHECK(stride_be <= max_offset && max_expert_offset <= max_offset,
+                api, ": fused MoE kernel uint32 weight-offset overflow: N*K and "
+                "(E-1)*N*K must be <= UINT32_MAX (4294967295); got E=", num_groups,
+                ", N=", rhs.size(1), ", K=", rhs.size(2),
+                ". The kernel multiplies 32-bit offsets before pointer addition; "
+                "larger weights are unsupported (K is packed storage width for FP4).");
+}
+
 void m_grouped_bf16_gemm_nt_fused(const torch::Tensor& lhs, const torch::Tensor& rhs,
                                   const torch::Tensor& out, const torch::Tensor& m_rows,
                                   const torch::Tensor& expert_ids_and_cumsum,
@@ -1256,6 +1273,7 @@ void m_grouped_bf16_gemm_nt_fused(const torch::Tensor& lhs, const torch::Tensor&
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
     DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
+    check_fused_moe_weight_offsets(rhs, "m_grouped_bf16_gemm_nt_fused");
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
         m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
@@ -1300,6 +1318,7 @@ void m_grouped_fp8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& 
     DG_HOST_ASSERT(k % 16 == 0);
     DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
+    check_fused_moe_weight_offsets(rhs, "m_grouped_fp8_gemm_nt_fused");
     const auto arch_major = device_runtime->get_arch_major();
 
     // Select per-channel quantization when each token and each expert output channel has one scale.
@@ -1371,6 +1390,7 @@ void m_grouped_int8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>&
     DG_HOST_ASSERT(k % 16 == 0);
     DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
+    check_fused_moe_weight_offsets(rhs, "m_grouped_int8_gemm_nt_fused");
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
         m_grouped_gemm_perchannel_nt_fused_impl(
@@ -1419,6 +1439,7 @@ void m_grouped_fp4_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& 
     TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
     TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+    check_fused_moe_weight_offsets(rhs, "m_grouped_fp4_gemm_nt_fused");
     const auto expected_lhs_scales_k = ceil_div(ceil_div(k, 16), 2);
     const auto expected_lhs_scales_shape = std::vector<int64_t>{num_token, expected_lhs_scales_k};
     TORCH_CHECK(

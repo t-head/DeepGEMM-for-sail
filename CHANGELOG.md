@@ -26,6 +26,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Fused MoE weight offsets**: BF16, INT8, FP8 and MXFP4 fused GEMMs reject
+  weight shapes whose per-expert stride or last expert base exceeds the kernel's
+  uint32 range, before JIT compilation or launch. Device code is unchanged.
 - **Quantized dense C contract**: INT8 and FP8 dense NT GEMMs now reject
   unsupported C accumulation before modifying the output, including aliased
   and empty C tensors. BF16 dense C accumulation remains supported.
