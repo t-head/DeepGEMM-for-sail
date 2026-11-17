@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **MXFP4 scale offset diagnostics**: explicitly reject an odd byte offset
+  before uint16 packing and explain that cloning the view provides aligned storage.
 - **Dynamic masked N tails**: reject unsupported A8W8 K>2048, N%256!=0
   combinations instead of returning output with unscheduled columns.
 - **FP8 masked SBO validation**: reject N-expanded overlap configurations

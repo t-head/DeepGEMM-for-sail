@@ -247,6 +247,8 @@ inline PreprocessedWeights preprocess_weights_and_scales(
         DG_HOST_ASSERT(scales.dim() == 2 || scales.dim() == 3);
         if (scales.size(-1) % 2 != 0)
             scales = at::constant_pad_nd(scales, {0, 1}, 0);
+        TORCH_CHECK(scales.storage_offset() % 2 == 0,
+                    "MXFP4 scale storage offset must be aligned to 2 bytes for uint16 packing; clone the scale view");
         scales = scales.view(torch::kUInt16);
         if (scales.dim() == 2)
             scales = scales.t().contiguous().t();

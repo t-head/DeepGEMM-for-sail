@@ -192,3 +192,15 @@ def test_bug22_dynamic_masked_n_tail(monkeypatch, dtype):
     out = torch.full((2, 64, 384), -123, dtype=torch.bfloat16, device='cuda')
     api = dg.m_grouped_int8_gemm_nt_masked if dtype == torch.int8 else dg.m_grouped_fp8_gemm_nt_masked
     reject(lambda: api((a, sa), (b, sb), out, rows, 32), 'dynamic A8W8 masked requires N divisible', out)
+
+
+@pytest.mark.parametrize('width', [4, 5])
+def test_bug23_fp4_scale_offset(width):
+    sf = torch.full((16 * width + 1,), 127, dtype=torch.uint8, device='cuda')[1:].view(16, width)
+    if width == 4:
+        with pytest.raises(RuntimeError, match='scale storage offset must be aligned to 2 bytes'):
+            dg.preprocess_mxfp4_scales(sf)
+    else:
+        actual = dg.preprocess_mxfp4_scales(sf)
+        torch.testing.assert_close(actual, dg.preprocess_mxfp4_scales(sf.clone()), rtol=0, atol=0)
+    assert dg.preprocess_mxfp4_scales(sf.clone()).dtype == torch.uint16

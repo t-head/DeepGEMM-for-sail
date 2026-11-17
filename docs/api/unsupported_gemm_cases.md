@@ -17,3 +17,4 @@ Bug numbers refer to the DeepGEMM correctness review in ppu-kernel-quirks.
 | 19 | FP4 masked requires enable_sbo_overlap=False. | Completion signaling is not implemented in either its standard or dynamic path. |
 | 20 | Blockwise FP8 masked rejects SBO when its selected short-K kernel expands N fourfold. | Its completion count does not match the advertised threshold. |
 | 22 | Dynamic A8W8 masked requires N divisible by 256 when K>2048. | Its expanded scheduling drops a partial N tile. Disable dynamic tiling to use the static path for such shapes. |
+| 23 | MXFP4 scales must have an even byte storage offset when reinterpreted as uint16. | Clone an odd-offset contiguous view. Padding an odd scale width already produces aligned storage. |
