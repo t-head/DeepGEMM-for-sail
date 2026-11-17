@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **FP4 bias layout**: reject noncontiguous bias views before the fixed-stride
+  dense or grouped epilogue can read unrelated values.
 - **MXFP4 scale offset diagnostics**: explicitly reject an odd byte offset
   before uint16 packing and explain that cloning the view provides aligned storage.
 - **Dynamic masked N tails**: reject unsupported A8W8 K>2048, N%256!=0

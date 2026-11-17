@@ -204,3 +204,13 @@ def test_bug23_fp4_scale_offset(width):
         actual = dg.preprocess_mxfp4_scales(sf)
         torch.testing.assert_close(actual, dg.preprocess_mxfp4_scales(sf.clone()), rtol=0, atol=0)
     assert dg.preprocess_mxfp4_scales(sf.clone()).dtype == torch.uint16
+
+
+def test_bug24_fp4_bias_view():
+    a = torch.full((16, 64), 0x22, dtype=torch.uint8, device='cuda')
+    b = torch.full((128, 64), 0x22, dtype=torch.uint8, device='cuda')
+    sa = torch.full((16, 4), 127, dtype=torch.uint8, device='cuda')
+    sb = torch.full((128, 4), 127, dtype=torch.uint8, device='cuda')
+    bias = torch.ones((128, 2), dtype=torch.float32, device='cuda')[:, 0]
+    out = torch.full((16, 128), -123, dtype=torch.bfloat16, device='cuda')
+    reject(lambda: dg.fp4_gemm_nt((a, sa), (b, sb), bias, out), 'FP4 bias must be contiguous', out)

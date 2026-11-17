@@ -329,6 +329,8 @@ void fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                  const std::string& compiled_dims,
                  const bool disable_ue8m0_cast,
                  std::optional<ConfigTuple> configs = std::nullopt) {
+    TORCH_CHECK(!bias.has_value() || !bias->defined() || bias->numel() == 0 || bias->is_contiguous(),
+                "FP4 bias must be contiguous: the epilogue uses a fixed unit column stride");
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
@@ -1137,6 +1139,8 @@ static void m_grouped_fp4_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Te
                                         std::optional<ConfigTuple> configs = std::nullopt,
                                         std::optional<std::string> activation_type = std::nullopt) {
 
+    TORCH_CHECK(!bias.has_value() || !bias->defined() || bias->numel() == 0 || bias->is_contiguous(),
+                "FP4 bias must be contiguous: the epilogue uses a fixed unit column stride");
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
@@ -1540,6 +1544,8 @@ static std::pair<int, int> m_grouped_fp4_gemm_nt_masked(const std::pair<torch::T
 
     TORCH_CHECK(!enable_sbo_overlap.value_or(false),
                 "FP4 masked SBO overlap is unsupported: the kernel does not publish completion signals");
+    TORCH_CHECK(!bias.has_value() || !bias->defined() || bias->numel() == 0 || bias->is_contiguous(),
+                "FP4 bias must be contiguous: the epilogue uses a fixed unit column stride");
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
