@@ -157,14 +157,13 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
 struct BFOutFrozenSpec {
     int m, splits, grid, block, smem;
     bool mma_reuse;
-    const char* id;
     const char* code;
 };
 static const BFOutFrozenSpec* bfout_frozen_spec(int m) {
     switch (m) {
         case 8: {
             static const BFOutFrozenSpec spec{8, 1, 48, 64, 65536,
-                true, "3f47a47de103fa4e37f0", R"BFOUT(#define DG_BFOUT_CTA_K 0
+                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
 #define DG_BFOUT_ONE_TILE 0
@@ -202,7 +201,7 @@ __global__ void bfout_candidate(Kernel::Params p) {
         }
         case 16: {
             static const BFOutFrozenSpec spec{16, 1, 48, 64, 65536,
-                false, "27d5c202de64d79a8674", R"BFOUT(#define DG_BFOUT_CTA_K 0
+                false, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
 #define DG_BFOUT_ONE_TILE 0
@@ -240,7 +239,7 @@ __global__ void bfout_candidate(Kernel::Params p) {
         }
         case 128: {
             static const BFOutFrozenSpec spec{128, 1, 36, 192, 143360,
-                true, "3161c920ed3c2eda7f28", R"BFOUT(#define DG_BFOUT_CTA_K 0
+                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
 #define DG_BFOUT_ONE_TILE 1
@@ -278,7 +277,7 @@ __global__ void bfout_candidate(Kernel::Params p) {
         }
         case 256: {
             static const BFOutFrozenSpec spec{256, 1, 36, 256, 245760,
-                false, "b5940ae48e2daaa600f3", R"BFOUT(#define DG_BFOUT_CTA_K 1
+                false, R"BFOUT(#define DG_BFOUT_CTA_K 1
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
 #define DG_BFOUT_ONE_TILE 1
@@ -316,7 +315,7 @@ __global__ void bfout_candidate(Kernel::Params p) {
         }
         case 512: {
             static const BFOutFrozenSpec spec{512, 1, 36, 256, 143360,
-                true, "87c8870423f9e446677d", R"BFOUT(#define DG_BFOUT_CTA_K 0
+                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
 #define DG_BFOUT_ONE_TILE 1
@@ -354,7 +353,7 @@ __global__ void bfout_candidate(Kernel::Params p) {
         }
         case 1024: {
             static const BFOutFrozenSpec spec{1024, 1, 36, 256, 163840,
-                true, "c7b620bb4991314a22fd", R"BFOUT(#define DG_BFOUT_CTA_K 0
+                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
 #define DG_BFOUT_ONE_TILE 1
@@ -392,7 +391,7 @@ __global__ void bfout_candidate(Kernel::Params p) {
         }
         case 2048: {
             static const BFOutFrozenSpec spec{2048, 1, 32, 512, 229376,
-                true, "073f040b4e5b3027f3d6", R"BFOUT(#define DG_BFOUT_CTA_K 0
+                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
 #define DG_BFOUT_ONE_TILE 0
@@ -430,7 +429,7 @@ __global__ void bfout_candidate(Kernel::Params p) {
         }
         case 4096: {
             static const BFOutFrozenSpec spec{4096, 1, 39, 512, 221184,
-                true, "eee79e7ddf8385f874a7", R"BFOUT(#define DG_BFOUT_CTA_K 0
+                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
 #define DG_BFOUT_ONE_TILE 0
@@ -468,7 +467,7 @@ __global__ void bfout_candidate(Kernel::Params p) {
         }
         case 8192: {
             static const BFOutFrozenSpec spec{8192, 1, 39, 512, 221184,
-                true, "7a6dffa5862ce7f3b12d", R"BFOUT(#define DG_DUAL_B_K_ORDER 1
+                true, R"BFOUT(#define DG_DUAL_B_K_ORDER 1
 #define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
 #define DG_BFOUT_PACKED_STORE 1
@@ -507,7 +506,7 @@ __global__ void bfout_candidate(Kernel::Params p) {
         }
         case 16384: {
             static const BFOutFrozenSpec spec{16384, 1, 39, 512, 262144,
-                true, "c558a75f4634c5f00cd1", R"BFOUT(#define DG_DUAL_B_STATIC_STAGES 1
+                true, R"BFOUT(#define DG_DUAL_B_STATIC_STAGES 1
 #define DG_DUAL_B_K_ORDER 6
 #define DG_BFOUT_CTA_K 0
 #define DG_BFOUT_PARTIAL 0
@@ -625,8 +624,8 @@ static void bfout_launch_frozen(const BFOutFrozenSpec& spec, const torch::Tensor
         }
     }
     if (const char* log = std::getenv("show_log"); log && isdigit(*log)) {
-        printf("bfout_frozen:id=%s,M=%d,N=%d,K=%d,grid=%d,block=%d,smem=%d,splits=%d,mma_reuse=%d,workspace=%lld\n",
-            spec.id, m, n, k, spec.grid, spec.block, spec.smem, spec.splits, int(spec.mma_reuse),
+        printf("bfout_frozen:M=%d,N=%d,K=%d,grid=%d,block=%d,smem=%d,splits=%d,mma_reuse=%d,workspace=%lld\n",
+            m, n, k, spec.grid, spec.block, spec.smem, spec.splits, int(spec.mma_reuse),
             spec.splits > 1 ? int64_t(spec.splits) * 8 * m * n : int64_t(0));
     }
 }
