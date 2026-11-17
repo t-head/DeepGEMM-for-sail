@@ -302,6 +302,37 @@ void shfl_xor_reduce_wq4(float (&sums)[2][2]) {
             sums[t][r] += __shfl_xor_sync(0xffffffffu, sums[t][r], 1);
 }
 
+// H8 AVG keeps the 16-column MMA tile: each quad lane T contributes heads
+// {2*T, 2*T+1} to both queries, with j=4*q+2*r+h for row r in {G,G+8}.
+// Return one full head sum per lane: query T/2, row T&1. All four lanes
+// must participate before the caller applies query/KV bounds or stores.
+template <typename AccTensor>
+__forceinline__ __device__
+__ppu_bfloat16 bf16_epilogue_reduce_wq2(const AccTensor& accum, int m, uint32_t lane_idx) {
+    const uint32_t row = lane_idx & 1;
+    const uint32_t query = (lane_idx % 4) / 2;
+    // Keep packed rows in scalars to avoid local-memory array indexing.
+    // Round each ReLU result before the pair/xor1/xor2 BF16 addition tree.
+    uint32_t a0 = tix::cvt_rte_bf16x2_f32_relu(accum(4, m, 0), accum(0, m, 0));
+    uint32_t b0 = tix::cvt_rte_bf16x2_f32_relu(accum(5, m, 0), accum(1, m, 0));
+    const __ppu_bfloat162 pair0 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(a0),
+                                       reinterpret_cast<__ppu_bfloat162&>(b0));
+    const uint32_t row0 = reinterpret_cast<const uint32_t&>(pair0);
+    uint32_t a1 = tix::cvt_rte_bf16x2_f32_relu(accum(6, m, 0), accum(2, m, 0));
+    uint32_t b1 = tix::cvt_rte_bf16x2_f32_relu(accum(7, m, 0), accum(3, m, 0));
+    const __ppu_bfloat162 pair1 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(a1),
+                                       reinterpret_cast<__ppu_bfloat162&>(b1));
+    const uint32_t row1 = reinterpret_cast<const uint32_t&>(pair1);
+    const uint32_t mine = row ? row1 : row0;
+    const uint32_t peer = row ? row0 : row1;
+    const uint32_t other_row = __shfl_xor_sync(0xffffffffu, peer, 1);
+    const __ppu_bfloat162 halves = __hadd2(reinterpret_cast<const __ppu_bfloat162&>(mine),
+                                        reinterpret_cast<const __ppu_bfloat162&>(other_row));
+    const uint32_t other_half = __shfl_xor_sync(0xffffffffu, reinterpret_cast<const uint32_t&>(halves), 2);
+    const __ppu_bfloat162 totals = __hadd2(halves, reinterpret_cast<const __ppu_bfloat162&>(other_half));
+    return query ? __high2bfloat16(totals) : __low2bfloat16(totals);
+}
+
 // FP4 fma2 phase: weight access via tCrW tensor (no arch branching)
 template <int kTotalTransforms, typename TCrW>
 __forceinline__ __device__
