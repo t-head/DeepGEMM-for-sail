@@ -1277,6 +1277,8 @@ void m_grouped_bf16_gemm_nt_fused(const torch::Tensor& lhs, const torch::Tensor&
 
     check_fused_moe_weight_offsets(rhs, "m_grouped_bf16_gemm_nt_fused");
     TORCH_CHECK(n % 2 == 0, "fused BF16 epilogue requires even N");
+    TORCH_CHECK(std::get<3>(configs) > 0 && k % std::get<3>(configs) == 0,
+                "fused BF16 requires K divisible by block_k: the A-copy kernel does not mask K tails");
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
         m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(

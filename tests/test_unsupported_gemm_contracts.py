@@ -45,3 +45,14 @@ def test_bug08_fused_bf16_odd_n():
     reject(lambda: dg.m_grouped_bf16_gemm_nt_fused(a, b, out, meta, meta, meta, meta,
                                                   (1, 16, 64, 128, 16, 32, 2)),
            'epilogue requires even N', out)
+
+
+@pytest.mark.parametrize('k', [80, 96])
+def test_bug10_fused_bf16_k_tail(k):
+    a = torch.ones((1, k), dtype=torch.bfloat16, device='cuda')
+    b = torch.ones((2, 64, k), dtype=torch.bfloat16, device='cuda')
+    out = torch.full((1, 64), -123, dtype=torch.bfloat16, device='cuda')
+    meta = torch.zeros(4, dtype=torch.int32, device='cuda')
+    reject(lambda: dg.m_grouped_bf16_gemm_nt_fused(a, b, out, meta, meta, meta, meta,
+                                                  (1, 16, 64, 64, 16, 16, 2)),
+           'A-copy kernel does not mask K tails', out)

@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Fused BF16 K tails**: reject K not divisible by the selected block_k
+  before the unmasked vector copy can read outside A.
 - **Packed BF16 epilogue validation**: reject odd N in quantized dense and
   BF16/INT8/FP8 fused MoE APIs before a packed store can write past output.
 - **Grouped BF16 GEMV validation**: unsupported vector K/stride alignments now
