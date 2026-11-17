@@ -126,3 +126,8 @@ def fused_quantized(kind, k=256):
 def test_bug15_fused_scale_k_tail(kind, k):
     call, out = fused_quantized(kind, k)
     reject(lambda: call((1, 16, 64, 128, 16, 32, 2)), 'scale staging does not support K tails', out)
+
+
+def test_bug16_w4fa16_expanded_n_tail():
+    call, out = w4fa16_call(384, 2, 2)
+    reject(call, 'N divisible by block_n', out)

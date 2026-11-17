@@ -244,6 +244,9 @@ static void m_grouped_gemm_w4a16_common(W4A16Type w4a16_type, GemmType gemm_type
         DG_HOST_ASSERT(is_ppu1v5_device());
         TORCH_CHECK(config.n_expand == 1 || config.num_stages == 2,
                     "W4FA16 MMA N expansion requires num_stages=2");
+        TORCH_CHECK(config.n_expand <= 1 || (config.block_n > 0 &&
+                    n % (static_cast<int64_t>(config.block_n) * config.n_expand) == 0),
+                    "W4FA16 MMA N expansion requires N divisible by block_n*n_expand");
     }
 
     DG_HOST_ASSERT(config.warp_n == 64);

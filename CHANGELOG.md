@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **W4FA16 expanded N tails**: reject configurations that would execute a
+  complete expanded tile beyond the logical output width.
 - **Per-channel fused K tails**: reject INT8/FP8 partial K tiles before the
   kernel can overwrite an active pipeline stage with scales.
 - **MoE routing layout**: reject noncontiguous topk_ids before metadata generation.
