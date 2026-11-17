@@ -13,3 +13,4 @@ Bug numbers refer to the DeepGEMM correctness review in ppu-kernel-quirks.
 | 14 | moe_align_block_size requires contiguous topk_ids. | Both routing kernels index the route tensor as a flat contiguous array. |
 | 15 | INT8/per-channel FP8 fused MoE requires K divisible by block_k. | A partial K tile can race with scale staging. |
 | 16 | W4FA16 MMA N expansion requires N divisible by block_n*n_expand. | Expanded full tiles outside N do not have column predicates. |
+| 18 | INT8/FP8 grouped contiguous requires use_psum_layout=False and per-row expert IDs. BF16 supports compact exclusive expert end offsets. | The quantized scheduler does not interpret prefix-sum endpoints. |

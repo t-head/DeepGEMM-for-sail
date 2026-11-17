@@ -131,3 +131,24 @@ def test_bug15_fused_scale_k_tail(kind, k):
 def test_bug16_w4fa16_expanded_n_tail():
     call, out = w4fa16_call(384, 2, 2)
     reject(call, 'N divisible by block_n', out)
+
+
+@pytest.mark.parametrize('kind', ['bf16', 'int8', 'fp8-channel', 'fp8-block'])
+def test_bug18_contiguous_psum(kind):
+    dtype = {'bf16': torch.bfloat16, 'int8': torch.int8}.get(kind, torch.float8_e4m3fn)
+    a = torch.ones((256, 256), device='cuda').to(dtype)
+    b = torch.ones((2, 128, 256), device='cuda').to(dtype)
+    out = torch.full((256, 128), -123, dtype=torch.bfloat16, device='cuda')
+    ids = torch.tensor([128, 256], dtype=torch.int32, device='cuda')
+    if kind == 'bf16':
+        api = dg.m_grouped_bf16_gemm_nt_contiguous
+    else:
+        block = kind == 'fp8-block'
+        a = a, torch.ones((256, 2 if block else 1), device='cuda')
+        b = b, torch.ones((2, 1, 2) if block else (2, 128, 1), device='cuda')
+        api = dg.m_grouped_int8_gemm_nt_contiguous if kind == 'int8' else dg.m_grouped_fp8_gemm_nt_contiguous
+    if kind == 'bf16':
+        api(a, b, out, ids, use_psum_layout=True)
+        torch.testing.assert_close(out, torch.full_like(out, 256), rtol=0, atol=0)
+    else:
+        reject(lambda: api(a, b, out, ids, use_psum_layout=True), 'psum layout is unsupported', out)

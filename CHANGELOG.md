@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Quantized grouped contiguous psum validation**: reject unsupported prefix-sum layouts
+  before they can be interpreted as expert IDs, including FP8 channel fallback.
 - **W4FA16 expanded N tails**: reject configurations that would execute a
   complete expanded tile beyond the logical output width.
 - **Per-channel fused K tails**: reject INT8/FP8 partial K tiles before the

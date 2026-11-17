@@ -408,6 +408,7 @@ void m_grouped_int8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Ten
                                        const bool ensure_zero_padding,
                                        const std::optional<int> expected_m_for_psum_layout,
                                        std::optional<ConfigTuple> configs = std::nullopt) {
+    TORCH_CHECK(!use_psum_layout, "grouped contiguous psum layout is unsupported; pass per-row expert IDs");
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
@@ -685,6 +686,7 @@ void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tens
                                       const bool& ensure_zero_padding,
                                       const std::optional<int>& expected_m_for_psum_layout,
                                       std::optional<ConfigTuple> configs = std::nullopt) {
+    TORCH_CHECK(!use_psum_layout, "grouped contiguous psum layout is unsupported; pass per-row expert IDs");
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;
