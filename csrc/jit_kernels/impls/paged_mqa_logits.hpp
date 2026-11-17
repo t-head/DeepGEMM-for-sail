@@ -371,13 +371,13 @@ static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens
     const bool is_fp4 = get_ppu_arch() == AC_PPU0015 and qk_dtype == torch::kInt8;
     const int head_dim = is_fp4 ? logical_head_dim / 2 : logical_head_dim;
     const int element_size = static_cast<int>(c10::elementSize(qk_dtype));
-    const auto tile = is_fp4 and num_heads != 4 and indices.has_value()
+    const auto tile = is_fp4 and num_heads >= 32 and indices.has_value()
         ? deep_gemm_mqa_common::get_fp4_varlen_tile(num_heads)
         : deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
     const int split_kv = tile.split_kv, tb_per_cu = tile.tb_per_cu;
 
     const int num_blocks = num_sms * tb_per_cu;
-    if (is_fp4 and num_heads != 4 and indices.has_value()) {
+    if (is_fp4 and num_heads >= 32 and indices.has_value()) {
         const int rows = num_blocks + 1 + batch_size;
         // Keep the prefix workspace alive with its opaque metadata owner.
         // A temporary tensor can alias the logits allocation in Graph replay.
@@ -465,13 +465,13 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
                                torch::TensorOptions().dtype(logits_dtype).device(q.device()));
 
     const void* weights_ptr = is_avg ? nullptr : weights.data_ptr();
-    // The kernel pads 4 heads to 16 per warp N tile (BLOCK_N = ceil(next_n/4)*16), so the
-    // host-side smem/thread computations use the same padded geometry.
+    // AVG packs Q/head rows into 16-column warp tiles; match the device padding
+    // when computing shared memory and thread counts.
     int tile_next_n = next_n, tile_num_heads = num_heads;
     if (grouped) tile_next_n = deep_gemm_mqa_common::FP4PagedVarlenConfig::kQueryHeadRows / num_heads;
-    if (num_heads == 4) {
+    if (is_avg) {
         tile_num_heads = 16;
-        tile_next_n = (next_n + 3) / 4;
+        tile_next_n = ceil_div(next_n * num_heads, 16);
     }
     const std::string scale_mode = is_avg ? "deep_gemm::kScaleModeUnity" : "deep_gemm::kScaleModeWeights";
 

@@ -57,7 +57,7 @@ public:
     static constexpr uint32_t kSharedQScaleStages = kGrouped ? 1 : kNumQStages;
     static_assert(!kGrouped || kNextN * kNumHeads == 128, "Invalid grouped Q geometry");
     static constexpr bool kIsAvg = kScaleMode == deep_gemm::kScaleModeUnity;
-    static_assert(!kIsAvg || kNumHeads == 4, "FP4 paged AVG requires 4 heads");
+    static_assert(!kIsAvg || kNumHeads == 4 || kNumHeads == 8, "FP4 paged AVG requires 4 or 8 heads");
     static constexpr int kMmaNumHeads = kIsAvg ? 16 : kNumHeads;
     static constexpr int kQueriesPerWarp = kMmaNumHeads / kNumHeads;
     static constexpr float kInvSqrtHeadDim = 0.08838834764831844f; // 1 / sqrt(128)
@@ -90,7 +90,9 @@ public:
     static constexpr int MaxThreadsPerBlock = kNumMathWarpGroups * size(TiledMma{});
     static constexpr int WarpOnGroup = size(TiledMma{}) / 32;
     static constexpr int MinBlocksPerMultiprocessor = 1;
-    static constexpr bool WarpInterleaving = (MaxThreadsPerBlock == 512) && !kGrouped;
+    // H8's 384-thread tile alternates two six-warp halves.
+    static constexpr bool WarpInterleaving = !kGrouped &&
+        (MaxThreadsPerBlock == 512 || (kIsAvg && kNumHeads == 8 && MaxThreadsPerBlock == 384));
     static_assert(!(WarpInterleaving && kNumQStages == 1), "warp-interleave does not support stage_q = 1");
 
     // A page32 copy fills half a 64-row KV stage. The TSM stage stride must
@@ -234,8 +236,8 @@ public:
         gmem_tiled_copy_weight.desc_.template init<ElementWeights, false, get<0>(TilerWeight{}), get<1>(TilerWeight{})>(
             nullptr, 1, BLOCK_N, StrideSFB{});
         if constexpr (kIsAvg) {
-            // Pad the MMA tile, not the request: next_n=1/5/6 has fewer valid
-            // Q heads and scale words than BLOCK_N. AIU fills the rest with zero.
+            // Pad an incomplete final query group to the MMA tile. AIU fills
+            // the remaining Q heads and scale words with zero.
             gmem_tiled_copy_B.desc_.dim_h = kNextN * kNumHeads;
             gmem_tiled_copy_SFB.desc_.dim_w = kNextN * kNumHeads;
         }
@@ -311,7 +313,7 @@ public:
         int warp_m_idx = local_warp_idx % WarpOnM;
         int warp_n_idx = local_warp_idx / WarpOnM;
         int lane_idx = deep_gemm::tix::get_lane_idx();
-        int warp_group_id = warp_idx / 8;
+        int warp_group_id = warp_idx / (WarpInterleaving ? MaxThreadsPerBlock / 64 : 8);
 
         // Kernel level shared memory storage
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -688,14 +690,16 @@ public:
             copy(smem_tiled_copy_SFA, source(_, m_block, k_block, (kReuseRequest ? smem_pipe_read_kv : smem_pipe_read_kv * request_pack + (kGrouped ? warp_n_idx / output_q_span_cached : 0))), tCrSFA_copy_view(_, m_block, k_block));
         };
 
-        // Reuse each lane's two Q-row output bases across the KV tile's M blocks.
+        // Reuse each lane's Q-row output bases across the KV tile's M blocks.
         static constexpr bool kReuseAvgLogitsBase = kIsAvg && !SPLIT_MBLOCK;
-        ElementLogits* avg_logits_bases[2];
+        static constexpr int kAvgOutputsPerLane = kNumHeads == 8 ? 1 : 2;
+        ElementLogits* avg_logits_bases[kAvgOutputsPerLane];
         auto prepare_avg_logits_tile = [&](uint32_t current_q_idx, uint32_t current_kv_idx) {
             if constexpr (kReuseAvgLogitsBase) {
                 #pragma unroll
-                for (int t = 0; t < 2; ++t) {
-                    const uint32_t token = warp_n_idx * kQueriesPerWarp + 2 * t + (lane_idx % 4) / 2;
+                for (int t = 0; t < kAvgOutputsPerLane; ++t) {
+                    const uint32_t token = warp_n_idx * kQueriesPerWarp +
+                        (kNumHeads == 8 ? (lane_idx % 4) / 2 : 2 * t + (lane_idx % 4) / 2);
                     const bool valid_token = token < kNextN;
                     // Padded Q lanes retain an in-allocation base; the original
                     // output guard remains below, after the full-mask shuffle.
@@ -713,7 +717,24 @@ public:
             static constexpr int kNumAccumPerMma = size<0>(accum);
 
             int m = m_block;
-            if constexpr (kIsAvg) {
+            if constexpr (kIsAvg && kNumHeads == 8) {
+                CUTE_STATIC_ASSERT(MmaIterN == 1 && kQueriesPerWarp == 2);
+                const uint32_t token = warp_n_idx * kQueriesPerWarp + (lane_idx % 4) / 2;
+                static_assert(cute::is_same_v<ElementLogits, __ppu_bfloat16>, "H8 AVG requires BF16 output");
+                const ElementLogits value = __hmul(deep_gemm::bf16_epilogue_reduce_wq2(accum, m, lane_idx),
+                                                   (__ppu_bfloat16)kInvSqrtHeadDim);
+                // The quad owns two queries x two KV rows, exactly once each.
+                // Keep the full-mask head reduction above the padded-query guard.
+                if (token < kNextN) {
+                    if constexpr (kReuseAvgLogitsBase) {
+                        avg_logits_bases[0][m * InstM] = value;
+                    } else {
+                        const auto logits_q_offset = (q_idx * kNextN + token) * params.logits_stride;
+                        const uint32_t logits_kv_offset = kv_idx * BLOCK_KV + warp_offset + m * InstM + v_offset_mine;
+                        params.logits[logits_q_offset + logits_kv_offset] = value;
+                    }
+                }
+            } else if constexpr (kIsAvg) {
                 CUTE_STATIC_ASSERT(MmaIterN == 1 && kQueriesPerWarp == 4);
                 const uint32_t lane_in_quad = lane_idx % 4;
                 const uint32_t token_base = warp_n_idx * kQueriesPerWarp;

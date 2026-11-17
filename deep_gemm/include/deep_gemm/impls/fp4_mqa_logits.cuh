@@ -73,12 +73,14 @@ public:
     static constexpr bool WarpInterleaving = NumThreadsPerCTA == 512;
     // Output ownership and task distribution are independent of M-block grouping.
     static constexpr bool kIsAvg = kScaleMode != deep_gemm::kScaleModeWeights;
+    static_assert(!(kIsAvg && kNumHeads == 8) || (WARP_Q == 2 && MmaIterN == 1),
+                  "H8 AVG requires WARP_QH=16");
     static_assert(!kQOwnerEpilogue ||
                   (kIsAvg && kNumHeads == 4 && WARP_Q == 4 && MmaIterN == 1),
                   "Q-owner requires H4 AVG with WARP_Q=4");
     static_assert(!kBalanceOutputTiles ||
-                  (kIsAvg && kNumHeads == 4 && kNumQStages == 1),
-                  "balanced output tiles require H4 AVG with one Q stage");
+                  (kIsAvg && (kNumHeads == 4 || kNumHeads == 8) && kNumQStages == 1),
+                  "balanced output tiles require H4/H8 AVG with one Q stage");
 
 
     // ── AIU operands for Q/K ────────────────────────────────────────────
@@ -487,7 +489,32 @@ public:
                 auto logits_q_offset = (block_q_idx * BLOCK_Q + warp_q_idx) * params.stride_k;
                 auto logits_kv_offset = kv_offset + mma_offset;
 
-                if constexpr (cute::is_same_v<ElementLogits, float>) {
+                if constexpr (kIsAvg && kNumHeads == 8) {
+                    // Each quad owns two queries and two KV row halves, one output per lane.
+                    const uint32_t local_q = warp_q_idx * WARP_Q + (lane_idx % 4) / 2;
+                    const uint32_t q_idx = block_q_idx * BLOCK_Q + local_q;
+                    const uint32_t kv_idx = kv_offset + mma_offset + v_offset_mine;
+                    float q_scale = 1.0f;
+                    if constexpr (kScaleMode == deep_gemm::kScaleModeQRow)
+                        q_scale = scale_q_row[(lane_idx % 4) / 2];
+                    else if constexpr (kScaleMode == deep_gemm::kScaleModeQScalar)
+                        q_scale = scale_q;
+
+                    static_assert(cute::is_same_v<ElementLogits, __ppu_bfloat16>, "H8 AVG requires BF16 output");
+                    const __ppu_bfloat16 total = deep_gemm::bf16_epilogue_reduce_wq2(accum, m, lane_idx);
+                    const float scale = kInvSqrtHeadDim * q_scale;
+                    const uint32_t scale2 = deep_gemm::tix::cvt_rte_bf16x2_f32(scale, scale);
+                    const ElementLogits value = __hmul(total, __low2bfloat16(reinterpret_cast<const __ppu_bfloat162&>(scale2)));
+                    if (q_idx < static_cast<uint32_t>(params.seq_len_q)) {
+                        if constexpr (kIsCompressedLogits) {
+                            const uint32_t column = kv_idx - seq_k_start[local_q];
+                            if (column < seq_k_end[local_q] - seq_k_start[local_q])
+                                params.logits[q_idx * params.stride_k + column] = value;
+                        } else if (kv_idx < static_cast<uint32_t>(params.seq_len_k)) {
+                            params.logits[q_idx * params.stride_k + kv_idx] = value;
+                        }
+                    }
+                } else if constexpr (cute::is_same_v<ElementLogits, float>) {
                     float v_0, v_1;
                     if constexpr (kScaleMode == deep_gemm::kScaleModeWeights) {
                         deep_gemm::float_epilogue_reduce_tCrW(accum, m, tCrW, v_0, v_1);

@@ -129,6 +129,11 @@ static int get_paged_num_threads(const PagedTile& tile, int next_n) {
 static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_heads, int head_dim, int datasize) {
     DG_HOST_ASSERT(page_kv == 32 or (page_kv > 0 and page_kv % 64 == 0));
     const bool is_fp4 = datasize == 1 and head_dim == 64;
+    if (is_fp4 and num_heads == 8) {
+        DG_HOST_ASSERT(next_n >= 1 and next_n <= 6);
+        // H8 packs two queries into each 16-column warp tile.
+        return {2, 3, 256, 64, false, next_n <= 4 ? 4 : 3};
+    }
     constexpr int weights_size = 4, logits_size = 4;
 
     const auto& calc_smem = [&](int split_kv, int stage_q, int stage_k) {
@@ -381,15 +386,18 @@ static MqaLogitsConfig get_fp4_avg_configs(int seq_len_q, int seq_len_k,
     return config;
 }
 
-// The public API reserves H4 for AVG and validates FP4 packed head_dim == 64.
+// The public API validates AVG head counts and FP4 packed head_dim == 64.
 // Reuse the host's scale mode; no duplicate AVG/scale/dimension flags are needed.
 static MqaLogitsConfig get_best_configs(torch::ScalarType qk_dtype, int seq_len_q, int seq_len_k,
                                        int num_heads, torch::ScalarType logits_dtype,
                                        bool is_fp4, int num_sms, bool is_compressed,
                                        QScaleMode scale_mode) {
     DG_HOST_ASSERT(num_sms > 0);
-    const bool is_avg = num_heads == 4;
+    const bool is_avg = scale_mode != kScaleModeWeights;
     if (is_avg) {
+        // One H8 geometry for all Q-scale modes and output dtypes.
+        if (is_fp4 and num_heads == 8)
+            return {8, 64, 256, 16, 64, 1, 3, 2, false, seq_len_k >= 1024};
         if (is_fp4)
             return get_fp4_avg_configs(seq_len_q, seq_len_k, logits_dtype, num_sms,
                                        is_compressed, scale_mode);
