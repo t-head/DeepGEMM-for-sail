@@ -79,3 +79,19 @@ def test_bug11_einsum_b_scale_view(expr):
     out = torch.full((16, 2, 256) if expr.endswith('bhd') else (2, 16, 256),
                      -123, dtype=torch.bfloat16, device='cuda')
     reject(lambda: dg.fp8_einsum(expr, (a, sa), (b, sb), out), 'contiguous rhs_scales', out)
+
+
+def w4fa16_call(n, stages, expand):
+    a = torch.ones((16, 128), dtype=torch.bfloat16, device='cuda')
+    b = torch.full((1, n, 64), 0x22, dtype=torch.uint8, device='cuda')
+    sb = torch.full((1, n // 64, 256), 127, dtype=torch.uint8, device='cuda')
+    out = torch.full((16, n), -123, dtype=torch.bfloat16, device='cuda')
+    ids = torch.zeros(16, dtype=torch.int32, device='cuda')
+    rows = torch.full((1,), 16, dtype=torch.int32, device='cuda')
+    return (lambda: dg.m_grouped_gemm_w4a16_nopad(a, (b, sb), out, ids, rows,
+                                                 (1, 16, 128, 128, 16, 64, 128, stages, expand))), out
+
+
+def test_bug12_w4fa16_expanded_pipeline():
+    call, out = w4fa16_call(256, 3, 2)
+    reject(call, 'N expansion requires num_stages=2', out)

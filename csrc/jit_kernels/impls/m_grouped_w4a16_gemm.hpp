@@ -242,6 +242,8 @@ static void m_grouped_gemm_w4a16_common(W4A16Type w4a16_type, GemmType gemm_type
     if (is_mma) {
         // w4fa16_mma is only supported on PPU1.5
         DG_HOST_ASSERT(is_ppu1v5_device());
+        TORCH_CHECK(config.n_expand == 1 || config.num_stages == 2,
+                    "W4FA16 MMA N expansion requires num_stages=2");
     }
 
     DG_HOST_ASSERT(config.warp_n == 64);
