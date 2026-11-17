@@ -253,19 +253,6 @@ torch::Tensor bf16xfp32_gemm_nt(const torch::Tensor& x,
     return out;
 }
 
-// Legacy zero-initialized int32 workspace allocator, independent of GEMM.
-// Shape contract: [ceil(max_tokens / 16), ceil(n / 64)]. Internal K
-// partitioning reduces inside the CTA; GEMM accepts no external workspace.
-torch::Tensor get_gemm_bf16xfp32_workspace(const int64_t& max_weight_hidden_size,
-                                          const int64_t& max_tokens = 131072) {
-    constexpr int64_t kMinTileM = 16;
-    constexpr int64_t kMinTileN = 64;
-    const int64_t nm_max = (max_tokens + kMinTileM - 1) / kMinTileM;
-    const int64_t nn_max = (max_weight_hidden_size + kMinTileN - 1) / kMinTileN;
-    return torch::zeros({nm_max, nn_max},
-                        torch::TensorOptions().dtype(torch::kInt32).device(at::kCUDA));
-}
-
 void int8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                   const std::pair<torch::Tensor, torch::Tensor>& b,
                   const torch::Tensor& d,
@@ -2070,8 +2057,6 @@ static void register_apis(pybind11::module_& m) {
     m.def("bf16xfp32_gemm_nt", &bf16xfp32_gemm_nt, py::arg("x"), py::arg("w_high"),
           py::arg("w_low"), py::arg("scale"), py::arg("use_fp32_output") = false,
           py::arg("configs") = std::nullopt);
-    m.def("get_gemm_bf16xfp32_workspace", &get_gemm_bf16xfp32_workspace,
-          py::arg("max_weight_hidden_size"), py::arg("max_tokens") = 131072);
     m.def("k_grouped_bf16_gemm_tn_contiguous", &k_grouped_bf16_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("ks_cpu"), py::arg("grouped_layout"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "mn", py::arg("use_psum_layout") = false,
