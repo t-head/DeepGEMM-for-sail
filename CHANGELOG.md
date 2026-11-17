@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Fused MoE A alignment**: reject continuous views whose base address is
+  not aligned to the vector copy's 16-byte requirement.
 - **Fused blockwise FP8 warp count**: reject single-warp configurations
   that have no B-scale producer.
 - **FP4 bias layout**: reject noncontiguous bias views before the fixed-stride

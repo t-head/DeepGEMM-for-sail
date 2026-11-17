@@ -219,3 +219,19 @@ def test_bug24_fp4_bias_view():
 def test_bug26_fused_fp8_single_warp():
     call, out = fused_quantized('fp8-block')
     reject(lambda: call((1, 16, 32, 128, 16, 32, 2)), 'requires at least two warps', out)
+
+
+@pytest.mark.parametrize('offset', [1, 8])
+def test_bug27_fused_bf16_base_alignment(offset):
+    a = torch.ones(16 * 128 + offset, dtype=torch.bfloat16, device='cuda')[offset:].view(16, 128)
+    b = torch.ones((2, 64, 128), dtype=torch.bfloat16, device='cuda')
+    ids = torch.zeros((16, 1), dtype=torch.int32, device='cuda')
+    cfg, rows, meta, tokens, blocks, *_ = dg.moe_align_block_size(
+        a, b, ids, config=(1, 16, 64, 128, 16, 32, 2))
+    out = torch.full((16, 64), -123, dtype=torch.bfloat16, device='cuda')
+    call = lambda: dg.m_grouped_bf16_gemm_nt_fused(a, b, out, rows, meta, tokens, blocks, cfg)
+    if offset == 1:
+        reject(call, 'lhs base address must be 16-byte aligned', out)
+    else:
+        call()
+        torch.testing.assert_close(out, torch.full_like(out, 128), rtol=0, atol=0)

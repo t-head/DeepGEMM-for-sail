@@ -20,3 +20,4 @@ Bug numbers refer to the DeepGEMM correctness review in ppu-kernel-quirks.
 | 23 | MXFP4 scales must have an even byte storage offset when reinterpreted as uint16. | Clone an odd-offset contiguous view. Padding an odd scale width already produces aligned storage. |
 | 24 | Dense/nopad/masked FP4 bias must be contiguous. | The epilogue uses a fixed unit column stride. |
 | 26 | Blockwise FP8 fused MoE requires at least two warps per CTA. | Warp 1 is the B-scale producer. |
+| 27 | BF16/INT8/FP8/MXFP4 fused MoE requires a 16-byte-aligned A base address. | Logical contiguity alone does not guarantee aligned vector loads. |

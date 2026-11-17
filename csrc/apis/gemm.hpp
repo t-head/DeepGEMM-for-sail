@@ -1283,6 +1283,8 @@ void m_grouped_bf16_gemm_nt_fused(const torch::Tensor& lhs, const torch::Tensor&
     DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
     check_fused_moe_weight_offsets(rhs, "m_grouped_bf16_gemm_nt_fused");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(lhs.data_ptr()) % 16 == 0,
+                "fused MoE lhs base address must be 16-byte aligned for vector copies");
     TORCH_CHECK(n % 2 == 0, "fused BF16 epilogue requires even N");
     TORCH_CHECK(std::get<3>(configs) > 0 && k % std::get<3>(configs) == 0,
                 "fused BF16 requires K divisible by block_k: the A-copy kernel does not mask K tails");
@@ -1331,6 +1333,8 @@ void m_grouped_fp8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& 
     DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
     check_fused_moe_weight_offsets(rhs, "m_grouped_fp8_gemm_nt_fused");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(lhs.data_ptr()) % 16 == 0,
+                "fused MoE lhs base address must be 16-byte aligned for vector copies");
     TORCH_CHECK(n % 2 == 0, "fused BF16 epilogue requires even N");
     const auto arch_major = device_runtime->get_arch_major();
 
@@ -1410,6 +1414,8 @@ void m_grouped_int8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>&
     DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
     check_fused_moe_weight_offsets(rhs, "m_grouped_int8_gemm_nt_fused");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(lhs.data_ptr()) % 16 == 0,
+                "fused MoE lhs base address must be 16-byte aligned for vector copies");
     TORCH_CHECK(n % 2 == 0, "fused BF16 epilogue requires even N");
     TORCH_CHECK(std::get<3>(configs) > 0 && k % std::get<3>(configs) == 0,
                 "per-channel fused MoE requires K divisible by block_k: scale staging does not support K tails");
@@ -1462,6 +1468,8 @@ void m_grouped_fp4_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& 
     TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
     check_fused_moe_weight_offsets(rhs, "m_grouped_fp4_gemm_nt_fused");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(lhs.data_ptr()) % 16 == 0,
+                "fused MoE lhs base address must be 16-byte aligned for vector copies");
     const auto expected_lhs_scales_k = ceil_div(ceil_div(k, 16), 2);
     const auto expected_lhs_scales_shape = std::vector<int64_t>{num_token, expected_lhs_scales_k};
     TORCH_CHECK(
