@@ -10,7 +10,6 @@ API under test:
                              use_fp32_output=False)            # convenience wrapper
     deep_gemm.bf16xfp32_gemm_nt(x, w_high, w_low, scale,
                                 use_fp32_output, configs=None) # native API
-    deep_gemm.get_gemm_bf16xfp32_workspace(n)                 # legacy workspace
 
 Documented contract (see csrc/apis/gemm.hpp):
     x          : BF16, row-major [m, k]
@@ -140,16 +139,6 @@ def test_gemm_bf16xfp32_router_decode(m, use_fp32_output, api):
 def test_gemm_bf16xfp32_router_prefill(m, use_fp32_output, api):
     """Cover all eight prefill shapes without turning UT into a timing test."""
     _check_bf16xfp32_router_case(m, use_fp32_output, api)
-
-
-def test_gemm_bf16xfp32_workspace_shape():
-    """Workspace contract: [ceil(max_tokens / 16), ceil(n / 64)] int32 zeros."""
-    if not torch.cuda.is_available():
-        pytest.skip("no PPU device available")
-    ws = deep_gemm.get_gemm_bf16xfp32_workspace(1000, max_tokens=100)
-    assert ws.dtype == torch.int32
-    assert ws.shape == (7, 16)  # ceil(100/16)=7, ceil(1000/64)=16
-    assert (ws == 0).all()
 
 
 def test_gemm_bf16xfp32_rejects_invalid_inputs():

@@ -56,9 +56,8 @@ from ._C import (
     m_grouped_bf16_gemm_nt_masked,
     m_grouped_bf16_gemm_nt_nopad,
     m_grouped_bf16_gemm_nt_fused,
-    # BF16 x FP32 GEMM (native API and legacy workspace helper)
+    # BF16 x FP32 GEMM
     bf16xfp32_gemm_nt,
-    get_gemm_bf16xfp32_workspace,
     # INT8 GEMMs
     int8_gemm_nt,
     m_grouped_int8_gemm_nt_contiguous,
