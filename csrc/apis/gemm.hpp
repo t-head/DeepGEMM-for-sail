@@ -193,6 +193,7 @@ void int8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                   const std::string& compiled_dims,
                   std::optional<ConfigTuple> configs = std::nullopt) {
     TORCH_CHECK(!c.has_value(), "int8_gemm_nt does not support C accumulation; pass c=None");
+    TORCH_CHECK(b.first.size(-2) % 2 == 0, "quantized dense BF16 epilogue requires even N");
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
     check_major_type_cd(d);
@@ -232,6 +233,7 @@ void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                  const bool disable_ue8m0_cast,
                  std::optional<ConfigTuple> configs = std::nullopt) {
     TORCH_CHECK(!c.has_value(), "fp8_gemm_nt does not support C accumulation; pass c=None");
+    TORCH_CHECK(b.first.size(-2) % 2 == 0, "quantized dense BF16 epilogue requires even N");
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
     if (fp8_requires_k_major()) {
@@ -1274,6 +1276,7 @@ void m_grouped_bf16_gemm_nt_fused(const torch::Tensor& lhs, const torch::Tensor&
     DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
     check_fused_moe_weight_offsets(rhs, "m_grouped_bf16_gemm_nt_fused");
+    TORCH_CHECK(n % 2 == 0, "fused BF16 epilogue requires even N");
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
         m_grouped_gemm_bf16_bf16_bf16_nt_fused_impl(
@@ -1319,6 +1322,7 @@ void m_grouped_fp8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>& 
     DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
     check_fused_moe_weight_offsets(rhs, "m_grouped_fp8_gemm_nt_fused");
+    TORCH_CHECK(n % 2 == 0, "fused BF16 epilogue requires even N");
     const auto arch_major = device_runtime->get_arch_major();
 
     // Select per-channel quantization when each token and each expert output channel has one scale.
@@ -1391,6 +1395,7 @@ void m_grouped_int8_gemm_nt_fused(const std::pair<torch::Tensor, torch::Tensor>&
     DG_HOST_ASSERT(num_token > 0 && m_sum % num_token == 0);
 
     check_fused_moe_weight_offsets(rhs, "m_grouped_int8_gemm_nt_fused");
+    TORCH_CHECK(n % 2 == 0, "fused BF16 epilogue requires even N");
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
         m_grouped_gemm_perchannel_nt_fused_impl(

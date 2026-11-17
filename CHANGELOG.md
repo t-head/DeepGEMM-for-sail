@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Packed BF16 epilogue validation**: reject odd N in quantized dense and
+  BF16/INT8/FP8 fused MoE APIs before a packed store can write past output.
 - **Grouped BF16 GEMV validation**: unsupported vector K/stride alignments now
   raise host errors instead of silently returning an unwritten output.
 - **Fused MoE weight offsets**: BF16, INT8, FP8 and MXFP4 fused GEMMs reject
