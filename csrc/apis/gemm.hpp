@@ -397,6 +397,11 @@ void fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     }
 }
 
+static void zero_grouped_padding(const torch::Tensor& out, const torch::Tensor& indices, bool ensure_zero_padding) {
+    if (ensure_zero_padding && !is_compile_only() && out.numel() != 0)
+        out.masked_fill_(indices.lt(0).unsqueeze(1), 0);
+}
+
 void m_grouped_int8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
                                        const std::pair<torch::Tensor, torch::Tensor>& b,
                                        const torch::Tensor& d,
@@ -452,6 +457,7 @@ void m_grouped_int8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Ten
     if (arch_major == 8) {
         m_grouped_gemm_int8_int8_bf16_nt_contiguous_impl(lhs, lhs_scales, rhs, rhs_scales, d, m_indices, m, n, k,
                                                          num_groups, configs);
+        zero_grouped_padding(d, m_indices, ensure_zero_padding);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -712,7 +718,7 @@ void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tens
         if (arch_major == 8) {
             return m_grouped_int8_gemm_nt_contiguous(a, b, d, m_indices,
                                                      std::nullopt, std::nullopt, std::nullopt,
-                                                     compiled_dims, false, false, true, std::nullopt,
+                                                     compiled_dims, false, false, ensure_zero_padding, std::nullopt,
                                                      configs);
         } else {
             DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -752,6 +758,7 @@ void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tens
     if (arch_major == 8) {
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_impl(lhs, lhs_scales, rhs, rhs_scales, d, m_indices, m, n, k, num_groups,
                                                        configs);
+        zero_grouped_padding(d, m_indices, ensure_zero_padding);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -1034,6 +1041,8 @@ void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& lhs, const torch::Te
     if (arch_major == 8) {
         m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(
             lhs, rhs, out, m_indices, m, n, k, num_groups, configs, c, use_psum_layout);
+        if (!use_psum_layout)
+            zero_grouped_padding(out, m_indices, ensure_zero_padding);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

@@ -147,6 +147,61 @@ def test_bug16_w4fa16_expanded_n_tail():
 
 
 @pytest.mark.parametrize('kind', ['bf16', 'int8', 'fp8-channel', 'fp8-block'])
+@pytest.mark.parametrize('clear_padding', [False, True])
+def test_bug17_contiguous_padding(kind, clear_padding):
+    dtype = {'bf16': torch.bfloat16, 'int8': torch.int8}.get(kind, torch.float8_e4m3fn)
+    a = torch.ones((256, 256), device='cuda').to(dtype)
+    b = torch.ones((2, 128, 256), device='cuda')
+    b[1].fill_(2)
+    b = b.to(dtype)
+    ids = torch.full((256,), -1, dtype=torch.int32, device='cuda')
+    ids[0], ids[128] = 0, 1
+    out = torch.full((256, 128), -123, dtype=torch.bfloat16, device='cuda')
+    if kind == 'bf16':
+        api = dg.m_grouped_bf16_gemm_nt_contiguous
+    else:
+        block = kind == 'fp8-block'
+        a = a, torch.ones((256, 2 if block else 1), device='cuda')
+        b = b, torch.ones((2, 1, 2) if block else (2, 128, 1), device='cuda')
+        api = dg.m_grouped_int8_gemm_nt_contiguous if kind == 'int8' else dg.m_grouped_fp8_gemm_nt_contiguous
+    api(a, b, out, ids, ensure_zero_padding=clear_padding)
+    torch.testing.assert_close(out[0], torch.full_like(out[0], 256), rtol=0, atol=0)
+    torch.testing.assert_close(out[128], torch.full_like(out[128], 512), rtol=0, atol=0)
+    if clear_padding:
+        assert torch.count_nonzero(out[ids < 0]).item() == 0
+    else:
+        assert torch.count_nonzero(out[ids < 0]).item() == 254 * 128
+    before = out.clone()
+    old_mode = dg.get_compile_mode()
+    try:
+        dg.set_compile_mode(1)
+        api(a, b, out, ids, ensure_zero_padding=True)
+    finally:
+        dg.set_compile_mode(old_mode)
+    torch.testing.assert_close(out, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('alias', [False, True])
+@pytest.mark.parametrize('clear_padding', [False, True])
+def test_bug17_bf16_accumulation_padding(alias, clear_padding):
+    a = torch.ones((512, 256), dtype=torch.bfloat16, device='cuda')
+    b = torch.ones((2, 128, 256), dtype=torch.bfloat16, device='cuda')
+    b[1].fill_(2)
+    ids = torch.full((512,), -1, dtype=torch.int32, device='cuda')
+    ids[0], ids[256] = 0, 1
+    out = torch.full((512, 128), 7, dtype=torch.bfloat16, device='cuda')
+    c = out if alias else out.clone()
+    dg.m_grouped_bf16_gemm_nt_contiguous(a, b, out, ids, c=c,
+                                        ensure_zero_padding=clear_padding)
+    torch.testing.assert_close(out[0], torch.full_like(out[0], 263), rtol=0, atol=0)
+    torch.testing.assert_close(out[256], torch.full_like(out[256], 519), rtol=0, atol=0)
+    if clear_padding:
+        assert torch.count_nonzero(out[ids < 0]).item() == 0
+    if not alias:
+        torch.testing.assert_close(c, torch.full_like(c, 7), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('kind', ['bf16', 'int8', 'fp8-channel', 'fp8-block'])
 def test_bug18_contiguous_psum(kind):
     dtype = {'bf16': torch.bfloat16, 'int8': torch.int8}.get(kind, torch.float8_e4m3fn)
     a = torch.ones((256, 256), device='cuda').to(dtype)

@@ -201,7 +201,8 @@ def check_wide_padded_experts():
     ids[128:256] = 0
     ids[256:] = 1
     d = torch.full((319, 256), 16, device="cuda", dtype=torch.bfloat16)
-    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, ids, c=d, configs=wide)
+    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+        a, b, d, ids, c=d, configs=wide, ensure_zero_padding=False)
     assert (d[:128] == 16).all() and (d[128:256] == 208).all() and (d[256:] == 400).all()
 
 
@@ -265,7 +266,8 @@ def run_grouped_accumulation_regression(check=True):
     indices[:128] = -1
     for config in (tile, mixed_tile):
         d = torch.full((256, 256), 5, device="cuda", dtype=torch.bfloat16)
-        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, indices, c=d, configs=config)
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+            a, b, d, indices, c=d, configs=config, ensure_zero_padding=False)
         if check:
             assert (d[:128] == 5).all() and (d[128:] == 69).all()
 
