@@ -154,6 +154,9 @@ Unsupported inputs/configurations raise host errors; see [810E checkin cases](te
 
 #### Grouped GEMMs (contiguous layout)
 
+See [unsupported GEMM combinations](docs/api/unsupported_gemm_cases.md) for
+additional host-checked shape, layout and configuration constraints.
+
 Unlike traditional grouped GEMMs in ACTLIZE, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape.
 
 For training forward passes or inference prefilling, where each expert may process a varying number of tokens, we concatenate these tokens into a single tensor, referred to as the "contiguous" layout. Note that each expert segment must be aligned to the GEMM M block size (`get_m_alignment_for_contiguous_layout()`).

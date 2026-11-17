@@ -403,12 +403,8 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
             dim3 grid = grid_x * grid_y;
             dim3 block = BlockSize;
             // check GEMM_K alignment
-            if (gemmv_args.K % (NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type)) != 0) {
-                printf("K alignment mismatch, K = %d, NUM_UNROLL = %d, ThreadPerN = %d, sizeof(load_atype) = %d, "
-                       "sizeof(src_type) = %d",
-                       gemmv_args.K, NUM_UNROLL, ThreadPerN, sizeof(load_atype), sizeof(src_type));
-                return;
-            }
+            TORCH_CHECK(gemmv_args.K % (NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type)) == 0,
+                        "grouped BF16 GEMV requires K aligned to the selected vector tile");
             auto args = GemvRuntime::Args{.launch_info = {BlockSize, ThreadPerN, NPerThread, NUM_UNROLL, SWZL_SIZE_M,
                                                           SMALL_K, "__ppu_bfloat16", "float", "batched_gemvt_kernel"},
                                           .launch_args = {grid, block, 0},
@@ -443,18 +439,9 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
             int MAX_K = NUM_UNROLL * ThreadPerN * sizeof(load_atype) / sizeof(src_type);
             int MIN_ALIGNMENT = 16 / sizeof(src_type); // for int4 copy
 
-            if (gemmv_args.K > MAX_K) {
-                printf("unsupported K, K = %d, MAX_K = %d, NUM_UNROLL = %d, ThreadPerN = %d, sizeof(load_atype) = %d, "
-                       "sizeof(src_type) = %d",
-                       gemmv_args.K, MAX_K, NUM_UNROLL, ThreadPerN, sizeof(load_atype), sizeof(src_type));
-                return;
-            }
-
-            if (gemmv_args.stride_am % MIN_ALIGNMENT != 0 || gemmv_args.stride_bn % MIN_ALIGNMENT != 0) {
-                printf("unsupported stride, stride_am = %d, stride_bn = %d\n", gemmv_args.stride_am,
-                       gemmv_args.stride_bn);
-                return;
-            }
+            TORCH_CHECK(gemmv_args.K <= MAX_K, "grouped BF16 GEMV K exceeds the selected small-K tile");
+            TORCH_CHECK(gemmv_args.stride_am % MIN_ALIGNMENT == 0 && gemmv_args.stride_bn % MIN_ALIGNMENT == 0,
+                        "grouped BF16 GEMV requires input row strides aligned to 16 bytes");
             dim3 grid = grid_x * grid_y;
             dim3 block = BlockSize;
             auto args =

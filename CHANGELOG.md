@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Grouped BF16 GEMV validation**: unsupported vector K/stride alignments now
+  raise host errors instead of silently returning an unwritten output.
 - **Fused MoE weight offsets**: BF16, INT8, FP8 and MXFP4 fused GEMMs reject
   weight shapes whose per-expert stride or last expert base exceeds the kernel's
   uint32 range, before JIT compilation or launch. Device code is unchanged.

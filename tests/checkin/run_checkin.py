@@ -33,6 +33,7 @@ SCRIPT_SUITES = {
         '-m pytest -q -s --disable-warnings -x tests/test_grouped_bf16_gemv_precision.py',
         '-m pytest -q -s --disable-warnings -x tests/test_quantized_dense_accumulation.py',
         '-m pytest -q -s --disable-warnings -x tests/test_fused_moe_weight_offsets.py',
+        '-m pytest -q -s --disable-warnings -x tests/test_unsupported_gemm_contracts.py',
     ],
     'ZW-M890P-MegaMoE': [
         '-m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py',
