@@ -82,6 +82,7 @@ void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         return;
 
     // The PPU blockwise kernel uses a fixed (1, 128, 128) scale recipe.
+    TORCH_CHECK(sfb.is_contiguous(), "blockwise FP8 einsum requires contiguous rhs_scales");
     DG_HOST_ASSERT(recipe == std::make_tuple(1, 128, 128));
     const auto [gran_m, gran_n, gran_k] = recipe.value();
     check_sf_layout(sfa, m, k, gran_m, gran_k, batch_size, false, false, torch::kFloat32);

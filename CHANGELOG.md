@@ -26,6 +26,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **Scale layout validation**: reject noncontiguous A scales in A8W8 nopad
+  and noncontiguous B scales in blockwise FP8 einsum before fixed-stride reads.
 - **Fused BF16 K tails**: reject K not divisible by the selected block_k
   before the unmasked vector copy can read outside A.
 - **Packed BF16 epilogue validation**: reject odd N in quantized dense and

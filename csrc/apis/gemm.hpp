@@ -541,6 +541,7 @@ void m_grouped_int8_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>&
                                   const bool ensure_zero_padding = true,
                                   const std::optional<int> expected_m_for_psum_layout = std::nullopt,
                                   std::optional<ConfigTuple> configs = std::nullopt) {
+    TORCH_CHECK(a.second.is_contiguous(), "grouped A8W8 nopad requires contiguous lhs_scales");
     const auto& lhs = a.first;
     const auto& lhs_scales = a.second;
     const auto& rhs = b.first;

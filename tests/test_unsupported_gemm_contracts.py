@@ -56,3 +56,26 @@ def test_bug10_fused_bf16_k_tail(k):
     reject(lambda: dg.m_grouped_bf16_gemm_nt_fused(a, b, out, meta, meta, meta, meta,
                                                   (1, 16, 64, 64, 16, 16, 2)),
            'A-copy kernel does not mask K tails', out)
+
+
+@pytest.mark.parametrize('dtype', [torch.int8, torch.float8_e4m3fn])
+def test_bug11_grouped_a_scale_view(dtype):
+    a = torch.ones((32, 128), device='cuda').to(dtype)
+    b = torch.ones((2, 128, 128), device='cuda').to(dtype)
+    sa = torch.ones((32, 2), device='cuda')[:, :1]
+    sb = torch.ones((2, 128, 1), device='cuda')
+    out = torch.full((32, 128), -123, dtype=torch.bfloat16, device='cuda')
+    ids = torch.arange(32, dtype=torch.int32, device='cuda') // 16
+    api = dg.m_grouped_int8_gemm_nt_nopad if dtype == torch.int8 else dg.m_grouped_fp8_gemm_nt_nopad
+    reject(lambda: api((a, sa), (b, sb), out, ids), 'contiguous lhs_scales', out)
+
+
+@pytest.mark.parametrize('expr', ['bhr,hdr->bhd', 'bhr,hdr->hbd'])
+def test_bug11_einsum_b_scale_view(expr):
+    a = torch.ones((16, 2, 256), device='cuda').to(torch.float8_e4m3fn)
+    b = torch.ones((2, 256, 256), device='cuda').to(torch.float8_e4m3fn)
+    sa = torch.ones((16, 2, 2), device='cuda')
+    sb = torch.ones((2, 2, 2, 2), device='cuda')[..., 0]
+    out = torch.full((16, 2, 256) if expr.endswith('bhd') else (2, 16, 256),
+                     -123, dtype=torch.bfloat16, device='cuda')
+    reject(lambda: dg.fp8_einsum(expr, (a, sa), (b, sb), out), 'contiguous rhs_scales', out)
