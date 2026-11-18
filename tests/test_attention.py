@@ -837,23 +837,21 @@ class _PagedFP4VarlenCase:
         self.lengths.copy_(torch.tensor(lengths, device='cuda', dtype=torch.int32)[:, None])
         self.table.copy_(torch.tensor(tables, device='cuda', dtype=torch.int32))
 
-    def metadata(self, grouped=True):
+    def metadata(self):
         return deep_gemm.get_paged_mqa_logits_metadata(
             self.lengths, self.page, deep_gemm.get_num_sms(),
-            indices=self.ids if grouped else None,
+            indices=self.ids,
             metadata_extra=(1, self.heads, 128, torch.int8))
 
-    def run(self, grouped=True):
-        meta = self.metadata(grouped)
+    def run(self):
+        meta = self.metadata()
         output = deep_gemm.fp8_fp4_paged_mqa_logits(
             self.q, self.cache, self.weights, self.lengths, self.table, meta,
             self.context, indices=self.ids)
         return meta, output
 
     def check(self, output):
-        _, baseline = self.run(False)
         valid = torch.arange(self.context, device='cuda')[None, :] < self.lengths
-        assert torch.equal(output[valid].view(torch.int16), baseline[valid].view(torch.int16))
         expected = ref_paged_mqa_logits(self.q_ref, self.cache_ref, self.weights,
                                         self.lengths, self.table, self.context)
         diff = calc_diff(output.masked_fill(~valid, 0), expected.masked_fill(~valid, 0))
@@ -868,6 +866,8 @@ def test_paged_fp4_varlen():
         for page in (32, 64, 128):
             case = _PagedFP4VarlenCase(heads, page)
             meta, output = case.run()
+            workers_per_cu = 5 if heads == 32 else 3
+            assert meta.shape == (workers_per_cu * deep_gemm.get_num_sms() + 1, 2)
             case.check(output)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -881,6 +881,37 @@ def test_paged_fp4_varlen():
                 valid = torch.arange(case.context, device='cuda')[None, :] < case.lengths
                 assert torch.isnan(output[~valid]).all(), 'write beyond per-query context'
             if heads == 32 and page == 64:
+                # Four grouped CUs and five legacy CUs both produce 21 rows.
+                saved_num_sms = deep_gemm.get_num_sms()
+                try:
+                    deep_gemm.set_num_sms(4)
+                    stale_meta = case.metadata()
+                    assert stale_meta.shape == (21, 2)
+                    deep_gemm.set_num_sms(5)
+                    try:
+                        deep_gemm.fp8_fp4_paged_mqa_logits(
+                            case.q, case.cache, case.weights, case.lengths, case.table,
+                            stale_meta, case.context, indices=case.ids)
+                    except RuntimeError as error:
+                        assert 'request indices require grouped MXFP4 metadata' in str(error), str(error)
+                    else:
+                        raise AssertionError('grouped metadata from another CU budget must be rejected')
+                finally:
+                    deep_gemm.set_num_sms(saved_num_sms)
+
+                # Like a serving runner, copy into a stable buffer before replay.
+                stable_meta = meta.clone()
+                external_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(external_graph):
+                    external_output = deep_gemm.fp8_fp4_paged_mqa_logits(
+                        case.q, case.cache, case.weights, case.lengths, case.table,
+                        stable_meta, case.context, indices=case.ids)
+                for phase in (0, 1):
+                    case.update(phase)
+                    stable_meta.copy_(case.metadata())
+                    external_graph.replay()
+                    case.check(external_output)
+
                 # One run, all singletons and the zero-work schedule are distinct boundaries.
                 for single in (True, False):
                     if single:
@@ -904,9 +935,10 @@ def test_paged_fp4_varlen():
         meta = deep_gemm.get_paged_mqa_logits_metadata(
             lengths, 64, deep_gemm.get_num_sms(), indices=ids,
             metadata_extra=(1, heads, 128, torch.int8))
-        workers = meta.size(0) - nq - 1
-        starts = meta[:workers + 1].cpu()
-        assert torch.all(starts[:-1, 0] == 0) and starts[-1, 0] == nq // (128 // heads)
+        workers = (5 if heads == 32 else 3) * deep_gemm.get_num_sms()
+        assert meta.shape == (workers + 1, 2)
+        starts = meta.cpu()
+        assert torch.all(starts[:-1, 0] == 0) and starts[-1, 0] == nq
         assert starts[0, 1] == 0 and torch.all(starts[1:workers, 1] > starts[:workers - 1, 1])
         print('PASS grouped FP4 metadata capacity', heads, flush=True)
 

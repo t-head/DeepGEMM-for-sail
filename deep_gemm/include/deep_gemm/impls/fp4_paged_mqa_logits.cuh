@@ -38,7 +38,7 @@ struct FP4PagedArguments {
     ElementLogits* logits;
     const uint32_t* block_table;
     const uint32_t* schedule_meta;
-    const uint32_t* grouped_meta;
+    const uint32_t* indices;
 };
 
 template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights, uint32_t kNextN, uint32_t kNumHeads,
@@ -284,7 +284,9 @@ public:
     template <typename QSpan, typename ReuseKV, typename Valid0, typename Valid1>
     CUTLASS_DEVICE void run_task(Params const& params, char* smem_buf,
                                  uint32_t only_q, uint32_t kv_begin, uint32_t kv_end,
-                                 uint32_t last_q, QSpan, ReuseKV, Valid0, Valid1) {
+                                 uint32_t last_q, QSpan, ReuseKV, Valid0, Valid1,
+                                 deep_gemm::FP4VarlenQBlock first = {},
+                                 deep_gemm::FP4VarlenQBlock second = {}) {
         constexpr uint32_t kFixedQSpan = QSpan::value;
         constexpr bool kReuseRequest = ReuseKV::value;
         constexpr uint32_t kRequestValid0 = Valid0::value, kRequestValid1 = Valid1::value;
@@ -425,17 +427,17 @@ public:
         auto scheduler = [&]() {
             if constexpr (kGrouped)
                 return deep_gemm::FP4SingleGroupScheduler<BLOCK_KV, kNumMathWarpGroups, kNextN>(
-                    only_q, kv_begin, kv_end, reinterpret_cast<const deep_gemm::FP4VarlenQBlock*>(params.grouped_meta)[only_q].context_len,
+                    only_q, kv_begin, kv_end, first.context_len,
                     kReuseRequest ? 1u : kNextN / (kFixedQSpan ? StorageQSpan :
-                        deep_gemm::fp4_varlen_q_span<kNextN>(reinterpret_cast<const deep_gemm::FP4VarlenQBlock*>(params.grouped_meta)[only_q].valid_q)));
+                        deep_gemm::fp4_varlen_q_span<kNextN>(first.valid_q)));
             else
                 return deep_gemm::PagedMQALogitsScheduler<BLOCK_KV, kNumMathWarpGroups, kNextN>(
                     params.batch_size, blockIdx.x, params.context_lens, params.schedule_meta);
         }();
-        const auto group_desc = reinterpret_cast<const deep_gemm::FP4VarlenQBlock*>(params.grouped_meta);
+        const auto group_desc = [&](uint32_t q) { return q == 0 ? first : second; };
         const uint32_t request_pack = [&]() {
             if constexpr (kGrouped && kFixedQSpan) return kNextN / StorageQSpan;
-            else if constexpr (kGrouped) return kNextN / deep_gemm::fp4_varlen_q_span<kNextN>(group_desc[only_q].valid_q);
+            else if constexpr (kGrouped) return kNextN / deep_gemm::fp4_varlen_q_span<kNextN>(first.valid_q);
             else return 1u;
         }();
         const uint32_t pipeline_depth = kNumKVStages / request_pack;
@@ -488,9 +490,9 @@ public:
         // Load Q (packed FP4) + q_sf (e8m0) + weights from gmem to smem
         auto load_q_g2s = [&](QIndex q_key) {
             const uint32_t q_idx = uint32_t(q_key);
-            auto q_offset = (kGrouped ? group_desc[q_idx].source_q : q_idx * kNextN) * kNumHeads;
+            auto q_offset = (kGrouped ? group_desc(q_idx).source_q : q_idx * kNextN) * kNumHeads;
             if constexpr (kGrouped) {
-                const uint32_t rows = group_desc[q_idx].valid_q * kNumHeads;
+                const uint32_t rows = group_desc(q_idx).valid_q * kNumHeads;
                 gmem_tiled_copy_B.desc_.dim_h = rows;
                 gmem_tiled_copy_SFB.desc_.dim_w = rows;
                 gmem_tiled_copy_weight.desc_.dim_w = rows;
@@ -524,7 +526,7 @@ public:
             const uint32_t q_idx = uint32_t(q_key);
             if constexpr (kGrouped) {
                 if (issued_q_idx != q_key) {
-                    const auto d = group_desc[q_idx];
+                    const auto d = group_desc(q_idx);
                     issued_table_row = d.table_row;
                     issued_context = d.context_len;
                     issued_q_span = kFixedQSpan ? StorageQSpan : deep_gemm::fp4_varlen_q_span<kNextN>(d.valid_q);
@@ -617,7 +619,7 @@ public:
             auto q_source = q_copy.partition_S(make_mix_tensor_like(sB));
             auto sf_copy = smem_tiled_copy_SFB.get_slice(q_lane * 32 + lane_idx);
             auto sf_source = sf_copy.partition_S(sSFBTrans);
-            const uint32_t source_q = kGrouped ? (kStaticRequest ? request_source_q : group_desc[q_idx].source_q) : 0;
+            const uint32_t source_q = kGrouped ? (kStaticRequest ? request_source_q : group_desc(q_idx).source_q) : 0;
             copy(smem_tiled_copy_B, q_source(_, _, _, smem_pipe_read_q), tCrB_copy_view);
             if constexpr (kGrouped) {
                 if (smem_pipe_read_q == 0) {
@@ -913,13 +915,13 @@ public:
         auto handle_q_change = [&]() {
             if constexpr (kGrouped) {
                 const uint32_t q = uint32_t(q_idx);
-                output_q_count_cached = kStaticRequest ? request_valid : group_desc[q].valid_q;
+                output_q_count_cached = kStaticRequest ? request_valid : group_desc(q).valid_q;
                 output_q_span_cached = kReuseRequest ? deep_gemm::fp4_varlen_q_span<kNextN>(output_q_count_cached)
                     : (kFixedQSpan ? StorageQSpan : deep_gemm::fp4_varlen_q_span<kNextN>(output_q_count_cached));
                 const uint32_t q_shift = kFixedQSpan ? (StorageQSpan == 4 ? 2 : (StorageQSpan == 2 ? 1 : 0))
                     : deep_gemm::fp4_varlen_q_shift<kNextN>(output_q_count_cached);
                 const uint32_t q_lane = kReuseRequest ? request_q_lane : (FoldSingleQ ? 0 : warp_n_idx & (output_q_span_cached - 1));
-                output_row_cached = (kStaticRequest ? request_source_q : group_desc[q].source_q) + q_lane;
+                output_row_cached = (kStaticRequest ? request_source_q : group_desc(q).source_q) + q_lane;
                 output_valid_cached = q_lane < output_q_count_cached;
                 kv_group_offset_cached = warp_group_idx + (kReuseRequest ? 0 : warp_n_idx >> q_shift) * kNumMathWarpGroups;
                 read_kv_slot_cached = warp_group_idx;
@@ -1065,7 +1067,7 @@ public:
                     for_each(make_int_sequence<decltype(count)::value>{}, body);
                 }
             };
-            const uint32_t source0 = group_desc[only_q].source_q;
+            const uint32_t source0 = first.source_q;
             uint32_t cluster = kv_begin, rotation = 0;
             while (cluster < kv_end) {
                 auto process_q_block = [&](auto qi, auto valid_count, auto blocks) {
@@ -1154,7 +1156,7 @@ public:
                 } else {
                     const uint32_t blocks = last_q - only_q;
                     for (uint32_t qi = 0; qi < blocks; ++qi)
-                        process_q_block(qi, group_desc[only_q + qi].valid_q, blocks);
+                        process_q_block(qi, group_desc(only_q + qi).valid_q, blocks);
                 }
                 cluster += 4 * kNumMathWarpGroups;
                 rotation = (rotation + 1) & 3;
@@ -1240,16 +1242,18 @@ public:
     static constexpr int MaxThreadsPerBlock = Kernel::MaxThreadsPerBlock;
     static constexpr int MinBlocksPerMultiprocessor = WorkersPerCU;
     CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
-        deep_gemm::FP4GroupedPagedScheduler<BQ, Split, BK, WorkersPerCU> scheduler(
+        deep_gemm::FP4GroupedPagedScheduler<BQ, Split, BK, WorkersPerCU> scheduler{
             reinterpret_cast<const deep_gemm::FP4VarlenCTAStart*>(p.schedule_meta),
-            reinterpret_cast<const deep_gemm::FP4VarlenQBlock*>(p.grouped_meta));
+            p.indices, p.context_lens, p.batch_size};
         Kernel op;
         scheduler.for_each_task(
-            [&](uint32_t q, uint32_t begin, uint32_t end, uint32_t last,
-                uint32_t count0, uint32_t count1) {
+            [&](deep_gemm::FP4VarlenQBlock first, deep_gemm::FP4VarlenQBlock second,
+                uint32_t begin, uint32_t end) {
+                const uint32_t count0 = first.valid_q, count1 = second.valid_q;
+                const uint32_t blocks = count1 ? 2 : 1;
                 auto run_request = [&](auto valid0, auto valid1) {
-                    op.run_task(p, smem, q, begin, end, last,
-                                Int<BQ>{}, cute::true_type{}, valid0, valid1);
+                    op.run_task(p, smem, 0, begin, end, blocks,
+                                Int<BQ>{}, cute::true_type{}, valid0, valid1, first, second);
                 };
                 if constexpr (BQ == 4) {
                     if (count0 == 3 && count1 == 0) run_request(Int<3>{}, Int<0>{});
@@ -1258,11 +1262,11 @@ public:
                     else run_request(Int<0>{}, Int<0>{});
                 } else run_request(Int<0>{}, Int<0>{});
             },
-            [&](uint32_t q, uint32_t begin, uint32_t end, uint32_t valid) {
-                const uint32_t span = deep_gemm::fp4_varlen_q_span<BQ>(valid);
+            [&](deep_gemm::FP4VarlenQBlock first, uint32_t begin, uint32_t end) {
+                const uint32_t span = deep_gemm::fp4_varlen_q_span<BQ>(first.valid_q);
                 auto run = [&](auto q_span) {
-                    op.run_task(p, smem, q, begin, end, 0,
-                                q_span, cute::false_type{}, Int<0>{}, Int<0>{});
+                    op.run_task(p, smem, 0, begin, end, 0,
+                                q_span, cute::false_type{}, Int<0>{}, Int<0>{}, first);
                 };
                 if (span == 1) run(Int<1>{});
                 else if (span == 2) run(Int<2>{});
