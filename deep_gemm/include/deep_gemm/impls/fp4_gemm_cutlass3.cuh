@@ -983,3 +983,4 @@ public:
 } // namespace cutlass::gemm::kernel
 
 #include <deep_gemm/impls/fp4_gemm_cutlass3_overlap_prologue.cuh>
+#include <deep_gemm/epilogue/epilogue_no_tsm_swizzle_b.cuh>

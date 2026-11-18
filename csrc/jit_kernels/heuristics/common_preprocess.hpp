@@ -74,7 +74,10 @@ inline const char* preprocess_mode_name(const PreprocessMode& mode) {
 /// W4A8_INT8/W4A8_NVFP4/W4A8_NVFP4_FP8 without it.
 inline PreprocessedWeights preprocess_weights_and_scales(
         const PreprocessMode& mode, bool fuse_activation,
-        const torch::Tensor& weight, const std::optional<const torch::Tensor>& weight_scale) {
+        const torch::Tensor& weight, const std::optional<const torch::Tensor>& weight_scale,
+        bool swizzle_b = false) {
+    TORCH_CHECK(!swizzle_b || mode == PreprocessMode::MXFP4,
+                "swizzle_b is only supported for PreprocessMode::MXFP4");
     if (mode == PreprocessMode::W4A8_NVFP4 || mode == PreprocessMode::W4A8_NVFP4_FP8) {
         TORCH_CHECK(!fuse_activation && weight.defined() && weight_scale.has_value(),
                     "NVFP4 W4A8 preprocessing requires weights/scales and fuse_activation=False");
@@ -220,6 +223,25 @@ inline PreprocessedWeights preprocess_weights_and_scales(
         TORCH_CHECK(weight_scale.has_value(), "MXFP4 requires scales");
         auto weight_out = weight;
         auto scale_out = *weight_scale;
+        if (swizzle_b) {
+            // Offline B-row permutation for coalesced epilogue stores. Within each 16-col MMA atom,
+            // reorder rows so that each lane's scattered fragment columns {2q,2q+1,2q+8,2q+9}
+            // map to contiguous output columns {4q,4q+1,4q+2,4q+3}. The kernel epilogue then writes
+            // one b64 (4 bf16) per lane per atom instead of 2x b32. Output stays in natural order.
+            // Requires m16n16 MMA; type-agnostic (commutes with per-row quantization along K).
+            TORCH_CHECK(!fuse_activation && weight_out.defined() && weight_scale.has_value(),
+                        "swizzle_b requires fuse_activation=False and both weight and scale");
+            DG_HOST_ASSERT(weight_out.dim() == 3 && weight_out.dtype() == torch::kUInt8);
+            const int64_t n = weight_out.size(1);
+            TORCH_CHECK(n % 16 == 0, "swizzle_b requires N % 16 == 0");
+            // perm[c] = destination row within a 16-col atom for source row c.
+            auto options = torch::TensorOptions().dtype(torch::kLong).device(weight_out.device());
+            auto base = torch::tensor({0,1,4,5,8,9,12,13,2,3,6,7,10,11,14,15}, options);
+            auto offsets = torch::arange(0, n, 16, options).unsqueeze(1);
+            auto indices = (offsets + base.unsqueeze(0)).reshape({-1});
+            weight_out = weight_out.index_select(1, indices).contiguous();
+            scale_out = scale_out.index_select(-2, indices).contiguous();
+        }
         if (fuse_activation) {
             DG_HOST_ASSERT(weight.dim() == 3);
             DG_HOST_ASSERT(weight.dtype() == torch::kUInt8);

@@ -19,10 +19,15 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
     std::optional<ConfigTuple> configs = std::nullopt,
     const torch::Tensor& out_scale = torch::Tensor(),
     float swiglu_limit = 0.0f,
-    std::string activation_type = "silu_and_mul") {
+    std::string activation_type = "silu_and_mul",
+    bool swizzle_b = false) {
     // When `out_scale` is provided, silu_and_mul + mxfp4 post-quant are fused into the epilogue.
     const bool enable_act_and_quant_fusing = out_scale.defined() && out_scale.numel() > 0;
     const bool hasBias = bias.numel() > 0;
+    if (swizzle_b) {
+        TORCH_CHECK(!hasBias && !enable_act_and_quant_fusing && n % 16 == 0,
+                    "swizzle_b requires no bias, no fused epilogue, and N % 16 == 0");
+    }
 
     int num_sms = get_num_sms();
     int expected_m = ceil_div(m, num_groups);
@@ -163,7 +168,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
                         n, k, "MGroupedNoPad", kernel_strategy, "fp4_grouped_deep_gemm_nopad",
                         hasBias, n_expand, false,
                         EpilogueTypeS[static_cast<int>(kEpilogueType)],
-                        enable_act_and_quant_fusing && swiglu_limit > 0.0f};
+                        enable_act_and_quant_fusing && swiglu_limit > 0.0f, swizzle_b};
     args.launch_args = {grid, block, SMSIZE};
 
     // Branch exactly like the device-side CollectiveEpilogue conditional in generate_impl:
@@ -243,6 +248,7 @@ static void m_grouped_gemm_fp4_fp4_bf16_nt_nopad_impl(
                                   current_stream());
         dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
         dg_prof_params.add_params("swiglu_limit", swiglu_limit);
+        dg_prof_params.add_params("swizzle_b", swizzle_b);
     }
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
@@ -280,10 +286,15 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
     const torch::Tensor& signal = torch::Tensor(),
     const torch::Tensor& out_scale = torch::Tensor(),
     float swiglu_limit = 0.0f,
-    std::string activation_type = "silu_and_mul") {
+    std::string activation_type = "silu_and_mul",
+    bool swizzle_b = false) {
     // When `out_scale` is provided, silu_and_mul + mxfp4 post-quant are fused into the epilogue.
     const bool enable_act_and_quant_fusing = out_scale.defined() && out_scale.numel() > 0;
     const bool hasBias = bias.numel() > 0;
+    if (swizzle_b) {
+        TORCH_CHECK(!hasBias && !enable_act_and_quant_fusing && n % 16 == 0,
+                    "swizzle_b requires no bias, no fused epilogue, and N % 16 == 0");
+    }
 
     int num_sms = get_num_sms();
 
@@ -392,7 +403,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
         dyn_args.launch_info = {n, k, kNumGroups, dynamic_tile_id, "MGroupedMasked",
                                 "fp4_grouped_deep_gemm_masked_dynamic_tile",
                                 EpilogueTypeS[static_cast<int>(kEpilogueType)],
-                                enable_act_and_quant_fusing && swiglu_limit > 0.0f};
+                                enable_act_and_quant_fusing && swiglu_limit > 0.0f, swizzle_b};
         // The dynamic-tile kernel's block shape is get_block_shape() == MaxThreadsPerBlock, which
         // varies per kDynamicTileId and is unrelated to the fixed 128x128 block config above.
         dim3 const dyn_block = dyn_launch.block_threads;
@@ -459,6 +470,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
                                       grouped_layout, current_stream());
             dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
             dg_prof_params.add_params("swiglu_limit", swiglu_limit);
+            dg_prof_params.add_params("swizzle_b", swizzle_b);
         }
         {
             auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
@@ -484,7 +496,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
                         n, k, "MGroupedMasked", kernel_strategy, "fp4_grouped_deep_gemm_masked",
                         hasBias, n_expand, enable_sbo_overlap,
                         EpilogueTypeS[static_cast<int>(kEpilogueType)],
-                        enable_act_and_quant_fusing && swiglu_limit > 0.0f};
+                        enable_act_and_quant_fusing && swiglu_limit > 0.0f, swizzle_b};
     args.launch_args = {grid, block, SMSIZE};
 
     // Branch exactly like the device-side CollectiveEpilogue conditional in generate_impl:
@@ -564,6 +576,7 @@ static std::pair<int, int> m_grouped_gemm_fp4_fp4_bf16_nt_masked_impl(
                                   current_stream());
         dg_prof_params.add_params("epilogue_type", EpilogueTypeS[static_cast<int>(kEpilogueType)]);
         dg_prof_params.add_params("swiglu_limit", swiglu_limit);
+        dg_prof_params.add_params("swizzle_b", swizzle_b);
     }
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);

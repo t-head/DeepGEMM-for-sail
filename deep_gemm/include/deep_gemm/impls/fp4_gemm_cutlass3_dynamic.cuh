@@ -15,6 +15,7 @@
 #include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/mma/fp4_mma_overlap_prologue.cuh>
 #include <deep_gemm/epilogue/fp4_epilogue_silu_and_mul_post_quant.cuh>
+#include <deep_gemm/epilogue/epilogue_no_tsm_swizzle_b.cuh>
 
 namespace cutlass::gemm {
 
@@ -94,7 +95,8 @@ template <
   bool hasBias = false,
   int N_EXPAND = 1,
   deep_gemm::EpilogueType kEpilogueType = deep_gemm::EpilogueType::Default,
-  bool kApplySwigluLimit = false
+  bool kApplySwigluLimit = false,
+  bool kSwizzleB = false
 >
 struct Fp4TypeBuilder {
   using LayoutA     = cutlass::layout::RowMajor;
@@ -241,10 +243,16 @@ struct Fp4TypeBuilder {
     kEpilogueType
   >;
 
-  using CollectiveEpilogue = typename cutlass::platform::conditional<
+  using CollectiveEpilogueDefault = typename cutlass::platform::conditional<
     is_act_and_quant_fused(kEpilogueType),
     CollectiveEpilogueSiluAndMulPostQuant,
     CollectiveEpilogueNoTsm
+  >::type;
+
+  using CollectiveEpilogue = typename cutlass::platform::conditional<
+    kSwizzleB,
+    cutlass::epilogue::collective::CollectiveEpilogueNoTsmBSwizzled<CollectiveEpilogueNoTsm>,
+    CollectiveEpilogueDefault
   >::type;
 
   struct SharedStorage {
@@ -362,7 +370,8 @@ template <
   int kNumGroups,
   deep_gemm::FP4DynamicTileId kDynamicTileId,
   deep_gemm::EpilogueType kEpilogueType,
-  bool kApplySwigluLimit
+  bool kApplySwigluLimit,
+  bool kSwizzleB = false
 >
 struct Fp4DeepGemmDynamicTile {
 
@@ -375,19 +384,19 @@ struct Fp4DeepGemmDynamicTile {
   using KernelAiuFp4DynamicTile = typename Fp4DynamicTileSelector<kDynamicTileId>::type;
   using Builder0 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
                                   SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 0,
-                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit>;
+                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit, kSwizzleB>;
   using Builder1 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
                                   SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 1,
-                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit>;
+                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit, kSwizzleB>;
   using Builder2 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
                                   SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 2,
-                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit>;
+                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit, kSwizzleB>;
   using Builder3 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
                                   SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 3,
-                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit>;
+                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit, kSwizzleB>;
   using Builder4 = Fp4TypeBuilder<kGemmType, ElementA, ElementB, ElementC, ElementD, ElementAcc, ElementCompute,
                                   SHAPE_N, SHAPE_K, kNumGroups, KernelAiuFp4DynamicTile, 4,
-                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit>;
+                                  false /*has_bias*/, 1 /*n_expand*/, kEpilogueType, kApplySwigluLimit, kSwizzleB>;
   static constexpr uint32_t MaxThreadsPerBlock = Builder4::MaxThreadsPerBlock;
 
   using CollectiveEpilogue = typename Builder4::CollectiveEpilogue;
