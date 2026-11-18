@@ -40,6 +40,7 @@ public:
         // apply_swiglu_limit only matters for fused activation epilogues.
         std::string epilogue_type = "Default";
         bool apply_swiglu_limit = false;
+        bool swizzle_b = false;
     };
 
     struct MainLoopArguments {
@@ -210,7 +211,7 @@ public:
                                info.num_groups, info.warp_m, info.warp_n, info.num_stages,
                                info.gemm_type, info.enable_sbo_overlap, info.hasBias, info.n_expand,
                                info.epilogue_type, info.apply_swiglu_limit, info.kernel_strategy,
-                               info.kernel_name, args.launch_args.smem_size);
+                               info.swizzle_b, info.kernel_name, args.launch_args.smem_size);
     }
 
     static std::string generate_impl(const Args& args) {
@@ -250,6 +251,7 @@ constexpr int N_EXPAND = {};
 static constexpr EpilogueType kEpilogueType = EpilogueType::{};
 static constexpr bool kApplySwigluLimit = {};
 static constexpr KernelStrategy kKernelStrategy = KernelStrategy::{};
+static constexpr bool kSwizzleB = {};
 
 // A matrix configuration
 using         ElementA    = cutlass::float4_t;
@@ -381,7 +383,7 @@ using CollectiveEpilogueSiluAndMulPostQuant = typename cutlass::epilogue::collec
 >;
 
 // Bias or odd N requires TSM; otherwise select fused post-quantization or the plain epilogue.
-using CollectiveEpilogue = typename cutlass::platform::conditional<
+using CollectiveEpilogueDefault = typename cutlass::platform::conditional<
     hasBias || (SHAPE_N % 2 != 0),
     CollectiveEpilogueWithTsm,
     typename cutlass::platform::conditional<
@@ -389,6 +391,14 @@ using CollectiveEpilogue = typename cutlass::platform::conditional<
         CollectiveEpilogueSiluAndMulPostQuant,
         CollectiveEpilogueNoTsm
     >::type
+>::type;
+
+// B-swizzled epilogue: atom-local permuted b64 stores for offline-swizzled weights.
+// Host guarantees kSwizzleB is only set with Default epilogue, no bias, even N.
+using CollectiveEpilogue = typename cutlass::platform::conditional<
+    kSwizzleB,
+    cutlass::epilogue::collective::CollectiveEpilogueNoTsmBSwizzled<CollectiveEpilogueNoTsm>,
+    CollectiveEpilogueDefault
 >::type;
 
 // NOTE: kEpilogueType must be passed explicitly -- the scheduler derives SHAPE_N_OUT and
@@ -434,7 +444,7 @@ __global__ void {}(
             args.launch_info.warp_m, args.launch_info.warp_n, args.launch_info.num_stages, args.launch_info.gemm_type,
             args.launch_info.enable_sbo_overlap, args.launch_info.hasBias, args.launch_info.n_expand,
             args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit,
-            args.launch_info.kernel_strategy,
+            args.launch_info.kernel_strategy, args.launch_info.swizzle_b,
             args.launch_args.smem_size,
             fused_smem_guard,
             args.launch_info.kernel_name);
@@ -468,6 +478,7 @@ public:
         // apply_swiglu_limit only matters for fused activation epilogues.
         std::string epilogue_type = "Default";
         bool apply_swiglu_limit = false;
+        bool swizzle_b = false;
     };
 
     using DynamicTileKernelParams = FP4GemmRuntime::DynamicTileKernelParams;
@@ -492,6 +503,7 @@ static constexpr auto kDynamicTileId = FP4DynamicTileId::{};
 static constexpr GemmType kGemmType = GemmType::{};
 static constexpr EpilogueType kEpilogueType = EpilogueType::{};
 static constexpr bool kApplySwigluLimit = {};
+static constexpr bool kSwizzleB = {};
 
 using ElementD = typename EpilogueTraits<kEpilogueType>::ElementD;
 // The dynamic-tile kernel picks its own tile shape from kDynamicTileId, so no block/warp constants
@@ -507,7 +519,8 @@ using GemmKernel = cutlass::gemm::kernel::Fp4DeepGemmDynamicTile<
     SHAPE_N, SHAPE_K, NUM_GROUPS,
     kDynamicTileId,
     kEpilogueType,
-    kApplySwigluLimit
+    kApplySwigluLimit,
+    kSwizzleB
 >;
 
 // The dynamic-tile kernel decides its own tile shape from kDynamicTileId, so get_smem_config_fp4()
@@ -532,6 +545,7 @@ __global__ void {}(
             args.launch_info.n, args.launch_info.k, args.launch_info.num_groups,
             args.launch_info.dynamic_tile_id, args.launch_info.gemm_type,
             args.launch_info.epilogue_type, args.launch_info.apply_swiglu_limit,
+            args.launch_info.swizzle_b,
             args.launch_args.smem_size,
             args.launch_info.kernel_name);
     }
