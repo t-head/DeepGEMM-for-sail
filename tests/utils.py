@@ -2644,6 +2644,8 @@ def test_paged_mqa_logits(args) -> None:
         kv_cache_fp4, kv_cache_dequant = kv_cache_cast_to_fp4(kv_cache)
         q, kv_cache = q_dequant, kv_cache_dequant
         metadata_extra = (next_n, num_heads, head_dim, torch.int8)
+        if not is_avg and request_indices is None:
+            request_indices = torch.arange(batch_size, device=q.device, dtype=torch.int32)
         schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(),
                                                 indices=request_indices, metadata_extra=metadata_extra)
         if is_avg:
@@ -2658,8 +2660,7 @@ def test_paged_mqa_logits(args) -> None:
                 q=q_in, kv_cache=kv_cache_fp4, weights=weights,
                 context_lens=context_lens, block_table=block_tables,
                 schedule_meta=schedule_metadata, max_context_len=max_model_len,
-                indices=request_indices if request_indices is not None else torch.arange(
-                    batch_size, device=q.device, dtype=torch.int32),
+                indices=request_indices,
             )
     else:
         print("ERROR: Unsupported dtype for Paged MQA Logits, please check!")
@@ -3203,13 +3204,16 @@ def test_sparse_mqa_logits(args) -> None:
                 full_logits = torch.empty((seq_len_q, 0), device='cuda', dtype=torch.bfloat16)
             elif not is_int8 and page_kv == 64:
                 context_lens_2d = context_lens.unsqueeze(-1)
+                # Schedule each reference row independently of sparse request groups.
+                dense_indices = torch.arange(seq_len_q, device=q_in[0].device, dtype=torch.int32)
                 schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
                     context_lens_2d, page_kv, deep_gemm.get_num_sms(),
+                    indices=dense_indices,
                     metadata_extra=(1, num_heads, head_dim, torch.int8))
                 full_logits = deep_gemm.fp8_fp4_paged_mqa_logits(
                     q=q_in, kv_cache=kv_cache, weights=weights, context_lens=context_lens_2d,
                     block_table=block_table, schedule_meta=schedule_meta,
-                    max_context_len=max(context_lens_list), indices=request_ids)
+                    max_context_len=max(context_lens_list), indices=dense_indices)
             else:
                 # Reconstruct logical KV so the reference is independent of dense page-size support.
                 page_data = kv_cache.view(total_pages, -1)

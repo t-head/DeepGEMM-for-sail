@@ -159,16 +159,15 @@ __device__ __forceinline__ uint32_t fp4_varlen_request_unit(const FP4VarlenQBloc
                            (pack == 4 ? SingletonCostMultiplier : 1);
 }
 
-// CTA starts followed by dense (source Q, valid Q, max KV, table row)
-// descriptors. Original Q count bounds the allocation, not shared memory.
+// Descriptors and prefix sums are temporary. Only CTA boundaries are returned.
 template <uint32_t BlockQ, uint32_t SplitKV, uint32_t NumWorkers, uint32_t SingletonCostMultiplier>
 __device__ __forceinline__ void fp4_varlen_metadata(uint32_t nq, const uint32_t *lengths, const uint32_t *indices,
-                                                    FP4VarlenCTAStart *metadata, uint64_t *prefix) {
+                                                    FP4VarlenCTAStart *metadata, FP4VarlenQBlock *desc,
+                                                    uint64_t *prefix) {
     constexpr uint32_t Threads = 256;
     const uint32_t tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     __shared__ uint64_t warp_cost[8], carried_cost;
     __shared__ uint32_t warp_count[8], carried_count;
-    auto desc = reinterpret_cast<FP4VarlenQBlock*>(metadata + NumWorkers + 1);
     for (uint32_t q = tid; q < nq; q += Threads) {
         desc[q] = FP4VarlenQBlock{0, 0, 0, 0};
     }
@@ -297,7 +296,7 @@ __device__ __forceinline__ void fp4_varlen_metadata(uint32_t nq, const uint32_t 
                 split = uint32_t(from_start / unit);
             }
         }
-        metadata[worker] = FP4VarlenCTAStart{lo, split, groups, SplitKV};
+        metadata[worker] = FP4VarlenCTAStart{lo < groups ? desc[lo].table_row : nq, split};
     }
     __syncthreads();
 }
@@ -306,10 +305,9 @@ __device__ __forceinline__ void fp4_varlen_metadata(uint32_t nq, const uint32_t 
 template <uint32_t BlockQ, uint32_t SplitKV, uint32_t BlockKV, uint32_t WorkersPerCU>
 struct FP4GroupedPagedScheduler {
     const FP4VarlenCTAStart* starts;
-    const FP4VarlenQBlock* groups;
-    __device__ __forceinline__ FP4GroupedPagedScheduler(const FP4VarlenCTAStart* starts,
-                                                        const FP4VarlenQBlock* groups)
-        : starts(starts), groups(groups) {}
+    const uint32_t* indices;
+    const uint32_t* lengths;
+    uint32_t nq;
     template <typename RequestFn, typename SingleFn>
     __device__ __forceinline__ void for_each_task(RequestFn&& on_request, SingleFn&& on_single) const {
         const uint32_t num_cus = gridDim.x / WorkersPerCU;
@@ -319,27 +317,34 @@ struct FP4GroupedPagedScheduler {
         const uint32_t worker = slot * num_cus + (blockIdx.x % num_cus + slot) % num_cus;
         const FP4VarlenCTAStart first = starts[worker], last = starts[worker + 1];
         constexpr uint32_t MathGroups = SplitKV / BlockKV;
-        for (uint32_t q = first.group; q <= last.group && q < starts[0].num_groups;) {
-            if (q == last.group && last.kv_split == 0) break;
-            const FP4VarlenQBlock d = groups[q];
+        for (uint32_t q = first.source_q; q <= last.source_q && q < nq;) {
+            if (q == last.source_q && last.kv_split == 0) break;
+            const uint32_t id = __ldg(indices + q);
             uint32_t run_end = q + 1;
-            while (run_end < starts[0].num_groups && groups[run_end].table_row == d.table_row) ++run_end;
+            while (run_end < nq && __ldg(indices + run_end) == id) ++run_end;
+            const uint32_t count = run_end - q;
+            const uint32_t blocks = math::ceil_div(count, BlockQ);
+            const uint32_t base = count / blocks, remainder = count % blocks;
+            const uint32_t valid = base + (remainder != 0);
+            const uint32_t context = __ldg(lengths + run_end - 1);
             // Q spans are powers of two. Keep the quotient explicit so local
             // task dispatch cannot turn it into a runtime integer division.
-            const uint32_t pack = BlockQ >> fp4_varlen_q_shift<BlockQ>(d.valid_q);
-            const uint32_t begin = q == first.group ? first.kv_split * MathGroups * pack : 0;
-            const uint32_t end = q == last.group ? last.kv_split * MathGroups * pack
-                : deep_gemm::math::ceil_div(d.context_len, BlockKV);
+            const uint32_t pack = BlockQ >> fp4_varlen_q_shift<BlockQ>(valid);
+            const uint32_t begin = q == first.source_q ? first.kv_split * MathGroups * pack : 0;
+            const uint32_t end = q == last.source_q ? last.kv_split * MathGroups * pack
+                : deep_gemm::math::ceil_div(context, BlockKV);
             if (begin < end) {
-                if (run_end > q + 1 || (BlockQ == 4 && d.valid_q == 3)) {
-                    for (uint32_t window = q; window < run_end; window += 2) {
-                        const uint32_t last_block = min(window + 2, run_end);
-                        const uint32_t count0 = groups[window].valid_q;
-                        const uint32_t count1 = window + 1 < last_block ? groups[window + 1].valid_q : 0;
-                        on_request(window, begin, end, last_block, count0, count1);
+                if (blocks > 1 || (BlockQ == 4 && valid == 3)) {
+                    uint32_t source = q;
+                    for (uint32_t block = 0; block < blocks; block += 2) {
+                        const uint32_t count0 = base + (block < remainder);
+                        const uint32_t count1 = block + 1 < blocks ? base + (block + 1 < remainder) : 0;
+                        on_request(FP4VarlenQBlock{source, count0, context, q},
+                                   FP4VarlenQBlock{source + count0, count1, context, q}, begin, end);
+                        source += count0 + count1;
                     }
                 } else {
-                    on_single(q, begin, end, d.valid_q);
+                    on_single(FP4VarlenQBlock{q, valid, context, q}, begin, end);
                 }
             }
             q = run_end;

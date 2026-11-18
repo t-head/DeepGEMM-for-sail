@@ -214,7 +214,7 @@ static torch::Tensor mqa_logits_common(const torch::Tensor& q, const torch::Tens
 //   context_lens:   int32 [batch_size, next_n]
 //   block_table:    int32 [batch_size, max_block_len]
 //   schedule_meta:  opaque int32 metadata from `get_paged_mqa_logits_metadata`;
-//                   legacy uses two columns, request-grouped FP4 DSA uses four.
+//                   two columns, one row per CTA plus an end sentinel.
 //   max_context_len: maximum context length
 //   clean_logits:   whether to mask out-of-range logits with -inf (unsupported here, see below)
 //   logits_dtype:   output logits dtype, float32 or bfloat16
@@ -224,7 +224,8 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
                                             const torch::Tensor& weights, const torch::Tensor& context_lens,
                                             const torch::Tensor& block_table, const torch::Tensor& schedule_meta,
                                             int max_context_len, bool clean_logits, torch::ScalarType logits_dtype,
-                                            const std::optional<torch::Tensor>& q_sf = std::nullopt) {
+                                            const std::optional<torch::Tensor>& q_sf = std::nullopt,
+                                            const std::optional<torch::Tensor>& indices = std::nullopt) {
     TORCH_CHECK(not clean_logits, "clean_logits=True is not supported on PPU");
     const bool is_fp4 = q_sf.has_value();
     check_indexer_arch(q.scalar_type(), is_fp4);
@@ -243,8 +244,7 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
     DG_HOST_ASSERT(context_lens.size(1) == next_n);
     DG_HOST_ASSERT(batch_size == context_lens.size(0) and batch_size == block_table.size(0));
     DG_HOST_ASSERT(num_heads_kv == 1);
-    const bool grouped = is_fp4 and not is_avg and meta_info_size == 4;
-    DG_HOST_ASSERT(grouped or ((schedule_meta_size - 1) % get_num_sms() == 0 and meta_info_size == 2));
+    DG_HOST_ASSERT((schedule_meta_size - 1) % get_num_sms() == 0 and meta_info_size == 2);
     TORCH_CHECK(is_avg ? (1 <= next_n and next_n <= 6) : next_n == 1,
                 "weighted paged indexer requires next_n == 1; AVG supports next_n in [1, 6]");
     TORCH_CHECK(context_lens.is_contiguous(), "context_lens must be contiguous");
@@ -298,7 +298,7 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
 
     return paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, batch_size, next_n,
                             num_heads, head_dim, num_kv_blocks, page_kv, schedule_meta_size, max_context_len,
-                            logits_dtype, q_sf);
+                            logits_dtype, q_sf, indices);
 }
 
 extern "C" {
@@ -442,6 +442,8 @@ torch::Tensor get_paged_mqa_logits_metadata(
                 "metadata_extra requires logical head_dim=64 or 128");
     TORCH_CHECK(not (arch == AC_PPU0015 and qk_dtype == torch::kInt8) or d == 128,
                 "M890 MXFP4 metadata_extra requires logical head_dim=128, not packed head_dim=64");
+    TORCH_CHECK(arch != AC_PPU0015 or qk_dtype != torch::kInt8 or is_avg or indices.has_value(),
+                "MXFP4 paged metadata requires per-query request indices for weighted logits");
     // shared memory limit
     TORCH_CHECK(batch_size > 0 and batch_size <= 65536, "batch_size must be in [1, 65536]");
 
@@ -486,7 +488,7 @@ torch::Tensor fp8_fp4_paged_mqa_logits(const std::pair<torch::Tensor, std::optio
     check_row_indices(indices, context_lens);
     return paged_mqa_logits_common(q.first, kv_cache, checked_weights(weights, q.first, torch::kBFloat16),
                                    context_lens, block_table, schedule_meta, max_context_len, false,
-                                   torch::kBFloat16, q.second);
+                                   torch::kBFloat16, q.second, indices);
 }
 
 // ---- Sparse MQA logits (DeepSeek V4.1 DSA indexer; ported from open-source 26/09) ----

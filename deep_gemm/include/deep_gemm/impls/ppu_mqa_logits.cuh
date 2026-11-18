@@ -33,6 +33,10 @@ public:
   // WARP_Q == 4 (4-head avg tile): parity-split epilogue, each lane loads/stores
   // only its own kv row half (see operator()). Applies to both float and bf16 logits
   static constexpr bool kWq4 = WARP_Q == 4;
+  static constexpr bool kUseFullKVStores = kIsCompressedLogits &&
+      kScaleMode == deep_gemm::kScaleModeWeights &&
+      (cute::is_same_v<ElementLogits, float> ||
+       (cute::is_same_v<ElementQK, int8_t> && cute::is_same_v<ElementLogits, __ppu_bfloat16>));
 
   using StrideAB = Stride<Int<BLOCK_K>, _1>;
 
@@ -355,7 +359,7 @@ public:
         }
     };
 
-    auto epilogue = [&](uint32_t block_q_idx, uint32_t kv_start, uint32_t kv_block_idx) {
+    auto epilogue = [&](uint32_t block_q_idx, uint32_t kv_start, uint32_t kv_block_idx, auto full_kv_tag) {
         const auto& kv_offset = kv_start + kv_block_idx * BLOCK_KV + warp_offset;
         static constexpr uint32_t kNumAccumPerMma = 8;
         // The warp's N tile must be a legal MMA shape; 4 heads use WARP_Q = 4 (WARP_QH = 16)
@@ -424,7 +428,12 @@ public:
 
                 // Store into the global memory
                 const uint32_t& q_idx = block_q_idx * BLOCK_Q + warp_q_idx;
-                if constexpr (kIsCompressedLogits) {
+                if constexpr (decltype(full_kv_tag)::value) {
+                    const uint32_t column = kv_offset - seq_k_start[warp_q_idx];
+                    const StrideKType base = q_idx * params.stride_k + column + mma_offset;
+                    params.logits[base + v_0_offset] = v_0 * scale_kv_0;
+                    params.logits[base + v_1_offset] = v_1 * scale_kv_1;
+                } else if constexpr (kIsCompressedLogits) {
                     // Finish each uint32 relative column before adding the row base.
                     const uint32_t rel_lo = kv_offset + mma_offset + v_0_offset - seq_k_start[warp_q_idx];
                     const uint32_t rel_hi = kv_offset + mma_offset + v_1_offset - seq_k_start[warp_q_idx];
@@ -513,7 +522,12 @@ public:
 
                 // Store
                 const uint32_t& q_idx = block_q_idx * BLOCK_Q + warp_q_idx;
-                if constexpr (kIsCompressedLogits) {
+                if constexpr (decltype(full_kv_tag)::value) {
+                    const uint32_t column = kv_offset - seq_k_start[warp_q_idx];
+                    const StrideKType base = q_idx * params.stride_k + column + mma_offset;
+                    params.logits[base + v_0_offset] = __low2bfloat16(packed);
+                    params.logits[base + v_1_offset] = __high2bfloat16(packed);
+                } else if constexpr (kIsCompressedLogits) {
                     // Finish each uint32 relative column before adding the row base.
                     const uint32_t rel_lo = kv_offset + mma_offset + v_0_offset - seq_k_start[warp_q_idx];
                     const uint32_t rel_hi = kv_offset + mma_offset + v_1_offset - seq_k_start[warp_q_idx];
@@ -537,6 +551,18 @@ public:
                 params.cu_seq_len_k_start, params.cu_seq_len_k_end,
                 seq_k_start, seq_k_end)),
             q_stage_idx, q_phase, kv_start, kv_end, num_kv_blocks);
+        uint32_t first_full = 0, last_full = 0;
+        if constexpr (kUseFullKVStores) {
+            // Only tiles in the intersection are valid for every output row.
+            uint32_t common_start = kv_start, common_end = kv_end;
+            #pragma unroll
+            for (int q = 0; q < BLOCK_Q; ++q) {
+                common_start = max(common_start, seq_k_start[q]);
+                common_end = min(common_end, seq_k_end[q]);
+            }
+            first_full = deep_gemm::math::ceil_div(common_start - kv_start, static_cast<uint32_t>(BLOCK_KV));
+            last_full = (max(common_end, kv_start) - kv_start) / BLOCK_KV;
+        }
         tAgA.data() = tKgK.data() + kv_start * kHeadDim;
         tSFAgSFA.data() = tSFKgSFK.data() + kv_start;
         tBgB.data() = tQgQ.data() + block_q_idx * BLOCK_Q * kNumHeads * kHeadDim;
@@ -606,7 +632,14 @@ public:
             deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
 
             // Reduce + store logits
-            epilogue(block_q_idx, kv_start, kv_block_idx);
+            if constexpr (kUseFullKVStores) {
+                if (kv_block_idx >= first_full && kv_block_idx < last_full)
+                    epilogue(block_q_idx, kv_start, kv_block_idx, cute::true_type{});
+                else
+                    epilogue(block_q_idx, kv_start, kv_block_idx, cute::false_type{});
+            } else {
+                epilogue(block_q_idx, kv_start, kv_block_idx, cute::false_type{});
+            }
 
             // wait for next K, load next K to vreg
             cp_async_wait<kNumKVStages - 2>();
