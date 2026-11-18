@@ -319,6 +319,39 @@ get_best_configs_dense_ppu1v5(int m, int n, int k, int num_groups, int num_sms) 
                            best_num_stages, best_smem_config);
 }
 
+static std::tuple<int, int, int> derive_grouped_warps_ppu1v5(
+    int block_m, int block_n, int n, int k, bool fixed_block_n) {
+    int warp_m = block_m / 2;
+    int warp_n = block_n / 2;
+
+    // Fixed wide tiles use four M warps once M is large enough, keeping
+    // each thread's accumulator footprint bounded as the CTA tile grows.
+    if ((block_m > 128 || (fixed_block_n && block_m >= 128)) && block_n == 256) {
+        warp_m = block_m / 4;
+        warp_n = block_n / 4;
+    } else if (block_m == 64 && block_n >= 128) {
+        warp_m = (k < 256) ? 64 : 32;
+        warp_n = 64;
+    } else if (block_m == 32 && block_n >= 64) {
+        warp_m = 32;
+        warp_n = (block_n <= 128) ? block_n / 2 : block_n / 4;
+    } else if (block_n == 32 && n <= 128 && block_m >= 64) {
+        warp_m = block_m / 4;
+        warp_n = 32;
+    } else if ((block_m == 128 || block_m == 256) && block_n >= 32) {
+        warp_m = 64;
+        warp_n = (block_n <= 128) ? block_n / 2 : block_n / 4;
+    } else if (block_m == 16) {
+        warp_m = 16;
+        block_n = (!fixed_block_n && n < 512) ? 64 : block_n;
+        warp_n = (block_n < 128) ? block_n / 2 : block_n / 4;
+    } else if (block_n == 128 || block_n == 256) {
+        warp_m = (block_m != 32) ? block_m / 2 : block_m;
+        warp_n = 64;
+    }
+    return std::make_tuple(block_n, warp_m, warp_n);
+}
+
 std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
 get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
                         GemmType gemm_type, int max_block_n = 256,
@@ -559,34 +592,9 @@ get_best_configs_ppu1v5(int m, int n, int k, int num_groups, int num_sms,
 
     assert(num_min_sms <= num_sms);
 
-    int warp_m = best_block_m / 2;
-    int warp_n = best_block_n / 2;
-
-    // Fixed wide tiles use four M warps once M is large enough, keeping
-    // each thread's accumulator footprint bounded as the CTA tile grows.
-    if ((best_block_m > 128 || (fixed_block_n && best_block_m >= 128)) && best_block_n == 256) {
-        warp_m = best_block_m / 4;
-        warp_n = best_block_n / 4;
-    } else if (best_block_m == 64 && best_block_n >= 128) {
-        warp_m = (k < 256) ? 64 : 32;
-        warp_n = 64;
-    } else if (best_block_m == 32 && best_block_n >= 64) {
-        warp_m = 32;
-        warp_n = (best_block_n <= 128) ? best_block_n / 2 : best_block_n / 4;
-    } else if (best_block_n == 32 && n <= 128 && best_block_m >= 64) {
-        warp_m = best_block_m / 4;
-        warp_n = 32;
-    } else if ((best_block_m == 128 || best_block_m == 256) && best_block_n >= 32) {
-        warp_m = 64;
-        warp_n = (best_block_n <= 128) ? best_block_n / 2 : best_block_n / 4;
-    } else if (best_block_m == 16) {
-        warp_m = 16;
-        best_block_n = (!fixed_block_n && n < 512) ? 64 : best_block_n;
-        warp_n = (best_block_n < 128) ? best_block_n / 2 : best_block_n / 4;
-    } else if (best_block_n == 128 || best_block_n == 256) {
-        warp_m = (best_block_m != 32) ? best_block_m / 2 : best_block_m;
-        warp_n = 64;
-    }
+    int warp_m, warp_n;
+    std::tie(best_block_n, warp_m, warp_n) = derive_grouped_warps_ppu1v5(
+        best_block_m, best_block_n, n, k, fixed_block_n.has_value());
 
     int best_occ = 0;
     for (int num_stages : stage_candidates) {
@@ -641,19 +649,18 @@ get_adaptive_configs_int8(int m, int n, int k, int num_sms) {
     return std::make_tuple(sms, bm, bn, bk, wm, wn, stages, smem);
 }
 
-std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
-get_best_configs(int m, int n, int k, int num_groups, int num_sms,
-                 GemmType gemm_type = GemmType::Normal, int max_block_n = 256,
-                 std::optional<deep_gemm_lut::RuntimeLutKind> runtime_lut_kind = std::nullopt,
-                 bool* from_runtime_lut = nullptr, std::optional<int> fixed_block_n = std::nullopt,
-                 const std::vector<int>* allowed_block_ms = nullptr, int min_block_n = 0) {
-    TORCH_CHECK(!fixed_block_n ||
-        (is_ppu1v5_device() && gemm_type == GemmType::MGroupedNoPad &&
-         *fixed_block_n >= 32 && *fixed_block_n <= max_block_n &&
-         (*fixed_block_n & (*fixed_block_n - 1)) == 0 && n % *fixed_block_n == 0),
-        "fixed_block_n requires PPU1.5 GroupedNoPad, a power-of-two tile in [32, max_block_n] dividing N");
-    TORCH_CHECK(!allowed_block_ms || (is_ppu1v5_device() && gemm_type == GemmType::MGroupedNoPad &&
-                    !allowed_block_ms->empty()), "M tile constraints require PPU1.5 GroupedNoPad");
+using Int8ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
+
+struct NoPadConfig {
+    Int8ConfigTuple cfg;
+    const char* strategy;
+};
+
+static std::optional<Int8ConfigTuple> lookup_int8_configs(
+    int m, int n, int k, int num_groups, int num_sms, GemmType gemm_type,
+    std::optional<deep_gemm_lut::RuntimeLutKind> runtime_lut_kind,
+    bool* from_runtime_lut = nullptr, std::optional<int> fixed_block_n = std::nullopt,
+    const std::vector<int>* allowed_block_ms = nullptr) {
     const auto allowed = [&](int bm) {
         return !allowed_block_ms || std::find(allowed_block_ms->begin(), allowed_block_ms->end(), bm) != allowed_block_ms->end();
     };
@@ -682,6 +689,25 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         return std::make_tuple(num_sms, best_block_m, best_block_n, best_block_k,
                                best_warp_m, best_warp_n, best_stages, best_smem_config);
     }
+    return std::nullopt;
+}
+
+std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>
+get_best_configs(int m, int n, int k, int num_groups, int num_sms,
+                 GemmType gemm_type = GemmType::Normal, int max_block_n = 256,
+                 std::optional<deep_gemm_lut::RuntimeLutKind> runtime_lut_kind = std::nullopt,
+                 bool* from_runtime_lut = nullptr, std::optional<int> fixed_block_n = std::nullopt,
+                 const std::vector<int>* allowed_block_ms = nullptr, int min_block_n = 0) {
+    TORCH_CHECK(!fixed_block_n ||
+        (is_ppu1v5_device() && gemm_type == GemmType::MGroupedNoPad &&
+         *fixed_block_n >= 32 && *fixed_block_n <= max_block_n &&
+         (*fixed_block_n & (*fixed_block_n - 1)) == 0 && n % *fixed_block_n == 0),
+        "fixed_block_n requires PPU1.5 GroupedNoPad, a power-of-two tile in [32, max_block_n] dividing N");
+    TORCH_CHECK(!allowed_block_ms || (is_ppu1v5_device() && gemm_type == GemmType::MGroupedNoPad &&
+                    !allowed_block_ms->empty()), "M tile constraints require PPU1.5 GroupedNoPad");
+    if (auto lut_result = lookup_int8_configs(m, n, k, num_groups, num_sms, gemm_type,
+                                             runtime_lut_kind, from_runtime_lut, fixed_block_n, allowed_block_ms))
+        return *lut_result;
     // Adaptive tile selection for DenseGemm (INT8). warp_k/dense_s2_opt are injected in the dense
     // impl; here we only apply the adaptive tile choice (incl. bk *= 2) and return the 8-tuple.
     if (gemm_type == GemmType::Normal && is_ppu1v5_device() &&
@@ -949,6 +975,99 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     assert(best_num_stages != 0);
     return std::make_tuple(std::min(num_min_sms, num_sms), best_block_m, best_block_n, block_k, warp_m, warp_n,
                            best_num_stages, best_smem_config);
+}
+
+template <typename EvaluateResident, typename GetOccupancy>
+NoPadConfig get_best_nopad_configs(
+    int m, int n, int k, int num_groups, int num_sms,
+    deep_gemm_lut::RuntimeLutKind runtime_lut_kind,
+    EvaluateResident&& evaluate_resident, GetOccupancy&& get_occupancy) {
+    if (auto lut = lookup_int8_configs(m, n, k, num_groups, num_sms,
+                                      GemmType::MGroupedNoPad, runtime_lut_kind)) {
+        NoPadConfig resident{*lut, "MultistageOnN"};
+        if (evaluate_resident(resident.cfg, *lut))
+            return resident;
+        return {*lut, "OverlapPrologue"};
+    }
+
+    const NoPadConfig fallback{
+        get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, GemmType::MGroupedNoPad),
+        "OverlapPrologue"};
+    const std::vector<int> block_ms = k >= 384 ? std::vector<int>{256, 128, 64, 32, 16}
+                                              : std::vector<int>{128, 64, 32, 16};
+    std::vector<int> block_ns;
+    int bit_length = 0;
+    for (int temp_n = 256; temp_n > 0; temp_n >>= 1)
+        ++bit_length;
+    for (int x = k >= 384 ? bit_length - 1 : bit_length - 2; x > 4; --x)
+        block_ns.push_back(1 << x);
+
+    // N-panel reuse must not count four tiles as four times less work.
+    const auto get_num_waves = [&](int bm, int bn) {
+        return ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms);
+    };
+    const auto get_last_wave_util = [&](int bm, int bn) {
+        const int tail = (ceil_div(m, bm) * ceil_div(n, bn) * num_groups) % num_sms;
+        return tail == 0 ? num_sms : tail;
+    };
+    const auto get_block_utils = [](int dim, int block_dim) {
+        if (dim % block_dim != 0)
+            return (static_cast<double>(dim) / block_dim) / ceil_div(dim, block_dim);
+        return 1.0;
+    };
+    const auto get_block_ai = [](int bm, int bn) {
+        return static_cast<double>(bm * bn) / (bm + bn);
+    };
+    const auto prefer_resident = [&](const NoPadConfig& candidate, const NoPadConfig& best) {
+        const int bm = std::get<1>(candidate.cfg), bn = std::get<2>(candidate.cfg);
+        const int best_bm = std::get<1>(best.cfg), best_bn = std::get<2>(best.cfg);
+        const int num_occ = get_occupancy(candidate.cfg, true);
+        const int best_num_occ = get_occupancy(best.cfg, true);
+        if (num_occ == 0)
+            return false;
+        const int num_waves = get_num_waves(bm, bn);
+        const int best_num_waves = get_num_waves(best_bm, best_bn);
+        const double num_utils = get_block_utils(m, bm) * get_block_utils(n, bn);
+        const double best_num_utils = get_block_utils(m, best_bm) * get_block_utils(n, best_bn);
+        if (m < 512 || n < 512) {
+            const double ai = get_block_ai(bm, bn), best_ai = get_block_ai(best_bm, best_bn);
+            if (num_waves == best_num_waves && num_occ == best_num_occ &&
+                num_utils == best_num_utils && ai == best_ai)
+                return false;
+            const bool valid_occ = num_occ >= best_num_occ;
+            const bool valid_wave = static_cast<double>(num_waves) / num_occ <=
+                                    static_cast<double>(best_num_waves) / best_num_occ;
+            const bool valid_util = num_utils >= best_num_utils;
+            const bool valid_ai = ai >= best_ai;
+            return int(valid_wave) + int(valid_util) + int(valid_occ) + int(valid_ai) >= 3;
+        }
+        if (num_waves != best_num_waves)
+            return num_waves < best_num_waves;
+        const int util = get_last_wave_util(bm, bn), best_util = get_last_wave_util(best_bm, best_bn);
+        if (util != best_util)
+            return util > best_util;
+        return (bm == best_bm && bn < best_bn) || (bn == best_bn && bm < best_bm) ||
+               (bm != best_bm && bn > best_bn);
+    };
+
+    std::optional<NoPadConfig> best;
+    for (int bm : block_ms) {
+        for (int bn : block_ns) {
+            if ((bm > 128 && bn > 128) || bn == n || n < 32 || (bm == 16 && bn <= 32))
+                continue;
+            const auto [block_n, wm, wn] = derive_grouped_warps_ppu1v5(bm, bn, n, k, false);
+            for (int stages = 2; stages <= k / 128; ++stages) {
+                NoPadConfig candidate{
+                    std::make_tuple(num_sms, bm, block_n, 128, wm, wn, stages, std::make_tuple(0, 128, 0)),
+                    "MultistageOnN"};
+                if (!evaluate_resident(candidate.cfg, fallback.cfg))
+                    continue;
+                if (!best || prefer_resident(candidate, *best))
+                    best = candidate;
+            }
+        }
+    }
+    return best ? *best : fallback;
 }
 
 } // namespace deep_gemm_int8

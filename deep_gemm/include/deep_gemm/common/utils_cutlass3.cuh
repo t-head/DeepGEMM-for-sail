@@ -5,7 +5,15 @@
 #include <cutlass/cutlass.h>
 
 struct KernelAiuMultistageOnN {
-  constexpr static int N_EXPAND = 4;
+  static constexpr int N_EXPAND = 4;
+
+  // A8W8 operands use one byte per element.
+  static constexpr size_t smem_size(size_t k, size_t block_m, size_t block_n, size_t block_k, size_t stages) {
+    const size_t smem_a = block_m * k;
+    const size_t smem_b = stages * block_n * block_k;
+    const size_t smem_scales = (block_m + 2 * block_n) * sizeof(float);
+    return smem_a + smem_b + smem_scales;
+  }
 };
 
 struct KernelAiuMultistageOverlapPrologue {};

@@ -496,9 +496,8 @@ using TiledMma = TiledMMA<
     MMA_Atom<MmaInst>,
     Layout<Shape<Int<WarpOnM>, Int<WarpOnN>, _1>>,  // 1x4x1 thread group
     Tile<Int<WarpOnM * 16>, Int<WarpOnN * 16>, _32>>;       // 1x1x1 value group
-constexpr int EnableMultistageOnN = kKernelStrategy == KernelStrategy::MultistageOnN
-                                    && (SHAPE_N % (BLOCK_N) == 0)
-                                    && (SHAPE_K > (BLOCK_K * STAGES));
+constexpr int EnableMultistageOnN = kKernelStrategy == KernelStrategy::MultistageOnN;
+static_assert(!EnableMultistageOnN || SHAPE_K <= 512, "MultistageOnN requires short K");
 static constexpr int N_EXPAND = EnableMultistageOnN ? KernelAiuMultistageOnN::N_EXPAND : 1;
 constexpr int EnableOverlapPrologue = kKernelStrategy == KernelStrategy::OverlapPrologue;
                                           // && (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(int8_t) >= WarpOnM * 16 * BLOCK_N * sizeof(int32_t); // to impl
@@ -648,8 +647,16 @@ using GemmOcc = GemmOccModel<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_K,
                             kHwTsmPerCu, kHwMaxThreadsPerCta, kHwMaxWarpsPerCu, kHwTotalVregPerCu,
                             false, kTotalVregOverhead>;
 
+// Reserve the full 256-VREG budget for the supported N_EXPAND warp tiles.
+// Reuse the common TSM/thread occupancy terms; avoid tighter bounds that spill.
+constexpr int kNExpandWarpsPerWe = cute::min(kHwMaxWarpsPerCu / 8, kHwTotalVregPerCu / 8 / 256);
+constexpr int kMinBlocksPerMultiprocessor = EnableMultistageOnN
+    ? cute::min(GemmOcc::kSmemOcc, cute::min(GemmOcc::kThreadOcc,
+                8 * kNExpandWarpsPerWe / GemmOcc::kWarpsPerCta))
+    : GemmOcc::kMinBlocksPerMultiprocessor;
+
 extern "C"
-__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmOcc::kMinBlocksPerMultiprocessor)
+__launch_bounds__(GemmKernel::MaxThreadsPerBlock, kMinBlocksPerMultiprocessor)
 __global__ void {13}(
   typename GemmKernel::Params params
 ) {{

@@ -20,6 +20,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/common/profiling_interface.cuh>
 #include "int8_gemm.hpp"
 
@@ -678,6 +679,79 @@ static bool should_use_a8w4_gemv(bool is_a8w4, bool has_explicit_config, const v
            deep_gemm_a8w4_common::get_gemv_config(m, n, k, num_groups, config);
 }
 
+static NoPadConfig get_nopad_config(
+    int m, int n, int k, int expected_m, int num_groups, int num_sms, at::ScalarType dtype,
+    const std::optional<ConfigTuple>& configs, bool is_a8w4) {
+    const auto device = device_runtime->get_prop();
+    const bool is_ppu15 = device->major == 8 && device->minor == 9;
+    const char* fallback_strategy = is_ppu15 && k < 4096 ? "OverlapPrologue" : "Default";
+    const auto active_ctas = [&](const ConfigTuple& config, bool resident) {
+        const int bm = std::get<1>(config), bn = std::get<2>(config);
+        const int wm = std::get<4>(config), wn = std::get<5>(config);
+        const int bytes = std::get<0>(std::get<7>(config));
+        if (wm <= 0 || wn <= 0 || bytes <= 0)
+            return 0;
+        const int threads = (bm / wm) * (bn / wn) * 32;
+        if (threads <= 0)
+            return 0;
+        const int thread_budget = resident
+            ? std::min(device->maxThreadsPerMultiProcessor, device->regsPerMultiprocessor / 256)
+            : device->maxThreadsPerMultiProcessor;
+        return std::min<int>(device->sharedMemPerMultiprocessor / bytes, thread_budget / threads);
+    };
+    const auto evaluate_resident = [&](ConfigTuple& candidate, const ConfigTuple& fallback) {
+        const int sms = std::get<0>(candidate), bm = std::get<1>(candidate), bn = std::get<2>(candidate);
+        const int bk = std::get<3>(candidate), wm = std::get<4>(candidate), wn = std::get<5>(candidate);
+        const int stages = std::get<6>(candidate);
+        if (!is_ppu15 || is_a8w4 || (k != 256 && k != 384) || bk != 128 ||
+            stages < 2 || stages > k / bk || bm < 128 || bn < 128 || wm <= 0 || wn <= 0 ||
+            n % (int64_t(bn) * KernelAiuMultistageOnN::N_EXPAND) != 0)
+            return false;
+        const int warp_fragments = cute::ceil_div(wm, 16) + cute::ceil_div(wn, 16);
+        if (wm > 80 || warp_fragments > (stages == 2 ? 8 : 7))
+            return false;
+        const auto bytes = KernelAiuMultistageOnN::smem_size(k, bm, bn, bk, stages);
+        if (bytes > device->sharedMemPerBlockOptin)
+            return false;
+        std::get<0>(std::get<7>(candidate)) = static_cast<int>(bytes);
+        const int resident_ctas = active_ctas(candidate, true);
+        const int64_t panels = int64_t(ceil_div(m, bm)) * (n / bn / KernelAiuMultistageOnN::N_EXPAND);
+        if (resident_ctas == 0 || panels < int64_t(sms) * resident_ctas)
+            return false;
+        if (expected_m < 2 * bm && resident_ctas < active_ctas(fallback, false))
+            return false;
+        return true;
+    };
+    const auto complete_locked = [&](const ConfigTuple& cfg) -> NoPadConfig {
+        NoPadConfig resident{cfg, "MultistageOnN"};
+        if (evaluate_resident(resident.cfg, cfg))
+            return resident;
+        return {cfg, fallback_strategy};
+    };
+
+    if (configs.has_value()) {
+        ConfigTuple cfg = *configs;
+        std::get<7>(cfg) = deep_gemm_int8::get_smem_config(
+            std::get<6>(cfg), k, std::get<1>(cfg), std::get<2>(cfg), std::get<3>(cfg), 1, is_a8w4 ? 4 : 8);
+        return complete_locked(cfg);
+    }
+    if (is_a8w4) {
+        const auto lut_kind = deep_gemm_a8w4_common::get_a8w4_lut_kind();
+        return {deep_gemm_a8w4_common::get_best_configs(
+                    expected_m, n, k, num_groups, num_sms, GemmType::MGroupedNoPad,
+                    /*runtime_lut_kind=*/lut_kind, /*from_runtime_lut=*/nullptr),
+                fallback_strategy};
+    }
+    const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(dtype);
+    if (is_ppu15 && (k == 256 || k == 384))
+        return deep_gemm_int8::get_best_nopad_configs(
+            expected_m, n, k, num_groups, num_sms, lut_kind, evaluate_resident, active_ctas);
+    return {deep_gemm_int8::get_best_configs(
+                expected_m, n, k, num_groups, num_sms, GemmType::MGroupedNoPad,
+                /*max_block_n=*/256, /*runtime_lut_kind=*/lut_kind, /*from_runtime_lut=*/nullptr),
+            fallback_strategy};
+}
+
 static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                                                           const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                                                           const torch::Tensor& out, const torch::Tensor& m_indices,
@@ -889,28 +963,11 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         }
     }
 
-    ConfigTuple cfg;
-    if (configs.has_value()) {
-        auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
-        auto smem_config = deep_gemm_int8::get_smem_config(
-            nst, k, bm, bn, bk, /*bpp=*/1,
-            /*element_b_bits=*/is_a8w4 ? 4 : 8);
-        cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, nst, smem_config);
-    } else if (is_a8w4) {
-        const auto lut_kind = deep_gemm_a8w4_common::get_a8w4_lut_kind();
-        cfg = deep_gemm_a8w4_common::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::MGroupedNoPad,
-            /*runtime_lut_kind=*/lut_kind, /*from_runtime_lut=*/nullptr);
-    } else {
-        const auto lut_kind = deep_gemm_int8::get_a8w8_lut_kind(lhs.scalar_type());
-        cfg = deep_gemm_int8::get_best_configs(
-            expected_m, n, k, num_groups, num_sms, GemmType::MGroupedNoPad,
-            /*max_block_n=*/256, /*runtime_lut_kind=*/lut_kind,
-            /*from_runtime_lut=*/nullptr);
-    }
-
-    auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
-    auto SMSIZE = std::get<0>(smem_config);
+    const auto selection = get_nopad_config(
+        m, n, k, expected_m, num_groups, num_sms, lhs.scalar_type(), configs, is_a8w4);
+    const auto& [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = selection.cfg;
+    const char* kernel_strategy = selection.strategy;
+    const int SMSIZE = std::get<0>(smem_config);
     int kNumGroups = num_groups;
 
     if (is_a8w4) {
@@ -1011,11 +1068,6 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     INT8GemmCutlass3Runtime::GemmKernelParams params =
         INT8GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
-    // Default, MultistageOnN, MoeDynamicTile, OverlapPrologue, OverlapMainloop
-    auto kernel_strategy = "Default";
-    if (k < 4096 && is_ppu1v5_device()) {
-        kernel_strategy = "OverlapPrologue";
-    }
     auto args =
         INT8GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
                                                       num_stages, "MGroupedNoPad", kernel_strategy, kernel_name,
@@ -1029,7 +1081,8 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
     const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
-    HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
+    DG_HGGC_DRIVER_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_cu, kernel, block.x, SMSIZE));
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
@@ -1048,6 +1101,7 @@ static void m_grouped_gemm_a8w8_per_channel_nt_nopad_impl(const torch::Tensor& l
         hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
         hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
         printf("[GroupedNoPad:]\n");
+        printf("KernelStrategy:%s\n", args.launch_info.kernel_strategy.c_str());
         printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
         printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
                args.launch_args.grid_dim.x);
