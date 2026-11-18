@@ -141,17 +141,22 @@ signature retains the None default for argument ordering only; there is no
 compatibility fallback or automatic shape inference. Pass the same current
 SM count to metadata generation and execution.
 
-New paged weighted MXFP4 requires `indices`; legacy FP8 and INT8 reject non-None
-indices. Each query still has its own context-length and block-table row.
-Pass the same request grouping to metadata generation and computation, as
-shown below. Metadata is opaque; do not construct or modify its internal format.
+Paged weighted MXFP4 requires `indices` in both metadata generation and logits
+computation. Use the same request grouping and supply the resulting grouped
+metadata to the logits call. Legacy FP8 and INT8 reject non-None indices.
+Each query has its own context-length and block-table row.
+Metadata is opaque; do not construct or modify its internal format.
 
 On M890, metadata generated with MXFP4 DSA indices schedules consecutive
-request runs together. The implementation uses a fixed capacity of 128
+request runs together. The returned int32 tensor has shape
+`[num_sms * tb_per_cu + 1, 2]` with five CTAs per CU for H32 and three for H64.
+Its shape is independent of the number of query rows. The logits kernel
+reconstructs Q blocks from the request indices and context lengths.
+The implementation uses a fixed capacity of 128
 query/head rows (four queries for H32, two for H64), masks incomplete blocks,
-and reuses KV data across query blocks of a run. Metadata generated without
-indices retains the independent per-query compatibility path. AVG, legacy
-FP8 and INT8 do not use this grouped scheduler.
+and reuses KV data across query blocks of a run. Use a unique ID per query for
+independent per-query scheduling in weighted MXFP4. AVG, legacy FP8 and INT8
+do not use this grouped scheduler.
 
 ### Request indices and MTP / ragged integration
 
@@ -257,10 +262,10 @@ logits = deep_gemm.fp8_fp4_paged_mqa_logits(
 )
 ```
 
-Always pass the same current grouping to both calls. Supplying real IDs only
-to compute does not upgrade a legacy schedule: metadata generated without
-indices retains independent per-query scheduling. Regenerate metadata when
-contexts or grouping change. For CUDA Graph replay with mutable contexts or
+Always pass the same current grouping to both calls. The logits kernel selects
+grouped scheduling from `indices` and checks the metadata shape against the
+current CU budget. Regenerate metadata when the CU budget, contexts or grouping
+change. For CUDA Graph replay with mutable contexts or
 IDs, capture metadata generation before compute so replay rebuilds the
 schedule from the current GPU tensors. Derive `Q`/`output_size` from host-known
 batch planning information when available; avoid GPU `.item()` reads in the
