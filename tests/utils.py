@@ -703,6 +703,7 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
 
         epilogue_type = kwargs.get("epilogue_type", "Default")
         swiglu_limit = kwargs.get("swiglu_limit", 0.0)
+        swizzle_b = bool(kwargs.get("swizzle_b", 0))
         if is_act_and_quant_fused(epilogue_type):
             ### meta_data
             out_quanted = torch.empty((m, (n // 4)), dtype=torch.uint8, device=tensor_device)
@@ -721,7 +722,7 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
                 deep_gemm.PreprocessMode.MXFP4, True, y_fp4, y_fp4_scale)
         else:
             y_fp4, y_fp4_scale = deep_gemm.preprocess_weights_and_scales(
-                deep_gemm.PreprocessMode.MXFP4, False, y_fp4, y_fp4_scale)
+                deep_gemm.PreprocessMode.MXFP4, False, y_fp4, y_fp4_scale, swizzle_b=swizzle_b)
 
         # Recompute ref_out from fp4-dequantized values for accurate comparison
         if _acc_check:
@@ -840,6 +841,7 @@ def construct_grouped_masked(num_groups: int, m: int, expected_m_per_group: int,
 
         epilogue_type = kwargs.get("epilogue_type", "Default")
         swiglu_limit = kwargs.get("swiglu_limit", 0.0)
+        swizzle_b = bool(kwargs.get("swizzle_b", 0))
         if is_act_and_quant_fused(epilogue_type):
             ### meta_data
             out_quanted = torch.empty((num_groups, max_m, (n // 4)), dtype=torch.uint8, device=tensor_device)
@@ -872,7 +874,7 @@ def construct_grouped_masked(num_groups: int, m: int, expected_m_per_group: int,
                 deep_gemm.PreprocessMode.MXFP4, True, y_fp4, y_fp4_scale)
         else:
             y_fp4, y_fp4_scale = deep_gemm.preprocess_weights_and_scales(
-                deep_gemm.PreprocessMode.MXFP4, False, y_fp4, y_fp4_scale)
+                deep_gemm.PreprocessMode.MXFP4, False, y_fp4, y_fp4_scale, swizzle_b=swizzle_b)
 
         if _acc_check:
             x_ref = torch.stack(x_ref_list, dim=0)
@@ -2175,6 +2177,7 @@ def test_m_grouped_gemm_masked(args) -> None:
     enable_sbo_overlap = args['enable_sbo_overlap'] if 'enable_sbo_overlap' in args else False
     epilogue_type = args.get("epilogue_type", "Default")
     swiglu_limit = args.get("swiglu_limit", 0.0)
+    swizzle_b = bool(args.get("swizzle_b", 0))
 
     if isinstance(enable_sbo_overlap, str):
         enable_sbo_overlap = enable_sbo_overlap.lower() == 'true'
@@ -2200,10 +2203,10 @@ def test_m_grouped_gemm_masked(args) -> None:
     case = (f'GroupedMasked,data_type:{dtype_name},groups:{num_groups},m:{m},n:{n},k:{k},'
             f'em:{expected_m_per_group},padding_m:{max_m},distribution:{distribution},'
             f'quant_type:{quant_type},group_size:{group_size},enable_sbo_overlap:{int(enable_sbo_overlap)},'
-            f'epilogue_type:{epilogue_type},swiglu_limit:{swiglu_limit},with_bias:{int(bool(args.get("with_bias", False)))}')
+            f'epilogue_type:{epilogue_type},swiglu_limit:{swiglu_limit},with_bias:{int(bool(args.get("with_bias", False)))},swizzle_b:{int(swizzle_b)}')
     print(f'test_m_grouped_gemm_masked->test_func: {case}')
     if use_ppu:
-        x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit, padding_m=max_m)
+        x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit, padding_m=max_m, swizzle_b=swizzle_b)
         bias = make_grouped_fp4_bias(args)
         if bias is not None and _acc_check:
             ref_out = (ref_out.float() + bias.unsqueeze(1)).to(torch.bfloat16)
@@ -2229,7 +2232,7 @@ def test_m_grouped_gemm_masked(args) -> None:
             else:
                 # `Default` epilogue
                 result = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(x, y, bias, out, masked_m, expected_m_per_group,
-                                                                    enable_sbo_overlap=enable_sbo_overlap, signal=signal)
+                                                                    enable_sbo_overlap=enable_sbo_overlap, signal=signal, swizzle_b=swizzle_b)
         elif d == 'w4fa8_mma':
             deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(x, y, out, masked_m, expected_m_per_group)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
@@ -2393,9 +2396,11 @@ def test_m_grouped_gemm_nopad(args) -> None:
     if group_size in args: UT += f",group_size:{group_size}"
     epilogue_type = args.get("epilogue_type", "Default")
     swiglu_limit = args.get("swiglu_limit", 0.0)
+    swizzle_b = bool(args.get("swizzle_b", 0))
+    if swizzle_b: UT += f",swizzle_b:1"
     print(UT)
     if use_ppu:
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit)
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit, swizzle_b=swizzle_b)
         bias = make_grouped_fp4_bias(args)
         if bias is not None and _acc_check:
             ref_out = (ref_out.float() + bias[m_indices.long()]).to(torch.bfloat16)
@@ -2414,7 +2419,7 @@ def test_m_grouped_gemm_nopad(args) -> None:
                 ref_out, ref_out_scale = ref_out
                 deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices, out_scale=out_scale, swiglu_limit=swiglu_limit, activation_type=epilogue_type_to_activation(epilogue_type))
             else:
-                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices)
+                deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(x, y, bias, out, m_indices, swizzle_b=swizzle_b)
         elif d == 'w4fa8_mma':
             deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(x, y, out, m_indices)
         elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
