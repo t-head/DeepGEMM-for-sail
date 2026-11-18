@@ -167,14 +167,65 @@ def test_mqa_logits_loop():
     print("Passed\n")
 
 
-def test_fp4_mqa_compressed_boundaries():
-    if not is_ppu1v5_device():
-        return
+def _compressed_mqa_windows():
     # The first Q block has a full interior with partial prefix/suffix;
     # later blocks cover empty/disjoint windows and a partial Q tail.
     starts = [3, 7, 5, 9, 0, 63, 64, 65, 511, 512, 513, 1023, 1024]
     ends = [1025, 1029, 1030, 1027, 0, 64, 65, 129, 512, 768, 1025, 1024, 1031]
-    nq, nk, dim = len(starts), 1031, 128
+    return starts, ends
+
+
+def test_mqa_compressed_boundaries():
+    starts, ends = _compressed_mqa_windows()
+    nq, nk, dim = len(starts), max(ends), 128
+    width = max(end - start for start, end in zip(starts, ends))
+    ks = torch.tensor(starts, device='cuda', dtype=torch.int32)
+    ke = torch.tensor(ends, device='cuda', dtype=torch.int32)
+    valid = torch.arange(width, device='cuda')[None, :] < (ke - ks)[:, None]
+    if is_ppu1v5_device():
+        fn, qk_dtype = deep_gemm.fp8_mqa_logits, torch.float8_e4m3fn
+        output_dtypes = (torch.float32,)
+    else:
+        fn, qk_dtype = deep_gemm.int8_mqa_logits, torch.int8
+        output_dtypes = (torch.float32, torch.bfloat16)
+
+    for heads in (32, 64):
+        q = torch.randint(-8, 9, (nq, heads, dim), device='cuda').to(torch.float32).to(qk_dtype)
+        k = torch.randint(-8, 9, (nk, dim), device='cuda').to(torch.float32).to(qk_dtype)
+        scales = torch.rand(nk, device='cuda') / 64 + 1 / 128
+        scores = torch.einsum('qhd,kd->qhk', q.float(), k.float()).relu()
+        for dtype in output_dtypes:
+            weights = torch.rand(nq, heads, device='cuda').to(dtype) / 16
+            # The C++ API allocates logits with torch::empty. Poison that
+            # allocation so writes past each compressed row's end are observable.
+            deterministic = torch.are_deterministic_algorithms_enabled()
+            warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+            fill = torch.utils.deterministic.fill_uninitialized_memory
+            try:
+                torch.use_deterministic_algorithms(True)
+                torch.utils.deterministic.fill_uninitialized_memory = True
+                logits = fn(q, (k, scales), weights, ks, ke, max_seqlen_k=width)
+            finally:
+                torch.utils.deterministic.fill_uninitialized_memory = fill
+                torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+
+            reference = (scores * weights.float()[:, :, None]).sum(1) * scales
+            expected = torch.cat([reference[i, start:end]
+                                  for i, (start, end) in enumerate(zip(starts, ends))])
+            actual = logits[valid]
+            assert logits.dtype == dtype and logits.shape == (nq, width)
+            assert torch.isnan(logits[~valid]).all(), (qk_dtype, dtype, heads)
+            assert torch.isfinite(actual).all(), (qk_dtype, dtype, heads)
+            diff = calc_diff(actual, expected)
+            assert diff < 1e-3, (qk_dtype, dtype, heads, diff)
+            print('PASS compressed MQA writeback', qk_dtype, dtype, heads, flush=True)
+
+
+def test_fp4_mqa_compressed_boundaries():
+    if not is_ppu1v5_device():
+        return
+    starts, ends = _compressed_mqa_windows()
+    nq, nk, dim = len(starts), max(ends), 128
     ks = torch.tensor(starts, device='cuda', dtype=torch.int32)
     ke = torch.tensor(ends, device='cuda', dtype=torch.int32)
     for heads in (32, 64):
@@ -786,23 +837,21 @@ class _PagedFP4VarlenCase:
         self.lengths.copy_(torch.tensor(lengths, device='cuda', dtype=torch.int32)[:, None])
         self.table.copy_(torch.tensor(tables, device='cuda', dtype=torch.int32))
 
-    def metadata(self, grouped=True):
+    def metadata(self):
         return deep_gemm.get_paged_mqa_logits_metadata(
             self.lengths, self.page, deep_gemm.get_num_sms(),
-            indices=self.ids if grouped else None,
+            indices=self.ids,
             metadata_extra=(1, self.heads, 128, torch.int8))
 
-    def run(self, grouped=True):
-        meta = self.metadata(grouped)
+    def run(self):
+        meta = self.metadata()
         output = deep_gemm.fp8_fp4_paged_mqa_logits(
             self.q, self.cache, self.weights, self.lengths, self.table, meta,
             self.context, indices=self.ids)
         return meta, output
 
     def check(self, output):
-        _, baseline = self.run(False)
         valid = torch.arange(self.context, device='cuda')[None, :] < self.lengths
-        assert torch.equal(output[valid].view(torch.int16), baseline[valid].view(torch.int16))
         expected = ref_paged_mqa_logits(self.q_ref, self.cache_ref, self.weights,
                                         self.lengths, self.table, self.context)
         diff = calc_diff(output.masked_fill(~valid, 0), expected.masked_fill(~valid, 0))
@@ -817,6 +866,8 @@ def test_paged_fp4_varlen():
         for page in (32, 64, 128):
             case = _PagedFP4VarlenCase(heads, page)
             meta, output = case.run()
+            workers_per_cu = 5 if heads == 32 else 3
+            assert meta.shape == (workers_per_cu * deep_gemm.get_num_sms() + 1, 2)
             case.check(output)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -830,6 +881,37 @@ def test_paged_fp4_varlen():
                 valid = torch.arange(case.context, device='cuda')[None, :] < case.lengths
                 assert torch.isnan(output[~valid]).all(), 'write beyond per-query context'
             if heads == 32 and page == 64:
+                # Four grouped CUs and five legacy CUs both produce 21 rows.
+                saved_num_sms = deep_gemm.get_num_sms()
+                try:
+                    deep_gemm.set_num_sms(4)
+                    stale_meta = case.metadata()
+                    assert stale_meta.shape == (21, 2)
+                    deep_gemm.set_num_sms(5)
+                    try:
+                        deep_gemm.fp8_fp4_paged_mqa_logits(
+                            case.q, case.cache, case.weights, case.lengths, case.table,
+                            stale_meta, case.context, indices=case.ids)
+                    except RuntimeError as error:
+                        assert 'request indices require grouped MXFP4 metadata' in str(error), str(error)
+                    else:
+                        raise AssertionError('grouped metadata from another CU budget must be rejected')
+                finally:
+                    deep_gemm.set_num_sms(saved_num_sms)
+
+                # Like a serving runner, copy into a stable buffer before replay.
+                stable_meta = meta.clone()
+                external_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(external_graph):
+                    external_output = deep_gemm.fp8_fp4_paged_mqa_logits(
+                        case.q, case.cache, case.weights, case.lengths, case.table,
+                        stable_meta, case.context, indices=case.ids)
+                for phase in (0, 1):
+                    case.update(phase)
+                    stable_meta.copy_(case.metadata())
+                    external_graph.replay()
+                    case.check(external_output)
+
                 # One run, all singletons and the zero-work schedule are distinct boundaries.
                 for single in (True, False):
                     if single:
@@ -853,9 +935,10 @@ def test_paged_fp4_varlen():
         meta = deep_gemm.get_paged_mqa_logits_metadata(
             lengths, 64, deep_gemm.get_num_sms(), indices=ids,
             metadata_extra=(1, heads, 128, torch.int8))
-        workers = meta.size(0) - nq - 1
-        starts = meta[:workers + 1].cpu()
-        assert torch.all(starts[:-1, 0] == 0) and starts[-1, 0] == nq // (128 // heads)
+        workers = (5 if heads == 32 else 3) * deep_gemm.get_num_sms()
+        assert meta.shape == (workers + 1, 2)
+        starts = meta.cpu()
+        assert torch.all(starts[:-1, 0] == 0) and starts[-1, 0] == nq
         assert starts[0, 1] == 0 and torch.all(starts[1:workers, 1] > starts[:workers - 1, 1])
         print('PASS grouped FP4 metadata capacity', heads, flush=True)
 
@@ -941,6 +1024,7 @@ if __name__ == '__main__':
     test_per_layer_cache_view()
     test_paged_int8_page_boundaries()
     test_mqa_logits_loop()
+    test_mqa_compressed_boundaries()
     test_fp4_mqa_compressed_boundaries()
     test_paged_mqa_metadata_scan()
     test_paged_mqa_logits_loop()

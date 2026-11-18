@@ -13,6 +13,12 @@ These guidelines apply to contributions to this repository, including changes ma
 - Keep dtype-specific configuration logic independent. Move genuinely shared argument types to an appropriate common location rather than including another operator's implementation for incidental dependencies.
 - Do not change shared compiler, cache, or runtime interfaces to accommodate one operator when the requirement can be handled in that operator's runtime. Cross-cutting changes require a clear justification and validation of affected callers.
 
+## Upstream API compatibility review
+
+- For API changes and optimizations behind an upstream-compatible entry point, record the upstream revision and compare the actual calling contract. Check argument semantics and validation, return dtype and shape, what determines the shape, and buffer ownership and lifetime.
+- For each deviation from upstream, add an explicit explanation of why it is needed and why the proposed contract is feasible for affected callers. Explain whether upstream alignment is feasible, what limits it, and what caller changes or validation the deviation requires. Document caller-visible differences in the relevant API documentation.
+- Validate compatibility using actual caller patterns. Where callers preallocate fixed-size buffers, check which configuration values determine the required capacity, verify that they can copy and consume returned data in their own buffers, and exercise graph replay with updated inputs at the captured shape. Check that producer and consumer stages agree on the meaning of shared inputs and outputs.
+
 ## Optimization structure and tradeoffs
 
 AI contributors are encouraged to explore any plausible optimization path, including specialized configurations, duplicated code, and temporary strategies. The generalization and structural requirements below apply when preparing changes for formal submission, not during exploration. Attribute the performance impact of each optimization separately through controlled comparisons, and record its measured gain or regression rather than reporting only the combined result. Before submission, select and consolidate the retained changes according to the following requirements.
