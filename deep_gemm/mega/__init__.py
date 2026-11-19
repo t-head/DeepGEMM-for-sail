@@ -505,6 +505,11 @@ def transform_weights_for_w4a16_mega_moe(
 
     w1, s1 = l1_weights
     w2, s2 = l2_weights
+    if torch.cuda.get_device_capability(w1.device) == (8, 0):
+        pack = _C.preprocess_weights_and_scales
+        mode = _C.PreprocessMode.W4A16_MXFP4
+        return (pack(mode, False, _interleave_weights(w1), _interleave_weights(s1)),
+                pack(mode, False, w2, s2))
     return (_interleave_weights(w1), pack_scales(_interleave_weights(s1))), (w2, pack_scales(s2))
 
 
@@ -521,9 +526,13 @@ def _check_routed_buffer(
         or y.shape[1] != sym_buffer.hidden
     ):
         raise ValueError("output must have shape [tokens, workspace hidden]")
+    sm80_w4 = sym_buffer.mma_type == 'bf16xfp4' and torch.cuda.get_device_capability(y.device) == (8, 0)
+    packed_shape = ((sym_buffer.hidden // 16, 4 * sym_buffer.intermediate_hidden) if sm80_w4 else None)
     if (not isinstance(l1_weights, (tuple, list)) or len(l1_weights) != weight_components
             or not isinstance(l1_weights[0], torch.Tensor)
-            or l1_weights[0].ndim != 3 or l1_weights[0].shape[1] != 2 * sym_buffer.intermediate_hidden):
+            or l1_weights[0].ndim != 3
+            or (l1_weights[0].shape[1:] != packed_shape if sm80_w4
+                else l1_weights[0].shape[1] != 2 * sym_buffer.intermediate_hidden)):
         raise ValueError("l1_weights must match the workspace intermediate_hidden")
 
 

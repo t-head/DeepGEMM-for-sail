@@ -100,7 +100,7 @@ public:
     }
 
     template <
-        class ProblemShapeMNKL, class BlockShapeMNK, class BlockCoordMNKL,
+        int kWarpsOnK = 1, class ProblemShapeMNKL, class BlockShapeMNK, class BlockCoordMNKL,
         class FrgEngine, class FrgLayout, class TiledMma, class ResidueMNK>
     CUTLASS_DEVICE void operator()(
             ProblemShapeMNKL problem_shape_mnkl,
@@ -135,7 +135,10 @@ public:
 
         constexpr int kSmemM = size<0>(shared_accumulator);
         constexpr int kSmemN = size<1>(shared_accumulator);
-        constexpr int kNumThreads = CUTE_STATIC_V(size(TiledMma{}));
+        // After CTA K reduction only the leading K=0 warps own final accumulators.
+        // The whole CTA still participates in both shared-memory barriers.
+        constexpr int kNumThreads = CUTE_STATIC_V(size(TiledMma{})) / kWarpsOnK;
+        const bool writes_output = kWarpsOnK == 1 || thread_idx < kNumThreads;
         const uint32_t tile_row = m_coord * get<0>(block_shape_mnk);
         const uint32_t block_row = offset_m + tile_row;
         const uint32_t valid_rows = get<0>(problem_shape_mnkl);
@@ -168,16 +171,18 @@ public:
                             step_m * size<1>(shared_r2s) + pipe_m;
                         const int mma_n =
                             step_n * size<2>(shared_r2s) + pipe_n;
-                        copy(tiled_r2s,
-                             register_accumulator(_, mma_m, mma_n),
-                             shared_r2s(_, pipe_m, pipe_n));
+                        if (writes_output)
+                            copy(tiled_r2s,
+                                 register_accumulator(_, mma_m, mma_n),
+                                 shared_r2s(_, pipe_m, pipe_n));
                     }
                 }
                 __syncthreads();
 
-                scatter_subtile<kNumThreads>(shared_accumulator_stage, N,
-                    thread_idx, block_row + step_m * kSmemM, subtile_m_begin,
-                    valid_rows, n_base, scatter_buffer);
+                if (writes_output)
+                    scatter_subtile<kNumThreads>(shared_accumulator_stage, N,
+                        thread_idx, block_row + step_m * kSmemM, subtile_m_begin,
+                        valid_rows, n_base, scatter_buffer);
 
             }
         }
@@ -293,8 +298,7 @@ public:
         }
     }
 
-private:
-
+public:
     template <int kNumThreads, class SharedTensor>
     CUTLASS_DEVICE void scatter_subtile(SharedTensor shared_accumulator_stage,
             int N, int thread_idx, uint32_t global_row, uint32_t subtile_m_begin,
@@ -410,6 +414,7 @@ private:
         }
     }
 
+private:
     Params params_;
     ThreadEpilogueOp epilogue_op_;
 };

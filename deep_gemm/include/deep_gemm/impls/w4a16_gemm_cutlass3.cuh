@@ -33,7 +33,7 @@ template <typename ElementB, typename ElementScale,
           int BlockM, int BlockN, int BlockK,
           int WarpM, int WarpN, int WarpK,
           int kNumGroups, int kNumStages, GemmType kGemmType,
-          int kGroupSize = 32, int N_EXPAND = 1>
+          int kGroupSize = 32, int N_EXPAND = 1, class Scheduler = void>
 class W4A16GEMM {
 public:
   using ElementA = cutlass::bfloat16_t;
@@ -57,11 +57,12 @@ public:
   using TileShape = Shape<Int<BlockM>, Int<BlockN>, Int<BlockK>>;
   static constexpr int N_Blocks = ceil_div(ShapeN, BlockN * N_EXPAND);
   static constexpr int scheduler_swizzle = (BlockM == 16) ? 1: 2;
-  using TileScheduler = cute::conditional_t<
+  using DefaultScheduler = cute::conditional_t<
     Fused,
     deep_gemm::FusedGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND, kNumGroups, N_Blocks, scheduler_swizzle>,
     deep_gemm::DeepGemmScheduler<kGemmType, ShapeN, ShapeK, BlockM, BlockN * N_EXPAND, kNumGroups, N_Blocks, scheduler_swizzle>
   >;
+  using TileScheduler = cute::conditional_t<cute::is_same_v<Scheduler, void>, DefaultScheduler, Scheduler>;
 #if __HGGC_ARCH__ == 100
     using ArchTag = cutlass::arch::PPU0010;
 #else
@@ -186,7 +187,7 @@ public:
     const int* sorted_token_ids;
     typename TileScheduler::Params scheduler;
 
-    CUTLASS_HOST
+    CUTLASS_HOST_DEVICE
     Params(const ElementA* ptr_a_,
           const int* ptr_b_,
           const ElementScale* ptr_scale_,
@@ -222,9 +223,8 @@ public:
     }
   }
 
-  CUTLASS_DEVICE
-  void
-  operator()(Params const& params, char* smem_buf) {
+  template <class Output = std::false_type>
+  CUTLASS_DEVICE void operator()(Params const& params, char* smem_buf, Output output = {}) {
     int thread_idx = threadIdx.x;
     int warp_idx = canonical_warp_idx_sync();
     int warpm_idx = warp_idx % WarpsOnM;
@@ -328,14 +328,19 @@ public:
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
 
       int coord_l = deep_scheduler.curr_group_idx;
+      auto w = params.ptr_b;
+      auto sf = params.ptr_scale;
+      if constexpr (!std::is_same_v<Output, std::false_type>) {
+        output.select_bank(coord_l, w, sf);
+      }
       n_block_idx *= N_EXPAND;
 
-      Tensor mB_nkl = make_tensor(make_gmem_ptr(params.ptr_b), make_shape(Int<K / 16>{}, Int<N * 2>{}, Int<L>{}), strideB); // (k/16,n*2,l)
+      Tensor mB_nkl = make_tensor(make_gmem_ptr(w), make_shape(Int<K / 16>{}, Int<N * 2>{}, Int<L>{}), strideB); // (k/16,n*2,l)
       Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,coord_l)); // (k/16,n*2)
       Tensor gB = local_tile(mB_nk, TileB{}, make_coord(_, n_block_idx)); // (BLK_K/16,BLK_N*2,blocks_k)
       Tensor tBgB = gmem_thr_copy_B.partition_S(gB);
 
-      Tensor mScale_nkl = make_tensor(make_gmem_ptr(params.ptr_scale), make_shape(Int<K / kGroupSize>{}, Int<N>{}, Int<L>{}), strideScale); // (k/group_size,n,l)
+      Tensor mScale_nkl = make_tensor(make_gmem_ptr(sf), make_shape(Int<K / kGroupSize>{}, Int<N>{}, Int<L>{}), strideScale); // (k/group_size,n,l)
       Tensor mScale_nk = make_mix_tensor_like(mScale_nkl(_,_,coord_l)); // (k/group_size,n)
       Tensor gScale = local_tile(mScale_nk, TileScale{}, make_coord(_, n_block_idx)); // (BLK_K/group_size,BLOCK_N,blocks_k)
       Tensor tSgS = gmem_thr_copy_scale.partition_S(gScale);
@@ -379,6 +384,8 @@ public:
       auto g2s_copy_A = [&](int k_tile_iter, int k_pipe) {
         if constexpr(!Fused) { // aiu copy
           if (warp_idx == 0) {
+            if constexpr (!std::is_same_v<Output, std::false_type>)
+              output.wait_for_input(deep_scheduler, k_tile_iter);
             copy(gmem_tiled_copy_A, tAgA(_,_,_,k_tile_iter), tAsA(_,_,_,k_pipe));
           }
         } else { // async copy
@@ -755,6 +762,10 @@ public:
       __syncthreads();
 
       epilogue_cta_reduce();
+      if constexpr (!std::is_same_v<Output, std::false_type>) {
+        output.store(accum, thr_mma.partition_C(cD), tiled_mma, warpk_idx, deep_scheduler.curr_cumsum_m,
+                     m_block_idx, n_block_idx, residual_m, smem_buf);
+      } else
       #if __HGGC_ARCH__ == 150
         epilogue_no_tsm();
       #else

@@ -16,7 +16,7 @@ using comm::resolve_fused_round_generation;
 
 // INT8 broadcasts contiguous source-token scales, then compacts expert rows.
 // The publication, metadata, row copy and scheduler protocols remain shared.
-template <uint32_t BlockK>
+template <uint32_t BlockK, bool Bf16 = false>
 struct Int8FusedDispatch {
     template <class Scheduler>
     static constexpr uint32_t shared_bytes() {
@@ -32,7 +32,7 @@ struct Int8FusedDispatch {
         constexpr uint32_t groups = Scheduler::kNumGroups;
         constexpr uint32_t capacity = Scheduler::kSourceCapacity;
         constexpr uint32_t topk = Scheduler::kNumTopK;
-        const layout::Int8MegaMoEBuffer buffers(
+        const layout::MegaMoEBufferLayout<Bf16 ? layout::MegaMoEStorageFormat::BF16 : layout::MegaMoEStorageFormat::INT8> buffers(
             ranks, ranks * groups, capacity, topk, Scheduler::SHAPE_K, Scheduler::SHAPE_N / 2,
             sched.staging);
         auto* prefix = reinterpret_cast<uint32_t*>(shared);
@@ -58,7 +58,7 @@ struct Int8FusedDispatch {
                 const uint32_t begin = rank ? prefix[rank - 1] : 0;
                 const uint64_t source = (uint64_t(expert) * ranks + rank) * capacity + row - begin;
                 const uint32_t token = __ldbl(tokens + source);
-                __stbl(sched.local_sfa_buf + row_base + row,
+                if constexpr (!Bf16) __stbl(sched.local_sfa_buf + row_base + row,
                        __ldbl(scales + uint64_t(rank) * capacity + token / topk));
                 __stbl(&sources[row_base + row].rank_idx, rank);
                 __stbl(&sources[row_base + row].token_idx, token / topk);
@@ -80,7 +80,7 @@ struct Int8FusedDispatch {
         constexpr uint32_t groups = Scheduler::kNumGroups;
         constexpr uint32_t capacity = Scheduler::kSourceCapacity;
         constexpr uint32_t topk = Scheduler::kNumTopK;
-        const layout::Int8MegaMoEBuffer buffers(
+        const layout::MegaMoEBufferLayout<Bf16 ? layout::MegaMoEStorageFormat::BF16 : layout::MegaMoEStorageFormat::INT8> buffers(
             ranks, ranks * groups, capacity, topk, Scheduler::SHAPE_K, Scheduler::SHAPE_N / 2,
             sched.staging);
         auto* base = sched.sym_buffer.get_base_ptr<layout::MegaMoESignals*>();
@@ -109,7 +109,7 @@ struct Int8FusedDispatch {
         auto* ready = sched.sym_buffer.get_base_ptr<layout::MegaMoESignals*>()->preprocess_ready;
         prepare_metadata<Scheduler, Threads>(sched, smem, generation);
         mega_moe_common::run_copy_block<Scheduler::BLOCK_M, Scheduler::kNumRanks,
-                       BlockK, Scheduler::kKTilesPerFlag, Scheduler::SHAPE_K, Threads,
+                       BlockK * (Bf16 ? 2 : 1), Scheduler::kKTilesPerFlag, Scheduler::SHAPE_K * (Bf16 ? 2 : 1), Threads,
                        Scheduler::kSourceCapacity, Scheduler::kNumTopK>(
             sched, sched.copy_grouped_layout[0], smem, generation,
             [&](uint32_t expert, bool last_stripe) {
@@ -133,7 +133,7 @@ struct Int8FusedDispatch {
 
 // Copy allocates only metadata, independently of the GEMM operand pipeline.
 template <int N, int K, int BM, int BK, int Groups, int Ranks,
-          int KTilesPerFlag, int SourceCapacity, int TopK, int Threads>
+          int KTilesPerFlag, int SourceCapacity, int TopK, int Threads, bool Bf16 = false>
 struct MegaMoECopyKernel {
     static_assert(is_supported_megamoe_rank_count(Ranks));
     static_assert(Threads >= Ranks && Threads >= 64 && Threads % 32 == 0);
@@ -152,7 +152,7 @@ struct MegaMoECopyKernel {
     static constexpr int SharedStorageSize = CopyBytes > PrepareBytes ? CopyBytes : PrepareBytes;
 
     __device__ static void run(const Arguments& sched, char* smem) {
-        Int8FusedDispatch<BK>::template prepare_copy<PrepareConfig, Threads>(sched, smem);
+        Int8FusedDispatch<BK, Bf16>::template prepare_copy<PrepareConfig, Threads>(sched, smem);
     }
 };
 

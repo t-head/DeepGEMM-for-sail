@@ -105,7 +105,7 @@ __device__ __forceinline__ void broadcast_token_scales(
 }
 
 // Claim routes and publish quantized source rows through one round protocol.
-template <bool Int8, int Hidden, int TopK, uint32_t SourceCapacity,
+template <layout::MegaMoEStorageFormat Format, int Hidden, int TopK, uint32_t SourceCapacity,
           uint32_t NumRanks, uint32_t NumExperts, int Intermediate,
           int64_t StagingScales, int64_t StagingCounts, int64_t StagingTokens, typename TopkIdx, bool kInputAligned>
 __global__ void mega_moe_pre_dispatch(
@@ -114,14 +114,16 @@ __global__ void mega_moe_pre_dispatch(
     const float* __restrict__ topk_weights,
     uint32_t num_tokens, layout::SymBuffer<> sym_buffer) {
 
-    static_assert(Hidden >= 1024 && Hidden % 512 == 0,
+    constexpr bool Int8 = Format == layout::MegaMoEStorageFormat::INT8;
+    constexpr bool Bf16 = Format == layout::MegaMoEStorageFormat::BF16;
+    static_assert(Bf16 ? Hidden % 256 == 0 : Hidden >= 1024 && Hidden % 512 == 0,
                   "MegaMoE hidden must be a multiple of 512 and at least 1024");
     constexpr int kElementsPerThread = 16; // 16 BF16 values = 2 int4 loads
     constexpr int kScaleGroupSize = 32;
     constexpr int kLanesPerScale = kScaleGroupSize / kElementsPerThread;  // 2
     constexpr int kQuantChunks = Hidden / kElementsPerThread;
     using Scale = std::conditional_t<Int8, float, uint16_t>;
-    using BufferLayout = layout::MegaMoEBufferLayout<Int8>;
+    using BufferLayout = layout::MegaMoEBufferLayout<Format>;
     constexpr int kRowBytes = BufferLayout::Storage::row_bytes(Hidden);
     constexpr int kScales = BufferLayout::Storage::scale_bytes(Hidden) / sizeof(Scale);
     // INT8 batches independent token scales for communication, never along K.
@@ -129,7 +131,7 @@ __global__ void mega_moe_pre_dispatch(
     // For shapes such as Hidden=7168, reserve warp 7 for slot claims.
     constexpr int kQuantWarps = 7;
     constexpr int kQuantThreads = kQuantWarps * 32;
-    constexpr bool kSeparateClaimWarp = !Int8 && (kQuantChunks % kQuantThreads) == 0;
+    constexpr bool kSeparateClaimWarp = Format == layout::MegaMoEStorageFormat::MXFP4 && (kQuantChunks % kQuantThreads) == 0;
     static_assert(SourceCapacity > 0,
                   "SourceCapacity must be positive");
     static_assert(TopK >= 1 && TopK <= 32,
@@ -188,7 +190,7 @@ __global__ void mega_moe_pre_dispatch(
         : (threadIdx.x < TopK);
 
     __shared__ __align__(16) uint8_t s_data[kRowBytes];
-    __shared__ __align__(16) Scale s_scales[kScales];
+    __shared__ __align__(16) Scale s_scales[kScales ? kScales : 1];
     __shared__ uint32_t s_slot[TopK];
     __shared__ int s_expert[TopK];
     __shared__ bool s_push_scale[TopK];
@@ -281,14 +283,17 @@ __global__ void mega_moe_pre_dispatch(
                 slot = atomicAdd(&counts[expert_idx], 1u);
             }
             s_slot[t] = slot;
-            if constexpr (!Int8) {
+            if constexpr (Format == layout::MegaMoEStorageFormat::MXFP4) {
                 uint32_t owner = slot < SourceCapacity ? uint32_t(expert_idx) / kNumLocalExperts : NumRanks;
                 const uint32_t peers = __match_any_sync(0xffffffffu >> (32 - TopK), owner);
                 s_push_scale[t] = (peers & __ppu_read_lanemask_lt()) == 0;
             }
         }
 
-        if constexpr (Int8) {
+        if constexpr (Bf16) {
+            for (int j = threadIdx.x; j < Hidden; j += blockDim.x)
+                reinterpret_cast<__ppu_bfloat16*>(s_data)[j] = token_data[j];
+        } else if constexpr (Int8) {
             quantize_int8_token<Hidden, kInputAligned>(token_data, s_data, s_scales);
         } else {
             // Phase 1: preload BF16 vectors, then quantize into shared memory.
@@ -382,7 +387,7 @@ __global__ void mega_moe_pre_dispatch(
                     uint32_t local_expert = expert - owner * kNumLocalExperts;
                     uint64_t expert_rank = local_expert * NumRanks + rank_idx;
                     uint64_t staging_idx = expert_rank * SourceCapacity + slot;
-                    if constexpr (!Int8) {
+                    if constexpr (Format == layout::MegaMoEStorageFormat::MXFP4) {
                         if (s_push_scale[t]) {
                             uint16_t* staging = sym_buffer.map(staging_scales, owner) +
                                 (generation & 1u) * kScaleStride;
