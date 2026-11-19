@@ -747,12 +747,15 @@ static int64_t get_smem_size_bf16_810e(int bm, int bn, int bk, int wm, int stage
     return std::max(mainSmem, epiSmem);
 }
 
-// Shared-memory residency bound for the measured 810E tile families. Register
-// allocation can impose a tighter limit; this is not a general occupancy model.
+// SMEM-only estimate for 256 KiB/CU; register and thread limits are not modeled.
+static int64_t get_smem_residency_810e(const BF16GemmConfig810E& t) {
+    const int64_t smem = get_smem_size_bf16_810e(t.bm, t.bn, t.bk, t.wm, t.stages);
+    return std::max<int64_t>(1, (256LL << 10) / smem);
+}
+
 static int64_t get_smem_waves_810e(int64_t m, int64_t n,
                                    const BF16GemmConfig810E& t) {
-    const int64_t smem = get_smem_size_bf16_810e(t.bm, t.bn, t.bk, t.wm, t.stages);
-    const int64_t resident = std::max<int64_t>(1, (256LL << 10) / smem);
+    const int64_t resident = get_smem_residency_810e(t);
     const int64_t blocks = ceil_div(m, int64_t(t.bm)) * ceil_div(n, int64_t(t.bn)) * t.splits;
     return ceil_div(blocks, resident * kTensorCUs810E);
 }
@@ -1330,6 +1333,47 @@ static ConfigResult810E get_adaptive_configs_bf16_810e(
     if (plan.kind == BF16GemmKernelType810E::TSM && m > 64 && m <= 512 &&
         k >= 4096 && k % t.bk == 0 && t.splits == 1)
         t.peelFirstK = 1;
+    if (output == torch::kBFloat16 && !perElementOutput && !lowBudget && t.splits == 1) {
+        // Keep measured tiles on the persistent S2 path to recover utilization.
+        const bool squareS2 = t.bm == 128 && t.bn == 128 && t.bk == 64 && t.stages == 2;
+        const bool halfWidthS2 = t.bm == 128 && t.bn == 64 && t.bk == 64 && t.stages == 2;
+        const bool cachedMedium = m >= 1024 && n > 1024 && n <= 4096 && k >= 4096 &&
+            m * k * 2 <= (64LL << 20) && n * k * 2 <= (64LL << 20);
+        const bool largeStream = m >= 128 && m <= 512 && n * k * 2 > (128LL << 20);
+        const bool shortMedium = t.bm == 64 && t.bn == 128 && t.bk == 64 && t.stages == 2 &&
+            m >= 256 && m <= 512 && n >= 2048 && n <= 4096 && k >= 768 && k <= 2048 &&
+            get_smem_waves_810e(m, n, t) > 1;
+        if (plan.kind == BF16GemmKernelType810E::TSM && m % 128 == 0 &&
+            (((squareS2 || halfWidthS2) && cachedMedium) || (squareS2 && largeStream) || shortMedium)) {
+            plan.kind = BF16GemmKernelType810E::Standard;
+            t.tileOrder = 0;
+            t.peelFirstK = 0;
+        }
+
+        // Keep the measured full-wave gate under the 256 KiB / 20-CU model.
+        // This SMEM-only estimate does not guarantee runtime occupancy.
+        if (plan.kind == BF16GemmKernelType810E::Standard && halfWidthS2 &&
+            m >= 1024 && m % 128 == 0 && n > 512 && n <= 1024 && n % 128 == 64 &&
+            k >= 4096 && k % 64 == 0 && (m + n) * k * 2 <= (64LL << 20)) {
+            const BF16GemmConfig810E wide{128, 128, 64, 64, 32, 2, 1};
+            const int64_t resident = get_smem_residency_810e(wide);
+            const int64_t tiles = ceil_div(m, int64_t(wide.bm)) * ceil_div(n, int64_t(wide.bn));
+            if (tiles == resident * kTensorCUs810E) t = wide;
+        }
+
+        // For cached B, do not spend a third stage when its shared storage
+        // introduces another wave on short-M or tall, narrow-N grids.
+        const bool shortRows = plan.kind == BF16GemmKernelType810E::TSM &&
+            m > 128 && m <= 192 && t.bm == 64;
+        const bool narrowColumns = plan.kind == BF16GemmKernelType810E::Standard &&
+            n > 64 && n <= 128 && t.bm == 128;
+        if ((shortRows || narrowColumns) && t.bn == 128 && t.bk == 64 && t.stages == 3 &&
+            n * k * 2 <= (64LL << 20)) {
+            auto two = t;
+            two.stages = 2;
+            if (get_smem_waves_810e(m, n, two) < get_smem_waves_810e(m, n, t)) t = two;
+        }
+    }
     if (perElementOutput && (plan.tile.bm & (plan.tile.bm - 1)) != 0) {
         // The scalar Direct fallback retains its supported power-of-two tiles.
         plan.tile.bm = plan.tile.bm < 128 ? 64 : 128;
