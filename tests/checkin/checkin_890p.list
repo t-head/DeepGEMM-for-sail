@@ -164,6 +164,9 @@ GroupedMasked,data_type:fp4,groups:32,m:16384,n:4096,k:4096,em:512,distribution:
 GroupedMasked,data_type:fp4,groups:352,m:2048,n:3072,k:4096,em:256,distribution:uniform,epilogue_type:SiluAndMulStepPostQuantFp4,swiglu_limit:7.0000
 # Bias epilogue.
 GroupedMasked,data_type:fp4,groups:4,m:128,n:512,k:512,with_bias:1
+# B-swizzled epilogue.
+GroupedMasked,data_type:fp4,groups:8,m:32768,n:4096,k:2048,em:4096,distribution:uniform,swizzle_b:1
+GroupedMasked,data_type:fp4,groups:4,m:2048,n:512,k:2048,em:512,distribution:uniform,swizzle_b:1
 
 # --- GroupedMasked / w4a16 ---
 GroupedMasked,data_type:w4a16,groups:96,m:3072,n:2048,k:7168,quant_type:group,group_size:32
@@ -205,6 +208,10 @@ GroupedNoPad,data_type:fp4,groups:256,m:4096,n:512,k:4096,em:16,distribution:uni
 GroupedNoPad,data_type:fp4,groups:44,m:2048,n:3072,k:4096,distribution:uniform,epilogue_type:SiluAndMulStepPostQuantFp4,swiglu_limit:7.0000
 # Bias epilogue.
 GroupedNoPad,data_type:fp4,groups:4,m:128,n:512,k:512,with_bias:1
+# B-swizzled epilogue.
+GroupedNoPad,data_type:fp4,groups:4,m:32768,n:4096,k:2048,distribution:uniform,swizzle_b:1
+GroupedNoPad,data_type:fp4,groups:4,m:8192,n:512,k:2048,distribution:uniform,swizzle_b:1
+GroupedNoPad,data_type:fp4,groups:4,m:2048,n:128,k:512,distribution:uniform,swizzle_b:1
 
 # --- GroupedNoPad / w4a16 ---
 GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32

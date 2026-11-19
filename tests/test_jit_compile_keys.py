@@ -183,6 +183,7 @@ int fp4_checks() {
     CHECK_FP4(n_expand, 2);
     CHECK_FP4(epilogue_type, "SiluAndMulPostQuantFp4");
     CHECK_FP4(apply_swiglu_limit, true);
+    CHECK_FP4(swizzle_b, true);
 #undef CHECK_FP4
     count += check_change<Runtime>(args, [](auto& a) { a.launch_args.smem_size += 1024; }, "smem static_assert");
     count += check_change<Runtime>(args, [](auto& a) {

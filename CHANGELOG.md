@@ -15,6 +15,12 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 - **DeepSeek V4 normal Mega-mHC**: `mega_mhc` supports hidden sizes 4096 and
   7168 on Zhenwu M890 when both `shifted_prev_mix` and `new_prev_mix` are `None`.
 
+- **B-swizzled epilogue for grouped GEMM**: optional `swizzle_b=True` on
+  `m_grouped_fp4_gemm_nt_nopad` and `m_grouped_fp4_gemm_nt_masked`. Weights are
+  permuted offline per 16-col MMA atom via
+  `preprocess_weights_and_scales(mode=MXFP4, fuse_activation=False, weight, scale, swizzle_b=True)`,
+  enabling the kernel epilogue to write coalesced b64 stores (halved store requests). Requires N%16==0, no bias, no fused epilogue.
+
 ## 1.1.0+v1.1.0
 
 ### Fixed
