@@ -100,7 +100,7 @@ public:
     }
 
     template <
-        class ProblemShapeMNKL, class BlockShapeMNK, class BlockCoordMNKL,
+        int kWarpsOnK = 1, class ProblemShapeMNKL, class BlockShapeMNK, class BlockCoordMNKL,
         class FrgEngine, class FrgLayout, class TiledMma, class ResidueMNK>
     CUTLASS_DEVICE void operator()(
             ProblemShapeMNKL problem_shape_mnkl,
@@ -135,7 +135,10 @@ public:
 
         constexpr int kSmemM = size<0>(shared_accumulator);
         constexpr int kSmemN = size<1>(shared_accumulator);
-        constexpr int kNumThreads = CUTE_STATIC_V(size(TiledMma{}));
+        // After CTA K reduction only the leading K=0 warps own final accumulators.
+        // The whole CTA still participates in both shared-memory barriers.
+        constexpr int kNumThreads = CUTE_STATIC_V(size(TiledMma{})) / kWarpsOnK;
+        const bool writes_output = kWarpsOnK == 1 || thread_idx < kNumThreads;
         const uint32_t tile_row = m_coord * get<0>(block_shape_mnk);
         const uint32_t block_row = offset_m + tile_row;
         const uint32_t valid_rows = get<0>(problem_shape_mnkl);
@@ -168,16 +171,18 @@ public:
                             step_m * size<1>(shared_r2s) + pipe_m;
                         const int mma_n =
                             step_n * size<2>(shared_r2s) + pipe_n;
-                        copy(tiled_r2s,
-                             register_accumulator(_, mma_m, mma_n),
-                             shared_r2s(_, pipe_m, pipe_n));
+                        if (writes_output)
+                            copy(tiled_r2s,
+                                 register_accumulator(_, mma_m, mma_n),
+                                 shared_r2s(_, pipe_m, pipe_n));
                     }
                 }
                 __syncthreads();
 
-                scatter_subtile<kNumThreads>(shared_accumulator_stage, N,
-                    thread_idx, block_row + step_m * kSmemM, subtile_m_begin,
-                    valid_rows, n_base, scatter_buffer);
+                if (writes_output)
+                    scatter_subtile<kNumThreads>(shared_accumulator_stage, N,
+                        thread_idx, block_row + step_m * kSmemM, subtile_m_begin,
+                        valid_rows, n_base, scatter_buffer);
 
             }
         }
@@ -294,7 +299,6 @@ public:
     }
 
 private:
-
     template <int kNumThreads, class SharedTensor>
     CUTLASS_DEVICE void scatter_subtile(SharedTensor shared_accumulator_stage,
             int N, int thread_idx, uint32_t global_row, uint32_t subtile_m_begin,
@@ -486,7 +490,8 @@ __device__ __forceinline__ void moe_reduce_token(
 }
 
 // GEMM2 scatter completes peer synchronization before this weighted reduction.
-template <bool kOutputAligned, int kTopK, int kHidden, bool kBulkRemote, int kThreads, int kColumnSplits = 1>
+template <bool kOutputAligned, int kTopK, int kHidden, bool kBulkRemote, int kThreads,
+          int kColumnSplits = 1, bool kSkipZeroWeight = false>
 __device__ __forceinline__ void moe_reduce_impl(
         const __ppu_bfloat16* __restrict__ input,
         const int64_t* __restrict__ topk_indices,
@@ -499,7 +504,6 @@ __device__ __forceinline__ void moe_reduce_impl(
     int64_t slots[kTopK];
     float weights[kTopK];
     bool remote_slots[kTopK];
-    bool all_valid = true;
     // Expert IDs are contiguous within each rank. Reuse the local interval
     // across TopK instead of dividing every expert ID by local_experts.
     const int local_expert_begin = rank_idx * local_experts;
@@ -510,6 +514,11 @@ __device__ __forceinline__ void moe_reduce_impl(
     #pragma unroll
     for (int index = 0; index < kTopK; ++index) {
         expert_ids[index] = static_cast<int32_t>(__ldg(topk_indices + token * kTopK + index));
+        if constexpr (kSkipZeroWeight) {
+            // W4A16 counts zero-weight routes but omits their values from the sum.
+            if (__ldg(topk_weights + token * kTopK + index) == 0.0f)
+                expert_ids[index] = -1;
+        }
         metadata_valid &= expert_ids[index] >= 0;
     }
     if (metadata_valid) {
@@ -535,10 +544,8 @@ __device__ __forceinline__ void moe_reduce_impl(
     }
     #pragma unroll
     for (int index = 0; index < kTopK; ++index) {
-        const int32_t expert = static_cast<int32_t>(
-            __ldg(topk_indices + token * kTopK + index));
+        const int32_t expert = expert_ids[index];
         const bool valid = expert >= 0;
-        all_valid &= valid;
         if constexpr (kBulkRemote) {
             remote_slots[index] = valid &&
                 (expert < local_expert_begin || expert >= local_expert_end);
@@ -561,19 +568,13 @@ __device__ __forceinline__ void moe_reduce_impl(
             : 0.0f;
     }
 
-    // Skip invalid slots before loading scatter data, even when their weight is zero.
-    if (all_valid) {
-        moe_reduce_token<false, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits>(
-            input, output, slots, weights, remote_slots, token, column_part, reduce_thread);
-    } else {
-        moe_reduce_token<true, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits>(
-            input, output, slots, weights, remote_slots, token, column_part, reduce_thread);
-    }
+    moe_reduce_token<true, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits>(
+        input, output, slots, weights, remote_slots, token, column_part, reduce_thread);
 }
 
 // Distribute token/column tasks across warp-aligned groups for every operand type.
 template <bool kOutputAligned, int kTopK, int kHidden, int kCtaThreads,
-          int kColumnSplits = 1, int kReduceGroupThreads = 0>
+          int kColumnSplits = 1, int kReduceGroupThreads = 0, bool kSkipZeroWeight = false>
 __device__ __forceinline__ void moe_reduce_dispatch(
         const __ppu_bfloat16* input, const int64_t* ids, const float* weights,
         __ppu_bfloat16* output, int token_capacity, int local_experts, int rank_idx,
@@ -591,7 +592,7 @@ __device__ __forceinline__ void moe_reduce_dispatch(
     if (kColumnSplits == 1 || reduce_thread * 8 < kHidden / kColumnSplits) {
         for (int work = blockIdx.x * kTokenGroups + token_group;
              work < tokens * kColumnSplits; work += gridDim.x * kTokenGroups) {
-            moe_reduce_impl<kOutputAligned, kTopK, kHidden, true, kReduceThreads, kColumnSplits>(
+            moe_reduce_impl<kOutputAligned, kTopK, kHidden, true, kReduceThreads, kColumnSplits, kSkipZeroWeight>(
                 input,
                 ids, weights, output,
                 token_capacity, local_experts,

@@ -308,7 +308,8 @@ def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None)
             y = torch.empty((tokens, c.hidden), device="cuda", dtype=torch.bfloat16)
 
             def forward():
-                return pipeline.forward(source[:tokens], ids[:tokens], weights[:tokens], y, stats)
+                counters = stats.view(1, -1) if iteration % 2 else stats
+                return pipeline.forward(source[:tokens], ids[:tokens], weights[:tokens], y, counters)
 
             before = stats.clone()
             forward()
@@ -471,10 +472,31 @@ def test_mega_moe_channelwise_worklist_reuse(mega_moe_group):
         run_case(case, mega_moe_group, replicas=replicas)
 
 
+def test_mega_moe_w4a16_zero_weight_nan(mega_moe_group):
+    case = replace(CASES[2], activation="swiglu", experts=4 * mega_moe_group.size(), worlds=DISTRIBUTED_WORLDS)
+    rng = torch.Generator(device="cuda").manual_seed(17 + mega_moe_group.rank())
+    pipeline = make_pipeline(case, mega_moe_group, rng)
+    try:
+        source = torch.full((2, case.hidden), float("nan"), dtype=torch.bfloat16, device="cuda")
+        ids = torch.arange(case.topk, device="cuda").expand(2, -1).contiguous() + 4 * mega_moe_group.rank()
+        weights = torch.zeros_like(ids, dtype=torch.float32)
+        # The second token also exercises an invalid slot alongside a valid zero-weight route.
+        ids[1, 0] = -1
+        stats = torch.zeros(4, dtype=torch.int32, device="cuda")
+        y = pipeline.forward(source, ids, weights, torch.empty_like(source), stats)
+        torch.testing.assert_close(y, torch.zeros_like(y), rtol=0, atol=0)
+        expected = torch.bincount(ids[ids >= 0] % 4, minlength=4)
+        torch.testing.assert_close(stats, expected.int(), rtol=0, atol=0)
+    finally:
+        pipeline.buffer.destroy()
+
+
 def test_mega_moe_w4a16_complete_tiles(mega_moe_group):
     # H=768 cannot use a 512-column scatter tile. The narrow GEMM1 must also
     # select complete gate/up tiles rather than inherit ordinary GEMM tails.
     run_case(replace(CASES[2], hidden=768, tokens=(96, 33, 0, 8)), mega_moe_group)
+    # On SM80 the small-M family prefers BK=256, but GEMM2 must divide I exactly.
+    run_case(replace(CASES[2], intermediate=2176, tokens=(1, 33, 0)), mega_moe_group)
 
 
 @pytest.mark.parametrize("case", tuple(c for c in SMOKE_CASES if c.activation == "swiglu"), ids=lambda c: c.name)
