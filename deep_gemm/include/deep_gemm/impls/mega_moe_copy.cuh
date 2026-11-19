@@ -259,10 +259,26 @@ __device__ __forceinline__ void copy_rank_rows(
     }
 }
 
+// The BF16 path uses one of the unused scale-ready banks for its first
+// M blocks. Each K stripe has exactly one publisher, even out of order.
+template <uint32_t HeadM, class Arguments>
+__device__ __forceinline__ const volatile uint32_t* copy_stripe_flag(
+    const Arguments& sched, uint32_t mb, uint32_t stripe) {
+    if constexpr (HeadM > 0) {
+        constexpr auto bank = layout::MegaMoESignals::kNumMaxExperts;
+        static_assert(HeadM * 7 <= bank);
+        if (mb < HeadM)
+            return sched.sym_buffer.template get_base_ptr<layout::MegaMoESignals*>()->preprocess_ready
+                   + 1 + bank + mb * 7 + stripe;
+    }
+    return sched.copy_ready_flags + mb;
+}
+
 template <uint32_t BlockM, uint32_t NumRanks,
           uint32_t BlockK,
           uint32_t KTilesPerFlag, uint32_t ShapeK, uint32_t NumThreads,
-          uint32_t SourceCapacity, uint32_t TopK, class SchedulerArguments, class BeforePublish>
+          uint32_t SourceCapacity, uint32_t TopK, uint32_t HeadM = 0, uint32_t Workers = 1,
+          class SchedulerArguments, class BeforePublish>
 __device__ void run_copy_block(
     const SchedulerArguments& sched, uint32_t total_m_blocks,
     char* smem_buf, uint32_t generation, BeforePublish before_publish)
@@ -297,7 +313,10 @@ __device__ void run_copy_block(
 
     static_assert(NumThreads % 32 == 0, "bulk copy requires complete warps");
 
-    for (uint32_t mb = blockIdx.x; mb < total_m_blocks; mb += num_copy) {
+    const uint32_t id = blockIdx.x;
+    const bool in_head = id < HeadM * Workers;
+    uint32_t mb = in_head ? id / Workers : HeadM + id;
+    for (; mb < total_m_blocks; mb = mb < HeadM ? HeadM + id : mb + num_copy) {
         uint4 gl = (reinterpret_cast<const uint4*>(sched.copy_grouped_layout) + 1)[mb];
         uint32_t m_block_in_expert = mb - gl.z;
 
@@ -312,7 +331,8 @@ __device__ void run_copy_block(
             static_cast<uint64_t>(m_block_in_expert) * BlockM;
         auto* local_block_dst = reinterpret_cast<int4*>(sched.local_data_buf + row_base * ShapeK);
 
-        for (uint32_t ks = 0; ks < kNumStripes; ++ks) {
+        const bool split = mb < HeadM;
+        for (uint32_t ks = split ? id % Workers : 0; ks < kNumStripes; ks += split ? Workers : 1) {
             uint32_t stripe_col_start =
                 ks * kStripeVectors;
             // Clamp the tail stripe to the row width.
@@ -332,7 +352,7 @@ __device__ void run_copy_block(
             __syncthreads();
             if (threadIdx.x == 0) {
                 before_publish(gl.x, ks + 1 == kNumStripes);
-                __stbl(const_cast<uint32_t*>(sched.copy_ready_flags + mb),
+                __stbl(const_cast<uint32_t*>(copy_stripe_flag<HeadM>(sched, mb, ks)),
                        (generation << 3) | (ks + 1u));
             }
         }

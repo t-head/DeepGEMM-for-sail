@@ -102,7 +102,7 @@ struct Int8FusedDispatch {
         __syncthreads();
     }
 
-    template <class Scheduler, uint32_t Threads>
+    template <class Scheduler, uint32_t Threads, int HeadM = 0, int Workers = 1>
     __device__ static void prepare_copy(const sched::Int8MegaMoESchedulerArguments& sched, char* smem) {
         const uint32_t generation = resolve_fused_round_generation(
             *sched.sym_buffer.get_base_ptr<layout::MegaMoESignals*>());
@@ -110,7 +110,7 @@ struct Int8FusedDispatch {
         prepare_metadata<Scheduler, Threads>(sched, smem, generation);
         mega_moe_common::run_copy_block<Scheduler::BLOCK_M, Scheduler::kNumRanks,
                        BlockK * (Bf16 ? 2 : 1), Scheduler::kKTilesPerFlag, Scheduler::SHAPE_K * (Bf16 ? 2 : 1), Threads,
-                       Scheduler::kSourceCapacity, Scheduler::kNumTopK>(
+                       Scheduler::kSourceCapacity, Scheduler::kNumTopK, HeadM, Workers>(
             sched, sched.copy_grouped_layout[0], smem, generation,
             [&](uint32_t expert, bool last_stripe) {
                 // Only the last payload stripe joins per-token scale compaction.
@@ -133,7 +133,7 @@ struct Int8FusedDispatch {
 
 // Copy allocates only metadata, independently of the GEMM operand pipeline.
 template <int N, int K, int BM, int BK, int Groups, int Ranks,
-          int KTilesPerFlag, int SourceCapacity, int TopK, int Threads, bool Bf16 = false>
+          int KTilesPerFlag, int SourceCapacity, int TopK, int Threads, bool Bf16 = false, int HeadM = 0, int Workers = 1>
 struct MegaMoECopyKernel {
     static_assert(is_supported_megamoe_rank_count(Ranks));
     static_assert(Threads >= Ranks && Threads >= 64 && Threads % 32 == 0);
@@ -152,7 +152,7 @@ struct MegaMoECopyKernel {
     static constexpr int SharedStorageSize = CopyBytes > PrepareBytes ? CopyBytes : PrepareBytes;
 
     __device__ static void run(const Arguments& sched, char* smem) {
-        Int8FusedDispatch<BK, Bf16>::template prepare_copy<PrepareConfig, Threads>(sched, smem);
+        Int8FusedDispatch<BK, Bf16>::template prepare_copy<PrepareConfig, Threads, HeadM, Workers>(sched, smem);
     }
 };
 

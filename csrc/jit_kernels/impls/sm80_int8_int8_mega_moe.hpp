@@ -217,12 +217,13 @@ public:
         sched::Int8MegaMoESchedulerArguments scheduler;
         bool split_sync = false;
         bool bf16_payload = false;
+        int head_m = 0, workers = 1;
     };
     static std::string generate_impl(const Args& a) {
         return fmt::format(R"(
 #define DG_MEGAMOE_SPLIT_SYNC {}
 #include <deep_gemm/impls/int8_mega_moe_dispatch.cuh>
-using Kernel = deep_gemm::sm80::MegaMoECopyKernel<{},{},{},{},{},{},{},{},{},{},{}>;
+using Kernel = deep_gemm::sm80::MegaMoECopyKernel<{},{},{},{},{},{},{},{},{},{},{},{},{}>;
 static_assert(Kernel::SharedStorageSize == {});
 static_assert(sizeof(Kernel::Arguments) == {});
 extern "C" __global__ __launch_bounds__({}) void megamoe_int8_dispatch_copy(
@@ -231,7 +232,7 @@ extern "C" __global__ __launch_bounds__({}) void megamoe_int8_dispatch_copy(
     Kernel::run(scheduler, smem);
 }}
 )", static_cast<int>(a.split_sync), a.n, a.k, a.block_m, a.block_k, a.groups, a.ranks,
-            a.k_tiles_per_flag, a.capacity, a.topk, a.threads, a.bf16_payload,
+            a.k_tiles_per_flag, a.capacity, a.topk, a.threads, a.bf16_payload, a.head_m, a.workers,
             a.launch_args.smem_size, sizeof(a.scheduler), a.threads);
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {

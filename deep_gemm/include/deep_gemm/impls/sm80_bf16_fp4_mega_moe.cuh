@@ -7,7 +7,7 @@
 
 namespace deep_gemm::sm80 {
 template <bool First, int N, int BM, int BN, int WM, int Ranks, int Capacity, int TopK,
-          int TilesPerFlag, GatedActivation Activation, bool FastMath>
+          int TilesPerFlag, GatedActivation Activation, bool FastMath, int HeadM>
 struct W4Output {
     layout::SymBuffer<Ranks> scatter;
     layout::TokenSrcMetadata* sources;
@@ -28,7 +28,8 @@ struct W4Output {
     CUTLASS_DEVICE void wait_for_input(const Scheduler& sched, int k) const {
         if constexpr (First)
             if (k % TilesPerFlag == 0)
-                comm::wait_copy_stripe(sched.params.copy_ready_flags + sched.curr_global_block_m_idx,
+                comm::wait_copy_stripe(mega_moe_common::copy_stripe_flag<HeadM>(
+                                           sched.params, sched.curr_global_block_m_idx, k / TilesPerFlag),
                                        sched.round_generation, k / TilesPerFlag + 1);
     }
     template <class Acc, class Coord, class TiledMma>
@@ -74,7 +75,7 @@ struct W4Output {
 template <bool First, int N, int K, int BM, int BN, int BK, int WM, int WK,
           int Groups, int Stages, int Ranks, int Capacity, int TopK, int TilesPerFlag,
           GatedActivation Activation, bool FastMath, bool OutputAligned,
-          int ColumnSplits, int ReduceGroupThreads>
+          int ColumnSplits, int ReduceGroupThreads, int HeadM = 0>
 __device__ void w4_mega_gemm(const sched::Int8MegaMoESchedulerArguments& routing,
         layout::SymBuffer<Ranks> scatter, const cutlass::bfloat16_t* a,
         const int* w, const uint8_t* sf, const int* replica, const uint8_t* replica_sf,
@@ -93,7 +94,7 @@ __device__ void w4_mega_gemm(const sched::Int8MegaMoESchedulerArguments& routing
     } else {
         p.scheduler = TileSchedulerArguments(routing.shape_m, routing.grouped_layout);
     }
-    Kernel{}(p, smem, W4Output<First,N,BM,BN,WM,Ranks,Capacity,TopK,TilesPerFlag,Activation,FastMath>{
+    Kernel{}(p, smem, W4Output<First,N,BM,BN,WM,Ranks,Capacity,TopK,TilesPerFlag,Activation,FastMath,HeadM>{
         scatter, routing.src_info, d, replica, replica_sf, masters, limit, alpha, beta, linear_beta});
     if constexpr (!First) {
         auto* signals = routing.sym_buffer.get_base_ptr<layout::MegaMoESignals*>();
