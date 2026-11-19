@@ -14,6 +14,15 @@ namespace deep_gemm {
 // Non-paged block scheduler helpers
 // ============================================================
 
+// Public bounds are INT32 even when a kernel's argument mirror uses uint32.
+// Clamp before converting to an unsigned byte/element offset.
+template <typename BoundType>
+__forceinline__ __device__
+uint32_t load_mqa_bound(const BoundType* bounds, uint32_t query, uint32_t num_keys) {
+    const int32_t value = __ldg(reinterpret_cast<const int32_t*>(bounds) + query);
+    return min(static_cast<uint32_t>(max(value, int32_t{0})), num_keys);
+}
+
 template <int BLOCK_Q, int kNumQStages, int BLOCK_KV, bool kIsCompressedLogits,
           typename SeqLenType, typename CuSeqLenPtrType>
 __forceinline__ __device__
@@ -231,6 +240,38 @@ void float_epilogue_reduce_weights(const AccTensor& accum, int m,
         v_1 += transform(7, n);
 #endif
     }
+}
+
+// Distribute H8 outputs over all four lanes: parity owns the KV row half,
+// bit 1 owns the query. Preserve the adjacent-head pair sums, then gather
+// the other head half. The large tile scatters the row half first, needing
+// three shuffles. Small tiles retain the five-shuffle form: its shorter
+// register lifetime allows more resident CTAs on M890.
+template <bool kReduceScatter, typename AccTensor>
+__forceinline__ __device__
+float float_epilogue_reduce_weights_h8_output(const AccTensor& accum, int m,
+                                             const float* weights, uint32_t lane_idx, int n = 0) {
+    float partial[2];
+    #pragma unroll
+    for (int token = 0; token < 2; ++token) {
+        const int j = token * 4;
+        float lo = fmaxf(accum(j, m, n), 0) * weights[token * 2]
+                 + fmaxf(accum(j + 1, m, n), 0) * weights[token * 2 + 1];
+        float hi = fmaxf(accum(j + 2, m, n), 0) * weights[token * 2]
+                 + fmaxf(accum(j + 3, m, n), 0) * weights[token * 2 + 1];
+        if constexpr (kReduceScatter) {
+            const float own_half = lane_idx & 1 ? hi : lo;
+            const float other_half = lane_idx & 1 ? lo : hi;
+            partial[token] = own_half + __shfl_xor_sync(0xffffffffu, other_half, 1);
+        } else {
+            lo += __shfl_xor_sync(0xffffffffu, lo, 1);
+            hi += __shfl_xor_sync(0xffffffffu, hi, 1);
+            partial[token] = lane_idx & 1 ? hi : lo;
+        }
+    }
+    const float own = lane_idx & 2 ? partial[1] : partial[0];
+    const float other = lane_idx & 2 ? partial[0] : partial[1];
+    return own + __shfl_xor_sync(0xffffffffu, other, 2);
 }
 
 // Avg (unweighted) epilogue reduce: plain ReLU sum over heads, same j->v_0/v_1

@@ -2297,9 +2297,8 @@ def ref_fp8_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
     q = q.float()
     k = k.float()
 
-    mask_lo = torch.arange(0, seq_len_kv, device='cuda')[None, :] >= cu_seqlen_ks[:, None]
-    mask_hi = torch.arange(0, seq_len_kv, device='cuda')[None, :] < cu_seqlen_ke[:, None]
-    mask = mask_lo & mask_hi
+    positions = torch.arange(seq_len_kv, device=q.device)[None, :]
+    mask = (positions >= cu_seqlen_ks[:, None]) & (positions < cu_seqlen_ke[:, None])
 
     score = torch.einsum('mhd,nd->hmn', q, k)
     if avg:
@@ -2318,8 +2317,7 @@ def ref_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
     batch_size, next_n, heads, dim = q.size()
     num_block, block_size, _, dim = kv_cache.size()
     logits = torch.full([batch_size * next_n, max_model_len], float('-inf'), device=q.device, dtype=torch.float32)
-    # 2D context_lens: use last token's context_len (maximum) as KV range, matching kernel behavior
-    context_lens_max = context_lens[:, -1].tolist()
+    context_lens_max = context_lens.amax(dim=1).tolist()
     for i in range(batch_size):
         context_len = context_lens_max[i]
         # All tokens see the same KV range (up to max context_len)
@@ -2462,7 +2460,12 @@ def test_mqa_logits(args) -> None:
     ref_logits = None
     if get_acc_check():
         assert get_ref_backend() == "device", "ref_backend only supports 'device' for MQA Logits"
-        ref_logits, _ = ref_fp8_mqa_logits(q=q, kv=kv, weights=weights.float(), cu_seqlen_ks=ks, cu_seqlen_ke=ke, avg=is_avg)
+        ref_q, ref_kv = q, kv
+        if not is_avg and data_type == torch.float8_e4m3fn and num_heads == 8:
+            # Weighted H8 compares against the values represented by FP8 Q and K.
+            ref_q = q_fp8.float()
+            ref_kv = kv_fp8[0].float() * kv_fp8[1].reshape(-1, 1)
+        ref_logits, _ = ref_fp8_mqa_logits(q=ref_q, kv=ref_kv, weights=weights.float(), cu_seqlen_ks=ks, cu_seqlen_ke=ke, avg=is_avg)
         # q_scale is an extra multiplier applied inside the kernel (per-row vector or broadcast scalar)
         if is_avg and q_scale is not None:
             ref_logits = ref_logits * (q_scale if q_scale.numel() == 1 else q_scale.view(-1, 1))
@@ -2514,10 +2517,11 @@ def test_paged_mqa_logits(args) -> None:
     query_contexts = args.get('context_lens')
     is_varlen = args.get('is_varlen', varlen_indices is not None or query_contexts is not None)
     tokens_per_request = []
+    fp8_h8 = not is_avg and data_type == torch.float8_e4m3fn and num_heads == 8
     if is_varlen:
-        assert not is_avg and data_type == torch.uint8 and next_n == 1, \
-            "varlen replay is supported only by paged MXFP4 DSA with next_n=1"
-        assert not args.get('implicit_indices', False), "MXFP4 varlen requires explicit indices"
+        assert not is_avg and (data_type == torch.uint8 or fp8_h8) and next_n == 1, \
+            "varlen replay requires weighted MXFP4 or FP8 H8 with next_n=1"
+        assert not args.get('implicit_indices', False), "varlen requires explicit indices"
         assert not pre_distribution, "varlen replay requires current metadata contexts"
         assert args.get('context_pattern') is None, "use context_lens for exact varlen lengths"
         if not varlen_indices:
@@ -2555,6 +2559,7 @@ def test_paged_mqa_logits(args) -> None:
         assert logits_dtype in (torch.float32, torch.bfloat16), "Paged MQA Avg Logits supports float32 or bf16 logits"
 
     max_model_len = args.get('max_context_len', 262144)
+    assert max_model_len >= 0
     pagesize = args.get('page_kv', 64)
     assert pagesize == 32 or (pagesize > 0 and pagesize % 64 == 0)
 
@@ -2576,27 +2581,36 @@ def test_paged_mqa_logits(args) -> None:
         context_lens = torch.tensor(lengths, device='cuda', dtype=torch.int32)
     elif context_pattern is not None:
         assert isinstance(context_pattern, list) and len(context_pattern) > 0
+        assert all(isinstance(v, int) and 0 <= v <= max_model_len for v in context_pattern)
         context_lens = torch.tensor([context_pattern[i % len(context_pattern)] for i in range(batch_size)],
                                     device='cuda', dtype=torch.int32)
     elif distribution and isinstance(distribution, list):
         assert(len(distribution) == batch_size)
+        assert all(isinstance(v, int) and 0 <= v <= max_model_len for v in distribution)
         context_lens = torch.tensor(distribution[:batch_size], device='cuda', dtype=torch.int32)
     else:
-        context_lens = torch.randint(int(0.7 * avg_context_len), int(1.3 * avg_context_len), (batch_size, )).cuda().to(torch.int32)
+        assert avg_context_len >= 0
+        low = min(int(0.7 * avg_context_len), max_model_len)
+        high = min(max(low + 1, int(1.3 * avg_context_len)), max_model_len + 1)
+        context_lens = torch.randint(low, high, (batch_size,), device='cuda', dtype=torch.int32)
 
-    max_block_len = max(1, (context_lens.max().item() + pagesize - 1) // pagesize)
+    max_generated_len = context_lens.max().item()
+    assert max_generated_len <= max_model_len
+    max_block_len = max(1, (max_generated_len + pagesize - 1) // pagesize)
     request_indices = None
     if is_varlen:
         # Allocate each run's physical KV pages once, then expand its table row.
-        # Earlier query lengths may be nonmonotonic; the last one is the maximum.
+        # MXFP4 requires the last length to be the maximum.
         row_lengths = query_contexts if query_contexts is not None else lengths
         request_pages = []
         start = 0
         for count in tokens_per_request:
             end = start + count
-            assert row_lengths[end - 1] == max(row_lengths[start:end]), \
-                "each request's last query must have its maximum context length"
-            request_pages.append(ceil_div(row_lengths[end - 1], pagesize))
+            longest = max(row_lengths[start:end])
+            if not fp8_h8:
+                assert row_lengths[end - 1] == longest, \
+                    "each MXFP4 request's last query must have its maximum context length"
+            request_pages.append(ceil_div(longest, pagesize))
             start = end
         num_blocks = max(1, sum(request_pages))
         request_indices = torch.tensor(varlen_indices, device=q.device, dtype=torch.int32)
@@ -2631,6 +2645,7 @@ def test_paged_mqa_logits(args) -> None:
     # Generate pre_context_lens for get_paged_mqa_logits_metadata (may differ from main kernel context_lens in MTP + CUDA graph)
     if pre_distribution and isinstance(pre_distribution, list):
         assert next_n == 1
+        assert all(isinstance(v, int) and 0 <= v <= max_model_len for v in pre_distribution)
         pre_context_lens = torch.tensor(pre_distribution, device='cuda', dtype=torch.int32).unsqueeze(-1)
     else:
         pre_context_lens = context_lens
@@ -2641,11 +2656,12 @@ def test_paged_mqa_logits(args) -> None:
         q_fp8 = q.to(torch.float8_e4m3fn)
         kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
         metadata_extra = (next_n, num_heads, head_dim, torch.float8_e4m3fn)
-        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
+        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(),
+                                                indices=request_indices, metadata_extra=metadata_extra)
         if is_avg:
             logits = deep_gemm.fp8_paged_mqa_avg_logits(q_fp8, kv_cache_fp8, context_lens, block_tables, schedule_metadata, max_model_len, logits_dtype=logits_dtype)
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False)
+            logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False, indices=request_indices)
     elif data_type == torch.int8:
         q_int8, q_int8_scale = per_token_cast_to_int8(q.reshape(batch_size * next_n * num_heads, head_dim))
         q_int8 = q_int8.reshape(batch_size, next_n, num_heads, head_dim)
@@ -2692,8 +2708,15 @@ def test_paged_mqa_logits(args) -> None:
         assert get_ref_backend() == "device", "ref_backend only supports 'device' for Paged MQA Logits"
         # FP4 AVG uses represented Q/K values and FP32 dot products. Its BF16
         # output rounds each head, every reduction stage, and the final scale.
-        ref_q = q.float() if is_avg and data_type == torch.uint8 else q
-        ref_kv = kv_cache.float() if is_avg and data_type == torch.uint8 else kv_cache
+        if fp8_h8:
+            packed = kv_cache_fp8.view(num_blocks, -1)
+            values = packed[:, :pagesize * head_dim].contiguous().view(torch.float8_e4m3fn)
+            scales = packed[:, pagesize * head_dim:].contiguous().view(torch.float32)
+            ref_q = q_fp8.float()
+            ref_kv = values.float().view(num_blocks, pagesize, 1, head_dim) * scales.view(num_blocks, pagesize, 1, 1)
+        else:
+            ref_q = q.float() if is_avg and data_type == torch.uint8 else q
+            ref_kv = kv_cache.float() if is_avg and data_type == torch.uint8 else kv_cache
         ref_logits = ref_paged_mqa_logits(
             ref_q, ref_kv, weights, context_lens, block_tables, max_model_len, avg=is_avg,
             avg_bf16_rounding=is_avg and data_type == torch.uint8 and logits_dtype == torch.bfloat16,

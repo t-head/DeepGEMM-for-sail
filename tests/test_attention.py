@@ -1,3 +1,4 @@
+import os
 import random
 import torch
 
@@ -5,6 +6,7 @@ import deep_gemm
 from utils import test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, set_acc_check, parse_deepgemm_string_re
 from utils import is_ppu1v5_device, get_arch_version
 from utils import per_token_cast_to_fp4, cast_back_from_fp4, kv_cache_cast_to_fp4, ref_paged_mqa_logits, calc_diff
+from utils import kv_cache_cast_to_fp8, ref_fp8_mqa_logits
 
 def test_ks_ke(check_accuracy=True):
     if is_ppu1v5_device():
@@ -159,11 +161,17 @@ def test_mqa_logits_loop():
         'MqaLogits,data_type:int8,seq_len_q:4096,seq_len_kv:8192,num_heads:64,head_dim:128,compressed_logits:1',
         'MqaLogits,data_type:int8,seq_len_q:1024,seq_len_kv:4096,num_heads:32,head_dim:128,weights_dtype:bf16',
     ]
+    if is_ppu1v5_device():
+        cases.extend([
+            'MqaLogits,data_type:fp8,seq_len_q:1,seq_len_kv:389,num_heads:8,head_dim:64',
+            'MqaLogits,data_type:fp8,seq_len_q:5,seq_len_kv:389,num_heads:8,head_dim:128,compressed_logits:1',
+        ])
     for case in cases:
         if is_ppu1v5_device() and 'data_type:int8' in case:
             continue
         set_acc_check(True)
         test_mqa_logits(parse_deepgemm_string_re(case))
+    test_fp8_mqa_logits_h8_graph_replay()
     print("Passed\n")
 
 
@@ -189,7 +197,7 @@ def test_mqa_compressed_boundaries():
         fn, qk_dtype = deep_gemm.int8_mqa_logits, torch.int8
         output_dtypes = (torch.float32, torch.bfloat16)
 
-    for heads in (32, 64):
+    for heads in ((8, 32, 64) if is_ppu1v5_device() else (32, 64)):
         q = torch.randint(-8, 9, (nq, heads, dim), device='cuda').to(torch.float32).to(qk_dtype)
         k = torch.randint(-8, 9, (nk, dim), device='cuda').to(torch.float32).to(qk_dtype)
         scales = torch.rand(nk, device='cuda') / 64 + 1 / 128
@@ -363,6 +371,16 @@ def test_paged_mqa_logits_loop():
     ]
     if is_ppu1v5_device():
         cases.append('PagedMqaLogits,data_type:fp4,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192')
+        # Seven queries in one request cross the H8 six-query group boundary.
+        cases.append('PagedMqaLogits,data_type:fp8,batch_size:8,next_n:1,num_heads:8,head_dim:64,'
+                     'page_kv:128,is_varlen:1,varlen_indices:[0,0,0,0,0,0,0,1],'
+                     'context_lens:[257,0,1,63,129,128,65,0],max_context_len:257')
+        # Large-batch dumps replay an average rather than exact lengths.
+        cases.append('PagedMqaLogits,data_type:fp8,batch_size:65,next_n:1,num_heads:8,head_dim:128,'
+                     'page_kv:64,avg_context_len:4096,max_context_len:4096')
+        for heads, head_dim in ((32, 64), (64, 128)):
+            cases.append(f'PagedMqaLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:{heads},'
+                         f'head_dim:{head_dim},page_kv:32,context_pattern:[0,1,65,2049],max_context_len:2049')
     for case in cases:
         if is_ppu1v5_device() and 'data_type:int8' in case:
             continue
@@ -384,6 +402,7 @@ def test_paged_mqa_logits_loop():
         case = 'PagedMqaLogits,data_type:int8,batch_size:8,next_n:1,num_heads:32,head_dim:128,pre_distribution:[4090,0,1,0,1],distribution:[4090,0,1,0,1,100,200,300]'
         set_acc_check(False)
         test_paged_mqa_logits(parse_deepgemm_string_re(case))
+    test_fp8_paged_mqa_logits_h8_graph_replay()
     print("Passed\n")
 
 
@@ -927,6 +946,18 @@ def test_paged_fp4_varlen():
                 graph.replay()
                 assert torch.isnan(output).all(), 'zero context must not write logits'
             print('PASS grouped FP4', heads, page, flush=True)
+    if os.environ.get('DG_TEST_LARGE_ADDRESSES') == '1':
+        case = _PagedFP4VarlenCase(32, 64, context=65)
+        case.ids.copy_(torch.arange(case.nq, dtype=torch.int32, device='cuda'))
+        case.lengths.fill_(case.context)
+        # The final singleton's table row crosses the uint32 element-offset limit.
+        stride = (2**32 + case.nq - 2) // (case.nq - 1)
+        storage = torch.empty((case.nq - 1) * stride + case.pages, device='cuda', dtype=torch.int32)
+        storage[:case.nq + case.pages].zero_()  # Wrapped offsets also name valid physical pages.
+        table = storage.as_strided(case.table.shape, (stride, 1))
+        case.table = table.copy_(case.table)
+        case.check(case.run()[1])
+
     # A large legal Q count with huge contexts must not overflow metadata cost.
     for heads in (32, 64):
         nq = 65536
@@ -1012,6 +1043,204 @@ def test_nvtx():
     print("Passed\n")
 
 
+def test_fp8_mqa_logits_h8_graph_replay():
+    """Persistent output partitions must refresh Q, K, weights and windows."""
+    if not is_ppu1v5_device():
+        return
+    rows, length = 513, 32771
+    sample = [0, 1, 15, 16, 255, 256, 512]
+    for head_dim in (64, 128):
+        for compressed in (False, True):
+            q = torch.randint(-3, 4, (rows, 8, head_dim), device='cuda').to(torch.float8_e4m3fn)
+            k = torch.randint(-3, 4, (length, head_dim), device='cuda').to(torch.float8_e4m3fn)
+            scales = (torch.arange(length, device='cuda', dtype=torch.float32) % 7 + 1) / 16
+            weights = torch.empty((rows, 12), device='cuda')[:, :8]
+            weights.copy_((torch.arange(rows * 8, device='cuda').view(rows, 8) % 11 - 5) / 8)
+            q[0].zero_()
+            q[0, :, :8].copy_(torch.eye(8, device='cuda').to(q.dtype))
+            starts = torch.arange(rows, device='cuda', dtype=torch.int32) * 13 % 109
+            counts = torch.tensor([0 if (r // 16) % 5 == 1 else [length - 109, 129, 0, 8195][r % 4]
+                                   for r in range(rows)], device='cuda', dtype=torch.int32)
+            ends = starts + counts
+
+            def call():
+                return deep_gemm.fp8_mqa_logits(q, (k, scales), weights, starts, ends,
+                                                 max_seqlen_k=length if compressed else 0)
+
+            zeros = torch.zeros(1, device='cuda', dtype=torch.int32)
+            assert deep_gemm.fp8_mqa_logits(q[:1], (k[:0], scales[:0]), weights[:1], zeros, zeros,
+                                            max_seqlen_k=17).shape == (1, 17)
+            call()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                logits = call()
+            assert logits.shape == (rows, length) and logits.stride(-1) == 1 and logits.dtype == torch.float32
+            for changed in (False, True):
+                if changed:
+                    q.copy_(torch.randint(-3, 4, q.shape, device='cuda').to(q.dtype))
+                    k.copy_(torch.randint(-3, 4, k.shape, device='cuda').to(k.dtype))
+                    weights.neg_()
+                    scales.mul_(2)
+                    starts.copy_(starts.roll(1))
+                    ends.copy_(starts + counts.flip(0))
+                starts[0] = -7
+                starts[15], ends[15] = 0, -1
+                starts[16], ends[16] = -9, -1
+                starts[17], ends[17] = 33, 17
+                logits.fill_(float('nan'))
+                graph.replay()
+                ref, _ = ref_fp8_mqa_logits(q[sample].cpu(), k.float().cpu() * scales.cpu()[:, None],
+                                           weights[sample].cpu(), starts[sample].cpu(), ends[sample].cpu())
+                for index, row in enumerate(sample):
+                    start = max(0, min(starts[row].item(), length))
+                    end = max(start, min(ends[row].item(), length))
+                    column = 0 if compressed else start
+                    torch.testing.assert_close(logits[row, column:column + end - start].cpu(),
+                                               ref[index, start:end], rtol=0, atol=0)
+                assert torch.isnan(logits[[15, 16, 17]]).all(), 'empty/reversed windows must not write logits'
+    torch.cuda.synchronize()
+    print('PASS: FP8 MQA persistent partitions, reversed windows and updated graph inputs')
+
+
+def test_fp8_paged_mqa_logits_h8_graph_replay():
+    """Replay with different request IDs, page mappings and nonmonotonic query lengths."""
+    if not is_ppu1v5_device():
+        return
+    empty = torch.zeros(1, 1, device='cuda', dtype=torch.int32)
+    workers = deep_gemm.get_paged_mqa_logits_metadata(
+        empty, 64, deep_gemm.get_num_sms(), metadata_extra=(1, 8, 128, torch.float8_e4m3fn)).size(0) - 1
+    # Single-tile/pipelined crossover, long empty runs, page32 and a partial six-query group.
+    for dim, page, tokens, batch, width in ((64, 64, 1, 1, workers * 64), (64, 64, 1, 1, workers * 64 + 1),
+                                            (128, 64, 1, 4096, 64), (128, 32, 7, workers + 1, 257),
+                                            (128, 128, 5, 65, workers * 64 + 1)):
+        npages = (width + page - 1) // page
+        keys = torch.randint(-1, 2, (2 * npages, page, 1, dim), device='cuda').float()
+        keys[..., 0] = 1
+        keys[npages:, ..., 0] = -1
+        keys *= (448 * (2 ** (torch.arange(page, device='cuda') % 3))).view(1, page, 1, 1)
+        packed = kv_cache_cast_to_fp8(keys)
+        storage = torch.empty((len(keys), 2, page * (dim + 4)), dtype=torch.uint8, device='cuda')
+        cache = storage[:, 1].view_as(packed)
+        cache.copy_(packed)
+        q = torch.randint(-3, 4, (batch, tokens, 8, dim), device='cuda').to(torch.float8_e4m3fn)
+        weights = torch.empty((batch * tokens, 12), device='cuda')[:, :8]
+        weights.copy_((torch.arange(batch * tokens * 8, device='cuda').view(-1, 8) % 11 - 5) / 8)
+        lengths = torch.zeros(batch, tokens, dtype=torch.int32, device='cuda')
+        table = torch.full((batch, tokens, npages), -1, dtype=torch.int32, device='cuda')
+        pages = torch.arange(2 * npages - 1, -1, -1, dtype=torch.int32, device='cuda').view(2, npages)
+        indices = torch.arange(batch, dtype=torch.int32, device='cuda').repeat_interleave(tokens) if tokens > 1 else None
+
+        def call(capacity=width):
+            lens = lengths.view(-1, 1)
+            meta = deep_gemm.get_paged_mqa_logits_metadata(
+                lens, page, deep_gemm.get_num_sms(), indices=indices, metadata_extra=(1, 8, dim, q.dtype))
+            return deep_gemm.fp8_paged_mqa_logits(q.view(-1, 1, 8, dim), cache, weights, lens,
+                                                  table.view(-1, npages), meta, capacity, indices=indices)
+
+        call()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            logits = call()
+        pattern = torch.tensor([width, 0, 1, 33, width, 3, 65][:tokens], device='cuda', dtype=torch.int32)
+        for phase in (0, 1):
+            active = [0] if batch == 1 else ([0, batch - 1] if phase == 0 else [1, batch - 2])
+            lengths.zero_()
+            table.fill_(-1)
+            lengths[active] = pattern if phase == 0 else pattern.flip(0)
+            table[active] = pages[:len(active), None] if phase == 0 else pages.flip(0)[:len(active), None]
+            if phase:
+                q.copy_((-q.float()).to(q.dtype))
+                weights.neg_()
+                keys.neg_()
+                cache.copy_(kv_cache_cast_to_fp8(keys))
+                if indices is not None:
+                    indices.copy_(torch.arange(batch * tokens, device='cuda', dtype=torch.int32))
+                    # Split the old request and give adjacent queries different KV pages.
+                    table[active, 1::2] = pages[:len(active), None]
+            logits.fill_(float('nan'))
+            graph.replay()
+            valid = torch.arange(width, device='cuda') < lengths[active].reshape(-1, 1)
+            ref = ref_paged_mqa_logits(q[active].reshape(-1, 1, 8, dim).float(), keys,
+                                       weights.view(batch, tokens, 8)[active].reshape(-1, 8),
+                                       lengths[active].reshape(-1, 1), table[active].reshape(-1, npages), width)
+            result = logits.view(batch, tokens, width)[active].reshape(-1, width)
+            torch.testing.assert_close(result[valid], ref[valid], rtol=0, atol=0)
+            if batch > 2:
+                assert torch.isnan(logits.view(batch, tokens, width)[batch // 2]).all()
+        lengths.zero_()
+        table.fill_(-1)
+        logits.fill_(float('nan'))
+        graph.replay()
+        assert torch.isnan(logits).all() and call(0).shape == (batch * tokens, 0)
+        try:
+            call(-1)
+        except RuntimeError as error:
+            assert 'max_context_len must be nonnegative' in str(error)
+        else:
+            raise AssertionError('Negative FP8 paged output capacity accepted')
+
+
+def test_fp8_h8_large_addresses():
+    """Opt-in regressions for 64-bit Q, K, output and page-table offsets."""
+    if not is_ppu1v5_device() or os.environ.get('DG_TEST_LARGE_ADDRESSES') != '1':
+        return
+    high_k = 2**25  # D128 FP8 K row at byte offset 2**32
+    # (D, Q rows to probe, K rows, [(start, end, output capacity)]).
+    cases = [(128, [0, 31, 32], 1, [(0, 1, 2**27 + 1)]),
+             (128, [0], high_k + 2**20, [(high_k, high_k + 64, 64), (0, high_k + 2**20, high_k + 2**20)])]
+    for dim in (64, 128):
+        high_q = 2**32 // (8 * dim)
+        cases.append((dim, [0, high_q - 1, high_q, high_q + 16], 64, [(0, 1, 0), (0, 1, 1)]))
+    for dim, rows, nk, windows in cases:
+        nq = rows[-1] + 1
+        q = torch.zeros((nq, 8, dim), device='cuda', dtype=torch.float8_e4m3fn)
+        weights = torch.zeros((nq, 8), device='cuda')
+        for i, row in enumerate(rows):
+            q[row, 0, 0], weights[row, 0] = i + 1, (-1)**i
+        k = torch.zeros((nk, dim), device='cuda', dtype=q.dtype)
+        k[:, 0] = 1
+        k[high_k:, 0] = 2
+        scales = torch.ones(nk, device='cuda')
+        starts = torch.zeros(nq, device='cuda', dtype=torch.int32)
+        ends = torch.zeros_like(starts)
+        for start, end, capacity in windows:
+            starts[rows], ends[rows] = start, end
+            logits = deep_gemm.fp8_mqa_logits(q, (k, scales), weights, starts, ends, max_seqlen_k=capacity)
+            keys = sorted({v for v in (start, high_k - 1, high_k, end - 1) if start <= v < end})
+            columns = [v - start if capacity else v for v in keys]
+            expected = torch.tensor([[(i + 1) * (-1)**i * (1 + int(v >= high_k)) for v in keys]
+                                     for i in range(len(rows))], dtype=torch.float32)
+            # Index rows and columns together, without copying entire multi-GiB rows.
+            rr = torch.tensor(rows, device='cuda')[:, None]
+            torch.testing.assert_close(logits[rr, columns].cpu(), expected, rtol=0, atol=0)
+            del logits
+        del q, k, weights, scales, starts, ends
+
+    # Exercise both row-offset multiplication and strides wider than uint32.
+    for batch, row_stride in ((3, 2**31), (2, 2**32 + 4)):
+        for page, width, length in ((32, 65, 65), (128, 8193, 33)):
+            columns = (width + page - 1) // page
+            table_storage = torch.empty(((batch - 1) * row_stride + columns,),
+                                        device='cuda', dtype=torch.int32)
+            # Keep the wrapped old addresses valid so a regression gives
+            # incorrect scores rather than an invalid physical page.
+            table_storage[:16].zero_()
+            table = table_storage.as_strided((batch, columns), (row_stride, 1))
+            for row in range(batch):
+                table[row].fill_(row)
+            values = torch.tensor([448., 224., 112.], device='cuda')[:batch]
+            keys = values[:, None, None, None].expand(batch, page, 1, 128).contiguous()
+            cache = kv_cache_cast_to_fp8(keys)
+            q = torch.ones((batch, 1, 8, 128), device='cuda', dtype=torch.float8_e4m3fn)
+            weights = torch.full((batch, 8), 0.125, device='cuda')
+            lengths = torch.full((batch, 1), length, device='cuda', dtype=torch.int32)
+            metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                lengths, page, deep_gemm.get_num_sms(), metadata_extra=(1, 8, 128, q.dtype))
+            logits = deep_gemm.fp8_paged_mqa_logits(q, cache, weights, lengths, table, metadata, width)
+            torch.testing.assert_close(logits[:, :length], (values * 128)[:, None].expand(-1, length), rtol=0, atol=0)
+            del logits, table, table_storage
+
+
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -1028,6 +1257,7 @@ if __name__ == '__main__':
     test_fp4_mqa_compressed_boundaries()
     test_paged_mqa_metadata_scan()
     test_paged_mqa_logits_loop()
+    test_fp8_h8_large_addresses()
     test_mqa_avg_logits_loop()
     test_sparse_mqa_logits_loop()
     test_sparse_input_contracts()
