@@ -53,34 +53,41 @@ __host__ __device__ constexpr int64_t max_local_routed_rows(int64_t source_token
     return source_tokens * (topk < local_experts ? topk : local_experts);
 }
 
-template <bool Int8>
+enum class MegaMoEStorageFormat { MXFP4, INT8, BF16 };
+
+template <MegaMoEStorageFormat Format>
 struct MegaMoEStorage {
     __host__ __device__ static constexpr int64_t row_bytes(int64_t width) {
-        return Int8 ? width : width / 2;
+        if constexpr (Format == MegaMoEStorageFormat::BF16) return 2 * width;
+        if constexpr (Format == MegaMoEStorageFormat::INT8) return width;
+        return width / 2;
     }
     __host__ __device__ static constexpr int64_t scale_bytes(int64_t width) {
-        return Int8 ? sizeof(float) : (width / 64) * sizeof(uint16_t);
+        if constexpr (Format == MegaMoEStorageFormat::BF16) return 0;
+        if constexpr (Format == MegaMoEStorageFormat::INT8) return sizeof(float);
+        return (width / 64) * sizeof(uint16_t);
     }
 };
 
-using Int8Storage = MegaMoEStorage<true>;
+using Int8Storage = MegaMoEStorage<MegaMoEStorageFormat::INT8>;
 
 // Per-bank capacities inherited from the allocation owner.
 struct MegaMoEStaging {
     int64_t scales = 0, counts = 0, tokens = 0;
 
-    template <bool Int8 = false>
+    template <MegaMoEStorageFormat Format = MegaMoEStorageFormat::MXFP4>
     __host__ __device__
     static constexpr MegaMoEStaging for_shape(int ranks, int experts, int capacity, int hidden) {
-        return {math::constexpr_align<int64_t>(int64_t(ranks) * capacity * MegaMoEStorage<Int8>::scale_bytes(hidden), 256),
+        return {math::constexpr_align<int64_t>(int64_t(ranks) * capacity * MegaMoEStorage<Format>::scale_bytes(hidden), 256),
                 math::constexpr_align<int64_t>(int64_t(experts) * sizeof(uint32_t), 256),
                 math::constexpr_align<int64_t>(int64_t(experts) * capacity * sizeof(uint32_t), 256)};
     }
 };
 
-template <bool Int8>
+template <MegaMoEStorageFormat Format>
 struct MegaMoEBufferLayout {
-    using Storage = MegaMoEStorage<Int8>;
+    static constexpr auto kFormat = Format;
+    using Storage = MegaMoEStorage<Format>;
     Buffer copy_ready;
     Buffer dispatch_counts[2], dispatch_data, dispatch_retire;
     Buffer expert_base, expert_rank_prefix, grouped_layout, local_data, local_sfa, preprocess_ready;
@@ -103,7 +110,7 @@ struct MegaMoEBufferLayout {
             dispatch_counts[p] = {static_cast<int64_t>(offsetof(MegaMoESignals, dispatch_counts) +
                 p * sizeof(MegaMoESignals::dispatch_counts[0])), sizeof(MegaMoESignals::dispatch_counts[0])};
 
-        staging = staging_capacity.scales ? staging_capacity : MegaMoEStaging::for_shape<Int8>(ranks, experts, capacity, hidden);
+        staging = staging_capacity.tokens ? staging_capacity : MegaMoEStaging::for_shape<Format>(ranks, experts, capacity, hidden);
         // Token capacity bounds the full-pool BM16 flags for every alias.
         const int64_t max_copy_blocks = staging.tokens / (16 * sizeof(uint32_t));
         copy_ready = allocate(max_copy_blocks * sizeof(uint32_t));
@@ -121,7 +128,7 @@ struct MegaMoEBufferLayout {
         expert_rank_prefix = allocate(groups * ranks * sizeof(int32_t));
         grouped_layout = allocate(((1 + blocks) * 4 + groups) * sizeof(int32_t));
         local_data = allocate(compact * Storage::row_bytes(hidden));
-        const auto sfa_rows = Int8 ? compact : FusedSfaPartitionLayout::row_offset(compact, groups);
+        const auto sfa_rows = Format != MegaMoEStorageFormat::MXFP4 ? compact : FusedSfaPartitionLayout::row_offset(compact, groups);
         local_sfa = allocate(sfa_rows * Storage::scale_bytes(hidden));
         scatter_storage = allocate(int64_t(topk) * capacity * hidden * sizeof(uint16_t));
         src_info = allocate(compact * sizeof(TokenSrcMetadata));
@@ -131,7 +138,7 @@ struct MegaMoEBufferLayout {
         topk_weights = allocate(int64_t(capacity) * topk * sizeof(float));
         bytes = math::constexpr_align<int64_t>(bytes, 256);
         // INT8 computes activations in FP32, then stores BF16 rows for quantization.
-        if constexpr (Int8)
+        if constexpr (Format == MegaMoEStorageFormat::INT8)
             activated = allocate(compact * intermediate * sizeof(uint16_t));
     }
 
@@ -146,7 +153,8 @@ private:
     }
 };
 
-using MegaMoEBuffer = MegaMoEBufferLayout<false>;
-using Int8MegaMoEBuffer = MegaMoEBufferLayout<true>;
+using MegaMoEBuffer = MegaMoEBufferLayout<MegaMoEStorageFormat::MXFP4>;
+using Bf16MegaMoEBuffer = MegaMoEBufferLayout<MegaMoEStorageFormat::BF16>;
+using Int8MegaMoEBuffer = MegaMoEBufferLayout<MegaMoEStorageFormat::INT8>;
 
 }  // namespace deep_gemm::layout
