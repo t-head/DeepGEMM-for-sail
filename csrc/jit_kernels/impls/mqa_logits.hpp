@@ -283,7 +283,10 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
     QScaleMode scale_mode = kScaleModeWeights;
     const void* weights_ptr = weights.data_ptr();
     if (is_avg) {
-        if (not q_scale.has_value()) {
+        if (qk_dtype == torch::kInt8 and not is_fp4) {
+            scale_mode = kScaleModeQHead;
+            weights_ptr = q_scale->data_ptr();
+        } else if (not q_scale.has_value()) {
             scale_mode = kScaleModeUnity;
             weights_ptr = nullptr;
         } else if (q_scale->numel() == 1) {

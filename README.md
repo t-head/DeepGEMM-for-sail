@@ -456,7 +456,9 @@ AVG indexers use no weights, default to BF16 output and retain paged
 `next_n=1–6`. MXFP4 AVG supports 4 or 8 Q heads; FP8 AVG supports 4. H4 retains optional FP32 output; MXFP4 H8 requires BF16 output.
 Non-paged AVG requires a positive `max_seqlen_k`. The paged
 `fp8_fp4` AVG entry point accepts MXFP4 only; ordinary FP8 uses the separate
-FP8 entry point. All AVG entry points omit `clean_logits`.
+FP8 entry point. All AVG entry points omit `clean_logits`. 810E also provides
+`int8_mqa_avg_logits` and `int8_paged_mqa_avg_logits` for H4/H8 with
+explicit per-Q/head FP32 quantization scales and BF16 output.
 
 Logits outside valid windows are unspecified and require caller-side masking
 or valid candidate bounds for top-k. For paged scheduling on both PPU0010/PPU0015, callers must pass

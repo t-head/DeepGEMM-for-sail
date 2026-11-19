@@ -21,7 +21,7 @@ def device_version_supported(one_case):
     caselist can run on both PPU1.0 and PPU1.5.
     """
     data_type = one_case.get('data_type')
-    if (one_case.get('gemm_type') in ('MqaLogits', 'PagedMqaLogits')
+    if (one_case.get('gemm_type') in ('MqaLogits', 'PagedMqaLogits', 'MqaAvgLogits', 'PagedMqaAvgLogits')
             and data_type == torch.int8 and get_arch_version() != 80):
         return False, 'INT8 indexer requires 810E'
     sparse_int8 = (one_case.get('gemm_type') in ('SparseMqaLogits', 'PagedSparseMqaLogits')

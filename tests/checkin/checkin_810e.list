@@ -231,3 +231,11 @@ MegaMhc,data_type:bf16,m:7,sinkhorn_iters:10
 MegaMhc,data_type:bf16,m:37,case:interface_graph
 MegaMhc,data_type:bf16,m:65,case:layout
 MegaMhc,data_type:bf16,m:129,num_sms:1,case:layout
+
+# ============ INT8 AVG MQA (H4/H8, BF16) ============
+MqaAvgLogits,data_type:int8,seq_len_q:129,seq_len_kv:1025,num_heads:4,head_dim:128,logits_dtype:bf16,compressed_logits:1
+MqaAvgLogits,data_type:int8,seq_len_q:4096,seq_len_kv:8192,num_heads:8,head_dim:128,logits_dtype:bf16,compressed_logits:1
+PagedMqaAvgLogits,data_type:int8,batch_size:97,next_n:1,num_heads:4,head_dim:128,context_pattern:[0,1,17,65,513],page_kv:64,max_context_len:513,logits_dtype:bf16
+PagedMqaAvgLogits,data_type:int8,batch_size:97,next_n:3,num_heads:8,head_dim:128,context_pattern:[0,1,17,129,513],page_kv:192,max_context_len:513,logits_dtype:bf16
+PagedMqaAvgLogits,data_type:int8,batch_size:97,next_n:5,num_heads:4,head_dim:128,context_pattern:[0,1,17,129,513],page_kv:512,max_context_len:513,logits_dtype:bf16
+PagedMqaAvgLogits,data_type:int8,batch_size:97,next_n:6,num_heads:8,head_dim:128,context_pattern:[0,1,17,129,513],page_kv:128,max_context_len:513,logits_dtype:bf16

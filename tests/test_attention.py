@@ -389,7 +389,36 @@ def test_paged_mqa_logits_loop():
 
 def test_mqa_avg_logits_loop():
     if not is_ppu1v5_device():
-        print('Skipping avg MQA logits: requires PPU1.5')
+        set_acc_check(True)
+        for heads in (4, 8):
+            # Large D128 shapes revisit Q blocks in the persistent KV pipeline.
+            for nq, nk in ((129, 1025), (4096, 8192)):
+                test_mqa_logits(parse_deepgemm_string_re(
+                    f'MqaAvgLogits,data_type:int8,seq_len_q:{nq},seq_len_kv:{nk},'
+                    f'num_heads:{heads},head_dim:128,logits_dtype:bf16,compressed_logits:1'))
+            # next_n spans all padded Q layouts; mixed/empty contexts exercise request changes.
+            for next_n, page in ((1, 64), (2, 128), (3, 192), (4, 512), (5, 64), (6, 128)):
+                test_paged_mqa_logits(parse_deepgemm_string_re(
+                    f'PagedMqaAvgLogits,data_type:int8,batch_size:97,next_n:{next_n},'
+                    f'num_heads:{heads},head_dim:128,context_pattern:[0,1,17,63,64,65,129,513],'
+                    f'page_kv:{page},max_context_len:513,logits_dtype:bf16'))
+        # Nonzero/disjoint windows, empty rows, and signed INT8 extremes.
+        starts, ends = [3, 0, 65, 129, 511, 7, 1024], [513, 0, 129, 513, 512, 1025, 1025]
+        ks = torch.tensor(starts, device='cuda', dtype=torch.int32)
+        ke = torch.tensor(ends, device='cuda', dtype=torch.int32)
+        for heads in (4, 8):
+            q = torch.randint(-128, 128, (7, heads, 128), device='cuda', dtype=torch.int8)
+            k = torch.randint(-128, 128, (1025, 128), device='cuda', dtype=torch.int8)
+            qs = torch.rand((7, heads), device='cuda') * 0.03
+            qs[:, 0] = 0  # A head with zero scale must contribute exactly zero.
+            sf = torch.rand((1025,), device='cuda') * 0.02
+            reference = (torch.einsum('qhd,kd->qhk', q.float(), k.float()).relu()
+                         * qs[:, :, None]).sum(1) * sf[None, :] / (128 ** 0.5)
+            logits = deep_gemm.int8_mqa_avg_logits((q, qs), (k, sf), ks, ke, 1025)
+            actual = torch.cat([logits[i, :end-start] for i, (start, end) in enumerate(zip(starts, ends))])
+            expected = torch.cat([reference[i, start:end] for i, (start, end) in enumerate(zip(starts, ends))])
+            torch.testing.assert_close(actual.float(), expected.bfloat16().float(), rtol=8e-3, atol=2e-3)
+        print('Passed INT8 AVG H4/H8\n')
         return
     print('Testing Avg MQA Logits:')
     # Prefill covers all q_scale modes, both output dtypes, and an odd Q tail.

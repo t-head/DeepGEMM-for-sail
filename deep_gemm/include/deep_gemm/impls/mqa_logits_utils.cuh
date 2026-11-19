@@ -274,6 +274,35 @@ void float_epilogue_reduce_avg(const AccTensor& accum, int m,
 // WARP_Q == 4 never compile there. Avg-only (the host rejects weighted H = 4).
 // ============================================================
 
+// 810E INT8 accumulator j maps to row=lane/4+8*(j/4), column=lane%4+4*(j%4).
+// A 16-column warp tile contains four H4 queries or two H8 queries.
+// Reduce heads in FP32, then assign each (query, KV row) to one lane.
+template <uint32_t Heads, typename AccTensor>
+__forceinline__ __device__
+void int8_avg_head_sum(const AccTensor& accum, int m, const float (&scales)[4],
+                       uint32_t lane, float (&totals)[2]) {
+    static_assert(Heads == 4 || Heads == 8);
+    const uint32_t row = lane & 1;
+    float halves[16 / Heads];
+    #pragma unroll
+    for (int q = 0; q < 16 / Heads; ++q) {
+        float sums[2] = {0.0f, 0.0f};
+        #pragma unroll
+        for (int h = 0; h < Heads / 4; ++h) {
+            const int col = q * (Heads / 4) + h;
+            #pragma unroll
+            for (int r = 0; r < 2; ++r)
+                sums[r] += fmaxf(float(accum(col + 4 * r, m, 0)), 0.0f) * scales[col];
+        }
+        halves[q] = sums[row] + __shfl_xor_sync(0xffffffffu, sums[row ^ 1], 1);
+    }
+    #pragma unroll
+    for (int t = 0; t < (Heads == 4 ? 2 : 1); ++t) {
+        const uint32_t q = 2 * t + (lane % 4) / 2;
+        totals[t] = halves[q] + __shfl_xor_sync(0xffffffffu, halves[q ^ 1], 2);
+    }
+}
+
 // 4-head in-thread head sums (requires MmaIterN == 1, accum(j, m, 0)):
 // lane T holds heads {2*(T&1), 2*(T&1)+1} of q_{T/2} (j 0-3) and q_{2+T/2} (j 4-7).
 // sums[t][r] is the row-G/row-(G+8) half of warp-local q token 2*t + T/2.

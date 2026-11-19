@@ -21,6 +21,8 @@ enum QScaleMode : uint32_t {
     kScaleModeQRow = 1,
     kScaleModeQScalar = 2,
     kScaleModeUnity = 3,
+    // INT8 AVG: FP32 quantization scales per (Q, head), in the weights slot.
+    kScaleModeQHead = 4,
 };
 
 struct alignas(8) FP4VarlenCTAStart {

@@ -370,7 +370,9 @@ static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens
     const int element_size = static_cast<int>(c10::elementSize(qk_dtype));
     const auto tile = is_fp4 and num_heads >= 32 and indices.has_value()
         ? deep_gemm_mqa_common::get_fp4_varlen_tile(num_heads)
-        : deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
+        : get_ppu_arch() == AC_PPU0010 and (num_heads == 4 or num_heads == 8)
+            ? deep_gemm_mqa_common::get_int8_avg_paged_tile()
+            : deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
     const int split_kv = tile.split_kv, tb_per_cu = tile.tb_per_cu;
 
     const int num_blocks = num_sms * tb_per_cu;
@@ -431,7 +433,8 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
                                       int batch_size, int next_n, int num_heads, int head_dim, int num_kv_blocks,
                                       int page_kv, int schedule_meta_size, int max_context_len,
                                       torch::ScalarType logits_dtype, const std::optional<torch::Tensor>& q_sf,
-                                      const std::optional<torch::Tensor>& indices) {
+                                      const std::optional<torch::Tensor>& indices,
+                                      const std::optional<torch::Tensor>& q_head_scales = std::nullopt) {
     const bool is_fp4 = q_sf.has_value();
     // An empty weights tensor selects AVG (unity mode, no q_scale on paged).
     const bool is_avg = weights.numel() == 0;
@@ -448,9 +451,11 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
                                fused_kv_cache.storage_offset() + static_cast<int64_t>(page_kv) * head_dim)
                    .view(is_fp4 ? torch::kInt32 : torch::kFloat32);
 
+    const bool is_int8_avg = is_avg and not is_fp4 and qk_dtype == torch::kInt8;
     // A CTA budget change can make grouped and legacy metadata have the same shape.
     const bool grouped = is_fp4 and not is_avg and indices.has_value();
     const auto tile = grouped ? deep_gemm_mqa_common::get_fp4_varlen_tile(num_heads)
+        : is_int8_avg ? deep_gemm_mqa_common::get_int8_avg_paged_tile()
         : deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim,
                                                           static_cast<int>(q.element_size()));
     if (grouped) {
@@ -471,7 +476,7 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
     auto logits = torch::empty({batch_size * next_n, aligned_max_context_len},
                                torch::TensorOptions().dtype(logits_dtype).device(q.device()));
 
-    const void* weights_ptr = is_avg ? nullptr : weights.data_ptr();
+    const void* weights_ptr = is_int8_avg ? q_head_scales->data_ptr() : is_avg ? nullptr : weights.data_ptr();
     // AVG packs Q/head rows into 16-column warp tiles; match the device padding
     // when computing shared memory and thread counts.
     int tile_next_n = next_n, tile_num_heads = num_heads;
@@ -480,7 +485,7 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
         tile_num_heads = 16;
         tile_next_n = ceil_div(next_n * num_heads, 16);
     }
-    const std::string scale_mode = is_avg ? "deep_gemm::kScaleModeUnity" : "deep_gemm::kScaleModeWeights";
+    const std::string scale_mode = is_int8_avg ? "deep_gemm::kScaleModeQHead" : is_avg ? "deep_gemm::kScaleModeUnity" : "deep_gemm::kScaleModeWeights";
 
     const bool weights_bf16 = logits_dtype == torch::kBFloat16 and weights.scalar_type() == torch::kBFloat16;
     const std::string element_weights = weights_bf16 ? "__ppu_bfloat16" : "float";

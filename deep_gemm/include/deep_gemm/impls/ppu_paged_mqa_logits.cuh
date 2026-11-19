@@ -25,15 +25,16 @@ public:
   static constexpr float kInvSqrtHeadDim = kHeadDim == 32 ? 0x1.6a09e6p-3f : (kHeadDim == 64 ? 0x1p-3f : 0x1.6a09e6p-4f);
   // 4 heads: a warp N tile of 16 columns covers 4 q tokens, so BLOCK_N rounds
   // next_n * 4 up to a multiple of 16; pad rows are zero-filled by the Q copy
-  static constexpr uint32_t kMMANumHeads = kNumHeads == 4 ? 16 : kNumHeads;
+  static constexpr uint32_t kMMANumHeads = (kNumHeads == 4 || kScaleMode == deep_gemm::kScaleModeQHead) ? 16 : kNumHeads;
   static constexpr int BLOCK_M = BLOCK_KV;
-  static constexpr int BLOCK_N = kNumHeads == 4 ? (kNextN + 3) / 4 * 16 : kNextN * kMMANumHeads;
+  static constexpr int BLOCK_N = (kNumHeads == 4 || kScaleMode == deep_gemm::kScaleModeQHead)
+      ? (kNextN * kNumHeads + 15) / 16 * 16 : kNextN * kMMANumHeads;
   static constexpr int BLOCK_K = kHeadDim;
   static constexpr int WARP_M = WARP_KV;
   static constexpr int WARP_N = kMMANumHeads;
 
   static constexpr int BLOCK_Q = kNextN;
-  static constexpr int WARP_Q = kNumHeads == 4 ? 4 : 1;
+  static constexpr int WARP_Q = (kNumHeads == 4 || kScaleMode == deep_gemm::kScaleModeQHead) ? 16 / kNumHeads : 1;
   // 4-head avg tile: parity-split epilogue, each lane loads/stores only its own
   // kv row half (see operator()). Applies to both float and bf16 logits
   static constexpr bool kWq4 = WARP_Q == 4;
@@ -297,6 +298,7 @@ public:
     DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
 
     ElementLogits weights[kNumHeads / 4];
+    float q_head_scales[4];
 
     clear(accum);
     auto tKgK = tAgA;
@@ -411,6 +413,16 @@ public:
             deep_gemm::load_weights_from_smem_ld_shared<ElementWeights, ElementLogits, kNumHeads>(
                 sSFB(_,_,smem_pipe_read_q), weights, lane_idx, warp_q_idx);
         }
+        if constexpr (kScaleMode == deep_gemm::kScaleModeQHead) {
+            #pragma unroll
+            for (uint32_t j = 0; j < 4; ++j) {
+                const uint32_t column = 4 * j + lane_idx % 4;
+                const uint32_t local_q = column / kNumHeads;
+                const uint32_t head = column % kNumHeads;
+                const uint32_t token = q_idx * kNextN + min(warp_q_idx * WARP_Q + local_q, kNextN - 1);
+                q_head_scales[j] = __ldg(params.weights + token * kNumHeads + head);
+            }
+        }
         smem_pipe_read_q = (smem_pipe_read_q + 1) % kNumQStages;
     };
 
@@ -435,7 +447,7 @@ public:
         float * smem_kv_scales = sSFA(_,_,smem_pipe_read_kv).data().get();
         for (int m = 0; m < kMmaIterM; m++) {
             uint32_t mma_offset = m * InstM;
-            if constexpr (kWq4) {
+            if constexpr (kWq4 || kScaleMode == deep_gemm::kScaleModeQHead) {
                 // Each lane stores only its own parity's kv row in the kWq4 epilogue,
                 // so it only loads that row's scale
                 scale_kv_array[m] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
@@ -457,16 +469,32 @@ public:
     auto epilogue = [&](uint32_t q_idx, uint32_t kv_idx) {
         static constexpr uint32_t kNumAccumPerMma = 8;
         CUTE_STATIC_ASSERT(kMMANumHeads % 16 == 0);
-        CUTE_STATIC_ASSERT(WARP_Q == 1 || WARP_Q == 4);
+        CUTE_STATIC_ASSERT(WARP_Q == 1 || WARP_Q == 4 ||
+                           (WARP_Q == 2 && kScaleMode == deep_gemm::kScaleModeQHead));
         for (int m = 0; m < kMmaIterM; m++) {
             uint32_t mma_offset = m * InstM;
             float scale_kv_0, scale_kv_1;
-            if constexpr (!kWq4) {
+            if constexpr (!kWq4 && kScaleMode != deep_gemm::kScaleModeQHead) {
                 scale_kv_0 = scale_kv_array[m * 2];
                 scale_kv_1 = scale_kv_array[m * 2 + 1];
             }
 
-            if constexpr (kWq4 && kScaleMode == deep_gemm::kScaleModeUnity) {
+            if constexpr (kScaleMode == deep_gemm::kScaleModeQHead) {
+                CUTE_STATIC_ASSERT(MmaIterN{} == 1);
+                CUTE_STATIC_ASSERT(cute::is_same_v<ElementLogits, __ppu_bfloat16>);
+                float totals[2];
+                deep_gemm::int8_avg_head_sum<kNumHeads>(accum, m, q_head_scales, lane_idx, totals);
+                #pragma unroll
+                for (int t = 0; t < (kNumHeads == 4 ? 2 : 1); ++t) {
+                    const uint32_t local_q = 2 * t + (lane_idx % 4) / 2;
+                    const uint32_t token = warp_q_idx * WARP_Q + local_q;
+                    if (token < kNextN) {
+                        const auto row = (q_idx * kNextN + token) * params.logits_stride;
+                        const uint32_t col = kv_idx * BLOCK_KV + warp_offset + mma_offset + v_offset_mine;
+                        params.logits[row + col] = static_cast<ElementLogits>(totals[t] * scale_kv_array[m]);
+                    }
+                }
+            } else if constexpr (kWq4 && kScaleMode == deep_gemm::kScaleModeUnity) {
                 // 4-head avg epilogue, parity split as the non-paged kernel: each lane
                 // stores its own parity's kv row; the token guard skips pad tokens
                 static constexpr int kQPerLane = 2;
