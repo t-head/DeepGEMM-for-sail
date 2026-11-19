@@ -160,7 +160,19 @@ public:
         }
     }
 
-    static std::string generate_impl(const Args& args) {
+    static bool requires_safe_store(const Args& args) {
+        if (is_ppu1v5_device()) return false;
+        const auto& params = args.kernel_params.with_tsm;
+        const auto& output = params.collective_epilogue_params;
+        constexpr int alignment = 16 / sizeof(ElementOutput);
+        return cute::get<1>(params.problem_shape) % alignment != 0 ||
+               reinterpret_cast<uintptr_t>(output.ptr_D) % 16 != 0 ||
+               cute::get<0>(output.stride_D) % alignment != 0 ||
+               (cute::get<3>(params.problem_shape) > 1 && cute::get<2>(output.stride_D) % alignment != 0);
+    }
+
+    static std::string generate_impl(const Args& args, bool enable_safe_store = false) {
+        enable_safe_store = enable_safe_store || requires_safe_store(args);
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
         // One snapshot drives both the union member read and the injected epilogue flag.
@@ -274,6 +286,7 @@ using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueN
     IsAlignedN>;
 
 // TSM epilogue for alpha=1, beta=0;
+static constexpr bool kEnableSafeStore = {20};
 static constexpr int AlignmentC = 16 / sizeof(ElementC);
 using DefaultOperation = cutlass::epilogue::fusion::PPUEVT<
     cutlass::epilogue::fusion::PPUCompute<cutlass::epilogue::thread::Identity, ElementD, ElementCompute,
@@ -288,7 +301,7 @@ using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::Colle
     ElementC, LayoutC, AlignmentC,
     ElementC, LayoutC, AlignmentC,
     EpilogueSchedule,
-    DefaultOperation
+    DefaultOperation, void, kEnableSafeStore
 >::CollectiveOp;
 
 // Injected epilogue choice (is_ppu1v5_device()); matches to_underlying_arguments_rtc.
@@ -334,7 +347,8 @@ __global__ void {12}(
             args.launch_info.kernel_strategy, args.launch_info.enable_sbo_overlap, args.launch_info.kernel_name,
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
             with_tsm_epilogue, host_params_size,
-            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t");
+            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t",
+            enable_safe_store);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -1197,9 +1211,10 @@ public:
         // The custom kernel and EVT epilogue use real dimensions from Params
         // (or the validated M36 specialization). The unused standard scheduler
         // remains a fixed dummy type.
+        const bool enable_safe_store = Base::requires_safe_store(args);
         cute::get<1>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
         cute::get<2>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
-        auto code = Base::generate_impl(codegen_args);
+        auto code = Base::generate_impl(codegen_args, enable_safe_store);
         const int splits = SplitK ? cute::get<3>(args.kernel_params.with_tsm.problem_shape) : 1;
         Model810eBatchedRuntime::replace_once(code, "GemmKernel op;\n  op(params, smem);",
             fmt::format("static_assert(GemmKernel::SharedStorageSize <= {}, \"810E TSM launch storage is too small\");\n"

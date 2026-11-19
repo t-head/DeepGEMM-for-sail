@@ -118,6 +118,67 @@ int bf16_checks() {
     return count;
 }
 
+template <typename Output>
+int bf16_tsm_store_checks() {
+    using Runtime = BF16GemmCutlass3RuntimeT<Output>;
+    typename Runtime::Args args{};
+    args.launch_info = {64, 64, 32, 32, 32, 1, 2, "Normal", "Default", "test_tsm", false};
+    constexpr int alignment = 16 / sizeof(Output);
+    const bool with_tsm = !is_ppu1v5_device();
+    auto params = typename Runtime::template GemmKernelParamsT<typename Runtime::EpilogueParamWithTsm>{};
+    params.problem_shape = cute::make_tuple(3, 64, 32, 1);
+    params.collective_epilogue_params.ptr_D = reinterpret_cast<Output*>(uintptr_t(0x1000));
+    params.collective_epilogue_params.stride_D = {64, cute::Int<1>{}, 256};
+    if (with_tsm) args.kernel_params.with_tsm = params;
+    else {
+        args.kernel_params.no_tsm = {};
+        args.kernel_params.no_tsm.problem_shape = params.problem_shape;
+        args.kernel_params.no_tsm.collective_epilogue_params.ptr_D = params.collective_epilogue_params.ptr_D;
+        args.kernel_params.no_tsm.collective_epilogue_params.stride_D = params.collective_epilogue_params.stride_D;
+    }
+    const auto base_source = Runtime::generate_impl(args);
+    if (Runtime::requires_safe_store(args) || base_source.find("kEnableSafeStore = false;") == std::string::npos)
+        throw std::runtime_error("aligned outputs must preserve unchecked stores");
+    int count = 1;
+    auto check_policy = [&](const auto& other, bool expected, bool changes_source) {
+        const auto source = Runtime::generate_impl(other);
+        if (Runtime::requires_safe_store(other) != expected ||
+            source.find(std::string("kEnableSafeStore = ") + (expected ? "true;" : "false;")) == std::string::npos ||
+            (source != base_source) != changes_source ||
+            (get_hex_digest(source) != get_hex_digest(base_source)) != changes_source)
+            throw std::runtime_error("TSM store policy/source-cache identity mismatch");
+        ++count;
+    };
+    for (int offset = 0; offset < alignment; ++offset) {
+        auto other = args;
+        auto ptr = reinterpret_cast<Output*>(uintptr_t(0x2000 + offset * sizeof(Output)));
+        if (with_tsm) other.kernel_params.with_tsm.collective_epilogue_params.ptr_D = ptr;
+        else other.kernel_params.no_tsm.collective_epilogue_params.ptr_D = ptr;
+        check_policy(other, with_tsm && offset != 0, with_tsm && offset != 0);
+    }
+    if (!with_tsm) return count;
+    auto row_stride = args;
+    cute::get<0>(row_stride.kernel_params.with_tsm.collective_epilogue_params.stride_D) = 65;
+    check_policy(row_stride, true, true);
+    auto tail = args;
+    cute::get<1>(tail.kernel_params.with_tsm.problem_shape) = 62;
+    cute::get<0>(tail.kernel_params.with_tsm.collective_epilogue_params.stride_D) = 64;
+    check_policy(tail, true, true);
+    auto unused_batch_stride = args;
+    cute::get<2>(unused_batch_stride.kernel_params.with_tsm.collective_epilogue_params.stride_D) = 257;
+    check_policy(unused_batch_stride, false, false);
+    auto batched = unused_batch_stride;
+    cute::get<3>(batched.kernel_params.with_tsm.problem_shape) = 3;
+    check_policy(batched, true, true);
+    if (Runtime::generate_impl(args, true).find("kEnableSafeStore = true;") == std::string::npos)
+        throw std::runtime_error("explicit upper-level enable must be forwarded");
+    typename Model810eTsmRuntime<Output, false>::Args model{};
+    static_cast<typename Runtime::Args&>(model) = tail;
+    if (Model810eTsmRuntime<Output, false>::generate_impl(model).find("kEnableSafeStore = true;") == std::string::npos)
+        throw std::runtime_error("dummy scheduler N must not hide the real output tail");
+    return count + 2;
+}
+
 int int8_checks() {
     using Runtime = DenseINT8GemmCutlass3Runtime;
     auto args = dense_args<Runtime>();
@@ -222,6 +283,8 @@ int gemv_checks() {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bf16_cute_free", [] { return bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<cutlass::bfloat16_t>>()
                                     + bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<float>>(); });
+    m.def("bf16_tsm_stores", [] { return bf16_tsm_store_checks<cutlass::bfloat16_t>()
+                                       + bf16_tsm_store_checks<float>(); });
     m.def("int8_and_fp8_channel", int8_checks);
     m.def("fp8_block", fp8_checks);
     m.def("fp4", fp4_checks);
@@ -257,6 +320,9 @@ class CompileKeyTests(unittest.TestCase):
 
     def test_bf16_cute_free_both_output_types(self):
         self.assertGreater(self.native.bf16_cute_free(), 0)
+
+    def test_bf16_tsm_store_policy_and_source_cache(self):
+        self.assertGreater(self.native.bf16_tsm_stores(), 0)
 
     def test_int8_and_fp8_channel(self):
         self.assertGreater(self.native.int8_and_fp8_channel(), 0)
