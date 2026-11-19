@@ -16,6 +16,7 @@ The weighted MXFP4 entry points do not silently quantize FP8 inputs.
 | MXFP4 weighted | BF16 | BF16 | 1 |
 | Sparse INT8 / MXFP4 | BF16 | Fixed BF16 | 1 (flatten multiple Q per request) |
 | FP8/FP4 AVG | none | BF16 by default; optional FP32 for H4; FP4 H8 requires BF16 | 1–6 |
+| INT8 AVG (810E only) | none; explicit Q quantization scales | Fixed BF16 | 1–6 |
 
 Dense FP8 on M890 and dense INT8 on 810E support logical head dimensions
 64 and 128. Sparse INT8 requires logical D128.
@@ -31,8 +32,8 @@ valid lengths to top-k. The library does not call DeepSelect internally.
 
 ## Supported head dimensions and head counts
 
-All D values below are **logical `head_dim`**. Dense FP8/INT8 accept only D64 or
-D128; sparse INT8 requires D128. MXFP4 accepts only D128, represented by a
+All D values below are **logical `head_dim`**. Dense weighted FP8/INT8 accept only D64 or
+D128; INT8 AVG and sparse INT8 require D128. MXFP4 accepts only D128, represented by a
 packed tensor dimension of 64. All other head dimensions are unsupported and rejected by host checks.
 `num_heads` refers to Q heads, not the single KV head in a paged cache.
 
@@ -42,8 +43,9 @@ packed tensor dimension of 64. All other head dimensions are unsupported and rej
 | `fp8_mqa_logits` | FP8 / M890 | 64, 128 | 32, 64 |
 | `int8_mqa_logits` | INT8 / 810E only | 64, 128 | 32, 64 |
 | `fp8_fp4_mqa_logits` | MXFP4 / M890 | 128 | 32, 64 |
-| `get_paged_mqa_logits_metadata` | FP8 / M890; INT8 / 810E | 64, 128 | DSA: 32, 64; AVG: 4 (FP8 only) |
+| `get_paged_mqa_logits_metadata` | FP8 / M890 | 64, 128 | DSA: 32, 64; AVG: 4 |
 | `get_paged_mqa_logits_metadata` | MXFP4 / M890 | 128 | DSA: 32, 64; AVG: 4, 8 |
+| `get_paged_mqa_logits_metadata` | INT8 / 810E | DSA: 64, 128; AVG: 128 | DSA: 32, 64; AVG: 4, 8 |
 | `fp8_paged_mqa_logits` | FP8 / M890 | 64, 128 | 32, 64 |
 | `int8_paged_mqa_logits` | INT8 / 810E only | 64, 128 | 32, 64 |
 | `fp8_fp4_paged_mqa_logits` | MXFP4 / M890 | 128 | 32, 64 |
@@ -53,6 +55,8 @@ packed tensor dimension of 64. All other head dimensions are unsupported and rej
 | `get_paged_sparse_mqa_logits_metadata` | INT8 / 810E; MXFP4 / M890 | Fixed 128; no D argument | Fixed 32; no H argument |
 | `fp8_fp4_paged_sparse_mqa_logits` | MXFP4 / M890 | 128 | 32 |
 | `int8_paged_sparse_mqa_logits` | INT8 / 810E only | 128 | 32 |
+| `int8_mqa_avg_logits` | INT8 / 810E only | 128 | 4, 8 |
+| `int8_paged_mqa_avg_logits` | INT8 / 810E only | 128 | 4, 8 |
 | `fp8_mqa_avg_logits` | FP8 / M890 | 64, 128 | 4 |
 | `fp8_fp4_mqa_avg_logits` | FP8 / M890 | 64, 128 | 4 |
 | `fp8_fp4_mqa_avg_logits` | MXFP4 / M890 | 128 | 4, 8 |
@@ -60,9 +64,10 @@ packed tensor dimension of 64. All other head dimensions are unsupported and rej
 | `fp8_fp4_paged_mqa_avg_logits` | MXFP4 / M890 | 128 | 4, 8 |
 
 Host checks enforce the table's head-count limits: DSA accepts only H32/H64,
-FP8 AVG only H4, MXFP4 AVG H4/H8, and sparse only H32. All other head counts
-are rejected before kernel dispatch. Explicit paged metadata accepts the same
-head counts; 810E has no AVG indexer support.
+FP8 AVG only H4, MXFP4 and INT8 AVG H4/H8, and sparse only H32. All other
+head counts are rejected before kernel dispatch. The shared `get_paged_mqa_logits_metadata` API
+uses the same head-count limits, including MXFP4 AVG H4/H8 on M890 and
+INT8 AVG H4/H8 on 810E.
 The dense metadata stub performs no validation. Sparse metadata has no D/H
 arguments and targets its fixed-layout compute APIs.
 
@@ -516,6 +521,45 @@ shapes, storage interpretation and all scheduling inputs remain compatible.
 
 ## AVG indexer
 
+### INT8 on 810E
+
+```python
+def int8_mqa_avg_logits(q, kv, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k) -> torch.Tensor: ...
+def int8_paged_mqa_avg_logits(q, fused_kv_cache, context_lens, block_table, schedule_meta, max_context_len) -> torch.Tensor: ...
+```
+
+Both entry points support H4/H8, logical D128 and BF16 output only.
+`q` is `(q_int8, q_scales)`: contiguous signed INT8 values and contiguous
+FP32 scales shaped exactly like `q_int8.shape[:-1]`. Scales are nonnegative
+quantization factors, not head weights or the optional post-reduction
+`q_scale` of the FP8/FP4 API. No additional post-reduction scale is accepted.
+The represented operands are `Q = q_int8 * q_scales` and
+`K = k_int8 * k_scales`; the result is
+`sum_h(ReLU(dot(Q_h, K))) / sqrt(D)`, with no division by H.
+INT32 dot products are dequantized and reduced in FP32, then rounded once
+to BF16 at the output. The kernel does not quantize its inputs.
+
+Nonpaged `kv` is `(k_int8[K,D], k_scales[K])`; `[K,1]` scales are also
+accepted. Q is `[Q,H,D]`; start/end arrays must both be INT32 `[Q]` vectors.
+`max_seqlen_k > 0` is required, as for the other AVG entry points.
+Paged Q is `[B,N,H,D]`, N=1–6. The fused cache follows the existing INT8
+layout below: all value rows of a physical page, then its FP32 scales.
+810E page sizes must be positive multiples of 64; page32 remains unsupported.
+Build metadata with `metadata_extra=(N,H,D,torch.int8)` and the same
+`deep_gemm.get_num_sms()` used by execution. No metadata API change is needed.
+Context lengths are `[B,N]`. Each row's last length must be its maximum:
+`context_lens[b,N-1] == max(context_lens[b,:])`. Scheduling uses that last
+entry, so an ordering such as `[257,1]` can leave valid logits unwritten.
+Also ensure `max_context_len >= max(context_lens)` across all rows and tokens.
+
+Metadata and compute use the caller-selected current device and stream;
+they do not switch devices to match Q. Select the input device (for example,
+with `torch.cuda.device(...)`) before generating metadata and invoking either
+API, and keep all inputs and metadata on that device. Paged request indices are
+unsupported and out-of-range logits require external masking.
+
+### FP8/FP4 on M890
+
 `fp8_fp4_paged_mqa_avg_logits` accepts MXFP4 only (packed int8 values and
 required int32 Q scales); ordinary FP8 and missing Q scales are rejected.
 Use `fp8_paged_mqa_avg_logits` for ordinary FP8 paged AVG. The nonpaged
@@ -600,7 +644,7 @@ and execution must use matching query configurations, page sizes and SM counts.
 The tuple can be constructed from runtime configuration before Q exists:
 
 - `N`: future Q's next-token count; fixed to 1 for DSA, and 1–6 for AVG.
-- `H`: the actual head count: 32/64 for DSA, 4 for FP8 AVG, and 4/8 for MXFP4 AVG.
+- `H`: the actual head count: 32/64 for DSA, 4 for FP8 AVG, and 4/8 for MXFP4 or INT8 AVG.
 - `D`: logical head dimension; MXFP4 D128 uses 128, even though its packed
   Q tensor has last dimension 64.
 - `qk_dtype`: a `torch.dtype`, interpreted together with the current device
@@ -618,10 +662,11 @@ Passing `torch.int8` to metadata on M890 does not enable INT8 computation.
 | 810E INT8 DSA | `torch.int8` | `(1,H,128,torch.int8)` | 128 |
 | M890 legacy FP8 DSA | `torch.float8_e4m3fn` | `(1,H,128,torch.float8_e4m3fn)` | 128 |
 | M890 MXFP4 DSA | `torch.int8` | `(1,H,128,torch.int8)` | 64 |
+| 810E INT8 AVG | `torch.int8` | `(N,H,D,torch.int8)`, H=4/8 | D |
 | M890 FP8 AVG | `torch.float8_e4m3fn` | `(N,4,128,torch.float8_e4m3fn)` | 128 |
 | M890 MXFP4 AVG (H=4/8) | `torch.int8` | `(N,H,128,torch.int8)` | 64 |
 
-Logical D must be 64 or 128; D32 is rejected.
+Logical D must be 64 or 128; INT8 AVG requires D128. D32 is rejected.
 810E metadata accepts only `torch.int8`. M890 metadata accepts
 `torch.int8` or `torch.float8_e4m3fn`; MXFP4 requires logical D128.
 Use `torch.int8` for MXFP4, not `torch.float4_e2m1fn_x2` or `torch.uint8`.

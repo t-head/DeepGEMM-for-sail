@@ -123,6 +123,12 @@ static int get_paged_num_threads(const PagedTile& tile, int next_n) {
     return next_n * (tile.split_kv / tile.warp_kv) * 32;
 }
 
+// 810E INT8 AVG packs H4/H8 queries into 16-column warp tiles.
+// Metadata and compute use this same plan; three KV stages hide page loads.
+static PagedTile get_int8_avg_paged_tile() {
+    return {2, 3, 256, 64, false, 2};
+}
+
 // Paged tile lookup with resource-based search for unlisted shapes.
 // NOTES: `weights_size` / `logits_size` are hardcoded to 4 upstream even when the tensors are
 // BF16; preserve that accounting for the existing weighted paths.
@@ -393,6 +399,9 @@ static MqaLogitsConfig get_best_configs(torch::ScalarType qk_dtype, int seq_len_
                                        bool is_fp4, int num_sms, bool is_compressed,
                                        QScaleMode scale_mode) {
     DG_HOST_ASSERT(num_sms > 0);
+    // One geometry for H4/H8; CTA-synchronized 512-thread execution is faster than interleave on 810E.
+    if (scale_mode == kScaleModeQHead)
+        return {64 / num_heads, 64, 128, 16, 32, 1, 3};
     const bool is_avg = scale_mode != kScaleModeWeights;
     if (is_avg) {
         // One H8 geometry for all Q-scale modes and output dtypes.

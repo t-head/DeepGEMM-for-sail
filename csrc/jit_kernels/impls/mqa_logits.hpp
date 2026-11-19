@@ -270,20 +270,21 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
 static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& k_scales,
                                 const torch::Tensor& weights, const torch::Tensor& cu_seq_len_k_start,
                                 const torch::Tensor& cu_seq_len_k_end, int seq_len_q, int seq_len_k, int num_heads,
-                                int head_dim, bool clean_logits, int max_seqlen_k, torch::ScalarType logits_dtype,
+                                int head_dim, bool clean_logits, int max_seqlen_k, torch::ScalarType logits_dtype, bool is_avg,
                                 const std::optional<torch::Tensor>& q_sf,
                                 const std::optional<torch::Tensor>& k_sf,
                                 const std::optional<torch::Tensor>& q_scale = std::nullopt) {
     const bool is_fp4 = q_sf.has_value();
     const auto& qk_dtype = q.scalar_type();
     const bool is_compressed = max_seqlen_k > 0;
-    // Avg variant: an empty weights tensor selects it, and the `weights` kernel slot then
-    // carries `q_scale` (nullptr for the unity mode -- the kernel never dereferences it)
-    const bool is_avg = weights.numel() == 0;
+    // INT8 AVG supplies per-Q/head scales through weights; FP8/FP4 AVG may
+    // replace that kernel slot with an optional scalar or per-row multiplier.
     QScaleMode scale_mode = kScaleModeWeights;
     const void* weights_ptr = weights.data_ptr();
     if (is_avg) {
-        if (not q_scale.has_value()) {
+        if (qk_dtype == torch::kInt8 and not is_fp4) {
+            scale_mode = kScaleModeQHead;
+        } else if (not q_scale.has_value()) {
             scale_mode = kScaleModeUnity;
             weights_ptr = nullptr;
         } else if (q_scale->numel() == 1) {

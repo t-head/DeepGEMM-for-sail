@@ -121,3 +121,5 @@ Device checks comparing W4 warm-up shapes, types and strides with real quantizat
 ```bash
 python tests/checkin/test_warmup_inputs.py -v
 ```
+
+- `MqaAvgLogits` / `PagedMqaAvgLogits`, `data_type:int8`: six 810E cases cover H4/H8, BF16 output, D128, compressed Q/KV tails, paged next_n=1/3/5/6, page64/128/192/512, and mixed/empty contexts. The attention AVG loop covers all next_n values and nonzero window starts.

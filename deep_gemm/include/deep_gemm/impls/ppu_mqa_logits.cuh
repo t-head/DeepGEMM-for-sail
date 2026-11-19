@@ -67,7 +67,8 @@ public:
 
   static constexpr int NumThreadsPerCTA = size(TiledMma{});
   // WarpInterleaving is enabled only when NumThreadsPerCTA is 512, which satisfy the condition that 2 warp group partitioned onto separate WEs.
-  static constexpr bool WarpInterleaving = (NumThreadsPerCTA == 512);
+  // INT8 AVG keeps CTA-wide KV stage synchronization; measured faster than interleave.
+  static constexpr bool WarpInterleaving = (NumThreadsPerCTA == 512 && kScaleMode != deep_gemm::kScaleModeQHead);
 
   using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementQK, false, Int<BLOCK_M>, Int<BLOCK_K>, false>;
   using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementQK, false, Int<BLOCK_N>, Int<BLOCK_K>, true>;
@@ -272,6 +273,7 @@ public:
 
     // kNumHeads/4 weights per lane (WARP_Q == 4 tiles are avg-only, no weights)
     ElementLogits weights[WARP_QH / 4];
+    float q_head_scales[4];
     // Avg variants
     float scale_q = 1.0f;
     if constexpr (kScaleMode == deep_gemm::kScaleModeQScalar) scale_q = __ldg(params.weights);
@@ -322,6 +324,17 @@ public:
     };
 
     auto load_q_s2r = [&]() {
+        if constexpr (kScaleMode == deep_gemm::kScaleModeQHead) {
+            #pragma unroll
+            for (uint32_t j = 0; j < 4; ++j) {
+                const uint32_t column = 4 * j + lane_idx % 4;
+                const uint32_t local_q = column / kNumHeads;
+                const uint32_t head = column % kNumHeads;
+                const uint32_t token = min(block_q_idx * BLOCK_Q + warp_q_idx * WARP_Q + local_q, params.seq_len_q - 1);
+                q_head_scales[j] = __ldg(params.weights + token * kNumHeads + head);
+            }
+        }
+
         copy(smem_tiled_copy_B, tCsB(_,_,_,0), tCrB_copy_view);
         if constexpr (kScaleMode == deep_gemm::kScaleModeWeights) {
             // WARP_Q == 4 tiles are avg-only (the host rejects weighted H = 4)
@@ -341,7 +354,7 @@ public:
         float * smem_kv_scales = sSFA(_,_,kv_stage_idx).data().get();
         for (int m = 0; m < kMmaIterM; m++) {
             uint32_t mma_offset = m * InstM;
-            if constexpr (kWq4) {
+            if constexpr (kWq4 || kScaleMode == deep_gemm::kScaleModeQHead) {
                 // Each lane stores only its own parity's kv row in the WARP_Q==4
                 // epilogue, so it only loads that row's scale
                 scale_kv_array[m] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
@@ -364,11 +377,12 @@ public:
         static constexpr uint32_t kNumAccumPerMma = 8;
         // The warp's N tile must be a legal MMA shape; 4 heads use WARP_Q = 4 (WARP_QH = 16)
         CUTE_STATIC_ASSERT(WARP_QH % 16 == 0);
-        CUTE_STATIC_ASSERT(WARP_Q == 1 || WARP_Q == 4);
+        CUTE_STATIC_ASSERT(WARP_Q == 1 || WARP_Q == 4 ||
+                           (WARP_Q == 2 && kScaleMode == deep_gemm::kScaleModeQHead));
         for (int m = 0; m < kMmaIterM; m++) {
             uint32_t mma_offset = m * InstM;
             float scale_kv_0, scale_kv_1;
-            if constexpr (!kWq4) {
+            if constexpr (!kWq4 && kScaleMode != deep_gemm::kScaleModeQHead) {
                 scale_kv_0 = scale_kv_array[m * 2];
                 scale_kv_1 = scale_kv_array[m * 2 + 1];
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights && WARP_Q == 1) {
@@ -382,7 +396,30 @@ public:
                 }
             }
 
-            if constexpr (cute::is_same_v<ElementLogits, float> && kWq4) {
+            if constexpr (kScaleMode == deep_gemm::kScaleModeQHead) {
+                CUTE_STATIC_ASSERT(MmaIterN{} == 1);
+                CUTE_STATIC_ASSERT(cute::is_same_v<ElementLogits, __ppu_bfloat16>);
+                float totals[2];
+                deep_gemm::int8_avg_head_sum<kNumHeads>(accum, m, q_head_scales, lane_idx, totals);
+                #pragma unroll
+                for (int t = 0; t < (kNumHeads == 4 ? 2 : 1); ++t) {
+                    const uint32_t local_q = 2 * t + (lane_idx % 4) / 2;
+                    const uint32_t lq = warp_q_idx * WARP_Q + local_q;
+                    const uint32_t q_idx = block_q_idx * BLOCK_Q + lq;
+                    const uint32_t col = kv_offset + mma_offset + v_offset_mine;
+                    if (q_idx < params.seq_len_q) {
+                        if constexpr (kIsCompressedLogits) {
+                            const uint32_t rel_kv = col - seq_k_start[lq];
+                            if (rel_kv < seq_k_end[lq] - seq_k_start[lq])
+                                params.logits[q_idx * params.stride_k + rel_kv] =
+                                    static_cast<ElementLogits>(totals[t] * scale_kv_array[m]);
+                        } else {
+                            params.logits[q_idx * params.stride_k + col] =
+                                static_cast<ElementLogits>(totals[t] * scale_kv_array[m]);
+                        }
+                    }
+                }
+            } else if constexpr (cute::is_same_v<ElementLogits, float> && kWq4) {
                 static constexpr int kQPerLane = 2;
                 CUTE_STATIC_ASSERT(MmaIterN{} == 1);
                 float sums[kQPerLane][2];
