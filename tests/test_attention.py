@@ -387,11 +387,36 @@ def test_paged_mqa_logits_loop():
     print("Passed\n")
 
 
+def _run_mqa_avg_cases(prefill_cases, paged_cases):
+    set_acc_check(True)
+    for case in prefill_cases:
+        print(case)
+        test_mqa_logits(parse_deepgemm_string_re(case))
+    for case in paged_cases:
+        print(case)
+        test_paged_mqa_logits(parse_deepgemm_string_re(case))
+
+
 def test_mqa_avg_logits_loop():
-    if not is_ppu1v5_device():
-        print('Skipping avg MQA logits: requires PPU1.5')
-        return
     print('Testing Avg MQA Logits:')
+    if not is_ppu1v5_device():
+        prefill_cases = [
+            f'MqaAvgLogits,data_type:int8,seq_len_q:{nq},seq_len_kv:{nk},'
+            f'num_heads:{heads},head_dim:128,logits_dtype:bf16,compressed_logits:1'
+            for heads, nq, nk in ((4, 129, 1025), (8, 4096, 8192))
+        ]
+        paged_cases = [
+            f'PagedMqaAvgLogits,data_type:int8,batch_size:64,next_n:{next_n},'
+            f'num_heads:{heads},head_dim:128,avg_context_len:2048,page_kv:{page},'
+            f'max_context_len:4096,logits_dtype:bf16'
+            for heads, next_n, page in (
+                (4, 1, 64), (8, 2, 128), (8, 3, 192),
+                (4, 4, 512), (4, 5, 64), (8, 6, 128),
+            )
+        ]
+        _run_mqa_avg_cases(prefill_cases, paged_cases)
+        print('Passed INT8 AVG H4/H8\n')
+        return
     # Prefill covers all q_scale modes, both output dtypes, and an odd Q tail.
     prefill_cases = [
         'MqaAvgLogits,data_type:fp8,seq_len_q:129,seq_len_kv:1024,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32,compressed_logits:1',
@@ -460,13 +485,7 @@ def test_mqa_avg_logits_loop():
             f'PagedMqaAvgLogits,data_type:fp4,batch_size:{request_switch_batch},next_n:{next_n},'
             f'num_heads:8,head_dim:128,page_kv:{page_kv},logits_dtype:bf16,'
             f'context_pattern:[17,0,1,63,64,65,129,257,513],max_context_len:768')
-    set_acc_check(True)
-    for case in prefill_cases:
-        print(case)
-        test_mqa_logits(parse_deepgemm_string_re(case))
-    for case in paged_cases:
-        print(case)
-        test_paged_mqa_logits(parse_deepgemm_string_re(case))
+    _run_mqa_avg_cases(prefill_cases, paged_cases)
     # Call directly: the shared AVG helper always enables compressed output.
     q = (torch.zeros((1, 4, 64), device='cuda', dtype=torch.int8),
          torch.zeros((1, 4), device='cuda', dtype=torch.int32))

@@ -2389,7 +2389,7 @@ def test_mqa_logits(args) -> None:
     print("test_mqa_logits->test_func: {},data_type:{},seq_len_q:{},seq_len_kv:{},num_heads:{},head_dim:{},c4_compressed:{},compressed_logits:{},weights_dtype:{},logits_dtype:{},q_scale:{}".format(args.get('gemm_type', 'MqaLogits'), data_type, seq_len_q, seq_len_kv, num_heads, head_dim, c4_compressed, compressed_logits, weights_dtype, logits_dtype, q_scale_mode))
 
     if is_avg:
-        assert data_type in (torch.float8_e4m3fn, torch.uint8), "MQA Avg Logits supports fp8 or fp4 only"
+        assert data_type in (torch.float8_e4m3fn, torch.uint8, torch.int8)
         assert logits_dtype in (torch.float32, torch.bfloat16), "MQA Avg Logits supports float32 or bf16 logits"
 
     q = torch.randn(seq_len_q, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
@@ -2426,8 +2426,15 @@ def test_mqa_logits(args) -> None:
         q_int8_scale = q_int8_scale.reshape(seq_len_q, num_heads)
         weights_int8 = weights * q_int8_scale.to(weights.dtype)
         kv_int8 = per_token_cast_to_int8(kv)
-        logits = deep_gemm.int8_mqa_logits(q_int8, kv_int8, weights_int8, ks, ke,
-                                           clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k)
+        if is_avg:
+            assert logits_dtype == torch.bfloat16 and q_scale_mode == 0
+            logits = deep_gemm.int8_mqa_avg_logits((q_int8, q_int8_scale), kv_int8, ks, ke, max_seqlen_k)
+            # Compare the kernel with the represented quantized operands, not quantization error.
+            q = q_int8.float() * q_int8_scale.unsqueeze(-1)
+            kv = kv_int8[0].float() * kv_int8[1].view(-1, 1)
+        else:
+            logits = deep_gemm.int8_mqa_logits(q_int8, kv_int8, weights_int8, ks, ke,
+                                               clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k)
     elif data_type == torch.uint8:  # FP4
         q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
         q_in = (q_fp4[0].view(seq_len_q, num_heads, head_dim // 2), q_fp4[1].view(seq_len_q, num_heads))
@@ -2487,6 +2494,9 @@ def test_mqa_logits(args) -> None:
         logits_masked = logits.masked_fill(neginf_mask, 0)
         ref_logits_masked = ref_logits.masked_fill(ref_neginf_mask, 0)
 
+        if is_avg and data_type == torch.int8:
+            torch.testing.assert_close(logits_masked.float(), ref_logits_masked.to(logits_dtype).float(),
+                                       rtol=8e-3, atol=2e-3)
         diff = calc_diff(logits_masked, ref_logits_masked)
         if torch.isnan(diff) or diff >= 1e-3:
             print(f"ERROR: Accuracy check failed, diff={diff}")
@@ -2551,7 +2561,7 @@ def test_paged_mqa_logits(args) -> None:
     print("test_paged_mqa_logits->test_func: {},data_type:{},batch_size:{},next_n:{},avg_context_len:{},num_heads:{},head_dim:{},logits_dtype:{},weights_dtype:{}".format(args.get('gemm_type', 'PagedMqaLogits'), data_type, batch_size, next_n, avg_context_len, num_heads, head_dim, logits_dtype, weights_dtype))
 
     if is_avg:
-        assert data_type in (torch.float8_e4m3fn, torch.uint8), "Paged MQA Avg Logits supports fp8 or fp4 only"
+        assert data_type in (torch.float8_e4m3fn, torch.uint8, torch.int8)
         assert logits_dtype in (torch.float32, torch.bfloat16), "Paged MQA Avg Logits supports float32 or bf16 logits"
 
     max_model_len = args.get('max_context_len', 262144)
@@ -2654,7 +2664,18 @@ def test_paged_mqa_logits(args) -> None:
         kv_cache_int8 = kv_cache_cast_to_int8(kv_cache)
         metadata_extra = (next_n, num_heads, head_dim, torch.int8)
         schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
-        logits = deep_gemm.int8_paged_mqa_logits(q_int8, kv_cache_int8, weights_int8, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False)
+        if is_avg:
+            assert logits_dtype == torch.bfloat16
+            qs = q_int8_scale.view(batch_size, next_n, num_heads)
+            logits = deep_gemm.int8_paged_mqa_avg_logits(
+                (q_int8, qs), kv_cache_int8, context_lens, block_tables, schedule_metadata, max_model_len)
+            q = q_int8.float() * qs.unsqueeze(-1)
+            packed = kv_cache_int8.view(num_blocks, -1)
+            values = packed[:, :pagesize * head_dim].contiguous().view(torch.int8)
+            scales = packed[:, pagesize * head_dim:].contiguous().view(torch.float32)
+            kv_cache = values.view(num_blocks, pagesize, 1, head_dim).float() * scales[:, :, None, None]
+        else:
+            logits = deep_gemm.int8_paged_mqa_logits(q_int8, kv_cache_int8, weights_int8, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False)
     elif data_type == torch.uint8:  # FP4
         q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
         q_in = (q_fp4[0].view(batch_size, next_n, num_heads, head_dim // 2), q_fp4[1].view(batch_size, next_n, num_heads))
@@ -2711,7 +2732,7 @@ def test_paged_mqa_logits(args) -> None:
         logits_masked = logits.masked_fill(ref_neginf_mask, 0)
         ref_logits_masked = ref_logits.masked_fill(ref_neginf_mask, 0)
 
-        if is_avg and data_type == torch.uint8:
+        if is_avg and data_type in (torch.uint8, torch.int8):
             # Check each valid token/K pair: an aggregate error can hide a bad
             # request switch or a missing token in the next_n=5/6 tail.
             is_bf16 = logits_dtype == torch.bfloat16

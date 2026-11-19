@@ -8,6 +8,13 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **Zhenwu810E INT8 AVG MQA**: adds `int8_mqa_avg_logits` and
+  `int8_paged_mqa_avg_logits` with H4/H8, logical D128 and BF16 output.
+  Accepts explicit FP32 quantization scales per Q/head and per KV token.
+  Supports compressed non-paged output and paged `next_n=1..6` with page
+  sizes that are positive multiples of 64, using the existing metadata API.
+  See the [INT8 AVG API guide](docs/api/indexer.md#int8-on-810e).
+
 - **M890 M-grouped BF16 NT GEMM**: supports optional BF16 C accumulation,
   including in-place `c=d`, and compact expert end offsets through
   `use_psum_layout=True`, including empty experts.
