@@ -143,6 +143,19 @@ struct Mainloop {
     }
   }
 
+  static __device__ __forceinline__ void join_input_stage() {
+#if __HGGC_ARCH__ == 150 && defined(DG_BF16_RS_SHARED_PACKETS) && DG_BF16_RS_SHARED_PACKETS > 0 && DG_GEMM_RS_WORLD == 2
+    // The AIU wait still applies at the caller. Drain input loads without
+    // making a shared input-stage join wait on the previous remote output.
+    __ppu_wait_vldcnt(0);
+    __ppu_wait_sldcnt(0);
+    __ppu_wait_tsmcnt(0);
+    __ppu_barrier_sync_nocnt(0, 1);
+#else
+    __syncthreads();
+#endif
+  }
+
   /// G2S issue point, shared by both unroll shapes. Placed after the MMA of step
   /// kKStepsPerWarp-2 and before the cross-tile prefetch of step kKStepsPerWarp-1,
   /// with the wait schedule kept isomorphic to cutlass3 (see do_k_pair).
@@ -156,13 +169,13 @@ struct Mainloop {
     if constexpr (DenseS2Opt) {
       if constexpr (STAGES > 2) {
         cutlass::arch::cp_async_wait<STAGES - 2>();
-        __syncthreads();
+        join_input_stage();
       } else {
-        __syncthreads();
+        join_input_stage();
       }
     } else {
       cutlass::arch::cp_async_wait<STAGES - 2>();
-      __syncthreads();
+      join_input_stage();
     }
     if (issue_g2s) {
       if (warp_id == 0) {
@@ -181,7 +194,7 @@ struct Mainloop {
       // reading -- in flight. That surviving group is the DMA/MMA overlap a
       // wait<0> drain throws away.
       cutlass::arch::cp_async_wait<1>();
-      __syncthreads();
+      join_input_stage();
     }
   }
 
@@ -462,13 +475,19 @@ struct Mainloop {
     }
   }
 
+  struct NoProgress {
+    __device__ __forceinline__ void progress() const {}
+  };
+
   /// Run the whole K-pipeline for one output tile: prologue + mainloop.
+  template <class Progress = NoProgress>
   static __device__ __forceinline__ void run(
       Params const& params,
       char* smem,
       int warp_id, int warp_row, int warp_col, int warp_k,
       int m_offset, int n_offset,
-      float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread]) {
+      float (&accum)[kMmasPerWarpM][kMmasPerWarpN][kAccumPerThread],
+      Progress const& progress = Progress{}) {
 
     int total_k_tiles = math::ceil_div(params.K, BLOCK_K);
 
@@ -514,6 +533,7 @@ struct Mainloop {
                /*skip_preload=*/ (k_iter > 0),
                /*next_stage=*/ next_read_stage,
                a_reg, b_reg);
+      progress.progress();
 
       if (issue_g2s) ++k_tile_to_load;
       if (++read_stage >= STAGES) read_stage = 0;

@@ -52,6 +52,27 @@ python tests/run_deep_gemm.py --caselist tests/checkin/checkin_890p.list --case_
 
 For masked GEMM, the `test_m_grouped_gemm_masked->test_func:` log line contains a replayable `--format` specification with the generated expert counts, padding, scheduler hint, epilogue, clipping limit and bias setting. Pass that specification to `tests/run_deep_gemm.py --format` to repeat the same case configuration.
 
+## GEMM + ReduceScatter
+
+`ZW-M890P-GemmRS` is a manual suite requiring eight free M890 cards on one
+host. It runs TP2/4/8 sequentially and is intentionally excluded from the shared
+PR CI; existing CI allocations are unchanged. Run the focused suite locally:
+
+```bash
+NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1 NCCL_IB_DISABLE=1 \
+python tests/checkin/run_checkin.py --suite ZW-M890P-GemmRS
+```
+
+Six small cases per TP cover BF16 and both FP8 layouts, short shards, owner/N
+tails, staged sends, changing-input Graphs and workspace reuse. The existing
+source-exact packet and elementwise reduction validators are shared with replay;
+positive/negative cancellation checks source rounding. This is a focused contract
+suite, not a performance sweep. Logs and failures appear in
+`checkin-logs/script-*.log` and the usual JUnit report.
+
+`--disable_acc` replay waits for real device execution before releasing resources;
+compile-only replay does not compare unwritten output.
+
 ## MegaMoE and MegaGate
 
 The single-device suite runs the public smoke tests for SwiGLU, SwiGLU-Step

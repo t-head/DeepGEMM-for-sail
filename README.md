@@ -148,6 +148,58 @@ Explicit/LUT tiles require a 16-byte-aligned product output and N divisible by
 8 (BF16) or 4 (FP32); with C, this applies to the internal FP32 product.
 Unsupported inputs/configurations raise host errors; see [810E checkin cases](tests/checkin/checkin_810e.list).
 
+#### BF16 and FP8 GEMM + ReduceScatter
+
+`deep_gemm.fp8_gemm_nt_reduce_scatter(lhs, rhs, out, workspace=workspace, configs=None)` fuses FP8 GEMM and ReduceScatter on M890 with single-host TP1/TP2/TP4/TP8. It infers M/N/K from the inputs and writes the BF16 `[M/TP,N]` shard into the caller's output tensor. FP32 scale shapes select blockwise (A1×128/W128×128) or per-row/per-channel quantization; both share the workspace returned by `deep_gemm.get_workspace_for_gemm_reduce_scatter`.
+
+`deep_gemm.bf16_gemm_nt_reduce_scatter(a, b, out, workspace=workspace, configs=None)` accepts contiguous BF16 `a[M,Klocal]` and `b[N,Klocal]` with the same output and workspace contract. It follows native dense BF16 accumulation, rounds each source partial to BF16, reduces source partials in FP32, then rounds the output to BF16. Klocal must be a positive multiple of 32; explicit BF16 tiles support BK64/128/256/512. The BF16 fused path is validated on M890 with offline JIT compilation.
+
+The workspace owns the symmetric allocation, communication handle, peer pointer tables and synchronization state. `num_max_rows` and `num_max_cols` specify capacity; each call can use different M/N/K within that capacity. Fixed phase offsets allow different shapes and captured graphs to reuse the workspace sequentially. TP1 runs the native dense GEMM without communication or a symmetric-memory dependency.
+
+The workspace accepts `tile_policy="rs_aware"` (default; native tiles adapted to RS row ownership and resource requirements) or `tile_policy="native"` (native tile selection). Both policies use the fused implementation for TP>1. Explicit `configs=(num_sms, BM, BN, BK, WM, WN, stages, smem)` override the tile policy, following the existing GEMM tuple convention; C++ recomputes SMEM for the selected tile. General shapes require positive M/N/K, M divisible by TP, N divisible by 16, and any positive integer local M (`M/TP`). Output shards have equal row counts; the caller handles framework token padding. Packet indices, including padded rows, must fit in int32. Blockwise K must exceed 512 and be divisible by 128; channelwise K can be any positive multiple of 32. Explicit configurations use BK128 for blockwise and BK64/128/256 for channelwise. Blockwise BN must divide 128, be a multiple of 128, or equal the specially handled 192. TP1 uses the native GEMM and rejects explicit blockwise BN192 configurations, which require the fused weight-scale refinement. Communication overlap is selected from tile alignment, successor work and shared-memory capacity, without a per-shape dispatch table. Two BF16 packet phases reserve `4 * ceil(TP * packet_rows * num_max_cols / 128) * 128` bytes per rank, where `local_capacity = ceil(num_max_rows / TP)`, `R` is 4/8/16 for capacities below 8/below 16/otherwise, and `packet_rows = R * ceil((local_capacity + R - 1) / R)` includes boundary-packet padding, plus control state and the caller output.
+
+Set the current device and initialize the default process group before obtaining workspaces collectively with the selected process group. All ranks must use matching capacities, shapes, configurations and call order; serialize calls across streams. Each call and captured graph uses its explicit output, so writing another output does not overwrite earlier results. For TP>1, the BF16 output base address must be 16-byte aligned, including contiguous views with a storage offset. Outputs must not alias inputs or workspace storage. Warm up outside Graph capture and retain workspaces, inputs and outputs until pending work and captured graphs are released. Call `workspace.reset_state()` collectively outside capture before 2**31 calls.
+
+```python
+import torch
+import deep_gemm
+
+workspace = deep_gemm.get_workspace_for_gemm_reduce_scatter(torch.distributed.group.WORLD, max_m, max_n)
+out = torch.empty((m // tp, n), dtype=torch.bfloat16, device="cuda")
+# FP8 E4M3 data: A[M,Klocal], W[N,Klocal]; FP32 scales:
+# A[M,Klocal/128], W[ceil(N/128),Klocal/128] for blockwise,
+# or A[M,1], W[N,1] for channelwise.
+deep_gemm.fp8_gemm_nt_reduce_scatter((a_fp8, a_scales), (w_fp8, w_scales), out, workspace=workspace)
+# The same workspace can be reused sequentially with dense BF16 inputs.
+deep_gemm.bf16_gemm_nt_reduce_scatter(a_bf16, w_bf16, out, workspace=workspace)
+```
+
+Run the shared [correctness and benchmark entry point](tests/test_gemm_comm.py) with `torchrun --standalone --nproc-per-node=2 tests/test_gemm_comm.py --skew`; use one, four or eight processes for TP1/TP4/TP8, add `--extended` for general-shape coverage and `--benchmark` for timings; select `--quantization bf16` to validate or benchmark BF16. Both quantizations use the public `deep_gemm.fp8_gemm_nt` C++ JIT baseline. The default M list includes 8/16/32/64/128/256/512/1024/2048/4096 with N=7168 and K=24576/TP.
+
+The small checkin suite covers all three input formats, short shards, owner/N tails,
+sender overlap, changing-input Graph replay and sequential workspace reuse:
+`python tests/checkin/run_checkin.py --suite ZW-M890P-GemmRS`.
+The suite first precompiles rank specializations with the existing persistent
+workers and JIT cache (`--compile-workers 16`), then runs correctness serially.
+Use `--phase compile` to warm the cache, or `--phase run` to execute without a
+precompile pass. Precompilation uses one selected device for metadata and loading;
+communication kernels are inspected with `launch=False`, without peer storage.
+For a larger matrix, pass a `GemmReduceScatter` caselist to the same checkin runner;
+it starts one process group per TP and reuses its workspace across cases.
+Run this suite manually on a host with eight free M890 cards. It is intentionally
+excluded from the shared PR CI workflow. Smoke and replay reuse the source-exact
+BF16 partial and elementwise reduction checks,
+including positive/negative cancellation fixtures for each input format.
+Set `show_log=1` to print the final transport path, tile, grid and resource use.
+With `PPU_LIB_SHOW_PARAMS=1`, fused TP2/4/8 calls emit `GemmReduceScatter` cases;
+`PPU_LIB_PERF_INSTRUMENT=1` adds the corresponding HGTX launch ranges.
+Replay an emitted format with `torchrun --standalone --nproc-per-node=<tp> tests/run_deep_gemm.py --format='<emitted format>'`.
+Here K is local and M is global. Replay restores tile/SM and BF16 warp-K settings
+and rebuilds symmetric storage collectively; rank is informational. It checks
+fresh random, structured and zero inputs, including Graph replay. Original input
+contents, peer addresses, epoch history, process-group topology and surrounding
+stream/Graph dependencies are not serialized. TP1 retains native GEMM dump/replay.
+
 #### Grouped GEMMs (contiguous layout)
 
 Unlike traditional grouped GEMMs in ACTLIZE, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape.
