@@ -439,9 +439,70 @@ def test_mega_gate_sigmoid_routing_controls() -> None:
 
 
 @test_filter(lambda: get_arch_major() >= 8)
-def test_mega_gate_sigmoid_partial_scores(tmp_path) -> None:
-    # Observe the production validity flag directly: trapping the full kernel would
-    # invalidate the device context used by the rest of the check-in suite.
+@torch.no_grad()
+def test_mega_gate_nonfinite_scores() -> None:
+    """Unmasked non-finite rows must not abort or index outside the experts."""
+    torch.manual_seed(19)
+    try:
+        for deterministic in (True, False):
+            deep_gemm.use_deterministic_algorithms(deterministic)
+            for scoring_func in ('sqrtsoftplus', 'sigmoid'):
+                # Plain selection, image bias, and the pruned expert-bias path;
+                # include partial expert/token tiles and both split-K policies.
+                for rows, hidden, experts, topk, bias_mode in (
+                    (3, 4096, 132, 8, 'none'),
+                    (129, 5120, 384, 6, 'image'),
+                    (1024, 4096, 256, 6, 'expert'),
+                ):
+                    inputs = make_inputs(rows, hidden, experts, with_bias=bias_mode != 'none',
+                                         with_image_bias=bias_mode == 'image')
+                    if bias_mode == 'expert':
+                        inputs['bias'].fill_(-1000)
+                        inputs['bias'][:topk] = 1000
+                    clean = inputs['x'].clone()
+                    outputs = make_outputs(inputs, with_unmapped_topk_idx=True, num_topk=topk)
+                    run_mega_gate(inputs, outputs, num_topk=topk, scoring_func=scoring_func)
+                    expected_ids = outputs['topk_idx'].clone()
+                    expected_weights = outputs['topk_weights'].clone()
+                    # Warm up before capture; each replay changes the affected rows.
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run_mega_gate(inputs, outputs, num_topk=topk, scoring_func=scoring_func)
+                    for bad_rows in (slice(0, 1), slice(rows - 1, rows), slice(None)):
+                        for value in (float('nan'), float('inf'), float('-inf')):
+                            inputs['x'].copy_(clean)
+                            inputs['x'][bad_rows] = value
+                            graph.replay()
+                            torch.cuda.synchronize()
+                            ids, logical = outputs['topk_idx'], outputs['unmapped_topk_idx']
+                            assert ((logical >= 0) & (logical < experts)).all().item()
+                            assert ((ids >= 0) & (ids < experts + VLLM_NUM_EXTRA_EXPERTS)).all().item()
+                            counts = inputs['logical_count'][logical]
+                            token = torch.arange(rows, device='cuda')[:, None]
+                            physical = inputs['to_physical_map'][logical, (token * 23333) % counts]
+                            assert torch.equal(ids, physical)
+                            valid = torch.ones(rows, dtype=torch.bool, device='cuda')
+                            valid[bad_rows] = False
+                            assert torch.equal(ids[valid], expected_ids[valid])
+                            torch.testing.assert_close(outputs['topk_weights'][valid], expected_weights[valid])
+
+                    # Explicit masking still produces the public -1/zero sentinels.
+                    mask = torch.arange(rows, device='cuda') % 2 == 0
+                    inputs['x'].copy_(clean)
+                    inputs['x'][~mask] = float('nan')
+                    run_mega_gate(inputs, outputs, num_topk=topk, scoring_func=scoring_func, mask=mask)
+                    assert outputs['topk_idx'][~mask].eq(-1).all().item()
+                    assert outputs['topk_weights'][~mask].eq(0).all().item()
+                    assert outputs['unmapped_topk_idx'][~mask].eq(-1).all().item()
+                    assert torch.equal(outputs['topk_idx'][mask], expected_ids[mask])
+                    torch.testing.assert_close(outputs['topk_weights'][mask], expected_weights[mask])
+    finally:
+        deep_gemm.use_deterministic_algorithms(False)
+
+
+@test_filter(lambda: get_arch_major() >= 8)
+def test_mega_gate_partial_score_storage(tmp_path) -> None:
+    # Preserve NaN/inf and the architecture-specific accumulator layout.
     root = Path(__file__).resolve().parents[1]
     hgcc = (os.environ.get('DG_JIT_HGCC_COMPILER') or os.environ.get('DG_HGCC_COMPILER')
             or Path(deep_gemm.PPU_HOME) / 'bin/hgcc')
@@ -488,6 +549,7 @@ def test_mega_gate_sigmoid_infinite_logits() -> None:
 
 
 if __name__ == '__main__':
+    test_mega_gate_nonfinite_scores()
     test_mega_gate_sigmoid_routing_controls()
     test_mega_gate_sigmoid_infinite_logits()
     test_mega_gate_scoring_modes()

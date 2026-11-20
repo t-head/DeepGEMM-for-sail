@@ -16,33 +16,9 @@ __device__ __forceinline__ void device_check(bool condition) {
     if (!condition) __builtin_trap();
 }
 
-// Store GEMM scores and defer any invalid-score trap until synchronization completes.
-template <bool UseSigmoid, int S>
-__device__ __forceinline__ void store_checked_scores(const KernelArgs& a, int token, int expert, float* dst, float lo, float hi,
-                                                      bool check_activated, bool& gate_is_valid) {
-    bool valid;
-    if constexpr (UseSigmoid) {
-#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
-        const bool check_hi = expert + 4 < a.routing.num_routed_experts;
-#else
-        // tc02 pairs stay within the aligned expert range.
-        constexpr bool check_hi = true;
-#endif
-        if (token >= a.num_tokens || expert >= a.routing.num_routed_experts) {
-            valid = true;
-        } else if constexpr (S == 1) {
-            valid = !isnan(lo) && (!check_hi || !isnan(hi));
-        } else {
-            // Learned routing checks the reduced logits. Fixed/random routes skip that loop.
-            const bool skips_reduction_check = (a.fix_routing_mask && a.fix_routing_mask[token]) ||
-                                               (a.force_random && a.force_random[token]);
-            valid = !skips_reduction_check || (isfinite(lo) && (!check_hi || isfinite(hi)));
-        }
-    } else {
-        valid = check_activated ? lo < INFINITY && hi < INFINITY : isfinite(lo) && isfinite(hi);
-    }
-    // Masked input may contain NaN/inf. The final MMA tile can extend past the mask allocation.
-    gate_is_valid &= valid || (a.mask && (token >= a.num_tokens || !a.mask[token]));
+// Match upstream: graph-padding rows may contain non-finite scores. Preserve them
+// without trapping; the caller must discard the corresponding token outputs.
+__device__ __forceinline__ void store_scores(float* dst, float lo, float hi) {
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
     // Adjacent tc01 accumulator registers hold scores four experts apart.
     dst[0] = lo;
@@ -201,13 +177,12 @@ __device__ __forceinline__ void store_token_outputs(const RoutingArgs& args, con
 }
 
 template <uint32_t kNumTopk, bool kHasUnmappedTopkIdx, bool kHasPhysicalMap, bool UseSigmoid>
-__device__ __forceinline__ bool store_topk_token(const RoutingArgs& args, const int* routed_logical_count,
+__device__ __forceinline__ void store_topk_token(const RoutingArgs& args, const int* routed_logical_count,
                                      const uint32_t& global_token_idx, const uint32_t& lane_idx,
                                      int selected_expert_idx, const float& selected_unbiased_score) {
     static_assert(kNumTopk <= 32, "Top-k slots exceed a warp");
-    const bool valid = lane_idx >= kNumTopk or
-        (selected_expert_idx >= 0 and selected_expert_idx < static_cast<int>(args.num_routed_experts));
-    // Like upstream, keep an invalid selection in bounds until the final gate assertion.
+    // Non-finite scores can leave no valid candidate. Bound all selectors before
+    // indexing the logical-to-physical map, including the pruned candidate paths.
     if (lane_idx < kNumTopk)
         selected_expert_idx = min(max(selected_expert_idx, 0), static_cast<int>(args.num_routed_experts) - 1);
     const auto num_physical_topk = kNumTopk + args.num_shared_experts;
@@ -243,7 +218,6 @@ __device__ __forceinline__ bool store_topk_token(const RoutingArgs& args, const 
     const auto selected_weight = lane_idx < kNumTopk ? selected_unbiased_score / topk_sum * args.routed_scaling_factor : 1.0f;
     store_token_outputs<kNumTopk, kHasUnmappedTopkIdx>(args, global_token_idx, lane_idx,
                                                        physical_expert_idx, selected_weight, selected_expert_idx);
-    return valid;
 }
 
 template <uint32_t kNumTopk, bool kHasUnmappedTopkIdx, bool kHasPhysicalMap>
