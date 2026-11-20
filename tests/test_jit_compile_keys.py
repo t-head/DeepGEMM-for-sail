@@ -136,17 +136,42 @@ int bf16_tsm_store_checks() {
         args.kernel_params.no_tsm.collective_epilogue_params.ptr_D = params.collective_epilogue_params.ptr_D;
         args.kernel_params.no_tsm.collective_epilogue_params.stride_D = params.collective_epilogue_params.stride_D;
     }
+    static_assert(std::is_same_v<decltype(&Runtime::generate_impl),
+                  std::string (*)(const typename Runtime::Args&)>, "Generator signature must stay unchanged.");
     const auto base_source = Runtime::generate_impl(args);
-    if (Runtime::requires_safe_store(args) || base_source.find("kEnableSafeStore = false;") == std::string::npos)
-        throw std::runtime_error("aligned outputs must preserve unchecked stores");
+    auto check_selection = [&](const std::string& source, bool expected_safe) {
+        if ((source.find("CollectiveBuilderSafeStore<") != std::string::npos) != expected_safe ||
+            (source.find("collective_builder_safe_store.hpp") != std::string::npos) != expected_safe ||
+            source.find("kEnableSafeStore") != std::string::npos ||
+            source.find(std::string("kWithTsmEpilogue = ") + (with_tsm ? "true;" : "false;")) == std::string::npos)
+            throw std::runtime_error("Separate epilogue type/device selection mismatch");
+    };
+    check_selection(base_source, false);
     int count = 1;
-    auto check_policy = [&](const auto& other, bool expected, bool changes_source) {
+    // The TSM runtime caches generated source, rather than exposing compile_key.
+    auto check_tile = [&](const auto& other) {
         const auto source = Runtime::generate_impl(other);
-        if (Runtime::requires_safe_store(other) != expected ||
-            source.find(std::string("kEnableSafeStore = ") + (expected ? "true;" : "false;")) == std::string::npos ||
-            (source != base_source) != changes_source ||
+        check_selection(source, false);
+        if (source == base_source || get_hex_digest(source) == get_hex_digest(base_source))
+            throw std::runtime_error("TSM tile change must alter source-cache identity");
+        ++count;
+    };
+#define CHECK_TSM_TILE(field, value) \
+    { auto other = args; other.launch_info.field = value; check_tile(other); }
+    CHECK_TSM_TILE(block_m, 128);
+    CHECK_TSM_TILE(block_n, 128);
+    CHECK_TSM_TILE(block_k, 64);
+    CHECK_TSM_TILE(warp_m, 64);
+    CHECK_TSM_TILE(warp_n, 64);
+    CHECK_TSM_TILE(num_stages, 3);
+    CHECK_TSM_TILE(kernel_name, "another_tsm_entry");
+#undef CHECK_TSM_TILE
+    auto check_policy = [&](const auto& other, bool changes_source, bool expected_safe = false) {
+        const auto source = Runtime::generate_impl(other);
+        check_selection(source, with_tsm && expected_safe);
+        if ((source != base_source) != changes_source ||
             (get_hex_digest(source) != get_hex_digest(base_source)) != changes_source)
-            throw std::runtime_error("TSM store policy/source-cache identity mismatch");
+            throw std::runtime_error("Separate epilogue source-cache identity mismatch");
         ++count;
     };
     for (int offset = 0; offset < alignment; ++offset) {
@@ -154,9 +179,31 @@ int bf16_tsm_store_checks() {
         auto ptr = reinterpret_cast<Output*>(uintptr_t(0x2000 + offset * sizeof(Output)));
         if (with_tsm) other.kernel_params.with_tsm.collective_epilogue_params.ptr_D = ptr;
         else other.kernel_params.no_tsm.collective_epilogue_params.ptr_D = ptr;
-        check_policy(other, with_tsm && offset != 0, with_tsm && offset != 0);
+        check_policy(other, with_tsm && offset != 0, offset != 0);
+        if (with_tsm && offset != 0) {
+            auto same_category = other;
+            same_category.kernel_params.with_tsm.collective_epilogue_params.ptr_D =
+                reinterpret_cast<Output*>(uintptr_t(0x3000 + offset * sizeof(Output)));
+            if (Runtime::generate_impl(other) != Runtime::generate_impl(same_category))
+                throw std::runtime_error("Addresses in one eligibility class must reuse source");
+        }
     }
-    if (!with_tsm) return count;
+    for (const char* group : {"MGroupedContiguous", "MGroupedMasked", "MGroupedNoPad"}) {
+        auto grouped = args;
+        grouped.launch_info.gemm_type = group;
+        check_selection(Runtime::generate_impl(grouped), false);
+        ++count;
+    }
+    if (!with_tsm) {
+        auto row_stride = args;
+        cute::get<0>(row_stride.kernel_params.no_tsm.collective_epilogue_params.stride_D) = 65;
+        check_policy(row_stride, false);
+        auto batched = row_stride;
+        cute::get<2>(batched.kernel_params.no_tsm.collective_epilogue_params.stride_D) = 257;
+        cute::get<3>(batched.kernel_params.no_tsm.problem_shape) = 3;
+        check_policy(batched, false);
+        return count;
+    }
     auto row_stride = args;
     cute::get<0>(row_stride.kernel_params.with_tsm.collective_epilogue_params.stride_D) = 65;
     check_policy(row_stride, true, true);
@@ -164,19 +211,69 @@ int bf16_tsm_store_checks() {
     cute::get<1>(tail.kernel_params.with_tsm.problem_shape) = 62;
     cute::get<0>(tail.kernel_params.with_tsm.collective_epilogue_params.stride_D) = 64;
     check_policy(tail, true, true);
+    for (int n : {alignment, 2 * alignment, 64 - alignment, 64 + alignment}) {
+        auto aligned_tail = args;
+        cute::get<1>(aligned_tail.kernel_params.with_tsm.problem_shape) = n;
+        cute::get<0>(aligned_tail.kernel_params.with_tsm.collective_epilogue_params.stride_D) = n + alignment;
+        check_selection(Runtime::generate_impl(aligned_tail), false);
+        ++count;
+    }
+    auto m_tail = args;
+    cute::get<0>(m_tail.kernel_params.with_tsm.problem_shape) = 65;
+    check_policy(m_tail, false);
     auto unused_batch_stride = args;
     cute::get<2>(unused_batch_stride.kernel_params.with_tsm.collective_epilogue_params.stride_D) = 257;
-    check_policy(unused_batch_stride, false, false);
+    check_policy(unused_batch_stride, false);
     auto batched = unused_batch_stride;
     cute::get<3>(batched.kernel_params.with_tsm.problem_shape) = 3;
     check_policy(batched, true, true);
-    if (Runtime::generate_impl(args, true).find("kEnableSafeStore = true;") == std::string::npos)
-        throw std::runtime_error("explicit upper-level enable must be forwarded");
+    auto aligned_batch = batched;
+    cute::get<2>(aligned_batch.kernel_params.with_tsm.collective_epilogue_params.stride_D) = 256;
+    check_policy(aligned_batch, false);
     typename Model810eTsmRuntime<Output, false>::Args model{};
     static_cast<typename Runtime::Args&>(model) = tail;
-    if (Model810eTsmRuntime<Output, false>::generate_impl(model).find("kEnableSafeStore = true;") == std::string::npos)
-        throw std::runtime_error("dummy scheduler N must not hide the real output tail");
-    return count + 2;
+    const auto model_source = Model810eTsmRuntime<Output, false>::generate_impl(model);
+    check_selection(model_source, true);
+    auto model_aligned = model;
+    cute::get<1>(model_aligned.kernel_params.with_tsm.problem_shape) = 64;
+    const auto model_aligned_source = Model810eTsmRuntime<Output, false>::generate_impl(model_aligned);
+    check_selection(model_aligned_source, false);
+    if (model_aligned_source == model_source)
+        throw std::runtime_error("810E epilogue must be selected BEFORE dimension normalization");
+    auto model_other_aligned = model_aligned;
+    cute::get<1>(model_other_aligned.kernel_params.with_tsm.problem_shape) = 128;
+    cute::get<0>(model_other_aligned.kernel_params.with_tsm.collective_epilogue_params.stride_D) = 128;
+    if (Model810eTsmRuntime<Output, false>::generate_impl(model_other_aligned) != model_aligned_source)
+        throw std::runtime_error("810E aligned tails must retain canonicalized source reuse");
+    auto model_other_unsafe = model;
+    cute::get<1>(model_other_unsafe.kernel_params.with_tsm.problem_shape) = 2;
+    if (Model810eTsmRuntime<Output, false>::generate_impl(model_other_unsafe) != model_source)
+        throw std::runtime_error("810E unsafe tails must retain canonicalized source reuse");
+    typename Model810eTsmRuntime<Output, true>::Args split{};
+    static_cast<typename Runtime::Args&>(split) = batched;
+    const auto split_source = Model810eTsmRuntime<Output, true>::generate_impl(split);
+    check_selection(split_source, true);
+    if (split_source.find("Model810eTsmKernel<CollectiveMainloop, CollectiveEpilogue, true, 3,") == std::string::npos)
+        throw std::runtime_error("810E split-K must retain the selected safe epilogue");
+    auto aligned_split = split;
+    cute::get<2>(aligned_split.kernel_params.with_tsm.collective_epilogue_params.stride_D) = 256;
+    check_selection(Model810eTsmRuntime<Output, true>::generate_impl(aligned_split), false);
+    for (auto tile : {std::array<int, 4>{8,16,8,16}, {64,64,32,32},
+                      {128,128,32,64}, {64,128,64,32}}) {
+        auto varied = args;
+        varied.launch_info.block_m=tile[0]; varied.launch_info.block_n=tile[1];
+        varied.launch_info.warp_m=tile[2]; varied.launch_info.warp_n=tile[3];
+        for (int m : {1,tile[0]-1,tile[0],tile[0]+1})
+            for (int n = 1; n <= tile[1]+2*alignment; ++n) {
+                varied.kernel_params.with_tsm.problem_shape=cute::make_tuple(m,n,32,1);
+                cute::get<0>(varied.kernel_params.with_tsm.collective_epilogue_params.stride_D)=
+                    ((n+alignment-1)/alignment)*alignment;
+                if (Runtime::legacy_store_is_safe(varied) != (n % alignment == 0))
+                    throw std::runtime_error("Host eligibility differs from tested CUTE partition contract");
+                ++count;
+            }
+    }
+    return count + 6;
 }
 
 int int8_checks() {
@@ -321,7 +418,7 @@ class CompileKeyTests(unittest.TestCase):
     def test_bf16_cute_free_both_output_types(self):
         self.assertGreater(self.native.bf16_cute_free(), 0)
 
-    def test_bf16_tsm_store_policy_and_source_cache(self):
+    def test_bf16_separate_tsm_epilogue_and_source_cache(self):
         self.assertGreater(self.native.bf16_tsm_stores(), 0)
 
     def test_int8_and_fp8_channel(self):

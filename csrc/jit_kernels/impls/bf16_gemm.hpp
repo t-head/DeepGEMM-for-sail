@@ -160,19 +160,33 @@ public:
         }
     }
 
-    static bool requires_safe_store(const Args& args) {
-        if (is_ppu1v5_device()) return false;
-        const auto& params = args.kernel_params.with_tsm;
-        const auto& output = params.collective_epilogue_params;
+    // DefaultGemm_Epilogue_Configuration partitions one row vector per EVT
+    // fragment. Check its runtime geometry; generated static_asserts and host
+    // tests verify this proof against the actual CUTE S2R partition.
+    static bool legacy_store_is_safe(const Args& args) {
+        const auto& info = args.launch_info;
+        const auto& p = args.kernel_params.with_tsm;
         constexpr int alignment = 16 / sizeof(ElementOutput);
-        return cute::get<1>(params.problem_shape) % alignment != 0 ||
-               reinterpret_cast<uintptr_t>(output.ptr_D) % 16 != 0 ||
-               cute::get<0>(output.stride_D) % alignment != 0 ||
-               (cute::get<3>(params.problem_shape) > 1 && cute::get<2>(output.stride_D) % alignment != 0);
+        const int m = cute::get<0>(p.problem_shape), n = cute::get<1>(p.problem_shape);
+        const int batches = cute::get<3>(p.problem_shape);
+        if (m <= 0 || n <= 0 || batches <= 0 || n % alignment) return false;
+        if (info.block_m <= 0 || info.block_n < alignment || info.warp_m <= 0 || info.warp_n <= 0 ||
+            info.block_m % info.warp_m || info.block_n % info.warp_n || info.block_n % alignment)
+            return false;
+        const int64_t warps_m = info.block_m / info.warp_m;
+        const int64_t threads = warps_m * (info.block_n / info.warp_n) * 32;
+        const int64_t thread_n = std::min<int64_t>(threads, info.block_n / alignment);
+        if (thread_n <= 0 || threads % thread_n) return false;
+        const int64_t thread_m = threads / thread_n;
+        if ((warps_m * 16) % thread_m || info.block_n % (thread_n * alignment)) return false;
+        const auto& e = p.collective_epilogue_params;
+        if (e.ptr_D == nullptr || reinterpret_cast<uintptr_t>(e.ptr_D) % 16) return false;
+        const int64_t row = cute::get<0>(e.stride_D), batch = cute::get<2>(e.stride_D);
+        return (m <= 1 || (row >= n && row % alignment == 0)) &&
+               (batches <= 1 || (batch > 0 && batch % alignment == 0));
     }
 
-    static std::string generate_impl(const Args& args, bool enable_safe_store = false) {
-        enable_safe_store = enable_safe_store || requires_safe_store(args);
+    static std::string generate_impl(const Args& args) {
         // Query device hardware constants from the driver and inject into generated kernel (see gemm_occ_model.cuh).
         const PpuHwParams& hw = PpuHwParams::instance();
         // One snapshot drives both the union member read and the injected epilogue flag.
@@ -182,6 +196,16 @@ public:
                                                         : args.kernel_params.with_tsm.problem_shape;
         // Injected into the generated source; same source as to_underlying_arguments_rtc.
         const bool with_tsm_epilogue = not is_ppu1v5;
+        // Grouped BF16 shares this generator but keeps the legacy epilogue.
+        const bool normal_tsm = with_tsm_epilogue && args.launch_info.gemm_type == "Normal";
+        const bool use_safe_store_epilogue = normal_tsm && !legacy_store_is_safe(args);
+        const char* legacy_contract = normal_tsm && !use_safe_store_epilogue ?
+            "static_assert(CollectiveEpilogue_withTsm::kAlignmentD == AlignmentC, \"Legacy EVT alignment proof mismatch.\");\n"
+            "static_assert(CollectiveEpilogue_withTsm::is_row_vector_partition(), \"Legacy EVT requires a proven row-vector partition.\");\n"
+            "static_assert(SHAPE_N % AlignmentC == 0, \"Legacy EVT JIT tail does not match output alignment.\");\n" : "";
+        const char* tsm_builder = use_safe_store_epilogue ? "CollectiveBuilderSafeStore" : "CollectiveBuilder";
+        const char* safe_store_include = use_safe_store_epilogue ?
+            "#include <cutlass/epilogue/collective/collective_builder_safe_store.hpp>\n" : "";
         // sizeof of what the driver copies; the device asserts it equals its own Params size.
         const auto host_params_size = with_tsm_epilogue ? sizeof(args.kernel_params.with_tsm)
                                                         : sizeof(args.kernel_params.no_tsm);
@@ -189,7 +213,7 @@ public:
             R"(
 #include <deep_gemm/impls/bf16_gemm_cutlass3.cuh>
 #include <deep_gemm/common/gemm_occ_model.cuh>
-namespace deep_gemm {{
+{21}namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
 
@@ -286,14 +310,13 @@ using CollectiveEpilogue_noTsm = cutlass::epilogue::collective::DefaultEpilogueN
     IsAlignedN>;
 
 // TSM epilogue for alpha=1, beta=0;
-static constexpr bool kEnableSafeStore = {20};
 static constexpr int AlignmentC = 16 / sizeof(ElementC);
 using DefaultOperation = cutlass::epilogue::fusion::PPUEVT<
     cutlass::epilogue::fusion::PPUCompute<cutlass::epilogue::thread::Identity, ElementD, ElementCompute,
                                        cutlass::FloatRoundStyle::round_to_nearest>,
     cutlass::epilogue::fusion::PPUAccFetch>;
 using EpilogueSchedule = typename cutlass::epilogue::EpilogueSimtVectorized;
-using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::CollectiveBuilder<
+using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::{20}<
     ArchTag, cutlass::arch::OpClassTensorOp,
     TileShape, WarpShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
@@ -301,10 +324,10 @@ using CollectiveEpilogue_withTsm = typename cutlass::epilogue::collective::Colle
     ElementC, LayoutC, AlignmentC,
     ElementC, LayoutC, AlignmentC,
     EpilogueSchedule,
-    DefaultOperation, void, kEnableSafeStore
+    DefaultOperation
 >::CollectiveOp;
 
-// Injected epilogue choice (is_ppu1v5_device()); matches to_underlying_arguments_rtc.
+{22}// Injected epilogue choice (is_ppu1v5_device()); matches to_underlying_arguments_rtc.
 static constexpr bool kWithTsmEpilogue = {17};
 using CollectiveEpilogue = typename cutlass::platform::conditional<
     kWithTsmEpilogue,
@@ -348,7 +371,7 @@ __global__ void {12}(
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
             with_tsm_epilogue, host_params_size,
             std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t",
-            enable_safe_store);
+            tsm_builder, safe_store_include, legacy_contract);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -1033,6 +1056,9 @@ public:
         // only; canonicalizing them lets different N/K cases share one binary.
         // Keep the actual launch arguments untouched, including batch count.
         auto codegen_args = args;
+        // This Direct kernel never executes EVT. Preserve its previous unused
+        // safe type declarations without introducing a new legacy contract.
+        codegen_args.kernel_params.with_tsm.collective_epilogue_params.ptr_D = nullptr;
         cute::get<1>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
         cute::get<2>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
         auto code = Base::generate_impl(codegen_args);
@@ -1056,6 +1082,9 @@ public:
         // the unused standard scheduler/epilogue declarations, so normalize
         // only this codegen copy to share JIT kernels across problem shapes.
         auto codegen_args = args;
+        // This Direct kernel never executes EVT. Preserve its previous unused
+        // safe type declarations without introducing a new legacy contract.
+        codegen_args.kernel_params.with_tsm.collective_epilogue_params.ptr_D = nullptr;
         cute::get<1>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
         cute::get<2>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
         auto code = Base::generate_impl(codegen_args);
@@ -1207,14 +1236,18 @@ public:
         bool static_k256 = false;
     };
     static std::string generate_impl(const Args& args) {
-        auto codegen_args = static_cast<const typename Base::Args&>(args);
-        // The custom kernel and EVT epilogue use real dimensions from Params
-        // (or the validated M36 specialization). The unused standard scheduler
-        // remains a fixed dummy type.
-        const bool enable_safe_store = Base::requires_safe_store(args);
-        cute::get<1>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
-        cute::get<2>(codegen_args.kernel_params.with_tsm.problem_shape) = 128;
-        auto code = Base::generate_impl(codegen_args, enable_safe_store);
+        // Select the epilogue using REAL Params, before canonicalizing the
+        // unused scheduler dimensions. No pointer values enter generated code.
+        auto code = Base::generate_impl(static_cast<const typename Base::Args&>(args));
+        const int real_n = cute::get<1>(args.kernel_params.with_tsm.problem_shape);
+        const int real_k = cute::get<2>(args.kernel_params.with_tsm.problem_shape);
+        if (Base::legacy_store_is_safe(args))
+            Model810eBatchedRuntime::replace_once(code, "SHAPE_N % AlignmentC == 0",
+                fmt::format("{} == 0", real_n % (16 / sizeof(Output))));
+        Model810eBatchedRuntime::replace_once(code,
+            fmt::format("constexpr int SHAPE_N = {};", real_n), "constexpr int SHAPE_N = 128;");
+        Model810eBatchedRuntime::replace_once(code,
+            fmt::format("constexpr int SHAPE_K = {};", real_k), "constexpr int SHAPE_K = 128;");
         const int splits = SplitK ? cute::get<3>(args.kernel_params.with_tsm.problem_shape) : 1;
         Model810eBatchedRuntime::replace_once(code, "GemmKernel op;\n  op(params, smem);",
             fmt::format("static_assert(GemmKernel::SharedStorageSize <= {}, \"810E TSM launch storage is too small\");\n"
