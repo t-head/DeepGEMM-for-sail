@@ -546,9 +546,8 @@ def main(argv=None, *, cases=None):
         parser.error("DeepEP normal requires eager timing because dispatch returns CPU expert counts; "
                      "both paths must use the same timing mode")
     with _process_group() as group:
-        arch = (8, 0) if case.precision == "int8_channelwise" else (8, 9)
-        if torch.cuda.get_device_capability() != arch:
-            raise ValueError(f"{case.precision} MegaMoE requires SM{arch[0]}{arch[1]}")
+        if torch.cuda.get_device_capability() not in case.supported_arches:
+            raise ValueError(f"{case.precision} MegaMoE requires one of {case.supported_arches}")
         world = dist.get_world_size()
         if args.ep is not None and world != args.ep:
             raise ValueError(f"--ep={args.ep} requires {args.ep} launched ranks; got {world}")

@@ -56,7 +56,7 @@ class SymmBuffer:
     input scale per 128 elements. W4A16 exposes BF16 x and an empty x_sf view.
     INT8 exposes x [token, hidden] and per-source-token FP32 scales in the
     x_sf staging view, populated by mega_moe_pre_dispatch.
-    INT8 copy streams/events are created with the allocation, shared by aliases,
+    On SM80, INT8 and W4A16 copy streams/events are created with the allocation, shared by aliases,
     and released with the last allocation owner after execution and Graphs retire.
     """
 
@@ -490,22 +490,21 @@ def transform_weights_for_w4a16_mega_moe(
         l1_weights: Tuple[torch.Tensor, torch.Tensor], l2_weights: Tuple[torch.Tensor, torch.Tensor],
         activation: str = "situ",
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-    """Pack canonical MXFP4 weights and UE8M0 scales for BF16 x MXFP4."""
+    """Pack canonical MXFP4 weights and UE8M0 scales for BF16 x MXFP4.
+
+    For an [E, N, K] matrix, SM80 returns int32 weights [E, K/16, 2N]
+    and uint8 scales [E, K/32, N]. SM89 uses packed uint8 weights [E, N, K/2]
+    and uint8 scales [E, N/64, 2K].
+    """
     _normalize_activation(activation)
     _check_routed_weights(l1_weights, l2_weights, torch.uint8)
 
-    def pack_scales(scales):
-        e, n, groups = scales.shape
-        return (
-            scales.reshape(e, n // 64, 8, 8, groups // 2, 2)
-            .permute(0, 1, 4, 3, 2, 5)
-            .contiguous()
-            .reshape(e, n // 64, groups // 2 * 128)
-        )
-
     w1, s1 = l1_weights
-    w2, s2 = l2_weights
-    return (_interleave_weights(w1), pack_scales(_interleave_weights(s1))), (w2, pack_scales(s2))
+    mode = (_C.PreprocessMode.W4A16_MXFP4 if torch.cuda.get_device_capability(w1.device) == (8, 0)
+            else _C.PreprocessMode.W4A16_MXFP4_MMA)
+    pack = _C.preprocess_weights_and_scales
+    return (pack(mode, False, _interleave_weights(w1), _interleave_weights(s1)),
+            pack(mode, False, *l2_weights))
 
 
 def _check_routed_buffer(
@@ -522,8 +521,15 @@ def _check_routed_buffer(
     ):
         raise ValueError("output must have shape [tokens, workspace hidden]")
     if (not isinstance(l1_weights, (tuple, list)) or len(l1_weights) != weight_components
-            or not isinstance(l1_weights[0], torch.Tensor)
-            or l1_weights[0].ndim != 3 or l1_weights[0].shape[1] != 2 * sym_buffer.intermediate_hidden):
+            or not isinstance(l1_weights[0], torch.Tensor) or l1_weights[0].ndim != 3):
+        raise ValueError("l1_weights must match the workspace intermediate_hidden")
+    weight = l1_weights[0]
+    intermediate = sym_buffer.intermediate_hidden
+    if sym_buffer.mma_type == 'bf16xfp4' and weight.dtype == torch.int32:
+        matches = weight.shape[1:] == (sym_buffer.hidden // 16, 4 * intermediate)
+    else:
+        matches = weight.shape[1] == 2 * intermediate
+    if not matches:
         raise ValueError("l1_weights must match the workspace intermediate_hidden")
 
 
@@ -587,6 +593,8 @@ def bf16_fp4_mega_moe(
 ) -> None:
     """Complete BF16 x MXFP4 MoE with BF16 output in original token order.
 
+    Valid routes contribute to receive statistics even when their weight is zero.
+    The weighted sum skips those zero-weight contributions.
     SiTU parameters follow fp4_fp4_mega_moe; situ_linear_beta=None disables
     the up-branch softcap. situ_beta must be positive and finite.
     SwiGLU, STEP and OAI are also supported, with OAI-only activation_alpha.
