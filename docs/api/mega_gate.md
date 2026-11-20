@@ -93,6 +93,15 @@ Fixed routing reads the first K logical IDs from `unmapped_topk_idx`,
 preserves their slot order, and computes their weights using the selected
 scoring function before applying physical mapping.
 
+Like upstream MegaGate, non-finite GEMM scores do not trigger a device trap.
+This permits graph-padding rows with uninitialized features. Learned routing
+keeps selected logical IDs in `[0,E)` before reading scores or mapping experts,
+but the affected rows' selections and weights are otherwise unspecified;
+weights may remain NaN or infinity. The caller must discard padded outputs
+or supply `mask` to obtain the `-1`/zero sentinels. This also means non-finite
+scores on real tokens are not diagnosed by the kernel. Fixed routing IDs and
+physical-map replica counts must still satisfy the requirements below.
+
 ## Layout and value requirements
 
 - All tensors reside on the same PPU device as `x`. Inputs, metadata and

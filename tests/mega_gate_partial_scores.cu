@@ -1,50 +1,41 @@
 #include <deep_gemm/epilogue/ppu_mega_gate.cuh>
 #include <cstdio>
 
-using deep_gemm::epilogue::mega_gate::store_checked_scores;
-using deep_gemm::mega_gate_layout::KernelArgs;
+using deep_gemm::epilogue::mega_gate::store_scores;
 
-template <int Splits>
-__device__ bool accepts(bool fixed, bool random, float lo, float hi) {
-    KernelArgs args{};
-    args.num_tokens = 1;
-    args.routing.num_routed_experts = 8;
-    args.fix_routing_mask = &fixed;
-    args.force_random = &random;
-    alignas(8) float scratch[5];
-    bool valid = true;
-    store_checked_scores<true, Splits>(args, 0, 0, scratch, lo, hi, false, valid);
+__device__ bool preserves(float lo, float hi) {
+    alignas(8) float scratch[6] = {17, 17, 17, 17, 17, 17};
+    store_scores(scratch, lo, hi);
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+    constexpr int hi_offset = 4;
+#else
+    constexpr int hi_offset = 1;
+#endif
+    bool valid = __float_as_uint(scratch[0]) == __float_as_uint(lo) &&
+                 __float_as_uint(scratch[hi_offset]) == __float_as_uint(hi);
+    for (int i = 1; i < 6; ++i)
+        if (i != hi_offset) valid &= scratch[i] == 17;
     return valid;
 }
 
 __global__ void check(int* result) {
-    // One thread per control: learned, fixed or random routing.
-    const int route = threadIdx.x;
-    const bool fixed = route == 1, random = route == 2;
-    const bool valid = accepts<1>(fixed, random, INFINITY, -INFINITY) &&
-                       !accepts<1>(fixed, random, NAN, 1.0f) &&
-                       accepts<2>(fixed, random, 1.0f, -2.0f) &&
-                       (accepts<2>(fixed, random, INFINITY, 0.0f) == (route == 0)) &&
-                       (accepts<2>(fixed, random, 0.0f, -INFINITY) == (route == 0)) &&
-                       (accepts<2>(fixed, random, NAN, 0.0f) == (route == 0));
-    result[route] = valid;
+    *result = preserves(1.0f, -2.0f) && preserves(INFINITY, -INFINITY) &&
+              preserves(NAN, 1.0f) && preserves(-1.0f, NAN);
 }
 
 int main() {
     int* device;
-    int results[3]{};
-    if (hggcMalloc(reinterpret_cast<void**>(&device), sizeof(results)) != hggcSuccess)
+    int result = 0;
+    if (hggcMalloc(reinterpret_cast<void**>(&device), sizeof(result)) != hggcSuccess)
         return 1;
-    check<<<1, 3>>>(device);
-    const auto status = hggcMemcpy(results, device, sizeof(results), hggcMemcpyDeviceToHost);
+    check<<<1, 1>>>(device);
+    const auto status = hggcMemcpy(&result, device, sizeof(result), hggcMemcpyDeviceToHost);
     hggcFree(device);
     if (status != hggcSuccess)
         return 1;
-    for (int route = 0; route < 3; ++route) {
-        if (!results[route]) {
-            std::fprintf(stderr, "Unexpected sigmoid partial-score validity for route %d\n", route);
-            return 1;
-        }
+    if (!result) {
+        std::fprintf(stderr, "GEMM score storage changed values or accumulator layout\n");
+        return 1;
     }
     return 0;
 }

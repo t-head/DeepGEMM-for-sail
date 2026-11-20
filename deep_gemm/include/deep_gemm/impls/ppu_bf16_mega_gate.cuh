@@ -124,7 +124,7 @@ __device__ __forceinline__ void select_merge_topk(float (&scores)[Waves * 4], in
 
 template<int E, int S, int Topk, bool HasPhysicalMap, bool HasUnmapped, int Threads, int BlockTokens=16,
          bool CompactScores=false, int ScoreStride=S, bool PreActivated=false, int Features=-1, int ScoreBlockTokens=1, bool WarpLocal=false, int RowGroups=1>
-__device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::KernelArgs a, int token_base, bool& gate_is_valid, int row_group=0) {
+__device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::KernelArgs a, int token_base, int row_group=0) {
     using namespace mega_gate_layout;
     using namespace epilogue::mega_gate;
     constexpr int M = BlockTokens, Warps = Threads / 32;
@@ -224,7 +224,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
                 value = mega_gate_detail::reduced_score<E,S,CompactScores,ScoreStride,ScoreBlockTokens>(a, token, selected);
                 if (!PreActivated or !score_for_ranking) value = gate_score<UseSigmoid>(value);
             }
-            gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, value);
+            store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, value);
             continue;
         }
         const float* bias = a.image_token_mask and a.image_token_mask[token] ? a.image_bias : a.bias;
@@ -244,8 +244,6 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
             const int expert = (v / 4) * 128 + lane * 4 + v % 4;
             values[v] = CompactScores and expert >= a.routing.num_routed_experts ? 0.0f :
                 mega_gate_detail::reduced_score<E,S,CompactScores,ScoreStride,ScoreBlockTokens>(a, token, expert);
-            if constexpr (UseSigmoid && S > 1)
-                gate_is_valid &= expert >= a.routing.num_routed_experts || !isnan(values[v]);
         }
         if constexpr (PruneCandidates) {
             if (worth_pruning) {
@@ -321,7 +319,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
                             }
                             const float chosen_score = __shfl_sync(0xffffffff, score, selected_lane);
                             const float selected_score = lane < Topk ? chosen_score : 0.0f;
-                            gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
+                            store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
                             continue;
                         }
                     }
@@ -352,7 +350,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
                             rank_keys[1]=0x007fffffu;experts[1]=-1;scores[1]=0.0f;
                         }
                     }
-                    gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
+                    store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
                     continue;
                 }
             }
@@ -368,6 +366,10 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
             mega_gate_detail::select_merge_topk<Waves, Topk>(ranking, selected);
         else
             select_warp_topk<Waves, Topk>(ranking, selected);
+        // Clamp before loading the selected score, not just before routing.
+        // NaN/inf rows need not produce meaningful weights, but must stay in bounds.
+        if (lane < Topk)
+            selected = min(max(selected, 0), static_cast<int>(a.routing.num_routed_experts) - 1);
         float value = 0.0f;
         if constexpr (PreActivated and ScoreStride > 1 and M >= 32) {
             if (lane < Topk)
@@ -376,7 +378,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
             value = select_warp_expert_value<Waves>(values, selected);
         }
         if (!score_for_ranking and lane < Topk) value = sqrt_softplus(value);
-        gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, value);
+        store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, value);
     }
 }
 
@@ -429,10 +431,6 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
     }
     const int tile_stride = PersistentGroups ? gridDim.x / Producers : token_tiles;
     const int rounds = PersistentGroups ? (token_tiles - first_token_tile + tile_stride - 1) / tile_stride : 1;
-    bool gate_is_valid = true;
-    constexpr bool UseSigmoid = Features >= 0 and (Features & kSigmoidScore);
-    const bool check_activated = !UseSigmoid and S == 1 and
-        (Features < 0 ? (a.bias or a.image_token_mask) : bool(Features & (kExpertBias | kImageTokenMask)));
     for (int round = 0; round < rounds; ++round) {
     const int token_tile = first_token_tile + round * tile_stride;
     const int token_base = token_tile * M;
@@ -488,7 +486,7 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
                                                expert_base + warp_n * WarpN + ni * 16, lane, r, token, expert);
                 const int64_t score_row = GroupedScores ?
                     (int64_t(token / M) * S + split) * M + token % M : int64_t(token) * S + split;
-                store_checked_scores<UseSigmoid, S>(a, token, expert, a.scratch + score_row * E + expert, lo, hi, check_activated, gate_is_valid);
+                store_scores(a.scratch + score_row * E + expert, lo, hi);
             }
         } else {
         epilogue::WarpKReduce<WarpK, WarpsMN, WarpM / 16, WarpN / 16, 8, Stages * (M + N) * K / 2>::run(
@@ -510,8 +508,7 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
                         const int row = token - a.scratch_token_base;
                         const int64_t score_row = GroupedScores ?
                             (int64_t(row / M) * S + split) * M + row % M : int64_t(row) * S + split;
-                        store_checked_scores<UseSigmoid, S>(a, token, expert, a.scratch + score_row * E + expert, acc[mi][ni][r],
-                                             acc[mi][ni][r + 1], check_activated, gate_is_valid);
+                        store_scores(a.scratch + score_row * E + expert, acc[mi][ni][r], acc[mi][ni][r + 1]);
                     }
                 }
             }
@@ -530,7 +527,7 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
         if constexpr (!PersistentGroups) cooperative_groups::this_grid().sync();
         if constexpr (S == 1) {
             ppu_mega_gate_topk_impl<E, S, Topk, HasPhysicalMap, HasUnmapped, Threads, M,
-                                    false, S, false, Features, 1, false, Producers>(a, token_base, gate_is_valid, producer);
+                                    false, S, false, Features, 1, false, Producers>(a, token_base, producer);
         } else {
         constexpr int RowsPerProducer = (M + Producers - 1) / Producers;
         for (int row = producer * RowsPerProducer + warp;
@@ -538,7 +535,7 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
             const int token = token_base + row;
             if (token < a.num_tokens)
                 ppu_mega_gate_topk_impl<E, S, Topk, HasPhysicalMap, HasUnmapped, 32, 1,
-                                        false, S, false, Features, GroupedScores ? M : 1, true>(a, token, gate_is_valid);
+                                        false, S, false, Features, GroupedScores ? M : 1, true>(a, token);
         }
         }
         if constexpr (PersistentGroups) {
@@ -548,11 +545,9 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
         break;
     }
     if constexpr (Producers == 1) {
-        ppu_mega_gate_topk_impl<E, S, Topk, HasPhysicalMap, HasUnmapped, Threads, M, false, S, false, Features>(a, token_base, gate_is_valid);
+        ppu_mega_gate_topk_impl<E, S, Topk, HasPhysicalMap, HasUnmapped, Threads, M, false, S, false, Features>(a, token_base);
         break;
     }
     }
-    // No producer can trap for a bad GEMM score before completing its rounds.
-    device_check(gate_is_valid);
 }
 } // namespace deep_gemm
