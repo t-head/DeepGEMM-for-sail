@@ -1,7 +1,7 @@
 #pragma once
 
 #include <deep_gemm/impls/mega_moe_copy.cuh>
-#include <deep_gemm/impls/expert_preprocess.cuh>
+#include <deep_gemm/impls/mega_moe_dispatch.cuh>
 
 #include <hggc_runtime.h>
 #include <deep_gemm/common/exception.cuh>
@@ -14,13 +14,13 @@ namespace deep_gemm::sm80 {
 using mega_moe_common::CopyRankMetadataShared;
 using comm::resolve_fused_round_generation;
 
-// INT8 broadcasts contiguous source-token scales, then compacts expert rows.
-// The publication, metadata, row copy and scheduler protocols remain shared.
-template <uint32_t BlockK>
+// INT8 shares route publication and counts with FP4, then compacts FP32 scales.
+template <uint32_t BlockK, uint32_t SharedBytes = 0, Stage1RoutePolicy Routes = Stage1RoutePolicy::PerToken>
 struct Int8FusedDispatch {
     template <class Scheduler>
     static constexpr uint32_t shared_bytes() {
-        return (Scheduler::kNumRanks + 1) * sizeof(uint32_t);
+        constexpr uint32_t prefix_bytes = (Scheduler::kNumRanks + 1) * sizeof(uint32_t);
+        return SharedBytes > prefix_bytes ? SharedBytes : prefix_bytes;
     }
 
     // Like FP4, compute CTAs compact scale rows while NCB copies payloads.
@@ -38,8 +38,7 @@ struct Int8FusedDispatch {
         auto* prefix = reinterpret_cast<uint32_t*>(shared);
         auto* base = sched.sym_buffer.template get_base_ptr<layout::MegaMoESignals*>();
         auto* ready = base->preprocess_ready;
-        const auto* scales = buffers.staging_scales[0].data<float>(base) +
-            uint64_t(generation & 1u) * (sched.staging.scales / sizeof(float));
+        const auto* scales = buffers.staging_scales[1].data<float>(base);
         const auto* tokens = sched.dispatch_token_topk +
             uint64_t(generation & 1u) * (sched.staging.tokens / sizeof(uint32_t));
         auto* sources = sched.src_info;
@@ -50,19 +49,13 @@ struct Int8FusedDispatch {
             __syncthreads();
             const uint32_t row_base = prefix[ranks];
             for (uint32_t row = threadIdx.x; row < prefix[ranks - 1]; row += Threads) {
-                uint32_t rank = 0;
-                for (uint32_t step = ranks / 2; step; step /= 2) {
-                    const uint32_t next = rank + step;
-                    if (row >= prefix[next - 1]) rank = next;
-                }
-                const uint32_t begin = rank ? prefix[rank - 1] : 0;
-                const uint64_t source = (uint64_t(expert) * ranks + rank) * capacity + row - begin;
-                const uint32_t token = __ldbl(tokens + source);
-                __stbl(sched.local_sfa_buf + row_base + row,
-                       __ldbl(scales + uint64_t(rank) * capacity + token / topk));
-                __stbl(&sources[row_base + row].rank_idx, rank);
-                __stbl(&sources[row_base + row].token_idx, token / topk);
-                __stbl(&sources[row_base + row].topk_idx, token % topk);
+                const auto source = load_route_source<ranks, capacity, topk>(tokens, prefix, expert, row);
+                MegaMoEScaleFormat<true>::copy_vector(
+                    scales + uint64_t(source.rank_idx) * capacity + source.token_idx,
+                    sched.local_sfa_buf + row_base + row);
+                __stbl(&sources[row_base + row].rank_idx, source.rank_idx);
+                __stbl(&sources[row_base + row].token_idx, source.token_idx);
+                __stbl(&sources[row_base + row].topk_idx, source.topk_idx);
             }
             __ppu_threadfence_uncache();
             __syncthreads();
@@ -73,41 +66,28 @@ struct Int8FusedDispatch {
         }
     }
 
-    template <class Scheduler, uint32_t Threads>
-    __device__ static void prepare_metadata(const sched::Int8MegaMoESchedulerArguments& sched,
-                                           char* smem, uint32_t generation) {
-        constexpr uint32_t ranks = Scheduler::kNumRanks;
-        constexpr uint32_t groups = Scheduler::kNumGroups;
-        constexpr uint32_t capacity = Scheduler::kSourceCapacity;
-        constexpr uint32_t topk = Scheduler::kNumTopK;
-        const layout::Int8MegaMoEBuffer buffers(
-            ranks, ranks * groups, capacity, topk, Scheduler::SHAPE_K, Scheduler::SHAPE_N / 2,
-            sched.staging);
-        auto* base = sched.sym_buffer.get_base_ptr<layout::MegaMoESignals*>();
-        const auto* counts = buffers.staging_counts[0].data<uint32_t>(base) +
-            (generation & 1u) * (sched.staging.counts / sizeof(uint32_t));
-        if (blockIdx.x == 0) {
-            prepare_expert_metadata<Scheduler::BLOCK_M, ranks, groups, Threads, false>(
-                sched, base, generation, reinterpret_cast<uint32_t*>(smem), counts);
-        }
-        wait_metadata(sched, generation);
-    }
-
     __device__ static __forceinline__ void wait_metadata(
         const sched::Int8MegaMoESchedulerArguments& sched, uint32_t generation) {
         auto* ready = sched.sym_buffer.get_base_ptr<layout::MegaMoESignals*>()->preprocess_ready;
-        if (threadIdx.x == 0)
-            while (tix::ld_ready_flag_uncached(ready) !=
-                   (kPreprocessMetadataReadyBit | generation)) { }
+        if (threadIdx.x == 0) comm::wait_expert_metadata(ready, generation);
         __syncthreads();
     }
 
     template <class Scheduler, uint32_t Threads>
     __device__ static void prepare_copy(const sched::Int8MegaMoESchedulerArguments& sched, char* smem) {
-        const uint32_t generation = resolve_fused_round_generation(
-            *sched.sym_buffer.get_base_ptr<layout::MegaMoESignals*>());
-        auto* ready = sched.sym_buffer.get_base_ptr<layout::MegaMoESignals*>()->preprocess_ready;
-        prepare_metadata<Scheduler, Threads>(sched, smem, generation);
+        auto* signals = sched.sym_buffer.get_base_ptr<layout::MegaMoESignals*>();
+        const uint32_t generation = resolve_fused_round_generation(*signals);
+        auto* ready = signals->preprocess_ready;
+        if constexpr (!DG_MEGAMOE_SPLIT_SYNC) {
+            if (blockIdx.x == 0) {
+                const layout::Int8MegaMoEBuffer buffers(
+                    Scheduler::kNumRanks, Scheduler::kNumRanks * Scheduler::kNumGroups,
+                    Scheduler::kSourceCapacity, Scheduler::kNumTopK, Scheduler::SHAPE_K,
+                    Scheduler::SHAPE_N / 2, sched.staging);
+                prepare_stage1_metadata<Scheduler, Threads>(sched, signals, buffers, smem, generation);
+            }
+            wait_metadata(sched, generation);
+        }
         mega_moe_common::run_copy_block<Scheduler::BLOCK_M, Scheduler::kNumRanks,
                        BlockK, Scheduler::kKTilesPerFlag, Scheduler::SHAPE_K, Threads,
                        Scheduler::kSourceCapacity, Scheduler::kNumTopK>(
@@ -123,9 +103,11 @@ struct Int8FusedDispatch {
     __device__ static void prepare(const typename Scheduler::Arguments& sched, char* smem) {
         const uint32_t generation = resolve_fused_round_generation(
             *sched.sym_buffer.template get_base_ptr<layout::MegaMoESignals*>());
-        // Independent copy CTAs publish metadata. GEMM CTAs compact scales
-        // and consume payload stripes through the mainloop readiness checks.
-        wait_metadata(sched, generation);
+        if constexpr (!DG_MEGAMOE_SPLIT_SYNC) {
+            publish_stage1_routes<Scheduler, Threads, SharedBytes, Routes, false>(sched, smem, generation);
+            // Copy CTAs build metadata while GEMM CTAs publish routes and scales.
+            wait_metadata(sched, generation);
+        }
         reshape_scales<Scheduler, Threads>(sched, smem, generation);
         __threadfence();
     }
@@ -148,7 +130,7 @@ struct MegaMoECopyKernel {
     };
     using Arguments = sched::Int8MegaMoESchedulerArguments;
     static constexpr int CopyBytes = sizeof(CopyRankMetadataShared<BM, Ranks>);
-    static constexpr int PrepareBytes = Groups * (Ranks + 4) * sizeof(uint32_t);
+    static constexpr int PrepareBytes = expert_metadata_smem_bytes(Groups, Ranks);
     static constexpr int SharedStorageSize = CopyBytes > PrepareBytes ? CopyBytes : PrepareBytes;
 
     __device__ static void run(const Arguments& sched, char* smem) {

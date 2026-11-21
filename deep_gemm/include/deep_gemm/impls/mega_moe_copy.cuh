@@ -4,6 +4,7 @@
 #include <type_traits>
 #include <utility>
 #include <hggc_runtime.h>
+#include <deep_gemm/impls/mega_moe_dispatch.cuh>
 #include <deep_gemm/layout/dispatch_layout.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 
@@ -39,19 +40,11 @@ __device__ __forceinline__ void build_copy_row_map(
     uint32_t total = metadata.rank_prefix[NumRanks - 1];
     for (uint32_t row = threadIdx.x; row < BlockM && block_begin + row < total;
          row += blockDim.x) {
-        uint32_t query = block_begin + row;
-        uint32_t owner = 0;
-        for (uint32_t step = NumRanks / 2; step; step /= 2) {
-            uint32_t candidate = owner + step;
-            if (query >= metadata.rank_prefix[candidate - 1]) owner = candidate;
-        }
-        uint32_t begin = owner ? metadata.rank_prefix[owner - 1] : 0;
-        const uint64_t source_index = (uint64_t(expert_local) * NumRanks + owner) * SourceCapacity +
-            (query - begin);
-        const uint32_t source_token = __ldbl(token_topk + source_index) / TopK;
-        const uint8_t* source = sched.sym_buffer.map(sched.dispatch_data, owner);
+        const auto route = load_route_source<NumRanks, SourceCapacity, TopK>(
+            token_topk, metadata.rank_prefix, expert_local, block_begin + row);
+        const uint8_t* source = sched.sym_buffer.map(sched.dispatch_data, route.rank_idx);
         metadata.row_addr[row] = reinterpret_cast<uint64_t>(source) +
-            static_cast<uint64_t>(source_token) * RowBytes;
+            static_cast<uint64_t>(route.token_idx) * RowBytes;
     }
     // Finish row lookup before replacing the global prefixes.
     __syncthreads();

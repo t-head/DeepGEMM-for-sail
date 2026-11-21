@@ -47,6 +47,7 @@ public:
     static_assert(Stage == MegaMoEPhaseKind::Linear1 || Stage == MegaMoEPhaseKind::Linear2,
                   "unsupported MegaMoE stage");
     static constexpr bool kIsLinear1 = Stage == MegaMoEPhaseKind::Linear1;
+    static constexpr int kRanks = Ranks;
 
     struct LaunchInfo {
         int n, k, block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages, num_sms;
@@ -54,6 +55,7 @@ public:
         bool apply_clamp = false, wide_offsets = false, warp_pipeline = false;
         bool has_linear_beta = true;
         bool fast_math = true;
+        Stage1RoutePolicy routes = Stage1RoutePolicy::PerToken;
     };
 
     struct Args {
@@ -87,7 +89,7 @@ public:
 #define DG_MEGAMOE_OWNER_READER_OPT {}
 #define DG_MEGAMOE_SPLIT_SYNC {}
 #include <deep_gemm/impls/sm89_fp4_fp4_mega_moe.cuh>
-using Builder = deep_gemm::MegaMoEMxfp4Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation::{}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEMxfp4Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation::{}, {}, {}, {}, static_cast<deep_gemm::Stage1RoutePolicy>({})>;
 using Kernel = Builder::Kernel;
 static_assert(Kernel::SharedStorageSize == {}, "MegaMoE shared storage size differs from host");
 static_assert(sizeof(Kernel::MainloopArguments) == {}, "MegaMoE mainloop size differs from host");
@@ -105,7 +107,7 @@ static void __instantiate_kernel() {{
             Activation == GatedActivation::SiTU ? "SiTU" :
             Activation == GatedActivation::SwiGLUStep ? "SwiGLUStep" :
             Activation == GatedActivation::SwiGLUOAI ? "SwiGLUOAI" : "SwiGLU", info.has_linear_beta, info.fast_math,
-            a.replica_weights.weights != nullptr,
+            a.replica_weights.weights != nullptr, static_cast<int>(info.routes),
             a.launch_args.smem_size, sizeof(a.mainloop), sizeof(a.epilogue), sizeof(a.scheduler),
             a.kernel_name, kernel_args);
     }
@@ -149,6 +151,13 @@ static void launch_gemm(typename Runtime::Args& args, int expected_m) {
     const auto runtime = compiler->build(name, Runtime::generate(args));
     const int blocks = get_kernel_occupancy(runtime, args.launch_args.block_dim.x, args.launch_args.smem_size);
     args.launch_args.grid_dim.x = info.num_sms * blocks;
+    if constexpr (Runtime::kIsLinear1) {
+        if (args.split_sync)
+            launch_dispatch_prepare<false>({
+                info.k * 2, info.n / 2, info.block_m, info.num_groups, Runtime::kRanks,
+                info.source_capacity, info.topk, info.routes, args.launch_args, args.scheduler,
+                args.launch_args.grid_dim.x - info.copy_blocks});
+    }
     const MegaMoEGemmProfile profile{
         "fp4", info.num_groups, cute::get<0>(args.mainloop.problem_shape), info.n, info.k, expected_m,
         {info.num_sms, info.block_m, info.block_n, info.block_k, info.warp_m, info.warp_n,
@@ -186,7 +195,8 @@ static auto make_linear1_args(
                         .num_sms = config.num_sms,
                         .copy_blocks = config.copy_blocks, .k_tiles_per_flag = config.k_tiles_per_flag,
                         .source_capacity = m / Ranks, .topk = num_topk,
-                        .apply_clamp = apply_clamp, .has_linear_beta = has_linear_beta, .fast_math = fast_math},
+                        .apply_clamp = apply_clamp, .has_linear_beta = has_linear_beta, .fast_math = fast_math,
+                        .routes = select_stage1_routes(scheduler.num_source_tokens, Ranks, num_topk, k / 256, config, true)},
         .launch_args = {dim3(1), dim3((config.block_m / config.warp_m) * (config.block_n / config.warp_n) * 32), config.smem_size},
         .mainloop = make_mainloop_arguments(m, n, k, compact_m,
             scheduler.local_data_buf, scheduler.local_sfa_buf, l1_weights, l1_weights_sf),
@@ -290,13 +300,13 @@ static void sm89_fp4_fp4_mega_moe(
     auto* masked_m = scheduler.grouped_layout;
     scheduler.sym_buffer = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx);
     scheduler.num_copy_blocks = l1_config.copy_blocks;
+    scheduler.num_source_tokens = num_tokens;
     scheduler.cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats
         ? cumulative_local_expert_recv_stats->data_ptr<int32_t>() : nullptr;
     auto* signals = reinterpret_cast<layout::MegaMoESignals*>(base);
     auto* l2_acts = mega_buffer.l2_acts.data(base);
     auto* l2_acts_sf = mega_buffer.l2_acts_sf.data<uint16_t>(base);
     const int compact_m = static_cast<int>(mega_buffer.compact);
-    if (split_sync) launch_sync("mega_moe_dispatch_sync", num_ranks, signals);
     for_ranks(num_ranks, [&](auto r) {
         constexpr int Ranks = decltype(r)::value;
         using Linear2Runtime = GemmRuntime<MegaMoEPhaseKind::Linear2, Ranks>;
@@ -317,7 +327,7 @@ static void sm89_fp4_fp4_mega_moe(
                               l2_acts, l2_acts_sf, compact_m, num_topk, scheduler, signals, l1_config, fast_math, expected_m, split_sync);
         if (split_sync) {
             launch_gemm<Linear2Runtime>(l2_args, expected_m);
-            launch_sync("mega_moe_scatter_sync", num_ranks, signals);
+            launch_scatter_sync(num_ranks, signals);
             l2_args.kernel_name = kReduceKernelName;
         }
         launch_gemm<Linear2Runtime>(l2_args, expected_m);

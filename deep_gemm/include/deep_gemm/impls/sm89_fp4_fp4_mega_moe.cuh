@@ -18,6 +18,7 @@
 #include <deep_gemm/epilogue/fp4_epilogue_silu_and_mul_post_quant.cuh>
 #include <deep_gemm/epilogue/mega_moe_l2_epilogue.cuh>
 #include <deep_gemm/impls/fp4_mega_moe_dispatch.cuh>
+#include <deep_gemm/impls/mega_moe_dispatch.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 
 namespace deep_gemm {
@@ -30,7 +31,8 @@ template <int N, int K, int BM, int BN, int BK, int WM, int WN,
           bool ApplyClamp = false, bool WideScatterOffset = false,
           bool WarpPipeline = false,
           GatedActivation Activation = GatedActivation::SwiGLU,
-          bool kHasLinearBeta = true, bool FastMath = true, bool HasReplicas = false>
+          bool kHasLinearBeta = true, bool FastMath = true, bool HasReplicas = false,
+          Stage1RoutePolicy Routes = Stage1RoutePolicy::PerToken>
 struct MegaMoEMxfp4Kernel {
     static_assert(Stage == MegaMoEPhaseKind::Linear1 || Stage == MegaMoEPhaseKind::Linear2,
                   "unsupported MegaMoE stage");
@@ -107,17 +109,20 @@ struct MegaMoEMxfp4Kernel {
         };
         using SharedStorage = std::conditional_t<WarpPipeline, PipelineStorage, OverlaidStorage>;
         static constexpr int SharedStorageSize = cute::max(static_cast<int>(sizeof(SharedStorage)),
-            kIsLinear1 ? Groups * (Ranks + kExpertMetadataAuxFields) * static_cast<int>(sizeof(uint32_t)) : 0);
+            kIsLinear1 ? expert_metadata_smem_bytes(Groups, Ranks) : 0);
 
         CUTLASS_DEVICE void operator()(MainloopArguments mainloop, const EpilogueParams& epilogue_params,
                                       const SchedulerParams& scheduler_params, layout::MegaMoESignals* signals,
                                       char* smem_buf, const MegaMoEReplicaWeights& replicas, uint32_t generation,
                                       const layout::SymBuffer<Ranks>* scatter_buffer = nullptr) {
             if constexpr (kIsLinear1) {
-                static_assert(Groups * (Ranks + kExpertMetadataAuxFields) * sizeof(uint32_t) <= SharedStorageSize,
+                static_assert(expert_metadata_smem_bytes(Groups, Ranks) <= SharedStorageSize,
                               "dispatch preprocess must fit the GEMM shared allocation");
                 static_assert(sizeof(CopyRankMetadataShared<BM, Ranks>) <= SharedStorageSize,
                               "copy rank metadata must fit the GEMM shared allocation");
+                if constexpr (!DG_MEGAMOE_SPLIT_SYNC)
+                    publish_stage1_routes<Scheduler, MaxThreadsPerBlock, SharedStorageSize, Routes, true>(
+                        scheduler_params, smem_buf, generation);
                 prepare_expert_layout_and_reshape_sfa<Scheduler, BM, MaxThreadsPerBlock>(
                     scheduler_params, signals, smem_buf, generation);
 
@@ -274,7 +279,7 @@ void sm89_fp4_fp4_mega_moe_l1(typename Kernel::MainloopArguments mainloop, typen
                               MegaMoEReplicaWeights replicas) {
     extern __shared__ char smem[];
     Kernel op;
-    op(mainloop, epilogue, scheduler, signals, smem, replicas, resolve_fused_round_generation(*signals));
+    op(mainloop, epilogue, scheduler, signals, smem, replicas, comm::resolve_fused_round_generation(*signals));
 }
 
 template <typename Kernel, int Ranks, int TopK, int Hidden, int Groups,
