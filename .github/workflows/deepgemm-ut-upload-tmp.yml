@@ -36,6 +36,11 @@ jobs:
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 480
+    outputs:
+      repo: ${{ steps.source.outputs.repo }}
+      commit: ${{ steps.source.outputs.commit }}
+      branch: ${{ steps.source.outputs.branch }}
+      tag: ${{ steps.source.outputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +51,19 @@ jobs:
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
+
+      - name: Record source information used for the build
+        id: source
+        shell: bash
+        env:
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          printf 'repo=%s\n' "$SOURCE_REPO" >> "$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # Use the branch from the actual checkout; leave it empty for detached HEAD without a default.
+          printf 'branch=%s\n' "$(git symbolic-ref --quiet --short HEAD || true)" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$(git tag --points-at HEAD | paste -sd ',' -)" >> "$GITHUB_OUTPUT"
 
       - name: Build and Test on PPU
         id: ppu-test
@@ -151,6 +169,10 @@ jobs:
     timeout-minutes: 15
     outputs:
       artifact_name: ${{ steps.artifact-name.outputs.artifact_name }}
+      repo: ${{ needs.build-test.outputs.repo }}
+      commit: ${{ needs.build-test.outputs.commit }}
+      branch: ${{ needs.build-test.outputs.branch }}
+      tag: ${{ needs.build-test.outputs.tag }}
     steps:
       - name: Set merged artifact name
         id: artifact-name
@@ -175,6 +197,10 @@ jobs:
     with:
       # run_attempt moves when only the publishing job is rerun.
       artifact_name: ${{ needs.merge.outputs.artifact_name }}
+      repo: ${{ needs.merge.outputs.repo }}
+      commit: ${{ needs.merge.outputs.commit }}
+      branch: ${{ needs.merge.outputs.branch }}
+      tag: ${{ needs.merge.outputs.tag }}
       template_repository: t-head/ci-infra
       template_ref: main
     secrets:
