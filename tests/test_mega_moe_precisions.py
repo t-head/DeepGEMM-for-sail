@@ -500,6 +500,16 @@ def test_mega_moe_w4a16_int4(mega_moe_group, activation):
 
 
 @pytest.mark.parametrize("precision", ("w4a16", "w4a16_int4"))
+def test_sm80_w4a16_split_k_activation(mega_moe_group, precision):
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("requires SM80 W4A16")
+    # GEMM1 splits K for small M at H=2048. Only K=0 warps own gate/up pairs.
+    case = replace(CASES[2], precision=precision, hidden=2048,
+                   experts=4 * mega_moe_group.size(), tokens=(1, 33))
+    run_case(case, mega_moe_group)
+
+
+@pytest.mark.parametrize("precision", ("w4a16", "w4a16_int4"))
 def test_sm80_w4a16_split_k_scatter(mega_moe_group, precision):
     if torch.cuda.get_device_capability() != (8, 0):
         pytest.skip("requires the SM80 W4A16 scatter epilogue")

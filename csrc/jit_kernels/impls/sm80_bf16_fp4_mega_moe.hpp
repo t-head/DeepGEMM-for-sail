@@ -87,9 +87,11 @@ static void sm80_w4_mega_moe(const torch::Tensor& y, const W4Bank& w1, const W4B
         {dim3(routing.num_copy_blocks), dim3(256), copy_smem}, routing, true, true};
     auto copy = compiler->build("megamoe_int8_dispatch_copy", Copy::generate(copy_args));
     const auto shared_bytes = [&scales](const auto& c) {
-        const int epilogue = c.first ? c.tile.block_m * c.tile.block_n * 4 :
-            2 * (c.tile.block_m / c.tile.warp_m) * 16 * c.tile.block_n * 4;
-        return std::max(get_smem_config(c.tile, false, scales.element_size(), 32), epilogue);
+        const int gemm = get_smem_config(c.tile, false, scales.element_size(), 32);
+        if (c.first)
+            return c.tile.block_k == c.tile.warp_k ? gemm : std::max(gemm, c.tile.block_m * c.tile.block_n * 4);
+        const int scatter = 2 * (c.tile.block_m / c.tile.warp_m) * 16 * c.tile.block_n * 4;
+        return std::max(gemm, scatter);
     };
     // Match grouped W4A16's persistent grid policy. Query the actual binary
     // for each phase; the Tensor CU budget also bounds the resident scatter grid.

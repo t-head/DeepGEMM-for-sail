@@ -35,7 +35,33 @@ struct W4Output {
     CUTLASS_DEVICE void store(Acc acc, Coord coord, TiledMma mma, int k_warp, int base, int mb, int nb,
                               int rows, char* smem) const {
         using namespace cute;
-        if constexpr (First) {
+        constexpr int kWarpsOnK = size<3>(typename TiledMma::ThrLayoutVMNK{});
+        if constexpr (First && kWarpsOnK == 1) {
+            using AccLayout = typename MMA_Traits<PPU0010_16x16x16_F32BF16BF16F32_TN>::CLayout;
+            static_assert(std::is_same_v<typename TiledMma::AtomLayoutC_TV, AccLayout>);
+
+            // Packed weights interleave eight gate columns with eight up columns.
+            // Within each lane's eight values, gate indices 0,1,4,5 pair with 2,3,6,7.
+            CUTLASS_PRAGMA_UNROLL
+            for (int m = 0; m < size<1>(acc); ++m) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int n = 0; n < size<2>(acc); ++n) {
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int gate = 0; gate < size<0>(acc); ++gate) {
+                        if (gate & 2) continue;
+                        const auto c = coord(gate, m, n);
+                        const int row = get<0>(c), col = get<1>(c);
+                        if (row >= rows) continue;
+                        const float value = routed_gated_activation<Activation, FastMath>(
+                            acc(gate, m, n), acc(gate + 2, m, n), limit, alpha, beta, linear_beta);
+                        const int out_col = nb * (BN / 2) + (col / 16) * 8 + col % 8;
+                        activated[int64_t(base + mb * BM + row) * (N / 2) + out_col] =
+                            cutlass::bfloat16_t(value);
+                    }
+                }
+            }
+        } else if constexpr (First) {
+            // Split-K leaves only the K=0 warps with results. Share them across the CTA for activation.
             auto tile = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem)),
                                     make_layout(make_shape(Int<BM>{}, Int<BN>{}), LayoutRight{}));
             if (!k_warp) {
@@ -61,7 +87,6 @@ struct W4Output {
                 cutlass::bfloat16_t, Op, Ranks, (int64_t(TopK) * Capacity * N > UINT32_MAX)>;
             typename Scatter::Params p{{}, sources, nullptr, Capacity};
             Scatter epilogue{p};
-            constexpr int kWarpsOnK = size<3>(typename TiledMma::ThrLayoutVMNK{});
             epilogue.template operator()<kWarpsOnK>(
                 make_shape(rows + mb * BM, N, 1, 1), make_shape(Int<BM>{}, Int<BN>{}, _1{}),
                 make_coord(mb, nb, 0, 0), acc, mma, make_shape(0, 0, 0),
