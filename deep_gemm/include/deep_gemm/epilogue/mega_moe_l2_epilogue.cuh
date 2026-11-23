@@ -137,8 +137,10 @@ public:
         constexpr int kSmemN = size<1>(shared_accumulator);
         // After CTA K reduction only the leading K=0 warps own final accumulators.
         // The whole CTA still participates in both shared-memory barriers.
-        constexpr int kNumThreads = CUTE_STATIC_V(size(TiledMma{})) / kWarpsOnK;
-        const bool writes_output = kWarpsOnK == 1 || thread_idx < kNumThreads;
+        constexpr int kCtaThreads = CUTE_STATIC_V(size(TiledMma{}));
+        constexpr int kAccumulatorThreads = kCtaThreads / kWarpsOnK;
+        // After the shared-memory barrier each warp can scatter an independent row.
+        constexpr int kScatterThreads = cute::min(kCtaThreads, kSmemM * 32);
         const uint32_t tile_row = m_coord * get<0>(block_shape_mnk);
         const uint32_t block_row = offset_m + tile_row;
         const uint32_t valid_rows = get<0>(problem_shape_mnkl);
@@ -171,7 +173,7 @@ public:
                             step_m * size<1>(shared_r2s) + pipe_m;
                         const int mma_n =
                             step_n * size<2>(shared_r2s) + pipe_n;
-                        if (writes_output)
+                        if (thread_idx < kAccumulatorThreads)
                             copy(tiled_r2s,
                                  register_accumulator(_, mma_m, mma_n),
                                  shared_r2s(_, pipe_m, pipe_n));
@@ -179,8 +181,8 @@ public:
                 }
                 __syncthreads();
 
-                if (writes_output)
-                    scatter_subtile<kNumThreads>(shared_accumulator_stage, N,
+                if (thread_idx < kScatterThreads)
+                    scatter_subtile<kScatterThreads>(shared_accumulator_stage, N,
                         thread_idx, block_row + step_m * kSmemM, subtile_m_begin,
                         valid_rows, n_base, scatter_buffer);
 
@@ -311,7 +313,8 @@ private:
         constexpr int kRowsPerIteration = kNumThreads / 32;
         constexpr int kRowsPerSubtile = kSmemM / kRowsPerIteration;
         static_assert(kNumThreads % 32 == 0 && kSmemM % kRowsPerIteration == 0);
-        static_assert(kRowsPerSubtile % 2 == 0 && (kVector == 4 || kVector == 8));
+        constexpr int kRowsPerBatch = kRowsPerSubtile == 1 ? 1 : 2;
+        static_assert(kRowsPerSubtile % kRowsPerBatch == 0 && (kVector == 4 || kVector == 8));
         const int row_lane = thread_idx / 32;
         const int column = (thread_idx % 32) * kVector;
         auto* local_tile_base = scatter_buffer.template get_base_ptr<__ppu_bfloat16*>() + n_base;
@@ -329,21 +332,12 @@ private:
         }
 
         CUTLASS_PRAGMA_UNROLL
-        for (int row_base = 0; row_base < kSmemM;
-             row_base += 2 * kRowsPerIteration) {
-            const int rows[2] = {
-                row_lane + row_base,
-                row_lane + row_base + kRowsPerIteration};
-            const layout::TokenSrcMetadata infos[2] = {
-                metadata[row_base / kRowsPerIteration],
-                metadata[(row_base + kRowsPerIteration) /
-                         kRowsPerIteration]};
-
+        for (int base = 0; base < kRowsPerSubtile; base += kRowsPerBatch) {
             bool pending_remote = false;
             CUTLASS_PRAGMA_UNROLL
-            for (int pair = 0; pair < 2; ++pair) {
-                const int row = rows[pair];
-                const layout::TokenSrcMetadata token_info = infos[pair];
+            for (int i = 0; i < kRowsPerBatch; ++i) {
+                const int row = row_lane + (base + i) * kRowsPerIteration;
+                const layout::TokenSrcMetadata token_info = metadata[base + i];
                 const uint32_t expert_row = subtile_m_begin + row;
                 const uint32_t destination_rank = token_info.rank_idx;
                 if (row < kSmemM && expert_row < valid_rows) {

@@ -499,6 +499,17 @@ def test_mega_moe_w4a16_int4(mega_moe_group, activation):
     run_case(case, mega_moe_group, replicas=True, fast_math=False)
 
 
+@pytest.mark.parametrize("precision", ("w4a16", "w4a16_int4"))
+def test_sm80_w4a16_split_k_scatter(mega_moe_group, precision):
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("requires the SM80 W4A16 scatter epilogue")
+    # K=2048 selects K-split GEMM2 for small M. Partial subtiles exercise
+    # the valid-row mask when non-accumulator warps also scatter.
+    case = replace(CASES[2], precision=precision, intermediate=2048,
+                   experts=4 * mega_moe_group.size(), tokens=(1, 33, 129))
+    run_case(case, mega_moe_group)
+
+
 def test_mega_moe_w4a16_int4_rejects_mixed_formats(mega_moe_group):
     case = replace(CASES[2], precision="w4a16_int4", experts=4 * mega_moe_group.size())
     rng = torch.Generator(device="cuda").manual_seed(42)
