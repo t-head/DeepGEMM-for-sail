@@ -434,7 +434,7 @@ public:
         }
       };
 
-      auto mix_gemm = [&](int k_block) {
+      auto mix_gemm_rows = [&](int k_block, auto row_groups) {
         auto dequant = [&](int n_idx, int k_block) {
           constexpr int InterleavedElems = 8;
           using Dequant = deep_gemm::DequantW4A16<ElementA, ElementB, InterleavedElems>;
@@ -454,12 +454,13 @@ public:
         for (int n_idx = 0; n_idx < 4; n_idx++) {
           dequant(n_idx, k_block);
           CUTLASS_PRAGMA_UNROLL
-          for (int m_idx = 0; m_idx < size<1>(accum); m_idx++) {
+          for (int m_idx = 0; m_idx < row_groups; m_idx++) {
             cute::gemm(tiled_mma, tCrA(_,m_idx,k_block), tCrB(_,n_idx,k_block), accum(_,m_idx,n_idx));
           }
         }
       };
 
+      auto mix_gemm = [&](int k_block) { mix_gemm_rows(k_block, size<1>(accum)); };
       auto epilogue_cta_reduce = [&]() {
         if constexpr(WarpsOnK == 1) return;
 
@@ -720,6 +721,7 @@ public:
           s2r_prologue();
         }
 
+        auto run_k = [&](auto row_groups) {
         auto process_kblock_iterations = [&](int k_block) {
           if (k_block == K_BLOCK_MAX - 1) {
             update_s2r_source(smem_pipe_read);
@@ -741,7 +743,7 @@ public:
             smem_pipe_read = (smem_pipe_read + 1) % kNumStages;
           }
 
-          mix_gemm(k_block);
+          mix_gemm_rows(k_block, row_groups);
         };
 
         #if __HGGC_ARCH__ == 150 // mm instruction, but increase vreg
@@ -756,6 +758,17 @@ public:
             process_kblock_iterations(k_block);
           });
         }
+        };
+        if constexpr (!std::is_same_v<Output,std::false_type>) {
+          if constexpr (Output::kIsGemm1 && BlockM==128 && WarpM==64 && WarpsOnK==1) {
+            static_assert(decltype(size<1>(accum))::value==4);
+            if (residual_m <= 32) run_k(Int<1>{});
+            else if (residual_m <= 64) run_k(Int<2>{});
+            else if (residual_m <= 96) run_k(Int<3>{});
+            else run_k(Int<4>{});
+          } else run_k(size<1>(accum));
+        } else run_k(size<1>(accum));
+
       }
 
       cp_async_wait<0>();

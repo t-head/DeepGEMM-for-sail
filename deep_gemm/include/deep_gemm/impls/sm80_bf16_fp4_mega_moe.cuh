@@ -9,6 +9,7 @@ namespace deep_gemm::sm80 {
 template <typename ElementScale, bool First, int N, int BM, int BN, int WM, int Ranks, int Capacity, int TopK,
           int TilesPerFlag, GatedActivation Activation, bool FastMath>
 struct W4Output {
+    static constexpr bool kIsGemm1 = First;
     const layout::SymBuffer<Ranks>& scatter;
     layout::TokenSrcMetadata* sources;
     cutlass::bfloat16_t* activated;
@@ -47,16 +48,22 @@ struct W4Output {
                 CUTLASS_PRAGMA_UNROLL
                 for (int n = 0; n < size<2>(acc); ++n) {
                     CUTLASS_PRAGMA_UNROLL
-                    for (int gate = 0; gate < size<0>(acc); ++gate) {
-                        if (gate & 2) continue;
-                        const auto c = coord(gate, m, n);
+                    for (int g = 0; g < 8; g += 4) {
+                        const auto c = coord(g,m,n);
                         const int row = get<0>(c), col = get<1>(c);
-                        if (row >= rows) continue;
-                        const float value = routed_gated_activation<Activation, FastMath>(
-                            acc(gate, m, n), acc(gate + 2, m, n), limit, alpha, beta, linear_beta);
-                        const int out_col = nb * (BN / 2) + (col / 16) * 8 + col % 8;
-                        activated[int64_t(base + mb * BM + row) * (N / 2) + out_col] =
-                            cutlass::bfloat16_t(value);
+                        const float x = routed_gated_activation<Activation, FastMath>(
+                            acc(g,m,n), acc(g+2,m,n), limit, alpha, beta, linear_beta);
+                        const float y = routed_gated_activation<Activation, FastMath>(
+                            acc(g+1,m,n), acc(g+3,m,n), limit, alpha, beta, linear_beta);
+                        const uint32_t two = deep_gemm::tix::cvt_rte_bf16x2_f32(y,x);
+                        const uint32_t peer = __shfl_xor_sync(0xffffffffu,two,1);
+                        const unsigned odd = threadIdx.x & 1;
+                        const uint32_t pair = odd ? ((peer>>16) | (two&0xffff0000u)) : ((two&0xffffu) | (peer<<16));
+                        const int out_col = nb*(BN/2)+(col/16)*8+(col%8)-odd+4*odd;
+                        if (row < rows) {
+                            auto* dst = activated+int64_t(base+mb*BM+row)*(N/2)+out_col;
+                            *reinterpret_cast<uint32_t*>(dst) = pair;
+                        }
                     }
                 }
             }
