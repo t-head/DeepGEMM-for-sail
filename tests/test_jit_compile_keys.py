@@ -1,7 +1,8 @@
 """Native PPU host-codegen regression; requires the source checkout and PPU SDK.
 
 Run on an idle PPU: python tests/test_jit_compile_keys.py -v
-The helper compiles host C++ only. It never compiles or launches generated GEMMs.
+The SDK frontend parses the device declarations; only host codegen checks run.
+Generated GEMMs are never compiled or launched.
 """
 import os
 from pathlib import Path
@@ -16,8 +17,11 @@ from torch.utils.cpp_extension import load_inline
 CPP_SOURCE = r'''
 // Exercise the actual host code generators, without compiling or launching GEMMs.
 #include "jit_kernels/impls/bf16_gemm.hpp"
+#include "jit_kernels/impls/bf16_gemm_comm.hpp"
 #include "jit_kernels/impls/fp4_gemm.hpp"
 #include "jit_kernels/impls/fp8_gemm.hpp"
+#include "jit_kernels/impls/fp8_blockwise_gemm_comm.hpp"
+#include "jit_kernels/impls/fp8_channelwise_gemm_comm.hpp"
 
 #include <stdexcept>
 
@@ -160,6 +164,138 @@ int fp8_checks() {
     return count;
 }
 
+template <typename Runtime>
+int rs_checks(typename Runtime::Args args) {
+    args.m = 64; args.rank = 0; args.world = 2;
+    int count = tile_checks<Runtime>(args);
+#define CHECK_RS(field, value) \
+    count += check_change<Runtime>(args, [](auto& a) { a.field = value; }, #field)
+    CHECK_RS(m, 96);
+    CHECK_RS(rank, 1);
+    CHECK_RS(world, 4);
+#undef CHECK_RS
+    return count;
+}
+
+template <class Native>
+int bf16_rs_checks() {
+    using Runtime = gemm_comm::Bf16GemmRSRuntime<Native>;
+    constexpr bool Dense = std::is_same_v<Native, DenseBF16GemmCuteFreeRuntimeT<cutlass::bfloat16_t>>;
+    typename Runtime::Args args{};
+    args.launch_info.block_m = 128; args.launch_info.block_n = 128; args.launch_info.block_k = 64;
+    args.launch_info.warp_m = 32; args.launch_info.warp_n = 64; args.launch_info.num_stages = 4;
+    args.launch_info.gemm_type = "Normal"; args.launch_info.kernel_strategy = "Default";
+    args.launch_info.kernel_name = "test_bf16_rs";
+    args.m = 64; args.n = 512; args.k = 512; args.rank = 0; args.world = 2;
+    args.launch_args.smem_size = 32768;
+    typename Native::GemmArguments ga{};
+    ga.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+    ga.problem_shape = cute::make_tuple(64, 512, 512, 1);
+    ga.hw_info = {0, 39};
+    args.kernel_params = Native::to_underlying_arguments_rtc(ga, nullptr);
+    if constexpr (Dense)
+        args.launch_info.warp_k = 64;
+    else
+        args.launch_info.num_groups = 1;
+    int count = rs_checks<Runtime>(args);
+    count += check_change<Runtime>(args, [](auto& a) { a.n = 768; }, "RS literal N");
+    count += check_change<Runtime>(args, [](auto& a) { a.k = 1024; }, "RS literal K");
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_args.smem_size = 65536; }, "RS shared budget");
+    count += check_change<Runtime>(args, [](auto& a) { a.plan.shared_packets = 8; }, "RS sender staging");
+    count += check_change<Runtime>(args, [](auto& a) { a.plan.compact_min_m = 16; }, "RS compact packet geometry");
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_args.grid_dim.x = 19; }, "RS runtime grid", false);
+    if constexpr (Dense) {
+        static_assert(sizeof(gemm_comm::Bf16GemmRSParams) == 4 * sizeof(void*));
+        count += dynamic_checks<Runtime>(args);
+        count += check_change<Runtime>(args, [](auto& a) { a.launch_info.b_cache_policy = 3; }, "RS B cache policy");
+        count += check_change<Runtime>(args, [](auto& a) { a.launch_info.nonpersistent = true; }, "RS native topology");
+        count += check_change<Runtime>(args, [](auto& a) { a.launch_info.warp_k = 32; }, "RS warp K");
+        count += check_change<Runtime>(args, [](auto& a) { a.launch_info.dense_s2_opt = true; }, "RS dense synchronization");
+        count += check_change<Runtime>(args, [](auto& a) { a.launch_info.overlap_prologue = true; }, "RS input overlap");
+        count += check_change<Runtime>(args, [](auto& a) {
+            cute::get<1>(a.kernel_params.problem_shape) = 514;
+        }, "RS native N alignment");
+    } else {
+        count += check_change<Runtime>(args, [](auto& a) {
+            a.launch_args.grid_dim = dim3(19);
+            a.launch_args.block_dim = dim3(256);
+            auto change = [](auto& p) {
+                cute::get<0>(p.problem_shape) = 96;
+                p.hw_info.cu_count = 19;
+                p.collective_mainloop_params.ptr_A = reinterpret_cast<cutlass::bfloat16_t*>(uintptr_t(0x1000));
+                p.collective_epilogue_params.ptr_D = reinterpret_cast<cutlass::bfloat16_t*>(uintptr_t(0x2000));
+                p.workspace = reinterpret_cast<void*>(uintptr_t(0x3000));
+            };
+            if (is_ppu1v5_device()) change(a.kernel_params.no_tsm); else change(a.kernel_params.with_tsm);
+        }, "RS runtime launch and pointers", false);
+    }
+    return count;
+}
+
+int fp8_block_rs_checks() {
+    using Runtime = gemm_comm::Fp8BlockwiseGemmRSRuntime;
+    auto args = dense_args<Runtime>();
+    args.launch_info.num_groups = 1;
+    args.launch_info.kernel_strategy = "Default";
+    int count = rs_checks<Runtime>(args) + dynamic_checks<Runtime>(args);
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_info.num_groups = 2; }, "groups");
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_info.kernel_strategy = "OtherStrategy"; }, "strategy");
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_info.enable_sbo_overlap = true; }, "SBO overlap");
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_info.block_n = 192; }, "BN192 scale refinement");
+    count += check_change<Runtime>(args, [](auto& a) { cute::get<1>(a.kernel_params.problem_shape) = 768; }, "literal N");
+    count += check_change<Runtime>(args, [](auto& a) { cute::get<2>(a.kernel_params.problem_shape) = 1024; }, "literal K");
+    for (int bn : {128, 192}) {
+        args.launch_info.block_n = bn;
+        const auto native = FP8GemmRuntime::generate_impl({args.launch_info, args.launch_args, args.kernel_params});
+        const auto fused = Runtime::generate_impl(args);
+        TORCH_CHECK(native.find("using GemmKernel = DeepGemmUniversal<") != std::string::npos &&
+                    native.find("cute::Shape<cute::_1,cute::_128,cute::_128>") != std::string::npos,
+                    "fusion changed the native blockwise generator");
+        TORCH_CHECK(fused.find("using GemmKernel = gemm_comm::Fp8BlockwiseGemmRS<") != std::string::npos &&
+                    fused.find(fmt::format("cute::Shape<cute::_1,cute::Int<{}>,cute::_128>", bn == 192 ? 64 : 128)) !=
+                        std::string::npos,
+                    "blockwise fusion lost its kernel or scale layout adaptation");
+        ++count;
+    }
+    return count;
+}
+
+int fp8_channel_rs_checks() {
+    using Runtime = gemm_comm::Fp8ChannelwiseGemmRSRuntime;
+    Runtime::Args args{};
+    args.launch_info.block_m = 128; args.launch_info.block_n = 128; args.launch_info.block_k = 64;
+    args.launch_info.warp_m = 32; args.launch_info.warp_n = 64; args.launch_info.warp_k = 64;
+    args.launch_info.num_stages = 4;
+    args.launch_info.gemm_type = "Normal"; args.launch_info.kernel_strategy = "Default";
+    args.launch_info.kernel_name = "test_gemm_rs"; args.type_info = "cutlass::float_e4m3_t";
+    args.kernel_params.problem_shape = cute::make_tuple(64, 512, 512, 1);
+    args.m = 64; args.n = 512; args.k = 512; args.world = 2;
+    args.launch_args.smem_size = 32768;
+    args.launch_args.grid_dim = dim3(39);
+    int count = rs_checks<Runtime>(args);
+    count += check_change<Runtime>(args, [](auto& a) { a.n = 768; }, "literal N");
+    count += check_change<Runtime>(args, [](auto& a) { a.k = 1024; }, "literal K");
+    count += check_change<Runtime>(args, [](auto& a) { a.shared_packets = 8; }, "sender staging");
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_args.smem_size = 65536; }, "shared-memory budget");
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_args.grid_dim.x = 19; }, "ordinary runtime grid", false);
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_info.warp_k = 32; }, "warp K");
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_info.dense_s2_opt = true; }, "dense input synchronization");
+    count += check_change<Runtime>(args, [](auto& a) {
+        a.launch_args.block_dim = dim3(256, 1, 1);
+        auto& p = a.kernel_params;
+        cute::get<0>(p.problem_shape) = 96;
+        p.hw_info.cu_count = 19;
+        p.collective_mainloop_params.ptr_A = reinterpret_cast<void*>(uintptr_t(0x1000));
+        p.collective_epilogue_params.ptr_D = reinterpret_cast<cutlass::bfloat16_t*>(uintptr_t(0x2000));
+        p.workspace = reinterpret_cast<void*>(uintptr_t(0x3000));
+    }, "runtime M/CU and addresses", false);
+    args.m = 4096; args.n = 4096; args.k = 6144; args.shared_packets = 8;
+    args.launch_info.block_m = 256; args.launch_info.block_n = 256;
+    args.kernel_params.problem_shape = cute::make_tuple(4096, 4096, 6144, 1);
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_args.grid_dim.x = 19; }, "sender runtime grid", false);
+    return count;
+}
+
 int fp4_checks() {
     using Runtime = FP4GemmRuntime;
     Runtime::Args args{};
@@ -230,10 +366,35 @@ int gemv_checks() {
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("rs_n_grid", [] {
+        using namespace deep_gemm::gemm_comm;
+        for (int bn : {192, 384}) {
+            ConfigTuple config{39, 64, bn, 128, 16, bn / 2, 2, {}};
+            adapt_gemm_rs_n_grid(config, 64, 192, 39, false, is_blockwise_gemm_rs_n_tile);
+            if (std::get<2>(config) != 192 || !is_blockwise_gemm_rs_n_tile(std::get<2>(config)))
+                throw std::runtime_error("blockwise N-grid left supported scale widths");
+        }
+        ConfigTuple channel{39, 64, 192, 128, 16, 96, 2, {}};
+        adapt_gemm_rs_n_grid(channel, 64, 192, 39, true);
+        if (std::get<2>(channel) != 96)
+            throw std::runtime_error("channelwise N-grid adaptation changed");
+        ConfigTuple bf16{39, 64, 192, 128, 16, 96, 2, {}};
+        adapt_gemm_rs_n_grid(bf16, 64, 192, 39, false);
+        if (std::get<2>(bf16) != 96)
+            throw std::runtime_error("BF16 acquired an FP8 scale-width restriction");
+        return 4;
+    });
     m.def("bf16_cute_free", [] { return bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<cutlass::bfloat16_t>>()
                                     + bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<float>>(); });
+    m.def("bf16_rs", [] {
+        if (is_ppu1v5_device())
+            return bf16_rs_checks<DenseBF16GemmCuteFreeRuntimeT<cutlass::bfloat16_t>>();
+        return bf16_rs_checks<BF16GemmCutlass3RuntimeT<cutlass::bfloat16_t>>();
+    });
     m.def("int8_and_fp8_channel", int8_checks);
     m.def("fp8_block", fp8_checks);
+    m.def("fp8_block_rs", fp8_block_rs_checks);
+    m.def("fp8_channel_rs", fp8_channel_rs_checks);
     m.def("fp4", fp4_checks);
     m.def("gemv", gemv_checks);
 }
@@ -256,17 +417,25 @@ class CompileKeyTests(unittest.TestCase):
                     sdk / 'include', sdk / 'include/cccl', root / 'csrc', root / 'deep_gemm/include',
                     actlize, actlize / 'include', actlize / 'tools', root / 'third-party/fmt/include']
         library_dirs = [sdk / part for part in ('lib', 'lib64', 'lib64/stubs')]
+        compiler_libraries = sorted({path.stem[3:] for directory in library_dirs
+                                     for path in directory.glob('lib*rtc.so')})
+        libraries = ['hggc', 'hggcrt1', *compiler_libraries, 'acblasLt', 'c10_cuda', 'torch_cuda']
         cls.native = load_inline(
             name='deep_gemm_compile_key_tests',
-            cpp_sources=CPP_SOURCE,
+            cpp_sources='',
+            cuda_sources=CPP_SOURCE,
             extra_include_paths=[str(path) for path in includes if path.is_dir()],
             extra_cflags=['-O0', '-std=c++17', '-DUSE_HGGC'],
+            extra_cuda_cflags=['-O0', '-std=c++17', '-DUSE_HGGC'],
             extra_ldflags=[f'-L{path}' for path in library_dirs if path.is_dir()]
-                          + ['-lhggc', '-lhggcrt1', '-lhgrtc', '-lacblasLt', '-lc10_cuda', '-ltorch_cuda'],
-            with_cuda=False)
+                          + [f'-l{library}' for library in libraries],
+            with_cuda=True)
 
     def test_bf16_cute_free_both_output_types(self):
         self.assertGreater(self.native.bf16_cute_free(), 0)
+
+    def test_bf16_reduce_scatter(self):
+        self.assertGreater(self.native.bf16_rs(), 0)
 
     def test_int8_and_fp8_channel(self):
         self.assertGreater(self.native.int8_and_fp8_channel(), 0)
@@ -274,11 +443,20 @@ class CompileKeyTests(unittest.TestCase):
     def test_fp8_block(self):
         self.assertGreater(self.native.fp8_block(), 0)
 
+    def test_fp8_block_reduce_scatter(self):
+        self.assertGreater(self.native.fp8_block_rs(), 0)
+
+    def test_fp8_channel_reduce_scatter(self):
+        self.assertGreater(self.native.fp8_channel_rs(), 0)
+
     def test_fp4(self):
         self.assertGreater(self.native.fp4(), 0)
 
     def test_gemv_both_m_and_output_types(self):
         self.assertGreater(self.native.gemv(), 0)
+
+    def test_reduce_scatter_n_grid_scale_widths(self):
+        self.assertEqual(self.native.rs_n_grid(), 4)
 
 
 if __name__ == '__main__':

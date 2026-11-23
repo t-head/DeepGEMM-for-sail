@@ -83,6 +83,11 @@ def run_moe_align(args):
     return main(check_accuracy=get_acc_check())
 
 
+def run_gemm_reduce_scatter(args):
+    from test_gemm_comm import replay_case
+    return replay_case(args, check_accuracy=get_acc_check())
+
+
 def call_test_func(gemm_type, func_args):
     supported_call_funcs = {
         "KGroupedContiguous": test_k_grouped_gemm_contiguous,
@@ -108,6 +113,7 @@ def call_test_func(gemm_type, func_args):
         "Activation": run_activation_regression,
         "MoeAlign": run_moe_align,
         "MegaGate": test_mega_gate,
+        "GemmReduceScatter": run_gemm_reduce_scatter,
     }
 
     if gemm_type in supported_call_funcs.keys():
@@ -118,6 +124,8 @@ def call_test_func(gemm_type, func_args):
         raise ValueError(f"Unsupported test function: {gemm_type}")
 
 if __name__ == '__main__':
+    if 'LOCAL_RANK' in os.environ:
+        torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(0)
